@@ -664,6 +664,10 @@ struct OfflineRenderJobState {
     WaterRainSettings waterRainSettings{};
     WaterRainVisualSettings waterRainVisual{};
     std::optional<invisible_places::water::WaterScenarioState> frozenPreviewWaterScenario;
+    // Timings v2 runs of the exported scenario, frozen with the job so the
+    // per-frame keyed-setting overlay is deterministic for the whole export.
+    std::vector<invisible_places::water::WaterFeatureTimingRun>
+        frozenFeatureTimingRuns;
     invisible_places::water::WaterSeepageRainEnvelope seepageRainEnvelope{};
     invisible_places::water::WaterMeshFlowRainEnvelope meshFlowRainEnvelope{};
     std::uint64_t effectiveSeepageInvocations = 0U;
@@ -1402,6 +1406,10 @@ struct WaterWorkflowState {
     // are never reissued to a later run — animations on disk keep referencing
     // run ids, and a reused id would silently rebind their timing.
     std::uint32_t nextTimingRunSequence = 1U;
+    // Timings v2: per-scenario feature runs with per-setting key tracks.
+    std::vector<invisible_places::water::WaterScenarioFeatureRuns>
+        featureTimingRunsByScenario;
+    std::uint32_t nextFeatureTimingRunSequence = 1U;
     // Clone-on-edit shadow for one scenario at a time (its name gains
     // "_edited"). It never enters seepageScenarios or any embedded fallback
     // snapshot; live preview reads it, exports opt in per job.
@@ -1858,6 +1866,56 @@ std::optional<invisible_places::water::WaterScenarioState> ResolveActiveWaterSce
     return fallbackDefinition->state;
 }
 
+const invisible_places::water::WaterScenarioFeatureRuns*
+FindScenarioFeatureRuns(
+    const WaterWorkflowState& water,
+    const std::string& scenarioId) {
+    if (scenarioId.empty()) {
+        return nullptr;
+    }
+    for (const auto& entry : water.featureTimingRunsByScenario) {
+        if (entry.scenarioId == scenarioId) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+invisible_places::water::WaterScenarioFeatureRuns& EnsureScenarioFeatureRuns(
+    WaterWorkflowState* water,
+    const std::string& scenarioId) {
+    for (auto& entry : water->featureTimingRunsByScenario) {
+        if (entry.scenarioId == scenarioId) {
+            return entry;
+        }
+    }
+    water->featureTimingRunsByScenario.push_back({.scenarioId = scenarioId});
+    return water->featureTimingRunsByScenario.back();
+}
+
+std::string ActiveWaterTimingScenarioId(
+    const PreviewRuntimeState& runtimeState) {
+    if (runtimeState.animationPanel.currentPath.has_value() &&
+        !runtimeState.animationPanel.currentPath->selectedWaterScenarioId
+             .empty()) {
+        return runtimeState.animationPanel.currentPath
+            ->selectedWaterScenarioId;
+    }
+    return runtimeState.water.selectedSeepageScenarioId;
+}
+
+std::vector<invisible_places::water::WaterFeatureTimingRun>
+SnapshotActiveWaterFeatureTimingRuns(
+    const PreviewRuntimeState& runtimeState) {
+    const auto* entry = FindScenarioFeatureRuns(
+        runtimeState.water,
+        ActiveWaterTimingScenarioId(runtimeState));
+    if (entry == nullptr) {
+        return {};
+    }
+    return entry->runs;
+}
+
 struct WaterFrameState {
     float normalizedTime = 0.0F;
     float sampleTimeSeconds = 0.0F;
@@ -1865,9 +1923,74 @@ struct WaterFrameState {
     std::optional<invisible_places::water::WaterScenarioState> rawScenarioState;
     std::optional<invisible_places::water::WaterScenarioState> seepageScenarioState;
     std::vector<invisible_places::water::WaterSeepageNodeAnimationStateEntry> nodeStates;
+    // Timings v2: every keyed (feature, setting) sampled at normalizedTime.
+    invisible_places::water::WaterFeatureTimingOverlay featureOverlay;
 };
 
-WaterFrameState ResolveWaterFrameState(
+// Applies the Timings v2 keyed-setting overlay onto a resolved water frame:
+// global levels override the scenario channels (including the delayed
+// seepage rain and mesh-flow moisture, which follow the keyed instantaneous
+// rain), and per-node samples become absolute parameter overrides.
+void ApplyWaterFeatureTimingRunsToFrame(
+    std::span<const invisible_places::water::WaterFeatureTimingRun> runs,
+    WaterFrameState* frame) {
+    if (frame == nullptr || runs.empty()) {
+        return;
+    }
+    frame->featureOverlay =
+        invisible_places::water::BuildWaterFeatureTimingOverlay(
+            runs,
+            frame->normalizedTime);
+    const auto& overlay = frame->featureOverlay;
+    if (overlay.samples.empty()) {
+        return;
+    }
+    if (frame->rawScenarioState.has_value()) {
+        invisible_places::water::ApplyWaterFeatureTimingOverlayToScenario(
+            overlay,
+            &frame->rawScenarioState.value());
+    }
+    if (frame->seepageScenarioState.has_value()) {
+        invisible_places::water::ApplyWaterFeatureTimingOverlayToScenario(
+            overlay,
+            &frame->seepageScenarioState.value());
+    }
+    if (const auto* rain = overlay.Find(
+            {.kind = invisible_places::water::WaterKeyedFeatureKind::Rain},
+            "level");
+        rain != nullptr) {
+        frame->meshFlowMoisture = std::clamp(*rain, 0.0F, 1.0F);
+    }
+    for (const auto& sample : overlay.samples) {
+        if (sample.feature.kind !=
+            invisible_places::water::WaterKeyedFeatureKind::SeepageNode) {
+            continue;
+        }
+        auto entryIt = std::find_if(
+            frame->nodeStates.begin(),
+            frame->nodeStates.end(),
+            [&](const auto& entry) {
+                return entry.nodeId == sample.feature.objectId;
+            });
+        if (entryIt == frame->nodeStates.end()) {
+            frame->nodeStates.push_back({
+                .nodeId = sample.feature.objectId,
+                .state = {},
+            });
+            entryIt = std::prev(frame->nodeStates.end());
+        }
+        const float value = std::max(0.0F, sample.value);
+        if (sample.settingId == "strength") {
+            entryIt->state.strengthOverride = value;
+        } else if (sample.settingId == "prominence") {
+            entryIt->state.prominenceOverride = value;
+        } else if (sample.settingId == "source_width") {
+            entryIt->state.sourceWidthOverride = value;
+        }
+    }
+}
+
+WaterFrameState ResolveWaterFrameStateBase(
     PreviewRuntimeState* runtimeState) {
     WaterFrameState result;
     if (runtimeState == nullptr) {
@@ -1951,6 +2074,20 @@ WaterFrameState ResolveWaterFrameState(
     return result;
 }
 
+WaterFrameState ResolveWaterFrameState(
+    PreviewRuntimeState* runtimeState) {
+    auto result = ResolveWaterFrameStateBase(runtimeState);
+    if (runtimeState != nullptr) {
+        const auto* entry = FindScenarioFeatureRuns(
+            runtimeState->water,
+            ActiveWaterTimingScenarioId(*runtimeState));
+        if (entry != nullptr) {
+            ApplyWaterFeatureTimingRunsToFrame(entry->runs, &result);
+        }
+    }
+    return result;
+}
+
 struct WaterFlowSourceActivityParameters {
     float maximumFlowStrength = 1.0F;
     float rainResponse = 0.0F;
@@ -1959,31 +2096,54 @@ struct WaterFlowSourceActivityParameters {
 
 std::optional<WaterFlowSourceActivityParameters> ResolveWaterFlowSourceActivityParameters(
     const WaterWorkflowState& water,
-    std::optional<std::uint32_t> sourceId) {
+    std::optional<std::uint32_t> sourceId,
+    const invisible_places::water::WaterFeatureTimingOverlay* overlay = nullptr) {
     if (!sourceId.has_value()) {
         return std::nullopt;
     }
+    const auto applyOverlay = [&](WaterFlowSourceActivityParameters parameters,
+                                  invisible_places::water::WaterKeyedFeatureKind kind) {
+        if (overlay != nullptr) {
+            const invisible_places::water::WaterKeyedFeatureId feature{
+                .kind = kind,
+                .objectId = sourceId.value(),
+            };
+            if (const auto* strength = overlay->Find(feature, "strength");
+                strength != nullptr) {
+                parameters.maximumFlowStrength = std::max(0.0F, *strength);
+            }
+            if (const auto* response = overlay->Find(feature, "rain_response");
+                response != nullptr) {
+                parameters.rainResponse = std::max(0.0F, *response);
+            }
+        }
+        return parameters;
+    };
     const auto emitterIt = std::find_if(
         water.emitters.begin(),
         water.emitters.end(),
         [&](const WaterEmitter& emitter) { return emitter.id == sourceId.value(); });
     if (emitterIt != water.emitters.end()) {
-        return WaterFlowSourceActivityParameters{
-            .maximumFlowStrength = emitterIt->maximumFlowStrength,
-            .rainResponse = emitterIt->rainResponse,
-            .showTrail = emitterIt->showTrail,
-        };
+        return applyOverlay(
+            WaterFlowSourceActivityParameters{
+                .maximumFlowStrength = emitterIt->maximumFlowStrength,
+                .rainResponse = emitterIt->rainResponse,
+                .showTrail = emitterIt->showTrail,
+            },
+            invisible_places::water::WaterKeyedFeatureKind::FlowSource);
     }
     const auto manualIt = std::find_if(
         water.manualFlowPaths.begin(),
         water.manualFlowPaths.end(),
         [&](const WaterManualFlowPathSource& source) { return source.id == sourceId.value(); });
     if (manualIt != water.manualFlowPaths.end()) {
-        return WaterFlowSourceActivityParameters{
-            .maximumFlowStrength = manualIt->maximumFlowStrength,
-            .rainResponse = manualIt->rainResponse,
-            .showTrail = manualIt->showTrail,
-        };
+        return applyOverlay(
+            WaterFlowSourceActivityParameters{
+                .maximumFlowStrength = manualIt->maximumFlowStrength,
+                .rainResponse = manualIt->rainResponse,
+                .showTrail = manualIt->showTrail,
+            },
+            invisible_places::water::WaterKeyedFeatureKind::FlowPath);
     }
     return std::nullopt;
 }
@@ -1991,8 +2151,10 @@ std::optional<WaterFlowSourceActivityParameters> ResolveWaterFlowSourceActivityP
 float ResolveWaterFlowSourceActivity(
     const WaterWorkflowState& water,
     std::optional<std::uint32_t> sourceId,
-    const std::optional<invisible_places::water::WaterScenarioState>& scenarioState) {
-    const auto parameters = ResolveWaterFlowSourceActivityParameters(water, sourceId);
+    const std::optional<invisible_places::water::WaterScenarioState>& scenarioState,
+    const invisible_places::water::WaterFeatureTimingOverlay* overlay = nullptr) {
+    const auto parameters =
+        ResolveWaterFlowSourceActivityParameters(water, sourceId, overlay);
     if (!parameters.has_value()) {
         return 1.0F;
     }
@@ -2008,14 +2170,16 @@ void ApplyWaterFlowSourceActivityToStyle(
     const WaterWorkflowState& water,
     const PreviewLayerSession& session,
     const std::optional<invisible_places::water::WaterScenarioState>& scenarioState,
-    PointCloudStyleState* style) {
+    PointCloudStyleState* style,
+    const invisible_places::water::WaterFeatureTimingOverlay* overlay = nullptr) {
     if (style == nullptr || !session.waterFlowSourceId.has_value()) {
         return;
     }
     style->waterFlowActivity = ResolveWaterFlowSourceActivity(
         water,
         session.waterFlowSourceId,
-        scenarioState);
+        scenarioState,
+        overlay);
 }
 
 // Shoreline waves are authored point style, so the scenario's keyed level
@@ -19816,6 +19980,10 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
     document.selectedWaterScenarioId = runtimeState.water.selectedSeepageScenarioId;
     document.waterTimingRuns = runtimeState.water.timingRuns;
     document.waterTimingRunSequence = runtimeState.water.nextTimingRunSequence;
+    document.waterFeatureTimingRuns =
+        runtimeState.water.featureTimingRunsByScenario;
+    document.waterFeatureTimingRunSequence =
+        runtimeState.water.nextFeatureTimingRunSequence;
     document.tempWaterScenario = runtimeState.water.editedScenario;
     document.waterRippleLayers = runtimeState.water.rippleLayers;
     document.waterFieldLayers = runtimeState.water.fieldLayers;
@@ -20661,6 +20829,10 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->water.selectedSeepageScenarioId = document.selectedWaterScenarioId;
     runtimeState->water.timingRuns = document.waterTimingRuns;
     runtimeState->water.nextTimingRunSequence = document.waterTimingRunSequence;
+    runtimeState->water.featureTimingRunsByScenario =
+        document.waterFeatureTimingRuns;
+    runtimeState->water.nextFeatureTimingRunSequence =
+        document.waterFeatureTimingRunSequence;
     runtimeState->water.editedScenario = document.tempWaterScenario;
     if (runtimeState->water.editedScenario.has_value() &&
         FindWaterScenarioDefinition(
@@ -23081,7 +23253,8 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
             runtimeState.water,
             session,
             activeWaterScenario,
-            &style);
+            &style,
+            &activeWater.featureOverlay);
         ApplyWaterShorelineLevelToStyle(activeWaterScenario, &style);
         std::vector<invisible_places::water::WaterRippleRuntimeMembership> rippleMemberships;
         std::vector<invisible_places::water::WaterRippleRuntimeParams> rippleParams;
@@ -23927,6 +24100,8 @@ bool RenderCurrentAnimationFramePreview(
     job.frozenPreviewWaterScenario = ResolveActiveWaterScenarioState(
         *runtimeState,
         runtimeState->exportUsesEditedScenario);
+    job.frozenFeatureTimingRuns =
+        SnapshotActiveWaterFeatureTimingRuns(*runtimeState);
     job.seepageRainEnvelope = BuildFrozenAnimationSeepageRainEnvelope(
         job.animationPath,
         job.waterScenarios);
@@ -26939,6 +27114,7 @@ WaterFrameState ResolveFrozenWaterFrameState(
                     result.normalizedTime);
         }
     }
+    ApplyWaterFeatureTimingRunsToFrame(job.frozenFeatureTimingRuns, &result);
     return result;
 }
 
@@ -27256,6 +27432,8 @@ bool StartQuickMp4ExportJob(
         .frozenPreviewWaterScenario = ResolveActiveWaterScenarioState(
             *runtimeState,
             runtimeState->exportUsesEditedScenario),
+        .frozenFeatureTimingRuns =
+            SnapshotActiveWaterFeatureTimingRuns(*runtimeState),
         .effectiveSeepageInvocations = effectiveSeepageInvocations,
         .frozenSeepageLayers = std::move(frozenSeepageLayers),
         .frozenFlowSourceLayers = std::move(frozenFlowSourceLayers),
@@ -27940,6 +28118,8 @@ void StartStillCameraExportJob(
         .frozenPreviewWaterScenario = ResolveActiveWaterScenarioState(
             *runtimeState,
             runtimeState->exportUsesEditedScenario),
+        .frozenFeatureTimingRuns =
+            SnapshotActiveWaterFeatureTimingRuns(*runtimeState),
         .exportVisualName = "Current View",
         .exportLog = MakeExportLogState(
             pngStackDirectory.empty() ? std::filesystem::path{settings.outputDirectory} : pngStackDirectory.parent_path(),
@@ -28192,6 +28372,8 @@ void StartAnimationExportJob(
         .frozenPreviewWaterScenario = ResolveActiveWaterScenarioState(
             *runtimeState,
             runtimeState->exportUsesEditedScenario),
+        .frozenFeatureTimingRuns =
+            SnapshotActiveWaterFeatureTimingRuns(*runtimeState),
         .effectiveSeepageInvocations = effectiveSeepageInvocations,
         .frozenSeepageLayers = std::move(frozenSeepageLayers),
         .frozenFlowSourceLayers = std::move(frozenFlowSourceLayers),
@@ -44846,6 +45028,31 @@ bool PreviewLiveVisualEffectsRequireSceneRedraw(
     if (runtimeState.water.collisionRainSettings.enabled) {
         return true;
     }
+    // Keyed rain must advance the rain clock even while the standalone Rain
+    // panel checkbox is off: the effective per-frame enable comes from the
+    // scenario level with the Timings v2 overlay applied, not the authored
+    // checkbox.
+    if (auto scenario = ResolveActiveWaterScenarioState(runtimeState);
+        scenario.has_value()) {
+        if (const auto* entry = FindScenarioFeatureRuns(
+                runtimeState.water,
+                ActiveWaterTimingScenarioId(runtimeState));
+            entry != nullptr) {
+            const auto overlay =
+                invisible_places::water::BuildWaterFeatureTimingOverlay(
+                    entry->runs,
+                    std::clamp(
+                        runtimeState.animationPanel.scrubAmount,
+                        0.0F,
+                        1.0F));
+            invisible_places::water::ApplyWaterFeatureTimingOverlayToScenario(
+                overlay,
+                &scenario.value());
+        }
+        if (scenario->rainLevel > 1.0e-5F) {
+            return true;
+        }
+    }
     if (runtimeState.water.dynamicMeshFlowSettings.enabled &&
         runtimeState.water.dynamicMeshFlowSettings.showTrails) {
         return true;
@@ -44970,7 +45177,8 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                 runtimeState.water,
                 session,
                 activeWaterScenario,
-                &renderStyle);
+                &renderStyle,
+                &waterFrame.featureOverlay);
             ApplyWaterShorelineLevelToStyle(activeWaterScenario, &renderStyle);
             renderState.pointCloudLayers.push_back(
                 {.layerId = sessionIndex,

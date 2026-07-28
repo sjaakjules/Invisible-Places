@@ -331,6 +331,14 @@ struct WaterSeepageNodeAnimationState {
     float reachScale = 1.0F;
     float widthScale = 1.0F;
     float prominence = 1.0F;
+    // Timings v2 keyed absolute values. Negative means "not keyed": the
+    // authored value times the multiplier lanes above applies. When set,
+    // the keyed value replaces the authored base but the scenario level,
+    // activity, and spread/rain gains still scale on top — all parameter
+    // lanes, never topology.
+    float strengthOverride = -1.0F;
+    float prominenceOverride = -1.0F;
+    float sourceWidthOverride = -1.0F;
 };
 
 struct WaterSeepageNodeKey {

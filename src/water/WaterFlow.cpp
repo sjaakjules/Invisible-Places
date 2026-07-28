@@ -5548,6 +5548,13 @@ WaterSeepageNodeAnimationState SanitizeSeepageNodeAnimationState(
     state.reachScale = std::clamp(SeepageFiniteOr(state.reachScale, 1.0F), 0.0F, 8.0F);
     state.widthScale = std::clamp(SeepageFiniteOr(state.widthScale, 1.0F), 0.0F, 8.0F);
     state.prominence = std::clamp(SeepageFiniteOr(state.prominence, 1.0F), 0.0F, 8.0F);
+    const auto sanitizeOverride = [](float value) {
+        value = SeepageFiniteOr(value, -1.0F);
+        return value < 0.0F ? -1.0F : std::min(value, 8.0F);
+    };
+    state.strengthOverride = sanitizeOverride(state.strengthOverride);
+    state.prominenceOverride = sanitizeOverride(state.prominenceOverride);
+    state.sourceWidthOverride = sanitizeOverride(state.sourceWidthOverride);
     return state;
 }
 
@@ -5620,7 +5627,10 @@ void ApplySeepageRuntimeScenarioAndAnimation(
     node->effectiveActivity = nodeState.activity;
     node->localSpread = nodeState.localSpread;
     node->wettingProgress = nodeState.wettingProgress;
-    node->strength = node->authoredStrength * scenarioLevel * node->effectiveActivity;
+    const float baseStrength = nodeState.strengthOverride >= 0.0F
+                                   ? nodeState.strengthOverride
+                                   : node->authoredStrength;
+    node->strength = baseStrength * scenarioLevel * node->effectiveActivity;
     node->scenarioSpread = Clamp01(
         1.0F - (1.0F - globalSpread) * (1.0F - node->localSpread));
     node->rainVisualStrength = scenarioState.has_value()
@@ -5640,12 +5650,18 @@ void ApplySeepageRuntimeScenarioAndAnimation(
         node->authoredReachMeters * nodeState.reachScale * reachScale,
         0.0F,
         std::max(0.0F, node->selectionReachLimitMeters));
+    const float baseWidth = nodeState.sourceWidthOverride >= 0.0F
+                                ? nodeState.sourceWidthOverride
+                                : node->authoredWidthMeters;
     node->widthMeters = std::clamp(
-        node->authoredWidthMeters * nodeState.widthScale * widthScale,
+        baseWidth * nodeState.widthScale * widthScale,
         0.0F,
         std::max(0.0F, node->selectionWidthLimitMeters));
+    const float baseProminence = nodeState.prominenceOverride >= 0.0F
+                                     ? nodeState.prominenceOverride
+                                     : node->authoredProminence;
     node->prominence = std::clamp(
-        node->authoredProminence * nodeState.prominence,
+        baseProminence * nodeState.prominence,
         0.0F,
         8.0F);
     // The connected-support travel budget comes from strength alone (which
