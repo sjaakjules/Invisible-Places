@@ -462,3 +462,223 @@ TEST_CASE("Edited scenario shadows round-trip through temp_water_scenario", "[wa
     CHECK(loaded->tempWaterScenario->state.seepageLevel == Approx(0.42F));
     CHECK(loaded->tempWaterScenario->state.rainLevel == Approx(0.9F));
 }
+
+TEST_CASE("Keyed setting tracks hold endpoints and step at exact Hold keys",
+          "[water][timing][keyed]") {
+    using Catch::Approx;
+    using invisible_places::water::EvaluateWaterKeyedSettingTrack;
+    using invisible_places::water::WaterKeyedSettingTrack;
+    using invisible_places::water::WaterScenarioInterpolation;
+
+    WaterKeyedSettingTrack track;
+    track.settingId = "strength";
+    CHECK_FALSE(EvaluateWaterKeyedSettingTrack(track, 0.5F).has_value());
+
+    track.keys = {
+        {.position = 0.20F,
+         .value = 0.0F,
+         .interpolation = WaterScenarioInterpolation::Hold},
+        {.position = 0.40F,
+         .value = 1.2F,
+         .interpolation = WaterScenarioInterpolation::Linear},
+        {.position = 0.60F,
+         .value = 0.4F,
+         .interpolation = WaterScenarioInterpolation::Smooth},
+        {.position = 0.80F, .value = 0.0F},
+    };
+    // Endpoint hold both sides.
+    CHECK(EvaluateWaterKeyedSettingTrack(track, 0.0F).value() ==
+          Approx(0.0F));
+    CHECK(EvaluateWaterKeyedSettingTrack(track, 0.95F).value() ==
+          Approx(0.0F));
+    // Hold segment keeps the left value strictly inside it...
+    CHECK(EvaluateWaterKeyedSettingTrack(track, 0.30F).value() ==
+          Approx(0.0F));
+    // ...but sampling exactly AT the next key reads the post-step value —
+    // the step lands on the key, never one sample late.
+    CHECK(EvaluateWaterKeyedSettingTrack(track, 0.40F).value() ==
+          Approx(1.2F));
+    // Linear midpoint.
+    CHECK(EvaluateWaterKeyedSettingTrack(track, 0.50F).value() ==
+          Approx(0.8F));
+    // Smoothstep midpoint equals the linear midpoint by symmetry.
+    CHECK(EvaluateWaterKeyedSettingTrack(track, 0.70F).value() ==
+          Approx(0.2F));
+}
+
+TEST_CASE("Adding a key between keys preserves surrounding blends and order",
+          "[water][timing][keyed]") {
+    using Catch::Approx;
+    using invisible_places::water::AddOrUpdateWaterSettingKey;
+    using invisible_places::water::EvaluateWaterKeyedSettingTrack;
+    using invisible_places::water::NextWaterSettingKeyPosition;
+    using invisible_places::water::PreviousWaterSettingKeyPosition;
+    using invisible_places::water::WaterKeyedSettingTrack;
+    using invisible_places::water::WaterScenarioInterpolation;
+
+    WaterKeyedSettingTrack track;
+    track.settingId = "prominence";
+    AddOrUpdateWaterSettingKey(
+        &track, 0.25F, 0.5F, WaterScenarioInterpolation::Linear);
+    AddOrUpdateWaterSettingKey(
+        &track, 0.40F, 1.0F, WaterScenarioInterpolation::Linear);
+    // Insert between the two at the blended value: the curve through the
+    // new key is unchanged, and later edits only bend it locally.
+    const float blended =
+        EvaluateWaterKeyedSettingTrack(track, 0.325F).value();
+    AddOrUpdateWaterSettingKey(
+        &track, 0.325F, blended, WaterScenarioInterpolation::Linear);
+    REQUIRE(track.keys.size() == 3U);
+    CHECK(track.keys[1].position == Approx(0.325F));
+    // The value at 0.30 still lies on the ORIGINAL 0.25->0.40 line: the
+    // inserted key changed the curve nowhere.
+    CHECK(EvaluateWaterKeyedSettingTrack(track, 0.30F).value() ==
+          Approx(0.5F + (0.30F - 0.25F) / 0.15F * 0.5F).margin(1.0e-4F));
+
+    // Replacement within tolerance updates in place instead of duplicating.
+    AddOrUpdateWaterSettingKey(
+        &track, 0.32505F, 0.9F, WaterScenarioInterpolation::Smooth);
+    REQUIRE(track.keys.size() == 3U);
+    CHECK(track.keys[1].value == Approx(0.9F));
+
+    // Prev/next navigation is strict and bounded.
+    CHECK(PreviousWaterSettingKeyPosition(track, 0.325F).value() ==
+          Approx(0.25F));
+    CHECK(NextWaterSettingKeyPosition(track, 0.325F).value() ==
+          Approx(0.40F));
+    CHECK_FALSE(PreviousWaterSettingKeyPosition(track, 0.25F).has_value());
+    CHECK_FALSE(NextWaterSettingKeyPosition(track, 0.40F).has_value());
+}
+
+TEST_CASE("Feature timing overlay samples every keyed setting and drives scenario channels",
+          "[water][timing][keyed][overlay]") {
+    using Catch::Approx;
+    using invisible_places::water::ApplyWaterFeatureTimingOverlayToScenario;
+    using invisible_places::water::BuildWaterFeatureTimingOverlay;
+    using invisible_places::water::FindWaterFeatureRunContaining;
+    using invisible_places::water::WaterFeatureTimingRun;
+    using invisible_places::water::WaterKeyedFeatureId;
+    using invisible_places::water::WaterKeyedFeatureKind;
+    using invisible_places::water::WaterScenarioInterpolation;
+    using invisible_places::water::WaterScenarioState;
+
+    WaterFeatureTimingRun rainRun;
+    rainRun.id = 1U;
+    rainRun.name = "Storm";
+    rainRun.features.push_back({
+        .feature = {.kind = WaterKeyedFeatureKind::Rain},
+        .settings = {{
+            .settingId = "level",
+            .keys = {
+                {.position = 0.0F,
+                 .value = 0.0F,
+                 .interpolation = WaterScenarioInterpolation::Linear},
+                {.position = 0.5F,
+                 .value = 0.5F,
+                 .interpolation = WaterScenarioInterpolation::Linear},
+            },
+        }},
+    });
+    rainRun.features.push_back({
+        .feature = {.kind = WaterKeyedFeatureKind::SeepageNode,
+                    .objectId = 4U},
+        .settings = {{
+            .settingId = "strength",
+            .keys = {{.position = 0.2F, .value = 1.5F}},
+        }},
+    });
+
+    const std::vector<WaterFeatureTimingRun> runs{rainRun};
+    const auto overlay = BuildWaterFeatureTimingOverlay(runs, 0.25F);
+    REQUIRE(overlay.samples.size() == 2U);
+    const auto* rain = overlay.Find(
+        {.kind = WaterKeyedFeatureKind::Rain}, "level");
+    REQUIRE(rain != nullptr);
+    CHECK(*rain == Approx(0.25F));
+    const auto* strength = overlay.Find(
+        {.kind = WaterKeyedFeatureKind::SeepageNode, .objectId = 4U},
+        "strength");
+    REQUIRE(strength != nullptr);
+    CHECK(*strength == Approx(1.5F));
+    CHECK(overlay.Find(
+              {.kind = WaterKeyedFeatureKind::SeepageNode, .objectId = 9U},
+              "strength") == nullptr);
+
+    // Only the keyed global channel moves; everything else is untouched.
+    WaterScenarioState state;
+    state.rainLevel = 1.0F;
+    state.flowLevel = 0.7F;
+    ApplyWaterFeatureTimingOverlayToScenario(overlay, &state);
+    CHECK(state.rainLevel == Approx(0.25F));
+    CHECK(state.flowLevel == Approx(0.7F));
+
+    const auto* containing = FindWaterFeatureRunContaining(
+        runs,
+        {.kind = WaterKeyedFeatureKind::SeepageNode, .objectId = 4U});
+    REQUIRE(containing != nullptr);
+    CHECK(containing->name == "Storm");
+    CHECK(FindWaterFeatureRunContaining(
+              runs,
+              {.kind = WaterKeyedFeatureKind::FlowSource, .objectId = 1U}) ==
+          nullptr);
+}
+
+TEST_CASE("Per-scenario feature timing runs round-trip through the project document",
+          "[water][timing][keyed][serialization]") {
+    using Catch::Approx;
+    using invisible_places::serialization::LoadProjectDocument;
+    using invisible_places::serialization::ProjectDocument;
+    using invisible_places::serialization::SaveProjectDocument;
+    using invisible_places::water::WaterKeyedFeatureKind;
+    using invisible_places::water::WaterScenarioInterpolation;
+
+    ProjectDocument document;
+    document.projectName = "Feature timing runs";
+    invisible_places::water::WaterScenarioFeatureRuns entry;
+    entry.scenarioId = "pre-colonisation-wet";
+    invisible_places::water::WaterFeatureTimingRun run;
+    run.id = 7U;
+    run.name = "Rain + Seeps";
+    run.features.push_back({
+        .feature = {.kind = WaterKeyedFeatureKind::SeepageNode,
+                    .objectId = 4U},
+        .settings = {{
+            .settingId = "strength",
+            .keys = {
+                {.position = 0.20F,
+                 .value = 0.0F,
+                 .interpolation = WaterScenarioInterpolation::Hold},
+                {.position = 0.35F,
+                 .value = 1.2F,
+                 .interpolation = WaterScenarioInterpolation::Smooth},
+            },
+        }},
+    });
+    entry.runs.push_back(run);
+    document.waterFeatureTimingRuns.push_back(entry);
+    document.waterFeatureTimingRunSequence = 8U;
+
+    TemporaryTimingFile file{"invisible_places_feature_timing_runs.json"};
+    std::string errorMessage;
+    REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+    const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded->waterFeatureTimingRuns.size() == 1U);
+    const auto& loadedEntry = loaded->waterFeatureTimingRuns.front();
+    CHECK(loadedEntry.scenarioId == "pre-colonisation-wet");
+    REQUIRE(loadedEntry.runs.size() == 1U);
+    const auto& loadedRun = loadedEntry.runs.front();
+    CHECK(loadedRun.id == 7U);
+    CHECK(loadedRun.name == "Rain + Seeps");
+    REQUIRE(loadedRun.features.size() == 1U);
+    const auto& timeline = loadedRun.features.front();
+    CHECK(timeline.feature.kind == WaterKeyedFeatureKind::SeepageNode);
+    CHECK(timeline.feature.objectId == 4U);
+    REQUIRE(timeline.settings.size() == 1U);
+    REQUIRE(timeline.settings.front().keys.size() == 2U);
+    CHECK(timeline.settings.front().keys[0].position == Approx(0.20F));
+    CHECK(timeline.settings.front().keys[0].interpolation ==
+          WaterScenarioInterpolation::Hold);
+    CHECK(timeline.settings.front().keys[1].value == Approx(1.2F));
+    CHECK(loaded->waterFeatureTimingRunSequence == 8U);
+}

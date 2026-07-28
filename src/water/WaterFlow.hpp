@@ -394,6 +394,145 @@ struct WaterScenarioTrack {
     std::vector<WaterTimingRunAssignment> timingAssignments;
 };
 
+// ---- Timings v2: per-feature, per-setting keyframing ----
+// A run groups scene water features whose individual settings are keyed
+// along the linked animation (positions normalized 0..1, so duration edits
+// never move timing). Runs are scenario-scoped and evaluated directly per
+// frame; within one scenario a feature belongs to at most one run. Key
+// display names are derived ("<run name> <n>" in time order), never stored,
+// so inserting a key between two others renumbers the later ones for free.
+enum class WaterKeyedFeatureKind : std::uint8_t {
+    Rain = 0,
+    MeshFlow,
+    Shoreline,
+    SeepageGlobal,
+    FlowGlobal,
+    SeepageNode,
+    FlowSource,
+    FlowPath,
+};
+
+struct WaterKeyedFeatureId {
+    WaterKeyedFeatureKind kind = WaterKeyedFeatureKind::Rain;
+    // Seepage node / flow emitter / manual path id; zero for scene globals.
+    std::uint32_t objectId = 0U;
+
+    friend auto operator<=>(
+        const WaterKeyedFeatureId&,
+        const WaterKeyedFeatureId&) = default;
+};
+
+struct WaterSettingKey {
+    float position = 0.0F;
+    float value = 0.0F;
+    WaterScenarioInterpolation interpolation =
+        WaterScenarioInterpolation::Smooth;
+};
+
+struct WaterKeyedSettingTrack {
+    std::string settingId;
+    std::vector<WaterSettingKey> keys;
+};
+
+struct WaterFeatureTimeline {
+    WaterKeyedFeatureId feature{};
+    std::vector<WaterKeyedSettingTrack> settings;
+};
+
+struct WaterFeatureTimingRun {
+    std::uint32_t id = 0U;
+    std::string name = "Run";
+    std::vector<WaterFeatureTimeline> features;
+};
+
+struct WaterScenarioFeatureRuns {
+    std::string scenarioId;
+    std::vector<WaterFeatureTimingRun> runs;
+};
+
+// Registry of the settings each feature kind can key. The id is the stable
+// serialization identity; label and range drive the keyed sliders. Global
+// kinds key one "level" that overrides the matching scenario channel.
+struct WaterKeyableSettingInfo {
+    const char* id = "";
+    const char* label = "";
+    float minimum = 0.0F;
+    float maximum = 1.0F;
+    float defaultValue = 1.0F;
+};
+
+[[nodiscard]] std::span<const WaterKeyableSettingInfo> WaterKeyableSettings(
+    WaterKeyedFeatureKind kind);
+[[nodiscard]] const WaterKeyableSettingInfo* FindWaterKeyableSetting(
+    WaterKeyedFeatureKind kind,
+    std::string_view settingId);
+[[nodiscard]] std::string_view WaterKeyedFeatureKindLabel(
+    WaterKeyedFeatureKind kind);
+[[nodiscard]] std::string_view WaterKeyedFeatureKindName(
+    WaterKeyedFeatureKind kind);
+[[nodiscard]] std::optional<WaterKeyedFeatureKind>
+ParseWaterKeyedFeatureKindName(std::string_view name);
+[[nodiscard]] bool WaterKeyedFeatureKindIsGlobal(WaterKeyedFeatureKind kind);
+
+[[nodiscard]] WaterKeyedSettingTrack SanitizeWaterKeyedSettingTrack(
+    WaterKeyedSettingTrack track);
+[[nodiscard]] WaterFeatureTimingRun SanitizeWaterFeatureTimingRun(
+    WaterFeatureTimingRun run);
+// Endpoint-hold sampling with Hold/Linear/Smooth segments. An exact interior
+// key belongs to the segment it starts, so a Hold step reads its new value
+// at the key position itself. Empty tracks return nullopt.
+[[nodiscard]] std::optional<float> EvaluateWaterKeyedSettingTrack(
+    const WaterKeyedSettingTrack& track,
+    float normalizedPosition);
+// Inserts, or replaces any key within 1e-4 of the position (id-free tracks
+// renumber implicitly via time order).
+void AddOrUpdateWaterSettingKey(
+    WaterKeyedSettingTrack* track,
+    float position,
+    float value,
+    WaterScenarioInterpolation interpolation =
+        WaterScenarioInterpolation::Smooth);
+[[nodiscard]] std::optional<float> PreviousWaterSettingKeyPosition(
+    const WaterKeyedSettingTrack& track,
+    float position);
+[[nodiscard]] std::optional<float> NextWaterSettingKeyPosition(
+    const WaterKeyedSettingTrack& track,
+    float position);
+
+struct WaterFeatureTimingSampleEntry {
+    WaterKeyedFeatureId feature{};
+    std::string settingId;
+    float value = 0.0F;
+};
+
+// Every keyed (feature, setting) evaluated at one normalized position.
+struct WaterFeatureTimingOverlay {
+    std::vector<WaterFeatureTimingSampleEntry> samples;
+
+    [[nodiscard]] const float* Find(
+        const WaterKeyedFeatureId& feature,
+        std::string_view settingId) const;
+};
+
+[[nodiscard]] WaterFeatureTimingOverlay BuildWaterFeatureTimingOverlay(
+    std::span<const WaterFeatureTimingRun> runs,
+    float normalizedPosition);
+// Applies the global-kind "level" samples onto the matching scenario
+// channels (Rain, Mesh Flow, Shoreline, Seepage Global, Flow Global).
+void ApplyWaterFeatureTimingOverlayToScenario(
+    const WaterFeatureTimingOverlay& overlay,
+    WaterScenarioState* state);
+
+[[nodiscard]] const WaterFeatureTimingRun* FindWaterFeatureRunContaining(
+    std::span<const WaterFeatureTimingRun> runs,
+    const WaterKeyedFeatureId& feature);
+[[nodiscard]] WaterFeatureTimeline* FindWaterFeatureTimeline(
+    WaterFeatureTimingRun* run,
+    const WaterKeyedFeatureId& feature);
+[[nodiscard]] const WaterFeatureTimeline* FindWaterFeatureTimeline(
+    const WaterFeatureTimingRun* run,
+    const WaterKeyedFeatureId& feature);
+
 struct WaterSeepageRainEnvelope {
     float sampleRateHz = 120.0F;
     float durationSeconds = 0.0F;

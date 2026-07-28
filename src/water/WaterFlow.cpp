@@ -6753,6 +6753,405 @@ std::vector<WaterScenarioKey> CompileWaterTimingScenarioKeys(
     return keys;
 }
 
+
+// ---- Timings v2: per-feature, per-setting keyframing ----
+
+namespace {
+
+constexpr std::array<WaterKeyableSettingInfo, 1> kWaterGlobalLevelSettings{{
+    {.id = "level",
+     .label = "Level",
+     .minimum = 0.0F,
+     .maximum = 1.0F,
+     .defaultValue = 1.0F},
+}};
+
+constexpr std::array<WaterKeyableSettingInfo, 3> kWaterSeepageNodeSettings{{
+    {.id = "strength",
+     .label = "Node Strength",
+     .minimum = 0.0F,
+     .maximum = 2.0F,
+     .defaultValue = 1.0F},
+    {.id = "prominence",
+     .label = "Prominence",
+     .minimum = 0.0F,
+     .maximum = 2.0F,
+     .defaultValue = 1.0F},
+    {.id = "source_width",
+     .label = "Source Width",
+     .minimum = 0.01F,
+     .maximum = 2.0F,
+     .defaultValue = 0.10F},
+}};
+
+constexpr std::array<WaterKeyableSettingInfo, 2> kWaterFlowSourceSettings{{
+    {.id = "strength",
+     .label = "Maximum Flow Strength",
+     .minimum = 0.0F,
+     .maximum = 2.0F,
+     .defaultValue = 1.0F},
+    {.id = "rain_response",
+     .label = "Rain Response",
+     .minimum = 0.0F,
+     .maximum = 2.0F,
+     .defaultValue = 1.0F},
+}};
+
+}  // namespace
+
+std::span<const WaterKeyableSettingInfo> WaterKeyableSettings(
+    WaterKeyedFeatureKind kind) {
+    switch (kind) {
+        case WaterKeyedFeatureKind::Rain:
+        case WaterKeyedFeatureKind::MeshFlow:
+        case WaterKeyedFeatureKind::Shoreline:
+        case WaterKeyedFeatureKind::SeepageGlobal:
+        case WaterKeyedFeatureKind::FlowGlobal:
+            return kWaterGlobalLevelSettings;
+        case WaterKeyedFeatureKind::SeepageNode:
+            return kWaterSeepageNodeSettings;
+        case WaterKeyedFeatureKind::FlowSource:
+        case WaterKeyedFeatureKind::FlowPath:
+            return kWaterFlowSourceSettings;
+    }
+    return {};
+}
+
+const WaterKeyableSettingInfo* FindWaterKeyableSetting(
+    WaterKeyedFeatureKind kind,
+    std::string_view settingId) {
+    for (const auto& info : WaterKeyableSettings(kind)) {
+        if (settingId == info.id) {
+            return &info;
+        }
+    }
+    return nullptr;
+}
+
+std::string_view WaterKeyedFeatureKindLabel(WaterKeyedFeatureKind kind) {
+    switch (kind) {
+        case WaterKeyedFeatureKind::Rain:
+            return "Rain";
+        case WaterKeyedFeatureKind::MeshFlow:
+            return "Mesh Flow";
+        case WaterKeyedFeatureKind::Shoreline:
+            return "Shoreline";
+        case WaterKeyedFeatureKind::SeepageGlobal:
+            return "Seepage (Global)";
+        case WaterKeyedFeatureKind::FlowGlobal:
+            return "Flow (Global)";
+        case WaterKeyedFeatureKind::SeepageNode:
+            return "Seepage Node";
+        case WaterKeyedFeatureKind::FlowSource:
+            return "Flow Source";
+        case WaterKeyedFeatureKind::FlowPath:
+            return "Flow Path";
+    }
+    return "Water Feature";
+}
+
+std::string_view WaterKeyedFeatureKindName(WaterKeyedFeatureKind kind) {
+    switch (kind) {
+        case WaterKeyedFeatureKind::Rain:
+            return "rain";
+        case WaterKeyedFeatureKind::MeshFlow:
+            return "mesh_flow";
+        case WaterKeyedFeatureKind::Shoreline:
+            return "shoreline";
+        case WaterKeyedFeatureKind::SeepageGlobal:
+            return "seepage_global";
+        case WaterKeyedFeatureKind::FlowGlobal:
+            return "flow_global";
+        case WaterKeyedFeatureKind::SeepageNode:
+            return "seepage_node";
+        case WaterKeyedFeatureKind::FlowSource:
+            return "flow_source";
+        case WaterKeyedFeatureKind::FlowPath:
+            return "flow_path";
+    }
+    return "rain";
+}
+
+std::optional<WaterKeyedFeatureKind> ParseWaterKeyedFeatureKindName(
+    std::string_view name) {
+    static constexpr std::array<WaterKeyedFeatureKind, 8> kKinds{
+        WaterKeyedFeatureKind::Rain,
+        WaterKeyedFeatureKind::MeshFlow,
+        WaterKeyedFeatureKind::Shoreline,
+        WaterKeyedFeatureKind::SeepageGlobal,
+        WaterKeyedFeatureKind::FlowGlobal,
+        WaterKeyedFeatureKind::SeepageNode,
+        WaterKeyedFeatureKind::FlowSource,
+        WaterKeyedFeatureKind::FlowPath,
+    };
+    for (const auto kind : kKinds) {
+        if (name == WaterKeyedFeatureKindName(kind)) {
+            return kind;
+        }
+    }
+    return std::nullopt;
+}
+
+bool WaterKeyedFeatureKindIsGlobal(WaterKeyedFeatureKind kind) {
+    switch (kind) {
+        case WaterKeyedFeatureKind::SeepageNode:
+        case WaterKeyedFeatureKind::FlowSource:
+        case WaterKeyedFeatureKind::FlowPath:
+            return false;
+        case WaterKeyedFeatureKind::Rain:
+        case WaterKeyedFeatureKind::MeshFlow:
+        case WaterKeyedFeatureKind::Shoreline:
+        case WaterKeyedFeatureKind::SeepageGlobal:
+        case WaterKeyedFeatureKind::FlowGlobal:
+            return true;
+    }
+    return true;
+}
+
+WaterKeyedSettingTrack SanitizeWaterKeyedSettingTrack(
+    WaterKeyedSettingTrack track) {
+    for (auto& key : track.keys) {
+        key.position = Clamp01(SeepageFiniteOr(key.position, 0.0F));
+        key.value = SeepageFiniteOr(key.value, 0.0F);
+    }
+    std::stable_sort(
+        track.keys.begin(),
+        track.keys.end(),
+        [](const WaterSettingKey& left, const WaterSettingKey& right) {
+            return left.position < right.position;
+        });
+    return track;
+}
+
+WaterFeatureTimingRun SanitizeWaterFeatureTimingRun(
+    WaterFeatureTimingRun run) {
+    if (run.name.empty()) {
+        run.name = "Run";
+    }
+    for (auto& timeline : run.features) {
+        std::vector<WaterKeyedSettingTrack> kept;
+        kept.reserve(timeline.settings.size());
+        for (auto& setting : timeline.settings) {
+            if (setting.settingId.empty()) {
+                continue;
+            }
+            const bool duplicate = std::any_of(
+                kept.begin(),
+                kept.end(),
+                [&](const WaterKeyedSettingTrack& existing) {
+                    return existing.settingId == setting.settingId;
+                });
+            if (duplicate) {
+                continue;
+            }
+            kept.push_back(
+                SanitizeWaterKeyedSettingTrack(std::move(setting)));
+        }
+        timeline.settings = std::move(kept);
+    }
+    return run;
+}
+
+std::optional<float> EvaluateWaterKeyedSettingTrack(
+    const WaterKeyedSettingTrack& track,
+    float normalizedPosition) {
+    if (track.keys.empty()) {
+        return std::nullopt;
+    }
+    normalizedPosition = Clamp01(SeepageFiniteOr(normalizedPosition, 0.0F));
+    std::vector<const WaterSettingKey*> ordered;
+    ordered.reserve(track.keys.size());
+    for (const auto& key : track.keys) {
+        ordered.push_back(&key);
+    }
+    std::stable_sort(
+        ordered.begin(),
+        ordered.end(),
+        [](const WaterSettingKey* left, const WaterSettingKey* right) {
+            return left->position < right->position;
+        });
+    const auto keyValue = [](const WaterSettingKey& key) {
+        return SeepageFiniteOr(key.value, 0.0F);
+    };
+    if (normalizedPosition <= ordered.front()->position) {
+        return keyValue(*ordered.front());
+    }
+    if (normalizedPosition >= ordered.back()->position) {
+        return keyValue(*ordered.back());
+    }
+    for (std::size_t index = 0U; index + 1U < ordered.size(); ++index) {
+        const auto& left = *ordered[index];
+        const auto& right = *ordered[index + 1U];
+        // An exact interior key position belongs to the segment it starts,
+        // so sampling at a key after a Hold segment yields the post-step
+        // value instead of the stale left limit.
+        if (normalizedPosition >= right.position) {
+            continue;
+        }
+        if (left.interpolation == WaterScenarioInterpolation::Hold) {
+            return keyValue(left);
+        }
+        const float span =
+            std::max(1.0e-6F, right.position - left.position);
+        float amount =
+            Clamp01((normalizedPosition - left.position) / span);
+        if (left.interpolation == WaterScenarioInterpolation::Smooth) {
+            amount = amount * amount * (3.0F - 2.0F * amount);
+        }
+        return std::lerp(keyValue(left), keyValue(right), amount);
+    }
+    return keyValue(*ordered.back());
+}
+
+void AddOrUpdateWaterSettingKey(
+    WaterKeyedSettingTrack* track,
+    float position,
+    float value,
+    WaterScenarioInterpolation interpolation) {
+    if (track == nullptr) {
+        return;
+    }
+    constexpr float kReplacementTolerance = 1.0e-4F;
+    WaterSettingKey key{
+        .position = Clamp01(SeepageFiniteOr(position, 0.0F)),
+        .value = SeepageFiniteOr(value, 0.0F),
+        .interpolation = interpolation,
+    };
+    const auto existing = std::find_if(
+        track->keys.begin(),
+        track->keys.end(),
+        [&](const WaterSettingKey& candidate) {
+            return std::abs(candidate.position - key.position) <=
+                   kReplacementTolerance;
+        });
+    if (existing != track->keys.end()) {
+        *existing = key;
+    } else {
+        track->keys.push_back(key);
+    }
+    std::stable_sort(
+        track->keys.begin(),
+        track->keys.end(),
+        [](const WaterSettingKey& left, const WaterSettingKey& right) {
+            return left.position < right.position;
+        });
+}
+
+std::optional<float> PreviousWaterSettingKeyPosition(
+    const WaterKeyedSettingTrack& track,
+    float position) {
+    constexpr float kNeighbourTolerance = 1.0e-4F;
+    std::optional<float> best;
+    for (const auto& key : track.keys) {
+        if (key.position < position - kNeighbourTolerance &&
+            (!best.has_value() || key.position > *best)) {
+            best = key.position;
+        }
+    }
+    return best;
+}
+
+std::optional<float> NextWaterSettingKeyPosition(
+    const WaterKeyedSettingTrack& track,
+    float position) {
+    constexpr float kNeighbourTolerance = 1.0e-4F;
+    std::optional<float> best;
+    for (const auto& key : track.keys) {
+        if (key.position > position + kNeighbourTolerance &&
+            (!best.has_value() || key.position < *best)) {
+            best = key.position;
+        }
+    }
+    return best;
+}
+
+const float* WaterFeatureTimingOverlay::Find(
+    const WaterKeyedFeatureId& feature,
+    std::string_view settingId) const {
+    for (const auto& sample : samples) {
+        if (sample.feature == feature && sample.settingId == settingId) {
+            return &sample.value;
+        }
+    }
+    return nullptr;
+}
+
+WaterFeatureTimingOverlay BuildWaterFeatureTimingOverlay(
+    std::span<const WaterFeatureTimingRun> runs,
+    float normalizedPosition) {
+    WaterFeatureTimingOverlay overlay;
+    for (const auto& run : runs) {
+        for (const auto& timeline : run.features) {
+            for (const auto& setting : timeline.settings) {
+                const auto value = EvaluateWaterKeyedSettingTrack(
+                    setting,
+                    normalizedPosition);
+                if (!value.has_value()) {
+                    continue;
+                }
+                overlay.samples.push_back({
+                    .feature = timeline.feature,
+                    .settingId = setting.settingId,
+                    .value = *value,
+                });
+            }
+        }
+    }
+    return overlay;
+}
+
+void ApplyWaterFeatureTimingOverlayToScenario(
+    const WaterFeatureTimingOverlay& overlay,
+    WaterScenarioState* state) {
+    if (state == nullptr) {
+        return;
+    }
+    const auto applyLevel = [&](WaterKeyedFeatureKind kind, float* channel) {
+        const auto* value = overlay.Find({.kind = kind}, "level");
+        if (value != nullptr) {
+            *channel = Clamp01(SeepageFiniteOr(*value, 0.0F));
+        }
+    };
+    applyLevel(WaterKeyedFeatureKind::Rain, &state->rainLevel);
+    applyLevel(WaterKeyedFeatureKind::MeshFlow, &state->meshFlowLevel);
+    applyLevel(WaterKeyedFeatureKind::Shoreline, &state->shorelineLevel);
+    applyLevel(WaterKeyedFeatureKind::SeepageGlobal, &state->seepageLevel);
+    applyLevel(WaterKeyedFeatureKind::FlowGlobal, &state->flowLevel);
+}
+
+const WaterFeatureTimingRun* FindWaterFeatureRunContaining(
+    std::span<const WaterFeatureTimingRun> runs,
+    const WaterKeyedFeatureId& feature) {
+    for (const auto& run : runs) {
+        if (FindWaterFeatureTimeline(&run, feature) != nullptr) {
+            return &run;
+        }
+    }
+    return nullptr;
+}
+
+WaterFeatureTimeline* FindWaterFeatureTimeline(
+    WaterFeatureTimingRun* run,
+    const WaterKeyedFeatureId& feature) {
+    if (run == nullptr) {
+        return nullptr;
+    }
+    for (auto& timeline : run->features) {
+        if (timeline.feature == feature) {
+            return &timeline;
+        }
+    }
+    return nullptr;
+}
+
+const WaterFeatureTimeline* FindWaterFeatureTimeline(
+    const WaterFeatureTimingRun* run,
+    const WaterKeyedFeatureId& feature) {
+    return FindWaterFeatureTimeline(
+        const_cast<WaterFeatureTimingRun*>(run),
+        feature);
+}
+
 WaterSeepageQuality ResolveWaterSeepageQuality(
     WaterSeepageQuality quality,
     std::uint64_t effectivePointInvocations) {

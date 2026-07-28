@@ -3379,6 +3379,112 @@ invisible_places::water::WaterTimingKey ParseWaterTimingKey(const json& keyJson)
     return key;
 }
 
+
+json SerializeWaterFeatureTimingRun(
+    const invisible_places::water::WaterFeatureTimingRun& run) {
+    json featuresJson = json::array();
+    for (const auto& timeline : run.features) {
+        json settingsJson = json::array();
+        for (const auto& setting : timeline.settings) {
+            json keysJson = json::array();
+            for (const auto& key : setting.keys) {
+                keysJson.push_back({
+                    {"position", key.position},
+                    {"value", key.value},
+                    {"interpolation",
+                     WaterScenarioInterpolationName(key.interpolation)},
+                });
+            }
+            settingsJson.push_back({
+                {"id", setting.settingId},
+                {"keys", std::move(keysJson)},
+            });
+        }
+        featuresJson.push_back({
+            {"kind",
+             std::string{invisible_places::water::WaterKeyedFeatureKindName(
+                 timeline.feature.kind)}},
+            {"object_id", timeline.feature.objectId},
+            {"settings", std::move(settingsJson)},
+        });
+    }
+    return {
+        {"id", run.id},
+        {"name", run.name},
+        {"features", std::move(featuresJson)},
+    };
+}
+
+invisible_places::water::WaterFeatureTimingRun ParseWaterFeatureTimingRun(
+    const json& runJson) {
+    invisible_places::water::WaterFeatureTimingRun run;
+    run.id = runJson.value("id", 0U);
+    run.name = runJson.value("name", std::string{"Run"});
+    if (runJson.contains("features") && runJson.at("features").is_array()) {
+        for (const auto& featureJson : runJson.at("features")) {
+            invisible_places::water::WaterFeatureTimeline timeline;
+            const auto kind =
+                invisible_places::water::ParseWaterKeyedFeatureKindName(
+                    featureJson.value("kind", std::string{}));
+            if (!kind.has_value()) {
+                continue;
+            }
+            timeline.feature.kind = kind.value();
+            timeline.feature.objectId = featureJson.value("object_id", 0U);
+            if (featureJson.contains("settings") &&
+                featureJson.at("settings").is_array()) {
+                for (const auto& settingJson : featureJson.at("settings")) {
+                    invisible_places::water::WaterKeyedSettingTrack track;
+                    track.settingId =
+                        settingJson.value("id", std::string{});
+                    if (settingJson.contains("keys") &&
+                        settingJson.at("keys").is_array()) {
+                        for (const auto& keyJson : settingJson.at("keys")) {
+                            invisible_places::water::WaterSettingKey key;
+                            key.position = keyJson.value("position", 0.0F);
+                            key.value = keyJson.value("value", 0.0F);
+                            if (keyJson.contains("interpolation")) {
+                                key.interpolation =
+                                    ParseWaterScenarioInterpolation(
+                                        keyJson.at("interpolation"));
+                            }
+                            track.keys.push_back(key);
+                        }
+                    }
+                    timeline.settings.push_back(std::move(track));
+                }
+            }
+            run.features.push_back(std::move(timeline));
+        }
+    }
+    return invisible_places::water::SanitizeWaterFeatureTimingRun(
+        std::move(run));
+}
+
+json SerializeWaterScenarioFeatureRuns(
+    const invisible_places::water::WaterScenarioFeatureRuns& entry) {
+    json runsJson = json::array();
+    for (const auto& run : entry.runs) {
+        runsJson.push_back(SerializeWaterFeatureTimingRun(run));
+    }
+    return {
+        {"scenario_id", entry.scenarioId},
+        {"runs", std::move(runsJson)},
+    };
+}
+
+invisible_places::water::WaterScenarioFeatureRuns
+ParseWaterScenarioFeatureRuns(const json& entryJson) {
+    invisible_places::water::WaterScenarioFeatureRuns entry;
+    entry.scenarioId = entryJson.value("scenario_id", std::string{});
+    if (entryJson.contains("runs") && entryJson.at("runs").is_array()) {
+        for (const auto& runJson : entryJson.at("runs")) {
+            entry.runs.push_back(ParseWaterFeatureTimingRun(runJson));
+        }
+    }
+    return entry;
+}
+
 json SerializeWaterTimingRun(const invisible_places::water::WaterTimingRun& run) {
     json runJson{
         {"id", run.id},
@@ -6438,6 +6544,9 @@ bool SaveProjectDocument(
         {"selected_water_scenario", document.selectedWaterScenarioId},
         {"water_timing_runs", json::array()},
         {"water_timing_run_sequence", document.waterTimingRunSequence},
+        {"water_feature_timing_runs", json::array()},
+        {"water_feature_timing_run_sequence",
+         document.waterFeatureTimingRunSequence},
         {"water_flow_trail_settings", SerializeWaterFlowTrailSettings(document.waterFlowTrailSettings)},
         {"water_show_flow_trails", document.waterShowFlowTrails},
         {"water_field_settings", SerializeWaterFieldSettings(document.waterFieldSettings)},
@@ -6512,6 +6621,10 @@ bool SaveProjectDocument(
     }
     for (const auto& run : document.waterTimingRuns) {
         projectJson["water_timing_runs"].push_back(SerializeWaterTimingRun(run));
+    }
+    for (const auto& entry : document.waterFeatureTimingRuns) {
+        projectJson["water_feature_timing_runs"].push_back(
+            SerializeWaterScenarioFeatureRuns(entry));
     }
     if (document.tempWaterScenario.has_value()) {
         projectJson["temp_water_scenario"] =
@@ -6715,6 +6828,17 @@ std::optional<ProjectDocument> LoadProjectDocument(
     document.waterTimingRunSequence = projectJson->value(
         "water_timing_run_sequence",
         document.waterTimingRunSequence);
+    if (projectJson->contains("water_feature_timing_runs") &&
+        projectJson->at("water_feature_timing_runs").is_array()) {
+        for (const auto& entryJson :
+             projectJson->at("water_feature_timing_runs")) {
+            document.waterFeatureTimingRuns.push_back(
+                ParseWaterScenarioFeatureRuns(entryJson));
+        }
+    }
+    document.waterFeatureTimingRunSequence = projectJson->value(
+        "water_feature_timing_run_sequence",
+        document.waterFeatureTimingRunSequence);
     if (projectJson->contains("temp_water_scenario")) {
         document.tempWaterScenario =
             ParseWaterScenarioDefinition(projectJson->at("temp_water_scenario"));

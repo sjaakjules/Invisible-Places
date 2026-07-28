@@ -189,6 +189,10 @@ struct ProjectDocument {
     std::vector<invisible_places::water::WaterScenarioDefinition> waterScenarios;
     std::string selectedWaterScenarioId;
     std::vector<invisible_places::water::WaterTimingRun> waterTimingRuns;
+    // Timings v2: per-scenario feature runs with per-setting key tracks.
+    std::vector<invisible_places::water::WaterScenarioFeatureRuns>
+        waterFeatureTimingRuns;
+    std::uint32_t waterFeatureTimingRunSequence = 1U;
     std::uint32_t waterTimingRunSequence = 1U;
     std::optional<invisible_places::water::WaterScenarioDefinition> tempWaterScenario;
     std::vector<invisible_places::water::WaterEffectLayer> waterRippleLayers;
