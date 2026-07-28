@@ -84,7 +84,7 @@ layout(set = 0, binding = 0, std140) uniform DynamicMeshFlowUniforms {
     uvec4 capacities;              // particles, history, output points, events
     uvec4 ground;                  // mask, max probes, occupied, seed
     uvec4 control;                 // reset epoch, show trails, entry count, Rain reset epoch
-    uvec4 contactGrid;             // mask, capacity, unused, unused
+    uvec4 contactGrid;             // mask, capacity, surface surge bits, unused
     vec4 timing;                   // time, dt, activity, moisture
     vec4 boundsMinimumResolution;  // xyz minimum, cell resolution
     vec4 boundsMaximumBand;        // xyz maximum, edge coverage
@@ -560,11 +560,27 @@ bool SelectConnectedGroundStep(
             dot(direction, crossSlope);
         const float noisePreference =
             0.5 + 0.5 * crossAlignment * signedCrossNoise;
+        // Aquifer particles hold their heading and barely wander; surface
+        // particles answer the cross-slope noise more readily, reading as
+        // water finding its way around branches and debris. Downhill keeps
+        // the dominant weight so the median-alignment diagnostic holds.
+        const float characterStrength =
+            clamp(uintBitsToFloat(uniforms.contactGrid.z), 0.0, 1.0);
+        const bool aquiferCharacter =
+            Hash01(uniforms.ground.w, particleIndex, 47u) < 0.45;
+        const float inertiaWeight = mix(
+            0.25,
+            aquiferCharacter ? 0.30 : 0.20,
+            characterStrength);
+        const float noiseWeight = mix(
+            0.05,
+            aquiferCharacter ? 0.025 : 0.10,
+            characterStrength);
         const float score =
             0.55 * tunedDownhillAlignment +
-            0.25 * tunedInertiaAlignment +
+            inertiaWeight * tunedInertiaAlignment +
             0.15 * clamp(candidate.convergence, 0.0, 1.0) +
-            0.05 * clamp(noisePreference, 0.0, 1.0) +
+            noiseWeight * clamp(noisePreference, 0.0, 1.0) +
             Hash01(
                 uniforms.ground.w,
                 particleIndex,
@@ -1135,9 +1151,38 @@ void main() {
     const vec3 previousVelocity = SafeNormalize(
         particle.velocityDistance.xyz,
         current.downhill);
+    // Two overlapping flow characters share the walk: aquifer particles are
+    // slow, steady groundwater filaments, while surface particles pool
+    // against debris and surge over it on a per-particle stall-and-rush
+    // cycle. Surface Surge scales the whole character (0 restores one
+    // uniform steady population); identity is a stable per-particle hash so
+    // the split never flickers across respawns.
+    const bool aquiferParticle =
+        Hash01(uniforms.ground.w, particleIndex, 47u) < 0.45;
+    const float surgeStrength =
+        clamp(uintBitsToFloat(uniforms.contactGrid.z), 0.0, 1.0);
+    float surgeNorm = 1.0;
+    float characterSpeedScale = mix(1.0, 0.55, surgeStrength);
+    if (!aquiferParticle) {
+        const float surgePeriod = mix(
+            2.0,
+            7.0,
+            Hash01(uniforms.ground.w, particleIndex, 53u));
+        const float surgePhase =
+            Hash01(uniforms.ground.w, particleIndex, 59u);
+        const float surgeWave = 0.5 + 0.5 * sin(
+            6.28318530718 *
+            (uniforms.timing.x / surgePeriod + surgePhase));
+        surgeNorm = smoothstep(0.30, 0.75, surgeWave);
+        characterSpeedScale = mix(
+            1.0,
+            mix(0.15, 1.60, surgeNorm),
+            surgeStrength);
+    }
     const float speed =
         max(0.001, uniforms.motion0.x) *
-        mix(0.72, 1.35, current.convergence);
+        mix(0.72, 1.35, current.convergence) *
+        characterSpeedScale;
     const float resolution =
         max(0.001, uniforms.boundsMinimumResolution.w);
     float stepBudget =
@@ -1190,14 +1235,21 @@ void main() {
             vec4(
                 velocity,
                 particle.velocityDistance.w + stepDistance);
+        // The walk advances at most one connected cell per dispatch, so any
+        // budget beyond one cell can never be spent this frame. Carrying
+        // more would bank the rush phase's surplus and silently spend it
+        // through the stall — defeating the surge character and making the
+        // motion depend on frame rate. Cap the carry at one cell of credit.
         particle.normalConfidence =
             vec4(
                 next.normal,
-                max(0.0, stepBudget - max(resolution, stepDistance)));
+                min(
+                    resolution,
+                    max(0.0, stepBudget - max(resolution, stepDistance))));
         trailSurface = next;
     } else {
         particle.positionAge.w += max(0.0, uniforms.timing.y);
-        particle.normalConfidence.w = stepBudget;
+        particle.normalConfidence.w = min(stepBudget, resolution);
     }
     outputPositions.positions[
         routeStart + historyLength - 1u] =
@@ -1275,6 +1327,15 @@ void main() {
         resolution * 2.0,
         resolution * 8.0,
         routeLength);
+    // Aquifer filaments read subtler and steadier; surface trails stretch
+    // their streaks while rushing and shorten them while pooling.
+    if (aquiferParticle) {
+        nextWeights.trailProminence *= mix(1.0, 0.90, surgeStrength);
+        nextWeights.trailStreakScale *= mix(1.0, 0.95, surgeStrength);
+    } else {
+        nextWeights.trailStreakScale *=
+            mix(1.0, mix(0.85, 1.15, surgeNorm), surgeStrength);
+    }
     for (uint anchor = 0u; anchor < historyLength; ++anchor) {
         const uint previousAnchor =
             anchor > 0u ? anchor - 1u : anchor;

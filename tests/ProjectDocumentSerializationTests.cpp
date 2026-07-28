@@ -1398,6 +1398,7 @@ TEST_CASE("Project schema 45 round-trips automatic fixed-capacity Mesh Flow cont
   settings.sourceBandFraction = 0.06F;
   settings.dryConcavityFocus = 0.62F;
   settings.edgeCoverage = 0.85F;
+  settings.surfaceSurge = 0.25F;
   settings.rainSpawnSpread = 1.15F;
   settings.rainDistributedSourceFraction = 0.47F;
   settings.trailOpacityDry = 0.03F;
@@ -1450,6 +1451,7 @@ TEST_CASE("Project schema 45 round-trips automatic fixed-capacity Mesh Flow cont
     CHECK(mesh.at("rain_distributed_source_fraction") ==
           Catch::Approx(0.47F));
     CHECK(mesh.at("edge_coverage") == Catch::Approx(0.85F));
+    CHECK(mesh.at("surface_surge") == Catch::Approx(0.25F));
     CHECK(mesh.at("trail_opacity_dry") == Catch::Approx(0.03F));
     CHECK(mesh.at("trail_opacity_wet") == Catch::Approx(0.16F));
     CHECK(mesh.at("trail_emission_dry") == Catch::Approx(0.05F));
@@ -1476,6 +1478,7 @@ TEST_CASE("Project schema 45 round-trips automatic fixed-capacity Mesh Flow cont
   CHECK(loadedSettings.sourceBandFraction == Catch::Approx(0.04F));
   CHECK(loadedSettings.rainDistributedSourceFraction == Catch::Approx(0.47F));
   CHECK(loadedSettings.edgeCoverage == Catch::Approx(0.85F));
+  CHECK(loadedSettings.surfaceSurge == Catch::Approx(0.25F));
   CHECK(loadedSettings.trailOpacityDry == Catch::Approx(0.03F));
   CHECK(loadedSettings.trailOpacityWet == Catch::Approx(0.16F));
   CHECK(loadedSettings.trailEmissionDry == Catch::Approx(0.05F));

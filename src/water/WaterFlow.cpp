@@ -3365,6 +3365,10 @@ WaterDynamicMeshFlowSettings SanitizeWaterDynamicMeshFlowSettings(
         finiteOr(settings.edgeCoverage, 0.0F),
         0.0F,
         1.0F);
+    settings.surfaceSurge = std::clamp(
+        finiteOr(settings.surfaceSurge, 0.6F),
+        0.0F,
+        1.0F);
     settings.rainSpawnSpread = std::clamp(
         finiteOr(settings.rainSpawnSpread, 0.75F),
         0.0F,
@@ -5700,6 +5704,7 @@ std::string WaterDynamicMeshFlowSettingsFingerprint(
     SeepageFingerprintU32(&hash, settings.historyLength);
     SeepageFingerprintFloat(&hash, settings.dryConcavityFocus);
     SeepageFingerprintFloat(&hash, settings.edgeCoverage);
+    SeepageFingerprintFloat(&hash, settings.surfaceSurge);
     SeepageFingerprintFloat(&hash, settings.rainSpawnSpread);
     SeepageFingerprintFloat(&hash, settings.rainDistributedSourceFraction);
     SeepageFingerprintU32(&hash, settings.previewParticleLimit);

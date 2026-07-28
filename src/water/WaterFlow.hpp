@@ -1129,6 +1129,11 @@ struct WaterDynamicMeshFlowSettings {
     float particleNoiseStrength = 0.10F;
     float particleNoiseScaleMeters = 0.45F;
     float particleNoiseSpeed = 0.18F;
+    // Depth of the surface population's stall-and-rush speed cycle (0 keeps
+    // every trail steady). Roughly half the particles flow as slow, steady
+    // aquifer filaments; the rest read as surface water pooling against
+    // debris and surging over it.
+    float surfaceSurge = 0.6F;
     float sharedWindStrength = 0.035F;
     float sharedWindScaleMeters = 3.0F;
     float sharedWindSpeed = 0.025F;

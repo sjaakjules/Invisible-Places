@@ -1478,6 +1478,7 @@ TEST_CASE("Mesh Flow fixed-capacity settings sanitize and fingerprint live contr
     CHECK(defaults.sourceBandWidthMeters == Approx(0.75F));
     CHECK(defaults.sourceBandFraction == Approx(0.04F));
     CHECK(defaults.edgeCoverage == Approx(0.0F));
+    CHECK(defaults.surfaceSurge == Approx(0.6F));
     CHECK(defaults.rainDistributedSourceFraction == Approx(0.55F));
     CHECK(defaults.speedMetersPerSecond == Approx(0.26F));
     CHECK(defaults.surfaceOffsetMeters == Approx(0.003F));
@@ -1495,6 +1496,7 @@ TEST_CASE("Mesh Flow fixed-capacity settings sanitize and fingerprint live contr
     invalid.historyLength = 1U;
     invalid.sourceBandWidthMeters = -1.0F;
     invalid.edgeCoverage = 2.0F;
+    invalid.surfaceSurge = -1.0F;
     invalid.rockResponse.radiusMeters = 5.0F;
     invalid.rockResponse.colourise.x = -2.0F;
     invalid.vegetationResponse.twinkle = 9.0F;
@@ -1504,6 +1506,7 @@ TEST_CASE("Mesh Flow fixed-capacity settings sanitize and fingerprint live contr
     CHECK(sanitized.historyLength == 24U);
     CHECK(sanitized.sourceBandWidthMeters == Approx(0.75F));
     CHECK(sanitized.edgeCoverage == Approx(1.0F));
+    CHECK(sanitized.surfaceSurge == Approx(0.0F));
     CHECK(sanitized.rockResponse.radiusMeters == Approx(0.75F));
     CHECK(sanitized.rockResponse.colourise.x == Approx(0.0F));
     CHECK(sanitized.vegetationResponse.twinkle == Approx(4.0F));
@@ -1527,6 +1530,10 @@ TEST_CASE("Mesh Flow fixed-capacity settings sanitize and fingerprint live contr
           WaterDynamicMeshFlowSettingsFingerprint(changed));
     changed = defaults;
     changed.edgeCoverage = 0.5F;
+    CHECK(defaultFingerprint !=
+          WaterDynamicMeshFlowSettingsFingerprint(changed));
+    changed = defaults;
+    changed.surfaceSurge = 0.2F;
     CHECK(defaultFingerprint !=
           WaterDynamicMeshFlowSettingsFingerprint(changed));
 

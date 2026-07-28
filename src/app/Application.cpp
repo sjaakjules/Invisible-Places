@@ -39344,6 +39344,19 @@ void DrawWaterDynamicMeshFlowPanel(
             3.0F,
             "%.2f");
         liveChanged |= ImGui::SliderFloat(
+            "Surface Surge",
+            &settings.surfaceSurge,
+            0.0F,
+            1.0F,
+            "%.2f");
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Splits trails into slow, steady aquifer filaments and "
+                "surface water that pools against debris, then surges over "
+                "it with stretched streaks. 0 keeps one uniform steady "
+                "population.");
+        }
+        liveChanged |= ImGui::SliderFloat(
             "Shared Wind",
             &settings.sharedWindStrength,
             0.0F,

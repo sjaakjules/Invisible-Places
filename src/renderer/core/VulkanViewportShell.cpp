@@ -3622,7 +3622,8 @@ DynamicMeshFlowGpuUpdateResult VulkanViewportShell::UpdateDynamicMeshFlowGpuSimu
     uniforms.contactGrid = glm::uvec4{
         resources->dynamicMeshFlowContactGridMask,
         resources->dynamicMeshFlowContactGridMask + 1U,
-        0U,
+        std::bit_cast<std::uint32_t>(
+            std::clamp(request.settings.surfaceSurge, 0.0F, 1.0F)),
         0U,
     };
     uniforms.boundsMinimumResolution = glm::vec4{
