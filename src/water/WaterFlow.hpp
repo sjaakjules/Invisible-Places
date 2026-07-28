@@ -548,6 +548,10 @@ inline constexpr std::size_t kWaterSeepageMaximumSupportCellsPerNode = 262'144U;
 inline constexpr float kWaterSeepageDescentCostFactor = 0.75F;
 inline constexpr float kWaterSeepageContourCostFactor = 2.2F;
 inline constexpr float kWaterSeepageAscentCostFactor = 5.0F;
+// Contour steps cost up to this much more on steep surfaces: a node on a
+// near-vertical face wets tall and narrow (descent-to-contour ratio ~5.9)
+// while flat ground keeps the base isotropic-ish creep (~2.9).
+inline constexpr float kWaterSeepageSteepContourMultiplier = 2.0F;
 inline constexpr float kWaterSeepageRunMetersPerStrength = 1.5F;
 // Vegetation more than this far above its connected substrate is hovering
 // canopy and stays dry.

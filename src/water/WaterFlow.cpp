@@ -9250,7 +9250,9 @@ std::string WaterSeepageSupportSelectionFingerprint(
     }
     // v2: least-resistance flood cost/path metrics replaced the
     // centreline corridor.
-    return "water-seepage-support-v2-" + SeepageFingerprintString(hash);
+    // v3: contour step cost scales with surface steepness (stored per-cell
+    // costs change), so cached support selections must rebuild.
+    return "water-seepage-support-v3-" + SeepageFingerprintString(hash);
 }
 
 }  // namespace
@@ -9344,16 +9346,34 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
     // ground, and wicks a short way up connected structure above the node.
     // The stored per-cell cost is compared against the live strength-driven
     // budget at render time, so the area reshapes without rebuilding.
-    const auto stepCostFactor = [](const glm::vec3& step, float stepLength) {
+    const auto stepCostFactor = [](const glm::vec3& step,
+                                   float stepLength,
+                                   const glm::vec3& surfaceNormal) {
         const float drop = -step.z / std::max(stepLength, 1.0e-6F);
-        const float blend = std::clamp(drop * 2.0F, -1.0F, 1.0F);
+        // Contouring gets more expensive the steeper the local surface, and
+        // the descent discount sharpens with it: on a near-vertical face
+        // only a genuinely steep step is descent-priced (shallow diagonals
+        // no longer smear the fan sideways at the cheap rate), so seeping
+        // wetness runs a long way down before it slowly widens. Gentle
+        // terrain keeps the forgiving threshold and its even, short spread.
+        const float steepness =
+            1.0F - std::clamp(std::abs(surfaceNormal.z), 0.0F, 1.0F);
+        const float descentSharpness = std::lerp(2.0F, 1.0F, steepness);
+        const float blend =
+            std::clamp(drop * descentSharpness, -1.0F, 1.0F);
+        const float contourFactor =
+            kWaterSeepageContourCostFactor *
+            std::lerp(
+                1.0F,
+                kWaterSeepageSteepContourMultiplier,
+                steepness);
         return blend >= 0.0F
                    ? std::lerp(
-                         kWaterSeepageContourCostFactor,
+                         contourFactor,
                          kWaterSeepageDescentCostFactor,
                          blend)
                    : std::lerp(
-                         kWaterSeepageContourCostFactor,
+                         contourFactor,
                          kWaterSeepageAscentCostFactor,
                          -blend);
     };
@@ -9369,9 +9389,13 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
     const float reachLimit = result.selection.reachLimitMeters;
     const float halfWidthLimit = result.selection.widthLimitMeters * 0.5F;
     // The flood stops at the cost limit: the selection reach limit expressed
-    // in cost-metres plus the feather allowance, so the live budget always
-    // has selected cells to feather across.
-    const float costLimit = reachLimit + edgeAllowance * kWaterSeepageContourCostFactor;
+    // in cost-metres plus the feather allowance priced at the steepest
+    // contour rate, so the live budget always has selected cells to feather
+    // across even on a near-vertical face.
+    const float costLimit =
+        reachLimit +
+        edgeAllowance * kWaterSeepageContourCostFactor *
+            kWaterSeepageSteepContourMultiplier;
     const float continuityDistance = std::clamp(
         depthTolerance,
         sourceResolution * 1.75F,
@@ -9560,7 +9584,8 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
                     const float stepLength = std::sqrt(distanceSquared);
                     const float nextCost =
                         current.costMeters +
-                        stepLength * stepCostFactor(step, stepLength);
+                        stepLength *
+                            stepCostFactor(step, stepLength, neighbourNormal);
                     if (const auto existing = queuedCost.find(key);
                         existing != queuedCost.end() &&
                         existing->second <= nextCost + 0.005F) {

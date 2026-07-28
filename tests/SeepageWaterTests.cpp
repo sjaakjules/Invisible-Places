@@ -2461,6 +2461,74 @@ TEST_CASE("Connected Seepage support follows a turning maximum-downhill centreli
     CHECK(turnedCell->lateralDistanceMeters > 0.06F);
 }
 
+TEST_CASE("Seepage on a vertical face runs far down before it creeps sideways",
+          "[water][seepage][surface-cache][connected][least-resistance][steep]") {
+    using invisible_places::water::BuildWaterSeepageSupportSelection;
+    using invisible_places::water::BuildWaterSurfaceCacheFromSamples;
+    using invisible_places::water::WaterSurfaceRole;
+    using invisible_places::water::WaterSurfaceSample;
+
+    // A vertical rock wall in the Y-Z plane (normals point along +X, so
+    // surface steepness is 1). The node sits top-centre; cells straight
+    // below must stay descent-priced while equally distant contour cells
+    // cost the steep contour rate — tall and narrow, as slow wetness on a
+    // cliff face behaves.
+    std::vector<WaterSurfaceSample> samples;
+    for (std::int32_t y = 0; y <= 60; ++y) {
+        for (std::int32_t z = 0; z >= -60; --z) {
+            for (std::uint32_t sample = 0U; sample < 8U; ++sample) {
+                samples.push_back({
+                    .position = {
+                        0.005F + static_cast<float>(sample) * 0.00001F,
+                        0.005F + 0.010F * static_cast<float>(y),
+                        -0.005F + 0.010F * static_cast<float>(z),
+                    },
+                    .normal = {1.0F, 0.0F, 0.0F},
+                    .role = WaterSurfaceRole::Rock,
+                });
+            }
+        }
+    }
+    const auto cache = BuildWaterSurfaceCacheFromSamples(samples, 0.010F);
+    auto node = MakeSeepageNode();
+    node.position = {0.005F, 0.305F, -0.005F};
+    node.surfaceNormal = {1.0F, 0.0F, 0.0F};
+    node.widthMeters = 0.03F;
+    node.selectionReachLimitMeters = 1.0F;
+    node.selectionWidthLimitMeters = 0.70F;
+    node.edgeFeatherMeters = 0.005F;
+
+    const auto support = BuildWaterSeepageSupportSelection(node, "ROCK", cache);
+    REQUIRE(support.success);
+    const auto findCell = [&](const auto& predicate)
+        -> const invisible_places::water::WaterSeepageSupportCell* {
+        for (const auto& cell : support.selection.cells) {
+            if (predicate(cell)) {
+                return &cell;
+            }
+        }
+        return nullptr;
+    };
+    // 0.30 m straight down: descent-priced cost, well under the travelled
+    // distance.
+    const auto* below = findCell([](const auto& cell) {
+        return cell.z <= -29 && cell.z >= -32 &&
+               std::abs(cell.y - 30) <= 1;
+    });
+    REQUIRE(below != nullptr);
+    CHECK(below->downwardDistanceMeters < 0.30F);
+    // 0.30 m along the contour: priced at the steep contour rate
+    // (kWaterSeepageContourCostFactor x kWaterSeepageSteepContourMultiplier),
+    // several times the descent cost for the same travelled distance.
+    const auto* beside = findCell([](const auto& cell) {
+        return cell.y >= 59 && cell.y <= 61 && cell.z >= -2;
+    });
+    REQUIRE(beside != nullptr);
+    CHECK(beside->downwardDistanceMeters > 1.0F);
+    CHECK(beside->downwardDistanceMeters >
+          below->downwardDistanceMeters * 4.0F);
+}
+
 TEST_CASE("Seepage flood splits into both downhill routes of a saddle",
           "[water][seepage][surface-cache][connected][least-resistance]") {
     using invisible_places::water::BuildWaterSeepageSupportSelection;
