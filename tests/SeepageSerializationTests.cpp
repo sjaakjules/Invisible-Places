@@ -50,6 +50,10 @@ WaterSeepageLookSettings MakeLook(
     look.tricklePatchSizeMeters = 0.081F + offset;
     look.trickleWidthMeters = 0.019F + offset;
     look.trickleFrontSoftness = 0.11F + offset;
+    look.pulseSpacingMeters = 0.18F + offset;
+    look.pulseWidthMeters = 0.055F + offset;
+    look.pulseSpeedMetersPerSecond = 0.12F + offset;
+    look.pulseIrregularity = 0.38F + offset;
     look.blendMode = blendMode;
     look.response.intensity = 0.71F + offset;
     look.response.emissionAdd = 0.82F + offset;
@@ -98,6 +102,18 @@ void CheckLook(
     CHECK(
         actual.trickleFrontSoftness ==
         Catch::Approx(expected.trickleFrontSoftness));
+    CHECK(
+        actual.pulseSpacingMeters ==
+        Catch::Approx(expected.pulseSpacingMeters));
+    CHECK(
+        actual.pulseWidthMeters ==
+        Catch::Approx(expected.pulseWidthMeters));
+    CHECK(
+        actual.pulseSpeedMetersPerSecond ==
+        Catch::Approx(expected.pulseSpeedMetersPerSecond));
+    CHECK(
+        actual.pulseIrregularity ==
+        Catch::Approx(expected.pulseIrregularity));
     CHECK(actual.blendMode == expected.blendMode);
     CHECK(actual.response.intensity == Catch::Approx(expected.response.intensity));
     CHECK(actual.response.emissionAdd == Catch::Approx(expected.response.emissionAdd));
@@ -216,6 +232,15 @@ TEST_CASE("Project documents round-trip Seepage nodes and shared looks", "[water
             0.02F,
             WaterEffectBlendMode::Override),
     });
+    auto contourPulses = MakeLook(
+        WaterSeepageQuality::High,
+        0.03F,
+        WaterEffectBlendMode::Max);
+    contourPulses.pattern = WaterSeepagePattern::ContourPulses;
+    document.waterSeepageLookProfiles.push_back({
+        .name = "Contour pulses",
+        .settings = contourPulses,
+    });
     const invisible_places::water::WaterSeepageResponseProfile responseProfile{
         .name = "Strong response",
         .response = MakeLook(
@@ -253,6 +278,9 @@ TEST_CASE("Project documents round-trip Seepage nodes and shared looks", "[water
     CHECK(savedJson.find("\"pattern\": \"wet_rock_sheen\"") != std::string::npos);
     CHECK(savedJson.find("\"pattern\": \"chaotic_bloom\"") != std::string::npos);
     CHECK(savedJson.find("\"pattern\": \"wetting_trickle\"") != std::string::npos);
+    CHECK(savedJson.find("\"pattern\": \"contour_pulses\"") != std::string::npos);
+    CHECK(savedJson.find("\"pulse_spacing_meters\"") != std::string::npos);
+    CHECK(savedJson.find("\"pulse_speed_meters_per_second\"") != std::string::npos);
     CHECK(savedJson.find("\"quality\": \"auto\"") != std::string::npos);
     CHECK(savedJson.find("\"quality\": \"low\"") != std::string::npos);
     CHECK(savedJson.find("\"quality\": \"balanced\"") != std::string::npos);
@@ -270,7 +298,7 @@ TEST_CASE("Project documents round-trip Seepage nodes and shared looks", "[water
     REQUIRE(loaded.has_value());
     CHECK(loaded->schemaVersion == invisible_places::serialization::kProjectDocumentSchemaVersion);
     CheckLook(loaded->waterSeepageDefaultLook, document.waterSeepageDefaultLook);
-    REQUIRE(loaded->waterSeepageLookProfiles.size() == 3U);
+    REQUIRE(loaded->waterSeepageLookProfiles.size() == 4U);
     CHECK(loaded->waterSeepageLookProfiles.front().name == profile.name);
     CheckLook(loaded->waterSeepageLookProfiles.front().settings, profile.settings);
     REQUIRE(loaded->waterSeepageResponseProfiles.size() == 1U);

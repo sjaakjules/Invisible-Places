@@ -260,9 +260,9 @@ struct alignas(16) SparseWaterRippleParamsGpu {
 struct alignas(16) WaterSeepageLookGpu {
     // x: pattern, y: blend mode.
     glm::uvec4 control{0U, 1U, 0U, 0U};
-    // Layout retained from the removed legacy-ripple pattern: legacy0 lanes
-    // are spare; legacy1 carries z: density, w: response intensity.
-    glm::vec4 legacy0{0.0F, 0.0F, 0.0F, 0.0F};
+    // Contour Pulses: x spacing, y width, z speed, w irregularity.
+    // Other patterns ignore this formerly spare legacy-ripple lane.
+    glm::vec4 legacy0{0.18F, 0.055F, 0.12F, 0.38F};
     glm::vec4 legacy1{0.0F, 0.0F, 0.45F, 0.85F};
     glm::vec4 response0{0.35F, 0.04F, 1.12F, 0.0F};
     glm::vec4 response1{1.08F, 0.28F, 0.42F, 0.46F};
@@ -336,9 +336,28 @@ WaterSeepageLookGpu MakeWaterSeepageLookGpu(
         0U,
         0U,
     };
-    // legacy0 lanes are spare since the legacy-ripple pattern was removed;
-    // they are kept to preserve the GPU struct layout.
-    gpu.legacy0 = glm::vec4{0.0F, 0.0F, 0.0F, 0.0F};
+    gpu.legacy0 = glm::vec4{
+        finiteClamp(
+            look.pulseSpacingMeters,
+            0.005F,
+            20.0F,
+            fallback.pulseSpacingMeters),
+        finiteClamp(
+            look.pulseWidthMeters,
+            0.001F,
+            10.0F,
+            fallback.pulseWidthMeters),
+        finiteClamp(
+            look.pulseSpeedMetersPerSecond,
+            0.0F,
+            4.0F,
+            fallback.pulseSpeedMetersPerSecond),
+        finiteClamp(
+            look.pulseIrregularity,
+            0.0F,
+            1.0F,
+            fallback.pulseIrregularity),
+    };
     gpu.legacy1 = glm::vec4{
         0.0F,  // Spare lane (was legacy turbulence).
         0.0F,  // Spare lane (was legacy phase).

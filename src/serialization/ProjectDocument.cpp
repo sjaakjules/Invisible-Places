@@ -2955,6 +2955,8 @@ const char* WaterSeepagePatternName(WaterSeepagePattern pattern) {
             return "chaotic_bloom";
         case WaterSeepagePattern::WettingTrickle:
             return "wetting_trickle";
+        case WaterSeepagePattern::ContourPulses:
+            return "contour_pulses";
     }
     return "chaotic_bloom";
 }
@@ -2969,6 +2971,9 @@ WaterSeepagePattern ParseWaterSeepagePattern(const json& patternJson) {
     }
     if (name == "wetting_trickle") {
         return WaterSeepagePattern::WettingTrickle;
+    }
+    if (name == "contour_pulses") {
+        return WaterSeepagePattern::ContourPulses;
     }
     // "chaotic_bloom", the removed "legacy_ripples", and unknown names all
     // resolve to the current default pattern.
@@ -2998,6 +3003,10 @@ json SerializeWaterSeepageLookSettings(const WaterSeepageLookSettings& settings)
         {"trickle_patch_size_meters", settings.tricklePatchSizeMeters},
         {"trickle_width_meters", settings.trickleWidthMeters},
         {"trickle_front_softness", settings.trickleFrontSoftness},
+        {"pulse_spacing_meters", settings.pulseSpacingMeters},
+        {"pulse_width_meters", settings.pulseWidthMeters},
+        {"pulse_speed_meters_per_second", settings.pulseSpeedMetersPerSecond},
+        {"pulse_irregularity", settings.pulseIrregularity},
         {"blend_mode", WaterEffectBlendModeName(settings.blendMode)},
         {"response", SerializeWaterEffectResponseSettings(settings.response)},
     };
@@ -3047,6 +3056,18 @@ WaterSeepageLookSettings ParseWaterSeepageLookSettings(const json& settingsJson)
     settings.trickleFrontSoftness = settingsJson.value(
         "trickle_front_softness",
         settings.trickleFrontSoftness);
+    settings.pulseSpacingMeters = settingsJson.value(
+        "pulse_spacing_meters",
+        settings.pulseSpacingMeters);
+    settings.pulseWidthMeters = settingsJson.value(
+        "pulse_width_meters",
+        settings.pulseWidthMeters);
+    settings.pulseSpeedMetersPerSecond = settingsJson.value(
+        "pulse_speed_meters_per_second",
+        settings.pulseSpeedMetersPerSecond);
+    settings.pulseIrregularity = settingsJson.value(
+        "pulse_irregularity",
+        settings.pulseIrregularity);
     if (settingsJson.contains("blend_mode")) {
         settings.blendMode = ParseWaterEffectBlendMode(settingsJson.at("blend_mode"));
     }

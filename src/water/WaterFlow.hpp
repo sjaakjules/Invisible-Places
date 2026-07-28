@@ -139,7 +139,8 @@ enum class WaterSeepageQuality {
 enum class WaterSeepagePattern {
     WetRockSheen,
     ChaoticBloom,
-    WettingTrickle
+    WettingTrickle,
+    ContourPulses
 };
 
 enum class WaterScenarioInterpolation {
@@ -248,6 +249,10 @@ struct WaterSeepageLookSettings {
     float tricklePatchSizeMeters = 0.08F;
     float trickleWidthMeters = 0.018F;
     float trickleFrontSoftness = 0.10F;
+    float pulseSpacingMeters = 0.18F;
+    float pulseWidthMeters = 0.055F;
+    float pulseSpeedMetersPerSecond = 0.12F;
+    float pulseIrregularity = 0.38F;
     WaterEffectResponseSettings response{
         .intensity = 0.85F,
         .emissionAdd = 0.35F,

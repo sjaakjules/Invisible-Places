@@ -9469,6 +9469,7 @@ void SeedWaterSeepageProfilePresets(WaterWorkflowState* water) {
     upsertLook("Wet Rock_preset", WaterSeepagePattern::WetRockSheen);
     upsertLook("Chaotic Bloom_preset", WaterSeepagePattern::ChaoticBloom);
     upsertLook("Wetting Trickle_preset", WaterSeepagePattern::WettingTrickle);
+    upsertLook("Contour Pulses_preset", WaterSeepagePattern::ContourPulses);
 
     const auto upsertResponse = [&](std::string_view name, float intensityScale) {
         WaterSeepageResponseProfile profile;
@@ -40332,6 +40333,8 @@ const char* WaterSeepagePatternLabel(WaterSeepagePattern pattern) {
             return "Chaotic Bloom";
         case WaterSeepagePattern::WettingTrickle:
             return "Wetting Trickle";
+        case WaterSeepagePattern::ContourPulses:
+            return "Contour Pulses";
     }
     return "Chaotic Bloom";
 }
@@ -40402,17 +40405,19 @@ bool DrawWaterSeepageSettingsControls(WaterSeepageLookSettings* look) {
         }
         ImGui::EndCombo();
     }
-    constexpr std::array<WaterSeepagePattern, 3> patterns{{
+    constexpr std::array<WaterSeepagePattern, 4> patterns{{
         WaterSeepagePattern::WetRockSheen,
         WaterSeepagePattern::ChaoticBloom,
         WaterSeepagePattern::WettingTrickle,
+        WaterSeepagePattern::ContourPulses,
     }};
     const bool patternOpen = ImGui::BeginCombo("Pattern", WaterSeepagePatternLabel(look->pattern));
     tooltip(
         "Chooses the Seepage algorithm. Wet Rock Sheen "
         "uses stable world-space damp patches and angle-dependent reflection; Chaotic Bloom "
         "uses irregular ridged lobes; Wetting Trickle saturates small patches before short, "
-        "irregular fingers reveal downhill.");
+        "irregular fingers reveal downhill; Contour Pulses sends softly blended irregular "
+        "fronts down the same least-resistance support used by Node Strength.");
     if (patternOpen) {
         for (const auto pattern : patterns) {
             const bool selected = look->pattern == pattern;
@@ -40581,11 +40586,59 @@ bool DrawWaterSeepageSettingsControls(WaterSeepageLookSettings* look) {
                 "Controls slow internal change within saturated patches. Keep this low for a "
                 "subtle damp-rock response during long camera pans.");
             break;
+
+        case WaterSeepagePattern::ContourPulses:
+            ImGui::SeparatorText("Contour Pulse Pattern");
+            slider(
+                "Pulse Spacing",
+                &look->pulseSpacingMeters,
+                0.01F,
+                2.0F,
+                "%.3f m",
+                "Sets the downstream distance between wet-intensity fronts. Distance is "
+                "measured over connected surface support rather than in world Z, so fronts "
+                "bend around the rock contour.",
+                ImGuiSliderFlags_Logarithmic);
+            slider(
+                "Pulse Width",
+                &look->pulseWidthMeters,
+                0.002F,
+                0.50F,
+                "%.3f m",
+                "Sets how broadly each front blends into the damp surface. Wider values "
+                "create gentle swells; narrow values read as sharper wave lines.",
+                ImGuiSliderFlags_Logarithmic);
+            slider(
+                "Pulse Speed",
+                &look->pulseSpeedMetersPerSecond,
+                0.0F,
+                0.75F,
+                "%.3f m/s",
+                "Controls how quickly fronts travel from the node down the least-resistance "
+                "surface metric. A quieter secondary train moves at a slightly different speed.");
+            slider(
+                "Front Irregularity",
+                &look->pulseIrregularity,
+                0.0F,
+                1.0F,
+                "%.2f",
+                "Wrinkles each front with stable 3D noise, delays its side edges, and varies "
+                "local speed. Zero is smooth and regular; higher values split and reconnect.");
+            slider(
+                "Evolution",
+                &look->evolution,
+                0.0F,
+                1.0F,
+                "%.3f",
+                "Slowly evolves the irregular front shape independently of downhill travel. "
+                "Keep this modest for coherent waves during a long camera pan.");
+            break;
     }
 
     if (look->pattern == WaterSeepagePattern::WetRockSheen ||
         look->pattern == WaterSeepagePattern::ChaoticBloom ||
-        look->pattern == WaterSeepagePattern::WettingTrickle) {
+        look->pattern == WaterSeepagePattern::WettingTrickle ||
+        look->pattern == WaterSeepagePattern::ContourPulses) {
         ImGui::SeparatorText("Angle-Dependent Reflection");
         slider(
             "Roughness",

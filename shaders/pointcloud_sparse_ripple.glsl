@@ -33,10 +33,11 @@ struct SparseRippleComposite {
 };
 
 struct SeepageLook {
-    // x: pattern (0 wet rock, 1 chaotic bloom, 2 wetting trickle), y: blend mode.
+    // x: pattern (0 wet rock, 1 chaotic bloom, 2 wetting trickle,
+    // 3 contour pulses), y: blend mode.
     uvec4 control;
-    // legacy0 lanes are spare (layout retained from the removed legacy-ripple
-    // pattern); legacy1 carries z: density, w: response intensity.
+    // Contour Pulses: x spacing, y width, z speed, w irregularity.
+    // legacy1 carries z: density, w: response intensity.
     vec4 legacy0;
     vec4 legacy1;
     vec4 response0;
@@ -1884,6 +1885,12 @@ vec4 SeepageLookLegacy1(uint nodeIndex, bool transition) {
                : seepageParamData.seepageParams[nodeIndex].look.legacy1;
 }
 
+vec4 SeepageLookLegacy0(uint nodeIndex, bool transition) {
+    return transition
+               ? seepageParamData.seepageParams[nodeIndex].transitionLook.legacy0
+               : seepageParamData.seepageParams[nodeIndex].look.legacy0;
+}
+
 vec4 SeepageLookResponse0(uint nodeIndex, bool transition) {
     return transition
                ? seepageParamData.seepageParams[nodeIndex].transitionLook.response0
@@ -2108,6 +2115,17 @@ float SeepageReflectionSignal(
         1.0);
 }
 
+float SeepagePulseTrain(
+    float coordinateMeters,
+    float spacingMeters,
+    float widthMeters) {
+    const float spacing = max(0.005, spacingMeters);
+    const float width = clamp(widthMeters, 0.001, spacing * 0.49);
+    const float wrapped = coordinateMeters - floor(coordinateMeters / spacing) * spacing;
+    const float distanceToFront = min(wrapped, spacing - wrapped);
+    return clamp(1.0 - smoothstep(width * 0.22, width, distanceToFront), 0.0, 1.0);
+}
+
 vec3 SeepagePatternSignals(
     uint nodeIndex,
     bool transition,
@@ -2122,6 +2140,7 @@ vec3 SeepagePatternSignals(
     float effectiveHalfWidth,
     float fanMask) {
     const uvec4 lookControl = SeepageLookControl(nodeIndex, transition);
+    const vec4 legacy0 = SeepageLookLegacy0(nodeIndex, transition);
     const vec4 legacy1 = SeepageLookLegacy1(nodeIndex, transition);
     const vec4 response2 = SeepageLookResponse2(nodeIndex, transition);
     const vec4 organic0 = SeepageLookOrganic0(nodeIndex, transition);
@@ -2147,6 +2166,82 @@ vec3 SeepagePatternSignals(
         seepageParamData.seepageParams[nodeIndex].noiseBasis[0].xyz,
         seepageParamData.seepageParams[nodeIndex].noiseBasis[1].xyz,
         seepageParamData.seepageParams[nodeIndex].noiseBasis[2].xyz);
+    if (lookControl.x == 3u) {
+        const float spacing = max(0.005, legacy0.x);
+        const float width = clamp(legacy0.y, 0.001, spacing * 0.49);
+        const float speed = max(0.0, legacy0.z);
+        const float irregularity = clamp(legacy0.w, 0.0, 1.0);
+        const float downstream = max(0.0, downstreamDistance);
+        const float lateralNormalised = clamp(
+            signedLateralDistance / max(0.001, effectiveHalfWidth),
+            -1.5,
+            1.5);
+        vec3 coordinate = noiseRotation * (worldPosition / (spacing * 1.65));
+        coordinate += vec3(0.017, -0.013, 0.011) * (time * organic0.z);
+        const SeepageNoise3Sample frontNoise = SeepageFractalNoise3(
+            coordinate,
+            proceduralSeed + 17431u,
+            seepageParamData.seepageParams[nodeIndex].control.y);
+        const float centredNoise = frontNoise.value * 2.0 - 1.0;
+        const float bowedFront =
+            pow(abs(lateralNormalised), 1.35) *
+            spacing * (0.10 + irregularity * 0.28);
+        const float frontWarp =
+            centredNoise * spacing * irregularity * 0.42;
+        const float warpedDownstream = downstream + bowedFront + frontWarp;
+        const float primarySpeed =
+            speed * (1.0 + centredNoise * irregularity * 0.09);
+        const float secondarySpeed =
+            speed * (1.06 - centredNoise * irregularity * 0.075);
+        const float seedPhase = SeepageNoiseHash01(
+            int(seepageNodeData.seepageNodes[nodeIndex].control.x),
+            int(seepageParamData.seepageParams[nodeIndex].control.w),
+            proceduralSeed + 19009u);
+        const float primaryPulse = SeepagePulseTrain(
+            warpedDownstream - time * primarySpeed,
+            spacing,
+            width);
+        const float secondaryPulse = SeepagePulseTrain(
+            downstream + bowedFront * 0.62 - frontWarp * 0.55 -
+                time * secondarySpeed + spacing * (0.34 + seedPhase * 0.20),
+            spacing * 1.23,
+            width * 1.18);
+        const float pulse = max(primaryPulse, secondaryPulse * 0.58);
+        const float coverageThreshold = 0.72 - density * 0.38;
+        const float dampPatch = smoothstep(
+            coverageThreshold,
+            coverageThreshold + 0.24,
+            frontNoise.value);
+        const vec3 resolvedNormal =
+            styleData.pointMeta.z != 0u && dot(pointNormal, pointNormal) > 1e-8
+                ? normalize(pointNormal)
+                : RippleSafeNormal(surfaceNormal);
+        const vec3 worldGradient = transpose(noiseRotation) * frontNoise.gradient;
+        const float reflection = SeepageReflectionSignal(
+            nodeIndex,
+            transition,
+            worldPosition,
+            resolvedNormal,
+            worldGradient,
+            max(pulse, dampPatch * 0.35));
+        return vec3(
+            clamp(
+                strengthMask * wetness *
+                    (0.54 + dampPatch * 0.25 +
+                     pulse * (0.18 + rainGain * 0.08)),
+                0.0,
+                1.0),
+            clamp(
+                strengthMask * pulse * (0.32 + dampPatch * 0.30),
+                0.0,
+                1.0),
+            clamp(
+                strengthMask *
+                    (pulse * 0.72 + dampPatch * 0.18) *
+                    response2.z * reflection,
+                0.0,
+                1.0));
+    }
     if (lookControl.x == 2u) {
         const uint quality = seepageParamData.seepageParams[nodeIndex].control.y;
         // The trickle run is the strength- and slope-shaped envelope reach;
