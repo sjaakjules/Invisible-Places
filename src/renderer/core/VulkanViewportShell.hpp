@@ -3,6 +3,7 @@
 #include "io/GaussianSplatData.hpp"
 #include "io/PointCloudData.hpp"
 #include "output/ExrWriter.hpp"
+#include "renderer/core/FrameTiming.hpp"
 #include "renderer/gsplat/GsplatLayer.hpp"
 #include "renderer/gsplat/HighQualityGaussianScene.hpp"
 #include "renderer/pointcloud/PointCloudPreviewState.hpp"
@@ -10,6 +11,7 @@
 #include "water/WaterFlow.hpp"
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -30,6 +32,12 @@ namespace invisible_places::renderer::core {
 
 inline constexpr std::uint64_t kWaterSurfaceUploadStagingLimitBytes =
     64ULL * 1024ULL * 1024ULL;
+
+struct GpuPhaseDiagnostics {
+    double milliseconds = 0.0;
+    double averageMilliseconds = 0.0;
+    bool active = false;
+};
 
 struct ViewportDiagnostics {
     std::string rendererName;
@@ -59,7 +67,20 @@ struct ViewportDiagnostics {
     double pointCommandRecordMs = 0.0;
     std::uint32_t framesInFlight = 0;
     std::uint32_t swapchainImageCount = 0;
+    std::uint32_t requestedSwapchainImageCount = 0;
+    std::string presentMode;
     std::uint32_t currentFrameIndex = 0;
+    std::uint32_t submittedFrameSlot = 0;
+    std::uint32_t submittedImageIndex = 0;
+    std::uint32_t completedFrameSlot = 0;
+    std::uint32_t completedImageIndex = 0;
+    std::uint32_t imageWaitImageIndex = 0;
+    std::uint32_t imageWaitOwnerFrameSlot = 0;
+    std::uint64_t submittedSubmissionSerial = 0;
+    std::uint64_t completedSubmissionSerial = 0;
+    std::uint64_t imageWaitOwnerSubmissionSerial = 0;
+    std::uint64_t staleImageOwnerCount = 0;
+    bool imageOwnerWaited = false;
     double frameRenderMs = 0.0;
     double averageFrameRenderMs = 0.0;
     double minFrameRenderMs = 0.0;
@@ -68,14 +89,45 @@ struct ViewportDiagnostics {
     double averageFrameFps = 0.0;
     double frameAverageWindowSeconds = 0.5;
     double frameUiRenderMs = 0.0;
+    double averageFrameUiRenderMs = 0.0;
     double frameFenceWaitMs = 0.0;
+    double averageFrameFenceWaitMs = 0.0;
+    double frameCompletedMaintenanceMs = 0.0;
+    double averageFrameCompletedMaintenanceMs = 0.0;
     double frameAcquireMs = 0.0;
+    double averageFrameAcquireMs = 0.0;
     double frameImageWaitMs = 0.0;
+    double averageFrameImageWaitMs = 0.0;
     double framePrepareMs = 0.0;
+    double frameHighQualityGaussianPrepareMs = 0.0;
+    double averageFrameHighQualityGaussianPrepareMs = 0.0;
+    double frameUniformResourceUploadMs = 0.0;
+    double averageFrameUniformResourceUploadMs = 0.0;
+    double frameResetRetirePollingMs = 0.0;
+    double averageFrameResetRetirePollingMs = 0.0;
     double frameCommandBufferMs = 0.0;
+    double averageFrameCommandBufferMs = 0.0;
     double frameSubmitMs = 0.0;
+    double averageFrameSubmitMs = 0.0;
     double framePresentMs = 0.0;
+    double averageFramePresentMs = 0.0;
     double framePlatformWindowsMs = 0.0;
+    double averageFramePlatformWindowsMs = 0.0;
+    bool gpuTimestampsSupported = false;
+    bool gpuTimestampResultsAvailable = false;
+    std::uint64_t gpuTimestampUnavailableResultCount = 0;
+    std::uint32_t gpuTimestampValidBits = 0;
+    double gpuTimestampPeriodNanoseconds = 0.0;
+    std::uint32_t gpuResultLatencyFrames = 0;
+    GpuPhaseDiagnostics gpuTotal{};
+    GpuPhaseDiagnostics gpuRainCompute{};
+    GpuPhaseDiagnostics gpuDepth{};
+    GpuPhaseDiagnostics gpuWeightedAccumulation{};
+    GpuPhaseDiagnostics gpuComposite{};
+    GpuPhaseDiagnostics gpuOpaqueAndHighQuality{};
+    GpuPhaseDiagnostics gpuPostProcess{};
+    GpuPhaseDiagnostics gpuImGui{};
+    GpuPhaseDiagnostics gpuDynamicMeshFlow{};
     std::uint32_t rainActiveParticleCount = 0U;
     std::uint32_t rainImpactOverflowCount = 0U;
     std::uint32_t rainEventsEmittedThisFrame = 0U;
@@ -632,6 +684,8 @@ class VulkanViewportShell {
         std::array<VkDescriptorSet, kDynamicMeshFlowLiveSlots> dynamicMeshFlowDescriptorSets{};
         std::array<VkFence, kDynamicMeshFlowLiveSlots> dynamicMeshFlowDispatchFences{};
         std::array<VkCommandBuffer, kDynamicMeshFlowLiveSlots> dynamicMeshFlowCommandBuffers{};
+        std::array<VkQueryPool, kDynamicMeshFlowLiveSlots> dynamicMeshFlowTimestampQueryPools{};
+        std::array<bool, kDynamicMeshFlowLiveSlots> dynamicMeshFlowTimestampPending{};
         VkDescriptorPool dynamicMeshFlowDescriptorPool = VK_NULL_HANDLE;
         BufferAllocation waterFlowSourceUniformBuffer{};
         BufferAllocation waterFlowSourceInputBuffer{};
@@ -785,8 +839,35 @@ class VulkanViewportShell {
         BufferAllocation uniformBuffer{};
         VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
         VkSemaphore imageAvailableSemaphore = VK_NULL_HANDLE;
-        VkSemaphore renderFinishedSemaphore = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
+        VkQueryPool timestampQueryPool = VK_NULL_HANDLE;
+        std::uint64_t activeSubmissionSerial = 0U;
+        std::uint64_t completedSubmissionSerial = 0U;
+        std::uint32_t submittedImageIndex = 0U;
+        bool timestampPending = false;
+        std::uint32_t timestampActiveMask = 0U;
+    };
+
+    static constexpr std::uint32_t kFrameTimestampQueryCount = 9U;
+    enum FrameTimestampQuery : std::uint32_t {
+        kTimestampFrameStart = 0U,
+        kTimestampRainEnd,
+        kTimestampDepthEnd,
+        kTimestampWeightedEnd,
+        kTimestampCompositeEnd,
+        kTimestampOpaqueEnd,
+        kTimestampPostProcessEnd,
+        kTimestampImGuiEnd,
+        kTimestampFrameEnd,
+    };
+    enum GpuPhaseActiveBit : std::uint32_t {
+        kGpuPhaseRainActive = 1U << 0U,
+        kGpuPhaseDepthActive = 1U << 1U,
+        kGpuPhaseWeightedActive = 1U << 2U,
+        kGpuPhaseCompositeActive = 1U << 3U,
+        kGpuPhaseOpaqueActive = 1U << 4U,
+        kGpuPhasePostProcessActive = 1U << 5U,
+        kGpuPhaseImGuiActive = 1U << 6U,
     };
 
     struct HighQualityGaussianSceneResources {
@@ -1014,6 +1095,11 @@ class VulkanViewportShell {
     void CreateCommandPool();
     void CreateCommandBuffers();
     void CreateSyncObjects();
+    void CreateSwapchainRenderFinishedSemaphores();
+    void DestroySwapchainRenderFinishedSemaphores();
+    void ReadCompletedFrameTimestamps(std::size_t frameIndex);
+    void UpdateCpuTimingAverages();
+    void UpdateGpuTimingAverages();
     void CreateImGuiResources();
     void UploadImGuiFonts();
     void UpdateRainDescriptorSets();
@@ -1256,7 +1342,8 @@ class VulkanViewportShell {
     std::vector<VkImageView> imageViews_;
     std::vector<VkFramebuffer> framebuffers_;
     std::vector<VkFramebuffer> presentFramebuffers_;
-    std::vector<VkFence> swapchainImagesInFlight_;
+    std::vector<SwapchainImageOwner> swapchainImageOwners_;
+    std::vector<VkSemaphore> swapchainRenderFinishedSemaphores_;
 
     std::uint32_t graphicsQueueFamily_ = 0;
     std::uint32_t presentQueueFamily_ = 0;
@@ -1269,6 +1356,20 @@ class VulkanViewportShell {
 
     std::array<FrameResources, kFramesInFlight> frameResources_{};
     std::size_t currentFrameIndex_ = 0;
+    std::uint64_t nextSubmissionSerial_ = 1U;
+    VkPresentModeKHR selectedPresentMode_ = VK_PRESENT_MODE_FIFO_KHR;
+    std::uint32_t requestedSwapchainImageCount_ = 0U;
+    bool gpuTimestampsSupported_ = false;
+    std::uint32_t gpuTimestampValidBits_ = 0U;
+    double gpuTimestampPeriodNanoseconds_ = 0.0;
+    RollingPhaseAverages<12> cpuTimingWindow_{};
+    RollingPhaseAverages<8> gpuTimingWindow_{};
+    RollingPhaseAverages<1> dynamicMeshFlowTimingWindow_{};
+    std::chrono::steady_clock::time_point lastGpuTimingSampleAt_{};
+    std::chrono::steady_clock::time_point
+        lastDynamicMeshFlowTimingSampleAt_{};
+    std::uint64_t dynamicMeshFlowTimingResultGeneration_ = 0U;
+    std::uint64_t dynamicMeshFlowTimingPublishedGeneration_ = 0U;
     std::vector<ImageAllocation> depthImages_;
     std::vector<ImageAllocation> sceneColorImages_;
     std::vector<ImageAllocation> accumulationImages_;

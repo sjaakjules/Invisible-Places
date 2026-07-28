@@ -285,7 +285,7 @@ Export jobs freeze the animation track and per-node tracks, delayed Seepage Rain
 
 Seepage creates no generated PLY or growing point overlay: nodes/default/profile/scenario state serialize in project data and nodes/looks serialize in `water_sources.json`, while connected support, the spatial grid, and GPU buffers are transient and derived after load.
 
-Native SampleScene and Scene1 integration smokes exercise visible-depth/cache placement, connected-only selection, actual-cell Structure Overlay diagnostics, compact GPU upload, and parameter-only reach/width/prominence/activity/wetting/Rain changes. They also verify that a 120-second state cycle does not scan cache sources, rebuild support, upload topology, attach descriptors, or create density-specific topology.
+Native SampleScene and Scene3 integration smokes exercise visible-depth/cache placement, connected-only selection, actual-cell Structure Overlay diagnostics, compact GPU upload, and parameter-only reach/width/prominence/activity/wetting/Rain changes. They also verify that an authored state cycle does not scan cache sources, rebuild support, upload topology, attach descriptors, or create density-specific topology.
 
 ### Future improvement: optional mesh-assisted connectivity (not implemented)
 
@@ -414,7 +414,7 @@ Rain visual presets `Rain Mist`, `Rain Fine Lines`, and `Rain Downpour` control 
 
 The software fallback uses `OfflineRainSimulationState`: it advances one deterministic `RainSimulator` and builds one role impact grid per output frame, then shares the immutable particle/event frame across every tile. It does not re-simulate rain or rebuild events per tile.
 
-Native GPU Rain validation remains available through `--gui-smoke rain-gpu-sample-scene` and `--gui-smoke rain-gpu-scene1-3mm`. Cross-feature integration uses `--gui-smoke water-integration-sample-scene` with `Saved/validation/SampleSceneValidation_project.json` and `--gui-smoke water-integration-scene1-top-view` with `Saved/exhibitionScene_project.json`/`Top_View`. These scenarios verify display-first startup, one shared-surface upload, responsive edits, and export sampling without per-frame topology work.
+Native GPU Rain validation remains available through `--gui-smoke rain-gpu-sample-scene` and `--gui-smoke rain-gpu-scene3-5mm`. Cross-feature integration uses `--gui-smoke water-integration-sample-scene` with the lightweight validation project and tracked animation under `tests/fixtures`, and the separately labelled full-site `--gui-smoke water-integration-scene3-exhibition` with `Saved/ExhibitionFinal_project.json`/`Exhibition`. These scenarios verify display-first startup, one shared-surface upload, responsive edits, and export sampling without per-frame topology work.
 
 ## Trail Surfel Scalar Contract
 

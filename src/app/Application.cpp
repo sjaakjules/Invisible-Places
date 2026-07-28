@@ -2,6 +2,7 @@
 
 #include "app/ManualFlowPathEditMath.hpp"
 #include "app/PointVisualSelection.hpp"
+#include "app/WaterSurfaceCacheReadiness.hpp"
 #include "app/WaterPathDiagnostics.hpp"
 #include "camera/AnimationPath.hpp"
 #include "camera/CameraPath.hpp"
@@ -37,6 +38,7 @@
 #include "water/WaterFlow.hpp"
 
 #include <imgui.h>
+#include <GLFW/glfw3.h>
 
 #include <algorithm>
 #include <array>
@@ -17066,12 +17068,13 @@ void EnsureWaterSurfaceCacheReady(
     }
     if (runtimeState->water.waterSurfaceCachePreprocessPending) {
         const auto surfaceView = viewport->WaterSurfaceFlowView();
+        const auto groundView = viewport->WaterGroundFlowView();
         const auto& installedCache = runtimeState->water.waterSurfaceCache;
-        if (viewport->WaterSurfaceUploadPending() ||
-            installedCache == nullptr ||
-            !surfaceView.valid || !surfaceView.preprocessingComplete ||
-            surfaceView.cacheIdentity == nullptr ||
-            *surfaceView.cacheIdentity != installedCache->cacheIdentity) {
+        if (!WaterSurfaceResidentTablesReady(
+                installedCache.get(),
+                surfaceView,
+                groundView,
+                viewport->WaterSurfaceUploadPending())) {
             return;
         }
         runtimeState->water.waterSurfaceCachePreprocessPending = false;
@@ -42329,10 +42332,16 @@ void DrawDebugGeneralSection(
             diagnostics.accumulationHeight);
         if (diagnostics.framesInFlight > 0U) {
             ImGui::Text(
-                "Frames: %u in flight, %u swapchain images, current %u",
+                "Frames: %u in flight, %u / %u swapchain images, current %u",
                 diagnostics.framesInFlight,
+                diagnostics.requestedSwapchainImageCount,
                 diagnostics.swapchainImageCount,
                 diagnostics.currentFrameIndex);
+            ImGui::Text(
+                "Present mode: %s",
+                diagnostics.presentMode.empty()
+                    ? "Unknown"
+                    : diagnostics.presentMode.c_str());
         }
         ImGui::Checkbox("Pause 3D View During Export", &runtimeState->pauseLiveViewportDuringExport);
         EndPanelSection();
@@ -42340,7 +42349,7 @@ void DrawDebugGeneralSection(
 
     if (BeginPanelSection("Frame Timing")) {
         ImGui::Text(
-            "Render frame: %.3f ms (%.1f FPS)",
+            "CPU - current Renderer DrawFrame: %.3f ms (%.1f FPS)",
             diagnostics.frameRenderMs,
             diagnostics.frameFps);
         ImGui::Text(
@@ -42353,15 +42362,136 @@ void DrawDebugGeneralSection(
             diagnostics.minFrameRenderMs,
             diagnostics.maxFrameRenderMs);
         ImGui::Separator();
-        ImGui::Text("UI render: %.3f ms", diagnostics.frameUiRenderMs);
-        ImGui::Text("Fence wait: %.3f ms", diagnostics.frameFenceWaitMs);
-        ImGui::Text("Prepare uniforms/resources: %.3f ms", diagnostics.framePrepareMs);
-        ImGui::Text("Acquire image: %.3f ms", diagnostics.frameAcquireMs);
-        ImGui::Text("Acquired image wait: %.3f ms", diagnostics.frameImageWaitMs);
-        ImGui::Text("Command buffer: %.3f ms", diagnostics.frameCommandBufferMs);
-        ImGui::Text("Queue submit: %.3f ms", diagnostics.frameSubmitMs);
-        ImGui::Text("Present: %.3f ms", diagnostics.framePresentMs);
-        ImGui::Text("Platform windows: %.3f ms", diagnostics.framePlatformWindowsMs);
+        ImGui::TextDisabled("CPU orchestration");
+        const auto drawCpuPhase =
+            [](const char* label, double milliseconds, double averageMilliseconds) {
+                ImGui::Text(
+                    "%s: %.3f ms (%.3f ms avg)",
+                    label,
+                    milliseconds,
+                    averageMilliseconds);
+            };
+        drawCpuPhase(
+            "ImGui finalization",
+            diagnostics.frameUiRenderMs,
+            diagnostics.averageFrameUiRenderMs);
+        drawCpuPhase(
+            "Frame-slot fence wait",
+            diagnostics.frameFenceWaitMs,
+            diagnostics.averageFrameFenceWaitMs);
+        drawCpuPhase(
+            "Completed-frame maintenance",
+            diagnostics.frameCompletedMaintenanceMs,
+            diagnostics.averageFrameCompletedMaintenanceMs);
+        drawCpuPhase(
+            "HQ Gaussian prepare",
+            diagnostics.frameHighQualityGaussianPrepareMs,
+            diagnostics.averageFrameHighQualityGaussianPrepareMs);
+        drawCpuPhase(
+            "Uniform/resource upload",
+            diagnostics.frameUniformResourceUploadMs,
+            diagnostics.averageFrameUniformResourceUploadMs);
+        drawCpuPhase(
+            "Acquire call",
+            diagnostics.frameAcquireMs,
+            diagnostics.averageFrameAcquireMs);
+        drawCpuPhase(
+            "Image-owner wait",
+            diagnostics.frameImageWaitMs,
+            diagnostics.averageFrameImageWaitMs);
+        drawCpuPhase(
+            "Reset / retire polling",
+            diagnostics.frameResetRetirePollingMs,
+            diagnostics.averageFrameResetRetirePollingMs);
+        drawCpuPhase(
+            "Command encoding",
+            diagnostics.frameCommandBufferMs,
+            diagnostics.averageFrameCommandBufferMs);
+        drawCpuPhase(
+            "Queue submit",
+            diagnostics.frameSubmitMs,
+            diagnostics.averageFrameSubmitMs);
+        drawCpuPhase(
+            "Present call",
+            diagnostics.framePresentMs,
+            diagnostics.averageFramePresentMs);
+        drawCpuPhase(
+            "Platform windows",
+            diagnostics.framePlatformWindowsMs,
+            diagnostics.averageFramePlatformWindowsMs);
+        ImGui::Separator();
+        ImGui::TextDisabled("Synchronization");
+        ImGui::Text(
+            "Submitted: serial %llu, slot %u, image %u",
+            static_cast<unsigned long long>(
+                diagnostics.submittedSubmissionSerial),
+            diagnostics.submittedFrameSlot,
+            diagnostics.submittedImageIndex);
+        ImGui::Text(
+            "Completed: serial %llu, slot %u, image %u",
+            static_cast<unsigned long long>(
+                diagnostics.completedSubmissionSerial),
+            diagnostics.completedFrameSlot,
+            diagnostics.completedImageIndex);
+        if (diagnostics.imageOwnerWaited) {
+            ImGui::Text(
+                "Waited for owner: serial %llu, slot %u, image %u",
+                static_cast<unsigned long long>(
+                    diagnostics.imageWaitOwnerSubmissionSerial),
+                diagnostics.imageWaitOwnerFrameSlot,
+                diagnostics.imageWaitImageIndex);
+        } else {
+            ImGui::TextDisabled("Image owner was already complete.");
+        }
+        ImGui::Text(
+            "Stale image owners discarded: %llu",
+            static_cast<unsigned long long>(
+                diagnostics.staleImageOwnerCount));
+        ImGui::Separator();
+        ImGui::TextDisabled("GPU - last completed submission");
+        if (!diagnostics.gpuTimestampsSupported) {
+            ImGui::TextWrapped(
+                "GPU timestamps are unavailable on this queue; CPU and "
+                "synchronization timings remain active.");
+        } else if (!diagnostics.gpuTimestampResultsAvailable) {
+            ImGui::Text(
+                "Waiting for a completed timestamp result (%u-frame latency).",
+                diagnostics.gpuResultLatencyFrames);
+        } else {
+            const auto drawGpuPhase =
+                [](const char* label,
+                   const invisible_places::renderer::core::GpuPhaseDiagnostics& phase) {
+                    if (phase.active) {
+                        ImGui::Text(
+                            "%s: %.3f ms (%.3f ms avg)",
+                            label,
+                            phase.milliseconds,
+                            phase.averageMilliseconds);
+                    } else {
+                        ImGui::TextDisabled("%s: inactive", label);
+                    }
+                };
+            drawGpuPhase("Total", diagnostics.gpuTotal);
+            drawGpuPhase("Rain compute", diagnostics.gpuRainCompute);
+            drawGpuPhase("Depth", diagnostics.gpuDepth);
+            drawGpuPhase(
+                "Weighted accumulation",
+                diagnostics.gpuWeightedAccumulation);
+            drawGpuPhase("Composite", diagnostics.gpuComposite);
+            drawGpuPhase(
+                "Opaque / Fast / HQ Gaussian",
+                diagnostics.gpuOpaqueAndHighQuality);
+            drawGpuPhase("Postprocess / EDL", diagnostics.gpuPostProcess);
+            drawGpuPhase("ImGui / present pass", diagnostics.gpuImGui);
+            drawGpuPhase(
+                "Dynamic Mesh Flow (preceding submission)",
+                diagnostics.gpuDynamicMeshFlow);
+            ImGui::TextDisabled(
+                "%u-frame result latency; %u valid bits, %.3f ns/tick",
+                diagnostics.gpuResultLatencyFrames,
+                diagnostics.gpuTimestampValidBits,
+                diagnostics.gpuTimestampPeriodNanoseconds);
+        }
         EndPanelSection();
     }
 }
@@ -45787,14 +45917,14 @@ int RunExportCodecBenchmark(
         std::cerr << "Export benchmark requires a live Vulkan window and viewport.\n";
         return 2;
     }
-    if (options.scenario != "top-view-codecs") {
+    if (options.scenario != "exhibition-codecs") {
         std::cerr << "Unknown export benchmark scenario: " << options.scenario << "\n";
         return 2;
     }
 
     const auto outputDirectory =
         options.outputDirectory.empty()
-            ? DefaultRenderOutputDirectory(dataRoot) / "benchmarks" / "top-view-codecs"
+            ? DefaultRenderOutputDirectory(dataRoot) / "benchmarks" / "exhibition-codecs"
             : options.outputDirectory;
     std::error_code createError;
     std::filesystem::create_directories(outputDirectory, createError);
@@ -45812,9 +45942,9 @@ int RunExportCodecBenchmark(
         return 1;
     }
 
-    const auto topViewPath = DefaultAnimationDirectory(dataRoot) / "Top_View.ipanim.json";
-    if (!LoadAnimationPathFromFile(runtimeState, topViewPath)) {
-        std::cerr << "Failed to load Top_View animation: " << runtimeState->errorMessage << "\n";
+    const auto exhibitionPath = DefaultAnimationDirectory(dataRoot) / "Exhibition.ipanim.json";
+    if (!LoadAnimationPathFromFile(runtimeState, exhibitionPath)) {
+        std::cerr << "Failed to load Exhibition animation: " << runtimeState->errorMessage << "\n";
         return 1;
     }
 
@@ -45887,7 +46017,7 @@ int RunExportCodecBenchmark(
             outputDirectory,
             results,
             options.scenario,
-            "Top_View",
+            "Exhibition",
             "Roughness-Ghost");
         if (!results.back().notes.empty() && results.back().status != "ok") {
             break;
@@ -45899,7 +46029,7 @@ int RunExportCodecBenchmark(
         outputDirectory,
         results,
         options.scenario,
-        "Top_View",
+        "Exhibition",
         "Roughness-Ghost");
     std::cout << "Benchmark report: " << (outputDirectory / "benchmark_results.md").string() << "\n";
     return std::all_of(
@@ -46011,6 +46141,7 @@ struct GuiSmokeReport {
     std::size_t sparseRippleEffectCount = 0;
     std::size_t sparseRippleRegionCount = 0;
     std::size_t regionVertexCount = 0;
+    std::size_t seepageGpuBytes = 0;
     double paramsOnlyUpdateMs = 0.0;
     double dynamicMeshWarmMoveTotalMs = 0.0;
     double dynamicMeshWarmMoveAverageMs = 0.0;
@@ -46094,6 +46225,7 @@ bool WriteGuiSmokeReport(const GuiSmokeReport& report) {
     output << "  \"sparse_ripple_effect_count\": " << report.sparseRippleEffectCount << ",\n";
     output << "  \"sparse_ripple_region_count\": " << report.sparseRippleRegionCount << ",\n";
     output << "  \"region_vertex_count\": " << report.regionVertexCount << ",\n";
+    output << "  \"seepage_gpu_bytes\": " << report.seepageGpuBytes << ",\n";
     output << "  \"params_only_update_ms\": " << FormatFixed(report.paramsOnlyUpdateMs, 3) << ",\n";
     output << "  \"dynamic_mesh_warm_move_total_ms\": " << FormatFixed(report.dynamicMeshWarmMoveTotalMs, 3) << ",\n";
     output << "  \"dynamic_mesh_warm_move_average_ms\": " << FormatFixed(report.dynamicMeshWarmMoveAverageMs, 3) << ",\n";
@@ -46855,6 +46987,565 @@ int RunWaterRegionSampleTerrestrialSmoke(
     return finish();
 }
 
+struct RendererImageOwnerWaitSample {
+    std::uint64_t submissionSerial = 0U;
+    std::uint32_t imageIndex = 0U;
+    std::uint32_t frameSlot = 0U;
+    double milliseconds = 0.0;
+};
+
+struct RendererFrameTimingSamples {
+    std::vector<double> cpuMilliseconds;
+    std::vector<double> cpuUiFinalizeMilliseconds;
+    std::vector<double> cpuFrameSlotFenceWaitMilliseconds;
+    std::vector<double> cpuCompletedMaintenanceMilliseconds;
+    std::vector<double> cpuHighQualityGaussianPrepareMilliseconds;
+    std::vector<double> cpuUniformResourceUploadMilliseconds;
+    std::vector<double> cpuAcquireMilliseconds;
+    std::vector<double> imageOwnerWaitMilliseconds;
+    std::vector<double> cpuResetRetirePollingMilliseconds;
+    std::vector<double> cpuCommandEncodingMilliseconds;
+    std::vector<double> cpuSubmitMilliseconds;
+    std::vector<double> cpuPresentMilliseconds;
+    std::vector<double> cpuPlatformWindowsMilliseconds;
+    std::vector<RendererImageOwnerWaitSample> imageOwnerWaits;
+    std::vector<double> gpuMilliseconds;
+    std::vector<double> gpuRainComputeMilliseconds;
+    std::vector<double> gpuDepthMilliseconds;
+    std::vector<double> gpuWeightedAccumulationMilliseconds;
+    std::vector<double> gpuCompositeMilliseconds;
+    std::vector<double> gpuOpaqueAndHighQualityMilliseconds;
+    std::vector<double> gpuPostProcessMilliseconds;
+    std::vector<double> gpuImGuiMilliseconds;
+};
+
+nlohmann::json RendererFrameTimingSampleSummary(
+    const RendererFrameTimingSamples& samples) {
+    const auto maximum = [](const std::vector<double>& values) {
+        return values.empty() ? 0.0
+                              : *std::max_element(values.begin(), values.end());
+    };
+    const auto summary = [&](const std::vector<double>& values) {
+        return nlohmann::json{
+            {"sample_count", values.size()},
+            {"p50", PercentileValue(values, 0.50)},
+            {"p95", PercentileValue(values, 0.95)},
+            {"maximum", maximum(values)},
+        };
+    };
+    nlohmann::json ownerWaits = nlohmann::json::array();
+    for (const auto& wait : samples.imageOwnerWaits) {
+        ownerWaits.push_back({
+            {"submission_serial", wait.submissionSerial},
+            {"image_index", wait.imageIndex},
+            {"frame_slot", wait.frameSlot},
+            {"milliseconds", wait.milliseconds},
+        });
+    }
+    return {
+        {"sample_count", samples.cpuMilliseconds.size()},
+        {"gpu_sample_count", samples.gpuMilliseconds.size()},
+        {"cpu_ms", summary(samples.cpuMilliseconds)},
+        {"cpu_phase_ms",
+         {{"imgui_finalization",
+           summary(samples.cpuUiFinalizeMilliseconds)},
+          {"frame_slot_fence_wait",
+           summary(samples.cpuFrameSlotFenceWaitMilliseconds)},
+          {"completed_frame_maintenance",
+           summary(samples.cpuCompletedMaintenanceMilliseconds)},
+          {"hq_gaussian_preparation",
+           summary(samples.cpuHighQualityGaussianPrepareMilliseconds)},
+          {"uniform_resource_upload",
+           summary(samples.cpuUniformResourceUploadMilliseconds)},
+          {"acquire_call", summary(samples.cpuAcquireMilliseconds)},
+          {"image_owner_wait",
+           summary(samples.imageOwnerWaitMilliseconds)},
+          {"reset_retire_polling",
+           summary(samples.cpuResetRetirePollingMilliseconds)},
+          {"command_encoding",
+           summary(samples.cpuCommandEncodingMilliseconds)},
+          {"queue_submit", summary(samples.cpuSubmitMilliseconds)},
+          {"present_call", summary(samples.cpuPresentMilliseconds)},
+          {"platform_windows",
+           summary(samples.cpuPlatformWindowsMilliseconds)}}},
+        {"ownership_wait_count", samples.imageOwnerWaits.size()},
+        {"ownership_waits", std::move(ownerWaits)},
+        {"gpu_ms",
+         {{"total", summary(samples.gpuMilliseconds)},
+          {"rain_compute", summary(samples.gpuRainComputeMilliseconds)},
+          {"depth", summary(samples.gpuDepthMilliseconds)},
+          {"weighted_accumulation",
+           summary(samples.gpuWeightedAccumulationMilliseconds)},
+          {"composite", summary(samples.gpuCompositeMilliseconds)},
+          {"opaque_fast_hq",
+           summary(samples.gpuOpaqueAndHighQualityMilliseconds)},
+          {"postprocess", summary(samples.gpuPostProcessMilliseconds)},
+          {"imgui", summary(samples.gpuImGuiMilliseconds)}}},
+    };
+}
+
+int RunRendererFrameTimingScene3Smoke(
+    const GuiSmokeOptions& options,
+    const invisible_places::io::AssetCatalog& assetCatalog,
+    platform::Window* window,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    PreviewRuntimeState* runtimeState) {
+    const auto outputDirectory =
+        options.outputDirectory.empty()
+            ? std::filesystem::path{"build/macos-debug/renderer-frame-timing-scene3-5mm"}
+            : options.outputDirectory;
+    const auto reportPath = outputDirectory / "renderer-frame-timing-scene3-5mm.json";
+    std::vector<std::string> passes;
+    std::vector<std::string> failures;
+    RendererFrameTimingSamples fixedSamples;
+    RendererFrameTimingSamples movingSamples;
+    std::uint64_t invalidOwnerWaitCount = 0U;
+    std::uint64_t invalidCompletedSubmissionCount = 0U;
+    std::uint64_t gpuPhaseReconciliationFailureCount = 0U;
+    std::uint64_t gpuResultCount = 0U;
+    std::size_t selectedPointCount = 0U;
+    std::vector<RendererImageOwnerWaitSample> ownershipWaits;
+    bool cachedSceneObserved = false;
+    bool cachedGpuPhasesInactive = false;
+    bool resizeObserved = false;
+    bool gpuResultsAfterResize = false;
+
+    auto finish = [&]() {
+        std::error_code createError;
+        std::filesystem::create_directories(outputDirectory, createError);
+        nlohmann::json report{
+            {"scenario", options.scenario},
+            {"passed", failures.empty()},
+            {"selected_point_count", selectedPointCount},
+            {"fixed_camera", RendererFrameTimingSampleSummary(fixedSamples)},
+            {"moving_camera", RendererFrameTimingSampleSummary(movingSamples)},
+            {"invalid_owner_wait_count", invalidOwnerWaitCount},
+            {"invalid_completed_submission_count",
+             invalidCompletedSubmissionCount},
+            {"gpu_phase_reconciliation_failure_count",
+             gpuPhaseReconciliationFailureCount},
+            {"gpu_result_count", gpuResultCount},
+            {"ownership_wait_count", ownershipWaits.size()},
+            {"cached_scene_observed", cachedSceneObserved},
+            {"cached_gpu_phases_inactive", cachedGpuPhasesInactive},
+            {"resize_observed", resizeObserved},
+            {"gpu_results_after_resize", gpuResultsAfterResize},
+            {"passes", passes},
+            {"failures", failures},
+        };
+        if (viewport != nullptr) {
+            const auto& diagnostics = viewport->Diagnostics();
+            report["present_mode"] = diagnostics.presentMode;
+            report["requested_swapchain_image_count"] =
+                diagnostics.requestedSwapchainImageCount;
+            report["swapchain_image_count"] = diagnostics.swapchainImageCount;
+            report["frames_in_flight"] = diagnostics.framesInFlight;
+            report["submitted_submission_serial"] =
+                diagnostics.submittedSubmissionSerial;
+            report["completed_submission_serial"] =
+                diagnostics.completedSubmissionSerial;
+            report["stale_image_owner_count"] =
+                diagnostics.staleImageOwnerCount;
+            report["gpu_timestamp_supported"] =
+                diagnostics.gpuTimestampsSupported;
+            report["gpu_timestamp_unavailable_result_count"] =
+                diagnostics.gpuTimestampUnavailableResultCount;
+        }
+        report["ownership_waits"] = nlohmann::json::array();
+        for (const auto& wait : ownershipWaits) {
+            report["ownership_waits"].push_back({
+                {"submission_serial", wait.submissionSerial},
+                {"image_index", wait.imageIndex},
+                {"frame_slot", wait.frameSlot},
+                {"milliseconds", wait.milliseconds},
+            });
+        }
+        std::ofstream output{reportPath, std::ios::trunc};
+        if (!output.is_open()) {
+            std::cerr << "Failed to write renderer timing report: "
+                      << reportPath.string() << "\n";
+            return 1;
+        }
+        output << report.dump(2) << '\n';
+        std::cout << "Renderer frame timing report: " << reportPath.string() << "\n";
+        return failures.empty() ? 0 : 1;
+    };
+
+    if (window == nullptr || viewport == nullptr || runtimeState == nullptr) {
+        failures.emplace_back(
+            "Renderer timing smoke requires a live window, viewport, and runtime.");
+        return finish();
+    }
+
+    runtimeState->sessions = BuildSessions(assetCatalog);
+    runtimeState->pointCloudScenes = BuildScenePointCloudRuntimeStates(
+        assetCatalog,
+        &runtimeState->sessions);
+    const auto sceneIt = std::find_if(
+        runtimeState->pointCloudScenes.begin(),
+        runtimeState->pointCloudScenes.end(),
+        [](const auto& scene) { return scene.sceneGroupName == "Scene3"; });
+    if (sceneIt == runtimeState->pointCloudScenes.end()) {
+        failures.emplace_back("Scene3 was not discovered.");
+        return finish();
+    }
+    auto& scene = *sceneIt;
+    const auto bundle = std::find_if(
+        scene.displayBundles.begin(),
+        scene.displayBundles.end(),
+        [](const auto& candidate) {
+            return candidate.spacingMicrometres == 5'000U;
+        });
+    if (bundle == scene.displayBundles.end()) {
+        failures.emplace_back("Scene3 has no complete 5 mm display bundle.");
+        return finish();
+    }
+
+    for (std::size_t roleIndex = 0U;
+         roleIndex < bundle->sessionIndices.size();
+         ++roleIndex) {
+        const auto sessionIndex = bundle->sessionIndices[roleIndex];
+        auto& session = runtimeState->sessions[sessionIndex];
+        auto loaded = invisible_places::io::LoadPointCloud(session.sourcePath);
+        if (!loaded.success || loaded.cloud.PointCount() == 0U) {
+            failures.emplace_back(
+                "Could not load " + session.sourcePath.filename().string() + ".");
+            return finish();
+        }
+        selectedPointCount += loaded.cloud.PointCount();
+        if (!ActivateLoadedPointCloud(
+                sessionIndex,
+                std::move(loaded.cloud),
+                runtimeState,
+                viewport,
+                {.uploadToGpu = true,
+                 .makeVisible = true,
+                 .selectSession = false,
+                 .focusWhenFirstVisible = false})) {
+            failures.emplace_back(
+                "Could not upload " + session.sourcePath.filename().string() + ".");
+            return finish();
+        }
+        session.committedDisplaySource = true;
+        session.visible = true;
+        scene.committedDisplaySessionIndices[roleIndex] = sessionIndex;
+    }
+    scene.committedDisplaySpacingMicrometres = 5'000U;
+    scene.displayLoaded = true;
+    scene.displayVisible = true;
+    scene.mixedDisplay = false;
+    if (selectedPointCount != 14'832'063U) {
+        failures.emplace_back(
+            "Scene3 5 mm ROCK/SAND/VEG count was " +
+            std::to_string(selectedPointCount) + ", expected 14,832,063.");
+        return finish();
+    }
+    passes.emplace_back(
+        "Loaded only Scene3 ROCK/SAND/VEG 5 mm display files (14,832,063 points).");
+
+    runtimeState->selectedSessionIndex =
+        scene.committedDisplaySessionIndices.front();
+    runtimeState->projectSettings.pointCloudRendererMode =
+        PointCloudRendererMode::Beauty;
+    runtimeState->projectSettings.eyeDomeLightingEnabled = false;
+    runtimeState->water.collisionRainSettings.enabled = false;
+    runtimeState->water.dynamicMeshFlowSettings.enabled = false;
+    runtimeState->water.seepageNodes.clear();
+    runtimeState->water.rippleLayers.clear();
+    runtimeState->water.fieldLayers.clear();
+    FocusSessionLayer(
+        runtimeState,
+        *viewport,
+        runtimeState->selectedSessionIndex.value(),
+        0.62F);
+    viewport->SetDiagnosticsEnabled(true);
+    viewport->SetSceneCachingEnabled(false);
+    viewport->SetLiveSceneRenderingEnabled(true);
+    viewport->WaitIdle();
+
+    auto drawMeasuredFrame = [&](RendererFrameTimingSamples* samples,
+                                 float simulatedSeconds,
+                                 bool updateRenderState = true) {
+        window->PollEvents();
+        viewport->BeginUiFrame();
+        if (updateRenderState) {
+            viewport->UpdateRenderState(
+                BuildRenderState(*runtimeState, *viewport, simulatedSeconds));
+        }
+        viewport->DrawFrame();
+        const auto& diagnostics = viewport->Diagnostics();
+        if (diagnostics.imageOwnerWaited) {
+            const RendererImageOwnerWaitSample wait{
+                .submissionSerial =
+                    diagnostics.imageWaitOwnerSubmissionSerial,
+                .imageIndex = diagnostics.imageWaitImageIndex,
+                .frameSlot = diagnostics.imageWaitOwnerFrameSlot,
+                .milliseconds = diagnostics.frameImageWaitMs,
+            };
+            ownershipWaits.push_back(wait);
+            if (samples != nullptr) {
+                samples->imageOwnerWaits.push_back(wait);
+            }
+        }
+        if (samples != nullptr) {
+            samples->cpuMilliseconds.push_back(diagnostics.frameRenderMs);
+            samples->cpuUiFinalizeMilliseconds.push_back(
+                diagnostics.frameUiRenderMs);
+            samples->cpuFrameSlotFenceWaitMilliseconds.push_back(
+                diagnostics.frameFenceWaitMs);
+            samples->cpuCompletedMaintenanceMilliseconds.push_back(
+                diagnostics.frameCompletedMaintenanceMs);
+            samples->cpuHighQualityGaussianPrepareMilliseconds.push_back(
+                diagnostics.frameHighQualityGaussianPrepareMs);
+            samples->cpuUniformResourceUploadMilliseconds.push_back(
+                diagnostics.frameUniformResourceUploadMs);
+            samples->cpuAcquireMilliseconds.push_back(
+                diagnostics.frameAcquireMs);
+            samples->imageOwnerWaitMilliseconds.push_back(
+                diagnostics.frameImageWaitMs);
+            samples->cpuResetRetirePollingMilliseconds.push_back(
+                diagnostics.frameResetRetirePollingMs);
+            samples->cpuCommandEncodingMilliseconds.push_back(
+                diagnostics.frameCommandBufferMs);
+            samples->cpuSubmitMilliseconds.push_back(
+                diagnostics.frameSubmitMs);
+            samples->cpuPresentMilliseconds.push_back(
+                diagnostics.framePresentMs);
+            samples->cpuPlatformWindowsMilliseconds.push_back(
+                diagnostics.framePlatformWindowsMs);
+            if (diagnostics.gpuTimestampResultsAvailable) {
+                samples->gpuMilliseconds.push_back(
+                    diagnostics.gpuTotal.milliseconds);
+                const auto appendActive =
+                    [](std::vector<double>* values,
+                       const invisible_places::renderer::core::GpuPhaseDiagnostics&
+                           phase) {
+                        if (phase.active) {
+                            values->push_back(phase.milliseconds);
+                        }
+                    };
+                appendActive(
+                    &samples->gpuRainComputeMilliseconds,
+                    diagnostics.gpuRainCompute);
+                appendActive(
+                    &samples->gpuDepthMilliseconds,
+                    diagnostics.gpuDepth);
+                appendActive(
+                    &samples->gpuWeightedAccumulationMilliseconds,
+                    diagnostics.gpuWeightedAccumulation);
+                appendActive(
+                    &samples->gpuCompositeMilliseconds,
+                    diagnostics.gpuComposite);
+                appendActive(
+                    &samples->gpuOpaqueAndHighQualityMilliseconds,
+                    diagnostics.gpuOpaqueAndHighQuality);
+                appendActive(
+                    &samples->gpuPostProcessMilliseconds,
+                    diagnostics.gpuPostProcess);
+                appendActive(
+                    &samples->gpuImGuiMilliseconds,
+                    diagnostics.gpuImGui);
+            }
+        }
+        if (diagnostics.imageOwnerWaited &&
+            (diagnostics.imageWaitOwnerSubmissionSerial == 0U ||
+             diagnostics.imageWaitOwnerFrameSlot >=
+                 diagnostics.framesInFlight ||
+             diagnostics.imageWaitImageIndex >=
+                 diagnostics.swapchainImageCount)) {
+            ++invalidOwnerWaitCount;
+        }
+        if (diagnostics.gpuTimestampResultsAvailable) {
+            ++gpuResultCount;
+            if (diagnostics.completedSubmissionSerial == 0U ||
+                diagnostics.completedSubmissionSerial >=
+                    diagnostics.submittedSubmissionSerial) {
+                ++invalidCompletedSubmissionCount;
+            }
+            const std::array<const invisible_places::renderer::core::GpuPhaseDiagnostics*, 7>
+                phases{{
+                    &diagnostics.gpuRainCompute,
+                    &diagnostics.gpuDepth,
+                    &diagnostics.gpuWeightedAccumulation,
+                    &diagnostics.gpuComposite,
+                    &diagnostics.gpuOpaqueAndHighQuality,
+                    &diagnostics.gpuPostProcess,
+                    &diagnostics.gpuImGui,
+                }};
+            const double phaseTotal = std::accumulate(
+                phases.begin(),
+                phases.end(),
+                0.0,
+                [](double sum, const auto* phase) {
+                    return sum + (phase->active ? phase->milliseconds : 0.0);
+                });
+            const double tolerance =
+                std::max(0.05, diagnostics.gpuTotal.milliseconds * 0.01);
+            if (std::abs(phaseTotal - diagnostics.gpuTotal.milliseconds) >
+                tolerance) {
+                ++gpuPhaseReconciliationFailureCount;
+            }
+        }
+    };
+
+    for (std::uint32_t frame = 0U; frame < 12U; ++frame) {
+        drawMeasuredFrame(nullptr, static_cast<float>(frame) / 30.0F);
+    }
+    for (std::uint32_t frame = 0U; frame < 120U; ++frame) {
+        drawMeasuredFrame(&fixedSamples, static_cast<float>(frame + 12U) / 30.0F);
+    }
+
+    const auto exhibitionPath =
+        DefaultAnimationDirectory(assetCatalog.dataRoot) / "Exhibition.ipanim.json";
+    if (!LoadAnimationPathFromFile(runtimeState, exhibitionPath)) {
+        failures.emplace_back(
+            "Could not load Exhibition moving-camera path: " +
+            runtimeState->errorMessage);
+        return finish();
+    }
+    const auto exhibitionFrameDenominator =
+        runtimeState->animationPanel.currentPath->durationFrames > 1U
+            ? runtimeState->animationPanel.currentPath->durationFrames - 1U
+            : 1U;
+    for (std::uint32_t frame = 0U; frame < 120U; ++frame) {
+        runtimeState->animationPanel.scrubAmount =
+            static_cast<float>(frame) /
+            static_cast<float>(exhibitionFrameDenominator);
+        ApplyAnimationScrub(runtimeState);
+        drawMeasuredFrame(&movingSamples, static_cast<float>(frame) / 30.0F);
+    }
+
+    viewport->SetSceneCachingEnabled(true);
+    viewport->UpdateRenderState(
+        BuildRenderState(*runtimeState, *viewport, 4.0F));
+    const std::uint32_t cacheFrames =
+        std::max(
+            4U,
+            viewport->Diagnostics().swapchainImageCount +
+                (2U * viewport->Diagnostics().framesInFlight) + 2U);
+    for (std::uint32_t frame = 0U; frame < cacheFrames; ++frame) {
+        drawMeasuredFrame(nullptr, 4.0F, false);
+        const auto& diagnostics = viewport->Diagnostics();
+        cachedSceneObserved =
+            cachedSceneObserved ||
+            (diagnostics.sceneCacheActive &&
+             !diagnostics.sceneRenderedThisFrame);
+        cachedGpuPhasesInactive =
+            cachedGpuPhasesInactive ||
+            (diagnostics.sceneCacheActive &&
+             !diagnostics.sceneRenderedThisFrame &&
+             diagnostics.gpuTimestampResultsAvailable &&
+             !diagnostics.gpuDepth.active &&
+             !diagnostics.gpuWeightedAccumulation.active &&
+             !diagnostics.gpuComposite.active &&
+             !diagnostics.gpuOpaqueAndHighQuality.active &&
+             diagnostics.gpuPostProcess.active);
+    }
+    viewport->SetSceneCachingEnabled(false);
+
+    int originalWidth = 0;
+    int originalHeight = 0;
+    glfwGetWindowSize(window->NativeHandle(), &originalWidth, &originalHeight);
+    if (originalWidth > 0 && originalHeight > 0) {
+        const std::uint32_t originalFramebufferWidth = viewport->Width();
+        const std::uint32_t originalFramebufferHeight = viewport->Height();
+        const std::uint64_t submittedSerialBeforeResize =
+            viewport->Diagnostics().submittedSubmissionSerial;
+        std::uint64_t firstPostResizeSubmissionSerial = 0U;
+        glfwSetWindowSize(
+            window->NativeHandle(),
+            originalWidth + 32,
+            originalHeight + 24);
+        const std::uint32_t resizeRecoveryFrames =
+            viewport->Diagnostics().swapchainImageCount +
+            (2U * viewport->Diagnostics().framesInFlight);
+        for (std::uint32_t frame = 0U;
+             frame < resizeRecoveryFrames;
+             ++frame) {
+            drawMeasuredFrame(nullptr, 4.0F + static_cast<float>(frame) / 30.0F);
+            const auto& resizeDiagnostics = viewport->Diagnostics();
+            resizeObserved =
+                resizeObserved ||
+                viewport->Width() != originalFramebufferWidth ||
+                viewport->Height() != originalFramebufferHeight;
+            if (firstPostResizeSubmissionSerial == 0U &&
+                resizeDiagnostics.submittedSubmissionSerial >
+                    submittedSerialBeforeResize) {
+                firstPostResizeSubmissionSerial =
+                    resizeDiagnostics.submittedSubmissionSerial;
+            }
+            gpuResultsAfterResize =
+                gpuResultsAfterResize ||
+                (firstPostResizeSubmissionSerial != 0U &&
+                 resizeDiagnostics.gpuTimestampResultsAvailable &&
+                 resizeDiagnostics.completedSubmissionSerial >=
+                     firstPostResizeSubmissionSerial);
+        }
+        glfwSetWindowSize(window->NativeHandle(), originalWidth, originalHeight);
+        for (std::uint32_t frame = 0U; frame < 4U; ++frame) {
+            drawMeasuredFrame(nullptr, 4.25F + static_cast<float>(frame) / 30.0F);
+        }
+    }
+
+    const auto& diagnostics = viewport->Diagnostics();
+    if (diagnostics.staleImageOwnerCount != 0U) {
+        failures.emplace_back("A stale swapchain-image owner was observed.");
+    } else {
+        passes.emplace_back("No stale swapchain-image owner was observed.");
+    }
+    if (invalidOwnerWaitCount != 0U) {
+        failures.emplace_back(
+            "An image-owner wait did not identify its submission serial.");
+    } else {
+        passes.emplace_back("Every image-owner wait identified its submission.");
+    }
+    if (diagnostics.gpuTimestampsSupported && gpuResultCount == 0U) {
+        failures.emplace_back(
+            "GPU timestamps are supported but no completed result was published.");
+    } else if (diagnostics.gpuTimestampsSupported) {
+        passes.emplace_back("GPU results were tied to completed submissions.");
+    } else {
+        passes.emplace_back(
+            "GPU timestamps are unsupported; CPU and synchronization diagnostics remained available.");
+    }
+    if (diagnostics.gpuTimestampsSupported &&
+        (fixedSamples.gpuMilliseconds.size() != 120U ||
+         movingSamples.gpuMilliseconds.size() != 120U)) {
+        failures.emplace_back(
+            "Expected 120 valid GPU timestamp samples in both timing phases.");
+    }
+    if (diagnostics.gpuTimestampsSupported &&
+        invalidCompletedSubmissionCount != 0U) {
+        failures.emplace_back(
+            "A GPU result was not tied to an older completed submission.");
+    }
+    if (gpuPhaseReconciliationFailureCount != 0U) {
+        failures.emplace_back(
+            "One or more GPU phase totals did not reconcile with total GPU time.");
+    }
+    if (!cachedSceneObserved) {
+        failures.emplace_back("The cached-scene phase was not observed.");
+    }
+    if (diagnostics.gpuTimestampsSupported && !cachedGpuPhasesInactive) {
+        failures.emplace_back(
+            "Cached frames did not publish inactive scene GPU phases.");
+    }
+    if (!resizeObserved) {
+        failures.emplace_back(
+            "The requested window resize did not recreate a different framebuffer size.");
+    }
+    if (diagnostics.gpuTimestampsSupported && !gpuResultsAfterResize) {
+        failures.emplace_back("GPU timing did not resume after swapchain resize.");
+    }
+    if (fixedSamples.cpuMilliseconds.size() == 120U &&
+        movingSamples.cpuMilliseconds.size() == 120U) {
+        passes.emplace_back(
+            "Captured 120 fixed-camera and 120 Exhibition moving-camera frames.");
+    }
+    viewport->WaitIdle();
+    return finish();
+}
+
 int RunGpuCollisionRainSmoke(
     const GuiSmokeOptions& options,
     const invisible_places::io::AssetCatalog& assetCatalog,
@@ -46863,14 +47554,14 @@ int RunGpuCollisionRainSmoke(
     PreviewRuntimeState* runtimeState) {
     GuiSmokeReport report;
     report.scenario = options.scenario;
-    const bool scene1ThreeMillimetre = options.scenario == "rain-gpu-scene1-3mm";
-    const std::string targetSceneFolder = scene1ThreeMillimetre ? "Scene1" : "SampleScene";
+    const bool scene3FiveMillimetre = options.scenario == "rain-gpu-scene3-5mm";
+    const std::string targetSceneFolder = scene3FiveMillimetre ? "Scene3" : "SampleScene";
     const auto outputDirectory = options.outputDirectory.empty()
                                      ? std::filesystem::path{"build/macos-debug/rain-gpu-smoke"}
                                      : options.outputDirectory;
     report.outputPath = outputDirectory /
-                        (scene1ThreeMillimetre
-                             ? "rain-gpu-scene1-3mm.json"
+                        (scene3FiveMillimetre
+                             ? "rain-gpu-scene3-5mm.json"
                              : "rain-gpu-sample-scene.json");
 
     auto finish = [&]() {
@@ -46901,22 +47592,36 @@ int RunGpuCollisionRainSmoke(
         return finish();
     }
     auto& scene = *sceneIt;
-    if (scene1ThreeMillimetre) {
+    if (scene3FiveMillimetre) {
         const auto bundle = std::find_if(
             scene.displayBundles.begin(),
             scene.displayBundles.end(),
             [](const SceneDisplayBundleRuntime& candidate) {
-                return candidate.spacingMicrometres == 3'000U;
+                return candidate.spacingMicrometres == 5'000U;
             });
         if (bundle == scene.displayBundles.end()) {
-            report.Fail("Scene1 did not provide the requested complete 3 mm display bundle.");
+            report.Fail("Scene3 did not provide the requested complete 5 mm display bundle.");
             return finish();
         }
         for (std::size_t roleIndex = 0; roleIndex < bundle->sessionIndices.size(); ++roleIndex) {
             scene.committedDisplaySessionIndices[roleIndex] = bundle->sessionIndices[roleIndex];
         }
-        scene.committedDisplaySpacingMicrometres = 3'000U;
+        scene.committedDisplaySpacingMicrometres = 5'000U;
         scene.mixedDisplay = false;
+        scene.waterSurfaceSources.clear();
+        scene.waterSurfaceSources.reserve(bundle->sessionIndices.size());
+        for (const auto sessionIndex : bundle->sessionIndices) {
+            const auto& session = runtimeState->sessions[sessionIndex];
+            scene.waterSurfaceSources.push_back({
+                .sourcePath = session.sourcePath,
+                .role = RainCollisionRoleForSession(session),
+                .spacingMicrometres = 5'000U,
+                .isFallback = false,
+            });
+        }
+        scene.waterSurfaceSignature =
+            invisible_places::water::WaterSurfaceCacheSignature(
+                scene.waterSurfaceSources);
     }
     if (std::any_of(
             scene.committedDisplaySessionIndices.begin(),
@@ -46958,7 +47663,7 @@ int RunGpuCollisionRainSmoke(
                         .count();
     scene.displayLoaded = true;
     scene.displayVisible = true;
-    scene.mixedDisplay = !scene1ThreeMillimetre;
+    scene.mixedDisplay = !scene3FiveMillimetre;
     runtimeState->selectedSessionIndex = scene.committedDisplaySessionIndices.front();
     runtimeState->projectSettings.pointCloudRendererMode = PointCloudRendererMode::Beauty;
     runtimeState->projectSettings.eyeDomeLightingEnabled = false;
@@ -46983,11 +47688,26 @@ int RunGpuCollisionRainSmoke(
         report.Fail(targetSceneFolder + " rain collision cache failed: " + cacheResult.errorMessage);
         return finish();
     }
-    if (std::none_of(
+    if (scene3FiveMillimetre &&
+        scene.waterSurfaceSources.size() == 3U &&
+        std::all_of(
             scene.waterSurfaceSources.begin(),
             scene.waterSurfaceSources.end(),
-            [](const WaterSurfaceSource& source) { return source.isFallback; }) &&
-        cacheResult.warnings.empty()) {
+            [](const WaterSurfaceSource& source) {
+                return source.spacingMicrometres == 5'000U &&
+                       !source.isFallback;
+            }) &&
+        cacheResult.cache.sourcePointCount == 14'832'063U) {
+        report.Pass(
+            "Scene3 collision used only the 5 mm ROCK, SAND, and VEG display "
+            "sources (14,832,063 points).");
+    } else if (std::none_of(
+                   scene.waterSurfaceSources.begin(),
+                   scene.waterSurfaceSources.end(),
+                   [](const WaterSurfaceSource& source) {
+                       return source.isFallback;
+                   }) &&
+               cacheResult.warnings.empty()) {
         report.Pass(targetSceneFolder + " collision used exact 2 mm ROCK, SAND, and VEG sources.");
     } else if (cacheResult.warnings.size() == scene.waterSurfaceSources.size()) {
         report.Pass("SampleScene used one explicit coarsest-source fallback warning per role.");
@@ -47146,7 +47866,7 @@ int RunGpuCollisionRainSmoke(
                                   .count();
     auto renderComparison = [&](std::string_view stem, bool effectsEnabled) {
         const auto suffix = effectsEnabled ? "effects-on" : "effects-off";
-        const auto scenePrefix = scene1ThreeMillimetre ? std::string{"scene1-"} : std::string{};
+        const auto scenePrefix = scene3FiveMillimetre ? std::string{"scene3-"} : std::string{};
         const auto exrPath = outputDirectory / (scenePrefix + std::string{stem} + "-" + suffix + ".exr");
         const auto ppmPath = outputDirectory / (scenePrefix + std::string{stem} + "-" + suffix + ".ppm");
         renderTimeSeconds += 1.0F / 30.0F;
@@ -47437,13 +48157,28 @@ int RunWaterSeepageSmoke(
             "The Seepage GPU node count did not match the eight-node fixture: " +
             std::to_string(uploadedSeepageNodeCount) + " uploaded.");
     }
-    if (runtimeState->water.seepageGpuBytes < 4U * 1024U * 1024U) {
+    report.seepageGpuBytes = runtimeState->water.seepageGpuBytes;
+    // Connected 10 mm support stores a 16-byte reference per selected
+    // node/cell plus its sparse hash. The former 4 MiB ceiling predated that
+    // payload and is lower than one node's documented 262,144-reference
+    // maximum. Keep this SampleScene regression bound tight enough to catch a
+    // near-doubling of the measured eight-node fixture without rejecting its
+    // expected connected topology.
+    constexpr std::size_t kSampleSceneSeepageAuxiliaryLimitBytes =
+        16U * 1024U * 1024U;
+    if (report.seepageGpuBytes < kSampleSceneSeepageAuxiliaryLimitBytes) {
         report.Pass(
-            "Seepage auxiliary data stayed below 4 MiB: " +
-            FormatFixed(static_cast<double>(runtimeState->water.seepageGpuBytes) / (1024.0 * 1024.0), 3) +
+            "Seepage auxiliary data stayed below 16 MiB: " +
+            FormatFixed(static_cast<double>(report.seepageGpuBytes) / (1024.0 * 1024.0), 3) +
             " MiB.");
     } else {
-        report.Fail("Seepage auxiliary data exceeded 4 MiB.");
+        report.Fail(
+            "Seepage auxiliary data exceeded 16 MiB: " +
+            FormatFixed(
+                static_cast<double>(report.seepageGpuBytes) /
+                    (1024.0 * 1024.0),
+                3) +
+            " MiB.");
     }
 
     // Let every fenced parameter-ring slot observe the newly attached
@@ -47800,16 +48535,16 @@ int RunDynamicMeshFlowGroundSmoke(
     PreviewRuntimeState* runtimeState) {
     GuiSmokeReport report;
     report.scenario = options.scenario;
-    const bool scene1Visual =
-        options.scenario == "dynamic-mesh-flow-scene1-visual";
+    const bool scene3Visual =
+        options.scenario == "dynamic-mesh-flow-scene3-5mm-visual";
     const std::string expectedSceneName =
-        scene1Visual ? "Scene1" : "SampleScene";
+        scene3Visual ? "Scene3" : "SampleScene";
     const auto outputDirectory = options.outputDirectory.empty()
                                      ? std::filesystem::path{"build/macos-debug/water-region-smoke"}
                                      : options.outputDirectory;
     report.outputPath = outputDirectory /
-        (scene1Visual
-             ? "dynamic-mesh-flow-scene1-visual.json"
+        (scene3Visual
+             ? "dynamic-mesh-flow-scene3-5mm-visual.json"
              : "dynamic-mesh-flow-ground.json");
 
     auto finish = [&]() {
@@ -47825,9 +48560,9 @@ int RunDynamicMeshFlowGroundSmoke(
         return finish();
     }
 
-    const auto projectPath = scene1Visual
+    const auto projectPath = scene3Visual
         ? assetCatalog.dataRoot.parent_path() / "Saved" /
-              "exhibitionScene_project.json"
+              "ExhibitionFinal_project.json"
         : assetCatalog.dataRoot.parent_path() / "Saved" / "validation" /
               "SampleSceneValidation_project.json";
     std::string loadError;
@@ -47851,13 +48586,113 @@ int RunDynamicMeshFlowGroundSmoke(
                  : runtimeState->errorMessage));
         return finish();
     }
-    if (scene1Visual) {
-        const auto topViewPath =
-            DefaultAnimationDirectory(assetCatalog.dataRoot) /
-            "Top_View.ipanim.json";
-        if (!LoadAnimationPathFromFile(runtimeState, topViewPath)) {
+    if (scene3Visual) {
+        const auto sceneIt = std::find_if(
+            runtimeState->pointCloudScenes.begin(),
+            runtimeState->pointCloudScenes.end(),
+            [](const auto& scene) {
+                return scene.sceneGroupName == "Scene3";
+            });
+        if (sceneIt == runtimeState->pointCloudScenes.end()) {
             report.Fail(
-                "Scene1 Mesh Flow visual smoke could not load Top_View: " +
+                "Scene3 Mesh Flow visual smoke could not find the Scene3 "
+                "runtime fixture.");
+            return finish();
+        }
+        CancelWaterSurfaceCacheWarmup(&runtimeState->water);
+        viewport->ClearWaterSurfaceCache();
+        auto& scene = *sceneIt;
+        const auto fiveMillimetreBundle = std::find_if(
+            scene.displayBundles.begin(),
+            scene.displayBundles.end(),
+            [](const SceneDisplayBundleRuntime& candidate) {
+                return candidate.spacingMicrometres == 5'000U;
+            });
+        if (fiveMillimetreBundle == scene.displayBundles.end()) {
+            report.Fail(
+                "Scene3 Mesh Flow visual smoke could not find its complete "
+                "5 mm ROCK/SAND/VEG display bundle.");
+            return finish();
+        }
+        const auto groundSource = std::find_if(
+            scene.waterSurfaceSources.begin(),
+            scene.waterSurfaceSources.end(),
+            [](const auto& source) {
+                return source.role == WaterSurfaceRole::Ground &&
+                       source.spacingMicrometres == 5'000U &&
+                       !source.isFallback;
+            });
+        if (groundSource == scene.waterSurfaceSources.end()) {
+            report.Fail(
+                "Scene3 Mesh Flow visual smoke could not find its 5 mm "
+                "sampled Ground source.");
+            return finish();
+        }
+        const WaterSurfaceSource isolatedGroundSource = *groundSource;
+        constexpr std::array<WaterSurfaceRole, 3> kExpectedRoles{
+            WaterSurfaceRole::Rock,
+            WaterSurfaceRole::Sand,
+            WaterSurfaceRole::Vegetation,
+        };
+        constexpr std::array<std::string_view, 3> kExpectedFilenames{
+            "Site3-ROCK-5mm.ply",
+            "Site3-SAND-5mm.ply",
+            "Site3-VEG-5mm.ply",
+        };
+        std::vector<WaterSurfaceSource> isolatedSources;
+        isolatedSources.reserve(kExpectedRoles.size() + 1U);
+        for (std::size_t roleIndex = 0U;
+             roleIndex < fiveMillimetreBundle->sessionIndices.size();
+             ++roleIndex) {
+            const auto sessionIndex =
+                fiveMillimetreBundle->sessionIndices[roleIndex];
+            if (sessionIndex >= runtimeState->sessions.size()) {
+                report.Fail(
+                    "Scene3 Mesh Flow visual smoke found an invalid session "
+                    "in its 5 mm display bundle.");
+                return finish();
+            }
+            const auto& session = runtimeState->sessions[sessionIndex];
+            const auto role = RainCollisionRoleForSession(session);
+            if (role != kExpectedRoles[roleIndex] ||
+                session.sourcePath.filename() !=
+                    kExpectedFilenames[roleIndex] ||
+                NormalizePathKey(session.sourcePath.parent_path()) !=
+                    NormalizePathKey(scene.sourceFolder)) {
+                report.Fail(
+                    "Scene3 Mesh Flow visual smoke's 5 mm display bundle did "
+                    "not contain the expected scene-local ROCK/SAND/VEG files.");
+                return finish();
+            }
+            isolatedSources.push_back({
+                .sourcePath = session.sourcePath,
+                .role = role,
+                .spacingMicrometres = 5'000U,
+                .isFallback = false,
+            });
+        }
+        isolatedSources.push_back(isolatedGroundSource);
+        scene.waterSurfaceSources = std::move(isolatedSources);
+        scene.waterSurfaceSignature =
+            invisible_places::water::WaterSurfaceCacheSignature(
+                scene.waterSurfaceSources);
+        scene.waterSurfaceCache.reset();
+        scene.waterSurfaceCacheStatus =
+            WaterSurfaceCacheRuntimeStatus::Missing;
+        runtimeState->water.waterSurfaceCache.reset();
+        runtimeState->water.waterSurfaceCacheSignature.clear();
+        runtimeState->water.waterSurfaceSceneGroupName.clear();
+        runtimeState->water.waterSurfaceCacheLoadedFromDisk = false;
+        runtimeState->water.waterSurfaceCachePreprocessPending = false;
+        runtimeState->water.waterSurfaceCacheWarnings.clear();
+        runtimeState->errorMessage.clear();
+
+        const auto exhibitionPath =
+            DefaultAnimationDirectory(assetCatalog.dataRoot) /
+            "Exhibition.ipanim.json";
+        if (!LoadAnimationPathFromFile(runtimeState, exhibitionPath)) {
+            report.Fail(
+                "Scene3 Mesh Flow visual smoke could not load Exhibition: " +
                 runtimeState->errorMessage);
             return finish();
         }
@@ -47898,7 +48733,7 @@ int RunDynamicMeshFlowGroundSmoke(
 
     const auto startupStartedAt = std::chrono::steady_clock::now();
     const auto startupDeadline = startupStartedAt +
-        (scene1Visual ? std::chrono::seconds{300} : std::chrono::seconds{120});
+        (scene3Visual ? std::chrono::seconds{540} : std::chrono::seconds{120});
     std::vector<double> frameTimesMs;
     std::size_t startupFrame = 0U;
     while (std::chrono::steady_clock::now() < startupDeadline &&
@@ -47919,7 +48754,8 @@ int RunDynamicMeshFlowGroundSmoke(
         const bool displayReady =
             scene != nullptr && scene->displayLoaded &&
             scene->displayVisible &&
-            scene->committedDisplaySpacingMicrometres == 3000U;
+            scene->committedDisplaySpacingMicrometres ==
+                (scene3Visual ? 5'000U : 3'000U);
         const bool cacheReady =
             scene != nullptr &&
             scene->waterSurfaceCacheStatus ==
@@ -47937,16 +48773,92 @@ int RunDynamicMeshFlowGroundSmoke(
     }
 
     auto* scene = findExpectedScene();
-    if (scene == nullptr || water.waterSurfaceCache == nullptr ||
-        !viewport->WaterGroundFlowView().valid ||
-        !water.dynamicMeshFlowGpuSessionIndex.has_value()) {
-        report.Fail(
-            expectedSceneName +
-            " display, schema-4 Ground cache, or GPU Mesh Flow "
-            "did not become ready before the deadline: " +
-            (runtimeState->errorMessage.empty()
-                 ? runtimeState->statusMessage
-                 : runtimeState->errorMessage));
+    const auto startupFlowView = viewport->WaterSurfaceFlowView();
+    const auto startupGroundView = viewport->WaterGroundFlowView();
+    const bool startupDisplayReady =
+        scene != nullptr && scene->displayLoaded && scene->displayVisible &&
+        scene->committedDisplaySpacingMicrometres ==
+            (scene3Visual ? 5'000U : 3'000U);
+    const bool startupStatusReady =
+        scene != nullptr &&
+        scene->waterSurfaceCacheStatus == WaterSurfaceCacheRuntimeStatus::Valid;
+    const bool startupPreprocessReady =
+        !water.waterSurfaceCachePreprocessPending &&
+        !viewport->WaterSurfaceUploadPending();
+    const bool startupFlowRequired =
+        water.waterSurfaceCache != nullptr &&
+        !water.waterSurfaceCache->flowSurfaceSurfels.empty();
+    const bool startupFlowIdentityReady =
+        water.waterSurfaceCache != nullptr &&
+        startupFlowView.cacheIdentity != nullptr &&
+        *startupFlowView.cacheIdentity ==
+            water.waterSurfaceCache->cacheIdentity;
+    const bool startupFlowReady =
+        !startupFlowRequired ||
+        (startupFlowView.valid &&
+         startupFlowView.preprocessingComplete &&
+         startupFlowIdentityReady);
+    const bool startupGroundRequired =
+        water.waterSurfaceCache != nullptr &&
+        !water.waterSurfaceCache->groundCells.empty();
+    const bool startupGroundIdentityReady =
+        water.waterSurfaceCache != nullptr &&
+        startupGroundView.cacheIdentity != nullptr &&
+        *startupGroundView.cacheIdentity ==
+            water.waterSurfaceCache->cacheIdentity;
+    const bool startupGroundReady =
+        !startupGroundRequired ||
+        (startupGroundView.valid && startupGroundIdentityReady);
+    const bool startupSessionReady =
+        water.dynamicMeshFlowGpuSessionIndex.has_value() &&
+        water.dynamicMeshFlowAllocationRevision > 0U &&
+        water.dynamicMeshFlowDescriptorGeneration > 0U;
+    const bool startupReady =
+        scene != nullptr && water.waterSurfaceCache != nullptr &&
+        startupDisplayReady && startupStatusReady &&
+        startupPreprocessReady && startupFlowReady &&
+        startupGroundReady && startupSessionReady;
+    if (!startupReady) {
+        std::ostringstream detail;
+        detail << expectedSceneName
+               << " startup deadline: display="
+               << (startupDisplayReady ? "ready" : "waiting")
+               << ", status="
+               << (scene == nullptr
+                       ? "scene-missing"
+                       : WaterSurfaceCacheRuntimeStatusLabel(
+                             scene->waterSurfaceCacheStatus))
+               << ", preprocess="
+               << (startupPreprocessReady ? "ready" : "pending")
+               << ", Flow="
+               << (startupFlowRequired
+                       ? (startupFlowReady ? "ready" : "waiting")
+                       : "not-required")
+               << "(valid=" << (startupFlowView.valid ? "true" : "false")
+               << ", identity="
+               << (startupFlowIdentityReady ? "match" : "mismatch")
+               << "), Ground="
+               << (startupGroundRequired
+                       ? (startupGroundReady ? "ready" : "waiting")
+                       : "not-required")
+               << "(valid=" << (startupGroundView.valid ? "true" : "false")
+               << ", identity="
+               << (startupGroundIdentityReady ? "match" : "mismatch")
+               << "), session="
+               << (startupSessionReady ? "ready" : "waiting")
+               << "(index="
+               << (water.dynamicMeshFlowGpuSessionIndex.has_value()
+                       ? "set"
+                       : "unset")
+               << ", allocation="
+               << water.dynamicMeshFlowAllocationRevision
+               << ", descriptors="
+               << water.dynamicMeshFlowDescriptorGeneration
+               << "); message="
+               << (runtimeState->errorMessage.empty()
+                       ? runtimeState->statusMessage
+                       : runtimeState->errorMessage);
+        report.Fail(detail.str());
         return finish();
     }
     report.loadMs =
@@ -47964,29 +48876,101 @@ int RunDynamicMeshFlowGroundSmoke(
                    !source.isFallback;
         });
     const auto groundView = viewport->WaterGroundFlowView();
-    const std::string expectedGroundFilename = scene1Visual
-        ? "Site1-MESHSampled-5mm.ply"
+    const std::string expectedGroundFilename = scene3Visual
+        ? "Site3-MESHSampled-5mm.ply"
         : "Site1-MeshSampled-5mm-SampleScene.ply";
+    invisible_places::io::Bounds3f computedGroundBounds;
+    const float groundResolutionMeters =
+        water.waterSurfaceCache->resolutionMeters;
+    for (const auto& cell : water.waterSurfaceCache->groundCells) {
+        computedGroundBounds.Expand({
+            static_cast<float>(cell.cellX) * groundResolutionMeters,
+            static_cast<float>(cell.cellY) * groundResolutionMeters,
+            cell.height,
+        });
+    }
     const float groundSpanX =
-        groundView.bounds.maximum.x - groundView.bounds.minimum.x;
+        computedGroundBounds.maximum.x - computedGroundBounds.minimum.x;
     const float groundSpanY =
-        groundView.bounds.maximum.y - groundView.bounds.minimum.y;
+        computedGroundBounds.maximum.y - computedGroundBounds.minimum.y;
+    const auto formatGroundBounds =
+        [](const invisible_places::io::Bounds3f& bounds) {
+            if (!bounds.valid) {
+                return std::string{"invalid"};
+            }
+            std::ostringstream formatted;
+            formatted << '['
+                      << FormatFixed(bounds.minimum.x, 3) << ','
+                      << FormatFixed(bounds.minimum.y, 3) << ','
+                      << FormatFixed(bounds.minimum.z, 3) << "]-["
+                      << FormatFixed(bounds.maximum.x, 3) << ','
+                      << FormatFixed(bounds.maximum.y, 3) << ','
+                      << FormatFixed(bounds.maximum.z, 3) << ']';
+            return formatted.str();
+        };
+    report.meshFlowGroundBounds =
+        formatGroundBounds(computedGroundBounds);
     const auto approximately = [](float value, float expected) {
         return std::abs(value - expected) <= 0.025F;
     };
+    const bool exactScene3FiveMillimetreSources = [&]() {
+        if (!scene3Visual) {
+            return true;
+        }
+        constexpr std::array<
+            std::pair<WaterSurfaceRole, std::string_view>,
+            4>
+            kExpectedSources{{
+                {WaterSurfaceRole::Rock, "Site3-ROCK-5mm.ply"},
+                {WaterSurfaceRole::Sand, "Site3-SAND-5mm.ply"},
+                {WaterSurfaceRole::Vegetation, "Site3-VEG-5mm.ply"},
+                {WaterSurfaceRole::Ground, "Site3-MESHSampled-5mm.ply"},
+            }};
+        if (scene->waterSurfaceSources.size() != kExpectedSources.size()) {
+            return false;
+        }
+        return std::all_of(
+            kExpectedSources.begin(),
+            kExpectedSources.end(),
+            [&](const auto& expected) {
+                return std::any_of(
+                    scene->waterSurfaceSources.begin(),
+                    scene->waterSurfaceSources.end(),
+                    [&](const WaterSurfaceSource& source) {
+                        return source.role == expected.first &&
+                               source.sourcePath.filename() ==
+                                   expected.second &&
+                               source.spacingMicrometres == 5'000U &&
+                               !source.isFallback &&
+                               NormalizePathKey(
+                                   source.sourcePath.parent_path()) ==
+                                   NormalizePathKey(scene->sourceFolder);
+                    });
+            });
+    }();
     const bool sceneScaleReady =
-        !scene1Visual ||
-        (water.waterSurfaceCache->groundSourcePointCount == 6'110'899U &&
-         water.waterSurfaceCache->groundCells.size() == 1'612'446U &&
-         groundView.bounds.valid &&
-         groundSpanX > 15.0F &&
-         groundSpanY > 25.0F &&
-         approximately(groundView.bounds.minimum.x, 298.415F) &&
-         approximately(groundView.bounds.minimum.y, 87.788F) &&
-         approximately(groundView.bounds.minimum.z, 0.157F) &&
-         approximately(groundView.bounds.maximum.x, 318.181F) &&
-         approximately(groundView.bounds.maximum.y, 119.530F) &&
-         approximately(groundView.bounds.maximum.z, 12.531F));
+        !scene3Visual ||
+        (exactScene3FiveMillimetreSources &&
+         water.waterSurfaceCache->sourcePointCount == 14'832'063U &&
+         water.waterSurfaceCache->groundSourcePointCount == 9'514'537U &&
+         water.waterSurfaceCache->groundCells.size() == 2'534'557U &&
+         groundView.occupiedCellCount == 2'534'557U &&
+         computedGroundBounds.valid &&
+         groundSpanX > 16.0F &&
+         groundSpanY > 38.0F &&
+         approximately(computedGroundBounds.minimum.x, 302.710F) &&
+         approximately(computedGroundBounds.minimum.y, 75.690F) &&
+         approximately(computedGroundBounds.minimum.z, 0.923F) &&
+         approximately(computedGroundBounds.maximum.x, 319.300F) &&
+         approximately(computedGroundBounds.maximum.y, 114.260F) &&
+         approximately(computedGroundBounds.maximum.z, 7.424F));
+    const bool groundIdentityMatches =
+        groundView.cacheIdentity != nullptr &&
+        *groundView.cacheIdentity == water.waterSurfaceCache->cacheIdentity;
+    const bool groundResolutionMatches =
+        std::abs(groundResolutionMeters - 0.010F) <= 1.0e-6F &&
+        std::abs(groundView.resolutionMeters - groundResolutionMeters) <=
+            1.0e-6F;
     const bool groundContractReady =
         groundSource != scene->waterSurfaceSources.end() &&
         groundSource->sourcePath.filename() == expectedGroundFilename &&
@@ -47995,42 +48979,53 @@ int RunDynamicMeshFlowGroundSmoke(
         water.waterSurfaceSceneGroupName == scene->sceneGroupName &&
         water.waterSurfaceCacheSignature == scene->waterSurfaceSignature &&
         water.waterSurfaceCache->signature == scene->waterSurfaceSignature &&
-        groundView.cacheIdentity != nullptr &&
-        *groundView.cacheIdentity == water.waterSurfaceCache->cacheIdentity &&
+        groundIdentityMatches &&
         water.waterSurfaceCache->schemaVersion ==
             invisible_places::water::kWaterSurfaceCacheSchemaVersion &&
         !water.waterSurfaceCache->groundCells.empty() &&
         water.waterSurfaceCache->groundSourcePointCount > 0U &&
+        groundView.bounds.valid &&
         groundView.occupiedCellCount ==
             water.waterSurfaceCache->groundCells.size() &&
-        std::abs(groundView.resolutionMeters - 0.010F) <= 1.0e-6F &&
+        groundResolutionMatches &&
         sceneScaleReady;
     if (groundContractReady) {
         report.Pass(
             expectedSceneName +
-            " used its active 5 mm MESHSampled cloud through "
-            "the persisted schema-4 10 mm Ground table.");
+            " used exactly its 5 mm ROCK/SAND/VEG display bundle plus active "
+            "5 mm MESHSampled cloud through the schema-4 10 mm shared cache.");
     } else {
-        report.Fail(
-            "The active-scene sampled Ground source or 10 mm GPU hash did "
-            "not satisfy the shared-cache contract.");
+        std::ostringstream detail;
+        detail
+            << "The active-scene sampled Ground source or 10 mm GPU hash did "
+               "not satisfy the four-source 5 mm shared-cache contract: "
+            << "exactSources="
+            << (exactScene3FiveMillimetreSources ? "true" : "false")
+            << ", sources=" << scene->waterSurfaceSources.size()
+            << ", terrain/VEG points="
+            << water.waterSurfaceCache->sourcePointCount
+            << ", Ground points="
+            << water.waterSurfaceCache->groundSourcePointCount
+            << ", computed Ground bounds="
+            << report.meshFlowGroundBounds
+            << ", identity="
+            << (groundIdentityMatches ? "match" : "mismatch")
+            << ", occupied CPU/GPU="
+            << water.waterSurfaceCache->groundCells.size() << '/'
+            << groundView.occupiedCellCount
+            << ", resolution CPU/GPU="
+            << FormatFixed(groundResolutionMeters, 6) << '/'
+            << FormatFixed(groundView.resolutionMeters, 6)
+            << " m, GPU bounds valid="
+            << (groundView.bounds.valid ? "true" : "false")
+            << '.';
+        report.Fail(detail.str());
         return finish();
     }
     report.meshFlowGroundSource =
         groundSource->sourcePath.lexically_normal().generic_string();
     report.meshFlowGroundCellCount =
         water.waterSurfaceCache->groundCells.size();
-    {
-        std::ostringstream bounds;
-        bounds << '['
-               << FormatFixed(groundView.bounds.minimum.x, 3) << ','
-               << FormatFixed(groundView.bounds.minimum.y, 3) << ','
-               << FormatFixed(groundView.bounds.minimum.z, 3) << "]-["
-               << FormatFixed(groundView.bounds.maximum.x, 3) << ','
-               << FormatFixed(groundView.bounds.maximum.y, 3) << ','
-               << FormatFixed(groundView.bounds.maximum.z, 3) << ']';
-        report.meshFlowGroundBounds = bounds.str();
-    }
 
     // Evaluate the same scalar regime used by the compute shader over resident
     // Ground metadata. This is diagnostic-only: it does not scan a PLY, alter
@@ -48480,12 +49475,12 @@ int RunDynamicMeshFlowGroundSmoke(
             ".");
     }
 
-    if (scene1Visual) {
+    if (scene3Visual) {
         std::error_code outputError;
         std::filesystem::create_directories(outputDirectory, outputError);
         if (outputError) {
             report.Fail(
-                "Could not create the Scene1 Mesh Flow visual directory: " +
+                "Could not create the Scene3 Mesh Flow visual directory: " +
                 outputError.message());
             return finish();
         }
@@ -48535,8 +49530,8 @@ int RunDynamicMeshFlowGroundSmoke(
         float simulationClock = parameterSimulationSeconds;
         runtimeState->animationPanel.scrubAmount = 68.0F / 120.0F;
         ApplyAnimationScrub(runtimeState);
-        // Top_View's middle pan sees almost none of the automatic +X entry
-        // table. Frame the dense Scene1 vegetation-supported entry band and
+        // Exhibition's middle pan sees almost none of the automatic +X entry
+        // table. Frame the dense Scene3 vegetation-supported entry band and
         // its first several downhill metres so light/heavy comparisons measure
         // the authored automatic population rather than camera coincidence.
         invisible_places::camera::CameraState meshFlowDiagnosticCamera;
@@ -48575,7 +49570,7 @@ int RunDynamicMeshFlowGroundSmoke(
                         visualState,
                         simulationClock)) {
                     report.Fail(
-                        "Scene1 visual phase '" +
+                        "Scene3 visual phase '" +
                         std::string{phase.label} +
                         "' failed to update the fixed-capacity simulation: " +
                         runtimeState->errorMessage);
@@ -48637,7 +49632,7 @@ int RunDynamicMeshFlowGroundSmoke(
                 &captureError);
             if (!captured.has_value()) {
                 report.Fail(
-                    "Could not capture Scene1 Mesh Flow phase '" +
+                    "Could not capture Scene3 Mesh Flow phase '" +
                     std::string{phase.label} + "': " + captureError);
                 return finish();
             }
@@ -48855,7 +49850,7 @@ int RunDynamicMeshFlowGroundSmoke(
             }
         } else {
             report.Fail(
-                "The Scene1 visual smoke did not capture three matching "
+                "The Scene3 visual smoke did not capture three matching "
                 "Mesh-on/Mesh-off frame pairs.");
         }
         if (report.meshFlowMaximumAvailableRainSeeds > 0U &&
@@ -48877,12 +49872,12 @@ int RunDynamicMeshFlowGroundSmoke(
                 capturedFrames,
                 &sheetError)) {
             report.Fail(
-                "Could not write the Scene1 Mesh Flow visual contact sheet: " +
+                "Could not write the Scene3 Mesh Flow visual contact sheet: " +
                 sheetError);
             return finish();
         }
         report.Pass(
-            "Rendered Top_View light-concavity, rain-heavy-rill, and post-Rain "
+            "Rendered Exhibition light-concavity, rain-heavy-rill, and post-Rain "
             "recession frames plus a live Vulkan contact sheet.");
     }
 
@@ -49677,7 +50672,7 @@ std::optional<WaterIntegrationCapturedFrame> RenderWaterIntegrationOfflineCompar
 }
 
 // Drives the real export frame path (full-density gate, saved-visual export
-// snapshot, GPU EXR frame) on the Scene1 exhibition project and verifies the
+// snapshot, GPU EXR frame) on the lightweight SampleScene validation project and verifies the
 // base point cloud actually reaches the output pixels. Also regression-tests
 // recovery from an abandoned asynchronous EXR frame, which previously latched
 // every later frame preview shut with "already has a frame in flight".
@@ -49708,25 +50703,28 @@ int RunAnimationExportFrameSmoke(
     }
 
     const auto projectPath =
-        assetCatalog.dataRoot.parent_path() / "Saved" / "exhibitionScene_project.json";
+        assetCatalog.dataRoot.parent_path() / "Saved" / "validation" /
+        "SampleSceneValidation_project.json";
     std::string loadError;
     const auto project =
         invisible_places::serialization::LoadProjectDocument(projectPath, &loadError);
     if (!project.has_value()) {
-        report.Fail("The Scene1 exhibition project did not load: " + loadError);
+        report.Fail("The SampleScene validation project did not load: " + loadError);
         return finish();
     }
     if (!ApplyProjectDocumentToRuntime(project.value(), runtimeState, viewport)) {
         report.Fail(
-            "The Scene1 exhibition project could not be applied: " +
+            "The SampleScene validation project could not be applied: " +
             (runtimeState->errorMessage.empty() ? runtimeState->statusMessage
                                                 : runtimeState->errorMessage));
         return finish();
     }
-    const auto topViewPath =
-        DefaultAnimationDirectory(assetCatalog.dataRoot) / "Top_View.ipanim.json";
-    if (!LoadAnimationPathFromFile(runtimeState, topViewPath)) {
-        report.Fail("Top_View could not be loaded: " + runtimeState->errorMessage);
+    const auto sampleAnimationPath =
+        assetCatalog.dataRoot.parent_path() / "tests" / "fixtures" /
+        "sample_scene_validation.ipanim.json";
+    if (!LoadAnimationPathFromFile(runtimeState, sampleAnimationPath)) {
+        report.Fail("SampleScene validation animation could not be loaded: " +
+                    runtimeState->errorMessage);
         return finish();
     }
 
@@ -49979,6 +50977,122 @@ int RunAnimationExportFrameSmoke(
     return finish();
 }
 
+invisible_places::serialization::ProjectDocument
+BuildScene3WaterIntegrationFixture(
+    invisible_places::serialization::ProjectDocument fixture,
+    const std::filesystem::path& dataRoot) {
+    using invisible_places::serialization::ProjectLayerDocument;
+    using invisible_places::serialization::ScenePointCloudGroupDocument;
+    using invisible_places::serialization::ScenePointCloudRoleSourceDocument;
+
+    fixture.projectName = "Scene3 Water Integration Validation";
+    fixture.activeWaterSceneGroupName = "Scene3";
+    fixture.lastAnimationPath =
+        DefaultAnimationDirectory(dataRoot) / "Exhibition.ipanim.json";
+    fixture.waterPathCache.reset();
+    fixture.waterPathCacheManifest.reset();
+    fixture.waterRippleRuntimeCaches.clear();
+
+    auto sceneWaterState = std::find_if(
+        fixture.waterSceneStates.begin(),
+        fixture.waterSceneStates.end(),
+        [](const auto& state) { return state.sceneGroupName == "Scene3"; });
+    if (sceneWaterState == fixture.waterSceneStates.end()) {
+        sceneWaterState = std::find_if(
+            fixture.waterSceneStates.begin(),
+            fixture.waterSceneStates.end(),
+            [](const auto& state) {
+                return state.sceneGroupName == "SampleScene";
+            });
+    }
+    if (sceneWaterState != fixture.waterSceneStates.end()) {
+        sceneWaterState->sceneGroupName = "Scene3";
+        sceneWaterState->pathCache.reset();
+        sceneWaterState->pathCacheManifest.reset();
+        sceneWaterState->rippleRuntimeCaches.clear();
+        sceneWaterState->dynamicMeshPath.clear();
+        fixture.waterSceneStates = {*sceneWaterState};
+    } else {
+        fixture.waterSceneStates.clear();
+    }
+
+    fixture.sceneVisualStates.erase(
+        std::remove_if(
+            fixture.sceneVisualStates.begin(),
+            fixture.sceneVisualStates.end(),
+            [](const auto& visual) {
+                return visual.sceneGroupName != "Scene3" &&
+                       visual.sceneGroupName != "SampleScene";
+            }),
+        fixture.sceneVisualStates.end());
+    for (auto& visual : fixture.sceneVisualStates) {
+        visual.sceneGroupName = "Scene3";
+    }
+
+    struct RoleFixture {
+        std::string_view role;
+        std::string_view analysisFilename;
+        std::string_view displayFilename;
+        std::uint64_t displayPointCount;
+    };
+    constexpr std::array<RoleFixture, 3> kRoles{{
+        {"ROCK", "Site3-ROCK-1mm.ply", "Site3-ROCK-5mm.ply", 2'351'842U},
+        {"SAND", "Site3-SAND-2mm.ply", "Site3-SAND-5mm.ply", 8'747'717U},
+        {"VEG", "Site3-VEG-1mm.ply", "Site3-VEG-5mm.ply", 3'732'504U},
+    }};
+    std::vector<ProjectLayerDocument> layers;
+    layers.reserve(kRoles.size());
+    std::vector<ScenePointCloudRoleSourceDocument> roleSources;
+    roleSources.reserve(kRoles.size());
+    for (const auto& role : kRoles) {
+        const auto templateLayer = std::find_if(
+            fixture.layers.begin(),
+            fixture.layers.end(),
+            [&](const auto& layer) { return layer.sceneRole == role.role; });
+        ProjectLayerDocument layer =
+            templateLayer != fixture.layers.end()
+                ? *templateLayer
+                : ProjectLayerDocument{};
+        layer.kind =
+            invisible_places::serialization::SerializedLayerKind::PointCloud;
+        layer.sceneGroupName = "Scene3";
+        layer.sceneRole = role.role;
+        layer.sourcePath = dataRoot / "Scene3" / role.displayFilename;
+        layer.selectedSceneVariantPath = layer.sourcePath;
+        layer.inferredPointSpacingMeters = 0.005F;
+        layer.pointSpacingMeters = 0.005F;
+        layer.loaded = true;
+        layer.visible = true;
+        layer.pointBudgetActivePoints = role.displayPointCount;
+        layers.push_back(std::move(layer));
+        roleSources.push_back({
+            .sceneRole = std::string{role.role},
+            .analysisSourcePath =
+                dataRoot / "Scene3" / role.analysisFilename,
+            .displaySourcePath =
+                dataRoot / "Scene3" / role.displayFilename,
+        });
+    }
+    fixture.layers = std::move(layers);
+    fixture.selectedLayerPath = dataRoot / "Scene3" / "Site3-ROCK-5mm.ply";
+    fixture.scenePointCloudGroups = {
+        ScenePointCloudGroupDocument{
+            .sceneGroupName = "Scene3",
+            .displaySpacingMeters = 0.005F,
+            .displayLoaded = true,
+            .displayVisible = true,
+            .roleSources = std::move(roleSources),
+            .waterSurfaceCache = std::nullopt,
+        }};
+    fixture.savedAnimations = {
+        {.filePath =
+             DefaultAnimationDirectory(dataRoot) / "Exhibition.ipanim.json",
+         .associatedLayerPaths = {
+             std::filesystem::path{"__scene_group__/Scene3"}}}};
+    fixture.hasSavedAnimationRegistry = true;
+    return fixture;
+}
+
 int RunWaterIntegrationSmoke(
     const GuiSmokeOptions& options,
     platform::Window* window,
@@ -49989,7 +51103,7 @@ int RunWaterIntegrationSmoke(
     const auto outputDirectory =
         options.outputDirectory.empty()
             ? DefaultRenderOutputDirectory(dataRoot) / "water-integration" /
-                  (sampleScene ? "sample-scene" : "scene1-top-view")
+                  (sampleScene ? "sample-scene" : "scene3-exhibition")
             : options.outputDirectory;
     WaterIntegrationSmokeReport report{
         .scenario = options.scenario,
@@ -49997,8 +51111,12 @@ int RunWaterIntegrationSmoke(
                            ? dataRoot.parent_path() / "Saved" / "validation" /
                                  "SampleSceneValidation_project.json"
                            : dataRoot.parent_path() / "Saved" /
-                                 "exhibitionScene_project.json",
-        .animationPath = DefaultAnimationDirectory(dataRoot) / "Top_View.ipanim.json",
+                                 "ExhibitionFinal_project.json",
+        .animationPath = sampleScene
+                             ? dataRoot.parent_path() / "tests" / "fixtures" /
+                                   "sample_scene_validation.ipanim.json"
+                             : DefaultAnimationDirectory(dataRoot) /
+                                   "Exhibition.ipanim.json",
         .outputPath = outputDirectory / "water-integration-report.json",
     };
     const auto finish = [&]() {
@@ -50027,12 +51145,17 @@ int RunWaterIntegrationSmoke(
 
     runtimeState->persistence.projectFilePath = report.projectPath.string();
     std::string loadError;
-    const auto project = invisible_places::serialization::LoadProjectDocument(
+    auto project = invisible_places::serialization::LoadProjectDocument(
         report.projectPath,
         &loadError);
     if (!project.has_value()) {
         report.Fail("Could not load validation project: " + loadError);
         return finish();
+    }
+    if (!sampleScene) {
+        project = BuildScene3WaterIntegrationFixture(
+            std::move(project.value()),
+            dataRoot);
     }
     const auto startupStartedAt = std::chrono::steady_clock::now();
     if (!ApplyProjectDocumentToRuntime(project.value(), runtimeState, viewport)) {
@@ -50044,23 +51167,29 @@ int RunWaterIntegrationSmoke(
         return finish();
     }
     if (!LoadAnimationPathFromFile(runtimeState, report.animationPath)) {
-        report.Fail("Could not load Top_View: " + runtimeState->errorMessage);
+        report.Fail("Could not load validation animation: " + runtimeState->errorMessage);
         return finish();
     }
-    const auto& loadedTopView = runtimeState->animationPanel.currentPath.value();
-    const auto topViewDurationSeconds =
-        invisible_places::camera::AnimationPathDurationSeconds(loadedTopView);
-    if (loadedTopView.name == "Top_View" &&
-        loadedTopView.durationFrames == 3600U &&
-        loadedTopView.exportSettings.framesPerSecond == 30U &&
-        std::abs(topViewDurationSeconds - 120.0F) <= 1.0e-4F) {
-        report.Pass("Loaded Top_View as the authored 3,600-frame, 30 fps, 120-second pan.");
+    const auto& loadedValidationPath = runtimeState->animationPanel.currentPath.value();
+    const auto validationDurationSeconds =
+        invisible_places::camera::AnimationPathDurationSeconds(loadedValidationPath);
+    const std::string expectedAnimationName =
+        AnimationNameFromFilePath(report.animationPath);
+    const std::uint32_t expectedAnimationFrames = sampleScene ? 900U : 3600U;
+    const float expectedAnimationSeconds = sampleScene ? 30.0F : 120.0F;
+    if (loadedValidationPath.name == expectedAnimationName &&
+        loadedValidationPath.durationFrames == expectedAnimationFrames &&
+        loadedValidationPath.exportSettings.framesPerSecond == 30U &&
+        std::abs(validationDurationSeconds - expectedAnimationSeconds) <= 1.0e-4F) {
+        report.Pass(
+            "Loaded " + expectedAnimationName + " as the authored " +
+            std::to_string(expectedAnimationFrames) + "-frame, 30 fps path.");
     } else {
         report.Fail(
-            "Top_View was not the authored 3,600-frame, 30 fps, 120-second pan (" +
-            std::to_string(loadedTopView.durationFrames) + " frames, " +
-            std::to_string(loadedTopView.exportSettings.framesPerSecond) + " fps, " +
-            FormatFixed(topViewDurationSeconds, 3) + " seconds).");
+            expectedAnimationName + " did not match its authored timing (" +
+            std::to_string(loadedValidationPath.durationFrames) + " frames, " +
+            std::to_string(loadedValidationPath.exportSettings.framesPerSecond) + " fps, " +
+            FormatFixed(validationDurationSeconds, 3) + " seconds).");
     }
     // Exercise the real project startup state before installing the synthetic
     // 120-second acceptance track. The reported flicker occurs with authored
@@ -50072,7 +51201,9 @@ int RunWaterIntegrationSmoke(
     InvalidateWaterSeepageParams(&runtimeState->water);
     StartQueuedLayerLoadIfIdle(runtimeState);
 
-    const std::string expectedSceneName = sampleScene ? "SampleScene" : "Scene1";
+    const std::string expectedSceneName = sampleScene ? "SampleScene" : "Scene3";
+    const std::uint32_t expectedDisplaySpacingMicrometres =
+        sampleScene ? 3'000U : 5'000U;
     auto findExpectedScene = [&]() -> ScenePointCloudRuntime* {
         const auto sceneIt = std::find_if(
             runtimeState->pointCloudScenes.begin(),
@@ -50082,7 +51213,8 @@ int RunWaterIntegrationSmoke(
     };
     auto displayReady = [&](const ScenePointCloudRuntime& scene) {
         if (!scene.displayLoaded || !scene.displayVisible ||
-            scene.committedDisplaySpacingMicrometres != 3000U) {
+            scene.committedDisplaySpacingMicrometres !=
+                expectedDisplaySpacingMicrometres) {
             return false;
         }
         return std::all_of(
@@ -50216,13 +51348,19 @@ int RunWaterIntegrationSmoke(
         return finish();
     }
     if (sawDisplay && report.displayVisibleBeforeAnalysis) {
-        report.Pass("The complete 3 mm display became visible before canonical analysis residency.");
+        report.Pass(
+            "The complete " +
+            std::to_string(expectedDisplaySpacingMicrometres / 1'000U) +
+            " mm display became visible before canonical analysis residency.");
     } else if (!sawDisplay) {
         report.Fail(
-            "The complete 3 mm display did not become visible before the startup deadline (" +
+            "The complete " +
+            std::to_string(expectedDisplaySpacingMicrometres / 1'000U) +
+            " mm display did not become visible before the startup deadline (" +
             startupStateSummary() + ").");
     } else {
-        report.Fail("Canonical analysis data was resident when the 3 mm display first became visible.");
+        report.Fail(
+            "Canonical analysis data was resident when the display first became visible.");
     }
     if (cacheReady) {
         report.Pass("The shared surface cache installed and completed GPU preprocessing.");
@@ -50292,12 +51430,14 @@ int RunWaterIntegrationSmoke(
             "to the expected scene.");
     }
     if (!sampleScene && runtimeState->water.waterSurfaceCache != nullptr) {
-        constexpr std::uint64_t expectedScene1SourcePoints = 39'409'886ULL;
-        if (runtimeState->water.waterSurfaceCache->sourcePointCount == expectedScene1SourcePoints) {
-            report.Pass("Scene1 cache consumed the expected 39,409,886 source points.");
+        constexpr std::uint64_t expectedScene3SourcePoints = 73'862'216ULL;
+        if (runtimeState->water.waterSurfaceCache->sourcePointCount == expectedScene3SourcePoints) {
+            report.Pass(
+                "Scene3 cache consumed the expected 73,862,216 terrain points "
+                "plus its separate 9,514,537-point sampled Ground.");
         } else {
             report.Fail(
-                "Scene1 cache source-point count differed from 39,409,886 (" +
+                "Scene3 cache terrain source-point count differed from 73,862,216 (" +
                 FormatPointCount(runtimeState->water.waterSurfaceCache->sourcePointCount) + ").");
         }
     }
@@ -50324,9 +51464,9 @@ int RunWaterIntegrationSmoke(
     }
     if (!sampleScene && report.cachePayloadBytes > 0U &&
         report.cachePayloadBytes <= invisible_places::water::kWaterSurfaceCacheMaximumPersistenceBytes) {
-        report.Pass("Scene1 installed a persisted 10 mm shared-cache payload below the 5 GiB ceiling.");
+        report.Pass("Scene3 installed a persisted 10 mm shared-cache payload below the 5 GiB ceiling.");
     } else if (!sampleScene) {
-        report.Fail("Scene1 shared-cache payload was empty or exceeded the persistence ceiling.");
+        report.Fail("Scene3 shared-cache payload was empty or exceeded the persistence ceiling.");
     }
     if (report.cacheLoadedFromDisk) {
         if (report.startupCounters.sourceScans == 0U &&
@@ -50337,10 +51477,10 @@ int RunWaterIntegrationSmoke(
             report.Fail("Warm cache load performed source scans, table rebuilds, or extra full-payload hashing.");
         }
         if (!sampleScene && report.cacheValidationUploadMs <= 8000.0) {
-            report.Pass("Warm Scene1 cache validation/upload completed within eight seconds.");
+            report.Pass("Warm Scene3 cache validation/upload completed within eight seconds.");
         } else if (!sampleScene) {
             report.Fail(
-                "Warm Scene1 cache validation/upload exceeded eight seconds (" +
+                "Warm Scene3 cache validation/upload exceeded eight seconds (" +
                 FormatFixed(report.cacheValidationUploadMs, 3) + " ms).");
         }
     } else if (report.startupCounters.sourceScans == 4U &&
@@ -50361,7 +51501,7 @@ int RunWaterIntegrationSmoke(
     const auto startupRockSessionIndex = findCommittedRockSession(*scene);
     if (startupSeepageIt == runtimeState->water.seepageNodes.end() ||
         !startupRockSessionIndex.has_value()) {
-        report.Fail("The authored startup Seepage node or 3 mm ROCK display layer was unavailable.");
+        report.Fail("The authored startup Seepage node or ROCK display layer was unavailable.");
     } else {
         const auto rockLayerId = startupRockSessionIndex.value();
         // Validate the attachment actually used by the live presentation path,
@@ -50955,18 +52095,21 @@ int RunWaterIntegrationSmoke(
         return false;
     };
 
-    bool densityCyclePassed = true;
-    for (const auto spacing : std::array<invisible_places::scene::PointSpacingMicrometres, 3>{
-             2000U,
-             3000U,
-             2000U}) {
-        densityCyclePassed = switchDisplayDensityForSmoke(spacing) && densityCyclePassed;
-    }
-    if (densityCyclePassed) {
-        report.Pass("Completed the 3 mm -> 2 mm -> 3 mm -> 2 mm Seepage-enabled density cycle.");
-    }
+    if (sampleScene) {
+        bool densityCyclePassed = true;
+        for (const auto spacing : std::array<invisible_places::scene::PointSpacingMicrometres, 3>{
+                 2000U,
+                 expectedDisplaySpacingMicrometres,
+                 2000U}) {
+            densityCyclePassed = switchDisplayDensityForSmoke(spacing) && densityCyclePassed;
+        }
+        if (densityCyclePassed) {
+            report.Pass(
+                "Completed the authored display -> 2 mm -> authored display -> "
+                "2 mm Seepage-enabled density cycle.");
+        }
 
-    if (scene->committedDisplaySpacingMicrometres == 2000U) {
+        if (scene->committedDisplaySpacingMicrometres == 2000U) {
         const auto previousDisplay = scene->committedDisplaySessionIndices;
         const auto selectedSessionBeforeFailure = runtimeState->selectedSessionIndex;
         const auto topologyBuildsBeforeFailure =
@@ -50978,7 +52121,7 @@ int RunWaterIntegrationSmoke(
             runtimeState,
             viewport,
             scene,
-            3000U);
+            expectedDisplaySpacingMicrometres);
         const auto failureDeadline = std::chrono::steady_clock::now() +
                                      (sampleScene ? std::chrono::seconds{120}
                                                   : std::chrono::seconds{360});
@@ -50999,7 +52142,7 @@ int RunWaterIntegrationSmoke(
             report.densityTransactionPeakGpuResidentBytes,
             scene->lastSwitchPeakGpuResidentBytes);
         const auto expectedFailedTargetBytesIt =
-            settledResidentBytesBySpacing.find(3000U);
+            settledResidentBytesBySpacing.find(expectedDisplaySpacingMicrometres);
         const auto failureResidencyCeiling = std::max(
             scene->lastSwitchOldGpuResidentBytes,
             expectedFailedTargetBytesIt != settledResidentBytesBySpacing.end()
@@ -51034,7 +52177,8 @@ int RunWaterIntegrationSmoke(
                 runtimeState->sessions[sessionIndex.value()].gpuResident &&
                 runtimeState->sessions[sessionIndex.value()].visible;
         }
-        if (const auto* failedTarget = FindSceneDisplayBundle(*scene, 3000U);
+        if (const auto* failedTarget =
+                FindSceneDisplayBundle(*scene, expectedDisplaySpacingMicrometres);
             failedTarget != nullptr) {
             for (const auto targetSessionIndex : failedTarget->sessionIndices) {
                 if (std::find(
@@ -51076,12 +52220,22 @@ int RunWaterIntegrationSmoke(
         }
         scene->smokeInjectedUploadFailureRoleIndex.reset();
         runtimeState->errorMessage.clear();
+        } else {
+            report.Fail(
+                "Density rollback injection was skipped because the 2 mm bundle "
+                "was not committed.");
+        }
+        if (scene->committedDisplaySpacingMicrometres == 2000U &&
+            switchDisplayDensityForSmoke(expectedDisplaySpacingMicrometres)) {
+            report.Pass(
+                "Restored the authored display for the remaining animation validation.");
+        }
+    } else if (scene->committedDisplaySpacingMicrometres == 5'000U) {
+        report.Pass(
+            "Scene3 retained the live-view 5 mm display; density transaction and "
+            "rollback coverage remains on SampleScene.");
     } else {
-        report.Fail("Density rollback injection was skipped because the 2 mm bundle was not committed.");
-    }
-    if (scene->committedDisplaySpacingMicrometres == 2000U &&
-        switchDisplayDensityForSmoke(3000U)) {
-        report.Pass("Restored the authored 3 mm display for the remaining Top_View validation.");
+        report.Fail("Scene3 did not retain its authored 5 mm display.");
     }
 
     InstallWaterIntegrationScenario(runtimeState);
@@ -51156,7 +52310,7 @@ int RunWaterIntegrationSmoke(
             std::string{"Explicit Bake Path activated SampleFlowPoint id 1 alongside SampleFlowPath id 10 via "} +
             (pathBakeDelta == 0U ? "the settled Flow sidecar." : "one cold source-local bake."));
     } else {
-        // Scene1 startup remains bounded and never requests canonical analysis.
+        // Scene3 startup remains bounded and never requests canonical analysis.
         // Its authored manual path can be prepared from the compact cache.
         if (WaterFlowIntegrationJobsSettled(*runtimeState, *viewport) &&
             !hasGeneratedFlowSources({flowPathIt->id})) {
@@ -51720,10 +52874,20 @@ int Application::Run(ApplicationRunOptions options) const {
             viewport->WaitIdle();
             return smokeExitCode;
         }
+        if (options.guiSmoke->scenario == "renderer-frame-timing-scene3-5mm") {
+            const auto smokeExitCode = RunRendererFrameTimingScene3Smoke(
+                options.guiSmoke.value(),
+                assetCatalog,
+                &window,
+                &viewport.value(),
+                &runtimeState);
+            StopBackgroundWorkForShutdown(&runtimeState);
+            viewport->WaitIdle();
+            return smokeExitCode;
+        }
         if (options.guiSmoke->scenario == "dynamic-mesh-flow-ground" ||
-            options.guiSmoke->scenario == "dynamic-mesh-flow-site3" ||
             options.guiSmoke->scenario ==
-                "dynamic-mesh-flow-scene1-visual") {
+                "dynamic-mesh-flow-scene3-5mm-visual") {
             const auto smokeExitCode = RunDynamicMeshFlowGroundSmoke(
                 options.guiSmoke.value(),
                 assetCatalog,
@@ -51758,7 +52922,7 @@ int Application::Run(ApplicationRunOptions options) const {
             return smokeExitCode;
         }
         if (options.guiSmoke->scenario == "rain-gpu-sample-scene" ||
-            options.guiSmoke->scenario == "rain-gpu-scene1-3mm") {
+            options.guiSmoke->scenario == "rain-gpu-scene3-5mm") {
             const auto smokeExitCode = RunGpuCollisionRainSmoke(
                 options.guiSmoke.value(),
                 assetCatalog,
@@ -51770,7 +52934,7 @@ int Application::Run(ApplicationRunOptions options) const {
             return smokeExitCode;
         }
         if (options.guiSmoke->scenario == "water-integration-sample-scene" ||
-            options.guiSmoke->scenario == "water-integration-scene1-top-view") {
+            options.guiSmoke->scenario == "water-integration-scene3-exhibition") {
             const auto smokeExitCode = RunWaterIntegrationSmoke(
                 options.guiSmoke.value(),
                 &window,
@@ -51949,7 +53113,7 @@ int Application::Run(ApplicationRunOptions options) const {
                     viewport.value(),
                     &waterFrameState);
             }
-            viewport->SetDiagnosticsEnabled(true);
+            viewport->SetDiagnosticsEnabled(runtimeState.showDiagnosticsPanel);
             viewport->SetSceneCachingEnabled(!runtimeState.projectSettings.constantUpdateView);
             viewport->SetLiveSceneRenderingEnabled(!pauseLiveViewport);
             if (!pauseLiveViewport) {

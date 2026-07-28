@@ -77,6 +77,21 @@ double MillisecondsBetween(
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
+const char* PresentModeName(VkPresentModeKHR presentMode) {
+    switch (presentMode) {
+        case VK_PRESENT_MODE_IMMEDIATE_KHR:
+            return "Immediate";
+        case VK_PRESENT_MODE_MAILBOX_KHR:
+            return "Mailbox";
+        case VK_PRESENT_MODE_FIFO_KHR:
+            return "FIFO";
+        case VK_PRESENT_MODE_FIFO_RELAXED_KHR:
+            return "FIFO relaxed";
+        default:
+            return "Unknown";
+    }
+}
+
 struct alignas(16) PointCloudBindingGpu {
     glm::vec4 constantValue{0.0F, 0.0F, 0.0F, 0.0F};
     glm::vec4 range{0.0F, 1.0F, 0.0F, 1.0F};
@@ -1538,13 +1553,13 @@ VulkanViewportShell::~VulkanViewportShell() {
             vkDestroySemaphore(device_, frame.imageAvailableSemaphore, nullptr);
             frame.imageAvailableSemaphore = VK_NULL_HANDLE;
         }
-        if (frame.renderFinishedSemaphore != VK_NULL_HANDLE) {
-            vkDestroySemaphore(device_, frame.renderFinishedSemaphore, nullptr);
-            frame.renderFinishedSemaphore = VK_NULL_HANDLE;
-        }
         if (frame.fence != VK_NULL_HANDLE) {
             vkDestroyFence(device_, frame.fence, nullptr);
             frame.fence = VK_NULL_HANDLE;
+        }
+        if (frame.timestampQueryPool != VK_NULL_HANDLE) {
+            vkDestroyQueryPool(device_, frame.timestampQueryPool, nullptr);
+            frame.timestampQueryPool = VK_NULL_HANDLE;
         }
     }
 
@@ -1746,6 +1761,13 @@ bool VulkanViewportShell::AnySceneImageNeedsRender() const {
 
 void VulkanViewportShell::DrawFrame() {
     const bool collectDiagnostics = diagnosticsEnabled_;
+    if (dynamicMeshFlowTimingPublishedGeneration_ ==
+        dynamicMeshFlowTimingResultGeneration_) {
+        diagnostics_.gpuDynamicMeshFlow.active = false;
+    } else {
+        dynamicMeshFlowTimingPublishedGeneration_ =
+            dynamicMeshFlowTimingResultGeneration_;
+    }
     const auto frameStart = collectDiagnostics ? std::chrono::steady_clock::now()
                                                : std::chrono::steady_clock::time_point{};
 
@@ -1757,22 +1779,46 @@ void VulkanViewportShell::DrawFrame() {
                                           : std::chrono::steady_clock::time_point{};
 
     auto& frame = frameResources_[currentFrameIndex_];
-    vkWaitForFences(device_, 1, &frame.fence, VK_TRUE, UINT64_MAX);
+    Check(
+        vkWaitForFences(device_, 1, &frame.fence, VK_TRUE, UINT64_MAX),
+        "vkWaitForFences(frame slot)");
+    const auto fenceWaitEnd = collectDiagnostics
+                                  ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
+    if (frame.activeSubmissionSerial != 0U) {
+        frame.completedSubmissionSerial = frame.activeSubmissionSerial;
+        ReadCompletedFrameTimestamps(currentFrameIndex_);
+        ClearCompletedImageOwners(
+            &swapchainImageOwners_,
+            static_cast<std::uint32_t>(currentFrameIndex_),
+            frame.completedSubmissionSerial);
+        frame.activeSubmissionSerial = 0U;
+    }
     PollWaterFlowSourceDispatches();
     // This frame slot is no longer referenced by the GPU, so it is safe to
     // publish the newest compact water-effect snapshots without waiting for
     // any other in-flight frame.
     FlushSparseWaterRippleParamsForFrame(currentFrameIndex_);
     FlushWaterSeepageParamsForFrame(currentFrameIndex_);
-    const auto fenceEnd = collectDiagnostics ? std::chrono::steady_clock::now()
-                                             : std::chrono::steady_clock::time_point{};
+    const auto maintenanceEnd = collectDiagnostics
+                                    ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
     if (AnySceneImageNeedsRender()) {
         RefreshHighQualityGaussianScene(currentFrameIndex_);
+    }
+    const auto highQualityPrepareEnd = collectDiagnostics
+                                           ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
+    if (AnySceneImageNeedsRender()) {
         UpdateUniformBuffer(currentFrameIndex_);
     }
     const auto prepareEnd = collectDiagnostics ? std::chrono::steady_clock::now()
                                                : std::chrono::steady_clock::time_point{};
 
+    diagnostics_.imageOwnerWaited = false;
+    diagnostics_.imageWaitImageIndex = 0U;
+    diagnostics_.imageWaitOwnerFrameSlot = 0U;
+    diagnostics_.imageWaitOwnerSubmissionSerial = 0U;
     std::uint32_t imageIndex = 0;
     const VkResult acquireResult =
         vkAcquireNextImageKHR(
@@ -1794,20 +1840,61 @@ void VulkanViewportShell::DrawFrame() {
         Check(acquireResult, "vkAcquireNextImageKHR");
     }
 
-    if (imageIndex < swapchainImagesInFlight_.size() && swapchainImagesInFlight_[imageIndex] != VK_NULL_HANDLE) {
-        vkWaitForFences(device_, 1, &swapchainImagesInFlight_[imageIndex], VK_TRUE, UINT64_MAX);
+    if (imageIndex < swapchainImageOwners_.size()) {
+        const auto owner = swapchainImageOwners_[imageIndex];
+        if (owner.Valid() && owner.frameSlot < frameResources_.size()) {
+            auto& ownerFrame = frameResources_[owner.frameSlot];
+            const auto state = ClassifySwapchainImageOwner(
+                owner,
+                ownerFrame.activeSubmissionSerial,
+                ownerFrame.completedSubmissionSerial);
+            if (state == SwapchainImageOwnerState::Active) {
+                if (collectDiagnostics) {
+                    diagnostics_.imageOwnerWaited = true;
+                    diagnostics_.imageWaitImageIndex = imageIndex;
+                    diagnostics_.imageWaitOwnerFrameSlot =
+                        owner.frameSlot;
+                    diagnostics_.imageWaitOwnerSubmissionSerial =
+                        owner.submissionSerial;
+                }
+                Check(
+                    vkWaitForFences(
+                        device_,
+                        1,
+                        &ownerFrame.fence,
+                        VK_TRUE,
+                        UINT64_MAX),
+                    "vkWaitForFences(swapchain image owner)");
+                ownerFrame.completedSubmissionSerial =
+                    ownerFrame.activeSubmissionSerial;
+                ReadCompletedFrameTimestamps(owner.frameSlot);
+                ClearCompletedImageOwners(
+                    &swapchainImageOwners_,
+                    owner.frameSlot,
+                    owner.submissionSerial);
+                ownerFrame.activeSubmissionSerial = 0U;
+            } else {
+                if (state == SwapchainImageOwnerState::Stale) {
+                    ++diagnostics_.staleImageOwnerCount;
+                }
+                swapchainImageOwners_[imageIndex] = {};
+            }
+        } else if (owner.Valid()) {
+            ++diagnostics_.staleImageOwnerCount;
+            swapchainImageOwners_[imageIndex] = {};
+        }
     }
     const auto imageWaitEnd = collectDiagnostics ? std::chrono::steady_clock::now()
                                                  : std::chrono::steady_clock::time_point{};
-    if (imageIndex < swapchainImagesInFlight_.size()) {
-        swapchainImagesInFlight_[imageIndex] = frame.fence;
-    }
     Check(vkResetFences(device_, 1, &frame.fence), "vkResetFences");
     Check(vkResetCommandBuffer(frame.commandBuffer, 0), "vkResetCommandBuffer");
     // Surface descriptor generations can be reclaimed only after MoltenVK's
     // executable command buffer for this slot has been reset, not merely once
     // its fence has signalled.
     PollWaterSurfacePreprocess();
+    const auto resetPollEnd = collectDiagnostics
+                                  ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
     RecordCommandBuffer(frame.commandBuffer, imageIndex, currentFrameIndex_);
     const auto recordEnd = collectDiagnostics ? std::chrono::steady_clock::now()
                                               : std::chrono::steady_clock::time_point{};
@@ -1820,15 +1907,38 @@ void VulkanViewportShell::DrawFrame() {
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &frame.commandBuffer;
     submitInfo.signalSemaphoreCount = 1;
-    submitInfo.pSignalSemaphores = &frame.renderFinishedSemaphore;
+    VkSemaphore renderFinishedSemaphore =
+        imageIndex < swapchainRenderFinishedSemaphores_.size()
+            ? swapchainRenderFinishedSemaphores_[imageIndex]
+            : VK_NULL_HANDLE;
+    if (renderFinishedSemaphore == VK_NULL_HANDLE) {
+        throw std::runtime_error{
+            "Acquired swapchain image has no render-finished semaphore."};
+    }
+    submitInfo.pSignalSemaphores = &renderFinishedSemaphore;
 
     Check(vkQueueSubmit(graphicsQueue_, 1, &submitInfo, frame.fence), "vkQueueSubmit");
+    const std::uint64_t submissionSerial = nextSubmissionSerial_++;
+    frame.activeSubmissionSerial = submissionSerial;
+    frame.submittedImageIndex = imageIndex;
+    frame.timestampPending =
+        collectDiagnostics && gpuTimestampsSupported_ &&
+        frame.timestampQueryPool != VK_NULL_HANDLE;
+    if (imageIndex < swapchainImageOwners_.size()) {
+        swapchainImageOwners_[imageIndex] = SwapchainImageOwner{
+            static_cast<std::uint32_t>(currentFrameIndex_),
+            submissionSerial};
+    }
+    diagnostics_.submittedFrameSlot =
+        static_cast<std::uint32_t>(currentFrameIndex_);
+    diagnostics_.submittedImageIndex = imageIndex;
+    diagnostics_.submittedSubmissionSerial = submissionSerial;
     const auto submitEnd = collectDiagnostics ? std::chrono::steady_clock::now()
                                               : std::chrono::steady_clock::time_point{};
 
     VkPresentInfoKHR presentInfo{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     presentInfo.waitSemaphoreCount = 1;
-    presentInfo.pWaitSemaphores = &frame.renderFinishedSemaphore;
+    presentInfo.pWaitSemaphores = &renderFinishedSemaphore;
     presentInfo.swapchainCount = 1;
     presentInfo.pSwapchains = &swapchain_;
     presentInfo.pImageIndices = &imageIndex;
@@ -1862,17 +1972,29 @@ void VulkanViewportShell::DrawFrame() {
         diagnostics_.currentFrameIndex = static_cast<std::uint32_t>(currentFrameIndex_);
         diagnostics_.frameAverageWindowSeconds = kFrameAverageWindowMs / 1000.0;
         diagnostics_.frameUiRenderMs = MillisecondsBetween(frameStart, uiEnd);
-        diagnostics_.frameFenceWaitMs = MillisecondsBetween(uiEnd, fenceEnd);
-        diagnostics_.framePrepareMs = MillisecondsBetween(fenceEnd, prepareEnd);
+        diagnostics_.frameFenceWaitMs =
+            MillisecondsBetween(uiEnd, fenceWaitEnd);
+        diagnostics_.frameCompletedMaintenanceMs =
+            MillisecondsBetween(fenceWaitEnd, maintenanceEnd);
+        diagnostics_.frameHighQualityGaussianPrepareMs =
+            MillisecondsBetween(maintenanceEnd, highQualityPrepareEnd);
+        diagnostics_.frameUniformResourceUploadMs =
+            MillisecondsBetween(highQualityPrepareEnd, prepareEnd);
+        diagnostics_.framePrepareMs =
+            MillisecondsBetween(maintenanceEnd, prepareEnd);
         diagnostics_.frameAcquireMs = MillisecondsBetween(prepareEnd, acquireEnd);
         diagnostics_.frameImageWaitMs = MillisecondsBetween(acquireEnd, imageWaitEnd);
-        diagnostics_.frameCommandBufferMs = MillisecondsBetween(imageWaitEnd, recordEnd);
+        diagnostics_.frameResetRetirePollingMs =
+            MillisecondsBetween(imageWaitEnd, resetPollEnd);
+        diagnostics_.frameCommandBufferMs =
+            MillisecondsBetween(resetPollEnd, recordEnd);
         diagnostics_.frameSubmitMs = MillisecondsBetween(recordEnd, submitEnd);
         diagnostics_.framePresentMs = MillisecondsBetween(submitEnd, presentEnd);
         diagnostics_.framePlatformWindowsMs = MillisecondsBetween(presentEnd, frameEnd);
         diagnostics_.frameRenderMs = MillisecondsBetween(frameStart, frameEnd);
         diagnostics_.frameFps =
             diagnostics_.frameRenderMs > 0.0 ? 1000.0 / diagnostics_.frameRenderMs : 0.0;
+        UpdateCpuTimingAverages();
         if (!diagnosticsTimingInitialized_) {
             diagnostics_.averageFrameRenderMs = diagnostics_.frameRenderMs;
             diagnostics_.averageFrameFps = diagnostics_.frameFps;
@@ -2140,14 +2262,46 @@ void VulkanViewportShell::SetDiagnosticsEnabled(bool enabled) {
         diagnostics_.averageFrameFps = 0.0;
         diagnostics_.frameAverageWindowSeconds = 0.5;
         diagnostics_.frameUiRenderMs = 0.0;
+        diagnostics_.averageFrameUiRenderMs = 0.0;
         diagnostics_.frameFenceWaitMs = 0.0;
+        diagnostics_.averageFrameFenceWaitMs = 0.0;
+        diagnostics_.frameCompletedMaintenanceMs = 0.0;
+        diagnostics_.averageFrameCompletedMaintenanceMs = 0.0;
         diagnostics_.frameAcquireMs = 0.0;
+        diagnostics_.averageFrameAcquireMs = 0.0;
         diagnostics_.frameImageWaitMs = 0.0;
+        diagnostics_.averageFrameImageWaitMs = 0.0;
         diagnostics_.framePrepareMs = 0.0;
+        diagnostics_.frameHighQualityGaussianPrepareMs = 0.0;
+        diagnostics_.averageFrameHighQualityGaussianPrepareMs = 0.0;
+        diagnostics_.frameUniformResourceUploadMs = 0.0;
+        diagnostics_.averageFrameUniformResourceUploadMs = 0.0;
+        diagnostics_.frameResetRetirePollingMs = 0.0;
+        diagnostics_.averageFrameResetRetirePollingMs = 0.0;
         diagnostics_.frameCommandBufferMs = 0.0;
+        diagnostics_.averageFrameCommandBufferMs = 0.0;
         diagnostics_.frameSubmitMs = 0.0;
+        diagnostics_.averageFrameSubmitMs = 0.0;
         diagnostics_.framePresentMs = 0.0;
+        diagnostics_.averageFramePresentMs = 0.0;
         diagnostics_.framePlatformWindowsMs = 0.0;
+        diagnostics_.averageFramePlatformWindowsMs = 0.0;
+        diagnostics_.gpuTimestampResultsAvailable = false;
+        diagnostics_.gpuTimestampUnavailableResultCount = 0U;
+        diagnostics_.gpuTotal = {};
+        diagnostics_.gpuRainCompute = {};
+        diagnostics_.gpuDepth = {};
+        diagnostics_.gpuWeightedAccumulation = {};
+        diagnostics_.gpuComposite = {};
+        diagnostics_.gpuOpaqueAndHighQuality = {};
+        diagnostics_.gpuPostProcess = {};
+        diagnostics_.gpuImGui = {};
+        diagnostics_.gpuDynamicMeshFlow = {};
+        cpuTimingWindow_.Reset();
+        gpuTimingWindow_.Reset();
+        dynamicMeshFlowTimingWindow_.Reset();
+        lastGpuTimingSampleAt_ = {};
+        lastDynamicMeshFlowTimingSampleAt_ = {};
     }
 }
 
@@ -7082,6 +7236,8 @@ void VulkanViewportShell::PickPhysicalDevice() {
         diagnostics_.driverName = "Vulkan";
         pointSizeRangeMin_ = std::max(1.0F, properties.limits.pointSizeRange[0]);
         pointSizeRangeMax_ = std::max(pointSizeRangeMin_, properties.limits.pointSizeRange[1]);
+        gpuTimestampPeriodNanoseconds_ =
+            static_cast<double>(properties.limits.timestampPeriod);
         break;
     }
 
@@ -7092,6 +7248,28 @@ void VulkanViewportShell::PickPhysicalDevice() {
     const auto selection = FindQueueFamilies(physicalDevice_, surface_);
     graphicsQueueFamily_ = selection.graphicsFamily.value();
     presentQueueFamily_ = selection.presentFamily.value();
+
+    std::uint32_t queueFamilyCount = 0U;
+    vkGetPhysicalDeviceQueueFamilyProperties(
+        physicalDevice_,
+        &queueFamilyCount,
+        nullptr);
+    std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
+    vkGetPhysicalDeviceQueueFamilyProperties(
+        physicalDevice_,
+        &queueFamilyCount,
+        queueFamilies.data());
+    if (graphicsQueueFamily_ < queueFamilies.size()) {
+        gpuTimestampValidBits_ =
+            queueFamilies[graphicsQueueFamily_].timestampValidBits;
+    }
+    gpuTimestampsSupported_ =
+        gpuTimestampValidBits_ > 0U &&
+        gpuTimestampPeriodNanoseconds_ > 0.0;
+    diagnostics_.gpuTimestampsSupported = gpuTimestampsSupported_;
+    diagnostics_.gpuTimestampValidBits = gpuTimestampValidBits_;
+    diagnostics_.gpuTimestampPeriodNanoseconds =
+        gpuTimestampPeriodNanoseconds_;
 }
 
 void VulkanViewportShell::CreateLogicalDevice() {
@@ -7139,6 +7317,8 @@ void VulkanViewportShell::CreateSwapchain() {
     if (support.capabilities.maxImageCount > 0 && imageCount > support.capabilities.maxImageCount) {
         imageCount = support.capabilities.maxImageCount;
     }
+    requestedSwapchainImageCount_ = imageCount;
+    selectedPresentMode_ = presentMode;
 
     const std::uint32_t queueFamilyIndices[] = {graphicsQueueFamily_, presentQueueFamily_};
 
@@ -7175,7 +7355,8 @@ void VulkanViewportShell::CreateSwapchain() {
     swapchainImageFormat_ = surfaceFormat.format;
     swapchainWidth_ = extent.width;
     swapchainHeight_ = extent.height;
-    swapchainImagesInFlight_.assign(swapchainImages_.size(), VK_NULL_HANDLE);
+    swapchainImageOwners_.assign(swapchainImages_.size(), {});
+    CreateSwapchainRenderFinishedSemaphores();
 
     std::ostringstream summary;
     summary << "Renderer: " << diagnostics_.rendererName << " | " << swapchainWidth_ << "x"
@@ -7183,6 +7364,11 @@ void VulkanViewportShell::CreateSwapchain() {
     diagnostics_.summary = summary.str();
     diagnostics_.width = swapchainWidth_;
     diagnostics_.height = swapchainHeight_;
+    diagnostics_.requestedSwapchainImageCount =
+        requestedSwapchainImageCount_;
+    diagnostics_.swapchainImageCount =
+        static_cast<std::uint32_t>(swapchainImages_.size());
+    diagnostics_.presentMode = PresentModeName(selectedPresentMode_);
 }
 
 void VulkanViewportShell::CreateImageViews() {
@@ -10088,10 +10274,274 @@ void VulkanViewportShell::CreateSyncObjects() {
         Check(
             vkCreateSemaphore(device_, &semaphoreInfo, nullptr, &frame.imageAvailableSemaphore),
             "vkCreateSemaphore(imageAvailable)");
-        Check(
-            vkCreateSemaphore(device_, &semaphoreInfo, nullptr, &frame.renderFinishedSemaphore),
-            "vkCreateSemaphore(renderFinished)");
         Check(vkCreateFence(device_, &fenceInfo, nullptr, &frame.fence), "vkCreateFence");
+    }
+
+    if (!gpuTimestampsSupported_) {
+        return;
+    }
+
+    VkQueryPoolCreateInfo queryPoolInfo{
+        VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    queryPoolInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    queryPoolInfo.queryCount = kFrameTimestampQueryCount;
+    for (auto& frame : frameResources_) {
+        const VkResult queryResult = vkCreateQueryPool(
+            device_,
+            &queryPoolInfo,
+            nullptr,
+            &frame.timestampQueryPool);
+        if (queryResult == VK_SUCCESS) {
+            continue;
+        }
+        for (auto& createdFrame : frameResources_) {
+            if (createdFrame.timestampQueryPool != VK_NULL_HANDLE) {
+                vkDestroyQueryPool(
+                    device_,
+                    createdFrame.timestampQueryPool,
+                    nullptr);
+                createdFrame.timestampQueryPool = VK_NULL_HANDLE;
+            }
+        }
+        gpuTimestampsSupported_ = false;
+        diagnostics_.gpuTimestampsSupported = false;
+        break;
+    }
+}
+
+void VulkanViewportShell::CreateSwapchainRenderFinishedSemaphores() {
+    DestroySwapchainRenderFinishedSemaphores();
+    swapchainRenderFinishedSemaphores_.resize(
+        swapchainImages_.size(),
+        VK_NULL_HANDLE);
+    VkSemaphoreCreateInfo semaphoreInfo{
+        VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    for (auto& semaphore : swapchainRenderFinishedSemaphores_) {
+        Check(
+            vkCreateSemaphore(device_, &semaphoreInfo, nullptr, &semaphore),
+            "vkCreateSemaphore(swapchain render finished)");
+    }
+}
+
+void VulkanViewportShell::DestroySwapchainRenderFinishedSemaphores() {
+    for (auto& semaphore : swapchainRenderFinishedSemaphores_) {
+        if (semaphore != VK_NULL_HANDLE && device_ != VK_NULL_HANDLE) {
+            vkDestroySemaphore(device_, semaphore, nullptr);
+            semaphore = VK_NULL_HANDLE;
+        }
+    }
+    swapchainRenderFinishedSemaphores_.clear();
+}
+
+void VulkanViewportShell::ReadCompletedFrameTimestamps(
+    std::size_t frameIndex) {
+    if (frameIndex >= frameResources_.size()) {
+        return;
+    }
+    auto& frame = frameResources_[frameIndex];
+    diagnostics_.completedFrameSlot =
+        static_cast<std::uint32_t>(frameIndex);
+    diagnostics_.completedImageIndex = frame.submittedImageIndex;
+    diagnostics_.completedSubmissionSerial =
+        frame.completedSubmissionSerial;
+    diagnostics_.gpuTimestampResultsAvailable = false;
+    if (!gpuTimestampsSupported_ || !frame.timestampPending ||
+        frame.timestampQueryPool == VK_NULL_HANDLE) {
+        frame.timestampPending = false;
+        return;
+    }
+
+    std::array<TimestampQueryResult, kFrameTimestampQueryCount> results{};
+    const VkResult result = vkGetQueryPoolResults(
+        device_,
+        frame.timestampQueryPool,
+        0U,
+        kFrameTimestampQueryCount,
+        sizeof(results),
+        results.data(),
+        sizeof(TimestampQueryResult),
+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    frame.timestampPending = false;
+    if (result != VK_SUCCESS ||
+        !TimestampResultsAvailable(results)) {
+        ++diagnostics_.gpuTimestampUnavailableResultCount;
+        return;
+    }
+
+    const auto elapsed = [&](std::uint32_t start, std::uint32_t end) {
+        return TimestampDeltaMilliseconds(
+            results[start].value,
+            results[end].value,
+            gpuTimestampValidBits_,
+            gpuTimestampPeriodNanoseconds_);
+    };
+    const auto setPhase = [](
+                              GpuPhaseDiagnostics* phase,
+                              double milliseconds,
+                              bool active) {
+        phase->milliseconds = active ? milliseconds : 0.0;
+        phase->active = active;
+    };
+    const double totalMilliseconds =
+        elapsed(kTimestampFrameStart, kTimestampFrameEnd);
+    std::array<double, 7> phaseMilliseconds = {
+        elapsed(kTimestampFrameStart, kTimestampRainEnd),
+        elapsed(kTimestampRainEnd, kTimestampDepthEnd),
+        elapsed(kTimestampDepthEnd, kTimestampWeightedEnd),
+        elapsed(kTimestampWeightedEnd, kTimestampCompositeEnd),
+        elapsed(kTimestampCompositeEnd, kTimestampOpaqueEnd),
+        elapsed(kTimestampOpaqueEnd, kTimestampPostProcessEnd),
+        // Include render-pass completion in the final active band so the
+        // published phase sum reconciles exactly with total GPU time.
+        elapsed(kTimestampPostProcessEnd, kTimestampImGuiEnd) +
+            elapsed(kTimestampImGuiEnd, kTimestampFrameEnd),
+    };
+    const std::array<bool, 7> phaseActive = {
+        (frame.timestampActiveMask & kGpuPhaseRainActive) != 0U,
+        (frame.timestampActiveMask & kGpuPhaseDepthActive) != 0U,
+        (frame.timestampActiveMask & kGpuPhaseWeightedActive) != 0U,
+        (frame.timestampActiveMask & kGpuPhaseCompositeActive) != 0U,
+        (frame.timestampActiveMask & kGpuPhaseOpaqueActive) != 0U,
+        (frame.timestampActiveMask & kGpuPhasePostProcessActive) != 0U,
+        (frame.timestampActiveMask & kGpuPhaseImGuiActive) != 0U,
+    };
+    // Empty phases still contain render-pass/subpass transition cost. Keep
+    // them visibly inactive, but attribute that overhead to the nearest active
+    // band so active phase totals remain trustworthy and reconcilable.
+    for (std::size_t index = 0U; index < phaseActive.size(); ++index) {
+        if (phaseActive[index] || phaseMilliseconds[index] == 0.0) {
+            continue;
+        }
+        std::size_t target = phaseActive.size();
+        for (std::size_t candidate = index + 1U;
+             candidate < phaseActive.size();
+             ++candidate) {
+            if (phaseActive[candidate]) {
+                target = candidate;
+                break;
+            }
+        }
+        if (target == phaseActive.size()) {
+            for (std::size_t candidate = index; candidate > 0U;
+                 --candidate) {
+                if (phaseActive[candidate - 1U]) {
+                    target = candidate - 1U;
+                    break;
+                }
+            }
+        }
+        if (target < phaseActive.size()) {
+            phaseMilliseconds[target] += phaseMilliseconds[index];
+        }
+        phaseMilliseconds[index] = 0.0;
+    }
+    const std::array<GpuPhaseDiagnostics*, 7> phaseOutputs = {
+        &diagnostics_.gpuRainCompute,
+        &diagnostics_.gpuDepth,
+        &diagnostics_.gpuWeightedAccumulation,
+        &diagnostics_.gpuComposite,
+        &diagnostics_.gpuOpaqueAndHighQuality,
+        &diagnostics_.gpuPostProcess,
+        &diagnostics_.gpuImGui,
+    };
+    setPhase(&diagnostics_.gpuTotal, totalMilliseconds, true);
+    for (std::size_t index = 0U; index < phaseOutputs.size(); ++index) {
+        setPhase(
+            phaseOutputs[index],
+            phaseMilliseconds[index],
+            phaseActive[index]);
+    }
+    diagnostics_.gpuTimestampResultsAvailable = true;
+    diagnostics_.gpuResultLatencyFrames = static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(
+            kFramesInFlight,
+            nextSubmissionSerial_ > frame.completedSubmissionSerial
+                ? nextSubmissionSerial_ -
+                      frame.completedSubmissionSerial - 1U
+                : 0U));
+    UpdateGpuTimingAverages();
+}
+
+void VulkanViewportShell::UpdateCpuTimingAverages() {
+    const std::array<double, 12> milliseconds = {
+        diagnostics_.frameUiRenderMs,
+        diagnostics_.frameFenceWaitMs,
+        diagnostics_.frameCompletedMaintenanceMs,
+        diagnostics_.frameHighQualityGaussianPrepareMs,
+        diagnostics_.frameUniformResourceUploadMs,
+        diagnostics_.frameAcquireMs,
+        diagnostics_.frameImageWaitMs,
+        diagnostics_.frameResetRetirePollingMs,
+        diagnostics_.frameCommandBufferMs,
+        diagnostics_.frameSubmitMs,
+        diagnostics_.framePresentMs,
+        diagnostics_.framePlatformWindowsMs,
+    };
+    std::array<bool, 12> active{};
+    active.fill(true);
+    cpuTimingWindow_.AddFrame(
+        milliseconds,
+        active,
+        diagnostics_.frameRenderMs);
+    if (!cpuTimingWindow_.PublishIfReady(500.0)) {
+        return;
+    }
+    const std::array<double*, 12> averages = {
+        &diagnostics_.averageFrameUiRenderMs,
+        &diagnostics_.averageFrameFenceWaitMs,
+        &diagnostics_.averageFrameCompletedMaintenanceMs,
+        &diagnostics_.averageFrameHighQualityGaussianPrepareMs,
+        &diagnostics_.averageFrameUniformResourceUploadMs,
+        &diagnostics_.averageFrameAcquireMs,
+        &diagnostics_.averageFrameImageWaitMs,
+        &diagnostics_.averageFrameResetRetirePollingMs,
+        &diagnostics_.averageFrameCommandBufferMs,
+        &diagnostics_.averageFrameSubmitMs,
+        &diagnostics_.averageFramePresentMs,
+        &diagnostics_.averageFramePlatformWindowsMs,
+    };
+    for (std::size_t index = 0U; index < averages.size(); ++index) {
+        *averages[index] = cpuTimingWindow_.PublishedAverage(index);
+    }
+}
+
+void VulkanViewportShell::UpdateGpuTimingAverages() {
+    const std::array<GpuPhaseDiagnostics*, 8> phases = {
+        &diagnostics_.gpuTotal,
+        &diagnostics_.gpuRainCompute,
+        &diagnostics_.gpuDepth,
+        &diagnostics_.gpuWeightedAccumulation,
+        &diagnostics_.gpuComposite,
+        &diagnostics_.gpuOpaqueAndHighQuality,
+        &diagnostics_.gpuPostProcess,
+        &diagnostics_.gpuImGui,
+    };
+    std::array<double, 8> milliseconds{};
+    std::array<bool, 8> active{};
+    for (std::size_t index = 0U; index < phases.size(); ++index) {
+        milliseconds[index] = phases[index]->milliseconds;
+        active[index] = phases[index]->active;
+    }
+    const auto sampleTime = std::chrono::steady_clock::now();
+    const double elapsedMilliseconds =
+        lastGpuTimingSampleAt_ == std::chrono::steady_clock::time_point{}
+            ? diagnostics_.gpuTotal.milliseconds
+            : std::chrono::duration<double, std::milli>(
+                  sampleTime - lastGpuTimingSampleAt_)
+                  .count();
+    lastGpuTimingSampleAt_ = sampleTime;
+    gpuTimingWindow_.AddFrame(
+        milliseconds,
+        active,
+        elapsedMilliseconds);
+    if (!gpuTimingWindow_.PublishIfReady(500.0)) {
+        return;
+    }
+    for (std::size_t index = 0U; index < phases.size(); ++index) {
+        if (gpuTimingWindow_.PublishedActive(index)) {
+            phases[index]->averageMilliseconds =
+                gpuTimingWindow_.PublishedAverage(index);
+        }
     }
 }
 
@@ -10838,6 +11288,71 @@ void VulkanViewportShell::PrepareDynamicMeshFlowDispatchSlot(
         }
     }
 
+    auto& timestampQueryPool =
+        resources->dynamicMeshFlowTimestampQueryPools[liveSlot];
+    auto& timestampPending =
+        resources->dynamicMeshFlowTimestampPending[liveSlot];
+    if (timestampPending && timestampQueryPool != VK_NULL_HANDLE) {
+        std::array<TimestampQueryResult, 2> results{};
+        const VkResult queryResult = vkGetQueryPoolResults(
+            device_,
+            timestampQueryPool,
+            0U,
+            2U,
+            sizeof(results),
+            results.data(),
+            sizeof(TimestampQueryResult),
+            VK_QUERY_RESULT_64_BIT |
+                VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+        timestampPending = false;
+        if (queryResult == VK_SUCCESS &&
+            TimestampResultsAvailable(results)) {
+            const double milliseconds =
+                TimestampDeltaMilliseconds(
+                    results[0].value,
+                    results[1].value,
+                    gpuTimestampValidBits_,
+                    gpuTimestampPeriodNanoseconds_);
+            diagnostics_.gpuDynamicMeshFlow.milliseconds =
+                milliseconds;
+            diagnostics_.gpuDynamicMeshFlow.active = true;
+            ++dynamicMeshFlowTimingResultGeneration_;
+            const auto sampleTime = std::chrono::steady_clock::now();
+            const double elapsedMilliseconds =
+                lastDynamicMeshFlowTimingSampleAt_ ==
+                        std::chrono::steady_clock::time_point{}
+                    ? milliseconds
+                    : std::chrono::duration<double, std::milli>(
+                          sampleTime -
+                          lastDynamicMeshFlowTimingSampleAt_)
+                          .count();
+            lastDynamicMeshFlowTimingSampleAt_ = sampleTime;
+            dynamicMeshFlowTimingWindow_.AddFrame(
+                {milliseconds},
+                {true},
+                elapsedMilliseconds);
+            if (dynamicMeshFlowTimingWindow_.PublishIfReady(500.0)) {
+                diagnostics_.gpuDynamicMeshFlow.averageMilliseconds =
+                    dynamicMeshFlowTimingWindow_.PublishedAverage(0U);
+            }
+        } else {
+            ++diagnostics_.gpuTimestampUnavailableResultCount;
+        }
+    }
+    if (gpuTimestampsSupported_ && timestampQueryPool == VK_NULL_HANDLE) {
+        VkQueryPoolCreateInfo queryPoolInfo{
+            VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        queryPoolInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        queryPoolInfo.queryCount = 2U;
+        if (vkCreateQueryPool(
+                device_,
+                &queryPoolInfo,
+                nullptr,
+                &timestampQueryPool) != VK_SUCCESS) {
+            timestampQueryPool = VK_NULL_HANDLE;
+        }
+    }
+
     auto& commandBuffer = resources->dynamicMeshFlowCommandBuffers[liveSlot];
     if (commandBuffer != VK_NULL_HANDLE) {
         vkFreeCommandBuffers(device_, commandPool_, 1, &commandBuffer);
@@ -10869,6 +11384,19 @@ void VulkanViewportShell::DispatchDynamicMeshFlowCompute(
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     Check(vkBeginCommandBuffer(commandBuffer, &beginInfo), "vkBeginCommandBuffer(dynamic mesh flow)");
+
+    const VkQueryPool timestampQueryPool =
+        diagnosticsEnabled_ && gpuTimestampsSupported_
+            ? resources->dynamicMeshFlowTimestampQueryPools[liveSlot]
+            : VK_NULL_HANDLE;
+    if (timestampQueryPool != VK_NULL_HANDLE) {
+        vkCmdResetQueryPool(commandBuffer, timestampQueryPool, 0U, 2U);
+        vkCmdWriteTimestamp(
+            commandBuffer,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            timestampQueryPool,
+            0U);
+    }
 
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, dynamicMeshFlowComputePipeline_);
     vkCmdBindDescriptorSets(
@@ -10947,6 +11475,13 @@ void VulkanViewportShell::DispatchDynamicMeshFlowCompute(
         barriers.data(),
         0,
         nullptr);
+    if (timestampQueryPool != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp(
+            commandBuffer,
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            timestampQueryPool,
+            1U);
+    }
 
     Check(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer(dynamic mesh flow)");
 
@@ -10959,6 +11494,8 @@ void VulkanViewportShell::DispatchDynamicMeshFlowCompute(
     Check(
         vkQueueSubmit(graphicsQueue_, 1, &submitInfo, resources->dynamicMeshFlowDispatchFences[liveSlot]),
         "vkQueueSubmit(dynamic mesh flow)");
+    resources->dynamicMeshFlowTimestampPending[liveSlot] =
+        timestampQueryPool != VK_NULL_HANDLE;
 }
 
 VkDescriptorPool VulkanViewportShell::CreateWaterFlowSourceDescriptorPool() {
@@ -12728,13 +13265,14 @@ void VulkanViewportShell::CleanupSwapchain() {
     }
     imageViews_.clear();
 
+    DestroySwapchainRenderFinishedSemaphores();
     if (swapchain_ != VK_NULL_HANDLE) {
         vkDestroySwapchainKHR(device_, swapchain_, nullptr);
         swapchain_ = VK_NULL_HANDLE;
     }
 
     swapchainImages_.clear();
-    swapchainImagesInFlight_.clear();
+    swapchainImageOwners_.clear();
 }
 
 void VulkanViewportShell::CleanupPointCloudResources(ActivePointCloudResources* resources) {
@@ -12788,6 +13326,14 @@ void VulkanViewportShell::DestroyPointCloudResources(ActivePointCloudResources* 
             vkDestroyFence(device_, fence, nullptr);
             fence = VK_NULL_HANDLE;
         }
+        auto& timestampQueryPool =
+            resources->dynamicMeshFlowTimestampQueryPools[liveSlot];
+        if (timestampQueryPool != VK_NULL_HANDLE &&
+            device_ != VK_NULL_HANDLE) {
+            vkDestroyQueryPool(device_, timestampQueryPool, nullptr);
+            timestampQueryPool = VK_NULL_HANDLE;
+        }
+        resources->dynamicMeshFlowTimestampPending[liveSlot] = false;
     }
     RetireWaterFlowSourceComputeGeneration(resources);
 
@@ -13042,6 +13588,16 @@ void VulkanViewportShell::RecreateSwapchain() {
     }
 
     vkDeviceWaitIdle(device_);
+    for (auto& frame : frameResources_) {
+        if (frame.activeSubmissionSerial != 0U) {
+            frame.completedSubmissionSerial =
+                frame.activeSubmissionSerial;
+        }
+        frame.activeSubmissionSerial = 0U;
+        frame.timestampPending = false;
+        frame.timestampActiveMask = 0U;
+    }
+    diagnostics_.gpuTimestampResultsAvailable = false;
 
     CleanupSwapchain();
     CreateSwapchain();
@@ -14230,12 +14786,40 @@ void VulkanViewportShell::RecordCommandBuffer(
     Check(vkBeginCommandBuffer(commandBuffer, &beginInfo), "vkBeginCommandBuffer");
 
     const bool drawLiveScene = SceneImageNeedsRender(imageIndex);
+    const bool collectGpuTimestamps =
+        collectDiagnostics && gpuTimestampsSupported_ &&
+        frameIndex < frameResources_.size() &&
+        frameResources_[frameIndex].timestampQueryPool != VK_NULL_HANDLE;
+    const VkQueryPool timestampQueryPool =
+        collectGpuTimestamps
+            ? frameResources_[frameIndex].timestampQueryPool
+            : VK_NULL_HANDLE;
+    if (collectGpuTimestamps) {
+        vkCmdResetQueryPool(
+            commandBuffer,
+            timestampQueryPool,
+            0U,
+            kFrameTimestampQueryCount);
+        vkCmdWriteTimestamp(
+            commandBuffer,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            timestampQueryPool,
+            kTimestampFrameStart);
+    }
     if (drawLiveScene) {
         pointSubmittedCount = 0;
         pointPassSubmittedCount = 0;
     }
     const bool fastBasicPointRenderer =
         renderState_.pointCloudRendererMode == renderer::pointcloud::PointCloudRendererMode::FastBasic;
+    if (collectGpuTimestamps) {
+        frameResources_[frameIndex].timestampActiveMask = 0U;
+    }
+    const auto markGpuPhaseActive = [&](std::uint32_t phase) {
+        if (collectGpuTimestamps) {
+            frameResources_[frameIndex].timestampActiveMask |= phase;
+        }
+    };
     const VkViewport viewport{
         0.0F,
         0.0F,
@@ -14258,7 +14842,34 @@ void VulkanViewportShell::RecordCommandBuffer(
             }
         }
         UploadRainUniforms(frameIndex, swapchainWidth_, swapchainHeight_);
+        const bool recordsRainCompute =
+            frameIndex < rainResources_.descriptorSets.size() &&
+            renderState_.rainSettings.enabled &&
+            rainResources_.collisionReady &&
+            rainComputePipeline_ != VK_NULL_HANDLE &&
+            rainResources_.descriptorSets[frameIndex] != VK_NULL_HANDLE;
         RecordRainCompute(commandBuffer, frameIndex);
+        if (recordsRainCompute) {
+            markGpuPhaseActive(kGpuPhaseRainActive);
+        }
+    }
+    if (collectGpuTimestamps) {
+        vkCmdWriteTimestamp(
+            commandBuffer,
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            timestampQueryPool,
+            kTimestampRainEnd);
+    }
+    if (collectGpuTimestamps && !drawLiveScene) {
+        for (std::uint32_t query = kTimestampDepthEnd;
+             query <= kTimestampOpaqueEnd;
+             ++query) {
+            vkCmdWriteTimestamp(
+                commandBuffer,
+                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                timestampQueryPool,
+                query);
+        }
     }
 
     if (drawLiveScene) {
@@ -14316,6 +14927,7 @@ void VulkanViewportShell::RecordCommandBuffer(
                     imageIndex,
                     false,
                     &recordedDrawPointCount)) {
+                    markGpuPhaseActive(kGpuPhaseDepthActive);
                     if (collectDiagnostics) {
                         ++pointDrawCalls;
                         pointPassSubmittedCount += recordedDrawPointCount;
@@ -14325,6 +14937,13 @@ void VulkanViewportShell::RecordCommandBuffer(
         }
     }
 
+    if (collectGpuTimestamps) {
+        vkCmdWriteTimestamp(
+            commandBuffer,
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            timestampQueryPool,
+            kTimestampDepthEnd);
+    }
     vkCmdNextSubpass(commandBuffer, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
@@ -14358,6 +14977,7 @@ void VulkanViewportShell::RecordCommandBuffer(
                 imageIndex,
                 false,
                 &recordedDrawPointCount)) {
+                markGpuPhaseActive(kGpuPhaseWeightedActive);
                 if (collectDiagnostics) {
                     ++pointDrawCalls;
                     pointSubmittedCount += recordedDrawPointCount;
@@ -14389,6 +15009,7 @@ void VulkanViewportShell::RecordCommandBuffer(
                     frameIndex,
                     imageIndex,
                     &recordedDrawPointCount)) {
+                    markGpuPhaseActive(kGpuPhaseWeightedActive);
                     if (collectDiagnostics) {
                         ++pointDrawCalls;
                         ++pointConstantSimpleDrawCalls;
@@ -14401,7 +15022,17 @@ void VulkanViewportShell::RecordCommandBuffer(
     }
 
     if (drawLiveScene) {
+        const bool recordsRainDraw =
+            frameIndex < rainResources_.descriptorSets.size() &&
+            renderState_.rainSettings.enabled &&
+            rainResources_.collisionReady &&
+            rainPipeline_ != VK_NULL_HANDLE &&
+            rainResources_.descriptorSets[frameIndex] != VK_NULL_HANDLE &&
+            ActiveRainParticleCount(renderState_) > 0U;
         RecordRainDraw(commandBuffer, frameIndex, rainPipeline_);
+        if (recordsRainDraw) {
+            markGpuPhaseActive(kGpuPhaseWeightedActive);
+        }
     }
 
     if (drawLiveScene && !renderState_.gaussianSplatLayers.empty()) {
@@ -14475,9 +15106,17 @@ void VulkanViewportShell::RecordCommandBuffer(
                 sizeof(GaussianSplatPushConstants),
                 &pushConstants);
             vkCmdDraw(commandBuffer, 6, resources->splatCount, 0, 0);
+            markGpuPhaseActive(kGpuPhaseWeightedActive);
         }
     }
 
+    if (collectGpuTimestamps) {
+        vkCmdWriteTimestamp(
+            commandBuffer,
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            timestampQueryPool,
+            kTimestampWeightedEnd);
+    }
     vkCmdNextSubpass(commandBuffer, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
@@ -14497,8 +15136,16 @@ void VulkanViewportShell::RecordCommandBuffer(
             0,
             nullptr);
         vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+        markGpuPhaseActive(kGpuPhaseCompositeActive);
     }
 
+    if (collectGpuTimestamps) {
+        vkCmdWriteTimestamp(
+            commandBuffer,
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            timestampQueryPool,
+            kTimestampCompositeEnd);
+    }
     vkCmdNextSubpass(commandBuffer, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
@@ -14517,6 +15164,7 @@ void VulkanViewportShell::RecordCommandBuffer(
                 imageIndex,
                 false,
                 &recordedDrawPointCount)) {
+                markGpuPhaseActive(kGpuPhaseOpaqueActive);
                 if (collectDiagnostics) {
                     ++pointDrawCalls;
                     ++pointFastBasicDrawCalls;
@@ -14540,6 +15188,7 @@ void VulkanViewportShell::RecordCommandBuffer(
                     frameIndex,
                     imageIndex,
                     &highlightedPointCount)) {
+                    markGpuPhaseActive(kGpuPhaseOpaqueActive);
                     if (collectDiagnostics) {
                         ++pointDrawCalls;
                         ++pointFastBasicDrawCalls;
@@ -14570,6 +15219,7 @@ void VulkanViewportShell::RecordCommandBuffer(
                 imageIndex,
                 false,
                 &recordedDrawPointCount)) {
+                markGpuPhaseActive(kGpuPhaseOpaqueActive);
                 if (collectDiagnostics) {
                     ++pointDrawCalls;
                     ++pointOpaqueHardDiscDrawCalls;
@@ -14614,8 +15264,16 @@ void VulkanViewportShell::RecordCommandBuffer(
             sizeof(HighQualityGaussianPushConstants),
             &pushConstants);
         vkCmdDraw(commandBuffer, 6, highQualityGaussianScene_.splatCount, 0, 0);
+        markGpuPhaseActive(kGpuPhaseOpaqueActive);
     }
 
+    if (collectGpuTimestamps) {
+        vkCmdWriteTimestamp(
+            commandBuffer,
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            timestampQueryPool,
+            kTimestampOpaqueEnd);
+    }
     vkCmdEndRenderPass(commandBuffer);
         if (imageIndex < sceneImageRevisions_.size()) {
             sceneImageRevisions_[imageIndex] = sceneRevision_;
@@ -14645,6 +15303,9 @@ void VulkanViewportShell::RecordCommandBuffer(
     presentPassInfo.pClearValues = presentClearValues.data();
 
     vkCmdBeginRenderPass(commandBuffer, &presentPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+    // This timing band covers the always-recorded presentation render pass as
+    // well as optional ImGui draws, so it remains valid with an empty UI.
+    markGpuPhaseActive(kGpuPhaseImGuiActive);
     vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
@@ -14683,13 +15344,36 @@ void VulkanViewportShell::RecordCommandBuffer(
             sizeof(PostProcessPushConstants),
             &pushConstants);
         vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+        markGpuPhaseActive(kGpuPhasePostProcessActive);
+    }
+    if (collectGpuTimestamps) {
+        vkCmdWriteTimestamp(
+            commandBuffer,
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            timestampQueryPool,
+            kTimestampPostProcessEnd);
     }
 
     if (ImGui::GetCurrentContext() != nullptr) {
-        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), commandBuffer);
+        ImDrawData* drawData = ImGui::GetDrawData();
+        ImGui_ImplVulkan_RenderDrawData(drawData, commandBuffer);
+    }
+    if (collectGpuTimestamps) {
+        vkCmdWriteTimestamp(
+            commandBuffer,
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            timestampQueryPool,
+            kTimestampImGuiEnd);
     }
 
     vkCmdEndRenderPass(commandBuffer);
+    if (collectGpuTimestamps) {
+        vkCmdWriteTimestamp(
+            commandBuffer,
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            timestampQueryPool,
+            kTimestampFrameEnd);
+    }
     Check(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer");
 
     const auto recordEnd = collectDiagnostics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

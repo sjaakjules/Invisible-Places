@@ -93,8 +93,9 @@ SettledFlowCacheFixture MakeSettledFlowCacheFixture() {
   branch.rawAnchors[1].emitterId = 17.0F;
   branch.rawAnchors[1].pathDistance = 1.25F;
 
-  fixture.cache.supportLayerPath = "Data/Scene1/Site1-ROCK-1mm.ply";
-  fixture.cache.supportSignature = "scene1-support";
+  fixture.cache.supportLayerPath =
+      "Data/SampleScene/Site1-ROCK-1mm. SampleScene.ply";
+  fixture.cache.supportSignature = "sample_scene-support";
   fixture.cache.emitterSettingsFingerprint = "emitter-17-settings";
   fixture.cache.branches = {branch};
   fixture.cache.stale = false;
@@ -114,30 +115,30 @@ TEST_CASE("Current project schema round-trips authoritative scene density groups
   CHECK(document.schemaVersion == kProjectDocumentSchemaVersion);
   document.projectName = "current-density-schema";
   document.scenePointCloudGroups.push_back({
-      .sceneGroupName = "Scene1",
+      .sceneGroupName = "SampleScene",
       .displaySpacingMeters = 0.005F,
       .displayLoaded = true,
       .displayVisible = false,
       .roleSources =
           {
               {.sceneRole = "ROCK",
-               .analysisSourcePath = "Data/Scene1/Scene1-ROCK-1mm.ply",
-               .displaySourcePath = "Data/Scene1/Scene1-ROCK-5mm.ply"},
+               .analysisSourcePath = "Data/SampleScene/Site1-ROCK-1mm. SampleScene.ply",
+               .displaySourcePath = "Data/SampleScene/Site1-ROCK-5mm. SampleScene.ply"},
               {.sceneRole = "SAND",
-               .analysisSourcePath = "Data/Scene1/Scene1-SAND-2mm.ply",
-               .displaySourcePath = "Data/Scene1/Scene1-SAND-5mm.ply"},
+               .analysisSourcePath = "Data/SampleScene/Site1-SAND-2mm. SampleScene.ply",
+               .displaySourcePath = "Data/SampleScene/Site1-SAND-5mm. SampleScene.ply"},
               {.sceneRole = "VEG",
-               .analysisSourcePath = "Data/Scene1/Scene1-VEG-1mm.ply",
-               .displaySourcePath = "Data/Scene1/Scene1-VEG-5mm.ply"},
+               .analysisSourcePath = "Data/SampleScene/Site1-VEG-1mm. SampleScene.ply",
+               .displaySourcePath = "Data/SampleScene/Site1-VEG-5mm. SampleScene.ply"},
           },
   });
   document.scenePointCloudGroups.front().waterSurfaceCache =
       invisible_places::serialization::WaterSurfaceCacheManifestDocument{
-          .relativePath = ".invisible_places/cache/water/scene1.surfacecache",
+          .relativePath = ".invisible_places/cache/water/sample_scene.surfacecache",
           .cacheSchema = invisible_places::water::kWaterSurfaceCacheSchemaVersion,
           .algorithmId = std::string{
               invisible_places::water::kWaterSurfaceCacheAlgorithmId},
-          .sourceFingerprint = "scene1-complete-2mm-static",
+          .sourceFingerprint = "sample_scene-complete-2mm-static",
           .payloadBytes = 204ULL * 1024ULL * 1024ULL,
           .checksum = {1U, 2U, 3U, 4U},
           .requestedRebuildGeneration = 7U,
@@ -145,10 +146,11 @@ TEST_CASE("Current project schema round-trips authoritative scene density groups
       };
 
   ProjectLayerDocument legacyMirror;
-  legacyMirror.sourcePath = "Data/Scene1/Scene1-ROCK-2mm.ply";
-  legacyMirror.sceneGroupName = "Scene1";
+  legacyMirror.sourcePath = "Data/SampleScene/Site1-ROCK-2mm. SampleScene.ply";
+  legacyMirror.sceneGroupName = "SampleScene";
   legacyMirror.sceneRole = "ROCK";
-  legacyMirror.selectedSceneVariantPath = "Data/Scene1/Scene1-ROCK-2mm.ply";
+  legacyMirror.selectedSceneVariantPath =
+      "Data/SampleScene/Site1-ROCK-2mm. SampleScene.ply";
   legacyMirror.loaded = true;
   legacyMirror.visible = true;
   document.layers.push_back(legacyMirror);
@@ -161,23 +163,23 @@ TEST_CASE("Current project schema round-trips authoritative scene density groups
   REQUIRE(input.is_open());
   const auto savedJson = nlohmann::json::parse(input);
   CHECK(savedJson.at("schema_version") == kProjectDocumentSchemaVersion);
-  CHECK(savedJson.at("active_water_scene_group") == "Scene1");
+  CHECK(savedJson.at("active_water_scene_group") == "SampleScene");
   REQUIRE(savedJson.at("scene_point_cloud_groups").size() == 1U);
   CHECK(savedJson.at("scene_point_cloud_groups").front().at("scene_group") ==
-        "Scene1");
+        "SampleScene");
   CHECK(savedJson.at("scene_point_cloud_groups")
             .front()
             .at("water_surface_cache")
-            .at("source_fingerprint") == "scene1-complete-2mm-static");
+            .at("source_fingerprint") == "sample_scene-complete-2mm-static");
   CHECK(savedJson.at("layers").front().at("selected_scene_variant_path") ==
-        "Data/Scene1/Scene1-ROCK-2mm.ply");
+        "Data/SampleScene/Site1-ROCK-2mm. SampleScene.ply");
 
   const auto loaded = LoadProjectDocument(file.path, &errorMessage);
   REQUIRE(loaded.has_value());
   REQUIRE(loaded->scenePointCloudGroups.size() == 1U);
-  CHECK(loaded->activeWaterSceneGroupName == "Scene1");
+  CHECK(loaded->activeWaterSceneGroupName == "SampleScene");
   const auto &group = loaded->scenePointCloudGroups.front();
-  CHECK(group.sceneGroupName == "Scene1");
+  CHECK(group.sceneGroupName == "SampleScene");
   CHECK(group.displaySpacingMeters == Catch::Approx(0.005F));
   CHECK(group.displayLoaded);
   CHECK_FALSE(group.displayVisible);
@@ -193,8 +195,12 @@ TEST_CASE("Current project schema round-trips authoritative scene density groups
   CHECK(group.waterSurfaceCache->builtRebuildGeneration == 7U);
   const auto *rock = FindRoleSource(group, "ROCK");
   REQUIRE(rock != nullptr);
-  CHECK(rock->analysisSourcePath == "Data/Scene1/Scene1-ROCK-1mm.ply");
-  CHECK(rock->displaySourcePath == "Data/Scene1/Scene1-ROCK-5mm.ply");
+  CHECK(
+      rock->analysisSourcePath ==
+      "Data/SampleScene/Site1-ROCK-1mm. SampleScene.ply");
+  CHECK(
+      rock->displaySourcePath ==
+      "Data/SampleScene/Site1-ROCK-5mm. SampleScene.ply");
   REQUIRE(loaded->layers.size() == 1U);
   CHECK(loaded->layers.front().selectedSceneVariantPath ==
         legacyMirror.selectedSceneVariantPath);
@@ -213,18 +219,18 @@ TEST_CASE("Schema 45 selects the explicit matching water scene instead of the fi
   sampleEmitter.name = "SampleFlowPoint";
   WaterEmitter sceneEmitter;
   sceneEmitter.id = 2U;
-  sceneEmitter.name = "Scene1FlowPoint";
+  sceneEmitter.name = "OtherSceneFlowPoint";
 
   WaterSceneStateDocument sampleState;
   sampleState.sceneGroupName = "SampleScene";
   sampleState.emitters = {sampleEmitter};
   WaterSceneStateDocument sceneState;
-  sceneState.sceneGroupName = "Scene1";
+  sceneState.sceneGroupName = "OtherScene";
   sceneState.emitters = {sceneEmitter};
 
   ProjectDocument document;
   document.projectName = "explicit-water-scene";
-  document.activeWaterSceneGroupName = "Scene1";
+  document.activeWaterSceneGroupName = "OtherScene";
   document.waterSceneStates = {sampleState, sceneState};
 
   TemporaryProjectFile file{"invisible_places_active_water_scene_schema45.json"};
@@ -234,25 +240,25 @@ TEST_CASE("Schema 45 selects the explicit matching water scene instead of the fi
   std::ifstream input{file.path};
   REQUIRE(input.is_open());
   auto saved = nlohmann::json::parse(input);
-  CHECK(saved.at("active_water_scene_group") == "Scene1");
+  CHECK(saved.at("active_water_scene_group") == "OtherScene");
 
   const auto loaded = LoadProjectDocument(file.path, &errorMessage);
   REQUIRE(loaded.has_value());
-  CHECK(loaded->activeWaterSceneGroupName == "Scene1");
+  CHECK(loaded->activeWaterSceneGroupName == "OtherScene");
   REQUIRE(loaded->waterSceneStates.size() == 2U);
   REQUIRE(loaded->waterEmitters.size() == 1U);
-  CHECK(loaded->waterEmitters.front().name == "Scene1FlowPoint");
+  CHECK(loaded->waterEmitters.front().name == "OtherSceneFlowPoint");
 
   // Schema-44 input has no explicit owner. The selected scene layer is the
   // compatibility signal and must still win over array order.
   saved["schema_version"] = 44U;
   saved.erase("active_water_scene_group");
-  saved["selected_layer_path"] = "Data/Scene1/Site1-ROCK-3mm.ply";
+  saved["selected_layer_path"] = "Data/OtherScene/OtherScene-ROCK-3mm.ply";
   saved["layers"] = nlohmann::json::array({
       {
           {"kind", "point_cloud"},
-          {"source_path", "Data/Scene1/Site1-ROCK-3mm.ply"},
-          {"scene_group", "Scene1"},
+          {"source_path", "Data/OtherScene/OtherScene-ROCK-3mm.ply"},
+          {"scene_group", "OtherScene"},
           {"scene_role", "ROCK"},
       },
   });
@@ -263,9 +269,9 @@ TEST_CASE("Schema 45 selects the explicit matching water scene instead of the fi
   }
   const auto migrated = LoadProjectDocument(file.path, &errorMessage);
   REQUIRE(migrated.has_value());
-  CHECK(migrated->activeWaterSceneGroupName == "Scene1");
+  CHECK(migrated->activeWaterSceneGroupName == "OtherScene");
   REQUIRE(migrated->waterEmitters.size() == 1U);
-  CHECK(migrated->waterEmitters.front().name == "Scene1FlowPoint");
+  CHECK(migrated->waterEmitters.front().name == "OtherSceneFlowPoint");
 }
 
 TEST_CASE("Schema 43 externalizes clean Flow path caches and prunes orphaned data",
@@ -291,15 +297,16 @@ TEST_CASE("Schema 43 externalizes clean Flow path caches and prunes orphaned dat
   branch.rawAnchors[1].pathDistance = 1.25F;
 
   WaterPathCache cache;
-  cache.supportLayerPath = "Data/Scene1/Site1-ROCK-1mm.ply";
-  cache.supportSignature = "scene1-support";
+  cache.supportLayerPath =
+      "Data/SampleScene/Site1-ROCK-1mm. SampleScene.ply";
+  cache.supportSignature = "sample_scene-support";
   cache.emitterSettingsFingerprint = "emitter-17-settings";
   cache.branches = {branch};
   cache.hiddenBranchIds = {999U};
   cache.stale = false;
 
   WaterSceneStateDocument state;
-  state.sceneGroupName = "Scene1";
+  state.sceneGroupName = "SampleScene";
   state.emitters = {emitter};
   state.pathCache = cache;
   ProjectDocument document;
@@ -614,7 +621,7 @@ TEST_CASE("Legacy embedded Flow caches are pruned and migrated on settled save",
   flow.cache.hiddenBranchIds = {31U, 32U, 999U};
 
   WaterSceneStateDocument state;
-  state.sceneGroupName = "Scene1";
+  state.sceneGroupName = "SampleScene";
   state.emitters = {flow.emitter};
   ProjectDocument authored;
   authored.projectName = "legacy-embedded-flow";
@@ -692,7 +699,7 @@ TEST_CASE("Invalid Flow manifests cannot fall back to embedded derived data",
       "invisible_places_invalid_flow_manifest"};
   auto flow = MakeSettledFlowCacheFixture();
   WaterSceneStateDocument state;
-  state.sceneGroupName = "Scene1";
+  state.sceneGroupName = "SampleScene";
   state.emitters = {flow.emitter};
   ProjectDocument authored;
   authored.waterSceneStates = {state};
@@ -1601,53 +1608,53 @@ TEST_CASE("Project schema v32 migrates legacy selected variants into scene "
       {"layers",
        nlohmann::json::array({
            {{"kind", "point_cloud"},
-            {"source_path", "Data/Scene1/Scene1-ROCK-1mm.ply"},
-            {"scene_group", "Scene1"},
+            {"source_path", "Data/SampleScene/Site1-ROCK-1mm. SampleScene.ply"},
+            {"scene_group", "SampleScene"},
             {"scene_role", "ROCK"},
             {"scene_primary_role", true},
             {"inferred_point_spacing_meters", 0.001F},
-            {"selected_scene_variant_path", "Data/Scene1/Scene1-ROCK-5mm.ply"},
+            {"selected_scene_variant_path", "Data/SampleScene/Site1-ROCK-5mm. SampleScene.ply"},
             {"loaded", false},
             {"visible", false}},
            {{"kind", "point_cloud"},
-            {"source_path", "Data/Scene1/Scene1-ROCK-5mm.ply"},
-            {"scene_group", "Scene1"},
+            {"source_path", "Data/SampleScene/Site1-ROCK-5mm. SampleScene.ply"},
+            {"scene_group", "SampleScene"},
             {"scene_role", "ROCK"},
             {"scene_primary_role", true},
             {"inferred_point_spacing_meters", 0.005F},
-            {"selected_scene_variant_path", "Data/Scene1/Scene1-ROCK-5mm.ply"},
+            {"selected_scene_variant_path", "Data/SampleScene/Site1-ROCK-5mm. SampleScene.ply"},
             {"loaded", true},
             {"visible", true}},
            {{"kind", "point_cloud"},
-            {"source_path", "Data/Scene1/Scene1-SAND-2mm.ply"},
-            {"scene_group", "Scene1"},
+            {"source_path", "Data/SampleScene/Site1-SAND-2mm. SampleScene.ply"},
+            {"scene_group", "SampleScene"},
             {"scene_role", "SAND"},
             {"inferred_point_spacing_meters", 0.002F},
-            {"selected_scene_variant_path", "Data/Scene1/Scene1-SAND-5mm.ply"},
+            {"selected_scene_variant_path", "Data/SampleScene/Site1-SAND-5mm. SampleScene.ply"},
             {"loaded", false},
             {"visible", false}},
            {{"kind", "point_cloud"},
-            {"source_path", "Data/Scene1/Scene1-SAND-5mm.ply"},
-            {"scene_group", "Scene1"},
+            {"source_path", "Data/SampleScene/Site1-SAND-5mm. SampleScene.ply"},
+            {"scene_group", "SampleScene"},
             {"scene_role", "SAND"},
             {"inferred_point_spacing_meters", 0.005F},
-            {"selected_scene_variant_path", "Data/Scene1/Scene1-SAND-5mm.ply"},
+            {"selected_scene_variant_path", "Data/SampleScene/Site1-SAND-5mm. SampleScene.ply"},
             {"loaded", true},
             {"visible", true}},
            {{"kind", "point_cloud"},
-            {"source_path", "Data/Scene1/Scene1-VEG-1mm.ply"},
-            {"scene_group", "Scene1"},
+            {"source_path", "Data/SampleScene/Site1-VEG-1mm. SampleScene.ply"},
+            {"scene_group", "SampleScene"},
             {"scene_role", "VEG"},
             {"inferred_point_spacing_meters", 0.001F},
-            {"selected_scene_variant_path", "Data/Scene1/Scene1-VEG-5mm.ply"},
+            {"selected_scene_variant_path", "Data/SampleScene/Site1-VEG-5mm. SampleScene.ply"},
             {"loaded", false},
             {"visible", false}},
            {{"kind", "point_cloud"},
-            {"source_path", "Data/Scene1/Scene1-VEG-5mm.ply"},
-            {"scene_group", "Scene1"},
+            {"source_path", "Data/SampleScene/Site1-VEG-5mm. SampleScene.ply"},
+            {"scene_group", "SampleScene"},
             {"scene_role", "VEG"},
             {"inferred_point_spacing_meters", 0.005F},
-            {"selected_scene_variant_path", "Data/Scene1/Scene1-VEG-5mm.ply"},
+            {"selected_scene_variant_path", "Data/SampleScene/Site1-VEG-5mm. SampleScene.ply"},
             {"loaded", true},
             {"visible", true}},
            {{"kind", "point_cloud"},
@@ -1670,7 +1677,7 @@ TEST_CASE("Project schema v32 migrates legacy selected variants into scene "
   CHECK(loaded->schemaVersion == kProjectDocumentSchemaVersion);
   REQUIRE(loaded->scenePointCloudGroups.size() == 1U);
   const auto &group = loaded->scenePointCloudGroups.front();
-  CHECK(group.sceneGroupName == "Scene1");
+  CHECK(group.sceneGroupName == "SampleScene");
   CHECK(group.displaySpacingMeters == Catch::Approx(0.005F));
   CHECK(group.displayLoaded);
   CHECK(group.displayVisible);

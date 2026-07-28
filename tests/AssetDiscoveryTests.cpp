@@ -1296,8 +1296,8 @@ TEST_CASE("Legacy layer point visuals migrate to project library and scene temps
     },
     {
       "kind": "point_cloud",
-      "source_path": "Data/Scene1/Site1-ROCK-1mm.ply",
-      "scene_group": "Scene1",
+      "source_path": "Data/SampleScene/Site1-ROCK-1mm. SampleScene.ply",
+      "scene_group": "SampleScene",
       "scene_role": "ROCK",
       "loaded": true,
       "visible": true,
@@ -1341,8 +1341,8 @@ TEST_CASE("Legacy layer point visuals migrate to project library and scene temps
     CHECK(findVisual("Unnamed") != document->pointVisuals.end());
 
     REQUIRE(document->sceneVisualStates.size() == 1U);
-    CHECK(document->sceneVisualStates[0].sceneGroupName == "Scene1");
-    CHECK(document->sceneVisualStates[0].visual.name == "Unnamed_Scene1");
+    CHECK(document->sceneVisualStates[0].sceneGroupName == "SampleScene");
+    CHECK(document->sceneVisualStates[0].visual.name == "Unnamed_SampleScene");
     CHECK(
         document->sceneVisualStates[0].visual.style.colorMode ==
         invisible_places::renderer::pointcloud::PointCloudColorMode::SolidColor);
@@ -1352,10 +1352,10 @@ TEST_CASE("Legacy layer point visuals migrate to project library and scene temps
     std::filesystem::remove(path);
 }
 
-TEST_CASE("ExhibitionScene project template stores shared visuals at project root", "[project][scene][water]") {
-    const auto projectPath = DataRoot().parent_path() / "Saved" / "exhibitionScene_project.json";
+TEST_CASE("Exhibition final project selects the complete Scene3 five millimetre display", "[project][scene][water]") {
+    const auto projectPath = DataRoot().parent_path() / "Saved" / "ExhibitionFinal_project.json";
     if (!std::filesystem::exists(projectPath)) {
-        SKIP("exhibitionScene project template is not present.");
+        SKIP("Exhibition final project is not present.");
     }
 
     std::string error;
@@ -1377,14 +1377,14 @@ TEST_CASE("ExhibitionScene project template stores shared visuals at project roo
     REQUIRE(rgbGhost != document->pointVisuals.end());
     CHECK(rgbGhost->style.waterStreakAspect >= 1.0F);
 
-    const auto rgbScene1State = std::find_if(
+    const auto rgbScene3State = std::find_if(
         document->sceneVisualStates.begin(),
         document->sceneVisualStates.end(),
         [](const auto& state) {
-            return state.sceneGroupName == "Scene1" &&
-                   state.visual.name == "RGB-Ghost_Scene1";
+            return state.sceneGroupName == "Scene3" &&
+                   state.visual.name == "RGB-Ghost_Scene3";
         });
-    CHECK(rgbScene1State != document->sceneVisualStates.end());
+    CHECK(rgbScene3State != document->sceneVisualStates.end());
 
     std::vector<std::string> roles;
     std::vector<std::string> filenames;
@@ -1392,18 +1392,19 @@ TEST_CASE("ExhibitionScene project template stores shared visuals at project roo
         CHECK_FALSE(layer.pointStyle.has_value());
         CHECK(layer.pointVisuals.empty());
         CHECK(layer.selectedPointVisualName == "Unnamed");
-        if (layer.sceneGroupName == "ExhibitionScene" &&
+        if (layer.sceneGroupName == "Scene3" && layer.loaded && layer.visible &&
             (layer.sceneRole == "ROCK" || layer.sceneRole == "SAND" || layer.sceneRole == "VEG")) {
             roles.push_back(layer.sceneRole);
             filenames.push_back(layer.sourcePath.filename().string());
         }
     }
+    CHECK(roles.size() == 3U);
     CHECK(std::find(roles.begin(), roles.end(), "ROCK") != roles.end());
     CHECK(std::find(roles.begin(), roles.end(), "SAND") != roles.end());
     CHECK(std::find(roles.begin(), roles.end(), "VEG") != roles.end());
-    CHECK(std::find(filenames.begin(), filenames.end(), "Site3-ROCK-1mm.ply") != filenames.end());
-    CHECK(std::find(filenames.begin(), filenames.end(), "Site3-SAND-2mm.ply") != filenames.end());
-    CHECK(std::find(filenames.begin(), filenames.end(), "Site3-VEG-1mm.ply") != filenames.end());
+    CHECK(std::find(filenames.begin(), filenames.end(), "Site3-ROCK-5mm.ply") != filenames.end());
+    CHECK(std::find(filenames.begin(), filenames.end(), "Site3-SAND-5mm.ply") != filenames.end());
+    CHECK(std::find(filenames.begin(), filenames.end(), "Site3-VEG-5mm.ply") != filenames.end());
 }
 
 TEST_CASE("Combined water support samples all scene roles with role multipliers", "[water][scene]") {
@@ -2585,7 +2586,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     invisible_places::serialization::ProjectLayerDocument layer;
     layer.kind = invisible_places::serialization::SerializedLayerKind::PointCloud;
     layer.sourcePath = "Data/Site2 -5mm.ply";
-    layer.sceneGroupName = "Scene1";
+    layer.sceneGroupName = "SampleScene";
     layer.sceneRole = "ROCK";
     layer.loaded = true;
     layer.visible = true;
@@ -2657,15 +2658,15 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     document.pointVisuals.push_back({.name = "Warm", .style = pointStyle});
     document.selectedPointVisualName = "Warm";
     document.sceneVisualStates.push_back({
-        .sceneGroupName = "Scene1",
-        .visual = {.name = "Warm_Scene1", .style = editedStyle},
+        .sceneGroupName = "SampleScene",
+        .visual = {.name = "Warm_SampleScene", .style = editedStyle},
     });
     auto coolStyle = pointStyle;
     coolStyle.exposure = 0.72F;
     document.pointVisuals.push_back({.name = "Cool", .style = coolStyle});
     document.sceneVisualStates.push_back({
-        .sceneGroupName = "Scene1",
-        .visual = {.name = "Cool_Scene1", .style = coolStyle},
+        .sceneGroupName = "SampleScene",
+        .visual = {.name = "Cool_SampleScene", .style = coolStyle},
     });
     auto scene2Style = pointStyle;
     scene2Style.exposure = 1.15F;
@@ -2823,7 +2824,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         CHECK(savedJson.find("\"point_visuals\"") != std::string::npos);
         CHECK(savedJson.find("\"selected_point_visual\"") != std::string::npos);
         CHECK(savedJson.find("\"scene_visual_states\"") != std::string::npos);
-        CHECK(savedJson.find("\"Warm_Scene1\"") != std::string::npos);
+        CHECK(savedJson.find("\"Warm_SampleScene\"") != std::string::npos);
         CHECK(savedJson.find("\"gsplat_visual_style\"") != std::string::npos);
         CHECK(savedJson.find("\"layer_tint\"") != std::string::npos);
         CHECK(savedJson.find("\"associated_layer_paths\"") != std::string::npos);
@@ -3152,7 +3153,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK_FALSE(loadedLayer.pointStyle.has_value());
     CHECK(loadedLayer.pointVisuals.empty());
     CHECK(loadedLayer.selectedPointVisualName == "Unnamed");
-    CHECK(loadedLayer.sceneGroupName == "Scene1");
+    CHECK(loadedLayer.sceneGroupName == "SampleScene");
     CHECK(loadedLayer.sceneRole == "ROCK");
     REQUIRE(loadedDocument->pointVisuals.size() == 2U);
     CHECK(loadedDocument->selectedPointVisualName == "Warm");
@@ -3216,15 +3217,15 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(loadedVisual.style.colormapPosition.fieldMap.fieldName == "Intensity");
     CHECK(!loadedVisual.style.colormapPosition.active);
     REQUIRE(loadedDocument->sceneVisualStates.size() == 3U);
-    CHECK(loadedDocument->sceneVisualStates[0].sceneGroupName == "Scene1");
-    CHECK(loadedDocument->sceneVisualStates[0].visual.name == "Warm_Scene1");
+    CHECK(loadedDocument->sceneVisualStates[0].sceneGroupName == "SampleScene");
+    CHECK(loadedDocument->sceneVisualStates[0].visual.name == "Warm_SampleScene");
     CHECK(
         loadedDocument->sceneVisualStates[0].visual.style.colorMode ==
         invisible_places::renderer::pointcloud::PointCloudColorMode::SolidColor);
     CHECK(loadedDocument->sceneVisualStates[0].visual.style.solidColor[2] == Catch::Approx(0.3F));
     CHECK(loadedDocument->sceneVisualStates[0].visual.style.waterStreakAspect == Catch::Approx(9.0F));
-    CHECK(loadedDocument->sceneVisualStates[1].sceneGroupName == "Scene1");
-    CHECK(loadedDocument->sceneVisualStates[1].visual.name == "Cool_Scene1");
+    CHECK(loadedDocument->sceneVisualStates[1].sceneGroupName == "SampleScene");
+    CHECK(loadedDocument->sceneVisualStates[1].visual.name == "Cool_SampleScene");
     CHECK(loadedDocument->sceneVisualStates[1].visual.style.exposure == Catch::Approx(0.72F));
     CHECK(loadedDocument->sceneVisualStates[2].sceneGroupName == "Scene2");
     CHECK(loadedDocument->sceneVisualStates[2].visual.name == "Warm_Scene2");

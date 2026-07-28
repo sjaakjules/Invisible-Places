@@ -4,7 +4,7 @@
 
 A grouped LiDAR scene is a folder containing role-named point clouds. The switching workflow currently recognises the `ROCK`, `SAND`, and `VEG` roles and infers physical point spacing from filename tokens such as `1mm`, `2mm`, `3mm`, and `5mm`.
 
-Discovery quantizes spacing to integer micrometres before comparing variants. A spacing is offered in **Visuals > Visible Point Cloud** only when the scene folder contains exactly one file at that spacing for every required role. A missing role or duplicate `(role, spacing)` file makes that spacing unavailable. Scene1 therefore exposes exactly 1, 2, 3, and 5 mm. Standalone point clouds and generated water overlays remain independent layers and are not included in the selector.
+Discovery quantizes spacing to integer micrometres before comparing variants. A spacing is offered in **Visuals > Visible Point Cloud** only when the scene folder contains exactly one file at that spacing for every required role. A missing role or duplicate `(role, spacing)` file makes that spacing unavailable. Scene3 therefore exposes exactly 1, 2, 3, and 5 mm. Standalone point clouds and generated water overlays remain independent layers and are not included in the selector.
 
 The selector sits between **Cloud** and **Saved Visuals** and is scene-wide. Changing it replaces ROCK, SAND, and VEG as one display bundle; it is not a per-role variant control. The former role-level Variant controls are read-only analysis-source status. The UI reports the spacing, total point count, loading progress, and any error. The old committed bundle remains visible while all three target roles load into CPU memory. Once the bundle is complete, rendering is settled once, the old GPU bundle is retired, and the target bundle is uploaded hidden before one atomic visibility commit. Every uploaded layer receives a fresh descriptor generation containing its base, highlight, EXR, and compact Seepage bindings; retired descriptor pools are released before any buffer they reference. A partial allocation or upload restores the previous bundle from retained CPU clouds without rescanning PLY files. Switching is disabled during an active export. Final exports ignore the live density switch: they render the finest complete scene bundle (loaded on demand by the export gate), while the viewport can stay on a coarse bundle for interactive framing.
 
@@ -73,12 +73,12 @@ The authoritative `scene_point_cloud_groups` array records committed display sta
 {
   "scene_point_cloud_groups": [
     {
-      "scene_group": "Scene1",
+      "scene_group": "Scene3",
       "display_spacing_meters": 0.005,
       "display_loaded": true,
       "display_visible": true,
       "water_surface_cache": {
-        "relative_path": "../Data/Scene1/.invisible_places/cache/water/example.surfacecache",
+        "relative_path": "../Data/Scene3/.invisible_places/cache/water/example.surfacecache",
         "cache_schema": 4,
         "algorithm_id": "water-surface-10mm-normal-average-ground-v4",
         "requested_rebuild_generation": 1,
@@ -87,8 +87,8 @@ The authoritative `scene_point_cloud_groups` array records committed display sta
       "roles": [
         {
           "scene_role": "ROCK",
-          "analysis_source_path": "Data/Scene1/Site3-ROCK-1mm.ply",
-          "display_source_path": "Data/Scene1/Site3-ROCK-5mm.ply"
+          "analysis_source_path": "Data/Scene3/Site3-ROCK-1mm.ply",
+          "display_source_path": "Data/Scene3/Site3-ROCK-5mm.ply"
         }
       ]
     }

@@ -1,0 +1,85 @@
+{
+  "aperture_f_stops": 8.0,
+  "associated_layer_paths": [
+    "__scene_group__/SampleScene"
+  ],
+  "depth_of_field_enabled": false,
+  "depth_of_field_max_blur_px": 24.0,
+  "duration_frames": 900,
+  "export_settings": {
+    "end_frame": 0,
+    "fps": 30,
+    "height": 1080,
+    "output_directory": "",
+    "start_frame": 0,
+    "still_camera_duration_seconds": 10.0,
+    "width": 1920
+  },
+  "export_visuals": [],
+  "keys": [
+    {
+      "aperture_f_stops": 8.0,
+      "camera_position": [
+        303.7449951171875,
+        104.19071197509766,
+        2.4324357509613037
+      ],
+      "duration_frames": 90,
+      "far_plane": 77.10322570800781,
+      "focus_distance": 1.0,
+      "focus_point": [
+        304.9866943359375,
+        104.11473083496094,
+        2.152068614959717
+      ],
+      "fov_degrees": 55.0,
+      "has_aperture_f_stops": false,
+      "has_focus_distance": false,
+      "has_orientation": false,
+      "id": "key_1",
+      "linked_camera_id": "sample_scene_validation_1",
+      "linked_camera_name": "SampleScene Validation Start",
+      "near_plane": 0.0005000000237487257,
+      "orientation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "source_shot_name": "SampleScene Validation Start"
+    },
+    {
+      "aperture_f_stops": 8.0,
+      "camera_position": [
+        303.61419677734375,
+        100.93214416503906,
+        2.218784809112549
+      ],
+      "duration_frames": 600,
+      "far_plane": 74.05430603027344,
+      "focus_distance": 1.0,
+      "focus_point": [
+        304.84857177734375,
+        101.1572494506836,
+        1.9908998012542725
+      ],
+      "fov_degrees": 55.0,
+      "has_aperture_f_stops": false,
+      "has_focus_distance": false,
+      "has_orientation": false,
+      "id": "key_2",
+      "linked_camera_id": "sample_scene_validation_2",
+      "linked_camera_name": "SampleScene Validation End",
+      "near_plane": 0.0005000000237487257,
+      "orientation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "source_shot_name": "SampleScene Validation End"
+    }
+  ],
+  "name": "sample_scene_validation",
+  "schema_version": 12
+}

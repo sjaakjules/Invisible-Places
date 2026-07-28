@@ -1,3 +1,4 @@
+#include "app/WaterSurfaceCacheReadiness.hpp"
 #include "io/AssetDiscovery.hpp"
 #include "io/PointCloudData.hpp"
 #include "renderer/core/VulkanViewportShell.hpp"
@@ -566,6 +567,69 @@ TEST_CASE("water surface CPU queries preserve the continuous surface sheet", "[w
         {1.0F, 1.0F, 1.0F},
         0.01F);
     CHECK_FALSE(outsideSupport.hit);
+}
+
+TEST_CASE(
+    "resident water cache readiness requires only populated GPU tables",
+    "[water][cache][readiness]") {
+    using invisible_places::app::WaterSurfaceResidentTablesReady;
+    using invisible_places::renderer::core::WaterGroundFlowGpuView;
+    using invisible_places::renderer::core::WaterSurfaceFlowGpuView;
+    using invisible_places::water::WaterGroundCell;
+    using invisible_places::water::WaterSurfaceCache;
+    using invisible_places::water::WaterSurfaceCacheIdentity;
+
+    WaterSurfaceCacheIdentity residentIdentity{
+        .sourceSignature = "ground-only",
+        .contentDigest = {1U, 2U, 3U, 4U},
+    };
+    WaterSurfaceCache groundOnly;
+    groundOnly.cacheIdentity = residentIdentity;
+    groundOnly.groundCells.push_back(WaterGroundCell{});
+
+    WaterSurfaceFlowGpuView absentFlow;
+    WaterGroundFlowGpuView readyGround{
+        .cacheIdentity = &residentIdentity,
+        .valid = true,
+    };
+    CHECK(WaterSurfaceResidentTablesReady(
+        &groundOnly,
+        absentFlow,
+        readyGround,
+        false));
+    CHECK_FALSE(WaterSurfaceResidentTablesReady(
+        &groundOnly,
+        absentFlow,
+        readyGround,
+        true));
+
+    WaterSurfaceCacheIdentity staleIdentity = residentIdentity;
+    staleIdentity.sourceSignature = "stale-ground";
+    readyGround.cacheIdentity = &staleIdentity;
+    CHECK_FALSE(WaterSurfaceResidentTablesReady(
+        &groundOnly,
+        absentFlow,
+        readyGround,
+        false));
+
+    groundOnly.flowSurfaceSurfels.push_back({});
+    readyGround.cacheIdentity = &residentIdentity;
+    WaterSurfaceFlowGpuView readyFlow{
+        .cacheIdentity = &residentIdentity,
+        .valid = true,
+        .preprocessingComplete = true,
+    };
+    CHECK(WaterSurfaceResidentTablesReady(
+        &groundOnly,
+        readyFlow,
+        readyGround,
+        false));
+    readyFlow.preprocessingComplete = false;
+    CHECK_FALSE(WaterSurfaceResidentTablesReady(
+        &groundOnly,
+        readyFlow,
+        readyGround,
+        false));
 }
 
 TEST_CASE(
@@ -3404,19 +3468,20 @@ TEST_CASE(
           Catch::Approx(droplets.dropletBlend).margin(1.0e-6F));
 }
 
-TEST_CASE("Scene1 builds and reloads the exact two millimetre water surface cache", "[.rain-data]") {
-    const auto sceneDirectory = std::filesystem::path{INVISIBLE_PLACES_DEFAULT_DATA_DIR} / "Scene1";
+TEST_CASE("SampleScene builds and reloads the exact two millimetre water surface cache", "[.rain-data]") {
+    const auto sceneDirectory =
+        std::filesystem::path{INVISIBLE_PLACES_DEFAULT_DATA_DIR} / "SampleScene";
     const std::vector<invisible_places::water::WaterSurfaceSource> sources{
-        {.sourcePath = sceneDirectory / "Site1-ROCK-2mm.ply",
+        {.sourcePath = sceneDirectory / "Site1-ROCK-2mm. SampleScene.ply",
          .role = WaterSurfaceRole::Rock,
          .spacingMicrometres = 2'000U},
-        {.sourcePath = sceneDirectory / "Site1-SAND-2mm.ply",
+        {.sourcePath = sceneDirectory / "Site1-SAND-2mm. SampleScene.ply",
          .role = WaterSurfaceRole::Sand,
          .spacingMicrometres = 2'000U},
-        {.sourcePath = sceneDirectory / "Site1-VEG-2mm.ply",
+        {.sourcePath = sceneDirectory / "Site1-VEG-2mm. SampleScene.ply",
          .role = WaterSurfaceRole::Vegetation,
          .spacingMicrometres = 2'000U},
-        {.sourcePath = sceneDirectory / "Site1-MESHSampled-5mm.ply",
+        {.sourcePath = sceneDirectory / "Site1-MeshSampled-5mm-SampleScene.ply",
          .role = WaterSurfaceRole::Ground,
          .spacingMicrometres = 5'000U},
     };
@@ -3433,7 +3498,7 @@ TEST_CASE("Scene1 builds and reloads the exact two millimetre water surface cach
     CHECK_FALSE(first.cache.surfaceCells.empty());
     CHECK_FALSE(first.cache.vegetationVoxels.empty());
     CHECK(first.cache.sourcePointCount > 0U);
-    CHECK(first.cache.sourcePointCount == 39'409'886U);
+    CHECK(first.cache.sourcePointCount == 6'754'803U);
     CHECK(first.cache.groundSourcePointCount > 0U);
     CHECK(first.cache.sources.size() == 4U);
     CHECK_FALSE(first.cache.groundCells.empty());

@@ -211,7 +211,7 @@ The ExhibitionScene multi-cloud workflow was additionally validated locally on J
 
 - `Data/SampleScene` discovered as one grouped ROCK/SAND/VEG scene with complete `1mm`, `2mm`, `3mm`, and `5mm` density bundles.
 - `scripts/generate_sample_scene_validation.py` rebuilds `Saved/validation/SampleSceneValidation_project.json` from the durable `tests/fixtures/sample_scene_water_sources.json` objects (`SampleFlowPoint`, `SampleFlowPath`, and `SampleSeepage`) without embedding derived caches.
-- Native integration scenarios are `--gui-smoke water-integration-sample-scene` for the validation project and `--gui-smoke water-integration-scene1-top-view` for `Saved/exhibitionScene_project.json` and its `Top_View` animation.
+- Native integration scenarios are `--gui-smoke water-integration-sample-scene` for the lightweight validation project and `--gui-smoke water-integration-scene3-exhibition` for the final Scene3 project and its `Exhibition` animation. The full-site scenario uses the live 5 mm display and is registered only with `-DINVISIBLE_PLACES_ENABLE_FULL_SITE_WATER_STRESS_TESTS=ON` because it may build the canonical shared-water cache.
 - `Saved/ExhibitionFinal_project.json` loads the combined Scene3 project by default when present. Startup falls back to `Saved/exhibitionScene_project.json`, then `Saved/invisible_places_project.json`.
 - `RGB-Ghost`, `Roughness`, and `ghosted` are folder-level point visuals with density-compensated role rendering.
 - SAND shoreline waves compile through the point-cloud shader path and are covered by focused shoreline tests.

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Refresh the local SampleScene validation project from its durable fixture.
+"""Refresh the local SampleScene validation project from durable fixtures.
 
-The tracked schema-19 fixture is authoritative, so validation keeps working
-after the authored objects are removed from the ignored exhibition project.
-An explicit option can refresh that fixture while those objects still exist.
-The helper builds a lightweight SampleScene project around the explicit 3 mm
-display bundle and canonicalises the legacy SampleScene filenames and object
-names in the local main project. The current authored filenames use the
-`SampleScene` suffix, including a space after the density delimiter.
+The tracked schema-19 water fixture and the current validation project are the
+default inputs, so regeneration never depends on or rewrites an authored
+exhibition project. An explicit main-project option can still refresh the water
+fixture while those authored objects exist. The helper builds a lightweight
+SampleScene project around the explicit 3 mm display bundle. Current authored
+filenames use the `SampleScene` suffix, including a space after the density
+delimiter.
 """
 
 from __future__ import annotations
@@ -28,6 +28,9 @@ DEFAULT_MAIN_PROJECT = REPOSITORY_ROOT / "Saved" / "exhibitionScene_project.json
 DEFAULT_FIXTURE = REPOSITORY_ROOT / "tests" / "fixtures" / "sample_scene_water_sources.json"
 DEFAULT_VALIDATION_PROJECT = (
     REPOSITORY_ROOT / "Saved" / "validation" / "SampleSceneValidation_project.json"
+)
+SAMPLE_ANIMATION = (
+    REPOSITORY_ROOT / "tests" / "fixtures" / "sample_scene_validation.ipanim.json"
 )
 
 PATH_RENAMES = {
@@ -608,8 +611,13 @@ def build_validation_project(
 
     for entry in validation.get("camera_shots", []):
         entry["associated_layer_paths"] = ["__scene_group__/SampleScene"]
-    for entry in validation.get("saved_animations", []):
-        entry["associated_layer_paths"] = ["__scene_group__/SampleScene"]
+    validation["last_animation_path"] = str(SAMPLE_ANIMATION)
+    validation["saved_animations"] = [
+        {
+            "file_path": str(SAMPLE_ANIMATION),
+            "associated_layer_paths": ["__scene_group__/SampleScene"],
+        }
+    ]
     return validation
 
 
@@ -630,7 +638,20 @@ def create_backup(path: Path) -> Path:
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--main-project", type=Path, default=DEFAULT_MAIN_PROJECT)
+    parser.add_argument(
+        "--template-project",
+        type=Path,
+        default=DEFAULT_VALIDATION_PROJECT,
+        help="SampleScene-only project used as the structural template.",
+    )
+    parser.add_argument(
+        "--main-project",
+        type=Path,
+        help=(
+            "Optional authored project to refresh fixture objects from and, "
+            "unless --skip-main-update is used, canonicalise in place."
+        ),
+    )
     parser.add_argument("--fixture", type=Path, default=DEFAULT_FIXTURE)
     parser.add_argument(
         "--validation-project", type=Path, default=DEFAULT_VALIDATION_PROJECT
@@ -638,7 +659,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--skip-main-update",
         action="store_true",
-        help="Generate copies without rewriting or backing up the ignored main project.",
+        help="Do not rewrite or back up the explicitly supplied main project.",
     )
     parser.add_argument(
         "--refresh-fixture-from-main",
@@ -653,16 +674,22 @@ def parse_arguments() -> argparse.Namespace:
 
 def main() -> int:
     arguments = parse_arguments()
-    main_project = arguments.main_project.resolve()
     validate_sample_assets()
-    original_project = load_json(main_project)
-    project = migrate_main_project(canonicalise(original_project))
+    template_project = arguments.template_project.resolve()
+    project = migrate_main_project(canonicalise(load_json(template_project)))
     fixture_path = arguments.fixture.resolve()
     if arguments.refresh_fixture_from_main:
-        state = authored_state(project)
+        if arguments.main_project is None:
+            raise ValueError(
+                "--refresh-fixture-from-main requires an explicit --main-project"
+            )
+        authored_project = migrate_main_project(
+            canonicalise(load_json(arguments.main_project.resolve()))
+        )
+        state = authored_state(authored_project)
         if state is None:
             raise ValueError("The main project no longer contains the authored fixture objects")
-        fixture = build_water_fixture(project, state)
+        fixture = build_water_fixture(authored_project, state)
         upgrade_water_contract(fixture, project=False)
         atomic_write_json(fixture_path, fixture)
     else:
@@ -673,18 +700,20 @@ def main() -> int:
     validation = build_validation_project(project, fixture)
     atomic_write_json(arguments.validation_project.resolve(), validation)
 
-    if arguments.skip_main_update:
-        print(f"Fixture: {arguments.fixture.resolve()}")
-        print(f"Validation project: {arguments.validation_project.resolve()}")
-        return 0
-
-    if project != original_project:
-        backup = create_backup(main_project)
-        atomic_write_json(main_project, project)
-        print(f"Backup: {backup}")
-        print(f"Updated main project: {main_project}")
-    else:
-        print(f"Main project already canonical: {main_project}")
+    if arguments.main_project is not None and not arguments.skip_main_update:
+        main_project = arguments.main_project.resolve()
+        original_project = load_json(main_project)
+        migrated_main_project = migrate_main_project(
+            canonicalise(original_project)
+        )
+        if migrated_main_project != original_project:
+            backup = create_backup(main_project)
+            atomic_write_json(main_project, migrated_main_project)
+            print(f"Backup: {backup}")
+            print(f"Updated main project: {main_project}")
+        else:
+            print(f"Main project already canonical: {main_project}")
+    print(f"Template: {template_project}")
     print(f"Fixture: {arguments.fixture.resolve()}")
     print(f"Validation project: {arguments.validation_project.resolve()}")
     return 0

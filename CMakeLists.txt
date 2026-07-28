@@ -21,6 +21,11 @@ option(
     OFF
 )
 option(
+    INVISIBLE_PLACES_ENABLE_FULL_SITE_WATER_STRESS_TESTS
+    "Enable the large Scene3 water-cache integration stress test (also requires GUI smoke tests)."
+    OFF
+)
+option(
     INVISIBLE_PLACES_ENABLE_FETCHCONTENT_GS
     "Allow FetchContent as an exception path for Gaussian splat integration."
     OFF
@@ -256,6 +261,22 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
 
     if(INVISIBLE_PLACES_ENABLE_GUI_SMOKE_TESTS)
         add_test(
+            NAME renderer-frame-timing-scene3-5mm
+            COMMAND
+                $<TARGET_FILE:invisible_places>
+                "${CMAKE_CURRENT_SOURCE_DIR}/Data"
+                --gui-smoke renderer-frame-timing-scene3-5mm
+                --smoke-output "${CMAKE_CURRENT_BINARY_DIR}/renderer-frame-timing-scene3-5mm"
+        )
+        set_tests_properties(
+            renderer-frame-timing-scene3-5mm
+            PROPERTIES
+                LABELS "gui_smoke;renderer_timing"
+                RUN_SERIAL TRUE
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                TIMEOUT 900
+        )
+        add_test(
             NAME water-region-sample-terrestrial-gui-smoke
             COMMAND
                 $<TARGET_FILE:invisible_places>
@@ -265,7 +286,10 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
         )
         set_tests_properties(
             water-region-sample-terrestrial-gui-smoke
-            PROPERTIES LABELS gui_smoke
+            PROPERTIES
+                LABELS gui_smoke
+                RUN_SERIAL TRUE
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         )
         add_test(
             NAME water-region-test-points-gui-smoke
@@ -277,7 +301,10 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
         )
         set_tests_properties(
             water-region-test-points-gui-smoke
-            PROPERTIES LABELS gui_smoke
+            PROPERTIES
+                LABELS gui_smoke
+                RUN_SERIAL TRUE
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         )
         add_test(
             NAME water-ripple-patterns-test-points-gui-smoke
@@ -289,7 +316,10 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
         )
         set_tests_properties(
             water-ripple-patterns-test-points-gui-smoke
-            PROPERTIES LABELS gui_smoke
+            PROPERTIES
+                LABELS gui_smoke
+                RUN_SERIAL TRUE
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         )
         add_test(
             NAME seepage-sample-terrestrial-gui-smoke
@@ -301,7 +331,10 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
         )
         set_tests_properties(
             seepage-sample-terrestrial-gui-smoke
-            PROPERTIES LABELS gui_smoke
+            PROPERTIES
+                LABELS gui_smoke
+                RUN_SERIAL TRUE
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         )
         add_test(
             NAME dynamic-mesh-flow-ground-gui-smoke
@@ -313,22 +346,42 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
         )
         set_tests_properties(
             dynamic-mesh-flow-ground-gui-smoke
-            PROPERTIES LABELS gui_smoke
+            PROPERTIES
+                LABELS gui_smoke
+                RUN_SERIAL TRUE
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         )
         add_test(
-            NAME dynamic-mesh-flow-scene1-visual-gui-smoke
+            NAME dynamic-mesh-flow-scene3-5mm-visual-gui-smoke
             COMMAND
                 $<TARGET_FILE:invisible_places>
                 "${CMAKE_CURRENT_SOURCE_DIR}/Data"
-                --gui-smoke dynamic-mesh-flow-scene1-visual
-                --smoke-output "${CMAKE_CURRENT_BINARY_DIR}/water-region-smoke/scene1-mesh-flow-visual"
+                --gui-smoke dynamic-mesh-flow-scene3-5mm-visual
+                --smoke-output "${CMAKE_CURRENT_BINARY_DIR}/water-region-smoke/scene3-mesh-flow-visual"
         )
         set_tests_properties(
-            dynamic-mesh-flow-scene1-visual-gui-smoke
+            dynamic-mesh-flow-scene3-5mm-visual-gui-smoke
             PROPERTIES
                 LABELS "gui_smoke;water_integration"
                 RUN_SERIAL TRUE
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
                 TIMEOUT 600
+        )
+        add_test(
+            NAME rain-gpu-scene3-5mm-gui-smoke
+            COMMAND
+                $<TARGET_FILE:invisible_places>
+                "${CMAKE_CURRENT_SOURCE_DIR}/Data"
+                --gui-smoke rain-gpu-scene3-5mm
+                --smoke-output "${CMAKE_CURRENT_BINARY_DIR}/rain-gpu-smoke/scene3-5mm"
+        )
+        set_tests_properties(
+            rain-gpu-scene3-5mm-gui-smoke
+            PROPERTIES
+                LABELS "gui_smoke;water_integration"
+                RUN_SERIAL TRUE
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                TIMEOUT 900
         )
         add_test(
             NAME animation-export-frame-gui-smoke
@@ -343,6 +396,7 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
             PROPERTIES
                 LABELS gui_smoke
                 RUN_SERIAL TRUE
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
                 TIMEOUT 1200
         )
         add_test(
@@ -358,22 +412,26 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
             PROPERTIES
                 LABELS "gui_smoke;water_integration"
                 RUN_SERIAL TRUE
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
                 TIMEOUT 360
         )
-        add_test(
-            NAME water-integration-scene1-top-view
-            COMMAND
-                $<TARGET_FILE:invisible_places>
-                "${CMAKE_CURRENT_SOURCE_DIR}/Data"
-                --gui-smoke water-integration-scene1-top-view
-                --smoke-output "${CMAKE_CURRENT_BINARY_DIR}/water-integration-smoke/scene1-top-view"
-        )
-        set_tests_properties(
-            water-integration-scene1-top-view
-            PROPERTIES
-                LABELS "gui_smoke;water_integration"
-                RUN_SERIAL TRUE
-                TIMEOUT 600
-        )
+        if(INVISIBLE_PLACES_ENABLE_FULL_SITE_WATER_STRESS_TESTS)
+            add_test(
+                NAME water-integration-scene3-exhibition
+                COMMAND
+                    $<TARGET_FILE:invisible_places>
+                    "${CMAKE_CURRENT_SOURCE_DIR}/Data"
+                    --gui-smoke water-integration-scene3-exhibition
+                    --smoke-output "${CMAKE_CURRENT_BINARY_DIR}/water-integration-smoke/scene3-exhibition"
+            )
+            set_tests_properties(
+                water-integration-scene3-exhibition
+                PROPERTIES
+                    LABELS "gui_smoke;water_integration;full_site_water_stress"
+                    RUN_SERIAL TRUE
+                    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                    TIMEOUT 1200
+            )
+        endif()
     endif()
 endif()

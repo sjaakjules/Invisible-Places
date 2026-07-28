@@ -1,8 +1,10 @@
 #include "InvisiblePlacesBuildConfig.hpp"
 #include "io/AssetDiscovery.hpp"
+#include "renderer/core/FrameTiming.hpp"
 #include "scene/PointCloudVariants.hpp"
 #include "scene/SceneCatalog.hpp"
 
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
@@ -206,17 +208,111 @@ TEST_CASE("Scene groups are keyed by folder rather than display name", "[scene][
             .spacingMicrometres == 1'000U);
 }
 
-TEST_CASE("Scene1 exposes 1, 2, 3, and 5 millimetre display bundles", "[scene][density][data]") {
+TEST_CASE("Swapchain image ownership is tied to a submission generation", "[renderer][sync]") {
+    using invisible_places::renderer::core::ClassifySwapchainImageOwner;
+    using invisible_places::renderer::core::ClearCompletedImageOwners;
+    using invisible_places::renderer::core::SwapchainImageOwner;
+    using invisible_places::renderer::core::SwapchainImageOwnerState;
+
+    std::vector<SwapchainImageOwner> imageOwners(3U);
+
+    // F0/image0 -> F1/image1.
+    imageOwners[0] = {.frameSlot = 0U, .submissionSerial = 1U};
+    imageOwners[1] = {.frameSlot = 1U, .submissionSerial = 2U};
+    CHECK(
+        ClassifySwapchainImageOwner(imageOwners[0], 1U, 0U) ==
+        SwapchainImageOwnerState::Active);
+    CHECK(
+        ClassifySwapchainImageOwner(imageOwners[1], 2U, 0U) ==
+        SwapchainImageOwnerState::Active);
+
+    // Completing F0/serial1 retires only image0's exact generation.
+    CHECK(ClearCompletedImageOwners(&imageOwners, 0U, 1U) == 1U);
+    CHECK_FALSE(imageOwners[0].Valid());
+    CHECK(imageOwners[1] == SwapchainImageOwner{1U, 2U});
+
+    // Reuse F0 for image2. Reacquiring image0 must remain unowned rather than
+    // aliasing the fence now used by F0/serial3.
+    imageOwners[2] = {.frameSlot = 0U, .submissionSerial = 3U};
+    CHECK(
+        ClassifySwapchainImageOwner(imageOwners[0], 3U, 1U) ==
+        SwapchainImageOwnerState::Unowned);
+    CHECK(
+        ClassifySwapchainImageOwner(imageOwners[2], 3U, 1U) ==
+        SwapchainImageOwnerState::Active);
+
+    const SwapchainImageOwner staleOwner{.frameSlot = 0U, .submissionSerial = 1U};
+    CHECK(
+        ClassifySwapchainImageOwner(staleOwner, 3U, 0U) ==
+        SwapchainImageOwnerState::Stale);
+    CHECK(
+        ClassifySwapchainImageOwner(staleOwner, 3U, 1U) ==
+        SwapchainImageOwnerState::Completed);
+    CHECK(ClearCompletedImageOwners(nullptr, 0U, 1U) == 0U);
+    CHECK(ClearCompletedImageOwners(&imageOwners, 0U, 0U) == 0U);
+}
+
+TEST_CASE("GPU timestamp deltas respect valid-bit wrapping", "[renderer][timing]") {
+    using invisible_places::renderer::core::RollingPhaseAverages;
+    using invisible_places::renderer::core::TimestampDeltaMilliseconds;
+    using invisible_places::renderer::core::TimestampMask;
+    using invisible_places::renderer::core::TimestampQueryResult;
+    using invisible_places::renderer::core::TimestampResultsAvailable;
+    using invisible_places::renderer::core::TimestampTickDelta;
+
+    CHECK(TimestampMask(0U) == 0U);
+    CHECK(TimestampMask(4U) == 0x0fU);
+    CHECK(TimestampMask(64U) == std::numeric_limits<std::uint64_t>::max());
+    CHECK(TimestampTickDelta(100U, 140U, 64U) == 40U);
+    CHECK(TimestampTickDelta(250U, 5U, 8U) == 11U);
+    CHECK(TimestampTickDelta(250U, 5U, 0U) == 0U);
+    CHECK(TimestampDeltaMilliseconds(0U, 500'000U, 64U, 2.0) ==
+          Catch::Approx(1.0));
+    CHECK(TimestampDeltaMilliseconds(0U, 500'000U, 64U, 0.0) == 0.0);
+    CHECK(TimestampDeltaMilliseconds(0U, 500'000U, 64U, -1.0) == 0.0);
+
+    const std::array<TimestampQueryResult, 2U> availableResults{{
+        {.value = 10U, .available = 1U},
+        {.value = 20U, .available = 1U},
+    }};
+    auto unavailableResults = availableResults;
+    unavailableResults[1].available = 0U;
+    CHECK(TimestampResultsAvailable(availableResults));
+    CHECK_FALSE(TimestampResultsAvailable(unavailableResults));
+    CHECK_FALSE(TimestampResultsAvailable({}));
+
+    RollingPhaseAverages<3U> averages;
+    averages.AddFrame(
+        {2.0, 50.0, 6.0},
+        {true, false, true},
+        200.0);
+    CHECK_FALSE(averages.PublishIfReady());
+    CHECK(averages.PendingSampleCount(0U) == 1U);
+    CHECK(averages.PendingSampleCount(1U) == 0U);
+    averages.AddFrame(
+        {4.0, 70.0, 10.0},
+        {true, false, true},
+        300.0);
+    REQUIRE(averages.PublishIfReady());
+    CHECK(averages.PublishedAverage(0U) == Catch::Approx(3.0));
+    CHECK_FALSE(averages.PublishedActive(1U));
+    CHECK(averages.PublishedAverage(2U) == Catch::Approx(8.0));
+    averages.Reset();
+    CHECK(averages.PendingSampleCount(0U) == 0U);
+    CHECK_FALSE(averages.PublishedActive(0U));
+}
+
+TEST_CASE("Scene3 exposes 1, 2, 3, and 5 millimetre display bundles", "[scene][density][data]") {
     const std::filesystem::path dataRoot{INVISIBLE_PLACES_DEFAULT_DATA_DIR};
-    if (!std::filesystem::exists(dataRoot / "Scene1")) {
-        SKIP("Scene1 fixture is not present in the local Data directory.");
+    if (!std::filesystem::exists(dataRoot / "Scene3")) {
+        SKIP("Scene3 fixture is not present in the local Data directory.");
     }
 
     const auto assetCatalog = invisible_places::io::DiscoverAssets(dataRoot);
     const auto sceneCatalog = invisible_places::scene::SceneCatalog::FromDiscoveredAssets(assetCatalog);
-    const auto* scene1 = sceneCatalog.FindPointCloudGroup("Scene1");
-    REQUIRE(scene1 != nullptr);
-    REQUIRE(scene1->completeDisplayBundles.size() == 4U);
+    const auto* scene3 = sceneCatalog.FindPointCloudGroup("Scene3");
+    REQUIRE(scene3 != nullptr);
+    REQUIRE(scene3->completeDisplayBundles.size() == 4U);
     const std::array<PointSpacingMicrometres, 4U> expectedSpacings{
         1'000U,
         2'000U,
@@ -224,16 +320,16 @@ TEST_CASE("Scene1 exposes 1, 2, 3, and 5 millimetre display bundles", "[scene][d
         5'000U,
     };
     for (std::size_t index = 0; index < expectedSpacings.size(); ++index) {
-        CHECK(scene1->completeDisplayBundles[index].spacingMicrometres == expectedSpacings[index]);
-        CHECK(scene1->completeDisplayBundles[index].totalPointCount > 0U);
+        CHECK(scene3->completeDisplayBundles[index].spacingMicrometres == expectedSpacings[index]);
+        CHECK(scene3->completeDisplayBundles[index].totalPointCount > 0U);
     }
 
-    REQUIRE(scene1->AnalysisSource(ScenePointCloudRole::Rock) != nullptr);
-    REQUIRE(scene1->AnalysisSource(ScenePointCloudRole::Sand) != nullptr);
-    REQUIRE(scene1->AnalysisSource(ScenePointCloudRole::Vegetation) != nullptr);
-    CHECK(scene1->AnalysisSource(ScenePointCloudRole::Rock)->spacingMicrometres == 1'000U);
-    CHECK(scene1->AnalysisSource(ScenePointCloudRole::Sand)->spacingMicrometres == 2'000U);
-    CHECK(scene1->AnalysisSource(ScenePointCloudRole::Vegetation)->spacingMicrometres == 1'000U);
-    REQUIRE(scene1->defaultDisplay.spacingMicrometres.has_value());
-    CHECK(scene1->defaultDisplay.spacingMicrometres.value() == 1'000U);
+    REQUIRE(scene3->AnalysisSource(ScenePointCloudRole::Rock) != nullptr);
+    REQUIRE(scene3->AnalysisSource(ScenePointCloudRole::Sand) != nullptr);
+    REQUIRE(scene3->AnalysisSource(ScenePointCloudRole::Vegetation) != nullptr);
+    CHECK(scene3->AnalysisSource(ScenePointCloudRole::Rock)->spacingMicrometres == 1'000U);
+    CHECK(scene3->AnalysisSource(ScenePointCloudRole::Sand)->spacingMicrometres == 2'000U);
+    CHECK(scene3->AnalysisSource(ScenePointCloudRole::Vegetation)->spacingMicrometres == 1'000U);
+    REQUIRE(scene3->defaultDisplay.spacingMicrometres.has_value());
+    CHECK(scene3->defaultDisplay.spacingMicrometres.value() == 1'000U);
 }
