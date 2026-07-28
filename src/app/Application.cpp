@@ -1916,6 +1916,56 @@ FindScenarioFeatureRuns(
     return nullptr;
 }
 
+invisible_places::water::WaterFeatureTimeline*
+FindMutableWaterFeatureTimeline(
+    WaterWorkflowState* water,
+    const std::string& scenarioId,
+    const invisible_places::water::WaterKeyedFeatureId& feature) {
+    if (water == nullptr || scenarioId.empty()) {
+        return nullptr;
+    }
+    for (auto& entry : water->featureTimingRunsByScenario) {
+        if (entry.scenarioId != scenarioId) {
+            continue;
+        }
+        for (auto& run : entry.runs) {
+            if (auto* timeline =
+                    invisible_places::water::FindWaterFeatureTimeline(
+                        &run,
+                        feature);
+                timeline != nullptr) {
+                return timeline;
+            }
+        }
+    }
+    return nullptr;
+}
+
+invisible_places::water::WaterKeyedSettingTrack*
+FindMutableWaterSettingTrack(
+    WaterWorkflowState* water,
+    const std::string& scenarioId,
+    const invisible_places::water::WaterKeyedFeatureId& feature,
+    std::string_view settingId) {
+    auto* timeline =
+        FindMutableWaterFeatureTimeline(
+            water,
+            scenarioId,
+            feature);
+    if (timeline == nullptr) {
+        return nullptr;
+    }
+    const auto setting = std::find_if(
+        timeline->settings.begin(),
+        timeline->settings.end(),
+        [&](const auto& candidate) {
+            return candidate.settingId == settingId;
+        });
+    return setting != timeline->settings.end()
+               ? &*setting
+               : nullptr;
+}
+
 invisible_places::water::WaterScenarioFeatureRuns& EnsureScenarioFeatureRuns(
     WaterWorkflowState* water,
     const std::string& scenarioId) {
@@ -39853,6 +39903,20 @@ KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
                     *track,
                     position)
               : std::nullopt;
+    const std::size_t currentKeyCount =
+        keyed
+            ? invisible_places::water::
+                  WaterSettingKeyCountAtPosition(
+                      *track,
+                      position)
+            : 0U;
+    const auto buttonTooltip = [](const char* text) {
+        if (ImGui::IsItemHovered(
+                ImGuiHoveredFlags_DelayNormal |
+                ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("%s", text);
+        }
+    };
     ImGui::SameLine();
     ImGui::PushID(label);
     ImGui::BeginDisabled(!previous.has_value());
@@ -39861,6 +39925,10 @@ KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
         ApplyAnimationScrub(runtimeState);
     }
     ImGui::EndDisabled();
+    buttonTooltip(
+        previous.has_value()
+            ? "Go to this setting's previous key."
+            : "This setting has no earlier key.");
     ImGui::SameLine(0.0F, 2.0F);
     ImGui::BeginDisabled(!next.has_value());
     if (ImGui::SmallButton(">")) {
@@ -39868,6 +39936,43 @@ KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
         ApplyAnimationScrub(runtimeState);
     }
     ImGui::EndDisabled();
+    buttonTooltip(
+        next.has_value()
+            ? "Go to this setting's next key."
+            : "This setting has no later key.");
+    ImGui::SameLine(0.0F, 2.0F);
+    ImGui::BeginDisabled(currentKeyCount == 0U);
+    if (ImGui::SmallButton("X")) {
+        std::size_t removed = 0U;
+        for (const auto& feature : features) {
+            removed += invisible_places::water::
+                RemoveWaterSettingKeysAtPosition(
+                    FindMutableWaterSettingTrack(
+                        &water,
+                        scenarioId,
+                        feature,
+                        settingId),
+                    position);
+        }
+        if (removed > 0U) {
+            ApplyAnimationScrub(runtimeState);
+            InvalidateWaterSeepageParams(&water);
+            runtimeState->previewRenderStateSignatureValid =
+                false;
+            runtimeState->statusMessage =
+                removed == 1U
+                    ? "Deleted the keyed setting at the current position."
+                    : "Deleted " + std::to_string(removed) +
+                          " keyed settings at the current position.";
+            runtimeState->errorMessage.clear();
+            result.keyedChanged = true;
+        }
+    }
+    ImGui::EndDisabled();
+    buttonTooltip(
+        currentKeyCount > 0U
+            ? "Delete this setting's key at the current animation position."
+            : "Move the animation position onto this setting's key to delete it.");
     ImGui::PopID();
 
     if (sliderChanged) {
@@ -44720,13 +44825,17 @@ void DrawWaterKeyMarkerStrip(
                 ImGui::SetKeyboardFocusHere();
                 edit->requestKeyboardFocus = false;
             }
-            bool applyRequested = ImGui::InputFloat(
+            // InputScalar deliberately rejects EnterReturnsTrue in this
+            // ImGui version. Submission stays explicit through Apply while
+            // the numeric field remains fully keyboard-editable.
+            ImGui::InputFloat(
                 "##WaterKeyNormalizedPosition",
                 &edit->draftPosition,
                 0.001F,
                 0.01F,
                 "%.4f",
-                ImGuiInputTextFlags_EnterReturnsTrue);
+                ImGuiInputTextFlags_None);
+            bool applyRequested = false;
             const bool validPosition =
                 std::isfinite(edit->draftPosition) &&
                 edit->draftPosition >= 0.0F &&
@@ -44779,45 +44888,12 @@ void DrawWaterKeyMarkerStrip(
                 auto& water = runtimeState->water;
                 const auto scenarioId =
                     ActiveWaterTimingScenarioId(*runtimeState);
-                auto entryIt = std::find_if(
-                    water.featureTimingRunsByScenario.begin(),
-                    water.featureTimingRunsByScenario.end(),
-                    [&](const auto& candidate) {
-                        return candidate.scenarioId == scenarioId;
-                    });
                 auto* mutableTrack =
-                    static_cast<
-                        invisible_places::water::
-                            WaterKeyedSettingTrack*>(nullptr);
-                if (entryIt !=
-                    water.featureTimingRunsByScenario.end()) {
-                    const auto runIt = std::find_if(
-                        entryIt->runs.begin(),
-                        entryIt->runs.end(),
-                        [&](const auto& candidate) {
-                            return candidate.id == edit->runId;
-                        });
-                    auto* mutableTimeline =
-                        runIt != entryIt->runs.end()
-                            ? invisible_places::water::
-                                  FindWaterFeatureTimeline(
-                                      &*runIt,
-                                      edit->feature)
-                            : nullptr;
-                    if (mutableTimeline != nullptr) {
-                        const auto mutableSettingIt = std::find_if(
-                            mutableTimeline->settings.begin(),
-                            mutableTimeline->settings.end(),
-                            [&](const auto& candidate) {
-                                return candidate.settingId ==
-                                       edit->settingId;
-                            });
-                        if (mutableSettingIt !=
-                            mutableTimeline->settings.end()) {
-                            mutableTrack = &*mutableSettingIt;
-                        }
-                    }
-                }
+                    FindMutableWaterSettingTrack(
+                        &water,
+                        scenarioId,
+                        edit->feature,
+                        edit->settingId);
                 if (invisible_places::water::MoveWaterSettingKey(
                         mutableTrack,
                         edit->sourcePosition,
@@ -44917,6 +44993,13 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
                   *timeline,
                   scrubPosition)
             : std::nullopt;
+    const std::size_t currentFeatureKeyCount =
+        timeline != nullptr
+            ? invisible_places::water::
+                  WaterFeatureKeyCountAtPosition(
+                      *timeline,
+                      scrubPosition)
+            : 0U;
     const bool hasKeyedSettings =
         timeline != nullptr &&
         std::any_of(
@@ -44995,6 +45078,51 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
                         : "Go to the next keyed setting for " +
                               featureLabel + ".";
     buttonTooltip(nextTooltip.c_str());
+
+    ImGui::SameLine(0.0F, 2.0F);
+    ImGui::BeginDisabled(currentFeatureKeyCount == 0U);
+    if (ImGui::SmallButton("X")) {
+        auto& water = runtimeState->water;
+        auto* mutableTimeline =
+            FindMutableWaterFeatureTimeline(
+                &water,
+                ActiveWaterTimingScenarioId(*runtimeState),
+                feature.value());
+        const std::size_t removed =
+            invisible_places::water::
+                RemoveWaterFeatureKeysAtPosition(
+                    mutableTimeline,
+                    scrubPosition);
+        if (removed > 0U) {
+            ApplyAnimationScrub(runtimeState);
+            InvalidateWaterSeepageParams(&water);
+            runtimeState->previewRenderStateSignatureValid = false;
+            runtimeState->statusMessage =
+                removed == 1U
+                    ? "Deleted the water key at the current position."
+                    : "Deleted " + std::to_string(removed) +
+                          " water keys at the current position.";
+            runtimeState->errorMessage.clear();
+        }
+    }
+    ImGui::EndDisabled();
+    const std::string deleteTooltip =
+        !feature.has_value()
+            ? "Select a keyable feature in the Water tab to delete its keys."
+            : !hasKeyedSettings
+                  ? featureLabel + " has no keyed settings."
+                  : currentFeatureKeyCount == 0U
+                        ? "Move the animation position onto a key for " +
+                              featureLabel + " to delete it."
+                        : currentFeatureKeyCount == 1U
+                              ? "Delete the key for " + featureLabel +
+                                    " at the current animation position."
+                              : "Delete all " +
+                                    std::to_string(
+                                        currentFeatureKeyCount) +
+                                    " keys for " + featureLabel +
+                                    " at the current animation position.";
+    buttonTooltip(deleteTooltip.c_str());
 
     ImGui::SameLine();
     const float timeWidth = ImGui::CalcTextSize(timeLabel.c_str()).x;

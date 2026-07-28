@@ -637,6 +637,53 @@ TEST_CASE("Key positions move without overwriting another keyed value",
     CHECK(track.keys[2].position == Approx(0.80F));
 }
 
+TEST_CASE("Setting and feature key deletion only affects the current position",
+          "[water][timing][keyed][delete]") {
+    using invisible_places::water::RemoveWaterFeatureKeysAtPosition;
+    using invisible_places::water::RemoveWaterSettingKeysAtPosition;
+    using invisible_places::water::WaterFeatureKeyCountAtPosition;
+    using invisible_places::water::WaterFeatureTimeline;
+    using invisible_places::water::WaterSettingKeyCountAtPosition;
+
+    WaterFeatureTimeline timeline;
+    timeline.settings = {
+        {.settingId = "activity",
+         .keys = {
+             {.position = 0.20F, .value = 0.1F},
+             {.position = 0.50F, .value = 0.8F},
+             {.position = 0.80F, .value = 0.2F},
+         }},
+        {.settingId = "prominence",
+         .keys = {
+             {.position = 0.50F, .value = 1.5F},
+             {.position = 0.70F, .value = 0.5F},
+         }},
+    };
+
+    CHECK(
+        WaterSettingKeyCountAtPosition(
+            timeline.settings.front(),
+            0.50005F) == 1U);
+    CHECK(WaterFeatureKeyCountAtPosition(timeline, 0.50F) == 2U);
+    CHECK(WaterFeatureKeyCountAtPosition(timeline, 0.51F) == 0U);
+
+    CHECK(
+        RemoveWaterSettingKeysAtPosition(
+            &timeline.settings.front(),
+            0.50005F) == 1U);
+    CHECK(timeline.settings.front().keys.size() == 2U);
+    CHECK(WaterFeatureKeyCountAtPosition(timeline, 0.50F) == 1U);
+
+    CHECK(RemoveWaterFeatureKeysAtPosition(&timeline, 0.50F) == 1U);
+    CHECK(WaterFeatureKeyCountAtPosition(timeline, 0.50F) == 0U);
+    CHECK(timeline.settings[0].keys.size() == 2U);
+    CHECK(timeline.settings[1].keys.size() == 1U);
+    CHECK(timeline.settings[0].keys[0].position == Approx(0.20F));
+    CHECK(timeline.settings[0].keys[1].position == Approx(0.80F));
+    CHECK(timeline.settings[1].keys[0].position == Approx(0.70F));
+    CHECK(RemoveWaterFeatureKeysAtPosition(nullptr, 0.70F) == 0U);
+}
+
 TEST_CASE("Feature timing overlay samples every keyed setting and drives scenario channels",
           "[water][timing][keyed][overlay]") {
     using Catch::Approx;

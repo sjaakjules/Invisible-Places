@@ -7231,6 +7231,65 @@ bool MoveWaterSettingKey(
     return true;
 }
 
+std::size_t WaterSettingKeyCountAtPosition(
+    const WaterKeyedSettingTrack& track,
+    float position) {
+    constexpr float kKeyTolerance = 1.0e-4F;
+    if (!std::isfinite(position)) {
+        return 0U;
+    }
+    return static_cast<std::size_t>(std::count_if(
+        track.keys.begin(),
+        track.keys.end(),
+        [&](const WaterSettingKey& key) {
+            return std::abs(key.position - position) <=
+                   kKeyTolerance;
+        }));
+}
+
+std::size_t RemoveWaterSettingKeysAtPosition(
+    WaterKeyedSettingTrack* track,
+    float position) {
+    if (track == nullptr) {
+        return 0U;
+    }
+    const auto previousSize = track->keys.size();
+    std::erase_if(
+        track->keys,
+        [&](const WaterSettingKey& key) {
+            constexpr float kKeyTolerance = 1.0e-4F;
+            return std::isfinite(position) &&
+                   std::abs(key.position - position) <=
+                       kKeyTolerance;
+        });
+    return previousSize - track->keys.size();
+}
+
+std::size_t WaterFeatureKeyCountAtPosition(
+    const WaterFeatureTimeline& timeline,
+    float position) {
+    std::size_t count = 0U;
+    for (const auto& setting : timeline.settings) {
+        count += WaterSettingKeyCountAtPosition(setting, position);
+    }
+    return count;
+}
+
+std::size_t RemoveWaterFeatureKeysAtPosition(
+    WaterFeatureTimeline* timeline,
+    float position) {
+    if (timeline == nullptr) {
+        return 0U;
+    }
+    std::size_t removed = 0U;
+    for (auto& setting : timeline->settings) {
+        removed += RemoveWaterSettingKeysAtPosition(
+            &setting,
+            position);
+    }
+    return removed;
+}
+
 std::optional<float> PreviousWaterSettingKeyPosition(
     const WaterKeyedSettingTrack& track,
     float position) {

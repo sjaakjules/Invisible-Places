@@ -512,6 +512,18 @@ void AddOrUpdateWaterSettingKey(
     WaterKeyedSettingTrack* track,
     float sourcePosition,
     float destinationPosition);
+[[nodiscard]] std::size_t WaterSettingKeyCountAtPosition(
+    const WaterKeyedSettingTrack& track,
+    float position);
+[[nodiscard]] std::size_t RemoveWaterSettingKeysAtPosition(
+    WaterKeyedSettingTrack* track,
+    float position);
+[[nodiscard]] std::size_t WaterFeatureKeyCountAtPosition(
+    const WaterFeatureTimeline& timeline,
+    float position);
+[[nodiscard]] std::size_t RemoveWaterFeatureKeysAtPosition(
+    WaterFeatureTimeline* timeline,
+    float position);
 [[nodiscard]] std::optional<float> PreviousWaterSettingKeyPosition(
     const WaterKeyedSettingTrack& track,
     float position);
