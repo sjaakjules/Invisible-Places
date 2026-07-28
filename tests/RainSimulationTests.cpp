@@ -1729,6 +1729,107 @@ TEST_CASE("rain intensity modifies visuals without touching collision data", "[w
     CHECK(invisible_places::water::RainImpactGridWorldSpan(gridSettings) == Catch::Approx(192.0F));
 }
 
+TEST_CASE(
+    "animated rain level zero stops emission while retaining the impact tail",
+    "[water][rain][timing]") {
+    auto settings =
+        invisible_places::water::DefaultRainRuntimeSettings();
+    settings.enabled = false;
+    settings =
+        invisible_places::water::RainSettingsForScenarioLevel(
+            settings,
+            0.0F);
+    CHECK(settings.enabled);
+    CHECK(settings.rainLevel == Catch::Approx(0.0F));
+
+    CHECK(invisible_places::water::RainImpactTailIsActive(
+        12.0F,
+        12.0F));
+    CHECK(invisible_places::water::RainImpactTailIsActive(
+        12.0F,
+        12.0F +
+            invisible_places::water::
+                kRainMaximumImpactLifetimeSeconds));
+    CHECK_FALSE(invisible_places::water::RainImpactTailIsActive(
+        12.0F,
+        12.0F +
+            invisible_places::water::
+                kRainMaximumImpactLifetimeSeconds +
+            0.001F));
+    CHECK_FALSE(invisible_places::water::RainImpactTailIsActive(
+        std::numeric_limits<float>::quiet_NaN(),
+        12.0F));
+    CHECK_FALSE(invisible_places::water::RainImpactTailIsActive(
+        12.0F,
+        11.0F));
+
+    std::vector<WaterSurfaceSample> samples;
+    for (int y = -30; y <= 30; ++y) {
+        for (int x = -30; x <= 30; ++x) {
+            samples.push_back({
+                {x * 0.02F, y * 0.02F, 0.0F},
+                {0.0F, 0.0F, 1.0F},
+                WaterSurfaceRole::Rock,
+            });
+        }
+    }
+    const auto cache =
+        invisible_places::water::BuildWaterSurfaceCacheFromSamples(
+            samples);
+    invisible_places::water::RainSimulationFrame frame;
+    frame.settings =
+        invisible_places::water::RainSettingsForScenarioLevel(
+            invisible_places::water::DefaultRainRuntimeSettings(),
+            1.0F);
+    frame.settings.activeParticleCount = 32U;
+    frame.settings.density = 1.0F;
+    frame.settings.weatherFrontStrength = 0.0F;
+    frame.settings.spawnRadiusMeters = 0.5F;
+    frame.settings.spawnHeightMeters = 0.15F;
+    frame.settings.cameraDeathDistanceMeters = 100.0F;
+    frame.cameraPosition = {0.0F, 0.0F, 1.0F};
+    frame.spawnCentre = {0.0F, 0.0F, 0.0F};
+    frame.deltaSeconds = 1.0F / 30.0F;
+
+    invisible_places::water::RainSimulator simulator{32U};
+    for (int step = 0; step < 60; ++step) {
+        frame.timeSeconds =
+            static_cast<float>(step) * frame.deltaSeconds;
+        (void)simulator.Advance(frame, cache);
+    }
+    REQUIRE(simulator.EventWriteIndex() > 0U);
+    const auto eventWriteIndex = simulator.EventWriteIndex();
+    const auto retainedEventCount = std::count_if(
+        simulator.Events().begin(),
+        simulator.Events().end(),
+        [](const auto& event) {
+            return event.role != WaterSurfaceRole::None;
+        });
+    REQUIRE(retainedEventCount > 0);
+
+    frame.settings =
+        invisible_places::water::RainSettingsForScenarioLevel(
+            frame.settings,
+            0.0F);
+    frame.timeSeconds += frame.deltaSeconds;
+    const auto zeroLevelDiagnostics =
+        simulator.Advance(frame, cache);
+    CHECK(zeroLevelDiagnostics.activeParticles == 0U);
+    CHECK(zeroLevelDiagnostics.emittedEvents == 0U);
+    CHECK(simulator.EventWriteIndex() == eventWriteIndex);
+    CHECK(std::none_of(
+        simulator.Particles().begin(),
+        simulator.Particles().end(),
+        [](const auto& particle) { return particle.active; }));
+    CHECK(
+        std::count_if(
+            simulator.Events().begin(),
+            simulator.Events().end(),
+            [](const auto& event) {
+                return event.role != WaterSurfaceRole::None;
+            }) == retainedEventCount);
+}
+
 TEST_CASE("near-surface rain becomes a slowed widened ellipse", "[water][rain][visual]") {
     const invisible_places::water::RainNearSurfaceSettings settings{};
     const auto airborne = invisible_places::water::EvaluateRainParticleVisualShape(

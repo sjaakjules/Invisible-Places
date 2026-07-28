@@ -2316,6 +2316,9 @@ void VulkanViewportShell::SetSceneCachingEnabled(bool enabled) {
 }
 
 void VulkanViewportShell::UpdateRainRuntimeTiming(const SceneRenderState& state) {
+    const bool timeMovedBack =
+        std::isfinite(rainResources_.previousTimeSeconds) &&
+        state.flowTimeSeconds < rainResources_.previousTimeSeconds;
     if (std::isfinite(rainResources_.previousTimeSeconds) &&
         state.flowTimeSeconds >= rainResources_.previousTimeSeconds) {
         rainResources_.frameDeltaSeconds = std::clamp(
@@ -2327,15 +2330,39 @@ void VulkanViewportShell::UpdateRainRuntimeTiming(const SceneRenderState& state)
     }
     if ((!rainResources_.previousRainEnabled && state.rainSettings.enabled) ||
         state.rainSettings.seed != rainResources_.lastSeed ||
-        state.flowTimeSeconds < rainResources_.previousTimeSeconds) {
+        timeMovedBack) {
         ++rainResources_.resetEpoch;
         if (rainResources_.resetEpoch == 0U) {
             rainResources_.resetEpoch = 1U;
         }
     }
+    if (!state.rainSettings.enabled || timeMovedBack) {
+        rainResources_.lastPotentialImpactTimeSeconds =
+            -std::numeric_limits<float>::infinity();
+    } else if (
+        rainResources_.collisionReady &&
+        state.rainSettings.impactEffectsEnabled &&
+        (state.rainSettings.sandEffectsEnabled ||
+         state.rainSettings.rockEffectsEnabled ||
+         state.rainSettings.vegetationEffectsEnabled) &&
+        state.rainSettings.rainLevel > 1.0e-5F &&
+        std::isfinite(state.flowTimeSeconds)) {
+        // A positive level may emit an impact this frame. At level zero the
+        // timestamp intentionally remains unchanged so existing GPU events
+        // receive their full natural lifetime without permitting new drops.
+        rainResources_.lastPotentialImpactTimeSeconds =
+            state.flowTimeSeconds;
+    }
     rainResources_.lastSeed = state.rainSettings.seed;
     rainResources_.previousTimeSeconds = state.flowTimeSeconds;
     rainResources_.previousRainEnabled = state.rainSettings.enabled;
+}
+
+bool VulkanViewportShell::RainImpactEffectsRequireRedraw(
+    float currentTimeSeconds) const {
+    return invisible_places::water::RainImpactTailIsActive(
+        rainResources_.lastPotentialImpactTimeSeconds,
+        currentTimeSeconds);
 }
 
 void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {

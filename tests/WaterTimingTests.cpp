@@ -595,6 +595,48 @@ TEST_CASE("Feature key navigation finds the nearest key across every setting",
           Approx(0.60F));
 }
 
+TEST_CASE("Key positions move without overwriting another keyed value",
+          "[water][timing][keyed][edit]") {
+    using invisible_places::water::MoveWaterSettingKey;
+    using invisible_places::water::WaterKeyedSettingTrack;
+    using invisible_places::water::WaterScenarioInterpolation;
+
+    WaterKeyedSettingTrack track{
+        .settingId = "level",
+        .keys = {
+            {.position = 0.20F,
+             .value = 0.25F,
+             .interpolation = WaterScenarioInterpolation::Hold},
+            {.position = 0.50F,
+             .value = 0.75F,
+             .interpolation = WaterScenarioInterpolation::Linear},
+            {.position = 0.80F,
+             .value = 1.00F,
+             .interpolation = WaterScenarioInterpolation::Smooth},
+        },
+    };
+
+    REQUIRE(MoveWaterSettingKey(&track, 0.50F, 0.65F));
+    REQUIRE(track.keys.size() == 3U);
+    CHECK(track.keys[1].position == Approx(0.65F));
+    CHECK(track.keys[1].value == Approx(0.75F));
+    CHECK(
+        track.keys[1].interpolation ==
+        WaterScenarioInterpolation::Linear);
+
+    // Source matching uses the same tolerance as marker navigation, while
+    // destinations outside the normalized range or on another key fail
+    // without mutating the track.
+    CHECK(MoveWaterSettingKey(&track, 0.65005F, 0.40F));
+    CHECK_FALSE(MoveWaterSettingKey(&track, 0.40F, 0.80005F));
+    CHECK_FALSE(MoveWaterSettingKey(&track, 0.40F, -0.01F));
+    CHECK_FALSE(MoveWaterSettingKey(&track, 0.40F, 1.01F));
+    CHECK_FALSE(MoveWaterSettingKey(&track, 0.99F, 0.30F));
+    CHECK(track.keys[0].position == Approx(0.20F));
+    CHECK(track.keys[1].position == Approx(0.40F));
+    CHECK(track.keys[2].position == Approx(0.80F));
+}
+
 TEST_CASE("Feature timing overlay samples every keyed setting and drives scenario channels",
           "[water][timing][keyed][overlay]") {
     using Catch::Approx;

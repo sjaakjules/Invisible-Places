@@ -408,6 +408,16 @@ struct AnimationPreparedPathCacheState {
     invisible_places::camera::PreparedAnimationPathEvaluationContext context{};
 };
 
+struct WaterKeyPositionEditState {
+    std::uint32_t runId = 0U;
+    invisible_places::water::WaterKeyedFeatureId feature{};
+    std::string settingId;
+    float sourcePosition = 0.0F;
+    float draftPosition = 0.0F;
+    bool requestKeyboardFocus = false;
+    std::string errorMessage;
+};
+
 struct AnimationPanelState {
     std::optional<AnimationPath> currentPath;
     std::string currentFilePath;
@@ -444,6 +454,7 @@ struct AnimationPanelState {
     bool previewDepthOfField = false;
     bool dirty = false;
     bool showSplines = true;
+    std::optional<WaterKeyPositionEditState> waterKeyPositionEdit;
     // Final exports must render the full-density source bundle the export
     // gate loads; playback-density decimation is an explicit opt-in for
     // fast test renders only.
@@ -23935,8 +23946,10 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
     const auto scenarioState = waterFrame.rawScenarioState.value_or(
         invisible_places::water::WaterScenarioState{});
     if (waterFrame.rawScenarioState.has_value()) {
-        renderState.rainSettings.rainLevel = std::clamp(scenarioState.rainLevel, 0.0F, 1.0F);
-        renderState.rainSettings.enabled = renderState.rainSettings.rainLevel > 1.0e-5F;
+        renderState.rainSettings =
+            invisible_places::water::RainSettingsForScenarioLevel(
+                renderState.rainSettings,
+                scenarioState.rainLevel);
     }
     for (const auto& frozenSource : job.frozenFlowSourceLayers) {
         const auto layerIt = std::find_if(
@@ -44510,8 +44523,9 @@ void DrawTimingsPanel(PreviewRuntimeState* runtimeState) {
 }
 
 // Key markers for one feature's setting tracks under the global bar. One
-// colour per setting; double-clicking a marker jumps the animation position
-// (and therefore the camera and every keyed water setting) to that key.
+// colour per setting. The two-stage double-click gesture prevents an
+// accidental time edit: first jump the global position to the marker, then
+// double-click it again to open the normalized-position editor.
 void DrawWaterKeyMarkerStrip(
     PreviewRuntimeState* runtimeState,
     const invisible_places::water::WaterFeatureTimingRun& run,
@@ -44591,17 +44605,193 @@ void DrawWaterKeyMarkerStrip(
                       AnimationDurationSeconds(
                           runtimeState->animationPanel.currentPath.value()))
                 : 0.0F;
+        const bool positionIsOnKey =
+            std::abs(
+                runtimeState->animationPanel.scrubAmount -
+                nearest.position) <= 1.0e-4F;
         ImGui::SetTooltip(
-            "%s %zu — %s = %.3f at %.2f s (double-click to jump)",
+            positionIsOnKey
+                ? "%s %zu — %s = %.3f at %.2f s (double-click to edit position)"
+                : "%s %zu — %s = %.3f at %.2f s (double-click to jump)",
             run.name.c_str(),
             nearest.keyNumber,
             info != nullptr ? info->label : setting.settingId.c_str(),
             nearest.value,
             nearest.position * durationSeconds);
         if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-            runtimeState->animationPanel.scrubAmount = nearest.position;
-            ApplyAnimationScrub(runtimeState);
+            if (positionIsOnKey) {
+                runtimeState->animationPanel.waterKeyPositionEdit =
+                    WaterKeyPositionEditState{
+                        .runId = run.id,
+                        .feature = timeline.feature,
+                        .settingId = setting.settingId,
+                        .sourcePosition = nearest.position,
+                        .draftPosition = nearest.position,
+                        .requestKeyboardFocus = true,
+                    };
+                ImGui::OpenPopup("Edit Water Key Position");
+            } else {
+                runtimeState->animationPanel.scrubAmount =
+                    nearest.position;
+                ApplyAnimationScrub(runtimeState);
+            }
         }
+    }
+
+    bool closeEditor = false;
+    if (ImGui::BeginPopup("Edit Water Key Position")) {
+        auto& edit =
+            runtimeState->animationPanel.waterKeyPositionEdit;
+        if (!edit.has_value() || edit->runId != run.id ||
+            edit->feature != timeline.feature) {
+            ImGui::CloseCurrentPopup();
+            closeEditor = true;
+        } else {
+            const auto settingIt = std::find_if(
+                timeline.settings.begin(),
+                timeline.settings.end(),
+                [&](const auto& candidate) {
+                    return candidate.settingId == edit->settingId;
+                });
+            const auto* settingInfo =
+                invisible_places::water::FindWaterKeyableSetting(
+                    timeline.feature.kind,
+                    edit->settingId);
+            ImGui::TextUnformatted(
+                settingInfo != nullptr
+                    ? settingInfo->label
+                    : edit->settingId.c_str());
+            ImGui::TextDisabled("Enter a normalized position from 0 to 1.");
+            ImGui::SetNextItemWidth(180.0F);
+            if (edit->requestKeyboardFocus) {
+                ImGui::SetKeyboardFocusHere();
+                edit->requestKeyboardFocus = false;
+            }
+            bool applyRequested = ImGui::InputFloat(
+                "##WaterKeyNormalizedPosition",
+                &edit->draftPosition,
+                0.001F,
+                0.01F,
+                "%.4f",
+                ImGuiInputTextFlags_EnterReturnsTrue);
+            const bool validPosition =
+                std::isfinite(edit->draftPosition) &&
+                edit->draftPosition >= 0.0F &&
+                edit->draftPosition <= 1.0F;
+            constexpr float kKeyTolerance = 1.0e-4F;
+            const bool destinationOccupied =
+                settingIt != timeline.settings.end() &&
+                std::any_of(
+                    settingIt->keys.begin(),
+                    settingIt->keys.end(),
+                    [&](const auto& candidate) {
+                        return std::abs(
+                                   candidate.position -
+                                   edit->sourcePosition) >
+                                   kKeyTolerance &&
+                               std::abs(
+                                   candidate.position -
+                                   edit->draftPosition) <=
+                                   kKeyTolerance;
+                    });
+            if (!validPosition) {
+                ImGui::TextColored(
+                    ImVec4{1.0F, 0.45F, 0.35F, 1.0F},
+                    "Position must be between 0 and 1.");
+            } else if (destinationOccupied) {
+                ImGui::TextColored(
+                    ImVec4{1.0F, 0.45F, 0.35F, 1.0F},
+                    "That setting already has a key at this position.");
+            } else if (!edit->errorMessage.empty()) {
+                ImGui::TextColored(
+                    ImVec4{1.0F, 0.45F, 0.35F, 1.0F},
+                    "%s",
+                    edit->errorMessage.c_str());
+            }
+
+            ImGui::BeginDisabled(
+                !validPosition || destinationOccupied ||
+                settingIt == timeline.settings.end());
+            applyRequested |= ImGui::Button("Apply");
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) {
+                ImGui::CloseCurrentPopup();
+                closeEditor = true;
+            }
+
+            if (applyRequested && validPosition &&
+                !destinationOccupied &&
+                settingIt != timeline.settings.end()) {
+                auto& water = runtimeState->water;
+                const auto scenarioId =
+                    ActiveWaterTimingScenarioId(*runtimeState);
+                auto entryIt = std::find_if(
+                    water.featureTimingRunsByScenario.begin(),
+                    water.featureTimingRunsByScenario.end(),
+                    [&](const auto& candidate) {
+                        return candidate.scenarioId == scenarioId;
+                    });
+                auto* mutableTrack =
+                    static_cast<
+                        invisible_places::water::
+                            WaterKeyedSettingTrack*>(nullptr);
+                if (entryIt !=
+                    water.featureTimingRunsByScenario.end()) {
+                    const auto runIt = std::find_if(
+                        entryIt->runs.begin(),
+                        entryIt->runs.end(),
+                        [&](const auto& candidate) {
+                            return candidate.id == edit->runId;
+                        });
+                    auto* mutableTimeline =
+                        runIt != entryIt->runs.end()
+                            ? invisible_places::water::
+                                  FindWaterFeatureTimeline(
+                                      &*runIt,
+                                      edit->feature)
+                            : nullptr;
+                    if (mutableTimeline != nullptr) {
+                        const auto mutableSettingIt = std::find_if(
+                            mutableTimeline->settings.begin(),
+                            mutableTimeline->settings.end(),
+                            [&](const auto& candidate) {
+                                return candidate.settingId ==
+                                       edit->settingId;
+                            });
+                        if (mutableSettingIt !=
+                            mutableTimeline->settings.end()) {
+                            mutableTrack = &*mutableSettingIt;
+                        }
+                    }
+                }
+                if (invisible_places::water::MoveWaterSettingKey(
+                        mutableTrack,
+                        edit->sourcePosition,
+                        edit->draftPosition)) {
+                    runtimeState->animationPanel.scrubAmount =
+                        edit->draftPosition;
+                    ApplyAnimationScrub(runtimeState);
+                    InvalidateWaterSeepageParams(&water);
+                    runtimeState->previewRenderStateSignatureValid =
+                        false;
+                    runtimeState->statusMessage =
+                        "Moved water key to position " +
+                        FormatFixed(edit->draftPosition, 4) + ".";
+                    runtimeState->errorMessage.clear();
+                    ImGui::CloseCurrentPopup();
+                    closeEditor = true;
+                } else {
+                    edit->errorMessage =
+                        "The key could not be moved; it may have changed.";
+                }
+            }
+        }
+        ImGui::EndPopup();
+    }
+    if (closeEditor ||
+        !ImGui::IsPopupOpen("Edit Water Key Position")) {
+        runtimeState->animationPanel.waterKeyPositionEdit.reset();
     }
 }
 
@@ -45764,7 +45954,8 @@ bool PreviewWaterSeepageRequiresSceneRedraw(
 
 bool PreviewLiveVisualEffectsRequireSceneRedraw(
     const PreviewRuntimeState& runtimeState,
-    const invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    float currentFlowTimeSeconds) {
     if (runtimeState.water.collisionRainSettings.enabled) {
         return true;
     }
@@ -45790,6 +45981,13 @@ bool PreviewLiveVisualEffectsRequireSceneRedraw(
                 &scenario.value());
         }
         if (scenario->rainLevel > 1.0e-5F) {
+            return true;
+        }
+        // Once emission reaches zero, keep advancing only until the last
+        // possible GPU impact has aged out. Otherwise scene caching would
+        // freeze wetness/rings on their final rainy frame.
+        if (viewport.RainImpactEffectsRequireRedraw(
+                currentFlowTimeSeconds)) {
             return true;
         }
     }
@@ -45891,11 +46089,10 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
     const auto& waterFrame = frameState != nullptr ? *frameState : evaluatedWaterFrame;
     const auto& activeWaterScenario = waterFrame.rawScenarioState;
     if (activeWaterScenario.has_value()) {
-        renderState.rainSettings.rainLevel = std::clamp(activeWaterScenario->rainLevel, 0.0F, 1.0F);
-        // A selected scenario owns Rain visibility: zero is truly off, while
-        // keyed positive levels reveal the already-prepared deterministic
-        // fixture even if the standalone Rain panel was previously disabled.
-        renderState.rainSettings.enabled = renderState.rainSettings.rainLevel > 1.0e-5F;
+        renderState.rainSettings =
+            invisible_places::water::RainSettingsForScenarioLevel(
+                renderState.rainSettings,
+                activeWaterScenario->rainLevel);
     }
     renderState.rainVisual = runtimeState.water.rainVisual;
     renderState.rainSpawnCentre = runtimeState.camera.OrbitCenter();
@@ -51554,8 +51751,10 @@ std::optional<WaterIntegrationCapturedFrame> RenderWaterIntegrationOfflineCompar
 
     auto rainSettings = runtimeState->water.collisionRainSettings;
     if (frameState.rawScenarioState.has_value()) {
-        rainSettings.rainLevel = frameState.rawScenarioState->rainLevel;
-        rainSettings.enabled = rainSettings.rainLevel > 1.0e-5F;
+        rainSettings =
+            invisible_places::water::RainSettingsForScenarioLevel(
+                rainSettings,
+                frameState.rawScenarioState->rainLevel);
     }
     invisible_places::output::OfflineRainSimulationState rainState;
     constexpr float kDeltaSeconds = 1.0F / 30.0F;
@@ -54102,7 +54301,10 @@ int Application::Run(ApplicationRunOptions options) const {
             viewport->SetLiveSceneRenderingEnabled(!pauseLiveViewport);
             if (!pauseLiveViewport) {
                 const bool previewLiveEffectsAffectScene =
-                    PreviewLiveVisualEffectsRequireSceneRedraw(runtimeState, viewport.value());
+                    PreviewLiveVisualEffectsRequireSceneRedraw(
+                        runtimeState,
+                        viewport.value(),
+                        liveWaterTimeSeconds);
                 const float previewFlowTimeSeconds =
                     previewLiveEffectsAffectScene ? liveWaterTimeSeconds : 0.0F;
                 const auto renderState = BuildRenderState(

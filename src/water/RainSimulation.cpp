@@ -1550,6 +1550,27 @@ RainRuntimeSettings DefaultRainRuntimeSettings() {
     return {};
 }
 
+RainRuntimeSettings RainSettingsForScenarioLevel(
+    RainRuntimeSettings settings,
+    float rainLevel) {
+    settings.rainLevel =
+        std::clamp(std::isfinite(rainLevel) ? rainLevel : 0.0F, 0.0F, 1.0F);
+    settings.enabled = true;
+    return settings;
+}
+
+bool RainImpactTailIsActive(
+    float lastPotentialImpactTimeSeconds,
+    float currentTimeSeconds) {
+    if (!std::isfinite(lastPotentialImpactTimeSeconds) ||
+        !std::isfinite(currentTimeSeconds) ||
+        currentTimeSeconds < lastPotentialImpactTimeSeconds) {
+        return false;
+    }
+    return currentTimeSeconds - lastPotentialImpactTimeSeconds <=
+           kRainMaximumImpactLifetimeSeconds;
+}
+
 RainImpactHeightBand SanitizeRainImpactHeightBand(RainImpactHeightBand band) {
     if (!std::isfinite(band.minZ)) {
         band.minZ = -kRainImpactBandUnbounded;

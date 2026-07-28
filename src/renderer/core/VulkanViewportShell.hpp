@@ -455,6 +455,8 @@ class VulkanViewportShell {
     void DrawFrame();
     void WaitIdle() const;
     void UpdateRenderState(const SceneRenderState& state);
+    [[nodiscard]] bool RainImpactEffectsRequireRedraw(
+        float currentTimeSeconds) const;
     void UploadPointCloud(
         std::size_t layerId,
         const invisible_places::io::LoadedPointCloud& cloud,
@@ -1039,6 +1041,8 @@ class VulkanViewportShell {
         std::uint32_t preprocessDispatchCount = 0U;
         std::uint32_t lastSeed = 0U;
         float previousTimeSeconds = -std::numeric_limits<float>::infinity();
+        float lastPotentialImpactTimeSeconds =
+            -std::numeric_limits<float>::infinity();
         float frameDeltaSeconds = 1.0F / 30.0F;
         bool previousRainEnabled = false;
         bool collisionReady = false;

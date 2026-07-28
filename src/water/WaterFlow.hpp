@@ -500,6 +500,13 @@ void AddOrUpdateWaterSettingKey(
     float value,
     WaterScenarioInterpolation interpolation =
         WaterScenarioInterpolation::Smooth);
+// Moves one key without overwriting another key in the same setting track.
+// Source matching and destination occupancy use the same 1e-4 tolerance as
+// insertion and navigation.
+[[nodiscard]] bool MoveWaterSettingKey(
+    WaterKeyedSettingTrack* track,
+    float sourcePosition,
+    float destinationPosition);
 [[nodiscard]] std::optional<float> PreviousWaterSettingKeyPosition(
     const WaterKeyedSettingTrack& track,
     float position);

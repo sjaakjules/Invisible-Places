@@ -18,6 +18,10 @@ inline constexpr std::uint32_t kRainImpactGridDimension = 256U;
 inline constexpr std::uint32_t kRainSandEventsPerCell = 8U;
 inline constexpr std::uint32_t kRainRockEventsPerCell = 16U;
 inline constexpr std::uint32_t kRainVegetationEventsPerCell = 4U;
+// The longest generated impact is Wetness (3.8 s plus up to 2.2 s from
+// impact speed). Keeping this shared prevents the live viewport from
+// freezing a fading event when animated rain reaches zero.
+inline constexpr float kRainMaximumImpactLifetimeSeconds = 6.0F;
 
 enum class RainIntensityPreset : std::uint32_t {
     LightMist = 0U,
@@ -170,6 +174,15 @@ struct RainIntensityMultipliers {
 };
 
 [[nodiscard]] RainRuntimeSettings DefaultRainRuntimeSettings();
+// A scenario's level controls emission, not the lifetime of impacts that
+// were already written. The scenario owns the runtime while selected, so a
+// zero level keeps the effect path alive with a zero particle target.
+[[nodiscard]] RainRuntimeSettings RainSettingsForScenarioLevel(
+    RainRuntimeSettings settings,
+    float rainLevel);
+[[nodiscard]] bool RainImpactTailIsActive(
+    float lastPotentialImpactTimeSeconds,
+    float currentTimeSeconds);
 
 // Bitmask of the enabled impact effects (kRainImpactEffect*Bit). Zero when
 // the master rain or impact-effects toggles are off. Deliberately independent

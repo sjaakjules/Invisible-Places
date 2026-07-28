@@ -7053,6 +7053,47 @@ void AddOrUpdateWaterSettingKey(
         });
 }
 
+bool MoveWaterSettingKey(
+    WaterKeyedSettingTrack* track,
+    float sourcePosition,
+    float destinationPosition) {
+    constexpr float kKeyTolerance = 1.0e-4F;
+    if (track == nullptr || !std::isfinite(sourcePosition) ||
+        !std::isfinite(destinationPosition) ||
+        destinationPosition < 0.0F || destinationPosition > 1.0F) {
+        return false;
+    }
+    const auto source = std::find_if(
+        track->keys.begin(),
+        track->keys.end(),
+        [&](const WaterSettingKey& candidate) {
+            return std::abs(candidate.position - sourcePosition) <=
+                   kKeyTolerance;
+        });
+    if (source == track->keys.end()) {
+        return false;
+    }
+    const bool destinationOccupied = std::any_of(
+        track->keys.begin(),
+        track->keys.end(),
+        [&](const WaterSettingKey& candidate) {
+            return &candidate != &*source &&
+                   std::abs(candidate.position - destinationPosition) <=
+                       kKeyTolerance;
+        });
+    if (destinationOccupied) {
+        return false;
+    }
+    source->position = destinationPosition;
+    std::stable_sort(
+        track->keys.begin(),
+        track->keys.end(),
+        [](const WaterSettingKey& left, const WaterSettingKey& right) {
+            return left.position < right.position;
+        });
+    return true;
+}
+
 std::optional<float> PreviousWaterSettingKeyPosition(
     const WaterKeyedSettingTrack& track,
     float position) {
