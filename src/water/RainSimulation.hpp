@@ -215,7 +215,17 @@ struct RainImpactEvent {
     io::Float3 normal{0.0F, 0.0F, 1.0F};
     float radiusMeters = 0.04F;
     WaterSurfaceRole role = WaterSurfaceRole::None;
+    // The struck role's own model lifetime (rock -> Wetness, sand -> Rings,
+    // vegetation -> Droplets).
     float lifetimeSeconds = 1.0F;
+    // Dual-lifetime lane: for GROUND strikes (ROCK and SAND) the OTHER
+    // ground model's lifetime — a ROCK strike carries the Rings lifetime it
+    // would have had and a SAND strike carries the Wetness lifetime — so
+    // each consuming model times the event with its own lane while the
+    // energy stays shared. Zero (the default, and every VEG strike) means
+    // the event never participates in the other model. GPU mirror:
+    // RainImpactEvent.lifetimeEnergy.z in shaders/rain_simulation.comp.
+    float secondaryLifetimeSeconds = 0.0F;
     float energy = 1.0F;
     std::uint32_t seed = 0U;
 };
@@ -323,6 +333,12 @@ struct RainImpactEffect {
     float timeSeconds,
     float sandWaterMask = 1.0F);
 
+// GROUND strike events (ROCK and SAND) are binned into BOTH the rock and
+// sand per-cell lists so Rings render near rock surfaces and Wetness near
+// sand; each list keeps an event only while ITS consuming model's lifetime
+// is unexpired (the struck role's lifetimeSeconds for its own list,
+// secondaryLifetimeSeconds for the other list). VEG events stay veg-only.
+// GPU mirror: BinEvent in shaders/rain_simulation.comp.
 [[nodiscard]] RainImpactGrid BuildRainImpactGrid(
     std::span<const RainImpactEvent> events,
     const io::Float3& cameraPosition,
@@ -334,7 +350,10 @@ struct RainImpactEffect {
 // shaders/pointcloud_rain_impact.glsl. Every enabled model (effectMask bits:
 // 1 Rings, 2 Wetness, 4 Droplets) is evaluated for the point regardless of
 // which cloud the point belongs to; each model is gated only by its own
-// world-Z height band (sanitized internally, defaults unbounded). Within a
+// world-Z height band (sanitized internally, defaults unbounded). Rings and
+// Wetness both consume GROUND strike events regardless of the struck role,
+// each timing the event with its own lifetime lane (see RainImpactEvent);
+// Droplets consumes VEG events only. Within a
 // model, Rings and Droplets max-combine their events and Wetness uses the
 // peak-preserving soft union; across models the three contributions compose
 // additively so overlapping bands show every effect at once: opacity and

@@ -2893,6 +2893,321 @@ TEST_CASE("rain impact lifetimes produce a short sand ring and slow rock fade", 
 }
 
 TEST_CASE(
+    "simulator ground impacts carry both model lifetimes",
+    "[water][rain][simulation][cross]") {
+    // Split terrain: rock on the -X half, sand on the +X half, so one run
+    // emits both ground strike roles.
+    std::vector<WaterSurfaceSample> samples;
+    for (int y = -30; y <= 30; ++y) {
+        for (int x = -30; x <= 30; ++x) {
+            samples.push_back({
+                {x * 0.02F, y * 0.02F, 0.0F},
+                {0.0F, 0.0F, 1.0F},
+                x < 0 ? WaterSurfaceRole::Rock : WaterSurfaceRole::Sand,
+            });
+        }
+    }
+    const auto cache =
+        invisible_places::water::BuildWaterSurfaceCacheFromSamples(samples);
+    invisible_places::water::RainSimulationFrame frame;
+    frame.settings.enabled = true;
+    frame.settings.activeParticleCount = 64U;
+    frame.settings.density = 1.0F;
+    frame.settings.weatherFrontStrength = 0.0F;
+    frame.settings.spawnRadiusMeters = 0.5F;
+    frame.settings.spawnHeightMeters = 0.3F;
+    frame.settings.cameraDeathDistanceMeters = 100.0F;
+    frame.settings.seed = 77U;
+    frame.cameraPosition = {0.0F, 0.0F, 1.0F};
+    frame.spawnCentre = {0.0F, 0.0F, 0.0F};
+    frame.deltaSeconds = 1.0F / 30.0F;
+
+    invisible_places::water::RainSimulator simulator{64U};
+    for (int step = 0; step < 24; ++step) {
+        frame.timeSeconds = step * frame.deltaSeconds;
+        (void)simulator.Advance(frame, cache);
+    }
+
+    // Every ground strike must store its own model lifetime in the primary
+    // lane and the OTHER ground model's lifetime in the secondary lane, both
+    // derived from the same impact speed.
+    std::uint32_t rockStrikes = 0U;
+    std::uint32_t sandStrikes = 0U;
+    for (const auto& event : simulator.Events()) {
+        if (event.role == WaterSurfaceRole::Rock) {
+            ++rockStrikes;
+            CHECK(event.lifetimeSeconds >= 3.8F);
+            CHECK(event.lifetimeSeconds <= 6.0F);
+            CHECK(event.secondaryLifetimeSeconds >= 0.48F);
+            CHECK(event.secondaryLifetimeSeconds <= 0.83F);
+            if (event.lifetimeSeconds < 5.99F &&
+                event.secondaryLifetimeSeconds < 0.8299F) {
+                const float speedFromRock =
+                    (event.lifetimeSeconds - 3.8F) / 0.12F;
+                const float speedFromSand =
+                    (event.secondaryLifetimeSeconds - 0.48F) / 0.018F;
+                CHECK(speedFromRock ==
+                      Catch::Approx(speedFromSand).margin(0.05F));
+            }
+        } else if (event.role == WaterSurfaceRole::Sand) {
+            ++sandStrikes;
+            CHECK(event.lifetimeSeconds >= 0.48F);
+            CHECK(event.lifetimeSeconds <= 0.83F);
+            CHECK(event.secondaryLifetimeSeconds >= 3.8F);
+            CHECK(event.secondaryLifetimeSeconds <= 6.0F);
+            if (event.lifetimeSeconds < 0.8299F &&
+                event.secondaryLifetimeSeconds < 5.99F) {
+                const float speedFromSand =
+                    (event.lifetimeSeconds - 0.48F) / 0.018F;
+                const float speedFromRock =
+                    (event.secondaryLifetimeSeconds - 3.8F) / 0.12F;
+                CHECK(speedFromSand ==
+                      Catch::Approx(speedFromRock).margin(0.05F));
+            }
+        }
+    }
+    CHECK(rockStrikes > 0U);
+    CHECK(sandStrikes > 0U);
+
+    // Ground strikes feed both ground models, so they spawn while EITHER
+    // Rings or Wetness is enabled and stop only when both are off.
+    frame.settings.rockEffectsEnabled = false;
+    frame.settings.sandEffectsEnabled = true;
+    invisible_places::water::RainSimulator ringsOnly{64U};
+    std::uint32_t ringsOnlyEvents = 0U;
+    for (int step = 0; step < 24; ++step) {
+        frame.timeSeconds = step * frame.deltaSeconds;
+        ringsOnlyEvents += ringsOnly.Advance(frame, cache).emittedEvents;
+    }
+    CHECK(ringsOnlyEvents > 0U);
+
+    frame.settings.sandEffectsEnabled = false;
+    invisible_places::water::RainSimulator groundOff{64U};
+    std::uint32_t groundOffEvents = 0U;
+    for (int step = 0; step < 24; ++step) {
+        frame.timeSeconds = step * frame.deltaSeconds;
+        groundOffEvents += groundOff.Advance(frame, cache).emittedEvents;
+    }
+    CHECK(groundOffEvents == 0U);
+}
+
+TEST_CASE(
+    "ground strikes cross-extend rings and wetness with per-model lifetimes",
+    "[water][rain][effects][cross]") {
+    using invisible_places::water::kRainImpactBandUnbounded;
+    using invisible_places::water::kRainImpactEffectDropletsBit;
+    using invisible_places::water::kRainImpactEffectRingsBit;
+    using invisible_places::water::kRainImpactEffectWetnessBit;
+    using invisible_places::water::RainImpactHeightBand;
+
+    // Events exactly as the simulator now emits them: the struck role's
+    // model lifetime in the primary lane and the OTHER ground model's
+    // lifetime in the secondary lane. The rock strike sits high (the rock
+    // cloud) and the sand strike low, mirroring a scene whose rock/sand
+    // terrain intersection sits between them; the vegetation strike hovers
+    // above both.
+    const std::vector<invisible_places::water::RainImpactEvent> events{
+        {.position = {0.0F, 0.0F, 2.0F},
+         .birthTimeSeconds = 0.0F,
+         .normal = {0.0F, 0.0F, 1.0F},
+         .radiusMeters = 0.12F,
+         .role = WaterSurfaceRole::Rock,
+         .lifetimeSeconds = 4.76F,
+         .secondaryLifetimeSeconds = 0.624F,
+         .energy = 1.0F,
+         .seed = 21U},
+        {.position = {0.8F, 0.0F, 1.0F},
+         .birthTimeSeconds = 0.0F,
+         .normal = {0.0F, 0.0F, 1.0F},
+         .radiusMeters = 0.10F,
+         .role = WaterSurfaceRole::Sand,
+         .lifetimeSeconds = 0.624F,
+         .secondaryLifetimeSeconds = 4.76F,
+         .energy = 1.0F,
+         .seed = 33U},
+        {.position = {-0.8F, 0.0F, 3.0F},
+         .birthTimeSeconds = 0.0F,
+         .normal = {0.0F, 0.0F, 1.0F},
+         .radiusMeters = 0.065F,
+         .role = WaterSurfaceRole::Vegetation,
+         .lifetimeSeconds = 2.0F,
+         .energy = 1.0F,
+         .seed = 0x5A17U},
+    };
+    // Bands crossing the terrain intersection: the rings band reaches up to
+    // the rock heights and the wetness band reaches down to the sand
+    // heights.
+    const RainImpactHeightBand ringsBand{
+        -kRainImpactBandUnbounded, 2.6F, 0.30F};
+    const RainImpactHeightBand wetnessBand{0.5F, 2.4F, 0.30F};
+    const RainImpactHeightBand dropletsBand{
+        2.5F, kRainImpactBandUnbounded, 0.30F};
+    const Float3 normal{0.0F, 0.0F, 1.0F};
+    const auto cellAt = [](const auto& grid, float x, float y) -> const auto& {
+        const auto cellX = static_cast<std::uint32_t>(
+            std::floor((x - grid.origin.x) / grid.cellSizeMeters));
+        const auto cellY = static_cast<std::uint32_t>(
+            std::floor((y - grid.origin.y) / grid.cellSizeMeters));
+        return grid.cells[
+            static_cast<std::size_t>(cellY) * grid.dimension + cellX];
+    };
+
+    // Both ground strikes occupy BOTH ground lists while both model
+    // lifetimes are alive; the vegetation strike stays veg-only.
+    const auto earlyGrid =
+        invisible_places::water::BuildRainImpactGrid(events, {}, 0.30F, 4.0F);
+    const auto& earlyRockCell = cellAt(earlyGrid, 0.0F, 0.0F);
+    const auto& earlySandCell = cellAt(earlyGrid, 0.8F, 0.0F);
+    const auto& earlyVegetationCell = cellAt(earlyGrid, -0.8F, 0.0F);
+    CHECK(earlyRockCell.rockCount == 1U);
+    CHECK(earlyRockCell.sandCount == 1U);
+    CHECK(earlySandCell.rockCount == 1U);
+    CHECK(earlySandCell.sandCount == 1U);
+    CHECK(earlyVegetationCell.vegetationCount == 1U);
+    CHECK(earlyVegetationCell.rockCount == 0U);
+    CHECK(earlyVegetationCell.sandCount == 0U);
+
+    // (a) A point near the ROCK strike inside the rings band shows RINGS
+    // timed by the ring lifetime: the expanding ring peaks where the ring
+    // radius derived from the 0.624 s lifetime sits at age 0.30.
+    const Float3 rockRingProbe{0.0652F, 0.0F, 2.0F};
+    const auto rockRings = invisible_places::water::EvaluateRainImpact(
+        earlyGrid,
+        kRainImpactEffectRingsBit,
+        rockRingProbe,
+        normal,
+        0.30F,
+        1.0F,
+        ringsBand,
+        wetnessBand,
+        dropletsBand);
+    CHECK(rockRings.opacity > 0.05F);
+
+    // (d) The same probe with the rings band moved above it zeroes the
+    // model again.
+    const RainImpactHeightBand ringsBandAbove{
+        2.6F, kRainImpactBandUnbounded, 0.30F};
+    const auto rockRingsExcluded = invisible_places::water::EvaluateRainImpact(
+        earlyGrid,
+        kRainImpactEffectRingsBit,
+        rockRingProbe,
+        normal,
+        0.30F,
+        1.0F,
+        ringsBandAbove,
+        wetnessBand,
+        dropletsBand);
+    CHECK(rockRingsExcluded.opacity == Catch::Approx(0.0F));
+
+    // The ring lifetime expires well before one second: past 0.624 s the
+    // ROCK strike stops contributing RINGS while its WETNESS (own timing)
+    // stays alive at the same point.
+    const auto midGrid =
+        invisible_places::water::BuildRainImpactGrid(events, {}, 0.70F, 4.0F);
+    const Float3 rockNearProbe{0.02F, 0.0F, 2.0F};
+    const auto expiredRings = invisible_places::water::EvaluateRainImpact(
+        midGrid,
+        kRainImpactEffectRingsBit,
+        rockNearProbe,
+        normal,
+        0.70F,
+        1.0F,
+        ringsBand,
+        wetnessBand,
+        dropletsBand);
+    const auto persistingWetness = invisible_places::water::EvaluateRainImpact(
+        midGrid,
+        kRainImpactEffectWetnessBit,
+        rockNearProbe,
+        normal,
+        0.70F,
+        1.0F,
+        ringsBand,
+        wetnessBand,
+        dropletsBand);
+    CHECK(expiredRings.opacity == Catch::Approx(0.0F));
+    CHECK(persistingWetness.opacity > 0.0F);
+
+    // (b) A point near the SAND strike inside the wetness band keeps a
+    // WETNESS response past one second (the sand ring itself died at
+    // 0.624 s), and the expired ring lifetime frees the sand slot while the
+    // wetness lane keeps the rock slot occupied.
+    const auto lateGrid =
+        invisible_places::water::BuildRainImpactGrid(events, {}, 1.2F, 4.0F);
+    const auto& lateRockCell = cellAt(lateGrid, 0.0F, 0.0F);
+    const auto& lateSandCell = cellAt(lateGrid, 0.8F, 0.0F);
+    CHECK(lateRockCell.sandCount == 0U);
+    CHECK(lateRockCell.rockCount == 1U);
+    CHECK(lateSandCell.sandCount == 0U);
+    CHECK(lateSandCell.rockCount == 1U);
+    const Float3 sandWetProbe{0.82F, 0.0F, 1.0F};
+    const auto sandWetness = invisible_places::water::EvaluateRainImpact(
+        lateGrid,
+        kRainImpactEffectWetnessBit,
+        sandWetProbe,
+        normal,
+        1.2F,
+        1.0F,
+        ringsBand,
+        wetnessBand,
+        dropletsBand);
+    const auto sandRings = invisible_places::water::EvaluateRainImpact(
+        lateGrid,
+        kRainImpactEffectRingsBit,
+        sandWetProbe,
+        normal,
+        1.2F,
+        1.0F,
+        ringsBand,
+        wetnessBand,
+        dropletsBand);
+    CHECK(sandWetness.opacity > 0.0F);
+    CHECK(sandRings.opacity == Catch::Approx(0.0F));
+
+    // (c) The vegetation strike contributes neither RINGS nor WETNESS even
+    // with unbounded bands, while its DROPLETS remain visible nearby.
+    const auto vegetationGrid =
+        invisible_places::water::BuildRainImpactGrid(events, {}, 0.10F, 4.0F);
+    float dropletsMaximum = 0.0F;
+    float vegetationRingsMaximum = 0.0F;
+    float vegetationWetnessMaximum = 0.0F;
+    for (int y = -20; y <= 20; ++y) {
+        for (int x = -20; x <= 20; ++x) {
+            const Float3 probe{
+                -0.8F + static_cast<float>(x) * 0.004F,
+                static_cast<float>(y) * 0.004F,
+                2.95F};
+            const auto droplets = invisible_places::water::EvaluateRainImpact(
+                vegetationGrid,
+                kRainImpactEffectDropletsBit,
+                probe,
+                normal,
+                0.10F);
+            const auto rings = invisible_places::water::EvaluateRainImpact(
+                vegetationGrid,
+                kRainImpactEffectRingsBit,
+                probe,
+                normal,
+                0.10F);
+            const auto wetness = invisible_places::water::EvaluateRainImpact(
+                vegetationGrid,
+                kRainImpactEffectWetnessBit,
+                probe,
+                normal,
+                0.10F);
+            dropletsMaximum = std::max(dropletsMaximum, droplets.emission);
+            vegetationRingsMaximum =
+                std::max(vegetationRingsMaximum, rings.opacity);
+            vegetationWetnessMaximum =
+                std::max(vegetationWetnessMaximum, wetness.opacity);
+        }
+    }
+    CHECK(dropletsMaximum > 0.0F);
+    CHECK(vegetationRingsMaximum == Catch::Approx(0.0F));
+    CHECK(vegetationWetnessMaximum == Catch::Approx(0.0F));
+}
+
+TEST_CASE(
     "overlapping impact effects compose additively instead of the strongest winning",
     "[water][rain][effects][composite]") {
     using invisible_places::water::kRainImpactEffectAllBits;

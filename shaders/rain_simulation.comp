@@ -12,6 +12,15 @@ struct RainParticle {
 struct RainImpactEvent {
     vec4 positionBirth;
     vec4 normalRadius;
+    // x: the struck role's own model lifetime (rock->Wetness, sand->Rings,
+    //    veg->Droplets). y: shared impact energy. z: dual-lifetime lane —
+    //    for ground strikes (ROCK and SAND) the OTHER ground model's
+    //    lifetime, so a ROCK strike carries the Rings lifetime it would have
+    //    had and a SAND strike carries the Wetness lifetime; each consuming
+    //    model times the event with its own lane. Zero (VEG strikes and
+    //    legacy events) means "never participates in the other model".
+    //    w: unused. CPU mirror: RainImpactEvent in
+    //    src/water/RainSimulation.hpp (secondaryLifetimeSeconds).
     vec4 lifetimeEnergy;
     uvec4 control;
 };
@@ -315,14 +324,17 @@ void SpawnParticle(uint index, inout RainParticle particle) {
     particle.state.w = rain.simulation1.z;
 }
 
-bool RoleEffectEnabled(uint role) {
-    return (role == kRoleSand && rain.effectToggles.x != 0u) ||
-           (role == kRoleRock && rain.effectToggles.y != 0u) ||
-           (role == kRoleVegetation && rain.effectToggles.z != 0u);
+// Ground strikes (ROCK and SAND) feed BOTH the Rings (sand list) and
+// Wetness (rock list) shading models, so they spawn while either consuming
+// effect is enabled. VEG strikes still feed Droplets only.
+bool ImpactSpawnEnabled(uint role) {
+    return role == kRoleVegetation
+        ? rain.effectToggles.z != 0u
+        : (rain.effectToggles.x != 0u || rain.effectToggles.y != 0u);
 }
 
 void EmitImpact(vec3 position, vec3 normal, uint role, RainParticle particle) {
-    if (rain.simulation1.y == 0u || !RoleEffectEnabled(role)) {
+    if (rain.simulation1.y == 0u || !ImpactSpawnEnabled(role)) {
         return;
     }
     const float impactSpeed = max(0.1, length(particle.velocity.xyz));
@@ -345,11 +357,23 @@ void EmitImpact(vec3 position, vec3 normal, uint role, RainParticle particle) {
         const float steepness = clamp(1.0 - abs(unitNormal.z), 0.0, 1.0);
         radius *= 1.0 + steepness * clamp(rain.effectScales.w, 0.0, 1.0);
     }
+    const float sandModelLifetime = 0.48 + min(0.35, impactSpeed * 0.018);
+    const float rockModelLifetime = 3.8 + min(2.2, impactSpeed * 0.12);
     float lifetime = role == kRoleSand
-        ? 0.48 + min(0.35, impactSpeed * 0.018)
+        ? sandModelLifetime
         : (role == kRoleRock
-            ? 3.8 + min(2.2, impactSpeed * 0.12)
+            ? rockModelLifetime
             : 1.1 + min(0.7, impactSpeed * 0.045));
+    // Dual-lifetime lane: a ground strike also carries the OTHER ground
+    // model's lifetime so Rings can time ROCK strikes and Wetness can time
+    // SAND strikes (CPU mirror: RainSimulator::EmitImpact in
+    // src/water/RainSimulation.cpp — keep both identical).
+    float secondaryLifetime = 0.0;
+    if (role == kRoleRock) {
+        secondaryLifetime = sandModelLifetime;
+    } else if (role == kRoleSand) {
+        secondaryLifetime = rockModelLifetime;
+    }
     const float energy = clamp(
         (dropWidth / 0.003) * (impactSpeed / 8.0) * rain.visual2.w * roleScale,
         0.05,
@@ -357,7 +381,7 @@ void EmitImpact(vec3 position, vec3 normal, uint role, RainParticle particle) {
     const uint writeIndex = atomicAdd(counters.eventWriteIndex, 1u) % rain.simulation0.z;
     events[writeIndex].positionBirth = vec4(position, rain.cameraTime.w);
     events[writeIndex].normalRadius = vec4(normalize(normal), radius);
-    events[writeIndex].lifetimeEnergy = vec4(lifetime, energy, 0.0, 0.0);
+    events[writeIndex].lifetimeEnergy = vec4(lifetime, energy, secondaryLifetime, 0.0);
     events[writeIndex].control = uvec4(role, particle.state.z, rain.simulation1.z, 0u);
     atomicAdd(counters.emittedThisFrame, 1u);
     if (role == kRoleSand) {
@@ -483,14 +507,153 @@ void AdvanceParticle(uint index) {
     particles[index] = particle;
 }
 
+void InsertRockReservoir(uint cellIndex, int x, int y, uint eventIndex, vec2 eventPosition, float age, float energy) {
+    const float cellSize = max(0.01, rain.impactGrid.z);
+    const vec2 cellMinimum =
+        rain.impactGrid.xy +
+        vec2(float(x), float(y)) * cellSize;
+    const vec2 cellMaximum = cellMinimum + vec2(cellSize);
+    const vec2 outsideDistance = max(
+        max(
+            cellMinimum - eventPosition,
+            eventPosition - cellMaximum),
+        vec2(0.0));
+    // Use common physical scales for the lexicographic ROCK
+    // reservoir. Per-event radius/lifetime normalization can
+    // otherwise rank a farther large or older long-lived impact
+    // ahead of the physically nearer/younger event. 0.5 m covers
+    // the corner of the steepness-boosted square broad phase
+    // (CPU mirror: kRockReservoirDistanceRangeMeters).
+    const float normalizedDistance = clamp(
+        length(outsideDistance) / 0.50,
+        0.0,
+        1.0);
+    const float agePriority = clamp(
+        age / 6.0,
+        0.0,
+        1.0);
+    const float inverseEnergy =
+        1.0 - clamp(energy / 2.5, 0.0, 1.0);
+    const uint distanceKey =
+        uint(floor(normalizedDistance * 1023.0 + 0.5));
+    const uint ageKey =
+        uint(floor(agePriority * 7.0 + 0.5));
+    const uint energyKey =
+        uint(floor(inverseEnergy * 7.0 + 0.5));
+    const uint priority = min(
+        (distanceKey << 6u) |
+        (ageKey << 3u) |
+        energyKey,
+        65534u);
+    uint carried =
+        (priority << 16u) | (eventIndex & 0xffffu);
+    const uint referenceBase =
+        cellIndex * kReferencesPerCell + kSandCapacity;
+
+    // Atomic insertion cascade keeps the globally smallest 16
+    // packed keys without hashing events onto colliding lanes.
+    // max(carried, displaced) forwards whichever key did not win
+    // the current slot, so the final set is scheduling-invariant.
+    for (uint lane = 0u; lane < kRockCapacity; ++lane) {
+        const uint displaced = atomicMin(
+            impactReferences[referenceBase + lane],
+            carried);
+        if (displaced > carried) {
+            atomicOr(
+                impactCounts[cellIndex].y,
+                1u << lane);
+        }
+        carried = max(carried, displaced);
+        if (carried == 0xffffffffu) {
+            break;
+        }
+    }
+    if (carried != 0xffffffffu) {
+        // All 16 slots were genuinely occupied and exactly one
+        // candidate (possibly displaced) has been discarded.
+        atomicAdd(counters.overflowCount, 1u);
+    }
+}
+
+// SAND and VEG lists retain every event until their capacity is genuinely
+// full. Claim the lowest free lane atomically rather than deriving it from
+// eventIndex: sparse global event indices such as SAND 0/8 or VEG 0/4 must
+// not collide while free lanes remain.
+void ClaimImpactFreeSlot(uint cellIndex, bool sandList, uint eventIndex) {
+    const uint capacity = sandList ? kSandCapacity : kVegetationCapacity;
+    const uint offset = sandList ? 0u : kSandCapacity + kRockCapacity;
+    const uint capacityMask = (1u << capacity) - 1u;
+    uint lane = capacity;
+    uint observedMask = sandList
+        ? impactCounts[cellIndex].x
+        : impactCounts[cellIndex].z;
+    while (lane == capacity) {
+        const uint availableMask =
+            (~observedMask) & capacityMask;
+        if (availableMask == 0u) {
+            atomicAdd(counters.overflowCount, 1u);
+            break;
+        }
+        const uint candidateLane =
+            uint(findLSB(availableMask));
+        const uint desiredMask =
+            observedMask | (1u << candidateLane);
+        const uint priorMask = sandList
+            ? atomicCompSwap(
+                  impactCounts[cellIndex].x,
+                  observedMask,
+                  desiredMask)
+            : atomicCompSwap(
+                  impactCounts[cellIndex].z,
+                  observedMask,
+                  desiredMask);
+        if (priorMask == observedMask) {
+            lane = candidateLane;
+        } else {
+            observedMask = priorMask;
+        }
+    }
+    if (lane < capacity) {
+        impactReferences[
+            cellIndex * kReferencesPerCell + offset + lane] =
+            eventIndex;
+    }
+}
+
 void BinEvent(uint eventIndex) {
     if (rain.simulation1.y == 0u || eventIndex >= rain.simulation0.z) {
         return;
     }
     const RainImpactEvent event = events[eventIndex];
     const float age = rain.cameraTime.w - event.positionBirth.w;
-    if (event.control.x == 0u || event.control.z != rain.simulation1.z || age < 0.0 ||
-        age > event.lifetimeEnergy.x || !RoleEffectEnabled(event.control.x)) {
+    if (event.control.x == 0u || event.control.z != rain.simulation1.z || age < 0.0) {
+        return;
+    }
+    // Ground strikes (ROCK and SAND) feed BOTH ground lists so Rings can
+    // render near rock surfaces and Wetness near sand. Each list keeps the
+    // event only while ITS consuming model's lifetime is unexpired (the
+    // struck role's model in lifetimeEnergy.x, the other ground model's in
+    // the .z lane), so short ring lifetimes never pin sand slots on
+    // long-dead rock events. VEG stays veg-only: rings/wetness must not
+    // appear on hovering canopy positions. The stored radius already bounds
+    // both consuming footprints, so one broad phase serves both lists.
+    const bool groundStrike =
+        event.control.x == kRoleRock || event.control.x == kRoleSand;
+    const float rockListLifetime = event.control.x == kRoleRock
+        ? event.lifetimeEnergy.x
+        : event.lifetimeEnergy.z;
+    const float sandListLifetime = event.control.x == kRoleSand
+        ? event.lifetimeEnergy.x
+        : event.lifetimeEnergy.z;
+    // A zero list lifetime means "never participates in that model" (CPU
+    // mirror: BuildRainImpactGrid).
+    const bool binRock = groundStrike && rain.effectToggles.y != 0u &&
+        rockListLifetime > 0.0 && age <= rockListLifetime;
+    const bool binSand = groundStrike && rain.effectToggles.x != 0u &&
+        sandListLifetime > 0.0 && age <= sandListLifetime;
+    const bool binVegetation = event.control.x == kRoleVegetation &&
+        rain.effectToggles.z != 0u && age <= event.lifetimeEnergy.x;
+    if (!binRock && !binSand && !binVegetation) {
         return;
     }
     const float cellSize = max(0.01, rain.impactGrid.z);
@@ -502,124 +665,21 @@ void BinEvent(uint eventIndex) {
     for (int y = max(0, minimumCell.y); y <= min(dimension - 1, maximumCell.y); ++y) {
         for (int x = max(0, minimumCell.x); x <= min(dimension - 1, maximumCell.x); ++x) {
             const uint cellIndex = uint(y * dimension + x);
-            if (event.control.x == kRoleRock) {
-                const vec2 cellMinimum =
-                    rain.impactGrid.xy +
-                    vec2(float(x), float(y)) * cellSize;
-                const vec2 cellMaximum = cellMinimum + vec2(cellSize);
-                const vec2 outsideDistance = max(
-                    max(
-                        cellMinimum - event.positionBirth.xy,
-                        event.positionBirth.xy - cellMaximum),
-                    vec2(0.0));
-                // Use common physical scales for the lexicographic ROCK
-                // reservoir. Per-event radius/lifetime normalization can
-                // otherwise rank a farther large or older long-lived impact
-                // ahead of the physically nearer/younger event. 0.5 m covers
-                // the corner of the steepness-boosted square broad phase
-                // (CPU mirror: kRockReservoirDistanceRangeMeters).
-                const float normalizedDistance = clamp(
-                    length(outsideDistance) / 0.50,
-                    0.0,
-                    1.0);
-                const float agePriority = clamp(
-                    age / 6.0,
-                    0.0,
-                    1.0);
-                const float inverseEnergy =
-                    1.0 - clamp(event.lifetimeEnergy.y / 2.5, 0.0, 1.0);
-                const uint distanceKey =
-                    uint(floor(normalizedDistance * 1023.0 + 0.5));
-                const uint ageKey =
-                    uint(floor(agePriority * 7.0 + 0.5));
-                const uint energyKey =
-                    uint(floor(inverseEnergy * 7.0 + 0.5));
-                const uint priority = min(
-                    (distanceKey << 6u) |
-                    (ageKey << 3u) |
-                    energyKey,
-                    65534u);
-                uint carried =
-                    (priority << 16u) | (eventIndex & 0xffffu);
-                const uint referenceBase =
-                    cellIndex * kReferencesPerCell + kSandCapacity;
-
-                // Atomic insertion cascade keeps the globally smallest 16
-                // packed keys without hashing events onto colliding lanes.
-                // max(carried, displaced) forwards whichever key did not win
-                // the current slot, so the final set is scheduling-invariant.
-                for (uint lane = 0u; lane < kRockCapacity; ++lane) {
-                    const uint displaced = atomicMin(
-                        impactReferences[referenceBase + lane],
-                        carried);
-                    if (displaced > carried) {
-                        atomicOr(
-                            impactCounts[cellIndex].y,
-                            1u << lane);
-                    }
-                    carried = max(carried, displaced);
-                    if (carried == 0xffffffffu) {
-                        break;
-                    }
-                }
-                if (carried != 0xffffffffu) {
-                    // All 16 slots were genuinely occupied and exactly one
-                    // candidate (possibly displaced) has been discarded.
-                    atomicAdd(counters.overflowCount, 1u);
-                }
-                continue;
+            if (binRock) {
+                InsertRockReservoir(
+                    cellIndex,
+                    x,
+                    y,
+                    eventIndex,
+                    event.positionBirth.xy,
+                    age,
+                    event.lifetimeEnergy.y);
             }
-
-            // SAND and VEG retain every event until their role capacity is
-            // genuinely full. Claim the lowest free lane atomically rather
-            // than deriving it from eventIndex: sparse global event indices
-            // such as SAND 0/8 or VEG 0/4 must not collide while free lanes
-            // remain.
-            const uint capacity =
-                event.control.x == kRoleSand
-                    ? kSandCapacity
-                    : kVegetationCapacity;
-            const uint offset =
-                event.control.x == kRoleSand
-                    ? 0u
-                    : kSandCapacity + kRockCapacity;
-            const uint capacityMask = (1u << capacity) - 1u;
-            uint lane = capacity;
-            uint observedMask =
-                event.control.x == kRoleSand
-                    ? impactCounts[cellIndex].x
-                    : impactCounts[cellIndex].z;
-            while (lane == capacity) {
-                const uint availableMask =
-                    (~observedMask) & capacityMask;
-                if (availableMask == 0u) {
-                    atomicAdd(counters.overflowCount, 1u);
-                    break;
-                }
-                const uint candidateLane =
-                    uint(findLSB(availableMask));
-                const uint desiredMask =
-                    observedMask | (1u << candidateLane);
-                const uint priorMask =
-                    event.control.x == kRoleSand
-                        ? atomicCompSwap(
-                              impactCounts[cellIndex].x,
-                              observedMask,
-                              desiredMask)
-                        : atomicCompSwap(
-                              impactCounts[cellIndex].z,
-                              observedMask,
-                              desiredMask);
-                if (priorMask == observedMask) {
-                    lane = candidateLane;
-                } else {
-                    observedMask = priorMask;
-                }
+            if (binSand) {
+                ClaimImpactFreeSlot(cellIndex, true, eventIndex);
             }
-            if (lane < capacity) {
-                impactReferences[
-                    cellIndex * kReferencesPerCell + offset + lane] =
-                    eventIndex;
+            if (binVegetation) {
+                ClaimImpactFreeSlot(cellIndex, false, eventIndex);
             }
         }
     }

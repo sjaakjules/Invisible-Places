@@ -230,9 +230,11 @@ float RainImpactBandWeight(vec3 band, float pointZ) {
 
 // The three impact effects are decoupled from the cloud roles: every point
 // layer evaluates every enabled model, each gated only by its own world-Z
-// height band. Events still spawn from rain striking the collision surfaces
-// (Rings from SAND impacts, Wetness from ROCK impacts, Droplets from VEG
-// impacts), but they shade all clouds' points within range and band.
+// height band. Events spawn from rain striking the collision surfaces, and
+// GROUND strikes (ROCK and SAND) feed BOTH the Rings and Wetness models —
+// each model timing the event with its own lifetime lane — while VEG
+// strikes feed Droplets only. Every event shades all clouds' points within
+// range and band.
 // rainImpactControl.x is an effect bitmask: 1 Rings, 2 Wetness, 4 Droplets.
 //
 // Each model first accumulates its own scalar value (Rings and Droplets take
@@ -341,11 +343,27 @@ RainImpactComposite ResolveRainImpactComposite(vec3 point, vec3 pointNormal) {
                 continue;
             }
             const RainImpactEventGpu event = rainImpactEvents[eventIndex];
-            if (event.control.x != role) {
+            // The two ground lists reference BOTH ground strike roles (the
+            // simulator bins ROCK and SAND strikes into each). A model
+            // always times an event with ITS OWN lifetime: the struck
+            // role's model lifetime sits in lifetimeEnergy.x and the other
+            // ground model's in the .z lane, so Rings uses the ring timing
+            // of a ROCK strike and Wetness the wet timing of a SAND strike.
+            // Energy (lifetimeEnergy.y) stays shared. VEG stays veg-only.
+            float modelLifetime = event.lifetimeEnergy.x;
+            if (role == kRainRoleSand || role == kRainRoleRock) {
+                if (event.control.x != kRainRoleSand &&
+                    event.control.x != kRainRoleRock) {
+                    continue;
+                }
+                if (event.control.x != role) {
+                    modelLifetime = event.lifetimeEnergy.z;
+                }
+            } else if (event.control.x != role) {
                 continue;
             }
             const float age = time - event.positionBirth.w;
-            const float lifetime = max(0.001, event.lifetimeEnergy.x);
+            const float lifetime = max(0.001, modelLifetime);
             if (age < 0.0 || age > lifetime) {
                 continue;
             }
@@ -354,7 +372,7 @@ RainImpactComposite ResolveRainImpactComposite(vec3 point, vec3 pointNormal) {
                 value = EvaluateSandRainImpactValue(
                     event.positionBirth.xyz,
                     event.normalRadius.w,
-                    event.lifetimeEnergy.x,
+                    modelLifetime,
                     point,
                     age,
                     sandWaterMask);
@@ -363,7 +381,7 @@ RainImpactComposite ResolveRainImpactComposite(vec3 point, vec3 pointNormal) {
                     event.positionBirth.xyz,
                     event.normalRadius.xyz,
                     event.normalRadius.w,
-                    event.lifetimeEnergy.x,
+                    modelLifetime,
                     event.control.y,
                     rockParams0,
                     rockParams1,

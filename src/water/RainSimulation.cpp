@@ -3086,20 +3086,30 @@ void RainSimulator::EmitImpact(
     const auto multipliers = RainIntensityValues(frame.settings.intensityPreset);
     const float dropWidth = frame.visual.widthMeters * frame.settings.dropletSizeScale * multipliers.width;
     const float impactSpeed = std::max(0.1F, Length(particle.velocity));
+    const float sandModelLifetime = 0.48F + std::min(0.35F, impactSpeed * 0.018F);
+    const float rockModelLifetime = 3.8F + std::min(2.2F, impactSpeed * 0.12F);
+    // GROUND strikes (ROCK and SAND) feed both the Rings and Wetness models,
+    // so they spawn while either effect is enabled and carry the OTHER
+    // ground model's lifetime in the secondary lane (GPU mirror: EmitImpact
+    // in shaders/rain_simulation.comp — keep both identical).
+    const bool groundEffectsEnabled =
+        frame.settings.sandEffectsEnabled || frame.settings.rockEffectsEnabled;
     float roleScale = 1.0F;
     float radius = 0.04F;
     float lifetime = 1.0F;
+    float secondaryLifetime = 0.0F;
     bool enabled = true;
     switch (hit.role) {
         case WaterSurfaceRole::Sand:
-            enabled = frame.settings.sandEffectsEnabled;
+            enabled = groundEffectsEnabled;
             roleScale = frame.settings.sandEffectScale;
             radius = std::clamp(0.020F + dropWidth * 6.0F + impactSpeed * 0.0015F, 0.025F, 0.11F);
-            lifetime = 0.48F + std::min(0.35F, impactSpeed * 0.018F);
+            lifetime = sandModelLifetime;
+            secondaryLifetime = rockModelLifetime;
             ++diagnostics->sandEvents;
             break;
         case WaterSurfaceRole::Rock: {
-            enabled = frame.settings.rockEffectsEnabled;
+            enabled = groundEffectsEnabled;
             roleScale = frame.settings.rockEffectScale;
             radius = std::clamp(0.028F + dropWidth * 10.0F + impactSpeed * 0.0020F, 0.035F, 0.16F);
             // Steep rock sheds water further: boost the event radius by
@@ -3113,7 +3123,8 @@ void RainSimulator::EmitImpact(
                 frame.settings.rockImpact.downhillStretch,
                 0.0F,
                 1.0F);
-            lifetime = 3.8F + std::min(2.2F, impactSpeed * 0.12F);
+            lifetime = rockModelLifetime;
+            secondaryLifetime = sandModelLifetime;
             ++diagnostics->rockEvents;
             break;
         }
@@ -3142,6 +3153,7 @@ void RainSimulator::EmitImpact(
         .radiusMeters = radius,
         .role = hit.role,
         .lifetimeSeconds = lifetime,
+        .secondaryLifetimeSeconds = secondaryLifetime,
         .energy = energy,
         .seed = particle.randomState,
     };
@@ -3410,7 +3422,38 @@ RainImpactGrid BuildRainImpactGrid(
 
     for (std::uint32_t eventIndex = 0; eventIndex < grid.events.size(); ++eventIndex) {
         const auto& event = grid.events[eventIndex];
-        if (!EventActive(event, timeSeconds)) {
+        const float age = timeSeconds - event.birthTimeSeconds;
+        if (event.role == WaterSurfaceRole::None || age < 0.0F) {
+            continue;
+        }
+        // GROUND strikes (ROCK and SAND) feed BOTH ground lists so Rings can
+        // render near rock surfaces and Wetness near sand. Each list keeps
+        // the event only while ITS consuming model's lifetime is unexpired
+        // (the struck role's lifetimeSeconds for its own list,
+        // secondaryLifetimeSeconds for the other list), so short ring
+        // lifetimes never pin sand slots on long-dead rock events. VEG stays
+        // veg-only: rings/wetness must not appear on hovering canopy
+        // positions. The stored radius already bounds both consuming
+        // footprints, so one broad phase serves both lists (GPU mirror:
+        // BinEvent in shaders/rain_simulation.comp).
+        const bool groundStrike = event.role == WaterSurfaceRole::Rock ||
+                                  event.role == WaterSurfaceRole::Sand;
+        const float rockListLifetime = event.role == WaterSurfaceRole::Rock
+            ? event.lifetimeSeconds
+            : event.secondaryLifetimeSeconds;
+        const float sandListLifetime = event.role == WaterSurfaceRole::Sand
+            ? event.lifetimeSeconds
+            : event.secondaryLifetimeSeconds;
+        // A zero list lifetime (legacy hand-built events, VEG lane default)
+        // means "never participates in that model".
+        const bool insertRockList = groundStrike &&
+            rockListLifetime > 0.0F && age <= rockListLifetime;
+        const bool insertSandList = groundStrike &&
+            sandListLifetime > 0.0F && age <= sandListLifetime;
+        const bool insertVegetationList =
+            event.role == WaterSurfaceRole::Vegetation &&
+            age <= event.lifetimeSeconds;
+        if (!insertRockList && !insertSandList && !insertVegetationList) {
             continue;
         }
         const auto minX = static_cast<std::int32_t>(std::floor(
@@ -3424,35 +3467,27 @@ RainImpactGrid BuildRainImpactGrid(
         for (std::int32_t y = std::max(0, minY); y <= std::min(static_cast<std::int32_t>(grid.dimension) - 1, maxY); ++y) {
             for (std::int32_t x = std::max(0, minX); x <= std::min(static_cast<std::int32_t>(grid.dimension) - 1, maxX); ++x) {
                 auto& cell = grid.cells[static_cast<std::size_t>(y) * grid.dimension + static_cast<std::size_t>(x)];
-                bool inserted = false;
-                switch (event.role) {
-                    case WaterSurfaceRole::Sand:
-                        inserted = insertFreeSlot(
-                            cell.sand,
-                            &cell.sandCount,
-                            &cell.sandMask,
-                            eventIndex);
-                        break;
-                    case WaterSurfaceRole::Rock:
-                        insertRock(
-                            &cell,
-                            eventIndex,
-                            x,
-                            y);
-                        inserted = true;
-                        break;
-                    case WaterSurfaceRole::Vegetation:
-                        inserted = insertFreeSlot(
-                            cell.vegetation,
-                            &cell.vegetationCount,
-                            &cell.vegetationMask,
-                            eventIndex);
-                        break;
-                    case WaterSurfaceRole::Ground:
-                    case WaterSurfaceRole::None:
-                        break;
+                if (insertRockList) {
+                    insertRock(
+                        &cell,
+                        eventIndex,
+                        x,
+                        y);
                 }
-                (void)inserted;
+                if (insertSandList) {
+                    (void)insertFreeSlot(
+                        cell.sand,
+                        &cell.sandCount,
+                        &cell.sandMask,
+                        eventIndex);
+                }
+                if (insertVegetationList) {
+                    (void)insertFreeSlot(
+                        cell.vegetation,
+                        &cell.vegetationCount,
+                        &cell.vegetationMask,
+                        eventIndex);
+                }
             }
         }
     }
@@ -3690,6 +3725,22 @@ RainImpactEffect EvaluateRainImpact(
     }
     const auto& cell = grid.cells[static_cast<std::size_t>(cellY) * grid.dimension + static_cast<std::size_t>(cellX)];
 
+    // The two ground lists reference BOTH ground strike roles (the grid bins
+    // ROCK and SAND strikes into each). A model always times an event with
+    // ITS OWN lifetime — the struck role's lifetimeSeconds for its own model,
+    // secondaryLifetimeSeconds for the other model — so the event is
+    // presented to the pure evaluator as that model's view. Energy stays
+    // shared. Mirrors ResolveRainImpactComposite in
+    // shaders/pointcloud_rain_impact.glsl.
+    const auto modelView = [](const RainImpactEvent& event,
+                              WaterSurfaceRole modelRole) {
+        auto view = event;
+        if (event.role != modelRole) {
+            view.role = modelRole;
+            view.lifetimeSeconds = event.secondaryLifetimeSeconds;
+        }
+        return view;
+    };
     float ringsValue = 0.0F;
     if (ringsWeight > 0.0F && cell.sandMask != 0U) {
         for (std::uint32_t index = 0; index < cell.sand.size(); ++index) {
@@ -3697,12 +3748,16 @@ RainImpactEffect EvaluateRainImpact(
                 continue;
             }
             const auto& event = grid.events[cell.sand[index]];
-            if (event.role != WaterSurfaceRole::Sand ||
-                !EventActive(event, timeSeconds)) {
+            if ((event.role != WaterSurfaceRole::Sand &&
+                 event.role != WaterSurfaceRole::Rock)) {
+                continue;
+            }
+            const auto ringsEvent = modelView(event, WaterSurfaceRole::Sand);
+            if (!EventActive(ringsEvent, timeSeconds)) {
                 continue;
             }
             const float value =
-                EvaluateSandRainImpactValue(event, point, timeSeconds, sandWaterMask) *
+                EvaluateSandRainImpactValue(ringsEvent, point, timeSeconds, sandWaterMask) *
                 event.energy * ringsWeight;
             ringsValue = std::max(ringsValue, value);
         }
@@ -3715,12 +3770,16 @@ RainImpactEffect EvaluateRainImpact(
                 continue;
             }
             const auto& event = grid.events[cell.rock[index]];
-            if (event.role != WaterSurfaceRole::Rock ||
-                !EventActive(event, timeSeconds)) {
+            if ((event.role != WaterSurfaceRole::Rock &&
+                 event.role != WaterSurfaceRole::Sand)) {
+                continue;
+            }
+            const auto wetnessEvent = modelView(event, WaterSurfaceRole::Rock);
+            if (!EventActive(wetnessEvent, timeSeconds)) {
                 continue;
             }
             const float value =
-                EvaluateRockRainImpactValue(event, point, normal, timeSeconds, grid.rockImpact) *
+                EvaluateRockRainImpactValue(wetnessEvent, point, normal, timeSeconds, grid.rockImpact) *
                 event.energy * wetnessWeight;
             // Peak-preserving soft union: one impact remains bit-for-bit
             // equivalent to its narrow-phase value, while every additional
