@@ -3690,6 +3690,7 @@ RainImpactEffect EvaluateRainImpact(
     }
     const auto& cell = grid.cells[static_cast<std::size_t>(cellY) * grid.dimension + static_cast<std::size_t>(cellX)];
 
+    float ringsValue = 0.0F;
     if (ringsWeight > 0.0F && cell.sandMask != 0U) {
         for (std::uint32_t index = 0; index < cell.sand.size(); ++index) {
             if ((cell.sandMask & (1U << index)) == 0U) {
@@ -3703,15 +3704,12 @@ RainImpactEffect EvaluateRainImpact(
             const float value =
                 EvaluateSandRainImpactValue(event, point, timeSeconds, sandWaterMask) *
                 event.energy * ringsWeight;
-            effect.opacity = std::max(effect.opacity, value * 0.18F);
-            effect.emission = std::max(effect.emission, value * 0.11F);
-            effect.sizeScale = std::max(effect.sizeScale, 1.0F + value * 0.16F);
-            effect.colourBlend = std::max(effect.colourBlend, value * 0.20F);
+            ringsValue = std::max(ringsValue, value);
         }
     }
+    float rockPeak = 0.0F;
+    float rockRemaining = 1.0F;
     if (wetnessWeight > 0.0F && cell.rockMask != 0U) {
-        float rockPeak = 0.0F;
-        float rockRemaining = 1.0F;
         for (std::uint32_t index = 0; index < cell.rock.size(); ++index) {
             if ((cell.rockMask & (1U << index)) == 0U) {
                 continue;
@@ -3730,14 +3728,9 @@ RainImpactEffect EvaluateRainImpact(
             rockPeak = std::max(rockPeak, value);
             rockRemaining *= 1.0F - std::clamp(value, 0.0F, 1.0F);
         }
-        const float wetnessValue = std::max(rockPeak, 1.0F - rockRemaining);
-        if (wetnessValue > 0.0F) {
-            effect.opacity = std::max(effect.opacity, wetnessValue * 0.18F);
-            effect.emission = std::max(effect.emission, wetnessValue * 0.11F);
-            effect.sizeScale = std::max(effect.sizeScale, 1.0F + wetnessValue * 0.16F);
-            effect.colourBlend = std::max(effect.colourBlend, wetnessValue * 0.42F);
-        }
     }
+    const float wetnessValue = std::max(rockPeak, 1.0F - rockRemaining);
+    float dropletsValue = 0.0F;
     if (dropletsWeight > 0.0F && cell.vegetationMask != 0U) {
         for (std::uint32_t index = 0; index < cell.vegetation.size(); ++index) {
             if ((cell.vegetationMask & (1U << index)) == 0U) {
@@ -3752,12 +3745,26 @@ RainImpactEffect EvaluateRainImpact(
             const float value =
                 EvaluateVegetationSprinkle(event, point, normal, age, grid.vegetationImpact) *
                 event.energy * dropletsWeight;
-            effect.opacity = std::max(effect.opacity, value * 0.14F);
-            effect.emission = std::max(effect.emission, value * 0.48F);
-            effect.sizeScale = std::max(effect.sizeScale, 1.0F + value * 0.12F);
-            effect.dropletBlend = std::max(effect.dropletBlend, value * 0.18F);
+            dropletsValue = std::max(dropletsValue, value);
         }
     }
+    // Cross-effect composition, identical to ResolveRainImpactComposite in
+    // shaders/pointcloud_rain_impact.glsl: the three models coexist. Adds
+    // sum, size multipliers multiply, and both tint weights sum per target
+    // colour (consumers clamp the tint application at 0.72), so a point
+    // inside overlapping bands shows Rings AND Wetness AND Droplets. A model
+    // whose value is zero contributes exactly nothing, keeping every
+    // single-effect response identical to its standalone evaluation.
+    effect.opacity =
+        ringsValue * 0.18F + wetnessValue * 0.18F + dropletsValue * 0.14F;
+    effect.emission =
+        ringsValue * 0.11F + wetnessValue * 0.11F + dropletsValue * 0.48F;
+    effect.sizeScale =
+        (1.0F + ringsValue * 0.16F) *
+        (1.0F + wetnessValue * 0.16F) *
+        (1.0F + dropletsValue * 0.12F);
+    effect.colourBlend = ringsValue * 0.20F + wetnessValue * 0.42F;
+    effect.dropletBlend = dropletsValue * 0.18F;
     return effect;
 }
 

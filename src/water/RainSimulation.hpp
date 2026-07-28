@@ -334,8 +334,12 @@ struct RainImpactEffect {
 // shaders/pointcloud_rain_impact.glsl. Every enabled model (effectMask bits:
 // 1 Rings, 2 Wetness, 4 Droplets) is evaluated for the point regardless of
 // which cloud the point belongs to; each model is gated only by its own
-// world-Z height band (sanitized internally, defaults unbounded). Rings and
-// Droplets max-combine, Wetness uses the peak-preserving soft union, and the
+// world-Z height band (sanitized internally, defaults unbounded). Within a
+// model, Rings and Droplets max-combine their events and Wetness uses the
+// peak-preserving soft union; across models the three contributions compose
+// additively so overlapping bands show every effect at once: opacity and
+// emission adds sum, size multipliers multiply, and the two tint weights sum
+// per target colour (consumers clamp the tint application at 0.72). The
 // response coefficients match the shader constants exactly. sandWaterMask is
 // one on the flooded/downhill side of the shoreline and one when the layer
 // has no shoreline region.

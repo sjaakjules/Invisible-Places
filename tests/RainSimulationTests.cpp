@@ -2892,6 +2892,135 @@ TEST_CASE("rain impact lifetimes produce a short sand ring and slow rock fade", 
     CHECK(rockEarly.colourBlend > rockLate.colourBlend);
 }
 
+TEST_CASE(
+    "overlapping impact effects compose additively instead of the strongest winning",
+    "[water][rain][effects][composite]") {
+    using invisible_places::water::kRainImpactEffectAllBits;
+    using invisible_places::water::kRainImpactEffectDropletsBit;
+    using invisible_places::water::kRainImpactEffectRingsBit;
+    using invisible_places::water::kRainImpactEffectWetnessBit;
+
+    // Rock hit long before the probe time so its wet patch has fully spread;
+    // the vegetation hit 0.45 s before keeps crown sprinkles alive near the
+    // event XY, and the sand hit 0.10 s before keeps its young ring inside
+    // that same neighbourhood. All three overlap around the impact centre.
+    const std::vector<invisible_places::water::RainImpactEvent> events{
+        {.position = {0.0F, 0.0F, 0.45F},
+         .birthTimeSeconds = 0.0F,
+         .normal = {0.0F, 0.0F, 1.0F},
+         .radiusMeters = 0.12F,
+         .role = WaterSurfaceRole::Rock,
+         .lifetimeSeconds = 5.0F,
+         .energy = 1.0F,
+         .seed = 21U},
+        {.position = {0.0F, 0.0F, 0.45F},
+         .birthTimeSeconds = 1.85F,
+         .normal = {0.0F, 0.0F, 1.0F},
+         .radiusMeters = 0.10F,
+         .role = WaterSurfaceRole::Sand,
+         .lifetimeSeconds = 1.0F,
+         .energy = 1.0F,
+         .seed = 33U},
+        {.position = {0.0F, 0.0F, 0.55F},
+         .birthTimeSeconds = 1.5F,
+         .normal = {0.0F, 0.0F, 1.0F},
+         .radiusMeters = 0.065F,
+         .role = WaterSurfaceRole::Vegetation,
+         .lifetimeSeconds = 2.0F,
+         .energy = 1.0F,
+         .seed = 0x5A17U},
+    };
+    constexpr float time = 1.95F;
+    const auto grid =
+        invisible_places::water::BuildRainImpactGrid(events, {}, time, 4.0F);
+    const Float3 normal{0.0F, 0.0F, 1.0F};
+    const auto evaluate = [&](std::uint32_t mask, const Float3& point) {
+        return invisible_places::water::EvaluateRainImpact(
+            grid, mask, point, normal, time);
+    };
+
+    // Find a point where all three models respond at once. The vegetation
+    // sprinkle is deliberately sparse, so scan the overlap neighbourhood.
+    bool found = false;
+    Float3 probe{};
+    invisible_places::water::RainImpactEffect rings;
+    invisible_places::water::RainImpactEffect wetness;
+    invisible_places::water::RainImpactEffect droplets;
+    for (int y = -24; y <= 24 && !found; ++y) {
+        for (int x = -24; x <= 24 && !found; ++x) {
+            const Float3 point{
+                static_cast<float>(x) * 0.0025F,
+                static_cast<float>(y) * 0.0025F,
+                0.45F};
+            const auto ringsOnly = evaluate(kRainImpactEffectRingsBit, point);
+            const auto wetnessOnly = evaluate(kRainImpactEffectWetnessBit, point);
+            const auto dropletsOnly = evaluate(kRainImpactEffectDropletsBit, point);
+            if (ringsOnly.colourBlend > 0.005F &&
+                wetnessOnly.colourBlend > 0.005F &&
+                dropletsOnly.emission > 0.005F) {
+                found = true;
+                probe = point;
+                rings = ringsOnly;
+                wetness = wetnessOnly;
+                droplets = dropletsOnly;
+            }
+        }
+    }
+    REQUIRE(found);
+
+    const auto combined = evaluate(kRainImpactEffectAllBits, probe);
+    // Adds sum, size multipliers multiply, tint weights sum per target
+    // colour. Every single-effect response therefore stays visible in the
+    // overlap instead of the locally strongest erasing the others.
+    CHECK(combined.opacity ==
+          Catch::Approx(rings.opacity + wetness.opacity + droplets.opacity)
+              .margin(1.0e-6F));
+    CHECK(combined.emission ==
+          Catch::Approx(rings.emission + wetness.emission + droplets.emission)
+              .margin(1.0e-6F));
+    CHECK(combined.sizeScale ==
+          Catch::Approx(rings.sizeScale * wetness.sizeScale * droplets.sizeScale)
+              .margin(1.0e-6F));
+    CHECK(combined.colourBlend ==
+          Catch::Approx(rings.colourBlend + wetness.colourBlend)
+              .margin(1.0e-6F));
+    CHECK(combined.dropletBlend ==
+          Catch::Approx(droplets.dropletBlend).margin(1.0e-6F));
+    CHECK(combined.opacity > rings.opacity);
+    CHECK(combined.opacity > wetness.opacity);
+    CHECK(combined.opacity > droplets.opacity);
+    CHECK(combined.colourBlend > rings.colourBlend);
+    CHECK(combined.colourBlend > wetness.colourBlend);
+    CHECK(combined.sizeScale > rings.sizeScale);
+    CHECK(combined.sizeScale > wetness.sizeScale);
+    CHECK(combined.dropletBlend > 0.0F);
+
+    // A model excluded by its own height band contributes exactly nothing
+    // while the remaining models keep their composed response.
+    const invisible_places::water::RainImpactHeightBand aboveProbe{
+        2.0F,
+        invisible_places::water::kRainImpactBandUnbounded,
+        0.30F};
+    const auto withoutRings = invisible_places::water::EvaluateRainImpact(
+        grid,
+        kRainImpactEffectAllBits,
+        probe,
+        normal,
+        time,
+        1.0F,
+        aboveProbe);
+    CHECK(withoutRings.opacity ==
+          Catch::Approx(wetness.opacity + droplets.opacity).margin(1.0e-6F));
+    CHECK(withoutRings.emission ==
+          Catch::Approx(wetness.emission + droplets.emission).margin(1.0e-6F));
+    CHECK(withoutRings.sizeScale ==
+          Catch::Approx(wetness.sizeScale * droplets.sizeScale).margin(1.0e-6F));
+    CHECK(withoutRings.colourBlend ==
+          Catch::Approx(wetness.colourBlend).margin(1.0e-6F));
+    CHECK(withoutRings.dropletBlend ==
+          Catch::Approx(droplets.dropletBlend).margin(1.0e-6F));
+}
+
 TEST_CASE("Scene1 builds and reloads the exact two millimetre water surface cache", "[.rain-data]") {
     const auto sceneDirectory = std::filesystem::path{INVISIBLE_PLACES_DEFAULT_DATA_DIR} / "Scene1";
     const std::vector<invisible_places::water::WaterSurfaceSource> sources{

@@ -234,6 +234,14 @@ float RainImpactBandWeight(vec3 band, float pointZ) {
 // (Rings from SAND impacts, Wetness from ROCK impacts, Droplets from VEG
 // impacts), but they shade all clouds' points within range and band.
 // rainImpactControl.x is an effect bitmask: 1 Rings, 2 Wetness, 4 Droplets.
+//
+// Each model first accumulates its own scalar value (Rings and Droplets take
+// the maximum over their events, Wetness uses the peak-preserving soft
+// union), then the three models compose additively so overlapping bands show
+// every effect at once instead of the locally strongest erasing the others:
+// opacity/emission adds sum, point-size multipliers multiply, and the two
+// tint weights sum per target colour (their application clamps at 0.72).
+// CPU mirror: EvaluateRainImpact in src/water/RainSimulation.cpp.
 RainImpactComposite ResolveRainImpactComposite(vec3 point, vec3 pointNormal) {
     RainImpactComposite composite = RainImpactComposite(0.0, 0.0, 1.0, 0.0, 0.0);
     const uint effectMask = styleData.rainImpactControl.x;
@@ -289,6 +297,8 @@ RainImpactComposite ResolveRainImpactComposite(vec3 point, vec3 pointNormal) {
             boundaryZ - point.z);
     }
 
+    float ringsValue = 0.0;
+    float dropletsValue = 0.0;
     float rockPeak = 0.0;
     float rockRemaining = 1.0;
     for (uint modelIndex = 0u; modelIndex < 3u; ++modelIndex) {
@@ -371,33 +381,29 @@ RainImpactComposite ResolveRainImpactComposite(vec3 point, vec3 pointNormal) {
                 // cannot cut a darker boundary through an existing wet region.
                 rockPeak = max(rockPeak, value);
                 rockRemaining *= 1.0 - clamp(value, 0.0, 1.0);
-                continue;
-            }
-            const bool droplets = role == kRainRoleVegetation;
-            composite.opacityAdd = max(
-                composite.opacityAdd,
-                value * (droplets ? 0.14 : 0.18));
-            composite.emissionAdd = max(
-                composite.emissionAdd,
-                value * (droplets ? 0.48 : 0.11));
-            composite.pointSizeMultiply = max(
-                composite.pointSizeMultiply,
-                1.0 + value * (droplets ? 0.12 : 0.16));
-            if (droplets) {
-                composite.dropletMix = max(composite.dropletMix, value * 0.18);
+            } else if (role == kRainRoleVegetation) {
+                dropletsValue = max(dropletsValue, value);
             } else {
-                composite.colourMix = max(composite.colourMix, value * 0.20);
+                ringsValue = max(ringsValue, value);
             }
         }
     }
     const float wetnessValue = max(rockPeak, 1.0 - rockRemaining);
-    if (wetnessValue > 0.0) {
-        composite.opacityAdd = max(composite.opacityAdd, wetnessValue * 0.18);
-        composite.emissionAdd = max(composite.emissionAdd, wetnessValue * 0.11);
-        composite.pointSizeMultiply =
-            max(composite.pointSizeMultiply, 1.0 + wetnessValue * 0.16);
-        composite.colourMix = max(composite.colourMix, wetnessValue * 0.42);
-    }
+    // Cross-effect composition: the three models coexist. Adds sum, size
+    // multipliers multiply, and both tint weights sum per target colour, so a
+    // point inside overlapping bands shows Rings AND Wetness AND Droplets.
+    // A model whose value is zero contributes exactly nothing, keeping every
+    // single-effect response identical to its standalone evaluation.
+    composite.opacityAdd =
+        ringsValue * 0.18 + wetnessValue * 0.18 + dropletsValue * 0.14;
+    composite.emissionAdd =
+        ringsValue * 0.11 + wetnessValue * 0.11 + dropletsValue * 0.48;
+    composite.pointSizeMultiply =
+        (1.0 + ringsValue * 0.16) *
+        (1.0 + wetnessValue * 0.16) *
+        (1.0 + dropletsValue * 0.12);
+    composite.colourMix = ringsValue * 0.20 + wetnessValue * 0.42;
+    composite.dropletMix = dropletsValue * 0.18;
     return composite;
 }
 
