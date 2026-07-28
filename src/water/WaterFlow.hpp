@@ -1099,6 +1099,10 @@ struct WaterDynamicMeshFlowSettings {
     float sourceBandWidthMeters = 0.75F;
     float sourceBandFraction = 0.04F;
     float dryConcavityFocus = 0.90F;
+    // 0 keeps dry spawns concentrated at the most likely (convergent) rim
+    // cells; 1 accepts candidates along the entire sampled-Ground +X rim
+    // regardless of moisture, so trails arrive along the whole rock edge.
+    float edgeCoverage = 0.0F;
     float rainSpawnSpread = 0.75F;
     float rainDistributedSourceFraction = 0.55F;
     std::uint32_t previewParticleLimit = 560;
@@ -1157,9 +1161,11 @@ struct WaterDynamicMeshFlowVisualWeights {
     float trailStreakScale = 1.0F;
 };
 
-// Cache-owned automatic source at the vegetation-supported highest-+X edge
-// of a connected Ground component. The 16-byte layout is also the std430 GPU
-// entry ABI; live Mesh Flow parameters only select from this immutable table.
+// Cache-owned automatic source on the vegetation-supported Ground surface,
+// ordered by geodesic distance from the component's +X rim (hash-shuffled
+// within 0.10 m bands so the GPU's index bias spreads spawns along the whole
+// curved edge). The 16-byte layout is also the std430 GPU entry ABI; live
+// Mesh Flow parameters only select from this immutable table.
 struct alignas(16) WaterDynamicMeshFlowGroundEntry {
     std::int32_t cellX = 0;
     std::int32_t cellY = 0;

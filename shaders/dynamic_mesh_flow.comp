@@ -87,7 +87,7 @@ layout(set = 0, binding = 0, std140) uniform DynamicMeshFlowUniforms {
     uvec4 contactGrid;             // mask, capacity, unused, unused
     vec4 timing;                   // time, dt, activity, moisture
     vec4 boundsMinimumResolution;  // xyz minimum, cell resolution
-    vec4 boundsMaximumBand;        // xyz maximum, reserved
+    vec4 boundsMaximumBand;        // xyz maximum, edge coverage
     vec4 motion0;                  // speed, downhill weight, inertia, surface offset
     vec4 particleNoise;            // strength, scale, speed, dry convergence focus
     vec4 sharedWind;               // strength, scale, speed, rain spread
@@ -349,7 +349,12 @@ MeshFlowVisualWeights EvaluateVisualWeights(
         clamp(uniforms.particleNoise.w, 0.0, 1.0);
     const float focused =
         1.0 - (1.0 - authoredFocus) * (1.0 - authoredFocus);
-    const float dryFocus = focused * (1.0 - wet);
+    // Edge Coverage overrides the dry concentration: at 1 every rim cell
+    // accepts spawns even in a dry scene, so trails reach the rock edge
+    // along the whole +X section instead of only the likeliest rills.
+    const float coverage =
+        clamp(uniforms.boundsMaximumBand.w, 0.0, 1.0);
+    const float dryFocus = focused * (1.0 - wet) * (1.0 - coverage);
     const float concavityAcceptance = 0.02 + 0.98 * rill;
     const float rillCoherence = rill * mix(0.68, 0.92, wet);
     // Activity and the dry appearance uniforms already provide sparsity.
@@ -577,10 +582,17 @@ bool SelectConnectedGroundStep(
         const float actualDrop = max(0.0, -delta.z);
         const float maximumExpectedDrop =
             max(0.030, max(0.0, -predictedDeltaZ) + 0.020);
+        // A drop the route diagnostics would flag as an unexplained vertical
+        // jump is a surface break, even when the steep local plane predicted
+        // it: the trickle detaches there and must contact, never render the
+        // plunge as a trail segment.
+        const float planarStepLength = length(delta.xy);
         const bool candidateContact =
             ((current.flags | candidate.flags) &
              kTerminalContactFlag) != 0u ||
-            actualDrop > maximumExpectedDrop;
+            actualDrop > maximumExpectedDrop ||
+            (actualDrop > 0.030 &&
+             actualDrop > planarStepLength * 1.5);
         if (!found || score > bestScore) {
             found = true;
             bestScore = score;
@@ -709,12 +721,18 @@ GroundQuery SpawnParticle(
     uint particleIndex,
     uint previousSourceKind,
     uint previousSourceSlot,
+    uint lifeCount,
     out vec3 initialVelocity,
     out uint sourceId,
     out uint sourceKind) {
     initialVelocity = vec3(1.0, 0.0, 0.0);
     sourceId = 0u;
     sourceKind = 0u;
+    // Salting spawn selection with the particle's life count decorrelates
+    // successive respawns: without it every hash below is time-invariant and
+    // a particle retraces the same route from the same cell forever. 7919
+    // exceeds the particle capacity, so (particle, life) pairs never collide.
+    const uint spawnKey = particleIndex + lifeCount * 7919u;
 
     // Preserve rain-fed emergence across the moisture recession without
     // rescanning the seed ring.  The hash-table slot is stable for the
@@ -756,6 +774,11 @@ GroundQuery SpawnParticle(
     const float rainSourceFraction =
         clamp(uniforms.vegetationExtra.w, 0.0, 1.0) *
         clamp(uniforms.timing.w, 0.0, 1.0);
+    // The rain-vs-entry preference stays per-particle time-invariant: the
+    // remembered-source tier keeps rain-fed status sticky, so a fresh draw
+    // per life would turn rain-fed into an absorbing state and the authored
+    // fraction would no longer bound the steady-state rain-fed share. Only
+    // the choice AMONG seeds and entries varies with the life count.
     const bool preferRainSource =
         availableRainSeeds > 0u &&
         Hash01(uniforms.ground.w, particleIndex, 37u) <
@@ -771,7 +794,7 @@ GroundQuery SpawnParticle(
             }
             const float ageSample = Hash01(
                 uniforms.ground.w,
-                particleIndex,
+                spawnKey,
                 attempt + 41u);
             const float distributedAgeSample = mix(
                 ageSample * ageSample * ageSample,
@@ -798,14 +821,14 @@ GroundQuery SpawnParticle(
             const float spreadAngle =
                 Hash01(
                     rainSeed.metadata.y,
-                    particleIndex,
+                    spawnKey,
                     attempt + 151u) *
                 6.28318530718;
             const float spreadRadius =
                 sqrt(
                     Hash01(
                         rainSeed.metadata.y,
-                        particleIndex,
+                        spawnKey,
                         attempt + 157u)) *
                 rainSpawnSpread * 0.12;
             vec3 distributedSeedPosition =
@@ -858,7 +881,7 @@ GroundQuery SpawnParticle(
          ++sampleIndex) {
         const float entrySample = Hash01(
             uniforms.ground.w,
-            particleIndex,
+            spawnKey,
             sampleIndex + 71u);
         const uint candidateIndex = min(
             entryCount - 1u,
@@ -891,14 +914,14 @@ GroundQuery SpawnParticle(
                 candidate.confidence);
         const float spawnSelection = Hash01(
             uniforms.ground.w ^ candidate.slotIndex,
-            particleIndex,
+            spawnKey,
             sampleIndex + 83u);
         const float score =
             candidate.convergence * 0.78 +
             candidate.confidence * 0.12 +
             Hash01(
                 uniforms.ground.w,
-                particleIndex,
+                spawnKey,
                 sampleIndex + 61u) *
                 0.10;
         // The dry focus is a source-location weighting, not a population
@@ -1052,10 +1075,14 @@ void main() {
         vec3 initialVelocity;
         uint sourceId;
         uint sourceKind;
+        // metadata.y packs the source kind in the low byte and the particle's
+        // life count above it; the life count only salts spawn selection.
+        const uint previousLifeCount = particle.metadata.y >> 8u;
         const GroundQuery spawn = SpawnParticle(
             particleIndex,
-            particle.metadata.y,
+            particle.metadata.y & 0xffu,
             particle.metadata.z,
+            previousLifeCount,
             initialVelocity,
             sourceId,
             sourceKind);
@@ -1077,7 +1104,7 @@ void main() {
         particle.metadata =
             uvec4(
                 kParticleFlowing,
-                sourceKind,
+                sourceKind | ((previousLifeCount + 1u) << 8u),
                 sourceId,
                 uniforms.control.x);
         spawned = true;
@@ -1239,6 +1266,15 @@ void main() {
             trailSurface.convergence,
             uniforms.timing.w,
             trailSurface.confidence);
+    // A fresh spawn collapses every anchor onto one cell, so the rendered
+    // spline degenerates to a single straight D8-aligned chord (and the
+    // near-zero route length aliases the streak phase) until the ring
+    // refills. Fade trails in with real polyline length instead of flashing
+    // that diagonal opener at every respawn.
+    nextWeights.trailProminence *= smoothstep(
+        resolution * 2.0,
+        resolution * 8.0,
+        routeLength);
     for (uint anchor = 0u; anchor < historyLength; ++anchor) {
         const uint previousAnchor =
             anchor > 0u ? anchor - 1u : anchor;
@@ -1372,7 +1408,7 @@ void main() {
         particle.metadata.x = kParticleFading;
         particle.positionAge.w = 0.0;
     } else {
-        if (particle.metadata.y == 1u) {
+        if ((particle.metadata.y & 0xffu) == 1u) {
             atomicAdd(counters.rainSeedParticleCount, 1u);
         }
     }

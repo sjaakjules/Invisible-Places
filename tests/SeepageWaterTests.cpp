@@ -1477,6 +1477,7 @@ TEST_CASE("Mesh Flow fixed-capacity settings sanitize and fingerprint live contr
     CHECK(defaults.historyLength == 24U);
     CHECK(defaults.sourceBandWidthMeters == Approx(0.75F));
     CHECK(defaults.sourceBandFraction == Approx(0.04F));
+    CHECK(defaults.edgeCoverage == Approx(0.0F));
     CHECK(defaults.rainDistributedSourceFraction == Approx(0.55F));
     CHECK(defaults.speedMetersPerSecond == Approx(0.26F));
     CHECK(defaults.surfaceOffsetMeters == Approx(0.003F));
@@ -1493,6 +1494,7 @@ TEST_CASE("Mesh Flow fixed-capacity settings sanitize and fingerprint live contr
     invalid.particleCapacity = 0U;
     invalid.historyLength = 1U;
     invalid.sourceBandWidthMeters = -1.0F;
+    invalid.edgeCoverage = 2.0F;
     invalid.rockResponse.radiusMeters = 5.0F;
     invalid.rockResponse.colourise.x = -2.0F;
     invalid.vegetationResponse.twinkle = 9.0F;
@@ -1501,6 +1503,7 @@ TEST_CASE("Mesh Flow fixed-capacity settings sanitize and fingerprint live contr
     CHECK(sanitized.particleCapacity == 4096U);
     CHECK(sanitized.historyLength == 24U);
     CHECK(sanitized.sourceBandWidthMeters == Approx(0.75F));
+    CHECK(sanitized.edgeCoverage == Approx(1.0F));
     CHECK(sanitized.rockResponse.radiusMeters == Approx(0.75F));
     CHECK(sanitized.rockResponse.colourise.x == Approx(0.0F));
     CHECK(sanitized.vegetationResponse.twinkle == Approx(4.0F));
@@ -1520,6 +1523,10 @@ TEST_CASE("Mesh Flow fixed-capacity settings sanitize and fingerprint live contr
           WaterDynamicMeshFlowSettingsFingerprint(changed));
     changed = defaults;
     changed.trailOpacityWet += 0.01F;
+    CHECK(defaultFingerprint !=
+          WaterDynamicMeshFlowSettingsFingerprint(changed));
+    changed = defaults;
+    changed.edgeCoverage = 0.5F;
     CHECK(defaultFingerprint !=
           WaterDynamicMeshFlowSettingsFingerprint(changed));
 
@@ -1615,14 +1622,45 @@ TEST_CASE("Mesh Flow light and heavy visual regimes preserve rills without topol
         0.0F);
     CHECK(weakCacheRill.trailProminence < heavyRill.trailProminence);
     CHECK(weakCacheRill.trailProminence > 0.45F);
+
+    // Edge Coverage overrides the dry concentration: full coverage accepts
+    // spawn candidates along the whole rim even in a dry scene, and half
+    // coverage sits strictly between the focused and open extremes.
+    auto fullCoverage = settings;
+    fullCoverage.edgeCoverage = 1.0F;
+    const auto dryOpenFullCoverage =
+        EvaluateWaterDynamicMeshFlowVisualWeights(
+            fullCoverage,
+            0.0F,
+            0.0F,
+            1.0F);
+    CHECK(dryOpenFullCoverage.automaticSpawnAcceptance == Approx(1.0F));
+    auto halfCoverage = settings;
+    halfCoverage.edgeCoverage = 0.5F;
+    const auto dryOpenHalfCoverage =
+        EvaluateWaterDynamicMeshFlowVisualWeights(
+            halfCoverage,
+            0.0F,
+            0.0F,
+            1.0F);
+    CHECK(dryOpenHalfCoverage.automaticSpawnAcceptance >
+          dryOpen.automaticSpawnAcceptance);
+    CHECK(dryOpenHalfCoverage.automaticSpawnAcceptance < 1.0F);
+    // Coverage reshapes spawn placement only; the visual regime weights
+    // stay untouched so the calibrated light/heavy envelope holds.
+    CHECK(dryOpenFullCoverage.trailProminence ==
+          Approx(dryOpen.trailProminence));
+    CHECK(dryOpenFullCoverage.directionalNoiseScale ==
+          Approx(dryOpen.directionalNoiseScale));
 }
 
-TEST_CASE("Mesh Flow dry entries follow the vegetation-supported positive-X edge",
+TEST_CASE("Mesh Flow entries follow the curved positive-X rim with geodesic distances",
           "[water][mesh-flow][ground][entry]") {
     using Catch::Approx;
     using invisible_places::water::BuildWaterDynamicMeshFlowGroundEntries;
     using invisible_places::water::WaterGroundCell;
     using invisible_places::water::WaterSurfaceCache;
+    using invisible_places::water::kWaterGroundTerminalContactFlag;
     using invisible_places::water::kWaterGroundVegetationSupportedFlag;
 
     WaterSurfaceCache cache;
@@ -1631,40 +1669,153 @@ TEST_CASE("Mesh Flow dry entries follow the vegetation-supported positive-X edge
         [](std::int32_t x,
            std::int32_t y,
            std::uint32_t component,
-           bool vegetationSupported) {
+           std::uint32_t flags) {
             WaterGroundCell result;
             result.cellX = x;
             result.cellY = y;
             result.componentId = component;
-            result.flags = vegetationSupported
-                               ? kWaterGroundVegetationSupportedFlag
-                               : 0U;
+            result.flags = flags;
             result.connectivityMask = 1U;
             return result;
         };
-    cache.groundCells = {
-        cell(0, 0, 1U, false),
-        cell(50, 0, 1U, true),
-        cell(60, 0, 1U, true),
-        // Bare sampled Ground continues 1.40 m beyond the vegetation. The
-        // former component-wide +X anchor incorrectly discarded both valid
-        // vegetation-supported entries.
-        cell(200, 0, 1U, false),
-        cell(220, 0, 2U, false),
-        // A vegetation-supported but disconnected column is not a valid
-        // automatic route source even when it is the local +X extreme.
-        cell(300, 0, 3U, true),
-    };
+
+    // One connected surface whose +X rim bends: a wide arm (rows 0..4
+    // reaching x = 140) and a narrow arm (rows 5..9 stopping at x = 40).
+    // The retired per-component maximum-X band measured the narrow arm's
+    // rim as 1.0 m behind the component edge and dropped it entirely.
+    for (std::int32_t y = 0; y <= 4; ++y) {
+        for (std::int32_t x = 0; x <= 140; ++x) {
+            cache.groundCells.push_back(
+                cell(x, y, 1U, kWaterGroundVegetationSupportedFlag));
+        }
+    }
+    for (std::int32_t y = 5; y <= 9; ++y) {
+        for (std::int32_t x = 0; x <= 40; ++x) {
+            cache.groundCells.push_back(
+                cell(x, y, 1U, kWaterGroundVegetationSupportedFlag));
+        }
+    }
+    // A qualifying bench separated from every free rim by terminal rock
+    // skin (a contact row above it and a contact column on its +X side).
+    // Distance must cross the skin at a cost premium instead of stranding
+    // the bench without sources.
+    for (std::int32_t x = 0; x <= 40; ++x) {
+        cache.groundCells.push_back(
+            cell(x, 10, 1U, kWaterGroundTerminalContactFlag));
+    }
+    for (std::int32_t y = 11; y <= 13; ++y) {
+        cache.groundCells.push_back(
+            cell(41, y, 1U, kWaterGroundTerminalContactFlag));
+        for (std::int32_t x = 0; x <= 40; ++x) {
+            cache.groundCells.push_back(
+                cell(x, y, 1U, kWaterGroundVegetationSupportedFlag));
+        }
+    }
+    // A second component whose entire +X boundary is terminal rock skin:
+    // the rim fallback must seed its highest qualifying column instead.
+    for (std::int32_t x = 200; x <= 210; ++x) {
+        cache.groundCells.push_back(cell(
+            x,
+            50,
+            2U,
+            x == 210
+                ? (kWaterGroundVegetationSupportedFlag |
+                   kWaterGroundTerminalContactFlag)
+                : kWaterGroundVegetationSupportedFlag));
+    }
+    // A vegetation-supported but disconnected column is never an automatic
+    // route source even though it forms its own rim.
+    cache.groundCells.push_back(
+        cell(300, 0, 3U, kWaterGroundVegetationSupportedFlag));
     cache.groundCells.back().connectivityMask = 0U;
+    std::sort(
+        cache.groundCells.begin(),
+        cache.groundCells.end(),
+        [](const WaterGroundCell& left, const WaterGroundCell& right) {
+            return std::tie(left.cellX, left.cellY) <
+                   std::tie(right.cellX, right.cellY);
+        });
 
     const auto entries = BuildWaterDynamicMeshFlowGroundEntries(cache);
-    REQUIRE(entries.size() == 2U);
-    CHECK(entries[0].cellX == 60);
-    CHECK(entries[0].edgeDistanceMeters == Approx(0.0F));
-    CHECK(entries[1].cellX == 50);
-    CHECK(entries[1].edgeDistanceMeters == Approx(0.10F));
-    CHECK(entries[1].edgeDistanceFraction ==
-          Approx(10.0F / 201.0F));
+    // Every vegetation-supported, non-terminal, connected cell qualifies:
+    // 5x141 + 5x41 + 3x41 bench + 10 (terminal cells excluded,
+    // disconnected excluded).
+    REQUIRE(entries.size() == 1043U);
+
+    const auto findEntry = [&](std::int32_t x, std::int32_t y)
+        -> const invisible_places::water::WaterDynamicMeshFlowGroundEntry* {
+        for (const auto& entry : entries) {
+            if (entry.cellX == x && entry.cellY == y) {
+                return &entry;
+            }
+        }
+        return nullptr;
+    };
+
+    // Both stretches of the curved rim carry distance-zero entries.
+    const auto* wideRim = findEntry(140, 2);
+    REQUIRE(wideRim != nullptr);
+    CHECK(wideRim->edgeDistanceMeters == Approx(0.0F));
+    CHECK(wideRim->edgeDistanceFraction == Approx(0.0F));
+    const auto* narrowRim = findEntry(40, 8);
+    REQUIRE(narrowRim != nullptr);
+    CHECK(narrowRim->edgeDistanceMeters == Approx(0.0F));
+    // (40, 5) touches the wide arm diagonally at (41, 4), so it is one
+    // orthogonal step behind the rim rather than on it.
+    const auto* nearRim = findEntry(40, 5);
+    REQUIRE(nearRim != nullptr);
+    CHECK(nearRim->edgeDistanceMeters == Approx(0.010F));
+
+    // Geodesic distance reaches the NEAREST rim: (0, 2) is 1.40 m from the
+    // wide rim but only 4 diagonal + 36 orthogonal steps from the narrow
+    // rim cell (40, 6).
+    const auto* interior = findEntry(0, 2);
+    REQUIRE(interior != nullptr);
+    CHECK(interior->edgeDistanceMeters ==
+          Approx((4.0F * 14.0F + 36.0F * 10.0F) / 1000.0F));
+    const auto* wideInterior = findEntry(100, 2);
+    REQUIRE(wideInterior != nullptr);
+    CHECK(wideInterior->edgeDistanceMeters == Approx(0.40F));
+
+    // The skin-ringed bench gets sources through the terminal row at three
+    // times the orthogonal step cost: rim (40,9) -> terminal (40,10) costs
+    // 30, then -> bench (40,11) costs 10.
+    const auto* benchEdge = findEntry(40, 11);
+    REQUIRE(benchEdge != nullptr);
+    CHECK(benchEdge->edgeDistanceMeters == Approx(0.040F));
+    const auto* benchInterior = findEntry(20, 12);
+    REQUIRE(benchInterior != nullptr);
+    CHECK(benchInterior->edgeDistanceMeters > 0.0F);
+    CHECK(findEntry(40, 10) == nullptr);
+
+    // The terminal-skin component seeds from its highest qualifying column.
+    const auto* fallbackSeed = findEntry(209, 50);
+    REQUIRE(fallbackSeed != nullptr);
+    CHECK(fallbackSeed->edgeDistanceMeters == Approx(0.0F));
+    const auto* fallbackBack = findEntry(200, 50);
+    REQUIRE(fallbackBack != nullptr);
+    CHECK(fallbackBack->edgeDistanceMeters == Approx(0.09F));
+    CHECK(fallbackBack->edgeDistanceFraction == Approx(1.0F));
+    CHECK(findEntry(210, 50) == nullptr);
+    CHECK(findEntry(300, 0) == nullptr);
+
+    // Entries stay ordered by 0.10 m distance band so the GPU sampler's
+    // index bias means "near the rim", spread along the whole edge.
+    for (std::size_t index = 1U; index < entries.size(); ++index) {
+        const auto band = [](float meters) {
+            return static_cast<std::uint32_t>(
+                       std::lround(meters * 1000.0F)) /
+                   100U;
+        };
+        CHECK(band(entries[index - 1U].edgeDistanceMeters) <=
+              band(entries[index].edgeDistanceMeters));
+    }
+
+    // Fractions normalise against the component's farthest qualifying cell.
+    for (const auto& entry : entries) {
+        CHECK(entry.edgeDistanceFraction >= 0.0F);
+        CHECK(entry.edgeDistanceFraction <= 1.0F);
+    }
 }
 
 TEST_CASE("Water Flow activity combines keyed level and Rain response deterministically", "[water][flow][scenario][animation]") {
@@ -2463,3 +2614,4 @@ TEST_CASE("Connected Seepage support keeps live dimensions parameter-only",
     CHECK(grid.nodes.front().widthMeters == Catch::Approx(0.060F));
     CHECK(grid.nodes.front().prominence == Catch::Approx(0.40F));
 }
+

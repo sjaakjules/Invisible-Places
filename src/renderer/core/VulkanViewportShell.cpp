@@ -3635,7 +3635,7 @@ DynamicMeshFlowGpuUpdateResult VulkanViewportShell::UpdateDynamicMeshFlowGpuSimu
         groundView.bounds.maximum.x,
         groundView.bounds.maximum.y,
         groundView.bounds.maximum.z,
-        0.0F,
+        std::clamp(request.settings.edgeCoverage, 0.0F, 1.0F),
     };
     uniforms.motion0 = glm::vec4{
         std::max(0.001F, request.settings.speedMetersPerSecond),

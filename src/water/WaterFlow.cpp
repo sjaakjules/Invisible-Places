@@ -3361,6 +3361,10 @@ WaterDynamicMeshFlowSettings SanitizeWaterDynamicMeshFlowSettings(
         finiteOr(settings.dryConcavityFocus, 0.90F),
         0.0F,
         1.0F);
+    settings.edgeCoverage = std::clamp(
+        finiteOr(settings.edgeCoverage, 0.0F),
+        0.0F,
+        1.0F);
     settings.rainSpawnSpread = std::clamp(
         finiteOr(settings.rainSpawnSpread, 0.75F),
         0.0F,
@@ -3592,7 +3596,11 @@ WaterDynamicMeshFlowVisualWeights EvaluateWaterDynamicMeshFlowVisualWeights(
     const float authoredFocus = clamp01(settings.dryConcavityFocus);
     const float focused = 1.0F - ((1.0F - authoredFocus) *
                                   (1.0F - authoredFocus));
-    const float dryFocus = focused * (1.0F - wet);
+    // Edge Coverage overrides the dry concentration: at 1 every rim cell
+    // accepts spawns even in a dry scene, so trails reach the rock edge
+    // along the whole +X section instead of only the likeliest rills.
+    const float coverage = clamp01(settings.edgeCoverage);
+    const float dryFocus = focused * (1.0F - wet) * (1.0F - coverage);
     const float concavityAcceptance = 0.02F + (0.98F * rill);
 
     WaterDynamicMeshFlowVisualWeights result;
@@ -3626,98 +3634,320 @@ WaterDynamicMeshFlowVisualWeights EvaluateWaterDynamicMeshFlowVisualWeights(
 
 std::vector<WaterDynamicMeshFlowGroundEntry>
 BuildWaterDynamicMeshFlowGroundEntries(const WaterSurfaceCache& cache) {
-    struct ComponentExtent {
-        std::int32_t minimumX = std::numeric_limits<std::int32_t>::max();
-        std::int32_t maximumX = std::numeric_limits<std::int32_t>::min();
-        std::int32_t vegetationMaximumX =
-            std::numeric_limits<std::int32_t>::min();
-        bool valid = false;
-        bool hasVegetationSupport = false;
-    };
-
-    std::uint32_t maximumComponent = 0U;
-    for (const auto& cell : cache.groundCells) {
-        maximumComponent = std::max(maximumComponent, cell.componentId);
+    // The spawn table follows the sampled Ground's +X rim wherever it curves.
+    // Rim cells are walkable cells with no same-component cell in any +X
+    // direction (the sampled surface simply ends there); every candidate then
+    // stores its geodesic surface distance to the nearest rim cell.  A single
+    // per-component maximum-X scalar would drop the whole rim wherever the
+    // edge bends away from the component's global +X extreme.
+    const auto& cells = cache.groundCells;
+    if (cells.empty()) {
+        return {};
     }
-    std::vector<ComponentExtent> extents(
-        static_cast<std::size_t>(maximumComponent) + 1U);
-    for (const auto& cell : cache.groundCells) {
+    const float resolution = std::max(0.001F, cache.resolutionMeters);
+    constexpr std::uint32_t kInvalidIndex =
+        std::numeric_limits<std::uint32_t>::max();
+
+    // Neighbour probes run tens of millions of times on the cache-install
+    // path, so retained cells are indexed by a dense grid over their compact
+    // coordinate extent; a hash map only backs the pathological sparse case.
+    std::int64_t minimumX = std::numeric_limits<std::int64_t>::max();
+    std::int64_t minimumY = std::numeric_limits<std::int64_t>::max();
+    std::int64_t maximumX = std::numeric_limits<std::int64_t>::min();
+    std::int64_t maximumY = std::numeric_limits<std::int64_t>::min();
+    for (const auto& cell : cells) {
         if (cell.componentId == 0U) {
             continue;
         }
-        auto& extent = extents[cell.componentId];
-        extent.minimumX = std::min(extent.minimumX, cell.cellX);
-        extent.maximumX = std::max(extent.maximumX, cell.cellX);
-        extent.valid = true;
-        if ((cell.flags & kWaterGroundVegetationSupportedFlag) != 0U) {
-            extent.vegetationMaximumX =
-                std::max(extent.vegetationMaximumX, cell.cellX);
-            extent.hasVegetationSupport = true;
+        minimumX = std::min<std::int64_t>(minimumX, cell.cellX);
+        minimumY = std::min<std::int64_t>(minimumY, cell.cellY);
+        maximumX = std::max<std::int64_t>(maximumX, cell.cellX);
+        maximumY = std::max<std::int64_t>(maximumY, cell.cellY);
+    }
+    if (maximumX < minimumX) {
+        return {};
+    }
+    const std::int64_t extentX = maximumX - minimumX + 1LL;
+    const std::int64_t extentY = maximumY - minimumY + 1LL;
+    const bool useDenseGrid = extentX * extentY <= 100'000'000LL;
+    std::vector<std::uint32_t> gridIndex;
+    std::unordered_map<std::uint64_t, std::uint32_t> mapIndex;
+    const auto packKey = [](std::int32_t x, std::int32_t y) {
+        return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(x))
+                << 32U) |
+               static_cast<std::uint64_t>(static_cast<std::uint32_t>(y));
+    };
+    if (useDenseGrid) {
+        gridIndex.assign(
+            static_cast<std::size_t>(extentX * extentY),
+            kInvalidIndex);
+    } else {
+        mapIndex.reserve(cells.size());
+    }
+    const auto lookupCell = [&](std::int32_t x,
+                                std::int32_t y) -> std::uint32_t {
+        if (useDenseGrid) {
+            if (x < minimumX || x > maximumX || y < minimumY ||
+                y > maximumY) {
+                return kInvalidIndex;
+            }
+            return gridIndex[static_cast<std::size_t>(
+                (y - minimumY) * extentX + (x - minimumX))];
+        }
+        const auto found = mapIndex.find(packKey(x, y));
+        return found != mapIndex.end() ? found->second : kInvalidIndex;
+    };
+    for (std::uint32_t index = 0U; index < cells.size(); ++index) {
+        if (cells[index].componentId == 0U) {
+            continue;
+        }
+        if (useDenseGrid) {
+            gridIndex[static_cast<std::size_t>(
+                (cells[index].cellY - minimumY) * extentX +
+                (cells[index].cellX - minimumX))] = index;
+        } else {
+            mapIndex.emplace(
+                packKey(cells[index].cellX, cells[index].cellY),
+                index);
         }
     }
 
-    const float resolution = std::max(0.001F, cache.resolutionMeters);
+    // Distance propagates across every retained cell of a component — the
+    // terminal rock skin is crossable at a cost premium, so a qualifying
+    // bench ringed by contact cells is never stranded without sources.
+    // Only vegetation-supported, non-terminal, connected cells become
+    // entries.
+    const auto walkable = [](const WaterGroundCell& cell) {
+        return cell.componentId != 0U &&
+               (cell.flags & kWaterGroundTerminalContactFlag) == 0U;
+    };
+    const auto qualifies = [&](const WaterGroundCell& cell) {
+        return walkable(cell) &&
+               (cell.flags & kWaterGroundVegetationSupportedFlag) != 0U &&
+               cell.connectivityMask != 0U;
+    };
+
+    struct ComponentInfo {
+        std::int32_t qualifyingMaximumX =
+            std::numeric_limits<std::int32_t>::min();
+        std::uint32_t maximumCost = 0U;
+        bool hasRim = false;
+    };
+    std::uint32_t maximumComponent = 0U;
+    for (const auto& cell : cells) {
+        maximumComponent = std::max(maximumComponent, cell.componentId);
+    }
+    std::vector<ComponentInfo> components(
+        static_cast<std::size_t>(maximumComponent) + 1U);
+
+    static constexpr std::array<std::pair<std::int32_t, std::int32_t>, 3>
+        kPositiveXNeighbours{{{1, 1}, {1, 0}, {1, -1}}};
+    const auto hasPositiveXNeighbour = [&](const WaterGroundCell& cell) {
+        for (const auto& offset : kPositiveXNeighbours) {
+            const auto neighbourIndex = lookupCell(
+                cell.cellX + offset.first,
+                cell.cellY + offset.second);
+            if (neighbourIndex != kInvalidIndex &&
+                cells[neighbourIndex].componentId == cell.componentId) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    std::vector<std::uint32_t> rimSeeds;
+    for (std::uint32_t index = 0U; index < cells.size(); ++index) {
+        const auto& cell = cells[index];
+        if (!walkable(cell)) {
+            continue;
+        }
+        if (qualifies(cell)) {
+            auto& component = components[cell.componentId];
+            component.qualifyingMaximumX =
+                std::max(component.qualifyingMaximumX, cell.cellX);
+        }
+        if (!hasPositiveXNeighbour(cell)) {
+            rimSeeds.push_back(index);
+            components[cell.componentId].hasRim = true;
+        }
+    }
+    // A component whose entire +X boundary is terminal rock skin has no free
+    // rim; fall back to its highest-+X qualifying column so it still spawns.
+    for (std::uint32_t index = 0U; index < cells.size(); ++index) {
+        const auto& cell = cells[index];
+        if (!qualifies(cell)) {
+            continue;
+        }
+        const auto& component = components[cell.componentId];
+        if (!component.hasRim &&
+            cell.cellX == component.qualifyingMaximumX) {
+            rimSeeds.push_back(index);
+        }
+    }
+
+    // Multi-source Dijkstra over each component's retained cells with
+    // {10, 14} step costs (orthogonal, diagonal) in tenth-of-cell units;
+    // stepping onto a terminal contact cell costs three times as much, so
+    // rock skin is a detour rather than a wall.  A 64-slot circular bucket
+    // queue keeps the transform linear in the cell count.
+    constexpr std::uint32_t kUnreachableCost =
+        std::numeric_limits<std::uint32_t>::max();
+    constexpr std::uint32_t kOrthogonalStepCost = 10U;
+    constexpr std::uint32_t kDiagonalStepCost = 14U;
+    constexpr std::uint32_t kTerminalStepCostMultiplier = 3U;
+    std::vector<std::uint32_t> cellCost(cells.size(), kUnreachableCost);
+    std::vector<bool> settled(cells.size(), false);
+    std::array<std::vector<std::uint32_t>, 64> buckets;
+    std::size_t pendingCount = 0U;
+    const auto pushCost = [&](std::uint32_t index, std::uint32_t cost) {
+        cellCost[index] = cost;
+        buckets[cost & 63U].push_back(index);
+        ++pendingCount;
+    };
+    for (const auto index : rimSeeds) {
+        if (cellCost[index] != 0U) {
+            pushCost(index, 0U);
+        }
+    }
+    static constexpr std::array<std::pair<std::int32_t, std::int32_t>, 8>
+        kAllNeighbours{{
+            {0, 1},
+            {1, 1},
+            {1, 0},
+            {1, -1},
+            {0, -1},
+            {-1, -1},
+            {-1, 0},
+            {-1, 1},
+        }};
+    std::vector<std::uint32_t> activeBucket;
+    for (std::uint32_t currentCost = 0U; pendingCount > 0U; ++currentCost) {
+        auto& bucket = buckets[currentCost & 63U];
+        activeBucket.clear();
+        activeBucket.swap(bucket);
+        pendingCount -= activeBucket.size();
+        for (const auto index : activeBucket) {
+            if (settled[index] || cellCost[index] != currentCost) {
+                continue;
+            }
+            settled[index] = true;
+            const auto& cell = cells[index];
+            for (const auto& offset : kAllNeighbours) {
+                const auto neighbourIndex = lookupCell(
+                    cell.cellX + offset.first,
+                    cell.cellY + offset.second);
+                if (neighbourIndex == kInvalidIndex ||
+                    settled[neighbourIndex] ||
+                    cells[neighbourIndex].componentId !=
+                        cell.componentId) {
+                    continue;
+                }
+                const bool diagonal =
+                    offset.first != 0 && offset.second != 0;
+                std::uint32_t stepCost =
+                    diagonal ? kDiagonalStepCost : kOrthogonalStepCost;
+                if (!walkable(cells[neighbourIndex])) {
+                    stepCost *= kTerminalStepCostMultiplier;
+                }
+                const std::uint32_t nextCost = currentCost + stepCost;
+                if (nextCost < cellCost[neighbourIndex]) {
+                    pushCost(neighbourIndex, nextCost);
+                }
+            }
+        }
+    }
+
+    // Order by 0.10 m distance bands, hash-shuffled within each band, so the
+    // GPU sampler's cubic bias toward index 0 becomes a bias toward the rim
+    // that is spatially uniform along it — never a bias toward one end of
+    // the edge. Exact distances stay in the entry for CPU consumers.  Sort
+    // keys are precomputed; recomputing hashes inside the comparator costs
+    // hundreds of milliseconds at millions of candidates.
+    const auto spreadHash = [](std::int32_t x, std::int32_t y) {
+        auto hash = static_cast<std::uint32_t>(x) * 0x9E3779B9U;
+        hash ^= static_cast<std::uint32_t>(y) * 0x85EBCA6BU;
+        hash ^= hash >> 16U;
+        hash *= 0x7FEB352DU;
+        hash ^= hash >> 15U;
+        hash *= 0x846CA68BU;
+        return hash ^ (hash >> 16U);
+    };
+    struct EntryCandidate {
+        std::uint64_t sortKey = 0U;
+        std::int32_t cellX = 0;
+        std::int32_t cellY = 0;
+        std::uint32_t cellIndex = 0U;
+        std::uint32_t cost = 0U;
+    };
+    std::vector<EntryCandidate> candidates;
+    candidates.reserve(std::min<std::size_t>(cells.size(), 262'144U));
+    for (std::uint32_t index = 0U; index < cells.size(); ++index) {
+        const auto& cell = cells[index];
+        if (!qualifies(cell) || cellCost[index] == kUnreachableCost) {
+            continue;
+        }
+        const std::uint32_t band = cellCost[index] / 100U;
+        candidates.push_back({
+            .sortKey = (static_cast<std::uint64_t>(band) << 32U) |
+                       spreadHash(cell.cellX, cell.cellY),
+            .cellX = cell.cellX,
+            .cellY = cell.cellY,
+            .cellIndex = index,
+            .cost = cellCost[index],
+        });
+        auto& component = components[cell.componentId];
+        component.maximumCost =
+            std::max(component.maximumCost, cellCost[index]);
+    }
+    std::sort(
+        candidates.begin(),
+        candidates.end(),
+        [](const EntryCandidate& left, const EntryCandidate& right) {
+            return std::tie(left.sortKey, left.cellX, left.cellY) <
+                   std::tie(right.sortKey, right.cellX, right.cellY);
+        });
+
+    // Cap the table without abandoning the interior: the nearest half of the
+    // cap is kept intact and the remainder is stride-sampled so spawns can
+    // still start anywhere on the smooth top surface, just more sparsely.
+    constexpr std::size_t kMaximumEntryCount = 262'144U;
+    constexpr std::size_t kNearBandKeepCount = kMaximumEntryCount / 2U;
+    if (candidates.size() > kMaximumEntryCount) {
+        std::vector<EntryCandidate> thinned;
+        thinned.reserve(kMaximumEntryCount);
+        thinned.assign(
+            candidates.begin(),
+            candidates.begin() +
+                static_cast<std::ptrdiff_t>(kNearBandKeepCount));
+        const std::size_t tailCount =
+            candidates.size() - kNearBandKeepCount;
+        const std::size_t tailKeepCount =
+            kMaximumEntryCount - kNearBandKeepCount;
+        for (std::size_t keep = 0U; keep < tailKeepCount; ++keep) {
+            const std::size_t tailIndex =
+                (keep * tailCount) / tailKeepCount;
+            thinned.push_back(candidates[kNearBandKeepCount + tailIndex]);
+        }
+        candidates = std::move(thinned);
+    }
+
     std::vector<WaterDynamicMeshFlowGroundEntry> result;
-    result.reserve(std::min<std::size_t>(cache.groundCells.size(), 262'144U));
-    for (const auto& cell : cache.groundCells) {
-        if (cell.componentId == 0U ||
-            cell.componentId >= extents.size() ||
-            (cell.flags & kWaterGroundVegetationSupportedFlag) == 0U ||
-            (cell.flags & kWaterGroundTerminalContactFlag) != 0U ||
-            cell.connectivityMask == 0U) {
-            continue;
-        }
-        const auto& extent = extents[cell.componentId];
-        if (!extent.valid || !extent.hasVegetationSupport) {
-            continue;
-        }
-        const auto componentCells =
-            static_cast<std::int64_t>(extent.maximumX) -
-            static_cast<std::int64_t>(extent.minimumX) + 1LL;
-        const auto edgeCells = std::max<std::int64_t>(
-            0LL,
-            static_cast<std::int64_t>(extent.vegetationMaximumX) -
-                static_cast<std::int64_t>(cell.cellX));
-        const float componentExtentMeters =
-            static_cast<float>(
-                std::max<std::int64_t>(0LL, componentCells - 1LL)) *
-            resolution;
-        const float edgeDistanceMeters =
-            static_cast<float>(edgeCells) * resolution;
-        const float fixedEntryBandMeters =
-            std::max(0.75F, componentExtentMeters * 0.04F);
-        if (edgeDistanceMeters > fixedEntryBandMeters) {
-            continue;
-        }
+    result.reserve(candidates.size());
+    for (const auto& candidate : candidates) {
+        const auto& cell = cells[candidate.cellIndex];
+        const auto maximumCost =
+            components[cell.componentId].maximumCost;
         result.push_back({
             .cellX = cell.cellX,
             .cellY = cell.cellY,
-            .edgeDistanceMeters = edgeDistanceMeters,
-            .edgeDistanceFraction =
-                static_cast<float>(edgeCells) /
-                static_cast<float>(
-                    std::max<std::int64_t>(1LL, componentCells)),
+            .edgeDistanceMeters =
+                static_cast<float>(candidate.cost) * resolution / 10.0F,
+            .edgeDistanceFraction = maximumCost > 0U
+                ? static_cast<float>(candidate.cost) /
+                      static_cast<float>(maximumCost)
+                : 0.0F,
         });
     }
-
-    // The immutable entry band is measured back from the highest supported
-    // vegetation cell, not an unrelated bare-Ground tail of the component.
-    // This preserves automatic dry trickles when vegetation ends before the
-    // sampled Ground's geometric +X extreme.
-    std::sort(
-        result.begin(),
-        result.end(),
-        [](const WaterDynamicMeshFlowGroundEntry& left,
-           const WaterDynamicMeshFlowGroundEntry& right) {
-            const float leftRank = std::min(
-                left.edgeDistanceMeters / 0.75F,
-                left.edgeDistanceFraction / 0.04F);
-            const float rightRank = std::min(
-                right.edgeDistanceMeters / 0.75F,
-                right.edgeDistanceFraction / 0.04F);
-            return std::tie(leftRank, left.cellX, left.cellY) <
-                   std::tie(rightRank, right.cellX, right.cellY);
-        });
     return result;
 }
 
@@ -5469,6 +5699,7 @@ std::string WaterDynamicMeshFlowSettingsFingerprint(
     SeepageFingerprintU32(&hash, settings.particleCapacity);
     SeepageFingerprintU32(&hash, settings.historyLength);
     SeepageFingerprintFloat(&hash, settings.dryConcavityFocus);
+    SeepageFingerprintFloat(&hash, settings.edgeCoverage);
     SeepageFingerprintFloat(&hash, settings.rainSpawnSpread);
     SeepageFingerprintFloat(&hash, settings.rainDistributedSourceFraction);
     SeepageFingerprintU32(&hash, settings.previewParticleLimit);

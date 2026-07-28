@@ -39200,14 +39200,27 @@ void DrawWaterDynamicMeshFlowPanel(
         liveChanged |= ImGui::Checkbox("Enabled##DynamicMeshFlowGpu", &settings.enabled);
         liveChanged |= ImGui::Checkbox("Show Trails", &settings.showTrails);
         ImGui::TextDisabled(
-            "Dry entry: vegetation-supported cells within max(0.75 m, 4%%) "
-            "of each component's highest +X edge.");
+            "Dry entry: vegetation-supported Ground ordered by distance "
+            "from the sampled surface's +X rim.");
         liveChanged |= ImGui::SliderFloat(
             "Dry Concavity Focus",
             &settings.dryConcavityFocus,
             0.0F,
             1.0F,
             "%.2f");
+        liveChanged |= ImGui::SliderFloat(
+            "Edge Coverage",
+            &settings.edgeCoverage,
+            0.0F,
+            1.0F,
+            "%.2f");
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Low keeps dry trails at the most likely (convergent) "
+                "places along the edge; high spreads spawns along the "
+                "whole +X rim so trails reach the rock edge everywhere, "
+                "regardless of moisture.");
+        }
         liveChanged |= ImGui::SliderFloat(
             "Rain-Fed Source Share",
             &settings.rainDistributedSourceFraction,
@@ -48435,7 +48448,23 @@ int RunDynamicMeshFlowGroundSmoke(
         report.Fail(
             "GPU route aggregates detected an out-of-bounds/off-surface "
             "particle, a long or vertical segment, or weak downhill "
-            "alignment.");
+            "alignment: samples " +
+            std::to_string(routeDiagnostics.routeSampleCount) +
+            ", in-bounds " +
+            std::to_string(routeDiagnostics.routeWithinGroundBoundsFraction) +
+            ", near-surface " +
+            std::to_string(
+                routeDiagnostics.routeWithinSurfaceToleranceFraction) +
+            ", max segment " +
+            std::to_string(routeDiagnostics.maximumRenderedSegmentMeters) +
+            " m, long segments " +
+            std::to_string(routeDiagnostics.longSegmentCount) +
+            ", vertical jumps " +
+            std::to_string(routeDiagnostics.unexplainedVerticalJumpCount) +
+            ", median downhill alignment " +
+            std::to_string(
+                routeDiagnostics.medianTangentDownhillAlignment) +
+            ".");
     }
 
     if (scene1Visual) {

@@ -4168,6 +4168,7 @@ json SerializeWaterDynamicMeshFlowSettings(WaterDynamicMeshFlowSettings settings
         {"particle_capacity", settings.particleCapacity},
         {"history_length", settings.historyLength},
         {"dry_concavity_focus", settings.dryConcavityFocus},
+        {"edge_coverage", settings.edgeCoverage},
         {"rain_spawn_spread", settings.rainSpawnSpread},
         {"rain_distributed_source_fraction", settings.rainDistributedSourceFraction},
         {"preview_particle_limit", settings.previewParticleLimit},
@@ -4274,6 +4275,10 @@ WaterDynamicMeshFlowSettings ParseWaterDynamicMeshFlowSettings(const json& setti
     settings.dryConcavityFocus = settingsJson.value(
         "dry_concavity_focus",
         settings.dryConcavityFocus);
+    settings.edgeCoverage = std::clamp(
+        settingsJson.value("edge_coverage", settings.edgeCoverage),
+        0.0F,
+        1.0F);
     settings.rainSpawnSpread = settingsJson.value(
         "rain_spawn_spread",
         settings.rainSpawnSpread);
