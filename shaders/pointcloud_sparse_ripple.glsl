@@ -37,7 +37,8 @@ struct SeepageLook {
     // 3 contour pulses), y: blend mode.
     uvec4 control;
     // Contour Pulses: x spacing, y width, z speed, w irregularity.
-    // legacy1 carries z: density, w: response intensity.
+    // legacy1 carries x: wave count, y: speed variation,
+    // z: density, w: response intensity.
     vec4 legacy0;
     vec4 legacy1;
     vec4 response0;
@@ -2115,15 +2116,18 @@ float SeepageReflectionSignal(
         1.0);
 }
 
-float SeepagePulseTrain(
-    float coordinateMeters,
-    float spacingMeters,
+float SeepageContourWave(
+    float distanceMeters,
     float widthMeters) {
-    const float spacing = max(0.005, spacingMeters);
-    const float width = clamp(widthMeters, 0.001, spacing * 0.49);
-    const float wrapped = coordinateMeters - floor(coordinateMeters / spacing) * spacing;
-    const float distanceToFront = min(wrapped, spacing - wrapped);
-    return clamp(1.0 - smoothstep(width * 0.22, width, distanceToFront), 0.0, 1.0);
+    const float width = max(0.001, widthMeters);
+    return clamp(
+        1.0 -
+            smoothstep(
+                width * 0.15,
+                width * 2.40,
+                abs(distanceMeters)),
+        0.0,
+        1.0);
 }
 
 vec3 SeepagePatternSignals(
@@ -2171,42 +2175,97 @@ vec3 SeepagePatternSignals(
         const float width = clamp(legacy0.y, 0.001, spacing * 0.49);
         const float speed = max(0.0, legacy0.z);
         const float irregularity = clamp(legacy0.w, 0.0, 1.0);
+        const int waveCount = int(clamp(floor(legacy1.x + 0.5), 1.0, 12.0));
+        const float speedVariation = clamp(legacy1.y, 0.0, 1.0);
         const float downstream = max(0.0, downstreamDistance);
         const float lateralNormalised = clamp(
             signedLateralDistance / max(0.001, effectiveHalfWidth),
             -1.5,
             1.5);
-        vec3 coordinate = noiseRotation * (worldPosition / (spacing * 1.65));
-        coordinate += vec3(0.017, -0.013, 0.011) * (time * organic0.z);
+        // Keep the surface field fixed and move only the independent fronts
+        // over it, avoiding whole-pattern texture advection.
+        const vec3 coordinate =
+            noiseRotation * (worldPosition / (spacing * 1.65));
         const SeepageNoise3Sample frontNoise = SeepageFractalNoise3(
             coordinate,
             proceduralSeed + 17431u,
             seepageParamData.seepageParams[nodeIndex].control.y);
         const float centredNoise = frontNoise.value * 2.0 - 1.0;
-        const float bowedFront =
+        const float baseBowedFront =
             pow(abs(lateralNormalised), 1.35) *
             spacing * (0.10 + irregularity * 0.28);
-        const float frontWarp =
-            centredNoise * spacing * irregularity * 0.42;
-        const float warpedDownstream = downstream + bowedFront + frontWarp;
-        const float primarySpeed =
-            speed * (1.0 + centredNoise * irregularity * 0.09);
-        const float secondarySpeed =
-            speed * (1.06 - centredNoise * irregularity * 0.075);
-        const float seedPhase = SeepageNoiseHash01(
-            int(seepageNodeData.seepageNodes[nodeIndex].control.x),
-            int(seepageParamData.seepageParams[nodeIndex].control.w),
-            proceduralSeed + 19009u);
-        const float primaryPulse = SeepagePulseTrain(
-            warpedDownstream - time * primarySpeed,
-            spacing,
-            width);
-        const float secondaryPulse = SeepagePulseTrain(
-            downstream + bowedFront * 0.62 - frontWarp * 0.55 -
-                time * secondarySpeed + spacing * (0.34 + seedPhase * 0.20),
-            spacing * 1.23,
-            width * 1.18);
-        const float pulse = max(primaryPulse, secondaryPulse * 0.58);
+        const float supportSpan = max(
+            max(0.005, effectiveReach) + width * 5.0,
+            spacing * 2.5);
+        float accumulatedWaves = 0.0;
+        for (int waveIndex = 0; waveIndex < 12; ++waveIndex) {
+            if (waveIndex >= waveCount) {
+                break;
+            }
+            const float speedHash = SeepageNoiseHash01(
+                waveIndex,
+                11,
+                proceduralSeed + 19009u);
+            const float startHash = SeepageNoiseHash01(
+                waveIndex,
+                23,
+                proceduralSeed + 27143u);
+            const float widthHash = SeepageNoiseHash01(
+                waveIndex,
+                37,
+                proceduralSeed + 31847u);
+            const float shapeHash = SeepageNoiseHash01(
+                waveIndex,
+                53,
+                proceduralSeed + 45119u);
+            const float amplitudeHash = SeepageNoiseHash01(
+                waveIndex,
+                71,
+                proceduralSeed + 57203u);
+            const float waveSpeed = speed * max(
+                0.15,
+                1.0 +
+                    (speedHash * 2.0 - 1.0) *
+                        speedVariation);
+            const float idleGap = max(
+                spacing * (0.45 + shapeHash * 0.55),
+                width * 4.0);
+            const float cycleDistance = supportSpan + idleGap;
+            const float travel =
+                mod(
+                    time * waveSpeed +
+                        startHash * cycleDistance,
+                    cycleDistance) -
+                idleGap;
+            const float waveWidth =
+                width * (0.72 + widthHash * 0.78);
+            const float shapeSign =
+                shapeHash < 0.5 ? -1.0 : 1.0;
+            const float frontWarp =
+                centredNoise * spacing * irregularity *
+                (0.14 + shapeHash * 0.24) * shapeSign;
+            const float slowShapeChange =
+                sin(
+                    time * organic0.z *
+                        (0.15 + widthHash * 0.25) +
+                    shapeHash * kRippleTwoPi) *
+                width * irregularity * 0.55;
+            const float distanceToWave =
+                downstream +
+                baseBowedFront * (0.72 + shapeHash * 0.46) +
+                frontWarp + slowShapeChange - travel;
+            const float wave =
+                SeepageContourWave(distanceToWave, waveWidth);
+            const float amplitude =
+                (0.58 + amplitudeHash * 0.42) *
+                mix(0.82, 1.16, frontNoise.value);
+            accumulatedWaves += wave * amplitude;
+        }
+        const float pulse = clamp(
+            accumulatedWaves * 0.22 +
+                max(0.0, accumulatedWaves - 0.90) * 0.42,
+            0.0,
+            1.0);
         const float coverageThreshold = 0.72 - density * 0.38;
         const float dampPatch = smoothstep(
             coverageThreshold,
@@ -2223,21 +2282,21 @@ vec3 SeepagePatternSignals(
             worldPosition,
             resolvedNormal,
             worldGradient,
-            max(pulse, dampPatch * 0.35));
+            max(pulse, dampPatch * 0.15));
         return vec3(
             clamp(
                 strengthMask * wetness *
-                    (0.54 + dampPatch * 0.25 +
-                     pulse * (0.18 + rainGain * 0.08)),
+                    (0.06 + dampPatch * 0.10 +
+                     pulse * (0.76 + rainGain * 0.12)),
                 0.0,
                 1.0),
             clamp(
-                strengthMask * pulse * (0.32 + dampPatch * 0.30),
+                strengthMask * pulse * (0.30 + dampPatch * 0.24),
                 0.0,
                 1.0),
             clamp(
                 strengthMask *
-                    (pulse * 0.72 + dampPatch * 0.18) *
+                    (0.015 + pulse * 0.78 + dampPatch * 0.06) *
                     response2.z * reflection,
                 0.0,
                 1.0));

@@ -40700,9 +40700,9 @@ bool DrawWaterSeepageSettingsControls(WaterSeepageLookSettings* look) {
                 0.01F,
                 2.0F,
                 "%.3f m",
-                "Sets the downstream distance between wet-intensity fronts. Distance is "
-                "measured over connected surface support rather than in world Z, so fronts "
-                "bend around the rock contour.",
+                "Sets the average launch separation between independent waves. Distance is "
+                "measured over connected surface support rather than world Z; larger spacing "
+                "also gives each wave a longer random idle interval before relaunch.",
                 ImGuiSliderFlags_Logarithmic);
             slider(
                 "Pulse Width",
@@ -40719,23 +40719,39 @@ bool DrawWaterSeepageSettingsControls(WaterSeepageLookSettings* look) {
                 0.0F,
                 0.75F,
                 "%.3f m/s",
-                "Controls how quickly fronts travel from the node down the least-resistance "
-                "surface metric. A quieter secondary train moves at a slightly different speed.");
+                "Sets the central drift speed. Each wave receives a stable speed above or below "
+                "this value, so faster fronts can catch and reinforce slower fronts.");
+            slider(
+                "Wave Count",
+                &look->pulseWaveCount,
+                1.0F,
+                12.0F,
+                "%.0f",
+                "Sets how many independently launched waves circulate over the live Strength "
+                "envelope. More waves increase the chance and intensity of overlapping fronts.");
+            slider(
+                "Speed Variation",
+                &look->pulseSpeedVariation,
+                0.0F,
+                1.0F,
+                "%.2f",
+                "Spreads individual wave speeds around Pulse Speed. Higher variation creates "
+                "more overtaking and irregular high-intensity overlap regions.");
             slider(
                 "Front Irregularity",
                 &look->pulseIrregularity,
                 0.0F,
                 1.0F,
                 "%.2f",
-                "Wrinkles each front with stable 3D noise, delays its side edges, and varies "
-                "local speed. Zero is smooth and regular; higher values split and reconnect.");
+                "Wrinkles each front with stationary 3D surface noise and delays its side edges. "
+                "Zero is smooth; higher values make overlapping fronts split and reconnect.");
             slider(
                 "Evolution",
                 &look->evolution,
                 0.0F,
                 1.0F,
                 "%.3f",
-                "Slowly evolves the irregular front shape independently of downhill travel. "
+                "Slowly flexes each front without translating the underlying surface field. "
                 "Keep this modest for coherent waves during a long camera pan.");
             break;
     }

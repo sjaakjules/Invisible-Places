@@ -54,6 +54,8 @@ WaterSeepageLookSettings MakeLook(
     look.pulseWidthMeters = 0.055F + offset;
     look.pulseSpeedMetersPerSecond = 0.12F + offset;
     look.pulseIrregularity = 0.38F + offset;
+    look.pulseWaveCount = 7.0F + offset;
+    look.pulseSpeedVariation = 0.55F + offset;
     look.blendMode = blendMode;
     look.response.intensity = 0.71F + offset;
     look.response.emissionAdd = 0.82F + offset;
@@ -114,6 +116,12 @@ void CheckLook(
     CHECK(
         actual.pulseIrregularity ==
         Catch::Approx(expected.pulseIrregularity));
+    CHECK(
+        actual.pulseWaveCount ==
+        Catch::Approx(expected.pulseWaveCount));
+    CHECK(
+        actual.pulseSpeedVariation ==
+        Catch::Approx(expected.pulseSpeedVariation));
     CHECK(actual.blendMode == expected.blendMode);
     CHECK(actual.response.intensity == Catch::Approx(expected.response.intensity));
     CHECK(actual.response.emissionAdd == Catch::Approx(expected.response.emissionAdd));
@@ -281,6 +289,8 @@ TEST_CASE("Project documents round-trip Seepage nodes and shared looks", "[water
     CHECK(savedJson.find("\"pattern\": \"contour_pulses\"") != std::string::npos);
     CHECK(savedJson.find("\"pulse_spacing_meters\"") != std::string::npos);
     CHECK(savedJson.find("\"pulse_speed_meters_per_second\"") != std::string::npos);
+    CHECK(savedJson.find("\"pulse_wave_count\"") != std::string::npos);
+    CHECK(savedJson.find("\"pulse_speed_variation\"") != std::string::npos);
     CHECK(savedJson.find("\"quality\": \"auto\"") != std::string::npos);
     CHECK(savedJson.find("\"quality\": \"low\"") != std::string::npos);
     CHECK(savedJson.find("\"quality\": \"balanced\"") != std::string::npos);

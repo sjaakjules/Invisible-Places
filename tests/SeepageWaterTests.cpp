@@ -100,6 +100,8 @@ TEST_CASE("Seepage defaults describe a subtle damp fan", "[water][seepage][defau
     CHECK(look.pulseWidthMeters == Approx(0.055F));
     CHECK(look.pulseSpeedMetersPerSecond == Approx(0.12F));
     CHECK(look.pulseIrregularity == Approx(0.38F));
+    CHECK(look.pulseWaveCount == Approx(7.0F));
+    CHECK(look.pulseSpeedVariation == Approx(0.55F));
     CHECK(look.response.intensity == Approx(0.85F));
     CHECK(look.response.emissionAdd == Approx(0.35F));
     CHECK(look.response.opacityAdd == Approx(0.04F));
@@ -1173,7 +1175,7 @@ TEST_CASE("Chaotic Bloom lobes advect downhill along the surface guide", "[water
     CHECK(downstreamLater.ripple == Catch::Approx(upstream.ripple).margin(1.0e-5F));
 }
 
-TEST_CASE("Contour Pulses carry blended fronts downhill over the live strength envelope", "[water][seepage][patterns][contour-pulses]") {
+TEST_CASE("Contour Pulses build strong regions from independently drifting wave overlap", "[water][seepage][patterns][contour-pulses]") {
     using invisible_places::water::EvaluateWaterSeepageGridContribution;
 
     WaterSeepageLookSettings look;
@@ -1186,12 +1188,14 @@ TEST_CASE("Contour Pulses carry blended fronts downhill over the live strength e
     look.pulseSpacingMeters = 0.50F;
     look.pulseWidthMeters = 0.025F;
     look.pulseSpeedMetersPerSecond = 0.10F;
-    look.pulseIrregularity = 0.0F;
+    look.pulseIrregularity = 0.60F;
+    look.pulseWaveCount = 1.0F;
+    look.pulseSpeedVariation = 0.0F;
 
     auto node = MakeSeepageNode();
     node.reachMeters = 2.0F;
     node.widthMeters = 0.60F;
-    const auto grid = BuildGrid(
+    const auto singleWaveGrid = BuildGrid(
         {node},
         "ROCK",
         false,
@@ -1199,40 +1203,94 @@ TEST_CASE("Contour Pulses carry blended fronts downhill over the live strength e
         1'000'000ULL,
         look);
     const invisible_places::io::Float3 normal{0.0F, 1.0F, 0.0F};
-    const auto sourceAtStart = EvaluateWaterSeepageGridContribution(
-        grid, {0.0F, 0.0F, 0.0F}, normal, 0.0F);
-    const auto sourceLater = EvaluateWaterSeepageGridContribution(
-        grid, {0.0F, 0.0F, 0.0F}, normal, 1.0F);
-    const auto downstreamBefore = EvaluateWaterSeepageGridContribution(
-        grid, {0.0F, 0.0F, -0.10F}, normal, 0.0F);
-    const auto downstreamLater = EvaluateWaterSeepageGridContribution(
-        grid, {0.0F, 0.0F, -0.10F}, normal, 1.0F);
-
-    CHECK(sourceAtStart.ripple > sourceLater.ripple + 0.05F);
-    CHECK(downstreamLater.ripple > downstreamBefore.ripple + 0.05F);
-    CHECK(downstreamLater.mask > 0.0F);
-
-    look.pulseIrregularity = 0.85F;
-    const auto irregularGrid = BuildGrid(
+    look.pulseWaveCount = 12.0F;
+    look.pulseSpeedVariation = 0.90F;
+    const auto variedWaveGrid = BuildGrid(
         {node},
         "ROCK",
         false,
         {},
         1'000'000ULL,
         look);
+    look.pulseSpeedVariation = 0.0F;
+    const auto uniformSpeedGrid = BuildGrid(
+        {node},
+        "ROCK",
+        false,
+        {},
+        1'000'000ULL,
+        look);
+
+    float maximumSingleWave = 0.0F;
+    float maximumVariedWaves = 0.0F;
+    float variedWaveSum = 0.0F;
+    float singleWaveSum = 0.0F;
+    float maximumSpeedVariationDifference = 0.0F;
     float maximumFrontDifference = 0.0F;
-    for (int sampleIndex = 0; sampleIndex < 24; ++sampleIndex) {
-        const float sampleTime = static_cast<float>(sampleIndex) * 0.19F;
-        const auto centre = EvaluateWaterSeepageGridContribution(
-            irregularGrid, {0.0F, 0.0F, -0.35F}, normal, sampleTime);
-        const auto side = EvaluateWaterSeepageGridContribution(
-            irregularGrid, {0.16F, 0.0F, -0.35F}, normal, sampleTime);
-        CHECK(std::isfinite(centre.ripple));
-        CHECK(std::isfinite(side.ripple));
+    for (int timeIndex = 0; timeIndex < 36; ++timeIndex) {
+        const float sampleTime =
+            static_cast<float>(timeIndex) * 0.31F;
+        for (int distanceIndex = 0;
+             distanceIndex < 24;
+             ++distanceIndex) {
+            const float downstream =
+                static_cast<float>(distanceIndex) * 0.06F;
+            const invisible_places::io::Float3 point{
+                0.0F,
+                0.0F,
+                -downstream,
+            };
+            const auto single =
+                EvaluateWaterSeepageGridContribution(
+                    singleWaveGrid,
+                    point,
+                    normal,
+                    sampleTime);
+            const auto varied =
+                EvaluateWaterSeepageGridContribution(
+                    variedWaveGrid,
+                    point,
+                    normal,
+                    sampleTime);
+            const auto uniform =
+                EvaluateWaterSeepageGridContribution(
+                    uniformSpeedGrid,
+                    point,
+                    normal,
+                    sampleTime);
+            CHECK(std::isfinite(single.ripple));
+            CHECK(std::isfinite(varied.ripple));
+            maximumSingleWave =
+                std::max(maximumSingleWave, single.ripple);
+            maximumVariedWaves =
+                std::max(maximumVariedWaves, varied.ripple);
+            singleWaveSum += single.ripple;
+            variedWaveSum += varied.ripple;
+            maximumSpeedVariationDifference = std::max(
+                maximumSpeedVariationDifference,
+                std::abs(varied.ripple - uniform.ripple));
+        }
+        const auto centre =
+            EvaluateWaterSeepageGridContribution(
+                variedWaveGrid,
+                {0.0F, 0.0F, -0.35F},
+                normal,
+                sampleTime);
+        const auto side =
+            EvaluateWaterSeepageGridContribution(
+                variedWaveGrid,
+                {0.16F, 0.0F, -0.35F},
+                normal,
+                sampleTime);
         maximumFrontDifference = std::max(
             maximumFrontDifference,
             std::abs(centre.ripple - side.ripple));
     }
+
+    CHECK(maximumSingleWave < 0.30F);
+    CHECK(maximumVariedWaves > maximumSingleWave + 0.08F);
+    CHECK(variedWaveSum > singleWaveSum * 2.0F);
+    CHECK(maximumSpeedVariationDifference > 1.0e-3F);
     CHECK(maximumFrontDifference > 1.0e-4F);
 }
 

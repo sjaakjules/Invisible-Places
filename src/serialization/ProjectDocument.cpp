@@ -3007,6 +3007,8 @@ json SerializeWaterSeepageLookSettings(const WaterSeepageLookSettings& settings)
         {"pulse_width_meters", settings.pulseWidthMeters},
         {"pulse_speed_meters_per_second", settings.pulseSpeedMetersPerSecond},
         {"pulse_irregularity", settings.pulseIrregularity},
+        {"pulse_wave_count", settings.pulseWaveCount},
+        {"pulse_speed_variation", settings.pulseSpeedVariation},
         {"blend_mode", WaterEffectBlendModeName(settings.blendMode)},
         {"response", SerializeWaterEffectResponseSettings(settings.response)},
     };
@@ -3068,6 +3070,12 @@ WaterSeepageLookSettings ParseWaterSeepageLookSettings(const json& settingsJson)
     settings.pulseIrregularity = settingsJson.value(
         "pulse_irregularity",
         settings.pulseIrregularity);
+    settings.pulseWaveCount = settingsJson.value(
+        "pulse_wave_count",
+        settings.pulseWaveCount);
+    settings.pulseSpeedVariation = settingsJson.value(
+        "pulse_speed_variation",
+        settings.pulseSpeedVariation);
     if (settingsJson.contains("blend_mode")) {
         settings.blendMode = ParseWaterEffectBlendMode(settingsJson.at("blend_mode"));
     }

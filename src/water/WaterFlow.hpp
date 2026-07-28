@@ -253,6 +253,8 @@ struct WaterSeepageLookSettings {
     float pulseWidthMeters = 0.055F;
     float pulseSpeedMetersPerSecond = 0.12F;
     float pulseIrregularity = 0.38F;
+    float pulseWaveCount = 7.0F;
+    float pulseSpeedVariation = 0.55F;
     WaterEffectResponseSettings response{
         .intensity = 0.85F,
         .emissionAdd = 0.35F,

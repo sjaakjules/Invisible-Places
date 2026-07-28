@@ -4207,6 +4207,16 @@ WaterSeepageLookSettings SanitizeSeepageLook(WaterSeepageLookSettings look) {
         SeepageFiniteOr(look.pulseIrregularity, fallback.pulseIrregularity),
         0.0F,
         1.0F);
+    look.pulseWaveCount = std::clamp(
+        SeepageFiniteOr(look.pulseWaveCount, fallback.pulseWaveCount),
+        1.0F,
+        12.0F);
+    look.pulseSpeedVariation = std::clamp(
+        SeepageFiniteOr(
+            look.pulseSpeedVariation,
+            fallback.pulseSpeedVariation),
+        0.0F,
+        1.0F);
     look.response = SanitizeSeepageResponse(look.response, fallback.response);
     return look;
 }
@@ -5280,13 +5290,14 @@ SeepagePatternSignals EvaluateWettingTrickleSeepageSignals(
     };
 }
 
-float SeepagePulseTrain(float coordinateMeters, float spacingMeters, float widthMeters) {
-    const float spacing = std::max(0.005F, spacingMeters);
-    const float width = std::clamp(widthMeters, 0.001F, spacing * 0.49F);
-    const float wrapped =
-        coordinateMeters - std::floor(coordinateMeters / spacing) * spacing;
-    const float distanceToFront = std::min(wrapped, spacing - wrapped);
-    return Clamp01(1.0F - SmoothStep(width * 0.22F, width, distanceToFront));
+float SeepageContourWave(float distanceMeters, float widthMeters) {
+    const float width = std::max(0.001F, widthMeters);
+    return Clamp01(
+        1.0F -
+        SmoothStep(
+            width * 0.15F,
+            width * 2.40F,
+            std::abs(distanceMeters)));
 }
 
 SeepagePatternSignals EvaluateContourPulseSeepageSignals(
@@ -5304,6 +5315,12 @@ SeepagePatternSignals EvaluateContourPulseSeepageSignals(
     const float width = std::clamp(look.pulseWidthMeters, 0.001F, spacing * 0.49F);
     const float speed = std::max(0.0F, look.pulseSpeedMetersPerSecond);
     const float irregularity = Clamp01(look.pulseIrregularity);
+    const int waveCount = std::clamp(
+        static_cast<int>(std::lround(look.pulseWaveCount)),
+        1,
+        12);
+    const float speedVariation =
+        Clamp01(look.pulseSpeedVariation);
     const float time = std::max(0.0F, timeSeconds);
     const float downstream = std::max(0.0F, fan.downDistance);
     const float lateralNormalised = std::clamp(
@@ -5312,44 +5329,94 @@ SeepagePatternSignals EvaluateContourPulseSeepageSignals(
         1.5F);
     const std::uint32_t proceduralSeed = node.seed ^ (node.id * 0x9e3779b9U);
 
-    // Sample stable world-space noise once. The connected downstream metric
-    // supplies the dominant coordinate; noise only wrinkles the front and
-    // varies its local speed, so pulses cannot turn into sideways bands.
-    glm::vec3 coordinate = node.noiseRotation * (position / (spacing * 1.65F));
-    coordinate += glm::vec3{0.017F, -0.013F, 0.011F} * (time * look.evolution);
+    // The surface field is stationary. Only independently launched fronts
+    // move over it, avoiding the sliding-texture look produced by advecting
+    // the complete noise domain down the support.
+    const glm::vec3 coordinate =
+        node.noiseRotation *
+        (position / (spacing * 1.65F));
     const auto frontNoise = SeepageFractalNoise3(
         coordinate,
         proceduralSeed + 17431U,
         node.resolvedQuality);
     const float centredNoise = frontNoise.value * 2.0F - 1.0F;
-    const float bowedFront =
+    const float baseBowedFront =
         std::pow(std::abs(lateralNormalised), 1.35F) *
         spacing * (0.10F + irregularity * 0.28F);
-    const float frontWarp =
-        centredNoise * spacing * irregularity * 0.42F;
-    const float warpedDownstream = downstream + bowedFront + frontWarp;
+    const float supportSpan = std::max(
+        std::max(0.005F, fan.effectiveReach) + width * 5.0F,
+        spacing * 2.5F);
+    float accumulatedWaves = 0.0F;
+    for (int waveIndex = 0; waveIndex < waveCount; ++waveIndex) {
+        const float speedHash = SeepageHash01(
+            waveIndex,
+            11,
+            proceduralSeed + 19009U);
+        const float startHash = SeepageHash01(
+            waveIndex,
+            23,
+            proceduralSeed + 27143U);
+        const float widthHash = SeepageHash01(
+            waveIndex,
+            37,
+            proceduralSeed + 31847U);
+        const float shapeHash = SeepageHash01(
+            waveIndex,
+            53,
+            proceduralSeed + 45119U);
+        const float amplitudeHash = SeepageHash01(
+            waveIndex,
+            71,
+            proceduralSeed + 57203U);
 
-    // Two softly blended trains use slightly different local speeds. Their
-    // crossing fronts split and reconnect without requiring any per-point
-    // state or per-frame topology work.
-    const float primarySpeed =
-        speed * (1.0F + centredNoise * irregularity * 0.09F);
-    const float secondarySpeed =
-        speed * (1.06F - centredNoise * irregularity * 0.075F);
-    const float seedPhase = SeepageHash01(
-        static_cast<std::int32_t>(node.id),
-        static_cast<std::int32_t>(node.seed),
-        proceduralSeed + 19009U);
-    const float primaryPulse = SeepagePulseTrain(
-        warpedDownstream - time * primarySpeed,
-        spacing,
-        width);
-    const float secondaryPulse = SeepagePulseTrain(
-        downstream + bowedFront * 0.62F - frontWarp * 0.55F -
-            time * secondarySpeed + spacing * (0.34F + seedPhase * 0.20F),
-        spacing * 1.23F,
-        width * 1.18F);
-    const float pulse = std::max(primaryPulse, secondaryPulse * 0.58F);
+        const float waveSpeed = speed * std::max(
+            0.15F,
+            1.0F +
+                (speedHash * 2.0F - 1.0F) *
+                    speedVariation);
+        const float idleGap =
+            std::max(spacing * (0.45F + shapeHash * 0.55F),
+                     width * 4.0F);
+        const float cycleDistance = supportSpan + idleGap;
+        // A stable random phase is equivalent to a random launch time. Each
+        // lane also has its own cycle and speed, so faster waves genuinely
+        // catch and reinforce slower ones rather than translating one mask.
+        const float travel =
+            std::fmod(
+                time * waveSpeed +
+                    startHash * cycleDistance,
+                cycleDistance) -
+            idleGap;
+        const float waveWidth =
+            width * (0.72F + widthHash * 0.78F);
+        const float shapeSign =
+            shapeHash < 0.5F ? -1.0F : 1.0F;
+        const float frontWarp =
+            centredNoise * spacing * irregularity *
+            (0.14F + shapeHash * 0.24F) * shapeSign;
+        const float slowShapeChange =
+            std::sin(
+                time * look.evolution *
+                    (0.15F + widthHash * 0.25F) +
+                shapeHash * kSeepageTwoPi) *
+            width * irregularity * 0.55F;
+        const float distanceToWave =
+            downstream +
+            baseBowedFront * (0.72F + shapeHash * 0.46F) +
+            frontWarp + slowShapeChange - travel;
+        const float wave =
+            SeepageContourWave(distanceToWave, waveWidth);
+        const float amplitude =
+            (0.58F + amplitudeHash * 0.42F) *
+            std::lerp(0.82F, 1.16F, frontNoise.value);
+        accumulatedWaves += wave * amplitude;
+    }
+    // One broad wave is intentionally subtle. Catch-up overlap ramps much
+    // faster, producing local high-intensity regions without hard bands.
+    const float pulse = Clamp01(
+        accumulatedWaves * 0.22F +
+        std::max(0.0F, accumulatedWaves - 0.90F) *
+            0.42F);
 
     const float coverageThreshold = 0.72F - density * 0.38F;
     const float dampPatch = SmoothStep(
@@ -5367,17 +5434,18 @@ SeepagePatternSignals EvaluateContourPulseSeepageSignals(
         worldGradient,
         environmentDirection,
         viewContext,
-        std::max(pulse, dampPatch * 0.35F));
+        std::max(pulse, dampPatch * 0.15F));
     const float strengthMask = fan.mask;
     return {
         .damp = Clamp01(
             strengthMask * wetness *
-            (0.54F + dampPatch * 0.25F + pulse * (0.18F + rainGain * 0.08F))),
+            (0.06F + dampPatch * 0.10F +
+             pulse * (0.76F + rainGain * 0.12F))),
         .variation = Clamp01(
-            strengthMask * pulse * (0.32F + dampPatch * 0.30F)),
+            strengthMask * pulse * (0.30F + dampPatch * 0.24F)),
         .glint = Clamp01(
             strengthMask *
-            (pulse * 0.72F + dampPatch * 0.18F) *
+            (0.015F + pulse * 0.78F + dampPatch * 0.06F) *
             look.glisten * reflection),
     };
 }
@@ -5608,6 +5676,14 @@ WaterSeepageLookSettings LerpSeepageLook(
     result.pulseIrregularity = std::lerp(
         left.pulseIrregularity,
         right.pulseIrregularity,
+        amount);
+    result.pulseWaveCount = std::lerp(
+        left.pulseWaveCount,
+        right.pulseWaveCount,
+        amount);
+    result.pulseSpeedVariation = std::lerp(
+        left.pulseSpeedVariation,
+        right.pulseSpeedVariation,
         amount);
     result.response = LerpSeepageResponse(left.response, right.response, amount);
     result.blendMode = amount < 0.5F ? left.blendMode : right.blendMode;
@@ -8487,7 +8563,7 @@ std::string WaterSeepageTopologyFingerprint(const WaterSeepageSpatialGrid& grid)
 
 std::string WaterSeepageParamsFingerprint(const WaterSeepageSpatialGrid& grid) {
     std::uint64_t hash = 1469598103934665603ULL;
-    SeepageFingerprintU32(&hash, 6U);
+    SeepageFingerprintU32(&hash, 7U);
     const auto fingerprintLook = [&](const WaterSeepageLookSettings& look) {
         SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(look.pattern));
         SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(look.blendMode));
@@ -8513,6 +8589,8 @@ std::string WaterSeepageParamsFingerprint(const WaterSeepageSpatialGrid& grid) {
         SeepageFingerprintFloat(&hash, look.pulseWidthMeters);
         SeepageFingerprintFloat(&hash, look.pulseSpeedMetersPerSecond);
         SeepageFingerprintFloat(&hash, look.pulseIrregularity);
+        SeepageFingerprintFloat(&hash, look.pulseWaveCount);
+        SeepageFingerprintFloat(&hash, look.pulseSpeedVariation);
         SeepageFingerprintFloat(&hash, look.rainResponse);
         SeepageFingerprintFloat(&hash, look.response.intensity);
         SeepageFingerprintFloat(&hash, look.response.emissionAdd);
