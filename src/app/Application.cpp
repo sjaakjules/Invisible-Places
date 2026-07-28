@@ -462,6 +462,7 @@ struct AnimationPlaybackState {
     bool active = false;
     AnimationPath path{};
     float durationSeconds = 3.0F;
+    float startPosition = 0.0F;
     std::chrono::steady_clock::time_point startedAt{};
 };
 
@@ -5382,6 +5383,8 @@ struct RangedFloatControlConfig {
     float visualMax = 1.0F;
     const char* format = "%.3f";
     float speed = 0.0F;
+    bool showLabel = true;
+    bool scaleDragToWidth = false;
     std::optional<float> hardMin = std::nullopt;
     std::optional<float> hardMax = std::nullopt;
 };
@@ -5439,7 +5442,6 @@ bool DrawRangedFloatControl(const char* label, float* value, const RangedFloatCo
     const float visualMin = std::min(config.visualMin, config.visualMax);
     const float visualMax = std::max(config.visualMin, config.visualMax);
     const float visualRange = std::max(visualMax - visualMin, 1.0e-6F);
-    const float dragSpeed = config.speed > 0.0F ? config.speed : visualRange / 200.0F;
     static ImGuiID editingControlId = 0;
     static ImGuiID focusEditingControlId = 0;
     static ImGuiID activeDragId = 0;
@@ -5451,13 +5453,22 @@ bool DrawRangedFloatControl(const char* label, float* value, const RangedFloatCo
 
     ImGui::PushID(label);
     const ImGuiID controlId = ImGui::GetID("##range");
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted(label);
-    ImGui::SameLine();
+    if (config.showLabel) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(label);
+        ImGui::SameLine();
+    }
 
     const ImGuiStyle& style = ImGui::GetStyle();
     const float barWidth = std::max(110.0F, ImGui::GetContentRegionAvail().x);
     const float frameHeight = ImGui::GetFrameHeight();
+    const float dragSpeed =
+        config.speed > 0.0F
+            ? config.speed
+            : visualRange /
+                  (config.scaleDragToWidth
+                       ? std::max(1.0F, barWidth)
+                       : 200.0F);
 
     if (editingControlId == controlId) {
         float inputValue = *value;
@@ -22867,10 +22878,19 @@ void StartAnimationPlayback(PreviewRuntimeState* runtimeState) {
         return;
     }
 
+    constexpr float kAnimationEndTolerance = 1.0e-4F;
+    const float currentPosition =
+        std::clamp(runtimeState->animationPanel.scrubAmount, 0.0F, 1.0F);
+    const float startPosition =
+        currentPosition >= 1.0F - kAnimationEndTolerance
+            ? 0.0F
+            : currentPosition;
+    runtimeState->animationPanel.scrubAmount = startPosition;
     runtimeState->animationPlayback = {
         .active = true,
         .path = path,
         .durationSeconds = AnimationDurationSeconds(path),
+        .startPosition = startPosition,
         .startedAt = std::chrono::steady_clock::now(),
     };
     runtimeState->cameraPlayback.active = false;
@@ -22886,6 +22906,17 @@ void StopAnimationPlayback(PreviewRuntimeState* runtimeState) {
     runtimeState->animationPlayback.active = false;
     if (!runtimeState->animationPanel.previewDepthOfField) {
         SetCameraDepthOfFieldEnabled(runtimeState, false);
+    }
+}
+
+void ToggleAnimationPlayback(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    if (runtimeState->animationPlayback.active) {
+        StopAnimationPlayback(runtimeState);
+    } else {
+        StartAnimationPlayback(runtimeState);
     }
 }
 
@@ -22921,11 +22952,7 @@ bool DrawAnimationScrubControl(PreviewRuntimeState* runtimeState) {
     }
     ImGui::SameLine();
     if (ImGui::Button(runtimeState->animationPlayback.active ? "Stop Playback" : "Play")) {
-        if (runtimeState->animationPlayback.active) {
-            StopAnimationPlayback(runtimeState);
-        } else {
-            StartAnimationPlayback(runtimeState);
-        }
+        ToggleAnimationPlayback(runtimeState);
     }
     return scrubChanged;
 }
@@ -22938,13 +22965,36 @@ void UpdateAnimationPlayback(PreviewRuntimeState* runtimeState) {
     const auto& playback = runtimeState->animationPlayback;
     const float elapsedSeconds =
         std::chrono::duration<float>(std::chrono::steady_clock::now() - playback.startedAt).count();
-    const float t = std::clamp(elapsedSeconds / std::max(0.001F, playback.durationSeconds), 0.0F, 1.0F);
+    const float t = std::clamp(
+        playback.startPosition +
+            elapsedSeconds /
+                std::max(0.001F, playback.durationSeconds),
+        0.0F,
+        1.0F);
     runtimeState->animationPanel.scrubAmount = t;
     ApplyAnimationEvaluation(runtimeState, playback.path, t, true);
 
     if (t >= 1.0F) {
         StopAnimationPlayback(runtimeState);
         runtimeState->statusMessage = "Animation playback complete.";
+    }
+}
+
+void HandleAnimationPlaybackShortcut(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr ||
+        !runtimeState->animationPanel.currentPath.has_value()) {
+        return;
+    }
+    const auto& io = ImGui::GetIO();
+    if (io.KeyCtrl || io.KeyAlt || io.KeyShift || io.KeySuper ||
+        io.WantTextInput || ImGui::IsAnyItemActive() ||
+        ImGui::IsPopupOpen(
+            static_cast<const char*>(nullptr),
+            ImGuiPopupFlags_AnyPopupId)) {
+        return;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
+        ToggleAnimationPlayback(runtimeState);
     }
 }
 
@@ -38231,27 +38281,14 @@ void DrawWaterSourceList(
             if (timeline == nullptr) {
                 return;
             }
-            std::optional<float> previous;
-            std::optional<float> next;
-            for (const auto& setting : timeline->settings) {
-                if (const auto candidate =
-                        invisible_places::water::
-                            PreviousWaterSettingKeyPosition(
-                                setting,
-                                scrubPosition);
-                    candidate.has_value() &&
-                    (!previous.has_value() || *candidate > *previous)) {
-                    previous = candidate;
-                }
-                if (const auto candidate =
-                        invisible_places::water::NextWaterSettingKeyPosition(
-                            setting,
-                            scrubPosition);
-                    candidate.has_value() &&
-                    (!next.has_value() || *candidate < *next)) {
-                    next = candidate;
-                }
-            }
+            const auto previous =
+                invisible_places::water::PreviousWaterFeatureKeyPosition(
+                    *timeline,
+                    scrubPosition);
+            const auto next =
+                invisible_places::water::NextWaterFeatureKeyPosition(
+                    *timeline,
+                    scrubPosition);
             ImGui::SameLine();
             ImGui::BeginDisabled(!previous.has_value());
             if (ImGui::SmallButton("<")) {
@@ -41631,6 +41668,7 @@ void DrawWaterPanel(
             ImGui::BeginDisabled();
         }
         water.activeRegionFeature = WaterRegionFeature::Ripple;
+        water.activeKeyingFeature.reset();
         DrawWaterRipplesPanel(runtimeState, viewport);
         if (!analysisReady) {
             ImGui::EndDisabled();
@@ -42799,6 +42837,7 @@ void DrawWaterPanel(
             ImGui::BeginDisabled();
         }
         water.activeRegionFeature = WaterRegionFeature::Field;
+        water.activeKeyingFeature.reset();
         DrawWaterFieldPanel(runtimeState, viewport);
         if (!analysisReady) {
             ImGui::EndDisabled();
@@ -44579,51 +44618,35 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
         std::max(0.0F, AnimationDurationSeconds(panel.currentPath.value()));
     const std::string timeLabel =
         FormatFixed(panel.scrubAmount * durationSeconds, 1) + "s";
-    const float playWidth = ImGui::CalcTextSize("Stop").x +
-                            ImGui::GetStyle().FramePadding.x * 2.0F;
-    const float timeWidth = ImGui::CalcTextSize("000.0s").x;
-    const float spacing = ImGui::GetStyle().ItemSpacing.x;
-    ImGui::PushItemWidth(std::max(
-        120.0F,
-        ImGui::GetContentRegionAvail().x - playWidth - timeWidth -
-            spacing * 2.0F));
     const bool scrubChanged = DrawRangedFloatControl(
-        "##GlobalAnimationPosition",
+        "GlobalAnimationPosition",
         &panel.scrubAmount,
         {.visualMin = 0.0F,
          .visualMax = 1.0F,
          .format = "%.3f",
+         .showLabel = false,
+         .scaleDragToWidth = true,
          .hardMin = 0.0F,
          .hardMax = 1.0F});
-    ImGui::PopItemWidth();
     const ImVec2 barMin = ImGui::GetItemRectMin();
     const ImVec2 barMax = ImGui::GetItemRectMax();
-    ImGui::SameLine();
-    ImGui::TextDisabled("%s", timeLabel.c_str());
-    ImGui::SameLine();
-    if (ImGui::SmallButton(
-            runtimeState->animationPlayback.active ? "Stop" : "Play")) {
-        if (runtimeState->animationPlayback.active) {
-            StopAnimationPlayback(runtimeState);
-        } else {
-            StartAnimationPlayback(runtimeState);
-        }
-    }
     if (scrubChanged) {
         ApplyAnimationScrub(runtimeState);
     }
 
     const auto& feature = runtimeState->water.activeKeyingFeature;
+    const invisible_places::water::WaterFeatureTimingRun* run = nullptr;
+    const invisible_places::water::WaterFeatureTimeline* timeline = nullptr;
     if (feature.has_value()) {
         const auto* entry = FindScenarioFeatureRuns(
             runtimeState->water,
             ActiveWaterTimingScenarioId(*runtimeState));
         if (entry != nullptr) {
-            const auto* run =
+            run =
                 invisible_places::water::FindWaterFeatureRunContaining(
                     entry->runs,
                     feature.value());
-            const auto* timeline =
+            timeline =
                 invisible_places::water::FindWaterFeatureTimeline(
                     run,
                     feature.value());
@@ -44637,6 +44660,108 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
             }
         }
     }
+
+    const float scrubPosition = std::clamp(panel.scrubAmount, 0.0F, 1.0F);
+    const auto previous =
+        timeline != nullptr
+            ? invisible_places::water::PreviousWaterFeatureKeyPosition(
+                  *timeline,
+                  scrubPosition)
+            : std::nullopt;
+    const auto next =
+        timeline != nullptr
+            ? invisible_places::water::NextWaterFeatureKeyPosition(
+                  *timeline,
+                  scrubPosition)
+            : std::nullopt;
+    const bool hasKeyedSettings =
+        timeline != nullptr &&
+        std::any_of(
+            timeline->settings.begin(),
+            timeline->settings.end(),
+            [](const auto& setting) { return !setting.keys.empty(); });
+    const std::string featureLabel =
+        feature.has_value()
+            ? WaterKeyedFeatureDisplayLabel(*runtimeState, *feature)
+            : std::string{};
+    const auto buttonTooltip = [](const char* text) {
+        if (ImGui::IsItemHovered(
+                ImGuiHoveredFlags_DelayNormal |
+                ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("%s", text);
+        }
+    };
+
+    ImGui::PushID("GlobalAnimationTransport");
+    if (ImGui::SmallButton("|<")) {
+        panel.scrubAmount = 0.0F;
+        ApplyAnimationScrub(runtimeState);
+    }
+    buttonTooltip("Go back to the start of the loaded animation.");
+
+    ImGui::SameLine();
+    const bool playbackAvailable = panel.currentPath->keys.size() >= 2U;
+    ImGui::BeginDisabled(!playbackAvailable);
+    if (ImGui::SmallButton(
+            runtimeState->animationPlayback.active ? "Stop" : "Play")) {
+        ToggleAnimationPlayback(runtimeState);
+    }
+    ImGui::EndDisabled();
+    buttonTooltip(
+        playbackAvailable
+            ? (runtimeState->animationPlayback.active
+                   ? "Stop animation playback. Shortcut: Space."
+                   : "Play the loaded animation from the current position. Shortcut: Space.")
+            : "Playback requires a loaded animation with at least two camera keys.");
+
+    const float navigationGap = ImGui::GetStyle().ItemSpacing.x * 3.0F;
+    ImGui::SameLine(0.0F, navigationGap);
+    ImGui::BeginDisabled(!previous.has_value());
+    if (ImGui::SmallButton("<")) {
+        panel.scrubAmount = previous.value();
+        ApplyAnimationScrub(runtimeState);
+    }
+    ImGui::EndDisabled();
+    const std::string previousTooltip =
+        !feature.has_value()
+            ? "Select a keyable feature in the Water tab to navigate its settings."
+            : !hasKeyedSettings
+                  ? featureLabel + " has no keyed settings."
+                  : !previous.has_value()
+                        ? "There is no earlier keyed setting for " +
+                              featureLabel + "."
+                        : "Go to the previous keyed setting for " +
+                              featureLabel + ".";
+    buttonTooltip(previousTooltip.c_str());
+
+    ImGui::SameLine(0.0F, 2.0F);
+    ImGui::BeginDisabled(!next.has_value());
+    if (ImGui::SmallButton(">")) {
+        panel.scrubAmount = next.value();
+        ApplyAnimationScrub(runtimeState);
+    }
+    ImGui::EndDisabled();
+    const std::string nextTooltip =
+        !feature.has_value()
+            ? "Select a keyable feature in the Water tab to navigate its settings."
+            : !hasKeyedSettings
+                  ? featureLabel + " has no keyed settings."
+                  : !next.has_value()
+                        ? "There is no later keyed setting for " +
+                              featureLabel + "."
+                        : "Go to the next keyed setting for " +
+                              featureLabel + ".";
+    buttonTooltip(nextTooltip.c_str());
+
+    ImGui::SameLine();
+    const float timeWidth = ImGui::CalcTextSize(timeLabel.c_str()).x;
+    const float timeCursorX =
+        std::max(
+            ImGui::GetCursorPosX(),
+            ImGui::GetWindowContentRegionMax().x - timeWidth);
+    ImGui::SetCursorPosX(timeCursorX);
+    ImGui::TextDisabled("%s", timeLabel.c_str());
+    ImGui::PopID();
     ImGui::Spacing();
 }
 
@@ -44676,6 +44801,11 @@ void DrawControlsWindow(
     const std::string fpsLabel =
         "Render FPS (" + FormatFixed(diagnostics.frameAverageWindowSeconds, 1) + "s): " +
         FormatFixed(renderFps, 1) + "  " + previewStatus;
+    if (runtimeState->animationPanel.currentPath.has_value()) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Global Animation Position");
+        ImGui::SameLine();
+    }
     const float fpsLabelWidth = ImGui::CalcTextSize(fpsLabel.c_str()).x;
     const float fpsCursorX =
         std::max(ImGui::GetCursorPosX(), ImGui::GetWindowContentRegionMax().x - fpsLabelWidth);
@@ -53057,6 +53187,41 @@ int RunWaterIntegrationSmoke(
     }
 
     InstallWaterIntegrationScenario(runtimeState);
+    runtimeState->animationPanel.scrubAmount = 0.35F;
+    StartAnimationPlayback(runtimeState);
+    const bool playbackStartedFromCurrent =
+        runtimeState->animationPlayback.active &&
+        std::abs(runtimeState->animationPlayback.startPosition - 0.35F) <=
+            1.0e-5F &&
+        std::abs(runtimeState->animationPanel.scrubAmount - 0.35F) <=
+            1.0e-5F;
+    const float stoppedPosition =
+        runtimeState->animationPanel.scrubAmount;
+    StopAnimationPlayback(runtimeState);
+    const bool playbackStopPreservedPosition =
+        !runtimeState->animationPlayback.active &&
+        std::abs(
+            runtimeState->animationPanel.scrubAmount -
+            stoppedPosition) <= 1.0e-5F;
+    runtimeState->animationPanel.scrubAmount = 1.0F;
+    StartAnimationPlayback(runtimeState);
+    const bool playbackRestartedAtEnd =
+        runtimeState->animationPlayback.active &&
+        std::abs(runtimeState->animationPlayback.startPosition) <=
+            1.0e-5F &&
+        std::abs(runtimeState->animationPanel.scrubAmount) <= 1.0e-5F;
+    StopAnimationPlayback(runtimeState);
+    if (playbackStartedFromCurrent &&
+        playbackStopPreservedPosition &&
+        playbackRestartedAtEnd) {
+        report.Pass(
+            "Animation transport starts from the current position, preserves "
+            "the stopped position, and restarts from zero at the end.");
+    } else {
+        report.Fail(
+            "Animation transport did not preserve start/stop/end position "
+            "semantics.");
+    }
     runtimeState->water.dynamicMeshFlowSettings.enabled = true;
     runtimeState->water.dynamicMeshFlowSettings.showTrails = true;
     runtimeState->water.dynamicMeshFlowSettings.automaticSources = true;
@@ -53892,6 +54057,7 @@ int Application::Run(ApplicationRunOptions options) const {
             DrawLoadingOverlay(runtimeState);
             DrawOfflineRenderOverlay(&runtimeState);
             if (!pauseLiveViewport) {
+                HandleAnimationPlaybackShortcut(&runtimeState);
                 DrawAnimationViewportOverlay(&runtimeState, viewport.value());
                 DrawWaterRegionOverlay(&runtimeState, viewport.value());
                 DrawWaterRegionPointPreviewOverlay(&runtimeState, viewport.value());

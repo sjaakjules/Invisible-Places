@@ -550,6 +550,51 @@ TEST_CASE("Adding a key between keys preserves surrounding blends and order",
     CHECK_FALSE(NextWaterSettingKeyPosition(track, 0.40F).has_value());
 }
 
+TEST_CASE("Feature key navigation finds the nearest key across every setting",
+          "[water][timing][keyed][navigation]") {
+    using Catch::Approx;
+    using invisible_places::water::NextWaterFeatureKeyPosition;
+    using invisible_places::water::PreviousWaterFeatureKeyPosition;
+    using invisible_places::water::WaterFeatureTimeline;
+
+    WaterFeatureTimeline timeline;
+    CHECK_FALSE(PreviousWaterFeatureKeyPosition(timeline, 0.5F).has_value());
+    CHECK_FALSE(NextWaterFeatureKeyPosition(timeline, 0.5F).has_value());
+
+    timeline.settings = {
+        {.settingId = "activity",
+         .keys = {
+             {.position = 0.10F, .value = 0.0F},
+             {.position = 0.50F, .value = 1.0F},
+             {.position = 0.90F, .value = 0.0F},
+         }},
+        {.settingId = "prominence",
+         .keys = {
+             {.position = 0.25F, .value = 0.5F},
+             {.position = 0.60F, .value = 1.5F},
+         }},
+        {.settingId = "empty"},
+    };
+
+    CHECK(PreviousWaterFeatureKeyPosition(timeline, 0.55F).value() ==
+          Approx(0.50F));
+    CHECK(NextWaterFeatureKeyPosition(timeline, 0.55F).value() ==
+          Approx(0.60F));
+    CHECK(PreviousWaterFeatureKeyPosition(timeline, 0.50F).value() ==
+          Approx(0.25F));
+    CHECK(NextWaterFeatureKeyPosition(timeline, 0.50F).value() ==
+          Approx(0.60F));
+    CHECK_FALSE(
+        PreviousWaterFeatureKeyPosition(timeline, 0.10F).has_value());
+    CHECK_FALSE(NextWaterFeatureKeyPosition(timeline, 0.90F).has_value());
+
+    // Positions within the replacement tolerance count as the current key.
+    CHECK(PreviousWaterFeatureKeyPosition(timeline, 0.50005F).value() ==
+          Approx(0.25F));
+    CHECK(NextWaterFeatureKeyPosition(timeline, 0.50005F).value() ==
+          Approx(0.60F));
+}
+
 TEST_CASE("Feature timing overlay samples every keyed setting and drives scenario channels",
           "[water][timing][keyed][overlay]") {
     using Catch::Approx;

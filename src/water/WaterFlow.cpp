@@ -7081,6 +7081,36 @@ std::optional<float> NextWaterSettingKeyPosition(
     return best;
 }
 
+std::optional<float> PreviousWaterFeatureKeyPosition(
+    const WaterFeatureTimeline& timeline,
+    float position) {
+    std::optional<float> best;
+    for (const auto& setting : timeline.settings) {
+        const auto candidate =
+            PreviousWaterSettingKeyPosition(setting, position);
+        if (candidate.has_value() &&
+            (!best.has_value() || *candidate > *best)) {
+            best = candidate;
+        }
+    }
+    return best;
+}
+
+std::optional<float> NextWaterFeatureKeyPosition(
+    const WaterFeatureTimeline& timeline,
+    float position) {
+    std::optional<float> best;
+    for (const auto& setting : timeline.settings) {
+        const auto candidate =
+            NextWaterSettingKeyPosition(setting, position);
+        if (candidate.has_value() &&
+            (!best.has_value() || *candidate < *best)) {
+            best = candidate;
+        }
+    }
+    return best;
+}
+
 const float* WaterFeatureTimingOverlay::Find(
     const WaterKeyedFeatureId& feature,
     std::string_view settingId) const {

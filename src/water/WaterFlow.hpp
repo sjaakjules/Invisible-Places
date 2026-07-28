@@ -506,6 +506,12 @@ void AddOrUpdateWaterSettingKey(
 [[nodiscard]] std::optional<float> NextWaterSettingKeyPosition(
     const WaterKeyedSettingTrack& track,
     float position);
+[[nodiscard]] std::optional<float> PreviousWaterFeatureKeyPosition(
+    const WaterFeatureTimeline& timeline,
+    float position);
+[[nodiscard]] std::optional<float> NextWaterFeatureKeyPosition(
+    const WaterFeatureTimeline& timeline,
+    float position);
 
 struct WaterFeatureTimingSampleEntry {
     WaterKeyedFeatureId feature{};
