@@ -24,6 +24,7 @@ from typing import Any
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_SCHEMA_VERSION = 47
 DEFAULT_MAIN_PROJECT = REPOSITORY_ROOT / "Saved" / "exhibitionScene_project.json"
 DEFAULT_FIXTURE = REPOSITORY_ROOT / "tests" / "fixtures" / "sample_scene_water_sources.json"
 DEFAULT_VALIDATION_PROJECT = (
@@ -325,7 +326,7 @@ def authored_state(
 
 
 def migrate_main_project(project: dict[str, Any]) -> dict[str, Any]:
-    project["schema_version"] = 46
+    project["schema_version"] = PROJECT_SCHEMA_VERSION
     upgrade_water_contract(project, project=True)
     state = authored_state(project, required=False)
     if state is not None:
@@ -538,7 +539,7 @@ def build_validation_project(
     project: dict[str, Any], fixture: dict[str, Any]
 ) -> dict[str, Any]:
     validation = copy.deepcopy(project)
-    validation["schema_version"] = 46
+    validation["schema_version"] = PROJECT_SCHEMA_VERSION
     upgrade_water_contract(validation, project=True)
     validation["project_name"] = "SampleScene Validation"
     validation["active_water_scene_group"] = "SampleScene"

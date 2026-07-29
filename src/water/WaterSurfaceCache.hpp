@@ -222,6 +222,11 @@ struct WaterSurfaceCachePayloadChecksum {
     bool operator==(const WaterSurfaceCachePayloadChecksum&) const = default;
 };
 
+enum class WaterSurfaceCacheLoadValidation : std::uint8_t {
+    Complete = 0U,
+    DeferGpuPayloadToUpload = 1U,
+};
+
 // A chunk-boundary-independent checksum used while schema-3/4 GPU table bytes
 // move directly from the sidecar into the mapped staging allocation. Keeping
 // this tiny builder shared by the loader and renderer lets the renderer reject
@@ -319,9 +324,11 @@ private:
 };
 
 // A schema-3/4 warm load keeps the queryable CPU aggregates resident but leaves
-// the already-built GPU tables in the validated sidecar. The renderer reads
-// these contiguous sections directly through its reusable 64 MiB staging
-// allocation, avoiding another cache-sized CPU table allocation.
+// the already-built GPU tables in the checked sidecar. Complete loads validate
+// those tables immediately; application warm loads can instead carry the CPU
+// checksum prefix so the renderer completes validation during its single
+// bounded staging read, avoiding both a second disk pass and a cache-sized CPU
+// table allocation.
 struct WaterSurfacePersistedGpuTables {
     std::filesystem::path filePath;
     std::uint64_t fileSize = 0U;
@@ -335,11 +342,19 @@ struct WaterSurfacePersistedGpuTables {
     std::uint64_t flowSurfaceCount = 0U;
     std::uint64_t groundCount = 0U;
     WaterSurfaceCachePayloadChecksum streamChecksum;
+    // Warm application loads can avoid reading the GPU tables twice. The
+    // background loader verifies the resident CPU prefix and the persisted
+    // trailer, then the renderer resumes this exact checksum while streaming
+    // the GPU bytes into its bounded staging buffer.
+    WaterSurfaceGpuStreamChecksumBuilder payloadChecksumPrefix;
+    bool payloadValidationDeferred = false;
 
     [[nodiscard]] bool Valid() const {
         return !filePath.empty() && fileSize > 0U && surfaceCount > 0U &&
                vegetationCount > 0U && flowSurfaceCount > 0U &&
-               streamChecksum.Valid();
+               (streamChecksum.Valid() ||
+                (payloadValidationDeferred &&
+                 payloadChecksumPrefix.Finish().Valid()));
     }
 
     [[nodiscard]] bool GroundValid() const {
@@ -439,7 +454,9 @@ struct WaterGroundQueryResult {
 [[nodiscard]] WaterSurfaceBuildResult BuildWaterSurfaceCache(
     std::span<const WaterSurfaceSource> sources,
     const std::filesystem::path& cacheRoot = {},
-    const std::atomic_bool* cancelRequested = nullptr);
+    const std::atomic_bool* cancelRequested = nullptr,
+    WaterSurfaceCacheLoadValidation loadValidation =
+        WaterSurfaceCacheLoadValidation::Complete);
 [[nodiscard]] WaterSurfaceCache BuildWaterSurfaceCacheFromSamples(
     std::span<const WaterSurfaceSample> samples,
     float resolutionMeters = kWaterSurfaceResolutionMeters);
@@ -452,7 +469,9 @@ struct WaterGroundQueryResult {
     std::string_view expectedSignature,
     WaterSurfaceCache* cache,
     std::string* errorMessage = nullptr,
-    WaterSurfaceBuildDiagnostics* diagnostics = nullptr);
+    WaterSurfaceBuildDiagnostics* diagnostics = nullptr,
+    WaterSurfaceCacheLoadValidation validation =
+        WaterSurfaceCacheLoadValidation::Complete);
 [[nodiscard]] WaterSurfaceGpuData BuildWaterSurfaceGpuData(
     const WaterSurfaceCache& cache);
 [[nodiscard]] WaterSurfaceCacheIdentity BuildWaterSurfaceCacheIdentity(

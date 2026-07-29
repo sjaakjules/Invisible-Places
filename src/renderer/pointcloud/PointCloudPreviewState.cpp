@@ -724,6 +724,19 @@ PointCloudMaterialVariant ResolvePointCloudMaterialVariant(const PointCloudStyle
 PointCloudMaterialVariant ResolvePointCloudMaterialVariant(
     const PointCloudStyleState& style,
     PointCloudDensityCompensation densityCompensation) {
+    return ResolvePointCloudMaterialVariant(
+        style,
+        densityCompensation,
+        false);
+}
+
+PointCloudMaterialVariant ResolvePointCloudMaterialVariant(
+    const PointCloudStyleState& style,
+    PointCloudDensityCompensation densityCompensation,
+    bool requiresUnifiedProceduralEffects) {
+    if (requiresUnifiedProceduralEffects) {
+        return PointCloudMaterialVariant::Unified;
+    }
     densityCompensation = SanitizePointCloudDensityCompensation(densityCompensation);
     if (densityCompensation.coverageCorrection != 1.0F) {
         return PointCloudMaterialVariant::Unified;

@@ -131,6 +131,165 @@ TEST_CASE("Seepage defaults describe a subtle damp fan", "[water][seepage][defau
     CHECK(node.targetSceneRoles[1] == "VEG");
 }
 
+TEST_CASE("Scalar keyed profile values update look and response fields safely",
+          "[water][seepage][timing][profiles]") {
+    using Catch::Approx;
+    using invisible_places::water::
+        ApplyWaterSeepageLookTimingValue;
+
+    WaterSeepageLookSettings look;
+    REQUIRE(
+        ApplyWaterSeepageLookTimingValue(
+            &look,
+            "look.pulse_speed",
+            0.42F));
+    REQUIRE(
+        ApplyWaterSeepageLookTimingValue(
+            &look,
+            "response.emission_add",
+            1.75F));
+    REQUIRE(
+        ApplyWaterSeepageLookTimingValue(
+            &look,
+            "response.colourise_blue",
+            0.21F));
+    CHECK(
+        look.pulseSpeedMetersPerSecond ==
+        Approx(0.42F));
+    CHECK(look.response.emissionAdd == Approx(1.75F));
+    CHECK(look.response.colouriseBlue == Approx(0.21F));
+
+    REQUIRE(
+        ApplyWaterSeepageLookTimingValue(
+            &look,
+            "look.pulse_wave_count",
+            99.0F));
+    CHECK(look.pulseWaveCount == Approx(12.0F));
+    CHECK_FALSE(
+        ApplyWaterSeepageLookTimingValue(
+            &look,
+            "look.not_a_setting",
+            1.0F));
+    CHECK_FALSE(
+        ApplyWaterSeepageLookTimingValue(
+            nullptr,
+            "look.density",
+            0.5F));
+}
+
+TEST_CASE("Scalar keyed Seepage looks preserve named and local authored profile bases",
+          "[water][seepage][timing][profiles][authored-base]") {
+    using invisible_places::water::ApplyWaterSeepageLookTimingValue;
+    using invisible_places::water::ResolveWaterSeepageLook;
+    using invisible_places::water::ResolveWaterSeepageTimingLookBase;
+    using invisible_places::water::WaterEffectBlendMode;
+    using invisible_places::water::WaterScenarioState;
+    using invisible_places::water::WaterSeepageResponseProfile;
+
+    WaterSeepageLookSettings namedSettings;
+    namedSettings.pattern = WaterSeepagePattern::WetRockSheen;
+    namedSettings.baseWetness = 0.62F;
+    namedSettings.glisten = 0.81F;
+    namedSettings.featureSizeMeters = 0.27F;
+    WaterSeepageLookSettings localSettings = namedSettings;
+    localSettings.baseWetness = 0.74F;
+    localSettings.glisten = 0.93F;
+    localSettings.featureSizeMeters = 0.19F;
+    const std::vector<WaterSeepageLookProfile> lookProfiles{
+        {.name = "Wet Rock", .settings = namedSettings},
+        {.name = "Wet Rock_02", .settings = localSettings},
+    };
+    const std::vector<WaterSeepageResponseProfile> responseProfiles{
+        {.name = "Strong",
+         .response = {.intensity = 1.25F,
+                      .emissionAdd = 0.42F,
+                      .colouriseRed = 0.17F},
+         .blendMode = WaterEffectBlendMode::Screen},
+        {.name = "Strong_02",
+         .response = {.intensity = 1.55F,
+                      .emissionAdd = 0.63F,
+                      .colouriseRed = 0.29F},
+         .blendMode = WaterEffectBlendMode::Add},
+    };
+
+    const auto checkAuthoredBase =
+        [&](std::string lookName,
+            std::string responseName,
+            float expectedWetness,
+            float expectedGlisten,
+            float expectedFeatureSize,
+            float expectedEmission,
+            float expectedRed,
+            WaterEffectBlendMode expectedBlend) {
+            auto node = MakeSeepageNode();
+            node.lookProfileName = std::move(lookName);
+            node.responseProfileName = std::move(responseName);
+            const auto resolved = ResolveWaterSeepageLook(
+                node,
+                lookProfiles,
+                responseProfiles,
+                {});
+            auto keyed = ResolveWaterSeepageTimingLookBase(
+                resolved,
+                std::nullopt);
+            REQUIRE(
+                ApplyWaterSeepageLookTimingValue(
+                    &keyed,
+                    "look.density",
+                    0.37F));
+            CHECK(keyed.density == Catch::Approx(0.37F));
+            CHECK(keyed.pattern == WaterSeepagePattern::WetRockSheen);
+            CHECK(keyed.baseWetness == Catch::Approx(expectedWetness));
+            CHECK(keyed.glisten == Catch::Approx(expectedGlisten));
+            CHECK(
+                keyed.featureSizeMeters ==
+                Catch::Approx(expectedFeatureSize));
+            CHECK(
+                keyed.response.emissionAdd ==
+                Catch::Approx(expectedEmission));
+            CHECK(
+                keyed.response.colouriseRed ==
+                Catch::Approx(expectedRed));
+            CHECK(keyed.blendMode == expectedBlend);
+        };
+
+    checkAuthoredBase(
+        "Wet Rock",
+        "Strong",
+        0.62F,
+        0.81F,
+        0.27F,
+        0.42F,
+        0.17F,
+        WaterEffectBlendMode::Screen);
+    checkAuthoredBase(
+        "Wet Rock_02",
+        "Strong_02",
+        0.74F,
+        0.93F,
+        0.19F,
+        0.63F,
+        0.29F,
+        WaterEffectBlendMode::Add);
+
+    WaterScenarioState scenario;
+    scenario.seepageLook.pattern = WaterSeepagePattern::WettingTrickle;
+    scenario.seepageLook.baseWetness = 0.19F;
+    scenario.seepageLook.glisten = 0.28F;
+    scenario.seepageLook.response.emissionAdd = 0.31F;
+    const auto scenarioBase = ResolveWaterSeepageTimingLookBase(
+        localSettings,
+        scenario);
+    CHECK(
+        scenarioBase.pattern ==
+        WaterSeepagePattern::WettingTrickle);
+    CHECK(scenarioBase.baseWetness == Catch::Approx(0.19F));
+    CHECK(scenarioBase.glisten == Catch::Approx(0.28F));
+    CHECK(
+        scenarioBase.response.emissionAdd ==
+        Catch::Approx(0.31F));
+}
+
 TEST_CASE("Historical Seepage scenarios share visual language but differ in moisture", "[water][seepage][scenario]") {
     using Catch::Approx;
     const auto scenarios = invisible_places::water::DefaultWaterScenarioDefinitions();
@@ -1177,6 +1336,7 @@ TEST_CASE("Chaotic Bloom lobes advect downhill along the surface guide", "[water
 
 TEST_CASE("Contour Pulses build strong regions from independently drifting wave overlap", "[water][seepage][patterns][contour-pulses]") {
     using invisible_places::water::EvaluateWaterSeepageGridContribution;
+    using invisible_places::water::PrepareWaterSeepagePulseFields;
 
     WaterSeepageLookSettings look;
     look.pattern = WaterSeepagePattern::ContourPulses;
@@ -1195,7 +1355,7 @@ TEST_CASE("Contour Pulses build strong regions from independently drifting wave 
     auto node = MakeSeepageNode();
     node.reachMeters = 2.0F;
     node.widthMeters = 0.60F;
-    const auto singleWaveGrid = BuildGrid(
+    auto singleWaveGrid = BuildGrid(
         {node},
         "ROCK",
         false,
@@ -1205,7 +1365,7 @@ TEST_CASE("Contour Pulses build strong regions from independently drifting wave 
     const invisible_places::io::Float3 normal{0.0F, 1.0F, 0.0F};
     look.pulseWaveCount = 12.0F;
     look.pulseSpeedVariation = 0.90F;
-    const auto variedWaveGrid = BuildGrid(
+    auto variedWaveGrid = BuildGrid(
         {node},
         "ROCK",
         false,
@@ -1213,7 +1373,7 @@ TEST_CASE("Contour Pulses build strong regions from independently drifting wave 
         1'000'000ULL,
         look);
     look.pulseSpeedVariation = 0.0F;
-    const auto uniformSpeedGrid = BuildGrid(
+    auto uniformSpeedGrid = BuildGrid(
         {node},
         "ROCK",
         false,
@@ -1230,6 +1390,15 @@ TEST_CASE("Contour Pulses build strong regions from independently drifting wave 
     for (int timeIndex = 0; timeIndex < 36; ++timeIndex) {
         const float sampleTime =
             static_cast<float>(timeIndex) * 0.31F;
+        PrepareWaterSeepagePulseFields(
+            &singleWaveGrid,
+            sampleTime);
+        PrepareWaterSeepagePulseFields(
+            &variedWaveGrid,
+            sampleTime);
+        PrepareWaterSeepagePulseFields(
+            &uniformSpeedGrid,
+            sampleTime);
         for (int distanceIndex = 0;
              distanceIndex < 24;
              ++distanceIndex) {
@@ -1292,6 +1461,137 @@ TEST_CASE("Contour Pulses build strong regions from independently drifting wave 
     CHECK(variedWaveSum > singleWaveSum * 2.0F);
     CHECK(maximumSpeedVariationDifference > 1.0e-3F);
     CHECK(maximumFrontDifference > 1.0e-4F);
+}
+
+TEST_CASE("Contour Pulses carry visible transient wetness with a dry base",
+          "[water][seepage][patterns][contour-pulses][regression]") {
+    using invisible_places::water::EvaluateWaterSeepageGridContribution;
+    using invisible_places::water::PrepareWaterSeepagePulseFields;
+
+    WaterSeepageLookSettings look;
+    look.pattern = WaterSeepagePattern::ContourPulses;
+    look.quality = WaterSeepageQuality::High;
+    look.baseWetness = 0.0F;
+    look.density = 1.0F;
+    look.glisten = 0.0F;
+    look.pulseWaveCount = 7.0F;
+    look.response.intensity = 1.0F;
+
+    auto node = MakeSeepageNode();
+    node.prominence = 3.0F;
+    node.reachMeters = 2.0F;
+    auto grid = BuildGrid(
+        {node},
+        "ROCK",
+        false,
+        {},
+        1'000'000ULL,
+        look);
+    REQUIRE(grid.nodes.size() == 1U);
+    REQUIRE(grid.nodes.front().pulseField.sampleCount == 128U);
+
+    float maximumDamp = 0.0F;
+    float maximumScale = 0.0F;
+    for (int timeIndex = 0; timeIndex < 24; ++timeIndex) {
+        const float time = static_cast<float>(timeIndex) * 0.23F;
+        PrepareWaterSeepagePulseFields(&grid, time);
+        for (int distanceIndex = 1; distanceIndex < 24; ++distanceIndex) {
+            const float downstream =
+                static_cast<float>(distanceIndex) * 0.05F;
+            const auto contribution =
+                EvaluateWaterSeepageGridContribution(
+                    grid,
+                    {0.0F, 0.0F, -downstream},
+                    {0.0F, 1.0F, 0.0F},
+                    time);
+            maximumDamp = std::max(
+                maximumDamp,
+                contribution.damp);
+            maximumScale = std::max(
+                maximumScale,
+                contribution.scale);
+        }
+    }
+
+    CHECK(maximumDamp > 0.08F);
+    CHECK(maximumScale > 0.08F);
+}
+
+TEST_CASE(
+    "Contour Pulse animation scrubs deterministically and matches frozen rendering",
+    "[water][seepage][patterns][contour-pulses][runtime]") {
+    WaterSeepageLookSettings look;
+    look.pattern = WaterSeepagePattern::ContourPulses;
+    look.quality = WaterSeepageQuality::High;
+    look.pulseWaveCount = 7.5F;
+    look.pulseSpeedMetersPerSecond = 0.12F;
+    auto grid = BuildGrid(
+        {MakeSeepageNode()},
+        "ROCK",
+        false,
+        {},
+        1'000'000ULL,
+        look);
+    REQUIRE(grid.nodes.size() == 1U);
+    CHECK(grid.nodes.front().pulseField.sampleCount == 128U);
+
+    const auto topologyBefore =
+        invisible_places::water::WaterSeepageTopologyFingerprint(grid);
+    const auto paramsBefore =
+        invisible_places::water::WaterSeepageParamsFingerprint(grid);
+    const auto supportReferenceCount = grid.supportReferences.size();
+    const auto coarseReferenceCount = grid.nodeReferences.size();
+    auto frozenGrid = grid;
+
+    invisible_places::water::PrepareWaterSeepagePulseFields(
+        &grid,
+        0.83F);
+    invisible_places::water::PrepareWaterSeepagePulseFields(
+        &frozenGrid,
+        0.83F);
+    const auto preparationAtTime =
+        grid.nodes.front().pulseFieldPreparationFingerprint;
+    CHECK(preparationAtTime != 0U);
+    CHECK(
+        invisible_places::water::WaterSeepageTopologyFingerprint(grid) ==
+        topologyBefore);
+    CHECK(
+        invisible_places::water::WaterSeepageParamsFingerprint(grid) !=
+        paramsBefore);
+    CHECK(grid.supportReferences.size() == supportReferenceCount);
+    CHECK(grid.nodeReferences.size() == coarseReferenceCount);
+    CHECK(
+        invisible_places::water::WaterSeepageParamsFingerprint(grid) ==
+        invisible_places::water::WaterSeepageParamsFingerprint(frozenGrid));
+    CHECK(
+        grid.nodes.front().pulseFieldPreparationFingerprint ==
+        frozenGrid.nodes.front().pulseFieldPreparationFingerprint);
+    CHECK(
+        grid.nodes.front().pulseField.samples ==
+        frozenGrid.nodes.front().pulseField.samples);
+
+    const auto paramsAtTime =
+        invisible_places::water::WaterSeepageParamsFingerprint(grid);
+    const auto samplesAtTime = grid.nodes.front().pulseField.samples;
+    invisible_places::water::PrepareWaterSeepagePulseFields(
+        &grid,
+        0.83F);
+    CHECK(
+        invisible_places::water::WaterSeepageParamsFingerprint(grid) ==
+        paramsAtTime);
+    CHECK(
+        grid.nodes.front().pulseFieldPreparationFingerprint ==
+        preparationAtTime);
+    CHECK(grid.nodes.front().pulseField.samples == samplesAtTime);
+
+    grid.nodes.front().look.pulseWaveCount = 8.25F;
+    invisible_places::water::PrepareWaterSeepagePulseFields(
+        &grid,
+        0.83F);
+    CHECK(
+        grid.nodes.front().pulseFieldPreparationFingerprint !=
+        preparationAtTime);
+    CHECK(grid.nodes.front().pulseField.samples != samplesAtTime);
 }
 
 TEST_CASE("Water scenario tracks interpolate normalized snapshots and wrap reflection angles", "[water][seepage][scenario][animation]") {
@@ -2002,6 +2302,142 @@ TEST_CASE("Applying scenario keys changes only compact Seepage parameters", "[wa
     CHECK(grid.nodes.front().rainVisualStrength == Catch::Approx(0.72F));
 }
 
+TEST_CASE("Keyed wetting progress reveals Contour Pulses and Wetting Trickle consistently",
+          "[water][seepage][patterns][wetting-progress]") {
+    using invisible_places::water::EvaluateWaterSeepageGridContribution;
+    using invisible_places::water::PrepareWaterSeepagePulseFields;
+    using invisible_places::water::WaterSeepageNodeAnimationStateEntry;
+
+    const auto nodeState = [](float progress) {
+        return std::array<WaterSeepageNodeAnimationStateEntry, 1U>{{
+            {
+                .nodeId = 1U,
+                .state = {
+                    .activity = 1.0F,
+                    .localSpread = 0.0F,
+                    .wettingProgress = progress,
+                },
+            },
+        }};
+    };
+    constexpr std::array patterns{
+        WaterSeepagePattern::ContourPulses,
+        WaterSeepagePattern::WettingTrickle,
+    };
+    for (const auto pattern : patterns) {
+        INFO("pattern " << static_cast<std::uint32_t>(pattern));
+        WaterSeepageLookSettings look;
+        look.pattern = pattern;
+        look.quality = WaterSeepageQuality::High;
+        look.baseWetness = 1.0F;
+        look.density = 1.0F;
+        look.glisten = 0.0F;
+        look.tricklePatchSizeMeters = 0.12F;
+        look.trickleWidthMeters = 0.03F;
+        look.trickleFrontSoftness = 0.02F;
+
+        const auto dryState = nodeState(0.0F);
+        const auto partialState = nodeState(0.50F);
+        const auto fullState = nodeState(1.0F);
+        auto dry = BuildGrid(
+            {MakeSeepageNode()},
+            "ROCK",
+            false,
+            {},
+            1'000'000ULL,
+            look,
+            {},
+            std::nullopt,
+            dryState);
+        auto partial = BuildGrid(
+            {MakeSeepageNode()},
+            "ROCK",
+            false,
+            {},
+            1'000'000ULL,
+            look,
+            {},
+            std::nullopt,
+            partialState);
+        auto full = BuildGrid(
+            {MakeSeepageNode()},
+            "ROCK",
+            false,
+            {},
+            1'000'000ULL,
+            look,
+            {},
+            std::nullopt,
+            fullState);
+        PrepareWaterSeepagePulseFields(&dry, 1.25F);
+        PrepareWaterSeepagePulseFields(&partial, 1.25F);
+        PrepareWaterSeepagePulseFields(&full, 1.25F);
+
+        constexpr invisible_places::io::Float3 normal{
+            0.0F,
+            1.0F,
+            0.0F,
+        };
+        const invisible_places::io::Float3 nearPoint{
+            0.0F,
+            0.0F,
+            -0.08F,
+        };
+        const invisible_places::io::Float3 farPoint{
+            0.0F,
+            0.0F,
+            -0.95F,
+        };
+        const auto dryNear = EvaluateWaterSeepageGridContribution(
+            dry,
+            nearPoint,
+            normal,
+            1.25F);
+        const auto partialNear = EvaluateWaterSeepageGridContribution(
+            partial,
+            nearPoint,
+            normal,
+            1.25F);
+        const auto partialFar = EvaluateWaterSeepageGridContribution(
+            partial,
+            farPoint,
+            normal,
+            1.25F);
+        const auto fullFar = EvaluateWaterSeepageGridContribution(
+            full,
+            farPoint,
+            normal,
+            1.25F);
+        CHECK(dryNear.mask == Catch::Approx(0.0F));
+        CHECK(dryNear.scale == Catch::Approx(0.0F));
+        CHECK(partialNear.mask > 0.0F);
+        CHECK(partialNear.scale > 0.0F);
+        CHECK(partialFar.mask == Catch::Approx(0.0F).margin(1.0e-6F));
+        CHECK(partialFar.scale == Catch::Approx(0.0F).margin(1.0e-6F));
+        CHECK(fullFar.mask > 0.0F);
+
+        float fullFarMaximumScale = 0.0F;
+        for (std::int32_t lateralIndex = -20;
+             lateralIndex <= 20;
+             ++lateralIndex) {
+            const invisible_places::io::Float3 point{
+                static_cast<float>(lateralIndex) * 0.005F,
+                0.0F,
+                farPoint.z,
+            };
+            fullFarMaximumScale = std::max(
+                fullFarMaximumScale,
+                EvaluateWaterSeepageGridContribution(
+                    full,
+                    point,
+                    normal,
+                    1.25F)
+                    .scale);
+        }
+        CHECK(fullFarMaximumScale > 0.0F);
+    }
+}
+
 TEST_CASE("Wetting Trickle reveals short deterministic fingers behind a keyed front", "[water][seepage][patterns][trickle]") {
     using invisible_places::water::EvaluateWaterSeepageGridContribution;
     using invisible_places::water::WaterSeepageNodeAnimationStateEntry;
@@ -2477,10 +2913,102 @@ TEST_CASE("Connected Seepage support is deterministic bounded and transactional"
 
     auto sandNode = node;
     CHECK_FALSE(BuildWaterSeepageSupportSelection(sandNode, "SAND", cache).success);
+    CHECK_FALSE(
+        BuildWaterSeepageSupportSelection(sandNode, "SAND", cache)
+            .surfaceUnavailable);
     sandNode.targetSceneRoles.push_back("SAND");
     const auto sand = BuildWaterSeepageSupportSelection(sandNode, "SAND", cache);
     REQUIRE(sand.success);
     CHECK(sand.selection.sourceRole == WaterSurfaceRole::Sand);
+
+    auto drySandNode = sandNode;
+    drySandNode.position = {0.125F, 0.005F, -0.005F};
+    const auto drySand =
+        BuildWaterSeepageSupportSelection(
+            drySandNode,
+            "SAND",
+            cache);
+    CHECK_FALSE(drySand.success);
+    CHECK(drySand.surfaceUnavailable);
+    CHECK_FALSE(drySand.cancelled);
+    CHECK_FALSE(drySand.diagnostics.cellLimitExceeded);
+}
+
+TEST_CASE("Connected Seepage node batches preserve authored result order",
+          "[water][seepage][surface-cache][connected][parallel]") {
+    using invisible_places::water::BuildWaterSeepageSupportSelection;
+    using invisible_places::water::BuildWaterSeepageSupportSelections;
+    using invisible_places::water::BuildWaterSurfaceCacheFromSamples;
+    using invisible_places::water::WaterSurfaceRole;
+    using invisible_places::water::WaterSurfaceSample;
+
+    std::vector<WaterSurfaceSample> samples;
+    for (std::int32_t z = 0; z > -20; --z) {
+        for (std::uint32_t sample = 0U; sample < 8U; ++sample) {
+            samples.push_back({
+                .position = {
+                    0.005F,
+                    0.005F + static_cast<float>(sample) * 0.0001F,
+                    -0.005F + static_cast<float>(z) * 0.010F,
+                },
+                .normal = {1.0F, 0.0F, 0.0F},
+                .role = WaterSurfaceRole::Rock,
+            });
+        }
+    }
+    const auto cache = BuildWaterSurfaceCacheFromSamples(samples, 0.010F);
+    std::array<WaterSeepageNode, 4U> nodes;
+    for (std::size_t index = 0U; index < nodes.size(); ++index) {
+        nodes[index] = MakeSeepageNode();
+        nodes[index].id = static_cast<std::uint32_t>(40U + index);
+        nodes[index].name = "Parallel " + std::to_string(index);
+        nodes[index].position = {
+            0.005F,
+            0.005F,
+            -0.005F - static_cast<float>(index) * 0.010F,
+        };
+        nodes[index].surfaceNormal = {1.0F, 0.0F, 0.0F};
+        nodes[index].downAxis = {0.0F, 0.0F, -1.0F};
+        nodes[index].selectionReachLimitMeters = 0.12F;
+        nodes[index].selectionWidthLimitMeters = 0.08F;
+    }
+
+    const auto parallel = BuildWaterSeepageSupportSelections(
+        nodes,
+        "ROCK",
+        cache,
+        {},
+        3U);
+    REQUIRE(parallel.size() == nodes.size());
+    for (std::size_t index = 0U; index < nodes.size(); ++index) {
+        const auto serial =
+            BuildWaterSeepageSupportSelection(nodes[index], "ROCK", cache);
+        REQUIRE(parallel[index].success);
+        REQUIRE(serial.success);
+        CHECK(parallel[index].selection.nodeId == nodes[index].id);
+        CHECK(parallel[index].selection.fingerprint ==
+              serial.selection.fingerprint);
+        REQUIRE(parallel[index].selection.cells.size() ==
+                serial.selection.cells.size());
+        for (std::size_t cellIndex = 0U;
+             cellIndex < serial.selection.cells.size();
+             ++cellIndex) {
+            const auto& parallelCell =
+                parallel[index].selection.cells[cellIndex];
+            const auto& serialCell =
+                serial.selection.cells[cellIndex];
+            CHECK(parallelCell.x == serialCell.x);
+            CHECK(parallelCell.y == serialCell.y);
+            CHECK(parallelCell.z == serialCell.z);
+            CHECK(parallelCell.downwardDistanceMeters ==
+                  Catch::Approx(serialCell.downwardDistanceMeters));
+            CHECK(parallelCell.flowRunMeters ==
+                  Catch::Approx(serialCell.flowRunMeters));
+            CHECK(parallelCell.crossContourMeters ==
+                  Catch::Approx(serialCell.crossContourMeters));
+            CHECK(parallelCell.upstream == serialCell.upstream);
+        }
+    }
 }
 
 TEST_CASE("VEG Seepage maps connected ROCK metrics onto VEG occupancy cells",
@@ -2500,18 +3028,23 @@ TEST_CASE("VEG Seepage maps connected ROCK metrics onto VEG occupancy cells",
             });
         }
     }
-    for (std::uint32_t sample = 0U; sample < 8U; ++sample) {
-        samples.push_back({
-            .position = {0.005F, 0.105F, -0.045F},
-            .normal = {0.0F, 1.0F, 0.0F},
-            .role = WaterSurfaceRole::Vegetation,
-        });
+    // The first vegetation layer hugs the ROCK substrate; the second remains
+    // within the tangential association search but is beyond Surface Depth.
+    for (const float vegetationY : {0.065F, 0.105F}) {
+        for (std::uint32_t sample = 0U; sample < 8U; ++sample) {
+            samples.push_back({
+                .position = {0.005F, vegetationY, -0.045F},
+                .normal = {0.0F, 1.0F, 0.0F},
+                .role = WaterSurfaceRole::Vegetation,
+            });
+        }
     }
     const auto cache = BuildWaterSurfaceCacheFromSamples(samples, 0.020F);
     auto node = MakeSeepageNode();
     node.position = {0.005F, 0.005F, -0.005F};
     node.selectionReachLimitMeters = 0.12F;
     node.selectionWidthLimitMeters = 0.20F;
+    node.depthToleranceMeters = 0.08F;
 
     const auto selection = BuildWaterSeepageSupportSelection(node, "VEG", cache);
     REQUIRE(selection.success);
@@ -2520,7 +3053,15 @@ TEST_CASE("VEG Seepage maps connected ROCK metrics onto VEG occupancy cells",
     CHECK(std::all_of(
         selection.selection.cells.begin(),
         selection.selection.cells.end(),
-        [](const auto& cell) { return cell.y >= 10; }));
+        [](const auto& cell) {
+            return cell.y >= 6 && cell.y < 10;
+        }));
+    CHECK(std::none_of(
+        selection.selection.cells.begin(),
+        selection.selection.cells.end(),
+        [](const auto& cell) {
+            return cell.y >= 10;
+        }));
     CHECK(std::any_of(
         selection.selection.cells.begin(),
         selection.selection.cells.end(),
@@ -2564,8 +3105,8 @@ TEST_CASE("Connected Seepage support follows a turning maximum-downhill centreli
     node.position = path.front();
     node.reachMeters = 0.08F;
     node.widthMeters = 0.03F;
-    node.selectionReachLimitMeters = 0.10F;
-    node.selectionWidthLimitMeters = 0.03F;
+    node.selectionReachLimitMeters = 0.50F;
+    node.selectionWidthLimitMeters = 0.08F;
     node.edgeFeatherMeters = 0.005F;
 
     const auto support = BuildWaterSeepageSupportSelection(node, "ROCK", cache);
@@ -2575,16 +3116,14 @@ TEST_CASE("Connected Seepage support follows a turning maximum-downhill centreli
         support.selection.cells.end(),
         [](const auto& cell) { return cell.x >= 4 && cell.z <= -7; });
     REQUIRE(turnedCell != support.selection.cells.end());
-    // The least-resistance flood stores an accumulated cost and geodesic
-    // path: the turned end of a steep descent stays cheap (well under the
-    // contour-priced straight-line alternative) and its path length reflects
-    // the travelled route around the turn.
+    // The least-resistance flood retains independent flow-run and
+    // cross-contour metrics: the turning path advances downhill while its
+    // smaller lateral component is charged at the steep contour rate.
     CHECK(turnedCell->downwardDistanceMeters > 0.03F);
-    CHECK(
-        turnedCell->downwardDistanceMeters <
-        turnedCell->lateralDistanceMeters *
-            invisible_places::water::kWaterSeepageContourCostFactor);
-    CHECK(turnedCell->lateralDistanceMeters > 0.06F);
+    CHECK(turnedCell->flowRunMeters > 0.05F);
+    CHECK(turnedCell->crossContourMeters > 0.02F);
+    CHECK(turnedCell->crossContourMeters <
+          turnedCell->flowRunMeters);
 }
 
 TEST_CASE("Seepage on a vertical face runs far down before it creeps sideways",
@@ -2639,12 +3178,12 @@ TEST_CASE("Seepage on a vertical face runs far down before it creeps sideways",
     // distance.
     const auto* below = findCell([](const auto& cell) {
         return cell.z <= -29 && cell.z >= -32 &&
-               std::abs(cell.y - 30) <= 1;
+               cell.y == 30;
     });
     REQUIRE(below != nullptr);
     CHECK(below->downwardDistanceMeters < 0.30F);
     // 0.30 m along the contour: priced at the steep contour rate
-    // (kWaterSeepageContourCostFactor x kWaterSeepageSteepContourMultiplier),
+    // (kWaterSeepageSteepContourCostFactor),
     // several times the descent cost for the same travelled distance.
     const auto* beside = findCell([](const auto& cell) {
         return cell.y >= 59 && cell.y <= 61 && cell.z >= -2;
@@ -2666,21 +3205,46 @@ TEST_CASE("Seepage flood splits into both downhill routes of a saddle",
     // contour shelf (+Y). Slow wetness should run down BOTH gullies and
     // barely creep along the level shelf.
     std::vector<WaterSurfaceSample> samples;
-    const auto addColumn = [&](float x, float y, float z) {
-        for (std::uint32_t sample = 0U; sample < 8U; ++sample) {
+    const auto addColumn = [&](
+                               float x,
+                               float y,
+                               float z,
+                               const invisible_places::io::Float3& normal,
+                               std::uint32_t sampleCount = 8U) {
+        for (std::uint32_t sample = 0U;
+             sample < sampleCount;
+             ++sample) {
             samples.push_back({
                 .position = {x, y, z},
-                .normal = {0.0F, 0.0F, 1.0F},
+                .normal = normal,
                 .role = WaterSurfaceRole::Rock,
             });
         }
     };
-    addColumn(0.005F, 0.005F, -0.005F);
-    for (std::uint32_t station = 1U; station <= 6U; ++station) {
+    constexpr float kInvSqrtTwo = 0.70710678F;
+    addColumn(
+        0.005F,
+        0.005F,
+        -0.005F,
+        {0.0F, 0.0F, 1.0F},
+        1U);
+    for (std::uint32_t station = 1U; station <= 8U; ++station) {
         const float along = static_cast<float>(station) * 0.010F;
-        addColumn(0.005F + along, 0.005F, -0.005F - along);
-        addColumn(0.005F - along, 0.005F, -0.005F - along);
-        addColumn(0.005F, 0.005F + along, -0.005F);
+        addColumn(
+            0.005F + along,
+            0.005F,
+            -0.005F - along,
+            {kInvSqrtTwo, 0.0F, kInvSqrtTwo});
+        addColumn(
+            0.005F - along,
+            0.005F,
+            -0.005F - along,
+            {-kInvSqrtTwo, 0.0F, kInvSqrtTwo});
+        addColumn(
+            0.005F,
+            0.005F + along,
+            -0.005F,
+            {0.0F, 0.0F, 1.0F});
     }
     const auto cache = BuildWaterSurfaceCacheFromSamples(samples, 0.010F);
     auto node = MakeSeepageNode();
@@ -2703,16 +3267,956 @@ TEST_CASE("Seepage flood splits into both downhill routes of a saddle",
         return best;
     };
     // Both gully ends were reached, at similar (cheap, descent-priced) cost.
-    const float rightGully = costAt(6, 0);
-    const float leftGully = costAt(-6, 0);
+    const float rightGully = costAt(8, 0);
+    const float leftGully = costAt(-8, 0);
     REQUIRE(rightGully < 1.0F);
     REQUIRE(leftGully < 1.0F);
     CHECK(rightGully == Catch::Approx(leftGully).margin(0.01F));
     // The level shelf at the same travelled distance costs contour rates —
     // markedly more than either descent.
-    const float shelf = costAt(0, 6);
+    const float shelf = costAt(0, 8);
     REQUIRE(shelf < 1.0F);
     CHECK(shelf > rightGully * 1.5F);
+}
+
+TEST_CASE("Connected Seepage live masks grow monotonically through the authored strength sweep",
+          "[water][seepage][surface-cache][connected][mask][strength-sweep]") {
+    using invisible_places::water::BuildWaterSeepageSupportSelection;
+    using invisible_places::water::BuildWaterSurfaceCacheFromSamples;
+    using invisible_places::water::EvaluateWaterSeepageGridContribution;
+    using invisible_places::water::EvaluateWaterSeepageSupportCellMask;
+    using invisible_places::water::WaterSurfaceRole;
+    using invisible_places::water::WaterSurfaceSample;
+
+    // A 1.8 m vertical sheet covers the eight strengths captured from the
+    // reference node. Its modest cross extent makes a sideways leak obvious
+    // while keeping this deterministic CPU fixture quick.
+    std::vector<WaterSurfaceSample> samples;
+    for (std::int32_t y = -15; y <= 15; ++y) {
+        for (std::int32_t z = 0; z >= -180; --z) {
+            for (std::uint32_t sample = 0U; sample < 8U; ++sample) {
+                samples.push_back({
+                    .position = {
+                        0.005F +
+                            static_cast<float>(sample) * 0.00001F,
+                        0.005F + static_cast<float>(y) * 0.010F,
+                        -0.005F + static_cast<float>(z) * 0.010F,
+                    },
+                    .normal = {1.0F, 0.0F, 0.0F},
+                    .role = WaterSurfaceRole::Rock,
+                });
+            }
+        }
+    }
+    const auto cache =
+        BuildWaterSurfaceCacheFromSamples(samples, 0.010F);
+    auto node = MakeSeepageNode();
+    node.position = {0.005F, 0.005F, -0.005F};
+    node.surfaceNormal = {1.0F, 0.0F, 0.0F};
+    node.downAxis = {0.0F, 0.0F, -1.0F};
+    node.widthMeters = 0.06F;
+    node.selectionReachLimitMeters = 1.80F;
+    node.selectionWidthLimitMeters = 0.30F;
+    node.edgeFeatherMeters = 0.14F;
+    const auto built =
+        BuildWaterSeepageSupportSelection(node, "ROCK", cache);
+    REQUIRE(built.success);
+    REQUIRE_FALSE(built.selection.cells.empty());
+    const std::array strengths{
+        0.02F,
+        0.12F,
+        0.20F,
+        0.32F,
+        0.43F,
+        0.63F,
+        0.93F,
+        1.13F,
+    };
+
+    std::size_t previousActiveCount = 0U;
+    float previousMaximumRun = 0.0F;
+    for (std::size_t strengthIndex = 0U;
+         strengthIndex < strengths.size();
+         ++strengthIndex) {
+        node.strength = strengths[strengthIndex];
+        const std::array selections{built.selection};
+        const auto grid = BuildGrid(
+            {node},
+            "ROCK",
+            false,
+            {},
+            1'000'000ULL,
+            {},
+            {},
+            std::nullopt,
+            {},
+            selections);
+        REQUIRE(grid.nodes.size() == 1U);
+        const auto& runtime = grid.nodes.front();
+        std::size_t activeCount = 0U;
+        float maximumRun = 0.0F;
+        float maximumCross = 0.0F;
+        float maximumParityDifference = 0.0F;
+        for (const auto& cell : built.selection.cells) {
+            const float overlayMask =
+                EvaluateWaterSeepageSupportCellMask(runtime, cell);
+            const invisible_places::io::Float3 point{
+                (static_cast<float>(cell.x) + 0.5F) *
+                    built.selection.cellSizeMeters,
+                (static_cast<float>(cell.y) + 0.5F) *
+                    built.selection.cellSizeMeters,
+                (static_cast<float>(cell.z) + 0.5F) *
+                    built.selection.cellSizeMeters,
+            };
+            const float rendererMask =
+                EvaluateWaterSeepageGridContribution(
+                    grid,
+                    point,
+                    cell.surfaceNormal,
+                    0.31F)
+                    .mask;
+            maximumParityDifference = std::max(
+                maximumParityDifference,
+                std::abs(overlayMask - rendererMask));
+            if (overlayMask <= 1.0e-4F) {
+                continue;
+            }
+            ++activeCount;
+            if (!cell.upstream) {
+                maximumRun = std::max(
+                    maximumRun,
+                    cell.flowRunMeters);
+                maximumCross = std::max(
+                    maximumCross,
+                    cell.crossContourMeters);
+            }
+        }
+        INFO("strength index " << strengthIndex);
+        CHECK(maximumParityDifference < 2.0e-5F);
+        CHECK(activeCount >= previousActiveCount);
+        CHECK(maximumRun + 1.0e-5F >= previousMaximumRun);
+        if (strengthIndex == 0U) {
+            // The 0.14 m artistic feather must not turn the source into a
+            // broad disk; source membership is capped at two 10 mm cells.
+            CHECK(maximumCross < 0.061F);
+        }
+        if (strengths[strengthIndex] >= 0.93F) {
+            CHECK(maximumRun > maximumCross * 5.0F);
+        }
+        previousActiveCount = activeCount;
+        previousMaximumRun = maximumRun;
+    }
+    CHECK(previousMaximumRun > 1.45F);
+}
+
+TEST_CASE("Connected steep support converts cost budget to physical wetting-front reach",
+          "[water][seepage][surface-cache][connected][wetting-progress]") {
+    using invisible_places::water::EvaluateWaterSeepageGridContribution;
+    using invisible_places::water::WaterSeepageNodeAnimationStateEntry;
+    using invisible_places::water::WaterSeepageSupportCell;
+    using invisible_places::water::WaterSeepageSupportSelection;
+    using invisible_places::water::WaterSurfaceRole;
+
+    auto node = MakeSeepageNode();
+    node.position = {0.005F, 0.005F, -0.005F};
+    node.surfaceNormal = {1.0F, 0.0F, 0.0F};
+    node.downAxis = {0.0F, 0.0F, -1.0F};
+    node.widthMeters = 0.04F;
+    node.strength = 0.40F;
+    node.edgeFeatherMeters = 0.005F;
+    node.selectionReachLimitMeters = 1.0F;
+    node.selectionWidthLimitMeters = 0.08F;
+
+    // At this wall cell, 0.59 m of pure descent costs 0.4425 cost-metres.
+    // Strength 0.4 supplies a 0.6 cost-metre budget. After reserving the
+    // upstream-first phase, its remapped downhill budget is about 0.545 m,
+    // whose physical pure-descent reach is about 0.727 m (not 0.545 m).
+    WaterSeepageSupportSelection support;
+    support.nodeId = node.id;
+    support.targetSceneRole = "ROCK";
+    support.sourceRole = WaterSurfaceRole::Rock;
+    support.cellSizeMeters = 0.010F;
+    support.reachLimitMeters = node.selectionReachLimitMeters;
+    support.widthLimitMeters = node.selectionWidthLimitMeters;
+    support.fingerprint = "steep-physical-reach";
+    support.cells.push_back(WaterSeepageSupportCell{
+        .x = 0,
+        .y = 0,
+        .z = -60,
+        .downwardDistanceMeters = 0.59F * 0.75F,
+        .flowRunMeters = 0.59F,
+        .crossContourMeters = 0.0F,
+        .surfaceNormal = {1.0F, 0.0F, 0.0F},
+        .confidence = 1.0F,
+    });
+    // Supply the paired upstream topology used by the production mask. Its
+    // immutable extent reserves the short high-wick lead before downhill.
+    support.cells.push_back(WaterSeepageSupportCell{
+        .x = 0,
+        .y = 0,
+        .z = 75,
+        .downwardDistanceMeters = 0.75F,
+        .flowRunMeters = 0.75F,
+        .crossContourMeters = 0.0F,
+        .surfaceNormal = {1.0F, 0.0F, 0.0F},
+        .confidence = 1.0F,
+        .upstream = true,
+    });
+    support.bounds.Expand({0.0F, 0.0F, -0.60F});
+    support.bounds.Expand({0.01F, 0.01F, 0.76F});
+    const std::array supportSelections{support};
+
+    WaterSeepageLookSettings look;
+    look.pattern = WaterSeepagePattern::ContourPulses;
+    look.baseWetness = 1.0F;
+    look.density = 1.0F;
+    look.glisten = 0.0F;
+    look.trickleFrontSoftness = 0.005F;
+    const auto buildAtProgress = [&](float progress) {
+        const std::array<WaterSeepageNodeAnimationStateEntry, 1U> state{{
+            {
+                .nodeId = node.id,
+                .state = {
+                    .activity = 1.0F,
+                    .localSpread = 0.0F,
+                    .wettingProgress = progress,
+                },
+            },
+        }};
+        return BuildGrid(
+            {node},
+            "ROCK",
+            false,
+            {},
+            1'000'000ULL,
+            look,
+            {},
+            std::nullopt,
+            state,
+            supportSelections);
+    };
+    const auto beforeFront = buildAtProgress(0.78F);
+    const auto afterFront = buildAtProgress(0.84F);
+    const auto full = buildAtProgress(1.0F);
+    const invisible_places::io::Float3 point{
+        0.005F,
+        0.005F,
+        -0.595F,
+    };
+    const invisible_places::io::Float3 normal{1.0F, 0.0F, 0.0F};
+    const auto before = EvaluateWaterSeepageGridContribution(
+        beforeFront,
+        point,
+        normal,
+        0.0F);
+    const auto after = EvaluateWaterSeepageGridContribution(
+        afterFront,
+        point,
+        normal,
+        0.0F);
+    const auto fullyRevealed = EvaluateWaterSeepageGridContribution(
+        full,
+        point,
+        normal,
+        0.0F);
+    CHECK(before.mask == Catch::Approx(0.0F).margin(1.0e-6F));
+    CHECK(after.mask > 0.95F);
+    CHECK(after.mask == Catch::Approx(fullyRevealed.mask).margin(2.0e-4F));
+}
+
+TEST_CASE("Connected Seepage reveals its highest wick back to the node before releasing downhill",
+          "[water][seepage][surface-cache][connected][mask][upstream-first]") {
+    using invisible_places::water::EvaluateWaterSeepageSupportCellMask;
+    using invisible_places::water::WaterSeepageSupportCell;
+
+    auto node = MakeSeepageNode();
+    node.surfaceNormal = {1.0F, 0.0F, 0.0F};
+    node.downAxis = {0.0F, 0.0F, -1.0F};
+    node.widthMeters = 0.10F;
+    node.selectionReachLimitMeters = 1.80F;
+    node.selectionWidthLimitMeters = 0.20F;
+    node.edgeFeatherMeters = 0.010F;
+
+    const WaterSeepageSupportCell highestUpstream{
+        .downwardDistanceMeters = 1.35F,
+        .flowRunMeters = 1.35F,
+        .crossContourMeters = 0.0F,
+        .surfaceNormal = {1.0F, 0.0F, 0.0F},
+        .confidence = 1.0F,
+        .upstream = true,
+    };
+    const WaterSeepageSupportCell middleUpstream{
+        .downwardDistanceMeters = 1.10F,
+        .flowRunMeters = 1.10F,
+        .crossContourMeters = 0.0F,
+        .surfaceNormal = {1.0F, 0.0F, 0.0F},
+        .confidence = 1.0F,
+        .upstream = true,
+    };
+    const WaterSeepageSupportCell nodewardUpstream{
+        .downwardDistanceMeters = 0.010F,
+        .flowRunMeters = 0.010F,
+        .crossContourMeters = 0.0F,
+        .surfaceNormal = {1.0F, 0.0F, 0.0F},
+        .confidence = 1.0F,
+        .upstream = true,
+    };
+    const WaterSeepageSupportCell sourceDownstream{
+        .downwardDistanceMeters = 0.0075F,
+        .flowRunMeters = 0.010F,
+        .crossContourMeters = 0.0F,
+        .surfaceNormal = {1.0F, 0.0F, 0.0F},
+        .confidence = 1.0F,
+        .upstream = false,
+    };
+    const WaterSeepageSupportCell firstRouteDownstream{
+        .downwardDistanceMeters = 0.075F,
+        .flowRunMeters = 0.10F,
+        .crossContourMeters = 0.0F,
+        .surfaceNormal = {1.0F, 0.0F, 0.0F},
+        .confidence = 1.0F,
+        .upstream = false,
+    };
+
+    const auto maskAtStrength =
+        [&](float strength,
+            const WaterSeepageSupportCell& cell) {
+            node.strength = strength;
+            const auto grid = BuildGrid(
+                {node},
+                "ROCK",
+                false,
+                {},
+                1'000'000ULL);
+            REQUIRE(grid.nodes.size() == 1U);
+            auto runtime = grid.nodes.front();
+            // The production grid derives this immutable value from the
+            // connected selection. Supply the synthetic route's true tip.
+            runtime.maximumUpstreamRunMeters =
+                highestUpstream.flowRunMeters;
+            return EvaluateWaterSeepageSupportCellMask(
+                runtime,
+                cell);
+        };
+
+    // The old node-outward reveal produced the opposite ordering here.
+    CHECK(maskAtStrength(0.02F, highestUpstream) > 0.90F);
+    CHECK(maskAtStrength(0.02F, middleUpstream) < 1.0e-4F);
+    CHECK(maskAtStrength(0.02F, nodewardUpstream) < 1.0e-4F);
+    CHECK(maskAtStrength(0.02F, sourceDownstream) < 1.0e-4F);
+
+    CHECK(maskAtStrength(0.11F, highestUpstream) > 0.90F);
+    CHECK(maskAtStrength(0.11F, middleUpstream) > 0.90F);
+    CHECK(maskAtStrength(0.11F, nodewardUpstream) < 1.0e-4F);
+    CHECK(maskAtStrength(0.11F, sourceDownstream) < 1.0e-4F);
+
+    CHECK(maskAtStrength(0.15F, nodewardUpstream) > 0.90F);
+    CHECK(maskAtStrength(0.15F, sourceDownstream) > 0.90F);
+    CHECK(maskAtStrength(0.15F, firstRouteDownstream) < 1.0e-4F);
+    CHECK(maskAtStrength(0.21F, firstRouteDownstream) > 0.90F);
+}
+
+TEST_CASE("Connected Seepage recentres a winding upstream route without widening its branches",
+          "[water][seepage][surface-cache][connected][mask][upstream-centreline]") {
+    using invisible_places::water::BuildWaterSeepageSupportSelection;
+    using invisible_places::water::BuildWaterSurfaceCacheFromSamples;
+    using invisible_places::water::EvaluateWaterSeepageSupportCellMask;
+    using invisible_places::water::WaterSurfaceRole;
+    using invisible_places::water::WaterSurfaceSample;
+
+    // Climb a vertical face while the only connected route winds sideways.
+    // The route therefore accumulates far more contour travel than the live
+    // one-cell tip width, despite still being the correct centre branch.
+    std::vector<WaterSurfaceSample> samples;
+    const auto addCell = [&](std::int32_t y, std::int32_t z) {
+        for (std::uint32_t sample = 0U; sample < 8U; ++sample) {
+            samples.push_back({
+                .position = {
+                    0.005F +
+                        static_cast<float>(sample) * 0.00001F,
+                    0.005F + static_cast<float>(y) * 0.010F,
+                    0.005F + static_cast<float>(z) * 0.010F,
+                },
+                .normal = {1.0F, 0.0F, 0.0F},
+                .role = WaterSurfaceRole::Rock,
+            });
+        }
+    };
+    for (std::int32_t z = 0; z <= 25; ++z) {
+        addCell(std::min(z / 2, 10), z);
+    }
+    // Add a same-station branch at the highest point. Its first cell shares
+    // the station centreline, but the distant end must retain branch excess
+    // after the station baseline is removed.
+    for (std::int32_t y = 11; y <= 18; ++y) {
+        addCell(y, 25);
+    }
+
+    const auto cache =
+        BuildWaterSurfaceCacheFromSamples(samples, 0.010F);
+    auto node = MakeSeepageNode();
+    node.position = {0.005F, 0.005F, 0.005F};
+    node.surfaceNormal = {1.0F, 0.0F, 0.0F};
+    node.downAxis = {0.0F, 0.0F, -1.0F};
+    node.widthMeters = 0.10F;
+    node.strength = 0.02F;
+    node.selectionReachLimitMeters = 2.34375F;
+    node.selectionWidthLimitMeters = 0.50F;
+    node.edgeFeatherMeters = 0.005F;
+
+    const auto built =
+        BuildWaterSeepageSupportSelection(node, "ROCK", cache);
+    REQUIRE(built.success);
+    const std::array selections{built.selection};
+    const auto grid = BuildGrid(
+        {node},
+        "ROCK",
+        false,
+        {},
+        1'000'000ULL,
+        {},
+        {},
+        std::nullopt,
+        {},
+        selections);
+    REQUIRE(grid.nodes.size() == 1U);
+
+    const auto findCell = [&](std::int32_t y, std::int32_t z) {
+        return std::find_if(
+            built.selection.cells.begin(),
+            built.selection.cells.end(),
+            [=](const auto& cell) {
+                return cell.x == 0 && cell.y == y &&
+                       cell.z == z && cell.upstream;
+            });
+    };
+    const auto highSpine = findCell(10, 25);
+    const auto highBranch = findCell(18, 25);
+    const auto lowerSpine = findCell(5, 10);
+    REQUIRE(highSpine != built.selection.cells.end());
+    REQUIRE(highBranch != built.selection.cells.end());
+    REQUIRE(lowerSpine != built.selection.cells.end());
+
+    CHECK(highSpine->crossContourMeters < 0.001F);
+    CHECK(highBranch->crossContourMeters > 0.065F);
+    CHECK(EvaluateWaterSeepageSupportCellMask(
+              grid.nodes.front(),
+              *highSpine) >
+          0.90F);
+    CHECK(EvaluateWaterSeepageSupportCellMask(
+              grid.nodes.front(),
+              *highBranch) <
+          0.01F);
+    CHECK(EvaluateWaterSeepageSupportCellMask(
+              grid.nodes.front(),
+              *lowerSpine) <
+          0.01F);
+}
+
+TEST_CASE("Connected Seepage fills the top-down upstream taper laterally through strength one",
+          "[water][seepage][surface-cache][connected][mask][upstream-width]") {
+    using invisible_places::water::EvaluateWaterSeepageSupportCellMask;
+    using invisible_places::water::WaterSeepageSupportCell;
+
+    auto node = MakeSeepageNode();
+    node.surfaceNormal = {1.0F, 0.0F, 0.0F};
+    node.downAxis = {0.0F, 0.0F, -1.0F};
+    node.widthMeters = 0.10F;
+    node.selectionReachLimitMeters = 1.80F;
+    node.selectionWidthLimitMeters = 0.20F;
+    node.edgeFeatherMeters = 0.005F;
+
+    const WaterSeepageSupportCell middleOuter{
+        .downwardDistanceMeters = 0.50F,
+        .flowRunMeters = 0.50F,
+        .crossContourMeters = 0.025F,
+        .surfaceNormal = {1.0F, 0.0F, 0.0F},
+        .confidence = 1.0F,
+        .upstream = true,
+    };
+    const WaterSeepageSupportCell nodeEdge{
+        .downwardDistanceMeters = 0.010F,
+        .flowRunMeters = 0.010F,
+        .crossContourMeters = 0.045F,
+        .surfaceNormal = {1.0F, 0.0F, 0.0F},
+        .confidence = 1.0F,
+        .upstream = true,
+    };
+
+    const auto maskAtStrength =
+        [&](float strength,
+            const WaterSeepageSupportCell& cell) {
+            node.strength = strength;
+            const auto grid = BuildGrid(
+                {node},
+                "ROCK",
+                false,
+                {},
+                1'000'000ULL);
+            REQUIRE(grid.nodes.size() == 1U);
+            auto runtime = grid.nodes.front();
+            runtime.maximumUpstreamRunMeters = 1.0F;
+            return EvaluateWaterSeepageSupportCellMask(runtime, cell);
+        };
+
+    // When the descending front first reaches the node, the source already
+    // meets Source Width but the older upper route remains a narrow centre.
+    CHECK(maskAtStrength(0.20F, nodeEdge) > 0.90F);
+    const float earlyMiddle = maskAtStrength(0.20F, middleOuter);
+    const float laterMiddle = maskAtStrength(0.60F, middleOuter);
+    const float fullMiddle = maskAtStrength(1.0F, middleOuter);
+    CHECK(earlyMiddle < 0.10F);
+    CHECK(laterMiddle > earlyMiddle);
+    CHECK(fullMiddle > laterMiddle);
+    CHECK(fullMiddle > 0.90F);
+}
+
+TEST_CASE("Connected Seepage keeps a separately tapered upstream wick",
+          "[water][seepage][surface-cache][connected][mask][upstream]") {
+    using invisible_places::water::BuildWaterSeepageSupportSelection;
+    using invisible_places::water::BuildWaterSurfaceCacheFromSamples;
+    using invisible_places::water::EvaluateWaterSeepageSupportCellMask;
+    using invisible_places::water::UnpackWaterSeepageSupportReferenceMetadata;
+    using invisible_places::water::WaterSurfaceRole;
+    using invisible_places::water::WaterSurfaceSample;
+    using invisible_places::water::kWaterSeepageSupportUpstreamFlag;
+
+    std::vector<WaterSurfaceSample> samples;
+    for (std::int32_t y = -3; y <= 3; ++y) {
+        for (std::int32_t z = -45; z <= 35; ++z) {
+            for (std::uint32_t sample = 0U; sample < 8U; ++sample) {
+                samples.push_back({
+                    .position = {
+                        0.005F +
+                            static_cast<float>(sample) * 0.00001F,
+                        0.005F + static_cast<float>(y) * 0.010F,
+                        -0.005F + static_cast<float>(z) * 0.010F,
+                    },
+                    .normal = {1.0F, 0.0F, 0.0F},
+                    .role = WaterSurfaceRole::Rock,
+                });
+            }
+        }
+    }
+    const auto cache =
+        BuildWaterSurfaceCacheFromSamples(samples, 0.010F);
+    auto node = MakeSeepageNode();
+    node.position = {0.005F, 0.005F, -0.005F};
+    node.surfaceNormal = {1.0F, 0.0F, 0.0F};
+    node.downAxis = {0.0F, 0.0F, -1.0F};
+    node.widthMeters = 0.04F;
+    node.strength = 0.20F;
+    node.selectionReachLimitMeters = 0.30F;
+    node.selectionWidthLimitMeters = 0.08F;
+    node.edgeFeatherMeters = 0.005F;
+    const auto built =
+        BuildWaterSeepageSupportSelection(node, "ROCK", cache);
+    REQUIRE(built.success);
+    const std::array selections{built.selection};
+    const auto grid = BuildGrid(
+        {node},
+        "ROCK",
+        false,
+        {},
+        1'000'000ULL,
+        {},
+        {},
+        std::nullopt,
+        {},
+        selections);
+    REQUIRE(grid.nodes.size() == 1U);
+    float selectedMaximumUpstreamRun = 0.0F;
+    for (const auto& cell : built.selection.cells) {
+        if (cell.upstream) {
+            selectedMaximumUpstreamRun = std::max(
+                selectedMaximumUpstreamRun,
+                cell.flowRunMeters);
+        }
+    }
+    CHECK(grid.nodes.front().maximumUpstreamRunMeters ==
+          Catch::Approx(selectedMaximumUpstreamRun).margin(1.0e-6F));
+    CHECK(std::any_of(
+        grid.supportReferences.begin(),
+        grid.supportReferences.end(),
+        [](const auto& reference) {
+            return (UnpackWaterSeepageSupportReferenceMetadata(
+                        reference.packedNormalRoleConfidenceFlags)
+                        .flags &
+                    kWaterSeepageSupportUpstreamFlag) != 0U;
+        }));
+    float maximumDownstreamRun = 0.0F;
+    float maximumUpstreamRun = 0.0F;
+    float farUpstreamCross = 0.0F;
+    for (const auto& cell : built.selection.cells) {
+        if (EvaluateWaterSeepageSupportCellMask(
+                grid.nodes.front(),
+                cell) <= 1.0e-4F) {
+            continue;
+        }
+        if (cell.upstream) {
+            maximumUpstreamRun = std::max(
+                maximumUpstreamRun,
+                cell.flowRunMeters);
+            if (cell.flowRunMeters >
+                node.selectionReachLimitMeters * 0.75F) {
+                farUpstreamCross = std::max(
+                    farUpstreamCross,
+                    cell.crossContourMeters);
+            }
+        } else {
+            maximumDownstreamRun = std::max(
+                maximumDownstreamRun,
+                cell.flowRunMeters);
+        }
+    }
+    REQUIRE(maximumDownstreamRun > 0.35F);
+    REQUIRE(maximumUpstreamRun > 0.26F);
+    CHECK(maximumUpstreamRun / maximumDownstreamRun ==
+          Catch::Approx(0.75F).margin(0.08F));
+    CHECK(farUpstreamCross < 0.016F);
+}
+
+TEST_CASE("Connected Seepage upstream routing cannot enter an unpriced downhill lane",
+          "[water][seepage][surface-cache][connected][upstream][bounded]") {
+    using invisible_places::water::BuildWaterSeepageSupportSelection;
+    using invisible_places::water::BuildWaterSurfaceCacheFromSamples;
+    using invisible_places::water::WaterSurfaceRole;
+    using invisible_places::water::WaterSurfaceSample;
+
+    // On a level sheet projected gravity is degenerate, so the authored
+    // down-axis supplies the transported tangent. Before downhill rejection
+    // was applied at the source, the upstream label could walk every +X cell
+    // for zero cost (`up == cross == 0`) regardless of Selection Reach.
+    std::vector<WaterSurfaceSample> samples;
+    for (std::int32_t x = -20; x <= 300; ++x) {
+        for (std::uint32_t sample = 0U; sample < 8U; ++sample) {
+            samples.push_back({
+                .position = {
+                    0.005F + static_cast<float>(x) * 0.010F,
+                    0.005F + static_cast<float>(sample) * 0.00001F,
+                    0.005F,
+                },
+                .normal = {0.0F, 0.0F, 1.0F},
+                .role = WaterSurfaceRole::Rock,
+            });
+        }
+    }
+    const auto cache =
+        BuildWaterSurfaceCacheFromSamples(samples, 0.010F);
+    auto node = MakeSeepageNode();
+    node.position = {0.005F, 0.005F, 0.005F};
+    node.surfaceNormal = {0.0F, 0.0F, 1.0F};
+    node.downAxis = {1.0F, 0.0F, 0.0F};
+    node.selectionReachLimitMeters = 0.10F;
+    node.selectionWidthLimitMeters = 0.06F;
+    node.depthToleranceMeters = 0.02F;
+
+    const auto built =
+        BuildWaterSeepageSupportSelection(node, "ROCK", cache);
+    REQUIRE(built.success);
+    CHECK_FALSE(built.diagnostics.cellLimitExceeded);
+    CHECK(built.diagnostics.visitedSurfelCount < 100U);
+    CHECK(std::none_of(
+        built.selection.cells.begin(),
+        built.selection.cells.end(),
+        [](const auto& cell) {
+            return cell.upstream && cell.x > 1;
+        }));
+}
+
+TEST_CASE("Connected Seepage bounds near-normal substrate tunnelling",
+          "[water][seepage][surface-cache][connected][bounded][normal-step]") {
+    using invisible_places::water::BuildWaterSeepageSupportSelection;
+    using invisible_places::water::BuildWaterSurfaceCacheFromSamples;
+    using invisible_places::water::WaterSurfaceRole;
+    using invisible_places::water::WaterSurfaceSample;
+
+    // Model a thick/noisy ROCK layer whose adjacent cells advance almost
+    // entirely through the surface normal. The tiny downward tangent used to
+    // cost almost nothing and also remained inside the flow/cross source
+    // exception, so a full-site cache could be searched far beyond the
+    // authored reach even though this is not travel along the rock surface.
+    std::vector<WaterSurfaceSample> samples;
+    for (std::int32_t x = 0; x <= 500; ++x) {
+        for (std::uint32_t sample = 0U; sample < 8U; ++sample) {
+            samples.push_back({
+                .position = {
+                    0.005F + static_cast<float>(x) * 0.010F,
+                    0.005F + static_cast<float>(sample) * 0.00001F,
+                    0.005F - static_cast<float>(x) * 0.0001F,
+                },
+                .normal = {1.0F, 0.0F, 0.0F},
+                .role = WaterSurfaceRole::Rock,
+            });
+        }
+    }
+    const auto cache =
+        BuildWaterSurfaceCacheFromSamples(samples, 0.010F);
+    auto node = MakeSeepageNode();
+    node.position = {0.005F, 0.005F, 0.005F};
+    node.surfaceNormal = {1.0F, 0.0F, 0.0F};
+    node.downAxis = {0.0F, 0.0F, -1.0F};
+    node.selectionReachLimitMeters = 0.10F;
+    node.selectionWidthLimitMeters = 0.06F;
+    node.depthToleranceMeters = 0.02F;
+
+    const auto built =
+        BuildWaterSeepageSupportSelection(node, "ROCK", cache);
+    REQUIRE(built.success);
+    CHECK_FALSE(built.diagnostics.cellLimitExceeded);
+    CHECK(built.diagnostics.rejectedReachCount > 0U);
+    CHECK(built.diagnostics.visitedSurfelCount < 100U);
+    CHECK(std::none_of(
+        built.selection.cells.begin(),
+        built.selection.cells.end(),
+        [](const auto& cell) {
+            return cell.x > 20;
+        }));
+}
+
+TEST_CASE("Connected Seepage decomposes diagonal slope travel into run and true contour width",
+          "[water][seepage][surface-cache][connected][diagonal]") {
+    using invisible_places::water::BuildWaterSeepageSupportSelection;
+    using invisible_places::water::BuildWaterSurfaceCacheFromSamples;
+    using invisible_places::water::WaterSurfaceRole;
+    using invisible_places::water::WaterSurfaceSample;
+
+    constexpr float kInvSqrtTwo = 0.70710678F;
+    std::vector<WaterSurfaceSample> samples;
+    for (std::int32_t cross = -10; cross <= 10; ++cross) {
+        for (std::int32_t run = 0; run <= 16; ++run) {
+            for (std::uint32_t sample = 0U; sample < 8U; ++sample) {
+                samples.push_back({
+                    .position = {
+                        0.005F + static_cast<float>(run) * 0.010F,
+                        0.005F + static_cast<float>(cross) * 0.010F,
+                        -0.005F - static_cast<float>(run) * 0.010F,
+                    },
+                    .normal = {
+                        kInvSqrtTwo,
+                        0.0F,
+                        kInvSqrtTwo,
+                    },
+                    .role = WaterSurfaceRole::Rock,
+                });
+            }
+        }
+    }
+    const auto cache =
+        BuildWaterSurfaceCacheFromSamples(samples, 0.010F);
+    auto node = MakeSeepageNode();
+    node.position = {0.005F, 0.005F, -0.005F};
+    node.surfaceNormal = {
+        kInvSqrtTwo,
+        0.0F,
+        kInvSqrtTwo,
+    };
+    node.downAxis = {
+        kInvSqrtTwo,
+        0.0F,
+        -kInvSqrtTwo,
+    };
+    node.selectionReachLimitMeters = 0.30F;
+    node.selectionWidthLimitMeters = 0.12F;
+    node.edgeFeatherMeters = 0.005F;
+    const auto built =
+        BuildWaterSeepageSupportSelection(node, "ROCK", cache);
+    REQUIRE(built.success);
+
+    const auto diagonal = std::max_element(
+        built.selection.cells.begin(),
+        built.selection.cells.end(),
+        [](const auto& left, const auto& right) {
+            const float leftScore =
+                left.upstream || left.crossContourMeters > 0.002F
+                    ? -1.0F
+                    : left.flowRunMeters;
+            const float rightScore =
+                right.upstream || right.crossContourMeters > 0.002F
+                    ? -1.0F
+                    : right.flowRunMeters;
+            return leftScore < rightScore;
+        });
+    REQUIRE(diagonal != built.selection.cells.end());
+    CHECK_FALSE(diagonal->upstream);
+    CHECK(diagonal->flowRunMeters > 0.18F);
+    CHECK(diagonal->crossContourMeters < 0.002F);
+    CHECK(diagonal->downwardDistanceMeters <
+          diagonal->flowRunMeters * 1.10F);
+    CHECK(std::none_of(
+        built.selection.cells.begin(),
+        built.selection.cells.end(),
+        [&](const auto& cell) {
+            return cell.crossContourMeters >
+                   node.selectionWidthLimitMeters * 0.5F + 0.021F;
+        }));
+}
+
+TEST_CASE("Connected Seepage follows a ledge tangent and widens only where the surface flattens",
+          "[water][seepage][surface-cache][connected][ledge]") {
+    using invisible_places::water::BuildWaterSeepageSupportSelection;
+    using invisible_places::water::BuildWaterSurfaceCacheFromSamples;
+    using invisible_places::water::EvaluateWaterSeepageSupportCellMask;
+    using invisible_places::water::WaterSeepageSupportCell;
+    using invisible_places::water::WaterSurfaceRole;
+    using invisible_places::water::WaterSurfaceSample;
+
+    std::vector<WaterSurfaceSample> samples;
+    const auto addCell = [&](float x,
+                             float y,
+                             float z,
+                             const invisible_places::io::Float3& normal) {
+        for (std::uint32_t sample = 0U; sample < 8U; ++sample) {
+            samples.push_back({
+                .position = {
+                    x + static_cast<float>(sample) * 0.00001F,
+                    y,
+                    z,
+                },
+                .normal = normal,
+                .role = WaterSurfaceRole::Rock,
+            });
+        }
+    };
+    for (std::int32_t cross = -8; cross <= 8; ++cross) {
+        const float y =
+            0.005F + static_cast<float>(cross) * 0.010F;
+        for (std::int32_t down = 0; down <= 9; ++down) {
+            addCell(
+                0.005F,
+                y,
+                -0.005F - static_cast<float>(down) * 0.010F,
+                {1.0F, 0.0F, 0.0F});
+        }
+        for (std::int32_t out = 1; out <= 10; ++out) {
+            addCell(
+                0.005F + static_cast<float>(out) * 0.010F,
+                y,
+                -0.105F,
+                {0.0F, 0.0F, 1.0F});
+        }
+    }
+    const auto cache =
+        BuildWaterSurfaceCacheFromSamples(samples, 0.010F);
+    auto node = MakeSeepageNode();
+    node.position = {0.005F, 0.005F, -0.005F};
+    node.surfaceNormal = {1.0F, 0.0F, 0.0F};
+    node.downAxis = {0.0F, 0.0F, -1.0F};
+    node.widthMeters = 0.04F;
+    node.selectionReachLimitMeters = 0.45F;
+    node.selectionWidthLimitMeters = 0.16F;
+    node.edgeFeatherMeters = 0.005F;
+    const auto built =
+        BuildWaterSeepageSupportSelection(node, "ROCK", cache);
+    REQUIRE(built.success);
+    const auto ledgeEnd = std::find_if(
+        built.selection.cells.begin(),
+        built.selection.cells.end(),
+        [](const auto& cell) {
+            return !cell.upstream && cell.x >= 9 &&
+                   cell.z <= -10 &&
+                   cell.crossContourMeters < 0.012F;
+        });
+    REQUIRE(ledgeEnd != built.selection.cells.end());
+    CHECK(ledgeEnd->flowRunMeters > 0.16F);
+    CHECK(ledgeEnd->surfaceNormal.z > 0.9F);
+
+    const std::array selections{built.selection};
+    const auto runtime = BuildGrid(
+        {node},
+        "ROCK",
+        false,
+        {},
+        1'000'000ULL,
+        {},
+        {},
+        std::nullopt,
+        {},
+        selections)
+                             .nodes.front();
+    const WaterSeepageSupportCell wallCell{
+        .downwardDistanceMeters = 0.20F,
+        .flowRunMeters = 0.20F,
+        .crossContourMeters = 0.075F,
+        .surfaceNormal = {1.0F, 0.0F, 0.0F},
+        .confidence = 1.0F,
+    };
+    auto flatCell = wallCell;
+    flatCell.surfaceNormal = {0.0F, 0.0F, 1.0F};
+    CHECK(EvaluateWaterSeepageSupportCellMask(
+              runtime,
+              flatCell) >
+          EvaluateWaterSeepageSupportCellMask(
+              runtime,
+              wallCell) +
+              0.20F);
+}
+
+TEST_CASE("Connected Seepage charges confidence-weighted tangents and rejects normal-layer jumps",
+          "[water][seepage][surface-cache][connected][normal-frame]") {
+    using invisible_places::water::BuildWaterSeepageSupportSelection;
+    using invisible_places::water::BuildWaterSurfaceCacheFromSamples;
+    using invisible_places::water::WaterSurfaceRole;
+    using invisible_places::water::WaterSurfaceSample;
+
+    std::vector<WaterSurfaceSample> samples;
+    for (std::uint32_t sample = 0U; sample < 8U; ++sample) {
+        samples.push_back({
+            .position = {
+                0.005F + static_cast<float>(sample) * 0.00001F,
+                0.005F,
+                -0.005F,
+            },
+            .normal = {1.0F, 0.0F, 0.0F},
+            .role = WaterSurfaceRole::Rock,
+        });
+    }
+    // Low-confidence normal noise must not rotate the local tangent enough to
+    // reject this genuinely downhill neighbour.
+    samples.push_back({
+        .position = {0.005F, 0.005F, -0.015F},
+        .normal = {0.21F, 0.0F, 0.9777F},
+        .role = WaterSurfaceRole::Rock,
+    });
+    // An adjacent parallel layer is one cache cell away but lies entirely
+    // normal to the substrate, outside Surface Depth.
+    for (std::uint32_t sample = 0U; sample < 8U; ++sample) {
+        samples.push_back({
+            .position = {
+                0.015F,
+                0.005F + static_cast<float>(sample) * 0.00001F,
+                -0.015F,
+            },
+            .normal = {1.0F, 0.0F, 0.0F},
+            .role = WaterSurfaceRole::Rock,
+        });
+    }
+    const auto cache =
+        BuildWaterSurfaceCacheFromSamples(samples, 0.010F);
+    auto node = MakeSeepageNode();
+    node.position = {0.005F, 0.005F, -0.005F};
+    node.surfaceNormal = {1.0F, 0.0F, 0.0F};
+    node.downAxis = {0.0F, 0.0F, -1.0F};
+    node.depthToleranceMeters = 0.005F;
+    node.selectionReachLimitMeters = 0.10F;
+    node.selectionWidthLimitMeters = 0.10F;
+    node.edgeFeatherMeters = 0.005F;
+    const auto built =
+        BuildWaterSeepageSupportSelection(node, "ROCK", cache);
+    REQUIRE(built.success);
+    CHECK(std::any_of(
+        built.selection.cells.begin(),
+        built.selection.cells.end(),
+        [](const auto& cell) {
+            return cell.z <= -2 &&
+                   cell.flowRunMeters > 0.005F;
+        }));
+    CHECK(std::none_of(
+        built.selection.cells.begin(),
+        built.selection.cells.end(),
+        [](const auto& cell) {
+            return cell.x >= 1;
+        }));
 }
 
 TEST_CASE("Connected Seepage support keeps live dimensions parameter-only",
@@ -2722,23 +4226,45 @@ TEST_CASE("Connected Seepage support keeps live dimensions parameter-only",
     using invisible_places::water::BuildWaterSurfaceCacheFromSamples;
     using invisible_places::water::EvaluateWaterSeepageGridContribution;
     using invisible_places::water::PackWaterSeepageSupportReferenceMetadata;
+    using invisible_places::water::PackWaterSeepageSupportRunCrossMetrics;
     using invisible_places::water::UnpackWaterSeepageSupportReferenceMetadata;
+    using invisible_places::water::UnpackWaterSeepageSupportRunCrossMetrics;
     using invisible_places::water::WaterSeepageNodeAnimationStateEntry;
     using invisible_places::water::WaterSeepageParamsFingerprint;
     using invisible_places::water::WaterSeepageTopologyFingerprint;
     using invisible_places::water::WaterSurfaceRole;
     using invisible_places::water::WaterSurfaceSample;
+    using invisible_places::water::kWaterSeepageSupportConnectedFlag;
+    using invisible_places::water::kWaterSeepageSupportUpstreamFlag;
 
     const auto packed = PackWaterSeepageSupportReferenceMetadata(
         {0.0F, 1.0F, 0.0F},
         WaterSurfaceRole::Rock,
         0.73F,
-        1U);
+        kWaterSeepageSupportConnectedFlag |
+            kWaterSeepageSupportUpstreamFlag);
     const auto unpacked = UnpackWaterSeepageSupportReferenceMetadata(packed);
     CHECK(unpacked.sourceRole == WaterSurfaceRole::Rock);
     CHECK(unpacked.confidence == Catch::Approx(0.73F).margin(0.005F));
     CHECK(unpacked.surfaceNormal.y == Catch::Approx(1.0F).margin(0.005F));
-    CHECK(unpacked.flags == 1U);
+    CHECK(unpacked.flags ==
+          (kWaterSeepageSupportConnectedFlag |
+           kWaterSeepageSupportUpstreamFlag));
+    const auto packedRunCross =
+        PackWaterSeepageSupportRunCrossMetrics(1.234F, 0.067F);
+    const auto unpackedRunCross =
+        UnpackWaterSeepageSupportRunCrossMetrics(packedRunCross);
+    CHECK(unpackedRunCross.flowRunMeters ==
+          Catch::Approx(1.234F).margin(0.001F));
+    CHECK(unpackedRunCross.crossContourMeters ==
+          Catch::Approx(0.067F).margin(0.0001F));
+    const auto clampedRunCross =
+        UnpackWaterSeepageSupportRunCrossMetrics(
+            PackWaterSeepageSupportRunCrossMetrics(
+                -1.0F,
+                std::numeric_limits<float>::quiet_NaN()));
+    CHECK(clampedRunCross.flowRunMeters == 0.0F);
+    CHECK(clampedRunCross.crossContourMeters == 0.0F);
     STATIC_REQUIRE(sizeof(invisible_places::water::WaterSeepageSupportReference) == 16U);
 
     std::vector<WaterSurfaceSample> samples;

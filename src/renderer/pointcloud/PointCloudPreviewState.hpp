@@ -317,6 +317,10 @@ std::uint64_t ClampPointBudget(std::uint64_t totalPoints, std::uint64_t requeste
 [[nodiscard]] PointCloudMaterialVariant ResolvePointCloudMaterialVariant(
     const PointCloudStyleState& style,
     PointCloudDensityCompensation densityCompensation);
+[[nodiscard]] PointCloudMaterialVariant ResolvePointCloudMaterialVariant(
+    const PointCloudStyleState& style,
+    PointCloudDensityCompensation densityCompensation,
+    bool requiresUnifiedProceduralEffects);
 [[nodiscard]] const char* PointCloudMaterialVariantName(PointCloudMaterialVariant variant);
 PointBudgetState MakePointBudgetState(std::uint64_t totalPoints, std::uint64_t requestedPoints);
 PointBudgetState MakePointBudgetState(

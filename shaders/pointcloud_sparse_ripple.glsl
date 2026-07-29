@@ -67,7 +67,8 @@ struct SeepageNodeTopology {
     vec4 downEdge;
     // xyz: lateral fan direction, w: legacy topology source half-width.
     vec4 lateralStart;
-    // x: topology selection half-width limit.
+    // x: topology selection half-width limit,
+    // y: maximum resident upstream flow-run distance.
     vec4 geometry;
     // x: sample count, y: achieved reach as float bits, z: valid, w: complete.
     uvec4 guideControl;
@@ -93,6 +94,12 @@ struct SeepageNodeParams {
     vec4 liveGeometry;
     // Seed-derived, orientation-independent world-noise rotation.
     vec4 noiseBasis[3];
+    // x/y: current/transition sample counts, z/w: stable spans as float bits.
+    // The two fixed-capacity fields remain inside the frame-ringed parameter
+    // record, so animated pulses never alter topology or descriptors.
+    uvec4 pulseFieldControl;
+    vec4 pulseField[32];
+    vec4 transitionPulseField[32];
 };
 
 struct SeepageHashCell {
@@ -104,8 +111,11 @@ struct SeepageHashCell {
 
 struct SeepageNodeReference {
     uint nodeIndex;
-    float downstreamDistance;
-    float lateralDistance;
+    float leastResistanceCost;
+    // x: accumulated local flow-run; y: downstream cross-contour travel or
+    // station-relative upstream branch excess, packed as IEEE-754 half
+    // floats to preserve the 16-byte std430 reference ABI.
+    uint packedRunCross;
     uint packedNormalRoleConfidenceFlags;
 };
 
@@ -1805,11 +1815,10 @@ vec3 DecodeSeepageSupportNormal(uint packed) {
     return RippleSafeNormal(normal);
 }
 
-// Least-resistance membership: the cached per-cell flood cost is compared
-// against the live strength-driven budget (liveGeometry.w), and the geodesic
-// path distance keeps a full-strength source patch of the authored Width
-// around the node. CPU mirror: EvaluateConnectedSeepageSupportMask in
-// src/water/WaterFlow.cpp.
+// Least-resistance membership: immutable support stores flood cost plus
+// geometric flow-run/cross-contour distances. Live Strength changes only the
+// compact budget and width masks. CPU mirror:
+// EvaluateConnectedSeepageLiveMask in src/water/WaterFlow.cpp.
 float SeepageConnectedSupportMask(
     uint nodeIndex,
     SeepageNodeReference reference,
@@ -1822,40 +1831,239 @@ float SeepageConnectedSupportMask(
     out float lateralNormalised,
     out vec3 resolvedSurfaceNormal,
     out vec3 resolvedDownTangent) {
-    const float cost = max(0.0, reference.downstreamDistance);
-    const float pathDistance = max(0.0, reference.lateralDistance);
-    downstreamDistance = cost;
-    const vec3 lateralAxis = RippleSafeNormal(
-        seepageNodeData.seepageNodes[nodeIndex].lateralStart.xyz);
-    lateralDistance = dot(
-        worldPosition - seepageNodeData.seepageNodes[nodeIndex].positionReach.xyz,
-        lateralAxis);
+    const float rawCost = reference.leastResistanceCost;
+    const float cost = RippleFiniteFloat(rawCost) ? max(0.0, rawCost) : 0.0;
+    vec2 runCross = unpackHalf2x16(reference.packedRunCross);
+    runCross = vec2(
+        RippleFiniteFloat(runCross.x) ? max(0.0, runCross.x) : 0.0,
+        RippleFiniteFloat(runCross.y) ? max(0.0, runCross.y) : 0.0);
+    const float run = runCross.x;
+    const float crossContour = runCross.y;
+    const uint supportFlags =
+        (reference.packedNormalRoleConfidenceFlags >> 30u) & 0x3u;
+    const bool upstream = (supportFlags & 0x2u) != 0u;
+    // The upstream wick is a persistent damp source reveal, not a travelling
+    // wave lane. Retain its run for taper/membership but keep procedural
+    // downstream animation at the source.
+    downstreamDistance = upstream ? 0.0 : run;
     resolvedSurfaceNormal = DecodeSeepageSupportNormal(
         reference.packedNormalRoleConfidenceFlags);
-    resolvedDownTangent = RippleSafeNormal(
-        seepageNodeData.seepageNodes[nodeIndex].downEdge.xyz);
+
+    // Re-project gravity at every support cell so the animation follows
+    // ledges and protrusions rather than remaining vertical in the node's
+    // original tangent plane.
+    const vec3 gravity = vec3(0.0, 0.0, -1.0);
+    vec3 localDown =
+        gravity -
+        resolvedSurfaceNormal * dot(gravity, resolvedSurfaceNormal);
+    if (!RippleFiniteVec3(localDown) || dot(localDown, localDown) <= 1e-8) {
+        const vec3 nodeDown =
+            seepageNodeData.seepageNodes[nodeIndex].downEdge.xyz;
+        localDown =
+            nodeDown -
+            resolvedSurfaceNormal * dot(nodeDown, resolvedSurfaceNormal);
+    }
+    if (!RippleFiniteVec3(localDown) || dot(localDown, localDown) <= 1e-8) {
+        const vec3 helper =
+            abs(resolvedSurfaceNormal.x) < 0.8
+                ? vec3(1.0, 0.0, 0.0)
+                : vec3(0.0, 1.0, 0.0);
+        localDown = cross(resolvedSurfaceNormal, helper);
+    }
+    resolvedDownTangent = RippleSafeNormal(localDown);
+    vec3 localLateral = RippleSafeNormal(
+        cross(resolvedSurfaceNormal, resolvedDownTangent));
+    const vec3 nodeLateral = RippleSafeNormal(
+        seepageNodeData.seepageNodes[nodeIndex].lateralStart.xyz);
+    if (dot(localLateral, nodeLateral) < 0.0) {
+        localLateral = -localLateral;
+    }
+    lateralDistance = dot(
+        worldPosition - seepageNodeData.seepageNodes[nodeIndex].positionReach.xyz,
+        localLateral);
+
     const float budget = max(0.0, seepageParamData.seepageParams[nodeIndex].liveGeometry.w);
     const float sourceRadius =
         max(0.0, seepageParamData.seepageParams[nodeIndex].liveGeometry.y) * 0.5;
-    effectiveReach = budget;
-    effectiveHalfWidth = max(sourceRadius, budget * 0.5);
-    lateralNormalised = lateralDistance / max(effectiveHalfWidth, 1e-4);
     if (budget <= 1e-5) {
+        effectiveReach = 0.0;
+        effectiveHalfWidth = 0.0;
+        lateralNormalised = 0.0;
         return 0.0;
     }
-    const float edgeFeather = max(
-        1e-4,
+
+    const float cellSize = max(1e-5, styleData.seepageGridParams.x);
+    const float selectionHalfWidth = max(
+        0.0,
+        seepageNodeData.seepageNodes[nodeIndex].geometry.x);
+    const float authoredFeather = max(
+        0.0,
         seepageNodeData.seepageNodes[nodeIndex].downEdge.w);
-    const float feather = max(edgeFeather, budget * 0.15);
-    const float budgetMask = 1.0 - smoothstep(
-        max(0.0, budget - feather),
-        budget,
-        cost);
+    // Reveal the real resident high tip back toward the node over the first
+    // 12% of the immutable budget range, then release the downhill front.
+    // This mirrors EvaluateConnectedSeepageLiveMask exactly.
+    const float maximumBudget = max(
+        cellSize,
+        max(
+            0.0,
+            seepageNodeData.seepageNodes[nodeIndex].positionReach.w));
+    const float sequenceProgress = clamp(
+        budget / maximumBudget,
+        0.0,
+        1.0);
+    const float maximumUpstreamRun = max(
+        0.0,
+        seepageNodeData.seepageNodes[nodeIndex].geometry.y);
+    const float upstreamLeadFraction =
+        maximumUpstreamRun > cellSize * 0.5
+            ? 0.12
+            : 0.0;
+    const float routeProgress =
+        upstream
+            ? (upstreamLeadFraction > 0.0
+                   ? clamp(
+                         sequenceProgress / upstreamLeadFraction,
+                         0.0,
+                         1.0)
+                   : 0.0)
+            : (upstreamLeadFraction > 0.0
+                   ? clamp(
+                         (sequenceProgress - upstreamLeadFraction) /
+                             (1.0 - upstreamLeadFraction),
+                         0.0,
+                         1.0)
+                   : sequenceProgress);
+    const float routeBudget =
+        maximumBudget * routeProgress;
+    const float sourceFeather = max(
+        1e-5,
+        min(authoredFeather, cellSize * 2.0));
+
+    const vec3 projectedGravity =
+        gravity -
+        resolvedSurfaceNormal * dot(gravity, resolvedSurfaceNormal);
+    const float steepness = clamp(length(projectedGravity), 0.0, 1.0);
+    const float steepBlend = smoothstep(0.35, 0.75, steepness);
+
+    float budgetMask = 0.0;
+    float allowedHalfWidth = sourceRadius;
+    if (upstream) {
+        const float upstreamExtent =
+            max(cellSize, maximumUpstreamRun);
+        const float reverseFrontRun =
+            upstreamExtent * (1.0 - routeProgress);
+        const float reverseFrontFeather = max(
+            cellSize,
+            min(
+                max(cellSize, authoredFeather),
+                upstreamExtent * 0.15));
+        budgetMask =
+            reverseFrontRun <= 1e-5
+                ? 1.0
+                : smoothstep(
+                      max(
+                          0.0,
+                          reverseFrontRun - reverseFrontFeather),
+                      reverseFrontRun,
+                      run);
+
+        const float nodewardStation = clamp(
+            1.0 - run / upstreamExtent,
+            0.0,
+            1.0);
+        const float tipHalfWidth =
+            min(sourceRadius, cellSize * 0.5);
+        const float fullTaperHalfWidth = mix(
+            tipHalfWidth,
+            sourceRadius,
+            nodewardStation);
+        const float centrelineHalfWidth = mix(
+            tipHalfWidth,
+            sourceRadius,
+            nodewardStation * nodewardStation);
+        float lateralFill = 0.0;
+        if (routeProgress >= 1.0 - 1e-5) {
+            const float effectiveStrength = clamp(
+                seepageParamData.seepageParams[nodeIndex].geometry.z,
+                0.0,
+                1.0);
+            const float completionStrength =
+                sequenceProgress > 1e-5
+                    ? clamp(
+                          effectiveStrength *
+                              upstreamLeadFraction /
+                              sequenceProgress,
+                          0.0,
+                          1.0)
+                    : effectiveStrength;
+            lateralFill =
+                completionStrength >= 1.0 - 1e-6
+                    ? (effectiveStrength >= 1.0 - 1e-6
+                           ? 1.0
+                           : 0.0)
+                    : smoothstep(
+                          completionStrength,
+                          1.0,
+                          effectiveStrength);
+        }
+        allowedHalfWidth = mix(
+            centrelineHalfWidth,
+            fullTaperHalfWidth,
+            lateralFill);
+        effectiveReach = upstreamExtent;
+    } else {
+        const float frontFeather = max(
+            max(1e-5, authoredFeather),
+            routeBudget * 0.15);
+        budgetMask =
+            routeBudget > 1e-5
+                ? 1.0 - smoothstep(
+                      max(0.0, routeBudget - frontFeather),
+                      routeBudget,
+                      cost)
+                : 0.0;
+        allowedHalfWidth +=
+            run * mix(0.55, 0.10, steepBlend);
+        // The live budget is in least-resistance cost-metres. Patterns need
+        // the corresponding physical pure-downstream run so keyed fronts
+        // traverse steep support continuously instead of stopping at 75%.
+        const float pureRouteCostPerMeter =
+            mix(2.2, 0.75, steepBlend);
+        effectiveReach =
+            routeBudget / max(1e-5, pureRouteCostPerMeter);
+    }
+    allowedHalfWidth = clamp(
+        allowedHalfWidth,
+        0.0,
+        selectionHalfWidth);
+    effectiveHalfWidth = allowedHalfWidth;
+    lateralNormalised =
+        lateralDistance / max(effectiveHalfWidth, 1e-4);
+    const float lateralFeather = max(
+        1e-5,
+        min(
+            authoredFeather,
+            max(cellSize * 2.0, allowedHalfWidth * 0.25)));
+    const float widthMask = 1.0 - smoothstep(
+        allowedHalfWidth,
+        allowedHalfWidth + lateralFeather,
+        crossContour);
+    const float sourceDistance = length(vec2(run, crossContour));
     const float sourceMask = 1.0 - smoothstep(
         sourceRadius,
-        sourceRadius + feather,
-        pathDistance);
-    const float coreMask = clamp(max(budgetMask, sourceMask), 0.0, 1.0);
+        sourceRadius + sourceFeather,
+        sourceDistance);
+    const bool upstreamReachedNode =
+        upstreamLeadFraction <= 0.0 ||
+        sequenceProgress + 1e-6 >= upstreamLeadFraction;
+    const float releasedSourceMask =
+        !upstream && upstreamReachedNode
+            ? sourceMask
+            : 0.0;
+    const float coreMask = clamp(
+        max(releasedSourceMask, budgetMask * widthMask),
+        0.0,
+        1.0);
     if (coreMask <= 1e-6) {
         return 0.0;
     }
@@ -2116,18 +2324,69 @@ float SeepageReflectionSignal(
         1.0);
 }
 
-float SeepageContourWave(
-    float distanceMeters,
-    float widthMeters) {
-    const float width = max(0.001, widthMeters);
-    return clamp(
-        1.0 -
-            smoothstep(
-                width * 0.15,
-                width * 2.40,
-                abs(distanceMeters)),
+float SeepagePulseFieldValue(
+    uint nodeIndex,
+    bool transition,
+    uint sampleIndex) {
+    const uint vecIndex = sampleIndex >> 2u;
+    const int component = int(sampleIndex & 3u);
+    const vec4 packedSamples =
+        transition
+            ? seepageParamData.seepageParams[nodeIndex]
+                  .transitionPulseField[vecIndex]
+            : seepageParamData.seepageParams[nodeIndex]
+                  .pulseField[vecIndex];
+    const float value = packedSamples[component];
+    return RippleFiniteFloat(value) ? clamp(value, 0.0, 1.0) : 0.0;
+}
+
+float SampleSeepagePulseField(
+    uint nodeIndex,
+    bool transition,
+    float downstreamMeters) {
+    const uvec4 control =
+        seepageParamData.seepageParams[nodeIndex].pulseFieldControl;
+    const uint sampleCount = min(
+        transition ? control.y : control.x,
+        128u);
+    const float stableSpan = uintBitsToFloat(
+        transition ? control.w : control.z);
+    if (sampleCount == 0u ||
+        !RippleFiniteFloat(stableSpan) ||
+        stableSpan <= 1e-6) {
+        return 0.0;
+    }
+    if (sampleCount == 1u) {
+        return SeepagePulseFieldValue(
+            nodeIndex,
+            transition,
+            0u);
+    }
+
+    const float normalised = clamp(
+        RippleFiniteFloat(downstreamMeters)
+            ? downstreamMeters / stableSpan
+            : 0.0,
         0.0,
         1.0);
+    const float sampleCoordinate =
+        normalised * float(sampleCount - 1u);
+    const uint firstIndex = min(
+        uint(floor(sampleCoordinate)),
+        sampleCount - 1u);
+    const uint secondIndex = min(
+        firstIndex + 1u,
+        sampleCount - 1u);
+    return mix(
+        SeepagePulseFieldValue(
+            nodeIndex,
+            transition,
+            firstIndex),
+        SeepagePulseFieldValue(
+            nodeIndex,
+            transition,
+            secondIndex),
+        fract(sampleCoordinate));
 }
 
 vec3 SeepagePatternSignals(
@@ -2172,11 +2431,7 @@ vec3 SeepagePatternSignals(
         seepageParamData.seepageParams[nodeIndex].noiseBasis[2].xyz);
     if (lookControl.x == 3u) {
         const float spacing = max(0.005, legacy0.x);
-        const float width = clamp(legacy0.y, 0.001, spacing * 0.49);
-        const float speed = max(0.0, legacy0.z);
         const float irregularity = clamp(legacy0.w, 0.0, 1.0);
-        const int waveCount = int(clamp(floor(legacy1.x + 0.5), 1.0, 12.0));
-        const float speedVariation = clamp(legacy1.y, 0.0, 1.0);
         const float downstream = max(0.0, downstreamDistance);
         const float lateralNormalised = clamp(
             signedLateralDistance / max(0.001, effectiveHalfWidth),
@@ -2194,76 +2449,21 @@ vec3 SeepagePatternSignals(
         const float baseBowedFront =
             pow(abs(lateralNormalised), 1.35) *
             spacing * (0.10 + irregularity * 0.28);
-        const float supportSpan = max(
-            max(0.005, effectiveReach) + width * 5.0,
-            spacing * 2.5);
-        float accumulatedWaves = 0.0;
-        for (int waveIndex = 0; waveIndex < 12; ++waveIndex) {
-            if (waveIndex >= waveCount) {
-                break;
-            }
-            const float speedHash = SeepageNoiseHash01(
-                waveIndex,
-                11,
-                proceduralSeed + 19009u);
-            const float startHash = SeepageNoiseHash01(
-                waveIndex,
-                23,
-                proceduralSeed + 27143u);
-            const float widthHash = SeepageNoiseHash01(
-                waveIndex,
-                37,
-                proceduralSeed + 31847u);
-            const float shapeHash = SeepageNoiseHash01(
-                waveIndex,
-                53,
-                proceduralSeed + 45119u);
-            const float amplitudeHash = SeepageNoiseHash01(
-                waveIndex,
-                71,
-                proceduralSeed + 57203u);
-            const float waveSpeed = speed * max(
-                0.15,
-                1.0 +
-                    (speedHash * 2.0 - 1.0) *
-                        speedVariation);
-            const float idleGap = max(
-                spacing * (0.45 + shapeHash * 0.55),
-                width * 4.0);
-            const float cycleDistance = supportSpan + idleGap;
-            const float travel =
-                mod(
-                    time * waveSpeed +
-                        startHash * cycleDistance,
-                    cycleDistance) -
-                idleGap;
-            const float waveWidth =
-                width * (0.72 + widthHash * 0.78);
-            const float shapeSign =
-                shapeHash < 0.5 ? -1.0 : 1.0;
-            const float frontWarp =
-                centredNoise * spacing * irregularity *
-                (0.14 + shapeHash * 0.24) * shapeSign;
-            const float slowShapeChange =
-                sin(
-                    time * organic0.z *
-                        (0.15 + widthHash * 0.25) +
-                    shapeHash * kRippleTwoPi) *
-                width * irregularity * 0.55;
-            const float distanceToWave =
-                downstream +
-                baseBowedFront * (0.72 + shapeHash * 0.46) +
-                frontWarp + slowShapeChange - travel;
-            const float wave =
-                SeepageContourWave(distanceToWave, waveWidth);
-            const float amplitude =
-                (0.58 + amplitudeHash * 0.42) *
-                mix(0.82, 1.16, frontNoise.value);
-            accumulatedWaves += wave * amplitude;
-        }
+        // All authored wave launches and their slow evolution were composed
+        // once for this node into a fixed-span longitudinal field. Per point,
+        // stationary world noise only bows/roughens the lookup coordinate.
+        // This keeps Strength/Rain reveals from teleporting wave phase and
+        // replaces the former 7–12-wave inner loop with one interpolation.
+        const float frontWarp =
+            centredNoise * spacing * irregularity * 0.25;
+        const float fieldDistance =
+            downstream + baseBowedFront + frontWarp;
         const float pulse = clamp(
-            accumulatedWaves * 0.22 +
-                max(0.0, accumulatedWaves - 0.90) * 0.42,
+            SampleSeepagePulseField(
+                nodeIndex,
+                transition,
+                fieldDistance) *
+                mix(0.82, 1.16, frontNoise.value),
             0.0,
             1.0);
         const float coverageThreshold = 0.72 - density * 0.38;
@@ -2285,9 +2485,11 @@ vec3 SeepagePatternSignals(
             max(pulse, dampPatch * 0.15));
         return vec3(
             clamp(
-                strengthMask * wetness *
-                    (0.06 + dampPatch * 0.10 +
-                     pulse * (0.76 + rainGain * 0.12)),
+                strengthMask *
+                    (wetness * (0.06 + dampPatch * 0.10) +
+                     pulse *
+                         (0.62 + wetness * 0.14 +
+                          rainGain * 0.12)),
                 0.0,
                 1.0),
             clamp(

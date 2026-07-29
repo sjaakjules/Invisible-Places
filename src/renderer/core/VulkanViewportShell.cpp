@@ -1,6 +1,7 @@
 #include "renderer/core/VulkanViewportShell.hpp"
 
 #include "InvisiblePlacesBuildConfig.hpp"
+#include "water/WaterSeepagePulseField.hpp"
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -16,6 +17,7 @@
 #include <chrono>
 #include <cmath>
 #include <cctype>
+#include <cstddef>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -288,7 +290,7 @@ struct alignas(16) WaterSeepageNodeTopologyGpu {
     glm::vec4 normalSurface{0.0F, 1.0F, 0.0F, 0.15F};
     glm::vec4 downEdge{0.0F, 0.0F, -1.0F, 0.10F};
     glm::vec4 lateralStart{1.0F, 0.0F, 0.0F, 0.06F};
-    // x: tail half-width.
+    // x: selection half-width, y: maximum resident upstream run.
     glm::vec4 geometry{0.375F, 0.0F, 0.0F, 0.0F};
     glm::uvec4 guideControl{0U, 0U, 0U, 0U};
     std::array<glm::vec4, kGuideSampleCapacity> guidePositionStation{};
@@ -299,6 +301,8 @@ struct alignas(16) WaterSeepageNodeTopologyGpu {
 // It intentionally retains the two complete looks required for deterministic
 // point-level pattern cross-dissolves, but contains no guide/topology data.
 struct alignas(16) WaterSeepageNodeParamsGpu {
+    static constexpr std::size_t kPulseFieldVec4Capacity = 32U;
+
     // x: stable node id, y: quality, z: blend mode, w: seed.
     glm::uvec4 control{0U, 1U, 1U, 1U};
     // x: viewport/export enabled factor, y: normal-alignment weight,
@@ -310,16 +314,25 @@ struct alignas(16) WaterSeepageNodeParamsGpu {
     // x: scenario/local spread, y: transition amount, z: wetting progress.
     glm::vec4 scenario{0.0F, 0.0F, 1.0F, 0.0F};
     // x: live reach, y: live full width, z: live prominence,
-    // w: live source half-width. These values never rebuild topology.
-    glm::vec4 liveGeometry{1.25F, 0.75F, 1.0F, 0.06F};
+    // w: least-resistance travel budget. These values never rebuild topology.
+    glm::vec4 liveGeometry{1.25F, 0.75F, 1.0F, 1.5F};
     // Seed-derived basis is live so changing a node seed immediately changes
     // both noise orientation and procedural hashes.
     std::array<glm::vec4, 3> noiseBasis{};
+    // x/y: current/transition sample counts, z/w: their stable spans as float
+    // bits. Both fields are rewritten through the existing frame-safe
+    // parameter ring; no topology or descriptor update is needed per frame.
+    glm::uvec4 pulseFieldControl{0U, 0U, 0U, 0U};
+    std::array<glm::vec4, kPulseFieldVec4Capacity> pulseField{};
+    std::array<glm::vec4, kPulseFieldVec4Capacity> transitionPulseField{};
 };
 
 static_assert(sizeof(WaterSeepageLookGpu) == 176U);
 static_assert(sizeof(WaterSeepageNodeTopologyGpu) == 368U);
-static_assert(sizeof(WaterSeepageNodeParamsGpu) == 464U);
+static_assert(sizeof(WaterSeepageNodeParamsGpu) == 1504U);
+static_assert(offsetof(WaterSeepageNodeParamsGpu, pulseFieldControl) == 464U);
+static_assert(offsetof(WaterSeepageNodeParamsGpu, pulseField) == 480U);
+static_assert(offsetof(WaterSeepageNodeParamsGpu, transitionPulseField) == 992U);
 
 WaterSeepageLookGpu MakeWaterSeepageLookGpu(
     const invisible_places::water::WaterSeepageLookSettings& look) {
@@ -765,7 +778,9 @@ WaterSeepageNodeTopologyGpu MakeWaterSeepageNodeTopologyGpu(
         std::max(
             0.001F,
             finiteOr(node.selectionWidthLimitMeters, 1.215F) * 0.5F),
-        0.0F,
+        std::max(
+            0.0F,
+            finiteOr(node.maximumUpstreamRunMeters, 0.0F)),
         0.0F,
         0.0F,
     };
@@ -822,6 +837,50 @@ WaterSeepageNodeTopologyGpu MakeWaterSeepageNodeTopologyGpu(
     return gpu;
 }
 
+struct PackedWaterSeepagePulseField {
+    std::uint32_t sampleCount = 0U;
+    std::uint32_t stableSpanBits = 0U;
+    std::array<
+        glm::vec4,
+        WaterSeepageNodeParamsGpu::kPulseFieldVec4Capacity> samples{};
+};
+
+PackedWaterSeepagePulseField PackWaterSeepagePulseField(
+    const invisible_places::water::WaterSeepagePulseField& field) {
+    static_assert(
+        WaterSeepageNodeParamsGpu::kPulseFieldVec4Capacity * 4U ==
+        invisible_places::water::kWaterSeepagePulseFieldCapacity);
+
+    PackedWaterSeepagePulseField packed;
+    const float stableSpan = std::isfinite(field.stableSpanMeters)
+                                 ? std::clamp(
+                                       field.stableSpanMeters,
+                                       0.005F,
+                                       1000.0F)
+                                 : 0.0F;
+    const auto sampleCount = std::min<std::uint32_t>(
+        field.sampleCount,
+        invisible_places::water::kWaterSeepagePulseFieldCapacity);
+    if (sampleCount == 0U || stableSpan <= 0.0F) {
+        return packed;
+    }
+
+    packed.sampleCount = sampleCount;
+    packed.stableSpanBits = std::bit_cast<std::uint32_t>(stableSpan);
+    for (std::uint32_t sampleIndex = 0U;
+         sampleIndex < sampleCount;
+         ++sampleIndex) {
+        const float sample = std::isfinite(field.samples[sampleIndex])
+                                 ? std::clamp(
+                                       field.samples[sampleIndex],
+                                       0.0F,
+                                       1.0F)
+                                 : 0.0F;
+        packed.samples[sampleIndex / 4U][sampleIndex % 4U] = sample;
+    }
+    return packed;
+}
+
 WaterSeepageNodeParamsGpu MakeWaterSeepageNodeParamsGpu(
     const invisible_places::water::WaterSeepageRuntimeNode& node) {
     const auto finiteOr = [](float value, float fallback) {
@@ -868,6 +927,24 @@ WaterSeepageNodeParamsGpu MakeWaterSeepageNodeParamsGpu(
         }
         gpu.noiseBasis[basisIndex] = glm::vec4{basis, 0.0F};
     }
+    const auto pulseField = PackWaterSeepagePulseField(node.pulseField);
+    auto transitionPulseField =
+        PackWaterSeepagePulseField(node.transitionPulseField);
+    // A missing transition field is safe to treat as the current field. This
+    // keeps a partially prepared frame deterministic while still allowing
+    // the point-level pattern selector to choose either look.
+    if (transitionPulseField.sampleCount == 0U &&
+        pulseField.sampleCount != 0U) {
+        transitionPulseField = pulseField;
+    }
+    gpu.pulseFieldControl = glm::uvec4{
+        pulseField.sampleCount,
+        transitionPulseField.sampleCount,
+        pulseField.stableSpanBits,
+        transitionPulseField.stableSpanBits,
+    };
+    gpu.pulseField = pulseField.samples;
+    gpu.transitionPulseField = transitionPulseField.samples;
     return gpu;
 }
 
@@ -2511,6 +2588,13 @@ std::uint64_t VulkanViewportShell::PointCloudResourceResidentBytes(
     add(resources.dynamicMeshFlowParticleBuffer);
     add(resources.dynamicMeshFlowContactEventBuffer);
     add(resources.dynamicMeshFlowContactGridBuffer);
+    add(resources.seepageNodeBuffer);
+    for (const auto& paramsBuffer : resources.seepageParamsBuffers) {
+        add(paramsBuffer);
+    }
+    add(resources.seepageExrParamsBuffer);
+    add(resources.seepageHashCellBuffer);
+    add(resources.seepageNodeReferenceBuffer);
     add(resources.waterFlowPendingPositionBuffer);
     add(resources.waterFlowPendingPositionStorageBuffer);
     add(resources.waterFlowPendingColorBuffer);
@@ -5256,6 +5340,35 @@ std::size_t VulkanViewportShell::WaterSeepageNodeReferenceCount(std::size_t laye
     return resources != nullptr ? static_cast<std::size_t>(resources->seepageNodeReferenceCount) : 0U;
 }
 
+std::uint64_t VulkanViewportShell::WaterSeepageResidentBytes(
+    std::size_t layerId) const {
+    const auto* resources = FindPointCloudResources(layerId);
+    if (resources == nullptr) {
+        return 0U;
+    }
+    const auto bufferBytes = [](const BufferAllocation& buffer) {
+        return buffer.buffer != VK_NULL_HANDLE
+                   ? static_cast<std::uint64_t>(buffer.size)
+                   : 0U;
+    };
+    std::uint64_t bytes = 0U;
+    const auto add = [&](const BufferAllocation& buffer) {
+        const auto size = bufferBytes(buffer);
+        bytes = size >
+                        std::numeric_limits<std::uint64_t>::max() - bytes
+                    ? std::numeric_limits<std::uint64_t>::max()
+                    : bytes + size;
+    };
+    add(resources->seepageNodeBuffer);
+    for (const auto& paramsBuffer : resources->seepageParamsBuffers) {
+        add(paramsBuffer);
+    }
+    add(resources->seepageExrParamsBuffer);
+    add(resources->seepageHashCellBuffer);
+    add(resources->seepageNodeReferenceBuffer);
+    return bytes;
+}
+
 std::uint64_t VulkanViewportShell::WaterSeepageTopologyUploadRevision(std::size_t layerId) const {
     const auto* resources = FindPointCloudResources(layerId);
     return resources != nullptr ? resources->seepageTopologyUploadRevision : 0U;
@@ -5953,7 +6066,11 @@ void VulkanViewportShell::UploadWaterSurfaceCache(
         };
         if (streamsPersistedTables) {
             invisible_places::water::WaterSurfaceGpuStreamChecksumBuilder
-                streamChecksum;
+                streamChecksum =
+                    gpuData->persistedTables.payloadValidationDeferred
+                        ? gpuData->persistedTables.payloadChecksumPrefix
+                        : invisible_places::water::
+                              WaterSurfaceGpuStreamChecksumBuilder{};
             std::ifstream persistedInput{
                 gpuData->persistedTables.filePath,
                 std::ios::binary};
@@ -5994,8 +6111,11 @@ void VulkanViewportShell::UploadWaterSurfaceCache(
                     pending.groundTableBuffer,
                     &streamChecksum);
             }
-            if (streamChecksum.Finish() !=
-                    gpuData->persistedTables.streamChecksum ||
+            const auto expectedStreamChecksum =
+                gpuData->persistedTables.payloadValidationDeferred
+                    ? gpuData->payloadChecksum
+                    : gpuData->persistedTables.streamChecksum;
+            if (streamChecksum.Finish() != expectedStreamChecksum ||
                 !persistedFileMatchesSnapshot()) {
                 throw std::runtime_error{
                     "Water surface sidecar changed during GPU upload."};
@@ -13768,6 +13888,28 @@ bool VulkanViewportShell::ResolvePointCloudDrawPlan(const SceneRenderState::Poin
     return true;
 }
 
+renderer::pointcloud::PointCloudMaterialVariant
+VulkanViewportShell::ResolvePointCloudLayerMaterialVariant(
+    const SceneRenderState::PointCloudLayerState& layer) const {
+    const auto* resources = FindPointCloudResources(layer.layerId);
+    // ConstantSimple and OpaqueHardDisc deliberately omit the procedural
+    // water evaluator. Once Seepage topology is attached, keep this layer on
+    // the unified material even while a frame-ring parameter update is
+    // settling; the style readiness gate safely disables Seepage for that
+    // individual frame, whereas selecting either optimized shader would
+    // silently discard the effect for every frame and export.
+    const bool hasAttachedSeepage =
+        resources != nullptr &&
+        resources->seepageNodeCount > 0U &&
+        resources->seepageHashCellCapacity > 0U &&
+        resources->seepageNodeReferenceCount > 0U &&
+        resources->seepageUnionBounds.valid;
+    return renderer::pointcloud::ResolvePointCloudMaterialVariant(
+        layer.style,
+        layer.densityCompensation,
+        hasAttachedSeepage);
+}
+
 bool VulkanViewportShell::UploadPointCloudLayerStyle(
     const SceneRenderState::PointCloudLayerState& layer,
     const PointCloudDrawPlan& plan,
@@ -13828,7 +13970,7 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         renderer::pointcloud::SanitizePointCloudDensityCompensation(layer.densityCompensation);
     const bool forceDepthContribution =
         renderState_.eyeDomeLightingEnabled || liveSceneReadbackCaptureEnabled_ ||
-        renderer::pointcloud::ResolvePointCloudMaterialVariant(layer.style, densityCompensation) ==
+        ResolvePointCloudLayerMaterialVariant(layer) ==
             renderer::pointcloud::PointCloudMaterialVariant::OpaqueHardDisc;
     styleGpu.renderControl = glm::uvec4{
         forceDepthContribution ? 2U : 0U,
@@ -14651,9 +14793,8 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
                 true));
             continue;
         }
-        const auto materialVariant = renderer::pointcloud::ResolvePointCloudMaterialVariant(
-            layer.style,
-            layer.densityCompensation);
+        const auto materialVariant =
+            ResolvePointCloudLayerMaterialVariant(layer);
         const bool opaqueHardDisc =
             materialVariant == renderer::pointcloud::PointCloudMaterialVariant::OpaqueHardDisc;
         if (opaqueHardDisc || renderState_.eyeDomeLightingEnabled) {
@@ -14678,9 +14819,7 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     for (const auto& layer : renderState_.pointCloudLayers) {
         VkPipeline spritePipeline = resources.pointAccumulationPipeline;
         VkPipeline surfelPipeline = resources.surfelAccumulationPipeline;
-        if (renderer::pointcloud::ResolvePointCloudMaterialVariant(
-                layer.style,
-                layer.densityCompensation) ==
+        if (ResolvePointCloudLayerMaterialVariant(layer) ==
             renderer::pointcloud::PointCloudMaterialVariant::ConstantSimple) {
             spritePipeline = resources.pointConstantSimpleAccumulationPipeline;
             surfelPipeline = resources.surfelConstantSimpleAccumulationPipeline;
@@ -14960,9 +15099,8 @@ void VulkanViewportShell::RecordCommandBuffer(
         (!fastBasicPointRenderer || liveSceneReadbackCaptureEnabled_) &&
         !renderState_.pointCloudLayers.empty()) {
         for (const auto& layer : renderState_.pointCloudLayers) {
-            const auto materialVariant = renderer::pointcloud::ResolvePointCloudMaterialVariant(
-                layer.style,
-                layer.densityCompensation);
+            const auto materialVariant =
+                ResolvePointCloudLayerMaterialVariant(layer);
             const bool opaqueHardDisc =
                 materialVariant == renderer::pointcloud::PointCloudMaterialVariant::OpaqueHardDisc;
             if (opaqueHardDisc || renderState_.eyeDomeLightingEnabled ||
@@ -15005,9 +15143,8 @@ void VulkanViewportShell::RecordCommandBuffer(
 
     if (drawLiveScene && !fastBasicPointRenderer && !renderState_.pointCloudLayers.empty()) {
         for (const auto& layer : renderState_.pointCloudLayers) {
-            const auto materialVariant = renderer::pointcloud::ResolvePointCloudMaterialVariant(
-                layer.style,
-                layer.densityCompensation);
+            const auto materialVariant =
+                ResolvePointCloudLayerMaterialVariant(layer);
             if (materialVariant == renderer::pointcloud::PointCloudMaterialVariant::OpaqueHardDisc) {
                 continue;
             }
@@ -15256,9 +15393,8 @@ void VulkanViewportShell::RecordCommandBuffer(
         }
     } else if (drawLiveScene && !renderState_.pointCloudLayers.empty()) {
         for (const auto& layer : renderState_.pointCloudLayers) {
-            const auto materialVariant = renderer::pointcloud::ResolvePointCloudMaterialVariant(
-                layer.style,
-                layer.densityCompensation);
+            const auto materialVariant =
+                ResolvePointCloudLayerMaterialVariant(layer);
             if (materialVariant != renderer::pointcloud::PointCloudMaterialVariant::OpaqueHardDisc) {
                 continue;
             }

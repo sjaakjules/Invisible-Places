@@ -114,7 +114,11 @@ ReadPersistedGpuStreamChecksum(
     if (!input.is_open()) {
         throw std::runtime_error{"Unable to open persisted GPU tables."};
     }
-    invisible_places::water::WaterSurfaceGpuStreamChecksumBuilder checksum;
+    invisible_places::water::WaterSurfaceGpuStreamChecksumBuilder checksum =
+        tables.payloadValidationDeferred
+            ? tables.payloadChecksumPrefix
+            : invisible_places::water::
+                  WaterSurfaceGpuStreamChecksumBuilder{};
     std::array<std::byte, 23U> scratch{};
     const auto readSection = [&](std::uint64_t offset,
                                  std::uint64_t tag,
@@ -1208,6 +1212,23 @@ TEST_CASE("rain collision cache persistence rejects stale signatures", "[water][
     CHECK(loaded.gpuData.sourceIdentity == expectedIdentity);
     CHECK_FALSE(invisible_places::water::LoadWaterSurfaceCache(path, "changed", &loaded, &error));
 
+    invisible_places::water::WaterSurfaceCache deferred;
+    REQUIRE(invisible_places::water::LoadWaterSurfaceCache(
+        path,
+        "expected",
+        &deferred,
+        &error,
+        nullptr,
+        invisible_places::water::WaterSurfaceCacheLoadValidation::
+            DeferGpuPayloadToUpload));
+    REQUIRE(deferred.gpuData.persistedTables.Valid());
+    CHECK(deferred.gpuData.persistedTables.payloadValidationDeferred);
+    CHECK_FALSE(deferred.gpuData.persistedTables.streamChecksum.Valid());
+    CHECK(
+        ReadPersistedGpuStreamChecksum(deferred.gpuData.persistedTables) ==
+        deferred.gpuData.payloadChecksum);
+    CHECK(deferred.cacheIdentity == expectedIdentity);
+
     // A renderer may reopen the sidecar after asynchronous validation. Even
     // if an in-place edit preserves both size and timestamp, the direct
     // staging stream checksum must distinguish it before hidden resources are
@@ -1221,6 +1242,15 @@ TEST_CASE("rain collision cache persistence rejects stale signatures", "[water][
         "expected",
         &changedDuringUpload,
         &error));
+    invisible_places::water::WaterSurfaceCache deferredChangedDuringUpload;
+    REQUIRE(invisible_places::water::LoadWaterSurfaceCache(
+        changedDuringUploadPath,
+        "expected",
+        &deferredChangedDuringUpload,
+        &error,
+        nullptr,
+        invisible_places::water::WaterSurfaceCacheLoadValidation::
+            DeferGpuPayloadToUpload));
     const auto unchangedWriteTime =
         std::filesystem::last_write_time(changedDuringUploadPath);
     {
@@ -1250,6 +1280,10 @@ TEST_CASE("rain collision cache persistence rejects stale signatures", "[water][
     CHECK(ReadPersistedGpuStreamChecksum(
               changedDuringUpload.gpuData.persistedTables) !=
           changedDuringUpload.gpuData.persistedTables.streamChecksum);
+    CHECK(
+        ReadPersistedGpuStreamChecksum(
+            deferredChangedDuringUpload.gpuData.persistedTables) !=
+        deferredChangedDuringUpload.gpuData.payloadChecksum);
 
     // Schema 4 requires its checksum trailer; truncation cannot silently turn a
     // current cache into a trusted warm-load payload.

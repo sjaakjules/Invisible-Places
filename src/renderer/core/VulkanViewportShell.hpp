@@ -525,6 +525,7 @@ class VulkanViewportShell {
     [[nodiscard]] std::size_t WaterSeepageNodeCount(std::size_t layerId) const;
     [[nodiscard]] std::size_t WaterSeepageOccupiedCellCount(std::size_t layerId) const;
     [[nodiscard]] std::size_t WaterSeepageNodeReferenceCount(std::size_t layerId) const;
+    [[nodiscard]] std::uint64_t WaterSeepageResidentBytes(std::size_t layerId) const;
     [[nodiscard]] std::uint64_t WaterSeepageTopologyUploadRevision(std::size_t layerId) const;
     [[nodiscard]] std::uint64_t WaterSeepageParamsUploadRevision(std::size_t layerId) const;
     [[nodiscard]] WaterEffectFramePublicationDiagnostics WaterSeepageParamsPublicationState(
@@ -1213,6 +1214,9 @@ class VulkanViewportShell {
         bool forceFullSource,
         bool requireLiveDescriptors,
         PointCloudDrawPlan* plan);
+    [[nodiscard]] renderer::pointcloud::PointCloudMaterialVariant
+    ResolvePointCloudLayerMaterialVariant(
+        const SceneRenderState::PointCloudLayerState& layer) const;
     [[nodiscard]] bool UploadPointCloudLayerStyle(
         const SceneRenderState::PointCloudLayerState& layer,
         const PointCloudDrawPlan& plan,

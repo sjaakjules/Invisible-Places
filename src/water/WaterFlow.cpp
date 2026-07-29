@@ -1,6 +1,7 @@
 #include "water/WaterFlow.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <bit>
 #include <cctype>
@@ -20,6 +21,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -28,6 +30,7 @@
 
 #include <glm/common.hpp>
 #include <glm/geometric.hpp>
+#include <glm/packing.hpp>
 #include <glm/vec2.hpp>
 #include <glm/vec3.hpp>
 #include <glm/vec4.hpp>
@@ -5206,67 +5209,157 @@ SeepagePatternSignals EvaluateWettingTrickleSeepageSignals(
     const float rainGain = Clamp01(node.rainVisualStrength * look.rainResponse);
     const float wetness = Clamp01(look.baseWetness + 0.30F * rainGain);
     const float density = Clamp01(look.density + 0.25F * rainGain);
-    const float patchSize = std::max(0.005F, look.tricklePatchSizeMeters);
-    const float trickleWidth = std::max(0.001F, look.trickleWidthMeters);
+    const float featureSize = std::max(0.005F, look.tricklePatchSizeMeters);
+    const float trickleWidth = std::max(0.002F, look.trickleWidthMeters);
     // The wetting front travels the same strength- and slope-shaped run the
     // fan mask uses, so the pattern never re-declares its own extent (the
     // node Reach — already spread/rain scaled — is the single area source).
     const float trickleLength = std::max(0.005F, fan.effectiveReach);
-    const float frontSoftness = std::max(0.001F, look.trickleFrontSoftness);
-    const float downDistance = std::max(0.0F, fan.downDistance);
+    const float frontSoftness = std::max(0.002F, look.trickleFrontSoftness);
+    const float downstream = std::max(0.0F, fan.downDistance);
+    const float distanceProgress =
+        std::clamp(downstream / trickleLength, 0.0F, 1.0F);
     const float time = std::max(0.0F, timeSeconds);
+    glm::vec3 resolvedDown = fan.downTangent;
+    if (!IsValidPoint(resolvedDown) ||
+        glm::dot(resolvedDown, resolvedDown) <= kNormalEpsilon) {
+        resolvedDown = glm::vec3{0.0F, 0.0F, 1.0F};
+    } else {
+        resolvedDown = glm::normalize(resolvedDown);
+    }
     const glm::vec3 advectedPosition =
-        position - fan.downTangent * (time * look.downhillDriftMetersPerSecond);
+        position -
+        resolvedDown *
+            (time * std::max(0.0F, look.downhillDriftMetersPerSecond));
     const std::uint32_t proceduralSeed = node.seed ^ (node.id * 0x9e3779b9U);
 
-    glm::vec3 patchCoordinate = node.noiseRotation * (advectedPosition / patchSize);
-    patchCoordinate += glm::vec3{0.019F, -0.031F, 0.023F} * (time * look.evolution);
-    const auto patchNoise = SeepageFractalNoise3(
-        patchCoordinate,
+    glm::vec3 coordinate =
+        node.noiseRotation * (advectedPosition / featureSize);
+    coordinate +=
+        glm::vec3{0.037F, -0.029F, 0.043F} *
+        (time * look.evolution);
+    const auto trickleNoise = SeepageFractalNoise3(
+        coordinate,
         proceduralSeed + 6151U,
         node.resolvedQuality);
-    const float patchFeather = std::lerp(0.26F, 0.055F, Clamp01(look.contrast));
-    const float patchThreshold = 0.78F - density * 0.46F;
-    const float patch = SmoothStep(
-        patchThreshold - patchFeather,
-        patchThreshold + patchFeather,
-        patchNoise.value);
+    const float breakup = Clamp01(look.breakup);
+    const float patchThreshold =
+        0.70F - density * 0.34F + breakup * 0.07F;
+    const float patchField = SmoothStep(
+        patchThreshold,
+        patchThreshold + std::lerp(0.22F, 0.12F, breakup),
+        trickleNoise.value);
 
-    const float frontVariation =
-        (patchNoise.value - 0.5F) * frontSoftness * (0.35F + look.breakup * 1.15F);
-    const float frontDistance = trickleLength * progress + frontVariation;
-    // No separate tail mask: the fan mask's end feather already fades the run
-    // out at the effective reach.
-    const float arrivalMask = Clamp01(1.0F - SmoothStep(
-        frontDistance,
-        frontDistance + frontSoftness,
-        downDistance));
-    if (arrivalMask <= 1.0e-6F) {
-        return {};
-    }
+    const float sourceDistance =
+        std::hypot(downstream, fan.signedLateralDistance);
+    const float sourceEnvelope = 1.0F - SmoothStep(
+        featureSize * 0.30F,
+        featureSize * 1.35F,
+        sourceDistance);
+    const float sourcePatch =
+        sourceEnvelope * std::lerp(0.38F, 1.0F, patchField);
 
-    glm::vec3 fingerCoordinate{
-        fan.signedLateralDistance / trickleWidth,
-        downDistance / std::max(patchSize * 1.75F, trickleWidth),
-        time * look.evolution * 0.37F,
-    };
-    fingerCoordinate += patchNoise.gradient * (look.curl * 0.18F);
-    const auto fingerNoise = SeepageFractalNoise3(
-        fingerCoordinate,
-        proceduralSeed + 12289U,
-        node.resolvedQuality);
-    const float ridge = 1.0F - std::abs(fingerNoise.value * 2.0F - 1.0F);
-    const float fingerThreshold = 0.46F + Clamp01(look.breakup) * 0.22F;
-    const float fingers = SmoothStep(fingerThreshold, 0.94F, ridge);
-    const float seededPatch = Clamp01(
-        patch * (0.58F + fingers * 0.42F) + fingers * density * 0.24F);
+    const float fanHalfWidth = std::max(1.0e-4F, fan.effectiveHalfWidth);
+    const float lateralWander =
+        (trickleNoise.value - 0.5F) *
+        featureSize *
+        std::lerp(0.16F, 0.85F, breakup);
+    const float laneHash0 =
+        SeepageHash01(0, 0, proceduralSeed + 7013U);
+    const float laneHash1 =
+        SeepageHash01(1, 0, proceduralSeed + 7013U);
+    const float laneHash2 =
+        SeepageHash01(2, 0, proceduralSeed + 7013U);
+    const float lane0 =
+        (laneHash0 - 0.5F) * fanHalfWidth * 0.55F +
+        lateralWander;
+    const float lane1 =
+        (laneHash1 - 0.5F) * fanHalfWidth * 1.25F -
+        lateralWander * 0.58F;
+    const float lane2 =
+        (laneHash2 - 0.5F) * fanHalfWidth * 1.55F +
+        lateralWander * 0.36F;
+    const float softWidth =
+        trickleWidth * std::lerp(1.65F, 2.65F, breakup);
+    float fingers = 1.0F - SmoothStep(
+        trickleWidth,
+        softWidth,
+        std::abs(fan.signedLateralDistance - lane0));
+    const float secondaryGate = SmoothStep(
+        0.22F,
+        0.72F,
+        density + laneHash1 * 0.24F);
+    const float tertiaryGate = SmoothStep(
+        0.48F,
+        0.90F,
+        density + laneHash2 * 0.18F);
+    fingers = std::max(
+        fingers,
+        (1.0F - SmoothStep(
+                    trickleWidth * 0.82F,
+                    softWidth * 0.86F,
+                    std::abs(
+                        fan.signedLateralDistance -
+                        lane1))) *
+            secondaryGate);
+    fingers = std::max(
+        fingers,
+        (1.0F - SmoothStep(
+                    trickleWidth * 0.68F,
+                    softWidth * 0.74F,
+                    std::abs(
+                        fan.signedLateralDistance -
+                        lane2))) *
+            tertiaryGate);
+
+    const auto delayCellDown = static_cast<std::int32_t>(
+        std::floor(downstream / featureSize));
+    const auto delayCellLateral = static_cast<std::int32_t>(
+        std::floor(fan.signedLateralDistance / featureSize));
+    const float saturationDelay = SeepageHash01(
+        delayCellDown,
+        delayCellLateral,
+        proceduralSeed + 8089U);
+    const float onset = std::clamp(
+        0.03F +
+            distanceProgress * 0.68F +
+            saturationDelay * 0.14F +
+            (1.0F - patchField) * breakup * 0.06F,
+        0.0F,
+        0.92F);
+    const float progressFeather = std::clamp(
+        frontSoftness / trickleLength,
+        0.008F,
+        0.32F);
+    const float wetReveal = SmoothStep(
+        onset - progressFeather,
+        onset + progressFeather,
+        progress);
+    const float frontPulse = 1.0F - SmoothStep(
+        progressFeather,
+        progressFeather * 3.2F,
+        std::abs(progress - onset));
+    const float breakupGate = std::lerp(
+        1.0F,
+        SmoothStep(
+            0.20F,
+            0.78F,
+            trickleNoise.value + patchField * 0.22F),
+        breakup);
+    const float trickleBody = fingers * breakupGate;
+    const float persistentDamp = std::max(
+        sourcePatch,
+        trickleBody * (0.50F + patchField * 0.50F));
+    const float activeWet = wetReveal * persistentDamp;
     const glm::vec3 baseNormal = ResolveSeepagePatternNormal(pointNormal, fan);
     const glm::vec3 environmentDirection = SeepageEnvironmentDirection(look);
-    const glm::vec3 worldGradient = glm::transpose(node.noiseRotation) * patchNoise.gradient;
+    const glm::vec3 worldGradient =
+        glm::transpose(node.noiseRotation) *
+        trickleNoise.gradient;
     const float sparseGate = SmoothStep(
         0.90F - look.glintDensity * 0.58F,
         0.98F,
-        fingerNoise.value);
+        trickleNoise.value);
     const float reflection = SeepageReflectionSignal(
         look,
         position,
@@ -5274,30 +5367,27 @@ SeepagePatternSignals EvaluateWettingTrickleSeepageSignals(
         worldGradient,
         environmentDirection,
         viewContext,
-        sparseGate);
+        std::max(sparseGate, activeWet * 0.42F));
     // Strength shapes the area envelope inside the fan mask, not the signal
     // amplitude (see EvaluateSeepageAreaEnvelope).
-    const float strengthMask = fan.mask * arrivalMask;
+    const float strengthMask = fan.mask;
     return {
         .damp = Clamp01(
-            strengthMask *
-            (wetness * (0.58F + seededPatch * 0.38F) +
-             fingers * (0.08F + rainGain * 0.12F))),
+            strengthMask * activeWet *
+            (wetness * (0.70F + patchField * 0.22F) +
+             rainGain * 0.12F)),
         .variation = Clamp01(
-            strengthMask * fingers * (0.16F + seededPatch * 0.34F)),
+            strengthMask * wetReveal *
+            (trickleBody *
+                 (0.16F + patchField * 0.20F) +
+             frontPulse * fingers * 0.52F +
+             sourcePatch * 0.08F)),
         .glint = Clamp01(
-            strengthMask * seededPatch * look.glisten * reflection),
+            strengthMask *
+            activeWet *
+            look.glisten *
+            reflection),
     };
-}
-
-float SeepageContourWave(float distanceMeters, float widthMeters) {
-    const float width = std::max(0.001F, widthMeters);
-    return Clamp01(
-        1.0F -
-        SmoothStep(
-            width * 0.15F,
-            width * 2.40F,
-            std::abs(distanceMeters)));
 }
 
 SeepagePatternSignals EvaluateContourPulseSeepageSignals(
@@ -5306,22 +5396,13 @@ SeepagePatternSignals EvaluateContourPulseSeepageSignals(
     const SeepageFanSample& fan,
     const glm::vec3& position,
     const glm::vec3& pointNormal,
-    float timeSeconds,
+    bool transitionPulseField,
     const WaterSeepageViewContext& viewContext) {
     const float rainGain = Clamp01(node.rainVisualStrength * look.rainResponse);
     const float wetness = Clamp01(look.baseWetness + 0.30F * rainGain);
     const float density = Clamp01(look.density + 0.25F * rainGain);
     const float spacing = std::max(0.005F, look.pulseSpacingMeters);
-    const float width = std::clamp(look.pulseWidthMeters, 0.001F, spacing * 0.49F);
-    const float speed = std::max(0.0F, look.pulseSpeedMetersPerSecond);
     const float irregularity = Clamp01(look.pulseIrregularity);
-    const int waveCount = std::clamp(
-        static_cast<int>(std::lround(look.pulseWaveCount)),
-        1,
-        12);
-    const float speedVariation =
-        Clamp01(look.pulseSpeedVariation);
-    const float time = std::max(0.0F, timeSeconds);
     const float downstream = std::max(0.0F, fan.downDistance);
     const float lateralNormalised = std::clamp(
         fan.signedLateralDistance / std::max(0.001F, fan.effectiveHalfWidth),
@@ -5343,80 +5424,18 @@ SeepagePatternSignals EvaluateContourPulseSeepageSignals(
     const float baseBowedFront =
         std::pow(std::abs(lateralNormalised), 1.35F) *
         spacing * (0.10F + irregularity * 0.28F);
-    const float supportSpan = std::max(
-        std::max(0.005F, fan.effectiveReach) + width * 5.0F,
-        spacing * 2.5F);
-    float accumulatedWaves = 0.0F;
-    for (int waveIndex = 0; waveIndex < waveCount; ++waveIndex) {
-        const float speedHash = SeepageHash01(
-            waveIndex,
-            11,
-            proceduralSeed + 19009U);
-        const float startHash = SeepageHash01(
-            waveIndex,
-            23,
-            proceduralSeed + 27143U);
-        const float widthHash = SeepageHash01(
-            waveIndex,
-            37,
-            proceduralSeed + 31847U);
-        const float shapeHash = SeepageHash01(
-            waveIndex,
-            53,
-            proceduralSeed + 45119U);
-        const float amplitudeHash = SeepageHash01(
-            waveIndex,
-            71,
-            proceduralSeed + 57203U);
-
-        const float waveSpeed = speed * std::max(
-            0.15F,
-            1.0F +
-                (speedHash * 2.0F - 1.0F) *
-                    speedVariation);
-        const float idleGap =
-            std::max(spacing * (0.45F + shapeHash * 0.55F),
-                     width * 4.0F);
-        const float cycleDistance = supportSpan + idleGap;
-        // A stable random phase is equivalent to a random launch time. Each
-        // lane also has its own cycle and speed, so faster waves genuinely
-        // catch and reinforce slower ones rather than translating one mask.
-        const float travel =
-            std::fmod(
-                time * waveSpeed +
-                    startHash * cycleDistance,
-                cycleDistance) -
-            idleGap;
-        const float waveWidth =
-            width * (0.72F + widthHash * 0.78F);
-        const float shapeSign =
-            shapeHash < 0.5F ? -1.0F : 1.0F;
-        const float frontWarp =
-            centredNoise * spacing * irregularity *
-            (0.14F + shapeHash * 0.24F) * shapeSign;
-        const float slowShapeChange =
-            std::sin(
-                time * look.evolution *
-                    (0.15F + widthHash * 0.25F) +
-                shapeHash * kSeepageTwoPi) *
-            width * irregularity * 0.55F;
-        const float distanceToWave =
-            downstream +
-            baseBowedFront * (0.72F + shapeHash * 0.46F) +
-            frontWarp + slowShapeChange - travel;
-        const float wave =
-            SeepageContourWave(distanceToWave, waveWidth);
-        const float amplitude =
-            (0.58F + amplitudeHash * 0.42F) *
-            std::lerp(0.82F, 1.16F, frontNoise.value);
-        accumulatedWaves += wave * amplitude;
-    }
-    // One broad wave is intentionally subtle. Catch-up overlap ramps much
-    // faster, producing local high-intensity regions without hard bands.
+    // All launches, independent speeds, slow evolution, and additive overlap
+    // were composed once for this node into a stable longitudinal field.
+    // Per point, stationary world noise only bends the lookup coordinate.
+    const float frontWarp =
+        centredNoise * spacing * irregularity * 0.25F;
+    const auto& pulseField = transitionPulseField
+                                 ? node.transitionPulseField
+                                 : node.pulseField;
     const float pulse = Clamp01(
-        accumulatedWaves * 0.22F +
-        std::max(0.0F, accumulatedWaves - 0.90F) *
-            0.42F);
+        pulseField.Sample(
+            downstream + baseBowedFront + frontWarp) *
+        std::lerp(0.82F, 1.16F, frontNoise.value));
 
     const float coverageThreshold = 0.72F - density * 0.38F;
     const float dampPatch = SmoothStep(
@@ -5438,9 +5457,11 @@ SeepagePatternSignals EvaluateContourPulseSeepageSignals(
     const float strengthMask = fan.mask;
     return {
         .damp = Clamp01(
-            strengthMask * wetness *
-            (0.06F + dampPatch * 0.10F +
-             pulse * (0.76F + rainGain * 0.12F))),
+            strengthMask *
+            (wetness * (0.06F + dampPatch * 0.10F) +
+             pulse *
+                 (0.62F + wetness * 0.14F +
+                  rainGain * 0.12F))),
         .variation = Clamp01(
             strengthMask * pulse * (0.30F + dampPatch * 0.24F)),
         .glint = Clamp01(
@@ -5450,14 +5471,22 @@ SeepagePatternSignals EvaluateContourPulseSeepageSignals(
     };
 }
 
-WaterSeepageLookSettings SelectSeepageTransitionLook(
+struct SelectedSeepageTransitionLook {
+    WaterSeepageLookSettings look{};
+    bool transition = false;
+};
+
+SelectedSeepageTransitionLook SelectSeepageTransitionLook(
     const WaterSeepageRuntimeNode& node,
     const glm::vec3& position) {
     if (!node.transitionLook.has_value() || node.transitionAmount <= 1.0e-6F) {
-        return node.look;
+        return {.look = node.look, .transition = false};
     }
     if (node.transitionAmount >= 1.0F - 1.0e-6F) {
-        return node.transitionLook.value();
+        return {
+            .look = node.transitionLook.value(),
+            .transition = true,
+        };
     }
     const float cellSize = std::max(0.005F, std::min(
         node.look.featureSizeMeters,
@@ -5466,7 +5495,13 @@ WaterSeepageLookSettings SelectSeepageTransitionLook(
     const float selector = static_cast<float>(
         SeepageHash3(coordinate, node.seed ^ node.id) & 0x00ffffffU) /
         static_cast<float>(0x01000000U);
-    return selector < node.transitionAmount ? node.transitionLook.value() : node.look;
+    const bool useTransition = selector < node.transitionAmount;
+    return {
+        .look = useTransition
+                    ? node.transitionLook.value()
+                    : node.look,
+        .transition = useTransition,
+    };
 }
 
 void BlendSeepageContribution(
@@ -5768,6 +5803,10 @@ WaterSeepageNodeAnimationState SanitizeSeepageNodeAnimationState(
     state.strengthOverride = sanitizeOverride(state.strengthOverride);
     state.prominenceOverride = sanitizeOverride(state.prominenceOverride);
     state.sourceWidthOverride = sanitizeOverride(state.sourceWidthOverride);
+    if (state.lookOverride.has_value()) {
+        state.lookOverride = SanitizeSeepageLook(
+            std::move(state.lookOverride.value()));
+    }
     return state;
 }
 
@@ -5819,9 +5858,12 @@ void ApplySeepageRuntimeScenarioAndAnimation(
         return;
     }
     const auto nodeState = SanitizeSeepageNodeAnimationState(rawNodeState);
-    node->look = scenarioState.has_value()
-                     ? SanitizeSeepageLook(scenarioState->seepageLook)
-                     : SanitizeSeepageLook(node->authoredLook);
+    node->look = nodeState.lookOverride.has_value()
+                     ? SanitizeSeepageLook(nodeState.lookOverride.value())
+                     : scenarioState.has_value()
+                           ? SanitizeSeepageLook(
+                                 scenarioState->seepageLook)
+                           : SanitizeSeepageLook(node->authoredLook);
     node->resolvedQuality = ResolveWaterSeepageQuality(
         node->look.quality,
         effectivePointInvocations);
@@ -5986,6 +6028,97 @@ std::string WaterDynamicMeshFlowSettingsFingerprint(
 
 WaterSeepageLookSettings DefaultWaterSeepageLookSettings() {
     return {};
+}
+
+bool ApplyWaterSeepageLookTimingValue(
+    WaterSeepageLookSettings* look,
+    std::string_view settingId,
+    float value) {
+    if (look == nullptr || !std::isfinite(value)) {
+        return false;
+    }
+    float* target = nullptr;
+    if (settingId == "look.base_wetness") {
+        target = &look->baseWetness;
+    } else if (settingId == "look.density") {
+        target = &look->density;
+    } else if (settingId == "look.glisten") {
+        target = &look->glisten;
+    } else if (settingId == "look.rain_response") {
+        target = &look->rainResponse;
+    } else if (settingId == "look.feature_size") {
+        target = &look->featureSizeMeters;
+    } else if (settingId == "look.contrast") {
+        target = &look->contrast;
+    } else if (settingId == "look.evolution") {
+        target = &look->evolution;
+    } else if (settingId == "look.roughness") {
+        target = &look->roughness;
+    } else if (settingId == "look.angle_response") {
+        target = &look->angleResponse;
+    } else if (settingId == "look.micro_normal_strength") {
+        target = &look->microNormalStrength;
+    } else if (settingId == "look.glint_density") {
+        target = &look->glintDensity;
+    } else if (settingId == "look.environment_azimuth") {
+        target = &look->environmentAzimuthDegrees;
+    } else if (settingId == "look.environment_elevation") {
+        target = &look->environmentElevationDegrees;
+    } else if (settingId == "look.curl") {
+        target = &look->curl;
+    } else if (settingId == "look.breakup") {
+        target = &look->breakup;
+    } else if (settingId == "look.downhill_drift") {
+        target = &look->downhillDriftMetersPerSecond;
+    } else if (settingId == "look.trickle_patch_size") {
+        target = &look->tricklePatchSizeMeters;
+    } else if (settingId == "look.trickle_width") {
+        target = &look->trickleWidthMeters;
+    } else if (settingId == "look.trickle_front_softness") {
+        target = &look->trickleFrontSoftness;
+    } else if (settingId == "look.pulse_spacing") {
+        target = &look->pulseSpacingMeters;
+    } else if (settingId == "look.pulse_width") {
+        target = &look->pulseWidthMeters;
+    } else if (settingId == "look.pulse_speed") {
+        target = &look->pulseSpeedMetersPerSecond;
+    } else if (settingId == "look.pulse_irregularity") {
+        target = &look->pulseIrregularity;
+    } else if (settingId == "look.pulse_wave_count") {
+        target = &look->pulseWaveCount;
+    } else if (settingId == "look.pulse_speed_variation") {
+        target = &look->pulseSpeedVariation;
+    } else if (settingId == "response.intensity") {
+        target = &look->response.intensity;
+    } else if (settingId == "response.emission_add") {
+        target = &look->response.emissionAdd;
+    } else if (settingId == "response.opacity_add") {
+        target = &look->response.opacityAdd;
+    } else if (settingId == "response.opacity_multiply") {
+        target = &look->response.opacityMultiply;
+    } else if (settingId == "response.point_size_add") {
+        target = &look->response.pointSizeAdd;
+    } else if (settingId == "response.point_size_multiply") {
+        target = &look->response.pointSizeMultiply;
+    } else if (settingId == "response.hue_shift") {
+        target = &look->response.hueShift;
+    } else if (settingId == "response.colourise_red") {
+        target = &look->response.colouriseRed;
+    } else if (settingId == "response.colourise_green") {
+        target = &look->response.colouriseGreen;
+    } else if (settingId == "response.colourise_blue") {
+        target = &look->response.colouriseBlue;
+    } else if (settingId == "response.colourise_amount") {
+        target = &look->response.colouriseAmount;
+    } else if (settingId == "response.gaussian_sharpness_bias") {
+        target = &look->response.gaussianSharpnessBias;
+    }
+    if (target == nullptr) {
+        return false;
+    }
+    *target = value;
+    *look = SanitizeSeepageLook(std::move(*look));
+    return true;
 }
 
 std::vector<WaterScenarioDefinition> DefaultWaterScenarioDefinitions() {
@@ -7181,10 +7314,62 @@ WaterFeatureTimingRun SanitizeWaterFeatureTimingRun(
     return run;
 }
 
+bool AssignWaterFeatureToTimingRun(
+    WaterScenarioFeatureRuns* entry,
+    const WaterKeyedFeatureId& feature,
+    std::uint32_t targetRunId) {
+    if (entry == nullptr) {
+        return false;
+    }
+    const auto targetIt = std::find_if(
+        entry->runs.begin(),
+        entry->runs.end(),
+        [&](const WaterFeatureTimingRun& run) {
+            return run.id == targetRunId;
+        });
+    if (targetIt == entry->runs.end()) {
+        return false;
+    }
+
+    std::optional<WaterFeatureTimeline> movedTimeline;
+    for (auto& run : entry->runs) {
+        const auto timelineIt = std::find_if(
+            run.features.begin(),
+            run.features.end(),
+            [&](const WaterFeatureTimeline& timeline) {
+                return timeline.feature == feature;
+            });
+        if (timelineIt == run.features.end()) {
+            continue;
+        }
+        if (run.id == targetRunId) {
+            return true;
+        }
+        movedTimeline = std::move(*timelineIt);
+        run.features.erase(timelineIt);
+        break;
+    }
+
+    auto destination = std::find_if(
+        entry->runs.begin(),
+        entry->runs.end(),
+        [&](const WaterFeatureTimingRun& run) {
+            return run.id == targetRunId;
+        });
+    if (destination == entry->runs.end()) {
+        return false;
+    }
+    destination->features.push_back(
+        movedTimeline.has_value()
+            ? std::move(movedTimeline.value())
+            : WaterFeatureTimeline{.feature = feature});
+    return true;
+}
+
 std::optional<float> EvaluateWaterKeyedSettingTrack(
     const WaterKeyedSettingTrack& track,
     float normalizedPosition) {
-    if (track.keys.empty()) {
+    if (!track.active || track.keys.empty()) {
         return std::nullopt;
     }
     normalizedPosition = Clamp01(SeepageFiniteOr(normalizedPosition, 0.0F));
@@ -7346,6 +7531,9 @@ std::size_t WaterFeatureKeyCountAtPosition(
     float position) {
     std::size_t count = 0U;
     for (const auto& setting : timeline.settings) {
+        if (!setting.active) {
+            continue;
+        }
         count += WaterSettingKeyCountAtPosition(setting, position);
     }
     return count;
@@ -7359,6 +7547,9 @@ std::size_t RemoveWaterFeatureKeysAtPosition(
     }
     std::size_t removed = 0U;
     for (auto& setting : timeline->settings) {
+        if (!setting.active) {
+            continue;
+        }
         removed += RemoveWaterSettingKeysAtPosition(
             &setting,
             position);
@@ -7369,6 +7560,9 @@ std::size_t RemoveWaterFeatureKeysAtPosition(
 std::optional<float> PreviousWaterSettingKeyPosition(
     const WaterKeyedSettingTrack& track,
     float position) {
+    if (!track.active) {
+        return std::nullopt;
+    }
     constexpr float kNeighbourTolerance = 1.0e-4F;
     std::optional<float> best;
     for (const auto& key : track.keys) {
@@ -7383,6 +7577,9 @@ std::optional<float> PreviousWaterSettingKeyPosition(
 std::optional<float> NextWaterSettingKeyPosition(
     const WaterKeyedSettingTrack& track,
     float position) {
+    if (!track.active) {
+        return std::nullopt;
+    }
     constexpr float kNeighbourTolerance = 1.0e-4F;
     std::optional<float> best;
     for (const auto& key : track.keys) {
@@ -7422,6 +7619,34 @@ std::optional<float> NextWaterFeatureKeyPosition(
         }
     }
     return best;
+}
+
+std::vector<float> WaterFeatureProfileKeyPositions(
+    const WaterFeatureTimeline& timeline,
+    std::string_view profileGroup) {
+    constexpr float kPositionTolerance = 1.0e-4F;
+    std::vector<float> positions;
+    for (const auto& setting : timeline.settings) {
+        if (!setting.active || setting.profileGroup != profileGroup) {
+            continue;
+        }
+        for (const auto& key : setting.keys) {
+            if (std::isfinite(key.position)) {
+                positions.push_back(Clamp01(key.position));
+            }
+        }
+    }
+    std::sort(positions.begin(), positions.end());
+    positions.erase(
+        std::unique(
+            positions.begin(),
+            positions.end(),
+            [](float left, float right) {
+                return std::abs(left - right) <=
+                       kPositionTolerance;
+            }),
+        positions.end());
+    return positions;
 }
 
 const float* WaterFeatureTimingOverlay::Find(
@@ -7581,6 +7806,15 @@ WaterSeepageLookSettings ResolveWaterSeepageLook(
         node.responseProfileName);
 }
 
+WaterSeepageLookSettings ResolveWaterSeepageTimingLookBase(
+    const WaterSeepageLookSettings& resolvedAuthoredLook,
+    const std::optional<WaterScenarioState>& scenarioState) {
+    return SanitizeSeepageLook(
+        scenarioState.has_value()
+            ? scenarioState->seepageLook
+            : resolvedAuthoredLook);
+}
+
 std::string WaterSeepageLocalLookName(std::string_view baseName, std::uint32_t nodeId) {
     baseName = TrimSeepageName(baseName);
     if (baseName.empty()) {
@@ -7679,6 +7913,185 @@ WaterSeepageSupportReferenceMetadata UnpackWaterSeepageSupportReferenceMetadata(
     };
 }
 
+std::uint32_t PackWaterSeepageSupportRunCrossMetrics(
+    float flowRunMeters,
+    float crossContourMeters) {
+    constexpr float kMaximumFiniteHalf = 65504.0F;
+    const glm::vec2 metrics{
+        std::clamp(
+            SeepageFiniteOr(flowRunMeters, 0.0F),
+            0.0F,
+            kMaximumFiniteHalf),
+        std::clamp(
+            SeepageFiniteOr(crossContourMeters, 0.0F),
+            0.0F,
+            kMaximumFiniteHalf),
+    };
+    return glm::packHalf2x16(metrics);
+}
+
+WaterSeepageSupportRunCrossMetrics
+UnpackWaterSeepageSupportRunCrossMetrics(std::uint32_t packed) {
+    const glm::vec2 metrics = glm::unpackHalf2x16(packed);
+    return {
+        .flowRunMeters = std::max(
+            0.0F,
+            SeepageFiniteOr(metrics.x, 0.0F)),
+        .crossContourMeters = std::max(
+            0.0F,
+            SeepageFiniteOr(metrics.y, 0.0F)),
+    };
+}
+
+namespace {
+
+WaterSeepagePulseFieldQuality ResolveSeepagePulseFieldQuality(
+    WaterSeepageQuality quality) {
+    switch (quality) {
+        case WaterSeepageQuality::Low:
+            return WaterSeepagePulseFieldQuality::Low;
+        case WaterSeepageQuality::High:
+            return WaterSeepagePulseFieldQuality::High;
+        case WaterSeepageQuality::Auto:
+        case WaterSeepageQuality::Balanced:
+            return WaterSeepagePulseFieldQuality::Balanced;
+    }
+    return WaterSeepagePulseFieldQuality::Balanced;
+}
+
+WaterSeepagePulseField BuildRuntimeSeepagePulseField(
+    const WaterSeepageRuntimeNode& node,
+    const WaterSeepageLookSettings& look,
+    float sampleTimeSeconds) {
+    if (look.pattern != WaterSeepagePattern::ContourPulses) {
+        return {};
+    }
+    WaterSeepagePulseFieldSettings settings;
+    settings.spacingMeters = look.pulseSpacingMeters;
+    settings.widthMeters = look.pulseWidthMeters;
+    settings.speedMetersPerSecond =
+        look.pulseSpeedMetersPerSecond;
+    settings.irregularity = look.pulseIrregularity;
+    settings.evolution = look.evolution;
+    settings.waveCount = look.pulseWaveCount;
+    settings.speedVariation = look.pulseSpeedVariation;
+    settings.seed = node.seed;
+    settings.nodeId = node.id;
+    settings.quality =
+        ResolveSeepagePulseFieldQuality(node.resolvedQuality);
+    // Preserve the old minimum cycle domain for very small authored support,
+    // but never derive it from live reach/Strength/Rain.
+    settings.stableSpanMeters = std::max(
+        std::max(0.005F, node.pulseStableSpanMeters),
+        std::max(0.005F, look.pulseSpacingMeters) * 2.5F);
+    settings.timeSeconds = sampleTimeSeconds;
+    return BuildWaterSeepagePulseField(settings);
+}
+
+std::uint64_t WaterSeepagePulseFieldPreparationFingerprint(
+    const WaterSeepageRuntimeNode& node,
+    float currentTime,
+    float transitionTime) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    const auto fingerprintLook =
+        [&](const WaterSeepageLookSettings& look, float time) {
+            SeepageFingerprintU32(
+                &hash,
+                static_cast<std::uint32_t>(look.pattern));
+            if (look.pattern != WaterSeepagePattern::ContourPulses) {
+                return;
+            }
+            SeepageFingerprintFloat(&hash, look.pulseSpacingMeters);
+            SeepageFingerprintFloat(&hash, look.pulseWidthMeters);
+            SeepageFingerprintFloat(
+                &hash,
+                look.pulseSpeedMetersPerSecond);
+            SeepageFingerprintFloat(&hash, look.pulseIrregularity);
+            SeepageFingerprintFloat(&hash, look.pulseWaveCount);
+            SeepageFingerprintFloat(&hash, look.pulseSpeedVariation);
+            SeepageFingerprintFloat(&hash, look.evolution);
+            SeepageFingerprintFloat(&hash, time);
+        };
+    SeepageFingerprintU32(&hash, node.id);
+    SeepageFingerprintU32(&hash, node.seed);
+    SeepageFingerprintU32(
+        &hash,
+        static_cast<std::uint32_t>(node.resolvedQuality));
+    SeepageFingerprintFloat(
+        &hash,
+        node.pulseStableSpanMeters);
+    fingerprintLook(node.look, currentTime);
+    SeepageFingerprintU32(
+        &hash,
+        node.transitionLook.has_value() ? 1U : 0U);
+    if (node.transitionLook.has_value()) {
+        fingerprintLook(
+            node.transitionLook.value(),
+            transitionTime);
+    }
+    // Zero is reserved for an unprepared runtime node.
+    return hash == 0U ? 1U : hash;
+}
+
+void PrepareRuntimeSeepagePulseFields(
+    WaterSeepageRuntimeNode* node,
+    float sampleTimeSeconds) {
+    if (node == nullptr) {
+        return;
+    }
+    const float time = std::max(
+        0.0F,
+        SeepageFiniteOr(sampleTimeSeconds, 0.0F));
+    const auto pulseFieldAnimates =
+        [](const WaterSeepageLookSettings& look) {
+            return look.pattern ==
+                       WaterSeepagePattern::ContourPulses &&
+                   (look.pulseSpeedMetersPerSecond > 1.0e-6F ||
+                    look.evolution > 1.0e-6F);
+        };
+    const float currentTime =
+        pulseFieldAnimates(node->look) ? time : 0.0F;
+    const float transitionTime =
+        node->transitionLook.has_value() &&
+                pulseFieldAnimates(node->transitionLook.value())
+            ? time
+            : 0.0F;
+    const auto preparationFingerprint =
+        WaterSeepagePulseFieldPreparationFingerprint(
+            *node,
+            currentTime,
+            transitionTime);
+    if (node->pulseFieldPreparationFingerprint ==
+        preparationFingerprint) {
+        return;
+    }
+    node->pulseField =
+        BuildRuntimeSeepagePulseField(
+            *node,
+            node->look,
+            currentTime);
+    node->transitionPulseField = node->transitionLook.has_value()
+                                     ? BuildRuntimeSeepagePulseField(
+                                           *node,
+                                           node->transitionLook.value(),
+                                           transitionTime)
+                                     : node->pulseField;
+    const bool hasContourPulses =
+        node->look.pattern == WaterSeepagePattern::ContourPulses ||
+        (node->transitionLook.has_value() &&
+         node->transitionLook->pattern ==
+             WaterSeepagePattern::ContourPulses);
+    node->pulseFieldTimeSeconds =
+        hasContourPulses &&
+                (currentTime > 0.0F || transitionTime > 0.0F)
+            ? time
+            : 0.0F;
+    node->pulseFieldPreparationFingerprint =
+        preparationFingerprint;
+}
+
+}  // namespace
+
 WaterSeepageSpatialGrid BuildWaterSeepageSpatialGrid(
     std::span<const WaterSeepageNode> nodes,
     std::span<const WaterSeepageLookProfile> profiles,
@@ -7757,6 +8170,10 @@ WaterSeepageSpatialGrid BuildWaterSeepageSpatialGrid(
             SeepageFiniteOr(node.selectionWidthLimitMeters, 1.215F),
             0.002F,
             1000.0F);
+        runtime.pulseStableSpanMeters = std::max(
+            0.005F,
+            runtime.selectionReachLimitMeters /
+                kWaterSeepageDescentCostFactor);
         runtime.authoredStartHalfWidthMeters = 0.5F * std::clamp(
             SeepageFiniteOr(node.startWidthMeters, 0.12F),
             0.002F,
@@ -7790,6 +8207,7 @@ WaterSeepageSpatialGrid BuildWaterSeepageSpatialGrid(
             rainSettings,
             effectivePointInvocations,
             FindSeepageNodeAnimationState(nodeAnimationStates, node.id));
+        PrepareRuntimeSeepagePulseFields(&runtime, 0.0F);
         CopyWaterSeepageSurfaceGuide(
             FindWaterSeepageSurfaceGuide(guides, node.id),
             &runtime);
@@ -7859,8 +8277,14 @@ WaterSeepageSpatialGrid BuildWaterSeepageSpatialGrid(
         ++grid.diagnostics.supportSelectionCount;
         for (const auto& cell : selection->cells) {
             if (!std::isfinite(cell.downwardDistanceMeters) ||
-                !std::isfinite(cell.lateralDistanceMeters)) {
+                !std::isfinite(cell.flowRunMeters) ||
+                !std::isfinite(cell.crossContourMeters)) {
                 continue;
+            }
+            if (cell.upstream) {
+                runtime.maximumUpstreamRunMeters = std::max(
+                    runtime.maximumUpstreamRunMeters,
+                    std::max(0.0F, cell.flowRunMeters));
             }
             supportByCell[{cell.x, cell.y, cell.z}].push_back({
                 .nodeIndex = static_cast<std::uint32_t>(nodeIndex),
@@ -7934,13 +8358,19 @@ WaterSeepageSpatialGrid BuildWaterSeepageSpatialGrid(
                 grid.supportReferences.push_back({
                     .nodeIndex = reference.nodeIndex,
                     .downwardDistanceMeters = reference.cell.downwardDistanceMeters,
-                    .lateralDistanceMeters = reference.cell.lateralDistanceMeters,
+                    .packedRunCrossMeters =
+                        PackWaterSeepageSupportRunCrossMetrics(
+                            reference.cell.flowRunMeters,
+                            reference.cell.crossContourMeters),
                     .packedNormalRoleConfidenceFlags =
                         PackWaterSeepageSupportReferenceMetadata(
                             reference.cell.surfaceNormal,
                             reference.sourceRole,
                             reference.cell.confidence,
-                            1U),
+                            kWaterSeepageSupportConnectedFlag |
+                                (reference.cell.upstream
+                                     ? kWaterSeepageSupportUpstreamFlag
+                                     : 0U)),
                 });
             }
         }
@@ -8125,7 +8555,243 @@ void ApplyWaterSeepageScenarioParameters(
     }
 }
 
+void PrepareWaterSeepagePulseFields(
+    WaterSeepageSpatialGrid* grid,
+    float sampleTimeSeconds) {
+    if (grid == nullptr) {
+        return;
+    }
+    for (auto& node : grid->nodes) {
+        PrepareRuntimeSeepagePulseFields(
+            &node,
+            sampleTimeSeconds);
+    }
+}
+
 namespace {
+
+struct ConnectedSeepageLiveMask {
+    float mask = 0.0F;
+    float effectiveRun = 0.0F;
+    float effectiveHalfWidth = 0.0F;
+};
+
+ConnectedSeepageLiveMask EvaluateConnectedSeepageLiveMask(
+    const WaterSeepageRuntimeNode& node,
+    float costMeters,
+    float flowRunMeters,
+    float crossContourMeters,
+    const glm::vec3& surfaceNormal,
+    bool upstream,
+    float supportCellSizeMeters) {
+    ConnectedSeepageLiveMask result;
+    const float budget = std::max(0.0F, node.budgetMeters);
+    if (budget <= 1.0e-5F) {
+        return result;
+    }
+    const float cellSize = std::max(
+        1.0e-5F,
+        SeepageFiniteOr(
+            supportCellSizeMeters,
+            kWaterSeepageSupportCellSizeMeters));
+    const float cost = std::max(
+        0.0F,
+        SeepageFiniteOr(costMeters, 0.0F));
+    const float run = std::max(
+        0.0F,
+        SeepageFiniteOr(flowRunMeters, 0.0F));
+    const float cross = std::max(
+        0.0F,
+        SeepageFiniteOr(crossContourMeters, 0.0F));
+    const float sourceRadius =
+        std::max(0.0F, node.widthMeters) * 0.5F;
+    const float selectionHalfWidth =
+        std::max(0.0F, node.selectionWidthLimitMeters) * 0.5F;
+    const float authoredFeather =
+        std::max(0.0F, node.edgeFeatherMeters);
+
+    // Both route reveals are remaps of the compact live Strength value. The
+    // settled support therefore stays immutable while the real resident
+    // upstream tip reveals back toward the node before downhill is released.
+    const float maximumBudget = std::max(
+        cellSize,
+        std::max(0.0F, node.selectionReachLimitMeters));
+    const float sequenceProgress = Clamp01(
+        budget / maximumBudget);
+    const float maximumUpstreamRun = std::max(
+        0.0F,
+        SeepageFiniteOr(node.maximumUpstreamRunMeters, 0.0F));
+    const float upstreamLeadFraction =
+        maximumUpstreamRun > cellSize * 0.5F
+            ? kWaterSeepageUpstreamLeadFraction
+            : 0.0F;
+    const float routeProgress =
+        upstream
+            ? (upstreamLeadFraction > 0.0F
+                   ? Clamp01(
+                         sequenceProgress /
+                         upstreamLeadFraction)
+                   : 0.0F)
+            : (upstreamLeadFraction > 0.0F
+                   ? Clamp01(
+                         (sequenceProgress -
+                          upstreamLeadFraction) /
+                         (1.0F -
+                          upstreamLeadFraction))
+                   : sequenceProgress);
+    const float routeBudget =
+        maximumBudget * routeProgress;
+
+    // Source feather is intentionally bounded by two resident support cells.
+    // A large artistic edge feather can soften the travelling front but must
+    // not create a broad, always-wet disk around the authored node.
+    const float sourceFeather = std::max(
+        1.0e-5F,
+        std::min(authoredFeather, cellSize * 2.0F));
+    const glm::vec3 normal =
+        IsValidPoint(surfaceNormal) &&
+                glm::dot(surfaceNormal, surfaceNormal) >
+                    kNormalEpsilon
+            ? glm::normalize(surfaceNormal)
+            : glm::vec3{0.0F, 0.0F, 1.0F};
+    const glm::vec3 projectedGravity =
+        kGravity - normal * glm::dot(kGravity, normal);
+    const float steepness = std::clamp(
+        glm::length(projectedGravity),
+        0.0F,
+        1.0F);
+    const float steepBlend = SmoothStep(
+        kWaterSeepageSteepnessBlendStart,
+        kWaterSeepageSteepnessBlendEnd,
+        steepness);
+
+    float budgetMask = 0.0F;
+    float allowedHalfWidth = sourceRadius;
+    if (upstream) {
+        const float upstreamExtent =
+            std::max(cellSize, maximumUpstreamRun);
+        const float reverseFrontRun =
+            upstreamExtent * (1.0F - routeProgress);
+        const float reverseFrontFeather = std::max(
+            cellSize,
+            std::min(
+                std::max(cellSize, authoredFeather),
+                upstreamExtent * 0.15F));
+        // Reverse the usual flood reveal: the furthest/highest resident cells
+        // become wet first, then the front descends toward the authored node.
+        budgetMask =
+            reverseFrontRun <= 1.0e-5F
+                ? 1.0F
+                : SmoothStep(
+                      std::max(
+                          0.0F,
+                          reverseFrontRun - reverseFrontFeather),
+                      reverseFrontRun,
+                      run);
+
+        const float nodewardStation = Clamp01(
+            1.0F - run / upstreamExtent);
+        const float tipHalfWidth =
+            std::min(sourceRadius, cellSize * 0.5F);
+        const float fullTaperHalfWidth = std::lerp(
+            tipHalfWidth,
+            sourceRadius,
+            nodewardStation);
+        // The first top-down pass is deliberately a narrow centreline except
+        // at the node, where it meets the authored Source Width. Once that
+        // pass is complete, Strength fills the remaining taper laterally and
+        // reaches the complete upstream envelope at Strength 1.
+        const float centrelineHalfWidth = std::lerp(
+            tipHalfWidth,
+            sourceRadius,
+            nodewardStation * nodewardStation);
+        float lateralFill = 0.0F;
+        if (routeProgress >= 1.0F - 1.0e-5F) {
+            const float effectiveStrength =
+                Clamp01(SeepageFiniteOr(node.strength, 0.0F));
+            const float completionStrength =
+                sequenceProgress > 1.0e-5F
+                    ? std::clamp(
+                          effectiveStrength *
+                              upstreamLeadFraction /
+                              sequenceProgress,
+                          0.0F,
+                          1.0F)
+                    : effectiveStrength;
+            lateralFill =
+                completionStrength >= 1.0F - 1.0e-6F
+                    ? (effectiveStrength >= 1.0F - 1.0e-6F
+                           ? 1.0F
+                           : 0.0F)
+                    : SmoothStep(
+                          completionStrength,
+                          1.0F,
+                          effectiveStrength);
+        }
+        allowedHalfWidth = std::lerp(
+            centrelineHalfWidth,
+            fullTaperHalfWidth,
+            lateralFill);
+        result.effectiveRun = upstreamExtent;
+    } else {
+        const float frontFeather = std::max(
+            std::max(1.0e-5F, authoredFeather),
+            routeBudget * 0.15F);
+        budgetMask =
+            routeBudget > 1.0e-5F
+                ? 1.0F - SmoothStep(
+                      std::max(
+                          0.0F,
+                          routeBudget - frontFeather),
+                      routeBudget,
+                      cost)
+                : 0.0F;
+        allowedHalfWidth +=
+            run * std::lerp(0.55F, 0.10F, steepBlend);
+        // `budget` is stored in least-resistance cost-metres. Convert it back
+        // to the physical run of a pure downstream route at this cell's slope
+        // before patterns use it to normalise a travelling wetting front.
+        const float pureRouteCostPerMeter = std::lerp(
+            kWaterSeepageContourCostFactor,
+            kWaterSeepageDescentCostFactor,
+            steepBlend);
+        result.effectiveRun =
+            routeBudget /
+            std::max(1.0e-5F, pureRouteCostPerMeter);
+    }
+    allowedHalfWidth = std::clamp(
+        allowedHalfWidth,
+        0.0F,
+        selectionHalfWidth);
+    result.effectiveHalfWidth = allowedHalfWidth;
+    const float lateralFeather = std::max(
+        1.0e-5F,
+        std::min(
+            authoredFeather,
+            std::max(
+                cellSize * 2.0F,
+                allowedHalfWidth * 0.25F)));
+    const float widthMask = 1.0F - SmoothStep(
+        allowedHalfWidth,
+        allowedHalfWidth + lateralFeather,
+        cross);
+    const float sourceDistance = std::hypot(run, cross);
+    const float sourceMask = 1.0F - SmoothStep(
+        sourceRadius,
+        sourceRadius + sourceFeather,
+        sourceDistance);
+    const bool upstreamReachedNode =
+        upstreamLeadFraction <= 0.0F ||
+        sequenceProgress + 1.0e-6F >= upstreamLeadFraction;
+    const float releasedSourceMask =
+        !upstream && upstreamReachedNode
+            ? sourceMask
+            : 0.0F;
+    result.mask = Clamp01(std::max(
+        releasedSourceMask,
+        budgetMask * widthMask));
+    return result;
+}
 
 WaterSeepageRuntimeContribution EvaluateWaterSeepageRuntimeContributionWithFan(
     const WaterSeepageRuntimeNode& node,
@@ -8139,13 +8805,38 @@ WaterSeepageRuntimeContribution EvaluateWaterSeepageRuntimeContributionWithFan(
         return contribution;
     }
 
-    auto look = SanitizeSeepageLook(SelectSeepageTransitionLook(node, ToGlm(position)));
+    const auto selectedLook =
+        SelectSeepageTransitionLook(node, ToGlm(position));
+    auto look = SanitizeSeepageLook(selectedLook.look);
     if (look.quality == WaterSeepageQuality::Auto) {
         look.quality = node.resolvedQuality;
     }
-    if (look.pattern == WaterSeepagePattern::WettingTrickle &&
-        node.wettingProgress <= 1.0e-6F) {
+    const float wettingProgress = Clamp01(node.wettingProgress);
+    if (wettingProgress <= 1.0e-6F) {
         return contribution;
+    }
+    auto wettingFan = fan;
+    if (wettingProgress < 1.0F - 1.0e-6F) {
+        // This is the CPU/offline mirror of the shader's node-level wetting
+        // reveal. It gates every look, while Wetting Trickle additionally uses
+        // the same progress value to reveal its patch and finger signals.
+        const float frontReach =
+            std::max(1.0e-4F, wettingFan.effectiveReach);
+        const float frontSoftness = std::max(
+            std::max(0.0F, node.edgeFeatherMeters),
+            look.trickleFrontSoftness);
+        const float frontDistance =
+            frontReach * wettingProgress;
+        const float frontMask = 1.0F - SmoothStep(
+            frontDistance - frontSoftness,
+            frontDistance + frontSoftness,
+            std::max(0.0F, wettingFan.downDistance));
+        wettingFan.mask *=
+            frontMask *
+            SmoothStep(0.0F, 0.04F, wettingProgress);
+        if (wettingFan.mask <= 1.0e-6F) {
+            return contribution;
+        }
     }
     SeepagePatternSignals signals;
     switch (look.pattern) {
@@ -8153,7 +8844,7 @@ WaterSeepageRuntimeContribution EvaluateWaterSeepageRuntimeContributionWithFan(
             signals = EvaluateWetRockSeepageSignals(
                 node,
                 look,
-                fan,
+                wettingFan,
                 ToGlm(position),
                 pointNormal,
                 timeSeconds,
@@ -8163,7 +8854,7 @@ WaterSeepageRuntimeContribution EvaluateWaterSeepageRuntimeContributionWithFan(
             signals = EvaluateChaoticBloomSeepageSignals(
                 node,
                 look,
-                fan,
+                wettingFan,
                 ToGlm(position),
                 pointNormal,
                 timeSeconds,
@@ -8173,7 +8864,7 @@ WaterSeepageRuntimeContribution EvaluateWaterSeepageRuntimeContributionWithFan(
             signals = EvaluateWettingTrickleSeepageSignals(
                 node,
                 look,
-                fan,
+                wettingFan,
                 ToGlm(position),
                 pointNormal,
                 timeSeconds,
@@ -8183,14 +8874,14 @@ WaterSeepageRuntimeContribution EvaluateWaterSeepageRuntimeContributionWithFan(
             signals = EvaluateContourPulseSeepageSignals(
                 node,
                 look,
-                fan,
+                wettingFan,
                 ToGlm(position),
                 pointNormal,
-                timeSeconds,
+                selectedLook.transition,
                 viewContext);
             break;
     }
-    contribution.mask = fan.mask;
+    contribution.mask = wettingFan.mask;
     contribution.damp = signals.damp;
     contribution.ripple = signals.variation;
     contribution.glint = signals.glint;
@@ -8227,38 +8918,65 @@ SeepageFanSample EvaluateConnectedSeepageSupportMask(
     SeepageFanSample sample;
     const auto metadata = UnpackWaterSeepageSupportReferenceMetadata(
         reference.packedNormalRoleConfidenceFlags);
-    sample.downDistance = reference.downwardDistanceMeters;
-    sample.lateralDistance = reference.lateralDistanceMeters;
-    sample.signedLateralDistance = glm::dot(ToGlm(position) - node.position, node.lateralAxis);
+    const auto runCross = UnpackWaterSeepageSupportRunCrossMetrics(
+        reference.packedRunCrossMeters);
+    const bool upstream =
+        (metadata.flags & kWaterSeepageSupportUpstreamFlag) != 0U;
+    // Upstream support participates in the source/wick mask but never drives
+    // a procedural front uphill.
+    sample.downDistance =
+        upstream ? 0.0F : runCross.flowRunMeters;
+    sample.lateralDistance = runCross.crossContourMeters;
     sample.surfaceNormal = SafeSeepageNormal(metadata.surfaceNormal);
-    sample.downTangent = node.downAxis;
-    // Least-resistance membership: the cached per-cell flood cost is
-    // compared against the live strength-driven budget, and the geodesic
-    // path distance keeps a full-strength source patch of the authored
-    // Width around the node. Mirrored in SeepageConnectedSupportMask in
-    // shaders/pointcloud_sparse_ripple.glsl.
-    const float cost = std::max(0.0F, reference.downwardDistanceMeters);
-    const float pathDistance = std::max(0.0F, reference.lateralDistanceMeters);
-    const float budget = std::max(0.0F, node.budgetMeters);
-    sample.effectiveReach = budget;
-    sample.effectiveHalfWidth = std::max(node.widthMeters * 0.5F, budget * 0.5F);
-    if (budget <= 1.0e-5F) {
-        return sample;
+    glm::vec3 projectedGravity =
+        kGravity -
+        sample.surfaceNormal *
+            glm::dot(kGravity, sample.surfaceNormal);
+    if (!IsValidPoint(projectedGravity) ||
+        glm::dot(projectedGravity, projectedGravity) <=
+            kNormalEpsilon) {
+        projectedGravity =
+            node.downAxis -
+            sample.surfaceNormal *
+                glm::dot(node.downAxis, sample.surfaceNormal);
     }
-    const float feather = std::max(
-        std::max(1.0e-5F, node.edgeFeatherMeters),
-        budget * 0.15F);
-    const float sourceRadius = node.widthMeters * 0.5F;
-    const float budgetMask = 1.0F - SmoothStep(
-        std::max(0.0F, budget - feather),
-        budget,
-        cost);
-    const float sourceMask = 1.0F - SmoothStep(
-        sourceRadius,
-        sourceRadius + feather,
-        pathDistance);
-    const float coreMask = Clamp01(std::max(budgetMask, sourceMask));
-    if (coreMask <= 1.0e-6F) {
+    if (!IsValidPoint(projectedGravity) ||
+        glm::dot(projectedGravity, projectedGravity) <=
+            kNormalEpsilon) {
+        const glm::vec3 helper =
+            std::abs(sample.surfaceNormal.x) < 0.8F
+                ? glm::vec3{1.0F, 0.0F, 0.0F}
+                : glm::vec3{0.0F, 1.0F, 0.0F};
+        projectedGravity =
+            glm::cross(sample.surfaceNormal, helper);
+    }
+    sample.downTangent = glm::normalize(projectedGravity);
+    glm::vec3 localLateral =
+        glm::cross(sample.surfaceNormal, sample.downTangent);
+    if (!IsValidPoint(localLateral) ||
+        glm::dot(localLateral, localLateral) <= kNormalEpsilon) {
+        localLateral = node.lateralAxis;
+    } else {
+        localLateral = glm::normalize(localLateral);
+        if (glm::dot(localLateral, node.lateralAxis) < 0.0F) {
+            localLateral = -localLateral;
+        }
+    }
+    sample.signedLateralDistance = glm::dot(
+        ToGlm(position) - node.position,
+        localLateral);
+    const auto liveMask = EvaluateConnectedSeepageLiveMask(
+        node,
+        reference.downwardDistanceMeters,
+        runCross.flowRunMeters,
+        runCross.crossContourMeters,
+        sample.surfaceNormal,
+        upstream,
+        kWaterSeepageSupportCellSizeMeters);
+    sample.effectiveReach = liveMask.effectiveRun;
+    sample.effectiveHalfWidth =
+        liveMask.effectiveHalfWidth;
+    if (liveMask.mask <= 1.0e-6F) {
         return sample;
     }
     const bool normalValid = IsValidPoint(pointNormal) &&
@@ -8270,7 +8988,8 @@ SeepageFanSample EvaluateConnectedSeepageSupportMask(
     const float aligned = SmoothStep(0.15F, 0.85F, normalAgreement);
     const float normalMask = std::lerp(1.0F, aligned, Clamp01(node.normalAlignment));
     const float confidenceMask = std::lerp(0.65F, 1.0F, Clamp01(metadata.confidence));
-    sample.mask = Clamp01(coreMask * normalMask * confidenceMask);
+    sample.mask = Clamp01(
+        liveMask.mask * normalMask * confidenceMask);
     return sample;
 }
 
@@ -8414,7 +9133,7 @@ std::string WaterSeepageAuthoredTopologyFingerprint(
         }
 
         std::uint64_t nodeHash = 1469598103934665603ULL;
-        SeepageFingerprintU32(&nodeHash, 3U);
+        SeepageFingerprintU32(&nodeHash, 5U);
         SeepageFingerprintU32(&nodeHash, node.id);
         SeepageFingerprintFloat(&nodeHash, node.position.x);
         SeepageFingerprintFloat(&nodeHash, node.position.y);
@@ -8434,7 +9153,7 @@ std::string WaterSeepageAuthoredTopologyFingerprint(
     std::sort(nodeFingerprints.begin(), nodeFingerprints.end());
 
     std::uint64_t hash = 1469598103934665603ULL;
-    SeepageFingerprintU32(&hash, 3U);
+    SeepageFingerprintU32(&hash, 5U);
     SeepageFingerprintText(&hash, normalizedTargetRole);
     SeepageFingerprintU32(
         &hash,
@@ -8442,7 +9161,7 @@ std::string WaterSeepageAuthoredTopologyFingerprint(
     for (const auto& fingerprint : nodeFingerprints) {
         SeepageFingerprintText(&hash, fingerprint);
     }
-    return "water-seepage-authored-topology-v3-" + SeepageFingerprintString(hash);
+    return "water-seepage-authored-topology-v5-" + SeepageFingerprintString(hash);
 }
 
 bool WaterSeepageGridHasActiveViewportEffect(
@@ -8479,7 +9198,9 @@ bool WaterSeepageGridHasActiveViewportEffect(
 
 std::string WaterSeepageTopologyFingerprint(const WaterSeepageSpatialGrid& grid) {
     std::uint64_t hash = 1469598103934665603ULL;
-    SeepageFingerprintU32(&hash, 3U);
+    // v7 retains the connected support's derived maximum upstream extent,
+    // geometrically bounded routes, and station-relative upstream width.
+    SeepageFingerprintU32(&hash, 7U);
     SeepageFingerprintFloat(&hash, grid.cellSizeMeters);
     SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(grid.nodes.size()));
     for (const auto& node : grid.nodes) {
@@ -8500,6 +9221,7 @@ std::string WaterSeepageTopologyFingerprint(const WaterSeepageSpatialGrid& grid)
         SeepageFingerprintFloat(&hash, node.selectionWidthLimitMeters);
         SeepageFingerprintFloat(&hash, node.edgeFeatherMeters);
         SeepageFingerprintFloat(&hash, node.depthToleranceMeters);
+        SeepageFingerprintFloat(&hash, node.maximumUpstreamRunMeters);
         SeepageFingerprintU32(&hash, node.usesConnectedSupport ? 1U : 0U);
         if (!node.usesConnectedSupport) {
             SeepageFingerprintU32(&hash, node.guideSampleCount);
@@ -8555,15 +9277,15 @@ std::string WaterSeepageTopologyFingerprint(const WaterSeepageSpatialGrid& grid)
     for (const auto& reference : grid.supportReferences) {
         SeepageFingerprintU32(&hash, reference.nodeIndex);
         SeepageFingerprintFloat(&hash, reference.downwardDistanceMeters);
-        SeepageFingerprintFloat(&hash, reference.lateralDistanceMeters);
+        SeepageFingerprintU32(&hash, reference.packedRunCrossMeters);
         SeepageFingerprintU32(&hash, reference.packedNormalRoleConfidenceFlags);
     }
-    return "water-seepage-topology-v3-" + SeepageFingerprintString(hash);
+    return "water-seepage-topology-v7-" + SeepageFingerprintString(hash);
 }
 
 std::string WaterSeepageParamsFingerprint(const WaterSeepageSpatialGrid& grid) {
     std::uint64_t hash = 1469598103934665603ULL;
-    SeepageFingerprintU32(&hash, 7U);
+    SeepageFingerprintU32(&hash, 8U);
     const auto fingerprintLook = [&](const WaterSeepageLookSettings& look) {
         SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(look.pattern));
         SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(look.blendMode));
@@ -8629,8 +9351,27 @@ std::string WaterSeepageParamsFingerprint(const WaterSeepageSpatialGrid& grid) {
         if (node.transitionLook.has_value()) {
             fingerprintLook(node.transitionLook.value());
         }
+        const bool hasContourPulseField =
+            node.look.pattern == WaterSeepagePattern::ContourPulses ||
+            (node.transitionLook.has_value() &&
+             node.transitionLook->pattern ==
+                 WaterSeepagePattern::ContourPulses);
+        if (hasContourPulseField) {
+            SeepageFingerprintFloat(
+                &hash,
+                node.pulseFieldTimeSeconds);
+            SeepageFingerprintFloat(
+                &hash,
+                node.pulseStableSpanMeters);
+            SeepageFingerprintU32(
+                &hash,
+                node.pulseField.sampleCount);
+            SeepageFingerprintU32(
+                &hash,
+                node.transitionPulseField.sampleCount);
+        }
     }
-    return "water-seepage-params-v5-" + SeepageFingerprintString(hash);
+    return "water-seepage-params-v6-" + SeepageFingerprintString(hash);
 }
 
 WaterSettingsBundle DefaultWaterSettingsBundle(WaterScaleMode mode) {
@@ -9923,24 +10664,46 @@ WaterSeepageSurfaceGuide TraceWaterSeepageSurfaceCacheGuide(
 
 using SeepageSupportSourceKey =
     std::tuple<std::int32_t, std::int32_t, std::int32_t, WaterSurfaceRole>;
+using SeepageSupportStateKey =
+    std::tuple<
+        std::int32_t,
+        std::int32_t,
+        std::int32_t,
+        WaterSurfaceRole,
+        bool>;
 using SeepageSupportCellKey = std::tuple<std::int32_t, std::int32_t, std::int32_t>;
 
-const WaterSurfaceSurfel* FindSeepageSupportSurfel(
-    const WaterSurfaceCache& cache,
-    const SeepageSupportSourceKey& key) {
-    const auto found = std::lower_bound(
-        cache.flowSurfaceSurfels.begin(),
-        cache.flowSurfaceSurfels.end(),
-        key,
-        [](const WaterSurfaceSurfel& surfel, const SeepageSupportSourceKey& candidate) {
-            return std::tie(surfel.cellX, surfel.cellY, surfel.cellZ, surfel.role) < candidate;
-        });
-    if (found == cache.flowSurfaceSurfels.end() ||
-        std::tie(found->cellX, found->cellY, found->cellZ, found->role) != key) {
-        return nullptr;
+struct SeepageSupportStateKeyHash {
+    std::size_t operator()(const SeepageSupportStateKey& key) const noexcept {
+        const auto [x, y, z, role, upstream] = key;
+        std::uint64_t hash = 1469598103934665603ULL;
+        const auto mix = [&](std::uint32_t value) {
+            hash ^= value;
+            hash *= 1099511628211ULL;
+        };
+        mix(static_cast<std::uint32_t>(x));
+        mix(static_cast<std::uint32_t>(y));
+        mix(static_cast<std::uint32_t>(z));
+        mix(static_cast<std::uint32_t>(role));
+        mix(upstream ? 1U : 0U);
+        return static_cast<std::size_t>(hash);
     }
-    return &*found;
-}
+};
+
+struct SeepageSupportCellKeyHash {
+    std::size_t operator()(const SeepageSupportCellKey& key) const noexcept {
+        const auto [x, y, z] = key;
+        std::uint64_t hash = 1469598103934665603ULL;
+        const auto mix = [&](std::uint32_t value) {
+            hash ^= value;
+            hash *= 1099511628211ULL;
+        };
+        mix(static_cast<std::uint32_t>(x));
+        mix(static_cast<std::uint32_t>(y));
+        mix(static_cast<std::uint32_t>(z));
+        return static_cast<std::size_t>(hash);
+    }
+};
 
 std::optional<WaterSurfaceRole> SeepageSupportSourceRole(
     const WaterSeepageNode& node,
@@ -9962,9 +10725,14 @@ std::optional<WaterSurfaceRole> SeepageSupportSourceRole(
 
 struct PendingSeepageSupportSurfel {
     const WaterSurfaceSurfel* surfel = nullptr;
-    // Accumulated least-resistance cost and geodesic distance from the node.
+    // The two labels are deliberately separate Dijkstra states. An upstream
+    // wick can therefore never inherit a cheaper route that first travelled
+    // downstream and came back up around a ledge.
+    bool upstream = false;
     float costMeters = 0.0F;
-    float pathMeters = 0.0F;
+    float flowRunMeters = 0.0F;
+    float crossContourMeters = 0.0F;
+    glm::vec3 downTangent{0.0F, 0.0F, -1.0F};
 };
 
 struct PendingSeepageSupportSurfelGreater {
@@ -9978,12 +10746,14 @@ struct PendingSeepageSupportSurfelGreater {
                    left.surfel->cellX,
                    left.surfel->cellY,
                    left.surfel->cellZ,
-                   left.surfel->role) >
+                   left.surfel->role,
+                   left.upstream) >
                std::tie(
                    right.surfel->cellX,
                    right.surfel->cellY,
                    right.surfel->cellZ,
-                   right.surfel->role);
+                   right.surfel->role,
+                   right.upstream);
     }
 };
 
@@ -9992,7 +10762,7 @@ std::string WaterSeepageSupportSelectionFingerprint(
     const WaterSurfaceCache& cache,
     const WaterSeepageNode& node) {
     std::uint64_t hash = 1469598103934665603ULL;
-    SeepageFingerprintU32(&hash, 1U);
+    SeepageFingerprintU32(&hash, 6U);
     SeepageFingerprintU32(&hash, selection.nodeId);
     SeepageFingerprintText(&hash, selection.targetSceneRole);
     SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(selection.sourceRole));
@@ -10016,17 +10786,18 @@ std::string WaterSeepageSupportSelectionFingerprint(
         SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(cell.y));
         SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(cell.z));
         SeepageFingerprintFloat(&hash, cell.downwardDistanceMeters);
-        SeepageFingerprintFloat(&hash, cell.lateralDistanceMeters);
+        SeepageFingerprintFloat(&hash, cell.flowRunMeters);
+        SeepageFingerprintFloat(&hash, cell.crossContourMeters);
         SeepageFingerprintFloat(&hash, cell.surfaceNormal.x);
         SeepageFingerprintFloat(&hash, cell.surfaceNormal.y);
         SeepageFingerprintFloat(&hash, cell.surfaceNormal.z);
         SeepageFingerprintFloat(&hash, cell.confidence);
+        SeepageFingerprintU32(&hash, cell.upstream ? 1U : 0U);
     }
-    // v2: least-resistance flood cost/path metrics replaced the
-    // centreline corridor.
-    // v3: contour step cost scales with surface steepness (stored per-cell
-    // costs change), so cached support selections must rebuild.
-    return "water-seepage-support-v3-" + SeepageFingerprintString(hash);
+    // v6: the upstream metric is station-relative branch excess. A winding
+    // centre route can therefore stay one cell wide at the high tip without
+    // discarding the cross-contour price that bounded the immutable support.
+    return "water-seepage-support-v6-" + SeepageFingerprintString(hash);
 }
 
 }  // namespace
@@ -10077,6 +10848,79 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
     const std::uint32_t roleMask = sourceRole.value() == WaterSurfaceRole::Sand
                                        ? kWaterSurfaceSandRoleMask
                                        : kWaterSurfaceRockRoleMask;
+    // The immutable surfel vector is ordered by X/Y/Z/role. A flood probes 26
+    // neighbours at every accepted cell; repeating a full-vector lower_bound
+    // for each probe dominated full-site startup. Cache the much smaller
+    // contiguous X slices touched by this node, then search only Y/Z/role
+    // within a slice. This adds O(number of visited X cells) metadata and
+    // returns the exact same surfel pointer as the former global search.
+    std::unordered_map<
+        std::int32_t,
+        std::pair<std::size_t, std::size_t>>
+        sourceXRanges;
+    sourceXRanges.reserve(512U);
+    const auto findSupportSurfel =
+        [&](const SeepageSupportSourceKey& key)
+            -> const WaterSurfaceSurfel* {
+            const auto [cellX, cellY, cellZ, role] = key;
+            auto range = sourceXRanges.find(cellX);
+            if (range == sourceXRanges.end()) {
+                const auto begin = std::lower_bound(
+                    surfaceCache.flowSurfaceSurfels.begin(),
+                    surfaceCache.flowSurfaceSurfels.end(),
+                    cellX,
+                    [](const WaterSurfaceSurfel& surfel,
+                       std::int32_t candidateX) {
+                        return surfel.cellX < candidateX;
+                    });
+                const auto end = std::upper_bound(
+                    begin,
+                    surfaceCache.flowSurfaceSurfels.end(),
+                    cellX,
+                    [](std::int32_t candidateX,
+                       const WaterSurfaceSurfel& surfel) {
+                        return candidateX < surfel.cellX;
+                    });
+                range = sourceXRanges.emplace(
+                    cellX,
+                    std::pair{
+                        static_cast<std::size_t>(
+                            begin -
+                            surfaceCache.flowSurfaceSurfels.begin()),
+                        static_cast<std::size_t>(
+                            end -
+                            surfaceCache.flowSurfaceSurfels.begin()),
+                    }).first;
+            }
+            const auto sliceBegin =
+                surfaceCache.flowSurfaceSurfels.begin() +
+                static_cast<std::ptrdiff_t>(range->second.first);
+            const auto sliceEnd =
+                surfaceCache.flowSurfaceSurfels.begin() +
+                static_cast<std::ptrdiff_t>(range->second.second);
+            const auto candidateKey =
+                std::tuple{cellY, cellZ, role};
+            const auto found = std::lower_bound(
+                sliceBegin,
+                sliceEnd,
+                candidateKey,
+                [](const WaterSurfaceSurfel& surfel,
+                   const auto& candidate) {
+                    return std::tie(
+                               surfel.cellY,
+                               surfel.cellZ,
+                               surfel.role) <
+                           candidate;
+                });
+            if (found == sliceEnd ||
+                std::tie(
+                    found->cellY,
+                    found->cellZ,
+                    found->role) != candidateKey) {
+                return nullptr;
+            }
+            return &*found;
+        };
     const float startRadius = std::clamp(
         std::max(sourceResolution * 2.25F, 0.05F),
         sourceResolution,
@@ -10089,110 +10933,246 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
         roleMask);
     if (!start.hit || start.surfel.role != sourceRole.value()) {
         result.errorMessage = "No matching shared-cache surface cell was found beneath the Seepage node.";
+        result.surfaceUnavailable = true;
         return result;
     }
 
     const glm::vec3 nodePosition = ToGlm(node.position);
     const glm::vec3 nodeNormal = SafeSeepageNormal(node.surfaceNormal);
-    glm::vec3 downAxis = ToGlm(DeriveWaterSeepageDownAxis(
-        node.surfaceNormal,
-        node.downAxis));
-    if (!IsValidPoint(downAxis) || glm::dot(downAxis, downAxis) <= kNormalEpsilon) {
-        downAxis = kGravity;
+    const auto deterministicTangent = [](const glm::vec3& normal) {
+        const glm::vec3 helper =
+            std::abs(normal.x) <= std::abs(normal.y) &&
+                    std::abs(normal.x) <= std::abs(normal.z)
+                ? glm::vec3{1.0F, 0.0F, 0.0F}
+                : (std::abs(normal.y) <= std::abs(normal.z)
+                       ? glm::vec3{0.0F, 1.0F, 0.0F}
+                       : glm::vec3{0.0F, 0.0F, 1.0F});
+        return glm::normalize(glm::cross(normal, helper));
+    };
+    const auto projectedTangent = [&](const glm::vec3& direction,
+                                      const glm::vec3& normal) {
+        glm::vec3 tangent =
+            direction - normal * glm::dot(direction, normal);
+        return IsValidPoint(tangent) &&
+                       glm::dot(tangent, tangent) > kNormalEpsilon
+                   ? glm::normalize(tangent)
+                   : deterministicTangent(normal);
+    };
+    const glm::vec3 startNormal = [&] {
+        glm::vec3 normal = SafeSeepageNormal(start.surfel.normal);
+        if (glm::dot(normal, nodeNormal) < 0.0F) {
+            normal = -normal;
+        }
+        return normal;
+    }();
+    glm::vec3 seedDownTangent =
+        kGravity - startNormal * glm::dot(kGravity, startNormal);
+    if (!IsValidPoint(seedDownTangent) ||
+        glm::dot(seedDownTangent, seedDownTangent) <= kNormalEpsilon) {
+        seedDownTangent = projectedTangent(
+            ToGlm(node.downAxis),
+            startNormal);
     } else {
-        downAxis = glm::normalize(downAxis);
+        seedDownTangent = glm::normalize(seedDownTangent);
     }
-    glm::vec3 lateralAxis = glm::cross(nodeNormal, downAxis);
-    if (!IsValidPoint(lateralAxis) || glm::dot(lateralAxis, lateralAxis) <= kNormalEpsilon) {
-        const glm::vec3 helper = std::abs(nodeNormal.x) < 0.8F
-                                     ? glm::vec3{1.0F, 0.0F, 0.0F}
-                                     : glm::vec3{0.0F, 1.0F, 0.0F};
-        lateralAxis = glm::cross(nodeNormal, helper);
-    }
-    lateralAxis = glm::normalize(lateralAxis);
 
-    // Least-resistance flood: a Dijkstra expansion over connected surfels
-    // where each step costs its length scaled by how slow seeping wetness
-    // moves in that direction — steep descent is cheap, contouring is
-    // expensive, and climbing is very expensive. Water therefore splits into
-    // every available downhill path (left AND right of a saddle), runs
-    // further down steeper routes, spreads evenly but shortly across flat
-    // ground, and wicks a short way up connected structure above the node.
-    // The stored per-cell cost is compared against the live strength-driven
-    // budget at render time, so the area reshapes without rebuilding.
-    const auto stepCostFactor = [](const glm::vec3& step,
-                                   float stepLength,
-                                   const glm::vec3& surfaceNormal) {
-        const float drop = -step.z / std::max(stepLength, 1.0e-6F);
-        // Contouring gets more expensive the steeper the local surface, and
-        // the descent discount sharpens with it: on a near-vertical face
-        // only a genuinely steep step is descent-priced (shallow diagonals
-        // no longer smear the fan sideways at the cheap rate), so seeping
-        // wetness runs a long way down before it slowly widens. Gentle
-        // terrain keeps the forgiving threshold and its even, short spread.
-        const float steepness =
-            1.0F - std::clamp(std::abs(surfaceNormal.z), 0.0F, 1.0F);
-        const float descentSharpness = std::lerp(2.0F, 1.0F, steepness);
-        const float blend =
-            std::clamp(drop * descentSharpness, -1.0F, 1.0F);
-        const float contourFactor =
-            kWaterSeepageContourCostFactor *
-            std::lerp(
-                1.0F,
-                kWaterSeepageSteepContourMultiplier,
+    struct TangentStepMetrics {
+        glm::vec3 localNormal{0.0F, 0.0F, 1.0F};
+        glm::vec3 downTangent{0.0F, 0.0F, -1.0F};
+        float tangentLength = 0.0F;
+        float down = 0.0F;
+        float up = 0.0F;
+        float cross = 0.0F;
+        float steepBlend = 0.0F;
+    };
+    const auto tangentStepMetrics =
+        [&](const glm::vec3& step,
+            const glm::vec3& currentNormal,
+            float currentConfidence,
+            glm::vec3 neighbourNormal,
+            float neighbourConfidence,
+            const glm::vec3& previousDownTangent) {
+            if (glm::dot(currentNormal, neighbourNormal) < 0.0F) {
+                neighbourNormal = -neighbourNormal;
+            }
+            const float currentWeight = std::max(
+                0.05F,
+                Clamp01(currentConfidence));
+            const float neighbourWeight = std::max(
+                0.05F,
+                Clamp01(neighbourConfidence));
+            glm::vec3 localNormal =
+                currentNormal * currentWeight +
+                neighbourNormal * neighbourWeight;
+            localNormal =
+                IsValidPoint(localNormal) &&
+                        glm::dot(localNormal, localNormal) > kNormalEpsilon
+                    ? glm::normalize(localNormal)
+                    : currentNormal;
+            TangentStepMetrics metrics;
+            metrics.localNormal = localNormal;
+            const glm::vec3 tangentStep =
+                step - localNormal * glm::dot(step, localNormal);
+            metrics.tangentLength = glm::length(tangentStep);
+            glm::vec3 projectedGravity =
+                kGravity - localNormal * glm::dot(kGravity, localNormal);
+            const float steepness = std::clamp(
+                glm::length(projectedGravity),
+                0.0F,
+                1.0F);
+            metrics.steepBlend = SmoothStep(
+                kWaterSeepageSteepnessBlendStart,
+                kWaterSeepageSteepnessBlendEnd,
                 steepness);
-        return blend >= 0.0F
-                   ? std::lerp(
-                         contourFactor,
-                         kWaterSeepageDescentCostFactor,
-                         blend)
-                   : std::lerp(
-                         contourFactor,
-                         kWaterSeepageAscentCostFactor,
-                         -blend);
+            glm::vec3 transported =
+                previousDownTangent -
+                localNormal *
+                    glm::dot(previousDownTangent, localNormal);
+            if (!IsValidPoint(transported) ||
+                glm::dot(transported, transported) <=
+                    kNormalEpsilon) {
+                transported = deterministicTangent(localNormal);
+            } else {
+                transported = glm::normalize(transported);
+            }
+            if (steepness > kNormalEpsilon) {
+                const glm::vec3 gravityTangent =
+                    projectedGravity / steepness;
+                if (glm::dot(transported, gravityTangent) < 0.0F) {
+                    transported = -transported;
+                }
+                metrics.downTangent = glm::mix(
+                    transported,
+                    gravityTangent,
+                    metrics.steepBlend);
+                metrics.downTangent =
+                    glm::dot(
+                        metrics.downTangent,
+                        metrics.downTangent) > kNormalEpsilon
+                        ? glm::normalize(metrics.downTangent)
+                        : gravityTangent;
+                if (glm::dot(
+                        metrics.downTangent,
+                        projectedGravity) < 0.0F) {
+                    metrics.downTangent =
+                        -metrics.downTangent;
+                }
+            } else {
+                metrics.downTangent = transported;
+            }
+            const float signedFlow =
+                glm::dot(tangentStep, metrics.downTangent);
+            metrics.down = std::max(0.0F, signedFlow);
+            metrics.up = std::max(0.0F, -signedFlow);
+            metrics.cross = std::sqrt(std::max(
+                0.0F,
+                metrics.tangentLength * metrics.tangentLength -
+                    signedFlow * signedFlow));
+            return metrics;
+        };
+
+    // Two independent labels share the same connected surface but never each
+    // other's route. Downstream blends flat isotropic creep into strongly
+    // anisotropic wall flow; upstream is a narrow, separately tapered wick.
+    const auto downstreamStepCost = [](const TangentStepMetrics& metrics) {
+        const float flatCost =
+            kWaterSeepageContourCostFactor * metrics.tangentLength;
+        const float steepCost =
+            kWaterSeepageDescentCostFactor * metrics.down +
+            kWaterSeepageSteepContourCostFactor * metrics.cross +
+            kWaterSeepageAscentCostFactor * metrics.up;
+        return std::lerp(flatCost, steepCost, metrics.steepBlend);
+    };
+    const auto upstreamStepCost = [](const TangentStepMetrics& metrics) {
+        return kWaterSeepageUpstreamCostFactor * metrics.up +
+               kWaterSeepageSteepContourCostFactor * metrics.cross;
     };
     const float depthTolerance = std::clamp(
         SeepageFiniteOr(node.depthToleranceMeters, 0.15F),
         sourceResolution * 0.50F,
         2.0F);
-    const float edgeAllowance = std::clamp(
-        SeepageFiniteOr(node.edgeFeatherMeters, 0.10F),
-        0.0F,
-        std::max(result.selection.reachLimitMeters,
-                 result.selection.widthLimitMeters));
     const float reachLimit = result.selection.reachLimitMeters;
     const float halfWidthLimit = result.selection.widthLimitMeters * 0.5F;
-    // The flood stops at the cost limit: the selection reach limit expressed
-    // in cost-metres plus the feather allowance priced at the steepest
-    // contour rate, so the live budget always has selected cells to feather
-    // across even on a near-vertical face.
-    const float costLimit =
-        reachLimit +
-        edgeAllowance * kWaterSeepageContourCostFactor *
-            kWaterSeepageSteepContourMultiplier;
+    // The selection includes enough topology for the live front and lateral
+    // feathers at maximum authored limits. Cross-contour travel has its own
+    // hard cap, so a cheap descending detour cannot later return far outside
+    // the requested width.
+    const float costLimit = reachLimit;
+    const float sourcePlaneTolerance =
+        result.selection.cellSizeMeters * 2.0F;
+    const float sourceTopologyFeather =
+        result.selection.cellSizeMeters * 2.0F;
+    const float sourcePatchRadius =
+        halfWidthLimit + sourceTopologyFeather;
+    const float sourcePatchRadiusSquared =
+        sourcePatchRadius * sourcePatchRadius;
     const float continuityDistance = std::clamp(
         depthTolerance,
         sourceResolution * 1.75F,
         sourceResolution * 6.0F);
     const float continuityDistanceSquared = continuityDistance * continuityDistance;
+    // Every valid route step is priced by at least the cheapest authored
+    // travel regime. The world-radius guard is deliberately more generous:
+    // it includes the source-width exception and one continuity hop, but
+    // prevents a noisy/thick substrate from walking through near-normal
+    // neighbours indefinitely while accumulating almost no tangent cost.
+    constexpr float kMinimumTravelCostFactor =
+        std::min(
+            kWaterSeepageDescentCostFactor,
+            kWaterSeepageUpstreamCostFactor);
+    const float maximumGeometricRadius =
+        costLimit / kMinimumTravelCostFactor +
+        sourcePatchRadius +
+        continuityDistance;
+    const float maximumGeometricRadiusSquared =
+        maximumGeometricRadius * maximumGeometricRadius;
 
     std::priority_queue<
         PendingSeepageSupportSurfel,
         std::vector<PendingSeepageSupportSurfel>,
         PendingSeepageSupportSurfelGreater>
         pending;
-    std::map<SeepageSupportSourceKey, float> queuedCost;
-    std::set<SeepageSupportSourceKey> visited;
-    std::map<SeepageSupportCellKey, WaterSeepageSupportCell> emitted;
+    struct SeepageSupportState {
+        float queuedCost = 0.0F;
+        bool visited = false;
+    };
+    std::unordered_map<
+        SeepageSupportStateKey,
+        SeepageSupportState,
+        SeepageSupportStateKeyHash>
+        states;
+    struct EmittedSeepageSupportCell {
+        WaterSeepageSupportCell cell;
+        std::uint8_t priority = 0U;
+    };
+    std::unordered_map<
+        SeepageSupportCellKey,
+        EmittedSeepageSupportCell,
+        SeepageSupportCellKeyHash>
+        emitted;
+    // Avoid one allocation per tree node while keeping the initial bucket
+    // arrays small enough for two concurrent full-site node builds.
+    states.reserve(std::min<std::size_t>(maximumVisited, 65'536U));
+    emitted.reserve(std::min<std::size_t>(maximumCells, 65'536U));
+    std::size_t visitedCount = 0U;
     std::vector<const WaterSurfaceSurfel*> acceptedSubstrateSurfels;
-    std::vector<std::pair<float, float>> acceptedSubstrateCostPath;
+    struct AcceptedSubstrateMetrics {
+        float costMeters = 0.0F;
+        float flowRunMeters = 0.0F;
+        float crossContourMeters = 0.0F;
+        bool upstream = false;
+        glm::vec3 downTangent{0.0F, 0.0F, -1.0F};
+    };
+    std::vector<AcceptedSubstrateMetrics> acceptedSubstrateMetrics;
     const bool targetIsVegetation =
         NormalizeSeepageRole(targetSceneRole) == "veg";
     const auto emitSourceCell = [&](std::int32_t sourceX,
                                     std::int32_t sourceY,
                                     std::int32_t sourceZ,
-                                    float downwardDistance,
-                                    float lateralDistance,
+                                    float costMeters,
+                                    float flowRunMeters,
+                                    float crossContourMeters,
+                                    bool upstream,
                                     const invisible_places::io::Float3& surfaceNormal,
                                     float confidence) {
         const auto childMinimum = [&](std::int32_t sourceCoordinate) {
@@ -10222,18 +11202,41 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
                         static_cast<std::int32_t>(y),
                         static_cast<std::int32_t>(z),
                     };
+                    const float cellCentreZ =
+                        (static_cast<float>(z) + 0.5F) *
+                        result.selection.cellSizeMeters;
+                    const bool preferredUpstream =
+                        cellCentreZ > nodePosition.z;
+                    const std::uint8_t priority =
+                        upstream == preferredUpstream ? 2U : 1U;
                     const WaterSeepageSupportCell cell{
                         .x = static_cast<std::int32_t>(x),
                         .y = static_cast<std::int32_t>(y),
                         .z = static_cast<std::int32_t>(z),
-                        .downwardDistanceMeters = downwardDistance,
-                        .lateralDistanceMeters = lateralDistance,
+                        .downwardDistanceMeters = costMeters,
+                        .flowRunMeters = flowRunMeters,
+                        .crossContourMeters = crossContourMeters,
                         .surfaceNormal = surfaceNormal,
                         .confidence = Clamp01(confidence),
+                        .upstream = upstream,
                     };
-                    const auto [it, inserted] = emitted.emplace(key, cell);
-                    if (!inserted && cell.confidence > it->second.confidence) {
-                        it->second = cell;
+                    const auto [it, inserted] = emitted.emplace(
+                        key,
+                        EmittedSeepageSupportCell{
+                            .cell = cell,
+                            .priority = priority,
+                        });
+                    if (!inserted &&
+                        (priority > it->second.priority ||
+                         (priority == it->second.priority &&
+                          (cell.downwardDistanceMeters <
+                               it->second.cell.downwardDistanceMeters - 1.0e-6F ||
+                           (std::abs(
+                                cell.downwardDistanceMeters -
+                                it->second.cell.downwardDistanceMeters) <= 1.0e-6F &&
+                            cell.confidence > it->second.cell.confidence))))) {
+                        it->second.cell = cell;
+                        it->second.priority = priority;
                     }
                     if (emitted.size() > maximumCells) {
                         return false;
@@ -10249,13 +11252,33 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
         start.surfel.cellZ,
         sourceRole.value(),
     };
-    const auto* startSurfel = FindSeepageSupportSurfel(surfaceCache, startKey);
+    const auto* startSurfel = findSupportSurfel(startKey);
     if (startSurfel == nullptr) {
         result.errorMessage = "The shared-cache Seepage seed cell was not addressable.";
         return result;
     }
-    pending.push({.surfel = startSurfel, .costMeters = 0.0F, .pathMeters = 0.0F});
-    queuedCost.emplace(startKey, 0.0F);
+    for (const bool upstream : {false, true}) {
+        pending.push({
+            .surfel = startSurfel,
+            .upstream = upstream,
+            .costMeters = 0.0F,
+            .flowRunMeters = 0.0F,
+            .crossContourMeters = 0.0F,
+            .downTangent = seedDownTangent,
+        });
+        states.emplace(
+            SeepageSupportStateKey{
+                start.surfel.cellX,
+                start.surfel.cellY,
+                start.surfel.cellZ,
+                sourceRole.value(),
+                upstream,
+            },
+            SeepageSupportState{
+                .queuedCost = 0.0F,
+                .visited = false,
+            });
+    }
 
     while (!pending.empty()) {
         if (options.stopToken != nullptr && options.stopToken->stop_requested()) {
@@ -10263,7 +11286,7 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
             result.errorMessage = "Connected Seepage support selection was cancelled.";
             return result;
         }
-        if (visited.size() >= maximumVisited) {
+        if (visitedCount >= maximumVisited) {
             result.diagnostics.cellLimitExceeded = true;
             result.errorMessage =
                 "Connected Seepage support exceeded its bounded surfel budget; "
@@ -10273,25 +11296,49 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
         const auto current = pending.top();
         pending.pop();
         const auto& surfel = *current.surfel;
-        const auto currentKey = SeepageSupportSourceKey{
+        const auto currentKey = SeepageSupportStateKey{
             surfel.cellX,
             surfel.cellY,
             surfel.cellZ,
             surfel.role,
+            current.upstream,
         };
-        if (!visited.insert(currentKey).second) {
+        const auto currentState = states.find(currentKey);
+        if (currentState == states.end() ||
+            currentState->second.visited) {
             continue;
         }
+        currentState->second.visited = true;
+        ++visitedCount;
         ++result.diagnostics.visitedSurfelCount;
 
         const glm::vec3 centroid = ToGlm(surfel.centroid);
         bool accepted = true;
-        // Cells are kept while the flood cost stays inside the reach limit
-        // OR the geodesic path stays inside the Source Width patch bound
-        // (the width limit), so the always-wet patch is never clipped by
-        // ascent pricing right above the node.
-        if (current.costMeters > costLimit &&
-            current.pathMeters > halfWidthLimit + edgeAllowance) {
+        const glm::vec3 nodeDelta = centroid - nodePosition;
+        const float gravitationalElevation =
+            centroid.z - nodePosition.z;
+        if (glm::dot(nodeDelta, nodeDelta) >
+            maximumGeometricRadiusSquared) {
+            ++result.diagnostics.rejectedReachCount;
+            accepted = false;
+        } else if ((!current.upstream &&
+             gravitationalElevation > sourcePlaneTolerance) ||
+            (current.upstream &&
+             gravitationalElevation < -sourcePlaneTolerance)) {
+            ++result.diagnostics.rejectedAboveNodeCount;
+            accepted = false;
+        } else if (current.crossContourMeters >
+                   halfWidthLimit + sourceTopologyFeather) {
+            ++result.diagnostics.rejectedWidthCount;
+            accepted = false;
+        } else if (
+            current.costMeters > costLimit &&
+            (std::hypot(
+                 current.flowRunMeters,
+                 current.crossContourMeters) >
+                 sourcePatchRadius ||
+             glm::dot(nodeDelta, nodeDelta) >
+                 sourcePatchRadiusSquared)) {
             ++result.diagnostics.rejectedReachCount;
             accepted = false;
         } else if (surfel.confidence < 0.10F || surfel.normalCoherence < 0.10F) {
@@ -10301,17 +11348,28 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
 
         if (accepted) {
             ++result.diagnostics.acceptedSurfelCount;
-            acceptedSubstrateSurfels.push_back(&surfel);
-            acceptedSubstrateCostPath.emplace_back(
-                current.costMeters,
-                current.pathMeters);
+            const bool preferredUpstream =
+                gravitationalElevation > 0.0F;
+            if (current.upstream == preferredUpstream) {
+                acceptedSubstrateSurfels.push_back(&surfel);
+                acceptedSubstrateMetrics.push_back({
+                    .costMeters = current.costMeters,
+                    .flowRunMeters = current.flowRunMeters,
+                    .crossContourMeters =
+                        current.crossContourMeters,
+                    .upstream = current.upstream,
+                    .downTangent = current.downTangent,
+                });
+            }
             if (!targetIsVegetation &&
                 !emitSourceCell(
                     surfel.cellX,
                     surfel.cellY,
                     surfel.cellZ,
                     current.costMeters,
-                    current.pathMeters,
+                    current.flowRunMeters,
+                    current.crossContourMeters,
+                    current.upstream,
                     surfel.normal,
                     surfel.confidence *
                         (0.45F + 0.55F * surfel.normalCoherence))) {
@@ -10333,16 +11391,26 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
                     if (dx == 0 && dy == 0 && dz == 0) {
                         continue;
                     }
-                    const auto key = SeepageSupportSourceKey{
+                    const auto sourceKey = SeepageSupportSourceKey{
                         surfel.cellX + dx,
                         surfel.cellY + dy,
                         surfel.cellZ + dz,
                         sourceRole.value(),
                     };
-                    if (visited.contains(key)) {
+                    const auto stateKey = SeepageSupportStateKey{
+                        surfel.cellX + dx,
+                        surfel.cellY + dy,
+                        surfel.cellZ + dz,
+                        sourceRole.value(),
+                        current.upstream,
+                    };
+                    const auto neighbourState = states.find(stateKey);
+                    if (neighbourState != states.end() &&
+                        neighbourState->second.visited) {
                         continue;
                     }
-                    const auto* neighbour = FindSeepageSupportSurfel(surfaceCache, key);
+                    const auto* neighbour =
+                        findSupportSurfel(sourceKey);
                     if (neighbour == nullptr) {
                         continue;
                     }
@@ -10350,27 +11418,86 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
                     const float distanceSquared = glm::dot(step, step);
                     const glm::vec3 neighbourNormal = SafeSeepageNormal(neighbour->normal);
                     if (!std::isfinite(distanceSquared) ||
-                        distanceSquared > continuityDistanceSquared ||
-                        std::abs(glm::dot(currentNormal, neighbourNormal)) < 0.20F) {
+                        distanceSquared > continuityDistanceSquared) {
                         ++result.diagnostics.rejectedContinuityCount;
                         continue;
                     }
                     const float stepLength = std::sqrt(distanceSquared);
+                    const auto metrics = tangentStepMetrics(
+                        step,
+                        currentNormal,
+                        surfel.confidence,
+                        neighbourNormal,
+                        neighbour->confidence,
+                        current.downTangent);
+                    if (!std::isfinite(metrics.tangentLength) ||
+                        metrics.tangentLength <= 1.0e-6F) {
+                        ++result.diagnostics.rejectedContinuityCount;
+                        continue;
+                    }
+                    if (std::abs(
+                            glm::dot(
+                                step,
+                                metrics.localNormal)) >
+                        depthTolerance) {
+                        ++result.diagnostics.rejectedContinuityCount;
+                        continue;
+                    }
+                    if (current.upstream &&
+                        metrics.down > sourceResolution * 0.25F) {
+                        // The upstream label is a one-way wick from the node
+                        // toward higher substrate. A downhill step has zero
+                        // `up` and can have zero `cross`, so admitting it here
+                        // creates an unpriced lane on flat or gently stepped
+                        // terrain. Reject it at the source as well as farther
+                        // uphill; the independent downstream label owns that
+                        // side of the connected surface.
+                        ++result.diagnostics.rejectedAboveNodeCount;
+                        continue;
+                    }
+                    const float directionalEdgeCost =
+                        current.upstream
+                            ? upstreamStepCost(metrics)
+                            : downstreamStepCost(metrics);
+                    // Tangent decomposition shapes seepage on a surface, but
+                    // it cannot make motion through the surface free. This
+                    // floor is identical to ordinary steep descent when the
+                    // step lies in the substrate plane and only adds cost to
+                    // near-normal hops caused by roughness or layer thickness.
+                    const float edgeCost = std::max(
+                        directionalEdgeCost,
+                        kMinimumTravelCostFactor * stepLength);
                     const float nextCost =
-                        current.costMeters +
-                        stepLength *
-                            stepCostFactor(step, stepLength, neighbourNormal);
-                    if (const auto existing = queuedCost.find(key);
-                        existing != queuedCost.end() &&
-                        existing->second <= nextCost + 0.005F) {
+                        current.costMeters + edgeCost;
+                    if (neighbourState != states.end() &&
+                        neighbourState->second.queuedCost <=
+                            nextCost + 1.0e-6F) {
                         continue;
                     }
                     pending.push({
                         .surfel = neighbour,
+                        .upstream = current.upstream,
                         .costMeters = nextCost,
-                        .pathMeters = current.pathMeters + stepLength,
+                        .flowRunMeters =
+                            current.flowRunMeters +
+                            (current.upstream
+                                 ? metrics.up
+                                 : metrics.down + metrics.up),
+                        .crossContourMeters =
+                            current.crossContourMeters +
+                            metrics.cross,
+                        .downTangent = metrics.downTangent,
                     });
-                    queuedCost.insert_or_assign(key, nextCost);
+                    if (neighbourState == states.end()) {
+                        states.emplace(
+                            stateKey,
+                            SeepageSupportState{
+                                .queuedCost = nextCost,
+                                .visited = false,
+                            });
+                    } else {
+                        neighbourState->second.queuedCost = nextCost;
+                    }
                 }
             }
         }
@@ -10384,6 +11511,10 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
         SupportGraph substrateGraph;
         substrateGraph.cellSize = std::max(0.05F, sourceResolution * 4.0F);
         substrateGraph.points.reserve(acceptedSubstrateSurfels.size());
+        glm::vec3 substrateMinimum{
+            std::numeric_limits<float>::max()};
+        glm::vec3 substrateMaximum{
+            std::numeric_limits<float>::lowest()};
         for (const auto* substrate : acceptedSubstrateSurfels) {
             const auto index = static_cast<std::uint32_t>(substrateGraph.points.size());
             substrateGraph.points.push_back({
@@ -10395,6 +11526,12 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
                     (0.45F + 0.55F * substrate->normalCoherence)),
                 .hasNormal = true,
             });
+            substrateMinimum = glm::min(
+                substrateMinimum,
+                substrateGraph.points.back().position);
+            substrateMaximum = glm::max(
+                substrateMaximum,
+                substrateGraph.points.back().position);
             substrateGraph.grid[
                 MakeGridKey(substrateGraph.points.back().position, substrateGraph.cellSize)]
                 .push_back(index);
@@ -10411,11 +11548,23 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
         const float selectionRadius =
             costLimit / kWaterSeepageDescentCostFactor +
             halfWidthLimit + associationDistance;
+        // A VEG voxel can only be emitted when it lies within
+        // associationDistance of the already accepted substrate. Restrict the
+        // sorted X scan to that exact expanded support envelope and reject Y/Z
+        // outside it before the 27-cell graph query. On full-site caches this
+        // avoids walking a metres-wide vegetation slab for a narrow seepage
+        // route, without changing any association or depth threshold.
+        const glm::vec3 associationPadding{
+            associationDistance + 1.0e-5F};
+        const glm::vec3 vegetationMinimum =
+            substrateMinimum - associationPadding;
+        const glm::vec3 vegetationMaximum =
+            substrateMaximum + associationPadding;
         const auto minimumCellX = SeepageCellCoordinate(
-            nodePosition.x - selectionRadius,
+            vegetationMinimum.x,
             sourceResolution);
         const auto maximumCellX = SeepageCellCoordinate(
-            nodePosition.x + selectionRadius,
+            vegetationMaximum.x,
             sourceResolution);
         auto vegetation = std::lower_bound(
             surfaceCache.vegetationVoxels.begin(),
@@ -10441,6 +11590,12 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
                 (static_cast<float>(vegetation->cellY) + 0.5F) * sourceResolution,
                 (static_cast<float>(vegetation->cellZ) + 0.5F) * sourceResolution,
             };
+            if (vegetationPosition.y < vegetationMinimum.y ||
+                vegetationPosition.y > vegetationMaximum.y ||
+                vegetationPosition.z < vegetationMinimum.z ||
+                vegetationPosition.z > vegetationMaximum.z) {
+                continue;
+            }
             const glm::vec3 vegetationDelta = vegetationPosition - nodePosition;
             if (glm::dot(vegetationDelta, vegetationDelta) >
                 selectionRadius * selectionRadius) {
@@ -10475,11 +11630,54 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
             if (riseAboveSubstrate > kWaterSeepageVegetationRiseMeters) {
                 continue;
             }
-            const auto& [substrateCost, substratePath] =
-                acceptedSubstrateCostPath[*closestIndex];
-            const float climbPenalty =
-                std::max(0.0F, riseAboveSubstrate) *
-                kWaterSeepageAscentCostFactor;
+            const auto& substrateMetrics =
+                acceptedSubstrateMetrics[*closestIndex];
+            glm::vec3 substrateNormal = substrate.normal;
+            if (glm::dot(substrateNormal, nodeNormal) < 0.0F) {
+                substrateNormal = -substrateNormal;
+            }
+            const glm::vec3 substrateDelta =
+                vegetationPosition - substrate.position;
+            const float normalOffset =
+                glm::dot(substrateDelta, substrateNormal);
+            // Surface Depth is a rejection bound, not a finite-price bridge:
+            // foliage floating outward from the rock must never become wet
+            // merely because a large live budget can pay for the gap.
+            if (std::abs(normalOffset) > depthTolerance) {
+                continue;
+            }
+            const glm::vec3 tangentDelta =
+                substrateDelta - substrateNormal * normalOffset;
+            const auto associationMetrics = tangentStepMetrics(
+                tangentDelta,
+                substrateNormal,
+                substrate.confidence,
+                substrateNormal,
+                substrate.confidence,
+                substrateMetrics.downTangent);
+            const float associationCost =
+                substrateMetrics.upstream
+                    ? upstreamStepCost(associationMetrics)
+                    : downstreamStepCost(associationMetrics);
+            const float flowRun =
+                substrateMetrics.flowRunMeters +
+                (substrateMetrics.upstream
+                     ? associationMetrics.up
+                     : associationMetrics.down +
+                           associationMetrics.up);
+            const float crossContour =
+                substrateMetrics.crossContourMeters +
+                associationMetrics.cross;
+            const float cost =
+                substrateMetrics.costMeters + associationCost;
+            if (crossContour >
+                    halfWidthLimit + sourceTopologyFeather ||
+                (cost > costLimit &&
+                 std::hypot(flowRun, crossContour) >
+                     halfWidthLimit +
+                         sourceTopologyFeather)) {
+                continue;
+            }
             const float vegetationConfidence = std::clamp(
                 static_cast<float>(vegetation->sampleCount) / 8.0F,
                 0.0F,
@@ -10488,8 +11686,10 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
                     vegetation->cellX,
                     vegetation->cellY,
                     vegetation->cellZ,
-                    substrateCost + climbPenalty,
-                    substratePath + std::max(0.0F, riseAboveSubstrate),
+                    cost,
+                    flowRun,
+                    crossContour,
+                    substrateMetrics.upstream,
                     FromGlm(substrate.normal),
                     substrate.confidence * (0.50F + 0.50F * vegetationConfidence))) {
                 result.diagnostics.cellLimitExceeded = true;
@@ -10503,12 +11703,67 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
 
     if (emitted.empty()) {
         result.errorMessage = "No connected shared-cache cells were accepted beneath the Seepage node.";
+        result.surfaceUnavailable = true;
         return result;
     }
     result.selection.cells.reserve(emitted.size());
+    for (const auto& [_, emittedCell] : emitted) {
+        result.selection.cells.push_back(emittedCell.cell);
+    }
+    // Upstream routes often have to wind around surface roughness before
+    // reaching the highest resident cell. Their accumulated cross-contour
+    // price is still required while selecting bounded support, but using that
+    // absolute price as live width can reject every cell at the real tip.
+    // Remove only the cheapest upstream price in each 10 mm flow-run station:
+    // one connected centre route remains addressable while other branches
+    // retain their local excess and must still pass the narrow live mask.
+    std::unordered_map<std::int64_t, float> upstreamStationBaselines;
+    upstreamStationBaselines.reserve(
+        result.selection.cells.size() / 8U + 1U);
+    const float inverseStationSize =
+        1.0F / std::max(
+                   1.0e-5F,
+                   result.selection.cellSizeMeters);
+    const auto upstreamStation = [inverseStationSize](
+                                     const WaterSeepageSupportCell& cell) {
+        return static_cast<std::int64_t>(std::llround(
+            std::max(0.0F, cell.flowRunMeters) *
+            inverseStationSize));
+    };
+    for (const auto& cell : result.selection.cells) {
+        if (!cell.upstream) {
+            continue;
+        }
+        const auto station = upstreamStation(cell);
+        const float cross = std::max(0.0F, cell.crossContourMeters);
+        const auto [baseline, inserted] =
+            upstreamStationBaselines.emplace(station, cross);
+        if (!inserted) {
+            baseline->second = std::min(baseline->second, cross);
+        }
+    }
+    for (auto& cell : result.selection.cells) {
+        if (!cell.upstream) {
+            continue;
+        }
+        const auto baseline =
+            upstreamStationBaselines.find(upstreamStation(cell));
+        if (baseline != upstreamStationBaselines.end()) {
+            cell.crossContourMeters = std::max(
+                0.0F,
+                cell.crossContourMeters - baseline->second);
+        }
+    }
+    std::sort(
+        result.selection.cells.begin(),
+        result.selection.cells.end(),
+        [](const WaterSeepageSupportCell& left,
+           const WaterSeepageSupportCell& right) {
+            return std::tie(left.x, left.y, left.z) <
+                   std::tie(right.x, right.y, right.z);
+        });
     const float halfCell = result.selection.cellSizeMeters * 0.5F;
-    for (const auto& [_, cell] : emitted) {
-        result.selection.cells.push_back(cell);
+    for (const auto& cell : result.selection.cells) {
         const invisible_places::io::Float3 centre{
             (static_cast<float>(cell.x) + 0.5F) * result.selection.cellSizeMeters,
             (static_cast<float>(cell.y) + 0.5F) * result.selection.cellSizeMeters,
@@ -10528,32 +11783,109 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
     return result;
 }
 
+std::vector<WaterSeepageSupportBuildResult>
+BuildWaterSeepageSupportSelections(
+    std::span<const WaterSeepageNode> nodes,
+    std::string_view targetSceneRole,
+    const WaterSurfaceCache& surfaceCache,
+    const WaterSeepageSupportBuildOptions& options,
+    std::size_t maximumParallelBuilds) {
+    std::vector<WaterSeepageSupportBuildResult> results(nodes.size());
+    if (nodes.empty()) {
+        return results;
+    }
+
+    // Results use fixed authored indices, so scheduling cannot affect their
+    // order, fingerprints, or later atomic publication. Three simultaneous
+    // floods provide useful full-site overlap without allowing 18 authored
+    // nodes to allocate their bounded Dijkstra maps at once.
+    const std::size_t workerCount = std::clamp<std::size_t>(
+        maximumParallelBuilds,
+        1U,
+        std::min<std::size_t>(3U, nodes.size()));
+    std::atomic_size_t nextNodeIndex{0U};
+    const auto buildNext = [&]() {
+        while (options.stopToken == nullptr ||
+               !options.stopToken->stop_requested()) {
+            const std::size_t nodeIndex =
+                nextNodeIndex.fetch_add(1U, std::memory_order_relaxed);
+            if (nodeIndex >= nodes.size()) {
+                return;
+            }
+            try {
+                results[nodeIndex] = BuildWaterSeepageSupportSelection(
+                    nodes[nodeIndex],
+                    targetSceneRole,
+                    surfaceCache,
+                    options);
+            } catch (...) {
+                // Allocation and container failures must remain ordinary
+                // candidate failures. Escaping a std::jthread entry point
+                // calls std::terminate and can take down the whole desktop
+                // while a large shared surface cache is being traversed.
+                auto& failed = results[nodeIndex];
+                failed.selection.nodeId = nodes[nodeIndex].id;
+                try {
+                    failed.errorMessage =
+                        "Connected Seepage support generation failed unexpectedly.";
+                } catch (...) {
+                    // Preserve the no-throw worker boundary even when the
+                    // original failure was exhausted memory. Polling also
+                    // treats an empty candidate error as a generic failure.
+                }
+            }
+        }
+    };
+    if (workerCount == 1U) {
+        buildNext();
+        return results;
+    }
+
+    std::vector<std::jthread> workers;
+    workers.reserve(workerCount);
+    for (std::size_t workerIndex = 0U;
+         workerIndex < workerCount;
+         ++workerIndex) {
+        workers.emplace_back(buildNext);
+    }
+    // Join before evaluating the return expression; moving `results` while a
+    // worker still owns one of its elements would otherwise be a data race.
+    workers.clear();
+    return results;
+}
+
 float EvaluateWaterSeepageSupportCellMask(
     const WaterSeepageRuntimeNode& node,
     const WaterSeepageSupportCell& cell) {
-    // Same budget/source-patch math as EvaluateConnectedSeepageSupportMask
-    // (minus the per-point normal-agreement term the overlay cannot know).
-    const float cost = std::max(0.0F, cell.downwardDistanceMeters);
-    const float pathDistance = std::max(0.0F, cell.lateralDistanceMeters);
-    const float budget = std::max(0.0F, node.budgetMeters);
-    if (budget <= 1.0e-5F) {
-        return 0.0F;
-    }
-    const float feather = std::max(
-        std::max(1.0e-5F, node.edgeFeatherMeters),
-        budget * 0.15F);
-    const float sourceRadius = node.widthMeters * 0.5F;
-    const float budgetMask = 1.0F - SmoothStep(
-        std::max(0.0F, budget - feather),
-        budget,
-        cost);
-    const float sourceMask = 1.0F - SmoothStep(
-        sourceRadius,
-        sourceRadius + feather,
-        pathDistance);
-    const float coreMask = Clamp01(std::max(budgetMask, sourceMask));
-    const float confidenceMask = std::lerp(0.65F, 1.0F, Clamp01(cell.confidence));
-    return Clamp01(coreMask * confidenceMask);
+    // Exact renderer membership math, excluding only point-normal agreement
+    // because a structure-overlay cell has no rendered point normal. Quantize
+    // through the compact reference representation so threshold cells match
+    // the GPU instead of drifting by a half-float rounding step.
+    const auto runCross = UnpackWaterSeepageSupportRunCrossMetrics(
+        PackWaterSeepageSupportRunCrossMetrics(
+            cell.flowRunMeters,
+            cell.crossContourMeters));
+    const auto liveMask = EvaluateConnectedSeepageLiveMask(
+        node,
+        cell.downwardDistanceMeters,
+        runCross.flowRunMeters,
+        runCross.crossContourMeters,
+        SafeSeepageNormal(cell.surfaceNormal),
+        cell.upstream,
+        kWaterSeepageSupportCellSizeMeters);
+    const float packedConfidence =
+        UnpackWaterSeepageSupportReferenceMetadata(
+            PackWaterSeepageSupportReferenceMetadata(
+                cell.surfaceNormal,
+                WaterSurfaceRole::None,
+                cell.confidence,
+                cell.upstream
+                    ? kWaterSeepageSupportUpstreamFlag
+                    : 0U))
+            .confidence;
+    const float confidenceMask =
+        std::lerp(0.65F, 1.0F, packedConfidence);
+    return Clamp01(liveMask.mask * confidenceMask);
 }
 
 bool CommitWaterSeepageSupportSelection(

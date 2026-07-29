@@ -3,6 +3,7 @@
 #include "io/MeshData.hpp"
 #include "io/PointCloudData.hpp"
 #include "water/RainSimulation.hpp"
+#include "water/WaterSeepagePulseField.hpp"
 
 #include <array>
 #include <cstddef>
@@ -346,6 +347,10 @@ struct WaterSeepageNodeAnimationState {
     float strengthOverride = -1.0F;
     float prominenceOverride = -1.0F;
     float sourceWidthOverride = -1.0F;
+    // Complete transient look produced by active scalar profile tracks. The
+    // frame resolver starts from the otherwise active scenario/profile look,
+    // applies keyed values, and never writes the result into the saved base.
+    std::optional<WaterSeepageLookSettings> lookOverride;
 };
 
 struct WaterSeepageNodeKey {
@@ -446,6 +451,14 @@ struct WaterSettingKey {
 
 struct WaterKeyedSettingTrack {
     std::string settingId;
+    // Dormant tracks retain their keys in the scenario but do not evaluate,
+    // draw markers, or participate in navigation until enabled again.
+    bool active = true;
+    // Dynamic profile fields use stored display metadata instead of growing
+    // the fixed feature-setting registry for every scalar profile member.
+    std::string label;
+    std::string profileGroup;
+    std::string profileName;
     std::vector<WaterSettingKey> keys;
 };
 
@@ -493,6 +506,12 @@ ParseWaterKeyedFeatureKindName(std::string_view name);
     WaterKeyedSettingTrack track);
 [[nodiscard]] WaterFeatureTimingRun SanitizeWaterFeatureTimingRun(
     WaterFeatureTimingRun run);
+// Moves an existing feature timeline (including dormant tracks and keys) to
+// the target run, or adds a new empty timeline when it is not assigned.
+[[nodiscard]] bool AssignWaterFeatureToTimingRun(
+    WaterScenarioFeatureRuns* entry,
+    const WaterKeyedFeatureId& feature,
+    std::uint32_t targetRunId);
 // Endpoint-hold sampling with Hold/Linear/Smooth segments. An exact interior
 // key belongs to the segment it starts, so a Hold step reads its new value
 // at the key position itself. Empty tracks return nullopt.
@@ -538,6 +557,12 @@ void AddOrUpdateWaterSettingKey(
 [[nodiscard]] std::optional<float> NextWaterFeatureKeyPosition(
     const WaterFeatureTimeline& timeline,
     float position);
+// Ordered union of active keys in one profile group. UI names are derived
+// from this order, so insertion and moves renumber <profile>_Run01 states
+// without rewriting the saved key data.
+[[nodiscard]] std::vector<float> WaterFeatureProfileKeyPositions(
+    const WaterFeatureTimeline& timeline,
+    std::string_view profileGroup);
 
 struct WaterFeatureTimingSampleEntry {
     WaterKeyedFeatureId feature{};
@@ -675,6 +700,11 @@ struct WaterSeepageRuntimeNode {
     float widthMeters = 0.75F;
     float selectionReachLimitMeters = 2.34375F;
     float selectionWidthLimitMeters = 1.215F;
+    // Immutable extent derived from the connected upstream support. It lets
+    // the live mask reveal the real highest resident cell back toward
+    // the node instead of assuming that every surface reaches the authored
+    // selection limit.
+    float maximumUpstreamRunMeters = 0.0F;
     float prominence = 1.0F;
     float authoredReachMeters = 1.25F;
     float authoredWidthMeters = 0.75F;
@@ -705,6 +735,16 @@ struct WaterSeepageRuntimeNode {
     WaterSeepageLookSettings look{};
     std::optional<WaterSeepageLookSettings> transitionLook;
     float transitionAmount = 0.0F;
+    // Contour Pulses are composed once per node and animation sample. Every
+    // rendered point then performs one interpolated longitudinal lookup plus
+    // stationary surface noise instead of evaluating every authored wave.
+    // The span comes from immutable maximum support limits, never live
+    // Strength/Rain, so revealing more support cannot teleport wave phase.
+    float pulseStableSpanMeters = 1.0F;
+    float pulseFieldTimeSeconds = 0.0F;
+    std::uint64_t pulseFieldPreparationFingerprint = 0U;
+    WaterSeepagePulseField pulseField{};
+    WaterSeepagePulseField transitionPulseField{};
     std::uint32_t guideSampleCount = 0U;
     std::array<WaterSeepageGuideSample, kWaterSeepageMaximumGuideSamples> guideSamples{};
     float guideRequestedReachMeters = 0.0F;
@@ -717,24 +757,30 @@ struct WaterSeepageRuntimeNode {
 inline constexpr float kWaterSeepageSupportCellSizeMeters = 0.010F;
 inline constexpr std::size_t kWaterSeepageMaximumSupportCellsPerNode = 262'144U;
 
-// Least-resistance flood model: support is selected by a Dijkstra flood over
-// connected cache surfels where each step costs its length scaled by how the
-// water would move — steep descent is cheap, contouring is expensive, and
-// climbing is very expensive (a short wetting halo above the node). Node
-// Strength converts to a live travel budget in cost-metres, so the wet area
-// splits into every available downhill path, runs further down steeper ones,
-// and recedes or spreads per frame with zero topology work.
+// Least-resistance flood model: support is selected by labelled downstream
+// and upstream Dijkstra floods over connected cache surfels. Steps are
+// decomposed in each surfel's tangent plane, so steep descent is cheap,
+// cross-contour creep is expensive, and the short upstream wick cannot enter
+// through a cheaper downstream detour. Node Strength converts to a live
+// travel budget in cost-metres; full-precision run/cross metrics then reshape
+// the selected support per frame without topology work.
 inline constexpr float kWaterSeepageDescentCostFactor = 0.75F;
 inline constexpr float kWaterSeepageContourCostFactor = 2.2F;
 inline constexpr float kWaterSeepageAscentCostFactor = 5.0F;
-// Contour steps cost up to this much more on steep surfaces: a node on a
-// near-vertical face wets tall and narrow (descent-to-contour ratio ~5.9)
-// while flat ground keeps the base isotropic-ish creep (~2.9).
-inline constexpr float kWaterSeepageSteepContourMultiplier = 2.0F;
+inline constexpr float kWaterSeepageUpstreamCostFactor = 1.0F;
+// Reveal the high wick from its resident tip back toward the node before
+// releasing the downhill front. Keep this aligned with
+// SeepageConnectedSupportMask in pointcloud_sparse_ripple.glsl.
+inline constexpr float kWaterSeepageUpstreamLeadFraction = 0.12F;
+inline constexpr float kWaterSeepageSteepContourCostFactor = 8.8F;
+inline constexpr float kWaterSeepageSteepnessBlendStart = 0.35F;
+inline constexpr float kWaterSeepageSteepnessBlendEnd = 0.75F;
 inline constexpr float kWaterSeepageRunMetersPerStrength = 1.5F;
 // Vegetation more than this far above its connected substrate is hovering
 // canopy and stays dry.
 inline constexpr float kWaterSeepageVegetationRiseMeters = 0.15F;
+inline constexpr std::uint32_t kWaterSeepageSupportConnectedFlag = 1U;
+inline constexpr std::uint32_t kWaterSeepageSupportUpstreamFlag = 2U;
 
 // One density-independent cache cell selected beneath an authored node. The
 // metrics are evaluated against live node parameters and therefore do not
@@ -743,13 +789,20 @@ struct WaterSeepageSupportCell {
     std::int32_t x = 0;
     std::int32_t y = 0;
     std::int32_t z = 0;
-    // Accumulated least-resistance cost from the node (cost-metres) and the
-    // geodesic surface distance actually travelled. Field names predate the
-    // flood model and are kept for the shared CPU/GPU reference ABI.
+    // Accumulated least-resistance cost from the node (cost-metres).
+    // The field name predates the tangent-decomposed flood and remains for
+    // compatibility with diagnostics and existing callers.
     float downwardDistanceMeters = 0.0F;
-    float lateralDistanceMeters = 0.0F;
+    // Full-precision tangent-plane metrics used by the CPU Structure Overlay.
+    // Downstream cross-contour distance is accumulated from the node. For an
+    // upstream cell it is the excess above the cheapest route in the same
+    // flow-run station, retaining branch width without hiding a winding tip.
+    // Runtime references pack both non-negative values as half-floats.
+    float flowRunMeters = 0.0F;
+    float crossContourMeters = 0.0F;
     invisible_places::io::Float3 surfaceNormal{0.0F, 0.0F, 1.0F};
     float confidence = 0.0F;
+    bool upstream = false;
 };
 
 struct WaterSeepageSupportSelectionDiagnostics {
@@ -787,12 +840,19 @@ struct WaterSeepageSupportBuildResult {
     std::string errorMessage;
     bool success = false;
     bool cancelled = false;
+    // The node is valid but this authored role has no local substrate/occupancy
+    // to shade. Callers settle this as an empty node-role result rather than
+    // poisoning the complete role draft or retrying it every frame.
+    bool surfaceUnavailable = false;
 };
 
 struct alignas(16) WaterSeepageSupportReference {
     std::uint32_t nodeIndex = 0U;
     float downwardDistanceMeters = 0.0F;
-    float lateralDistanceMeters = 0.0F;
+    // x: accumulated local flow-run; y: downstream cross-contour travel or
+    // station-relative upstream branch excess.
+    // Both are non-negative IEEE-754 half-floats packed into one 32-bit lane.
+    std::uint32_t packedRunCrossMeters = 0U;
     // Octahedral normal (10+10 bits), confidence (8 bits), authored terrain
     // role (2 bits), and flags (2 bits). Keeping this record exactly 16 bytes
     // lets the CPU and std430 GPU paths share one bounded reference payload.
@@ -801,10 +861,17 @@ struct alignas(16) WaterSeepageSupportReference {
 
 static_assert(sizeof(WaterSeepageSupportReference) == 16U);
 
+struct WaterSeepageSupportRunCrossMetrics {
+    float flowRunMeters = 0.0F;
+    float crossContourMeters = 0.0F;
+};
+
 struct WaterSeepageSupportReferenceMetadata {
     invisible_places::io::Float3 surfaceNormal{0.0F, 0.0F, 1.0F};
     WaterSurfaceRole sourceRole = WaterSurfaceRole::None;
     float confidence = 0.0F;
+    // kWaterSeepageSupportConnectedFlag and
+    // kWaterSeepageSupportUpstreamFlag.
     std::uint32_t flags = 0U;
 };
 
@@ -815,6 +882,11 @@ struct WaterSeepageSupportReferenceMetadata {
     std::uint32_t flags = 0U);
 [[nodiscard]] WaterSeepageSupportReferenceMetadata
 UnpackWaterSeepageSupportReferenceMetadata(std::uint32_t packed);
+[[nodiscard]] std::uint32_t PackWaterSeepageSupportRunCrossMetrics(
+    float flowRunMeters,
+    float crossContourMeters);
+[[nodiscard]] WaterSeepageSupportRunCrossMetrics
+UnpackWaterSeepageSupportRunCrossMetrics(std::uint32_t packed);
 
 struct WaterSeepageSpatialHashCell {
     std::int32_t x = 0;
@@ -1453,6 +1525,13 @@ BuildWaterDynamicMeshFlowGroundEntries(const WaterSurfaceCache& cache);
 [[nodiscard]] float WaterRainPresetVisualStrength(WaterRainIntensityPreset preset);
 
 [[nodiscard]] WaterSeepageLookSettings DefaultWaterSeepageLookSettings();
+// Applies one scalar Timings-v2 profile sample. IDs beginning with "look."
+// address the look half; "response." addresses the visual-response half.
+// Returns false for an unknown/non-scalar setting.
+[[nodiscard]] bool ApplyWaterSeepageLookTimingValue(
+    WaterSeepageLookSettings* look,
+    std::string_view settingId,
+    float value);
 [[nodiscard]] std::vector<WaterScenarioDefinition> DefaultWaterScenarioDefinitions();
 [[nodiscard]] WaterScenarioState SanitizeWaterScenarioState(WaterScenarioState state);
 [[nodiscard]] WaterScenarioState EvaluateWaterScenarioTrack(
@@ -1560,6 +1639,12 @@ void ApplyWaterTimingLevelToScenarioState(
     std::span<const WaterSeepageLookProfile> profiles,
     std::span<const WaterSeepageResponseProfile> responseProfiles,
     const WaterSeepageLookSettings& defaultLook);
+// Scalar timing keys need a complete transient look as their base. Authored
+// mode starts from the node's fully resolved settings/response pair, while an
+// active scenario deliberately takes precedence over every node profile.
+[[nodiscard]] WaterSeepageLookSettings ResolveWaterSeepageTimingLookBase(
+    const WaterSeepageLookSettings& resolvedAuthoredLook,
+    const std::optional<WaterScenarioState>& scenarioState);
 [[nodiscard]] std::string WaterSeepageLocalLookName(std::string_view baseName, std::uint32_t nodeId);
 [[nodiscard]] invisible_places::io::Float3 DeriveWaterSeepageDownAxis(
     const invisible_places::io::Float3& surfaceNormal,
@@ -1585,6 +1670,17 @@ void ApplyWaterTimingLevelToScenarioState(
     std::string_view targetSceneRole,
     const WaterSurfaceCache& surfaceCache,
     const WaterSeepageSupportBuildOptions& options = {});
+// Builds independent node selections concurrently while preserving authored
+// result order. The worker count is deliberately bounded: each Dijkstra owns
+// temporary visited/queued maps, so unrestricted fan-out can multiply memory
+// pressure when a full-site cache contains many authored nodes.
+[[nodiscard]] std::vector<WaterSeepageSupportBuildResult>
+BuildWaterSeepageSupportSelections(
+    std::span<const WaterSeepageNode> nodes,
+    std::string_view targetSceneRole,
+    const WaterSurfaceCache& surfaceCache,
+    const WaterSeepageSupportBuildOptions& options = {},
+    std::size_t maximumParallelBuilds = 3U);
 // A failed/cancelled/capped candidate never replaces the last settled
 // selection. This explicit commit seam keeps asynchronous callers atomic.
 [[nodiscard]] bool CommitWaterSeepageSupportSelection(
@@ -1612,6 +1708,14 @@ void ApplyWaterSeepageScenarioParameters(
     const WaterRainSettings& rainSettings,
     std::uint64_t effectivePointInvocations,
     std::span<const WaterSeepageNodeAnimationStateEntry> nodeAnimationStates = {});
+// Prepares the compact frame-ringed Contour Pulse samples once for a resolved
+// frame state (unchanged inputs are reused). Call this before CPU/offline
+// evaluation at that frame time; point evaluation deliberately never rebuilds
+// a field. Preparation changes no support, descriptors, point data, or
+// topology.
+void PrepareWaterSeepagePulseFields(
+    WaterSeepageSpatialGrid* grid,
+    float sampleTimeSeconds);
 [[nodiscard]] WaterSeepageRuntimeContribution EvaluateWaterSeepageRuntimeContribution(
     const WaterSeepageRuntimeNode& node,
     const invisible_places::io::Float3& position,

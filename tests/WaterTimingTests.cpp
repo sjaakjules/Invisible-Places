@@ -550,6 +550,149 @@ TEST_CASE("Adding a key between keys preserves surrounding blends and order",
     CHECK_FALSE(NextWaterSettingKeyPosition(track, 0.40F).has_value());
 }
 
+TEST_CASE("Dormant setting tracks preserve keys without evaluating or navigating",
+          "[water][timing][keyed][dormant]") {
+    using invisible_places::water::BuildWaterFeatureTimingOverlay;
+    using invisible_places::water::EvaluateWaterKeyedSettingTrack;
+    using invisible_places::water::NextWaterFeatureKeyPosition;
+    using invisible_places::water::PreviousWaterFeatureKeyPosition;
+    using invisible_places::water::WaterFeatureProfileKeyPositions;
+    using invisible_places::water::WaterFeatureTimeline;
+    using invisible_places::water::WaterFeatureTimingRun;
+    using invisible_places::water::WaterKeyedFeatureKind;
+
+    WaterFeatureTimeline timeline{
+        .feature = {
+            .kind = WaterKeyedFeatureKind::SeepageNode,
+            .objectId = 12U},
+        .settings = {
+            {.settingId = "look.density",
+             .active = false,
+             .label = "Coverage",
+             .profileGroup = "seepage_look",
+             .profileName = "Wet Rock",
+             .keys = {
+                 {.position = 0.20F, .value = 0.25F},
+                 {.position = 0.70F, .value = 0.85F},
+             }},
+            {.settingId = "look.glisten",
+             .active = true,
+             .label = "Glisten",
+             .profileGroup = "seepage_look",
+             .profileName = "Wet Rock",
+             .keys = {
+                 {.position = 0.40F, .value = 0.30F},
+                 {.position = 0.70F, .value = 0.90F},
+             }},
+        }};
+
+    CHECK_FALSE(
+        EvaluateWaterKeyedSettingTrack(
+            timeline.settings.front(),
+            0.5F)
+            .has_value());
+    CHECK(
+        PreviousWaterFeatureKeyPosition(timeline, 0.65F).value() ==
+        Approx(0.40F));
+    CHECK(
+        NextWaterFeatureKeyPosition(timeline, 0.65F).value() ==
+        Approx(0.70F));
+
+    const auto positions =
+        WaterFeatureProfileKeyPositions(
+            timeline,
+            "seepage_look");
+    REQUIRE(positions.size() == 2U);
+    CHECK(positions[0] == Approx(0.40F));
+    CHECK(positions[1] == Approx(0.70F));
+
+    WaterFeatureTimingRun run;
+    run.id = 2U;
+    run.features.push_back(timeline);
+    const auto overlay =
+        BuildWaterFeatureTimingOverlay(
+            std::span{&run, 1},
+            0.5F);
+    CHECK(
+        overlay.Find(
+            timeline.feature,
+            "look.density") == nullptr);
+    REQUIRE(
+        overlay.Find(
+            timeline.feature,
+            "look.glisten") != nullptr);
+}
+
+TEST_CASE("Focused feature run assignment preserves its complete timeline",
+          "[water][timing][keyed][runs]") {
+    using invisible_places::water::AssignWaterFeatureToTimingRun;
+    using invisible_places::water::FindWaterFeatureTimeline;
+    using invisible_places::water::WaterFeatureTimingRun;
+    using invisible_places::water::WaterKeyedFeatureId;
+    using invisible_places::water::WaterKeyedFeatureKind;
+    using invisible_places::water::WaterScenarioFeatureRuns;
+
+    const WaterKeyedFeatureId feature{
+        .kind = WaterKeyedFeatureKind::FlowSource,
+        .objectId = 9U};
+    WaterScenarioFeatureRuns entry;
+    entry.scenarioId = "wet";
+    entry.runs = {
+        WaterFeatureTimingRun{
+            .id = 1U,
+            .name = "First",
+            .features = {{
+                .feature = feature,
+                .settings = {{
+                    .settingId = "strength",
+                    .active = false,
+                    .keys = {{
+                        .position = 0.3F,
+                        .value = 0.6F}},
+                }},
+            }}},
+        WaterFeatureTimingRun{.id = 2U, .name = "Second"},
+    };
+
+    REQUIRE(
+        AssignWaterFeatureToTimingRun(
+            &entry,
+            feature,
+            2U));
+    CHECK(
+        FindWaterFeatureTimeline(
+            &entry.runs[0],
+            feature) == nullptr);
+    const auto* moved =
+        FindWaterFeatureTimeline(
+            &entry.runs[1],
+            feature);
+    REQUIRE(moved != nullptr);
+    REQUIRE(moved->settings.size() == 1U);
+    CHECK_FALSE(moved->settings.front().active);
+    REQUIRE(moved->settings.front().keys.size() == 1U);
+    CHECK(
+        moved->settings.front().keys.front().value ==
+        Approx(0.6F));
+
+    const WaterKeyedFeatureId newFeature{
+        .kind = WaterKeyedFeatureKind::Rain};
+    REQUIRE(
+        AssignWaterFeatureToTimingRun(
+            &entry,
+            newFeature,
+            2U));
+    REQUIRE(
+        FindWaterFeatureTimeline(
+            &entry.runs[1],
+            newFeature) != nullptr);
+    CHECK_FALSE(
+        AssignWaterFeatureToTimingRun(
+            &entry,
+            newFeature,
+            99U));
+}
+
 TEST_CASE("Feature key navigation finds the nearest key across every setting",
           "[water][timing][keyed][navigation]") {
     using Catch::Approx;
@@ -778,6 +921,10 @@ TEST_CASE("Per-scenario feature timing runs round-trip through the project docum
                     .objectId = 4U},
         .settings = {{
             .settingId = "strength",
+            .active = false,
+            .label = "Node Strength",
+            .profileGroup = "seepage_look",
+            .profileName = "Wet Rock",
             .keys = {
                 {.position = 0.20F,
                  .value = 0.0F,
@@ -809,10 +956,109 @@ TEST_CASE("Per-scenario feature timing runs round-trip through the project docum
     CHECK(timeline.feature.kind == WaterKeyedFeatureKind::SeepageNode);
     CHECK(timeline.feature.objectId == 4U);
     REQUIRE(timeline.settings.size() == 1U);
+    CHECK_FALSE(timeline.settings.front().active);
+    CHECK(timeline.settings.front().label == "Node Strength");
+    CHECK(timeline.settings.front().profileGroup == "seepage_look");
+    CHECK(timeline.settings.front().profileName == "Wet Rock");
     REQUIRE(timeline.settings.front().keys.size() == 2U);
     CHECK(timeline.settings.front().keys[0].position == Approx(0.20F));
     CHECK(timeline.settings.front().keys[0].interpolation ==
           WaterScenarioInterpolation::Hold);
     CHECK(timeline.settings.front().keys[1].value == Approx(1.2F));
     CHECK(loaded->waterFeatureTimingRunSequence == 8U);
+}
+
+TEST_CASE("Schema 46 timing tracks migrate with active legacy defaults",
+          "[water][timing][keyed][serialization][migration]") {
+    using invisible_places::serialization::kProjectDocumentSchemaVersion;
+    using invisible_places::serialization::LoadProjectDocument;
+    using invisible_places::serialization::SaveProjectDocument;
+    using invisible_places::water::WaterKeyedFeatureKind;
+    using invisible_places::water::WaterScenarioInterpolation;
+
+    // Schema 46 introduced per-feature timing tracks, before dormant-state
+    // and dynamic profile display metadata became persistent in schema 47.
+    const std::string schema46Json = R"({
+        "schema_version": 46,
+        "project_name": "Schema 46 Feature Timing",
+        "water_feature_timing_runs": [
+            {
+                "scenario_id": "pre-colonisation-wet",
+                "runs": [
+                    {
+                        "id": 3,
+                        "name": "Legacy Seepage",
+                        "features": [
+                            {
+                                "kind": "seepage_node",
+                                "object_id": 42,
+                                "settings": [
+                                    {
+                                        "id": "strength",
+                                        "keys": [
+                                            {
+                                                "position": 0.25,
+                                                "value": 0.6,
+                                                "interpolation": "linear"
+                                            }
+                                        ]
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            }
+        ],
+        "water_feature_timing_run_sequence": 4
+    })";
+
+    TemporaryTimingFile file{"invisible_places_feature_timing_schema46.json"};
+    {
+        std::ofstream output{file.path};
+        REQUIRE(output.good());
+        output << schema46Json;
+    }
+
+    std::string errorMessage;
+    auto loaded = LoadProjectDocument(file.path, &errorMessage);
+    REQUIRE(loaded.has_value());
+    CHECK(loaded->schemaVersion == kProjectDocumentSchemaVersion);
+    REQUIRE(loaded->waterFeatureTimingRuns.size() == 1U);
+    REQUIRE(loaded->waterFeatureTimingRuns.front().runs.size() == 1U);
+    const auto& run = loaded->waterFeatureTimingRuns.front().runs.front();
+    REQUIRE(run.features.size() == 1U);
+    CHECK(run.features.front().feature.kind ==
+          WaterKeyedFeatureKind::SeepageNode);
+    CHECK(run.features.front().feature.objectId == 42U);
+    REQUIRE(run.features.front().settings.size() == 1U);
+    const auto& setting = run.features.front().settings.front();
+    CHECK(setting.settingId == "strength");
+    CHECK(setting.active);
+    CHECK(setting.label.empty());
+    CHECK(setting.profileGroup.empty());
+    CHECK(setting.profileName.empty());
+    REQUIRE(setting.keys.size() == 1U);
+    CHECK(setting.keys.front().position == Approx(0.25F));
+    CHECK(setting.keys.front().value == Approx(0.6F));
+    CHECK(setting.keys.front().interpolation ==
+          WaterScenarioInterpolation::Linear);
+
+    // Rewriting the migrated project persists the schema-47 defaults, so a
+    // second load is identical and no legacy key data is lost.
+    REQUIRE(SaveProjectDocument(*loaded, file.path, &errorMessage));
+    loaded = LoadProjectDocument(file.path, &errorMessage);
+    REQUIRE(loaded.has_value());
+    CHECK(loaded->schemaVersion == kProjectDocumentSchemaVersion);
+    const auto& roundTrippedSetting =
+        loaded->waterFeatureTimingRuns.front()
+            .runs.front()
+            .features.front()
+            .settings.front();
+    CHECK(roundTrippedSetting.active);
+    CHECK(roundTrippedSetting.label.empty());
+    CHECK(roundTrippedSetting.profileGroup.empty());
+    CHECK(roundTrippedSetting.profileName.empty());
+    REQUIRE(roundTrippedSetting.keys.size() == 1U);
+    CHECK(roundTrippedSetting.keys.front().value == Approx(0.6F));
 }

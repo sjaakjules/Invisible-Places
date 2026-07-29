@@ -818,96 +818,8 @@ private:
     std::size_t byteCount_ = 0U;
 };
 
-class WaterSurfacePayloadChecksumBuilder {
-public:
-    template <typename T>
-    void AddPod(const T& value) {
-        static_assert(std::is_trivially_copyable_v<T>);
-        AddBytes(&value, sizeof(value));
-    }
-
-    void AddBytes(const void* data, std::size_t size) {
-        if (data == nullptr || size == 0U) {
-            return;
-        }
-        const auto* bytes = static_cast<const std::uint8_t*>(data);
-        hashedByteCount_ += static_cast<std::uint64_t>(size);
-        if (tailSize_ != 0U) {
-            const auto copied = std::min(size, tail_.size() - tailSize_);
-            std::memcpy(tail_.data() + tailSize_, bytes, copied);
-            tailSize_ += copied;
-            bytes += copied;
-            size -= copied;
-            if (tailSize_ == tail_.size()) {
-                std::uint64_t word = 0U;
-                std::memcpy(&word, tail_.data(), sizeof(word));
-                MixWord(word);
-                tailSize_ = 0U;
-            }
-        }
-        while (size >= sizeof(std::uint64_t)) {
-            std::uint64_t word = 0U;
-            std::memcpy(&word, bytes, sizeof(word));
-            MixWord(word);
-            bytes += sizeof(word);
-            size -= sizeof(word);
-        }
-        if (size != 0U) {
-            std::memcpy(tail_.data(), bytes, size);
-            tailSize_ = size;
-        }
-    }
-
-    [[nodiscard]] WaterSurfaceCachePayloadChecksum Finish() const {
-        auto first = first_;
-        auto second = second_;
-        if (tailSize_ != 0U) {
-            std::uint64_t tailWord = 0U;
-            std::memcpy(&tailWord, tail_.data(), tailSize_);
-            tailWord ^= static_cast<std::uint64_t>(tailSize_) << 56U;
-            MixWordInto(&first, &second, tailWord, wordCount_);
-        }
-        const auto finalise = [this](std::uint64_t value, std::uint64_t salt) {
-            value ^= hashedByteCount_ + salt;
-            value ^= value >> 30U;
-            value *= 0xBF58476D1CE4E5B9ULL;
-            value ^= value >> 27U;
-            value *= 0x94D049BB133111EBULL;
-            return value ^ (value >> 31U);
-        };
-        return {
-            .words = {
-                finalise(first, 0x9E3779B97F4A7C15ULL),
-                finalise(second, 0xD6E8FEB86659FD93ULL),
-            },
-            .hashedByteCount = static_cast<std::uint64_t>(hashedByteCount_),
-        };
-    }
-
-private:
-    static void MixWordInto(
-        std::uint64_t* first,
-        std::uint64_t* second,
-        std::uint64_t word,
-        std::uint64_t wordIndex) {
-        const auto mixed = word + 0x9E3779B97F4A7C15ULL * (wordIndex + 1U);
-        *first = std::rotl(*first ^ mixed, 27) * 0x3C79AC492BA7B653ULL;
-        *second = std::rotl(*second + (mixed ^ (*first >> 17U)), 31) *
-                  0x1C69B3F74AC4AE35ULL;
-    }
-
-    void MixWord(std::uint64_t word) {
-        MixWordInto(&first_, &second_, word, wordCount_);
-        ++wordCount_;
-    }
-
-    std::uint64_t first_ = 0x243F6A8885A308D3ULL;
-    std::uint64_t second_ = 0x13198A2E03707344ULL;
-    std::uint64_t wordCount_ = 0U;
-    std::uint64_t hashedByteCount_ = 0U;
-    std::array<std::uint8_t, sizeof(std::uint64_t)> tail_{};
-    std::size_t tailSize_ = 0U;
-};
+using WaterSurfacePayloadChecksumBuilder =
+    WaterSurfaceGpuStreamChecksumBuilder;
 
 template <typename T>
 void AddWaterSurfacePayloadArray(
@@ -1767,7 +1679,8 @@ static std::filesystem::path LegacyRainCachePath(
 WaterSurfaceBuildResult BuildWaterSurfaceCache(
     std::span<const WaterSurfaceSource> sources,
     const std::filesystem::path& cacheRoot,
-    const std::atomic_bool* cancelRequested) {
+    const std::atomic_bool* cancelRequested,
+    WaterSurfaceCacheLoadValidation loadValidation) {
     WaterSurfaceBuildResult result;
     if (sources.empty()) {
         result.errorMessage = "Water surface cache has no role sources.";
@@ -1797,7 +1710,8 @@ WaterSurfaceBuildResult BuildWaterSurfaceCache(
                     candidateSignature,
                     &result.cache,
                     &result.errorMessage,
-                    &result.diagnostics)) {
+                    &result.diagnostics,
+                    loadValidation)) {
                 result.errorMessage.clear();
                 continue;
             }
@@ -2132,7 +2046,8 @@ bool LoadWaterSurfaceCache(
     std::string_view expectedSignature,
     WaterSurfaceCache* cache,
     std::string* errorMessage,
-    WaterSurfaceBuildDiagnostics* diagnostics) {
+    WaterSurfaceBuildDiagnostics* diagnostics,
+    WaterSurfaceCacheLoadValidation validation) {
     if (cache == nullptr) {
         return false;
     }
@@ -2176,6 +2091,10 @@ bool LoadWaterSurfaceCache(
     const bool previousSchema = magicView == kPreviousWaterSurfaceCacheMagic;
     const bool currentSchema = magicView == kWaterSurfaceCacheMagic;
     const bool checksummedSchema = previousSchema || currentSchema;
+    const bool deferGpuPayloadValidation =
+        currentSchema &&
+        validation ==
+            WaterSurfaceCacheLoadValidation::DeferGpuPayloadToUpload;
     if (!input.good() ||
         (!legacySchema && !previousSchema && !currentSchema) ||
         !ReadPod(input, &loaded.schemaVersion) ||
@@ -2378,6 +2297,10 @@ bool LoadWaterSurfaceCache(
         loaded.gpuData.persistedTables.vegetationCount = gpuVegetationCount;
         loaded.gpuData.persistedTables.flowSurfaceCount = gpuFlowSurfaceCount;
         loaded.gpuData.persistedTables.groundCount = gpuGroundCount;
+        loaded.gpuData.persistedTables.payloadChecksumPrefix =
+            payloadChecksumBuilder;
+        loaded.gpuData.persistedTables.payloadValidationDeferred =
+            deferGpuPayloadValidation;
         const auto readPersistedSection = [&](std::uint64_t count,
                                               std::uint64_t elementBytes,
                                               std::uint64_t tag,
@@ -2393,6 +2316,12 @@ bool LoadWaterSurfaceCache(
             gpuStreamChecksumBuilder.AddPod(tag);
             gpuStreamChecksumBuilder.AddPod(count);
             std::uint64_t remaining = SaturatingMultiply(count, elementBytes);
+            if (deferGpuPayloadValidation) {
+                input.seekg(
+                    static_cast<std::streamoff>(remaining),
+                    std::ios::cur);
+                return input.good();
+            }
             while (remaining > 0U) {
                 const auto chunkBytes = static_cast<std::size_t>(std::min<std::uint64_t>(
                     remaining,
@@ -2431,8 +2360,10 @@ bool LoadWaterSurfaceCache(
                  sizeof(WaterGpuGroundSlot),
                  8U,
                  &loaded.gpuData.persistedTables.groundOffset));
-        loaded.gpuData.persistedTables.streamChecksum =
-            gpuStreamChecksumBuilder.Finish();
+        if (!deferGpuPayloadValidation) {
+            loaded.gpuData.persistedTables.streamChecksum =
+                gpuStreamChecksumBuilder.Finish();
+        }
     } else {
         try {
             loaded.gpuData.surfaceTable.resize(static_cast<std::size_t>(gpuSurfaceCount));
@@ -2495,12 +2426,30 @@ bool LoadWaterSurfaceCache(
             identityOk = identityOk && ReadPod(input, &word);
         }
         identityOk = identityOk && ReadPod(input, &persistedChecksum.hashedByteCount);
+        const auto locallyComputedPayloadChecksum =
+            loaded.gpuData.payloadChecksum;
+        const auto expectedPayloadHashedBytes = SaturatingAdd(
+            loaded.gpuData.persistedTables.payloadChecksumPrefix
+                .Finish()
+                .hashedByteCount,
+            SaturatingAdd(
+                gpuPayloadBytes,
+                currentSchema ? 4U * 2U * sizeof(std::uint64_t)
+                              : 3U * 2U * sizeof(std::uint64_t)));
+        if (deferGpuPayloadValidation) {
+            loaded.gpuData.payloadChecksum = persistedChecksum;
+        }
         derivedIdentity = MakeWaterSurfaceCacheIdentity(
             loaded,
             loaded.gpuData,
             loaded.schemaVersion,
             &loaded.gpuData.payloadChecksum);
-        if (!identityOk || persistedChecksum != loaded.gpuData.payloadChecksum ||
+        if (!identityOk ||
+            (deferGpuPayloadValidation
+                 ? (!persistedChecksum.Valid() ||
+                    persistedChecksum.hashedByteCount !=
+                        expectedPayloadHashedBytes)
+                 : persistedChecksum != locallyComputedPayloadChecksum) ||
             persistedIdentity != derivedIdentity ||
             input.peek() != std::char_traits<char>::eof()) {
             if (errorMessage != nullptr) {

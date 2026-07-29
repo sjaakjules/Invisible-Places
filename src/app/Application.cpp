@@ -56,6 +56,7 @@
 #include <nlohmann/json.hpp>
 #include <condition_variable>
 #include <deque>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -1405,6 +1406,7 @@ struct WaterSeepageSupportJobShared {
     std::string semanticKey;
     std::vector<std::string> nodeFingerprints;
     std::vector<WaterSeepageSupportBuildResult> results;
+    std::exception_ptr failure;
 };
 
 struct WaterSeepageSupportJobState {
@@ -2035,9 +2037,11 @@ struct WaterFrameState {
 // global levels override the scenario channels (including the delayed
 // seepage rain and mesh-flow moisture, which follow the keyed instantaneous
 // rain), and per-node samples become absolute parameter overrides.
+template <typename ResolveAuthoredLook>
 void ApplyWaterFeatureTimingRunsToFrame(
     std::span<const invisible_places::water::WaterFeatureTimingRun> runs,
-    WaterFrameState* frame) {
+    WaterFrameState* frame,
+    ResolveAuthoredLook&& resolveAuthoredLook) {
     if (frame == nullptr || runs.empty()) {
         return;
     }
@@ -2090,6 +2094,25 @@ void ApplyWaterFeatureTimingRunsToFrame(
             entryIt->state.prominenceOverride = value;
         } else if (sample.settingId == "source_width") {
             entryIt->state.sourceWidthOverride = value;
+        } else if (
+            sample.settingId.starts_with("look.") ||
+            sample.settingId.starts_with("response.")) {
+            if (!entryIt->state.lookOverride.has_value()) {
+                const auto authoredLook =
+                    resolveAuthoredLook(sample.feature.objectId);
+                entryIt->state.lookOverride =
+                    invisible_places::water::
+                        ResolveWaterSeepageTimingLookBase(
+                            authoredLook.value_or(
+                                invisible_places::water::
+                                    DefaultWaterSeepageLookSettings()),
+                            frame->seepageScenarioState);
+            }
+            (void)invisible_places::water::
+                ApplyWaterSeepageLookTimingValue(
+                    &entryIt->state.lookOverride.value(),
+                    sample.settingId,
+                    sample.value);
         }
     }
 }
@@ -2186,7 +2209,27 @@ WaterFrameState ResolveWaterFrameState(
             runtimeState->water,
             ActiveWaterTimingScenarioId(*runtimeState));
         if (entry != nullptr) {
-            ApplyWaterFeatureTimingRunsToFrame(entry->runs, &result);
+            ApplyWaterFeatureTimingRunsToFrame(
+                entry->runs,
+                &result,
+                [&](std::uint32_t nodeId)
+                    -> std::optional<WaterSeepageLookSettings> {
+                    const auto node = std::find_if(
+                        runtimeState->water.seepageNodes.begin(),
+                        runtimeState->water.seepageNodes.end(),
+                        [nodeId](const WaterSeepageNode& candidate) {
+                            return candidate.id == nodeId;
+                        });
+                    if (node == runtimeState->water.seepageNodes.end()) {
+                        return std::nullopt;
+                    }
+                    return invisible_places::water::
+                        ResolveWaterSeepageLook(
+                            *node,
+                            runtimeState->water.seepageLookProfiles,
+                            runtimeState->water.seepageResponseProfiles,
+                            runtimeState->water.defaultSeepageLook);
+                });
         }
     }
     return result;
@@ -4258,11 +4301,22 @@ bool RecompileWaterTimingTracks(
     invisible_places::camera::AnimationPath* animationPath,
     bool useEditedScenario = true);
 void RecompileWaterTimingTracksForAnimation(PreviewRuntimeState* runtimeState);
-bool DrawWaterSeepageLookControls(WaterSeepageLookSettings* look);
-bool DrawWaterSeepageSettingsControls(WaterSeepageLookSettings* look);
+struct WaterProfileKeyingContext {
+    PreviewRuntimeState* runtimeState = nullptr;
+    std::vector<invisible_places::water::WaterKeyedFeatureId> features;
+    std::string profileGroup;
+    std::string profileName;
+};
+bool DrawWaterSeepageLookControls(
+    WaterSeepageLookSettings* look,
+    const WaterProfileKeyingContext* keying = nullptr);
+bool DrawWaterSeepageSettingsControls(
+    WaterSeepageLookSettings* look,
+    const WaterProfileKeyingContext* keying = nullptr);
 bool DrawWaterSeepageResponseControls(
     invisible_places::water::WaterEffectResponseSettings* response,
-    WaterEffectBlendMode* blendMode);
+    WaterEffectBlendMode* blendMode,
+    const WaterProfileKeyingContext* keying = nullptr);
 void StartDynamicMeshSurfaceCacheWarmup(PreviewRuntimeState* runtimeState, bool publishStatus = false);
 std::shared_ptr<MeshSurfaceCache> EnsureDynamicMeshSurfaceCache(
     PreviewRuntimeState* runtimeState,
@@ -17125,7 +17179,9 @@ void StartWaterSurfaceCacheWarmup(
                 result = invisible_places::water::BuildWaterSurfaceCache(
                     sources,
                     forceRebuild ? std::filesystem::path{} : buildRoot,
-                    &shared->cancelRequested);
+                    &shared->cancelRequested,
+                    invisible_places::water::WaterSurfaceCacheLoadValidation::
+                        DeferGpuPayloadToUpload);
                 persistedPath = result.persistedPath;
                 if (result.success && !result.cancelled && persistedPath.empty()) {
                     std::string saveError;
@@ -23461,6 +23517,9 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
                     runtimeState.water.seepageResponseProfiles);
             }
         }
+        invisible_places::water::PrepareWaterSeepagePulseFields(
+            &seepageGrid,
+            activeWater.sampleTimeSeconds);
         layers.push_back(
             {.cloud = session.offlinePointCloud,
              .style = fastBasicRenderer
@@ -27297,7 +27356,27 @@ WaterFrameState ResolveFrozenWaterFrameState(
                     result.normalizedTime);
         }
     }
-    ApplyWaterFeatureTimingRunsToFrame(job.frozenFeatureTimingRuns, &result);
+    ApplyWaterFeatureTimingRunsToFrame(
+        job.frozenFeatureTimingRuns,
+        &result,
+        [&](std::uint32_t nodeId)
+            -> std::optional<WaterSeepageLookSettings> {
+            // Frozen grids already contain the queue-time fully resolved
+            // authored settings and response profile. Reuse that snapshot so
+            // later project/profile edits cannot change an active export.
+            for (const auto& layer : job.frozenSeepageLayers) {
+                const auto node = std::find_if(
+                    layer.grid.nodes.begin(),
+                    layer.grid.nodes.end(),
+                    [nodeId](const auto& candidate) {
+                        return candidate.id == nodeId;
+                    });
+                if (node != layer.grid.nodes.end()) {
+                    return node->authoredLook;
+                }
+            }
+            return std::nullopt;
+        });
     return result;
 }
 
@@ -27390,6 +27469,9 @@ void UploadFrozenAnimationSeepageParameters(
             job->waterRainSettings,
             job->effectiveSeepageInvocations,
             frameState.nodeStates);
+        invisible_places::water::PrepareWaterSeepagePulseFields(
+            &frozenLayer.grid,
+            frameState.sampleTimeSeconds);
         viewport->UpdateWaterSeepageParams(
             frozenLayer.layerId,
             frozenLayer.grid);
@@ -39799,6 +39881,7 @@ void DrawWaterDynamicMeshFlowPanel(
 struct KeyedWaterSliderResult {
     bool authoredChanged = false;
     bool keyedChanged = false;
+    bool keyingStateChanged = false;
 };
 
 // The keyed-editing core: when the primary feature belongs to a run of the
@@ -39818,7 +39901,10 @@ KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
     const char* format,
     ImGuiSliderFlags flags,
     bool mixed,
-    float* editedValue) {
+    float* editedValue,
+    std::string_view profileGroup = {},
+    std::string_view profileName = {},
+    const char* semanticHelp = nullptr) {
     KeyedWaterSliderResult result;
     auto& water = runtimeState->water;
     const auto scenarioId = ActiveWaterTimingScenarioId(*runtimeState);
@@ -39831,13 +39917,23 @@ KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
     }
     if (run == nullptr) {
         float value = authoredValue;
-        if (ImGui::SliderFloat(
+        const bool sliderChanged = ImGui::SliderFloat(
                 label,
                 &value,
                 minimumValue,
                 maximumValue,
                 mixed ? "different" : format,
-                flags)) {
+                flags);
+        if (semanticHelp != nullptr &&
+            semanticHelp[0] != '\0' &&
+            ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::BeginTooltip();
+            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 32.0F);
+            ImGui::TextUnformatted(semanticHelp);
+            ImGui::PopTextWrapPos();
+            ImGui::EndTooltip();
+        }
+        if (sliderChanged) {
             result.authoredChanged = true;
             *editedValue = value;
         }
@@ -39858,15 +39954,20 @@ KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
     }
     const float position =
         std::clamp(runtimeState->animationPanel.scrubAmount, 0.0F, 1.0F);
-    const bool keyed = track != nullptr && !track->keys.empty();
+    const bool keyingActive = track != nullptr && track->active;
+    const bool keyed =
+        keyingActive && track != nullptr && !track->keys.empty();
     float value = keyed
                       ? invisible_places::water::
                             EvaluateWaterKeyedSettingTrack(*track, position)
                                 .value_or(authoredValue)
                       : authoredValue;
-    if (keyed) {
+    if (keyingActive) {
         ImGui::PushStyleColor(ImGuiCol_Text, kWaterKeyedSettingColour);
     }
+    const ImU32 activeLabelColour =
+        ImGui::GetColorU32(ImGuiCol_Text);
+    const float sliderWidth = ImGui::CalcItemWidth();
     const bool sliderChanged = ImGui::SliderFloat(
         label,
         &value,
@@ -39874,24 +39975,133 @@ KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
         maximumValue,
         mixed ? "different" : format,
         flags);
-    if (keyed) {
+    const bool sliderHovered =
+        ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal);
+    const ImVec2 sliderItemMin = ImGui::GetItemRectMin();
+    if (keyingActive) {
         ImGui::PopStyleColor();
     }
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+    const std::string renderedLabel = [&]() {
+        const std::string text{label};
+        const auto hiddenId = text.find("##");
+        return hiddenId == std::string::npos
+                   ? text
+                   : text.substr(0U, hiddenId);
+    }();
+    const ImVec2 labelMin{
+        sliderItemMin.x + sliderWidth +
+            ImGui::GetStyle().ItemInnerSpacing.x,
+        sliderItemMin.y};
+    const ImVec2 labelMax{
+        labelMin.x + ImGui::CalcTextSize(renderedLabel.c_str()).x,
+        labelMin.y + ImGui::GetTextLineHeight()};
+    const bool labelHovered =
+        ImGui::IsMouseHoveringRect(labelMin, labelMax);
+    if (keyingActive && !renderedLabel.empty()) {
+        // ImGui has no separate bold face in this theme. A one-pixel second
+        // pass produces the intended bold setting-name affordance while
+        // retaining the current font and scale.
+        ImGui::GetWindowDrawList()->AddText(
+            ImVec2{labelMin.x + 0.75F, labelMin.y},
+            activeLabelColour,
+            renderedLabel.c_str());
+    }
+
+    bool toggledKeying = false;
+    if (labelHovered &&
+        ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        const bool enable = !keyingActive;
+        auto& mutableEntry =
+            EnsureScenarioFeatureRuns(&water, scenarioId);
+        for (const auto& feature : features) {
+            for (auto& mutableRun : mutableEntry.runs) {
+                auto* mutableTimeline =
+                    invisible_places::water::FindWaterFeatureTimeline(
+                        &mutableRun,
+                        feature);
+                if (mutableTimeline == nullptr) {
+                    continue;
+                }
+                auto mutableTrack = std::find_if(
+                    mutableTimeline->settings.begin(),
+                    mutableTimeline->settings.end(),
+                    [&](const auto& candidate) {
+                        return candidate.settingId == settingId;
+                    });
+                if (mutableTrack ==
+                    mutableTimeline->settings.end()) {
+                    mutableTimeline->settings.push_back(
+                        {.settingId = settingId,
+                         .active = enable,
+                         .label = renderedLabel,
+                         .profileGroup =
+                             std::string{profileGroup},
+                         .profileName =
+                             std::string{profileName}});
+                } else {
+                    mutableTrack->active = enable;
+                    mutableTrack->label = renderedLabel;
+                    if (!profileGroup.empty()) {
+                        mutableTrack->profileGroup =
+                            std::string{profileGroup};
+                        mutableTrack->profileName =
+                            std::string{profileName};
+                    }
+                }
+                break;
+            }
+        }
+        ApplyAnimationScrub(runtimeState);
+        InvalidateWaterSeepageParams(&water);
+        runtimeState->previewRenderStateSignatureValid = false;
+        runtimeState->statusMessage =
+            enable
+                ? "Enabled keying for " + renderedLabel + "."
+                : "Disabled keying for " + renderedLabel +
+                      "; its scenario keys were preserved.";
+        runtimeState->errorMessage.clear();
+        result.keyingStateChanged = true;
+        toggledKeying = true;
+    }
+    if (sliderHovered || labelHovered) {
+        ImGui::BeginTooltip();
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 32.0F);
+        if (semanticHelp != nullptr && semanticHelp[0] != '\0') {
+            ImGui::TextUnformatted(semanticHelp);
+            ImGui::Separator();
+        }
         if (keyed) {
-            ImGui::SetTooltip(
-                "Keyed in run \"%s\" (%zu key%s). Editing adds or moves the "
-                "key at the current animation position; values blend "
-                "between keys.",
+            ImGui::TextWrapped(
+                "Keyed in run \"%s\" (%zu key%s). Editing writes the key "
+                "at the current animation position. Double-click the bold "
+                "setting name to disable keying while preserving its keys.",
                 run->name.c_str(),
                 track->keys.size(),
                 track->keys.size() == 1U ? "" : "s");
+        } else if (keyingActive) {
+            ImGui::TextWrapped(
+                "Keying is enabled in run \"%s\". Adjust the value to add "
+                "the first key, or double-click the bold setting name to "
+                "disable keying.",
+                run->name.c_str());
         } else {
-            ImGui::SetTooltip(
-                "In run \"%s\": editing writes a key at the current "
-                "animation position instead of changing the base setting.",
+            ImGui::TextWrapped(
+                "Base value. Double-click the setting name to make it "
+                "keyable in run \"%s\".",
                 run->name.c_str());
         }
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
+    }
+    if (toggledKeying) {
+        return result;
+    }
+    if (!keyingActive) {
+        if (sliderChanged) {
+            result.authoredChanged = true;
+            *editedValue = value;
+        }
+        return result;
     }
     const auto previous =
         keyed ? invisible_places::water::PreviousWaterSettingKeyPosition(
@@ -39996,8 +40206,23 @@ KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
                 }
                 if (mutableTrack == nullptr) {
                     mutableTimeline->settings.push_back(
-                        {.settingId = settingId});
+                        {.settingId = settingId,
+                         .active = true,
+                         .label = renderedLabel,
+                         .profileGroup =
+                             std::string{profileGroup},
+                         .profileName =
+                             std::string{profileName}});
                     mutableTrack = &mutableTimeline->settings.back();
+                } else {
+                    mutableTrack->active = true;
+                    mutableTrack->label = renderedLabel;
+                    if (!profileGroup.empty()) {
+                        mutableTrack->profileGroup =
+                            std::string{profileGroup};
+                        mutableTrack->profileName =
+                            std::string{profileName};
+                    }
                 }
                 invisible_places::water::AddOrUpdateWaterSettingKey(
                     mutableTrack,
@@ -40008,6 +40233,393 @@ KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
         }
         result.keyedChanged = true;
         *editedValue = value;
+    }
+    return result;
+}
+
+// Presents an RGB response as the same single colour editor used by the
+// Visuals tab while retaining the three scalar timing tracks used by existing
+// projects. Enabling, navigating, editing, or deleting keying operates on the
+// colour as one setting so users never have to coordinate three channel rows.
+KeyedWaterSliderResult DrawKeyedWaterColourSetting(
+    PreviewRuntimeState* runtimeState,
+    std::span<const invisible_places::water::WaterKeyedFeatureId> features,
+    const std::array<std::string_view, 3>& settingIds,
+    const char* label,
+    const std::array<float, 3>& authoredColour,
+    std::array<float, 3>* editedColour,
+    std::string_view profileGroup = {},
+    std::string_view profileName = {},
+    const char* semanticHelp = nullptr) {
+    KeyedWaterSliderResult result;
+    if (runtimeState == nullptr || editedColour == nullptr) {
+        return result;
+    }
+
+    auto& water = runtimeState->water;
+    const auto scenarioId = ActiveWaterTimingScenarioId(*runtimeState);
+    const auto* entry = FindScenarioFeatureRuns(water, scenarioId);
+    const invisible_places::water::WaterFeatureTimingRun* run = nullptr;
+    if (entry != nullptr && !features.empty()) {
+        run = invisible_places::water::FindWaterFeatureRunContaining(
+            entry->runs,
+            features.front());
+    }
+    if (run == nullptr) {
+        auto colour = authoredColour;
+        const bool colourChanged =
+            ImGui::ColorEdit3(label, colour.data());
+        if (semanticHelp != nullptr &&
+            semanticHelp[0] != '\0' &&
+            ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::BeginTooltip();
+            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 32.0F);
+            ImGui::TextUnformatted(semanticHelp);
+            ImGui::PopTextWrapPos();
+            ImGui::EndTooltip();
+        }
+        if (colourChanged) {
+            result.authoredChanged = true;
+            *editedColour = colour;
+        }
+        return result;
+    }
+
+    const auto* timeline =
+        invisible_places::water::FindWaterFeatureTimeline(
+            run,
+            features.front());
+    std::array<const invisible_places::water::WaterKeyedSettingTrack*, 3>
+        tracks{};
+    if (timeline != nullptr) {
+        for (std::size_t channel = 0; channel < settingIds.size(); ++channel) {
+            const auto track = std::find_if(
+                timeline->settings.begin(),
+                timeline->settings.end(),
+                [&](const auto& candidate) {
+                    return candidate.settingId == settingIds[channel];
+                });
+            if (track != timeline->settings.end()) {
+                tracks[channel] = &*track;
+            }
+        }
+    }
+
+    const float position =
+        std::clamp(runtimeState->animationPanel.scrubAmount, 0.0F, 1.0F);
+    const bool keyingActive = std::any_of(
+        tracks.begin(),
+        tracks.end(),
+        [](const auto* track) {
+            return track != nullptr && track->active;
+        });
+    std::array<float, 3> colour = authoredColour;
+    for (std::size_t channel = 0; channel < tracks.size(); ++channel) {
+        const auto* track = tracks[channel];
+        if (track != nullptr && track->active && !track->keys.empty()) {
+            colour[channel] =
+                invisible_places::water::EvaluateWaterKeyedSettingTrack(
+                    *track,
+                    position)
+                    .value_or(authoredColour[channel]);
+        }
+    }
+
+    if (keyingActive) {
+        ImGui::PushStyleColor(ImGuiCol_Text, kWaterKeyedSettingColour);
+    }
+    const ImU32 activeLabelColour = ImGui::GetColorU32(ImGuiCol_Text);
+    const float editorWidth = ImGui::CalcItemWidth();
+    const bool colourChanged =
+        ImGui::ColorEdit3(label, colour.data());
+    const bool colourHovered =
+        ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal);
+    const ImVec2 editorItemMin = ImGui::GetItemRectMin();
+    if (keyingActive) {
+        ImGui::PopStyleColor();
+    }
+
+    const std::string renderedLabel = [&]() {
+        const std::string text{label};
+        const auto hiddenId = text.find("##");
+        return hiddenId == std::string::npos
+                   ? text
+                   : text.substr(0U, hiddenId);
+    }();
+    const ImVec2 labelMin{
+        editorItemMin.x + editorWidth +
+            ImGui::GetStyle().ItemInnerSpacing.x,
+        editorItemMin.y};
+    const ImVec2 labelMax{
+        labelMin.x + ImGui::CalcTextSize(renderedLabel.c_str()).x,
+        labelMin.y + ImGui::GetTextLineHeight()};
+    const bool labelHovered =
+        ImGui::IsMouseHoveringRect(labelMin, labelMax);
+    if (keyingActive && !renderedLabel.empty()) {
+        ImGui::GetWindowDrawList()->AddText(
+            ImVec2{labelMin.x + 0.75F, labelMin.y},
+            activeLabelColour,
+            renderedLabel.c_str());
+    }
+
+    const auto channelLabel =
+        [&](std::size_t channel) {
+            static constexpr std::array<std::string_view, 3> suffixes{
+                " Red",
+                " Green",
+                " Blue",
+            };
+            return renderedLabel + std::string{suffixes[channel]};
+        };
+    bool toggledKeying = false;
+    if (labelHovered &&
+        ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        const bool enable = !keyingActive;
+        auto& mutableEntry =
+            EnsureScenarioFeatureRuns(&water, scenarioId);
+        for (const auto& feature : features) {
+            for (auto& mutableRun : mutableEntry.runs) {
+                auto* mutableTimeline =
+                    invisible_places::water::FindWaterFeatureTimeline(
+                        &mutableRun,
+                        feature);
+                if (mutableTimeline == nullptr) {
+                    continue;
+                }
+                for (std::size_t channel = 0;
+                     channel < settingIds.size();
+                     ++channel) {
+                    auto mutableTrack = std::find_if(
+                        mutableTimeline->settings.begin(),
+                        mutableTimeline->settings.end(),
+                        [&](const auto& candidate) {
+                            return candidate.settingId ==
+                                   settingIds[channel];
+                        });
+                    if (mutableTrack ==
+                        mutableTimeline->settings.end()) {
+                        mutableTimeline->settings.push_back(
+                            {.settingId =
+                                 std::string{settingIds[channel]},
+                             .active = enable,
+                             .label = channelLabel(channel),
+                             .profileGroup =
+                                 std::string{profileGroup},
+                             .profileName =
+                                 std::string{profileName}});
+                    } else {
+                        mutableTrack->active = enable;
+                        mutableTrack->label = channelLabel(channel);
+                        if (!profileGroup.empty()) {
+                            mutableTrack->profileGroup =
+                                std::string{profileGroup};
+                            mutableTrack->profileName =
+                                std::string{profileName};
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        ApplyAnimationScrub(runtimeState);
+        InvalidateWaterSeepageParams(&water);
+        runtimeState->previewRenderStateSignatureValid = false;
+        runtimeState->statusMessage =
+            enable
+                ? "Enabled keying for " + renderedLabel + "."
+                : "Disabled keying for " + renderedLabel +
+                      "; its scenario keys were preserved.";
+        runtimeState->errorMessage.clear();
+        result.keyingStateChanged = true;
+        toggledKeying = true;
+    }
+
+    if (colourHovered || labelHovered) {
+        ImGui::BeginTooltip();
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 32.0F);
+        if (semanticHelp != nullptr && semanticHelp[0] != '\0') {
+            ImGui::TextUnformatted(semanticHelp);
+            ImGui::Separator();
+        }
+        ImGui::TextWrapped(
+            keyingActive
+                ? "Keyed colour in run \"%s\". Editing writes one RGB "
+                  "colour key at the current animation position. "
+                  "Double-click the bold setting name to disable keying "
+                  "while preserving its keys."
+                : "Base colour. Double-click the setting name to make the "
+                  "whole tint keyable in run \"%s\".",
+            run->name.c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
+    }
+    if (toggledKeying) {
+        return result;
+    }
+    if (!keyingActive) {
+        if (colourChanged) {
+            result.authoredChanged = true;
+            *editedColour = colour;
+        }
+        return result;
+    }
+
+    std::optional<float> previous;
+    std::optional<float> next;
+    std::size_t currentKeyCount = 0U;
+    for (const auto* track : tracks) {
+        if (track == nullptr || !track->active) {
+            continue;
+        }
+        if (const auto candidate =
+                invisible_places::water::
+                    PreviousWaterSettingKeyPosition(
+                        *track,
+                        position);
+            candidate.has_value() &&
+            (!previous.has_value() ||
+             candidate.value() > previous.value())) {
+            previous = candidate;
+        }
+        if (const auto candidate =
+                invisible_places::water::
+                    NextWaterSettingKeyPosition(
+                        *track,
+                        position);
+            candidate.has_value() &&
+            (!next.has_value() ||
+             candidate.value() < next.value())) {
+            next = candidate;
+        }
+        currentKeyCount +=
+            invisible_places::water::
+                WaterSettingKeyCountAtPosition(
+                    *track,
+                    position);
+    }
+
+    const auto buttonTooltip = [](const char* text) {
+        if (ImGui::IsItemHovered(
+                ImGuiHoveredFlags_DelayNormal |
+                ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("%s", text);
+        }
+    };
+    ImGui::SameLine();
+    ImGui::PushID(label);
+    ImGui::BeginDisabled(!previous.has_value());
+    if (ImGui::SmallButton("<")) {
+        runtimeState->animationPanel.scrubAmount =
+            previous.value();
+        ApplyAnimationScrub(runtimeState);
+    }
+    ImGui::EndDisabled();
+    buttonTooltip(
+        previous.has_value()
+            ? "Go to the tint's previous colour key."
+            : "This tint has no earlier colour key.");
+    ImGui::SameLine(0.0F, 2.0F);
+    ImGui::BeginDisabled(!next.has_value());
+    if (ImGui::SmallButton(">")) {
+        runtimeState->animationPanel.scrubAmount = next.value();
+        ApplyAnimationScrub(runtimeState);
+    }
+    ImGui::EndDisabled();
+    buttonTooltip(
+        next.has_value()
+            ? "Go to the tint's next colour key."
+            : "This tint has no later colour key.");
+    ImGui::SameLine(0.0F, 2.0F);
+    ImGui::BeginDisabled(currentKeyCount == 0U);
+    if (ImGui::SmallButton("X")) {
+        std::size_t removed = 0U;
+        for (const auto& feature : features) {
+            for (const auto settingId : settingIds) {
+                removed += invisible_places::water::
+                    RemoveWaterSettingKeysAtPosition(
+                        FindMutableWaterSettingTrack(
+                            &water,
+                            scenarioId,
+                            feature,
+                            settingId),
+                        position);
+            }
+        }
+        if (removed > 0U) {
+            ApplyAnimationScrub(runtimeState);
+            InvalidateWaterSeepageParams(&water);
+            runtimeState->previewRenderStateSignatureValid = false;
+            runtimeState->statusMessage =
+                "Deleted the keyed tint at the current position.";
+            runtimeState->errorMessage.clear();
+            result.keyedChanged = true;
+        }
+    }
+    ImGui::EndDisabled();
+    buttonTooltip(
+        currentKeyCount > 0U
+            ? "Delete the complete tint key at the current animation position."
+            : "Move the animation position onto a tint key to delete it.");
+    ImGui::PopID();
+
+    if (colourChanged) {
+        auto& mutableEntry =
+            EnsureScenarioFeatureRuns(&water, scenarioId);
+        for (const auto& feature : features) {
+            for (auto& mutableRun : mutableEntry.runs) {
+                auto* mutableTimeline =
+                    invisible_places::water::FindWaterFeatureTimeline(
+                        &mutableRun,
+                        feature);
+                if (mutableTimeline == nullptr) {
+                    continue;
+                }
+                for (std::size_t channel = 0;
+                     channel < settingIds.size();
+                     ++channel) {
+                    auto mutableTrack = std::find_if(
+                        mutableTimeline->settings.begin(),
+                        mutableTimeline->settings.end(),
+                        [&](const auto& candidate) {
+                            return candidate.settingId ==
+                                   settingIds[channel];
+                        });
+                    if (mutableTrack ==
+                        mutableTimeline->settings.end()) {
+                        mutableTimeline->settings.push_back(
+                            {.settingId =
+                                 std::string{settingIds[channel]},
+                             .active = true,
+                             .label = channelLabel(channel),
+                             .profileGroup =
+                                 std::string{profileGroup},
+                             .profileName =
+                                 std::string{profileName}});
+                        mutableTrack =
+                            std::prev(
+                                mutableTimeline->settings.end());
+                    } else {
+                        mutableTrack->active = true;
+                        mutableTrack->label =
+                            channelLabel(channel);
+                        if (!profileGroup.empty()) {
+                            mutableTrack->profileGroup =
+                                std::string{profileGroup};
+                            mutableTrack->profileName =
+                                std::string{profileName};
+                        }
+                    }
+                    invisible_places::water::
+                        AddOrUpdateWaterSettingKey(
+                            &*mutableTrack,
+                            position,
+                            colour[channel]);
+                }
+                break;
+            }
+        }
+        result.keyedChanged = true;
+        *editedColour = colour;
     }
     return result;
 }
@@ -40458,7 +41070,86 @@ void DrawWaterSeepageParameterTooltip(const char* text) {
 // Pattern/appearance half of a seepage look (everything except the visual
 // response). Paired with DrawWaterSeepageResponseControls; the node panel
 // binds each half to its own named-profile library.
-bool DrawWaterSeepageSettingsControls(WaterSeepageLookSettings* look) {
+std::string_view WaterSeepageLookTimingSettingId(
+    const WaterSeepageLookSettings& look,
+    const float* value) {
+    if (value == &look.baseWetness) return "look.base_wetness";
+    if (value == &look.density) return "look.density";
+    if (value == &look.glisten) return "look.glisten";
+    if (value == &look.rainResponse) return "look.rain_response";
+    if (value == &look.featureSizeMeters) return "look.feature_size";
+    if (value == &look.contrast) return "look.contrast";
+    if (value == &look.evolution) return "look.evolution";
+    if (value == &look.roughness) return "look.roughness";
+    if (value == &look.angleResponse) return "look.angle_response";
+    if (value == &look.microNormalStrength) {
+        return "look.micro_normal_strength";
+    }
+    if (value == &look.glintDensity) return "look.glint_density";
+    if (value == &look.environmentAzimuthDegrees) {
+        return "look.environment_azimuth";
+    }
+    if (value == &look.environmentElevationDegrees) {
+        return "look.environment_elevation";
+    }
+    if (value == &look.curl) return "look.curl";
+    if (value == &look.breakup) return "look.breakup";
+    if (value == &look.downhillDriftMetersPerSecond) {
+        return "look.downhill_drift";
+    }
+    if (value == &look.tricklePatchSizeMeters) {
+        return "look.trickle_patch_size";
+    }
+    if (value == &look.trickleWidthMeters) {
+        return "look.trickle_width";
+    }
+    if (value == &look.trickleFrontSoftness) {
+        return "look.trickle_front_softness";
+    }
+    if (value == &look.pulseSpacingMeters) return "look.pulse_spacing";
+    if (value == &look.pulseWidthMeters) return "look.pulse_width";
+    if (value == &look.pulseSpeedMetersPerSecond) {
+        return "look.pulse_speed";
+    }
+    if (value == &look.pulseIrregularity) {
+        return "look.pulse_irregularity";
+    }
+    if (value == &look.pulseWaveCount) return "look.pulse_wave_count";
+    if (value == &look.pulseSpeedVariation) {
+        return "look.pulse_speed_variation";
+    }
+    return {};
+}
+
+std::string_view WaterSeepageResponseTimingSettingId(
+    const invisible_places::water::WaterEffectResponseSettings& response,
+    const float* value) {
+    if (value == &response.intensity) return "response.intensity";
+    if (value == &response.emissionAdd) return "response.emission_add";
+    if (value == &response.opacityAdd) return "response.opacity_add";
+    if (value == &response.opacityMultiply) {
+        return "response.opacity_multiply";
+    }
+    if (value == &response.pointSizeAdd) return "response.point_size_add";
+    if (value == &response.pointSizeMultiply) {
+        return "response.point_size_multiply";
+    }
+    if (value == &response.hueShift) return "response.hue_shift";
+    if (value == &response.colouriseRed) return "response.colourise_red";
+    if (value == &response.colouriseGreen) return "response.colourise_green";
+    if (value == &response.colouriseBlue) return "response.colourise_blue";
+    if (value == &response.colouriseAmount) {
+        return "response.colourise_amount";
+    }
+    if (value == &response.gaussianSharpnessBias) {
+        return "response.gaussian_sharpness_bias";
+    }
+    return {};
+}
+
+bool DrawWaterSeepageSettingsControls(
+    WaterSeepageLookSettings* look,
+    const WaterProfileKeyingContext* keying) {
     if (look == nullptr) {
         return false;
     }
@@ -40474,14 +41165,42 @@ bool DrawWaterSeepageSettingsControls(WaterSeepageLookSettings* look) {
                             const char* format,
                             const char* help,
                             ImGuiSliderFlags flags = ImGuiSliderFlags_None) {
-        const bool valueChanged = ImGui::SliderFloat(
-            label,
-            value,
-            minimum,
-            maximum,
-            format,
-            flags);
-        tooltip(help);
+        bool valueChanged = false;
+        if (keying != nullptr &&
+            keying->runtimeState != nullptr &&
+            !keying->features.empty()) {
+            const auto settingId =
+                WaterSeepageLookTimingSettingId(*look, value);
+            float edited = *value;
+            const auto result = DrawKeyedWaterSettingSlider(
+                keying->runtimeState,
+                keying->features,
+                settingId.data(),
+                label,
+                *value,
+                minimum,
+                maximum,
+                format,
+                flags,
+                false,
+                &edited,
+                keying->profileGroup,
+                keying->profileName,
+                help);
+            if (result.authoredChanged) {
+                *value = edited;
+                valueChanged = true;
+            }
+        } else {
+            valueChanged = ImGui::SliderFloat(
+                label,
+                value,
+                minimum,
+                maximum,
+                format,
+                flags);
+            tooltip(help);
+        }
         changed |= valueChanged;
     };
 
@@ -40543,7 +41262,8 @@ bool DrawWaterSeepageSettingsControls(WaterSeepageLookSettings* look) {
         1.0F,
         "%.2f",
         "Sets the persistent damp appearance inside the connected support footprint, including areas that "
-        "are not currently catching a highlight.");
+        "are not currently catching a highlight. Contour Pulse fronts still carry transient wetness when "
+        "this is zero.");
     slider(
         "Coverage",
         &look->density,
@@ -40826,7 +41546,8 @@ bool DrawWaterSeepageSettingsControls(WaterSeepageLookSettings* look) {
 // the underlying cloud, independent of which pattern produces it.
 bool DrawWaterSeepageResponseControls(
     invisible_places::water::WaterEffectResponseSettings* response,
-    WaterEffectBlendMode* blendMode) {
+    WaterEffectBlendMode* blendMode,
+    const WaterProfileKeyingContext* keying) {
     if (response == nullptr || blendMode == nullptr) {
         return false;
     }
@@ -40841,8 +41562,44 @@ bool DrawWaterSeepageResponseControls(
                             float maximum,
                             const char* format,
                             const char* help) {
-        const bool valueChanged = ImGui::SliderFloat(label, value, minimum, maximum, format);
-        tooltip(help);
+        bool valueChanged = false;
+        if (keying != nullptr &&
+            keying->runtimeState != nullptr &&
+            !keying->features.empty()) {
+            const auto settingId =
+                WaterSeepageResponseTimingSettingId(
+                    *response,
+                    value);
+            float edited = *value;
+            const auto result = DrawKeyedWaterSettingSlider(
+                keying->runtimeState,
+                keying->features,
+                settingId.data(),
+                label,
+                *value,
+                minimum,
+                maximum,
+                format,
+                ImGuiSliderFlags_None,
+                false,
+                &edited,
+                keying->profileGroup,
+                keying->profileName,
+                help);
+            if (result.authoredChanged) {
+                *value = edited;
+                valueChanged = true;
+            }
+        } else {
+            valueChanged =
+                ImGui::SliderFloat(
+                    label,
+                    value,
+                    minimum,
+                    maximum,
+                    format);
+            tooltip(help);
+        }
         changed |= valueChanged;
     };
     constexpr std::array<WaterEffectBlendMode, 5> blendModes{{
@@ -40919,19 +41676,45 @@ bool DrawWaterSeepageResponseControls(
         1.0F,
         "%.2f",
         "Controls how strongly Wet Tint mixes over the existing cloud colour at affected points.");
-    float tint[3] = {
+    const std::array<float, 3> authoredTint{
         response->colouriseRed,
         response->colouriseGreen,
         response->colouriseBlue,
     };
-    const bool tintChanged = ImGui::ColorEdit3("Wet Tint", tint);
-    tooltip(
-        "Colour applied by Colour Mix. A cool, desaturated tint usually reads as damp rock "
-        "without overpowering the source cloud colour.");
-    if (tintChanged) {
-        response->colouriseRed = tint[0];
-        response->colouriseGreen = tint[1];
-        response->colouriseBlue = tint[2];
+    std::array<float, 3> editedTint = authoredTint;
+    KeyedWaterSliderResult tintResult;
+    if (keying != nullptr &&
+        keying->runtimeState != nullptr &&
+        !keying->features.empty()) {
+        tintResult = DrawKeyedWaterColourSetting(
+            keying->runtimeState,
+            keying->features,
+            {{
+                "response.colourise_red",
+                "response.colourise_green",
+                "response.colourise_blue",
+            }},
+            "Wet Tint",
+            authoredTint,
+            &editedTint,
+            keying->profileGroup,
+            keying->profileName,
+            "Colour applied by Colour Mix. A cool, desaturated tint usually "
+            "reads as damp rock without overpowering the source cloud colour. "
+            "Animation keying stores the selected colour as one coordinated "
+            "RGB key.");
+    } else {
+        tintResult.authoredChanged =
+            ImGui::ColorEdit3("Wet Tint", editedTint.data());
+        tooltip(
+            "Colour applied by Colour Mix. A cool, desaturated tint usually reads as damp rock "
+            "without overpowering the source cloud colour. Animation keying stores the selected "
+            "colour as one coordinated RGB key.");
+    }
+    if (tintResult.authoredChanged) {
+        response->colouriseRed = editedTint[0];
+        response->colouriseGreen = editedTint[1];
+        response->colouriseBlue = editedTint[2];
         changed = true;
     }
     return changed;
@@ -40939,14 +41722,121 @@ bool DrawWaterSeepageResponseControls(
 
 // Full look editor (settings + response) for the scenario and key editors,
 // which store a complete look inline rather than profile references.
-bool DrawWaterSeepageLookControls(WaterSeepageLookSettings* look) {
+bool DrawWaterSeepageLookControls(
+    WaterSeepageLookSettings* look,
+    const WaterProfileKeyingContext* keying) {
     if (look == nullptr) {
         return false;
     }
-    bool changed = DrawWaterSeepageSettingsControls(look);
+    bool changed =
+        DrawWaterSeepageSettingsControls(look, keying);
     ImGui::SeparatorText("Visual Response");
-    changed |= DrawWaterSeepageResponseControls(&look->response, &look->blendMode);
+    changed |= DrawWaterSeepageResponseControls(
+        &look->response,
+        &look->blendMode,
+        keying);
     return changed;
+}
+
+std::string WaterKeyedProfileStateName(
+    std::string_view baseName,
+    std::size_t orderedPosition) {
+    std::ostringstream name;
+    name << BasePointVisualName(baseName) << "_Run"
+         << std::setfill('0') << std::setw(2)
+         << (orderedPosition + 1U);
+    return name.str();
+}
+
+void DrawWaterKeyedProfilesCombo(
+    PreviewRuntimeState* runtimeState,
+    const invisible_places::water::WaterKeyedFeatureId& feature,
+    std::string_view profileGroup,
+    std::string_view baseName,
+    const char* widgetId) {
+    const auto* entry = FindScenarioFeatureRuns(
+        runtimeState->water,
+        ActiveWaterTimingScenarioId(*runtimeState));
+    const auto* run =
+        entry != nullptr
+            ? invisible_places::water::
+                  FindWaterFeatureRunContaining(
+                      entry->runs,
+                      feature)
+            : nullptr;
+    const auto* timeline =
+        invisible_places::water::FindWaterFeatureTimeline(
+            run,
+            feature);
+    const auto positions =
+        timeline != nullptr
+            ? invisible_places::water::
+                  WaterFeatureProfileKeyPositions(
+                      *timeline,
+                      profileGroup)
+            : std::vector<float>{};
+    constexpr float kPositionTolerance = 1.0e-4F;
+    const float currentPosition = std::clamp(
+        runtimeState->animationPanel.scrubAmount,
+        0.0F,
+        1.0F);
+    std::optional<std::size_t> currentIndex;
+    for (std::size_t index = 0U; index < positions.size();
+         ++index) {
+        if (std::abs(positions[index] - currentPosition) <=
+            kPositionTolerance) {
+            currentIndex = index;
+            break;
+        }
+    }
+    const std::string preview =
+        currentIndex.has_value()
+            ? WaterKeyedProfileStateName(
+                  baseName,
+                  currentIndex.value())
+            : positions.empty()
+                  ? "No keyed profiles"
+                  : "Between keyed profiles";
+    const std::string label =
+        std::string{"Keyed Profiles##"} + widgetId;
+    ImGui::BeginDisabled(positions.empty());
+    if (ImGui::BeginCombo(label.c_str(), preview.c_str())) {
+        for (std::size_t index = 0U; index < positions.size();
+             ++index) {
+            const auto name =
+                WaterKeyedProfileStateName(baseName, index);
+            const std::string option =
+                name + "  (" +
+                FormatFixed(positions[index], 4) + ")";
+            if (ImGui::Selectable(
+                    option.c_str(),
+                    currentIndex == index)) {
+                runtimeState->animationPanel.scrubAmount =
+                    positions[index];
+                ApplyAnimationScrub(runtimeState);
+            }
+            if (currentIndex == index) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(
+            ImGuiHoveredFlags_DelayNormal |
+            ImGuiHoveredFlags_AllowWhenDisabled)) {
+        if (positions.empty()) {
+            ImGui::SetTooltip(
+                "Double-click a profile setting name to enable keying, "
+                "then adjust it at one or more animation positions.");
+        } else {
+            ImGui::SetTooltip(
+                "Complete keyed states derived from %s. Names follow key "
+                "order, so moving or inserting a key renumbers them "
+                "automatically.",
+                BasePointVisualName(baseName).c_str());
+        }
+    }
 }
 
 bool DrawWaterSeepageRoleToggle(const char* label, std::string_view role, WaterSeepageNode* node) {
@@ -41078,6 +41968,23 @@ void DrawWaterSeepagePanel(
         water.selectedSeepageNodeIndices.begin(),
         water.selectedSeepageNodeIndices.end());
     const bool multiSelect = selectedSeepageIndices.size() > 1U;
+    std::vector<invisible_places::water::WaterKeyedFeatureId>
+        selectedSeepageFeatures;
+    selectedSeepageFeatures.reserve(
+        selectedSeepageIndices.size());
+    selectedSeepageFeatures.push_back(
+        {.kind = invisible_places::water::WaterKeyedFeatureKind::
+             SeepageNode,
+         .objectId = node->id});
+    for (const auto index : selectedSeepageIndices) {
+        const auto id = water.seepageNodes[index].id;
+        if (id != node->id) {
+            selectedSeepageFeatures.push_back(
+                {.kind = invisible_places::water::
+                     WaterKeyedFeatureKind::SeepageNode,
+                 .objectId = id});
+        }
+    }
 
     bool topologyChanged = false;
     bool paramsChanged = false;
@@ -41526,6 +42433,12 @@ void DrawWaterSeepagePanel(
             }
             ImGui::EndCombo();
         }
+        DrawWaterKeyedProfilesCombo(
+            runtimeState,
+            selectedSeepageFeatures.front(),
+            "seepage_look",
+            assignedName,
+            "SeepageLook");
         if (!namesIdentical) {
             ImGui::TextColored(
                 kSeepageNoticeColour,
@@ -41565,7 +42478,15 @@ void DrawWaterSeepagePanel(
                 }
             } else {
                 WaterSeepageLookSettings editedLook = ViewedWaterSeepageLook(water, *node);
-                if (DrawWaterSeepageSettingsControls(&editedLook)) {
+                const WaterProfileKeyingContext keying{
+                    .runtimeState = runtimeState,
+                    .features = selectedSeepageFeatures,
+                    .profileGroup = "seepage_look",
+                    .profileName = assignedName,
+                };
+                if (DrawWaterSeepageSettingsControls(
+                        &editedLook,
+                        &keying)) {
                     if (const auto shadowIndex =
                             FindWaterSeepageLookProfileIndex(water, shadowName);
                         shadowIndex.has_value()) {
@@ -41671,6 +42592,12 @@ void DrawWaterSeepagePanel(
             }
             ImGui::EndCombo();
         }
+        DrawWaterKeyedProfilesCombo(
+            runtimeState,
+            selectedSeepageFeatures.front(),
+            "seepage_response",
+            assignedResponseName,
+            "SeepageResponse");
         if (!namesIdentical) {
             ImGui::TextColored(
                 kSeepageNoticeColour,
@@ -41712,7 +42639,16 @@ void DrawWaterSeepagePanel(
                 auto viewedLook = ViewedWaterSeepageLook(water, *node);
                 auto editedResponse = viewedLook.response;
                 auto editedBlendMode = viewedLook.blendMode;
-                if (DrawWaterSeepageResponseControls(&editedResponse, &editedBlendMode)) {
+                const WaterProfileKeyingContext keying{
+                    .runtimeState = runtimeState,
+                    .features = selectedSeepageFeatures,
+                    .profileGroup = "seepage_response",
+                    .profileName = assignedResponseName,
+                };
+                if (DrawWaterSeepageResponseControls(
+                        &editedResponse,
+                        &editedBlendMode,
+                        &keying)) {
                     const invisible_places::water::WaterSeepageResponseProfile shadow{
                         .name = shadowName,
                         .response = editedResponse,
@@ -44210,6 +45146,12 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                             invisible_places::water::FindWaterKeyableSetting(
                                 timeline.feature.kind,
                                 setting.settingId);
+                        const char* settingLabel =
+                            !setting.label.empty()
+                                ? setting.label.c_str()
+                                : info != nullptr
+                                      ? info->label
+                                      : setting.settingId.c_str();
                         auto ordered = setting.keys;
                         std::stable_sort(
                             ordered.begin(),
@@ -44226,8 +45168,7 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                                 "%s %zu  %s = %.3f at %.2f s",
                                 run.name.c_str(),
                                 keyIndex + 1U,
-                                info != nullptr ? info->label
-                                                : setting.settingId.c_str(),
+                                settingLabel,
                                 key.value,
                                 key.position * durationSeconds);
                             ImGui::SameLine();
@@ -44736,6 +45677,9 @@ void DrawWaterKeyMarkerStrip(
          settingIndex < timeline.settings.size();
          ++settingIndex) {
         const auto& setting = timeline.settings[settingIndex];
+        if (!setting.active) {
+            continue;
+        }
         auto ordered = setting.keys;
         std::stable_sort(
             ordered.begin(),
@@ -44772,6 +45716,12 @@ void DrawWaterKeyMarkerStrip(
         const auto* info = invisible_places::water::FindWaterKeyableSetting(
             timeline.feature.kind,
             setting.settingId);
+        const char* settingLabel =
+            !setting.label.empty()
+                ? setting.label.c_str()
+                : info != nullptr
+                      ? info->label
+                      : setting.settingId.c_str();
         const float durationSeconds =
             runtimeState->animationPanel.currentPath.has_value()
                 ? std::max(
@@ -44789,7 +45739,7 @@ void DrawWaterKeyMarkerStrip(
                 : "%s %zu — %s = %.3f at %.2f s (double-click to jump)",
             run.name.c_str(),
             nearest.keyNumber,
-            info != nullptr ? info->label : setting.settingId.c_str(),
+            settingLabel,
             nearest.value,
             nearest.position * durationSeconds);
         if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
@@ -44832,9 +45782,12 @@ void DrawWaterKeyMarkerStrip(
                     timeline.feature.kind,
                     edit->settingId);
             ImGui::TextUnformatted(
-                settingInfo != nullptr
-                    ? settingInfo->label
-                    : edit->settingId.c_str());
+                settingIt != timeline.settings.end() &&
+                        !settingIt->label.empty()
+                    ? settingIt->label.c_str()
+                    : settingInfo != nullptr
+                          ? settingInfo->label
+                          : edit->settingId.c_str());
             ImGui::TextDisabled("Enter a normalized position from 0 to 1.");
             ImGui::SetNextItemWidth(180.0F);
             if (edit->requestKeyboardFocus) {
@@ -45021,7 +45974,9 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
         std::any_of(
             timeline->settings.begin(),
             timeline->settings.end(),
-            [](const auto& setting) { return !setting.keys.empty(); });
+            [](const auto& setting) {
+                return setting.active && !setting.keys.empty();
+            });
     const std::string featureLabel =
         feature.has_value()
             ? WaterKeyedFeatureDisplayLabel(*runtimeState, *feature)
@@ -45152,6 +46107,108 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
     ImGui::Spacing();
 }
 
+void DrawFocusedWaterRunCombo(
+    PreviewRuntimeState* runtimeState) {
+    if (!runtimeState->animationPanel.currentPath.has_value()) {
+        return;
+    }
+    auto& water = runtimeState->water;
+    const auto& feature = water.activeKeyingFeature;
+    const auto scenarioId =
+        ActiveWaterTimingScenarioId(*runtimeState);
+    const auto* entry =
+        FindScenarioFeatureRuns(water, scenarioId);
+    const auto* currentRun =
+        feature.has_value() && entry != nullptr
+            ? invisible_places::water::
+                  FindWaterFeatureRunContaining(
+                      entry->runs,
+                      feature.value())
+            : nullptr;
+    const std::string preview =
+        !feature.has_value()
+            ? "No water feature in focus"
+            : scenarioId.empty()
+                  ? "No water scenario"
+                  : currentRun != nullptr
+                        ? currentRun->name
+                        : "Not in a run";
+
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    const bool available =
+        feature.has_value() && !scenarioId.empty() &&
+        entry != nullptr && !entry->runs.empty();
+    ImGui::BeginDisabled(!available);
+    if (ImGui::BeginCombo(
+            "Water Run##FocusedWaterRun",
+            preview.c_str())) {
+        if (currentRun == nullptr) {
+            ImGui::TextDisabled("Not in a run");
+            ImGui::Separator();
+        }
+        for (const auto& run : entry->runs) {
+            const bool selected =
+                currentRun != nullptr &&
+                currentRun->id == run.id;
+            if (ImGui::Selectable(
+                    run.name.c_str(),
+                    selected)) {
+                auto& mutableEntry =
+                    EnsureScenarioFeatureRuns(
+                        &water,
+                        scenarioId);
+                if (invisible_places::water::
+                        AssignWaterFeatureToTimingRun(
+                            &mutableEntry,
+                            feature.value(),
+                            run.id)) {
+                    const auto featureLabel =
+                        WaterKeyedFeatureDisplayLabel(
+                            *runtimeState,
+                            feature.value());
+                    runtimeState->statusMessage =
+                        featureLabel + " now belongs to " +
+                        run.name + ".";
+                    runtimeState->errorMessage.clear();
+                    ApplyAnimationScrub(runtimeState);
+                    InvalidateWaterSeepageParams(&water);
+                    runtimeState
+                        ->previewRenderStateSignatureValid =
+                        false;
+                }
+            }
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(
+            ImGuiHoveredFlags_DelayNormal |
+            ImGuiHoveredFlags_AllowWhenDisabled)) {
+        if (!feature.has_value()) {
+            ImGui::SetTooltip(
+                "Select a keyable Water feature or source first.");
+        } else if (scenarioId.empty()) {
+            ImGui::SetTooltip(
+                "Choose a water scenario for the loaded animation first.");
+        } else if (entry == nullptr || entry->runs.empty()) {
+            ImGui::SetTooltip(
+                "Create a feature run in the Timings tab, then assign %s here.",
+                WaterKeyedFeatureDisplayLabel(
+                    *runtimeState,
+                    feature.value())
+                    .c_str());
+        } else {
+            ImGui::SetTooltip(
+                "Assign the focused water feature to a run, or move it "
+                "between runs while preserving all active and dormant keys.");
+        }
+    }
+    ImGui::Spacing();
+}
+
 void DrawControlsWindow(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
@@ -45200,6 +46257,7 @@ void DrawControlsWindow(
     ImGui::TextDisabled("%s", fpsLabel.c_str());
 
     DrawGlobalAnimationTimingBar(runtimeState);
+    DrawFocusedWaterRunCombo(runtimeState);
 
     sidePanel.hovered = ImGui::IsWindowHovered(
         ImGuiHoveredFlags_AllowWhenBlockedByActiveItem | ImGuiHoveredFlags_RootAndChildWindows);
@@ -45672,6 +46730,7 @@ bool PollWaterSeepageSupportJob(PreviewRuntimeState* runtimeState) {
     std::string semanticKey;
     std::vector<std::string> nodeFingerprints;
     std::vector<WaterSeepageSupportBuildResult> results;
+    std::exception_ptr buildFailure;
     {
         std::scoped_lock lock(shared->mutex);
         if (!shared->completed) {
@@ -45680,6 +46739,7 @@ bool PollWaterSeepageSupportJob(PreviewRuntimeState* runtimeState) {
         semanticKey = shared->semanticKey;
         nodeFingerprints = std::move(shared->nodeFingerprints);
         results = std::move(shared->results);
+        buildFailure = shared->failure;
     }
     water.seepageSupportJob = {};
 
@@ -45687,6 +46747,12 @@ bool PollWaterSeepageSupportJob(PreviewRuntimeState* runtimeState) {
     auto& pendingFingerprints =
         water.seepagePendingSupportNodeFingerprints[semanticKey];
     std::string failure;
+    if (buildFailure != nullptr) {
+        // Keep the previously settled descriptor generation bound. The
+        // worker publishes exceptions instead of allowing them to escape its
+        // std::jthread entry point, which would invoke std::terminate.
+        failure = "Connected Seepage support generation failed unexpectedly.";
+    }
     std::size_t committedCount = 0U;
     for (std::size_t resultIndex = 0U;
          resultIndex < results.size() && resultIndex < nodeFingerprints.size();
@@ -45696,6 +46762,24 @@ bool PollWaterSeepageSupportJob(PreviewRuntimeState* runtimeState) {
         if (!invisible_places::water::CommitWaterSeepageSupportSelection(
                 candidate,
                 &selection)) {
+            if (candidate.surfaceUnavailable &&
+                candidate.selection.nodeId != 0U) {
+                const auto nodeId = candidate.selection.nodeId;
+                std::erase_if(
+                    pending,
+                    [nodeId](
+                        const WaterSeepageSupportSelection& settled) {
+                        return settled.nodeId == nodeId;
+                    });
+                // A valid node with no local cell is a settled empty result for
+                // this role. Remember its topology fingerprint so ordinary
+                // frames do not retry it; moving the node or changing an
+                // authored limit produces a new fingerprint and rebuilds.
+                pendingFingerprints[nodeId] =
+                    nodeFingerprints[resultIndex];
+                ++committedCount;
+                continue;
+            }
             if (failure.empty()) {
                 failure = candidate.errorMessage.empty()
                               ? "Connected Seepage support selection failed."
@@ -45864,21 +46948,26 @@ bool EnsureWaterSeepageSupportSelectionQueued(
     water.seepageSupportJob.worker = std::jthread(
         [shared, cache, nodes = std::move(missingNodes), role](std::stop_token stopToken) mutable {
             std::vector<WaterSeepageSupportBuildResult> results;
-            results.reserve(nodes.size());
-            for (const auto& node : nodes) {
+            std::exception_ptr failure;
+            try {
                 invisible_places::water::WaterSeepageSupportBuildOptions options;
                 options.stopToken = &stopToken;
-                results.push_back(invisible_places::water::BuildWaterSeepageSupportSelection(
-                    node,
-                    role,
-                    *cache,
-                    options));
-                if (stopToken.stop_requested()) {
-                    break;
-                }
+                results =
+                    invisible_places::water::BuildWaterSeepageSupportSelections(
+                        nodes,
+                        role,
+                        *cache,
+                        options,
+                        3U);
+            } catch (...) {
+                // This outer boundary also contains failures that occur while
+                // allocating the result vector or starting the bounded inner
+                // workers, before a per-node candidate exists.
+                failure = std::current_exception();
             }
             std::scoped_lock lock(shared->mutex);
             shared->results = std::move(results);
+            shared->failure = failure;
             shared->completed = true;
         });
     return false;
@@ -45915,6 +47004,8 @@ void EnsureWaterSeepageRuntimeUpToDate(
     std::unordered_set<std::string> activeAttachmentKeys;
     std::unordered_set<std::string> activeSemanticKeys;
     std::unordered_set<std::string> activeGuideKeys;
+    std::unordered_map<std::string, std::string>
+        activeSemanticParamsFingerprints;
 
     for (std::size_t sessionIndex = 0; sessionIndex < runtimeState->sessions.size(); ++sessionIndex) {
         const auto& session = runtimeState->sessions[sessionIndex];
@@ -45971,8 +47062,25 @@ void EnsureWaterSeepageRuntimeUpToDate(
             const auto supportSpan = !hasConnectedSelection
                                          ? std::span<const WaterSeepageSupportSelection>{}
                                          : std::span<const WaterSeepageSupportSelection>{supportIt->second};
+            std::vector<WaterSeepageNode> connectedNodes;
+            if (hasConnectedSelection) {
+                connectedNodes.reserve(roleNodes.size());
+                for (const auto& node : roleNodes) {
+                    if (std::any_of(
+                            supportIt->second.begin(),
+                            supportIt->second.end(),
+                            [&](const WaterSeepageSupportSelection&
+                                    selection) {
+                                return selection.nodeId == node.id &&
+                                       !selection.cells.empty() &&
+                                       !selection.fingerprint.empty();
+                            })) {
+                        connectedNodes.push_back(node);
+                    }
+                }
+            }
             const auto nodesForGrid = hasConnectedSelection
-                                          ? std::span<const WaterSeepageNode>{roleNodes}
+                                          ? std::span<const WaterSeepageNode>{connectedNodes}
                                           : std::span<const WaterSeepageNode>{guidedNodes};
             grid = invisible_places::water::BuildWaterSeepageSpatialGrid(
                 nodesForGrid,
@@ -46008,7 +47116,7 @@ void EnsureWaterSeepageRuntimeUpToDate(
             if (!surfaceGuideKey.empty()) {
                 runtimeState->water.seepageRuntimeGuideKeys[semanticKey] = surfaceGuideKey;
             }
-        } else {
+        } else if (firstSemanticUse) {
             // This touches only one compact record per active node. The hash
             // table, references, guide samples, and point cloud remain intact.
             invisible_places::water::ApplyWaterSeepageRuntimeParameters(
@@ -46027,7 +47135,40 @@ void EnsureWaterSeepageRuntimeUpToDate(
             activeGuideKeys.insert(guideKey->second);
         }
         auto& grid = gridIt->second;
-        const auto paramsFingerprint = invisible_places::water::WaterSeepageParamsFingerprint(grid);
+        if (firstSemanticUse) {
+            // Contour Pulses are CPU-composed and the GPU only samples the
+            // baked field. A loaded animation owns the pulse clock so
+            // repeated scrubs and live playback match still/offline exports.
+            // Without a loaded animation there is no resolved timeline, so
+            // the ordinary viewport remains free-running on its steady
+            // preview clock instead of freezing at sample time zero.
+            const float pulseTimeSeconds =
+                runtimeState->animationPanel.currentPath.has_value()
+                    ? activeWater.sampleTimeSeconds
+                    : std::chrono::duration<float>(
+                          std::chrono::steady_clock::now() -
+                          runtimeState->startedAt)
+                          .count();
+            invisible_places::water::PrepareWaterSeepagePulseFields(
+                &grid,
+                pulseTimeSeconds);
+            activeSemanticParamsFingerprints.emplace(
+                semanticKey,
+                invisible_places::water::
+                    WaterSeepageParamsFingerprint(grid));
+        }
+        const auto paramsFingerprintIt =
+            activeSemanticParamsFingerprints.find(semanticKey);
+        if (paramsFingerprintIt ==
+            activeSemanticParamsFingerprints.end()) {
+            runtimeState->errorMessage =
+                "Seepage parameter preparation did not settle for " +
+                semanticKey + '.';
+            runtimeState->statusMessage.clear();
+            continue;
+        }
+        const auto& paramsFingerprint =
+            paramsFingerprintIt->second;
         const auto topologyIt = runtimeState->water.seepageTopologyFingerprints.find(attachmentKey);
         const auto semanticAttachmentIt =
             runtimeState->water.seepageAttachmentSemanticKeys.find(attachmentKey);
@@ -46074,12 +47215,15 @@ void EnsureWaterSeepageRuntimeUpToDate(
             runtimeState->statusMessage.clear();
             continue;
         }
+        const auto residentBytes =
+            viewport->WaterSeepageResidentBytes(sessionIndex);
+        totalBytes =
+            residentBytes >
+                    std::numeric_limits<std::size_t>::max() - totalBytes
+                ? std::numeric_limits<std::size_t>::max()
+                : totalBytes +
+                      static_cast<std::size_t>(residentBytes);
         if (firstSemanticUse) {
-            totalBytes += grid.nodes.size() * sizeof(invisible_places::water::WaterSeepageRuntimeNode);
-            totalBytes += grid.hashCells.size() * sizeof(invisible_places::water::WaterSeepageSpatialHashCell);
-            totalBytes += grid.nodeReferences.size() * sizeof(std::uint32_t);
-            totalBytes += grid.supportHashCells.size() * sizeof(invisible_places::water::WaterSeepageSpatialHashCell);
-            totalBytes += grid.supportReferences.size() * sizeof(invisible_places::water::WaterSeepageSupportReference);
             overflowCells += grid.diagnostics.overflowCellCount;
             overflowCells += grid.diagnostics.supportOverflowCellCount;
         }
@@ -49499,7 +50643,10 @@ int RunWaterSeepageSmoke(
             "The Seepage GPU node count did not match the eight-node fixture: " +
             std::to_string(uploadedSeepageNodeCount) + " uploaded.");
     }
-    report.seepageGpuBytes = runtimeState->water.seepageGpuBytes;
+    report.seepageGpuBytes =
+        static_cast<std::size_t>(
+            viewport->WaterSeepageResidentBytes(
+                targetSessionIndex));
     // Connected 10 mm support stores a 16-byte reference per selected
     // node/cell plus its sparse hash. The former 4 MiB ceiling predated that
     // payload and is lower than one node's documented 262,144-reference
@@ -49862,7 +51009,13 @@ std::optional<WaterIntegrationCapturedFrame> CaptureWaterIntegrationFrame(
     float simulatedSeconds,
     const std::filesystem::path& exrPath,
     const std::filesystem::path& ppmPath,
-    std::string* errorMessage);
+    std::string* errorMessage,
+    bool includeSeepageOverlay = false);
+
+void CompositeWaterSeepageCaptureOverlay(
+    PreviewRuntimeState* runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    WaterIntegrationCapturedFrame* frame);
 
 bool WriteWaterIntegrationContactSheet(
     const std::filesystem::path& outputPath,
@@ -51708,6 +52861,198 @@ void InstallWaterIntegrationScenario(PreviewRuntimeState* runtimeState) {
     runtimeState->animationPanel.meshFlowRainEnvelopeCache = {};
 }
 
+void CompositeWaterSeepageCaptureOverlay(
+    PreviewRuntimeState* runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    WaterIntegrationCapturedFrame* frame) {
+    if (runtimeState == nullptr || frame == nullptr ||
+        frame->width == 0U || frame->height == 0U ||
+        frame->rgb.size() !=
+            static_cast<std::size_t>(frame->width) * frame->height * 3U) {
+        return;
+    }
+
+    const auto matrices =
+        runtimeState->camera.Matrices(CurrentAspectRatio(viewport));
+    const auto project = [&](const glm::vec3& worldPoint)
+        -> std::optional<std::pair<int, int>> {
+        const glm::vec4 clip =
+            matrices.viewProjection * glm::vec4{worldPoint, 1.0F};
+        if (clip.w <= 1.0e-6F) {
+            return std::nullopt;
+        }
+        const glm::vec3 ndc = glm::vec3{clip} / clip.w;
+        if (ndc.x < -1.0F || ndc.x > 1.0F ||
+            ndc.y < -1.0F || ndc.y > 1.0F ||
+            ndc.z < -1.0F || ndc.z > 1.0F) {
+            return std::nullopt;
+        }
+        return std::pair{
+            static_cast<int>(std::lround(
+                (ndc.x * 0.5F + 0.5F) *
+                static_cast<float>(frame->width - 1U))),
+            static_cast<int>(std::lround(
+                (ndc.y * 0.5F + 0.5F) *
+                static_cast<float>(frame->height - 1U))),
+        };
+    };
+    const auto blendCircle = [&](int centerX,
+                                 int centerY,
+                                 int radius,
+                                 std::array<std::uint8_t, 3> colour,
+                                 float alpha) {
+        const int clampedRadius = std::max(1, radius);
+        const int radiusSquared = clampedRadius * clampedRadius;
+        const float clampedAlpha = std::clamp(alpha, 0.0F, 1.0F);
+        for (int y = centerY - clampedRadius;
+             y <= centerY + clampedRadius;
+             ++y) {
+            if (y < 0 || y >= static_cast<int>(frame->height)) {
+                continue;
+            }
+            for (int x = centerX - clampedRadius;
+                 x <= centerX + clampedRadius;
+                 ++x) {
+                if (x < 0 || x >= static_cast<int>(frame->width)) {
+                    continue;
+                }
+                const int dx = x - centerX;
+                const int dy = y - centerY;
+                if (dx * dx + dy * dy > radiusSquared) {
+                    continue;
+                }
+                const std::size_t offset =
+                    (static_cast<std::size_t>(y) * frame->width +
+                     static_cast<std::size_t>(x)) *
+                    3U;
+                for (std::size_t channel = 0U; channel < 3U; ++channel) {
+                    const float mixed =
+                        std::lerp(
+                            static_cast<float>(frame->rgb[offset + channel]),
+                            static_cast<float>(colour[channel]),
+                            clampedAlpha);
+                    frame->rgb[offset + channel] =
+                        static_cast<std::uint8_t>(std::clamp(
+                            std::lround(mixed),
+                            0L,
+                            255L));
+                }
+            }
+        }
+    };
+
+    runtimeState->water.seepageOverlayMarkerCount = 0U;
+    runtimeState->water.seepageOverlayStructureCount = 0U;
+    for (const auto& node : runtimeState->water.seepageNodes) {
+        if (!node.enabledInViewport) {
+            continue;
+        }
+        if (const auto marker = project(ToGlm(node.position));
+            marker.has_value()) {
+            blendCircle(
+                marker->first,
+                marker->second,
+                8,
+                {4U, 18U, 20U},
+                0.72F);
+            blendCircle(
+                marker->first,
+                marker->second,
+                5,
+                {218U, 255U, 247U},
+                0.95F);
+            blendCircle(
+                marker->first,
+                marker->second,
+                2,
+                {72U, 235U, 194U},
+                1.0F);
+            ++runtimeState->water.seepageOverlayMarkerCount;
+        }
+        if (!runtimeState->water.showSeepageStructure) {
+            continue;
+        }
+
+        const invisible_places::water::WaterSeepageRuntimeNode*
+            runtimeNode = nullptr;
+        for (const auto& [_, grid] :
+             runtimeState->water.seepageRuntimeGrids) {
+            const auto candidate = std::find_if(
+                grid.nodes.begin(),
+                grid.nodes.end(),
+                [&](const auto& value) {
+                    return value.id == node.id &&
+                           value.usesConnectedSupport;
+                });
+            if (candidate != grid.nodes.end()) {
+                runtimeNode = &*candidate;
+                break;
+            }
+        }
+        if (runtimeNode == nullptr) {
+            continue;
+        }
+
+        std::size_t supportCellCount = 0U;
+        for (const auto& [_, selections] :
+             runtimeState->water.seepageSupportSelections) {
+            for (const auto& selection : selections) {
+                if (selection.nodeId == node.id) {
+                    supportCellCount += selection.cells.size();
+                }
+            }
+        }
+        constexpr std::size_t kMaximumCaptureOverlayCells = 12'288U;
+        const std::size_t stride = std::max<std::size_t>(
+            1U,
+            (supportCellCount + kMaximumCaptureOverlayCells - 1U) /
+                kMaximumCaptureOverlayCells);
+        std::size_t visitedCellIndex = 0U;
+        std::size_t drawnCellCount = 0U;
+        for (const auto& [_, selections] :
+             runtimeState->water.seepageSupportSelections) {
+            for (const auto& selection : selections) {
+                if (selection.nodeId != node.id) {
+                    continue;
+                }
+                for (const auto& cell : selection.cells) {
+                    if ((visitedCellIndex++ % stride) != 0U) {
+                        continue;
+                    }
+                    const float mask =
+                        invisible_places::water::
+                            EvaluateWaterSeepageSupportCellMask(
+                                *runtimeNode,
+                                cell);
+                    if (mask <= 0.01F) {
+                        continue;
+                    }
+                    const float cellSize =
+                        std::max(1.0e-6F, selection.cellSizeMeters);
+                    const auto screen = project({
+                        (static_cast<float>(cell.x) + 0.5F) * cellSize,
+                        (static_cast<float>(cell.y) + 0.5F) * cellSize,
+                        (static_cast<float>(cell.z) + 0.5F) * cellSize,
+                    });
+                    if (!screen.has_value()) {
+                        continue;
+                    }
+                    blendCircle(
+                        screen->first,
+                        screen->second,
+                        2,
+                        {72U, 235U, 194U},
+                        0.24F + 0.66F * mask);
+                    ++drawnCellCount;
+                }
+            }
+        }
+        if (drawnCellCount > 0U) {
+            ++runtimeState->water.seepageOverlayStructureCount;
+        }
+    }
+}
+
 std::optional<WaterIntegrationCapturedFrame> CaptureWaterIntegrationFrame(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport,
@@ -51715,7 +53060,8 @@ std::optional<WaterIntegrationCapturedFrame> CaptureWaterIntegrationFrame(
     float simulatedSeconds,
     const std::filesystem::path& exrPath,
     const std::filesystem::path& ppmPath,
-    std::string* errorMessage) {
+    std::string* errorMessage,
+    bool includeSeepageOverlay) {
     if (runtimeState == nullptr || viewport == nullptr) {
         if (errorMessage != nullptr) {
             *errorMessage = "Water integration frame capture has no viewport.";
@@ -51818,6 +53164,15 @@ std::optional<WaterIntegrationCapturedFrame> CaptureWaterIntegrationFrame(
              readback.colorRgba8[pixel + 1U],
              readback.colorRgba8[pixel + 2U]});
     }
+    if (includeSeepageOverlay) {
+        // Swapchain readback intentionally excludes ImGui draw lists. Composite
+        // the same live connected-cell mask into validation artifacts so a
+        // Structure Overlay capture shows the footprint being measured.
+        CompositeWaterSeepageCaptureOverlay(
+            runtimeState,
+            *viewport,
+            &captured);
+    }
 
     invisible_places::output::ExrImage image;
     invisible_places::output::InitializeExrImage(
@@ -51832,9 +53187,10 @@ std::optional<WaterIntegrationCapturedFrame> CaptureWaterIntegrationFrame(
     };
     for (std::size_t pixel = 0U; pixel < pixelCount; ++pixel) {
         const auto rgbaOffset = pixel * 4U;
-        image.beautyR[pixel] = srgb8ToLinear(readback.colorRgba8[rgbaOffset]);
-        image.beautyG[pixel] = srgb8ToLinear(readback.colorRgba8[rgbaOffset + 1U]);
-        image.beautyB[pixel] = srgb8ToLinear(readback.colorRgba8[rgbaOffset + 2U]);
+        const auto rgbOffset = pixel * 3U;
+        image.beautyR[pixel] = srgb8ToLinear(captured.rgb[rgbOffset]);
+        image.beautyG[pixel] = srgb8ToLinear(captured.rgb[rgbOffset + 1U]);
+        image.beautyB[pixel] = srgb8ToLinear(captured.rgb[rgbOffset + 2U]);
         image.alpha[pixel] =
             static_cast<float>(readback.colorRgba8[rgbaOffset + 3U]) / 255.0F;
         image.depth[pixel] = readback.linearDepth[pixel];
@@ -52437,6 +53793,1935 @@ BuildScene3WaterIntegrationFixture(
     return fixture;
 }
 
+struct Scene3SeepageSweepMetric {
+    float strength = 0.0F;
+    std::uint32_t waveCount = 0U;
+    std::size_t supportCellCount = 0U;
+    std::size_t activeStructureCellCount = 0U;
+    double weightedStructureCellCount = 0.0;
+    float maximumDownhillMeters = 0.0F;
+    float maximumLateralMeters = 0.0F;
+    float maximumFlowRunMeters = 0.0F;
+    float maximumDownstreamFlowRunMeters = 0.0F;
+    float maximumUpstreamFlowRunMeters = 0.0F;
+    float maximumCrossContourMeters = 0.0F;
+    float maximumWorldVerticalDropMeters = 0.0F;
+    float maximumWorldHorizontalMeters = 0.0F;
+    float downhillToLateralRatio = 0.0F;
+    float flowRunToCrossContourRatio = 0.0F;
+    float verticalToHorizontalRatio = 0.0F;
+    double meanSurfaceSteepness = 0.0;
+    std::size_t steepCellCount = 0U;
+    std::size_t flatCellCount = 0U;
+    std::size_t upstreamCellCount = 0U;
+    double steepMeanLateralMeters = 0.0;
+    double flatMeanLateralMeters = 0.0;
+    double steepMeanCrossContourMeters = 0.0;
+    double flatMeanCrossContourMeters = 0.0;
+    std::size_t effectSampleCount = 0U;
+    double meanEffectScale = 0.0;
+    double maximumEffectScale = 0.0;
+    double meanRipple = 0.0;
+    double meanTemporalDelta = 0.0;
+    double parameterPreparationMs = 0.0;
+    double parameterUpdateMs = 0.0;
+    std::uint64_t topologyUploadRevision = 0U;
+    std::uint64_t paramsUploadRevision = 0U;
+    std::uint64_t supportBuildRevision = 0U;
+    std::uint64_t topologyBuildRevision = 0U;
+    std::uint64_t descriptorAttachmentRevision = 0U;
+    std::string topologyFingerprint;
+    std::string paramsFingerprint;
+    WaterSeepageQuality resolvedQuality = WaterSeepageQuality::Auto;
+};
+
+struct Scene3SeepageSmokeReport {
+    std::string scenario;
+    std::filesystem::path projectPath;
+    std::filesystem::path outputPath;
+    std::vector<std::string> passes;
+    std::vector<std::string> failures;
+    double startupMs = 0.0;
+    double displayVisibleMs = 0.0;
+    double cacheReadyMs = 0.0;
+    bool cacheLoadedFromDisk = false;
+    bool exactSurfaceSources = false;
+    std::uint64_t displayPointCount = 0U;
+    std::uint64_t cacheTerrainPointCount = 0U;
+    std::size_t cachePayloadBytes = 0U;
+    std::size_t seepageGpuBytes = 0U;
+    std::uint64_t initialTopologyUploadRevision = 0U;
+    std::uint64_t initialParamsUploadRevision = 0U;
+    std::uint64_t initialSupportBuildRevision = 0U;
+    std::uint64_t initialTopologyBuildRevision = 0U;
+    std::uint64_t initialDescriptorAttachmentRevision = 0U;
+    double parameterP50Ms = 0.0;
+    double parameterP95Ms = 0.0;
+    double parameterMaxMs = 0.0;
+    std::filesystem::path cropFixturePath;
+    std::uintmax_t cropFixtureBytes = 0U;
+    std::size_t cropSurfelCount = 0U;
+    std::size_t cropSupportCellCount = 0U;
+    double cropWriteMs = 0.0;
+    double cropReloadAndBuildMs = 0.0;
+    bool cropMatchesProduction = false;
+    std::filesystem::path captureContactSheetPath;
+    std::vector<std::filesystem::path> structureFramePpmPaths;
+    std::vector<std::filesystem::path> structureFrameExrPaths;
+    std::vector<std::filesystem::path> effectFramePpmPaths;
+    std::vector<std::filesystem::path> effectFrameExrPaths;
+    std::vector<Scene3SeepageSweepMetric> metrics;
+
+    void Pass(std::string message) { passes.push_back(std::move(message)); }
+    void Fail(std::string message) { failures.push_back(std::move(message)); }
+    [[nodiscard]] bool Passed() const { return failures.empty(); }
+};
+
+std::string_view WaterSeepageQualitySmokeLabel(WaterSeepageQuality quality) {
+    switch (quality) {
+        case WaterSeepageQuality::Auto:
+            return "Auto";
+        case WaterSeepageQuality::Low:
+            return "Low";
+        case WaterSeepageQuality::Balanced:
+            return "Balanced";
+        case WaterSeepageQuality::High:
+            return "High";
+    }
+    return "Unknown";
+}
+
+bool WriteScene3SeepageSmokeReport(const Scene3SeepageSmokeReport& report) {
+    std::error_code error;
+    std::filesystem::create_directories(report.outputPath.parent_path(), error);
+    std::ofstream output{report.outputPath, std::ios::trunc};
+    if (!output.is_open()) {
+        return false;
+    }
+    const auto writeStrings = [&output](
+                                  std::string_view label,
+                                  const std::vector<std::string>& values) {
+        output << "  \"" << label << "\": [";
+        for (std::size_t index = 0U; index < values.size(); ++index) {
+            if (index > 0U) {
+                output << ", ";
+            }
+            output << '"' << JsonEscape(values[index]) << '"';
+        }
+        output << ']';
+    };
+    const auto writePaths = [&output](
+                                std::string_view label,
+                                const std::vector<std::filesystem::path>& paths) {
+        output << "  \"" << label << "\": [";
+        for (std::size_t index = 0U; index < paths.size(); ++index) {
+            if (index > 0U) {
+                output << ", ";
+            }
+            output << '"' << JsonEscape(paths[index].string()) << '"';
+        }
+        output << ']';
+    };
+    output << "{\n"
+           << "  \"scenario\": \"" << JsonEscape(report.scenario) << "\",\n"
+           << "  \"passed\": " << (report.Passed() ? "true" : "false") << ",\n"
+           << "  \"project\": \"" << JsonEscape(report.projectPath.string()) << "\",\n"
+           << "  \"startup_ms\": " << FormatFixed(report.startupMs, 3) << ",\n"
+           << "  \"display_visible_ms\": " << FormatFixed(report.displayVisibleMs, 3) << ",\n"
+           << "  \"cache_ready_ms\": " << FormatFixed(report.cacheReadyMs, 3) << ",\n"
+           << "  \"cache_loaded_from_disk\": "
+           << (report.cacheLoadedFromDisk ? "true" : "false") << ",\n"
+           << "  \"exact_surface_sources\": "
+           << (report.exactSurfaceSources ? "true" : "false") << ",\n"
+           << "  \"display_point_count\": " << report.displayPointCount << ",\n"
+           << "  \"cache_terrain_point_count\": "
+           << report.cacheTerrainPointCount << ",\n"
+           << "  \"cache_payload_bytes\": " << report.cachePayloadBytes << ",\n"
+           << "  \"seepage_gpu_bytes\": " << report.seepageGpuBytes << ",\n"
+           << "  \"initial_topology_upload_revision\": "
+           << report.initialTopologyUploadRevision << ",\n"
+           << "  \"initial_params_upload_revision\": "
+           << report.initialParamsUploadRevision << ",\n"
+           << "  \"initial_support_build_revision\": "
+           << report.initialSupportBuildRevision << ",\n"
+           << "  \"initial_topology_build_revision\": "
+           << report.initialTopologyBuildRevision << ",\n"
+           << "  \"initial_descriptor_attachment_revision\": "
+           << report.initialDescriptorAttachmentRevision << ",\n"
+           << "  \"parameter_p50_ms\": "
+           << FormatFixed(report.parameterP50Ms, 3) << ",\n"
+           << "  \"parameter_p95_ms\": "
+           << FormatFixed(report.parameterP95Ms, 3) << ",\n"
+           << "  \"parameter_max_ms\": "
+           << FormatFixed(report.parameterMaxMs, 3) << ",\n"
+           << "  \"crop_fixture\": \""
+           << JsonEscape(report.cropFixturePath.string()) << "\",\n"
+           << "  \"crop_fixture_bytes\": " << report.cropFixtureBytes << ",\n"
+           << "  \"crop_surfel_count\": " << report.cropSurfelCount << ",\n"
+           << "  \"crop_support_cell_count\": "
+           << report.cropSupportCellCount << ",\n"
+           << "  \"crop_write_ms\": "
+           << FormatFixed(report.cropWriteMs, 3) << ",\n"
+           << "  \"crop_reload_and_build_ms\": "
+           << FormatFixed(report.cropReloadAndBuildMs, 3) << ",\n"
+           << "  \"crop_matches_production\": "
+           << (report.cropMatchesProduction ? "true" : "false") << ",\n"
+           << "  \"capture_contact_sheet\": \""
+           << JsonEscape(report.captureContactSheetPath.string()) << "\",\n"
+           << "  \"sweeps\": [";
+    for (std::size_t index = 0U; index < report.metrics.size(); ++index) {
+        if (index > 0U) {
+            output << ", ";
+        }
+        const auto& metric = report.metrics[index];
+        output << "\n    {"
+               << "\"strength\":" << FormatFixed(metric.strength, 3)
+               << ",\"wave_count\":" << metric.waveCount
+               << ",\"quality\":\""
+               << WaterSeepageQualitySmokeLabel(metric.resolvedQuality) << '"'
+               << ",\"support_cell_count\":" << metric.supportCellCount
+               << ",\"active_structure_cell_count\":"
+               << metric.activeStructureCellCount
+               << ",\"weighted_structure_cell_count\":"
+               << FormatFixed(metric.weightedStructureCellCount, 6)
+               << ",\"maximum_downhill_m\":"
+               << FormatFixed(metric.maximumDownhillMeters, 6)
+               << ",\"maximum_lateral_m\":"
+               << FormatFixed(metric.maximumLateralMeters, 6)
+               << ",\"maximum_flow_run_m\":"
+               << FormatFixed(metric.maximumFlowRunMeters, 6)
+               << ",\"maximum_downstream_flow_run_m\":"
+               << FormatFixed(metric.maximumDownstreamFlowRunMeters, 6)
+               << ",\"maximum_upstream_flow_run_m\":"
+               << FormatFixed(metric.maximumUpstreamFlowRunMeters, 6)
+               << ",\"maximum_cross_contour_m\":"
+               << FormatFixed(metric.maximumCrossContourMeters, 6)
+               << ",\"maximum_world_vertical_drop_m\":"
+               << FormatFixed(metric.maximumWorldVerticalDropMeters, 6)
+               << ",\"maximum_world_horizontal_m\":"
+               << FormatFixed(metric.maximumWorldHorizontalMeters, 6)
+               << ",\"downhill_to_lateral_ratio\":"
+               << FormatFixed(metric.downhillToLateralRatio, 6)
+               << ",\"flow_run_to_cross_contour_ratio\":"
+               << FormatFixed(metric.flowRunToCrossContourRatio, 6)
+               << ",\"vertical_to_horizontal_ratio\":"
+               << FormatFixed(metric.verticalToHorizontalRatio, 6)
+               << ",\"mean_surface_steepness\":"
+               << FormatFixed(metric.meanSurfaceSteepness, 6)
+               << ",\"steep_cell_count\":" << metric.steepCellCount
+               << ",\"flat_cell_count\":" << metric.flatCellCount
+               << ",\"upstream_cell_count\":" << metric.upstreamCellCount
+               << ",\"steep_mean_lateral_m\":"
+               << FormatFixed(metric.steepMeanLateralMeters, 6)
+               << ",\"flat_mean_lateral_m\":"
+               << FormatFixed(metric.flatMeanLateralMeters, 6)
+               << ",\"steep_mean_cross_contour_m\":"
+               << FormatFixed(metric.steepMeanCrossContourMeters, 6)
+               << ",\"flat_mean_cross_contour_m\":"
+               << FormatFixed(metric.flatMeanCrossContourMeters, 6)
+               << ",\"effect_sample_count\":" << metric.effectSampleCount
+               << ",\"mean_effect_scale\":"
+               << FormatFixed(metric.meanEffectScale, 6)
+               << ",\"maximum_effect_scale\":"
+               << FormatFixed(metric.maximumEffectScale, 6)
+               << ",\"mean_ripple\":" << FormatFixed(metric.meanRipple, 6)
+               << ",\"mean_temporal_delta\":"
+               << FormatFixed(metric.meanTemporalDelta, 6)
+               << ",\"parameter_preparation_ms\":"
+               << FormatFixed(metric.parameterPreparationMs, 6)
+               << ",\"parameter_update_ms\":"
+               << FormatFixed(metric.parameterUpdateMs, 3)
+               << ",\"topology_upload_revision\":"
+               << metric.topologyUploadRevision
+               << ",\"params_upload_revision\":"
+               << metric.paramsUploadRevision
+               << ",\"support_build_revision\":"
+               << metric.supportBuildRevision
+               << ",\"topology_build_revision\":"
+               << metric.topologyBuildRevision
+               << ",\"descriptor_attachment_revision\":"
+               << metric.descriptorAttachmentRevision
+               << ",\"topology_fingerprint\":\""
+               << JsonEscape(metric.topologyFingerprint) << '"'
+               << ",\"params_fingerprint\":\""
+               << JsonEscape(metric.paramsFingerprint) << "\"}";
+    }
+    if (!report.metrics.empty()) {
+        output << '\n';
+    }
+    output << "  ],\n";
+    writePaths("structure_frame_ppm", report.structureFramePpmPaths);
+    output << ",\n";
+    writePaths("structure_frame_exr", report.structureFrameExrPaths);
+    output << ",\n";
+    writePaths("effect_frame_ppm", report.effectFramePpmPaths);
+    output << ",\n";
+    writePaths("effect_frame_exr", report.effectFrameExrPaths);
+    output << ",\n";
+    writeStrings("passes", report.passes);
+    output << ",\n";
+    writeStrings("failures", report.failures);
+    output << "\n}\n";
+    return output.good();
+}
+
+constexpr std::string_view kScene3SeepageCropMagic =
+    "IP_SEEPAGE_CROP_1";
+constexpr std::uint32_t kScene3SeepageCropSchema = 1U;
+
+bool WriteScene3SeepageCropFixture(
+    const std::filesystem::path& path,
+    const WaterSurfaceCache& crop,
+    std::string* errorMessage) {
+    static_assert(std::is_trivially_copyable_v<
+                  invisible_places::water::WaterSurfaceSurfel>);
+    std::error_code directoryError;
+    if (!path.parent_path().empty()) {
+        std::filesystem::create_directories(
+            path.parent_path(),
+            directoryError);
+    }
+    if (directoryError) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "Could not create the crop-fixture directory: " +
+                directoryError.message();
+        }
+        return false;
+    }
+    std::ofstream output{path, std::ios::binary | std::ios::trunc};
+    if (!output.is_open()) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Could not open the crop fixture for writing.";
+        }
+        return false;
+    }
+    const auto writePod = [&output](const auto& value) {
+        output.write(
+            reinterpret_cast<const char*>(&value),
+            static_cast<std::streamsize>(sizeof(value)));
+        return output.good();
+    };
+    const std::uint32_t signatureSize =
+        static_cast<std::uint32_t>(std::min<std::size_t>(
+            crop.signature.size(),
+            std::numeric_limits<std::uint32_t>::max()));
+    const std::uint64_t surfelCount =
+        static_cast<std::uint64_t>(crop.flowSurfaceSurfels.size());
+    output.write(
+        kScene3SeepageCropMagic.data(),
+        static_cast<std::streamsize>(kScene3SeepageCropMagic.size()));
+    bool valid =
+        output.good() &&
+        writePod(kScene3SeepageCropSchema) &&
+        writePod(crop.resolutionMeters) &&
+        writePod(crop.bounds) &&
+        writePod(signatureSize);
+    if (valid && signatureSize > 0U) {
+        output.write(
+            crop.signature.data(),
+            static_cast<std::streamsize>(signatureSize));
+        valid = output.good();
+    }
+    for (const auto digestWord : crop.cacheIdentity.contentDigest) {
+        valid = valid && writePod(digestWord);
+    }
+    valid = valid && writePod(surfelCount);
+    if (valid && surfelCount > 0U) {
+        output.write(
+            reinterpret_cast<const char*>(
+                crop.flowSurfaceSurfels.data()),
+            static_cast<std::streamsize>(
+                surfelCount *
+                sizeof(invisible_places::water::WaterSurfaceSurfel)));
+        valid = output.good();
+    }
+    output.flush();
+    valid = valid && output.good();
+    if (!valid && errorMessage != nullptr) {
+        *errorMessage = "Could not finish writing the crop fixture.";
+    }
+    return valid;
+}
+
+bool LoadScene3SeepageCropFixture(
+    const std::filesystem::path& path,
+    WaterSurfaceCache* crop,
+    std::string* errorMessage) {
+    static_assert(std::is_trivially_copyable_v<
+                  invisible_places::water::WaterSurfaceSurfel>);
+    if (crop == nullptr) {
+        return false;
+    }
+    std::ifstream input{path, std::ios::binary};
+    if (!input.is_open()) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Could not open the compact Seepage crop.";
+        }
+        return false;
+    }
+    const auto readPod = [&input](auto* value) {
+        input.read(
+            reinterpret_cast<char*>(value),
+            static_cast<std::streamsize>(sizeof(*value)));
+        return input.good();
+    };
+    std::string magic(kScene3SeepageCropMagic.size(), '\0');
+    input.read(magic.data(), static_cast<std::streamsize>(magic.size()));
+    std::uint32_t schema = 0U;
+    float resolutionMeters = 0.0F;
+    invisible_places::io::Bounds3f bounds;
+    std::uint32_t signatureSize = 0U;
+    constexpr std::uint32_t kMaximumSignatureBytes = 16'384U;
+    if (!input.good() ||
+        magic != kScene3SeepageCropMagic ||
+        !readPod(&schema) ||
+        schema != kScene3SeepageCropSchema ||
+        !readPod(&resolutionMeters) ||
+        !std::isfinite(resolutionMeters) ||
+        std::abs(
+            resolutionMeters -
+            invisible_places::water::kWaterSeepageSupportCellSizeMeters) >
+            1.0e-6F ||
+        !readPod(&bounds) ||
+        !readPod(&signatureSize) ||
+        signatureSize > kMaximumSignatureBytes) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The compact Seepage crop header was invalid.";
+        }
+        return false;
+    }
+    std::string signature(signatureSize, '\0');
+    if (signatureSize > 0U) {
+        input.read(
+            signature.data(),
+            static_cast<std::streamsize>(signature.size()));
+    }
+    std::array<std::uint64_t, 4> digest{};
+    for (auto& word : digest) {
+        if (!readPod(&word)) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "The compact Seepage crop identity was truncated.";
+            }
+            return false;
+        }
+    }
+    std::uint64_t surfelCount = 0U;
+    constexpr std::uint64_t kMaximumCropSurfels = 2'000'000ULL;
+    if (!input.good() ||
+        !readPod(&surfelCount) ||
+        surfelCount == 0U ||
+        surfelCount > kMaximumCropSurfels) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The compact Seepage crop surfel count was invalid.";
+        }
+        return false;
+    }
+    WaterSurfaceCache loaded;
+    loaded.resolutionMeters = resolutionMeters;
+    loaded.signature = signature;
+    loaded.bounds = bounds;
+    loaded.sourcePointCount = surfelCount;
+    loaded.revision = 1U;
+    loaded.cacheIdentity = {
+        .sourceSignature = signature,
+        .contentDigest = digest,
+    };
+    loaded.flowSurfaceSurfels.resize(
+        static_cast<std::size_t>(surfelCount));
+    input.read(
+        reinterpret_cast<char*>(
+            loaded.flowSurfaceSurfels.data()),
+        static_cast<std::streamsize>(
+            surfelCount *
+            sizeof(invisible_places::water::WaterSurfaceSurfel)));
+    if (!input.good() ||
+        !std::is_sorted(
+            loaded.flowSurfaceSurfels.begin(),
+            loaded.flowSurfaceSurfels.end(),
+            [](const auto& left, const auto& right) {
+                return std::tie(
+                           left.cellX,
+                           left.cellY,
+                           left.cellZ,
+                           left.role) <
+                       std::tie(
+                           right.cellX,
+                           right.cellY,
+                           right.cellZ,
+                           right.role);
+            })) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The compact Seepage crop payload was truncated or unsorted.";
+        }
+        return false;
+    }
+    *crop = std::move(loaded);
+    return true;
+}
+
+WaterSurfaceCache BuildScene3SeepageCrop(
+    const WaterSurfaceCache& source,
+    const WaterSeepageSupportSelection& productionSelection,
+    float marginMeters) {
+    WaterSurfaceCache crop;
+    crop.resolutionMeters = source.resolutionMeters;
+    crop.signature = source.signature;
+    crop.revision = source.revision;
+    crop.cacheIdentity = source.cacheIdentity;
+    const auto minimum = invisible_places::io::Float3{
+        productionSelection.bounds.minimum.x - marginMeters,
+        productionSelection.bounds.minimum.y - marginMeters,
+        productionSelection.bounds.minimum.z - marginMeters,
+    };
+    const auto maximum = invisible_places::io::Float3{
+        productionSelection.bounds.maximum.x + marginMeters,
+        productionSelection.bounds.maximum.y + marginMeters,
+        productionSelection.bounds.maximum.z + marginMeters,
+    };
+    crop.flowSurfaceSurfels.reserve(
+        std::min<std::size_t>(
+            source.flowSurfaceSurfels.size(),
+            productionSelection.cells.size() * 3U));
+    for (const auto& surfel : source.flowSurfaceSurfels) {
+        if (surfel.role != productionSelection.sourceRole ||
+            surfel.centroid.x < minimum.x ||
+            surfel.centroid.y < minimum.y ||
+            surfel.centroid.z < minimum.z ||
+            surfel.centroid.x > maximum.x ||
+            surfel.centroid.y > maximum.y ||
+            surfel.centroid.z > maximum.z) {
+            continue;
+        }
+        crop.flowSurfaceSurfels.push_back(surfel);
+        crop.bounds.Expand(surfel.centroid);
+    }
+    crop.sourcePointCount = crop.flowSurfaceSurfels.size();
+    return crop;
+}
+
+Scene3SeepageSweepMetric MeasureScene3SeepageSweep(
+    const WaterSeepageSpatialGrid& grid,
+    const WaterSeepageSupportSelection& support,
+    std::uint32_t nodeId,
+    float strength,
+    std::uint32_t waveCount) {
+    Scene3SeepageSweepMetric metric{
+        .strength = strength,
+        .waveCount = waveCount,
+        .supportCellCount = support.cells.size(),
+        .topologyFingerprint =
+            invisible_places::water::WaterSeepageTopologyFingerprint(grid),
+        .paramsFingerprint =
+            invisible_places::water::WaterSeepageParamsFingerprint(grid),
+    };
+    const auto runtimeNode = std::find_if(
+        grid.nodes.begin(),
+        grid.nodes.end(),
+        [&](const invisible_places::water::WaterSeepageRuntimeNode& candidate) {
+            return candidate.id == nodeId;
+        });
+    if (runtimeNode == grid.nodes.end()) {
+        return metric;
+    }
+    metric.resolvedQuality = runtimeNode->resolvedQuality;
+
+    constexpr float kActiveMaskThreshold = 0.01F;
+    constexpr std::size_t kMaximumEffectSamples = 32'768U;
+    std::vector<const invisible_places::water::WaterSeepageSupportCell*>
+        activeCells;
+    activeCells.reserve(std::min<std::size_t>(
+        support.cells.size(),
+        kMaximumEffectSamples * 2U));
+    double steepLateralSum = 0.0;
+    double flatLateralSum = 0.0;
+    double steepCrossContourSum = 0.0;
+    double flatCrossContourSum = 0.0;
+    double steepnessSum = 0.0;
+    for (const auto& cell : support.cells) {
+        const float mask =
+            invisible_places::water::EvaluateWaterSeepageSupportCellMask(
+                *runtimeNode,
+                cell);
+        if (mask <= kActiveMaskThreshold) {
+            continue;
+        }
+        ++metric.activeStructureCellCount;
+        metric.weightedStructureCellCount += mask;
+        activeCells.push_back(&cell);
+
+        const float cellSize = std::max(1.0e-6F, support.cellSizeMeters);
+        const glm::vec3 centre{
+            (static_cast<float>(cell.x) + 0.5F) * cellSize,
+            (static_cast<float>(cell.y) + 0.5F) * cellSize,
+            (static_cast<float>(cell.z) + 0.5F) * cellSize,
+        };
+        const glm::vec3 delta = centre - runtimeNode->position;
+        const float downhill = std::max(
+            0.0F,
+            glm::dot(delta, runtimeNode->downAxis));
+        const float lateral = std::abs(
+            glm::dot(delta, runtimeNode->lateralAxis));
+        metric.maximumDownhillMeters =
+            std::max(metric.maximumDownhillMeters, downhill);
+        metric.maximumLateralMeters =
+            std::max(metric.maximumLateralMeters, lateral);
+        metric.maximumFlowRunMeters =
+            std::max(metric.maximumFlowRunMeters, cell.flowRunMeters);
+        if (cell.upstream) {
+            metric.maximumUpstreamFlowRunMeters =
+                std::max(
+                    metric.maximumUpstreamFlowRunMeters,
+                    cell.flowRunMeters);
+        } else {
+            metric.maximumDownstreamFlowRunMeters =
+                std::max(
+                    metric.maximumDownstreamFlowRunMeters,
+                    cell.flowRunMeters);
+        }
+        metric.maximumCrossContourMeters =
+            std::max(
+                metric.maximumCrossContourMeters,
+                cell.crossContourMeters);
+        if (cell.upstream) {
+            ++metric.upstreamCellCount;
+        }
+        metric.maximumWorldVerticalDropMeters = std::max(
+            metric.maximumWorldVerticalDropMeters,
+            runtimeNode->position.z - centre.z);
+        metric.maximumWorldHorizontalMeters = std::max(
+            metric.maximumWorldHorizontalMeters,
+            std::hypot(delta.x, delta.y));
+
+        const glm::vec3 normal{
+            cell.surfaceNormal.x,
+            cell.surfaceNormal.y,
+            cell.surfaceNormal.z,
+        };
+        const float normalLengthSquared = glm::dot(normal, normal);
+        const float absoluteNormalZ =
+            normalLengthSquared > 1.0e-8F
+                ? std::abs(glm::normalize(normal).z)
+                : 1.0F;
+        const float steepness = std::sqrt(std::max(
+            0.0F,
+            1.0F - absoluteNormalZ * absoluteNormalZ));
+        steepnessSum += steepness;
+        if (absoluteNormalZ <= 0.50F) {
+            ++metric.steepCellCount;
+            steepLateralSum += lateral;
+            steepCrossContourSum += cell.crossContourMeters;
+        } else if (absoluteNormalZ >= 0.75F) {
+            ++metric.flatCellCount;
+            flatLateralSum += lateral;
+            flatCrossContourSum += cell.crossContourMeters;
+        }
+    }
+    if (metric.activeStructureCellCount > 0U) {
+        metric.meanSurfaceSteepness =
+            steepnessSum /
+            static_cast<double>(metric.activeStructureCellCount);
+    }
+    if (metric.steepCellCount > 0U) {
+        metric.steepMeanLateralMeters =
+            steepLateralSum / static_cast<double>(metric.steepCellCount);
+        metric.steepMeanCrossContourMeters =
+            steepCrossContourSum /
+            static_cast<double>(metric.steepCellCount);
+    }
+    if (metric.flatCellCount > 0U) {
+        metric.flatMeanLateralMeters =
+            flatLateralSum / static_cast<double>(metric.flatCellCount);
+        metric.flatMeanCrossContourMeters =
+            flatCrossContourSum /
+            static_cast<double>(metric.flatCellCount);
+    }
+    metric.downhillToLateralRatio =
+        metric.maximumDownhillMeters /
+        std::max(0.005F, metric.maximumLateralMeters);
+    metric.flowRunToCrossContourRatio =
+        metric.maximumFlowRunMeters /
+        std::max(0.005F, metric.maximumCrossContourMeters);
+    metric.verticalToHorizontalRatio =
+        metric.maximumWorldVerticalDropMeters /
+        std::max(0.005F, metric.maximumWorldHorizontalMeters);
+
+    const std::size_t sampleStride = std::max<std::size_t>(
+        1U,
+        activeCells.size() /
+            std::max<std::size_t>(1U, kMaximumEffectSamples));
+    constexpr float kFirstTimeSeconds = 0.0F;
+    constexpr float kSecondTimeSeconds = 0.83F;
+    double effectScaleSum = 0.0;
+    double rippleSum = 0.0;
+    double temporalDeltaSum = 0.0;
+    WaterSeepageSpatialGrid evaluationGrid = grid;
+    invisible_places::water::PrepareWaterSeepagePulseFields(
+        &evaluationGrid,
+        kFirstTimeSeconds);
+    std::vector<float> firstScales;
+    firstScales.reserve(std::min<std::size_t>(
+        activeCells.size(),
+        kMaximumEffectSamples + 1U));
+    for (std::size_t index = 0U;
+         index < activeCells.size();
+         index += sampleStride) {
+        const auto& cell = *activeCells[index];
+        const float cellSize = std::max(1.0e-6F, support.cellSizeMeters);
+        const invisible_places::io::Float3 position{
+            (static_cast<float>(cell.x) + 0.5F) * cellSize,
+            (static_cast<float>(cell.y) + 0.5F) * cellSize,
+            (static_cast<float>(cell.z) + 0.5F) * cellSize,
+        };
+        const auto first =
+            invisible_places::water::EvaluateWaterSeepageGridContribution(
+                evaluationGrid,
+                position,
+                cell.surfaceNormal,
+                kFirstTimeSeconds);
+        effectScaleSum += first.scale;
+        rippleSum += first.ripple;
+        metric.maximumEffectScale =
+            std::max(metric.maximumEffectScale, static_cast<double>(first.scale));
+        firstScales.push_back(first.scale);
+        ++metric.effectSampleCount;
+    }
+    invisible_places::water::PrepareWaterSeepagePulseFields(
+        &evaluationGrid,
+        kSecondTimeSeconds);
+    std::size_t effectSampleIndex = 0U;
+    for (std::size_t index = 0U;
+         index < activeCells.size() &&
+         effectSampleIndex < firstScales.size();
+         index += sampleStride, ++effectSampleIndex) {
+        const auto& cell = *activeCells[index];
+        const float cellSize = std::max(1.0e-6F, support.cellSizeMeters);
+        const invisible_places::io::Float3 position{
+            (static_cast<float>(cell.x) + 0.5F) * cellSize,
+            (static_cast<float>(cell.y) + 0.5F) * cellSize,
+            (static_cast<float>(cell.z) + 0.5F) * cellSize,
+        };
+        const auto second =
+            invisible_places::water::EvaluateWaterSeepageGridContribution(
+                evaluationGrid,
+                position,
+                cell.surfaceNormal,
+                kSecondTimeSeconds);
+        temporalDeltaSum += std::abs(
+            second.scale -
+            firstScales[effectSampleIndex]);
+    }
+    if (metric.effectSampleCount > 0U) {
+        const double inverseCount =
+            1.0 / static_cast<double>(metric.effectSampleCount);
+        metric.meanEffectScale = effectScaleSum * inverseCount;
+        metric.meanRipple = rippleSum * inverseCount;
+        metric.meanTemporalDelta = temporalDeltaSum * inverseCount;
+    }
+    return metric;
+}
+
+int RunScene3SeepageNodeSmoke(
+    const GuiSmokeOptions& options,
+    platform::Window* window,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    PreviewRuntimeState* runtimeState,
+    const std::filesystem::path& dataRoot) {
+    const auto outputDirectory =
+        options.outputDirectory.empty()
+            ? DefaultRenderOutputDirectory(dataRoot) / "water-region-smoke" /
+                  "seepage-scene3-node"
+            : options.outputDirectory;
+    Scene3SeepageSmokeReport report{
+        .scenario = options.scenario,
+        .projectPath =
+            dataRoot.parent_path() / "Saved" / "ExhibitionFinal_project.json",
+        .outputPath = outputDirectory / "seepage-scene3-node.json",
+    };
+    const auto finish = [&]() {
+        if (!WriteScene3SeepageSmokeReport(report)) {
+            std::cerr << "Failed to write Scene3 Seepage smoke report: "
+                      << report.outputPath.string() << "\n";
+            return 1;
+        }
+        std::cout << "Scene3 Seepage smoke report: "
+                  << report.outputPath.string() << "\n";
+        for (const auto& failure : report.failures) {
+            std::cerr << "Scene3 Seepage failure: " << failure << "\n";
+        }
+        return report.Passed() ? 0 : 1;
+    };
+    if (window == nullptr || viewport == nullptr || runtimeState == nullptr) {
+        report.Fail("The Scene3 Seepage runner requires a live window, viewport, and runtime.");
+        return finish();
+    }
+
+    std::error_code createError;
+    std::filesystem::create_directories(outputDirectory, createError);
+    if (createError) {
+        report.Fail(
+            "Could not create the Scene3 Seepage smoke output directory: " +
+            createError.message());
+        return finish();
+    }
+
+    std::string loadError;
+    auto project = invisible_places::serialization::LoadProjectDocument(
+        report.projectPath,
+        &loadError);
+    if (!project.has_value()) {
+        report.Fail("Could not load the Scene3 validation project: " + loadError);
+        return finish();
+    }
+    project = BuildScene3WaterIntegrationFixture(
+        std::move(project.value()),
+        dataRoot);
+    runtimeState->persistence.projectFilePath = report.projectPath.string();
+    const auto startupStartedAt = std::chrono::steady_clock::now();
+    if (!ApplyProjectDocumentToRuntime(project.value(), runtimeState, viewport)) {
+        report.Fail(
+            "Could not apply the Scene3 validation project: " +
+            (runtimeState->errorMessage.empty()
+                 ? runtimeState->statusMessage
+                 : runtimeState->errorMessage));
+        return finish();
+    }
+
+    struct Scene3SeepageSmokeTarget {
+        std::uint32_t id = 0U;
+        std::string_view name;
+        invisible_places::io::Float3 position{};
+    };
+    // Prefer the current review node while retaining the former node-4
+    // fixture as a compatibility fallback for older Scene3 project snapshots.
+    constexpr std::array<Scene3SeepageSmokeTarget, 2U> kTargets{{
+        {
+            .id = 20U,
+            .name = "Seepage 20",
+            .position = {
+                308.13482666015625F,
+                104.35515594482422F,
+                2.5054962635040283F,
+            },
+        },
+        {
+            .id = 4U,
+            .name = "Seepage 4",
+            .position = {
+                308.190185546875F,
+                104.30165100097656F,
+                2.7592077255249023F,
+            },
+        },
+    }};
+    const Scene3SeepageSmokeTarget* target = nullptr;
+    const WaterSeepageNode* authoredNode = nullptr;
+    bool usedEmbeddedTarget = false;
+    const auto coordinateError = [](float left, float right) {
+        return std::abs(left - right);
+    };
+    for (const auto& candidateTarget : kTargets) {
+        const auto candidate = std::find_if(
+            runtimeState->water.seepageNodes.begin(),
+            runtimeState->water.seepageNodes.end(),
+            [&](const WaterSeepageNode& value) {
+                return value.id == candidateTarget.id &&
+                       value.name == candidateTarget.name &&
+                       coordinateError(
+                           value.position.x,
+                           candidateTarget.position.x) <= 1.0e-5F &&
+                       coordinateError(
+                           value.position.y,
+                           candidateTarget.position.y) <= 1.0e-5F &&
+                       coordinateError(
+                           value.position.z,
+                           candidateTarget.position.z) <= 1.0e-5F;
+            });
+        if (candidate != runtimeState->water.seepageNodes.end()) {
+            target = &candidateTarget;
+            authoredNode = &*candidate;
+            break;
+        }
+    }
+    WaterSeepageNode embeddedNode;
+    if (target == nullptr || authoredNode == nullptr) {
+        // Saved/ExhibitionFinal_project.json is an actively edited production
+        // project. Keep this regression stable when its review nodes are
+        // renamed or moved by carrying the exact node-20 snapshot that owns
+        // the accompanying Scene3 cache crop and expected measurements.
+        target = &kTargets.front();
+        embeddedNode.id = target->id;
+        embeddedNode.name = std::string{target->name};
+        embeddedNode.position = target->position;
+        embeddedNode.surfaceNormal = {
+            0.6960864663124084F,
+            0.5861761569976807F,
+            0.41456139087677F,
+        };
+        embeddedNode.downAxis = {
+            0.3171031177043915F,
+            0.26703330874443054F,
+            -0.9100213646888733F,
+        };
+        embeddedNode.widthMeters = 0.10F;
+        embeddedNode.prominence = 3.0F;
+        embeddedNode.selectionReachLimitMeters = 2.34375F;
+        embeddedNode.selectionWidthLimitMeters = 1.215F;
+        embeddedNode.edgeFeatherMeters = 0.10F;
+        embeddedNode.depthToleranceMeters = 0.15F;
+        embeddedNode.normalAlignment = 0.20F;
+        embeddedNode.seed = 1'549'107'668U;
+        embeddedNode.targetSceneRoles = {"ROCK", "VEG", "SAND"};
+        authoredNode = &embeddedNode;
+        usedEmbeddedTarget = true;
+    }
+    const auto targetLabel = std::string{target->name};
+    const auto targetNodeId = target->id;
+    if (coordinateError(authoredNode->position.x, target->position.x) <= 1.0e-5F &&
+        coordinateError(authoredNode->position.y, target->position.y) <= 1.0e-5F &&
+        coordinateError(authoredNode->position.z, target->position.z) <= 1.0e-5F) {
+        report.Pass(
+            usedEmbeddedTarget
+                ? "Loaded the embedded exact Scene3 " +
+                      targetLabel + " validation snapshot."
+                : "Loaded the exact authored Scene3 " +
+                      targetLabel + " placement.");
+    } else {
+        report.Fail(
+            "Scene3 " + targetLabel +
+            " did not match its expected authored position.");
+        return finish();
+    }
+
+    WaterSeepageNode node = *authoredNode;
+    WaterSeepageLookSettings contourLook =
+        ViewedWaterSeepageLook(runtimeState->water, node);
+    contourLook.pattern = WaterSeepagePattern::ContourPulses;
+    contourLook.quality = WaterSeepageQuality::Auto;
+    // Exercise the pulse itself in the GPU smoke: persistent dampness and
+    // reflection are disabled so a missing pulse field cannot be hidden by
+    // another response channel.
+    contourLook.baseWetness = 0.0F;
+    contourLook.glisten = 0.0F;
+    contourLook.pulseWaveCount = 7.0F;
+    contourLook.pulseSpeedVariation = 0.55F;
+    const std::string kSmokeLookName =
+        "__Scene3_Node" + std::to_string(targetNodeId) +
+        "_Contour_Pulses_Smoke";
+    std::erase_if(
+        runtimeState->water.seepageLookProfiles,
+        [kSmokeLookName](const WaterSeepageLookProfile& profile) {
+            return profile.name == kSmokeLookName;
+        });
+    runtimeState->water.seepageLookProfiles.push_back({
+        .name = std::string{kSmokeLookName},
+        .settings = contourLook,
+    });
+    node.lookProfileName = std::string{kSmokeLookName};
+    node.lookOverride.reset();
+    node.tempLookOverride.reset();
+    node.enabledInViewport = true;
+    node.enabledInExport = true;
+    node.strength = 0.02F;
+    runtimeState->water.seepageNodes = {node};
+    runtimeState->water.selectedSeepageNodeIndex = 0U;
+    runtimeState->water.selectedSeepageNodeIndices = {0U};
+    runtimeState->water.nextSeepageNodeId =
+        std::max<std::uint32_t>(5U, node.id + 1U);
+    runtimeState->water.selectedSeepageScenarioId.clear();
+    runtimeState->water.collisionRainSettings.enabled = false;
+    runtimeState->animationPanel.currentPath.reset();
+    for (auto& session : runtimeState->sessions) {
+        if (session.sceneGroupName == "Scene3" &&
+            IsAuthoredWaterTerrainSession(session)) {
+            session.pointStyle.geometryMode =
+                PointCloudGeometryMode::ScreenSprites;
+        }
+    }
+    runtimeState->projectSettings.pointCloudRendererMode =
+        PointCloudRendererMode::Beauty;
+    InvalidateWaterSeepageTopology(&runtimeState->water);
+    InvalidateWaterSeepageParams(&runtimeState->water);
+    StartQueuedLayerLoadIfIdle(runtimeState);
+
+    const auto findScene = [&]() -> ScenePointCloudRuntime* {
+        const auto scene = std::find_if(
+            runtimeState->pointCloudScenes.begin(),
+            runtimeState->pointCloudScenes.end(),
+            [](const ScenePointCloudRuntime& candidate) {
+                return candidate.sceneGroupName == "Scene3";
+            });
+        return scene == runtimeState->pointCloudScenes.end() ? nullptr : &*scene;
+    };
+    const auto displayReady = [&](const ScenePointCloudRuntime& scene) {
+        if (!scene.displayLoaded || !scene.displayVisible ||
+            scene.committedDisplaySpacingMicrometres != 5'000U) {
+            return false;
+        }
+        return std::all_of(
+            scene.committedDisplaySessionIndices.begin(),
+            scene.committedDisplaySessionIndices.end(),
+            [&](const auto& sessionIndex) {
+                if (!sessionIndex.has_value() ||
+                    sessionIndex.value() >= runtimeState->sessions.size()) {
+                    return false;
+                }
+                const auto& session =
+                    runtimeState->sessions[sessionIndex.value()];
+                return session.loaded && session.gpuResident &&
+                       session.committedDisplaySource;
+            });
+    };
+    bool sawDisplay = false;
+    bool cacheReady = false;
+    const auto startupDeadline =
+        startupStartedAt + std::chrono::seconds{240};
+    while (std::chrono::steady_clock::now() < startupDeadline &&
+           !window->ShouldClose()) {
+        PumpWaterIntegrationSmokeFrame(
+            window,
+            runtimeState,
+            viewport,
+            0.0F,
+            true,
+            true);
+        auto* scene = findScene();
+        if (scene != nullptr && !sawDisplay && displayReady(*scene)) {
+            sawDisplay = true;
+            report.displayVisibleMs =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - startupStartedAt)
+                    .count();
+        }
+        if (scene != nullptr && sawDisplay &&
+            scene->waterSurfaceCacheStatus ==
+                WaterSurfaceCacheRuntimeStatus::Valid &&
+            runtimeState->water.waterSurfaceCache != nullptr &&
+            viewport->WaterSurfaceFlowView().valid &&
+            viewport->WaterSurfaceFlowView().preprocessingComplete) {
+            cacheReady = true;
+            report.cacheReadyMs =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - startupStartedAt)
+                    .count();
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+    report.startupMs =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - startupStartedAt)
+            .count();
+    auto* scene = findScene();
+    if (scene == nullptr || !sawDisplay) {
+        report.Fail("The role-aware Scene3 5 mm display bundle did not become visible.");
+        return finish();
+    }
+    if (!cacheReady) {
+        report.Fail("The Scene3 shared surface cache did not become ready.");
+        return finish();
+    }
+    report.Pass("Loaded the complete role-aware Scene3 5 mm display bundle.");
+    for (const auto& sessionIndex : scene->committedDisplaySessionIndices) {
+        if (!sessionIndex.has_value() ||
+            sessionIndex.value() >= runtimeState->sessions.size()) {
+            continue;
+        }
+        const auto& session = runtimeState->sessions[sessionIndex.value()];
+        if (session.offlinePointCloud != nullptr) {
+            report.displayPointCount +=
+                session.offlinePointCloud->PointCount();
+        }
+    }
+    constexpr std::uint64_t kExpectedScene3DisplayPoints = 14'832'063ULL;
+    if (report.displayPointCount == kExpectedScene3DisplayPoints) {
+        report.Pass("Scene3 committed all 14,832,063 authored 5 mm display points.");
+    } else {
+        report.Fail(
+            "Scene3 5 mm display point count differed from 14,832,063 (" +
+            FormatPointCount(report.displayPointCount) + ").");
+    }
+
+    const auto terrainSourceCount = std::count_if(
+        scene->waterSurfaceSources.begin(),
+        scene->waterSurfaceSources.end(),
+        [](const auto& source) {
+            return source.role !=
+                   invisible_places::water::WaterSurfaceRole::Ground;
+        });
+    const auto groundSourceCount = std::count_if(
+        scene->waterSurfaceSources.begin(),
+        scene->waterSurfaceSources.end(),
+        [](const auto& source) {
+            return source.role ==
+                       invisible_places::water::WaterSurfaceRole::Ground &&
+                   source.spacingMicrometres == 5'000U &&
+                   !source.isFallback;
+        });
+    report.exactSurfaceSources =
+        terrainSourceCount ==
+            invisible_places::scene::kScenePointCloudRoleCount &&
+        groundSourceCount == 1U &&
+        std::all_of(
+            scene->waterSurfaceSources.begin(),
+            scene->waterSurfaceSources.end(),
+            [&](const auto& source) {
+                return NormalizePathKey(source.sourcePath.parent_path()) ==
+                           NormalizePathKey(scene->sourceFolder) &&
+                       (source.role ==
+                            invisible_places::water::WaterSurfaceRole::Ground ||
+                        (source.spacingMicrometres == 2'000U &&
+                         !source.isFallback));
+            });
+    if (report.exactSurfaceSources) {
+        report.Pass(
+            "Seepage used exact Scene3 2 mm ROCK/SAND/VEG plus the sampled 5 mm Ground cache source.");
+    } else {
+        report.Fail(
+            "Seepage did not resolve the expected Scene3 shared-cache source set.");
+    }
+    report.cacheLoadedFromDisk =
+        runtimeState->water.waterSurfaceCacheLoadedFromDisk;
+    if (report.cacheLoadedFromDisk) {
+        report.Pass("Loaded the Scene3 10 mm surface artifact from the warm cache.");
+    } else {
+        report.Fail(
+            "The Scene3 surface artifact was built cold; rerun this smoke after the cache is persisted.");
+    }
+    if (runtimeState->water.waterSurfaceCache != nullptr) {
+        report.cacheTerrainPointCount =
+            runtimeState->water.waterSurfaceCache->sourcePointCount;
+    }
+    if (scene->waterSurfaceCache.has_value()) {
+        report.cachePayloadBytes = scene->waterSurfaceCache->payloadBytes;
+    }
+
+    const auto rockSessionIndex = std::find_if(
+        scene->committedDisplaySessionIndices.begin(),
+        scene->committedDisplaySessionIndices.end(),
+        [&](const auto& sessionIndex) {
+            return sessionIndex.has_value() &&
+                   sessionIndex.value() < runtimeState->sessions.size() &&
+                   SceneRoleIs(
+                       runtimeState->sessions[sessionIndex.value()].sceneRole,
+                       "ROCK");
+        });
+    if (rockSessionIndex == scene->committedDisplaySessionIndices.end()) {
+        report.Fail("The committed Scene3 ROCK display session was unavailable.");
+        return finish();
+    }
+    const std::size_t rockLayerId = rockSessionIndex->value();
+    const auto rockGridKey = WaterSeepageSemanticTopologyKey(
+        *runtimeState,
+        runtimeState->sessions[rockLayerId]);
+    const auto topologyDeadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds{180};
+    bool topologyReady = false;
+    const auto liveSeepagePublicationReady =
+        [&](const auto& publication) {
+            const auto submittedFrameSlot =
+                viewport->Diagnostics().submittedFrameSlot;
+            // Contour Pulse fields advance every live viewport frame. The
+            // newest compact params generation is therefore published only
+            // to the fenced slot DrawFrame is about to submit; requiring the
+            // other in-flight slot to match would make an animated effect
+            // appear permanently unsettled. Topology descriptors must still
+            // agree globally, while the submitted slot must carry the newest
+            // parameter snapshot.
+            return publication.requestedGeneration > 0U &&
+                   publication.topologyGeneration > 0U &&
+                   publication.descriptorGenerationMismatchCount == 0U &&
+                   submittedFrameSlot <
+                       publication.liveFrameGenerations.size() &&
+                   publication.liveFrameGenerations[
+                       submittedFrameSlot] ==
+                       publication.requestedGeneration;
+        };
+    while (std::chrono::steady_clock::now() < topologyDeadline &&
+           !window->ShouldClose()) {
+        PumpWaterIntegrationSmokeFrame(
+            window,
+            runtimeState,
+            viewport,
+            0.0F,
+            true,
+            true);
+        const auto grid =
+            runtimeState->water.seepageRuntimeGrids.find(rockGridKey);
+        const auto support =
+            runtimeState->water.seepageSupportSelections.find(rockGridKey);
+        const auto publication =
+            viewport->WaterSeepageParamsPublicationState(rockLayerId);
+        topologyReady =
+            grid != runtimeState->water.seepageRuntimeGrids.end() &&
+            support != runtimeState->water.seepageSupportSelections.end() &&
+            std::any_of(
+                support->second.begin(),
+                support->second.end(),
+                [targetNodeId](const WaterSeepageSupportSelection& selection) {
+                    return selection.nodeId == targetNodeId &&
+                           !selection.cells.empty();
+                }) &&
+            viewport->WaterSeepageNodeCount(rockLayerId) == 1U &&
+            viewport->WaterSeepageOccupiedCellCount(rockLayerId) > 0U &&
+            viewport->WaterSeepageNodeReferenceCount(rockLayerId) > 0U &&
+            liveSeepagePublicationReady(publication) &&
+            !runtimeState->water.seepageSupportJob.worker.joinable();
+        if (topologyReady) {
+            break;
+        }
+        if (runtimeState->water.seepageSupportFailedKeys.contains(
+                rockGridKey)) {
+            report.Fail(
+                "Connected support for exact Scene3 " +
+                targetLabel + " failed: " +
+                (runtimeState->water.seepageSupportWarning.empty()
+                     ? std::string{"no worker diagnostic was published"}
+                     : runtimeState->water.seepageSupportWarning));
+            return finish();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+    if (!topologyReady) {
+        const auto grid =
+            runtimeState->water.seepageRuntimeGrids.find(rockGridKey);
+        const auto support =
+            runtimeState->water.seepageSupportSelections.find(rockGridKey);
+        const bool targetSupportReady =
+            support !=
+                runtimeState->water.seepageSupportSelections.end() &&
+            std::any_of(
+                support->second.begin(),
+                support->second.end(),
+                [targetNodeId](
+                    const WaterSeepageSupportSelection& selection) {
+                    return selection.nodeId == targetNodeId &&
+                           !selection.cells.empty();
+                });
+        const auto publication =
+            viewport->WaterSeepageParamsPublicationState(rockLayerId);
+        std::ostringstream detail;
+        detail
+            << "Connected support for exact Scene3 "
+            << targetLabel
+            << " did not settle"
+            << " (active_job_key="
+            << (runtimeState->water.seepageSupportJob.semanticKey.empty()
+                    ? std::string{"<none>"}
+                    : runtimeState->water.seepageSupportJob.semanticKey)
+            << ",worker_joinable="
+            << (runtimeState->water.seepageSupportJob.worker.joinable()
+                    ? 1
+                    : 0)
+            << ",support_revision="
+            << runtimeState->water.seepageSupportBuildRevision
+            << ",rock_grid="
+            << (grid !=
+                        runtimeState->water.seepageRuntimeGrids.end()
+                    ? 1
+                    : 0)
+            << ",rock_support="
+            << (support !=
+                        runtimeState->water.seepageSupportSelections.end()
+                    ? 1
+                    : 0)
+            << ",target_support=" << (targetSupportReady ? 1 : 0)
+            << ",gpu_nodes="
+            << viewport->WaterSeepageNodeCount(rockLayerId)
+            << ",gpu_cells="
+            << viewport->WaterSeepageOccupiedCellCount(rockLayerId)
+            << ",gpu_refs="
+            << viewport->WaterSeepageNodeReferenceCount(rockLayerId)
+            << ",descriptor_ready="
+            << (publication.descriptorGenerationReady ? 1 : 0)
+            << ",descriptor_mismatches="
+            << publication.descriptorGenerationMismatchCount
+            << ",requested_generation="
+            << publication.requestedGeneration
+            << ",topology_generation="
+            << publication.topologyGeneration
+            << ",live_generations=["
+            << publication.liveFrameGenerations[0] << ','
+            << publication.liveFrameGenerations[1] << ']'
+            << ",submitted_frame_slot="
+            << viewport->Diagnostics().submittedFrameSlot
+            << ",failed_keys="
+            << runtimeState->water.seepageSupportFailedKeys.size()
+            << ",rock_failed="
+            << (runtimeState->water.seepageSupportFailedKeys.contains(
+                    rockGridKey)
+                    ? 1
+                    : 0);
+        if (!runtimeState->water.seepageSupportWarning.empty()) {
+            detail << ",warning="
+                   << runtimeState->water.seepageSupportWarning;
+        }
+        if (!runtimeState->errorMessage.empty()) {
+            detail << ",runtime_error="
+                   << runtimeState->errorMessage;
+        }
+        detail << ").";
+        report.Fail(detail.str());
+        return finish();
+    }
+    report.Pass(
+        "Resolved exact Scene3 " + targetLabel +
+        " to one compact connected-cell topology.");
+    report.seepageGpuBytes =
+        static_cast<std::size_t>(
+            viewport->WaterSeepageResidentBytes(rockLayerId));
+    report.initialTopologyUploadRevision =
+        viewport->WaterSeepageTopologyUploadRevision(rockLayerId);
+    report.initialParamsUploadRevision =
+        viewport->WaterSeepageParamsUploadRevision(rockLayerId);
+    report.initialSupportBuildRevision =
+        runtimeState->water.seepageSupportBuildRevision;
+    report.initialTopologyBuildRevision =
+        runtimeState->water.seepageTopologyBuildRevision;
+    report.initialDescriptorAttachmentRevision =
+        runtimeState->water.seepageDescriptorAttachmentRevision;
+
+    const auto initialGrid =
+        runtimeState->water.seepageRuntimeGrids.find(rockGridKey);
+    const auto initialSupport =
+        runtimeState->water.seepageSupportSelections.find(rockGridKey);
+    if (initialGrid == runtimeState->water.seepageRuntimeGrids.end() ||
+        initialSupport ==
+            runtimeState->water.seepageSupportSelections.end()) {
+        report.Fail("Scene3 Seepage topology vanished before the sweep.");
+        return finish();
+    }
+    const auto initialSelection = std::find_if(
+        initialSupport->second.begin(),
+        initialSupport->second.end(),
+        [targetNodeId](const WaterSeepageSupportSelection& selection) {
+            return selection.nodeId == targetNodeId;
+        });
+    if (initialSelection == initialSupport->second.end()) {
+        report.Fail(
+            "Scene3 " + targetLabel +
+            " had no ROCK support selection.");
+        return finish();
+    }
+    const std::string initialTopologyFingerprint =
+        invisible_places::water::WaterSeepageTopologyFingerprint(
+            initialGrid->second);
+    const std::string initialSupportFingerprint =
+        initialSelection->fingerprint;
+    const auto initialSupportNodeFingerprints =
+        runtimeState->water.seepageSupportNodeFingerprints;
+    const auto initialTopologyBuildRevision =
+        runtimeState->water.seepageTopologyBuildRevision;
+    const auto initialDescriptorAttachmentRevision =
+        runtimeState->water.seepageDescriptorAttachmentRevision;
+    const auto initialTopologyUploadRevision =
+        viewport->WaterSeepageTopologyUploadRevision(rockLayerId);
+
+    // The production sidecar is intentionally streamed as one validated
+    // artifact and has no spatial range-read API. Materialise the exact
+    // target-node neighbourhood once from its resident 10 mm surfels, then reload
+    // that compact test-only fixture and prove it rebuilds byte-for-byte
+    // equivalent connected support. Subsequent CPU tuning can use this crop
+    // without loading any 5 mm display cloud or scanning the full sidecar.
+    report.cropFixturePath =
+        outputDirectory /
+        ("scene3-node" + std::to_string(targetNodeId) +
+         "-rock-10mm.seepagecrop");
+    const auto cropWriteStartedAt = std::chrono::steady_clock::now();
+    auto crop = BuildScene3SeepageCrop(
+        *runtimeState->water.waterSurfaceCache,
+        *initialSelection,
+        0.25F);
+    report.cropSurfelCount = crop.flowSurfaceSurfels.size();
+    std::string cropError;
+    const bool cropWritten = WriteScene3SeepageCropFixture(
+        report.cropFixturePath,
+        crop,
+        &cropError);
+    report.cropWriteMs =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - cropWriteStartedAt)
+            .count();
+    std::error_code cropSizeError;
+    report.cropFixtureBytes = std::filesystem::file_size(
+        report.cropFixturePath,
+        cropSizeError);
+    const auto cropReloadStartedAt = std::chrono::steady_clock::now();
+    WaterSurfaceCache reloadedCrop;
+    const bool cropReloaded =
+        cropWritten &&
+        LoadScene3SeepageCropFixture(
+            report.cropFixturePath,
+            &reloadedCrop,
+            &cropError);
+    WaterSeepageSupportBuildResult cropSupport;
+    if (cropReloaded) {
+        cropSupport =
+            invisible_places::water::BuildWaterSeepageSupportSelection(
+                runtimeState->water.seepageNodes.front(),
+                "ROCK",
+                reloadedCrop);
+    }
+    report.cropReloadAndBuildMs =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - cropReloadStartedAt)
+            .count();
+    report.cropSupportCellCount =
+        cropSupport.selection.cells.size();
+    report.cropMatchesProduction =
+        cropWritten &&
+        cropReloaded &&
+        cropSupport.success &&
+        !cropSupport.cancelled &&
+        !cropSupport.diagnostics.cellLimitExceeded &&
+        cropSupport.selection.fingerprint ==
+            initialSupportFingerprint &&
+        cropSupport.selection.cells.size() ==
+            initialSelection->cells.size();
+    if (report.cropMatchesProduction &&
+        !cropSizeError &&
+        report.cropSurfelCount <
+            runtimeState->water.waterSurfaceCache
+                ->flowSurfaceSurfels.size()) {
+        report.Pass(
+            "Reloaded the compact " + targetLabel +
+            " 10 mm crop and reproduced the production ROCK support exactly.");
+    } else {
+        report.Fail(
+            "The compact " + targetLabel +
+            " crop did not reproduce production support" +
+            (cropError.empty() ? std::string{"."}
+                               : std::string{": "} + cropError));
+        return finish();
+    }
+    const std::array<WaterSeepageSupportSelection, 1>
+        compactSupportSelections{{std::move(cropSupport.selection)}};
+    auto compactMetricGrid =
+        invisible_places::water::BuildWaterSeepageSpatialGrid(
+            runtimeState->water.seepageNodes,
+            runtimeState->water.seepageLookProfiles,
+            runtimeState->water.defaultSeepageLook,
+            "ROCK",
+            false,
+            runtimeState->water.collisionRainSettings,
+            EffectiveWaterSeepageShaderInvocations(*runtimeState),
+            {},
+            std::nullopt,
+            {},
+            compactSupportSelections,
+            runtimeState->water.seepageResponseProfiles);
+    if (invisible_places::water::WaterSeepageTopologyFingerprint(
+            compactMetricGrid) != initialTopologyFingerprint) {
+        report.Fail(
+            "The compact " + targetLabel +
+            " metric grid did not match the production topology.");
+        return finish();
+    }
+
+    constexpr std::array<float, 8> kStrengths{{
+        0.02F,
+        0.12F,
+        0.20F,
+        0.32F,
+        0.43F,
+        0.63F,
+        0.93F,
+        1.13F,
+    }};
+    constexpr std::array<std::uint32_t, 2> kWaveCounts{{7U, 12U}};
+    std::vector<double> parameterTimes;
+    bool allParameterOnly = true;
+    bool allEffectsVisible = true;
+    std::array<bool, kWaveCounts.size()> animatedWaveCounts{};
+    bool allBalancedQuality = true;
+    for (std::size_t waveIndex = 0U;
+         waveIndex < kWaveCounts.size();
+         ++waveIndex) {
+        const auto waveCount = kWaveCounts[waveIndex];
+        for (const auto strength : kStrengths) {
+            runtimeState->water.seepageNodes.front().strength = strength;
+            const auto profileIndex = FindWaterSeepageLookProfileIndex(
+                runtimeState->water,
+                kSmokeLookName);
+            if (!profileIndex.has_value()) {
+                report.Fail("The dedicated Contour Pulses smoke profile disappeared.");
+                return finish();
+            }
+            auto& look =
+                runtimeState->water
+                    .seepageLookProfiles[profileIndex.value()]
+                    .settings;
+            look.pattern = WaterSeepagePattern::ContourPulses;
+            look.quality = WaterSeepageQuality::Auto;
+            look.pulseWaveCount = static_cast<float>(waveCount);
+            look.pulseSpeedVariation = 0.55F;
+
+            const auto paramsBefore =
+                viewport->WaterSeepageParamsUploadRevision(rockLayerId);
+            const auto publicationBefore =
+                viewport->WaterSeepageParamsPublicationState(
+                    rockLayerId);
+            InvalidateWaterSeepageParams(&runtimeState->water);
+            const auto parameterStartedAt =
+                std::chrono::steady_clock::now();
+            EnsureWaterSeepageRuntimeUpToDate(runtimeState, viewport);
+            // UpdateWaterSeepageParams publishes one compact CPU snapshot for
+            // the renderer's frame ring. That synchronous publication is the
+            // key-edit latency: each frame slot copies the newest snapshot
+            // only after its own fence is complete. Waiting for both slots
+            // here would measure two full Scene3 renders rather than Seepage
+            // parameter work, and continuous animation never needs that
+            // global-ring barrier.
+            const double parameterPublicationMs =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() -
+                    parameterStartedAt)
+                    .count();
+            const auto stagedPublication =
+                viewport->WaterSeepageParamsPublicationState(
+                    rockLayerId);
+            const bool publicationReady =
+                viewport->WaterSeepageParamsUploadRevision(
+                    rockLayerId) > paramsBefore &&
+                stagedPublication.requestedGeneration >
+                    publicationBefore.requestedGeneration;
+            parameterTimes.push_back(parameterPublicationMs);
+
+            // Exercise the real frame-ring handoff independently of the
+            // latency metric. DrawFrame waits only for the slot it is about to
+            // reuse, then FlushWaterSeepageParamsForFrame copies the newest
+            // pending generation before command recording.
+            PumpWaterIntegrationSmokeFrame(
+                window,
+                runtimeState,
+                viewport,
+                0.0F,
+                true,
+                true);
+            const auto activatedPublication =
+                viewport->WaterSeepageParamsPublicationState(
+                    rockLayerId);
+            const auto submittedFrameSlot =
+                viewport->Diagnostics().submittedFrameSlot;
+            // Pumping the draw may advance a free-running Contour Pulse from
+            // the explicitly staged edit to a newer snapshot. It must never
+            // regress behind that edit, and the submitted slot must contain
+            // the newest snapshot actually requested for this frame.
+            const bool submittedFrameUsesLatestParams =
+                submittedFrameSlot <
+                    activatedPublication.liveFrameGenerations.size() &&
+                activatedPublication.requestedGeneration >=
+                    stagedPublication.requestedGeneration &&
+                activatedPublication.liveFrameGenerations[
+                    submittedFrameSlot] ==
+                    activatedPublication.requestedGeneration &&
+                activatedPublication
+                        .descriptorGenerationMismatchCount ==
+                    0U;
+
+            const auto grid =
+                runtimeState->water.seepageRuntimeGrids.find(rockGridKey);
+            const auto supports =
+                runtimeState->water.seepageSupportSelections.find(
+                    rockGridKey);
+            if (!publicationReady ||
+                !submittedFrameUsesLatestParams ||
+                grid ==
+                    runtimeState->water.seepageRuntimeGrids.end() ||
+                supports ==
+                    runtimeState->water.seepageSupportSelections.end()) {
+                report.Fail(
+                    "A Scene3 strength/wave parameter sample did not publish.");
+                return finish();
+            }
+            const auto support = std::find_if(
+                supports->second.begin(),
+                supports->second.end(),
+                [targetNodeId](const WaterSeepageSupportSelection& selection) {
+                    return selection.nodeId == targetNodeId;
+                });
+            if (support == supports->second.end()) {
+                report.Fail(
+                    "Scene3 " + targetLabel +
+                    " support disappeared during the parameter sweep.");
+                return finish();
+            }
+
+            invisible_places::water::ApplyWaterSeepageRuntimeParameters(
+                &compactMetricGrid,
+                runtimeState->water.seepageNodes,
+                runtimeState->water.seepageLookProfiles,
+                runtimeState->water.defaultSeepageLook,
+                std::nullopt,
+                runtimeState->water.collisionRainSettings,
+                EffectiveWaterSeepageShaderInvocations(*runtimeState),
+                {},
+                runtimeState->water.seepageResponseProfiles);
+            auto metric = MeasureScene3SeepageSweep(
+                compactMetricGrid,
+                compactSupportSelections.front(),
+                targetNodeId,
+                strength,
+                waveCount);
+            metric.parameterPreparationMs =
+                parameterPublicationMs;
+            metric.parameterUpdateMs =
+                parameterPublicationMs;
+            metric.topologyUploadRevision =
+                viewport->WaterSeepageTopologyUploadRevision(rockLayerId);
+            metric.paramsUploadRevision =
+                viewport->WaterSeepageParamsUploadRevision(rockLayerId);
+            metric.supportBuildRevision =
+                runtimeState->water.seepageSupportBuildRevision;
+            metric.topologyBuildRevision =
+                runtimeState->water.seepageTopologyBuildRevision;
+            metric.descriptorAttachmentRevision =
+                runtimeState->water.seepageDescriptorAttachmentRevision;
+            allBalancedQuality =
+                allBalancedQuality &&
+                metric.resolvedQuality ==
+                    WaterSeepageQuality::Balanced;
+            allEffectsVisible =
+                allEffectsVisible &&
+                metric.effectSampleCount > 0U &&
+                metric.maximumEffectScale > 1.0e-5;
+            animatedWaveCounts[waveIndex] =
+                animatedWaveCounts[waveIndex] ||
+                metric.meanTemporalDelta > 1.0e-7;
+            const bool parameterOnly =
+                metric.topologyFingerprint ==
+                    initialTopologyFingerprint &&
+                support->fingerprint ==
+                    initialSupportFingerprint &&
+                runtimeState->water.seepageSupportNodeFingerprints ==
+                    initialSupportNodeFingerprints &&
+                metric.supportBuildRevision ==
+                    report.initialSupportBuildRevision &&
+                metric.topologyBuildRevision ==
+                    initialTopologyBuildRevision &&
+                metric.descriptorAttachmentRevision ==
+                    initialDescriptorAttachmentRevision &&
+                metric.topologyUploadRevision ==
+                    initialTopologyUploadRevision &&
+                metric.paramsUploadRevision > paramsBefore;
+            allParameterOnly = allParameterOnly && parameterOnly;
+            report.metrics.push_back(std::move(metric));
+        }
+    }
+
+    if (allParameterOnly) {
+        report.Pass(
+            "All 16 strength/wave edits updated compact parameters without rebuilding support, topology, or descriptors.");
+    } else {
+        report.Fail(
+            "At least one strength/wave edit rebuilt Scene3 Seepage support or topology.");
+    }
+    if (allBalancedQuality) {
+        report.Pass(
+            "Auto quality resolved to Balanced for the 14.8 million-invocation Scene3 screen-sprite bundle.");
+    } else {
+        report.Fail(
+            "Scene3 Contour Pulses did not consistently resolve Auto to Balanced.");
+    }
+    if (allEffectsVisible &&
+        std::all_of(
+            animatedWaveCounts.begin(),
+            animatedWaveCounts.end(),
+            [](bool animated) { return animated; })) {
+        report.Pass(
+            "Contour Pulses produced visible, time-varying effect samples at 7 and 12 waves.");
+    } else {
+        report.Fail(
+            "One or more Contour Pulses samples were empty or temporally static.");
+    }
+
+    bool monotonicStructure = true;
+    for (const auto waveCount : kWaveCounts) {
+        const Scene3SeepageSweepMetric* previous = nullptr;
+        for (const auto& metric : report.metrics) {
+            if (metric.waveCount != waveCount) {
+                continue;
+            }
+            if (previous != nullptr) {
+                monotonicStructure =
+                    monotonicStructure &&
+                    metric.activeStructureCellCount >=
+                        previous->activeStructureCellCount &&
+                    metric.weightedStructureCellCount + 1.0e-6 >=
+                        previous->weightedStructureCellCount &&
+                    metric.maximumDownhillMeters + 1.0e-5F >=
+                        previous->maximumDownhillMeters;
+            }
+            previous = &metric;
+        }
+    }
+    if (monotonicStructure) {
+        report.Pass(
+            "Increasing Node Strength grew the connected footprint monotonically for both wave counts.");
+    } else {
+        report.Fail(
+            "Increasing Node Strength reduced the connected Scene3 footprint.");
+    }
+
+    bool waveCountPreservedStructure = true;
+    for (std::size_t strengthIndex = 0U;
+         strengthIndex < kStrengths.size();
+         ++strengthIndex) {
+        const auto& seven = report.metrics[strengthIndex];
+        const auto& twelve =
+            report.metrics[kStrengths.size() + strengthIndex];
+        waveCountPreservedStructure =
+            waveCountPreservedStructure &&
+            seven.activeStructureCellCount ==
+                twelve.activeStructureCellCount &&
+            std::abs(
+                seven.weightedStructureCellCount -
+                twelve.weightedStructureCellCount) <= 1.0e-5 &&
+            std::abs(
+                seven.maximumDownhillMeters -
+                twelve.maximumDownhillMeters) <= 1.0e-5F &&
+            std::abs(
+                seven.maximumLateralMeters -
+                twelve.maximumLateralMeters) <= 1.0e-5F;
+    }
+    if (waveCountPreservedStructure) {
+        report.Pass(
+            "Changing 7 to 12 waves altered appearance only, not the affected Scene3 structure.");
+    } else {
+        report.Fail(
+            "Wave count unexpectedly changed the connected Scene3 footprint.");
+    }
+
+    const auto highestStrength = std::find_if(
+        report.metrics.begin(),
+        report.metrics.end(),
+        [](const Scene3SeepageSweepMetric& metric) {
+            return metric.waveCount == 7U &&
+                   std::abs(metric.strength - 1.13F) <= 1.0e-5F;
+        });
+    if (highestStrength != report.metrics.end() &&
+        // The original clicked tangent is not a reliable footprint axis once
+        // support bends around protrusions. Use the accumulated transported
+        // flow/cross metrics plus world drop, which are the quantities the
+        // live mask and shader actually follow.
+        highestStrength->flowRunToCrossContourRatio >= 1.5F &&
+        highestStrength->maximumDownstreamFlowRunMeters >
+            highestStrength->maximumUpstreamFlowRunMeters &&
+        highestStrength->maximumWorldVerticalDropMeters >
+            highestStrength->maximumWorldHorizontalMeters * 0.75F) {
+        report.Pass(
+            "The strongest Scene3 footprint remained predominantly downhill/vertical while retaining flatter-surface spread metrics.");
+    } else {
+        report.Fail(
+            "The strongest Scene3 footprint spread wider than its downhill/vertical reach.");
+    }
+
+    report.parameterP50Ms = PercentileValue(parameterTimes, 0.50);
+    report.parameterP95Ms = PercentileValue(parameterTimes, 0.95);
+    report.parameterMaxMs =
+        parameterTimes.empty()
+            ? 0.0
+            : *std::max_element(
+                  parameterTimes.begin(),
+                  parameterTimes.end());
+    if (report.parameterP95Ms < 10.0 &&
+        report.parameterMaxMs < 100.0) {
+        report.Pass(
+            "Scene3 strength/wave parameter updates stayed below 10 ms p95 and 100 ms maximum.");
+    } else {
+        report.Fail(
+            "Scene3 strength/wave parameter updates exceeded the responsiveness target (p95=" +
+            FormatFixed(report.parameterP95Ms, 3) +
+            " ms, max=" +
+            FormatFixed(report.parameterMaxMs, 3) + " ms).");
+    }
+
+    struct Scene3SeepageCaptureSample {
+        float strength = 0.0F;
+        std::uint32_t waveCount = 7U;
+        float timeSeconds = 0.0F;
+        std::string_view label;
+    };
+    constexpr std::array<Scene3SeepageCaptureSample, 4> kCaptureSamples{{
+        {.strength = 0.02F,
+         .waveCount = 7U,
+         .timeSeconds = 0.0F,
+         .label = "strength-002-waves-07"},
+        {.strength = 0.43F,
+         .waveCount = 7U,
+         .timeSeconds = 0.83F,
+         .label = "strength-043-waves-07"},
+        {.strength = 1.13F,
+         .waveCount = 7U,
+         .timeSeconds = 1.66F,
+         .label = "strength-113-waves-07"},
+        {.strength = 1.13F,
+         .waveCount = 12U,
+         .timeSeconds = 0.83F,
+         .label = "strength-113-waves-12"},
+    }};
+    const invisible_places::io::Float3 captureFocus{
+        0.5F *
+            (initialSelection->bounds.minimum.x +
+             initialSelection->bounds.maximum.x),
+        0.5F *
+            (initialSelection->bounds.minimum.y +
+             initialSelection->bounds.maximum.y),
+        0.5F *
+            (initialSelection->bounds.minimum.z +
+             initialSelection->bounds.maximum.z),
+    };
+    runtimeState->camera.FrameBounds(
+        initialSelection->bounds,
+        captureFocus,
+        CurrentAspectRatio(*viewport),
+        0.92F);
+    SyncPivotOverlayToCamera(runtimeState);
+    runtimeState->previewRenderStateSignatureValid = false;
+
+    const auto captureTopologyRevision =
+        viewport->WaterSeepageTopologyUploadRevision(rockLayerId);
+    const auto captureTopologyBuildRevision =
+        runtimeState->water.seepageTopologyBuildRevision;
+    const auto captureDescriptorAttachmentRevision =
+        runtimeState->water.seepageDescriptorAttachmentRevision;
+    std::vector<WaterIntegrationCapturedFrame> captureFrames;
+    captureFrames.reserve(kCaptureSamples.size() * 2U);
+    bool allCapturesSucceeded = true;
+    for (const auto& sample : kCaptureSamples) {
+        runtimeState->water.seepageNodes.front().strength =
+            sample.strength;
+        const auto profileIndex = FindWaterSeepageLookProfileIndex(
+            runtimeState->water,
+            kSmokeLookName);
+        if (!profileIndex.has_value()) {
+            report.Fail(
+                "The dedicated Contour Pulses profile disappeared before visual capture.");
+            allCapturesSucceeded = false;
+            break;
+        }
+        auto& look =
+            runtimeState->water
+                .seepageLookProfiles[profileIndex.value()]
+                .settings;
+        look.pattern = WaterSeepagePattern::ContourPulses;
+        look.pulseWaveCount =
+            static_cast<float>(sample.waveCount);
+        InvalidateWaterSeepageParams(&runtimeState->water);
+        auto frameState = ResolveWaterFrameState(runtimeState);
+        frameState.sampleTimeSeconds = sample.timeSeconds;
+        EnsureWaterSeepageRuntimeUpToDate(
+            runtimeState,
+            viewport,
+            &frameState);
+
+        std::string captureError;
+        runtimeState->water.showSeepageStructure = false;
+        const auto effectPpm =
+            outputDirectory /
+            (std::string{sample.label} + "-effect.ppm");
+        const auto effectExr =
+            outputDirectory /
+            (std::string{sample.label} + "-effect.exr");
+        auto effectFrame = CaptureWaterIntegrationFrame(
+            runtimeState,
+            viewport,
+            frameState,
+            sample.timeSeconds,
+            effectExr,
+            effectPpm,
+            &captureError,
+            true);
+        if (!effectFrame.has_value()) {
+            report.Fail(
+                "Could not capture the marker/effect frame for " +
+                std::string{sample.label} + ": " + captureError);
+            allCapturesSucceeded = false;
+            break;
+        }
+        report.effectFramePpmPaths.push_back(effectPpm);
+        report.effectFrameExrPaths.push_back(effectExr);
+        captureFrames.push_back(std::move(effectFrame.value()));
+
+        runtimeState->water.showSeepageStructure = true;
+        const auto structurePpm =
+            outputDirectory /
+            (std::string{sample.label} + "-structure.ppm");
+        const auto structureExr =
+            outputDirectory /
+            (std::string{sample.label} + "-structure.exr");
+        auto structureFrame = CaptureWaterIntegrationFrame(
+            runtimeState,
+            viewport,
+            frameState,
+            sample.timeSeconds,
+            structureExr,
+            structurePpm,
+            &captureError,
+            true);
+        if (!structureFrame.has_value()) {
+            report.Fail(
+                "Could not capture the Structure Overlay frame for " +
+                std::string{sample.label} + ": " + captureError);
+            allCapturesSucceeded = false;
+            break;
+        }
+        report.structureFramePpmPaths.push_back(structurePpm);
+        report.structureFrameExrPaths.push_back(structureExr);
+        captureFrames.push_back(std::move(structureFrame.value()));
+    }
+    runtimeState->water.showSeepageStructure = false;
+
+    if (allCapturesSucceeded) {
+        report.captureContactSheetPath =
+            outputDirectory /
+            ("scene3-node" + std::to_string(targetNodeId) +
+             "-strength-contact-sheet.ppm");
+        std::string contactSheetError;
+        if (!WriteWaterIntegrationContactSheet(
+                report.captureContactSheetPath,
+                captureFrames,
+                &contactSheetError)) {
+            report.Fail(
+                "Could not write the paired Scene3 Seepage contact sheet: " +
+                contactSheetError);
+            allCapturesSucceeded = false;
+        }
+    }
+    const auto captureGrid =
+        runtimeState->water.seepageRuntimeGrids.find(rockGridKey);
+    const bool capturesWereParameterOnly =
+        captureGrid !=
+            runtimeState->water.seepageRuntimeGrids.end() &&
+        viewport->WaterSeepageTopologyUploadRevision(rockLayerId) ==
+            captureTopologyRevision &&
+        runtimeState->water.seepageTopologyBuildRevision ==
+            captureTopologyBuildRevision &&
+        runtimeState->water.seepageDescriptorAttachmentRevision ==
+            captureDescriptorAttachmentRevision &&
+        invisible_places::water::WaterSeepageTopologyFingerprint(
+            captureGrid->second) ==
+            initialTopologyFingerprint;
+    if (allCapturesSucceeded && capturesWereParameterOnly &&
+        report.effectFramePpmPaths.size() ==
+            kCaptureSamples.size() &&
+        report.structureFramePpmPaths.size() ==
+            kCaptureSamples.size()) {
+        report.Pass(
+            "Captured paired marker/effect and Structure Overlay frames across low, medium, high, and 12-wave states without topology work.");
+    } else if (!capturesWereParameterOnly) {
+        report.Fail(
+            "Scene3 visual captures unexpectedly rebuilt Seepage topology or descriptors.");
+    }
+
+    viewport->WaitIdle();
+    return finish();
+}
+
 int RunWaterIntegrationSmoke(
     const GuiSmokeOptions& options,
     platform::Window* window,
@@ -52519,15 +55804,24 @@ int RunWaterIntegrationSmoke(
         invisible_places::camera::AnimationPathDurationSeconds(loadedValidationPath);
     const std::string expectedAnimationName =
         AnimationNameFromFilePath(report.animationPath);
-    const std::uint32_t expectedAnimationFrames = sampleScene ? 900U : 3600U;
-    const float expectedAnimationSeconds = sampleScene ? 30.0F : 120.0F;
+    const bool sampleTimingMatches =
+        !sampleScene ||
+        (loadedValidationPath.durationFrames == 900U &&
+         loadedValidationPath.exportSettings.framesPerSecond == 30U &&
+         std::abs(validationDurationSeconds - 30.0F) <= 1.0e-4F);
+    const bool authoredTimingIsUsable =
+        loadedValidationPath.durationFrames >= 2U &&
+        loadedValidationPath.exportSettings.framesPerSecond > 0U &&
+        std::isfinite(validationDurationSeconds) &&
+        validationDurationSeconds > 0.0F;
     if (loadedValidationPath.name == expectedAnimationName &&
-        loadedValidationPath.durationFrames == expectedAnimationFrames &&
-        loadedValidationPath.exportSettings.framesPerSecond == 30U &&
-        std::abs(validationDurationSeconds - expectedAnimationSeconds) <= 1.0e-4F) {
+        sampleTimingMatches && authoredTimingIsUsable) {
         report.Pass(
             "Loaded " + expectedAnimationName + " as the authored " +
-            std::to_string(expectedAnimationFrames) + "-frame, 30 fps path.");
+            std::to_string(loadedValidationPath.durationFrames) + "-frame, " +
+            std::to_string(
+                loadedValidationPath.exportSettings.framesPerSecond) +
+            " fps path.");
     } else {
         report.Fail(
             expectedAnimationName + " did not match its authored timing (" +
@@ -52848,6 +56142,11 @@ int RunWaterIntegrationSmoke(
         report.Fail("The authored startup Seepage node or ROCK display layer was unavailable.");
     } else {
         const auto rockLayerId = startupRockSessionIndex.value();
+        const auto expectedRockTopologyNodeCount =
+            WaterSeepageNodesForRole(
+                runtimeState->water.seepageNodes,
+                runtimeState->sessions[rockLayerId].sceneRole)
+                .size();
         // Validate the attachment actually used by the live presentation path,
         // not the independent EXR render target. Cache preprocessing and the
         // asynchronous connected-cell selections have separate readiness
@@ -52888,7 +56187,9 @@ int RunWaterIntegrationSmoke(
                 viewport->WaterSeepageParamsPublicationState(rockLayerId);
             startupSeepageSettled = startupSeepageSettled &&
                                     rockPublication.descriptorGenerationReady &&
-                                    viewport->WaterSeepageNodeCount(rockLayerId) == 1U &&
+                                    expectedRockTopologyNodeCount > 0U &&
+                                    viewport->WaterSeepageNodeCount(rockLayerId) ==
+                                        expectedRockTopologyNodeCount &&
                                     viewport->WaterSeepageOccupiedCellCount(rockLayerId) > 0U &&
                                     viewport->WaterSeepageNodeReferenceCount(rockLayerId) > 0U;
             if (startupSeepageSettled) {
@@ -53133,7 +56434,8 @@ int RunWaterIntegrationSmoke(
             report.Fail(detail.str());
         }
         const bool initialPublicationSettled =
-            initialTopologyRevision > 0U && initialNodeCount == 1U &&
+            initialTopologyRevision > 0U &&
+            initialNodeCount == expectedRockTopologyNodeCount &&
             initialOccupiedCellCount > 0U && initialReferenceCount > 0U &&
             initialPublication.requestedGeneration > 0U &&
             initialPublication.liveFrameGenerations[0] ==
@@ -54296,6 +57598,18 @@ int Application::Run(ApplicationRunOptions options) const {
                 &window,
                 &viewport.value(),
                 &runtimeState);
+            StopBackgroundWorkForShutdown(&runtimeState);
+            viewport->WaitIdle();
+            return smokeExitCode;
+        }
+        if (options.guiSmoke->scenario == "seepage-scene3-node" ||
+            options.guiSmoke->scenario == "seepage-scene3-node4") {
+            const auto smokeExitCode = RunScene3SeepageNodeSmoke(
+                options.guiSmoke.value(),
+                &window,
+                &viewport.value(),
+                &runtimeState,
+                dataRoot_);
             StopBackgroundWorkForShutdown(&runtimeState);
             viewport->WaitIdle();
             return smokeExitCode;

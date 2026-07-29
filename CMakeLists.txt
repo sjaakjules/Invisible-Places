@@ -158,6 +158,7 @@ add_library(
     src/style/RenderParameterBinding.cpp
     src/water/RainSimulation.cpp
     src/water/WaterFlow.cpp
+    src/water/WaterSeepagePulseField.cpp
 )
 
 add_dependencies(invisible_places_core invisible_places_shaders)
@@ -250,6 +251,7 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
             tests/SeepageOfflineRendererTests.cpp
             tests/SeepageSerializationTests.cpp
             tests/SeepageWaterTests.cpp
+            tests/WaterSeepagePulseFieldTests.cpp
             tests/WaterTimingTests.cpp
         )
         target_link_libraries(invisible_places_tests PRIVATE invisible_places_core Catch2::Catch2WithMain)
@@ -428,6 +430,22 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
                 water-integration-scene3-exhibition
                 PROPERTIES
                     LABELS "gui_smoke;water_integration;full_site_water_stress"
+                    RUN_SERIAL TRUE
+                    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                    TIMEOUT 1200
+            )
+            add_test(
+                NAME seepage-scene3-node
+                COMMAND
+                    $<TARGET_FILE:invisible_places>
+                    "${CMAKE_CURRENT_SOURCE_DIR}/Data"
+                    --gui-smoke seepage-scene3-node
+                    --smoke-output "${CMAKE_CURRENT_BINARY_DIR}/water-region-smoke/seepage-scene3-node"
+            )
+            set_tests_properties(
+                seepage-scene3-node
+                PROPERTIES
+                    LABELS "gui_smoke;water_integration;full_site_water_stress;seepage"
                     RUN_SERIAL TRUE
                     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
                     TIMEOUT 1200

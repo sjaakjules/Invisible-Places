@@ -11080,6 +11080,7 @@ TEST_CASE("Point alpha contribution policy is shared by preview and export selec
 
 TEST_CASE("Point material variant resolver selects simple and unified paths", "[point-style]") {
     using invisible_places::renderer::pointcloud::PointCloudColorMode;
+    using invisible_places::renderer::pointcloud::PointCloudDensityCompensation;
     using invisible_places::renderer::pointcloud::PointCloudMaterialVariant;
     using invisible_places::renderer::pointcloud::ResolvePointCloudMaterialVariant;
     using invisible_places::style::ParameterSourceMode;
@@ -11090,6 +11091,19 @@ TEST_CASE("Point material variant resolver selects simple and unified paths", "[
     invisible_places::style::SetScalarConstant(&style.emissiveStrength, 1.25F);
     invisible_places::style::SetScalarConstant(&style.depthFade, 0.0F);
     CHECK(ResolvePointCloudMaterialVariant(style) == PointCloudMaterialVariant::ConstantSimple);
+    CHECK(
+        ResolvePointCloudMaterialVariant(
+            style,
+            PointCloudDensityCompensation{},
+            true) == PointCloudMaterialVariant::Unified);
+
+    const invisible_places::renderer::pointcloud::PointCloudStyleState opaqueStyle;
+    CHECK(ResolvePointCloudMaterialVariant(opaqueStyle) == PointCloudMaterialVariant::OpaqueHardDisc);
+    CHECK(
+        ResolvePointCloudMaterialVariant(
+            opaqueStyle,
+            PointCloudDensityCompensation{},
+            true) == PointCloudMaterialVariant::Unified);
 
     auto fieldOpacity = style;
     fieldOpacity.opacity.mode = ParameterSourceMode::FieldMapped;

@@ -3426,6 +3426,10 @@ json SerializeWaterFeatureTimingRun(
             }
             settingsJson.push_back({
                 {"id", setting.settingId},
+                {"active", setting.active},
+                {"label", setting.label},
+                {"profile_group", setting.profileGroup},
+                {"profile_name", setting.profileName},
                 {"keys", std::move(keysJson)},
             });
         }
@@ -3466,6 +3470,18 @@ invisible_places::water::WaterFeatureTimingRun ParseWaterFeatureTimingRun(
                     invisible_places::water::WaterKeyedSettingTrack track;
                     track.settingId =
                         settingJson.value("id", std::string{});
+                    track.active =
+                        settingJson.value("active", true);
+                    track.label =
+                        settingJson.value("label", std::string{});
+                    track.profileGroup =
+                        settingJson.value(
+                            "profile_group",
+                            std::string{});
+                    track.profileName =
+                        settingJson.value(
+                            "profile_name",
+                            std::string{});
                     if (settingJson.contains("keys") &&
                         settingJson.at("keys").is_array()) {
                         for (const auto& keyJson : settingJson.at("keys")) {
