@@ -400,6 +400,102 @@ PointCloudStyleState::PointCloudStyleState() {
     depthFade.active = false;
 }
 
+PointCloudShorelineWaveSettings ExtractPointCloudShorelineWaveSettings(
+    const PointCloudStyleState& style) {
+    PointCloudShorelineWaveSettings settings;
+    settings.enabled = style.shorelineWaveEnabled;
+    settings.algorithm = style.shorelineWaveAlgorithm;
+    settings.heightFoam = style.shorelineHeightFoam;
+    auto& foam = settings.foamFronts;
+    foam.boundaryZ = style.shorelineBoundaryZ;
+    foam.heightReachMeters = style.shorelineHeightReachMeters;
+    foam.edgeFadeMeters = style.shorelineEdgeFadeMeters;
+    foam.directionX = style.shorelineDirectionX;
+    foam.directionY = style.shorelineDirectionY;
+    foam.patternScale = style.shorelinePatternScale;
+    foam.wavelengthMeters = style.shorelineWavelengthMeters;
+    foam.speed = style.shorelineSpeed;
+    foam.warp = style.shorelineWarp;
+    foam.turbulence = style.shorelineTurbulence;
+    foam.density = style.shorelineDensity;
+    foam.phase = style.shorelinePhase;
+    foam.intensity = style.shorelineIntensity;
+    foam.emissionAdd = style.shorelineEmissionAdd;
+    foam.opacityAdd = style.shorelineOpacityAdd;
+    foam.opacityMultiply = style.shorelineOpacityMultiply;
+    foam.pointSizeAdd = style.shorelinePointSizeAdd;
+    foam.pointSizeMultiply = style.shorelinePointSizeMultiply;
+    foam.colourMix = style.shorelineColourMix;
+    foam.colour = style.shorelineColour;
+    foam.seed = style.shorelineSeed;
+    return settings;
+}
+
+void ApplyPointCloudShorelineWaveSettings(
+    PointCloudStyleState* style,
+    const PointCloudShorelineWaveSettings& settings) {
+    if (style == nullptr) {
+        return;
+    }
+    style->shorelineWaveEnabled = settings.enabled;
+    style->shorelineWaveAlgorithm = settings.algorithm;
+    style->shorelineHeightFoam = settings.heightFoam;
+    const auto& foam = settings.foamFronts;
+    style->shorelineBoundaryZ = foam.boundaryZ;
+    style->shorelineHeightReachMeters = foam.heightReachMeters;
+    style->shorelineEdgeFadeMeters = foam.edgeFadeMeters;
+    style->shorelineDirectionX = foam.directionX;
+    style->shorelineDirectionY = foam.directionY;
+    style->shorelinePatternScale = foam.patternScale;
+    style->shorelineWavelengthMeters = foam.wavelengthMeters;
+    style->shorelineSpeed = foam.speed;
+    style->shorelineWarp = foam.warp;
+    style->shorelineTurbulence = foam.turbulence;
+    style->shorelineDensity = foam.density;
+    style->shorelinePhase = foam.phase;
+    style->shorelineIntensity = foam.intensity;
+    style->shorelineEmissionAdd = foam.emissionAdd;
+    style->shorelineOpacityAdd = foam.opacityAdd;
+    style->shorelineOpacityMultiply = foam.opacityMultiply;
+    style->shorelinePointSizeAdd = foam.pointSizeAdd;
+    style->shorelinePointSizeMultiply = foam.pointSizeMultiply;
+    style->shorelineColourMix = foam.colourMix;
+    style->shorelineColour = foam.colour;
+    style->shorelineSeed = foam.seed;
+}
+
+PointCloudShorelineWaveSettings CalmPointCloudShorelineWaveSettings() {
+    PointCloudShorelineWaveSettings settings;
+    settings.enabled = true;
+    settings.algorithm = PointCloudShorelineWaveAlgorithm::FoamFronts;
+    auto& foam = settings.foamFronts;
+    foam.boundaryZ = 1.595F;
+    foam.heightReachMeters = 2.0F;
+    foam.edgeFadeMeters = 0.117F;
+    constexpr float kDirectionRadians = 81.0F * 3.14159265358979323846F / 180.0F;
+    foam.directionX = std::cos(kDirectionRadians);
+    foam.directionY = std::sin(kDirectionRadians);
+    foam.wavelengthMeters = 0.10F;
+    foam.patternScale = 0.33F;
+    foam.speed = 0.55F;
+    foam.warp = 1.05F;
+    foam.turbulence = 0.64F;
+    foam.density = 1.0F;
+    foam.intensity = 0.97F;
+    foam.emissionAdd = 0.65F;
+    foam.opacityAdd = 0.08F;
+    foam.opacityMultiply = 1.25F;
+    foam.pointSizeAdd = 0.0F;
+    foam.pointSizeMultiply = 1.35F;
+    foam.colourMix = 0.75F;
+    foam.colour = {
+        158.0F / 255.0F,
+        224.0F / 255.0F,
+        1.0F,
+    };
+    return settings;
+}
+
 bool PointCloudAlphaContributesDepth(float alpha) {
     return alpha > kMaterialEpsilon;
 }
@@ -504,26 +600,20 @@ WaterFlowActivityScales ResolveWaterFlowActivityScales(
         std::isfinite(effectiveActivity) ? effectiveActivity : 1.0F,
         0.0F,
         1.0F);
-    const float seed = std::clamp(std::isfinite(trailSeed) ? trailSeed : 0.0F, 0.0F, 1.0F);
-    if (scales.activity <= 0.0F) {
-        scales.trailVisibility = 0.0F;
-    } else if (scales.activity >= 1.0F) {
-        scales.trailVisibility = 1.0F;
-    } else {
-        constexpr float kSoftGateHalfWidth = 0.035F;
-        const float edge0 = seed - kSoftGateHalfWidth;
-        const float edge1 = seed + kSoftGateHalfWidth;
-        const float t = std::clamp(
-            (scales.activity - edge0) / (edge1 - edge0),
-            0.0F,
-            1.0F);
-        scales.trailVisibility = t * t * (3.0F - 2.0F * t);
-    }
+    // Every sample in a trail shares one seed, so using that seed as an
+    // activity threshold switches whole trails on and off while a keyed value
+    // crosses it. Fade the settled population uniformly instead: the routes
+    // and their deterministic seed variation remain stable at every strength.
+    (void)trailSeed;
+    scales.trailVisibility = scales.activity;
     scales.appearance = 0.30F + 0.70F * scales.activity;
     scales.width = 0.65F + 0.35F * scales.activity;
-    scales.speed = 0.60F + 0.40F * scales.activity;
+    // Travel phase is derived from absolute render time. Modulating its speed
+    // with a keyed strength would therefore jump the phase whenever strength
+    // changes. Trail Speed remains the sole motion-speed control.
+    scales.speed = 1.0F;
     scales.visibleLength = 0.55F + 0.45F * scales.activity;
-    scales.lateralMotion = 0.15F * scales.activity;
+    scales.lateralMotion = 0.15F;
     return scales;
 }
 

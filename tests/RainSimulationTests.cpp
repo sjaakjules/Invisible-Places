@@ -2651,6 +2651,39 @@ TEST_CASE(
     CHECK(blended < wetRing);
 }
 
+TEST_CASE(
+    "SAND rain ring thickness scales its edge without moving the front",
+    "[water][rain][effects][sand]") {
+    const invisible_places::water::RainImpactEvent event{
+        .position = {0.0F, 0.0F, 0.0F},
+        .birthTimeSeconds = 0.0F,
+        .normal = {0.0F, 0.0F, 1.0F},
+        .radiusMeters = 0.10F,
+        .role = WaterSurfaceRole::Sand,
+        .lifetimeSeconds = 1.0F,
+        .energy = 1.0F,
+        .seed = 11U,
+    };
+    constexpr float time = 0.50F;
+    constexpr float ringRadius = 0.10F * (0.12F + 0.88F * time);
+    const invisible_places::water::RainRingImpactSettings legacy{1.0F};
+    const invisible_places::water::RainRingImpactSettings half{0.5F};
+    const auto legacyPeak =
+        invisible_places::water::EvaluateSandRainImpactValue(
+            event, {ringRadius, 0.0F, 0.0F}, time, 1.0F, legacy);
+    const auto halfPeak =
+        invisible_places::water::EvaluateSandRainImpactValue(
+            event, {ringRadius, 0.0F, 0.0F}, time, 1.0F, half);
+    const auto legacyEdge =
+        invisible_places::water::EvaluateSandRainImpactValue(
+            event, {ringRadius + 0.010F, 0.0F, 0.0F}, time, 1.0F, legacy);
+    const auto halfEdge =
+        invisible_places::water::EvaluateSandRainImpactValue(
+            event, {ringRadius + 0.010F, 0.0F, 0.0F}, time, 1.0F, half);
+    CHECK(halfPeak == Catch::Approx(legacyPeak).margin(1.0e-6F));
+    CHECK(halfEdge < legacyEdge * 0.35F);
+}
+
 TEST_CASE("rock rain impact uses the reduced slow-growing footprint", "[water][rain][effects]") {
     constexpr float radius = 0.12F;
     const float effectiveRadius = radius * std::sqrt(2.0F / 3.0F);
@@ -3472,6 +3505,117 @@ TEST_CASE(
     CHECK(dropletsMaximum > 0.0F);
     CHECK(vegetationRingsMaximum == Catch::Approx(0.0F));
     CHECK(vegetationWetnessMaximum == Catch::Approx(0.0F));
+}
+
+TEST_CASE(
+    "rain response scales follow effect models instead of impact roles",
+    "[water][rain][effects][response]") {
+    using invisible_places::water::kRainImpactEffectDropletsBit;
+    using invisible_places::water::kRainImpactEffectRingsBit;
+    using invisible_places::water::kRainImpactEffectWetnessBit;
+    const std::vector<invisible_places::water::RainImpactEvent> events{
+        {.position = {0.0F, 0.0F, 0.0F},
+         .birthTimeSeconds = 0.0F,
+         .normal = {0.0F, 0.0F, 1.0F},
+         .radiusMeters = 0.12F,
+         .role = WaterSurfaceRole::Rock,
+         .lifetimeSeconds = 4.76F,
+         .secondaryLifetimeSeconds = 0.624F,
+         .energy = 1.0F,
+         .seed = 21U},
+        {.position = {0.8F, 0.0F, 0.0F},
+         .birthTimeSeconds = 0.0F,
+         .normal = {0.0F, 0.0F, 1.0F},
+         .radiusMeters = 0.10F,
+         .role = WaterSurfaceRole::Sand,
+         .lifetimeSeconds = 0.624F,
+         .secondaryLifetimeSeconds = 4.76F,
+         .energy = 1.0F,
+         .seed = 33U},
+        {.position = {-0.8F, 0.0F, 0.0F},
+         .birthTimeSeconds = 0.0F,
+         .normal = {0.0F, 0.0F, 1.0F},
+         .radiusMeters = 0.065F,
+         .role = WaterSurfaceRole::Vegetation,
+         .lifetimeSeconds = 2.0F,
+         .energy = 1.0F,
+         .seed = 0x5A17U},
+    };
+    constexpr float time = 0.30F;
+    const auto build = [&](float rings, float wetness, float droplets) {
+        return invisible_places::water::BuildRainImpactGrid(
+            events,
+            {},
+            time,
+            4.0F,
+            {},
+            {},
+            {},
+            rings,
+            wetness,
+            droplets);
+    };
+    const auto baseline = build(1.0F, 1.0F, 1.0F);
+    const auto ringsOff = build(0.0F, 1.0F, 1.0F);
+    const auto ringsDouble = build(2.0F, 1.0F, 1.0F);
+    const auto wetnessOff = build(1.0F, 0.0F, 1.0F);
+    const auto dropletsOff = build(1.0F, 1.0F, 0.0F);
+    const Float3 normal{0.0F, 0.0F, 1.0F};
+    const std::array<Float3, 2> ringProbes{{
+        {0.0652F, 0.0F, 0.0F},
+        {0.8542F, 0.0F, 0.0F},
+    }};
+    for (const auto& probe : ringProbes) {
+        const auto base = invisible_places::water::EvaluateRainImpact(
+            baseline, kRainImpactEffectRingsBit, probe, normal, time);
+        const auto off = invisible_places::water::EvaluateRainImpact(
+            ringsOff, kRainImpactEffectRingsBit, probe, normal, time);
+        const auto doubled = invisible_places::water::EvaluateRainImpact(
+            ringsDouble, kRainImpactEffectRingsBit, probe, normal, time);
+        REQUIRE(base.opacity > 0.01F);
+        CHECK(off.opacity == Catch::Approx(0.0F));
+        CHECK(doubled.opacity == Catch::Approx(base.opacity * 2.0F).margin(1.0e-5F));
+    }
+    for (const Float3 probe : {Float3{0.0F, 0.0F, 0.0F},
+                              Float3{0.8F, 0.0F, 0.0F}}) {
+        const auto base = invisible_places::water::EvaluateRainImpact(
+            baseline, kRainImpactEffectWetnessBit, probe, normal, time);
+        const auto off = invisible_places::water::EvaluateRainImpact(
+            wetnessOff, kRainImpactEffectWetnessBit, probe, normal, time);
+        REQUIRE(base.opacity > 0.01F);
+        CHECK(off.opacity == Catch::Approx(0.0F));
+    }
+
+    float baselineDroplets = 0.0F;
+    float disabledDroplets = 0.0F;
+    for (int y = -18; y <= 18; ++y) {
+        for (int x = -18; x <= 18; ++x) {
+            const Float3 probe{
+                -0.8F + static_cast<float>(x) * 0.004F,
+                static_cast<float>(y) * 0.004F,
+                -0.02F};
+            baselineDroplets = std::max(
+                baselineDroplets,
+                invisible_places::water::EvaluateRainImpact(
+                    baseline,
+                    kRainImpactEffectDropletsBit,
+                    probe,
+                    normal,
+                    time)
+                    .emission);
+            disabledDroplets = std::max(
+                disabledDroplets,
+                invisible_places::water::EvaluateRainImpact(
+                    dropletsOff,
+                    kRainImpactEffectDropletsBit,
+                    probe,
+                    normal,
+                    time)
+                    .emission);
+        }
+    }
+    CHECK(baselineDroplets > 0.0F);
+    CHECK(disabledDroplets == Catch::Approx(0.0F));
 }
 
 TEST_CASE(

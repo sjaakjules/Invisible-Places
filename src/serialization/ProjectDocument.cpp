@@ -38,6 +38,7 @@ using invisible_places::renderer::pointcloud::PointCloudColorMode;
 using invisible_places::renderer::pointcloud::PointCloudColormapId;
 using invisible_places::renderer::pointcloud::PointCloudFalloffProfile;
 using invisible_places::renderer::pointcloud::PointCloudGeometryMode;
+using invisible_places::renderer::pointcloud::PointCloudFoamFrontsShorelineSettings;
 using invisible_places::renderer::pointcloud::PointCloudHeightFoamShorelineSettings;
 using invisible_places::renderer::pointcloud::PointCloudNprPreset;
 using invisible_places::renderer::pointcloud::PointCloudPreviewLodMode;
@@ -46,6 +47,8 @@ using invisible_places::renderer::pointcloud::PointCloudScreenSpriteSizeMode;
 using invisible_places::renderer::pointcloud::PointCloudStyleState;
 using invisible_places::renderer::pointcloud::PointCloudStylisationMode;
 using invisible_places::renderer::pointcloud::PointCloudShorelineWaveAlgorithm;
+using invisible_places::renderer::pointcloud::PointCloudShorelineWaveProfile;
+using invisible_places::renderer::pointcloud::PointCloudShorelineWaveSettings;
 using invisible_places::style::FieldMapConfig;
 using invisible_places::style::ParameterSourceMode;
 using invisible_places::style::RenderParameterBinding;
@@ -723,6 +726,161 @@ PointCloudHeightFoamShorelineSettings ParseHeightFoamShorelineSettings(const jso
         settings.edgeFadeMeters,
         settings.breakZ);
     return settings;
+}
+
+json SerializeFoamFrontsShorelineSettings(
+    const PointCloudFoamFrontsShorelineSettings& settings) {
+    return json{
+        {"boundary_z", settings.boundaryZ},
+        {"height_reach_meters", settings.heightReachMeters},
+        {"edge_fade_meters", settings.edgeFadeMeters},
+        {"direction", std::array<float, 2>{settings.directionX, settings.directionY}},
+        {"pattern_scale", settings.patternScale},
+        {"wavelength_meters", settings.wavelengthMeters},
+        {"speed", settings.speed},
+        {"warp", settings.warp},
+        {"turbulence", settings.turbulence},
+        {"density", settings.density},
+        {"phase", settings.phase},
+        {"intensity", settings.intensity},
+        {"emission_add", settings.emissionAdd},
+        {"opacity_add", settings.opacityAdd},
+        {"opacity_multiply", settings.opacityMultiply},
+        {"point_size_add", settings.pointSizeAdd},
+        {"point_size_multiply", settings.pointSizeMultiply},
+        {"colour_mix", settings.colourMix},
+        {"colour", settings.colour},
+        {"seed", settings.seed},
+    };
+}
+
+PointCloudFoamFrontsShorelineSettings ParseFoamFrontsShorelineSettings(
+    const json& settingsJson) {
+    PointCloudFoamFrontsShorelineSettings settings;
+    settings.boundaryZ = std::clamp(
+        settingsJson.value("boundary_z", settings.boundaryZ),
+        -1000.0F,
+        1000.0F);
+    settings.heightReachMeters = std::clamp(
+        settingsJson.value("height_reach_meters", settings.heightReachMeters),
+        0.001F,
+        50.0F);
+    settings.edgeFadeMeters = std::clamp(
+        settingsJson.value("edge_fade_meters", settings.edgeFadeMeters),
+        0.0F,
+        10.0F);
+    if (settingsJson.contains("direction")) {
+        const auto direction =
+            settingsJson.at("direction").get<std::array<float, 2>>();
+        settings.directionX = direction[0];
+        settings.directionY = direction[1];
+    }
+    settings.patternScale = std::clamp(
+        settingsJson.value("pattern_scale", settings.patternScale),
+        0.01F,
+        50.0F);
+    settings.wavelengthMeters = std::clamp(
+        settingsJson.value("wavelength_meters", settings.wavelengthMeters),
+        0.002F,
+        10.0F);
+    settings.speed =
+        std::clamp(settingsJson.value("speed", settings.speed), 0.0F, 10.0F);
+    settings.warp =
+        std::clamp(settingsJson.value("warp", settings.warp), 0.0F, 3.0F);
+    settings.turbulence = std::clamp(
+        settingsJson.value("turbulence", settings.turbulence),
+        0.0F,
+        1.0F);
+    settings.density = std::clamp(
+        settingsJson.value("density", settings.density),
+        0.0F,
+        1.0F);
+    settings.phase = settingsJson.value("phase", settings.phase);
+    settings.intensity = std::clamp(
+        settingsJson.value("intensity", settings.intensity),
+        0.0F,
+        5.0F);
+    settings.emissionAdd = std::clamp(
+        settingsJson.value("emission_add", settings.emissionAdd),
+        0.0F,
+        8.0F);
+    settings.opacityAdd = std::clamp(
+        settingsJson.value("opacity_add", settings.opacityAdd),
+        -1.0F,
+        2.0F);
+    settings.opacityMultiply = std::clamp(
+        settingsJson.value("opacity_multiply", settings.opacityMultiply),
+        0.0F,
+        8.0F);
+    settings.pointSizeAdd = std::clamp(
+        settingsJson.value("point_size_add", settings.pointSizeAdd),
+        -256.0F,
+        512.0F);
+    settings.pointSizeMultiply = std::clamp(
+        settingsJson.value("point_size_multiply", settings.pointSizeMultiply),
+        0.0F,
+        8.0F);
+    settings.colourMix = std::clamp(
+        settingsJson.value("colour_mix", settings.colourMix),
+        0.0F,
+        1.0F);
+    if (settingsJson.contains("colour")) {
+        settings.colour =
+            settingsJson.at("colour").get<std::array<float, 3>>();
+        for (auto& channel : settings.colour) {
+            channel = std::clamp(channel, 0.0F, 1.0F);
+        }
+    }
+    settings.seed = settingsJson.value("seed", settings.seed);
+    return settings;
+}
+
+json SerializePointCloudShorelineWaveSettings(
+    const PointCloudShorelineWaveSettings& settings) {
+    return json{
+        {"enabled", settings.enabled},
+        {"algorithm", PointCloudShorelineWaveAlgorithmName(settings.algorithm)},
+        {"foam_fronts", SerializeFoamFrontsShorelineSettings(settings.foamFronts)},
+        {"height_foam", SerializeHeightFoamShorelineSettings(settings.heightFoam)},
+    };
+}
+
+PointCloudShorelineWaveSettings ParsePointCloudShorelineWaveSettings(
+    const json& settingsJson) {
+    PointCloudShorelineWaveSettings settings;
+    settings.enabled = settingsJson.value("enabled", settings.enabled);
+    if (settingsJson.contains("algorithm")) {
+        settings.algorithm =
+            ParsePointCloudShorelineWaveAlgorithm(settingsJson.at("algorithm"));
+    }
+    if (settingsJson.contains("foam_fronts")) {
+        settings.foamFronts =
+            ParseFoamFrontsShorelineSettings(settingsJson.at("foam_fronts"));
+    }
+    if (settingsJson.contains("height_foam")) {
+        settings.heightFoam =
+            ParseHeightFoamShorelineSettings(settingsJson.at("height_foam"));
+    }
+    return settings;
+}
+
+json SerializePointCloudShorelineWaveProfile(
+    const PointCloudShorelineWaveProfile& profile) {
+    return json{
+        {"name", profile.name},
+        {"settings", SerializePointCloudShorelineWaveSettings(profile.settings)},
+    };
+}
+
+PointCloudShorelineWaveProfile ParsePointCloudShorelineWaveProfile(
+    const json& profileJson) {
+    PointCloudShorelineWaveProfile profile;
+    profile.name = profileJson.value("name", profile.name);
+    if (profileJson.contains("settings")) {
+        profile.settings =
+            ParsePointCloudShorelineWaveSettings(profileJson.at("settings"));
+    }
+    return profile;
 }
 
 const char* SerializedLayerKindName(SerializedLayerKind kind) {
@@ -4880,7 +5038,8 @@ json SerializeWaterRainSettings(
           {"band_max_z", settings.vegetationImpactBand.maxZ},
           {"band_fade_meters", settings.vegetationImpactBand.fadeMeters}}},
         {"sand_impact",
-         {{"band_min_z", settings.sandImpactBand.minZ},
+         {{"ring_thickness_scale", settings.ringImpact.thicknessScale},
+          {"band_min_z", settings.sandImpactBand.minZ},
           {"band_max_z", settings.sandImpactBand.maxZ},
           {"band_fade_meters", settings.sandImpactBand.fadeMeters}}},
         {"visual_profile",
@@ -5018,6 +5177,12 @@ RainRuntimeSettings ParseWaterRainSettings(const json& settingsJson) {
     if (version >= 3 && settingsJson.contains("sand_impact") &&
         settingsJson.at("sand_impact").is_object()) {
         const auto& tuning = settingsJson.at("sand_impact");
+        settings.ringImpact.thicknessScale = std::clamp(
+            tuning.value(
+                "ring_thickness_scale",
+                settings.ringImpact.thicknessScale),
+            0.25F,
+            2.0F);
         settings.sandImpactBand = invisible_places::water::SanitizeRainImpactHeightBand({
             tuning.value("band_min_z", settings.sandImpactBand.minZ),
             tuning.value("band_max_z", settings.sandImpactBand.maxZ),
@@ -6582,6 +6747,9 @@ bool SaveProjectDocument(
         {"selected_water_trail_profile", document.selectedWaterTrailProfileName},
         {"water_caustic_look_settings", SerializeWaterCausticLookSettings(document.waterCausticLookSettings)},
         {"water_seepage_nodes", json::array()},
+        {"water_shoreline_profiles", json::array()},
+        {"selected_water_shoreline_profile",
+         document.selectedWaterShorelineProfileName},
         {"water_seepage_default_look", SerializeWaterSeepageLookSettings(document.waterSeepageDefaultLook)},
         {"water_seepage_look_profiles", json::array()},
         {"water_seepage_response_profiles", json::array()},
@@ -6620,6 +6788,11 @@ bool SaveProjectDocument(
     if (document.tempExportPreset.has_value()) {
         projectJson["temp_export_preset"] = SerializeExportPreset(document.tempExportPreset.value());
     }
+    if (document.waterShorelineDefaultSettings.has_value()) {
+        projectJson["water_shoreline_default_settings"] =
+            SerializePointCloudShorelineWaveSettings(
+                document.waterShorelineDefaultSettings.value());
+    }
     if (!document.waterSceneStates.empty()) {
         for (const auto& state : document.waterSceneStates) {
             auto preparedState = PrepareWaterSceneStateForSave(document, state, outputPath);
@@ -6651,6 +6824,10 @@ bool SaveProjectDocument(
     }
     for (const auto& node : document.waterSeepageNodes) {
         projectJson["water_seepage_nodes"].push_back(SerializeWaterSeepageNode(node));
+    }
+    for (const auto& profile : document.waterShorelineProfiles) {
+        projectJson["water_shoreline_profiles"].push_back(
+            SerializePointCloudShorelineWaveProfile(profile));
     }
     for (const auto& profile : document.waterSeepageLookProfiles) {
         projectJson["water_seepage_look_profiles"].push_back(
@@ -6829,6 +7006,22 @@ std::optional<ProjectDocument> LoadProjectDocument(
         document.waterCausticLookSettings =
             ParseWaterCausticLookSettings(projectJson->at("water_caustic_look_settings"));
     }
+    if (projectJson->contains("water_shoreline_default_settings")) {
+        document.waterShorelineDefaultSettings =
+            ParsePointCloudShorelineWaveSettings(
+                projectJson->at("water_shoreline_default_settings"));
+    }
+    if (projectJson->contains("water_shoreline_profiles") &&
+        projectJson->at("water_shoreline_profiles").is_array()) {
+        for (const auto& profileJson :
+             projectJson->at("water_shoreline_profiles")) {
+            document.waterShorelineProfiles.push_back(
+                ParsePointCloudShorelineWaveProfile(profileJson));
+        }
+    }
+    document.selectedWaterShorelineProfileName = projectJson->value(
+        "selected_water_shoreline_profile",
+        document.selectedWaterShorelineProfileName);
     if (projectJson->contains("water_seepage_default_look")) {
         document.waterSeepageDefaultLook =
             ParseWaterSeepageLookSettings(projectJson->at("water_seepage_default_look"));
@@ -7267,6 +7460,9 @@ bool SaveWaterSourcesDocument(
         {"water_emitters", json::array()},
         {"water_manual_flow_paths", json::array()},
         {"water_seepage_nodes", json::array()},
+        {"water_shoreline_profiles", json::array()},
+        {"selected_water_shoreline_profile",
+         document.selectedShorelineProfileName},
         {"water_seepage_default_look", SerializeWaterSeepageLookSettings(document.seepageDefaultLook)},
         {"water_seepage_look_profiles", json::array()},
         {"water_seepage_response_profiles", json::array()},
@@ -7277,6 +7473,11 @@ bool SaveWaterSourcesDocument(
     if (document.tempSourceSettings.has_value()) {
         sourcesJson["temp_water_source_settings"] =
             SerializeWaterSourceSettings(document.tempSourceSettings.value());
+    }
+    if (document.shorelineDefaultSettings.has_value()) {
+        sourcesJson["water_shoreline_default_settings"] =
+            SerializePointCloudShorelineWaveSettings(
+                document.shorelineDefaultSettings.value());
     }
     if (document.tempCausticLookSettings.has_value()) {
         sourcesJson["temp_water_caustic_look_settings"] =
@@ -7311,6 +7512,10 @@ bool SaveWaterSourcesDocument(
     }
     for (const auto& node : document.seepageNodes) {
         sourcesJson["water_seepage_nodes"].push_back(SerializeWaterSeepageNode(node));
+    }
+    for (const auto& profile : document.shorelineProfiles) {
+        sourcesJson["water_shoreline_profiles"].push_back(
+            SerializePointCloudShorelineWaveProfile(profile));
     }
     for (const auto& profile : document.seepageLookProfiles) {
         sourcesJson["water_seepage_look_profiles"].push_back(
@@ -7364,6 +7569,22 @@ std::optional<WaterSourcesDocument> LoadWaterSourcesDocument(
         document.causticLookSettings =
             ParseWaterCausticLookSettings(sourcesJson->at("water_caustic_look_settings"));
     }
+    if (sourcesJson->contains("water_shoreline_default_settings")) {
+        document.shorelineDefaultSettings =
+            ParsePointCloudShorelineWaveSettings(
+                sourcesJson->at("water_shoreline_default_settings"));
+    }
+    if (sourcesJson->contains("water_shoreline_profiles") &&
+        sourcesJson->at("water_shoreline_profiles").is_array()) {
+        for (const auto& profileJson :
+             sourcesJson->at("water_shoreline_profiles")) {
+            document.shorelineProfiles.push_back(
+                ParsePointCloudShorelineWaveProfile(profileJson));
+        }
+    }
+    document.selectedShorelineProfileName = sourcesJson->value(
+        "selected_water_shoreline_profile",
+        document.selectedShorelineProfileName);
     if (sourcesJson->contains("water_seepage_default_look")) {
         document.seepageDefaultLook =
             ParseWaterSeepageLookSettings(sourcesJson->at("water_seepage_default_look"));

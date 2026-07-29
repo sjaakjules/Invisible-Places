@@ -122,6 +122,47 @@ struct PointCloudHeightFoamShorelineSettings {
     std::uint32_t seed = 1U;
 };
 
+// A profile-sized copy of the legacy Foam Fronts fields that remain flattened
+// on PointCloudStyleState for shader/persistence compatibility. Keeping this
+// bank separate lets named Shoreline profiles preserve both algorithms while
+// changing only the water settings on an existing point visual.
+struct PointCloudFoamFrontsShorelineSettings {
+    float boundaryZ = 1.55F;
+    float heightReachMeters = 0.45F;
+    float edgeFadeMeters = 0.05F;
+    float directionX = 1.0F;
+    float directionY = 0.0F;
+    float patternScale = 1.0F;
+    float wavelengthMeters = 0.25F;
+    float speed = 0.55F;
+    float warp = 0.35F;
+    float turbulence = 0.06F;
+    float density = 0.55F;
+    float phase = 0.0F;
+    float intensity = 1.15F;
+    float emissionAdd = 0.65F;
+    float opacityAdd = 0.08F;
+    float opacityMultiply = 1.25F;
+    float pointSizeAdd = 0.0F;
+    float pointSizeMultiply = 1.35F;
+    float colourMix = 0.75F;
+    std::array<float, 3> colour{0.62F, 0.88F, 1.0F};
+    std::uint32_t seed = 1U;
+};
+
+struct PointCloudShorelineWaveSettings {
+    bool enabled = false;
+    PointCloudShorelineWaveAlgorithm algorithm =
+        PointCloudShorelineWaveAlgorithm::FoamFronts;
+    PointCloudFoamFrontsShorelineSettings foamFronts{};
+    PointCloudHeightFoamShorelineSettings heightFoam{};
+};
+
+struct PointCloudShorelineWaveProfile {
+    std::string name = "Default";
+    PointCloudShorelineWaveSettings settings{};
+};
+
 struct PointCloudDensityCompensation {
     float footprintScale = 1.0F;
     float coverageCorrection = 1.0F;
@@ -129,9 +170,11 @@ struct PointCloudDensityCompensation {
 
 struct WaterFlowActivityScales {
     float activity = 1.0F;
+    // A continuous whole-population fade; trail seeds never threshold it.
     float trailVisibility = 1.0F;
     float appearance = 1.0F;
     float width = 1.0F;
+    // Motion stays independent of strength because phase uses absolute time.
     float speed = 1.0F;
     float visibleLength = 1.0F;
     float lateralMotion = 0.15F;
@@ -277,6 +320,12 @@ std::uint64_t ClampPointBudget(std::uint64_t totalPoints, std::uint64_t requeste
     PointCloudStyleState style,
     std::string_view sceneRole);
 [[nodiscard]] bool PointCloudStyleHasActiveShorelineWaves(const PointCloudStyleState& style);
+[[nodiscard]] PointCloudShorelineWaveSettings ExtractPointCloudShorelineWaveSettings(
+    const PointCloudStyleState& style);
+void ApplyPointCloudShorelineWaveSettings(
+    PointCloudStyleState* style,
+    const PointCloudShorelineWaveSettings& settings);
+[[nodiscard]] PointCloudShorelineWaveSettings CalmPointCloudShorelineWaveSettings();
 // True when an authored shoreline still defines a flooded/dry spatial region,
 // even if its animation speed is paused. Rain uses this predicate so viewport
 // and offline SAND impacts agree at a held shoreline frame.

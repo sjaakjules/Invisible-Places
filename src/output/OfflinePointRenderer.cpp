@@ -492,6 +492,9 @@ float WaterTrailTravelPhase(
     const auto activity = invisible_places::renderer::pointcloud::ResolveWaterFlowActivityScales(
         style.waterFlowActivity,
         ScalarFieldValueBySlot(cloud, kWaterTrailSeedFieldSlot, pointIndex));
+    // Strength fades the settled trail population but must not alter this
+    // absolute-time phase. The authored runtime speed scale is the only live
+    // velocity control, matching all three point vertex shaders.
     const float speed =
         std::max(0.0F, ScalarFieldValueBySlot(cloud, kWaterTrailSpeedFieldSlot, pointIndex)) *
         activity.speed *
@@ -2359,7 +2362,11 @@ void AdvanceOfflineRainFrame(
                               timeSeconds,
                               invisible_places::water::RainImpactGridWorldSpan(settings),
                               settings.rockImpact,
-                              settings.vegetationImpact)
+                              settings.vegetationImpact,
+                              settings.ringImpact,
+                              settings.sandEffectScale,
+                              settings.rockEffectScale,
+                              settings.vegetationEffectScale)
                             : invisible_places::water::RainImpactGrid{};
     state->frame = {
         .settings = settings,

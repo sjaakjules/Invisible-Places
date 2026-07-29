@@ -19,8 +19,8 @@
 namespace invisible_places::serialization {
 
 inline constexpr std::size_t kMaxSerializedWaterRippleRuntimeCacheMemberships = 250'000U;
-inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 47U;
-inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 19U;
+inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 48U;
+inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 20U;
 inline constexpr std::uint32_t kAnimationDocumentSchemaVersion = 13U;
 inline constexpr std::uint32_t kWaterPathCacheSidecarSchemaVersion = 1U;
 inline constexpr std::uint64_t kMaximumPersistedWaterCacheBytes = 5ULL * 1024ULL * 1024ULL * 1024ULL;
@@ -182,6 +182,11 @@ struct ProjectDocument {
     std::vector<invisible_places::water::WaterEmitter> waterEmitters;
     std::vector<invisible_places::water::WaterManualFlowPathSource> waterManualFlowPaths;
     std::vector<invisible_places::water::WaterSeepageNode> waterSeepageNodes;
+    std::optional<invisible_places::renderer::pointcloud::PointCloudShorelineWaveSettings>
+        waterShorelineDefaultSettings;
+    std::vector<invisible_places::renderer::pointcloud::PointCloudShorelineWaveProfile>
+        waterShorelineProfiles;
+    std::string selectedWaterShorelineProfileName = "Default";
     invisible_places::water::WaterSeepageLookSettings waterSeepageDefaultLook{};
     std::vector<invisible_places::water::WaterSeepageLookProfile> waterSeepageLookProfiles;
     std::vector<invisible_places::water::WaterSeepageResponseProfile>
@@ -251,6 +256,11 @@ struct WaterSourcesDocument {
     std::vector<invisible_places::water::WaterEmitter> emitters;
     std::vector<invisible_places::water::WaterManualFlowPathSource> manualFlowPaths;
     std::vector<invisible_places::water::WaterSeepageNode> seepageNodes;
+    std::optional<invisible_places::renderer::pointcloud::PointCloudShorelineWaveSettings>
+        shorelineDefaultSettings;
+    std::vector<invisible_places::renderer::pointcloud::PointCloudShorelineWaveProfile>
+        shorelineProfiles;
+    std::string selectedShorelineProfileName = "Default";
     invisible_places::water::WaterSeepageLookSettings seepageDefaultLook{};
     std::vector<invisible_places::water::WaterSeepageLookProfile> seepageLookProfiles;
     std::vector<invisible_places::water::WaterSeepageResponseProfile>

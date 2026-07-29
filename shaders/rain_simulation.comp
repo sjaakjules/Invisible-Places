@@ -339,8 +339,6 @@ void EmitImpact(vec3 position, vec3 normal, uint role, RainParticle particle) {
     }
     const float impactSpeed = max(0.1, length(particle.velocity.xyz));
     const float dropWidth = max(0.0001, rain.visual0.x * rain.visual2.z);
-    float roleScale = role == kRoleSand ? rain.effectScales.x :
-                      (role == kRoleRock ? rain.effectScales.y : rain.effectScales.z);
     float radius = role == kRoleSand
         ? clamp(0.020 + dropWidth * 6.0 + impactSpeed * 0.0015, 0.025, 0.11)
         : (role == kRoleRock
@@ -374,8 +372,11 @@ void EmitImpact(vec3 position, vec3 normal, uint role, RainParticle particle) {
     } else if (role == kRoleSand) {
         secondaryLifetime = rockModelLifetime;
     }
+    // Store only physical drop energy. Per-effect response belongs to the
+    // point shading model, allowing Rings/Wetness/Droplets to respond around
+    // every eligible impact and to update existing events immediately.
     const float energy = clamp(
-        (dropWidth / 0.003) * (impactSpeed / 8.0) * rain.visual2.w * roleScale,
+        (dropWidth / 0.003) * (impactSpeed / 8.0) * rain.visual2.w,
         0.05,
         2.5);
     const uint writeIndex = atomicAdd(counters.eventWriteIndex, 1u) % rain.simulation0.z;

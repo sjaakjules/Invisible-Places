@@ -1518,7 +1518,7 @@ TEST_CASE("Contour Pulses carry visible transient wetness with a dry base",
 }
 
 TEST_CASE(
-    "Contour Pulse animation scrubs deterministically and matches frozen rendering",
+    "Contour Pulse renderer time animates without republishing its reference field",
     "[water][seepage][patterns][contour-pulses][runtime]") {
     WaterSeepageLookSettings look;
     look.pattern = WaterSeepagePattern::ContourPulses;
@@ -1539,6 +1539,9 @@ TEST_CASE(
         invisible_places::water::WaterSeepageTopologyFingerprint(grid);
     const auto paramsBefore =
         invisible_places::water::WaterSeepageParamsFingerprint(grid);
+    const auto preparationBefore =
+        grid.nodes.front().pulseFieldPreparationFingerprint;
+    const auto samplesBefore = grid.nodes.front().pulseField.samples;
     const auto supportReferenceCount = grid.supportReferences.size();
     const auto coarseReferenceCount = grid.nodeReferences.size();
     auto frozenGrid = grid;
@@ -1552,11 +1555,12 @@ TEST_CASE(
     const auto preparationAtTime =
         grid.nodes.front().pulseFieldPreparationFingerprint;
     CHECK(preparationAtTime != 0U);
+    CHECK(preparationAtTime == preparationBefore);
     CHECK(
         invisible_places::water::WaterSeepageTopologyFingerprint(grid) ==
         topologyBefore);
     CHECK(
-        invisible_places::water::WaterSeepageParamsFingerprint(grid) !=
+        invisible_places::water::WaterSeepageParamsFingerprint(grid) ==
         paramsBefore);
     CHECK(grid.supportReferences.size() == supportReferenceCount);
     CHECK(grid.nodeReferences.size() == coarseReferenceCount);
@@ -1569,6 +1573,7 @@ TEST_CASE(
     CHECK(
         grid.nodes.front().pulseField.samples ==
         frozenGrid.nodes.front().pulseField.samples);
+    CHECK(grid.nodes.front().pulseField.samples == samplesBefore);
 
     const auto paramsAtTime =
         invisible_places::water::WaterSeepageParamsFingerprint(grid);
@@ -1583,6 +1588,80 @@ TEST_CASE(
         grid.nodes.front().pulseFieldPreparationFingerprint ==
         preparationAtTime);
     CHECK(grid.nodes.front().pulseField.samples == samplesAtTime);
+
+    float maximumAnimatedDifference = 0.0F;
+    for (int distanceIndex = 1; distanceIndex < 24; ++distanceIndex) {
+        const float downstream =
+            static_cast<float>(distanceIndex) * 0.05F;
+        const invisible_places::io::Float3 point{
+            0.0F,
+            0.0F,
+            -downstream,
+        };
+        const invisible_places::io::Float3 normal{
+            0.0F,
+            1.0F,
+            0.0F,
+        };
+        const auto atStart =
+            invisible_places::water::EvaluateWaterSeepageGridContribution(
+                grid,
+                point,
+                normal,
+                0.0F);
+        const auto later =
+            invisible_places::water::EvaluateWaterSeepageGridContribution(
+                grid,
+                point,
+                normal,
+                0.83F);
+        const auto repeated =
+            invisible_places::water::EvaluateWaterSeepageGridContribution(
+                grid,
+                point,
+                normal,
+                0.83F);
+        const auto frozen =
+            invisible_places::water::EvaluateWaterSeepageGridContribution(
+                frozenGrid,
+                point,
+                normal,
+                0.83F);
+        CHECK(repeated.ripple == Catch::Approx(later.ripple).margin(1.0e-6F));
+        CHECK(frozen.ripple == Catch::Approx(later.ripple).margin(1.0e-6F));
+        maximumAnimatedDifference = std::max(
+            maximumAnimatedDifference,
+            std::abs(later.ripple - atStart.ripple));
+    }
+    CHECK(maximumAnimatedDifference > 1.0e-3F);
+
+    // A clock-only preparation request remains a complete no-op.
+    invisible_places::water::PrepareWaterSeepagePulseFields(
+        &grid,
+        127.0F);
+    CHECK(
+        invisible_places::water::WaterSeepageParamsFingerprint(grid) ==
+        paramsAtTime);
+    CHECK(
+        grid.nodes.front().pulseFieldPreparationFingerprint ==
+        preparationAtTime);
+    CHECK(grid.nodes.front().pulseField.samples == samplesAtTime);
+
+    // Motion controls are consumed directly by the CPU/GPU sampler. They
+    // update the compact look record but do not regenerate reference samples.
+    grid.nodes.front().look.pulseSpeedMetersPerSecond += 0.07F;
+    grid.nodes.front().look.pulseSpeedVariation = 0.91F;
+    grid.nodes.front().look.evolution += 0.03F;
+    invisible_places::water::PrepareWaterSeepagePulseFields(
+        &grid,
+        14.0F);
+    CHECK(
+        grid.nodes.front().pulseFieldPreparationFingerprint ==
+        preparationAtTime);
+    CHECK(grid.nodes.front().pulseField.samples == samplesAtTime);
+    CHECK(
+        invisible_places::water::WaterSeepageParamsFingerprint(grid) !=
+        paramsAtTime);
 
     grid.nodes.front().look.pulseWaveCount = 8.25F;
     invisible_places::water::PrepareWaterSeepagePulseFields(

@@ -284,6 +284,7 @@ RainImpactComposite ResolveRainImpactComposite(vec3 point, vec3 pointNormal) {
     const vec4 rockParams0 = styleData.rainImpactRock0;
     const vec4 rockParams1 = styleData.rainImpactRock1;
     const float rockDownhillStretch = styleData.rainImpactSandBand.w;
+    const vec4 responses = max(styleData.rainImpactResponse, vec4(0.0));
 
     float sandWaterMask = 1.0;
     if (ringsBand > 0.0 && HasShorelineWaveEffect()) {
@@ -375,7 +376,8 @@ RainImpactComposite ResolveRainImpactComposite(vec3 point, vec3 pointNormal) {
                     modelLifetime,
                     point,
                     age,
-                    sandWaterMask);
+                    sandWaterMask,
+                    responses.w);
             } else if (role == kRainRoleRock) {
                 value = EvaluateRockRainImpactValue(
                     event.positionBirth.xyz,
@@ -392,7 +394,13 @@ RainImpactComposite ResolveRainImpactComposite(vec3 point, vec3 pointNormal) {
             } else {
                 value = RainVegetationSprinkleValue(event, point, pointNormal, age);
             }
-            value *= event.lifetimeEnergy.y * bandWeight;
+            // Response is per consuming effect, not the event's collision
+            // role. It therefore affects every point and ground-impact role
+            // inside this model's band and updates existing events instantly.
+            const float response =
+                role == kRainRoleSand ? responses.x :
+                (role == kRainRoleRock ? responses.y : responses.z);
+            value *= event.lifetimeEnergy.y * bandWeight * response;
             if (role == kRainRoleRock) {
                 // Preserve the strongest individual contribution while softly
                 // filling overlap. Adding another retained impact therefore

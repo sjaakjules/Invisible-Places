@@ -166,6 +166,8 @@ struct alignas(16) PointCloudStyleGpu {
     // xyz: SAND height band [minZ, maxZ, fadeMeters], w: Wetness downhill
     // stretch.
     glm::vec4 rainImpactSandBand{-1.0e8F, 2.0F, 0.30F, 1.0F};
+    // xyz: Rings/Wetness/Droplets response, w: expanding-ring thickness.
+    glm::vec4 rainImpactResponse{1.0F};
 };
 
 struct alignas(16) RainUniformsGpu {
@@ -320,8 +322,9 @@ struct alignas(16) WaterSeepageNodeParamsGpu {
     // both noise orientation and procedural hashes.
     std::array<glm::vec4, 3> noiseBasis{};
     // x/y: current/transition sample counts, z/w: their stable spans as float
-    // bits. Both fields are rewritten through the existing frame-safe
-    // parameter ring; no topology or descriptor update is needed per frame.
+    // bits. The reference fields change only with authored pulse shape;
+    // renderer time advances their shader lookups, so clock-only frames do
+    // not rewrite this record or touch topology/descriptors.
     glm::uvec4 pulseFieldControl{0U, 0U, 0U, 0U};
     std::array<glm::vec4, kPulseFieldVec4Capacity> pulseField{};
     std::array<glm::vec4, kPulseFieldVec4Capacity> transitionPulseField{};
@@ -14399,6 +14402,17 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         sandBand.fadeMeters,
         std::clamp(renderState_.rainSettings.rockImpact.downhillStretch, 0.0F, 2.0F),
     };
+    styleGpu.rainImpactResponse = glm::vec4{
+        std::max(0.0F, renderState_.rainSettings.sandEffectScale),
+        std::max(0.0F, renderState_.rainSettings.rockEffectScale),
+        std::max(0.0F, renderState_.rainSettings.vegetationEffectScale),
+        std::isfinite(renderState_.rainSettings.ringImpact.thicknessScale)
+            ? std::clamp(
+                  renderState_.rainSettings.ringImpact.thicknessScale,
+                  0.25F,
+                  2.0F)
+            : 1.0F,
+    };
     styleGpu.pointSize = MakePointCloudBindingGpu(
         layer.style.pointSize,
         layer.scalarFields,
@@ -15789,9 +15803,11 @@ void VulkanViewportShell::UploadRainUniformsToBuffer(
         0U,
     };
     uniforms.effectScales = glm::vec4{
-        std::max(0.0F, settings.sandEffectScale),
-        std::max(0.0F, settings.rockEffectScale),
-        std::max(0.0F, settings.vegetationEffectScale),
+        // Response is consumed by the point shaders, not baked into newly
+        // emitted events. Keep the retired lanes neutral for ABI stability.
+        1.0F,
+        1.0F,
+        1.0F,
         // Wetness downhill stretch: the GPU simulator boosts steep rock
         // impact radii by steepness x min(stretch, 1) at spawn.
         std::clamp(settings.rockImpact.downhillStretch, 0.0F, 2.0F),

@@ -181,6 +181,10 @@ using WaterSurfaceRole = invisible_places::water::WaterSurfaceRole;
 using WaterSurfaceSource = invisible_places::water::WaterSurfaceSource;
 using RainRuntimeSettings = invisible_places::water::RainRuntimeSettings;
 using WaterRainVisualSettings = invisible_places::water::WaterRainVisualSettings;
+using PointCloudShorelineWaveProfile =
+    invisible_places::renderer::pointcloud::PointCloudShorelineWaveProfile;
+using PointCloudShorelineWaveSettings =
+    invisible_places::renderer::pointcloud::PointCloudShorelineWaveSettings;
 using WaterSeepageLookProfile = invisible_places::water::WaterSeepageLookProfile;
 using WaterSeepageLookSettings = invisible_places::water::WaterSeepageLookSettings;
 using WaterSeepageNode = invisible_places::water::WaterSeepageNode;
@@ -1419,6 +1423,12 @@ struct WaterWorkflowState {
     std::vector<WaterEmitter> emitters;
     std::vector<WaterManualFlowPathSource> manualFlowPaths;
     std::vector<WaterSeepageNode> seepageNodes;
+    PointCloudShorelineWaveSettings defaultShorelineSettings{};
+    // Shoreline profiles are authoring snapshots copied into the active point
+    // visual. The point visual remains the renderer/export source of truth.
+    std::vector<PointCloudShorelineWaveProfile> shorelineProfiles;
+    std::string selectedShorelineProfileName = "Default";
+    std::string shorelineProfileNameBuffer = "Default";
     WaterSeepageLookSettings defaultSeepageLook =
         invisible_places::water::DefaultWaterSeepageLookSettings();
     // Two independent named-profile libraries: seepage settings (pattern,
@@ -3577,6 +3587,7 @@ void HashRainRuntime(
         settings.sandEffectScale,
         settings.rockEffectScale,
         settings.vegetationEffectScale,
+        settings.ringImpact.thicknessScale,
         settings.nearSurface.approachDistanceMeters,
         settings.nearSurface.minimumSpeedFactor,
         settings.nearSurface.squish,
@@ -9471,6 +9482,100 @@ void ApplyWaterSeepageSelectionClick(
         return;
     }
     SetWaterSeepageSingleSelection(water, index);
+}
+
+std::string NormalizeWaterShorelineProfileName(std::string_view name) {
+    const auto trimmed = TrimText(name);
+    return trimmed.empty() ? std::string{"Default"} : trimmed;
+}
+
+std::optional<std::size_t> FindWaterShorelineProfileIndex(
+    const WaterWorkflowState& water,
+    std::string_view name) {
+    const auto normalized = NormalizeWaterShorelineProfileName(name);
+    for (std::size_t index = 0; index < water.shorelineProfiles.size(); ++index) {
+        if (NormalizeWaterShorelineProfileName(
+                water.shorelineProfiles[index].name) == normalized) {
+            return index;
+        }
+    }
+    return std::nullopt;
+}
+
+PointCloudShorelineWaveSettings ResolveWaterShorelineProfile(
+    const WaterWorkflowState& water,
+    std::string_view name) {
+    const auto normalized = NormalizeWaterShorelineProfileName(name);
+    if (normalized == "Default") {
+        return water.defaultShorelineSettings;
+    }
+    if (const auto index = FindWaterShorelineProfileIndex(water, normalized);
+        index.has_value()) {
+        return water.shorelineProfiles[index.value()].settings;
+    }
+    return water.defaultShorelineSettings;
+}
+
+std::string ResolveSavedWaterShorelineProfileName(
+    const WaterWorkflowState& water) {
+    const auto assigned = NormalizeWaterShorelineProfileName(
+        water.selectedShorelineProfileName);
+    if (!IsEditedPointVisualName(assigned)) {
+        return assigned == "Default" ||
+                       FindWaterShorelineProfileIndex(water, assigned)
+                           .has_value()
+                   ? assigned
+                   : std::string{"Default"};
+    }
+    const auto base = BasePointVisualName(assigned);
+    if (base == "Default" ||
+        FindWaterShorelineProfileIndex(water, base).has_value()) {
+        return base;
+    }
+    const auto preset = PresetPointVisualName(base);
+    return FindWaterShorelineProfileIndex(water, preset).has_value()
+               ? preset
+               : std::string{"Default"};
+}
+
+std::vector<PointCloudShorelineWaveProfile> WithoutPresetWaterShorelineProfiles(
+    const std::vector<PointCloudShorelineWaveProfile>& profiles) {
+    std::vector<PointCloudShorelineWaveProfile> filtered;
+    filtered.reserve(profiles.size());
+    for (const auto& profile : profiles) {
+        if (!IsPresetPointVisualName(profile.name)) {
+            filtered.push_back(profile);
+        }
+    }
+    return filtered;
+}
+
+void SeedWaterShorelineProfilePresets(WaterWorkflowState* water) {
+    if (water == nullptr) {
+        return;
+    }
+    // Default has dedicated project storage. Treat a same-named library entry
+    // as malformed input so it cannot shadow the editable built-in profile.
+    std::erase_if(
+        water->shorelineProfiles,
+        [](const PointCloudShorelineWaveProfile& profile) {
+            return NormalizeWaterShorelineProfileName(profile.name) ==
+                   "Default";
+        });
+    const std::string presetName = PresetPointVisualName("Calm");
+    const PointCloudShorelineWaveProfile calm{
+        .name = presetName,
+        .settings =
+            invisible_places::renderer::pointcloud::
+                CalmPointCloudShorelineWaveSettings(),
+    };
+    if (const auto existing =
+            FindWaterShorelineProfileIndex(*water, presetName);
+        existing.has_value()) {
+        water->shorelineProfiles[existing.value()] = calm;
+    } else {
+        water->shorelineProfiles.push_back(calm);
+    }
 }
 
 // Keeps both profile name fields following the primary selection's base
@@ -15597,6 +15702,12 @@ void SaveWaterSources(PreviewRuntimeState* runtimeState) {
     document.emitters = runtimeState->water.emitters;
     document.manualFlowPaths = runtimeState->water.manualFlowPaths;
     document.seepageNodes = runtimeState->water.seepageNodes;
+    document.shorelineDefaultSettings =
+        runtimeState->water.defaultShorelineSettings;
+    document.shorelineProfiles = WithoutPresetWaterShorelineProfiles(
+        runtimeState->water.shorelineProfiles);
+    document.selectedShorelineProfileName =
+        runtimeState->water.selectedShorelineProfileName;
     document.seepageDefaultLook = runtimeState->water.defaultSeepageLook;
     document.seepageLookProfiles = WithoutPresetSeepageLookProfiles(
         runtimeState->water.seepageLookProfiles);
@@ -15671,6 +15782,66 @@ void LoadWaterSources(
     runtimeState->water.emitters = document->emitters;
     runtimeState->water.manualFlowPaths = document->manualFlowPaths;
     runtimeState->water.seepageNodes = document->seepageNodes;
+    if (document->shorelineDefaultSettings.has_value()) {
+        runtimeState->water.defaultShorelineSettings =
+            document->shorelineDefaultSettings.value();
+    } else if (const auto visualIndex =
+                   ResolveLoadedPointCloudLookdevIndex(*runtimeState);
+               visualIndex.has_value() &&
+               visualIndex.value() < runtimeState->sessions.size()) {
+        // Legacy water_sources.json has no Shoreline library. Capture the
+        // visible authored settings as Default without touching the cloud.
+        runtimeState->water.defaultShorelineSettings =
+            invisible_places::renderer::pointcloud::
+                ExtractPointCloudShorelineWaveSettings(
+                    runtimeState->sessions[visualIndex.value()].pointStyle);
+    }
+    runtimeState->water.shorelineProfiles =
+        document->shorelineProfiles;
+    SeedWaterShorelineProfilePresets(&runtimeState->water);
+    runtimeState->water.selectedShorelineProfileName =
+        NormalizeWaterShorelineProfileName(
+            document->selectedShorelineProfileName);
+    if (runtimeState->water.selectedShorelineProfileName != "Default" &&
+        !FindWaterShorelineProfileIndex(
+             runtimeState->water,
+             runtimeState->water.selectedShorelineProfileName)
+             .has_value()) {
+        runtimeState->water.selectedShorelineProfileName = "Default";
+    }
+    runtimeState->water.shorelineProfileNameBuffer =
+        BasePointVisualName(
+            runtimeState->water.selectedShorelineProfileName);
+    if (document->shorelineDefaultSettings.has_value()) {
+        // Schema-20 water-source documents own an explicit Shoreline library,
+        // so loading one must also restore its selected profile. Legacy files
+        // have no such metadata and deliberately keep the authored point
+        // visual untouched (captured above as Default for future edits).
+        if (const auto visualIndex =
+                ResolveLoadedPointCloudLookdevIndex(*runtimeState);
+            visualIndex.has_value() &&
+            visualIndex.value() < runtimeState->sessions.size()) {
+            auto& visualSession =
+                runtimeState->sessions[visualIndex.value()];
+            invisible_places::renderer::pointcloud::
+                ApplyPointCloudShorelineWaveSettings(
+                    &visualSession.pointStyle,
+                    ResolveWaterShorelineProfile(
+                        runtimeState->water,
+                        runtimeState->water
+                            .selectedShorelineProfileName));
+            SanitizePointCloudStyle(&visualSession);
+            MarkPointVisualEdited(runtimeState, &visualSession);
+            if (!IsProjectPointVisualSession(visualSession)) {
+                SyncScenePointVisualsFromOwner(
+                    runtimeState,
+                    &visualSession);
+            }
+            SyncWaterPointVisualSelectionFromSession(
+                runtimeState,
+                visualSession);
+        }
+    }
     runtimeState->water.defaultSeepageLook = document->seepageDefaultLook;
     runtimeState->water.seepageLookProfiles = document->seepageLookProfiles;
     runtimeState->water.seepageResponseProfiles = document->seepageResponseProfiles;
@@ -20142,6 +20313,12 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
     document.waterEmitters = runtimeState.water.emitters;
     document.waterManualFlowPaths = runtimeState.water.manualFlowPaths;
     document.waterSeepageNodes = runtimeState.water.seepageNodes;
+    document.waterShorelineDefaultSettings =
+        runtimeState.water.defaultShorelineSettings;
+    document.waterShorelineProfiles = WithoutPresetWaterShorelineProfiles(
+        runtimeState.water.shorelineProfiles);
+    document.selectedWaterShorelineProfileName =
+        runtimeState.water.selectedShorelineProfileName;
     document.waterSeepageDefaultLook = runtimeState.water.defaultSeepageLook;
     document.waterSeepageLookProfiles = WithoutPresetSeepageLookProfiles(
         runtimeState.water.seepageLookProfiles);
@@ -20986,6 +21163,36 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->water.emitters = document.waterEmitters;
     runtimeState->water.manualFlowPaths = document.waterManualFlowPaths;
     runtimeState->water.seepageNodes = document.waterSeepageNodes;
+    if (document.waterShorelineDefaultSettings.has_value()) {
+        runtimeState->water.defaultShorelineSettings =
+            document.waterShorelineDefaultSettings.value();
+    } else if (const auto selectedStyle = ProjectPointVisualStyleByName(
+                   runtimeState->pointVisualLibrary,
+                   runtimeState->pointVisualLibrary.selectedPointVisualName);
+               selectedStyle.has_value()) {
+        // Schema-47 and older projects already persist Shoreline inside the
+        // point visual. Capture it as the editable Default without applying
+        // anything back to the scene, preserving the loaded appearance.
+        runtimeState->water.defaultShorelineSettings =
+            invisible_places::renderer::pointcloud::
+                ExtractPointCloudShorelineWaveSettings(selectedStyle.value());
+    }
+    runtimeState->water.shorelineProfiles =
+        document.waterShorelineProfiles;
+    SeedWaterShorelineProfilePresets(&runtimeState->water);
+    runtimeState->water.selectedShorelineProfileName =
+        NormalizeWaterShorelineProfileName(
+            document.selectedWaterShorelineProfileName);
+    if (runtimeState->water.selectedShorelineProfileName != "Default" &&
+        !FindWaterShorelineProfileIndex(
+             runtimeState->water,
+             runtimeState->water.selectedShorelineProfileName)
+             .has_value()) {
+        runtimeState->water.selectedShorelineProfileName = "Default";
+    }
+    runtimeState->water.shorelineProfileNameBuffer =
+        BasePointVisualName(
+            runtimeState->water.selectedShorelineProfileName);
     runtimeState->water.defaultSeepageLook = document.waterSeepageDefaultLook;
     runtimeState->water.seepageLookProfiles = document.waterSeepageLookProfiles;
     runtimeState->water.seepageResponseProfiles =
@@ -23519,7 +23726,7 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
         }
         invisible_places::water::PrepareWaterSeepagePulseFields(
             &seepageGrid,
-            activeWater.sampleTimeSeconds);
+            0.0F);
         layers.push_back(
             {.cloud = session.offlinePointCloud,
              .style = fastBasicRenderer
@@ -23809,6 +24016,18 @@ std::optional<SavedPointVisualExportSelection> ResolveSavedPointVisualExportSele
         selection.visualName = visualIt->name;
         selection.visualOverride.style = visualIt->style;
     }
+    // Shoreline profiles are saved independently from the point-visual
+    // library. Compose the selected saved profile into the frozen export
+    // override so preview/still/animation output agrees, while an `_edited`
+    // shadow continues to export its saved base just like point visuals do.
+    const auto shorelineProfileName =
+        ResolveSavedWaterShorelineProfileName(runtimeState->water);
+    invisible_places::renderer::pointcloud::
+        ApplyPointCloudShorelineWaveSettings(
+            &selection.visualOverride.style,
+            ResolveWaterShorelineProfile(
+                runtimeState->water,
+                shorelineProfileName));
     if (!session.scalarFields.empty()) {
         ResolveProjectVisualStyleBindingsByFieldName(
             &selection.visualOverride.style,
@@ -27315,7 +27534,6 @@ WaterFrameState ResolveFrozenWaterFrameState(
         result.normalizedTime =
             std::clamp(job.frozenNormalizedTime, 0.0F, 1.0F);
     }
-
     result.rawScenarioState = EvaluateFrozenAnimationWaterScenario(
         job,
         result.sampleTimeSeconds);
@@ -27471,7 +27689,7 @@ void UploadFrozenAnimationSeepageParameters(
             frameState.nodeStates);
         invisible_places::water::PrepareWaterSeepagePulseFields(
             &frozenLayer.grid,
-            frameState.sampleTimeSeconds);
+            0.0F);
         viewport->UpdateWaterSeepageParams(
             frozenLayer.layerId,
             frozenLayer.grid);
@@ -39412,13 +39630,206 @@ void DrawWaterShorelineWavesPanel(PreviewRuntimeState* runtimeState) {
         return;
     }
 
-    if (DrawPointCloudShorelineWavesSection(session)) {
+    auto& water = runtimeState->water;
+    SeedWaterShorelineProfilePresets(&water);
+    water.selectedShorelineProfileName =
+        NormalizeWaterShorelineProfileName(
+            water.selectedShorelineProfileName);
+    if (water.selectedShorelineProfileName != "Default" &&
+        !FindWaterShorelineProfileIndex(
+             water,
+             water.selectedShorelineProfileName)
+             .has_value()) {
+        water.selectedShorelineProfileName = "Default";
+        water.shorelineProfileNameBuffer = "Default";
+        runtimeState->errorMessage =
+            "The selected Shoreline profile is missing; using Default.";
+    }
+
+    bool styleChanged = false;
+    const auto finishStyleEdit = [&]() {
         SanitizePointCloudStyle(session);
         MarkPointVisualEdited(runtimeState, session);
         if (!IsProjectPointVisualSession(*session)) {
             SyncScenePointVisualsFromOwner(runtimeState, session);
         }
         SyncWaterPointVisualSelectionFromSession(runtimeState, *session);
+    };
+    const auto upsertProfile = [&](std::string_view name,
+                                   const PointCloudShorelineWaveSettings& settings) {
+        const auto normalized = NormalizeWaterShorelineProfileName(name);
+        if (const auto existing =
+                FindWaterShorelineProfileIndex(water, normalized);
+            existing.has_value()) {
+            water.shorelineProfiles[existing.value()].settings = settings;
+        } else {
+            water.shorelineProfiles.push_back({
+                .name = normalized,
+                .settings = settings,
+            });
+        }
+    };
+    const auto removeProfile = [&](std::string_view name) {
+        const auto normalized = NormalizeWaterShorelineProfileName(name);
+        std::erase_if(
+            water.shorelineProfiles,
+            [&](const PointCloudShorelineWaveProfile& profile) {
+                return NormalizeWaterShorelineProfileName(profile.name) ==
+                       normalized;
+            });
+    };
+    const auto applyProfile = [&](std::string_view name) {
+        const auto normalized = NormalizeWaterShorelineProfileName(name);
+        invisible_places::renderer::pointcloud::
+            ApplyPointCloudShorelineWaveSettings(
+                &session->pointStyle,
+                ResolveWaterShorelineProfile(water, normalized));
+        water.selectedShorelineProfileName = normalized;
+        water.shorelineProfileNameBuffer = BasePointVisualName(normalized);
+        styleChanged = true;
+    };
+    const auto discardTarget = [&](std::string_view editedName) {
+        const std::string base = BasePointVisualName(editedName);
+        if (base == "Default" ||
+            FindWaterShorelineProfileIndex(water, base).has_value()) {
+            return base;
+        }
+        const std::string preset = PresetPointVisualName(base);
+        return FindWaterShorelineProfileIndex(water, preset).has_value()
+                   ? preset
+                   : std::string{"Default"};
+    };
+
+    const std::string assignedName =
+        water.selectedShorelineProfileName;
+    const bool assignedIsEdited =
+        IsEditedPointVisualName(assignedName);
+    const std::string shadowName =
+        EditedPointVisualName(BasePointVisualName(assignedName));
+    const bool shadowExists =
+        FindWaterShorelineProfileIndex(water, shadowName).has_value();
+    bool editorsLocked = !assignedIsEdited && shadowExists;
+
+    if (BeginPanelSection("Shoreline Profile")) {
+        const auto profileLabel = [](std::string_view name) {
+            if (IsPresetPointVisualName(name)) {
+                return BasePointVisualName(name) + " (Preset)";
+            }
+            return std::string{name};
+        };
+        const std::string selectedLabel = profileLabel(assignedName);
+        if (ImGui::BeginCombo(
+                "Profile",
+                selectedLabel.c_str())) {
+            const auto drawChoice = [&](std::string_view name) {
+                const std::string normalized =
+                    NormalizeWaterShorelineProfileName(name);
+                const bool selected = assignedName == normalized;
+                const std::string label = profileLabel(normalized);
+                if (ImGui::Selectable(label.c_str(), selected)) {
+                    applyProfile(normalized);
+                }
+                if (selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
+            };
+            drawChoice("Default");
+            for (const auto& profile : water.shorelineProfiles) {
+                drawChoice(profile.name);
+            }
+            ImGui::EndCombo();
+        }
+        if (IsPresetPointVisualName(assignedName)) {
+            ImGui::TextDisabled(
+                "Preset (read-only; editing creates a copy)");
+        } else if (assignedIsEdited) {
+            ImGui::TextColored(
+                ImVec4{0.55F, 0.78F, 0.98F, 1.0F},
+                "Editing %s",
+                BasePointVisualName(assignedName).c_str());
+        }
+
+        if (editorsLocked) {
+            ImGui::TextColored(
+                ImVec4{0.92F, 0.58F, 0.18F, 1.0F},
+                "An edited version exists; switch to it to continue editing.");
+            const std::string switchLabel = "Switch to " + shadowName;
+            if (ImGui::Button(switchLabel.c_str())) {
+                applyProfile(shadowName);
+                editorsLocked = false;
+            }
+        }
+
+        InputTextString(
+            "Profile Name",
+            &water.shorelineProfileNameBuffer);
+        if (ImGui::Button("Save Profile")) {
+            const auto trimmed =
+                TrimText(water.shorelineProfileNameBuffer);
+            const std::string targetName = BasePointVisualName(
+                trimmed.empty() ? assignedName : trimmed);
+            const auto settings =
+                invisible_places::renderer::pointcloud::
+                    ExtractPointCloudShorelineWaveSettings(
+                        session->pointStyle);
+            if (targetName == "Default") {
+                water.defaultShorelineSettings = settings;
+            } else {
+                upsertProfile(targetName, settings);
+            }
+            removeProfile(EditedPointVisualName(targetName));
+            water.selectedShorelineProfileName = targetName;
+            water.shorelineProfileNameBuffer = targetName;
+            runtimeState->statusMessage =
+                "Saved Shoreline profile " + targetName + ".";
+            runtimeState->errorMessage.clear();
+        }
+        if (assignedIsEdited) {
+            ImGui::SameLine();
+            if (ImGui::Button("Discard Edits")) {
+                const std::string target = discardTarget(assignedName);
+                removeProfile(assignedName);
+                applyProfile(target);
+                runtimeState->statusMessage =
+                    "Discarded Shoreline profile edits.";
+                runtimeState->errorMessage.clear();
+            }
+        } else {
+            ImGui::SameLine();
+            if (ImGui::Button("Revert to Profile")) {
+                applyProfile(assignedName);
+                runtimeState->statusMessage =
+                    "Reverted Shoreline settings to " +
+                    profileLabel(assignedName) + ".";
+                runtimeState->errorMessage.clear();
+            }
+        }
+        EndPanelSection();
+    }
+
+    if (editorsLocked) {
+        ImGui::BeginDisabled();
+    }
+    const bool waveControlsChanged =
+        DrawPointCloudShorelineWavesSection(session);
+    if (editorsLocked) {
+        ImGui::EndDisabled();
+    }
+    if (waveControlsChanged) {
+        const auto settings =
+            invisible_places::renderer::pointcloud::
+                ExtractPointCloudShorelineWaveSettings(
+                    session->pointStyle);
+        const std::string editedName =
+            assignedIsEdited ? assignedName : shadowName;
+        upsertProfile(editedName, settings);
+        water.selectedShorelineProfileName = editedName;
+        water.shorelineProfileNameBuffer =
+            BasePointVisualName(editedName);
+        styleChanged = true;
+    }
+    if (styleChanged) {
+        finishStyleEdit();
     }
 }
 
@@ -40790,16 +41201,43 @@ void DrawWaterGpuRainPanel(
         }
         // The effects are no longer tied to their originating cloud type:
         // each applies to all clouds' points inside its own height band.
-        // Rings spawn from SAND impacts, Wetness from ROCK impacts, and
-        // Droplets from VEG impacts.
+        // Rings and Wetness consume every ground impact, while Droplets
+        // consume vegetation impacts. Each response is applied by effect
+        // after collision, so none of these sliders selects a cloud role.
         ImGui::Checkbox("Rings", &settings.sandEffectsEnabled);
         ImGui::SameLine();
         ImGui::Checkbox("Wetness", &settings.rockEffectsEnabled);
         ImGui::SameLine();
         ImGui::Checkbox("Droplets", &settings.vegetationEffectsEnabled);
         ImGui::SliderFloat("Rings Response", &settings.sandEffectScale, 0.0F, 3.0F, "%.2f");
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Scales expanding rings around every eligible ground impact "
+                "and on every rendered cloud inside the Rings height band.");
+        }
+        ImGui::SliderFloat(
+            "Ring Thickness",
+            &settings.ringImpact.thicknessScale,
+            0.25F,
+            2.0F,
+            "%.2f x");
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Scales the width of each expanding ring without changing "
+                "its radius or travel speed. 0.50 is half the legacy width.");
+        }
         ImGui::SliderFloat("Wetness Response", &settings.rockEffectScale, 0.0F, 3.0F, "%.2f");
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Scales the wet-surface response around every eligible "
+                "ground impact and on every cloud inside the Wetness band.");
+        }
         ImGui::SliderFloat("Droplets Response", &settings.vegetationEffectScale, 0.0F, 3.0F, "%.2f");
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Scales vegetation-impact droplets on every rendered cloud "
+                "inside the Droplets height band.");
+        }
         if (!settings.impactEffectsEnabled) {
             ImGui::EndDisabled();
         }
@@ -47136,22 +47574,12 @@ void EnsureWaterSeepageRuntimeUpToDate(
         }
         auto& grid = gridIt->second;
         if (firstSemanticUse) {
-            // Contour Pulses are CPU-composed and the GPU only samples the
-            // baked field. A loaded animation owns the pulse clock so
-            // repeated scrubs and live playback match still/offline exports.
-            // Without a loaded animation there is no resolved timeline, so
-            // the ordinary viewport remains free-running on its steady
-            // preview clock instead of freezing at sample time zero.
-            const float pulseTimeSeconds =
-                runtimeState->animationPanel.currentPath.has_value()
-                    ? activeWater.sampleTimeSeconds
-                    : std::chrono::duration<float>(
-                          std::chrono::steady_clock::now() -
-                          runtimeState->startedAt)
-                          .count();
+            // The compact reference field changes only with authored shape.
+            // Shader frame time advances it continuously, so clock-only
+            // frames do not change this fingerprint or publish parameters.
             invisible_places::water::PrepareWaterSeepagePulseFields(
                 &grid,
-                pulseTimeSeconds);
+                0.0F);
             activeSemanticParamsFingerprints.emplace(
                 semanticKey,
                 invisible_places::water::

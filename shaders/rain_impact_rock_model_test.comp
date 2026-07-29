@@ -47,7 +47,8 @@ void main() {
             inputValue.eventNormalLifetime.w,
             inputValue.pointAge.xyz,
             inputValue.pointAge.w,
-            inputValue.rockImpact0.x);
+            inputValue.rockImpact0.x,
+            inputValue.rockImpact0.y);
     } else {
         outputs[index] = EvaluateRockRainImpactValue(
             inputValue.eventPositionRadius.xyz,

@@ -269,9 +269,9 @@ TEST_CASE("Water Flow activity scales are deterministic and monotonic", "[pointc
     CHECK(off.trailVisibility == 0.0F);
     CHECK(off.appearance == Catch::Approx(0.30F));
     CHECK(off.width == Catch::Approx(0.65F));
-    CHECK(off.speed == Catch::Approx(0.60F));
+    CHECK(off.speed == Catch::Approx(1.0F));
     CHECK(off.visibleLength == Catch::Approx(0.55F));
-    CHECK(off.lateralMotion == 0.0F);
+    CHECK(off.lateralMotion == Catch::Approx(0.15F));
 
     const auto full = ResolveWaterFlowActivityScales(1.0F, 1.0F);
     CHECK(full.trailVisibility == 1.0F);
@@ -283,8 +283,28 @@ TEST_CASE("Water Flow activity scales are deterministic and monotonic", "[pointc
 
     const auto earlyTrail = ResolveWaterFlowActivityScales(0.25F, 0.10F);
     const auto lateTrail = ResolveWaterFlowActivityScales(0.25F, 0.80F);
-    CHECK(earlyTrail.trailVisibility == 1.0F);
-    CHECK(lateTrail.trailVisibility == 0.0F);
+    CHECK(earlyTrail.trailVisibility == Catch::Approx(0.25F));
+    CHECK(lateTrail.trailVisibility == Catch::Approx(0.25F));
+    CHECK(earlyTrail.speed == lateTrail.speed);
+    CHECK(earlyTrail.lateralMotion == lateTrail.lateralMotion);
+
+    float previousCoverage = 0.0F;
+    for (std::uint32_t step = 0U; step <= 1000U; ++step) {
+        const float activity = static_cast<float>(step) / 1000.0F;
+        for (const float seed : {0.0F, 0.10F, 0.50F, 0.80F, 1.0F}) {
+            const auto scales = ResolveWaterFlowActivityScales(activity, seed);
+            CHECK(scales.trailVisibility == Catch::Approx(activity));
+            CHECK(scales.speed == Catch::Approx(1.0F));
+            CHECK(scales.lateralMotion == Catch::Approx(0.15F));
+        }
+        const auto scales = ResolveWaterFlowActivityScales(activity, 0.5F);
+        const float coverage = scales.trailVisibility * scales.appearance;
+        CHECK(coverage >= previousCoverage);
+        if (step > 0U) {
+            CHECK(coverage - previousCoverage < 0.002F);
+        }
+        previousCoverage = coverage;
+    }
 }
 
 TEST_CASE("Water Flow runtime speed scale is safe and survives Fast Basic styling", "[pointcloud][water][speed]") {
@@ -321,13 +341,21 @@ TEST_CASE("Offline Water Flow activity hides and reveals stable trails", "[outpu
     const auto early = RenderSingleWaterTrail(0.25F, 0.1F);
     const auto full = RenderSingleWaterTrail(1.0F, 0.8F);
     CHECK(Maximum(off.alpha) == 0.0F);
-    CHECK(Maximum(late.alpha) == 0.0F);
+    CHECK(Maximum(late.alpha) > 0.0F);
     CHECK(Maximum(early.alpha) > 0.0F);
+    // The seed may still move a trail within its stable micro-motion pattern,
+    // but it no longer decides whether that trail exists at this activity.
+    CHECK(Maximum(late.alpha) > Maximum(early.alpha) * 0.5F);
+    CHECK(Maximum(early.alpha) > Maximum(late.alpha) * 0.5F);
     CHECK(Maximum(full.alpha) > Maximum(early.alpha));
 
     const auto fastOff = RenderSingleWaterTrail(0.0F, 0.1F, true);
+    const auto fastPartialEarly = RenderSingleWaterTrail(0.25F, 0.1F, true);
+    const auto fastPartialLate = RenderSingleWaterTrail(0.25F, 0.8F, true);
     const auto fastFull = RenderSingleWaterTrail(1.0F, 0.1F, true);
     CHECK(Maximum(fastOff.alpha) == 0.0F);
+    CHECK(Maximum(fastPartialEarly.alpha) > 0.0F);
+    CHECK(Maximum(fastPartialLate.alpha) > 0.0F);
     CHECK(Maximum(fastFull.alpha) > 0.0F);
 }
 

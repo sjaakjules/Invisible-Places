@@ -735,13 +735,13 @@ struct WaterSeepageRuntimeNode {
     WaterSeepageLookSettings look{};
     std::optional<WaterSeepageLookSettings> transitionLook;
     float transitionAmount = 0.0F;
-    // Contour Pulses are composed once per node and animation sample. Every
-    // rendered point then performs one interpolated longitudinal lookup plus
-    // stationary surface noise instead of evaluating every authored wave.
-    // The span comes from immutable maximum support limits, never live
+    // Contour Pulses are composed into a compact reference field only when
+    // their authored shape changes. Rendering advances through that field
+    // from the frame time on the GPU (and with the same sampler offline), so
+    // a clock-only frame never rebuilds or uploads Seepage parameters. The
+    // span comes from immutable maximum support limits, never live
     // Strength/Rain, so revealing more support cannot teleport wave phase.
     float pulseStableSpanMeters = 1.0F;
-    float pulseFieldTimeSeconds = 0.0F;
     std::uint64_t pulseFieldPreparationFingerprint = 0U;
     WaterSeepagePulseField pulseField{};
     WaterSeepagePulseField transitionPulseField{};
@@ -1708,11 +1708,11 @@ void ApplyWaterSeepageScenarioParameters(
     const WaterRainSettings& rainSettings,
     std::uint64_t effectivePointInvocations,
     std::span<const WaterSeepageNodeAnimationStateEntry> nodeAnimationStates = {});
-// Prepares the compact frame-ringed Contour Pulse samples once for a resolved
-// frame state (unchanged inputs are reused). Call this before CPU/offline
-// evaluation at that frame time; point evaluation deliberately never rebuilds
-// a field. Preparation changes no support, descriptors, point data, or
-// topology.
+// Prepares the compact Contour Pulse reference samples from authored shape
+// settings (unchanged inputs are reused). sampleTimeSeconds is retained for
+// source compatibility but deliberately does not participate in preparation:
+// rendering advances the reference field from its own frame time. Preparation
+// changes no support, descriptors, point data, or topology.
 void PrepareWaterSeepagePulseFields(
     WaterSeepageSpatialGrid* grid,
     float sampleTimeSeconds);

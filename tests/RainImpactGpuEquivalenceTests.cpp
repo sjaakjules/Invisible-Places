@@ -720,12 +720,15 @@ struct SandRainCase {
     Float3 point{};
     float timeSeconds = 0.0F;
     float waterMask = 1.0F;
+    invisible_places::water::RainRingImpactSettings ringImpact{};
 };
 
 std::vector<SandRainCase> BuildSandEquivalenceCases() {
     std::vector<SandRainCase> cases;
     constexpr Float3 eventPosition{0.31F, -0.27F, 0.83F};
     for (const float radius : {0.025F, 0.070F, 0.11F}) {
+        const float thicknessScale =
+            radius < 0.04F ? 0.5F : (radius > 0.10F ? 1.75F : 1.0F);
         for (const float lifetime : {0.48F, 0.70F, 0.83F}) {
             for (const float waterMask : {0.0F, 0.25F, 0.5F, 1.0F}) {
                 for (const float age : {-0.01F,
@@ -745,6 +748,7 @@ std::vector<SandRainCase> BuildSandEquivalenceCases() {
                             eventPosition.z -
                                 radius * distanceScale * 0.08F};
                         result.waterMask = waterMask;
+                        result.ringImpact.thicknessScale = thicknessScale;
                         result.event = {
                             .position = eventPosition,
                             .birthTimeSeconds = 1.25F,
@@ -774,6 +778,7 @@ std::vector<SandRainCase> BuildSandEquivalenceCases() {
                             age};
                         result.gpu.control = {0U, 1U, 0U, 0U};
                         result.gpu.rockImpact0[0] = waterMask;
+                        result.gpu.rockImpact0[1] = thicknessScale;
                         cases.push_back(result);
                     }
                 }
@@ -964,7 +969,8 @@ TEST_CASE(
                 testCase.event,
                 testCase.point,
                 testCase.timeSeconds,
-                testCase.waterMask);
+                testCase.waterMask,
+                testCase.ringImpact);
         const float gpuValue = gpuValues[index];
         REQUIRE(std::isfinite(cpuValue));
         REQUIRE(std::isfinite(gpuValue));

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Refresh the local SampleScene validation project from durable fixtures.
 
-The tracked schema-19 water fixture and the current validation project are the
+The tracked schema-20 water fixture and the current validation project are the
 default inputs, so regeneration never depends on or rewrites an authored
 exhibition project. An explicit main-project option can still refresh the water
 fixture while those authored objects exist. The helper builds a lightweight
@@ -24,7 +24,7 @@ from typing import Any
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
-PROJECT_SCHEMA_VERSION = 47
+PROJECT_SCHEMA_VERSION = 48
 DEFAULT_MAIN_PROJECT = REPOSITORY_ROOT / "Saved" / "exhibitionScene_project.json"
 DEFAULT_FIXTURE = REPOSITORY_ROOT / "tests" / "fixtures" / "sample_scene_water_sources.json"
 DEFAULT_VALIDATION_PROJECT = (
@@ -386,7 +386,7 @@ def build_water_fixture(project: dict[str, Any], state: dict[str, Any]) -> dict[
     seepage = copy.deepcopy(named_object(state["water_seepage_nodes"], "SampleSeepage"))
 
     fixture: dict[str, Any] = {
-        "schema_version": 19,
+        "schema_version": 20,
         "fixture_metadata": {
             "scene_group": "SampleScene",
             "display_spacing_micrometres": DISPLAY_SPACING,
@@ -440,8 +440,8 @@ def build_water_fixture(project: dict[str, Any], state: dict[str, Any]) -> dict[
 
 
 def validate_water_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
-    if fixture.get("schema_version") != 19:
-        raise ValueError("SampleScene water fixture must use water-source schema 19")
+    if fixture.get("schema_version") != 20:
+        raise ValueError("SampleScene water fixture must use water-source schema 20")
     metadata = fixture.get("fixture_metadata")
     if not isinstance(metadata, dict) or metadata.get("scene_group") != "SampleScene":
         raise ValueError("SampleScene water fixture has invalid fixture metadata")

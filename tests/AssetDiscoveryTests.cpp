@@ -1573,6 +1573,62 @@ TEST_CASE("Height Foam shoreline keeps independent defaults and clamps break hei
     CHECK_FALSE(PointCloudStyleHasShorelineWaveRegion(style));
 }
 
+TEST_CASE("Shoreline profiles copy only water settings and Calm matches the authored preset",
+          "[water][shoreline][profiles]") {
+    using invisible_places::renderer::pointcloud::ApplyPointCloudShorelineWaveSettings;
+    using invisible_places::renderer::pointcloud::CalmPointCloudShorelineWaveSettings;
+    using invisible_places::renderer::pointcloud::ExtractPointCloudShorelineWaveSettings;
+    using invisible_places::renderer::pointcloud::PointCloudShorelineWaveAlgorithm;
+    using invisible_places::renderer::pointcloud::PointCloudStyleState;
+
+    auto calm = CalmPointCloudShorelineWaveSettings();
+    CHECK(calm.enabled);
+    CHECK(calm.algorithm == PointCloudShorelineWaveAlgorithm::FoamFronts);
+    CHECK(calm.foamFronts.boundaryZ == Catch::Approx(1.595F));
+    CHECK(calm.foamFronts.heightReachMeters == Catch::Approx(2.0F));
+    CHECK(calm.foamFronts.edgeFadeMeters == Catch::Approx(0.117F));
+    CHECK(
+        std::atan2(calm.foamFronts.directionY, calm.foamFronts.directionX) *
+            180.0F / 3.14159265358979323846F ==
+        Catch::Approx(81.0F));
+    CHECK(calm.foamFronts.wavelengthMeters == Catch::Approx(0.10F));
+    CHECK(calm.foamFronts.patternScale == Catch::Approx(0.33F));
+    CHECK(calm.foamFronts.speed == Catch::Approx(0.55F));
+    CHECK(calm.foamFronts.warp == Catch::Approx(1.05F));
+    CHECK(calm.foamFronts.turbulence == Catch::Approx(0.64F));
+    CHECK(calm.foamFronts.density == Catch::Approx(1.0F));
+    CHECK(calm.foamFronts.intensity == Catch::Approx(0.97F));
+    CHECK(calm.foamFronts.emissionAdd == Catch::Approx(0.65F));
+    CHECK(calm.foamFronts.opacityAdd == Catch::Approx(0.08F));
+    CHECK(calm.foamFronts.opacityMultiply == Catch::Approx(1.25F));
+    CHECK(calm.foamFronts.pointSizeAdd == Catch::Approx(0.0F));
+    CHECK(calm.foamFronts.pointSizeMultiply == Catch::Approx(1.35F));
+    CHECK(calm.foamFronts.colourMix == Catch::Approx(0.75F));
+    CHECK(calm.foamFronts.colour[0] == Catch::Approx(158.0F / 255.0F));
+    CHECK(calm.foamFronts.colour[1] == Catch::Approx(224.0F / 255.0F));
+    CHECK(calm.foamFronts.colour[2] == Catch::Approx(1.0F));
+
+    // Applying a Shoreline profile must not replace the rest of the selected
+    // point visual. It also carries the inactive algorithm bank so changing
+    // algorithms after selection recovers the profile's authored values.
+    calm.heightFoam.runupZ = 2.17F;
+    calm.heightFoam.offshoreFoamStrength = 0.43F;
+    PointCloudStyleState style;
+    style.exposure = 1.73F;
+    style.solidColor = {0.11F, 0.22F, 0.33F, 0.44F};
+    ApplyPointCloudShorelineWaveSettings(&style, calm);
+    CHECK(style.exposure == Catch::Approx(1.73F));
+    CHECK(style.solidColor ==
+          std::array<float, 4>{0.11F, 0.22F, 0.33F, 0.44F});
+    CHECK(style.shorelineBoundaryZ == Catch::Approx(1.595F));
+    CHECK(style.shorelineHeightFoam.runupZ == Catch::Approx(2.17F));
+
+    const auto extracted = ExtractPointCloudShorelineWaveSettings(style);
+    CHECK(extracted.enabled);
+    CHECK(extracted.foamFronts.warp == Catch::Approx(1.05F));
+    CHECK(extracted.heightFoam.offshoreFoamStrength == Catch::Approx(0.43F));
+}
+
 TEST_CASE("Sand-cloud shoreline waves use dedicated foam helper", "[water][shoreline][shader]") {
     const auto shaderPath = DataRoot().parent_path() / "shaders" / "pointcloud_sparse_ripple.glsl";
     std::ifstream input{shaderPath};
@@ -1686,6 +1742,12 @@ TEST_CASE("Seepage cannot publish non-finite point material outputs", "[water][s
     CHECK(sparseRipple.find(
               "seepageParamData.seepageParams[nodeIndex].geometry.x <= 1e-5") !=
           std::string::npos);
+    CHECK(sparseRipple.find("float SampleAnimatedSeepagePulseField(") !=
+          std::string::npos);
+    CHECK(sparseRipple.find("fieldDistanceMeters - time * speed") !=
+          std::string::npos);
+    CHECK(sparseRipple.find("if (quality >= 2u)") != std::string::npos);
+    CHECK(sparseRipple.find("if (quality >= 3u)") != std::string::npos);
 
     const auto preview = readShader(shaderRoot / "pointcloud_preview.vert");
     CHECK(preview.find("RippleFiniteFloat(resolvedPointSize)") != std::string::npos);
@@ -10660,6 +10722,7 @@ TEST_CASE("GPU rain settings and visual profile round-trip while route rain stay
     rain.gustStrength = 0.62F;
     rain.weatherFrontStrength = 0.48F;
     rain.rockEffectScale = 1.35F;
+    rain.ringImpact.thicknessScale = 0.50F;
     rain.nearSurface = {
         .approachDistanceMeters = 0.41F,
         .minimumSpeedFactor = 0.22F,
@@ -10706,6 +10769,9 @@ TEST_CASE("GPU rain settings and visual profile round-trip while route rain stay
     CHECK(rainJson.at("near_surface").at("squish").get<float>() == Catch::Approx(0.83F));
     CHECK(rainJson.at("rock_impact").at("edge_breakup").get<float>() == Catch::Approx(0.58F));
     CHECK(
+        rainJson.at("sand_impact").at("ring_thickness_scale").get<float>() ==
+        Catch::Approx(0.50F));
+    CHECK(
         rainJson.at("vegetation_impact").at("stream_width_meters").get<float>() ==
         Catch::Approx(0.012F));
     CHECK_FALSE(savedJson.contains("selected_water_rain_trail_profile"));
@@ -10731,6 +10797,7 @@ TEST_CASE("GPU rain settings and visual profile round-trip while route rain stay
     CHECK(loaded->waterRainSettings.rockImpact.centreFalloff == Catch::Approx(0.44F));
     CHECK(loaded->waterRainSettings.rockImpact.heightBias == Catch::Approx(1.30F));
     CHECK(loaded->waterRainSettings.rockImpact.persistence == Catch::Approx(2.20F));
+    CHECK(loaded->waterRainSettings.ringImpact.thicknessScale == Catch::Approx(0.50F));
     CHECK(loaded->waterRainSettings.vegetationImpact.twinkle == Catch::Approx(2.70F));
     CHECK(
         loaded->waterRainSettings.vegetationImpact.propagationMetersPerSecond ==
@@ -10765,6 +10832,9 @@ TEST_CASE("GPU rain settings and visual profile round-trip while route rain stay
         versionTwo->waterRainSettings.rockImpact.edgeBreakup ==
         Catch::Approx(defaults.rockImpact.edgeBreakup));
     CHECK(
+        versionTwo->waterRainSettings.ringImpact.thicknessScale ==
+        Catch::Approx(defaults.ringImpact.thicknessScale));
+    CHECK(
         versionTwo->waterRainSettings.vegetationImpact.twinkle ==
         Catch::Approx(defaults.vegetationImpact.twinkle));
 
@@ -10798,6 +10868,7 @@ TEST_CASE("GPU rain settings and visual profile round-trip while route rain stay
     CHECK(loadedSources->rainSettings.seed == 9876U);
     CHECK(loadedSources->rainSettings.nearSurface.squish == Catch::Approx(0.83F));
     CHECK(loadedSources->rainSettings.rockImpact.persistence == Catch::Approx(2.20F));
+    CHECK(loadedSources->rainSettings.ringImpact.thicknessScale == Catch::Approx(0.50F));
     CHECK(loadedSources->rainSettings.vegetationImpact.streamSpread == Catch::Approx(1.10F));
     CHECK(loadedSources->rainVisualSettings.opacity == Catch::Approx(0.77F));
 

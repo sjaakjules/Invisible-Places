@@ -3121,7 +3121,6 @@ void RainSimulator::EmitImpact(
     // in shaders/rain_simulation.comp — keep both identical).
     const bool groundEffectsEnabled =
         frame.settings.sandEffectsEnabled || frame.settings.rockEffectsEnabled;
-    float roleScale = 1.0F;
     float radius = 0.04F;
     float lifetime = 1.0F;
     float secondaryLifetime = 0.0F;
@@ -3129,7 +3128,6 @@ void RainSimulator::EmitImpact(
     switch (hit.role) {
         case WaterSurfaceRole::Sand:
             enabled = groundEffectsEnabled;
-            roleScale = frame.settings.sandEffectScale;
             radius = std::clamp(0.020F + dropWidth * 6.0F + impactSpeed * 0.0015F, 0.025F, 0.11F);
             lifetime = sandModelLifetime;
             secondaryLifetime = rockModelLifetime;
@@ -3137,7 +3135,6 @@ void RainSimulator::EmitImpact(
             break;
         case WaterSurfaceRole::Rock: {
             enabled = groundEffectsEnabled;
-            roleScale = frame.settings.rockEffectScale;
             radius = std::clamp(0.028F + dropWidth * 10.0F + impactSpeed * 0.0020F, 0.035F, 0.16F);
             // Steep rock sheds water further: boost the event radius by
             // surface steepness so the Wetness footprint can run downhill.
@@ -3157,7 +3154,6 @@ void RainSimulator::EmitImpact(
         }
         case WaterSurfaceRole::Vegetation:
             enabled = frame.settings.vegetationEffectsEnabled;
-            roleScale = frame.settings.vegetationEffectScale;
             radius = std::clamp(0.016F + dropWidth * 4.0F, 0.018F, 0.065F);
             lifetime = 1.1F + std::min(0.7F, impactSpeed * 0.045F);
             ++diagnostics->vegetationEvents;
@@ -3169,8 +3165,11 @@ void RainSimulator::EmitImpact(
     if (!enabled) {
         return;
     }
+    // Store only physical drop energy. Rings/Wetness/Droplets responses are
+    // applied by the consuming shading model so one slider affects that
+    // effect around every eligible impact, including events already alive.
     const float energy = std::clamp(
-        (dropWidth / 0.003F) * (impactSpeed / 8.0F) * multipliers.effectEnergy * roleScale,
+        (dropWidth / 0.003F) * (impactSpeed / 8.0F) * multipliers.effectEnergy,
         0.05F,
         2.5F);
     events_[eventWriteIndex_ % events_.size()] = {
@@ -3325,7 +3324,11 @@ RainImpactGrid BuildRainImpactGrid(
     float timeSeconds,
     float worldSpanMeters,
     const RainRockImpactSettings& rockImpact,
-    const RainVegetationImpactSettings& vegetationImpact) {
+    const RainVegetationImpactSettings& vegetationImpact,
+    const RainRingImpactSettings& ringImpact,
+    float ringsResponse,
+    float wetnessResponse,
+    float dropletsResponse) {
     RainImpactGrid grid;
     grid.dimension = kRainImpactGridDimension;
     grid.cellSizeMeters = std::max(0.01F, worldSpanMeters / static_cast<float>(grid.dimension));
@@ -3336,8 +3339,18 @@ RainImpactGrid BuildRainImpactGrid(
     };
     grid.cells.resize(static_cast<std::size_t>(grid.dimension) * grid.dimension);
     grid.events.assign(events.begin(), events.end());
+    grid.ringImpact = ringImpact;
     grid.rockImpact = rockImpact;
     grid.vegetationImpact = vegetationImpact;
+    grid.ringsResponse = std::max(
+        0.0F,
+        std::isfinite(ringsResponse) ? ringsResponse : 0.0F);
+    grid.wetnessResponse = std::max(
+        0.0F,
+        std::isfinite(wetnessResponse) ? wetnessResponse : 0.0F);
+    grid.dropletsResponse = std::max(
+        0.0F,
+        std::isfinite(dropletsResponse) ? dropletsResponse : 0.0F);
 
     const auto rockPriorityKey = [&](const RainImpactEvent& event,
                                      std::uint32_t eventIndex,
@@ -3657,7 +3670,8 @@ float EvaluateSandRainImpactValue(
     const RainImpactEvent& event,
     const io::Float3& point,
     float timeSeconds,
-    float sandWaterMask) {
+    float sandWaterMask,
+    const RainRingImpactSettings& settings) {
     const float age = timeSeconds - event.birthTimeSeconds;
     if (event.role != WaterSurfaceRole::Sand || age < 0.0F ||
         age > event.lifetimeSeconds) {
@@ -3672,7 +3686,12 @@ float EvaluateSandRainImpactValue(
     const float wetRadius = std::max(0.001F, event.radiusMeters);
     const float wetNormalizedDistance = planarDistance / wetRadius;
     const float ringRadius = wetRadius * (0.12F + 0.88F * life);
-    const float ringThickness = std::max(0.003F, wetRadius * 0.14F);
+    const float thicknessScale = std::clamp(
+        std::isfinite(settings.thicknessScale) ? settings.thicknessScale : 1.0F,
+        0.25F,
+        2.0F);
+    const float ringThickness =
+        std::max(0.00075F, std::max(0.003F, wetRadius * 0.14F) * thicknessScale);
     const float ringDistance = std::abs(planarDistance - ringRadius);
     const float wetRadialFade =
         1.0F - SmoothStep(0.0F, 1.0F, wetNormalizedDistance);
@@ -3784,8 +3803,13 @@ RainImpactEffect EvaluateRainImpact(
                 continue;
             }
             const float value =
-                EvaluateSandRainImpactValue(ringsEvent, point, timeSeconds, sandWaterMask) *
-                event.energy * ringsWeight;
+                EvaluateSandRainImpactValue(
+                    ringsEvent,
+                    point,
+                    timeSeconds,
+                    sandWaterMask,
+                    grid.ringImpact) *
+                event.energy * ringsWeight * grid.ringsResponse;
             ringsValue = std::max(ringsValue, value);
         }
     }
@@ -3807,7 +3831,7 @@ RainImpactEffect EvaluateRainImpact(
             }
             const float value =
                 EvaluateRockRainImpactValue(wetnessEvent, point, normal, timeSeconds, grid.rockImpact) *
-                event.energy * wetnessWeight;
+                event.energy * wetnessWeight * grid.wetnessResponse;
             // Peak-preserving soft union: one impact remains bit-for-bit
             // equivalent to its narrow-phase value, while every additional
             // retained impact can only strengthen the wet response.
@@ -3830,7 +3854,7 @@ RainImpactEffect EvaluateRainImpact(
             const float age = timeSeconds - event.birthTimeSeconds;
             const float value =
                 EvaluateVegetationSprinkle(event, point, normal, age, grid.vegetationImpact) *
-                event.energy * dropletsWeight;
+                event.energy * dropletsWeight * grid.dropletsResponse;
             dropletsValue = std::max(dropletsValue, value);
         }
     }

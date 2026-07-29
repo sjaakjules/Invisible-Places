@@ -10,7 +10,8 @@ float EvaluateSandRainImpactValue(
     float lifetime,
     vec3 point,
     float age,
-    float waterMask) {
+    float waterMask,
+    float thicknessScale) {
     if (age < 0.0 || age > lifetime) {
         return 0.0;
     }
@@ -24,7 +25,9 @@ float EvaluateSandRainImpactValue(
     const float wetRadius = max(0.001, eventRadius);
     const float wetNormalizedDistance = planarDistance / wetRadius;
     const float ringRadius = wetRadius * (0.12 + 0.88 * life);
-    const float ringThickness = max(0.003, wetRadius * 0.14);
+    const float ringThickness = max(
+        0.00075,
+        max(0.003, wetRadius * 0.14) * clamp(thicknessScale, 0.25, 2.0));
     const float ringDistance = abs(planarDistance - ringRadius);
     const float wetRadialFade =
         1.0 - smoothstep(0.0, 1.0, wetNormalizedDistance);

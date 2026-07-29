@@ -79,6 +79,12 @@ struct RainRockImpactSettings {
     float downhillStretch = 1.0F;
 };
 
+struct RainRingImpactSettings {
+    // Multiplies the existing expanding-ring width. One preserves legacy
+    // projects; 0.5 produces a ring half as thick without changing its radius.
+    float thicknessScale = 1.0F;
+};
+
 // Finite sentinel for an open band edge. JSON cannot round-trip IEEE
 // infinity, so unbounded edges persist as this value instead.
 inline constexpr float kRainImpactBandUnbounded = 1.0e8F;
@@ -151,10 +157,14 @@ struct RainRuntimeSettings {
     float weatherFrontStrength = 0.40F;
     float weatherFrontScaleMeters = 12.0F;
     float weatherFrontSpeedMetersPerSecond = 1.5F;
+    // Legacy field names retained for project compatibility. These are
+    // per-effect responses, not collision-role scales: Rings, Wetness, and
+    // Droplets respectively shade every point inside their configured bands.
     float sandEffectScale = 1.0F;
     float rockEffectScale = 1.0F;
     float vegetationEffectScale = 1.0F;
     RainNearSurfaceSettings nearSurface{};
+    RainRingImpactSettings ringImpact{};
     RainRockImpactSettings rockImpact{};
     RainVegetationImpactSettings vegetationImpact{};
     RainImpactHeightBand sandImpactBand{-kRainImpactBandUnbounded, 2.0F, 0.30F};
@@ -312,8 +322,12 @@ struct RainImpactGrid {
     std::uint32_t dimension = kRainImpactGridDimension;
     std::vector<RainImpactGridCell> cells;
     std::vector<RainImpactEvent> events;
+    RainRingImpactSettings ringImpact{};
     RainRockImpactSettings rockImpact{};
     RainVegetationImpactSettings vegetationImpact{};
+    float ringsResponse = 1.0F;
+    float wetnessResponse = 1.0F;
+    float dropletsResponse = 1.0F;
     std::uint32_t overflowCount = 0U;
 };
 
@@ -344,7 +358,8 @@ struct RainImpactEffect {
     const RainImpactEvent& event,
     const io::Float3& point,
     float timeSeconds,
-    float sandWaterMask = 1.0F);
+    float sandWaterMask = 1.0F,
+    const RainRingImpactSettings& settings = {});
 
 // GROUND strike events (ROCK and SAND) are binned into BOTH the rock and
 // sand per-cell lists so Rings render near rock surfaces and Wetness near
@@ -358,7 +373,11 @@ struct RainImpactEffect {
     float timeSeconds,
     float worldSpanMeters = 32.0F,
     const RainRockImpactSettings& rockImpact = {},
-    const RainVegetationImpactSettings& vegetationImpact = {});
+    const RainVegetationImpactSettings& vegetationImpact = {},
+    const RainRingImpactSettings& ringImpact = {},
+    float ringsResponse = 1.0F,
+    float wetnessResponse = 1.0F,
+    float dropletsResponse = 1.0F);
 // CPU twin of ResolveRainImpactComposite in
 // shaders/pointcloud_rain_impact.glsl. Every enabled model (effectMask bits:
 // 1 Rings, 2 Wetness, 4 Droplets) is evaluated for the point regardless of

@@ -89,6 +89,7 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 rainImpactVegetation0;
     vec4 rainImpactVegetation1;
     vec4 rainImpactSandBand;
+    vec4 rainImpactResponse;
 } styleData;
 
 #include "pointcloud_sparse_ripple.glsl"
@@ -536,11 +537,8 @@ float WaterTrailTravelPhase(uint pointIndex) {
     const float trailDistance = max(0.0, LoadScalarFieldValue(kWaterTrailDistanceFieldSlot, pointIndex));
     const float trailAge = LoadScalarFieldValue(kWaterTrailAgeFieldSlot, pointIndex);
     const float baseStartPhase = LoadScalarFieldValue(kWaterTrailStartPhaseFieldSlot, pointIndex);
-    const float activity = clamp(styleData.renderParams1.w, 0.0, 1.0);
-    const float speedScale = mix(0.60, 1.0, activity);
     const float speed =
         max(0.0, LoadScalarFieldValue(kWaterTrailSpeedFieldSlot, pointIndex)) *
-        speedScale *
         max(0.0, styleData.renderParams2.y);
     const float trailStartPhase = fract(
         baseStartPhase +
@@ -569,16 +567,10 @@ float WaterFlowAppearanceScale() {
     return mix(0.30, 1.0, WaterFlowActivity());
 }
 
-float WaterTrailActivityGate(uint pointIndex) {
-    const float activity = WaterFlowActivity();
-    if (activity <= 0.0) {
-        return 0.0;
-    }
-    if (activity >= 1.0) {
-        return 1.0;
-    }
-    const float seed = clamp(LoadScalarFieldValue(kWaterTrailSeedFieldSlot, pointIndex), 0.0, 1.0);
-    return smoothstep(seed - 0.035, seed + 0.035, activity);
+float WaterTrailActivityGate() {
+    // Fade every settled trail continuously. Per-trail seed variation remains
+    // available to motion, but never gates an entire trail during keying.
+    return WaterFlowActivity();
 }
 
 float WaterTrailBaseWidth(uint pointIndex) {
@@ -640,7 +632,7 @@ float WaterTrailVisibility(uint pointIndex) {
                   0.0,
                   1.0)
             : 1.0;
-    return WaterTrailActivityGate(pointIndex) * routeEndFade * meshTerminalFade;
+    return WaterTrailActivityGate() * routeEndFade * meshTerminalFade;
 }
 
 vec3 WaterTrailRoutePosition(uint pointIndex, float phase, vec3 fallbackPosition) {
@@ -731,7 +723,7 @@ vec3 ResolveWaterTrailPosition(vec3 basePosition, uint pointIndex) {
         (phase * 1.70 + trailSeed * 3.17 + max(0.0, uniforms.depthParameters.x) * 0.35) *
         6.28318530718;
     const float microMotion =
-        sin(motionPhase) * WaterTrailBaseWidth(pointIndex) * 0.15 * WaterFlowActivity();
+        sin(motionPhase) * WaterTrailBaseWidth(pointIndex) * 0.15;
     return routePosition + lateral * (lateralOffset + microMotion);
 }
 

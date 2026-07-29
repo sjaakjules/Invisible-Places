@@ -5390,12 +5390,126 @@ SeepagePatternSignals EvaluateWettingTrickleSeepageSignals(
     };
 }
 
+float WrapContourPulseDistance(
+    float distanceMeters,
+    float stableSpanMeters) {
+    if (!std::isfinite(distanceMeters) ||
+        !std::isfinite(stableSpanMeters) ||
+        stableSpanMeters <= 1.0e-6F) {
+        return 0.0F;
+    }
+    float wrapped = std::fmod(distanceMeters, stableSpanMeters);
+    if (wrapped < 0.0F) {
+        wrapped += stableSpanMeters;
+    }
+    return wrapped;
+}
+
+float SampleAnimatedContourPulseField(
+    const WaterSeepageRuntimeNode& node,
+    const WaterSeepageLookSettings& look,
+    bool transitionPulseField,
+    float fieldDistanceMeters,
+    float timeSeconds) {
+    const auto& field = transitionPulseField
+                            ? node.transitionPulseField
+                            : node.pulseField;
+    if (field.sampleCount == 0U ||
+        !std::isfinite(field.stableSpanMeters) ||
+        field.stableSpanMeters <= 1.0e-6F) {
+        return 0.0F;
+    }
+
+    const float time = std::max(
+        0.0F,
+        SeepageFiniteOr(timeSeconds, 0.0F));
+    const float speed = std::max(
+        0.0F,
+        SeepageFiniteOr(look.pulseSpeedMetersPerSecond, 0.0F));
+    const float speedVariation = Clamp01(look.pulseSpeedVariation);
+    const float irregularity = Clamp01(look.pulseIrregularity);
+    const float evolution = std::max(
+        0.0F,
+        SeepageFiniteOr(look.evolution, 0.0F));
+    const float span = field.stableSpanMeters;
+    const std::uint32_t proceduralSeed =
+        node.seed ^ (node.id * 0x9e3779b9U);
+    const float evolutionHash =
+        SeepageHash01(7, 19, proceduralSeed + 49201U);
+    const float evolutionPhase = std::fmod(
+        time * evolution * (0.15F + evolutionHash * 0.25F) +
+            evolutionHash * kSeepageTwoPi,
+        kSeepageTwoPi);
+    const float evolutionShift =
+        std::sin(evolutionPhase) *
+        std::max(0.001F, look.pulseWidthMeters) *
+        irregularity * 0.55F;
+
+    // The reference field contains every authored launch and fractional wave
+    // weight. Advancing its lookup coordinate in the shader makes clock-only
+    // frames free of CPU field construction and parameter uploads.
+    const float primaryDistance = WrapContourPulseDistance(
+        fieldDistanceMeters - time * speed + evolutionShift,
+        span);
+    float pulse = field.Sample(primaryDistance);
+
+    // Balanced/High tiers add one/two deterministic phase populations. They
+    // move at nearby speeds and merge additively, retaining the authored
+    // catch-up/overlap character without restoring a 7–12-wave point loop.
+    if (node.resolvedQuality == WaterSeepageQuality::Balanced ||
+        node.resolvedQuality == WaterSeepageQuality::High) {
+        const float phaseHash =
+            SeepageHash01(23, 41, proceduralSeed + 58309U);
+        const float speedHash =
+            SeepageHash01(31, 59, proceduralSeed + 61487U);
+        const float secondarySpeed =
+            speed *
+            std::max(
+                0.15F,
+                1.0F +
+                    (0.35F + speedHash * 0.45F) *
+                        speedVariation);
+        const float secondaryDistance = WrapContourPulseDistance(
+            fieldDistanceMeters + phaseHash * span -
+                time * secondarySpeed -
+                evolutionShift * 0.65F,
+            span);
+        pulse +=
+            field.Sample(secondaryDistance) *
+            speedVariation * 0.82F;
+    }
+    if (node.resolvedQuality == WaterSeepageQuality::High) {
+        const float phaseHash =
+            SeepageHash01(47, 71, proceduralSeed + 64763U);
+        const float speedHash =
+            SeepageHash01(61, 83, proceduralSeed + 68371U);
+        const float tertiarySpeed =
+            speed *
+            std::max(
+                0.15F,
+                1.0F -
+                    (0.25F + speedHash * 0.40F) *
+                        speedVariation);
+        const float tertiaryDistance = WrapContourPulseDistance(
+            fieldDistanceMeters + phaseHash * span -
+                time * tertiarySpeed +
+                evolutionShift * 0.40F,
+            span);
+        pulse +=
+            field.Sample(tertiaryDistance) *
+            speedVariation * 0.50F;
+    }
+    return Clamp01(
+        pulse + std::max(0.0F, pulse - 0.82F) * 0.22F);
+}
+
 SeepagePatternSignals EvaluateContourPulseSeepageSignals(
     const WaterSeepageRuntimeNode& node,
     const WaterSeepageLookSettings& look,
     const SeepageFanSample& fan,
     const glm::vec3& position,
     const glm::vec3& pointNormal,
+    float timeSeconds,
     bool transitionPulseField,
     const WaterSeepageViewContext& viewContext) {
     const float rainGain = Clamp01(node.rainVisualStrength * look.rainResponse);
@@ -5424,17 +5538,18 @@ SeepagePatternSignals EvaluateContourPulseSeepageSignals(
     const float baseBowedFront =
         std::pow(std::abs(lateralNormalised), 1.35F) *
         spacing * (0.10F + irregularity * 0.28F);
-    // All launches, independent speeds, slow evolution, and additive overlap
-    // were composed once for this node into a stable longitudinal field.
-    // Per point, stationary world noise only bends the lookup coordinate.
+    // Authored launches and fractional wave count are composed into a stable
+    // reference field. Renderer time supplies motion/evolution below while
+    // stationary world noise bends each point's lookup coordinate.
     const float frontWarp =
         centredNoise * spacing * irregularity * 0.25F;
-    const auto& pulseField = transitionPulseField
-                                 ? node.transitionPulseField
-                                 : node.pulseField;
     const float pulse = Clamp01(
-        pulseField.Sample(
-            downstream + baseBowedFront + frontWarp) *
+        SampleAnimatedContourPulseField(
+            node,
+            look,
+            transitionPulseField,
+            downstream + baseBowedFront + frontWarp,
+            timeSeconds) *
         std::lerp(0.82F, 1.16F, frontNoise.value));
 
     const float coverageThreshold = 0.72F - density * 0.38F;
@@ -7961,8 +8076,7 @@ WaterSeepagePulseFieldQuality ResolveSeepagePulseFieldQuality(
 
 WaterSeepagePulseField BuildRuntimeSeepagePulseField(
     const WaterSeepageRuntimeNode& node,
-    const WaterSeepageLookSettings& look,
-    float sampleTimeSeconds) {
+    const WaterSeepageLookSettings& look) {
     if (look.pattern != WaterSeepagePattern::ContourPulses) {
         return {};
     }
@@ -7979,22 +8093,26 @@ WaterSeepagePulseField BuildRuntimeSeepagePulseField(
     settings.nodeId = node.id;
     settings.quality =
         ResolveSeepagePulseFieldQuality(node.resolvedQuality);
-    // Preserve the old minimum cycle domain for very small authored support,
-    // but never derive it from live reach/Strength/Rain.
+    // Include a fixed idle tail after the immutable support extent. The last
+    // reference sample is made equal to the first below, so wrapped shader
+    // sampling crosses the cycle boundary without a visible flash.
     settings.stableSpanMeters = std::max(
-        std::max(0.005F, node.pulseStableSpanMeters),
-        std::max(0.005F, look.pulseSpacingMeters) * 2.5F);
-    settings.timeSeconds = sampleTimeSeconds;
-    return BuildWaterSeepagePulseField(settings);
+        0.005F,
+        std::max(0.005F, node.pulseStableSpanMeters) +
+            std::max(0.005F, look.pulseSpacingMeters) * 2.5F);
+    settings.timeSeconds = 0.0F;
+    auto field = BuildWaterSeepagePulseField(settings);
+    if (field.sampleCount > 1U) {
+        field.samples[field.sampleCount - 1U] = field.samples[0U];
+    }
+    return field;
 }
 
 std::uint64_t WaterSeepagePulseFieldPreparationFingerprint(
-    const WaterSeepageRuntimeNode& node,
-    float currentTime,
-    float transitionTime) {
+    const WaterSeepageRuntimeNode& node) {
     std::uint64_t hash = 1469598103934665603ULL;
     const auto fingerprintLook =
-        [&](const WaterSeepageLookSettings& look, float time) {
+        [&](const WaterSeepageLookSettings& look) {
             SeepageFingerprintU32(
                 &hash,
                 static_cast<std::uint32_t>(look.pattern));
@@ -8003,14 +8121,8 @@ std::uint64_t WaterSeepagePulseFieldPreparationFingerprint(
             }
             SeepageFingerprintFloat(&hash, look.pulseSpacingMeters);
             SeepageFingerprintFloat(&hash, look.pulseWidthMeters);
-            SeepageFingerprintFloat(
-                &hash,
-                look.pulseSpeedMetersPerSecond);
             SeepageFingerprintFloat(&hash, look.pulseIrregularity);
             SeepageFingerprintFloat(&hash, look.pulseWaveCount);
-            SeepageFingerprintFloat(&hash, look.pulseSpeedVariation);
-            SeepageFingerprintFloat(&hash, look.evolution);
-            SeepageFingerprintFloat(&hash, time);
         };
     SeepageFingerprintU32(&hash, node.id);
     SeepageFingerprintU32(&hash, node.seed);
@@ -8020,14 +8132,12 @@ std::uint64_t WaterSeepagePulseFieldPreparationFingerprint(
     SeepageFingerprintFloat(
         &hash,
         node.pulseStableSpanMeters);
-    fingerprintLook(node.look, currentTime);
+    fingerprintLook(node.look);
     SeepageFingerprintU32(
         &hash,
         node.transitionLook.has_value() ? 1U : 0U);
     if (node.transitionLook.has_value()) {
-        fingerprintLook(
-            node.transitionLook.value(),
-            transitionTime);
+        fingerprintLook(node.transitionLook.value());
     }
     // Zero is reserved for an unprepared runtime node.
     return hash == 0U ? 1U : hash;
@@ -8035,32 +8145,12 @@ std::uint64_t WaterSeepagePulseFieldPreparationFingerprint(
 
 void PrepareRuntimeSeepagePulseFields(
     WaterSeepageRuntimeNode* node,
-    float sampleTimeSeconds) {
+    float /*sampleTimeSeconds*/) {
     if (node == nullptr) {
         return;
     }
-    const float time = std::max(
-        0.0F,
-        SeepageFiniteOr(sampleTimeSeconds, 0.0F));
-    const auto pulseFieldAnimates =
-        [](const WaterSeepageLookSettings& look) {
-            return look.pattern ==
-                       WaterSeepagePattern::ContourPulses &&
-                   (look.pulseSpeedMetersPerSecond > 1.0e-6F ||
-                    look.evolution > 1.0e-6F);
-        };
-    const float currentTime =
-        pulseFieldAnimates(node->look) ? time : 0.0F;
-    const float transitionTime =
-        node->transitionLook.has_value() &&
-                pulseFieldAnimates(node->transitionLook.value())
-            ? time
-            : 0.0F;
     const auto preparationFingerprint =
-        WaterSeepagePulseFieldPreparationFingerprint(
-            *node,
-            currentTime,
-            transitionTime);
+        WaterSeepagePulseFieldPreparationFingerprint(*node);
     if (node->pulseFieldPreparationFingerprint ==
         preparationFingerprint) {
         return;
@@ -8068,24 +8158,12 @@ void PrepareRuntimeSeepagePulseFields(
     node->pulseField =
         BuildRuntimeSeepagePulseField(
             *node,
-            node->look,
-            currentTime);
+            node->look);
     node->transitionPulseField = node->transitionLook.has_value()
                                      ? BuildRuntimeSeepagePulseField(
                                            *node,
-                                           node->transitionLook.value(),
-                                           transitionTime)
+                                           node->transitionLook.value())
                                      : node->pulseField;
-    const bool hasContourPulses =
-        node->look.pattern == WaterSeepagePattern::ContourPulses ||
-        (node->transitionLook.has_value() &&
-         node->transitionLook->pattern ==
-             WaterSeepagePattern::ContourPulses);
-    node->pulseFieldTimeSeconds =
-        hasContourPulses &&
-                (currentTime > 0.0F || transitionTime > 0.0F)
-            ? time
-            : 0.0F;
     node->pulseFieldPreparationFingerprint =
         preparationFingerprint;
 }
@@ -8877,6 +8955,7 @@ WaterSeepageRuntimeContribution EvaluateWaterSeepageRuntimeContributionWithFan(
                 wettingFan,
                 ToGlm(position),
                 pointNormal,
+                timeSeconds,
                 selectedLook.transition,
                 viewContext);
             break;
@@ -9359,9 +9438,6 @@ std::string WaterSeepageParamsFingerprint(const WaterSeepageSpatialGrid& grid) {
         if (hasContourPulseField) {
             SeepageFingerprintFloat(
                 &hash,
-                node.pulseFieldTimeSeconds);
-            SeepageFingerprintFloat(
-                &hash,
                 node.pulseStableSpanMeters);
             SeepageFingerprintU32(
                 &hash,
@@ -9371,7 +9447,7 @@ std::string WaterSeepageParamsFingerprint(const WaterSeepageSpatialGrid& grid) {
                 node.transitionPulseField.sampleCount);
         }
     }
-    return "water-seepage-params-v6-" + SeepageFingerprintString(hash);
+    return "water-seepage-params-v7-" + SeepageFingerprintString(hash);
 }
 
 WaterSettingsBundle DefaultWaterSettingsBundle(WaterScaleMode mode) {

@@ -206,6 +206,148 @@ TEST_CASE("Current project schema round-trips authoritative scene density groups
         legacyMirror.selectedSceneVariantPath);
 }
 
+TEST_CASE("Shoreline profile libraries round-trip while legacy files retain their authored visual",
+          "[project][serialization][water][shoreline][profiles]") {
+  using invisible_places::renderer::pointcloud::CalmPointCloudShorelineWaveSettings;
+  using invisible_places::renderer::pointcloud::PointCloudShorelineWaveAlgorithm;
+  using invisible_places::renderer::pointcloud::PointCloudShorelineWaveProfile;
+  using invisible_places::renderer::pointcloud::PointCloudStyleState;
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::LoadWaterSourcesDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::serialization::SaveWaterSourcesDocument;
+  using invisible_places::serialization::WaterSourcesDocument;
+
+  auto defaultSettings = CalmPointCloudShorelineWaveSettings();
+  defaultSettings.foamFronts.phase = 0.37F;
+  defaultSettings.heightFoam.runupZ = 2.12F;
+
+  auto stormSettings = defaultSettings;
+  stormSettings.algorithm = PointCloudShorelineWaveAlgorithm::HeightFoam;
+  stormSettings.heightFoam.intensity = 1.82F;
+  stormSettings.heightFoam.colour = {0.31F, 0.52F, 0.79F};
+  const PointCloudShorelineWaveProfile storm{
+      .name = "Storm",
+      .settings = stormSettings,
+  };
+
+  ProjectDocument project;
+  project.projectName = "shoreline-profile-library";
+  PointCloudStyleState authoredVisual;
+  authoredVisual.exposure = 1.67F;
+  authoredVisual.shorelineWaveEnabled = true;
+  authoredVisual.shorelineIntensity = 2.41F;
+  project.pointVisuals.push_back({
+      .name = "Authored",
+      .style = authoredVisual,
+  });
+  project.selectedPointVisualName = "Authored";
+  project.waterShorelineDefaultSettings = defaultSettings;
+  project.waterShorelineProfiles = {storm};
+  project.selectedWaterShorelineProfileName = "Storm";
+
+  TemporaryProjectFile projectFile{
+      "invisible_places_shoreline_profiles_current.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(project, projectFile.path, &errorMessage));
+  const auto loadedProject =
+      LoadProjectDocument(projectFile.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loadedProject.has_value());
+  REQUIRE(loadedProject->waterShorelineDefaultSettings.has_value());
+  CHECK(
+      loadedProject->waterShorelineDefaultSettings->foamFronts.phase ==
+      Catch::Approx(0.37F));
+  CHECK(
+      loadedProject->waterShorelineDefaultSettings->heightFoam.runupZ ==
+      Catch::Approx(2.12F));
+  REQUIRE(loadedProject->waterShorelineProfiles.size() == 1U);
+  CHECK(loadedProject->waterShorelineProfiles.front().name == "Storm");
+  CHECK(
+      loadedProject->waterShorelineProfiles.front().settings.algorithm ==
+      PointCloudShorelineWaveAlgorithm::HeightFoam);
+  CHECK(
+      loadedProject->waterShorelineProfiles.front()
+          .settings.heightFoam.intensity == Catch::Approx(1.82F));
+  CHECK(
+      loadedProject->waterShorelineProfiles.front()
+          .settings.heightFoam.colour[1] == Catch::Approx(0.52F));
+  CHECK(loadedProject->selectedWaterShorelineProfileName == "Storm");
+
+  {
+    std::ifstream input{projectFile.path};
+    REQUIRE(input.is_open());
+    auto legacyJson = nlohmann::json::parse(input);
+    CHECK(legacyJson.at("schema_version") ==
+          kProjectDocumentSchemaVersion);
+    legacyJson["schema_version"] = 47U;
+    legacyJson.erase("water_shoreline_default_settings");
+    legacyJson.erase("water_shoreline_profiles");
+    legacyJson.erase("selected_water_shoreline_profile");
+    std::ofstream output{projectFile.path};
+    REQUIRE(output.is_open());
+    output << legacyJson.dump(2);
+  }
+  const auto legacyProject =
+      LoadProjectDocument(projectFile.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(legacyProject.has_value());
+  CHECK(legacyProject->schemaVersion == kProjectDocumentSchemaVersion);
+  CHECK_FALSE(legacyProject->waterShorelineDefaultSettings.has_value());
+  CHECK(legacyProject->waterShorelineProfiles.empty());
+  CHECK(legacyProject->selectedWaterShorelineProfileName == "Default");
+  REQUIRE(legacyProject->pointVisuals.size() == 1U);
+  CHECK(legacyProject->pointVisuals.front().style.exposure ==
+        Catch::Approx(1.67F));
+  CHECK(legacyProject->pointVisuals.front().style.shorelineIntensity ==
+        Catch::Approx(2.41F));
+
+  WaterSourcesDocument sources;
+  sources.shorelineDefaultSettings = defaultSettings;
+  sources.shorelineProfiles = {storm};
+  sources.selectedShorelineProfileName = "Storm";
+  TemporaryProjectFile sourcesFile{
+      "invisible_places_shoreline_profiles_sources.json"};
+  REQUIRE(SaveWaterSourcesDocument(sources, sourcesFile.path, &errorMessage));
+  const auto loadedSources =
+      LoadWaterSourcesDocument(sourcesFile.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loadedSources.has_value());
+  CHECK(loadedSources->schemaVersion == kWaterSourcesDocumentSchemaVersion);
+  REQUIRE(loadedSources->shorelineDefaultSettings.has_value());
+  CHECK(loadedSources->shorelineDefaultSettings->foamFronts.boundaryZ ==
+        Catch::Approx(1.595F));
+  REQUIRE(loadedSources->shorelineProfiles.size() == 1U);
+  CHECK(loadedSources->shorelineProfiles.front().name == "Storm");
+  CHECK(loadedSources->shorelineProfiles.front()
+            .settings.heightFoam.intensity == Catch::Approx(1.82F));
+  CHECK(loadedSources->selectedShorelineProfileName == "Storm");
+
+  {
+    std::ifstream input{sourcesFile.path};
+    REQUIRE(input.is_open());
+    auto legacyJson = nlohmann::json::parse(input);
+    CHECK(legacyJson.at("schema_version") ==
+          kWaterSourcesDocumentSchemaVersion);
+    legacyJson["schema_version"] = 19U;
+    legacyJson.erase("water_shoreline_default_settings");
+    legacyJson.erase("water_shoreline_profiles");
+    legacyJson.erase("selected_water_shoreline_profile");
+    std::ofstream output{sourcesFile.path};
+    REQUIRE(output.is_open());
+    output << legacyJson.dump(2);
+  }
+  const auto legacySources =
+      LoadWaterSourcesDocument(sourcesFile.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(legacySources.has_value());
+  CHECK(legacySources->schemaVersion == 19U);
+  CHECK_FALSE(legacySources->shorelineDefaultSettings.has_value());
+  CHECK(legacySources->shorelineProfiles.empty());
+  CHECK(legacySources->selectedShorelineProfileName == "Default");
+}
+
 TEST_CASE("Schema 45 selects the explicit matching water scene instead of the first state",
           "[project][serialization][water][scene-ownership]") {
   using invisible_places::serialization::LoadProjectDocument;

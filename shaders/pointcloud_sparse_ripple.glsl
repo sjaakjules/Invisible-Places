@@ -2389,6 +2389,120 @@ float SampleSeepagePulseField(
         fract(sampleCoordinate));
 }
 
+float WrapSeepagePulseDistance(
+    float distanceMeters,
+    float stableSpanMeters) {
+    if (!RippleFiniteFloat(distanceMeters) ||
+        !RippleFiniteFloat(stableSpanMeters) ||
+        stableSpanMeters <= 1e-6) {
+        return 0.0;
+    }
+    return mod(distanceMeters, stableSpanMeters);
+}
+
+float SampleAnimatedSeepagePulseField(
+    uint nodeIndex,
+    bool transition,
+    float fieldDistanceMeters,
+    float timeSeconds,
+    vec4 legacy0,
+    vec4 legacy1,
+    vec4 organic0,
+    uint quality,
+    uint proceduralSeed) {
+    const uvec4 fieldControl =
+        seepageParamData.seepageParams[nodeIndex].pulseFieldControl;
+    const float stableSpan = uintBitsToFloat(
+        transition ? fieldControl.w : fieldControl.z);
+    if (!RippleFiniteFloat(stableSpan) || stableSpan <= 1e-6) {
+        return 0.0;
+    }
+
+    const float time = max(
+        0.0,
+        RippleFiniteFloat(timeSeconds) ? timeSeconds : 0.0);
+    const float speed = max(0.0, legacy0.z);
+    const float speedVariation = clamp(legacy1.y, 0.0, 1.0);
+    const float irregularity = clamp(legacy0.w, 0.0, 1.0);
+    const float evolution = max(0.0, organic0.z);
+    const float evolutionHash =
+        SeepageNoiseHash01(7, 19, proceduralSeed + 49201u);
+    const float evolutionPhase = mod(
+        time * evolution * (0.15 + evolutionHash * 0.25) +
+            evolutionHash * kRippleTwoPi,
+        kRippleTwoPi);
+    const float evolutionShift =
+        sin(evolutionPhase) *
+        max(0.001, legacy0.y) *
+        irregularity * 0.55;
+
+    // The compact field is built only when authored shape settings change.
+    // Frame time advances the lookup here, so camera scrubbing and a stalled
+    // support worker cannot freeze the visible wave phase.
+    const float primaryDistance = WrapSeepagePulseDistance(
+        fieldDistanceMeters - time * speed + evolutionShift,
+        stableSpan);
+    float pulse = SampleSeepagePulseField(
+        nodeIndex,
+        transition,
+        primaryDistance);
+
+    // Quality-scaled neighbouring phase populations preserve irregular
+    // catch-up and additive overlap with at most three interpolated lookups.
+    if (quality >= 2u) {
+        const float phaseHash =
+            SeepageNoiseHash01(23, 41, proceduralSeed + 58309u);
+        const float speedHash =
+            SeepageNoiseHash01(31, 59, proceduralSeed + 61487u);
+        const float secondarySpeed =
+            speed *
+            max(
+                0.15,
+                1.0 +
+                    (0.35 + speedHash * 0.45) *
+                        speedVariation);
+        const float secondaryDistance = WrapSeepagePulseDistance(
+            fieldDistanceMeters + phaseHash * stableSpan -
+                time * secondarySpeed -
+                evolutionShift * 0.65,
+            stableSpan);
+        pulse +=
+            SampleSeepagePulseField(
+                nodeIndex,
+                transition,
+                secondaryDistance) *
+            speedVariation * 0.82;
+    }
+    if (quality >= 3u) {
+        const float phaseHash =
+            SeepageNoiseHash01(47, 71, proceduralSeed + 64763u);
+        const float speedHash =
+            SeepageNoiseHash01(61, 83, proceduralSeed + 68371u);
+        const float tertiarySpeed =
+            speed *
+            max(
+                0.15,
+                1.0 -
+                    (0.25 + speedHash * 0.40) *
+                        speedVariation);
+        const float tertiaryDistance = WrapSeepagePulseDistance(
+            fieldDistanceMeters + phaseHash * stableSpan -
+                time * tertiarySpeed +
+                evolutionShift * 0.40,
+            stableSpan);
+        pulse +=
+            SampleSeepagePulseField(
+                nodeIndex,
+                transition,
+                tertiaryDistance) *
+            speedVariation * 0.50;
+    }
+    return clamp(
+        pulse + max(0.0, pulse - 0.82) * 0.22,
+        0.0,
+        1.0);
+}
+
 vec3 SeepagePatternSignals(
     uint nodeIndex,
     bool transition,
@@ -2449,20 +2563,26 @@ vec3 SeepagePatternSignals(
         const float baseBowedFront =
             pow(abs(lateralNormalised), 1.35) *
             spacing * (0.10 + irregularity * 0.28);
-        // All authored wave launches and their slow evolution were composed
-        // once for this node into a fixed-span longitudinal field. Per point,
-        // stationary world noise only bows/roughens the lookup coordinate.
-        // This keeps Strength/Rain reveals from teleporting wave phase and
-        // replaces the former 7–12-wave inner loop with one interpolation.
+        // Authored launches and fractional Wave Count are composed only when
+        // shape settings change. Renderer time supplies motion/evolution,
+        // while stationary world noise bows/roughens each lookup coordinate.
+        // Strength/Rain reveals cannot teleport phase, and the former
+        // 7–12-wave inner loop becomes at most three interpolations.
         const float frontWarp =
             centredNoise * spacing * irregularity * 0.25;
         const float fieldDistance =
             downstream + baseBowedFront + frontWarp;
         const float pulse = clamp(
-            SampleSeepagePulseField(
+            SampleAnimatedSeepagePulseField(
                 nodeIndex,
                 transition,
-                fieldDistance) *
+                fieldDistance,
+                time,
+                legacy0,
+                legacy1,
+                organic0,
+                seepageParamData.seepageParams[nodeIndex].control.y,
+                proceduralSeed) *
                 mix(0.82, 1.16, frontNoise.value),
             0.0,
             1.0);
