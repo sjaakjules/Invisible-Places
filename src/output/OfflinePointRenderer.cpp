@@ -956,7 +956,14 @@ glm::vec3 ApplyColorize(
         style.colorizeColor[1],
         style.colorizeColor[2],
     });
-    const auto colorized = HslToRgb({tintHsl.x, tintHsl.y, sourceHsl.z});
+    // Carry most of the selected colour's lightness (matching the GPU
+    // colorize) so brightness and vividness of the selection participate.
+    const float colorizedLightness = std::clamp(
+        std::lerp(sourceHsl.z, tintHsl.z, 0.65F),
+        0.0F,
+        1.0F);
+    const auto colorized =
+        HslToRgb({tintHsl.x, tintHsl.y, colorizedLightness});
     return glm::mix(baseColor, colorized, amount);
 }
 

@@ -13916,7 +13916,7 @@ TEST_CASE("Offline point depth fade reduces alpha without changing color ratio",
           Catch::Approx(noFade.beautyR[center] / noFade.alpha[center]).margin(0.02F));
 }
 
-TEST_CASE("Offline point colourise recolours while preserving lightness", "[output][offline][point-style]") {
+TEST_CASE("Offline point colourise carries the selected colour lightness", "[output][offline][point-style]") {
     invisible_places::io::LoadedPointCloud cloud;
     cloud.positions = {{0.0F, 0.0F, 0.0F}};
     cloud.packedColors = {0xFF000080U};
@@ -13929,11 +13929,12 @@ TEST_CASE("Offline point colourise recolours while preserving lightness", "[outp
     cameraState.farPlane = 20.0F;
     WriteLookAtOrientation(&cameraState);
 
-    auto renderWithColourise = [&](float amount) {
+    auto renderWithColourise = [&](std::array<float, 3> colour,
+                                   float amount) {
         invisible_places::renderer::pointcloud::PointCloudStyleState style;
         style.colorMode = invisible_places::renderer::pointcloud::PointCloudColorMode::SourceRgb;
         style.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::HardDisc;
-        style.colorizeColor = {0.0F, 0.0F, 1.0F};
+        style.colorizeColor = {colour[0], colour[1], colour[2]};
         style.colorizeAmount = amount;
         invisible_places::style::SetScalarConstant(&style.pointSize, 5.0F);
         invisible_places::style::SetScalarConstant(&style.opacity, 1.0F);
@@ -13954,15 +13955,24 @@ TEST_CASE("Offline point colourise recolours while preserving lightness", "[outp
         return image;
     };
 
-    const auto unchanged = renderWithColourise(0.0F);
-    const auto colourised = renderWithColourise(1.0F);
+    const auto unchanged = renderWithColourise({0.0F, 0.0F, 1.0F}, 0.0F);
+    const auto brightBlue = renderWithColourise({0.0F, 0.0F, 1.0F}, 1.0F);
+    const auto darkBlue = renderWithColourise({0.0F, 0.0F, 0.30F}, 1.0F);
     const auto center = static_cast<std::size_t>(4) * 9U + 4U;
     REQUIRE(unchanged.alpha[center] > 0.0F);
-    REQUIRE(colourised.alpha[center] > 0.0F);
+    REQUIRE(brightBlue.alpha[center] > 0.0F);
+    REQUIRE(darkBlue.alpha[center] > 0.0F);
     CHECK(unchanged.beautyR[center] > unchanged.beautyB[center]);
-    CHECK(colourised.beautyB[center] > colourised.beautyR[center]);
-    CHECK((colourised.beautyB[center] / colourised.alpha[center]) ==
-          Catch::Approx(unchanged.beautyR[center] / unchanged.alpha[center]).margin(0.03F));
+    CHECK(brightBlue.beautyB[center] > brightBlue.beautyR[center]);
+    CHECK(darkBlue.beautyB[center] > darkBlue.beautyR[center]);
+    // The selected colour's lightness participates: a bright selection lifts
+    // the dark source point well above its original lightness...
+    CHECK(brightBlue.beautyB[center] / brightBlue.alpha[center] >
+          unchanged.beautyR[center] / unchanged.alpha[center] + 0.05F);
+    // ...and a darker selection of the same hue lands visibly darker than
+    // the bright one, so value is no longer invariant.
+    CHECK(darkBlue.beautyB[center] / darkBlue.alpha[center] <
+          brightBlue.beautyB[center] / brightBlue.alpha[center] - 0.05F);
 }
 
 TEST_CASE("Offline point solid centres can reach opaque alpha", "[output][offline][point-style]") {

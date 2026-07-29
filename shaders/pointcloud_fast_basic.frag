@@ -293,7 +293,14 @@ vec3 ApplyColorize(vec3 baseColor) {
     }
     const vec3 sourceHsl = RgbToHsl(clamp(baseColor, 0.0, 1.0));
     const vec3 tintHsl = RgbToHsl(clamp(styleData.colorize.rgb, 0.0, 1.0));
-    return mix(baseColor, HslToRgb(vec3(tintHsl.x, tintHsl.y, sourceHsl.z)), amount);
+    // Carry most of the selected colour's lightness so brightness and
+    // vividness of the selection participate in the blend.
+    const float colorizedLightness =
+        clamp(mix(sourceHsl.z, tintHsl.z, 0.65), 0.0, 1.0);
+    return mix(
+        baseColor,
+        HslToRgb(vec3(tintHsl.x, tintHsl.y, colorizedLightness)),
+        amount);
 }
 
 vec3 ResolveBaseColor() {

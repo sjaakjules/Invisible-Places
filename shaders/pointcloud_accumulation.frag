@@ -173,7 +173,14 @@ vec3 ApplyColorize(vec3 baseColor) {
     }
     const vec3 sourceHsl = RgbToHsl(clamp(baseColor, 0.0, 1.0));
     const vec3 tintHsl = RgbToHsl(clamp(styleData.colorize.rgb, 0.0, 1.0));
-    const vec3 colorized = HslToRgb(vec3(tintHsl.x, tintHsl.y, sourceHsl.z));
+    // Carry most of the selected colour's lightness (keeping some of the
+    // point's own shading detail) so a brighter or more vivid selection
+    // genuinely brightens and saturates the result instead of only
+    // re-hueing it at the point's original lightness.
+    const float colorizedLightness =
+        clamp(mix(sourceHsl.z, tintHsl.z, 0.65), 0.0, 1.0);
+    const vec3 colorized =
+        HslToRgb(vec3(tintHsl.x, tintHsl.y, colorizedLightness));
     return mix(baseColor, colorized, amount);
 }
 
