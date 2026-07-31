@@ -39,6 +39,9 @@ struct TimingColouriseFieldSelector {
 };
 
 struct TimingColourisePaletteStop {
+    // Stable within one palette/effect. Animation tracks refer to this id so
+    // sorting or moving stops never exchanges their authored properties.
+    std::string id;
     float position = 0.0F;
     std::array<float, 3> colour{1.0F, 1.0F, 1.0F};
     // Mix amount for the sampled colour. This never changes point opacity.
@@ -48,6 +51,26 @@ struct TimingColourisePaletteStop {
 struct TimingColourisePalette {
     std::vector<TimingColourisePaletteStop> stops{
         TimingColourisePaletteStop{}};
+};
+
+// Whole-palette snapshots are retained for projects authored before
+// independent stop-property keying. New effects use StopParameters: their
+// stop topology is static and each stop property owns its own curve.
+enum class TimingColourisePaletteKeyModel : std::uint8_t {
+    LegacySnapshots = 0,
+    StopParameters,
+};
+
+enum class TimingColourisePaletteSourceKind : std::uint8_t {
+    Custom = 0,
+    Preset,
+    Saved,
+};
+
+enum class TimingColourisePaletteStopParameter : std::uint8_t {
+    Position = 0,
+    Colour,
+    ColouriseAmount,
 };
 
 using TimingColouriseLut =
@@ -108,6 +131,19 @@ struct TimingColourisePaletteKey {
         invisible_places::water::WaterScenarioInterpolation::Smooth;
 };
 
+struct TimingColourisePaletteStopParameterKey {
+    std::string stopId;
+    TimingColourisePaletteStopParameter parameter =
+        TimingColourisePaletteStopParameter::Position;
+    // Normalized animation position, not the stop's position in the palette.
+    float position = 0.0F;
+    // Position and ColouriseAmount use scalarValue; Colour uses colourValue.
+    float scalarValue = 0.0F;
+    std::array<float, 3> colourValue{1.0F, 1.0F, 1.0F};
+    invisible_places::water::WaterScenarioInterpolation interpolation =
+        invisible_places::water::WaterScenarioInterpolation::Smooth;
+};
+
 struct TimingColouriseBoundsKey {
     float position = 0.0F;
     TimingColouriseBounds bounds{};
@@ -122,7 +158,20 @@ struct TimingColouriseEffect {
     TimingColouriseFieldSelector field{};
     TimingColourisePalette basePalette{};
     TimingColouriseBounds baseBounds{};
+    TimingColourisePaletteKeyModel paletteKeyModel =
+        TimingColourisePaletteKeyModel::StopParameters;
+    TimingColourisePaletteSourceKind paletteSourceKind =
+        TimingColourisePaletteSourceKind::Custom;
+    // Provenance is authoring metadata only. Evaluation always uses the
+    // copied palette stored on this effect, never a live library reference.
+    std::string paletteSourceId;
+    std::string paletteSourceName;
+    bool paletteEdited = false;
+    // Legacy whole-palette snapshots remain active only in LegacySnapshots
+    // mode. New authoring writes the independent tracks below.
     std::vector<TimingColourisePaletteKey> paletteKeys;
+    std::vector<TimingColourisePaletteStopParameterKey>
+        paletteStopParameterKeys;
     TimingColouriseBoundsKeyMode boundsKeyMode =
         TimingColouriseBoundsKeyMode::LowerUpper;
     // New independently keyed bounds controls. Legacy whole-bounds keys remain
@@ -166,6 +215,8 @@ struct TimingColouriseLayerSample {
 
 [[nodiscard]] TimingColourisePalette SanitizeTimingColourisePalette(
     TimingColourisePalette palette);
+[[nodiscard]] std::string AllocateTimingColourisePaletteStopId(
+    const TimingColourisePalette& palette);
 [[nodiscard]] TimingColouriseBounds SanitizeTimingColouriseBounds(
     TimingColouriseBounds bounds);
 [[nodiscard]] bool TimingColouriseBoundsParameterIsAllowed(
@@ -204,6 +255,9 @@ SanitizeTimingColourisePaletteDefinition(
 
 [[nodiscard]] TimingColouriseLut CompileTimingColourisePaletteLut(
     const TimingColourisePalette& palette);
+[[nodiscard]] TimingColourisePalette EvaluateTimingColourisePalette(
+    const TimingColouriseEffect& effect,
+    float normalizedPosition);
 [[nodiscard]] TimingColouriseLut EvaluateTimingColourisePaletteLut(
     const TimingColouriseEffect& effect,
     float normalizedPosition);
@@ -229,6 +283,21 @@ void AddOrUpdateTimingColourisePaletteKey(
     TimingColourisePalette palette,
     invisible_places::water::WaterScenarioInterpolation interpolation =
         invisible_places::water::WaterScenarioInterpolation::Smooth);
+[[nodiscard]] bool AddOrUpdateTimingColourisePaletteStopScalarKey(
+    TimingColouriseEffect* effect,
+    std::string_view stopId,
+    TimingColourisePaletteStopParameter parameter,
+    float position,
+    float value,
+    invisible_places::water::WaterScenarioInterpolation interpolation =
+        invisible_places::water::WaterScenarioInterpolation::Smooth);
+[[nodiscard]] bool AddOrUpdateTimingColourisePaletteStopColourKey(
+    TimingColouriseEffect* effect,
+    std::string_view stopId,
+    float position,
+    std::array<float, 3> colour,
+    invisible_places::water::WaterScenarioInterpolation interpolation =
+        invisible_places::water::WaterScenarioInterpolation::Smooth);
 void AddOrUpdateTimingColouriseBoundsKey(
     TimingColouriseEffect* effect,
     float position,
@@ -246,6 +315,10 @@ void AddOrUpdateTimingColouriseBoundsKey(
     TimingColouriseEffect* effect,
     float sourcePosition,
     float destinationPosition);
+[[nodiscard]] bool CanMoveTimingColourisePaletteKeysAtPosition(
+    const TimingColouriseEffect& effect,
+    float sourcePosition,
+    float destinationPosition);
 [[nodiscard]] bool MoveTimingColouriseBoundsKey(
     TimingColouriseEffect* effect,
     float sourcePosition,
@@ -257,6 +330,12 @@ void AddOrUpdateTimingColouriseBoundsKey(
     float destinationPosition);
 [[nodiscard]] std::size_t TimingColourisePaletteKeyCountAtPosition(
     const TimingColouriseEffect& effect,
+    float position);
+[[nodiscard]] std::size_t
+TimingColourisePaletteStopParameterKeyCountAtPosition(
+    const TimingColouriseEffect& effect,
+    std::string_view stopId,
+    TimingColourisePaletteStopParameter parameter,
     float position);
 [[nodiscard]] std::size_t
 TimingColouriseBoundsParameterKeyCountAtPosition(
@@ -271,6 +350,12 @@ TimingColouriseBoundsParameterKeyCountAtPosition(
     float position);
 [[nodiscard]] std::size_t RemoveTimingColourisePaletteKeysAtPosition(
     TimingColouriseEffect* effect,
+    float position);
+[[nodiscard]] std::size_t
+RemoveTimingColourisePaletteStopParameterKeysAtPosition(
+    TimingColouriseEffect* effect,
+    std::string_view stopId,
+    TimingColourisePaletteStopParameter parameter,
     float position);
 [[nodiscard]] std::size_t RemoveTimingColouriseBoundsKeysAtPosition(
     TimingColouriseEffect* effect,
@@ -290,6 +375,19 @@ PreviousTimingColourisePaletteKeyPosition(
 [[nodiscard]] std::optional<float> NextTimingColourisePaletteKeyPosition(
     const TimingColouriseEffect& effect,
     float position);
+[[nodiscard]] std::vector<float> TimingColourisePaletteKeyPositions(
+    const TimingColouriseEffect& effect);
+// Stop topology is static for independent property tracks. Removing a stop
+// is refused while it has keys, preserving dormant animation data.
+[[nodiscard]] bool CanRemoveTimingColourisePaletteStop(
+    const TimingColouriseEffect& effect,
+    std::string_view stopId);
+[[nodiscard]] bool RemoveTimingColourisePaletteStop(
+    TimingColouriseEffect* effect,
+    std::string_view stopId);
+[[nodiscard]] std::string TimingColourisePaletteKeyStateName(
+    std::string_view paletteName,
+    std::size_t orderedPosition);
 [[nodiscard]] std::optional<float>
 PreviousTimingColouriseBoundsKeyPosition(
     const TimingColouriseEffect& effect,

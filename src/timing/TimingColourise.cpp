@@ -2,8 +2,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
 #include <limits>
 #include <numeric>
+#include <sstream>
+#include <unordered_set>
 #include <utility>
 
 namespace invisible_places::timing {
@@ -75,6 +78,87 @@ bool IsValidBoundsParameter(TimingColouriseBoundsParameter parameter) {
             return true;
     }
     return false;
+}
+
+bool IsValidPaletteKeyModel(TimingColourisePaletteKeyModel model) {
+    switch (model) {
+        case TimingColourisePaletteKeyModel::LegacySnapshots:
+        case TimingColourisePaletteKeyModel::StopParameters:
+            return true;
+    }
+    return false;
+}
+
+bool IsValidPaletteSourceKind(TimingColourisePaletteSourceKind kind) {
+    switch (kind) {
+        case TimingColourisePaletteSourceKind::Custom:
+        case TimingColourisePaletteSourceKind::Preset:
+        case TimingColourisePaletteSourceKind::Saved:
+            return true;
+    }
+    return false;
+}
+
+bool IsValidPaletteStopParameter(
+    TimingColourisePaletteStopParameter parameter) {
+    switch (parameter) {
+        case TimingColourisePaletteStopParameter::Position:
+        case TimingColourisePaletteStopParameter::Colour:
+        case TimingColourisePaletteStopParameter::ColouriseAmount:
+            return true;
+    }
+    return false;
+}
+
+float SanitizePaletteStopScalarValue(
+    TimingColourisePaletteStopParameter parameter,
+    float value) {
+    value = FiniteOr(value, 0.0F);
+    if (parameter == TimingColourisePaletteStopParameter::Position ||
+        parameter ==
+            TimingColourisePaletteStopParameter::ColouriseAmount) {
+        return Clamp01(value);
+    }
+    return value;
+}
+
+std::array<float, 3> SanitizePaletteStopColour(
+    std::array<float, 3> colour) {
+    for (auto& channel : colour) {
+        channel = Clamp01(channel);
+    }
+    return colour;
+}
+
+void SortAndCoalescePaletteStopParameterKeys(
+    std::vector<TimingColourisePaletteStopParameterKey>* keys) {
+    std::stable_sort(
+        keys->begin(),
+        keys->end(),
+        [](const TimingColourisePaletteStopParameterKey& left,
+           const TimingColourisePaletteStopParameterKey& right) {
+            if (left.stopId != right.stopId) {
+                return left.stopId < right.stopId;
+            }
+            if (left.parameter != right.parameter) {
+                return static_cast<std::uint8_t>(left.parameter) <
+                       static_cast<std::uint8_t>(right.parameter);
+            }
+            return left.position < right.position;
+        });
+    std::vector<TimingColourisePaletteStopParameterKey> unique;
+    unique.reserve(keys->size());
+    for (auto& key : *keys) {
+        if (!unique.empty() && unique.back().stopId == key.stopId &&
+            unique.back().parameter == key.parameter &&
+            std::abs(unique.back().position - key.position) <=
+                kTimingColouriseKeyTolerance) {
+            unique.back() = std::move(key);
+        } else {
+            unique.push_back(std::move(key));
+        }
+    }
+    *keys = std::move(unique);
 }
 
 float SanitizeBoundsParameterValue(
@@ -205,6 +289,113 @@ std::optional<float> EvaluateBoundsParameterTrack(
         (normalizedPosition - left->position) /
             (right->position - left->position));
     return std::lerp(left->value, right->value, amount);
+}
+
+struct PaletteStopParameterBrackets {
+    const TimingColourisePaletteStopParameterKey* first = nullptr;
+    const TimingColourisePaletteStopParameterKey* last = nullptr;
+    const TimingColourisePaletteStopParameterKey* left = nullptr;
+    const TimingColourisePaletteStopParameterKey* right = nullptr;
+};
+
+PaletteStopParameterBrackets PaletteStopParameterKeysAround(
+    const std::vector<TimingColourisePaletteStopParameterKey>& keys,
+    std::string_view stopId,
+    TimingColourisePaletteStopParameter parameter,
+    float normalizedPosition) {
+    PaletteStopParameterBrackets result;
+    for (const auto& key : keys) {
+        if (key.stopId != stopId || key.parameter != parameter) {
+            continue;
+        }
+        if (result.first == nullptr) {
+            result.first = &key;
+        }
+        result.last = &key;
+        if (key.position <= normalizedPosition) {
+            result.left = &key;
+        }
+        if (result.right == nullptr && key.position >= normalizedPosition) {
+            result.right = &key;
+        }
+    }
+    if (result.first == nullptr) {
+        return result;
+    }
+    if (normalizedPosition <= result.first->position) {
+        result.left = result.first;
+        result.right = result.first;
+    } else if (normalizedPosition >= result.last->position) {
+        result.left = result.last;
+        result.right = result.last;
+    } else {
+        if (result.left == nullptr) {
+            result.left = result.first;
+        }
+        if (result.right == nullptr) {
+            result.right = result.last;
+        }
+    }
+    return result;
+}
+
+std::optional<float> EvaluatePaletteStopScalarTrack(
+    const std::vector<TimingColourisePaletteStopParameterKey>& keys,
+    std::string_view stopId,
+    TimingColourisePaletteStopParameter parameter,
+    float normalizedPosition) {
+    const auto brackets = PaletteStopParameterKeysAround(
+        keys,
+        stopId,
+        parameter,
+        normalizedPosition);
+    if (brackets.first == nullptr) {
+        return std::nullopt;
+    }
+    if (brackets.left == brackets.right ||
+        std::abs(brackets.right->position - brackets.left->position) <=
+            kTimingColouriseKeyTolerance) {
+        return brackets.right->scalarValue;
+    }
+    const float amount = InterpolationAmount(
+        brackets.left->interpolation,
+        (normalizedPosition - brackets.left->position) /
+            (brackets.right->position - brackets.left->position));
+    return std::lerp(
+        brackets.left->scalarValue,
+        brackets.right->scalarValue,
+        amount);
+}
+
+std::optional<std::array<float, 3>> EvaluatePaletteStopColourTrack(
+    const std::vector<TimingColourisePaletteStopParameterKey>& keys,
+    std::string_view stopId,
+    float normalizedPosition) {
+    const auto brackets = PaletteStopParameterKeysAround(
+        keys,
+        stopId,
+        TimingColourisePaletteStopParameter::Colour,
+        normalizedPosition);
+    if (brackets.first == nullptr) {
+        return std::nullopt;
+    }
+    if (brackets.left == brackets.right ||
+        std::abs(brackets.right->position - brackets.left->position) <=
+            kTimingColouriseKeyTolerance) {
+        return brackets.right->colourValue;
+    }
+    const float amount = InterpolationAmount(
+        brackets.left->interpolation,
+        (normalizedPosition - brackets.left->position) /
+            (brackets.right->position - brackets.left->position));
+    std::array<float, 3> colour{};
+    for (std::size_t channel = 0U; channel < colour.size(); ++channel) {
+        colour[channel] = std::lerp(
+            brackets.left->colourValue[channel],
+            brackets.right->colourValue[channel],
+            amount);
+    }
+    return colour;
 }
 
 TimingColouriseBounds EvaluateLegacyTimingColouriseBounds(
@@ -472,7 +663,49 @@ TimingColourisePalette SanitizeTimingColourisePalette(
     if (palette.stops.empty()) {
         palette.stops.push_back(TimingColourisePaletteStop{});
     }
+    // Reserve every authored id before filling gaps. This keeps a missing id
+    // that sorts before "palette-stop-1" from stealing that existing id.
+    std::unordered_set<std::string> reservedIds;
+    for (const auto& stop : palette.stops) {
+        if (!stop.id.empty()) {
+            reservedIds.insert(stop.id);
+        }
+    }
+    std::unordered_set<std::string> usedIds;
+    std::uint32_t sequence = 1U;
+    for (auto& stop : palette.stops) {
+        if (!stop.id.empty() && usedIds.insert(stop.id).second) {
+            continue;
+        }
+        std::string candidate;
+        do {
+            candidate = "palette-stop-" +
+                        std::to_string(sequence++);
+        } while (reservedIds.contains(candidate) ||
+                 usedIds.contains(candidate));
+        stop.id = std::move(candidate);
+        reservedIds.insert(stop.id);
+        usedIds.insert(stop.id);
+    }
     return palette;
+}
+
+std::string AllocateTimingColourisePaletteStopId(
+    const TimingColourisePalette& palette) {
+    std::unordered_set<std::string> ids;
+    ids.reserve(palette.stops.size());
+    for (const auto& stop : palette.stops) {
+        if (!stop.id.empty()) {
+            ids.insert(stop.id);
+        }
+    }
+    for (std::uint32_t sequence = 1U;; ++sequence) {
+        const std::string candidate =
+            "palette-stop-" + std::to_string(sequence);
+        if (!ids.contains(candidate)) {
+            return candidate;
+        }
+    }
 }
 
 TimingColouriseBounds SanitizeTimingColouriseBounds(
@@ -772,10 +1005,44 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
     effect.basePalette =
         SanitizeTimingColourisePalette(std::move(effect.basePalette));
     effect.baseBounds = SanitizeTimingColouriseBounds(effect.baseBounds);
+    if (!IsValidPaletteKeyModel(effect.paletteKeyModel)) {
+        effect.paletteKeyModel = effect.paletteKeys.empty()
+                                     ? TimingColourisePaletteKeyModel::
+                                           StopParameters
+                                     : TimingColourisePaletteKeyModel::
+                                           LegacySnapshots;
+    }
+    if (!IsValidPaletteSourceKind(effect.paletteSourceKind)) {
+        effect.paletteSourceKind =
+            TimingColourisePaletteSourceKind::Custom;
+    }
+    if (effect.paletteSourceKind ==
+        TimingColourisePaletteSourceKind::Custom) {
+        effect.paletteSourceId.clear();
+    }
     for (auto& key : effect.paletteKeys) {
         key.position = Clamp01(key.position);
         key.palette =
             SanitizeTimingColourisePalette(std::move(key.palette));
+    }
+    std::unordered_set<std::string> stopIds;
+    stopIds.reserve(effect.basePalette.stops.size());
+    for (const auto& stop : effect.basePalette.stops) {
+        stopIds.insert(stop.id);
+    }
+    std::erase_if(
+        effect.paletteStopParameterKeys,
+        [&](const TimingColourisePaletteStopParameterKey& key) {
+            return key.stopId.empty() || !stopIds.contains(key.stopId) ||
+                   !IsValidPaletteStopParameter(key.parameter);
+        });
+    for (auto& key : effect.paletteStopParameterKeys) {
+        key.position = Clamp01(key.position);
+        key.scalarValue = SanitizePaletteStopScalarValue(
+            key.parameter,
+            key.scalarValue);
+        key.colourValue =
+            SanitizePaletteStopColour(key.colourValue);
     }
     for (auto& key : effect.boundsKeys) {
         key.position = Clamp01(key.position);
@@ -799,6 +1066,8 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
             SanitizeBoundsParameterValue(key.parameter, key.value);
     }
     SortAndCoalesceKeys(&effect.paletteKeys);
+    SortAndCoalescePaletteStopParameterKeys(
+        &effect.paletteStopParameterKeys);
     SortAndCoalesceKeys(&effect.boundsKeys);
     SortAndCoalesceBoundsParameterKeys(&effect.boundsParameterKeys);
     return effect;
@@ -861,10 +1130,54 @@ TimingColouriseLut CompileTimingColourisePaletteLut(
     return lut;
 }
 
+TimingColourisePalette EvaluateTimingColourisePalette(
+    const TimingColouriseEffect& effect,
+    float normalizedPosition) {
+    const auto sanitized = SanitizeTimingColouriseEffect(effect);
+    // A legacy snapshot track is evaluated directly as LUTs by
+    // EvaluateTimingColourisePaletteLut. There is no single stop topology
+    // capable of representing its sample-wise interpolation, so this helper
+    // intentionally exposes its authored base palette only.
+    if (sanitized.paletteKeyModel ==
+        TimingColourisePaletteKeyModel::LegacySnapshots) {
+        return sanitized.basePalette;
+    }
+    normalizedPosition = Clamp01(normalizedPosition);
+    auto palette = sanitized.basePalette;
+    for (auto& stop : palette.stops) {
+        stop.position = EvaluatePaletteStopScalarTrack(
+                            sanitized.paletteStopParameterKeys,
+                            stop.id,
+                            TimingColourisePaletteStopParameter::Position,
+                            normalizedPosition)
+                            .value_or(stop.position);
+        stop.colour = EvaluatePaletteStopColourTrack(
+                          sanitized.paletteStopParameterKeys,
+                          stop.id,
+                          normalizedPosition)
+                          .value_or(stop.colour);
+        stop.colouriseAmount =
+            EvaluatePaletteStopScalarTrack(
+                sanitized.paletteStopParameterKeys,
+                stop.id,
+                TimingColourisePaletteStopParameter::ColouriseAmount,
+                normalizedPosition)
+                .value_or(stop.colouriseAmount);
+    }
+    return SanitizeTimingColourisePalette(std::move(palette));
+}
+
 TimingColouriseLut EvaluateTimingColourisePaletteLut(
     const TimingColouriseEffect& effect,
     float normalizedPosition) {
     const auto sanitized = SanitizeTimingColouriseEffect(effect);
+    if (sanitized.paletteKeyModel ==
+        TimingColourisePaletteKeyModel::StopParameters) {
+        return CompileTimingColourisePaletteLut(
+            EvaluateTimingColourisePalette(
+                sanitized,
+                normalizedPosition));
+    }
     if (sanitized.paletteKeys.empty()) {
         return CompileTimingColourisePaletteLut(sanitized.basePalette);
     }
@@ -1014,12 +1327,127 @@ void AddOrUpdateTimingColourisePaletteKey(
     if (effect == nullptr) {
         return;
     }
+    effect->paletteKeyModel =
+        TimingColourisePaletteKeyModel::LegacySnapshots;
     AddOrUpdateKey(
         &effect->paletteKeys,
         position,
         std::move(palette),
         interpolation,
         SanitizeTimingColourisePalette);
+}
+
+bool AddOrUpdateTimingColourisePaletteStopScalarKey(
+    TimingColouriseEffect* effect,
+    std::string_view stopId,
+    TimingColourisePaletteStopParameter parameter,
+    float position,
+    float value,
+    invisible_places::water::WaterScenarioInterpolation interpolation) {
+    if (effect == nullptr || stopId.empty() ||
+        (parameter != TimingColourisePaletteStopParameter::Position &&
+         parameter !=
+             TimingColourisePaletteStopParameter::ColouriseAmount) ||
+        !std::isfinite(position) || !std::isfinite(value)) {
+        return false;
+    }
+    effect->basePalette =
+        SanitizeTimingColourisePalette(std::move(effect->basePalette));
+    const bool stopExists = std::any_of(
+        effect->basePalette.stops.begin(),
+        effect->basePalette.stops.end(),
+        [&](const TimingColourisePaletteStop& stop) {
+            return stop.id == stopId;
+        });
+    if (!stopExists ||
+        (effect->paletteKeyModel ==
+             TimingColourisePaletteKeyModel::LegacySnapshots &&
+         !effect->paletteKeys.empty())) {
+        return false;
+    }
+    effect->paletteKeyModel =
+        TimingColourisePaletteKeyModel::StopParameters;
+    TimingColourisePaletteStopParameterKey key{
+        .stopId = std::string{stopId},
+        .parameter = parameter,
+        .position = Clamp01(position),
+        .scalarValue =
+            SanitizePaletteStopScalarValue(parameter, value),
+        .interpolation = interpolation,
+    };
+    const auto existing = std::find_if(
+        effect->paletteStopParameterKeys.begin(),
+        effect->paletteStopParameterKeys.end(),
+        [&](const TimingColourisePaletteStopParameterKey& candidate) {
+            return candidate.stopId == key.stopId &&
+                   candidate.parameter == parameter &&
+                   std::abs(candidate.position - key.position) <=
+                       kTimingColouriseKeyTolerance;
+        });
+    if (existing == effect->paletteStopParameterKeys.end()) {
+        effect->paletteStopParameterKeys.push_back(std::move(key));
+    } else {
+        *existing = std::move(key);
+    }
+    SortAndCoalescePaletteStopParameterKeys(
+        &effect->paletteStopParameterKeys);
+    return true;
+}
+
+bool AddOrUpdateTimingColourisePaletteStopColourKey(
+    TimingColouriseEffect* effect,
+    std::string_view stopId,
+    float position,
+    std::array<float, 3> colour,
+    invisible_places::water::WaterScenarioInterpolation interpolation) {
+    if (effect == nullptr || stopId.empty() ||
+        !std::isfinite(position) ||
+        std::any_of(
+            colour.begin(),
+            colour.end(),
+            [](float channel) { return !std::isfinite(channel); })) {
+        return false;
+    }
+    effect->basePalette =
+        SanitizeTimingColourisePalette(std::move(effect->basePalette));
+    const bool stopExists = std::any_of(
+        effect->basePalette.stops.begin(),
+        effect->basePalette.stops.end(),
+        [&](const TimingColourisePaletteStop& stop) {
+            return stop.id == stopId;
+        });
+    if (!stopExists ||
+        (effect->paletteKeyModel ==
+             TimingColourisePaletteKeyModel::LegacySnapshots &&
+         !effect->paletteKeys.empty())) {
+        return false;
+    }
+    effect->paletteKeyModel =
+        TimingColourisePaletteKeyModel::StopParameters;
+    TimingColourisePaletteStopParameterKey key{
+        .stopId = std::string{stopId},
+        .parameter = TimingColourisePaletteStopParameter::Colour,
+        .position = Clamp01(position),
+        .colourValue = SanitizePaletteStopColour(colour),
+        .interpolation = interpolation,
+    };
+    const auto existing = std::find_if(
+        effect->paletteStopParameterKeys.begin(),
+        effect->paletteStopParameterKeys.end(),
+        [&](const TimingColourisePaletteStopParameterKey& candidate) {
+            return candidate.stopId == key.stopId &&
+                   candidate.parameter == key.parameter &&
+                   std::abs(candidate.position - key.position) <=
+                       kTimingColouriseKeyTolerance;
+        });
+    if (existing == effect->paletteStopParameterKeys.end()) {
+        effect->paletteStopParameterKeys.push_back(std::move(key));
+    } else {
+        *existing = std::move(key);
+    }
+    SortAndCoalescePaletteStopParameterKeys(
+        &effect->paletteStopParameterKeys);
+    return true;
 }
 
 void AddOrUpdateTimingColouriseBoundsKey(
@@ -1103,11 +1531,98 @@ bool MoveTimingColourisePaletteKey(
     TimingColouriseEffect* effect,
     float sourcePosition,
     float destinationPosition) {
-    return effect != nullptr &&
-           MoveKey(
-               &effect->paletteKeys,
-               sourcePosition,
-               destinationPosition);
+    if (effect == nullptr ||
+        !CanMoveTimingColourisePaletteKeysAtPosition(
+            *effect,
+            sourcePosition,
+            destinationPosition)) {
+        return false;
+    }
+    if (std::abs(destinationPosition - sourcePosition) <=
+        kTimingColouriseKeyTolerance) {
+        return true;
+    }
+    for (auto& key : effect->paletteKeys) {
+        if (std::abs(key.position - sourcePosition) <=
+            kTimingColouriseKeyTolerance) {
+            key.position = destinationPosition;
+        }
+    }
+    for (auto& key : effect->paletteStopParameterKeys) {
+        if (std::abs(key.position - sourcePosition) <=
+            kTimingColouriseKeyTolerance) {
+            key.position = destinationPosition;
+        }
+    }
+    SortAndCoalesceKeys(&effect->paletteKeys);
+    SortAndCoalescePaletteStopParameterKeys(
+        &effect->paletteStopParameterKeys);
+    return true;
+}
+
+bool CanMoveTimingColourisePaletteKeysAtPosition(
+    const TimingColouriseEffect& effect,
+    float sourcePosition,
+    float destinationPosition) {
+    if (!std::isfinite(sourcePosition) ||
+        !std::isfinite(destinationPosition) ||
+        destinationPosition < 0.0F || destinationPosition > 1.0F) {
+        return false;
+    }
+    const bool hasLegacySource =
+        KeyCountAtPosition(effect.paletteKeys, sourcePosition) != 0U;
+    const bool hasParameterSource = std::any_of(
+        effect.paletteStopParameterKeys.begin(),
+        effect.paletteStopParameterKeys.end(),
+        [&](const TimingColourisePaletteStopParameterKey& key) {
+            return std::abs(key.position - sourcePosition) <=
+                   kTimingColouriseKeyTolerance;
+        });
+    if (!hasLegacySource && !hasParameterSource) {
+        return false;
+    }
+    if (std::abs(destinationPosition - sourcePosition) <=
+        kTimingColouriseKeyTolerance) {
+        return true;
+    }
+    const bool hasLegacyDestination =
+        KeyCountAtPosition(effect.paletteKeys, destinationPosition) != 0U;
+    if (hasLegacyDestination) {
+        // A legacy snapshot owns every stop property at its position.
+        return false;
+    }
+    if (hasLegacySource &&
+        std::any_of(
+            effect.paletteStopParameterKeys.begin(),
+            effect.paletteStopParameterKeys.end(),
+            [&](const TimingColourisePaletteStopParameterKey& key) {
+                return std::abs(key.position - destinationPosition) <=
+                       kTimingColouriseKeyTolerance;
+            })) {
+        return false;
+    }
+    for (const auto& source : effect.paletteStopParameterKeys) {
+        if (std::abs(source.position - sourcePosition) >
+            kTimingColouriseKeyTolerance) {
+            continue;
+        }
+        const bool sameTrackOccupied = std::any_of(
+            effect.paletteStopParameterKeys.begin(),
+            effect.paletteStopParameterKeys.end(),
+            [&](const TimingColourisePaletteStopParameterKey& candidate) {
+                return candidate.stopId == source.stopId &&
+                       candidate.parameter == source.parameter &&
+                       std::abs(candidate.position - sourcePosition) >
+                           kTimingColouriseKeyTolerance &&
+                       std::abs(
+                           candidate.position - destinationPosition) <=
+                           kTimingColouriseKeyTolerance;
+            });
+        if (sameTrackOccupied) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool MoveTimingColouriseBoundsKey(
@@ -1242,7 +1757,35 @@ bool MoveTimingColouriseBoundsParameterKey(
 std::size_t TimingColourisePaletteKeyCountAtPosition(
     const TimingColouriseEffect& effect,
     float position) {
-    return KeyCountAtPosition(effect.paletteKeys, position);
+    if (!std::isfinite(position)) {
+        return 0U;
+    }
+    return KeyCountAtPosition(effect.paletteKeys, position) +
+           static_cast<std::size_t>(std::count_if(
+               effect.paletteStopParameterKeys.begin(),
+               effect.paletteStopParameterKeys.end(),
+               [&](const TimingColourisePaletteStopParameterKey& key) {
+                   return std::abs(key.position - position) <=
+                          kTimingColouriseKeyTolerance;
+               }));
+}
+
+std::size_t TimingColourisePaletteStopParameterKeyCountAtPosition(
+    const TimingColouriseEffect& effect,
+    std::string_view stopId,
+    TimingColourisePaletteStopParameter parameter,
+    float position) {
+    if (!std::isfinite(position)) {
+        return 0U;
+    }
+    return static_cast<std::size_t>(std::count_if(
+        effect.paletteStopParameterKeys.begin(),
+        effect.paletteStopParameterKeys.end(),
+        [&](const TimingColourisePaletteStopParameterKey& key) {
+            return key.stopId == stopId && key.parameter == parameter &&
+                   std::abs(key.position - position) <=
+                       kTimingColouriseKeyTolerance;
+        }));
 }
 
 std::size_t TimingColouriseBoundsParameterKeyCountAtPosition(
@@ -1286,9 +1829,44 @@ std::size_t TimingColouriseEffectKeyCountAtPosition(
 std::size_t RemoveTimingColourisePaletteKeysAtPosition(
     TimingColouriseEffect* effect,
     float position) {
-    return effect == nullptr
-               ? 0U
-               : RemoveKeysAtPosition(&effect->paletteKeys, position);
+    if (effect == nullptr) {
+        return 0U;
+    }
+    const auto legacy =
+        RemoveKeysAtPosition(&effect->paletteKeys, position);
+    if (!std::isfinite(position)) {
+        return legacy;
+    }
+    const auto previousSize =
+        effect->paletteStopParameterKeys.size();
+    std::erase_if(
+        effect->paletteStopParameterKeys,
+        [&](const TimingColourisePaletteStopParameterKey& key) {
+            return std::abs(key.position - position) <=
+                   kTimingColouriseKeyTolerance;
+        });
+    return legacy + previousSize -
+                        effect->paletteStopParameterKeys.size();
+}
+
+std::size_t RemoveTimingColourisePaletteStopParameterKeysAtPosition(
+    TimingColouriseEffect* effect,
+    std::string_view stopId,
+    TimingColourisePaletteStopParameter parameter,
+    float position) {
+    if (effect == nullptr || !std::isfinite(position)) {
+        return 0U;
+    }
+    const auto previousSize =
+        effect->paletteStopParameterKeys.size();
+    std::erase_if(
+        effect->paletteStopParameterKeys,
+        [&](const TimingColourisePaletteStopParameterKey& key) {
+            return key.stopId == stopId && key.parameter == parameter &&
+                   std::abs(key.position - position) <=
+                       kTimingColouriseKeyTolerance;
+        });
+    return previousSize - effect->paletteStopParameterKeys.size();
 }
 
 std::size_t RemoveTimingColouriseBoundsKeysAtPosition(
@@ -1340,13 +1918,120 @@ std::size_t RemoveTimingColouriseEffectKeysAtPosition(
 std::optional<float> PreviousTimingColourisePaletteKeyPosition(
     const TimingColouriseEffect& effect,
     float position) {
-    return PreviousKeyPosition(effect.paletteKeys, position);
+    if (!std::isfinite(position)) {
+        return std::nullopt;
+    }
+    std::optional<float> best =
+        PreviousKeyPosition(effect.paletteKeys, position);
+    for (const auto& key : effect.paletteStopParameterKeys) {
+        if (key.position < position - kTimingColouriseKeyTolerance &&
+            (!best.has_value() || key.position > best.value())) {
+            best = key.position;
+        }
+    }
+    return best;
 }
 
 std::optional<float> NextTimingColourisePaletteKeyPosition(
     const TimingColouriseEffect& effect,
     float position) {
-    return NextKeyPosition(effect.paletteKeys, position);
+    if (!std::isfinite(position)) {
+        return std::nullopt;
+    }
+    std::optional<float> best =
+        NextKeyPosition(effect.paletteKeys, position);
+    for (const auto& key : effect.paletteStopParameterKeys) {
+        if (key.position > position + kTimingColouriseKeyTolerance &&
+            (!best.has_value() || key.position < best.value())) {
+            best = key.position;
+        }
+    }
+    return best;
+}
+
+std::vector<float> TimingColourisePaletteKeyPositions(
+    const TimingColouriseEffect& effect) {
+    std::vector<float> positions;
+    positions.reserve(
+        effect.paletteKeys.size() +
+        effect.paletteStopParameterKeys.size());
+    for (const auto& key : effect.paletteKeys) {
+        if (std::isfinite(key.position)) {
+            positions.push_back(Clamp01(key.position));
+        }
+    }
+    for (const auto& key : effect.paletteStopParameterKeys) {
+        if (std::isfinite(key.position)) {
+            positions.push_back(Clamp01(key.position));
+        }
+    }
+    std::stable_sort(positions.begin(), positions.end());
+    std::vector<float> unique;
+    unique.reserve(positions.size());
+    for (const float position : positions) {
+        if (unique.empty() ||
+            std::abs(unique.back() - position) >
+                kTimingColouriseKeyTolerance) {
+            unique.push_back(position);
+        }
+    }
+    return unique;
+}
+
+bool CanRemoveTimingColourisePaletteStop(
+    const TimingColouriseEffect& effect,
+    std::string_view stopId) {
+    if (stopId.empty() || effect.basePalette.stops.size() <= 1U ||
+        !effect.paletteKeys.empty()) {
+        return false;
+    }
+    const bool stopExists = std::any_of(
+        effect.basePalette.stops.begin(),
+        effect.basePalette.stops.end(),
+        [&](const TimingColourisePaletteStop& stop) {
+            return stop.id == stopId;
+        });
+    const bool hasKeys = std::any_of(
+        effect.paletteStopParameterKeys.begin(),
+        effect.paletteStopParameterKeys.end(),
+        [&](const TimingColourisePaletteStopParameterKey& key) {
+            return key.stopId == stopId;
+        });
+    return stopExists && !hasKeys;
+}
+
+bool RemoveTimingColourisePaletteStop(
+    TimingColouriseEffect* effect,
+    std::string_view stopId) {
+    if (effect == nullptr ||
+        !CanRemoveTimingColourisePaletteStop(*effect, stopId)) {
+        return false;
+    }
+    std::erase_if(
+        effect->basePalette.stops,
+        [&](const TimingColourisePaletteStop& stop) {
+            return stop.id == stopId;
+        });
+    effect->basePalette = SanitizeTimingColourisePalette(
+        std::move(effect->basePalette));
+    return true;
+}
+
+std::string TimingColourisePaletteKeyStateName(
+    std::string_view paletteName,
+    std::size_t orderedPosition) {
+    std::string base =
+        paletteName.empty() ? "Palette" : std::string{paletteName};
+    constexpr std::string_view editedSuffix = "_edited";
+    if (base.size() >= editedSuffix.size() &&
+        std::string_view{base}.substr(
+            base.size() - editedSuffix.size()) == editedSuffix) {
+        base.resize(base.size() - editedSuffix.size());
+    }
+    std::ostringstream name;
+    name << base << "_Run" << std::setfill('0') << std::setw(2)
+         << orderedPosition + 1U;
+    return name.str();
 }
 
 std::optional<float> PreviousTimingColouriseBoundsKeyPosition(

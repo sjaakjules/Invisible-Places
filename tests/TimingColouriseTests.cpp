@@ -5,7 +5,9 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -21,7 +23,10 @@ using invisible_places::timing::TimingColouriseBoundsKeyMode;
 using invisible_places::timing::TimingColouriseBoundsParameter;
 using invisible_places::timing::TimingColouriseEffect;
 using invisible_places::timing::TimingColourisePalette;
+using invisible_places::timing::TimingColourisePaletteKeyModel;
+using invisible_places::timing::TimingColourisePaletteSourceKind;
 using invisible_places::timing::TimingColourisePaletteStop;
+using invisible_places::timing::TimingColourisePaletteStopParameter;
 using invisible_places::water::WaterScenarioInterpolation;
 
 struct TemporaryTimingColouriseFile {
@@ -96,6 +101,426 @@ TEST_CASE(
     CHECK(solidLut.front() == solidLut.back());
     CHECK(solidLut[17][1] == Approx(0.4F));
     CHECK(solidLut[17][3] == Approx(0.3F));
+}
+
+TEST_CASE(
+    "Timing Colourise palette stops receive stable unique identities",
+    "[timing][colourise][palette][ids]") {
+    TimingColourisePalette palette{
+        .stops = {
+            {.id = "mineral", .position = 0.8F},
+            {.position = 0.2F},
+            {.id = "mineral", .position = 0.5F},
+            {.id = "palette-stop-1", .position = 0.1F},
+        },
+    };
+    const auto sanitized =
+        invisible_places::timing::SanitizeTimingColourisePalette(
+            palette);
+    REQUIRE(sanitized.stops.size() == 4U);
+    CHECK(sanitized.stops[0].id == "palette-stop-1");
+    CHECK(sanitized.stops[1].id == "palette-stop-2");
+    // Duplicate repair follows canonical palette order, so the first stop at
+    // that id retains it and the later duplicate receives a fresh identity.
+    CHECK(sanitized.stops[2].id == "mineral");
+    CHECK(sanitized.stops[3].id != "mineral");
+    CHECK(
+        invisible_places::timing::AllocateTimingColourisePaletteStopId(
+            sanitized) == "palette-stop-4");
+
+    auto moved = sanitized;
+    const auto mineral = std::find_if(
+        moved.stops.begin(),
+        moved.stops.end(),
+        [](const auto& stop) { return stop.id == "mineral"; });
+    REQUIRE(mineral != moved.stops.end());
+    mineral->position = 0.0F;
+    moved = invisible_places::timing::SanitizeTimingColourisePalette(
+        std::move(moved));
+    CHECK(moved.stops.front().id == "mineral");
+}
+
+TEST_CASE(
+    "Timing Colourise independently evaluates stop position colour and amount",
+    "[timing][colourise][palette][parameters]") {
+    TimingColouriseEffect effect;
+    effect.basePalette = invisible_places::timing::
+        SanitizeTimingColourisePalette({
+            .stops = {{
+                .id = "drifting-stop",
+                .position = 0.15F,
+                .colour = {0.2F, 0.2F, 0.2F},
+                .colouriseAmount = 0.65F,
+            }},
+        });
+    const auto linear = WaterScenarioInterpolation::Linear;
+    REQUIRE(
+        invisible_places::timing::
+            AddOrUpdateTimingColourisePaletteStopScalarKey(
+                &effect,
+                "drifting-stop",
+                TimingColourisePaletteStopParameter::Position,
+                0.1F,
+                0.0F,
+                linear));
+    REQUIRE(
+        invisible_places::timing::
+            AddOrUpdateTimingColourisePaletteStopScalarKey(
+                &effect,
+                "drifting-stop",
+                TimingColourisePaletteStopParameter::Position,
+                0.3F,
+                0.3F,
+                linear));
+    REQUIRE(
+        invisible_places::timing::
+            AddOrUpdateTimingColourisePaletteStopScalarKey(
+                &effect,
+                "drifting-stop",
+                TimingColourisePaletteStopParameter::Position,
+                0.5F,
+                0.0F,
+                linear));
+    const std::array firstColour{
+        26.0F / 255.0F,
+        87.0F / 255.0F,
+        242.0F / 255.0F};
+    const std::array secondColour{
+        23.0F / 255.0F,
+        250.0F / 255.0F,
+        1.0F};
+    REQUIRE(
+        invisible_places::timing::
+            AddOrUpdateTimingColourisePaletteStopColourKey(
+                &effect,
+                "drifting-stop",
+                0.2F,
+                firstColour,
+                linear));
+    REQUIRE(
+        invisible_places::timing::
+            AddOrUpdateTimingColourisePaletteStopColourKey(
+                &effect,
+                "drifting-stop",
+                0.5F,
+                secondColour,
+                linear));
+
+    CHECK(effect.paletteKeyModel ==
+          TimingColourisePaletteKeyModel::StopParameters);
+    const auto atQuarter =
+        invisible_places::timing::EvaluateTimingColourisePalette(
+            effect,
+            0.25F);
+    REQUIRE(atQuarter.stops.size() == 1U);
+    CHECK(atQuarter.stops[0].position == Approx(0.225F));
+    CHECK(
+        atQuarter.stops[0].colour[0] ==
+        Approx(std::lerp(firstColour[0], secondColour[0], 1.0F / 6.0F)));
+    CHECK(atQuarter.stops[0].colouriseAmount == Approx(0.65F));
+
+    const auto atFourTenths =
+        invisible_places::timing::EvaluateTimingColourisePalette(
+            effect,
+            0.4F);
+    REQUIRE(atFourTenths.stops.size() == 1U);
+    CHECK(atFourTenths.stops[0].position == Approx(0.15F));
+    CHECK(
+        atFourTenths.stops[0].colour[1] ==
+        Approx(std::lerp(firstColour[1], secondColour[1], 2.0F / 3.0F)));
+
+    const auto atSharedEnd =
+        invisible_places::timing::EvaluateTimingColourisePalette(
+            effect,
+            0.5F);
+    CHECK(atSharedEnd.stops[0].position == Approx(0.0F));
+    CHECK(atSharedEnd.stops[0].colour == secondColour);
+    CHECK(
+        invisible_places::timing::
+            TimingColourisePaletteStopParameterKeyCountAtPosition(
+                effect,
+                "drifting-stop",
+                TimingColourisePaletteStopParameter::Position,
+                0.5F) == 1U);
+    CHECK(
+        invisible_places::timing::
+            TimingColourisePaletteStopParameterKeyCountAtPosition(
+                effect,
+                "drifting-stop",
+                TimingColourisePaletteStopParameter::Colour,
+                0.5F) == 1U);
+}
+
+TEST_CASE(
+    "Timing Colourise palette union moves only properties present at a time",
+    "[timing][colourise][palette][parameters][move]") {
+    TimingColouriseEffect effect;
+    effect.basePalette = invisible_places::timing::
+        SanitizeTimingColourisePalette({
+            .stops = {{.id = "stop-a"}},
+        });
+    const auto addPosition = [&](float time, float value) {
+        return invisible_places::timing::
+            AddOrUpdateTimingColourisePaletteStopScalarKey(
+                &effect,
+                "stop-a",
+                TimingColourisePaletteStopParameter::Position,
+                time,
+                value,
+                WaterScenarioInterpolation::Linear);
+    };
+    const auto addColour = [&](float time, float red) {
+        return invisible_places::timing::
+            AddOrUpdateTimingColourisePaletteStopColourKey(
+                &effect,
+                "stop-a",
+                time,
+                {red, 0.0F, 0.0F},
+                WaterScenarioInterpolation::Linear);
+    };
+    REQUIRE(addPosition(0.1F, 0.0F));
+    REQUIRE(addColour(0.2F, 0.2F));
+    REQUIRE(addPosition(0.5F, 0.5F));
+    REQUIRE(addColour(0.5F, 0.5F));
+
+    CHECK(
+        invisible_places::timing::MoveTimingColourisePaletteKey(
+            &effect,
+            0.5F,
+            0.6F));
+    CHECK(
+        invisible_places::timing::TimingColourisePaletteKeyCountAtPosition(
+            effect,
+            0.6F) == 2U);
+    CHECK(
+        invisible_places::timing::MoveTimingColourisePaletteKey(
+            &effect,
+            0.1F,
+            0.25F));
+    CHECK(
+        invisible_places::timing::
+            TimingColourisePaletteStopParameterKeyCountAtPosition(
+                effect,
+                "stop-a",
+                TimingColourisePaletteStopParameter::Colour,
+                0.2F) == 1U);
+
+    REQUIRE(
+        invisible_places::timing::
+            AddOrUpdateTimingColourisePaletteStopScalarKey(
+                &effect,
+                "stop-a",
+                TimingColourisePaletteStopParameter::ColouriseAmount,
+                0.7F,
+                0.4F));
+    CHECK(
+        invisible_places::timing::CanMoveTimingColourisePaletteKeysAtPosition(
+            effect,
+            0.6F,
+            0.7F));
+    CHECK(
+        invisible_places::timing::MoveTimingColourisePaletteKey(
+            &effect,
+            0.6F,
+            0.7F));
+    CHECK(
+        invisible_places::timing::TimingColourisePaletteKeyCountAtPosition(
+            effect,
+            0.7F) == 3U);
+
+    REQUIRE(addPosition(0.9F, 0.9F));
+    CHECK_FALSE(
+        invisible_places::timing::CanMoveTimingColourisePaletteKeysAtPosition(
+            effect,
+            0.7F,
+            0.9F));
+    CHECK_FALSE(
+        invisible_places::timing::MoveTimingColourisePaletteKey(
+            &effect,
+            0.7F,
+            0.9F));
+    // The failed union move is atomic: all three source properties remain.
+    CHECK(
+        invisible_places::timing::TimingColourisePaletteKeyCountAtPosition(
+            effect,
+            0.7F) == 3U);
+}
+
+TEST_CASE(
+    "Timing Colourise palette union rejects legacy and same-track collisions",
+    "[timing][colourise][palette][parameters][legacy][move]") {
+    TimingColouriseEffect effect;
+    effect.basePalette = invisible_places::timing::
+        SanitizeTimingColourisePalette({
+            .stops = {{.id = "stop-a"}},
+        });
+    REQUIRE(
+        invisible_places::timing::
+            AddOrUpdateTimingColourisePaletteStopScalarKey(
+                &effect,
+                "stop-a",
+                TimingColourisePaletteStopParameter::Position,
+                0.2F,
+                0.3F));
+    // The compatibility API deliberately switches to the legacy model, but
+    // retains dormant property data for a future explicit conversion.
+    invisible_places::timing::AddOrUpdateTimingColourisePaletteKey(
+        &effect,
+        0.8F,
+        Solid({0.8F, 0.2F, 0.1F}));
+    CHECK(effect.paletteKeyModel ==
+          TimingColourisePaletteKeyModel::LegacySnapshots);
+    CHECK_FALSE(
+        invisible_places::timing::CanMoveTimingColourisePaletteKeysAtPosition(
+            effect,
+            0.2F,
+            0.8F));
+    CHECK_FALSE(
+        invisible_places::timing::CanMoveTimingColourisePaletteKeysAtPosition(
+            effect,
+            0.8F,
+            0.2F));
+    CHECK_FALSE(
+        invisible_places::timing::
+            AddOrUpdateTimingColourisePaletteStopColourKey(
+                &effect,
+                "stop-a",
+                0.4F,
+                {0.0F, 1.0F, 0.0F}));
+
+    const auto legacyHalfway =
+        invisible_places::timing::EvaluateTimingColourisePaletteLut(
+            effect,
+            0.5F);
+    // A single legacy snapshot endpoint-holds its own value. The dormant
+    // stop-position key must not affect legacy evaluation.
+    CHECK(legacyHalfway.front()[0] == Approx(0.8F));
+    CHECK(legacyHalfway.front()[1] == Approx(0.2F));
+}
+
+TEST_CASE(
+    "Timing Colourise palette key union navigates deletes and names by time order",
+    "[timing][colourise][palette][parameters][navigation]") {
+    TimingColouriseEffect effect;
+    effect.basePalette = invisible_places::timing::
+        SanitizeTimingColourisePalette({
+            .stops = {{.id = "stop-a"}},
+        });
+    REQUIRE(
+        invisible_places::timing::
+            AddOrUpdateTimingColourisePaletteStopScalarKey(
+                &effect,
+                "stop-a",
+                TimingColourisePaletteStopParameter::Position,
+                0.2F,
+                0.1F));
+    REQUIRE(
+        invisible_places::timing::
+            AddOrUpdateTimingColourisePaletteStopColourKey(
+                &effect,
+                "stop-a",
+                0.20005F,
+                {1.0F, 0.0F, 0.0F}));
+    REQUIRE(
+        invisible_places::timing::
+            AddOrUpdateTimingColourisePaletteStopScalarKey(
+                &effect,
+                "stop-a",
+                TimingColourisePaletteStopParameter::ColouriseAmount,
+                0.6F,
+                0.5F));
+    const auto positions =
+        invisible_places::timing::TimingColourisePaletteKeyPositions(
+            effect);
+    REQUIRE(positions.size() == 2U);
+    CHECK(positions[0] == Approx(0.2F));
+    CHECK(positions[1] == Approx(0.6F));
+    CHECK(
+        invisible_places::timing::NextTimingColourisePaletteKeyPosition(
+            effect,
+            0.2F) == Approx(0.6F));
+    CHECK(
+        invisible_places::timing::PreviousTimingColourisePaletteKeyPosition(
+            effect,
+            0.6F) == Approx(0.2F));
+    CHECK(
+        invisible_places::timing::TimingColourisePaletteKeyStateName(
+            "Mineral_edited",
+            0U) == "Mineral_Run01");
+    CHECK(
+        invisible_places::timing::TimingColourisePaletteKeyStateName(
+            "Mineral",
+            11U) == "Mineral_Run12");
+    CHECK(
+        invisible_places::timing::RemoveTimingColourisePaletteKeysAtPosition(
+            &effect,
+            0.2F) == 2U);
+    CHECK(
+        invisible_places::timing::TimingColourisePaletteKeyPositions(effect) ==
+        std::vector<float>{0.6F});
+}
+
+TEST_CASE(
+    "Timing Colourise refuses to remove keyed palette topology",
+    "[timing][colourise][palette][topology]") {
+    TimingColouriseEffect effect;
+    effect.basePalette = invisible_places::timing::
+        SanitizeTimingColourisePalette({
+            .stops = {
+                {.id = "keyed", .position = 0.0F},
+                {.id = "unkeyed", .position = 1.0F},
+            },
+        });
+    REQUIRE(
+        invisible_places::timing::
+            AddOrUpdateTimingColourisePaletteStopColourKey(
+                &effect,
+                "keyed",
+                0.4F,
+                {1.0F, 0.0F, 0.0F}));
+    CHECK_FALSE(
+        invisible_places::timing::CanRemoveTimingColourisePaletteStop(
+            effect,
+            "keyed"));
+    CHECK_FALSE(
+        invisible_places::timing::RemoveTimingColourisePaletteStop(
+            &effect,
+            "keyed"));
+    CHECK(
+        invisible_places::timing::CanRemoveTimingColourisePaletteStop(
+            effect,
+            "unkeyed"));
+    CHECK(
+        invisible_places::timing::RemoveTimingColourisePaletteStop(
+            &effect,
+            "unkeyed"));
+    CHECK_FALSE(
+        invisible_places::timing::RemoveTimingColourisePaletteStop(
+            &effect,
+            "keyed"));
+}
+
+TEST_CASE(
+    "Timing Colourise palette source provenance remains evaluation metadata",
+    "[timing][colourise][palette][source]") {
+    TimingColouriseEffect effect;
+    effect.paletteSourceKind = TimingColourisePaletteSourceKind::Saved;
+    effect.paletteSourceId = "colourise-palette-7";
+    effect.paletteSourceName = "Mineral";
+    effect.paletteEdited = true;
+    const auto sanitized =
+        invisible_places::timing::SanitizeTimingColouriseEffect(effect);
+    CHECK(sanitized.paletteSourceKind ==
+          TimingColourisePaletteSourceKind::Saved);
+    CHECK(sanitized.paletteSourceId == "colourise-palette-7");
+    CHECK(sanitized.paletteSourceName == "Mineral");
+    CHECK(sanitized.paletteEdited);
+
+    effect.paletteSourceKind = TimingColourisePaletteSourceKind::Custom;
+    const auto custom =
+        invisible_places::timing::SanitizeTimingColouriseEffect(effect);
+    CHECK(custom.paletteSourceId.empty());
+    CHECK(custom.paletteSourceName == "Mineral");
 }
 
 TEST_CASE(
