@@ -159,6 +159,7 @@ add_library(
     src/style/RenderParameterBinding.cpp
     src/timing/TimingColourise.cpp
     src/timing/TimingColouriseHistogram.cpp
+    src/timing/TimingColourisePresets.cpp
     src/water/RainSimulation.cpp
     src/water/WaterFlow.cpp
     src/water/WaterSeepagePulseField.cpp
@@ -255,6 +256,7 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
             tests/SeepageSerializationTests.cpp
             tests/SeepageWaterTests.cpp
             tests/TimingColouriseHistogramTests.cpp
+            tests/TimingColourisePresetTests.cpp
             tests/TimingColouriseTests.cpp
             tests/WaterSeepagePulseFieldTests.cpp
             tests/WaterTimingTests.cpp
