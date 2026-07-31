@@ -218,7 +218,7 @@ TEST_CASE("Project resume state round-trips the active scene and animation",
   document.activeAnimationPath =
       "Saved/animations/Contour build-up.ipanim.json";
   document.activeAnimationPosition = 0.625F;
-  // The old field remains independent so schema-51 readers prove that the
+  // The old field remains independent so current readers prove that the
   // explicit active-animation field is authoritative.
   document.lastAnimationPath =
       "Saved/animations/Previously active.ipanim.json";
@@ -290,6 +290,223 @@ TEST_CASE("Pre-resume-state projects migrate their last animation and selected s
   CHECK(loaded->activeAnimationPath ==
         std::filesystem::path{"Saved/animations/Legacy active.ipanim.json"});
   CHECK(loaded->activeAnimationPosition == Catch::Approx(0.0F));
+}
+
+TEST_CASE("Palette stop-property animation and provenance round-trip",
+          "[project][serialization][colourise][palette]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::timing::TimingColouriseEffect;
+  using invisible_places::timing::TimingColourisePaletteKeyModel;
+  using invisible_places::timing::TimingColourisePaletteSourceKind;
+  using invisible_places::timing::TimingColourisePaletteStopParameter;
+  using invisible_places::timing::TimingColourisePaletteStopParameterKey;
+  using invisible_places::timing::TimingTakeSceneState;
+  using invisible_places::water::WaterScenarioInterpolation;
+
+  TimingColouriseEffect effect;
+  effect.id = "colourise-effect-3";
+  effect.name = "Animated Mako";
+  effect.basePalette.stops = {
+      {.id = "deep-stop",
+       .position = 0.0F,
+       .colour = {0.02F, 0.05F, 0.18F},
+       .colouriseAmount = 0.7F},
+      {.id = "foam-stop",
+       .position = 1.0F,
+       .colour = {0.65F, 0.95F, 0.82F},
+       .colouriseAmount = 0.9F},
+  };
+  effect.paletteKeyModel =
+      TimingColourisePaletteKeyModel::StopParameters;
+  effect.paletteSourceKind =
+      TimingColourisePaletteSourceKind::Saved;
+  effect.paletteSourceId = "colourise-palette-9";
+  effect.paletteSourceName = "Mako Study";
+  effect.paletteEdited = true;
+  effect.paletteStopParameterKeys = {
+      TimingColourisePaletteStopParameterKey{
+          .stopId = "deep-stop",
+          .parameter = TimingColourisePaletteStopParameter::Position,
+          .position = 0.1F,
+          .scalarValue = 0.05F,
+          .interpolation = WaterScenarioInterpolation::Linear,
+      },
+      TimingColourisePaletteStopParameterKey{
+          .stopId = "deep-stop",
+          .parameter = TimingColourisePaletteStopParameter::Colour,
+          .position = 0.6F,
+          .colourValue = {0.1F, 0.4F, 0.8F},
+          .interpolation = WaterScenarioInterpolation::Smooth,
+      },
+      TimingColourisePaletteStopParameterKey{
+          .stopId = "foam-stop",
+          .parameter =
+              TimingColourisePaletteStopParameter::ColouriseAmount,
+          .position = 0.8F,
+          .scalarValue = 0.35F,
+          .interpolation = WaterScenarioInterpolation::Hold,
+      },
+  };
+
+  ProjectDocument document;
+  TimingTakeSceneState state;
+  state.sceneGroupName = "Scene3";
+  state.colouriseEffects.push_back(effect);
+  document.timingTakeStates.push_back(state);
+
+  TemporaryProjectFile file{
+      "invisible_places_palette_stop_parameter_round_trip.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+
+  std::ifstream input{file.path};
+  REQUIRE(input.is_open());
+  const auto savedJson = nlohmann::json::parse(input);
+  const auto &savedEffect = savedJson.at("timing_take_states")
+                                .front()
+                                .at("colourise_effects")
+                                .front();
+  CHECK(savedEffect.at("palette_key_model") == "stop_parameters");
+  CHECK(savedEffect.at("base_palette")
+            .at("stops")
+            .front()
+            .at("id") == "deep-stop");
+  CHECK(savedEffect.at("palette_source").at("kind") == "saved");
+  CHECK(savedEffect.at("palette_source").at("id") ==
+        "colourise-palette-9");
+  CHECK(savedEffect.at("palette_source").at("name") == "Mako Study");
+  CHECK(savedEffect.at("palette_source").at("edited"));
+  REQUIRE(savedEffect.at("palette_stop_parameter_keys").size() == 3U);
+
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->timingTakeStates.size() == 1U);
+  REQUIRE(loaded->timingTakeStates.front().colouriseEffects.size() == 1U);
+  const auto &loadedEffect =
+      loaded->timingTakeStates.front().colouriseEffects.front();
+  CHECK(loadedEffect.paletteKeyModel ==
+        TimingColourisePaletteKeyModel::StopParameters);
+  CHECK(loadedEffect.paletteSourceKind ==
+        TimingColourisePaletteSourceKind::Saved);
+  CHECK(loadedEffect.paletteSourceId == "colourise-palette-9");
+  CHECK(loadedEffect.paletteSourceName == "Mako Study");
+  CHECK(loadedEffect.paletteEdited);
+  REQUIRE(loadedEffect.basePalette.stops.size() == 2U);
+  CHECK(loadedEffect.basePalette.stops[0].id == "deep-stop");
+  CHECK(loadedEffect.basePalette.stops[1].id == "foam-stop");
+  REQUIRE(loadedEffect.paletteStopParameterKeys.size() == 3U);
+  CHECK(loadedEffect.paletteStopParameterKeys[0].stopId == "deep-stop");
+  CHECK(loadedEffect.paletteStopParameterKeys[0].parameter ==
+        TimingColourisePaletteStopParameter::Position);
+  CHECK(loadedEffect.paletteStopParameterKeys[0].scalarValue ==
+        Catch::Approx(0.05F));
+  CHECK(loadedEffect.paletteStopParameterKeys[1].parameter ==
+        TimingColourisePaletteStopParameter::Colour);
+  CHECK(loadedEffect.paletteStopParameterKeys[1].colourValue[2] ==
+        Catch::Approx(0.8F));
+  CHECK(loadedEffect.paletteStopParameterKeys[2].parameter ==
+        TimingColourisePaletteStopParameter::ColouriseAmount);
+  CHECK(loadedEffect.paletteStopParameterKeys[2].interpolation ==
+        WaterScenarioInterpolation::Hold);
+}
+
+TEST_CASE("Schema 51 palette snapshots migrate without changing their animation model",
+          "[project][serialization][colourise][palette][migration]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::timing::TimingColourisePaletteKeyModel;
+  using invisible_places::timing::TimingColourisePaletteSourceKind;
+
+  const nlohmann::json legacyProject{
+      {"schema_version", 51U},
+      {"timing_takes",
+       nlohmann::json::array(
+           {{{"id", "authored-timing"}, {"name", "Authored Timing"}}})},
+      {"selected_timing_take_id", "authored-timing"},
+      {"timing_take_states",
+       nlohmann::json::array({
+           {{"take_id", "authored-timing"},
+            {"scene_group", "Scene3"},
+            {"colourise_effects",
+             nlohmann::json::array({
+                 {{"id", "legacy-snapshots"},
+                  {"base_palette",
+                   {{"stops",
+                     nlohmann::json::array(
+                         {{{"position", 0.0F},
+                           {"colour", {0.0F, 0.1F, 0.2F}},
+                           {"colourise_amount", 0.8F}},
+                          {{"position", 1.0F},
+                           {"colour", {0.8F, 0.9F, 1.0F}},
+                           {"colourise_amount", 1.0F}}})}}},
+                  {"palette_keys",
+                   nlohmann::json::array(
+                       {{{"position", 0.4F},
+                         {"interpolation", "smooth"},
+                         {"palette",
+                          {{"stops",
+                            nlohmann::json::array(
+                                {{{"position", 0.0F},
+                                  {"colour", {0.2F, 0.3F, 0.4F}},
+                                  {"colourise_amount", 0.6F}}})}}}}})}},
+                 {{"id", "new-empty-effect"},
+                  {"palette_keys", nlohmann::json::array()}},
+             })}},
+       })},
+  };
+
+  TemporaryProjectFile file{
+      "invisible_places_palette_schema51_migration.json"};
+  {
+    std::ofstream output{file.path, std::ios::trunc};
+    REQUIRE(output.is_open());
+    output << legacyProject.dump(2);
+  }
+
+  std::string errorMessage;
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  CHECK(loaded->schemaVersion == kProjectDocumentSchemaVersion);
+  REQUIRE(loaded->timingTakeStates.size() == 1U);
+  REQUIRE(loaded->timingTakeStates.front().colouriseEffects.size() == 2U);
+  const auto &legacyEffect =
+      loaded->timingTakeStates.front().colouriseEffects[0];
+  CHECK(legacyEffect.paletteKeyModel ==
+        TimingColourisePaletteKeyModel::LegacySnapshots);
+  CHECK(legacyEffect.paletteSourceKind ==
+        TimingColourisePaletteSourceKind::Custom);
+  CHECK_FALSE(legacyEffect.paletteEdited);
+  CHECK(legacyEffect.paletteStopParameterKeys.empty());
+  REQUIRE(legacyEffect.basePalette.stops.size() == 2U);
+  CHECK_FALSE(legacyEffect.basePalette.stops[0].id.empty());
+  CHECK_FALSE(legacyEffect.basePalette.stops[1].id.empty());
+  CHECK(legacyEffect.basePalette.stops[0].id !=
+        legacyEffect.basePalette.stops[1].id);
+  CHECK(loaded->timingTakeStates.front().colouriseEffects[1]
+            .paletteKeyModel ==
+        TimingColourisePaletteKeyModel::StopParameters);
+
+  TemporaryProjectFile migratedFile{
+      "invisible_places_palette_schema52_migrated.json"};
+  REQUIRE(SaveProjectDocument(*loaded, migratedFile.path, &errorMessage));
+  std::ifstream migratedInput{migratedFile.path};
+  REQUIRE(migratedInput.is_open());
+  const auto migratedJson = nlohmann::json::parse(migratedInput);
+  const auto &migratedEffect = migratedJson.at("timing_take_states")
+                                   .front()
+                                   .at("colourise_effects")
+                                   .front();
+  CHECK(migratedEffect.at("palette_key_model") == "legacy_snapshots");
+  CHECK_FALSE(migratedEffect.at("base_palette")
+                  .at("stops")
+                  .front()
+                  .at("id")
+                  .get<std::string>()
+                  .empty());
 }
 
 TEST_CASE("Shoreline profile libraries round-trip while legacy files retain their authored visual",

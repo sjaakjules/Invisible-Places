@@ -3731,6 +3731,99 @@ ParseTimingColouriseFieldSource(const json& sourceJson) {
     return TimingColouriseFieldSource::Scalar;
 }
 
+std::string TimingColourisePaletteKeyModelName(
+    invisible_places::timing::TimingColourisePaletteKeyModel model) {
+    using invisible_places::timing::TimingColourisePaletteKeyModel;
+    switch (model) {
+        case TimingColourisePaletteKeyModel::LegacySnapshots:
+            return "legacy_snapshots";
+        case TimingColourisePaletteKeyModel::StopParameters:
+            return "stop_parameters";
+    }
+    return "stop_parameters";
+}
+
+std::optional<invisible_places::timing::TimingColourisePaletteKeyModel>
+ParseTimingColourisePaletteKeyModel(const json& modelJson) {
+    using invisible_places::timing::TimingColourisePaletteKeyModel;
+    if (!modelJson.is_string()) {
+        return std::nullopt;
+    }
+    const auto name = modelJson.get<std::string>();
+    if (name == "legacy_snapshots") {
+        return TimingColourisePaletteKeyModel::LegacySnapshots;
+    }
+    if (name == "stop_parameters") {
+        return TimingColourisePaletteKeyModel::StopParameters;
+    }
+    return std::nullopt;
+}
+
+std::string TimingColourisePaletteSourceKindName(
+    invisible_places::timing::TimingColourisePaletteSourceKind kind) {
+    using invisible_places::timing::TimingColourisePaletteSourceKind;
+    switch (kind) {
+        case TimingColourisePaletteSourceKind::Custom:
+            return "custom";
+        case TimingColourisePaletteSourceKind::Preset:
+            return "preset";
+        case TimingColourisePaletteSourceKind::Saved:
+            return "saved";
+    }
+    return "custom";
+}
+
+invisible_places::timing::TimingColourisePaletteSourceKind
+ParseTimingColourisePaletteSourceKind(const json& kindJson) {
+    using invisible_places::timing::TimingColourisePaletteSourceKind;
+    if (!kindJson.is_string()) {
+        return TimingColourisePaletteSourceKind::Custom;
+    }
+    const auto name = kindJson.get<std::string>();
+    if (name == "preset") {
+        return TimingColourisePaletteSourceKind::Preset;
+    }
+    if (name == "saved") {
+        return TimingColourisePaletteSourceKind::Saved;
+    }
+    return TimingColourisePaletteSourceKind::Custom;
+}
+
+std::string TimingColourisePaletteStopParameterName(
+    invisible_places::timing::TimingColourisePaletteStopParameter
+        parameter) {
+    using invisible_places::timing::TimingColourisePaletteStopParameter;
+    switch (parameter) {
+        case TimingColourisePaletteStopParameter::Position:
+            return "position";
+        case TimingColourisePaletteStopParameter::Colour:
+            return "colour";
+        case TimingColourisePaletteStopParameter::ColouriseAmount:
+            return "colourise_amount";
+    }
+    return "position";
+}
+
+std::optional<
+    invisible_places::timing::TimingColourisePaletteStopParameter>
+ParseTimingColourisePaletteStopParameter(const json& parameterJson) {
+    using invisible_places::timing::TimingColourisePaletteStopParameter;
+    if (!parameterJson.is_string()) {
+        return std::nullopt;
+    }
+    const auto name = parameterJson.get<std::string>();
+    if (name == "position") {
+        return TimingColourisePaletteStopParameter::Position;
+    }
+    if (name == "colour" || name == "color") {
+        return TimingColourisePaletteStopParameter::Colour;
+    }
+    if (name == "colourise_amount" || name == "colorize_amount") {
+        return TimingColourisePaletteStopParameter::ColouriseAmount;
+    }
+    return std::nullopt;
+}
+
 json SerializeTimingColourisePalette(
     const invisible_places::timing::TimingColourisePalette& palette) {
     json stopsJson = json::array();
@@ -3738,6 +3831,7 @@ json SerializeTimingColourisePalette(
         invisible_places::timing::SanitizeTimingColourisePalette(palette);
     for (const auto& stop : sanitized.stops) {
         stopsJson.push_back({
+            {"id", stop.id},
             {"position", stop.position},
             {"colour", stop.colour},
             {"colourise_amount", stop.colouriseAmount},
@@ -3754,6 +3848,7 @@ ParseTimingColourisePalette(const json& paletteJson) {
         paletteJson.at("stops").is_array()) {
         for (const auto& stopJson : paletteJson.at("stops")) {
             invisible_places::timing::TimingColourisePaletteStop stop;
+            stop.id = stopJson.value("id", std::string{});
             stop.position = stopJson.value("position", stop.position);
             if (stopJson.contains("colour") &&
                 stopJson.at("colour").is_array() &&
@@ -3882,6 +3977,19 @@ json SerializeTimingColouriseEffect(
             {"palette", SerializeTimingColourisePalette(key.palette)},
         });
     }
+    json paletteStopParameterKeysJson = json::array();
+    for (const auto& key : sanitized.paletteStopParameterKeys) {
+        paletteStopParameterKeysJson.push_back({
+            {"stop_id", key.stopId},
+            {"parameter",
+             TimingColourisePaletteStopParameterName(key.parameter)},
+            {"position", key.position},
+            {"scalar_value", key.scalarValue},
+            {"colour_value", key.colourValue},
+            {"interpolation",
+             WaterScenarioInterpolationName(key.interpolation)},
+        });
+    }
     json boundsKeysJson = json::array();
     for (const auto& key : sanitized.boundsKeys) {
         boundsKeysJson.push_back({
@@ -3916,7 +4024,21 @@ json SerializeTimingColouriseEffect(
          SerializeTimingColourisePalette(sanitized.basePalette)},
         {"base_bounds",
          SerializeTimingColouriseBounds(sanitized.baseBounds)},
+        {"palette_key_model",
+         TimingColourisePaletteKeyModelName(
+             sanitized.paletteKeyModel)},
+        {"palette_source",
+         {
+             {"kind",
+              TimingColourisePaletteSourceKindName(
+                  sanitized.paletteSourceKind)},
+             {"id", sanitized.paletteSourceId},
+             {"name", sanitized.paletteSourceName},
+             {"edited", sanitized.paletteEdited},
+         }},
         {"palette_keys", std::move(paletteKeysJson)},
+        {"palette_stop_parameter_keys",
+         std::move(paletteStopParameterKeysJson)},
         {"bounds_key_mode",
          TimingColouriseBoundsKeyModeName(sanitized.boundsKeyMode)},
         {"bounds_parameter_keys", std::move(boundsParameterKeysJson)},
@@ -3947,6 +4069,26 @@ ParseTimingColouriseEffect(const json& effectJson) {
         effect.baseBounds =
             ParseTimingColouriseBounds(effectJson.at("base_bounds"));
     }
+    const auto parsedPaletteKeyModel =
+        effectJson.contains("palette_key_model")
+            ? ParseTimingColourisePaletteKeyModel(
+                  effectJson.at("palette_key_model"))
+            : std::nullopt;
+    if (effectJson.contains("palette_source") &&
+        effectJson.at("palette_source").is_object()) {
+        const auto& sourceJson = effectJson.at("palette_source");
+        if (sourceJson.contains("kind")) {
+            effect.paletteSourceKind =
+                ParseTimingColourisePaletteSourceKind(
+                    sourceJson.at("kind"));
+        }
+        effect.paletteSourceId =
+            sourceJson.value("id", std::string{});
+        effect.paletteSourceName =
+            sourceJson.value("name", std::string{});
+        effect.paletteEdited =
+            sourceJson.value("edited", false);
+    }
     if (effectJson.contains("bounds_key_mode")) {
         effect.boundsKeyMode = ParseTimingColouriseBoundsKeyMode(
             effectJson.at("bounds_key_mode"));
@@ -3965,6 +4107,50 @@ ParseTimingColouriseEffect(const json& effectJson) {
                     ParseTimingColourisePalette(keyJson.at("palette"));
             }
             effect.paletteKeys.push_back(std::move(key));
+        }
+    }
+    effect.paletteKeyModel =
+        parsedPaletteKeyModel.value_or(
+            effect.paletteKeys.empty()
+                ? invisible_places::timing::
+                      TimingColourisePaletteKeyModel::StopParameters
+                : invisible_places::timing::
+                      TimingColourisePaletteKeyModel::LegacySnapshots);
+    if (effectJson.contains("palette_stop_parameter_keys") &&
+        effectJson.at("palette_stop_parameter_keys").is_array()) {
+        for (const auto& keyJson :
+             effectJson.at("palette_stop_parameter_keys")) {
+            const auto parameter =
+                keyJson.contains("parameter")
+                    ? ParseTimingColourisePaletteStopParameter(
+                          keyJson.at("parameter"))
+                    : std::nullopt;
+            if (!parameter.has_value()) {
+                continue;
+            }
+            invisible_places::timing::
+                TimingColourisePaletteStopParameterKey key;
+            key.stopId =
+                keyJson.value("stop_id", std::string{});
+            key.parameter = parameter.value();
+            key.position =
+                keyJson.value("position", key.position);
+            key.scalarValue = keyJson.value(
+                "scalar_value",
+                key.scalarValue);
+            if (keyJson.contains("colour_value") &&
+                keyJson.at("colour_value").is_array() &&
+                keyJson.at("colour_value").size() >= 3U) {
+                key.colourValue = keyJson.at("colour_value")
+                                      .get<std::array<float, 3>>();
+            }
+            if (keyJson.contains("interpolation")) {
+                key.interpolation =
+                    ParseWaterScenarioInterpolation(
+                        keyJson.at("interpolation"));
+            }
+            effect.paletteStopParameterKeys.push_back(
+                std::move(key));
         }
     }
     if (effectJson.contains("bounds_parameter_keys") &&
