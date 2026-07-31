@@ -347,6 +347,10 @@ struct WaterSeepageNodeAnimationState {
     float strengthOverride = -1.0F;
     float prominenceOverride = -1.0F;
     float sourceWidthOverride = -1.0F;
+    // Resolved per-node Rain envelope value. Negative keeps the legacy
+    // fallback (scenario Rain when present, otherwise the authored Rain
+    // control). This is a transient frame value, never an authored setting.
+    float rainLevelOverride = -1.0F;
     // Complete transient look produced by active scalar profile tracks. The
     // frame resolver starts from the otherwise active scenario/profile look,
     // applies keyed values, and never writes the result into the saved base.
@@ -582,8 +586,9 @@ struct WaterFeatureTimingOverlay {
 [[nodiscard]] WaterFeatureTimingOverlay BuildWaterFeatureTimingOverlay(
     std::span<const WaterFeatureTimingRun> runs,
     float normalizedPosition);
-// Applies the global-kind "level" samples onto the matching scenario
-// channels (Rain, Mesh Flow, Shoreline, Seepage Global, Flow Global).
+// Applies active singleton "level" samples onto the legacy frame-control
+// carrier (Rain, Mesh Flow, Shoreline). Parsed Seepage/Flow global samples
+// are deliberately ignored.
 void ApplyWaterFeatureTimingOverlayToScenario(
     const WaterFeatureTimingOverlay& overlay,
     WaterScenarioState* state);
@@ -610,6 +615,30 @@ struct WaterMeshFlowRainEnvelope {
     float durationSeconds = 0.0F;
     std::vector<float> samples;
     std::string fingerprint;
+};
+
+inline constexpr float kWaterRainEnvelopeSampleRateHz = 120.0F;
+inline constexpr std::size_t kWaterRainEnvelopeMaximumSamples = 1'000'000U;
+
+// A bounded, deterministic sampling domain shared by authored Seepage and
+// Mesh Flow Rain responses. When the requested duration would exceed the
+// sample budget, the effective rate is reduced while retaining both
+// endpoints.
+struct WaterRainEnvelopeDomain {
+    float durationSeconds = 0.0F;
+    float sampleRateHz = kWaterRainEnvelopeSampleRateHz;
+    float stepSeconds = 0.0F;
+    std::size_t sampleCount = 1U;
+};
+
+struct WaterRainResponseSettings {
+    float delaySeconds = 0.0F;
+    float riseSeconds = 0.0F;
+    float recessionSeconds = 0.0F;
+
+    friend auto operator<=>(
+        const WaterRainResponseSettings&,
+        const WaterRainResponseSettings&) = default;
 };
 
 // Bounded fixed-step schedule used when a stateful GPU Mesh Flow simulation is
@@ -655,6 +684,12 @@ struct WaterSeepageNode {
     float depthToleranceMeters = 0.15F;
     float normalAlignment = 0.20F;
     float strength = 1.0F;
+    // Authored, node-specific response to the global Rain amount. These
+    // parameters affect only the live wetness envelope and never rebuild
+    // connected support.
+    float rainDelaySeconds = 0.0F;
+    float rainRiseSeconds = 0.0F;
+    float rainRecessionSeconds = 0.0F;
     std::uint32_t seed = 1U;
     bool enabledInViewport = true;
     bool enabledInExport = true;
@@ -1358,6 +1393,13 @@ struct WaterDynamicMeshFlowSettings {
     // cells; 1 accepts candidates along the entire sampled-Ground +X rim
     // regardless of moisture, so trails arrive along the whole rock edge.
     float edgeCoverage = 0.0F;
+    // Authored moisture response. Activity is the dry baseline; Rain Gain
+    // fills the remaining activity from the filtered global Rain amount.
+    float activity = 1.0F;
+    float rainGain = 0.0F;
+    float moisturePersistenceMultiplier = 1.0F;
+    float rainRiseSeconds = 0.0F;
+    float rainRecessionSeconds = 0.0F;
     float rainSpawnSpread = 0.75F;
     float rainDistributedSourceFraction = 0.55F;
     std::uint32_t previewParticleLimit = 560;
@@ -1507,6 +1549,13 @@ struct WaterDynamicMeshFlowDiagnostics {
 [[nodiscard]] WaterDynamicMeshFlowSettings DefaultWaterDynamicMeshFlowSettings();
 [[nodiscard]] WaterDynamicMeshFlowSettings SanitizeWaterDynamicMeshFlowSettings(
     WaterDynamicMeshFlowSettings settings);
+void ApplyWaterFeatureTimingOverlayToDynamicMeshFlowSettings(
+    const WaterFeatureTimingOverlay& overlay,
+    WaterDynamicMeshFlowSettings* settings);
+[[nodiscard]] WaterRainResponseSettings
+ResolveWaterDynamicMeshFlowRainResponse(
+    const WaterDynamicMeshFlowSettings& settings,
+    const WaterFeatureTimingOverlay* overlay = nullptr);
 [[nodiscard]] WaterDynamicMeshFlowVisualWeights
 EvaluateWaterDynamicMeshFlowVisualWeights(
     const WaterDynamicMeshFlowSettings& settings,
@@ -1541,9 +1590,17 @@ BuildWaterDynamicMeshFlowGroundEntries(const WaterSurfaceCache& cache);
 [[nodiscard]] float EffectiveWaterDynamicMeshFlowLevel(
     const WaterScenarioState& state,
     float effectiveRainLevel);
+[[nodiscard]] float EffectiveWaterDynamicMeshFlowLevel(
+    const WaterDynamicMeshFlowSettings& settings,
+    float effectiveRainLevel,
+    const WaterFeatureTimingOverlay* overlay = nullptr);
 [[nodiscard]] float EffectiveWaterDynamicMeshPersistenceSeconds(
     float authoredPersistenceSeconds,
     const WaterScenarioState& state);
+[[nodiscard]] float EffectiveWaterDynamicMeshPersistenceSeconds(
+    float authoredPersistenceSeconds,
+    const WaterDynamicMeshFlowSettings& settings,
+    const WaterFeatureTimingOverlay* overlay = nullptr);
 [[nodiscard]] std::string WaterDynamicMeshFlowScenarioFingerprint(
     const WaterScenarioTrack& track,
     const WaterScenarioDefinition& definition);
@@ -1553,12 +1610,24 @@ BuildWaterDynamicMeshFlowGroundEntries(const WaterSurfaceCache& cache);
     float durationSeconds,
     float sampleRateHz = 120.0F,
     std::size_t maxSamples = 1'000'000U);
+[[nodiscard]] WaterMeshFlowRainEnvelope BuildWaterMeshFlowRainEnvelope(
+    const WaterDynamicMeshFlowSettings& settings,
+    std::span<const WaterFeatureTimingRun> runs,
+    float authoredRainLevel,
+    float durationSeconds,
+    float sampleRateHz = kWaterRainEnvelopeSampleRateHz,
+    std::size_t maxSamples = kWaterRainEnvelopeMaximumSamples);
 [[nodiscard]] float EvaluateWaterMeshFlowRainEnvelope(
     const WaterMeshFlowRainEnvelope& envelope,
     float timeSeconds);
 [[nodiscard]] std::string WaterMeshFlowRainEnvelopeFingerprint(
     const WaterScenarioTrack& track,
     const WaterScenarioDefinition& definition,
+    float durationSeconds);
+[[nodiscard]] std::string WaterMeshFlowRainEnvelopeFingerprint(
+    const WaterDynamicMeshFlowSettings& settings,
+    std::span<const WaterFeatureTimingRun> runs,
+    float authoredRainLevel,
     float durationSeconds);
 [[nodiscard]] std::uint64_t WaterMeshFlowSampleTick(
     float sampleTimeSeconds,
@@ -1588,6 +1657,13 @@ void AddOrUpdateWaterSeepageNodeKey(
     float durationSeconds,
     float sampleRateHz = 120.0F,
     std::size_t maxSamples = 1'000'000U);
+[[nodiscard]] WaterSeepageRainEnvelope BuildWaterSeepageNodeRainEnvelope(
+    const WaterSeepageNode& node,
+    std::span<const WaterFeatureTimingRun> runs,
+    float authoredRainLevel,
+    float durationSeconds,
+    float sampleRateHz = kWaterRainEnvelopeSampleRateHz,
+    std::size_t maxSamples = kWaterRainEnvelopeMaximumSamples);
 [[nodiscard]] float EvaluateWaterSeepageRainEnvelope(
     const WaterSeepageRainEnvelope& envelope,
     float timeSeconds);
@@ -1595,8 +1671,35 @@ void AddOrUpdateWaterSeepageNodeKey(
     const WaterScenarioTrack& track,
     const WaterScenarioDefinition& definition,
     float durationSeconds);
+[[nodiscard]] std::string WaterSeepageNodeRainEnvelopeFingerprint(
+    const WaterSeepageNode& node,
+    std::span<const WaterFeatureTimingRun> runs,
+    float authoredRainLevel,
+    float durationSeconds);
+[[nodiscard]] WaterRainEnvelopeDomain MakeWaterRainEnvelopeDomain(
+    float durationSeconds,
+    float sampleRateHz = kWaterRainEnvelopeSampleRateHz,
+    std::size_t maxSamples = kWaterRainEnvelopeMaximumSamples);
+[[nodiscard]] WaterRainResponseSettings SanitizeWaterRainResponseSettings(
+    WaterRainResponseSettings settings);
+[[nodiscard]] WaterRainResponseSettings ResolveWaterSeepageNodeRainResponse(
+    const WaterSeepageNode& node,
+    const WaterFeatureTimingOverlay* overlay = nullptr);
+void ApplyWaterFeatureTimingOverlayToSeepageNode(
+    const WaterFeatureTimingOverlay& overlay,
+    WaterSeepageNode* node);
 [[nodiscard]] float EffectiveWaterFlowActivity(
     const WaterScenarioState& state,
+    float maximumFlowStrength,
+    float rainResponse,
+    bool sourceShowTrail = true,
+    bool globalShowTrails = true);
+// Timing Takes have no aggregate Flow level. The authored source strength is
+// therefore the wet maximum, while Rain Response controls how much of that
+// strength is rain-fed (zero keeps the authored strength constant; one fades
+// from dry to the authored maximum).
+[[nodiscard]] float EffectiveAuthoredWaterFlowActivity(
+    float effectiveRainLevel,
     float maximumFlowStrength,
     float rainResponse,
     bool sourceShowTrail = true,
@@ -1639,9 +1742,9 @@ void ApplyWaterTimingLevelToScenarioState(
     std::span<const WaterSeepageLookProfile> profiles,
     std::span<const WaterSeepageResponseProfile> responseProfiles,
     const WaterSeepageLookSettings& defaultLook);
-// Scalar timing keys need a complete transient look as their base. Authored
-// mode starts from the node's fully resolved settings/response pair, while an
-// active scenario deliberately takes precedence over every node profile.
+// Scalar timing keys need a complete transient look as their base. The node's
+// fully resolved authored settings/response pair always wins; the scenario
+// argument is retained only for source compatibility with legacy callers.
 [[nodiscard]] WaterSeepageLookSettings ResolveWaterSeepageTimingLookBase(
     const WaterSeepageLookSettings& resolvedAuthoredLook,
     const std::optional<WaterScenarioState>& scenarioState);

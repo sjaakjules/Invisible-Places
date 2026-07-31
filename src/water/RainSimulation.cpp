@@ -1471,6 +1471,17 @@ RainRuntimeSettings RainSettingsForScenarioLevel(
     return settings;
 }
 
+RainRuntimeSettings RainSettingsForOptionalTimingLevel(
+    RainRuntimeSettings authoredSettings,
+    std::optional<float> keyedRainLevel) {
+    if (!keyedRainLevel.has_value()) {
+        return authoredSettings;
+    }
+    return RainSettingsForScenarioLevel(
+        authoredSettings,
+        keyedRainLevel.value());
+}
+
 bool RainImpactTailIsActive(
     float lastPotentialImpactTimeSeconds,
     float currentTimeSeconds) {
@@ -3212,11 +3223,10 @@ RainSimulationDiagnostics RainSimulator::Advance(
 
     for (std::uint32_t index = 0; index < particles_.size(); ++index) {
         auto& particle = particles_[index];
-        if (index >= targetCount) {
-            particle.active = false;
-            continue;
-        }
         if (!particle.active) {
+            if (index >= targetCount) {
+                continue;
+            }
             SpawnParticle(index, frame);
             ++diagnostics.respawnCount;
             if (!particle.active) {
@@ -3295,8 +3305,12 @@ RainSimulationDiagnostics RainSimulator::Advance(
             if (frame.settings.impactEffectsEnabled) {
                 EmitImpact(hit, frame, particle, &diagnostics);
             }
-            SpawnParticle(index, frame);
-            ++diagnostics.respawnCount;
+            if (index < targetCount) {
+                SpawnParticle(index, frame);
+                ++diagnostics.respawnCount;
+            } else {
+                particle.active = false;
+            }
             continue;
         }
 
@@ -3311,8 +3325,12 @@ RainSimulationDiagnostics RainSimulator::Advance(
              particle.position.y > surfaceCache.bounds.maximum.y + deathDistance);
         if (outsideCache || cameraDistanceSquared > deathDistance * deathDistance) {
             ++diagnostics.escapedParticles;
-            SpawnParticle(index, frame);
-            ++diagnostics.respawnCount;
+            if (index < targetCount) {
+                SpawnParticle(index, frame);
+                ++diagnostics.respawnCount;
+            } else {
+                particle.active = false;
+            }
         }
     }
     return diagnostics;

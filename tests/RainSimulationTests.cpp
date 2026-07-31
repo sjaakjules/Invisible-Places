@@ -1769,8 +1769,28 @@ TEST_CASE(
     auto settings =
         invisible_places::water::DefaultRainRuntimeSettings();
     settings.enabled = false;
+    settings.rainLevel = 0.42F;
+    const auto authoredOnly =
+        invisible_places::water::
+            RainSettingsForOptionalTimingLevel(
+                settings,
+                std::nullopt);
+    CHECK_FALSE(authoredOnly.enabled);
+    CHECK(
+        authoredOnly.rainLevel ==
+        Catch::Approx(0.42F));
+    const auto keyedOn =
+        invisible_places::water::
+            RainSettingsForOptionalTimingLevel(
+                settings,
+                0.65F);
+    CHECK(keyedOn.enabled);
+    CHECK(
+        keyedOn.rainLevel ==
+        Catch::Approx(0.65F));
     settings =
-        invisible_places::water::RainSettingsForScenarioLevel(
+        invisible_places::water::
+            RainSettingsForOptionalTimingLevel(
             settings,
             0.0F);
     CHECK(settings.enabled);
@@ -1848,20 +1868,45 @@ TEST_CASE(
     frame.timeSeconds += frame.deltaSeconds;
     const auto zeroLevelDiagnostics =
         simulator.Advance(frame, cache);
-    CHECK(zeroLevelDiagnostics.activeParticles == 0U);
-    CHECK(zeroLevelDiagnostics.emittedEvents == 0U);
-    CHECK(simulator.EventWriteIndex() == eventWriteIndex);
-    CHECK(std::none_of(
+    CHECK(zeroLevelDiagnostics.activeParticles > 0U);
+    CHECK(zeroLevelDiagnostics.respawnCount == 0U);
+    CHECK(simulator.EventWriteIndex() >= eventWriteIndex);
+    bool drained = std::none_of(
         simulator.Particles().begin(),
         simulator.Particles().end(),
-        [](const auto& particle) { return particle.active; }));
+        [](const auto& particle) { return particle.active; });
+    for (int step = 0; step < 300 && !drained; ++step) {
+        frame.timeSeconds += frame.deltaSeconds;
+        const auto drainingDiagnostics =
+            simulator.Advance(frame, cache);
+        CHECK(drainingDiagnostics.respawnCount == 0U);
+        drained = std::none_of(
+            simulator.Particles().begin(),
+            simulator.Particles().end(),
+            [](const auto& particle) {
+                return particle.active;
+            });
+    }
+    CHECK(drained);
+    // Drops that were already airborne are still allowed to land and create
+    // their final impact effects while the emitter is at zero.
+    CHECK(simulator.EventWriteIndex() >= eventWriteIndex);
     CHECK(
         std::count_if(
             simulator.Events().begin(),
             simulator.Events().end(),
             [](const auto& event) {
                 return event.role != WaterSurfaceRole::None;
-            }) == retainedEventCount);
+            }) >= retainedEventCount);
+    const auto drainedEventWriteIndex = simulator.EventWriteIndex();
+    for (int step = 0; step < 10; ++step) {
+        frame.timeSeconds += frame.deltaSeconds;
+        const auto idleDiagnostics =
+            simulator.Advance(frame, cache);
+        CHECK(idleDiagnostics.activeParticles == 0U);
+        CHECK(idleDiagnostics.respawnCount == 0U);
+    }
+    CHECK(simulator.EventWriteIndex() == drainedEventWriteIndex);
 }
 
 TEST_CASE("near-surface rain becomes a slowed widened ellipse", "[water][rain][visual]") {

@@ -208,8 +208,11 @@ struct SceneRenderState {
     struct PointCloudLayerState {
         std::size_t layerId = 0;
         renderer::pointcloud::PointCloudStyleState style{};
+        renderer::pointcloud::ResolvedTimingColouriseStack timingColourise{};
         std::vector<invisible_places::io::ScalarFieldStats> scalarFields;
         bool hasSourceRgb = true;
+        bool hasNormals = false;
+        bool timingColouriseEligible = false;
         std::uint32_t drawPointCount = 0;
         renderer::pointcloud::PointCloudDensityCompensation densityCompensation{};
         invisible_places::water::WaterSurfaceRole rainCollisionRole =
@@ -590,6 +593,11 @@ class VulkanViewportShell {
     [[nodiscard]] bool DiagnosticsEnabled() const { return diagnosticsEnabled_; }
     void SetLiveSceneRenderingEnabled(bool enabled) { liveSceneRenderingEnabled_ = enabled; }
     [[nodiscard]] bool LiveSceneRenderingEnabled() const { return liveSceneRenderingEnabled_; }
+    // Offline frames share Rain's persistent GPU buffers with the viewport.
+    // Suspending only the live Rain pass keeps an unpaused viewport useful
+    // without allowing its clock to advance or reset the export simulation.
+    void SetLiveRainSimulationEnabled(bool enabled);
+    void ResetRainRuntime();
     // Smoke diagnostics can arm the existing live depth prepass even when the
     // selected visual renderer does not otherwise need it. Normal viewport
     // rendering pays no additional point-cloud pass.
@@ -1045,6 +1053,7 @@ class VulkanViewportShell {
         float lastPotentialImpactTimeSeconds =
             -std::numeric_limits<float>::infinity();
         float frameDeltaSeconds = 1.0F / 30.0F;
+        std::uint32_t lastInFlightParticleCount = 0U;
         bool previousRainEnabled = false;
         bool collisionReady = false;
         bool flowSurfaceReady = false;
@@ -1405,6 +1414,7 @@ class VulkanViewportShell {
     ViewportDiagnostics diagnostics_{};
     bool diagnosticsEnabled_ = false;
     bool liveSceneRenderingEnabled_ = true;
+    bool liveRainSimulationEnabled_ = true;
     bool liveSceneReadbackCaptureEnabled_ = false;
     bool sceneCachingEnabled_ = false;
     std::uint32_t pointCloudMutationBatchDepth_ = 0U;

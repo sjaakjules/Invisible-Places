@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -190,6 +191,12 @@ struct RainIntensityMultipliers {
 [[nodiscard]] RainRuntimeSettings RainSettingsForScenarioLevel(
     RainRuntimeSettings settings,
     float rainLevel);
+// Authored Rain remains authoritative when no explicit Timing Take key is
+// sampled. A keyed value (including zero) activates the Rain runtime so new
+// droplets can stop while existing impact tails continue to decay.
+[[nodiscard]] RainRuntimeSettings RainSettingsForOptionalTimingLevel(
+    RainRuntimeSettings authoredSettings,
+    std::optional<float> keyedRainLevel);
 [[nodiscard]] bool RainImpactTailIsActive(
     float lastPotentialImpactTimeSeconds,
     float currentTimeSeconds);

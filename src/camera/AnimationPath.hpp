@@ -2,6 +2,7 @@
 
 #include "camera/CameraShot.hpp"
 #include "renderer/pointcloud/PointCloudPreviewState.hpp"
+#include "timing/TimingColourise.hpp"
 #include "water/WaterFlow.hpp"
 
 #include <array>
@@ -53,6 +54,10 @@ struct AnimationPath {
     float apertureFStops = 8.0F;
     float depthOfFieldMaxBlurPixels = 24.0F;
     AnimationExportSettings exportSettings{};
+    std::string selectedTimingTakeId =
+        std::string{invisible_places::timing::kAuthoredTimingTakeId};
+    // Retained for legacy animation round-trip. Runtime timing resolves
+    // selectedTimingTakeId instead.
     std::string selectedWaterScenarioId;
     std::vector<invisible_places::water::WaterScenarioTrack> waterScenarioTracks;
     std::optional<invisible_places::water::WaterAnimationTrailSettings> waterAnimationTrailSettings;

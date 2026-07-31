@@ -419,3 +419,106 @@ TEST_CASE("Missing offline scalar fields retain the authored constant fallback",
     CHECK(Maximum(missing.alpha) == Catch::Approx(Maximum(constant.alpha)).margin(1.0e-5F));
     CHECK(Maximum(missing.beautyR) == Catch::Approx(Maximum(constant.beautyR)).margin(1.0e-5F));
 }
+
+TEST_CASE(
+    "Offline timing colourise uses scalar bounds without changing point opacity",
+    "[output][offline][timing-colourise]") {
+    using invisible_places::renderer::pointcloud::PointCloudColorMode;
+    using invisible_places::renderer::pointcloud::PointCloudFalloffProfile;
+    using invisible_places::renderer::pointcloud::PointCloudStyleState;
+    using invisible_places::renderer::pointcloud::ResolvedTimingColouriseStack;
+    using invisible_places::renderer::pointcloud::TimingColouriseSource;
+
+    auto render = [](float scalarValue, bool fastBasic) {
+        invisible_places::io::LoadedPointCloud cloud;
+        cloud.positions = {{0.0F, 0.0F, 0.0F}};
+        cloud.scalarFields = {{
+            .name = "Interest",
+            .minimum = 0.0F,
+            .maximum = 2.0F,
+            .count = 1U,
+            .valid = true,
+        }};
+        cloud.scalarFieldValues = {scalarValue};
+
+        PointCloudStyleState style;
+        style.colorMode = PointCloudColorMode::SolidColor;
+        style.solidColor = {0.20F, 0.40F, 0.80F, 1.0F};
+        style.falloffProfile = PointCloudFalloffProfile::HardDisc;
+        style.solidCenters = true;
+        invisible_places::style::SetScalarConstant(&style.pointSize, 4.0F);
+        invisible_places::style::SetScalarConstant(&style.opacity, 1.0F);
+
+        ResolvedTimingColouriseStack stack;
+        stack.effectCount = 1U;
+        auto& effect = stack.effects.front();
+        effect.enabled = true;
+        effect.source = TimingColouriseSource::ScalarField;
+        effect.scalarFieldSlot = 0;
+        effect.lowerBound = 0.5F;
+        effect.upperBound = 1.5F;
+        effect.edgeFadeFraction = 0.25F;
+        effect.rgbaLut.fill({1.0F, 0.0F, 0.0F, 1.0F});
+
+        const invisible_places::output::OfflinePointLayer layer{
+            .cloud = &cloud,
+            .style = style,
+            .timingColourise = stack,
+            .hasSourceRgb = false,
+            .fastBasic = fastBasic,
+            .localToWorld = glm::mat4{1.0F},
+        };
+        invisible_places::camera::CameraState cameraState;
+        cameraState.position = {0.0F, 0.0F, 5.0F};
+        cameraState.target = {0.0F, 0.0F, 0.0F};
+        cameraState.nearPlane = 0.1F;
+        cameraState.farPlane = 20.0F;
+
+        invisible_places::output::ExrImage image;
+        invisible_places::output::InitializeExrImage(&image, 9U, 9U);
+        invisible_places::output::RenderPointCloudTile(
+            {layer},
+            cameraState,
+            invisible_places::output::OfflineRenderTile{0U, 0U, 9U, 9U},
+            &image);
+        return image;
+    };
+
+    for (const bool fastBasic : {false, true}) {
+        const auto outside = render(0.25F, fastBasic);
+        const auto above = render(1.75F, fastBasic);
+        const auto notANumber =
+            render(std::numeric_limits<float>::quiet_NaN(), fastBasic);
+        const auto positiveInfinity =
+            render(std::numeric_limits<float>::infinity(), fastBasic);
+        const auto negativeInfinity =
+            render(-std::numeric_limits<float>::infinity(), fastBasic);
+        const auto edge = render(0.5F, fastBasic);
+        const auto inside = render(1.0F, fastBasic);
+        const std::size_t center = 4U * 9U + 4U;
+        REQUIRE(outside.alpha[center] > 0.0F);
+        for (const auto* rejected : {
+                 &above,
+                 &notANumber,
+                 &positiveInfinity,
+                 &negativeInfinity,
+             }) {
+            REQUIRE(rejected->alpha[center] > 0.0F);
+            CHECK(
+                rejected->beautyR[center] ==
+                Catch::Approx(outside.beautyR[center]).margin(1.0e-5F));
+            CHECK(
+                rejected->beautyG[center] ==
+                Catch::Approx(outside.beautyG[center]).margin(1.0e-5F));
+            CHECK(
+                rejected->beautyB[center] ==
+                Catch::Approx(outside.beautyB[center]).margin(1.0e-5F));
+            CHECK(
+                rejected->alpha[center] ==
+                Catch::Approx(outside.alpha[center]).margin(1.0e-5F));
+        }
+        CHECK(edge.beautyB[center] == Catch::Approx(outside.beautyB[center]).margin(1.0e-5F));
+        CHECK(inside.beautyR[center] > inside.beautyB[center]);
+        CHECK(inside.alpha[center] == Catch::Approx(outside.alpha[center]).margin(1.0e-5F));
+    }
+}

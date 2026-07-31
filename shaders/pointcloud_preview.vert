@@ -14,6 +14,8 @@ layout(location = 7) flat out uint outPointIndex;
 layout(location = 8) out float outSurfaceAngleMask;
 layout(location = 9) out vec3 outAovNormal;
 layout(location = 10) out float outCaustic;
+layout(location = 11) out vec4 outWaterColourTransform;
+layout(location = 12) flat out vec4 outTimingColourise[5];
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 viewProjection;
@@ -100,11 +102,17 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 rainImpactVegetation1;
     vec4 rainImpactSandBand;
     vec4 rainImpactResponse;
+    uvec4 timingColouriseControl;
+    uvec4 timingColouriseSources[5];
+    vec4 timingColouriseRanges[5];
+    vec4 timingColouriseLut[320];
 } styleData;
 
 #include "pointcloud_sparse_ripple.glsl"
 #include "pointcloud_rain_impact.glsl"
 #include "pointcloud_mesh_flow_contact.glsl"
+#define POINTCLOUD_TIMING_COLOURISE_VERTEX
+#include "pointcloud_timing_colourise.glsl"
 
 const uint kFieldMapFlagClamp = 1u;
 const uint kFieldMapFlagInvert = 2u;
@@ -932,6 +940,30 @@ vec3 ResolveAovNormal(uint pointIndex) {
     return normalize(normal);
 }
 
+vec3 ApplyResolvedWaterColour(
+    vec3 baseColor,
+    uint pointIndex,
+    float caustic,
+    float previewTint,
+    float waterEffectScale,
+    SparseRippleComposite sparseRipple,
+    RainImpactComposite rainImpact,
+    MeshFlowContactComposite meshFlowContact) {
+    return ApplyMeshFlowContactColour(
+        ApplyRainImpactColour(
+            ApplySparseRippleColor(
+                ApplyWaterEffectColor(
+                    mix(
+                        baseColor,
+                        styleData.causticTint.rgb,
+                        CausticColorMixAmount(caustic, previewTint)),
+                    pointIndex,
+                    waterEffectScale),
+                sparseRipple),
+            rainImpact),
+        meshFlowContact);
+}
+
 void main() {
     const uint pointIndex = uint(gl_VertexIndex);
     // GPU Flow writes its settled route/trail geometry directly to the vec4
@@ -1020,19 +1052,48 @@ void main() {
         : minPointSize;
 
     const float causticColorSignal = CausticColorSignal(caustic, previewTint);
-    outSourceColor =
-        vec4(
-            ApplyMeshFlowContactColour(
-                ApplyRainImpactColour(
-                    ApplySparseRippleColor(
-                        ApplyWaterEffectColor(
-                            mix(inColor.rgb, styleData.causticTint.rgb, CausticColorMixAmount(caustic, previewTint)),
-                            pointIndex,
-                            waterEffectScale),
-                        sparseRipple),
-                    rainImpact),
+    ResolveTimingColouriseStack(pointIndex, outTimingColourise);
+    if (styleData.timingColouriseControl.x != 0u) {
+        const vec3 waterFromZero = ApplyResolvedWaterColour(
+            vec3(0.0),
+            pointIndex,
+            caustic,
+            previewTint,
+            waterEffectScale,
+            sparseRipple,
+            rainImpact,
+            meshFlowContact);
+        const vec3 waterFromOne = ApplyResolvedWaterColour(
+            vec3(1.0),
+            pointIndex,
+            caustic,
+            previewTint,
+            waterEffectScale,
+            sparseRipple,
+            rainImpact,
+            meshFlowContact);
+        const float retainedBase = dot(
+            waterFromOne - waterFromZero,
+            vec3(1.0 / 3.0));
+        outWaterColourTransform =
+            vec4(waterFromZero, retainedBase);
+        // Resolve Source RGB, Solid and Scalar Colormap through one fragment
+        // path before applying timing colourise and this water transform.
+        outSourceColor = inColor;
+    } else {
+        outWaterColourTransform = vec4(0.0, 0.0, 0.0, 1.0);
+        outSourceColor = vec4(
+            ApplyResolvedWaterColour(
+                inColor.rgb,
+                pointIndex,
+                caustic,
+                previewTint,
+                waterEffectScale,
+                sparseRipple,
+                rainImpact,
                 meshFlowContact),
             inColor.a);
+    }
     outColormapValue = EvaluateBinding(styleData.colormapPositionBinding);
     const vec2 animatedFlow = ApplyWaterFlowAnimation(
         EvaluateBinding(styleData.opacityBinding),

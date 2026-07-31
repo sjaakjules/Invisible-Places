@@ -277,17 +277,60 @@ TEST_CASE("Scalar keyed Seepage looks preserve named and local authored profile 
     scenario.seepageLook.baseWetness = 0.19F;
     scenario.seepageLook.glisten = 0.28F;
     scenario.seepageLook.response.emissionAdd = 0.31F;
-    const auto scenarioBase = ResolveWaterSeepageTimingLookBase(
+    const auto authoredBaseWithLegacyScenario =
+        ResolveWaterSeepageTimingLookBase(
         localSettings,
         scenario);
     CHECK(
-        scenarioBase.pattern ==
-        WaterSeepagePattern::WettingTrickle);
-    CHECK(scenarioBase.baseWetness == Catch::Approx(0.19F));
-    CHECK(scenarioBase.glisten == Catch::Approx(0.28F));
+        authoredBaseWithLegacyScenario.pattern ==
+        localSettings.pattern);
     CHECK(
-        scenarioBase.response.emissionAdd ==
-        Catch::Approx(0.31F));
+        authoredBaseWithLegacyScenario.baseWetness ==
+        Catch::Approx(localSettings.baseWetness));
+    CHECK(
+        authoredBaseWithLegacyScenario.glisten ==
+        Catch::Approx(localSettings.glisten));
+    CHECK(
+        authoredBaseWithLegacyScenario.response.emissionAdd ==
+        Catch::Approx(localSettings.response.emissionAdd));
+}
+
+TEST_CASE("Seepage runtime ignores legacy scenario looks transitions and spread",
+          "[water][seepage][timing][authored-base]") {
+    using Catch::Approx;
+    using invisible_places::water::WaterScenarioState;
+
+    WaterSeepageLookSettings authoredLook;
+    authoredLook.pattern = WaterSeepagePattern::WetRockSheen;
+    authoredLook.baseWetness = 0.67F;
+
+    WaterScenarioState legacyScenario;
+    legacyScenario.seepageLook.pattern =
+        WaterSeepagePattern::WettingTrickle;
+    legacyScenario.seepageLook.baseWetness = 0.12F;
+    legacyScenario.seepageSpread = 1.0F;
+    legacyScenario.transitionLook = WaterSeepageLookSettings{};
+    legacyScenario.transitionLook->pattern =
+        WaterSeepagePattern::ChaoticBloom;
+    legacyScenario.transitionAmount = 0.75F;
+
+    const auto grid = BuildGrid(
+        {MakeSeepageNode()},
+        "ROCK",
+        false,
+        {},
+        1'000'000ULL,
+        authoredLook,
+        {},
+        legacyScenario);
+    REQUIRE(grid.nodes.size() == 1U);
+    CHECK(
+        grid.nodes.front().look.pattern ==
+        WaterSeepagePattern::WetRockSheen);
+    CHECK(grid.nodes.front().look.baseWetness == Approx(0.67F));
+    CHECK_FALSE(grid.nodes.front().transitionLook.has_value());
+    CHECK(grid.nodes.front().transitionAmount == Approx(0.0F));
+    CHECK(grid.nodes.front().scenarioSpread == Approx(0.0F));
 }
 
 TEST_CASE("Historical Seepage scenarios share visual language but differ in moisture", "[water][seepage][scenario]") {
@@ -985,7 +1028,7 @@ TEST_CASE("Inactive Seepage runtime parameters settle without requesting live re
     WaterScenarioState fullyInactiveTransition;
     fullyInactiveTransition.transitionLook = noResponse;
     fullyInactiveTransition.transitionAmount = 1.0F;
-    CHECK_FALSE(WaterSeepageGridHasActiveViewportEffect(BuildGrid(
+    CHECK(WaterSeepageGridHasActiveViewportEffect(BuildGrid(
         {node},
         "ROCK",
         false,
@@ -1983,6 +2026,11 @@ TEST_CASE("Mesh Flow fixed-capacity settings sanitize and fingerprint live contr
     CHECK(defaults.sourceBandWidthMeters == Approx(0.75F));
     CHECK(defaults.sourceBandFraction == Approx(0.04F));
     CHECK(defaults.edgeCoverage == Approx(0.0F));
+    CHECK(defaults.activity == Approx(1.0F));
+    CHECK(defaults.rainGain == Approx(0.0F));
+    CHECK(defaults.moisturePersistenceMultiplier == Approx(1.0F));
+    CHECK(defaults.rainRiseSeconds == Approx(0.0F));
+    CHECK(defaults.rainRecessionSeconds == Approx(0.0F));
     CHECK(defaults.surfaceSurge == Approx(0.6F));
     CHECK(defaults.rainDistributedSourceFraction == Approx(0.55F));
     CHECK(defaults.speedMetersPerSecond == Approx(0.26F));
@@ -2001,6 +2049,13 @@ TEST_CASE("Mesh Flow fixed-capacity settings sanitize and fingerprint live contr
     invalid.historyLength = 1U;
     invalid.sourceBandWidthMeters = -1.0F;
     invalid.edgeCoverage = 2.0F;
+    invalid.activity = -1.0F;
+    invalid.rainGain = 9.0F;
+    invalid.moisturePersistenceMultiplier =
+        std::numeric_limits<float>::quiet_NaN();
+    invalid.rainRiseSeconds = -3.0F;
+    invalid.rainRecessionSeconds =
+        std::numeric_limits<float>::infinity();
     invalid.surfaceSurge = -1.0F;
     invalid.rockResponse.radiusMeters = 5.0F;
     invalid.rockResponse.colourise.x = -2.0F;
@@ -2011,6 +2066,13 @@ TEST_CASE("Mesh Flow fixed-capacity settings sanitize and fingerprint live contr
     CHECK(sanitized.historyLength == 24U);
     CHECK(sanitized.sourceBandWidthMeters == Approx(0.75F));
     CHECK(sanitized.edgeCoverage == Approx(1.0F));
+    CHECK(sanitized.activity == Approx(0.0F));
+    CHECK(sanitized.rainGain == Approx(4.0F));
+    CHECK(
+        sanitized.moisturePersistenceMultiplier ==
+        Approx(1.0F));
+    CHECK(sanitized.rainRiseSeconds == Approx(0.0F));
+    CHECK(sanitized.rainRecessionSeconds == Approx(0.0F));
     CHECK(sanitized.surfaceSurge == Approx(0.0F));
     CHECK(sanitized.rockResponse.radiusMeters == Approx(0.75F));
     CHECK(sanitized.rockResponse.colourise.x == Approx(0.0F));
@@ -2039,6 +2101,14 @@ TEST_CASE("Mesh Flow fixed-capacity settings sanitize and fingerprint live contr
           WaterDynamicMeshFlowSettingsFingerprint(changed));
     changed = defaults;
     changed.surfaceSurge = 0.2F;
+    CHECK(defaultFingerprint !=
+          WaterDynamicMeshFlowSettingsFingerprint(changed));
+    changed = defaults;
+    changed.rainGain = 0.5F;
+    CHECK(defaultFingerprint !=
+          WaterDynamicMeshFlowSettingsFingerprint(changed));
+    changed = defaults;
+    changed.rainRecessionSeconds = 4.0F;
     CHECK(defaultFingerprint !=
           WaterDynamicMeshFlowSettingsFingerprint(changed));
 
@@ -2332,6 +2402,7 @@ TEST_CASE("Mesh Flow entries follow the curved positive-X rim with geodesic dist
 
 TEST_CASE("Water Flow activity combines keyed level and Rain response deterministically", "[water][flow][scenario][animation]") {
     using Catch::Approx;
+    using invisible_places::water::EffectiveAuthoredWaterFlowActivity;
     using invisible_places::water::EffectiveWaterFlowActivity;
     using invisible_places::water::WaterScenarioState;
 
@@ -2356,13 +2427,48 @@ TEST_CASE("Water Flow activity combines keyed level and Rain response determinis
     CHECK(EffectiveWaterFlowActivity(state, 1.0F, 1.0F, true, false) == Approx(0.0F));
     CHECK(EffectiveWaterFlowActivity(state, 1.0F, 1.0F, true, true) == Approx(1.0F));
 
+    // Timing Takes have no aggregate Flow level. Rain Response partitions an
+    // authored source maximum into its dry baseline and rain-fed share.
+    CHECK(
+        EffectiveAuthoredWaterFlowActivity(
+            0.0F,
+            0.80F,
+            0.75F) ==
+        Approx(0.20F));
+    CHECK(
+        EffectiveAuthoredWaterFlowActivity(
+            0.50F,
+            0.80F,
+            0.75F) ==
+        Approx(0.50F));
+    CHECK(
+        EffectiveAuthoredWaterFlowActivity(
+            1.0F,
+            0.80F,
+            0.75F) ==
+        Approx(0.80F));
+    CHECK(
+        EffectiveAuthoredWaterFlowActivity(
+            0.0F,
+            0.80F,
+            0.0F) ==
+        Approx(0.80F));
+    CHECK(
+        EffectiveAuthoredWaterFlowActivity(
+            1.0F,
+            0.80F,
+            1.0F,
+            false,
+            true) ==
+        Approx(0.0F));
+
     const invisible_places::water::WaterEmitter emitter;
     const invisible_places::water::WaterManualFlowPathSource manual;
     CHECK(emitter.showTrail);
     CHECK(manual.showTrail);
 }
 
-TEST_CASE("Applying scenario keys changes only compact Seepage parameters", "[water][seepage][scenario][topology]") {
+TEST_CASE("Applying legacy scenario Rain changes only compact Seepage parameters", "[water][seepage][scenario][topology]") {
     using invisible_places::water::ApplyWaterSeepageScenarioParameters;
     using invisible_places::water::WaterSeepageParamsFingerprint;
     using invisible_places::water::WaterSeepageTopologyFingerprint;
@@ -2377,7 +2483,7 @@ TEST_CASE("Applying scenario keys changes only compact Seepage parameters", "[wa
     CHECK(WaterSeepageParamsFingerprint(grid) != paramsBefore);
     REQUIRE(grid.nodes.size() == 1U);
     CHECK(grid.nodes.front().resolvedQuality == WaterSeepageQuality::Low);
-    CHECK(grid.nodes.front().scenarioSpread == Catch::Approx(0.60F));
+    CHECK(grid.nodes.front().scenarioSpread == Catch::Approx(0.0F));
     CHECK(grid.nodes.front().rainVisualStrength == Catch::Approx(0.72F));
 }
 
@@ -2663,7 +2769,7 @@ TEST_CASE("Seepage runs travel further on steep guide surfaces than flat ones", 
     CHECK(maskAt({0.0F, 0.0F, 1.0F}) == Catch::Approx(0.0F).margin(1.0e-6F));
 }
 
-TEST_CASE("Per-node Seepage keys compose activity spread and wetting without topology changes", "[water][seepage][scenario][node-animation]") {
+TEST_CASE("Per-node Seepage keys keep legacy spread inert without topology changes", "[water][seepage][scenario][node-animation]") {
     using Catch::Approx;
     using invisible_places::water::AddOrUpdateWaterSeepageNodeKey;
     using invisible_places::water::ApplyWaterSeepageRuntimeParameters;
@@ -2717,7 +2823,7 @@ TEST_CASE("Per-node Seepage keys compose activity spread and wetting without top
         {MakeSeepageNode()}, "ROCK", false, {}, 1'000'000ULL, {}, {}, scenario, nodeStates);
     REQUIRE(grid.nodes.size() == 1U);
     CHECK(grid.nodes.front().strength == Approx(0.48F).margin(5.0e-5F));
-    CHECK(grid.nodes.front().scenarioSpread == Approx(0.625F).margin(5.0e-5F));
+    CHECK(grid.nodes.front().scenarioSpread == Approx(0.0F).margin(5.0e-5F));
     CHECK(grid.nodes.front().wettingProgress == Approx(0.5F).margin(5.0e-5F));
 
     const auto topology = WaterSeepageTopologyFingerprint(grid);
@@ -2735,7 +2841,7 @@ TEST_CASE("Per-node Seepage keys compose activity spread and wetting without top
     CHECK(WaterSeepageTopologyFingerprint(grid) == topology);
     CHECK(WaterSeepageParamsFingerprint(grid) != params);
     CHECK(grid.nodes.front().strength == Approx(0.20F));
-    CHECK(grid.nodes.front().scenarioSpread == Approx(0.40F));
+    CHECK(grid.nodes.front().scenarioSpread == Approx(0.0F));
     CHECK(grid.nodes.front().wettingProgress == Approx(0.90F));
 
     auto editedNode = MakeSeepageNode();
@@ -2830,6 +2936,293 @@ TEST_CASE("Seepage Rain envelopes are immediate by default and deterministic whe
     const auto sanitized = EvaluateWaterScenarioTrack(track, definition, 0.0F);
     CHECK(sanitized.seepageRainDelaySeconds == Approx(0.0F));
     CHECK(sanitized.seepageRainRiseSeconds == Approx(0.0F));
+}
+
+TEST_CASE("Authored per-node Rain envelopes are deterministic and share by signature",
+          "[water][seepage][rain][timing][authored]") {
+    using Catch::Approx;
+    using invisible_places::water::BuildWaterSeepageNodeRainEnvelope;
+    using invisible_places::water::EvaluateWaterSeepageRainEnvelope;
+    using invisible_places::water::MakeWaterRainEnvelopeDomain;
+    using invisible_places::water::ResolveWaterSeepageNodeRainResponse;
+    using invisible_places::water::WaterFeatureTimingRun;
+    using invisible_places::water::WaterKeyedFeatureKind;
+    using invisible_places::water::WaterScenarioInterpolation;
+    using invisible_places::water::
+        WaterSeepageNodeRainEnvelopeFingerprint;
+
+    auto invalidResponseNode = MakeSeepageNode(3U);
+    CHECK(invalidResponseNode.rainDelaySeconds == Approx(0.0F));
+    CHECK(invalidResponseNode.rainRiseSeconds == Approx(0.0F));
+    CHECK(invalidResponseNode.rainRecessionSeconds == Approx(0.0F));
+    invalidResponseNode.rainDelaySeconds = -1.0F;
+    invalidResponseNode.rainRiseSeconds =
+        std::numeric_limits<float>::quiet_NaN();
+    invalidResponseNode.rainRecessionSeconds =
+        std::numeric_limits<float>::infinity();
+    const auto sanitizedResponse =
+        ResolveWaterSeepageNodeRainResponse(
+            invalidResponseNode);
+    CHECK(sanitizedResponse.delaySeconds == Approx(0.0F));
+    CHECK(sanitizedResponse.riseSeconds == Approx(0.0F));
+    CHECK(sanitizedResponse.recessionSeconds == Approx(0.0F));
+
+    WaterFeatureTimingRun run;
+    run.id = 1U;
+    run.name = "Rain pulse";
+    run.features.push_back({
+        .feature = {.kind = WaterKeyedFeatureKind::Rain},
+        .settings = {{
+            .settingId = "level",
+            .keys = {
+                {.position = 0.0F,
+                 .value = 0.0F,
+                 .interpolation =
+                     WaterScenarioInterpolation::Hold},
+                {.position = 0.1F,
+                 .value = 1.0F,
+                 .interpolation =
+                     WaterScenarioInterpolation::Hold},
+                {.position = 0.5F,
+                 .value = 0.0F,
+                 .interpolation =
+                     WaterScenarioInterpolation::Hold},
+                {.position = 1.0F,
+                 .value = 0.0F,
+                 .interpolation =
+                     WaterScenarioInterpolation::Hold},
+            },
+        }},
+    });
+    const std::vector<WaterFeatureTimingRun> runs{run};
+
+    auto first = MakeSeepageNode(41U);
+    first.rainDelaySeconds = 0.25F;
+    first.rainRiseSeconds = 0.40F;
+    first.rainRecessionSeconds = 2.0F;
+    auto matching = first;
+    matching.id = 99U;
+
+    const auto firstFingerprint =
+        WaterSeepageNodeRainEnvelopeFingerprint(
+            first,
+            runs,
+            0.0F,
+            10.0F);
+    CHECK(
+        firstFingerprint ==
+        WaterSeepageNodeRainEnvelopeFingerprint(
+            matching,
+            runs,
+            0.0F,
+            10.0F));
+
+    const auto envelope = BuildWaterSeepageNodeRainEnvelope(
+        first,
+        runs,
+        0.0F,
+        10.0F);
+    const auto repeat = BuildWaterSeepageNodeRainEnvelope(
+        first,
+        runs,
+        0.0F,
+        10.0F);
+    REQUIRE(envelope.samples.size() == 1'201U);
+    CHECK(envelope.sampleRateHz == Approx(120.0F));
+    CHECK(envelope.samples == repeat.samples);
+    CHECK(envelope.fingerprint == firstFingerprint);
+    CHECK(EvaluateWaterSeepageRainEnvelope(envelope, 0.9F) ==
+          Approx(0.0F));
+    CHECK(EvaluateWaterSeepageRainEnvelope(envelope, 2.0F) >
+          0.5F);
+    const float lateFirst =
+        EvaluateWaterSeepageRainEnvelope(envelope, 8.0F);
+    const float earlySecond =
+        EvaluateWaterSeepageRainEnvelope(envelope, 2.0F);
+    CHECK(earlySecond > lateFirst);
+    CHECK(
+        EvaluateWaterSeepageRainEnvelope(envelope, 8.0F) ==
+        Approx(lateFirst));
+
+    matching.rainRecessionSeconds = 1.0F;
+    CHECK(
+        firstFingerprint !=
+        WaterSeepageNodeRainEnvelopeFingerprint(
+            matching,
+            runs,
+            0.0F,
+            10.0F));
+
+    const auto bounded =
+        MakeWaterRainEnvelopeDomain(10.0F, 120.0F, 16U);
+    CHECK(bounded.sampleCount == 16U);
+    CHECK(bounded.durationSeconds == Approx(10.0F));
+    CHECK(bounded.stepSeconds == Approx(10.0F / 15.0F));
+    CHECK(bounded.sampleRateHz == Approx(1.5F));
+}
+
+TEST_CASE("Keyed node Rain response changes only its authored envelope",
+          "[water][seepage][rain][timing][authored]") {
+    using Catch::Approx;
+    using invisible_places::water::BuildWaterSeepageNodeRainEnvelope;
+    using invisible_places::water::EvaluateWaterSeepageRainEnvelope;
+    using invisible_places::water::WaterFeatureTimingRun;
+    using invisible_places::water::WaterKeyedFeatureKind;
+    using invisible_places::water::WaterScenarioInterpolation;
+
+    WaterFeatureTimingRun run;
+    run.id = 1U;
+    run.features = {
+        {
+            .feature = {.kind = WaterKeyedFeatureKind::Rain},
+            .settings = {{
+                .settingId = "level",
+                .keys = {
+                    {.position = 0.0F,
+                     .value = 1.0F,
+                     .interpolation =
+                         WaterScenarioInterpolation::Hold},
+                    {.position = 1.0F, .value = 1.0F},
+                },
+            }},
+        },
+        {
+            .feature = {
+                .kind = WaterKeyedFeatureKind::SeepageNode,
+                .objectId = 7U,
+            },
+            .settings = {
+                {
+                    .settingId = "rain_delay_seconds",
+                    .keys = {
+                        {.position = 0.0F,
+                         .value = 2.0F,
+                         .interpolation =
+                             WaterScenarioInterpolation::Hold},
+                        {.position = 1.0F, .value = 2.0F},
+                    },
+                },
+                {
+                    .settingId = "rain_rise_seconds",
+                    .keys = {
+                        {.position = 0.0F,
+                         .value = 4.0F,
+                         .interpolation =
+                             WaterScenarioInterpolation::Hold},
+                        {.position = 1.0F, .value = 4.0F},
+                    },
+                },
+            },
+        },
+    };
+    const std::vector<WaterFeatureTimingRun> runs{run};
+    auto keyed = MakeSeepageNode(7U);
+    auto unkeyed = MakeSeepageNode(8U);
+    keyed.rainRiseSeconds = 0.0F;
+    unkeyed.rainRiseSeconds = 0.0F;
+
+    const auto keyedEnvelope =
+        BuildWaterSeepageNodeRainEnvelope(
+            keyed,
+            runs,
+            0.0F,
+            10.0F);
+    const auto unkeyedEnvelope =
+        BuildWaterSeepageNodeRainEnvelope(
+            unkeyed,
+            runs,
+            0.0F,
+            10.0F);
+    CHECK(
+        EvaluateWaterSeepageRainEnvelope(
+            keyedEnvelope,
+            1.0F) ==
+        Approx(0.0F));
+    CHECK(
+        EvaluateWaterSeepageRainEnvelope(
+            keyedEnvelope,
+            3.0F) <
+        EvaluateWaterSeepageRainEnvelope(
+            unkeyedEnvelope,
+            3.0F));
+    CHECK(
+        EvaluateWaterSeepageRainEnvelope(
+            unkeyedEnvelope,
+            0.0F) ==
+        Approx(1.0F));
+}
+
+TEST_CASE("Authored Mesh Flow response evaluates and filters keyed Rain",
+          "[water][mesh-flow][rain][timing][authored]") {
+    using Catch::Approx;
+    using invisible_places::water::BuildWaterMeshFlowRainEnvelope;
+    using invisible_places::water::EffectiveWaterDynamicMeshFlowLevel;
+    using invisible_places::water::
+        EffectiveWaterDynamicMeshPersistenceSeconds;
+    using invisible_places::water::EvaluateWaterMeshFlowRainEnvelope;
+    using invisible_places::water::WaterDynamicMeshFlowSettings;
+    using invisible_places::water::WaterFeatureTimingRun;
+    using invisible_places::water::WaterKeyedFeatureKind;
+    using invisible_places::water::WaterScenarioInterpolation;
+
+    WaterDynamicMeshFlowSettings settings;
+    settings.activity = 0.2F;
+    settings.rainGain = 1.0F;
+    settings.moisturePersistenceMultiplier = 2.0F;
+    settings.rainRiseSeconds = 0.5F;
+    settings.rainRecessionSeconds = 2.0F;
+    CHECK(
+        EffectiveWaterDynamicMeshFlowLevel(
+            settings,
+            0.0F) ==
+        Approx(0.2F));
+    CHECK(
+        EffectiveWaterDynamicMeshFlowLevel(
+            settings,
+            1.0F) ==
+        Approx(1.0F));
+    CHECK(
+        EffectiveWaterDynamicMeshPersistenceSeconds(
+            2.5F,
+            settings) ==
+        Approx(5.0F));
+
+    WaterFeatureTimingRun run;
+    run.id = 1U;
+    run.features.push_back({
+        .feature = {.kind = WaterKeyedFeatureKind::Rain},
+        .settings = {{
+            .settingId = "level",
+            .keys = {
+                {.position = 0.0F,
+                 .value = 1.0F,
+                 .interpolation =
+                     WaterScenarioInterpolation::Hold},
+                {.position = 0.5F,
+                 .value = 0.0F,
+                 .interpolation =
+                     WaterScenarioInterpolation::Hold},
+                {.position = 1.0F, .value = 0.0F},
+            },
+        }},
+    });
+    const std::vector<WaterFeatureTimingRun> runs{run};
+    const auto envelope = BuildWaterMeshFlowRainEnvelope(
+        settings,
+        runs,
+        0.0F,
+        10.0F);
+    const auto repeat = BuildWaterMeshFlowRainEnvelope(
+        settings,
+        runs,
+        0.0F,
+        10.0F);
+    CHECK(envelope.samples == repeat.samples);
+    CHECK(envelope.fingerprint == repeat.fingerprint);
+    CHECK(EvaluateWaterMeshFlowRainEnvelope(envelope, 2.0F) >
+          0.5F);
+    CHECK(EvaluateWaterMeshFlowRainEnvelope(envelope, 8.0F) >
+          0.0F);
 }
 
 TEST_CASE("Seepage surface-cache guides follow a vertical ROCK sheet", "[water][seepage][surface-cache][guide]") {

@@ -20,6 +20,7 @@ namespace invisible_places::output {
 struct OfflinePointLayer {
     const invisible_places::io::LoadedPointCloud* cloud = nullptr;
     invisible_places::renderer::pointcloud::PointCloudStyleState style{};
+    invisible_places::renderer::pointcloud::ResolvedTimingColouriseStack timingColourise{};
     bool hasSourceRgb = false;
     bool fastBasic = false;
     std::uint64_t drawPointCount = 0;

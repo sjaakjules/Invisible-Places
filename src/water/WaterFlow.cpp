@@ -3368,6 +3368,26 @@ WaterDynamicMeshFlowSettings SanitizeWaterDynamicMeshFlowSettings(
         finiteOr(settings.edgeCoverage, 0.0F),
         0.0F,
         1.0F);
+    settings.activity = std::clamp(
+        finiteOr(settings.activity, 1.0F),
+        0.0F,
+        1.0F);
+    settings.rainGain = std::clamp(
+        finiteOr(settings.rainGain, 0.0F),
+        0.0F,
+        4.0F);
+    settings.moisturePersistenceMultiplier = std::clamp(
+        finiteOr(settings.moisturePersistenceMultiplier, 1.0F),
+        0.0F,
+        8.0F);
+    settings.rainRiseSeconds = std::clamp(
+        finiteOr(settings.rainRiseSeconds, 0.0F),
+        0.0F,
+        86'400.0F);
+    settings.rainRecessionSeconds = std::clamp(
+        finiteOr(settings.rainRecessionSeconds, 0.0F),
+        0.0F,
+        86'400.0F);
     settings.surfaceSurge = std::clamp(
         finiteOr(settings.surfaceSurge, 0.6F),
         0.0F,
@@ -5918,6 +5938,10 @@ WaterSeepageNodeAnimationState SanitizeSeepageNodeAnimationState(
     state.strengthOverride = sanitizeOverride(state.strengthOverride);
     state.prominenceOverride = sanitizeOverride(state.prominenceOverride);
     state.sourceWidthOverride = sanitizeOverride(state.sourceWidthOverride);
+    state.rainLevelOverride = sanitizeOverride(state.rainLevelOverride);
+    if (state.rainLevelOverride >= 0.0F) {
+        state.rainLevelOverride = Clamp01(state.rainLevelOverride);
+    }
     if (state.lookOverride.has_value()) {
         state.lookOverride = SanitizeSeepageLook(
             std::move(state.lookOverride.value()));
@@ -5973,12 +5997,11 @@ void ApplySeepageRuntimeScenarioAndAnimation(
         return;
     }
     const auto nodeState = SanitizeSeepageNodeAnimationState(rawNodeState);
+    // Scenario looks are legacy data. Every node begins from its authored
+    // profile pair and only an explicit Timings-v2 scalar look overrides it.
     node->look = nodeState.lookOverride.has_value()
                      ? SanitizeSeepageLook(nodeState.lookOverride.value())
-                     : scenarioState.has_value()
-                           ? SanitizeSeepageLook(
-                                 scenarioState->seepageLook)
-                           : SanitizeSeepageLook(node->authoredLook);
+                     : SanitizeSeepageLook(node->authoredLook);
     node->resolvedQuality = ResolveWaterSeepageQuality(
         node->look.quality,
         effectivePointInvocations);
@@ -5989,33 +6012,30 @@ void ApplySeepageRuntimeScenarioAndAnimation(
                                           scenarioState->seepageLevel,
                                           1.0F))
                                     : 1.0F;
-    const float globalSpread = scenarioState.has_value()
-                                   ? Clamp01(SeepageFiniteOr(
-                                         scenarioState->seepageSpread,
-                                         0.0F))
-                                   : 0.0F;
     node->effectiveActivity = nodeState.activity;
-    node->localSpread = nodeState.localSpread;
+    // Global and legacy per-node spread lanes are intentionally inert. The
+    // authored Strength and Source Width controls define extent explicitly.
+    node->localSpread = 0.0F;
     node->wettingProgress = nodeState.wettingProgress;
     const float baseStrength = nodeState.strengthOverride >= 0.0F
                                    ? nodeState.strengthOverride
                                    : node->authoredStrength;
     node->strength = baseStrength * scenarioLevel * node->effectiveActivity;
-    node->scenarioSpread = Clamp01(
-        1.0F - (1.0F - globalSpread) * (1.0F - node->localSpread));
-    node->rainVisualStrength = scenarioState.has_value()
-                                   ? Clamp01(SeepageFiniteOr(
-                                         scenarioState->rainLevel,
-                                         0.0F))
-                                   : (rainSettings.enabled
-                                          ? WaterRainPresetVisualStrength(
-                                                rainSettings.intensityPreset)
-                                          : 0.0F);
+    node->scenarioSpread = 0.0F;
+    node->rainVisualStrength =
+        nodeState.rainLevelOverride >= 0.0F
+            ? Clamp01(nodeState.rainLevelOverride)
+            : scenarioState.has_value()
+                  ? Clamp01(SeepageFiniteOr(
+                        scenarioState->rainLevel,
+                        0.0F))
+                  : (rainSettings.enabled
+                         ? WaterRainPresetVisualStrength(
+                               rainSettings.intensityPreset)
+                         : 0.0F);
     const float rainGain = SeepageRainGain(*node);
-    const float reachScale =
-        (1.0F + 0.50F * node->scenarioSpread) * (1.0F + 0.25F * rainGain);
-    const float widthScale =
-        (1.0F + 0.35F * node->scenarioSpread) * (1.0F + 0.20F * rainGain);
+    const float reachScale = 1.0F + 0.25F * rainGain;
+    const float widthScale = 1.0F + 0.20F * rainGain;
     node->reachMeters = std::clamp(
         node->authoredReachMeters * nodeState.reachScale * reachScale,
         0.0F,
@@ -6048,16 +6068,6 @@ void ApplySeepageRuntimeScenarioAndAnimation(
         node->endHalfWidthMeters);
     node->transitionLook.reset();
     node->transitionAmount = 0.0F;
-    if (scenarioState.has_value() && scenarioState->transitionLook.has_value()) {
-        node->transitionLook = SanitizeSeepageLook(
-            scenarioState->transitionLook.value());
-        node->transitionLook->quality = ResolveWaterSeepageQuality(
-            node->transitionLook->quality,
-            effectivePointInvocations);
-        node->transitionAmount = Clamp01(SeepageFiniteOr(
-            scenarioState->transitionAmount,
-            0.0F));
-    }
 }
 
 }  // namespace
@@ -6090,6 +6100,13 @@ std::string WaterDynamicMeshFlowSettingsFingerprint(
     SeepageFingerprintU32(&hash, settings.historyLength);
     SeepageFingerprintFloat(&hash, settings.dryConcavityFocus);
     SeepageFingerprintFloat(&hash, settings.edgeCoverage);
+    SeepageFingerprintFloat(&hash, settings.activity);
+    SeepageFingerprintFloat(&hash, settings.rainGain);
+    SeepageFingerprintFloat(
+        &hash,
+        settings.moisturePersistenceMultiplier);
+    SeepageFingerprintFloat(&hash, settings.rainRiseSeconds);
+    SeepageFingerprintFloat(&hash, settings.rainRecessionSeconds);
     SeepageFingerprintFloat(&hash, settings.surfaceSurge);
     SeepageFingerprintFloat(&hash, settings.rainSpawnSpread);
     SeepageFingerprintFloat(&hash, settings.rainDistributedSourceFraction);
@@ -6138,7 +6155,7 @@ std::string WaterDynamicMeshFlowSettingsFingerprint(
     SeepageFingerprintFloat(&hash, settings.animationDurationSeconds);
     SeepageFingerprintU32(&hash, settings.seed);
     SeepageFingerprintText(&hash, settings.particlePresetName);
-    return "water-dynamic-mesh-flow-settings-v2-" + SeepageFingerprintString(hash);
+    return "water-dynamic-mesh-flow-settings-v3-" + SeepageFingerprintString(hash);
 }
 
 WaterSeepageLookSettings DefaultWaterSeepageLookSettings() {
@@ -6900,6 +6917,26 @@ float EffectiveWaterFlowActivity(
         (flowLevel + (1.0F - flowLevel) * rainLevel * response));
 }
 
+float EffectiveAuthoredWaterFlowActivity(
+    float effectiveRainLevel,
+    float maximumFlowStrength,
+    float rainResponse,
+    bool sourceShowTrail,
+    bool globalShowTrails) {
+    if (!sourceShowTrail || !globalShowTrails) {
+        return 0.0F;
+    }
+    const float rain = Clamp01(
+        SeepageFiniteOr(effectiveRainLevel, 0.0F));
+    const float maximumStrength = Clamp01(
+        SeepageFiniteOr(maximumFlowStrength, 1.0F));
+    const float response = Clamp01(
+        SeepageFiniteOr(rainResponse, 0.0F));
+    return Clamp01(
+        maximumStrength *
+        std::lerp(1.0F - response, 1.0F, rain));
+}
+
 void AddOrUpdateWaterScenarioKey(
     WaterScenarioTrack* track,
     WaterScenarioKey key,
@@ -7243,7 +7280,37 @@ constexpr std::array<WaterKeyableSettingInfo, 1> kWaterGlobalLevelSettings{{
      .defaultValue = 1.0F},
 }};
 
-constexpr std::array<WaterKeyableSettingInfo, 3> kWaterSeepageNodeSettings{{
+constexpr std::array<WaterKeyableSettingInfo, 5> kWaterMeshFlowSettings{{
+    // Keep "level" as the stable identity for existing Timings-v2 tracks;
+    // authored Mesh Flow now calls the same parameter Activity.
+    {.id = "level",
+     .label = "Activity",
+     .minimum = 0.0F,
+     .maximum = 1.0F,
+     .defaultValue = 1.0F},
+    {.id = "rain_gain",
+     .label = "Rain Gain",
+     .minimum = 0.0F,
+     .maximum = 4.0F,
+     .defaultValue = 0.0F},
+    {.id = "moisture_persistence",
+     .label = "Moisture Persistence",
+     .minimum = 0.0F,
+     .maximum = 8.0F,
+     .defaultValue = 1.0F},
+    {.id = "rain_rise_seconds",
+     .label = "Rain Rise",
+     .minimum = 0.0F,
+     .maximum = 120.0F,
+     .defaultValue = 0.0F},
+    {.id = "rain_recession_seconds",
+     .label = "Rain Recession",
+     .minimum = 0.0F,
+     .maximum = 300.0F,
+     .defaultValue = 0.0F},
+}};
+
+constexpr std::array<WaterKeyableSettingInfo, 6> kWaterSeepageNodeSettings{{
     {.id = "strength",
      .label = "Node Strength",
      .minimum = 0.0F,
@@ -7259,6 +7326,21 @@ constexpr std::array<WaterKeyableSettingInfo, 3> kWaterSeepageNodeSettings{{
      .minimum = 0.01F,
      .maximum = 2.0F,
      .defaultValue = 0.10F},
+    {.id = "rain_delay_seconds",
+     .label = "Rain Delay",
+     .minimum = 0.0F,
+     .maximum = 120.0F,
+     .defaultValue = 0.0F},
+    {.id = "rain_rise_seconds",
+     .label = "Rain Rise",
+     .minimum = 0.0F,
+     .maximum = 120.0F,
+     .defaultValue = 0.0F},
+    {.id = "rain_recession_seconds",
+     .label = "Rain Recession",
+     .minimum = 0.0F,
+     .maximum = 300.0F,
+     .defaultValue = 0.0F},
 }};
 
 constexpr std::array<WaterKeyableSettingInfo, 2> kWaterFlowSourceSettings{{
@@ -7280,11 +7362,15 @@ std::span<const WaterKeyableSettingInfo> WaterKeyableSettings(
     WaterKeyedFeatureKind kind) {
     switch (kind) {
         case WaterKeyedFeatureKind::Rain:
-        case WaterKeyedFeatureKind::MeshFlow:
         case WaterKeyedFeatureKind::Shoreline:
+            return kWaterGlobalLevelSettings;
+        case WaterKeyedFeatureKind::MeshFlow:
+            return kWaterMeshFlowSettings;
         case WaterKeyedFeatureKind::SeepageGlobal:
         case WaterKeyedFeatureKind::FlowGlobal:
-            return kWaterGlobalLevelSettings;
+            // Legacy kinds remain parseable so existing documents can be
+            // round-tripped, but are no longer authorable or evaluated.
+            return {};
         case WaterKeyedFeatureKind::SeepageNode:
             return kWaterSeepageNodeSettings;
         case WaterKeyedFeatureKind::FlowSource:
@@ -7814,8 +7900,588 @@ void ApplyWaterFeatureTimingOverlayToScenario(
     applyLevel(WaterKeyedFeatureKind::Rain, &state->rainLevel);
     applyLevel(WaterKeyedFeatureKind::MeshFlow, &state->meshFlowLevel);
     applyLevel(WaterKeyedFeatureKind::Shoreline, &state->shorelineLevel);
-    applyLevel(WaterKeyedFeatureKind::SeepageGlobal, &state->seepageLevel);
-    applyLevel(WaterKeyedFeatureKind::FlowGlobal, &state->flowLevel);
+}
+
+WaterRainEnvelopeDomain MakeWaterRainEnvelopeDomain(
+    float durationSeconds,
+    float sampleRateHz,
+    std::size_t maxSamples) {
+    WaterRainEnvelopeDomain domain;
+    domain.durationSeconds = std::clamp(
+        SeepageFiniteOr(durationSeconds, 0.0F),
+        0.0F,
+        86'400.0F);
+    const float requestedRate = std::clamp(
+        SeepageFiniteOr(
+            sampleRateHz,
+            kWaterRainEnvelopeSampleRateHz),
+        1.0F,
+        10'000.0F);
+    const std::size_t safeMaximumSamples =
+        std::max<std::size_t>(1U, maxSamples);
+    const double requestedIntervals = std::ceil(
+        static_cast<double>(domain.durationSeconds) *
+        static_cast<double>(requestedRate));
+    const auto intervalCount = static_cast<std::size_t>(std::min(
+        requestedIntervals,
+        static_cast<double>(safeMaximumSamples - 1U)));
+    domain.sampleCount = intervalCount + 1U;
+    domain.stepSeconds =
+        intervalCount > 0U
+            ? domain.durationSeconds /
+                  static_cast<float>(intervalCount)
+            : 0.0F;
+    domain.sampleRateHz =
+        domain.stepSeconds > 0.0F
+            ? 1.0F / domain.stepSeconds
+            : requestedRate;
+    return domain;
+}
+
+WaterRainResponseSettings SanitizeWaterRainResponseSettings(
+    WaterRainResponseSettings settings) {
+    settings.delaySeconds = SanitizeSeepageTimingSeconds(
+        settings.delaySeconds);
+    settings.riseSeconds = SanitizeSeepageTimingSeconds(
+        settings.riseSeconds);
+    settings.recessionSeconds = SanitizeSeepageTimingSeconds(
+        settings.recessionSeconds);
+    return settings;
+}
+
+void ApplyWaterFeatureTimingOverlayToSeepageNode(
+    const WaterFeatureTimingOverlay& overlay,
+    WaterSeepageNode* node) {
+    if (node == nullptr) {
+        return;
+    }
+    const WaterKeyedFeatureId feature{
+        .kind = WaterKeyedFeatureKind::SeepageNode,
+        .objectId = node->id,
+    };
+    const auto applySeconds = [&](std::string_view settingId, float* target) {
+        if (const auto* value = overlay.Find(feature, settingId);
+            value != nullptr) {
+            *target = SanitizeSeepageTimingSeconds(*value);
+        }
+    };
+    applySeconds("rain_delay_seconds", &node->rainDelaySeconds);
+    applySeconds("rain_rise_seconds", &node->rainRiseSeconds);
+    applySeconds(
+        "rain_recession_seconds",
+        &node->rainRecessionSeconds);
+}
+
+WaterRainResponseSettings ResolveWaterSeepageNodeRainResponse(
+    const WaterSeepageNode& node,
+    const WaterFeatureTimingOverlay* overlay) {
+    auto resolvedNode = node;
+    if (overlay != nullptr) {
+        ApplyWaterFeatureTimingOverlayToSeepageNode(
+            *overlay,
+            &resolvedNode);
+    }
+    return SanitizeWaterRainResponseSettings({
+        .delaySeconds = resolvedNode.rainDelaySeconds,
+        .riseSeconds = resolvedNode.rainRiseSeconds,
+        .recessionSeconds = resolvedNode.rainRecessionSeconds,
+    });
+}
+
+void ApplyWaterFeatureTimingOverlayToDynamicMeshFlowSettings(
+    const WaterFeatureTimingOverlay& overlay,
+    WaterDynamicMeshFlowSettings* settings) {
+    if (settings == nullptr) {
+        return;
+    }
+    const WaterKeyedFeatureId feature{
+        .kind = WaterKeyedFeatureKind::MeshFlow,
+    };
+    const auto apply = [&](std::string_view settingId,
+                           float minimum,
+                           float maximum,
+                           float* target) {
+        if (const auto* value = overlay.Find(feature, settingId);
+            value != nullptr) {
+            *target = std::clamp(
+                SeepageFiniteOr(*value, minimum),
+                minimum,
+                maximum);
+        }
+    };
+    apply("level", 0.0F, 1.0F, &settings->activity);
+    apply("rain_gain", 0.0F, 4.0F, &settings->rainGain);
+    apply(
+        "moisture_persistence",
+        0.0F,
+        8.0F,
+        &settings->moisturePersistenceMultiplier);
+    apply(
+        "rain_rise_seconds",
+        0.0F,
+        86'400.0F,
+        &settings->rainRiseSeconds);
+    apply(
+        "rain_recession_seconds",
+        0.0F,
+        86'400.0F,
+        &settings->rainRecessionSeconds);
+}
+
+WaterRainResponseSettings ResolveWaterDynamicMeshFlowRainResponse(
+    const WaterDynamicMeshFlowSettings& settings,
+    const WaterFeatureTimingOverlay* overlay) {
+    auto resolved = settings;
+    if (overlay != nullptr) {
+        ApplyWaterFeatureTimingOverlayToDynamicMeshFlowSettings(
+            *overlay,
+            &resolved);
+    }
+    resolved = SanitizeWaterDynamicMeshFlowSettings(std::move(resolved));
+    return SanitizeWaterRainResponseSettings({
+        .delaySeconds = 0.0F,
+        .riseSeconds =
+            resolved.rainRiseSeconds *
+            resolved.moisturePersistenceMultiplier,
+        .recessionSeconds =
+            resolved.rainRecessionSeconds *
+            resolved.moisturePersistenceMultiplier,
+    });
+}
+
+float EffectiveWaterDynamicMeshFlowLevel(
+    const WaterDynamicMeshFlowSettings& settings,
+    float effectiveRainLevel,
+    const WaterFeatureTimingOverlay* overlay) {
+    auto resolved = settings;
+    if (overlay != nullptr) {
+        ApplyWaterFeatureTimingOverlayToDynamicMeshFlowSettings(
+            *overlay,
+            &resolved);
+    }
+    resolved = SanitizeWaterDynamicMeshFlowSettings(std::move(resolved));
+    const float rain = Clamp01(
+        SeepageFiniteOr(effectiveRainLevel, 0.0F));
+    return Clamp01(
+        resolved.activity +
+        (1.0F - resolved.activity) * rain * resolved.rainGain);
+}
+
+float EffectiveWaterDynamicMeshPersistenceSeconds(
+    float authoredPersistenceSeconds,
+    const WaterDynamicMeshFlowSettings& settings,
+    const WaterFeatureTimingOverlay* overlay) {
+    auto resolved = settings;
+    if (overlay != nullptr) {
+        ApplyWaterFeatureTimingOverlayToDynamicMeshFlowSettings(
+            *overlay,
+            &resolved);
+    }
+    resolved = SanitizeWaterDynamicMeshFlowSettings(std::move(resolved));
+    const float authored = std::clamp(
+        SeepageFiniteOr(authoredPersistenceSeconds, 0.0F),
+        0.0F,
+        86'400.0F);
+    return std::min(
+        86'400.0F,
+        authored * resolved.moisturePersistenceMultiplier);
+}
+
+namespace {
+
+const WaterKeyedSettingTrack* FindAuthoredRainEnvelopeTrack(
+    std::span<const WaterFeatureTimingRun> runs,
+    const WaterKeyedFeatureId& feature,
+    std::string_view settingId) {
+    for (const auto& run : runs) {
+        const auto* timeline = FindWaterFeatureTimeline(&run, feature);
+        if (timeline == nullptr) {
+            continue;
+        }
+        const auto setting = std::find_if(
+            timeline->settings.begin(),
+            timeline->settings.end(),
+            [&](const WaterKeyedSettingTrack& candidate) {
+                return candidate.settingId == settingId;
+            });
+        if (setting != timeline->settings.end()) {
+            return &*setting;
+        }
+    }
+    return nullptr;
+}
+
+float EvaluateAuthoredRainEnvelopeTrack(
+    const WaterKeyedSettingTrack* track,
+    float normalizedPosition,
+    float fallback,
+    float minimum,
+    float maximum) {
+    const auto value =
+        track != nullptr
+            ? EvaluateWaterKeyedSettingTrack(
+                  *track,
+                  normalizedPosition)
+            : std::nullopt;
+    return std::clamp(
+        SeepageFiniteOr(value.value_or(fallback), fallback),
+        minimum,
+        maximum);
+}
+
+void FingerprintAuthoredRainEnvelopeTrack(
+    std::uint64_t* hash,
+    const WaterKeyedSettingTrack* track) {
+    if (track == nullptr || !track->active || track->keys.empty()) {
+        SeepageFingerprintU32(hash, 0U);
+        return;
+    }
+    SeepageFingerprintU32(hash, 1U);
+    const auto sanitized =
+        SanitizeWaterKeyedSettingTrack(*track);
+    SeepageFingerprintU32(
+        hash,
+        static_cast<std::uint32_t>(std::min<std::size_t>(
+            sanitized.keys.size(),
+            static_cast<std::size_t>(
+                std::numeric_limits<std::uint32_t>::max()))));
+    for (const auto& key : sanitized.keys) {
+        SeepageFingerprintFloat(hash, key.position);
+        SeepageFingerprintFloat(hash, key.value);
+        SeepageFingerprintU32(
+            hash,
+            static_cast<std::uint32_t>(key.interpolation));
+    }
+}
+
+template <typename Envelope, typename ResolveRain, typename ResolveResponse>
+Envelope BuildAuthoredRainEnvelope(
+    const WaterRainEnvelopeDomain& domain,
+    ResolveRain&& resolveRain,
+    ResolveResponse&& resolveResponse,
+    std::string fingerprint) {
+    Envelope envelope;
+    envelope.sampleRateHz = domain.sampleRateHz;
+    envelope.durationSeconds = domain.durationSeconds;
+    envelope.samples.resize(domain.sampleCount, 0.0F);
+    envelope.fingerprint = std::move(fingerprint);
+
+    float filtered = 0.0F;
+    for (std::size_t index = 0U;
+         index < domain.sampleCount;
+         ++index) {
+        const float timeSeconds =
+            domain.stepSeconds * static_cast<float>(index);
+        const float normalizedPosition =
+            domain.durationSeconds > 1.0e-6F
+                ? timeSeconds / domain.durationSeconds
+                : 0.0F;
+        const auto response = SanitizeWaterRainResponseSettings(
+            resolveResponse(normalizedPosition));
+        const bool waitingForDelay =
+            timeSeconds < response.delaySeconds;
+        const float delayedTime = std::max(
+            0.0F,
+            timeSeconds - response.delaySeconds);
+        const float delayedPosition =
+            domain.durationSeconds > 1.0e-6F
+                ? delayedTime / domain.durationSeconds
+                : 0.0F;
+        const float target =
+            waitingForDelay
+                ? 0.0F
+                : Clamp01(resolveRain(delayedPosition));
+        const float responseSeconds =
+            target >= filtered
+                ? response.riseSeconds
+                : response.recessionSeconds;
+        if (responseSeconds <= 1.0e-6F ||
+            domain.stepSeconds <= 0.0F) {
+            filtered = target;
+        } else if (index == 0U) {
+            filtered = 0.0F;
+        } else {
+            const float responseAmount =
+                1.0F -
+                std::exp(
+                    -domain.stepSeconds /
+                    responseSeconds);
+            filtered = std::lerp(
+                filtered,
+                target,
+                Clamp01(responseAmount));
+        }
+        envelope.samples[index] = Clamp01(filtered);
+    }
+    return envelope;
+}
+
+}  // namespace
+
+std::string WaterSeepageNodeRainEnvelopeFingerprint(
+    const WaterSeepageNode& node,
+    std::span<const WaterFeatureTimingRun> runs,
+    float authoredRainLevel,
+    float durationSeconds) {
+    const WaterKeyedFeatureId rainFeature{
+        .kind = WaterKeyedFeatureKind::Rain,
+    };
+    const WaterKeyedFeatureId nodeFeature{
+        .kind = WaterKeyedFeatureKind::SeepageNode,
+        .objectId = node.id,
+    };
+    const auto* rainTrack = FindAuthoredRainEnvelopeTrack(
+        runs,
+        rainFeature,
+        "level");
+    const auto* delayTrack = FindAuthoredRainEnvelopeTrack(
+        runs,
+        nodeFeature,
+        "rain_delay_seconds");
+    const auto* riseTrack = FindAuthoredRainEnvelopeTrack(
+        runs,
+        nodeFeature,
+        "rain_rise_seconds");
+    const auto* recessionTrack = FindAuthoredRainEnvelopeTrack(
+        runs,
+        nodeFeature,
+        "rain_recession_seconds");
+    const auto response =
+        ResolveWaterSeepageNodeRainResponse(node);
+
+    std::uint64_t hash = 1469598103934665603ULL;
+    SeepageFingerprintU32(&hash, 1U);
+    SeepageFingerprintFloat(
+        &hash,
+        Clamp01(SeepageFiniteOr(authoredRainLevel, 0.0F)));
+    SeepageFingerprintFloat(
+        &hash,
+        std::clamp(
+            SeepageFiniteOr(durationSeconds, 0.0F),
+            0.0F,
+            86'400.0F));
+    SeepageFingerprintFloat(&hash, response.delaySeconds);
+    SeepageFingerprintFloat(&hash, response.riseSeconds);
+    SeepageFingerprintFloat(&hash, response.recessionSeconds);
+    FingerprintAuthoredRainEnvelopeTrack(&hash, rainTrack);
+    FingerprintAuthoredRainEnvelopeTrack(&hash, delayTrack);
+    FingerprintAuthoredRainEnvelopeTrack(&hash, riseTrack);
+    FingerprintAuthoredRainEnvelopeTrack(&hash, recessionTrack);
+    return "water-seepage-node-rain-envelope-v1-" +
+           SeepageFingerprintString(hash);
+}
+
+WaterSeepageRainEnvelope BuildWaterSeepageNodeRainEnvelope(
+    const WaterSeepageNode& node,
+    std::span<const WaterFeatureTimingRun> runs,
+    float authoredRainLevel,
+    float durationSeconds,
+    float sampleRateHz,
+    std::size_t maxSamples) {
+    const WaterKeyedFeatureId rainFeature{
+        .kind = WaterKeyedFeatureKind::Rain,
+    };
+    const WaterKeyedFeatureId nodeFeature{
+        .kind = WaterKeyedFeatureKind::SeepageNode,
+        .objectId = node.id,
+    };
+    const auto* rainTrack = FindAuthoredRainEnvelopeTrack(
+        runs,
+        rainFeature,
+        "level");
+    const auto* delayTrack = FindAuthoredRainEnvelopeTrack(
+        runs,
+        nodeFeature,
+        "rain_delay_seconds");
+    const auto* riseTrack = FindAuthoredRainEnvelopeTrack(
+        runs,
+        nodeFeature,
+        "rain_rise_seconds");
+    const auto* recessionTrack = FindAuthoredRainEnvelopeTrack(
+        runs,
+        nodeFeature,
+        "rain_recession_seconds");
+    const auto baseResponse =
+        ResolveWaterSeepageNodeRainResponse(node);
+    const auto domain = MakeWaterRainEnvelopeDomain(
+        durationSeconds,
+        sampleRateHz,
+        maxSamples);
+    return BuildAuthoredRainEnvelope<WaterSeepageRainEnvelope>(
+        domain,
+        [&](float position) {
+            return EvaluateAuthoredRainEnvelopeTrack(
+                rainTrack,
+                position,
+                Clamp01(SeepageFiniteOr(authoredRainLevel, 0.0F)),
+                0.0F,
+                1.0F);
+        },
+        [&](float position) {
+            return WaterRainResponseSettings{
+                .delaySeconds =
+                    EvaluateAuthoredRainEnvelopeTrack(
+                        delayTrack,
+                        position,
+                        baseResponse.delaySeconds,
+                        0.0F,
+                        86'400.0F),
+                .riseSeconds =
+                    EvaluateAuthoredRainEnvelopeTrack(
+                        riseTrack,
+                        position,
+                        baseResponse.riseSeconds,
+                        0.0F,
+                        86'400.0F),
+                .recessionSeconds =
+                    EvaluateAuthoredRainEnvelopeTrack(
+                        recessionTrack,
+                        position,
+                        baseResponse.recessionSeconds,
+                        0.0F,
+                        86'400.0F),
+            };
+        },
+        WaterSeepageNodeRainEnvelopeFingerprint(
+            node,
+            runs,
+            authoredRainLevel,
+            durationSeconds));
+}
+
+std::string WaterMeshFlowRainEnvelopeFingerprint(
+    const WaterDynamicMeshFlowSettings& settings,
+    std::span<const WaterFeatureTimingRun> runs,
+    float authoredRainLevel,
+    float durationSeconds) {
+    const WaterKeyedFeatureId rainFeature{
+        .kind = WaterKeyedFeatureKind::Rain,
+    };
+    const WaterKeyedFeatureId meshFeature{
+        .kind = WaterKeyedFeatureKind::MeshFlow,
+    };
+    const auto* rainTrack = FindAuthoredRainEnvelopeTrack(
+        runs,
+        rainFeature,
+        "level");
+    const auto* persistenceTrack = FindAuthoredRainEnvelopeTrack(
+        runs,
+        meshFeature,
+        "moisture_persistence");
+    const auto* riseTrack = FindAuthoredRainEnvelopeTrack(
+        runs,
+        meshFeature,
+        "rain_rise_seconds");
+    const auto* recessionTrack = FindAuthoredRainEnvelopeTrack(
+        runs,
+        meshFeature,
+        "rain_recession_seconds");
+    const auto sanitized =
+        SanitizeWaterDynamicMeshFlowSettings(settings);
+
+    std::uint64_t hash = 1469598103934665603ULL;
+    SeepageFingerprintU32(&hash, 1U);
+    SeepageFingerprintFloat(
+        &hash,
+        Clamp01(SeepageFiniteOr(authoredRainLevel, 0.0F)));
+    SeepageFingerprintFloat(
+        &hash,
+        std::clamp(
+            SeepageFiniteOr(durationSeconds, 0.0F),
+            0.0F,
+            86'400.0F));
+    SeepageFingerprintFloat(
+        &hash,
+        sanitized.moisturePersistenceMultiplier);
+    SeepageFingerprintFloat(&hash, sanitized.rainRiseSeconds);
+    SeepageFingerprintFloat(
+        &hash,
+        sanitized.rainRecessionSeconds);
+    FingerprintAuthoredRainEnvelopeTrack(&hash, rainTrack);
+    FingerprintAuthoredRainEnvelopeTrack(&hash, persistenceTrack);
+    FingerprintAuthoredRainEnvelopeTrack(&hash, riseTrack);
+    FingerprintAuthoredRainEnvelopeTrack(&hash, recessionTrack);
+    return "water-mesh-flow-authored-rain-envelope-v1-" +
+           SeepageFingerprintString(hash);
+}
+
+WaterMeshFlowRainEnvelope BuildWaterMeshFlowRainEnvelope(
+    const WaterDynamicMeshFlowSettings& settings,
+    std::span<const WaterFeatureTimingRun> runs,
+    float authoredRainLevel,
+    float durationSeconds,
+    float sampleRateHz,
+    std::size_t maxSamples) {
+    const WaterKeyedFeatureId rainFeature{
+        .kind = WaterKeyedFeatureKind::Rain,
+    };
+    const WaterKeyedFeatureId meshFeature{
+        .kind = WaterKeyedFeatureKind::MeshFlow,
+    };
+    const auto* rainTrack = FindAuthoredRainEnvelopeTrack(
+        runs,
+        rainFeature,
+        "level");
+    const auto* persistenceTrack = FindAuthoredRainEnvelopeTrack(
+        runs,
+        meshFeature,
+        "moisture_persistence");
+    const auto* riseTrack = FindAuthoredRainEnvelopeTrack(
+        runs,
+        meshFeature,
+        "rain_rise_seconds");
+    const auto* recessionTrack = FindAuthoredRainEnvelopeTrack(
+        runs,
+        meshFeature,
+        "rain_recession_seconds");
+    const auto sanitized =
+        SanitizeWaterDynamicMeshFlowSettings(settings);
+    const auto domain = MakeWaterRainEnvelopeDomain(
+        durationSeconds,
+        sampleRateHz,
+        maxSamples);
+    return BuildAuthoredRainEnvelope<WaterMeshFlowRainEnvelope>(
+        domain,
+        [&](float position) {
+            return EvaluateAuthoredRainEnvelopeTrack(
+                rainTrack,
+                position,
+                Clamp01(SeepageFiniteOr(authoredRainLevel, 0.0F)),
+                0.0F,
+                1.0F);
+        },
+        [&](float position) {
+            const float persistence =
+                EvaluateAuthoredRainEnvelopeTrack(
+                    persistenceTrack,
+                    position,
+                    sanitized.moisturePersistenceMultiplier,
+                    0.0F,
+                    8.0F);
+            return WaterRainResponseSettings{
+                .riseSeconds =
+                    EvaluateAuthoredRainEnvelopeTrack(
+                        riseTrack,
+                        position,
+                        sanitized.rainRiseSeconds,
+                        0.0F,
+                        86'400.0F) *
+                    persistence,
+                .recessionSeconds =
+                    EvaluateAuthoredRainEnvelopeTrack(
+                        recessionTrack,
+                        position,
+                        sanitized.rainRecessionSeconds,
+                        0.0F,
+                        86'400.0F) *
+                    persistence,
+            };
+        },
+        WaterMeshFlowRainEnvelopeFingerprint(
+            settings,
+            runs,
+            authoredRainLevel,
+            durationSeconds));
 }
 
 const WaterFeatureTimingRun* FindWaterFeatureRunContaining(
@@ -7923,11 +8589,10 @@ WaterSeepageLookSettings ResolveWaterSeepageLook(
 
 WaterSeepageLookSettings ResolveWaterSeepageTimingLookBase(
     const WaterSeepageLookSettings& resolvedAuthoredLook,
-    const std::optional<WaterScenarioState>& scenarioState) {
-    return SanitizeSeepageLook(
-        scenarioState.has_value()
-            ? scenarioState->seepageLook
-            : resolvedAuthoredLook);
+    const std::optional<WaterScenarioState>& /*scenarioState*/) {
+    // Scenarios are legacy timing containers only. A scalar keyed look always
+    // materializes from the node's resolved authored profile/response pair.
+    return SanitizeSeepageLook(resolvedAuthoredLook);
 }
 
 std::string WaterSeepageLocalLookName(std::string_view baseName, std::uint32_t nodeId) {

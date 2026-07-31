@@ -62,7 +62,7 @@ void main() {
     const uint particleIndex = uint(gl_InstanceIndex);
     const RainParticle particle = particles[particleIndex];
     const vec2 corner = kCorners[gl_VertexIndex];
-    if (particle.state.x == 0u || particleIndex >= rain.simulation0.x || rain.simulation1.x == 0u) {
+    if (particle.state.x == 0u || rain.simulation1.x == 0u) {
         gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
         outUv = corner;
         outColourOpacity = vec4(0.0);

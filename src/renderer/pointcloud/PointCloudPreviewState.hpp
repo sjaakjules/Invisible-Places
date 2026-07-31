@@ -6,6 +6,7 @@
 #include <glm/mat4x4.hpp>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <span>
@@ -21,6 +22,38 @@ inline constexpr float kInactiveOpacityDefault = 1.0F;
 inline constexpr float kInactiveEmissionDefault = 0.0F;
 inline constexpr float kInactiveDepthFadeDefault = 0.0F;
 inline constexpr float kInactiveColormapPositionDefault = 0.5F;
+inline constexpr std::size_t kTimingColouriseMaxEffects = 5U;
+inline constexpr std::size_t kTimingColouriseLutSamples = 64U;
+
+// Renderer-facing timing colourise data is deliberately independent from the
+// authored timing model. Callers resolve field names to each layer's local
+// scalar slot before populating this fixed-capacity payload.
+enum class TimingColouriseSource : std::uint32_t {
+    ScalarField = 0U,
+    NormalX = 1U,
+    NormalY = 2U,
+    NormalZ = 3U
+};
+
+struct ResolvedTimingColouriseEffect {
+    bool enabled = false;
+    TimingColouriseSource source = TimingColouriseSource::ScalarField;
+    std::int32_t scalarFieldSlot = -1;
+    float lowerBound = 0.0F;
+    float upperBound = 1.0F;
+    // Fraction of the selected [lower, upper] span used by each inward edge
+    // fade. Values are sanitized to [0, 0.5] by the render backends.
+    float edgeFadeFraction = 0.0F;
+    // RGB is the tint and A is colourise amount. Alpha never changes point
+    // opacity.
+    std::array<std::array<float, 4>, kTimingColouriseLutSamples> rgbaLut{};
+};
+
+struct ResolvedTimingColouriseStack {
+    std::uint32_t effectCount = 0U;
+    // Effects are applied in array order; later entries are visually topmost.
+    std::array<ResolvedTimingColouriseEffect, kTimingColouriseMaxEffects> effects{};
+};
 
 enum class PointCloudColorMode {
     SourceRgb,
@@ -315,6 +348,8 @@ struct PointCloudSessionState {
 std::uint64_t ClampPointBudget(std::uint64_t totalPoints, std::uint64_t requestedPoints);
 [[nodiscard]] bool PointCloudAlphaContributesDepth(float alpha);
 [[nodiscard]] bool PointCloudStyleHasActiveRoughnessMotion(const PointCloudStyleState& style);
+[[nodiscard]] bool TimingColouriseStackHasActiveEffects(
+    const ResolvedTimingColouriseStack& stack);
 [[nodiscard]] bool PointCloudSceneRoleAllowsRoughnessMotion(std::string_view sceneRole);
 [[nodiscard]] PointCloudStyleState MakePointCloudStyleForSceneRole(
     PointCloudStyleState style,

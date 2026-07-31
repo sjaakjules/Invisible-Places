@@ -168,6 +168,22 @@ struct alignas(16) PointCloudStyleGpu {
     glm::vec4 rainImpactSandBand{-1.0e8F, 2.0F, 0.30F, 1.0F};
     // xyz: Rings/Wetness/Droplets response, w: expanding-ring thickness.
     glm::vec4 rainImpactResponse{1.0F};
+    // x: active effect count. Effects are applied from index zero upward, so
+    // the last entry is visually topmost.
+    glm::uvec4 timingColouriseControl{0U, 0U, 0U, 0U};
+    // x: enabled, y: TimingColouriseSource, z: scalar slot + 1 (zero means
+    // unavailable). Normal sources do not consume z.
+    std::array<glm::uvec4, renderer::pointcloud::kTimingColouriseMaxEffects>
+        timingColouriseSources{};
+    // x/y: lower/upper bounds, z: symmetric inward edge-fade fraction.
+    std::array<glm::vec4, renderer::pointcloud::kTimingColouriseMaxEffects>
+        timingColouriseRanges{};
+    // Effect-major 64-sample RGBA lookup tables. RGB is tint; A is mix only.
+    std::array<
+        glm::vec4,
+        renderer::pointcloud::kTimingColouriseMaxEffects *
+            renderer::pointcloud::kTimingColouriseLutSamples>
+        timingColouriseLut{};
 };
 
 struct alignas(16) RainUniformsGpu {
@@ -2423,6 +2439,35 @@ void VulkanViewportShell::SetSceneCachingEnabled(bool enabled) {
     }
 }
 
+void VulkanViewportShell::ResetRainRuntime() {
+    ++rainResources_.resetEpoch;
+    if (rainResources_.resetEpoch == 0U) {
+        rainResources_.resetEpoch = 1U;
+    }
+    rainResources_.previousTimeSeconds =
+        -std::numeric_limits<float>::infinity();
+    rainResources_.previousRainEnabled = false;
+    rainResources_.lastPotentialImpactTimeSeconds =
+        -std::numeric_limits<float>::infinity();
+    rainResources_.lastInFlightParticleCount = 0U;
+    rainResources_.frameDeltaSeconds = 1.0F / 30.0F;
+    ++sceneRevision_;
+}
+
+void VulkanViewportShell::SetLiveRainSimulationEnabled(bool enabled) {
+    if (liveRainSimulationEnabled_ == enabled) {
+        return;
+    }
+    liveRainSimulationEnabled_ = enabled;
+    if (enabled) {
+        // The export owned the shared buffers while live Rain was suspended.
+        // Begin the resumed preview from its own deterministic initial state.
+        ResetRainRuntime();
+    } else {
+        ++sceneRevision_;
+    }
+}
+
 void VulkanViewportShell::UpdateRainRuntimeTiming(const SceneRenderState& state) {
     const bool timeMovedBack =
         std::isfinite(rainResources_.previousTimeSeconds) &&
@@ -2447,6 +2492,7 @@ void VulkanViewportShell::UpdateRainRuntimeTiming(const SceneRenderState& state)
     if (!state.rainSettings.enabled || timeMovedBack) {
         rainResources_.lastPotentialImpactTimeSeconds =
             -std::numeric_limits<float>::infinity();
+        rainResources_.lastInFlightParticleCount = 0U;
     } else if (
         rainResources_.collisionReady &&
         state.rainSettings.impactEffectsEnabled &&
@@ -2468,19 +2514,23 @@ void VulkanViewportShell::UpdateRainRuntimeTiming(const SceneRenderState& state)
 
 bool VulkanViewportShell::RainImpactEffectsRequireRedraw(
     float currentTimeSeconds) const {
-    return invisible_places::water::RainImpactTailIsActive(
-        rainResources_.lastPotentialImpactTimeSeconds,
-        currentTimeSeconds);
+    return rainResources_.lastInFlightParticleCount > 0U ||
+           invisible_places::water::RainImpactTailIsActive(
+               rainResources_.lastPotentialImpactTimeSeconds,
+               currentTimeSeconds);
 }
 
 void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
-    UpdateRainRuntimeTiming(state);
+    if (liveRainSimulationEnabled_) {
+        UpdateRainRuntimeTiming(state);
+    }
     renderState_ = state;
     for (auto& layer : renderState_.pointCloudLayers) {
         // Every layer takes the impact-capable material variant while the
         // effects are on: the models shade all clouds' points inside their
         // height bands, independent of the layer's collision role.
         layer.style.rainImpactEffects =
+            liveRainSimulationEnabled_ &&
             renderState_.rainSettings.enabled &&
             renderState_.rainSettings.impactEffectsEnabled;
     }
@@ -13907,10 +13957,13 @@ VulkanViewportShell::ResolvePointCloudLayerMaterialVariant(
         resources->seepageHashCellCapacity > 0U &&
         resources->seepageNodeReferenceCount > 0U &&
         resources->seepageUnionBounds.valid;
+    const bool hasTimingColourise =
+        renderer::pointcloud::TimingColouriseStackHasActiveEffects(
+            layer.timingColourise);
     return renderer::pointcloud::ResolvePointCloudMaterialVariant(
         layer.style,
         layer.densityCompensation,
-        hasAttachedSeepage);
+        hasAttachedSeepage || hasTimingColourise);
 }
 
 bool VulkanViewportShell::UploadPointCloudLayerStyle(
@@ -13951,6 +14004,90 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         layer.style.colorizeColor[2],
         std::clamp(layer.style.colorizeAmount, 0.0F, 1.0F),
     };
+    const std::size_t timingColouriseCount = std::min<std::size_t>(
+        layer.timingColourise.effectCount,
+        layer.timingColourise.effects.size());
+    std::uint32_t packedTimingColouriseCount = 0U;
+    for (std::size_t effectIndex = 0;
+         effectIndex < timingColouriseCount;
+         ++effectIndex) {
+        const auto& effect = layer.timingColourise.effects[effectIndex];
+        const bool scalarSource =
+            effect.source ==
+            renderer::pointcloud::TimingColouriseSource::ScalarField;
+        const bool scalarAvailable =
+            effect.scalarFieldSlot >= 0 &&
+            static_cast<std::uint32_t>(effect.scalarFieldSlot) <
+                resources->scalarFieldCount;
+        const bool normalSource =
+            effect.source ==
+                renderer::pointcloud::TimingColouriseSource::NormalX ||
+            effect.source ==
+                renderer::pointcloud::TimingColouriseSource::NormalY ||
+            effect.source ==
+                renderer::pointcloud::TimingColouriseSource::NormalZ;
+        const bool boundsValid =
+            std::isfinite(effect.lowerBound) &&
+            std::isfinite(effect.upperBound) &&
+            effect.upperBound > effect.lowerBound;
+        const bool enabled =
+            effect.enabled &&
+            boundsValid &&
+            ((scalarSource && scalarAvailable) ||
+             (normalSource && resources->hasNormals));
+        styleGpu.timingColouriseSources[effectIndex] = glm::uvec4{
+            enabled ? 1U : 0U,
+            static_cast<std::uint32_t>(effect.source),
+            scalarAvailable
+                ? static_cast<std::uint32_t>(effect.scalarFieldSlot) + 1U
+                : 0U,
+            0U,
+        };
+        styleGpu.timingColouriseRanges[effectIndex] = glm::vec4{
+            std::isfinite(effect.lowerBound) ? effect.lowerBound : 0.0F,
+            std::isfinite(effect.upperBound) ? effect.upperBound : 0.0F,
+            std::clamp(
+                std::isfinite(effect.edgeFadeFraction)
+                    ? effect.edgeFadeFraction
+                    : 0.0F,
+                0.0F,
+                0.5F),
+            0.0F,
+        };
+        for (std::size_t sampleIndex = 0;
+             sampleIndex <
+             renderer::pointcloud::kTimingColouriseLutSamples;
+             ++sampleIndex) {
+            const auto& sample = effect.rgbaLut[sampleIndex];
+            const std::size_t packedIndex =
+                effectIndex *
+                    renderer::pointcloud::kTimingColouriseLutSamples +
+                sampleIndex;
+            styleGpu.timingColouriseLut[packedIndex] = glm::vec4{
+                std::clamp(
+                    std::isfinite(sample[0]) ? sample[0] : 0.0F,
+                    0.0F,
+                    1.0F),
+                std::clamp(
+                    std::isfinite(sample[1]) ? sample[1] : 0.0F,
+                    0.0F,
+                    1.0F),
+                std::clamp(
+                    std::isfinite(sample[2]) ? sample[2] : 0.0F,
+                    0.0F,
+                    1.0F),
+                std::clamp(
+                    std::isfinite(sample[3]) ? sample[3] : 0.0F,
+                    0.0F,
+                    1.0F),
+            };
+        }
+        if (enabled) {
+            packedTimingColouriseCount =
+                static_cast<std::uint32_t>(effectIndex + 1U);
+        }
+    }
+    styleGpu.timingColouriseControl.x = packedTimingColouriseCount;
     styleGpu.globalControl = glm::uvec4{
         static_cast<std::uint32_t>(layer.style.colorMode),
         static_cast<std::uint32_t>(layer.style.colormap),
@@ -15049,14 +15186,22 @@ void VulkanViewportShell::RecordCommandBuffer(
                 }
             }
         }
-        UploadRainUniforms(frameIndex, swapchainWidth_, swapchainHeight_);
+        if (liveRainSimulationEnabled_) {
+            UploadRainUniforms(
+                frameIndex,
+                swapchainWidth_,
+                swapchainHeight_);
+        }
         const bool recordsRainCompute =
+            liveRainSimulationEnabled_ &&
             frameIndex < rainResources_.descriptorSets.size() &&
             renderState_.rainSettings.enabled &&
             rainResources_.collisionReady &&
             rainComputePipeline_ != VK_NULL_HANDLE &&
             rainResources_.descriptorSets[frameIndex] != VK_NULL_HANDLE;
-        RecordRainCompute(commandBuffer, frameIndex);
+        if (liveRainSimulationEnabled_) {
+            RecordRainCompute(commandBuffer, frameIndex);
+        }
         if (recordsRainCompute) {
             markGpuPhaseActive(kGpuPhaseRainActive);
         }
@@ -15229,13 +15374,18 @@ void VulkanViewportShell::RecordCommandBuffer(
 
     if (drawLiveScene) {
         const bool recordsRainDraw =
+            liveRainSimulationEnabled_ &&
             frameIndex < rainResources_.descriptorSets.size() &&
             renderState_.rainSettings.enabled &&
             rainResources_.collisionReady &&
             rainPipeline_ != VK_NULL_HANDLE &&
-            rainResources_.descriptorSets[frameIndex] != VK_NULL_HANDLE &&
-            ActiveRainParticleCount(renderState_) > 0U;
-        RecordRainDraw(commandBuffer, frameIndex, rainPipeline_);
+            rainResources_.descriptorSets[frameIndex] != VK_NULL_HANDLE;
+        if (liveRainSimulationEnabled_) {
+            RecordRainDraw(
+                commandBuffer,
+                frameIndex,
+                rainPipeline_);
+        }
         if (recordsRainDraw) {
             markGpuPhaseActive(kGpuPhaseWeightedActive);
         }
@@ -15664,23 +15814,43 @@ void VulkanViewportShell::UploadRainUniforms(
         return;
     }
 
+    const RainCountersGpu* completedCounters = nullptr;
+    if (resources.counterReadbackBuffers[frameIndex].mapped != nullptr) {
+        // DrawFrame has already waited this frame slot's fence. Read the
+        // slot-owned transfer snapshot rather than racing the shared compute
+        // counter buffer used by another live or EXR submission.
+        completedCounters = static_cast<const RainCountersGpu*>(
+            resources.counterReadbackBuffers[frameIndex].mapped);
+        resources.lastInFlightParticleCount =
+            renderState_.rainSettings.enabled
+                ? completedCounters->roleValues.w
+                : 0U;
+        if (renderState_.rainSettings.enabled &&
+            completedCounters->values.z > 0U &&
+            std::isfinite(renderState_.flowTimeSeconds)) {
+            // A draining airborne drop can land after the keyed Rain amount
+            // reaches zero. Anchor the wetness/ring tail to that real impact.
+            resources.lastPotentialImpactTimeSeconds =
+                renderState_.flowTimeSeconds;
+        }
+    }
     if (!renderState_.rainSettings.impactEffectsEnabled) {
         diagnostics_.rainImpactOverflowCount = 0U;
         diagnostics_.rainEventsEmittedThisFrame = 0U;
         diagnostics_.rainSandImpactsThisFrame = 0U;
         diagnostics_.rainRockImpactsThisFrame = 0U;
         diagnostics_.rainVegetationImpactsThisFrame = 0U;
-    } else if (resources.counterReadbackBuffers[frameIndex].mapped != nullptr) {
-        // DrawFrame has already waited this frame slot's fence. Read the
-        // slot-owned transfer snapshot rather than racing the shared compute
-        // counter buffer used by another live or EXR submission.
-        const auto* counters = static_cast<const RainCountersGpu*>(
-            resources.counterReadbackBuffers[frameIndex].mapped);
-        diagnostics_.rainImpactOverflowCount = counters->values.y;
-        diagnostics_.rainEventsEmittedThisFrame = counters->values.z;
-        diagnostics_.rainSandImpactsThisFrame = counters->roleValues.x;
-        diagnostics_.rainRockImpactsThisFrame = counters->roleValues.y;
-        diagnostics_.rainVegetationImpactsThisFrame = counters->roleValues.z;
+    } else if (completedCounters != nullptr) {
+        diagnostics_.rainImpactOverflowCount =
+            completedCounters->values.y;
+        diagnostics_.rainEventsEmittedThisFrame =
+            completedCounters->values.z;
+        diagnostics_.rainSandImpactsThisFrame =
+            completedCounters->roleValues.x;
+        diagnostics_.rainRockImpactsThisFrame =
+            completedCounters->roleValues.y;
+        diagnostics_.rainVegetationImpactsThisFrame =
+            completedCounters->roleValues.z;
     }
     UploadRainUniformsToBuffer(resources.uniformBuffers[frameIndex], width, height);
 }
@@ -15910,25 +16080,29 @@ void VulkanViewportShell::RecordRainComputeWithDescriptor(
             nullptr);
     };
 
-    if (renderState_.rainSettings.impactEffectsEnabled) {
-        constexpr std::uint32_t clearPhase = 0U;
-        vkCmdPushConstants(
-            commandBuffer,
-            rainPipelineLayout_,
-            VK_SHADER_STAGE_COMPUTE_BIT,
-            0U,
-            sizeof(clearPhase),
-            &clearPhase);
-        vkCmdDispatch(
-            commandBuffer,
-            (invisible_places::water::kRainImpactGridDimension *
-                 invisible_places::water::kRainImpactGridDimension +
-             63U) /
-                64U,
-            1U,
-            1U);
-        barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-    }
+    // Always reset the compact per-frame counters, including the number of
+    // airborne particles still draining after emission stops. The shader
+    // skips the larger impact-grid clear when impact effects are disabled.
+    constexpr std::uint32_t clearPhase = 0U;
+    vkCmdPushConstants(
+        commandBuffer,
+        rainPipelineLayout_,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0U,
+        sizeof(clearPhase),
+        &clearPhase);
+    vkCmdDispatch(
+        commandBuffer,
+        (invisible_places::water::kRainImpactGridDimension *
+             invisible_places::water::kRainImpactGridDimension +
+         63U) /
+            64U,
+        1U,
+        1U);
+    barrier(
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_SHADER_READ_BIT |
+            VK_ACCESS_SHADER_WRITE_BIT);
 
     constexpr std::uint32_t simulationPhase = 1U;
     vkCmdPushConstants(
@@ -16038,10 +16212,6 @@ void VulkanViewportShell::RecordRainDrawWithDescriptor(
         pipeline == VK_NULL_HANDLE || descriptorSet == VK_NULL_HANDLE) {
         return;
     }
-    const auto activeParticleCount = ActiveRainParticleCount(renderState_);
-    if (activeParticleCount == 0U) {
-        return;
-    }
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     vkCmdBindDescriptorSets(
         commandBuffer,
@@ -16052,7 +16222,14 @@ void VulkanViewportShell::RecordRainDrawWithDescriptor(
         &descriptorSet,
         0U,
         nullptr);
-    vkCmdDraw(commandBuffer, 6U, activeParticleCount, 0U, 0U);
+    // The spawn target can drop immediately, but already-active slots above
+    // it remain visible until they land or leave the collision volume.
+    vkCmdDraw(
+        commandBuffer,
+        6U,
+        invisible_places::water::kRainParticleCapacity,
+        0U,
+        0U);
 }
 
 VulkanViewportShell::BufferAllocation VulkanViewportShell::CreateHostVisibleBuffer(

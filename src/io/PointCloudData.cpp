@@ -346,6 +346,12 @@ void Bounds3f::Expand(const Float3& point) {
 }
 
 void ScalarFieldStats::Include(float value) {
+    // Non-finite scalar samples remain in the field-major point data so
+    // renderers can treat them as missing on a per-point basis. They must not
+    // poison the finite metadata range used to initialise UI bounds.
+    if (!std::isfinite(value)) {
+        return;
+    }
     if (!valid) {
         minimum = value;
         maximum = value;
@@ -597,6 +603,179 @@ PointCloudStreamResult StreamPointCloudPositionsNormals(
             result.bounds.Expand(sample.position);
             ++result.pointCount;
             if (visitor && !visitor(sample, globalIndex)) {
+                result.cancelled = true;
+                return result;
+            }
+        }
+    }
+
+    result.success = true;
+    return result;
+}
+
+PointCloudSelectedValueStreamResult StreamPointCloudSelectedValues(
+    const std::filesystem::path& filePath,
+    const PointCloudSelectedValueSelector& selector,
+    const PointCloudSelectedValueVisitor& visitor) {
+    if (selector.source == PointCloudSelectedValueSource::ScalarField &&
+        selector.scalarFieldName.empty()) {
+        return {
+            .errorMessage =
+                "A scalar field name is required when streaming a selected "
+                "point-cloud value.",
+        };
+    }
+
+    const auto headerResult = ParsePlyHeader(filePath);
+    if (!headerResult.success) {
+        return {.errorMessage = headerResult.errorMessage};
+    }
+
+    const auto& header = headerResult.header;
+    if (header.format != "binary_little_endian") {
+        return {
+            .errorMessage =
+                "Only binary_little_endian PLY point clouds are supported.",
+        };
+    }
+
+    std::string layoutError;
+    const auto layout = BuildPointCloudLayout(header, &layoutError);
+    if (!layout.has_value()) {
+        return {.errorMessage = layoutError};
+    }
+
+    const PropertyLayout* selectedScalar = nullptr;
+    std::array<const PropertyLayout*, 3> normalProperties{};
+    for (std::size_t index = 0U;
+         index < layout->properties.size() &&
+         index < header.properties.size();
+         ++index) {
+        const auto& property = layout->properties[index];
+        switch (property.semantic) {
+            case PropertySemantic::NormalX:
+                normalProperties[0U] = &property;
+                break;
+            case PropertySemantic::NormalY:
+                normalProperties[1U] = &property;
+                break;
+            case PropertySemantic::NormalZ:
+                normalProperties[2U] = &property;
+                break;
+            case PropertySemantic::ScalarField:
+                if (selector.source ==
+                        PointCloudSelectedValueSource::ScalarField &&
+                    ScalarFieldDisplayName(
+                        header.properties[index].name) ==
+                        selector.scalarFieldName) {
+                    selectedScalar = &property;
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+    if (selector.source == PointCloudSelectedValueSource::ScalarField &&
+        selectedScalar == nullptr) {
+        return {
+            .errorMessage =
+                "Point cloud does not contain scalar field '" +
+                selector.scalarFieldName + "'.",
+        };
+    }
+    if (selector.source != PointCloudSelectedValueSource::ScalarField &&
+        (!layout->hasNormals ||
+         std::any_of(
+             normalProperties.begin(),
+             normalProperties.end(),
+             [](const PropertyLayout* property) {
+                 return property == nullptr;
+             }))) {
+        return {
+            .errorMessage =
+                "Point cloud does not contain a complete normal triplet.",
+        };
+    }
+
+    std::ifstream input{filePath, std::ios::binary};
+    if (!input.is_open()) {
+        return {.errorMessage = "Unable to open point cloud file."};
+    }
+    input.seekg(
+        static_cast<std::streamoff>(header.dataOffsetBytes),
+        std::ios::beg);
+    if (!input.good()) {
+        return {.errorMessage = "Failed to seek to PLY payload."};
+    }
+
+    PointCloudSelectedValueStreamResult result;
+    const auto pointsPerChunk =
+        RecommendedPointsPerChunk(layout->recordSize);
+    std::vector<std::byte> chunkBuffer(
+        pointsPerChunk * layout->recordSize);
+    for (std::uint64_t pointStart = 0U;
+         pointStart < header.vertexCount;
+         pointStart += pointsPerChunk) {
+        const auto remaining = header.vertexCount - pointStart;
+        const auto pointsThisChunk = static_cast<std::size_t>(
+            std::min<std::uint64_t>(remaining, pointsPerChunk));
+        const auto bytesToRead =
+            pointsThisChunk * layout->recordSize;
+        input.read(
+            reinterpret_cast<char*>(chunkBuffer.data()),
+            static_cast<std::streamsize>(bytesToRead));
+        if (input.gcount() !=
+            static_cast<std::streamsize>(bytesToRead)) {
+            result.errorMessage =
+                "Unexpected EOF while reading point cloud payload.";
+            return result;
+        }
+
+        for (std::size_t localIndex = 0U;
+             localIndex < pointsThisChunk;
+             ++localIndex) {
+            const auto globalIndex =
+                pointStart +
+                static_cast<std::uint64_t>(localIndex);
+            const auto* recordBytes =
+                chunkBuffer.data() +
+                (localIndex * layout->recordSize);
+            float value = 0.0F;
+            if (selectedScalar != nullptr) {
+                value = static_cast<float>(ReadScalarAsDouble(
+                    recordBytes + selectedScalar->offset,
+                    selectedScalar->type));
+            } else {
+                Float3 normal{
+                    .x = static_cast<float>(ReadScalarAsDouble(
+                        recordBytes + normalProperties[0U]->offset,
+                        normalProperties[0U]->type)),
+                    .y = static_cast<float>(ReadScalarAsDouble(
+                        recordBytes + normalProperties[1U]->offset,
+                        normalProperties[1U]->type)),
+                    .z = static_cast<float>(ReadScalarAsDouble(
+                        recordBytes + normalProperties[2U]->offset,
+                        normalProperties[2U]->type)),
+                };
+                normal = NormalizeNormal(normal);
+                switch (selector.source) {
+                    case PointCloudSelectedValueSource::NormalX:
+                        value = normal.x;
+                        break;
+                    case PointCloudSelectedValueSource::NormalY:
+                        value = normal.y;
+                        break;
+                    case PointCloudSelectedValueSource::NormalZ:
+                        value = normal.z;
+                        break;
+                    case PointCloudSelectedValueSource::ScalarField:
+                        break;
+                }
+            }
+
+            ++result.pointCount;
+            if (visitor && !visitor(value, globalIndex)) {
                 result.cancelled = true;
                 return result;
             }

@@ -5,6 +5,7 @@
 #include "output/RenderPreset.hpp"
 #include "renderer/gsplat/GsplatLayer.hpp"
 #include "renderer/pointcloud/PointCloudPreviewState.hpp"
+#include "timing/TimingColourise.hpp"
 #include "water/RainSimulation.hpp"
 #include "water/WaterFlow.hpp"
 
@@ -19,9 +20,9 @@
 namespace invisible_places::serialization {
 
 inline constexpr std::size_t kMaxSerializedWaterRippleRuntimeCacheMemberships = 250'000U;
-inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 48U;
+inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 50U;
 inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 20U;
-inline constexpr std::uint32_t kAnimationDocumentSchemaVersion = 13U;
+inline constexpr std::uint32_t kAnimationDocumentSchemaVersion = 14U;
 inline constexpr std::uint32_t kWaterPathCacheSidecarSchemaVersion = 1U;
 inline constexpr std::uint64_t kMaximumPersistedWaterCacheBytes = 5ULL * 1024ULL * 1024ULL * 1024ULL;
 
@@ -198,6 +199,19 @@ struct ProjectDocument {
     std::vector<invisible_places::water::WaterScenarioFeatureRuns>
         waterFeatureTimingRuns;
     std::uint32_t waterFeatureTimingRunSequence = 1U;
+    // Authored Timing and named takes are runtime timing containers. Legacy
+    // waterScenarios and waterFeatureTimingRuns remain above for round-trip
+    // compatibility but are migrated into these compound scene states.
+    std::vector<invisible_places::timing::TimingTakeDefinition> timingTakes{
+        invisible_places::timing::AuthoredTimingTakeDefinition()};
+    std::string selectedTimingTakeId =
+        std::string{invisible_places::timing::kAuthoredTimingTakeId};
+    std::vector<invisible_places::timing::TimingTakeSceneState>
+        timingTakeStates;
+    std::vector<invisible_places::timing::TimingColourisePaletteDefinition>
+        timingColourisePalettes;
+    std::uint32_t timingTakeSequence = 1U;
+    std::uint32_t timingColourisePaletteSequence = 1U;
     std::uint32_t waterTimingRunSequence = 1U;
     std::optional<invisible_places::water::WaterScenarioDefinition> tempWaterScenario;
     std::vector<invisible_places::water::WaterEffectLayer> waterRippleLayers;

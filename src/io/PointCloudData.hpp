@@ -81,9 +81,38 @@ struct PointCloudStreamResult {
 using PointCloudPositionNormalVisitor =
     std::function<bool(const PointCloudPositionNormalSample&, std::uint64_t)>;
 
+enum class PointCloudSelectedValueSource : std::uint8_t {
+    ScalarField = 0,
+    NormalX,
+    NormalY,
+    NormalZ,
+};
+
+struct PointCloudSelectedValueSelector {
+    PointCloudSelectedValueSource source =
+        PointCloudSelectedValueSource::ScalarField;
+    // Uses the same display name as LoadedPointCloud::scalarFields; the
+    // on-disk "scalar_" prefix is intentionally hidden from callers.
+    std::string scalarFieldName;
+};
+
+struct PointCloudSelectedValueStreamResult {
+    std::uint64_t pointCount = 0;
+    std::string errorMessage;
+    bool success = false;
+    bool cancelled = false;
+};
+
+using PointCloudSelectedValueVisitor =
+    std::function<bool(float, std::uint64_t)>;
+
 PointCloudLoadResult LoadPointCloud(const std::filesystem::path& filePath);
 PointCloudStreamResult StreamPointCloudPositionsNormals(
     const std::filesystem::path& filePath,
     const PointCloudPositionNormalVisitor& visitor);
+PointCloudSelectedValueStreamResult StreamPointCloudSelectedValues(
+    const std::filesystem::path& filePath,
+    const PointCloudSelectedValueSelector& selector,
+    const PointCloudSelectedValueVisitor& visitor);
 
 }  // namespace invisible_places::io

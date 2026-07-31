@@ -13,6 +13,8 @@ layout(location = 7) flat in uint inPointIndex;
 layout(location = 8) in float inSurfaceAngleMask;
 layout(location = 9) in vec3 inAovNormal;
 layout(location = 10) in float inCaustic;
+layout(location = 11) in vec4 inWaterColourTransform;
+layout(location = 12) flat in vec4 inTimingColourise[5];
 
 layout(location = 0) out vec4 outAccumulation;
 layout(location = 1) out float outRevealage;
@@ -96,6 +98,8 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
 } styleData;
 
 #include "pointcloud_stylisation.glsl"
+#define POINTCLOUD_TIMING_COLOURISE_FRAGMENT
+#include "pointcloud_timing_colourise.glsl"
 
 layout(input_attachment_index = 0, set = 0, binding = 3) uniform subpassInput sceneDepthInput;
 
@@ -261,8 +265,15 @@ void main() {
         discard;
     }
 
-    vec3 baseColor =
-        PointStylisationColor(ApplyColorize(ResolveBaseColor()), centered, radius, inPointIndex, inSurfaceAngleMask);
+    const vec3 timingColour =
+        ApplyTimingColouriseStack(ApplyColorize(ResolveBaseColor()));
+    vec3 baseColor = PointStylisationColor(
+        timingColour * inWaterColourTransform.w +
+            inWaterColourTransform.rgb,
+        centered,
+        radius,
+        inPointIndex,
+        inSurfaceAngleMask);
     baseColor = mix(baseColor, styleData.causticTint.rgb, clamp(inCaustic * 0.55, 0.0, 1.0));
     outAccumulation = vec4(0.0);
     outRevealage = 0.0;

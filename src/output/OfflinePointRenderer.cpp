@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <utility>
 
 #include <glm/common.hpp>
@@ -970,6 +971,119 @@ glm::vec3 ApplyColorize(
     return glm::mix(baseColor, colorized, amount);
 }
 
+std::optional<float> ResolveTimingColouriseValue(
+    const OfflinePointLayer& layer,
+    const invisible_places::renderer::pointcloud::ResolvedTimingColouriseEffect&
+        effect,
+    std::size_t pointIndex) {
+    using invisible_places::renderer::pointcloud::TimingColouriseSource;
+    if (layer.cloud == nullptr) {
+        return std::nullopt;
+    }
+    const auto& cloud = *layer.cloud;
+    switch (effect.source) {
+        case TimingColouriseSource::ScalarField:
+            if (effect.scalarFieldSlot < 0 ||
+                static_cast<std::size_t>(effect.scalarFieldSlot) >=
+                    cloud.scalarFields.size()) {
+                return std::nullopt;
+            }
+            return ScalarFieldValueBySlot(
+                cloud,
+                static_cast<std::size_t>(effect.scalarFieldSlot),
+                pointIndex);
+        case TimingColouriseSource::NormalX:
+        case TimingColouriseSource::NormalY:
+        case TimingColouriseSource::NormalZ:
+            if (!cloud.hasNormals || pointIndex >= cloud.normals.size()) {
+                return std::nullopt;
+            }
+            if (effect.source == TimingColouriseSource::NormalX) {
+                return cloud.normals[pointIndex].x;
+            }
+            if (effect.source == TimingColouriseSource::NormalY) {
+                return cloud.normals[pointIndex].y;
+            }
+            return cloud.normals[pointIndex].z;
+    }
+    return std::nullopt;
+}
+
+glm::vec4 SampleTimingColouriseLut(
+    const invisible_places::renderer::pointcloud::ResolvedTimingColouriseEffect&
+        effect,
+    float normalizedValue) {
+    constexpr std::size_t kLastSample =
+        invisible_places::renderer::pointcloud::kTimingColouriseLutSamples - 1U;
+    const float scaled =
+        Clamp01(normalizedValue) * static_cast<float>(kLastSample);
+    const std::size_t lowerIndex = std::min<std::size_t>(
+        static_cast<std::size_t>(std::floor(scaled)),
+        kLastSample);
+    const std::size_t upperIndex =
+        std::min<std::size_t>(lowerIndex + 1U, kLastSample);
+    const float fraction = scaled - static_cast<float>(lowerIndex);
+    const auto& lower = effect.rgbaLut[lowerIndex];
+    const auto& upper = effect.rgbaLut[upperIndex];
+    return glm::mix(
+        glm::vec4{lower[0], lower[1], lower[2], lower[3]},
+        glm::vec4{upper[0], upper[1], upper[2], upper[3]},
+        fraction);
+}
+
+glm::vec3 ApplyTimingColourise(
+    glm::vec3 baseColor,
+    const OfflinePointLayer& layer,
+    std::size_t pointIndex) {
+    const std::size_t effectCount = std::min<std::size_t>(
+        layer.timingColourise.effectCount,
+        layer.timingColourise.effects.size());
+    for (std::size_t effectIndex = 0; effectIndex < effectCount; ++effectIndex) {
+        const auto& effect = layer.timingColourise.effects[effectIndex];
+        if (!effect.enabled ||
+            !std::isfinite(effect.lowerBound) ||
+            !std::isfinite(effect.upperBound) ||
+            effect.upperBound <= effect.lowerBound) {
+            continue;
+        }
+        const auto value = ResolveTimingColouriseValue(
+            layer,
+            effect,
+            pointIndex);
+        if (!value.has_value() ||
+            !std::isfinite(value.value()) ||
+            value.value() < effect.lowerBound ||
+            value.value() > effect.upperBound) {
+            continue;
+        }
+
+        const float span = effect.upperBound - effect.lowerBound;
+        const float normalized =
+            (value.value() - effect.lowerBound) / span;
+        float edgeMask = 1.0F;
+        const float fadeFraction = std::clamp(
+            std::isfinite(effect.edgeFadeFraction)
+                ? effect.edgeFadeFraction
+                : 0.0F,
+            0.0F,
+            0.5F);
+        if (fadeFraction > 1.0e-6F) {
+            edgeMask = std::min(
+                SmoothStep(0.0F, fadeFraction, normalized),
+                SmoothStep(0.0F, fadeFraction, 1.0F - normalized));
+        }
+        const glm::vec4 lut = SampleTimingColouriseLut(effect, normalized);
+        const float amount = Clamp01(lut.a) * Clamp01(edgeMask);
+        if (amount > 1.0e-5F) {
+            baseColor = glm::mix(
+                baseColor,
+                glm::clamp(glm::vec3{lut}, glm::vec3{0.0F}, glm::vec3{1.0F}),
+                amount);
+        }
+    }
+    return baseColor;
+}
+
 glm::vec3 ResolvePointColor(
     const OfflinePointLayer& layer,
     std::size_t pointIndex) {
@@ -1010,7 +1124,13 @@ glm::vec3 ResolvePointColor(
         baseColor = {customColor[0], customColor[1], customColor[2]};
     }
 
-    return ApplyWaterEffectColour(layer, pointIndex, ApplyColorize(baseColor, layer.style));
+    return ApplyWaterEffectColour(
+        layer,
+        pointIndex,
+        ApplyTimingColourise(
+            ApplyColorize(baseColor, layer.style),
+            layer,
+            pointIndex));
 }
 
 struct OfflinePointSample {

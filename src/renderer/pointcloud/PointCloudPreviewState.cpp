@@ -505,6 +505,27 @@ bool PointCloudStyleHasActiveStylisation(const PointCloudStyleState& style) {
            style.stylisationStrength > kMaterialEpsilon;
 }
 
+bool TimingColouriseStackHasActiveEffects(
+    const ResolvedTimingColouriseStack& stack) {
+    const std::size_t effectCount = std::min<std::size_t>(
+        stack.effectCount,
+        stack.effects.size());
+    for (std::size_t effectIndex = 0; effectIndex < effectCount; ++effectIndex) {
+        const auto& effect = stack.effects[effectIndex];
+        if (!effect.enabled ||
+            !std::isfinite(effect.lowerBound) ||
+            !std::isfinite(effect.upperBound) ||
+            effect.upperBound <= effect.lowerBound) {
+            continue;
+        }
+        if (effect.source != TimingColouriseSource::ScalarField ||
+            effect.scalarFieldSlot >= 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool PointCloudStyleHasActiveRoughnessMotion(const PointCloudStyleState& style) {
     return style.roughnessMotionStrength > kMaterialEpsilon &&
            style.roughnessMotionSpeed > kMaterialEpsilon;

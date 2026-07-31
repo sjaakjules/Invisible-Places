@@ -866,7 +866,7 @@ TEST_CASE("Feature timing overlay samples every keyed setting and drives scenari
     });
 
     const std::vector<WaterFeatureTimingRun> runs{rainRun};
-    const auto overlay = BuildWaterFeatureTimingOverlay(runs, 0.25F);
+    auto overlay = BuildWaterFeatureTimingOverlay(runs, 0.25F);
     REQUIRE(overlay.samples.size() == 2U);
     const auto* rain = overlay.Find(
         {.kind = WaterKeyedFeatureKind::Rain}, "level");
@@ -885,9 +885,21 @@ TEST_CASE("Feature timing overlay samples every keyed setting and drives scenari
     WaterScenarioState state;
     state.rainLevel = 1.0F;
     state.flowLevel = 0.7F;
+    state.seepageLevel = 0.6F;
+    overlay.samples.push_back({
+        .feature = {.kind = WaterKeyedFeatureKind::FlowGlobal},
+        .settingId = "level",
+        .value = 0.1F,
+    });
+    overlay.samples.push_back({
+        .feature = {.kind = WaterKeyedFeatureKind::SeepageGlobal},
+        .settingId = "level",
+        .value = 0.2F,
+    });
     ApplyWaterFeatureTimingOverlayToScenario(overlay, &state);
     CHECK(state.rainLevel == Approx(0.25F));
     CHECK(state.flowLevel == Approx(0.7F));
+    CHECK(state.seepageLevel == Approx(0.6F));
 
     const auto* containing = FindWaterFeatureRunContaining(
         runs,
@@ -898,6 +910,90 @@ TEST_CASE("Feature timing overlay samples every keyed setting and drives scenari
               runs,
               {.kind = WaterKeyedFeatureKind::FlowSource, .objectId = 1U}) ==
           nullptr);
+}
+
+TEST_CASE("Authored water response settings are keyable and overlays stay transient",
+          "[water][timing][keyed][authored]") {
+    using Catch::Approx;
+    using invisible_places::water::
+        ApplyWaterFeatureTimingOverlayToDynamicMeshFlowSettings;
+    using invisible_places::water::
+        ApplyWaterFeatureTimingOverlayToSeepageNode;
+    using invisible_places::water::FindWaterKeyableSetting;
+    using invisible_places::water::WaterDynamicMeshFlowSettings;
+    using invisible_places::water::WaterFeatureTimingOverlay;
+    using invisible_places::water::WaterKeyedFeatureKind;
+    using invisible_places::water::WaterSeepageNode;
+
+    const auto* delay = FindWaterKeyableSetting(
+        WaterKeyedFeatureKind::SeepageNode,
+        "rain_delay_seconds");
+    REQUIRE(delay != nullptr);
+    CHECK(delay->minimum == Approx(0.0F));
+    CHECK(delay->maximum == Approx(120.0F));
+    const auto* recession = FindWaterKeyableSetting(
+        WaterKeyedFeatureKind::SeepageNode,
+        "rain_recession_seconds");
+    REQUIRE(recession != nullptr);
+    CHECK(recession->maximum == Approx(300.0F));
+
+    const auto* activity = FindWaterKeyableSetting(
+        WaterKeyedFeatureKind::MeshFlow,
+        "level");
+    REQUIRE(activity != nullptr);
+    CHECK(std::string_view{activity->label} == "Activity");
+    REQUIRE(
+        FindWaterKeyableSetting(
+            WaterKeyedFeatureKind::MeshFlow,
+            "rain_gain") != nullptr);
+    REQUIRE(
+        FindWaterKeyableSetting(
+            WaterKeyedFeatureKind::MeshFlow,
+            "moisture_persistence") != nullptr);
+    CHECK(
+        invisible_places::water::WaterKeyableSettings(
+            WaterKeyedFeatureKind::SeepageGlobal)
+            .empty());
+    CHECK(
+        invisible_places::water::WaterKeyableSettings(
+            WaterKeyedFeatureKind::FlowGlobal)
+            .empty());
+
+    WaterFeatureTimingOverlay overlay;
+    overlay.samples = {
+        {{.kind = WaterKeyedFeatureKind::SeepageNode, .objectId = 9U},
+         "rain_delay_seconds",
+         4.5F},
+        {{.kind = WaterKeyedFeatureKind::SeepageNode, .objectId = 9U},
+         "rain_rise_seconds",
+         -2.0F},
+        {{.kind = WaterKeyedFeatureKind::MeshFlow},
+         "level",
+         0.25F},
+        {{.kind = WaterKeyedFeatureKind::MeshFlow},
+         "rain_gain",
+         1.5F},
+        {{.kind = WaterKeyedFeatureKind::MeshFlow},
+         "moisture_persistence",
+         2.0F},
+    };
+
+    WaterSeepageNode node;
+    node.id = 9U;
+    node.rainDelaySeconds = 1.0F;
+    node.rainRiseSeconds = 3.0F;
+    ApplyWaterFeatureTimingOverlayToSeepageNode(overlay, &node);
+    CHECK(node.rainDelaySeconds == Approx(4.5F));
+    CHECK(node.rainRiseSeconds == Approx(0.0F));
+    CHECK(node.rainRecessionSeconds == Approx(0.0F));
+
+    WaterDynamicMeshFlowSettings mesh;
+    ApplyWaterFeatureTimingOverlayToDynamicMeshFlowSettings(
+        overlay,
+        &mesh);
+    CHECK(mesh.activity == Approx(0.25F));
+    CHECK(mesh.rainGain == Approx(1.5F));
+    CHECK(mesh.moisturePersistenceMultiplier == Approx(2.0F));
 }
 
 TEST_CASE("Per-scenario feature timing runs round-trip through the project document",

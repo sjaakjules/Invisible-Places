@@ -86,6 +86,7 @@ set(INVISIBLE_PLACES_SHADER_INCLUDES
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_coverage.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_caustics.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_colormaps.glsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_timing_colourise.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_sparse_ripple.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_rain_impact.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_mesh_flow_contact.glsl"
@@ -156,6 +157,8 @@ add_library(
     src/scene/SceneCatalog.cpp
     src/serialization/ProjectDocument.cpp
     src/style/RenderParameterBinding.cpp
+    src/timing/TimingColourise.cpp
+    src/timing/TimingColouriseHistogram.cpp
     src/water/RainSimulation.cpp
     src/water/WaterFlow.cpp
     src/water/WaterSeepagePulseField.cpp
@@ -251,6 +254,8 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
             tests/SeepageOfflineRendererTests.cpp
             tests/SeepageSerializationTests.cpp
             tests/SeepageWaterTests.cpp
+            tests/TimingColouriseHistogramTests.cpp
+            tests/TimingColouriseTests.cpp
             tests/WaterSeepagePulseFieldTests.cpp
             tests/WaterTimingTests.cpp
         )

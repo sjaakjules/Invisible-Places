@@ -414,12 +414,18 @@ void AdvanceParticle(uint index) {
     if (particle.state.w != rain.simulation1.z) {
         particle = RainParticle(vec4(0.0), vec4(0.0), vec4(0.0), uvec4(0u, 0u, 0u, rain.simulation1.z));
     }
-    if (rain.simulation1.x == 0u || index >= rain.simulation0.x) {
+    if (rain.simulation1.x == 0u) {
         particle.state.x = 0u;
         particles[index] = particle;
         return;
     }
     if (particle.state.x == 0u) {
+        // The requested population is a spawn budget, not an immediate cull.
+        // Slots above it drain naturally after animated Rain reaches zero.
+        if (index >= rain.simulation0.x) {
+            particles[index] = particle;
+            return;
+        }
         SpawnParticle(index, particle);
         if (particle.state.x == 0u) {
             particles[index] = particle;
@@ -489,7 +495,14 @@ void AdvanceParticle(uint index) {
     if (futureHit && hitDistance <= travelledDistance + 1e-6) {
         particle.positionAge.xyz = hitPosition;
         EmitImpact(hitPosition, hitNormal, hitRole, particle);
-        SpawnParticle(index, particle);
+        if (index < rain.simulation0.x) {
+            SpawnParticle(index, particle);
+        } else {
+            particle.state.x = 0u;
+        }
+        if (particle.state.x != 0u) {
+            atomicAdd(counters.reservedCounter, 1u);
+        }
         particles[index] = particle;
         return;
     }
@@ -503,7 +516,14 @@ void AdvanceParticle(uint index) {
         particle.positionAge.y < rain.cacheBoundsMinResolution.y - deathDistance ||
         particle.positionAge.y > rain.cacheBoundsMaxDeathDistance.y + deathDistance;
     if (escaped) {
-        SpawnParticle(index, particle);
+        if (index < rain.simulation0.x) {
+            SpawnParticle(index, particle);
+        } else {
+            particle.state.x = 0u;
+        }
+    }
+    if (particle.state.x != 0u) {
+        atomicAdd(counters.reservedCounter, 1u);
     }
     particles[index] = particle;
 }
@@ -690,7 +710,7 @@ void main() {
     const uint index = gl_GlobalInvocationID.x;
     if (pushConstants.phase == 0u) {
         const uint cellCount = rain.collision0.w * rain.collision0.w;
-        if (index < cellCount) {
+        if (rain.simulation1.y != 0u && index < cellCount) {
             impactCounts[index] = uvec4(0u);
             const uint referenceBase = index * kReferencesPerCell;
             for (uint referenceIndex = 0u;

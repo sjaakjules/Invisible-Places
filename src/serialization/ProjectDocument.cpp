@@ -2320,6 +2320,9 @@ json SerializeAnimationPath(const AnimationPath& path) {
         {"aperture_f_stops", path.apertureFStops},
         {"depth_of_field_max_blur_px", path.depthOfFieldMaxBlurPixels},
         {"export_settings", SerializeAnimationExportSettings(path.exportSettings)},
+        {"selected_timing_take_id",
+         invisible_places::timing::NormalizeTimingTakeId(
+             path.selectedTimingTakeId)},
         {"selected_water_scenario_id", path.selectedWaterScenarioId},
         {"water_scenario_tracks", json::array()},
         {"keys", json::array()},
@@ -2362,6 +2365,11 @@ AnimationPath ParseAnimationPath(const json& pathJson) {
         pathJson.value("depth_of_field_max_blur_px", path.depthOfFieldMaxBlurPixels);
     path.selectedWaterScenarioId =
         pathJson.value("selected_water_scenario_id", std::string{});
+    path.selectedTimingTakeId =
+        invisible_places::timing::NormalizeTimingTakeId(
+            pathJson.value(
+                "selected_timing_take_id",
+                path.selectedWaterScenarioId));
     if (pathJson.contains("export_settings")) {
         path.exportSettings = ParseAnimationExportSettings(pathJson.at("export_settings"));
     }
@@ -3688,6 +3696,420 @@ ParseWaterScenarioFeatureRuns(const json& entryJson) {
     return entry;
 }
 
+std::string TimingColouriseFieldSourceName(
+    invisible_places::timing::TimingColouriseFieldSource source) {
+    using invisible_places::timing::TimingColouriseFieldSource;
+    switch (source) {
+        case TimingColouriseFieldSource::Scalar:
+            return "scalar";
+        case TimingColouriseFieldSource::NormalX:
+            return "normal_x";
+        case TimingColouriseFieldSource::NormalY:
+            return "normal_y";
+        case TimingColouriseFieldSource::NormalZ:
+            return "normal_z";
+    }
+    return "scalar";
+}
+
+invisible_places::timing::TimingColouriseFieldSource
+ParseTimingColouriseFieldSource(const json& sourceJson) {
+    using invisible_places::timing::TimingColouriseFieldSource;
+    if (!sourceJson.is_string()) {
+        return TimingColouriseFieldSource::Scalar;
+    }
+    const auto name = sourceJson.get<std::string>();
+    if (name == "normal_x") {
+        return TimingColouriseFieldSource::NormalX;
+    }
+    if (name == "normal_y") {
+        return TimingColouriseFieldSource::NormalY;
+    }
+    if (name == "normal_z") {
+        return TimingColouriseFieldSource::NormalZ;
+    }
+    return TimingColouriseFieldSource::Scalar;
+}
+
+json SerializeTimingColourisePalette(
+    const invisible_places::timing::TimingColourisePalette& palette) {
+    json stopsJson = json::array();
+    const auto sanitized =
+        invisible_places::timing::SanitizeTimingColourisePalette(palette);
+    for (const auto& stop : sanitized.stops) {
+        stopsJson.push_back({
+            {"position", stop.position},
+            {"colour", stop.colour},
+            {"colourise_amount", stop.colouriseAmount},
+        });
+    }
+    return {{"stops", std::move(stopsJson)}};
+}
+
+invisible_places::timing::TimingColourisePalette
+ParseTimingColourisePalette(const json& paletteJson) {
+    invisible_places::timing::TimingColourisePalette palette;
+    palette.stops.clear();
+    if (paletteJson.contains("stops") &&
+        paletteJson.at("stops").is_array()) {
+        for (const auto& stopJson : paletteJson.at("stops")) {
+            invisible_places::timing::TimingColourisePaletteStop stop;
+            stop.position = stopJson.value("position", stop.position);
+            if (stopJson.contains("colour") &&
+                stopJson.at("colour").is_array() &&
+                stopJson.at("colour").size() >= 3U) {
+                stop.colour =
+                    stopJson.at("colour").get<std::array<float, 3>>();
+            }
+            stop.colouriseAmount = stopJson.value(
+                "colourise_amount",
+                stop.colouriseAmount);
+            palette.stops.push_back(stop);
+        }
+    }
+    return invisible_places::timing::SanitizeTimingColourisePalette(
+        std::move(palette));
+}
+
+json SerializeTimingColouriseBounds(
+    const invisible_places::timing::TimingColouriseBounds& bounds) {
+    const auto sanitized =
+        invisible_places::timing::SanitizeTimingColouriseBounds(bounds);
+    return {
+        {"lower", sanitized.lower},
+        {"upper", sanitized.upper},
+        {"edge_fade", sanitized.edgeFade},
+    };
+}
+
+invisible_places::timing::TimingColouriseBounds
+ParseTimingColouriseBounds(const json& boundsJson) {
+    invisible_places::timing::TimingColouriseBounds bounds;
+    bounds.lower = boundsJson.value("lower", bounds.lower);
+    bounds.upper = boundsJson.value("upper", bounds.upper);
+    bounds.edgeFade = boundsJson.value("edge_fade", bounds.edgeFade);
+    return invisible_places::timing::SanitizeTimingColouriseBounds(bounds);
+}
+
+std::string TimingColouriseBoundsKeyModeName(
+    invisible_places::timing::TimingColouriseBoundsKeyMode mode) {
+    using invisible_places::timing::TimingColouriseBoundsKeyMode;
+    switch (mode) {
+        case TimingColouriseBoundsKeyMode::LowerUpper:
+            return "lower_upper";
+        case TimingColouriseBoundsKeyMode::CentreSpread:
+            return "centre_spread";
+        case TimingColouriseBoundsKeyMode::LowerSpread:
+            return "lower_spread";
+        case TimingColouriseBoundsKeyMode::UpperSpread:
+            return "upper_spread";
+    }
+    return "lower_upper";
+}
+
+invisible_places::timing::TimingColouriseBoundsKeyMode
+ParseTimingColouriseBoundsKeyMode(const json& modeJson) {
+    using invisible_places::timing::TimingColouriseBoundsKeyMode;
+    if (!modeJson.is_string()) {
+        return TimingColouriseBoundsKeyMode::LowerUpper;
+    }
+    const auto name = modeJson.get<std::string>();
+    if (name == "centre_spread") {
+        return TimingColouriseBoundsKeyMode::CentreSpread;
+    }
+    if (name == "lower_spread") {
+        return TimingColouriseBoundsKeyMode::LowerSpread;
+    }
+    if (name == "upper_spread") {
+        return TimingColouriseBoundsKeyMode::UpperSpread;
+    }
+    return TimingColouriseBoundsKeyMode::LowerUpper;
+}
+
+std::string TimingColouriseBoundsParameterName(
+    invisible_places::timing::TimingColouriseBoundsParameter parameter) {
+    using invisible_places::timing::TimingColouriseBoundsParameter;
+    switch (parameter) {
+        case TimingColouriseBoundsParameter::Lower:
+            return "lower";
+        case TimingColouriseBoundsParameter::Upper:
+            return "upper";
+        case TimingColouriseBoundsParameter::Centre:
+            return "centre";
+        case TimingColouriseBoundsParameter::Spread:
+            return "spread";
+        case TimingColouriseBoundsParameter::EdgeFade:
+            return "edge_fade";
+    }
+    return "lower";
+}
+
+std::optional<invisible_places::timing::TimingColouriseBoundsParameter>
+ParseTimingColouriseBoundsParameter(const json& parameterJson) {
+    using invisible_places::timing::TimingColouriseBoundsParameter;
+    if (!parameterJson.is_string()) {
+        return std::nullopt;
+    }
+    const auto name = parameterJson.get<std::string>();
+    if (name == "lower") {
+        return TimingColouriseBoundsParameter::Lower;
+    }
+    if (name == "upper") {
+        return TimingColouriseBoundsParameter::Upper;
+    }
+    if (name == "centre" || name == "center") {
+        return TimingColouriseBoundsParameter::Centre;
+    }
+    if (name == "spread" || name == "spacing") {
+        return TimingColouriseBoundsParameter::Spread;
+    }
+    if (name == "edge_fade") {
+        return TimingColouriseBoundsParameter::EdgeFade;
+    }
+    return std::nullopt;
+}
+
+json SerializeTimingColouriseEffect(
+    const invisible_places::timing::TimingColouriseEffect& effect) {
+    const auto sanitized =
+        invisible_places::timing::SanitizeTimingColouriseEffect(effect);
+    json paletteKeysJson = json::array();
+    for (const auto& key : sanitized.paletteKeys) {
+        paletteKeysJson.push_back({
+            {"position", key.position},
+            {"interpolation",
+             WaterScenarioInterpolationName(key.interpolation)},
+            {"palette", SerializeTimingColourisePalette(key.palette)},
+        });
+    }
+    json boundsKeysJson = json::array();
+    for (const auto& key : sanitized.boundsKeys) {
+        boundsKeysJson.push_back({
+            {"position", key.position},
+            {"interpolation",
+             WaterScenarioInterpolationName(key.interpolation)},
+            {"bounds", SerializeTimingColouriseBounds(key.bounds)},
+        });
+    }
+    json boundsParameterKeysJson = json::array();
+    for (const auto& key : sanitized.boundsParameterKeys) {
+        boundsParameterKeysJson.push_back({
+            {"parameter",
+             TimingColouriseBoundsParameterName(key.parameter)},
+            {"position", key.position},
+            {"value", key.value},
+            {"interpolation",
+             WaterScenarioInterpolationName(key.interpolation)},
+        });
+    }
+    return {
+        {"id", sanitized.id},
+        {"name", sanitized.name},
+        {"enabled", sanitized.enabled},
+        {"field",
+         {
+             {"source",
+              TimingColouriseFieldSourceName(sanitized.field.source)},
+             {"scalar_field_name", sanitized.field.scalarFieldName},
+         }},
+        {"base_palette",
+         SerializeTimingColourisePalette(sanitized.basePalette)},
+        {"base_bounds",
+         SerializeTimingColouriseBounds(sanitized.baseBounds)},
+        {"palette_keys", std::move(paletteKeysJson)},
+        {"bounds_key_mode",
+         TimingColouriseBoundsKeyModeName(sanitized.boundsKeyMode)},
+        {"bounds_parameter_keys", std::move(boundsParameterKeysJson)},
+        {"bounds_keys", std::move(boundsKeysJson)},
+    };
+}
+
+invisible_places::timing::TimingColouriseEffect
+ParseTimingColouriseEffect(const json& effectJson) {
+    invisible_places::timing::TimingColouriseEffect effect;
+    effect.id = effectJson.value("id", std::string{});
+    effect.name = effectJson.value("name", effect.name);
+    effect.enabled = effectJson.value("enabled", effect.enabled);
+    if (effectJson.contains("field") && effectJson.at("field").is_object()) {
+        const auto& fieldJson = effectJson.at("field");
+        if (fieldJson.contains("source")) {
+            effect.field.source =
+                ParseTimingColouriseFieldSource(fieldJson.at("source"));
+        }
+        effect.field.scalarFieldName =
+            fieldJson.value("scalar_field_name", std::string{});
+    }
+    if (effectJson.contains("base_palette")) {
+        effect.basePalette =
+            ParseTimingColourisePalette(effectJson.at("base_palette"));
+    }
+    if (effectJson.contains("base_bounds")) {
+        effect.baseBounds =
+            ParseTimingColouriseBounds(effectJson.at("base_bounds"));
+    }
+    if (effectJson.contains("bounds_key_mode")) {
+        effect.boundsKeyMode = ParseTimingColouriseBoundsKeyMode(
+            effectJson.at("bounds_key_mode"));
+    }
+    if (effectJson.contains("palette_keys") &&
+        effectJson.at("palette_keys").is_array()) {
+        for (const auto& keyJson : effectJson.at("palette_keys")) {
+            invisible_places::timing::TimingColourisePaletteKey key;
+            key.position = keyJson.value("position", key.position);
+            if (keyJson.contains("interpolation")) {
+                key.interpolation = ParseWaterScenarioInterpolation(
+                    keyJson.at("interpolation"));
+            }
+            if (keyJson.contains("palette")) {
+                key.palette =
+                    ParseTimingColourisePalette(keyJson.at("palette"));
+            }
+            effect.paletteKeys.push_back(std::move(key));
+        }
+    }
+    if (effectJson.contains("bounds_parameter_keys") &&
+        effectJson.at("bounds_parameter_keys").is_array()) {
+        for (const auto& keyJson :
+             effectJson.at("bounds_parameter_keys")) {
+            const auto parameter = keyJson.contains("parameter")
+                                       ? ParseTimingColouriseBoundsParameter(
+                                             keyJson.at("parameter"))
+                                       : std::nullopt;
+            if (!parameter.has_value()) {
+                continue;
+            }
+            invisible_places::timing::TimingColouriseBoundsParameterKey key;
+            key.parameter = parameter.value();
+            key.position = keyJson.value("position", key.position);
+            key.value = keyJson.value("value", key.value);
+            if (keyJson.contains("interpolation")) {
+                key.interpolation = ParseWaterScenarioInterpolation(
+                    keyJson.at("interpolation"));
+            }
+            effect.boundsParameterKeys.push_back(std::move(key));
+        }
+    }
+    if (effectJson.contains("bounds_keys") &&
+        effectJson.at("bounds_keys").is_array()) {
+        for (const auto& keyJson : effectJson.at("bounds_keys")) {
+            invisible_places::timing::TimingColouriseBoundsKey key;
+            key.position = keyJson.value("position", key.position);
+            if (keyJson.contains("interpolation")) {
+                key.interpolation = ParseWaterScenarioInterpolation(
+                    keyJson.at("interpolation"));
+            }
+            if (keyJson.contains("bounds")) {
+                key.bounds =
+                    ParseTimingColouriseBounds(keyJson.at("bounds"));
+            }
+            effect.boundsKeys.push_back(std::move(key));
+        }
+    }
+    return invisible_places::timing::SanitizeTimingColouriseEffect(
+        std::move(effect));
+}
+
+json SerializeTimingTakeDefinition(
+    const invisible_places::timing::TimingTakeDefinition& definition) {
+    const auto sanitized =
+        invisible_places::timing::SanitizeTimingTakeDefinition(definition);
+    return {
+        {"id", sanitized.id},
+        {"name", sanitized.name},
+    };
+}
+
+invisible_places::timing::TimingTakeDefinition
+ParseTimingTakeDefinition(const json& definitionJson) {
+    return invisible_places::timing::SanitizeTimingTakeDefinition({
+        .id = definitionJson.value("id", std::string{}),
+        .name =
+            definitionJson.value("name", std::string{"Timing Take"}),
+    });
+}
+
+json SerializeTimingTakeSceneState(
+    const invisible_places::timing::TimingTakeSceneState& state) {
+    const auto sanitized =
+        invisible_places::timing::SanitizeTimingTakeSceneState(state);
+    json runsJson = json::array();
+    for (const auto& run : sanitized.waterFeatureTimingRuns) {
+        runsJson.push_back(SerializeWaterFeatureTimingRun(run));
+    }
+    json effectsJson = json::array();
+    for (const auto& effect : sanitized.colouriseEffects) {
+        effectsJson.push_back(SerializeTimingColouriseEffect(effect));
+    }
+    return {
+        {"take_id", sanitized.takeId},
+        {"scene_group", sanitized.sceneGroupName},
+        {"water_feature_timing_runs", std::move(runsJson)},
+        {"water_feature_timing_run_sequence",
+         sanitized.waterFeatureTimingRunSequence},
+        {"colourise_effects", std::move(effectsJson)},
+        {"colourise_effect_sequence", sanitized.colouriseEffectSequence},
+    };
+}
+
+invisible_places::timing::TimingTakeSceneState
+ParseTimingTakeSceneState(const json& stateJson) {
+    invisible_places::timing::TimingTakeSceneState state;
+    state.takeId = stateJson.value("take_id", state.takeId);
+    state.sceneGroupName =
+        stateJson.value("scene_group", state.sceneGroupName);
+    state.waterFeatureTimingRunSequence = stateJson.value(
+        "water_feature_timing_run_sequence",
+        state.waterFeatureTimingRunSequence);
+    state.colouriseEffectSequence = stateJson.value(
+        "colourise_effect_sequence",
+        state.colouriseEffectSequence);
+    if (stateJson.contains("water_feature_timing_runs") &&
+        stateJson.at("water_feature_timing_runs").is_array()) {
+        for (const auto& runJson :
+             stateJson.at("water_feature_timing_runs")) {
+            state.waterFeatureTimingRuns.push_back(
+                ParseWaterFeatureTimingRun(runJson));
+        }
+    }
+    if (stateJson.contains("colourise_effects") &&
+        stateJson.at("colourise_effects").is_array()) {
+        for (const auto& effectJson :
+             stateJson.at("colourise_effects")) {
+            state.colouriseEffects.push_back(
+                ParseTimingColouriseEffect(effectJson));
+        }
+    }
+    return invisible_places::timing::SanitizeTimingTakeSceneState(
+        std::move(state));
+}
+
+json SerializeTimingColourisePaletteDefinition(
+    const invisible_places::timing::TimingColourisePaletteDefinition&
+        definition) {
+    const auto sanitized =
+        invisible_places::timing::
+            SanitizeTimingColourisePaletteDefinition(definition);
+    return {
+        {"id", sanitized.id},
+        {"name", sanitized.name},
+        {"palette", SerializeTimingColourisePalette(sanitized.palette)},
+    };
+}
+
+invisible_places::timing::TimingColourisePaletteDefinition
+ParseTimingColourisePaletteDefinition(const json& definitionJson) {
+    invisible_places::timing::TimingColourisePaletteDefinition definition;
+    definition.id = definitionJson.value("id", std::string{});
+    definition.name =
+        definitionJson.value("name", definition.name);
+    if (definitionJson.contains("palette")) {
+        definition.palette =
+            ParseTimingColourisePalette(definitionJson.at("palette"));
+    }
+    return invisible_places::timing::
+        SanitizeTimingColourisePaletteDefinition(std::move(definition));
+}
+
 json SerializeWaterTimingRun(const invisible_places::water::WaterTimingRun& run) {
     json runJson{
         {"id", run.id},
@@ -3816,6 +4238,9 @@ json SerializeWaterSeepageNode(const WaterSeepageNode& node) {
         {"depth_tolerance_meters", node.depthToleranceMeters},
         {"normal_alignment", node.normalAlignment},
         {"strength", node.strength},
+        {"rain_delay_seconds", node.rainDelaySeconds},
+        {"rain_rise_seconds", node.rainRiseSeconds},
+        {"rain_recession_seconds", node.rainRecessionSeconds},
         {"seed", node.seed},
         {"enabled_in_viewport", node.enabledInViewport},
         {"enabled_in_export", node.enabledInExport},
@@ -3878,6 +4303,20 @@ WaterSeepageNode ParseWaterSeepageNode(const json& nodeJson) {
         nodeJson.value("depth_tolerance_meters", node.depthToleranceMeters);
     node.normalAlignment = nodeJson.value("normal_alignment", node.normalAlignment);
     node.strength = nodeJson.value("strength", node.strength);
+    node.rainDelaySeconds = std::clamp(
+        nodeJson.value("rain_delay_seconds", node.rainDelaySeconds),
+        0.0F,
+        86'400.0F);
+    node.rainRiseSeconds = std::clamp(
+        nodeJson.value("rain_rise_seconds", node.rainRiseSeconds),
+        0.0F,
+        86'400.0F);
+    node.rainRecessionSeconds = std::clamp(
+        nodeJson.value(
+            "rain_recession_seconds",
+            node.rainRecessionSeconds),
+        0.0F,
+        86'400.0F);
     node.seed = nodeJson.value("seed", node.seed);
     node.enabledInViewport = nodeJson.value("enabled_in_viewport", node.enabledInViewport);
     node.enabledInExport = nodeJson.value("enabled_in_export", node.enabledInExport);
@@ -4478,6 +4917,12 @@ json SerializeWaterDynamicMeshFlowSettings(WaterDynamicMeshFlowSettings settings
         {"history_length", settings.historyLength},
         {"dry_concavity_focus", settings.dryConcavityFocus},
         {"edge_coverage", settings.edgeCoverage},
+        {"activity", settings.activity},
+        {"rain_gain", settings.rainGain},
+        {"moisture_persistence_multiplier",
+         settings.moisturePersistenceMultiplier},
+        {"rain_rise_seconds", settings.rainRiseSeconds},
+        {"rain_recession_seconds", settings.rainRecessionSeconds},
         {"surface_surge", settings.surfaceSurge},
         {"rain_spawn_spread", settings.rainSpawnSpread},
         {"rain_distributed_source_fraction", settings.rainDistributedSourceFraction},
@@ -4589,6 +5034,21 @@ WaterDynamicMeshFlowSettings ParseWaterDynamicMeshFlowSettings(const json& setti
         settingsJson.value("edge_coverage", settings.edgeCoverage),
         0.0F,
         1.0F);
+    settings.activity = settingsJson.value(
+        "activity",
+        settings.activity);
+    settings.rainGain = settingsJson.value(
+        "rain_gain",
+        settings.rainGain);
+    settings.moisturePersistenceMultiplier = settingsJson.value(
+        "moisture_persistence_multiplier",
+        settings.moisturePersistenceMultiplier);
+    settings.rainRiseSeconds = settingsJson.value(
+        "rain_rise_seconds",
+        settings.rainRiseSeconds);
+    settings.rainRecessionSeconds = settingsJson.value(
+        "rain_recession_seconds",
+        settings.rainRecessionSeconds);
     settings.surfaceSurge = std::clamp(
         settingsJson.value("surface_surge", settings.surfaceSurge),
         0.0F,
@@ -6480,6 +6940,199 @@ std::string ResolveActiveWaterSceneGroupName(const ProjectDocument& document) {
     return "Default";
 }
 
+void MigrateAndSanitizeTimingTakeData(
+    ProjectDocument* document,
+    bool hasNativeTimingTakes,
+    bool hasNativeTimingTakeStates,
+    bool hasLegacyWaterScenarios) {
+    if (document == nullptr) {
+        return;
+    }
+
+    std::vector<invisible_places::timing::TimingTakeDefinition> takes;
+    takes.push_back(
+        invisible_places::timing::AuthoredTimingTakeDefinition());
+    const auto appendTake =
+        [&](invisible_places::timing::TimingTakeDefinition take) {
+            take = invisible_places::timing::SanitizeTimingTakeDefinition(
+                std::move(take));
+            const bool duplicate = std::any_of(
+                takes.begin(),
+                takes.end(),
+                [&](const auto& existing) {
+                    return existing.id == take.id;
+                });
+            if (!duplicate) {
+                takes.push_back(std::move(take));
+            }
+        };
+    for (const auto& take : document->timingTakes) {
+        appendTake(take);
+    }
+    if (!hasNativeTimingTakes && hasLegacyWaterScenarios) {
+        for (const auto& scenario : document->waterScenarios) {
+            if (scenario.id.empty()) {
+                continue;
+            }
+            appendTake({
+                .id = scenario.id,
+                .name =
+                    scenario.name.empty() ? scenario.id : scenario.name,
+            });
+        }
+    }
+
+    document->selectedTimingTakeId =
+        invisible_places::timing::NormalizeTimingTakeId(
+            document->selectedTimingTakeId);
+    if (std::none_of(
+            takes.begin(),
+            takes.end(),
+            [&](const auto& take) {
+                return take.id == document->selectedTimingTakeId;
+            })) {
+        std::string name = document->selectedTimingTakeId;
+        const auto legacyScenario = std::find_if(
+            document->waterScenarios.begin(),
+            document->waterScenarios.end(),
+            [&](const auto& scenario) {
+                return scenario.id == document->selectedTimingTakeId;
+            });
+        if (legacyScenario != document->waterScenarios.end() &&
+            !legacyScenario->name.empty()) {
+            name = legacyScenario->name;
+        }
+        appendTake({
+            .id = document->selectedTimingTakeId,
+            .name = std::move(name),
+        });
+    }
+    document->timingTakes = std::move(takes);
+
+    std::vector<invisible_places::timing::TimingTakeSceneState>
+        compoundStates;
+    const auto mergeState =
+        [&](invisible_places::timing::TimingTakeSceneState state) {
+            state =
+                invisible_places::timing::SanitizeTimingTakeSceneState(
+                    std::move(state));
+            auto* existing =
+                invisible_places::timing::FindTimingTakeSceneState(
+                    &compoundStates,
+                    state.takeId,
+                    state.sceneGroupName);
+            if (existing == nullptr) {
+                compoundStates.push_back(std::move(state));
+                return;
+            }
+            existing->waterFeatureTimingRuns.insert(
+                existing->waterFeatureTimingRuns.end(),
+                std::make_move_iterator(
+                    state.waterFeatureTimingRuns.begin()),
+                std::make_move_iterator(
+                    state.waterFeatureTimingRuns.end()));
+            const auto availableEffects =
+                invisible_places::timing::kMaximumTimingColouriseEffects -
+                std::min(
+                    invisible_places::timing::
+                        kMaximumTimingColouriseEffects,
+                    existing->colouriseEffects.size());
+            const auto effectCount =
+                std::min(availableEffects, state.colouriseEffects.size());
+            existing->colouriseEffects.insert(
+                existing->colouriseEffects.end(),
+                std::make_move_iterator(
+                    state.colouriseEffects.begin()),
+                std::make_move_iterator(
+                    state.colouriseEffects.begin() +
+                    static_cast<std::ptrdiff_t>(effectCount)));
+            existing->waterFeatureTimingRunSequence = std::max(
+                existing->waterFeatureTimingRunSequence,
+                state.waterFeatureTimingRunSequence);
+            existing->colouriseEffectSequence = std::max(
+                existing->colouriseEffectSequence,
+                state.colouriseEffectSequence);
+        };
+    for (auto& state : document->timingTakeStates) {
+        mergeState(std::move(state));
+    }
+    if (!hasNativeTimingTakeStates) {
+        const auto sceneGroupName =
+            ResolveActiveWaterSceneGroupName(*document);
+        for (const auto& legacy : document->waterFeatureTimingRuns) {
+            invisible_places::timing::TimingTakeSceneState state;
+            state.takeId =
+                invisible_places::timing::NormalizeTimingTakeId(
+                    legacy.scenarioId);
+            state.sceneGroupName = sceneGroupName;
+            state.waterFeatureTimingRuns = legacy.runs;
+            state.waterFeatureTimingRunSequence =
+                document->waterFeatureTimingRunSequence;
+            mergeState(std::move(state));
+        }
+    }
+
+    for (auto& state : compoundStates) {
+        std::vector<std::string> effectIds;
+        effectIds.reserve(state.colouriseEffects.size());
+        for (auto& effect : state.colouriseEffects) {
+            if (effect.id.empty() ||
+                std::find(
+                    effectIds.begin(),
+                    effectIds.end(),
+                    effect.id) != effectIds.end()) {
+                effect.id =
+                    invisible_places::timing::
+                        AllocateTimingColouriseEffectId(
+                            state.colouriseEffects,
+                            &state.colouriseEffectSequence);
+            }
+            effectIds.push_back(effect.id);
+        }
+        if (std::none_of(
+                document->timingTakes.begin(),
+                document->timingTakes.end(),
+                [&](const auto& take) {
+                    return take.id == state.takeId;
+                })) {
+            document->timingTakes.push_back({
+                .id = state.takeId,
+                .name = state.takeId,
+            });
+        }
+    }
+    document->timingTakeStates = std::move(compoundStates);
+
+    std::vector<
+        invisible_places::timing::TimingColourisePaletteDefinition>
+        palettes;
+    palettes.reserve(document->timingColourisePalettes.size());
+    for (auto palette : document->timingColourisePalettes) {
+        palette = invisible_places::timing::
+            SanitizeTimingColourisePaletteDefinition(std::move(palette));
+        const bool duplicate = std::any_of(
+            palettes.begin(),
+            palettes.end(),
+            [&](const auto& existing) {
+                return !palette.id.empty() &&
+                       existing.id == palette.id;
+            });
+        if (palette.id.empty() || duplicate) {
+            palette.id =
+                invisible_places::timing::
+                    AllocateTimingColourisePaletteId(
+                        palettes,
+                        &document->timingColourisePaletteSequence);
+        }
+        palettes.push_back(std::move(palette));
+    }
+    document->timingColourisePalettes = std::move(palettes);
+    document->timingTakeSequence =
+        std::max(1U, document->timingTakeSequence);
+    document->timingColourisePaletteSequence =
+        std::max(1U, document->timingColourisePaletteSequence);
+}
+
 const WaterSceneStateDocument* FindActiveWaterSceneState(
     const ProjectDocument& document) {
     const auto sceneGroupName = ResolveActiveWaterSceneGroupName(document);
@@ -6760,6 +7413,15 @@ bool SaveProjectDocument(
         {"water_feature_timing_runs", json::array()},
         {"water_feature_timing_run_sequence",
          document.waterFeatureTimingRunSequence},
+        {"timing_takes", json::array()},
+        {"selected_timing_take_id",
+         invisible_places::timing::NormalizeTimingTakeId(
+             document.selectedTimingTakeId)},
+        {"timing_take_states", json::array()},
+        {"timing_colourise_palettes", json::array()},
+        {"timing_take_sequence", document.timingTakeSequence},
+        {"timing_colourise_palette_sequence",
+         document.timingColourisePaletteSequence},
         {"water_flow_trail_settings", SerializeWaterFlowTrailSettings(document.waterFlowTrailSettings)},
         {"water_show_flow_trails", document.waterShowFlowTrails},
         {"water_field_settings", SerializeWaterFieldSettings(document.waterFieldSettings)},
@@ -6848,6 +7510,18 @@ bool SaveProjectDocument(
         projectJson["water_feature_timing_runs"].push_back(
             SerializeWaterScenarioFeatureRuns(entry));
     }
+    for (const auto& take : document.timingTakes) {
+        projectJson["timing_takes"].push_back(
+            SerializeTimingTakeDefinition(take));
+    }
+    for (const auto& state : document.timingTakeStates) {
+        projectJson["timing_take_states"].push_back(
+            SerializeTimingTakeSceneState(state));
+    }
+    for (const auto& palette : document.timingColourisePalettes) {
+        projectJson["timing_colourise_palettes"].push_back(
+            SerializeTimingColourisePaletteDefinition(palette));
+    }
     if (document.tempWaterScenario.has_value()) {
         projectJson["temp_water_scenario"] =
             SerializeWaterScenarioDefinition(document.tempWaterScenario.value());
@@ -6913,6 +7587,15 @@ std::optional<ProjectDocument> LoadProjectDocument(
 
     ProjectDocument document;
     document.schemaVersion = projectJson->value("schema_version", 1U);
+    const bool hasNativeTimingTakes =
+        projectJson->contains("timing_takes") &&
+        projectJson->at("timing_takes").is_array();
+    const bool hasNativeTimingTakeStates =
+        projectJson->contains("timing_take_states") &&
+        projectJson->at("timing_take_states").is_array();
+    const bool hasLegacyWaterScenarios =
+        projectJson->contains("water_scenarios") &&
+        projectJson->at("water_scenarios").is_array();
     const bool defaultManualSurfaceGuide =
         document.schemaVersion >= kManualFlowSurfaceGuideProjectSchemaVersion;
     document.projectName = projectJson->value("project_name", std::string{"Invisible Places"});
@@ -7077,6 +7760,39 @@ std::optional<ProjectDocument> LoadProjectDocument(
     document.waterFeatureTimingRunSequence = projectJson->value(
         "water_feature_timing_run_sequence",
         document.waterFeatureTimingRunSequence);
+    if (hasNativeTimingTakes) {
+        document.timingTakes.clear();
+        for (const auto& takeJson : projectJson->at("timing_takes")) {
+            document.timingTakes.push_back(
+                ParseTimingTakeDefinition(takeJson));
+        }
+    }
+    document.selectedTimingTakeId =
+        invisible_places::timing::NormalizeTimingTakeId(
+            projectJson->value(
+                "selected_timing_take_id",
+                document.selectedWaterScenarioId));
+    if (hasNativeTimingTakeStates) {
+        for (const auto& stateJson :
+             projectJson->at("timing_take_states")) {
+            document.timingTakeStates.push_back(
+                ParseTimingTakeSceneState(stateJson));
+        }
+    }
+    if (projectJson->contains("timing_colourise_palettes") &&
+        projectJson->at("timing_colourise_palettes").is_array()) {
+        for (const auto& paletteJson :
+             projectJson->at("timing_colourise_palettes")) {
+            document.timingColourisePalettes.push_back(
+                ParseTimingColourisePaletteDefinition(paletteJson));
+        }
+    }
+    document.timingTakeSequence = projectJson->value(
+        "timing_take_sequence",
+        document.timingTakeSequence);
+    document.timingColourisePaletteSequence = projectJson->value(
+        "timing_colourise_palette_sequence",
+        document.timingColourisePaletteSequence);
     if (projectJson->contains("temp_water_scenario")) {
         document.tempWaterScenario =
             ParseWaterScenarioDefinition(projectJson->at("temp_water_scenario"));
@@ -7429,6 +8145,11 @@ std::optional<ProjectDocument> LoadProjectDocument(
     if (!document.waterSceneStates.empty()) {
         ApplyActiveWaterSceneState(&document);
     }
+    MigrateAndSanitizeTimingTakeData(
+        &document,
+        hasNativeTimingTakes,
+        hasNativeTimingTakeStates,
+        hasLegacyWaterScenarios);
     if (document.schemaVersion < kProjectDocumentSchemaVersion) {
         document.schemaVersion = kProjectDocumentSchemaVersion;
     }

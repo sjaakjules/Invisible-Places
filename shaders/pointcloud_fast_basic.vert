@@ -10,6 +10,7 @@ layout(location = 2) flat out uint outPointIndex;
 layout(location = 3) out vec3 outWorldPosition;
 layout(location = 4) out vec3 outPointNormal;
 layout(location = 5) out float outFlowCoverage;
+layout(location = 6) flat out vec4 outTimingColourise[5];
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 viewProjection;
@@ -96,11 +97,17 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 rainImpactVegetation1;
     vec4 rainImpactSandBand;
     vec4 rainImpactResponse;
+    uvec4 timingColouriseControl;
+    uvec4 timingColouriseSources[5];
+    vec4 timingColouriseRanges[5];
+    vec4 timingColouriseLut[320];
 } styleData;
 
 #include "pointcloud_sparse_ripple.glsl"
 #include "pointcloud_rain_impact.glsl"
 #include "pointcloud_mesh_flow_contact.glsl"
+#define POINTCLOUD_TIMING_COLOURISE_VERTEX
+#include "pointcloud_timing_colourise.glsl"
 
 const uint kWaterTrailRoleFieldSlot = 0u;
 const uint kWaterTrailSeedFieldSlot = 5u;
@@ -426,4 +433,5 @@ void main() {
     outFlowCoverage = WaterTrailOverlayEnabled()
         ? waterTrailVisibility * WaterFlowAppearanceScale()
         : 1.0;
+    ResolveTimingColouriseStack(pointIndex, outTimingColourise);
 }

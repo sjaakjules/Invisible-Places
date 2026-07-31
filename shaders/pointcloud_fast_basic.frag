@@ -7,6 +7,7 @@ layout(location = 2) flat in uint inPointIndex;
 layout(location = 3) in vec3 inWorldPosition;
 layout(location = 4) in vec3 inPointNormal;
 layout(location = 5) in float inFlowCoverage;
+layout(location = 6) flat in vec4 inTimingColourise[5];
 
 layout(location = 0) out vec4 outColor;
 
@@ -92,6 +93,8 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
 #include "pointcloud_sparse_ripple.glsl"
 #include "pointcloud_rain_impact.glsl"
 #include "pointcloud_mesh_flow_contact.glsl"
+#define POINTCLOUD_TIMING_COLOURISE_FRAGMENT
+#include "pointcloud_timing_colourise.glsl"
 
 const uint kFieldMapFlagClamp = 1u;
 const uint kFieldMapFlagInvert = 2u;
@@ -316,6 +319,7 @@ vec3 ResolveBaseColor() {
             styleData.gradientEndColor.rgb);
     }
     baseColor = ApplyColorize(baseColor);
+    baseColor = ApplyTimingColouriseStack(baseColor);
     float previewTint = 0.0;
     const float caustic = ResolveCausticStrength(previewTint);
     const float waterEffectScale = ResolveRippleEffectScale();
