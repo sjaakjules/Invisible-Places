@@ -1043,6 +1043,13 @@ bool AddAnimationFileToRegistry(
 void RefreshAnimationFileList(
     AnimationPanelState* panelState,
     const std::filesystem::path& animationDirectory);
+std::optional<std::size_t> FindAnimationRegistryIndex(
+    const AnimationPanelState& panelState,
+    const std::filesystem::path& path);
+bool LoadAnimationPathFromFile(
+    PreviewRuntimeState* runtimeState,
+    const std::filesystem::path& inputPath);
+void ApplyAnimationScrub(PreviewRuntimeState* runtimeState);
 std::string NormalizeMotionScalarFieldName(std::string_view name);
 bool SessionHasWaterEffectCompositionFields(const PreviewLayerSession& session);
 bool ApplyWaterEffectCompositionFieldsToSession(
@@ -20692,6 +20699,15 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
     document.cameraPathShotIndices = runtimeState.cameraPanel.pathShotIndices;
     document.cameraPathDurationFrames = runtimeState.cameraPanel.pathDurationFrames;
     document.lastAnimationPath = runtimeState.animationPanel.currentFilePath;
+    if (runtimeState.animationPanel.currentPath.has_value() &&
+        !runtimeState.animationPanel.currentFilePath.empty()) {
+        document.activeAnimationPath =
+            runtimeState.animationPanel.currentFilePath;
+        document.activeAnimationPosition = std::clamp(
+            runtimeState.animationPanel.scrubAmount,
+            0.0F,
+            1.0F);
+    }
     document.hasSavedAnimationRegistry = true;
     for (std::size_t index = 0; index < runtimeState.animationPanel.availableFiles.size(); ++index) {
         auto associatedLayerPaths =
@@ -20934,8 +20950,10 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
     document.waterRippleRuntimeCaches = CurrentWaterRippleRuntimeCachesForDocument(runtimeState);
 
     if (runtimeState.selectedSessionIndex.has_value()) {
-        document.selectedLayerPath =
-            runtimeState.sessions[runtimeState.selectedSessionIndex.value()].sourcePath;
+        const auto& selectedSession =
+            runtimeState.sessions[runtimeState.selectedSessionIndex.value()];
+        document.selectedLayerPath = selectedSession.sourcePath;
+        document.activeSceneGroupName = selectedSession.sceneGroupName;
     }
 
     document.scenePointCloudGroups.reserve(runtimeState.pointCloudScenes.size());
@@ -21022,6 +21040,51 @@ std::optional<std::size_t> FindSessionIndexBySourcePath(
     }
 
     return std::nullopt;
+}
+
+std::optional<std::size_t> FindSessionIndexForSceneGroup(
+    const PreviewRuntimeState& runtimeState,
+    std::string_view sceneGroupName) {
+    if (sceneGroupName.empty()) {
+        return std::nullopt;
+    }
+
+    const auto sceneIt = std::find_if(
+        runtimeState.pointCloudScenes.begin(),
+        runtimeState.pointCloudScenes.end(),
+        [&](const ScenePointCloudRuntime& scene) {
+            return scene.sceneGroupName == sceneGroupName;
+        });
+    if (sceneIt != runtimeState.pointCloudScenes.end()) {
+        for (const auto sessionIndex :
+             sceneIt->committedDisplaySessionIndices) {
+            if (sessionIndex.has_value() &&
+                sessionIndex.value() < runtimeState.sessions.size()) {
+                return sessionIndex;
+            }
+        }
+        for (const auto sessionIndex : sceneIt->analysisSessionIndices) {
+            if (sessionIndex.has_value() &&
+                sessionIndex.value() < runtimeState.sessions.size()) {
+                return sessionIndex;
+            }
+        }
+    }
+
+    const auto sessionIt = std::find_if(
+        runtimeState.sessions.begin(),
+        runtimeState.sessions.end(),
+        [&](const PreviewLayerSession& session) {
+            return session.sceneGroupName == sceneGroupName &&
+                   !IsGeneratedWaterOverlaySession(session);
+        });
+    return sessionIt == runtimeState.sessions.end()
+               ? std::nullopt
+               : std::optional<std::size_t>{
+                     static_cast<std::size_t>(
+                         std::distance(
+                             runtimeState.sessions.begin(),
+                             sessionIt))};
 }
 
 void StartQueuedLayerLoadIfIdle(PreviewRuntimeState* runtimeState) {
@@ -21554,6 +21617,17 @@ bool ApplyProjectDocumentToRuntime(
         return false;
     }
 
+    // Project application is a full context switch. Clear the previous
+    // animation before water/profile state is synchronized, then restore the
+    // persisted animation only after its project-owned libraries are ready.
+    runtimeState->animationPlayback.active = false;
+    runtimeState->animationPanel.currentPath.reset();
+    runtimeState->animationPanel.currentFilePath.clear();
+    runtimeState->animationPanel.selectedFileIndex.reset();
+    runtimeState->animationPanel.selectedKeyIndex.reset();
+    runtimeState->animationPanel.scrubAmount = 0.0F;
+    runtimeState->animationPanel.dirty = false;
+
     CancelWaterFlowTrailBuildJob(&runtimeState->water);
     runtimeState->water.flowTrailSourceRequests.clear();
     runtimeState->water.flowTrailSourceArtifacts.clear();
@@ -21933,7 +22007,6 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->cameraPanel.selectedPathItemIndex.reset();
     runtimeState->cameraPanel.pathDurationFrames =
         std::max<std::uint32_t>(1U, document.cameraPathDurationFrames);
-    runtimeState->animationPanel.currentFilePath = document.lastAnimationPath.string();
     runtimeState->animationPanel.availableFiles.clear();
     runtimeState->animationPanel.availableFileAssociatedLayerPaths.clear();
     runtimeState->animationPanel.availableFileLoadedPaths.clear();
@@ -22078,9 +22151,28 @@ bool ApplyProjectDocumentToRuntime(
         runtimeState,
         viewport);
 
-    runtimeState->selectedSessionIndex.reset();
-    if (!document.selectedLayerPath.empty()) {
-        runtimeState->selectedSessionIndex = FindSessionIndexBySourcePath(*runtimeState, document.selectedLayerPath);
+    const auto selectedLayerIndex =
+        document.selectedLayerPath.empty()
+            ? std::nullopt
+            : FindSessionIndexBySourcePath(
+                  *runtimeState,
+                  document.selectedLayerPath);
+    runtimeState->selectedSessionIndex = selectedLayerIndex;
+    // Prefer the precise saved layer when it still belongs to the active
+    // scene. The stable group identity repairs selection after a density or
+    // source-file replacement makes that path obsolete.
+    if (!document.activeSceneGroupName.empty() &&
+        (!runtimeState->selectedSessionIndex.has_value() ||
+         runtimeState->sessions[
+             runtimeState->selectedSessionIndex.value()]
+                 .sceneGroupName != document.activeSceneGroupName)) {
+        if (const auto activeSceneIndex =
+                FindSessionIndexForSceneGroup(
+                    *runtimeState,
+                    document.activeSceneGroupName);
+            activeSceneIndex.has_value()) {
+            runtimeState->selectedSessionIndex = activeSceneIndex;
+        }
     }
 
     if (runtimeState->selectedSessionIndex.has_value()) {
@@ -22103,6 +22195,39 @@ bool ApplyProjectDocumentToRuntime(
         viewport,
         &restoredRippleMemberships,
         &restoredRippleRegions);
+    bool restoredActiveAnimation = false;
+    std::string activeAnimationRestoreError;
+    if (!document.activeAnimationPath.empty()) {
+        if (LoadAnimationPathFromFile(
+                runtimeState,
+                document.activeAnimationPath)) {
+            restoredActiveAnimation = true;
+            runtimeState->animationPanel.scrubAmount =
+                std::clamp(
+                    document.activeAnimationPosition,
+                    0.0F,
+                    1.0F);
+            ApplyAnimationScrub(runtimeState);
+            runtimeState->animationPanel.selectedFileIndex =
+                FindAnimationRegistryIndex(
+                    runtimeState->animationPanel,
+                    document.activeAnimationPath);
+            if (requestedLoadedLayer &&
+                VisibleLayerCount(*runtimeState) == 0) {
+                runtimeState->preserveProjectCameraOnNextLayerActivation =
+                    true;
+            }
+        } else {
+            activeAnimationRestoreError =
+                runtimeState->errorMessage.empty()
+                    ? "The saved active animation could not be loaded."
+                    : runtimeState->errorMessage;
+            runtimeState->animationPanel.currentPath.reset();
+            runtimeState->animationPanel.currentFilePath.clear();
+            runtimeState->animationPanel.selectedFileIndex.reset();
+            runtimeState->animationPanel.selectedKeyIndex.reset();
+        }
+    }
     runtimeState->statusMessage =
         "Loaded project with " + FormatPointCount(document.layers.size()) + " layer settings.";
     if (restoredRippleSessions > 0U) {
@@ -22110,8 +22235,19 @@ bool ApplyProjectDocumentToRuntime(
             " Restored cached Ripple membership: " + FormatPointCount(restoredRippleMemberships) +
             " points across " + FormatPointCount(restoredRippleRegions) + " params.";
     }
+    if (restoredActiveAnimation) {
+        runtimeState->statusMessage +=
+            " Restored active animation " +
+            document.activeAnimationPath.filename().string() + ".";
+    }
     runtimeState->persistence.projectName = document.projectName;
-    runtimeState->errorMessage.clear();
+    if (activeAnimationRestoreError.empty()) {
+        runtimeState->errorMessage.clear();
+    } else {
+        runtimeState->errorMessage =
+            "The project loaded, but its active animation did not: " +
+            activeAnimationRestoreError;
+    }
     return true;
 }
 

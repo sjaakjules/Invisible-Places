@@ -20,7 +20,7 @@
 namespace invisible_places::serialization {
 
 inline constexpr std::size_t kMaxSerializedWaterRippleRuntimeCacheMemberships = 250'000U;
-inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 50U;
+inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 51U;
 inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 20U;
 inline constexpr std::uint32_t kAnimationDocumentSchemaVersion = 14U;
 inline constexpr std::uint32_t kWaterPathCacheSidecarSchemaVersion = 1U;
@@ -160,6 +160,12 @@ struct ProjectDocument {
     std::vector<SavedAnimation> savedAnimations;
     bool hasSavedAnimationRegistry = false;
     std::filesystem::path selectedLayerPath;
+    // Stable UI resume state. selectedLayerPath remains the precise legacy
+    // selection, while the scene group survives density/source replacement.
+    std::string activeSceneGroupName;
+    std::filesystem::path activeAnimationPath;
+    float activeAnimationPosition = 0.0F;
+    // Kept for reading and rewriting projects from before schema 51.
     std::filesystem::path lastAnimationPath;
     std::array<float, 4> backgroundColor{0.0F, 0.0F, 0.0F, 1.0F};
     bool eyeDomeLightingEnabled = false;

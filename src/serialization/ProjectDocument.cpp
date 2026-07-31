@@ -6907,6 +6907,18 @@ std::string UniqueVisibleSceneGroupName(const ProjectDocument& document) {
                : TrimAsciiWhitespace(visibleGroup->sceneGroupName);
 }
 
+std::string ResolveActiveSceneGroupName(const ProjectDocument& document) {
+    if (auto explicitScene = TrimAsciiWhitespace(document.activeSceneGroupName);
+        !explicitScene.empty()) {
+        return explicitScene;
+    }
+    if (auto selectedScene = SelectedLayerSceneGroupName(document);
+        !selectedScene.empty()) {
+        return selectedScene;
+    }
+    return UniqueVisibleSceneGroupName(document);
+}
+
 std::string ResolveActiveWaterSceneGroupName(const ProjectDocument& document) {
     if (auto explicitScene =
             TrimAsciiWhitespace(document.activeWaterSceneGroupName);
@@ -7360,11 +7372,17 @@ bool SaveProjectDocument(
     std::string* errorMessage) {
     const auto activeWaterSceneGroupName =
         ResolveActiveWaterSceneGroupName(document);
+    const auto activeSceneGroupName =
+        ResolveActiveSceneGroupName(document);
     json projectJson{
         {"schema_version", kProjectDocumentSchemaVersion},
         {"project_name", document.projectName},
         {"active_water_scene_group", activeWaterSceneGroupName},
         {"selected_layer_path", document.selectedLayerPath.generic_string()},
+        {"active_scene_group", activeSceneGroupName},
+        {"active_animation_path", document.activeAnimationPath.generic_string()},
+        {"active_animation_position",
+         std::clamp(document.activeAnimationPosition, 0.0F, 1.0F)},
         {"last_animation_path", document.lastAnimationPath.generic_string()},
         {"background_color", document.backgroundColor},
         {"eye_dome_lighting_enabled", document.eyeDomeLightingEnabled},
@@ -7603,6 +7621,14 @@ std::optional<ProjectDocument> LoadProjectDocument(
         projectJson->value("active_water_scene_group", std::string{}));
     document.selectedLayerPath = projectJson->value("selected_layer_path", std::string{});
     document.lastAnimationPath = projectJson->value("last_animation_path", std::string{});
+    document.activeSceneGroupName = TrimAsciiWhitespace(
+        projectJson->value("active_scene_group", std::string{}));
+    document.activeAnimationPath =
+        projectJson->value("active_animation_path", document.lastAnimationPath.generic_string());
+    document.activeAnimationPosition = std::clamp(
+        projectJson->value("active_animation_position", 0.0F),
+        0.0F,
+        1.0F);
     document.backgroundColor =
         projectJson->value("background_color", std::array<float, 4>{0.0F, 0.0F, 0.0F, 1.0F});
     document.eyeDomeLightingEnabled = projectJson->value("eye_dome_lighting_enabled", false);
@@ -8094,6 +8120,7 @@ std::optional<ProjectDocument> LoadProjectDocument(
     if (document.schemaVersion < 33U) {
         MigrateLegacyScenePointCloudGroups(&document);
     }
+    document.activeSceneGroupName = ResolveActiveSceneGroupName(document);
     if (document.schemaVersion < 30U || document.pointVisuals.empty()) {
         MigrateLegacyLayerPointVisuals(&document);
     } else if (

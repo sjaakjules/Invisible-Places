@@ -206,6 +206,92 @@ TEST_CASE("Current project schema round-trips authoritative scene density groups
         legacyMirror.selectedSceneVariantPath);
 }
 
+TEST_CASE("Project resume state round-trips the active scene and animation",
+          "[project][serialization][resume]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+
+  ProjectDocument document;
+  document.projectName = "resume-state";
+  document.activeSceneGroupName = "Scene3";
+  document.activeAnimationPath =
+      "Saved/animations/Contour build-up.ipanim.json";
+  document.activeAnimationPosition = 0.625F;
+  // The old field remains independent so schema-51 readers prove that the
+  // explicit active-animation field is authoritative.
+  document.lastAnimationPath =
+      "Saved/animations/Previously active.ipanim.json";
+
+  TemporaryProjectFile file{"invisible_places_resume_state_current.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+
+  std::ifstream input{file.path};
+  REQUIRE(input.is_open());
+  const auto savedJson = nlohmann::json::parse(input);
+  CHECK(savedJson.at("active_scene_group") == "Scene3");
+  CHECK(savedJson.at("active_animation_path") ==
+        "Saved/animations/Contour build-up.ipanim.json");
+  CHECK(savedJson.at("active_animation_position") ==
+        Catch::Approx(0.625F));
+
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  CHECK(loaded->activeSceneGroupName == "Scene3");
+  CHECK(loaded->activeAnimationPath ==
+        std::filesystem::path{"Saved/animations/Contour build-up.ipanim.json"});
+  CHECK(loaded->activeAnimationPosition == Catch::Approx(0.625F));
+  CHECK(loaded->lastAnimationPath ==
+        std::filesystem::path{"Saved/animations/Previously active.ipanim.json"});
+}
+
+TEST_CASE("Pre-resume-state projects migrate their last animation and selected scene",
+          "[project][serialization][resume][migration]") {
+  using invisible_places::serialization::LoadProjectDocument;
+
+  const nlohmann::json legacyProject{
+      {"schema_version", 50U},
+      {"selected_layer_path", "Data/Scene2/Scene2-SAND-5mm.ply"},
+      {"last_animation_path", "Saved/animations/Legacy active.ipanim.json"},
+      {"scene_point_cloud_groups",
+       nlohmann::json::array({
+           {{"scene_group", "Scene2"},
+            {"display_spacing_meters", 0.005F},
+            {"display_loaded", true},
+            {"display_visible", true},
+            {"role_sources", nlohmann::json::array()}},
+       })},
+      {"layers",
+       nlohmann::json::array({
+           {{"kind", "point_cloud"},
+            {"source_path", "Data/Scene2/Scene2-SAND-5mm.ply"},
+            {"scene_group", "Scene2"},
+            {"scene_role", "SAND"},
+            {"loaded", true},
+            {"visible", true}},
+       })},
+  };
+
+  TemporaryProjectFile file{"invisible_places_resume_state_schema50.json"};
+  {
+    std::ofstream output{file.path, std::ios::trunc};
+    REQUIRE(output.is_open());
+    output << legacyProject.dump(2);
+  }
+
+  std::string errorMessage;
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  CHECK(loaded->schemaVersion == kProjectDocumentSchemaVersion);
+  CHECK(loaded->activeSceneGroupName == "Scene2");
+  CHECK(loaded->activeAnimationPath ==
+        std::filesystem::path{"Saved/animations/Legacy active.ipanim.json"});
+  CHECK(loaded->activeAnimationPosition == Catch::Approx(0.0F));
+}
+
 TEST_CASE("Shoreline profile libraries round-trip while legacy files retain their authored visual",
           "[project][serialization][water][shoreline][profiles]") {
   using invisible_places::renderer::pointcloud::CalmPointCloudShorelineWaveSettings;
