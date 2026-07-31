@@ -34,6 +34,7 @@
 #include "style/RenderParameterBinding.hpp"
 #include "timing/TimingColourise.hpp"
 #include "timing/TimingColouriseHistogram.hpp"
+#include "timing/TimingColourisePresets.hpp"
 #include "ui/SidePanelState.hpp"
 #include "water/RainSimulation.hpp"
 #include "water/WaterSurfaceCache.hpp"
@@ -537,6 +538,12 @@ struct AnimationPlaybackState {
 };
 
 struct TimingsPanelState {
+    struct ColourisePaletteStopAuthoringState {
+        std::string effectId;
+        std::string stopId;
+        float animationPosition = 0.0F;
+    };
+
     std::optional<std::size_t> selectedRunIndex;
     std::optional<std::size_t> selectedKeyIndex;
     std::optional<std::size_t> renamingRunIndex;
@@ -575,6 +582,11 @@ struct TimingsPanelState {
     std::string timingTakeNameBuffer;
     std::string paletteNameBuffer;
     int selectedSavedPaletteIndex = 0;
+    std::optional<std::size_t> requestedColourisePalettePickerStopIndex;
+    std::optional<ColourisePaletteStopAuthoringState>
+        colourisePalettePicker;
+    std::optional<ColourisePaletteStopAuthoringState>
+        colourisePaletteDrag;
     int paletteInterpolationIndex = 0;
     int boundsInterpolationIndex = 0;
     TimingColouriseHistogramHandle activeHistogramHandle =
@@ -47129,11 +47141,44 @@ std::size_t ReplaceTimingColourisePaletteStop(
         std::move(stop));
 }
 
+float SnapTimingColourisePaletteStopPosition(
+    const invisible_places::timing::TimingColourisePalette& palette,
+    std::optional<std::size_t> movingStopIndex,
+    float position,
+    float snapDistance) {
+    position = std::clamp(position, 0.0F, 1.0F);
+    constexpr std::array snapPositions{0.0F, 0.5F, 1.0F};
+    for (const float snapPosition : snapPositions) {
+        if (std::abs(position - snapPosition) > snapDistance) {
+            continue;
+        }
+        const bool occupied = std::any_of(
+            palette.stops.begin(),
+            palette.stops.end(),
+            [&](const auto& candidate) {
+                const auto index = static_cast<std::size_t>(
+                    &candidate - palette.stops.data());
+                return (!movingStopIndex.has_value() ||
+                        movingStopIndex.value() != index) &&
+                       std::abs(candidate.position - snapPosition) <=
+                           invisible_places::timing::
+                               kTimingColouriseKeyTolerance;
+            });
+        if (!occupied) {
+            return snapPosition;
+        }
+    }
+    return position;
+}
+
 bool DrawTimingPalettePreview(
     const invisible_places::timing::TimingColouriseLut& lut,
     invisible_places::timing::TimingColourisePalette* editable,
     std::optional<std::size_t>* selectedStopIndex,
     bool* draggingStop,
+    std::optional<std::size_t>* requestedPickerStopIndex,
+    bool allowEditing,
+    bool allowTopologyEditing,
     const char* id) {
     constexpr float kHorizontalInset = 8.0F;
     constexpr float kGradientHeight = 28.0F;
@@ -47232,9 +47277,21 @@ bool DrawTimingPalettePreview(
             selectedStopIndex != nullptr) {
             *selectedStopIndex = hoveredStop;
             if (draggingStop != nullptr) {
-                *draggingStop = true;
+                *draggingStop = allowEditing;
             }
         } else if (draggingStop != nullptr) {
+            *draggingStop = false;
+        }
+    }
+    if (allowEditing && hovered && hoveredStop.has_value() &&
+        ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        if (selectedStopIndex != nullptr) {
+            *selectedStopIndex = hoveredStop;
+        }
+        if (requestedPickerStopIndex != nullptr) {
+            *requestedPickerStopIndex = hoveredStop;
+        }
+        if (draggingStop != nullptr) {
             *draggingStop = false;
         }
     }
@@ -47247,14 +47304,16 @@ bool DrawTimingPalettePreview(
         selectedStopIndex->has_value() &&
         selectedStopIndex->value() < editable->stops.size() &&
         draggingStop != nullptr && *draggingStop &&
+        allowEditing &&
         ImGui::IsItemActive() &&
         ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
         auto stop =
             editable->stops[selectedStopIndex->value()];
-        stop.position = std::clamp(
+        stop.position = SnapTimingColourisePaletteStopPosition(
+            *editable,
+            selectedStopIndex->value(),
             (mousePosition.x - gradientMinimum.x) / width,
-            0.0F,
-            1.0F);
+            std::max(0.008F, 7.0F / width));
         *selectedStopIndex =
             ReplaceTimingColourisePaletteStop(
                 editable,
@@ -47269,14 +47328,17 @@ bool DrawTimingPalettePreview(
         mousePosition.y <= gradientMaximum.y &&
         ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
     if (doubleClickedEmptySpectrum && editable != nullptr &&
+        allowEditing && allowTopologyEditing &&
         selectedStopIndex != nullptr &&
         editable->stops.size() <
             invisible_places::timing::
                 kMaximumTimingColourisePaletteStops) {
-        const float newPosition = std::clamp(
-            (mousePosition.x - gradientMinimum.x) / width,
-            0.0F,
-            1.0F);
+        const float newPosition =
+            SnapTimingColourisePaletteStopPosition(
+                *editable,
+                std::nullopt,
+                (mousePosition.x - gradientMinimum.x) / width,
+                std::max(0.008F, 7.0F / width));
         const auto sample =
             invisible_places::timing::
                 SampleTimingColouriseLut(
@@ -47407,19 +47469,24 @@ bool DrawTimingPalettePreview(
     }
 
     if (hovered) {
-        if (hoveredStop.has_value() && editable != nullptr) {
+        if (!allowEditing) {
+            ImGui::SetTooltip(
+                "This palette is read-only. Save a preset as a new "
+                "palette before editing it.");
+        } else if (hoveredStop.has_value() && editable != nullptr) {
             const auto& stop =
                 editable->stops[hoveredStop.value()];
             ImGui::SetTooltip(
                 "Stop %zu — position %.4f, Colourise Amount %.3f\n"
-                "Click to select; drag horizontally to reposition.",
+                "Click to select; drag horizontally to reposition.\n"
+                "Double-click to edit the colour.",
                 hoveredStop.value() + 1U,
                 stop.position,
                 stop.colouriseAmount);
-        } else if (editable == nullptr) {
+        } else if (!allowTopologyEditing) {
             ImGui::SetTooltip(
-                "This evaluated palette is read-only between keys. "
-                "Use Set Key to edit its colour stops.");
+                "Palette keys exist, so stop topology is locked. "
+                "Existing markers can still be selected and keyed.");
         } else if (
             editable->stops.size() >=
             invisible_places::timing::
@@ -47431,7 +47498,9 @@ bool DrawTimingPalettePreview(
             ImGui::SetTooltip(
                 "Double-click an empty place in the spectrum to add a "
                 "stop sampled from the existing colour. Click a marker "
-                "to select it, then drag it horizontally.");
+                "to select it, drag it horizontally, or double-click it "
+                "to edit its colour. Stops snap to 0, 0.5, and 1 when "
+                "those positions are free.");
         }
     }
     return changed;
@@ -47516,10 +47585,11 @@ void DrawTimingKeyLane(
             }
             if (track ==
                 TimingColouriseKeyTrack::Palette) {
-                return invisible_places::timing::
-                           TimingColourisePaletteKeyCountAtPosition(
-                               *effect,
-                               destinationPosition) > 0U;
+                return !invisible_places::timing::
+                            CanMoveTimingColourisePaletteKeysAtPosition(
+                                *effect,
+                                sourcePosition,
+                                destinationPosition);
             }
             return boundsParameter.has_value() &&
                    invisible_places::timing::
@@ -47680,14 +47750,16 @@ void DrawTimingKeyLane(
                 ImGui::SetKeyboardFocusHere();
                 editor->requestKeyboardFocus = false;
             }
-            const bool submitWithEnter =
-                ImGui::InputFloat(
-                    "##LocalColouriseKeyNormalizedPosition",
-                    &editor->draftPosition,
-                    0.001F,
-                    0.01F,
-                    "%.4f",
-                    ImGuiInputTextFlags_EnterReturnsTrue);
+            // This ImGui build asserts when EnterReturnsTrue is passed to
+            // InputScalar/InputFloat, so the adjacent Apply button owns
+            // submission while the value remains keyboard-editable.
+            ImGui::InputFloat(
+                "##LocalColouriseKeyNormalizedPosition",
+                &editor->draftPosition,
+                0.001F,
+                0.01F,
+                "%.4f",
+                ImGuiInputTextFlags_None);
             const bool valid =
                 std::isfinite(editor->draftPosition) &&
                 editor->draftPosition >= 0.0F &&
@@ -47713,8 +47785,7 @@ void DrawTimingKeyLane(
             }
             ImGui::BeginDisabled(!valid || occupied);
             const bool apply =
-                ImGui::Button("Apply") ||
-                submitWithEnter;
+                ImGui::Button("Apply");
             ImGui::EndDisabled();
             ImGui::SameLine();
             if (ImGui::Button("Cancel")) {
@@ -47749,46 +47820,182 @@ void DrawTimingKeyLane(
     }
 }
 
-std::vector<invisible_places::timing::TimingColourisePaletteDefinition>
-BuiltInTimingColourisePalettes() {
-    using invisible_places::timing::TimingColourisePaletteDefinition;
-    using invisible_places::timing::TimingColourisePaletteStop;
-    return {
-        {.id = "builtin-solid-white",
-         .name = "Solid White",
-         .palette = {.stops = {
-             TimingColourisePaletteStop{
-                 .position = 0.0F,
-                 .colour = {1.0F, 1.0F, 1.0F},
-                 .colouriseAmount = 1.0F}}}},
-        {.id = "builtin-warm-cool",
-         .name = "Warm / Cool",
-         .palette = {.stops = {
-             {.position = 0.0F,
-              .colour = {0.10F, 0.34F, 0.95F},
-              .colouriseAmount = 1.0F},
-             {.position = 0.5F,
-              .colour = {0.95F, 0.93F, 0.78F},
-              .colouriseAmount = 0.35F},
-             {.position = 1.0F,
-              .colour = {0.96F, 0.20F, 0.08F},
-              .colouriseAmount = 1.0F}}}},
-        {.id = "builtin-viridis",
-         .name = "Viridis",
-         .palette = {.stops = {
-             {.position = 0.0F,
-              .colour = {0.267F, 0.005F, 0.329F},
-              .colouriseAmount = 1.0F},
-             {.position = 0.34F,
-              .colour = {0.191F, 0.407F, 0.556F},
-              .colouriseAmount = 1.0F},
-             {.position = 0.67F,
-              .colour = {0.208F, 0.719F, 0.473F},
-              .colouriseAmount = 1.0F},
-             {.position = 1.0F,
-              .colour = {0.993F, 0.906F, 0.144F},
-              .colouriseAmount = 1.0F}}}},
-    };
+void DrawTimingPaletteGradientRect(
+    const invisible_places::timing::TimingColourisePalette& palette,
+    ImVec2 minimum,
+    ImVec2 maximum) {
+    const auto lut =
+        invisible_places::timing::CompileTimingColourisePaletteLut(
+            palette);
+    constexpr int kSegmentCount = 32;
+    auto* drawList = ImGui::GetWindowDrawList();
+    const float width = std::max(1.0F, maximum.x - minimum.x);
+    for (int segment = 0; segment < kSegmentCount; ++segment) {
+        const float leftPosition =
+            static_cast<float>(segment) /
+            static_cast<float>(kSegmentCount);
+        const float rightPosition =
+            static_cast<float>(segment + 1) /
+            static_cast<float>(kSegmentCount);
+        const auto left =
+            invisible_places::timing::SampleTimingColouriseLut(
+                lut,
+                leftPosition);
+        const auto right =
+            invisible_places::timing::SampleTimingColouriseLut(
+                lut,
+                rightPosition);
+        const auto colour = [](const auto& sample) {
+            const float amount = std::clamp(
+                sample.colouriseAmount,
+                0.0F,
+                1.0F);
+            return ImGui::ColorConvertFloat4ToU32(
+                ImVec4{
+                    std::lerp(0.18F, sample.colour[0], amount),
+                    std::lerp(0.18F, sample.colour[1], amount),
+                    std::lerp(0.18F, sample.colour[2], amount),
+                    1.0F});
+        };
+        drawList->AddRectFilledMultiColor(
+            ImVec2{
+                minimum.x + width * leftPosition,
+                minimum.y},
+            ImVec2{
+                minimum.x + width * rightPosition + 1.0F,
+                maximum.y},
+            colour(left),
+            colour(right),
+            colour(right),
+            colour(left));
+    }
+    drawList->AddRect(
+        minimum,
+        maximum,
+        ImGui::GetColorU32(ImGuiCol_Border),
+        1.0F);
+}
+
+bool DrawTimingPaletteComboEntry(
+    const invisible_places::timing::TimingColourisePaletteDefinition&
+        definition,
+    bool selected) {
+    ImGui::PushID(definition.id.c_str());
+    const bool activated = ImGui::Selectable(
+        "##TimingPaletteEntry",
+        selected,
+        ImGuiSelectableFlags_None,
+        ImVec2{0.0F, 25.0F});
+    const auto minimum = ImGui::GetItemRectMin();
+    const auto maximum = ImGui::GetItemRectMax();
+    const float swatchWidth = std::clamp(
+        (maximum.x - minimum.x) * 0.34F,
+        76.0F,
+        132.0F);
+    const ImVec2 swatchMinimum{
+        minimum.x + 4.0F,
+        minimum.y + 4.0F};
+    const ImVec2 swatchMaximum{
+        std::min(maximum.x - 4.0F, minimum.x + swatchWidth),
+        maximum.y - 4.0F};
+    DrawTimingPaletteGradientRect(
+        definition.palette,
+        swatchMinimum,
+        swatchMaximum);
+    ImGui::GetWindowDrawList()->AddText(
+        ImVec2{
+            swatchMaximum.x + 8.0F,
+            minimum.y +
+                std::max(
+                    0.0F,
+                    (maximum.y - minimum.y -
+                     ImGui::GetTextLineHeight()) *
+                        0.5F)},
+        ImGui::GetColorU32(ImGuiCol_Text),
+        definition.name.c_str());
+    if (selected) {
+        ImGui::SetItemDefaultFocus();
+    }
+    ImGui::PopID();
+    return activated;
+}
+
+bool TimingColouriseEffectHasPaletteKeys(
+    const invisible_places::timing::TimingColouriseEffect& effect) {
+    return !effect.paletteKeys.empty() ||
+           !effect.paletteStopParameterKeys.empty();
+}
+
+bool TimingColouriseSavedPaletteHasKeyedUse(
+    const WaterWorkflowState& water,
+    std::string_view paletteId) {
+    return std::any_of(
+        water.timingTakeSceneStates.begin(),
+        water.timingTakeSceneStates.end(),
+        [&](const auto& state) {
+            return std::any_of(
+                state.colouriseEffects.begin(),
+                state.colouriseEffects.end(),
+                [&](const auto& candidate) {
+                    return candidate.paletteSourceKind ==
+                               invisible_places::timing::
+                                   TimingColourisePaletteSourceKind::Saved &&
+                           candidate.paletteSourceId == paletteId &&
+                           TimingColouriseEffectHasPaletteKeys(candidate);
+                });
+        });
+}
+
+void DetachTimingColouriseSavedPaletteSource(
+    WaterWorkflowState* water,
+    std::string_view paletteId) {
+    if (water == nullptr) {
+        return;
+    }
+    for (auto& state : water->timingTakeSceneStates) {
+        for (auto& candidate : state.colouriseEffects) {
+            if (candidate.paletteSourceKind ==
+                    invisible_places::timing::
+                        TimingColourisePaletteSourceKind::Saved &&
+                candidate.paletteSourceId == paletteId) {
+                candidate.paletteSourceKind =
+                    invisible_places::timing::
+                        TimingColourisePaletteSourceKind::Custom;
+                candidate.paletteSourceId.clear();
+                candidate.paletteEdited = false;
+            }
+        }
+    }
+}
+
+void ApplyTimingColourisePaletteSource(
+    invisible_places::timing::TimingColouriseEffect* effect,
+    invisible_places::timing::TimingColourisePaletteSourceKind sourceKind,
+    const invisible_places::timing::TimingColourisePaletteDefinition&
+        definition,
+    bool allowKeyedSourceRebind = false) {
+    if (effect == nullptr) {
+        return;
+    }
+    const bool hasPaletteKeys =
+        TimingColouriseEffectHasPaletteKeys(*effect);
+    if (hasPaletteKeys && !allowKeyedSourceRebind) {
+        return;
+    }
+    effect->basePalette =
+        invisible_places::timing::SanitizeTimingColourisePalette(
+            definition.palette);
+    // Save New may rebind an already-keyed effect to the identical copied
+    // base palette. Preserve its key model so legacy snapshot tracks and new
+    // stop-parameter tracks both remain intact.
+    if (!hasPaletteKeys) {
+        effect->paletteKeyModel = invisible_places::timing::
+            TimingColourisePaletteKeyModel::StopParameters;
+    }
+    effect->paletteSourceKind = sourceKind;
+    effect->paletteSourceId = definition.id;
+    effect->paletteSourceName = definition.name;
+    effect->paletteEdited = false;
 }
 
 void DrawTimingColouriseTrackButtons(
@@ -47883,331 +48090,325 @@ void DrawTimingColourisePaletteEditor(
     if (runtimeState == nullptr || effect == nullptr) {
         return;
     }
+    using invisible_places::timing::TimingColourisePalette;
+    using invisible_places::timing::TimingColourisePaletteDefinition;
+    using invisible_places::timing::TimingColourisePaletteKeyModel;
+    using invisible_places::timing::TimingColourisePaletteSourceKind;
+    using invisible_places::timing::TimingColourisePaletteStopParameter;
+    using invisible_places::timing::
+        TimingColourisePaletteStopParameterKey;
+    using invisible_places::water::WaterScenarioInterpolation;
+
     auto& timings = runtimeState->timingsPanel;
     auto& water = runtimeState->water;
     const float position = std::clamp(
         runtimeState->animationPanel.scrubAmount,
         0.0F,
         1.0F);
-    auto exactKey = std::find_if(
-        effect->paletteKeys.begin(),
-        effect->paletteKeys.end(),
-        [&](const auto& key) {
-            return std::abs(key.position - position) <=
-                   invisible_places::timing::
-                       kTimingColouriseKeyTolerance;
-        });
-    const bool baseMode = effect->paletteKeys.empty();
-    auto evaluatedLut =
-        invisible_places::timing::
-            EvaluateTimingColourisePaletteLut(
-                *effect,
-                position);
-    invisible_places::timing::TimingColourisePalette* editable =
-        baseMode
-            ? &effect->basePalette
-            : exactKey != effect->paletteKeys.end()
-                  ? &exactKey->palette
-                  : nullptr;
+    const auto stopIndexById =
+        [](const TimingColourisePalette& palette,
+           std::string_view stopId)
+            -> std::optional<std::size_t> {
+        const auto found = std::find_if(
+            palette.stops.begin(),
+            palette.stops.end(),
+            [&](const auto& stop) { return stop.id == stopId; });
+        return found == palette.stops.end()
+                   ? std::nullopt
+                   : std::optional<std::size_t>{
+                         static_cast<std::size_t>(
+                             std::distance(
+                                 palette.stops.begin(),
+                                 found))};
+    };
+    const auto markPaletteBaseEdited = [&]() {
+        if (effect->paletteSourceKind !=
+            TimingColourisePaletteSourceKind::Preset) {
+            effect->paletteEdited = true;
+        }
+    };
+    const auto findSavedPalette =
+        [&](std::string_view id)
+            -> TimingColourisePaletteDefinition* {
+        const auto found = std::find_if(
+            water.savedTimingColourisePalettes.begin(),
+            water.savedTimingColourisePalettes.end(),
+            [&](const auto& palette) {
+                return palette.id == id;
+            });
+        return found ==
+                       water.savedTimingColourisePalettes.end()
+                   ? nullptr
+                   : &*found;
+    };
+    const auto paletteDisplayName = [&]() {
+        std::string name =
+            effect->paletteSourceName.empty()
+                ? std::string{"Custom"}
+                : effect->paletteSourceName;
+        if (effect->paletteEdited) {
+            name += "_edited";
+        }
+        return name;
+    };
 
-    std::vector<invisible_places::timing::TimingColourisePaletteDefinition>
-        palettes = BuiltInTimingColourisePalettes();
-    palettes.insert(
-        palettes.end(),
-        water.savedTimingColourisePalettes.begin(),
-        water.savedTimingColourisePalettes.end());
-    timings.selectedSavedPaletteIndex = std::clamp(
-        timings.selectedSavedPaletteIndex,
-        0,
-        std::max(0, static_cast<int>(palettes.size()) - 1));
-    const char* palettePreview =
-        palettes.empty()
-            ? "No saved palettes"
-            : palettes[static_cast<std::size_t>(
-                           timings.selectedSavedPaletteIndex)]
-                  .name.c_str();
-    ImGui::BeginDisabled(editable == nullptr);
+    bool hasPaletteKeys =
+        TimingColouriseEffectHasPaletteKeys(*effect);
+    const bool paletteSourceLocked =
+        hasPaletteKeys || effect->paletteEdited;
+    const auto presets =
+        invisible_places::timing::
+            BuiltInTimingColourisePalettePresets();
+
+    ImGui::TextDisabled("Preset Palette");
+    const std::string presetPreview =
+        effect->paletteSourceKind ==
+                TimingColourisePaletteSourceKind::Preset
+            ? paletteDisplayName()
+            : "Choose preset...";
+    ImGui::BeginDisabled(paletteSourceLocked);
     if (ImGui::BeginCombo(
-            "Palette",
-            palettePreview)) {
-        for (std::size_t index = 0U; index < palettes.size();
-             ++index) {
+            "##TimingColourisePresetPalette",
+            presetPreview.c_str())) {
+        for (const auto& preset : presets) {
             const bool selected =
-                static_cast<int>(index) ==
-                timings.selectedSavedPaletteIndex;
-            if (editable != nullptr &&
-                ImGui::Selectable(
-                    palettes[index].name.c_str(),
+                effect->paletteSourceKind ==
+                    TimingColourisePaletteSourceKind::Preset &&
+                effect->paletteSourceId == preset.id;
+            if (DrawTimingPaletteComboEntry(
+                    preset,
                     selected)) {
-                timings.selectedSavedPaletteIndex =
-                    static_cast<int>(index);
-                *editable = palettes[index].palette;
-                timings.selectedColourisePaletteStopIndex =
-                    0U;
-                timings.draggingColourisePaletteStop =
-                    false;
-                runtimeState->previewRenderStateSignatureValid =
-                    false;
+                ApplyTimingColourisePaletteSource(
+                    effect,
+                    TimingColourisePaletteSourceKind::Preset,
+                    preset);
+                timings.selectedColourisePaletteStopIndex = 0U;
+                timings.draggingColourisePaletteStop = false;
+                runtimeState
+                    ->previewRenderStateSignatureValid = false;
             }
         }
         ImGui::EndCombo();
     }
     ImGui::EndDisabled();
     DrawTimingControlTooltip(
-        editable == nullptr
-            ? "The evaluated palette is read-only between keys. Use Set Key before choosing a different saved palette."
-            : "Choose a built-in or saved palette. A snapshot is copied into this effect so later palette-library edits cannot change the animation.");
+        hasPaletteKeys
+            ? "Palette source changes are locked while this effect has keyed palette versions."
+        : effect->paletteEdited
+            ? effect->paletteSourceKind ==
+                      TimingColourisePaletteSourceKind::Saved
+                  ? "Save or Save New before changing source so the _edited palette is not discarded."
+                  : "Save New before changing source so the _edited custom palette is not discarded."
+            : "Choose a compact built-in palette. Presets are read-only until saved with +.");
 
-    evaluatedLut =
-        invisible_places::timing::
-            EvaluateTimingColourisePaletteLut(
-                *effect,
-                position);
-    if (editable != nullptr) {
-        *editable =
-            invisible_places::timing::
-                SanitizeTimingColourisePalette(*editable);
-        if (!timings.selectedColourisePaletteStopIndex
-                 .has_value() ||
-            timings.selectedColourisePaletteStopIndex.value() >=
-                editable->stops.size()) {
-            timings.selectedColourisePaletteStopIndex = 0U;
+    ImGui::TextDisabled("Saved Palette");
+    const std::string savedPreview =
+        effect->paletteSourceKind ==
+                TimingColourisePaletteSourceKind::Saved
+            ? paletteDisplayName()
+            : "Choose saved palette...";
+    const float savedActionWidth = 104.0F;
+    ImGui::SetNextItemWidth(std::max(
+        120.0F,
+        ImGui::GetContentRegionAvail().x -
+            savedActionWidth));
+    ImGui::BeginDisabled(paletteSourceLocked);
+    if (ImGui::BeginCombo(
+            "##TimingColouriseSavedPalette",
+            savedPreview.c_str())) {
+        for (const auto& saved :
+             water.savedTimingColourisePalettes) {
+            const bool selected =
+                effect->paletteSourceKind ==
+                    TimingColourisePaletteSourceKind::Saved &&
+                effect->paletteSourceId == saved.id;
+            if (DrawTimingPaletteComboEntry(
+                    saved,
+                    selected)) {
+                ApplyTimingColourisePaletteSource(
+                    effect,
+                    TimingColourisePaletteSourceKind::Saved,
+                    saved);
+                timings.selectedColourisePaletteStopIndex = 0U;
+                timings.draggingColourisePaletteStop = false;
+                runtimeState
+                    ->previewRenderStateSignatureValid = false;
+            }
         }
-    } else {
-        timings.draggingColourisePaletteStop = false;
+        if (water.savedTimingColourisePalettes.empty()) {
+            ImGui::TextDisabled(
+                "No saved palettes in this project.");
+        }
+        ImGui::EndCombo();
     }
-    if (DrawTimingPalettePreview(
-            evaluatedLut,
-            editable,
-            &timings.selectedColourisePaletteStopIndex,
-            &timings.draggingColourisePaletteStop,
-            "##TimingColourisePalettePreview")) {
-        runtimeState->previewRenderStateSignatureValid =
-            false;
-    }
+    ImGui::EndDisabled();
+    DrawTimingControlTooltip(
+        hasPaletteKeys
+            ? "Palette source changes are locked while this effect has keyed palette versions."
+        : effect->paletteEdited
+            ? effect->paletteSourceKind ==
+                      TimingColourisePaletteSourceKind::Saved
+                  ? "Save or Save New before changing source so the _edited palette is not discarded."
+                  : "Save New before changing source so the _edited custom palette is not discarded."
+            : "Copy a saved project palette into this Colourise effect.");
 
-    if (editable == nullptr) {
-        ImGui::TextDisabled(
-            "Evaluated between keys. Set a key to edit this palette.");
-    } else {
-        auto& stops = editable->stops;
-        std::size_t selectedIndex =
-            timings.selectedColourisePaletteStopIndex.value();
-        ImGui::Text(
-            "Selected Colour Stop %zu of %zu",
-            selectedIndex + 1U,
-            stops.size());
-        auto editedStop = stops[selectedIndex];
-        bool changed = false;
-        changed |= ImGui::ColorEdit3(
-            "Stop Colour",
-            editedStop.colour.data());
-        DrawTimingControlTooltip(
-            "Set the colour at this palette stop.");
-        changed |= ImGui::InputFloat(
-            "Stop Position",
-            &editedStop.position,
-            0.001F,
-            0.01F,
-            "%.4f",
-            ImGuiInputTextFlags_None);
-        DrawTimingControlTooltip(
-            "Enter a normalized position from 0 to 1, or drag the selected marker above.");
-        changed |= ImGui::InputFloat(
-            "Colourise Amount",
-            &editedStop.colouriseAmount,
-            0.01F,
-            0.10F,
-            "%.3f",
-            ImGuiInputTextFlags_None);
-        DrawTimingControlTooltip(
-            "Enter a value from 0 to 1. This mixes the stop colour into each point without changing point opacity.");
-        if (changed) {
-            timings.selectedColourisePaletteStopIndex =
-                ReplaceTimingColourisePaletteStop(
-                    editable,
-                    selectedIndex,
-                    std::move(editedStop));
-            runtimeState->previewRenderStateSignatureValid =
-                false;
+    ImGui::SameLine();
+    if (ImGui::SmallButton("+")) {
+        timings.paletteNameBuffer =
+            effect->paletteSourceName.empty()
+                ? "Palette " +
+                      std::to_string(
+                          water.savedTimingColourisePalettes
+                                  .size() +
+                              1U)
+                : effect->paletteSourceName + " Copy";
+        ImGui::OpenPopup(
+            "Save New Colourise Palette");
+    }
+    DrawTimingControlTooltip(
+        "Save this palette under a new editable project name. Effect-local keys remain attached.");
+
+    ImGui::SameLine(0.0F, 2.0F);
+    auto* selectedSavedPalette =
+        effect->paletteSourceKind ==
+                TimingColourisePaletteSourceKind::Saved
+            ? findSavedPalette(effect->paletteSourceId)
+            : nullptr;
+    const bool canSaveEdited =
+        selectedSavedPalette != nullptr &&
+        effect->paletteEdited;
+    ImGui::BeginDisabled(!canSaveEdited);
+    if (ImGui::SmallButton("Save") &&
+        selectedSavedPalette != nullptr) {
+        selectedSavedPalette->palette =
+            invisible_places::timing::
+                SanitizeTimingColourisePalette(
+                    effect->basePalette);
+        effect->paletteEdited = false;
+        runtimeState->statusMessage =
+            "Saved palette " +
+            selectedSavedPalette->name + ".";
+    }
+    ImGui::EndDisabled();
+    DrawTimingControlTooltip(
+        canSaveEdited
+            ? "Overwrite the saved palette with this _edited base and return to its saved name."
+            : "Edit a saved palette before overwriting it.");
+
+    ImGui::SameLine(0.0F, 2.0F);
+    const bool savedPaletteHasKeyedUse =
+        selectedSavedPalette != nullptr &&
+        TimingColouriseSavedPaletteHasKeyedUse(
+            water,
+            selectedSavedPalette->id);
+    const bool hadSelectedSavedPalette =
+        selectedSavedPalette != nullptr;
+    ImGui::BeginDisabled(
+        selectedSavedPalette == nullptr ||
+        savedPaletteHasKeyedUse);
+    if (ImGui::SmallButton("X") &&
+        selectedSavedPalette != nullptr) {
+        const std::string deletedId =
+            selectedSavedPalette->id;
+        const std::string deletedName =
+            selectedSavedPalette->name;
+        DetachTimingColouriseSavedPaletteSource(
+            &water,
+            deletedId);
+        std::erase_if(
+            water.savedTimingColourisePalettes,
+            [&](const auto& candidate) {
+                return candidate.id == deletedId;
+            });
+        selectedSavedPalette = nullptr;
+        runtimeState->statusMessage =
+            "Deleted saved palette " + deletedName + ".";
+    }
+    ImGui::EndDisabled();
+    DrawTimingControlTooltip(
+        !hadSelectedSavedPalette
+            ? "Select a saved palette before deleting it."
+        : savedPaletteHasKeyedUse
+            ? "This saved palette is used by keyed Colourise versions and cannot be deleted."
+            : "Delete this saved palette. Unkeyed effects keep independent custom snapshots.");
+
+    if (ImGui::BeginPopupModal(
+            "Save New Colourise Palette",
+            nullptr,
+            ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted(
+            "Save an editable project palette");
+        ImGui::SetNextItemWidth(280.0F);
+        InputTextString(
+            "Name",
+            &timings.paletteNameBuffer);
+        const std::string newName =
+            TrimText(timings.paletteNameBuffer);
+        const std::string normalizedNewName =
+            LowercaseAsciiCopy(newName);
+        const bool duplicateName =
+            std::any_of(
+                water.savedTimingColourisePalettes.begin(),
+                water.savedTimingColourisePalettes.end(),
+                [&](const auto& saved) {
+                    return LowercaseAsciiCopy(
+                               TrimText(saved.name)) ==
+                           normalizedNewName;
+                });
+        if (duplicateName) {
+            ImGui::TextDisabled(
+                "A saved palette already uses this name.");
         }
         ImGui::BeginDisabled(
-            stops.size() >=
-            invisible_places::timing::
-                kMaximumTimingColourisePaletteStops);
-        if (ImGui::Button("Add Stop")) {
-            float newPosition = 0.5F;
-            float widestSpan = -1.0F;
-            float previousPosition = 0.0F;
-            for (const auto& candidate : stops) {
-                const float span =
-                    candidate.position - previousPosition;
-                if (span > widestSpan) {
-                    widestSpan = span;
-                    newPosition =
-                        previousPosition + span * 0.5F;
-                }
-                previousPosition = candidate.position;
-            }
-            const float finalSpan = 1.0F - previousPosition;
-            if (finalSpan > widestSpan) {
-                newPosition =
-                    previousPosition + finalSpan * 0.5F;
-            }
-            const auto currentLut =
-                invisible_places::timing::
-                    CompileTimingColourisePaletteLut(
-                        *editable);
-            const auto sample =
-                invisible_places::timing::
-                    SampleTimingColouriseLut(
-                        currentLut,
-                        newPosition);
-            timings.selectedColourisePaletteStopIndex =
-                InsertTimingColourisePaletteStop(
-                    editable,
-                    {
-                        .position = newPosition,
-                        .colour = sample.colour,
-                        .colouriseAmount =
-                            sample.colouriseAmount,
-                    });
-            runtimeState->previewRenderStateSignatureValid =
-                false;
-        }
+            newName.empty() || duplicateName);
+        const bool saveNew =
+            ImGui::Button("Save New");
         ImGui::EndDisabled();
-        DrawTimingControlTooltip(
-            stops.size() >=
-                    invisible_places::timing::
-                        kMaximumTimingColourisePaletteStops
-                ? "A palette can contain at most eight stops."
-                : "Add a stop in the widest open part of the gradient, sampled from its existing colour. You can also double-click the spectrum.");
         ImGui::SameLine();
-        ImGui::BeginDisabled(stops.size() <= 1U);
-        if (ImGui::Button("X  Remove Stop")) {
-            stops.erase(
-                stops.begin() +
-                static_cast<std::ptrdiff_t>(
-                    timings
-                        .selectedColourisePaletteStopIndex
-                        .value()));
-            timings.selectedColourisePaletteStopIndex =
-                std::min<std::size_t>(
-                    timings
-                        .selectedColourisePaletteStopIndex
-                        .value(),
-                    stops.size() - 1U);
-            timings.draggingColourisePaletteStop =
-                false;
-            runtimeState->previewRenderStateSignatureValid =
-                false;
-        }
-        ImGui::EndDisabled();
-        DrawTimingControlTooltip(
-            stops.size() <= 1U
-                ? "A solid palette keeps its one required stop."
-                : "Delete the selected colour marker.");
-    }
-
-    InputTextString(
-        "Palette Name",
-        &timings.paletteNameBuffer);
-    DrawTimingControlTooltip(
-        "Name a reusable palette snapshot.");
-    ImGui::BeginDisabled(
-        timings.paletteNameBuffer.empty() ||
-        editable == nullptr);
-    if (ImGui::Button("Save As")) {
-        invisible_places::timing::
+        const bool cancelNew =
+            ImGui::Button("Cancel");
+        if (saveNew && !newName.empty() &&
+            !duplicateName) {
             TimingColourisePaletteDefinition definition;
-        definition.id =
-            invisible_places::timing::
-                AllocateTimingColourisePaletteId(
-                    water.savedTimingColourisePalettes,
-                    &water.nextTimingColourisePaletteSequence);
-        definition.name = timings.paletteNameBuffer;
-        definition.palette = *editable;
-        water.savedTimingColourisePalettes.push_back(
-            invisible_places::timing::
-                SanitizeTimingColourisePaletteDefinition(
-                    std::move(definition)));
-    }
-    ImGui::EndDisabled();
-    DrawTimingControlTooltip(
-        editable == nullptr
-            ? "Set a palette key before saving the evaluated palette."
-            : "Save the current palette as a reusable project palette.");
-    ImGui::SameLine();
-    const std::size_t builtInCount =
-        BuiltInTimingColourisePalettes().size();
-    const bool canOverwrite =
-        editable != nullptr &&
-        timings.selectedSavedPaletteIndex >=
-            static_cast<int>(builtInCount) &&
-        static_cast<std::size_t>(
-            timings.selectedSavedPaletteIndex) <
-            builtInCount +
-                water.savedTimingColourisePalettes.size();
-    ImGui::BeginDisabled(!canOverwrite);
-    if (ImGui::Button("Overwrite") && canOverwrite) {
-        water.savedTimingColourisePalettes[
-            static_cast<std::size_t>(
-                timings.selectedSavedPaletteIndex) -
-            builtInCount]
-            .palette = *editable;
-    }
-    ImGui::EndDisabled();
-    DrawTimingControlTooltip(
-        canOverwrite
-            ? "Overwrite the selected saved palette with this snapshot."
-            : "Select a saved project palette to overwrite it.");
-
-    std::vector<float> positions;
-    positions.reserve(effect->paletteKeys.size());
-    for (const auto& key : effect->paletteKeys) {
-        positions.push_back(key.position);
-    }
-    DrawTimingKeyLane(
-        "##TimingPaletteKeyLane",
-        runtimeState,
-        effect,
-        TimingColouriseKeyTrack::Palette,
-        std::nullopt,
-        positions,
-        IM_COL32(222, 134, 190, 255));
-    const bool exact =
-        invisible_places::timing::
-            TimingColourisePaletteKeyCountAtPosition(
-                *effect,
-                position) > 0U;
-    if (ImGui::Button(exact ? "Update Key" : "Set Key")) {
-        const auto palette =
-            editable != nullptr
-                ? *editable
-                : MaterializeTimingPaletteFromLut(
-                      evaluatedLut);
-        invisible_places::timing::
-            AddOrUpdateTimingColourisePaletteKey(
+            definition.id =
+                invisible_places::timing::
+                    AllocateTimingColourisePaletteId(
+                        water.savedTimingColourisePalettes,
+                        &water
+                             .nextTimingColourisePaletteSequence);
+            definition.name = newName;
+            definition.palette =
+                effect->basePalette;
+            water.savedTimingColourisePalettes.push_back(
+                invisible_places::timing::
+                    SanitizeTimingColourisePaletteDefinition(
+                        std::move(definition)));
+            ApplyTimingColourisePaletteSource(
                 effect,
-                position,
-                palette,
-                exactKey != effect->paletteKeys.end()
-                    ? exactKey->interpolation
-                    : invisible_places::water::
-                          WaterScenarioInterpolation::Smooth);
-        runtimeState->previewRenderStateSignatureValid =
-            false;
+                TimingColourisePaletteSourceKind::Saved,
+                water.savedTimingColourisePalettes.back(),
+                true);
+            timings.paletteNameBuffer.clear();
+            runtimeState
+                ->previewRenderStateSignatureValid = false;
+            ImGui::CloseCurrentPopup();
+        } else if (cancelNew) {
+            timings.paletteNameBuffer.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
     }
-    DrawTimingControlTooltip(
-        exact
-            ? "Update the Palette key at the current animation position."
-            : "Materialize the evaluated palette as an editable key here.");
-    ImGui::SameLine();
-    DrawTimingColouriseTrackButtons(
-        runtimeState,
-        effect,
-        true);
-    exactKey = std::find_if(
+
+    hasPaletteKeys =
+        TimingColouriseEffectHasPaletteKeys(*effect);
+    const bool legacyModel =
+        effect->paletteKeyModel ==
+        TimingColourisePaletteKeyModel::LegacySnapshots;
+    const bool presetReadOnly =
+        effect->paletteSourceKind ==
+        TimingColourisePaletteSourceKind::Preset;
+
+    auto legacyExactKey = std::find_if(
         effect->paletteKeys.begin(),
         effect->paletteKeys.end(),
         [&](const auto& key) {
@@ -48215,10 +48416,796 @@ void DrawTimingColourisePaletteEditor(
                    invisible_places::timing::
                        kTimingColouriseKeyTolerance;
         });
-    if (exactKey != effect->paletteKeys.end()) {
-        (void)DrawTimingInterpolationCombo(
-            "Palette Interpolation",
-            &exactKey->interpolation);
+    TimingColourisePalette* legacyEditable = nullptr;
+    auto evaluatedLut =
+        invisible_places::timing::
+            EvaluateTimingColourisePaletteLut(
+                *effect,
+                position);
+    TimingColourisePalette workingPalette;
+    if (legacyModel) {
+        if (effect->paletteKeys.empty()) {
+            legacyEditable = &effect->basePalette;
+        } else if (
+            legacyExactKey != effect->paletteKeys.end()) {
+            legacyEditable = &legacyExactKey->palette;
+        }
+        workingPalette =
+            legacyEditable != nullptr
+                ? invisible_places::timing::
+                      SanitizeTimingColourisePalette(
+                          *legacyEditable)
+                : MaterializeTimingPaletteFromLut(
+                      evaluatedLut);
+    } else {
+        workingPalette =
+            invisible_places::timing::
+                EvaluateTimingColourisePalette(
+                    *effect,
+                    position);
+    }
+
+    if (!timings.selectedColourisePaletteStopIndex
+             .has_value() ||
+        timings.selectedColourisePaletteStopIndex.value() >=
+            workingPalette.stops.size()) {
+        timings.selectedColourisePaletteStopIndex = 0U;
+    }
+
+    const auto paletteKeyPositions =
+        invisible_places::timing::
+            TimingColourisePaletteKeyPositions(*effect);
+    if (!paletteKeyPositions.empty()) {
+        std::string keyedPreview =
+            std::to_string(paletteKeyPositions.size()) +
+            (paletteKeyPositions.size() == 1U
+                 ? " keyed version"
+                 : " keyed versions");
+        for (std::size_t index = 0U;
+             index < paletteKeyPositions.size();
+             ++index) {
+            if (std::abs(
+                    paletteKeyPositions[index] -
+                    position) <=
+                invisible_places::timing::
+                    kTimingColouriseKeyTolerance) {
+                keyedPreview =
+                    invisible_places::timing::
+                        TimingColourisePaletteKeyStateName(
+                            paletteDisplayName(),
+                            index);
+                break;
+            }
+        }
+        if (ImGui::BeginCombo(
+                "Keyed Palettes",
+                keyedPreview.c_str())) {
+            for (std::size_t index = 0U;
+                 index < paletteKeyPositions.size();
+                 ++index) {
+                const float keyPosition =
+                    paletteKeyPositions[index];
+                TimingColourisePaletteDefinition keyed;
+                keyed.id =
+                    effect->id + "-palette-key-" +
+                    std::to_string(index);
+                keyed.name =
+                    invisible_places::timing::
+                        TimingColourisePaletteKeyStateName(
+                            paletteDisplayName(),
+                            index);
+                keyed.palette =
+                    legacyModel
+                        ? MaterializeTimingPaletteFromLut(
+                              invisible_places::timing::
+                                  EvaluateTimingColourisePaletteLut(
+                                      *effect,
+                                      keyPosition))
+                        : invisible_places::timing::
+                              EvaluateTimingColourisePalette(
+                                  *effect,
+                                  keyPosition);
+                const bool selected =
+                    std::abs(keyPosition - position) <=
+                    invisible_places::timing::
+                        kTimingColouriseKeyTolerance;
+                if (DrawTimingPaletteComboEntry(
+                        keyed,
+                        selected)) {
+                    runtimeState->animationPanel.scrubAmount =
+                        keyPosition;
+                    ApplyAnimationScrub(runtimeState);
+                }
+            }
+            ImGui::EndCombo();
+        }
+        DrawTimingControlTooltip(
+            "These _RunNN versions belong only to this Colourise effect. Their numbers follow key order automatically.");
+    } else {
+        ImGui::TextDisabled(
+            "No keyed palette versions for this Colourise effect.");
+    }
+
+    const bool canEditStops =
+        !presetReadOnly &&
+        (!legacyModel || legacyEditable != nullptr);
+    const bool canEditTopology =
+        canEditStops && !hasPaletteKeys;
+    if (timings.draggingColourisePaletteStop &&
+        timings.colourisePaletteDrag.has_value() &&
+        timings.colourisePaletteDrag->effectId ==
+            effect->id) {
+        if (const auto selectedById =
+                stopIndexById(
+                    workingPalette,
+                    timings.colourisePaletteDrag->stopId);
+            selectedById.has_value()) {
+            timings.selectedColourisePaletteStopIndex =
+                selectedById;
+        } else {
+            timings.draggingColourisePaletteStop = false;
+            timings.colourisePaletteDrag.reset();
+        }
+    } else if (!timings.draggingColourisePaletteStop) {
+        timings.colourisePaletteDrag.reset();
+    }
+    const auto paletteBeforePreview = workingPalette;
+    const bool wasDraggingPaletteStop =
+        timings.draggingColourisePaletteStop;
+    const bool previewChanged =
+        DrawTimingPalettePreview(
+            evaluatedLut,
+            &workingPalette,
+            &timings.selectedColourisePaletteStopIndex,
+            &timings.draggingColourisePaletteStop,
+            &timings
+                 .requestedColourisePalettePickerStopIndex,
+            canEditStops,
+            canEditTopology,
+            "##TimingColourisePalettePreview");
+    if (timings.draggingColourisePaletteStop) {
+        StopAnimationPlayback(runtimeState);
+        if (!wasDraggingPaletteStop ||
+            !timings.colourisePaletteDrag.has_value() ||
+            timings.colourisePaletteDrag->effectId !=
+                effect->id) {
+            const auto selectedIndex =
+                timings.selectedColourisePaletteStopIndex;
+            if (selectedIndex.has_value() &&
+                selectedIndex.value() <
+                    workingPalette.stops.size()) {
+                timings.colourisePaletteDrag =
+                    TimingsPanelState::
+                        ColourisePaletteStopAuthoringState{
+                            .effectId = effect->id,
+                            .stopId =
+                                workingPalette
+                                    .stops[selectedIndex.value()]
+                                    .id,
+                            .animationPosition = position,
+                        };
+            }
+        }
+    }
+    const float previewKeyPosition =
+        timings.colourisePaletteDrag.has_value() &&
+                timings.colourisePaletteDrag->effectId ==
+                    effect->id
+            ? timings.colourisePaletteDrag
+                  ->animationPosition
+            : position;
+    if (previewChanged) {
+        StopAnimationPlayback(runtimeState);
+        if (legacyModel && legacyEditable != nullptr) {
+            *legacyEditable =
+                invisible_places::timing::
+                    SanitizeTimingColourisePalette(
+                        workingPalette);
+            if (effect->paletteKeys.empty()) {
+                markPaletteBaseEdited();
+            }
+        } else if (!legacyModel &&
+                   !hasPaletteKeys) {
+            effect->basePalette =
+                invisible_places::timing::
+                    SanitizeTimingColourisePalette(
+                        workingPalette);
+            workingPalette = effect->basePalette;
+            markPaletteBaseEdited();
+        } else if (!legacyModel) {
+            for (const auto& stop :
+                 workingPalette.stops) {
+                const auto beforeIndex =
+                    stopIndexById(
+                        paletteBeforePreview,
+                        stop.id);
+                if (!beforeIndex.has_value() ||
+                    std::abs(
+                        paletteBeforePreview
+                                .stops[beforeIndex.value()]
+                                .position -
+                        stop.position) <=
+                        std::numeric_limits<float>::
+                            epsilon()) {
+                    continue;
+                }
+                const auto existing = std::find_if(
+                    effect
+                        ->paletteStopParameterKeys.begin(),
+                    effect
+                        ->paletteStopParameterKeys.end(),
+                    [&](const auto& key) {
+                        return key.stopId == stop.id &&
+                               key.parameter ==
+                                   TimingColourisePaletteStopParameter::
+                                       Position &&
+                               std::abs(
+                                   key.position -
+                                   previewKeyPosition) <=
+                                   invisible_places::timing::
+                                       kTimingColouriseKeyTolerance;
+                    });
+                const auto interpolation =
+                    existing !=
+                            effect
+                                ->paletteStopParameterKeys
+                                .end()
+                        ? existing->interpolation
+                        : WaterScenarioInterpolation::
+                              Smooth;
+                (void)invisible_places::timing::
+                    AddOrUpdateTimingColourisePaletteStopScalarKey(
+                        effect,
+                        stop.id,
+                        TimingColourisePaletteStopParameter::
+                            Position,
+                        previewKeyPosition,
+                        stop.position,
+                        interpolation);
+            }
+        }
+        runtimeState->previewRenderStateSignatureValid =
+            false;
+    }
+    if (!timings.draggingColourisePaletteStop) {
+        timings.colourisePaletteDrag.reset();
+    }
+
+    if (timings
+            .requestedColourisePalettePickerStopIndex
+            .has_value()) {
+        StopAnimationPlayback(runtimeState);
+        const auto selectedIndex =
+            std::min(
+                timings
+                    .requestedColourisePalettePickerStopIndex
+                    .value(),
+                workingPalette.stops.size() - 1U);
+        timings.selectedColourisePaletteStopIndex =
+            selectedIndex;
+        timings.colourisePalettePicker =
+            TimingsPanelState::
+                ColourisePaletteStopAuthoringState{
+                    .effectId = effect->id,
+                    .stopId =
+                        workingPalette
+                            .stops[selectedIndex]
+                            .id,
+                    .animationPosition = position,
+                };
+        timings
+            .requestedColourisePalettePickerStopIndex
+            .reset();
+        ImGui::OpenPopup("Colour Stop");
+    }
+
+    const auto findParameterKeyAt =
+        [&](std::string_view stopId,
+            TimingColourisePaletteStopParameter parameter,
+            float keyPosition)
+            -> TimingColourisePaletteStopParameterKey* {
+        const auto found = std::find_if(
+            effect->paletteStopParameterKeys.begin(),
+            effect->paletteStopParameterKeys.end(),
+            [&](const auto& key) {
+                return key.stopId == stopId &&
+                       key.parameter == parameter &&
+                       std::abs(key.position - keyPosition) <=
+                           invisible_places::timing::
+                               kTimingColouriseKeyTolerance;
+            });
+        return found ==
+                       effect->paletteStopParameterKeys.end()
+                   ? nullptr
+                   : &*found;
+    };
+    const auto interpolationForAt =
+        [&](std::string_view stopId,
+            TimingColourisePaletteStopParameter parameter,
+            float keyPosition) {
+        const auto* key =
+            findParameterKeyAt(
+                stopId,
+                parameter,
+                keyPosition);
+        return key != nullptr
+                   ? key->interpolation
+                   : WaterScenarioInterpolation::Smooth;
+    };
+
+    float pickerPosition = position;
+    const bool pickerMatches =
+        timings.colourisePalettePicker.has_value() &&
+        timings.colourisePalettePicker->effectId ==
+            effect->id;
+    if (pickerMatches) {
+        pickerPosition =
+            timings.colourisePalettePicker
+                ->animationPosition;
+        if (const auto selectedById =
+                stopIndexById(
+                    workingPalette,
+                    timings.colourisePalettePicker->stopId);
+            selectedById.has_value()) {
+            timings.selectedColourisePaletteStopIndex =
+                selectedById;
+        }
+    }
+
+    if (ImGui::BeginPopup("Colour Stop")) {
+        StopAnimationPlayback(runtimeState);
+        if (!canEditStops ||
+            !timings.selectedColourisePaletteStopIndex
+                 .has_value() ||
+            timings.selectedColourisePaletteStopIndex.value() >=
+                workingPalette.stops.size()) {
+            ImGui::TextDisabled(
+                presetReadOnly
+                    ? "Save this preset with + before editing it."
+                    : "This evaluated legacy palette is read-only between snapshot keys.");
+        } else {
+            const std::size_t selectedIndex =
+                timings
+                    .selectedColourisePaletteStopIndex
+                    .value();
+            const auto originalStop =
+                workingPalette.stops[selectedIndex];
+            auto editedStop = originalStop;
+            ImGui::Text(
+                "Colour Stop %zu of %zu",
+                selectedIndex + 1U,
+                workingPalette.stops.size());
+            const bool colourChanged =
+                ImGui::ColorPicker3(
+                    "##TimingColourStopPicker",
+                    editedStop.colour.data());
+
+            ImGui::TextDisabled("Position");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(92.0F);
+            const bool positionChanged =
+                ImGui::InputFloat(
+                    "##TimingColourStopPosition",
+                    &editedStop.position,
+                    0.0F,
+                    0.0F,
+                    "%.4f");
+            ImGui::SameLine();
+            ImGui::TextDisabled("Amount");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(92.0F);
+            const bool amountChanged =
+                ImGui::InputFloat(
+                    "##TimingColourStopAmount",
+                    &editedStop.colouriseAmount,
+                    0.0F,
+                    0.0F,
+                    "%.3f");
+            editedStop.position =
+                std::clamp(
+                    editedStop.position,
+                    0.0F,
+                    1.0F);
+            editedStop.colouriseAmount =
+                std::clamp(
+                    editedStop.colouriseAmount,
+                    0.0F,
+                    1.0F);
+
+            if (colourChanged || positionChanged ||
+                amountChanged) {
+                timings.selectedColourisePaletteStopIndex =
+                    ReplaceTimingColourisePaletteStop(
+                        &workingPalette,
+                        selectedIndex,
+                        editedStop);
+                if (legacyModel &&
+                    legacyEditable != nullptr) {
+                    *legacyEditable =
+                        invisible_places::timing::
+                            SanitizeTimingColourisePalette(
+                                workingPalette);
+                    if (effect->paletteKeys.empty()) {
+                        markPaletteBaseEdited();
+                    }
+                } else if (
+                    !legacyModel &&
+                    !hasPaletteKeys) {
+                    effect->basePalette =
+                        invisible_places::timing::
+                            SanitizeTimingColourisePalette(
+                                workingPalette);
+                    workingPalette =
+                        effect->basePalette;
+                    markPaletteBaseEdited();
+                } else if (!legacyModel) {
+                    if (colourChanged) {
+                        (void)invisible_places::timing::
+                            AddOrUpdateTimingColourisePaletteStopColourKey(
+                                effect,
+                                originalStop.id,
+                                pickerPosition,
+                                editedStop.colour,
+                                interpolationForAt(
+                                    originalStop.id,
+                                    TimingColourisePaletteStopParameter::
+                                        Colour,
+                                    pickerPosition));
+                    }
+                    if (positionChanged) {
+                        (void)invisible_places::timing::
+                            AddOrUpdateTimingColourisePaletteStopScalarKey(
+                                effect,
+                                originalStop.id,
+                                TimingColourisePaletteStopParameter::
+                                    Position,
+                                pickerPosition,
+                                editedStop.position,
+                                interpolationForAt(
+                                    originalStop.id,
+                                    TimingColourisePaletteStopParameter::
+                                        Position,
+                                    pickerPosition));
+                    }
+                    if (amountChanged) {
+                        (void)invisible_places::timing::
+                            AddOrUpdateTimingColourisePaletteStopScalarKey(
+                                effect,
+                                originalStop.id,
+                                TimingColourisePaletteStopParameter::
+                                    ColouriseAmount,
+                                pickerPosition,
+                                editedStop
+                                    .colouriseAmount,
+                                interpolationForAt(
+                                    originalStop.id,
+                                    TimingColourisePaletteStopParameter::
+                                        ColouriseAmount,
+                                    pickerPosition));
+                    }
+                }
+                runtimeState
+                    ->previewRenderStateSignatureValid = false;
+            }
+
+            const auto selectedAfterIndex =
+                stopIndexById(
+                    workingPalette,
+                    originalStop.id);
+            const auto stopForKey =
+                selectedAfterIndex.has_value()
+                    ? workingPalette
+                          .stops[selectedAfterIndex.value()]
+                    : editedStop;
+            if (!legacyModel) {
+                ImGui::PushID(originalStop.id.c_str());
+                const bool colourExact =
+                    findParameterKeyAt(
+                        originalStop.id,
+                        TimingColourisePaletteStopParameter::
+                            Colour,
+                        pickerPosition) != nullptr;
+                if (ImGui::SmallButton(
+                        colourExact
+                            ? "Update Colour Key"
+                            : "Key Colour")) {
+                    (void)invisible_places::timing::
+                        AddOrUpdateTimingColourisePaletteStopColourKey(
+                            effect,
+                            originalStop.id,
+                            pickerPosition,
+                            stopForKey.colour,
+                            interpolationForAt(
+                                originalStop.id,
+                                TimingColourisePaletteStopParameter::
+                                    Colour,
+                                pickerPosition));
+                    runtimeState
+                        ->previewRenderStateSignatureValid =
+                        false;
+                }
+                DrawTimingControlTooltip(
+                    "Key only this stop's colour at the captured animation position.");
+                ImGui::SameLine();
+                const bool positionExact =
+                    findParameterKeyAt(
+                        originalStop.id,
+                        TimingColourisePaletteStopParameter::
+                            Position,
+                        pickerPosition) != nullptr;
+                if (ImGui::SmallButton(
+                        positionExact
+                            ? "Update Position Key"
+                            : "Key Position")) {
+                    (void)invisible_places::timing::
+                        AddOrUpdateTimingColourisePaletteStopScalarKey(
+                            effect,
+                            originalStop.id,
+                            TimingColourisePaletteStopParameter::
+                                Position,
+                            pickerPosition,
+                            stopForKey.position,
+                            interpolationForAt(
+                                originalStop.id,
+                                TimingColourisePaletteStopParameter::
+                                    Position,
+                                pickerPosition));
+                    runtimeState
+                        ->previewRenderStateSignatureValid =
+                        false;
+                }
+                DrawTimingControlTooltip(
+                    "Key only this stop's gradient position at the captured animation position.");
+                ImGui::SameLine();
+                const bool amountExact =
+                    findParameterKeyAt(
+                        originalStop.id,
+                        TimingColourisePaletteStopParameter::
+                            ColouriseAmount,
+                        pickerPosition) != nullptr;
+                if (ImGui::SmallButton(
+                        amountExact
+                            ? "Update Amount Key"
+                            : "Key Amount")) {
+                    (void)invisible_places::timing::
+                        AddOrUpdateTimingColourisePaletteStopScalarKey(
+                            effect,
+                            originalStop.id,
+                            TimingColourisePaletteStopParameter::
+                                ColouriseAmount,
+                            pickerPosition,
+                            stopForKey.colouriseAmount,
+                            interpolationForAt(
+                                originalStop.id,
+                                TimingColourisePaletteStopParameter::
+                                    ColouriseAmount,
+                                pickerPosition));
+                    runtimeState
+                        ->previewRenderStateSignatureValid =
+                        false;
+                }
+                DrawTimingControlTooltip(
+                    "Key only this stop's Colourise Amount at the captured animation position.");
+                ImGui::PopID();
+            }
+
+            if (!legacyModel) {
+                if (auto* key = findParameterKeyAt(
+                        originalStop.id,
+                        TimingColourisePaletteStopParameter::
+                            Colour,
+                        pickerPosition);
+                    key != nullptr &&
+                    DrawTimingInterpolationCombo(
+                        "Colour Interpolation",
+                        &key->interpolation)) {
+                    runtimeState
+                        ->previewRenderStateSignatureValid =
+                        false;
+                }
+                if (auto* key = findParameterKeyAt(
+                        originalStop.id,
+                        TimingColourisePaletteStopParameter::
+                            Position,
+                        pickerPosition);
+                    key != nullptr &&
+                    DrawTimingInterpolationCombo(
+                        "Position Interpolation",
+                        &key->interpolation)) {
+                    runtimeState
+                        ->previewRenderStateSignatureValid =
+                        false;
+                }
+                if (auto* key = findParameterKeyAt(
+                        originalStop.id,
+                        TimingColourisePaletteStopParameter::
+                            ColouriseAmount,
+                        pickerPosition);
+                    key != nullptr &&
+                    DrawTimingInterpolationCombo(
+                        "Amount Interpolation",
+                        &key->interpolation)) {
+                    runtimeState
+                        ->previewRenderStateSignatureValid =
+                        false;
+                }
+            }
+
+            const bool canRemoveStop =
+                !legacyModel && !hasPaletteKeys &&
+                invisible_places::timing::
+                    CanRemoveTimingColourisePaletteStop(
+                        *effect,
+                        originalStop.id);
+            ImGui::BeginDisabled(!canRemoveStop);
+            if (ImGui::Button("X  Remove Stop") &&
+                invisible_places::timing::
+                    RemoveTimingColourisePaletteStop(
+                        effect,
+                        originalStop.id)) {
+                markPaletteBaseEdited();
+                timings.selectedColourisePaletteStopIndex =
+                    std::min<std::size_t>(
+                        selectedIndex,
+                        effect->basePalette.stops.size() -
+                            1U);
+                timings.draggingColourisePaletteStop =
+                    false;
+                runtimeState
+                    ->previewRenderStateSignatureValid = false;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndDisabled();
+            DrawTimingControlTooltip(
+                canRemoveStop
+                    ? "Delete this colour marker."
+                    : "A stop cannot be removed while palette keys depend on its topology.");
+        }
+        ImGui::EndPopup();
+    }
+    if (pickerMatches &&
+        !ImGui::IsPopupOpen("Colour Stop")) {
+        timings.colourisePalettePicker.reset();
+    }
+
+    if (timings.selectedColourisePaletteStopIndex
+            .has_value() &&
+        timings.selectedColourisePaletteStopIndex.value() <
+            workingPalette.stops.size()) {
+        const auto& selected =
+            workingPalette.stops[
+                timings
+                    .selectedColourisePaletteStopIndex
+                    .value()];
+        ImGui::TextDisabled(
+            "Stop %zu/%zu   position %.4f   amount %.3f   (double-click marker to edit)",
+            timings
+                    .selectedColourisePaletteStopIndex
+                    .value() +
+                1U,
+            workingPalette.stops.size(),
+            selected.position,
+            selected.colouriseAmount);
+    }
+
+    DrawTimingKeyLane(
+        "##TimingPaletteKeyLane",
+        runtimeState,
+        effect,
+        TimingColouriseKeyTrack::Palette,
+        std::nullopt,
+        paletteKeyPositions,
+        IM_COL32(222, 134, 190, 255));
+    const bool exact =
+        invisible_places::timing::
+            TimingColourisePaletteKeyCountAtPosition(
+                *effect,
+                position) > 0U;
+    if (legacyModel) {
+        ImGui::BeginDisabled(presetReadOnly);
+        if (ImGui::Button(
+                exact ? "Update Palette Key"
+                      : "Set Palette Key")) {
+            invisible_places::timing::
+                AddOrUpdateTimingColourisePaletteKey(
+                    effect,
+                    position,
+                    workingPalette,
+                    legacyExactKey !=
+                            effect->paletteKeys.end()
+                        ? legacyExactKey->interpolation
+                        : WaterScenarioInterpolation::
+                              Smooth);
+            runtimeState
+                ->previewRenderStateSignatureValid = false;
+        }
+        ImGui::EndDisabled();
+        DrawTimingControlTooltip(
+            "Legacy projects retain whole-palette snapshot keys exactly. New saved palettes use independent stop-property keys.");
+    } else {
+        const auto selectedIndex =
+            timings.selectedColourisePaletteStopIndex
+                .value_or(0U);
+        const bool canKeySelected =
+            !presetReadOnly &&
+            selectedIndex < workingPalette.stops.size();
+        ImGui::BeginDisabled(!canKeySelected);
+        if (ImGui::Button(
+                exact ? "Update Selected Stop Keys"
+                      : "Key Selected Stop")) {
+            const auto& stop =
+                workingPalette.stops[selectedIndex];
+            (void)invisible_places::timing::
+                AddOrUpdateTimingColourisePaletteStopScalarKey(
+                    effect,
+                    stop.id,
+                    TimingColourisePaletteStopParameter::
+                        Position,
+                    position,
+                    stop.position,
+                    interpolationForAt(
+                        stop.id,
+                        TimingColourisePaletteStopParameter::
+                            Position,
+                        position));
+            (void)invisible_places::timing::
+                AddOrUpdateTimingColourisePaletteStopColourKey(
+                    effect,
+                    stop.id,
+                    position,
+                    stop.colour,
+                    interpolationForAt(
+                        stop.id,
+                        TimingColourisePaletteStopParameter::
+                            Colour,
+                        position));
+            (void)invisible_places::timing::
+                AddOrUpdateTimingColourisePaletteStopScalarKey(
+                    effect,
+                    stop.id,
+                    TimingColourisePaletteStopParameter::
+                        ColouriseAmount,
+                    position,
+                    stop.colouriseAmount,
+                    interpolationForAt(
+                        stop.id,
+                        TimingColourisePaletteStopParameter::
+                            ColouriseAmount,
+                        position));
+            runtimeState
+                ->previewRenderStateSignatureValid = false;
+        }
+        ImGui::EndDisabled();
+        DrawTimingControlTooltip(
+            presetReadOnly
+                ? "Save this preset with + before keying it."
+                : "Key all three properties of the selected stop here. Editing an already-keyed palette writes only the property that changed.");
+    }
+    ImGui::SameLine();
+    DrawTimingColouriseTrackButtons(
+        runtimeState,
+        effect,
+        true);
+
+    if (legacyModel) {
+        legacyExactKey = std::find_if(
+            effect->paletteKeys.begin(),
+            effect->paletteKeys.end(),
+            [&](const auto& key) {
+                return std::abs(
+                           key.position - position) <=
+                       invisible_places::timing::
+                           kTimingColouriseKeyTolerance;
+            });
+        if (legacyExactKey !=
+            effect->paletteKeys.end()) {
+            if (DrawTimingInterpolationCombo(
+                    "Palette Interpolation",
+                    &legacyExactKey->interpolation)) {
+                runtimeState
+                    ->previewRenderStateSignatureValid = false;
+            }
+        }
     }
 }
 
@@ -50987,9 +51974,9 @@ void DrawTimingColouriseGlobalMarkerLanes(
         .track = TimingColouriseKeyTrack::Bounds,
         .colour = IM_COL32(102, 187, 227, 255),
     };
-    for (const auto& key : effect->paletteKeys) {
-        palette.positions.push_back(key.position);
-    }
+    palette.positions =
+        invisible_places::timing::
+            TimingColourisePaletteKeyPositions(*effect);
     for (const auto& key : effect->boundsKeys) {
         bounds.positions.push_back(key.position);
     }
@@ -51113,14 +52100,15 @@ void DrawTimingColouriseGlobalMarkerLanes(
                 ImGui::SetKeyboardFocusHere();
                 edit->requestKeyboardFocus = false;
             }
-            const bool submitWithEnter =
-                ImGui::InputFloat(
-                    "##ColouriseKeyNormalizedPosition",
-                    &edit->draftPosition,
-                    0.001F,
-                    0.01F,
-                    "%.4f",
-                    ImGuiInputTextFlags_EnterReturnsTrue);
+            // InputFloat routes through InputScalar in this ImGui version,
+            // where EnterReturnsTrue is explicitly unsupported.
+            ImGui::InputFloat(
+                "##ColouriseKeyNormalizedPosition",
+                &edit->draftPosition,
+                0.001F,
+                0.01F,
+                "%.4f",
+                ImGuiInputTextFlags_None);
             const bool valid =
                 std::isfinite(edit->draftPosition) &&
                 edit->draftPosition >= 0.0F &&
@@ -51129,21 +52117,11 @@ void DrawTimingColouriseGlobalMarkerLanes(
                 [&](float position) {
                     if (edit->track ==
                         TimingColouriseKeyTrack::Palette) {
-                        return std::any_of(
-                            effect->paletteKeys.begin(),
-                            effect->paletteKeys.end(),
-                            [&](const auto& key) {
-                                return std::abs(
-                                           key.position -
-                                           edit->sourcePosition) >
-                                           invisible_places::timing::
-                                               kTimingColouriseKeyTolerance &&
-                                       std::abs(
-                                           key.position -
-                                           position) <=
-                                           invisible_places::timing::
-                                               kTimingColouriseKeyTolerance;
-                            });
+                        return !invisible_places::timing::
+                                    CanMoveTimingColourisePaletteKeysAtPosition(
+                                        *effect,
+                                        edit->sourcePosition,
+                                        position);
                     }
                     return std::abs(
                                position -
@@ -51174,8 +52152,7 @@ void DrawTimingColouriseGlobalMarkerLanes(
             ImGui::BeginDisabled(
                 !valid || destinationOccupied);
             const bool apply =
-                ImGui::Button("Apply") ||
-                submitWithEnter;
+                ImGui::Button("Apply");
             ImGui::EndDisabled();
             ImGui::SameLine();
             if (ImGui::Button("Cancel")) {
@@ -51350,6 +52327,8 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
     const bool hasKeyedSettings =
         colouriseEffect != nullptr
             ? !colouriseEffect->paletteKeys.empty() ||
+                  !colouriseEffect
+                       ->paletteStopParameterKeys.empty() ||
                   !colouriseEffect->boundsKeys.empty() ||
                   !colouriseEffect->boundsParameterKeys.empty()
             : timeline != nullptr &&
