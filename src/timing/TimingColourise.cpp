@@ -496,6 +496,92 @@ std::size_t RemoveKeysAtPosition(
     return previousSize - keys->size();
 }
 
+struct PaletteKeyPositionCluster {
+    float representative = 0.0F;
+    float minimum = 0.0F;
+    float maximum = 0.0F;
+};
+
+std::vector<PaletteKeyPositionCluster> PaletteKeyPositionClusters(
+    const TimingColouriseEffect& effect) {
+    std::vector<float> positions;
+    positions.reserve(
+        effect.paletteKeys.size() +
+        effect.paletteStopParameterKeys.size());
+    for (const auto& key : effect.paletteKeys) {
+        if (std::isfinite(key.position)) {
+            positions.push_back(Clamp01(key.position));
+        }
+    }
+    for (const auto& key : effect.paletteStopParameterKeys) {
+        if (std::isfinite(key.position)) {
+            positions.push_back(Clamp01(key.position));
+        }
+    }
+    std::stable_sort(positions.begin(), positions.end());
+
+    std::vector<PaletteKeyPositionCluster> clusters;
+    clusters.reserve(positions.size());
+    for (const float position : positions) {
+        if (clusters.empty() ||
+            position - clusters.back().maximum >
+                kTimingColouriseKeyTolerance) {
+            clusters.push_back({
+                .representative = position,
+                .minimum = position,
+                .maximum = position,
+            });
+        } else {
+            // Use adjacent-distance (single-linkage) clustering so a chain of
+            // mutually tolerant keys cannot be split between two markers.
+            clusters.back().maximum = position;
+        }
+    }
+    return clusters;
+}
+
+float DistanceFromPaletteKeyPositionCluster(
+    const PaletteKeyPositionCluster& cluster,
+    float position) {
+    if (position < cluster.minimum) {
+        return cluster.minimum - position;
+    }
+    if (position > cluster.maximum) {
+        return position - cluster.maximum;
+    }
+    return 0.0F;
+}
+
+std::optional<std::size_t> PaletteKeyPositionClusterIndexAtPosition(
+    std::span<const PaletteKeyPositionCluster> clusters,
+    float position) {
+    if (!std::isfinite(position)) {
+        return std::nullopt;
+    }
+    std::optional<std::size_t> best;
+    float bestDistance = std::numeric_limits<float>::infinity();
+    for (std::size_t index = 0U; index < clusters.size(); ++index) {
+        const float distance =
+            DistanceFromPaletteKeyPositionCluster(clusters[index], position);
+        if (distance <= kTimingColouriseKeyTolerance &&
+            distance < bestDistance) {
+            best = index;
+            bestDistance = distance;
+        }
+    }
+    return best;
+}
+
+bool PaletteKeyPositionBelongsToCluster(
+    float position,
+    const PaletteKeyPositionCluster& cluster) {
+    if (!std::isfinite(position)) {
+        return false;
+    }
+    position = Clamp01(position);
+    return position >= cluster.minimum && position <= cluster.maximum;
+}
+
 template <typename Key>
 std::optional<float> PreviousKeyPosition(
     const std::vector<Key>& keys,
@@ -1542,15 +1628,26 @@ bool MoveTimingColourisePaletteKey(
         kTimingColouriseKeyTolerance) {
         return true;
     }
+    const auto clusters = PaletteKeyPositionClusters(*effect);
+    const auto sourceClusterIndex =
+        PaletteKeyPositionClusterIndexAtPosition(
+            clusters,
+            sourcePosition);
+    if (!sourceClusterIndex.has_value()) {
+        return false;
+    }
+    const auto sourceCluster = clusters[*sourceClusterIndex];
     for (auto& key : effect->paletteKeys) {
-        if (std::abs(key.position - sourcePosition) <=
-            kTimingColouriseKeyTolerance) {
+        if (PaletteKeyPositionBelongsToCluster(
+                key.position,
+                sourceCluster)) {
             key.position = destinationPosition;
         }
     }
     for (auto& key : effect->paletteStopParameterKeys) {
-        if (std::abs(key.position - sourcePosition) <=
-            kTimingColouriseKeyTolerance) {
+        if (PaletteKeyPositionBelongsToCluster(
+                key.position,
+                sourceCluster)) {
             key.position = destinationPosition;
         }
     }
@@ -1569,24 +1666,56 @@ bool CanMoveTimingColourisePaletteKeysAtPosition(
         destinationPosition < 0.0F || destinationPosition > 1.0F) {
         return false;
     }
-    const bool hasLegacySource =
-        KeyCountAtPosition(effect.paletteKeys, sourcePosition) != 0U;
-    const bool hasParameterSource = std::any_of(
-        effect.paletteStopParameterKeys.begin(),
-        effect.paletteStopParameterKeys.end(),
-        [&](const TimingColourisePaletteStopParameterKey& key) {
-            return std::abs(key.position - sourcePosition) <=
-                   kTimingColouriseKeyTolerance;
-        });
-    if (!hasLegacySource && !hasParameterSource) {
+    const auto clusters = PaletteKeyPositionClusters(effect);
+    const auto sourceClusterIndex =
+        PaletteKeyPositionClusterIndexAtPosition(
+            clusters,
+            sourcePosition);
+    if (!sourceClusterIndex.has_value()) {
         return false;
     }
     if (std::abs(destinationPosition - sourcePosition) <=
         kTimingColouriseKeyTolerance) {
         return true;
     }
-    const bool hasLegacyDestination =
-        KeyCountAtPosition(effect.paletteKeys, destinationPosition) != 0U;
+    const auto& sourceCluster = clusters[*sourceClusterIndex];
+    const auto isSourcePosition = [&](float position) {
+        return PaletteKeyPositionBelongsToCluster(
+            position,
+            sourceCluster);
+    };
+    const auto isDestinationPosition = [&](float position) {
+        if (!std::isfinite(position) || isSourcePosition(position)) {
+            return false;
+        }
+        for (std::size_t index = 0U; index < clusters.size(); ++index) {
+            if (index == *sourceClusterIndex ||
+                DistanceFromPaletteKeyPositionCluster(
+                    clusters[index],
+                    destinationPosition) >
+                    kTimingColouriseKeyTolerance) {
+                continue;
+            }
+            if (PaletteKeyPositionBelongsToCluster(
+                    position,
+                    clusters[index])) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const bool hasLegacySource = std::any_of(
+        effect.paletteKeys.begin(),
+        effect.paletteKeys.end(),
+        [&](const TimingColourisePaletteKey& key) {
+            return isSourcePosition(key.position);
+        });
+    const bool hasLegacyDestination = std::any_of(
+        effect.paletteKeys.begin(),
+        effect.paletteKeys.end(),
+        [&](const TimingColourisePaletteKey& key) {
+            return isDestinationPosition(key.position);
+        });
     if (hasLegacyDestination) {
         // A legacy snapshot owns every stop property at its position.
         return false;
@@ -1596,14 +1725,12 @@ bool CanMoveTimingColourisePaletteKeysAtPosition(
             effect.paletteStopParameterKeys.begin(),
             effect.paletteStopParameterKeys.end(),
             [&](const TimingColourisePaletteStopParameterKey& key) {
-                return std::abs(key.position - destinationPosition) <=
-                       kTimingColouriseKeyTolerance;
+                return isDestinationPosition(key.position);
             })) {
         return false;
     }
     for (const auto& source : effect.paletteStopParameterKeys) {
-        if (std::abs(source.position - sourcePosition) >
-            kTimingColouriseKeyTolerance) {
+        if (!isSourcePosition(source.position)) {
             continue;
         }
         const bool sameTrackOccupied = std::any_of(
@@ -1612,11 +1739,7 @@ bool CanMoveTimingColourisePaletteKeysAtPosition(
             [&](const TimingColourisePaletteStopParameterKey& candidate) {
                 return candidate.stopId == source.stopId &&
                        candidate.parameter == source.parameter &&
-                       std::abs(candidate.position - sourcePosition) >
-                           kTimingColouriseKeyTolerance &&
-                       std::abs(
-                           candidate.position - destinationPosition) <=
-                           kTimingColouriseKeyTolerance;
+                       isDestinationPosition(candidate.position);
             });
         if (sameTrackOccupied) {
             return false;
@@ -1757,17 +1880,28 @@ bool MoveTimingColouriseBoundsParameterKey(
 std::size_t TimingColourisePaletteKeyCountAtPosition(
     const TimingColouriseEffect& effect,
     float position) {
-    if (!std::isfinite(position)) {
+    const auto clusters = PaletteKeyPositionClusters(effect);
+    const auto clusterIndex =
+        PaletteKeyPositionClusterIndexAtPosition(clusters, position);
+    if (!clusterIndex.has_value()) {
         return 0U;
     }
-    return KeyCountAtPosition(effect.paletteKeys, position) +
-           static_cast<std::size_t>(std::count_if(
-               effect.paletteStopParameterKeys.begin(),
-               effect.paletteStopParameterKeys.end(),
-               [&](const TimingColourisePaletteStopParameterKey& key) {
-                   return std::abs(key.position - position) <=
-                          kTimingColouriseKeyTolerance;
-               }));
+    const auto& cluster = clusters[*clusterIndex];
+    const auto belongs = [&](const auto& key) {
+        return PaletteKeyPositionBelongsToCluster(
+            key.position,
+            cluster);
+    };
+    return static_cast<std::size_t>(
+               std::count_if(
+                   effect.paletteKeys.begin(),
+                   effect.paletteKeys.end(),
+                   belongs)) +
+           static_cast<std::size_t>(
+               std::count_if(
+                   effect.paletteStopParameterKeys.begin(),
+                   effect.paletteStopParameterKeys.end(),
+                   belongs));
 }
 
 std::size_t TimingColourisePaletteStopParameterKeyCountAtPosition(
@@ -1829,24 +1963,36 @@ std::size_t TimingColouriseEffectKeyCountAtPosition(
 std::size_t RemoveTimingColourisePaletteKeysAtPosition(
     TimingColouriseEffect* effect,
     float position) {
-    if (effect == nullptr) {
+    if (effect == nullptr || !std::isfinite(position)) {
         return 0U;
     }
-    const auto legacy =
-        RemoveKeysAtPosition(&effect->paletteKeys, position);
-    if (!std::isfinite(position)) {
-        return legacy;
+    const auto clusters = PaletteKeyPositionClusters(*effect);
+    const auto clusterIndex =
+        PaletteKeyPositionClusterIndexAtPosition(clusters, position);
+    if (!clusterIndex.has_value()) {
+        return 0U;
     }
-    const auto previousSize =
+    const auto cluster = clusters[*clusterIndex];
+    const auto previousLegacySize = effect->paletteKeys.size();
+    std::erase_if(
+        effect->paletteKeys,
+        [&](const TimingColourisePaletteKey& key) {
+            return PaletteKeyPositionBelongsToCluster(
+                key.position,
+                cluster);
+        });
+    const auto previousParameterSize =
         effect->paletteStopParameterKeys.size();
     std::erase_if(
         effect->paletteStopParameterKeys,
         [&](const TimingColourisePaletteStopParameterKey& key) {
-            return std::abs(key.position - position) <=
-                   kTimingColouriseKeyTolerance;
+            return PaletteKeyPositionBelongsToCluster(
+                key.position,
+                cluster);
         });
-    return legacy + previousSize -
-                        effect->paletteStopParameterKeys.size();
+    return previousLegacySize - effect->paletteKeys.size() +
+           previousParameterSize -
+               effect->paletteStopParameterKeys.size();
 }
 
 std::size_t RemoveTimingColourisePaletteStopParameterKeysAtPosition(
@@ -1921,15 +2067,26 @@ std::optional<float> PreviousTimingColourisePaletteKeyPosition(
     if (!std::isfinite(position)) {
         return std::nullopt;
     }
-    std::optional<float> best =
-        PreviousKeyPosition(effect.paletteKeys, position);
-    for (const auto& key : effect.paletteStopParameterKeys) {
-        if (key.position < position - kTimingColouriseKeyTolerance &&
-            (!best.has_value() || key.position > best.value())) {
-            best = key.position;
+    const auto clusters = PaletteKeyPositionClusters(effect);
+    if (const auto current =
+            PaletteKeyPositionClusterIndexAtPosition(
+                clusters,
+                position);
+        current.has_value()) {
+        if (*current == 0U) {
+            return std::nullopt;
+        }
+        return clusters[*current - 1U].representative;
+    }
+    for (auto cluster = clusters.rbegin();
+         cluster != clusters.rend();
+         ++cluster) {
+        if (cluster->maximum <
+            position - kTimingColouriseKeyTolerance) {
+            return cluster->representative;
         }
     }
-    return best;
+    return std::nullopt;
 }
 
 std::optional<float> NextTimingColourisePaletteKeyPosition(
@@ -1938,44 +2095,35 @@ std::optional<float> NextTimingColourisePaletteKeyPosition(
     if (!std::isfinite(position)) {
         return std::nullopt;
     }
-    std::optional<float> best =
-        NextKeyPosition(effect.paletteKeys, position);
-    for (const auto& key : effect.paletteStopParameterKeys) {
-        if (key.position > position + kTimingColouriseKeyTolerance &&
-            (!best.has_value() || key.position < best.value())) {
-            best = key.position;
+    const auto clusters = PaletteKeyPositionClusters(effect);
+    if (const auto current =
+            PaletteKeyPositionClusterIndexAtPosition(
+                clusters,
+                position);
+        current.has_value()) {
+        if (*current + 1U >= clusters.size()) {
+            return std::nullopt;
+        }
+        return clusters[*current + 1U].representative;
+    }
+    for (const auto& cluster : clusters) {
+        if (cluster.minimum >
+            position + kTimingColouriseKeyTolerance) {
+            return cluster.representative;
         }
     }
-    return best;
+    return std::nullopt;
 }
 
 std::vector<float> TimingColourisePaletteKeyPositions(
     const TimingColouriseEffect& effect) {
+    const auto clusters = PaletteKeyPositionClusters(effect);
     std::vector<float> positions;
-    positions.reserve(
-        effect.paletteKeys.size() +
-        effect.paletteStopParameterKeys.size());
-    for (const auto& key : effect.paletteKeys) {
-        if (std::isfinite(key.position)) {
-            positions.push_back(Clamp01(key.position));
-        }
+    positions.reserve(clusters.size());
+    for (const auto& cluster : clusters) {
+        positions.push_back(cluster.representative);
     }
-    for (const auto& key : effect.paletteStopParameterKeys) {
-        if (std::isfinite(key.position)) {
-            positions.push_back(Clamp01(key.position));
-        }
-    }
-    std::stable_sort(positions.begin(), positions.end());
-    std::vector<float> unique;
-    unique.reserve(positions.size());
-    for (const float position : positions) {
-        if (unique.empty() ||
-            std::abs(unique.back() - position) >
-                kTimingColouriseKeyTolerance) {
-            unique.push_back(position);
-        }
-    }
-    return unique;
+    return positions;
 }
 
 bool CanRemoveTimingColourisePaletteStop(

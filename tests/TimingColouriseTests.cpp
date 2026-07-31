@@ -461,6 +461,149 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Timing Colourise palette unions transitive tolerance chains",
+    "[timing][colourise][palette][parameters][navigation][tolerance]") {
+    TimingColouriseEffect effect;
+    effect.basePalette = invisible_places::timing::
+        SanitizeTimingColourisePalette({
+            .stops = {
+                {.id = "stop-a", .position = 0.0F},
+                {.id = "stop-b", .position = 1.0F},
+            },
+        });
+    REQUIRE(
+        invisible_places::timing::
+            AddOrUpdateTimingColourisePaletteStopScalarKey(
+                &effect,
+                "stop-a",
+                TimingColourisePaletteStopParameter::Position,
+                0.0F,
+                0.1F));
+    REQUIRE(
+        invisible_places::timing::
+            AddOrUpdateTimingColourisePaletteStopColourKey(
+                &effect,
+                "stop-a",
+                0.00009F,
+                {1.0F, 0.0F, 0.0F}));
+    REQUIRE(
+        invisible_places::timing::
+            AddOrUpdateTimingColourisePaletteStopScalarKey(
+                &effect,
+                "stop-a",
+                TimingColourisePaletteStopParameter::ColouriseAmount,
+                0.00018F,
+                0.5F));
+    REQUIRE(
+        invisible_places::timing::
+            AddOrUpdateTimingColourisePaletteStopScalarKey(
+                &effect,
+                "stop-a",
+                TimingColourisePaletteStopParameter::Position,
+                0.4F,
+                0.8F));
+
+    const auto positions =
+        invisible_places::timing::TimingColourisePaletteKeyPositions(
+            effect);
+    REQUIRE(positions.size() == 2U);
+    CHECK(positions[0] == Approx(0.0F));
+    CHECK(positions[1] == Approx(0.4F));
+    CHECK(
+        invisible_places::timing::TimingColourisePaletteKeyCountAtPosition(
+            effect,
+            0.0F) == 3U);
+    CHECK(
+        invisible_places::timing::TimingColourisePaletteKeyCountAtPosition(
+            effect,
+            0.00018F) == 3U);
+    CHECK_FALSE(
+        invisible_places::timing::
+            PreviousTimingColourisePaletteKeyPosition(
+                effect,
+                0.00018F)
+                .has_value());
+    CHECK(
+        invisible_places::timing::NextTimingColourisePaletteKeyPosition(
+            effect,
+            0.00018F) == Approx(0.4F));
+
+    SECTION("moving the marker moves every property in its cluster") {
+        REQUIRE(
+            invisible_places::timing::MoveTimingColourisePaletteKey(
+                &effect,
+                0.0F,
+                0.25F));
+        CHECK(
+            invisible_places::timing::TimingColourisePaletteKeyPositions(
+                effect) == std::vector<float>{0.25F, 0.4F});
+        CHECK(
+            invisible_places::timing::
+                TimingColourisePaletteKeyCountAtPosition(
+                    effect,
+                    0.25F) == 3U);
+        CHECK(
+            invisible_places::timing::
+                TimingColourisePaletteKeyCountAtPosition(
+                    effect,
+                    0.0F) == 0U);
+    }
+
+    SECTION("deleting the marker deletes every property in its cluster") {
+        CHECK(
+            invisible_places::timing::
+                RemoveTimingColourisePaletteKeysAtPosition(
+                    &effect,
+                    0.0F) == 3U);
+        CHECK(
+            invisible_places::timing::TimingColourisePaletteKeyPositions(
+                effect) == std::vector<float>{0.4F});
+    }
+
+    SECTION("moving detects a same-track collision at a cluster tail") {
+        REQUIRE(
+            invisible_places::timing::
+                AddOrUpdateTimingColourisePaletteStopScalarKey(
+                    &effect,
+                    "stop-b",
+                    TimingColourisePaletteStopParameter::Position,
+                    0.5F,
+                    0.2F));
+        REQUIRE(
+            invisible_places::timing::
+                AddOrUpdateTimingColourisePaletteStopColourKey(
+                    &effect,
+                    "stop-b",
+                    0.50009F,
+                    {0.0F, 1.0F, 0.0F}));
+        REQUIRE(
+            invisible_places::timing::
+                AddOrUpdateTimingColourisePaletteStopScalarKey(
+                    &effect,
+                    "stop-a",
+                    TimingColourisePaletteStopParameter::Position,
+                    0.50018F,
+                    0.9F));
+        CHECK_FALSE(
+            invisible_places::timing::
+                CanMoveTimingColourisePaletteKeysAtPosition(
+                    effect,
+                    0.0F,
+                    0.5F));
+        CHECK_FALSE(
+            invisible_places::timing::MoveTimingColourisePaletteKey(
+                &effect,
+                0.0F,
+                0.5F));
+        CHECK(
+            invisible_places::timing::
+                TimingColourisePaletteKeyCountAtPosition(
+                    effect,
+                    0.0F) == 3U);
+    }
+}
+
+TEST_CASE(
     "Timing Colourise refuses to remove keyed palette topology",
     "[timing][colourise][palette][topology]") {
     TimingColouriseEffect effect;
