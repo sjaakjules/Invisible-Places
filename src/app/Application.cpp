@@ -51427,9 +51427,28 @@ void DrawTimingKeyLaneGroup(
         return;
     }
     ImGui::PushID(id);
+    const auto laneDrawsValueGraph =
+        [&](const TimingColouriseKeyLaneSeries& lane) {
+            if (lane.track == TimingColouriseKeyTrack::Bounds &&
+                lane.boundsParameter.has_value()) {
+                return invisible_places::timing::
+                    TimingColouriseBoundsParameterIsAllowed(
+                        effect->boundsKeyMode,
+                        lane.boundsParameter.value());
+            }
+            return lane.track ==
+                       TimingColouriseKeyTrack::EffectParameter &&
+                   lane.effectParameter.has_value();
+        };
+    const bool drawsValueGraph = std::any_of(
+        series.begin(),
+        series.end(),
+        laneDrawsValueGraph);
+    constexpr float kCompactLaneHeight = 14.0F;
+    constexpr float kValueGraphHeight = 92.0F;
     const ImVec2 size{
         std::max(24.0F, ImGui::GetContentRegionAvail().x),
-        14.0F};
+        drawsValueGraph ? kValueGraphHeight : kCompactLaneHeight};
     ImGui::InvisibleButton(
         "##TimingKeyLaneSurface",
         size,
@@ -51437,7 +51456,12 @@ void DrawTimingKeyLaneGroup(
     const auto minimum = ImGui::GetItemRectMin();
     const auto maximum = ImGui::GetItemRectMax();
     const float width = std::max(1.0F, maximum.x - minimum.x);
-    const float centreY = (minimum.y + maximum.y) * 0.5F;
+    const float axisY =
+        drawsValueGraph
+            ? maximum.y - kCompactLaneHeight * 0.5F
+            : std::midpoint(minimum.y, maximum.y);
+    const float graphTopY = minimum.y + 5.0F;
+    const float graphHeight = std::max(1.0F, axisY - graphTopY);
     const auto activation = invisible_places::timing::
         SanitizeTimingColouriseActivationRange(
             effect->activationRange);
@@ -51527,8 +51551,9 @@ void DrawTimingKeyLaneGroup(
         }
         if (tied.size() > 1U) {
             const float verticalFraction = std::clamp(
-                (mouse.y - minimum.y) /
-                    std::max(1.0F, maximum.y - minimum.y),
+                (mouse.y -
+                 (axisY - kCompactLaneHeight * 0.5F)) /
+                    kCompactLaneHeight,
                 0.0F,
                 0.9999F);
             const auto tiedIndex = std::min<std::size_t>(
@@ -51544,7 +51569,8 @@ void DrawTimingKeyLaneGroup(
     const bool markerHovered =
         ImGui::IsItemHovered() &&
         nearestSeries != nullptr &&
-        nearestDistance <= kMarkerHitRadius;
+        nearestDistance <= kMarkerHitRadius &&
+        std::abs(mouse.y - axisY) <= kMarkerHitRadius;
     const auto sameTrack =
         [](const auto& state,
            const TimingColouriseKeyLaneSeries& lane) {
@@ -51630,6 +51656,35 @@ void DrawTimingKeyLaneGroup(
                            lane.effectParameter.value(),
                            destinationPosition) > 0U;
         };
+    const auto scalarValueAt =
+        [&](const TimingColouriseKeyLaneSeries& lane,
+            float position) -> std::optional<float> {
+            float value = 0.0F;
+            if (lane.track == TimingColouriseKeyTrack::Bounds &&
+                lane.boundsParameter.has_value()) {
+                value = invisible_places::timing::
+                    TimingColouriseBoundsParameterValue(
+                        invisible_places::timing::
+                            EvaluateTimingColouriseBounds(
+                                *effect,
+                                position),
+                        lane.boundsParameter.value());
+            } else if (
+                lane.track ==
+                    TimingColouriseKeyTrack::EffectParameter &&
+                lane.effectParameter.has_value()) {
+                value = invisible_places::timing::
+                    EvaluateTimingColouriseEffectParameter(
+                        *effect,
+                        lane.effectParameter.value(),
+                        position);
+            } else {
+                return std::nullopt;
+            }
+            return std::isfinite(value)
+                       ? std::optional<float>{value}
+                       : std::nullopt;
+        };
 
     auto& timings = runtimeState->timingsPanel;
     bool handledMarkerInteraction = false;
@@ -51640,12 +51695,24 @@ void DrawTimingKeyLaneGroup(
                 nearestPosition) <=
             invisible_places::timing::
                 kTimingColouriseKeyTolerance;
-        ImGui::SetTooltip(
-            onKey
-                ? "%s key at %.4f — drag to move; double-click to type an exact position."
-                : "%s key at %.4f — click to select; drag to move; double-click to select it.",
-            nearestSeries->label,
-            nearestPosition);
+        const auto markerValue =
+            scalarValueAt(*nearestSeries, nearestPosition);
+        if (markerValue.has_value()) {
+            ImGui::SetTooltip(
+                onKey
+                    ? "%s key %.6g at animation position %.4f — drag this axis marker to move it; double-click to type an exact position."
+                    : "%s key %.6g at animation position %.4f — click this axis marker to select it; drag to move it.",
+                nearestSeries->label,
+                markerValue.value(),
+                nearestPosition);
+        } else {
+            ImGui::SetTooltip(
+                onKey
+                    ? "%s key at %.4f — drag this axis marker to move it; double-click to type an exact position."
+                    : "%s key at %.4f — click this axis marker to select it; drag to move it.",
+                nearestSeries->label,
+                nearestPosition);
+        }
         if (ImGui::IsMouseDoubleClicked(
                 ImGuiMouseButton_Left)) {
             handledMarkerInteraction = true;
@@ -51776,6 +51843,237 @@ void DrawTimingKeyLaneGroup(
     }
 
     auto* drawList = ImGui::GetWindowDrawList();
+    const auto markerColour =
+        [&](ImU32 colour, float position) {
+            if (invisible_places::timing::
+                    TimingColouriseActivationRangeContains(
+                        activation,
+                        position)) {
+                return colour;
+            }
+            auto dimmed =
+                ImGui::ColorConvertU32ToFloat4(colour);
+            dimmed.w *= 0.32F;
+            return ImGui::ColorConvertFloat4ToU32(dimmed);
+        };
+
+    struct ValueGraph {
+        const TimingColouriseKeyLaneSeries* lane = nullptr;
+        std::vector<float> values;
+        float minimum = 0.0F;
+        float maximum = 0.0F;
+    };
+    std::vector<float> graphPositions;
+    std::vector<ValueGraph> valueGraphs;
+    if (drawsValueGraph) {
+        const int sampleCount = std::clamp(
+            static_cast<int>(std::ceil(width / 8.0F)),
+            40,
+            160);
+        graphPositions.reserve(
+            static_cast<std::size_t>(sampleCount));
+        for (int index = 0; index < sampleCount; ++index) {
+            graphPositions.push_back(std::lerp(
+                viewMinimum,
+                viewMaximum,
+                sampleCount > 1
+                    ? static_cast<float>(index) /
+                          static_cast<float>(sampleCount - 1)
+                    : 0.0F));
+        }
+
+        const bool hasBoundsSeries = std::any_of(
+            series.begin(),
+            series.end(),
+            [](const auto& lane) {
+                return lane.track == TimingColouriseKeyTrack::Bounds &&
+                       lane.boundsParameter.has_value();
+            });
+        std::vector<invisible_places::timing::TimingColouriseBounds>
+            evaluatedBounds;
+        if (hasBoundsSeries) {
+            evaluatedBounds.reserve(graphPositions.size());
+            for (const float position : graphPositions) {
+                evaluatedBounds.push_back(
+                    invisible_places::timing::
+                        EvaluateTimingColouriseBounds(
+                            *effect,
+                            position));
+            }
+        }
+
+        valueGraphs.reserve(series.size());
+        for (const auto& lane : series) {
+            if (!laneDrawsValueGraph(lane)) {
+                continue;
+            }
+            ValueGraph graph{
+                .lane = &lane,
+                .minimum = std::numeric_limits<float>::max(),
+                .maximum = std::numeric_limits<float>::lowest(),
+            };
+            graph.values.reserve(graphPositions.size());
+            for (std::size_t index = 0U;
+                 index < graphPositions.size();
+                 ++index) {
+                const auto value =
+                    lane.track == TimingColouriseKeyTrack::Bounds
+                        ? std::optional<float>{
+                              invisible_places::timing::
+                                  TimingColouriseBoundsParameterValue(
+                                      evaluatedBounds[index],
+                                      lane.boundsParameter.value())}
+                        : scalarValueAt(
+                              lane,
+                              graphPositions[index]);
+                const float finiteValue =
+                    value.has_value() &&
+                            std::isfinite(value.value())
+                        ? value.value()
+                        : 0.0F;
+                graph.values.push_back(finiteValue);
+                graph.minimum =
+                    std::min(graph.minimum, finiteValue);
+                graph.maximum =
+                    std::max(graph.maximum, finiteValue);
+            }
+            // Include every exact key in the scale even when it lands between
+            // graph samples, and account for the key's live dragged position.
+            for (const float position : lane.positions) {
+                const bool moved =
+                    movedThisFrame && draggedSeries != nullptr &&
+                    sameMoveGroup(*draggedSeries, lane) &&
+                    std::abs(position - movedSourcePosition) <=
+                        invisible_places::timing::
+                            kTimingColouriseKeyTolerance;
+                const float drawnPosition =
+                    moved ? movedDestinationPosition : position;
+                if (!positionInView(drawnPosition)) {
+                    continue;
+                }
+                if (const auto value =
+                        scalarValueAt(lane, drawnPosition);
+                    value.has_value()) {
+                    graph.minimum =
+                        std::min(graph.minimum, value.value());
+                    graph.maximum =
+                        std::max(graph.maximum, value.value());
+                }
+            }
+            const float magnitude = std::max(
+                std::abs(graph.minimum),
+                std::abs(graph.maximum));
+            if (graph.maximum - graph.minimum <=
+                std::max(1.0e-7F, magnitude * 1.0e-6F)) {
+                const float padding =
+                    std::max(1.0e-6F, magnitude * 0.05F);
+                graph.minimum -= padding;
+                graph.maximum += padding;
+            }
+            valueGraphs.push_back(std::move(graph));
+        }
+
+        drawList->AddRectFilled(
+            minimum,
+            maximum,
+            ImGui::GetColorU32(ImGuiCol_FrameBg),
+            2.0F);
+        drawList->AddRect(
+            minimum,
+            maximum,
+            ImGui::GetColorU32(ImGuiCol_Border),
+            2.0F);
+    }
+
+    const auto yForValue =
+        [&](const ValueGraph& graph, float value) {
+            return axisY -
+                   graphHeight * std::clamp(
+                                     (value - graph.minimum) /
+                                         std::max(
+                                             1.0e-7F,
+                                             graph.maximum -
+                                                 graph.minimum),
+                                     0.0F,
+                                     1.0F);
+        };
+    const ValueGraph* hoveredGraph = nullptr;
+    float hoveredGraphPosition = 0.0F;
+    float hoveredGraphValue = 0.0F;
+    float hoveredGraphDistance = 7.0F;
+    for (const auto& graph : valueGraphs) {
+        for (std::size_t index = 1U;
+             index < graphPositions.size();
+             ++index) {
+            const float leftPosition = graphPositions[index - 1U];
+            const float rightPosition = graphPositions[index];
+            const ImU32 segmentColour = markerColour(
+                graph.lane->colour,
+                std::midpoint(leftPosition, rightPosition));
+            drawList->AddLine(
+                ImVec2{
+                    xForPosition(leftPosition),
+                    yForValue(graph, graph.values[index - 1U])},
+                ImVec2{
+                    xForPosition(rightPosition),
+                    yForValue(graph, graph.values[index])},
+                segmentColour,
+                1.5F);
+        }
+        for (std::size_t index = 0U;
+             index < graphPositions.size();
+             ++index) {
+            if (!ImGui::IsItemHovered() ||
+                mouse.y > axisY - kMarkerHitRadius) {
+                break;
+            }
+            const float dx =
+                mouse.x - xForPosition(graphPositions[index]);
+            const float dy =
+                mouse.y - yForValue(graph, graph.values[index]);
+            const float distance = std::hypot(dx, dy);
+            if (distance < hoveredGraphDistance) {
+                hoveredGraphDistance = distance;
+                hoveredGraph = &graph;
+                hoveredGraphPosition = graphPositions[index];
+                hoveredGraphValue = graph.values[index];
+            }
+        }
+        for (const float position : graph.lane->positions) {
+            const bool moved =
+                movedThisFrame && draggedSeries != nullptr &&
+                sameMoveGroup(*draggedSeries, *graph.lane) &&
+                std::abs(position - movedSourcePosition) <=
+                    invisible_places::timing::
+                        kTimingColouriseKeyTolerance;
+            const float drawnPosition =
+                moved ? movedDestinationPosition : position;
+            if (!positionInView(drawnPosition)) {
+                continue;
+            }
+            const auto value =
+                scalarValueAt(*graph.lane, drawnPosition);
+            if (!value.has_value()) {
+                continue;
+            }
+            const ImVec2 point{
+                xForPosition(drawnPosition),
+                yForValue(graph, value.value())};
+            drawList->AddCircleFilled(
+                point,
+                3.5F,
+                markerColour(
+                    graph.lane->colour,
+                    drawnPosition));
+            drawList->AddCircle(
+                point,
+                4.25F,
+                ImGui::GetColorU32(ImGuiCol_Border),
+                0,
+                1.0F);
+        }
+    }
+
     const ImU32 activationColour =
         ImGui::GetColorU32(
             effect->enabled
@@ -51794,10 +52092,10 @@ void DrawTimingKeyLaneGroup(
         drawList->AddRectFilled(
             ImVec2{
                 xForPosition(visibleActivationStart),
-                centreY - 2.5F},
+                axisY - 2.5F},
             ImVec2{
                 xForPosition(visibleActivationEnd),
-                centreY + 2.5F},
+                axisY + 2.5F},
             activationColour,
             2.0F);
     }
@@ -51811,33 +52109,20 @@ void DrawTimingKeyLaneGroup(
         }
         const float x = xForPosition(boundary);
         drawList->AddLine(
-            ImVec2{x, centreY - 4.0F},
-            ImVec2{x, centreY + 4.0F},
+            ImVec2{x, axisY - 4.0F},
+            ImVec2{x, axisY + 4.0F},
             activationBoundaryColour,
             1.0F);
     }
     drawList->AddLine(
-        ImVec2{minimum.x, centreY},
-        ImVec2{maximum.x, centreY},
+        ImVec2{minimum.x, axisY},
+        ImVec2{maximum.x, axisY},
         ImGui::GetColorU32(ImGuiCol_Border));
     const float scrubPosition = std::clamp(
         runtimeState->animationPanel.scrubAmount,
         0.0F,
         1.0F);
     const float scrubX = xForPosition(scrubPosition);
-    const auto markerColour =
-        [&](ImU32 colour, float position) {
-            if (invisible_places::timing::
-                    TimingColouriseActivationRangeContains(
-                        activation,
-                        position)) {
-                return colour;
-            }
-            auto dimmed =
-                ImGui::ColorConvertU32ToFloat4(colour);
-            dimmed.w *= 0.32F;
-            return ImGui::ColorConvertFloat4ToU32(dimmed);
-        };
     for (const auto& lane : series) {
         for (const float position : lane.positions) {
             const bool isMovedMarker =
@@ -51862,13 +52147,13 @@ void DrawTimingKeyLaneGroup(
                         kTimingColouriseKeyTolerance;
             if (isMovedMarker) {
                 drawList->AddCircleFilled(
-                    ImVec2{x, centreY},
+                    ImVec2{x, axisY},
                     4.25F,
                     drawnColour);
             } else if (!isHoveredMarker) {
                 drawList->AddLine(
-                    ImVec2{x, centreY - 4.5F},
-                    ImVec2{x, centreY + 4.5F},
+                    ImVec2{x, axisY - 4.5F},
+                    ImVec2{x, axisY + 4.5F},
                     drawnColour,
                     2.0F);
             }
@@ -51878,8 +52163,8 @@ void DrawTimingKeyLaneGroup(
                 invisible_places::timing::
                     kTimingColouriseKeyTolerance) {
                 drawList->AddLine(
-                    ImVec2{x - 3.0F, centreY - 5.5F},
-                    ImVec2{x + 3.0F, centreY - 5.5F},
+                    ImVec2{x - 3.0F, axisY - 5.5F},
+                    ImVec2{x + 3.0F, axisY - 5.5F},
                     ImGui::GetColorU32(
                         ImGuiCol_SliderGrabActive),
                     1.5F);
@@ -51897,7 +52182,7 @@ void DrawTimingKeyLaneGroup(
                 : nearestPosition;
         const float x = xForPosition(drawnPosition);
         drawList->AddCircleFilled(
-            ImVec2{x, centreY},
+            ImVec2{x, axisY},
             4.25F,
             markerColour(
                 nearestSeries->colour,
@@ -51911,16 +52196,27 @@ void DrawTimingKeyLaneGroup(
             std::abs(
                 mouseX -
                 xForPosition(activation.end));
-        if (std::min(startDistance, endDistance) <= 5.0F) {
+        const bool axisHovered =
+            std::abs(mouse.y - axisY) <= kMarkerHitRadius;
+        if (axisHovered &&
+            std::min(startDistance, endDistance) <= 5.0F) {
             ImGui::SetTooltip(
-                "%s activation boundary at %.4f (derived, not a key). Edit it in the Activation overview above.",
+                "%s active-range boundary at %.4f (derived, not a key). Edit it in Visual Features above.",
                 startDistance <= endDistance ? "Start" : "End",
                 startDistance <= endDistance
                     ? activation.start
                     : activation.end);
+        } else if (hoveredGraph != nullptr) {
+            ImGui::SetTooltip(
+                "%s %.6g at animation position %.4f\nGraph range %.6g–%.6g; each setting is scaled from its own minimum at the axis to its maximum at the top.",
+                hoveredGraph->lane->label,
+                hoveredGraphValue,
+                hoveredGraphPosition,
+                hoveredGraph->minimum,
+                hoveredGraph->maximum);
         } else {
             ImGui::SetTooltip(
-                "Animation position %.4f — click or drag to scrub.",
+                "Animation position %.4f — click or drag to scrub. Drag coloured key markers on the horizontal axis to retime them.",
                 positionForX(mouseX));
         }
     }
@@ -51928,6 +52224,15 @@ void DrawTimingKeyLaneGroup(
     // The shared playhead is independent of authored keys. Keep its black
     // downward triangle visible between keys as well as on them; Active Range
     // view pins an out-of-range playhead to the appropriate edge.
+    const float playheadTipY =
+        drawsValueGraph ? graphTopY + 7.0F : axisY - 0.5F;
+    if (drawsValueGraph) {
+        drawList->AddLine(
+            ImVec2{scrubX, playheadTipY},
+            ImVec2{scrubX, axisY - 1.0F},
+            IM_COL32(18, 18, 18, 118),
+            1.0F);
+    }
     drawList->AddTriangleFilled(
         ImVec2{
             std::max(minimum.x, scrubX - 4.0F),
@@ -51935,7 +52240,7 @@ void DrawTimingKeyLaneGroup(
         ImVec2{
             std::min(maximum.x, scrubX + 4.0F),
             minimum.y + 1.0F},
-        ImVec2{scrubX, centreY - 0.5F},
+        ImVec2{scrubX, playheadTipY},
         IM_COL32(18, 18, 18, 255));
 
     bool closeEditor = false;
@@ -52790,7 +53095,9 @@ void DrawTimingEmissiveLevelEditor(
         .positions = std::span<const float>{keyPositions},
         .colour = IM_COL32(244, 155, 78, 255),
     };
-    ImGui::TextDisabled("Animation position");
+    ImGui::TextDisabled("Value over animation position");
+    DrawTimingControlTooltip(
+        "Curve height shows the evaluated setting value, scaled from that setting's visible minimum at the horizontal axis to its maximum at the top. Key dots show authored values; drag their matching coloured axis markers to retime them.");
     DrawTimingKeyLaneGroup(
         "##TimingEmissiveLevelKeyLane",
         runtimeState,
@@ -53687,7 +53994,9 @@ void DrawTimingColourisePaletteEditor(
             .colour = IM_COL32(238, 174, 72, 255),
         },
     };
-    ImGui::TextDisabled("Animation position");
+    ImGui::TextDisabled("Value over animation position");
+    DrawTimingControlTooltip(
+        "Each coloured curve uses its own visible value range so its slope shows acceleration and speed clearly. Key dots are visual; drag the matching coloured markers on the horizontal axis to retime keys.");
     DrawTimingKeyLaneGroup(
         "##TimingColouriseEffectParameterKeyLane",
         runtimeState,
@@ -56237,7 +56546,9 @@ void DrawTimingColouriseBoundsEditor(
             .colour = laneColours[index],
         };
     }
-    ImGui::TextDisabled("Animation position");
+    ImGui::TextDisabled("Value over animation position");
+    DrawTimingControlTooltip(
+        "Allowed Bounds settings are drawn as coloured evaluated curves, each scaled over its own visible value range. Key dots are visual; drag matching coloured markers on the horizontal axis to retime keys.");
     DrawTimingKeyLaneGroup(
         "##TimingColouriseBoundsParameterKeyLane",
         runtimeState,
