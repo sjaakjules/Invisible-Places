@@ -399,6 +399,49 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Timing Colourise display density preserves a broad peak around endpoint spikes",
+    "[timing][colourise][histogram][display]") {
+    constexpr auto binCount = invisible_places::timing::
+        kTimingColouriseHistogramBinCount;
+    constexpr auto middle = binCount / 2U;
+    std::array<std::uint64_t, binCount> bins{};
+    bins.fill(100U);
+    bins.front() = 53'400U;
+    bins.back() = 45'744U;
+    for (std::size_t index = middle - 64U;
+         index <= middle + 64U;
+         ++index) {
+        const auto distance =
+            index > middle ? index - middle : middle - index;
+        bins[index] = 2'400U - distance * 10U;
+    }
+    const auto histogram = MakeHistogram(-1.0F, 1.0F, bins);
+    const auto displayBins = invisible_places::timing::
+        BuildTimingColouriseHistogramDisplayBins(histogram);
+
+    REQUIRE(displayBins.size() == bins.size());
+    std::uint64_t expectedFirstWindow = 0U;
+    constexpr auto windowSize =
+        binCount /
+        invisible_places::timing::
+            kTimingColouriseHistogramReferenceDisplayBinCount;
+    for (std::size_t index = 0U; index < windowSize; ++index) {
+        expectedFirstWindow += bins[index];
+    }
+    CHECK(displayBins.front() == expectedFirstWindow);
+    CHECK(displayBins[middle] > displayBins.front());
+    CHECK(displayBins[middle] > displayBins.back());
+    const auto maximum = std::max_element(
+        displayBins.begin(),
+        displayBins.end());
+    REQUIRE(maximum != displayBins.end());
+    const auto maximumIndex = static_cast<std::size_t>(
+        std::distance(displayBins.begin(), maximum));
+    CHECK(maximumIndex >= middle - 64U);
+    CHECK(maximumIndex <= middle + 64U);
+}
+
+TEST_CASE(
     "Timing Colourise distribution axis is monotone invertible and zero anchored",
     "[timing][colourise][histogram][axis]") {
     using invisible_places::timing::

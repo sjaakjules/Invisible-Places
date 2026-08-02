@@ -833,6 +833,37 @@ bool IsGeneratedTimingColouriseScalarField(
         });
 }
 
+std::vector<std::uint64_t>
+BuildTimingColouriseHistogramDisplayBins(
+    const TimingColouriseHistogram& histogram) {
+    const std::size_t binCount = histogram.bins.size();
+    if (binCount == 0U) {
+        return {};
+    }
+    const std::size_t windowSize = std::clamp<std::size_t>(
+        binCount /
+            kTimingColouriseHistogramReferenceDisplayBinCount,
+        1U,
+        binCount);
+    std::vector<std::uint64_t> cumulative(binCount + 1U, 0U);
+    for (std::size_t index = 0U; index < binCount; ++index) {
+        cumulative[index + 1U] =
+            cumulative[index] + histogram.bins[index];
+    }
+    std::vector<std::uint64_t> displayBins(binCount, 0U);
+    const std::size_t halfWindow = windowSize / 2U;
+    const std::size_t latestStart = binCount - windowSize;
+    for (std::size_t index = 0U; index < binCount; ++index) {
+        const std::size_t centredStart =
+            index > halfWindow ? index - halfWindow : 0U;
+        const std::size_t start =
+            std::min(centredStart, latestStart);
+        const std::size_t end = start + windowSize;
+        displayBins[index] = cumulative[end] - cumulative[start];
+    }
+    return displayBins;
+}
+
 float TimingColouriseHistogramDisplayHeight(
     std::uint64_t binCount,
     std::uint64_t minimumBinCount,

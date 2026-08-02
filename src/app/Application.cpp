@@ -728,6 +728,7 @@ struct TimingColouriseHistogram {
     std::string signature;
     invisible_places::timing::TimingColouriseFieldSelector selector{};
     invisible_places::timing::TimingColouriseHistogram data{};
+    std::vector<std::uint64_t> displayBins;
 };
 
 struct TimingColouriseHistogramTask {
@@ -54704,10 +54705,14 @@ void StartTimingColouriseHistogramBatch(
                 [](const TimingColouriseHistogramTask& task,
                    invisible_places::timing::
                        TimingColouriseHistogram histogram) {
+                    auto displayBins = invisible_places::timing::
+                        BuildTimingColouriseHistogramDisplayBins(
+                            histogram);
                     return TimingColouriseHistogram{
                         .signature = task.signature,
                         .selector = task.selector,
                         .data = std::move(histogram),
+                        .displayBins = std::move(displayBins),
                     };
                 };
 
@@ -55418,17 +55423,16 @@ void DrawTimingColouriseHistogram(
     const auto maximum = ImGui::GetItemRectMax();
     auto* drawList = ImGui::GetWindowDrawList();
     const auto& histogramData = histogram->data;
+    const auto& histogramDisplayBins =
+        histogram->displayBins.size() ==
+                histogramData.bins.size()
+            ? histogram->displayBins
+            : histogramData.bins;
     const auto axis =
         invisible_places::timing::
             BuildTimingColouriseHistogramAxis(
                 histogramData,
                 requestedAxisMode);
-    const auto [minimumBinIterator, maximumBinIterator] =
-        std::minmax_element(
-        histogramData.bins.begin(),
-        histogramData.bins.end());
-    const auto minimumBin = *minimumBinIterator;
-    const auto maximumBin = *maximumBinIterator;
     const float width = maximum.x - minimum.x;
     const float height = maximum.y - minimum.y;
     // The persistent histogram is deliberately much finer than the graph.
@@ -55436,71 +55440,104 @@ void DrawTimingColouriseHistogram(
     // widened by Distribution Spread is therefore drawn independently, while
     // the long low-density tails remain inexpensive to display.
     constexpr float kMinimumDisplayBucketWidth = 1.0F;
-    std::uint64_t displayBucketTotal = 0U;
-    std::size_t displayBucketBinCount = 0U;
-    float displayBucketX0 = minimum.x;
-    const auto flushDisplayBucket =
-        [&](float requestedX1) {
-            if (displayBucketBinCount == 0U) {
-                return;
+    const auto forEachDisplayBucket =
+        [&](auto&& visit) {
+            std::uint64_t displayBucketTotal = 0U;
+            std::size_t displayBucketBinCount = 0U;
+            float displayBucketX0 = minimum.x;
+            const auto flushDisplayBucket =
+                [&](float requestedX1) {
+                    if (displayBucketBinCount == 0U) {
+                        return;
+                    }
+                    const auto averageCount =
+                        displayBucketTotal /
+                        static_cast<std::uint64_t>(
+                            displayBucketBinCount);
+                    const float x1 = std::min(
+                        maximum.x,
+                        std::max(
+                            requestedX1,
+                            displayBucketX0 + 1.0F));
+                    visit(
+                        displayBucketX0,
+                        x1,
+                        averageCount);
+                    displayBucketTotal = 0U;
+                    displayBucketBinCount = 0U;
+                    displayBucketX0 = requestedX1;
+                };
+            float binX0 = minimum.x;
+            for (std::size_t index = 0U;
+                 index < histogramData.bins.size();
+                 ++index) {
+                const float rawX1 = std::lerp(
+                    histogramData.minimum,
+                    histogramData.maximum,
+                    static_cast<float>(index + 1U) /
+                        static_cast<float>(
+                            histogramData.bins.size()));
+                const float binX1 =
+                    minimum.x + width * axis.RawToUnit(rawX1);
+                const float sourceBinWidth = binX1 - binX0;
+                if (displayBucketBinCount > 0U &&
+                    sourceBinWidth >=
+                        kMinimumDisplayBucketWidth) {
+                    flushDisplayBucket(binX0);
+                }
+                if (displayBucketBinCount == 0U) {
+                    displayBucketX0 = binX0;
+                }
+                displayBucketTotal +=
+                    histogramDisplayBins[index];
+                ++displayBucketBinCount;
+                const bool bucketIsVisible =
+                    binX1 - displayBucketX0 >=
+                    kMinimumDisplayBucketWidth;
+                if (sourceBinWidth >=
+                        kMinimumDisplayBucketWidth ||
+                    bucketIsVisible ||
+                    index + 1U ==
+                        histogramData.bins.size()) {
+                    flushDisplayBucket(binX1);
+                }
+                binX0 = binX1;
             }
-            const auto averageCount =
-                displayBucketTotal /
-                static_cast<std::uint64_t>(
-                    displayBucketBinCount);
+        };
+
+    // Normalize after the high-resolution bins have been merged for this
+    // horizontal axis. Normalizing against an unmerged one-bin spike would
+    // then averaging that spike into a pixel bucket, flattening every visible
+    // bar. Each axis keeps its own displayed minimum at zero and maximum at
+    // full graph height; Distribution Spread still changes only x spacing.
+    std::uint64_t minimumDisplayCount =
+        std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t maximumDisplayCount = 0U;
+    bool hasDisplayBuckets = false;
+    forEachDisplayBucket(
+        [&](float, float, std::uint64_t averageCount) {
+            minimumDisplayCount =
+                std::min(minimumDisplayCount, averageCount);
+            maximumDisplayCount =
+                std::max(maximumDisplayCount, averageCount);
+            hasDisplayBuckets = true;
+        });
+    if (!hasDisplayBuckets) {
+        minimumDisplayCount = 0U;
+    }
+    forEachDisplayBucket(
+        [&](float x0, float x1, std::uint64_t averageCount) {
             const float amount =
                 invisible_places::timing::
                     TimingColouriseHistogramDisplayHeight(
                         averageCount,
-                        minimumBin,
-                        maximumBin);
-            const float x1 = std::min(
-                maximum.x,
-                std::max(
-                    requestedX1,
-                    displayBucketX0 + 1.0F));
+                        minimumDisplayCount,
+                        maximumDisplayCount);
             drawList->AddRectFilled(
-                ImVec2{
-                    displayBucketX0,
-                    maximum.y - amount * height},
+                ImVec2{x0, maximum.y - amount * height},
                 ImVec2{x1, maximum.y},
                 IM_COL32(118, 156, 184, 210));
-            displayBucketTotal = 0U;
-            displayBucketBinCount = 0U;
-            displayBucketX0 = requestedX1;
-        };
-    float binX0 = minimum.x;
-    for (std::size_t index = 0U;
-         index < histogramData.bins.size();
-         ++index) {
-        const float rawX1 = std::lerp(
-            histogramData.minimum,
-            histogramData.maximum,
-            static_cast<float>(index + 1U) /
-                static_cast<float>(
-                    histogramData.bins.size()));
-        const float binX1 =
-            minimum.x + width * axis.RawToUnit(rawX1);
-        const float sourceBinWidth = binX1 - binX0;
-        if (displayBucketBinCount > 0U &&
-            sourceBinWidth >= kMinimumDisplayBucketWidth) {
-            flushDisplayBucket(binX0);
-        }
-        if (displayBucketBinCount == 0U) {
-            displayBucketX0 = binX0;
-        }
-        displayBucketTotal += histogramData.bins[index];
-        ++displayBucketBinCount;
-        const bool bucketIsVisible =
-            binX1 - displayBucketX0 >=
-            kMinimumDisplayBucketWidth;
-        if (sourceBinWidth >= kMinimumDisplayBucketWidth ||
-            bucketIsVisible ||
-            index + 1U == histogramData.bins.size()) {
-            flushDisplayBucket(binX1);
-        }
-        binX0 = binX1;
-    }
+        });
     drawList->AddRect(
         minimum,
         maximum,
@@ -55638,8 +55675,8 @@ void DrawTimingColouriseHistogram(
             "Drag the centre rail to translate the interval. Drag either rail circle to resize symmetrically.\n"
             "The sideways T handles set signed Fade: inward is positive, outward is negative.\n"} +
         (axis.UsesDistributionSpread()
-             ? "Distribution Spread uses the cached high-resolution distribution for graph spacing and drag sensitivity; authored values remain raw."
-             : "Histogram heights show the finite full-scene scalar distribution.");
+             ? "Distribution Spread uses the cached high-resolution distribution for graph spacing and drag sensitivity; the vertical density shape stays in raw-value space and authored values remain raw."
+             : "Histogram heights show the finite full-scene scalar distribution using a fixed raw-value density window.");
     const bool watermarkHovered = DrawTimingCornerHelpMark(
         drawList,
         minimum,

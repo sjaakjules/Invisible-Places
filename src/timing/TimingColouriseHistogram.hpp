@@ -20,6 +20,8 @@ namespace invisible_places::timing {
 // buckets for Distribution Spread to reveal narrow concentrations even when
 // a handful of outliers make the raw range much wider than the useful data.
 inline constexpr std::size_t kTimingColouriseHistogramBinCount = 16'384U;
+inline constexpr std::size_t
+    kTimingColouriseHistogramReferenceDisplayBinCount = 256U;
 inline constexpr std::uint32_t
     kTimingColouriseHistogramCacheSchemaVersion = 2U;
 inline constexpr std::size_t kTimingColouriseAuthoredLayerCount = 3U;
@@ -74,6 +76,14 @@ struct TimingColouriseHistogram {
                finiteValueCount > 0U && maximum >= minimum;
     }
 };
+
+// Integrates the high-resolution counts over a sliding raw-value window the
+// width of one former 256-bin bucket. This preserves broad distribution shape
+// and prevents isolated endpoint spikes from flattening the graph, while the
+// original 16,384 bins remain available to the Distribution Spread axis.
+[[nodiscard]] std::vector<std::uint64_t>
+BuildTimingColouriseHistogramDisplayBins(
+    const TimingColouriseHistogram& histogram);
 
 // Maps a bin count linearly onto the histogram's occupied display range. The
 // least-populated bucket is pinned to zero and the most-populated bucket to
