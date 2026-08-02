@@ -580,6 +580,15 @@ void AddOrUpdateTimingColouriseBoundsKey(
     TimingColouriseEffect* effect,
     float sourcePosition,
     float destinationPosition);
+// Checks the complete move group for collisions. The requested parameter and
+// a coincident geometric partner selected by Bounds Keying form one group;
+// Edge Fade remains independent.
+[[nodiscard]] bool CanMoveTimingColouriseBoundsParameterKeysAtPosition(
+    const TimingColouriseEffect& effect,
+    TimingColouriseBoundsParameter parameter,
+    float sourcePosition,
+    float destinationPosition);
+// Moves the complete bounds-parameter group described above atomically.
 [[nodiscard]] bool MoveTimingColouriseBoundsParameterKey(
     TimingColouriseEffect* effect,
     TimingColouriseBoundsParameter parameter,

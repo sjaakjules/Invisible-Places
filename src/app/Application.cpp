@@ -51615,11 +51615,12 @@ void DrawTimingKeyLaneGroup(
             }
             if (lane.track == TimingColouriseKeyTrack::Bounds) {
                 return lane.boundsParameter.has_value() &&
-                       invisible_places::timing::
-                           TimingColouriseBoundsParameterKeyCountAtPosition(
-                               *effect,
-                               lane.boundsParameter.value(),
-                               destinationPosition) > 0U;
+                       !invisible_places::timing::
+                            CanMoveTimingColouriseBoundsParameterKeysAtPosition(
+                                *effect,
+                                lane.boundsParameter.value(),
+                                sourcePosition,
+                                destinationPosition);
             }
             return lane.effectParameter.has_value() &&
                    invisible_places::timing::
@@ -51695,6 +51696,33 @@ void DrawTimingKeyLaneGroup(
             ? findMatchingSeries(
                   timings.colouriseLocalKeyDrag.value())
             : nullptr;
+    const auto sameMoveGroup =
+        [&](const TimingColouriseKeyLaneSeries& left,
+            const TimingColouriseKeyLaneSeries& right) {
+            if (sameTrack(left, right)) {
+                return true;
+            }
+            if (left.track != TimingColouriseKeyTrack::Bounds ||
+                right.track != TimingColouriseKeyTrack::Bounds ||
+                !left.boundsParameter.has_value() ||
+                !right.boundsParameter.has_value()) {
+                return false;
+            }
+            const auto geometricParameters =
+                invisible_places::timing::
+                    TimingColouriseBoundsParametersForMode(
+                        effect->boundsKeyMode);
+            const auto isGeometric =
+                [&](auto parameter) {
+                    return std::find(
+                               geometricParameters.begin(),
+                               geometricParameters.end(),
+                               parameter) !=
+                           geometricParameters.end();
+                };
+            return isGeometric(left.boundsParameter.value()) &&
+                   isGeometric(right.boundsParameter.value());
+        };
     // Empty lane space is a compact local scrubber. ImGui keeps the clicked
     // item active while the button is held, so the same path supports both a
     // single jump and continuous drag-scrubbing without stealing marker
@@ -51813,7 +51841,7 @@ void DrawTimingKeyLaneGroup(
         for (const float position : lane.positions) {
             const bool isMovedMarker =
                 movedThisFrame && draggedSeries != nullptr &&
-                sameTrack(*draggedSeries, lane) &&
+                sameMoveGroup(*draggedSeries, lane) &&
                 std::abs(position - movedSourcePosition) <=
                     invisible_places::timing::
                         kTimingColouriseKeyTolerance;
@@ -51860,7 +51888,7 @@ void DrawTimingKeyLaneGroup(
     if (markerHovered && nearestSeries != nullptr) {
         const float drawnPosition =
             movedThisFrame && draggedSeries != nullptr &&
-                    sameTrack(*draggedSeries, *nearestSeries) &&
+                    sameMoveGroup(*draggedSeries, *nearestSeries) &&
                     std::abs(nearestPosition - movedSourcePosition) <=
                         invisible_places::timing::
                             kTimingColouriseKeyTolerance

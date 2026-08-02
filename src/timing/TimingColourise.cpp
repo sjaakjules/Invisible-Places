@@ -3132,42 +3132,108 @@ bool MoveTimingColouriseBoundsKey(
     return true;
 }
 
+bool CanMoveTimingColouriseBoundsParameterKeysAtPosition(
+    const TimingColouriseEffect& effect,
+    TimingColouriseBoundsParameter parameter,
+    float sourcePosition,
+    float destinationPosition) {
+    if (!TimingColouriseBoundsParameterIsAllowed(
+            effect.boundsKeyMode,
+            parameter) ||
+        !std::isfinite(sourcePosition) ||
+        !std::isfinite(destinationPosition) ||
+        destinationPosition < 0.0F || destinationPosition > 1.0F) {
+        return false;
+    }
+    const auto geometricParameters =
+        TimingColouriseBoundsParametersForMode(effect.boundsKeyMode);
+    const bool moveGeometricPair =
+        std::find(
+            geometricParameters.begin(),
+            geometricParameters.end(),
+            parameter) != geometricParameters.end();
+    const auto movesParameter =
+        [&](TimingColouriseBoundsParameter candidate) {
+            return candidate == parameter ||
+                   (moveGeometricPair &&
+                    std::find(
+                        geometricParameters.begin(),
+                        geometricParameters.end(),
+                        candidate) != geometricParameters.end());
+        };
+    const bool hasRequestedSource = std::any_of(
+        effect.boundsParameterKeys.begin(),
+        effect.boundsParameterKeys.end(),
+        [&](const TimingColouriseBoundsParameterKey& key) {
+            return key.parameter == parameter &&
+                   std::abs(key.position - sourcePosition) <=
+                       kTimingColouriseKeyTolerance;
+        });
+    if (!hasRequestedSource) {
+        return false;
+    }
+    if (std::abs(destinationPosition - sourcePosition) <=
+        kTimingColouriseKeyTolerance) {
+        return true;
+    }
+    for (const auto& source : effect.boundsParameterKeys) {
+        if (!movesParameter(source.parameter) ||
+            std::abs(source.position - sourcePosition) >
+                kTimingColouriseKeyTolerance) {
+            continue;
+        }
+        const bool occupied = std::any_of(
+            effect.boundsParameterKeys.begin(),
+            effect.boundsParameterKeys.end(),
+            [&](const TimingColouriseBoundsParameterKey& candidate) {
+                return candidate.parameter == source.parameter &&
+                       std::abs(candidate.position - sourcePosition) >
+                           kTimingColouriseKeyTolerance &&
+                       std::abs(
+                           candidate.position - destinationPosition) <=
+                           kTimingColouriseKeyTolerance;
+            });
+        if (occupied) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool MoveTimingColouriseBoundsParameterKey(
     TimingColouriseEffect* effect,
     TimingColouriseBoundsParameter parameter,
     float sourcePosition,
     float destinationPosition) {
     if (effect == nullptr ||
-        !TimingColouriseBoundsParameterIsAllowed(
-            effect->boundsKeyMode,
-            parameter)) {
+        !CanMoveTimingColouriseBoundsParameterKeysAtPosition(
+            *effect,
+            parameter,
+            sourcePosition,
+            destinationPosition)) {
         return false;
     }
-    const auto source = std::find_if(
-        effect->boundsParameterKeys.begin(),
-        effect->boundsParameterKeys.end(),
-        [&](const TimingColouriseBoundsParameterKey& key) {
-            return key.parameter == parameter &&
-                   std::abs(key.position - sourcePosition) <=
-                       kTimingColouriseKeyTolerance;
-        });
-    if (source == effect->boundsParameterKeys.end() ||
-        !std::isfinite(destinationPosition) ||
-        destinationPosition < 0.0F || destinationPosition > 1.0F) {
-        return false;
+    const auto geometricParameters =
+        TimingColouriseBoundsParametersForMode(effect->boundsKeyMode);
+    const bool moveGeometricPair =
+        std::find(
+            geometricParameters.begin(),
+            geometricParameters.end(),
+            parameter) != geometricParameters.end();
+    for (auto& key : effect->boundsParameterKeys) {
+        const bool parameterMoves =
+            key.parameter == parameter ||
+            (moveGeometricPair &&
+             std::find(
+                 geometricParameters.begin(),
+                 geometricParameters.end(),
+                 key.parameter) != geometricParameters.end());
+        if (parameterMoves &&
+            std::abs(key.position - sourcePosition) <=
+                kTimingColouriseKeyTolerance) {
+            key.position = destinationPosition;
+        }
     }
-    const bool occupied = std::any_of(
-        effect->boundsParameterKeys.begin(),
-        effect->boundsParameterKeys.end(),
-        [&](const TimingColouriseBoundsParameterKey& key) {
-            return &key != &*source && key.parameter == parameter &&
-                   std::abs(key.position - destinationPosition) <=
-                       kTimingColouriseKeyTolerance;
-        });
-    if (occupied) {
-        return false;
-    }
-    source->position = destinationPosition;
     SortAndCoalesceBoundsParameterKeys(&effect->boundsParameterKeys);
     return true;
 }

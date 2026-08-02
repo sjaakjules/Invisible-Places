@@ -2802,7 +2802,7 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "Timing Colourise local key moves are isolated to their own lane",
+    "Timing Colourise noncoincident local keys stay isolated to their own lane",
     "[timing][colourise][keys][local-move]") {
     TimingColouriseEffect effect;
     REQUIRE(
@@ -2886,6 +2886,139 @@ TEST_CASE(
                 &effect,
                 0.4F,
                 0.9F));
+}
+
+TEST_CASE(
+    "Timing Colourise coincident geometric bounds keys move together",
+    "[timing][colourise][bounds][keys][local-move]") {
+    TimingColouriseEffect effect;
+    REQUIRE(
+        invisible_places::timing::
+            AddOrUpdateTimingColouriseBoundsParameterKey(
+                &effect,
+                TimingColouriseBoundsParameter::Lower,
+                0.2F,
+                1.0F));
+    REQUIRE(
+        invisible_places::timing::
+            AddOrUpdateTimingColouriseBoundsParameterKey(
+                &effect,
+                TimingColouriseBoundsParameter::Upper,
+                0.2F,
+                4.0F));
+    REQUIRE(
+        invisible_places::timing::
+            AddOrUpdateTimingColouriseBoundsParameterKey(
+                &effect,
+                TimingColouriseBoundsParameter::EdgeFade,
+                0.2F,
+                0.1F));
+    REQUIRE(
+        invisible_places::timing::
+            AddOrUpdateTimingColouriseBoundsParameterKey(
+                &effect,
+                TimingColouriseBoundsParameter::Upper,
+                0.8F,
+                5.0F));
+
+    CHECK(
+        invisible_places::timing::
+            CanMoveTimingColouriseBoundsParameterKeysAtPosition(
+                effect,
+                TimingColouriseBoundsParameter::Lower,
+                0.2F,
+                0.4F));
+    REQUIRE(
+        invisible_places::timing::
+            MoveTimingColouriseBoundsParameterKey(
+                &effect,
+                TimingColouriseBoundsParameter::Lower,
+                0.2F,
+                0.4F));
+    CHECK(
+        invisible_places::timing::
+            TimingColouriseBoundsParameterKeyCountAtPosition(
+                effect,
+                TimingColouriseBoundsParameter::Lower,
+                0.4F) == 1U);
+    CHECK(
+        invisible_places::timing::
+            TimingColouriseBoundsParameterKeyCountAtPosition(
+                effect,
+                TimingColouriseBoundsParameter::Upper,
+                0.4F) == 1U);
+    CHECK(
+        invisible_places::timing::
+            TimingColouriseBoundsParameterKeyCountAtPosition(
+                effect,
+                TimingColouriseBoundsParameter::EdgeFade,
+                0.2F) == 1U);
+
+    REQUIRE(
+        invisible_places::timing::
+            MoveTimingColouriseBoundsParameterKey(
+                &effect,
+                TimingColouriseBoundsParameter::Upper,
+                0.4F,
+                0.6F));
+    CHECK(
+        invisible_places::timing::
+            TimingColouriseBoundsParameterKeyCountAtPosition(
+                effect,
+                TimingColouriseBoundsParameter::Lower,
+                0.6F) == 1U);
+    CHECK(
+        invisible_places::timing::
+            TimingColouriseBoundsParameterKeyCountAtPosition(
+                effect,
+                TimingColouriseBoundsParameter::Upper,
+                0.6F) == 1U);
+    REQUIRE(
+        invisible_places::timing::
+            MoveTimingColouriseBoundsParameterKey(
+                &effect,
+                TimingColouriseBoundsParameter::EdgeFade,
+                0.2F,
+                0.3F));
+    CHECK(
+        invisible_places::timing::
+            TimingColouriseBoundsParameterKeyCountAtPosition(
+                effect,
+                TimingColouriseBoundsParameter::EdgeFade,
+                0.3F) == 1U);
+    CHECK(
+        invisible_places::timing::
+            TimingColouriseBoundsParameterKeyCountAtPosition(
+                effect,
+                TimingColouriseBoundsParameter::Lower,
+                0.6F) == 1U);
+
+    CHECK_FALSE(
+        invisible_places::timing::
+            CanMoveTimingColouriseBoundsParameterKeysAtPosition(
+                effect,
+                TimingColouriseBoundsParameter::Lower,
+                0.6F,
+                0.8F));
+    CHECK_FALSE(
+        invisible_places::timing::
+            MoveTimingColouriseBoundsParameterKey(
+                &effect,
+                TimingColouriseBoundsParameter::Lower,
+                0.6F,
+                0.8F));
+    CHECK(
+        invisible_places::timing::
+            TimingColouriseBoundsParameterKeyCountAtPosition(
+                effect,
+                TimingColouriseBoundsParameter::Lower,
+                0.6F) == 1U);
+    CHECK(
+        invisible_places::timing::
+            TimingColouriseBoundsParameterKeyCountAtPosition(
+                effect,
+                TimingColouriseBoundsParameter::Upper,
+                0.6F) == 1U);
 }
 
 TEST_CASE(
