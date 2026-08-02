@@ -40399,6 +40399,8 @@ void DrawAnimationSection(
                             return "Linear";
                         case invisible_places::water::WaterScenarioInterpolation::Hold:
                             return "Hold";
+                        case invisible_places::water::WaterScenarioInterpolation::SmoothVelocity:
+                            return "Smooth Velocity";
                     }
                     return "Smooth";
                 };
@@ -40673,6 +40675,8 @@ void DrawAnimationSection(
                                 return "Linear";
                             case invisible_places::water::WaterScenarioInterpolation::Hold:
                                 return "Hold";
+                            case invisible_places::water::WaterScenarioInterpolation::SmoothVelocity:
+                                return "Smooth Velocity";
                         }
                         return "Smooth";
                     };
@@ -50759,6 +50763,8 @@ const char* TimingInterpolationLabel(
             return "Linear";
         case WaterScenarioInterpolation::Hold:
             return "Hold";
+        case WaterScenarioInterpolation::SmoothVelocity:
+            return "Smooth Velocity";
         case WaterScenarioInterpolation::Smooth:
         default:
             return "Smooth";
@@ -50798,6 +50804,91 @@ bool DrawTimingInterpolationCombo(
     DrawTimingControlTooltip(
         "Choose Smooth, Linear, or Hold interpolation from this key to the next.");
     return changed;
+}
+
+template <typename Key, typename Matches>
+bool DrawTimingScalarTrackInterpolationCombo(
+    const char* label,
+    std::vector<Key>* keys,
+    Matches matches) {
+    if (keys == nullptr) {
+        return false;
+    }
+    const auto first = std::find_if(
+        keys->begin(),
+        keys->end(),
+        matches);
+    if (first == keys->end()) {
+        return false;
+    }
+    const auto firstMode = first->interpolation;
+    const bool mixed = std::any_of(
+        std::next(first),
+        keys->end(),
+        [&](const auto& key) {
+            return matches(key) && key.interpolation != firstMode;
+        });
+    using invisible_places::water::WaterScenarioInterpolation;
+    bool changed = false;
+    if (ImGui::BeginCombo(
+            label,
+            mixed ? "Mixed" : TimingInterpolationLabel(firstMode))) {
+        constexpr std::array options{
+            WaterScenarioInterpolation::Smooth,
+            WaterScenarioInterpolation::SmoothVelocity,
+        };
+        for (const auto option : options) {
+            const bool selected = !mixed && firstMode == option;
+            if (ImGui::Selectable(
+                    TimingInterpolationLabel(option),
+                    selected)) {
+                for (auto& key : *keys) {
+                    if (matches(key)) {
+                        key.interpolation = option;
+                    }
+                }
+                changed = true;
+            }
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+    DrawTimingControlTooltip(
+        "Curve style for this complete setting track. Smooth eases to rest at every key; Smooth Velocity carries a continuous, monotone speed through keys while values keep moving in the same direction, and rests at reversals or flat holds.");
+    return changed;
+}
+
+template <typename Key, typename Matches>
+invisible_places::water::WaterScenarioInterpolation
+TimingScalarTrackInterpolationAt(
+    const std::vector<Key>& keys,
+    Matches matches,
+    float position) {
+    using invisible_places::water::WaterScenarioInterpolation;
+    const Key* first = nullptr;
+    const Key* previous = nullptr;
+    for (const auto& key : keys) {
+        if (!matches(key)) {
+            continue;
+        }
+        if (first == nullptr) {
+            first = &key;
+        }
+        if (std::abs(key.position - position) <=
+            invisible_places::timing::kTimingColouriseKeyTolerance) {
+            return key.interpolation;
+        }
+        if (key.position < position) {
+            previous = &key;
+        }
+    }
+    if (previous != nullptr) {
+        return previous->interpolation;
+    }
+    return first != nullptr ? first->interpolation
+                            : WaterScenarioInterpolation::Smooth;
 }
 
 invisible_places::timing::TimingColourisePalette
@@ -52785,13 +52876,14 @@ bool TimingEffectIsEmissive(
     return effect.emissiveEnabled && !effect.colouriseEnabled;
 }
 
-void DrawTimingColouriseEffectParameterTrackButtons(
+bool DrawTimingColouriseEffectParameterTrackButtons(
     PreviewRuntimeState* runtimeState,
     invisible_places::timing::TimingColouriseEffect* effect,
     invisible_places::timing::TimingColouriseEffectParameter parameter) {
     if (runtimeState == nullptr || effect == nullptr) {
-        return;
+        return false;
     }
+    bool changed = false;
     const float position = std::clamp(
         runtimeState->animationPanel.scrubAmount,
         0.0F,
@@ -52835,11 +52927,11 @@ void DrawTimingColouriseEffectParameterTrackButtons(
     ImGui::SameLine(0.0F, 2.0F);
     ImGui::BeginDisabled(currentCount == 0U);
     if (ImGui::SmallButton("X")) {
-        (void)invisible_places::timing::
+        changed = invisible_places::timing::
             RemoveTimingColouriseEffectParameterKeysAtPosition(
                 effect,
                 parameter,
-                position);
+                position) > 0U;
         runtimeState->previewRenderStateSignatureValid = false;
     }
     ImGui::EndDisabled();
@@ -52847,6 +52939,24 @@ void DrawTimingColouriseEffectParameterTrackButtons(
         currentCount > 0U
             ? "Delete this control's key at the current animation position."
             : "Move onto a key for this control before deleting it.");
+    const bool hasKeys = std::any_of(
+        effect->effectParameterKeys.begin(),
+        effect->effectParameterKeys.end(),
+        [&](const auto& key) { return key.parameter == parameter; });
+    if (hasKeys) {
+        ImGui::SetNextItemWidth(
+            std::max(96.0F, ImGui::GetContentRegionAvail().x));
+        if (DrawTimingScalarTrackInterpolationCombo(
+                "##CurveStyle",
+                &effect->effectParameterKeys,
+                [&](const auto& key) {
+                    return key.parameter == parameter;
+                })) {
+            runtimeState->previewRenderStateSignatureValid = false;
+            changed = true;
+        }
+    }
+    return changed;
 }
 
 bool DrawTimingColouriseEffectParameterEditor(
@@ -52880,6 +52990,10 @@ bool DrawTimingColouriseEffectParameterEditor(
             return key.parameter == parameter;
         });
     const bool onKey = exact != effect->effectParameterKeys.end();
+    const auto trackInterpolation = TimingScalarTrackInterpolationAt(
+        effect->effectParameterKeys,
+        [&](const auto& key) { return key.parameter == parameter; },
+        position);
     float evaluated = invisible_places::timing::
         EvaluateTimingColouriseEffectParameter(
             *effect,
@@ -52953,7 +53067,7 @@ bool DrawTimingColouriseEffectParameterEditor(
     switch (parameter) {
         case TimingColouriseEffectParameter::PalettePhase:
             parameterTooltip =
-                "Shift by unwrapped palette turns. Drag the thin rail below for live changes, or click this value to type an exact number. Motion carries through continuing keys and rests only at reversals or flat holds.";
+                "Shift by unwrapped palette turns. Drag the thin rail below for live changes, or click this value to type an exact number. Choose Smooth Velocity below to carry speed through continuing keys, or Smooth to rest at every key.";
             break;
         case TimingColouriseEffectParameter::AmountOverride:
             parameterTooltip =
@@ -53029,7 +53143,7 @@ bool DrawTimingColouriseEffectParameterEditor(
                     parameter,
                     position,
                     evaluated,
-                    WaterScenarioInterpolation::Smooth);
+                    trackInterpolation);
         } else {
             switch (parameter) {
                 case TimingColouriseEffectParameter::PalettePhase:
@@ -53054,20 +53168,18 @@ bool DrawTimingColouriseEffectParameterEditor(
                     parameter,
                     position,
                     evaluated,
-                    WaterScenarioInterpolation::Smooth)) {
+                    trackInterpolation)) {
             runtimeState->previewRenderStateSignatureValid = false;
             changed = true;
         }
     }
     DrawTimingControlTooltip(
         onKey
-            ? "Update the Smooth key at the current animation position."
-            : "Add a Smooth key and arm this control for autokey at new scrub positions.");
+            ? "Update this key at the current animation position without changing the track's Curve style."
+            : "Add a key using this track's Curve style and arm the control for autokey at new scrub positions.");
     ImGui::SameLine(0.0F, 2.0F);
-    DrawTimingColouriseEffectParameterTrackButtons(
-        runtimeState,
-        effect,
-        parameter);
+    changed |= DrawTimingColouriseEffectParameterTrackButtons(
+        runtimeState, effect, parameter);
 
     ImGui::PopID();
     return changed;
@@ -55497,14 +55609,28 @@ bool SetTimingColouriseBoundsParameterAt(
             *effect,
             parameter);
     if (armed) {
+        auto interpolation = TimingScalarTrackInterpolationAt(
+            effect->boundsParameterKeys,
+            [&](const auto& key) {
+                return key.parameter == parameter;
+            },
+            position);
+        if (!TimingColouriseBoundsParameterHasKeys(
+                *effect,
+                parameter) &&
+            !effect->boundsKeys.empty()) {
+            interpolation = TimingScalarTrackInterpolationAt(
+                effect->boundsKeys,
+                [](const auto&) { return true; },
+                position);
+        }
         if (!invisible_places::timing::
                 AddOrUpdateTimingColouriseBoundsParameterKey(
                     effect,
                     parameter,
                     position,
                     value,
-                    invisible_places::water::
-                        WaterScenarioInterpolation::Smooth)) {
+                    interpolation)) {
             return false;
         }
         // A keyed bounds is a local edit: it detaches this feature from
@@ -56194,6 +56320,19 @@ void DrawTimingColouriseBoundsParameterTrackButtons(
                     *effect,
                     position),
             parameter);
+    auto interpolation = TimingScalarTrackInterpolationAt(
+        effect->boundsParameterKeys,
+        [&](const auto& key) { return key.parameter == parameter; },
+        position);
+    if (!TimingColouriseBoundsParameterHasKeys(
+            *effect,
+            parameter) &&
+        !effect->boundsKeys.empty()) {
+        interpolation = TimingScalarTrackInterpolationAt(
+            effect->boundsKeys,
+            [](const auto&) { return true; },
+            position);
+    }
     ImGui::BeginDisabled(!allowed);
     if (ImGui::SmallButton("+") &&
         invisible_places::timing::
@@ -56202,8 +56341,7 @@ void DrawTimingColouriseBoundsParameterTrackButtons(
                 parameter,
                 position,
                 evaluatedValue,
-                invisible_places::water::
-                    WaterScenarioInterpolation::Smooth)) {
+                interpolation)) {
         // A keyed bounds is a local edit that detaches this feature from
         // the shared Global bounds.
         effect->boundsEdited = true;
@@ -56212,7 +56350,7 @@ void DrawTimingColouriseBoundsParameterTrackButtons(
     ImGui::EndDisabled();
     DrawTimingControlTooltip(
         allowed
-            ? "Add a smooth key here. Further edits to this setting automatically key the current animation position."
+            ? "Add a key here using this setting's Curve style. Further edits automatically key the current animation position."
             : "This setting is view-only for the selected Bounds Keying mode.");
     ImGui::SameLine(0.0F, 2.0F);
     ImGui::BeginDisabled(!previous.has_value());
@@ -56252,6 +56390,21 @@ void DrawTimingColouriseBoundsParameterTrackButtons(
         currentCount > 0U
             ? "Delete this Bounds parameter key at the current animation position."
             : "Move onto a key for this Bounds parameter before deleting it.");
+    const bool hasKeys = TimingColouriseBoundsParameterHasKeys(
+        *effect,
+        parameter);
+    if (hasKeys) {
+        ImGui::SetNextItemWidth(
+            std::max(48.0F, ImGui::GetContentRegionAvail().x));
+        if (DrawTimingScalarTrackInterpolationCombo(
+                "##CurveStyle",
+                &effect->boundsParameterKeys,
+                [&](const auto& key) {
+                    return key.parameter == parameter;
+                })) {
+            runtimeState->previewRenderStateSignatureValid = false;
+        }
+    }
     ImGui::PopStyleVar();
 }
 
@@ -56344,10 +56497,10 @@ void DrawTimingColouriseBoundsParameterEditor(
         DrawTimingControlTooltip(
             editable
                 ? keyed
-                      ? "This setting is armed. Editing at a new animation position automatically adds a smooth key."
+                      ? "This setting is armed. Editing at a new animation position automatically adds a key using its Curve style."
                   : !effect->boundsKeys.empty()
-                      ? "This value comes from legacy Bounds keys. Editing promotes this setting to an independent smooth key track."
-                      : "Click the value to edit its base, or press + to arm smooth automatic keying."
+                      ? "This value comes from legacy Bounds keys. Editing promotes this setting to an independent scalar key track."
+                      : "Click the value to edit its base, or press + to arm automatic keying."
                 : "This value is resolved from the selected Bounds Keying mode and is view-only.");
     }
 

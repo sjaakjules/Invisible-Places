@@ -113,6 +113,10 @@ constexpr std::uintmax_t kLargeJsonRippleCacheStripBytes = 32ULL * 1024ULL * 102
 constexpr std::array<char, 8> kWaterPathCacheSidecarMagic{'I', 'P', 'F', 'L', 'O', 'W', 'C', '1'};
 constexpr std::uint32_t kManualFlowSurfaceGuideProjectSchemaVersion = 40U;
 constexpr std::uint32_t kManualFlowSurfaceGuideSourcesSchemaVersion = 16U;
+constexpr std::uint32_t kSmoothVelocityProjectSchemaVersion = 61U;
+static_assert(
+    kProjectDocumentSchemaVersion >=
+    kSmoothVelocityProjectSchemaVersion);
 
 constexpr std::string_view kProjectVisualEditedSuffix = "_edited";
 constexpr std::string_view kProjectVisualLegacyEditedSuffix = "_Edited";
@@ -3320,6 +3324,8 @@ const char* WaterScenarioInterpolationName(WaterScenarioInterpolation interpolat
             return "linear";
         case WaterScenarioInterpolation::Hold:
             return "hold";
+        case WaterScenarioInterpolation::SmoothVelocity:
+            return "smooth_velocity";
     }
     return "smooth";
 }
@@ -3334,6 +3340,9 @@ WaterScenarioInterpolation ParseWaterScenarioInterpolation(const json& interpola
     }
     if (name == "hold") {
         return WaterScenarioInterpolation::Hold;
+    }
+    if (name == "smooth_velocity") {
+        return WaterScenarioInterpolation::SmoothVelocity;
     }
     return WaterScenarioInterpolation::Smooth;
 }
@@ -7640,6 +7649,32 @@ std::string ResolveActiveWaterSceneGroupName(const ProjectDocument& document) {
     return "Default";
 }
 
+void MigrateLegacySmoothPalettePhaseKeys(
+    std::vector<invisible_places::timing::TimingTakeSceneState>* states) {
+    if (states == nullptr) {
+        return;
+    }
+    using invisible_places::timing::TimingColouriseEffectParameter;
+    using invisible_places::water::WaterScenarioInterpolation;
+    for (auto& state : *states) {
+        for (auto& effect : state.colouriseEffects) {
+            for (auto& key : effect.effectParameterKeys) {
+                if (key.parameter ==
+                        TimingColouriseEffectParameter::PalettePhase &&
+                    key.interpolation ==
+                        WaterScenarioInterpolation::Smooth) {
+                    // Before schema 61, Palette Phase alone interpreted
+                    // Smooth as a continuous-velocity monotone cubic. Keep
+                    // that authored motion while making Smooth consistently
+                    // mean per-key easing for every scalar track.
+                    key.interpolation =
+                        WaterScenarioInterpolation::SmoothVelocity;
+                }
+            }
+        }
+    }
+}
+
 void MigrateAndSanitizeTimingTakeData(
     ProjectDocument* document,
     bool hasNativeTimingTakes,
@@ -8954,6 +8989,11 @@ std::optional<ProjectDocument> LoadProjectDocument(
         hasNativeTimingTakes,
         hasNativeTimingTakeStates,
         hasLegacyWaterScenarios);
+    if (document.schemaVersion <
+        kSmoothVelocityProjectSchemaVersion) {
+        MigrateLegacySmoothPalettePhaseKeys(
+            &document.timingTakeStates);
+    }
     if (document.schemaVersion < kProjectDocumentSchemaVersion) {
         document.schemaVersion = kProjectDocumentSchemaVersion;
     }

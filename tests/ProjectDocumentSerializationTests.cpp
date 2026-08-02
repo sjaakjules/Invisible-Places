@@ -337,7 +337,8 @@ TEST_CASE("Palette stop-property animation and provenance round-trip",
           .parameter = TimingColouriseEffectParameter::PalettePhase,
           .position = 0.25F,
           .value = 2.75F,
-          .interpolation = WaterScenarioInterpolation::Linear,
+          .interpolation =
+              WaterScenarioInterpolation::SmoothVelocity,
       },
       TimingColouriseEffectParameterKey{
           .parameter = TimingColouriseEffectParameter::AmountOverride,
@@ -417,6 +418,8 @@ TEST_CASE("Palette stop-property animation and provenance round-trip",
   REQUIRE(savedEffect.at("effect_parameter_keys").size() == 2U);
   CHECK(savedEffect.at("effect_parameter_keys")[0].at("parameter") ==
         "palette_phase");
+  CHECK(savedEffect.at("effect_parameter_keys")[0].at("interpolation") ==
+        "smooth_velocity");
   CHECK(savedEffect.at("effect_parameter_keys")[1].at("parameter") ==
         "amount_override");
   REQUIRE(savedEffect.at("palette_stop_parameter_keys").size() == 3U);
@@ -447,6 +450,8 @@ TEST_CASE("Palette stop-property animation and provenance round-trip",
         Catch::Approx(0.25F));
   CHECK(loadedEffect.effectParameterKeys[0].value ==
         Catch::Approx(2.75F));
+  CHECK(loadedEffect.effectParameterKeys[0].interpolation ==
+        WaterScenarioInterpolation::SmoothVelocity);
   CHECK(loadedEffect.effectParameterKeys[1].parameter ==
         TimingColouriseEffectParameter::AmountOverride);
   CHECK(loadedEffect.effectParameterKeys[1].position ==
@@ -470,6 +475,73 @@ TEST_CASE("Palette stop-property animation and provenance round-trip",
         TimingColourisePaletteStopParameter::ColouriseAmount);
   CHECK(loadedEffect.paletteStopParameterKeys[2].interpolation ==
         WaterScenarioInterpolation::Smooth);
+}
+
+TEST_CASE(
+    "Project schema 60 preserves legacy continuous Palette Phase motion",
+    "[project][serialization][colourise][migration][velocity]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::timing::TimingColouriseEffect;
+  using invisible_places::timing::TimingColouriseEffectParameter;
+  using invisible_places::timing::TimingColouriseEffectParameterKey;
+  using invisible_places::timing::TimingTakeSceneState;
+  using invisible_places::water::WaterScenarioInterpolation;
+
+  TimingColouriseEffect effect;
+  effect.effectParameterKeys = {
+      TimingColouriseEffectParameterKey{
+          .parameter = TimingColouriseEffectParameter::PalettePhase,
+          .position = 0.25F,
+          .value = 0.5F,
+          .interpolation = WaterScenarioInterpolation::Smooth,
+      },
+      TimingColouriseEffectParameterKey{
+          .parameter = TimingColouriseEffectParameter::AmountOverride,
+          .position = 0.25F,
+          .value = 0.5F,
+          .interpolation = WaterScenarioInterpolation::Smooth,
+      },
+  };
+  ProjectDocument document;
+  TimingTakeSceneState state;
+  state.colouriseEffects.push_back(std::move(effect));
+  document.timingTakeStates.push_back(std::move(state));
+
+  TemporaryProjectFile file{
+      "invisible_places_smooth_velocity_schema_60_migration.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+  nlohmann::json legacy;
+  {
+    std::ifstream input{file.path};
+    REQUIRE(input.is_open());
+    legacy = nlohmann::json::parse(input);
+  }
+  legacy["schema_version"] = 60U;
+  {
+    std::ofstream output{file.path};
+    REQUIRE(output.is_open());
+    output << legacy.dump(2);
+  }
+
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->timingTakeStates.size() == 1U);
+  REQUIRE(loaded->timingTakeStates.front().colouriseEffects.size() == 1U);
+  const auto& keys = loaded->timingTakeStates.front()
+                         .colouriseEffects.front()
+                         .effectParameterKeys;
+  REQUIRE(keys.size() == 2U);
+  CHECK(keys[0].parameter ==
+        TimingColouriseEffectParameter::PalettePhase);
+  CHECK(keys[0].interpolation ==
+        WaterScenarioInterpolation::SmoothVelocity);
+  CHECK(keys[1].parameter ==
+        TimingColouriseEffectParameter::AmountOverride);
+  CHECK(keys[1].interpolation == WaterScenarioInterpolation::Smooth);
 }
 
 TEST_CASE("Reversed edited preset palette provenance round-trips",

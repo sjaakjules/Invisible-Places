@@ -29,10 +29,26 @@ float InterpolationAmount(
         return 0.0F;
     }
     if (interpolation ==
-        invisible_places::water::WaterScenarioInterpolation::Smooth) {
+            invisible_places::water::WaterScenarioInterpolation::Smooth ||
+        interpolation == invisible_places::water::
+                             WaterScenarioInterpolation::SmoothVelocity) {
         return amount * amount * (3.0F - 2.0F * amount);
     }
     return amount;
+}
+
+bool IsValidInterpolation(
+    invisible_places::water::WaterScenarioInterpolation interpolation) {
+    using invisible_places::water::WaterScenarioInterpolation;
+    switch (interpolation) {
+        case WaterScenarioInterpolation::Smooth:
+        case WaterScenarioInterpolation::SmoothVelocity:
+            return true;
+        case WaterScenarioInterpolation::Linear:
+        case WaterScenarioInterpolation::Hold:
+            return false;
+    }
+    return false;
 }
 
 template <typename Key>
@@ -279,36 +295,25 @@ float SanitizeEffectParameterValue(
     return 0.0F;
 }
 
-std::optional<float> EvaluatePalettePhaseTrack(
-    const std::vector<TimingColouriseEffectParameterKey>& keys,
-    float normalizedPosition) {
-    const auto trackBegin = std::find_if(
-        keys.begin(),
-        keys.end(),
-        [](const auto& key) {
-            return key.parameter ==
-                   TimingColouriseEffectParameter::PalettePhase;
-        });
-    if (trackBegin == keys.end()) {
+template <typename Iterator, typename ValueAt>
+std::optional<float> EvaluateScalarKeyTrack(
+    Iterator trackBegin,
+    Iterator trackEnd,
+    float normalizedPosition,
+    ValueAt valueAt) {
+    using invisible_places::water::WaterScenarioInterpolation;
+    if (trackBegin == trackEnd) {
         return std::nullopt;
     }
-    // Sanitization groups each parameter's keys and orders them by time.
-    const auto trackEnd = std::find_if(
-        trackBegin,
-        keys.end(),
-        [](const auto& key) {
-            return key.parameter !=
-                   TimingColouriseEffectParameter::PalettePhase;
-        });
     const auto keyCount = static_cast<std::size_t>(
         std::distance(trackBegin, trackEnd));
     const auto& first = *trackBegin;
     const auto& last = *(trackEnd - 1);
     if (normalizedPosition <= first.position || keyCount == 1U) {
-        return first.value;
+        return valueAt(first);
     }
     if (normalizedPosition >= last.position) {
-        return last.value;
+        return valueAt(last);
     }
 
     const auto right = std::lower_bound(
@@ -319,7 +324,7 @@ std::optional<float> EvaluatePalettePhaseTrack(
             return key.position < position;
         });
     if (right == trackEnd) {
-        return last.value;
+        return valueAt(last);
     }
     const auto left = right - 1;
     const double segmentDuration =
@@ -327,7 +332,7 @@ std::optional<float> EvaluatePalettePhaseTrack(
         static_cast<double>(left->position);
     if (segmentDuration <=
         static_cast<double>(kTimingColouriseKeyTolerance)) {
-        return right->value;
+        return valueAt(*right);
     }
     const double amount = std::clamp(
         (static_cast<double>(normalizedPosition) -
@@ -336,10 +341,10 @@ std::optional<float> EvaluatePalettePhaseTrack(
         0.0,
         1.0);
     if (left->interpolation !=
-        invisible_places::water::WaterScenarioInterpolation::Smooth) {
+        WaterScenarioInterpolation::SmoothVelocity) {
         return std::lerp(
-            left->value,
-            right->value,
+            valueAt(*left),
+            valueAt(*right),
             InterpolationAmount(
                 left->interpolation,
                 static_cast<float>(amount)));
@@ -357,8 +362,8 @@ std::optional<float> EvaluatePalettePhaseTrack(
         return duration >
                        static_cast<double>(
                            kTimingColouriseKeyTolerance)
-                   ? (static_cast<double>(keyAt(index + 1U).value) -
-                      static_cast<double>(keyAt(index).value)) /
+                   ? (static_cast<double>(valueAt(keyAt(index + 1U))) -
+                      static_cast<double>(valueAt(keyAt(index)))) /
                          duration
                    : 0.0;
     };
@@ -405,6 +410,10 @@ std::optional<float> EvaluatePalettePhaseTrack(
             return intervalVelocity(0U);
         }
         if (index == 0U) {
+            if (keyAt(0U).interpolation !=
+                WaterScenarioInterpolation::SmoothVelocity) {
+                return 0.0;
+            }
             return endpointVelocity(
                 intervalDuration(0U),
                 intervalDuration(1U),
@@ -412,11 +421,22 @@ std::optional<float> EvaluatePalettePhaseTrack(
                 intervalVelocity(1U));
         }
         if (index + 1U == keyCount) {
+            if (keyAt(keyCount - 2U).interpolation !=
+                WaterScenarioInterpolation::SmoothVelocity) {
+                return 0.0;
+            }
             return endpointVelocity(
                 intervalDuration(keyCount - 2U),
                 intervalDuration(keyCount - 3U),
                 intervalVelocity(keyCount - 2U),
                 intervalVelocity(keyCount - 3U));
+        }
+        if (keyAt(index - 1U).interpolation !=
+                WaterScenarioInterpolation::SmoothVelocity ||
+            keyAt(index).interpolation !=
+                WaterScenarioInterpolation::SmoothVelocity) {
+            // Changing interpolation styles is an authored velocity break.
+            return 0.0;
         }
         const double previousVelocity =
             intervalVelocity(index - 1U);
@@ -424,8 +444,7 @@ std::optional<float> EvaluatePalettePhaseTrack(
         if (!continuesInSameDirection(
                 previousVelocity,
                 nextVelocity)) {
-            // A local extremum or a flat hold is the only authored reason
-            // for palette rotation to come to rest at an interior key.
+            // Local extrema and flat holds deliberately come to rest.
             return 0.0;
         }
         const double previousDuration =
@@ -446,8 +465,8 @@ std::optional<float> EvaluatePalettePhaseTrack(
     const double rightTangent = tangentAt(leftIndex + 1U);
     const double amountSquared = amount * amount;
     const double amountCubed = amountSquared * amount;
-    const double leftValue = static_cast<double>(left->value);
-    const double rightValue = static_cast<double>(right->value);
+    const double leftValue = static_cast<double>(valueAt(*left));
+    const double rightValue = static_cast<double>(valueAt(*right));
     const double evaluated =
         (2.0 * amountCubed - 3.0 * amountSquared + 1.0) *
             leftValue +
@@ -461,8 +480,8 @@ std::optional<float> EvaluatePalettePhaseTrack(
     return std::isfinite(result)
                ? result
                : std::lerp(
-                     left->value,
-                     right->value,
+                     valueAt(*left),
+                     valueAt(*right),
                      static_cast<float>(amount));
 }
 
@@ -470,49 +489,20 @@ std::optional<float> EvaluateEffectParameterTrack(
     const std::vector<TimingColouriseEffectParameterKey>& keys,
     TimingColouriseEffectParameter parameter,
     float normalizedPosition) {
-    if (parameter == TimingColouriseEffectParameter::PalettePhase) {
-        return EvaluatePalettePhaseTrack(keys, normalizedPosition);
-    }
-    const TimingColouriseEffectParameterKey* first = nullptr;
-    const TimingColouriseEffectParameterKey* last = nullptr;
-    const TimingColouriseEffectParameterKey* left = nullptr;
-    const TimingColouriseEffectParameterKey* right = nullptr;
-    for (const auto& key : keys) {
-        if (key.parameter != parameter) {
-            continue;
-        }
-        if (first == nullptr) {
-            first = &key;
-        }
-        last = &key;
-        if (key.position <= normalizedPosition) {
-            left = &key;
-        }
-        if (right == nullptr && key.position >= normalizedPosition) {
-            right = &key;
-        }
-    }
-    if (first == nullptr) {
-        return std::nullopt;
-    }
-    if (normalizedPosition <= first->position) {
-        return first->value;
-    }
-    if (normalizedPosition >= last->position) {
-        return last->value;
-    }
-    left = left != nullptr ? left : first;
-    right = right != nullptr ? right : last;
-    if (left == right ||
-        std::abs(right->position - left->position) <=
-            kTimingColouriseKeyTolerance) {
-        return right->value;
-    }
-    const float amount = InterpolationAmount(
-        left->interpolation,
-        (normalizedPosition - left->position) /
-            (right->position - left->position));
-    return std::lerp(left->value, right->value, amount);
+    // Sanitization groups each parameter's keys and orders them by time.
+    const auto trackBegin = std::find_if(
+        keys.begin(),
+        keys.end(),
+        [&](const auto& key) { return key.parameter == parameter; });
+    const auto trackEnd = std::find_if(
+        trackBegin,
+        keys.end(),
+        [&](const auto& key) { return key.parameter != parameter; });
+    return EvaluateScalarKeyTrack(
+        trackBegin,
+        trackEnd,
+        normalizedPosition,
+        [](const auto& key) { return key.value; });
 }
 
 template <typename Key, typename Value, typename Sanitize>
@@ -558,50 +548,20 @@ std::optional<float> EvaluateBoundsParameterTrack(
     const std::vector<TimingColouriseBoundsParameterKey>& keys,
     TimingColouriseBoundsParameter parameter,
     float normalizedPosition) {
-    const TimingColouriseBoundsParameterKey* first = nullptr;
-    const TimingColouriseBoundsParameterKey* last = nullptr;
-    const TimingColouriseBoundsParameterKey* left = nullptr;
-    const TimingColouriseBoundsParameterKey* right = nullptr;
-    for (const auto& key : keys) {
-        if (key.parameter != parameter) {
-            continue;
-        }
-        if (first == nullptr) {
-            first = &key;
-        }
-        last = &key;
-        if (key.position <= normalizedPosition) {
-            left = &key;
-        }
-        if (right == nullptr && key.position >= normalizedPosition) {
-            right = &key;
-        }
-    }
-    if (first == nullptr) {
-        return std::nullopt;
-    }
-    if (normalizedPosition <= first->position) {
-        return first->value;
-    }
-    if (normalizedPosition >= last->position) {
-        return last->value;
-    }
-    if (left == nullptr) {
-        left = first;
-    }
-    if (right == nullptr) {
-        right = last;
-    }
-    if (left == right ||
-        std::abs(right->position - left->position) <=
-            kTimingColouriseKeyTolerance) {
-        return right->value;
-    }
-    const float amount = InterpolationAmount(
-        left->interpolation,
-        (normalizedPosition - left->position) /
-            (right->position - left->position));
-    return std::lerp(left->value, right->value, amount);
+    // Sanitization groups each parameter's keys and orders them by time.
+    const auto trackBegin = std::find_if(
+        keys.begin(),
+        keys.end(),
+        [&](const auto& key) { return key.parameter == parameter; });
+    const auto trackEnd = std::find_if(
+        trackBegin,
+        keys.end(),
+        [&](const auto& key) { return key.parameter != parameter; });
+    return EvaluateScalarKeyTrack(
+        trackBegin,
+        trackEnd,
+        normalizedPosition,
+        [](const auto& key) { return key.value; });
 }
 
 struct PaletteStopParameterBrackets {
@@ -1698,15 +1658,19 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
         key.value = SanitizeEffectParameterValue(
             key.parameter,
             key.value);
-        key.interpolation =
-            invisible_places::water::WaterScenarioInterpolation::Smooth;
+        if (!IsValidInterpolation(key.interpolation)) {
+            key.interpolation = invisible_places::water::
+                WaterScenarioInterpolation::Smooth;
+        }
     }
     for (auto& key : effect.paletteKeys) {
         key.position = Clamp01(key.position);
         key.palette =
             SanitizeTimingColourisePalette(std::move(key.palette));
-        key.interpolation =
-            invisible_places::water::WaterScenarioInterpolation::Smooth;
+        if (!IsValidInterpolation(key.interpolation)) {
+            key.interpolation = invisible_places::water::
+                WaterScenarioInterpolation::Smooth;
+        }
     }
     std::unordered_set<std::string> stopIds;
     std::size_t stopIdCapacity = effect.basePalette.stops.size();
@@ -1735,14 +1699,18 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
             key.scalarValue);
         key.colourValue =
             SanitizePaletteStopColour(key.colourValue);
-        key.interpolation =
-            invisible_places::water::WaterScenarioInterpolation::Smooth;
+        if (!IsValidInterpolation(key.interpolation)) {
+            key.interpolation = invisible_places::water::
+                WaterScenarioInterpolation::Smooth;
+        }
     }
     for (auto& key : effect.boundsKeys) {
         key.position = Clamp01(key.position);
         key.bounds = SanitizeTimingColouriseBounds(key.bounds);
-        key.interpolation =
-            invisible_places::water::WaterScenarioInterpolation::Smooth;
+        if (!IsValidInterpolation(key.interpolation)) {
+            key.interpolation = invisible_places::water::
+                WaterScenarioInterpolation::Smooth;
+        }
     }
     if (!IsValidBoundsKeyMode(effect.boundsKeyMode)) {
         effect.boundsKeyMode =
@@ -1760,8 +1728,10 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
         key.position = Clamp01(key.position);
         key.value =
             SanitizeBoundsParameterValue(key.parameter, key.value);
-        key.interpolation =
-            invisible_places::water::WaterScenarioInterpolation::Smooth;
+        if (!IsValidInterpolation(key.interpolation)) {
+            key.interpolation = invisible_places::water::
+                WaterScenarioInterpolation::Smooth;
+        }
     }
     SortAndCoalesceKeys(&effect.paletteKeys);
     SortAndCoalescePaletteStopParameterKeys(
@@ -1800,12 +1770,22 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
                            memory.boundsKeyMode,
                            key.parameter);
             });
+        for (auto& key : memory.boundsKeys) {
+            key.position = Clamp01(key.position);
+            key.bounds = SanitizeTimingColouriseBounds(key.bounds);
+            if (!IsValidInterpolation(key.interpolation)) {
+                key.interpolation = invisible_places::water::
+                    WaterScenarioInterpolation::Smooth;
+            }
+        }
         for (auto& key : memory.boundsParameterKeys) {
             key.position = Clamp01(key.position);
             key.value =
                 SanitizeBoundsParameterValue(key.parameter, key.value);
-            key.interpolation = invisible_places::water::
-                WaterScenarioInterpolation::Smooth;
+            if (!IsValidInterpolation(key.interpolation)) {
+                key.interpolation = invisible_places::water::
+                    WaterScenarioInterpolation::Smooth;
+            }
         }
         SortAndCoalesceKeys(&memory.boundsKeys);
         SortAndCoalesceBoundsParameterKeys(&memory.boundsParameterKeys);
@@ -2664,7 +2644,7 @@ void AddOrUpdateTimingColourisePaletteKey(
     TimingColouriseEffect* effect,
     float position,
     TimingColourisePalette palette,
-    invisible_places::water::WaterScenarioInterpolation /*interpolation*/) {
+    invisible_places::water::WaterScenarioInterpolation interpolation) {
     if (effect == nullptr) {
         return;
     }
@@ -2674,7 +2654,10 @@ void AddOrUpdateTimingColourisePaletteKey(
         &effect->paletteKeys,
         position,
         std::move(palette),
-        invisible_places::water::WaterScenarioInterpolation::Smooth,
+        IsValidInterpolation(interpolation)
+            ? interpolation
+            : invisible_places::water::
+                  WaterScenarioInterpolation::Smooth,
         SanitizeTimingColourisePalette);
 }
 
@@ -2684,7 +2667,7 @@ bool AddOrUpdateTimingColourisePaletteStopScalarKey(
     TimingColourisePaletteStopParameter parameter,
     float position,
     float value,
-    invisible_places::water::WaterScenarioInterpolation /*interpolation*/) {
+    invisible_places::water::WaterScenarioInterpolation interpolation) {
     if (effect == nullptr || stopId.empty() ||
         (parameter != TimingColourisePaletteStopParameter::Position &&
          parameter !=
@@ -2714,8 +2697,10 @@ bool AddOrUpdateTimingColourisePaletteStopScalarKey(
         .position = Clamp01(position),
         .scalarValue =
             SanitizePaletteStopScalarValue(parameter, value),
-        .interpolation =
-            invisible_places::water::WaterScenarioInterpolation::Smooth,
+        .interpolation = IsValidInterpolation(interpolation)
+                             ? interpolation
+                             : invisible_places::water::
+                                   WaterScenarioInterpolation::Smooth,
     };
     const auto existing = std::find_if(
         effect->paletteStopParameterKeys.begin(),
@@ -2741,7 +2726,7 @@ bool AddOrUpdateTimingColourisePaletteStopColourKey(
     std::string_view stopId,
     float position,
     std::array<float, 3> colour,
-    invisible_places::water::WaterScenarioInterpolation /*interpolation*/) {
+    invisible_places::water::WaterScenarioInterpolation interpolation) {
     if (effect == nullptr || stopId.empty() ||
         !std::isfinite(position) ||
         std::any_of(
@@ -2771,8 +2756,10 @@ bool AddOrUpdateTimingColourisePaletteStopColourKey(
         .parameter = TimingColourisePaletteStopParameter::Colour,
         .position = Clamp01(position),
         .colourValue = SanitizePaletteStopColour(colour),
-        .interpolation =
-            invisible_places::water::WaterScenarioInterpolation::Smooth,
+        .interpolation = IsValidInterpolation(interpolation)
+                             ? interpolation
+                             : invisible_places::water::
+                                   WaterScenarioInterpolation::Smooth,
     };
     const auto existing = std::find_if(
         effect->paletteStopParameterKeys.begin(),
@@ -2797,7 +2784,7 @@ void AddOrUpdateTimingColouriseBoundsKey(
     TimingColouriseEffect* effect,
     float position,
     TimingColouriseBounds bounds,
-    invisible_places::water::WaterScenarioInterpolation /*interpolation*/) {
+    invisible_places::water::WaterScenarioInterpolation interpolation) {
     if (effect == nullptr) {
         return;
     }
@@ -2805,7 +2792,10 @@ void AddOrUpdateTimingColouriseBoundsKey(
         &effect->boundsKeys,
         position,
         bounds,
-        invisible_places::water::WaterScenarioInterpolation::Smooth,
+        IsValidInterpolation(interpolation)
+            ? interpolation
+            : invisible_places::water::
+                  WaterScenarioInterpolation::Smooth,
         SanitizeTimingColouriseBounds);
 }
 
@@ -2814,7 +2804,7 @@ bool AddOrUpdateTimingColouriseBoundsParameterKey(
     TimingColouriseBoundsParameter parameter,
     float position,
     float value,
-    invisible_places::water::WaterScenarioInterpolation /*interpolation*/) {
+    invisible_places::water::WaterScenarioInterpolation interpolation) {
     if (effect == nullptr || !std::isfinite(position) ||
         !std::isfinite(value) ||
         !TimingColouriseBoundsParameterIsAllowed(
@@ -2843,8 +2833,11 @@ bool AddOrUpdateTimingColouriseBoundsParameterKey(
                 .value = TimingColouriseBoundsParameterValue(
                     legacy.bounds,
                     parameter),
-                .interpolation = invisible_places::water::
-                    WaterScenarioInterpolation::Smooth,
+                .interpolation =
+                    IsValidInterpolation(legacy.interpolation)
+                        ? legacy.interpolation
+                        : invisible_places::water::
+                              WaterScenarioInterpolation::Smooth,
             });
         }
     }
@@ -2852,8 +2845,10 @@ bool AddOrUpdateTimingColouriseBoundsParameterKey(
         .parameter = parameter,
         .position = Clamp01(position),
         .value = SanitizeBoundsParameterValue(parameter, value),
-        .interpolation =
-            invisible_places::water::WaterScenarioInterpolation::Smooth,
+        .interpolation = IsValidInterpolation(interpolation)
+                             ? interpolation
+                             : invisible_places::water::
+                                   WaterScenarioInterpolation::Smooth,
     };
     const auto existing = std::find_if(
         effect->boundsParameterKeys.begin(),
@@ -2877,7 +2872,7 @@ bool AddOrUpdateTimingColouriseEffectParameterKey(
     TimingColouriseEffectParameter parameter,
     float position,
     float value,
-    invisible_places::water::WaterScenarioInterpolation /*interpolation*/) {
+    invisible_places::water::WaterScenarioInterpolation interpolation) {
     if (effect == nullptr ||
         !TimingEffectParameterIsSupported(*effect, parameter) ||
         !std::isfinite(position) || !std::isfinite(value)) {
@@ -2887,8 +2882,10 @@ bool AddOrUpdateTimingColouriseEffectParameterKey(
         .parameter = parameter,
         .position = Clamp01(position),
         .value = SanitizeEffectParameterValue(parameter, value),
-        .interpolation =
-            invisible_places::water::WaterScenarioInterpolation::Smooth,
+        .interpolation = IsValidInterpolation(interpolation)
+                             ? interpolation
+                             : invisible_places::water::
+                                   WaterScenarioInterpolation::Smooth,
     };
     const auto existing = std::find_if(
         effect->effectParameterKeys.begin(),

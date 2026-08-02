@@ -22,6 +22,30 @@ using nlohmann::json;
 using invisible_places::renderer::pointcloud::PointCloudRendererMode;
 
 constexpr std::string_view kRenderSetupSuffix = ".iprender.json";
+constexpr std::uint32_t kSmoothVelocityRenderSetupSchemaVersion = 4U;
+static_assert(
+    kRenderSetupDocumentSchemaVersion >=
+    kSmoothVelocityRenderSetupSchemaVersion);
+
+void MigrateLegacySmoothPalettePhaseKeys(
+    invisible_places::timing::TimingTakeSceneState* state) {
+    if (state == nullptr) {
+        return;
+    }
+    using invisible_places::timing::TimingColouriseEffectParameter;
+    using invisible_places::water::WaterScenarioInterpolation;
+    for (auto& effect : state->colouriseEffects) {
+        for (auto& key : effect.effectParameterKeys) {
+            if (key.parameter ==
+                    TimingColouriseEffectParameter::PalettePhase &&
+                key.interpolation ==
+                    WaterScenarioInterpolation::Smooth) {
+                key.interpolation =
+                    WaterScenarioInterpolation::SmoothVelocity;
+            }
+        }
+    }
+}
 
 void SetError(std::string* errorMessage, std::string message) {
     if (errorMessage != nullptr) {
@@ -705,6 +729,10 @@ std::optional<RenderSetupDocument> LoadRenderSetupDocument(
         document.exportPreset = std::move(preset.value());
         document.livePointVisual = std::move(visual.value());
         document.timingState = std::move(timingState.value());
+        if (schema < kSmoothVelocityRenderSetupSchemaVersion) {
+            MigrateLegacySmoothPalettePhaseKeys(
+                &document.timingState);
+        }
         document.authoredWater = std::move(authoredWater.value());
         document.waterAnimationTrailSettings =
             std::move(animationTrailSettings.value());

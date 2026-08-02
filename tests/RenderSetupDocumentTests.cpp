@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -467,6 +468,21 @@ TEST_CASE(
               .activationRange.start == Approx(0.0F));
     CHECK(loaded->timingState.colouriseEffects.front()
               .activationRange.end == Approx(1.0F));
+    const auto& migratedKeys =
+        loaded->timingState.colouriseEffects.front()
+            .effectParameterKeys;
+    const auto migratedPhase = std::find_if(
+        migratedKeys.begin(),
+        migratedKeys.end(),
+        [](const auto& key) {
+            return key.parameter == invisible_places::timing::
+                                        TimingColouriseEffectParameter::
+                                            PalettePhase;
+        });
+    REQUIRE(migratedPhase != migratedKeys.end());
+    CHECK(migratedPhase->interpolation == invisible_places::water::
+                                                WaterScenarioInterpolation::
+                                                    SmoothVelocity);
 
     const auto historyEntry =
         invisible_places::serialization::ReadRenderSetupHistoryEntry(

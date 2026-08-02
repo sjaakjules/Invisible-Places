@@ -147,7 +147,11 @@ enum class WaterSeepagePattern {
 enum class WaterScenarioInterpolation {
     Smooth,
     Linear,
-    Hold
+    Hold,
+    // Monotone cubic interpolation that carries velocity through keys while
+    // the authored values continue in the same direction. Unlike Smooth,
+    // this only comes to rest at reversals, flat holds, or a mode boundary.
+    SmoothVelocity
 };
 
 enum class WaterFieldOutputMode {
