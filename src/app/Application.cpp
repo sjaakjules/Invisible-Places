@@ -56365,11 +56365,9 @@ BuildTimingColouriseActivationConcurrencySpans(
     return spans;
 }
 
-void DrawTimingColouriseActivationOverview(
-    PreviewRuntimeState* runtimeState,
-    std::vector<invisible_places::timing::TimingColouriseEffect>*
-        effects) {
-    if (runtimeState == nullptr || effects == nullptr) {
+void DrawTimingColouriseTimelineZoomToggle(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
         return;
     }
     auto& timings = runtimeState->timingsPanel;
@@ -56387,13 +56385,22 @@ void DrawTimingColouriseActivationOverview(
     }
     DrawTimingControlTooltip(
         activeRangeView
-            ? "The selected effect's setting lanes are expanded to its active interval. Switch off to see every key across 0..1."
-            : "Setting lanes show the full 0..1 animation. Keys outside the selected effect's active interval remain editable but are dimmed.");
+            ? "The selected feature's setting lanes are expanded to its active interval. Switch off to see every key across 0..1."
+            : "Setting lanes show the full 0..1 animation. Keys outside the selected feature's active interval remain editable but are dimmed.");
+}
 
+void DrawTimingColouriseActivationOverview(
+    PreviewRuntimeState* runtimeState,
+    std::vector<invisible_places::timing::TimingColouriseEffect>*
+        effects) {
+    if (runtimeState == nullptr || effects == nullptr) {
+        return;
+    }
+    auto& timings = runtimeState->timingsPanel;
     if (effects->empty()) {
         timings.colouriseActivationDrag.reset();
         ImGui::TextDisabled(
-            "Add an effect to author an activation range.");
+            "Add a Visual Feature to author an active range.");
         return;
     }
 
@@ -56460,23 +56467,25 @@ void DrawTimingColouriseActivationOverview(
             2,
             kTableFlags)) {
         ImGui::TableSetupColumn(
-            "Effect",
+            "Visual Feature",
             ImGuiTableColumnFlags_WidthFixed,
-            118.0F);
+            180.0F);
         ImGui::TableSetupColumn(
-            "Activation  0 ................................ 1",
+            "Active range  0 ............................. 1",
             ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
         ImGui::TableSetColumnIndex(0);
-        ImGui::TableHeader("Effect");
+        ImGui::TableHeader("Visual Feature");
         ImGui::TableSetColumnIndex(1);
         ImGui::TableHeader(
-            "Activation  0 ................................ 1");
+            "Active range  0 ............................. 1");
         DrawTimingCornerHelpMark(
             ImGui::GetWindowDrawList(),
             ImGui::GetItemRectMin(),
             ImGui::GetItemRectMax(),
-            "Activation timeline\n"
+            "Visual Features timeline\n"
+            "Click a feature name to select it, double-click to turn it on "
+            "or off, or drag it to change its layer priority.\n"
             "Drag either endpoint of a row's filled interval, or drag the "
             "filled body to translate it. Keys keep their global animation "
             "positions.\n"
@@ -56484,7 +56493,11 @@ void DrawTimingColouriseActivationOverview(
             "renderer slots than recommended. A feature with colourise and "
             "emissive output uses two of the eight slots.");
 
+        // This timeline is the single Visual Feature list: its names own
+        // selection, enable toggles, and renderer-priority reordering.
         bool dragEffectStillPresent = false;
+        std::optional<std::pair<std::size_t, std::size_t>>
+            requestedReorder;
         for (std::size_t index = 0U;
              index < effects->size();
              ++index) {
@@ -56497,7 +56510,8 @@ void DrawTimingColouriseActivationOverview(
                 ImGuiTableRowFlags_None,
                 24.0F);
             ImGui::TableSetColumnIndex(0);
-            if (!effect.enabled) {
+            const bool effectWasEnabled = effect.enabled;
+            if (!effectWasEnabled) {
                 ImGui::PushStyleColor(
                     ImGuiCol_Text,
                     ImGui::GetStyleColorVec4(
@@ -56507,15 +56521,55 @@ void DrawTimingColouriseActivationOverview(
                 std::string{"["} +
                 TimingEffectAspectBadge(effect) + "] " +
                 effect.name;
-            if (ImGui::Selectable(
-                    rowLabel.c_str(),
-                    timings.selectedColouriseEffectIndex ==
-                        index)) {
+            const bool selected = ImGui::Selectable(
+                rowLabel.c_str(),
+                timings.selectedColouriseEffectIndex ==
+                    index);
+            const bool toggleEnabled =
+                ImGui::IsItemHovered() &&
+                ImGui::IsMouseDoubleClicked(
+                    ImGuiMouseButton_Left);
+            if (selected) {
                 selectEffect(index);
             }
-            if (!effect.enabled) {
+            if (toggleEnabled) {
+                effect.enabled = !effect.enabled;
+                runtimeState->previewRenderStateSignatureValid =
+                    false;
+            }
+            if (!effectWasEnabled) {
                 ImGui::PopStyleColor();
             }
+            if (ImGui::BeginDragDropSource()) {
+                const auto payloadIndex = index;
+                ImGui::SetDragDropPayload(
+                    "TIMING_COLOURISE_EFFECT_ITEM",
+                    &payloadIndex,
+                    sizeof(payloadIndex));
+                ImGui::Text(
+                    "[%s] %s",
+                    TimingEffectAspectBadge(effect),
+                    effect.name.c_str());
+                ImGui::EndDragDropSource();
+            }
+            if (ImGui::BeginDragDropTarget()) {
+                if (const auto* payload =
+                        ImGui::AcceptDragDropPayload(
+                            "TIMING_COLOURISE_EFFECT_ITEM");
+                    payload != nullptr &&
+                    payload->DataSize ==
+                        sizeof(std::size_t)) {
+                    requestedReorder = std::pair{
+                        *static_cast<const std::size_t*>(
+                            payload->Data),
+                        index};
+                }
+                ImGui::EndDragDropTarget();
+            }
+            DrawTimingControlTooltip(
+                effect.enabled
+                    ? "Click to select, double-click to turn off, or drag to change layer priority. The top feature has highest priority."
+                    : "Click to select, double-click to turn on, or drag to change layer priority. The top feature has highest priority.");
 
             ImGui::TableSetColumnIndex(1);
             const ImVec2 laneSize{
@@ -56915,6 +56969,45 @@ void DrawTimingColouriseActivationOverview(
             timings.colouriseActivationDrag.reset();
         }
         ImGui::EndTable();
+
+        if (requestedReorder.has_value()) {
+            const auto [sourceIndex, destinationIndex] =
+                requestedReorder.value();
+            std::optional<std::string> selectedEffectId;
+            if (timings.selectedColouriseEffectIndex.has_value() &&
+                timings.selectedColouriseEffectIndex.value() <
+                    effects->size()) {
+                selectedEffectId =
+                    (*effects)[timings.selectedColouriseEffectIndex
+                                   .value()]
+                        .id;
+            }
+            if (invisible_places::timing::
+                    MoveTimingColouriseEffect(
+                        effects,
+                        sourceIndex,
+                        destinationIndex)) {
+                if (selectedEffectId.has_value()) {
+                    const auto selectedEffect = std::find_if(
+                        effects->begin(),
+                        effects->end(),
+                        [&](const auto& candidate) {
+                            return candidate.id ==
+                                   selectedEffectId.value();
+                        });
+                    timings.selectedColouriseEffectIndex =
+                        selectedEffect != effects->end()
+                            ? std::optional<std::size_t>{
+                                  static_cast<std::size_t>(
+                                      std::distance(
+                                          effects->begin(),
+                                          selectedEffect))}
+                            : std::nullopt;
+                }
+                runtimeState->previewRenderStateSignatureValid =
+                    false;
+            }
+        }
     }
     if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
         timings.colouriseActivationDrag.reset();
@@ -57000,129 +57093,9 @@ void DrawTimingColouriseSection(
         runtimeState->previewRenderStateSignatureValid =
             false;
     }
-    std::optional<std::pair<std::size_t, std::size_t>>
-        requestedReorder;
-    for (std::size_t index = 0U; index < effects.size();
-         ++index) {
-        auto& effect = effects[index];
-        ImGui::PushID(effect.id.c_str());
-        bool enabled = effect.enabled;
-        if (ImGui::Checkbox("##Enabled", &enabled)) {
-            effect.enabled = enabled;
-            runtimeState->previewRenderStateSignatureValid =
-                false;
-        }
-        DrawTimingControlTooltip(
-            effect.enabled
-                ? "Disable this effect without deleting its settings or keys."
-                : "Enable this effect.");
-        ImGui::SameLine();
-        const bool emissive = TimingEffectIsEmissive(effect);
-        const bool combined =
-            effect.colouriseEnabled && effect.emissiveEnabled;
-        ImVec4 kindColour =
-            combined ? ImVec4{0.72F, 0.70F, 0.55F, 1.0F}
-            : emissive ? ImVec4{0.96F, 0.61F, 0.31F, 1.0F}
-                       : ImVec4{0.47F, 0.76F, 0.91F, 1.0F};
-        if (!effect.enabled) {
-            kindColour = ImVec4{0.55F, 0.55F, 0.55F, 0.65F};
-        }
-        ImGui::TextColored(
-            kindColour,
-            "%s",
-            TimingEffectAspectBadge(effect));
-        DrawTimingControlTooltip(
-            combined ? "Visual Feature with colourise and emissive output"
-            : emissive ? "Emissive Visual Feature"
-                       : "Colourise Visual Feature");
-        ImGui::SameLine(0.0F, 5.0F);
-        if (!effect.enabled) {
-            ImGui::PushStyleColor(
-                ImGuiCol_Text,
-                ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-        }
-        const bool selected = ImGui::Selectable(
-                effect.name.c_str(),
-                timings.selectedColouriseEffectIndex ==
-                    index,
-                0,
-                ImVec2{
-                    std::max(
-                        80.0F,
-                        ImGui::GetContentRegionAvail().x),
-                    0.0F});
-        if (!effect.enabled) {
-            ImGui::PopStyleColor();
-        }
-        if (selected) {
-            selectEffect(index);
-        }
-        if (ImGui::BeginDragDropSource()) {
-            const auto payloadIndex = index;
-            ImGui::SetDragDropPayload(
-                "TIMING_COLOURISE_EFFECT_ITEM",
-                &payloadIndex,
-                sizeof(payloadIndex));
-            ImGui::Text(
-                "[%s] %s",
-                TimingEffectAspectBadge(effect),
-                effect.name.c_str());
-            ImGui::EndDragDropSource();
-        }
-        if (ImGui::BeginDragDropTarget()) {
-            if (const auto* payload = ImGui::AcceptDragDropPayload(
-                    "TIMING_COLOURISE_EFFECT_ITEM");
-                payload != nullptr &&
-                payload->DataSize == sizeof(std::size_t)) {
-                requestedReorder = std::pair{
-                    *static_cast<const std::size_t*>(
-                        payload->Data),
-                    index};
-            }
-            ImGui::EndDragDropTarget();
-        }
-        DrawTimingControlTooltip(
-            "Select this effect or drag it to change the layer order. "
-            "The top list item has highest priority when overlapping features need more than eight renderer slots.");
-        ImGui::PopID();
-    }
-    if (requestedReorder.has_value()) {
-        const auto [sourceIndex, destinationIndex] =
-            requestedReorder.value();
-        std::optional<std::string> selectedEffectId;
-        if (timings.selectedColouriseEffectIndex.has_value() &&
-            timings.selectedColouriseEffectIndex.value() <
-                effects.size()) {
-            selectedEffectId =
-                effects[timings.selectedColouriseEffectIndex.value()]
-                    .id;
-        }
-        if (invisible_places::timing::
-                MoveTimingColouriseEffect(
-                    &effects,
-                    sourceIndex,
-                    destinationIndex)) {
-            if (selectedEffectId.has_value()) {
-                const auto selected = std::find_if(
-                    effects.begin(),
-                    effects.end(),
-                    [&](const auto& candidate) {
-                        return candidate.id ==
-                               selectedEffectId.value();
-                    });
-                timings.selectedColouriseEffectIndex =
-                    selected != effects.end()
-                        ? std::optional<std::size_t>{
-                              static_cast<std::size_t>(
-                                  std::distance(
-                                      effects.begin(),
-                                      selected))}
-                        : std::nullopt;
-            }
-            runtimeState->previewRenderStateSignatureValid =
-                false;
-        }
-    }
+    DrawTimingColouriseActivationOverview(
+        runtimeState,
+        &effects);
     if (ImGui::Button("Add")) {
         invisible_places::timing::TimingColouriseEffect effect;
         effect.id = invisible_places::timing::
@@ -57181,8 +57154,8 @@ void DrawTimingColouriseSection(
     ImGui::EndDisabled();
     DrawTimingControlTooltip(
         !hasSelection
-            ? "Select an effect to duplicate it."
-            : "Duplicate the selected effect, including its keys.");
+            ? "Select a Visual Feature to duplicate it."
+            : "Duplicate the selected Visual Feature, including its keys.");
     ImGui::SameLine();
     ImGui::BeginDisabled(!hasSelection);
     if (ImGui::Button("Delete") && hasSelection) {
@@ -57208,17 +57181,12 @@ void DrawTimingColouriseSection(
     ImGui::EndDisabled();
     DrawTimingControlTooltip(
         hasSelection
-            ? "Delete the selected effect and all of its setting and Bounds keys."
-            : "Select an effect to delete it.");
-
-    ImGui::SeparatorText("Activation");
-    DrawTimingColouriseActivationOverview(
-        runtimeState,
-        &effects);
+            ? "Delete the selected Visual Feature and all of its setting and Bounds keys."
+            : "Select a Visual Feature to delete it.");
 
     if (!timings.selectedColouriseEffectIndex.has_value()) {
         ImGui::TextDisabled(
-            "Add or select an effect to edit its controls, scalar field, and animated Bounds.");
+            "Add or select a Visual Feature to edit its controls, scalar field, and animated Bounds.");
         EndPanelSection();
         return;
     }
@@ -57229,6 +57197,7 @@ void DrawTimingColouriseSection(
         &effect.name);
     DrawTimingLabelTooltip(
         "Rename this Visual Feature. Its output aspects are toggled in the Emissive and Colourise sections below.");
+    DrawTimingColouriseTimelineZoomToggle(runtimeState);
     ImGui::SeparatorText("Scalar Field and Bounds");
     auto catalog =
         BuildActiveTimingColouriseFieldCatalog(
