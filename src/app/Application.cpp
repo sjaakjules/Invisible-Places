@@ -40394,13 +40394,15 @@ void DrawAnimationSection(
                 const auto interpolationLabel = [](auto mode) {
                     switch (mode) {
                         case invisible_places::water::WaterScenarioInterpolation::Smooth:
-                            return "Smooth";
+                            return "Smooth Step";
                         case invisible_places::water::WaterScenarioInterpolation::Linear:
                             return "Linear";
                         case invisible_places::water::WaterScenarioInterpolation::Hold:
                             return "Hold";
                         case invisible_places::water::WaterScenarioInterpolation::SmoothVelocity:
-                            return "Smooth Velocity";
+                            return "Monotone Spline";
+                        case invisible_places::water::WaterScenarioInterpolation::CentripetalCatmullRom:
+                            return "Centripetal Catmull–Rom";
                     }
                     return "Smooth";
                 };
@@ -40408,7 +40410,7 @@ void DrawAnimationSection(
                     "Outgoing Interpolation",
                     interpolationLabel(activeSelectedKey.interpolation));
                 DrawWaterSeepageParameterTooltip(
-                    "Controls the segment from this key to the next. Smooth eases both ends, "
+                    "Controls the segment from this key to the next. Smooth Step eases both ends, "
                     "Linear changes uniformly, and Hold retains this complete water state until the next key.");
                 if (interpolationOpen) {
                     for (const auto mode : modes) {
@@ -40670,13 +40672,15 @@ void DrawAnimationSection(
                     const auto nodeInterpolationLabel = [](auto mode) {
                         switch (mode) {
                             case invisible_places::water::WaterScenarioInterpolation::Smooth:
-                                return "Smooth";
+                                return "Smooth Step";
                             case invisible_places::water::WaterScenarioInterpolation::Linear:
                                 return "Linear";
                             case invisible_places::water::WaterScenarioInterpolation::Hold:
                                 return "Hold";
                             case invisible_places::water::WaterScenarioInterpolation::SmoothVelocity:
-                                return "Smooth Velocity";
+                                return "Monotone Spline";
+                            case invisible_places::water::WaterScenarioInterpolation::CentripetalCatmullRom:
+                                return "Centripetal Catmull–Rom";
                         }
                         return "Smooth";
                     };
@@ -50764,11 +50768,13 @@ const char* TimingInterpolationLabel(
         case WaterScenarioInterpolation::Hold:
             return "Hold";
         case WaterScenarioInterpolation::SmoothVelocity:
-            return "Smooth Velocity";
+            return "Monotone Spline";
+        case WaterScenarioInterpolation::CentripetalCatmullRom:
+            return "Centripetal Catmull–Rom";
         case WaterScenarioInterpolation::Smooth:
-        default:
-            return "Smooth";
+            return "Smooth Step";
     }
+    return "Smooth Step";
 }
 
 bool DrawTimingInterpolationCombo(
@@ -50802,7 +50808,7 @@ bool DrawTimingInterpolationCombo(
         ImGui::EndCombo();
     }
     DrawTimingControlTooltip(
-        "Choose Smooth, Linear, or Hold interpolation from this key to the next.");
+        "Choose Smooth Step, Linear, or Hold interpolation from this key to the next.");
     return changed;
 }
 
@@ -50836,6 +50842,7 @@ bool DrawTimingScalarTrackInterpolationCombo(
         constexpr std::array options{
             WaterScenarioInterpolation::Smooth,
             WaterScenarioInterpolation::SmoothVelocity,
+            WaterScenarioInterpolation::CentripetalCatmullRom,
         };
         for (const auto option : options) {
             const bool selected = !mixed && firstMode == option;
@@ -50856,7 +50863,7 @@ bool DrawTimingScalarTrackInterpolationCombo(
         ImGui::EndCombo();
     }
     DrawTimingControlTooltip(
-        "Curve style for this complete setting track. Smooth eases to rest at every key; Smooth Velocity carries a continuous, monotone speed through keys while values keep moving in the same direction, and rests at reversals or flat holds.");
+        "Curve style for this complete setting track. Smooth Step eases to rest at every key. Monotone Spline carries continuous speed without overshoot and rests at reversals. Centripetal Catmull–Rom follows a fluid C1 curve through unevenly spaced keys and may gently overshoot intermediate scalar values.");
     return changed;
 }
 
@@ -51531,6 +51538,14 @@ void DrawTimingKeyLaneGroup(
                        TimingColouriseKeyTrack::EffectParameter &&
                    lane.effectParameter.has_value();
         };
+    const auto laneDrawsWrappedPalettePhase =
+        [](const TimingColouriseKeyLaneSeries& lane) {
+            return lane.track ==
+                       TimingColouriseKeyTrack::EffectParameter &&
+                   lane.effectParameter == invisible_places::timing::
+                                               TimingColouriseEffectParameter::
+                                                   PalettePhase;
+        };
     const bool drawsValueGraph = std::any_of(
         series.begin(),
         series.end(),
@@ -51789,13 +51804,28 @@ void DrawTimingKeyLaneGroup(
         const auto markerValue =
             scalarValueAt(*nearestSeries, nearestPosition);
         if (markerValue.has_value()) {
-            ImGui::SetTooltip(
-                onKey
-                    ? "%s key %.6g at animation position %.4f — drag this axis marker to move it; double-click to type an exact position."
-                    : "%s key %.6g at animation position %.4f — click this axis marker to select it; drag to move it.",
-                nearestSeries->label,
-                markerValue.value(),
-                nearestPosition);
+            if (laneDrawsWrappedPalettePhase(*nearestSeries)) {
+                const float delta = invisible_places::timing::
+                    TimingColourisePalettePhaseDeltaFromPrevious(
+                        *effect,
+                        nearestPosition);
+                ImGui::SetTooltip(
+                    onKey
+                        ? "%s key delta %.6g turns; accumulated %.6g at animation position %.4f — drag this axis marker to move it; double-click to type an exact position."
+                        : "%s key delta %.6g turns; accumulated %.6g at animation position %.4f — click this axis marker to select it; drag to move it.",
+                    nearestSeries->label,
+                    delta,
+                    markerValue.value(),
+                    nearestPosition);
+            } else {
+                ImGui::SetTooltip(
+                    onKey
+                        ? "%s key %.6g at animation position %.4f — drag this axis marker to move it; double-click to type an exact position."
+                        : "%s key %.6g at animation position %.4f — click this axis marker to select it; drag to move it.",
+                    nearestSeries->label,
+                    markerValue.value(),
+                    nearestPosition);
+            }
         } else {
             ImGui::SetTooltip(
                 onKey
@@ -51953,6 +51983,7 @@ void DrawTimingKeyLaneGroup(
         std::vector<float> values;
         float minimum = 0.0F;
         float maximum = 0.0F;
+        bool wrappedPalettePhase = false;
     };
     std::vector<float> graphPositions;
     std::vector<ValueGraph> valueGraphs;
@@ -52002,6 +52033,8 @@ void DrawTimingKeyLaneGroup(
                 .lane = &lane,
                 .minimum = std::numeric_limits<float>::max(),
                 .maximum = std::numeric_limits<float>::lowest(),
+                .wrappedPalettePhase =
+                    laneDrawsWrappedPalettePhase(lane),
             };
             graph.values.reserve(graphPositions.size());
             for (std::size_t index = 0U;
@@ -52051,15 +52084,20 @@ void DrawTimingKeyLaneGroup(
                         std::max(graph.maximum, value.value());
                 }
             }
-            const float magnitude = std::max(
-                std::abs(graph.minimum),
-                std::abs(graph.maximum));
-            if (graph.maximum - graph.minimum <=
-                std::max(1.0e-7F, magnitude * 1.0e-6F)) {
-                const float padding =
-                    std::max(1.0e-6F, magnitude * 0.05F);
-                graph.minimum -= padding;
-                graph.maximum += padding;
+            if (graph.wrappedPalettePhase) {
+                graph.minimum = -1.0F;
+                graph.maximum = 1.0F;
+            } else {
+                const float magnitude = std::max(
+                    std::abs(graph.minimum),
+                    std::abs(graph.maximum));
+                if (graph.maximum - graph.minimum <=
+                    std::max(1.0e-7F, magnitude * 1.0e-6F)) {
+                    const float padding =
+                        std::max(1.0e-6F, magnitude * 0.05F);
+                    graph.minimum -= padding;
+                    graph.maximum += padding;
+                }
             }
             valueGraphs.push_back(std::move(graph));
         }
@@ -52092,6 +52130,46 @@ void DrawTimingKeyLaneGroup(
     float hoveredGraphPosition = 0.0F;
     float hoveredGraphValue = 0.0F;
     float hoveredGraphDistance = 7.0F;
+    const auto colourWithOpacity = [](ImU32 colour, float opacity) {
+        auto converted = ImGui::ColorConvertU32ToFloat4(colour);
+        converted.w *= std::clamp(opacity, 0.0F, 1.0F);
+        return ImGui::ColorConvertFloat4ToU32(converted);
+    };
+    if (const auto phaseGraph = std::find_if(
+            valueGraphs.begin(),
+            valueGraphs.end(),
+            [](const ValueGraph& graph) {
+                return graph.wrappedPalettePhase;
+            });
+        phaseGraph != valueGraphs.end()) {
+        const ImU32 guideColour = colourWithOpacity(
+            ImGui::GetColorU32(ImGuiCol_Border),
+            0.55F);
+        drawList->AddLine(
+            ImVec2{minimum.x, yForValue(*phaseGraph, 0.0F)},
+            ImVec2{maximum.x, yForValue(*phaseGraph, 0.0F)},
+            guideColour,
+            1.0F);
+        const ImU32 labelColour =
+            ImGui::GetColorU32(ImGuiCol_TextDisabled);
+        drawList->AddText(
+            ImVec2{minimum.x + 3.0F, graphTopY},
+            labelColour,
+            "+1");
+        drawList->AddText(
+            ImVec2{
+                minimum.x + 3.0F,
+                yForValue(*phaseGraph, 0.0F) -
+                    ImGui::GetTextLineHeight() * 0.5F},
+            labelColour,
+            "0");
+        drawList->AddText(
+            ImVec2{
+                minimum.x + 3.0F,
+                axisY - ImGui::GetTextLineHeight()},
+            labelColour,
+            "-1");
+    }
     for (const auto& graph : valueGraphs) {
         for (std::size_t index = 1U;
              index < graphPositions.size();
@@ -52101,15 +52179,88 @@ void DrawTimingKeyLaneGroup(
             const ImU32 segmentColour = markerColour(
                 graph.lane->colour,
                 std::midpoint(leftPosition, rightPosition));
-            drawList->AddLine(
-                ImVec2{
-                    xForPosition(leftPosition),
-                    yForValue(graph, graph.values[index - 1U])},
-                ImVec2{
-                    xForPosition(rightPosition),
-                    yForValue(graph, graph.values[index])},
-                segmentColour,
-                1.5F);
+            if (!graph.wrappedPalettePhase) {
+                drawList->AddLine(
+                    ImVec2{
+                        xForPosition(leftPosition),
+                        yForValue(graph, graph.values[index - 1U])},
+                    ImVec2{
+                        xForPosition(rightPosition),
+                        yForValue(graph, graph.values[index])},
+                    segmentColour,
+                    1.5F);
+                continue;
+            }
+
+            // Draw every integer-shifted copy of the accumulated phase that
+            // intersects [-1, +1]. A line leaving at +1 therefore remains
+            // visible at 0 and -1, making successive turns readable without
+            // compressing an ever-growing unwrapped value range.
+            const float leftValue = graph.values[index - 1U];
+            const float rightValue = graph.values[index];
+            const int firstOffset = static_cast<int>(std::ceil(
+                std::min(leftValue, rightValue) - 1.0F));
+            const int lastOffset = static_cast<int>(std::floor(
+                std::max(leftValue, rightValue) + 1.0F));
+            const float middleValue =
+                std::midpoint(leftValue, rightValue);
+            const int primaryOffset =
+                static_cast<int>(std::trunc(middleValue));
+            for (int offset = firstOffset;
+                 offset <= lastOffset;
+                 ++offset) {
+                const float shiftedLeft =
+                    leftValue - static_cast<float>(offset);
+                const float shiftedRight =
+                    rightValue - static_cast<float>(offset);
+                const float difference = shiftedRight - shiftedLeft;
+                float visibleStart = 0.0F;
+                float visibleEnd = 1.0F;
+                if (std::abs(difference) <= 1.0e-7F) {
+                    if (shiftedLeft < -1.0F || shiftedLeft > 1.0F) {
+                        continue;
+                    }
+                } else {
+                    const float atLower =
+                        (-1.0F - shiftedLeft) / difference;
+                    const float atUpper =
+                        (1.0F - shiftedLeft) / difference;
+                    visibleStart = std::max(
+                        visibleStart,
+                        std::min(atLower, atUpper));
+                    visibleEnd = std::min(
+                        visibleEnd,
+                        std::max(atLower, atUpper));
+                    if (visibleEnd < visibleStart) {
+                        continue;
+                    }
+                }
+                const float clippedLeft = std::lerp(
+                    shiftedLeft,
+                    shiftedRight,
+                    visibleStart);
+                const float clippedRight = std::lerp(
+                    shiftedLeft,
+                    shiftedRight,
+                    visibleEnd);
+                drawList->AddLine(
+                    ImVec2{
+                        xForPosition(std::lerp(
+                            leftPosition,
+                            rightPosition,
+                            visibleStart)),
+                        yForValue(graph, clippedLeft)},
+                    ImVec2{
+                        xForPosition(std::lerp(
+                            leftPosition,
+                            rightPosition,
+                            visibleEnd)),
+                        yForValue(graph, clippedRight)},
+                    colourWithOpacity(
+                        segmentColour,
+                        offset == primaryOffset ? 1.0F : 0.32F),
+                    offset == primaryOffset ? 1.75F : 1.1F);
+            }
         }
         for (std::size_t index = 0U;
              index < graphPositions.size();
@@ -52118,16 +52269,33 @@ void DrawTimingKeyLaneGroup(
                 mouse.y > axisY - kMarkerHitRadius) {
                 break;
             }
-            const float dx =
-                mouse.x - xForPosition(graphPositions[index]);
-            const float dy =
-                mouse.y - yForValue(graph, graph.values[index]);
-            const float distance = std::hypot(dx, dy);
-            if (distance < hoveredGraphDistance) {
-                hoveredGraphDistance = distance;
-                hoveredGraph = &graph;
-                hoveredGraphPosition = graphPositions[index];
-                hoveredGraphValue = graph.values[index];
+            const float dx = mouse.x -
+                             xForPosition(graphPositions[index]);
+            const float value = graph.values[index];
+            const int firstOffset = graph.wrappedPalettePhase
+                                        ? static_cast<int>(
+                                              std::ceil(value - 1.0F))
+                                        : 0;
+            const int lastOffset = graph.wrappedPalettePhase
+                                       ? static_cast<int>(
+                                             std::floor(value + 1.0F))
+                                       : 0;
+            for (int offset = firstOffset;
+                 offset <= lastOffset;
+                 ++offset) {
+                const float drawnValue =
+                    graph.wrappedPalettePhase
+                        ? value - static_cast<float>(offset)
+                        : value;
+                const float dy =
+                    mouse.y - yForValue(graph, drawnValue);
+                const float distance = std::hypot(dx, dy);
+                if (distance < hoveredGraphDistance) {
+                    hoveredGraphDistance = distance;
+                    hoveredGraph = &graph;
+                    hoveredGraphPosition = graphPositions[index];
+                    hoveredGraphValue = value;
+                }
             }
         }
         for (const float position : graph.lane->positions) {
@@ -52147,21 +52315,49 @@ void DrawTimingKeyLaneGroup(
             if (!value.has_value()) {
                 continue;
             }
-            const ImVec2 point{
-                xForPosition(drawnPosition),
-                yForValue(graph, value.value())};
-            drawList->AddCircleFilled(
-                point,
-                3.5F,
-                markerColour(
-                    graph.lane->colour,
-                    drawnPosition));
-            drawList->AddCircle(
-                point,
-                4.25F,
-                ImGui::GetColorU32(ImGuiCol_Border),
-                0,
-                1.0F);
+            const int firstOffset = graph.wrappedPalettePhase
+                                        ? static_cast<int>(
+                                              std::ceil(value.value() -
+                                                        1.0F))
+                                        : 0;
+            const int lastOffset = graph.wrappedPalettePhase
+                                       ? static_cast<int>(
+                                             std::floor(value.value() +
+                                                        1.0F))
+                                       : 0;
+            const int primaryOffset =
+                static_cast<int>(std::trunc(value.value()));
+            for (int offset = firstOffset;
+                 offset <= lastOffset;
+                 ++offset) {
+                const float drawnValue =
+                    graph.wrappedPalettePhase
+                        ? value.value() - static_cast<float>(offset)
+                        : value.value();
+                const bool primary =
+                    !graph.wrappedPalettePhase ||
+                    offset == primaryOffset;
+                const ImVec2 point{
+                    xForPosition(drawnPosition),
+                    yForValue(graph, drawnValue)};
+                const ImU32 pointColour = colourWithOpacity(
+                    markerColour(
+                        graph.lane->colour,
+                        drawnPosition),
+                    primary ? 1.0F : 0.42F);
+                drawList->AddCircleFilled(
+                    point,
+                    primary ? 3.5F : 2.6F,
+                    pointColour);
+                drawList->AddCircle(
+                    point,
+                    primary ? 4.25F : 3.3F,
+                    colourWithOpacity(
+                        ImGui::GetColorU32(ImGuiCol_Border),
+                        primary ? 1.0F : 0.45F),
+                    0,
+                    1.0F);
+            }
         }
     }
 
@@ -52298,13 +52494,21 @@ void DrawTimingKeyLaneGroup(
                     ? activation.start
                     : activation.end);
         } else if (hoveredGraph != nullptr) {
-            ImGui::SetTooltip(
-                "%s %.6g at animation position %.4f\nGraph range %.6g–%.6g; each setting is scaled from its own minimum at the axis to its maximum at the top.",
-                hoveredGraph->lane->label,
-                hoveredGraphValue,
-                hoveredGraphPosition,
-                hoveredGraph->minimum,
-                hoveredGraph->maximum);
+            if (hoveredGraph->wrappedPalettePhase) {
+                ImGui::SetTooltip(
+                    "%s accumulated %.6g turns at animation position %.4f\nInteger-shifted copies show the same cyclic phase across the fixed -1 to +1 graph range.",
+                    hoveredGraph->lane->label,
+                    hoveredGraphValue,
+                    hoveredGraphPosition);
+            } else {
+                ImGui::SetTooltip(
+                    "%s %.6g at animation position %.4f\nGraph range %.6g–%.6g; each setting is scaled from its own minimum at the axis to its maximum at the top.",
+                    hoveredGraph->lane->label,
+                    hoveredGraphValue,
+                    hoveredGraphPosition,
+                    hoveredGraph->minimum,
+                    hoveredGraph->maximum);
+            }
         } else {
             ImGui::SetTooltip(
                 "Animation position %.4f — click or drag to scrub. Drag coloured key markers on the horizontal axis to retime them.",
@@ -52767,10 +52971,10 @@ TimingColourPhaseSliderResult DrawTimingColourPhaseSlider(
         return result;
     }
 
-    // Two unwrapped turns in either direction cover the authored motion
-    // studies while exact entry remains available for any finite value.
-    constexpr float kMinimumTurns = -2.0F;
-    constexpr float kMaximumTurns = 2.0F;
+    // Each key contributes at most one signed turn relative to the preceding
+    // phase target. Accumulation is visualized separately in the graph.
+    constexpr float kMinimumTurns = -1.0F;
+    constexpr float kMaximumTurns = 1.0F;
     constexpr float kTurnSpan = kMaximumTurns - kMinimumTurns;
     constexpr float kRailHeight = 14.0F;
 
@@ -52831,7 +53035,7 @@ TimingColourPhaseSliderResult DrawTimingColourPhaseSlider(
         ImVec2{maximum.x, centreY},
         railColour,
         1.0F);
-    for (int wholeTurn = -2; wholeTurn <= 2; ++wholeTurn) {
+    for (int wholeTurn = -1; wholeTurn <= 1; ++wholeTurn) {
         const float x = xForTurns(static_cast<float>(wholeTurn));
         const float halfHeight = wholeTurn == 0 ? 4.0F : 2.5F;
         drawList->AddLine(
@@ -52994,11 +53198,19 @@ bool DrawTimingColouriseEffectParameterEditor(
         effect->effectParameterKeys,
         [&](const auto& key) { return key.parameter == parameter; },
         position);
-    float evaluated = invisible_places::timing::
+    const float evaluatedTotal = invisible_places::timing::
         EvaluateTimingColouriseEffectParameter(
             *effect,
             parameter,
             position);
+    float authoredValue =
+        parameter == TimingColouriseEffectParameter::PalettePhase &&
+                hasKeys
+            ? invisible_places::timing::
+                  TimingColourisePalettePhaseDeltaFromPrevious(
+                      *effect,
+                      position)
+            : evaluatedTotal;
     ImGui::PushID(static_cast<int>(parameter));
     if (hasKeys) {
         ImGui::PushStyleColor(
@@ -53045,7 +53257,11 @@ bool DrawTimingColouriseEffectParameterEditor(
             kWaterKeyedSettingColour);
     }
     const std::string valueText =
-        FormatFixed(evaluated, 3) +
+        (parameter == TimingColouriseEffectParameter::PalettePhase &&
+                 hasKeys
+             ? std::string{"Delta "}
+             : std::string{}) +
+        FormatFixed(authoredValue, 3) +
         (parameter == TimingColouriseEffectParameter::PalettePhase
              ? " turns"
              : std::string{});
@@ -53067,7 +53283,7 @@ bool DrawTimingColouriseEffectParameterEditor(
     switch (parameter) {
         case TimingColouriseEffectParameter::PalettePhase:
             parameterTooltip =
-                "Shift by unwrapped palette turns. Drag the thin rail below for live changes, or click this value to type an exact number. Choose Smooth Velocity below to carry speed through continuing keys, or Smooth to rest at every key.";
+                "Each keyed value is a signed change from the preceding phase, limited to one complete turn in either direction. The phase accumulates across keys and wraps only when the palette is sampled. Drag the thin rail for live changes or click the value for exact entry.";
             break;
         case TimingColouriseEffectParameter::AmountOverride:
             parameterTooltip =
@@ -53083,7 +53299,7 @@ bool DrawTimingColouriseEffectParameterEditor(
     if (parameter == TimingColouriseEffectParameter::PalettePhase) {
         const auto slider = DrawTimingColourPhaseSlider(
             "##PalettePhaseTurns",
-            &evaluated);
+            &authoredValue);
         valueChanged = slider.changed;
         if (slider.active) {
             StopAnimationPlayback(runtimeState);
@@ -53092,7 +53308,9 @@ bool DrawTimingColouriseEffectParameterEditor(
             ImGui::OpenPopup("Edit Value");
         }
         DrawTimingControlTooltip(
-            "Drag for live Colour Phase changes from -2 to +2 turns. Whole turns are ticked; double-click to type any finite value.");
+            hasKeys
+                ? "Drag from -1 to +1 turn relative to the preceding phase key. The graph below shows the accumulated phase as wrapped copies. Double-click for exact entry."
+                : "Drag the unkeyed base phase from -1 to +1 turn. Double-click for exact entry.");
     }
 
     if (ImGui::BeginPopup("Edit Value")) {
@@ -53104,7 +53322,7 @@ bool DrawTimingColouriseEffectParameterEditor(
             TimingColouriseEffectParameter::EmissiveLevel) {
             valueChanged = DrawRangedFloatControl(
                 "##EmissiveLevel",
-                &evaluated,
+                &authoredValue,
                 {.visualMin = 0.0F,
                  .visualMax = 2.5F,
                  .format = "%.3f",
@@ -53117,24 +53335,27 @@ bool DrawTimingColouriseEffectParameterEditor(
             valueChanged =
                 ImGui::InputFloat(
                     "##Value",
-                    &evaluated,
+                    &authoredValue,
                     0.01F,
                     0.1F,
                     "%.3f") ||
                 valueChanged;
             DrawTimingControlTooltip(
                 parameter == TimingColouriseEffectParameter::PalettePhase
-                    ? "Enter any finite number of palette turns, including negative values."
+                    ? "Enter a signed phase change from -1 to +1 turn."
                     : "Enter a value from 0 to 1.");
         }
         ImGui::EndPopup();
     }
-    if (valueChanged && std::isfinite(evaluated)) {
-        if (parameter == TimingColouriseEffectParameter::AmountOverride) {
-            evaluated = std::clamp(evaluated, 0.0F, 1.0F);
+    if (valueChanged && std::isfinite(authoredValue)) {
+        if (parameter == TimingColouriseEffectParameter::PalettePhase) {
+            authoredValue = std::clamp(authoredValue, -1.0F, 1.0F);
+        } else if (
+            parameter == TimingColouriseEffectParameter::AmountOverride) {
+            authoredValue = std::clamp(authoredValue, 0.0F, 1.0F);
         } else if (
             parameter == TimingColouriseEffectParameter::EmissiveLevel) {
-            evaluated = std::max(0.0F, evaluated);
+            authoredValue = std::max(0.0F, authoredValue);
         }
         if (hasKeys) {
             (void)invisible_places::timing::
@@ -53142,18 +53363,18 @@ bool DrawTimingColouriseEffectParameterEditor(
                     effect,
                     parameter,
                     position,
-                    evaluated,
+                    authoredValue,
                     trackInterpolation);
         } else {
             switch (parameter) {
                 case TimingColouriseEffectParameter::PalettePhase:
-                    effect->palettePhaseOffset = evaluated;
+                    effect->palettePhaseOffset = authoredValue;
                     break;
                 case TimingColouriseEffectParameter::AmountOverride:
-                    effect->colouriseAmountOverride = evaluated;
+                    effect->colouriseAmountOverride = authoredValue;
                     break;
                 case TimingColouriseEffectParameter::EmissiveLevel:
-                    effect->emissiveLevel = evaluated;
+                    effect->emissiveLevel = authoredValue;
                     break;
             }
         }
@@ -53162,12 +53383,17 @@ bool DrawTimingColouriseEffectParameterEditor(
     }
 
     if (ImGui::SmallButton("+")) {
+        const float keyValue =
+            parameter == TimingColouriseEffectParameter::PalettePhase &&
+                    !hasKeys
+                ? 0.0F
+                : authoredValue;
         if (invisible_places::timing::
                 AddOrUpdateTimingColouriseEffectParameterKey(
                     effect,
                     parameter,
                     position,
-                    evaluated,
+                    keyValue,
                     trackInterpolation)) {
             runtimeState->previewRenderStateSignatureValid = false;
             changed = true;
@@ -53175,8 +53401,12 @@ bool DrawTimingColouriseEffectParameterEditor(
     }
     DrawTimingControlTooltip(
         onKey
-            ? "Update this key at the current animation position without changing the track's Curve style."
-            : "Add a key using this track's Curve style and arm the control for autokey at new scrub positions.");
+            ? (parameter == TimingColouriseEffectParameter::PalettePhase
+                   ? "Update this key's signed turn delta without changing the track's Curve style. Later phase totals move by the same delta change."
+                   : "Update this key at the current animation position without changing the track's Curve style.")
+            : (parameter == TimingColouriseEffectParameter::PalettePhase
+                   ? "Add a relative phase key using this track's Curve style. Inserting between keys preserves the following accumulated target when both split deltas fit within one turn."
+                   : "Add a key using this track's Curve style and arm the control for autokey at new scrub positions."));
     ImGui::SameLine(0.0F, 2.0F);
     changed |= DrawTimingColouriseEffectParameterTrackButtons(
         runtimeState, effect, parameter);
@@ -54108,7 +54338,7 @@ void DrawTimingColourisePaletteEditor(
     };
     ImGui::TextDisabled("Value over animation position");
     DrawTimingControlTooltip(
-        "Each coloured curve uses its own visible value range so its slope shows acceleration and speed clearly. Key dots are visual; drag the matching coloured markers on the horizontal axis to retime keys.");
+        "Colourise Amount uses its own visible value range. Colour Phase uses a fixed -1 to +1 turn range and draws integer-shifted copies of its accumulated curve so every wrap remains visible. Drag the matching coloured markers on the horizontal axis to retime keys.");
     DrawTimingKeyLaneGroup(
         "##TimingColouriseEffectParameterKeyLane",
         runtimeState,

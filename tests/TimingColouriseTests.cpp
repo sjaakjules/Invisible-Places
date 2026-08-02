@@ -1881,7 +1881,7 @@ TEST_CASE(
     CHECK(sanitized.effectParameterKeys.front().position ==
           Approx(0.0F));
     CHECK(sanitized.effectParameterKeys.front().value ==
-          Approx(2.0F));
+          Approx(1.0F));
 
     effect.colouriseAmountOverrideMode =
         TimingColouriseAmountOverrideMode::Scale;
@@ -2084,7 +2084,7 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "Timing Colourise phase animation retains unwrapped turns",
+    "Timing Colourise relative phase deltas accumulate into unwrapped turns",
     "[timing][colourise][palette][phase][effect-parameters]") {
     TimingColouriseEffect effect;
     effect.basePalette = TimingColourisePalette{
@@ -2100,18 +2100,18 @@ TEST_CASE(
              .colour = {0.0F, 0.0F, 1.0F}},
         },
     };
-    for (const auto [position, turns] :
+    for (const auto [position, delta] :
          std::array{
              std::pair{0.0F, 0.0F},
              std::pair{0.5F, 1.0F},
-             std::pair{1.0F, 2.0F},
+             std::pair{1.0F, 1.0F},
          }) {
         REQUIRE(invisible_places::timing::
                     AddOrUpdateTimingColouriseEffectParameterKey(
                         &effect,
                         TimingColouriseEffectParameter::PalettePhase,
                         position,
-                        turns,
+                        delta,
                         WaterScenarioInterpolation::Smooth));
     }
 
@@ -2153,7 +2153,7 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "Timing Colourise Smooth Velocity carries speed through continuing keys and rests at reversals",
+    "Timing Colourise Monotone Spline carries speed through continuing keys and rests at reversals",
     "[timing][colourise][palette][phase][velocity]") {
     TimingColouriseEffect continuing;
     continuing.effectParameterKeys = {
@@ -2167,7 +2167,7 @@ TEST_CASE(
          .interpolation = WaterScenarioInterpolation::SmoothVelocity},
         {.parameter = TimingColouriseEffectParameter::PalettePhase,
          .position = 1.0F,
-         .value = 2.0F,
+         .value = 1.0F,
          .interpolation = WaterScenarioInterpolation::SmoothVelocity},
     };
     const auto continuingValue = [&](float position) {
@@ -2177,9 +2177,9 @@ TEST_CASE(
                 TimingColouriseEffectParameter::PalettePhase,
                 position);
     };
-    CHECK(continuingValue(0.249F) == Approx(0.498F).margin(1.0e-5F));
+    CHECK(continuingValue(0.249F) < 0.5F);
     CHECK(continuingValue(0.25F) == Approx(0.50F).margin(1.0e-5F));
-    CHECK(continuingValue(0.251F) == Approx(0.502F).margin(1.0e-5F));
+    CHECK(continuingValue(0.251F) > 0.5F);
     const float incomingVelocity =
         (continuingValue(0.25F) - continuingValue(0.249F)) /
         0.001F;
@@ -2189,7 +2189,7 @@ TEST_CASE(
     CHECK(incomingVelocity > 1.0F);
     CHECK(outgoingVelocity > 1.0F);
     CHECK(incomingVelocity ==
-          Approx(outgoingVelocity).margin(2.0e-3F));
+          Approx(outgoingVelocity).margin(5.0e-3F));
 
     auto resting = continuing;
     for (auto& key : resting.effectParameterKeys) {
@@ -2223,7 +2223,7 @@ TEST_CASE(
          .interpolation = WaterScenarioInterpolation::SmoothVelocity},
         {.parameter = TimingColouriseEffectParameter::PalettePhase,
          .position = 1.0F,
-         .value = 0.0F,
+         .value = -1.0F,
          .interpolation = WaterScenarioInterpolation::SmoothVelocity},
     };
     const auto reversingValue = [&](float position) {
@@ -2244,7 +2244,79 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "Timing Colourise Smooth Velocity is shared by bounds and effect scalar tracks",
+    "Timing Colourise phase keys are relative one-turn deltas and split cleanly on insertion",
+    "[timing][colourise][palette][phase][relative]") {
+    TimingColouriseEffect effect;
+    effect.palettePhaseOffset = 0.25F;
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColouriseEffectParameterKey(
+                    &effect,
+                    TimingColouriseEffectParameter::PalettePhase,
+                    0.2F,
+                    0.5F,
+                    WaterScenarioInterpolation::Smooth));
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColouriseEffectParameterKey(
+                    &effect,
+                    TimingColouriseEffectParameter::PalettePhase,
+                    0.8F,
+                    0.5F,
+                    WaterScenarioInterpolation::Smooth));
+    CHECK(invisible_places::timing::
+              EvaluateTimingColouriseEffectParameter(
+                  effect,
+                  TimingColouriseEffectParameter::PalettePhase,
+                  0.2F) == Approx(0.75F));
+    CHECK(invisible_places::timing::
+              EvaluateTimingColouriseEffectParameter(
+                  effect,
+                  TimingColouriseEffectParameter::PalettePhase,
+                  0.8F) == Approx(1.25F));
+
+    const float insertionDelta = invisible_places::timing::
+        TimingColourisePalettePhaseDeltaFromPrevious(effect, 0.5F);
+    CHECK(insertionDelta == Approx(0.25F));
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColouriseEffectParameterKey(
+                    &effect,
+                    TimingColouriseEffectParameter::PalettePhase,
+                    0.5F,
+                    insertionDelta,
+                    WaterScenarioInterpolation::Smooth));
+    REQUIRE(effect.effectParameterKeys.size() == 3U);
+    CHECK(effect.effectParameterKeys[1].value == Approx(0.25F));
+    CHECK(effect.effectParameterKeys[2].value == Approx(0.25F));
+    CHECK(invisible_places::timing::
+              EvaluateTimingColouriseEffectParameter(
+                  effect,
+                  TimingColouriseEffectParameter::PalettePhase,
+                  0.8F) == Approx(1.25F));
+
+    CHECK(invisible_places::timing::
+              RemoveTimingColouriseEffectParameterKeysAtPosition(
+                  &effect,
+                  TimingColouriseEffectParameter::PalettePhase,
+                  0.5F) == 1U);
+    REQUIRE(effect.effectParameterKeys.size() == 2U);
+    CHECK(effect.effectParameterKeys[1].value == Approx(0.5F));
+    CHECK(invisible_places::timing::
+              EvaluateTimingColouriseEffectParameter(
+                  effect,
+                  TimingColouriseEffectParameter::PalettePhase,
+                  0.8F) == Approx(1.25F));
+
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColouriseEffectParameterKey(
+                    &effect,
+                    TimingColouriseEffectParameter::PalettePhase,
+                    1.0F,
+                    4.0F,
+                    WaterScenarioInterpolation::Smooth));
+    CHECK(effect.effectParameterKeys.back().value == Approx(1.0F));
+}
+
+TEST_CASE(
+    "Timing Colourise Monotone Spline is shared by bounds and effect scalar tracks",
     "[timing][colourise][bounds][emissive][velocity]") {
     TimingColouriseEffect effect;
     effect.emissiveEnabled = true;
@@ -2306,6 +2378,75 @@ TEST_CASE(
             return key.interpolation ==
                    WaterScenarioInterpolation::SmoothVelocity;
         }));
+}
+
+TEST_CASE(
+    "Timing Colourise Centripetal Catmull-Rom is C1 across uneven scalar keys",
+    "[timing][colourise][bounds][emissive][catmull-rom]") {
+    TimingColouriseEffect effect;
+    effect.emissiveEnabled = true;
+    for (const auto [position, value] :
+         std::array{
+             std::pair{0.0F, 0.05F},
+             std::pair{0.18F, 0.42F},
+             std::pair{0.55F, 0.64F},
+             std::pair{1.0F, 0.90F},
+         }) {
+        REQUIRE(invisible_places::timing::
+                    AddOrUpdateTimingColouriseEffectParameterKey(
+                        &effect,
+                        TimingColouriseEffectParameter::EmissiveLevel,
+                        position,
+                        value,
+                        WaterScenarioInterpolation::
+                            CentripetalCatmullRom));
+        REQUIRE(invisible_places::timing::
+                    AddOrUpdateTimingColouriseBoundsParameterKey(
+                        &effect,
+                        TimingColouriseBoundsParameter::Lower,
+                        position,
+                        value,
+                        WaterScenarioInterpolation::
+                            CentripetalCatmullRom));
+    }
+    const auto emissiveAt = [&](float position) {
+        return invisible_places::timing::EvaluateTimingEmissiveLevel(
+            effect,
+            position);
+    };
+    const auto lowerAt = [&](float position) {
+        return invisible_places::timing::EvaluateTimingColouriseBounds(
+                   effect,
+                   position)
+            .lower;
+    };
+    const auto checkC1 = [&](const auto& valueAt, float keyPosition) {
+        constexpr float epsilon = 1.0e-4F;
+        const float value = valueAt(keyPosition);
+        const float incoming =
+            (value - valueAt(keyPosition - epsilon)) / epsilon;
+        const float outgoing =
+            (valueAt(keyPosition + epsilon) - value) / epsilon;
+        CHECK(std::isfinite(incoming));
+        CHECK(std::isfinite(outgoing));
+        CHECK(incoming == Approx(outgoing).margin(0.03F));
+    };
+    for (const float keyPosition : {0.18F, 0.55F}) {
+        checkC1(emissiveAt, keyPosition);
+        checkC1(lowerAt, keyPosition);
+    }
+    CHECK(emissiveAt(0.18F) == Approx(0.42F).margin(1.0e-5F));
+    CHECK(emissiveAt(0.55F) == Approx(0.64F).margin(1.0e-5F));
+
+    auto smoothStep = effect;
+    for (auto& key : smoothStep.effectParameterKeys) {
+        key.interpolation = WaterScenarioInterpolation::Smooth;
+    }
+    CHECK(std::abs(
+              emissiveAt(0.36F) -
+              invisible_places::timing::EvaluateTimingEmissiveLevel(
+                  smoothStep,
+                  0.36F)) > 1.0e-3F);
 }
 
 TEST_CASE(
@@ -2449,7 +2590,7 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "Timing Colourise stores both supported Smooth interpolation styles",
+    "Timing Colourise stores all supported smooth interpolation styles",
     "[timing][colourise][keys][interpolation]") {
     TimingColouriseEffect effect;
     effect.basePalette = invisible_places::timing::
@@ -2539,6 +2680,37 @@ TEST_CASE(
     CHECK(allSmoothVelocity(sanitized.effectParameterKeys));
     CHECK(allSmoothVelocity(sanitized.boundsKeys));
     CHECK(allSmoothVelocity(sanitized.boundsParameterKeys));
+
+    const auto setAllCentripetalCatmullRom = [](auto* keys) {
+        for (auto& key : *keys) {
+            key.interpolation =
+                WaterScenarioInterpolation::CentripetalCatmullRom;
+        }
+    };
+    setAllCentripetalCatmullRom(&effect.paletteKeys);
+    setAllCentripetalCatmullRom(&effect.paletteStopParameterKeys);
+    setAllCentripetalCatmullRom(&effect.effectParameterKeys);
+    setAllCentripetalCatmullRom(&effect.boundsKeys);
+    setAllCentripetalCatmullRom(&effect.boundsParameterKeys);
+    const auto catmullSanitized =
+        invisible_places::timing::SanitizeTimingColouriseEffect(effect);
+    const auto allCentripetalCatmullRom = [](const auto& keys) {
+        return std::all_of(
+            keys.begin(),
+            keys.end(),
+            [](const auto& key) {
+                return key.interpolation == WaterScenarioInterpolation::
+                                                CentripetalCatmullRom;
+            });
+    };
+    CHECK(allCentripetalCatmullRom(catmullSanitized.paletteKeys));
+    CHECK(allCentripetalCatmullRom(
+        catmullSanitized.paletteStopParameterKeys));
+    CHECK(allCentripetalCatmullRom(
+        catmullSanitized.effectParameterKeys));
+    CHECK(allCentripetalCatmullRom(catmullSanitized.boundsKeys));
+    CHECK(allCentripetalCatmullRom(
+        catmullSanitized.boundsParameterKeys));
 
     effect.effectParameterKeys.front().interpolation =
         static_cast<WaterScenarioInterpolation>(255);

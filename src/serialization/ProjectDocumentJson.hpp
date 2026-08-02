@@ -41,6 +41,12 @@ TimingTakeSceneStateFromJson(
     const nlohmann::json& value,
     std::string* errorMessage = nullptr);
 
+// Converts pre-schema-62 Palette Phase keys from absolute unwrapped turns to
+// signed deltas before the current timing sanitizer constrains them to one
+// turn. Render-setup schema migration shares this JSON-level conversion.
+void MigrateAbsoluteTimingColourisePalettePhaseKeys(
+    nlohmann::json* timingTakeSceneStateJson);
+
 [[nodiscard]] nlohmann::json WaterAnimationTrailSettingsToJson(
     const invisible_places::water::WaterAnimationTrailSettings& settings);
 [[nodiscard]] std::optional<

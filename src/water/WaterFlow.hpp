@@ -151,7 +151,11 @@ enum class WaterScenarioInterpolation {
     // Monotone cubic interpolation that carries velocity through keys while
     // the authored values continue in the same direction. Unlike Smooth,
     // this only comes to rest at reversals, flat holds, or a mode boundary.
-    SmoothVelocity
+    SmoothVelocity,
+    // Chord-length-aware Catmull-Rom interpolation using alpha = 0.5. This
+    // follows a fluid C1 curve through every key without the uniform
+    // Catmull-Rom loops and cusps caused by unevenly spaced control points.
+    CentripetalCatmullRom
 };
 
 enum class WaterFieldOutputMode {

@@ -268,9 +268,11 @@ struct TimingColouriseEffect {
     // Applied after palette/key evaluation. This changes colour mixing only,
     // never point opacity or the authored per-stop amounts.
     float colouriseAmountOverride = 1.0F;
-    // Unwrapped cyclic offset in palette turns. Animation retains the full
-    // value (for example 0 -> 1 -> 2); wrapping happens only while sampling
-    // the evaluated LUT. Stops and their authored positions remain fixed.
+    // Base cyclic offset in palette turns. Palette Phase keys below store a
+    // signed delta from the preceding phase key (or this base for the first
+    // key), constrained to one turn in either direction. Evaluation
+    // accumulates those deltas without wrapping; wrapping happens only while
+    // sampling the LUT. Stops and their authored positions remain fixed.
     float palettePhaseOffset = 0.0F;
     // Independent animated tracks for phase and the amount override value.
     // EmissiveLevel shares this scalar-key representation. The Max/Scale mode
@@ -501,6 +503,12 @@ std::size_t MergeLegacyTimingEffectAspects(
 [[nodiscard]] float EvaluateTimingColouriseEffectParameter(
     const TimingColouriseEffect& effect,
     TimingColouriseEffectParameter parameter,
+    float normalizedPosition);
+// Returns the authored Palette Phase delta at an exact key. Between keys it
+// returns the currently evaluated phase relative to the preceding accumulated
+// key target, which makes inserting a key preserve the visible phase.
+[[nodiscard]] float TimingColourisePalettePhaseDeltaFromPrevious(
+    const TimingColouriseEffect& effect,
     float normalizedPosition);
 [[nodiscard]] float EvaluateTimingEmissiveLevel(
     const TimingColouriseEffect& effect,

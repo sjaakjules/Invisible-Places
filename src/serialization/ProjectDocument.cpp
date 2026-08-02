@@ -114,9 +114,13 @@ constexpr std::array<char, 8> kWaterPathCacheSidecarMagic{'I', 'P', 'F', 'L', 'O
 constexpr std::uint32_t kManualFlowSurfaceGuideProjectSchemaVersion = 40U;
 constexpr std::uint32_t kManualFlowSurfaceGuideSourcesSchemaVersion = 16U;
 constexpr std::uint32_t kSmoothVelocityProjectSchemaVersion = 61U;
+constexpr std::uint32_t kRelativePalettePhaseProjectSchemaVersion = 62U;
 static_assert(
     kProjectDocumentSchemaVersion >=
     kSmoothVelocityProjectSchemaVersion);
+static_assert(
+    kProjectDocumentSchemaVersion >=
+    kRelativePalettePhaseProjectSchemaVersion);
 
 constexpr std::string_view kProjectVisualEditedSuffix = "_edited";
 constexpr std::string_view kProjectVisualLegacyEditedSuffix = "_Edited";
@@ -3326,6 +3330,8 @@ const char* WaterScenarioInterpolationName(WaterScenarioInterpolation interpolat
             return "hold";
         case WaterScenarioInterpolation::SmoothVelocity:
             return "smooth_velocity";
+        case WaterScenarioInterpolation::CentripetalCatmullRom:
+            return "centripetal_catmull_rom";
     }
     return "smooth";
 }
@@ -3343,6 +3349,9 @@ WaterScenarioInterpolation ParseWaterScenarioInterpolation(const json& interpola
     }
     if (name == "smooth_velocity") {
         return WaterScenarioInterpolation::SmoothVelocity;
+    }
+    if (name == "centripetal_catmull_rom") {
+        return WaterScenarioInterpolation::CentripetalCatmullRom;
     }
     return WaterScenarioInterpolation::Smooth;
 }
@@ -8080,6 +8089,88 @@ void LoadWaterPathSidecars(
 
 }  // namespace
 
+void MigrateAbsoluteTimingColourisePalettePhaseKeys(
+    nlohmann::json* timingTakeSceneStateJson) {
+    if (timingTakeSceneStateJson == nullptr ||
+        !timingTakeSceneStateJson->is_object()) {
+        return;
+    }
+    const auto oneTurnDelta = [](float absoluteDelta) {
+        if (!std::isfinite(absoluteDelta)) {
+            return 0.0F;
+        }
+        if (absoluteDelta >= -1.0F && absoluteDelta <= 1.0F) {
+            return absoluteDelta;
+        }
+        const float remainder = std::fmod(absoluteDelta, 1.0F);
+        // An exact multi-turn difference has no fractional remainder. Keep
+        // one complete turn in the authored direction rather than collapsing
+        // the motion to a stationary key.
+        return std::abs(remainder) <= 1.0e-6F
+                   ? std::copysign(1.0F, absoluteDelta)
+                   : remainder;
+    };
+    const auto migrateEffectList = [&](const char* listName) {
+        auto list = timingTakeSceneStateJson->find(listName);
+        if (list == timingTakeSceneStateJson->end() ||
+            !list->is_array()) {
+            return;
+        }
+        for (auto& effect : *list) {
+            if (!effect.is_object()) {
+                continue;
+            }
+            auto keys = effect.find("effect_parameter_keys");
+            if (keys == effect.end() || !keys->is_array()) {
+                continue;
+            }
+            const float base =
+                effect.contains("palette_phase_offset") &&
+                        effect.at("palette_phase_offset").is_number()
+                    ? effect.at("palette_phase_offset").get<float>()
+                    : 0.0F;
+            std::vector<std::size_t> phaseKeyIndices;
+            for (std::size_t index = 0U; index < keys->size(); ++index) {
+                const auto& key = keys->at(index);
+                if (key.is_object() && key.contains("parameter") &&
+                    key.at("parameter").is_string() &&
+                    key.at("parameter").get_ref<const std::string&>() ==
+                        "palette_phase") {
+                    phaseKeyIndices.push_back(index);
+                }
+            }
+            std::stable_sort(
+                phaseKeyIndices.begin(),
+                phaseKeyIndices.end(),
+                [&](std::size_t left, std::size_t right) {
+                    const auto position = [&](std::size_t index) {
+                        const auto& key = keys->at(index);
+                        return key.contains("position") &&
+                                       key.at("position").is_number()
+                                   ? key.at("position").get<float>()
+                                   : 0.0F;
+                    };
+                    return position(left) < position(right);
+                });
+            float previousAbsolute = std::isfinite(base) ? base : 0.0F;
+            for (const std::size_t index : phaseKeyIndices) {
+                auto& key = keys->at(index);
+                const float absolute =
+                    key.contains("value") && key.at("value").is_number()
+                        ? key.at("value").get<float>()
+                        : previousAbsolute;
+                key["value"] = oneTurnDelta(
+                    absolute - previousAbsolute);
+                previousAbsolute =
+                    std::isfinite(absolute) ? absolute : previousAbsolute;
+            }
+        }
+    };
+    // Current projects write both lists for backwards compatibility.
+    migrateEffectList("timing_effects");
+    migrateEffectList("colourise_effects");
+}
+
 bool SaveProjectDocument(
     const ProjectDocument& document,
     const std::filesystem::path& outputPath,
@@ -8550,8 +8641,14 @@ std::optional<ProjectDocument> LoadProjectDocument(
     if (hasNativeTimingTakeStates) {
         for (const auto& stateJson :
              projectJson->at("timing_take_states")) {
+            auto migratedStateJson = stateJson;
+            if (document.schemaVersion <
+                kRelativePalettePhaseProjectSchemaVersion) {
+                MigrateAbsoluteTimingColourisePalettePhaseKeys(
+                    &migratedStateJson);
+            }
             document.timingTakeStates.push_back(
-                ParseTimingTakeSceneState(stateJson));
+                ParseTimingTakeSceneState(migratedStateJson));
         }
     }
     if (projectJson->contains("timing_colourise_palettes") &&

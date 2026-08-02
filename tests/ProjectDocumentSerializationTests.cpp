@@ -336,9 +336,9 @@ TEST_CASE("Palette stop-property animation and provenance round-trip",
       TimingColouriseEffectParameterKey{
           .parameter = TimingColouriseEffectParameter::PalettePhase,
           .position = 0.25F,
-          .value = 2.75F,
+          .value = 0.75F,
           .interpolation =
-              WaterScenarioInterpolation::SmoothVelocity,
+              WaterScenarioInterpolation::CentripetalCatmullRom,
       },
       TimingColouriseEffectParameterKey{
           .parameter = TimingColouriseEffectParameter::AmountOverride,
@@ -419,7 +419,7 @@ TEST_CASE("Palette stop-property animation and provenance round-trip",
   CHECK(savedEffect.at("effect_parameter_keys")[0].at("parameter") ==
         "palette_phase");
   CHECK(savedEffect.at("effect_parameter_keys")[0].at("interpolation") ==
-        "smooth_velocity");
+        "centripetal_catmull_rom");
   CHECK(savedEffect.at("effect_parameter_keys")[1].at("parameter") ==
         "amount_override");
   REQUIRE(savedEffect.at("palette_stop_parameter_keys").size() == 3U);
@@ -449,9 +449,9 @@ TEST_CASE("Palette stop-property animation and provenance round-trip",
   CHECK(loadedEffect.effectParameterKeys[0].position ==
         Catch::Approx(0.25F));
   CHECK(loadedEffect.effectParameterKeys[0].value ==
-        Catch::Approx(2.75F));
+        Catch::Approx(0.75F));
   CHECK(loadedEffect.effectParameterKeys[0].interpolation ==
-        WaterScenarioInterpolation::SmoothVelocity);
+        WaterScenarioInterpolation::CentripetalCatmullRom);
   CHECK(loadedEffect.effectParameterKeys[1].parameter ==
         TimingColouriseEffectParameter::AmountOverride);
   CHECK(loadedEffect.effectParameterKeys[1].position ==
@@ -478,7 +478,7 @@ TEST_CASE("Palette stop-property animation and provenance round-trip",
 }
 
 TEST_CASE(
-    "Project schema 60 preserves legacy continuous Palette Phase motion",
+    "Project schema 60 migrates absolute Palette Phase motion to relative deltas",
     "[project][serialization][colourise][migration][velocity]") {
   using invisible_places::serialization::LoadProjectDocument;
   using invisible_places::serialization::ProjectDocument;
@@ -495,6 +495,12 @@ TEST_CASE(
           .parameter = TimingColouriseEffectParameter::PalettePhase,
           .position = 0.25F,
           .value = 0.5F,
+          .interpolation = WaterScenarioInterpolation::Smooth,
+      },
+      TimingColouriseEffectParameterKey{
+          .parameter = TimingColouriseEffectParameter::PalettePhase,
+          .position = 0.75F,
+          .value = 0.75F,
           .interpolation = WaterScenarioInterpolation::Smooth,
       },
       TimingColouriseEffectParameterKey{
@@ -520,6 +526,14 @@ TEST_CASE(
     legacy = nlohmann::json::parse(input);
   }
   legacy["schema_version"] = 60U;
+  // Schema 60 stored absolute unwrapped targets. Recreate 0.5 -> 1.25;
+  // current schema stores the second target as a +0.75 relative delta.
+  auto& legacyEffectKeys = legacy.at("timing_take_states")
+                               .front()
+                               .at("timing_effects")
+                               .front()
+                               .at("effect_parameter_keys");
+  legacyEffectKeys[1]["value"] = 1.25F;
   {
     std::ofstream output{file.path};
     REQUIRE(output.is_open());
@@ -534,14 +548,26 @@ TEST_CASE(
   const auto& keys = loaded->timingTakeStates.front()
                          .colouriseEffects.front()
                          .effectParameterKeys;
-  REQUIRE(keys.size() == 2U);
+  REQUIRE(keys.size() == 3U);
   CHECK(keys[0].parameter ==
         TimingColouriseEffectParameter::PalettePhase);
   CHECK(keys[0].interpolation ==
         WaterScenarioInterpolation::SmoothVelocity);
+  CHECK(keys[0].value == Catch::Approx(0.5F));
   CHECK(keys[1].parameter ==
+        TimingColouriseEffectParameter::PalettePhase);
+  CHECK(keys[1].interpolation ==
+        WaterScenarioInterpolation::SmoothVelocity);
+  CHECK(keys[1].value == Catch::Approx(0.75F));
+  CHECK(keys[2].parameter ==
         TimingColouriseEffectParameter::AmountOverride);
-  CHECK(keys[1].interpolation == WaterScenarioInterpolation::Smooth);
+  CHECK(keys[2].interpolation == WaterScenarioInterpolation::Smooth);
+  CHECK(invisible_places::timing::
+            EvaluateTimingColouriseEffectParameter(
+                loaded->timingTakeStates.front()
+                    .colouriseEffects.front(),
+                TimingColouriseEffectParameter::PalettePhase,
+                0.75F) == Catch::Approx(1.25F));
 }
 
 TEST_CASE("Reversed edited preset palette provenance round-trips",

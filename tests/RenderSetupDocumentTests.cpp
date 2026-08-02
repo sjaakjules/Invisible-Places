@@ -452,6 +452,14 @@ TEST_CASE(
     legacyTiming.erase("timing_effect_sequence");
     legacyTiming.at("colourise_effects")[0]
         .erase("activation_range");
+    legacyTiming.at("colourise_effects")[0]
+        .at("effect_parameter_keys")
+        .push_back({
+            {"parameter", "palette_phase"},
+            {"position", 0.9F},
+            {"value", 1.3F},
+            {"interpolation", "smooth"},
+        });
     {
         std::ofstream output{legacyPath};
         REQUIRE(output.is_open());
@@ -480,9 +488,26 @@ TEST_CASE(
                                             PalettePhase;
         });
     REQUIRE(migratedPhase != migratedKeys.end());
+    CHECK(migratedPhase->value == Approx(0.3F));
     CHECK(migratedPhase->interpolation == invisible_places::water::
                                                 WaterScenarioInterpolation::
                                                     SmoothVelocity);
+    const auto migratedPhaseEnd = std::find_if(
+        std::next(migratedPhase),
+        migratedKeys.end(),
+        [](const auto& key) {
+            return key.parameter == invisible_places::timing::
+                                        TimingColouriseEffectParameter::
+                                            PalettePhase;
+        });
+    REQUIRE(migratedPhaseEnd != migratedKeys.end());
+    CHECK(migratedPhaseEnd->value == Approx(1.0F));
+    CHECK(invisible_places::timing::
+              EvaluateTimingColouriseEffectParameter(
+                  loaded->timingState.colouriseEffects.front(),
+                  invisible_places::timing::
+                      TimingColouriseEffectParameter::PalettePhase,
+                  0.9F) == Approx(1.3F));
 
     const auto historyEntry =
         invisible_places::serialization::ReadRenderSetupHistoryEntry(

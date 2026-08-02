@@ -13,7 +13,7 @@
 
 namespace invisible_places::serialization {
 
-inline constexpr std::uint32_t kRenderSetupDocumentSchemaVersion = 4U;
+inline constexpr std::uint32_t kRenderSetupDocumentSchemaVersion = 5U;
 inline constexpr std::uint32_t kMinimumRenderSetupDocumentSchemaVersion = 1U;
 inline constexpr std::uint32_t kRenderSetupHistorySchemaVersion = 1U;
 inline constexpr std::size_t kMaximumRenderSetupHistoryEntries = 100U;

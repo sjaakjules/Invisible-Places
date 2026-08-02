@@ -20,6 +20,10 @@ float Clamp01(float value) {
     return std::clamp(FiniteOr(value, 0.0F), 0.0F, 1.0F);
 }
 
+float ClampPalettePhaseDelta(float value) {
+    return std::clamp(FiniteOr(value, 0.0F), -1.0F, 1.0F);
+}
+
 float InterpolationAmount(
     invisible_places::water::WaterScenarioInterpolation interpolation,
     float amount) {
@@ -31,7 +35,10 @@ float InterpolationAmount(
     if (interpolation ==
             invisible_places::water::WaterScenarioInterpolation::Smooth ||
         interpolation == invisible_places::water::
-                             WaterScenarioInterpolation::SmoothVelocity) {
+                             WaterScenarioInterpolation::SmoothVelocity ||
+        interpolation == invisible_places::water::
+                             WaterScenarioInterpolation::
+                                 CentripetalCatmullRom) {
         return amount * amount * (3.0F - 2.0F * amount);
     }
     return amount;
@@ -43,6 +50,7 @@ bool IsValidInterpolation(
     switch (interpolation) {
         case WaterScenarioInterpolation::Smooth:
         case WaterScenarioInterpolation::SmoothVelocity:
+        case WaterScenarioInterpolation::CentripetalCatmullRom:
             return true;
         case WaterScenarioInterpolation::Linear:
         case WaterScenarioInterpolation::Hold:
@@ -286,7 +294,7 @@ float SanitizeEffectParameterValue(
     float value) {
     switch (parameter) {
         case TimingColouriseEffectParameter::PalettePhase:
-            return FiniteOr(value, 0.0F);
+            return ClampPalettePhaseDelta(value);
         case TimingColouriseEffectParameter::AmountOverride:
             return Clamp01(value);
         case TimingColouriseEffectParameter::EmissiveLevel:
@@ -340,6 +348,171 @@ std::optional<float> EvaluateScalarKeyTrack(
             segmentDuration,
         0.0,
         1.0);
+    if (left->interpolation ==
+        WaterScenarioInterpolation::CentripetalCatmullRom) {
+        struct SplinePoint {
+            double x = 0.0;
+            double y = 0.0;
+        };
+        double valueMinimum = std::numeric_limits<double>::max();
+        double valueMaximum = std::numeric_limits<double>::lowest();
+        for (auto key = trackBegin; key != trackEnd; ++key) {
+            const double value = static_cast<double>(valueAt(*key));
+            valueMinimum = std::min(valueMinimum, value);
+            valueMaximum = std::max(valueMaximum, value);
+        }
+        const double valueSpan = valueMaximum - valueMinimum;
+        if (!std::isfinite(valueSpan) ||
+            valueSpan <= std::numeric_limits<double>::epsilon()) {
+            return valueAt(*left);
+        }
+        const auto pointForKey = [&](const auto& key) {
+            return SplinePoint{
+                .x = static_cast<double>(key.position),
+                .y = (static_cast<double>(valueAt(key)) - valueMinimum) /
+                     valueSpan,
+            };
+        };
+        const auto leftIndex = static_cast<std::size_t>(
+            std::distance(trackBegin, left));
+        const SplinePoint point1 = pointForKey(*left);
+        const SplinePoint point2 = pointForKey(*right);
+        const SplinePoint point0 =
+            leftIndex > 0U
+                ? pointForKey(*(left - 1))
+                : SplinePoint{
+                      .x = 2.0 * point1.x - point2.x,
+                      .y = 2.0 * point1.y - point2.y,
+                  };
+        const SplinePoint point3 =
+            leftIndex + 2U < keyCount
+                ? pointForKey(*(right + 1))
+                : SplinePoint{
+                      .x = 2.0 * point2.x - point1.x,
+                      .y = 2.0 * point2.y - point1.y,
+                  };
+        const auto nextKnot = [](double knot,
+                                 const SplinePoint& firstPoint,
+                                 const SplinePoint& secondPoint) {
+            // The Euclidean chord length is raised to alpha = 0.5.
+            // A small floor keeps coincident control points evaluable.
+            const double increment = std::max(
+                1.0e-7,
+                std::sqrt(std::hypot(
+                    secondPoint.x - firstPoint.x,
+                    secondPoint.y - firstPoint.y)));
+            return knot + increment;
+        };
+        const double knot0 = 0.0;
+        const double knot1 = nextKnot(knot0, point0, point1);
+        const double knot2 = nextKnot(knot1, point1, point2);
+        const double knot3 = nextKnot(knot2, point2, point3);
+        const auto mixPoint = [](const SplinePoint& firstPoint,
+                                 const SplinePoint& secondPoint,
+                                 double firstWeight,
+                                 double secondWeight,
+                                 double denominator) {
+            denominator = std::max(denominator, 1.0e-12);
+            return SplinePoint{
+                .x = (firstWeight * firstPoint.x +
+                      secondWeight * secondPoint.x) /
+                     denominator,
+                .y = (firstWeight * firstPoint.y +
+                      secondWeight * secondPoint.y) /
+                     denominator,
+            };
+        };
+        const auto evaluatePoint = [&](double knot) {
+            const auto a1 = mixPoint(
+                point0,
+                point1,
+                knot1 - knot,
+                knot - knot0,
+                knot1 - knot0);
+            const auto a2 = mixPoint(
+                point1,
+                point2,
+                knot2 - knot,
+                knot - knot1,
+                knot2 - knot1);
+            const auto a3 = mixPoint(
+                point2,
+                point3,
+                knot3 - knot,
+                knot - knot2,
+                knot3 - knot2);
+            const auto b1 = mixPoint(
+                a1,
+                a2,
+                knot2 - knot,
+                knot - knot0,
+                knot2 - knot0);
+            const auto b2 = mixPoint(
+                a2,
+                a3,
+                knot3 - knot,
+                knot - knot1,
+                knot3 - knot1);
+            return mixPoint(
+                b1,
+                b2,
+                knot2 - knot,
+                knot - knot1,
+                knot2 - knot1);
+        };
+
+        // The centripetal spline is a 2D curve in animation-position/value
+        // space. Invert its x coordinate so evaluation remains keyed to the
+        // animation timeline and dy/dx stays continuous at shared nodes.
+        const double targetX = static_cast<double>(normalizedPosition);
+        constexpr int kBracketSamples = 32;
+        double bracketLow = knot1;
+        double bracketHigh = knot2;
+        bool bracketed = false;
+        double previousKnot = knot1;
+        double previousX = evaluatePoint(previousKnot).x;
+        for (int sample = 1; sample <= kBracketSamples; ++sample) {
+            const double candidateKnot = std::lerp(
+                knot1,
+                knot2,
+                static_cast<double>(sample) /
+                    static_cast<double>(kBracketSamples));
+            const double candidateX = evaluatePoint(candidateKnot).x;
+            if ((previousX - targetX) * (candidateX - targetX) <= 0.0) {
+                bracketLow = previousKnot;
+                bracketHigh = candidateKnot;
+                bracketed = true;
+                break;
+            }
+            previousKnot = candidateKnot;
+            previousX = candidateX;
+        }
+        double evaluatedKnot = std::lerp(knot1, knot2, amount);
+        if (bracketed) {
+            double lowX = evaluatePoint(bracketLow).x;
+            for (int iteration = 0; iteration < 36; ++iteration) {
+                const double middle =
+                    std::midpoint(bracketLow, bracketHigh);
+                const double middleX = evaluatePoint(middle).x;
+                if ((lowX - targetX) * (middleX - targetX) <= 0.0) {
+                    bracketHigh = middle;
+                } else {
+                    bracketLow = middle;
+                    lowX = middleX;
+                }
+            }
+            evaluatedKnot = std::midpoint(bracketLow, bracketHigh);
+        }
+        const double evaluated =
+            valueMinimum + evaluatePoint(evaluatedKnot).y * valueSpan;
+        const float result = static_cast<float>(evaluated);
+        return std::isfinite(result)
+                   ? result
+                   : std::lerp(
+                         valueAt(*left),
+                         valueAt(*right),
+                         static_cast<float>(amount));
+    }
     if (left->interpolation !=
         WaterScenarioInterpolation::SmoothVelocity) {
         return std::lerp(
@@ -488,7 +661,8 @@ std::optional<float> EvaluateScalarKeyTrack(
 std::optional<float> EvaluateEffectParameterTrack(
     const std::vector<TimingColouriseEffectParameterKey>& keys,
     TimingColouriseEffectParameter parameter,
-    float normalizedPosition) {
+    float normalizedPosition,
+    float palettePhaseBaseValue) {
     // Sanitization groups each parameter's keys and orders them by time.
     const auto trackBegin = std::find_if(
         keys.begin(),
@@ -498,6 +672,23 @@ std::optional<float> EvaluateEffectParameterTrack(
         trackBegin,
         keys.end(),
         [&](const auto& key) { return key.parameter != parameter; });
+    if (parameter == TimingColouriseEffectParameter::PalettePhase) {
+        std::vector<TimingColouriseEffectParameterKey> accumulated;
+        accumulated.reserve(static_cast<std::size_t>(
+            std::distance(trackBegin, trackEnd)));
+        float phase = FiniteOr(palettePhaseBaseValue, 0.0F);
+        for (auto key = trackBegin; key != trackEnd; ++key) {
+            phase += ClampPalettePhaseDelta(key->value);
+            auto absoluteKey = *key;
+            absoluteKey.value = phase;
+            accumulated.push_back(std::move(absoluteKey));
+        }
+        return EvaluateScalarKeyTrack(
+            accumulated.begin(),
+            accumulated.end(),
+            normalizedPosition,
+            [](const auto& key) { return key.value; });
+    }
     return EvaluateScalarKeyTrack(
         trackBegin,
         trackEnd,
@@ -2398,8 +2589,42 @@ float EvaluateTimingColouriseEffectParameter(
     return EvaluateEffectParameterTrack(
                sanitized.effectParameterKeys,
                parameter,
-               normalizedPosition)
+               normalizedPosition,
+               sanitized.palettePhaseOffset)
         .value_or(EffectParameterBaseValue(sanitized, parameter));
+}
+
+float TimingColourisePalettePhaseDeltaFromPrevious(
+    const TimingColouriseEffect& effect,
+    float normalizedPosition) {
+    const auto sanitized = SanitizeTimingColouriseEffect(effect);
+    if (!sanitized.colouriseEnabled) {
+        return 0.0F;
+    }
+    normalizedPosition = Clamp01(normalizedPosition);
+    float previousPhase = sanitized.palettePhaseOffset;
+    for (const auto& key : sanitized.effectParameterKeys) {
+        if (key.parameter !=
+            TimingColouriseEffectParameter::PalettePhase) {
+            continue;
+        }
+        if (std::abs(key.position - normalizedPosition) <=
+            kTimingColouriseKeyTolerance) {
+            return ClampPalettePhaseDelta(key.value);
+        }
+        if (key.position < normalizedPosition) {
+            previousPhase += ClampPalettePhaseDelta(key.value);
+            continue;
+        }
+        break;
+    }
+    const float evaluated = EvaluateEffectParameterTrack(
+                                sanitized.effectParameterKeys,
+                                TimingColouriseEffectParameter::PalettePhase,
+                                normalizedPosition,
+                                sanitized.palettePhaseOffset)
+                                .value_or(sanitized.palettePhaseOffset);
+    return ClampPalettePhaseDelta(evaluated - previousPhase);
 }
 
 float EvaluateTimingEmissiveLevel(
@@ -2458,7 +2683,8 @@ TimingColouriseLut EvaluateTimingColourisePaletteLut(
             return EvaluateEffectParameterTrack(
                        sanitized.effectParameterKeys,
                        parameter,
-                       normalizedPosition)
+                       normalizedPosition,
+                       sanitized.palettePhaseOffset)
                 .value_or(
                     EffectParameterBaseValue(
                         sanitized,
@@ -2896,6 +3122,31 @@ bool AddOrUpdateTimingColouriseEffectParameterKey(
                        kTimingColouriseKeyTolerance;
         });
     if (existing == effect->effectParameterKeys.end()) {
+        // A phase key stores a delta from its predecessor. When inserting
+        // between two existing phase keys, split the following delta so the
+        // next accumulated target (and everything after it) stays put. If an
+        // extreme authored edit would require more than one turn on the next
+        // key, keep the requested delta and let the later path shift instead.
+        if (parameter == TimingColouriseEffectParameter::PalettePhase) {
+            auto next = effect->effectParameterKeys.end();
+            for (auto candidate = effect->effectParameterKeys.begin();
+                 candidate != effect->effectParameterKeys.end();
+                 ++candidate) {
+                if (candidate->parameter == parameter &&
+                    candidate->position >
+                        key.position + kTimingColouriseKeyTolerance &&
+                    (next == effect->effectParameterKeys.end() ||
+                     candidate->position < next->position)) {
+                    next = candidate;
+                }
+            }
+            if (next != effect->effectParameterKeys.end()) {
+                const float splitDelta = next->value - key.value;
+                if (splitDelta >= -1.0F && splitDelta <= 1.0F) {
+                    next->value = ClampPalettePhaseDelta(splitDelta);
+                }
+            }
+        }
         effect->effectParameterKeys.push_back(key);
     } else {
         *existing = key;
@@ -3579,6 +3830,37 @@ std::size_t RemoveTimingColouriseEffectParameterKeysAtPosition(
         !std::isfinite(position)) {
         return 0U;
     }
+    const auto removed = std::find_if(
+        effect->effectParameterKeys.begin(),
+        effect->effectParameterKeys.end(),
+        [&](const TimingColouriseEffectParameterKey& key) {
+            return key.parameter == parameter &&
+                   std::abs(key.position - position) <=
+                       kTimingColouriseKeyTolerance;
+        });
+    if (removed == effect->effectParameterKeys.end()) {
+        return 0U;
+    }
+    if (parameter == TimingColouriseEffectParameter::PalettePhase) {
+        auto next = effect->effectParameterKeys.end();
+        for (auto candidate = effect->effectParameterKeys.begin();
+             candidate != effect->effectParameterKeys.end();
+             ++candidate) {
+            if (candidate->parameter == parameter &&
+                candidate->position >
+                    removed->position + kTimingColouriseKeyTolerance &&
+                (next == effect->effectParameterKeys.end() ||
+                 candidate->position < next->position)) {
+                next = candidate;
+            }
+        }
+        if (next != effect->effectParameterKeys.end()) {
+            const float joinedDelta = next->value + removed->value;
+            if (joinedDelta >= -1.0F && joinedDelta <= 1.0F) {
+                next->value = ClampPalettePhaseDelta(joinedDelta);
+            }
+        }
+    }
     const auto previousSize = effect->effectParameterKeys.size();
     std::erase_if(
         effect->effectParameterKeys,
@@ -3599,17 +3881,27 @@ std::size_t RemoveTimingColouriseEffectParameterKeysAtPosition(
     if (!std::isfinite(position)) {
         return 0U;
     }
+    const auto phaseRemoved =
+        effect->colouriseEnabled
+            ? RemoveTimingColouriseEffectParameterKeysAtPosition(
+                  effect,
+                  TimingColouriseEffectParameter::PalettePhase,
+                  position)
+            : 0U;
     const auto previousSize = effect->effectParameterKeys.size();
     std::erase_if(
         effect->effectParameterKeys,
         [&](const TimingColouriseEffectParameterKey& key) {
-            return TimingEffectParameterIsSupported(
+            return key.parameter !=
+                       TimingColouriseEffectParameter::PalettePhase &&
+                   TimingEffectParameterIsSupported(
                        *effect,
                        key.parameter) &&
                    std::abs(key.position - position) <=
                        kTimingColouriseKeyTolerance;
         });
-    return previousSize - effect->effectParameterKeys.size();
+    return phaseRemoved + previousSize -
+                              effect->effectParameterKeys.size();
 }
 
 std::size_t RemoveTimingColouriseEffectKeysAtPosition(

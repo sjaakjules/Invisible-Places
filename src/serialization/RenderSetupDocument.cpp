@@ -23,9 +23,13 @@ using invisible_places::renderer::pointcloud::PointCloudRendererMode;
 
 constexpr std::string_view kRenderSetupSuffix = ".iprender.json";
 constexpr std::uint32_t kSmoothVelocityRenderSetupSchemaVersion = 4U;
+constexpr std::uint32_t kRelativePalettePhaseRenderSetupSchemaVersion = 5U;
 static_assert(
     kRenderSetupDocumentSchemaVersion >=
     kSmoothVelocityRenderSetupSchemaVersion);
+static_assert(
+    kRenderSetupDocumentSchemaVersion >=
+    kRelativePalettePhaseRenderSetupSchemaVersion);
 
 void MigrateLegacySmoothPalettePhaseKeys(
     invisible_places::timing::TimingTakeSceneState* state) {
@@ -646,8 +650,14 @@ std::optional<RenderSetupDocument> LoadRenderSetupDocument(
             SetError(errorMessage, nestedError);
             return std::nullopt;
         }
+        auto timingStateJson =
+            snapshot.at("timing_take_scene_state");
+        if (schema < kRelativePalettePhaseRenderSetupSchemaVersion) {
+            MigrateAbsoluteTimingColourisePalettePhaseKeys(
+                &timingStateJson);
+        }
         auto timingState = TimingTakeSceneStateFromJson(
-            snapshot.at("timing_take_scene_state"),
+            timingStateJson,
             &nestedError);
         if (!timingState.has_value()) {
             SetError(errorMessage, nestedError);
