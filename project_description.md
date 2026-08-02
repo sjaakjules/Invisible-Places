@@ -142,6 +142,17 @@ The application should feel familiar to a CloudCompare user while also supportin
 - explicit look-at / target camera
 - orbit around inferred surface target
 
+The Camera panel exposes two orbit-control styles:
+- **Current (World Up):** yaw/pitch navigation that keeps world Z vertical.
+- **CloudCompare (Trackball):** an unconstrained virtual trackball that infers
+  a surface pivot from the screen centre at the start of an orbit. Tangential
+  drags near the trackball rim roll the camera, making it easy to redefine up.
+  While orbiting, a large RGB wireframe pivot sphere and axes show the active
+  rotation frame.
+
+The selected orbit-control style is stored with the project and does not form
+part of saved camera shots.
+
 ### Surface-inferred targeting
 The user should be able to orbit around what they are looking at.
 
@@ -168,6 +179,28 @@ Shot data includes:
 - optional per-shot style/render overrides.
 
 Default frame rate: **30 fps**.
+
+### Timing scalar effects
+The Timings tab owns one ordered list of scalar-driven effects. The user can
+add either a **Colourise** effect or an **Emissive** effect, reorder them by
+dragging, enable or disable each effect, and trim its inclusive active range on
+the animation overview.
+
+- Colourise effects retain their palette, phase, colourise-amount, scalar
+  field, bounds, fade, and smooth key tracks.
+- Emissive effects have no palette UI. They apply a non-negative, smoothly
+  keyable emissive level through a scalar-field bounds/fade mask; bounds and
+  fade use the same keyable histogram controls as Colourise effects.
+- Keys remain authorable outside an effect's active range. Rendering samples
+  the same global curves at the range boundaries, so enabling an effect does
+  not create a discontinuity or a separately editable shadow key.
+- Colourise and Emissive effects share the same overlap budget. Five or fewer
+  simultaneous effects is the responsiveness recommendation; the UI marks
+  ranges that exceed it, while the renderer safely supports up to eight
+  concurrent effects and gives higher list entries priority if more overlap.
+- Both effect kinds, their activation ranges, and their keys are stored with
+  the project and in render-setup snapshots. Emissive effects require a scalar
+  field and cannot select synthetic normal components.
 
 ## Side Panel UI
 The main artist-facing control surface is a side panel.

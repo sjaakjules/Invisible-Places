@@ -457,6 +457,24 @@ Possible implementation options:
 
 Keep v1 simple and predictable.
 
+### 9.5 Timed scalar-effect stack
+- Store Colourise and Emissive as two immutable kinds in one ordered timing
+  effect list, with shared enable and inclusive activation-range state.
+- Reuse scalar selector, bounds, signed edge fade, smooth key evaluation, and
+  derived activation-boundary sampling for both kinds. Emissive is scalar-only
+  and owns a non-negative level track; Colourise owns palette/phase/amount
+  tracks.
+- Pack both kinds into the fixed eight-entry point-style payload. The effect
+  type and emissive level occupy existing unused per-entry components, so the
+  uniform ABI does not grow. Beauty adds masked emission before exposure;
+  Fast Basic uses a bounded colour multiplier as its preview approximation.
+- Preserve the output-identical Colourise/off path, mirror the evaluation in
+  CPU offline rendering, and count both kinds against the same five-effect
+  responsiveness recommendation.
+- Project schema 59 stores the canonical heterogeneous `timing_effects` list
+  and sequence while retaining a Colourise-only legacy projection. Render
+  setup schema 3 snapshots the same canonical state.
+
 ## 10. Procedural Motion System
 ### 10.1 Motion objective
 Allow subtle per-point movement driven by scalar fields without mutating source data.

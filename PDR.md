@@ -211,6 +211,25 @@ The renderer should support multiple visual modes including solid dots, discs, X
 #### FR-STYLE-6
 Styles shall be saveable and reusable as presets.
 
+#### FR-STYLE-7
+The Timings tab shall support one ordered list containing both Colourise and
+Emissive scalar effects. Each effect shall have an enable toggle and an
+inclusive animation activation range.
+
+#### FR-STYLE-8
+An Emissive timing effect shall expose a non-negative, smoothly keyable level
+and smoothly keyable scalar-field bounds/fade controls, without exposing a
+palette. It shall add emission without changing point opacity.
+
+#### FR-STYLE-9
+Keys outside a timing effect's activation range shall remain editable and
+shall determine the smoothly evaluated value at each activation boundary.
+
+#### FR-STYLE-10
+Colourise and Emissive effects shall share a recommended maximum of five
+simultaneous effects. The UI shall identify ranges above that recommendation,
+and preview and export shall evaluate both kinds on GPU where feasible.
+
 ### 5.8 Procedural Motion
 #### FR-MOTION-1
 Dynamic point motion shall be procedural and non-destructive.
