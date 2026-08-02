@@ -1839,6 +1839,18 @@ void PrepareWaterSeepagePulseFields(
     std::string_view targetSceneRole);
 [[nodiscard]] bool WaterSeepageGridHasActiveViewportEffect(
     const WaterSeepageSpatialGrid& grid);
+// True when the look's GPU pattern output depends on the shader clock, i.e.
+// re-rendering at a later time can produce different pixels. Static looks
+// (all motion parameters zero) render identically at any time, so a cached
+// scene image stays correct until a parameter edit re-uploads the grid.
+[[nodiscard]] bool WaterSeepageLookIsTimeAnimating(
+    const WaterSeepageLookSettings& look);
+// WaterSeepageGridHasActiveViewportEffect restricted to nodes whose
+// contributing look is also time-animating: only those need a per-frame
+// scene redraw, everything else is covered by the params-fingerprint
+// invalidation path.
+[[nodiscard]] bool WaterSeepageGridHasTimeAnimatingViewportEffect(
+    const WaterSeepageSpatialGrid& grid);
 [[nodiscard]] std::string WaterSeepageTopologyFingerprint(const WaterSeepageSpatialGrid& grid);
 [[nodiscard]] std::string WaterSeepageParamsFingerprint(const WaterSeepageSpatialGrid& grid);
 

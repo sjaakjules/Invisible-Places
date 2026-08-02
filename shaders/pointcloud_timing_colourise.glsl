@@ -84,9 +84,9 @@ vec4 ResolveTimingColouriseEffect(uint effectIndex, uint pointIndex) {
 
     const float safeEdgeMask = clamp(edgeMask, 0.0, 1.0);
     if (source.w == kTimingColouriseEmissiveOutput) {
-        // The existing flat vec4 varying carries both effect kinds without
-        // increasing the point pipeline's interstage interface. Negative
-        // alpha is an emissive sentinel; x stores the non-negative add.
+        // A single resolved vec4 carries both effect kinds. Negative alpha
+        // is an emissive sentinel consumed by
+        // ResolveTimingColouriseTransform; x stores the non-negative add.
         return vec4(
             max(0.0, range.w) * safeEdgeMask,
             0.0,
@@ -116,15 +116,34 @@ vec4 ResolveTimingColouriseEffect(uint effectIndex, uint pointIndex) {
         clamp(lut.a, 0.0, 1.0) * safeEdgeMask);
 }
 
-void ResolveTimingColouriseStack(
+void ResolveTimingColouriseTransform(
     uint pointIndex,
-    out vec4 resolvedEffects[8]) {
+    out vec4 transform,
+    out float emissionAdd) {
+    // Compose the per-effect mix chain into one affine transform so the
+    // interstage payload is a single vec4 + float instead of eight vec4s:
+    // finalColour = baseColour * transform.a + transform.rgb.
+    vec3 blended = vec3(0.0);
+    float retained = 1.0;
+    float emission = 0.0;
+    const uint effectCount = min(
+        styleData.timingColouriseControl.x,
+        kTimingColouriseMaxEffects);
     for (uint effectIndex = 0u;
-         effectIndex < kTimingColouriseMaxEffects;
+         effectIndex < effectCount;
          ++effectIndex) {
-        resolvedEffects[effectIndex] =
+        const vec4 effect =
             ResolveTimingColouriseEffect(effectIndex, pointIndex);
+        if (effect.a < 0.0) {
+            emission += max(0.0, effect.x);
+            continue;
+        }
+        const float alpha = clamp(effect.a, 0.0, 1.0);
+        blended = mix(blended, clamp(effect.rgb, 0.0, 1.0), alpha);
+        retained *= 1.0 - alpha;
     }
+    transform = vec4(blended, retained);
+    emissionAdd = emission;
 }
 
 #endif
@@ -132,39 +151,12 @@ void ResolveTimingColouriseStack(
 #ifdef POINTCLOUD_TIMING_COLOURISE_FRAGMENT
 
 vec3 ApplyTimingColouriseStack(vec3 baseColor) {
-    vec3 colour = baseColor;
-    const uint effectCount = min(
-        styleData.timingColouriseControl.x,
-        kTimingColouriseMaxEffects);
-    for (uint effectIndex = 0u;
-         effectIndex < effectCount;
-         ++effectIndex) {
-        const vec4 effect = inTimingColourise[effectIndex];
-        if (effect.a < 0.0) {
-            continue;
-        }
-        colour = mix(
-            colour,
-            clamp(effect.rgb, 0.0, 1.0),
-            clamp(effect.a, 0.0, 1.0));
-    }
-    return colour;
+    return baseColor * inTimingColouriseTransform.a +
+        inTimingColouriseTransform.rgb;
 }
 
 float ResolveTimingColouriseEmissionAdd() {
-    float emissionAdd = 0.0;
-    const uint effectCount = min(
-        styleData.timingColouriseControl.x,
-        kTimingColouriseMaxEffects);
-    for (uint effectIndex = 0u;
-         effectIndex < effectCount;
-         ++effectIndex) {
-        const vec4 effect = inTimingColourise[effectIndex];
-        if (effect.a < 0.0) {
-            emissionAdd += max(0.0, effect.x);
-        }
-    }
-    return max(0.0, emissionAdd);
+    return max(0.0, inTimingColouriseEmissionAdd);
 }
 
 #endif

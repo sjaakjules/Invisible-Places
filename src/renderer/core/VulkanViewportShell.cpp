@@ -1732,6 +1732,9 @@ VulkanViewportShell::~VulkanViewportShell() {
     if (pointAccumulationPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, pointAccumulationPipeline_, nullptr);
     }
+    if (pointAccumulationDepthTestedPipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, pointAccumulationDepthTestedPipeline_, nullptr);
+    }
     if (pointConstantSimpleAccumulationPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, pointConstantSimpleAccumulationPipeline_, nullptr);
     }
@@ -1764,6 +1767,9 @@ VulkanViewportShell::~VulkanViewportShell() {
     }
     if (surfelAccumulationPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, surfelAccumulationPipeline_, nullptr);
+    }
+    if (surfelAccumulationDepthTestedPipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, surfelAccumulationDepthTestedPipeline_, nullptr);
     }
     if (surfelConstantSimpleAccumulationPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, surfelConstantSimpleAccumulationPipeline_, nullptr);
@@ -2568,6 +2574,15 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
         UpdateRainRuntimeTiming(state);
     }
     renderState_ = state;
+    // A keyed Rain track keeps rainSettings.enabled true even at level zero so
+    // the rain clock and tails stay continuous. Every visible rain artefact
+    // (rings, wetness, droplets) ages out within kRainMaximumImpactLifetimeSeconds
+    // and airborne drops re-anchor the tail when they land, so once the level
+    // is zero and the tail has drained there is provably nothing rain-related
+    // to shade and the layers can keep their cheaper material variants.
+    const bool rainCanShadeThisFrame =
+        renderState_.rainSettings.rainLevel > 1.0e-5F ||
+        RainImpactEffectsRequireRedraw(renderState_.flowTimeSeconds);
     for (auto& layer : renderState_.pointCloudLayers) {
         // Every layer takes the impact-capable material variant while the
         // effects are on: the models shade all clouds' points inside their
@@ -2575,7 +2590,8 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
         layer.style.rainImpactEffects =
             liveRainSimulationEnabled_ &&
             renderState_.rainSettings.enabled &&
-            renderState_.rainSettings.impactEffectsEnabled;
+            renderState_.rainSettings.impactEffectsEnabled &&
+            rainCanShadeThisFrame;
     }
     ++sceneRevision_;
 
@@ -5288,6 +5304,8 @@ void VulkanViewportShell::UploadWaterSeepageTopology(
     resources->seepageUsesConnectedSupport = payload.usesConnectedSupport;
     resources->seepageCellSizeMeters = std::max(0.001F, payload.cellSizeMeters);
     resources->seepageUnionBounds = payload.unionBounds;
+    resources->seepageCanContribute =
+        invisible_places::water::WaterSeepageGridHasActiveViewportEffect(grid);
     ++resources->seepageTopologyUploadRevision;
     ++resources->seepageParamsUploadRevision;
     ++sceneRevision_;
@@ -5332,6 +5350,8 @@ void VulkanViewportShell::UpdateWaterSeepageParams(
         resources->pendingSeepageParams.data(),
         params.data(),
         static_cast<std::size_t>(expectedSize));
+    resources->seepageCanContribute =
+        invisible_places::water::WaterSeepageGridHasActiveViewportEffect(grid);
     ++resources->seepageParamsGeneration;
     ++resources->seepageParamsUploadRevision;
     ++sceneRevision_;
@@ -8585,6 +8605,12 @@ void VulkanViewportShell::UpdateWaterSurfacePreprocessDescriptorSet(
 void VulkanViewportShell::CreatePointPipelines() {
     const auto vertexShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_preview.vert.spv").string());
+    // The depth prepass reuses the preview vertex source compiled with
+    // DEPTH_PREPASS, which strips colour-only work (timing colourise stack,
+    // water colour chains, colormap, AOV outputs) while producing
+    // bit-identical position, point size, opacity, and depth outputs.
+    const auto prepassVertexShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_preview_depth_prepass.vert.spv").string());
     const auto depthFragmentShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_export_depth.frag.spv").string());
     const auto accumulationFragmentShaderCode =
@@ -8601,6 +8627,8 @@ void VulkanViewportShell::CreatePointPipelines() {
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_fast_basic.frag.spv").string());
     const auto surfelVertexShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel.vert.spv").string());
+    const auto surfelPrepassVertexShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_depth_prepass.vert.spv").string());
     const auto surfelDepthFragmentShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_export_depth.frag.spv").string());
     const auto surfelAccumulationFragmentShaderCode =
@@ -8613,6 +8641,8 @@ void VulkanViewportShell::CreatePointPipelines() {
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_opaque_hard_disc.frag.spv").string());
 
     const auto vertexModule = CreateShaderModule(device_, vertexShaderCode, "vkCreateShaderModule(point vertex)");
+    const auto prepassVertexModule =
+        CreateShaderModule(device_, prepassVertexShaderCode, "vkCreateShaderModule(point prepass vertex)");
     const auto depthFragmentModule =
         CreateShaderModule(device_, depthFragmentShaderCode, "vkCreateShaderModule(point depth fragment)");
     const auto accumulationFragmentModule =
@@ -8629,6 +8659,8 @@ void VulkanViewportShell::CreatePointPipelines() {
         CreateShaderModule(device_, fastBasicFragmentShaderCode, "vkCreateShaderModule(point fast basic fragment)");
     const auto surfelVertexModule =
         CreateShaderModule(device_, surfelVertexShaderCode, "vkCreateShaderModule(surfel vertex)");
+    const auto surfelPrepassVertexModule =
+        CreateShaderModule(device_, surfelPrepassVertexShaderCode, "vkCreateShaderModule(surfel prepass vertex)");
     const auto surfelDepthFragmentModule =
         CreateShaderModule(device_, surfelDepthFragmentShaderCode, "vkCreateShaderModule(surfel depth fragment)");
     const auto surfelAccumulationFragmentModule =
@@ -8651,10 +8683,20 @@ void VulkanViewportShell::CreatePointPipelines() {
     vertexStage.module = vertexModule;
     vertexStage.pName = "main";
 
+    VkPipelineShaderStageCreateInfo prepassVertexStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    prepassVertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    prepassVertexStage.module = prepassVertexModule;
+    prepassVertexStage.pName = "main";
+
     VkPipelineShaderStageCreateInfo surfelVertexStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
     surfelVertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
     surfelVertexStage.module = surfelVertexModule;
     surfelVertexStage.pName = "main";
+
+    VkPipelineShaderStageCreateInfo surfelPrepassVertexStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    surfelPrepassVertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    surfelPrepassVertexStage.module = surfelPrepassVertexModule;
+    surfelPrepassVertexStage.pName = "main";
 
     VkPipelineShaderStageCreateInfo constantSimpleVertexStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
     constantSimpleVertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -8786,7 +8828,7 @@ void VulkanViewportShell::CreatePointPipelines() {
     opaqueColorBlend.blendEnable = VK_FALSE;
 
     createPointPipeline(
-        vertexStage,
+        prepassVertexStage,
         vertexInputInfo,
         inputAssembly,
         depthFragmentModule,
@@ -8813,6 +8855,26 @@ void VulkanViewportShell::CreatePointPipelines() {
         VK_COMPARE_OP_ALWAYS,
         "vkCreateGraphicsPipelines(point accumulation)",
         &pointAccumulationPipeline_);
+
+    // Preview performance mode: opaque-styled layers forced onto the unified
+    // shader accumulate against the read-only prepass depth so occluded
+    // fragments never shade. LESS_OR_EQUAL admits the surface the prepass
+    // itself wrote (positions are bit-identical between the two pipelines).
+    createPointPipeline(
+        vertexStage,
+        vertexInputInfo,
+        inputAssembly,
+        accumulationFragmentModule,
+        1,
+        std::vector<VkPipelineColorBlendAttachmentState>{
+            MakeAdditiveBlendAttachment(),
+            MakeRevealageBlendAttachment(),
+            MakeAdditiveBlendAttachment()},
+        true,
+        false,
+        VK_COMPARE_OP_LESS_OR_EQUAL,
+        "vkCreateGraphicsPipelines(point accumulation depth tested)",
+        &pointAccumulationDepthTestedPipeline_);
 
     createPointPipeline(
         constantSimpleVertexStage,
@@ -8857,7 +8919,7 @@ void VulkanViewportShell::CreatePointPipelines() {
         &pointFastBasicPipeline_);
 
     createPointPipeline(
-        surfelVertexStage,
+        surfelPrepassVertexStage,
         surfelVertexInputInfo,
         surfelInputAssembly,
         surfelDepthFragmentModule,
@@ -8884,6 +8946,22 @@ void VulkanViewportShell::CreatePointPipelines() {
         VK_COMPARE_OP_ALWAYS,
         "vkCreateGraphicsPipelines(surfel accumulation)",
         &surfelAccumulationPipeline_);
+
+    createPointPipeline(
+        surfelVertexStage,
+        surfelVertexInputInfo,
+        surfelInputAssembly,
+        surfelAccumulationFragmentModule,
+        1,
+        std::vector<VkPipelineColorBlendAttachmentState>{
+            MakeAdditiveBlendAttachment(),
+            MakeRevealageBlendAttachment(),
+            MakeAdditiveBlendAttachment()},
+        true,
+        false,
+        VK_COMPARE_OP_LESS_OR_EQUAL,
+        "vkCreateGraphicsPipelines(surfel accumulation depth tested)",
+        &surfelAccumulationDepthTestedPipeline_);
 
     createPointPipeline(
         surfelConstantSimpleVertexStage,
@@ -8919,6 +8997,7 @@ void VulkanViewportShell::CreatePointPipelines() {
     vkDestroyShaderModule(device_, surfelConstantSimpleVertexModule, nullptr);
     vkDestroyShaderModule(device_, surfelAccumulationFragmentModule, nullptr);
     vkDestroyShaderModule(device_, surfelDepthFragmentModule, nullptr);
+    vkDestroyShaderModule(device_, surfelPrepassVertexModule, nullptr);
     vkDestroyShaderModule(device_, surfelVertexModule, nullptr);
     vkDestroyShaderModule(device_, constantSimpleFragmentModule, nullptr);
     vkDestroyShaderModule(device_, fastBasicFragmentModule, nullptr);
@@ -8927,6 +9006,7 @@ void VulkanViewportShell::CreatePointPipelines() {
     vkDestroyShaderModule(device_, constantSimpleVertexModule, nullptr);
     vkDestroyShaderModule(device_, accumulationFragmentModule, nullptr);
     vkDestroyShaderModule(device_, depthFragmentModule, nullptr);
+    vkDestroyShaderModule(device_, prepassVertexModule, nullptr);
     vkDestroyShaderModule(device_, vertexModule, nullptr);
 }
 
@@ -9635,6 +9715,11 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
 
     const auto vertexShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_preview.vert.spv").string());
+    // Depth passes reuse the DEPTH_PREPASS-specialised vertex variants; they
+    // produce bit-identical position/size/opacity/depth without the
+    // colour-only work, so the exported depth AOV is unchanged.
+    const auto prepassVertexShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_preview_depth_prepass.vert.spv").string());
     const auto accumulationFragmentShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_exr_accumulation.frag.spv").string());
     const auto constantSimpleVertexShaderCode =
@@ -9651,6 +9736,8 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_export_depth.frag.spv").string());
     const auto surfelVertexShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel.vert.spv").string());
+    const auto surfelPrepassVertexShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_depth_prepass.vert.spv").string());
     const auto surfelAccumulationFragmentShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_exr_accumulation.frag.spv").string());
     const auto surfelConstantSimpleVertexShaderCode =
@@ -9665,6 +9752,8 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "rain_particle.frag.spv").string());
 
     const auto vertexModule = CreateShaderModule(device_, vertexShaderCode, "vkCreateShaderModule(exr point vertex)");
+    const auto prepassVertexModule =
+        CreateShaderModule(device_, prepassVertexShaderCode, "vkCreateShaderModule(exr point prepass vertex)");
     const auto accumulationFragmentModule =
         CreateShaderModule(device_, accumulationFragmentShaderCode, "vkCreateShaderModule(exr point accumulation fragment)");
     const auto constantSimpleVertexModule =
@@ -9687,6 +9776,8 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
         CreateShaderModule(device_, depthFragmentShaderCode, "vkCreateShaderModule(exr point depth fragment)");
     const auto surfelVertexModule =
         CreateShaderModule(device_, surfelVertexShaderCode, "vkCreateShaderModule(exr surfel vertex)");
+    const auto surfelPrepassVertexModule =
+        CreateShaderModule(device_, surfelPrepassVertexShaderCode, "vkCreateShaderModule(exr surfel prepass vertex)");
     const auto surfelAccumulationFragmentModule =
         CreateShaderModule(device_, surfelAccumulationFragmentShaderCode, "vkCreateShaderModule(exr surfel accumulation fragment)");
     const auto surfelConstantSimpleVertexModule =
@@ -9708,10 +9799,20 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
     vertexStage.module = vertexModule;
     vertexStage.pName = "main";
 
+    VkPipelineShaderStageCreateInfo prepassVertexStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    prepassVertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    prepassVertexStage.module = prepassVertexModule;
+    prepassVertexStage.pName = "main";
+
     VkPipelineShaderStageCreateInfo surfelVertexStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
     surfelVertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
     surfelVertexStage.module = surfelVertexModule;
     surfelVertexStage.pName = "main";
+
+    VkPipelineShaderStageCreateInfo surfelPrepassVertexStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    surfelPrepassVertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    surfelPrepassVertexStage.module = surfelPrepassVertexModule;
+    surfelPrepassVertexStage.pName = "main";
 
     VkPipelineShaderStageCreateInfo constantSimpleVertexStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
     constantSimpleVertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -9835,7 +9936,7 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
     opaqueColorBlend.blendEnable = VK_FALSE;
 
     createPointPipeline(
-        vertexStage,
+        prepassVertexStage,
         vertexInputInfo,
         inputAssembly,
         depthFragmentModule,
@@ -9912,7 +10013,7 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
         &resources->pointFastBasicPipeline);
 
     createPointPipeline(
-        surfelVertexStage,
+        surfelPrepassVertexStage,
         surfelVertexInputInfo,
         surfelInputAssembly,
         surfelDepthFragmentModule,
@@ -10019,6 +10120,7 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
     vkDestroyShaderModule(device_, surfelConstantSimpleVertexModule, nullptr);
     vkDestroyShaderModule(device_, surfelDepthFragmentModule, nullptr);
     vkDestroyShaderModule(device_, surfelAccumulationFragmentModule, nullptr);
+    vkDestroyShaderModule(device_, surfelPrepassVertexModule, nullptr);
     vkDestroyShaderModule(device_, surfelVertexModule, nullptr);
     vkDestroyShaderModule(device_, fastBasicDepthFragmentModule, nullptr);
     vkDestroyShaderModule(device_, fastBasicFragmentModule, nullptr);
@@ -10027,6 +10129,7 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
     vkDestroyShaderModule(device_, constantSimpleFragmentModule, nullptr);
     vkDestroyShaderModule(device_, constantSimpleVertexModule, nullptr);
     vkDestroyShaderModule(device_, accumulationFragmentModule, nullptr);
+    vkDestroyShaderModule(device_, prepassVertexModule, nullptr);
     vkDestroyShaderModule(device_, vertexModule, nullptr);
 
     const auto compositeVertexShaderCode =
@@ -11845,11 +11948,6 @@ void VulkanViewportShell::DispatchDynamicMeshFlowCompute(
             : VK_NULL_HANDLE;
     if (timestampQueryPool != VK_NULL_HANDLE) {
         vkCmdResetQueryPool(commandBuffer, timestampQueryPool, 0U, 2U);
-        vkCmdWriteTimestamp(
-            commandBuffer,
-            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-            timestampQueryPool,
-            0U);
     }
 
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, dynamicMeshFlowComputePipeline_);
@@ -11902,6 +12000,19 @@ void VulkanViewportShell::DispatchDynamicMeshFlowCompute(
         priorFrameBarriers.data(),
         0U,
         nullptr);
+    // Written after the prior-frame drain barrier, at the compute stage so
+    // the write is ordered after the barrier's compute-stage dependency
+    // resolves (a top-of-pipe write here could still latch before the drain
+    // completes). This keeps the timing band on the dispatch itself instead
+    // of absorbing the queue-drain wait, which previously made this timer
+    // read large while compute cost was small.
+    if (timestampQueryPool != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp(
+            commandBuffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            timestampQueryPool,
+            0U);
+    }
     vkCmdDispatch(commandBuffer, (particleCount + 63U) / 64U, 1U, 1U);
 
     std::array<VkBufferMemoryBarrier, 6> barriers{};
@@ -14180,17 +14291,21 @@ VulkanViewportShell::ResolvePointCloudLayerMaterialVariant(
     const SceneRenderState::PointCloudLayerState& layer) const {
     const auto* resources = FindPointCloudResources(layer.layerId);
     // ConstantSimple and OpaqueHardDisc deliberately omit the procedural
-    // water evaluator. Once Seepage topology is attached, keep this layer on
-    // the unified material even while a frame-ring parameter update is
-    // settling; the style readiness gate safely disables Seepage for that
-    // individual frame, whereas selecting either optimized shader would
-    // silently discard the effect for every frame and export.
+    // water evaluator, so the layer needs the unified material whenever the
+    // attached Seepage topology's current params can put the effect on
+    // screen. When every node contributes nothing (seepageCanContribute
+    // false) the unified shader would render identically to the optimized
+    // shaders, so those stay selectable. Mid-flight parameter updates need
+    // no extra guard: until a frame slot's params generation settles, the
+    // style readiness gate disables Seepage for that individual frame on
+    // the unified path too, so both variants draw the same image.
     const bool hasAttachedSeepage =
         resources != nullptr &&
         resources->seepageNodeCount > 0U &&
         resources->seepageHashCellCapacity > 0U &&
         resources->seepageNodeReferenceCount > 0U &&
-        resources->seepageUnionBounds.valid;
+        resources->seepageUnionBounds.valid &&
+        resources->seepageCanContribute;
     const bool hasTimingColourise =
         renderer::pointcloud::TimingColouriseStackHasActiveEffects(
             layer.timingColourise);
@@ -14198,6 +14313,25 @@ VulkanViewportShell::ResolvePointCloudLayerMaterialVariant(
         layer.style,
         layer.densityCompensation,
         hasAttachedSeepage || hasTimingColourise);
+}
+
+bool VulkanViewportShell::LayerUsesDepthTestedAccumulation(
+    const SceneRenderState::PointCloudLayerState& layer,
+    renderer::pointcloud::PointCloudMaterialVariant materialVariant) const {
+    // Preview performance mode targets layers that would render on the
+    // opaque early-z fast path if the procedural effects (timing colourise,
+    // seepage, rain shading) were not forcing the unified material. Those
+    // layers are opaque-styled, so depth-testing their weighted accumulation
+    // against the prepass depth culls only fragments an opaque pass would
+    // hide anyway. Genuinely translucent layers never qualify.
+    return renderState_.previewPerformanceMode &&
+           materialVariant ==
+               renderer::pointcloud::PointCloudMaterialVariant::Unified &&
+           renderer::pointcloud::ResolvePointCloudMaterialVariant(
+               layer.style,
+               layer.densityCompensation,
+               false) ==
+               renderer::pointcloud::PointCloudMaterialVariant::OpaqueHardDisc;
 }
 
 bool VulkanViewportShell::UploadPointCloudLayerStyle(
@@ -14359,10 +14493,17 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
     };
     const auto densityCompensation =
         renderer::pointcloud::SanitizePointCloudDensityCompensation(layer.densityCompensation);
+    const auto materialVariant = ResolvePointCloudLayerMaterialVariant(layer);
+    // Depth-tested accumulation only culls if the prepass actually wrote
+    // this layer's depth, which the depth fragment shaders gate on
+    // renderControl.x; without this the perf-mode prepass draw discards
+    // every fragment and the depth test passes everywhere. Live-only: the
+    // EXR depth pass must stay independent of the preview toggle.
     const bool forceDepthContribution =
         renderState_.eyeDomeLightingEnabled || liveSceneReadbackCaptureEnabled_ ||
-        ResolvePointCloudLayerMaterialVariant(layer) ==
-            renderer::pointcloud::PointCloudMaterialVariant::OpaqueHardDisc;
+        materialVariant ==
+            renderer::pointcloud::PointCloudMaterialVariant::OpaqueHardDisc ||
+        (!exrStyle && LayerUsesDepthTestedAccumulation(layer, materialVariant));
     styleGpu.renderControl = glm::uvec4{
         forceDepthContribution ? 2U : 0U,
         static_cast<std::uint32_t>(layer.style.falloffProfile),
@@ -15643,8 +15784,11 @@ void VulkanViewportShell::RecordCommandBuffer(
                 ResolvePointCloudLayerMaterialVariant(layer);
             const bool opaqueHardDisc =
                 materialVariant == renderer::pointcloud::PointCloudMaterialVariant::OpaqueHardDisc;
+            // Depth-tested accumulation needs this layer's depth in the
+            // prepass even when eye-dome lighting is off.
             if (opaqueHardDisc || renderState_.eyeDomeLightingEnabled ||
-                liveSceneReadbackCaptureEnabled_) {
+                liveSceneReadbackCaptureEnabled_ ||
+                LayerUsesDepthTestedAccumulation(layer, materialVariant)) {
                 if (collectDiagnostics) {
                     ++pointDepthLayerCount;
                 }
@@ -15693,6 +15837,9 @@ void VulkanViewportShell::RecordCommandBuffer(
             if (materialVariant == renderer::pointcloud::PointCloudMaterialVariant::ConstantSimple) {
                 spritePipeline = pointConstantSimpleAccumulationPipeline_;
                 surfelPipeline = surfelConstantSimpleAccumulationPipeline_;
+            } else if (LayerUsesDepthTestedAccumulation(layer, materialVariant)) {
+                spritePipeline = pointAccumulationDepthTestedPipeline_;
+                surfelPipeline = surfelAccumulationDepthTestedPipeline_;
             }
             if (collectDiagnostics) {
                 ++pointAccumulationLayerCount;

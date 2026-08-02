@@ -275,6 +275,10 @@ struct ProjectSettings {
     float eyeDomeLightingThickness = 1.0F;
     bool constantUpdateView = false;
     bool liveVisualEffects = false;
+    // Preview-only speedups that may slightly change how overlapping points
+    // blend in the live viewport (never in exports). Off preserves the
+    // original preview appearance exactly.
+    bool previewPerformanceMode = false;
     bool autoLowerGsplatQualityWhileNavigating = true;
     PointCloudPreviewLodMode pointCloudPreviewLodMode = PointCloudPreviewLodMode::FullResolution;
     std::uint64_t interactivePointCap = kDefaultInteractivePointCap;
@@ -1864,6 +1868,11 @@ struct WaterWorkflowState {
     std::uint64_t dynamicMeshFlowDispatchCount = 0U;
     std::uint64_t dynamicMeshFlowSharedGroundUploadRevision = 0U;
     std::uint32_t dynamicMeshFlowContactEventCount = 0U;
+    // Last live-clock second at which Mesh Flow's effective activity was
+    // nonzero. Negative until the simulation first becomes active. Drives
+    // the quiescence gate that stops per-frame dispatches and scene redraws
+    // once trails, terminal fades, and contact shading have drained.
+    float dynamicMeshFlowLastActiveSeconds = -1.0F;
     RainRuntimeSettings collisionRainSettings = invisible_places::water::DefaultRainRuntimeSettings();
     WaterRainVisualSettings rainVisual = invisible_places::water::RainVisualPreset("Rain Fine Lines");
     // Currently resolved owner of the water-surface lifecycle. Generated Flow
@@ -4349,6 +4358,7 @@ std::uint64_t RenderStateSignature(
     HashVec3(&seed, renderState.cameraPosition);
     HashVec4(&seed, renderState.backgroundColor);
     HashBool(&seed, renderState.proResAlphaPreviewEnabled);
+    HashBool(&seed, renderState.previewPerformanceMode);
     HashBool(&seed, renderState.eyeDomeLightingEnabled);
     HashFloat(&seed, renderState.eyeDomeLightingThickness);
     HashFloat(&seed, renderState.nearPlane);
@@ -16628,6 +16638,7 @@ void LoadWaterSources(
     runtimeState->water.dynamicMeshFlowDispatchCount = 0U;
     runtimeState->water.dynamicMeshFlowSharedGroundUploadRevision = 0U;
     runtimeState->water.dynamicMeshFlowContactEventCount = 0U;
+    runtimeState->water.dynamicMeshFlowLastActiveSeconds = -1.0F;
     runtimeState->water.collisionRainSettings = document->rainSettings;
     runtimeState->water.rainVisual = document->rainVisualSettings;
     runtimeState->water.defaultSourceSettings = document->sourceSettings;
@@ -18879,6 +18890,36 @@ struct WaterDynamicMeshFlowUpdateOptions {
     bool resetSimulation = false;
 };
 
+// How long after effective activity reaches zero the Mesh Flow simulation
+// can still change pixels: flowing particles finish their terminal fade over
+// contactFadeSeconds while contact shading on the host clouds persists (and
+// twinkles) for the response persistence windows.
+float DynamicMeshFlowQuiescenceTailSeconds(
+    const invisible_places::water::WaterDynamicMeshFlowSettings& settings) {
+    return std::max(
+        {std::max(0.01F, settings.contactFadeSeconds),
+         settings.rockResponse.persistenceSeconds,
+         settings.vegetationResponse.persistenceSeconds});
+}
+
+// True when the Mesh Flow simulation provably has nothing on screen and
+// nothing still draining: activity has been zero past the fade/persistence
+// tail (activity == 0 empties the population gate exactly, so every particle
+// has fully faded to Inactive) and the contact-event readback — which lags
+// stale-high, never stale-low — reports no live contact shading.
+bool DynamicMeshFlowIsQuiescent(
+    const PreviewRuntimeState& runtimeState,
+    float nowSeconds) {
+    const auto& water = runtimeState.water;
+    if (water.dynamicMeshFlowContactEventCount > 0U) {
+        return false;
+    }
+    return water.dynamicMeshFlowLastActiveSeconds < 0.0F ||
+           nowSeconds - water.dynamicMeshFlowLastActiveSeconds >
+               DynamicMeshFlowQuiescenceTailSeconds(
+                   water.dynamicMeshFlowSettings);
+}
+
 bool EnsureWaterDynamicMeshFlowGpuUpToDate(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport,
@@ -18975,6 +19016,41 @@ bool EnsureWaterDynamicMeshFlowGpuUpToDate(
             settings,
             frameState.meshFlowMoisture,
             &frameState.featureOverlay);
+    if (updateOptions == nullptr) {
+        if (timeSeconds < water.dynamicMeshFlowLastActiveSeconds) {
+            // Different pump paths drive this function with different time
+            // bases (live wall clock, smoke simulation clocks). A backwards
+            // step means the stamp belongs to another base; restart the
+            // quiescence tail from now rather than comparing across bases.
+            water.dynamicMeshFlowLastActiveSeconds = timeSeconds;
+        }
+        if (activity > 0.0F) {
+            water.dynamicMeshFlowLastActiveSeconds = timeSeconds;
+        } else if (
+            !water.dynamicMeshFlowResetRequested &&
+            DynamicMeshFlowIsQuiescent(*runtimeState, timeSeconds)) {
+            // The simulation is provably empty and its contact shading has
+            // drained, so dispatching would only re-simulate an all-Inactive
+            // population — and the dispatch path unconditionally bumps the
+            // viewport's scene revision, forcing a full re-render of every
+            // point layer each frame. Skip it until activity returns.
+            // Advancing the update clock keeps the resume path free of a
+            // spurious time-discontinuity reset; resuming from an empty
+            // population spawns exactly as an uninterrupted zero-activity
+            // simulation would.
+            water.dynamicMeshFlowLastUpdateSeconds = timeSeconds;
+            // Session bookkeeping the skipped path would otherwise perform:
+            // Show Trails must keep tracking the overlay session's
+            // visibility (renderer-mode selection and export snapshots read
+            // it) even while no dispatch is needed.
+            if (sessionIndex.has_value() &&
+                sessionIndex.value() < runtimeState->sessions.size()) {
+                runtimeState->sessions[sessionIndex.value()].visible =
+                    settings.showTrails;
+            }
+            return true;
+        }
+    }
     const float deltaSeconds =
         updateOptions != nullptr &&
                 updateOptions->deltaSeconds.has_value()
@@ -20988,6 +21064,7 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
     document.eyeDomeLightingThickness = runtimeState.projectSettings.eyeDomeLightingThickness;
     document.constantUpdateView = runtimeState.projectSettings.constantUpdateView;
     document.liveVisualEffects = runtimeState.projectSettings.liveVisualEffects;
+    document.previewPerformanceMode = runtimeState.projectSettings.previewPerformanceMode;
     document.sidePanelPinned = runtimeState.sidePanel.pinned;
     document.showLidarTab = runtimeState.showLidarTab;
     document.showGsplatTab = runtimeState.showGsplatTab;
@@ -21950,6 +22027,7 @@ bool ApplyProjectDocumentToRuntime(
         std::clamp(document.eyeDomeLightingThickness, 1.0F, 24.0F);
     runtimeState->projectSettings.constantUpdateView = document.constantUpdateView;
     runtimeState->projectSettings.liveVisualEffects = document.liveVisualEffects;
+    runtimeState->projectSettings.previewPerformanceMode = document.previewPerformanceMode;
     runtimeState->sidePanel.pinned = document.sidePanelPinned;
     runtimeState->showLidarTab = document.showLidarTab;
     runtimeState->showGsplatTab = document.showGsplatTab;
@@ -48599,6 +48677,14 @@ void DrawProjectPanel(
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Allows time-driven water and stylisation effects to update in preview.");
     }
+    ImGui::Checkbox("Preview Performance Mode", &settings.previewPerformanceMode);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Speeds up the live viewport by depth-testing opaque-styled layers that use the"
+            " procedural effects shader, so hidden points skip shading. May slightly change how"
+            " overlapping points blend in the preview only; animation exports are unaffected."
+            " Off keeps the original (slower) preview appearance.");
+    }
     ImGui::TextDisabled("Point preview: full cloud, no LOD/downsample.");
     EndPanelSection();
     }
@@ -59772,8 +59858,13 @@ bool PreviewWaterSeepageRequiresSceneRedraw(
             continue;
         }
         const auto grid = runtimeState.water.seepageRuntimeGrids.find(semanticKey);
+        // Only time-animating seepage needs a redraw every frame. Static
+        // looks stay correct in the cached scene image: any slider edit or
+        // animation-track change re-uploads the params (fingerprint check in
+        // EnsureWaterSeepageRuntimeUpToDate), which bumps the viewport's
+        // scene revision and re-renders once.
         if (grid != runtimeState.water.seepageRuntimeGrids.end() &&
-            invisible_places::water::WaterSeepageGridHasActiveViewportEffect(grid->second)) {
+            invisible_places::water::WaterSeepageGridHasTimeAnimatingViewportEffect(grid->second)) {
             return true;
         }
     }
@@ -59816,8 +59907,14 @@ bool PreviewLiveVisualEffectsRequireSceneRedraw(
             return true;
         }
     }
+    // While an offline render owns the frame pump, the live Mesh Flow update
+    // (and with it the activity stamp) is paused, so the quiescence tail
+    // cannot be compared against the still-advancing live clock — keep the
+    // pre-existing always-redraw behaviour for the export's duration.
     if (runtimeState.water.dynamicMeshFlowSettings.enabled &&
-        runtimeState.water.dynamicMeshFlowSettings.showTrails) {
+        runtimeState.water.dynamicMeshFlowSettings.showTrails &&
+        (runtimeState.offlineRenderJob.active ||
+         !DynamicMeshFlowIsQuiescent(runtimeState, currentFlowTimeSeconds))) {
         return true;
     }
     if (PreviewWaterSeepageRequiresSceneRedraw(runtimeState)) {
@@ -59840,8 +59937,16 @@ bool PreviewLiveVisualEffectsRequireSceneRedraw(
             fastBasicRenderer) {
             continue;
         }
-        if (renderStyle.flowAnimation ||
-            renderStyle.waterTrailOverlay ||
+        // A trail-overlay session at zero flow activity renders nothing: the
+        // shader multiplies every trail's opacity and emission by the
+        // activity gate, so neither its trail overlay nor its flow
+        // animation can change pixels until activity returns (which changes
+        // the render-state signature and resumes redraws).
+        const bool trailOverlayContentVisible =
+            !renderStyle.waterTrailOverlay ||
+            renderStyle.waterFlowActivity > 0.0F;
+        if (((renderStyle.flowAnimation || renderStyle.waterTrailOverlay) &&
+             trailOverlayContentVisible) ||
             invisible_places::renderer::pointcloud::PointCloudStyleHasActiveRoughnessMotion(renderStyle) ||
             invisible_places::renderer::pointcloud::PointCloudStyleHasActiveCaustics(renderStyle) ||
             viewport.SparseWaterRippleEffectCount(sessionIndex) > 0U) {
@@ -59890,6 +59995,7 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
         runtimeState.projectSettings.backgroundColor[3],
     };
     renderState.proResAlphaPreviewEnabled = runtimeState.projectSettings.proResAlphaPreviewEnabled;
+    renderState.previewPerformanceMode = runtimeState.projectSettings.previewPerformanceMode;
     renderState.pointCloudRendererMode =
         fastBasicRenderer ? PointCloudRendererMode::FastBasic : PointCloudRendererMode::Beauty;
     renderState.eyeDomeLightingEnabled =

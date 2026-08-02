@@ -13,7 +13,8 @@ layout(location = 7) flat in uint inPointIndex;
 layout(location = 8) in float inSurfaceAngleMask;
 layout(location = 10) in float inCaustic;
 layout(location = 11) in vec4 inWaterColourTransform;
-layout(location = 12) flat in vec4 inTimingColourise[8];
+layout(location = 12) flat in vec4 inTimingColouriseTransform;
+layout(location = 13) flat in float inTimingColouriseEmissionAdd;
 
 layout(location = 0) out vec4 outAccumulation;
 layout(location = 1) out float outRevealage;

@@ -188,6 +188,10 @@ struct SceneRenderState {
     glm::vec3 cameraPosition{0.0F, 0.0F, 1.0F};
     glm::vec4 backgroundColor{0.0F, 0.0F, 0.0F, 1.0F};
     bool proResAlphaPreviewEnabled = false;
+    // Live-preview-only trade-off: depth-test the weighted accumulation of
+    // opaque-styled layers that were forced onto the unified procedural
+    // shader, so occluded fragments skip shading. Never applied to exports.
+    bool previewPerformanceMode = false;
     bool eyeDomeLightingEnabled = false;
     float eyeDomeLightingThickness = 1.0F;
     float nearPlane = 0.05F;
@@ -749,6 +753,11 @@ class VulkanViewportShell {
         std::array<std::uint64_t, kFramesInFlight> seepageParamsFrameGenerations{};
         std::uint64_t seepageParamsExrGeneration = 0;
         std::uint64_t seepageTopologyGeneration = 0U;
+        // Mirrors WaterSeepageGridHasActiveViewportEffect for the most
+        // recently supplied grid: false when every node's uploaded params
+        // contribute nothing, letting the layer keep a cheaper material
+        // variant than the unified procedural shader.
+        bool seepageCanContribute = false;
         std::vector<std::byte> pendingSeepageParams;
         std::vector<std::uint32_t> seepageTopologyNodeIds;
         const invisible_places::water::MeshSurfaceCache* dynamicMeshFlowCacheIdentity = nullptr;
@@ -1234,6 +1243,9 @@ class VulkanViewportShell {
     [[nodiscard]] renderer::pointcloud::PointCloudMaterialVariant
     ResolvePointCloudLayerMaterialVariant(
         const SceneRenderState::PointCloudLayerState& layer) const;
+    [[nodiscard]] bool LayerUsesDepthTestedAccumulation(
+        const SceneRenderState::PointCloudLayerState& layer,
+        renderer::pointcloud::PointCloudMaterialVariant materialVariant) const;
     [[nodiscard]] bool UploadPointCloudLayerStyle(
         const SceneRenderState::PointCloudLayerState& layer,
         const PointCloudDrawPlan& plan,
@@ -1324,6 +1336,7 @@ class VulkanViewportShell {
     VkPipelineLayout eyeDomeLightingExportPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline pointDepthPrepassPipeline_ = VK_NULL_HANDLE;
     VkPipeline pointAccumulationPipeline_ = VK_NULL_HANDLE;
+    VkPipeline pointAccumulationDepthTestedPipeline_ = VK_NULL_HANDLE;
     VkPipeline pointConstantSimpleAccumulationPipeline_ = VK_NULL_HANDLE;
     VkPipeline pointOpaqueHardDiscPipeline_ = VK_NULL_HANDLE;
     VkPipeline pointFastBasicPipeline_ = VK_NULL_HANDLE;
@@ -1335,6 +1348,7 @@ class VulkanViewportShell {
     VkPipeline rainPipeline_ = VK_NULL_HANDLE;
     VkPipeline surfelDepthPrepassPipeline_ = VK_NULL_HANDLE;
     VkPipeline surfelAccumulationPipeline_ = VK_NULL_HANDLE;
+    VkPipeline surfelAccumulationDepthTestedPipeline_ = VK_NULL_HANDLE;
     VkPipeline surfelConstantSimpleAccumulationPipeline_ = VK_NULL_HANDLE;
     VkPipeline surfelOpaqueHardDiscPipeline_ = VK_NULL_HANDLE;
     VkPipeline gaussianSplatPipeline_ = VK_NULL_HANDLE;

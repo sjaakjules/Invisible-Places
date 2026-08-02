@@ -7855,6 +7855,7 @@ bool SaveProjectDocument(
         {"eye_dome_lighting_thickness", document.eyeDomeLightingThickness},
         {"constant_update_view", document.constantUpdateView},
         {"live_visual_effects", document.liveVisualEffects},
+        {"preview_performance_mode", document.previewPerformanceMode},
         {"side_panel_pinned", document.sidePanelPinned},
         {"orbit_control_mode", OrbitControlModeName(document.orbitControlMode)},
         {"show_lidar_tab", document.showLidarTab},
@@ -8107,6 +8108,7 @@ std::optional<ProjectDocument> LoadProjectDocument(
     document.eyeDomeLightingThickness = projectJson->value("eye_dome_lighting_thickness", 1.0F);
     document.constantUpdateView = projectJson->value("constant_update_view", false);
     document.liveVisualEffects = projectJson->value("live_visual_effects", false);
+    document.previewPerformanceMode = projectJson->value("preview_performance_mode", false);
     document.sidePanelPinned = projectJson->value("side_panel_pinned", false);
     if (projectJson->contains("orbit_control_mode")) {
         document.orbitControlMode =

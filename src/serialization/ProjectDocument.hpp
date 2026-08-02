@@ -175,6 +175,7 @@ struct ProjectDocument {
     bool proResAlphaPreviewEnabled = false;
     bool constantUpdateView = false;
     bool liveVisualEffects = false;
+    bool previewPerformanceMode = false;
     bool sidePanelPinned = false;
     bool showLidarTab = false;
     bool showGsplatTab = false;

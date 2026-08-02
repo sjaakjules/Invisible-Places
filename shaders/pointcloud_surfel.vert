@@ -1,19 +1,26 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 
+#ifndef DEPTH_PREPASS
 layout(location = 0) out vec4 outSourceColor;
 layout(location = 1) out float outColormapValue;
+#endif
 layout(location = 2) out float outOpacity;
+#ifndef DEPTH_PREPASS
 layout(location = 3) out float outEmissive;
+#endif
 layout(location = 5) out float outDepthFade;
 layout(location = 6) out float outViewDepth;
 layout(location = 7) out vec2 outDiscCoord;
 layout(location = 8) flat out uint outPointIndex;
+#ifndef DEPTH_PREPASS
 layout(location = 9) out float outSurfaceAngleMask;
 layout(location = 10) out vec3 outAovNormal;
 layout(location = 11) out float outCaustic;
 layout(location = 12) out vec4 outWaterColourTransform;
-layout(location = 13) flat out vec4 outTimingColourise[8];
+layout(location = 13) flat out vec4 outTimingColouriseTransform;
+layout(location = 14) flat out float outTimingColouriseEmissionAdd;
+#endif
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 viewProjection;
@@ -1152,7 +1159,9 @@ void main() {
 
     gl_Position = uniforms.viewProjection * worldPosition;
 
+#ifndef DEPTH_PREPASS
     const vec4 sourceColor = UnpackRgba8(surfelColors.colors[pointIndex]);
+#endif
     const float waterEffectOpacityAdd =
         HasWaterEffectComposition() ? WaterEffectField(styleData.waterEffectControl.z, pointIndex, 0.0) * waterEffectScale : 0.0;
     const float sparseRippleOpacityAdd = sparseRipple.opacityAdd;
@@ -1161,12 +1170,16 @@ void main() {
             ? mix(1.0, max(0.0, WaterEffectField(styleData.waterEffectControl.w, pointIndex, 1.0)), waterEffectScale)
             : 1.0;
     const float sparseRippleOpacityMultiply = sparseRipple.opacityMultiply;
+#ifndef DEPTH_PREPASS
     const float waterEffectEmissionAdd =
         HasWaterEffectComposition()
             ? max(0.0, WaterEffectField(styleData.waterEffectControl.y, pointIndex, 0.0)) * waterEffectScale
             : 0.0;
     const float sparseRippleEmissionAdd = sparseRipple.emissionAdd;
-    ResolveTimingColouriseStack(pointIndex, outTimingColourise);
+    ResolveTimingColouriseTransform(
+        pointIndex,
+        outTimingColouriseTransform,
+        outTimingColouriseEmissionAdd);
     if (styleData.timingColouriseControl.x != 0u) {
         const vec3 waterFromZero = ApplyResolvedWaterColour(
             vec3(0.0),
@@ -1207,6 +1220,7 @@ void main() {
             sourceColor.a);
     }
     outColormapValue = EvaluateBinding(styleData.colormapPositionBinding, pointIndex);
+#endif
     const vec2 animatedFlow = ApplyWaterFlowAnimation(
         EvaluateBinding(styleData.opacityBinding, pointIndex),
         EvaluateBinding(styleData.emissiveBinding, pointIndex),
@@ -1225,6 +1239,7 @@ void main() {
              meshFlowContact.opacityAdd) * flowEffectVisibility,
         0.0,
         4.0);
+#ifndef DEPTH_PREPASS
     outEmissive =
         animatedFlow.y +
         (caustic * max(0.0, styleData.causticParams1.y) +
@@ -1232,11 +1247,14 @@ void main() {
          sparseRippleEmissionAdd +
          rainImpact.emissionAdd +
          meshFlowContact.emissionAdd) * flowEffectVisibility;
+#endif
     outDepthFade = EvaluateBinding(styleData.depthFadeBinding, pointIndex);
     outViewDepth = -viewPosition.z;
     outDiscCoord = corner;
     outPointIndex = pointIndex;
+#ifndef DEPTH_PREPASS
     outSurfaceAngleMask = surfaceAngleMask;
     outAovNormal = ResolveAovNormal(pointIndex);
     outCaustic = CausticColorSignal(caustic, previewTint);
+#endif
 }

@@ -112,6 +112,28 @@ foreach(SHADER_SOURCE IN LISTS INVISIBLE_PLACES_SHADER_SOURCES)
     list(APPEND INVISIBLE_PLACES_SHADER_OUTPUTS "${SHADER_OUTPUT}")
 endforeach()
 
+set(SHADER_OUTPUT "${INVISIBLE_PLACES_SHADER_OUTPUT_DIR}/pointcloud_preview_depth_prepass.vert.spv")
+add_custom_command(
+    OUTPUT "${SHADER_OUTPUT}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${INVISIBLE_PLACES_SHADER_OUTPUT_DIR}"
+    COMMAND "${GLSLANG_VALIDATOR_EXECUTABLE}" -V --target-env vulkan1.2 -DDEPTH_PREPASS=1 -I"${CMAKE_CURRENT_SOURCE_DIR}/shaders" -o "${SHADER_OUTPUT}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_preview.vert"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_preview.vert" ${INVISIBLE_PLACES_SHADER_INCLUDES}
+    COMMENT "Compiling shader shaders/pointcloud_preview.vert (depth prepass)"
+    VERBATIM
+)
+list(APPEND INVISIBLE_PLACES_SHADER_OUTPUTS "${SHADER_OUTPUT}")
+
+set(SHADER_OUTPUT "${INVISIBLE_PLACES_SHADER_OUTPUT_DIR}/pointcloud_surfel_depth_prepass.vert.spv")
+add_custom_command(
+    OUTPUT "${SHADER_OUTPUT}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${INVISIBLE_PLACES_SHADER_OUTPUT_DIR}"
+    COMMAND "${GLSLANG_VALIDATOR_EXECUTABLE}" -V --target-env vulkan1.2 -DDEPTH_PREPASS=1 -I"${CMAKE_CURRENT_SOURCE_DIR}/shaders" -o "${SHADER_OUTPUT}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_surfel.vert"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_surfel.vert" ${INVISIBLE_PLACES_SHADER_INCLUDES}
+    COMMENT "Compiling shader shaders/pointcloud_surfel.vert (depth prepass)"
+    VERBATIM
+)
+list(APPEND INVISIBLE_PLACES_SHADER_OUTPUTS "${SHADER_OUTPUT}")
+
 add_custom_target(invisible_places_shaders DEPENDS ${INVISIBLE_PLACES_SHADER_OUTPUTS})
 
 configure_file(

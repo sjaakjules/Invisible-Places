@@ -4,18 +4,25 @@
 layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec4 inColor;
 
+#ifndef DEPTH_PREPASS
 layout(location = 0) out vec4 outSourceColor;
 layout(location = 1) out float outColormapValue;
+#endif
 layout(location = 2) out float outOpacity;
+#ifndef DEPTH_PREPASS
 layout(location = 3) out float outEmissive;
+#endif
 layout(location = 5) out float outDepthFade;
 layout(location = 6) out float outViewDepth;
 layout(location = 7) flat out uint outPointIndex;
+#ifndef DEPTH_PREPASS
 layout(location = 8) out float outSurfaceAngleMask;
 layout(location = 9) out vec3 outAovNormal;
 layout(location = 10) out float outCaustic;
 layout(location = 11) out vec4 outWaterColourTransform;
-layout(location = 12) flat out vec4 outTimingColourise[8];
+layout(location = 12) flat out vec4 outTimingColouriseTransform;
+layout(location = 13) flat out float outTimingColouriseEmissionAdd;
+#endif
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 viewProjection;
@@ -1051,8 +1058,12 @@ void main() {
         ? clamp(resolvedPointSize, minPointSize, maxPointSize)
         : minPointSize;
 
+#ifndef DEPTH_PREPASS
     const float causticColorSignal = CausticColorSignal(caustic, previewTint);
-    ResolveTimingColouriseStack(pointIndex, outTimingColourise);
+    ResolveTimingColouriseTransform(
+        pointIndex,
+        outTimingColouriseTransform,
+        outTimingColouriseEmissionAdd);
     if (styleData.timingColouriseControl.x != 0u) {
         const vec3 waterFromZero = ApplyResolvedWaterColour(
             vec3(0.0),
@@ -1095,6 +1106,7 @@ void main() {
             inColor.a);
     }
     outColormapValue = EvaluateBinding(styleData.colormapPositionBinding);
+#endif
     const vec2 animatedFlow = ApplyWaterFlowAnimation(
         EvaluateBinding(styleData.opacityBinding),
         EvaluateBinding(styleData.emissiveBinding),
@@ -1102,9 +1114,11 @@ void main() {
     const float safeBaseOpacity = RippleFiniteFloat(animatedFlow.x)
         ? clamp(animatedFlow.x, 0.0, 4.0)
         : 1.0;
+#ifndef DEPTH_PREPASS
     const float safeBaseEmissive = RippleFiniteFloat(animatedFlow.y)
         ? max(0.0, animatedFlow.y)
         : 0.0;
+#endif
     const float flowEffectVisibility = WaterTrailOverlayEnabled()
         ? WaterTrailVisibility(pointIndex) * WaterFlowAppearanceScale()
         : 1.0;
@@ -1119,6 +1133,7 @@ void main() {
     outOpacity = RippleFiniteFloat(resolvedOpacity)
         ? clamp(resolvedOpacity, 0.0, 4.0)
         : safeBaseOpacity;
+#ifndef DEPTH_PREPASS
     const float resolvedEmissive =
         animatedFlow.y +
         (caustic * max(0.0, styleData.causticParams1.y) +
@@ -1129,10 +1144,13 @@ void main() {
     outEmissive = RippleFiniteFloat(resolvedEmissive)
         ? max(0.0, resolvedEmissive)
         : safeBaseEmissive;
+#endif
     outDepthFade = EvaluateBinding(styleData.depthFadeBinding);
     outViewDepth = viewDepth;
     outPointIndex = pointIndex;
+#ifndef DEPTH_PREPASS
     outSurfaceAngleMask = ResolveSurfaceAngleMask(worldPosition.xyz, pointIndex);
     outAovNormal = ResolveAovNormal(pointIndex);
     outCaustic = causticColorSignal;
+#endif
 }

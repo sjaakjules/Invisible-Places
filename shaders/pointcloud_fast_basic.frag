@@ -7,7 +7,8 @@ layout(location = 2) flat in uint inPointIndex;
 layout(location = 3) in vec3 inWorldPosition;
 layout(location = 4) in vec3 inPointNormal;
 layout(location = 5) in float inFlowCoverage;
-layout(location = 6) flat in vec4 inTimingColourise[8];
+layout(location = 6) flat in vec4 inTimingColouriseTransform;
+layout(location = 7) flat in float inTimingColouriseEmissionAdd;
 
 layout(location = 0) out vec4 outColor;
 

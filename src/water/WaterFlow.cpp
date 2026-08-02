@@ -9908,35 +9908,104 @@ std::string WaterSeepageAuthoredTopologyFingerprint(
     return "water-seepage-authored-topology-v5-" + SeepageFingerprintString(hash);
 }
 
-bool WaterSeepageGridHasActiveViewportEffect(
-    const WaterSeepageSpatialGrid& grid) {
-    constexpr float activeThreshold = 1.0e-6F;
+namespace {
+
+// The GPU evaluator rejects a node only when its composed contribution
+// scale falls at or below 1e-5 after multiplying pattern signals (<= 1.38),
+// intensity (<= 8), prominence (<= 8), and rain boost (<= 1.65). For the
+// CPU predicates to be at least as permissive as the shader — a false here
+// must imply the shader draws nothing — each individually-gated factor uses
+// a threshold small enough that even against every other factor at its
+// clamp ceiling the composed scale stays under the shader's cutoff
+// (5e-7 * 8 * 1.65 * 1.38 ~= 9.1e-6 < 1e-5).
+constexpr float kSeepageActiveThreshold = 5.0e-7F;
+
+bool SeepageNodeGatesPass(const WaterSeepageRuntimeNode& node) {
+    return node.enabledFactor > kSeepageActiveThreshold &&
+           node.reachMeters > kSeepageActiveThreshold &&
+           node.widthMeters > kSeepageActiveThreshold &&
+           node.prominence > kSeepageActiveThreshold &&
+           node.strength > kSeepageActiveThreshold &&
+           node.effectiveActivity > kSeepageActiveThreshold;
+}
+
+bool SeepageLookCanContribute(
+    const WaterSeepageRuntimeNode& node,
+    const WaterSeepageLookSettings& look) {
+    return look.response.intensity > kSeepageActiveThreshold &&
+           (look.pattern != WaterSeepagePattern::WettingTrickle ||
+            node.wettingProgress > kSeepageActiveThreshold);
+}
+
+template <typename LookPredicate>
+bool SeepageGridHasQualifyingEffect(
+    const WaterSeepageSpatialGrid& grid,
+    LookPredicate&& lookQualifies) {
     return std::any_of(
         grid.nodes.begin(),
         grid.nodes.end(),
-        [](const WaterSeepageRuntimeNode& node) {
-            if (node.enabledFactor <= activeThreshold ||
-                node.reachMeters <= activeThreshold ||
-                node.widthMeters <= activeThreshold ||
-                node.prominence <= activeThreshold ||
-                node.strength <= activeThreshold ||
-                node.effectiveActivity <= activeThreshold) {
+        [&](const WaterSeepageRuntimeNode& node) {
+            if (!SeepageNodeGatesPass(node)) {
                 return false;
             }
-            const auto lookCanContribute = [&](const WaterSeepageLookSettings& look) {
-                return look.response.intensity > activeThreshold &&
-                       (look.pattern != WaterSeepagePattern::WettingTrickle ||
-                        node.wettingProgress > activeThreshold);
-            };
             if (!node.transitionLook.has_value() ||
-                node.transitionAmount <= activeThreshold) {
-                return lookCanContribute(node.look);
+                node.transitionAmount <= kSeepageActiveThreshold) {
+                return lookQualifies(node, node.look);
             }
-            if (node.transitionAmount >= 1.0F - activeThreshold) {
-                return lookCanContribute(node.transitionLook.value());
+            if (node.transitionAmount >= 1.0F - kSeepageActiveThreshold) {
+                return lookQualifies(node, node.transitionLook.value());
             }
-            return lookCanContribute(node.look) ||
-                   lookCanContribute(node.transitionLook.value());
+            return lookQualifies(node, node.look) ||
+                   lookQualifies(node, node.transitionLook.value());
+        });
+}
+
+}  // namespace
+
+bool WaterSeepageGridHasActiveViewportEffect(
+    const WaterSeepageSpatialGrid& grid) {
+    return SeepageGridHasQualifyingEffect(
+        grid,
+        [](const WaterSeepageRuntimeNode& node,
+           const WaterSeepageLookSettings& look) {
+            return SeepageLookCanContribute(node, look);
+        });
+}
+
+bool WaterSeepageLookIsTimeAnimating(const WaterSeepageLookSettings& look) {
+    // Non-finite motion parameters are mapped to animating defaults by
+    // SanitizeSeepageLook before they reach the GPU; treat them as animating
+    // so an unsanitized look can never freeze a moving effect.
+    const auto animates = [](float value) {
+        return !std::isfinite(value) || value > 0.0F;
+    };
+    // These conditions mirror the shader's only time-dependent terms in
+    // pointcloud_sparse_ripple.glsl: evolution/drift advection for the
+    // organic patterns and front speed (plus irregularity-scaled evolution
+    // shift) for Contour Pulses.
+    switch (look.pattern) {
+        case WaterSeepagePattern::WetRockSheen:
+            return animates(look.evolution);
+        case WaterSeepagePattern::ChaoticBloom:
+        case WaterSeepagePattern::WettingTrickle:
+            return animates(look.evolution) ||
+                   animates(look.downhillDriftMetersPerSecond);
+        case WaterSeepagePattern::ContourPulses:
+            return animates(look.pulseSpeedMetersPerSecond) ||
+                   (animates(look.evolution) &&
+                    animates(look.pulseIrregularity));
+    }
+    return true;
+}
+
+bool WaterSeepageGridHasTimeAnimatingViewportEffect(
+    const WaterSeepageSpatialGrid& grid) {
+    return SeepageGridHasQualifyingEffect(
+        grid,
+        [](const WaterSeepageRuntimeNode& node,
+           const WaterSeepageLookSettings& look) {
+            return SeepageLookCanContribute(node, look) &&
+                   WaterSeepageLookIsTimeAnimating(look);
         });
 }
 

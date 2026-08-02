@@ -10,7 +10,8 @@ layout(location = 2) flat out uint outPointIndex;
 layout(location = 3) out vec3 outWorldPosition;
 layout(location = 4) out vec3 outPointNormal;
 layout(location = 5) out float outFlowCoverage;
-layout(location = 6) flat out vec4 outTimingColourise[8];
+layout(location = 6) flat out vec4 outTimingColouriseTransform;
+layout(location = 7) flat out float outTimingColouriseEmissionAdd;
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 viewProjection;
@@ -433,5 +434,8 @@ void main() {
     outFlowCoverage = WaterTrailOverlayEnabled()
         ? waterTrailVisibility * WaterFlowAppearanceScale()
         : 1.0;
-    ResolveTimingColouriseStack(pointIndex, outTimingColourise);
+    ResolveTimingColouriseTransform(
+        pointIndex,
+        outTimingColouriseTransform,
+        outTimingColouriseEmissionAdd);
 }
