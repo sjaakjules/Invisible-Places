@@ -36,7 +36,9 @@ invisible_places::timing::TimingColouriseHistogram MakeHistogram(
     invisible_places::timing::TimingColouriseHistogram histogram{
         .minimum = minimum,
         .maximum = maximum,
-        .bins = bins,
+        .bins = std::vector<std::uint64_t>(
+            bins.begin(),
+            bins.end()),
     };
     for (const auto count : bins) {
         histogram.finiteValueCount += count;
@@ -293,6 +295,19 @@ TEST_CASE(
         total += count;
     }
     CHECK(total == result.histogram.finiteValueCount);
+}
+
+TEST_CASE(
+    "Timing Colourise high-resolution bins stay off the worker stack",
+    "[timing][colourise][histogram][storage]") {
+    using invisible_places::timing::TimingColouriseHistogram;
+    using invisible_places::timing::kTimingColouriseHistogramBinCount;
+
+    // Keep the owning object small enough to copy through the background job
+    // without reserving the 16,384-bin payload in each stack-frame temporary.
+    CHECK(sizeof(TimingColouriseHistogram) < 1'024U);
+    const TimingColouriseHistogram histogram;
+    CHECK(histogram.bins.size() == kTimingColouriseHistogramBinCount);
 }
 
 TEST_CASE(

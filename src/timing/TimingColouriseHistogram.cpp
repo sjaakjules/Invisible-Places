@@ -513,8 +513,11 @@ using HistogramCumulativeCounts = std::array<
 HistogramCumulativeCounts BuildHistogramCumulativeCounts(
     const TimingColouriseHistogram& histogram) {
     HistogramCumulativeCounts cumulative{};
+    const auto sourceBinCount = std::min(
+        histogram.bins.size(),
+        kTimingColouriseHistogramBinCount);
     for (std::size_t index = 0U;
-         index < histogram.bins.size();
+         index < sourceBinCount;
          ++index) {
         cumulative[index + 1U] =
             cumulative[index] +

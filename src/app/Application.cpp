@@ -725,14 +725,9 @@ struct TimingsPanelState {
 };
 
 struct TimingColouriseHistogram {
-    static constexpr std::size_t kBinCount =
-        invisible_places::timing::kTimingColouriseHistogramBinCount;
     std::string signature;
     invisible_places::timing::TimingColouriseFieldSelector selector{};
-    float minimum = 0.0F;
-    float maximum = 1.0F;
-    std::array<std::uint64_t, kBinCount> bins{};
-    std::uint64_t finiteValueCount = 0U;
+    invisible_places::timing::TimingColouriseHistogram data{};
 };
 
 struct TimingColouriseHistogramTask {
@@ -54679,17 +54674,13 @@ void StartTimingColouriseHistogramBatch(
             };
             const auto makeOutput =
                 [](const TimingColouriseHistogramTask& task,
-                   const invisible_places::timing::
-                       TimingColouriseHistogram& histogram) {
-                    TimingColouriseHistogram output;
-                    output.signature = task.signature;
-                    output.selector = task.selector;
-                    output.minimum = histogram.minimum;
-                    output.maximum = histogram.maximum;
-                    output.finiteValueCount =
-                        histogram.finiteValueCount;
-                    output.bins = histogram.bins;
-                    return output;
+                   invisible_places::timing::
+                       TimingColouriseHistogram histogram) {
+                    return TimingColouriseHistogram{
+                        .signature = task.signature,
+                        .selector = task.selector,
+                        .data = std::move(histogram),
+                    };
                 };
 
             std::vector<TimingColouriseHistogramTask>
@@ -54701,7 +54692,7 @@ void StartTimingColouriseHistogramBatch(
                     return;
                 }
                 std::string cacheError;
-                const auto cached =
+                auto cached =
                     invisible_places::timing::
                         LoadTimingColouriseHistogramCache(
                             task.cachePath,
@@ -54711,7 +54702,9 @@ void StartTimingColouriseHistogramBatch(
                     TimingColouriseHistogramJobResult result;
                     result.signature = task.signature;
                     result.histogram =
-                        makeOutput(task, cached.value());
+                        makeOutput(
+                            task,
+                            std::move(cached.value()));
                     publish(std::move(result));
                 } else {
                     missing.push_back(task);
@@ -54762,7 +54755,7 @@ void StartTimingColouriseHistogramBatch(
                     }
                 }
                 const auto& task = missing[taskIndex];
-                const auto computed =
+                auto computed =
                     invisible_places::timing::
                         ComputeTimingColouriseHistogramFromSources(
                             sources,
@@ -54776,15 +54769,15 @@ void StartTimingColouriseHistogramBatch(
                 TimingColouriseHistogramJobResult result;
                 result.signature = task.signature;
                 if (computed.success) {
-                    result.histogram =
-                        makeOutput(
-                            task,
-                            computed.histogram);
                     (void)invisible_places::timing::
                         SaveTimingColouriseHistogramCache(
                             task.cachePath,
                             task.signature,
                             computed.histogram);
+                    result.histogram =
+                        makeOutput(
+                            task,
+                            std::move(computed.histogram));
                 } else {
                     result.errorMessage =
                         computed.errorMessage;
@@ -54815,8 +54808,9 @@ void PollTimingColouriseHistogram(
     }
     for (auto& result : results) {
         if (result.histogram.has_value()) {
-            job.cache[result.signature] =
-                std::move(result.histogram.value());
+            job.cache.insert_or_assign(
+                result.signature,
+                std::move(result.histogram.value()));
             job.failures.erase(result.signature);
             if (job.failedSignature ==
                 result.signature) {
@@ -55395,14 +55389,7 @@ void DrawTimingColouriseHistogram(
     const auto minimum = ImGui::GetItemRectMin();
     const auto maximum = ImGui::GetItemRectMax();
     auto* drawList = ImGui::GetWindowDrawList();
-    invisible_places::timing::TimingColouriseHistogram
-        histogramData{
-            .minimum = histogram->minimum,
-            .maximum = histogram->maximum,
-            .finiteValueCount =
-                histogram->finiteValueCount,
-            .bins = histogram->bins,
-        };
+    const auto& histogramData = histogram->data;
     const auto axis =
         invisible_places::timing::
             BuildTimingColouriseHistogramAxis(
@@ -55410,8 +55397,8 @@ void DrawTimingColouriseHistogram(
                 requestedAxisMode);
     const auto [minimumBinIterator, maximumBinIterator] =
         std::minmax_element(
-        histogram->bins.begin(),
-        histogram->bins.end());
+        histogramData.bins.begin(),
+        histogramData.bins.end());
     const auto minimumBin = *minimumBinIterator;
     const auto maximumBin = *maximumBinIterator;
     const float width = maximum.x - minimum.x;
@@ -55456,14 +55443,14 @@ void DrawTimingColouriseHistogram(
         };
     float binX0 = minimum.x;
     for (std::size_t index = 0U;
-         index < histogram->bins.size();
+         index < histogramData.bins.size();
          ++index) {
         const float rawX1 = std::lerp(
-            histogram->minimum,
-            histogram->maximum,
+            histogramData.minimum,
+            histogramData.maximum,
             static_cast<float>(index + 1U) /
                 static_cast<float>(
-                    histogram->bins.size()));
+                    histogramData.bins.size()));
         const float binX1 =
             minimum.x + width * axis.RawToUnit(rawX1);
         const float sourceBinWidth = binX1 - binX0;
@@ -55474,14 +55461,14 @@ void DrawTimingColouriseHistogram(
         if (displayBucketBinCount == 0U) {
             displayBucketX0 = binX0;
         }
-        displayBucketTotal += histogram->bins[index];
+        displayBucketTotal += histogramData.bins[index];
         ++displayBucketBinCount;
         const bool bucketIsVisible =
             binX1 - displayBucketX0 >=
             kMinimumDisplayBucketWidth;
         if (sourceBinWidth >= kMinimumDisplayBucketWidth ||
             bucketIsVisible ||
-            index + 1U == histogram->bins.size()) {
+            index + 1U == histogramData.bins.size()) {
             flushDisplayBucket(binX1);
         }
         binX0 = binX1;
@@ -55491,8 +55478,8 @@ void DrawTimingColouriseHistogram(
         maximum,
         ImGui::GetColorU32(ImGuiCol_Border));
     if (axis.UsesDistributionSpread() &&
-        histogram->minimum < 0.0F &&
-        histogram->maximum > 0.0F) {
+        histogramData.minimum < 0.0F &&
+        histogramData.maximum > 0.0F) {
         const float zeroX =
             minimum.x + width * axis.zeroUnit;
         drawList->AddLine(
@@ -55547,9 +55534,9 @@ void DrawTimingColouriseHistogram(
     const float lowerFadeX = xForRaw(lowerFadeValue);
     const float upperFadeX = xForRaw(upperFadeValue);
     const bool histogramRangeEditable =
-        std::isfinite(histogram->minimum) &&
-        std::isfinite(histogram->maximum) &&
-        histogram->maximum > histogram->minimum;
+        std::isfinite(histogramData.minimum) &&
+        std::isfinite(histogramData.maximum) &&
+        histogramData.maximum > histogramData.minimum;
     const auto handleInsideHistogramRange =
         [&](TimingColouriseHistogramHandle handle) {
             // RawToUnit deliberately pins out-of-range values to an edge.
@@ -55637,13 +55624,13 @@ void DrawTimingColouriseHistogram(
             std::max(1.0F, width);
     const float mouseValue =
         mouseUnit < 0.0F
-            ? histogram->minimum +
+            ? histogramData.minimum +
                   mouseUnit *
-                      (histogram->maximum - histogram->minimum)
+                      (histogramData.maximum - histogramData.minimum)
         : mouseUnit > 1.0F
-            ? histogram->maximum +
+            ? histogramData.maximum +
                   (mouseUnit - 1.0F) *
-                      (histogram->maximum - histogram->minimum)
+                      (histogramData.maximum - histogramData.minimum)
             : axis.UnitToRaw(mouseUnit);
     TimingColouriseHistogramHandle hoveredHandle =
         TimingColouriseHistogramHandle::None;
@@ -55725,8 +55712,8 @@ void DrawTimingColouriseHistogram(
                 position,
                 mouseValue - runtimeState->timingsPanel
                                  .histogramHandleGrabOffset,
-                histogram->minimum,
-                histogram->maximum)) {
+                histogramData.minimum,
+                histogramData.maximum)) {
             runtimeState->previewRenderStateSignatureValid =
                 false;
         }
@@ -55753,7 +55740,7 @@ void DrawTimingColouriseHistogram(
                   ? "-1"
                   : "0"
             : FormatFixed(
-                  histogram->minimum,
+                  histogramData.minimum,
                   5)
                   .c_str());
     ImGui::SameLine();
@@ -55777,7 +55764,7 @@ void DrawTimingColouriseHistogram(
     const std::string maximumText =
         spreadAxis
             ? "1"
-            : FormatFixed(histogram->maximum, 5);
+            : FormatFixed(histogramData.maximum, 5);
     ImGui::SetCursorPosX(
         std::max(
             ImGui::GetCursorPosX(),
@@ -57553,9 +57540,9 @@ void DrawTimingColouriseSection(
                 effect.field);
         const bool spreadAvailable =
             histogram != nullptr &&
-            std::isfinite(histogram->minimum) &&
-            std::isfinite(histogram->maximum) &&
-            histogram->maximum > histogram->minimum;
+            std::isfinite(histogram->data.minimum) &&
+            std::isfinite(histogram->data.maximum) &&
+            histogram->data.maximum > histogram->data.minimum;
         bool useDistributionSpread =
             histogram != nullptr &&
             timings.spreadColouriseHistogramSignatures.contains(

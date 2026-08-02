@@ -61,10 +61,17 @@ struct TimingColouriseHistogram {
     float minimum = 0.0F;
     float maximum = 0.0F;
     std::uint64_t finiteValueCount = 0U;
-    std::array<std::uint64_t, kTimingColouriseHistogramBinCount> bins{};
+    // High-resolution storage must remain heap-backed: macOS worker threads
+    // have a much smaller default stack than the main UI thread, and a few
+    // fixed-array result copies can otherwise exhaust it before work begins.
+    std::vector<std::uint64_t> bins =
+        std::vector<std::uint64_t>(
+            kTimingColouriseHistogramBinCount,
+            0U);
 
     [[nodiscard]] bool Valid() const {
-        return finiteValueCount > 0U && maximum >= minimum;
+        return bins.size() == kTimingColouriseHistogramBinCount &&
+               finiteValueCount > 0U && maximum >= minimum;
     }
 };
 
