@@ -16,9 +16,12 @@
 
 namespace invisible_places::timing {
 
-inline constexpr std::size_t kTimingColouriseHistogramBinCount = 256U;
+// The full raw range remains exact, but this density leaves enough source
+// buckets for Distribution Spread to reveal narrow concentrations even when
+// a handful of outliers make the raw range much wider than the useful data.
+inline constexpr std::size_t kTimingColouriseHistogramBinCount = 16'384U;
 inline constexpr std::uint32_t
-    kTimingColouriseHistogramCacheSchemaVersion = 1U;
+    kTimingColouriseHistogramCacheSchemaVersion = 2U;
 inline constexpr std::size_t kTimingColouriseAuthoredLayerCount = 3U;
 
 struct TimingColouriseLayerFieldSet {
@@ -98,7 +101,7 @@ enum class TimingColouriseHistogramAxisShape : std::uint8_t {
 // Centred fields split the CDF at raw zero and anchor it exactly at the middle
 // of a -1..1 presentation. Predominantly one-sided fields use the full CDF as
 // a 0..1 presentation. One additional knot accommodates raw zero between the
-// histogram's 256 linear bins.
+// histogram's high-resolution linear bins.
 struct TimingColouriseHistogramAxis {
     static constexpr std::size_t kMaximumKnotCount =
         kTimingColouriseHistogramBinCount + 2U;
@@ -154,9 +157,9 @@ using TimingColouriseHistogramSourceBundle = std::array<
     TimingColouriseHistogramLayerSource,
     kTimingColouriseAuthoredLayerCount>;
 
-// Computes the exact range and 256 linear bins in two passes over resident
-// field-major arrays. Non-finite values are ignored. This function does no
-// file IO and is suitable for a cancellable background worker.
+// Computes the exact range and high-resolution linear bins in two passes over
+// resident field-major arrays. Non-finite values are ignored. This function
+// does no file IO and is suitable for a cancellable background worker.
 [[nodiscard]] TimingColouriseHistogramResult
 ComputeTimingColouriseHistogram(
     const TimingColouriseResidentCloudBundle& clouds,

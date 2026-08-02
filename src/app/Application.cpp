@@ -725,7 +725,8 @@ struct TimingsPanelState {
 };
 
 struct TimingColouriseHistogram {
-    static constexpr std::size_t kBinCount = 256U;
+    static constexpr std::size_t kBinCount =
+        invisible_places::timing::kTimingColouriseHistogramBinCount;
     std::string signature;
     invisible_places::timing::TimingColouriseFieldSelector selector{};
     float minimum = 0.0F;
@@ -51634,6 +51635,7 @@ void DrawTimingKeyLaneGroup(
         };
 
     auto& timings = runtimeState->timingsPanel;
+    bool handledMarkerInteraction = false;
     if (markerHovered) {
         const bool onKey =
             std::abs(
@@ -51649,6 +51651,7 @@ void DrawTimingKeyLaneGroup(
             nearestPosition);
         if (ImGui::IsMouseDoubleClicked(
                 ImGuiMouseButton_Left)) {
+            handledMarkerInteraction = true;
             timings.colouriseLocalKeyDrag.reset();
             if (onKey) {
                 timings.colouriseLocalKeyPositionEdit =
@@ -51672,6 +51675,7 @@ void DrawTimingKeyLaneGroup(
             }
         } else if (ImGui::IsMouseClicked(
                        ImGuiMouseButton_Left)) {
+            handledMarkerInteraction = true;
             runtimeState->animationPanel.scrubAmount =
                 nearestPosition;
             ApplyAnimationScrub(runtimeState);
@@ -51696,6 +51700,23 @@ void DrawTimingKeyLaneGroup(
             ? findMatchingSeries(
                   timings.colouriseLocalKeyDrag.value())
             : nullptr;
+    // Empty lane space is a compact local scrubber. ImGui keeps the clicked
+    // item active while the button is held, so the same path supports both a
+    // single jump and continuous drag-scrubbing without stealing marker
+    // drags or double-click key editing.
+    if (!handledMarkerInteraction &&
+        draggedSeries == nullptr &&
+        ImGui::IsItemActive() &&
+        ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        const float scrubPosition = positionForX(mouseX);
+        if (std::abs(
+                runtimeState->animationPanel.scrubAmount -
+                scrubPosition) >
+            std::numeric_limits<float>::epsilon()) {
+            runtimeState->animationPanel.scrubAmount = scrubPosition;
+            ApplyAnimationScrub(runtimeState);
+        }
+    }
     if (draggedSeries != nullptr &&
         ImGui::IsItemActive() &&
         ImGui::IsMouseDragging(
@@ -51775,6 +51796,11 @@ void DrawTimingKeyLaneGroup(
         ImVec2{minimum.x, centreY},
         ImVec2{maximum.x, centreY},
         ImGui::GetColorU32(ImGuiCol_Border));
+    const float scrubPosition = std::clamp(
+        runtimeState->animationPanel.scrubAmount,
+        0.0F,
+        1.0F);
+    const float scrubX = xForPosition(scrubPosition);
     const auto markerColour =
         [&](ImU32 colour, float position) {
             if (invisible_places::timing::
@@ -51868,8 +51894,25 @@ void DrawTimingKeyLaneGroup(
                 startDistance <= endDistance
                     ? activation.start
                     : activation.end);
+        } else {
+            ImGui::SetTooltip(
+                "Animation position %.4f — click or drag to scrub.",
+                positionForX(mouseX));
         }
     }
+
+    // The shared playhead is independent of authored keys. Keep its black
+    // downward triangle visible between keys as well as on them; Active Range
+    // view pins an out-of-range playhead to the appropriate edge.
+    drawList->AddTriangleFilled(
+        ImVec2{
+            std::max(minimum.x, scrubX - 4.0F),
+            minimum.y + 1.0F},
+        ImVec2{
+            std::min(maximum.x, scrubX + 4.0F),
+            minimum.y + 1.0F},
+        ImVec2{scrubX, centreY - 0.5F},
+        IM_COL32(18, 18, 18, 255));
 
     bool closeEditor = false;
     auto& editor =
@@ -52290,6 +52333,115 @@ const char* TimingColouriseEffectParameterLabel(
     return "Effect Control";
 }
 
+struct TimingColourPhaseSliderResult {
+    bool changed = false;
+    bool requestExactEdit = false;
+    bool active = false;
+};
+
+TimingColourPhaseSliderResult DrawTimingColourPhaseSlider(
+    const char* id,
+    float* turns) {
+    TimingColourPhaseSliderResult result;
+    if (turns == nullptr || !std::isfinite(*turns)) {
+        return result;
+    }
+
+    // Two unwrapped turns in either direction cover the authored motion
+    // studies while exact entry remains available for any finite value.
+    constexpr float kMinimumTurns = -2.0F;
+    constexpr float kMaximumTurns = 2.0F;
+    constexpr float kTurnSpan = kMaximumTurns - kMinimumTurns;
+    constexpr float kRailHeight = 14.0F;
+
+    ImGui::PushID(id);
+    const ImVec2 size{
+        std::max(24.0F, ImGui::GetContentRegionAvail().x),
+        kRailHeight};
+    ImGui::InvisibleButton(
+        "##ColourPhaseTurnsRail",
+        size,
+        ImGuiButtonFlags_MouseButtonLeft);
+    const ImVec2 minimum = ImGui::GetItemRectMin();
+    const ImVec2 maximum = ImGui::GetItemRectMax();
+    const float width = std::max(1.0F, maximum.x - minimum.x);
+    const float centreY = std::midpoint(minimum.y, maximum.y);
+    const auto xForTurns = [&](float value) {
+        return minimum.x +
+               width * std::clamp(
+                           (value - kMinimumTurns) / kTurnSpan,
+                           0.0F,
+                           1.0F);
+    };
+    const auto turnsForX = [&](float x) {
+        return std::lerp(
+            kMinimumTurns,
+            kMaximumTurns,
+            std::clamp((x - minimum.x) / width, 0.0F, 1.0F));
+    };
+
+    const bool hovered = ImGui::IsItemHovered();
+    const bool doubleClicked =
+        hovered &&
+        ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+    result.requestExactEdit = doubleClicked;
+    result.active = ImGui::IsItemActive();
+    if (result.active &&
+        ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
+        !doubleClicked) {
+        const float candidate =
+            turnsForX(ImGui::GetIO().MousePos.x);
+        if (candidate != *turns) {
+            *turns = candidate;
+            result.changed = true;
+        }
+    }
+
+    auto* drawList = ImGui::GetWindowDrawList();
+    const ImU32 railColour =
+        ImGui::GetColorU32(ImGuiCol_Border);
+    const ImU32 mutedTickColour =
+        ImGui::GetColorU32(ImGuiCol_TextDisabled);
+    const ImU32 activeColour = ImGui::GetColorU32(
+        result.active
+            ? ImGuiCol_SliderGrabActive
+            : ImGuiCol_SliderGrab);
+    drawList->AddLine(
+        ImVec2{minimum.x, centreY},
+        ImVec2{maximum.x, centreY},
+        railColour,
+        1.0F);
+    for (int wholeTurn = -2; wholeTurn <= 2; ++wholeTurn) {
+        const float x = xForTurns(static_cast<float>(wholeTurn));
+        const float halfHeight = wholeTurn == 0 ? 4.0F : 2.5F;
+        drawList->AddLine(
+            ImVec2{x, centreY - halfHeight},
+            ImVec2{x, centreY + halfHeight},
+            mutedTickColour,
+            1.0F);
+    }
+    const float zeroX = xForTurns(0.0F);
+    const float valueX = xForTurns(*turns);
+    drawList->AddLine(
+        ImVec2{std::min(zeroX, valueX), centreY},
+        ImVec2{std::max(zeroX, valueX), centreY},
+        activeColour,
+        2.0F);
+    drawList->AddCircleFilled(
+        ImVec2{valueX, centreY},
+        hovered || result.active ? 4.25F : 3.5F,
+        activeColour);
+    drawList->AddCircle(
+        ImVec2{valueX, centreY},
+        hovered || result.active ? 5.25F : 4.5F,
+        ImGui::GetColorU32(ImGuiCol_Border),
+        0,
+        1.0F);
+
+    ImGui::PopID();
+    return result;
+}
+
 // Aspect badge: "C", "E", or "CE" for a combined Visual Feature.
 const char* TimingEffectAspectBadge(
     const invisible_places::timing::TimingColouriseEffect& effect) {
@@ -52454,6 +52606,7 @@ bool DrawTimingColouriseEffectParameterEditor(
         (parameter == TimingColouriseEffectParameter::PalettePhase
              ? " turns"
              : std::string{});
+    bool valueChanged = false;
     const ImVec2 valueSize{
         ImGui::CalcTextSize(valueText.c_str()).x + 8.0F,
         0.0F};
@@ -52471,7 +52624,7 @@ bool DrawTimingColouriseEffectParameterEditor(
     switch (parameter) {
         case TimingColouriseEffectParameter::PalettePhase:
             parameterTooltip =
-                "Shift by unwrapped palette turns. Values such as 0, 1, and 2 preserve continuous forward motion; click to type a value.";
+                "Shift by unwrapped palette turns. Drag the thin rail below for live changes, or click this value to type an exact number. Motion carries through continuing keys and rests only at reversals or flat holds.";
             break;
         case TimingColouriseEffectParameter::AmountOverride:
             parameterTooltip =
@@ -52484,7 +52637,21 @@ bool DrawTimingColouriseEffectParameterEditor(
     }
     DrawTimingControlTooltip(parameterTooltip);
 
-    bool valueChanged = false;
+    if (parameter == TimingColouriseEffectParameter::PalettePhase) {
+        const auto slider = DrawTimingColourPhaseSlider(
+            "##PalettePhaseTurns",
+            &evaluated);
+        valueChanged = slider.changed;
+        if (slider.active) {
+            StopAnimationPlayback(runtimeState);
+        }
+        if (slider.requestExactEdit) {
+            ImGui::OpenPopup("Edit Value");
+        }
+        DrawTimingControlTooltip(
+            "Drag for live Colour Phase changes from -2 to +2 turns. Whole turns are ticked; double-click to type any finite value.");
+    }
+
     if (ImGui::BeginPopup("Edit Value")) {
         if (ImGui::IsWindowAppearing() &&
             parameter != TimingColouriseEffectParameter::EmissiveLevel) {
@@ -52504,12 +52671,14 @@ bool DrawTimingColouriseEffectParameterEditor(
                 "Drag from 0 to 2.5. Double-click the bar to type any non-negative finite value.");
         } else {
             ImGui::SetNextItemWidth(120.0F);
-            valueChanged = ImGui::InputFloat(
-                "##Value",
-                &evaluated,
-                0.01F,
-                0.1F,
-                "%.3f");
+            valueChanged =
+                ImGui::InputFloat(
+                    "##Value",
+                    &evaluated,
+                    0.01F,
+                    0.1F,
+                    "%.3f") ||
+                valueChanged;
             DrawTimingControlTooltip(
                 parameter == TimingColouriseEffectParameter::PalettePhase
                     ? "Enter any finite number of palette turns, including negative values."
@@ -55208,7 +55377,7 @@ void DrawTimingColouriseHistogram(
                 job.failedErrorMessage.c_str());
         } else {
             ImGui::TextDisabled(
-                "Computing exact SAND / ROCK / VEG histogram...");
+                "Computing high-resolution SAND / ROCK / VEG histogram...");
         }
         return;
     }
@@ -55247,37 +55416,75 @@ void DrawTimingColouriseHistogram(
     const auto maximumBin = *maximumBinIterator;
     const float width = maximum.x - minimum.x;
     const float height = maximum.y - minimum.y;
+    // The persistent histogram is deliberately much finer than the graph.
+    // Merge only source bins that occupy less than one screen pixel. A bin
+    // widened by Distribution Spread is therefore drawn independently, while
+    // the long low-density tails remain inexpensive to display.
+    constexpr float kMinimumDisplayBucketWidth = 1.0F;
+    std::uint64_t displayBucketTotal = 0U;
+    std::size_t displayBucketBinCount = 0U;
+    float displayBucketX0 = minimum.x;
+    const auto flushDisplayBucket =
+        [&](float requestedX1) {
+            if (displayBucketBinCount == 0U) {
+                return;
+            }
+            const auto averageCount =
+                displayBucketTotal /
+                static_cast<std::uint64_t>(
+                    displayBucketBinCount);
+            const float amount =
+                invisible_places::timing::
+                    TimingColouriseHistogramDisplayHeight(
+                        averageCount,
+                        minimumBin,
+                        maximumBin);
+            const float x1 = std::min(
+                maximum.x,
+                std::max(
+                    requestedX1,
+                    displayBucketX0 + 1.0F));
+            drawList->AddRectFilled(
+                ImVec2{
+                    displayBucketX0,
+                    maximum.y - amount * height},
+                ImVec2{x1, maximum.y},
+                IM_COL32(118, 156, 184, 210));
+            displayBucketTotal = 0U;
+            displayBucketBinCount = 0U;
+            displayBucketX0 = requestedX1;
+        };
+    float binX0 = minimum.x;
     for (std::size_t index = 0U;
          index < histogram->bins.size();
          ++index) {
-        const float amount =
-            invisible_places::timing::
-                TimingColouriseHistogramDisplayHeight(
-                    histogram->bins[index],
-                    minimumBin,
-                    maximumBin);
-        const float rawX0 = std::lerp(
-            histogram->minimum,
-            histogram->maximum,
-            static_cast<float>(index) /
-                static_cast<float>(
-                    histogram->bins.size()));
         const float rawX1 = std::lerp(
             histogram->minimum,
             histogram->maximum,
             static_cast<float>(index + 1U) /
                 static_cast<float>(
                     histogram->bins.size()));
-        const float x0 =
-            minimum.x + width * axis.RawToUnit(rawX0);
-        const float x1 =
+        const float binX1 =
             minimum.x + width * axis.RawToUnit(rawX1);
-        drawList->AddRectFilled(
-            ImVec2{
-                x0,
-                maximum.y - amount * height},
-            ImVec2{x1 + 1.0F, maximum.y},
-            IM_COL32(118, 156, 184, 210));
+        const float sourceBinWidth = binX1 - binX0;
+        if (displayBucketBinCount > 0U &&
+            sourceBinWidth >= kMinimumDisplayBucketWidth) {
+            flushDisplayBucket(binX0);
+        }
+        if (displayBucketBinCount == 0U) {
+            displayBucketX0 = binX0;
+        }
+        displayBucketTotal += histogram->bins[index];
+        ++displayBucketBinCount;
+        const bool bucketIsVisible =
+            binX1 - displayBucketX0 >=
+            kMinimumDisplayBucketWidth;
+        if (sourceBinWidth >= kMinimumDisplayBucketWidth ||
+            bucketIsVisible ||
+            index + 1U == histogram->bins.size()) {
+            flushDisplayBucket(binX1);
+        }
+        binX0 = binX1;
     }
     drawList->AddRect(
         minimum,
@@ -55416,7 +55623,7 @@ void DrawTimingColouriseHistogram(
             "Drag the centre rail to translate the interval. Drag either rail circle to resize symmetrically.\n"
             "The sideways T handles set signed Fade: inward is positive, outward is negative.\n"} +
         (axis.UsesDistributionSpread()
-             ? "Distribution Spread changes only graph spacing and drag sensitivity; authored values remain raw."
+             ? "Distribution Spread uses the cached high-resolution distribution for graph spacing and drag sensitivity; authored values remain raw."
              : "Histogram heights show the finite full-scene scalar distribution.");
     const bool watermarkHovered = DrawTimingCornerHelpMark(
         drawList,
@@ -57382,7 +57589,7 @@ void DrawTimingColouriseSection(
         ImGui::EndDisabled();
         DrawTimingLabelTooltip(
             spreadAvailable
-                ? "Raw Values uses the scalar's linear range. Distribution Spread uses the cached distribution to give concentrated values more mouse resolution. It changes only this editing graph; Bounds keys, rendering, and export stay in raw scalar units."
+                ? "Raw Values uses the scalar's linear range. Distribution Spread uses the cached 16,384-bin distribution to reveal concentrated detail and give it more mouse resolution. It changes only this editing graph; Bounds keys, rendering, and export stay in raw scalar units."
                 : "The editing axis becomes available when this finite, non-constant histogram is ready.");
         DrawTimingColouriseHistogram(
             runtimeState,

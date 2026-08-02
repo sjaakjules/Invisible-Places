@@ -21,7 +21,7 @@ namespace invisible_places::timing {
 namespace {
 
 constexpr std::array<char, 8> kHistogramCacheMagic{
-    'I', 'P', 'T', 'C', 'H', '0', '0', '1'};
+    'I', 'P', 'T', 'C', 'H', '0', '0', '2'};
 constexpr std::uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
 constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
 constexpr std::size_t kCancellationCheckStride = 4096U;

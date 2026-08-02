@@ -118,7 +118,8 @@ void WriteHistogramPly(
 
 TimingColouriseHistogramFingerprintInput FingerprintFixture() {
     return {
-        .schemaVersion = 3U,
+        .schemaVersion = invisible_places::timing::
+            kTimingColouriseHistogramCacheSchemaVersion,
         .sceneGroupName = "Scene 01",
         .selector =
             TimingColouriseFieldSelector{
@@ -279,17 +280,59 @@ TEST_CASE(
     CHECK(result.histogram.minimum == Catch::Approx(-1.0F));
     CHECK(result.histogram.maximum == Catch::Approx(3.0F));
     CHECK(result.histogram.finiteValueCount == 6U);
+    constexpr auto binCount = invisible_places::timing::
+        kTimingColouriseHistogramBinCount;
     CHECK(result.histogram.bins[0U] == 1U);
-    CHECK(result.histogram.bins[64U] == 1U);
-    CHECK(result.histogram.bins[128U] == 2U);
-    CHECK(result.histogram.bins[192U] == 1U);
-    CHECK(result.histogram.bins[255U] == 1U);
+    CHECK(result.histogram.bins[binCount / 4U] == 1U);
+    CHECK(result.histogram.bins[binCount / 2U] == 2U);
+    CHECK(result.histogram.bins[binCount * 3U / 4U] == 1U);
+    CHECK(result.histogram.bins[binCount - 1U] == 1U);
 
     std::uint64_t total = 0U;
     for (const auto count : result.histogram.bins) {
         total += count;
     }
     CHECK(total == result.histogram.finiteValueCount);
+}
+
+TEST_CASE(
+    "Timing Colourise histogram resolves narrow concentrations inside outliers",
+    "[timing][colourise][histogram][resolution]") {
+    std::vector<float> concentratedValues{-1.0F, 1.0F};
+    for (std::size_t index = 0U; index <= 32U; ++index) {
+        concentratedValues.push_back(
+            std::lerp(
+                -0.001F,
+                0.001F,
+                static_cast<float>(index) / 32.0F));
+    }
+    auto sand = MakeCloud(std::move(concentratedValues));
+    auto rock = MakeCloud({0.0F});
+    auto veg = MakeCloud({0.0F});
+    const invisible_places::timing::TimingColouriseResidentCloudBundle
+        clouds{&sand, &rock, &veg};
+    const auto result =
+        invisible_places::timing::ComputeTimingColouriseHistogram(
+            clouds,
+            TimingColouriseFieldSelector{
+                .source = TimingColouriseFieldSource::Scalar,
+                .scalarFieldName = "Field",
+            });
+
+    REQUIRE(result.success);
+    CHECK(result.histogram.minimum == Catch::Approx(-1.0F));
+    CHECK(result.histogram.maximum == Catch::Approx(1.0F));
+    const auto occupiedBinCount = static_cast<std::size_t>(
+        std::count_if(
+            result.histogram.bins.begin(),
+            result.histogram.bins.end(),
+            [](std::uint64_t count) {
+                return count > 0U;
+            }));
+    // The two outlier bins plus at least sixteen distinct bins across the
+    // narrow central concentration. The former 256-bin cache produced only
+    // one central bucket for this same distribution.
+    CHECK(occupiedBinCount >= 18U);
 }
 
 TEST_CASE(
@@ -356,8 +399,10 @@ TEST_CASE(
             kTimingColouriseHistogramBinCount>
         bins{};
     bins.fill(1U);
-    bins[127U] = 20'000U;
-    bins[128U] = 20'000U;
+    constexpr auto middleBin = invisible_places::timing::
+        kTimingColouriseHistogramBinCount / 2U;
+    bins[middleBin - 1U] = 20'000U;
+    bins[middleBin] = 20'000U;
     const auto histogram =
         MakeHistogram(-1.0F, 1.0F, bins);
     const auto axis =
@@ -446,8 +491,10 @@ TEST_CASE(
             kTimingColouriseHistogramBinCount>
         bins{};
     bins.fill(1U);
-    bins[127U] = 50'000U;
-    bins[128U] = 50'000U;
+    constexpr auto middleBin = invisible_places::timing::
+        kTimingColouriseHistogramBinCount / 2U;
+    bins[middleBin - 1U] = 50'000U;
+    bins[middleBin] = 50'000U;
     const auto histogram =
         MakeHistogram(-1.0F, 1.0F, bins);
     const auto rawAxis =
@@ -469,8 +516,8 @@ TEST_CASE(
                         invisible_places::timing::
                             kTimingColouriseHistogramBinCount));
         };
-    const float lower = rawBinEdge(127U);
-    const float upper = rawBinEdge(128U);
+    const float lower = rawBinEdge(middleBin - 1U);
+    const float upper = rawBinEdge(middleBin);
     const float rawWidth =
         rawAxis.RawToUnit(upper) -
         rawAxis.RawToUnit(lower);
@@ -499,13 +546,19 @@ TEST_CASE(
     // while the positive lobe has a much larger robust extent. The extent
     // imbalance should present as one 0..1 distribution rather than assigning
     // half the mouse width to each side of raw zero.
-    for (std::size_t index = 0U; index < 12U; ++index) {
+    constexpr auto binCount = invisible_places::timing::
+        kTimingColouriseHistogramBinCount;
+    constexpr auto denseEnd = binCount * 12U / 256U;
+    constexpr auto shoulderEnd = binCount / 2U;
+    for (std::size_t index = 0U; index < denseEnd; ++index) {
         bins[index] = 600U;
     }
-    for (std::size_t index = 12U; index < 128U; ++index) {
+    for (std::size_t index = denseEnd;
+         index < shoulderEnd;
+         ++index) {
         bins[index] = 24U;
     }
-    bins[255U] = 16U;
+    bins.back() = 16U;
     const auto histogram =
         MakeHistogram(-0.05F, 1.0F, bins);
     const auto axis =
@@ -998,8 +1051,8 @@ TEST_CASE(
         .finiteValueCount = 5U,
     };
     histogram.bins[0U] = 2U;
-    histogram.bins[127U] = 1U;
-    histogram.bins[255U] = 2U;
+    histogram.bins[histogram.bins.size() / 2U] = 1U;
+    histogram.bins.back() = 2U;
     std::string error;
     REQUIRE(
         invisible_places::timing::
