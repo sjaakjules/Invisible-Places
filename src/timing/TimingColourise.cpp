@@ -109,15 +109,6 @@ bool IsValidAmountOverrideMode(
     return false;
 }
 
-bool IsValidEffectKind(TimingEffectKind kind) {
-    switch (kind) {
-        case TimingEffectKind::Colourise:
-        case TimingEffectKind::Emissive:
-            return true;
-    }
-    return false;
-}
-
 bool IsValidEffectParameter(
     TimingColouriseEffectParameter parameter) {
     switch (parameter) {
@@ -1329,22 +1320,29 @@ bool SetTimingColouriseBoundsKeyMode(
 }
 
 bool TimingEffectParameterIsSupported(
-    TimingEffectKind kind,
+    bool colouriseEnabled,
+    bool emissiveEnabled,
     TimingColouriseEffectParameter parameter) {
-    if (!IsValidEffectKind(kind) || !IsValidEffectParameter(parameter)) {
+    if (!IsValidEffectParameter(parameter)) {
         return false;
     }
-    switch (kind) {
-        case TimingEffectKind::Colourise:
-            return parameter ==
-                       TimingColouriseEffectParameter::PalettePhase ||
-                   parameter ==
-                       TimingColouriseEffectParameter::AmountOverride;
-        case TimingEffectKind::Emissive:
-            return parameter ==
-                   TimingColouriseEffectParameter::EmissiveLevel;
+    switch (parameter) {
+        case TimingColouriseEffectParameter::PalettePhase:
+        case TimingColouriseEffectParameter::AmountOverride:
+            return colouriseEnabled;
+        case TimingColouriseEffectParameter::EmissiveLevel:
+            return emissiveEnabled;
     }
     return false;
+}
+
+bool TimingEffectParameterIsSupported(
+    const TimingColouriseEffect& effect,
+    TimingColouriseEffectParameter parameter) {
+    return TimingEffectParameterIsSupported(
+        effect.colouriseEnabled,
+        effect.emissiveEnabled,
+        parameter);
 }
 
 TimingColouriseActivationRange
@@ -1379,7 +1377,8 @@ bool TimingColouriseActivationRangeContains(
 bool TimingColouriseEffectIsActiveAt(
     const TimingColouriseEffect& effect,
     float normalizedPosition) {
-    return effect.enabled && IsValidEffectKind(effect.kind) &&
+    return effect.enabled &&
+           (effect.colouriseEnabled || effect.emissiveEnabled) &&
            TimingColouriseActivationRangeContains(
                effect.activationRange,
                normalizedPosition);
@@ -1387,20 +1386,26 @@ bool TimingColouriseEffectIsActiveAt(
 
 TimingColouriseEffect SanitizeTimingColouriseEffect(
     TimingColouriseEffect effect) {
-    if (!IsValidEffectKind(effect.kind)) {
-        effect.kind = TimingEffectKind::Colourise;
+    if (!effect.colouriseEnabled && !effect.emissiveEnabled) {
+        effect.colouriseEnabled = true;
     }
     if (effect.name.empty()) {
-        effect.name = effect.kind == TimingEffectKind::Emissive
-                          ? "Emissive"
-                          : "Colourise";
+        effect.name = "Visual Feature";
     }
     effect.activationRange = SanitizeTimingColouriseActivationRange(
         effect.activationRange);
-    if (effect.kind == TimingEffectKind::Emissive &&
+    if (effect.emissiveEnabled &&
         effect.field.source != TimingColouriseFieldSource::Scalar) {
-        effect.field.source = TimingColouriseFieldSource::Scalar;
-        effect.field.scalarFieldName.clear();
+        if (effect.colouriseEnabled) {
+            // Colourise legitimately reads normal sources; the emissive
+            // aspect simply cannot follow it there.
+            effect.emissiveEnabled = false;
+        } else {
+            // A pure emissive feature keeps the legacy behaviour of being
+            // forced back onto a scalar source.
+            effect.field.source = TimingColouriseFieldSource::Scalar;
+            effect.field.scalarFieldName.clear();
+        }
     }
     if (effect.field.source != TimingColouriseFieldSource::Scalar) {
         effect.field.scalarFieldName.clear();
@@ -1575,6 +1580,48 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
         &effect.effectParameterKeys);
     SortAndCoalesceKeys(&effect.boundsKeys);
     SortAndCoalesceBoundsParameterKeys(&effect.boundsParameterKeys);
+    std::vector<TimingColouriseFieldBoundsMemory> fieldBoundsMemory;
+    fieldBoundsMemory.reserve(effect.fieldBoundsMemory.size());
+    for (auto& memory : effect.fieldBoundsMemory) {
+        if (memory.selector.source ==
+                TimingColouriseFieldSource::Scalar &&
+            memory.selector.scalarFieldName.empty()) {
+            continue;
+        }
+        const bool duplicate = std::any_of(
+            fieldBoundsMemory.begin(),
+            fieldBoundsMemory.end(),
+            [&](const TimingColouriseFieldBoundsMemory& kept) {
+                return kept.selector == memory.selector;
+            });
+        if (duplicate) {
+            continue;
+        }
+        memory.bounds = SanitizeTimingColouriseBounds(memory.bounds);
+        if (!IsValidBoundsKeyMode(memory.boundsKeyMode)) {
+            memory.boundsKeyMode =
+                TimingColouriseBoundsKeyMode::LowerUpper;
+        }
+        std::erase_if(
+            memory.boundsParameterKeys,
+            [&](const TimingColouriseBoundsParameterKey& key) {
+                return !IsValidBoundsParameter(key.parameter) ||
+                       !TimingColouriseBoundsParameterIsAllowed(
+                           memory.boundsKeyMode,
+                           key.parameter);
+            });
+        for (auto& key : memory.boundsParameterKeys) {
+            key.position = Clamp01(key.position);
+            key.value =
+                SanitizeBoundsParameterValue(key.parameter, key.value);
+            key.interpolation = invisible_places::water::
+                WaterScenarioInterpolation::Smooth;
+        }
+        SortAndCoalesceKeys(&memory.boundsKeys);
+        SortAndCoalesceBoundsParameterKeys(&memory.boundsParameterKeys);
+        fieldBoundsMemory.push_back(std::move(memory));
+    }
+    effect.fieldBoundsMemory = std::move(fieldBoundsMemory);
     return effect;
 }
 
@@ -1780,6 +1827,314 @@ TimingTakeSceneState SanitizeTimingTakeSceneState(
     return state;
 }
 
+void StashTimingColouriseFieldBounds(TimingColouriseEffect* effect) {
+    if (effect == nullptr) {
+        return;
+    }
+    auto entry = std::find_if(
+        effect->fieldBoundsMemory.begin(),
+        effect->fieldBoundsMemory.end(),
+        [&](const TimingColouriseFieldBoundsMemory& memory) {
+            return memory.selector == effect->field;
+        });
+    if (entry == effect->fieldBoundsMemory.end()) {
+        effect->fieldBoundsMemory.emplace_back();
+        entry = std::prev(effect->fieldBoundsMemory.end());
+        entry->selector = effect->field;
+    }
+    entry->bounds = effect->baseBounds;
+    entry->boundsKeyMode = effect->boundsKeyMode;
+    entry->boundsParameterKeys = effect->boundsParameterKeys;
+    entry->boundsKeys = effect->boundsKeys;
+    entry->edited = effect->boundsEdited;
+    entry->adoptedGlobalRevision = effect->boundsAdoptedGlobalRevision;
+}
+
+void ApplyTimingColouriseFieldSelection(
+    TimingColouriseEffect* effect,
+    const TimingColouriseFieldSelector& selector,
+    const TimingColouriseBounds& fallbackBounds,
+    const TimingScalarBoundsStore* globalStore) {
+    if (effect == nullptr || effect->field == selector) {
+        return;
+    }
+    StashTimingColouriseFieldBounds(effect);
+    effect->field = selector;
+    const auto entry = std::find_if(
+        effect->fieldBoundsMemory.begin(),
+        effect->fieldBoundsMemory.end(),
+        [&](const TimingColouriseFieldBoundsMemory& memory) {
+            return memory.selector == selector;
+        });
+    if (entry != effect->fieldBoundsMemory.end()) {
+        effect->baseBounds = entry->bounds;
+        effect->boundsKeyMode = entry->boundsKeyMode;
+        effect->boundsParameterKeys = entry->boundsParameterKeys;
+        effect->boundsKeys = entry->boundsKeys;
+        effect->boundsEdited = entry->edited;
+        effect->boundsAdoptedGlobalRevision =
+            entry->adoptedGlobalRevision;
+    } else {
+        effect->baseBounds =
+            globalStore != nullptr && globalStore->revision > 0U
+                ? globalStore->globalBounds
+                : fallbackBounds;
+        effect->boundsKeyMode = TimingColouriseBoundsKeyMode::LowerUpper;
+        effect->boundsParameterKeys.clear();
+        effect->boundsKeys.clear();
+        effect->boundsEdited = false;
+        effect->boundsAdoptedGlobalRevision =
+            globalStore != nullptr ? globalStore->revision : 0U;
+    }
+    if (!effect->boundsEdited && globalStore != nullptr &&
+        globalStore->revision > effect->boundsAdoptedGlobalRevision) {
+        effect->baseBounds = globalStore->globalBounds;
+        effect->boundsAdoptedGlobalRevision = globalStore->revision;
+    }
+    *effect = SanitizeTimingColouriseEffect(std::move(*effect));
+}
+
+TimingScalarBoundsStore* FindTimingScalarBoundsStore(
+    std::vector<TimingScalarBoundsStore>* stores,
+    const TimingColouriseFieldSelector& selector) {
+    if (stores == nullptr) {
+        return nullptr;
+    }
+    const auto store = std::find_if(
+        stores->begin(),
+        stores->end(),
+        [&](const TimingScalarBoundsStore& candidate) {
+            return candidate.selector == selector;
+        });
+    return store != stores->end() ? &*store : nullptr;
+}
+
+const TimingScalarBoundsStore* FindTimingScalarBoundsStore(
+    const std::vector<TimingScalarBoundsStore>& stores,
+    const TimingColouriseFieldSelector& selector) {
+    const auto store = std::find_if(
+        stores.begin(),
+        stores.end(),
+        [&](const TimingScalarBoundsStore& candidate) {
+            return candidate.selector == selector;
+        });
+    return store != stores.end() ? &*store : nullptr;
+}
+
+void RecordTimingScalarBoundsEdit(
+    std::vector<TimingScalarBoundsStore>* stores,
+    TimingColouriseEffect* effect) {
+    if (effect == nullptr) {
+        return;
+    }
+    effect->boundsEdited = true;
+    if (stores == nullptr) {
+        return;
+    }
+    auto* store = FindTimingScalarBoundsStore(stores, effect->field);
+    if (store == nullptr) {
+        stores->emplace_back();
+        store = &stores->back();
+        store->selector = effect->field;
+    }
+    store->globalBounds = SanitizeTimingColouriseBounds(effect->baseBounds);
+    ++store->revision;
+    effect->boundsAdoptedGlobalRevision = store->revision;
+}
+
+bool RefreshTimingColouriseBoundsFromGlobal(
+    TimingColouriseEffect* effect,
+    const std::vector<TimingScalarBoundsStore>& stores) {
+    if (effect == nullptr || effect->boundsEdited) {
+        return false;
+    }
+    const auto* store = FindTimingScalarBoundsStore(stores, effect->field);
+    if (store == nullptr ||
+        store->revision <= effect->boundsAdoptedGlobalRevision) {
+        return false;
+    }
+    effect->baseBounds = store->globalBounds;
+    effect->boundsAdoptedGlobalRevision = store->revision;
+    return true;
+}
+
+std::size_t MergeLegacyTimingEffectAspects(
+    std::vector<TimingColouriseEffect>* effects,
+    const std::vector<bool>* mergeEligible,
+    std::size_t rendererSlotCapacity) {
+    if (effects == nullptr || effects->size() < 2U) {
+        return 0U;
+    }
+    // Local copy kept in lockstep with erasures so eligibility stays
+    // aligned with shifting indices.
+    std::vector<bool> eligibility;
+    if (mergeEligible != nullptr) {
+        eligibility = *mergeEligible;
+        eligibility.resize(effects->size(), false);
+    }
+    const auto eligible = [&](std::size_t index) {
+        return eligibility.empty() || eligibility[index];
+    };
+    const auto rangesMatch = [](const TimingColouriseActivationRange& a,
+                                const TimingColouriseActivationRange& b) {
+        // Exact equality: authored duplicates serialize identically, and a
+        // merged object with one window cannot reproduce even a sliver of
+        // activation difference.
+        const auto left = SanitizeTimingColouriseActivationRange(a);
+        const auto right = SanitizeTimingColouriseActivationRange(b);
+        return left.start == right.start && left.end == right.end;
+    };
+    const auto boundsParameterKeysMatch =
+        [](const std::vector<TimingColouriseBoundsParameterKey>& a,
+           const std::vector<TimingColouriseBoundsParameterKey>& b) {
+            return a.size() == b.size() &&
+                   std::equal(
+                       a.begin(),
+                       a.end(),
+                       b.begin(),
+                       [](const TimingColouriseBoundsParameterKey& x,
+                          const TimingColouriseBoundsParameterKey& y) {
+                           return x.parameter == y.parameter &&
+                                  x.position == y.position &&
+                                  x.value == y.value &&
+                                  x.interpolation == y.interpolation;
+                       });
+        };
+    const auto boundsKeysMatch =
+        [](const std::vector<TimingColouriseBoundsKey>& a,
+           const std::vector<TimingColouriseBoundsKey>& b) {
+            return a.size() == b.size() &&
+                   std::equal(
+                       a.begin(),
+                       a.end(),
+                       b.begin(),
+                       [](const TimingColouriseBoundsKey& x,
+                          const TimingColouriseBoundsKey& y) {
+                           return x.position == y.position &&
+                                  x.bounds.lower == y.bounds.lower &&
+                                  x.bounds.upper == y.bounds.upper &&
+                                  x.bounds.edgeFade == y.bounds.edgeFade &&
+                                  x.interpolation == y.interpolation;
+                       });
+        };
+    // Bounds gate and select the emissive contribution exactly as they do
+    // colourise, so a pair only evaluates identically when its complete
+    // bounds authoring matches; a single merged object carries one bounds.
+    const auto boundsAuthoringMatches =
+        [&](const TimingColouriseEffect& a,
+            const TimingColouriseEffect& b) {
+            return a.baseBounds.lower == b.baseBounds.lower &&
+                   a.baseBounds.upper == b.baseBounds.upper &&
+                   a.baseBounds.edgeFade == b.baseBounds.edgeFade &&
+                   a.boundsKeyMode == b.boundsKeyMode &&
+                   boundsParameterKeysMatch(
+                       a.boundsParameterKeys,
+                       b.boundsParameterKeys) &&
+                   boundsKeysMatch(a.boundsKeys, b.boundsKeys);
+        };
+    // With more slots concurrently active than the renderer retains, the
+    // topmost-first cap selection depends on list positions, and merging
+    // moves the emissive slot to its partner's position — only merge where
+    // the cap provably never engages inside the pair's window.
+    const auto concurrencyWithinCapacity =
+        [&](const TimingColouriseActivationRange& window) {
+            std::vector<float> samples{window.start, window.end};
+            for (const auto& effect : *effects) {
+                const auto range = SanitizeTimingColouriseActivationRange(
+                    effect.activationRange);
+                for (const float boundary : {range.start, range.end}) {
+                    if (boundary >= window.start &&
+                        boundary <= window.end) {
+                        samples.push_back(boundary);
+                    }
+                }
+            }
+            for (const float sample : samples) {
+                std::size_t slots = 0U;
+                for (const auto& effect : *effects) {
+                    if (TimingColouriseEffectIsActiveAt(effect, sample)) {
+                        slots +=
+                            (effect.colouriseEnabled ? 1U : 0U) +
+                            (effect.emissiveEnabled ? 1U : 0U);
+                    }
+                }
+                if (slots > rendererSlotCapacity) {
+                    return false;
+                }
+            }
+            return true;
+        };
+    std::size_t merged = 0U;
+    for (std::size_t index = 0U; index < effects->size(); ++index) {
+        if (!eligible(index) ||
+            !(*effects)[index].enabled ||
+            !(*effects)[index].colouriseEnabled ||
+            (*effects)[index].emissiveEnabled) {
+            continue;
+        }
+        std::size_t partnerIndex = effects->size();
+        for (std::size_t candidate = 0U; candidate < effects->size();
+             ++candidate) {
+            if (candidate == index || !eligible(candidate)) {
+                continue;
+            }
+            const auto& other = (*effects)[candidate];
+            if (other.emissiveEnabled && !other.colouriseEnabled &&
+                other.enabled && (*effects)[index].enabled &&
+                other.field == (*effects)[index].field &&
+                rangesMatch(
+                    other.activationRange,
+                    (*effects)[index].activationRange) &&
+                boundsAuthoringMatches(other, (*effects)[index])) {
+                partnerIndex = candidate;
+                break;
+            }
+        }
+        if (partnerIndex >= effects->size() ||
+            !concurrencyWithinCapacity(
+                SanitizeTimingColouriseActivationRange(
+                    (*effects)[index].activationRange))) {
+            continue;
+        }
+        // The colourise object absorbs the emissive aspect. The partner's
+        // dormant colourise-side data (palette, phase/amount keys) never
+        // contributed to rendering and is dropped with it; its bounds are
+        // identical to the target's by the gate above. The target's own
+        // emissive-level keys were provably dormant while it was
+        // colourise-only, so the partner's authored track replaces them.
+        auto& target = (*effects)[index];
+        const auto& partner = (*effects)[partnerIndex];
+        target.emissiveEnabled = true;
+        target.emissiveLevel = partner.emissiveLevel;
+        std::erase_if(
+            target.effectParameterKeys,
+            [](const TimingColouriseEffectParameterKey& key) {
+                return key.parameter ==
+                       TimingColouriseEffectParameter::EmissiveLevel;
+            });
+        for (const auto& key : partner.effectParameterKeys) {
+            if (key.parameter ==
+                TimingColouriseEffectParameter::EmissiveLevel) {
+                target.effectParameterKeys.push_back(key);
+            }
+        }
+        target = SanitizeTimingColouriseEffect(std::move(target));
+        effects->erase(
+            effects->begin() +
+            static_cast<std::ptrdiff_t>(partnerIndex));
+        if (!eligibility.empty()) {
+            eligibility.erase(
+                eligibility.begin() +
+                static_cast<std::ptrdiff_t>(partnerIndex));
+        }
+        if (partnerIndex < index) {
+            --index;
+        }
+        ++merged;
+    }
+    return merged;
+}
+
 bool MoveTimingColouriseEffect(
     std::vector<TimingColouriseEffect>* effects,
     std::size_t fromIndex,
@@ -1865,7 +2220,7 @@ float EvaluateTimingColouriseEffectParameter(
     float normalizedPosition) {
     const auto sanitized = SanitizeTimingColouriseEffect(effect);
     if (!TimingEffectParameterIsSupported(
-            sanitized.kind,
+            sanitized,
             parameter)) {
         return 0.0F;
     }
@@ -2334,7 +2689,7 @@ bool AddOrUpdateTimingColouriseEffectParameterKey(
     float value,
     invisible_places::water::WaterScenarioInterpolation /*interpolation*/) {
     if (effect == nullptr ||
-        !TimingEffectParameterIsSupported(effect->kind, parameter) ||
+        !TimingEffectParameterIsSupported(*effect, parameter) ||
         !std::isfinite(position) || !std::isfinite(value)) {
         return false;
     }
@@ -2633,7 +2988,7 @@ bool MoveTimingColouriseEffectParameterKey(
     float sourcePosition,
     float destinationPosition) {
     if (effect == nullptr ||
-        !TimingEffectParameterIsSupported(effect->kind, parameter) ||
+        !TimingEffectParameterIsSupported(*effect, parameter) ||
         !std::isfinite(destinationPosition) ||
         destinationPosition < 0.0F || destinationPosition > 1.0F) {
         return false;
@@ -2680,7 +3035,7 @@ bool CanMoveTimingColouriseEffectParameterKeysAtPosition(
         effect.effectParameterKeys.end(),
         [&](const TimingColouriseEffectParameterKey& key) {
             return TimingEffectParameterIsSupported(
-                       effect.kind,
+                       effect,
                        key.parameter) &&
                    std::abs(key.position - sourcePosition) <=
                        kTimingColouriseKeyTolerance;
@@ -2694,7 +3049,7 @@ bool CanMoveTimingColouriseEffectParameterKeysAtPosition(
     }
     for (const auto& source : effect.effectParameterKeys) {
         if (!TimingEffectParameterIsSupported(
-                effect.kind,
+                effect,
                 source.parameter) ||
             std::abs(source.position - sourcePosition) >
                 kTimingColouriseKeyTolerance) {
@@ -2730,7 +3085,7 @@ bool MoveTimingColouriseEffectParameterKeys(
     }
     for (auto& key : effect->effectParameterKeys) {
         if (TimingEffectParameterIsSupported(
-                effect->kind,
+                *effect,
                 key.parameter) &&
             std::abs(key.position - sourcePosition) <=
                 kTimingColouriseKeyTolerance) {
@@ -2808,7 +3163,7 @@ std::size_t TimingColouriseEffectParameterKeyCountAtPosition(
     const TimingColouriseEffect& effect,
     TimingColouriseEffectParameter parameter,
     float position) {
-    if (!TimingEffectParameterIsSupported(effect.kind, parameter) ||
+    if (!TimingEffectParameterIsSupported(effect, parameter) ||
         !std::isfinite(position)) {
         return 0U;
     }
@@ -2833,7 +3188,7 @@ std::size_t TimingColouriseEffectParameterUnionKeyCountAtPosition(
         effect.effectParameterKeys.end(),
         [&](const TimingColouriseEffectParameterKey& key) {
             return TimingEffectParameterIsSupported(
-                       effect.kind,
+                       effect,
                        key.parameter) &&
                    std::abs(key.position - position) <=
                        kTimingColouriseKeyTolerance;
@@ -2858,7 +3213,7 @@ std::size_t TimingColouriseEffectKeyCountAtPosition(
     const TimingColouriseEffect& effect,
     float position) {
     const auto paletteKeyCount =
-        effect.kind == TimingEffectKind::Colourise
+        effect.colouriseEnabled
             ? TimingColourisePaletteKeyCountAtPosition(effect, position)
             : 0U;
     return paletteKeyCount +
@@ -2967,7 +3322,7 @@ std::size_t RemoveTimingColouriseEffectParameterKeysAtPosition(
     TimingColouriseEffectParameter parameter,
     float position) {
     if (effect == nullptr ||
-        !TimingEffectParameterIsSupported(effect->kind, parameter) ||
+        !TimingEffectParameterIsSupported(*effect, parameter) ||
         !std::isfinite(position)) {
         return 0U;
     }
@@ -2996,7 +3351,7 @@ std::size_t RemoveTimingColouriseEffectParameterKeysAtPosition(
         effect->effectParameterKeys,
         [&](const TimingColouriseEffectParameterKey& key) {
             return TimingEffectParameterIsSupported(
-                       effect->kind,
+                       *effect,
                        key.parameter) &&
                    std::abs(key.position - position) <=
                        kTimingColouriseKeyTolerance;
@@ -3008,7 +3363,7 @@ std::size_t RemoveTimingColouriseEffectKeysAtPosition(
     TimingColouriseEffect* effect,
     float position) {
     const auto removedPaletteKeys =
-        effect != nullptr && effect->kind == TimingEffectKind::Colourise
+        effect != nullptr && effect->colouriseEnabled
             ? RemoveTimingColourisePaletteKeysAtPosition(effect, position)
             : 0U;
     return removedPaletteKeys +
@@ -3222,7 +3577,7 @@ PreviousTimingColouriseEffectParameterKeyPosition(
     const TimingColouriseEffect& effect,
     TimingColouriseEffectParameter parameter,
     float position) {
-    if (!TimingEffectParameterIsSupported(effect.kind, parameter) ||
+    if (!TimingEffectParameterIsSupported(effect, parameter) ||
         !std::isfinite(position)) {
         return std::nullopt;
     }
@@ -3242,7 +3597,7 @@ NextTimingColouriseEffectParameterKeyPosition(
     const TimingColouriseEffect& effect,
     TimingColouriseEffectParameter parameter,
     float position) {
-    if (!TimingEffectParameterIsSupported(effect.kind, parameter) ||
+    if (!TimingEffectParameterIsSupported(effect, parameter) ||
         !std::isfinite(position)) {
         return std::nullopt;
     }
@@ -3261,7 +3616,7 @@ std::vector<float> TimingColouriseEffectParameterKeyPositions(
     const TimingColouriseEffect& effect,
     TimingColouriseEffectParameter parameter) {
     std::vector<float> result;
-    if (!TimingEffectParameterIsSupported(effect.kind, parameter)) {
+    if (!TimingEffectParameterIsSupported(effect, parameter)) {
         return result;
     }
     for (const auto& key : effect.effectParameterKeys) {
@@ -3279,7 +3634,7 @@ std::vector<float> TimingColouriseEffectParameterKeyPositions(
     result.reserve(effect.effectParameterKeys.size());
     for (const auto& key : effect.effectParameterKeys) {
         if (TimingEffectParameterIsSupported(
-                effect.kind,
+                effect,
                 key.parameter)) {
             result.push_back(key.position);
         }
@@ -3307,7 +3662,7 @@ PreviousTimingColouriseAnyEffectParameterKeyPosition(
     std::optional<float> best;
     for (const auto& key : effect.effectParameterKeys) {
         if (TimingEffectParameterIsSupported(
-                effect.kind,
+                effect,
                 key.parameter) &&
             key.position < position - kTimingColouriseKeyTolerance &&
             (!best.has_value() || key.position > *best)) {
@@ -3327,7 +3682,7 @@ NextTimingColouriseAnyEffectParameterKeyPosition(
     std::optional<float> best;
     for (const auto& key : effect.effectParameterKeys) {
         if (TimingEffectParameterIsSupported(
-                effect.kind,
+                effect,
                 key.parameter) &&
             key.position > position + kTimingColouriseKeyTolerance &&
             (!best.has_value() || key.position < *best)) {
@@ -3340,7 +3695,7 @@ NextTimingColouriseAnyEffectParameterKeyPosition(
 std::optional<float> PreviousTimingColouriseEffectKeyPosition(
     const TimingColouriseEffect& effect,
     float position) {
-    const auto palette = effect.kind == TimingEffectKind::Colourise
+    const auto palette = effect.colouriseEnabled
                              ? PreviousTimingColourisePaletteKeyPosition(
                                    effect,
                                    position)
@@ -3366,7 +3721,7 @@ std::optional<float> PreviousTimingColouriseEffectKeyPosition(
 std::optional<float> NextTimingColouriseEffectKeyPosition(
     const TimingColouriseEffect& effect,
     float position) {
-    const auto palette = effect.kind == TimingEffectKind::Colourise
+    const auto palette = effect.colouriseEnabled
                              ? NextTimingColourisePaletteKeyPosition(
                                    effect,
                                    position)

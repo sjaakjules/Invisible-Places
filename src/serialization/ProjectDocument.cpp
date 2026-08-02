@@ -4069,6 +4069,90 @@ ParseTimingColouriseBoundsParameter(const json& parameterJson) {
     return std::nullopt;
 }
 
+json SerializeTimingColouriseBoundsParameterKeys(
+    const std::vector<
+        invisible_places::timing::TimingColouriseBoundsParameterKey>&
+        keys) {
+    json keysJson = json::array();
+    for (const auto& key : keys) {
+        keysJson.push_back({
+            {"parameter",
+             TimingColouriseBoundsParameterName(key.parameter)},
+            {"position", key.position},
+            {"value", key.value},
+            {"interpolation",
+             WaterScenarioInterpolationName(key.interpolation)},
+        });
+    }
+    return keysJson;
+}
+
+std::vector<invisible_places::timing::TimingColouriseBoundsParameterKey>
+ParseTimingColouriseBoundsParameterKeys(const json& keysJson) {
+    std::vector<
+        invisible_places::timing::TimingColouriseBoundsParameterKey>
+        keys;
+    if (!keysJson.is_array()) {
+        return keys;
+    }
+    for (const auto& keyJson : keysJson) {
+        const auto parameter = keyJson.contains("parameter")
+                                   ? ParseTimingColouriseBoundsParameter(
+                                         keyJson.at("parameter"))
+                                   : std::nullopt;
+        if (!parameter.has_value()) {
+            continue;
+        }
+        invisible_places::timing::TimingColouriseBoundsParameterKey key;
+        key.parameter = parameter.value();
+        key.position = keyJson.value("position", key.position);
+        key.value = keyJson.value("value", key.value);
+        if (keyJson.contains("interpolation")) {
+            key.interpolation = ParseWaterScenarioInterpolation(
+                keyJson.at("interpolation"));
+        }
+        keys.push_back(std::move(key));
+    }
+    return keys;
+}
+
+json SerializeTimingColouriseBoundsKeys(
+    const std::vector<
+        invisible_places::timing::TimingColouriseBoundsKey>& keys) {
+    json keysJson = json::array();
+    for (const auto& key : keys) {
+        keysJson.push_back({
+            {"position", key.position},
+            {"bounds", SerializeTimingColouriseBounds(key.bounds)},
+            {"interpolation",
+             WaterScenarioInterpolationName(key.interpolation)},
+        });
+    }
+    return keysJson;
+}
+
+std::vector<invisible_places::timing::TimingColouriseBoundsKey>
+ParseTimingColouriseBoundsKeys(const json& keysJson) {
+    std::vector<invisible_places::timing::TimingColouriseBoundsKey> keys;
+    if (!keysJson.is_array()) {
+        return keys;
+    }
+    for (const auto& keyJson : keysJson) {
+        invisible_places::timing::TimingColouriseBoundsKey key;
+        key.position = keyJson.value("position", key.position);
+        if (keyJson.contains("interpolation")) {
+            key.interpolation = ParseWaterScenarioInterpolation(
+                keyJson.at("interpolation"));
+        }
+        if (keyJson.contains("bounds")) {
+            key.bounds =
+                ParseTimingColouriseBounds(keyJson.at("bounds"));
+        }
+        keys.push_back(std::move(key));
+    }
+    return keys;
+}
+
 json SerializeTimingColouriseEffect(
     const invisible_places::timing::TimingColouriseEffect& effect) {
     const auto sanitized =
@@ -4137,7 +4221,16 @@ json SerializeTimingColouriseEffect(
     return {
         {"id", sanitized.id},
         {"name", sanitized.name},
-        {"kind", TimingEffectKindName(sanitized.kind)},
+        // The legacy kind is still written so pre-Visual-Feature readers can
+        // open newer documents; a combined feature degrades to colourise for
+        // them. Readers of this document prefer the aspect flags below.
+        {"kind",
+         TimingEffectKindName(
+             sanitized.emissiveEnabled && !sanitized.colouriseEnabled
+                 ? invisible_places::timing::TimingEffectKind::Emissive
+                 : invisible_places::timing::TimingEffectKind::Colourise)},
+        {"colourise_enabled", sanitized.colouriseEnabled},
+        {"emissive_enabled", sanitized.emissiveEnabled},
         {"enabled", sanitized.enabled},
         {"activation_range",
          {
@@ -4184,6 +4277,40 @@ json SerializeTimingColouriseEffect(
          TimingColouriseBoundsKeyModeName(sanitized.boundsKeyMode)},
         {"bounds_parameter_keys", std::move(boundsParameterKeysJson)},
         {"bounds_keys", std::move(boundsKeysJson)},
+        {"bounds_edited", sanitized.boundsEdited},
+        {"bounds_adopted_global_revision",
+         sanitized.boundsAdoptedGlobalRevision},
+        {"field_bounds_memory",
+         [&] {
+             json memoryJson = json::array();
+             for (const auto& memory : sanitized.fieldBoundsMemory) {
+                 memoryJson.push_back({
+                     {"field",
+                      {
+                          {"source",
+                           TimingColouriseFieldSourceName(
+                               memory.selector.source)},
+                          {"scalar_field_name",
+                           memory.selector.scalarFieldName},
+                      }},
+                     {"bounds",
+                      SerializeTimingColouriseBounds(memory.bounds)},
+                     {"bounds_key_mode",
+                      TimingColouriseBoundsKeyModeName(
+                          memory.boundsKeyMode)},
+                     {"bounds_parameter_keys",
+                      SerializeTimingColouriseBoundsParameterKeys(
+                          memory.boundsParameterKeys)},
+                     {"bounds_keys",
+                      SerializeTimingColouriseBoundsKeys(
+                          memory.boundsKeys)},
+                     {"edited", memory.edited},
+                     {"adopted_global_revision",
+                      memory.adoptedGlobalRevision},
+                 });
+             }
+             return memoryJson;
+         }()},
     };
 }
 
@@ -4195,15 +4322,26 @@ ParseTimingColouriseEffect(
         return std::nullopt;
     }
     invisible_places::timing::TimingColouriseEffect effect;
-    if (parseKind && effectJson.contains("kind")) {
+    const bool hasAspectFlags =
+        effectJson.contains("colourise_enabled") ||
+        effectJson.contains("emissive_enabled");
+    if (hasAspectFlags) {
+        effect.colouriseEnabled =
+            effectJson.value("colourise_enabled", true);
+        effect.emissiveEnabled =
+            effectJson.value("emissive_enabled", false);
+    } else if (parseKind && effectJson.contains("kind")) {
         const auto kind = ParseTimingEffectKind(effectJson.at("kind"));
         if (!kind.has_value()) {
             return std::nullopt;
         }
-        effect.kind = *kind;
-    } else {
-        effect.kind =
+        effect.colouriseEnabled =
+            *kind ==
             invisible_places::timing::TimingEffectKind::Colourise;
+        effect.emissiveEnabled = !effect.colouriseEnabled;
+    } else {
+        effect.colouriseEnabled = true;
+        effect.emissiveEnabled = false;
     }
     effect.id = effectJson.value("id", std::string{});
     effect.name = effectJson.value("name", effect.name);
@@ -4454,6 +4592,54 @@ ParseTimingColouriseEffect(
             effect.boundsKeys.push_back(std::move(key));
         }
     }
+    effect.boundsEdited =
+        effectJson.value("bounds_edited", effect.boundsEdited);
+    effect.boundsAdoptedGlobalRevision = effectJson.value(
+        "bounds_adopted_global_revision",
+        effect.boundsAdoptedGlobalRevision);
+    if (effectJson.contains("field_bounds_memory") &&
+        effectJson.at("field_bounds_memory").is_array()) {
+        for (const auto& memoryJson :
+             effectJson.at("field_bounds_memory")) {
+            if (!memoryJson.is_object() ||
+                !memoryJson.contains("field") ||
+                !memoryJson.at("field").is_object()) {
+                continue;
+            }
+            invisible_places::timing::TimingColouriseFieldBoundsMemory
+                memory;
+            const auto& fieldJson = memoryJson.at("field");
+            if (fieldJson.contains("source")) {
+                memory.selector.source = ParseTimingColouriseFieldSource(
+                    fieldJson.at("source"));
+            }
+            memory.selector.scalarFieldName = fieldJson.value(
+                "scalar_field_name",
+                memory.selector.scalarFieldName);
+            if (memoryJson.contains("bounds")) {
+                memory.bounds = ParseTimingColouriseBounds(
+                    memoryJson.at("bounds"));
+            }
+            if (memoryJson.contains("bounds_key_mode")) {
+                memory.boundsKeyMode = ParseTimingColouriseBoundsKeyMode(
+                    memoryJson.at("bounds_key_mode"));
+            }
+            if (memoryJson.contains("bounds_parameter_keys")) {
+                memory.boundsParameterKeys =
+                    ParseTimingColouriseBoundsParameterKeys(
+                        memoryJson.at("bounds_parameter_keys"));
+            }
+            if (memoryJson.contains("bounds_keys")) {
+                memory.boundsKeys = ParseTimingColouriseBoundsKeys(
+                    memoryJson.at("bounds_keys"));
+            }
+            memory.edited = memoryJson.value("edited", memory.edited);
+            memory.adoptedGlobalRevision = memoryJson.value(
+                "adopted_global_revision",
+                memory.adoptedGlobalRevision);
+            effect.fieldBoundsMemory.push_back(std::move(memory));
+        }
+    }
     return invisible_places::timing::SanitizeTimingColouriseEffect(
         std::move(effect));
 }
@@ -4490,8 +4676,7 @@ json SerializeTimingTakeSceneState(
     for (const auto& effect : sanitized.colouriseEffects) {
         auto effectJson = SerializeTimingColouriseEffect(effect);
         timingEffectsJson.push_back(effectJson);
-        if (effect.kind ==
-            invisible_places::timing::TimingEffectKind::Colourise) {
+        if (effect.colouriseEnabled) {
             legacyColouriseEffectsJson.push_back(std::move(effectJson));
         }
     }
@@ -4534,24 +4719,53 @@ ParseTimingTakeSceneState(const json& stateJson) {
                 ParseWaterFeatureTimingRun(runJson));
         }
     }
-    if (stateJson.contains("timing_effects") &&
-        stateJson.at("timing_effects").is_array()) {
-        for (const auto& effectJson : stateJson.at("timing_effects")) {
-            if (auto effect = ParseTimingColouriseEffect(effectJson);
-                effect.has_value()) {
-                state.colouriseEffects.push_back(std::move(*effect));
-            }
-        }
-    } else if (stateJson.contains("colourise_effects") &&
-               stateJson.at("colourise_effects").is_array()) {
-        for (const auto& effectJson : stateJson.at("colourise_effects")) {
+    std::vector<bool> legacyAspectEffects;
+    const auto parseEffectList = [&](const json& effectsJson,
+                                     bool parseKind) {
+        for (const auto& effectJson : effectsJson) {
+            const bool legacyAspects =
+                !parseKind ||
+                (effectJson.is_object() &&
+                 !effectJson.contains("colourise_enabled") &&
+                 !effectJson.contains("emissive_enabled"));
             if (auto effect = ParseTimingColouriseEffect(
                     effectJson,
-                    false);
+                    parseKind);
                 effect.has_value()) {
+                if (legacyAspects) {
+                    // Legacy single-aspect effects carry authored bounds
+                    // that predate the shared Global-bounds store; load
+                    // them detached so a later Global edit on the same
+                    // field can never silently overwrite them.
+                    effect->boundsEdited = true;
+                }
                 state.colouriseEffects.push_back(std::move(*effect));
+                legacyAspectEffects.push_back(legacyAspects);
             }
         }
+    };
+    if (stateJson.contains("timing_effects") &&
+        stateJson.at("timing_effects").is_array()) {
+        parseEffectList(stateJson.at("timing_effects"), true);
+    } else if (stateJson.contains("colourise_effects") &&
+               stateJson.at("colourise_effects").is_array()) {
+        parseEffectList(stateJson.at("colourise_effects"), false);
+    }
+    // Documents written before Visual Features carried single-aspect
+    // effects. Combine colourise/emissive pairs that provably evaluate
+    // identically as one object; anything else stays a separate feature.
+    // Only effects parsed without aspect flags participate, so features
+    // deliberately kept separate under the new model are never re-merged
+    // in a mixed document. This runs on presence rather than a schema
+    // number because this parser is shared with render-setup snapshots,
+    // which have no project schema in scope.
+    if (std::any_of(
+            legacyAspectEffects.begin(),
+            legacyAspectEffects.end(),
+            [](bool legacy) { return legacy; })) {
+        invisible_places::timing::MergeLegacyTimingEffectAspects(
+            &state.colouriseEffects,
+            &legacyAspectEffects);
     }
     return invisible_places::timing::SanitizeTimingTakeSceneState(
         std::move(state));
@@ -7904,6 +8118,7 @@ bool SaveProjectDocument(
              document.selectedTimingTakeId)},
         {"timing_take_states", json::array()},
         {"timing_colourise_palettes", json::array()},
+        {"timing_scalar_bounds_stores", json::array()},
         {"timing_take_sequence", document.timingTakeSequence},
         {"timing_colourise_palette_sequence",
          document.timingColourisePaletteSequence},
@@ -8006,6 +8221,28 @@ bool SaveProjectDocument(
     for (const auto& palette : document.timingColourisePalettes) {
         projectJson["timing_colourise_palettes"].push_back(
             SerializeTimingColourisePaletteDefinition(palette));
+    }
+    for (const auto& store : document.timingScalarBoundsStores) {
+        json profilesJson = json::array();
+        for (const auto& profile : store.profiles) {
+            profilesJson.push_back({
+                {"name", profile.name},
+                {"bounds",
+                 SerializeTimingColouriseBounds(profile.bounds)},
+            });
+        }
+        projectJson["timing_scalar_bounds_stores"].push_back({
+            {"field",
+             {
+                 {"source",
+                  TimingColouriseFieldSourceName(store.selector.source)},
+                 {"scalar_field_name", store.selector.scalarFieldName},
+             }},
+            {"global_bounds",
+             SerializeTimingColouriseBounds(store.globalBounds)},
+            {"revision", store.revision},
+            {"profiles", std::move(profilesJson)},
+        });
     }
     if (document.tempWaterScenario.has_value()) {
         projectJson["temp_water_scenario"] =
@@ -8288,6 +8525,65 @@ std::optional<ProjectDocument> LoadProjectDocument(
              projectJson->at("timing_colourise_palettes")) {
             document.timingColourisePalettes.push_back(
                 ParseTimingColourisePaletteDefinition(paletteJson));
+        }
+    }
+    if (projectJson->contains("timing_scalar_bounds_stores") &&
+        projectJson->at("timing_scalar_bounds_stores").is_array()) {
+        for (const auto& storeJson :
+             projectJson->at("timing_scalar_bounds_stores")) {
+            if (!storeJson.is_object() ||
+                !storeJson.contains("field") ||
+                !storeJson.at("field").is_object()) {
+                continue;
+            }
+            invisible_places::timing::TimingScalarBoundsStore store;
+            const auto& fieldJson = storeJson.at("field");
+            if (fieldJson.contains("source")) {
+                store.selector.source = ParseTimingColouriseFieldSource(
+                    fieldJson.at("source"));
+            }
+            store.selector.scalarFieldName = fieldJson.value(
+                "scalar_field_name",
+                store.selector.scalarFieldName);
+            if (storeJson.contains("global_bounds")) {
+                store.globalBounds = ParseTimingColouriseBounds(
+                    storeJson.at("global_bounds"));
+            }
+            store.revision =
+                storeJson.value("revision", store.revision);
+            if (storeJson.contains("profiles") &&
+                storeJson.at("profiles").is_array()) {
+                for (const auto& profileJson :
+                     storeJson.at("profiles")) {
+                    if (!profileJson.is_object()) {
+                        continue;
+                    }
+                    invisible_places::timing::TimingScalarBoundsProfile
+                        profile;
+                    profile.name =
+                        profileJson.value("name", profile.name);
+                    if (profile.name.empty()) {
+                        continue;
+                    }
+                    if (profileJson.contains("bounds")) {
+                        profile.bounds = ParseTimingColouriseBounds(
+                            profileJson.at("bounds"));
+                    }
+                    store.profiles.push_back(std::move(profile));
+                }
+            }
+            const bool duplicateSelector = std::any_of(
+                document.timingScalarBoundsStores.begin(),
+                document.timingScalarBoundsStores.end(),
+                [&](const invisible_places::timing::
+                        TimingScalarBoundsStore& existing) {
+                    return existing.selector == store.selector;
+                });
+            if (duplicateSelector) {
+                continue;
+            }
+            document.timingScalarBoundsStores.push_back(
+                std::move(store));
         }
     }
     document.timingTakeSequence = projectJson->value(

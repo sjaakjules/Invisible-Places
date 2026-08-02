@@ -18,7 +18,6 @@
 namespace {
 
 using Catch::Approx;
-using invisible_places::timing::TimingEffectKind;
 using invisible_places::timing::TimingColouriseBounds;
 using invisible_places::timing::TimingColouriseBoundsHandle;
 using invisible_places::timing::TimingColouriseBoundsKeyMode;
@@ -304,41 +303,89 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "Timing Emissive is scalar-only with smooth unbounded level keys",
+    "Visual Feature aspects gate parameters and keep emissive scalar-only",
     "[timing][colourise][emissive][effect-parameters]") {
     using invisible_places::timing::TimingColouriseFieldSource;
 
     const TimingColouriseEffect defaultEffect;
-    CHECK(defaultEffect.kind == TimingEffectKind::Colourise);
+    CHECK(defaultEffect.colouriseEnabled);
+    CHECK_FALSE(defaultEffect.emissiveEnabled);
     CHECK(defaultEffect.emissiveLevel == Approx(1.0F));
     CHECK(invisible_places::timing::TimingEffectParameterIsSupported(
-        TimingEffectKind::Colourise,
+        true,
+        false,
         TimingColouriseEffectParameter::PalettePhase));
     CHECK(invisible_places::timing::TimingEffectParameterIsSupported(
-        TimingEffectKind::Colourise,
+        true,
+        false,
         TimingColouriseEffectParameter::AmountOverride));
     CHECK_FALSE(invisible_places::timing::TimingEffectParameterIsSupported(
-        TimingEffectKind::Colourise,
+        true,
+        false,
         TimingColouriseEffectParameter::EmissiveLevel));
     CHECK(invisible_places::timing::TimingEffectParameterIsSupported(
-        TimingEffectKind::Emissive,
+        false,
+        true,
         TimingColouriseEffectParameter::EmissiveLevel));
     CHECK_FALSE(invisible_places::timing::TimingEffectParameterIsSupported(
-        TimingEffectKind::Emissive,
+        false,
+        true,
         TimingColouriseEffectParameter::PalettePhase));
+    CHECK_FALSE(invisible_places::timing::TimingEffectParameterIsSupported(
+        false,
+        true,
+        TimingColouriseEffectParameter::AmountOverride));
+    // A dual-aspect feature supports every effect parameter at once.
+    CHECK(invisible_places::timing::TimingEffectParameterIsSupported(
+        true,
+        true,
+        TimingColouriseEffectParameter::PalettePhase));
+    CHECK(invisible_places::timing::TimingEffectParameterIsSupported(
+        true,
+        true,
+        TimingColouriseEffectParameter::AmountOverride));
+    CHECK(invisible_places::timing::TimingEffectParameterIsSupported(
+        true,
+        true,
+        TimingColouriseEffectParameter::EmissiveLevel));
+    CHECK(invisible_places::timing::TimingEffectParameterIsSupported(
+        defaultEffect,
+        TimingColouriseEffectParameter::PalettePhase));
+    CHECK_FALSE(invisible_places::timing::TimingEffectParameterIsSupported(
+        defaultEffect,
+        TimingColouriseEffectParameter::EmissiveLevel));
+
+    // Sanitize refuses a feature with no aspect at all.
+    TimingColouriseEffect neither;
+    neither.colouriseEnabled = false;
+    neither.emissiveEnabled = false;
+    CHECK(invisible_places::timing::SanitizeTimingColouriseEffect(neither)
+              .colouriseEnabled);
 
     TimingColouriseEffect emissive;
-    emissive.kind = TimingEffectKind::Emissive;
+    emissive.colouriseEnabled = false;
+    emissive.emissiveEnabled = true;
     emissive.name.clear();
     emissive.field.source = TimingColouriseFieldSource::NormalX;
     emissive.field.scalarFieldName = "dormant-field";
     emissive.emissiveLevel = -4.0F;
     auto sanitized =
         invisible_places::timing::SanitizeTimingColouriseEffect(emissive);
-    CHECK(sanitized.name == "Emissive");
+    CHECK(sanitized.name == "Visual Feature");
     CHECK(sanitized.field.source == TimingColouriseFieldSource::Scalar);
     CHECK(sanitized.field.scalarFieldName.empty());
     CHECK(sanitized.emissiveLevel == Approx(0.0F));
+
+    // A dual-aspect feature legitimately follows colourise onto a normal
+    // source; only its emissive aspect is dropped rather than the field.
+    TimingColouriseEffect dual;
+    dual.emissiveEnabled = true;
+    dual.field.source = TimingColouriseFieldSource::NormalZ;
+    const auto dualSanitized =
+        invisible_places::timing::SanitizeTimingColouriseEffect(dual);
+    CHECK(dualSanitized.colouriseEnabled);
+    CHECK_FALSE(dualSanitized.emissiveEnabled);
+    CHECK(dualSanitized.field.source == TimingColouriseFieldSource::NormalZ);
 
     emissive.field.source = TimingColouriseFieldSource::Scalar;
     emissive.field.scalarFieldName = "Heat";
@@ -393,10 +440,11 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "Timing Emissive aggregate key operations preserve dormant palette data",
+    "Emissive-only Visual Feature key operations preserve dormant colourise data",
     "[timing][colourise][emissive][keys]") {
     TimingColouriseEffect effect;
-    effect.kind = TimingEffectKind::Emissive;
+    effect.colouriseEnabled = false;
+    effect.emissiveEnabled = true;
     effect.basePalette = TimingColourisePalette{
         .stops = {{.id = "tracked", .position = 0.5F}},
     };
@@ -3170,8 +3218,14 @@ TEST_CASE(
         REQUIRE(stateJson.at("colourise_effects").size() == 1U);
         CHECK(stateJson.at("timing_effect_sequence") ==
               stateJson.at("colourise_effect_sequence"));
+        // The legacy kind is still written so pre-Visual-Feature readers
+        // can open this document; current readers use the aspect flags.
         CHECK(stateJson.at("timing_effects")[0].at("kind") ==
               "colourise");
+        CHECK(stateJson.at("timing_effects")[0].at("colourise_enabled") ==
+              true);
+        CHECK(stateJson.at("timing_effects")[0].at("emissive_enabled") ==
+              false);
         const auto& activation =
             stateJson.at("timing_effects")[0]
                 .at("activation_range");
@@ -3200,6 +3254,9 @@ TEST_CASE(
     CHECK(
         loadedState.colouriseEffects.front().field.scalarFieldName ==
         "SurfaceRoughness-Sml");
+    // Aspect-flagged round-trips stay attached to the shared Global
+    // bounds unless the document says otherwise.
+    CHECK_FALSE(loadedState.colouriseEffects.front().boundsEdited);
     CHECK(
         loadedState.colouriseEffects.front().paletteKeys.front().palette
             .stops.front()
@@ -3229,40 +3286,73 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "Timing effects persist mixed Colourise and Emissive state safely",
-    "[timing][colourise][emissive][project][serialization]") {
+    "Legacy single-aspect timing effects merge into Visual Features on load",
+    "[timing][colourise][emissive][project][serialization][migration]") {
     using invisible_places::timing::TimingColouriseEffectParameterKey;
-    using invisible_places::timing::TimingColouriseFieldSource;
 
     invisible_places::serialization::ProjectDocument document;
     invisible_places::timing::TimingTakeSceneState state{
         .takeId = "timing-take-mixed",
         .sceneGroupName = "Site A",
     };
-    state.colouriseEffectSequence = 9U;
+    state.colouriseEffectSequence = 12U;
 
-    TimingColouriseEffect colourise;
-    colourise.id = "colourise-effect-1";
-    colourise.name = "Minerals";
-    colourise.field.scalarFieldName = "Mineral";
-    colourise.basePalette = Solid({0.1F, 0.5F, 0.8F}, 0.6F);
-    state.colouriseEffects.push_back(colourise);
+    const auto makeColourise = [](std::string id,
+                                  std::string field,
+                                  float start,
+                                  float end) {
+        TimingColouriseEffect effect;
+        effect.id = std::move(id);
+        effect.field.scalarFieldName = std::move(field);
+        effect.activationRange = {.start = start, .end = end};
+        return effect;
+    };
+    const auto makeEmissive = [](std::string id,
+                                 std::string field,
+                                 float start,
+                                 float end,
+                                 float level) {
+        TimingColouriseEffect effect;
+        effect.id = std::move(id);
+        effect.colouriseEnabled = false;
+        effect.emissiveEnabled = true;
+        effect.field.scalarFieldName = std::move(field);
+        effect.activationRange = {.start = start, .end = end};
+        effect.emissiveLevel = level;
+        return effect;
+    };
 
-    TimingColouriseEffect emissive;
-    emissive.id = "emissive-effect-2";
-    emissive.name = "Heat glow";
-    emissive.kind = TimingEffectKind::Emissive;
-    emissive.field.source = TimingColouriseFieldSource::Scalar;
-    emissive.field.scalarFieldName = "Heat";
-    emissive.emissiveLevel = 2.5F;
-    emissive.activationRange = {.start = 0.2F, .end = 0.8F};
-    emissive.basePalette = TimingColourisePalette{
-        .stops = {{.id = "dormant", .position = 0.5F}},
-    };
-    emissive.paletteKeys = {
-        {.position = 0.4F, .palette = Solid({1.0F, 0.2F, 0.1F})},
-    };
-    emissive.effectParameterKeys.push_back(
+    // Each matrix case lives in its own disjoint activation window so the
+    // renderer slot-capacity gate never engages inside a merge candidate's
+    // window (concurrency stays far below eight slots).
+    // (a) Same field, exactly equal window, identical bounds authoring,
+    // both enabled: the pair merges into one dual-aspect feature.
+    auto mergeColourise =
+        makeColourise("colourise-merge", "Mineral", 0.0F, 0.1F);
+    mergeColourise.name = "Minerals";
+    mergeColourise.basePalette = Solid({0.1F, 0.5F, 0.8F}, 0.6F);
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColouriseEffectParameterKey(
+                    &mergeColourise,
+                    TimingColouriseEffectParameter::PalettePhase,
+                    0.5F,
+                    1.5F));
+    // A dormant EmissiveLevel key on the colourise object never rendered;
+    // the merge must replace it with the partner's authored track.
+    mergeColourise.effectParameterKeys.push_back(
+        TimingColouriseEffectParameterKey{
+            .parameter = TimingColouriseEffectParameter::EmissiveLevel,
+            .position = 0.15F,
+            .value = 9.0F,
+        });
+    state.colouriseEffects.push_back(mergeColourise);
+    auto mergeEmissive =
+        makeEmissive("emissive-merge", "Mineral", 0.0F, 0.1F, 2.5F);
+    mergeEmissive.name = "Heat glow";
+    // Dormant colourise-side data on the emissive partner never rendered
+    // and is dropped by the merge; only its emissive level and
+    // EmissiveLevel keys survive.
+    mergeEmissive.effectParameterKeys.push_back(
         TimingColouriseEffectParameterKey{
             .parameter = TimingColouriseEffectParameter::AmountOverride,
             .position = 0.3F,
@@ -3270,17 +3360,96 @@ TEST_CASE(
         });
     REQUIRE(invisible_places::timing::
                 AddOrUpdateTimingColouriseEffectParameterKey(
-                    &emissive,
+                    &mergeEmissive,
                     TimingColouriseEffectParameter::EmissiveLevel,
                     0.6F,
                     4.0F));
+    state.colouriseEffects.push_back(mergeEmissive);
+
+    // (b) Same field but overlapping-yet-different windows: no merge.
+    state.colouriseEffects.push_back(
+        makeColourise("colourise-window", "Silt", 0.15F, 0.25F));
+    state.colouriseEffects.push_back(
+        makeEmissive("emissive-window", "Silt", 0.18F, 0.25F, 1.5F));
+
+    // (b2) Windows equal within the former 1e-4 key tolerance but not
+    // exactly equal: no merge under the exact-equality rule.
+    state.colouriseEffects.push_back(
+        makeColourise("colourise-tolerance", "Basalt", 0.3F, 0.4F));
+    state.colouriseEffects.push_back(makeEmissive(
+        "emissive-tolerance",
+        "Basalt",
+        0.30005F,
+        0.39995F,
+        2.25F));
+
+    // (c) Identical windows on different fields: no merge.
+    state.colouriseEffects.push_back(
+        makeColourise("colourise-field", "Clay", 0.45F, 0.5F));
+    state.colouriseEffects.push_back(
+        makeEmissive("emissive-field", "Heat", 0.45F, 0.5F, 3.0F));
+
+    // (d) Enabled mismatch: no merge.
+    state.colouriseEffects.push_back(
+        makeColourise("colourise-enabled", "Iron", 0.55F, 0.6F));
+    auto mismatchEmissive = makeEmissive(
+        "emissive-enabled-mismatch",
+        "Iron",
+        0.55F,
+        0.6F,
+        2.0F);
+    mismatchEmissive.enabled = false;
+    state.colouriseEffects.push_back(mismatchEmissive);
+
+    // (d2) Both disabled: a disabled pair no longer merges either.
+    auto disabledColourise =
+        makeColourise("colourise-both-disabled", "Copper", 0.55F, 0.6F);
+    disabledColourise.enabled = false;
+    state.colouriseEffects.push_back(disabledColourise);
+    auto disabledEmissive = makeEmissive(
+        "emissive-both-disabled",
+        "Copper",
+        0.55F,
+        0.6F,
+        1.25F);
+    disabledEmissive.enabled = false;
+    state.colouriseEffects.push_back(disabledEmissive);
+
+    // (g) Differing base bounds: bounds gate emissive output exactly as
+    // they gate colourise, so the pair cannot share one merged bounds.
+    state.colouriseEffects.push_back(
+        makeColourise("colourise-bounds", "Quartz", 0.65F, 0.7F));
+    auto boundsEmissive =
+        makeEmissive("emissive-bounds", "Quartz", 0.65F, 0.7F, 1.5F);
+    boundsEmissive.baseBounds = {
+        .lower = 0.0F,
+        .upper = 0.9F,
+        .edgeFade = 0.1F,
+    };
+    state.colouriseEffects.push_back(boundsEmissive);
+
+    // (h) Differing bounds parameter keys: no merge.
+    auto boundsKeyColourise =
+        makeColourise("colourise-bounds-keys", "Mica", 0.75F, 0.8F);
     REQUIRE(invisible_places::timing::
                 AddOrUpdateTimingColouriseBoundsParameterKey(
-                    &emissive,
+                    &boundsKeyColourise,
                     TimingColouriseBoundsParameter::Lower,
                     0.5F,
-                    0.25F));
-    state.colouriseEffects.push_back(emissive);
+                    0.2F));
+    state.colouriseEffects.push_back(boundsKeyColourise);
+    state.colouriseEffects.push_back(
+        makeEmissive("emissive-bounds-keys", "Mica", 0.75F, 0.8F, 1.5F));
+
+    // (e) One emissive with two colourise candidates: only the first
+    // candidate in list order absorbs it.
+    state.colouriseEffects.push_back(
+        makeColourise("colourise-first", "Moss", 0.85F, 0.9F));
+    state.colouriseEffects.push_back(
+        makeColourise("colourise-second", "Moss", 0.85F, 0.9F));
+    state.colouriseEffects.push_back(
+        makeEmissive("emissive-shared", "Moss", 0.85F, 0.9F, 1.75F));
+
     document.timingTakeStates.push_back(state);
 
     TemporaryTimingColouriseFile file{
@@ -3298,51 +3467,180 @@ TEST_CASE(
         saved = nlohmann::json::parse(input);
     }
     const auto& savedState = saved.at("timing_take_states")[0];
-    REQUIRE(savedState.at("timing_effects").size() == 2U);
-    REQUIRE(savedState.at("colourise_effects").size() == 1U);
-    CHECK(savedState.at("timing_effect_sequence") == 9U);
-    CHECK(savedState.at("colourise_effect_sequence") == 9U);
+    REQUIRE(savedState.at("timing_effects").size() == 19U);
+    // The legacy mirror only carries colourise-capable effects.
+    REQUIRE(savedState.at("colourise_effects").size() == 10U);
+    CHECK(savedState.at("timing_effect_sequence") == 12U);
+    CHECK(savedState.at("colourise_effect_sequence") == 12U);
     CHECK(savedState.at("timing_effects")[0].at("kind") == "colourise");
+    CHECK(savedState.at("timing_effects")[0].at("colourise_enabled") ==
+          true);
+    CHECK(savedState.at("timing_effects")[0].at("emissive_enabled") ==
+          false);
     CHECK(savedState.at("timing_effects")[1].at("kind") == "emissive");
+    CHECK(savedState.at("timing_effects")[1].at("colourise_enabled") ==
+          false);
+    CHECK(savedState.at("timing_effects")[1].at("emissive_enabled") ==
+          true);
     CHECK(savedState.at("timing_effects")[1].at("emissive_level") ==
           Approx(2.5F));
 
-    const auto loaded =
+    // (f) Aspect-flagged documents reload verbatim; the merge never runs
+    // and the effects stay attached to the shared Global bounds.
+    const auto flagged =
         invisible_places::serialization::LoadProjectDocument(
             file.path,
             &error);
-    REQUIRE(loaded.has_value());
-    REQUIRE(loaded->timingTakeStates.size() == 1U);
-    const auto& loadedEffects =
-        loaded->timingTakeStates.front().colouriseEffects;
-    REQUIRE(loadedEffects.size() == 2U);
-    CHECK(loadedEffects[0].kind == TimingEffectKind::Colourise);
-    CHECK(loadedEffects[1].kind == TimingEffectKind::Emissive);
-    CHECK(loadedEffects[1].emissiveLevel == Approx(2.5F));
-    CHECK(loadedEffects[1].field.scalarFieldName == "Heat");
-    CHECK(loadedEffects[1].activationRange.start == Approx(0.2F));
-    CHECK(loadedEffects[1].activationRange.end == Approx(0.8F));
-    CHECK(loadedEffects[1].paletteKeys.size() == 1U);
-    CHECK(loadedEffects[1].boundsParameterKeys.size() == 1U);
-    REQUIRE(loadedEffects[1].effectParameterKeys.size() == 2U);
-    CHECK(std::any_of(
-        loadedEffects[1].effectParameterKeys.begin(),
-        loadedEffects[1].effectParameterKeys.end(),
-        [](const auto& key) {
-            return key.parameter ==
-                   TimingColouriseEffectParameter::EmissiveLevel;
-        }));
-    CHECK(std::any_of(
-        loadedEffects[1].effectParameterKeys.begin(),
-        loadedEffects[1].effectParameterKeys.end(),
-        [](const auto& key) {
-            return key.parameter ==
-                   TimingColouriseEffectParameter::AmountOverride;
-        }));
+    REQUIRE(flagged.has_value());
+    REQUIRE(flagged->timingTakeStates.size() == 1U);
+    const auto& flaggedEffects =
+        flagged->timingTakeStates.front().colouriseEffects;
+    REQUIRE(flaggedEffects.size() == 19U);
+    CHECK(flaggedEffects[0].colouriseEnabled);
+    CHECK_FALSE(flaggedEffects[0].emissiveEnabled);
+    CHECK_FALSE(flaggedEffects[0].boundsEdited);
+    CHECK_FALSE(flaggedEffects[1].colouriseEnabled);
+    CHECK(flaggedEffects[1].emissiveEnabled);
+    CHECK(flaggedEffects[1].emissiveLevel == Approx(2.5F));
+    CHECK_FALSE(flaggedEffects[1].boundsEdited);
 
-    auto unknownKind = saved;
+    // Strip the aspect flags to recreate a pre-Visual-Feature document
+    // that only carries the legacy kind discriminator.
+    auto legacy = saved;
+    legacy["schema_version"] = 59U;
+    for (auto& effectJson :
+         legacy.at("timing_take_states")[0].at("timing_effects")) {
+        effectJson.erase("colourise_enabled");
+        effectJson.erase("emissive_enabled");
+    }
+    TemporaryTimingColouriseFile legacyFile{
+        "invisible_places_legacy_kind_timing_effects.ipproj"};
+    {
+        std::ofstream output{legacyFile.path};
+        REQUIRE(output.is_open());
+        output << legacy.dump(2);
+    }
+    const auto legacyLoaded =
+        invisible_places::serialization::LoadProjectDocument(
+            legacyFile.path,
+            &error);
+    REQUIRE(legacyLoaded.has_value());
+    REQUIRE(legacyLoaded->timingTakeStates.size() == 1U);
+    const auto& mergedEffects =
+        legacyLoaded->timingTakeStates.front().colouriseEffects;
+    REQUIRE(mergedEffects.size() == 17U);
+
+    const auto& merged = mergedEffects[0];
+    CHECK(merged.id == "colourise-merge");
+    CHECK(merged.name == "Minerals");
+    CHECK(merged.colouriseEnabled);
+    CHECK(merged.emissiveEnabled);
+    CHECK(merged.activationRange.start == Approx(0.0F));
+    CHECK(merged.activationRange.end == Approx(0.1F));
+    CHECK(merged.emissiveLevel == Approx(2.5F));
+    CHECK(merged.basePalette.stops.front().colour[2] == Approx(0.8F));
+    // Legacy authored bounds load detached so later Global edits can
+    // never silently overwrite them.
+    CHECK(merged.boundsEdited);
+    // The colourise object's own PalettePhase key survives; its dormant
+    // EmissiveLevel key is replaced by the partner's authored track; the
+    // partner's dormant AmountOverride key is dropped with the partner.
+    REQUIRE(merged.effectParameterKeys.size() == 2U);
+    CHECK(merged.effectParameterKeys[0].parameter ==
+          TimingColouriseEffectParameter::PalettePhase);
+    CHECK(merged.effectParameterKeys[0].position == Approx(0.5F));
+    CHECK(merged.effectParameterKeys[1].parameter ==
+          TimingColouriseEffectParameter::EmissiveLevel);
+    CHECK(merged.effectParameterKeys[1].position == Approx(0.6F));
+    CHECK(merged.effectParameterKeys[1].value == Approx(4.0F));
+
+    CHECK(mergedEffects[1].id == "colourise-window");
+    CHECK(mergedEffects[1].colouriseEnabled);
+    CHECK_FALSE(mergedEffects[1].emissiveEnabled);
+    CHECK(mergedEffects[1].boundsEdited);
+    CHECK(mergedEffects[2].id == "emissive-window");
+    CHECK_FALSE(mergedEffects[2].colouriseEnabled);
+    CHECK(mergedEffects[2].emissiveEnabled);
+    CHECK(mergedEffects[2].emissiveLevel == Approx(1.5F));
+    CHECK(mergedEffects[3].id == "colourise-tolerance");
+    CHECK_FALSE(mergedEffects[3].emissiveEnabled);
+    CHECK(mergedEffects[4].id == "emissive-tolerance");
+    CHECK_FALSE(mergedEffects[4].colouriseEnabled);
+    CHECK(mergedEffects[4].emissiveEnabled);
+    CHECK(mergedEffects[5].id == "colourise-field");
+    CHECK_FALSE(mergedEffects[5].emissiveEnabled);
+    CHECK(mergedEffects[6].id == "emissive-field");
+    CHECK_FALSE(mergedEffects[6].colouriseEnabled);
+    CHECK(mergedEffects[7].id == "colourise-enabled");
+    CHECK_FALSE(mergedEffects[7].emissiveEnabled);
+    CHECK(mergedEffects[8].id == "emissive-enabled-mismatch");
+    CHECK_FALSE(mergedEffects[8].enabled);
+    CHECK(mergedEffects[8].emissiveEnabled);
+    CHECK_FALSE(mergedEffects[8].colouriseEnabled);
+    CHECK(mergedEffects[9].id == "colourise-both-disabled");
+    CHECK_FALSE(mergedEffects[9].enabled);
+    CHECK_FALSE(mergedEffects[9].emissiveEnabled);
+    CHECK(mergedEffects[10].id == "emissive-both-disabled");
+    CHECK_FALSE(mergedEffects[10].enabled);
+    CHECK_FALSE(mergedEffects[10].colouriseEnabled);
+    CHECK(mergedEffects[11].id == "colourise-bounds");
+    CHECK_FALSE(mergedEffects[11].emissiveEnabled);
+    CHECK(mergedEffects[12].id == "emissive-bounds");
+    CHECK_FALSE(mergedEffects[12].colouriseEnabled);
+    CHECK(mergedEffects[12].baseBounds.upper == Approx(0.9F));
+    CHECK(mergedEffects[13].id == "colourise-bounds-keys");
+    CHECK_FALSE(mergedEffects[13].emissiveEnabled);
+    CHECK(mergedEffects[14].id == "emissive-bounds-keys");
+    CHECK_FALSE(mergedEffects[14].colouriseEnabled);
+    const auto& firstShared = mergedEffects[15];
+    CHECK(firstShared.id == "colourise-first");
+    CHECK(firstShared.colouriseEnabled);
+    CHECK(firstShared.emissiveEnabled);
+    CHECK(firstShared.emissiveLevel == Approx(1.75F));
+    CHECK(mergedEffects[16].id == "colourise-second");
+    CHECK(mergedEffects[16].colouriseEnabled);
+    CHECK_FALSE(mergedEffects[16].emissiveEnabled);
+
+    // Mixed document: one effect loses its aspect flags (legacy) while
+    // the identical-in-every-way pair keeps them. The presence gate runs
+    // the merge, but aspect-authored features are never eligible, so the
+    // flagged pair stays separate.
+    auto mixed = saved;
+    mixed.at("timing_take_states")[0]
+        .at("timing_effects")[2]
+        .erase("colourise_enabled");
+    mixed.at("timing_take_states")[0]
+        .at("timing_effects")[2]
+        .erase("emissive_enabled");
+    TemporaryTimingColouriseFile mixedFile{
+        "invisible_places_mixed_aspect_timing_effects.ipproj"};
+    {
+        std::ofstream output{mixedFile.path};
+        REQUIRE(output.is_open());
+        output << mixed.dump(2);
+    }
+    const auto mixedLoaded =
+        invisible_places::serialization::LoadProjectDocument(
+            mixedFile.path,
+            &error);
+    REQUIRE(mixedLoaded.has_value());
+    const auto& mixedEffects =
+        mixedLoaded->timingTakeStates.front().colouriseEffects;
+    REQUIRE(mixedEffects.size() == 19U);
+    CHECK(mixedEffects[0].id == "colourise-merge");
+    CHECK(mixedEffects[0].colouriseEnabled);
+    CHECK_FALSE(mixedEffects[0].emissiveEnabled);
+    CHECK_FALSE(mixedEffects[0].boundsEdited);
+    CHECK(mixedEffects[1].id == "emissive-merge");
+    // Only the kind-only effect loads detached from Global bounds.
+    CHECK(mixedEffects[2].id == "colourise-window");
+    CHECK(mixedEffects[2].boundsEdited);
+
+    // A kind this build does not understand is skipped rather than being
+    // guessed at, so its would-be partner stays a single-aspect feature.
+    auto unknownKind = legacy;
     unknownKind.at("timing_take_states")[0]
-        .at("timing_effects")[0]["kind"] = "future_effect";
+        .at("timing_effects")[1]["kind"] = "future_effect";
     TemporaryTimingColouriseFile unknownKindFile{
         "invisible_places_unknown_timing_effect_kind.ipproj"};
     {
@@ -3355,35 +3653,441 @@ TEST_CASE(
             unknownKindFile.path,
             &error);
     REQUIRE(unknownLoaded.has_value());
-    REQUIRE(unknownLoaded->timingTakeStates.front()
-                .colouriseEffects.size() == 1U);
-    CHECK(unknownLoaded->timingTakeStates.front()
-              .colouriseEffects.front()
-              .kind == TimingEffectKind::Emissive);
+    const auto& unknownEffects =
+        unknownLoaded->timingTakeStates.front().colouriseEffects;
+    REQUIRE(unknownEffects.size() == 17U);
+    CHECK(unknownEffects[0].id == "colourise-merge");
+    CHECK(unknownEffects[0].colouriseEnabled);
+    CHECK_FALSE(unknownEffects[0].emissiveEnabled);
+    CHECK(std::none_of(
+        unknownEffects.begin(),
+        unknownEffects.end(),
+        [](const TimingColouriseEffect& effect) {
+            return effect.id == "emissive-merge";
+        }));
+}
 
-    auto legacy = saved;
-    legacy["schema_version"] = 58U;
-    auto& legacyState = legacy.at("timing_take_states")[0];
-    legacyState.erase("timing_effects");
-    legacyState.erase("timing_effect_sequence");
-    legacyState.at("colourise_effects")[0]["kind"] = "future_effect";
-    TemporaryTimingColouriseFile legacyFile{
-        "invisible_places_legacy_colourise_effects.ipproj"};
+TEST_CASE(
+    "Legacy aspect merging respects renderer slot capacity and eligibility",
+    "[timing][colourise][emissive][migration][capacity]") {
+    const auto makePair = [](std::string field)
+        -> std::pair<TimingColouriseEffect, TimingColouriseEffect> {
+        TimingColouriseEffect colourise;
+        colourise.id = "c-" + field;
+        colourise.field.scalarFieldName = field;
+        TimingColouriseEffect emissive;
+        emissive.id = "e-" + field;
+        emissive.colouriseEnabled = false;
+        emissive.emissiveEnabled = true;
+        emissive.field.scalarFieldName = field;
+        emissive.emissiveLevel = 2.0F;
+        return {std::move(colourise), std::move(emissive)};
+    };
+    const auto makeEffects = [&] {
+        // Nine single-aspect enabled effects, all active across the full
+        // [0, 1] window: four exactly mergeable pairs plus one extra
+        // colourise effect. That is nine concurrent renderer slots.
+        std::vector<TimingColouriseEffect> effects;
+        for (const auto* field : {"F1", "F2", "F3", "F4"}) {
+            auto [colourise, emissive] = makePair(field);
+            effects.push_back(std::move(colourise));
+            effects.push_back(std::move(emissive));
+        }
+        TimingColouriseEffect extra;
+        extra.id = "c-extra";
+        extra.field.scalarFieldName = "F-Extra";
+        effects.push_back(std::move(extra));
+        return effects;
+    };
+
+    // Nine concurrent slots exceed the default eight-slot renderer
+    // capacity somewhere (everywhere) inside every pair's window, so
+    // merging is refused wholesale: cap selection is position dependent
+    // and a merged pair would change which slots the renderer keeps.
+    auto overCapacity = makeEffects();
+    CHECK(invisible_places::timing::MergeLegacyTimingEffectAspects(
+              &overCapacity) == 0U);
+    CHECK(overCapacity.size() == 9U);
+
+    // The same authoring merges once the capacity accommodates every
+    // concurrently active slot.
+    auto withinCapacity = makeEffects();
+    CHECK(invisible_places::timing::MergeLegacyTimingEffectAspects(
+              &withinCapacity,
+              nullptr,
+              16U) == 4U);
+    REQUIRE(withinCapacity.size() == 5U);
+    CHECK(withinCapacity[0].id == "c-F1");
+    CHECK(withinCapacity[0].colouriseEnabled);
+    CHECK(withinCapacity[0].emissiveEnabled);
+    CHECK(withinCapacity[0].emissiveLevel == Approx(2.0F));
+    CHECK(withinCapacity[4].id == "c-extra");
+    CHECK_FALSE(withinCapacity[4].emissiveEnabled);
+
+    // An eligibility mask excludes aspect-authored effects: the masked
+    // pair stays separate while every eligible pair still merges.
+    auto masked = makeEffects();
+    std::vector<bool> eligibility(masked.size(), true);
+    eligibility[0] = false;
+    eligibility[1] = false;
+    CHECK(invisible_places::timing::MergeLegacyTimingEffectAspects(
+              &masked,
+              &eligibility,
+              16U) == 3U);
+    REQUIRE(masked.size() == 6U);
+    CHECK(masked[0].id == "c-F1");
+    CHECK_FALSE(masked[0].emissiveEnabled);
+    CHECK(masked[1].id == "e-F1");
+    CHECK_FALSE(masked[1].colouriseEnabled);
+    CHECK(masked[2].id == "c-F2");
+    CHECK(masked[2].emissiveEnabled);
+}
+
+TEST_CASE(
+    "Dual-aspect Visual Features round-trip aspect flags and bounds memory",
+    "[timing][colourise][emissive][bounds][project][serialization]") {
+    using invisible_places::timing::TimingColouriseFieldBoundsMemory;
+    using invisible_places::timing::TimingColouriseFieldSource;
+
+    invisible_places::serialization::ProjectDocument document;
+    invisible_places::timing::TimingTakeSceneState state{
+        .takeId = "timing-take-dual",
+        .sceneGroupName = "Site A",
+    };
+
+    TimingColouriseEffect effect;
+    effect.id = "visual-feature-1";
+    effect.name = "Mineral heat";
+    // Colourise stays default-enabled, making this a dual-aspect feature.
+    effect.emissiveEnabled = true;
+    effect.field.scalarFieldName = "Mineral";
+    effect.basePalette = Solid({0.2F, 0.6F, 0.9F}, 0.7F);
+    effect.emissiveLevel = 3.0F;
+    effect.boundsEdited = true;
+    effect.boundsAdoptedGlobalRevision = 4U;
+    effect.fieldBoundsMemory.push_back(TimingColouriseFieldBoundsMemory{
+        .selector = {.source = TimingColouriseFieldSource::Scalar,
+                     .scalarFieldName = "Heat"},
+        .bounds = {.lower = 0.15F, .upper = 0.85F, .edgeFade = 0.05F},
+        .boundsKeyMode = TimingColouriseBoundsKeyMode::CentreSpread,
+        .boundsParameterKeys = {{.parameter =
+                                     TimingColouriseBoundsParameter::Centre,
+                                 .position = 0.5F,
+                                 .value = 0.4F}},
+        .boundsKeys = {{.position = 0.25F,
+                        .bounds = {.lower = 0.2F,
+                                   .upper = 0.6F,
+                                   .edgeFade = 0.1F}}},
+        .edited = true,
+        .adoptedGlobalRevision = 3U,
+    });
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColouriseEffectParameterKey(
+                    &effect,
+                    TimingColouriseEffectParameter::PalettePhase,
+                    0.2F,
+                    0.5F));
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColouriseEffectParameterKey(
+                    &effect,
+                    TimingColouriseEffectParameter::AmountOverride,
+                    0.4F,
+                    0.8F));
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColouriseEffectParameterKey(
+                    &effect,
+                    TimingColouriseEffectParameter::EmissiveLevel,
+                    0.6F,
+                    2.0F));
+    state.colouriseEffects.push_back(effect);
+    document.timingTakeStates.push_back(state);
+
+    TemporaryTimingColouriseFile file{
+        "invisible_places_dual_aspect_round_trip.ipproj"};
+    std::string error;
+    REQUIRE(invisible_places::serialization::SaveProjectDocument(
+        document,
+        file.path,
+        &error));
+
+    nlohmann::json saved;
     {
-        std::ofstream output{legacyFile.path};
-        REQUIRE(output.is_open());
-        output << legacy.dump(2);
+        std::ifstream input{file.path};
+        REQUIRE(input.is_open());
+        saved = nlohmann::json::parse(input);
     }
-    const auto legacyLoaded =
+    CHECK(
+        saved.at("schema_version") ==
+        invisible_places::serialization::kProjectDocumentSchemaVersion);
+    const auto& savedEffect =
+        saved.at("timing_take_states")[0].at("timing_effects")[0];
+    // Dual-aspect features degrade to plain colourise for legacy readers.
+    CHECK(savedEffect.at("kind") == "colourise");
+    CHECK(savedEffect.at("colourise_enabled") == true);
+    CHECK(savedEffect.at("emissive_enabled") == true);
+    CHECK(savedEffect.at("emissive_level") == Approx(3.0F));
+    REQUIRE(savedEffect.at("effect_parameter_keys").size() == 3U);
+    CHECK(savedEffect.at("bounds_edited") == true);
+    CHECK(savedEffect.at("bounds_adopted_global_revision") == 4U);
+    REQUIRE(savedEffect.at("field_bounds_memory").size() == 1U);
+    const auto& savedMemory = savedEffect.at("field_bounds_memory")[0];
+    CHECK(savedMemory.at("field").at("scalar_field_name") == "Heat");
+    CHECK(savedMemory.at("bounds").at("lower") == Approx(0.15F));
+    CHECK(savedMemory.at("bounds_key_mode") == "centre_spread");
+    REQUIRE(savedMemory.at("bounds_parameter_keys").size() == 1U);
+    REQUIRE(savedMemory.at("bounds_keys").size() == 1U);
+    CHECK(savedMemory.at("edited") == true);
+    CHECK(savedMemory.at("adopted_global_revision") == 3U);
+
+    const auto loaded =
         invisible_places::serialization::LoadProjectDocument(
-            legacyFile.path,
+            file.path,
             &error);
-    REQUIRE(legacyLoaded.has_value());
-    REQUIRE(legacyLoaded->timingTakeStates.front()
-                .colouriseEffects.size() == 1U);
-    CHECK(legacyLoaded->timingTakeStates.front()
-              .colouriseEffects.front()
-              .kind == TimingEffectKind::Colourise);
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded->timingTakeStates.size() == 1U);
+    REQUIRE(
+        loaded->timingTakeStates.front().colouriseEffects.size() == 1U);
+    const auto& loadedEffect =
+        loaded->timingTakeStates.front().colouriseEffects.front();
+    CHECK(loadedEffect.colouriseEnabled);
+    CHECK(loadedEffect.emissiveEnabled);
+    CHECK(loadedEffect.emissiveLevel == Approx(3.0F));
+    // Every effect parameter is live on a dual-aspect feature.
+    for (const auto parameter : {
+             TimingColouriseEffectParameter::PalettePhase,
+             TimingColouriseEffectParameter::AmountOverride,
+             TimingColouriseEffectParameter::EmissiveLevel,
+         }) {
+        CHECK(invisible_places::timing::TimingEffectParameterIsSupported(
+            loadedEffect,
+            parameter));
+    }
+    REQUIRE(loadedEffect.effectParameterKeys.size() == 3U);
+    CHECK(invisible_places::timing::
+              TimingColouriseEffectParameterKeyCountAtPosition(
+                  loadedEffect,
+                  TimingColouriseEffectParameter::PalettePhase,
+                  0.2F) == 1U);
+    CHECK(invisible_places::timing::
+              TimingColouriseEffectParameterKeyCountAtPosition(
+                  loadedEffect,
+                  TimingColouriseEffectParameter::AmountOverride,
+                  0.4F) == 1U);
+    CHECK(invisible_places::timing::
+              TimingColouriseEffectParameterKeyCountAtPosition(
+                  loadedEffect,
+                  TimingColouriseEffectParameter::EmissiveLevel,
+                  0.6F) == 1U);
+    CHECK(loadedEffect.boundsEdited);
+    CHECK(loadedEffect.boundsAdoptedGlobalRevision == 4U);
+    REQUIRE(loadedEffect.fieldBoundsMemory.size() == 1U);
+    const auto& loadedMemory = loadedEffect.fieldBoundsMemory.front();
+    CHECK(loadedMemory.selector.source ==
+          TimingColouriseFieldSource::Scalar);
+    CHECK(loadedMemory.selector.scalarFieldName == "Heat");
+    CHECK(loadedMemory.bounds.lower == Approx(0.15F));
+    CHECK(loadedMemory.bounds.upper == Approx(0.85F));
+    CHECK(loadedMemory.bounds.edgeFade == Approx(0.05F));
+    CHECK(loadedMemory.boundsKeyMode ==
+          TimingColouriseBoundsKeyMode::CentreSpread);
+    REQUIRE(loadedMemory.boundsParameterKeys.size() == 1U);
+    CHECK(loadedMemory.boundsParameterKeys.front().parameter ==
+          TimingColouriseBoundsParameter::Centre);
+    CHECK(loadedMemory.boundsParameterKeys.front().value ==
+          Approx(0.4F));
+    REQUIRE(loadedMemory.boundsKeys.size() == 1U);
+    CHECK(loadedMemory.boundsKeys.front().bounds.upper == Approx(0.6F));
+    CHECK(loadedMemory.edited);
+    CHECK(loadedMemory.adoptedGlobalRevision == 3U);
+}
+
+TEST_CASE(
+    "Visual Feature field selection stashes and restores bounds authoring",
+    "[timing][colourise][bounds][field-memory]") {
+    using invisible_places::timing::TimingColouriseFieldSelector;
+    using invisible_places::timing::TimingColouriseFieldSource;
+    using invisible_places::timing::TimingScalarBoundsStore;
+
+    TimingColouriseEffect effect;
+    effect.field.scalarFieldName = "SurfaceRoughness";
+    effect.baseBounds = {.lower = -2.0F, .upper = 4.0F, .edgeFade = 0.2F};
+    effect.boundsKeyMode = TimingColouriseBoundsKeyMode::CentreSpread;
+    effect.boundsParameterKeys = {
+        {.parameter = TimingColouriseBoundsParameter::Centre,
+         .position = 0.5F,
+         .value = 1.25F},
+    };
+    effect.boundsKeys = {
+        {.position = 0.75F,
+         .bounds = {.lower = -1.0F, .upper = 2.0F, .edgeFade = 0.1F}},
+    };
+    effect.boundsEdited = true;
+    effect.boundsAdoptedGlobalRevision = 2U;
+
+    const TimingColouriseFieldSelector heat{
+        .source = TimingColouriseFieldSource::Scalar,
+        .scalarFieldName = "Heat",
+    };
+    const TimingColouriseBounds fallback{
+        .lower = 0.0F,
+        .upper = 10.0F,
+        .edgeFade = 0.1F,
+    };
+    invisible_places::timing::ApplyTimingColouriseFieldSelection(
+        &effect,
+        heat,
+        fallback,
+        nullptr);
+    CHECK(effect.field.scalarFieldName == "Heat");
+    CHECK(effect.baseBounds.lower == Approx(0.0F));
+    CHECK(effect.baseBounds.upper == Approx(10.0F));
+    CHECK(effect.boundsKeyMode ==
+          TimingColouriseBoundsKeyMode::LowerUpper);
+    CHECK(effect.boundsParameterKeys.empty());
+    CHECK(effect.boundsKeys.empty());
+    CHECK_FALSE(effect.boundsEdited);
+    CHECK(effect.boundsAdoptedGlobalRevision == 0U);
+    REQUIRE(effect.fieldBoundsMemory.size() == 1U);
+    CHECK(effect.fieldBoundsMemory.front().selector.scalarFieldName ==
+          "SurfaceRoughness");
+    CHECK(effect.fieldBoundsMemory.front().edited);
+
+    // Re-selecting the active selector is a no-op.
+    invisible_places::timing::ApplyTimingColouriseFieldSelection(
+        &effect,
+        heat,
+        fallback,
+        nullptr);
+    CHECK(effect.fieldBoundsMemory.size() == 1U);
+
+    // A first visit with a shared store adopts its Global bounds instead
+    // of the fallback and remembers the adopted revision.
+    TimingScalarBoundsStore store;
+    store.selector = TimingColouriseFieldSelector{
+        .source = TimingColouriseFieldSource::Scalar,
+        .scalarFieldName = "Moss",
+    };
+    store.globalBounds = {.lower = 0.3F, .upper = 0.7F, .edgeFade = 0.15F};
+    store.revision = 5U;
+    invisible_places::timing::ApplyTimingColouriseFieldSelection(
+        &effect,
+        store.selector,
+        fallback,
+        &store);
+    CHECK(effect.field.scalarFieldName == "Moss");
+    CHECK(effect.baseBounds.lower == Approx(0.3F));
+    CHECK(effect.baseBounds.upper == Approx(0.7F));
+    CHECK_FALSE(effect.boundsEdited);
+    CHECK(effect.boundsAdoptedGlobalRevision == 5U);
+
+    // Returning to the original selector restores its complete bounds
+    // authoring: base bounds, key mode, both key vectors, edited state.
+    invisible_places::timing::ApplyTimingColouriseFieldSelection(
+        &effect,
+        TimingColouriseFieldSelector{
+            .source = TimingColouriseFieldSource::Scalar,
+            .scalarFieldName = "SurfaceRoughness",
+        },
+        fallback,
+        nullptr);
+    CHECK(effect.field.scalarFieldName == "SurfaceRoughness");
+    CHECK(effect.baseBounds.lower == Approx(-2.0F));
+    CHECK(effect.baseBounds.upper == Approx(4.0F));
+    CHECK(effect.baseBounds.edgeFade == Approx(0.2F));
+    CHECK(effect.boundsKeyMode ==
+          TimingColouriseBoundsKeyMode::CentreSpread);
+    REQUIRE(effect.boundsParameterKeys.size() == 1U);
+    CHECK(effect.boundsParameterKeys.front().parameter ==
+          TimingColouriseBoundsParameter::Centre);
+    CHECK(effect.boundsParameterKeys.front().value == Approx(1.25F));
+    REQUIRE(effect.boundsKeys.size() == 1U);
+    CHECK(effect.boundsKeys.front().bounds.upper == Approx(2.0F));
+    CHECK(effect.boundsEdited);
+    CHECK(effect.boundsAdoptedGlobalRevision == 2U);
+    // Every visited selector keeps a remembered entry.
+    CHECK(effect.fieldBoundsMemory.size() == 3U);
+}
+
+TEST_CASE(
+    "Unedited Visual Feature bounds follow the latest Global edit",
+    "[timing][colourise][bounds][field-memory]") {
+    using invisible_places::timing::TimingScalarBoundsStore;
+
+    std::vector<TimingScalarBoundsStore> stores;
+    TimingColouriseEffect editor;
+    editor.field.scalarFieldName = "Heat";
+    editor.baseBounds = {.lower = 0.1F, .upper = 0.9F, .edgeFade = 0.1F};
+    TimingColouriseEffect follower;
+    follower.field.scalarFieldName = "Heat";
+    TimingColouriseEffect otherField;
+    otherField.field.scalarFieldName = "Moss";
+
+    invisible_places::timing::RecordTimingScalarBoundsEdit(
+        &stores,
+        &editor);
+    CHECK(editor.boundsEdited);
+    CHECK(editor.boundsAdoptedGlobalRevision == 1U);
+    REQUIRE(stores.size() == 1U);
+    CHECK(stores.front().selector.scalarFieldName == "Heat");
+    CHECK(stores.front().revision == 1U);
+    CHECK(stores.front().globalBounds.lower == Approx(0.1F));
+
+    CHECK(invisible_places::timing::RefreshTimingColouriseBoundsFromGlobal(
+        &follower,
+        stores));
+    CHECK(follower.baseBounds.lower == Approx(0.1F));
+    CHECK(follower.baseBounds.upper == Approx(0.9F));
+    CHECK(follower.boundsAdoptedGlobalRevision == 1U);
+    CHECK_FALSE(follower.boundsEdited);
+    // Already current: nothing further to adopt.
+    CHECK_FALSE(
+        invisible_places::timing::RefreshTimingColouriseBoundsFromGlobal(
+            &follower,
+            stores));
+    // A feature bound to another selector is untouched.
+    CHECK_FALSE(
+        invisible_places::timing::RefreshTimingColouriseBoundsFromGlobal(
+            &otherField,
+            stores));
+
+    editor.baseBounds = {.lower = 0.2F, .upper = 0.6F, .edgeFade = 0.1F};
+    invisible_places::timing::RecordTimingScalarBoundsEdit(
+        &stores,
+        &editor);
+    REQUIRE(stores.size() == 1U);
+    CHECK(stores.front().revision == 2U);
+    CHECK(invisible_places::timing::RefreshTimingColouriseBoundsFromGlobal(
+        &follower,
+        stores));
+    CHECK(follower.baseBounds.upper == Approx(0.6F));
+
+    // A locally edited feature stays detached from later Global edits.
+    follower.boundsEdited = true;
+    editor.baseBounds = {.lower = 0.05F, .upper = 0.4F, .edgeFade = 0.1F};
+    invisible_places::timing::RecordTimingScalarBoundsEdit(
+        &stores,
+        &editor);
+    CHECK(stores.front().revision == 3U);
+    CHECK_FALSE(
+        invisible_places::timing::RefreshTimingColouriseBoundsFromGlobal(
+            &follower,
+            stores));
+    CHECK(follower.baseBounds.upper == Approx(0.6F));
+
+    auto* mutableStore =
+        invisible_places::timing::FindTimingScalarBoundsStore(
+            &stores,
+            editor.field);
+    REQUIRE(mutableStore != nullptr);
+    const auto& constStores = stores;
+    const auto* constStore =
+        invisible_places::timing::FindTimingScalarBoundsStore(
+            constStores,
+            editor.field);
+    CHECK(constStore == mutableStore);
+    CHECK(invisible_places::timing::FindTimingScalarBoundsStore(
+              constStores,
+              otherField.field) == nullptr);
 }
 
 TEST_CASE(

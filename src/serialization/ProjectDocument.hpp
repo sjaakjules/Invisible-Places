@@ -21,7 +21,7 @@
 namespace invisible_places::serialization {
 
 inline constexpr std::size_t kMaxSerializedWaterRippleRuntimeCacheMemberships = 250'000U;
-inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 59U;
+inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 60U;
 inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 20U;
 inline constexpr std::uint32_t kAnimationDocumentSchemaVersion = 14U;
 inline constexpr std::uint32_t kWaterPathCacheSidecarSchemaVersion = 1U;
@@ -220,6 +220,10 @@ struct ProjectDocument {
         timingTakeStates;
     std::vector<invisible_places::timing::TimingColourisePaletteDefinition>
         timingColourisePalettes;
+    // Shared per-scalar-field bounds knowledge: the latest edited (Global)
+    // bounds plus named saved profiles, keyed by field selector.
+    std::vector<invisible_places::timing::TimingScalarBoundsStore>
+        timingScalarBoundsStores;
     std::uint32_t timingTakeSequence = 1U;
     std::uint32_t timingColourisePaletteSequence = 1U;
     std::uint32_t waterTimingRunSequence = 1U;

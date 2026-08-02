@@ -85,6 +85,9 @@ enum class TimingColouriseAmountOverrideMode : std::uint8_t {
     Scale,
 };
 
+// Legacy discriminator retained only for parsing documents written before
+// Visual Features carried independent colourise/emissive aspects. Runtime
+// effects no longer store a kind; they enable either or both aspects.
 enum class TimingEffectKind : std::uint8_t {
     Colourise = 0,
     Emissive,
@@ -198,10 +201,50 @@ struct TimingColouriseActivationRange {
     float end = 1.0F;
 };
 
+// Remembered bounds authoring for one scalar field selector, so switching a
+// Visual Feature between families/variants and back never loses edits. An
+// unedited entry keeps following the latest globally edited bounds for its
+// selector; the first local edit detaches it.
+struct TimingColouriseFieldBoundsMemory {
+    TimingColouriseFieldSelector selector{};
+    TimingColouriseBounds bounds{};
+    TimingColouriseBoundsKeyMode boundsKeyMode =
+        TimingColouriseBoundsKeyMode::LowerUpper;
+    std::vector<TimingColouriseBoundsParameterKey> boundsParameterKeys;
+    std::vector<TimingColouriseBoundsKey> boundsKeys;
+    bool edited = false;
+    // Global-store revision this entry last adopted; unedited entries with
+    // an older revision refresh from the shared store.
+    std::uint64_t adoptedGlobalRevision = 0U;
+};
+
+// A named, shareable bounds state for one scalar field selector.
+struct TimingScalarBoundsProfile {
+    std::string name;
+    TimingColouriseBounds bounds{};
+};
+
+// Project-wide bounds knowledge for one scalar field selector: the latest
+// edited bounds (the "Global" profile) plus named saved states.
+struct TimingScalarBoundsStore {
+    TimingColouriseFieldSelector selector{};
+    TimingColouriseBounds globalBounds{};
+    std::uint64_t revision = 0U;
+    std::vector<TimingScalarBoundsProfile> profiles;
+};
+
+// One Visual Feature: a single scalar-field binding with an activation
+// window that can drive colourise output, emissive output, or both.
 struct TimingColouriseEffect {
     std::string id;
-    std::string name = "Colourise";
-    TimingEffectKind kind = TimingEffectKind::Colourise;
+    std::string name = "Visual Feature";
+    // Independent output aspects. Disabling an aspect keeps its authored
+    // settings and keys dormant, exactly as the former Colourise/Emissive
+    // kind split preserved the other kind's data. Sanitize guarantees at
+    // least one aspect stays enabled, and that the emissive aspect only
+    // pairs with a scalar field source.
+    bool colouriseEnabled = true;
+    bool emissiveEnabled = false;
     bool enabled = true;
     TimingColouriseActivationRange activationRange{};
     TimingColouriseFieldSelector field{};
@@ -247,6 +290,12 @@ struct TimingColouriseEffect {
     std::vector<TimingColouriseBoundsParameterKey> boundsParameterKeys;
     // Legacy v1 snapshot keys. New authoring should use boundsParameterKeys.
     std::vector<TimingColouriseBoundsKey> boundsKeys;
+    // Whether the live bounds above were locally edited for the current
+    // field selector (detaching them from the shared Global bounds).
+    bool boundsEdited = false;
+    std::uint64_t boundsAdoptedGlobalRevision = 0U;
+    // Per-selector authoring memory for every field this feature visited.
+    std::vector<TimingColouriseFieldBoundsMemory> fieldBoundsMemory;
 };
 
 struct TimingColourisePaletteDefinition {
@@ -354,8 +403,16 @@ ResolveTimingColouriseBoundsHandleEdit(
 [[nodiscard]] bool SetTimingColouriseBoundsKeyMode(
     TimingColouriseEffect* effect,
     TimingColouriseBoundsKeyMode mode);
+// Palette phase and amount override belong to the colourise aspect; the
+// emissive level belongs to the emissive aspect. Keys for a disabled
+// aspect's parameters stay stored but are never counted, moved, or
+// evaluated.
 [[nodiscard]] bool TimingEffectParameterIsSupported(
-    TimingEffectKind kind,
+    bool colouriseEnabled,
+    bool emissiveEnabled,
+    TimingColouriseEffectParameter parameter);
+[[nodiscard]] bool TimingEffectParameterIsSupported(
+    const TimingColouriseEffect& effect,
     TimingColouriseEffectParameter parameter);
 [[nodiscard]] TimingColouriseActivationRange
 SanitizeTimingColouriseActivationRange(
@@ -378,6 +435,53 @@ SanitizeTimingColourisePaletteDefinition(
     TimingTakeDefinition definition);
 [[nodiscard]] TimingTakeSceneState SanitizeTimingTakeSceneState(
     TimingTakeSceneState state);
+// Upserts the live bounds authoring (base bounds, key mode, both key
+// vectors, edited flag) into the effect's per-selector memory under its
+// current field selector.
+void StashTimingColouriseFieldBounds(TimingColouriseEffect* effect);
+// Switches the effect's field selector without losing authoring: the
+// current selector's bounds state is stashed first, then the new selector
+// restores its remembered state when one exists. Otherwise the effect
+// adopts the shared store's Global bounds (when provided) or the supplied
+// fallback range, with cleared keys and an unedited state.
+void ApplyTimingColouriseFieldSelection(
+    TimingColouriseEffect* effect,
+    const TimingColouriseFieldSelector& selector,
+    const TimingColouriseBounds& fallbackBounds,
+    const TimingScalarBoundsStore* globalStore);
+[[nodiscard]] TimingScalarBoundsStore* FindTimingScalarBoundsStore(
+    std::vector<TimingScalarBoundsStore>* stores,
+    const TimingColouriseFieldSelector& selector);
+[[nodiscard]] const TimingScalarBoundsStore* FindTimingScalarBoundsStore(
+    const std::vector<TimingScalarBoundsStore>& stores,
+    const TimingColouriseFieldSelector& selector);
+// Records a local base-bounds edit: marks the effect detached ("edited")
+// and publishes the bounds as the selector's latest Global state so other
+// features with unedited bounds for this selector follow along.
+void RecordTimingScalarBoundsEdit(
+    std::vector<TimingScalarBoundsStore>* stores,
+    TimingColouriseEffect* effect);
+// Adopts the selector's latest Global bounds when this effect has no local
+// edit and the store has advanced past the revision it last adopted.
+// Returns true when the bounds changed.
+bool RefreshTimingColouriseBoundsFromGlobal(
+    TimingColouriseEffect* effect,
+    const std::vector<TimingScalarBoundsStore>& stores);
+// Merges legacy single-aspect effect pairs into combined Visual Features:
+// an enabled colourise-only effect adopts an enabled emissive-only partner
+// only when the pair provably evaluated identically as separate objects —
+// exact same field, exactly equal activation window, identical complete
+// bounds authoring (base bounds, key mode, both key vectors; bounds gate
+// emissive output just as they gate colourise), and no renderer slot-cap
+// pressure anywhere inside the window (cap selection is position
+// dependent). Pairing is first-match in list order; unmatched effects are
+// left untouched. mergeEligible (index-aligned when provided) restricts
+// which effects may participate, so aspect-authored features in a mixed
+// document are never re-merged. Returns the number of merges performed.
+std::size_t MergeLegacyTimingEffectAspects(
+    std::vector<TimingColouriseEffect>* effects,
+    const std::vector<bool>* mergeEligible = nullptr,
+    std::size_t rendererSlotCapacity = 8U);
 // Moves an effect to its new final list index while keeping the effect and all
 // of its owned animation tracks together.
 [[nodiscard]] bool MoveTimingColouriseEffect(

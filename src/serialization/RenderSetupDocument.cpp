@@ -472,8 +472,7 @@ RenderSetupSummary SummarizeRenderSetupTiming(
             continue;
         }
         ++summary.enabledColouriseEffectCount;
-        if (effect.kind ==
-            invisible_places::timing::TimingEffectKind::Colourise) {
+        if (effect.colouriseEnabled) {
             summary.colouriseKeyCount += effect.paletteKeys.size();
             summary.colouriseKeyCount +=
                 effect.paletteStopParameterKeys.size();
@@ -486,7 +485,7 @@ RenderSetupSummary SummarizeRenderSetupTiming(
                         TimingColouriseEffectParameterKey& key) {
                     return invisible_places::timing::
                         TimingEffectParameterIsSupported(
-                            effect.kind,
+                            effect,
                             key.parameter);
                 }));
         summary.colouriseKeyCount += effect.boundsParameterKeys.size();

@@ -203,12 +203,13 @@ RenderSetupDocument MakeRenderSetup() {
             },
         };
         if (boundsEffect.id == "emissive-upper-spread") {
-            boundsEffect.kind =
-                invisible_places::timing::TimingEffectKind::Emissive;
+            boundsEffect.colouriseEnabled = false;
+            boundsEffect.emissiveEnabled = true;
             boundsEffect.name = "Emissive heat";
             boundsEffect.emissiveLevel = 2.5F;
-            // Palette state and Colourise controls remain dormant so changing
-            // the effect kind later does not discard authored work.
+            // Palette state and Colourise controls remain dormant so
+            // re-enabling the colourise aspect later does not discard
+            // authored work.
             boundsEffect.paletteKeys.push_back(
                 TimingColourisePaletteKey{
                     .position = 0.45F,
@@ -314,7 +315,13 @@ TEST_CASE(
         saved.at("snapshot").at("timing_take_scene_state");
     REQUIRE(savedTiming.at("timing_effects").size() == 4U);
     REQUIRE(savedTiming.at("colourise_effects").size() == 3U);
+    // Emissive-only features still write the legacy kind for old readers
+    // while carrying the authoritative aspect flags.
     CHECK(savedTiming.at("timing_effects")[3].at("kind") == "emissive");
+    CHECK(savedTiming.at("timing_effects")[3].at("colourise_enabled") ==
+          false);
+    CHECK(savedTiming.at("timing_effects")[3].at("emissive_enabled") ==
+          true);
     CHECK(savedTiming.at("timing_effects")[3].at("emissive_level") ==
           Approx(2.5F));
     const auto& activation =
@@ -358,8 +365,8 @@ TEST_CASE(
           invisible_places::timing::TimingColouriseBoundsKeyMode::LowerSpread);
     CHECK(loaded->timingState.colouriseEffects[3].boundsKeyMode ==
           invisible_places::timing::TimingColouriseBoundsKeyMode::UpperSpread);
-    CHECK(loaded->timingState.colouriseEffects[3].kind ==
-          invisible_places::timing::TimingEffectKind::Emissive);
+    CHECK_FALSE(loaded->timingState.colouriseEffects[3].colouriseEnabled);
+    CHECK(loaded->timingState.colouriseEffects[3].emissiveEnabled);
     CHECK(loaded->timingState.colouriseEffects[3].emissiveLevel ==
           Approx(2.5F));
     CHECK(loaded->timingState.colouriseEffects[3].paletteKeys.size() == 1U);
@@ -422,8 +429,8 @@ TEST_CASE(
     const auto legacyPath = directory.path / "legacy.iprender.json";
     auto authored = MakeRenderSetup();
     for (auto& effect : authored.timingState.colouriseEffects) {
-        effect.kind =
-            invisible_places::timing::TimingEffectKind::Colourise;
+        effect.colouriseEnabled = true;
+        effect.emissiveEnabled = false;
     }
     std::string error;
     REQUIRE(invisible_places::serialization::SaveRenderSetupDocument(
@@ -466,6 +473,113 @@ TEST_CASE(
             legacyPath,
             &error);
     CHECK(historyEntry.has_value());
+}
+
+TEST_CASE(
+    "Render setup snapshots merge legacy single-aspect timing effects on load",
+    "[render-setup][serialization][migration]") {
+    using invisible_places::timing::TimingColouriseEffectParameter;
+
+    TemporaryDirectory directory;
+    const auto currentPath = directory.path / "current.iprender.json";
+    const auto mismatchPath = directory.path / "mismatch.iprender.json";
+    const auto legacyPath = directory.path / "legacy.iprender.json";
+    const auto authored = MakeRenderSetup();
+    std::string error;
+    REQUIRE(invisible_places::serialization::SaveRenderSetupDocument(
+        authored,
+        currentPath,
+        &error));
+
+    // Recreate a pre-Visual-Feature snapshot that only carries the legacy
+    // kind discriminator on each timing effect.
+    nlohmann::json legacy;
+    {
+        std::ifstream input{currentPath};
+        REQUIRE(input.is_open());
+        legacy = nlohmann::json::parse(input);
+    }
+    auto& legacyTiming = legacy.at("snapshot")
+                             .at("timing_take_scene_state");
+    for (auto& effectJson : legacyTiming.at("timing_effects")) {
+        effectJson.erase("colourise_enabled");
+        effectJson.erase("emissive_enabled");
+    }
+    {
+        std::ofstream output{mismatchPath};
+        REQUIRE(output.is_open());
+        output << legacy.dump(2);
+    }
+
+    // The authored snapshot's emissive effect shares no colourise
+    // effect's complete bounds authoring (its key mode and parameter
+    // tracks differ), so nothing merges: bounds gate emissive output and
+    // one merged object could not reproduce both authored states.
+    const auto unmergedLoaded =
+        invisible_places::serialization::LoadRenderSetupDocument(
+            mismatchPath,
+            &error);
+    REQUIRE(unmergedLoaded.has_value());
+    REQUIRE(unmergedLoaded->timingState.colouriseEffects.size() == 4U);
+    CHECK_FALSE(
+        unmergedLoaded->timingState.colouriseEffects[3].colouriseEnabled);
+    CHECK(unmergedLoaded->timingState.colouriseEffects[3].emissiveEnabled);
+    // Legacy-parsed effects load detached from the shared Global bounds.
+    for (const auto& effect :
+         unmergedLoaded->timingState.colouriseEffects) {
+        CHECK(effect.boundsEdited);
+    }
+
+    // Align the second colourise effect's complete bounds authoring with
+    // the emissive effect's; the pair then provably evaluates identically
+    // and merges. The first colourise effect still differs by window.
+    auto aligned = legacy;
+    auto& alignedEffects = aligned.at("snapshot")
+                               .at("timing_take_scene_state")
+                               .at("timing_effects");
+    const auto emissiveJson = alignedEffects[3];
+    alignedEffects[1]["base_bounds"] = emissiveJson.at("base_bounds");
+    alignedEffects[1]["bounds_key_mode"] =
+        emissiveJson.at("bounds_key_mode");
+    alignedEffects[1]["bounds_parameter_keys"] =
+        emissiveJson.at("bounds_parameter_keys");
+    alignedEffects[1]["bounds_keys"] = emissiveJson.at("bounds_keys");
+    {
+        std::ofstream output{legacyPath};
+        REQUIRE(output.is_open());
+        output << aligned.dump(2);
+    }
+
+    const auto loaded =
+        invisible_places::serialization::LoadRenderSetupDocument(
+            legacyPath,
+            &error);
+    REQUIRE(loaded.has_value());
+    // The emissive-only effect pairs with the first colourise effect
+    // sharing its field, exact window, enabled toggle, and complete
+    // bounds authoring.
+    REQUIRE(loaded->timingState.colouriseEffects.size() == 3U);
+    CHECK(loaded->timingState.colouriseEffects[0].id == "colourise-1");
+    CHECK_FALSE(loaded->timingState.colouriseEffects[0].emissiveEnabled);
+    const auto& merged = loaded->timingState.colouriseEffects[1];
+    CHECK(merged.id == "colourise-centre-spread");
+    CHECK(merged.colouriseEnabled);
+    CHECK(merged.emissiveEnabled);
+    CHECK(merged.emissiveLevel == Approx(2.5F));
+    CHECK(merged.boundsEdited);
+    // Only the partner's EmissiveLevel key transfers; its dormant
+    // AmountOverride key is dropped with the partner.
+    REQUIRE(merged.effectParameterKeys.size() == 1U);
+    CHECK(merged.effectParameterKeys.front().parameter ==
+          TimingColouriseEffectParameter::EmissiveLevel);
+    CHECK(merged.effectParameterKeys.front().value == Approx(4.0F));
+    // The merged feature carries the shared (aligned) bounds authoring.
+    CHECK(merged.boundsKeyMode ==
+          invisible_places::timing::TimingColouriseBoundsKeyMode::
+              UpperSpread);
+    CHECK(loaded->timingState.colouriseEffects[2].id ==
+          "colourise-lower-spread");
+    CHECK_FALSE(loaded->timingState.colouriseEffects[2].emissiveEnabled);
 }
 
 TEST_CASE(

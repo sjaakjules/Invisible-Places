@@ -389,8 +389,14 @@ TEST_CASE("Palette stop-property animation and provenance round-trip",
       savedJson.at("timing_take_states").front();
   REQUIRE(savedState.at("timing_effects").size() == 1U);
   REQUIRE(savedState.at("colourise_effects").size() == 1U);
+  // The legacy kind stays written for pre-Visual-Feature readers; current
+  // readers rely on the aspect flags.
   CHECK(savedState.at("timing_effects").front().at("kind") ==
         "colourise");
+  CHECK(savedState.at("timing_effects").front().at("colourise_enabled") ==
+        true);
+  CHECK(savedState.at("timing_effects").front().at("emissive_enabled") ==
+        false);
   const auto &savedEffect = savedState.at("timing_effects").front();
   CHECK(savedEffect.at("palette_key_model") == "stop_parameters");
   CHECK(savedEffect.at("base_palette")
@@ -758,6 +764,82 @@ TEST_CASE("Legacy edited preset synthesizes a local palette edit",
             .at("stops")
             .front()
             .at("id") == "private-stop");
+}
+
+TEST_CASE("Timing scalar bounds stores and named profiles round-trip",
+          "[project][serialization][timing][bounds]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::timing::TimingColouriseFieldSource;
+  using invisible_places::timing::TimingScalarBoundsProfile;
+  using invisible_places::timing::TimingScalarBoundsStore;
+
+  ProjectDocument document;
+  TimingScalarBoundsStore store;
+  store.selector.source = TimingColouriseFieldSource::Scalar;
+  store.selector.scalarFieldName = "Heat";
+  store.globalBounds = {.lower = 0.2F, .upper = 0.8F, .edgeFade = 0.15F};
+  store.revision = 3U;
+  store.profiles = {
+      TimingScalarBoundsProfile{
+          .name = "Wet season",
+          .bounds = {.lower = 0.1F, .upper = 0.5F, .edgeFade = 0.05F},
+      },
+      // Nameless entries are tolerated on disk but dropped on load.
+      TimingScalarBoundsProfile{
+          .name = "",
+          .bounds = {.lower = 0.0F, .upper = 1.0F, .edgeFade = 0.1F},
+      },
+      TimingScalarBoundsProfile{
+          .name = "Dry season",
+          .bounds = {.lower = 0.4F, .upper = 0.9F, .edgeFade = 0.2F},
+      },
+  };
+  document.timingScalarBoundsStores.push_back(store);
+
+  TemporaryProjectFile file{
+      "invisible_places_timing_scalar_bounds_store_round_trip.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+
+  std::ifstream input{file.path};
+  REQUIRE(input.is_open());
+  const auto savedJson = nlohmann::json::parse(input);
+  REQUIRE(savedJson.at("timing_scalar_bounds_stores").size() == 1U);
+  const auto &savedStore =
+      savedJson.at("timing_scalar_bounds_stores").front();
+  CHECK(savedStore.at("field").at("scalar_field_name") == "Heat");
+  CHECK(savedStore.at("global_bounds").at("lower") ==
+        Catch::Approx(0.2F));
+  CHECK(savedStore.at("global_bounds").at("upper") ==
+        Catch::Approx(0.8F));
+  CHECK(savedStore.at("global_bounds").at("edge_fade") ==
+        Catch::Approx(0.15F));
+  CHECK(savedStore.at("revision") == 3U);
+  REQUIRE(savedStore.at("profiles").size() == 3U);
+  CHECK(savedStore.at("profiles")[0].at("name") == "Wet season");
+  CHECK(savedStore.at("profiles")[0].at("bounds").at("upper") ==
+        Catch::Approx(0.5F));
+
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->timingScalarBoundsStores.size() == 1U);
+  const auto &loadedStore = loaded->timingScalarBoundsStores.front();
+  CHECK(loadedStore.selector.source == TimingColouriseFieldSource::Scalar);
+  CHECK(loadedStore.selector.scalarFieldName == "Heat");
+  CHECK(loadedStore.globalBounds.lower == Catch::Approx(0.2F));
+  CHECK(loadedStore.globalBounds.upper == Catch::Approx(0.8F));
+  CHECK(loadedStore.globalBounds.edgeFade == Catch::Approx(0.15F));
+  CHECK(loadedStore.revision == 3U);
+  REQUIRE(loadedStore.profiles.size() == 2U);
+  CHECK(loadedStore.profiles[0].name == "Wet season");
+  CHECK(loadedStore.profiles[0].bounds.lower == Catch::Approx(0.1F));
+  CHECK(loadedStore.profiles[0].bounds.upper == Catch::Approx(0.5F));
+  CHECK(loadedStore.profiles[0].bounds.edgeFade == Catch::Approx(0.05F));
+  CHECK(loadedStore.profiles[1].name == "Dry season");
+  CHECK(loadedStore.profiles[1].bounds.upper == Catch::Approx(0.9F));
 }
 
 TEST_CASE("Schema 51 palette snapshots migrate without changing their animation model",

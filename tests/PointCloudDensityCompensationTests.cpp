@@ -671,3 +671,115 @@ TEST_CASE(
         Catch::Approx(1.35F).margin(1.0e-5F));
     CHECK(fastInside.alpha[kCenter] == Catch::Approx(fastOff.alpha[kCenter]).margin(1.0e-6F));
 }
+
+TEST_CASE(
+    "Offline timing dual-aspect features occupy one resolved slot per aspect",
+    "[output][offline][timing-colourise][emissive][capacity]") {
+    using invisible_places::renderer::pointcloud::PointCloudColorMode;
+    using invisible_places::renderer::pointcloud::PointCloudFalloffProfile;
+    using invisible_places::renderer::pointcloud::PointCloudStyleState;
+    using invisible_places::renderer::pointcloud::ResolvedTimingColouriseStack;
+    using invisible_places::renderer::pointcloud::TimingColouriseOutput;
+    using invisible_places::renderer::pointcloud::TimingColouriseSource;
+    using invisible_places::renderer::pointcloud::kTimingColouriseMaxEffects;
+
+    // A Visual Feature with both aspects enabled resolves into two stack
+    // slots (its colourise slot before its emissive slot, sharing bounds).
+    // Four active dual-aspect features therefore fill the entire renderer
+    // capacity; the app-side resolver drops a fifth active dual-aspect
+    // feature whole because its two-slot cost exceeds the remaining space.
+    STATIC_CHECK(4U * 2U == kTimingColouriseMaxEffects);
+    STATIC_CHECK(5U * 2U > kTimingColouriseMaxEffects);
+
+    auto render = [](bool tintVisible, float emissiveLevel, bool fastBasic) {
+        invisible_places::io::LoadedPointCloud cloud;
+        cloud.positions = {{0.0F, 0.0F, 0.0F}};
+        cloud.scalarFields = {{
+            .name = "Interest",
+            .minimum = 0.0F,
+            .maximum = 2.0F,
+            .count = 1U,
+            .valid = true,
+        }};
+        cloud.scalarFieldValues = {1.0F};
+
+        PointCloudStyleState style;
+        style.colorMode = PointCloudColorMode::SolidColor;
+        style.solidColor = {0.20F, 0.40F, 0.80F, 1.0F};
+        style.falloffProfile = PointCloudFalloffProfile::HardDisc;
+        style.solidCenters = true;
+        invisible_places::style::SetScalarConstant(&style.pointSize, 4.0F);
+        invisible_places::style::SetScalarConstant(&style.opacity, 1.0F);
+        invisible_places::style::SetScalarConstant(&style.emissiveStrength, 0.0F);
+
+        ResolvedTimingColouriseStack stack;
+        REQUIRE(stack.effects.size() == 8U);
+        stack.effectCount = static_cast<std::uint32_t>(stack.effects.size());
+        // Four dual-aspect features: slots 0/2/4/6 carry the colourise
+        // aspect and slots 1/3/5/7 the paired emissive aspect with the
+        // same bounds. Only the topmost pair is visible.
+        for (std::size_t feature = 0U; feature < 4U; ++feature) {
+            const bool topmost = feature == 3U;
+            auto& colourise = stack.effects[feature * 2U];
+            colourise.enabled = true;
+            colourise.output = TimingColouriseOutput::Colourise;
+            colourise.source = TimingColouriseSource::ScalarField;
+            colourise.scalarFieldSlot = 0;
+            colourise.lowerBound = 0.5F;
+            colourise.upperBound = 1.5F;
+            colourise.edgeFadeFraction = 0.25F;
+            colourise.rgbaLut.fill(
+                {1.0F, 0.0F, 0.0F, topmost && tintVisible ? 1.0F : 0.0F});
+            auto& emissive = stack.effects[feature * 2U + 1U];
+            emissive.enabled = true;
+            emissive.output = TimingColouriseOutput::Emissive;
+            emissive.source = TimingColouriseSource::ScalarField;
+            emissive.scalarFieldSlot = 0;
+            emissive.lowerBound = 0.5F;
+            emissive.upperBound = 1.5F;
+            emissive.edgeFadeFraction = 0.25F;
+            emissive.emissiveLevel = topmost ? emissiveLevel : 0.0F;
+        }
+
+        const invisible_places::output::OfflinePointLayer layer{
+            .cloud = &cloud,
+            .style = style,
+            .timingColourise = stack,
+            .hasSourceRgb = false,
+            .fastBasic = fastBasic,
+            .localToWorld = glm::mat4{1.0F},
+        };
+        invisible_places::camera::CameraState cameraState;
+        cameraState.position = {0.0F, 0.0F, 5.0F};
+        cameraState.target = {0.0F, 0.0F, 0.0F};
+        cameraState.nearPlane = 0.1F;
+        cameraState.farPlane = 20.0F;
+
+        invisible_places::output::ExrImage image;
+        invisible_places::output::InitializeExrImage(&image, 9U, 9U);
+        invisible_places::output::RenderPointCloudTile(
+            {layer},
+            cameraState,
+            invisible_places::output::OfflineRenderTile{0U, 0U, 9U, 9U},
+            &image);
+        return image;
+    };
+
+    constexpr std::size_t kCenter = 4U * 9U + 4U;
+    for (const bool fastBasic : {false, true}) {
+        const auto base = render(false, 0.0F, fastBasic);
+        const auto tinted = render(true, 0.0F, fastBasic);
+        const auto dual = render(true, 0.5F, fastBasic);
+        REQUIRE(base.alpha[kCenter] > 0.0F);
+        // The colourise slot tints the point toward the LUT colour.
+        CHECK(tinted.beautyR[kCenter] > base.beautyR[kCenter]);
+        CHECK(tinted.beautyR[kCenter] > tinted.beautyB[kCenter]);
+        // The paired emissive slot lifts the tinted result further.
+        CHECK(dual.beautyR[kCenter] > tinted.beautyR[kCenter]);
+        // Neither aspect ever changes point opacity.
+        CHECK(tinted.alpha[kCenter] ==
+              Catch::Approx(base.alpha[kCenter]).margin(1.0e-6F));
+        CHECK(dual.alpha[kCenter] ==
+              Catch::Approx(base.alpha[kCenter]).margin(1.0e-6F));
+    }
+}
