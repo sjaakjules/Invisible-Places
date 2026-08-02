@@ -298,6 +298,9 @@ TEST_CASE("Palette stop-property animation and provenance round-trip",
   using invisible_places::serialization::ProjectDocument;
   using invisible_places::serialization::SaveProjectDocument;
   using invisible_places::timing::TimingColouriseEffect;
+  using invisible_places::timing::TimingColouriseAmountOverrideMode;
+  using invisible_places::timing::TimingColouriseEffectParameter;
+  using invisible_places::timing::TimingColouriseEffectParameterKey;
   using invisible_places::timing::TimingColourisePaletteKeyModel;
   using invisible_places::timing::TimingColourisePaletteSourceKind;
   using invisible_places::timing::TimingColourisePaletteStopParameter;
@@ -325,6 +328,24 @@ TEST_CASE("Palette stop-property animation and provenance round-trip",
   effect.paletteSourceId = "colourise-palette-9";
   effect.paletteSourceName = "Mako Study";
   effect.paletteEdited = true;
+  effect.colouriseAmountOverrideMode =
+      TimingColouriseAmountOverrideMode::Scale;
+  effect.colouriseAmountOverride = 0.42F;
+  effect.palettePhaseOffset = -1.25F;
+  effect.effectParameterKeys = {
+      TimingColouriseEffectParameterKey{
+          .parameter = TimingColouriseEffectParameter::PalettePhase,
+          .position = 0.25F,
+          .value = 2.75F,
+          .interpolation = WaterScenarioInterpolation::Linear,
+      },
+      TimingColouriseEffectParameterKey{
+          .parameter = TimingColouriseEffectParameter::AmountOverride,
+          .position = 0.6F,
+          .value = 0.3F,
+          .interpolation = WaterScenarioInterpolation::Hold,
+      },
+  };
   effect.paletteStopParameterKeys = {
       TimingColourisePaletteStopParameterKey{
           .stopId = "deep-stop",
@@ -364,10 +385,13 @@ TEST_CASE("Palette stop-property animation and provenance round-trip",
   std::ifstream input{file.path};
   REQUIRE(input.is_open());
   const auto savedJson = nlohmann::json::parse(input);
-  const auto &savedEffect = savedJson.at("timing_take_states")
-                                .front()
-                                .at("colourise_effects")
-                                .front();
+  const auto &savedState =
+      savedJson.at("timing_take_states").front();
+  REQUIRE(savedState.at("timing_effects").size() == 1U);
+  REQUIRE(savedState.at("colourise_effects").size() == 1U);
+  CHECK(savedState.at("timing_effects").front().at("kind") ==
+        "colourise");
+  const auto &savedEffect = savedState.at("timing_effects").front();
   CHECK(savedEffect.at("palette_key_model") == "stop_parameters");
   CHECK(savedEffect.at("base_palette")
             .at("stops")
@@ -378,6 +402,17 @@ TEST_CASE("Palette stop-property animation and provenance round-trip",
         "colourise-palette-9");
   CHECK(savedEffect.at("palette_source").at("name") == "Mako Study");
   CHECK(savedEffect.at("palette_source").at("edited"));
+  CHECK(savedEffect.at("colourise_amount_override").at("mode") ==
+        "scale");
+  CHECK(savedEffect.at("colourise_amount_override").at("value") ==
+        Catch::Approx(0.42F));
+  CHECK(savedEffect.at("palette_phase_offset") ==
+        Catch::Approx(-1.25F));
+  REQUIRE(savedEffect.at("effect_parameter_keys").size() == 2U);
+  CHECK(savedEffect.at("effect_parameter_keys")[0].at("parameter") ==
+        "palette_phase");
+  CHECK(savedEffect.at("effect_parameter_keys")[1].at("parameter") ==
+        "amount_override");
   REQUIRE(savedEffect.at("palette_stop_parameter_keys").size() == 3U);
 
   const auto loaded = LoadProjectDocument(file.path, &errorMessage);
@@ -394,6 +429,24 @@ TEST_CASE("Palette stop-property animation and provenance round-trip",
   CHECK(loadedEffect.paletteSourceId == "colourise-palette-9");
   CHECK(loadedEffect.paletteSourceName == "Mako Study");
   CHECK(loadedEffect.paletteEdited);
+  CHECK(loadedEffect.colouriseAmountOverrideMode ==
+        TimingColouriseAmountOverrideMode::Scale);
+  CHECK(loadedEffect.colouriseAmountOverride ==
+        Catch::Approx(0.42F));
+  CHECK(loadedEffect.palettePhaseOffset == Catch::Approx(-1.25F));
+  REQUIRE(loadedEffect.effectParameterKeys.size() == 2U);
+  CHECK(loadedEffect.effectParameterKeys[0].parameter ==
+        TimingColouriseEffectParameter::PalettePhase);
+  CHECK(loadedEffect.effectParameterKeys[0].position ==
+        Catch::Approx(0.25F));
+  CHECK(loadedEffect.effectParameterKeys[0].value ==
+        Catch::Approx(2.75F));
+  CHECK(loadedEffect.effectParameterKeys[1].parameter ==
+        TimingColouriseEffectParameter::AmountOverride);
+  CHECK(loadedEffect.effectParameterKeys[1].position ==
+        Catch::Approx(0.6F));
+  CHECK(loadedEffect.effectParameterKeys[1].value ==
+        Catch::Approx(0.3F));
   REQUIRE(loadedEffect.basePalette.stops.size() == 2U);
   CHECK(loadedEffect.basePalette.stops[0].id == "deep-stop");
   CHECK(loadedEffect.basePalette.stops[1].id == "foam-stop");
@@ -410,13 +463,308 @@ TEST_CASE("Palette stop-property animation and provenance round-trip",
   CHECK(loadedEffect.paletteStopParameterKeys[2].parameter ==
         TimingColourisePaletteStopParameter::ColouriseAmount);
   CHECK(loadedEffect.paletteStopParameterKeys[2].interpolation ==
-        WaterScenarioInterpolation::Hold);
+        WaterScenarioInterpolation::Smooth);
+}
+
+TEST_CASE("Reversed edited preset palette provenance round-trips",
+          "[project][serialization][colourise][palette][preset]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::timing::ReverseTimingColourisePalette;
+  using invisible_places::timing::TimingColouriseEffect;
+  using invisible_places::timing::TimingColourisePalette;
+  using invisible_places::timing::TimingColourisePaletteSourceKind;
+  using invisible_places::timing::TimingTakeSceneState;
+
+  TimingColouriseEffect effect;
+  effect.id = "colourise-effect-reversed-preset";
+  effect.name = "Reversed Haline";
+  effect.paletteSourceKind = TimingColourisePaletteSourceKind::Preset;
+  effect.paletteSourceId = "cmocean-haline";
+  effect.paletteSourceName = "Haline";
+  effect.paletteEdited = true;
+  effect.basePalette = ReverseTimingColourisePalette(TimingColourisePalette{
+      .stops = {
+          {.id = "shadow-stop",
+           .position = 0.0F,
+           .colour = {0.03F, 0.08F, 0.22F},
+           .colouriseAmount = 0.25F},
+          {.id = "reef-stop",
+           .position = 0.18F,
+           .colour = {0.12F, 0.45F, 0.61F},
+           .colouriseAmount = 0.5F},
+          {.id = "foam-stop",
+           .position = 0.67F,
+           .colour = {0.71F, 0.88F, 0.67F},
+           .colouriseAmount = 0.75F},
+          {.id = "glint-stop",
+           .position = 1.0F,
+           .colour = {0.98F, 0.91F, 0.48F},
+           .colouriseAmount = 1.0F},
+      },
+  });
+
+  ProjectDocument document;
+  TimingTakeSceneState state;
+  state.sceneGroupName = "Scene3";
+  state.colouriseEffects.push_back(effect);
+  document.timingTakeStates.push_back(state);
+
+  TemporaryProjectFile file{
+      "invisible_places_reversed_preset_palette_round_trip.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->timingTakeStates.size() == 1U);
+  REQUIRE(loaded->timingTakeStates.front().colouriseEffects.size() == 1U);
+  const auto &loadedEffect =
+      loaded->timingTakeStates.front().colouriseEffects.front();
+
+  CHECK(loadedEffect.paletteSourceKind ==
+        TimingColourisePaletteSourceKind::Preset);
+  CHECK(loadedEffect.paletteSourceId == "cmocean-haline");
+  CHECK(loadedEffect.paletteSourceName == "Haline");
+  CHECK(loadedEffect.paletteEdited);
+
+  REQUIRE(loadedEffect.basePalette.stops.size() == 4U);
+  const auto &stops = loadedEffect.basePalette.stops;
+  CHECK(stops[0].id == "glint-stop");
+  CHECK(stops[0].position == Catch::Approx(0.0F));
+  CHECK(stops[0].colour[0] == Catch::Approx(0.98F));
+  CHECK(stops[0].colouriseAmount == Catch::Approx(1.0F));
+  CHECK(stops[1].id == "foam-stop");
+  CHECK(stops[1].position == Catch::Approx(0.33F));
+  CHECK(stops[1].colour[1] == Catch::Approx(0.88F));
+  CHECK(stops[1].colouriseAmount == Catch::Approx(0.75F));
+  CHECK(stops[2].id == "reef-stop");
+  CHECK(stops[2].position == Catch::Approx(0.82F));
+  CHECK(stops[2].colour[2] == Catch::Approx(0.61F));
+  CHECK(stops[2].colouriseAmount == Catch::Approx(0.5F));
+  CHECK(stops[3].id == "shadow-stop");
+  CHECK(stops[3].position == Catch::Approx(1.0F));
+  CHECK(stops[3].colour[2] == Catch::Approx(0.22F));
+  CHECK(stops[3].colouriseAmount == Catch::Approx(0.25F));
+}
+
+TEST_CASE("Active and inactive local preset palette edits round-trip",
+          "[project][serialization][colourise][palette][local-edit]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::timing::TimingColouriseEffect;
+  using invisible_places::timing::TimingColouriseLocalPaletteEdit;
+  using invisible_places::timing::TimingColourisePalette;
+  using invisible_places::timing::TimingColourisePaletteSourceKind;
+  using invisible_places::timing::TimingTakeSceneState;
+
+  const auto palette = [](std::string stopId, float red, float amount) {
+    return TimingColourisePalette{
+        .stops = {{.id = std::move(stopId),
+                   .position = 0.35F,
+                   .colour = {red, 0.25F, 0.75F},
+                   .colouriseAmount = amount}},
+    };
+  };
+  const auto activePalette = palette("active-stop", 0.8F, 0.45F);
+  const auto inactivePalette = palette("inactive-stop", 0.15F, 0.9F);
+
+  TimingColouriseEffect effect;
+  effect.id = "colourise-effect-local-presets";
+  effect.name = "Local preset studies";
+  effect.paletteSourceKind = TimingColourisePaletteSourceKind::Preset;
+  effect.paletteSourceId = "preset-active";
+  effect.paletteSourceName = "Active Preset";
+  effect.paletteEdited = true;
+  effect.basePalette = activePalette;
+  effect.localPaletteEdits = {
+      TimingColouriseLocalPaletteEdit{
+          .presetId = "preset-active",
+          .presetName = "Active Preset",
+          .palette = activePalette,
+      },
+      TimingColouriseLocalPaletteEdit{
+          .presetId = "preset-inactive",
+          .presetName = "Inactive Preset",
+          .palette = inactivePalette,
+      },
+  };
+
+  ProjectDocument document;
+  TimingTakeSceneState state;
+  state.sceneGroupName = "Scene3";
+  state.colouriseEffects.push_back(effect);
+  document.timingTakeStates.push_back(state);
+
+  TemporaryProjectFile file{
+      "invisible_places_local_preset_palette_edits_round_trip.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+
+  std::ifstream input{file.path};
+  REQUIRE(input.is_open());
+  auto savedJson = nlohmann::json::parse(input);
+  const auto &savedEffect = savedJson.at("timing_take_states")
+                                .front()
+                                .at("timing_effects")
+                                .front();
+  REQUIRE(savedEffect.at("local_palette_edits").size() == 2U);
+  CHECK(savedEffect.at("local_palette_edits")[0].at("preset_id") ==
+        "preset-active");
+  CHECK(savedEffect.at("local_palette_edits")[0].at("preset_name") ==
+        "Active Preset");
+  CHECK(savedEffect.at("local_palette_edits")[0]
+            .at("palette")
+            .at("stops")
+            .front()
+            .at("colourise_amount") == Catch::Approx(0.45F));
+  CHECK(savedEffect.at("local_palette_edits")[1].at("preset_id") ==
+        "preset-inactive");
+  CHECK(savedEffect.at("local_palette_edits")[1]
+            .at("palette")
+            .at("stops")
+            .front()
+            .at("colour")
+            .front() == Catch::Approx(0.15F));
+
+  // Invalid optional entries are ignored independently instead of rejecting
+  // the project or discarding valid local variants beside them.
+  input.close();
+  auto &savedLocalEdits = savedJson.at("timing_take_states")
+                              .front()
+                              .at("timing_effects")
+                              .front()
+                              .at("local_palette_edits");
+  savedLocalEdits.push_back(nullptr);
+  savedLocalEdits.push_back({
+      {"preset_id", "malformed-preset"},
+      {"preset_name", "Malformed Preset"},
+      {"palette", {{"stops", nlohmann::json::array({42})}}},
+  });
+  {
+    std::ofstream output{file.path, std::ios::trunc};
+    REQUIRE(output.is_open());
+    output << savedJson.dump(2);
+  }
+
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->timingTakeStates.size() == 1U);
+  REQUIRE(loaded->timingTakeStates.front().colouriseEffects.size() == 1U);
+  const auto &loadedEffect =
+      loaded->timingTakeStates.front().colouriseEffects.front();
+  CHECK(loadedEffect.paletteSourceKind ==
+        TimingColourisePaletteSourceKind::Preset);
+  CHECK(loadedEffect.paletteSourceId == "preset-active");
+  CHECK(loadedEffect.paletteEdited);
+  REQUIRE(loadedEffect.localPaletteEdits.size() == 2U);
+  CHECK(loadedEffect.localPaletteEdits[0].presetId == "preset-active");
+  CHECK(loadedEffect.localPaletteEdits[0].presetName == "Active Preset");
+  CHECK(loadedEffect.localPaletteEdits[0]
+            .palette.stops.front()
+            .colouriseAmount == Catch::Approx(0.45F));
+  CHECK(loadedEffect.localPaletteEdits[1].presetId == "preset-inactive");
+  CHECK(loadedEffect.localPaletteEdits[1]
+            .palette.stops.front()
+            .colour[0] == Catch::Approx(0.15F));
+  CHECK(loadedEffect.basePalette.stops.front().id == "active-stop");
+  CHECK(loadedEffect.basePalette.stops.front().colour[0] ==
+        Catch::Approx(0.8F));
+}
+
+TEST_CASE("Legacy edited preset synthesizes a local palette edit",
+          "[project][serialization][colourise][palette][local-edit][migration]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::timing::TimingColourisePaletteSourceKind;
+
+  const nlohmann::json legacyProject{
+      {"schema_version", 56U},
+      {"timing_takes",
+       nlohmann::json::array(
+           {{{"id", "authored-timing"}, {"name", "Authored Timing"}}})},
+      {"selected_timing_take_id", "authored-timing"},
+      {"timing_take_states",
+       nlohmann::json::array({
+           {{"take_id", "authored-timing"},
+            {"scene_group", "Scene3"},
+            {"colourise_effects",
+             nlohmann::json::array({
+                 {{"id", "legacy-edited-preset"},
+                  {"base_palette",
+                   {{"stops",
+                     nlohmann::json::array(
+                         {{{"id", "private-stop"},
+                           {"position", 0.4F},
+                           {"colour", {0.7F, 0.2F, 0.1F}},
+                           {"colourise_amount", 0.63F}}})}}},
+                  {"palette_source",
+                   {{"kind", "preset"},
+                    {"id", "legacy-preset"},
+                    {"name", "Legacy Preset"},
+                    {"edited", true}}}},
+             })}},
+       })},
+  };
+
+  TemporaryProjectFile file{
+      "invisible_places_legacy_local_palette_edit_migration.json"};
+  {
+    std::ofstream output{file.path, std::ios::trunc};
+    REQUIRE(output.is_open());
+    output << legacyProject.dump(2);
+  }
+
+  std::string errorMessage;
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  CHECK(loaded->schemaVersion == kProjectDocumentSchemaVersion);
+  REQUIRE(loaded->timingTakeStates.size() == 1U);
+  REQUIRE(loaded->timingTakeStates.front().colouriseEffects.size() == 1U);
+  const auto &effect =
+      loaded->timingTakeStates.front().colouriseEffects.front();
+  CHECK(effect.paletteSourceKind == TimingColourisePaletteSourceKind::Preset);
+  CHECK(effect.paletteSourceId == "legacy-preset");
+  CHECK(effect.paletteEdited);
+  REQUIRE(effect.localPaletteEdits.size() == 1U);
+  CHECK(effect.localPaletteEdits.front().presetId == "legacy-preset");
+  CHECK(effect.localPaletteEdits.front().presetName == "Legacy Preset");
+  REQUIRE(effect.localPaletteEdits.front().palette.stops.size() == 1U);
+  CHECK(effect.localPaletteEdits.front().palette.stops.front().id ==
+        "private-stop");
+  CHECK(effect.localPaletteEdits.front()
+            .palette.stops.front()
+            .colouriseAmount == Catch::Approx(0.63F));
+
+  REQUIRE(SaveProjectDocument(loaded.value(), file.path, &errorMessage));
+  std::ifstream input{file.path};
+  REQUIRE(input.is_open());
+  const auto migratedJson = nlohmann::json::parse(input);
+  CHECK(migratedJson.at("schema_version") == kProjectDocumentSchemaVersion);
+  const auto &savedLocalEdits = migratedJson.at("timing_take_states")
+                                    .front()
+                                    .at("colourise_effects")
+                                    .front()
+                                    .at("local_palette_edits");
+  REQUIRE(savedLocalEdits.size() == 1U);
+  CHECK(savedLocalEdits.front().at("preset_id") == "legacy-preset");
+  CHECK(savedLocalEdits.front()
+            .at("palette")
+            .at("stops")
+            .front()
+            .at("id") == "private-stop");
 }
 
 TEST_CASE("Schema 51 palette snapshots migrate without changing their animation model",
           "[project][serialization][colourise][palette][migration]") {
   using invisible_places::serialization::LoadProjectDocument;
   using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::timing::TimingColouriseAmountOverrideMode;
   using invisible_places::timing::TimingColourisePaletteKeyModel;
   using invisible_places::timing::TimingColourisePaletteSourceKind;
 
@@ -480,6 +828,11 @@ TEST_CASE("Schema 51 palette snapshots migrate without changing their animation 
   CHECK(legacyEffect.paletteSourceKind ==
         TimingColourisePaletteSourceKind::Custom);
   CHECK_FALSE(legacyEffect.paletteEdited);
+  CHECK(legacyEffect.colouriseAmountOverrideMode ==
+        TimingColouriseAmountOverrideMode::Maximum);
+  CHECK(legacyEffect.colouriseAmountOverride == Catch::Approx(1.0F));
+  CHECK(legacyEffect.palettePhaseOffset == Catch::Approx(0.0F));
+  CHECK(legacyEffect.effectParameterKeys.empty());
   CHECK(legacyEffect.paletteStopParameterKeys.empty());
   REQUIRE(legacyEffect.basePalette.stops.size() == 2U);
   CHECK_FALSE(legacyEffect.basePalette.stops[0].id.empty());
@@ -2181,4 +2534,60 @@ TEST_CASE("Project schema v32 preserves a missing selected variant for runtime "
   CHECK(rock->analysisSourcePath ==
         "Data/SceneMissing/SceneMissing-ROCK-5mm-missing.ply");
   CHECK(rock->displaySourcePath == rock->analysisSourcePath);
+}
+
+TEST_CASE("Project preserves independent Flow and Mesh Flow edited trail shadows",
+          "[project][serialization][water][edited]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::serialization::WaterTrailProfileDocument;
+
+  ProjectDocument document;
+  document.projectName = "edited-water-trails";
+
+  WaterTrailProfileDocument flowEdit;
+  flowEdit.name = "Silver Trail_edited";
+  flowEdit.geometry.trailLengthMeters = 1.25F;
+  flowEdit.geometry.widthMeters = 0.014F;
+  flowEdit.style.solidColor = {0.2F, 0.4F, 0.8F, 1.0F};
+  document.tempWaterTrailProfile = flowEdit;
+
+  WaterTrailProfileDocument meshEdit;
+  meshEdit.name = "Default_edited";
+  meshEdit.geometry.trailLengthMeters = 2.75F;
+  meshEdit.geometry.widthMeters = 0.031F;
+  meshEdit.style.solidColor = {0.8F, 0.3F, 0.1F, 1.0F};
+  document.tempWaterDynamicMeshTrailProfile = meshEdit;
+  document.waterDynamicMeshFlowSettings.trailProfileName = meshEdit.name;
+
+  TemporaryProjectFile file{
+      "invisible_places_independent_edited_water_trails.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+
+  std::ifstream input{file.path};
+  REQUIRE(input.is_open());
+  const auto savedJson = nlohmann::json::parse(input);
+  REQUIRE(savedJson.contains("temp_water_trail_profile"));
+  REQUIRE(savedJson.contains("temp_water_dynamic_mesh_trail_profile"));
+
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->tempWaterTrailProfile.has_value());
+  REQUIRE(loaded->tempWaterDynamicMeshTrailProfile.has_value());
+  CHECK(loaded->tempWaterTrailProfile->name == "Silver Trail_edited");
+  CHECK(loaded->tempWaterTrailProfile->geometry.trailLengthMeters ==
+        Catch::Approx(1.25F));
+  CHECK(loaded->tempWaterTrailProfile->geometry.widthMeters ==
+        Catch::Approx(0.014F));
+  CHECK(loaded->tempWaterDynamicMeshTrailProfile->name == "Default_edited");
+  CHECK(loaded->tempWaterDynamicMeshTrailProfile->geometry.trailLengthMeters ==
+        Catch::Approx(2.75F));
+  CHECK(loaded->tempWaterDynamicMeshTrailProfile->geometry.widthMeters ==
+        Catch::Approx(0.031F));
+  CHECK(loaded->tempWaterDynamicMeshTrailProfile->style.solidColor[0] ==
+        Catch::Approx(0.8F));
+  CHECK(loaded->waterDynamicMeshFlowSettings.trailProfileName ==
+        "Default_edited");
 }

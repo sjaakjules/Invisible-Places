@@ -36,6 +36,7 @@ class Window {
     Window& operator=(Window&&) = delete;
 
     [[nodiscard]] bool ShouldClose() const;
+    void CancelCloseRequest();
     void PollEvents();
     void SetTitle(const std::string& title);
     void ShowBootstrapContent(const BootstrapWindowContent& content);
@@ -43,6 +44,7 @@ class Window {
 
   private:
     GLFWwindow* window_ = nullptr;
+    bool escapeWasPressed_ = false;
 };
 
 }  // namespace invisible_places::platform

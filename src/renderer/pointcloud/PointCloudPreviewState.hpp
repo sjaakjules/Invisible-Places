@@ -22,7 +22,7 @@ inline constexpr float kInactiveOpacityDefault = 1.0F;
 inline constexpr float kInactiveEmissionDefault = 0.0F;
 inline constexpr float kInactiveDepthFadeDefault = 0.0F;
 inline constexpr float kInactiveColormapPositionDefault = 0.5F;
-inline constexpr std::size_t kTimingColouriseMaxEffects = 5U;
+inline constexpr std::size_t kTimingColouriseMaxEffects = 8U;
 inline constexpr std::size_t kTimingColouriseLutSamples = 64U;
 
 // Renderer-facing timing colourise data is deliberately independent from the
@@ -35,15 +35,24 @@ enum class TimingColouriseSource : std::uint32_t {
     NormalZ = 3U
 };
 
+enum class TimingColouriseOutput : std::uint32_t {
+    Colourise = 0U,
+    Emissive = 1U,
+};
+
 struct ResolvedTimingColouriseEffect {
     bool enabled = false;
     TimingColouriseSource source = TimingColouriseSource::ScalarField;
+    TimingColouriseOutput output = TimingColouriseOutput::Colourise;
     std::int32_t scalarFieldSlot = -1;
     float lowerBound = 0.0F;
     float upperBound = 1.0F;
-    // Fraction of the selected [lower, upper] span used by each inward edge
-    // fade. Values are sanitized to [0, 0.5] by the render backends.
-    float edgeFadeFraction = 0.0F;
+    // Signed fraction of the selected [lower, upper] span used by each edge
+    // fade. Positive values fade inward and negative values fade outward.
+    float edgeFadeFraction = 0.10F;
+    // A non-negative scalar added to the point's existing emissive strength
+    // after the field bounds/fade mask. Colourise effects ignore this value.
+    float emissiveLevel = 0.0F;
     // RGB is the tint and A is colourise amount. Alpha never changes point
     // opacity.
     std::array<std::array<float, 4>, kTimingColouriseLutSamples> rgbaLut{};

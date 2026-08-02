@@ -172,10 +172,12 @@ struct alignas(16) PointCloudStyleGpu {
     // the last entry is visually topmost.
     glm::uvec4 timingColouriseControl{0U, 0U, 0U, 0U};
     // x: enabled, y: TimingColouriseSource, z: scalar slot + 1 (zero means
-    // unavailable). Normal sources do not consume z.
+    // unavailable), w: TimingColouriseOutput. Normal sources do not consume
+    // z.
     std::array<glm::uvec4, renderer::pointcloud::kTimingColouriseMaxEffects>
         timingColouriseSources{};
-    // x/y: lower/upper bounds, z: symmetric inward edge-fade fraction.
+    // x/y: lower/upper bounds; z: signed edge-fade fraction (positive inward,
+    // negative outward); w: non-negative emissive level.
     std::array<glm::vec4, renderer::pointcloud::kTimingColouriseMaxEffects>
         timingColouriseRanges{};
     // Effect-major 64-sample RGBA lookup tables. RGB is tint; A is mix only.
@@ -185,6 +187,22 @@ struct alignas(16) PointCloudStyleGpu {
             renderer::pointcloud::kTimingColouriseLutSamples>
         timingColouriseLut{};
 };
+
+// PointStyleData is mirrored verbatim by the point-cloud GLSL uniform blocks.
+// Keep these checks beside the CPU definition so a capacity or field-layout
+// change cannot silently shift the fixed std140 ABI.
+static_assert(offsetof(PointCloudStyleGpu, timingColouriseControl) == 1168U);
+static_assert(offsetof(PointCloudStyleGpu, timingColouriseSources) == 1184U);
+static_assert(offsetof(PointCloudStyleGpu, timingColouriseRanges) == 1312U);
+static_assert(offsetof(PointCloudStyleGpu, timingColouriseLut) == 1440U);
+static_assert(sizeof(PointCloudStyleGpu) == 9632U);
+
+// The surfel/EXR pair has the largest point-cloud stage interface: 21 scalar
+// components plus one flat vec4 per Timing Colourise effect.
+constexpr std::uint32_t kPointCloudMaximumInterstageComponents =
+    21U +
+    (4U * static_cast<std::uint32_t>(
+              renderer::pointcloud::kTimingColouriseMaxEffects));
 
 struct alignas(16) RainUniformsGpu {
     glm::mat4 viewProjection{1.0F};
@@ -1141,6 +1159,10 @@ struct alignas(16) PostProcessPushConstants {
     glm::vec4 preview{0.0F, 0.0F, 0.0F, 0.0F};
 };
 
+struct alignas(16) EyeDomeLightingExportPushConstants {
+    glm::vec4 edl{1.0F, 24.0F, 0.35F, 1.0F};
+};
+
 std::string NormalizeScalarFieldName(std::string_view name) {
     std::string normalized;
     normalized.reserve(name.size());
@@ -1323,6 +1345,16 @@ bool IsDeviceSuitable(VkPhysicalDevice device, VkSurfaceKHR surface, bool* porta
     VkPhysicalDeviceFeatures features{};
     vkGetPhysicalDeviceFeatures(device, &features);
     if (features.largePoints == VK_FALSE) {
+        return false;
+    }
+
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(device, &properties);
+    if (properties.limits.maxUniformBufferRange < sizeof(PointCloudStyleGpu) ||
+        properties.limits.maxVertexOutputComponents <
+            kPointCloudMaximumInterstageComponents ||
+        properties.limits.maxFragmentInputComponents <
+            kPointCloudMaximumInterstageComponents) {
         return false;
     }
 
@@ -1611,6 +1643,7 @@ VulkanViewportShell::VulkanViewportShell(GLFWwindow* window) : window_(window) {
     CreateHighQualityGaussianSplatDescriptorSetLayout();
     CreateCompositeDescriptorSetLayout();
     CreatePostProcessDescriptorSetLayout();
+    CreateEyeDomeLightingExportDescriptorSetLayout();
     CreateDescriptorPools();
     CreatePostProcessSampler();
     CreateUniformResources();
@@ -1628,6 +1661,7 @@ VulkanViewportShell::VulkanViewportShell(GLFWwindow* window) : window_(window) {
     CreateHighQualityGaussianSplatPipeline();
     CreateCompositePipeline();
     CreatePostProcessPipeline();
+    CreateEyeDomeLightingExportPipeline();
     CreateFramebuffers();
     CreatePresentFramebuffers();
     CreateCommandPool();
@@ -1749,6 +1783,9 @@ VulkanViewportShell::~VulkanViewportShell() {
     if (postProcessPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, postProcessPipeline_, nullptr);
     }
+    if (eyeDomeLightingExportPipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, eyeDomeLightingExportPipeline_, nullptr);
+    }
     if (pointPipelineLayout_ != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(device_, pointPipelineLayout_, nullptr);
     }
@@ -1775,6 +1812,9 @@ VulkanViewportShell::~VulkanViewportShell() {
     }
     if (postProcessPipelineLayout_ != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(device_, postProcessPipelineLayout_, nullptr);
+    }
+    if (eyeDomeLightingExportPipelineLayout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(device_, eyeDomeLightingExportPipelineLayout_, nullptr);
     }
     if (postProcessSampler_ != VK_NULL_HANDLE) {
         vkDestroySampler(device_, postProcessSampler_, nullptr);
@@ -1814,6 +1854,9 @@ VulkanViewportShell::~VulkanViewportShell() {
     }
     if (postProcessDescriptorSetLayout_ != VK_NULL_HANDLE) {
         vkDestroyDescriptorSetLayout(device_, postProcessDescriptorSetLayout_, nullptr);
+    }
+    if (eyeDomeLightingExportDescriptorSetLayout_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(device_, eyeDomeLightingExportDescriptorSetLayout_, nullptr);
     }
     if (renderPass_ != VK_NULL_HANDLE) {
         vkDestroyRenderPass(device_, renderPass_, nullptr);
@@ -6980,10 +7023,18 @@ bool VulkanViewportShell::BeginPointCloudExrFrame(const PointCloudExrFrameReques
         throw std::runtime_error{"GPU EXR export requires at least one visible point-cloud layer."};
     }
 
+    const bool needsEyeDomeLightingResources =
+        request.renderState.eyeDomeLightingEnabled &&
+        HasPointCloudExrReadback(request.readbackMask, PointCloudExrReadbackMask::Color);
     if (exrExportResources_.framebuffer == VK_NULL_HANDLE ||
         exrExportResources_.width != request.width ||
-        exrExportResources_.height != request.height) {
-        CreateExrExportResources(request.width, request.height);
+        exrExportResources_.height != request.height ||
+        (needsEyeDomeLightingResources &&
+         exrExportResources_.eyeDomeLightingDescriptorSet == VK_NULL_HANDLE)) {
+        CreateExrExportResources(
+            request.width,
+            request.height,
+            needsEyeDomeLightingResources);
     }
 
     if (exrExportResources_.fence == VK_NULL_HANDLE ||
@@ -8064,6 +8115,36 @@ void VulkanViewportShell::CreatePostProcessDescriptorSetLayout() {
         "vkCreateDescriptorSetLayout(postprocess)");
 }
 
+void VulkanViewportShell::CreateEyeDomeLightingExportDescriptorSetLayout() {
+    const std::array<VkDescriptorSetLayoutBinding, 2> bindings = {
+        VkDescriptorSetLayoutBinding{
+            0,
+            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            1,
+            VK_SHADER_STAGE_COMPUTE_BIT,
+            nullptr},
+        VkDescriptorSetLayoutBinding{
+            1,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            1,
+            VK_SHADER_STAGE_COMPUTE_BIT,
+            nullptr},
+    };
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    layoutInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
+    layoutInfo.pBindings = bindings.data();
+
+    Check(
+        vkCreateDescriptorSetLayout(
+            device_,
+            &layoutInfo,
+            nullptr,
+            &eyeDomeLightingExportDescriptorSetLayout_),
+        "vkCreateDescriptorSetLayout(export EDL)");
+}
+
 void VulkanViewportShell::CreateDescriptorPools() {
     const std::array<VkDescriptorPoolSize, 4> poolSizes = {
         MakePoolSize(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 8192),
@@ -9063,19 +9144,34 @@ void VulkanViewportShell::CreateWaterSurfacePreprocessPipeline() {
     vkDestroyShaderModule(device_, shaderModule, nullptr);
 }
 
-void VulkanViewportShell::CreateExrExportResources(std::uint32_t width, std::uint32_t height) {
+void VulkanViewportShell::CreateExrExportResources(
+    std::uint32_t width,
+    std::uint32_t height,
+    bool enableEyeDomeLighting) {
     if (width == 0 || height == 0) {
         throw std::runtime_error{"GPU EXR export requires a non-zero frame size."};
     }
 
     constexpr VkFormat kExportColorFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
     constexpr VkFormat kExportLinearDepthFormat = VK_FORMAT_R32_SFLOAT;
-    if (!FormatSupportsOptimalFeatures(physicalDevice_, kExportColorFormat,
-                                       VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT)) {
+    VkFormatFeatureFlags requiredColorFeatures =
+        VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
+    VkFormatFeatureFlags requiredDepthFeatures =
+        VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
+    if (enableEyeDomeLighting) {
+        requiredColorFeatures |= VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+        requiredDepthFeatures |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    }
+    if (!FormatSupportsOptimalFeatures(
+            physicalDevice_,
+            kExportColorFormat,
+            requiredColorFeatures)) {
         throw std::runtime_error{"GPU EXR export requires RGBA16F color attachment readback support."};
     }
-    if (!FormatSupportsOptimalFeatures(physicalDevice_, kExportLinearDepthFormat,
-                                       VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT)) {
+    if (!FormatSupportsOptimalFeatures(
+            physicalDevice_,
+            kExportLinearDepthFormat,
+            requiredDepthFeatures)) {
         throw std::runtime_error{"GPU EXR export requires R32F depth attachment readback support."};
     }
 
@@ -9092,8 +9188,16 @@ void VulkanViewportShell::CreateExrExportResources(std::uint32_t width, std::uin
         CreateExrExportRenderPass(&resources);
         CreateExrExportPipelines(&resources);
 
+        const VkImageUsageFlags colorPostProcessUsage =
+            enableEyeDomeLighting ? VK_IMAGE_USAGE_STORAGE_BIT : 0U;
+        const VkImageUsageFlags depthPostProcessUsage =
+            enableEyeDomeLighting ? VK_IMAGE_USAGE_SAMPLED_BIT : 0U;
         resources.colorImage = CreateAttachmentImage(
-            width, height, kExportColorFormat, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+            width,
+            height,
+            kExportColorFormat,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                colorPostProcessUsage,
             VK_IMAGE_ASPECT_COLOR_BIT);
         resources.depthImage =
             CreateAttachmentImage(width, height, depthFormat_,
@@ -9116,7 +9220,9 @@ void VulkanViewportShell::CreateExrExportResources(std::uint32_t width, std::uin
             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
         resources.linearDepthImage = CreateAttachmentImage(
             width, height, kExportLinearDepthFormat,
-            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                depthPostProcessUsage,
+            VK_IMAGE_ASPECT_COLOR_BIT);
         resources.normalImage = CreateAttachmentImage(
             width, height, kExportColorFormat, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
             VK_IMAGE_ASPECT_COLOR_BIT);
@@ -9146,6 +9252,10 @@ void VulkanViewportShell::CreateExrExportResources(std::uint32_t width, std::uin
         framebufferInfo.layers = 1;
         Check(vkCreateFramebuffer(device_, &framebufferInfo, nullptr, &resources.framebuffer),
               "vkCreateFramebuffer(exr)");
+
+        if (enableEyeDomeLighting) {
+            CreateExrExportEyeDomeLightingResources(&resources);
+        }
 
         resources.colorReadbackBuffer = CreateHostVisibleBuffer(
             static_cast<VkDeviceSize>(width) * static_cast<VkDeviceSize>(height) * 4U * sizeof(std::uint16_t),
@@ -9239,6 +9349,74 @@ void VulkanViewportShell::CreateExrExportResources(std::uint32_t width, std::uin
     // Old point pools are gone before their old EXR depth attachment. The
     // replaced EXR generation can now be destroyed without a stale binding.
     DestroyExrExportResources(&stagedResources);
+}
+
+void VulkanViewportShell::CreateExrExportEyeDomeLightingResources(
+    ExrExportResources* resources) {
+    if (resources == nullptr ||
+        resources->colorImage.view == VK_NULL_HANDLE ||
+        resources->linearDepthImage.view == VK_NULL_HANDLE) {
+        throw std::runtime_error{
+            "GPU export EDL requires initialized color and linear-depth images."};
+    }
+
+    const std::array<VkDescriptorPoolSize, 2> poolSizes = {
+        MakePoolSize(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1U),
+        MakePoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1U),
+    };
+    VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    poolInfo.maxSets = 1U;
+    poolInfo.poolSizeCount = static_cast<std::uint32_t>(poolSizes.size());
+    poolInfo.pPoolSizes = poolSizes.data();
+    Check(
+        vkCreateDescriptorPool(
+            device_,
+            &poolInfo,
+            nullptr,
+            &resources->eyeDomeLightingDescriptorPool),
+        "vkCreateDescriptorPool(export EDL generation)");
+
+    VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    allocInfo.descriptorPool = resources->eyeDomeLightingDescriptorPool;
+    allocInfo.descriptorSetCount = 1U;
+    allocInfo.pSetLayouts = &eyeDomeLightingExportDescriptorSetLayout_;
+    Check(
+        vkAllocateDescriptorSets(
+            device_,
+            &allocInfo,
+            &resources->eyeDomeLightingDescriptorSet),
+        "vkAllocateDescriptorSets(export EDL generation)");
+
+    VkDescriptorImageInfo colorInfo{};
+    colorInfo.imageView = resources->colorImage.view;
+    colorInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkDescriptorImageInfo depthInfo{};
+    depthInfo.sampler = postProcessSampler_;
+    depthInfo.imageView = resources->linearDepthImage.view;
+    depthInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    std::array<VkWriteDescriptorSet, 2> writes{};
+    writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[0].dstSet = resources->eyeDomeLightingDescriptorSet;
+    writes[0].dstBinding = 0U;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[0].descriptorCount = 1U;
+    writes[0].pImageInfo = &colorInfo;
+
+    writes[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[1].dstSet = resources->eyeDomeLightingDescriptorSet;
+    writes[1].dstBinding = 1U;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[1].descriptorCount = 1U;
+    writes[1].pImageInfo = &depthInfo;
+
+    vkUpdateDescriptorSets(
+        device_,
+        static_cast<std::uint32_t>(writes.size()),
+        writes.data(),
+        0U,
+        nullptr);
 }
 
 void VulkanViewportShell::CreateExrExportRenderPass(ExrExportResources* resources) {
@@ -10334,6 +10512,54 @@ void VulkanViewportShell::CreatePostProcessPipeline() {
 
     vkDestroyShaderModule(device_, fragmentModule, nullptr);
     vkDestroyShaderModule(device_, vertexModule, nullptr);
+}
+
+void VulkanViewportShell::CreateEyeDomeLightingExportPipeline() {
+    const auto shaderCode = ReadBinaryFile(
+        (std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} /
+         "edl_export.comp.spv")
+            .string());
+    const auto shaderModule =
+        CreateShaderModule(device_, shaderCode, "vkCreateShaderModule(export EDL compute)");
+
+    VkPushConstantRange pushConstantRange{};
+    pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushConstantRange.offset = 0U;
+    pushConstantRange.size = sizeof(EyeDomeLightingExportPushConstants);
+
+    VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layoutInfo.setLayoutCount = 1U;
+    layoutInfo.pSetLayouts = &eyeDomeLightingExportDescriptorSetLayout_;
+    layoutInfo.pushConstantRangeCount = 1U;
+    layoutInfo.pPushConstantRanges = &pushConstantRange;
+    Check(
+        vkCreatePipelineLayout(
+            device_,
+            &layoutInfo,
+            nullptr,
+            &eyeDomeLightingExportPipelineLayout_),
+        "vkCreatePipelineLayout(export EDL)");
+
+    VkPipelineShaderStageCreateInfo stageInfo{
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    stageInfo.module = shaderModule;
+    stageInfo.pName = "main";
+
+    VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    pipelineInfo.stage = stageInfo;
+    pipelineInfo.layout = eyeDomeLightingExportPipelineLayout_;
+    Check(
+        vkCreateComputePipelines(
+            device_,
+            VK_NULL_HANDLE,
+            1U,
+            &pipelineInfo,
+            nullptr,
+            &eyeDomeLightingExportPipeline_),
+        "vkCreateComputePipelines(export EDL)");
+
+    vkDestroyShaderModule(device_, shaderModule, nullptr);
 }
 
 void VulkanViewportShell::CreateFramebuffers() {
@@ -13743,6 +13969,14 @@ void VulkanViewportShell::DestroyExrExportResources(ExrExportResources* resource
     // The composite descriptor is generation-owned and must be retired before
     // the image views it binds. Point EXR descriptors are owned by their point
     // pools and are retired by the caller before an installed EXR generation.
+    resources->eyeDomeLightingDescriptorSet = VK_NULL_HANDLE;
+    if (resources->eyeDomeLightingDescriptorPool != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(
+            device_,
+            resources->eyeDomeLightingDescriptorPool,
+            nullptr);
+        resources->eyeDomeLightingDescriptorPool = VK_NULL_HANDLE;
+    }
     resources->compositeDescriptorSet = VK_NULL_HANDLE;
     if (resources->compositeDescriptorPool != VK_NULL_HANDLE) {
         vkDestroyDescriptorPool(device_, resources->compositeDescriptorPool, nullptr);
@@ -14030,62 +14264,79 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
             std::isfinite(effect.lowerBound) &&
             std::isfinite(effect.upperBound) &&
             effect.upperBound > effect.lowerBound;
-        const bool enabled =
-            effect.enabled &&
-            boundsValid &&
-            ((scalarSource && scalarAvailable) ||
-             (normalSource && resources->hasNormals));
-        styleGpu.timingColouriseSources[effectIndex] = glm::uvec4{
-            enabled ? 1U : 0U,
+        const bool outputValid =
+            effect.output ==
+                renderer::pointcloud::TimingColouriseOutput::Colourise ||
+            effect.output ==
+                renderer::pointcloud::TimingColouriseOutput::Emissive;
+        if (!effect.enabled ||
+            !boundsValid ||
+            !outputValid ||
+            !((scalarSource && scalarAvailable) ||
+              (normalSource && resources->hasNormals))) {
+            continue;
+        }
+
+        const std::size_t packedEffectIndex =
+            static_cast<std::size_t>(packedTimingColouriseCount);
+        styleGpu.timingColouriseSources[packedEffectIndex] = glm::uvec4{
+            1U,
             static_cast<std::uint32_t>(effect.source),
             scalarAvailable
                 ? static_cast<std::uint32_t>(effect.scalarFieldSlot) + 1U
                 : 0U,
-            0U,
+            static_cast<std::uint32_t>(effect.output),
         };
-        styleGpu.timingColouriseRanges[effectIndex] = glm::vec4{
+        styleGpu.timingColouriseRanges[packedEffectIndex] = glm::vec4{
             std::isfinite(effect.lowerBound) ? effect.lowerBound : 0.0F,
             std::isfinite(effect.upperBound) ? effect.upperBound : 0.0F,
             std::clamp(
                 std::isfinite(effect.edgeFadeFraction)
                     ? effect.edgeFadeFraction
-                    : 0.0F,
-                0.0F,
+                    : 0.10F,
+                -0.5F,
                 0.5F),
-            0.0F,
+            effect.output ==
+                    renderer::pointcloud::TimingColouriseOutput::Emissive
+                ? std::max(
+                      0.0F,
+                      std::isfinite(effect.emissiveLevel)
+                          ? effect.emissiveLevel
+                          : 0.0F)
+                : 0.0F,
         };
-        for (std::size_t sampleIndex = 0;
-             sampleIndex <
-             renderer::pointcloud::kTimingColouriseLutSamples;
-             ++sampleIndex) {
-            const auto& sample = effect.rgbaLut[sampleIndex];
-            const std::size_t packedIndex =
-                effectIndex *
-                    renderer::pointcloud::kTimingColouriseLutSamples +
-                sampleIndex;
-            styleGpu.timingColouriseLut[packedIndex] = glm::vec4{
-                std::clamp(
-                    std::isfinite(sample[0]) ? sample[0] : 0.0F,
-                    0.0F,
-                    1.0F),
-                std::clamp(
-                    std::isfinite(sample[1]) ? sample[1] : 0.0F,
-                    0.0F,
-                    1.0F),
-                std::clamp(
-                    std::isfinite(sample[2]) ? sample[2] : 0.0F,
-                    0.0F,
-                    1.0F),
-                std::clamp(
-                    std::isfinite(sample[3]) ? sample[3] : 0.0F,
-                    0.0F,
-                    1.0F),
-            };
+        if (effect.output ==
+            renderer::pointcloud::TimingColouriseOutput::Colourise) {
+            for (std::size_t sampleIndex = 0;
+                 sampleIndex <
+                 renderer::pointcloud::kTimingColouriseLutSamples;
+                 ++sampleIndex) {
+                const auto& sample = effect.rgbaLut[sampleIndex];
+                const std::size_t packedIndex =
+                    packedEffectIndex *
+                        renderer::pointcloud::kTimingColouriseLutSamples +
+                    sampleIndex;
+                styleGpu.timingColouriseLut[packedIndex] = glm::vec4{
+                    std::clamp(
+                        std::isfinite(sample[0]) ? sample[0] : 0.0F,
+                        0.0F,
+                        1.0F),
+                    std::clamp(
+                        std::isfinite(sample[1]) ? sample[1] : 0.0F,
+                        0.0F,
+                        1.0F),
+                    std::clamp(
+                        std::isfinite(sample[2]) ? sample[2] : 0.0F,
+                        0.0F,
+                        1.0F),
+                    std::clamp(
+                        std::isfinite(sample[3]) ? sample[3] : 0.0F,
+                        0.0F,
+                        1.0F),
+                };
+            }
         }
-        if (enabled) {
-            packedTimingColouriseCount =
-                static_cast<std::uint32_t>(effectIndex + 1U);
-        }
+        ++packedTimingColouriseCount;
     }
     styleGpu.timingColouriseControl.x = packedTimingColouriseCount;
     styleGpu.globalControl = glm::uvec4{
@@ -15040,6 +15291,136 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     }
 
     vkCmdEndRenderPass(resources.commandBuffer);
+
+    const bool applyEyeDomeLighting =
+        request.renderState.eyeDomeLightingEnabled &&
+        HasPointCloudExrReadback(request.readbackMask, PointCloudExrReadbackMask::Color);
+    if (applyEyeDomeLighting) {
+        if (eyeDomeLightingExportPipeline_ == VK_NULL_HANDLE ||
+            eyeDomeLightingExportPipelineLayout_ == VK_NULL_HANDLE ||
+            resources.eyeDomeLightingDescriptorSet == VK_NULL_HANDLE) {
+            throw std::runtime_error{"GPU export EDL resources are not initialized."};
+        }
+
+        std::array<VkImageMemoryBarrier, 2> shaderReadBarriers{};
+        shaderReadBarriers[0] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        shaderReadBarriers[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        shaderReadBarriers[0].dstAccessMask =
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        shaderReadBarriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        shaderReadBarriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        shaderReadBarriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        shaderReadBarriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        shaderReadBarriers[0].image = resources.colorImage.image;
+        shaderReadBarriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        shaderReadBarriers[0].subresourceRange.baseMipLevel = 0U;
+        shaderReadBarriers[0].subresourceRange.levelCount = 1U;
+        shaderReadBarriers[0].subresourceRange.baseArrayLayer = 0U;
+        shaderReadBarriers[0].subresourceRange.layerCount = 1U;
+
+        shaderReadBarriers[1] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        shaderReadBarriers[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        shaderReadBarriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        shaderReadBarriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        shaderReadBarriers[1].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        shaderReadBarriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        shaderReadBarriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        shaderReadBarriers[1].image = resources.linearDepthImage.image;
+        shaderReadBarriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        shaderReadBarriers[1].subresourceRange.baseMipLevel = 0U;
+        shaderReadBarriers[1].subresourceRange.levelCount = 1U;
+        shaderReadBarriers[1].subresourceRange.baseArrayLayer = 0U;
+        shaderReadBarriers[1].subresourceRange.layerCount = 1U;
+
+        vkCmdPipelineBarrier(
+            resources.commandBuffer,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0U,
+            0U,
+            nullptr,
+            0U,
+            nullptr,
+            static_cast<std::uint32_t>(shaderReadBarriers.size()),
+            shaderReadBarriers.data());
+
+        vkCmdBindPipeline(
+            resources.commandBuffer,
+            VK_PIPELINE_BIND_POINT_COMPUTE,
+            eyeDomeLightingExportPipeline_);
+        vkCmdBindDescriptorSets(
+            resources.commandBuffer,
+            VK_PIPELINE_BIND_POINT_COMPUTE,
+            eyeDomeLightingExportPipelineLayout_,
+            0U,
+            1U,
+            &resources.eyeDomeLightingDescriptorSet,
+            0U,
+            nullptr);
+        const EyeDomeLightingExportPushConstants pushConstants{
+            .edl = glm::vec4{
+                1.0F,
+                24.0F,
+                0.35F,
+                std::clamp(
+                    request.renderState.eyeDomeLightingThickness,
+                    0.0F,
+                    24.0F),
+            },
+        };
+        vkCmdPushConstants(
+            resources.commandBuffer,
+            eyeDomeLightingExportPipelineLayout_,
+            VK_SHADER_STAGE_COMPUTE_BIT,
+            0U,
+            sizeof(EyeDomeLightingExportPushConstants),
+            &pushConstants);
+        constexpr std::uint32_t kWorkgroupSize = 16U;
+        vkCmdDispatch(
+            resources.commandBuffer,
+            (request.width + kWorkgroupSize - 1U) / kWorkgroupSize,
+            (request.height + kWorkgroupSize - 1U) / kWorkgroupSize,
+            1U);
+
+        std::array<VkImageMemoryBarrier, 2> transferBarriers{};
+        transferBarriers[0] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        transferBarriers[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        transferBarriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        transferBarriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        transferBarriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        transferBarriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        transferBarriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        transferBarriers[0].image = resources.colorImage.image;
+        transferBarriers[0].subresourceRange = shaderReadBarriers[0].subresourceRange;
+
+        std::uint32_t transferBarrierCount = 1U;
+        if (HasPointCloudExrReadback(
+                request.readbackMask,
+                PointCloudExrReadbackMask::Depth)) {
+            transferBarriers[1] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            transferBarriers[1].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            transferBarriers[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            transferBarriers[1].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            transferBarriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            transferBarriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            transferBarriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            transferBarriers[1].image = resources.linearDepthImage.image;
+            transferBarriers[1].subresourceRange = shaderReadBarriers[1].subresourceRange;
+            transferBarrierCount = 2U;
+        }
+
+        vkCmdPipelineBarrier(
+            resources.commandBuffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0U,
+            0U,
+            nullptr,
+            0U,
+            nullptr,
+            transferBarrierCount,
+            transferBarriers.data());
+    }
 
     VkBufferImageCopy colorCopyRegion{};
     colorCopyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;

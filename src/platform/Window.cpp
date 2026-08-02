@@ -69,6 +69,12 @@ bool Window::ShouldClose() const {
     return window_ == nullptr || glfwWindowShouldClose(window_) == GLFW_TRUE;
 }
 
+void Window::CancelCloseRequest() {
+    if (window_ != nullptr) {
+        glfwSetWindowShouldClose(window_, GLFW_FALSE);
+    }
+}
+
 void Window::PollEvents() {
     if (window_ == nullptr) {
         return;
@@ -76,9 +82,12 @@ void Window::PollEvents() {
 
     glfwPollEvents();
 
-    if (glfwGetKey(window_, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
+    const bool escapePressed =
+        glfwGetKey(window_, GLFW_KEY_ESCAPE) == GLFW_PRESS;
+    if (escapePressed && !escapeWasPressed_) {
         glfwSetWindowShouldClose(window_, GLFW_TRUE);
     }
+    escapeWasPressed_ = escapePressed;
 }
 
 void Window::SetTitle(const std::string& title) {

@@ -15,7 +15,9 @@ namespace invisible_places::timing {
 
 inline constexpr std::string_view kAuthoredTimingTakeId = "authored-timing";
 inline constexpr std::string_view kAuthoredTimingTakeName = "Authored Timing";
-inline constexpr std::size_t kMaximumTimingColouriseEffects = 5U;
+// Authoring remains unrestricted. This is only the shared responsiveness
+// recommendation for how many effects should overlap at one animation time.
+inline constexpr std::size_t kTimingColouriseSoftActiveEffectLimit = 5U;
 inline constexpr std::size_t kMaximumTimingColourisePaletteStops = 8U;
 inline constexpr std::size_t kTimingColouriseLutSampleCount = 64U;
 inline constexpr float kTimingColouriseKeyTolerance = 1.0e-4F;
@@ -53,6 +55,15 @@ struct TimingColourisePalette {
         TimingColourisePaletteStop{}};
 };
 
+// An effect-local alternative derived from a built-in preset. It is not part
+// of the shared project palette library and remains owned by one Colourise
+// effect while that effect switches between presets.
+struct TimingColouriseLocalPaletteEdit {
+    std::string presetId;
+    std::string presetName;
+    TimingColourisePalette palette{};
+};
+
 // Whole-palette snapshots are retained for projects authored before
 // independent stop-property keying. New effects use StopParameters: their
 // stop topology is static and each stop property owns its own curve.
@@ -67,6 +78,24 @@ enum class TimingColourisePaletteSourceKind : std::uint8_t {
     Saved,
 };
 
+enum class TimingColouriseAmountOverrideMode : std::uint8_t {
+    // Clamp every sampled stop amount to the authored override ceiling.
+    Maximum = 0,
+    // Multiply every sampled stop amount by the authored override value.
+    Scale,
+};
+
+enum class TimingEffectKind : std::uint8_t {
+    Colourise = 0,
+    Emissive,
+};
+
+enum class TimingColouriseEffectParameter : std::uint8_t {
+    PalettePhase = 0,
+    AmountOverride,
+    EmissiveLevel,
+};
+
 enum class TimingColourisePaletteStopParameter : std::uint8_t {
     Position = 0,
     Colour,
@@ -79,8 +108,9 @@ using TimingColouriseLut =
 struct TimingColouriseBounds {
     float lower = 0.0F;
     float upper = 1.0F;
-    // Fraction of the selected span faded at each edge, in [0, 0.5].
-    float edgeFade = 0.0F;
+    // Signed fraction of the selected span faded at each edge, in [-0.5,
+    // 0.5]. Positive values fade inward; negative values fade outward.
+    float edgeFade = 0.10F;
 };
 
 // An effect chooses exactly one bounds parameterisation. This makes the two
@@ -124,6 +154,15 @@ struct TimingColouriseBoundsParameterKey {
         invisible_places::water::WaterScenarioInterpolation::Smooth;
 };
 
+struct TimingColouriseEffectParameterKey {
+    TimingColouriseEffectParameter parameter =
+        TimingColouriseEffectParameter::PalettePhase;
+    float position = 0.0F;
+    float value = 0.0F;
+    invisible_places::water::WaterScenarioInterpolation interpolation =
+        invisible_places::water::WaterScenarioInterpolation::Smooth;
+};
+
 struct TimingColourisePaletteKey {
     float position = 0.0F;
     TimingColourisePalette palette{};
@@ -151,10 +190,20 @@ struct TimingColouriseBoundsKey {
         invisible_places::water::WaterScenarioInterpolation::Smooth;
 };
 
+struct TimingColouriseActivationRange {
+    // Inclusive normalized animation positions. This window controls only
+    // whether the effect contributes to rendering; authored tracks remain
+    // global and continue to evaluate from every key.
+    float start = 0.0F;
+    float end = 1.0F;
+};
+
 struct TimingColouriseEffect {
     std::string id;
     std::string name = "Colourise";
+    TimingEffectKind kind = TimingEffectKind::Colourise;
     bool enabled = true;
+    TimingColouriseActivationRange activationRange{};
     TimingColouriseFieldSelector field{};
     TimingColourisePalette basePalette{};
     TimingColouriseBounds baseBounds{};
@@ -166,7 +215,25 @@ struct TimingColouriseEffect {
     // copied palette stored on this effect, never a live library reference.
     std::string paletteSourceId;
     std::string paletteSourceName;
+    // Private preset variants owned only by this effect. basePalette remains
+    // the active evaluation snapshot; paletteEdited identifies when the
+    // matching local variant is the active snapshot.
+    std::vector<TimingColouriseLocalPaletteEdit> localPaletteEdits;
     bool paletteEdited = false;
+    TimingColouriseAmountOverrideMode colouriseAmountOverrideMode =
+        TimingColouriseAmountOverrideMode::Maximum;
+    // Applied after palette/key evaluation. This changes colour mixing only,
+    // never point opacity or the authored per-stop amounts.
+    float colouriseAmountOverride = 1.0F;
+    // Unwrapped cyclic offset in palette turns. Animation retains the full
+    // value (for example 0 -> 1 -> 2); wrapping happens only while sampling
+    // the evaluated LUT. Stops and their authored positions remain fixed.
+    float palettePhaseOffset = 0.0F;
+    // Independent animated tracks for phase and the amount override value.
+    // EmissiveLevel shares this scalar-key representation. The Max/Scale mode
+    // itself remains an authored, non-animated choice.
+    float emissiveLevel = 1.0F;
+    std::vector<TimingColouriseEffectParameterKey> effectParameterKeys;
     // Legacy whole-palette snapshots remain active only in LegacySnapshots
     // mode. New authoring writes the independent tracks below.
     std::vector<TimingColourisePaletteKey> paletteKeys;
@@ -187,6 +254,37 @@ struct TimingColourisePaletteDefinition {
     std::string name = "Palette";
     TimingColourisePalette palette{};
 };
+
+[[nodiscard]] const TimingColouriseLocalPaletteEdit*
+FindTimingColouriseLocalPaletteEdit(
+    const TimingColouriseEffect& effect,
+    std::string_view presetId);
+// Stores an effect-local variant for the effect's current built-in preset and
+// makes that variant the active base palette.
+[[nodiscard]] bool UpsertTimingColouriseLocalPaletteEdit(
+    TimingColouriseEffect* effect,
+    TimingColourisePalette palette);
+// Selects a built-in source snapshot without deleting any private variants
+// already owned by this effect.
+[[nodiscard]] bool ActivateTimingColouriseOriginalPreset(
+    TimingColouriseEffect* effect,
+    const TimingColourisePaletteDefinition& preset);
+[[nodiscard]] bool ActivateTimingColouriseLocalPaletteEdit(
+    TimingColouriseEffect* effect,
+    std::string_view presetId);
+// Removes the private variant derived from `originalPreset`. If that variant
+// is active, the supplied original becomes active in its place.
+[[nodiscard]] bool DiscardTimingColouriseLocalPaletteEdit(
+    TimingColouriseEffect* effect,
+    const TimingColourisePaletteDefinition& originalPreset);
+// Converts a private variant into a shared Saved definition, activates that
+// saved snapshot on the effect, and removes only the promoted private entry.
+[[nodiscard]] std::optional<TimingColourisePaletteDefinition>
+PromoteTimingColouriseLocalPaletteEdit(
+    TimingColouriseEffect* effect,
+    std::string_view presetId,
+    std::string savedPaletteId,
+    std::string savedPaletteName);
 
 struct TimingTakeDefinition {
     std::string id;
@@ -215,6 +313,19 @@ struct TimingColouriseLayerSample {
 
 [[nodiscard]] TimingColourisePalette SanitizeTimingColourisePalette(
     TimingColourisePalette palette);
+// Mirrors the palette left-to-right without changing stop identities or
+// authored colour/amount values. The returned stops are sanitized and sorted.
+[[nodiscard]] TimingColourisePalette ReverseTimingColourisePalette(
+    TimingColourisePalette palette);
+[[nodiscard]] bool CanReverseTimingColourisePaletteAtPosition(
+    const TimingColouriseEffect& effect,
+    float position);
+// Reverses an unkeyed base palette, or authors only stop-position values at
+// the requested animation position. Legacy snapshot tracks can be reversed
+// only while positioned exactly on one of their keys.
+[[nodiscard]] bool ReverseTimingColourisePaletteAtPosition(
+    TimingColouriseEffect* effect,
+    float position);
 [[nodiscard]] std::string AllocateTimingColourisePaletteStopId(
     const TimingColourisePalette& palette);
 [[nodiscard]] TimingColouriseBounds SanitizeTimingColouriseBounds(
@@ -243,6 +354,21 @@ ResolveTimingColouriseBoundsHandleEdit(
 [[nodiscard]] bool SetTimingColouriseBoundsKeyMode(
     TimingColouriseEffect* effect,
     TimingColouriseBoundsKeyMode mode);
+[[nodiscard]] bool TimingEffectParameterIsSupported(
+    TimingEffectKind kind,
+    TimingColouriseEffectParameter parameter);
+[[nodiscard]] TimingColouriseActivationRange
+SanitizeTimingColouriseActivationRange(
+    TimingColouriseActivationRange range);
+// Uses an inclusive [start, end] interval. Non-finite sample positions are
+// never active; finite positions are clamped to the normalized domain.
+[[nodiscard]] bool TimingColouriseActivationRangeContains(
+    TimingColouriseActivationRange range,
+    float normalizedPosition);
+// Combines the persistent enabled toggle with the activation window.
+[[nodiscard]] bool TimingColouriseEffectIsActiveAt(
+    const TimingColouriseEffect& effect,
+    float normalizedPosition);
 [[nodiscard]] TimingColouriseEffect SanitizeTimingColouriseEffect(
     TimingColouriseEffect effect);
 [[nodiscard]] TimingColourisePaletteDefinition
@@ -252,9 +378,29 @@ SanitizeTimingColourisePaletteDefinition(
     TimingTakeDefinition definition);
 [[nodiscard]] TimingTakeSceneState SanitizeTimingTakeSceneState(
     TimingTakeSceneState state);
+// Moves an effect to its new final list index while keeping the effect and all
+// of its owned animation tracks together.
+[[nodiscard]] bool MoveTimingColouriseEffect(
+    std::vector<TimingColouriseEffect>* effects,
+    std::size_t fromIndex,
+    std::size_t toIndex);
 
 [[nodiscard]] TimingColouriseLut CompileTimingColourisePaletteLut(
     const TimingColourisePalette& palette);
+[[nodiscard]] TimingColouriseLut ApplyTimingColouriseAmountOverride(
+    TimingColouriseLut lut,
+    TimingColouriseAmountOverrideMode mode,
+    float value);
+[[nodiscard]] TimingColouriseLut ApplyTimingColourisePalettePhase(
+    const TimingColouriseLut& lut,
+    float phaseOffset);
+[[nodiscard]] float EvaluateTimingColouriseEffectParameter(
+    const TimingColouriseEffect& effect,
+    TimingColouriseEffectParameter parameter,
+    float normalizedPosition);
+[[nodiscard]] float EvaluateTimingEmissiveLevel(
+    const TimingColouriseEffect& effect,
+    float normalizedPosition);
 [[nodiscard]] TimingColourisePalette EvaluateTimingColourisePalette(
     const TimingColouriseEffect& effect,
     float normalizedPosition);
@@ -311,6 +457,13 @@ void AddOrUpdateTimingColouriseBoundsKey(
     float value,
     invisible_places::water::WaterScenarioInterpolation interpolation =
         invisible_places::water::WaterScenarioInterpolation::Smooth);
+[[nodiscard]] bool AddOrUpdateTimingColouriseEffectParameterKey(
+    TimingColouriseEffect* effect,
+    TimingColouriseEffectParameter parameter,
+    float position,
+    float value,
+    invisible_places::water::WaterScenarioInterpolation interpolation =
+        invisible_places::water::WaterScenarioInterpolation::Smooth);
 [[nodiscard]] bool MoveTimingColourisePaletteKey(
     TimingColouriseEffect* effect,
     float sourcePosition,
@@ -328,6 +481,19 @@ void AddOrUpdateTimingColouriseBoundsKey(
     TimingColouriseBoundsParameter parameter,
     float sourcePosition,
     float destinationPosition);
+[[nodiscard]] bool MoveTimingColouriseEffectParameterKey(
+    TimingColouriseEffect* effect,
+    TimingColouriseEffectParameter parameter,
+    float sourcePosition,
+    float destinationPosition);
+[[nodiscard]] bool MoveTimingColouriseEffectParameterKeys(
+    TimingColouriseEffect* effect,
+    float sourcePosition,
+    float destinationPosition);
+[[nodiscard]] bool CanMoveTimingColouriseEffectParameterKeysAtPosition(
+    const TimingColouriseEffect& effect,
+    float sourcePosition,
+    float destinationPosition);
 [[nodiscard]] std::size_t TimingColourisePaletteKeyCountAtPosition(
     const TimingColouriseEffect& effect,
     float position);
@@ -341,6 +507,15 @@ TimingColourisePaletteStopParameterKeyCountAtPosition(
 TimingColouriseBoundsParameterKeyCountAtPosition(
     const TimingColouriseEffect& effect,
     TimingColouriseBoundsParameter parameter,
+    float position);
+[[nodiscard]] std::size_t
+TimingColouriseEffectParameterKeyCountAtPosition(
+    const TimingColouriseEffect& effect,
+    TimingColouriseEffectParameter parameter,
+    float position);
+[[nodiscard]] std::size_t
+TimingColouriseEffectParameterUnionKeyCountAtPosition(
+    const TimingColouriseEffect& effect,
     float position);
 [[nodiscard]] std::size_t TimingColouriseBoundsKeyCountAtPosition(
     const TimingColouriseEffect& effect,
@@ -364,6 +539,15 @@ RemoveTimingColourisePaletteStopParameterKeysAtPosition(
 RemoveTimingColouriseBoundsParameterKeysAtPosition(
     TimingColouriseEffect* effect,
     TimingColouriseBoundsParameter parameter,
+    float position);
+[[nodiscard]] std::size_t
+RemoveTimingColouriseEffectParameterKeysAtPosition(
+    TimingColouriseEffect* effect,
+    TimingColouriseEffectParameter parameter,
+    float position);
+[[nodiscard]] std::size_t
+RemoveTimingColouriseEffectParameterKeysAtPosition(
+    TimingColouriseEffect* effect,
     float position);
 [[nodiscard]] std::size_t RemoveTimingColouriseEffectKeysAtPosition(
     TimingColouriseEffect* effect,
@@ -404,6 +588,31 @@ PreviousTimingColouriseBoundsParameterKeyPosition(
 NextTimingColouriseBoundsParameterKeyPosition(
     const TimingColouriseEffect& effect,
     TimingColouriseBoundsParameter parameter,
+    float position);
+[[nodiscard]] std::optional<float>
+PreviousTimingColouriseEffectParameterKeyPosition(
+    const TimingColouriseEffect& effect,
+    TimingColouriseEffectParameter parameter,
+    float position);
+[[nodiscard]] std::optional<float>
+NextTimingColouriseEffectParameterKeyPosition(
+    const TimingColouriseEffect& effect,
+    TimingColouriseEffectParameter parameter,
+    float position);
+[[nodiscard]] std::vector<float>
+TimingColouriseEffectParameterKeyPositions(
+    const TimingColouriseEffect& effect,
+    TimingColouriseEffectParameter parameter);
+[[nodiscard]] std::vector<float>
+TimingColouriseEffectParameterKeyPositions(
+    const TimingColouriseEffect& effect);
+[[nodiscard]] std::optional<float>
+PreviousTimingColouriseAnyEffectParameterKeyPosition(
+    const TimingColouriseEffect& effect,
+    float position);
+[[nodiscard]] std::optional<float>
+NextTimingColouriseAnyEffectParameterKeyPosition(
+    const TimingColouriseEffect& effect,
     float position);
 [[nodiscard]] std::optional<float> PreviousTimingColouriseEffectKeyPosition(
     const TimingColouriseEffect& effect,

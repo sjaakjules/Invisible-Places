@@ -1,6 +1,7 @@
 #pragma once
 
 #include "camera/AnimationPath.hpp"
+#include "camera/CameraNavigation.hpp"
 #include "camera/CameraShot.hpp"
 #include "output/RenderPreset.hpp"
 #include "renderer/gsplat/GsplatLayer.hpp"
@@ -20,7 +21,7 @@
 namespace invisible_places::serialization {
 
 inline constexpr std::size_t kMaxSerializedWaterRippleRuntimeCacheMemberships = 250'000U;
-inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 52U;
+inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 59U;
 inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 20U;
 inline constexpr std::uint32_t kAnimationDocumentSchemaVersion = 14U;
 inline constexpr std::uint32_t kWaterPathCacheSidecarSchemaVersion = 1U;
@@ -154,6 +155,8 @@ struct ProjectDocument {
     invisible_places::renderer::gsplat::GaussianSplatStyleState gsplatVisualStyle{};
     std::vector<ProjectLayerDocument> layers;
     std::optional<invisible_places::camera::CameraState> cameraState;
+    invisible_places::camera::OrbitControlMode orbitControlMode =
+        invisible_places::camera::OrbitControlMode::WorldUp;
     std::vector<invisible_places::camera::CameraShot> cameraShots;
     std::vector<std::size_t> cameraPathShotIndices;
     std::uint32_t cameraPathDurationFrames = 180;
@@ -236,6 +239,7 @@ struct ProjectDocument {
     std::optional<invisible_places::water::WaterPathGenerationSettings> tempWaterPathProfileSettings;
     std::optional<invisible_places::water::WaterFlowTrailSettings> tempWaterLaneProfileSettings;
     std::optional<WaterTrailProfileDocument> tempWaterTrailProfile;
+    std::optional<WaterTrailProfileDocument> tempWaterDynamicMeshTrailProfile;
     invisible_places::water::WaterCausticLookSettings waterCausticLookSettings{};
     std::optional<invisible_places::water::WaterCausticLookSettings> tempWaterCausticLookSettings;
     std::vector<ProjectLayerDocument::PointVisual> waterPointVisuals;

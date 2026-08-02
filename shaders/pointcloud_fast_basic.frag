@@ -7,7 +7,7 @@ layout(location = 2) flat in uint inPointIndex;
 layout(location = 3) in vec3 inWorldPosition;
 layout(location = 4) in vec3 inPointNormal;
 layout(location = 5) in float inFlowCoverage;
-layout(location = 6) flat in vec4 inTimingColourise[5];
+layout(location = 6) flat in vec4 inTimingColourise[8];
 
 layout(location = 0) out vec4 outColor;
 
@@ -88,6 +88,7 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 rainImpactVegetation1;
     vec4 rainImpactSandBand;
     vec4 rainImpactResponse;
+    uvec4 timingColouriseControl;
 } styleData;
 
 #include "pointcloud_sparse_ripple.glsl"
@@ -342,11 +343,18 @@ vec3 ResolveBaseColor() {
                 rainImpact),
             meshFlowContact);
     // Fast Basic is intentionally opaque and has no separate emission target;
-    // represent Mesh Flow contact emission as a bounded colour lift.
-    return composedColour +
-           meshFlowContact.tint *
-               min(1.0, meshFlowContact.emissionAdd) *
-               0.35;
+    // represent emission as a bounded colour lift.
+    const vec3 finalColour =
+        composedColour +
+        meshFlowContact.tint *
+            min(1.0, meshFlowContact.emissionAdd) *
+            0.35;
+    const float timingEmissionAdd = ResolveTimingColouriseEmissionAdd();
+    if (timingEmissionAdd <= 0.0) {
+        return finalColour;
+    }
+    return finalColour *
+           (1.0 + 0.35 * min(1.0, timingEmissionAdd));
 }
 
 float WaterFlowCoverageNoise() {

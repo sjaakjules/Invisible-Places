@@ -14,7 +14,7 @@ layout(location = 8) flat in uint inPointIndex;
 layout(location = 9) in float inSurfaceAngleMask;
 layout(location = 11) in float inCaustic;
 layout(location = 12) in vec4 inWaterColourTransform;
-layout(location = 13) flat in vec4 inTimingColourise[5];
+layout(location = 13) flat in vec4 inTimingColourise[8];
 
 layout(location = 0) out vec4 outAccumulation;
 layout(location = 1) out float outRevealage;
@@ -93,6 +93,7 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 rainImpactVegetation1;
     vec4 rainImpactSandBand;
     vec4 rainImpactResponse;
+    uvec4 timingColouriseControl;
 } styleData;
 
 #include "pointcloud_stylisation.glsl"
@@ -272,7 +273,12 @@ void main() {
     outAccumulation = vec4(baseColor * weightedAlpha * weight, weightedAlpha * weight);
     outRevealage = weightedAlpha;
 
-    const float emissionGain = max(0.0, inEmissive) * max(0.0, styleData.renderParams0.x);
+    float resolvedEmissive = max(0.0, inEmissive);
+    const float timingEmissionAdd = ResolveTimingColouriseEmissionAdd();
+    if (timingEmissionAdd > 0.0) {
+        resolvedEmissive += timingEmissionAdd;
+    }
+    const float emissionGain = resolvedEmissive * max(0.0, styleData.renderParams0.x);
     if (emissionGain > 1e-5) {
         outEmission += vec4(
             baseColor * compensatedRawAlpha * emissionGain,

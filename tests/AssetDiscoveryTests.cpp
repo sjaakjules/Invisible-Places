@@ -2203,6 +2203,72 @@ TEST_CASE("Orbit camera keeps repeated zoom-out wheel steps controlled", "[camer
     CHECK(camera.Distance() < zoomedOutDistance);
 }
 
+TEST_CASE("CloudCompare trackball orbits freely and rolls at its rim", "[camera][orbit][trackball]") {
+    invisible_places::io::Bounds3f bounds;
+    bounds.Expand({-1.0F, -1.0F, -1.0F});
+    bounds.Expand({1.0F, 1.0F, 1.0F});
+
+    invisible_places::camera::OrbitCamera camera;
+    camera.FrameBounds(bounds, 1.0F);
+    const glm::vec3 pivot = camera.OrbitCenter();
+    const auto beforeOrbit = camera.Matrices(1.0F);
+    const float radiusBeforeOrbit = glm::length(beforeOrbit.position - pivot);
+
+    camera.OrbitTrackball(
+        400.0F,
+        400.0F,
+        500.0F,
+        400.0F,
+        800.0F,
+        800.0F,
+        400.0F,
+        400.0F);
+    const auto afterOrbit = camera.Matrices(1.0F);
+    CHECK(glm::length(afterOrbit.position - pivot) == Catch::Approx(radiusBeforeOrbit));
+    CHECK(glm::length(afterOrbit.position - beforeOrbit.position) > 0.01F);
+    CHECK(camera.OrbitCenter().x == Catch::Approx(pivot.x));
+    CHECK(camera.OrbitCenter().y == Catch::Approx(pivot.y));
+    CHECK(camera.OrbitCenter().z == Catch::Approx(pivot.z));
+
+    invisible_places::camera::OrbitCamera rollingCamera;
+    rollingCamera.FrameBounds(bounds, 1.0F);
+    const auto beforeRollState = rollingCamera.CaptureState();
+    const glm::quat beforeRollOrientation{
+        beforeRollState.orientation[3],
+        beforeRollState.orientation[0],
+        beforeRollState.orientation[1],
+        beforeRollState.orientation[2],
+    };
+    const auto beforeRollMatrices = rollingCamera.Matrices(1.0F);
+
+    // A tangential quarter-turn along the virtual sphere's rim is pure roll:
+    // view direction and eye position stay fixed while camera-up rotates.
+    rollingCamera.OrbitTrackball(
+        400.0F,
+        800.0F,
+        0.0F,
+        400.0F,
+        800.0F,
+        800.0F,
+        400.0F,
+        400.0F);
+    const auto afterRollState = rollingCamera.CaptureState();
+    const glm::quat afterRollOrientation{
+        afterRollState.orientation[3],
+        afterRollState.orientation[0],
+        afterRollState.orientation[1],
+        afterRollState.orientation[2],
+    };
+    const auto afterRollMatrices = rollingCamera.Matrices(1.0F);
+    const glm::vec3 upBefore = beforeRollOrientation * glm::vec3{0.0F, 1.0F, 0.0F};
+    const glm::vec3 upAfter = afterRollOrientation * glm::vec3{0.0F, 1.0F, 0.0F};
+    const glm::vec3 forwardBefore = beforeRollOrientation * glm::vec3{0.0F, 0.0F, -1.0F};
+    const glm::vec3 forwardAfter = afterRollOrientation * glm::vec3{0.0F, 0.0F, -1.0F};
+    CHECK(glm::dot(forwardBefore, forwardAfter) > 0.999F);
+    CHECK(std::abs(glm::dot(upBefore, upAfter)) < 0.01F);
+    CHECK(glm::length(afterRollMatrices.position - beforeRollMatrices.position) < 0.0001F);
+}
+
 TEST_CASE("Point preview LOD resolver only applies automatic LOD to camera motion", "[budget][lod]") {
     using invisible_places::renderer::pointcloud::MakePointBudgetState;
     using invisible_places::renderer::pointcloud::PointCloudPreviewLodMode;
@@ -2347,6 +2413,8 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     document.constantUpdateView = true;
     document.liveVisualEffects = true;
     document.sidePanelPinned = true;
+    document.orbitControlMode =
+        invisible_places::camera::OrbitControlMode::CloudCompareTrackball;
     document.autoLowerGsplatQualityWhileNavigating = false;
     document.pointCloudPreviewLodMode =
         invisible_places::renderer::pointcloud::PointCloudPreviewLodMode::ForceLod;
@@ -2882,6 +2950,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         CHECK(savedJson.find("\"eye_dome_lighting_thickness\": 4.0") != std::string::npos);
         CHECK(savedJson.find("\"constant_update_view\"") != std::string::npos);
         CHECK(savedJson.find("\"live_visual_effects\"") != std::string::npos);
+        CHECK(savedJson.find("\"orbit_control_mode\": \"cloudcompare_trackball\"") != std::string::npos);
         CHECK(savedJson.find("\"point_cloud_renderer_mode\"") != std::string::npos);
         CHECK(savedJson.find("\"point_visuals\"") != std::string::npos);
         CHECK(savedJson.find("\"selected_point_visual\"") != std::string::npos);
@@ -2906,6 +2975,9 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
 
     CHECK(loadedDocument->projectName == "Roundtrip");
     CHECK(loadedDocument->sidePanelPinned);
+    CHECK(
+        loadedDocument->orbitControlMode ==
+        invisible_places::camera::OrbitControlMode::CloudCompareTrackball);
     CHECK(!loadedDocument->autoLowerGsplatQualityWhileNavigating);
     CHECK(
         loadedDocument->pointCloudPreviewLodMode ==
@@ -3329,6 +3401,9 @@ TEST_CASE("Project document defaults ProRes alpha preview off for older projects
     REQUIRE(loadedDocument.has_value());
     CHECK(loadedDocument->schemaVersion == invisible_places::serialization::ProjectDocument{}.schemaVersion);
     CHECK_FALSE(loadedDocument->proResAlphaPreviewEnabled);
+    CHECK(
+        loadedDocument->orbitControlMode ==
+        invisible_places::camera::OrbitControlMode::WorldUp);
 
     std::filesystem::remove(outputPath);
 }

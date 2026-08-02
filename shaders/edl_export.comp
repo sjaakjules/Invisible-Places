@@ -1,0 +1,94 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform image2D sceneColorImage;
+layout(set = 0, binding = 1) uniform sampler2D linearDepthInput;
+
+layout(push_constant) uniform EyeDomeLightingData {
+    vec4 edl;
+} postProcess;
+
+bool ValidDepth(float depth) {
+    return !isnan(depth) && !isinf(depth) && depth > 0.0;
+}
+
+float LogDepth(float depth) {
+    return log2(max(depth, 1.0e-6));
+}
+
+float EyeDomeLightingShade(ivec2 coord, ivec2 size) {
+    const float centerDepth = texelFetch(linearDepthInput, coord, 0).r;
+    if (!ValidDepth(centerDepth)) {
+        return 1.0;
+    }
+
+    const ivec2 offsets[8] = ivec2[](
+        ivec2(-1, 0),
+        ivec2(1, 0),
+        ivec2(0, -1),
+        ivec2(0, 1),
+        ivec2(-1, -1),
+        ivec2(1, -1),
+        ivec2(-1, 1),
+        ivec2(1, 1)
+    );
+
+    const float centerLogDepth = LogDepth(centerDepth);
+    float response = 0.0;
+    float sampleCount = 0.0;
+    const float radiusLimit = clamp(postProcess.edl.w, 0.0, 24.0);
+    if (radiusLimit <= 1.0e-6) {
+        return 1.0;
+    }
+
+    const int radiusPixels = clamp(int(ceil(radiusLimit)), 1, 24);
+    for (int radius = 1; radius <= radiusPixels; ++radius) {
+        const float ringWeight = clamp(radiusLimit - float(radius - 1), 0.0, 1.0);
+        if (ringWeight <= 1.0e-6) {
+            continue;
+        }
+        for (int index = 0; index < 8; ++index) {
+            const ivec2 sampleCoord = coord + (offsets[index] * radius);
+            if (sampleCoord.x < 0 || sampleCoord.y < 0 || sampleCoord.x >= size.x || sampleCoord.y >= size.y) {
+                continue;
+            }
+
+            const float neighborDepth = texelFetch(linearDepthInput, sampleCoord, 0).r;
+            if (!ValidDepth(neighborDepth)) {
+                continue;
+            }
+
+            response += max(0.0, LogDepth(neighborDepth) - centerLogDepth) * ringWeight;
+            sampleCount += 1.0;
+        }
+    }
+
+    if (sampleCount <= 1.0e-6 || response <= 1.0e-6) {
+        return 1.0;
+    }
+
+    const float shade = exp(-max(0.0, postProcess.edl.y) * response / sampleCount);
+    return clamp(shade, clamp(postProcess.edl.z, 0.0, 1.0), 1.0);
+}
+
+void main() {
+    const ivec2 size = imageSize(sceneColorImage);
+    const ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= size.x || coord.y >= size.y) {
+        return;
+    }
+
+    const float shade = EyeDomeLightingShade(coord, size);
+    // Match the CPU reference: near-unity shade leaves the original half bits
+    // untouched, while shaded RGB is clamped non-negative before half storage.
+    if (shade >= 0.9999) {
+        return;
+    }
+
+    const vec4 sceneColor = imageLoad(sceneColorImage, coord);
+    imageStore(
+        sceneColorImage,
+        coord,
+        vec4(max(sceneColor.rgb * shade, vec3(0.0)), sceneColor.a));
+}

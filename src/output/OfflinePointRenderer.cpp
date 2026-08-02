@@ -1009,6 +1009,72 @@ std::optional<float> ResolveTimingColouriseValue(
     return std::nullopt;
 }
 
+struct ResolvedTimingColouriseMask {
+    float normalizedValue = 0.0F;
+    float edgeMask = 0.0F;
+};
+
+std::optional<ResolvedTimingColouriseMask> ResolveTimingColouriseMask(
+    const OfflinePointLayer& layer,
+    const invisible_places::renderer::pointcloud::ResolvedTimingColouriseEffect&
+        effect,
+    std::size_t pointIndex) {
+    if (!effect.enabled ||
+        !std::isfinite(effect.lowerBound) ||
+        !std::isfinite(effect.upperBound) ||
+        effect.upperBound <= effect.lowerBound) {
+        return std::nullopt;
+    }
+    const auto value = ResolveTimingColouriseValue(
+        layer,
+        effect,
+        pointIndex);
+    if (!value.has_value() || !std::isfinite(value.value())) {
+        return std::nullopt;
+    }
+
+    const float span = effect.upperBound - effect.lowerBound;
+    const float fadeFraction = std::clamp(
+        std::isfinite(effect.edgeFadeFraction)
+            ? effect.edgeFadeFraction
+            : 0.10F,
+        -0.5F,
+        0.5F);
+    const float outwardWidth =
+        span * std::max(-fadeFraction, 0.0F);
+    if (value.value() < effect.lowerBound - outwardWidth ||
+        value.value() > effect.upperBound + outwardWidth) {
+        return std::nullopt;
+    }
+
+    ResolvedTimingColouriseMask result;
+    result.normalizedValue = std::clamp(
+        (value.value() - effect.lowerBound) / span,
+        0.0F,
+        1.0F);
+    result.edgeMask = 1.0F;
+    if (fadeFraction > 1.0e-6F) {
+        result.edgeMask = std::min(
+            SmoothStep(0.0F, fadeFraction, result.normalizedValue),
+            SmoothStep(
+                0.0F,
+                fadeFraction,
+                1.0F - result.normalizedValue));
+    } else if (fadeFraction < -1.0e-6F) {
+        result.edgeMask = std::min(
+            SmoothStep(
+                effect.lowerBound - outwardWidth,
+                effect.lowerBound,
+                value.value()),
+            1.0F - SmoothStep(
+                effect.upperBound,
+                effect.upperBound + outwardWidth,
+                value.value()));
+    }
+    result.edgeMask = Clamp01(result.edgeMask);
+    return result;
+}
+
 glm::vec4 SampleTimingColouriseLut(
     const invisible_places::renderer::pointcloud::ResolvedTimingColouriseEffect&
         effect,
@@ -1040,40 +1106,22 @@ glm::vec3 ApplyTimingColourise(
         layer.timingColourise.effects.size());
     for (std::size_t effectIndex = 0; effectIndex < effectCount; ++effectIndex) {
         const auto& effect = layer.timingColourise.effects[effectIndex];
-        if (!effect.enabled ||
-            !std::isfinite(effect.lowerBound) ||
-            !std::isfinite(effect.upperBound) ||
-            effect.upperBound <= effect.lowerBound) {
+        if (effect.output !=
+            invisible_places::renderer::pointcloud::
+                TimingColouriseOutput::Colourise) {
             continue;
         }
-        const auto value = ResolveTimingColouriseValue(
+        const auto mask = ResolveTimingColouriseMask(
             layer,
             effect,
             pointIndex);
-        if (!value.has_value() ||
-            !std::isfinite(value.value()) ||
-            value.value() < effect.lowerBound ||
-            value.value() > effect.upperBound) {
+        if (!mask.has_value()) {
             continue;
         }
-
-        const float span = effect.upperBound - effect.lowerBound;
-        const float normalized =
-            (value.value() - effect.lowerBound) / span;
-        float edgeMask = 1.0F;
-        const float fadeFraction = std::clamp(
-            std::isfinite(effect.edgeFadeFraction)
-                ? effect.edgeFadeFraction
-                : 0.0F,
-            0.0F,
-            0.5F);
-        if (fadeFraction > 1.0e-6F) {
-            edgeMask = std::min(
-                SmoothStep(0.0F, fadeFraction, normalized),
-                SmoothStep(0.0F, fadeFraction, 1.0F - normalized));
-        }
-        const glm::vec4 lut = SampleTimingColouriseLut(effect, normalized);
-        const float amount = Clamp01(lut.a) * Clamp01(edgeMask);
+        const glm::vec4 lut = SampleTimingColouriseLut(
+            effect,
+            mask->normalizedValue);
+        const float amount = Clamp01(lut.a) * mask->edgeMask;
         if (amount > 1.0e-5F) {
             baseColor = glm::mix(
                 baseColor,
@@ -1082,6 +1130,37 @@ glm::vec3 ApplyTimingColourise(
         }
     }
     return baseColor;
+}
+
+float ResolveTimingColouriseEmissionAdd(
+    const OfflinePointLayer& layer,
+    std::size_t pointIndex) {
+    const std::size_t effectCount = std::min<std::size_t>(
+        layer.timingColourise.effectCount,
+        layer.timingColourise.effects.size());
+    float emissionAdd = 0.0F;
+    for (std::size_t effectIndex = 0; effectIndex < effectCount; ++effectIndex) {
+        const auto& effect = layer.timingColourise.effects[effectIndex];
+        if (effect.output !=
+            invisible_places::renderer::pointcloud::
+                TimingColouriseOutput::Emissive) {
+            continue;
+        }
+        const auto mask = ResolveTimingColouriseMask(
+            layer,
+            effect,
+            pointIndex);
+        if (!mask.has_value()) {
+            continue;
+        }
+        const float level = std::max(
+            0.0F,
+            std::isfinite(effect.emissiveLevel)
+                ? effect.emissiveLevel
+                : 0.0F);
+        emissionAdd += level * mask->edgeMask;
+    }
+    return std::max(0.0F, emissionAdd);
 }
 
 glm::vec3 ResolvePointColor(
@@ -2171,6 +2250,9 @@ bool BuildOfflinePointSample(
         if (waterTrails) {
             sample->emissive *= waterTrailVisibility * waterFlowActivity.appearance;
         }
+        sample->emissive += ResolveTimingColouriseEmissionAdd(
+            layer,
+            pointIndex);
         sample->color = ResolvePointColor(layer, pointIndex);
         sample->color = glm::mix(
             sample->color,
@@ -2843,6 +2925,12 @@ void RenderFastBasicPointCloudTile(
                 glm::vec3{0.54F, 0.80F, 0.82F},
                 std::clamp(rainImpact.dropletBlend, 0.0F, 0.72F));
             color *= 1.0F + std::max(0.0F, rainImpact.emission);
+            const float timingEmissionAdd =
+                ResolveTimingColouriseEmissionAdd(layer, pointIndex);
+            if (timingEmissionAdd > 0.0F) {
+                color *= 1.0F +
+                         0.35F * std::min(1.0F, timingEmissionAdd);
+            }
             // Fast Basic intentionally ignores the authored material opacity,
             // while procedural water effects can still attenuate its opaque base.
             const float flowCoverage = waterTrails

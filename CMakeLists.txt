@@ -81,6 +81,7 @@ set(INVISIBLE_PLACES_SHADER_SOURCES
     shaders/gsplat_composite.frag
     shaders/pointcloud_exr_composite.frag
     shaders/edl_postprocess.frag
+    shaders/edl_export.comp
 )
 set(INVISIBLE_PLACES_SHADER_INCLUDES
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_coverage.glsl"
@@ -156,6 +157,7 @@ add_library(
     src/scene/PointCloudVariants.cpp
     src/scene/SceneCatalog.cpp
     src/serialization/ProjectDocument.cpp
+    src/serialization/RenderSetupDocument.cpp
     src/style/RenderParameterBinding.cpp
     src/timing/TimingColourise.cpp
     src/timing/TimingColouriseHistogram.cpp
@@ -248,6 +250,7 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
             tests/PointCloudDensityCompensationTests.cpp
             tests/PointCloudVariantsTests.cpp
             tests/ProjectDocumentSerializationTests.cpp
+            tests/RenderSetupDocumentTests.cpp
             tests/RainImpactGpuEquivalenceTests.cpp
             tests/RainOfflineRendererTests.cpp
             tests/RainSimulationTests.cpp

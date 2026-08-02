@@ -913,6 +913,8 @@ class VulkanViewportShell {
         // the long-lived viewport descriptor pool.
         VkDescriptorPool compositeDescriptorPool = VK_NULL_HANDLE;
         VkDescriptorSet compositeDescriptorSet = VK_NULL_HANDLE;
+        VkDescriptorPool eyeDomeLightingDescriptorPool = VK_NULL_HANDLE;
+        VkDescriptorSet eyeDomeLightingDescriptorSet = VK_NULL_HANDLE;
         VkPipeline pointDepthPipeline = VK_NULL_HANDLE;
         VkPipeline pointAccumulationPipeline = VK_NULL_HANDLE;
         VkPipeline pointConstantSimpleAccumulationPipeline = VK_NULL_HANDLE;
@@ -1084,6 +1086,7 @@ class VulkanViewportShell {
     void CreateHighQualityGaussianSplatDescriptorSetLayout();
     void CreateCompositeDescriptorSetLayout();
     void CreatePostProcessDescriptorSetLayout();
+    void CreateEyeDomeLightingExportDescriptorSetLayout();
     void CreateDescriptorPools();
     void CreatePostProcessSampler();
     void CreateUniformResources();
@@ -1097,9 +1100,14 @@ class VulkanViewportShell {
     void CreateHighQualityGaussianSplatPipeline();
     void CreateCompositePipeline();
     void CreatePostProcessPipeline();
-    void CreateExrExportResources(std::uint32_t width, std::uint32_t height);
+    void CreateEyeDomeLightingExportPipeline();
+    void CreateExrExportResources(
+        std::uint32_t width,
+        std::uint32_t height,
+        bool enableEyeDomeLighting);
     void CreateExrExportRenderPass(ExrExportResources* resources);
     void CreateExrExportPipelines(ExrExportResources* resources);
+    void CreateExrExportEyeDomeLightingResources(ExrExportResources* resources);
     void CreateFramebuffers();
     void CreatePresentFramebuffers();
     void CreateDepthResources();
@@ -1313,6 +1321,7 @@ class VulkanViewportShell {
     VkPipelineLayout highQualityGaussianSplatPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout compositePipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout postProcessPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout eyeDomeLightingExportPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline pointDepthPrepassPipeline_ = VK_NULL_HANDLE;
     VkPipeline pointAccumulationPipeline_ = VK_NULL_HANDLE;
     VkPipeline pointConstantSimpleAccumulationPipeline_ = VK_NULL_HANDLE;
@@ -1332,6 +1341,7 @@ class VulkanViewportShell {
     VkPipeline highQualityGaussianSplatPipeline_ = VK_NULL_HANDLE;
     VkPipeline compositePipeline_ = VK_NULL_HANDLE;
     VkPipeline postProcessPipeline_ = VK_NULL_HANDLE;
+    VkPipeline eyeDomeLightingExportPipeline_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout pointDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout dynamicMeshFlowDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout waterFlowSourceDescriptorSetLayout_ = VK_NULL_HANDLE;
@@ -1341,6 +1351,7 @@ class VulkanViewportShell {
     VkDescriptorSetLayout highQualityGaussianSplatDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout compositeDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout postProcessDescriptorSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout eyeDomeLightingExportDescriptorSetLayout_ = VK_NULL_HANDLE;
     std::optional<DynamicMeshFlowContactGpuView>
         pointDescriptorDynamicMeshFlowContactOverride_;
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;

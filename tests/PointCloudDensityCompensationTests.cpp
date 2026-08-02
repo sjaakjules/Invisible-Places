@@ -450,8 +450,21 @@ TEST_CASE(
         invisible_places::style::SetScalarConstant(&style.opacity, 1.0F);
 
         ResolvedTimingColouriseStack stack;
-        stack.effectCount = 1U;
-        auto& effect = stack.effects.front();
+        REQUIRE(stack.effects.size() == 8U);
+        stack.effectCount = static_cast<std::uint32_t>(
+            stack.effects.size());
+        for (auto& transparentEffect : stack.effects) {
+            transparentEffect.enabled = true;
+            transparentEffect.source = TimingColouriseSource::ScalarField;
+            transparentEffect.scalarFieldSlot = 0;
+            transparentEffect.lowerBound = 0.5F;
+            transparentEffect.upperBound = 1.5F;
+            transparentEffect.edgeFadeFraction = 0.25F;
+            transparentEffect.rgbaLut.fill({0.0F, 1.0F, 0.0F, 0.0F});
+        }
+        // Put the visible layer in the eighth slot so this fixture proves the
+        // complete renderer/offline capacity is evaluated.
+        auto& effect = stack.effects.back();
         effect.enabled = true;
         effect.source = TimingColouriseSource::ScalarField;
         effect.scalarFieldSlot = 0;
@@ -521,4 +534,140 @@ TEST_CASE(
         CHECK(inside.beautyR[center] > inside.beautyB[center]);
         CHECK(inside.alpha[center] == Catch::Approx(outside.alpha[center]).margin(1.0e-5F));
     }
+}
+
+TEST_CASE(
+    "Offline timing emissive matches Beauty masks and Fast Basic bounded lift",
+    "[output][offline][timing-colourise][emissive]") {
+    using invisible_places::renderer::pointcloud::PointCloudColorMode;
+    using invisible_places::renderer::pointcloud::PointCloudFalloffProfile;
+    using invisible_places::renderer::pointcloud::PointCloudStyleState;
+    using invisible_places::renderer::pointcloud::ResolvedTimingColouriseStack;
+    using invisible_places::renderer::pointcloud::TimingColouriseOutput;
+    using invisible_places::renderer::pointcloud::TimingColouriseSource;
+
+    auto render = [](
+                      float fieldValue,
+                      float emissiveLevel,
+                      bool fastBasic,
+                      bool enabled = true,
+                      bool useNormalZ = false,
+                      float edgeFadeFraction = 0.25F,
+                      float secondEmissiveLevel = 0.0F) {
+        invisible_places::io::LoadedPointCloud cloud;
+        cloud.positions = {{0.0F, 0.0F, 0.0F}};
+        cloud.normals = {{0.0F, 0.0F, fieldValue}};
+        cloud.hasNormals = true;
+        cloud.scalarFields = {{
+            .name = "Interest",
+            .minimum = 0.0F,
+            .maximum = 2.0F,
+            .count = 1U,
+            .valid = true,
+        }};
+        cloud.scalarFieldValues = {fieldValue};
+
+        PointCloudStyleState style;
+        style.colorMode = PointCloudColorMode::SolidColor;
+        style.solidColor = {0.20F, 0.40F, 0.80F, 1.0F};
+        style.falloffProfile = PointCloudFalloffProfile::HardDisc;
+        style.solidCenters = true;
+        invisible_places::style::SetScalarConstant(&style.pointSize, 4.0F);
+        invisible_places::style::SetScalarConstant(&style.opacity, 1.0F);
+        invisible_places::style::SetScalarConstant(&style.emissiveStrength, 0.0F);
+
+        ResolvedTimingColouriseStack stack;
+        REQUIRE(stack.effects.size() == 8U);
+        stack.effectCount = static_cast<std::uint32_t>(stack.effects.size());
+        auto configureEmissive = [&](std::size_t effectIndex, float level) {
+            auto& effect = stack.effects[effectIndex];
+            effect.enabled = enabled;
+            effect.output = TimingColouriseOutput::Emissive;
+            effect.source = useNormalZ
+                                ? TimingColouriseSource::NormalZ
+                                : TimingColouriseSource::ScalarField;
+            effect.scalarFieldSlot = useNormalZ ? -1 : 0;
+            effect.lowerBound = 0.5F;
+            effect.upperBound = 1.5F;
+            effect.edgeFadeFraction = edgeFadeFraction;
+            effect.emissiveLevel = level;
+        };
+        // Exercise the complete shared capacity by placing the first visible
+        // emissive effect in the eighth slot.
+        configureEmissive(stack.effects.size() - 1U, emissiveLevel);
+        if (secondEmissiveLevel > 0.0F) {
+            configureEmissive(stack.effects.size() - 2U, secondEmissiveLevel);
+        }
+
+        const invisible_places::output::OfflinePointLayer layer{
+            .cloud = &cloud,
+            .style = style,
+            .timingColourise = stack,
+            .hasSourceRgb = false,
+            .fastBasic = fastBasic,
+            .localToWorld = glm::mat4{1.0F},
+        };
+        invisible_places::camera::CameraState cameraState;
+        cameraState.position = {0.0F, 0.0F, 5.0F};
+        cameraState.target = {0.0F, 0.0F, 0.0F};
+        cameraState.nearPlane = 0.1F;
+        cameraState.farPlane = 20.0F;
+
+        invisible_places::output::ExrImage image;
+        invisible_places::output::InitializeExrImage(&image, 9U, 9U);
+        invisible_places::output::RenderPointCloudTile(
+            {layer},
+            cameraState,
+            invisible_places::output::OfflineRenderTile{0U, 0U, 9U, 9U},
+            &image);
+        return image;
+    };
+
+    constexpr std::size_t kCenter = 4U * 9U + 4U;
+    for (const bool fastBasic : {false, true}) {
+        const auto disabled = render(1.0F, 0.5F, fastBasic, false);
+        const auto zero = render(1.0F, 0.0F, fastBasic);
+        const auto outside = render(0.25F, 0.5F, fastBasic);
+        REQUIRE(disabled.alpha[kCenter] > 0.0F);
+        CHECK(zero.beautyR[kCenter] == Catch::Approx(disabled.beautyR[kCenter]).margin(1.0e-6F));
+        CHECK(zero.beautyG[kCenter] == Catch::Approx(disabled.beautyG[kCenter]).margin(1.0e-6F));
+        CHECK(zero.beautyB[kCenter] == Catch::Approx(disabled.beautyB[kCenter]).margin(1.0e-6F));
+        CHECK(outside.beautyR[kCenter] == Catch::Approx(disabled.beautyR[kCenter]).margin(1.0e-6F));
+        CHECK(outside.beautyG[kCenter] == Catch::Approx(disabled.beautyG[kCenter]).margin(1.0e-6F));
+        CHECK(outside.beautyB[kCenter] == Catch::Approx(disabled.beautyB[kCenter]).margin(1.0e-6F));
+        CHECK(zero.alpha[kCenter] == Catch::Approx(disabled.alpha[kCenter]).margin(1.0e-6F));
+        CHECK(outside.alpha[kCenter] == Catch::Approx(disabled.alpha[kCenter]).margin(1.0e-6F));
+    }
+
+    const auto beautyOff = render(1.0F, 0.0F, false);
+    const auto beautyInside = render(1.0F, 0.5F, false);
+    const auto beautyStacked = render(1.0F, 0.5F, false, true, false, 0.25F, 0.5F);
+    const auto beautyNormal = render(1.0F, 0.5F, false, true, true);
+    CHECK(beautyInside.beautyR[kCenter] > beautyOff.beautyR[kCenter]);
+    CHECK(beautyInside.beautyG[kCenter] > beautyOff.beautyG[kCenter]);
+    CHECK(beautyInside.beautyB[kCenter] > beautyOff.beautyB[kCenter]);
+    CHECK(beautyStacked.beautyR[kCenter] > beautyInside.beautyR[kCenter]);
+    CHECK(beautyNormal.beautyR[kCenter] == Catch::Approx(beautyInside.beautyR[kCenter]).margin(1.0e-5F));
+
+    const auto fastOff = render(1.0F, 0.0F, true);
+    const auto fastInside = render(1.0F, 0.5F, true);
+    const auto fastHalfFade = render(0.625F, 0.5F, true);
+    const auto fastOutwardHalfFade =
+        render(0.375F, 0.5F, true, true, false, -0.25F);
+    const auto fastCapped = render(1.0F, 2.0F, true);
+    REQUIRE(fastOff.beautyR[kCenter] > 0.0F);
+    CHECK(
+        fastInside.beautyR[kCenter] / fastOff.beautyR[kCenter] ==
+        Catch::Approx(1.175F).margin(1.0e-5F));
+    CHECK(
+        fastHalfFade.beautyR[kCenter] / fastOff.beautyR[kCenter] ==
+        Catch::Approx(1.0875F).margin(1.0e-5F));
+    CHECK(
+        fastOutwardHalfFade.beautyR[kCenter] /
+            fastOff.beautyR[kCenter] ==
+        Catch::Approx(1.0875F).margin(1.0e-5F));
+    CHECK(
+        fastCapped.beautyR[kCenter] / fastOff.beautyR[kCenter] ==
+        Catch::Approx(1.35F).margin(1.0e-5F));
+    CHECK(fastInside.alpha[kCenter] == Catch::Approx(fastOff.alpha[kCenter]).margin(1.0e-6F));
 }

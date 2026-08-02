@@ -30,6 +30,15 @@ class OrbitCamera {
         float distanceScale);
     void ResetToFramedBounds(float aspectRatio);
     void Orbit(float deltaX, float deltaY);
+    void OrbitTrackball(
+        float previousX,
+        float previousY,
+        float currentX,
+        float currentY,
+        float viewportWidth,
+        float viewportHeight,
+        float pivotScreenX,
+        float pivotScreenY);
     void Pan(float deltaX, float deltaY, float viewportWidth, float viewportHeight);
     void Dolly(float wheelDelta);
     void SetTargetPreservingPosition(const glm::vec3& target);
@@ -57,6 +66,7 @@ class OrbitCamera {
     [[nodiscard]] glm::vec3 Forward() const;
     [[nodiscard]] glm::vec3 Right() const;
     [[nodiscard]] glm::vec3 Up() const;
+    [[nodiscard]] glm::quat Orientation() const;
     [[nodiscard]] float EffectiveAspectRatio(float aspectRatio) const;
     void UpdateClippingPlanes();
     void ApplyFramedBounds(float aspectRatio, float distanceScale = 1.0F);

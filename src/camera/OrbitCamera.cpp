@@ -16,9 +16,63 @@ namespace invisible_places::camera {
 namespace {
 
 constexpr float kPitchLimit = 1.45F;
+constexpr float kPi = 3.14159265358979323846F;
 
 glm::vec3 ToGlm(const invisible_places::io::Float3& value) {
     return {value.x, value.y, value.z};
+}
+
+glm::vec3 TrackballVector(
+    float x,
+    float y,
+    float viewportWidth,
+    float viewportHeight,
+    float pivotScreenX,
+    float pivotScreenY) {
+    const float safeWidth = std::max(1.0F, viewportWidth);
+    const float safeHeight = std::max(1.0F, viewportHeight);
+    const float centerX = std::clamp(pivotScreenX, safeWidth * 0.25F, safeWidth * 0.75F);
+    const float centerY = std::clamp(pivotScreenY, safeHeight * 0.25F, safeHeight * 0.75F);
+    glm::vec3 result{
+        std::clamp((x - centerX) / (safeWidth * 0.5F), -1.0F, 1.0F),
+        std::clamp((centerY - y) / (safeHeight * 0.5F), -1.0F, 1.0F),
+        0.0F,
+    };
+    const float radiusSquared = (result.x * result.x) + (result.y * result.y);
+    if (radiusSquared > 1.0F) {
+        const float inverseRadius = 1.0F / std::sqrt(radiusSquared);
+        result.x *= inverseRadius;
+        result.y *= inverseRadius;
+    } else {
+        result.z = std::sqrt(std::max(0.0F, 1.0F - radiusSquared));
+    }
+    return result;
+}
+
+glm::quat ShortestArcRotation(const glm::vec3& from, const glm::vec3& to) {
+    const glm::vec3 normalizedFrom = glm::normalize(from);
+    const glm::vec3 normalizedTo = glm::normalize(to);
+    const float cosine = std::clamp(glm::dot(normalizedFrom, normalizedTo), -1.0F, 1.0F);
+    if (cosine >= 1.0F - 1.0e-6F) {
+        return {1.0F, 0.0F, 0.0F, 0.0F};
+    }
+    if (cosine <= -1.0F + 1.0e-6F) {
+        glm::vec3 axis = glm::cross(normalizedFrom, glm::vec3{1.0F, 0.0F, 0.0F});
+        if (glm::length(axis) <= 1.0e-5F) {
+            axis = glm::cross(normalizedFrom, glm::vec3{0.0F, 1.0F, 0.0F});
+        }
+        return glm::angleAxis(kPi, glm::normalize(axis));
+    }
+
+    const glm::vec3 axis = glm::cross(normalizedFrom, normalizedTo);
+    const float scale = std::sqrt((1.0F + cosine) * 2.0F);
+    const float inverseScale = 1.0F / scale;
+    return glm::normalize(glm::quat{
+        scale * 0.5F,
+        axis.x * inverseScale,
+        axis.y * inverseScale,
+        axis.z * inverseScale,
+    });
 }
 
 }  // namespace
@@ -86,6 +140,57 @@ void OrbitCamera::Orbit(float deltaX, float deltaY) {
 
     ApplyPositionTarget(rotateAroundPivot(position), rotateAroundPivot(viewTarget));
     orbitCenter_ = pivot;
+}
+
+void OrbitCamera::OrbitTrackball(
+    float previousX,
+    float previousY,
+    float currentX,
+    float currentY,
+    float viewportWidth,
+    float viewportHeight,
+    float pivotScreenX,
+    float pivotScreenY) {
+    if ((previousX == currentX && previousY == currentY) ||
+        viewportWidth <= 0.0F || viewportHeight <= 0.0F) {
+        return;
+    }
+
+    const glm::vec3 previous = TrackballVector(
+        previousX,
+        previousY,
+        viewportWidth,
+        viewportHeight,
+        pivotScreenX,
+        pivotScreenY);
+    const glm::vec3 current = TrackballVector(
+        currentX,
+        currentY,
+        viewportWidth,
+        viewportHeight,
+        pivotScreenX,
+        pivotScreenY);
+    const glm::quat viewSpaceRotation = ShortestArcRotation(previous, current);
+    const glm::quat localCameraRotation = glm::conjugate(viewSpaceRotation);
+    const glm::quat oldOrientation = Orientation();
+    const glm::quat worldRotation =
+        glm::normalize(oldOrientation * localCameraRotation * glm::conjugate(oldOrientation));
+    const auto rotateAroundPivot = [&](const glm::vec3& point) {
+        return orbitCenter_ + (worldRotation * (point - orbitCenter_));
+    };
+
+    position_ = rotateAroundPivot(position_);
+    target_ = rotateAroundPivot(target_);
+    explicitOrientation_ = glm::normalize(oldOrientation * localCameraRotation);
+    hasExplicitOrientation_ = true;
+    distance_ = std::max(minimumDistance_, glm::length(orbitCenter_ - position_));
+    const auto forwardForAngles = Forward();
+    yawRadians_ = std::atan2(forwardForAngles.y, forwardForAngles.x);
+    pitchRadians_ = std::clamp(
+        std::asin(std::clamp(forwardForAngles.z, -1.0F, 1.0F)),
+        -kPitchLimit,
+        kPitchLimit);
+    UpdateClippingPlanes();
 }
 
 void OrbitCamera::Pan(float deltaX, float deltaY, float viewportWidth, float viewportHeight) {
@@ -222,12 +327,7 @@ void OrbitCamera::ApplyState(const CameraState& state) {
 
 CameraState OrbitCamera::CaptureState() const {
     const auto position = Position();
-    auto orientation = explicitOrientation_;
-    if (!hasExplicitOrientation_) {
-        const auto view = glm::lookAtRH(position, target_, WorldUp());
-        const auto cameraToWorld = glm::inverse(glm::mat3{view});
-        orientation = glm::normalize(glm::quat_cast(cameraToWorld));
-    }
+    const auto orientation = Orientation();
 
     CameraState state;
     state.position = {position.x, position.y, position.z};
@@ -305,6 +405,15 @@ glm::vec3 OrbitCamera::Up() const {
         return glm::normalize(explicitOrientation_) * glm::vec3{0.0F, 1.0F, 0.0F};
     }
     return glm::normalize(glm::cross(Right(), Forward()));
+}
+
+glm::quat OrbitCamera::Orientation() const {
+    if (hasExplicitOrientation_) {
+        return glm::normalize(explicitOrientation_);
+    }
+    const auto view = glm::lookAtRH(position_, target_, WorldUp());
+    const auto cameraToWorld = glm::inverse(glm::mat3{view});
+    return glm::normalize(glm::quat_cast(cameraToWorld));
 }
 
 float OrbitCamera::EffectiveAspectRatio(float aspectRatio) const {

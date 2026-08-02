@@ -10,7 +10,7 @@ layout(location = 2) flat out uint outPointIndex;
 layout(location = 3) out vec3 outWorldPosition;
 layout(location = 4) out vec3 outPointNormal;
 layout(location = 5) out float outFlowCoverage;
-layout(location = 6) flat out vec4 outTimingColourise[5];
+layout(location = 6) flat out vec4 outTimingColourise[8];
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 viewProjection;
@@ -98,9 +98,9 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 rainImpactSandBand;
     vec4 rainImpactResponse;
     uvec4 timingColouriseControl;
-    uvec4 timingColouriseSources[5];
-    vec4 timingColouriseRanges[5];
-    vec4 timingColouriseLut[320];
+    uvec4 timingColouriseSources[8];
+    vec4 timingColouriseRanges[8];
+    vec4 timingColouriseLut[512];
 } styleData;
 
 #include "pointcloud_sparse_ripple.glsl"
