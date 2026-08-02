@@ -2153,6 +2153,71 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Timing Colourise phase carries velocity through continuing keys and rests at reversals",
+    "[timing][colourise][palette][phase][velocity]") {
+    TimingColouriseEffect continuing;
+    continuing.effectParameterKeys = {
+        {.parameter = TimingColouriseEffectParameter::PalettePhase,
+         .position = 0.0F,
+         .value = 0.0F},
+        {.parameter = TimingColouriseEffectParameter::PalettePhase,
+         .position = 0.25F,
+         .value = 0.5F},
+        {.parameter = TimingColouriseEffectParameter::PalettePhase,
+         .position = 1.0F,
+         .value = 2.0F},
+    };
+    const auto continuingValue = [&](float position) {
+        return invisible_places::timing::
+            EvaluateTimingColouriseEffectParameter(
+                continuing,
+                TimingColouriseEffectParameter::PalettePhase,
+                position);
+    };
+    CHECK(continuingValue(0.24F) == Approx(0.48F).margin(1.0e-5F));
+    CHECK(continuingValue(0.25F) == Approx(0.50F).margin(1.0e-5F));
+    CHECK(continuingValue(0.26F) == Approx(0.52F).margin(1.0e-5F));
+    const float incomingVelocity =
+        (continuingValue(0.25F) - continuingValue(0.24F)) /
+        0.01F;
+    const float outgoingVelocity =
+        (continuingValue(0.26F) - continuingValue(0.25F)) /
+        0.01F;
+    CHECK(incomingVelocity > 1.0F);
+    CHECK(outgoingVelocity > 1.0F);
+    CHECK(incomingVelocity ==
+          Approx(outgoingVelocity).margin(1.0e-3F));
+
+    TimingColouriseEffect reversing;
+    reversing.effectParameterKeys = {
+        {.parameter = TimingColouriseEffectParameter::PalettePhase,
+         .position = 0.0F,
+         .value = 0.0F},
+        {.parameter = TimingColouriseEffectParameter::PalettePhase,
+         .position = 0.5F,
+         .value = 1.0F},
+        {.parameter = TimingColouriseEffectParameter::PalettePhase,
+         .position = 1.0F,
+         .value = 0.0F},
+    };
+    const auto reversingValue = [&](float position) {
+        return invisible_places::timing::
+            EvaluateTimingColouriseEffectParameter(
+                reversing,
+                TimingColouriseEffectParameter::PalettePhase,
+                position);
+    };
+    const float peak = reversingValue(0.5F);
+    const float approachVelocity =
+        (peak - reversingValue(0.49F)) / 0.01F;
+    const float departureVelocity =
+        (reversingValue(0.51F) - peak) / 0.01F;
+    CHECK(peak == Approx(1.0F));
+    CHECK(std::abs(approachVelocity) < 0.1F);
+    CHECK(std::abs(departureVelocity) < 0.1F);
+}
+
+TEST_CASE(
     "Timing Colourise interpolates different palette topologies as RGBA LUTs",
     "[timing][colourise][keys]") {
     TimingColouriseEffect effect;

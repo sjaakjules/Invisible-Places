@@ -279,10 +279,200 @@ float SanitizeEffectParameterValue(
     return 0.0F;
 }
 
+std::optional<float> EvaluatePalettePhaseTrack(
+    const std::vector<TimingColouriseEffectParameterKey>& keys,
+    float normalizedPosition) {
+    const auto trackBegin = std::find_if(
+        keys.begin(),
+        keys.end(),
+        [](const auto& key) {
+            return key.parameter ==
+                   TimingColouriseEffectParameter::PalettePhase;
+        });
+    if (trackBegin == keys.end()) {
+        return std::nullopt;
+    }
+    // Sanitization groups each parameter's keys and orders them by time.
+    const auto trackEnd = std::find_if(
+        trackBegin,
+        keys.end(),
+        [](const auto& key) {
+            return key.parameter !=
+                   TimingColouriseEffectParameter::PalettePhase;
+        });
+    const auto keyCount = static_cast<std::size_t>(
+        std::distance(trackBegin, trackEnd));
+    const auto& first = *trackBegin;
+    const auto& last = *(trackEnd - 1);
+    if (normalizedPosition <= first.position || keyCount == 1U) {
+        return first.value;
+    }
+    if (normalizedPosition >= last.position) {
+        return last.value;
+    }
+
+    const auto right = std::lower_bound(
+        trackBegin,
+        trackEnd,
+        normalizedPosition,
+        [](const auto& key, float position) {
+            return key.position < position;
+        });
+    if (right == trackEnd) {
+        return last.value;
+    }
+    const auto left = right - 1;
+    const double segmentDuration =
+        static_cast<double>(right->position) -
+        static_cast<double>(left->position);
+    if (segmentDuration <=
+        static_cast<double>(kTimingColouriseKeyTolerance)) {
+        return right->value;
+    }
+    const double amount = std::clamp(
+        (static_cast<double>(normalizedPosition) -
+         static_cast<double>(left->position)) /
+            segmentDuration,
+        0.0,
+        1.0);
+    if (left->interpolation !=
+        invisible_places::water::WaterScenarioInterpolation::Smooth) {
+        return std::lerp(
+            left->value,
+            right->value,
+            InterpolationAmount(
+                left->interpolation,
+                static_cast<float>(amount)));
+    }
+
+    const auto keyAt = [&](std::size_t index) -> const auto& {
+        return *(trackBegin + static_cast<std::ptrdiff_t>(index));
+    };
+    const auto intervalDuration = [&](std::size_t index) {
+        return static_cast<double>(keyAt(index + 1U).position) -
+               static_cast<double>(keyAt(index).position);
+    };
+    const auto intervalVelocity = [&](std::size_t index) {
+        const double duration = intervalDuration(index);
+        return duration >
+                       static_cast<double>(
+                           kTimingColouriseKeyTolerance)
+                   ? (static_cast<double>(keyAt(index + 1U).value) -
+                      static_cast<double>(keyAt(index).value)) /
+                         duration
+                   : 0.0;
+    };
+    const auto continuesInSameDirection =
+        [](double leftVelocity, double rightVelocity) {
+            return leftVelocity != 0.0 && rightVelocity != 0.0 &&
+                   std::isfinite(leftVelocity) &&
+                   std::isfinite(rightVelocity) &&
+                   std::signbit(leftVelocity) ==
+                       std::signbit(rightVelocity);
+        };
+    const auto endpointVelocity =
+        [&](double adjacentDuration,
+            double nextDuration,
+            double adjacentVelocity,
+            double nextVelocity) {
+            const double denominator =
+                adjacentDuration + nextDuration;
+            if (denominator <= 0.0 ||
+                !std::isfinite(denominator)) {
+                return adjacentVelocity;
+            }
+            double velocity =
+                ((2.0 * adjacentDuration + nextDuration) *
+                     adjacentVelocity -
+                 adjacentDuration * nextVelocity) /
+                denominator;
+            if (!continuesInSameDirection(
+                    velocity,
+                    adjacentVelocity)) {
+                return 0.0;
+            }
+            if (!continuesInSameDirection(
+                    adjacentVelocity,
+                    nextVelocity) &&
+                std::abs(velocity) >
+                    3.0 * std::abs(adjacentVelocity)) {
+                velocity = 3.0 * adjacentVelocity;
+            }
+            return velocity;
+        };
+    const auto tangentAt = [&](std::size_t index) {
+        if (keyCount == 2U) {
+            return intervalVelocity(0U);
+        }
+        if (index == 0U) {
+            return endpointVelocity(
+                intervalDuration(0U),
+                intervalDuration(1U),
+                intervalVelocity(0U),
+                intervalVelocity(1U));
+        }
+        if (index + 1U == keyCount) {
+            return endpointVelocity(
+                intervalDuration(keyCount - 2U),
+                intervalDuration(keyCount - 3U),
+                intervalVelocity(keyCount - 2U),
+                intervalVelocity(keyCount - 3U));
+        }
+        const double previousVelocity =
+            intervalVelocity(index - 1U);
+        const double nextVelocity = intervalVelocity(index);
+        if (!continuesInSameDirection(
+                previousVelocity,
+                nextVelocity)) {
+            // A local extremum or a flat hold is the only authored reason
+            // for palette rotation to come to rest at an interior key.
+            return 0.0;
+        }
+        const double previousDuration =
+            intervalDuration(index - 1U);
+        const double nextDuration = intervalDuration(index);
+        const double previousWeight =
+            2.0 * nextDuration + previousDuration;
+        const double nextWeight =
+            nextDuration + 2.0 * previousDuration;
+        return (previousWeight + nextWeight) /
+               (previousWeight / previousVelocity +
+                nextWeight / nextVelocity);
+    };
+
+    const auto leftIndex = static_cast<std::size_t>(
+        std::distance(trackBegin, left));
+    const double leftTangent = tangentAt(leftIndex);
+    const double rightTangent = tangentAt(leftIndex + 1U);
+    const double amountSquared = amount * amount;
+    const double amountCubed = amountSquared * amount;
+    const double leftValue = static_cast<double>(left->value);
+    const double rightValue = static_cast<double>(right->value);
+    const double evaluated =
+        (2.0 * amountCubed - 3.0 * amountSquared + 1.0) *
+            leftValue +
+        (amountCubed - 2.0 * amountSquared + amount) *
+            segmentDuration * leftTangent +
+        (-2.0 * amountCubed + 3.0 * amountSquared) *
+            rightValue +
+        (amountCubed - amountSquared) * segmentDuration *
+            rightTangent;
+    const float result = static_cast<float>(evaluated);
+    return std::isfinite(result)
+               ? result
+               : std::lerp(
+                     left->value,
+                     right->value,
+                     static_cast<float>(amount));
+}
+
 std::optional<float> EvaluateEffectParameterTrack(
     const std::vector<TimingColouriseEffectParameterKey>& keys,
     TimingColouriseEffectParameter parameter,
     float normalizedPosition) {
+    if (parameter == TimingColouriseEffectParameter::PalettePhase) {
+        return EvaluatePalettePhaseTrack(keys, normalizedPosition);
+    }
     const TimingColouriseEffectParameterKey* first = nullptr;
     const TimingColouriseEffectParameterKey* last = nullptr;
     const TimingColouriseEffectParameterKey* left = nullptr;
