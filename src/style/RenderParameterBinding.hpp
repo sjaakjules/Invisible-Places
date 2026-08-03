@@ -21,6 +21,16 @@ enum FieldMapFlags : std::uint32_t {
     FieldMapFlagUseLayerStats = 1U << 2U,
 };
 
+// Manually edited input bounds remembered for a field the mapping is not
+// currently using, so switching fields and back never loses the edit. Entries
+// exist only for fields whose bounds were manual (layer-stats mode remembers
+// nothing because its bounds always track the field's own min/max).
+struct FieldMapBoundsMemoryEntry {
+    std::string fieldName;
+    float inputMin = 0.0F;
+    float inputMax = 1.0F;
+};
+
 struct FieldMapConfig {
     std::int32_t fieldSlot = -1;
     std::string fieldName;
@@ -30,6 +40,7 @@ struct FieldMapConfig {
     float outputMax = 1.0F;
     float gamma = 1.0F;
     std::uint32_t flags = FieldMapFlagClamp | FieldMapFlagUseLayerStats;
+    std::vector<FieldMapBoundsMemoryEntry> boundsMemory;
 };
 
 struct RenderParameterBinding {
@@ -50,6 +61,20 @@ void ConfigureFieldMapFromStats(
     float outputMin,
     float outputMax,
     const invisible_places::io::ScalarFieldStats* fieldStats);
+// Stash-on-switch: upserts a memory entry for the CURRENT field when its
+// input bounds are manual, and erases any entry when the field is back on
+// layer stats (returning to it should give the defaults again). Call before
+// pointing the mapping at another field.
+void RememberFieldMapBounds(FieldMapConfig* config);
+// Restore-on-return: when the (already selected) current field has a memory
+// entry, reinstates its manual input bounds and clears the layer-stats flag.
+// Returns whether an entry was applied.
+bool RestoreFieldMapBoundsMemory(FieldMapConfig* config);
+// Drops unusable entries (empty names, non-finite bounds), collapses
+// duplicates keeping the most recent, orders min before max, removes the
+// current field's entry (its truth is inputMin/inputMax), and bounds the
+// list size.
+void SanitizeFieldMapBoundsMemory(FieldMapConfig* config);
 void SyncBindingFieldReference(
     RenderParameterBinding* binding,
     const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields);

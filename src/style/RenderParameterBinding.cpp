@@ -81,6 +81,112 @@ void ConfigureFieldMapFromStats(
     }
 }
 
+namespace {
+
+std::vector<FieldMapBoundsMemoryEntry>::iterator FindBoundsMemoryEntry(
+    std::vector<FieldMapBoundsMemoryEntry>& memory,
+    std::string_view fieldName) {
+    const auto normalized = NormalizedFieldName(fieldName);
+    return std::find_if(
+        memory.begin(),
+        memory.end(),
+        [&](const FieldMapBoundsMemoryEntry& entry) {
+            return NormalizedFieldName(entry.fieldName) == normalized;
+        });
+}
+
+}  // namespace
+
+void RememberFieldMapBounds(FieldMapConfig* config) {
+    if (config == nullptr || config->fieldName.empty()) {
+        return;
+    }
+
+    const auto existing =
+        FindBoundsMemoryEntry(config->boundsMemory, config->fieldName);
+    if (HasFieldMapFlag(*config, FieldMapFlagUseLayerStats)) {
+        // Layer-stats bounds always re-derive from the field itself, so a
+        // remembered manual pair would wrongly resurrect on return.
+        if (existing != config->boundsMemory.end()) {
+            config->boundsMemory.erase(existing);
+        }
+        return;
+    }
+    if (!std::isfinite(config->inputMin) ||
+        !std::isfinite(config->inputMax)) {
+        return;
+    }
+
+    if (existing != config->boundsMemory.end()) {
+        existing->fieldName = config->fieldName;
+        existing->inputMin = config->inputMin;
+        existing->inputMax = config->inputMax;
+    } else {
+        config->boundsMemory.push_back(
+            {.fieldName = config->fieldName,
+             .inputMin = config->inputMin,
+             .inputMax = config->inputMax});
+    }
+}
+
+bool RestoreFieldMapBoundsMemory(FieldMapConfig* config) {
+    if (config == nullptr || config->fieldName.empty()) {
+        return false;
+    }
+
+    const auto entry =
+        FindBoundsMemoryEntry(config->boundsMemory, config->fieldName);
+    if (entry == config->boundsMemory.end()) {
+        return false;
+    }
+
+    config->inputMin = entry->inputMin;
+    config->inputMax = entry->inputMax;
+    SetFieldMapFlag(config, FieldMapFlagUseLayerStats, false);
+    return true;
+}
+
+void SanitizeFieldMapBoundsMemory(FieldMapConfig* config) {
+    if (config == nullptr) {
+        return;
+    }
+
+    constexpr std::size_t kMaximumEntries = 64U;
+    const auto currentName = NormalizedFieldName(config->fieldName);
+    std::vector<FieldMapBoundsMemoryEntry> sanitized;
+    sanitized.reserve(std::min(config->boundsMemory.size(), kMaximumEntries));
+    // Walk newest-first so duplicate names keep the most recent entry, then
+    // restore the original ordering for stable serialization.
+    for (auto it = config->boundsMemory.rbegin();
+         it != config->boundsMemory.rend();
+         ++it) {
+        if (it->fieldName.empty() || !std::isfinite(it->inputMin) ||
+            !std::isfinite(it->inputMax)) {
+            continue;
+        }
+        const auto normalized = NormalizedFieldName(it->fieldName);
+        if (!currentName.empty() && normalized == currentName) {
+            continue;
+        }
+        const bool duplicate = std::any_of(
+            sanitized.begin(),
+            sanitized.end(),
+            [&](const FieldMapBoundsMemoryEntry& kept) {
+                return NormalizedFieldName(kept.fieldName) == normalized;
+            });
+        if (duplicate || sanitized.size() >= kMaximumEntries) {
+            continue;
+        }
+        auto entry = *it;
+        if (entry.inputMin > entry.inputMax) {
+            std::swap(entry.inputMin, entry.inputMax);
+        }
+        sanitized.push_back(std::move(entry));
+    }
+    std::reverse(sanitized.begin(), sanitized.end());
+    config->boundsMemory = std::move(sanitized);
+}
+
 void SyncBindingFieldReference(
     RenderParameterBinding* binding,
     const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields) {

@@ -181,6 +181,12 @@ The UI shall show field statistics such as discovered min and max values.
 #### FR-PARAM-9
 The UI should provide reset-to-constant and quick-normalise actions.
 
+#### FR-PARAM-10
+Field-Mapped mode shall show the selected field's value distribution as a histogram with directly draggable lower and upper input bounds, defaulting to the field's discovered minimum and maximum.
+
+#### FR-PARAM-11
+Manually edited input bounds shall be remembered per parameter and field, so switching a parameter to another field and back restores the bounds it was last edited with; fields left in layer-stats mode return to their discovered range.
+
 ### 5.7 Point-Cloud Styling
 #### FR-STYLE-1
 The renderer shall support at least the following point style parameters:

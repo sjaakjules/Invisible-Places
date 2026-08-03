@@ -1494,6 +1494,19 @@ struct PreviewLayerSession {
     std::vector<invisible_places::io::ScalarFieldStats> scalarFields;
     std::vector<invisible_places::io::Float3> pivotSamples;
     std::shared_ptr<invisible_places::io::LoadedPointCloud> offlinePointCloud;
+    // Lazily computed per-field histograms for the Visuals-tab bounds
+    // editor. Entries are keyed by field slot plus the payload generation
+    // and cloud identity so reloads recompute; failures are cached too so a
+    // missing source is not re-probed every frame.
+    struct VisualsFieldHistogramEntry {
+        std::int32_t fieldSlot = -1;
+        std::uint64_t contentGeneration = 0U;
+        const void* cloudIdentity = nullptr;
+        bool computed = false;
+        invisible_places::timing::TimingColouriseHistogram histogram{};
+        std::vector<std::uint64_t> displayBins;
+    };
+    std::vector<VisualsFieldHistogramEntry> visualsFieldHistograms;
     std::vector<std::uint32_t> previewLodSampledIndices;
     std::uint32_t previewLodRequestedDrawCount = 0;
     std::uint32_t previewLodSampledDrawCount = 0;
@@ -2123,6 +2136,15 @@ struct PreviewRuntimeState {
     AnimationPlaybackState animationPlayback{};
     TimingsPanelState timingsPanel{};
     TimingColouriseHistogramRuntime timingColouriseHistogram{};
+    // Transient drag over a Visuals-tab field histogram: the owning widget's
+    // ImGui item id, which bound is held, and the cursor-to-bound raw-value
+    // offset captured at grab time.
+    struct VisualsHistogramDragState {
+        ImGuiID item = 0;
+        std::uint8_t handle = 0;  // 1 = lower bound, 2 = upper bound
+        float grabOffsetRaw = 0.0F;
+    };
+    VisualsHistogramDragState visualsHistogramDrag{};
     std::vector<CameraShot> cameraShots;
     RenderJobSettings renderSettings{};
     OfflineRenderJobState offlineRenderJob{};
@@ -4878,6 +4900,12 @@ void SanitizePointCloudStyle(PreviewLayerSession* session) {
     invisible_places::style::SyncBindingFieldReference(&session->pointStyle.emissiveStrength, session->scalarFields);
     invisible_places::style::SyncBindingFieldReference(&session->pointStyle.depthFade, session->scalarFields);
     invisible_places::style::SyncBindingFieldReference(&session->pointStyle.colormapPosition, session->scalarFields);
+    invisible_places::style::SanitizeFieldMapBoundsMemory(&session->pointStyle.pointSize.fieldMap);
+    invisible_places::style::SanitizeFieldMapBoundsMemory(&session->pointStyle.surfelDiameter.fieldMap);
+    invisible_places::style::SanitizeFieldMapBoundsMemory(&session->pointStyle.opacity.fieldMap);
+    invisible_places::style::SanitizeFieldMapBoundsMemory(&session->pointStyle.emissiveStrength.fieldMap);
+    invisible_places::style::SanitizeFieldMapBoundsMemory(&session->pointStyle.depthFade.fieldMap);
+    invisible_places::style::SanitizeFieldMapBoundsMemory(&session->pointStyle.colormapPosition.fieldMap);
 
     session->pointStyle.exposure = std::max(0.0F, session->pointStyle.exposure);
     session->pointStyle.innerRadius = std::clamp(session->pointStyle.innerRadius, 0.0F, 0.99F);
@@ -6504,12 +6532,380 @@ std::string BindingFieldLabel(
     return "Select Field";
 }
 
+// ---- Visuals field histogram with interactive input bounds ----
+
+// Returns the cached (or lazily computed) histogram entry for one of this
+// session's scalar fields. The domain comes from the field's exact load-time
+// stats; the bins stride-sample very large clouds because the graph is a
+// display aid, not an analysis product. Failures are cached against the same
+// identity so a missing offline payload is not re-probed every frame.
+const PreviewLayerSession::VisualsFieldHistogramEntry*
+EnsureVisualsFieldHistogram(
+    PreviewLayerSession* session,
+    std::int32_t fieldSlot) {
+    if (session == nullptr || fieldSlot < 0 ||
+        static_cast<std::size_t>(fieldSlot) >=
+            session->scalarFields.size()) {
+        return nullptr;
+    }
+    const auto* cloud = session->offlinePointCloud.get();
+    for (const auto& entry : session->visualsFieldHistograms) {
+        if (entry.fieldSlot == fieldSlot &&
+            entry.contentGeneration ==
+                session->pointCloudContentGeneration &&
+            entry.cloudIdentity == cloud) {
+            return &entry;
+        }
+    }
+
+    PreviewLayerSession::VisualsFieldHistogramEntry entry;
+    entry.fieldSlot = fieldSlot;
+    entry.contentGeneration = session->pointCloudContentGeneration;
+    entry.cloudIdentity = cloud;
+    const auto& sessionStats =
+        session->scalarFields[static_cast<std::size_t>(fieldSlot)];
+    if (cloud != nullptr) {
+        // Resolve on the offline cloud by name first: density variants do
+        // not guarantee identical scalar property order.
+        std::optional<std::size_t> cloudField;
+        for (std::size_t index = 0U; index < cloud->scalarFields.size();
+             ++index) {
+            if (cloud->scalarFields[index].name == sessionStats.name) {
+                cloudField = index;
+                break;
+            }
+        }
+        if (!cloudField.has_value() &&
+            static_cast<std::size_t>(fieldSlot) <
+                cloud->scalarFields.size() &&
+            sessionStats.name.empty()) {
+            cloudField = static_cast<std::size_t>(fieldSlot);
+        }
+        const std::size_t pointCount = cloud->PointCount();
+        if (cloudField.has_value() && pointCount > 0U) {
+            const auto& stats = cloud->scalarFields[cloudField.value()];
+            const std::size_t valuesBegin =
+                cloud->ScalarFieldValueIndex(cloudField.value(), 0U);
+            const bool valuesComplete =
+                cloud->scalarFieldValues.size() >= valuesBegin + pointCount;
+            if (stats.valid && valuesComplete &&
+                std::isfinite(stats.minimum) &&
+                std::isfinite(stats.maximum) &&
+                stats.maximum >= stats.minimum) {
+                auto& histogram = entry.histogram;
+                histogram.minimum = stats.minimum;
+                histogram.maximum = stats.maximum;
+                constexpr std::size_t kMaximumSamples = 4'000'000U;
+                const std::size_t stride =
+                    std::max<std::size_t>(1U, pointCount / kMaximumSamples);
+                const float span = histogram.maximum - histogram.minimum;
+                const float scale =
+                    span > 0.0F
+                        ? static_cast<float>(
+                              invisible_places::timing::
+                                  kTimingColouriseHistogramBinCount) /
+                              span
+                        : 0.0F;
+                std::uint64_t finiteCount = 0U;
+                for (std::size_t point = 0U; point < pointCount;
+                     point += stride) {
+                    const float value =
+                        cloud->scalarFieldValues[valuesBegin + point];
+                    if (!std::isfinite(value)) {
+                        continue;
+                    }
+                    std::size_t bin = 0U;
+                    if (span > 0.0F) {
+                        bin = std::min<std::size_t>(
+                            invisible_places::timing::
+                                    kTimingColouriseHistogramBinCount -
+                                1U,
+                            static_cast<std::size_t>(std::max(
+                                0.0F,
+                                (value - histogram.minimum) * scale)));
+                    }
+                    ++histogram.bins[bin];
+                    ++finiteCount;
+                }
+                histogram.finiteValueCount = finiteCount;
+                if (histogram.Valid()) {
+                    entry.displayBins = invisible_places::timing::
+                        BuildTimingColouriseHistogramDisplayBins(histogram);
+                    entry.computed = true;
+                }
+            }
+        }
+    }
+
+    constexpr std::size_t kMaximumCacheEntries = 12U;
+    if (session->visualsFieldHistograms.size() >= kMaximumCacheEntries) {
+        session->visualsFieldHistograms.erase(
+            session->visualsFieldHistograms.begin());
+    }
+    session->visualsFieldHistograms.push_back(std::move(entry));
+    return &session->visualsFieldHistograms.back();
+}
+
+// Draws the mapped field's value distribution with draggable lower/upper
+// input-bound handles. Bounds default to the field's min/max through the
+// existing layer-stats mode; grabbing a handle switches the mapping to
+// manual bounds, freezing the other side at its current value. Editing here
+// is equivalent to typing in the Input Min/Max fields below the graph.
+bool DrawVisualsFieldHistogramBounds(
+    PreviewRuntimeState* runtimeState,
+    PreviewLayerSession* session,
+    RenderParameterBinding* binding,
+    const invisible_places::io::ScalarFieldStats& stats) {
+    using invisible_places::style::FieldMapFlagUseLayerStats;
+    if (runtimeState == nullptr || session == nullptr ||
+        binding == nullptr || !stats.valid ||
+        !(stats.maximum > stats.minimum)) {
+        return false;
+    }
+    const auto* entry =
+        EnsureVisualsFieldHistogram(session, binding->fieldMap.fieldSlot);
+    if (entry == nullptr || !entry->computed) {
+        ImGui::TextDisabled(
+            "Histogram appears when this layer's source points are "
+            "resident.");
+        return false;
+    }
+    const auto axis = invisible_places::timing::
+        BuildTimingColouriseHistogramAxis(
+            entry->histogram,
+            invisible_places::timing::TimingColouriseHistogramAxisMode::
+                Raw);
+    if (!axis.validRange) {
+        return false;
+    }
+
+    bool changed = false;
+    constexpr float kHistogramHeight = 64.0F;
+    ImGui::InvisibleButton(
+        "##VisualsFieldHistogram",
+        ImVec2{
+            std::max(160.0F, ImGui::GetContentRegionAvail().x),
+            kHistogramHeight});
+    const ImGuiID itemId = ImGui::GetItemID();
+    const auto minimum = ImGui::GetItemRectMin();
+    const auto maximum = ImGui::GetItemRectMax();
+    const float width = std::max(1.0F, maximum.x - minimum.x);
+    auto* drawList = ImGui::GetWindowDrawList();
+    drawList->AddRectFilled(
+        minimum,
+        maximum,
+        ImGui::GetColorU32(ImGuiCol_FrameBg),
+        2.0F);
+
+    // Merge display bins into >= 1 px screen buckets; the peak within each
+    // bucket keeps narrow concentrations visible.
+    const std::size_t bucketCount = static_cast<std::size_t>(
+        std::clamp(width, 32.0F, 512.0F));
+    std::vector<std::uint64_t> bucketValues(bucketCount, 0U);
+    const std::size_t binCount = entry->displayBins.size();
+    for (std::size_t bucket = 0U; bucket < bucketCount; ++bucket) {
+        const std::size_t firstBin = std::min(
+            binCount - 1U,
+            bucket * binCount / bucketCount);
+        const std::size_t lastBin = std::min(
+            binCount,
+            std::max<std::size_t>(
+                firstBin + 1U,
+                (bucket + 1U) * binCount / bucketCount));
+        std::uint64_t peak = 0U;
+        for (std::size_t bin = firstBin; bin < lastBin; ++bin) {
+            peak = std::max(peak, entry->displayBins[bin]);
+        }
+        bucketValues[bucket] = peak;
+    }
+    std::uint64_t bucketMinimum =
+        std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t bucketMaximum = 0U;
+    for (const auto value : bucketValues) {
+        bucketMinimum = std::min(bucketMinimum, value);
+        bucketMaximum = std::max(bucketMaximum, value);
+    }
+    const float baseY = maximum.y - 1.0F;
+    const float barSpanY = kHistogramHeight - 8.0F;
+    for (std::size_t bucket = 0U; bucket < bucketCount; ++bucket) {
+        const float height =
+            invisible_places::timing::TimingColouriseHistogramDisplayHeight(
+                bucketValues[bucket],
+                bucketMinimum,
+                bucketMaximum);
+        if (height <= 0.0F) {
+            continue;
+        }
+        const float x0 = minimum.x +
+                         width * static_cast<float>(bucket) /
+                             static_cast<float>(bucketCount);
+        const float x1 = minimum.x +
+                         width * static_cast<float>(bucket + 1U) /
+                             static_cast<float>(bucketCount);
+        drawList->AddRectFilled(
+            ImVec2{x0, baseY - barSpanY * height},
+            ImVec2{std::max(x1, x0 + 1.0F), baseY},
+            IM_COL32(118, 156, 184, 210));
+    }
+    drawList->AddRect(
+        minimum,
+        maximum,
+        ImGui::GetColorU32(ImGuiCol_Border),
+        2.0F);
+
+    const bool useLayerStats = invisible_places::style::HasFieldMapFlag(
+        binding->fieldMap,
+        FieldMapFlagUseLayerStats);
+    const float lower =
+        invisible_places::style::ResolveBindingInputMinimum(
+            *binding,
+            &stats);
+    const float upper =
+        invisible_places::style::ResolveBindingInputMaximum(
+            *binding,
+            &stats);
+    const auto xForRaw = [&](float rawValue) {
+        return minimum.x + width * axis.RawToUnit(rawValue);
+    };
+    const auto rawForX = [&](float x) {
+        return axis.UnitToRaw(
+            std::clamp((x - minimum.x) / width, 0.0F, 1.0F));
+    };
+    // Bounds outside the data range pin to the graph edge but stay
+    // grabbable so they can be dragged back into the distribution.
+    const ImU32 lowerColour = IM_COL32(255, 190, 74, 255);
+    const ImU32 upperColour = IM_COL32(242, 104, 96, 255);
+    const auto drawBound = [&](float rawValue, ImU32 colour) {
+        const float x = xForRaw(rawValue);
+        drawList->AddLine(
+            ImVec2{x, minimum.y + 1.0F},
+            ImVec2{x, maximum.y - 1.0F},
+            colour,
+            2.0F);
+        drawList->AddTriangleFilled(
+            ImVec2{x - 4.0F, minimum.y + 1.0F},
+            ImVec2{x + 4.0F, minimum.y + 1.0F},
+            ImVec2{x, minimum.y + 7.0F},
+            colour);
+    };
+    drawBound(lower, lowerColour);
+    drawBound(upper, upperColour);
+
+    const auto mouse = ImGui::GetIO().MousePos;
+    auto& drag = runtimeState->visualsHistogramDrag;
+    const bool hovered = ImGui::IsItemHovered();
+    constexpr float kHandleHitRadius = 9.0F;
+    std::uint8_t hoveredHandle = 0U;
+    if (hovered) {
+        const float lowerDistance = std::abs(mouse.x - xForRaw(lower));
+        const float upperDistance = std::abs(mouse.x - xForRaw(upper));
+        if (std::min(lowerDistance, upperDistance) <= kHandleHitRadius) {
+            hoveredHandle =
+                lowerDistance <= upperDistance ? 1U : 2U;
+        }
+    }
+    const float epsilon =
+        std::max(1.0e-6F, (stats.maximum - stats.minimum) * 1.0e-3F);
+    const auto applyBound = [&](std::uint8_t handle, float rawValue) {
+        float target = std::clamp(rawValue, stats.minimum, stats.maximum);
+        if (useLayerStats) {
+            // First manual edit: freeze both sides at their current
+            // resolved values, then move only the grabbed one.
+            binding->fieldMap.inputMin = lower;
+            binding->fieldMap.inputMax = upper;
+            invisible_places::style::SetFieldMapFlag(
+                &binding->fieldMap,
+                FieldMapFlagUseLayerStats,
+                false);
+        }
+        if (handle == 1U) {
+            binding->fieldMap.inputMin = std::min(
+                target,
+                binding->fieldMap.inputMax - epsilon);
+        } else {
+            binding->fieldMap.inputMax = std::max(
+                target,
+                binding->fieldMap.inputMin + epsilon);
+        }
+        changed = true;
+    };
+
+    if (hovered && hoveredHandle != 0U) {
+        const float value = hoveredHandle == 1U ? lower : upper;
+        ImGui::SetTooltip(
+            "%s bound %.5g — drag to remap the field between these "
+            "bounds; double-click to reset it to the field %s.",
+            hoveredHandle == 1U ? "Lower" : "Upper",
+            value,
+            hoveredHandle == 1U ? "minimum" : "maximum");
+        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            applyBound(
+                hoveredHandle,
+                hoveredHandle == 1U ? stats.minimum : stats.maximum);
+            drag = {};
+        } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            drag.item = itemId;
+            drag.handle = hoveredHandle;
+            drag.grabOffsetRaw =
+                rawForX(mouse.x) -
+                (hoveredHandle == 1U ? lower : upper);
+        }
+    } else if (hovered) {
+        ImGui::SetTooltip(
+            "%s distribution of %llu sampled points.\nDrag the coloured "
+            "bounds to choose the mapped input range; it defaults to the "
+            "field minimum and maximum.",
+            stats.name.c_str(),
+            static_cast<unsigned long long>(
+                entry->histogram.finiteValueCount));
+    }
+    if (drag.item == itemId && drag.handle != 0U) {
+        if (ImGui::IsItemActive() &&
+            ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            applyBound(
+                drag.handle,
+                rawForX(mouse.x) - drag.grabOffsetRaw);
+        } else if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            drag = {};
+        }
+    }
+
+    const auto labelColour = ImGui::GetColorU32(ImGuiCol_TextDisabled);
+    char label[64];
+    std::snprintf(label, sizeof(label), "%.5g", stats.minimum);
+    drawList->AddText(
+        ImVec2{minimum.x + 3.0F, maximum.y - 16.0F},
+        labelColour,
+        label);
+    std::snprintf(label, sizeof(label), "%.5g", stats.maximum);
+    drawList->AddText(
+        ImVec2{
+            maximum.x - 3.0F - ImGui::CalcTextSize(label).x,
+            maximum.y - 16.0F},
+        labelColour,
+        label);
+    std::snprintf(label, sizeof(label), "[%.5g, %.5g]", lower, upper);
+    drawList->AddText(
+        ImVec2{
+            std::clamp(
+                std::midpoint(xForRaw(lower), xForRaw(upper)) -
+                    ImGui::CalcTextSize(label).x * 0.5F,
+                minimum.x + 3.0F,
+                maximum.x - 3.0F - ImGui::CalcTextSize(label).x),
+            minimum.y + 2.0F},
+        ImGui::GetColorU32(ImGuiCol_Text),
+        label);
+    return changed;
+}
+
 bool DrawScalarBindingBody(
     const char* id,
     RenderParameterBinding* binding,
     const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields,
     const ScalarBindingWidgetConfig& config,
-    bool drawActiveCheckbox = true) {
+    bool drawActiveCheckbox = true,
+    PreviewRuntimeState* runtimeState = nullptr,
+    PreviewLayerSession* session = nullptr) {
     if (binding == nullptr) {
         return false;
     }
@@ -6577,6 +6973,11 @@ bool DrawScalarBindingBody(
         for (std::size_t fieldIndex = 0; fieldIndex < scalarFields.size(); ++fieldIndex) {
             const bool selected = binding->fieldMap.fieldSlot == static_cast<std::int32_t>(fieldIndex);
             if (ImGui::Selectable(scalarFields[fieldIndex].name.c_str(), selected)) {
+                // Leaving a field stashes its manual bounds; arriving on a
+                // field restores the bounds it was last edited with, so
+                // switching away and back never loses the adjustment.
+                invisible_places::style::RememberFieldMapBounds(
+                    &binding->fieldMap);
                 invisible_places::style::ConfigureFieldMapFromStats(
                     binding,
                     static_cast<std::int32_t>(fieldIndex),
@@ -6584,6 +6985,8 @@ bool DrawScalarBindingBody(
                     binding->fieldMap.outputMin,
                     binding->fieldMap.outputMax,
                     &scalarFields[fieldIndex]);
+                invisible_places::style::RestoreFieldMapBoundsMemory(
+                    &binding->fieldMap);
                 changed = true;
             }
             if (selected) {
@@ -6596,6 +6999,13 @@ bool DrawScalarBindingBody(
     const auto* fieldStats = ScalarFieldStatsBySlot(scalarFields, binding->fieldMap.fieldSlot);
     if (fieldStats != nullptr && fieldStats->valid) {
         ImGui::Text("Discovered: %.5g to %.5g", fieldStats->minimum, fieldStats->maximum);
+    }
+    if (fieldStats != nullptr && fieldStats->valid) {
+        changed |= DrawVisualsFieldHistogramBounds(
+            runtimeState,
+            session,
+            binding,
+            *fieldStats);
     }
 
     bool useLayerStats = invisible_places::style::HasFieldMapFlag(
@@ -38296,7 +38706,9 @@ PointCloudFalloffProfile EffectivePointFalloffProfile(const PointCloudStyleState
     return style.falloffProfile;
 }
 
-bool DrawPointCloudPointSettingsSection(PreviewLayerSession* session) {
+bool DrawPointCloudPointSettingsSection(
+    PreviewRuntimeState* runtimeState,
+    PreviewLayerSession* session) {
     if (session == nullptr || !BeginPanelSection("Point Settings")) {
         return false;
     }
@@ -38331,7 +38743,10 @@ bool DrawPointCloudPointSettingsSection(PreviewLayerSession* session) {
         "Point Size",
         PointSizeBinding(session),
         session->scalarFields,
-        PointSizeBindingConfig(*session));
+        PointSizeBindingConfig(*session),
+        true,
+        runtimeState,
+        session);
     if (style.flowAnimation && style.geometryMode != PointCloudGeometryMode::ScreenSprites) {
         changed |= ImGui::SliderFloat("Streak Aspect", &style.waterStreakAspect, 1.0F, 32.0F, "%.1f");
     }
@@ -38390,7 +38805,9 @@ bool DrawColormapSwatch(
     return clicked;
 }
 
-bool DrawPointCloudColourSection(PreviewLayerSession* session) {
+bool DrawPointCloudColourSection(
+    PreviewRuntimeState* runtimeState,
+    PreviewLayerSession* session) {
     if (session == nullptr || !BeginPanelSection("Colour")) {
         return false;
     }
@@ -38480,7 +38897,10 @@ bool DrawPointCloudColourSection(PreviewLayerSession* session) {
              .defaultConstant = 0.5F,
              .format = "%.3f",
              .hardMin = 0.0F,
-             .hardMax = 1.0F});
+             .hardMax = 1.0F},
+            true,
+            runtimeState,
+            session);
     } else if (style.colorMode == PointCloudColorMode::ScalarColormap) {
         ImGui::TextDisabled("No scalar fields were discovered for this cloud.");
     }
@@ -39057,6 +39477,8 @@ bool DrawPointCloudFalloffSection(PreviewLayerSession* session) {
 bool DrawVisualBindingSection(
     const char* sectionLabel,
     const char* id,
+    PreviewRuntimeState* runtimeState,
+    PreviewLayerSession* session,
     RenderParameterBinding* binding,
     const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields,
     const ScalarBindingWidgetConfig& config) {
@@ -39064,12 +39486,23 @@ bool DrawVisualBindingSection(
     if (!BeginPanelSection(sectionLabel, true, binding != nullptr ? &binding->active : nullptr, &activeChanged)) {
         return activeChanged;
     }
-    const bool changed = activeChanged || DrawScalarBindingBody(id, binding, scalarFields, config, false);
+    const bool changed =
+        activeChanged ||
+        DrawScalarBindingBody(
+            id,
+            binding,
+            scalarFields,
+            config,
+            false,
+            runtimeState,
+            session);
     EndPanelSection();
     return changed;
 }
 
-bool DrawPointCloudEmissionSection(PreviewLayerSession* session) {
+bool DrawPointCloudEmissionSection(
+    PreviewRuntimeState* runtimeState,
+    PreviewLayerSession* session) {
     if (session == nullptr) {
         return false;
     }
@@ -39091,7 +39524,9 @@ bool DrawPointCloudEmissionSection(PreviewLayerSession* session) {
          .defaultConstant = 0.0F,
          .format = "%.2f",
          .hardMin = 0.0F},
-        false);
+        false,
+        runtimeState,
+        session);
     ImGui::Spacing();
     changed |= DrawRangedFloatControl(
         "Exposure",
@@ -39102,7 +39537,9 @@ bool DrawPointCloudEmissionSection(PreviewLayerSession* session) {
     return changed;
 }
 
-bool DrawPointCloudDepthFadeSection(PreviewLayerSession* session) {
+bool DrawPointCloudDepthFadeSection(
+    PreviewRuntimeState* runtimeState,
+    PreviewLayerSession* session) {
     if (session == nullptr) {
         return false;
     }
@@ -39110,6 +39547,8 @@ bool DrawPointCloudDepthFadeSection(PreviewLayerSession* session) {
     return DrawVisualBindingSection(
         "Depth Fade",
         "Depth Fade",
+        runtimeState,
+        session,
         &session->pointStyle.depthFade,
         session->scalarFields,
         {.constantMin = 0.0F,
@@ -39122,7 +39561,9 @@ bool DrawPointCloudDepthFadeSection(PreviewLayerSession* session) {
          .hardMax = 1.0F});
 }
 
-bool DrawPointCloudStyleSection(PreviewLayerSession* session) {
+bool DrawPointCloudStyleSection(
+    PreviewRuntimeState* runtimeState,
+    PreviewLayerSession* session) {
     if (session == nullptr) {
         return false;
     }
@@ -39130,14 +39571,16 @@ bool DrawPointCloudStyleSection(PreviewLayerSession* session) {
     auto& style = session->pointStyle;
     bool changed = false;
 
-    changed |= DrawPointCloudPointSettingsSection(session);
+    changed |= DrawPointCloudPointSettingsSection(runtimeState, session);
     changed |= DrawPointCloudStylisationSection(session);
     changed |= DrawPointCloudSurfaceMotionSection(session);
     changed |= DrawPointCloudFalloffSection(session);
-    changed |= DrawPointCloudColourSection(session);
+    changed |= DrawPointCloudColourSection(runtimeState, session);
     changed |= DrawVisualBindingSection(
         "Opacity",
         "Opacity",
+        runtimeState,
+        session,
         &style.opacity,
         session->scalarFields,
         {.constantMin = 0.0F,
@@ -39148,8 +39591,8 @@ bool DrawPointCloudStyleSection(PreviewLayerSession* session) {
          .format = "%.2f",
          .hardMin = 0.0F,
          .hardMax = 1.0F});
-    changed |= DrawPointCloudEmissionSection(session);
-    changed |= DrawPointCloudDepthFadeSection(session);
+    changed |= DrawPointCloudEmissionSection(runtimeState, session);
+    changed |= DrawPointCloudDepthFadeSection(runtimeState, session);
 
     if (changed) {
         SanitizePointCloudStyle(session);
@@ -41882,7 +42325,7 @@ void DrawVisualsPanel(
     }
 
     DrawWaterEffectStackVisualsSection(runtimeState, viewport, session);
-    if (DrawPointCloudStyleSection(session)) {
+    if (DrawPointCloudStyleSection(runtimeState, session)) {
         MarkPointVisualEdited(runtimeState, session);
         if (!IsProjectPointVisualSession(*session)) {
             SyncScenePointVisualsFromOwner(runtimeState, session);
@@ -43572,10 +44015,15 @@ void DrawWaterTrailStyleEditor(
     editSession.scalarFields = WaterTrailScalarFieldsForUi(*runtimeState);
     editSession.pointStyle = MakeWaterTrailSessionStyle(profile.style, profile.geometry);
     bool styleChanged = false;
-    styleChanged |= DrawPointCloudColourSection(&editSession);
+    // Trail fields are synthetic per-particle values with no resident cloud
+    // behind them, so the null runtime/session pair suppresses the field
+    // histogram while bounds memory still rides on the binding itself.
+    styleChanged |= DrawPointCloudColourSection(nullptr, &editSession);
     styleChanged |= DrawVisualBindingSection(
         "Opacity",
         "Opacity",
+        nullptr,
+        nullptr,
         &editSession.pointStyle.opacity,
         editSession.scalarFields,
         {.constantMin = 0.0F,
@@ -43586,7 +44034,7 @@ void DrawWaterTrailStyleEditor(
          .format = "%.2f",
          .hardMin = 0.0F,
          .hardMax = 1.0F});
-    styleChanged |= DrawPointCloudEmissionSection(&editSession);
+    styleChanged |= DrawPointCloudEmissionSection(nullptr, &editSession);
 
     if (generationChanged || visualChanged || styleChanged) {
         const auto editedName = EditedWaterProfileName(water.selectedTrailProfileName);
@@ -43781,10 +44229,14 @@ void DrawWaterDynamicMeshTrailStyleEditor(
     editSession.scalarFields = WaterTrailScalarFieldsForUi(*runtimeState);
     editSession.pointStyle = MakeWaterTrailSessionStyle(profile.style, profile.geometry);
     bool styleChanged = false;
-    styleChanged |= DrawPointCloudColourSection(&editSession);
+    // Synthetic trail fields have no resident cloud; suppress the field
+    // histogram (bounds memory still works on the binding itself).
+    styleChanged |= DrawPointCloudColourSection(nullptr, &editSession);
     styleChanged |= DrawVisualBindingSection(
         "MeshTrailOpacity",
         "Opacity",
+        nullptr,
+        nullptr,
         &editSession.pointStyle.opacity,
         editSession.scalarFields,
         {.constantMin = 0.0F,
@@ -43795,7 +44247,7 @@ void DrawWaterDynamicMeshTrailStyleEditor(
          .format = "%.2f",
          .hardMin = 0.0F,
          .hardMax = 1.0F});
-    styleChanged |= DrawPointCloudEmissionSection(&editSession);
+    styleChanged |= DrawPointCloudEmissionSection(nullptr, &editSession);
 
     if (generationChanged || visualChanged || styleChanged) {
         const auto editedName = EditedWaterProfileName(settings.trailProfileName);

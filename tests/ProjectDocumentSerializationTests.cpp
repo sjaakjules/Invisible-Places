@@ -940,6 +940,76 @@ TEST_CASE("Timing scalar bounds stores and named profiles round-trip",
   CHECK(loadedStore.profiles[1].bounds.upper == Catch::Approx(0.9F));
 }
 
+TEST_CASE("Point visual field-map bounds memory round-trips",
+          "[project][serialization][visuals][bounds]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::ProjectLayerDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::style::FieldMapFlagClamp;
+  using invisible_places::style::ParameterSourceMode;
+
+  ProjectDocument document;
+  ProjectLayerDocument::PointVisual visual;
+  visual.name = "Remembered Bounds";
+  auto &opacity = visual.style.opacity;
+  opacity.mode = ParameterSourceMode::FieldMapped;
+  opacity.fieldMap.fieldSlot = 0;
+  opacity.fieldMap.fieldName = "Interest";
+  opacity.fieldMap.inputMin = 0.5F;
+  opacity.fieldMap.inputMax = 3.5F;
+  // Manual bounds: layer-stats mode deliberately off.
+  opacity.fieldMap.flags = FieldMapFlagClamp;
+  opacity.fieldMap.boundsMemory = {
+      {.fieldName = "Roughness", .inputMin = 0.25F, .inputMax = 0.75F},
+      {.fieldName = "Heat", .inputMin = -2.0F, .inputMax = 6.0F},
+  };
+  document.pointVisuals.push_back(visual);
+
+  TemporaryProjectFile file{
+      "invisible_places_field_map_bounds_memory_round_trip.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+
+  std::ifstream input{file.path};
+  REQUIRE(input.is_open());
+  const auto savedJson = nlohmann::json::parse(input);
+  const auto &savedMemory = savedJson.at("point_visuals")
+                                .front()
+                                .at("point_style")
+                                .at("opacity")
+                                .at("field_map")
+                                .at("bounds_memory");
+  REQUIRE(savedMemory.size() == 2U);
+  CHECK(savedMemory[0].at("field_name") == "Roughness");
+  CHECK(savedMemory[0].at("input_min") == Catch::Approx(0.25F));
+  CHECK(savedMemory[0].at("input_max") == Catch::Approx(0.75F));
+  CHECK(savedMemory[1].at("field_name") == "Heat");
+
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->pointVisuals.size() == 1U);
+  const auto &loadedMap = loaded->pointVisuals.front().style.opacity.fieldMap;
+  CHECK(loadedMap.inputMin == Catch::Approx(0.5F));
+  CHECK(loadedMap.inputMax == Catch::Approx(3.5F));
+  REQUIRE(loadedMap.boundsMemory.size() == 2U);
+  CHECK(loadedMap.boundsMemory[0].fieldName == "Roughness");
+  CHECK(loadedMap.boundsMemory[0].inputMin == Catch::Approx(0.25F));
+  CHECK(loadedMap.boundsMemory[0].inputMax == Catch::Approx(0.75F));
+  CHECK(loadedMap.boundsMemory[1].fieldName == "Heat");
+  CHECK(loadedMap.boundsMemory[1].inputMin == Catch::Approx(-2.0F));
+  CHECK(loadedMap.boundsMemory[1].inputMax == Catch::Approx(6.0F));
+
+  // A binding without memory keeps its JSON free of the optional key.
+  CHECK_FALSE(savedJson.at("point_visuals")
+                  .front()
+                  .at("point_style")
+                  .at("emissive_strength")
+                  .at("field_map")
+                  .contains("bounds_memory"));
+}
+
 TEST_CASE("Schema 51 palette snapshots migrate without changing their animation model",
           "[project][serialization][colourise][palette][migration]") {
   using invisible_places::serialization::LoadProjectDocument;

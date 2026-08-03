@@ -115,12 +115,16 @@ constexpr std::uint32_t kManualFlowSurfaceGuideProjectSchemaVersion = 40U;
 constexpr std::uint32_t kManualFlowSurfaceGuideSourcesSchemaVersion = 16U;
 constexpr std::uint32_t kSmoothVelocityProjectSchemaVersion = 61U;
 constexpr std::uint32_t kRelativePalettePhaseProjectSchemaVersion = 62U;
+constexpr std::uint32_t kFieldMapBoundsMemoryProjectSchemaVersion = 63U;
 static_assert(
     kProjectDocumentSchemaVersion >=
     kSmoothVelocityProjectSchemaVersion);
 static_assert(
     kProjectDocumentSchemaVersion >=
     kRelativePalettePhaseProjectSchemaVersion);
+static_assert(
+    kProjectDocumentSchemaVersion >=
+    kFieldMapBoundsMemoryProjectSchemaVersion);
 
 constexpr std::string_view kProjectVisualEditedSuffix = "_edited";
 constexpr std::string_view kProjectVisualLegacyEditedSuffix = "_Edited";
@@ -1005,7 +1009,7 @@ GaussianSplatQualityMode ParseGaussianSplatQualityMode(const json& value) {
 }
 
 json SerializeBinding(const RenderParameterBinding& binding) {
-    return json{
+    json serialized{
         {"active", binding.active},
         {"mode", ParameterSourceModeName(binding.mode)},
         {"constant_value", binding.constantValue},
@@ -1021,6 +1025,18 @@ json SerializeBinding(const RenderParameterBinding& binding) {
              {"flags", binding.fieldMap.flags},
          }},
     };
+    if (!binding.fieldMap.boundsMemory.empty()) {
+        json memoryJson = json::array();
+        for (const auto& entry : binding.fieldMap.boundsMemory) {
+            memoryJson.push_back(json{
+                {"field_name", entry.fieldName},
+                {"input_min", entry.inputMin},
+                {"input_max", entry.inputMax},
+            });
+        }
+        serialized["field_map"]["bounds_memory"] = std::move(memoryJson);
+    }
+    return serialized;
 }
 
 RenderParameterBinding ParseBinding(const json& bindingJson) {
@@ -1048,6 +1064,23 @@ RenderParameterBinding ParseBinding(const json& bindingJson) {
             static_cast<std::uint32_t>(
                 invisible_places::style::FieldMapFlagClamp |
                 invisible_places::style::FieldMapFlagUseLayerStats));
+        if (fieldMapJson.contains("bounds_memory") &&
+            fieldMapJson.at("bounds_memory").is_array()) {
+            for (const auto& entryJson : fieldMapJson.at("bounds_memory")) {
+                if (!entryJson.is_object()) {
+                    continue;
+                }
+                invisible_places::style::FieldMapBoundsMemoryEntry entry;
+                entry.fieldName =
+                    entryJson.value("field_name", std::string{});
+                entry.inputMin = entryJson.value("input_min", 0.0F);
+                entry.inputMax = entryJson.value("input_max", 1.0F);
+                if (!entry.fieldName.empty()) {
+                    binding.fieldMap.boundsMemory.push_back(
+                        std::move(entry));
+                }
+            }
+        }
     }
 
     return binding;

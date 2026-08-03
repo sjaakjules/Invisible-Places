@@ -1,6 +1,7 @@
 #include "style/RenderParameterBinding.hpp"
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -106,4 +107,104 @@ TEST_CASE("Legacy slot-only scalar bindings acquire a durable name once", "[styl
 
     CHECK(binding.fieldMap.fieldSlot == 0);
     CHECK(binding.fieldMap.fieldName == "Roughness");
+}
+
+TEST_CASE("Manual input bounds survive switching fields and back", "[style][field-binding]") {
+    auto stats = Field("Interest");
+    stats.minimum = -2.0F;
+    stats.maximum = 6.0F;
+    auto roughness = Field("Roughness");
+
+    invisible_places::style::RenderParameterBinding binding;
+    invisible_places::style::ConfigureFieldMapFromStats(
+        &binding, 0, "Interest", 0.0F, 1.0F, &stats);
+    REQUIRE(invisible_places::style::HasFieldMapFlag(
+        binding.fieldMap,
+        invisible_places::style::FieldMapFlagUseLayerStats));
+
+    // Manual edit narrows the mapped range.
+    invisible_places::style::SetFieldMapFlag(
+        &binding.fieldMap,
+        invisible_places::style::FieldMapFlagUseLayerStats,
+        false);
+    binding.fieldMap.inputMin = 0.5F;
+    binding.fieldMap.inputMax = 3.5F;
+
+    // Switch to Roughness: stash, defaults, no memory for the new field.
+    invisible_places::style::RememberFieldMapBounds(&binding.fieldMap);
+    invisible_places::style::ConfigureFieldMapFromStats(
+        &binding, 1, "Roughness", 0.0F, 1.0F, &roughness);
+    CHECK_FALSE(
+        invisible_places::style::RestoreFieldMapBoundsMemory(&binding.fieldMap));
+    CHECK(invisible_places::style::HasFieldMapFlag(
+        binding.fieldMap,
+        invisible_places::style::FieldMapFlagUseLayerStats));
+
+    // Return to Interest: the manual bounds come back and stats mode stays off.
+    invisible_places::style::RememberFieldMapBounds(&binding.fieldMap);
+    invisible_places::style::ConfigureFieldMapFromStats(
+        &binding, 0, "Interest", 0.0F, 1.0F, &stats);
+    CHECK(invisible_places::style::RestoreFieldMapBoundsMemory(&binding.fieldMap));
+    CHECK(binding.fieldMap.inputMin == Catch::Approx(0.5F));
+    CHECK(binding.fieldMap.inputMax == Catch::Approx(3.5F));
+    CHECK_FALSE(invisible_places::style::HasFieldMapFlag(
+        binding.fieldMap,
+        invisible_places::style::FieldMapFlagUseLayerStats));
+}
+
+TEST_CASE("Reverting a field to layer stats forgets its remembered bounds", "[style][field-binding]") {
+    auto stats = Field("Interest");
+    auto roughness = Field("Roughness");
+
+    invisible_places::style::RenderParameterBinding binding;
+    invisible_places::style::ConfigureFieldMapFromStats(
+        &binding, 0, "Interest", 0.0F, 1.0F, &stats);
+    invisible_places::style::SetFieldMapFlag(
+        &binding.fieldMap,
+        invisible_places::style::FieldMapFlagUseLayerStats,
+        false);
+    binding.fieldMap.inputMin = 0.2F;
+    binding.fieldMap.inputMax = 0.8F;
+    invisible_places::style::RememberFieldMapBounds(&binding.fieldMap);
+    REQUIRE(binding.fieldMap.boundsMemory.size() == 1U);
+
+    // Back on layer stats: leaving the field must erase the stale entry so a
+    // later return gives the defaults again.
+    invisible_places::style::SetFieldMapFlag(
+        &binding.fieldMap,
+        invisible_places::style::FieldMapFlagUseLayerStats,
+        true);
+    invisible_places::style::RememberFieldMapBounds(&binding.fieldMap);
+    CHECK(binding.fieldMap.boundsMemory.empty());
+
+    invisible_places::style::ConfigureFieldMapFromStats(
+        &binding, 1, "Roughness", 0.0F, 1.0F, &roughness);
+    CHECK_FALSE(
+        invisible_places::style::RestoreFieldMapBoundsMemory(&binding.fieldMap));
+}
+
+TEST_CASE("Bounds memory sanitize drops unusable and duplicate entries", "[style][field-binding]") {
+    invisible_places::style::FieldMapConfig config;
+    config.fieldName = "Current";
+    config.boundsMemory = {
+        {.fieldName = "", .inputMin = 0.0F, .inputMax = 1.0F},
+        {.fieldName = "Stale", .inputMin = 5.0F, .inputMax = 2.0F},
+        {.fieldName = "stale", .inputMin = 4.0F, .inputMax = -1.0F},
+        {.fieldName = "Current", .inputMin = 0.1F, .inputMax = 0.9F},
+        {.fieldName = "Kept",
+         .inputMin = std::numeric_limits<float>::quiet_NaN(),
+         .inputMax = 1.0F},
+        {.fieldName = "Kept", .inputMin = 0.25F, .inputMax = 0.75F},
+    };
+
+    invisible_places::style::SanitizeFieldMapBoundsMemory(&config);
+
+    REQUIRE(config.boundsMemory.size() == 2U);
+    // The later duplicate wins and inverted bounds are reordered.
+    CHECK(config.boundsMemory[0].fieldName == "stale");
+    CHECK(config.boundsMemory[0].inputMin == Catch::Approx(-1.0F));
+    CHECK(config.boundsMemory[0].inputMax == Catch::Approx(4.0F));
+    CHECK(config.boundsMemory[1].fieldName == "Kept");
+    CHECK(config.boundsMemory[1].inputMin == Catch::Approx(0.25F));
+    CHECK(config.boundsMemory[1].inputMax == Catch::Approx(0.75F));
 }
