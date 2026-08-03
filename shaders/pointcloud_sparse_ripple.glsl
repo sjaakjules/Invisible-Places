@@ -527,21 +527,36 @@ float SandCloudShorelineWaveValue(vec2 uv, float shoreDistance, float edgeBlendW
     const float finishOffset = max(edgeBlendWidth, edgeBlendWidth + warpGuard);
     float combined = 0.0;
 
+    // Band Density chooses how many of the four fronts run: two at 0, four
+    // at 1. The fronts share one cycle rate on fixed staggered offsets with
+    // only a bounded wobble, so their brief quiet windows can never drift
+    // into alignment and the shore never pauses: at least one front is
+    // always inbound with two fronts, and effectively two once all four run.
+    const float frontCount = mix(2.0, 4.0, density01);
+
     for (int waveIndex = 0; waveIndex < 4; ++waveIndex) {
         const float slot = float(waveIndex);
-        const float slotSeed = seed + slot * 53.17;
-        const float timingNoise = RippleHash(slotSeed * 0.071 + 11.0);
-        const float speedNoise = mix(0.91, 1.09, RippleHash(slotSeed * 0.097 + 23.0));
-        const float waveGate = RippleHash(slotSeed * 0.113 + 31.0);
-        if (waveGate > mix(0.62, 1.0, density01)) {
+        // Activation order 0, 2, 1, 3: the first two fronts sit half a
+        // cycle apart, so the always-inbound guarantee holds from Density 0.
+        const float activationRank =
+            waveIndex == 0 ? 0.0
+                           : (waveIndex == 2 ? 1.0
+                                             : (waveIndex == 1 ? 2.0 : 3.0));
+        const float frontWeight = 1.0 - smoothstep(
+            frontCount - 0.35,
+            frontCount + 0.15,
+            activationRank + 0.5);
+        if (frontWeight <= 1.0e-4) {
             continue;
         }
+        const float slotSeed = seed + slot * 53.17;
+        const float timingNoise = RippleHash(slotSeed * 0.071 + 11.0);
 
         const float offset =
-            slot * 0.235 +
-            (timingNoise - 0.5) * (0.12 + turbulence01 * 0.10) +
-            RippleSmoothBlockNoise(vec2(t * 0.018, slotSeed), 0.23, seed, 181.0) * 0.10;
-        const float cycle = fract(t * waveRate * speedNoise + offset);
+            slot * 0.25 +
+            (timingNoise - 0.5) * 0.05 +
+            RippleSmoothBlockNoise(vec2(t * 0.018, slotSeed), 0.23, seed, 181.0) * 0.04;
+        const float cycle = fract(t * waveRate + offset);
         const float activeEnd = incomingShare + returnShare;
         if (cycle >= activeEnd) {
             continue;
@@ -625,7 +640,7 @@ float SandCloudShorelineWaveValue(vec2 uv, float shoreDistance, float edgeBlendW
                  arrivingFoam * (0.42 + density01 * 0.28) * breakup) *
                 incomingMask;
             const float value = max(incomingBodyFoam, incomingEdgeFoam) * arrivalFade * peakSoftening;
-            combined = max(combined, value * shorewardMask);
+            combined = max(combined, value * shorewardMask * frontWeight);
         } else {
             const float returnProgress = smoothstep(0.0, 1.0, (cycle - incomingShare) / returnShare);
             const float returnDistance = waveTravel * 0.50;
@@ -701,7 +716,7 @@ float SandCloudShorelineWaveValue(vec2 uv, float shoreDistance, float edgeBlendW
                  peakCarryFoam * (0.38 + density01 * 0.24) * breakup) *
                 peakCarryMask * peakCarryFade * 0.72;
             const float value = max(max(heldValue, peakCarryValue), edgeValue * edgeIntroduce);
-            combined = max(combined, value * shorewardMask);
+            combined = max(combined, value * shorewardMask * frontWeight);
         }
     }
 

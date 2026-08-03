@@ -1668,6 +1668,16 @@ TEST_CASE("Sand-cloud shoreline waves use dedicated foam helpers", "[water][shor
     CHECK(helperBody.find("const float edgeIntroduce = smoothstep(0.0, 0.18, returnProgress);") != std::string::npos);
     CHECK(helperBody.find("const float peakCarryFade") != std::string::npos);
     CHECK(helperBody.find("edgeValue * edgeIntroduce") != std::string::npos);
+    // No-pause guarantee: Band Density runs two to four fronts on one
+    // shared cycle rate with staggered offsets and bounded wobble; the old
+    // per-seed slot cull and per-slot cycle speeds that let quiet windows
+    // align are gone.
+    CHECK(helperBody.find("const float frontCount = mix(2.0, 4.0, density01);") !=
+          std::string::npos);
+    CHECK(helperBody.find("const float activationRank") != std::string::npos);
+    CHECK(helperBody.find("slot * 0.25 +") != std::string::npos);
+    CHECK(helperBody.find("waveGate") == std::string::npos);
+    CHECK(helperBody.find("speedNoise") == std::string::npos);
 
     const auto continuousBandsPos = shader.find("float ContinuousBandShorelineWaveValue(");
     REQUIRE(continuousBandsPos != std::string::npos);
