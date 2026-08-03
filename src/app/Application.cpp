@@ -563,6 +563,42 @@ struct TimingColouriseLocalKeyPositionEditState {
     std::string errorMessage;
 };
 
+// Water run graph interaction state is identity-based, never pointer-based:
+// runs, features, and tracks are re-resolved from these ids every frame so a
+// deleted or reimported run simply drops the interaction instead of dangling.
+struct WaterRunKeyDragState {
+    std::string scenarioId;
+    std::uint32_t runId = 0U;
+    invisible_places::water::WaterKeyedFeatureId feature{};
+    std::string settingId;
+    float currentPosition = 0.0F;
+    // Curve-dot drags edit value and position together; axis-lane drags
+    // retime only, matching the Visual Features lanes.
+    bool valueDrag = false;
+    // Value frame frozen at drag start so an autoscaled fallback range
+    // cannot stretch underneath the cursor while the value is dragged.
+    float rangeMinimum = 0.0F;
+    float rangeMaximum = 1.0F;
+    // Cursor-to-key offset at grab time; without it a grab up to the hit
+    // radius off-centre snaps the key to the cursor on the first frame.
+    float grabOffsetX = 0.0F;
+    float grabOffsetY = 0.0F;
+};
+
+struct WaterRunKeyEditState {
+    std::string scenarioId;
+    std::uint32_t runId = 0U;
+    invisible_places::water::WaterKeyedFeatureId feature{};
+    std::string settingId;
+    float sourcePosition = 0.0F;
+    float draftPosition = 0.0F;
+    float draftValue = 0.0F;
+    invisible_places::water::WaterScenarioInterpolation draftInterpolation =
+        invisible_places::water::WaterScenarioInterpolation::Smooth;
+    bool requestKeyboardFocus = false;
+    std::string errorMessage;
+};
+
 struct AnimationPanelState {
     std::optional<AnimationPath> currentPath;
     std::string currentFilePath;
@@ -682,6 +718,19 @@ struct TimingsPanelState {
         std::vector<bool> moveChoices;
     };
     std::optional<PendingFeatureRunImport> pendingImport;
+    // Run timeline graph editor. Visibility is remembered per (take, run)
+    // for the session as a hidden set so newly added features appear on the
+    // graph without any extra step.
+    struct WaterRunGraphViewState {
+        std::string scenarioId;
+        std::uint32_t runId = 0U;
+        std::vector<invisible_places::water::WaterKeyedFeatureId>
+            hiddenFeatures;
+    };
+    bool waterRunGraphSplit = false;
+    std::vector<WaterRunGraphViewState> waterRunGraphViews;
+    std::optional<WaterRunKeyDragState> waterRunKeyDrag;
+    std::optional<WaterRunKeyEditState> waterRunKeyEdit;
     // Timing-take and Colourise authoring state. The selected effect is
     // intentionally UI-only; effects themselves are project-owned by the
     // active (take, scene-group) pair.
@@ -50024,6 +50073,911 @@ BuildAvailableKeyingFeatures(
     return features;
 }
 
+// Defined with the Timing helpers further down; declared here so the water
+// run graph editor can share the interpolation combo and control tooltips.
+void DrawTimingControlTooltip(const char* text);
+bool DrawTimingInterpolationCombo(
+    const char* label,
+    invisible_places::water::WaterScenarioInterpolation* interpolation);
+
+// ---- Water run timeline graph ----
+// The Timings-tab editor for a selected run's keyed setting tracks, visually
+// matched to the Visual Features setting lanes (value curves over the shared
+// normalized animation position, compact marker lane and playhead beneath).
+// Unlike the colourise lanes it also edits values: curve dots drag in both
+// axes, double-click on empty graph space adds a key to the targeted series,
+// and the key popup edits position, value, and interpolation or deletes the
+// key. Matches the water model tolerances (1e-4 insertion/move/navigation).
+
+// Shared with the top-bar water key marker strip so a setting keeps one
+// colour everywhere it appears.
+constexpr std::array<ImU32, 5> kWaterKeyedSettingColours{
+    IM_COL32(240, 173, 78, 255),
+    IM_COL32(102, 187, 227, 255),
+    IM_COL32(148, 214, 132, 255),
+    IM_COL32(222, 134, 190, 255),
+    IM_COL32(196, 196, 120, 255),
+};
+
+// Darkens a feature's base colour per setting index so a multi-setting
+// feature stays one recognisable family on the combined graph.
+ImU32 WaterRunSeriesShade(ImU32 colour, std::size_t step) {
+    if (step == 0U) {
+        return colour;
+    }
+    auto converted = ImGui::ColorConvertU32ToFloat4(colour);
+    const float scale =
+        1.0F / (1.0F + 0.4F * static_cast<float>(step));
+    converted.x *= scale;
+    converted.y *= scale;
+    converted.z *= scale;
+    return ImGui::ColorConvertFloat4ToU32(converted);
+}
+
+struct WaterRunGraphSeries {
+    invisible_places::water::WaterKeyedFeatureId feature{};
+    std::string settingId;
+    std::string label;
+    ImU32 colour = IM_COL32_WHITE;
+    // Null when a registry setting has no authored track yet; the series
+    // then draws a dashed guide at defaultValue and a double-click creates
+    // the track together with its first key. Timeline is never null.
+    invisible_places::water::WaterKeyedSettingTrack* track = nullptr;
+    invisible_places::water::WaterFeatureTimeline* timeline = nullptr;
+    // Fixed value frame for the vertical axis; registry ranges when known,
+    // padded key extents for dynamic profile tracks.
+    float minimum = 0.0F;
+    float maximum = 1.0F;
+    float defaultValue = 1.0F;
+};
+
+void DrawWaterRunTimingGraph(
+    const char* id,
+    PreviewRuntimeState* runtimeState,
+    const std::string& scenarioId,
+    invisible_places::water::WaterFeatureTimingRun* run,
+    std::span<WaterRunGraphSeries> series,
+    float durationSeconds) {
+    using invisible_places::water::WaterScenarioInterpolation;
+    using invisible_places::water::WaterSettingKey;
+    if (runtimeState == nullptr || run == nullptr || series.empty()) {
+        return;
+    }
+    constexpr float kKeyTolerance = 1.0e-4F;
+    auto& timings = runtimeState->timingsPanel;
+    ImGui::PushID(id);
+    constexpr float kCompactLaneHeight = 14.0F;
+    constexpr float kValueGraphHeight = 92.0F;
+    const ImVec2 size{
+        std::max(24.0F, ImGui::GetContentRegionAvail().x),
+        kValueGraphHeight};
+    ImGui::InvisibleButton(
+        "##WaterRunGraphSurface",
+        size,
+        ImGuiButtonFlags_MouseButtonLeft);
+    const auto minimum = ImGui::GetItemRectMin();
+    const auto maximum = ImGui::GetItemRectMax();
+    const float width = std::max(1.0F, maximum.x - minimum.x);
+    const float axisY = maximum.y - kCompactLaneHeight * 0.5F;
+    const float graphTopY = minimum.y + 5.0F;
+    const float graphHeight = std::max(1.0F, axisY - graphTopY);
+    const auto xForPosition = [&](float position) {
+        return minimum.x + width * std::clamp(position, 0.0F, 1.0F);
+    };
+    const auto positionForX = [&](float x) {
+        return std::clamp((x - minimum.x) / width, 0.0F, 1.0F);
+    };
+    const auto seriesRange =
+        [&](const WaterRunGraphSeries& lane) -> std::pair<float, float> {
+        if (timings.waterRunKeyDrag.has_value() &&
+            timings.waterRunKeyDrag->scenarioId == scenarioId &&
+            timings.waterRunKeyDrag->runId == run->id &&
+            timings.waterRunKeyDrag->feature == lane.feature &&
+            timings.waterRunKeyDrag->settingId == lane.settingId) {
+            return {
+                timings.waterRunKeyDrag->rangeMinimum,
+                timings.waterRunKeyDrag->rangeMaximum};
+        }
+        return {lane.minimum, lane.maximum};
+    };
+    const auto yForValue = [&](const WaterRunGraphSeries& lane, float value) {
+        const auto [rangeMinimum, rangeMaximum] = seriesRange(lane);
+        return axisY -
+               graphHeight *
+                   std::clamp(
+                       (value - rangeMinimum) /
+                           std::max(1.0e-6F, rangeMaximum - rangeMinimum),
+                       0.0F,
+                       1.0F);
+    };
+    const auto valueForY = [&](const WaterRunGraphSeries& lane, float y) {
+        const auto [rangeMinimum, rangeMaximum] = seriesRange(lane);
+        const float normalized = std::clamp(
+            (axisY - y) / graphHeight,
+            0.0F,
+            1.0F);
+        return std::lerp(rangeMinimum, rangeMaximum, normalized);
+    };
+
+    // Sorted key snapshots drive every hit test and all drawing; they are
+    // rebuilt after a mutation so the frame renders the post-edit state.
+    std::vector<std::vector<WaterSettingKey>> sortedKeys;
+    const auto rebuildSortedKeys = [&] {
+        sortedKeys.assign(series.size(), {});
+        for (std::size_t index = 0U; index < series.size(); ++index) {
+            const auto* track = series[index].track;
+            if (track == nullptr || !track->active) {
+                continue;
+            }
+            sortedKeys[index] = track->keys;
+            std::stable_sort(
+                sortedKeys[index].begin(),
+                sortedKeys[index].end(),
+                [](const auto& left, const auto& right) {
+                    return left.position < right.position;
+                });
+        }
+    };
+    rebuildSortedKeys();
+
+    const auto seriesValueAt =
+        [&](std::size_t index, float position) -> std::optional<float> {
+        const auto& lane = series[index];
+        if (!sortedKeys[index].empty() && lane.track != nullptr) {
+            return invisible_places::water::EvaluateWaterKeyedSettingTrack(
+                *lane.track,
+                position);
+        }
+        return std::nullopt;
+    };
+    const auto interpolationForNewKey =
+        [&](std::size_t index, float position) {
+            const auto& keys = sortedKeys[index];
+            WaterScenarioInterpolation interpolation =
+                WaterScenarioInterpolation::Smooth;
+            for (const auto& key : keys) {
+                if (key.position <= position + kKeyTolerance) {
+                    interpolation = key.interpolation;
+                } else {
+                    break;
+                }
+            }
+            if (!keys.empty() &&
+                keys.front().position > position + kKeyTolerance) {
+                interpolation = keys.front().interpolation;
+            }
+            return interpolation;
+        };
+    const auto keyInterpolationAt =
+        [&](std::size_t index, float position) {
+            for (const auto& key : sortedKeys[index]) {
+                if (std::abs(key.position - position) <= kKeyTolerance) {
+                    return key.interpolation;
+                }
+            }
+            return WaterScenarioInterpolation::Smooth;
+        };
+    const auto keyNumberAt =
+        [&](std::size_t index, float position) -> std::size_t {
+        std::size_t number = 0U;
+        for (const auto& key : sortedKeys[index]) {
+            ++number;
+            if (std::abs(key.position - position) <= kKeyTolerance) {
+                return number;
+            }
+        }
+        return 0U;
+    };
+
+    const auto mouse = ImGui::GetIO().MousePos;
+    constexpr float kMarkerHitRadius = 7.0F;
+    constexpr float kDotHitRadius = 6.0F;
+    const bool itemHovered = ImGui::IsItemHovered();
+    const bool inAxisBand =
+        std::abs(mouse.y - axisY) <= kMarkerHitRadius;
+    const bool inGraphArea =
+        itemHovered && mouse.y < axisY - kMarkerHitRadius;
+
+    // Nearest curve dot (2D) takes precedence over the axis marker strip.
+    std::optional<std::size_t> hoveredDotSeries;
+    float hoveredDotPosition = 0.0F;
+    float hoveredDotValue = 0.0F;
+    float hoveredDotDistance = kDotHitRadius;
+    if (itemHovered) {
+        for (std::size_t index = 0U; index < series.size(); ++index) {
+            for (const auto& key : sortedKeys[index]) {
+                const float dx = mouse.x - xForPosition(key.position);
+                const float dy =
+                    mouse.y - yForValue(series[index], key.value);
+                const float distance = std::hypot(dx, dy);
+                if (distance < hoveredDotDistance) {
+                    hoveredDotDistance = distance;
+                    hoveredDotSeries = index;
+                    hoveredDotPosition = key.position;
+                    hoveredDotValue = key.value;
+                }
+            }
+        }
+    }
+
+    // Axis-lane nearest marker with the coincident-key vertical split used
+    // by the Visual Features lanes.
+    std::optional<std::size_t> nearestMarkerSeries;
+    float nearestMarkerPosition = 0.0F;
+    float nearestMarkerDistance = std::numeric_limits<float>::max();
+    for (std::size_t index = 0U; index < series.size(); ++index) {
+        for (const auto& key : sortedKeys[index]) {
+            const float distance =
+                std::abs(mouse.x - xForPosition(key.position));
+            if (distance < nearestMarkerDistance) {
+                nearestMarkerDistance = distance;
+                nearestMarkerSeries = index;
+                nearestMarkerPosition = key.position;
+            }
+        }
+    }
+    if (nearestMarkerSeries.has_value()) {
+        struct TiedMarker {
+            std::size_t seriesIndex = 0U;
+            float position = 0.0F;
+        };
+        std::vector<TiedMarker> tied;
+        for (std::size_t index = 0U; index < series.size(); ++index) {
+            for (const auto& key : sortedKeys[index]) {
+                const float distance =
+                    std::abs(mouse.x - xForPosition(key.position));
+                if (std::abs(distance - nearestMarkerDistance) <= 0.5F) {
+                    tied.push_back({index, key.position});
+                }
+            }
+        }
+        if (tied.size() > 1U) {
+            const float verticalFraction = std::clamp(
+                (mouse.y - (axisY - kCompactLaneHeight * 0.5F)) /
+                    kCompactLaneHeight,
+                0.0F,
+                0.9999F);
+            const auto tiedIndex = std::min<std::size_t>(
+                tied.size() - 1U,
+                static_cast<std::size_t>(
+                    verticalFraction * static_cast<float>(tied.size())));
+            nearestMarkerSeries = tied[tiedIndex].seriesIndex;
+            nearestMarkerPosition = tied[tiedIndex].position;
+        }
+    }
+    const bool markerHovered =
+        itemHovered && !hoveredDotSeries.has_value() &&
+        nearestMarkerSeries.has_value() &&
+        nearestMarkerDistance <= kMarkerHitRadius && inAxisBand;
+
+    const auto matchesSeries = [&](const auto& state, std::size_t index) {
+        return state.scenarioId == scenarioId && state.runId == run->id &&
+               state.feature == series[index].feature &&
+               state.settingId == series[index].settingId;
+    };
+    const auto findMatchingSeries =
+        [&](const auto& state) -> std::optional<std::size_t> {
+        for (std::size_t index = 0U; index < series.size(); ++index) {
+            if (matchesSeries(state, index)) {
+                return index;
+            }
+        }
+        return std::nullopt;
+    };
+
+    const auto scrubTo = [&](float position) {
+        runtimeState->animationPanel.scrubAmount = position;
+        ApplyAnimationScrub(runtimeState);
+    };
+    const auto armDrag = [&](std::size_t index,
+                             float position,
+                             float keyValue,
+                             bool value) {
+        timings.waterRunKeyDrag = WaterRunKeyDragState{
+            .scenarioId = scenarioId,
+            .runId = run->id,
+            .feature = series[index].feature,
+            .settingId = series[index].settingId,
+            .currentPosition = position,
+            .valueDrag = value,
+            .rangeMinimum = series[index].minimum,
+            .rangeMaximum = series[index].maximum,
+            .grabOffsetX = mouse.x - xForPosition(position),
+            .grabOffsetY =
+                value ? mouse.y - yForValue(series[index], keyValue)
+                      : 0.0F,
+        };
+    };
+    const auto openKeyEditor = [&](std::size_t index, float position) {
+        float value = 0.0F;
+        for (const auto& key : sortedKeys[index]) {
+            if (std::abs(key.position - position) <= kKeyTolerance) {
+                value = key.value;
+                break;
+            }
+        }
+        timings.waterRunKeyDrag.reset();
+        timings.waterRunKeyEdit = WaterRunKeyEditState{
+            .scenarioId = scenarioId,
+            .runId = run->id,
+            .feature = series[index].feature,
+            .settingId = series[index].settingId,
+            .sourcePosition = position,
+            .draftPosition = position,
+            .draftValue = value,
+            .draftInterpolation = keyInterpolationAt(index, position),
+            .requestKeyboardFocus = true,
+        };
+        ImGui::OpenPopup("Edit Water Run Key");
+    };
+
+    const auto seriesKeyLabel = [&](std::size_t index, float position) {
+        const auto number = keyNumberAt(index, position);
+        std::string label = run->name;
+        if (number > 0U) {
+            label += " " + std::to_string(number);
+        }
+        label += " — " + series[index].label;
+        return label;
+    };
+
+    bool mutated = false;
+    bool handledInteraction = false;
+    // A first key on an unauthored setting must create its track, which can
+    // reallocate the timeline's settings vector and dangle sibling series
+    // pointers; those adds are deferred until after all drawing.
+    struct PendingKeyAdd {
+        std::size_t seriesIndex = 0U;
+        float position = 0.0F;
+        float value = 0.0F;
+        WaterScenarioInterpolation interpolation =
+            WaterScenarioInterpolation::Smooth;
+    };
+    std::optional<PendingKeyAdd> pendingAdd;
+    const auto addKey = [&](std::size_t index, float position, float value) {
+        const auto& lane = series[index];
+        const float clamped = std::clamp(value, lane.minimum, lane.maximum);
+        const auto interpolation = interpolationForNewKey(index, position);
+        if (lane.track != nullptr && lane.track->active &&
+            !lane.track->keys.empty()) {
+            invisible_places::water::AddOrUpdateWaterSettingKey(
+                lane.track,
+                position,
+                clamped,
+                interpolation);
+            mutated = true;
+        } else {
+            pendingAdd = PendingKeyAdd{
+                .seriesIndex = index,
+                .position = position,
+                .value = clamped,
+                .interpolation = interpolation,
+            };
+        }
+        scrubTo(position);
+    };
+
+    const bool scrubOnKey =
+        [&](float position) {
+            return std::abs(
+                       runtimeState->animationPanel.scrubAmount -
+                       position) <= kKeyTolerance;
+        }(hoveredDotSeries.has_value() ? hoveredDotPosition
+                                       : nearestMarkerPosition);
+
+    if (hoveredDotSeries.has_value()) {
+        const auto index = hoveredDotSeries.value();
+        ImGui::SetTooltip(
+            "%s = %.3g at %.2f s (position %.4f)\nDrag to move the key in time and value; double-click to edit or delete it.",
+            seriesKeyLabel(index, hoveredDotPosition).c_str(),
+            hoveredDotValue,
+            hoveredDotPosition * durationSeconds,
+            hoveredDotPosition);
+        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            handledInteraction = true;
+            openKeyEditor(index, hoveredDotPosition);
+        } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            handledInteraction = true;
+            scrubTo(hoveredDotPosition);
+            armDrag(index, hoveredDotPosition, hoveredDotValue, true);
+        }
+    } else if (markerHovered) {
+        const auto index = nearestMarkerSeries.value();
+        float markerValue = 0.0F;
+        for (const auto& key : sortedKeys[index]) {
+            if (std::abs(key.position - nearestMarkerPosition) <=
+                kKeyTolerance) {
+                markerValue = key.value;
+                break;
+            }
+        }
+        ImGui::SetTooltip(
+            scrubOnKey
+                ? "%s = %.3g at %.2f s — drag this axis marker to retime it; double-click to edit or delete it."
+                : "%s = %.3g at %.2f s — click to select; drag to retime; double-click to jump the animation here.",
+            seriesKeyLabel(index, nearestMarkerPosition).c_str(),
+            markerValue,
+            nearestMarkerPosition * durationSeconds);
+        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            handledInteraction = true;
+            if (scrubOnKey) {
+                openKeyEditor(index, nearestMarkerPosition);
+            } else {
+                scrubTo(nearestMarkerPosition);
+            }
+        } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            handledInteraction = true;
+            scrubTo(nearestMarkerPosition);
+            armDrag(index, nearestMarkerPosition, markerValue, false);
+        }
+    } else if (
+        inGraphArea &&
+        ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        // Double-click in open graph space adds a key to the targeted
+        // series: the only series when there is one, otherwise the curve
+        // (or dashed default guide) nearest to the click.
+        const float position = positionForX(mouse.x);
+        std::optional<std::size_t> target;
+        if (series.size() == 1U) {
+            target = 0U;
+        } else {
+            float nearestDistance = 28.0F;
+            for (std::size_t index = 0U; index < series.size(); ++index) {
+                const float value =
+                    seriesValueAt(index, position)
+                        .value_or(series[index].defaultValue);
+                const float distance =
+                    std::abs(mouse.y - yForValue(series[index], value));
+                if (distance < nearestDistance) {
+                    nearestDistance = distance;
+                    target = index;
+                }
+            }
+        }
+        if (target.has_value()) {
+            handledInteraction = true;
+            addKey(
+                target.value(),
+                position,
+                valueForY(series[target.value()], mouse.y));
+        }
+    }
+
+    // Resolve any live drag against this graph's series.
+    std::optional<std::size_t> draggedSeries =
+        timings.waterRunKeyDrag.has_value()
+            ? findMatchingSeries(timings.waterRunKeyDrag.value())
+            : std::nullopt;
+    if (!handledInteraction && !draggedSeries.has_value() &&
+        ImGui::IsItemActive() &&
+        ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        // Empty surface doubles as a local scrubber, exactly like the
+        // Visual Features lanes.
+        const float scrubPosition = positionForX(mouse.x);
+        if (std::abs(
+                runtimeState->animationPanel.scrubAmount -
+                scrubPosition) >
+            std::numeric_limits<float>::epsilon()) {
+            scrubTo(scrubPosition);
+        }
+    }
+    if (draggedSeries.has_value() && ImGui::IsItemActive() &&
+        ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0F)) {
+        auto& drag = timings.waterRunKeyDrag.value();
+        auto* track = series[draggedSeries.value()].track;
+        if (track != nullptr) {
+            // Captured before any move: the snapshot still holds the key at
+            // its pre-move position, and the dragged key must keep its
+            // authored interpolation through every AddOrUpdate replacement.
+            const auto draggedInterpolation = keyInterpolationAt(
+                draggedSeries.value(),
+                drag.currentPosition);
+            const float destination =
+                positionForX(mouse.x - drag.grabOffsetX);
+            const bool destinationOccupied =
+                invisible_places::water::WaterSettingKeyCountAtPosition(
+                    *track,
+                    destination) > 0U;
+            if (std::abs(destination - drag.currentPosition) >
+                    kKeyTolerance &&
+                !destinationOccupied) {
+                if (invisible_places::water::MoveWaterSettingKey(
+                        track,
+                        drag.currentPosition,
+                        destination)) {
+                    drag.currentPosition = destination;
+                    scrubTo(destination);
+                    mutated = true;
+                }
+            }
+            if (drag.valueDrag) {
+                const float value = std::clamp(
+                    valueForY(
+                        series[draggedSeries.value()],
+                        mouse.y - drag.grabOffsetY),
+                    drag.rangeMinimum,
+                    drag.rangeMaximum);
+                invisible_places::water::AddOrUpdateWaterSettingKey(
+                    track,
+                    drag.currentPosition,
+                    value,
+                    draggedInterpolation);
+                mutated = true;
+            }
+        }
+    }
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
+        draggedSeries.has_value()) {
+        timings.waterRunKeyDrag.reset();
+    }
+    if (mutated) {
+        rebuildSortedKeys();
+    }
+
+    // ---- Drawing ----
+    auto* drawList = ImGui::GetWindowDrawList();
+    drawList->AddRectFilled(
+        minimum,
+        maximum,
+        ImGui::GetColorU32(ImGuiCol_FrameBg),
+        2.0F);
+    drawList->AddRect(
+        minimum,
+        maximum,
+        ImGui::GetColorU32(ImGuiCol_Border),
+        2.0F);
+    const auto colourWithOpacity = [](ImU32 colour, float opacity) {
+        auto converted = ImGui::ColorConvertU32ToFloat4(colour);
+        converted.w *= std::clamp(opacity, 0.0F, 1.0F);
+        return ImGui::ColorConvertFloat4ToU32(converted);
+    };
+
+    const int sampleCount = std::clamp(
+        static_cast<int>(std::ceil(width / 8.0F)),
+        40,
+        160);
+    std::vector<float> samplePositions;
+    samplePositions.reserve(static_cast<std::size_t>(sampleCount));
+    for (int index = 0; index < sampleCount; ++index) {
+        samplePositions.push_back(
+            sampleCount > 1
+                ? static_cast<float>(index) /
+                      static_cast<float>(sampleCount - 1)
+                : 0.0F);
+    }
+
+    std::optional<std::size_t> hoveredCurveSeries;
+    float hoveredCurvePosition = 0.0F;
+    float hoveredCurveValue = 0.0F;
+    float hoveredCurveDistance = 7.0F;
+    for (std::size_t index = 0U; index < series.size(); ++index) {
+        const auto& lane = series[index];
+        if (sortedKeys[index].empty()) {
+            // Unauthored or dormant series: a dashed guide at the default
+            // value marks where the first key lands.
+            const float y = yForValue(lane, lane.defaultValue);
+            const ImU32 guide = colourWithOpacity(lane.colour, 0.40F);
+            for (float x = minimum.x + 2.0F; x < maximum.x - 2.0F;
+                 x += 10.0F) {
+                drawList->AddLine(
+                    ImVec2{x, y},
+                    ImVec2{std::min(x + 6.0F, maximum.x - 2.0F), y},
+                    guide,
+                    1.0F);
+            }
+            continue;
+        }
+        std::vector<float> values;
+        values.reserve(samplePositions.size());
+        for (const float position : samplePositions) {
+            values.push_back(
+                seriesValueAt(index, position)
+                    .value_or(lane.defaultValue));
+        }
+        for (std::size_t sample = 1U; sample < samplePositions.size();
+             ++sample) {
+            drawList->AddLine(
+                ImVec2{
+                    xForPosition(samplePositions[sample - 1U]),
+                    yForValue(lane, values[sample - 1U])},
+                ImVec2{
+                    xForPosition(samplePositions[sample]),
+                    yForValue(lane, values[sample])},
+                lane.colour,
+                1.5F);
+        }
+        if (inGraphArea && !hoveredDotSeries.has_value()) {
+            for (std::size_t sample = 0U;
+                 sample < samplePositions.size();
+                 ++sample) {
+                const float dx =
+                    mouse.x - xForPosition(samplePositions[sample]);
+                const float dy =
+                    mouse.y - yForValue(lane, values[sample]);
+                const float distance = std::hypot(dx, dy);
+                if (distance < hoveredCurveDistance) {
+                    hoveredCurveDistance = distance;
+                    hoveredCurveSeries = index;
+                    hoveredCurvePosition = samplePositions[sample];
+                    hoveredCurveValue = values[sample];
+                }
+            }
+        }
+        for (const auto& key : sortedKeys[index]) {
+            const ImVec2 point{
+                xForPosition(key.position),
+                yForValue(lane, key.value)};
+            const bool isHovered =
+                hoveredDotSeries == index &&
+                std::abs(key.position - hoveredDotPosition) <=
+                    kKeyTolerance;
+            drawList->AddCircleFilled(
+                point,
+                isHovered ? 4.5F : 3.5F,
+                lane.colour);
+            drawList->AddCircle(
+                point,
+                isHovered ? 5.25F : 4.25F,
+                ImGui::GetColorU32(ImGuiCol_Border),
+                0,
+                1.0F);
+        }
+    }
+
+    // Axis lane: shared baseline, per-series markers, playhead.
+    drawList->AddLine(
+        ImVec2{minimum.x, axisY},
+        ImVec2{maximum.x, axisY},
+        ImGui::GetColorU32(ImGuiCol_Border));
+    for (std::size_t index = 0U; index < series.size(); ++index) {
+        for (const auto& key : sortedKeys[index]) {
+            const float x = xForPosition(key.position);
+            const bool isHoveredMarker =
+                markerHovered && nearestMarkerSeries == index &&
+                std::abs(key.position - nearestMarkerPosition) <=
+                    kKeyTolerance;
+            if (isHoveredMarker) {
+                drawList->AddCircleFilled(
+                    ImVec2{x, axisY},
+                    4.25F,
+                    series[index].colour);
+            } else {
+                drawList->AddLine(
+                    ImVec2{x, axisY - 4.5F},
+                    ImVec2{x, axisY + 4.5F},
+                    series[index].colour,
+                    2.0F);
+            }
+            if (std::abs(
+                    runtimeState->animationPanel.scrubAmount -
+                    key.position) <= kKeyTolerance) {
+                drawList->AddLine(
+                    ImVec2{x - 3.0F, axisY - 5.5F},
+                    ImVec2{x + 3.0F, axisY - 5.5F},
+                    ImGui::GetColorU32(ImGuiCol_SliderGrabActive),
+                    1.5F);
+            }
+        }
+    }
+    if (itemHovered && !hoveredDotSeries.has_value() && !markerHovered) {
+        if (hoveredCurveSeries.has_value()) {
+            ImGui::SetTooltip(
+                "%s %.3g at %.2f s (position %.4f)\nEach setting is scaled from its own minimum at the axis to its maximum at the top.\nDouble-click to add a key here.",
+                series[hoveredCurveSeries.value()].label.c_str(),
+                hoveredCurveValue,
+                hoveredCurvePosition * durationSeconds,
+                hoveredCurvePosition);
+        } else if (inGraphArea) {
+            ImGui::SetTooltip(
+                "Animation position %.4f (%.2f s) — click or drag to scrub; double-click to add a key on the nearest setting curve.",
+                positionForX(mouse.x),
+                positionForX(mouse.x) * durationSeconds);
+        } else {
+            ImGui::SetTooltip(
+                "Animation position %.4f (%.2f s) — click or drag to scrub. Drag coloured key markers to retime them.",
+                positionForX(mouse.x),
+                positionForX(mouse.x) * durationSeconds);
+        }
+    }
+    const float scrubX = xForPosition(
+        std::clamp(runtimeState->animationPanel.scrubAmount, 0.0F, 1.0F));
+    const float playheadTipY = graphTopY + 7.0F;
+    drawList->AddLine(
+        ImVec2{scrubX, playheadTipY},
+        ImVec2{scrubX, axisY - 1.0F},
+        IM_COL32(18, 18, 18, 118),
+        1.0F);
+    drawList->AddTriangleFilled(
+        ImVec2{std::max(minimum.x, scrubX - 4.0F), minimum.y + 1.0F},
+        ImVec2{std::min(maximum.x, scrubX + 4.0F), minimum.y + 1.0F},
+        ImVec2{scrubX, playheadTipY},
+        IM_COL32(18, 18, 18, 255));
+
+    // ---- Exact key editor popup ----
+    bool closeEditor = false;
+    auto& editor = timings.waterRunKeyEdit;
+    const std::optional<std::size_t> editorSeries =
+        editor.has_value() ? findMatchingSeries(editor.value())
+                           : std::nullopt;
+    if (ImGui::BeginPopup("Edit Water Run Key")) {
+        if (!editorSeries.has_value() ||
+            series[editorSeries.value()].track == nullptr) {
+            ImGui::CloseCurrentPopup();
+            closeEditor = true;
+        } else {
+            const auto index = editorSeries.value();
+            auto* track = series[index].track;
+            ImGui::Text(
+                "%s",
+                seriesKeyLabel(index, editor->sourcePosition).c_str());
+            ImGui::TextDisabled(
+                "Position is normalized 0 to 1 along the animation.");
+            if (editor->requestKeyboardFocus) {
+                ImGui::SetKeyboardFocusHere();
+                editor->requestKeyboardFocus = false;
+            }
+            ImGui::SetNextItemWidth(180.0F);
+            ImGui::InputFloat(
+                "Position##WaterRunKey",
+                &editor->draftPosition,
+                0.001F,
+                0.01F,
+                "%.4f");
+            if (durationSeconds > 0.0F) {
+                ImGui::SameLine();
+                ImGui::TextDisabled(
+                    "= %.2f s",
+                    std::clamp(editor->draftPosition, 0.0F, 1.0F) *
+                        durationSeconds);
+            }
+            ImGui::SetNextItemWidth(180.0F);
+            ImGui::InputFloat(
+                "Value##WaterRunKey",
+                &editor->draftValue,
+                0.01F,
+                0.1F,
+                "%.3f");
+            ImGui::SameLine();
+            if (invisible_places::water::FindWaterKeyableSetting(
+                    series[index].feature.kind,
+                    series[index].settingId) != nullptr) {
+                ImGui::TextDisabled(
+                    "%.3g to %.3g",
+                    series[index].minimum,
+                    series[index].maximum);
+            } else {
+                ImGui::TextDisabled("any value");
+            }
+            ImGui::SetNextItemWidth(180.0F);
+            DrawTimingInterpolationCombo(
+                "To Next Key##WaterRunKey",
+                &editor->draftInterpolation);
+            const bool validPosition =
+                std::isfinite(editor->draftPosition) &&
+                editor->draftPosition >= 0.0F &&
+                editor->draftPosition <= 1.0F;
+            const bool positionChanged =
+                std::abs(
+                    editor->draftPosition - editor->sourcePosition) >
+                kKeyTolerance;
+            const bool occupied =
+                validPosition && positionChanged &&
+                invisible_places::water::WaterSettingKeyCountAtPosition(
+                    *track,
+                    editor->draftPosition) > 0U;
+            if (!validPosition) {
+                ImGui::TextColored(
+                    ImVec4{1.0F, 0.45F, 0.35F, 1.0F},
+                    "Position must be between 0 and 1.");
+            } else if (occupied) {
+                ImGui::TextColored(
+                    ImVec4{1.0F, 0.45F, 0.35F, 1.0F},
+                    "This setting already has a key there.");
+            } else if (!editor->errorMessage.empty()) {
+                ImGui::TextColored(
+                    ImVec4{1.0F, 0.45F, 0.35F, 1.0F},
+                    "%s",
+                    editor->errorMessage.c_str());
+            }
+            ImGui::BeginDisabled(!validPosition || occupied);
+            const bool apply = ImGui::Button("Apply");
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ImGui::Button("Delete Key")) {
+                (void)invisible_places::water::
+                    RemoveWaterSettingKeysAtPosition(
+                        track,
+                        editor->sourcePosition);
+                mutated = true;
+                ImGui::CloseCurrentPopup();
+                closeEditor = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) {
+                ImGui::CloseCurrentPopup();
+                closeEditor = true;
+            }
+            if (apply && validPosition && !occupied) {
+                bool moveSucceeded = true;
+                if (positionChanged) {
+                    moveSucceeded =
+                        invisible_places::water::MoveWaterSettingKey(
+                            track,
+                            editor->sourcePosition,
+                            editor->draftPosition);
+                }
+                if (moveSucceeded) {
+                    // Registry settings clamp to their slider range; dynamic
+                    // profile tracks have no authored range, so any finite
+                    // value is accepted (their graph frame follows the keys).
+                    const auto* info =
+                        invisible_places::water::FindWaterKeyableSetting(
+                            series[index].feature.kind,
+                            series[index].settingId);
+                    float appliedValue =
+                        std::isfinite(editor->draftValue)
+                            ? editor->draftValue
+                            : series[index].defaultValue;
+                    if (info != nullptr) {
+                        appliedValue = std::clamp(
+                            appliedValue,
+                            info->minimum,
+                            info->maximum);
+                    }
+                    invisible_places::water::AddOrUpdateWaterSettingKey(
+                        track,
+                        editor->draftPosition,
+                        appliedValue,
+                        editor->draftInterpolation);
+                    mutated = true;
+                    scrubTo(editor->draftPosition);
+                    ImGui::CloseCurrentPopup();
+                    closeEditor = true;
+                } else {
+                    editor->errorMessage =
+                        "The key could not be moved; it may have changed.";
+                }
+            }
+        }
+        ImGui::EndPopup();
+    }
+    if (editor.has_value() && editorSeries.has_value() &&
+        (closeEditor || !ImGui::IsPopupOpen("Edit Water Run Key"))) {
+        editor.reset();
+    }
+
+    // Deferred first-key adds run last: creating the track may reallocate
+    // the timeline's settings vector, which would dangle sibling series
+    // pointers used by everything above.
+    if (pendingAdd.has_value()) {
+        const auto& add = pendingAdd.value();
+        auto& lane = series[add.seriesIndex];
+        auto* timeline = lane.timeline;
+        if (timeline != nullptr) {
+            invisible_places::water::WaterKeyedSettingTrack* track =
+                nullptr;
+            for (auto& setting : timeline->settings) {
+                if (setting.settingId == lane.settingId) {
+                    track = &setting;
+                    break;
+                }
+            }
+            if (track == nullptr) {
+                timeline->settings.push_back(
+                    {.settingId = lane.settingId, .active = true});
+                track = &timeline->settings.back();
+            }
+            track->active = true;
+            invisible_places::water::AddOrUpdateWaterSettingKey(
+                track,
+                add.position,
+                add.value,
+                add.interpolation);
+        }
+    }
+    ImGui::PopID();
+}
+
 void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
     using invisible_places::water::WaterFeatureTimingRun;
     using invisible_places::water::WaterKeyedFeatureId;
@@ -50143,6 +51097,25 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                 "in the Water tab afterwards: its sliders key at the "
                 "animation position and its markers show on the top bar.");
 
+            // Session-remembered graph view for this (take, run): which
+            // features are hidden from the timeline graphs below.
+            auto& graphView =
+                [&]() -> TimingsPanelState::WaterRunGraphViewState& {
+                for (auto& view : timings.waterRunGraphViews) {
+                    if (view.scenarioId == scenarioId &&
+                        view.runId == run.id) {
+                        return view;
+                    }
+                }
+                timings.waterRunGraphViews.push_back(
+                    {.scenarioId = scenarioId, .runId = run.id});
+                return timings.waterRunGraphViews.back();
+            }();
+            const auto featureBaseColour = [](std::size_t featureIndex) {
+                return kWaterKeyedSettingColours[
+                    featureIndex % kWaterKeyedSettingColours.size()];
+            };
+
             std::optional<std::size_t> removeFeatureIndex;
             for (std::size_t featureIndex = 0U;
                  featureIndex < run.features.size();
@@ -50157,8 +51130,25 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                 for (const auto& setting : timeline.settings) {
                     keyCount += setting.keys.size();
                 }
-                const bool open = ImGui::TreeNode(
-                    "##feature",
+                const auto hiddenIt = std::find(
+                    graphView.hiddenFeatures.begin(),
+                    graphView.hiddenFeatures.end(),
+                    timeline.feature);
+                bool visible = hiddenIt == graphView.hiddenFeatures.end();
+                if (ImGui::Checkbox("##Visible", &visible)) {
+                    if (visible) {
+                        graphView.hiddenFeatures.erase(hiddenIt);
+                    } else {
+                        graphView.hiddenFeatures.push_back(
+                            timeline.feature);
+                    }
+                }
+                DrawWaterSeepageParameterTooltip(
+                    "Show this feature on the timeline graph below.");
+                ImGui::SameLine();
+                ImGui::TextColored(
+                    ImGui::ColorConvertU32ToFloat4(
+                        featureBaseColour(featureIndex)),
                     "%s — %zu key%s",
                     label.c_str(),
                     keyCount,
@@ -50187,64 +51177,208 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                     }
                     ImGui::EndCombo();
                 }
-                if (open) {
-                    for (auto& setting : timeline.settings) {
-                        const auto* info =
-                            invisible_places::water::FindWaterKeyableSetting(
-                                timeline.feature.kind,
-                                setting.settingId);
-                        const char* settingLabel =
-                            !setting.label.empty()
-                                ? setting.label.c_str()
-                                : info != nullptr
-                                      ? info->label
-                                      : setting.settingId.c_str();
-                        auto ordered = setting.keys;
-                        std::stable_sort(
-                            ordered.begin(),
-                            ordered.end(),
-                            [](const auto& left, const auto& right) {
-                                return left.position < right.position;
-                            });
-                        for (std::size_t keyIndex = 0U;
-                             keyIndex < ordered.size();
-                             ++keyIndex) {
-                            const auto& key = ordered[keyIndex];
-                            ImGui::PushID(static_cast<int>(keyIndex));
-                            ImGui::TextDisabled(
-                                "%s %zu  %s = %.3f at %.2f s",
-                                run.name.c_str(),
-                                keyIndex + 1U,
-                                settingLabel,
-                                key.value,
-                                key.position * durationSeconds);
-                            ImGui::SameLine();
-                            if (ImGui::SmallButton("Go")) {
-                                runtimeState->animationPanel.scrubAmount =
-                                    key.position;
-                                ApplyAnimationScrub(runtimeState);
-                            }
-                            ImGui::SameLine();
-                            if (ImGui::SmallButton("Delete")) {
-                                std::erase_if(
-                                    setting.keys,
-                                    [&](const auto& candidate) {
-                                        return std::abs(
-                                                   candidate.position -
-                                                   key.position) <= 1.0e-5F;
-                                    });
-                            }
-                            ImGui::PopID();
-                        }
-                    }
-                    ImGui::TreePop();
-                }
                 ImGui::PopID();
             }
             if (removeFeatureIndex.has_value()) {
                 run.features.erase(
                     run.features.begin() +
                     static_cast<std::ptrdiff_t>(removeFeatureIndex.value()));
+            }
+
+            // ---- Timeline graphs ----
+            // Builds the graph series for one feature. Split graphs list
+            // every registry setting (unauthored ones as dashed guides that
+            // accept a first key); the combined graph overlays only keyed
+            // tracks so many dashed defaults do not bury the curves.
+            const auto buildFeatureSeries =
+                [&](invisible_places::water::WaterFeatureTimeline& timeline,
+                    std::size_t featureIndex,
+                    bool combined,
+                    std::vector<WaterRunGraphSeries>* out) {
+                    const auto featureLabel = WaterKeyedFeatureDisplayLabel(
+                        *runtimeState,
+                        timeline.feature);
+                    const auto seriesColour =
+                        [&](std::size_t settingIndex) {
+                            return combined
+                                       ? WaterRunSeriesShade(
+                                             featureBaseColour(featureIndex),
+                                             settingIndex)
+                                       : kWaterKeyedSettingColours[
+                                             settingIndex %
+                                             kWaterKeyedSettingColours
+                                                 .size()];
+                        };
+                    const auto trackFor =
+                        [&](std::string_view settingId)
+                        -> invisible_places::water::WaterKeyedSettingTrack* {
+                        for (auto& setting : timeline.settings) {
+                            if (setting.settingId == settingId) {
+                                return &setting;
+                            }
+                        }
+                        return nullptr;
+                    };
+                    std::size_t settingIndex = 0U;
+                    for (const auto& info :
+                         invisible_places::water::WaterKeyableSettings(
+                             timeline.feature.kind)) {
+                        auto* track = trackFor(info.id);
+                        const bool keyed = track != nullptr &&
+                                           track->active &&
+                                           !track->keys.empty();
+                        if (combined && !keyed) {
+                            ++settingIndex;
+                            continue;
+                        }
+                        out->push_back(WaterRunGraphSeries{
+                            .feature = timeline.feature,
+                            .settingId = std::string{info.id},
+                            .label = combined
+                                         ? featureLabel + " · " + info.label
+                                         : std::string{info.label},
+                            .colour = seriesColour(settingIndex),
+                            .track = track,
+                            .timeline = &timeline,
+                            .minimum = info.minimum,
+                            .maximum = info.maximum,
+                            .defaultValue = info.defaultValue,
+                        });
+                        ++settingIndex;
+                    }
+                    // Dynamic profile tracks carry their own labels and no
+                    // registry range; they join once keyed, framed by their
+                    // padded key extents.
+                    for (auto& setting : timeline.settings) {
+                        if (invisible_places::water::FindWaterKeyableSetting(
+                                timeline.feature.kind,
+                                setting.settingId) != nullptr) {
+                            continue;
+                        }
+                        if (!setting.active || setting.keys.empty()) {
+                            continue;
+                        }
+                        float minimum = std::numeric_limits<float>::max();
+                        float maximum = std::numeric_limits<float>::lowest();
+                        for (const auto& key : setting.keys) {
+                            minimum = std::min(minimum, key.value);
+                            maximum = std::max(maximum, key.value);
+                        }
+                        const float magnitude = std::max(
+                            std::abs(minimum),
+                            std::abs(maximum));
+                        if (maximum - minimum <=
+                            std::max(1.0e-6F, magnitude * 1.0e-6F)) {
+                            const float padding =
+                                std::max(1.0e-3F, magnitude * 0.05F);
+                            minimum -= padding;
+                            maximum += padding;
+                        }
+                        const std::string settingLabel =
+                            !setting.label.empty() ? setting.label
+                                                   : setting.settingId;
+                        out->push_back(WaterRunGraphSeries{
+                            .feature = timeline.feature,
+                            .settingId = setting.settingId,
+                            .label = combined
+                                         ? featureLabel + " · " +
+                                               settingLabel
+                                         : settingLabel,
+                            .colour = seriesColour(settingIndex),
+                            .track = &setting,
+                            .timeline = &timeline,
+                            .minimum = minimum,
+                            .maximum = maximum,
+                            .defaultValue =
+                                std::midpoint(minimum, maximum),
+                        });
+                        ++settingIndex;
+                    }
+                };
+
+            ImGui::SeparatorText("Timeline");
+            if (ImGui::Checkbox(
+                    "Split Graphs",
+                    &timings.waterRunGraphSplit)) {
+                timings.waterRunKeyDrag.reset();
+            }
+            DrawWaterSeepageParameterTooltip(
+                "On: one editable graph per visible feature, listing every "
+                "keyable setting (dashed line = no keys yet). Off: every "
+                "visible feature's keyed settings overlaid on one shared "
+                "graph. Use the checkboxes above to choose the visible "
+                "features. Double-click a graph to add a key, drag curve "
+                "points to move them, double-click a point to edit or "
+                "delete it.");
+            std::vector<std::size_t> visibleFeatures;
+            for (std::size_t featureIndex = 0U;
+                 featureIndex < run.features.size();
+                 ++featureIndex) {
+                if (std::find(
+                        graphView.hiddenFeatures.begin(),
+                        graphView.hiddenFeatures.end(),
+                        run.features[featureIndex].feature) ==
+                    graphView.hiddenFeatures.end()) {
+                    visibleFeatures.push_back(featureIndex);
+                }
+            }
+            if (run.features.empty()) {
+                ImGui::TextDisabled(
+                    "Add a feature above to start keying this run.");
+            } else if (visibleFeatures.empty()) {
+                ImGui::TextDisabled(
+                    "Every feature is hidden. Tick a feature above to see "
+                    "its graph.");
+            } else if (timings.waterRunGraphSplit) {
+                for (const std::size_t featureIndex : visibleFeatures) {
+                    auto& timeline = run.features[featureIndex];
+                    ImGui::PushID(static_cast<int>(featureIndex));
+                    ImGui::TextColored(
+                        ImGui::ColorConvertU32ToFloat4(
+                            featureBaseColour(featureIndex)),
+                        "%s",
+                        WaterKeyedFeatureDisplayLabel(
+                            *runtimeState,
+                            timeline.feature)
+                            .c_str());
+                    std::vector<WaterRunGraphSeries> featureSeries;
+                    buildFeatureSeries(
+                        timeline,
+                        featureIndex,
+                        false,
+                        &featureSeries);
+                    DrawWaterRunTimingGraph(
+                        "##WaterRunFeatureGraph",
+                        runtimeState,
+                        scenarioId,
+                        &run,
+                        featureSeries,
+                        durationSeconds);
+                    ImGui::PopID();
+                }
+            } else {
+                std::vector<WaterRunGraphSeries> combinedSeries;
+                for (const std::size_t featureIndex : visibleFeatures) {
+                    buildFeatureSeries(
+                        run.features[featureIndex],
+                        featureIndex,
+                        true,
+                        &combinedSeries);
+                }
+                if (combinedSeries.empty()) {
+                    ImGui::TextDisabled(
+                        "No keys on the visible features yet. Turn on "
+                        "Split Graphs to add first keys here, or key a "
+                        "slider in the Water tab.");
+                } else {
+                    DrawWaterRunTimingGraph(
+                        "##WaterRunCombinedGraph",
+                        runtimeState,
+                        scenarioId,
+                        &run,
+                        combinedSeries,
+                        durationSeconds);
+                }
             }
         }
         EndPanelSection();
@@ -58673,13 +59807,9 @@ void DrawWaterKeyMarkerStrip(
     const invisible_places::water::WaterFeatureTimeline& timeline,
     ImVec2 barMin,
     ImVec2 barMax) {
-    static constexpr std::array<ImU32, 5> kSettingColours{
-        IM_COL32(240, 173, 78, 255),
-        IM_COL32(102, 187, 227, 255),
-        IM_COL32(148, 214, 132, 255),
-        IM_COL32(222, 134, 190, 255),
-        IM_COL32(196, 196, 120, 255),
-    };
+    // One palette with the Timings-tab run graphs so a setting keeps its
+    // colour between the top bar and the run timeline.
+    const auto& kSettingColours = kWaterKeyedSettingColours;
     const float barWidth = std::max(1.0F, barMax.x - barMin.x);
     constexpr float kStripHeight = 9.0F;
     ImGui::SetCursorScreenPos(ImVec2{barMin.x, barMax.y + 2.0F});
