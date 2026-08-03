@@ -1126,6 +1126,8 @@ TEST_CASE("Shoreline profile libraries round-trip while legacy files retain thei
   using invisible_places::serialization::WaterSourcesDocument;
 
   auto defaultSettings = CalmPointCloudShorelineWaveSettings();
+  defaultSettings.algorithm =
+      PointCloudShorelineWaveAlgorithm::ContinuousBands;
   defaultSettings.foamFronts.phase = 0.37F;
   defaultSettings.heightFoam.runupZ = 2.12F;
 
@@ -1162,6 +1164,8 @@ TEST_CASE("Shoreline profile libraries round-trip while legacy files retain thei
   INFO(errorMessage);
   REQUIRE(loadedProject.has_value());
   REQUIRE(loadedProject->waterShorelineDefaultSettings.has_value());
+  CHECK(loadedProject->waterShorelineDefaultSettings->algorithm ==
+        PointCloudShorelineWaveAlgorithm::ContinuousBands);
   CHECK(
       loadedProject->waterShorelineDefaultSettings->foamFronts.phase ==
       Catch::Approx(0.37F));
@@ -1222,6 +1226,8 @@ TEST_CASE("Shoreline profile libraries round-trip while legacy files retain thei
   REQUIRE(loadedSources.has_value());
   CHECK(loadedSources->schemaVersion == kWaterSourcesDocumentSchemaVersion);
   REQUIRE(loadedSources->shorelineDefaultSettings.has_value());
+  CHECK(loadedSources->shorelineDefaultSettings->algorithm ==
+        PointCloudShorelineWaveAlgorithm::ContinuousBands);
   CHECK(loadedSources->shorelineDefaultSettings->foamFronts.boundaryZ ==
         Catch::Approx(1.595F));
   REQUIRE(loadedSources->shorelineProfiles.size() == 1U);

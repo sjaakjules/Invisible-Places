@@ -1569,6 +1569,12 @@ TEST_CASE("Height Foam shoreline keeps independent defaults and clamps break hei
     CHECK(PointCloudStyleHasShorelineWaveRegion(style));
     CHECK(style.shorelineSpeed == Catch::Approx(0.55F));
 
+    style.shorelineWaveAlgorithm = PointCloudShorelineWaveAlgorithm::ContinuousBands;
+    CHECK(PointCloudStyleHasActiveShorelineWaves(style));
+    CHECK(PointCloudStyleHasShorelineWaveRegion(style));
+    style.shorelineSpeed = 0.0F;
+    CHECK_FALSE(PointCloudStyleHasActiveShorelineWaves(style));
+
     style.shorelineWaveEnabled = false;
     CHECK_FALSE(PointCloudStyleHasShorelineWaveRegion(style));
 }
@@ -1629,7 +1635,7 @@ TEST_CASE("Shoreline profiles copy only water settings and Calm matches the auth
     CHECK(extracted.heightFoam.offshoreFoamStrength == Catch::Approx(0.43F));
 }
 
-TEST_CASE("Sand-cloud shoreline waves use dedicated foam helper", "[water][shoreline][shader]") {
+TEST_CASE("Sand-cloud shoreline waves use dedicated foam helpers", "[water][shoreline][shader]") {
     const auto shaderPath = DataRoot().parent_path() / "shaders" / "pointcloud_sparse_ripple.glsl";
     std::ifstream input{shaderPath};
     REQUIRE(input.good());
@@ -1639,7 +1645,7 @@ TEST_CASE("Sand-cloud shoreline waves use dedicated foam helper", "[water][shore
 
     const auto helperPos = shader.find("float SandCloudShorelineWaveValue(");
     REQUIRE(helperPos != std::string::npos);
-    const auto helperEnd = shader.find("\n}\n\nfloat HeightFoamShorelineWaveValue", helperPos);
+    const auto helperEnd = shader.find("\n}\n\nfloat ContinuousBandShorelineWaveValue", helperPos);
     REQUIRE(helperEnd != std::string::npos);
     const auto helperBody = shader.substr(helperPos, helperEnd - helperPos);
     CHECK(helperBody.find("const float t = phase;") != std::string::npos);
@@ -1663,6 +1669,33 @@ TEST_CASE("Sand-cloud shoreline waves use dedicated foam helper", "[water][shore
     CHECK(helperBody.find("const float peakCarryFade") != std::string::npos);
     CHECK(helperBody.find("edgeValue * edgeIntroduce") != std::string::npos);
 
+    const auto continuousBandsPos = shader.find("float ContinuousBandShorelineWaveValue(");
+    REQUIRE(continuousBandsPos != std::string::npos);
+    const auto continuousBandsEnd = shader.find(
+        "\n}\n\nfloat HeightFoamShorelineWaveValue",
+        continuousBandsPos);
+    REQUIRE(continuousBandsEnd != std::string::npos);
+    const auto continuousBandsBody = shader.substr(
+        continuousBandsPos,
+        continuousBandsEnd - continuousBandsPos);
+    CHECK(continuousBandsBody.find("const float activeBandCount = mix(2.0, 4.0, density01);") !=
+          std::string::npos);
+    // The bay-beach jostle contract: overlapping fronts on smooth staggered
+    // cycles, a vigour swell choosing crash-versus-fade, and a run-in wash
+    // zone — with no lifecycle reset or inactive branch anywhere.
+    CHECK(continuousBandsBody.find("const float runInDepth") != std::string::npos);
+    CHECK(continuousBandsBody.find("slot * 2.399963") != std::string::npos);
+    CHECK(continuousBandsBody.find("const float approach") != std::string::npos);
+    CHECK(continuousBandsBody.find("const float vigor") != std::string::npos);
+    CHECK(continuousBandsBody.find("const float crashDepth") != std::string::npos);
+    CHECK(continuousBandsBody.find("const float waveCenter = mix(startDepth, crashDepth, approach);") !=
+          std::string::npos);
+    CHECK(continuousBandsBody.find("const float washFoam") != std::string::npos);
+    CHECK(continuousBandsBody.find("const float frontLocalCoordinate = front;") !=
+          std::string::npos);
+    CHECK(continuousBandsBody.find("fract(") == std::string::npos);
+    CHECK(continuousBandsBody.find("continue;") == std::string::npos);
+
     const auto heightFoamPos = shader.find("float HeightFoamShorelineWaveValue(");
     REQUIRE(heightFoamPos != std::string::npos);
     const auto heightFoamEnd = shader.find("\n}\n\nfloat RippleWetSheenValue", heightFoamPos);
@@ -1682,8 +1715,10 @@ TEST_CASE("Sand-cloud shoreline waves use dedicated foam helper", "[water][shore
     REQUIRE(evaluateEnd != std::string::npos);
     const auto evaluateBody = shader.substr(evaluatePos, evaluateEnd - evaluatePos);
     CHECK(evaluateBody.find("SandCloudShorelineWaveValue(") != std::string::npos);
+    CHECK(evaluateBody.find("ContinuousBandShorelineWaveValue(") != std::string::npos);
     CHECK(evaluateBody.find("HeightFoamShorelineWaveValue(") != std::string::npos);
     CHECK(evaluateBody.find("shorelineWaveControl.z == 1u") != std::string::npos);
+    CHECK(evaluateBody.find("shorelineWaveControl.z == 2u") != std::string::npos);
     CHECK(evaluateBody.find("RippleTideBandsValue(") == std::string::npos);
 }
 

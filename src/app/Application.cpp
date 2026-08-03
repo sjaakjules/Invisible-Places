@@ -2025,6 +2025,11 @@ struct WaterWorkflowState {
     std::vector<std::vector<std::uint32_t>> pathEditUndoHiddenBranchIds;
     std::unordered_set<std::size_t> flowBranchMaskedSessionIndices;
     WaterRegionFeature activeRegionFeature = WaterRegionFeature::None;
+    // True only on frames where the Water panel's Seepage sub-tab is the one
+    // drawn (reset with activeRegionFeature each frame). Seepage node markers
+    // are pickable and movable only while it is set; on other tabs they draw
+    // dimmed and ignore the mouse.
+    bool seepageTabActive = false;
     WaterRegionEditorState regionEditor{};
     std::optional<std::size_t> selectedEmitterIndex;
     std::optional<std::size_t> selectedManualFlowPathIndex;
@@ -36425,6 +36430,7 @@ void DrawWaterSeepageOverlay(
     };
     runtimeState->water.seepageSurfaceGuideWarning.clear();
     const bool canPick =
+        runtimeState->water.seepageTabActive &&
         !RenderSetupAuthoringLocked(runtimeState) &&
         IsMouseOverRenderViewport(viewport) &&
         !viewport.UiWantsMouseCapture() &&
@@ -36468,13 +36474,26 @@ void DrawWaterSeepageOverlay(
         const bool moving = runtimeState->water.movingSeepageNodeIndex.has_value() &&
                             runtimeState->water.movingSeepageNodeIndex.value() == index;
         const ImVec2 center = projected->screen;
-        const float radius = selected ? 8.0F : (inSelectionSet ? 6.5F : 5.5F);
+        // Outside the Seepage tab the markers stay as quiet location hints:
+        // dimmed, slightly smaller, and never mouse-interactive.
+        const bool seepageTabActive = runtimeState->water.seepageTabActive;
+        const float offTabScale = seepageTabActive ? 1.0F : 0.42F;
+        const auto dimmed = [&](ImU32 colour) {
+            auto converted = ImGui::ColorConvertU32ToFloat4(colour);
+            converted.w *= offTabScale;
+            return ImGui::ColorConvertFloat4ToU32(converted);
+        };
+        const float radius =
+            (selected ? 8.0F : (inSelectionSet ? 6.5F : 5.5F)) *
+            (seepageTabActive ? 1.0F : 0.85F);
         const float pulse = moving ? static_cast<float>(0.75 + 0.25 * std::sin(ImGui::GetTime() * 8.0)) : 1.0F;
-        const ImU32 fill = selected ? IM_COL32(255, 255, 255, 250)
-                                    : (inSelectionSet ? IM_COL32(196, 244, 226, 245)
-                                                      : IM_COL32(72, 214, 178, 240));
-        const ImU32 edge = IM_COL32(145, 255, 226, inSelectionSet ? 255 : 210);
-        drawList->AddCircleFilled(center, (radius + 3.5F) * pulse, IM_COL32(0, 0, 0, 145), 28);
+        const ImU32 fill = dimmed(
+            selected ? IM_COL32(255, 255, 255, 250)
+                     : (inSelectionSet ? IM_COL32(196, 244, 226, 245)
+                                       : IM_COL32(72, 214, 178, 240)));
+        const ImU32 edge =
+            dimmed(IM_COL32(145, 255, 226, inSelectionSet ? 255 : 210));
+        drawList->AddCircleFilled(center, (radius + 3.5F) * pulse, dimmed(IM_COL32(0, 0, 0, 145)), 28);
         drawList->AddCircleFilled(center, radius * pulse, fill, 28);
         drawList->AddCircle(center, (radius + 2.5F) * pulse, edge, 28, 2.0F);
         ++runtimeState->water.seepageOverlayMarkerCount;
@@ -37020,9 +37039,12 @@ void DrawWaterSeepageOverlay(
     std::optional<glm::vec3> gizmoPoint;
     if (water.seepageGizmoDrag.kind != ManualFlowPathGizmoDragKind::None) {
         gizmoPoint = ToGlm(water.seepageNodes[water.seepageGizmoDragIndex].position);
-    } else if (water.selectedSeepageNodeIndex.has_value() &&
+    } else if (water.seepageTabActive &&
+               water.selectedSeepageNodeIndex.has_value() &&
                water.selectedSeepageNodeIndex.value() < water.seepageNodes.size() &&
                !water.movingSeepageNodeIndex.has_value()) {
+        // The translation gizmo belongs to the Seepage tab; on other tabs
+        // the selected node keeps only its dimmed marker.
         gizmoPoint = ToGlm(
             water.seepageNodes[water.selectedSeepageNodeIndex.value()].position);
     }
@@ -39233,10 +39255,25 @@ bool DrawPointCloudShorelineWavesSection(PreviewLayerSession* session) {
     changed |= ImGui::Checkbox("Enable Shoreline Waves", &style.shorelineWaveEnabled);
 
     if (style.shorelineWaveEnabled) {
-        int algorithmIndex = static_cast<int>(style.shorelineWaveAlgorithm);
-        const char* algorithms[] = {"Foam Fronts (Current)", "Height Foam"};
+        constexpr std::array kAlgorithms{
+            PointCloudShorelineWaveAlgorithm::FoamFronts,
+            PointCloudShorelineWaveAlgorithm::ContinuousBands,
+            PointCloudShorelineWaveAlgorithm::HeightFoam,
+        };
+        const auto selectedAlgorithm = std::find(
+            kAlgorithms.begin(),
+            kAlgorithms.end(),
+            style.shorelineWaveAlgorithm);
+        int algorithmIndex = selectedAlgorithm != kAlgorithms.end()
+                                 ? static_cast<int>(std::distance(kAlgorithms.begin(), selectedAlgorithm))
+                                 : 0;
+        const char* algorithms[] = {
+            "Foam Fronts (Current)",
+            "Continuous Bands",
+            "Height Foam",
+        };
         if (DrawRightAlignedCombo("Algorithm", &algorithmIndex, algorithms, IM_ARRAYSIZE(algorithms))) {
-            style.shorelineWaveAlgorithm = static_cast<PointCloudShorelineWaveAlgorithm>(algorithmIndex);
+            style.shorelineWaveAlgorithm = kAlgorithms[static_cast<std::size_t>(algorithmIndex)];
             changed = true;
         }
 
@@ -48019,6 +48056,7 @@ void DrawWaterPanel(
             ImGui::BeginDisabled();
         }
         water.activeRegionFeature = WaterRegionFeature::None;
+        water.seepageTabActive = true;
         {
             const auto* selectedNode = SelectedWaterSeepageNode(*runtimeState);
             if (selectedNode != nullptr) {
@@ -61513,6 +61551,7 @@ void DrawControlsWindow(
     sidePanel.revealAmount = 1.0F;
     sidePanel.mode = invisible_places::ui::SidePanelMode::Expanded;
     runtimeState->water.activeRegionFeature = WaterRegionFeature::None;
+    runtimeState->water.seepageTabActive = false;
 
     const ImVec2 controlsSize{540.0F, 780.0F};
     ImGuiWindowClass controlsWindowClass;
@@ -61762,12 +61801,14 @@ bool CtrlClickMoveSelectedViewportEntity(
     }
     auto& water = runtimeState->water;
     if (!RenderSetupAuthoringLocked(runtimeState)) {
-        if (water.selectedSeepageNodeIndex.has_value() &&
+        if (water.seepageTabActive &&
+            water.selectedSeepageNodeIndex.has_value() &&
             water.selectedSeepageNodeIndex.value() < water.seepageNodes.size()) {
             // A Ctrl+click that lands on a drawn Seepage marker toggles
             // viewport multi-selection in DrawWaterSeepageOverlay later this
             // frame, so the move must decline it; only clicks away from every
-            // marker reposition the primary node.
+            // marker reposition the primary node. Off the Seepage tab the
+            // whole branch stands down with the rest of the node picking.
             const auto matrices =
                 runtimeState->camera.Matrices(CurrentAspectRatio(viewport));
             for (std::size_t index = 0;
@@ -61917,6 +61958,7 @@ void UpdateCameraFromInput(
         return;
     }
     if (waterAuthoringAllowed &&
+        runtimeState->water.seepageTabActive &&
         runtimeState->water.movingSeepageNodeIndex.has_value() &&
         renderViewportHovered &&
         !viewport.UiWantsMouseCapture() &&
@@ -61926,6 +61968,7 @@ void UpdateCameraFromInput(
         return;
     }
     if (waterAuthoringAllowed &&
+        runtimeState->water.seepageTabActive &&
         runtimeState->water.seepagePlacementArmed &&
         renderViewportHovered &&
         !viewport.UiWantsMouseCapture() &&

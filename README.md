@@ -49,7 +49,7 @@ The central idea is that data already present in the point cloud can become visu
 - Includes colormaps such as Viridis, Plasma, Inferno, Magma, Cividis, Turbo, topographic, land-surface, fire, ice, and high-contrast ramps.
 - Includes point-cloud stylisation controls for watercolor, living wash, cartoon ink, brush dabs, pencil hatch, grainy pigment, and related painterly looks.
 - Includes folder-level multi-cloud visuals so grouped ROCK/SAND/VEG scenes are edited as one cloud. Authored values stay on a 1 mm baseline while per-role footprint and measured-count coverage compensation makes 2/3/5 mm display bundles retain a similar appearance.
-- Includes SAND-only shader shoreline waves for grouped coastal scenes. These use the editable boundary height, defaulting to `z = 1.55 m`, and do not require region polygons or CPU point membership.
+- Includes SAND-only shader shoreline waves for grouped coastal scenes, with crashing Foam Fronts, an always-active Continuous Bands bay of overlapping gentle crashes and mid-band fades, and height-driven foam. These use the editable boundary height, defaulting to `z = 1.55 m`, and do not require region polygons or CPU point membership.
 - Supports eye-dome lighting for depth readability outside the Fast Basic path.
 - Uses deterministic point sampling and spatial sampling so large clouds can be reduced predictably.
 - Has automatic preview LOD during camera navigation or animation playback.

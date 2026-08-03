@@ -133,7 +133,8 @@ enum class PointCloudMaterialVariant {
 
 enum class PointCloudShorelineWaveAlgorithm {
     FoamFronts,
-    HeightFoam
+    HeightFoam,
+    ContinuousBands
 };
 
 struct PointCloudHeightFoamShorelineSettings {
@@ -165,8 +166,10 @@ struct PointCloudHeightFoamShorelineSettings {
 };
 
 // A profile-sized copy of the legacy Foam Fronts fields that remain flattened
-// on PointCloudStyleState for shader/persistence compatibility. Keeping this
-// bank separate lets named Shoreline profiles preserve both algorithms while
+// on PointCloudStyleState for shader/persistence compatibility. Continuous
+// Bands intentionally shares this control bank because it is an alternate
+// motion model for the same foam look. Keeping the bank separate from Height
+// Foam lets named Shoreline profiles preserve both control families while
 // changing only the water settings on an existing point visual.
 struct PointCloudFoamFrontsShorelineSettings {
     float boundaryZ = 1.55F;

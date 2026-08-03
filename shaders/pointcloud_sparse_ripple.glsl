@@ -708,6 +708,192 @@ float SandCloudShorelineWaveValue(vec2 uv, float shoreDistance, float edgeBlendW
     return clamp(combined, 0.0, 1.0);
 }
 
+float ContinuousBandShorelineWaveValue(
+    vec2 uv,
+    float shoreDistance,
+    float reachMeters,
+    float wavelength,
+    float warp,
+    float turbulence,
+    float density,
+    float seed,
+    float phase) {
+    const float safeReach = max(0.001, reachMeters);
+    const float safeWavelength = max(0.002, wavelength);
+    const float density01 = clamp(density, 0.0, 1.0);
+    const float turbulence01 = clamp(turbulence, 0.0, 1.0);
+    const float clampedWarp = clamp(warp, 0.0, 2.0);
+    const float alongShore = uv.y;
+
+    // Bay-beach jostle built from the Foam Fronts wave character: two to four
+    // overlapping fronts share the whole reach instead of oscillating inside
+    // fixed lanes. Every front runs a smooth periodic gather-push-recede
+    // cycle with no inactive window and no phase reset, so somewhere along
+    // the beach foam is always moving. A slow per-front vigour swell decides
+    // how far each cycle reaches: vigorous cycles crash beside the waterline
+    // and wash into the upper run-in zone, tired ones dissolve inside the
+    // deeper jostling water while their neighbours keep moving.
+    const float activeBandCount = mix(2.0, 4.0, density01);
+    // Upper share of the reach where finished crashes wash out; everything
+    // below it is the jostling body of the bay.
+    const float runInDepth = safeReach * 0.30;
+    const float frontWidth = max(
+        safeWavelength * (0.052 + turbulence01 * 0.030),
+        0.003);
+    const float foamReach = max(
+        safeWavelength * (0.55 + turbulence01 * 0.30),
+        frontWidth * 5.0);
+    const float lateralScale = max(safeWavelength * 1.35, 0.012);
+    const float waveRate = 0.062 + density01 * 0.034;
+    const float seedAngle = RippleHash(seed * 0.071 + 19.0) * kRippleTwoPi;
+    float combined = 0.0;
+
+    for (int bandIndex = 0; bandIndex < 4; ++bandIndex) {
+        const float slot = float(bandIndex);
+        const float bandWeight = 1.0 - smoothstep(
+            activeBandCount - 0.35,
+            activeBandCount + 0.15,
+            slot + 0.5);
+        const float slotSeed = seed + slot * 53.17;
+        // Incommensurate cycle speeds plus a golden-angle stagger keep the
+        // fronts from clumping into one shared quiet moment.
+        const float speedScale =
+            mix(0.72, 1.37, RippleHash(slotSeed * 0.097 + 23.0));
+        const float waveAngle =
+            phase * waveRate * speedScale * kRippleTwoPi +
+            seedAngle + slot * 2.399963;
+        // Alongshore lead and lag: one stretch of beach crashes while a
+        // neighbouring stretch is still gathering, so fronts cross and
+        // jostle instead of arriving as unbroken parallel bands.
+        const float lateralPhase =
+            sin((alongShore / (lateralScale * 3.1)) + seedAngle + slot * 1.91) *
+                (0.55 + clampedWarp * 0.50) +
+            sin(
+                (alongShore / max(safeWavelength * 2.3, 0.02)) -
+                seedAngle * 0.73 + slot * 2.37) *
+                (0.22 + turbulence01 * 0.30);
+        const float cycleAngle = waveAngle + lateralPhase;
+        // Smooth asymmetric cycle: long gather, quicker push, lingering
+        // recede. The second harmonic sharpens the push without introducing
+        // any lifecycle reset, and the value and velocity agree everywhere.
+        const float approach = clamp(
+            0.5 - 0.5 * cos(cycleAngle) - 0.12 * sin(cycleAngle * 2.0),
+            0.0,
+            1.0);
+        // Slow vigour swell, also varying along the shore, chooses between
+        // crashing near the waterline and fading mid-band this cycle.
+        const float vigor = 0.5 + 0.5 * sin(
+            waveAngle * 0.237 + slotSeed * 0.61 +
+            sin(alongShore / (lateralScale * 5.7) + slotSeed) * 0.8);
+        const float crashDepth =
+            mix(runInDepth * 1.30, runInDepth * 0.12, vigor);
+        const float startDepth =
+            safeReach * mix(0.66, 0.98, RippleHash(slotSeed * 0.061 + 47.0));
+        const float waveCenter = mix(startDepth, crashDepth, approach);
+
+        const float scallopNoise = RippleSmoothBlockNoise(
+            vec2(
+                alongShore + slot * safeWavelength * 0.37,
+                seed * 0.13 + slot * 0.41),
+            max(safeWavelength * 0.48, 0.008),
+            seed,
+            151.0 + slot * 19.0);
+        const float frontWarpSignal = clamp(
+            sin((alongShore / lateralScale) + seed * 1.17 + slot * 1.91) * 0.62 +
+                sin(
+                    (alongShore / max(safeWavelength * 0.58, 0.006)) -
+                    seed * 0.73 + slot * 2.37) *
+                    0.28 +
+                (scallopNoise - 0.5) * 1.15,
+            -1.0,
+            1.0);
+        const float frontWarp = frontWarpSignal *
+            safeWavelength * (0.045 + clampedWarp * 0.060 + turbulence01 * 0.035);
+        const float front = max(0.0, shoreDistance) + frontWarp - waveCenter;
+        const float frontLocalCoordinate = front;
+
+        // Front-local grain follows each band through both directions of the
+        // oscillation instead of being resampled at a lifecycle boundary.
+        const vec2 waveFrontStreakUv = vec2(
+            frontLocalCoordinate * (2.05 + turbulence01 * 0.45) + slot * 0.19,
+            alongShore * (0.11 + turbulence01 * 0.05) +
+                sin(
+                    frontLocalCoordinate / max(safeWavelength * 0.55, 0.006) +
+                    slotSeed * 0.17) *
+                    safeWavelength * 0.045 +
+                slot * 0.31);
+        const float waveFrontStreakNoise = RippleSmoothBlockNoise(
+            waveFrontStreakUv,
+            max(safeWavelength * 0.20, 0.006),
+            seed,
+            203.0 + slot * 23.0);
+        const float foamMottleNoise = RippleSmoothBlockNoise(
+            vec2(
+                frontLocalCoordinate * 0.54 + slot * 0.19,
+                alongShore * 0.62 + slot * 0.31),
+            max(safeWavelength * 0.42, 0.007),
+            seed,
+            227.0 + slot * 29.0);
+        const float foamNoise = RippleSmoothBlockNoise(
+            mix(
+                vec2(
+                    frontLocalCoordinate * 0.54 + slot * 0.19,
+                    alongShore * 0.62 + slot * 0.31),
+                waveFrontStreakUv,
+                0.78),
+            max(safeWavelength * 0.24, 0.006),
+            seed,
+            251.0 + slot * 31.0);
+        const float shoreBreakup = smoothstep(
+            0.24,
+            0.92,
+            scallopNoise + turbulence01 * 0.22);
+        const float breakup = smoothstep(
+            0.18,
+            0.96,
+            waveFrontStreakNoise * 0.52 +
+                foamNoise * 0.28 +
+                foamMottleNoise * 0.18 +
+                shoreBreakup * 0.24 +
+                turbulence01 * 0.18);
+        const float foamContinuity = mix(0.72, 1.0, breakup);
+        const float crest = RippleLine(front, frontWidth);
+        const float crestHalo = RippleLine(front, frontWidth * 1.70);
+        const float foamDistance = abs(front);
+        const float surroundingFoam =
+            exp(-foamDistance / max(foamReach * 0.42, 1.0e-4)) *
+            smoothstep(frontWidth * 0.35, frontWidth * 1.70, foamDistance) *
+            (1.0 - smoothstep(foamReach * 0.40, foamReach, foamDistance));
+        // Bright beside the waterline, faint while gathering offshore, and
+        // never fully absent so the bay always carries moving foam.
+        const float crashProximity = smoothstep(
+            runInDepth * 1.8,
+            runInDepth * 0.5,
+            waveCenter);
+        const float crestGain = mix(0.26, 1.0, crashProximity);
+        // Crash wash: foam trailing shoreward of a front that reached the
+        // run-in zone, blooming at the push's peak and draining as the front
+        // recedes (the asymmetric cycle keeps `approach` high just after the
+        // crash, so the wash lingers before it fades).
+        const float washLength = foamReach * (0.7 + 0.8 * vigor);
+        const float washFoam =
+            exp(min(0.0, front) / max(washLength, 1.0e-4)) *
+            smoothstep(frontWidth * 0.35, frontWidth * 1.55, -front) *
+            crashProximity *
+            smoothstep(0.55, 0.90, approach);
+        const float value =
+            (crest * (0.70 + shoreBreakup * 0.22) * foamContinuity * crestGain +
+             crestHalo * (0.08 + density01 * 0.06) * foamContinuity * crestGain +
+             surroundingFoam * (0.24 + density01 * 0.22) * breakup *
+                 mix(0.55, 1.0, crashProximity) +
+             washFoam * (0.34 + density01 * 0.24) * breakup) *
+            bandWeight;
+        combined = max(combined, value);
+    }
+
+    return clamp(combined, 0.0, 1.0);
+}
+
 float HeightFoamShorelineWaveValue(
     vec2 shoreUv,
     float worldZ,
@@ -3021,6 +3207,17 @@ SparseRippleComposite EvaluateShorelineWaveContribution(vec3 worldPosition, vec3
             styleData.shorelineWaveParams5.y,
             styleData.shorelineWaveParams5.z,
             styleData.shorelineWaveParams5.w,
+            float(styleData.shorelineWaveControl.y),
+            timePhase);
+    } else if (styleData.shorelineWaveControl.z == 2u) {
+        pattern = ContinuousBandShorelineWaveValue(
+            vec2(shoreDistance, tangentCoordinate) * patternScale,
+            shoreDistance,
+            reachMeters,
+            wavelength,
+            styleData.shorelineWaveParams2.y,
+            styleData.shorelineWaveParams2.z,
+            styleData.shorelineWaveParams2.w,
             float(styleData.shorelineWaveControl.y),
             timePhase);
     } else {

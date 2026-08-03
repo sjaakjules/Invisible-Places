@@ -643,13 +643,21 @@ const char* PointCloudShorelineWaveAlgorithmName(PointCloudShorelineWaveAlgorith
             return "foam_fronts";
         case PointCloudShorelineWaveAlgorithm::HeightFoam:
             return "height_foam";
+        case PointCloudShorelineWaveAlgorithm::ContinuousBands:
+            return "continuous_bands";
     }
     return "foam_fronts";
 }
 
 PointCloudShorelineWaveAlgorithm ParsePointCloudShorelineWaveAlgorithm(const json& value) {
-    if (value.is_string() && value.get<std::string>() == "height_foam") {
-        return PointCloudShorelineWaveAlgorithm::HeightFoam;
+    if (value.is_string()) {
+        const auto algorithmName = value.get<std::string>();
+        if (algorithmName == "height_foam") {
+            return PointCloudShorelineWaveAlgorithm::HeightFoam;
+        }
+        if (algorithmName == "continuous_bands") {
+            return PointCloudShorelineWaveAlgorithm::ContinuousBands;
+        }
     }
     return PointCloudShorelineWaveAlgorithm::FoamFronts;
 }

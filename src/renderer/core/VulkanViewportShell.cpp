@@ -14636,6 +14636,9 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         const bool heightFoam =
             layer.style.shorelineWaveAlgorithm ==
             invisible_places::renderer::pointcloud::PointCloudShorelineWaveAlgorithm::HeightFoam;
+        const bool continuousBands =
+            layer.style.shorelineWaveAlgorithm ==
+            invisible_places::renderer::pointcloud::PointCloudShorelineWaveAlgorithm::ContinuousBands;
         const auto& foam = layer.style.shorelineHeightFoam;
         const glm::vec2 directionInput = heightFoam
                                              ? glm::vec2{foam.directionX, foam.directionY}
@@ -14661,10 +14664,13 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
                                        edgeFadeMeters,
                                        foam.breakZ)
                                  : boundaryZ;
+        // shorelineWaveControl.z is the shader algorithm ABI: Foam Fronts =
+        // 0, Height Foam = 1, and Continuous Bands = 2. Keep this explicit so
+        // the UI enum may remain independently ordered.
         styleGpu.shorelineWaveControl = glm::uvec4{
             1U,
             heightFoam ? foam.seed : layer.style.shorelineSeed,
-            heightFoam ? 1U : 0U,
+            heightFoam ? 1U : (continuousBands ? 2U : 0U),
             0U,
         };
         styleGpu.shorelineWaveParams0 = glm::vec4{
