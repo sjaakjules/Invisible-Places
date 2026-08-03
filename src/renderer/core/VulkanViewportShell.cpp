@@ -186,6 +186,26 @@ struct alignas(16) PointCloudStyleGpu {
         renderer::pointcloud::kTimingColouriseMaxEffects *
             renderer::pointcloud::kTimingColouriseLutSamples>
         timingColouriseLut{};
+    // Additional shoreline instances (x = packed count) with the same lane
+    // layout as the primary shorelineWave* fields above. Appended after the
+    // Timing Colourise block so every existing std140 offset is preserved.
+    glm::uvec4 additionalShorelineCount{0U, 0U, 0U, 0U};
+    std::array<glm::uvec4, renderer::pointcloud::kMaxAdditionalShorelineInstances>
+        additionalShorelineControl{};
+    std::array<glm::vec4, renderer::pointcloud::kMaxAdditionalShorelineInstances>
+        additionalShorelineParams0{};
+    std::array<glm::vec4, renderer::pointcloud::kMaxAdditionalShorelineInstances>
+        additionalShorelineParams1{};
+    std::array<glm::vec4, renderer::pointcloud::kMaxAdditionalShorelineInstances>
+        additionalShorelineParams2{};
+    std::array<glm::vec4, renderer::pointcloud::kMaxAdditionalShorelineInstances>
+        additionalShorelineParams3{};
+    std::array<glm::vec4, renderer::pointcloud::kMaxAdditionalShorelineInstances>
+        additionalShorelineParams4{};
+    std::array<glm::vec4, renderer::pointcloud::kMaxAdditionalShorelineInstances>
+        additionalShorelineParams5{};
+    std::array<glm::vec4, renderer::pointcloud::kMaxAdditionalShorelineInstances>
+        additionalShorelineTint{};
 };
 
 // PointStyleData is mirrored verbatim by the point-cloud GLSL uniform blocks.
@@ -195,7 +215,9 @@ static_assert(offsetof(PointCloudStyleGpu, timingColouriseControl) == 1168U);
 static_assert(offsetof(PointCloudStyleGpu, timingColouriseSources) == 1184U);
 static_assert(offsetof(PointCloudStyleGpu, timingColouriseRanges) == 1312U);
 static_assert(offsetof(PointCloudStyleGpu, timingColouriseLut) == 1440U);
-static_assert(sizeof(PointCloudStyleGpu) == 9632U);
+static_assert(
+    offsetof(PointCloudStyleGpu, additionalShorelineCount) == 9632U);
+static_assert(sizeof(PointCloudStyleGpu) == 10160U);
 
 // The surfel/EXR pair has the largest point-cloud stage interface: 21 scalar
 // components plus one flat vec4 per Timing Colourise effect.
@@ -14732,6 +14754,137 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
             std::clamp(shorelineColour[2], 0.0F, 4.0F),
             1.0F,
         };
+    }
+    styleGpu.additionalShorelineCount = glm::uvec4{0U, 0U, 0U, 0U};
+    if (layer.shorelineInstancesEligible) {
+        std::uint32_t packedShorelineCount = 0U;
+        for (const auto& instanceSettings : renderState_.additionalShorelines) {
+            if (packedShorelineCount >=
+                renderer::pointcloud::kMaxAdditionalShorelineInstances) {
+                break;
+            }
+            if (!instanceSettings.enabled) {
+                continue;
+            }
+            // Same lane recipe as the primary block above, read from the
+            // profile-shaped settings banks instead of the flattened style.
+            const bool instanceHeightFoam =
+                instanceSettings.algorithm ==
+                invisible_places::renderer::pointcloud::
+                    PointCloudShorelineWaveAlgorithm::HeightFoam;
+            const bool instanceContinuousBands =
+                instanceSettings.algorithm ==
+                invisible_places::renderer::pointcloud::
+                    PointCloudShorelineWaveAlgorithm::ContinuousBands;
+            const auto& ff = instanceSettings.foamFronts;
+            const auto& hf = instanceSettings.heightFoam;
+            const glm::vec2 instanceDirectionInput =
+                instanceHeightFoam
+                    ? glm::vec2{hf.directionX, hf.directionY}
+                    : glm::vec2{ff.directionX, ff.directionY};
+            const glm::vec2 instanceDirection =
+                glm::dot(instanceDirectionInput, instanceDirectionInput) >
+                        1.0e-8F
+                    ? glm::normalize(instanceDirectionInput)
+                    : glm::vec2{1.0F, 0.0F};
+            const float instanceBoundaryZ =
+                instanceHeightFoam ? hf.runupZ : ff.boundaryZ;
+            const float instanceReach =
+                instanceHeightFoam
+                    ? std::clamp(hf.offshoreReachMeters, 0.001F, 50.0F)
+                    : std::clamp(ff.heightReachMeters, 0.001F, 50.0F);
+            const float instanceEdgeFade =
+                instanceHeightFoam
+                    ? std::clamp(hf.edgeFadeMeters, 0.0F, 10.0F)
+                    : std::clamp(ff.edgeFadeMeters, 0.0F, 10.0F);
+            const float instanceBreakZ =
+                instanceHeightFoam
+                    ? invisible_places::renderer::pointcloud::
+                          NormalizeHeightFoamBreakZ(
+                              instanceBoundaryZ,
+                              instanceReach,
+                              instanceEdgeFade,
+                              hf.breakZ)
+                    : instanceBoundaryZ;
+            const std::size_t slot = packedShorelineCount;
+            styleGpu.additionalShorelineControl[slot] = glm::uvec4{
+                1U,
+                static_cast<std::uint32_t>(
+                    instanceHeightFoam ? hf.seed : ff.seed),
+                instanceHeightFoam ? 1U : (instanceContinuousBands ? 2U : 0U),
+                0U,
+            };
+            styleGpu.additionalShorelineParams0[slot] = glm::vec4{
+                instanceBoundaryZ,
+                instanceReach,
+                instanceEdgeFade,
+                instanceHeightFoam ? std::clamp(hf.intensity, 0.0F, 5.0F)
+                                   : std::clamp(ff.intensity, 0.0F, 5.0F),
+            };
+            styleGpu.additionalShorelineParams1[slot] = glm::vec4{
+                instanceDirection.x,
+                instanceDirection.y,
+                instanceHeightFoam
+                    ? std::clamp(hf.patternScale, 0.01F, 50.0F)
+                    : std::clamp(ff.patternScale, 0.01F, 50.0F),
+                instanceHeightFoam
+                    ? std::clamp(hf.wavelengthMeters, 0.002F, 10.0F)
+                    : std::clamp(ff.wavelengthMeters, 0.002F, 10.0F),
+            };
+            styleGpu.additionalShorelineParams2[slot] = glm::vec4{
+                instanceHeightFoam ? std::clamp(hf.speed, 0.0F, 10.0F)
+                                   : std::clamp(ff.speed, 0.0F, 10.0F),
+                instanceHeightFoam ? std::clamp(hf.warp, 0.0F, 3.0F)
+                                   : std::clamp(ff.warp, 0.0F, 3.0F),
+                instanceHeightFoam ? std::clamp(hf.turbulence, 0.0F, 1.0F)
+                                   : std::clamp(ff.turbulence, 0.0F, 1.0F),
+                instanceHeightFoam ? std::clamp(hf.density, 0.0F, 1.0F)
+                                   : std::clamp(ff.density, 0.0F, 1.0F),
+            };
+            styleGpu.additionalShorelineParams3[slot] = glm::vec4{
+                instanceHeightFoam ? hf.phase : ff.phase,
+                instanceHeightFoam ? std::clamp(hf.emissionAdd, 0.0F, 8.0F)
+                                   : std::clamp(ff.emissionAdd, 0.0F, 8.0F),
+                instanceHeightFoam ? std::clamp(hf.opacityAdd, -1.0F, 2.0F)
+                                   : std::clamp(ff.opacityAdd, -1.0F, 2.0F),
+                instanceHeightFoam
+                    ? std::clamp(hf.opacityMultiply, 0.0F, 8.0F)
+                    : std::clamp(ff.opacityMultiply, 0.0F, 8.0F),
+            };
+            styleGpu.additionalShorelineParams4[slot] = glm::vec4{
+                instanceHeightFoam
+                    ? std::clamp(hf.pointSizeAdd, -256.0F, 512.0F)
+                    : std::clamp(ff.pointSizeAdd, -256.0F, 512.0F),
+                instanceHeightFoam
+                    ? std::clamp(hf.pointSizeMultiply, 0.0F, 8.0F)
+                    : std::clamp(ff.pointSizeMultiply, 0.0F, 8.0F),
+                instanceHeightFoam ? std::clamp(hf.colourMix, 0.0F, 1.0F)
+                                   : std::clamp(ff.colourMix, 0.0F, 1.0F),
+                0.0F,
+            };
+            styleGpu.additionalShorelineParams5[slot] = glm::vec4{
+                instanceBreakZ,
+                instanceHeightFoam
+                    ? std::clamp(hf.offshoreFoamStrength, 0.0F, 3.0F)
+                    : 0.0F,
+                instanceHeightFoam
+                    ? std::clamp(hf.incomingStrength, 0.0F, 5.0F)
+                    : 1.0F,
+                instanceHeightFoam
+                    ? std::clamp(hf.returnStrength, 0.0F, 1.0F)
+                    : 0.0F,
+            };
+            const auto& instanceColour =
+                instanceHeightFoam ? hf.colour : ff.colour;
+            styleGpu.additionalShorelineTint[slot] = glm::vec4{
+                std::clamp(instanceColour[0], 0.0F, 4.0F),
+                std::clamp(instanceColour[1], 0.0F, 4.0F),
+                std::clamp(instanceColour[2], 0.0F, 4.0F),
+                1.0F,
+            };
+            ++packedShorelineCount;
+        }
+        styleGpu.additionalShorelineCount.x = packedShorelineCount;
     }
     const auto waterEffectEmissionAddSlot = FindExactScalarFieldSlot(layer.scalarFields, "water_effect_emission_add");
     const auto waterEffectOpacityAddSlot = FindExactScalarFieldSlot(layer.scalarFields, "water_effect_opacity_add");

@@ -442,6 +442,9 @@ enum class WaterKeyedFeatureKind : std::uint8_t {
     SeepageNode,
     FlowSource,
     FlowPath,
+    // Additional shoreline instance (objectId = instance id). The primary
+    // style shoreline stays the global Shoreline kind above.
+    ShorelineInstance,
 };
 
 struct WaterKeyedFeatureId {

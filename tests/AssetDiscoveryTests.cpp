@@ -1719,17 +1719,45 @@ TEST_CASE("Sand-cloud shoreline waves use dedicated foam helpers", "[water][shor
     CHECK(heightFoamBody.find("max(0.0, incomingStrength)") != std::string::npos);
     CHECK(heightFoamBody.find("clamp(returnStrength, 0.0, 1.0)") != std::string::npos);
 
-    const auto evaluatePos = shader.find("SparseRippleComposite EvaluateShorelineWaveContribution(");
+    // The algorithm dispatch lives in the shared lane-parameterized
+    // evaluator; the primary shoreline and every additional instance route
+    // through it with identical semantics.
+    const auto evaluateFromPos =
+        shader.find("SparseRippleComposite EvaluateShorelineWaveContributionFrom(");
+    REQUIRE(evaluateFromPos != std::string::npos);
+    const auto evaluatePos = shader.find(
+        "SparseRippleComposite EvaluateShorelineWaveContribution(vec3",
+        evaluateFromPos);
     REQUIRE(evaluatePos != std::string::npos);
     const auto evaluateEnd = shader.find("SparseRippleComposite EvaluateSparseRippleContribution", evaluatePos);
     REQUIRE(evaluateEnd != std::string::npos);
+    const auto evaluateFromBody =
+        shader.substr(evaluateFromPos, evaluatePos - evaluateFromPos);
+    CHECK(evaluateFromBody.find("SandCloudShorelineWaveValue(") != std::string::npos);
+    CHECK(evaluateFromBody.find("ContinuousBandShorelineWaveValue(") != std::string::npos);
+    CHECK(evaluateFromBody.find("HeightFoamShorelineWaveValue(") != std::string::npos);
+    CHECK(evaluateFromBody.find("waveControl.z == 1u") != std::string::npos);
+    CHECK(evaluateFromBody.find("waveControl.z == 2u") != std::string::npos);
+    CHECK(evaluateFromBody.find("RippleTideBandsValue(") == std::string::npos);
     const auto evaluateBody = shader.substr(evaluatePos, evaluateEnd - evaluatePos);
-    CHECK(evaluateBody.find("SandCloudShorelineWaveValue(") != std::string::npos);
-    CHECK(evaluateBody.find("ContinuousBandShorelineWaveValue(") != std::string::npos);
-    CHECK(evaluateBody.find("HeightFoamShorelineWaveValue(") != std::string::npos);
-    CHECK(evaluateBody.find("shorelineWaveControl.z == 1u") != std::string::npos);
-    CHECK(evaluateBody.find("shorelineWaveControl.z == 2u") != std::string::npos);
-    CHECK(evaluateBody.find("RippleTideBandsValue(") == std::string::npos);
+    CHECK(evaluateBody.find("EvaluateShorelineWaveContributionFrom(") != std::string::npos);
+    CHECK(evaluateBody.find("HasShorelineWaveEffect()") != std::string::npos);
+
+    // Additional shoreline instances blend additively over the primary in
+    // the composite resolver, each behind its own height-mask early-out.
+    const auto resolvePos =
+        shader.find("SparseRippleComposite ResolveSparseRippleComposite(");
+    REQUIRE(resolvePos != std::string::npos);
+    const auto resolveEnd = shader.find("SparseRippleComposite ApplySparseRippleColor", resolvePos);
+    const auto resolveBody = shader.substr(
+        resolvePos,
+        resolveEnd == std::string::npos ? shader.size() - resolvePos
+                                        : resolveEnd - resolvePos);
+    CHECK(resolveBody.find("additionalShorelineCount.x") != std::string::npos);
+    CHECK(resolveBody.find("additionalShorelineControl[shorelineIndex]") !=
+          std::string::npos);
+    CHECK(resolveBody.find("BlendSparseRippleContribution(result, instanceContribution, 0u)") !=
+          std::string::npos);
 }
 
 TEST_CASE("Shoreline shader layouts reserve Height Foam parameters consistently", "[water][shoreline][shader]") {

@@ -116,6 +116,7 @@ constexpr std::uint32_t kManualFlowSurfaceGuideSourcesSchemaVersion = 16U;
 constexpr std::uint32_t kSmoothVelocityProjectSchemaVersion = 61U;
 constexpr std::uint32_t kRelativePalettePhaseProjectSchemaVersion = 62U;
 constexpr std::uint32_t kFieldMapBoundsMemoryProjectSchemaVersion = 63U;
+constexpr std::uint32_t kShorelineInstancesProjectSchemaVersion = 64U;
 static_assert(
     kProjectDocumentSchemaVersion >=
     kSmoothVelocityProjectSchemaVersion);
@@ -125,6 +126,9 @@ static_assert(
 static_assert(
     kProjectDocumentSchemaVersion >=
     kFieldMapBoundsMemoryProjectSchemaVersion);
+static_assert(
+    kProjectDocumentSchemaVersion >=
+    kShorelineInstancesProjectSchemaVersion);
 
 constexpr std::string_view kProjectVisualEditedSuffix = "_edited";
 constexpr std::string_view kProjectVisualLegacyEditedSuffix = "_Edited";
@@ -8358,6 +8362,22 @@ bool SaveProjectDocument(
         projectJson["water_shoreline_profiles"].push_back(
             SerializePointCloudShorelineWaveProfile(profile));
     }
+    if (!document.waterShorelineInstances.empty()) {
+        auto& instancesJson = projectJson["water_shoreline_instances"];
+        instancesJson = json::array();
+        for (const auto& instance : document.waterShorelineInstances) {
+            instancesJson.push_back(json{
+                {"id", instance.id},
+                {"name", instance.name},
+                {"enabled", instance.enabled},
+                {"settings",
+                 SerializePointCloudShorelineWaveSettings(
+                     instance.settings)},
+            });
+        }
+        projectJson["next_water_shoreline_instance_id"] =
+            document.nextWaterShorelineInstanceId;
+    }
     for (const auto& profile : document.waterSeepageLookProfiles) {
         projectJson["water_seepage_look_profiles"].push_back(
             SerializeWaterSeepageLookProfile(profile));
@@ -8612,6 +8632,28 @@ std::optional<ProjectDocument> LoadProjectDocument(
     document.selectedWaterShorelineProfileName = projectJson->value(
         "selected_water_shoreline_profile",
         document.selectedWaterShorelineProfileName);
+    if (projectJson->contains("water_shoreline_instances") &&
+        projectJson->at("water_shoreline_instances").is_array()) {
+        for (const auto& instanceJson :
+             projectJson->at("water_shoreline_instances")) {
+            if (!instanceJson.is_object()) {
+                continue;
+            }
+            invisible_places::renderer::pointcloud::PointCloudShorelineInstance
+                instance;
+            instance.id = instanceJson.value("id", 0U);
+            instance.name = instanceJson.value("name", std::string{"Shoreline"});
+            instance.enabled = instanceJson.value("enabled", true);
+            if (instanceJson.contains("settings")) {
+                instance.settings = ParsePointCloudShorelineWaveSettings(
+                    instanceJson.at("settings"));
+            }
+            document.waterShorelineInstances.push_back(std::move(instance));
+        }
+    }
+    document.nextWaterShorelineInstanceId = projectJson->value(
+        "next_water_shoreline_instance_id",
+        document.nextWaterShorelineInstanceId);
     if (projectJson->contains("water_seepage_default_look")) {
         document.waterSeepageDefaultLook =
             ParseWaterSeepageLookSettings(projectJson->at("water_seepage_default_look"));
@@ -9218,6 +9260,22 @@ nlohmann::json WaterSourcesDocumentToJson(
         sourcesJson["water_shoreline_profiles"].push_back(
             SerializePointCloudShorelineWaveProfile(profile));
     }
+    if (!document.shorelineInstances.empty()) {
+        auto& instancesJson = sourcesJson["water_shoreline_instances"];
+        instancesJson = json::array();
+        for (const auto& instance : document.shorelineInstances) {
+            instancesJson.push_back(json{
+                {"id", instance.id},
+                {"name", instance.name},
+                {"enabled", instance.enabled},
+                {"settings",
+                 SerializePointCloudShorelineWaveSettings(
+                     instance.settings)},
+            });
+        }
+        sourcesJson["next_water_shoreline_instance_id"] =
+            document.nextShorelineInstanceId;
+    }
     for (const auto& profile : document.seepageLookProfiles) {
         sourcesJson["water_seepage_look_profiles"].push_back(
             SerializeWaterSeepageLookProfile(profile));
@@ -9293,6 +9351,28 @@ static WaterSourcesDocument ParseWaterSourcesDocumentJsonValue(
     document.selectedShorelineProfileName = sourcesJson->value(
         "selected_water_shoreline_profile",
         document.selectedShorelineProfileName);
+    if (sourcesJson->contains("water_shoreline_instances") &&
+        sourcesJson->at("water_shoreline_instances").is_array()) {
+        for (const auto& instanceJson :
+             sourcesJson->at("water_shoreline_instances")) {
+            if (!instanceJson.is_object()) {
+                continue;
+            }
+            invisible_places::renderer::pointcloud::PointCloudShorelineInstance
+                instance;
+            instance.id = instanceJson.value("id", 0U);
+            instance.name = instanceJson.value("name", std::string{"Shoreline"});
+            instance.enabled = instanceJson.value("enabled", true);
+            if (instanceJson.contains("settings")) {
+                instance.settings = ParsePointCloudShorelineWaveSettings(
+                    instanceJson.at("settings"));
+            }
+            document.shorelineInstances.push_back(std::move(instance));
+        }
+    }
+    document.nextShorelineInstanceId = sourcesJson->value(
+        "next_water_shoreline_instance_id",
+        document.nextShorelineInstanceId);
     if (sourcesJson->contains("water_seepage_default_look")) {
         document.seepageDefaultLook =
             ParseWaterSeepageLookSettings(sourcesJson->at("water_seepage_default_look"));

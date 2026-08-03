@@ -3181,59 +3181,78 @@ float ShorelineHeightMask(float boundaryZ, float reachMeters, float edgeFadeMete
     return clamp(waterSide * reachFade, 0.0, 1.0);
 }
 
-SparseRippleComposite EvaluateShorelineWaveContribution(vec3 worldPosition, vec3 pointNormal, float timeSeconds) {
+// Shared shoreline evaluation over one explicit lane set. The primary style
+// shoreline and every additional shoreline instance use identical lane
+// semantics, so the same body serves both.
+SparseRippleComposite EvaluateShorelineWaveContributionFrom(
+    uvec4 waveControl,
+    vec4 waveParams0,
+    vec4 waveParams1,
+    vec4 waveParams2,
+    vec4 waveParams3,
+    vec4 waveParams4,
+    vec4 waveParams5,
+    vec4 waveTint,
+    vec3 worldPosition,
+    vec3 pointNormal,
+    float timeSeconds) {
     SparseRippleComposite contribution = EmptySparseRippleComposite();
-    if (!HasShorelineWaveEffect()) {
+    const bool waveActive =
+        waveControl.x != 0u &&
+        waveParams0.y > 1e-5 &&
+        waveParams1.w > 1e-5 &&
+        waveParams0.w > 1e-5;
+    if (!waveActive) {
         return contribution;
     }
 
-    const float boundaryZ = styleData.shorelineWaveParams0.x;
-    const float reachMeters = max(0.001, styleData.shorelineWaveParams0.y);
-    const float edgeFadeMeters = max(0.0, styleData.shorelineWaveParams0.z);
+    const float boundaryZ = waveParams0.x;
+    const float reachMeters = max(0.001, waveParams0.y);
+    const float edgeFadeMeters = max(0.0, waveParams0.z);
     const float heightMask = ShorelineHeightMask(boundaryZ, reachMeters, edgeFadeMeters, worldPosition.z);
     if (heightMask <= 1e-5) {
         return contribution;
     }
 
-    vec2 tangent = vec2(styleData.shorelineWaveParams1.x, styleData.shorelineWaveParams1.y);
+    vec2 tangent = vec2(waveParams1.x, waveParams1.y);
     tangent = dot(tangent, tangent) > 1e-8 ? normalize(tangent) : vec2(1.0, 0.0);
     const float tangentCoordinate = dot(worldPosition.xy, tangent);
     const float shoreDistance = max(0.0, boundaryZ - worldPosition.z);
-    const float patternScale = max(0.01, styleData.shorelineWaveParams1.z);
-    const float wavelength = max(0.002, styleData.shorelineWaveParams1.w);
+    const float patternScale = max(0.01, waveParams1.z);
+    const float wavelength = max(0.002, waveParams1.w);
     const float shorelineEdgeBlendWidth =
         max(0.001, min(max(edgeFadeMeters, wavelength * 0.20), reachMeters * 0.45));
     const float timePhase =
-        styleData.shorelineWaveParams3.x + (timeSeconds * max(0.0, styleData.shorelineWaveParams2.x));
+        waveParams3.x + (timeSeconds * max(0.0, waveParams2.x));
     float pattern = 0.0;
-    if (styleData.shorelineWaveControl.z == 1u) {
+    if (waveControl.z == 1u) {
         pattern = HeightFoamShorelineWaveValue(
             vec2(shoreDistance, tangentCoordinate),
             worldPosition.z,
             boundaryZ,
-            styleData.shorelineWaveParams5.x,
+            waveParams5.x,
             reachMeters,
             edgeFadeMeters,
             patternScale,
             wavelength,
-            styleData.shorelineWaveParams2.y,
-            styleData.shorelineWaveParams2.z,
-            styleData.shorelineWaveParams2.w,
-            styleData.shorelineWaveParams5.y,
-            styleData.shorelineWaveParams5.z,
-            styleData.shorelineWaveParams5.w,
-            float(styleData.shorelineWaveControl.y),
+            waveParams2.y,
+            waveParams2.z,
+            waveParams2.w,
+            waveParams5.y,
+            waveParams5.z,
+            waveParams5.w,
+            float(waveControl.y),
             timePhase);
-    } else if (styleData.shorelineWaveControl.z == 2u) {
+    } else if (waveControl.z == 2u) {
         pattern = ContinuousBandShorelineWaveValue(
             vec2(shoreDistance, tangentCoordinate) * patternScale,
             shoreDistance,
             reachMeters,
             wavelength,
-            styleData.shorelineWaveParams2.y,
-            styleData.shorelineWaveParams2.z,
-            styleData.shorelineWaveParams2.w,
-            float(styleData.shorelineWaveControl.y),
+            waveParams2.y,
+            waveParams2.z,
+            waveParams2.w,
+            float(waveControl.y),
             timePhase);
     } else {
         pattern = SandCloudShorelineWaveValue(
@@ -3241,29 +3260,47 @@ SparseRippleComposite EvaluateShorelineWaveContribution(vec3 worldPosition, vec3
             shoreDistance,
             shorelineEdgeBlendWidth,
             wavelength,
-            styleData.shorelineWaveParams2.y,
-            styleData.shorelineWaveParams2.z,
-            styleData.shorelineWaveParams2.w,
-            float(styleData.shorelineWaveControl.y),
+            waveParams2.y,
+            waveParams2.z,
+            waveParams2.w,
+            float(waveControl.y),
             timePhase);
     }
 
     const float normalMask =
         clamp(0.62 + 0.38 * abs(dot(RippleSafeNormal(pointNormal), vec3(0.0, 0.0, 1.0))), 0.0, 1.0);
-    const float scale = clamp(pattern * heightMask * normalMask * styleData.shorelineWaveParams0.w, 0.0, 1.0);
+    const float scale = clamp(pattern * heightMask * normalMask * waveParams0.w, 0.0, 1.0);
     if (scale <= 1e-5) {
         return contribution;
     }
 
     contribution.scale = scale;
-    contribution.colourMix = clamp(styleData.shorelineWaveParams4.z * scale, 0.0, 1.0);
-    contribution.emissionAdd = max(0.0, styleData.shorelineWaveParams3.y) * scale;
-    contribution.opacityAdd = styleData.shorelineWaveParams3.z * scale;
-    contribution.opacityMultiply = mix(1.0, max(0.0, styleData.shorelineWaveParams3.w), scale);
-    contribution.pointSizeAdd = styleData.shorelineWaveParams4.x * scale;
-    contribution.pointSizeMultiply = mix(1.0, max(0.0, styleData.shorelineWaveParams4.y), scale);
-    contribution.colour = clamp(styleData.shorelineWaveTint.rgb, vec3(0.0), vec3(1.0));
+    contribution.colourMix = clamp(waveParams4.z * scale, 0.0, 1.0);
+    contribution.emissionAdd = max(0.0, waveParams3.y) * scale;
+    contribution.opacityAdd = waveParams3.z * scale;
+    contribution.opacityMultiply = mix(1.0, max(0.0, waveParams3.w), scale);
+    contribution.pointSizeAdd = waveParams4.x * scale;
+    contribution.pointSizeMultiply = mix(1.0, max(0.0, waveParams4.y), scale);
+    contribution.colour = clamp(waveTint.rgb, vec3(0.0), vec3(1.0));
     return contribution;
+}
+
+SparseRippleComposite EvaluateShorelineWaveContribution(vec3 worldPosition, vec3 pointNormal, float timeSeconds) {
+    if (!HasShorelineWaveEffect()) {
+        return EmptySparseRippleComposite();
+    }
+    return EvaluateShorelineWaveContributionFrom(
+        styleData.shorelineWaveControl,
+        styleData.shorelineWaveParams0,
+        styleData.shorelineWaveParams1,
+        styleData.shorelineWaveParams2,
+        styleData.shorelineWaveParams3,
+        styleData.shorelineWaveParams4,
+        styleData.shorelineWaveParams5,
+        styleData.shorelineWaveTint,
+        worldPosition,
+        pointNormal,
+        timeSeconds);
 }
 
 SparseRippleComposite EvaluateSparseRippleContribution(SparseRippleMembership membership, SparseRippleParams params, vec3 worldPosition, vec3 pointNormal, float timeSeconds) {
@@ -3453,6 +3490,25 @@ void BlendSeepageContributions(
 
 SparseRippleComposite ResolveSparseRippleComposite(vec3 worldPosition, vec3 pointNormal, uint pointIndex, float timeSeconds) {
     SparseRippleComposite result = EvaluateShorelineWaveContribution(worldPosition, pointNormal, timeSeconds);
+    // Additional shoreline instances blend additively over the primary
+    // shoreline. Each instance early-outs on its own height mask, so points
+    // outside an instance's band pay only the mask test.
+    const uint additionalShorelineCount = min(styleData.additionalShorelineCount.x, 4u);
+    for (uint shorelineIndex = 0u; shorelineIndex < additionalShorelineCount; ++shorelineIndex) {
+        SparseRippleComposite instanceContribution = EvaluateShorelineWaveContributionFrom(
+            styleData.additionalShorelineControl[shorelineIndex],
+            styleData.additionalShorelineParams0[shorelineIndex],
+            styleData.additionalShorelineParams1[shorelineIndex],
+            styleData.additionalShorelineParams2[shorelineIndex],
+            styleData.additionalShorelineParams3[shorelineIndex],
+            styleData.additionalShorelineParams4[shorelineIndex],
+            styleData.additionalShorelineParams5[shorelineIndex],
+            styleData.additionalShorelineTint[shorelineIndex],
+            worldPosition,
+            pointNormal,
+            timeSeconds);
+        BlendSparseRippleContribution(result, instanceContribution, 0u);
+    }
     BlendSeepageContributions(result, worldPosition, pointNormal, pointIndex, timeSeconds);
     if (!HasSparseRippleEffects()) {
         return SanitizeSparseRippleComposite(result);

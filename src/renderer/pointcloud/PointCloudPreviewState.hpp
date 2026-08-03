@@ -208,6 +208,22 @@ struct PointCloudShorelineWaveProfile {
     PointCloudShorelineWaveSettings settings{};
 };
 
+// An additional shoreline rendered on SAND clouds alongside the primary
+// style shoreline: a second bay, pool line, or terrace at its own boundary
+// height. Instances are project water state rather than part of a point
+// visual, and each is keyable per instance through the water feature timing
+// runs (level plus the visual response scalars).
+struct PointCloudShorelineInstance {
+    std::uint32_t id = 0U;
+    std::string name = "Shoreline";
+    bool enabled = true;
+    PointCloudShorelineWaveSettings settings{};
+};
+
+// Shader-side uniform capacity for additional shoreline instances; the UI
+// blocks adding more and the packer drops any beyond the cap.
+inline constexpr std::size_t kMaxAdditionalShorelineInstances = 4U;
+
 struct PointCloudDensityCompensation {
     float footprintScale = 1.0F;
     float coverageCorrection = 1.0F;

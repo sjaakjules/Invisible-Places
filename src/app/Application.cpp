@@ -193,6 +193,8 @@ using PointCloudShorelineWaveProfile =
     invisible_places::renderer::pointcloud::PointCloudShorelineWaveProfile;
 using PointCloudShorelineWaveSettings =
     invisible_places::renderer::pointcloud::PointCloudShorelineWaveSettings;
+using PointCloudShorelineInstance =
+    invisible_places::renderer::pointcloud::PointCloudShorelineInstance;
 using WaterSeepageLookProfile = invisible_places::water::WaterSeepageLookProfile;
 using WaterSeepageLookSettings = invisible_places::water::WaterSeepageLookSettings;
 using WaterSeepageNode = invisible_places::water::WaterSeepageNode;
@@ -1030,6 +1032,9 @@ struct OfflineRenderJobState {
     // per-frame keyed-setting overlay is deterministic for the whole export.
     std::vector<invisible_places::water::WaterFeatureTimingRun>
         frozenFeatureTimingRuns;
+    // Additional shoreline instances frozen with the job; their keyed
+    // visual settings evaluate per exported frame from the frozen runs.
+    std::vector<PointCloudShorelineInstance> frozenShorelineInstances;
     std::string frozenTimingTakeId{
         invisible_places::timing::kAuthoredTimingTakeId};
     std::string frozenTimingSceneGroupName = "Default";
@@ -1086,6 +1091,7 @@ struct QueuedQuickMp4WaterSnapshot {
     std::vector<invisible_places::timing::TimingTakeSceneState>
         timingTakeSceneStates;
     std::vector<WaterSeepageNode> seepageNodes;
+    std::vector<PointCloudShorelineInstance> shorelineInstances;
     std::optional<invisible_places::water::WaterScenarioState>
         authoredFrameControlState;
     WaterRainSettings rainSettings{};
@@ -1291,6 +1297,7 @@ struct OfflinePointLayerSnapshot {
     std::vector<invisible_places::water::WaterRippleRuntimeParams> rippleParams;
     invisible_places::water::WaterSeepageSpatialGrid seepageGrid;
     WaterSurfaceRole rainCollisionRole = WaterSurfaceRole::None;
+    bool shorelineInstancesEligible = false;
 };
 
 using SavedPointVisualState = invisible_places::app::point_visual::VisualState;
@@ -1826,6 +1833,11 @@ struct WaterWorkflowState {
     std::vector<PointCloudShorelineWaveProfile> shorelineProfiles;
     std::string selectedShorelineProfileName = "Default";
     std::string shorelineProfileNameBuffer = "Default";
+    // Additional shorelines rendered on SAND alongside the primary style
+    // shoreline; each is keyable per instance via the timing runs.
+    std::vector<PointCloudShorelineInstance> shorelineInstances;
+    std::uint32_t nextShorelineInstanceId = 1U;
+    std::optional<std::size_t> selectedShorelineInstanceIndex;
     WaterSeepageLookSettings defaultSeepageLook =
         invisible_places::water::DefaultWaterSeepageLookSettings();
     // Two independent named-profile libraries: seepage settings (pattern,
@@ -3150,6 +3162,80 @@ void ApplyWaterShorelineLevelToStyle(
     foam.colourMix *= level;
     foam.opacityMultiply = std::lerp(1.0F, foam.opacityMultiply, level);
     foam.pointSizeMultiply = std::lerp(1.0F, foam.pointSizeMultiply, level);
+}
+
+// Resolves the frame's additional shoreline instances for the renderer:
+// disabled instances drop, keyed setting tracks replace the authored visual
+// scalars of both banks, and the keyed level scales responses exactly like
+// the primary shoreline's level. Authored instance state is never mutated.
+std::vector<PointCloudShorelineWaveSettings>
+ResolveAdditionalShorelinesForFrame(
+    const std::vector<PointCloudShorelineInstance>& instances,
+    const invisible_places::water::WaterFeatureTimingOverlay* overlay) {
+    std::vector<PointCloudShorelineWaveSettings> resolved;
+    for (const auto& instance : instances) {
+        if (resolved.size() >=
+            invisible_places::renderer::pointcloud::
+                kMaxAdditionalShorelineInstances) {
+            break;
+        }
+        if (!instance.enabled || !instance.settings.enabled) {
+            continue;
+        }
+        auto settings = instance.settings;
+        if (overlay != nullptr) {
+            const invisible_places::water::WaterKeyedFeatureId feature{
+                .kind = invisible_places::water::WaterKeyedFeatureKind::
+                    ShorelineInstance,
+                .objectId = instance.id};
+            const auto keyed = [&](const char* settingId) {
+                return overlay->Find(feature, settingId);
+            };
+            const auto applyScalarOverrides = [&](auto& bank) {
+                if (const auto* value = keyed("intensity")) {
+                    bank.intensity = std::max(0.0F, *value);
+                }
+                if (const auto* value = keyed("emission_add")) {
+                    bank.emissionAdd = std::max(0.0F, *value);
+                }
+                if (const auto* value = keyed("opacity_add")) {
+                    bank.opacityAdd = std::clamp(*value, -1.0F, 2.0F);
+                }
+                if (const auto* value = keyed("point_size_multiply")) {
+                    bank.pointSizeMultiply = std::max(0.0F, *value);
+                }
+                if (const auto* value = keyed("colour_mix")) {
+                    bank.colourMix = std::clamp(*value, 0.0F, 1.0F);
+                }
+            };
+            applyScalarOverrides(settings.foamFronts);
+            applyScalarOverrides(settings.heightFoam);
+            float level = 1.0F;
+            if (const auto* value = keyed("level")) {
+                level = std::clamp(*value, 0.0F, 1.0F);
+            }
+            if (level <= 1.0e-5F) {
+                continue;
+            }
+            if (level < 1.0F) {
+                const auto applyLevel = [&](auto& bank) {
+                    bank.intensity *= level;
+                    bank.emissionAdd *= level;
+                    bank.opacityAdd *= level;
+                    bank.pointSizeAdd *= level;
+                    bank.colourMix *= level;
+                    bank.opacityMultiply =
+                        std::lerp(1.0F, bank.opacityMultiply, level);
+                    bank.pointSizeMultiply =
+                        std::lerp(1.0F, bank.pointSizeMultiply, level);
+                };
+                applyLevel(settings.foamFronts);
+                applyLevel(settings.heightFoam);
+            }
+        }
+        resolved.push_back(std::move(settings));
+    }
+    return resolved;
 }
 
 std::string ActiveWaterScenarioDisplayName(const PreviewRuntimeState& runtimeState) {
@@ -10732,6 +10818,17 @@ void ApplyWaterSeepageSelectionClick(
 std::string NormalizeWaterShorelineProfileName(std::string_view name) {
     const auto trimmed = TrimText(name);
     return trimmed.empty() ? std::string{"Default"} : trimmed;
+}
+
+std::uint32_t NextAvailableShorelineInstanceId(
+    const std::vector<
+        invisible_places::renderer::pointcloud::PointCloudShorelineInstance>&
+        instances) {
+    std::uint32_t next = 1U;
+    for (const auto& instance : instances) {
+        next = std::max(next, instance.id + 1U);
+    }
+    return next;
 }
 
 std::optional<std::size_t> FindWaterShorelineProfileIndex(
@@ -21640,6 +21737,9 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
         runtimeState.water.shorelineProfiles);
     document.selectedWaterShorelineProfileName =
         runtimeState.water.selectedShorelineProfileName;
+    document.waterShorelineInstances = runtimeState.water.shorelineInstances;
+    document.nextWaterShorelineInstanceId =
+        runtimeState.water.nextShorelineInstanceId;
     document.waterSeepageDefaultLook = runtimeState.water.defaultSeepageLook;
     document.waterSeepageLookProfiles = WithoutPresetSeepageLookProfiles(
         runtimeState.water.seepageLookProfiles);
@@ -22589,6 +22689,12 @@ bool ApplyProjectDocumentToRuntime(
     }
     runtimeState->water.shorelineProfiles =
         document.waterShorelineProfiles;
+    runtimeState->water.shorelineInstances = document.waterShorelineInstances;
+    runtimeState->water.nextShorelineInstanceId = std::max(
+        document.nextWaterShorelineInstanceId,
+        NextAvailableShorelineInstanceId(
+            runtimeState->water.shorelineInstances));
+    runtimeState->water.selectedShorelineInstanceIndex.reset();
     SeedWaterShorelineProfilePresets(&runtimeState->water);
     runtimeState->water.selectedShorelineProfileName =
         NormalizeWaterShorelineProfileName(
@@ -23238,6 +23344,10 @@ CaptureRenderSetupAuthoredWater(
     water.shorelineProfiles = project.waterShorelineProfiles;
     water.selectedShorelineProfileName =
         project.selectedWaterShorelineProfileName;
+    water.shorelineInstances = project.waterShorelineInstances;
+    water.nextShorelineInstanceId = std::max(
+        project.nextWaterShorelineInstanceId,
+        NextAvailableShorelineInstanceId(water.shorelineInstances));
     water.seepageDefaultLook = project.waterSeepageDefaultLook;
     water.seepageLookProfiles = project.waterSeepageLookProfiles;
     water.seepageResponseProfiles =
@@ -23298,6 +23408,8 @@ void ApplyRenderSetupAuthoredWaterToProject(
     project->waterShorelineProfiles = water.shorelineProfiles;
     project->selectedWaterShorelineProfileName =
         water.selectedShorelineProfileName;
+    project->waterShorelineInstances = water.shorelineInstances;
+    project->nextWaterShorelineInstanceId = water.nextShorelineInstanceId;
     project->waterSeepageDefaultLook = water.seepageDefaultLook;
     project->waterSeepageLookProfiles = water.seepageLookProfiles;
     project->waterSeepageResponseProfiles =
@@ -25599,7 +25711,9 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
                          return WaterSurfaceRole::Vegetation;
                  }
                  return WaterSurfaceRole::None;
-             }()});
+             }(),
+             .shorelineInstancesEligible =
+                 NormalizeSceneRoleName(session.sceneRole) == "sand"});
     }
     return layers;
 }
@@ -26112,6 +26226,8 @@ BuildAnimationExportPointCloudLayerSnapshot(
              .hasNormals = session.hasNormals,
              .timingColouriseEligible =
                  IsAuthoredTimingColouriseLayer(session),
+             .shorelineInstancesEligible =
+                 NormalizeSceneRoleName(session.sceneRole) == "sand",
              .drawPointCount = static_cast<std::uint32_t>(std::min<std::uint64_t>(
                  drawPointCount,
                  std::numeric_limits<std::uint32_t>::max())),
@@ -27009,6 +27125,9 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
             ApplyWaterShorelineLevelToStyle(waterFrame.rawScenarioState, &layer.style);
         }
     }
+    renderState.additionalShorelines = ResolveAdditionalShorelinesForFrame(
+        job.frozenShorelineInstances,
+        &waterFrame.featureOverlay);
 
     return renderState;
 }
@@ -30881,6 +31000,7 @@ void FreezeAuthoredTimingState(
         ? timingSnapshot->sceneGroupName
         : ActiveWaterTimingSceneGroupName(runtimeState.water);
     job->frozenFeatureTimingRuns.clear();
+    job->frozenShorelineInstances = runtimeState.water.shorelineInstances;
     job->frozenTimingColouriseEffects.clear();
     if (timingSnapshot != nullptr) {
         job->frozenFeatureTimingRuns =
@@ -30947,6 +31067,7 @@ void FreezeQueuedQuickMp4AuthoredTimingState(
                   invisible_places::timing::kAuthoredTimingTakeId};
     job->frozenTimingSceneGroupName = snapshot.sceneGroupName;
     job->frozenFeatureTimingRuns.clear();
+    job->frozenShorelineInstances = snapshot.shorelineInstances;
     job->frozenTimingColouriseEffects.clear();
     if (const auto* timingState =
             invisible_places::timing::FindTimingTakeSceneState(
@@ -31895,6 +32016,8 @@ void StartSelectedQuickMp4Batch(
         runtimeState->water.timingTakeSceneStates;
     waterSnapshot->seepageNodes =
         runtimeState->water.seepageNodes;
+    waterSnapshot->shorelineInstances =
+        runtimeState->water.shorelineInstances;
     waterSnapshot->authoredFrameControlState =
         ResolveActiveWaterScenarioState(*runtimeState, false);
     waterSnapshot->rainSettings =
@@ -32483,6 +32606,7 @@ void StartStillCameraExportJob(
             runtimeState->exportUsesEditedScenario),
         .frozenFeatureTimingRuns =
             SnapshotActiveWaterFeatureTimingRuns(*runtimeState),
+        .frozenShorelineInstances = runtimeState->water.shorelineInstances,
         .frozenNormalizedTime = std::clamp(
             runtimeState->animationPanel.scrubAmount,
             0.0F,
@@ -32799,6 +32923,7 @@ void StartAnimationExportJob(
             runtimeState->exportUsesEditedScenario),
         .frozenFeatureTimingRuns =
             SnapshotActiveWaterFeatureTimingRuns(*runtimeState),
+        .frozenShorelineInstances = runtimeState->water.shorelineInstances,
         .frozenNormalizedTime = renderSnapshot.normalizedPosition,
         .effectiveSeepageInvocations = effectiveSeepageInvocations,
         .frozenSeepageLayers = std::move(frozenSeepageLayers),
@@ -39269,7 +39394,7 @@ bool DrawPointCloudShorelineWavesSection(PreviewLayerSession* session) {
                                  : 0;
         const char* algorithms[] = {
             "Foam Fronts (Current)",
-            "Continuous Bands",
+            "Bay Waves",
             "Height Foam",
         };
         if (DrawRightAlignedCombo("Algorithm", &algorithmIndex, algorithms, IM_ARRAYSIZE(algorithms))) {
@@ -44311,6 +44436,7 @@ void DrawKeyedGlobalLevelRow(
     invisible_places::water::WaterKeyedFeatureKind kind,
     const char* label,
     float baseLevel);
+void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState);
 
 void DrawWaterShorelineWavesPanel(PreviewRuntimeState* runtimeState) {
     if (runtimeState == nullptr) {
@@ -44536,6 +44662,8 @@ void DrawWaterShorelineWavesPanel(PreviewRuntimeState* runtimeState) {
     if (styleChanged) {
         finishStyleEdit();
     }
+
+    DrawAdditionalShorelinesSection(runtimeState);
 }
 
 struct KeyedWaterSliderResult {
@@ -45854,6 +45982,251 @@ void DrawKeyedGlobalLevelRow(
         ImGuiSliderFlags_None,
         false,
         &edited);
+}
+
+// Additional shorelines: extra bays, pool lines, or terraces rendered on
+// SAND beside the primary shoreline. Instances are project water state (not
+// part of the point visual); each one's level and visual response scalars
+// are keyable per instance through the Timings runs, so several shorelines
+// can fade in and out independently over an animation.
+void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    auto& water = runtimeState->water;
+    if (!BeginPanelSection("Additional Shorelines")) {
+        return;
+    }
+    auto& instances = water.shorelineInstances;
+    if (water.selectedShorelineInstanceIndex.has_value() &&
+        water.selectedShorelineInstanceIndex.value() >= instances.size()) {
+        water.selectedShorelineInstanceIndex.reset();
+    }
+    for (std::size_t index = 0U; index < instances.size(); ++index) {
+        auto& instance = instances[index];
+        ImGui::PushID(static_cast<int>(instance.id));
+        ImGui::Checkbox("##Enabled", &instance.enabled);
+        DrawWaterSeepageParameterTooltip(
+            "Render this shoreline instance. Its keyed Level can still turn "
+            "it off along the animation.");
+        ImGui::SameLine();
+        const bool selected =
+            water.selectedShorelineInstanceIndex == index;
+        const std::string rowLabel =
+            (instance.name.empty()
+                 ? "Shoreline " + std::to_string(instance.id)
+                 : instance.name) +
+            (instance.enabled ? "" : "  (hidden)");
+        if (ImGui::Selectable(rowLabel.c_str(), selected)) {
+            water.selectedShorelineInstanceIndex = index;
+        }
+        ImGui::PopID();
+    }
+    const bool canAdd =
+        instances.size() <
+        invisible_places::renderer::pointcloud::
+            kMaxAdditionalShorelineInstances;
+    if (!canAdd) {
+        ImGui::BeginDisabled();
+    }
+    if (ImGui::Button("Add Shoreline")) {
+        PointCloudShorelineInstance instance;
+        instance.id = water.nextShorelineInstanceId++;
+        instance.name = "Shoreline " + std::to_string(instance.id);
+        // Seed from the applied profile so the new instance starts from a
+        // familiar look; retune its boundary height to place it.
+        instance.settings = ResolveWaterShorelineProfile(
+            water,
+            NormalizeWaterShorelineProfileName(
+                water.selectedShorelineProfileName));
+        instance.settings.enabled = true;
+        instances.push_back(std::move(instance));
+        water.selectedShorelineInstanceIndex = instances.size() - 1U;
+    }
+    if (!canAdd) {
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::TextDisabled(
+            "Up to %zu additional shorelines render.",
+            invisible_places::renderer::pointcloud::
+                kMaxAdditionalShorelineInstances);
+    }
+    DrawWaterSeepageParameterTooltip(
+        "Each instance is a full shoreline with its own boundary height, "
+        "algorithm, and look, blended additively over the primary "
+        "shoreline on SAND clouds. Add an instance to a Timings run to key "
+        "its Level and visual response over the animation.");
+
+    if (water.selectedShorelineInstanceIndex.has_value()) {
+        auto& instance =
+            instances[water.selectedShorelineInstanceIndex.value()];
+        ImGui::Separator();
+        ImGui::PushID(static_cast<int>(instance.id));
+        InputTextString("Instance Name", &instance.name);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Remove")) {
+            instances.erase(
+                instances.begin() +
+                static_cast<std::ptrdiff_t>(
+                    water.selectedShorelineInstanceIndex.value()));
+            water.selectedShorelineInstanceIndex.reset();
+            ImGui::PopID();
+            EndPanelSection();
+            return;
+        }
+
+        const invisible_places::water::WaterKeyedFeatureId feature{
+            .kind = invisible_places::water::WaterKeyedFeatureKind::
+                ShorelineInstance,
+            .objectId = instance.id};
+        const std::array<invisible_places::water::WaterKeyedFeatureId, 1>
+            keyedFeatures{feature};
+        const bool heightFoamActive =
+            instance.settings.algorithm ==
+            invisible_places::renderer::pointcloud::
+                PointCloudShorelineWaveAlgorithm::HeightFoam;
+        const auto keyedScalarRow = [&](const char* settingId,
+                                        const char* label,
+                                        float ffValue,
+                                        float hfValue,
+                                        float minimum,
+                                        float maximum,
+                                        auto&& assign) {
+            float edited = 0.0F;
+            const auto result = DrawKeyedWaterSettingSlider(
+                runtimeState,
+                keyedFeatures,
+                settingId,
+                label,
+                heightFoamActive ? hfValue : ffValue,
+                minimum,
+                maximum,
+                "%.2f",
+                ImGuiSliderFlags_None,
+                false,
+                &edited,
+                {},
+                {},
+                "Keyable per instance: edits key at the animation position "
+                "when this instance is in a Timings run, and edit the "
+                "authored value otherwise.");
+            if (result.authoredChanged) {
+                assign(edited);
+            }
+        };
+        ImGui::TextDisabled("Keyable Visual Response");
+        keyedScalarRow(
+            "intensity",
+            "Intensity",
+            instance.settings.foamFronts.intensity,
+            instance.settings.heightFoam.intensity,
+            0.0F,
+            2.0F,
+            [&](float value) {
+                (heightFoamActive
+                     ? instance.settings.heightFoam.intensity
+                     : instance.settings.foamFronts.intensity) = value;
+            });
+        keyedScalarRow(
+            "emission_add",
+            "Emission Add",
+            instance.settings.foamFronts.emissionAdd,
+            instance.settings.heightFoam.emissionAdd,
+            0.0F,
+            2.0F,
+            [&](float value) {
+                (heightFoamActive
+                     ? instance.settings.heightFoam.emissionAdd
+                     : instance.settings.foamFronts.emissionAdd) = value;
+            });
+        keyedScalarRow(
+            "opacity_add",
+            "Opacity Add",
+            instance.settings.foamFronts.opacityAdd,
+            instance.settings.heightFoam.opacityAdd,
+            -1.0F,
+            1.0F,
+            [&](float value) {
+                (heightFoamActive
+                     ? instance.settings.heightFoam.opacityAdd
+                     : instance.settings.foamFronts.opacityAdd) = value;
+            });
+        keyedScalarRow(
+            "point_size_multiply",
+            "Point Size Multiply",
+            instance.settings.foamFronts.pointSizeMultiply,
+            instance.settings.heightFoam.pointSizeMultiply,
+            0.0F,
+            3.0F,
+            [&](float value) {
+                (heightFoamActive
+                     ? instance.settings.heightFoam.pointSizeMultiply
+                     : instance.settings.foamFronts.pointSizeMultiply) =
+                    value;
+            });
+        keyedScalarRow(
+            "colour_mix",
+            "Colour Mix",
+            instance.settings.foamFronts.colourMix,
+            instance.settings.heightFoam.colourMix,
+            0.0F,
+            1.0F,
+            [&](float value) {
+                (heightFoamActive
+                     ? instance.settings.heightFoam.colourMix
+                     : instance.settings.foamFronts.colourMix) = value;
+            });
+        {
+            // The keyed Level has no authored scalar; it only exists as a
+            // track, so the row appears once the instance joins a run.
+            const auto* entry = FindScenarioFeatureRuns(
+                water,
+                ActiveWaterTimingScenarioId(*runtimeState));
+            if (entry != nullptr &&
+                invisible_places::water::FindWaterFeatureRunContaining(
+                    entry->waterFeatureTimingRuns,
+                    feature) != nullptr) {
+                float edited = 1.0F;
+                (void)DrawKeyedWaterSettingSlider(
+                    runtimeState,
+                    keyedFeatures,
+                    "level",
+                    "Level (Keyed)",
+                    1.0F,
+                    0.0F,
+                    1.0F,
+                    "%.2f",
+                    ImGuiSliderFlags_None,
+                    false,
+                    &edited,
+                    {},
+                    {},
+                    "Master fade for this instance along the animation; "
+                    "zero hides it for the frame.");
+            } else {
+                ImGui::TextDisabled(
+                    "Add this instance to a Timings run to key its Level "
+                    "and visual response over the animation.");
+            }
+        }
+
+        // Full settings editor over a scratch style, the same pattern the
+        // water-trail profile editors use; instances never touch the point
+        // visual.
+        PreviewLayerSession editSession;
+        editSession.kind = LayerKind::PointCloud;
+        invisible_places::renderer::pointcloud::
+            ApplyPointCloudShorelineWaveSettings(
+                &editSession.pointStyle,
+                instance.settings);
+        if (DrawPointCloudShorelineWavesSection(&editSession)) {
+            instance.settings = invisible_places::renderer::pointcloud::
+                ExtractPointCloudShorelineWaveSettings(
+                    editSession.pointStyle);
+        }
+        ImGui::PopID();
+    }
+    EndPanelSection();
 }
 
 void DrawWaterGpuRainPanel(
@@ -48046,8 +48419,27 @@ void DrawWaterPanel(
     }
     if (ImGui::BeginTabItem("Shoreline")) {
         water.activeRegionFeature = WaterRegionFeature::None;
-        water.activeKeyingFeature = invisible_places::water::WaterKeyedFeatureId{
-            .kind = invisible_places::water::WaterKeyedFeatureKind::Shoreline};
+        // A selected additional instance takes the keying focus (top-bar
+        // markers + keyed slider writes); otherwise the global Shoreline.
+        if (water.selectedShorelineInstanceIndex.has_value() &&
+            water.selectedShorelineInstanceIndex.value() <
+                water.shorelineInstances.size()) {
+            water.activeKeyingFeature =
+                invisible_places::water::WaterKeyedFeatureId{
+                    .kind = invisible_places::water::WaterKeyedFeatureKind::
+                        ShorelineInstance,
+                    .objectId =
+                        water
+                            .shorelineInstances[water
+                                                    .selectedShorelineInstanceIndex
+                                                    .value()]
+                            .id};
+        } else {
+            water.activeKeyingFeature =
+                invisible_places::water::WaterKeyedFeatureId{
+                    .kind = invisible_places::water::WaterKeyedFeatureKind::
+                        Shoreline};
+        }
         DrawWaterShorelineWavesPanel(runtimeState);
         ImGui::EndTabItem();
     }
@@ -50522,6 +50914,16 @@ std::string WaterKeyedFeatureDisplayLabel(
                 }
             }
             return "Path " + std::to_string(feature.objectId) + " (missing)";
+        case WaterKeyedFeatureKind::ShorelineInstance:
+            for (const auto& instance : water.shorelineInstances) {
+                if (instance.id == feature.objectId) {
+                    return instance.name.empty()
+                               ? "Shoreline " + std::to_string(instance.id)
+                               : instance.name;
+                }
+            }
+            return "Shoreline " + std::to_string(feature.objectId) +
+                   " (missing)";
         default:
             return std::string{
                 invisible_places::water::WaterKeyedFeatureKindLabel(
@@ -50552,6 +50954,10 @@ BuildAvailableKeyingFeatures(
     for (const auto& source : runtimeState.water.manualFlowPaths) {
         features.push_back({.kind = WaterKeyedFeatureKind::FlowPath,
                             .objectId = source.id});
+    }
+    for (const auto& instance : runtimeState.water.shorelineInstances) {
+        features.push_back({.kind = WaterKeyedFeatureKind::ShorelineInstance,
+                            .objectId = instance.id});
     }
     if (entry != nullptr) {
         std::erase_if(features, [&](const WaterKeyedFeatureId& feature) {
@@ -62952,6 +63358,9 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                 WaterFrameExplicitRainLevel(waterFrame));
     renderState.rainVisual = runtimeState.water.rainVisual;
     renderState.rainSpawnCentre = runtimeState.camera.OrbitCenter();
+    renderState.additionalShorelines = ResolveAdditionalShorelinesForFrame(
+        runtimeState.water.shorelineInstances,
+        &waterFrame.featureOverlay);
 
     for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
         const auto& session = runtimeState.sessions[sessionIndex];
@@ -62996,6 +63405,8 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                  .hasNormals = session.hasNormals,
                  .timingColouriseEligible =
                      IsAuthoredTimingColouriseLayer(session),
+                 .shorelineInstancesEligible =
+                     NormalizeSceneRoleName(session.sceneRole) == "sand",
                  .drawPointCount = static_cast<std::uint32_t>(drawPointCount),
                  .densityCompensation = ResolveSessionDensityCompensation(runtimeState, session),
                  .rainCollisionRole = RainCollisionRoleForSession(session)});

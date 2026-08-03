@@ -1158,3 +1158,50 @@ TEST_CASE("Schema 46 timing tracks migrate with active legacy defaults",
     REQUIRE(roundTrippedSetting.keys.size() == 1U);
     CHECK(roundTrippedSetting.keys.front().value == Approx(0.6F));
 }
+
+TEST_CASE("Shoreline instances key level and visual response scalars", "[water][timing][shoreline]") {
+    using invisible_places::water::FindWaterKeyableSetting;
+    using invisible_places::water::ParseWaterKeyedFeatureKindName;
+    using invisible_places::water::WaterKeyedFeatureKind;
+    using invisible_places::water::WaterKeyedFeatureKindIsGlobal;
+    using invisible_places::water::WaterKeyedFeatureKindName;
+
+    const auto settings = invisible_places::water::WaterKeyableSettings(
+        WaterKeyedFeatureKind::ShorelineInstance);
+    REQUIRE(settings.size() == 6U);
+    const auto* level = FindWaterKeyableSetting(
+        WaterKeyedFeatureKind::ShorelineInstance,
+        "level");
+    REQUIRE(level != nullptr);
+    CHECK(level->maximum == Approx(1.0F));
+    CHECK(level->defaultValue == Approx(1.0F));
+    for (const char* settingId :
+         {"intensity",
+          "emission_add",
+          "opacity_add",
+          "point_size_multiply",
+          "colour_mix"}) {
+        REQUIRE(
+            FindWaterKeyableSetting(
+                WaterKeyedFeatureKind::ShorelineInstance,
+                settingId) != nullptr);
+    }
+    const auto* opacityAdd = FindWaterKeyableSetting(
+        WaterKeyedFeatureKind::ShorelineInstance,
+        "opacity_add");
+    REQUIRE(opacityAdd != nullptr);
+    CHECK(opacityAdd->minimum == Approx(-1.0F));
+
+    // Instances are per-object features whose serialized kind name
+    // round-trips; unknown names still parse to nothing.
+    CHECK_FALSE(
+        WaterKeyedFeatureKindIsGlobal(
+            WaterKeyedFeatureKind::ShorelineInstance));
+    CHECK(
+        WaterKeyedFeatureKindName(
+            WaterKeyedFeatureKind::ShorelineInstance) ==
+        "shoreline_instance");
+    const auto parsed = ParseWaterKeyedFeatureKindName("shoreline_instance");
+    REQUIRE(parsed.has_value());
+    CHECK(parsed.value() == WaterKeyedFeatureKind::ShorelineInstance);
+}

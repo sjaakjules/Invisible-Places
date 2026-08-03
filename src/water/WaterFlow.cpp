@@ -7356,6 +7356,43 @@ constexpr std::array<WaterKeyableSettingInfo, 2> kWaterFlowSourceSettings{{
      .defaultValue = 1.0F},
 }};
 
+// Additional shoreline instances key a master level plus the visual response
+// scalars of the active algorithm bank. Keyed values replace the authored
+// bank scalar for the frame; shape and motion parameters stay authored.
+constexpr std::array<WaterKeyableSettingInfo, 6>
+    kWaterShorelineInstanceSettings{{
+        {.id = "level",
+         .label = "Level",
+         .minimum = 0.0F,
+         .maximum = 1.0F,
+         .defaultValue = 1.0F},
+        {.id = "intensity",
+         .label = "Intensity",
+         .minimum = 0.0F,
+         .maximum = 2.0F,
+         .defaultValue = 1.0F},
+        {.id = "emission_add",
+         .label = "Emission Add",
+         .minimum = 0.0F,
+         .maximum = 2.0F,
+         .defaultValue = 0.0F},
+        {.id = "opacity_add",
+         .label = "Opacity Add",
+         .minimum = -1.0F,
+         .maximum = 1.0F,
+         .defaultValue = 0.0F},
+        {.id = "point_size_multiply",
+         .label = "Point Size Multiply",
+         .minimum = 0.0F,
+         .maximum = 3.0F,
+         .defaultValue = 1.0F},
+        {.id = "colour_mix",
+         .label = "Colour Mix",
+         .minimum = 0.0F,
+         .maximum = 1.0F,
+         .defaultValue = 0.75F},
+    }};
+
 }  // namespace
 
 std::span<const WaterKeyableSettingInfo> WaterKeyableSettings(
@@ -7376,6 +7413,8 @@ std::span<const WaterKeyableSettingInfo> WaterKeyableSettings(
         case WaterKeyedFeatureKind::FlowSource:
         case WaterKeyedFeatureKind::FlowPath:
             return kWaterFlowSourceSettings;
+        case WaterKeyedFeatureKind::ShorelineInstance:
+            return kWaterShorelineInstanceSettings;
     }
     return {};
 }
@@ -7409,6 +7448,8 @@ std::string_view WaterKeyedFeatureKindLabel(WaterKeyedFeatureKind kind) {
             return "Flow Source";
         case WaterKeyedFeatureKind::FlowPath:
             return "Flow Path";
+        case WaterKeyedFeatureKind::ShorelineInstance:
+            return "Shoreline Instance";
     }
     return "Water Feature";
 }
@@ -7431,13 +7472,15 @@ std::string_view WaterKeyedFeatureKindName(WaterKeyedFeatureKind kind) {
             return "flow_source";
         case WaterKeyedFeatureKind::FlowPath:
             return "flow_path";
+        case WaterKeyedFeatureKind::ShorelineInstance:
+            return "shoreline_instance";
     }
     return "rain";
 }
 
 std::optional<WaterKeyedFeatureKind> ParseWaterKeyedFeatureKindName(
     std::string_view name) {
-    static constexpr std::array<WaterKeyedFeatureKind, 8> kKinds{
+    static constexpr std::array<WaterKeyedFeatureKind, 9> kKinds{
         WaterKeyedFeatureKind::Rain,
         WaterKeyedFeatureKind::MeshFlow,
         WaterKeyedFeatureKind::Shoreline,
@@ -7446,6 +7489,7 @@ std::optional<WaterKeyedFeatureKind> ParseWaterKeyedFeatureKindName(
         WaterKeyedFeatureKind::SeepageNode,
         WaterKeyedFeatureKind::FlowSource,
         WaterKeyedFeatureKind::FlowPath,
+        WaterKeyedFeatureKind::ShorelineInstance,
     };
     for (const auto kind : kKinds) {
         if (name == WaterKeyedFeatureKindName(kind)) {
@@ -7460,6 +7504,7 @@ bool WaterKeyedFeatureKindIsGlobal(WaterKeyedFeatureKind kind) {
         case WaterKeyedFeatureKind::SeepageNode:
         case WaterKeyedFeatureKind::FlowSource:
         case WaterKeyedFeatureKind::FlowPath:
+        case WaterKeyedFeatureKind::ShorelineInstance:
             return false;
         case WaterKeyedFeatureKind::Rain:
         case WaterKeyedFeatureKind::MeshFlow:

@@ -1010,6 +1010,73 @@ TEST_CASE("Point visual field-map bounds memory round-trips",
                   .contains("bounds_memory"));
 }
 
+TEST_CASE("Additional shoreline instances round-trip with their banks",
+          "[project][serialization][water][shoreline]") {
+  using invisible_places::renderer::pointcloud::PointCloudShorelineInstance;
+  using invisible_places::renderer::pointcloud::
+      PointCloudShorelineWaveAlgorithm;
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+
+  ProjectDocument document;
+  PointCloudShorelineInstance pool;
+  pool.id = 7U;
+  pool.name = "Upper Pool";
+  pool.enabled = true;
+  pool.settings.enabled = true;
+  pool.settings.algorithm = PointCloudShorelineWaveAlgorithm::ContinuousBands;
+  pool.settings.foamFronts.boundaryZ = 2.35F;
+  pool.settings.foamFronts.intensity = 0.62F;
+  pool.settings.foamFronts.colourMix = 0.41F;
+  PointCloudShorelineInstance terrace;
+  terrace.id = 9U;
+  terrace.name = "Terrace";
+  terrace.enabled = false;
+  terrace.settings.algorithm = PointCloudShorelineWaveAlgorithm::HeightFoam;
+  terrace.settings.heightFoam.runupZ = 3.1F;
+  document.waterShorelineInstances = {pool, terrace};
+  document.nextWaterShorelineInstanceId = 10U;
+
+  TemporaryProjectFile file{
+      "invisible_places_shoreline_instances_round_trip.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+
+  std::ifstream input{file.path};
+  REQUIRE(input.is_open());
+  const auto savedJson = nlohmann::json::parse(input);
+  REQUIRE(savedJson.at("water_shoreline_instances").size() == 2U);
+  CHECK(savedJson.at("water_shoreline_instances")[0].at("name") ==
+        "Upper Pool");
+  CHECK(savedJson.at("water_shoreline_instances")[0]
+            .at("settings")
+            .at("foam_fronts")
+            .at("boundary_z") == Catch::Approx(2.35F));
+  CHECK(savedJson.at("next_water_shoreline_instance_id") == 10U);
+
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->waterShorelineInstances.size() == 2U);
+  const auto& loadedPool = loaded->waterShorelineInstances[0];
+  CHECK(loadedPool.id == 7U);
+  CHECK(loadedPool.name == "Upper Pool");
+  CHECK(loadedPool.enabled);
+  CHECK(loadedPool.settings.algorithm ==
+        PointCloudShorelineWaveAlgorithm::ContinuousBands);
+  CHECK(loadedPool.settings.foamFronts.boundaryZ == Catch::Approx(2.35F));
+  CHECK(loadedPool.settings.foamFronts.intensity == Catch::Approx(0.62F));
+  CHECK(loadedPool.settings.foamFronts.colourMix == Catch::Approx(0.41F));
+  const auto& loadedTerrace = loaded->waterShorelineInstances[1];
+  CHECK(loadedTerrace.id == 9U);
+  CHECK_FALSE(loadedTerrace.enabled);
+  CHECK(loadedTerrace.settings.algorithm ==
+        PointCloudShorelineWaveAlgorithm::HeightFoam);
+  CHECK(loadedTerrace.settings.heightFoam.runupZ == Catch::Approx(3.1F));
+  CHECK(loaded->nextWaterShorelineInstanceId == 10U);
+}
+
 TEST_CASE("Schema 51 palette snapshots migrate without changing their animation model",
           "[project][serialization][colourise][palette][migration]") {
   using invisible_places::serialization::LoadProjectDocument;

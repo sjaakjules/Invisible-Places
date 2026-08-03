@@ -24,7 +24,7 @@ from typing import Any
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
-PROJECT_SCHEMA_VERSION = 63
+PROJECT_SCHEMA_VERSION = 64
 DEFAULT_MAIN_PROJECT = REPOSITORY_ROOT / "Saved" / "exhibitionScene_project.json"
 DEFAULT_FIXTURE = REPOSITORY_ROOT / "tests" / "fixtures" / "sample_scene_water_sources.json"
 DEFAULT_VALIDATION_PROJECT = (

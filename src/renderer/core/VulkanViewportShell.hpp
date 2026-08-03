@@ -217,6 +217,9 @@ struct SceneRenderState {
         bool hasSourceRgb = true;
         bool hasNormals = false;
         bool timingColouriseEligible = false;
+        // SAND-role layers render the scene's additional shoreline
+        // instances alongside (or without) the style's own shoreline.
+        bool shorelineInstancesEligible = false;
         std::uint32_t drawPointCount = 0;
         renderer::pointcloud::PointCloudDensityCompensation densityCompensation{};
         invisible_places::water::WaterSurfaceRole rainCollisionRole =
@@ -231,6 +234,12 @@ struct SceneRenderState {
 
     std::vector<PointCloudLayerState> pointCloudLayers;
     std::vector<GaussianSplatLayerState> gaussianSplatLayers;
+    // Additional shoreline instances for this frame, already resolved:
+    // disabled instances removed and keyed setting overrides applied, in
+    // authored order. The style packer uploads at most
+    // kMaxAdditionalShorelineInstances of them for eligible layers.
+    std::vector<renderer::pointcloud::PointCloudShorelineWaveSettings>
+        additionalShorelines;
 };
 
 enum class PointCloudExrReadbackMask : std::uint32_t {

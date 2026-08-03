@@ -113,6 +113,15 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     uvec4 timingColouriseSources[8];
     vec4 timingColouriseRanges[8];
     vec4 timingColouriseLut[512];
+    uvec4 additionalShorelineCount;
+    uvec4 additionalShorelineControl[4];
+    vec4 additionalShorelineParams0[4];
+    vec4 additionalShorelineParams1[4];
+    vec4 additionalShorelineParams2[4];
+    vec4 additionalShorelineParams3[4];
+    vec4 additionalShorelineParams4[4];
+    vec4 additionalShorelineParams5[4];
+    vec4 additionalShorelineTint[4];
 } styleData;
 
 #include "pointcloud_sparse_ripple.glsl"
