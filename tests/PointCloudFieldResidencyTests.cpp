@@ -6,9 +6,12 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -284,6 +287,110 @@ TEST_CASE("Used scalar field sets aggregate bindings and Visual Features",
         invisible_places::app::AlwaysResidentScalarFieldPatterns();
     CHECK(std::find(patterns.begin(), patterns.end(), "roughness") !=
           patterns.end());
+}
+
+TEST_CASE("Parallel PLY parsing matches the single-threaded result exactly",
+          "[pointcloud][fields][parallel]") {
+    // Enough points that four forced ranges each cover thousands of
+    // records, with values varied per point and a NaN mixed in so the
+    // stats-merge and non-finite paths are exercised.
+    constexpr std::size_t kParallelPointCount = 10'000U;
+    const auto path =
+        std::filesystem::temp_directory_path() /
+        "invisible-places-field-residency" / "parallel-parse.ply";
+    std::filesystem::create_directories(path.parent_path());
+    {
+        std::ofstream output{path, std::ios::binary | std::ios::trunc};
+        REQUIRE(output.is_open());
+        output << "ply\n"
+               << "format binary_little_endian 1.0\n"
+               << "element vertex " << kParallelPointCount << "\n"
+               << "property float x\n"
+               << "property float y\n"
+               << "property float z\n"
+               << "property uchar red\n"
+               << "property uchar green\n"
+               << "property uchar blue\n"
+               << "property float nx\n"
+               << "property float ny\n"
+               << "property float nz\n"
+               << "property float scalar_Height\n"
+               << "property double scalar_Intensity\n"
+               << "end_header\n";
+        for (std::size_t pointIndex = 0; pointIndex < kParallelPointCount; ++pointIndex) {
+            const auto base = static_cast<float>(pointIndex);
+            WriteBinaryValue(&output, std::sin(base * 0.37F) * 40.0F);
+            WriteBinaryValue(&output, std::cos(base * 0.11F) * 25.0F);
+            WriteBinaryValue(&output, base * 0.001F);
+            WriteBinaryValue(&output, static_cast<std::uint8_t>(pointIndex % 251U));
+            WriteBinaryValue(&output, static_cast<std::uint8_t>(pointIndex % 83U));
+            WriteBinaryValue(&output, static_cast<std::uint8_t>(pointIndex % 17U));
+            WriteBinaryValue(&output, std::sin(base));
+            WriteBinaryValue(&output, std::cos(base));
+            WriteBinaryValue(&output, 0.5F);
+            WriteBinaryValue(
+                &output,
+                pointIndex == 4'321U
+                    ? std::numeric_limits<float>::quiet_NaN()
+                    : std::fmod(base * 1.7F, 90.0F));
+            WriteBinaryValue(&output, 1000.0 + static_cast<double>(pointIndex % 777U));
+        }
+    }
+
+    const auto sequential = LoadPointCloud(path, {}, 1U);
+    const auto parallel = LoadPointCloud(path, {}, 4U);
+    REQUIRE(sequential.success);
+    REQUIRE(parallel.success);
+
+    CHECK(parallel.cloud.PointCount() == kParallelPointCount);
+    // Bitwise equality: the fixture plants a NaN, which float == would
+    // reject even for identical payloads.
+    REQUIRE(parallel.cloud.scalarFieldValues.size() ==
+            sequential.cloud.scalarFieldValues.size());
+    CHECK(std::memcmp(
+              parallel.cloud.scalarFieldValues.data(),
+              sequential.cloud.scalarFieldValues.data(),
+              sequential.cloud.scalarFieldValues.size() * sizeof(float)) == 0);
+    CHECK(parallel.cloud.packedColors == sequential.cloud.packedColors);
+    REQUIRE(parallel.cloud.positions.size() ==
+            sequential.cloud.positions.size());
+    for (std::size_t index = 0; index < parallel.cloud.positions.size(); ++index) {
+        CHECK(parallel.cloud.positions[index].x ==
+              sequential.cloud.positions[index].x);
+        CHECK(parallel.cloud.normals[index].y ==
+              sequential.cloud.normals[index].y);
+    }
+    REQUIRE(parallel.cloud.scalarFields.size() ==
+            sequential.cloud.scalarFields.size());
+    for (std::size_t slot = 0; slot < parallel.cloud.scalarFields.size(); ++slot) {
+        const auto& left = parallel.cloud.scalarFields[slot];
+        const auto& right = sequential.cloud.scalarFields[slot];
+        CHECK(left.name == right.name);
+        CHECK(left.sourceIndex == right.sourceIndex);
+        CHECK(left.minimum == right.minimum);
+        CHECK(left.maximum == right.maximum);
+        CHECK(left.count == right.count);  // NaN skipped identically
+        CHECK(left.valid == right.valid);
+    }
+    CHECK(parallel.cloud.bounds.minimum.x == sequential.cloud.bounds.minimum.x);
+    CHECK(parallel.cloud.bounds.maximum.z == sequential.cloud.bounds.maximum.z);
+    CHECK(parallel.cloud.focusPoint.x == sequential.cloud.focusPoint.x);
+    CHECK(parallel.cloud.focusPoint.y == sequential.cloud.focusPoint.y);
+    CHECK(parallel.cloud.focusPoint.z == sequential.cloud.focusPoint.z);
+
+    // Filtered parallel loads agree with filtered sequential loads too.
+    PointCloudScalarFieldFilter filter;
+    filter.mode = PointCloudScalarFieldFilter::Mode::Selected;
+    filter.names = {"Intensity"};
+    const auto filteredSequential = LoadPointCloud(path, filter, 1U);
+    const auto filteredParallel = LoadPointCloud(path, filter, 3U);
+    REQUIRE(filteredSequential.success);
+    REQUIRE(filteredParallel.success);
+    CHECK(filteredParallel.cloud.scalarFieldValues ==
+          filteredSequential.cloud.scalarFieldValues);
+    REQUIRE(filteredParallel.cloud.scalarFields.size() == 1U);
+    CHECK(filteredParallel.cloud.scalarFields[0].minimum ==
+          filteredSequential.cloud.scalarFields[0].minimum);
 }
 
 TEST_CASE("Scalar-field eviction frees the least recently referenced fields",

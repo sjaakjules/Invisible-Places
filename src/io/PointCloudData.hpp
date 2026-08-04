@@ -157,9 +157,17 @@ struct PointCloudSelectedValueStreamResult {
 using PointCloudSelectedValueVisitor =
     std::function<bool(float, std::uint64_t)>;
 
+// The fixed record stride lets the payload parse in parallel: disjoint
+// vertex ranges are read and decoded by independent workers directly into
+// the destination arrays, and stats/bounds/focus samples merge
+// deterministically, so the result is bit-identical to a single-threaded
+// parse. threadCount 0 sizes the pool automatically (bounded by hardware
+// concurrency and the cloud's point count; small clouds stay
+// single-threaded); an explicit count forces that many ranges.
 PointCloudLoadResult LoadPointCloud(
     const std::filesystem::path& filePath,
-    const PointCloudScalarFieldFilter& fieldFilter = {});
+    const PointCloudScalarFieldFilter& fieldFilter = {},
+    unsigned threadCount = 0U);
 PointCloudStreamResult StreamPointCloudPositionsNormals(
     const std::filesystem::path& filePath,
     const PointCloudPositionNormalVisitor& visitor);

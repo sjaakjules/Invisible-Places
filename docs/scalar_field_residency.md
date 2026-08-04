@@ -84,6 +84,30 @@ reading ~28 bytes/point of geometry plus 4 bytes/point per referenced
 field — and recently written cache pages are typically still in the OS
 page cache, making the reload largely I/O-free.
 
+## Parallel PLY parsing
+
+The first (cache-building) parse of a cloud is also parallel: the record
+stride is fixed, so `LoadPointCloud` splits the payload into disjoint
+vertex ranges, one worker per range, each seeking directly to its byte
+range and decoding into the shared destination arrays. Stats, bounds, and
+focus samples merge deterministically — the result is bit-identical to a
+single-threaded parse (pinned by a unit test), and small clouds stay
+single-threaded automatically. The flattened property program also skips
+filter-rejected fields entirely and reads float32 properties without the
+historical double round-trip. Measured on the 1.3 GB 5 mm SAND cloud
+(8.7 M points, warm file cache, -O2): 1298 ms single-threaded versus
+457 ms parallel, 372 ms parallel with a three-field filter.
+
+## Render Current View
+
+The Export tab's **Render Current View** button (beside Render Frame
+Preview) renders one frame from the viewport camera exactly as posed at
+click time — frozen so it survives the full-density load wait — at full
+export density and quality, using the current animation position's water
+state and a single sample (a still camera has no motion blur). It shares
+Render Frame Preview's readiness gate, so required clouds and scalar
+fields load first and the render then fires automatically.
+
 ## Caustic slots
 
 `caustic_*_field_slot` values persist as file-order indices (the resident

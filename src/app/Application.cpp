@@ -2264,6 +2264,12 @@ struct PreviewRuntimeState {
         pendingCurrentRenderSnapshot;
     std::shared_ptr<ResolvedRenderSetupSnapshot>
         pendingFramePreviewSnapshot;
+    // Render Current View freezes the click-time viewport camera here so a
+    // frame preview that waits on full-density loads still renders the pose
+    // the user was looking at, not wherever they orbited meanwhile. Empty
+    // means the preview follows the animation camera.
+    std::optional<invisible_places::camera::CameraState>
+        pendingFramePreviewCamera;
     std::filesystem::path waterSurfaceCacheRoot;
     invisible_places::platform::ScopedPowerAssertion exportPowerAssertion{};
     bool showDiagnosticsPanel = false;
@@ -28081,6 +28087,12 @@ bool RenderCurrentAnimationFramePreview(
     }
 
     auto& panel = runtimeState->animationPanel;
+    // Taken (not peeked): every exit leaves the slot cleared, and only the
+    // freeze branch re-arms it beside the frozen snapshot, so a stale
+    // current-view camera can never leak into a later animation-frame click.
+    const auto currentViewCamera =
+        std::move(runtimeState->pendingFramePreviewCamera);
+    runtimeState->pendingFramePreviewCamera.reset();
     ResolvedRenderSetupSnapshot renderSnapshot;
     if (runtimeState->pendingFramePreviewSnapshot != nullptr) {
         renderSnapshot = *runtimeState->pendingFramePreviewSnapshot;
@@ -28117,6 +28129,9 @@ bool RenderCurrentAnimationFramePreview(
                     std::make_shared<ResolvedRenderSetupSnapshot>(
                         std::move(renderSnapshot));
             }
+            // Keep the click-time camera frozen beside the snapshot for the
+            // automatic retry.
+            runtimeState->pendingFramePreviewCamera = currentViewCamera;
             if (!runtimeState->statusMessage.empty()) {
                 runtimeState->statusMessage += " ";
             }
@@ -28157,6 +28172,12 @@ bool RenderCurrentAnimationFramePreview(
     if (sampleOffsets.empty()) {
         sampleOffsets.push_back(0.0F);
     }
+    if (currentViewCamera.has_value()) {
+        // A static viewport camera has no motion to blur across sample
+        // offsets; one sample at the base time renders exactly the pose the
+        // user is looking at.
+        sampleOffsets.assign(1U, 0.0F);
+    }
     std::vector<float> sampleTimesSeconds;
     std::vector<invisible_places::camera::CameraState> sampleCameras;
     sampleTimesSeconds.reserve(sampleOffsets.size());
@@ -28167,9 +28188,12 @@ bool RenderCurrentAnimationFramePreview(
             0.0F,
             std::max(0.0F, durationSeconds));
         sampleTimesSeconds.push_back(sampleTimeSeconds);
-        sampleCameras.push_back(invisible_places::camera::EvaluatePreparedAnimationPath(
-            preparedAnimationPath,
-            sampleTimeSeconds).camera);
+        sampleCameras.push_back(
+            currentViewCamera.has_value()
+                ? currentViewCamera.value()
+                : invisible_places::camera::EvaluatePreparedAnimationPath(
+                      preparedAnimationPath,
+                      sampleTimeSeconds).camera);
     }
 
     const auto exportRendererMode =
@@ -28387,14 +28411,18 @@ bool RenderCurrentAnimationFramePreview(
         panel.framePreview.closePending = false;
         panel.framePreview.savedPath.clear();
         panel.framePreview.saveStatus.clear();
-        panel.framePreview.title = "Frame Preview - " + panel.framePreview.animationName;
+        panel.framePreview.title =
+            (currentViewCamera.has_value() ? "Current View - "
+                                           : "Frame Preview - ") +
+            panel.framePreview.animationName;
         panel.framePreview.summary =
             std::string{AnimationExportModeLabel(activeMode)} + " | " +
             std::to_string(settings.width) + " x " + std::to_string(settings.height) +
             " | internal " + std::to_string(renderWidth) + " x " + std::to_string(renderHeight) +
             " | " + std::to_string(sampleOffsets.size()) + " sample" +
             (sampleOffsets.size() == 1U ? "" : "s") +
-            " | t=" + FormatFixed(baseTimeSeconds, 3) + "s";
+            " | t=" + FormatFixed(baseTimeSeconds, 3) + "s" +
+            (currentViewCamera.has_value() ? " | viewport camera" : "");
     } catch (const std::exception& error) {
         runtimeState->errorMessage = "Frame preview display failed: " + std::string{error.what()};
         runtimeState->statusMessage.clear();
@@ -34879,6 +34907,20 @@ void DrawAnimationExportSection(
             ImGui::BeginDisabled();
         }
         if (ImGui::Button("Render Frame Preview")) {
+            runtimeState->pendingFramePreviewCamera.reset();
+            RenderCurrentAnimationFramePreview(runtimeState, viewport);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Renders one frame at the current animation position using "
+                "the active export preset.");
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Render Current View")) {
+            // Freeze the pose now: full-density loading may take a while and
+            // the user will keep navigating meanwhile.
+            runtimeState->pendingFramePreviewCamera =
+                runtimeState->camera.CaptureState();
             RenderCurrentAnimationFramePreview(runtimeState, viewport);
         }
         if (framePreviewDisabled) {
@@ -34886,8 +34928,10 @@ void DrawAnimationExportSection(
         }
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(
-                "Renders one frame at the current animation position using "
-                "the active export preset.");
+                "Renders one frame from the viewport camera as it is right "
+                "now — not the animation camera — at full export density and "
+                "quality, using the current animation position's water "
+                "state. One sample (a still camera has no motion blur).");
         }
     }
 
