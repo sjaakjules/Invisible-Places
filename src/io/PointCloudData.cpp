@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -151,6 +152,67 @@ std::string ScalarFieldDisplayName(std::string_view propertyName) {
     }
 
     return std::string{propertyName.substr(prefix.size())};
+}
+
+std::string LowerAscii(std::string_view value) {
+    std::string lowered;
+    lowered.reserve(value.size());
+    for (const char character : value) {
+        lowered.push_back(static_cast<char>(
+            std::tolower(static_cast<unsigned char>(character))));
+    }
+    return lowered;
+}
+
+// Mirrors the renderer's field-name normalization so containsPatterns match
+// the same fields its by-name heuristics (roughness, ground id) resolve.
+std::string NormalizedAlnumFieldName(std::string_view value) {
+    std::string normalized;
+    normalized.reserve(value.size());
+    for (const char character : value) {
+        const auto byte = static_cast<unsigned char>(character);
+        if (std::isalnum(byte) == 0) {
+            continue;
+        }
+        normalized.push_back(static_cast<char>(std::tolower(byte)));
+    }
+    return normalized;
+}
+
+bool FieldFilterSelects(
+    const PointCloudScalarFieldFilter& filter,
+    std::string_view displayName,
+    std::uint32_t sourceIndex) {
+    if (filter.LoadsAll()) {
+        return true;
+    }
+    if (std::find(
+            filter.sourceIndices.begin(),
+            filter.sourceIndices.end(),
+            sourceIndex) != filter.sourceIndices.end()) {
+        return true;
+    }
+    const auto loweredName = LowerAscii(displayName);
+    if (std::any_of(
+            filter.names.begin(),
+            filter.names.end(),
+            [&loweredName](const std::string& candidate) {
+                return LowerAscii(candidate) == loweredName;
+            })) {
+        return true;
+    }
+    if (filter.containsPatterns.empty()) {
+        return false;
+    }
+    const auto normalizedName = NormalizedAlnumFieldName(displayName);
+    return std::any_of(
+        filter.containsPatterns.begin(),
+        filter.containsPatterns.end(),
+        [&normalizedName](const std::string& pattern) {
+            return !pattern.empty() &&
+                   normalizedName.find(NormalizedAlnumFieldName(pattern)) !=
+                       std::string::npos;
+        });
 }
 
 struct PointCloudLayout {
@@ -369,7 +431,22 @@ std::size_t LoadedPointCloud::ScalarFieldValueIndex(std::size_t fieldIndex, std:
     return (fieldIndex * PointCount()) + pointIndex;
 }
 
-PointCloudLoadResult LoadPointCloud(const std::filesystem::path& filePath) {
+std::optional<std::size_t> LoadedPointCloud::ResidentSlotForSourceIndex(
+    std::int32_t sourceIndex) const {
+    if (sourceIndex < 0) {
+        return std::nullopt;
+    }
+    for (std::size_t slot = 0; slot < scalarFields.size(); ++slot) {
+        if (scalarFields[slot].sourceIndex == sourceIndex) {
+            return slot;
+        }
+    }
+    return std::nullopt;
+}
+
+PointCloudLoadResult LoadPointCloud(
+    const std::filesystem::path& filePath,
+    const PointCloudScalarFieldFilter& fieldFilter) {
     const auto headerResult = ParsePlyHeader(filePath);
     if (!headerResult.success) {
         return {.errorMessage = headerResult.errorMessage, .success = false};
@@ -402,19 +479,38 @@ PointCloudLoadResult LoadPointCloud(const std::filesystem::path& filePath) {
     cloud.hasSourceRgb = header.HasColorRgb();
     cloud.hasNormals = layout->hasNormals;
 
+    // File-order scalar slot -> resident matrix row, or -1 when the filter
+    // leaves the field on disk. Selected fields keep their relative file
+    // order so repeat loads with the same filter produce identical slots.
+    std::vector<std::int32_t> residentSlotBySourceIndex(layout->scalarFieldCount, -1);
     try {
         cloud.positions.resize(static_cast<std::size_t>(header.vertexCount));
         if (cloud.hasNormals) {
             cloud.normals.resize(static_cast<std::size_t>(header.vertexCount));
         }
         cloud.packedColors.resize(static_cast<std::size_t>(header.vertexCount), PackRgba8(255, 255, 255));
+        cloud.availableScalarFields.reserve(layout->scalarFieldCount);
         cloud.scalarFields.reserve(layout->scalarFieldCount);
+        std::uint32_t sourceIndex = 0;
         for (const auto& property : header.properties) {
             if (!StartsWith(property.name, "scalar_")) {
                 continue;
             }
 
-            cloud.scalarFields.push_back({.name = ScalarFieldDisplayName(property.name)});
+            auto displayName = ScalarFieldDisplayName(property.name);
+            cloud.availableScalarFields.push_back({
+                .name = displayName,
+                .sourceIndex = sourceIndex,
+            });
+            if (FieldFilterSelects(fieldFilter, displayName, sourceIndex)) {
+                residentSlotBySourceIndex[sourceIndex] =
+                    static_cast<std::int32_t>(cloud.scalarFields.size());
+                ScalarFieldStats stats;
+                stats.name = std::move(displayName);
+                stats.sourceIndex = static_cast<std::int32_t>(sourceIndex);
+                cloud.scalarFields.push_back(std::move(stats));
+            }
+            ++sourceIndex;
         }
 
         cloud.scalarFieldValues.resize(
@@ -482,11 +578,16 @@ PointCloudLoadResult LoadPointCloud(const std::filesystem::path& filePath) {
                         normal.z = static_cast<float>(ReadScalarAsDouble(propertyBytes, property.type));
                         break;
                     case PropertySemantic::ScalarField: {
+                        const auto residentSlot =
+                            residentSlotBySourceIndex[property.scalarFieldIndex];
+                        if (residentSlot < 0) {
+                            break;
+                        }
                         const auto scalarValue =
                             static_cast<float>(ReadScalarAsDouble(propertyBytes, property.type));
-                        cloud.scalarFieldValues[cloud.ScalarFieldValueIndex(property.scalarFieldIndex, globalIndex)] =
-                            scalarValue;
-                        cloud.scalarFields[property.scalarFieldIndex].Include(scalarValue);
+                        cloud.scalarFieldValues[cloud.ScalarFieldValueIndex(
+                            static_cast<std::size_t>(residentSlot), globalIndex)] = scalarValue;
+                        cloud.scalarFields[static_cast<std::size_t>(residentSlot)].Include(scalarValue);
                         break;
                     }
                     case PropertySemantic::Skip:

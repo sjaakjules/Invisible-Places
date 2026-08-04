@@ -29,6 +29,7 @@
 #include "renderer/pointcloud/PointCloudPreviewState.hpp"
 #include "scene/SceneCatalog.hpp"
 #include "scene/PointCloudVariants.hpp"
+#include "app/UsedScalarFields.hpp"
 #include "serialization/ProjectDocument.hpp"
 #include "serialization/RenderSetupDocument.hpp"
 #include "style/RenderParameterBinding.hpp"
@@ -283,6 +284,10 @@ struct ProjectSettings {
     // blend in the live viewport (never in exports). Off preserves the
     // original preview appearance exactly.
     bool previewPerformanceMode = false;
+    // Escape hatch for scalar-field residency: when set, point-cloud loads
+    // materialise every on-disk scalar field exactly as before field
+    // filtering existed. Takes effect on the next load of each cloud.
+    bool loadAllScalarFields = false;
     bool autoLowerGsplatQualityWhileNavigating = true;
     PointCloudPreviewLodMode pointCloudPreviewLodMode = PointCloudPreviewLodMode::FullResolution;
     std::uint64_t interactivePointCap = kDefaultInteractivePointCap;
@@ -1529,6 +1534,11 @@ struct PreviewLayerSession {
     invisible_places::io::Matrix4d localToWorld{};
     bool hasLocalFocusPoint = false;
     std::vector<invisible_places::io::ScalarFieldStats> scalarFields;
+    // Every scalar field the source file offers (mirrors
+    // offlinePointCloud->availableScalarFields): the resident subset in
+    // scalarFields plus the fields the load filter left on disk, which the
+    // on-demand loader can stream in later.
+    std::vector<invisible_places::io::AvailableScalarField> availableScalarFields;
     std::vector<invisible_places::io::Float3> pivotSamples;
     std::shared_ptr<invisible_places::io::LoadedPointCloud> offlinePointCloud;
     // Lazily computed per-field histograms for the Visuals-tab bounds
@@ -1614,6 +1624,35 @@ struct PendingLayerLoad {
     bool useResidentPointCloud = false;
     bool showUploadOverlayFrame = false;
     std::chrono::steady_clock::time_point startedAt = std::chrono::steady_clock::now();
+};
+
+// One background stream of a single scalar field from a filtered cloud's
+// source file, mirroring the PendingLayerLoad worker/poll split. Values and
+// stats are produced entirely on the worker; the main thread appends them
+// to the resident cloud and (for GPU-resident sessions) replaces the scalar
+// buffer.
+struct ScalarFieldLoadResult {
+    invisible_places::io::ScalarFieldStats stats;
+    std::vector<float> values;
+    std::string errorMessage;
+    bool success = false;
+};
+
+struct BackgroundScalarFieldLoadState {
+    std::mutex mutex;
+    std::optional<ScalarFieldLoadResult> result;
+};
+
+struct PendingScalarFieldLoad {
+    std::size_t sessionIndex = 0;
+    std::string fieldName;
+    // Guards against the session's payload being replaced while the stream
+    // ran; a stale result is dropped.
+    std::uint64_t contentGeneration = 0U;
+    std::shared_ptr<BackgroundScalarFieldLoadState> backgroundState;
+    std::jthread backgroundThread;
+    std::chrono::steady_clock::time_point startedAt =
+        std::chrono::steady_clock::now();
 };
 
 struct SceneDisplayBundleRuntime {
@@ -2171,6 +2210,8 @@ struct PreviewRuntimeState {
     std::vector<ScenePointCloudRuntime> pointCloudScenes;
     std::optional<std::size_t> selectedSessionIndex;
     std::optional<PendingLayerLoad> pendingLoad;
+    std::optional<PendingScalarFieldLoad> pendingScalarFieldLoad;
+    std::uint64_t scalarFieldResidencyPollCounter = 0U;
     invisible_places::camera::OrbitCamera camera;
     bool preserveProjectCameraOnNextLayerActivation = false;
     CameraInteractionState cameraInteraction{};
@@ -7222,7 +7263,53 @@ bool DrawScalarBindingBody(
                 ImGui::SetItemDefaultFocus();
             }
         }
+        // Fields the load filter left on disk stay selectable: choosing one
+        // records the durable name with no slot, and the residency sweep
+        // streams the values in (the binding resolves itself on arrival).
+        if (session != nullptr) {
+            for (const auto& available : session->availableScalarFields) {
+                const bool resident = std::any_of(
+                    scalarFields.begin(),
+                    scalarFields.end(),
+                    [&available](const invisible_places::io::ScalarFieldStats& field) {
+                        return field.name == available.name;
+                    });
+                if (resident) {
+                    continue;
+                }
+                const bool selected =
+                    binding->fieldMap.fieldSlot < 0 &&
+                    binding->fieldMap.fieldName == available.name;
+                const auto label = available.name + " (on demand)";
+                if (ImGui::Selectable(label.c_str(), selected)) {
+                    invisible_places::style::RememberFieldMapBounds(
+                        &binding->fieldMap);
+                    binding->fieldMap.fieldName = available.name;
+                    binding->fieldMap.fieldSlot = -1;
+                    invisible_places::style::RestoreFieldMapBoundsMemory(
+                        &binding->fieldMap);
+                    changed = true;
+                }
+                if (selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+        }
         ImGui::EndCombo();
+    }
+    if (session != nullptr && binding->fieldMap.fieldSlot < 0 &&
+        !binding->fieldMap.fieldName.empty()) {
+        const bool availableOnDisk = std::any_of(
+            session->availableScalarFields.begin(),
+            session->availableScalarFields.end(),
+            [&](const invisible_places::io::AvailableScalarField& available) {
+                return available.name == binding->fieldMap.fieldName;
+            });
+        if (availableOnDisk) {
+            ImGui::TextDisabled(
+                "Field '%s' is loading in the background...",
+                binding->fieldMap.fieldName.c_str());
+        }
     }
 
     const auto* fieldStats = ScalarFieldStatsBySlot(scalarFields, binding->fieldMap.fieldSlot);
@@ -7582,11 +7669,42 @@ bool IsCpuReadyAnalysisPointCloudSource(const PreviewLayerSession& session) {
     return IsAnalysisPointCloudSource(session) && session.cpuResident && session.offlinePointCloud != nullptr;
 }
 
+// Caustic field assignments persist as file-order slots (the resident slot
+// of the era when every on-disk field loaded). Under field-filtered loads
+// the resident matrix may be a subset, so consumption translates the
+// file-order slot to the field's current resident row — or disables the
+// lookup (-1) until the on-demand loader delivers the field. Sessions
+// without an availableScalarFields catalog (runtime-generated overlays,
+// pre-filter payloads) keep their slots untouched: for them file order and
+// resident order are the same thing.
+void TranslateCausticFieldSlotsToResident(
+    PointCloudStyleState* style,
+    const PreviewLayerSession& session) {
+    if (style == nullptr || session.availableScalarFields.empty()) {
+        return;
+    }
+    const auto translate = [&session](std::int32_t fileOrderSlot) {
+        if (fileOrderSlot < 0) {
+            return fileOrderSlot;
+        }
+        for (std::size_t slot = 0; slot < session.scalarFields.size(); ++slot) {
+            if (session.scalarFields[slot].sourceIndex == fileOrderSlot) {
+                return static_cast<std::int32_t>(slot);
+            }
+        }
+        return -1;
+    };
+    style->causticMaskFieldSlot = translate(style->causticMaskFieldSlot);
+    style->causticEdgeFieldSlot = translate(style->causticEdgeFieldSlot);
+    style->causticSeedFieldSlot = translate(style->causticSeedFieldSlot);
+}
+
 PointCloudStyleState MakeSceneRenderStyle(
     const PreviewRuntimeState& runtimeState,
     const PreviewLayerSession& session,
     PointCloudStyleState style) {
     ResolveProjectVisualStyleBindingsByFieldName(&style, session);
+    TranslateCausticFieldSlotsToResident(&style, session);
     style = invisible_places::renderer::pointcloud::MakePointCloudStyleForSceneRole(
         style,
         session.sceneRole);
@@ -9396,6 +9514,7 @@ bool ActivateLoadedPointCloud(
     session.hasNormals = cloud.hasNormals;
     session.totalPrimitives = cloud.PointCount();
     session.scalarFields = cloud.scalarFields;
+    session.availableScalarFields = cloud.availableScalarFields;
     session.bounds = cloud.bounds;
     session.focusPoint = cloud.focusPoint;
     session.hasFocusPoint = cloud.hasFocusPoint;
@@ -9545,6 +9664,224 @@ void HandleScenePurposeLoadFailed(
     std::uint64_t sceneSwitchGeneration,
     std::string_view errorMessage);
 
+// The scalar fields a session's authored state can reference, aggregated
+// over every saved visual, the live style, and every Timing Take's Visual
+// Features. Deliberately animation-agnostic and take-agnostic: any take can
+// be selected at any time, so all of them contribute. Unknown names cost
+// nothing (the loader and on-demand streamer ignore them).
+invisible_places::app::UsedScalarFieldSet CollectRequiredScalarFieldNames(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& session) {
+    invisible_places::app::UsedScalarFieldSet used;
+    const auto addStyle = [&used](const PointCloudStyleState& style) {
+        used.AddBinding(style.pointSize);
+        used.AddBinding(style.surfelDiameter);
+        used.AddBinding(style.opacity);
+        used.AddBinding(style.emissiveStrength);
+        used.AddBinding(style.depthFade);
+        used.AddBinding(style.colormapPosition);
+    };
+    addStyle(session.pointStyle);
+    for (const auto& visual : session.pointVisuals) {
+        addStyle(visual.style);
+    }
+    // Colourise selectors carry no per-role scoping, and the same field set
+    // ships in every density variant and role of a scene, so every effect
+    // contributes to every session rather than risking a miss.
+    for (const auto& takeState : runtimeState.water.timingTakeSceneStates) {
+        for (const auto& effect : takeState.colouriseEffects) {
+            used.AddColouriseEffect(effect);
+        }
+    }
+    return used;
+}
+
+invisible_places::io::PointCloudScalarFieldFilter
+CollectScalarFieldLoadFilter(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& session) {
+    invisible_places::io::PointCloudScalarFieldFilter filter;
+    if (runtimeState.projectSettings.loadAllScalarFields) {
+        return filter;
+    }
+    filter.mode =
+        invisible_places::io::PointCloudScalarFieldFilter::Mode::Selected;
+    filter.names = CollectRequiredScalarFieldNames(runtimeState, session).Names();
+    filter.containsPatterns =
+        invisible_places::app::AlwaysResidentScalarFieldPatterns();
+    // Caustic assignments are persisted as file-order slots; whitelist them
+    // by index so the styles that reference them keep working, then
+    // MakeSceneRenderStyle translates the slot to the resident row.
+    const auto addCausticSlots = [&filter](const PointCloudStyleState& style) {
+        for (const auto slot : {style.causticMaskFieldSlot,
+                                style.causticEdgeFieldSlot,
+                                style.causticSeedFieldSlot}) {
+            if (slot >= 0) {
+                filter.sourceIndices.push_back(
+                    static_cast<std::uint32_t>(slot));
+            }
+        }
+    };
+    addCausticSlots(session.pointStyle);
+    for (const auto& visual : session.pointVisuals) {
+        addCausticSlots(visual.style);
+    }
+    return filter;
+}
+
+// First required-but-unloaded field of a session whose source offers it, or
+// nullopt when the session is fully satisfied.
+std::optional<std::string> SessionMissingRequiredScalarFieldName(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& session) {
+    if (session.kind != LayerKind::PointCloud || !session.cpuResident ||
+        session.offlinePointCloud == nullptr ||
+        session.availableScalarFields.empty()) {
+        return std::nullopt;
+    }
+    const auto required = CollectRequiredScalarFieldNames(runtimeState, session);
+    if (required.Empty()) {
+        return std::nullopt;
+    }
+    for (const auto& available : session.availableScalarFields) {
+        if (!required.Contains(available.name)) {
+            continue;
+        }
+        const bool resident = std::any_of(
+            session.scalarFields.begin(),
+            session.scalarFields.end(),
+            [&available](const invisible_places::io::ScalarFieldStats& field) {
+                return field.name == available.name;
+            });
+        if (!resident) {
+            return available.name;
+        }
+    }
+    return std::nullopt;
+}
+
+void StartScalarFieldLoad(
+    PreviewRuntimeState* runtimeState,
+    std::size_t sessionIndex,
+    const std::string& fieldName) {
+    if (runtimeState == nullptr ||
+        runtimeState->pendingScalarFieldLoad.has_value() ||
+        sessionIndex >= runtimeState->sessions.size()) {
+        return;
+    }
+    auto& session = runtimeState->sessions[sessionIndex];
+    if (session.offlinePointCloud == nullptr) {
+        return;
+    }
+    const auto expectedPointCount = session.offlinePointCloud->PointCount();
+    std::int32_t sourceIndex = -1;
+    for (const auto& available : session.availableScalarFields) {
+        if (available.name == fieldName) {
+            sourceIndex = static_cast<std::int32_t>(available.sourceIndex);
+            break;
+        }
+    }
+    if (sourceIndex < 0 || expectedPointCount == 0U) {
+        return;
+    }
+
+    auto backgroundState = std::make_shared<BackgroundScalarFieldLoadState>();
+    const auto sourcePath = session.sourcePath;
+    std::jthread backgroundThread{[backgroundState,
+                                   sourcePath,
+                                   fieldName,
+                                   sourceIndex,
+                                   expectedPointCount](std::stop_token stopToken) {
+        ScalarFieldLoadResult result;
+        result.stats.name = fieldName;
+        result.stats.sourceIndex = sourceIndex;
+        try {
+            result.values.assign(expectedPointCount, 0.0F);
+        } catch (const std::exception& error) {
+            result.errorMessage =
+                std::string{"Scalar field allocation failed: "} + error.what();
+            std::scoped_lock lock(backgroundState->mutex);
+            backgroundState->result = std::move(result);
+            return;
+        }
+        const auto streamResult =
+            invisible_places::io::StreamPointCloudSelectedValues(
+                sourcePath,
+                {.source = invisible_places::io::
+                     PointCloudSelectedValueSource::ScalarField,
+                 .scalarFieldName = fieldName},
+                [&](float value, std::uint64_t pointIndex) {
+                    if (stopToken.stop_requested()) {
+                        return false;
+                    }
+                    if (pointIndex < expectedPointCount) {
+                        result.values[static_cast<std::size_t>(pointIndex)] =
+                            value;
+                        result.stats.Include(value);
+                    }
+                    return true;
+                });
+        if (stopToken.stop_requested()) {
+            return;
+        }
+        if (!streamResult.success) {
+            result.errorMessage = streamResult.errorMessage.empty()
+                                      ? "Scalar field stream failed."
+                                      : streamResult.errorMessage;
+        } else if (streamResult.pointCount != expectedPointCount) {
+            result.errorMessage =
+                "Scalar field stream returned an unexpected point count.";
+        } else {
+            result.success = true;
+        }
+        std::scoped_lock lock(backgroundState->mutex);
+        backgroundState->result = std::move(result);
+    }};
+
+    runtimeState->pendingScalarFieldLoad = PendingScalarFieldLoad{
+        .sessionIndex = sessionIndex,
+        .fieldName = fieldName,
+        .contentGeneration = session.pointCloudContentGeneration,
+        .backgroundState = std::move(backgroundState),
+        .backgroundThread = std::move(backgroundThread),
+        .startedAt = std::chrono::steady_clock::now(),
+    };
+    runtimeState->statusMessage =
+        "Loading scalar field '" + fieldName + "' for " +
+        session.displayName + " in the background...";
+}
+
+// Streams at most one missing required field at a time, checked on a small
+// frame cadence. Loads are only started while the app is otherwise idle for
+// heavy work: never during an offline export, a whole-cloud load, or the
+// shared-cache high-memory slot.
+void EnsureRequiredScalarFieldsResident(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr ||
+        runtimeState->pendingScalarFieldLoad.has_value() ||
+        runtimeState->pendingLoad.has_value() ||
+        runtimeState->offlineRenderJob.active ||
+        runtimeState->water.waterSurfaceCacheWarmup.worker.joinable() ||
+        runtimeState->water.waterSurfaceCachePreprocessPending) {
+        return;
+    }
+    constexpr std::uint64_t kResidencyCheckIntervalFrames = 15U;
+    if ((runtimeState->scalarFieldResidencyPollCounter++ %
+         kResidencyCheckIntervalFrames) != 0U) {
+        return;
+    }
+    for (std::size_t sessionIndex = 0U;
+         sessionIndex < runtimeState->sessions.size();
+         ++sessionIndex) {
+        const auto missing = SessionMissingRequiredScalarFieldName(
+            *runtimeState,
+            runtimeState->sessions[sessionIndex]);
+        if (missing.has_value()) {
+            StartScalarFieldLoad(runtimeState, sessionIndex, missing.value());
+            return;
+        }
+    }
+}
+
 void BeginLayerLoad(
     std::size_t sessionIndex,
     PreviewRuntimeState* runtimeState,
@@ -9622,21 +9959,28 @@ void BeginLayerLoad(
     const auto layerKind = session.kind;
     const auto filePath = session.sourcePath;
     const auto transformPath = session.transformPath;
+    // Resolved on the main thread against the session's authored state at
+    // spawn time; fields referenced by later edits stream in on demand.
+    const auto scalarFieldFilter =
+        layerKind == LayerKind::PointCloud
+            ? CollectScalarFieldLoadFilter(*runtimeState, session)
+            : invisible_places::io::PointCloudScalarFieldFilter{};
     runtimeState->statusMessage = "Loading " + session.displayName + " in the background...";
     runtimeState->errorMessage.clear();
     std::cout << "Loading " << LayerKindLabel(layerKind) << ": " << filePath.filename().string() << std::endl;
 
     auto backgroundState = std::make_shared<BackgroundLayerLoadState>();
     std::jthread backgroundThread{
-        [backgroundState, layerKind, filePath, transformPath](std::stop_token stopToken) {
+        [backgroundState, layerKind, filePath, transformPath, scalarFieldFilter](std::stop_token stopToken) {
             if (stopToken.stop_requested()) {
                 return;
             }
 
-            LayerLoadResult result = layerKind == LayerKind::PointCloud
-                                         ? LayerLoadResult{invisible_places::io::LoadPointCloud(filePath)}
-                                         : LayerLoadResult{
-                                               invisible_places::io::LoadGaussianSplat(filePath, transformPath)};
+            LayerLoadResult result =
+                layerKind == LayerKind::PointCloud
+                    ? LayerLoadResult{invisible_places::io::LoadPointCloud(filePath, scalarFieldFilter)}
+                    : LayerLoadResult{
+                          invisible_places::io::LoadGaussianSplat(filePath, transformPath)};
             if (stopToken.stop_requested()) {
                 return;
             }
@@ -9659,10 +10003,106 @@ void BeginLayerLoad(
     };
 }
 
+// Completes one background scalar-field stream: appends the field to the
+// resident cloud (append keeps every existing slot stable, so name-resolved
+// bindings, colourise slots, and per-slot histogram caches stay valid) and
+// replaces the GPU scalar buffer for GPU-resident sessions.
+void PollPendingScalarFieldLoad(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || viewport == nullptr ||
+        !runtimeState->pendingScalarFieldLoad.has_value() ||
+        runtimeState->offlineRenderJob.active) {
+        return;
+    }
+    auto& pending = runtimeState->pendingScalarFieldLoad.value();
+    std::optional<ScalarFieldLoadResult> result;
+    {
+        std::scoped_lock lock(pending.backgroundState->mutex);
+        if (!pending.backgroundState->result.has_value()) {
+            return;
+        }
+        result = std::move(pending.backgroundState->result);
+        pending.backgroundState->result.reset();
+    }
+    const auto sessionIndex = pending.sessionIndex;
+    const auto contentGeneration = pending.contentGeneration;
+    const auto fieldName = pending.fieldName;
+    runtimeState->pendingScalarFieldLoad.reset();
+
+    if (!result->success) {
+        runtimeState->errorMessage = "Scalar field '" + fieldName +
+                                     "' failed to load: " + result->errorMessage;
+        runtimeState->statusMessage.clear();
+        std::cerr << runtimeState->errorMessage << std::endl;
+        return;
+    }
+    if (sessionIndex >= runtimeState->sessions.size()) {
+        return;
+    }
+    auto& session = runtimeState->sessions[sessionIndex];
+    if (session.offlinePointCloud == nullptr ||
+        session.pointCloudContentGeneration != contentGeneration ||
+        session.offlinePointCloud->PointCount() != result->values.size()) {
+        // The payload changed while the stream ran; the residency sweep will
+        // re-request the field against the new payload if still needed.
+        return;
+    }
+    auto& cloud = *session.offlinePointCloud;
+    const bool alreadyResident = std::any_of(
+        cloud.scalarFields.begin(),
+        cloud.scalarFields.end(),
+        [&fieldName](const invisible_places::io::ScalarFieldStats& field) {
+            return field.name == fieldName;
+        });
+    if (alreadyResident) {
+        return;
+    }
+    try {
+        cloud.scalarFieldValues.insert(
+            cloud.scalarFieldValues.end(),
+            result->values.begin(),
+            result->values.end());
+    } catch (const std::exception& error) {
+        runtimeState->errorMessage = "Scalar field '" + fieldName +
+                                     "' could not be appended: " + error.what();
+        runtimeState->statusMessage.clear();
+        return;
+    }
+    cloud.scalarFields.push_back(result->stats);
+    session.scalarFields = cloud.scalarFields;
+
+    if (session.gpuResident) {
+        try {
+            viewport->UploadPointCloudScalarFields(
+                sessionIndex,
+                cloud.scalarFields,
+                cloud.scalarFieldValues);
+        } catch (const std::exception& error) {
+            runtimeState->errorMessage =
+                "GPU upload failed while adding scalar field '" + fieldName +
+                "': " + std::string{error.what()};
+            runtimeState->statusMessage.clear();
+            return;
+        }
+    }
+    runtimeState->statusMessage = "Loaded scalar field '" + fieldName +
+                                  "' for " + session.displayName + ".";
+    runtimeState->errorMessage.clear();
+}
+
 void PollPendingLayerLoad(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
-    if (runtimeState == nullptr || viewport == nullptr || !runtimeState->pendingLoad.has_value()) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return;
+    }
+    // Scalar-field residency shares this poll site so every frame pump —
+    // live loop, smokes, benchmarks — services field streams without extra
+    // wiring. Both calls are cheap no-ops in the common case.
+    PollPendingScalarFieldLoad(runtimeState, viewport);
+    EnsureRequiredScalarFieldsResident(runtimeState);
+    if (!runtimeState->pendingLoad.has_value()) {
         return;
     }
 
@@ -21816,6 +22256,7 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
     document.constantUpdateView = runtimeState.projectSettings.constantUpdateView;
     document.liveVisualEffects = runtimeState.projectSettings.liveVisualEffects;
     document.previewPerformanceMode = runtimeState.projectSettings.previewPerformanceMode;
+    document.loadAllScalarFields = runtimeState.projectSettings.loadAllScalarFields;
     document.sidePanelPinned = runtimeState.sidePanel.pinned;
     document.showLidarTab = runtimeState.showLidarTab;
     document.showGsplatTab = runtimeState.showGsplatTab;
@@ -22448,6 +22889,38 @@ bool EnsureFullDensityExportSourcesReady(
         runtimeState->errorMessage.clear();
         return false;
     }
+
+    // Every export source is loaded; now every scalar field its authored
+    // state references must be resident, so the frozen export renders with
+    // the same field data the preview resolves.
+    for (const auto& scene : runtimeState->pointCloudScenes) {
+        if (!scene.displayLoaded || !scene.displayVisible) {
+            continue;
+        }
+        for (const auto sessionIndex : SceneFullDensityExportSessionIndices(scene)) {
+            if (!sessionIndex.has_value() ||
+                sessionIndex.value() >= runtimeState->sessions.size()) {
+                continue;
+            }
+            const auto missing = SessionMissingRequiredScalarFieldName(
+                *runtimeState,
+                runtimeState->sessions[sessionIndex.value()]);
+            if (!missing.has_value()) {
+                continue;
+            }
+            if (!runtimeState->pendingScalarFieldLoad.has_value()) {
+                StartScalarFieldLoad(
+                    runtimeState,
+                    sessionIndex.value(),
+                    missing.value());
+            }
+            runtimeState->statusMessage =
+                "Loading scalar field '" + missing.value() +
+                "' for export; start the export again when loading finishes.";
+            runtimeState->errorMessage.clear();
+            return false;
+        }
+    }
     return true;
 }
 
@@ -22786,6 +23259,7 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->projectSettings.constantUpdateView = document.constantUpdateView;
     runtimeState->projectSettings.liveVisualEffects = document.liveVisualEffects;
     runtimeState->projectSettings.previewPerformanceMode = document.previewPerformanceMode;
+    runtimeState->projectSettings.loadAllScalarFields = document.loadAllScalarFields;
     runtimeState->sidePanel.pinned = document.sidePanelPinned;
     runtimeState->showLidarTab = document.showLidarTab;
     runtimeState->showGsplatTab = document.showGsplatTab;
@@ -50118,8 +50592,45 @@ void DrawProjectPanel(
             " overlapping points blend in the preview only; animation exports are unaffected."
             " Off keeps the original (slower) preview appearance.");
     }
+    ImGui::Checkbox("Load All Scalar Fields", &settings.loadAllScalarFields);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Bypasses scalar-field residency: newly loaded point clouds keep every on-disk"
+            " field in CPU and GPU memory (the pre-filtering behaviour, tens of GB for 1 mm"
+            " scenes). Off loads only the fields the project references and streams others in"
+            " on demand. Takes effect on each cloud's next load.");
+    }
     ImGui::TextDisabled("Point preview: full cloud, no LOD/downsample.");
     EndPanelSection();
+    }
+    if (BeginPanelSection("Scalar Field Residency")) {
+        std::uint64_t residentCpuBytes = 0U;
+        for (const auto& session : runtimeState->sessions) {
+            if (session.kind != LayerKind::PointCloud ||
+                session.offlinePointCloud == nullptr) {
+                continue;
+            }
+            const auto& cloud = *session.offlinePointCloud;
+            residentCpuBytes +=
+                cloud.scalarFieldValues.size() * sizeof(float);
+            if (session.availableScalarFields.empty()) {
+                continue;
+            }
+            ImGui::Text(
+                "%s: %zu / %zu fields resident",
+                session.displayName.c_str(),
+                cloud.scalarFields.size(),
+                session.availableScalarFields.size());
+        }
+        ImGui::Text(
+            "CPU scalar-field payload: %.2f GB",
+            static_cast<double>(residentCpuBytes) / (1024.0 * 1024.0 * 1024.0));
+        if (runtimeState->pendingScalarFieldLoad.has_value()) {
+            ImGui::TextDisabled(
+                "Streaming '%s'...",
+                runtimeState->pendingScalarFieldLoad->fieldName.c_str());
+        }
+        EndPanelSection();
     }
     DrawProjectSection(runtimeState, viewport);
 }
@@ -57826,11 +58337,23 @@ BuildActiveTimingColouriseFieldCatalog(
             runtimeState->sessions[
                 indices.value()[layer]];
         fields[layer].hasNormals = session.hasNormals;
-        fields[layer].scalarFieldNames.reserve(
-            session.scalarFields.size());
-        for (const auto& field : session.scalarFields) {
-            fields[layer].scalarFieldNames.push_back(
-                field.name);
+        // The catalog offers every on-disk field, not only the resident
+        // subset: choosing an unloaded field streams it in on demand.
+        if (!session.availableScalarFields.empty()) {
+            fields[layer].scalarFieldNames.reserve(
+                session.availableScalarFields.size());
+            for (const auto& available :
+                 session.availableScalarFields) {
+                fields[layer].scalarFieldNames.push_back(
+                    available.name);
+            }
+        } else {
+            fields[layer].scalarFieldNames.reserve(
+                session.scalarFields.size());
+            for (const auto& field : session.scalarFields) {
+                fields[layer].scalarFieldNames.push_back(
+                    field.name);
+            }
         }
     }
     return invisible_places::timing::

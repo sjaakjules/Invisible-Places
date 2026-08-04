@@ -21,7 +21,7 @@
 namespace invisible_places::serialization {
 
 inline constexpr std::size_t kMaxSerializedWaterRippleRuntimeCacheMemberships = 250'000U;
-inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 64U;
+inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 65U;
 inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 21U;
 inline constexpr std::uint32_t kAnimationDocumentSchemaVersion = 14U;
 inline constexpr std::uint32_t kWaterPathCacheSidecarSchemaVersion = 1U;
@@ -176,6 +176,10 @@ struct ProjectDocument {
     bool constantUpdateView = false;
     bool liveVisualEffects = false;
     bool previewPerformanceMode = false;
+    // Bypasses scalar-field residency so loads keep every on-disk field
+    // (the pre-schema-65 behaviour). Off = filtered loads with on-demand
+    // field streaming.
+    bool loadAllScalarFields = false;
     bool sidePanelPinned = false;
     bool showLidarTab = false;
     bool showGsplatTab = false;
