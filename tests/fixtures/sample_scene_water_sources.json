@@ -1,5 +1,5 @@
 {
-  "schema_version": 21,
+  "schema_version": 22,
   "fixture_metadata": {
     "scene_group": "SampleScene",
     "display_spacing_micrometres": 3000,
@@ -1817,7 +1817,53 @@
       "trail_profile": "Global",
       "trail_profile_locked": false,
       "use_surface_guide": true,
-      "show_trail": true
+      "show_trail": true,
+      "control_point_lane_widths": [
+        {
+          "mode": "inherit",
+          "value": 1.0
+        },
+        {
+          "mode": "inherit",
+          "value": 1.0
+        },
+        {
+          "mode": "inherit",
+          "value": 1.0
+        },
+        {
+          "mode": "inherit",
+          "value": 1.0
+        },
+        {
+          "mode": "inherit",
+          "value": 1.0
+        },
+        {
+          "mode": "inherit",
+          "value": 1.0
+        },
+        {
+          "mode": "inherit",
+          "value": 1.0
+        },
+        {
+          "mode": "inherit",
+          "value": 1.0
+        },
+        {
+          "mode": "inherit",
+          "value": 1.0
+        },
+        {
+          "mode": "inherit",
+          "value": 1.0
+        },
+        {
+          "mode": "inherit",
+          "value": 1.0
+        }
+      ]
     }
   ],
   "water_seepage_nodes": [

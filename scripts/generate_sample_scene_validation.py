@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Refresh the local SampleScene validation project from durable fixtures.
 
-The tracked schema-20 water fixture and the current validation project are the
+The tracked schema-22 water fixture and the current validation project are the
 default inputs, so regeneration never depends on or rewrites an authored
 exhibition project. An explicit main-project option can still refresh the water
 fixture while those authored objects exist. The helper builds a lightweight
@@ -24,7 +24,8 @@ from typing import Any
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
-PROJECT_SCHEMA_VERSION = 65
+PROJECT_SCHEMA_VERSION = 66
+WATER_SOURCES_SCHEMA_VERSION = 22
 DEFAULT_MAIN_PROJECT = REPOSITORY_ROOT / "Saved" / "exhibitionScene_project.json"
 DEFAULT_FIXTURE = REPOSITORY_ROOT / "tests" / "fixtures" / "sample_scene_water_sources.json"
 DEFAULT_VALIDATION_PROJECT = (
@@ -90,7 +91,38 @@ STATE_WATER_KEYS = (
 
 
 def upgrade_water_contract(value: dict[str, Any], *, project: bool) -> None:
-    """Apply the schema-45/19 automatic Mesh Flow contract."""
+    """Apply the current project/water-source authored-data contract."""
+
+    value.pop("water_shoreline_default_settings", None)
+    value.pop("selected_water_shoreline_profile", None)
+    for profile in value.get("water_shoreline_profiles", []):
+        if not isinstance(profile, dict):
+            continue
+        profile.setdefault("object_override", False)
+        profile.setdefault("shoreline_instance_id", 0)
+        profile.setdefault("base_profile_name", "")
+
+    if project:
+        # Current project files cannot derive Shoreline from a Visual. Keep
+        # the compatibility fields structurally valid but disabled wherever a
+        # template still carries them.
+        def clear_style(style: Any) -> None:
+            if isinstance(style, dict):
+                style["shoreline_wave_enabled"] = False
+
+        for visual in value.get("point_visuals", []):
+            if isinstance(visual, dict):
+                clear_style(visual.get("point_style"))
+        for state in value.get("scene_visual_states", []):
+            if isinstance(state, dict) and isinstance(state.get("visual"), dict):
+                clear_style(state["visual"].get("point_style"))
+        for layer in value.get("layers", []):
+            if not isinstance(layer, dict):
+                continue
+            clear_style(layer.get("point_style"))
+            for visual in layer.get("point_visuals", []):
+                if isinstance(visual, dict):
+                    clear_style(visual.get("point_style"))
 
     value["water_show_flow_trails" if project else "show_flow_trails"] = value.get(
         "water_show_flow_trails" if project else "show_flow_trails", True
@@ -228,6 +260,22 @@ def upgrade_water_contract(value: dict[str, Any], *, project: bool) -> None:
             for source in container.get(source_key, []):
                 if isinstance(source, dict):
                     source.setdefault("show_trail", True)
+                    if source_key == "water_manual_flow_paths":
+                        point_count = len(source.get("control_points", []))
+                        widths = source.get("control_point_lane_widths", [])
+                        if not isinstance(widths, list):
+                            widths = []
+                        widths = [
+                            width
+                            if isinstance(width, dict)
+                            else {"mode": "inherit", "value": 1.0}
+                            for width in widths[:point_count]
+                        ]
+                        widths.extend(
+                            {"mode": "inherit", "value": 1.0}
+                            for _ in range(point_count - len(widths))
+                        )
+                        source["control_point_lane_widths"] = widths
         for node in container.get("water_seepage_nodes", []):
             if not isinstance(node, dict):
                 continue
@@ -386,7 +434,7 @@ def build_water_fixture(project: dict[str, Any], state: dict[str, Any]) -> dict[
     seepage = copy.deepcopy(named_object(state["water_seepage_nodes"], "SampleSeepage"))
 
     fixture: dict[str, Any] = {
-        "schema_version": 21,
+        "schema_version": WATER_SOURCES_SCHEMA_VERSION,
         "fixture_metadata": {
             "scene_group": "SampleScene",
             "display_spacing_micrometres": DISPLAY_SPACING,
@@ -440,8 +488,11 @@ def build_water_fixture(project: dict[str, Any], state: dict[str, Any]) -> dict[
 
 
 def validate_water_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
-    if fixture.get("schema_version") != 21:
-        raise ValueError("SampleScene water fixture must use water-source schema 21")
+    if fixture.get("schema_version") != WATER_SOURCES_SCHEMA_VERSION:
+        raise ValueError(
+            "SampleScene water fixture must use water-source schema "
+            f"{WATER_SOURCES_SCHEMA_VERSION}"
+        )
     metadata = fixture.get("fixture_metadata")
     if not isinstance(metadata, dict) or metadata.get("scene_group") != "SampleScene":
         raise ValueError("SampleScene water fixture has invalid fixture metadata")
@@ -694,8 +745,10 @@ def main() -> int:
         upgrade_water_contract(fixture, project=False)
         atomic_write_json(fixture_path, fixture)
     else:
-        fixture = validate_water_fixture(load_json(fixture_path))
+        fixture = load_json(fixture_path)
         upgrade_water_contract(fixture, project=False)
+        fixture["schema_version"] = WATER_SOURCES_SCHEMA_VERSION
+        fixture = validate_water_fixture(fixture)
         atomic_write_json(fixture_path, fixture)
 
     validation = build_validation_project(project, fixture)

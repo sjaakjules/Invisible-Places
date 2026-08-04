@@ -27,6 +27,7 @@ using nlohmann::json;
 using invisible_places::camera::AnimationExportSettings;
 using invisible_places::camera::AnimationPath;
 using invisible_places::camera::AnimationPathKey;
+using invisible_places::camera::AnimationLinkedLoopMetadata;
 using invisible_places::camera::AnimationLoopSmoothingMetadata;
 using invisible_places::camera::CameraShot;
 using invisible_places::camera::CameraState;
@@ -131,6 +132,12 @@ static_assert(
 static_assert(
     kProjectDocumentSchemaVersion >=
     kShorelineInstancesProjectSchemaVersion);
+static_assert(
+    kProjectDocumentSchemaVersion >=
+    kWaterOwnedShorelineProjectSchemaVersion);
+static_assert(
+    kWaterSourcesDocumentSchemaVersion >=
+    kWaterOwnedShorelineSourcesSchemaVersion);
 
 constexpr std::string_view kProjectVisualEditedSuffix = "_edited";
 constexpr std::string_view kProjectVisualLegacyEditedSuffix = "_Edited";
@@ -917,6 +924,9 @@ json SerializePointCloudShorelineWaveProfile(
     return json{
         {"name", profile.name},
         {"settings", SerializePointCloudShorelineWaveSettings(profile.settings)},
+        {"object_override", profile.objectOverride},
+        {"shoreline_instance_id", profile.shorelineInstanceId},
+        {"base_profile_name", profile.baseProfileName},
     };
 }
 
@@ -928,6 +938,14 @@ PointCloudShorelineWaveProfile ParsePointCloudShorelineWaveProfile(
         profile.settings =
             ParsePointCloudShorelineWaveSettings(profileJson.at("settings"));
     }
+    profile.objectOverride =
+        profileJson.value("object_override", profile.objectOverride);
+    profile.shorelineInstanceId =
+        profileJson.value(
+            "shoreline_instance_id",
+            profile.shorelineInstanceId);
+    profile.baseProfileName =
+        profileJson.value("base_profile_name", profile.baseProfileName);
     return profile;
 }
 
@@ -2415,6 +2433,44 @@ ParseAnimationLoopSmoothingMetadata(const json& smoothingJson) {
     return smoothing;
 }
 
+json SerializeAnimationLinkedLoopMetadata(
+    const AnimationLinkedLoopMetadata& linkedLoop) {
+    return json{
+        {"first_file_name", linkedLoop.firstFileName},
+        {"second_file_name", linkedLoop.secondFileName},
+        {"first_start_key_id", linkedLoop.firstStartKeyId},
+        {"first_start_position", linkedLoop.firstStartPosition},
+        {"padding_frames", linkedLoop.paddingFrames},
+    };
+}
+
+std::optional<AnimationLinkedLoopMetadata>
+ParseAnimationLinkedLoopMetadata(const json& linkedLoopJson) {
+    if (!linkedLoopJson.is_object()) {
+        return std::nullopt;
+    }
+    AnimationLinkedLoopMetadata linkedLoop;
+    linkedLoop.firstFileName =
+        linkedLoopJson.value("first_file_name", std::string{});
+    linkedLoop.secondFileName =
+        linkedLoopJson.value("second_file_name", std::string{});
+    linkedLoop.firstStartKeyId =
+        linkedLoopJson.value("first_start_key_id", std::string{});
+    linkedLoop.firstStartPosition = std::clamp(
+        linkedLoopJson.value("first_start_position", 0.0F),
+        0.0F,
+        1.0F);
+    linkedLoop.paddingFrames = std::clamp<std::int32_t>(
+        linkedLoopJson.value("padding_frames", 0),
+        -3600,
+        3600);
+    if (linkedLoop.firstFileName.empty() ||
+        linkedLoop.secondFileName.empty()) {
+        return std::nullopt;
+    }
+    return linkedLoop;
+}
+
 json SerializeAnimationExportSettings(const AnimationExportSettings& settings) {
     return json{
         {"output_directory", settings.outputDirectory},
@@ -2469,6 +2525,10 @@ json SerializeAnimationPath(const AnimationPath& path) {
             SerializeAnimationLoopSmoothingMetadata(
                 path.loopTransitionSmoothing.value());
     }
+    if (path.linkedLoop.has_value()) {
+        pathJson["linked_loop"] = SerializeAnimationLinkedLoopMetadata(
+            path.linkedLoop.value());
+    }
     if (path.tempWaterAnimationTrailSettings.has_value()) {
         pathJson["temp_water_animation_trail_settings"] =
             SerializeWaterAnimationTrailSettings(path.tempWaterAnimationTrailSettings.value());
@@ -2514,6 +2574,10 @@ AnimationPath ParseAnimationPath(const json& pathJson) {
     if (pathJson.contains("loop_transition_smoothing")) {
         path.loopTransitionSmoothing = ParseAnimationLoopSmoothingMetadata(
             pathJson.at("loop_transition_smoothing"));
+    }
+    if (pathJson.contains("linked_loop")) {
+        path.linkedLoop = ParseAnimationLinkedLoopMetadata(
+            pathJson.at("linked_loop"));
     }
     if (pathJson.contains("water_animation_trail_settings")) {
         path.waterAnimationTrailSettings =
@@ -2994,6 +3058,36 @@ WaterEmitter ParseWaterEmitter(const json& emitterJson) {
     return emitter;
 }
 
+const char* WaterManualFlowPathLaneWidthModeName(
+    invisible_places::water::WaterManualFlowPathLaneWidthMode mode) {
+    using invisible_places::water::WaterManualFlowPathLaneWidthMode;
+    switch (mode) {
+        case WaterManualFlowPathLaneWidthMode::Absolute:
+            return "absolute";
+        case WaterManualFlowPathLaneWidthMode::Relative:
+            return "relative";
+        case WaterManualFlowPathLaneWidthMode::Inherit:
+        default:
+            return "inherit";
+    }
+}
+
+invisible_places::water::WaterManualFlowPathLaneWidthMode
+ParseWaterManualFlowPathLaneWidthMode(const json& value) {
+    using invisible_places::water::WaterManualFlowPathLaneWidthMode;
+    if (!value.is_string()) {
+        return WaterManualFlowPathLaneWidthMode::Inherit;
+    }
+    const auto name = value.get<std::string>();
+    if (name == "absolute") {
+        return WaterManualFlowPathLaneWidthMode::Absolute;
+    }
+    if (name == "relative") {
+        return WaterManualFlowPathLaneWidthMode::Relative;
+    }
+    return WaterManualFlowPathLaneWidthMode::Inherit;
+}
+
 json SerializeWaterManualFlowPath(const WaterManualFlowPathSource& source) {
     json sourceJson{
         {"id", source.id},
@@ -3007,9 +3101,19 @@ json SerializeWaterManualFlowPath(const WaterManualFlowPathSource& source) {
         {"rain_response", source.rainResponse},
         {"show_trail", source.showTrail},
         {"control_points", json::array()},
+        {"control_point_lane_widths", json::array()},
     };
-    for (const auto& point : source.controlPoints) {
+    for (std::size_t index = 0U; index < source.controlPoints.size(); ++index) {
+        const auto& point = source.controlPoints[index];
         sourceJson["control_points"].push_back(std::array<float, 3>{point.x, point.y, point.z});
+        const auto laneWidth =
+            index < source.controlPointLaneWidths.size()
+                ? source.controlPointLaneWidths[index]
+                : invisible_places::water::WaterManualFlowPathLaneWidth{};
+        sourceJson["control_point_lane_widths"].push_back(json{
+            {"mode", WaterManualFlowPathLaneWidthModeName(laneWidth.mode)},
+            {"value", std::isfinite(laneWidth.value) ? laneWidth.value : 1.0F},
+        });
     }
     return sourceJson;
 }
@@ -3043,6 +3147,29 @@ WaterManualFlowPathSource ParseWaterManualFlowPath(
             source.controlPoints.push_back({point[0], point[1], point[2]});
         }
     }
+    if (sourceJson.contains("control_point_lane_widths") &&
+        sourceJson.at("control_point_lane_widths").is_array()) {
+        for (const auto& widthJson :
+             sourceJson.at("control_point_lane_widths")) {
+            invisible_places::water::WaterManualFlowPathLaneWidth laneWidth;
+            if (widthJson.is_object()) {
+                if (widthJson.contains("mode")) {
+                    laneWidth.mode =
+                        ParseWaterManualFlowPathLaneWidthMode(
+                            widthJson.at("mode"));
+                }
+                const float value =
+                    widthJson.value("value", laneWidth.value);
+                laneWidth.value = std::isfinite(value)
+                                      ? std::clamp(value, 0.0F, 100.0F)
+                                      : 1.0F;
+            }
+            source.controlPointLaneWidths.push_back(laneWidth);
+        }
+    }
+    source.controlPointLaneWidths.resize(
+        source.controlPoints.size(),
+        invisible_places::water::WaterManualFlowPathLaneWidth{});
     return source;
 }
 
@@ -5464,7 +5591,7 @@ WaterRippleRuntimeCacheDocument ParseWaterRippleRuntimeCache(const json& cacheJs
 }
 
 json SerializeWaterFlowTrailSettings(const WaterFlowTrailSettings& settings) {
-    return json{
+    json serialized{
         {"enabled", settings.enabled},
         {"trail_count_total", settings.trailCountTotal},
         {"lane_count", settings.laneCount},
@@ -5486,6 +5613,25 @@ json SerializeWaterFlowTrailSettings(const WaterFlowTrailSettings& settings) {
         {"speed_meters_per_second", settings.speedMetersPerSecond},
         {"seed", settings.seed},
     };
+    const bool fadeSettingsAuthored =
+        settings.startFadeEnabled || settings.endFadeEnabled ||
+        settings.startFadeFullDistanceMeters != 0.25F ||
+        settings.startFadeRandomBeginDistanceMeters != 0.10F ||
+        settings.endFadeFullDistanceMeters != 0.25F ||
+        settings.endFadeRandomBeginDistanceMeters != 0.10F;
+    if (fadeSettingsAuthored) {
+        serialized["start_fade_enabled"] = settings.startFadeEnabled;
+        serialized["start_fade_full_distance_meters"] =
+            settings.startFadeFullDistanceMeters;
+        serialized["start_fade_random_begin_distance_meters"] =
+            settings.startFadeRandomBeginDistanceMeters;
+        serialized["end_fade_enabled"] = settings.endFadeEnabled;
+        serialized["end_fade_full_distance_meters"] =
+            settings.endFadeFullDistanceMeters;
+        serialized["end_fade_random_begin_distance_meters"] =
+            settings.endFadeRandomBeginDistanceMeters;
+    }
+    return serialized;
 }
 
 WaterFlowTrailSettings ParseWaterFlowTrailSettings(const json& settingsJson) {
@@ -5507,6 +5653,34 @@ WaterFlowTrailSettings ParseWaterFlowTrailSettings(const json& settingsJson) {
     settings.trailStreakLengthMeters = settingsJson.value(
         "trail_streak_length_meters",
         settingsJson.value("stream_world_length_meters", settings.trailStreakLengthMeters));
+    settings.startFadeEnabled =
+        settingsJson.value("start_fade_enabled", settings.startFadeEnabled);
+    settings.startFadeFullDistanceMeters = std::clamp(
+        settingsJson.value(
+            "start_fade_full_distance_meters",
+            settings.startFadeFullDistanceMeters),
+        0.0F,
+        50.0F);
+    settings.startFadeRandomBeginDistanceMeters = std::clamp(
+        settingsJson.value(
+            "start_fade_random_begin_distance_meters",
+            settings.startFadeRandomBeginDistanceMeters),
+        0.0F,
+        50.0F);
+    settings.endFadeEnabled =
+        settingsJson.value("end_fade_enabled", settings.endFadeEnabled);
+    settings.endFadeFullDistanceMeters = std::clamp(
+        settingsJson.value(
+            "end_fade_full_distance_meters",
+            settings.endFadeFullDistanceMeters),
+        0.0F,
+        50.0F);
+    settings.endFadeRandomBeginDistanceMeters = std::clamp(
+        settingsJson.value(
+            "end_fade_random_begin_distance_meters",
+            settings.endFadeRandomBeginDistanceMeters),
+        0.0F,
+        50.0F);
     settings.surfaceOffsetMeters = settingsJson.value("surface_offset_meters", settings.surfaceOffsetMeters);
     settings.pathAttraction = settingsJson.value("path_attraction", settings.pathAttraction);
     settings.laneSpreadMeters = settingsJson.value("lane_spread_meters", settings.laneSpreadMeters);
@@ -6648,12 +6822,31 @@ WaterAnimationTrailSettings ParseWaterAnimationTrailSettings(const json& setting
 }
 
 json SerializeWaterTrailGeometrySettings(const WaterTrailGeometrySettings& settings) {
-    return json{
+    json serialized{
         {"trail_length_meters", settings.trailLengthMeters},
         {"point_spacing_meters", settings.pointSpacingMeters},
         {"width_meters", settings.widthMeters},
         {"streak_length_meters", settings.streakLengthMeters},
     };
+    const bool fadeSettingsAuthored =
+        settings.startFadeEnabled || settings.endFadeEnabled ||
+        settings.startFadeFullDistanceMeters != 0.25F ||
+        settings.startFadeRandomBeginDistanceMeters != 0.10F ||
+        settings.endFadeFullDistanceMeters != 0.25F ||
+        settings.endFadeRandomBeginDistanceMeters != 0.10F;
+    if (fadeSettingsAuthored) {
+        serialized["start_fade_enabled"] = settings.startFadeEnabled;
+        serialized["start_fade_full_distance_meters"] =
+            settings.startFadeFullDistanceMeters;
+        serialized["start_fade_random_begin_distance_meters"] =
+            settings.startFadeRandomBeginDistanceMeters;
+        serialized["end_fade_enabled"] = settings.endFadeEnabled;
+        serialized["end_fade_full_distance_meters"] =
+            settings.endFadeFullDistanceMeters;
+        serialized["end_fade_random_begin_distance_meters"] =
+            settings.endFadeRandomBeginDistanceMeters;
+    }
+    return serialized;
 }
 
 WaterTrailGeometrySettings ParseWaterTrailGeometrySettings(const json& settingsJson) {
@@ -6670,6 +6863,34 @@ WaterTrailGeometrySettings ParseWaterTrailGeometrySettings(const json& settingsJ
             settingsJson.value("world_length_meters", settings.streakLengthMeters)),
         0.001F,
         5.0F);
+    settings.startFadeEnabled =
+        settingsJson.value("start_fade_enabled", settings.startFadeEnabled);
+    settings.startFadeFullDistanceMeters = std::clamp(
+        settingsJson.value(
+            "start_fade_full_distance_meters",
+            settings.startFadeFullDistanceMeters),
+        0.0F,
+        50.0F);
+    settings.startFadeRandomBeginDistanceMeters = std::clamp(
+        settingsJson.value(
+            "start_fade_random_begin_distance_meters",
+            settings.startFadeRandomBeginDistanceMeters),
+        0.0F,
+        50.0F);
+    settings.endFadeEnabled =
+        settingsJson.value("end_fade_enabled", settings.endFadeEnabled);
+    settings.endFadeFullDistanceMeters = std::clamp(
+        settingsJson.value(
+            "end_fade_full_distance_meters",
+            settings.endFadeFullDistanceMeters),
+        0.0F,
+        50.0F);
+    settings.endFadeRandomBeginDistanceMeters = std::clamp(
+        settingsJson.value(
+            "end_fade_random_begin_distance_meters",
+            settings.endFadeRandomBeginDistanceMeters),
+        0.0F,
+        50.0F);
     return settings;
 }
 
@@ -8521,8 +8742,6 @@ bool SaveProjectDocument(
         {"water_caustic_look_settings", SerializeWaterCausticLookSettings(document.waterCausticLookSettings)},
         {"water_seepage_nodes", json::array()},
         {"water_shoreline_profiles", json::array()},
-        {"selected_water_shoreline_profile",
-         document.selectedWaterShorelineProfileName},
         {"water_seepage_default_look", SerializeWaterSeepageLookSettings(document.waterSeepageDefaultLook)},
         {"water_seepage_look_profiles", json::array()},
         {"water_seepage_response_profiles", json::array()},
@@ -8571,11 +8790,9 @@ bool SaveProjectDocument(
     if (document.tempExportPreset.has_value()) {
         projectJson["temp_export_preset"] = SerializeExportPreset(document.tempExportPreset.value());
     }
-    if (document.waterShorelineDefaultSettings.has_value()) {
-        projectJson["water_shoreline_default_settings"] =
-            SerializePointCloudShorelineWaveSettings(
-                document.waterShorelineDefaultSettings.value());
-    }
+    // `water_shoreline_default_settings` is load-only legacy state. Current
+    // files persist only explicitly named Water profiles and their effect
+    // instances, so opening and saving cannot manufacture a Default profile.
     if (!document.waterSceneStates.empty()) {
         for (const auto& state : document.waterSceneStates) {
             auto preparedState = PrepareWaterSceneStateForSave(document, state, outputPath);
@@ -8620,6 +8837,8 @@ bool SaveProjectDocument(
                 {"id", instance.id},
                 {"name", instance.name},
                 {"enabled", instance.enabled},
+                {"profile_name", instance.profileName},
+                {"base_profile_name", instance.baseProfileName},
                 {"settings",
                  SerializePointCloudShorelineWaveSettings(
                      instance.settings)},
@@ -8751,6 +8970,7 @@ std::optional<ProjectDocument> LoadProjectDocument(
 
     ProjectDocument document;
     document.schemaVersion = projectJson->value("schema_version", 1U);
+    document.sourceSchemaVersion = document.schemaVersion;
     const bool hasNativeTimingTakes =
         projectJson->contains("timing_takes") &&
         projectJson->at("timing_takes").is_array();
@@ -8897,6 +9117,10 @@ std::optional<ProjectDocument> LoadProjectDocument(
             instance.id = instanceJson.value("id", 0U);
             instance.name = instanceJson.value("name", std::string{"Shoreline"});
             instance.enabled = instanceJson.value("enabled", true);
+            instance.profileName =
+                instanceJson.value("profile_name", std::string{});
+            instance.baseProfileName =
+                instanceJson.value("base_profile_name", std::string{});
             if (instanceJson.contains("settings")) {
                 instance.settings = ParsePointCloudShorelineWaveSettings(
                     instanceJson.at("settings"));
@@ -9457,8 +9681,6 @@ nlohmann::json WaterSourcesDocumentToJson(
         {"water_manual_flow_paths", json::array()},
         {"water_seepage_nodes", json::array()},
         {"water_shoreline_profiles", json::array()},
-        {"selected_water_shoreline_profile",
-         document.selectedShorelineProfileName},
         {"water_seepage_default_look", SerializeWaterSeepageLookSettings(document.seepageDefaultLook)},
         {"water_seepage_look_profiles", json::array()},
         {"water_seepage_response_profiles", json::array()},
@@ -9470,11 +9692,8 @@ nlohmann::json WaterSourcesDocumentToJson(
         sourcesJson["temp_water_source_settings"] =
             SerializeWaterSourceSettings(document.tempSourceSettings.value());
     }
-    if (document.shorelineDefaultSettings.has_value()) {
-        sourcesJson["water_shoreline_default_settings"] =
-            SerializePointCloudShorelineWaveSettings(
-                document.shorelineDefaultSettings.value());
-    }
+    // `water_shoreline_default_settings` remains readable for migration but
+    // is deliberately never emitted by the current Water document schema.
     if (document.tempCausticLookSettings.has_value()) {
         sourcesJson["temp_water_caustic_look_settings"] =
             SerializeWaterCausticLookSettings(document.tempCausticLookSettings.value());
@@ -9521,6 +9740,8 @@ nlohmann::json WaterSourcesDocumentToJson(
                 {"id", instance.id},
                 {"name", instance.name},
                 {"enabled", instance.enabled},
+                {"profile_name", instance.profileName},
+                {"base_profile_name", instance.baseProfileName},
                 {"settings",
                  SerializePointCloudShorelineWaveSettings(
                      instance.settings)},
@@ -9616,6 +9837,10 @@ static WaterSourcesDocument ParseWaterSourcesDocumentJsonValue(
             instance.id = instanceJson.value("id", 0U);
             instance.name = instanceJson.value("name", std::string{"Shoreline"});
             instance.enabled = instanceJson.value("enabled", true);
+            instance.profileName =
+                instanceJson.value("profile_name", std::string{});
+            instance.baseProfileName =
+                instanceJson.value("base_profile_name", std::string{});
             if (instanceJson.contains("settings")) {
                 instance.settings = ParsePointCloudShorelineWaveSettings(
                     instanceJson.at("settings"));

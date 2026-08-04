@@ -430,6 +430,12 @@ enum class AnimationEditTarget {
     Focus
 };
 
+enum class LinkedLoopLiveCameraMode : std::uint8_t {
+    InterleavedOverlay = 0,
+    SourceA,
+    SourceB,
+};
+
 enum class ManualFlowPathGizmoDragKind {
     None,
     Axis,
@@ -671,6 +677,22 @@ struct AnimationTimelineViewDragState {
     invisible_places::timing::TimelineViewRange originalRange{};
 };
 
+enum class AnimationLoopDiagnosticsStatus : std::uint8_t {
+    Baseline = 0,
+    Applied,
+    Rejected,
+    Invalid,
+};
+
+struct AnimationLoopDiagnostics {
+    std::filesystem::path firstFilePath;
+    std::filesystem::path secondFilePath;
+    AnimationLoopDiagnosticsStatus status =
+        AnimationLoopDiagnosticsStatus::Baseline;
+    invisible_places::camera::AnimationLoopTransitionMetrics metrics{};
+    std::string message;
+};
+
 struct AnimationPanelState {
     std::optional<AnimationPath> currentPath;
     std::string currentFilePath;
@@ -696,6 +718,14 @@ struct AnimationPanelState {
     bool currentPathUsesEdited = false;
     std::filesystem::path loopSmoothingPartnerPath;
     float loopSmoothingMaxEndMovePercent = 10.0F;
+    std::optional<AnimationLoopDiagnostics> loopSmoothingDiagnostics;
+    bool showLinkedLoopOverlap = true;
+    int linkedLoopPaddingFrames = 0;
+    std::string linkedLoopStartKeyId;
+    LinkedLoopLiveCameraMode linkedLoopLiveCameraMode =
+        LinkedLoopLiveCameraMode::InterleavedOverlay;
+    bool linkedLoopTemporalOverlayWasActive = false;
+    bool linkedLoopTemporalRenderFirstNext = true;
     std::optional<std::size_t> renamingFileIndex;
     std::string fileRenameBuffer;
     bool focusFileRename = false;
@@ -1843,6 +1873,17 @@ struct WaterRegionEditorState {
     bool consumedViewportInputThisFrame = false;
 };
 
+struct ManualFlowPathLaneWidthDragState {
+    bool active = false;
+    bool hasMoved = false;
+    std::size_t nodeIndex = 0U;
+    ImVec2 centre{};
+    ImVec2 startMouse{};
+    ImVec2 screenDirection{1.0F, 0.0F};
+    float pixelsPerWorldUnit = 1.0F;
+    float globalLaneSpanMeters = 0.12F;
+};
+
 struct ManualFlowPathEditorState {
     bool active = false;
     bool creating = false;
@@ -1851,6 +1892,7 @@ struct ManualFlowPathEditorState {
     std::optional<std::size_t> selectedNodeIndex;
     std::optional<std::size_t> hoveredNodeIndex;
     ManualFlowPathGizmoDragState drag{};
+    ManualFlowPathLaneWidthDragState laneWidthDrag{};
     bool pointerCapturedUntilRelease = false;
     bool consumedViewportInputThisFrame = false;
 };
@@ -1962,14 +2004,14 @@ struct WaterWorkflowState {
     std::vector<WaterEmitter> emitters;
     std::vector<WaterManualFlowPathSource> manualFlowPaths;
     std::vector<WaterSeepageNode> seepageNodes;
-    PointCloudShorelineWaveSettings defaultShorelineSettings{};
-    // Shoreline profiles are authoring snapshots copied into the active point
-    // visual. The point visual remains the renderer/export source of truth.
+    // Named Water-owned bases and object-specific copies. The legacy selected
+    // name survives only long enough to migrate pre-schema-66/22 files.
     std::vector<PointCloudShorelineWaveProfile> shorelineProfiles;
-    std::string selectedShorelineProfileName = "Default";
-    std::string shorelineProfileNameBuffer = "Default";
-    // Additional shorelines rendered on SAND alongside the primary style
-    // shoreline; each is keyable per instance via the timing runs.
+    std::string selectedShorelineProfileName;
+    std::string shorelineProfileNameBuffer = "Shoreline Profile";
+    // Ordered, project-owned Shoreline effects. The first live entry may use
+    // the renderer's legacy primary uniform bank, but no entry is owned by or
+    // saved through the Visual library.
     std::vector<PointCloudShorelineInstance> shorelineInstances;
     std::uint32_t nextShorelineInstanceId = 1U;
     std::optional<std::size_t> selectedShorelineInstanceIndex;
@@ -3273,9 +3315,10 @@ void ApplyWaterFlowSourceActivityToStyle(
         overlay);
 }
 
-// Shoreline waves are authored point style, so the scenario's keyed level
-// scales the per-frame style copy only — authored layer styles are never
-// mutated and no rebuild or upload happens when the level changes.
+// The renderer transports the first Water-owned Shoreline effect through a
+// per-frame point-style copy, so the scenario's keyed level scales that copy
+// only. Neither the Water profile nor a saved Visual is mutated, and no
+// topology rebuild happens when the level changes.
 void ApplyWaterShorelineLevelToStyle(
     const std::optional<invisible_places::water::WaterScenarioState>& scenarioState,
     PointCloudStyleState* style) {
@@ -3308,19 +3351,50 @@ void ApplyWaterShorelineLevelToStyle(
     foam.pointSizeMultiply = std::lerp(1.0F, foam.pointSizeMultiply, level);
 }
 
-// Resolves the frame's additional shoreline instances for the renderer:
-// disabled instances drop, keyed setting tracks replace the authored visual
-// scalars of both banks, and the keyed level scales responses exactly like
-// the primary shoreline's level. Authored instance state is never mutated.
+void ApplyWaterShorelineLevelToSettings(
+    const std::optional<invisible_places::water::WaterScenarioState>&
+        scenarioState,
+    PointCloudShorelineWaveSettings* settings) {
+    if (settings == nullptr || !settings->enabled) {
+        return;
+    }
+    PointCloudStyleState transport;
+    invisible_places::renderer::pointcloud::
+        ApplyPointCloudShorelineWaveSettings(
+            &transport,
+            *settings);
+    ApplyWaterShorelineLevelToStyle(
+        scenarioState,
+        &transport);
+    *settings = invisible_places::renderer::pointcloud::
+        ExtractPointCloudShorelineWaveSettings(transport);
+}
+
+void ClearPointCloudStyleShoreline(PointCloudStyleState* style) {
+    if (style == nullptr) {
+        return;
+    }
+    invisible_places::renderer::pointcloud::
+        ApplyPointCloudShorelineWaveSettings(
+            style,
+            PointCloudShorelineWaveSettings{});
+}
+
+// Resolves the frame's complete project-owned Shoreline list. Disabled
+// effects drop, keyed setting tracks replace authored visual scalars, and the
+// global Shoreline level scales every effect uniformly. Authored Water state
+// and saved point visuals are never mutated.
 std::vector<PointCloudShorelineWaveSettings>
-ResolveAdditionalShorelinesForFrame(
+ResolveShorelinesForFrame(
     const std::vector<PointCloudShorelineInstance>& instances,
-    const invisible_places::water::WaterFeatureTimingOverlay* overlay) {
+    const invisible_places::water::WaterFeatureTimingOverlay* overlay,
+    const std::optional<invisible_places::water::WaterScenarioState>&
+        scenarioState = std::nullopt) {
     std::vector<PointCloudShorelineWaveSettings> resolved;
     for (const auto& instance : instances) {
         if (resolved.size() >=
             invisible_places::renderer::pointcloud::
-                kMaxAdditionalShorelineInstances) {
+                kMaxShorelineInstances) {
             break;
         }
         if (!instance.enabled || !instance.settings.enabled) {
@@ -3376,6 +3450,12 @@ ResolveAdditionalShorelinesForFrame(
                 applyLevel(settings.foamFronts);
                 applyLevel(settings.heightFoam);
             }
+        }
+        ApplyWaterShorelineLevelToSettings(
+            scenarioState,
+            &settings);
+        if (!settings.enabled) {
+            continue;
         }
         resolved.push_back(std::move(settings));
     }
@@ -4336,6 +4416,18 @@ std::uint64_t AnimationPathMotionFingerprint(const AnimationPath& path) {
         HashArray3(&seed, smoothing.originalFirstFocusPoint);
         HashArray3(&seed, smoothing.originalLastCameraPosition);
         HashArray3(&seed, smoothing.originalLastFocusPoint);
+    }
+    HashBool(&seed, path.linkedLoop.has_value());
+    if (path.linkedLoop.has_value()) {
+        const auto& linkedLoop = path.linkedLoop.value();
+        HashString(&seed, linkedLoop.firstFileName);
+        HashString(&seed, linkedLoop.secondFileName);
+        HashString(&seed, linkedLoop.firstStartKeyId);
+        HashFloat(&seed, linkedLoop.firstStartPosition);
+        HashCombine(
+            &seed,
+            static_cast<std::uint64_t>(
+                static_cast<std::int64_t>(linkedLoop.paddingFrames)));
     }
     return seed;
 }
@@ -11674,8 +11766,18 @@ void ApplyWaterSeepageSelectionClick(
 }
 
 std::string NormalizeWaterShorelineProfileName(std::string_view name) {
-    const auto trimmed = TrimText(name);
-    return trimmed.empty() ? std::string{"Default"} : trimmed;
+    return TrimText(name);
+}
+
+std::string WaterShorelineObjectProfileName(
+    std::string_view baseName,
+    std::string_view objectName) {
+    const std::string base = NormalizeWaterShorelineProfileName(baseName);
+    const std::string object = TrimText(objectName);
+    if (base.empty()) {
+        return {};
+    }
+    return base + "_" + (object.empty() ? std::string{"Shoreline"} : object);
 }
 
 std::uint32_t NextAvailableShorelineInstanceId(
@@ -11702,79 +11804,197 @@ std::optional<std::size_t> FindWaterShorelineProfileIndex(
     return std::nullopt;
 }
 
-PointCloudShorelineWaveSettings ResolveWaterShorelineProfile(
+std::optional<std::size_t> FindWaterShorelineObjectProfileIndex(
     const WaterWorkflowState& water,
-    std::string_view name) {
-    const auto normalized = NormalizeWaterShorelineProfileName(name);
-    if (normalized == "Default") {
-        return water.defaultShorelineSettings;
-    }
-    if (const auto index = FindWaterShorelineProfileIndex(water, normalized);
-        index.has_value()) {
-        return water.shorelineProfiles[index.value()].settings;
-    }
-    return water.defaultShorelineSettings;
-}
-
-std::string ResolveSavedWaterShorelineProfileName(
-    const WaterWorkflowState& water) {
-    const auto assigned = NormalizeWaterShorelineProfileName(
-        water.selectedShorelineProfileName);
-    if (!IsEditedPointVisualName(assigned)) {
-        return assigned == "Default" ||
-                       FindWaterShorelineProfileIndex(water, assigned)
-                           .has_value()
-                   ? assigned
-                   : std::string{"Default"};
-    }
-    const auto base = BasePointVisualName(assigned);
-    if (base == "Default" ||
-        FindWaterShorelineProfileIndex(water, base).has_value()) {
-        return base;
-    }
-    const auto preset = PresetPointVisualName(base);
-    return FindWaterShorelineProfileIndex(water, preset).has_value()
-               ? preset
-               : std::string{"Default"};
-}
-
-std::vector<PointCloudShorelineWaveProfile> WithoutPresetWaterShorelineProfiles(
-    const std::vector<PointCloudShorelineWaveProfile>& profiles) {
-    std::vector<PointCloudShorelineWaveProfile> filtered;
-    filtered.reserve(profiles.size());
-    for (const auto& profile : profiles) {
-        if (!IsPresetPointVisualName(profile.name)) {
-            filtered.push_back(profile);
+    std::uint32_t instanceId,
+    std::string_view baseProfileName) {
+    const auto base = NormalizeWaterShorelineProfileName(baseProfileName);
+    for (std::size_t index = 0U; index < water.shorelineProfiles.size(); ++index) {
+        const auto& profile = water.shorelineProfiles[index];
+        if (profile.objectOverride &&
+            profile.shorelineInstanceId == instanceId &&
+            NormalizeWaterShorelineProfileName(profile.baseProfileName) == base) {
+            return index;
         }
     }
-    return filtered;
+    return std::nullopt;
 }
 
-void SeedWaterShorelineProfilePresets(WaterWorkflowState* water) {
+std::string UniqueWaterShorelineProfileName(
+    const WaterWorkflowState& water,
+    std::string_view preferredName) {
+    const std::string preferred =
+        NormalizeWaterShorelineProfileName(preferredName).empty()
+            ? std::string{"Shoreline Profile"}
+            : NormalizeWaterShorelineProfileName(preferredName);
+    if (!FindWaterShorelineProfileIndex(water, preferred).has_value()) {
+        return preferred;
+    }
+    for (std::uint32_t suffix = 2U; suffix < 10000U; ++suffix) {
+        const auto candidate = preferred + " " + std::to_string(suffix);
+        if (!FindWaterShorelineProfileIndex(water, candidate).has_value()) {
+            return candidate;
+        }
+    }
+    return preferred + " Copy";
+}
+
+void NormalizeWaterShorelineState(
+    WaterWorkflowState* water,
+    const std::optional<PointCloudShorelineWaveSettings>& legacyPrimary =
+        std::nullopt) {
     if (water == nullptr) {
         return;
     }
-    // Default has dedicated project storage. Treat a same-named library entry
-    // as malformed input so it cannot shadow the editable built-in profile.
+
+    // Default and code-owned point-visual presets were artifacts of the old
+    // ownership model. Capture a usable legacy value before removing those
+    // names; no new project or standalone Water save emits them.
+    const std::string legacySelection =
+        NormalizeWaterShorelineProfileName(
+            water->selectedShorelineProfileName);
     std::erase_if(
         water->shorelineProfiles,
         [](const PointCloudShorelineWaveProfile& profile) {
-            return NormalizeWaterShorelineProfileName(profile.name) ==
-                   "Default";
+            const auto name =
+                NormalizeWaterShorelineProfileName(profile.name);
+            return name.empty() || name == "Default" ||
+                   name.ends_with("_preset");
         });
-    const std::string presetName = PresetPointVisualName("Calm");
-    const PointCloudShorelineWaveProfile calm{
-        .name = presetName,
-        .settings =
+
+    if (legacyPrimary.has_value() && legacyPrimary->enabled &&
+        water->shorelineInstances.size() <
             invisible_places::renderer::pointcloud::
-                CalmPointCloudShorelineWaveSettings(),
-    };
-    if (const auto existing =
-            FindWaterShorelineProfileIndex(*water, presetName);
-        existing.has_value()) {
-        water->shorelineProfiles[existing.value()] = calm;
-    } else {
-        water->shorelineProfiles.push_back(calm);
+                kMaxShorelineInstances) {
+        std::string baseName = legacySelection;
+        if (baseName.empty() || baseName == "Default" ||
+            baseName.ends_with("_preset") ||
+            baseName.ends_with("_edited")) {
+            baseName = "Shoreline";
+        }
+        if (const auto editedSuffix = baseName.rfind("_edited");
+            editedSuffix != std::string::npos &&
+            editedSuffix + 7U == baseName.size()) {
+            baseName.resize(editedSuffix);
+        }
+        if (FindWaterShorelineProfileIndex(*water, baseName).has_value()) {
+            baseName = UniqueWaterShorelineProfileName(*water, baseName);
+        }
+        water->shorelineProfiles.push_back({
+            .name = baseName,
+            .settings = legacyPrimary.value(),
+        });
+        PointCloudShorelineInstance primary;
+        primary.id = NextAvailableShorelineInstanceId(
+            water->shorelineInstances);
+        primary.name = "Shoreline";
+        primary.enabled = true;
+        primary.profileName = baseName;
+        primary.baseProfileName = baseName;
+        primary.settings = legacyPrimary.value();
+        water->shorelineInstances.insert(
+            water->shorelineInstances.begin(),
+            std::move(primary));
+    }
+
+    for (auto& instance : water->shorelineInstances) {
+        instance.name = TrimText(instance.name);
+        if (instance.name.empty()) {
+            instance.name =
+                "Shoreline " + std::to_string(instance.id);
+        }
+        instance.profileName =
+            NormalizeWaterShorelineProfileName(instance.profileName);
+        instance.baseProfileName =
+            NormalizeWaterShorelineProfileName(instance.baseProfileName);
+        std::optional<std::size_t> assignedProfileIndex;
+        // Object-copy names are human-readable and can theoretically collide
+        // with another base name. Metadata is authoritative for an applied
+        // object copy; selecting the base remains unambiguous because then
+        // profileName and baseProfileName are equal.
+        if (!instance.profileName.empty() &&
+            instance.profileName != instance.baseProfileName) {
+            if (const auto objectProfile =
+                    FindWaterShorelineObjectProfileIndex(
+                        *water,
+                        instance.id,
+                        instance.baseProfileName);
+                objectProfile.has_value() &&
+                NormalizeWaterShorelineProfileName(
+                    water->shorelineProfiles[objectProfile.value()].name) ==
+                    instance.profileName) {
+                assignedProfileIndex = objectProfile;
+            }
+        }
+        if (!assignedProfileIndex.has_value() &&
+            !instance.profileName.empty()) {
+            const auto namedProfile = FindWaterShorelineProfileIndex(
+                *water,
+                instance.profileName);
+            if (namedProfile.has_value()) {
+                const auto& candidate =
+                    water->shorelineProfiles[namedProfile.value()];
+                if (!candidate.objectOverride ||
+                    candidate.shorelineInstanceId == instance.id) {
+                    assignedProfileIndex = namedProfile;
+                }
+            }
+        }
+        if (!assignedProfileIndex.has_value()) {
+            const auto profileName = UniqueWaterShorelineProfileName(
+                *water,
+                instance.name + " Profile");
+            water->shorelineProfiles.push_back({
+                .name = profileName,
+                .settings = instance.settings,
+            });
+            instance.profileName = profileName;
+            instance.baseProfileName = profileName;
+        } else {
+            const auto& profile =
+                water->shorelineProfiles[assignedProfileIndex.value()];
+            instance.settings = profile.settings;
+            if (instance.baseProfileName.empty()) {
+                instance.baseProfileName =
+                    profile.objectOverride
+                        ? NormalizeWaterShorelineProfileName(
+                              profile.baseProfileName)
+                        : instance.profileName;
+            }
+        }
+    }
+    if (water->shorelineInstances.size() >
+        invisible_places::renderer::pointcloud::
+            kMaxShorelineInstances) {
+        water->shorelineInstances.resize(
+            invisible_places::renderer::pointcloud::
+                kMaxShorelineInstances);
+    }
+    water->nextShorelineInstanceId = std::max(
+        water->nextShorelineInstanceId,
+        NextAvailableShorelineInstanceId(
+            water->shorelineInstances));
+    water->selectedShorelineProfileName.clear();
+}
+
+void ClearWaterShorelineFromSavedVisuals(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    for (auto& visual :
+         runtimeState->pointVisualLibrary.pointVisuals) {
+        ClearPointCloudStyleShoreline(&visual.style);
+    }
+    for (auto& state :
+         runtimeState->pointVisualLibrary.sceneVisualStates) {
+        ClearPointCloudStyleShoreline(&state.visual.style);
+    }
+    for (auto& session : runtimeState->sessions) {
+        ClearPointCloudStyleShoreline(&session.pointStyle);
+        for (auto& visual : session.pointVisuals) {
+            ClearPointCloudStyleShoreline(&visual.style);
+        }
     }
 }
 
@@ -14469,7 +14689,10 @@ std::vector<WaterTrailOverlayGroup> BuildFlowTrailOverlayGroups(
             trailProfile.geometry.pointSpacingMeters * 2.0F,
             0.005F,
             0.05F);
-        const auto anchors = invisible_places::water::BuildManualFlowPathAnchors(source, anchorSpacing);
+        const auto anchors = invisible_places::water::BuildManualFlowPathAnchors(
+            source,
+            anchorSpacing,
+            flowSettings.laneSpreadMeters);
         if (anchors.points.size() < 2U) {
             continue;
         }
@@ -14533,6 +14756,12 @@ std::uint64_t WaterFlowTrailSourceFingerprint(
     HashCombine(&hash, settings.laneCount);
     HashFloat(&hash, settings.trailLengthMeters);
     HashFloat(&hash, settings.trailPointSpacingMeters);
+    HashBool(&hash, settings.startFadeEnabled);
+    HashFloat(&hash, settings.startFadeFullDistanceMeters);
+    HashFloat(&hash, settings.startFadeRandomBeginDistanceMeters);
+    HashBool(&hash, settings.endFadeEnabled);
+    HashFloat(&hash, settings.endFadeFullDistanceMeters);
+    HashFloat(&hash, settings.endFadeRandomBeginDistanceMeters);
     // Width, streak length, speed, and the display/profile name are style
     // inputs. They are deliberately excluded so visual-only edits update the
     // mapped source style without invalidating route/trail compute output.
@@ -14557,6 +14786,7 @@ std::uint64_t WaterFlowTrailSourceFingerprint(
         HashFloat(&hash, point.pathDistance);
         HashFloat(&hash, point.confidence);
         HashFloat(&hash, point.accumulation);
+        HashFloat(&hash, point.laneSpanMeters);
     }
     HashBool(&hash, usesPathAnalysis);
     HashBool(&hash, useSurfaceGuide);
@@ -14673,7 +14903,9 @@ WaterFlowTrailBuildRequest CaptureWaterFlowTrailBuildRequest(
         bool usesPathAnalysis,
         bool useSurfaceGuide,
         invisible_places::water::WaterFlowGpuInputKind gpuInputKind,
-        std::vector<invisible_places::io::Float3> gpuControlPoints) {
+        std::vector<invisible_places::io::Float3> gpuControlPoints,
+        std::vector<invisible_places::water::WaterManualFlowPathLaneWidth>
+            gpuControlPointLaneWidths) {
         WaterFlowTrailSourceBuildRequest sourceRequest;
         sourceRequest.sourceId = sourceId;
         sourceRequest.anchors =
@@ -14697,6 +14929,7 @@ WaterFlowTrailBuildRequest CaptureWaterFlowTrailBuildRequest(
             gpuInputKind == invisible_places::water::WaterFlowGpuInputKind::ManualCatmullRomControlPoints
                 ? invisible_places::water::BuildWaterFlowGpuManualSplineSourceInput(
                       *sourceRequest.gpuControlPoints,
+                      gpuControlPointLaneWidths,
                       sourceId,
                       1U)
                 : invisible_places::water::BuildWaterFlowGpuSampledSourceInput(
@@ -14788,6 +15021,7 @@ WaterFlowTrailBuildRequest CaptureWaterFlowTrailBuildRequest(
             true,
             false,
             invisible_places::water::WaterFlowGpuInputKind::SampledAnchors,
+            {},
             {});
         usesGeneratedAnchors = true;
     }
@@ -14804,7 +15038,10 @@ WaterFlowTrailBuildRequest CaptureWaterFlowTrailBuildRequest(
             trailProfile.geometry.pointSpacingMeters * 2.0F,
             0.005F,
             0.05F);
-        auto anchors = invisible_places::water::BuildManualFlowPathAnchors(source, anchorSpacing);
+        auto anchors = invisible_places::water::BuildManualFlowPathAnchors(
+            source,
+            anchorSpacing,
+            settings.laneSpreadMeters);
         if (anchors.points.size() < 2U) {
             continue;
         }
@@ -14816,7 +15053,8 @@ WaterFlowTrailBuildRequest CaptureWaterFlowTrailBuildRequest(
             false,
             source.useSurfaceGuide,
             invisible_places::water::WaterFlowGpuInputKind::ManualCatmullRomControlPoints,
-            source.controlPoints);
+            source.controlPoints,
+            source.controlPointLaneWidths);
     }
 
     if (request.sources.empty() && !runtimeState.water.pathAnchors.points.empty()) {
@@ -14843,6 +15081,7 @@ WaterFlowTrailBuildRequest CaptureWaterFlowTrailBuildRequest(
                 true,
                 false,
                 invisible_places::water::WaterFlowGpuInputKind::SampledAnchors,
+                {},
                 {});
             usesGeneratedAnchors = true;
         }
@@ -15613,12 +15852,22 @@ bool AddOrRefreshWaterFlowGpuSourceSession(
         result.layout.pointCount);
     session.totalPrimitives = visiblePointBudget;
     session.scalarFields = invisible_places::water::WaterTrailOverlayScalarFieldsForPointCount(
-        result.layout.pointCapacity);
+        result.layout.pointCapacity,
+        true);
     session.bounds = source.anchors->bounds;
     if (session.bounds.valid) {
+        float maximumLaneSpan =
+            std::max(0.0F, source.settings.laneSpreadMeters);
+        for (const auto& anchor : source.anchors->points) {
+            if (std::isfinite(anchor.laneSpanMeters) &&
+                anchor.laneSpanMeters >= 0.0F) {
+                maximumLaneSpan =
+                    std::max(maximumLaneSpan, anchor.laneSpanMeters);
+            }
+        }
         const float padding = std::max(
             std::abs(source.settings.surfaceOffsetMeters),
-            std::max(0.0F, source.settings.laneSpreadMeters) * 0.5F);
+            maximumLaneSpan * 0.5F);
         session.bounds.minimum.x -= padding;
         session.bounds.minimum.y -= padding;
         session.bounds.minimum.z -= padding;
@@ -17915,12 +18164,14 @@ void SaveWaterSources(PreviewRuntimeState* runtimeState) {
     document.emitters = runtimeState->water.emitters;
     document.manualFlowPaths = runtimeState->water.manualFlowPaths;
     document.seepageNodes = runtimeState->water.seepageNodes;
-    document.shorelineDefaultSettings =
-        runtimeState->water.defaultShorelineSettings;
-    document.shorelineProfiles = WithoutPresetWaterShorelineProfiles(
-        runtimeState->water.shorelineProfiles);
-    document.selectedShorelineProfileName =
-        runtimeState->water.selectedShorelineProfileName;
+    document.shorelineDefaultSettings.reset();
+    document.shorelineProfiles =
+        runtimeState->water.shorelineProfiles;
+    document.selectedShorelineProfileName.clear();
+    document.shorelineInstances =
+        runtimeState->water.shorelineInstances;
+    document.nextShorelineInstanceId =
+        runtimeState->water.nextShorelineInstanceId;
     document.seepageDefaultLook = runtimeState->water.defaultSeepageLook;
     document.seepageLookProfiles = WithoutPresetSeepageLookProfiles(
         runtimeState->water.seepageLookProfiles);
@@ -17995,66 +18246,54 @@ void LoadWaterSources(
     runtimeState->water.emitters = document->emitters;
     runtimeState->water.manualFlowPaths = document->manualFlowPaths;
     runtimeState->water.seepageNodes = document->seepageNodes;
-    if (document->shorelineDefaultSettings.has_value()) {
-        runtimeState->water.defaultShorelineSettings =
-            document->shorelineDefaultSettings.value();
-    } else if (const auto visualIndex =
-                   ResolveLoadedPointCloudLookdevIndex(*runtimeState);
-               visualIndex.has_value() &&
-               visualIndex.value() < runtimeState->sessions.size()) {
-        // Legacy water_sources.json has no Shoreline library. Capture the
-        // visible authored settings as Default without touching the cloud.
-        runtimeState->water.defaultShorelineSettings =
-            invisible_places::renderer::pointcloud::
-                ExtractPointCloudShorelineWaveSettings(
-                    runtimeState->sessions[visualIndex.value()].pointStyle);
-    }
     runtimeState->water.shorelineProfiles =
         document->shorelineProfiles;
-    SeedWaterShorelineProfilePresets(&runtimeState->water);
+    runtimeState->water.shorelineInstances =
+        document->shorelineInstances;
+    runtimeState->water.nextShorelineInstanceId = std::max(
+        document->nextShorelineInstanceId,
+        NextAvailableShorelineInstanceId(
+            runtimeState->water.shorelineInstances));
     runtimeState->water.selectedShorelineProfileName =
         NormalizeWaterShorelineProfileName(
             document->selectedShorelineProfileName);
-    if (runtimeState->water.selectedShorelineProfileName != "Default" &&
-        !FindWaterShorelineProfileIndex(
-             runtimeState->water,
-             runtimeState->water.selectedShorelineProfileName)
-             .has_value()) {
-        runtimeState->water.selectedShorelineProfileName = "Default";
-    }
-    runtimeState->water.shorelineProfileNameBuffer =
-        BasePointVisualName(
-            runtimeState->water.selectedShorelineProfileName);
-    if (document->shorelineDefaultSettings.has_value()) {
-        // Schema-20 water-source documents own an explicit Shoreline library,
-        // so loading one must also restore its selected profile. Legacy files
-        // have no such metadata and deliberately keep the authored point
-        // visual untouched (captured above as Default for future edits).
-        if (const auto visualIndex =
-                ResolveLoadedPointCloudLookdevIndex(*runtimeState);
-            visualIndex.has_value() &&
-            visualIndex.value() < runtimeState->sessions.size()) {
-            auto& visualSession =
-                runtimeState->sessions[visualIndex.value()];
-            invisible_places::renderer::pointcloud::
-                ApplyPointCloudShorelineWaveSettings(
-                    &visualSession.pointStyle,
-                    ResolveWaterShorelineProfile(
+    std::optional<PointCloudShorelineWaveSettings> legacyPrimary;
+    if (document->schemaVersion <
+        invisible_places::serialization::
+            kWaterOwnedShorelineSourcesSchemaVersion) {
+        if (document->shorelineDefaultSettings.has_value()) {
+            legacyPrimary =
+                document->shorelineDefaultSettings.value();
+            if (const auto profileIndex =
+                    FindWaterShorelineProfileIndex(
                         runtimeState->water,
                         runtimeState->water
-                            .selectedShorelineProfileName));
-            SanitizePointCloudStyle(&visualSession);
-            MarkPointVisualEdited(runtimeState, &visualSession);
-            if (!IsProjectPointVisualSession(visualSession)) {
-                SyncScenePointVisualsFromOwner(
-                    runtimeState,
-                    &visualSession);
+                            .selectedShorelineProfileName);
+                profileIndex.has_value()) {
+                legacyPrimary = runtimeState->water
+                                    .shorelineProfiles[profileIndex.value()]
+                                    .settings;
             }
-            SyncWaterPointVisualSelectionFromSession(
-                runtimeState,
-                visualSession);
+        } else if (const auto visualIndex =
+                       ResolveLoadedPointCloudLookdevIndex(*runtimeState);
+                   visualIndex.has_value() &&
+                   visualIndex.value() <
+                       runtimeState->sessions.size()) {
+            const auto settings =
+                invisible_places::renderer::pointcloud::
+                    ExtractPointCloudShorelineWaveSettings(
+                        runtimeState->sessions[visualIndex.value()]
+                            .pointStyle);
+            if (settings.enabled) {
+                legacyPrimary = settings;
+            }
         }
     }
+    NormalizeWaterShorelineState(
+        &runtimeState->water,
+        legacyPrimary);
+    ClearWaterShorelineFromSavedVisuals(runtimeState);
+    runtimeState->water.selectedShorelineInstanceIndex.reset();
     runtimeState->water.defaultSeepageLook = document->seepageDefaultLook;
     runtimeState->water.seepageLookProfiles = document->seepageLookProfiles;
     runtimeState->water.seepageResponseProfiles = document->seepageResponseProfiles;
@@ -18348,16 +18587,29 @@ bool SaveManualFlowPathEdit(
     }
     auto& editor = runtimeState->water.manualFlowPathEditor;
     std::vector<invisible_places::io::Float3> cleaned;
+    std::vector<invisible_places::water::WaterManualFlowPathLaneWidth>
+        cleanedLaneWidths;
     cleaned.reserve(editor.draft.controlPoints.size());
-    for (const auto& point : editor.draft.controlPoints) {
+    cleanedLaneWidths.reserve(editor.draft.controlPoints.size());
+    for (std::size_t index = 0U;
+         index < editor.draft.controlPoints.size();
+         ++index) {
+        const auto& point = editor.draft.controlPoints[index];
         if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) {
             continue;
         }
         if (cleaned.empty() || glm::length(ToGlm(point) - ToGlm(cleaned.back())) > 1.0e-5F) {
             cleaned.push_back(point);
+            cleanedLaneWidths.push_back(
+                index < editor.draft.controlPointLaneWidths.size()
+                    ? editor.draft.controlPointLaneWidths[index]
+                    : invisible_places::water::
+                          WaterManualFlowPathLaneWidth{});
         }
     }
     editor.draft.controlPoints = std::move(cleaned);
+    editor.draft.controlPointLaneWidths =
+        std::move(cleanedLaneWidths);
     if (editor.draft.controlPoints.size() < 2U) {
         runtimeState->errorMessage = "A manual Flow path needs at least two distinct nodes.";
         runtimeState->statusMessage.clear();
@@ -22596,6 +22848,7 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
         ProjectLayerDocument::PointVisual visualDocument;
         visualDocument.name = NormalizePointVisualName(visual.name);
         visualDocument.style = visual.style;
+        ClearPointCloudStyleShoreline(&visualDocument.style);
         document.pointVisuals.push_back(std::move(visualDocument));
     }
     if (document.pointVisuals.empty()) {
@@ -22606,8 +22859,10 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
                     return IsProjectPointVisualSession(session);
                 });
             sessionIt != runtimeState.sessions.end()) {
+            auto style = sessionIt->pointStyle;
+            ClearPointCloudStyleShoreline(&style);
             document.pointVisuals.push_back(
-                {.name = std::string{kDefaultPointVisualName}, .style = sessionIt->pointStyle});
+                {.name = std::string{kDefaultPointVisualName}, .style = style});
         }
     }
     document.selectedPointVisualName =
@@ -22627,18 +22882,17 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
         stateDocument.sceneGroupName = state.sceneGroupName;
         stateDocument.visual.name = NormalizePointVisualName(state.visual.name);
         stateDocument.visual.style = state.visual.style;
+        ClearPointCloudStyleShoreline(&stateDocument.visual.style);
         document.sceneVisualStates.push_back(std::move(stateDocument));
     }
     document.gsplatVisualStyle = runtimeState.projectSettings.gsplatVisualStyle;
     document.waterEmitters = runtimeState.water.emitters;
     document.waterManualFlowPaths = runtimeState.water.manualFlowPaths;
     document.waterSeepageNodes = runtimeState.water.seepageNodes;
-    document.waterShorelineDefaultSettings =
-        runtimeState.water.defaultShorelineSettings;
-    document.waterShorelineProfiles = WithoutPresetWaterShorelineProfiles(
-        runtimeState.water.shorelineProfiles);
-    document.selectedWaterShorelineProfileName =
-        runtimeState.water.selectedShorelineProfileName;
+    document.waterShorelineDefaultSettings.reset();
+    document.waterShorelineProfiles =
+        runtimeState.water.shorelineProfiles;
+    document.selectedWaterShorelineProfileName.clear();
     document.waterShorelineInstances = runtimeState.water.shorelineInstances;
     document.nextWaterShorelineInstanceId =
         runtimeState.water.nextShorelineInstanceId;
@@ -23614,19 +23868,23 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->water.emitters = document.waterEmitters;
     runtimeState->water.manualFlowPaths = document.waterManualFlowPaths;
     runtimeState->water.seepageNodes = document.waterSeepageNodes;
-    if (document.waterShorelineDefaultSettings.has_value()) {
-        runtimeState->water.defaultShorelineSettings =
-            document.waterShorelineDefaultSettings.value();
-    } else if (const auto selectedStyle = ProjectPointVisualStyleByName(
-                   runtimeState->pointVisualLibrary,
-                   runtimeState->pointVisualLibrary.selectedPointVisualName);
-               selectedStyle.has_value()) {
-        // Schema-47 and older projects already persist Shoreline inside the
-        // point visual. Capture it as the editable Default without applying
-        // anything back to the scene, preserving the loaded appearance.
-        runtimeState->water.defaultShorelineSettings =
+    std::optional<PointCloudShorelineWaveSettings>
+        legacyPrimaryShoreline;
+    if (const auto selectedStyle = ProjectPointVisualStyleByName(
+            runtimeState->pointVisualLibrary,
+            runtimeState->pointVisualLibrary.selectedPointVisualName);
+        selectedStyle.has_value()) {
+        const auto settings =
             invisible_places::renderer::pointcloud::
-                ExtractPointCloudShorelineWaveSettings(selectedStyle.value());
+                ExtractPointCloudShorelineWaveSettings(
+                    selectedStyle.value());
+        const bool legacyOwnership =
+            document.sourceSchemaVersion <
+            invisible_places::serialization::
+                kWaterOwnedShorelineProjectSchemaVersion;
+        if (legacyOwnership && settings.enabled) {
+            legacyPrimaryShoreline = settings;
+        }
     }
     runtimeState->water.shorelineProfiles =
         document.waterShorelineProfiles;
@@ -23636,20 +23894,13 @@ bool ApplyProjectDocumentToRuntime(
         NextAvailableShorelineInstanceId(
             runtimeState->water.shorelineInstances));
     runtimeState->water.selectedShorelineInstanceIndex.reset();
-    SeedWaterShorelineProfilePresets(&runtimeState->water);
     runtimeState->water.selectedShorelineProfileName =
         NormalizeWaterShorelineProfileName(
             document.selectedWaterShorelineProfileName);
-    if (runtimeState->water.selectedShorelineProfileName != "Default" &&
-        !FindWaterShorelineProfileIndex(
-             runtimeState->water,
-             runtimeState->water.selectedShorelineProfileName)
-             .has_value()) {
-        runtimeState->water.selectedShorelineProfileName = "Default";
-    }
-    runtimeState->water.shorelineProfileNameBuffer =
-        BasePointVisualName(
-            runtimeState->water.selectedShorelineProfileName);
+    NormalizeWaterShorelineState(
+        &runtimeState->water,
+        legacyPrimaryShoreline);
+    ClearWaterShorelineFromSavedVisuals(runtimeState);
     runtimeState->water.defaultSeepageLook = document.waterSeepageDefaultLook;
     runtimeState->water.seepageLookProfiles = document.waterSeepageLookProfiles;
     runtimeState->water.seepageResponseProfiles =
@@ -24375,11 +24626,9 @@ CaptureRenderSetupAuthoredWater(
     water.emitters = project.waterEmitters;
     water.manualFlowPaths = project.waterManualFlowPaths;
     water.seepageNodes = project.waterSeepageNodes;
-    water.shorelineDefaultSettings =
-        project.waterShorelineDefaultSettings;
+    water.shorelineDefaultSettings.reset();
     water.shorelineProfiles = project.waterShorelineProfiles;
-    water.selectedShorelineProfileName =
-        project.selectedWaterShorelineProfileName;
+    water.selectedShorelineProfileName.clear();
     water.shorelineInstances = project.waterShorelineInstances;
     water.nextShorelineInstanceId = std::max(
         project.nextWaterShorelineInstanceId,
@@ -24439,11 +24688,9 @@ void ApplyRenderSetupAuthoredWaterToProject(
     project->waterEmitters = water.emitters;
     project->waterManualFlowPaths = water.manualFlowPaths;
     project->waterSeepageNodes = water.seepageNodes;
-    project->waterShorelineDefaultSettings =
-        water.shorelineDefaultSettings;
+    project->waterShorelineDefaultSettings.reset();
     project->waterShorelineProfiles = water.shorelineProfiles;
-    project->selectedWaterShorelineProfileName =
-        water.selectedShorelineProfileName;
+    project->selectedWaterShorelineProfileName.clear();
     project->waterShorelineInstances = water.shorelineInstances;
     project->nextWaterShorelineInstanceId = water.nextShorelineInstanceId;
     project->waterSeepageDefaultLook = water.seepageDefaultLook;
@@ -24888,6 +25135,22 @@ std::optional<std::size_t> FindAnimationRegistryIndex(
     const auto targetKey = NormalizePathKey(path);
     for (std::size_t index = 0; index < panelState.availableFiles.size(); ++index) {
         if (NormalizePathKey(panelState.availableFiles[index]) == targetKey) {
+            return index;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::size_t> FindAnimationRegistryIndexByFileName(
+    const AnimationPanelState& panelState,
+    std::string_view fileName) {
+    if (fileName.empty()) {
+        return std::nullopt;
+    }
+    for (std::size_t index = 0U;
+         index < panelState.availableFiles.size();
+         ++index) {
+        if (panelState.availableFiles[index].filename().string() == fileName) {
             return index;
         }
     }
@@ -25804,6 +26067,133 @@ void SetCameraDepthOfFieldEnabled(PreviewRuntimeState* runtimeState, bool enable
     runtimeState->camera.ApplyState(cameraState);
 }
 
+void ApplyAnimationEvaluationResult(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::camera::AnimationPathEvaluation evaluation,
+    bool allowDepthOfField) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    evaluation.camera.hasDepthOfField = evaluation.camera.hasDepthOfField && allowDepthOfField;
+    runtimeState->camera.ApplyState(evaluation.camera);
+    runtimeState->pivotOverlay.visible = true;
+    runtimeState->pivotOverlay.pivot = FromGlm(glm::vec3{
+        evaluation.focusPoint[0],
+        evaluation.focusPoint[1],
+        evaluation.focusPoint[2]});
+    runtimeState->pivotOverlay.lastSetAt = std::chrono::steady_clock::now();
+}
+
+bool EvaluateLinkedLoopLiveCamera(
+    const PreviewRuntimeState& runtimeState,
+    const AnimationPath& path,
+    float amount,
+    invisible_places::camera::AnimationPathEvaluation* evaluation,
+    invisible_places::camera::AnimationLinkedLoopSourceSample*
+        sourceSample = nullptr) {
+    if (evaluation == nullptr || !path.linkedLoop.has_value()) {
+        return false;
+    }
+
+    const auto& metadata = path.linkedLoop.value();
+    const auto firstIndex = FindAnimationRegistryIndexByFileName(
+        runtimeState.animationPanel,
+        metadata.firstFileName);
+    const auto secondIndex = FindAnimationRegistryIndexByFileName(
+        runtimeState.animationPanel,
+        metadata.secondFileName);
+    if (!firstIndex.has_value() || !secondIndex.has_value()) {
+        return false;
+    }
+    const auto* first = RegistryAnimationPath(
+        runtimeState,
+        firstIndex.value());
+    const auto* second = RegistryAnimationPath(
+        runtimeState,
+        secondIndex.value());
+    if (first == nullptr || second == nullptr ||
+        first->keys.size() < 2U || second->keys.size() < 2U) {
+        return false;
+    }
+
+    const auto& panel = runtimeState.animationPanel;
+    const bool isCurrentLinkedPath =
+        panel.currentPath.has_value() &&
+        panel.currentPath->linkedLoop.has_value() &&
+        panel.currentPath->linkedLoop->firstFileName ==
+            metadata.firstFileName &&
+        panel.currentPath->linkedLoop->secondFileName ==
+            metadata.secondFileName;
+    const std::int32_t paddingFrames =
+        isCurrentLinkedPath
+            ? static_cast<std::int32_t>(panel.linkedLoopPaddingFrames)
+            : metadata.paddingFrames;
+    const std::string_view startKeyId =
+        isCurrentLinkedPath && !panel.linkedLoopStartKeyId.empty()
+            ? std::string_view{panel.linkedLoopStartKeyId}
+            : std::string_view{metadata.firstStartKeyId};
+    float firstStartPosition = metadata.firstStartPosition;
+    const auto startKey = std::find_if(
+        first->keys.begin(),
+        first->keys.end(),
+        [startKeyId](const auto& key) {
+            return key.id == startKeyId;
+        });
+    if (startKey != first->keys.end()) {
+        firstStartPosition = invisible_places::camera::
+            AnimationPathKeyNormalizedPosition(
+                *first,
+                static_cast<std::size_t>(
+                    std::distance(first->keys.begin(), startKey)));
+    }
+
+    const auto sample = invisible_places::camera::
+        EvaluateLinkedLoopSourceSample(
+            *first,
+            *second,
+            firstStartPosition,
+            paddingFrames,
+            std::clamp(amount, 0.0F, 1.0F));
+    if (!sample.valid) {
+        return false;
+    }
+    if (sourceSample != nullptr) {
+        *sourceSample = sample;
+    }
+    const auto dominantEvaluation = [&]() -> const auto& {
+        if (sample.firstActive &&
+            (!sample.secondActive ||
+             sample.firstWeight >= sample.secondWeight)) {
+            return sample.first;
+        }
+        if (sample.secondActive) {
+            return sample.second;
+        }
+        // Positive padding can leave a held interval with no active clip.
+        return sample.blended;
+    };
+    switch (panel.linkedLoopLiveCameraMode) {
+        case LinkedLoopLiveCameraMode::SourceA:
+            *evaluation = sample.firstActive
+                              ? sample.first
+                              : dominantEvaluation();
+            break;
+        case LinkedLoopLiveCameraMode::SourceB:
+            *evaluation = sample.secondActive
+                              ? sample.second
+                              : dominantEvaluation();
+            break;
+        case LinkedLoopLiveCameraMode::InterleavedOverlay:
+        default:
+            // Overlay owns the overlap presentation. Any evaluation that
+            // happens before its alternating render update uses the dominant
+            // source rather than resurrecting the removed movement blend.
+            *evaluation = dominantEvaluation();
+            break;
+    }
+    return true;
+}
+
 void ApplyAnimationEvaluation(
     PreviewRuntimeState* runtimeState,
     const AnimationPath& path,
@@ -25813,17 +26203,104 @@ void ApplyAnimationEvaluation(
         return;
     }
 
-    auto evaluation = invisible_places::camera::EvaluateAnimationPath(
-        path,
-        AnimationDurationSeconds(path) * std::clamp(amount, 0.0F, 1.0F));
-    evaluation.camera.hasDepthOfField = evaluation.camera.hasDepthOfField && allowDepthOfField;
-    runtimeState->camera.ApplyState(evaluation.camera);
-    runtimeState->pivotOverlay.visible = true;
-    runtimeState->pivotOverlay.pivot = FromGlm(glm::vec3{
-        evaluation.focusPoint[0],
-        evaluation.focusPoint[1],
-        evaluation.focusPoint[2]});
-    runtimeState->pivotOverlay.lastSetAt = std::chrono::steady_clock::now();
+    invisible_places::camera::AnimationPathEvaluation evaluation;
+    if (!EvaluateLinkedLoopLiveCamera(
+            *runtimeState,
+            path,
+            amount,
+            &evaluation)) {
+        evaluation = invisible_places::camera::EvaluateAnimationPath(
+            path,
+            AnimationDurationSeconds(path) *
+                std::clamp(amount, 0.0F, 1.0F));
+    }
+    ApplyAnimationEvaluationResult(
+        runtimeState,
+        std::move(evaluation),
+        allowDepthOfField);
+}
+
+void UpdateLinkedLoopTemporalCameraOverlay(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return;
+    }
+    auto& panel = runtimeState->animationPanel;
+    const bool requested =
+        panel.linkedLoopLiveCameraMode ==
+            LinkedLoopLiveCameraMode::InterleavedOverlay &&
+        panel.currentPath.has_value() &&
+        panel.currentPath->linkedLoop.has_value() &&
+        !runtimeState->cameraPlayback.active;
+    if (!requested) {
+        panel.linkedLoopTemporalOverlayWasActive = false;
+        panel.linkedLoopTemporalRenderFirstNext = true;
+        viewport->SetTemporalCameraOverlay(false);
+        return;
+    }
+
+    invisible_places::camera::AnimationPathEvaluation fallbackEvaluation;
+    invisible_places::camera::AnimationLinkedLoopSourceSample sourceSample;
+    if (!EvaluateLinkedLoopLiveCamera(
+            *runtimeState,
+            panel.currentPath.value(),
+            panel.scrubAmount,
+            &fallbackEvaluation,
+            &sourceSample)) {
+        panel.linkedLoopTemporalOverlayWasActive = false;
+        panel.linkedLoopTemporalRenderFirstNext = true;
+        viewport->SetTemporalCameraOverlay(false);
+        return;
+    }
+
+    const bool allowDepthOfField =
+        runtimeState->animationPlayback.active ||
+        panel.previewDepthOfField;
+    if (!sourceSample.firstActive || !sourceSample.secondActive) {
+        panel.linkedLoopTemporalOverlayWasActive = false;
+        panel.linkedLoopTemporalRenderFirstNext = true;
+        viewport->SetTemporalCameraOverlay(false);
+        ApplyAnimationEvaluationResult(
+            runtimeState,
+            std::move(fallbackEvaluation),
+            allowDepthOfField);
+        return;
+    }
+
+    bool renderFirst = panel.linkedLoopTemporalRenderFirstNext;
+    if (!panel.linkedLoopTemporalOverlayWasActive) {
+        // The first cached image should be the dominant source so entering an
+        // overlap never flashes the nominally zero-weight camera.
+        renderFirst =
+            sourceSample.firstWeight >= sourceSample.secondWeight;
+        panel.linkedLoopTemporalOverlayWasActive = true;
+    }
+    panel.linkedLoopTemporalRenderFirstNext = !renderFirst;
+    ApplyAnimationEvaluationResult(
+        runtimeState,
+        renderFirst ? sourceSample.first : sourceSample.second,
+        allowDepthOfField);
+    const float aspectRatio = CurrentAspectRatio(*viewport);
+    std::array<glm::mat4, 2U> currentSourceViewProjections{};
+    const auto sourceViewProjection =
+        [aspectRatio](
+            const invisible_places::camera::AnimationPathEvaluation&
+                evaluation) {
+            invisible_places::camera::OrbitCamera sourceCamera;
+            sourceCamera.ApplyState(evaluation.camera);
+            return sourceCamera.Matrices(aspectRatio).viewProjection;
+        };
+    currentSourceViewProjections[0U] =
+        sourceViewProjection(sourceSample.first);
+    currentSourceViewProjections[1U] =
+        sourceViewProjection(sourceSample.second);
+    viewport->SetTemporalCameraOverlay(
+        true,
+        renderFirst ? 0U : 1U,
+        sourceSample.firstWeight,
+        sourceSample.secondWeight,
+        &currentSourceViewProjections);
 }
 
 void EmbedAnimationWaterScenarioFallbacks(
@@ -26145,6 +26622,19 @@ bool LoadAnimationPathVariant(
     }
     panel.currentFilePath = inputPath.string();
     panel.draftAnimationName = panel.currentPath->name;
+    if (panel.currentPath->linkedLoop.has_value()) {
+        panel.linkedLoopPaddingFrames =
+            panel.currentPath->linkedLoop->paddingFrames;
+        panel.linkedLoopStartKeyId =
+            panel.currentPath->linkedLoop->firstStartKeyId;
+    } else {
+        panel.linkedLoopPaddingFrames = 0;
+        panel.linkedLoopStartKeyId.clear();
+    }
+    panel.linkedLoopLiveCameraMode =
+        LinkedLoopLiveCameraMode::InterleavedOverlay;
+    panel.linkedLoopTemporalOverlayWasActive = false;
+    panel.linkedLoopTemporalRenderFirstNext = true;
     ApplyActiveExportPresetToRenderSettings(runtimeState);
     panel.selectedKeyIndex =
         panel.currentPath->keys.empty()
@@ -26232,6 +26722,7 @@ bool DiscardAnimationEdits(
         panel.availableFileLoopEditPairIds[index].clear();
         panel.availableFileDirtyFlags[index] = false;
     }
+    panel.loopSmoothingDiagnostics.reset();
 
     if (reloadCurrentSavedVersion) {
         const auto currentIndex = FindAnimationRegistryIndex(
@@ -26900,6 +27391,10 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
     std::vector<OfflinePointLayerSnapshot> layers;
     const auto activeWater = ResolveWaterFrameState(&runtimeState);
     const auto& activeWaterScenario = activeWater.rawScenarioState;
+    const auto resolvedShorelines = ResolveShorelinesForFrame(
+        runtimeState.water.shorelineInstances,
+        &activeWater.featureOverlay,
+        activeWaterScenario);
     const auto* activeColouriseEffects =
         ActiveTimingColouriseEffects(runtimeState);
     const bool fastBasicRenderer =
@@ -26948,7 +27443,14 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
             activeWaterScenario,
             &style,
             &activeWater.featureOverlay);
-        ApplyWaterShorelineLevelToStyle(activeWaterScenario, &style);
+        ClearPointCloudStyleShoreline(&style);
+        if (SceneRoleIs(session.sceneRole, "sand") &&
+            !resolvedShorelines.empty()) {
+            invisible_places::renderer::pointcloud::
+                ApplyPointCloudShorelineWaveSettings(
+                    &style,
+                    resolvedShorelines.front());
+        }
         std::vector<invisible_places::water::WaterRippleRuntimeMembership> rippleMemberships;
         std::vector<invisible_places::water::WaterRippleRuntimeParams> rippleParams;
         BuildOfflineRippleRuntimeForSession(
@@ -27274,11 +27776,8 @@ ResolveCurrentRenderSetupSnapshot(
     PreviewRuntimeState* runtimeState,
     std::string* errorMessage);
 
-// Current-animation exports are WYSIWYG: copy the effective in-memory style
-// from the scene visual owner, including an `_edited` point visual and the
-// currently authored Shoreline controls. BuildAnimationExportPointCloudLayer-
-// Snapshot resolves the copied field names again for each export-density
-// layer, so this style is safe to apply to the finest bundle.
+// Current-animation exports are WYSIWYG for the Visual, while Shoreline is
+// composed independently from the frozen Water effect list later.
 std::optional<SavedPointVisualExportSelection>
 ResolveCurrentPointVisualExportSelection(
     PreviewRuntimeState* runtimeState) {
@@ -27297,6 +27796,8 @@ ResolveCurrentPointVisualExportSelection(
     SavedPointVisualExportSelection selection;
     selection.visualOverride.sessionIndex = sessionIndex.value();
     selection.visualOverride.style = session.pointStyle;
+    ClearPointCloudStyleShoreline(
+        &selection.visualOverride.style);
     selection.visualName =
         NormalizePointVisualName(session.selectedPointVisualName);
     if (selection.visualName.empty()) {
@@ -27360,18 +27861,10 @@ std::optional<SavedPointVisualExportSelection> ResolveSavedPointVisualExportSele
         selection.visualName = visualIt->name;
         selection.visualOverride.style = visualIt->style;
     }
-    // Shoreline profiles are saved independently from the point-visual
-    // library. Compose the selected saved profile into the frozen export
-    // override so preview/still/animation output agrees, while an `_edited`
-    // shadow continues to export its saved base just like point visuals do.
-    const auto shorelineProfileName =
-        ResolveSavedWaterShorelineProfileName(runtimeState->water);
-    invisible_places::renderer::pointcloud::
-        ApplyPointCloudShorelineWaveSettings(
-            &selection.visualOverride.style,
-            ResolveWaterShorelineProfile(
-                runtimeState->water,
-                shorelineProfileName));
+    // Shoreline is composed later from the frozen project-owned Water effect
+    // list. A saved Visual can no longer select, hide, or resurrect it.
+    ClearPointCloudStyleShoreline(
+        &selection.visualOverride.style);
     if (!session.scalarFields.empty()) {
         ResolveProjectVisualStyleBindingsByFieldName(
             &selection.visualOverride.style,
@@ -28457,16 +28950,27 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
                     : 0.0F;
         }
     }
-    if (waterFrame.rawScenarioState.has_value()) {
-        // Keyed shoreline evaluates per exported frame on the copied layer
-        // styles, matching preview; the job snapshot keeps the authored level.
-        for (auto& layer : renderState.pointCloudLayers) {
-            ApplyWaterShorelineLevelToStyle(waterFrame.rawScenarioState, &layer.style);
+    const auto resolvedShorelines = ResolveShorelinesForFrame(
+        job.frozenShorelineInstances,
+        &waterFrame.featureOverlay,
+        waterFrame.rawScenarioState);
+    for (auto& layer : renderState.pointCloudLayers) {
+        ClearPointCloudStyleShoreline(&layer.style);
+        if (layer.shorelineInstancesEligible &&
+            !resolvedShorelines.empty()) {
+            invisible_places::renderer::pointcloud::
+                ApplyPointCloudShorelineWaveSettings(
+                    &layer.style,
+                    resolvedShorelines.front());
         }
     }
-    renderState.additionalShorelines = ResolveAdditionalShorelinesForFrame(
-        job.frozenShorelineInstances,
-        &waterFrame.featureOverlay);
+    if (resolvedShorelines.size() > 1U) {
+        renderState.additionalShorelines.assign(
+            resolvedShorelines.begin() + 1,
+            resolvedShorelines.end());
+    } else {
+        renderState.additionalShorelines.clear();
+    }
 
     return renderState;
 }
@@ -30313,10 +30817,16 @@ FrozenRenderSetupProvenance CollectRenderSetupProvenance(
     }
 
     const auto& water = runtimeState.water;
-    if (IsEditedPointVisualName(water.selectedShorelineProfileName)) {
-        AppendUniqueRenderSetupEditedLabel(
-            &labels,
-            "Shoreline: " + water.selectedShorelineProfileName);
+    for (const auto& instance : water.shorelineInstances) {
+        const auto profile = FindWaterShorelineProfileIndex(
+            water,
+            instance.profileName);
+        if (profile.has_value() &&
+            water.shorelineProfiles[profile.value()].objectOverride) {
+            AppendUniqueRenderSetupEditedLabel(
+                &labels,
+                "Shoreline: " + instance.profileName);
+        }
     }
 
     const auto activeEmitter = [](const WaterEmitter& emitter) {
@@ -37068,11 +37578,15 @@ void DrawManualFlowPathGuide(
     const invisible_places::camera::OrbitCameraMatrices& matrices,
     const invisible_places::renderer::core::VulkanViewportShell& viewport,
     ImU32 colour,
-    float width) {
+    float width,
+    float globalLaneSpanMeters = 0.12F) {
     if (drawList == nullptr) {
         return;
     }
-    const auto anchors = invisible_places::water::BuildManualFlowPathAnchors(source);
+    const auto anchors = invisible_places::water::BuildManualFlowPathAnchors(
+        source,
+        0.025F,
+        globalLaneSpanMeters);
     std::optional<ImVec2> previous;
     for (const auto& anchor : anchors.points) {
         const auto projected = ProjectWorldPoint(matrices, viewport, ToGlm(anchor.position));
@@ -37110,13 +37624,19 @@ void DrawManualFlowPathOverlay(
                                        editor.sourceIndex.has_value() &&
                                        editor.sourceIndex.value() == index;
         if (water.showFlowSourceGuides && (selected || pathView) && !editingThisSource) {
+            const float globalLaneSpanMeters =
+                ResolveManualFlowPathLaneSettings(
+                    water,
+                    water.manualFlowPaths[index])
+                    .laneSpreadMeters;
             DrawManualFlowPathGuide(
                 drawList,
                 water.manualFlowPaths[index],
                 matrices,
                 viewport,
                 selected ? IM_COL32(72, 231, 255, 245) : IM_COL32(72, 205, 235, 180),
-                selected ? 3.0F : 2.1F);
+                selected ? 3.0F : 2.1F,
+                globalLaneSpanMeters);
         }
     }
 
@@ -37126,11 +37646,74 @@ void DrawManualFlowPathOverlay(
 
     auto& draft = editor.draft;
     auto& nodes = draft.controlPoints;
-    auto anchors = invisible_places::water::BuildManualFlowPathAnchors(draft);
+    auto& nodeLaneWidths = draft.controlPointLaneWidths;
+    nodeLaneWidths.resize(
+        nodes.size(),
+        invisible_places::water::WaterManualFlowPathLaneWidth{});
+    const float globalLaneSpanMeters =
+        ResolveManualFlowPathLaneSettings(water, draft).laneSpreadMeters;
+    auto anchors = invisible_places::water::BuildManualFlowPathAnchors(
+        draft,
+        0.025F,
+        globalLaneSpanMeters);
 
     if (!io.MouseDown[0] && editor.pointerCapturedUntilRelease) {
         editor.drag = {};
+        editor.laneWidthDrag = {};
         editor.pointerCapturedUntilRelease = false;
+    }
+
+    if (editor.laneWidthDrag.active) {
+        editor.consumedViewportInputThisFrame = true;
+        editor.pointerCapturedUntilRelease = io.MouseDown[0];
+        if (!io.MouseDown[0] ||
+            editor.laneWidthDrag.nodeIndex >= nodeLaneWidths.size()) {
+            editor.laneWidthDrag = {};
+        } else {
+            const float mouseDeltaX =
+                io.MousePos.x - editor.laneWidthDrag.startMouse.x;
+            const float mouseDeltaY =
+                io.MousePos.y - editor.laneWidthDrag.startMouse.y;
+            editor.laneWidthDrag.hasMoved =
+                editor.laneWidthDrag.hasMoved ||
+                std::sqrt(mouseDeltaX * mouseDeltaX + mouseDeltaY * mouseDeltaY) > 1.5F;
+            if (editor.laneWidthDrag.hasMoved) {
+                const float fromCentreX =
+                    io.MousePos.x - editor.laneWidthDrag.centre.x;
+                const float fromCentreY =
+                    io.MousePos.y - editor.laneWidthDrag.centre.y;
+                const float halfWidthPixels = std::abs(
+                    fromCentreX * editor.laneWidthDrag.screenDirection.x +
+                    fromCentreY * editor.laneWidthDrag.screenDirection.y);
+                const float resolvedWidth = std::clamp(
+                    (halfWidthPixels * 2.0F) /
+                        std::max(1.0e-5F, editor.laneWidthDrag.pixelsPerWorldUnit),
+                    0.0F,
+                    100.0F);
+                auto& laneWidth =
+                    nodeLaneWidths[editor.laneWidthDrag.nodeIndex];
+                if (editor.laneWidthDrag.globalLaneSpanMeters > 1.0e-5F) {
+                    laneWidth.mode = invisible_places::water::
+                        WaterManualFlowPathLaneWidthMode::Relative;
+                    laneWidth.value = std::clamp(
+                        resolvedWidth /
+                            editor.laneWidthDrag.globalLaneSpanMeters,
+                        0.0F,
+                        100.0F);
+                } else {
+                    // A relative multiplier cannot represent a non-zero width
+                    // while the global cover is zero, so retain the exact
+                    // dragged size as an absolute override.
+                    laneWidth.mode = invisible_places::water::
+                        WaterManualFlowPathLaneWidthMode::Absolute;
+                    laneWidth.value = resolvedWidth;
+                }
+                anchors = invisible_places::water::BuildManualFlowPathAnchors(
+                    draft,
+                    0.025F,
+                    globalLaneSpanMeters);
+            }
+        }
     }
 
     if (editor.drag.kind != ManualFlowPathGizmoDragKind::None) {
@@ -37180,7 +37763,10 @@ void DrawManualFlowPathOverlay(
             }
             if (std::isfinite(nextPoint.x) && std::isfinite(nextPoint.y) && std::isfinite(nextPoint.z)) {
                 nodes[editor.drag.nodeIndex] = FromGlm(nextPoint);
-                anchors = invisible_places::water::BuildManualFlowPathAnchors(draft);
+                anchors = invisible_places::water::BuildManualFlowPathAnchors(
+                    draft,
+                    0.025F,
+                    globalLaneSpanMeters);
             }
         }
     }
@@ -37191,11 +37777,149 @@ void DrawManualFlowPathOverlay(
         matrices,
         viewport,
         IM_COL32(79, 232, 255, 255),
-        3.3F);
+        3.3F,
+        globalLaneSpanMeters);
 
     const bool canInteract =
         (editor.drag.kind != ManualFlowPathGizmoDragKind::None) ||
+        editor.laneWidthDrag.active ||
         (!viewport.UiWantsMouseCapture() && IsMouseOverRenderViewport(viewport));
+
+    struct LaneWidthHandle {
+        std::size_t nodeIndex = 0U;
+        ImVec2 centre{};
+        ImVec2 left{};
+        ImVec2 right{};
+        ImVec2 direction{1.0F, 0.0F};
+        float pixelsPerWorldUnit = 1.0F;
+        ImU32 colour = 0U;
+    };
+    std::vector<LaneWidthHandle> laneWidthHandles;
+    laneWidthHandles.reserve(nodes.size());
+    for (std::size_t index = 0U; index < nodes.size(); ++index) {
+        const glm::vec3 node = ToGlm(nodes[index]);
+        const auto projectedCentre = ProjectWorldPoint(matrices, viewport, node);
+        if (!projectedCentre.has_value()) {
+            continue;
+        }
+
+        glm::vec3 tangent{1.0F, 0.0F, 0.0F};
+        glm::vec3 normal{0.0F, 0.0F, 1.0F};
+        if (!anchors.points.empty()) {
+            std::size_t closestAnchor = 0U;
+            float closestDistanceSquared = std::numeric_limits<float>::max();
+            for (std::size_t anchorIndex = 0U;
+                 anchorIndex < anchors.points.size();
+                 ++anchorIndex) {
+                const glm::vec3 delta =
+                    ToGlm(anchors.points[anchorIndex].position) - node;
+                const float distanceSquared = glm::dot(delta, delta);
+                if (distanceSquared < closestDistanceSquared) {
+                    closestDistanceSquared = distanceSquared;
+                    closestAnchor = anchorIndex;
+                }
+            }
+            const std::size_t previousAnchor =
+                closestAnchor > 0U ? closestAnchor - 1U : closestAnchor;
+            const std::size_t nextAnchor = std::min(
+                closestAnchor + 1U,
+                anchors.points.size() - 1U);
+            const glm::vec3 anchorTangent =
+                ToGlm(anchors.points[nextAnchor].position) -
+                ToGlm(anchors.points[previousAnchor].position);
+            if (glm::dot(anchorTangent, anchorTangent) > 1.0e-8F) {
+                tangent = glm::normalize(anchorTangent);
+            }
+            normal = ToGlm(anchors.points[closestAnchor].normal);
+            if (glm::dot(normal, normal) <= 1.0e-8F) {
+                normal = {0.0F, 0.0F, 1.0F};
+            } else {
+                normal = glm::normalize(normal);
+            }
+        }
+        glm::vec3 lateral = glm::cross(normal, tangent);
+        if (glm::dot(lateral, lateral) <= 1.0e-8F) {
+            lateral = glm::cross(glm::vec3{0.0F, 0.0F, 1.0F}, tangent);
+        }
+        if (glm::dot(lateral, lateral) <= 1.0e-8F) {
+            lateral = glm::cross(glm::vec3{0.0F, 1.0F, 0.0F}, tangent);
+        }
+        if (glm::dot(lateral, lateral) <= 1.0e-8F) {
+            continue;
+        }
+        lateral = glm::normalize(lateral);
+
+        const float cameraDistance = std::max(
+            0.10F,
+            glm::length(node - matrices.position));
+        const float probeDistance = std::max(0.025F, cameraDistance * 0.025F);
+        const auto projectedProbe = ProjectWorldPoint(
+            matrices,
+            viewport,
+            node + lateral * probeDistance);
+        if (!projectedProbe.has_value()) {
+            continue;
+        }
+        ImVec2 direction{
+            projectedProbe->screen.x - projectedCentre->screen.x,
+            projectedProbe->screen.y - projectedCentre->screen.y,
+        };
+        const float probePixels = std::sqrt(
+            direction.x * direction.x + direction.y * direction.y);
+        if (probePixels <= 1.0e-4F) {
+            continue;
+        }
+        direction.x /= probePixels;
+        direction.y /= probePixels;
+        const float pixelsPerWorldUnit =
+            probePixels / std::max(1.0e-5F, probeDistance);
+        const auto& laneWidth = nodeLaneWidths[index];
+        const float resolvedWidth = invisible_places::water::
+            ResolveWaterManualFlowPathLaneWidth(
+                laneWidth,
+                globalLaneSpanMeters);
+        const float displayedHalfWidthPixels = std::max(
+            7.0F,
+            resolvedWidth * 0.5F * pixelsPerWorldUnit);
+        const ImVec2 left{
+            projectedCentre->screen.x - direction.x * displayedHalfWidthPixels,
+            projectedCentre->screen.y - direction.y * displayedHalfWidthPixels,
+        };
+        const ImVec2 right{
+            projectedCentre->screen.x + direction.x * displayedHalfWidthPixels,
+            projectedCentre->screen.y + direction.y * displayedHalfWidthPixels,
+        };
+        ImU32 handleColour = IM_COL32(83, 206, 242, 238);
+        if (laneWidth.mode == invisible_places::water::
+                                  WaterManualFlowPathLaneWidthMode::Relative) {
+            handleColour = IM_COL32(255, 184, 72, 248);
+        } else if (laneWidth.mode == invisible_places::water::
+                                         WaterManualFlowPathLaneWidthMode::Absolute) {
+            handleColour = IM_COL32(221, 112, 255, 248);
+        }
+        const bool selected = editor.selectedNodeIndex.has_value() &&
+                              editor.selectedNodeIndex.value() == index;
+        if (!selected) {
+            handleColour = (handleColour & IM_COL32(255, 255, 255, 0)) |
+                           IM_COL32(0, 0, 0, 190);
+        }
+        drawList->AddLine(left, right, IM_COL32(0, 0, 0, 205), selected ? 7.0F : 5.0F);
+        drawList->AddLine(left, right, handleColour, selected ? 3.4F : 2.2F);
+        drawList->AddCircleFilled(left, selected ? 5.5F : 4.4F, handleColour, 16);
+        drawList->AddCircleFilled(right, selected ? 5.5F : 4.4F, handleColour, 16);
+        drawList->AddCircle(left, selected ? 6.5F : 5.4F, IM_COL32(0, 0, 0, 220), 16, 1.3F);
+        drawList->AddCircle(right, selected ? 6.5F : 5.4F, IM_COL32(0, 0, 0, 220), 16, 1.3F);
+        laneWidthHandles.push_back({
+            .nodeIndex = index,
+            .centre = projectedCentre->screen,
+            .left = left,
+            .right = right,
+            .direction = direction,
+            .pixelsPerWorldUnit = pixelsPerWorldUnit,
+            .colour = handleColour,
+        });
+    }
+
     editor.hoveredNodeIndex.reset();
     float closestNodeDistance = 11.0F;
     for (std::size_t index = 0; index < nodes.size(); ++index) {
@@ -37352,8 +38076,32 @@ void DrawManualFlowPathOverlay(
         }
     }
 
-    if (!canInteract || editor.drag.kind != ManualFlowPathGizmoDragKind::None) {
+    if (!canInteract ||
+        editor.drag.kind != ManualFlowPathGizmoDragKind::None ||
+        editor.laneWidthDrag.active) {
         return;
+    }
+
+    std::optional<std::size_t> hoveredLaneWidthHandle;
+    float closestLaneWidthHandleDistance = 10.0F;
+    for (std::size_t index = 0U; index < laneWidthHandles.size(); ++index) {
+        const auto& handle = laneWidthHandles[index];
+        const float endpointDistance = std::min(
+            ScreenDistance(io.MousePos, handle.left),
+            ScreenDistance(io.MousePos, handle.right));
+        const float barDistance =
+            DistanceToScreenSegment(io.MousePos, handle.left, handle.right);
+        const float centreDistance = ScreenDistance(io.MousePos, handle.centre);
+        const float hitDistance =
+            endpointDistance < 10.0F
+                ? endpointDistance
+                : (centreDistance > 10.0F && barDistance < 6.0F
+                       ? barDistance
+                       : std::numeric_limits<float>::max());
+        if (hitDistance < closestLaneWidthHandleDistance) {
+            closestLaneWidthHandleDistance = hitDistance;
+            hoveredLaneWidthHandle = index;
+        }
     }
 
     std::optional<std::size_t> hoveredAxis;
@@ -37376,6 +38124,7 @@ void DrawManualFlowPathOverlay(
                                ScreenDistance(io.MousePos, selectedScreen.value()) <= 10.0F;
     const auto curveHit = PickManualFlowPathCurve(draft, anchors, matrices, viewport, io.MousePos);
     if (hoveredCenter || hoveredAxis.has_value() || hoveredPlane.has_value() ||
+        hoveredLaneWidthHandle.has_value() ||
         editor.hoveredNodeIndex.has_value() || curveHit.has_value()) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
     }
@@ -37414,12 +38163,56 @@ void DrawManualFlowPathOverlay(
                                        glm::length(ToGlm(nodes.back()) - ToGlm(pivot->point)) <= 1.0e-5F;
             if (!duplicateLast) {
                 nodes.push_back(pivot->point);
+                nodeLaneWidths.push_back({});
                 editor.selectedNodeIndex = nodes.size() - 1U;
                 runtimeState->statusMessage = "Added manual flow path node.";
                 runtimeState->errorMessage.clear();
             }
         } else {
             runtimeState->errorMessage = "No visible surface was found under the pointer.";
+        }
+        return;
+    }
+
+    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
+        editor.hoveredNodeIndex.has_value()) {
+        const std::size_t nodeIndex = editor.hoveredNodeIndex.value();
+        if (nodeIndex < nodeLaneWidths.size()) {
+            auto& laneWidth = nodeLaneWidths[nodeIndex];
+            const float resolvedWidth = invisible_places::water::
+                ResolveWaterManualFlowPathLaneWidth(
+                    laneWidth,
+                    globalLaneSpanMeters);
+            using LaneWidthMode = invisible_places::water::
+                WaterManualFlowPathLaneWidthMode;
+            if (laneWidth.mode == LaneWidthMode::Inherit) {
+                laneWidth.mode = LaneWidthMode::Relative;
+                laneWidth.value = 1.0F;
+                runtimeState->statusMessage =
+                    "Node lane cover is now Relative (1.00 x global).";
+            } else if (laneWidth.mode == LaneWidthMode::Relative) {
+                laneWidth.mode = LaneWidthMode::Absolute;
+                laneWidth.value = resolvedWidth;
+                runtimeState->statusMessage =
+                    "Node lane cover is now Absolute and will keep its current size.";
+            } else if (globalLaneSpanMeters > 1.0e-5F) {
+                laneWidth.mode = LaneWidthMode::Relative;
+                laneWidth.value = std::clamp(
+                    resolvedWidth / globalLaneSpanMeters,
+                    0.0F,
+                    100.0F);
+                runtimeState->statusMessage =
+                    "Node lane cover is now Relative and keeps its current resolved size.";
+            } else {
+                runtimeState->errorMessage =
+                    "Raise Lane Cover Width above zero before converting this Absolute node to Relative.";
+                runtimeState->statusMessage.clear();
+                return;
+            }
+            editor.selectedNodeIndex = nodeIndex;
+            editor.consumedViewportInputThisFrame = true;
+            editor.pointerCapturedUntilRelease = true;
+            runtimeState->errorMessage.clear();
         }
         return;
     }
@@ -37432,6 +38225,10 @@ void DrawManualFlowPathOverlay(
         if (!insertIndex.has_value()) {
             return;
         }
+        nodeLaneWidths.insert(
+            nodeLaneWidths.begin() +
+                static_cast<std::ptrdiff_t>(insertIndex.value()),
+            invisible_places::water::WaterManualFlowPathLaneWidth{});
         editor.selectedNodeIndex = insertIndex.value();
         editor.consumedViewportInputThisFrame = true;
         editor.pointerCapturedUntilRelease = true;
@@ -37441,6 +38238,24 @@ void DrawManualFlowPathOverlay(
     }
 
     if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        if (hoveredLaneWidthHandle.has_value()) {
+            const auto& handle =
+                laneWidthHandles[hoveredLaneWidthHandle.value()];
+            editor.selectedNodeIndex = handle.nodeIndex;
+            editor.laneWidthDrag = {
+                .active = true,
+                .hasMoved = false,
+                .nodeIndex = handle.nodeIndex,
+                .centre = handle.centre,
+                .startMouse = io.MousePos,
+                .screenDirection = handle.direction,
+                .pixelsPerWorldUnit = handle.pixelsPerWorldUnit,
+                .globalLaneSpanMeters = globalLaneSpanMeters,
+            };
+            editor.pointerCapturedUntilRelease = true;
+            editor.consumedViewportInputThisFrame = true;
+            return;
+        }
         if (hoveredCenter && editor.selectedNodeIndex.has_value()) {
             glm::vec3 viewNormal = matrices.position - ToGlm(nodes[editor.selectedNodeIndex.value()]);
             if (glm::length(viewNormal) > 1.0e-5F) {
@@ -37511,7 +38326,22 @@ void DrawManualFlowPathOverlay(
         (ImGui::IsKeyPressed(ImGuiKey_Delete) || ImGui::IsKeyPressed(ImGuiKey_Backspace))) {
         const std::size_t nodeIndex = editor.selectedNodeIndex.value();
         if (nodeIndex < nodes.size()) {
+            if (nodeIndex < nodeLaneWidths.size() &&
+                nodeLaneWidths[nodeIndex].mode != invisible_places::water::
+                    WaterManualFlowPathLaneWidthMode::Inherit) {
+                nodeLaneWidths[nodeIndex] = {};
+                editor.consumedViewportInputThisFrame = true;
+                runtimeState->statusMessage =
+                    "Reset the selected node lane cover to Standard. Delete again to remove the node.";
+                runtimeState->errorMessage.clear();
+                return;
+            }
             nodes.erase(nodes.begin() + static_cast<std::ptrdiff_t>(nodeIndex));
+            if (nodeIndex < nodeLaneWidths.size()) {
+                nodeLaneWidths.erase(
+                    nodeLaneWidths.begin() +
+                    static_cast<std::ptrdiff_t>(nodeIndex));
+            }
             editor.selectedNodeIndex = nodes.empty()
                                            ? std::nullopt
                                            : std::optional<std::size_t>{std::min(nodeIndex, nodes.size() - 1U)};
@@ -39803,6 +40633,472 @@ void DrawAnimationCurveOverlay(
     }
 }
 
+std::size_t ResolveLinkedLoopStartKeyIndex(
+    const AnimationPath& path,
+    std::string_view keyId,
+    float fallbackPosition = 0.5F) {
+    if (path.keys.empty()) {
+        return 0U;
+    }
+    if (!keyId.empty()) {
+        const auto keyIt = std::find_if(
+            path.keys.begin(),
+            path.keys.end(),
+            [&](const auto& key) { return key.id == keyId; });
+        if (keyIt != path.keys.end()) {
+            return static_cast<std::size_t>(
+                std::distance(path.keys.begin(), keyIt));
+        }
+    }
+    std::size_t closestIndex = 0U;
+    float closestDistance = std::numeric_limits<float>::max();
+    for (std::size_t index = 0U; index < path.keys.size(); ++index) {
+        const float position = invisible_places::camera::
+            AnimationPathKeyNormalizedPosition(path, index);
+        const float distance = std::abs(position - fallbackPosition);
+        if (distance < closestDistance) {
+            closestDistance = distance;
+            closestIndex = index;
+        }
+    }
+    return closestIndex;
+}
+
+void DrawLinkedLoopTimelinePreview(
+    const AnimationPath& first,
+    const AnimationPath& second,
+    std::int32_t paddingFrames,
+    float firstStartPosition) {
+    const auto timing = invisible_places::camera::ResolveLinkedLoopTiming(
+        first,
+        second,
+        paddingFrames);
+    paddingFrames = timing.paddingFrames;
+    const float periodFrames =
+        static_cast<float>(timing.periodFrames);
+
+    const ImVec2 size{
+        std::max(80.0F, ImGui::GetContentRegionAvail().x),
+        54.0F};
+    ImGui::InvisibleButton(
+        "##LinkedLoopOverlapTimeline",
+        size);
+    const ImVec2 minimum = ImGui::GetItemRectMin();
+    const ImVec2 maximum = ImGui::GetItemRectMax();
+    auto* drawList = ImGui::GetWindowDrawList();
+    drawList->AddRectFilled(
+        minimum,
+        maximum,
+        ImGui::GetColorU32(ImGuiCol_FrameBg),
+        3.0F);
+    const float width = std::max(1.0F, maximum.x - minimum.x);
+    const auto xAtFrame = [&](float frame) {
+        return minimum.x + width * std::clamp(
+            frame / periodFrames,
+            0.0F,
+            1.0F);
+    };
+    const float bandTop = minimum.y + 8.0F;
+    const float bandBottom = maximum.y - 8.0F;
+    const auto drawBand = [&](float start, float end, ImU32 color) {
+        if (end <= start) {
+            return;
+        }
+        drawList->AddRectFilled(
+            ImVec2{xAtFrame(start), bandTop},
+            ImVec2{xAtFrame(end), bandBottom},
+            color,
+            2.0F);
+    };
+    const auto drawCircularBand = [&](float start,
+                                      float duration,
+                                      ImU32 color) {
+        if (duration <= 0.0F) {
+            return;
+        }
+        if (duration >= periodFrames) {
+            drawBand(0.0F, periodFrames, color);
+            return;
+        }
+        float wrappedStart = std::fmod(start, periodFrames);
+        if (wrappedStart < 0.0F) {
+            wrappedStart += periodFrames;
+        }
+        const float end = wrappedStart + duration;
+        drawBand(
+            wrappedStart,
+            std::min(end, periodFrames),
+            color);
+        if (end > periodFrames) {
+            drawBand(0.0F, end - periodFrames, color);
+        }
+    };
+    const ImU32 firstColor = IM_COL32(70, 155, 255, 82);
+    const ImU32 secondColor = IM_COL32(255, 150, 70, 82);
+    drawCircularBand(
+        0.0F,
+        static_cast<float>(timing.firstDurationFrames),
+        firstColor);
+    const float secondStart = timing.secondStartFrame;
+    const float secondEnd =
+        secondStart + static_cast<float>(timing.secondDurationFrames);
+    drawCircularBand(
+        secondStart,
+        static_cast<float>(timing.secondDurationFrames),
+        secondColor);
+
+    const float startFrame = std::clamp(firstStartPosition, 0.0F, 1.0F) *
+                             static_cast<float>(
+                                 timing.firstDurationFrames);
+    const float markerX = xAtFrame(startFrame);
+    drawList->AddLine(
+        ImVec2{markerX, minimum.y + 2.0F},
+        ImVec2{markerX, maximum.y - 2.0F},
+        IM_COL32(255, 235, 140, 245),
+        2.0F);
+    drawList->AddTriangleFilled(
+        ImVec2{markerX, minimum.y + 2.0F},
+        ImVec2{markerX - 4.0F, minimum.y + 7.0F},
+        ImVec2{markerX + 4.0F, minimum.y + 7.0F},
+        IM_COL32(255, 235, 140, 245));
+    drawList->AddText(
+        ImVec2{minimum.x + 5.0F, bandTop + 3.0F},
+        IM_COL32(170, 215, 255, 220),
+        "A");
+    drawList->AddText(
+        ImVec2{std::min(
+                   maximum.x - 16.0F,
+                   xAtFrame(std::fmod(secondStart, periodFrames)) + 5.0F),
+               bandTop + 3.0F},
+        IM_COL32(255, 205, 165, 220),
+        "B");
+    drawList->AddRect(
+        minimum,
+        maximum,
+        ImGui::GetColorU32(ImGuiCol_Border),
+        3.0F);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+        ImGui::SetTooltip(
+            "Both clips share one translucent lane. Darker regions are "
+            "real crossfade overlaps; empty regions are held gaps. The "
+            "yellow marker is the linked loop's phase start. At zero "
+            "padding, each incoming first key aligns with the outgoing "
+            "penultimate key, blending the complete terminal edge.");
+    }
+    if (paddingFrames == 0) {
+        ImGui::TextDisabled(
+            "Each incoming first key starts at the outgoing penultimate key.");
+    } else {
+        ImGui::TextDisabled(
+            "Each incoming first key starts %+d frames from the outgoing penultimate key.",
+            paddingFrames);
+    }
+
+    const float firstEnd =
+        static_cast<float>(timing.firstDurationFrames);
+    const float nextFirstStart = periodFrames;
+    const float firstToSecondOverlap = std::max(
+        0.0F,
+        std::min(firstEnd, secondEnd) -
+            std::max(0.0F, secondStart));
+    const float firstToSecondGap = std::max(
+        0.0F,
+        secondStart - firstEnd);
+    const float secondToFirstOverlap = std::max(
+        0.0F,
+        std::min(
+            secondEnd,
+            nextFirstStart +
+                static_cast<float>(timing.firstDurationFrames)) -
+            std::max(secondStart, nextFirstStart));
+    const float secondToFirstGap = std::max(
+        0.0F,
+        nextFirstStart - secondEnd);
+    const auto joinLabel = [](float overlap, float gap) {
+        if (overlap > 0.0F) {
+            return std::to_string(static_cast<int>(std::lround(overlap))) +
+                   "-frame overlap";
+        }
+        if (gap > 0.0F) {
+            return std::to_string(static_cast<int>(std::lround(gap))) +
+                   "-frame hold";
+        }
+        return std::string{"endpoint meet"};
+    };
+    const auto firstJoin = joinLabel(
+        firstToSecondOverlap,
+        firstToSecondGap);
+    const auto secondJoin = joinLabel(
+        secondToFirstOverlap,
+        secondToFirstGap);
+    ImGui::TextDisabled(
+        "A->B: %s; B->A: %s.",
+        firstJoin.c_str(),
+        secondJoin.c_str());
+}
+
+void DrawLinkedLoopLiveCameraControls(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    auto& panel = runtimeState->animationPanel;
+    bool changed = false;
+    ImGui::TextUnformatted("Live Camera");
+    ImGui::SameLine();
+    ImGui::PushID("LinkedLoopLiveCamera");
+    if (ImGui::RadioButton(
+            "Overlay",
+            panel.linkedLoopLiveCameraMode ==
+                LinkedLoopLiveCameraMode::InterleavedOverlay)) {
+        panel.linkedLoopLiveCameraMode =
+            LinkedLoopLiveCameraMode::InterleavedOverlay;
+        changed = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton(
+            "A",
+            panel.linkedLoopLiveCameraMode ==
+                LinkedLoopLiveCameraMode::SourceA)) {
+        panel.linkedLoopLiveCameraMode =
+            LinkedLoopLiveCameraMode::SourceA;
+        changed = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton(
+            "B",
+            panel.linkedLoopLiveCameraMode ==
+                LinkedLoopLiveCameraMode::SourceB)) {
+        panel.linkedLoopLiveCameraMode =
+            LinkedLoopLiveCameraMode::SourceB;
+        changed = true;
+    }
+    ImGui::PopID();
+    if (changed && panel.currentPath.has_value()) {
+        ApplyAnimationEvaluation(
+            runtimeState,
+            panel.currentPath.value(),
+            panel.scrubAmount,
+            runtimeState->animationPlayback.active ||
+                panel.previewDepthOfField);
+    }
+    ImGui::TextDisabled(
+        "Overlay alternates A/B and motion-warps the cached partner between renders.");
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+        ImGui::SetTooltip(
+            "Overlay renders A and B on alternate display frames, retains "
+            "both colour/depth images, and composites them with the linked "
+            "weights. While one source renders, the cached partner is "
+            "reprojected toward its camera pose at the current time, reducing "
+            "half-rate camera judder without a second point pass. Newly "
+            "revealed edges fall back conservatively, so very fast movement "
+            "can still show a small temporal trail. A or B isolates that "
+            "source; outside overlaps the active source or held endpoint "
+            "remains visible.");
+    }
+}
+
+void PreserveLinkedAnimationOwnedSettings(
+    const AnimationPath& previous,
+    AnimationPath* rebuilt) {
+    if (rebuilt == nullptr) {
+        return;
+    }
+    rebuilt->exportSettings = previous.exportSettings;
+    rebuilt->selectedTimingTakeId = previous.selectedTimingTakeId;
+    rebuilt->selectedWaterScenarioId = previous.selectedWaterScenarioId;
+    rebuilt->waterScenarioTracks = previous.waterScenarioTracks;
+    rebuilt->waterAnimationTrailSettings =
+        previous.waterAnimationTrailSettings;
+    rebuilt->tempWaterAnimationTrailSettings =
+        previous.tempWaterAnimationTrailSettings;
+    rebuilt->waterPointVisualStyle = previous.waterPointVisualStyle;
+    rebuilt->tempWaterPointVisualStyle =
+        previous.tempWaterPointVisualStyle;
+    rebuilt->waterCausticLookSettings =
+        previous.waterCausticLookSettings;
+    rebuilt->tempWaterCausticLookSettings =
+        previous.tempWaterCausticLookSettings;
+    rebuilt->waterVisualSettings = previous.waterVisualSettings;
+    rebuilt->tempWaterVisualSettings = previous.tempWaterVisualSettings;
+    rebuilt->waterSettings = previous.waterSettings;
+    rebuilt->tempWaterSettings = previous.tempWaterSettings;
+}
+
+void DrawLinkedLoopEndpointGhosts(
+    const AnimationPath& first,
+    const AnimationPath& second,
+    std::int32_t paddingFrames,
+    const invisible_places::camera::OrbitCameraMatrices& matrices,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    const auto firstContext =
+        invisible_places::camera::PrepareAnimationPathEvaluation(first);
+    const auto secondContext =
+        invisible_places::camera::PrepareAnimationPathEvaluation(second);
+    if (!firstContext.valid || !secondContext.valid) {
+        return;
+    }
+    const auto timing = invisible_places::camera::ResolveLinkedLoopTiming(
+        first,
+        second,
+        paddingFrames);
+    auto* drawList = ImGui::GetBackgroundDrawList(
+        ImGui::GetMainViewport());
+    const auto drawPair = [&](const auto& outgoing,
+                              const auto& incoming,
+                              bool outgoingIsFirst) {
+        const ImU32 outgoingCameraColor = outgoingIsFirst
+                                              ? IM_COL32(80, 160, 255, 72)
+                                              : IM_COL32(255, 150, 70, 72);
+        const ImU32 incomingCameraColor = outgoingIsFirst
+                                              ? IM_COL32(255, 150, 70, 72)
+                                              : IM_COL32(80, 160, 255, 72);
+        const ImU32 outgoingFocusColor = outgoingIsFirst
+                                             ? IM_COL32(80, 160, 255, 58)
+                                             : IM_COL32(255, 150, 70, 58);
+        const ImU32 incomingFocusColor = outgoingIsFirst
+                                             ? IM_COL32(255, 150, 70, 58)
+                                             : IM_COL32(80, 160, 255, 58);
+        const auto outgoingCamera = ProjectWorldPoint(
+            matrices,
+            viewport,
+            glm::vec3{
+                outgoing.camera.position[0],
+                outgoing.camera.position[1],
+                outgoing.camera.position[2]});
+        const auto incomingCamera = ProjectWorldPoint(
+            matrices,
+            viewport,
+            glm::vec3{
+                incoming.camera.position[0],
+                incoming.camera.position[1],
+                incoming.camera.position[2]});
+        const auto outgoingFocus = ProjectWorldPoint(
+            matrices,
+            viewport,
+            glm::vec3{
+                outgoing.focusPoint[0],
+                outgoing.focusPoint[1],
+                outgoing.focusPoint[2]});
+        const auto incomingFocus = ProjectWorldPoint(
+            matrices,
+            viewport,
+            glm::vec3{
+                incoming.focusPoint[0],
+                incoming.focusPoint[1],
+                incoming.focusPoint[2]});
+        if (outgoingCamera.has_value() && incomingCamera.has_value()) {
+            drawList->AddLine(
+                outgoingCamera->screen,
+                incomingCamera->screen,
+                IM_COL32(255, 255, 255, 34),
+                1.0F);
+            drawList->AddCircleFilled(
+                outgoingCamera->screen,
+                4.0F,
+                outgoingCameraColor,
+                16);
+            drawList->AddCircleFilled(
+                incomingCamera->screen,
+                4.0F,
+                incomingCameraColor,
+                16);
+        }
+        if (outgoingCamera.has_value() && outgoingFocus.has_value()) {
+            drawList->AddLine(
+                outgoingCamera->screen,
+                outgoingFocus->screen,
+                outgoingIsFirst
+                    ? IM_COL32(80, 160, 255, 52)
+                    : IM_COL32(255, 150, 70, 52),
+                1.0F);
+            drawList->AddCircleFilled(
+                outgoingFocus->screen,
+                2.5F,
+                outgoingFocusColor,
+                12);
+        }
+        if (incomingCamera.has_value() && incomingFocus.has_value()) {
+            drawList->AddLine(
+                incomingCamera->screen,
+                incomingFocus->screen,
+                outgoingIsFirst
+                    ? IM_COL32(255, 150, 70, 52)
+                    : IM_COL32(80, 160, 255, 52),
+                1.0F);
+            drawList->AddCircleFilled(
+                incomingFocus->screen,
+                2.5F,
+                incomingFocusColor,
+                12);
+        }
+    };
+    const auto drawJoin = [&](const auto& outgoingContext,
+                              const auto& incomingContext,
+                              float outgoingStart,
+                              float incomingStart,
+                              float outgoingDuration,
+                              float incomingDuration,
+                              bool outgoingIsFirst) {
+        const float overlapStart = std::max(
+            outgoingStart,
+            incomingStart);
+        const float overlapEnd = std::min(
+            outgoingStart + outgoingDuration,
+            incomingStart + incomingDuration);
+        const float overlapFrames = std::max(
+            0.0F,
+            overlapEnd - overlapStart);
+        const int sampleCount = overlapFrames > 0.0F ? 7 : 1;
+        for (int sampleIndex = 0;
+             sampleIndex < sampleCount;
+             ++sampleIndex) {
+            const float amount = sampleCount == 1
+                                     ? 0.0F
+                                     : static_cast<float>(sampleIndex) /
+                                           static_cast<float>(
+                                               sampleCount - 1);
+            const float globalFrame = overlapFrames > 0.0F
+                                          ? overlapStart +
+                                                overlapFrames * amount
+                                          : outgoingStart +
+                                                outgoingDuration;
+            const float outgoingFrame = overlapFrames > 0.0F
+                                            ? globalFrame - outgoingStart
+                                            : outgoingDuration;
+            const float incomingFrame = overlapFrames > 0.0F
+                                            ? globalFrame - incomingStart
+                                            : 0.0F;
+            drawPair(
+                invisible_places::camera::
+                    EvaluatePreparedAnimationPath(
+                        outgoingContext,
+                        outgoingFrame / 30.0F),
+                invisible_places::camera::
+                    EvaluatePreparedAnimationPath(
+                        incomingContext,
+                        incomingFrame / 30.0F),
+                outgoingIsFirst);
+        }
+    };
+    drawJoin(
+        firstContext,
+        secondContext,
+        0.0F,
+        timing.secondStartFrame,
+        static_cast<float>(timing.firstDurationFrames),
+        static_cast<float>(timing.secondDurationFrames),
+        true);
+    drawJoin(
+        secondContext,
+        firstContext,
+        timing.secondStartFrame,
+        static_cast<float>(timing.periodFrames),
+        static_cast<float>(timing.secondDurationFrames),
+        static_cast<float>(timing.firstDurationFrames),
+        false);
+}
+
 void DrawAnimationViewportOverlay(
     PreviewRuntimeState* runtimeState,
     const invisible_places::renderer::core::VulkanViewportShell& viewport) {
@@ -39842,6 +41138,81 @@ void DrawAnimationViewportOverlay(
     const auto& preparedPath = CachedPreparedAnimationPath(&panel, path);
     DrawAnimationCurveOverlay(preparedPath, matrices, viewport, cameraColor, true);
     DrawAnimationCurveOverlay(preparedPath, matrices, viewport, focusColor, false);
+
+    if (panel.showLinkedLoopOverlap) {
+        const AnimationPath* linkedFirst = nullptr;
+        const AnimationPath* linkedSecond = nullptr;
+        std::int32_t linkedPaddingFrames =
+            static_cast<std::int32_t>(panel.linkedLoopPaddingFrames);
+        if (path.linkedLoop.has_value()) {
+            const auto firstIndex = FindAnimationRegistryIndexByFileName(
+                panel,
+                path.linkedLoop->firstFileName);
+            const auto secondIndex = FindAnimationRegistryIndexByFileName(
+                panel,
+                path.linkedLoop->secondFileName);
+            if (firstIndex.has_value()) {
+                linkedFirst = RegistryAnimationPath(
+                    *runtimeState,
+                    firstIndex.value());
+            }
+            if (secondIndex.has_value()) {
+                linkedSecond = RegistryAnimationPath(
+                    *runtimeState,
+                    secondIndex.value());
+            }
+            linkedPaddingFrames = static_cast<std::int32_t>(
+                panel.linkedLoopPaddingFrames);
+        } else if (!panel.loopSmoothingPartnerPath.empty()) {
+            const auto partnerIndex = FindAnimationRegistryIndex(
+                panel,
+                panel.loopSmoothingPartnerPath);
+            if (partnerIndex.has_value()) {
+                linkedFirst = &path;
+                linkedSecond = RegistryAnimationPath(
+                    *runtimeState,
+                    partnerIndex.value());
+            }
+        }
+        if (linkedFirst != nullptr && linkedSecond != nullptr) {
+            if (linkedFirst != &path) {
+                const auto firstGhost = invisible_places::camera::
+                    PrepareAnimationPathEvaluation(*linkedFirst);
+                DrawAnimationCurveOverlay(
+                    firstGhost,
+                    matrices,
+                    viewport,
+                    IM_COL32(80, 160, 255, 62),
+                    true);
+                DrawAnimationCurveOverlay(
+                    firstGhost,
+                    matrices,
+                    viewport,
+                    IM_COL32(88, 220, 150, 48),
+                    false);
+            }
+            const auto secondGhost = invisible_places::camera::
+                PrepareAnimationPathEvaluation(*linkedSecond);
+            DrawAnimationCurveOverlay(
+                secondGhost,
+                matrices,
+                viewport,
+                IM_COL32(255, 150, 70, 62),
+                true);
+            DrawAnimationCurveOverlay(
+                secondGhost,
+                matrices,
+                viewport,
+                IM_COL32(255, 205, 120, 48),
+                false);
+            DrawLinkedLoopEndpointGhosts(
+                *linkedFirst,
+                *linkedSecond,
+                linkedPaddingFrames,
+                matrices,
+                viewport);
+        }
+    }
 
     const auto& io = ImGui::GetIO();
     if (panel.drag.active) {
@@ -41778,6 +43149,114 @@ void ApplyLoopEndpointsToCameraShots(
     }
 }
 
+invisible_places::camera::AnimationLoopTransitionMetrics
+LoopMetricsFromSmoothingAttempt(
+    const invisible_places::camera::AnimationLoopSmoothingResult& result,
+    bool currentIsCanonicalFirst) {
+    invisible_places::camera::AnimationLoopTransitionMetrics metrics;
+    metrics.valid = result.succeeded;
+    metrics.hasAppliedSmoothing = result.changed;
+    metrics.beforeMismatch = result.beforeMismatch;
+    metrics.afterMismatch = result.afterMismatch;
+    if (currentIsCanonicalFirst) {
+        metrics.beforeSeamMismatch = result.beforeSeamMismatch;
+        metrics.afterSeamMismatch = result.afterSeamMismatch;
+        metrics.terminalSpeedRmsChange = result.terminalSpeedRmsChange;
+    } else {
+        metrics.beforeSeamMismatch = {
+            result.beforeSeamMismatch[1U],
+            result.beforeSeamMismatch[0U],
+        };
+        metrics.afterSeamMismatch = {
+            result.afterSeamMismatch[1U],
+            result.afterSeamMismatch[0U],
+        };
+        metrics.terminalSpeedRmsChange = {
+            result.terminalSpeedRmsChange[1U],
+            result.terminalSpeedRmsChange[0U],
+        };
+    }
+    metrics.maxCameraMove = result.maxCameraMove;
+    metrics.maxFocusMove = result.maxFocusMove;
+    metrics.maxCameraCapUsage = result.maxCameraCapUsage;
+    metrics.maxFocusCapUsage = result.maxFocusCapUsage;
+    metrics.errorMessage = result.errorMessage;
+    return metrics;
+}
+
+void StoreInvalidAnimationLoopDiagnostics(
+    AnimationPanelState* panel,
+    std::size_t currentFileIndex,
+    std::size_t partnerFileIndex,
+    std::string message) {
+    if (panel == nullptr ||
+        currentFileIndex >= panel->availableFiles.size() ||
+        partnerFileIndex >= panel->availableFiles.size()) {
+        return;
+    }
+    invisible_places::camera::AnimationLoopTransitionMetrics metrics;
+    metrics.errorMessage = message;
+    panel->loopSmoothingDiagnostics = AnimationLoopDiagnostics{
+        .firstFilePath = panel->availableFiles[currentFileIndex],
+        .secondFilePath = panel->availableFiles[partnerFileIndex],
+        .status = AnimationLoopDiagnosticsStatus::Invalid,
+        .metrics = std::move(metrics),
+        .message = std::move(message),
+    };
+}
+
+bool RefreshAnimationLoopDiagnostics(
+    PreviewRuntimeState* runtimeState,
+    std::size_t partnerFileIndex) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+    SyncCurrentAnimationToRegistry(runtimeState);
+    auto& panel = runtimeState->animationPanel;
+    const auto currentFileIndex = FindAnimationRegistryIndex(
+        panel,
+        std::filesystem::path{panel.currentFilePath});
+    if (!currentFileIndex.has_value() ||
+        partnerFileIndex >= panel.availableFiles.size() ||
+        partnerFileIndex == currentFileIndex.value()) {
+        return false;
+    }
+    const auto* current = RegistryAnimationPath(
+        *runtimeState,
+        currentFileIndex.value());
+    const auto* partner = RegistryAnimationPath(
+        *runtimeState,
+        partnerFileIndex);
+    if (current == nullptr || partner == nullptr) {
+        return false;
+    }
+
+    auto metrics = invisible_places::camera::MeasureAnimationLoopTransitions(
+        *current,
+        *partner);
+    AnimationLoopDiagnostics diagnostics{
+        .firstFilePath = panel.availableFiles[currentFileIndex.value()],
+        .secondFilePath = panel.availableFiles[partnerFileIndex],
+        .status = metrics.valid
+                      ? (metrics.hasAppliedSmoothing
+                             ? AnimationLoopDiagnosticsStatus::Applied
+                             : AnimationLoopDiagnosticsStatus::Baseline)
+                      : AnimationLoopDiagnosticsStatus::Invalid,
+        .metrics = std::move(metrics),
+    };
+    if (diagnostics.status == AnimationLoopDiagnosticsStatus::Applied) {
+        diagnostics.message =
+            "Validated against the original endpoints preserved with the smoothing.";
+    } else if (diagnostics.status == AnimationLoopDiagnosticsStatus::Baseline) {
+        diagnostics.message =
+            "Current unsmoothed baseline; apply smoothing to create a before/after comparison.";
+    } else {
+        diagnostics.message = diagnostics.metrics.errorMessage;
+    }
+    panel.loopSmoothingDiagnostics = std::move(diagnostics);
+    return panel.loopSmoothingDiagnostics->metrics.valid;
+}
+
 bool ApplyAnimationLoopSmoothing(
     PreviewRuntimeState* runtimeState,
     std::size_t partnerFileIndex,
@@ -41807,20 +43286,39 @@ bool ApplyAnimationLoopSmoothing(
             currentFileIndex.value(),
             partnerFileIndex,
             &validationError)) {
+        StoreInvalidAnimationLoopDiagnostics(
+            &panel,
+            currentFileIndex.value(),
+            partnerFileIndex,
+            validationError);
         runtimeState->errorMessage = std::move(validationError);
         runtimeState->statusMessage.clear();
         return false;
     }
     const auto* partner = RegistryAnimationPath(*runtimeState, partnerFileIndex);
     if (partner == nullptr) {
-        runtimeState->errorMessage = "The selected loop animation is not loaded.";
+        const std::string message =
+            "The selected loop animation is not loaded.";
+        StoreInvalidAnimationLoopDiagnostics(
+            &panel,
+            currentFileIndex.value(),
+            partnerFileIndex,
+            message);
+        runtimeState->errorMessage = message;
         return false;
     }
     const auto* current = RegistryAnimationPath(
         *runtimeState,
         currentFileIndex.value());
     if (current == nullptr) {
-        runtimeState->errorMessage = "The current loop animation is not loaded.";
+        const std::string message =
+            "The current loop animation is not loaded.";
+        StoreInvalidAnimationLoopDiagnostics(
+            &panel,
+            currentFileIndex.value(),
+            partnerFileIndex,
+            message);
+        runtimeState->errorMessage = message;
         return false;
     }
     auto candidateCurrent = *current;
@@ -41850,6 +43348,19 @@ bool ApplyAnimationLoopSmoothing(
                    .pairId = pairId,
                    .firstFileName = panel.availableFiles[partnerFileIndex].filename().string(),
                    .secondFileName = panel.availableFiles[currentFileIndex.value()].filename().string()});
+    panel.loopSmoothingDiagnostics = AnimationLoopDiagnostics{
+        .firstFilePath = panel.availableFiles[currentFileIndex.value()],
+        .secondFilePath = panel.availableFiles[partnerFileIndex],
+        .status = smoothingResult.succeeded
+                      ? (smoothingResult.changed
+                             ? AnimationLoopDiagnosticsStatus::Applied
+                             : AnimationLoopDiagnosticsStatus::Rejected)
+                      : AnimationLoopDiagnosticsStatus::Invalid,
+        .metrics = LoopMetricsFromSmoothingAttempt(
+            smoothingResult,
+            currentIsCanonicalFirst),
+        .message = smoothingResult.errorMessage,
+    };
     if (!smoothingResult.succeeded || !smoothingResult.changed) {
         runtimeState->errorMessage = smoothingResult.errorMessage.empty()
                                          ? "The endpoints are already optimal within the selected movement limit."
@@ -41962,6 +43473,7 @@ bool UnapplyAnimationLoopSmoothing(
     panel.perceivedFlowCache = {};
     runtimeState->animationPlayback.active = false;
     ApplyAnimationScrub(runtimeState);
+    RefreshAnimationLoopDiagnostics(runtimeState, partnerFileIndex);
     runtimeState->statusMessage =
         "Restored the original endpoint cameras and focus points in both "
         "_Edited versions. Save Changes to promote them.";
@@ -42244,6 +43756,9 @@ void DrawAnimationSection(
         return;
     }
 
+    std::optional<AnimationPath> pendingLinkedPath;
+    bool pendingLinkedPathIsNew = false;
+
     if (BeginPanelSection("Current Path")) {
     ImGui::Text("File: %s", panel.currentFilePath.empty() ? "unsaved" : panel.currentFilePath.c_str());
     ImGui::Text(
@@ -42514,6 +44029,172 @@ void DrawAnimationSection(
                 "respacing can subtly reshape the camera spline.");
         }
 
+        if (animationPath.linkedLoop.has_value()) {
+            const auto& linkedMetadata = animationPath.linkedLoop.value();
+            ImGui::SeparatorText("Linked Animation");
+            ImGui::TextWrapped(
+                "%s + %s",
+                linkedMetadata.firstFileName.c_str(),
+                linkedMetadata.secondFileName.c_str());
+            ImGui::Checkbox(
+                "Preview Source Overlap",
+                &panel.showLinkedLoopOverlap);
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+                ImGui::SetTooltip(
+                    "Draws both source splines and paired samples across the "
+                    "complete A-to-B and B-to-A overlap sections at high "
+                    "transparency.");
+            }
+
+            const auto firstSourceIndex =
+                FindAnimationRegistryIndexByFileName(
+                    panel,
+                    linkedMetadata.firstFileName);
+            const auto secondSourceIndex =
+                FindAnimationRegistryIndexByFileName(
+                    panel,
+                    linkedMetadata.secondFileName);
+            const auto* firstSource = firstSourceIndex.has_value()
+                                          ? RegistryAnimationPath(
+                                                *runtimeState,
+                                                firstSourceIndex.value())
+                                          : nullptr;
+            const auto* secondSource = secondSourceIndex.has_value()
+                                           ? RegistryAnimationPath(
+                                                 *runtimeState,
+                                                 secondSourceIndex.value())
+                                           : nullptr;
+            if (firstSource == nullptr || secondSource == nullptr) {
+                ImGui::TextColored(
+                    ImVec4{0.95F, 0.55F, 0.22F, 1.0F},
+                    "A linked source is missing from the project. The compiled animation remains playable.");
+            } else {
+                DrawLinkedLoopLiveCameraControls(runtimeState);
+                int requestedPaddingFrames =
+                    panel.linkedLoopPaddingFrames;
+                ImGui::BeginDisabled(renderSetupLocksAnimationSwitching);
+                if (ImGui::InputInt(
+                        "Padding Frames",
+                        &requestedPaddingFrames)) {
+                    panel.linkedLoopPaddingFrames =
+                        invisible_places::camera::
+                            ClampLinkedLoopPaddingFrames(
+                                *firstSource,
+                                *secondSource,
+                                requestedPaddingFrames);
+                }
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(
+                        ImGuiHoveredFlags_DelayNormal |
+                        ImGuiHoveredFlags_AllowWhenDisabled)) {
+                    ImGui::SetTooltip(
+                        "Padding is measured from the outgoing penultimate "
+                        "key to the incoming first key at both joins. Zero "
+                        "blends the complete terminal edge. Positive values "
+                        "delay the incoming key; a hold begins only after the "
+                        "terminal edge is exhausted. Negative values begin "
+                        "the blend earlier.");
+                }
+
+                const std::size_t startKeyIndex =
+                    ResolveLinkedLoopStartKeyIndex(
+                        *firstSource,
+                        panel.linkedLoopStartKeyId.empty()
+                            ? linkedMetadata.firstStartKeyId
+                            : panel.linkedLoopStartKeyId,
+                        linkedMetadata.firstStartPosition);
+                if (panel.linkedLoopStartKeyId.empty() &&
+                    startKeyIndex < firstSource->keys.size()) {
+                    panel.linkedLoopStartKeyId =
+                        firstSource->keys[startKeyIndex].id;
+                }
+                const auto& startKey =
+                    firstSource->keys[startKeyIndex];
+                const float startPosition = invisible_places::camera::
+                    AnimationPathKeyNormalizedPosition(
+                        *firstSource,
+                        startKeyIndex);
+                const std::string startLabel =
+                    "Key " + std::to_string(startKeyIndex + 1U) +
+                    "  (" + FormatFixed(startPosition, 3) + ")";
+                ImGui::BeginDisabled(renderSetupLocksAnimationSwitching);
+                if (ImGui::BeginCombo(
+                        "Loop Start Key",
+                        startLabel.c_str())) {
+                    for (std::size_t keyIndex = 0U;
+                         keyIndex < firstSource->keys.size();
+                         ++keyIndex) {
+                        const float position = invisible_places::camera::
+                            AnimationPathKeyNormalizedPosition(
+                                *firstSource,
+                                keyIndex);
+                        const std::string label =
+                            "Key " + std::to_string(keyIndex + 1U) +
+                            "  (" + FormatFixed(position, 3) + ")";
+                        const bool selected = keyIndex == startKeyIndex;
+                        if (ImGui::Selectable(
+                                label.c_str(),
+                                selected)) {
+                            panel.linkedLoopStartKeyId =
+                                firstSource->keys[keyIndex].id;
+                        }
+                        if (selected) {
+                            ImGui::SetItemDefaultFocus();
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                ImGui::EndDisabled();
+                DrawLinkedLoopTimelinePreview(
+                    *firstSource,
+                    *secondSource,
+                    static_cast<std::int32_t>(
+                        panel.linkedLoopPaddingFrames),
+                    startPosition);
+
+                ImGui::BeginDisabled(renderSetupLocksAnimationSwitching);
+                if (ImGui::Button("Rebuild Linked Animation")) {
+                    std::string buildError;
+                    auto rebuilt = invisible_places::camera::
+                        BuildLinkedLoopAnimation(
+                            *firstSource,
+                            *secondSource,
+                            {.name = animationPath.name,
+                             .firstFileName =
+                                 panel.availableFiles[
+                                     firstSourceIndex.value()]
+                                     .filename()
+                                     .string(),
+                             .secondFileName =
+                                 panel.availableFiles[
+                                     secondSourceIndex.value()]
+                                     .filename()
+                                     .string(),
+                             .firstStartKeyIndex =
+                                 ResolveLinkedLoopStartKeyIndex(
+                                     *firstSource,
+                                     panel.linkedLoopStartKeyId,
+                                     startPosition),
+                             .paddingFrames =
+                                 static_cast<std::int32_t>(
+                                     panel.linkedLoopPaddingFrames)},
+                            &buildError);
+                    if (rebuilt.has_value()) {
+                        PreserveLinkedAnimationOwnedSettings(
+                            animationPath,
+                            &rebuilt.value());
+                        pendingLinkedPath = std::move(rebuilt.value());
+                        pendingLinkedPathIsNew = false;
+                    } else {
+                        runtimeState->errorMessage = std::move(buildError);
+                        runtimeState->statusMessage.clear();
+                    }
+                }
+                ImGui::EndDisabled();
+                ImGui::TextDisabled(
+                    "Rebuild refreshes the compiled frames from the current saved/_Edited source versions.");
+            }
+        } else {
         const auto currentLoopFileIndex =
             panel.currentFilePath.empty()
                 ? std::nullopt
@@ -42603,6 +44284,171 @@ void DrawAnimationSection(
                       *runtimeState,
                       loopPartnerIndex.value())
                 : nullptr;
+
+        ImGui::SeparatorText("Linked Animation");
+        ImGui::Checkbox(
+            "Preview Source Overlap",
+            &panel.showLinkedLoopOverlap);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Draws the partner spline and paired samples across the "
+                "complete A-to-B and B-to-A overlap sections at high "
+                "transparency.");
+        }
+        if (loopPartner == nullptr) {
+            ImGui::TextDisabled(
+                "Choose a Loop Partner to preview or create a linked loop.");
+        } else {
+            int requestedPaddingFrames =
+                panel.linkedLoopPaddingFrames;
+            ImGui::BeginDisabled(renderSetupLocksAnimationSwitching);
+            if (ImGui::InputInt(
+                    "Padding Frames",
+                    &requestedPaddingFrames)) {
+                panel.linkedLoopPaddingFrames =
+                    invisible_places::camera::
+                        ClampLinkedLoopPaddingFrames(
+                            animationPath,
+                            *loopPartner,
+                            requestedPaddingFrames);
+            }
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(
+                    ImGuiHoveredFlags_DelayNormal |
+                    ImGuiHoveredFlags_AllowWhenDisabled)) {
+                ImGui::SetTooltip(
+                    "Padding is measured from the outgoing penultimate "
+                    "key to the incoming first key at both joins. Zero "
+                    "blends the complete terminal edge. Positive values "
+                    "delay the incoming key; a hold begins only after the "
+                    "terminal edge is exhausted. Negative values begin "
+                    "the blend earlier.");
+            }
+
+            std::size_t linkedStartKeyIndex =
+                ResolveLinkedLoopStartKeyIndex(
+                    animationPath,
+                    panel.linkedLoopStartKeyId,
+                    0.5F);
+            if (linkedStartKeyIndex < animationPath.keys.size() &&
+                (panel.linkedLoopStartKeyId.empty() ||
+                 animationPath.keys[linkedStartKeyIndex].id !=
+                     panel.linkedLoopStartKeyId)) {
+                panel.linkedLoopStartKeyId =
+                    animationPath.keys[linkedStartKeyIndex].id;
+            }
+            const float linkedStartPosition =
+                invisible_places::camera::
+                    AnimationPathKeyNormalizedPosition(
+                        animationPath,
+                        linkedStartKeyIndex);
+            const std::string linkedStartLabel =
+                "Key " + std::to_string(linkedStartKeyIndex + 1U) +
+                "  (" + FormatFixed(linkedStartPosition, 3) + ")";
+            ImGui::BeginDisabled(renderSetupLocksAnimationSwitching);
+            if (ImGui::BeginCombo(
+                    "Loop Start Key",
+                    linkedStartLabel.c_str())) {
+                for (std::size_t keyIndex = 0U;
+                     keyIndex < animationPath.keys.size();
+                     ++keyIndex) {
+                    const float position = invisible_places::camera::
+                        AnimationPathKeyNormalizedPosition(
+                            animationPath,
+                            keyIndex);
+                    std::string label =
+                        "Key " + std::to_string(keyIndex + 1U) +
+                        "  (" + FormatFixed(position, 3) + ")";
+                    if (!animationPath.keys[keyIndex]
+                             .sourceShotName.empty()) {
+                        label += "  " + animationPath.keys[keyIndex]
+                                              .sourceShotName;
+                    }
+                    const bool selected =
+                        keyIndex == linkedStartKeyIndex;
+                    if (ImGui::Selectable(
+                            label.c_str(),
+                            selected)) {
+                        panel.linkedLoopStartKeyId =
+                            animationPath.keys[keyIndex].id;
+                        linkedStartKeyIndex = keyIndex;
+                    }
+                    if (selected) {
+                        ImGui::SetItemDefaultFocus();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::EndDisabled();
+            DrawLinkedLoopTimelinePreview(
+                animationPath,
+                *loopPartner,
+                static_cast<std::int32_t>(
+                    panel.linkedLoopPaddingFrames),
+                invisible_places::camera::
+                    AnimationPathKeyNormalizedPosition(
+                        animationPath,
+                        ResolveLinkedLoopStartKeyIndex(
+                            animationPath,
+                            panel.linkedLoopStartKeyId,
+                            linkedStartPosition)));
+
+            const bool canCreateLinked =
+                !renderSetupLocksAnimationSwitching &&
+                currentLoopFileIndex.has_value() &&
+                loopPartnerIndex.has_value() &&
+                animationPath.keys.size() >= 3U &&
+                loopPartner->keys.size() >= 3U;
+            ImGui::BeginDisabled(!canCreateLinked);
+            if (ImGui::Button("Create Linked Animation")) {
+                std::string buildError;
+                auto linked = invisible_places::camera::
+                    BuildLinkedLoopAnimation(
+                        animationPath,
+                        *loopPartner,
+                        {.name = animationPath.name + " + " +
+                                 loopPartner->name + " Linked",
+                         .firstFileName =
+                             panel.availableFiles[
+                                 currentLoopFileIndex.value()]
+                                 .filename()
+                                 .string(),
+                         .secondFileName =
+                             panel.availableFiles[
+                                 loopPartnerIndex.value()]
+                                 .filename()
+                                 .string(),
+                         .firstStartKeyIndex =
+                             ResolveLinkedLoopStartKeyIndex(
+                                 animationPath,
+                                 panel.linkedLoopStartKeyId,
+                                 linkedStartPosition),
+                         .paddingFrames =
+                             static_cast<std::int32_t>(
+                                 panel.linkedLoopPaddingFrames)},
+                        &buildError);
+                if (linked.has_value()) {
+                    pendingLinkedPath = std::move(linked.value());
+                    pendingLinkedPathIsNew = true;
+                } else {
+                    runtimeState->errorMessage =
+                        std::move(buildError);
+                    runtimeState->statusMessage.clear();
+                }
+            }
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(
+                    ImGuiHoveredFlags_DelayNormal |
+                    ImGuiHoveredFlags_AllowWhenDisabled)) {
+                ImGui::SetTooltip(
+                    "Creates an unsaved, renderable animation beginning at "
+                    "the selected key in A, continuing through B, then "
+                    "wrapping through A to that same key. Each source needs "
+                    "at least three keys so its complete terminal edge is "
+                    "defined.");
+            }
+        }
+
         const bool matchingAppliedPair =
             loopPartner != nullptr &&
             animationPath.loopTransitionSmoothing.has_value() &&
@@ -42670,11 +44516,163 @@ void DrawAnimationSection(
                 "Restores only the four saved endpoint camera/focus poses "
                 "and keeps every later middle-key or timing edit.");
         }
+        const bool canValidateLoop =
+            currentLoopFileIndex.has_value() &&
+            loopPartnerIndex.has_value() &&
+            currentLoopFileIndex.value() != loopPartnerIndex.value() &&
+            animationPath.keys.size() >= 3U &&
+            loopPartner != nullptr && loopPartner->keys.size() >= 3U;
+        ImGui::BeginDisabled(!canValidateLoop);
+        if (ImGui::Button("Validate Loop Metrics")) {
+            if (RefreshAnimationLoopDiagnostics(
+                    runtimeState,
+                    loopPartnerIndex.value())) {
+                runtimeState->statusMessage =
+                    "Loop-transition metrics refreshed.";
+                runtimeState->errorMessage.clear();
+            } else {
+                const auto& diagnostics =
+                    panel.loopSmoothingDiagnostics;
+                runtimeState->errorMessage =
+                    diagnostics.has_value() &&
+                            !diagnostics->metrics.errorMessage.empty()
+                        ? diagnostics->metrics.errorMessage
+                        : "The selected loop pair could not be measured.";
+                runtimeState->statusMessage.clear();
+            }
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(
+                ImGuiHoveredFlags_DelayNormal |
+                ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip(
+                "Measures both transition directions without changing either "
+                "animation. Saved smoothing is compared with the original "
+                "endpoints stored in its reversible metadata.");
+        }
+
+        const auto diagnosticsMatchSelection = [&]() {
+            if (!panel.loopSmoothingDiagnostics.has_value() ||
+                !currentLoopFileIndex.has_value() ||
+                !loopPartnerIndex.has_value()) {
+                return false;
+            }
+            const auto& diagnostics =
+                panel.loopSmoothingDiagnostics.value();
+            return NormalizePathKey(diagnostics.firstFilePath) ==
+                       NormalizePathKey(
+                           panel.availableFiles[currentLoopFileIndex.value()]) &&
+                   NormalizePathKey(diagnostics.secondFilePath) ==
+                       NormalizePathKey(
+                           panel.availableFiles[loopPartnerIndex.value()]);
+        };
+        if (matchingAppliedPair && !diagnosticsMatchSelection()) {
+            RefreshAnimationLoopDiagnostics(
+                runtimeState,
+                loopPartnerIndex.value());
+        }
+        if (diagnosticsMatchSelection()) {
+            const auto& diagnostics =
+                panel.loopSmoothingDiagnostics.value();
+            const auto& metrics = diagnostics.metrics;
+            const auto improvementPercent = [](float before, float after) {
+                return before > 1.0e-8F
+                           ? 100.0F * (before - after) / before
+                           : 0.0F;
+            };
+            const auto currentLabel = AnimationRegistryDisplayLabel(
+                *runtimeState,
+                currentLoopFileIndex.value());
+            const auto partnerLabel = AnimationRegistryDisplayLabel(
+                *runtimeState,
+                loopPartnerIndex.value());
+            ImGui::SeparatorText("Loop Validation");
+            switch (diagnostics.status) {
+                case AnimationLoopDiagnosticsStatus::Applied:
+                    ImGui::TextColored(
+                        ImVec4{0.35F, 0.80F, 0.45F, 1.0F},
+                        "Applied and validated");
+                    break;
+                case AnimationLoopDiagnosticsStatus::Rejected:
+                    ImGui::TextColored(
+                        ImVec4{0.95F, 0.68F, 0.25F, 1.0F},
+                        "Best candidate was not applied");
+                    break;
+                case AnimationLoopDiagnosticsStatus::Baseline:
+                    ImGui::TextDisabled("Current unsmoothed baseline");
+                    break;
+                case AnimationLoopDiagnosticsStatus::Invalid:
+                    ImGui::TextColored(
+                        ImVec4{0.95F, 0.35F, 0.35F, 1.0F},
+                        "Validation unavailable");
+                    break;
+            }
+            if (metrics.valid) {
+                if (diagnostics.status ==
+                    AnimationLoopDiagnosticsStatus::Baseline) {
+                    ImGui::Text(
+                        "Current flow mismatch: %.6f (lower is better)",
+                        metrics.afterMismatch);
+                    ImGui::Text(
+                        "%s -> %s: %.6f",
+                        currentLabel.c_str(),
+                        partnerLabel.c_str(),
+                        metrics.afterSeamMismatch[0U]);
+                    ImGui::Text(
+                        "%s -> %s: %.6f",
+                        partnerLabel.c_str(),
+                        currentLabel.c_str(),
+                        metrics.afterSeamMismatch[1U]);
+                } else {
+                    ImGui::Text(
+                        "Overall mismatch: %.6f -> %.6f  (%+.1f%%)",
+                        metrics.beforeMismatch,
+                        metrics.afterMismatch,
+                        improvementPercent(
+                            metrics.beforeMismatch,
+                            metrics.afterMismatch));
+                    ImGui::Text(
+                        "%s -> %s: %.6f -> %.6f  (%+.1f%%)",
+                        currentLabel.c_str(),
+                        partnerLabel.c_str(),
+                        metrics.beforeSeamMismatch[0U],
+                        metrics.afterSeamMismatch[0U],
+                        improvementPercent(
+                            metrics.beforeSeamMismatch[0U],
+                            metrics.afterSeamMismatch[0U]));
+                    ImGui::Text(
+                        "%s -> %s: %.6f -> %.6f  (%+.1f%%)",
+                        partnerLabel.c_str(),
+                        currentLabel.c_str(),
+                        metrics.beforeSeamMismatch[1U],
+                        metrics.afterSeamMismatch[1U],
+                        improvementPercent(
+                            metrics.beforeSeamMismatch[1U],
+                            metrics.afterSeamMismatch[1U]));
+                    ImGui::Text(
+                        "Endpoint move: camera %.6f (%.1f%% cap), focus %.6f (%.1f%% cap)",
+                        metrics.maxCameraMove,
+                        100.0F * metrics.maxCameraCapUsage,
+                        metrics.maxFocusMove,
+                        100.0F * metrics.maxFocusCapUsage);
+                    ImGui::Text(
+                        "Terminal speed RMS change: %s %.1f%%, %s %.1f%%",
+                        currentLabel.c_str(),
+                        100.0F * metrics.terminalSpeedRmsChange[0U],
+                        partnerLabel.c_str(),
+                        100.0F * metrics.terminalSpeedRmsChange[1U]);
+                }
+            }
+            if (!diagnostics.message.empty()) {
+                ImGui::TextWrapped("%s", diagnostics.message.c_str());
+            }
+        }
         if (animationPath.loopTransitionSmoothing.has_value()) {
             ImGui::TextDisabled(
                 "End smoothing applied at %.0f%% maximum movement.",
                 100.0F * animationPath.loopTransitionSmoothing
                                ->maxEndMoveFraction);
+        }
         }
     }
 
@@ -42757,6 +44755,54 @@ void DrawAnimationSection(
         ImGui::TextDisabled("_Edited");
     }
     EndPanelSection();
+    }
+
+    if (pendingLinkedPath.has_value()) {
+        if (pendingLinkedPathIsNew) {
+            // Preserve any unsaved source edits in its registry shadow before
+            // replacing the active panel with the new linked draft.
+            SyncCurrentAnimationToRegistry(runtimeState);
+            panel.currentFilePath.clear();
+            panel.selectedFileIndex.reset();
+            panel.selectedFileUsesEdited = false;
+            panel.currentPathUsesEdited = false;
+            panel.linkedLoopLiveCameraMode =
+                LinkedLoopLiveCameraMode::InterleavedOverlay;
+            panel.linkedLoopTemporalOverlayWasActive = false;
+            panel.linkedLoopTemporalRenderFirstNext = true;
+        }
+        panel.currentPath = std::move(pendingLinkedPath.value());
+        panel.draftAnimationName = panel.currentPath->name;
+        panel.linkedLoopPaddingFrames =
+            panel.currentPath->linkedLoop.has_value()
+                ? panel.currentPath->linkedLoop->paddingFrames
+                : 0;
+        panel.linkedLoopStartKeyId =
+            panel.currentPath->linkedLoop.has_value()
+                ? panel.currentPath->linkedLoop->firstStartKeyId
+                : std::string{};
+        panel.selectedKeyIndex = 0U;
+        panel.scrubAmount = 0.0F;
+        panel.dirty = true;
+        panel.preparedPathCache = {};
+        panel.motionStatsCache = {};
+        panel.perceivedFlowCache = {};
+        runtimeState->animationPlayback.active = false;
+        runtimeState->cameraPlayback.active = false;
+        if (!pendingLinkedPathIsNew && currentVersionIndex.has_value()) {
+            panel.currentPathUsesEdited = true;
+            panel.selectedFileUsesEdited = true;
+            MarkRegistryAnimationDirty(
+                runtimeState,
+                currentVersionIndex.value());
+        }
+        SyncWaterAnimationTrailProfileFromCurrentAnimation(runtimeState);
+        ApplyAnimationScrub(runtimeState);
+        runtimeState->statusMessage = pendingLinkedPathIsNew
+                                          ? "Created an unsaved linked loop. Save it to add the linked animation to the project."
+                                          : "Rebuilt the linked animation from its current source versions. Save Changes to promote it.";
+        runtimeState->errorMessage.clear();
+        return;
     }
 
     // Legacy scenario tracks remain serialized for round-trip compatibility,
@@ -46682,6 +48728,80 @@ void DrawWaterTrailStyleEditor(
             visualChanged = true;
         }
         trailTooltip("Rendered dash length for each trail sample.");
+        ImGui::SeparatorText("Endpoint Fades");
+        if (ImGui::Checkbox("Fade From Start", &profile.geometry.startFadeEnabled)) {
+            generationChanged = true;
+            generationRefreshRequested = true;
+        }
+        trailTooltip(
+            "Fade trail points near the beginning of the route. Each trail "
+            "uses a stable random fade-begin distance.");
+        if (profile.geometry.startFadeEnabled) {
+            if (ImGui::DragFloat(
+                    "Start Fully Visible At",
+                    &profile.geometry.startFadeFullDistanceMeters,
+                    0.01F,
+                    0.0F,
+                    50.0F,
+                    "%.2f m")) {
+                generationChanged = true;
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                generationRefreshRequested = true;
+            }
+            trailTooltip(
+                "Distance from the route start where every trail has reached full opacity.");
+            if (ImGui::DragFloat(
+                    "Start Random Begin Range",
+                    &profile.geometry.startFadeRandomBeginDistanceMeters,
+                    0.01F,
+                    0.0F,
+                    50.0F,
+                    "%.2f m")) {
+                generationChanged = true;
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                generationRefreshRequested = true;
+            }
+            trailTooltip(
+                "Each trail begins fading at a stable random distance between 0 and this value, capped before the full-opacity distance.");
+        }
+        if (ImGui::Checkbox("Fade Toward End", &profile.geometry.endFadeEnabled)) {
+            generationChanged = true;
+            generationRefreshRequested = true;
+        }
+        trailTooltip(
+            "Fade trail points as they approach the route end, independently of the start fade.");
+        if (profile.geometry.endFadeEnabled) {
+            if (ImGui::DragFloat(
+                    "End Fully Visible At",
+                    &profile.geometry.endFadeFullDistanceMeters,
+                    0.01F,
+                    0.0F,
+                    50.0F,
+                    "%.2f m")) {
+                generationChanged = true;
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                generationRefreshRequested = true;
+            }
+            trailTooltip(
+                "Distance inward from the route end where every trail remains fully opaque.");
+            if (ImGui::DragFloat(
+                    "End Random Begin Range",
+                    &profile.geometry.endFadeRandomBeginDistanceMeters,
+                    0.01F,
+                    0.0F,
+                    50.0F,
+                    "%.2f m")) {
+                generationChanged = true;
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                generationRefreshRequested = true;
+            }
+            trailTooltip(
+                "Each trail begins its end fade at a stable random distance between 0 and this value, measured inward from the endpoint.");
+        }
         ImGui::TreePop();
     }
     profile.geometry.trailLengthMeters = std::clamp(profile.geometry.trailLengthMeters, 0.001F, 50.0F);
@@ -46689,6 +48809,14 @@ void DrawWaterTrailStyleEditor(
     profile.geometry.widthMeters = std::clamp(profile.geometry.widthMeters, 0.0005F, 1.0F);
     profile.geometry.streakLengthMeters =
         std::max(profile.geometry.widthMeters, std::clamp(profile.geometry.streakLengthMeters, 0.001F, 5.0F));
+    profile.geometry.startFadeFullDistanceMeters =
+        std::clamp(profile.geometry.startFadeFullDistanceMeters, 0.0F, 50.0F);
+    profile.geometry.startFadeRandomBeginDistanceMeters =
+        std::clamp(profile.geometry.startFadeRandomBeginDistanceMeters, 0.0F, 50.0F);
+    profile.geometry.endFadeFullDistanceMeters =
+        std::clamp(profile.geometry.endFadeFullDistanceMeters, 0.0F, 50.0F);
+    profile.geometry.endFadeRandomBeginDistanceMeters =
+        std::clamp(profile.geometry.endFadeRandomBeginDistanceMeters, 0.0F, 50.0F);
     visualChanged |= invisible_places::water::WaterTrailGeometryLiveVisualOnlyEdit(previousGeometry, profile.geometry);
     generationChanged |=
         !invisible_places::water::WaterTrailGeometryGenerationInputsEqual(previousGeometry, profile.geometry);
@@ -46982,215 +49110,110 @@ void DrawWaterShorelineWavesPanel(PreviewRuntimeState* runtimeState) {
     DrawEmbeddedWaterFeatureTimeline(
         runtimeState,
         {.kind = invisible_places::water::WaterKeyedFeatureKind::Shoreline});
-
-    const auto visualIndex = ResolveLoadedPointCloudLookdevIndex(*runtimeState);
-    PreviewLayerSession* session =
-        visualIndex.has_value() ? &runtimeState->sessions[visualIndex.value()] : nullptr;
-    if (session == nullptr) {
-        ImGui::TextUnformatted("Load a lidar layer to edit shoreline waves.");
-        return;
-    }
-
     auto& water = runtimeState->water;
-    SeedWaterShorelineProfilePresets(&water);
-    water.selectedShorelineProfileName =
-        NormalizeWaterShorelineProfileName(
-            water.selectedShorelineProfileName);
-    if (water.selectedShorelineProfileName != "Default" &&
-        !FindWaterShorelineProfileIndex(
-             water,
-             water.selectedShorelineProfileName)
-             .has_value()) {
-        water.selectedShorelineProfileName = "Default";
-        water.shorelineProfileNameBuffer = "Default";
-        runtimeState->errorMessage =
-            "The selected Shoreline profile is missing; using Default.";
-    }
+    NormalizeWaterShorelineState(&water);
 
-    bool styleChanged = false;
-    const auto finishStyleEdit = [&]() {
-        SanitizePointCloudStyle(session);
-        MarkPointVisualEdited(runtimeState, session);
-        if (!IsProjectPointVisualSession(*session)) {
-            SyncScenePointVisualsFromOwner(runtimeState, session);
-        }
-        SyncWaterPointVisualSelectionFromSession(runtimeState, *session);
-    };
-    const auto upsertProfile = [&](std::string_view name,
-                                   const PointCloudShorelineWaveSettings& settings) {
-        const auto normalized = NormalizeWaterShorelineProfileName(name);
-        if (const auto existing =
-                FindWaterShorelineProfileIndex(water, normalized);
-            existing.has_value()) {
-            water.shorelineProfiles[existing.value()].settings = settings;
-        } else {
-            water.shorelineProfiles.push_back({
-                .name = normalized,
-                .settings = settings,
-            });
-        }
-    };
-    const auto removeProfile = [&](std::string_view name) {
-        const auto normalized = NormalizeWaterShorelineProfileName(name);
-        std::erase_if(
-            water.shorelineProfiles,
-            [&](const PointCloudShorelineWaveProfile& profile) {
-                return NormalizeWaterShorelineProfileName(profile.name) ==
-                       normalized;
-            });
-    };
-    const auto applyProfile = [&](std::string_view name) {
-        const auto normalized = NormalizeWaterShorelineProfileName(name);
-        invisible_places::renderer::pointcloud::
-            ApplyPointCloudShorelineWaveSettings(
-                &session->pointStyle,
-                ResolveWaterShorelineProfile(water, normalized));
-        water.selectedShorelineProfileName = normalized;
-        water.shorelineProfileNameBuffer = BasePointVisualName(normalized);
-        styleChanged = true;
-    };
-    const auto discardTarget = [&](std::string_view editedName) {
-        const std::string base = BasePointVisualName(editedName);
-        if (base == "Default" ||
-            FindWaterShorelineProfileIndex(water, base).has_value()) {
-            return base;
-        }
-        const std::string preset = PresetPointVisualName(base);
-        return FindWaterShorelineProfileIndex(water, preset).has_value()
-                   ? preset
-                   : std::string{"Default"};
-    };
-
-    const std::string assignedName =
-        water.selectedShorelineProfileName;
-    const bool assignedIsEdited =
-        IsEditedPointVisualName(assignedName);
-    const std::string shadowName =
-        EditedPointVisualName(BasePointVisualName(assignedName));
-    const bool shadowExists =
-        FindWaterShorelineProfileIndex(water, shadowName).has_value();
-    bool editorsLocked = !assignedIsEdited && shadowExists;
-
-    if (BeginPanelSection("Shoreline Profile")) {
-        const auto profileLabel = [](std::string_view name) {
-            if (IsPresetPointVisualName(name)) {
-                return BasePointVisualName(name) + " (Preset)";
-            }
-            return std::string{name};
-        };
-        const std::string selectedLabel = profileLabel(assignedName);
-        if (ImGui::BeginCombo(
-                "Profile",
-                selectedLabel.c_str())) {
-            const auto drawChoice = [&](std::string_view name) {
-                const std::string normalized =
-                    NormalizeWaterShorelineProfileName(name);
-                const bool selected = assignedName == normalized;
-                const std::string label = profileLabel(normalized);
-                if (ImGui::Selectable(label.c_str(), selected)) {
-                    applyProfile(normalized);
-                }
-                if (selected) {
-                    ImGui::SetItemDefaultFocus();
-                }
-            };
-            drawChoice("Default");
-            for (const auto& profile : water.shorelineProfiles) {
-                drawChoice(profile.name);
-            }
-            ImGui::EndCombo();
-        }
-        if (IsPresetPointVisualName(assignedName)) {
-            ImGui::TextDisabled(
-                "Preset (read-only; editing creates a copy)");
-        } else if (assignedIsEdited) {
-            ImGui::TextColored(
-                ImVec4{0.55F, 0.78F, 0.98F, 1.0F},
-                "Editing %s",
-                BasePointVisualName(assignedName).c_str());
-        }
-
-        if (editorsLocked) {
-            ImGui::TextColored(
-                ImVec4{0.92F, 0.58F, 0.18F, 1.0F},
-                "An edited version exists; switch to it to continue editing.");
-            const std::string switchLabel = "Switch to " + shadowName;
-            if (ImGui::Button(switchLabel.c_str())) {
-                applyProfile(shadowName);
-                editorsLocked = false;
-            }
-        }
-
+    if (BeginPanelSection("Saved Shoreline Profiles")) {
+        ImGui::TextWrapped(
+            "Profiles and effects belong to Water. Saved Visuals no longer "
+            "carry Shoreline settings.");
         InputTextString(
             "Profile Name",
             &water.shorelineProfileNameBuffer);
-        if (ImGui::Button("Save Profile")) {
-            const auto trimmed =
-                TrimText(water.shorelineProfileNameBuffer);
-            const std::string targetName = BasePointVisualName(
-                trimmed.empty() ? assignedName : trimmed);
-            const auto settings =
-                invisible_places::renderer::pointcloud::
-                    ExtractPointCloudShorelineWaveSettings(
-                        session->pointStyle);
-            if (targetName == "Default") {
-                water.defaultShorelineSettings = settings;
+        const bool hasSelectedInstance =
+            water.selectedShorelineInstanceIndex.has_value() &&
+            water.selectedShorelineInstanceIndex.value() <
+                water.shorelineInstances.size();
+        if (ImGui::Button(
+                hasSelectedInstance
+                    ? "Save Base Profile"
+                    : "Create Profile")) {
+            const std::string targetName =
+                NormalizeWaterShorelineProfileName(
+                    water.shorelineProfileNameBuffer);
+            if (targetName.empty() || targetName == "Default" ||
+                targetName.ends_with("_preset")) {
+                runtimeState->errorMessage =
+                    "Enter a named Shoreline profile other than Default.";
+                runtimeState->statusMessage.clear();
             } else {
-                upsertProfile(targetName, settings);
+                PointCloudShorelineWaveSettings settings =
+                    invisible_places::renderer::pointcloud::
+                        CalmPointCloudShorelineWaveSettings();
+                if (hasSelectedInstance) {
+                    settings = water
+                                   .shorelineInstances[water
+                                                           .selectedShorelineInstanceIndex
+                                                           .value()]
+                                   .settings;
+                }
+                const auto existing =
+                    FindWaterShorelineProfileIndex(water, targetName);
+                if (existing.has_value() &&
+                    water.shorelineProfiles[existing.value()]
+                        .objectOverride) {
+                    runtimeState->errorMessage =
+                        "That name belongs to an object-specific Shoreline copy.";
+                    runtimeState->statusMessage.clear();
+                } else {
+                    PointCloudShorelineWaveProfile saved{
+                        .name = targetName,
+                        .settings = settings,
+                    };
+                    if (existing.has_value()) {
+                        water.shorelineProfiles[existing.value()] = saved;
+                    } else {
+                        water.shorelineProfiles.push_back(saved);
+                    }
+                    for (auto& instance : water.shorelineInstances) {
+                        if (instance.profileName == targetName &&
+                            instance.baseProfileName == targetName) {
+                            instance.settings = settings;
+                        }
+                    }
+                    if (hasSelectedInstance) {
+                        auto& instance =
+                            water.shorelineInstances[water
+                                                        .selectedShorelineInstanceIndex
+                                                        .value()];
+                        instance.profileName = targetName;
+                        instance.baseProfileName = targetName;
+                        instance.settings = settings;
+                    }
+                    water.shorelineProfileNameBuffer = targetName;
+                    runtimeState->statusMessage =
+                        "Saved Shoreline profile " + targetName + ".";
+                    runtimeState->errorMessage.clear();
+                }
             }
-            removeProfile(EditedPointVisualName(targetName));
-            water.selectedShorelineProfileName = targetName;
-            water.shorelineProfileNameBuffer = targetName;
-            runtimeState->statusMessage =
-                "Saved Shoreline profile " + targetName + ".";
-            runtimeState->errorMessage.clear();
         }
-        if (assignedIsEdited) {
-            ImGui::SameLine();
-            if (ImGui::Button("Discard Edits")) {
-                const std::string target = discardTarget(assignedName);
-                removeProfile(assignedName);
-                applyProfile(target);
-                runtimeState->statusMessage =
-                    "Discarded Shoreline profile edits.";
-                runtimeState->errorMessage.clear();
-            }
+        DrawWaterSeepageParameterTooltip(
+            "With no effect selected this creates a named calm-water base. "
+            "With an effect selected it saves that effect's current settings "
+            "as the named base profile.");
+        if (water.shorelineProfiles.empty()) {
+            ImGui::TextDisabled(
+                "Create a named profile before adding a Shoreline effect.");
         } else {
-            ImGui::SameLine();
-            if (ImGui::Button("Revert to Profile")) {
-                applyProfile(assignedName);
-                runtimeState->statusMessage =
-                    "Reverted Shoreline settings to " +
-                    profileLabel(assignedName) + ".";
-                runtimeState->errorMessage.clear();
-            }
+            const auto baseCount = std::count_if(
+                water.shorelineProfiles.begin(),
+                water.shorelineProfiles.end(),
+                [](const PointCloudShorelineWaveProfile& profile) {
+                    return !profile.objectOverride;
+                });
+            ImGui::TextDisabled(
+                "%zu saved base profile%s, %zu object-specific cop%s",
+                static_cast<std::size_t>(baseCount),
+                baseCount == 1 ? "" : "s",
+                water.shorelineProfiles.size() -
+                    static_cast<std::size_t>(baseCount),
+                water.shorelineProfiles.size() -
+                            static_cast<std::size_t>(baseCount) ==
+                        1U
+                    ? "y"
+                    : "ies");
         }
         EndPanelSection();
-    }
-
-    if (editorsLocked) {
-        ImGui::BeginDisabled();
-    }
-    const bool waveControlsChanged =
-        DrawPointCloudShorelineWavesSection(session);
-    if (editorsLocked) {
-        ImGui::EndDisabled();
-    }
-    if (waveControlsChanged) {
-        const auto settings =
-            invisible_places::renderer::pointcloud::
-                ExtractPointCloudShorelineWaveSettings(
-                    session->pointStyle);
-        const std::string editedName =
-            assignedIsEdited ? assignedName : shadowName;
-        upsertProfile(editedName, settings);
-        water.selectedShorelineProfileName = editedName;
-        water.shorelineProfileNameBuffer =
-            BasePointVisualName(editedName);
-        styleChanged = true;
-    }
-    if (styleChanged) {
-        finishStyleEdit();
     }
 
     DrawAdditionalShorelinesSection(runtimeState);
@@ -48556,17 +50579,14 @@ void DrawKeyedGlobalLevelRow(
         &edited);
 }
 
-// Additional shorelines: extra bays, pool lines, or terraces rendered on
-// SAND beside the primary shoreline. Instances are project water state (not
-// part of the point visual); each one's level and visual response scalars
-// are keyable per instance through the Timings runs, so several shorelines
-// can fade in and out independently over an animation.
+// Complete project-owned Shoreline effect list. Every object uses a saved
+// base profile and at most one object-specific derived copy.
 void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
     if (runtimeState == nullptr) {
         return;
     }
     auto& water = runtimeState->water;
-    if (!BeginPanelSection("Additional Shorelines")) {
+    if (!BeginPanelSection("Shoreline Effects")) {
         return;
     }
     auto& instances = water.shorelineInstances;
@@ -48588,16 +50608,32 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
             (instance.name.empty()
                  ? "Shoreline " + std::to_string(instance.id)
                  : instance.name) +
+            (instance.profileName.empty()
+                 ? "  [no profile]"
+                 : "  [" + instance.profileName + "]") +
             (instance.enabled ? "" : "  (hidden)");
         if (ImGui::Selectable(rowLabel.c_str(), selected)) {
             water.selectedShorelineInstanceIndex = index;
+            water.shorelineProfileNameBuffer =
+                instance.baseProfileName.empty()
+                    ? instance.profileName
+                    : instance.baseProfileName;
         }
         ImGui::PopID();
     }
+    const auto firstBaseProfile = std::find_if(
+        water.shorelineProfiles.begin(),
+        water.shorelineProfiles.end(),
+        [](const PointCloudShorelineWaveProfile& profile) {
+            return !profile.objectOverride;
+        });
+    const bool hasBaseProfile =
+        firstBaseProfile != water.shorelineProfiles.end();
     const bool canAdd =
+        hasBaseProfile &&
         instances.size() <
-        invisible_places::renderer::pointcloud::
-            kMaxAdditionalShorelineInstances;
+            invisible_places::renderer::pointcloud::
+                kMaxShorelineInstances;
     if (!canAdd) {
         ImGui::BeginDisabled();
     }
@@ -48605,28 +50641,28 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
         PointCloudShorelineInstance instance;
         instance.id = water.nextShorelineInstanceId++;
         instance.name = "Shoreline " + std::to_string(instance.id);
-        // Seed from the applied profile so the new instance starts from a
-        // familiar look; retune its boundary height to place it.
-        instance.settings = ResolveWaterShorelineProfile(
-            water,
-            NormalizeWaterShorelineProfileName(
-                water.selectedShorelineProfileName));
-        instance.settings.enabled = true;
+        instance.profileName = firstBaseProfile->name;
+        instance.baseProfileName = firstBaseProfile->name;
+        instance.settings = firstBaseProfile->settings;
         instances.push_back(std::move(instance));
         water.selectedShorelineInstanceIndex = instances.size() - 1U;
     }
     if (!canAdd) {
         ImGui::EndDisabled();
         ImGui::SameLine();
-        ImGui::TextDisabled(
-            "Up to %zu additional shorelines render.",
-            invisible_places::renderer::pointcloud::
-                kMaxAdditionalShorelineInstances);
+        if (!hasBaseProfile) {
+            ImGui::TextDisabled("Create a named profile first.");
+        } else {
+            ImGui::TextDisabled(
+                "Up to %zu shoreline effects render.",
+                invisible_places::renderer::pointcloud::
+                    kMaxShorelineInstances);
+        }
     }
     DrawWaterSeepageParameterTooltip(
-        "Each instance is a full shoreline with its own boundary height, "
-        "algorithm, and look, blended additively over the primary "
-        "shoreline on SAND clouds. Add an instance to a Timings run to key "
+        "Each object is a full shoreline with its own boundary height, "
+        "algorithm, and profile-backed look, blended additively on SAND "
+        "clouds. Add an object to a Timings run to key "
         "its Level and visual response over the animation.");
 
     if (water.selectedShorelineInstanceIndex.has_value()) {
@@ -48634,18 +50670,114 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
             instances[water.selectedShorelineInstanceIndex.value()];
         ImGui::Separator();
         ImGui::PushID(static_cast<int>(instance.id));
-        InputTextString("Instance Name", &instance.name);
+        if (InputTextString("Instance Name", &instance.name)) {
+            instance.name = TrimText(instance.name);
+            if (instance.name.empty()) {
+                instance.name =
+                    "Shoreline " + std::to_string(instance.id);
+            }
+            for (auto& profile : water.shorelineProfiles) {
+                if (!profile.objectOverride ||
+                    profile.shorelineInstanceId != instance.id) {
+                    continue;
+                }
+                const auto renamed = WaterShorelineObjectProfileName(
+                    profile.baseProfileName,
+                    instance.name);
+                if (!renamed.empty()) {
+                    const bool wasApplied =
+                        instance.profileName == profile.name;
+                    profile.name = renamed;
+                    if (wasApplied) {
+                        instance.profileName = renamed;
+                    }
+                }
+            }
+        }
         ImGui::SameLine();
         if (ImGui::SmallButton("Remove")) {
+            const std::uint32_t removedId = instance.id;
             instances.erase(
                 instances.begin() +
                 static_cast<std::ptrdiff_t>(
                     water.selectedShorelineInstanceIndex.value()));
+            std::erase_if(
+                water.shorelineProfiles,
+                [&](const PointCloudShorelineWaveProfile& profile) {
+                    return profile.objectOverride &&
+                           profile.shorelineInstanceId == removedId;
+                });
             water.selectedShorelineInstanceIndex.reset();
             ImGui::PopID();
             EndPanelSection();
             return;
         }
+
+        const std::string profilePreview =
+            instance.profileName.empty()
+                ? std::string{"Select saved profile"}
+                : instance.profileName;
+        if (ImGui::BeginCombo(
+                "Saved Profile",
+                profilePreview.c_str())) {
+            for (const auto& profile : water.shorelineProfiles) {
+                if (profile.objectOverride &&
+                    profile.shorelineInstanceId != instance.id) {
+                    continue;
+                }
+                const bool selected =
+                    instance.profileName == profile.name;
+                const std::string label =
+                    profile.objectOverride
+                        ? profile.name + " (Object Copy)"
+                        : profile.name;
+                if (ImGui::Selectable(label.c_str(), selected)) {
+                    instance.profileName = profile.name;
+                    instance.baseProfileName =
+                        profile.objectOverride
+                            ? profile.baseProfileName
+                            : profile.name;
+                    instance.settings = profile.settings;
+                    water.shorelineProfileNameBuffer =
+                        instance.baseProfileName;
+                }
+                if (selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        const bool usingObjectCopy =
+            FindWaterShorelineObjectProfileIndex(
+                water,
+                instance.id,
+                instance.baseProfileName)
+                .has_value() &&
+            instance.profileName != instance.baseProfileName;
+        if (usingObjectCopy) {
+            ImGui::TextColored(
+                ImVec4{0.55F, 0.78F, 0.98F, 1.0F},
+                "Object copy of %s",
+                instance.baseProfileName.c_str());
+            if (ImGui::Button("Use Saved Base")) {
+                if (const auto base =
+                        FindWaterShorelineProfileIndex(
+                            water,
+                            instance.baseProfileName);
+                    base.has_value()) {
+                    instance.profileName =
+                        water.shorelineProfiles[base.value()].name;
+                    instance.settings =
+                        water.shorelineProfiles[base.value()].settings;
+                }
+            }
+            DrawWaterSeepageParameterTooltip(
+                "Selects the saved named base without deleting this object's "
+                "copy. The next edit rebuilds and overwrites that same copy "
+                "from the base plus the new change.");
+        }
+
+        bool instanceSettingsChanged = false;
 
         const invisible_places::water::WaterKeyedFeatureId feature{
             .kind = invisible_places::water::WaterKeyedFeatureKind::
@@ -48685,6 +50817,7 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
                 "authored value otherwise.");
             if (result.authoredChanged) {
                 assign(edited);
+                instanceSettingsChanged = true;
             }
         };
         ImGui::TextDisabled("Keyable Visual Response");
@@ -48796,6 +50929,57 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
             instance.settings = invisible_places::renderer::pointcloud::
                 ExtractPointCloudShorelineWaveSettings(
                     editSession.pointStyle);
+            instanceSettingsChanged = true;
+        }
+        if (instanceSettingsChanged) {
+            std::string baseName =
+                NormalizeWaterShorelineProfileName(
+                    instance.baseProfileName);
+            if (!FindWaterShorelineProfileIndex(
+                     water,
+                     baseName)
+                     .has_value()) {
+                const auto base = std::find_if(
+                    water.shorelineProfiles.begin(),
+                    water.shorelineProfiles.end(),
+                    [](const PointCloudShorelineWaveProfile& profile) {
+                        return !profile.objectOverride;
+                    });
+                if (base != water.shorelineProfiles.end()) {
+                    baseName = base->name;
+                }
+            }
+            const std::string objectProfileName =
+                WaterShorelineObjectProfileName(
+                    baseName,
+                    instance.name);
+            if (!objectProfileName.empty()) {
+                PointCloudShorelineWaveProfile objectProfile{
+                    .name = objectProfileName,
+                    .settings = instance.settings,
+                    .objectOverride = true,
+                    .shorelineInstanceId = instance.id,
+                    .baseProfileName = baseName,
+                };
+                if (const auto existing =
+                        FindWaterShorelineObjectProfileIndex(
+                            water,
+                            instance.id,
+                            baseName);
+                    existing.has_value()) {
+                    water.shorelineProfiles[existing.value()] =
+                        objectProfile;
+                } else {
+                    water.shorelineProfiles.push_back(
+                        objectProfile);
+                }
+                instance.profileName = objectProfileName;
+                instance.baseProfileName = baseName;
+                runtimeState->statusMessage =
+                    "Updated Shoreline object profile " +
+                    objectProfileName + ".";
+                runtimeState->errorMessage.clear();
+            }
         }
         ImGui::PopID();
     }
@@ -51033,10 +53217,17 @@ void DrawWaterPanel(
     // Live parameter/style controls operate on already committed display buffers.
     // Only the explicit topology entry points above request canonical analysis.
     const bool analysisReady = true;
+    constexpr ImGuiWindowFlags waterScrollFlags =
+        ImGuiWindowFlags_AlwaysVerticalScrollbar;
     if (!ImGui::BeginTabBar("WaterFeatureTabs")) {
         return;
     }
     if (ImGui::BeginTabItem("Ripples")) {
+        if (ImGui::BeginChild(
+                "WaterRipplesScroll",
+                ImVec2{0.0F, 0.0F},
+                false,
+                waterScrollFlags)) {
         if (!analysisReady) {
             ImGui::BeginDisabled();
         }
@@ -51046,9 +53237,16 @@ void DrawWaterPanel(
         if (!analysisReady) {
             ImGui::EndDisabled();
         }
+        }
+        ImGui::EndChild();
         ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem("Shoreline")) {
+        if (ImGui::BeginChild(
+                "WaterShorelineScroll",
+                ImVec2{0.0F, 0.0F},
+                false,
+                waterScrollFlags)) {
         water.activeRegionFeature = WaterRegionFeature::None;
         // A selected additional instance takes the keying focus (top-bar
         // markers + keyed slider writes); otherwise the global Shoreline.
@@ -51072,9 +53270,16 @@ void DrawWaterPanel(
                         Shoreline};
         }
         DrawWaterShorelineWavesPanel(runtimeState);
+        }
+        ImGui::EndChild();
         ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem("Seepage")) {
+        if (ImGui::BeginChild(
+                "WaterSeepageScroll",
+                ImVec2{0.0F, 0.0F},
+                false,
+                waterScrollFlags)) {
         if (!analysisReady) {
             ImGui::BeginDisabled();
         }
@@ -51096,9 +53301,16 @@ void DrawWaterPanel(
         if (!analysisReady) {
             ImGui::EndDisabled();
         }
+        }
+        ImGui::EndChild();
         ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem("Rain")) {
+        if (ImGui::BeginChild(
+                "WaterRainScroll",
+                ImVec2{0.0F, 0.0F},
+                false,
+                waterScrollFlags)) {
         if (!analysisReady) {
             ImGui::BeginDisabled();
         }
@@ -51109,9 +53321,16 @@ void DrawWaterPanel(
         if (!analysisReady) {
             ImGui::EndDisabled();
         }
+        }
+        ImGui::EndChild();
         ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem("Flow")) {
+    if (ImGui::BeginChild(
+            "WaterFlowScroll",
+            ImVec2{0.0F, 0.0F},
+            false,
+            waterScrollFlags)) {
     if (!analysisReady) {
         ImGui::BeginDisabled();
     }
@@ -51363,9 +53582,111 @@ void DrawWaterPanel(
                     &draft.trailProfileName,
                     &draft.trailProfileLocked);
                 ImGui::TextDisabled("Nodes: %zu", draft.controlPoints.size());
+                draft.controlPointLaneWidths.resize(
+                    draft.controlPoints.size(),
+                    invisible_places::water::
+                        WaterManualFlowPathLaneWidth{});
+                if (water.manualFlowPathEditor.selectedNodeIndex.has_value() &&
+                    water.manualFlowPathEditor.selectedNodeIndex.value() <
+                        draft.controlPointLaneWidths.size()) {
+                    const std::size_t nodeIndex =
+                        water.manualFlowPathEditor.selectedNodeIndex.value();
+                    auto& laneWidth =
+                        draft.controlPointLaneWidths[nodeIndex];
+                    ImGui::SeparatorText(
+                        ("Node " + std::to_string(nodeIndex + 1U) +
+                         " Lane Cover")
+                            .c_str());
+                    const float globalLaneWidth =
+                        ResolveManualFlowPathLaneSettings(water, draft)
+                            .laneSpreadMeters;
+                    const float resolvedLaneWidth = invisible_places::water::
+                        ResolveWaterManualFlowPathLaneWidth(
+                            laneWidth,
+                            globalLaneWidth);
+                    using LaneWidthMode = invisible_places::water::
+                        WaterManualFlowPathLaneWidthMode;
+                    int mode = laneWidth.mode == LaneWidthMode::Relative
+                                   ? 1
+                                   : (laneWidth.mode == LaneWidthMode::Absolute
+                                          ? 2
+                                          : 0);
+                    const char* modes[] = {
+                        "Standard",
+                        "Relative",
+                        "Absolute",
+                    };
+                    if (ImGui::Combo(
+                            "Lane Cover Mode",
+                            &mode,
+                            modes,
+                            IM_ARRAYSIZE(modes))) {
+                        if (mode == 0) {
+                            laneWidth = {};
+                        } else if (mode == 1) {
+                            if (globalLaneWidth > 1.0e-5F) {
+                                laneWidth.mode = LaneWidthMode::Relative;
+                                laneWidth.value = std::clamp(
+                                    resolvedLaneWidth / globalLaneWidth,
+                                    0.0F,
+                                    100.0F);
+                            }
+                        } else {
+                            laneWidth.mode = LaneWidthMode::Absolute;
+                            laneWidth.value = resolvedLaneWidth;
+                        }
+                    }
+                    if (laneWidth.mode ==
+                        invisible_places::water::
+                            WaterManualFlowPathLaneWidthMode::Absolute) {
+                        ImGui::InputFloat(
+                            "Absolute Cover",
+                            &laneWidth.value,
+                            0.01F,
+                            0.10F,
+                            "%.3f m");
+                        laneWidth.value = std::clamp(
+                            std::isfinite(laneWidth.value)
+                                ? laneWidth.value
+                                : 0.0F,
+                            0.0F,
+                            100.0F);
+                    } else if (laneWidth.mode ==
+                               invisible_places::water::
+                                   WaterManualFlowPathLaneWidthMode::Relative) {
+                        ImGui::InputFloat(
+                            "Global Multiplier",
+                            &laneWidth.value,
+                            0.05F,
+                            0.25F,
+                            "%.2f x");
+                        laneWidth.value = std::clamp(
+                            std::isfinite(laneWidth.value)
+                                ? laneWidth.value
+                                : 1.0F,
+                            0.0F,
+                            100.0F);
+                    }
+                    ImGui::TextDisabled(
+                        "Resolved cover: %.3f m (global %.3f m)",
+                        invisible_places::water::
+                            ResolveWaterManualFlowPathLaneWidth(
+                                laneWidth,
+                                globalLaneWidth),
+                        globalLaneWidth);
+                    DrawWaterSeepageParameterTooltip(
+                        "Standard follows Lane Cover Width. Absolute remains "
+                        "fixed when the global value changes. Relative "
+                        "multiplies it, so 0.2 is 20% and 2.3 is 230%. Width "
+                        "blends smoothly between path nodes.");
+                } else {
+                    ImGui::TextDisabled(
+                        "Select a path node to set its local lane cover.");
+                }
                 ImGui::TextWrapped(
-                    "Ctrl+left-click adds surface nodes. Select a node for axis, plane, or camera-plane dragging. "
-                    "Double-click the spline to insert; Delete removes the selected node.");
+                    "Ctrl+left-click adds surface nodes. Drag a coloured cross-bar to make a Relative lane width. "
+                    "Double-click a node to switch Standard → Relative → Absolute; double-click Absolute to return to Relative. "
+                    "Delete first resets a width override to Standard, then deletes the node.");
                 const bool canSave = invisible_places::water::BuildManualFlowPathAnchors(draft).points.size() >= 2U;
                 if (!canSave) {
                     ImGui::BeginDisabled();
@@ -52231,18 +54552,32 @@ void DrawWaterPanel(
     if (!analysisReady) {
         ImGui::EndDisabled();
     }
+    }
+    ImGui::EndChild();
     ImGui::EndTabItem();
     }
 
     if (ImGui::BeginTabItem("Mesh Flow")) {
+        if (ImGui::BeginChild(
+                "WaterMeshFlowScroll",
+                ImVec2{0.0F, 0.0F},
+                false,
+                waterScrollFlags)) {
         water.activeRegionFeature = WaterRegionFeature::None;
         water.activeKeyingFeature = invisible_places::water::WaterKeyedFeatureId{
             .kind = invisible_places::water::WaterKeyedFeatureKind::MeshFlow};
         DrawWaterDynamicMeshFlowPanel(runtimeState, viewport);
+        }
+        ImGui::EndChild();
         ImGui::EndTabItem();
     }
 
     if (ImGui::BeginTabItem("Field")) {
+        if (ImGui::BeginChild(
+                "WaterFieldScroll",
+                ImVec2{0.0F, 0.0F},
+                false,
+                waterScrollFlags)) {
         if (!analysisReady) {
             ImGui::BeginDisabled();
         }
@@ -52252,6 +54587,8 @@ void DrawWaterPanel(
         if (!analysisReady) {
             ImGui::EndDisabled();
         }
+        }
+        ImGui::EndChild();
         ImGui::EndTabItem();
     }
     ImGui::EndTabBar();
@@ -65322,13 +67659,10 @@ void DrawControlsWindow(
         }
         if (beginControlsTabItem("Water", ControlsTab::Water)) {
             runtimeState->activeControlsTab = ControlsTab::Water;
-            if (ImGui::BeginChild("WaterTabScroll", ImVec2{0.0F, 0.0F}, false, tabScrollFlags)) {
-                drawReadOnlyNotice();
-                ImGui::BeginDisabled(renderSetupReadOnly);
-                DrawWaterPanel(runtimeState, viewport);
-                ImGui::EndDisabled();
-            }
-            ImGui::EndChild();
+            drawReadOnlyNotice();
+            ImGui::BeginDisabled(renderSetupReadOnly);
+            DrawWaterPanel(runtimeState, viewport);
+            ImGui::EndDisabled();
             ImGui::EndTabItem();
         }
         if (beginControlsTabItem("Camera", ControlsTab::Camera)) {
@@ -66488,13 +68822,14 @@ bool PreviewLiveVisualEffectsRequireSceneRedraw(
         FastBasicPointRendererActive(runtimeState.projectSettings) &&
         !VisibleGeneratedWaterTrailOverlayPresent(runtimeState);
 
-    // Additional shoreline instances animate continuously whenever visible.
-    // Resolve them exactly as BuildRenderState will (disabled instances and
-    // keyed level 0 drop out) so a silenced list stops latching redraws.
-    const auto resolvedAdditionalShorelines =
-        ResolveAdditionalShorelinesForFrame(
+    // Project-owned Shoreline effects animate continuously whenever visible.
+    // Resolve them exactly as BuildRenderState will so a keyed-zero list does
+    // not latch redraws and legacy point-visual shoreline fields are ignored.
+    const auto resolvedShorelines =
+        ResolveShorelinesForFrame(
             runtimeState.water.shorelineInstances,
-            overlayPtr);
+            overlayPtr,
+            scenario);
 
     for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
         const auto& session = runtimeState.sessions[sessionIndex];
@@ -66502,14 +68837,8 @@ bool PreviewLiveVisualEffectsRequireSceneRedraw(
             continue;
         }
         auto renderStyle = MakeSceneRenderStyle(runtimeState, session, session.pointStyle);
-        // Mirror BuildRenderState's keyed shoreline level: a take that keys
-        // the shoreline to zero silences the waves, so it must not keep
-        // re-rendering an otherwise static scene every frame.
-        ApplyWaterShorelineLevelToStyle(scenario, &renderStyle);
-        if (invisible_places::renderer::pointcloud::PointCloudStyleHasActiveShorelineWaves(renderStyle)) {
-            return true;
-        }
-        if (!resolvedAdditionalShorelines.empty() &&
+        ClearPointCloudStyleShoreline(&renderStyle);
+        if (!resolvedShorelines.empty() &&
             SceneRoleIs(session.sceneRole, "sand")) {
             return true;
         }
@@ -66608,9 +68937,15 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                 WaterFrameExplicitRainLevel(waterFrame));
     renderState.rainVisual = runtimeState.water.rainVisual;
     renderState.rainSpawnCentre = runtimeState.camera.OrbitCenter();
-    renderState.additionalShorelines = ResolveAdditionalShorelinesForFrame(
+    const auto resolvedShorelines = ResolveShorelinesForFrame(
         runtimeState.water.shorelineInstances,
-        &waterFrame.featureOverlay);
+        &waterFrame.featureOverlay,
+        activeWaterScenario);
+    if (resolvedShorelines.size() > 1U) {
+        renderState.additionalShorelines.assign(
+            resolvedShorelines.begin() + 1,
+            resolvedShorelines.end());
+    }
 
     for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
         const auto& session = runtimeState.sessions[sessionIndex];
@@ -66631,7 +68966,14 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                 activeWaterScenario,
                 &renderStyle,
                 &waterFrame.featureOverlay);
-            ApplyWaterShorelineLevelToStyle(activeWaterScenario, &renderStyle);
+            ClearPointCloudStyleShoreline(&renderStyle);
+            if (SceneRoleIs(session.sceneRole, "sand") &&
+                !resolvedShorelines.empty()) {
+                invisible_places::renderer::pointcloud::
+                    ApplyPointCloudShorelineWaveSettings(
+                        &renderStyle,
+                        resolvedShorelines.front());
+            }
             renderState.pointCloudLayers.push_back(
                 {.layerId = sessionIndex,
                  .style = fastBasicRenderer
@@ -77672,6 +80014,76 @@ int Application::Run(ApplicationRunOptions options) const {
             std::cerr << "GUI smoke mode requires a live Vulkan viewport.\n";
             return 2;
         }
+        if (options.guiSmoke->scenario ==
+            "temporal-camera-overlay") {
+            viewport->SetSceneCachingEnabled(false);
+            viewport->SetLiveSceneRenderingEnabled(true);
+            for (std::uint32_t frameIndex = 0U;
+                 frameIndex < 4U;
+                 ++frameIndex) {
+                window.PollEvents();
+                viewport->BeginUiFrame();
+                const std::uint32_t sourceIndex = frameIndex % 2U;
+                const float aspectRatio = CurrentAspectRatio(*viewport);
+                std::array<glm::mat4, 2U> sourceViewProjections{};
+                std::array<
+                    invisible_places::camera::OrbitCamera,
+                    2U>
+                    sourceCameras{};
+                for (std::size_t cameraIndex = 0U;
+                     cameraIndex < sourceCameras.size();
+                     ++cameraIndex) {
+                    invisible_places::camera::CameraState cameraState;
+                    const float cameraOffset =
+                        (cameraIndex == 0U ? -0.20F : 0.20F) +
+                        static_cast<float>(frameIndex) * 0.025F;
+                    cameraState.position = {cameraOffset, 0.0F, 4.0F};
+                    cameraState.target = {cameraOffset, 0.0F, 0.0F};
+                    cameraState.orbitCenter = cameraState.target;
+                    cameraState.hasOrbitCenter = true;
+                    cameraState.focusDistance = 4.0F;
+                    sourceCameras[cameraIndex].ApplyState(cameraState);
+                    sourceViewProjections[cameraIndex] =
+                        sourceCameras[cameraIndex]
+                            .Matrices(aspectRatio)
+                            .viewProjection;
+                }
+                renderer::core::SceneRenderState renderState;
+                renderState.backgroundColor = sourceIndex == 0U
+                                                  ? glm::vec4{
+                                                        0.10F,
+                                                        0.02F,
+                                                        0.02F,
+                                                        1.0F}
+                                                  : glm::vec4{
+                                                        0.02F,
+                                                        0.04F,
+                                                        0.12F,
+                                                        1.0F};
+                const auto renderedMatrices =
+                    sourceCameras[sourceIndex].Matrices(aspectRatio);
+                renderState.view = renderedMatrices.view;
+                renderState.projection = renderedMatrices.projection;
+                renderState.viewProjection =
+                    renderedMatrices.viewProjection;
+                renderState.cameraPosition = renderedMatrices.position;
+                renderState.focusDistance = 4.0F;
+                viewport->SetTemporalCameraOverlay(
+                    true,
+                    sourceIndex,
+                    0.5F,
+                    0.5F,
+                    &sourceViewProjections);
+                viewport->UpdateRenderState(renderState);
+                viewport->DrawFrame();
+            }
+            viewport->SetTemporalCameraOverlay(false);
+            viewport->WaitIdle();
+            std::cout
+                << "Temporal camera overlay smoke passed.\n";
+            StopBackgroundWorkForShutdown(&runtimeState);
+            return 0;
+        }
         if (options.guiSmoke->scenario == "water-region-sample-terrestrial" ||
             options.guiSmoke->scenario == "water-region-test-points" ||
             options.guiSmoke->scenario == "water-ripple-patterns-test-points") {
@@ -77943,6 +80355,13 @@ int Application::Run(ApplicationRunOptions options) const {
                 UpdateAnimationPlayback(&runtimeState);
                 UpdateCameraShotPlayback(&runtimeState);
                 UpdatePerformanceInteractionState(&runtimeState, viewport.value());
+            }
+            if (!pauseLiveViewport) {
+                UpdateLinkedLoopTemporalCameraOverlay(
+                    &runtimeState,
+                    &viewport.value());
+            } else {
+                viewport->SetTemporalCameraOverlay(false);
             }
             const auto waterFrameState = ResolveWaterFrameState(&runtimeState);
             // Playback advances compact water parameters. Upload Seepage after
