@@ -1,4 +1,5 @@
 #include "serialization/ProjectDocument.hpp"
+#include "timing/TimelineView.hpp"
 #include "water/WaterFlow.hpp"
 
 #include <catch2/catch_approx.hpp>
@@ -7,6 +8,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -69,6 +71,53 @@ struct TemporaryTimingFile {
 };
 
 }  // namespace
+
+TEST_CASE(
+    "Timeline view ranges default full and map zoomed feature-run positions",
+    "[water][timing][timeline-view]") {
+    using invisible_places::timing::SanitizeTimelineViewRange;
+    using invisible_places::timing::TimelinePositionIsInView;
+    using invisible_places::timing::TimelinePositionToViewFraction;
+    using invisible_places::timing::TimelineViewFractionToPosition;
+    using invisible_places::timing::TimelineViewRange;
+    using invisible_places::timing::TimelineViewRangeIsFull;
+
+    const TimelineViewRange full;
+    CHECK(TimelineViewRangeIsFull(full));
+    CHECK(TimelinePositionToViewFraction(full, 0.35F) ==
+          Approx(0.35F));
+
+    const auto zoomed = SanitizeTimelineViewRange({0.75F, 0.25F});
+    CHECK(zoomed.start == Approx(0.25F));
+    CHECK(zoomed.end == Approx(0.75F));
+    CHECK_FALSE(TimelineViewRangeIsFull(zoomed));
+    CHECK_FALSE(TimelinePositionIsInView(zoomed, 0.20F));
+    CHECK(TimelinePositionIsInView(zoomed, 0.25F));
+    CHECK(TimelinePositionIsInView(zoomed, 0.50F));
+    CHECK(TimelinePositionIsInView(zoomed, 0.75F));
+    CHECK_FALSE(TimelinePositionIsInView(zoomed, 0.80F));
+    CHECK(TimelinePositionToViewFraction(zoomed, 0.25F) ==
+          Approx(0.0F));
+    CHECK(TimelinePositionToViewFraction(zoomed, 0.50F) ==
+          Approx(0.5F));
+    CHECK(TimelinePositionToViewFraction(zoomed, 0.75F) ==
+          Approx(1.0F));
+    CHECK(TimelineViewFractionToPosition(zoomed, 0.0F) ==
+          Approx(0.25F));
+    CHECK(TimelineViewFractionToPosition(zoomed, 0.5F) ==
+          Approx(0.50F));
+    CHECK(TimelineViewFractionToPosition(zoomed, 1.0F) ==
+          Approx(0.75F));
+
+    const auto collapsed =
+        SanitizeTimelineViewRange({0.90F, 0.90F}, 0.20F);
+    CHECK(collapsed.start == Approx(0.80F));
+    CHECK(collapsed.end == Approx(1.00F));
+    const auto nonFinite = SanitizeTimelineViewRange(
+        {std::numeric_limits<float>::quiet_NaN(),
+         std::numeric_limits<float>::infinity()});
+    CHECK(TimelineViewRangeIsFull(nonFinite));
+}
 
 TEST_CASE("Timing run evaluation holds endpoints and interpolates", "[water][timing]") {
     const auto run = Run(
@@ -1204,4 +1253,227 @@ TEST_CASE("Shoreline instances key level and visual response scalars", "[water][
     const auto parsed = ParseWaterKeyedFeatureKindName("shoreline_instance");
     REQUIRE(parsed.has_value());
     CHECK(parsed.value() == WaterKeyedFeatureKind::ShorelineInstance);
+}
+
+TEST_CASE("Keyed setting Monotone Spline passes keys, stays monotone, and rests at reversals",
+          "[water][timing][keyed][velocity]") {
+    using invisible_places::water::EvaluateWaterKeyedSettingTrack;
+    using invisible_places::water::WaterKeyedSettingTrack;
+
+    WaterKeyedSettingTrack track;
+    track.settingId = "strength";
+    track.keys = {
+        {.position = 0.0F,
+         .value = 0.0F,
+         .interpolation = WaterScenarioInterpolation::SmoothVelocity},
+        {.position = 0.25F,
+         .value = 0.5F,
+         .interpolation = WaterScenarioInterpolation::SmoothVelocity},
+        {.position = 1.0F,
+         .value = 1.0F,
+         .interpolation = WaterScenarioInterpolation::SmoothVelocity},
+    };
+    const auto valueAt = [&](float position) {
+        return EvaluateWaterKeyedSettingTrack(track, position).value();
+    };
+    // Passes exactly through every key.
+    CHECK(valueAt(0.0F) == Approx(0.0F).margin(1.0e-5F));
+    CHECK(valueAt(0.25F) == Approx(0.5F).margin(1.0e-5F));
+    CHECK(valueAt(1.0F) == Approx(1.0F).margin(1.0e-5F));
+    // Between increasing keys the curve is monotone: dense samples never
+    // step backwards and never overshoot the surrounding key values.
+    float previous = valueAt(0.0F);
+    for (int sample = 1; sample <= 400; ++sample) {
+        const float position = static_cast<float>(sample) / 400.0F;
+        const float value = valueAt(position);
+        CHECK(value >= previous - 1.0e-4F);
+        CHECK(value >= -1.0e-4F);
+        CHECK(value <= 1.0F + 1.0e-4F);
+        if (position <= 0.25F) {
+            CHECK(value <= 0.5F + 1.0e-4F);
+        } else {
+            CHECK(value >= 0.5F - 1.0e-4F);
+        }
+        previous = value;
+    }
+    // Velocity carries through the continuing interior key (C1-ish): the
+    // finite-difference slopes on both sides agree and stay near the
+    // incoming speed instead of easing to rest like Smooth would.
+    const float incoming = (valueAt(0.25F) - valueAt(0.249F)) / 0.001F;
+    const float outgoing = (valueAt(0.251F) - valueAt(0.25F)) / 0.001F;
+    CHECK(incoming > 1.0F);
+    CHECK(outgoing > 1.0F);
+    CHECK(incoming == Approx(outgoing).margin(1.0e-2F));
+
+    WaterKeyedSettingTrack reversing;
+    reversing.settingId = "strength";
+    reversing.keys = {
+        {.position = 0.0F,
+         .value = 0.0F,
+         .interpolation = WaterScenarioInterpolation::SmoothVelocity},
+        {.position = 0.5F,
+         .value = 1.0F,
+         .interpolation = WaterScenarioInterpolation::SmoothVelocity},
+        {.position = 1.0F,
+         .value = 0.0F,
+         .interpolation = WaterScenarioInterpolation::SmoothVelocity},
+    };
+    const auto reversingAt = [&](float position) {
+        return EvaluateWaterKeyedSettingTrack(reversing, position).value();
+    };
+    // The direction reversal comes to rest: C0 through the peak key with a
+    // flat top on both sides.
+    const float peak = reversingAt(0.5F);
+    CHECK(peak == Approx(1.0F));
+    CHECK(reversingAt(0.499F) == Approx(peak).margin(1.0e-3F));
+    CHECK(reversingAt(0.501F) == Approx(peak).margin(1.0e-3F));
+    const float approachVelocity = (peak - reversingAt(0.499F)) / 0.001F;
+    const float departureVelocity = (reversingAt(0.501F) - peak) / 0.001F;
+    CHECK(std::abs(approachVelocity) < 0.05F);
+    CHECK(std::abs(departureVelocity) < 0.05F);
+}
+
+TEST_CASE("Keyed setting Centripetal Catmull-Rom stays finite through uneven keys",
+          "[water][timing][keyed][catmull-rom]") {
+    using invisible_places::water::EvaluateWaterKeyedSettingTrack;
+    using invisible_places::water::WaterKeyedSettingTrack;
+
+    WaterKeyedSettingTrack track;
+    track.settingId = "strength";
+    track.keys = {
+        {.position = 0.0F,
+         .value = 0.05F,
+         .interpolation = WaterScenarioInterpolation::CentripetalCatmullRom},
+        {.position = 0.18F,
+         .value = 0.42F,
+         .interpolation = WaterScenarioInterpolation::CentripetalCatmullRom},
+        {.position = 0.55F,
+         .value = 0.64F,
+         .interpolation = WaterScenarioInterpolation::CentripetalCatmullRom},
+        {.position = 1.0F,
+         .value = 0.90F,
+         .interpolation = WaterScenarioInterpolation::CentripetalCatmullRom},
+    };
+    const auto valueAt = [&](float position) {
+        return EvaluateWaterKeyedSettingTrack(track, position).value();
+    };
+    // Passes exactly through the interior keys.
+    CHECK(valueAt(0.18F) == Approx(0.42F).margin(1.0e-5F));
+    CHECK(valueAt(0.55F) == Approx(0.64F).margin(1.0e-5F));
+    // Uneven key spacing still produces finite, continuous values across the
+    // whole timeline.
+    float previous = valueAt(0.0F);
+    for (int sample = 1; sample <= 500; ++sample) {
+        const float position = static_cast<float>(sample) / 500.0F;
+        const float value = valueAt(position);
+        REQUIRE(std::isfinite(value));
+        CHECK(std::abs(value - previous) < 0.02F);
+        previous = value;
+    }
+
+    // A two-key track degrades gracefully through endpoint reflection.
+    WaterKeyedSettingTrack pair;
+    pair.settingId = "strength";
+    pair.keys = {
+        {.position = 0.2F,
+         .value = 0.3F,
+         .interpolation = WaterScenarioInterpolation::CentripetalCatmullRom},
+        {.position = 0.8F,
+         .value = 0.7F,
+         .interpolation = WaterScenarioInterpolation::CentripetalCatmullRom},
+    };
+    const auto pairAt = [&](float position) {
+        return EvaluateWaterKeyedSettingTrack(pair, position).value();
+    };
+    CHECK(pairAt(0.2F) == Approx(0.3F).margin(1.0e-5F));
+    CHECK(pairAt(0.8F) == Approx(0.7F).margin(1.0e-5F));
+    for (int sample = 0; sample <= 100; ++sample) {
+        const float position =
+            0.2F + 0.6F * static_cast<float>(sample) / 100.0F;
+        const float value = pairAt(position);
+        REQUIRE(std::isfinite(value));
+        CHECK(value >= 0.3F - 1.0e-3F);
+        CHECK(value <= 0.7F + 1.0e-3F);
+    }
+}
+
+TEST_CASE("Mixed Hold and Catmull-Rom segments step exactly at the shared key",
+          "[water][timing][keyed][catmull-rom]") {
+    using invisible_places::water::EvaluateWaterKeyedSettingTrack;
+    using invisible_places::water::WaterKeyedSettingTrack;
+
+    WaterKeyedSettingTrack track;
+    track.settingId = "strength";
+    track.keys = {
+        {.position = 0.2F,
+         .value = 0.0F,
+         .interpolation = WaterScenarioInterpolation::Hold},
+        {.position = 0.4F,
+         .value = 1.2F,
+         .interpolation = WaterScenarioInterpolation::CentripetalCatmullRom},
+        {.position = 0.7F,
+         .value = 0.4F,
+         .interpolation = WaterScenarioInterpolation::CentripetalCatmullRom},
+        {.position = 0.9F,
+         .value = 0.8F,
+         .interpolation = WaterScenarioInterpolation::Linear},
+    };
+    const auto valueAt = [&](float position) {
+        return EvaluateWaterKeyedSettingTrack(track, position).value();
+    };
+    // Strictly inside the Hold segment the left value holds...
+    CHECK(valueAt(0.399F) == Approx(0.0F));
+    // ...and sampling exactly AT the key after the Hold reads the spline
+    // segment that key starts, so the step lands on the key.
+    CHECK(valueAt(0.4F) == Approx(1.2F).margin(1.0e-5F));
+    CHECK(valueAt(0.7F) == Approx(0.4F).margin(1.0e-5F));
+    for (int sample = 0; sample <= 100; ++sample) {
+        const float position =
+            0.4F + 0.3F * static_cast<float>(sample) / 100.0F;
+        REQUIRE(std::isfinite(valueAt(position)));
+    }
+}
+
+TEST_CASE("Timing runs evaluate Monotone Spline and Catmull-Rom within clamped levels",
+          "[water][timing][velocity][catmull-rom]") {
+    const auto velocityRun = Run(
+        WaterTimingFeature::Rain,
+        {Key(0.0F, 0.0F, WaterScenarioInterpolation::SmoothVelocity),
+         Key(0.25F, 0.5F, WaterScenarioInterpolation::SmoothVelocity),
+         Key(1.0F, 1.0F, WaterScenarioInterpolation::SmoothVelocity)});
+    CHECK(EvaluateWaterTimingRun(velocityRun, 0.25F, 0.75F) ==
+          Approx(0.5F).margin(1.0e-5F));
+    // Velocity is continuous through the continuing interior key.
+    const float incoming =
+        (EvaluateWaterTimingRun(velocityRun, 0.25F, 0.75F) -
+         EvaluateWaterTimingRun(velocityRun, 0.249F, 0.75F)) /
+        0.001F;
+    const float outgoing =
+        (EvaluateWaterTimingRun(velocityRun, 0.251F, 0.75F) -
+         EvaluateWaterTimingRun(velocityRun, 0.25F, 0.75F)) /
+        0.001F;
+    CHECK(incoming > 1.0F);
+    CHECK(incoming == Approx(outgoing).margin(1.0e-2F));
+
+    const auto catmullRun = Run(
+        WaterTimingFeature::Seepage,
+        {Key(0.0F, 0.0F, WaterScenarioInterpolation::CentripetalCatmullRom),
+         Key(0.3F, 1.0F, WaterScenarioInterpolation::CentripetalCatmullRom),
+         Key(0.6F, 1.0F, WaterScenarioInterpolation::CentripetalCatmullRom),
+         Key(1.0F, 0.2F, WaterScenarioInterpolation::CentripetalCatmullRom)});
+    CHECK(EvaluateWaterTimingRun(catmullRun, 0.3F, 0.5F) ==
+          Approx(1.0F).margin(1.0e-5F));
+    CHECK(EvaluateWaterTimingRun(catmullRun, 0.6F, 0.5F) ==
+          Approx(1.0F).margin(1.0e-5F));
+    // Run output stays clamped 0..1 for both modes even where the raw
+    // spline would overshoot the keyed levels.
+    for (int sample = 0; sample <= 200; ++sample) {
+        const float position = static_cast<float>(sample) / 200.0F;
+        for (const auto* run : {&velocityRun, &catmullRun}) {
+            const float value = EvaluateWaterTimingRun(*run, position, 0.5F);
+            REQUIRE(std::isfinite(value));
+            CHECK(value >= 0.0F);
+            CHECK(value <= 1.0F);
+        }
+    }
 }

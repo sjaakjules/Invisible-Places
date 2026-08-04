@@ -124,6 +124,11 @@ struct AnimationPathMotionStats {
     float currentTargetSpeed = 0.0F;
 };
 
+struct AnimationPerceivedFlowSample {
+    float normalizedPosition = 0.0F;
+    float screenSpeed = 0.0F;
+};
+
 AnimationPath BuildAnimationPathFromCameraShots(
     const std::string& name,
     const std::vector<CameraShot>& orderedShots,
@@ -149,6 +154,26 @@ AnimationPath BuildAnimationPathFromCameraShots(
     AnimationPathMotionTarget target,
     float worldUnitsPerSecond,
     std::uint32_t sampleCount = 240U);
+
+// Perceived-motion probing. MeasurePreparedAnimationPathPerceivedFlow samples
+// an optical-flow proxy across normalized time 0..1: angular view speed plus
+// the view-perpendicular camera speed divided by the focus distance, all
+// normalized by the vertical field of view so screenSpeed reads in screen
+// heights per second. Degenerate paths (invalid context, a single key, or a
+// zero duration) still return the requested sample count with screenSpeed 0.
+// ComputeConstantPerceivedSpeedSegmentFrames redistributes the path's total
+// frames (max(path.durationFrames, keys - 1), preserved exactly via
+// largest-remainder rounding) so each segment's share is proportional to its
+// midpoint-rule integrated perceived flow, holding perceived speed roughly
+// constant. Every segment keeps at least one frame; ~zero integrated flow
+// falls back to an even split; fewer than two keys or zero
+// path.durationFrames returns an empty vector.
+[[nodiscard]] std::vector<AnimationPerceivedFlowSample> MeasurePreparedAnimationPathPerceivedFlow(
+    const PreparedAnimationPathEvaluationContext& context,
+    std::uint32_t sampleCount = 160U);
+[[nodiscard]] std::vector<std::uint32_t> ComputeConstantPerceivedSpeedSegmentFrames(
+    const AnimationPath& path,
+    std::uint32_t samplesPerSegment = 24U);
 
 AnimationPathEvaluation EvaluateAnimationPath(
     const AnimationPath& path,

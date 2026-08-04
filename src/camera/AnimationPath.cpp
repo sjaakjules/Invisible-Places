@@ -11,6 +11,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <glm/mat3x3.hpp>
+#include <glm/trigonometric.hpp>
 #include <glm/vec3.hpp>
 #include <glm/vec4.hpp>
 
@@ -370,6 +371,52 @@ glm::quat EvaluatePreparedOrientation(
     return glm::normalize(glm::slerp(left, right, std::clamp(amount, 0.0F, 1.0F)));
 }
 
+glm::vec3 ViewDirectionFromEvaluation(
+    const PreparedAnimationPathEvaluationContext& context,
+    const AnimationPathEvaluation& evaluation) {
+    if (!context.hasOrientation) {
+        const glm::vec3 toFocus =
+            ToGlm(evaluation.focusPoint) - ToGlm(evaluation.camera.position);
+        if (glm::dot(toFocus, toFocus) > 1.0e-10F) {
+            return glm::normalize(toFocus);
+        }
+    }
+    return QuaternionFromCameraState(evaluation.camera) * glm::vec3{0.0F, 0.0F, -1.0F};
+}
+
+float PerceivedFlowScreenHeightsPerSecond(
+    const PreparedAnimationPathEvaluationContext& context,
+    float timeSeconds,
+    float deltaSeconds) {
+    const float leftTime = std::max(0.0F, timeSeconds - deltaSeconds);
+    const float rightTime = std::min(context.durationSeconds, timeSeconds + deltaSeconds);
+    const float spanSeconds = rightTime - leftTime;
+    if (spanSeconds <= 1.0e-6F) {
+        return 0.0F;
+    }
+
+    const auto left = EvaluatePreparedAnimationPath(context, leftTime);
+    const auto right = EvaluatePreparedAnimationPath(context, rightTime);
+    const auto current = EvaluatePreparedAnimationPath(context, timeSeconds);
+
+    const glm::vec3 cameraVelocity =
+        (ToGlm(right.camera.position) - ToGlm(left.camera.position)) / spanSeconds;
+    const glm::vec3 leftView = ViewDirectionFromEvaluation(context, left);
+    const glm::vec3 rightView = ViewDirectionFromEvaluation(context, right);
+    const glm::vec3 currentView = ViewDirectionFromEvaluation(context, current);
+    const float viewAlignment = std::clamp(glm::dot(leftView, rightView), -1.0F, 1.0F);
+    const float angularSpeed = std::acos(viewAlignment) / spanSeconds;
+
+    const float subjectDistance = std::max(current.focusDistance, 0.05F);
+    const glm::vec3 perpendicularVelocity =
+        cameraVelocity - (currentView * glm::dot(cameraVelocity, currentView));
+    const float flowRadiansPerSecond =
+        angularSpeed + (glm::length(perpendicularVelocity) / subjectDistance);
+    const float verticalFovRadians = std::max(glm::radians(current.camera.fovDegrees), 0.01F);
+    const float screenSpeed = flowRadiansPerSecond / verticalFovRadians;
+    return std::isfinite(screenSpeed) ? std::max(screenSpeed, 0.0F) : 0.0F;
+}
+
 }  // namespace
 
 AnimationPath BuildAnimationPathFromCameraShots(
@@ -621,6 +668,116 @@ std::uint32_t AnimationDurationFramesForAverageSpeed(
         return std::numeric_limits<std::uint32_t>::max();
     }
     return std::max<std::uint32_t>(minimumFrames, static_cast<std::uint32_t>(requestedFrames));
+}
+
+std::vector<AnimationPerceivedFlowSample> MeasurePreparedAnimationPathPerceivedFlow(
+    const PreparedAnimationPathEvaluationContext& context,
+    std::uint32_t sampleCount) {
+    const std::uint32_t samples = std::clamp<std::uint32_t>(sampleCount, 2U, 4096U);
+    std::vector<AnimationPerceivedFlowSample> flow(samples);
+    for (std::uint32_t sampleIndex = 0U; sampleIndex < samples; ++sampleIndex) {
+        flow[sampleIndex].normalizedPosition =
+            static_cast<float>(sampleIndex) / static_cast<float>(samples - 1U);
+    }
+    if (!context.valid || context.singleKey || context.durationSeconds <= 1.0e-6F) {
+        return flow;
+    }
+
+    const float deltaSeconds = std::min(
+        std::max(
+            context.durationSeconds / static_cast<float>(std::max<std::uint32_t>(samples, 30U)),
+            1.0F / 240.0F),
+        context.durationSeconds);
+    for (auto& sample : flow) {
+        sample.screenSpeed = PerceivedFlowScreenHeightsPerSecond(
+            context,
+            context.durationSeconds * sample.normalizedPosition,
+            deltaSeconds);
+    }
+    return flow;
+}
+
+std::vector<std::uint32_t> ComputeConstantPerceivedSpeedSegmentFrames(
+    const AnimationPath& path,
+    std::uint32_t samplesPerSegment) {
+    if (path.keys.size() < 2U || path.durationFrames < 1U) {
+        return {};
+    }
+
+    const auto segmentCount = path.keys.size() - 1U;
+    const auto targetTotalFrames = std::max<std::uint32_t>(
+        path.durationFrames,
+        static_cast<std::uint32_t>(segmentCount));
+
+    // Midpoint-rule integral of perceived flow per segment; each segment's
+    // share of the total frames then follows its share of the total flow.
+    std::vector<float> integratedFlow(segmentCount, 0.0F);
+    const auto context = PrepareAnimationPathEvaluation(path);
+    if (context.valid && !context.singleKey &&
+        context.knots.size() == path.keys.size() &&
+        context.durationSeconds > 1.0e-6F) {
+        const std::uint32_t interiorSamples =
+            std::clamp<std::uint32_t>(samplesPerSegment, 4U, 256U);
+        const auto totalSamples = interiorSamples * static_cast<std::uint32_t>(segmentCount);
+        const float deltaSeconds = std::min(
+            std::max(
+                context.durationSeconds /
+                    static_cast<float>(std::max<std::uint32_t>(totalSamples, 30U)),
+                1.0F / 240.0F),
+            context.durationSeconds);
+        for (std::size_t segmentIndex = 0; segmentIndex < segmentCount; ++segmentIndex) {
+            const float stepSeconds =
+                (context.knots[segmentIndex + 1U] - context.knots[segmentIndex]) /
+                static_cast<float>(interiorSamples);
+            if (stepSeconds <= 0.0F) {
+                continue;
+            }
+            float segmentFlow = 0.0F;
+            for (std::uint32_t step = 0U; step < interiorSamples; ++step) {
+                const float timeSeconds =
+                    context.knots[segmentIndex] +
+                    ((static_cast<float>(step) + 0.5F) * stepSeconds);
+                segmentFlow +=
+                    PerceivedFlowScreenHeightsPerSecond(context, timeSeconds, deltaSeconds);
+            }
+            integratedFlow[segmentIndex] = segmentFlow * stepSeconds;
+        }
+    }
+
+    std::vector<std::uint32_t> frames(segmentCount, 1U);
+    const float totalFlow =
+        std::accumulate(integratedFlow.begin(), integratedFlow.end(), 0.0F);
+    if (!std::isfinite(totalFlow) || totalFlow <= 1.0e-6F) {
+        // Static camera (or unusable evaluation): fall back to an even split.
+        const auto baseFrames = targetTotalFrames / static_cast<std::uint32_t>(segmentCount);
+        const auto leftoverFrames = targetTotalFrames % static_cast<std::uint32_t>(segmentCount);
+        for (std::size_t segmentIndex = 0; segmentIndex < segmentCount; ++segmentIndex) {
+            frames[segmentIndex] = baseFrames + (segmentIndex < leftoverFrames ? 1U : 0U);
+        }
+        return frames;
+    }
+
+    std::vector<float> remainders(segmentCount, 0.0F);
+    std::uint32_t assignedFrames = static_cast<std::uint32_t>(segmentCount);
+    const std::uint32_t extraFrames = targetTotalFrames - assignedFrames;
+    for (std::size_t segmentIndex = 0; segmentIndex < segmentCount; ++segmentIndex) {
+        const float idealExtraFrames =
+            static_cast<float>(extraFrames) * (integratedFlow[segmentIndex] / totalFlow);
+        const auto wholeFrames = static_cast<std::uint32_t>(std::floor(idealExtraFrames));
+        frames[segmentIndex] += wholeFrames;
+        assignedFrames += wholeFrames;
+        remainders[segmentIndex] = idealExtraFrames - static_cast<float>(wholeFrames);
+    }
+    while (assignedFrames < targetTotalFrames) {
+        const auto nextIt = std::max_element(remainders.begin(), remainders.end());
+        if (nextIt == remainders.end()) {
+            break;
+        }
+        ++frames[static_cast<std::size_t>(nextIt - remainders.begin())];
+        *nextIt = -1.0F;
+        ++assignedFrames;
+    }
+    return frames;
 }
 
 AnimationPathEvaluation EvaluateAnimationPath(

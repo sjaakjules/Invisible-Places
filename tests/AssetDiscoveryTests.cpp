@@ -11647,6 +11647,108 @@ TEST_CASE("Animation path reports world-space speeds and retimes from average sp
     CHECK(retimed.averageCameraSpeed == Catch::Approx(2.5F));
 }
 
+TEST_CASE("Animation path perceived flow favours the close sweep when retiming segments", "[camera][animation]") {
+    invisible_places::camera::AnimationPath path;
+    path.durationFrames = 120;
+    path.keys = {
+        {.cameraPosition = {0.0F, 0.0F, 0.0F}, .focusPoint = {0.0F, 1.0F, 0.0F}, .durationFrames = 60},
+        {.cameraPosition = {4.0F, 0.0F, 0.0F}, .focusPoint = {4.0F, 1.0F, 0.0F}, .durationFrames = 60},
+        {.cameraPosition = {4.05F, 0.0F, 0.0F}, .focusPoint = {4.05F, 1.0F, 0.0F}, .durationFrames = 60},
+    };
+
+    const auto preparedPath = invisible_places::camera::PrepareAnimationPathEvaluation(path);
+    REQUIRE(preparedPath.valid);
+    const auto flowSamples =
+        invisible_places::camera::MeasurePreparedAnimationPathPerceivedFlow(preparedPath, 160U);
+    REQUIRE(flowSamples.size() == 160U);
+    CHECK(flowSamples.front().normalizedPosition == Catch::Approx(0.0F));
+    CHECK(flowSamples.back().normalizedPosition == Catch::Approx(1.0F));
+
+    float sweepFlow = 0.0F;
+    float dwellFlow = 0.0F;
+    std::size_t sweepCount = 0U;
+    std::size_t dwellCount = 0U;
+    for (const auto& sample : flowSamples) {
+        CHECK(std::isfinite(sample.screenSpeed));
+        CHECK(sample.screenSpeed >= 0.0F);
+        if (sample.normalizedPosition < 0.5F) {
+            sweepFlow += sample.screenSpeed;
+            ++sweepCount;
+        } else {
+            dwellFlow += sample.screenSpeed;
+            ++dwellCount;
+        }
+    }
+    REQUIRE(sweepCount > 0U);
+    REQUIRE(dwellCount > 0U);
+    CHECK(sweepFlow / static_cast<float>(sweepCount) >
+          dwellFlow / static_cast<float>(dwellCount));
+
+    const auto segmentFrames =
+        invisible_places::camera::ComputeConstantPerceivedSpeedSegmentFrames(path);
+    REQUIRE(segmentFrames.size() == 2U);
+    CHECK(segmentFrames[0] + segmentFrames[1] == 120U);
+    CHECK(segmentFrames[0] > segmentFrames[1]);
+    CHECK(segmentFrames[0] >= 1U);
+    CHECK(segmentFrames[1] >= 1U);
+}
+
+TEST_CASE("Animation path perceived flow rises when the subject is close", "[camera][animation]") {
+    const auto buildPath = [](float focusY) {
+        invisible_places::camera::AnimationPath path;
+        path.durationFrames = 60;
+        path.keys = {
+            {.cameraPosition = {0.0F, 0.0F, 0.0F}, .focusPoint = {1.0F, focusY, 0.0F}, .durationFrames = 30},
+            {.cameraPosition = {2.0F, 0.0F, 0.0F}, .focusPoint = {1.0F, focusY, 0.0F}, .durationFrames = 30},
+        };
+        return path;
+    };
+
+    const auto meanFlow = [](const invisible_places::camera::AnimationPath& path) {
+        const auto preparedPath = invisible_places::camera::PrepareAnimationPathEvaluation(path);
+        REQUIRE(preparedPath.valid);
+        const auto flowSamples =
+            invisible_places::camera::MeasurePreparedAnimationPathPerceivedFlow(preparedPath, 96U);
+        REQUIRE_FALSE(flowSamples.empty());
+        float totalFlow = 0.0F;
+        for (const auto& sample : flowSamples) {
+            CHECK(std::isfinite(sample.screenSpeed));
+            CHECK(sample.screenSpeed >= 0.0F);
+            totalFlow += sample.screenSpeed;
+        }
+        return totalFlow / static_cast<float>(flowSamples.size());
+    };
+
+    const float closeMeanFlow = meanFlow(buildPath(1.0F));
+    const float farMeanFlow = meanFlow(buildPath(50.0F));
+    CHECK(closeMeanFlow > farMeanFlow);
+}
+
+TEST_CASE("Animation path perceived flow is zero for static paths and retimes evenly", "[camera][animation]") {
+    invisible_places::camera::AnimationPath path;
+    path.durationFrames = 90;
+    path.keys = {
+        {.cameraPosition = {1.0F, 2.0F, 0.5F}, .focusPoint = {1.0F, 3.0F, 0.5F}, .durationFrames = 45},
+        {.cameraPosition = {1.0F, 2.0F, 0.5F}, .focusPoint = {1.0F, 3.0F, 0.5F}, .durationFrames = 45},
+        {.cameraPosition = {1.0F, 2.0F, 0.5F}, .focusPoint = {1.0F, 3.0F, 0.5F}, .durationFrames = 45},
+    };
+
+    const auto preparedPath = invisible_places::camera::PrepareAnimationPathEvaluation(path);
+    REQUIRE(preparedPath.valid);
+    const auto flowSamples =
+        invisible_places::camera::MeasurePreparedAnimationPathPerceivedFlow(preparedPath);
+    REQUIRE_FALSE(flowSamples.empty());
+    for (const auto& sample : flowSamples) {
+        CHECK(sample.screenSpeed == Catch::Approx(0.0F).margin(1.0e-3F));
+    }
+
+    const auto segmentFrames =
+        invisible_places::camera::ComputeConstantPerceivedSpeedSegmentFrames(path);
+    REQUIRE(segmentFrames.size() == 2U);
+    CHECK(segmentFrames[0] == 45U);
+    CHECK(segmentFrames[1] == 45U);
+}
+
 TEST_CASE("Animation path keeps camera and focus derivatives smooth through middle keys", "[camera][animation]") {
     invisible_places::camera::AnimationPath path;
     path.name = "Smooth";

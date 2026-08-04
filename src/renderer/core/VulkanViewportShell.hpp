@@ -1464,6 +1464,10 @@ class VulkanViewportShell {
     bool diagnosticsTimingInitialized_ = false;
     double diagnosticsFpsWindowMs_ = 0.0;
     std::uint32_t diagnosticsFpsWindowFrames_ = 0;
+    // Always-on frame cadence (wall time between DrawFrame calls) backing
+    // the persistent FPS readout, independent of diagnostics collection.
+    bool frameCadenceInitialized_ = false;
+    std::chrono::steady_clock::time_point lastFrameCadenceTimestamp_{};
     float pointSizeRangeMin_ = 1.0F;
     float pointSizeRangeMax_ = 64.0F;
 };

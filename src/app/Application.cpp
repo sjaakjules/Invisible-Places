@@ -32,6 +32,7 @@
 #include "serialization/ProjectDocument.hpp"
 #include "serialization/RenderSetupDocument.hpp"
 #include "style/RenderParameterBinding.hpp"
+#include "timing/TimelineView.hpp"
 #include "timing/TimingColourise.hpp"
 #include "timing/TimingColouriseHistogram.hpp"
 #include "timing/TimingColourisePresets.hpp"
@@ -304,6 +305,7 @@ struct PreservedAnimationRuntimeState {
     std::string filePath;
     std::optional<std::size_t> selectedFileIndex;
     float scrubAmount = 0.0F;
+    invisible_places::timing::TimelineViewRange timelineViewRange{};
     bool dirty = false;
 };
 
@@ -499,6 +501,15 @@ struct AnimationPreparedPathCacheState {
     invisible_places::camera::PreparedAnimationPathEvaluationContext context{};
 };
 
+// The perceived-speed curve depends only on the path's motion fingerprint —
+// never on the scrub position — so scrubbing must not re-integrate it.
+struct AnimationPerceivedFlowCacheState {
+    bool valid = false;
+    std::uint64_t pathFingerprint = 0;
+    std::vector<invisible_places::camera::AnimationPerceivedFlowSample>
+        samples;
+};
+
 struct WaterKeyPositionEditState {
     std::uint32_t runId = 0U;
     invisible_places::water::WaterKeyedFeatureId feature{};
@@ -601,6 +612,19 @@ struct WaterRunKeyEditState {
     std::string errorMessage;
 };
 
+enum class AnimationTimelineViewDragPart : std::uint8_t {
+    Start = 0,
+    Body,
+    End,
+};
+
+struct AnimationTimelineViewDragState {
+    AnimationTimelineViewDragPart part =
+        AnimationTimelineViewDragPart::Body;
+    float mouseStartX = 0.0F;
+    invisible_places::timing::TimelineViewRange originalRange{};
+};
+
 struct AnimationPanelState {
     std::optional<AnimationPath> currentPath;
     std::string currentFilePath;
@@ -638,6 +662,11 @@ struct AnimationPanelState {
     std::string exportPresetNameBuffer = "MP4";
     std::optional<ExportPreset> editedExportPreset;
     float scrubAmount = 0.0F;
+    // Session-only editing lens shared by every Feature Run graph. Authored
+    // animation/key positions and export sampling always remain normalized
+    // over the complete 0..1 animation.
+    invisible_places::timing::TimelineViewRange timelineViewRange{};
+    std::optional<AnimationTimelineViewDragState> timelineViewDrag;
     bool liveApply = true;
     bool previewDepthOfField = false;
     bool dirty = false;
@@ -655,6 +684,7 @@ struct AnimationPanelState {
     bool showHoudiniCameraExportNotice = false;
     AnimationPreparedPathCacheState preparedPathCache{};
     AnimationMotionStatsCacheState motionStatsCache{};
+    AnimationPerceivedFlowCacheState perceivedFlowCache{};
     AnimationViewportDragState drag{};
     AnimationFramePreviewState framePreview{};
 };
@@ -4233,6 +4263,35 @@ invisible_places::camera::AnimationPathMotionStats CachedAnimationPathMotionStat
     return stats;
 }
 
+const std::vector<invisible_places::camera::AnimationPerceivedFlowSample>&
+CachedAnimationPathPerceivedFlow(
+    AnimationPanelState* panel,
+    const AnimationPath& path) {
+    const auto fingerprint = AnimationPathMotionFingerprint(path);
+    if (panel != nullptr &&
+        panel->perceivedFlowCache.valid &&
+        panel->perceivedFlowCache.pathFingerprint == fingerprint) {
+        return panel->perceivedFlowCache.samples;
+    }
+    const auto& preparedPath = CachedPreparedAnimationPath(panel, path);
+    auto samples =
+        invisible_places::camera::MeasurePreparedAnimationPathPerceivedFlow(
+            preparedPath);
+    if (panel != nullptr) {
+        panel->perceivedFlowCache = {
+            .valid = true,
+            .pathFingerprint = fingerprint,
+            .samples = std::move(samples),
+        };
+        return panel->perceivedFlowCache.samples;
+    }
+    thread_local std::vector<
+        invisible_places::camera::AnimationPerceivedFlowSample>
+        fallbackSamples;
+    fallbackSamples = std::move(samples);
+    return fallbackSamples;
+}
+
 void HashBinding(std::uint64_t* seed, const RenderParameterBinding& binding) {
     HashBool(seed, binding.active);
     HashCombine(seed, static_cast<std::uint64_t>(binding.mode));
@@ -4533,6 +4592,78 @@ void HashRainRuntime(
     }
 }
 
+void HashShorelineFoamFrontsBank(
+    std::uint64_t* seed,
+    const invisible_places::renderer::pointcloud::
+        PointCloudFoamFrontsShorelineSettings& bank) {
+    HashFloat(seed, bank.boundaryZ);
+    HashFloat(seed, bank.heightReachMeters);
+    HashFloat(seed, bank.edgeFadeMeters);
+    HashFloat(seed, bank.directionX);
+    HashFloat(seed, bank.directionY);
+    HashFloat(seed, bank.patternScale);
+    HashFloat(seed, bank.wavelengthMeters);
+    HashFloat(seed, bank.speed);
+    HashFloat(seed, bank.warp);
+    HashFloat(seed, bank.turbulence);
+    HashFloat(seed, bank.density);
+    HashFloat(seed, bank.phase);
+    HashFloat(seed, bank.intensity);
+    HashFloat(seed, bank.emissionAdd);
+    HashFloat(seed, bank.opacityAdd);
+    HashFloat(seed, bank.opacityMultiply);
+    HashFloat(seed, bank.pointSizeAdd);
+    HashFloat(seed, bank.pointSizeMultiply);
+    HashFloat(seed, bank.colourMix);
+    HashFloat(seed, bank.colour[0]);
+    HashFloat(seed, bank.colour[1]);
+    HashFloat(seed, bank.colour[2]);
+    HashCombine(seed, static_cast<std::uint64_t>(bank.seed));
+}
+
+void HashShorelineHeightFoamBank(
+    std::uint64_t* seed,
+    const invisible_places::renderer::pointcloud::
+        PointCloudHeightFoamShorelineSettings& bank) {
+    HashFloat(seed, bank.runupZ);
+    HashFloat(seed, bank.breakZ);
+    HashFloat(seed, bank.offshoreReachMeters);
+    HashFloat(seed, bank.edgeFadeMeters);
+    HashFloat(seed, bank.directionX);
+    HashFloat(seed, bank.directionY);
+    HashFloat(seed, bank.patternScale);
+    HashFloat(seed, bank.wavelengthMeters);
+    HashFloat(seed, bank.speed);
+    HashFloat(seed, bank.warp);
+    HashFloat(seed, bank.turbulence);
+    HashFloat(seed, bank.density);
+    HashFloat(seed, bank.phase);
+    HashFloat(seed, bank.intensity);
+    HashFloat(seed, bank.offshoreFoamStrength);
+    HashFloat(seed, bank.incomingStrength);
+    HashFloat(seed, bank.returnStrength);
+    HashFloat(seed, bank.emissionAdd);
+    HashFloat(seed, bank.opacityAdd);
+    HashFloat(seed, bank.opacityMultiply);
+    HashFloat(seed, bank.pointSizeAdd);
+    HashFloat(seed, bank.pointSizeMultiply);
+    HashFloat(seed, bank.colourMix);
+    HashFloat(seed, bank.colour[0]);
+    HashFloat(seed, bank.colour[1]);
+    HashFloat(seed, bank.colour[2]);
+    HashCombine(seed, static_cast<std::uint64_t>(bank.seed));
+}
+
+void HashShorelineWaveSettings(
+    std::uint64_t* seed,
+    const invisible_places::renderer::pointcloud::
+        PointCloudShorelineWaveSettings& settings) {
+    HashBool(seed, settings.enabled);
+    HashCombine(seed, static_cast<std::uint64_t>(settings.algorithm));
+    HashShorelineFoamFrontsBank(seed, settings.foamFronts);
+    HashShorelineHeightFoamBank(seed, settings.heightFoam);
+}
+
 std::uint64_t RenderStateSignature(
     const invisible_places::renderer::core::SceneRenderState& renderState) {
     std::uint64_t seed = 1469598103934665603ULL;
@@ -4556,6 +4687,13 @@ std::uint64_t RenderStateSignature(
     HashFloat(&seed, renderState.flowTimeSeconds);
     HashRainRuntime(&seed, renderState.rainSettings, renderState.rainVisual);
     HashVec3(&seed, renderState.rainSpawnCentre);
+    // Resolved shoreline instances must invalidate the cached scene image:
+    // without this, removing or silencing the last instance would leave its
+    // final frame frozen on screen once the redraw latch releases.
+    HashCombine(&seed, renderState.additionalShorelines.size());
+    for (const auto& shoreline : renderState.additionalShorelines) {
+        HashShorelineWaveSettings(&seed, shoreline);
+    }
     HashCombine(&seed, static_cast<std::uint64_t>(renderState.pointCloudRendererMode));
     HashCombine(&seed, renderState.pointCloudLayers.size());
     for (const auto& layer : renderState.pointCloudLayers) {
@@ -11978,6 +12116,8 @@ void UnloadCurrentAnimationForWaterEditing(PreviewRuntimeState* runtimeState) {
     runtimeState->animationPanel.draftAnimationName.clear();
     runtimeState->animationPanel.selectedKeyIndex.reset();
     runtimeState->animationPanel.scrubAmount = 0.0F;
+    runtimeState->animationPanel.timelineViewRange = {};
+    runtimeState->animationPanel.timelineViewDrag.reset();
     runtimeState->animationPanel.dirty = false;
     SyncWaterAnimationTrailProfileFromCurrentAnimation(runtimeState);
     runtimeState->water.pathAnchors = {};
@@ -19514,6 +19654,19 @@ bool EnsureWaterDynamicMeshFlowGpuUpToDate(
     }
     auto& water = runtimeState->water;
     auto& liveSettings = water.dynamicMeshFlowSettings;
+    // Disabled is the common idle state: skip the ground-view and active-
+    // scene lookups (they normalize scene/session paths every frame) and
+    // only keep the overlay session hidden.
+    if (updateOptions == nullptr && !liveSettings.enabled) {
+        if (water.dynamicMeshFlowGpuSessionIndex.has_value() &&
+            water.dynamicMeshFlowGpuSessionIndex.value() <
+                runtimeState->sessions.size()) {
+            runtimeState
+                ->sessions[water.dynamicMeshFlowGpuSessionIndex.value()]
+                .visible = false;
+        }
+        return false;
+    }
     auto settings = invisible_places::water::SanitizeWaterDynamicMeshFlowSettings(
         updateOptions != nullptr && updateOptions->settings != nullptr
             ? *updateOptions->settings
@@ -19630,6 +19783,21 @@ bool EnsureWaterDynamicMeshFlowGpuUpToDate(
                 sessionIndex.value() < runtimeState->sessions.size()) {
                 runtimeState->sessions[sessionIndex.value()].visible =
                     settings.showTrails;
+            }
+            return true;
+        }
+        if (!settings.showTrails) {
+            // Hidden trails draw nothing, yet the dispatch path
+            // unconditionally bumps the viewport's scene revision and
+            // re-renders every point layer each frame. Freeze the
+            // simulation while it is invisible; advancing the update clock
+            // (exactly like the quiescence skip above) lets it resume
+            // without a spurious time-discontinuity reset, and a pending
+            // reset request stays latched for the next visible dispatch.
+            water.dynamicMeshFlowLastUpdateSeconds = timeSeconds;
+            if (sessionIndex.has_value() &&
+                sessionIndex.value() < runtimeState->sessions.size()) {
+                runtimeState->sessions[sessionIndex.value()].visible = false;
             }
             return true;
         }
@@ -22602,6 +22770,8 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->animationPanel.selectedFileIndex.reset();
     runtimeState->animationPanel.selectedKeyIndex.reset();
     runtimeState->animationPanel.scrubAmount = 0.0F;
+    runtimeState->animationPanel.timelineViewRange = {};
+    runtimeState->animationPanel.timelineViewDrag.reset();
     runtimeState->animationPanel.dirty = false;
 
     CancelWaterFlowTrailBuildJob(&runtimeState->water);
@@ -23305,6 +23475,9 @@ PreservedAnimationRuntimeState CaptureAnimationRuntimeState(
             runtimeState.animationPanel.scrubAmount,
             0.0F,
             1.0F),
+        .timelineViewRange =
+            invisible_places::timing::SanitizeTimelineViewRange(
+                runtimeState.animationPanel.timelineViewRange),
         .dirty = runtimeState.animationPanel.dirty,
     };
 }
@@ -23323,9 +23496,14 @@ void RestoreAnimationRuntimeState(
     panel.selectedWaterKeyIndex.reset();
     panel.selectedSeepageNodeKeyIndex.reset();
     panel.scrubAmount = std::clamp(state.scrubAmount, 0.0F, 1.0F);
+    panel.timelineViewRange =
+        invisible_places::timing::SanitizeTimelineViewRange(
+            state.timelineViewRange);
+    panel.timelineViewDrag.reset();
     panel.dirty = state.dirty;
     panel.preparedPathCache = {};
     panel.motionStatsCache = {};
+    panel.perceivedFlowCache = {};
     runtimeState->animationPlayback.active = false;
     if (panel.currentPath.has_value()) {
         ApplyAnimationScrub(runtimeState);
@@ -24921,6 +25099,8 @@ bool LoadAnimationPathFromFile(PreviewRuntimeState* runtimeState, const std::fil
     runtimeState->animationPanel.selectedKeyIndex =
         runtimeState->animationPanel.currentPath->keys.empty() ? std::nullopt : std::optional<std::size_t>{0};
     runtimeState->animationPanel.scrubAmount = 0.0F;
+    runtimeState->animationPanel.timelineViewRange = {};
+    runtimeState->animationPanel.timelineViewDrag.reset();
     runtimeState->animationPanel.previewDepthOfField = false;
     runtimeState->timingsPanel = TimingsPanelState{};
     runtimeState->animationPanel.dirty =
@@ -25713,7 +25893,7 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
                  return WaterSurfaceRole::None;
              }(),
              .shorelineInstancesEligible =
-                 NormalizeSceneRoleName(session.sceneRole) == "sand"});
+                 SceneRoleIs(session.sceneRole, "sand")});
     }
     return layers;
 }
@@ -26227,7 +26407,7 @@ BuildAnimationExportPointCloudLayerSnapshot(
              .timingColouriseEligible =
                  IsAuthoredTimingColouriseLayer(session),
              .shorelineInstancesEligible =
-                 NormalizeSceneRoleName(session.sceneRole) == "sand",
+                 SceneRoleIs(session.sceneRole, "sand"),
              .drawPointCount = static_cast<std::uint32_t>(std::min<std::uint64_t>(
                  drawPointCount,
                  std::numeric_limits<std::uint32_t>::max())),
@@ -34312,7 +34492,10 @@ void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
     RefreshAnimationExportWriterProgress(&job);
     const auto& io = ImGui::GetIO();
     constexpr float kExportProgressWindowWidth = 560.0F;
-    constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse;
+    // NoFocusOnAppearing: this card pops from background job state — taking
+    // ImGui focus would cancel whatever drag the user is holding.
+    constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse |
+                                       ImGuiWindowFlags_NoFocusOnAppearing;
     ImGui::SetNextWindowPos(
         ImVec2{std::max(20.0F, io.DisplaySize.x - kExportProgressWindowWidth - 24.0F), 24.0F},
         ImGuiCond_FirstUseEver);
@@ -38618,7 +38801,8 @@ void DrawLoadingOverlay(const PreviewRuntimeState& runtimeState) {
         ImGui::SetNextWindowPos(viewportPosition, ImGuiCond_Always);
         ImGui::SetNextWindowSize(viewportSize, ImGuiCond_Always);
         constexpr auto fullscreenFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                                         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav;
+                                         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
+                                         ImGuiWindowFlags_NoFocusOnAppearing;
         ImGui::Begin("InitialLayerLoadingOverlay", nullptr, fullscreenFlags);
         const auto& backgroundColor = runtimeState.projectSettings.backgroundColor;
         ImGui::GetWindowDrawList()->AddRectFilled(
@@ -38667,8 +38851,11 @@ void DrawLoadingOverlay(const PreviewRuntimeState& runtimeState) {
     }
     ImGui::SetNextWindowPos(ImVec2{viewportPosition.x + 24.0F, viewportPosition.y + 100.0F}, ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(0.90F);
+    // NoFocusOnAppearing: background loads start from the main loop with no
+    // user action; stealing focus mid-drag kills the active slider grab.
     constexpr auto cardFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
-                               ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav;
+                               ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
+                               ImGuiWindowFlags_NoFocusOnAppearing;
     ImGui::Begin("BackgroundLayerLoadingCard", nullptr, cardFlags);
     DrawSpinnerArc(14.0F, 4.0F, IM_COL32(110, 86, 34, 255));
     ImGui::SameLine();
@@ -40540,6 +40727,142 @@ void DrawAnimationSection(
         motionStats.currentCameraSpeed,
         motionStats.currentTargetSpeed);
 
+    ImGui::SeparatorText("Scene Speed");
+    {
+        const auto& perceivedFlow =
+            CachedAnimationPathPerceivedFlow(&panel, animationPath);
+        float peakScreenSpeed = 0.0F;
+        for (const auto& sample : perceivedFlow) {
+            peakScreenSpeed = std::max(peakScreenSpeed, sample.screenSpeed);
+        }
+        const float scrubPosition = std::clamp(panel.scrubAmount, 0.0F, 1.0F);
+        float atPositionScreenSpeed = 0.0F;
+        if (!perceivedFlow.empty()) {
+            const auto sampleIndex = static_cast<std::size_t>(std::lround(
+                scrubPosition *
+                static_cast<float>(perceivedFlow.size() - 1U)));
+            atPositionScreenSpeed = perceivedFlow[sampleIndex].screenSpeed;
+        }
+        ImGui::TextDisabled(
+            "Perceived speed: %.2f screens/s (peak %.2f)",
+            atPositionScreenSpeed,
+            peakScreenSpeed);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "An optical-flow estimate of on-screen motion: view rotation "
+                "plus the camera's sideways speed against the focus "
+                "distance, in screen heights per second. Use it to judge "
+                "how fast the scene appears to move along the pan.");
+        }
+
+        const ImVec2 plotSize{
+            std::max(24.0F, ImGui::GetContentRegionAvail().x),
+            56.0F};
+        ImGui::InvisibleButton(
+            "##PerceivedSpeedPlot",
+            plotSize,
+            ImGuiButtonFlags_MouseButtonLeft);
+        const ImVec2 plotMin = ImGui::GetItemRectMin();
+        const ImVec2 plotMax = ImGui::GetItemRectMax();
+        const float plotWidth = std::max(1.0F, plotMax.x - plotMin.x);
+        const float plotHeight = std::max(1.0F, plotMax.y - plotMin.y);
+        auto* drawList = ImGui::GetWindowDrawList();
+        drawList->AddRectFilled(
+            plotMin,
+            plotMax,
+            ImGui::GetColorU32(ImGuiCol_FrameBg),
+            2.0F);
+        if (perceivedFlow.size() >= 2U && peakScreenSpeed > 1.0e-6F) {
+            const ImU32 curveColour =
+                ImGui::GetColorU32(ImGuiCol_SliderGrabActive);
+            ImVec2 previousPoint{};
+            for (std::size_t index = 0; index < perceivedFlow.size();
+                 ++index) {
+                const auto& sample = perceivedFlow[index];
+                const ImVec2 point{
+                    plotMin.x + plotWidth * sample.normalizedPosition,
+                    plotMax.y -
+                        plotHeight *
+                            std::clamp(
+                                sample.screenSpeed / peakScreenSpeed,
+                                0.0F,
+                                1.0F) *
+                            0.92F -
+                        2.0F,
+                };
+                if (index > 0U) {
+                    drawList->AddLine(
+                        previousPoint,
+                        point,
+                        curveColour,
+                        1.5F);
+                }
+                previousPoint = point;
+            }
+        }
+        if (ImGui::IsItemActive() &&
+            ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            panel.scrubAmount = std::clamp(
+                (ImGui::GetIO().MousePos.x - plotMin.x) / plotWidth,
+                0.0F,
+                1.0F);
+            ApplyAnimationScrub(runtimeState);
+        }
+        const float playheadX = plotMin.x + plotWidth * scrubPosition;
+        drawList->AddLine(
+            ImVec2{playheadX, plotMin.y + 1.0F},
+            ImVec2{playheadX, plotMax.y - 1.0F},
+            ImGui::GetColorU32(ImGuiCol_Text),
+            1.0F);
+        drawList->AddRect(
+            plotMin,
+            plotMax,
+            ImGui::GetColorU32(ImGuiCol_Border),
+            2.0F);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Estimated perceived scene speed over the animation. Click "
+                "or drag to scrub.");
+        }
+
+        const bool canEqualize =
+            animationPath.keys.size() >= 2U && peakScreenSpeed > 1.0e-6F;
+        ImGui::BeginDisabled(!canEqualize);
+        if (ImGui::Button("Equalize Perceived Speed")) {
+            const auto segmentFrames = invisible_places::camera::
+                ComputeConstantPerceivedSpeedSegmentFrames(animationPath);
+            if (segmentFrames.size() + 1U == animationPath.keys.size()) {
+                for (std::size_t segmentIndex = 0;
+                     segmentIndex < segmentFrames.size();
+                     ++segmentIndex) {
+                    animationPath.keys[segmentIndex + 1U].durationFrames =
+                        segmentFrames[segmentIndex];
+                }
+                panel.dirty = true;
+                runtimeState->animationPlayback.active = false;
+                if (panel.liveApply) {
+                    ApplyAnimationScrub(runtimeState);
+                }
+                runtimeState->statusMessage =
+                    "Retimed " + std::to_string(segmentFrames.size()) +
+                    " segments for constant perceived speed. Fine-tune "
+                    "each key's Segment Frames in the Keys section.";
+                runtimeState->errorMessage.clear();
+            }
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(
+                ImGuiHoveredFlags_DelayNormal |
+                ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip(
+                "Redistributes the animation's total frames between keys so "
+                "the pan reads at one constant perceived speed. The total "
+                "duration is unchanged and the result is ordinary per-key "
+                "segment frames, editable in the Keys section. Knot "
+                "respacing can subtly reshape the camera spline.");
+        }
+    }
+
     if (ImGui::Button("Save")) {
         const auto outputPath = panel.currentFilePath.empty()
                                     ? UniqueAnimationFilePathForName(*runtimeState, animationPath.name)
@@ -41506,6 +41829,29 @@ void DrawAnimationSection(
                 AnimationEditTarget::Focus,
                 {focusPoint[0], focusPoint[1], focusPoint[2]})) {
             panel.dirty = true;
+        }
+    }
+    if (panel.selectedKeyIndex.value() > 0U) {
+        int segmentFrames = static_cast<int>(key.durationFrames);
+        if (ImGui::InputInt("Segment Frames", &segmentFrames)) {
+            const auto clampedFrames =
+                static_cast<std::uint32_t>(std::max(1, segmentFrames));
+            if (key.durationFrames != clampedFrames) {
+                key.durationFrames = clampedFrames;
+                panel.dirty = true;
+                runtimeState->animationPlayback.active = false;
+                if (panel.liveApply) {
+                    ApplyAnimationScrub(runtimeState);
+                }
+            }
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Frames for the segment arriving at this key (30 fps "
+                "source frames). Per-key frames act as relative weights — "
+                "they rescale to the path's Full Duration Frames, so "
+                "raising one segment's share slows that stretch of the "
+                "camera move. Equalize Perceived Speed writes these.");
         }
     }
     EndPanelSection();
@@ -44437,6 +44783,11 @@ void DrawKeyedGlobalLevelRow(
     const char* label,
     float baseLevel);
 void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState);
+// Defined with the water run timeline graph further down; declared here so
+// every water sub-tab can embed the selected feature's timeline.
+void DrawEmbeddedWaterFeatureTimeline(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::water::WaterKeyedFeatureId feature);
 
 void DrawWaterShorelineWavesPanel(PreviewRuntimeState* runtimeState) {
     if (runtimeState == nullptr) {
@@ -44447,11 +44798,14 @@ void DrawWaterShorelineWavesPanel(PreviewRuntimeState* runtimeState) {
         DrawKeyedGlobalLevelRow(
             runtimeState,
             invisible_places::water::WaterKeyedFeatureKind::Shoreline,
-            "Shoreline Level (Keyed)",
+            "Shoreline Level",
             scenario.has_value()
                 ? std::clamp(scenario->shorelineLevel, 0.0F, 1.0F)
                 : 1.0F);
     }
+    DrawEmbeddedWaterFeatureTimeline(
+        runtimeState,
+        {.kind = invisible_places::water::WaterKeyedFeatureKind::Shoreline});
 
     const auto visualIndex = ResolveLoadedPointCloudLookdevIndex(*runtimeState);
     PreviewLayerSession* session =
@@ -44805,6 +45159,10 @@ void DrawWaterDynamicMeshFlowPanel(
             "The sampled Ground sheet is part of the scene sidecar; the triangle MESH is not loaded at runtime.");
         EndPanelSection();
     }
+
+    DrawEmbeddedWaterFeatureTimeline(
+        runtimeState,
+        {.kind = invisible_places::water::WaterKeyedFeatureKind::MeshFlow});
 
     if (BeginPanelSection("Activity and Sources")) {
         liveChanged |= ImGui::Checkbox("Enabled##DynamicMeshFlowGpu", &settings.enabled);
@@ -45211,12 +45569,81 @@ void DrawWaterDynamicMeshFlowPanel(
     return;
 }
 
+// True while the feature belongs to a run of the active Timing Take — the
+// condition under which its responsive settings become keyable in the panels.
+bool WaterFeatureIsInTimingRun(
+    const PreviewRuntimeState& runtimeState,
+    invisible_places::water::WaterKeyedFeatureId feature) {
+    const auto* entry = FindScenarioFeatureRuns(
+        runtimeState.water,
+        ActiveWaterTimingScenarioId(runtimeState));
+    return entry != nullptr &&
+           invisible_places::water::FindWaterFeatureRunContaining(
+               entry->waterFeatureTimingRuns,
+               feature) != nullptr;
+}
+
+// Regenerative settings rebuild caches, topology, or simulations instead of
+// applying per frame, so they can never be keyed. While the owning feature
+// sits in a Timings run, dim their labels so the bold keyable settings stand
+// out. Pass the same flag to both calls.
+void BeginWaterRegenerativeSettingLabels(bool featureInRun) {
+    if (!featureInRun) {
+        return;
+    }
+    const ImVec4 text = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+    const ImVec4 disabled =
+        ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
+    ImGui::PushStyleColor(
+        ImGuiCol_Text,
+        ImVec4{
+            std::lerp(text.x, disabled.x, 0.6F),
+            std::lerp(text.y, disabled.y, 0.6F),
+            std::lerp(text.z, disabled.z, 0.6F),
+            std::lerp(text.w, disabled.w, 0.6F)});
+}
+
+void EndWaterRegenerativeSettingLabels(bool featureInRun) {
+    if (featureInRun) {
+        ImGui::PopStyleColor();
+    }
+}
+
+// Draws the visible setting name exactly once, to the right of the keyed
+// widget it follows on the same line. In-run settings are keyable, so the
+// name is always bold (a one-pixel second text pass — ImGui has no bold face
+// in this theme); the amber tint marks keying as enabled. Returns whether
+// the name is hovered so callers can handle the double-click toggle.
+bool DrawKeyedWaterSettingLabel(
+    const std::string& renderedLabel,
+    bool keyingActive) {
+    if (renderedLabel.empty()) {
+        return false;
+    }
+    ImGui::SameLine(0.0F, ImGui::GetStyle().ItemInnerSpacing.x);
+    if (keyingActive) {
+        ImGui::PushStyleColor(ImGuiCol_Text, kWaterKeyedSettingColour);
+    }
+    ImGui::TextUnformatted(renderedLabel.c_str());
+    const bool hovered = ImGui::IsItemHovered();
+    const ImVec2 textMin = ImGui::GetItemRectMin();
+    ImGui::GetWindowDrawList()->AddText(
+        ImVec2{textMin.x + 0.75F, textMin.y},
+        ImGui::GetColorU32(ImGuiCol_Text),
+        renderedLabel.c_str());
+    if (keyingActive) {
+        ImGui::PopStyleColor();
+    }
+    return hovered;
+}
+
 // The keyed-editing core: when the primary feature belongs to a run of the
 // active Timing Take the slider displays the value evaluated at the current
 // animation position, edits write keys (for every passed feature that is in
-// a run) instead of touching authored state, the label tints while keys
-// exist, and trailing < > arrows scrub to this setting's neighbouring keys.
-// Outside a run it is a plain slider on the authored value.
+// a run) instead of touching authored state, the bold name tints amber while
+// keying is enabled, and trailing < > arrows scrub to this setting's
+// neighbouring keys. Outside a run it is a plain slider on the authored
+// value.
 KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
     PreviewRuntimeState* runtimeState,
     std::span<const invisible_places::water::WaterKeyedFeatureId> features,
@@ -45289,25 +45716,6 @@ KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
                             EvaluateWaterKeyedSettingTrack(*track, position)
                                 .value_or(authoredValue)
                       : authoredValue;
-    if (keyingActive) {
-        ImGui::PushStyleColor(ImGuiCol_Text, kWaterKeyedSettingColour);
-    }
-    const ImU32 activeLabelColour =
-        ImGui::GetColorU32(ImGuiCol_Text);
-    const float sliderWidth = ImGui::CalcItemWidth();
-    const bool sliderChanged = ImGui::SliderFloat(
-        label,
-        &value,
-        minimumValue,
-        maximumValue,
-        mixed ? "different" : format,
-        flags);
-    const bool sliderHovered =
-        ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal);
-    const ImVec2 sliderItemMin = ImGui::GetItemRectMin();
-    if (keyingActive) {
-        ImGui::PopStyleColor();
-    }
     const std::string renderedLabel = [&]() {
         const std::string text{label};
         const auto hiddenId = text.find("##");
@@ -45315,24 +45723,26 @@ KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
                    ? text
                    : text.substr(0U, hiddenId);
     }();
-    const ImVec2 labelMin{
-        sliderItemMin.x + sliderWidth +
-            ImGui::GetStyle().ItemInnerSpacing.x,
-        sliderItemMin.y};
-    const ImVec2 labelMax{
-        labelMin.x + ImGui::CalcTextSize(renderedLabel.c_str()).x,
-        labelMin.y + ImGui::GetTextLineHeight()};
-    const bool labelHovered =
-        ImGui::IsMouseHoveringRect(labelMin, labelMax);
-    if (keyingActive && !renderedLabel.empty()) {
-        // ImGui has no separate bold face in this theme. A one-pixel second
-        // pass produces the intended bold setting-name affordance while
-        // retaining the current font and scale.
-        ImGui::GetWindowDrawList()->AddText(
-            ImVec2{labelMin.x + 0.75F, labelMin.y},
-            activeLabelColour,
-            renderedLabel.c_str());
+    // The slider carries a hidden label so the visible name is rendered by
+    // exactly one code path (the shared bold label helper) — never twice.
+    const std::string hiddenSliderLabel = "##" + std::string{label};
+    if (keyingActive) {
+        ImGui::PushStyleColor(ImGuiCol_Text, kWaterKeyedSettingColour);
     }
+    const bool sliderChanged = ImGui::SliderFloat(
+        hiddenSliderLabel.c_str(),
+        &value,
+        minimumValue,
+        maximumValue,
+        mixed ? "different" : format,
+        flags);
+    const bool sliderHovered =
+        ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal);
+    if (keyingActive) {
+        ImGui::PopStyleColor();
+    }
+    const bool labelHovered =
+        DrawKeyedWaterSettingLabel(renderedLabel, keyingActive);
 
     bool toggledKeying = false;
     if (labelHovered &&
@@ -45652,20 +46062,6 @@ KeyedWaterSliderResult DrawKeyedWaterColourSetting(
         }
     }
 
-    if (keyingActive) {
-        ImGui::PushStyleColor(ImGuiCol_Text, kWaterKeyedSettingColour);
-    }
-    const ImU32 activeLabelColour = ImGui::GetColorU32(ImGuiCol_Text);
-    const float editorWidth = ImGui::CalcItemWidth();
-    const bool colourChanged =
-        ImGui::ColorEdit3(label, colour.data());
-    const bool colourHovered =
-        ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal);
-    const ImVec2 editorItemMin = ImGui::GetItemRectMin();
-    if (keyingActive) {
-        ImGui::PopStyleColor();
-    }
-
     const std::string renderedLabel = [&]() {
         const std::string text{label};
         const auto hiddenId = text.find("##");
@@ -45673,21 +46069,21 @@ KeyedWaterSliderResult DrawKeyedWaterColourSetting(
                    ? text
                    : text.substr(0U, hiddenId);
     }();
-    const ImVec2 labelMin{
-        editorItemMin.x + editorWidth +
-            ImGui::GetStyle().ItemInnerSpacing.x,
-        editorItemMin.y};
-    const ImVec2 labelMax{
-        labelMin.x + ImGui::CalcTextSize(renderedLabel.c_str()).x,
-        labelMin.y + ImGui::GetTextLineHeight()};
-    const bool labelHovered =
-        ImGui::IsMouseHoveringRect(labelMin, labelMax);
-    if (keyingActive && !renderedLabel.empty()) {
-        ImGui::GetWindowDrawList()->AddText(
-            ImVec2{labelMin.x + 0.75F, labelMin.y},
-            activeLabelColour,
-            renderedLabel.c_str());
+    // Hidden editor label — the visible name is rendered exactly once by the
+    // shared bold label helper.
+    const std::string hiddenEditorLabel = "##" + std::string{label};
+    if (keyingActive) {
+        ImGui::PushStyleColor(ImGuiCol_Text, kWaterKeyedSettingColour);
     }
+    const bool colourChanged =
+        ImGui::ColorEdit3(hiddenEditorLabel.c_str(), colour.data());
+    const bool colourHovered =
+        ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal);
+    if (keyingActive) {
+        ImGui::PopStyleColor();
+    }
+    const bool labelHovered =
+        DrawKeyedWaterSettingLabel(renderedLabel, keyingActive);
 
     const auto channelLabel =
         [&](std::size_t channel) {
@@ -46079,6 +46475,7 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
             .kind = invisible_places::water::WaterKeyedFeatureKind::
                 ShorelineInstance,
             .objectId = instance.id};
+        DrawEmbeddedWaterFeatureTimeline(runtimeState, feature);
         const std::array<invisible_places::water::WaterKeyedFeatureId, 1>
             keyedFeatures{feature};
         const bool heightFoamActive =
@@ -46191,7 +46588,7 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
                     runtimeState,
                     keyedFeatures,
                     "level",
-                    "Level (Keyed)",
+                    "Level",
                     1.0F,
                     0.0F,
                     1.0F,
@@ -46244,11 +46641,14 @@ void DrawWaterGpuRainPanel(
             DrawKeyedGlobalLevelRow(
                 runtimeState,
                 invisible_places::water::WaterKeyedFeatureKind::Rain,
-                "Rain Level (Keyed)",
+                "Rain Level",
                 scenario.has_value()
                     ? std::clamp(scenario->rainLevel, 0.0F, 1.0F)
                     : 0.0F);
         }
+        DrawEmbeddedWaterFeatureTimeline(
+            runtimeState,
+            {.kind = invisible_places::water::WaterKeyedFeatureKind::Rain});
         ImGui::Checkbox("Enabled##GpuRain", &settings.enabled);
         const auto intensityLabel = invisible_places::water::WaterRainIntensityPresetLabel(
             static_cast<WaterRainIntensityPreset>(settings.intensityPreset));
@@ -46283,8 +46683,18 @@ void DrawWaterGpuRainPanel(
         ImGui::SliderFloat("Visibility", &settings.opacityScale, 0.0F, 3.0F, "%.2f");
         ImGui::SliderFloat("Glow", &settings.emissionScale, 0.0F, 4.0F, "%.2f");
         int seed = static_cast<int>(settings.seed);
+        const bool rainInRun = WaterFeatureIsInTimingRun(
+            *runtimeState,
+            {.kind = invisible_places::water::WaterKeyedFeatureKind::Rain});
+        BeginWaterRegenerativeSettingLabels(rainInRun);
         if (ImGui::InputInt("Seed", &seed)) {
             settings.seed = static_cast<std::uint32_t>(std::max(0, seed));
+        }
+        EndWaterRegenerativeSettingLabels(rainInRun);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Changing the seed reseeds the whole rain simulation — not "
+                "keyable.");
         }
         EndPanelSection();
     }
@@ -47572,11 +47982,23 @@ void DrawWaterSeepagePanel(
         }
     }
 
+    DrawEmbeddedWaterFeatureTimeline(
+        runtimeState,
+        {.kind = invisible_places::water::WaterKeyedFeatureKind::SeepageNode,
+         .objectId = node->id});
+
     bool topologyChanged = false;
     bool paramsChanged = false;
     bool exportChanged = false;
     bool deleteSelected = false;
     if (BeginPanelSection("Selected Node")) {
+        // While the node is keyable (in a run), settings that rebuild its
+        // support topology dim — only the responsive, bold settings key.
+        const bool nodeInRun = WaterFeatureIsInTimingRun(
+            *runtimeState,
+            {.kind =
+                 invisible_places::water::WaterKeyedFeatureKind::SeepageNode,
+             .objectId = node->id});
         // Multi-edit slider bound to the primary's value. While the selected
         // nodes disagree (beyond a small epsilon) the value box renders the
         // word "different"; any change writes the resulting value to every
@@ -47620,6 +48042,10 @@ void DrawWaterSeepagePanel(
         // Keyable settings route through the Timings v2 helper: when the
         // primary node is in a run, edits write keys for every selected
         // node that is in a run; otherwise this is the plain multi-edit.
+        // semanticHelp flows through the keyed slider so the parameter
+        // documentation stays reachable in keying mode (the helper merges it
+        // into its own hover tooltip; an external last-item tooltip would
+        // anchor to the wrong item once the label is a separate text item).
         const auto keyedOrMultiEdit = [&](const char* settingId,
                                           const char* label,
                                           float WaterSeepageNode::*field,
@@ -47627,6 +48053,7 @@ void DrawWaterSeepagePanel(
                                           float maximumValue,
                                           const char* format,
                                           ImGuiSliderFlags flags,
+                                          const char* semanticHelp,
                                           auto&& clampForNode) {
             std::vector<invisible_places::water::WaterKeyedFeatureId> features;
             features.push_back(
@@ -47663,7 +48090,10 @@ void DrawWaterSeepagePanel(
                 format,
                 flags,
                 mixed,
-                &edited);
+                &edited,
+                {},
+                {},
+                semanticHelp);
             if (!result.authoredChanged) {
                 return false;
             }
@@ -47703,13 +48133,18 @@ void DrawWaterSeepagePanel(
             "Includes this node in still, EXR, video, and offline Seepage evaluation.");
         if (!multiSelect) {
             float position[3]{node->position.x, node->position.y, node->position.z};
-            if (ImGui::InputFloat3("Position", position, "%.3f")) {
+            BeginWaterRegenerativeSettingLabels(nodeInRun);
+            const bool positionEdited =
+                ImGui::InputFloat3("Position", position, "%.3f");
+            EndWaterRegenerativeSettingLabels(nodeInRun);
+            if (positionEdited) {
                 node->position = {position[0], position[1], position[2]};
                 topologyChanged = true;
             }
             DrawWaterSeepageParameterTooltip(
                 "World-space source point for connected downhill selection. Move In View snaps "
-                "the node to resident shared-cache support and refreshes its surface normal.");
+                "the node to resident shared-cache support and refreshes its surface normal. "
+                "Rebuilds the node's support — not keyable.");
             const auto selectedIndex = water.selectedSeepageNodeIndex.value();
             const bool moving = water.movingSeepageNodeIndex.has_value() &&
                                 water.movingSeepageNodeIndex.value() == selectedIndex;
@@ -47736,16 +48171,15 @@ void DrawWaterSeepagePanel(
             std::max(0.02F, node->selectionWidthLimitMeters),
             "%.2f m",
             ImGuiSliderFlags_Logarithmic,
+            "Width of the always-wet patch around the node. Everywhere beyond it the affected "
+            "area comes from Node Strength: wetness follows paths of least resistance across "
+            "the connected surface. Parameter-only and keyable.",
             [](const WaterSeepageNode& target, float value) {
                 return std::clamp(
                     value,
                     0.01F,
                     std::max(0.02F, target.selectionWidthLimitMeters));
             });
-        DrawWaterSeepageParameterTooltip(
-            "Width of the always-wet patch around the node. Everywhere beyond it the affected "
-            "area comes from Node Strength: wetness follows paths of least resistance across "
-            "the connected surface. Parameter-only and keyable.");
         paramsChanged |= keyedOrMultiEdit(
             "prominence",
             "Prominence",
@@ -47754,11 +48188,17 @@ void DrawWaterSeepagePanel(
             3.0F,
             "%.2f",
             ImGuiSliderFlags_None,
-            noPerNodeClamp);
-        DrawWaterSeepageParameterTooltip(
             "How strongly the effect changes the underlying cloud. Prominence never changes "
-            "where seepage applies — key it to draw attention to a node or let it fade.");
-        if (ImGui::TreeNode("Advanced Selection Limits")) {
+            "where seepage applies — key it to draw attention to a node or let it fade.",
+            noPerNodeClamp);
+        // Wraps enclose only the widgets: tooltips draw after the pop so
+        // their text keeps the normal (undimmed) colour.
+        BeginWaterRegenerativeSettingLabels(nodeInRun);
+        const bool advancedLimitsOpen =
+            ImGui::TreeNode("Advanced Selection Limits");
+        EndWaterRegenerativeSettingLabels(nodeInRun);
+        if (advancedLimitsOpen) {
+            BeginWaterRegenerativeSettingLabels(nodeInRun);
             topologyChanged |= multiEditSliderFloat(
                 "Maximum Selection Reach",
                 &WaterSeepageNode::selectionReachLimitMeters,
@@ -47767,10 +48207,12 @@ void DrawWaterSeepagePanel(
                 "%.2f m",
                 ImGuiSliderFlags_Logarithmic,
                 noPerNodeClamp);
+            EndWaterRegenerativeSettingLabels(nodeInRun);
             DrawWaterSeepageParameterTooltip(
                 "Cost bound (in cost-metres) for the asynchronous least-resistance flood — the "
                 "hard ceiling on how far Node Strength can ever push this node. Changing it "
-                "rebuilds only this node's compact support.");
+                "rebuilds only this node's compact support — not keyable.");
+            BeginWaterRegenerativeSettingLabels(nodeInRun);
             topologyChanged |= multiEditSliderFloat(
                 "Maximum Selection Width",
                 &WaterSeepageNode::selectionWidthLimitMeters,
@@ -47784,12 +48226,15 @@ void DrawWaterSeepagePanel(
                         std::max(0.02F, target.widthMeters),
                         25.0F);
                 });
+            EndWaterRegenerativeSettingLabels(nodeInRun);
             DrawWaterSeepageParameterTooltip(
                 "Topology bound for the Source Width patch: cells within half this distance of "
                 "the node stay selected even where climbing cost exceeds the reach limit. Live "
-                "Source Width remains responsive inside this bound.");
+                "Source Width remains responsive inside this bound. Rebuilds support — not "
+                "keyable.");
             ImGui::TreePop();
         }
+        BeginWaterRegenerativeSettingLabels(nodeInRun);
         topologyChanged |= multiEditSliderFloat(
             "Edge Feather",
             &WaterSeepageNode::edgeFeatherMeters,
@@ -47798,8 +48243,11 @@ void DrawWaterSeepagePanel(
             "%.2f m",
             ImGuiSliderFlags_None,
             noPerNodeClamp);
+        EndWaterRegenerativeSettingLabels(nodeInRun);
         DrawWaterSeepageParameterTooltip(
-            "Softens the sides, start, end, and depth boundary of the affected region.");
+            "Softens the sides, start, end, and depth boundary of the affected region. "
+            "Rebuilds the node's support — not keyable.");
+        BeginWaterRegenerativeSettingLabels(nodeInRun);
         topologyChanged |= multiEditSliderFloat(
             "Surface Depth",
             &WaterSeepageNode::depthToleranceMeters,
@@ -47808,8 +48256,10 @@ void DrawWaterSeepagePanel(
             "%.3f m",
             ImGuiSliderFlags_Logarithmic,
             noPerNodeClamp);
+        EndWaterRegenerativeSettingLabels(nodeInRun);
         DrawWaterSeepageParameterTooltip(
-            "Maximum depth mismatch allowed while connecting neighbouring authored cache cells.");
+            "Maximum depth mismatch allowed while connecting neighbouring authored cache cells. "
+            "Rebuilds the node's support — not keyable.");
         paramsChanged |= multiEditSliderFloat(
             "Normal Alignment",
             &WaterSeepageNode::normalAlignment,
@@ -47829,15 +48279,14 @@ void DrawWaterSeepagePanel(
             3.0F,
             "%.2f",
             ImGuiSliderFlags_None,
-            noPerNodeClamp);
-        DrawWaterSeepageParameterTooltip(
             "How much water this node carries — strength is the travel budget, and wetness "
             "follows paths of least resistance: it splits into every available downhill route "
             "(further down steeper ones), spreads evenly but shortly across flat ground, and "
             "wicks a short way up connected structure. Low keeps a small patch near the node; "
             "high sends it far along each route. Node Strength keys replace this authored "
             "value live, so the area grows and recedes along an animation without a topology "
-            "rebuild.");
+            "rebuild.",
+            noPerNodeClamp);
         paramsChanged |= keyedOrMultiEdit(
             "rain_delay_seconds",
             "Rain Delay",
@@ -47846,9 +48295,8 @@ void DrawWaterSeepagePanel(
             120.0F,
             "%.1f s",
             ImGuiSliderFlags_None,
+            "Seconds before this node begins responding to the effective Rain amount.",
             noPerNodeClamp);
-        DrawWaterSeepageParameterTooltip(
-            "Seconds before this node begins responding to the effective Rain amount.");
         paramsChanged |= keyedOrMultiEdit(
             "rain_rise_seconds",
             "Rain Rise",
@@ -47857,9 +48305,8 @@ void DrawWaterSeepagePanel(
             120.0F,
             "%.1f s",
             ImGuiSliderFlags_None,
+            "Seconds for this node's Rain envelope to rise toward the effective Rain amount.",
             noPerNodeClamp);
-        DrawWaterSeepageParameterTooltip(
-            "Seconds for this node's Rain envelope to rise toward the effective Rain amount.");
         paramsChanged |= keyedOrMultiEdit(
             "rain_recession_seconds",
             "Rain Recession",
@@ -47868,9 +48315,8 @@ void DrawWaterSeepagePanel(
             300.0F,
             "%.1f s",
             ImGuiSliderFlags_None,
+            "Seconds for this node's Rain envelope to decay after Rain falls, allowing wetness effects to finish naturally.",
             noPerNodeClamp);
-        DrawWaterSeepageParameterTooltip(
-            "Seconds for this node's Rain envelope to decay after Rain falls, allowing wetness effects to finish naturally.");
         bool seedMixed = false;
         for (const auto index : selectedSeepageIndices) {
             if (water.seepageNodes[index].seed != node->seed) {
@@ -47913,19 +48359,28 @@ void DrawWaterSeepagePanel(
                 }
             }
         };
-        if (DrawWaterSeepageRoleToggle("ROCK", "ROCK", node)) {
+        BeginWaterRegenerativeSettingLabels(nodeInRun);
+        const bool rockToggled = DrawWaterSeepageRoleToggle("ROCK", "ROCK", node);
+        EndWaterRegenerativeSettingLabels(nodeInRun);
+        if (rockToggled) {
             applyRoleToSelection("ROCK");
             topologyChanged = true;
         }
         DrawWaterSeepageParameterTooltip("Allows this node to affect connected ROCK cache cells.");
         ImGui::SameLine();
-        if (DrawWaterSeepageRoleToggle("VEG", "VEG", node)) {
+        BeginWaterRegenerativeSettingLabels(nodeInRun);
+        const bool vegToggled = DrawWaterSeepageRoleToggle("VEG", "VEG", node);
+        EndWaterRegenerativeSettingLabels(nodeInRun);
+        if (vegToggled) {
             applyRoleToSelection("VEG");
             topologyChanged = true;
         }
         DrawWaterSeepageParameterTooltip("Allows nearby VEG cells associated with the connected ROCK substrate.");
         ImGui::SameLine();
-        if (DrawWaterSeepageRoleToggle("SAND", "SAND", node)) {
+        BeginWaterRegenerativeSettingLabels(nodeInRun);
+        const bool sandToggled = DrawWaterSeepageRoleToggle("SAND", "SAND", node);
+        EndWaterRegenerativeSettingLabels(nodeInRun);
+        if (sandToggled) {
             applyRoleToSelection("SAND");
             topologyChanged = true;
         }
@@ -48640,6 +49095,16 @@ void DrawWaterPanel(
 
         DrawWaterSourceList(runtimeState, viewport);
 
+        if (water.activeKeyingFeature.has_value() &&
+            (water.activeKeyingFeature->kind ==
+                 invisible_places::water::WaterKeyedFeatureKind::FlowSource ||
+             water.activeKeyingFeature->kind ==
+                 invisible_places::water::WaterKeyedFeatureKind::FlowPath)) {
+            DrawEmbeddedWaterFeatureTimeline(
+                runtimeState,
+                water.activeKeyingFeature.value());
+        }
+
         std::optional<std::size_t> deleteEmitterIndex;
         std::optional<std::size_t> deleteManualPathIndex;
         if (BeginPanelSection("Selected Source")) {
@@ -48753,7 +49218,21 @@ void DrawWaterPanel(
                     selectedEmitter->position.y,
                     selectedEmitter->position.z,
                 };
-                if (ImGui::InputFloat3("Position", position, "%.3f")) {
+                const bool emitterInRun = WaterFeatureIsInTimingRun(
+                    *runtimeState,
+                    {.kind = invisible_places::water::WaterKeyedFeatureKind::
+                         FlowSource,
+                     .objectId = selectedEmitter->id});
+                BeginWaterRegenerativeSettingLabels(emitterInRun);
+                const bool emitterPositionEdited =
+                    ImGui::InputFloat3("Position", position, "%.3f");
+                EndWaterRegenerativeSettingLabels(emitterInRun);
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+                    ImGui::SetTooltip(
+                        "Moving the source requires a path bake — not "
+                        "keyable.");
+                }
+                if (emitterPositionEdited) {
                     selectedEmitter->position = {position[0], position[1], position[2]};
                     MarkWaterPathDirty(runtimeState, selectedEmitter->id);
                 }
@@ -48993,12 +49472,20 @@ void DrawWaterPanel(
                         activityFrame.rawScenarioState,
                         &activityFrame.featureOverlay));
                 bool refreshTrails = false;
+                const bool pathInRun = WaterFeatureIsInTimingRun(
+                    *runtimeState,
+                    {.kind = invisible_places::water::WaterKeyedFeatureKind::
+                         FlowPath,
+                     .objectId = source.id});
+                BeginWaterRegenerativeSettingLabels(pathInRun);
                 if (ImGui::Checkbox("Use Surface Guide", &source.useSurfaceGuide)) {
                     refreshTrails = true;
                 }
+                EndWaterRegenerativeSettingLabels(pathInRun);
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetTooltip(
-                        "Uses the shared 10 mm 3D surface cache to follow rock and sand without leaving the Lane Cover Width corridor.");
+                        "Uses the shared 10 mm 3D surface cache to follow rock and sand without leaving the Lane Cover Width corridor. "
+                        "Rebuilds this source's trails — not keyable.");
                 }
                 refreshTrails |= DrawWaterSourceProfileAssignmentCombo(
                     water,
@@ -49716,11 +50203,15 @@ void DrawDebugGeneralSection(
 
     if (BeginPanelSection("Frame Timing")) {
         ImGui::Text(
-            "CPU - current Renderer DrawFrame: %.3f ms (%.1f FPS)",
+            "CPU - current Renderer DrawFrame: %.3f ms (%.1f FPS equivalent)",
             diagnostics.frameRenderMs,
-            diagnostics.frameFps);
+            diagnostics.frameRenderMs > 0.0
+                ? 1000.0 / diagnostics.frameRenderMs
+                : 0.0);
         ImGui::Text(
-            "%.1fs average: %.3f ms (%.1f FPS)",
+            "Frame cadence: %.3f ms (%.1f FPS) | %.1fs average: %.3f ms (%.1f FPS)",
+            diagnostics.frameFps > 0.0 ? 1000.0 / diagnostics.frameFps : 0.0,
+            diagnostics.frameFps,
             diagnostics.frameAverageWindowSeconds,
             diagnostics.averageFrameRenderMs,
             diagnostics.averageFrameFps);
@@ -50974,7 +51465,8 @@ BuildAvailableKeyingFeatures(
 void DrawTimingControlTooltip(const char* text);
 bool DrawTimingInterpolationCombo(
     const char* label,
-    invisible_places::water::WaterScenarioInterpolation* interpolation);
+    invisible_places::water::WaterScenarioInterpolation* interpolation,
+    bool includeSplineModes);
 
 // ---- Water run timeline graph ----
 // The Timings-tab editor for a selected run's keyed setting tracks, visually
@@ -51027,6 +51519,86 @@ struct WaterRunGraphSeries {
     float defaultValue = 1.0F;
 };
 
+// Builds the per-feature graph lanes: one lane per registry setting of the
+// feature (unauthored settings as dashed default guides that accept a first
+// key) plus one lane per keyed dynamic profile track, framed by its padded
+// key extents. Shared by the Timings-tab Split Graphs view and the timeline
+// embedded at the top of each water sub-tab.
+void BuildWaterFeatureGraphSeries(
+    invisible_places::water::WaterFeatureTimeline& timeline,
+    std::vector<WaterRunGraphSeries>* out) {
+    const auto seriesColour = [](std::size_t settingIndex) {
+        return kWaterKeyedSettingColours[
+            settingIndex % kWaterKeyedSettingColours.size()];
+    };
+    const auto trackFor =
+        [&](std::string_view settingId)
+        -> invisible_places::water::WaterKeyedSettingTrack* {
+        for (auto& setting : timeline.settings) {
+            if (setting.settingId == settingId) {
+                return &setting;
+            }
+        }
+        return nullptr;
+    };
+    std::size_t settingIndex = 0U;
+    for (const auto& info :
+         invisible_places::water::WaterKeyableSettings(
+             timeline.feature.kind)) {
+        out->push_back(WaterRunGraphSeries{
+            .feature = timeline.feature,
+            .settingId = std::string{info.id},
+            .label = std::string{info.label},
+            .colour = seriesColour(settingIndex),
+            .track = trackFor(info.id),
+            .timeline = &timeline,
+            .minimum = info.minimum,
+            .maximum = info.maximum,
+            .defaultValue = info.defaultValue,
+        });
+        ++settingIndex;
+    }
+    // Dynamic profile tracks carry their own labels and no registry range;
+    // they join once keyed, framed by their padded key extents.
+    for (auto& setting : timeline.settings) {
+        if (invisible_places::water::FindWaterKeyableSetting(
+                timeline.feature.kind,
+                setting.settingId) != nullptr) {
+            continue;
+        }
+        if (!setting.active || setting.keys.empty()) {
+            continue;
+        }
+        float minimum = std::numeric_limits<float>::max();
+        float maximum = std::numeric_limits<float>::lowest();
+        for (const auto& key : setting.keys) {
+            minimum = std::min(minimum, key.value);
+            maximum = std::max(maximum, key.value);
+        }
+        const float magnitude =
+            std::max(std::abs(minimum), std::abs(maximum));
+        if (maximum - minimum <=
+            std::max(1.0e-6F, magnitude * 1.0e-6F)) {
+            const float padding = std::max(1.0e-3F, magnitude * 0.05F);
+            minimum -= padding;
+            maximum += padding;
+        }
+        out->push_back(WaterRunGraphSeries{
+            .feature = timeline.feature,
+            .settingId = setting.settingId,
+            .label = !setting.label.empty() ? setting.label
+                                            : setting.settingId,
+            .colour = seriesColour(settingIndex),
+            .track = &setting,
+            .timeline = &timeline,
+            .minimum = minimum,
+            .maximum = maximum,
+            .defaultValue = std::midpoint(minimum, maximum),
+        });
+        ++settingIndex;
+    }
+}
+
 void DrawWaterRunTimingGraph(
     const char* id,
     PreviewRuntimeState* runtimeState,
@@ -51057,11 +51629,26 @@ void DrawWaterRunTimingGraph(
     const float axisY = maximum.y - kCompactLaneHeight * 0.5F;
     const float graphTopY = minimum.y + 5.0F;
     const float graphHeight = std::max(1.0F, axisY - graphTopY);
+    const auto viewRange =
+        invisible_places::timing::SanitizeTimelineViewRange(
+            runtimeState->animationPanel.timelineViewRange);
+    const auto positionInView = [&](float position) {
+        return invisible_places::timing::TimelinePositionIsInView(
+            viewRange,
+            position,
+            kKeyTolerance);
+    };
     const auto xForPosition = [&](float position) {
-        return minimum.x + width * std::clamp(position, 0.0F, 1.0F);
+        return minimum.x +
+               width * invisible_places::timing::
+                           TimelinePositionToViewFraction(
+                               viewRange,
+                               position);
     };
     const auto positionForX = [&](float x) {
-        return std::clamp((x - minimum.x) / width, 0.0F, 1.0F);
+        return invisible_places::timing::TimelineViewFractionToPosition(
+            viewRange,
+            (x - minimum.x) / width);
     };
     const auto seriesRange =
         [&](const WaterRunGraphSeries& lane) -> std::pair<float, float> {
@@ -51182,6 +51769,9 @@ void DrawWaterRunTimingGraph(
     if (itemHovered) {
         for (std::size_t index = 0U; index < series.size(); ++index) {
             for (const auto& key : sortedKeys[index]) {
+                if (!positionInView(key.position)) {
+                    continue;
+                }
                 const float dx = mouse.x - xForPosition(key.position);
                 const float dy =
                     mouse.y - yForValue(series[index], key.value);
@@ -51203,6 +51793,9 @@ void DrawWaterRunTimingGraph(
     float nearestMarkerDistance = std::numeric_limits<float>::max();
     for (std::size_t index = 0U; index < series.size(); ++index) {
         for (const auto& key : sortedKeys[index]) {
+            if (!positionInView(key.position)) {
+                continue;
+            }
             const float distance =
                 std::abs(mouse.x - xForPosition(key.position));
             if (distance < nearestMarkerDistance) {
@@ -51220,6 +51813,9 @@ void DrawWaterRunTimingGraph(
         std::vector<TiedMarker> tied;
         for (std::size_t index = 0U; index < series.size(); ++index) {
             for (const auto& key : sortedKeys[index]) {
+                if (!positionInView(key.position)) {
+                    continue;
+                }
                 const float distance =
                     std::abs(mouse.x - xForPosition(key.position));
                 if (std::abs(distance - nearestMarkerDistance) <= 0.5F) {
@@ -51536,10 +52132,12 @@ void DrawWaterRunTimingGraph(
     samplePositions.reserve(static_cast<std::size_t>(sampleCount));
     for (int index = 0; index < sampleCount; ++index) {
         samplePositions.push_back(
-            sampleCount > 1
-                ? static_cast<float>(index) /
-                      static_cast<float>(sampleCount - 1)
-                : 0.0F);
+            invisible_places::timing::TimelineViewFractionToPosition(
+                viewRange,
+                sampleCount > 1
+                    ? static_cast<float>(index) /
+                          static_cast<float>(sampleCount - 1)
+                    : 0.0F));
     }
 
     std::optional<std::size_t> hoveredCurveSeries;
@@ -51600,6 +52198,9 @@ void DrawWaterRunTimingGraph(
             }
         }
         for (const auto& key : sortedKeys[index]) {
+            if (!positionInView(key.position)) {
+                continue;
+            }
             const ImVec2 point{
                 xForPosition(key.position),
                 yForValue(lane, key.value)};
@@ -51627,6 +52228,9 @@ void DrawWaterRunTimingGraph(
         ImGui::GetColorU32(ImGuiCol_Border));
     for (std::size_t index = 0U; index < series.size(); ++index) {
         for (const auto& key : sortedKeys[index]) {
+            if (!positionInView(key.position)) {
+                continue;
+            }
             const float x = xForPosition(key.position);
             const bool isHoveredMarker =
                 markerHovered && nearestMarkerSeries == index &&
@@ -51675,8 +52279,13 @@ void DrawWaterRunTimingGraph(
                 positionForX(mouse.x) * durationSeconds);
         }
     }
+    // Keep the shared playhead discoverable while it sits outside the zoomed
+    // section by pinning it to the corresponding edge of the graph.
     const float scrubX = xForPosition(
-        std::clamp(runtimeState->animationPanel.scrubAmount, 0.0F, 1.0F));
+        std::clamp(
+            runtimeState->animationPanel.scrubAmount,
+            viewRange.start,
+            viewRange.end));
     const float playheadTipY = graphTopY + 7.0F;
     drawList->AddLine(
         ImVec2{scrubX, playheadTipY},
@@ -51747,7 +52356,8 @@ void DrawWaterRunTimingGraph(
             ImGui::SetNextItemWidth(180.0F);
             DrawTimingInterpolationCombo(
                 "To Next Key##WaterRunKey",
-                &editor->draftInterpolation);
+                &editor->draftInterpolation,
+                /*includeSplineModes=*/true);
             const bool validPosition =
                 std::isfinite(editor->draftPosition) &&
                 editor->draftPosition >= 0.0F &&
@@ -51871,6 +52481,69 @@ void DrawWaterRunTimingGraph(
                 add.interpolation);
         }
     }
+    ImGui::PopID();
+}
+
+// The per-feature timeline embedded at the top of a water sub-tab: the same
+// editor as the Timings-tab Split Graphs view, drawn for the one feature the
+// panel is focused on. Draws nothing when no animation is loaded or the
+// feature is not in a run of the active Timing Take (the Water Run combo
+// under the transport assigns it to one).
+void DrawEmbeddedWaterFeatureTimeline(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::water::WaterKeyedFeatureId feature) {
+    if (runtimeState == nullptr ||
+        !runtimeState->animationPanel.currentPath.has_value()) {
+        return;
+    }
+    const auto scenarioId = ActiveWaterTimingScenarioId(*runtimeState);
+    if (scenarioId.empty()) {
+        return;
+    }
+    auto& water = runtimeState->water;
+    auto* entry = invisible_places::timing::FindTimingTakeSceneState(
+        &water.timingTakeSceneStates,
+        scenarioId,
+        ActiveWaterTimingSceneGroupName(water));
+    if (entry == nullptr) {
+        return;
+    }
+    invisible_places::water::WaterFeatureTimingRun* run = nullptr;
+    invisible_places::water::WaterFeatureTimeline* timeline = nullptr;
+    for (auto& candidate : entry->waterFeatureTimingRuns) {
+        timeline = invisible_places::water::FindWaterFeatureTimeline(
+            &candidate,
+            feature);
+        if (timeline != nullptr) {
+            run = &candidate;
+            break;
+        }
+    }
+    if (run == nullptr || timeline == nullptr) {
+        return;
+    }
+    const float durationSeconds = std::max(
+        0.0F,
+        AnimationDurationSeconds(
+            *runtimeState->animationPanel.currentPath));
+    std::vector<WaterRunGraphSeries> series;
+    BuildWaterFeatureGraphSeries(*timeline, &series);
+    if (series.empty()) {
+        return;
+    }
+    ImGui::PushID("EmbeddedFeatureTimeline");
+    ImGui::PushID(static_cast<int>(feature.kind));
+    ImGui::PushID(static_cast<int>(feature.objectId));
+    ImGui::TextDisabled("Timeline — run \"%s\"", run->name.c_str());
+    DrawWaterRunTimingGraph(
+        "##WaterFeatureEmbeddedGraph",
+        runtimeState,
+        scenarioId,
+        run,
+        series,
+        durationSeconds);
+    ImGui::PopID();
+    ImGui::PopID();
     ImGui::PopID();
 }
 
@@ -52091,19 +52764,18 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                     std::size_t featureIndex,
                     bool combined,
                     std::vector<WaterRunGraphSeries>* out) {
+                    if (!combined) {
+                        BuildWaterFeatureGraphSeries(timeline, out);
+                        return;
+                    }
                     const auto featureLabel = WaterKeyedFeatureDisplayLabel(
                         *runtimeState,
                         timeline.feature);
                     const auto seriesColour =
                         [&](std::size_t settingIndex) {
-                            return combined
-                                       ? WaterRunSeriesShade(
-                                             featureBaseColour(featureIndex),
-                                             settingIndex)
-                                       : kWaterKeyedSettingColours[
-                                             settingIndex %
-                                             kWaterKeyedSettingColours
-                                                 .size()];
+                            return WaterRunSeriesShade(
+                                featureBaseColour(featureIndex),
+                                settingIndex);
                         };
                     const auto trackFor =
                         [&](std::string_view settingId)
@@ -52206,6 +52878,24 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                 "features. Double-click a graph to add a key, drag curve "
                 "points to move them, double-click a point to edit or "
                 "delete it.");
+            const auto timelineViewRange =
+                invisible_places::timing::SanitizeTimelineViewRange(
+                    runtimeState->animationPanel.timelineViewRange);
+            if (invisible_places::timing::TimelineViewRangeIsFull(
+                    timelineViewRange)) {
+                ImGui::TextDisabled(
+                    "View: full animation (set bounds under Global Animation Position to zoom)");
+            } else if (durationSeconds > 0.0F) {
+                ImGui::TextDisabled(
+                    "View: %.2f s to %.2f s",
+                    timelineViewRange.start * durationSeconds,
+                    timelineViewRange.end * durationSeconds);
+            } else {
+                ImGui::TextDisabled(
+                    "View: %.4f to %.4f",
+                    timelineViewRange.start,
+                    timelineViewRange.end);
+            }
             std::vector<std::size_t> visibleFeatures;
             for (std::size_t featureIndex = 0U;
                  featureIndex < run.features.size();
@@ -52807,9 +53497,13 @@ const char* TimingInterpolationLabel(
     return "Smooth Step";
 }
 
+// includeSplineModes adds Monotone Spline and Centripetal Catmull–Rom —
+// pass it only where the underlying evaluator truly honours those curves
+// (water setting tracks); the colourise stop keys still ease per segment.
 bool DrawTimingInterpolationCombo(
     const char* label,
-    invisible_places::water::WaterScenarioInterpolation* interpolation) {
+    invisible_places::water::WaterScenarioInterpolation* interpolation,
+    bool includeSplineModes = false) {
     if (interpolation == nullptr) {
         return false;
     }
@@ -52818,12 +53512,16 @@ bool DrawTimingInterpolationCombo(
     if (ImGui::BeginCombo(
             label,
             TimingInterpolationLabel(*interpolation))) {
-        constexpr std::array options{
+        constexpr std::array baseOptions{
             WaterScenarioInterpolation::Smooth,
             WaterScenarioInterpolation::Linear,
             WaterScenarioInterpolation::Hold,
         };
-        for (const auto option : options) {
+        constexpr std::array splineOptions{
+            WaterScenarioInterpolation::SmoothVelocity,
+            WaterScenarioInterpolation::CentripetalCatmullRom,
+        };
+        const auto drawOption = [&](WaterScenarioInterpolation option) {
             const bool selected = *interpolation == option;
             if (ImGui::Selectable(
                     TimingInterpolationLabel(option),
@@ -52834,11 +53532,26 @@ bool DrawTimingInterpolationCombo(
             if (selected) {
                 ImGui::SetItemDefaultFocus();
             }
+        };
+        for (const auto option : baseOptions) {
+            drawOption(option);
+        }
+        if (includeSplineModes) {
+            for (const auto option : splineOptions) {
+                drawOption(option);
+            }
         }
         ImGui::EndCombo();
     }
     DrawTimingControlTooltip(
-        "Choose Smooth Step, Linear, or Hold interpolation from this key to the next.");
+        includeSplineModes
+            ? "Interpolation from this key to the next: Smooth Step, Linear, "
+              "or Hold ease this segment alone; Monotone Spline follows the "
+              "neighbouring keys without overshoot and rests at reversals; "
+              "Centripetal Catmull–Rom curves smoothly through the "
+              "surrounding keys."
+            : "Choose Smooth Step, Linear, or Hold interpolation from this "
+              "key to the next.");
     return changed;
 }
 
@@ -61462,6 +62175,264 @@ std::size_t RemoveTimingEffectRelevantKeysAtPosition(
     return removed;
 }
 
+void DrawAnimationTimelineViewBoundsOverlay(
+    invisible_places::timing::TimelineViewRange range,
+    ImVec2 barMin,
+    ImVec2 barMax) {
+    range = invisible_places::timing::SanitizeTimelineViewRange(range);
+    if (invisible_places::timing::TimelineViewRangeIsFull(range)) {
+        return;
+    }
+    const float width = std::max(1.0F, barMax.x - barMin.x);
+    const float startX = barMin.x + width * range.start;
+    const float endX = barMin.x + width * range.end;
+    auto* drawList = ImGui::GetWindowDrawList();
+    drawList->AddRectFilled(
+        barMin,
+        ImVec2{startX, barMax.y},
+        IM_COL32(0, 0, 0, 76));
+    drawList->AddRectFilled(
+        ImVec2{endX, barMin.y},
+        barMax,
+        IM_COL32(0, 0, 0, 76));
+    const ImU32 boundaryColour = IM_COL32(245, 185, 82, 225);
+    drawList->AddLine(
+        ImVec2{startX, barMin.y},
+        ImVec2{startX, barMax.y},
+        boundaryColour,
+        1.5F);
+    drawList->AddLine(
+        ImVec2{endX, barMin.y},
+        ImVec2{endX, barMax.y},
+        boundaryColour,
+        1.5F);
+}
+
+bool DrawAnimationTimelineViewRangeSelector(
+    PreviewRuntimeState* runtimeState,
+    float durationSeconds) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+    auto& panel = runtimeState->animationPanel;
+    panel.timelineViewRange =
+        invisible_places::timing::SanitizeTimelineViewRange(
+            panel.timelineViewRange);
+    bool changed = false;
+
+    ImGui::PushID("AnimationTimelineViewRange");
+    const bool fullRange =
+        invisible_places::timing::TimelineViewRangeIsFull(
+            panel.timelineViewRange);
+    const std::string rangeLabel =
+        durationSeconds > 0.0F
+            ? FormatFixed(
+                  panel.timelineViewRange.start * durationSeconds,
+                  2) +
+                  "s - " +
+                  FormatFixed(
+                      panel.timelineViewRange.end * durationSeconds,
+                      2) +
+                  "s"
+            : FormatFixed(panel.timelineViewRange.start, 4) +
+                  " - " +
+                  FormatFixed(panel.timelineViewRange.end, 4);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled(
+        "Feature Run View: %s%s",
+        fullRange ? "Full animation, " : "",
+        rangeLabel.c_str());
+    const float fullButtonWidth =
+        ImGui::CalcTextSize("Full").x +
+        ImGui::GetStyle().FramePadding.x * 2.0F;
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(std::max(
+        ImGui::GetCursorPosX(),
+        ImGui::GetWindowContentRegionMax().x - fullButtonWidth));
+    ImGui::BeginDisabled(fullRange);
+    if (ImGui::SmallButton("Full")) {
+        panel.timelineViewRange = {};
+        panel.timelineViewDrag.reset();
+        changed = true;
+    }
+    ImGui::EndDisabled();
+
+    constexpr float kSelectorHeight = 14.0F;
+    const ImVec2 size{
+        std::max(24.0F, ImGui::GetContentRegionAvail().x),
+        kSelectorHeight};
+    ImGui::InvisibleButton(
+        "##FeatureRunViewRange",
+        size,
+        ImGuiButtonFlags_MouseButtonLeft);
+    const ImVec2 minimum = ImGui::GetItemRectMin();
+    const ImVec2 maximum = ImGui::GetItemRectMax();
+    const float width = std::max(1.0F, maximum.x - minimum.x);
+    const float mouseX = ImGui::GetIO().MousePos.x;
+    const auto overviewPositionForX = [&](float x) {
+        return std::clamp((x - minimum.x) / width, 0.0F, 1.0F);
+    };
+
+    if (ImGui::IsItemHovered()) {
+        const float startX =
+            minimum.x + width * panel.timelineViewRange.start;
+        const float endX =
+            minimum.x + width * panel.timelineViewRange.end;
+        constexpr float kHandleHitRadius = 7.0F;
+        if (std::min(
+                std::abs(mouseX - startX),
+                std::abs(mouseX - endX)) <= kHandleHitRadius) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        } else if (mouseX >= startX && mouseX <= endX) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        }
+    }
+
+    if (ImGui::IsItemHovered() &&
+        ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        if (!fullRange) {
+            panel.timelineViewRange = {};
+            changed = true;
+        }
+        panel.timelineViewDrag.reset();
+    } else if (ImGui::IsItemActivated()) {
+        const float startX =
+            minimum.x + width * panel.timelineViewRange.start;
+        const float endX =
+            minimum.x + width * panel.timelineViewRange.end;
+        const float startDistance = std::abs(mouseX - startX);
+        const float endDistance = std::abs(mouseX - endX);
+        constexpr float kHandleHitRadius = 7.0F;
+        AnimationTimelineViewDragPart part =
+            AnimationTimelineViewDragPart::Body;
+        if (std::min(startDistance, endDistance) <=
+            kHandleHitRadius) {
+            part = startDistance <= endDistance
+                       ? AnimationTimelineViewDragPart::Start
+                       : AnimationTimelineViewDragPart::End;
+        } else if (mouseX < startX) {
+            part = AnimationTimelineViewDragPart::Start;
+        } else if (mouseX > endX) {
+            part = AnimationTimelineViewDragPart::End;
+        }
+        panel.timelineViewDrag = AnimationTimelineViewDragState{
+            .part = part,
+            .mouseStartX = mouseX,
+            .originalRange = panel.timelineViewRange,
+        };
+    }
+
+    if (panel.timelineViewDrag.has_value() &&
+        ImGui::IsItemActive() &&
+        ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        const auto& drag = panel.timelineViewDrag.value();
+        auto candidate = panel.timelineViewRange;
+        switch (drag.part) {
+            case AnimationTimelineViewDragPart::Start:
+                candidate.start = std::clamp(
+                    overviewPositionForX(mouseX),
+                    0.0F,
+                    candidate.end -
+                        invisible_places::timing::
+                            kMinimumTimelineViewSpan);
+                break;
+            case AnimationTimelineViewDragPart::End:
+                candidate.end = std::clamp(
+                    overviewPositionForX(mouseX),
+                    candidate.start +
+                        invisible_places::timing::
+                            kMinimumTimelineViewSpan,
+                    1.0F);
+                break;
+            case AnimationTimelineViewDragPart::Body: {
+                const float span =
+                    drag.originalRange.end -
+                    drag.originalRange.start;
+                const float delta =
+                    (mouseX - drag.mouseStartX) / width;
+                candidate.start = std::clamp(
+                    drag.originalRange.start + delta,
+                    0.0F,
+                    1.0F - span);
+                candidate.end = candidate.start + span;
+                break;
+            }
+        }
+        candidate =
+            invisible_places::timing::SanitizeTimelineViewRange(
+                candidate);
+        if (std::abs(
+                candidate.start -
+                panel.timelineViewRange.start) >
+                std::numeric_limits<float>::epsilon() ||
+            std::abs(
+                candidate.end -
+                panel.timelineViewRange.end) >
+                std::numeric_limits<float>::epsilon()) {
+            panel.timelineViewRange = candidate;
+            changed = true;
+        }
+    }
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        panel.timelineViewDrag.reset();
+    }
+
+    auto* drawList = ImGui::GetWindowDrawList();
+    drawList->AddRectFilled(
+        minimum,
+        maximum,
+        ImGui::GetColorU32(ImGuiCol_FrameBg),
+        2.0F);
+    const float startX =
+        minimum.x + width * panel.timelineViewRange.start;
+    const float endX =
+        minimum.x + width * panel.timelineViewRange.end;
+    ImVec4 fill =
+        ImGui::GetStyleColorVec4(ImGuiCol_SliderGrabActive);
+    fill.w *= 0.42F;
+    drawList->AddRectFilled(
+        ImVec2{startX, minimum.y},
+        ImVec2{endX, maximum.y},
+        ImGui::ColorConvertFloat4ToU32(fill),
+        2.0F);
+    drawList->AddRect(
+        minimum,
+        maximum,
+        ImGui::GetColorU32(ImGuiCol_Border),
+        2.0F);
+    const ImU32 handleColour =
+        ImGui::GetColorU32(ImGuiCol_SliderGrabActive);
+    drawList->AddLine(
+        ImVec2{startX, minimum.y},
+        ImVec2{startX, maximum.y},
+        handleColour,
+        2.0F);
+    drawList->AddLine(
+        ImVec2{endX, minimum.y},
+        ImVec2{endX, maximum.y},
+        handleColour,
+        2.0F);
+    const float playheadX =
+        minimum.x +
+        width * std::clamp(panel.scrubAmount, 0.0F, 1.0F);
+    drawList->AddLine(
+        ImVec2{playheadX, minimum.y + 2.0F},
+        ImVec2{playheadX, maximum.y - 2.0F},
+        IM_COL32(18, 18, 18, 230),
+        1.0F);
+
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Drag either end to zoom Feature Run timelines; drag the highlighted middle to pan.\nDouble-click or press Full to reset. Stored key times, playback, and exports remain unchanged.");
+    }
+    ImGui::PopID();
+
+    if (changed) {
+        runtimeState->timingsPanel.waterRunKeyDrag.reset();
+    }
+    return changed;
+}
+
 // The persistent Animation Position row above the controls tabs: scrubbing
 // here always repositions the camera (and every keyed water setting follows
 // the frame resolve), and the marker strip below shows the keys of the
@@ -61557,6 +62528,14 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
             }
         }
     }
+
+    DrawAnimationTimelineViewRangeSelector(
+        runtimeState,
+        durationSeconds);
+    DrawAnimationTimelineViewBoundsOverlay(
+        panel.timelineViewRange,
+        barMin,
+        barMax);
 
     const float scrubPosition = std::clamp(panel.scrubAmount, 0.0F, 1.0F);
     const auto relevantEffectKeyPositions =
@@ -62032,7 +63011,7 @@ void DrawControlsWindow(
     const char* previewStatus =
         diagnostics.sceneCacheActive && !diagnostics.sceneRenderedThisFrame ? "cached" : "rendering";
     const std::string fpsLabel =
-        "Render FPS (" + FormatFixed(diagnostics.frameAverageWindowSeconds, 1) + "s): " +
+        "FPS (" + FormatFixed(diagnostics.frameAverageWindowSeconds, 1) + "s): " +
         FormatFixed(renderFps, 1) + "  " + previewStatus;
     if (runtimeState->animationPanel.currentPath.has_value()) {
         ImGui::AlignTextToFramePadding();
@@ -63209,23 +64188,28 @@ bool PreviewLiveVisualEffectsRequireSceneRedraw(
     // panel checkbox is off: the effective per-frame enable comes from the
     // Timing Take level with its explicit overlay applied, not the authored
     // checkbox.
-    if (auto scenario = ResolveActiveWaterScenarioState(runtimeState);
-        scenario.has_value()) {
-        if (const auto* entry = FindScenarioFeatureRuns(
-                runtimeState.water,
-                ActiveWaterTimingScenarioId(runtimeState));
-            entry != nullptr) {
-            const auto overlay =
-                invisible_places::water::BuildWaterFeatureTimingOverlay(
-                    entry->waterFeatureTimingRuns,
-                    std::clamp(
-                        runtimeState.animationPanel.scrubAmount,
-                        0.0F,
-                        1.0F));
+    auto scenario = ResolveActiveWaterScenarioState(runtimeState);
+    invisible_places::water::WaterFeatureTimingOverlay overlay;
+    const invisible_places::water::WaterFeatureTimingOverlay* overlayPtr =
+        nullptr;
+    if (const auto* entry = FindScenarioFeatureRuns(
+            runtimeState.water,
+            ActiveWaterTimingScenarioId(runtimeState));
+        entry != nullptr) {
+        overlay = invisible_places::water::BuildWaterFeatureTimingOverlay(
+            entry->waterFeatureTimingRuns,
+            std::clamp(
+                runtimeState.animationPanel.scrubAmount,
+                0.0F,
+                1.0F));
+        overlayPtr = &overlay;
+        if (scenario.has_value()) {
             invisible_places::water::ApplyWaterFeatureTimingOverlayToScenario(
                 overlay,
                 &scenario.value());
         }
+    }
+    if (scenario.has_value()) {
         if (scenario->rainLevel > 1.0e-5F) {
             return true;
         }
@@ -63254,13 +64238,29 @@ bool PreviewLiveVisualEffectsRequireSceneRedraw(
         FastBasicPointRendererActive(runtimeState.projectSettings) &&
         !VisibleGeneratedWaterTrailOverlayPresent(runtimeState);
 
+    // Additional shoreline instances animate continuously whenever visible.
+    // Resolve them exactly as BuildRenderState will (disabled instances and
+    // keyed level 0 drop out) so a silenced list stops latching redraws.
+    const auto resolvedAdditionalShorelines =
+        ResolveAdditionalShorelinesForFrame(
+            runtimeState.water.shorelineInstances,
+            overlayPtr);
+
     for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
         const auto& session = runtimeState.sessions[sessionIndex];
         if (!IsRenderablePointCloudSource(runtimeState, session)) {
             continue;
         }
-        const auto renderStyle = MakeSceneRenderStyle(runtimeState, session, session.pointStyle);
+        auto renderStyle = MakeSceneRenderStyle(runtimeState, session, session.pointStyle);
+        // Mirror BuildRenderState's keyed shoreline level: a take that keys
+        // the shoreline to zero silences the waves, so it must not keep
+        // re-rendering an otherwise static scene every frame.
+        ApplyWaterShorelineLevelToStyle(scenario, &renderStyle);
         if (invisible_places::renderer::pointcloud::PointCloudStyleHasActiveShorelineWaves(renderStyle)) {
+            return true;
+        }
+        if (!resolvedAdditionalShorelines.empty() &&
+            SceneRoleIs(session.sceneRole, "sand")) {
             return true;
         }
         if (!runtimeState.projectSettings.liveVisualEffects ||
@@ -63406,7 +64406,7 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                  .timingColouriseEligible =
                      IsAuthoredTimingColouriseLayer(session),
                  .shorelineInstancesEligible =
-                     NormalizeSceneRoleName(session.sceneRole) == "sand",
+                     SceneRoleIs(session.sceneRole, "sand"),
                  .drawPointCount = static_cast<std::uint32_t>(drawPointCount),
                  .densityCompensation = ResolveSessionDensityCompensation(runtimeState, session),
                  .rainCollisionRole = RainCollisionRoleForSession(session)});
@@ -74623,6 +75623,16 @@ int Application::Run(ApplicationRunOptions options) const {
 
     SaveBeforeCloseState saveBeforeClose;
     while (!saveBeforeClose.exitConfirmed) {
+        // Escape's ImGui meaning (cancel the active drag or text edit) wins
+        // over the quit shortcut while any widget interaction is live; the
+        // previous frame's ImGui state is the correct gate here because the
+        // poll runs before this frame's UI is built.
+        if (ImGui::GetCurrentContext() != nullptr) {
+            window.SetEscapeCloseSuppressed(
+                ImGui::GetIO().WantCaptureKeyboard ||
+                ImGui::IsAnyItemActive() ||
+                ImGui::IsAnyMouseDown());
+        }
         window.PollEvents();
         if (window.ShouldClose()) {
             if (!viewport.has_value()) {

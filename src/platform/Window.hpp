@@ -38,6 +38,10 @@ class Window {
     [[nodiscard]] bool ShouldClose() const;
     void CancelCloseRequest();
     void PollEvents();
+    // While suppressed, Escape does not request a window close — the UI
+    // layer sets this each frame so Escape can keep its ImGui meaning
+    // (cancel the active drag or text edit) without also quitting.
+    void SetEscapeCloseSuppressed(bool suppressed);
     void SetTitle(const std::string& title);
     void ShowBootstrapContent(const BootstrapWindowContent& content);
     [[nodiscard]] GLFWwindow* NativeHandle() const { return window_; }
@@ -45,6 +49,7 @@ class Window {
   private:
     GLFWwindow* window_ = nullptr;
     bool escapeWasPressed_ = false;
+    bool escapeCloseSuppressed_ = false;
 };
 
 }  // namespace invisible_places::platform

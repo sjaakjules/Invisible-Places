@@ -84,10 +84,14 @@ void Window::PollEvents() {
 
     const bool escapePressed =
         glfwGetKey(window_, GLFW_KEY_ESCAPE) == GLFW_PRESS;
-    if (escapePressed && !escapeWasPressed_) {
+    if (escapePressed && !escapeWasPressed_ && !escapeCloseSuppressed_) {
         glfwSetWindowShouldClose(window_, GLFW_TRUE);
     }
     escapeWasPressed_ = escapePressed;
+}
+
+void Window::SetEscapeCloseSuppressed(bool suppressed) {
+    escapeCloseSuppressed_ = suppressed;
 }
 
 void Window::SetTitle(const std::string& title) {

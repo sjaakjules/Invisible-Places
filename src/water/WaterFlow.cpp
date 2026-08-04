@@ -15,6 +15,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <queue>
 #include <set>
@@ -6341,7 +6342,13 @@ WaterScenarioState EvaluateWaterScenarioTrack(
         if (left.interpolation == WaterScenarioInterpolation::Hold) {
             return SanitizeWaterScenarioStateImpl(left.state);
         }
-        if (left.interpolation == WaterScenarioInterpolation::Smooth) {
+        // Scenario keys blend whole multi-channel states, so the spline modes
+        // approximate as the eased blend; a per-channel spline is not
+        // applicable here.
+        if (left.interpolation == WaterScenarioInterpolation::Smooth ||
+            left.interpolation == WaterScenarioInterpolation::SmoothVelocity ||
+            left.interpolation ==
+                WaterScenarioInterpolation::CentripetalCatmullRom) {
             amount = amount * amount * (3.0F - 2.0F * amount);
         }
         result.seepageLevel = std::lerp(left.state.seepageLevel, right.state.seepageLevel, amount);
@@ -6442,7 +6449,13 @@ WaterSeepageNodeAnimationState EvaluateWaterSeepageNodeAnimationTrack(
         }
         const float span = std::max(1.0e-6F, right.position - left.position);
         float amount = Clamp01((normalizedPosition - left.position) / span);
-        if (left.interpolation == WaterScenarioInterpolation::Smooth) {
+        // Node keys blend whole multi-channel states, so the spline modes
+        // approximate as the eased blend; a per-channel spline is not
+        // applicable here.
+        if (left.interpolation == WaterScenarioInterpolation::Smooth ||
+            left.interpolation == WaterScenarioInterpolation::SmoothVelocity ||
+            left.interpolation ==
+                WaterScenarioInterpolation::CentripetalCatmullRom) {
             amount = amount * amount * (3.0F - 2.0F * amount);
         }
         return LerpSeepageNodeAnimationState(left.state, right.state, amount);
@@ -7000,6 +7013,312 @@ WaterTimingRun SanitizeWaterTimingRun(WaterTimingRun run) {
     return run;
 }
 
+namespace {
+
+// Spline segment evaluation shared by the legacy v1 timing runs and the v2
+// keyed setting tracks. Keys arrive as position-ordered pointers; valueAt
+// bridges the differing value fields (WaterTimingKey::level versus
+// WaterSettingKey::value). The math mirrors the TimingColourise scalar key
+// track evaluator so both editors animate identically.
+constexpr float kWaterKeySplineTolerance = 1.0e-4F;
+
+template <typename Key, typename ValueAt>
+float EvaluateCentripetalCatmullRomKeySegment(
+    const std::vector<const Key*>& ordered,
+    std::size_t leftIndex,
+    float normalizedPosition,
+    float amount,
+    ValueAt valueAt) {
+    struct SplinePoint {
+        double x = 0.0;
+        double y = 0.0;
+    };
+    const Key& left = *ordered[leftIndex];
+    const Key& right = *ordered[leftIndex + 1U];
+    // Values are normalized by the whole track's range so chord lengths
+    // weight position and value comparably regardless of the value scale.
+    double valueMinimum = std::numeric_limits<double>::max();
+    double valueMaximum = std::numeric_limits<double>::lowest();
+    for (const Key* key : ordered) {
+        const double value = static_cast<double>(valueAt(*key));
+        valueMinimum = std::min(valueMinimum, value);
+        valueMaximum = std::max(valueMaximum, value);
+    }
+    const double valueSpan = valueMaximum - valueMinimum;
+    if (!std::isfinite(valueSpan) ||
+        valueSpan <= std::numeric_limits<double>::epsilon()) {
+        return valueAt(left);
+    }
+    const auto pointForKey = [&](const Key& key) {
+        return SplinePoint{
+            .x = static_cast<double>(key.position),
+            .y = (static_cast<double>(valueAt(key)) - valueMinimum) /
+                 valueSpan,
+        };
+    };
+    const SplinePoint point1 = pointForKey(left);
+    const SplinePoint point2 = pointForKey(right);
+    const SplinePoint point0 =
+        leftIndex > 0U
+            ? pointForKey(*ordered[leftIndex - 1U])
+            : SplinePoint{
+                  .x = 2.0 * point1.x - point2.x,
+                  .y = 2.0 * point1.y - point2.y,
+              };
+    const SplinePoint point3 =
+        leftIndex + 2U < ordered.size()
+            ? pointForKey(*ordered[leftIndex + 2U])
+            : SplinePoint{
+                  .x = 2.0 * point2.x - point1.x,
+                  .y = 2.0 * point2.y - point1.y,
+              };
+    const auto nextKnot = [](double knot,
+                             const SplinePoint& firstPoint,
+                             const SplinePoint& secondPoint) {
+        // The Euclidean chord length is raised to alpha = 0.5.
+        // A small floor keeps coincident control points evaluable.
+        const double increment = std::max(
+            1.0e-7,
+            std::sqrt(std::hypot(
+                secondPoint.x - firstPoint.x,
+                secondPoint.y - firstPoint.y)));
+        return knot + increment;
+    };
+    const double knot0 = 0.0;
+    const double knot1 = nextKnot(knot0, point0, point1);
+    const double knot2 = nextKnot(knot1, point1, point2);
+    const double knot3 = nextKnot(knot2, point2, point3);
+    const auto mixPoint = [](const SplinePoint& firstPoint,
+                             const SplinePoint& secondPoint,
+                             double firstWeight,
+                             double secondWeight,
+                             double denominator) {
+        denominator = std::max(denominator, 1.0e-12);
+        return SplinePoint{
+            .x = (firstWeight * firstPoint.x +
+                  secondWeight * secondPoint.x) /
+                 denominator,
+            .y = (firstWeight * firstPoint.y +
+                  secondWeight * secondPoint.y) /
+                 denominator,
+        };
+    };
+    const auto evaluatePoint = [&](double knot) {
+        const auto a1 = mixPoint(
+            point0,
+            point1,
+            knot1 - knot,
+            knot - knot0,
+            knot1 - knot0);
+        const auto a2 = mixPoint(
+            point1,
+            point2,
+            knot2 - knot,
+            knot - knot1,
+            knot2 - knot1);
+        const auto a3 = mixPoint(
+            point2,
+            point3,
+            knot3 - knot,
+            knot - knot2,
+            knot3 - knot2);
+        const auto b1 = mixPoint(
+            a1,
+            a2,
+            knot2 - knot,
+            knot - knot0,
+            knot2 - knot0);
+        const auto b2 = mixPoint(
+            a2,
+            a3,
+            knot3 - knot,
+            knot - knot1,
+            knot3 - knot1);
+        return mixPoint(
+            b1,
+            b2,
+            knot2 - knot,
+            knot - knot1,
+            knot2 - knot1);
+    };
+
+    // The centripetal spline is a 2D curve in animation-position/value
+    // space. Invert its x coordinate so evaluation remains keyed to the
+    // animation timeline and dy/dx stays continuous at shared nodes.
+    const double targetX = static_cast<double>(normalizedPosition);
+    constexpr int kBracketSamples = 32;
+    double bracketLow = knot1;
+    double bracketHigh = knot2;
+    bool bracketed = false;
+    double previousKnot = knot1;
+    double previousX = evaluatePoint(previousKnot).x;
+    for (int sample = 1; sample <= kBracketSamples; ++sample) {
+        const double candidateKnot = std::lerp(
+            knot1,
+            knot2,
+            static_cast<double>(sample) /
+                static_cast<double>(kBracketSamples));
+        const double candidateX = evaluatePoint(candidateKnot).x;
+        if ((previousX - targetX) * (candidateX - targetX) <= 0.0) {
+            bracketLow = previousKnot;
+            bracketHigh = candidateKnot;
+            bracketed = true;
+            break;
+        }
+        previousKnot = candidateKnot;
+        previousX = candidateX;
+    }
+    double evaluatedKnot = std::lerp(knot1, knot2, static_cast<double>(amount));
+    if (bracketed) {
+        double lowX = evaluatePoint(bracketLow).x;
+        for (int iteration = 0; iteration < 36; ++iteration) {
+            const double middle = std::midpoint(bracketLow, bracketHigh);
+            const double middleX = evaluatePoint(middle).x;
+            if ((lowX - targetX) * (middleX - targetX) <= 0.0) {
+                bracketHigh = middle;
+            } else {
+                bracketLow = middle;
+                lowX = middleX;
+            }
+        }
+        evaluatedKnot = std::midpoint(bracketLow, bracketHigh);
+    }
+    const double evaluated =
+        valueMinimum + evaluatePoint(evaluatedKnot).y * valueSpan;
+    const float result = static_cast<float>(evaluated);
+    return std::isfinite(result)
+               ? result
+               : std::lerp(valueAt(left), valueAt(right), amount);
+}
+
+template <typename Key, typename ValueAt>
+float EvaluateSmoothVelocityKeySegment(
+    const std::vector<const Key*>& ordered,
+    std::size_t leftIndex,
+    float amount,
+    ValueAt valueAt) {
+    const std::size_t keyCount = ordered.size();
+    const Key& left = *ordered[leftIndex];
+    const Key& right = *ordered[leftIndex + 1U];
+    const auto keyAt = [&](std::size_t index) -> const Key& {
+        return *ordered[index];
+    };
+    const auto intervalDuration = [&](std::size_t index) {
+        return static_cast<double>(keyAt(index + 1U).position) -
+               static_cast<double>(keyAt(index).position);
+    };
+    const auto intervalVelocity = [&](std::size_t index) {
+        const double duration = intervalDuration(index);
+        return duration > static_cast<double>(kWaterKeySplineTolerance)
+                   ? (static_cast<double>(valueAt(keyAt(index + 1U))) -
+                      static_cast<double>(valueAt(keyAt(index)))) /
+                         duration
+                   : 0.0;
+    };
+    const auto continuesInSameDirection =
+        [](double leftVelocity, double rightVelocity) {
+            return leftVelocity != 0.0 && rightVelocity != 0.0 &&
+                   std::isfinite(leftVelocity) &&
+                   std::isfinite(rightVelocity) &&
+                   std::signbit(leftVelocity) ==
+                       std::signbit(rightVelocity);
+        };
+    const auto endpointVelocity =
+        [&](double adjacentDuration,
+            double nextDuration,
+            double adjacentVelocity,
+            double nextVelocity) {
+            const double denominator = adjacentDuration + nextDuration;
+            if (denominator <= 0.0 || !std::isfinite(denominator)) {
+                return adjacentVelocity;
+            }
+            double velocity =
+                ((2.0 * adjacentDuration + nextDuration) *
+                     adjacentVelocity -
+                 adjacentDuration * nextVelocity) /
+                denominator;
+            if (!continuesInSameDirection(velocity, adjacentVelocity)) {
+                return 0.0;
+            }
+            if (!continuesInSameDirection(
+                    adjacentVelocity,
+                    nextVelocity) &&
+                std::abs(velocity) > 3.0 * std::abs(adjacentVelocity)) {
+                velocity = 3.0 * adjacentVelocity;
+            }
+            return velocity;
+        };
+    const auto tangentAt = [&](std::size_t index) {
+        if (keyCount == 2U) {
+            return intervalVelocity(0U);
+        }
+        if (index == 0U) {
+            if (keyAt(0U).interpolation !=
+                WaterScenarioInterpolation::SmoothVelocity) {
+                return 0.0;
+            }
+            return endpointVelocity(
+                intervalDuration(0U),
+                intervalDuration(1U),
+                intervalVelocity(0U),
+                intervalVelocity(1U));
+        }
+        if (index + 1U == keyCount) {
+            if (keyAt(keyCount - 2U).interpolation !=
+                WaterScenarioInterpolation::SmoothVelocity) {
+                return 0.0;
+            }
+            return endpointVelocity(
+                intervalDuration(keyCount - 2U),
+                intervalDuration(keyCount - 3U),
+                intervalVelocity(keyCount - 2U),
+                intervalVelocity(keyCount - 3U));
+        }
+        if (keyAt(index - 1U).interpolation !=
+                WaterScenarioInterpolation::SmoothVelocity ||
+            keyAt(index).interpolation !=
+                WaterScenarioInterpolation::SmoothVelocity) {
+            // Changing interpolation styles is an authored velocity break.
+            return 0.0;
+        }
+        const double previousVelocity = intervalVelocity(index - 1U);
+        const double nextVelocity = intervalVelocity(index);
+        if (!continuesInSameDirection(previousVelocity, nextVelocity)) {
+            // Local extrema and flat holds deliberately come to rest.
+            return 0.0;
+        }
+        const double previousDuration = intervalDuration(index - 1U);
+        const double nextDuration = intervalDuration(index);
+        const double previousWeight =
+            2.0 * nextDuration + previousDuration;
+        const double nextWeight = nextDuration + 2.0 * previousDuration;
+        return (previousWeight + nextWeight) /
+               (previousWeight / previousVelocity +
+                nextWeight / nextVelocity);
+    };
+
+    const double segmentDuration = intervalDuration(leftIndex);
+    const double leftTangent = tangentAt(leftIndex);
+    const double rightTangent = tangentAt(leftIndex + 1U);
+    const double amountValue = static_cast<double>(Clamp01(amount));
+    const double amountSquared = amountValue * amountValue;
+    const double amountCubed = amountSquared * amountValue;
+    const double leftValue = static_cast<double>(valueAt(left));
+    const double rightValue = static_cast<double>(valueAt(right));
+    const double evaluated =
+        (2.0 * amountCubed - 3.0 * amountSquared + 1.0) * leftValue +
+        (amountCubed - 2.0 * amountSquared + amountValue) *
+            segmentDuration * leftTangent +
+        (-2.0 * amountCubed + 3.0 * amountSquared) * rightValue +
+        (amountCubed - amountSquared) * segmentDuration * rightTangent;
+    const float result = static_cast<float>(evaluated);
+    return std::isfinite(result)
+               ? result
+               : std::lerp(valueAt(left), valueAt(right), amount);
+}
+
+}  // namespace
+
 float EvaluateWaterTimingRun(
     const WaterTimingRun& run,
     float normalizedPosition,
@@ -7042,6 +7361,23 @@ float EvaluateWaterTimingRun(
         }
         const float span = std::max(1.0e-6F, right.position - left.position);
         float amount = Clamp01((normalizedPosition - left.position) / span);
+        // Splines may overshoot the keyed levels; run levels stay 0..1.
+        if (left.interpolation == WaterScenarioInterpolation::SmoothVelocity) {
+            return Clamp01(EvaluateSmoothVelocityKeySegment(
+                ordered,
+                index,
+                amount,
+                keyLevel));
+        }
+        if (left.interpolation ==
+            WaterScenarioInterpolation::CentripetalCatmullRom) {
+            return Clamp01(EvaluateCentripetalCatmullRomKeySegment(
+                ordered,
+                index,
+                normalizedPosition,
+                amount,
+                keyLevel));
+        }
         if (left.interpolation == WaterScenarioInterpolation::Smooth) {
             amount = amount * amount * (3.0F - 2.0F * amount);
         }
@@ -7211,15 +7547,36 @@ std::vector<WaterScenarioKey> CompileWaterTimingScenarioKeys(
                 WaterTimingLevelFromScenarioState(run.feature, baseState);
             const float leftLevel = EvaluateWaterTimingRun(run, position, fallback);
             const float rightLevel = EvaluateWaterTimingRun(run, nextPosition, fallback);
-            if (std::abs(leftLevel - rightLevel) <= kLevelTolerance) {
+            const auto* leftKey = runKeyAt(run, position);
+            const bool leftIsSpline =
+                leftKey != nullptr &&
+                (leftKey->interpolation ==
+                     WaterScenarioInterpolation::SmoothVelocity ||
+                 leftKey->interpolation ==
+                     WaterScenarioInterpolation::CentripetalCatmullRom);
+            bool changes =
+                std::abs(leftLevel - rightLevel) > kLevelTolerance;
+            if (!changes && leftIsSpline) {
+                // Neighbour-aware splines can bend inside a segment whose
+                // endpoints are equal; probe the midpoint before compiling
+                // the segment to a flat Hold.
+                const float midLevel = EvaluateWaterTimingRun(
+                    run,
+                    std::midpoint(position, nextPosition),
+                    fallback);
+                changes = std::abs(midLevel - leftLevel) > kLevelTolerance;
+            }
+            if (!changes) {
                 continue;
             }
             anyChange = true;
             // Exact only when this run has its own keys at both endpoints, so
             // the compiled segment coincides with one authored run segment.
-            const auto* leftKey = runKeyAt(run, position);
+            // Spline modes never pass through exactly: the run evaluator is
+            // neighbour-aware while a compiled scenario segment eases in
+            // isolation, so they take the subdivision path instead.
             const auto* rightKey = runKeyAt(run, nextPosition);
-            if (leftKey == nullptr || rightKey == nullptr) {
+            if (leftKey == nullptr || rightKey == nullptr || leftIsSpline) {
                 exactSegment = false;
                 continue;
             }
@@ -7655,6 +8012,23 @@ std::optional<float> EvaluateWaterKeyedSettingTrack(
             std::max(1.0e-6F, right.position - left.position);
         float amount =
             Clamp01((normalizedPosition - left.position) / span);
+        if (left.interpolation ==
+            WaterScenarioInterpolation::SmoothVelocity) {
+            return EvaluateSmoothVelocityKeySegment(
+                ordered,
+                index,
+                amount,
+                keyValue);
+        }
+        if (left.interpolation ==
+            WaterScenarioInterpolation::CentripetalCatmullRom) {
+            return EvaluateCentripetalCatmullRomKeySegment(
+                ordered,
+                index,
+                normalizedPosition,
+                amount,
+                keyValue);
+        }
         if (left.interpolation == WaterScenarioInterpolation::Smooth) {
             amount = amount * amount * (3.0F - 2.0F * amount);
         }

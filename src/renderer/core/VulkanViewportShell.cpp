@@ -1923,6 +1923,13 @@ void VulkanViewportShell::BeginUiFrame() {
     if (ImGui::GetPlatformIO().Monitors.empty()) {
         ImGui::GetIO().ConfigFlags &= ~ImGuiConfigFlags_ViewportsEnable;
     }
+    // ImGui clears every mouse button when any of its windows reports OS
+    // focus loss. macOS system screenshots and multi-viewport focus churn do
+    // exactly that mid-drag, releasing slider and window drags the user is
+    // still physically holding — Cocoa keeps delivering the eventual mouse
+    // release to the originating window, so ignoring focus loss while a
+    // button is held is safe and drops no release event.
+    ImGui::GetIO().ConfigDebugIgnoreFocusLoss = ImGui::IsAnyMouseDown();
     ImGui::NewFrame();
     uiFrameBegun_ = true;
 }
@@ -2029,6 +2036,9 @@ void VulkanViewportShell::DrawFrame() {
     if (acquireResult == VK_ERROR_OUT_OF_DATE_KHR) {
         UpdateImGuiPlatformWindowsIfNeeded();
         RecreateSwapchain();
+        // Exclude the aborted frame plus the swapchain rebuild from the next
+        // cadence sample so the always-on FPS readout is not distorted.
+        lastFrameCadenceTimestamp_ = std::chrono::steady_clock::now();
         return;
     }
     if (acquireResult != VK_SUCCESS && acquireResult != VK_SUBOPTIMAL_KHR) {
@@ -2145,6 +2155,8 @@ void VulkanViewportShell::DrawFrame() {
         framebufferResized_ = false;
         UpdateImGuiPlatformWindowsIfNeeded();
         RecreateSwapchain();
+        // Exclude the swapchain rebuild from the next cadence sample.
+        lastFrameCadenceTimestamp_ = std::chrono::steady_clock::now();
         return;
     }
 
@@ -2161,11 +2173,9 @@ void VulkanViewportShell::DrawFrame() {
     const auto frameEnd = collectDiagnostics ? std::chrono::steady_clock::now()
                                              : std::chrono::steady_clock::time_point{};
     if (collectDiagnostics) {
-        constexpr double kFrameAverageWindowMs = 500.0;
         diagnostics_.framesInFlight = static_cast<std::uint32_t>(kFramesInFlight);
         diagnostics_.swapchainImageCount = static_cast<std::uint32_t>(swapchainImages_.size());
         diagnostics_.currentFrameIndex = static_cast<std::uint32_t>(currentFrameIndex_);
-        diagnostics_.frameAverageWindowSeconds = kFrameAverageWindowMs / 1000.0;
         diagnostics_.frameUiRenderMs = MillisecondsBetween(frameStart, uiEnd);
         diagnostics_.frameFenceWaitMs =
             MillisecondsBetween(uiEnd, fenceWaitEnd);
@@ -2187,12 +2197,8 @@ void VulkanViewportShell::DrawFrame() {
         diagnostics_.framePresentMs = MillisecondsBetween(submitEnd, presentEnd);
         diagnostics_.framePlatformWindowsMs = MillisecondsBetween(presentEnd, frameEnd);
         diagnostics_.frameRenderMs = MillisecondsBetween(frameStart, frameEnd);
-        diagnostics_.frameFps =
-            diagnostics_.frameRenderMs > 0.0 ? 1000.0 / diagnostics_.frameRenderMs : 0.0;
         UpdateCpuTimingAverages();
         if (!diagnosticsTimingInitialized_) {
-            diagnostics_.averageFrameRenderMs = diagnostics_.frameRenderMs;
-            diagnostics_.averageFrameFps = diagnostics_.frameFps;
             diagnostics_.minFrameRenderMs = diagnostics_.frameRenderMs;
             diagnostics_.maxFrameRenderMs = diagnostics_.frameRenderMs;
             diagnosticsTimingInitialized_ = true;
@@ -2202,19 +2208,36 @@ void VulkanViewportShell::DrawFrame() {
             diagnostics_.maxFrameRenderMs =
                 std::max(diagnostics_.maxFrameRenderMs, diagnostics_.frameRenderMs);
         }
-        diagnosticsFpsWindowMs_ += diagnostics_.frameRenderMs;
+    }
+    // Frame cadence is the wall-clock time between successive DrawFrame
+    // calls and is always measured: the Controls-window FPS readout must not
+    // depend on the Debug window enabling full diagnostics collection, and
+    // cadence — unlike frameRenderMs — includes the app-side work done
+    // between frames, so it reflects the frame rate the user actually sees.
+    const auto cadenceEnd = std::chrono::steady_clock::now();
+    if (frameCadenceInitialized_) {
+        constexpr double kFrameAverageWindowMs = 500.0;
+        const double wallMs =
+            MillisecondsBetween(lastFrameCadenceTimestamp_, cadenceEnd);
+        diagnostics_.frameAverageWindowSeconds =
+            kFrameAverageWindowMs / 1000.0;
+        diagnostics_.frameFps = wallMs > 0.0 ? 1000.0 / wallMs : 0.0;
+        diagnosticsFpsWindowMs_ += wallMs;
         ++diagnosticsFpsWindowFrames_;
         if (diagnosticsFpsWindowMs_ >= kFrameAverageWindowMs) {
             diagnostics_.averageFrameRenderMs =
-                diagnosticsFpsWindowMs_ / static_cast<double>(diagnosticsFpsWindowFrames_);
+                diagnosticsFpsWindowMs_ /
+                static_cast<double>(diagnosticsFpsWindowFrames_);
             diagnostics_.averageFrameFps =
-                diagnosticsFpsWindowMs_ > 0.0
-                    ? (1000.0 * static_cast<double>(diagnosticsFpsWindowFrames_)) / diagnosticsFpsWindowMs_
-                    : 0.0;
+                (1000.0 *
+                 static_cast<double>(diagnosticsFpsWindowFrames_)) /
+                diagnosticsFpsWindowMs_;
             diagnosticsFpsWindowMs_ = 0.0;
             diagnosticsFpsWindowFrames_ = 0;
         }
     }
+    frameCadenceInitialized_ = true;
+    lastFrameCadenceTimestamp_ = cadenceEnd;
     currentFrameIndex_ = (currentFrameIndex_ + 1U) % kFramesInFlight;
 }
 
@@ -2447,15 +2470,12 @@ void VulkanViewportShell::SetDiagnosticsEnabled(bool enabled) {
     diagnosticsEnabled_ = enabled;
     if (enabled) {
         diagnosticsTimingInitialized_ = false;
-        diagnosticsFpsWindowMs_ = 0.0;
-        diagnosticsFpsWindowFrames_ = 0;
+        // The FPS/cadence fields are always-on and deliberately survive this
+        // reset — opening the Debug window must not blank the persistent
+        // frame-rate readout.
         diagnostics_.frameRenderMs = 0.0;
-        diagnostics_.averageFrameRenderMs = 0.0;
         diagnostics_.minFrameRenderMs = 0.0;
         diagnostics_.maxFrameRenderMs = 0.0;
-        diagnostics_.frameFps = 0.0;
-        diagnostics_.averageFrameFps = 0.0;
-        diagnostics_.frameAverageWindowSeconds = 0.5;
         diagnostics_.frameUiRenderMs = 0.0;
         diagnostics_.averageFrameUiRenderMs = 0.0;
         diagnostics_.frameFenceWaitMs = 0.0;
