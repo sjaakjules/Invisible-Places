@@ -7791,6 +7791,38 @@ constexpr std::array<WaterKeyableSettingInfo, 2> kWaterFlowSourceSettings{{
      .defaultValue = 1.0F},
 }};
 
+// Manual paths have authored geometry, so their responsive animation surface
+// is deliberately narrower than the lane/trail generation settings. These
+// five values are evaluated into point style/uniform state each frame and do
+// not resize buffers, reroute lanes, or regenerate trail samples.
+constexpr std::array<WaterKeyableSettingInfo, 5> kWaterFlowPathSettings{{
+    {.id = "strength",
+     .label = "Maximum Flow Strength",
+     .minimum = 0.0F,
+     .maximum = 2.0F,
+     .defaultValue = 1.0F},
+    {.id = "rain_response",
+     .label = "Rain Response",
+     .minimum = 0.0F,
+     .maximum = 2.0F,
+     .defaultValue = 1.0F},
+    {.id = "speed",
+     .label = "Speed",
+     .minimum = 0.001F,
+     .maximum = 10.0F,
+     .defaultValue = 0.45F},
+    {.id = "trail_width",
+     .label = "Trail Width",
+     .minimum = 0.0005F,
+     .maximum = 1.0F,
+     .defaultValue = 0.006F},
+    {.id = "trail_streak_length",
+     .label = "Streak Length",
+     .minimum = 0.001F,
+     .maximum = 5.0F,
+     .defaultValue = 0.045F},
+}};
+
 // Additional shoreline instances key a master level plus the visual response
 // scalars of the active algorithm bank. Keyed values replace the authored
 // bank scalar for the frame; shape and motion parameters stay authored.
@@ -7846,8 +7878,9 @@ std::span<const WaterKeyableSettingInfo> WaterKeyableSettings(
         case WaterKeyedFeatureKind::SeepageNode:
             return kWaterSeepageNodeSettings;
         case WaterKeyedFeatureKind::FlowSource:
-        case WaterKeyedFeatureKind::FlowPath:
             return kWaterFlowSourceSettings;
+        case WaterKeyedFeatureKind::FlowPath:
+            return kWaterFlowPathSettings;
         case WaterKeyedFeatureKind::ShorelineInstance:
             return kWaterShorelineInstanceSettings;
     }
@@ -7964,6 +7997,72 @@ WaterKeyedSettingTrack SanitizeWaterKeyedSettingTrack(
             return left.position < right.position;
         });
     return track;
+}
+
+std::string WaterKeyedSettingsProfileSavedName(
+    std::string_view baseProfileName,
+    std::string_view objectName) {
+    const auto trimmedBase = TrimSeepageName(baseProfileName);
+    const auto trimmedObject = TrimSeepageName(objectName);
+    const std::string base =
+        trimmedBase.empty() ? std::string{"Default"}
+                            : std::string{trimmedBase};
+    const std::string object =
+        trimmedObject.empty() ? std::string{"Path Source"}
+                              : std::string{trimmedObject};
+    return base + "_" + object;
+}
+
+std::string WaterKeyedSettingsProfileEditedName(
+    std::string_view baseProfileName,
+    std::string_view objectName) {
+    return WaterKeyedSettingsProfileSavedName(
+               baseProfileName,
+               objectName) +
+           "_edited";
+}
+
+WaterKeyedSettingsProfile SanitizeWaterKeyedSettingsProfile(
+    WaterKeyedSettingsProfile profile) {
+    const auto trimmedBase = TrimSeepageName(profile.baseProfileName);
+    profile.baseProfileName =
+        trimmedBase.empty() ? std::string{"Default"}
+                            : std::string{trimmedBase};
+    profile.ownerObjectName =
+        std::string{TrimSeepageName(profile.ownerObjectName)};
+    profile.sourceProfileName =
+        std::string{TrimSeepageName(profile.sourceProfileName)};
+    const auto trimmedName = TrimSeepageName(profile.name);
+    profile.name =
+        trimmedName.empty()
+            ? (profile.edited
+                   ? WaterKeyedSettingsProfileEditedName(
+                         profile.baseProfileName,
+                         profile.ownerObjectName)
+                   : WaterKeyedSettingsProfileSavedName(
+                         profile.baseProfileName,
+                         profile.ownerObjectName))
+            : std::string{trimmedName};
+
+    std::vector<WaterKeyedSettingTrack> kept;
+    kept.reserve(profile.settings.size());
+    for (auto& setting : profile.settings) {
+        setting.settingId =
+            std::string{TrimSeepageName(setting.settingId)};
+        if (setting.settingId.empty() ||
+            std::any_of(
+                kept.begin(),
+                kept.end(),
+                [&](const WaterKeyedSettingTrack& existing) {
+                    return existing.settingId == setting.settingId;
+                })) {
+            continue;
+        }
+        kept.push_back(
+            SanitizeWaterKeyedSettingTrack(std::move(setting)));
+    }
+    profile.settings = std::move(kept);
+    return profile;
 }
 
 WaterFeatureTimingRun SanitizeWaterFeatureTimingRun(

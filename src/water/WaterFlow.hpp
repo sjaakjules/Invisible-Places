@@ -477,6 +477,22 @@ struct WaterKeyedSettingTrack {
     std::vector<WaterSettingKey> keys;
 };
 
+// Project-owned reusable key tracks. Saved profiles are immutable templates;
+// editing an applied profile creates an object-owned `_edited` shadow whose
+// sourceProfileName points back to the saved template for discard/restore.
+// Keys stay normalized to the linked animation (0..1), so a profile can be
+// applied to another Flow Path Source without depending on frame count.
+struct WaterKeyedSettingsProfile {
+    std::string name;
+    std::string baseProfileName = "Default";
+    std::string ownerObjectName;
+    std::string sourceProfileName;
+    std::uint32_t ownerObjectId = 0U;
+    WaterKeyedFeatureKind featureKind = WaterKeyedFeatureKind::FlowPath;
+    bool edited = false;
+    std::vector<WaterKeyedSettingTrack> settings;
+};
+
 struct WaterFeatureTimeline {
     WaterKeyedFeatureId feature{};
     std::vector<WaterKeyedSettingTrack> settings;
@@ -519,6 +535,14 @@ ParseWaterKeyedFeatureKindName(std::string_view name);
 
 [[nodiscard]] WaterKeyedSettingTrack SanitizeWaterKeyedSettingTrack(
     WaterKeyedSettingTrack track);
+[[nodiscard]] WaterKeyedSettingsProfile SanitizeWaterKeyedSettingsProfile(
+    WaterKeyedSettingsProfile profile);
+[[nodiscard]] std::string WaterKeyedSettingsProfileSavedName(
+    std::string_view baseProfileName,
+    std::string_view objectName);
+[[nodiscard]] std::string WaterKeyedSettingsProfileEditedName(
+    std::string_view baseProfileName,
+    std::string_view objectName);
 [[nodiscard]] WaterFeatureTimingRun SanitizeWaterFeatureTimingRun(
     WaterFeatureTimingRun run);
 // Moves an existing feature timeline (including dormant tracks and keys) to
@@ -2189,6 +2213,10 @@ struct WaterManualFlowPathSource {
     // New sources opt in. Project/source schema migration disables this for
     // legacy manual paths until the user explicitly enables it.
     bool useSurfaceGuide = true;
+    // Empty means the source owns only its live timeline tracks. A saved name
+    // applies an immutable project profile; an `_edited` name references the
+    // object-owned working shadow created on the first keyed edit.
+    std::string keyedSettingsProfileName;
     float maximumFlowStrength = 1.0F;
     float rainResponse = 0.0F;
     bool showTrail = true;

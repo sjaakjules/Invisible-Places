@@ -11289,6 +11289,48 @@ void VulkanViewportShell::CreateImGuiResources() {
     io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
     io.ConfigViewportsNoDecoration = false;
 
+    // Keep a real italic face in the shared atlas for regenerative Water
+    // setting labels. Loading is conditional so packaged/headless builds
+    // retain the ordinary default font when a platform font is unavailable.
+    // Application code locates this face by its stable debug name.
+    io.FontDefault = io.Fonts->AddFontDefault();
+    constexpr std::string_view kWaterItalicFontName =
+        "Water Settings Italic";
+#if defined(__APPLE__)
+    constexpr std::array<std::string_view, 2> kItalicFontCandidates{
+        "/System/Library/Fonts/Supplemental/Arial Italic.ttf",
+        "/System/Library/Fonts/Supplemental/Helvetica Oblique.ttf",
+    };
+#elif defined(_WIN32)
+    constexpr std::array<std::string_view, 2> kItalicFontCandidates{
+        "C:/Windows/Fonts/segoeuii.ttf",
+        "C:/Windows/Fonts/ariali.ttf",
+    };
+#else
+    constexpr std::array<std::string_view, 2> kItalicFontCandidates{
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Italic.ttf",
+    };
+#endif
+    for (const auto candidate : kItalicFontCandidates) {
+        std::error_code fontError;
+        if (!std::filesystem::is_regular_file(candidate, fontError)) {
+            continue;
+        }
+        ImFontConfig italicConfig;
+        std::strncpy(
+            italicConfig.Name,
+            kWaterItalicFontName.data(),
+            sizeof(italicConfig.Name) - 1U);
+        italicConfig.Name[sizeof(italicConfig.Name) - 1U] = '\0';
+        if (io.Fonts->AddFontFromFileTTF(
+                std::string{candidate}.c_str(),
+                13.0F,
+                &italicConfig) != nullptr) {
+            break;
+        }
+    }
+
     ImGui_ImplGlfw_InitForVulkan(window_, true);
 
     ImGui_ImplVulkan_InitInfo initInfo{};

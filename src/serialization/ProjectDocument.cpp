@@ -3103,6 +3103,10 @@ json SerializeWaterManualFlowPath(const WaterManualFlowPathSource& source) {
         {"control_points", json::array()},
         {"control_point_lane_widths", json::array()},
     };
+    if (!source.keyedSettingsProfileName.empty()) {
+        sourceJson["keyed_settings_profile"] =
+            source.keyedSettingsProfileName;
+    }
     for (std::size_t index = 0U; index < source.controlPoints.size(); ++index) {
         const auto& point = source.controlPoints[index];
         sourceJson["control_points"].push_back(std::array<float, 3>{point.x, point.y, point.z});
@@ -3129,6 +3133,9 @@ WaterManualFlowPathSource ParseWaterManualFlowPath(
     source.laneProfileLocked = sourceJson.value("lane_profile_locked", source.laneProfileLocked);
     source.trailProfileLocked = sourceJson.value("trail_profile_locked", source.trailProfileLocked);
     source.useSurfaceGuide = sourceJson.value("use_surface_guide", defaultUseSurfaceGuide);
+    source.keyedSettingsProfileName = sourceJson.value(
+        "keyed_settings_profile",
+        source.keyedSettingsProfileName);
     source.maximumFlowStrength = std::clamp(
         sourceJson.value("maximum_flow_strength", source.maximumFlowStrength),
         0.0F,
@@ -3860,29 +3867,119 @@ invisible_places::water::WaterTimingKey ParseWaterTimingKey(const json& keyJson)
 }
 
 
+json SerializeWaterKeyedSettingTrack(
+    const invisible_places::water::WaterKeyedSettingTrack& setting) {
+    json keysJson = json::array();
+    for (const auto& key : setting.keys) {
+        keysJson.push_back({
+            {"position", key.position},
+            {"value", key.value},
+            {"interpolation",
+             WaterScenarioInterpolationName(key.interpolation)},
+        });
+    }
+    return {
+        {"id", setting.settingId},
+        {"active", setting.active},
+        {"label", setting.label},
+        {"profile_group", setting.profileGroup},
+        {"profile_name", setting.profileName},
+        {"keys", std::move(keysJson)},
+    };
+}
+
+invisible_places::water::WaterKeyedSettingTrack
+ParseWaterKeyedSettingTrack(const json& settingJson) {
+    invisible_places::water::WaterKeyedSettingTrack track;
+    track.settingId = settingJson.value("id", std::string{});
+    track.active = settingJson.value("active", true);
+    track.label = settingJson.value("label", std::string{});
+    track.profileGroup = settingJson.value(
+        "profile_group",
+        std::string{});
+    track.profileName = settingJson.value(
+        "profile_name",
+        std::string{});
+    if (settingJson.contains("keys") &&
+        settingJson.at("keys").is_array()) {
+        for (const auto& keyJson : settingJson.at("keys")) {
+            invisible_places::water::WaterSettingKey key;
+            key.position = keyJson.value("position", 0.0F);
+            key.value = keyJson.value("value", 0.0F);
+            if (keyJson.contains("interpolation")) {
+                key.interpolation = ParseWaterScenarioInterpolation(
+                    keyJson.at("interpolation"));
+            }
+            track.keys.push_back(key);
+        }
+    }
+    return invisible_places::water::SanitizeWaterKeyedSettingTrack(
+        std::move(track));
+}
+
+json SerializeWaterKeyedSettingsProfile(
+    const invisible_places::water::WaterKeyedSettingsProfile& input) {
+    const auto profile = invisible_places::water::
+        SanitizeWaterKeyedSettingsProfile(input);
+    json settingsJson = json::array();
+    for (const auto& setting : profile.settings) {
+        settingsJson.push_back(
+            SerializeWaterKeyedSettingTrack(setting));
+    }
+    return {
+        {"name", profile.name},
+        {"base_profile_name", profile.baseProfileName},
+        {"owner_object_name", profile.ownerObjectName},
+        {"owner_object_id", profile.ownerObjectId},
+        {"source_profile_name", profile.sourceProfileName},
+        {"feature_kind",
+         std::string{invisible_places::water::WaterKeyedFeatureKindName(
+             profile.featureKind)}},
+        {"edited", profile.edited},
+        {"settings", std::move(settingsJson)},
+    };
+}
+
+invisible_places::water::WaterKeyedSettingsProfile
+ParseWaterKeyedSettingsProfile(const json& profileJson) {
+    invisible_places::water::WaterKeyedSettingsProfile profile;
+    profile.name = profileJson.value("name", std::string{});
+    profile.baseProfileName = profileJson.value(
+        "base_profile_name",
+        profile.baseProfileName);
+    profile.ownerObjectName = profileJson.value(
+        "owner_object_name",
+        std::string{});
+    profile.ownerObjectId = profileJson.value("owner_object_id", 0U);
+    profile.sourceProfileName = profileJson.value(
+        "source_profile_name",
+        std::string{});
+    profile.edited = profileJson.value("edited", false);
+    if (const auto kind = invisible_places::water::
+            ParseWaterKeyedFeatureKindName(
+                profileJson.value("feature_kind", std::string{"flow_path"}));
+        kind.has_value()) {
+        profile.featureKind = kind.value();
+    }
+    if (profileJson.contains("settings") &&
+        profileJson.at("settings").is_array()) {
+        for (const auto& settingJson : profileJson.at("settings")) {
+            profile.settings.push_back(
+                ParseWaterKeyedSettingTrack(settingJson));
+        }
+    }
+    return invisible_places::water::SanitizeWaterKeyedSettingsProfile(
+        std::move(profile));
+}
+
 json SerializeWaterFeatureTimingRun(
     const invisible_places::water::WaterFeatureTimingRun& run) {
     json featuresJson = json::array();
     for (const auto& timeline : run.features) {
         json settingsJson = json::array();
         for (const auto& setting : timeline.settings) {
-            json keysJson = json::array();
-            for (const auto& key : setting.keys) {
-                keysJson.push_back({
-                    {"position", key.position},
-                    {"value", key.value},
-                    {"interpolation",
-                     WaterScenarioInterpolationName(key.interpolation)},
-                });
-            }
-            settingsJson.push_back({
-                {"id", setting.settingId},
-                {"active", setting.active},
-                {"label", setting.label},
-                {"profile_group", setting.profileGroup},
-                {"profile_name", setting.profileName},
-                {"keys", std::move(keysJson)},
-            });
+            settingsJson.push_back(
+                SerializeWaterKeyedSettingTrack(setting));
         }
         featuresJson.push_back({
             {"kind",
@@ -3918,36 +4015,8 @@ invisible_places::water::WaterFeatureTimingRun ParseWaterFeatureTimingRun(
             if (featureJson.contains("settings") &&
                 featureJson.at("settings").is_array()) {
                 for (const auto& settingJson : featureJson.at("settings")) {
-                    invisible_places::water::WaterKeyedSettingTrack track;
-                    track.settingId =
-                        settingJson.value("id", std::string{});
-                    track.active =
-                        settingJson.value("active", true);
-                    track.label =
-                        settingJson.value("label", std::string{});
-                    track.profileGroup =
-                        settingJson.value(
-                            "profile_group",
-                            std::string{});
-                    track.profileName =
-                        settingJson.value(
-                            "profile_name",
-                            std::string{});
-                    if (settingJson.contains("keys") &&
-                        settingJson.at("keys").is_array()) {
-                        for (const auto& keyJson : settingJson.at("keys")) {
-                            invisible_places::water::WaterSettingKey key;
-                            key.position = keyJson.value("position", 0.0F);
-                            key.value = keyJson.value("value", 0.0F);
-                            if (keyJson.contains("interpolation")) {
-                                key.interpolation =
-                                    ParseWaterScenarioInterpolation(
-                                        keyJson.at("interpolation"));
-                            }
-                            track.keys.push_back(key);
-                        }
-                    }
-                    timeline.settings.push_back(std::move(track));
+                    timeline.settings.push_back(
+                        ParseWaterKeyedSettingTrack(settingJson));
                 }
             }
             run.features.push_back(std::move(timeline));
@@ -8750,6 +8819,7 @@ bool SaveProjectDocument(
         {"water_timing_runs", json::array()},
         {"water_timing_run_sequence", document.waterTimingRunSequence},
         {"water_feature_timing_runs", json::array()},
+        {"water_keyed_settings_profiles", json::array()},
         {"water_feature_timing_run_sequence",
          document.waterFeatureTimingRunSequence},
         {"timing_takes", json::array()},
@@ -8865,6 +8935,10 @@ bool SaveProjectDocument(
     for (const auto& entry : document.waterFeatureTimingRuns) {
         projectJson["water_feature_timing_runs"].push_back(
             SerializeWaterScenarioFeatureRuns(entry));
+    }
+    for (const auto& profile : document.waterKeyedSettingsProfiles) {
+        projectJson["water_keyed_settings_profiles"].push_back(
+            SerializeWaterKeyedSettingsProfile(profile));
     }
     for (const auto& take : document.timingTakes) {
         projectJson["timing_takes"].push_back(
@@ -9181,6 +9255,14 @@ std::optional<ProjectDocument> LoadProjectDocument(
              projectJson->at("water_feature_timing_runs")) {
             document.waterFeatureTimingRuns.push_back(
                 ParseWaterScenarioFeatureRuns(entryJson));
+        }
+    }
+    if (projectJson->contains("water_keyed_settings_profiles") &&
+        projectJson->at("water_keyed_settings_profiles").is_array()) {
+        for (const auto& profileJson :
+             projectJson->at("water_keyed_settings_profiles")) {
+            document.waterKeyedSettingsProfiles.push_back(
+                ParseWaterKeyedSettingsProfile(profileJson));
         }
     }
     document.waterFeatureTimingRunSequence = projectJson->value(
@@ -9670,6 +9752,7 @@ nlohmann::json WaterSourcesDocumentToJson(
         {"water_path_profiles", json::array()},
         {"water_lane_profiles", json::array()},
         {"water_trail_profiles", json::array()},
+        {"water_keyed_settings_profiles", json::array()},
         {"selected_water_path_profile", document.selectedPathProfileName},
         {"selected_water_lane_profile", document.selectedLaneProfileName},
         {"selected_water_trail_profile", document.selectedTrailProfileName},
@@ -9718,6 +9801,10 @@ nlohmann::json WaterSourcesDocumentToJson(
     }
     for (const auto& profile : document.trailProfiles) {
         sourcesJson["water_trail_profiles"].push_back(SerializeWaterTrailProfile(profile));
+    }
+    for (const auto& profile : document.keyedSettingsProfiles) {
+        sourcesJson["water_keyed_settings_profiles"].push_back(
+            SerializeWaterKeyedSettingsProfile(profile));
     }
     for (const auto& emitter : document.emitters) {
         sourcesJson["water_emitters"].push_back(SerializeWaterEmitter(emitter));
@@ -9902,6 +9989,14 @@ static WaterSourcesDocument ParseWaterSourcesDocumentJsonValue(
         sourcesJson->at("water_trail_profiles").is_array()) {
         for (const auto& profileJson : sourcesJson->at("water_trail_profiles")) {
             document.trailProfiles.push_back(ParseWaterTrailProfile(profileJson));
+        }
+    }
+    if (sourcesJson->contains("water_keyed_settings_profiles") &&
+        sourcesJson->at("water_keyed_settings_profiles").is_array()) {
+        for (const auto& profileJson :
+             sourcesJson->at("water_keyed_settings_profiles")) {
+            document.keyedSettingsProfiles.push_back(
+                ParseWaterKeyedSettingsProfile(profileJson));
         }
     }
     document.selectedPathProfileName =

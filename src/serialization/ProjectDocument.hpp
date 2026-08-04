@@ -229,6 +229,11 @@ struct ProjectDocument {
     // Timings v2: per-scenario feature runs with per-setting key tracks.
     std::vector<invisible_places::water::WaterScenarioFeatureRuns>
         waterFeatureTimingRuns;
+    // Reusable normalized key-track templates. These are independent of a
+    // Timing Take; applying one copies its tracks into the selected feature's
+    // run and edits fork to an object-owned shadow.
+    std::vector<invisible_places::water::WaterKeyedSettingsProfile>
+        waterKeyedSettingsProfiles;
     std::uint32_t waterFeatureTimingRunSequence = 1U;
     // Authored Timing and named takes are runtime timing containers. Legacy
     // waterScenarios and waterFeatureTimingRuns remain above for round-trip
@@ -331,6 +336,8 @@ struct WaterSourcesDocument {
     std::vector<WaterPathProfileDocument> pathProfiles;
     std::vector<WaterLaneProfileDocument> laneProfiles;
     std::vector<WaterTrailProfileDocument> trailProfiles;
+    std::vector<invisible_places::water::WaterKeyedSettingsProfile>
+        keyedSettingsProfiles;
     std::string selectedPathProfileName = "Default";
     std::string selectedLaneProfileName = "Default";
     std::string selectedTrailProfileName = "Default";

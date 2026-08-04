@@ -1009,6 +1009,29 @@ TEST_CASE("Authored water response settings are keyable and overlays stay transi
         invisible_places::water::WaterKeyableSettings(
             WaterKeyedFeatureKind::FlowGlobal)
             .empty());
+    const auto pointSourceSettings =
+        invisible_places::water::WaterKeyableSettings(
+            WaterKeyedFeatureKind::FlowSource);
+    CHECK(pointSourceSettings.size() == 2U);
+    CHECK(
+        FindWaterKeyableSetting(
+            WaterKeyedFeatureKind::FlowSource,
+            "speed") == nullptr);
+    const auto pathSourceSettings =
+        invisible_places::water::WaterKeyableSettings(
+            WaterKeyedFeatureKind::FlowPath);
+    CHECK(pathSourceSettings.size() == 5U);
+    for (const char* settingId :
+         {"strength",
+          "rain_response",
+          "speed",
+          "trail_width",
+          "trail_streak_length"}) {
+        REQUIRE(
+            FindWaterKeyableSetting(
+                WaterKeyedFeatureKind::FlowPath,
+                settingId) != nullptr);
+    }
 
     WaterFeatureTimingOverlay overlay;
     overlay.samples = {
@@ -1084,6 +1107,24 @@ TEST_CASE("Per-scenario feature timing runs round-trip through the project docum
     });
     entry.runs.push_back(run);
     document.waterFeatureTimingRuns.push_back(entry);
+    document.waterKeyedSettingsProfiles.push_back({
+        .name = "Calm Lanes_Creek Path",
+        .baseProfileName = "Calm Lanes",
+        .ownerObjectName = "Creek Path",
+        .ownerObjectId = 42U,
+        .featureKind = WaterKeyedFeatureKind::FlowPath,
+        .settings = {{
+            .settingId = "speed",
+            .active = true,
+            .label = "Speed",
+            .profileGroup = "flow_path",
+            .profileName = "Calm Lanes",
+            .keys = {
+                {.position = 0.0F, .value = 0.2F},
+                {.position = 1.0F, .value = 0.8F},
+            },
+        }},
+    });
     document.waterFeatureTimingRunSequence = 8U;
 
     TemporaryTimingFile file{"invisible_places_feature_timing_runs.json"};
@@ -1113,6 +1154,116 @@ TEST_CASE("Per-scenario feature timing runs round-trip through the project docum
           WaterScenarioInterpolation::Hold);
     CHECK(timeline.settings.front().keys[1].value == Approx(1.2F));
     CHECK(loaded->waterFeatureTimingRunSequence == 8U);
+    REQUIRE(loaded->waterKeyedSettingsProfiles.size() == 1U);
+    const auto& keyedProfile =
+        loaded->waterKeyedSettingsProfiles.front();
+    CHECK(keyedProfile.name == "Calm Lanes_Creek Path");
+    CHECK(keyedProfile.baseProfileName == "Calm Lanes");
+    CHECK(keyedProfile.ownerObjectName == "Creek Path");
+    CHECK(keyedProfile.ownerObjectId == 42U);
+    CHECK_FALSE(keyedProfile.edited);
+    REQUIRE(keyedProfile.settings.size() == 1U);
+    CHECK(keyedProfile.settings.front().settingId == "speed");
+    REQUIRE(keyedProfile.settings.front().keys.size() == 2U);
+    CHECK(keyedProfile.settings.front().keys.back().value == Approx(0.8F));
+}
+
+TEST_CASE("Flow Path keyed profile names and shadows are object-owned",
+          "[water][timing][keyed][profiles]") {
+    using Catch::Approx;
+    using invisible_places::water::SanitizeWaterKeyedSettingsProfile;
+    using invisible_places::water::WaterKeyedFeatureKind;
+    using invisible_places::water::WaterKeyedSettingsProfileEditedName;
+    using invisible_places::water::WaterKeyedSettingsProfileSavedName;
+
+    CHECK(
+        WaterKeyedSettingsProfileSavedName("  Calm Lanes  ", " Creek ") ==
+        "Calm Lanes_Creek");
+    CHECK(
+        WaterKeyedSettingsProfileEditedName("Calm Lanes", "Creek") ==
+        "Calm Lanes_Creek_edited");
+
+    auto profile = SanitizeWaterKeyedSettingsProfile({
+        .baseProfileName = "  Calm Lanes ",
+        .ownerObjectName = " Creek ",
+        .sourceProfileName = " Source_Path ",
+        .ownerObjectId = 8U,
+        .featureKind = WaterKeyedFeatureKind::FlowPath,
+        .edited = true,
+        .settings = {
+            {.settingId = " speed ",
+             .keys = {
+                 {.position = 1.3F, .value = 0.8F},
+                 {.position = -0.2F, .value = 0.2F},
+             }},
+            {.settingId = "speed", .keys = {{.position = 0.5F, .value = 4.0F}}},
+        },
+    });
+    CHECK(profile.name == "Calm Lanes_Creek_edited");
+    CHECK(profile.baseProfileName == "Calm Lanes");
+    CHECK(profile.ownerObjectName == "Creek");
+    CHECK(profile.sourceProfileName == "Source_Path");
+    REQUIRE(profile.settings.size() == 1U);
+    CHECK(profile.settings.front().settingId == "speed");
+    REQUIRE(profile.settings.front().keys.size() == 2U);
+    CHECK(profile.settings.front().keys.front().position == Approx(0.0F));
+    CHECK(profile.settings.front().keys.back().position == Approx(1.0F));
+}
+
+TEST_CASE("Flow Path keyed profiles round-trip with standalone Water sources",
+          "[water][timing][keyed][profiles][serialization]") {
+    using invisible_places::serialization::LoadWaterSourcesDocument;
+    using invisible_places::serialization::SaveWaterSourcesDocument;
+    using invisible_places::serialization::WaterSourcesDocument;
+    using invisible_places::water::WaterKeyedFeatureKind;
+
+    WaterSourcesDocument document;
+    document.manualFlowPaths.push_back({
+        .id = 17U,
+        .name = "Lower Creek",
+        .keyedSettingsProfileName =
+            "Calm Lanes_Lower Creek_edited",
+    });
+    document.keyedSettingsProfiles.push_back({
+        .name = "Calm Lanes_Lower Creek_edited",
+        .baseProfileName = "Calm Lanes",
+        .ownerObjectName = "Lower Creek",
+        .sourceProfileName = "Calm Lanes_Upper Creek",
+        .ownerObjectId = 17U,
+        .featureKind = WaterKeyedFeatureKind::FlowPath,
+        .edited = true,
+        .settings = {{
+            .settingId = "trail_width",
+            .active = true,
+            .label = "Trail Width",
+            .profileGroup = "flow_path",
+            .profileName = "Calm Lanes",
+            .keys = {{.position = 0.4F, .value = 0.012F}},
+        }},
+    });
+
+    TemporaryTimingFile file{
+        "invisible_places_flow_path_keyed_profiles.json"};
+    std::string errorMessage;
+    REQUIRE(SaveWaterSourcesDocument(
+        document,
+        file.path,
+        &errorMessage));
+    const auto loaded = LoadWaterSourcesDocument(
+        file.path,
+        &errorMessage);
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded->manualFlowPaths.size() == 1U);
+    CHECK(
+        loaded->manualFlowPaths.front().keyedSettingsProfileName ==
+        "Calm Lanes_Lower Creek_edited");
+    REQUIRE(loaded->keyedSettingsProfiles.size() == 1U);
+    const auto& profile = loaded->keyedSettingsProfiles.front();
+    CHECK(profile.edited);
+    CHECK(profile.sourceProfileName == "Calm Lanes_Upper Creek");
+    CHECK(profile.ownerObjectId == 17U);
+    REQUIRE(profile.settings.size() == 1U);
+    CHECK(profile.settings.front().settingId == "trail_width");
 }
 
 TEST_CASE("Schema 46 timing tracks migrate with active legacy defaults",

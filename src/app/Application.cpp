@@ -2037,6 +2037,10 @@ struct WaterWorkflowState {
     // Timings v2: per-scenario feature runs with per-setting key tracks.
     std::vector<invisible_places::water::WaterScenarioFeatureRuns>
         featureTimingRunsByScenario;
+    // Reusable Flow Path key-track templates. Saved entries are immutable;
+    // edits live in object-owned `_edited` shadows until saved or discarded.
+    std::vector<invisible_places::water::WaterKeyedSettingsProfile>
+        keyedSettingsProfiles;
     std::uint32_t nextFeatureTimingRunSequence = 1U;
     // Schema-49 authored timing. Legacy scenario runs above remain available
     // for round-tripping old projects, but preview/export read only these
@@ -3221,6 +3225,8 @@ struct WaterFlowSourceActivityParameters {
     float maximumFlowStrength = 1.0F;
     float rainResponse = 0.0F;
     bool showTrail = true;
+    invisible_places::water::WaterKeyedFeatureKind featureKind =
+        invisible_places::water::WaterKeyedFeatureKind::FlowSource;
 };
 
 std::optional<WaterFlowSourceActivityParameters> ResolveWaterFlowSourceActivityParameters(
@@ -3258,6 +3264,8 @@ std::optional<WaterFlowSourceActivityParameters> ResolveWaterFlowSourceActivityP
                 .maximumFlowStrength = emitterIt->maximumFlowStrength,
                 .rainResponse = emitterIt->rainResponse,
                 .showTrail = emitterIt->showTrail,
+                .featureKind = invisible_places::water::
+                    WaterKeyedFeatureKind::FlowSource,
             },
             invisible_places::water::WaterKeyedFeatureKind::FlowSource);
     }
@@ -3271,6 +3279,8 @@ std::optional<WaterFlowSourceActivityParameters> ResolveWaterFlowSourceActivityP
                 .maximumFlowStrength = manualIt->maximumFlowStrength,
                 .rainResponse = manualIt->rainResponse,
                 .showTrail = manualIt->showTrail,
+                .featureKind = invisible_places::water::
+                    WaterKeyedFeatureKind::FlowPath,
             },
             invisible_places::water::WaterKeyedFeatureKind::FlowPath);
     }
@@ -3313,6 +3323,66 @@ void ApplyWaterFlowSourceActivityToStyle(
         session.waterFlowSourceId,
         scenarioState,
         overlay);
+    const auto parameters = ResolveWaterFlowSourceActivityParameters(
+        water,
+        session.waterFlowSourceId,
+        nullptr);
+    if (overlay == nullptr || !parameters.has_value() ||
+        parameters->featureKind !=
+            invisible_places::water::WaterKeyedFeatureKind::FlowPath) {
+        return;
+    }
+
+    const invisible_places::water::WaterKeyedFeatureId feature{
+        .kind = invisible_places::water::WaterKeyedFeatureKind::FlowPath,
+        .objectId = session.waterFlowSourceId.value(),
+    };
+    if (const auto* speed = overlay->Find(feature, "speed");
+        speed != nullptr) {
+        const float bakedSpeed = std::max(
+            1.0e-5F,
+            session.waterFlowBakedSpeedMetersPerSecond);
+        style->waterFlowSpeedScale =
+            std::max(0.0F, *speed) / bakedSpeed;
+    }
+
+    const bool hasStyleGeometry =
+        style->waterTrailStyleGeometry &&
+        style->surfelDiameter.active &&
+        style->surfelDiameter.mode == ParameterSourceMode::Constant;
+    if (!hasStyleGeometry) {
+        return;
+    }
+    const float authoredWidth = std::max(
+        0.0005F,
+        style->surfelDiameter.constantValue[0]);
+    const float authoredStreak = std::max(
+        authoredWidth,
+        authoredWidth * std::max(1.0F, style->waterStreakAspect));
+    const auto* keyedWidth = overlay->Find(feature, "trail_width");
+    const auto* keyedStreak =
+        overlay->Find(feature, "trail_streak_length");
+    if (keyedWidth == nullptr && keyedStreak == nullptr) {
+        return;
+    }
+    const float width = std::clamp(
+        keyedWidth != nullptr ? *keyedWidth : authoredWidth,
+        0.0005F,
+        1.0F);
+    const float streak = std::max(
+        width,
+        std::clamp(
+            keyedStreak != nullptr ? *keyedStreak : authoredStreak,
+            0.001F,
+            5.0F));
+    invisible_places::style::SetScalarConstant(
+        &style->surfelDiameter,
+        width);
+    invisible_places::style::SetScalarConstant(
+        &style->pointSize,
+        width * 1000.0F);
+    style->waterStreakAspect =
+        std::clamp(streak / width, 1.0F, 32.0F);
 }
 
 // The renderer transports the first Water-owned Shoreline effect through a
@@ -14098,6 +14168,46 @@ void EnsureWaterProfiles(PreviewRuntimeState* runtimeState) {
         emitter.laneProfileName = NormalizeWaterProfileName(emitter.laneProfileName, kWaterProfileGlobalName);
         emitter.trailProfileName = NormalizeWaterProfileName(emitter.trailProfileName, kWaterProfileGlobalName);
     }
+    std::vector<invisible_places::water::WaterKeyedSettingsProfile>
+        keyedProfiles;
+    keyedProfiles.reserve(water.keyedSettingsProfiles.size());
+    for (auto profile : water.keyedSettingsProfiles) {
+        profile = invisible_places::water::
+            SanitizeWaterKeyedSettingsProfile(std::move(profile));
+        if (profile.featureKind !=
+                invisible_places::water::WaterKeyedFeatureKind::FlowPath ||
+            profile.name.empty() ||
+            std::any_of(
+                keyedProfiles.begin(),
+                keyedProfiles.end(),
+                [&](const auto& existing) {
+                    return existing.name == profile.name;
+                })) {
+            continue;
+        }
+        keyedProfiles.push_back(std::move(profile));
+    }
+    water.keyedSettingsProfiles = std::move(keyedProfiles);
+    for (auto& source : water.manualFlowPaths) {
+        source.laneProfileName = NormalizeWaterProfileName(
+            source.laneProfileName,
+            kWaterProfileGlobalName);
+        source.trailProfileName = NormalizeWaterProfileName(
+            source.trailProfileName,
+            kWaterProfileGlobalName);
+        source.keyedSettingsProfileName =
+            TrimText(source.keyedSettingsProfileName);
+        if (!source.keyedSettingsProfileName.empty() &&
+            std::none_of(
+                water.keyedSettingsProfiles.begin(),
+                water.keyedSettingsProfiles.end(),
+                [&](const auto& profile) {
+                    return profile.name ==
+                           source.keyedSettingsProfileName;
+                })) {
+            source.keyedSettingsProfileName.clear();
+        }
+    }
 }
 
 WaterPathProfileDocument MakeWaterPathProfileDocument(const SavedWaterPathProfileState& profile) {
@@ -14446,6 +14556,44 @@ bool ApplyWaterFlowSourceLiveSettings(
         runtimeState->previewRenderStateSignatureValid = false;
     }
     return updated;
+}
+
+void StoreManualFlowPathLaneProfileEdit(
+    WaterWorkflowState* water,
+    WaterManualFlowPathSource* source,
+    const WaterFlowTrailSettings& settings) {
+    if (water == nullptr || source == nullptr) {
+        return;
+    }
+    const auto baseName = WaterSourceSavedProfileName(
+        source->laneProfileName,
+        water->selectedLaneProfileName);
+    water->editedLaneProfileSettings = settings;
+    water->selectedLaneProfileName = EditedWaterProfileName(baseName);
+    water->laneProfileNameBuffer = BaseWaterProfileName(baseName);
+    // Moving a base value creates/updates the normal profile's `_edited`
+    // shadow. Keyed slider edits never call this path.
+    source->laneProfileLocked = false;
+}
+
+void StoreManualFlowPathTrailProfileEdit(
+    PreviewRuntimeState* runtimeState,
+    WaterManualFlowPathSource* source,
+    const SavedWaterTrailProfileState& profile) {
+    if (runtimeState == nullptr || source == nullptr) {
+        return;
+    }
+    auto& water = runtimeState->water;
+    const auto baseName = WaterSourceSavedProfileName(
+        source->trailProfileName,
+        water.selectedTrailProfileName);
+    water.editedTrailProfile = MakeWaterTrailProfile(
+        EditedWaterProfileName(baseName),
+        profile.geometry,
+        profile.style);
+    water.selectedTrailProfileName = EditedWaterProfileName(baseName);
+    water.trailProfileNameBuffer = BaseWaterProfileName(baseName);
+    source->trailProfileLocked = false;
 }
 
 WaterSourceSettings ActiveProfileDefaultWaterSourceSettings(const WaterWorkflowState& water) {
@@ -18196,6 +18344,8 @@ void SaveWaterSources(PreviewRuntimeState* runtimeState) {
     document.selectedTrailProfileName = NormalizeWaterProfileName(runtimeState->water.selectedTrailProfileName);
     document.tempPathProfileSettings = runtimeState->water.editedPathProfileSettings;
     document.tempLaneProfileSettings = runtimeState->water.editedLaneProfileSettings;
+    document.keyedSettingsProfiles =
+        runtimeState->water.keyedSettingsProfiles;
     document.pathProfiles.reserve(runtimeState->water.pathProfiles.size());
     for (const auto& profile : runtimeState->water.pathProfiles) {
         document.pathProfiles.push_back(MakeWaterPathProfileDocument(profile));
@@ -18358,6 +18508,8 @@ void LoadWaterSources(
     runtimeState->water.selectedTrailProfileName = document->selectedTrailProfileName;
     runtimeState->water.editedPathProfileSettings = document->tempPathProfileSettings;
     runtimeState->water.editedLaneProfileSettings = document->tempLaneProfileSettings;
+    runtimeState->water.keyedSettingsProfiles =
+        document->keyedSettingsProfiles;
     runtimeState->water.editedTrailProfile =
         document->tempTrailProfile.has_value()
             ? std::optional<SavedWaterTrailProfileState>{
@@ -18479,7 +18631,16 @@ void SelectWaterEmitterInViewport(
         return;
     }
 
+    if (runtimeState->water.manualFlowPathEditor.active &&
+        runtimeState->water.manualFlowPathEditor.creating) {
+        runtimeState->statusMessage =
+            "Save or cancel the new Flow path before selecting a Point Source.";
+        runtimeState->errorMessage.clear();
+        return;
+    }
+
     const auto& emitter = runtimeState->water.emitters[emitterIndex];
+    runtimeState->water.manualFlowPathEditor = {};
     runtimeState->water.selectedEmitterIndex = emitterIndex;
     runtimeState->water.selectedManualFlowPathIndex.reset();
     ClearWaterSeepageSelection(&runtimeState->water);
@@ -18498,17 +18659,32 @@ void SelectManualFlowPathSource(PreviewRuntimeState* runtimeState, std::size_t s
     if (runtimeState == nullptr || sourceIndex >= runtimeState->water.manualFlowPaths.size()) {
         return;
     }
-    runtimeState->water.selectedManualFlowPathIndex = sourceIndex;
-    runtimeState->water.selectedEmitterIndex.reset();
+    auto& water = runtimeState->water;
+    if (water.manualFlowPathEditor.active && water.manualFlowPathEditor.creating) {
+        runtimeState->statusMessage =
+            "Save or cancel the new Flow path before selecting another path.";
+        runtimeState->errorMessage.clear();
+        return;
+    }
+    const bool selectionChanged =
+        !water.selectedManualFlowPathIndex.has_value() ||
+        water.selectedManualFlowPathIndex.value() != sourceIndex;
+    if (selectionChanged || water.manualFlowPathEditor.active) {
+        water.manualFlowPathEditor = {};
+        water.manualFlowPathEditor.sourceIndex = sourceIndex;
+    }
+    water.selectedManualFlowPathIndex = sourceIndex;
+    water.selectedEmitterIndex.reset();
     ClearWaterSeepageSelection(&runtimeState->water);
-    runtimeState->water.selectedDynamicMeshAttractorIndex.reset();
-    runtimeState->water.movingEmitterIndex.reset();
-    runtimeState->water.placementArmed = false;
-    runtimeState->water.pathAttractorPlacementArmed = false;
-    runtimeState->water.dynamicMeshAttractorPlacementArmed = false;
+    water.selectedDynamicMeshAttractorIndex.reset();
+    water.movingEmitterIndex.reset();
+    water.placementArmed = false;
+    water.pathAttractorPlacementArmed = false;
+    water.dynamicMeshAttractorPlacementArmed = false;
     runtimeState->cameraPlayback.active = false;
     runtimeState->statusMessage =
-        "Selected manual Flow path " + runtimeState->water.manualFlowPaths[sourceIndex].name + ".";
+        "Selected manual Flow path " + water.manualFlowPaths[sourceIndex].name +
+        "; node and handle edits save automatically.";
     runtimeState->errorMessage.clear();
 }
 
@@ -18652,6 +18828,8 @@ void DeselectWaterEmitter(PreviewRuntimeState* runtimeState) {
         return;
     }
     runtimeState->water.selectedEmitterIndex.reset();
+    runtimeState->water.selectedManualFlowPathIndex.reset();
+    runtimeState->water.manualFlowPathEditor = {};
     runtimeState->water.movingEmitterIndex.reset();
     runtimeState->water.placementArmed = false;
     runtimeState->water.pathAttractorPlacementArmed = false;
@@ -22907,6 +23085,8 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
     document.waterTimingRunSequence = runtimeState.water.nextTimingRunSequence;
     document.waterFeatureTimingRuns =
         runtimeState.water.featureTimingRunsByScenario;
+    document.waterKeyedSettingsProfiles =
+        runtimeState.water.keyedSettingsProfiles;
     document.waterFeatureTimingRunSequence =
         runtimeState.water.nextFeatureTimingRunSequence;
     document.timingTakes = runtimeState.water.timingTakes;
@@ -23917,6 +24097,8 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->water.nextTimingRunSequence = document.waterTimingRunSequence;
     runtimeState->water.featureTimingRunsByScenario =
         document.waterFeatureTimingRuns;
+    runtimeState->water.keyedSettingsProfiles =
+        document.waterKeyedSettingsProfiles;
     runtimeState->water.nextFeatureTimingRunSequence =
         document.waterFeatureTimingRunSequence;
     runtimeState->water.timingTakes = document.timingTakes;
@@ -24649,6 +24831,8 @@ CaptureRenderSetupAuthoredWater(
     water.pathProfiles = project.waterPathProfiles;
     water.laneProfiles = project.waterLaneProfiles;
     water.trailProfiles = project.waterTrailProfiles;
+    water.keyedSettingsProfiles =
+        project.waterKeyedSettingsProfiles;
     water.selectedPathProfileName =
         project.selectedWaterPathProfileName;
     water.selectedLaneProfileName =
@@ -24709,6 +24893,8 @@ void ApplyRenderSetupAuthoredWaterToProject(
     project->waterPathProfiles = water.pathProfiles;
     project->waterLaneProfiles = water.laneProfiles;
     project->waterTrailProfiles = water.trailProfiles;
+    project->waterKeyedSettingsProfiles =
+        water.keyedSettingsProfiles;
     project->selectedWaterPathProfileName =
         water.selectedPathProfileName;
     project->selectedWaterLaneProfileName =
@@ -37612,18 +37798,32 @@ void DrawManualFlowPathOverlay(
     auto& water = runtimeState->water;
     auto& editor = water.manualFlowPathEditor;
     editor.consumedViewportInputThisFrame = false;
+    const bool authoringLocked = RenderSetupAuthoringLocked(runtimeState);
     const auto matrices = runtimeState->camera.Matrices(CurrentAspectRatio(viewport));
     ImDrawList* drawList = ImGui::GetBackgroundDrawList(ImGui::GetMainViewport());
     const auto& io = ImGui::GetIO();
+
+    const std::optional<std::size_t> liveSelectedSourceIndex =
+        !editor.active && water.selectedManualFlowPathIndex.has_value() &&
+                water.selectedManualFlowPathIndex.value() <
+                    water.manualFlowPaths.size()
+            ? water.selectedManualFlowPathIndex
+            : std::nullopt;
+    const std::optional<std::size_t> interactiveStoredSourceIndex =
+        editor.active && !editor.creating && editor.sourceIndex.has_value() &&
+                editor.sourceIndex.value() < water.manualFlowPaths.size()
+            ? editor.sourceIndex
+            : liveSelectedSourceIndex;
 
     for (std::size_t index = 0; index < water.manualFlowPaths.size(); ++index) {
         const bool selected = water.selectedManualFlowPathIndex.has_value() &&
                               water.selectedManualFlowPathIndex.value() == index;
         const bool pathView = water.overlayViewMode == WaterOverlayViewMode::Path;
-        const bool editingThisSource = editor.active && !editor.creating &&
-                                       editor.sourceIndex.has_value() &&
-                                       editor.sourceIndex.value() == index;
-        if (water.showFlowSourceGuides && (selected || pathView) && !editingThisSource) {
+        const bool editingThisSource =
+            interactiveStoredSourceIndex.has_value() &&
+            interactiveStoredSourceIndex.value() == index;
+        if (water.showFlowSourceGuides && (selected || pathView) &&
+            (!editingThisSource || authoringLocked)) {
             const float globalLaneSpanMeters =
                 ResolveManualFlowPathLaneSettings(
                     water,
@@ -37640,11 +37840,36 @@ void DrawManualFlowPathOverlay(
         }
     }
 
-    if (RenderSetupAuthoringLocked(runtimeState) || !editor.active) {
+    if (authoringLocked) {
         return;
     }
 
-    auto& draft = editor.draft;
+    WaterManualFlowPathSource* editedSource = nullptr;
+    std::optional<std::uint32_t> liveSourceId;
+    if (editor.active) {
+        editedSource = &editor.draft;
+    } else if (liveSelectedSourceIndex.has_value()) {
+        editor.sourceIndex = liveSelectedSourceIndex;
+        editedSource =
+            &water.manualFlowPaths[liveSelectedSourceIndex.value()];
+        liveSourceId = editedSource->id;
+    }
+    if (editedSource == nullptr) {
+        return;
+    }
+    const auto saveLiveChange = [&](std::chrono::milliseconds debounce) {
+        if (!liveSourceId.has_value()) {
+            return;
+        }
+        runtimeState->previewRenderStateSignatureValid = false;
+        QueueWaterFlowTrailRefresh(
+            runtimeState,
+            WaterOverlayRefreshPersistence::InMemoryOnly,
+            debounce,
+            liveSourceId.value());
+    };
+
+    auto& draft = *editedSource;
     auto& nodes = draft.controlPoints;
     auto& nodeLaneWidths = draft.controlPointLaneWidths;
     nodeLaneWidths.resize(
@@ -37692,22 +37917,12 @@ void DrawManualFlowPathOverlay(
                     100.0F);
                 auto& laneWidth =
                     nodeLaneWidths[editor.laneWidthDrag.nodeIndex];
-                if (editor.laneWidthDrag.globalLaneSpanMeters > 1.0e-5F) {
-                    laneWidth.mode = invisible_places::water::
-                        WaterManualFlowPathLaneWidthMode::Relative;
-                    laneWidth.value = std::clamp(
-                        resolvedWidth /
-                            editor.laneWidthDrag.globalLaneSpanMeters,
-                        0.0F,
-                        100.0F);
-                } else {
-                    // A relative multiplier cannot represent a non-zero width
-                    // while the global cover is zero, so retain the exact
-                    // dragged size as an absolute override.
-                    laneWidth.mode = invisible_places::water::
-                        WaterManualFlowPathLaneWidthMode::Absolute;
-                    laneWidth.value = resolvedWidth;
-                }
+                laneWidth = invisible_places::water::
+                    ApplyWaterManualFlowPathLaneWidthHandleDrag(
+                        laneWidth,
+                        resolvedWidth,
+                        editor.laneWidthDrag.globalLaneSpanMeters);
+                saveLiveChange(std::chrono::milliseconds{120});
                 anchors = invisible_places::water::BuildManualFlowPathAnchors(
                     draft,
                     0.025F,
@@ -37763,6 +37978,7 @@ void DrawManualFlowPathOverlay(
             }
             if (std::isfinite(nextPoint.x) && std::isfinite(nextPoint.y) && std::isfinite(nextPoint.z)) {
                 nodes[editor.drag.nodeIndex] = FromGlm(nextPoint);
+                saveLiveChange(std::chrono::milliseconds{120});
                 anchors = invisible_places::water::BuildManualFlowPathAnchors(
                     draft,
                     0.025F,
@@ -38165,6 +38381,7 @@ void DrawManualFlowPathOverlay(
                 nodes.push_back(pivot->point);
                 nodeLaneWidths.push_back({});
                 editor.selectedNodeIndex = nodes.size() - 1U;
+                saveLiveChange(std::chrono::milliseconds{0});
                 runtimeState->statusMessage = "Added manual flow path node.";
                 runtimeState->errorMessage.clear();
             }
@@ -38212,6 +38429,7 @@ void DrawManualFlowPathOverlay(
             editor.selectedNodeIndex = nodeIndex;
             editor.consumedViewportInputThisFrame = true;
             editor.pointerCapturedUntilRelease = true;
+            saveLiveChange(std::chrono::milliseconds{0});
             runtimeState->errorMessage.clear();
         }
         return;
@@ -38232,6 +38450,7 @@ void DrawManualFlowPathOverlay(
         editor.selectedNodeIndex = insertIndex.value();
         editor.consumedViewportInputThisFrame = true;
         editor.pointerCapturedUntilRelease = true;
+        saveLiveChange(std::chrono::milliseconds{0});
         runtimeState->statusMessage = "Inserted manual flow path node.";
         runtimeState->errorMessage.clear();
         return;
@@ -38331,9 +38550,16 @@ void DrawManualFlowPathOverlay(
                     WaterManualFlowPathLaneWidthMode::Inherit) {
                 nodeLaneWidths[nodeIndex] = {};
                 editor.consumedViewportInputThisFrame = true;
+                saveLiveChange(std::chrono::milliseconds{0});
                 runtimeState->statusMessage =
                     "Reset the selected node lane cover to Standard. Delete again to remove the node.";
                 runtimeState->errorMessage.clear();
+                return;
+            }
+            if (liveSourceId.has_value() && nodes.size() <= 2U) {
+                runtimeState->errorMessage =
+                    "A saved Flow path must keep at least two nodes.";
+                runtimeState->statusMessage.clear();
                 return;
             }
             nodes.erase(nodes.begin() + static_cast<std::ptrdiff_t>(nodeIndex));
@@ -38346,6 +38572,7 @@ void DrawManualFlowPathOverlay(
                                            ? std::nullopt
                                            : std::optional<std::size_t>{std::min(nodeIndex, nodes.size() - 1U)};
             editor.consumedViewportInputThisFrame = true;
+            saveLiveChange(std::chrono::milliseconds{0});
             runtimeState->statusMessage = "Deleted manual flow path node.";
             runtimeState->errorMessage.clear();
         }
@@ -38402,6 +38629,8 @@ void DrawWaterEmitterOverlay(
         !viewport.UiWantsMouseCapture() &&
         renderViewportHovered &&
         !runtimeState->water.manualFlowPathEditor.active &&
+        !runtimeState->water.manualFlowPathEditor
+             .consumedViewportInputThisFrame &&
         runtimeState->water.overlayViewMode != WaterOverlayViewMode::Path &&
         !runtimeState->water.placementArmed &&
         !runtimeState->water.seepagePlacementArmed &&
@@ -48003,7 +48232,18 @@ bool DrawWaterSourceProfileAssignmentCombo(
     std::string* profileName,
     bool* lockedToSavedProfile);
 
-constexpr ImVec4 kWaterKeyedSettingColour{0.95F, 0.72F, 0.25F, 1.0F};
+constexpr ImVec4 kWaterKeyableSettingColour{0.08F, 0.07F, 0.05F, 1.0F};
+constexpr ImVec4 kWaterKeyedSettingColour{0.96F, 0.70F, 0.04F, 1.0F};
+constexpr char kWaterPointSourceDragPayload[] = "WATER_FLOW_POINT";
+constexpr char kWaterPathSourceDragPayload[] = "WATER_FLOW_PATH";
+constexpr std::size_t kImGuiDragPayloadTypeMaxCharacters =
+    sizeof(ImGuiPayload{}.DataType) - 1U;
+static_assert(
+    sizeof(kWaterPointSourceDragPayload) - 1U <=
+    kImGuiDragPayloadTypeMaxCharacters);
+static_assert(
+    sizeof(kWaterPathSourceDragPayload) - 1U <=
+    kImGuiDragPayloadTypeMaxCharacters);
 
 void DrawWaterSourceList(
     PreviewRuntimeState* runtimeState,
@@ -48027,6 +48267,8 @@ void DrawWaterSourceList(
     const auto* keyedEntry = FindScenarioFeatureRuns(
         water,
         ActiveWaterTimingScenarioId(*runtimeState));
+    std::optional<std::pair<std::size_t, std::size_t>> requestedEmitterReorder;
+    std::optional<std::pair<std::size_t, std::size_t>> requestedManualPathReorder;
     const float scrubPosition =
         std::clamp(runtimeState->animationPanel.scrubAmount, 0.0F, 1.0F);
     const auto drawKeyNavigation =
@@ -48060,7 +48302,12 @@ void DrawWaterSourceList(
     const auto drawSourceRow = [&](const char* label,
                                    bool selected,
                                    const invisible_places::water::
-                                       WaterKeyedFeatureId& feature) {
+                                       WaterKeyedFeatureId& feature,
+                                   const char* dragPayloadType,
+                                   const char* dragDescription,
+                                   std::size_t sourceIndex,
+                                   std::optional<std::pair<std::size_t, std::size_t>>*
+                                       requestedReorder) {
         const auto* run = keyedEntry != nullptr
             ? invisible_places::water::FindWaterFeatureRunContaining(
                   keyedEntry->waterFeatureTimingRuns,
@@ -48070,18 +48317,45 @@ void DrawWaterSourceList(
             ImGui::PushStyleColor(ImGuiCol_Text, kWaterKeyedSettingColour);
         }
         const bool clicked = ImGui::Selectable(label, selected);
+        const bool rowHovered =
+            ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal);
+        if (rowHovered) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+        }
+        if (ImGui::BeginDragDropSource()) {
+            ImGui::SetDragDropPayload(
+                dragPayloadType,
+                &sourceIndex,
+                sizeof(sourceIndex));
+            ImGui::TextUnformatted(label);
+            ImGui::EndDragDropSource();
+        }
+        if (requestedReorder != nullptr && ImGui::BeginDragDropTarget()) {
+            if (const auto* payload =
+                    ImGui::AcceptDragDropPayload(dragPayloadType);
+                payload != nullptr &&
+                payload->DataSize == sizeof(std::size_t)) {
+                *requestedReorder = std::pair{
+                    *static_cast<const std::size_t*>(payload->Data),
+                    sourceIndex};
+            }
+            ImGui::EndDragDropTarget();
+        }
         if (run != nullptr) {
             ImGui::PopStyleColor();
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            if (rowHovered) {
                 ImGui::SetTooltip(
                     "In run \"%s\" — edits key at the animation position "
-                    "instead of changing base settings.",
-                    run->name.c_str());
+                    "instead of changing base settings.\n%s",
+                    run->name.c_str(),
+                    dragDescription);
             }
             drawKeyNavigation(
                 invisible_places::water::FindWaterFeatureTimeline(
                     run,
                     feature));
+        } else if (rowHovered) {
+            ImGui::SetTooltip("%s", dragDescription);
         }
         return clicked;
     };
@@ -48091,7 +48365,8 @@ void DrawWaterSourceList(
     }
     for (std::size_t index = 0; index < water.emitters.size(); ++index) {
         auto& emitter = water.emitters[index];
-        ImGui::PushID(static_cast<int>(index));
+        ImGui::PushID("PointFlowSource");
+        ImGui::PushID(static_cast<int>(emitter.id));
         const bool selected = water.selectedEmitterIndex.has_value() &&
                               water.selectedEmitterIndex.value() == index;
         const std::string label =
@@ -48102,10 +48377,15 @@ void DrawWaterSourceList(
                 selected,
                 {.kind =
                      invisible_places::water::WaterKeyedFeatureKind::FlowSource,
-                 .objectId = emitter.id})) {
+                 .objectId = emitter.id},
+                kWaterPointSourceDragPayload,
+                "Drag to reorder Point Sources.",
+                index,
+                &requestedEmitterReorder)) {
             SelectWaterEmitterInViewport(runtimeState, *viewport, index);
             water.selectedManualFlowPathIndex.reset();
         }
+        ImGui::PopID();
         ImGui::PopID();
     }
 
@@ -48114,7 +48394,8 @@ void DrawWaterSourceList(
     }
     for (std::size_t index = 0; index < water.manualFlowPaths.size(); ++index) {
         auto& source = water.manualFlowPaths[index];
-        ImGui::PushID(static_cast<int>(water.emitters.size() + index));
+        ImGui::PushID("ManualPathFlowSource");
+        ImGui::PushID(static_cast<int>(source.id));
         const bool selected =
             water.selectedManualFlowPathIndex.has_value() &&
             water.selectedManualFlowPathIndex.value() == index;
@@ -48124,11 +48405,70 @@ void DrawWaterSourceList(
                 selected,
                 {.kind =
                      invisible_places::water::WaterKeyedFeatureKind::FlowPath,
-                 .objectId = source.id}) &&
-            !water.manualFlowPathEditor.active) {
+                 .objectId = source.id},
+                kWaterPathSourceDragPayload,
+                "Drag to reorder Manual Path Sources.",
+                index,
+                &requestedManualPathReorder) &&
+            (!water.manualFlowPathEditor.active ||
+             !water.manualFlowPathEditor.creating)) {
             SelectManualFlowPathSource(runtimeState, index);
         }
         ImGui::PopID();
+        ImGui::PopID();
+    }
+
+    const auto remapMovedIndex = [](
+        std::optional<std::size_t>* index,
+        std::size_t from,
+        std::size_t to) {
+        if (index == nullptr || !index->has_value() || from == to) {
+            return;
+        }
+        auto value = index->value();
+        if (value == from) {
+            value = to;
+        } else if (from < to && value > from && value <= to) {
+            --value;
+        } else if (to < from && value >= to && value < from) {
+            ++value;
+        }
+        *index = value;
+    };
+    const auto moveItem = []<typename Item>(
+        std::vector<Item>* items,
+        std::size_t from,
+        std::size_t to) {
+        if (items == nullptr || from >= items->size() || to >= items->size() ||
+            from == to) {
+            return false;
+        }
+        auto item = std::move((*items)[from]);
+        items->erase(items->begin() + static_cast<std::ptrdiff_t>(from));
+        items->insert(
+            items->begin() + static_cast<std::ptrdiff_t>(to),
+            std::move(item));
+        return true;
+    };
+    if (requestedEmitterReorder.has_value()) {
+        const auto [from, to] = requestedEmitterReorder.value();
+        if (moveItem(&water.emitters, from, to)) {
+            remapMovedIndex(&water.selectedEmitterIndex, from, to);
+            remapMovedIndex(&water.movingEmitterIndex, from, to);
+            runtimeState->statusMessage =
+                "Reordered Point Sources; source identities and timing keys were preserved.";
+            runtimeState->errorMessage.clear();
+        }
+    }
+    if (requestedManualPathReorder.has_value()) {
+        const auto [from, to] = requestedManualPathReorder.value();
+        if (moveItem(&water.manualFlowPaths, from, to)) {
+            remapMovedIndex(&water.selectedManualFlowPathIndex, from, to);
+            remapMovedIndex(&water.manualFlowPathEditor.sourceIndex, from, to);
+            runtimeState->statusMessage =
+                "Reordered Manual Path Sources; source identities and timing keys were preserved.";
+            runtimeState->errorMessage.clear();
+        }
     }
 
     EndPanelSection();
@@ -49784,8 +50124,24 @@ bool WaterFeatureIsInTimingRun(
 
 // Regenerative settings rebuild caches, topology, or simulations instead of
 // applying per frame, so they can never be keyed. While the owning feature
-// sits in a Timings run, dim their labels so the bold keyable settings stand
-// out. Pass the same flag to both calls.
+// sits in a Timings run, dim and italicise them so the bold keyable settings
+// stand out. Pass the same flag to both calls.
+ImFont* WaterRegenerativeItalicFont() {
+    constexpr std::string_view kFontName = "Water Settings Italic";
+    const auto* atlas = ImGui::GetIO().Fonts;
+    if (atlas == nullptr) {
+        return nullptr;
+    }
+    for (int index = 0; index < atlas->Fonts.Size; ++index) {
+        auto* font = atlas->Fonts[index];
+        if (font != nullptr &&
+            std::string_view{font->GetDebugName()} == kFontName) {
+            return font;
+        }
+    }
+    return nullptr;
+}
+
 void BeginWaterRegenerativeSettingLabels(bool featureInRun) {
     if (!featureInRun) {
         return;
@@ -49800,10 +50156,16 @@ void BeginWaterRegenerativeSettingLabels(bool featureInRun) {
             std::lerp(text.y, disabled.y, 0.6F),
             std::lerp(text.z, disabled.z, 0.6F),
             std::lerp(text.w, disabled.w, 0.6F)});
+    if (auto* italic = WaterRegenerativeItalicFont(); italic != nullptr) {
+        ImGui::PushFont(italic);
+    }
 }
 
 void EndWaterRegenerativeSettingLabels(bool featureInRun) {
     if (featureInRun) {
+        if (WaterRegenerativeItalicFont() != nullptr) {
+            ImGui::PopFont();
+        }
         ImGui::PopStyleColor();
     }
 }
@@ -49820,9 +50182,10 @@ bool DrawKeyedWaterSettingLabel(
         return false;
     }
     ImGui::SameLine(0.0F, ImGui::GetStyle().ItemInnerSpacing.x);
-    if (keyingActive) {
-        ImGui::PushStyleColor(ImGuiCol_Text, kWaterKeyedSettingColour);
-    }
+    ImGui::PushStyleColor(
+        ImGuiCol_Text,
+        keyingActive ? kWaterKeyedSettingColour
+                     : kWaterKeyableSettingColour);
     ImGui::TextUnformatted(renderedLabel.c_str());
     const bool hovered = ImGui::IsItemHovered();
     const ImVec2 textMin = ImGui::GetItemRectMin();
@@ -49830,9 +50193,7 @@ bool DrawKeyedWaterSettingLabel(
         ImVec2{textMin.x + 0.75F, textMin.y},
         ImGui::GetColorU32(ImGuiCol_Text),
         renderedLabel.c_str());
-    if (keyingActive) {
-        ImGui::PopStyleColor();
-    }
+    ImGui::PopStyleColor();
     return hovered;
 }
 
@@ -49925,9 +50286,10 @@ KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
     // The slider carries a hidden label so the visible name is rendered by
     // exactly one code path (the shared bold label helper) — never twice.
     const std::string hiddenSliderLabel = "##" + std::string{label};
-    if (keyingActive) {
-        ImGui::PushStyleColor(ImGuiCol_Text, kWaterKeyedSettingColour);
-    }
+    ImGui::PushStyleColor(
+        ImGuiCol_Text,
+        keyingActive ? kWaterKeyedSettingColour
+                     : kWaterKeyableSettingColour);
     const bool sliderChanged = ImGui::SliderFloat(
         hiddenSliderLabel.c_str(),
         &value,
@@ -49937,9 +50299,7 @@ KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
         flags);
     const bool sliderHovered =
         ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal);
-    if (keyingActive) {
-        ImGui::PopStyleColor();
-    }
+    ImGui::PopStyleColor();
     const bool labelHovered =
         DrawKeyedWaterSettingLabel(renderedLabel, keyingActive);
 
@@ -52208,6 +52568,432 @@ void DrawWaterKeyedProfilesCombo(
     }
 }
 
+std::optional<std::size_t> FindWaterKeyedSettingsProfileIndex(
+    const WaterWorkflowState& water,
+    std::string_view name) {
+    const auto normalized = TrimText(name);
+    for (std::size_t index = 0U;
+         index < water.keyedSettingsProfiles.size();
+         ++index) {
+        if (TrimText(water.keyedSettingsProfiles[index].name) ==
+            normalized) {
+            return index;
+        }
+    }
+    return std::nullopt;
+}
+
+std::string FlowPathKeyedSettingsBaseName(
+    const WaterWorkflowState& water,
+    const WaterManualFlowPathSource& source) {
+    if (const auto profileIndex = FindWaterKeyedSettingsProfileIndex(
+            water,
+            source.keyedSettingsProfileName);
+        profileIndex.has_value()) {
+        return BaseWaterProfileName(
+            water.keyedSettingsProfiles[profileIndex.value()]
+                .baseProfileName);
+    }
+    return BaseWaterProfileName(
+        WaterSourceSavedProfileName(
+            source.laneProfileName,
+            water.selectedLaneProfileName));
+}
+
+std::vector<invisible_places::water::WaterKeyedSettingTrack>
+SanitizedFlowPathProfileTracks(
+    std::span<const invisible_places::water::WaterKeyedSettingTrack>
+        settings) {
+    std::vector<invisible_places::water::WaterKeyedSettingTrack> kept;
+    kept.reserve(settings.size());
+    for (const auto& setting : settings) {
+        if (invisible_places::water::FindWaterKeyableSetting(
+                invisible_places::water::WaterKeyedFeatureKind::FlowPath,
+                setting.settingId) == nullptr) {
+            continue;
+        }
+        kept.push_back(
+            invisible_places::water::SanitizeWaterKeyedSettingTrack(
+                setting));
+    }
+    return kept;
+}
+
+bool FlowPathProfileTracksEqual(
+    std::span<const invisible_places::water::WaterKeyedSettingTrack> left,
+    std::span<const invisible_places::water::WaterKeyedSettingTrack> right) {
+    if (left.size() != right.size()) {
+        return false;
+    }
+    for (std::size_t settingIndex = 0U;
+         settingIndex < left.size();
+         ++settingIndex) {
+        const auto& a = left[settingIndex];
+        const auto& b = right[settingIndex];
+        if (a.settingId != b.settingId || a.active != b.active ||
+            a.label != b.label || a.profileGroup != b.profileGroup ||
+            a.profileName != b.profileName ||
+            a.keys.size() != b.keys.size()) {
+            return false;
+        }
+        for (std::size_t keyIndex = 0U;
+             keyIndex < a.keys.size();
+             ++keyIndex) {
+            const auto& aKey = a.keys[keyIndex];
+            const auto& bKey = b.keys[keyIndex];
+            if (aKey.position != bKey.position ||
+                aKey.value != bKey.value ||
+                aKey.interpolation != bKey.interpolation) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void ApplyFlowPathKeyedSettingsProfile(
+    PreviewRuntimeState* runtimeState,
+    WaterManualFlowPathSource* source,
+    const invisible_places::water::WaterKeyedFeatureId& feature,
+    const invisible_places::water::WaterKeyedSettingsProfile* profile) {
+    if (runtimeState == nullptr || source == nullptr) {
+        return;
+    }
+    auto* timeline = FindMutableWaterFeatureTimeline(
+        &runtimeState->water,
+        ActiveWaterTimingScenarioId(*runtimeState),
+        feature);
+    if (timeline == nullptr) {
+        return;
+    }
+    if (profile == nullptr) {
+        timeline->settings.clear();
+        source->keyedSettingsProfileName.clear();
+        runtimeState->statusMessage =
+            "Cleared the Path Source keyed-settings assignment.";
+    } else {
+        timeline->settings =
+            SanitizedFlowPathProfileTracks(profile->settings);
+        source->keyedSettingsProfileName = profile->name;
+        runtimeState->statusMessage =
+            "Applied keyed settings " + profile->name + " to " +
+            source->name + ".";
+    }
+    ApplyAnimationScrub(runtimeState);
+    runtimeState->previewRenderStateSignatureValid = false;
+    runtimeState->errorMessage.clear();
+}
+
+void MarkFlowPathKeyedSettingsEdited(
+    PreviewRuntimeState* runtimeState,
+    WaterManualFlowPathSource* source,
+    const invisible_places::water::WaterKeyedFeatureId& feature) {
+    if (runtimeState == nullptr || source == nullptr) {
+        return;
+    }
+    auto* timeline = FindMutableWaterFeatureTimeline(
+        &runtimeState->water,
+        ActiveWaterTimingScenarioId(*runtimeState),
+        feature);
+    if (timeline == nullptr) {
+        return;
+    }
+    auto& water = runtimeState->water;
+    const std::string priorAssignment =
+        source->keyedSettingsProfileName;
+    const auto priorIndex = FindWaterKeyedSettingsProfileIndex(
+        water,
+        priorAssignment);
+    const auto* priorProfile =
+        priorIndex.has_value()
+            ? &water.keyedSettingsProfiles[priorIndex.value()]
+            : nullptr;
+    const std::string baseName =
+        priorProfile != nullptr
+            ? BaseWaterProfileName(priorProfile->baseProfileName)
+            : FlowPathKeyedSettingsBaseName(water, *source);
+    const std::string sourceProfileName =
+        priorProfile != nullptr && priorProfile->edited
+            ? priorProfile->sourceProfileName
+            : (priorProfile != nullptr ? priorProfile->name
+                                       : std::string{});
+    auto edited = invisible_places::water::
+        SanitizeWaterKeyedSettingsProfile({
+            .name = invisible_places::water::
+                WaterKeyedSettingsProfileEditedName(
+                    baseName,
+                    source->name),
+            .baseProfileName = baseName,
+            .ownerObjectName = source->name,
+            .sourceProfileName = sourceProfileName,
+            .ownerObjectId = source->id,
+            .featureKind = invisible_places::water::
+                WaterKeyedFeatureKind::FlowPath,
+            .edited = true,
+            .settings = SanitizedFlowPathProfileTracks(
+                timeline->settings),
+        });
+
+    // One working shadow per object. Selecting another object's saved
+    // profile and editing replaces this shadow with the newly applied base
+    // plus the current edit; the selected saved profile remains untouched.
+    const auto existing = std::find_if(
+        water.keyedSettingsProfiles.begin(),
+        water.keyedSettingsProfiles.end(),
+        [&](const auto& candidate) {
+            return candidate.edited &&
+                   candidate.featureKind == edited.featureKind &&
+                   candidate.ownerObjectId == source->id;
+        });
+    if (existing != water.keyedSettingsProfiles.end()) {
+        *existing = std::move(edited);
+        source->keyedSettingsProfileName = existing->name;
+    } else {
+        water.keyedSettingsProfiles.push_back(std::move(edited));
+        source->keyedSettingsProfileName =
+            water.keyedSettingsProfiles.back().name;
+    }
+    runtimeState->statusMessage =
+        "Updated " + source->keyedSettingsProfileName +
+        " without changing its saved keyed profile.";
+    runtimeState->errorMessage.clear();
+}
+
+void SyncFlowPathKeyedSettingsProfileFromTimeline(
+    PreviewRuntimeState* runtimeState,
+    WaterManualFlowPathSource* source,
+    const invisible_places::water::WaterKeyedFeatureId& feature) {
+    if (runtimeState == nullptr || source == nullptr ||
+        source->keyedSettingsProfileName.empty()) {
+        return;
+    }
+    const auto profileIndex = FindWaterKeyedSettingsProfileIndex(
+        runtimeState->water,
+        source->keyedSettingsProfileName);
+    const auto* timeline = FindMutableWaterFeatureTimeline(
+        &runtimeState->water,
+        ActiveWaterTimingScenarioId(*runtimeState),
+        feature);
+    if (!profileIndex.has_value() || timeline == nullptr) {
+        return;
+    }
+    const auto timelineTracks = SanitizedFlowPathProfileTracks(
+        timeline->settings);
+    const auto profileTracks = SanitizedFlowPathProfileTracks(
+        runtimeState->water
+            .keyedSettingsProfiles[profileIndex.value()]
+            .settings);
+    if (!FlowPathProfileTracksEqual(
+            timelineTracks,
+            profileTracks)) {
+        MarkFlowPathKeyedSettingsEdited(
+            runtimeState,
+            source,
+            feature);
+    }
+}
+
+void SaveFlowPathKeyedSettingsProfile(
+    PreviewRuntimeState* runtimeState,
+    WaterManualFlowPathSource* source,
+    const invisible_places::water::WaterKeyedFeatureId& feature) {
+    if (runtimeState == nullptr || source == nullptr) {
+        return;
+    }
+    auto* timeline = FindMutableWaterFeatureTimeline(
+        &runtimeState->water,
+        ActiveWaterTimingScenarioId(*runtimeState),
+        feature);
+    if (timeline == nullptr) {
+        return;
+    }
+    auto& water = runtimeState->water;
+    const std::string baseName =
+        FlowPathKeyedSettingsBaseName(water, *source);
+    auto saved = invisible_places::water::
+        SanitizeWaterKeyedSettingsProfile({
+            .name = invisible_places::water::
+                WaterKeyedSettingsProfileSavedName(
+                    baseName,
+                    source->name),
+            .baseProfileName = baseName,
+            .ownerObjectName = source->name,
+            .ownerObjectId = source->id,
+            .featureKind = invisible_places::water::
+                WaterKeyedFeatureKind::FlowPath,
+            .edited = false,
+            .settings = SanitizedFlowPathProfileTracks(
+                timeline->settings),
+        });
+    const std::string savedName = saved.name;
+
+    water.keyedSettingsProfiles.erase(
+        std::remove_if(
+            water.keyedSettingsProfiles.begin(),
+            water.keyedSettingsProfiles.end(),
+            [&](const auto& candidate) {
+                return candidate.edited &&
+                       candidate.featureKind == saved.featureKind &&
+                       candidate.ownerObjectId == source->id;
+            }),
+        water.keyedSettingsProfiles.end());
+    const auto savedIndex = FindWaterKeyedSettingsProfileIndex(
+        water,
+        savedName);
+    if (savedIndex.has_value()) {
+        water.keyedSettingsProfiles[savedIndex.value()] =
+            std::move(saved);
+    } else {
+        water.keyedSettingsProfiles.push_back(std::move(saved));
+    }
+    source->keyedSettingsProfileName = savedName;
+    runtimeState->statusMessage =
+        "Saved keyed settings profile " + savedName + ".";
+    runtimeState->errorMessage.clear();
+}
+
+void DiscardFlowPathKeyedSettingsEdits(
+    PreviewRuntimeState* runtimeState,
+    WaterManualFlowPathSource* source,
+    const invisible_places::water::WaterKeyedFeatureId& feature) {
+    if (runtimeState == nullptr || source == nullptr) {
+        return;
+    }
+    auto& water = runtimeState->water;
+    const auto editedIndex = FindWaterKeyedSettingsProfileIndex(
+        water,
+        source->keyedSettingsProfileName);
+    if (!editedIndex.has_value() ||
+        !water.keyedSettingsProfiles[editedIndex.value()].edited) {
+        return;
+    }
+    const auto edited = water.keyedSettingsProfiles[editedIndex.value()];
+    const auto sourceIndex = FindWaterKeyedSettingsProfileIndex(
+        water,
+        edited.sourceProfileName);
+    const auto restored =
+        sourceIndex.has_value()
+            ? std::optional<invisible_places::water::
+                  WaterKeyedSettingsProfile>{
+                  water.keyedSettingsProfiles[sourceIndex.value()]}
+            : std::nullopt;
+    water.keyedSettingsProfiles.erase(
+        water.keyedSettingsProfiles.begin() +
+        static_cast<std::ptrdiff_t>(editedIndex.value()));
+    ApplyFlowPathKeyedSettingsProfile(
+        runtimeState,
+        source,
+        feature,
+        restored.has_value() ? &restored.value() : nullptr);
+    runtimeState->statusMessage =
+        restored.has_value()
+            ? "Discarded keyed edits and restored " + restored->name + "."
+            : "Discarded the Path Source keyed edits.";
+}
+
+void DrawFlowPathKeyedSettingsProfileControls(
+    PreviewRuntimeState* runtimeState,
+    WaterManualFlowPathSource* source,
+    const invisible_places::water::WaterKeyedFeatureId& feature) {
+    if (runtimeState == nullptr || source == nullptr) {
+        return;
+    }
+    auto& water = runtimeState->water;
+    const bool featureInRun = WaterFeatureIsInTimingRun(
+        *runtimeState,
+        feature);
+    const auto selectedIndex = FindWaterKeyedSettingsProfileIndex(
+        water,
+        source->keyedSettingsProfileName);
+    const std::string preview =
+        selectedIndex.has_value()
+            ? water.keyedSettingsProfiles[selectedIndex.value()].name
+            : std::string{"None"};
+
+    ImGui::BeginDisabled(!featureInRun);
+    if (ImGui::BeginCombo(
+            "Keyed Settings Profile",
+            preview.c_str())) {
+        if (ImGui::Selectable("None", !selectedIndex.has_value())) {
+            ApplyFlowPathKeyedSettingsProfile(
+                runtimeState,
+                source,
+                feature,
+                nullptr);
+        }
+        bool separatorDrawn = false;
+        for (const auto& profile : water.keyedSettingsProfiles) {
+            if (profile.featureKind !=
+                    invisible_places::water::WaterKeyedFeatureKind::FlowPath ||
+                profile.edited) {
+                continue;
+            }
+            if (!separatorDrawn) {
+                ImGui::Separator();
+                separatorDrawn = true;
+            }
+            const bool selected =
+                profile.name == source->keyedSettingsProfileName;
+            if (ImGui::Selectable(profile.name.c_str(), selected)) {
+                const auto copy = profile;
+                ApplyFlowPathKeyedSettingsProfile(
+                    runtimeState,
+                    source,
+                    feature,
+                    &copy);
+            }
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+    const auto* timeline = FindMutableWaterFeatureTimeline(
+        &water,
+        ActiveWaterTimingScenarioId(*runtimeState),
+        feature);
+    const bool hasKeyedSettings =
+        timeline != nullptr &&
+        std::any_of(
+            timeline->settings.begin(),
+            timeline->settings.end(),
+            [](const auto& setting) {
+                return !setting.keys.empty();
+            });
+    ImGui::BeginDisabled(!hasKeyedSettings);
+    if (ImGui::Button("Save Keyed Settings")) {
+        SaveFlowPathKeyedSettingsProfile(
+            runtimeState,
+            source,
+            feature);
+    }
+    ImGui::EndDisabled();
+    const auto currentIndex = FindWaterKeyedSettingsProfileIndex(
+        water,
+        source->keyedSettingsProfileName);
+    const bool hasEdited =
+        currentIndex.has_value() &&
+        water.keyedSettingsProfiles[currentIndex.value()].edited;
+    if (hasEdited) {
+        ImGui::SameLine();
+        if (ImGui::Button("Discard Keyed Edits")) {
+            DiscardFlowPathKeyedSettingsEdits(
+                runtimeState,
+                source,
+                feature);
+        }
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(
+            ImGuiHoveredFlags_DelayNormal |
+            ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip(
+            featureInRun
+                ? "Saved key tracks are immutable templates. Editing an applied profile creates <base>_<object>_edited; Save promotes it and Discard restores its source."
+                : "Assign this Path Source to a Timing run before applying or saving keyed settings.");
+    }
+}
+
 bool DrawWaterSeepageRoleToggle(const char* label, std::string_view role, WaterSeepageNode* node) {
     if (node == nullptr) {
         return false;
@@ -53200,6 +53986,124 @@ void DrawWaterSeepagePanel(
     }
 }
 
+bool DrawManualFlowPathNodeLaneControls(
+    WaterWorkflowState* water,
+    ManualFlowPathEditorState* editor,
+    WaterManualFlowPathSource* source) {
+    if (water == nullptr || editor == nullptr || source == nullptr) {
+        return false;
+    }
+
+    ImGui::PushID("ManualFlowPathNodeLaneControls");
+    ImGui::TextDisabled("Nodes: %zu", source->controlPoints.size());
+    source->controlPointLaneWidths.resize(
+        source->controlPoints.size(),
+        invisible_places::water::WaterManualFlowPathLaneWidth{});
+
+    bool changed = false;
+    if (editor->selectedNodeIndex.has_value() &&
+        editor->selectedNodeIndex.value() <
+            source->controlPointLaneWidths.size()) {
+        const std::size_t nodeIndex = editor->selectedNodeIndex.value();
+        auto& laneWidth = source->controlPointLaneWidths[nodeIndex];
+        const auto previousMode = laneWidth.mode;
+        const float previousValue = laneWidth.value;
+        ImGui::PushID(static_cast<int>(nodeIndex));
+        ImGui::SeparatorText(
+            ("Node " + std::to_string(nodeIndex + 1U) + " Lane Cover")
+                .c_str());
+        const float globalLaneWidth =
+            ResolveManualFlowPathLaneSettings(*water, *source)
+                .laneSpreadMeters;
+        const float resolvedLaneWidth = invisible_places::water::
+            ResolveWaterManualFlowPathLaneWidth(
+                laneWidth,
+                globalLaneWidth);
+        using LaneWidthMode = invisible_places::water::
+            WaterManualFlowPathLaneWidthMode;
+        int mode = laneWidth.mode == LaneWidthMode::Relative
+                       ? 1
+                       : (laneWidth.mode == LaneWidthMode::Absolute ? 2 : 0);
+        const char* modes[] = {
+            "Standard",
+            "Relative",
+            "Absolute",
+        };
+        if (ImGui::Combo(
+                "Lane Cover Mode",
+                &mode,
+                modes,
+                IM_ARRAYSIZE(modes))) {
+            if (mode == 0) {
+                laneWidth = {};
+            } else if (mode == 1) {
+                laneWidth.mode = LaneWidthMode::Relative;
+                laneWidth.value = globalLaneWidth > 1.0e-5F
+                                      ? std::clamp(
+                                            resolvedLaneWidth /
+                                                globalLaneWidth,
+                                            0.0F,
+                                            100.0F)
+                                      : 1.0F;
+            } else {
+                laneWidth.mode = LaneWidthMode::Absolute;
+                laneWidth.value = resolvedLaneWidth;
+            }
+        }
+        if (laneWidth.mode == LaneWidthMode::Absolute) {
+            ImGui::InputFloat(
+                "Absolute Cover",
+                &laneWidth.value,
+                0.01F,
+                0.10F,
+                "%.3f m");
+            laneWidth.value = std::clamp(
+                std::isfinite(laneWidth.value) ? laneWidth.value : 0.0F,
+                0.0F,
+                100.0F);
+        } else if (laneWidth.mode == LaneWidthMode::Relative) {
+            ImGui::InputFloat(
+                "Global Multiplier",
+                &laneWidth.value,
+                0.05F,
+                0.25F,
+                "%.2f x");
+            laneWidth.value = std::clamp(
+                std::isfinite(laneWidth.value) ? laneWidth.value : 1.0F,
+                0.0F,
+                100.0F);
+        }
+        changed = laneWidth.mode != previousMode ||
+                  laneWidth.value != previousValue;
+        ImGui::TextDisabled(
+            "Resolved cover: %.3f m (global %.3f m)",
+            invisible_places::water::ResolveWaterManualFlowPathLaneWidth(
+                laneWidth,
+                globalLaneWidth),
+            globalLaneWidth);
+        DrawWaterSeepageParameterTooltip(
+            "Standard follows Lane Cover Width. Absolute remains fixed "
+            "when the global value changes. Relative multiplies it, so "
+            "0.2 is 20% and 2.3 is 230%. Width blends smoothly between "
+            "path nodes.");
+        ImGui::PopID();
+    } else {
+        if (editor->selectedNodeIndex.has_value()) {
+            editor->selectedNodeIndex.reset();
+        }
+        ImGui::TextDisabled(
+            "Select a path node to set its local lane cover.");
+    }
+    ImGui::TextWrapped(
+        "Ctrl+left-click adds surface nodes. Drag a coloured cross-bar to "
+        "edit its current width mode; Standard becomes Relative on first "
+        "drag. Double-click a node to switch Standard -> Relative -> "
+        "Absolute; double-click Absolute to return to Relative. Delete "
+        "first resets a width override to Standard, then deletes the node.");
+    ImGui::PopID();
+    return changed;
+}
+
 void DrawWaterPanel(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
@@ -53498,6 +54402,18 @@ void DrawWaterPanel(
             DrawEmbeddedWaterFeatureTimeline(
                 runtimeState,
                 water.activeKeyingFeature.value());
+            if (water.activeKeyingFeature->kind ==
+                    invisible_places::water::WaterKeyedFeatureKind::
+                        FlowPath &&
+                water.selectedManualFlowPathIndex.has_value() &&
+                water.selectedManualFlowPathIndex.value() <
+                    water.manualFlowPaths.size()) {
+                SyncFlowPathKeyedSettingsProfileFromTimeline(
+                    runtimeState,
+                    &water.manualFlowPaths
+                        [water.selectedManualFlowPathIndex.value()],
+                    water.activeKeyingFeature.value());
+            }
         }
 
         std::optional<std::size_t> deleteEmitterIndex;
@@ -53581,112 +54497,10 @@ void DrawWaterPanel(
                     "Path Trail",
                     &draft.trailProfileName,
                     &draft.trailProfileLocked);
-                ImGui::TextDisabled("Nodes: %zu", draft.controlPoints.size());
-                draft.controlPointLaneWidths.resize(
-                    draft.controlPoints.size(),
-                    invisible_places::water::
-                        WaterManualFlowPathLaneWidth{});
-                if (water.manualFlowPathEditor.selectedNodeIndex.has_value() &&
-                    water.manualFlowPathEditor.selectedNodeIndex.value() <
-                        draft.controlPointLaneWidths.size()) {
-                    const std::size_t nodeIndex =
-                        water.manualFlowPathEditor.selectedNodeIndex.value();
-                    auto& laneWidth =
-                        draft.controlPointLaneWidths[nodeIndex];
-                    ImGui::SeparatorText(
-                        ("Node " + std::to_string(nodeIndex + 1U) +
-                         " Lane Cover")
-                            .c_str());
-                    const float globalLaneWidth =
-                        ResolveManualFlowPathLaneSettings(water, draft)
-                            .laneSpreadMeters;
-                    const float resolvedLaneWidth = invisible_places::water::
-                        ResolveWaterManualFlowPathLaneWidth(
-                            laneWidth,
-                            globalLaneWidth);
-                    using LaneWidthMode = invisible_places::water::
-                        WaterManualFlowPathLaneWidthMode;
-                    int mode = laneWidth.mode == LaneWidthMode::Relative
-                                   ? 1
-                                   : (laneWidth.mode == LaneWidthMode::Absolute
-                                          ? 2
-                                          : 0);
-                    const char* modes[] = {
-                        "Standard",
-                        "Relative",
-                        "Absolute",
-                    };
-                    if (ImGui::Combo(
-                            "Lane Cover Mode",
-                            &mode,
-                            modes,
-                            IM_ARRAYSIZE(modes))) {
-                        if (mode == 0) {
-                            laneWidth = {};
-                        } else if (mode == 1) {
-                            if (globalLaneWidth > 1.0e-5F) {
-                                laneWidth.mode = LaneWidthMode::Relative;
-                                laneWidth.value = std::clamp(
-                                    resolvedLaneWidth / globalLaneWidth,
-                                    0.0F,
-                                    100.0F);
-                            }
-                        } else {
-                            laneWidth.mode = LaneWidthMode::Absolute;
-                            laneWidth.value = resolvedLaneWidth;
-                        }
-                    }
-                    if (laneWidth.mode ==
-                        invisible_places::water::
-                            WaterManualFlowPathLaneWidthMode::Absolute) {
-                        ImGui::InputFloat(
-                            "Absolute Cover",
-                            &laneWidth.value,
-                            0.01F,
-                            0.10F,
-                            "%.3f m");
-                        laneWidth.value = std::clamp(
-                            std::isfinite(laneWidth.value)
-                                ? laneWidth.value
-                                : 0.0F,
-                            0.0F,
-                            100.0F);
-                    } else if (laneWidth.mode ==
-                               invisible_places::water::
-                                   WaterManualFlowPathLaneWidthMode::Relative) {
-                        ImGui::InputFloat(
-                            "Global Multiplier",
-                            &laneWidth.value,
-                            0.05F,
-                            0.25F,
-                            "%.2f x");
-                        laneWidth.value = std::clamp(
-                            std::isfinite(laneWidth.value)
-                                ? laneWidth.value
-                                : 1.0F,
-                            0.0F,
-                            100.0F);
-                    }
-                    ImGui::TextDisabled(
-                        "Resolved cover: %.3f m (global %.3f m)",
-                        invisible_places::water::
-                            ResolveWaterManualFlowPathLaneWidth(
-                                laneWidth,
-                                globalLaneWidth),
-                        globalLaneWidth);
-                    DrawWaterSeepageParameterTooltip(
-                        "Standard follows Lane Cover Width. Absolute remains "
-                        "fixed when the global value changes. Relative "
-                        "multiplies it, so 0.2 is 20% and 2.3 is 230%. Width "
-                        "blends smoothly between path nodes.");
-                } else {
-                    ImGui::TextDisabled(
-                        "Select a path node to set its local lane cover.");
-                }
-                ImGui::TextWrapped(
-                    "Ctrl+left-click adds surface nodes. Drag a coloured cross-bar to make a Relative lane width. "
-                    "Double-click a node to switch Standard → Relative → Absolute; double-click Absolute to return to Relative. "
-                    "Delete first resets a width override to Standard, then deletes the node.");
+                DrawManualFlowPathNodeLaneControls(
+                    &water,
+                    &water.manualFlowPathEditor,
+                    &draft);
                 const bool canSave = invisible_places::water::BuildManualFlowPathAnchors(draft).points.size() >= 2U;
                 if (!canSave) {
                     ImGui::BeginDisabled();
@@ -53912,16 +54726,29 @@ void DrawWaterPanel(
                         previousTrailProfile.geometry);
                 const bool previousUseSurfaceGuide = source.useSurfaceGuide;
                 InputTextString("Name", &source.name);
+                const invisible_places::water::WaterKeyedFeatureId feature{
+                    .kind = invisible_places::water::WaterKeyedFeatureKind::
+                        FlowPath,
+                    .objectId = source.id};
+                const bool pathInRun = WaterFeatureIsInTimingRun(
+                    *runtimeState,
+                    feature);
+                const std::string keyedProfileBaseName =
+                    FlowPathKeyedSettingsBaseName(water, source);
                 bool activityChanged = false;
+                bool keyedSettingsChanged = false;
+                bool responsiveBaseChanged = false;
+                BeginWaterRegenerativeSettingLabels(pathInRun);
                 activityChanged |=
                     ImGui::Checkbox("Show Trail", &source.showTrail);
+                EndWaterRegenerativeSettingLabels(pathInRun);
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+                    ImGui::SetTooltip(
+                        "Immediate authored visibility. Key Maximum Flow Strength to zero for an animated fade; this switch is not keyed.");
+                }
                 {
-                    const invisible_places::water::WaterKeyedFeatureId feature{
-                        .kind = invisible_places::water::WaterKeyedFeatureKind::
-                            FlowPath,
-                        .objectId = source.id};
                     float edited = source.maximumFlowStrength;
-                    if (DrawKeyedWaterSettingSlider(
+                    const auto strengthResult = DrawKeyedWaterSettingSlider(
                             runtimeState,
                             std::span{&feature, 1},
                             "strength",
@@ -53932,14 +54759,20 @@ void DrawWaterPanel(
                             "%.2f",
                             ImGuiSliderFlags_None,
                             false,
-                            &edited)
-                            .authoredChanged) {
+                            &edited,
+                            "flow_path",
+                            keyedProfileBaseName,
+                            "Live source activity; evaluated per frame without rebuilding the authored path or its lanes.");
+                    keyedSettingsChanged |=
+                        strengthResult.keyedChanged ||
+                        strengthResult.keyingStateChanged;
+                    if (strengthResult.authoredChanged) {
                         source.maximumFlowStrength =
                             std::clamp(edited, 0.0F, 1.0F);
                         activityChanged = true;
                     }
                     edited = source.rainResponse;
-                    if (DrawKeyedWaterSettingSlider(
+                    const auto responseResult = DrawKeyedWaterSettingSlider(
                             runtimeState,
                             std::span{&feature, 1},
                             "rain_response",
@@ -53950,14 +54783,134 @@ void DrawWaterPanel(
                             "%.2f",
                             ImGuiSliderFlags_None,
                             false,
-                            &edited)
-                            .authoredChanged) {
+                            &edited,
+                            "flow_path",
+                            keyedProfileBaseName,
+                            "Live multiplier for scenario rain response; evaluated per frame without regenerating trails.");
+                    keyedSettingsChanged |=
+                        responseResult.keyedChanged ||
+                        responseResult.keyingStateChanged;
+                    if (responseResult.authoredChanged) {
                         source.rainResponse = std::clamp(edited, 0.0F, 1.0F);
                         activityChanged = true;
+                    }
+
+                    ImGui::SeparatorText("Responsive Animation Settings");
+                    auto laneSettings =
+                        ResolveManualFlowPathLaneSettings(water, source);
+                    float speed = laneSettings.speedMetersPerSecond;
+                    const auto speedResult = DrawKeyedWaterSettingSlider(
+                        runtimeState,
+                        std::span{&feature, 1},
+                        "speed",
+                        "Speed",
+                        speed,
+                        0.001F,
+                        10.0F,
+                        "%.2f m/s",
+                        ImGuiSliderFlags_Logarithmic,
+                        false,
+                        &speed,
+                        "flow_path",
+                        keyedProfileBaseName,
+                        "Uniform-only motion speed. Key playback changes no lane route, trail sample, or buffer allocation.");
+                    keyedSettingsChanged |=
+                        speedResult.keyedChanged ||
+                        speedResult.keyingStateChanged;
+                    if (speedResult.authoredChanged) {
+                        laneSettings.speedMetersPerSecond =
+                            std::clamp(speed, 0.001F, 10.0F);
+                        StoreManualFlowPathLaneProfileEdit(
+                            &water,
+                            &source,
+                            laneSettings);
+                        responsiveBaseChanged = true;
+                    }
+
+                    auto trailProfile =
+                        ResolveManualFlowPathTrailProfile(
+                            *runtimeState,
+                            source);
+                    float trailWidth = trailProfile.geometry.widthMeters;
+                    const auto widthResult = DrawKeyedWaterSettingSlider(
+                        runtimeState,
+                        std::span{&feature, 1},
+                        "trail_width",
+                        "Trail Width",
+                        trailWidth,
+                        0.0005F,
+                        1.0F,
+                        "%.4f m",
+                        ImGuiSliderFlags_Logarithmic,
+                        false,
+                        &trailWidth,
+                        "flow_path",
+                        keyedProfileBaseName,
+                        "Style-level world width. It updates the live point footprint without regenerating trails or lanes.");
+                    keyedSettingsChanged |=
+                        widthResult.keyedChanged ||
+                        widthResult.keyingStateChanged;
+                    if (widthResult.authoredChanged) {
+                        trailProfile.geometry.widthMeters =
+                            std::clamp(trailWidth, 0.0005F, 1.0F);
+                        trailProfile.geometry.streakLengthMeters = std::max(
+                            trailProfile.geometry.widthMeters,
+                            trailProfile.geometry.streakLengthMeters);
+                        StoreManualFlowPathTrailProfileEdit(
+                            runtimeState,
+                            &source,
+                            trailProfile);
+                        responsiveBaseChanged = true;
+                    }
+
+                    trailProfile = ResolveManualFlowPathTrailProfile(
+                        *runtimeState,
+                        source);
+                    float streakLength =
+                        trailProfile.geometry.streakLengthMeters;
+                    const auto streakResult = DrawKeyedWaterSettingSlider(
+                        runtimeState,
+                        std::span{&feature, 1},
+                        "trail_streak_length",
+                        "Streak Length",
+                        streakLength,
+                        0.001F,
+                        5.0F,
+                        "%.3f m",
+                        ImGuiSliderFlags_Logarithmic,
+                        false,
+                        &streakLength,
+                        "flow_path",
+                        keyedProfileBaseName,
+                        "Style-level motion streak length. It changes only the rendered aspect, never trail topology.");
+                    keyedSettingsChanged |=
+                        streakResult.keyedChanged ||
+                        streakResult.keyingStateChanged;
+                    if (streakResult.authoredChanged) {
+                        trailProfile.geometry.streakLengthMeters = std::max(
+                            trailProfile.geometry.widthMeters,
+                            std::clamp(streakLength, 0.001F, 5.0F));
+                        StoreManualFlowPathTrailProfileEdit(
+                            runtimeState,
+                            &source,
+                            trailProfile);
+                        responsiveBaseChanged = true;
                     }
                 }
                 if (activityChanged) {
                     runtimeState->previewRenderStateSignatureValid = false;
+                }
+                if (responsiveBaseChanged) {
+                    RefreshResolvedWaterFlowSourceSettings(runtimeState);
+                    runtimeState->statusMessage =
+                        "Updated responsive Path Source settings without regenerating trails or lanes.";
+                    runtimeState->errorMessage.clear();
+                }
+                if (keyedSettingsChanged) {
+                    MarkFlowPathKeyedSettingsEdited(
+                        runtimeState,
+                        &source,
+                        feature);
                 }
                 const auto activityFrame =
                     ResolveWaterFrameState(runtimeState);
@@ -53969,11 +54922,6 @@ void DrawWaterPanel(
                         activityFrame.rawScenarioState,
                         &activityFrame.featureOverlay));
                 bool refreshTrails = false;
-                const bool pathInRun = WaterFeatureIsInTimingRun(
-                    *runtimeState,
-                    {.kind = invisible_places::water::WaterKeyedFeatureKind::
-                         FlowPath,
-                     .objectId = source.id});
                 BeginWaterRegenerativeSettingLabels(pathInRun);
                 if (ImGui::Checkbox("Use Surface Guide", &source.useSurfaceGuide)) {
                     refreshTrails = true;
@@ -53984,18 +54932,22 @@ void DrawWaterPanel(
                         "Uses the shared 10 mm 3D surface cache to follow rock and sand without leaving the Lane Cover Width corridor. "
                         "Rebuilds this source's trails — not keyable.");
                 }
+                BeginWaterRegenerativeSettingLabels(pathInRun);
                 refreshTrails |= DrawWaterSourceProfileAssignmentCombo(
                     water,
                     WaterProfileKind::Lane,
                     "Lanes",
                     &source.laneProfileName,
                     &source.laneProfileLocked);
+                EndWaterRegenerativeSettingLabels(pathInRun);
+                BeginWaterRegenerativeSettingLabels(pathInRun);
                 refreshTrails |= DrawWaterSourceProfileAssignmentCombo(
                     water,
                     WaterProfileKind::Trail,
                     "Trail",
                     &source.trailProfileName,
                     &source.trailProfileLocked);
+                EndWaterRegenerativeSettingLabels(pathInRun);
                 if (refreshTrails) {
                     const auto nextTrailProfile =
                         ResolveManualFlowPathTrailProfile(*runtimeState, source);
@@ -54024,14 +54976,28 @@ void DrawWaterPanel(
                         runtimeState->errorMessage.clear();
                     }
                 }
-                ImGui::TextDisabled(
-                    "Nodes: %zu", source.controlPoints.size());
-                if (ImGui::Button("Edit Path")) {
-                    BeginEditingManualFlowPath(
+                DrawFlowPathKeyedSettingsProfileControls(
+                    runtimeState,
+                    &source,
+                    feature);
+                if (DrawManualFlowPathNodeLaneControls(
+                        &water,
+                        &water.manualFlowPathEditor,
+                        &source)) {
+                    runtimeState->previewRenderStateSignatureValid = false;
+                    QueueWaterFlowTrailRefresh(
                         runtimeState,
-                        water.selectedManualFlowPathIndex.value());
+                        WaterOverlayRefreshPersistence::InMemoryOnly,
+                        std::chrono::milliseconds{120},
+                        source.id);
+                    runtimeState->statusMessage =
+                        "Saved the selected path node's lane cover; updating "
+                        "its trails in the background.";
+                    runtimeState->errorMessage.clear();
                 }
-                ImGui::SameLine();
+                ImGui::TextDisabled(
+                    "Selected path nodes and handles are live; every change "
+                    "is saved automatically.");
                 if (ImGui::Button("Delete Source")) {
                     deleteManualPathIndex =
                         water.selectedManualFlowPathIndex.value();
@@ -54051,7 +55017,6 @@ void DrawWaterPanel(
             }
             if (ImGui::Button("Deselect Source")) {
                 DeselectWaterEmitter(runtimeState);
-                water.selectedManualFlowPathIndex.reset();
                 selectedEmitter = nullptr;
             }
             if (!hasSelectedSource) {
@@ -54123,7 +55088,17 @@ void DrawWaterPanel(
             water.manualFlowPaths.erase(
                 water.manualFlowPaths.begin() +
                 static_cast<std::ptrdiff_t>(deleteManualPathIndex.value()));
+            water.keyedSettingsProfiles.erase(
+                std::remove_if(
+                    water.keyedSettingsProfiles.begin(),
+                    water.keyedSettingsProfiles.end(),
+                    [&](const auto& profile) {
+                        return profile.edited &&
+                               profile.ownerObjectId == deletedSourceId;
+                    }),
+                water.keyedSettingsProfiles.end());
             water.selectedManualFlowPathIndex.reset();
+            water.manualFlowPathEditor = {};
             QueueWaterFlowTrailRefresh(
                 runtimeState,
                 WaterOverlayRefreshPersistence::InMemoryOnly,
@@ -54134,7 +55109,25 @@ void DrawWaterPanel(
                 "; updating trails in the background.";
         }
 
-        if (BeginPanelSection("Path")) {
+        const bool manualPathSourceSelected =
+            water.selectedManualFlowPathIndex.has_value() &&
+            water.selectedManualFlowPathIndex.value() <
+                water.manualFlowPaths.size();
+        const bool manualPathSourceInRun =
+            manualPathSourceSelected &&
+            WaterFeatureIsInTimingRun(
+                *runtimeState,
+                {.kind = invisible_places::water::WaterKeyedFeatureKind::
+                     FlowPath,
+                 .objectId =
+                     water.manualFlowPaths
+                         [water.selectedManualFlowPathIndex.value()]
+                             .id});
+        // Point Sources need the procedural Path profile and bake controls.
+        // A manual Path Source already owns its authored spline, so showing
+        // these controls there was both irrelevant and easy to mistake for
+        // settings on the selected path.
+        if (!manualPathSourceSelected && BeginPanelSection("Path")) {
             DrawWaterPathProfileSelector(runtimeState);
             auto pathSettings = ViewedGlobalWaterPathSettings(water);
             const auto previousPathSettings = pathSettings;
@@ -54334,6 +55327,12 @@ void DrawWaterPanel(
         }
 
         if (BeginPanelSection("Lanes")) {
+            if (manualPathSourceInRun) {
+                ImGui::TextDisabled(
+                    "Italic controls edit the unkeyed Lane profile. Key live Speed in Selected Source above.");
+            }
+            BeginWaterRegenerativeSettingLabels(
+                manualPathSourceInRun);
             DrawWaterLaneProfileSelector(runtimeState);
             auto laneSettings = ViewedGlobalWaterLaneSettings(water);
             const auto previousLaneSettings = laneSettings;
@@ -54533,10 +55532,18 @@ void DrawWaterPanel(
                     runtimeState,
                     WaterOverlayRefreshPersistence::InMemoryOnly);
             }
+            EndWaterRegenerativeSettingLabels(
+                manualPathSourceInRun);
             EndPanelSection();
         }
 
         if (BeginPanelSection("Trail")) {
+            if (manualPathSourceInRun) {
+                ImGui::TextDisabled(
+                    "Italic controls edit the unkeyed Trail profile. Key live Width and Streak Length in Selected Source above.");
+            }
+            BeginWaterRegenerativeSettingLabels(
+                manualPathSourceInRun);
             DrawWaterTrailProfileSelector(runtimeState, viewport);
             DrawWaterTrailStyleEditor(runtimeState, viewport, ViewedGlobalWaterTrailProfile(*runtimeState));
             if (ImGui::Button("Regenerate Trails")) {
@@ -54544,6 +55551,8 @@ void DrawWaterPanel(
                     runtimeState,
                     WaterOverlayRefreshPersistence::InMemoryOnly);
             }
+            EndWaterRegenerativeSettingLabels(
+                manualPathSourceInRun);
             EndPanelSection();
         }
 
