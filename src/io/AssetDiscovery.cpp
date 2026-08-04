@@ -68,9 +68,17 @@ std::vector<std::filesystem::path> SortedDataFiles(const std::filesystem::path& 
         return files;
     }
 
-    for (const auto& entry : std::filesystem::recursive_directory_iterator{
-             root,
-             std::filesystem::directory_options::skip_permission_denied}) {
+    auto iterator = std::filesystem::recursive_directory_iterator{
+        root,
+        std::filesystem::directory_options::skip_permission_denied};
+    const auto end = std::filesystem::recursive_directory_iterator{};
+    for (; iterator != end; ++iterator) {
+        const auto& entry = *iterator;
+        if (entry.is_directory() &&
+            std::filesystem::exists(entry.path() / ".invisible_places-ignore")) {
+            iterator.disable_recursion_pending();
+            continue;
+        }
         if (!entry.is_regular_file()) {
             continue;
         }

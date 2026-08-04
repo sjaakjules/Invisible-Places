@@ -75065,6 +75065,583 @@ bool WriteWaterIntegrationContactSheet(
     return WritePpmImage(outputPath, sheetWidth, height, sheet, errorMessage);
 }
 
+bool WritePatchBoundaryPng(
+    const std::filesystem::path& outputPath,
+    const WaterIntegrationCapturedFrame& frame,
+    std::string* errorMessage) {
+    if (frame.width == 0U || frame.height == 0U ||
+        frame.rgb.size() !=
+            static_cast<std::size_t>(frame.width) * frame.height * 3U) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Patch-boundary capture has invalid RGB dimensions.";
+        }
+        return false;
+    }
+    std::vector<std::uint8_t> rgba(
+        static_cast<std::size_t>(frame.width) * frame.height * 4U,
+        255U);
+    for (std::size_t pixel = 0U;
+         pixel < static_cast<std::size_t>(frame.width) * frame.height;
+         ++pixel) {
+        rgba[pixel * 4U] = frame.rgb[pixel * 3U];
+        rgba[pixel * 4U + 1U] = frame.rgb[pixel * 3U + 1U];
+        rgba[pixel * 4U + 2U] = frame.rgb[pixel * 3U + 2U];
+    }
+    return invisible_places::output::WritePngRgba8(
+        outputPath,
+        frame.width,
+        frame.height,
+        rgba,
+        errorMessage);
+}
+
+bool WritePatchBoundaryContactSheetPng(
+    const std::filesystem::path& outputPath,
+    std::span<const WaterIntegrationCapturedFrame> frames,
+    std::string* errorMessage) {
+    if (frames.empty()) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Patch-boundary contact sheet has no frames.";
+        }
+        return false;
+    }
+    const auto width = frames.front().width;
+    const auto height = frames.front().height;
+    if (width == 0U || height == 0U ||
+        !std::all_of(
+            frames.begin(),
+            frames.end(),
+            [&](const auto& frame) {
+                return frame.width == width && frame.height == height &&
+                       frame.rgb.size() ==
+                           static_cast<std::size_t>(width) * height * 3U;
+            })) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "Patch-boundary contact-sheet frames do not match.";
+        }
+        return false;
+    }
+    const auto sheetWidth =
+        width * static_cast<std::uint32_t>(frames.size());
+    WaterIntegrationCapturedFrame sheet{
+        .width = sheetWidth,
+        .height = height,
+        .rgb = std::vector<std::uint8_t>(
+            static_cast<std::size_t>(sheetWidth) * height * 3U,
+            0U),
+    };
+    for (std::size_t frameIndex = 0U;
+         frameIndex < frames.size();
+         ++frameIndex) {
+        for (std::uint32_t row = 0U; row < height; ++row) {
+            const auto sourceOffset =
+                static_cast<std::size_t>(row) * width * 3U;
+            const auto destinationOffset =
+                (static_cast<std::size_t>(row) * sheetWidth +
+                 frameIndex * width) *
+                3U;
+            std::copy_n(
+                frames[frameIndex].rgb.begin() +
+                    static_cast<std::ptrdiff_t>(sourceOffset),
+                static_cast<std::size_t>(width) * 3U,
+                sheet.rgb.begin() +
+                    static_cast<std::ptrdiff_t>(destinationOffset));
+        }
+    }
+    return WritePatchBoundaryPng(outputPath, sheet, errorMessage);
+}
+
+void DrawPatchBoundaryDebugEllipse(
+    const PreviewRuntimeState& runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    std::array<float, 3> centre,
+    std::array<float, 2> radius,
+    WaterIntegrationCapturedFrame* frame) {
+    if (frame == nullptr || frame->width == 0U || frame->height == 0U) {
+        return;
+    }
+    const auto matrices =
+        runtimeState.camera.Matrices(CurrentAspectRatio(viewport));
+    const auto project = [&](float x, float y, float z)
+        -> std::optional<std::pair<int, int>> {
+        const glm::vec4 clip =
+            matrices.viewProjection * glm::vec4{x, y, z, 1.0F};
+        if (clip.w <= 1.0e-6F) {
+            return std::nullopt;
+        }
+        const glm::vec3 ndc = glm::vec3{clip} / clip.w;
+        if (ndc.x < -1.0F || ndc.x > 1.0F ||
+            ndc.y < -1.0F || ndc.y > 1.0F) {
+            return std::nullopt;
+        }
+        return std::pair{
+            static_cast<int>(std::lround(
+                (ndc.x * 0.5F + 0.5F) *
+                static_cast<float>(frame->width - 1U))),
+            static_cast<int>(std::lround(
+                (ndc.y * 0.5F + 0.5F) *
+                static_cast<float>(frame->height - 1U))),
+        };
+    };
+    const auto setPixel = [&](int x, int y) {
+        if (x < 0 || y < 0 ||
+            x >= static_cast<int>(frame->width) ||
+            y >= static_cast<int>(frame->height)) {
+            return;
+        }
+        const auto offset =
+            (static_cast<std::size_t>(y) * frame->width +
+             static_cast<std::size_t>(x)) *
+            3U;
+        frame->rgb[offset] = 24U;
+        frame->rgb[offset + 1U] = 236U;
+        frame->rgb[offset + 2U] = 255U;
+    };
+    const auto drawLine = [&](std::pair<int, int> from,
+                              std::pair<int, int> to) {
+        int x = from.first;
+        int y = from.second;
+        const int dx = std::abs(to.first - from.first);
+        const int sx = from.first < to.first ? 1 : -1;
+        const int dy = -std::abs(to.second - from.second);
+        const int sy = from.second < to.second ? 1 : -1;
+        int error = dx + dy;
+        while (true) {
+            for (int oy = -1; oy <= 1; ++oy) {
+                for (int ox = -1; ox <= 1; ++ox) {
+                    setPixel(x + ox, y + oy);
+                }
+            }
+            if (x == to.first && y == to.second) {
+                break;
+            }
+            const int doubled = 2 * error;
+            if (doubled >= dy) {
+                error += dy;
+                x += sx;
+            }
+            if (doubled <= dx) {
+                error += dx;
+                y += sy;
+            }
+        }
+    };
+    constexpr std::size_t kSamples = 96U;
+    constexpr float kTwoPi = 6.2831853071795864769F;
+    std::optional<std::pair<int, int>> first;
+    std::optional<std::pair<int, int>> previous;
+    for (std::size_t sample = 0U; sample <= kSamples; ++sample) {
+        const float angle =
+            kTwoPi *
+            static_cast<float>(sample % kSamples) /
+            static_cast<float>(kSamples);
+        const auto screen = project(
+            centre[0] + radius[0] * std::cos(angle),
+            centre[1] + radius[1] * std::sin(angle),
+            centre[2]);
+        if (!screen.has_value()) {
+            previous.reset();
+            continue;
+        }
+        if (!first.has_value()) {
+            first = screen;
+        }
+        if (previous.has_value()) {
+            drawLine(previous.value(), screen.value());
+        }
+        previous = screen;
+    }
+    if (previous.has_value() && first.has_value()) {
+        drawLine(previous.value(), first.value());
+    }
+}
+
+int RunScene3PatchBoundarySmoke(
+    const GuiSmokeOptions& options,
+    const invisible_places::io::AssetCatalog& assetCatalog,
+    platform::Window* window,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    PreviewRuntimeState* runtimeState) {
+    constexpr std::uint32_t kValidationSpacingMicrometres = 1'000U;
+    constexpr float kValidationPointDiameterMetres = 0.002F;
+    GuiSmokeReport report;
+    report.scenario = options.scenario;
+    const auto outputDirectory = options.outputDirectory.empty()
+        ? std::filesystem::path{"build/macos-debug/scene3-patch-boundaries"}
+        : options.outputDirectory;
+    report.outputPath =
+        outputDirectory / "scene3-patch-boundaries.json";
+    const auto finish = [&]() {
+        if (!WriteGuiSmokeReport(report)) {
+            std::cerr << "Failed to write GUI smoke report: "
+                      << report.outputPath.string() << "\n";
+            return 1;
+        }
+        std::cout << "GUI smoke report: "
+                  << report.outputPath.string() << std::endl;
+        return report.Passed() ? 0 : 1;
+    };
+    if (window == nullptr || viewport == nullptr || runtimeState == nullptr) {
+        report.Fail(
+            "Patch-boundary smoke did not receive a live window, viewport, "
+            "and runtime state.");
+        return finish();
+    }
+    const auto projectPath = options.projectPath.empty()
+        ? assetCatalog.dataRoot.parent_path() / "Saved" /
+              "ExhibitionFinal_project.json"
+        : options.projectPath;
+    std::string loadError;
+    const auto project =
+        invisible_places::serialization::LoadProjectDocument(
+            projectPath,
+            &loadError);
+    if (!project.has_value()) {
+        report.Fail(
+            "Patch-boundary project did not load: " + loadError);
+        return finish();
+    }
+    const auto loadStarted = std::chrono::steady_clock::now();
+    if (!ApplyProjectDocumentToRuntime(
+            project.value(), runtimeState, viewport)) {
+        report.Fail(
+            "Patch-boundary project could not be applied: " +
+            (runtimeState->errorMessage.empty()
+                 ? runtimeState->statusMessage
+                 : runtimeState->errorMessage));
+        return finish();
+    }
+    runtimeState->projectSettings.liveVisualEffects = false;
+    runtimeState->projectSettings.previewPerformanceMode = false;
+    runtimeState->projectSettings.pointCloudPreviewLodMode =
+        PointCloudPreviewLodMode::FullResolution;
+    runtimeState->water.collisionRainSettings.enabled = false;
+    runtimeState->water.dynamicMeshFlowSettings.enabled = false;
+    runtimeState->water.rippleLayers.clear();
+    runtimeState->water.fieldLayers.clear();
+    runtimeState->water.shorelineInstances.clear();
+    runtimeState->water.selectedShorelineInstanceIndex.reset();
+    for (auto& node : runtimeState->water.seepageNodes) {
+        node.enabledInViewport = false;
+    }
+    for (auto& session : runtimeState->sessions) {
+        if (session.kind == LayerKind::GaussianSplat ||
+            IsGeneratedWaterOverlaySession(session)) {
+            session.visible = false;
+        }
+    }
+    const auto sceneIt = std::find_if(
+        runtimeState->pointCloudScenes.begin(),
+        runtimeState->pointCloudScenes.end(),
+        [](const auto& scene) {
+            return scene.sceneGroupName == "Scene3";
+        });
+    if (sceneIt == runtimeState->pointCloudScenes.end()) {
+        report.Fail("Patch-boundary project contains no Scene3 runtime.");
+        return finish();
+    }
+    auto& scene = *sceneIt;
+    const auto bundleIt = std::find_if(
+        scene.displayBundles.begin(),
+        scene.displayBundles.end(),
+        [&](const auto& bundle) {
+            return bundle.spacingMicrometres == kValidationSpacingMicrometres;
+        });
+    if (bundleIt == scene.displayBundles.end()) {
+        report.Fail("Patch-boundary project contains no complete 1 mm Scene3 bundle.");
+        return finish();
+    }
+    StartQueuedLayerLoadIfIdle(runtimeState);
+    const auto pumpFrame = [&]() {
+        window->PollEvents();
+        PollPendingLayerLoad(runtimeState, viewport);
+        CommitReadySceneDisplaySwitches(runtimeState, viewport);
+        StartQueuedLayerLoadIfIdle(runtimeState);
+        for (auto& session : runtimeState->sessions) {
+            if (session.kind == LayerKind::GaussianSplat ||
+                IsGeneratedWaterOverlaySession(session)) {
+                session.visible = false;
+            }
+        }
+        viewport->BeginUiFrame();
+        viewport->SetDiagnosticsEnabled(true);
+        viewport->SetSceneCachingEnabled(false);
+        viewport->SetLiveSceneRenderingEnabled(true);
+        viewport->SetLiveRainSimulationEnabled(false);
+        viewport->UpdateRenderState(
+            BuildRenderState(*runtimeState, *viewport, 0.0F));
+        viewport->DrawFrame();
+    };
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::minutes{15};
+    while (std::chrono::steady_clock::now() < deadline &&
+           !window->ShouldClose() &&
+           (scene.pendingDisplaySpacingMicrometres.has_value() ||
+            scene.pendingMixedDisplay)) {
+        pumpFrame();
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+    if (scene.pendingDisplaySpacingMicrometres.has_value() ||
+        scene.pendingMixedDisplay) {
+        report.Fail(
+            "The saved Scene3 display did not settle before the 1 mm "
+            "patch-boundary switch.");
+        return finish();
+    }
+    if (scene.committedDisplaySpacingMicrometres !=
+        kValidationSpacingMicrometres) {
+        if (!RequestSceneDisplaySwitch(
+                runtimeState,
+                viewport,
+                &scene,
+                kValidationSpacingMicrometres)) {
+            report.Fail(
+                "Patch-boundary smoke could not request the 1 mm Scene3 bundle: " +
+                (scene.switchError.empty()
+                     ? runtimeState->errorMessage
+                     : scene.switchError));
+            return finish();
+        }
+        StartQueuedLayerLoadIfIdle(runtimeState);
+    }
+    while (std::chrono::steady_clock::now() < deadline &&
+           !window->ShouldClose()) {
+        pumpFrame();
+        const bool displayReady =
+            scene.displayLoaded && scene.displayVisible &&
+            scene.committedDisplaySpacingMicrometres == kValidationSpacingMicrometres &&
+            std::all_of(
+                scene.committedDisplaySessionIndices.begin(),
+                scene.committedDisplaySessionIndices.end(),
+                [&](const auto& index) {
+                    return index.has_value() &&
+                           index.value() < runtimeState->sessions.size() &&
+                           runtimeState->sessions[index.value()].gpuResident;
+                });
+        if (displayReady) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+    const bool displayReady =
+        scene.displayLoaded && scene.displayVisible &&
+        scene.committedDisplaySpacingMicrometres == kValidationSpacingMicrometres;
+    if (!displayReady) {
+        report.Fail(
+            "The 1 mm Scene3 bundle did not become ready: " +
+            (scene.switchError.empty()
+                 ? runtimeState->errorMessage
+                 : scene.switchError));
+        return finish();
+    }
+    report.loadMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - loadStarted).count();
+    const auto sandSessionIndex =
+        scene.committedDisplaySessionIndices[static_cast<std::size_t>(
+            invisible_places::scene::ScenePointCloudRole::Sand)];
+    if (!sandSessionIndex.has_value() ||
+        sandSessionIndex.value() >= runtimeState->sessions.size()) {
+        report.Fail("The committed 1 mm Scene3 bundle has no SAND session.");
+        return finish();
+    }
+    auto& sandSession = runtimeState->sessions[sandSessionIndex.value()];
+    const auto visualWarning = SelectProjectPointVisualForScene(
+        runtimeState,
+        sandSession,
+        "Projector-01");
+    if (!visualWarning.empty()) {
+        report.Fail(
+            "Projector-01 field binding failed: " + visualWarning);
+        return finish();
+    }
+    bool pointDiameterApplied = true;
+    for (const auto& sessionIndex : scene.committedDisplaySessionIndices) {
+        if (!sessionIndex.has_value() ||
+            sessionIndex.value() >= runtimeState->sessions.size()) {
+            pointDiameterApplied = false;
+            continue;
+        }
+        auto& session = runtimeState->sessions[sessionIndex.value()];
+        session.pointStyle.screenSpriteSizeMode =
+            PointCloudScreenSpriteSizeMode::WorldMillimeters;
+        invisible_places::style::SetScalarConstant(
+            &session.pointStyle.surfelDiameter,
+            kValidationPointDiameterMetres);
+        const auto renderedStyle = MakeSceneRenderStyle(
+            *runtimeState,
+            session,
+            session.pointStyle);
+        pointDiameterApplied &=
+            renderedStyle.geometryMode == PointCloudGeometryMode::ScreenSprites &&
+            renderedStyle.screenSpriteSizeMode ==
+                PointCloudScreenSpriteSizeMode::WorldMillimeters &&
+            renderedStyle.falloffProfile == PointCloudFalloffProfile::Gaussian &&
+            renderedStyle.surfelDiameter.active &&
+            renderedStyle.surfelDiameter.mode ==
+                invisible_places::style::ParameterSourceMode::Constant &&
+            std::abs(
+                renderedStyle.surfelDiameter.constantValue[0] -
+                kValidationPointDiameterMetres) <= 1.0e-7F;
+    }
+    if (!pointDiameterApplied) {
+        report.Fail(
+            "Patch-boundary smoke could not force every Scene3 role to a "
+            "2 mm world-space Projector point diameter.");
+        return finish();
+    }
+    const std::array<std::string_view, 3> requiredFields{
+        "Roughness",
+        "A_R_MeanCurvature_Combined",
+        "A_R_Recession_Combined",
+    };
+    const auto hasField = [&](std::string_view name) {
+        return std::any_of(
+            sandSession.scalarFields.begin(),
+            sandSession.scalarFields.end(),
+            [&](const auto& field) {
+                return field.name == name;
+            });
+    };
+    if (!std::all_of(
+            requiredFields.begin(),
+            requiredFields.end(),
+            hasField)) {
+        report.Fail(
+            "Projector-01 did not load Roughness and both required A_R fields.");
+        return finish();
+    }
+    const auto neutralWaterFrame = ResolveWaterFrameState(runtimeState);
+    const auto neutralRenderState = BuildRenderState(
+        *runtimeState,
+        *viewport,
+        0.0F,
+        &neutralWaterFrame);
+    const bool shorelineStyleActive = std::any_of(
+        neutralRenderState.pointCloudLayers.begin(),
+        neutralRenderState.pointCloudLayers.end(),
+        [](const auto& layer) {
+            return layer.style.shorelineWaveEnabled;
+        });
+    if (!runtimeState->water.shorelineInstances.empty() ||
+        !neutralRenderState.additionalShorelines.empty() ||
+        shorelineStyleActive) {
+        report.Fail(
+            "Patch-boundary smoke retained an active Shoreline effect.");
+        return finish();
+    }
+    report.Pass(
+        "Cleared all Shoreline instances and verified every rendered "
+        "point-cloud style has shoreline waves disabled.");
+    report.selectedPointCount = sandSession.totalPrimitives;
+    report.Pass(
+        "Loaded the explicit project, full 1 mm Scene3 bundle, exact "
+        "Projector-01 RGB/Roughness/A_R field bindings, and a fixed 2 mm "
+        "world-space point diameter.");
+
+    struct PatchView {
+        std::string_view camera;
+        std::array<float, 3> centre;
+        std::array<float, 2> radius;
+        bool drawBoundaryEllipse{true};
+    };
+    const std::array<PatchView, 4> patchViews{{
+        {"Patch 01", {305.4618F, 105.8048F, 1.4165F}, {0.6819F, 0.6450F}},
+        {"Patch 02", {304.5282F, 99.0090F, 1.4577F}, {0.6849F, 0.6900F}},
+        {"Patch 03", {311.8013F, 77.2173F, 1.4222F}, {0.6450F, 0.7125F}},
+        {"Patch 04", {307.0819F, 104.0351F, 1.8022F}, {0.0F, 0.0F}, false},
+    }};
+    std::vector<WaterIntegrationCapturedFrame> capturedFrames;
+    capturedFrames.reserve(patchViews.size());
+    for (const auto& patch : patchViews) {
+        const auto shotIt = std::find_if(
+            runtimeState->cameraShots.begin(),
+            runtimeState->cameraShots.end(),
+            [&](const auto& shot) {
+                return shot.name == patch.camera;
+            });
+        if (shotIt == runtimeState->cameraShots.end()) {
+            report.Fail(
+                "Saved camera is missing: " + std::string{patch.camera});
+            return finish();
+        }
+        runtimeState->camera.ApplyState(shotIt->state);
+        runtimeState->previewRenderStateSignatureValid = false;
+        for (std::uint32_t frame = 0U; frame < 8U; ++frame) {
+            pumpFrame();
+        }
+        const auto slug = BenchmarkSlug(patch.camera);
+        std::string captureError;
+        auto captured = CaptureWaterIntegrationFrame(
+            runtimeState,
+            viewport,
+            ResolveWaterFrameState(runtimeState),
+            0.0F,
+            outputDirectory / (slug + ".exr"),
+            outputDirectory / (slug + ".ppm"),
+            &captureError);
+        if (!captured.has_value()) {
+            report.Fail(
+                "Could not capture " + std::string{patch.camera} + ": " +
+                captureError);
+            return finish();
+        }
+        const auto pngPath = outputDirectory / (slug + ".png");
+        if (!WritePatchBoundaryPng(
+                pngPath,
+                captured.value(),
+                &captureError)) {
+            report.Fail(
+                "Could not write " + pngPath.string() + ": " +
+                captureError);
+            return finish();
+        }
+        if (patch.drawBoundaryEllipse) {
+            auto debugFrame = captured.value();
+            DrawPatchBoundaryDebugEllipse(
+                *runtimeState,
+                *viewport,
+                patch.centre,
+                patch.radius,
+                &debugFrame);
+            const auto debugPath =
+                outputDirectory / (slug + "_boundary.png");
+            if (!WritePatchBoundaryPng(
+                    debugPath,
+                    debugFrame,
+                    &captureError)) {
+                report.Fail(
+                    "Could not write " + debugPath.string() + ": " +
+                    captureError);
+                return finish();
+            }
+        }
+        report.Pass(
+            "Rendered " + std::string{patch.camera} + " to " +
+            pngPath.string() +
+            (patch.drawBoundaryEllipse
+                 ? " with a separate boundary overlay."
+                 : " as the unannotated ScanID 9 density-edge view."));
+        capturedFrames.push_back(std::move(captured.value()));
+    }
+    std::string sheetError;
+    const auto sheetPath =
+        outputDirectory / "patch-01-02-03-04-contact-sheet.png";
+    if (!WritePatchBoundaryContactSheetPng(
+            sheetPath,
+            capturedFrames,
+            &sheetError)) {
+        report.Fail(
+            "Could not write patch contact sheet: " + sheetError);
+        return finish();
+    }
+    report.Pass(
+        "Captured all four unannotated Projector-01 views and contact sheet: " +
+        sheetPath.string());
+    viewport->WaitIdle();
+    return finish();
+}
+
 std::optional<WaterIntegrationCapturedFrame> RenderWaterIntegrationOfflineComparison(
     PreviewRuntimeState* runtimeState,
     const ScenePointCloudRuntime& scene,
@@ -80178,6 +80755,17 @@ int Application::Run(ApplicationRunOptions options) const {
                 &viewport.value(),
                 &runtimeState,
                 dataRoot_);
+            StopBackgroundWorkForShutdown(&runtimeState);
+            viewport->WaitIdle();
+            return smokeExitCode;
+        }
+        if (options.guiSmoke->scenario == "scene3-patch-boundaries") {
+            const auto smokeExitCode = RunScene3PatchBoundarySmoke(
+                options.guiSmoke.value(),
+                assetCatalog,
+                &window,
+                &viewport.value(),
+                &runtimeState);
             StopBackgroundWorkForShutdown(&runtimeState);
             viewport->WaitIdle();
             return smokeExitCode;

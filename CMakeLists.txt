@@ -265,6 +265,44 @@ if(APPLE)
 endif()
 
 if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        set(INVISIBLE_PLACES_PATCH_PYTHON_CANDIDATES "${Python3_EXECUTABLE}")
+        if(APPLE)
+            list(APPEND INVISIBLE_PLACES_PATCH_PYTHON_CANDIDATES "/opt/homebrew/bin/python3")
+        endif()
+        unset(INVISIBLE_PLACES_PATCH_PYTHON_EXECUTABLE)
+        foreach(INVISIBLE_PLACES_PATCH_PYTHON_CANDIDATE IN LISTS INVISIBLE_PLACES_PATCH_PYTHON_CANDIDATES)
+            if(EXISTS "${INVISIBLE_PLACES_PATCH_PYTHON_CANDIDATE}" AND
+               NOT INVISIBLE_PLACES_PATCH_PYTHON_EXECUTABLE)
+                execute_process(
+                    COMMAND "${INVISIBLE_PLACES_PATCH_PYTHON_CANDIDATE}" -c "import numpy"
+                    RESULT_VARIABLE INVISIBLE_PLACES_PATCH_PYTHON_RESULT
+                    OUTPUT_QUIET
+                    ERROR_QUIET
+                )
+                if(INVISIBLE_PLACES_PATCH_PYTHON_RESULT EQUAL 0)
+                    set(INVISIBLE_PLACES_PATCH_PYTHON_EXECUTABLE
+                        "${INVISIBLE_PLACES_PATCH_PYTHON_CANDIDATE}")
+                endif()
+            endif()
+        endforeach()
+        if(INVISIBLE_PLACES_PATCH_PYTHON_EXECUTABLE)
+            add_test(
+                NAME scene3-scanner-patch-refinement-tests
+                COMMAND
+                    "${INVISIBLE_PLACES_PATCH_PYTHON_EXECUTABLE}" -m unittest
+                    tests/test_refine_scene3_scanner_patches.py -v
+            )
+            set_tests_properties(
+                scene3-scanner-patch-refinement-tests
+                PROPERTIES
+                    LABELS "pointcloud;python"
+                    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+            )
+        endif()
+    endif()
+
     find_package(Catch2 3 CONFIG QUIET)
     if(Catch2_FOUND)
         add_executable(
@@ -298,6 +336,23 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
     endif()
 
     if(INVISIBLE_PLACES_ENABLE_GUI_SMOKE_TESTS)
+        add_test(
+            NAME scene3-patch-boundaries-gui-smoke
+            COMMAND
+                $<TARGET_FILE:invisible_places>
+                "${CMAKE_CURRENT_SOURCE_DIR}/Data"
+                --gui-smoke scene3-patch-boundaries
+                --smoke-project "${CMAKE_CURRENT_SOURCE_DIR}/Saved/ExhibitionFinal_project.json"
+                --smoke-output "${CMAKE_CURRENT_BINARY_DIR}/scene3-patch-boundaries"
+        )
+        set_tests_properties(
+            scene3-patch-boundaries-gui-smoke
+            PROPERTIES
+                LABELS "gui_smoke;pointcloud;full_site"
+                RUN_SERIAL TRUE
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                TIMEOUT 1200
+        )
         add_test(
             NAME renderer-frame-timing-scene3-5mm
             COMMAND

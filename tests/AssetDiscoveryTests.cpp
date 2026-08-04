@@ -1117,6 +1117,29 @@ TEST_CASE("Discovery groups role-named sibling PLY files by folder", "[discovery
     std::filesystem::remove_all(root);
 }
 
+TEST_CASE("Asset discovery skips marked staging trees", "[discovery][scene]") {
+    const auto root =
+        std::filesystem::temp_directory_path() /
+        "invisible_places_discovery_ignore_test";
+    std::filesystem::remove_all(root);
+    WriteTinyPointCloudPly(root / "VisibleScene" / "Visible-SAND-1mm.ply");
+    WriteTinyPointCloudPly(
+        root / "RefinementStaging" / "HiddenScene" / "Hidden-SAND-1mm.ply");
+    {
+        std::ofstream marker{
+            root / "RefinementStaging" / ".invisible_places-ignore"};
+        marker << "staging\n";
+    }
+
+    const auto catalog = invisible_places::io::DiscoverAssets(root);
+
+    REQUIRE(catalog.issues.empty());
+    REQUIRE(catalog.pointClouds.size() == 1U);
+    CHECK(catalog.pointClouds.front().filePath.filename() ==
+          "Visible-SAND-1mm.ply");
+    std::filesystem::remove_all(root);
+}
+
 TEST_CASE(
     "Sampled Ground discovery rejects ambiguous scene-local candidates",
     "[discovery][scene][ground]") {

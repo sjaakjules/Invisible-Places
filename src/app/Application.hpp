@@ -9,6 +9,7 @@ namespace invisible_places::app {
 struct GuiSmokeOptions {
     std::string scenario;
     std::filesystem::path outputDirectory;
+    std::filesystem::path projectPath;
 };
 
 struct ExportBenchmarkOptions {

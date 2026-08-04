@@ -28,6 +28,15 @@ int main(int argc, char** argv) {
                 options.guiSmoke.emplace();
             }
             options.guiSmoke->outputDirectory = argv[++index];
+        } else if (argument == "--smoke-project") {
+            if (index + 1 >= argc || argv[index + 1] == nullptr) {
+                std::cerr << "--smoke-project requires a project path.\n";
+                return 2;
+            }
+            if (!options.guiSmoke.has_value()) {
+                options.guiSmoke.emplace();
+            }
+            options.guiSmoke->projectPath = argv[++index];
         } else if (argument == "--export-benchmark") {
             if (index + 1 >= argc || argv[index + 1] == nullptr) {
                 std::cerr << "--export-benchmark requires a scenario name.\n";
