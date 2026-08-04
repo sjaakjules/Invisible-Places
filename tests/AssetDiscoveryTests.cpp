@@ -2588,6 +2588,12 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     document.waterTrailGeometry.pointSpacingMeters = 0.033F;
     document.waterTrailGeometry.widthMeters = 0.014F;
     document.waterTrailGeometry.streakLengthMeters = 0.095F;
+    document.waterTrailGeometry.startFadeEnabled = true;
+    document.waterTrailGeometry.startFadeFullDistanceMeters = 0.31F;
+    document.waterTrailGeometry.startFadeRandomBeginDistanceMeters = 0.12F;
+    document.waterTrailGeometry.endFadeEnabled = true;
+    document.waterTrailGeometry.endFadeFullDistanceMeters = 0.47F;
+    document.waterTrailGeometry.endFadeRandomBeginDistanceMeters = 0.19F;
     invisible_places::serialization::WaterPathProfileDocument pathProfile;
     pathProfile.name = "Shelf Path";
     pathProfile.settings = document.waterSourceSettings.path;
@@ -3191,6 +3197,12 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(loadedDocument->waterTrailGeometry.pointSpacingMeters == Catch::Approx(0.033F));
     CHECK(loadedDocument->waterTrailGeometry.widthMeters == Catch::Approx(0.014F));
     CHECK(loadedDocument->waterTrailGeometry.streakLengthMeters == Catch::Approx(0.095F));
+    CHECK(loadedDocument->waterTrailGeometry.startFadeEnabled);
+    CHECK(loadedDocument->waterTrailGeometry.startFadeFullDistanceMeters == Catch::Approx(0.31F));
+    CHECK(loadedDocument->waterTrailGeometry.startFadeRandomBeginDistanceMeters == Catch::Approx(0.12F));
+    CHECK(loadedDocument->waterTrailGeometry.endFadeEnabled);
+    CHECK(loadedDocument->waterTrailGeometry.endFadeFullDistanceMeters == Catch::Approx(0.47F));
+    CHECK(loadedDocument->waterTrailGeometry.endFadeRandomBeginDistanceMeters == Catch::Approx(0.19F));
     REQUIRE(loadedDocument->waterPathProfiles.size() == 1U);
     CHECK(loadedDocument->waterPathProfiles[0].name == "Shelf Path");
     CHECK(loadedDocument->waterPathProfiles[0].settings.pathLength == Catch::Approx(7.5F));
@@ -4547,6 +4559,12 @@ TEST_CASE("Water v2 trails expose deterministic scalar contracts", "[water][v2]"
     trailSettings.trailPointSpacingMeters = 0.09F;
     trailSettings.trailWidthMeters = 0.012F;
     trailSettings.trailStreakLengthMeters = 0.050F;
+    trailSettings.startFadeEnabled = true;
+    trailSettings.startFadeFullDistanceMeters = 0.18F;
+    trailSettings.startFadeRandomBeginDistanceMeters = 0.07F;
+    trailSettings.endFadeEnabled = true;
+    trailSettings.endFadeFullDistanceMeters = 0.24F;
+    trailSettings.endFadeRandomBeginDistanceMeters = 0.11F;
     trailSettings.laneSpreadMeters = 0.04F;
     trailSettings.laneCount = 4U;
     trailSettings.laneCrossing = 0.37F;
@@ -4595,7 +4613,12 @@ TEST_CASE("Water v2 trails expose deterministic scalar contracts", "[water][v2]"
         "trail_lane_pitch",
         "trail_lane_span",
         "trail_lane_crossing",
-        "trail_cross_seed"};
+        "trail_cross_seed",
+        "endpoint_fade_flags",
+        "start_fade_full_distance",
+        "start_fade_random_begin_distance",
+        "end_fade_full_distance",
+        "end_fade_random_begin_distance"};
     REQUIRE(cloud.ScalarFieldCount() == expectedFields.size());
     for (std::size_t index = 0; index < expectedFields.size(); ++index) {
         CHECK(cloud.scalarFields[index].name == expectedFields[index]);
@@ -4648,6 +4671,11 @@ TEST_CASE("Water v2 trails expose deterministic scalar contracts", "[water][v2]"
     CHECK(firstVisibleSample->trailLaneCrossing == Catch::Approx(trailSettings.laneCrossing));
     CHECK(firstVisibleSample->trailCrossSeed >= 0.0F);
     CHECK(firstVisibleSample->trailCrossSeed <= 1.0F);
+    CHECK(firstVisibleSample->endpointFadeFlags == Catch::Approx(3.0F));
+    CHECK(firstVisibleSample->startFadeFullDistanceMeters == Catch::Approx(0.18F));
+    CHECK(firstVisibleSample->startFadeRandomBeginDistanceMeters == Catch::Approx(0.07F));
+    CHECK(firstVisibleSample->endFadeFullDistanceMeters == Catch::Approx(0.24F));
+    CHECK(firstVisibleSample->endFadeRandomBeginDistanceMeters == Catch::Approx(0.11F));
     CHECK(std::abs(firstVisibleSample->trailLateralOffset) <= (trailSettings.laneSpreadMeters * 0.5F) + 0.002F);
     CHECK(expectedLaneCount < static_cast<std::uint32_t>(
         std::ceil(trailSettings.laneSpreadMeters / expectedLanePitch)));
@@ -4774,6 +4802,9 @@ TEST_CASE("Water Flow lane edits stay outside path bake inputs", "[water][flow][
     routeChanging = lanes;
     routeChanging.turbulenceScaleMeters *= 2.0F;
     CHECK_FALSE(invisible_places::water::WaterFlowLaneRouteInputsEqual(lanes, routeChanging));
+    routeChanging = lanes;
+    routeChanging.startFadeEnabled = true;
+    CHECK_FALSE(invisible_places::water::WaterFlowLaneRouteInputsEqual(lanes, routeChanging));
     CHECK(invisible_places::water::WaterSourceBakeInputsEqual(source, source));
 
     invisible_places::water::WaterTrailGeometrySettings geometry;
@@ -4787,6 +4818,16 @@ TEST_CASE("Water Flow lane edits stay outside path bake inputs", "[water][flow][
     generatedGeometry.pointSpacingMeters *= 1.5F;
     CHECK_FALSE(invisible_places::water::WaterTrailGeometryGenerationInputsEqual(geometry, generatedGeometry));
     CHECK_FALSE(invisible_places::water::WaterTrailGeometryLiveVisualOnlyEdit(geometry, generatedGeometry));
+
+    generatedGeometry = geometry;
+    generatedGeometry.endFadeEnabled = true;
+    generatedGeometry.endFadeFullDistanceMeters = 0.42F;
+    CHECK_FALSE(invisible_places::water::WaterTrailGeometryGenerationInputsEqual(geometry, generatedGeometry));
+    const auto fadedSettings = invisible_places::water::ApplyWaterTrailGeometryToFlowTrailSettings(
+        lanes,
+        generatedGeometry);
+    CHECK(fadedSettings.endFadeEnabled);
+    CHECK(fadedSettings.endFadeFullDistanceMeters == Catch::Approx(0.42F));
 }
 
 TEST_CASE("Water Flow trail builds cancel cleanly without publishing partial samples", "[water][flow][performance]") {
@@ -4875,7 +4916,14 @@ TEST_CASE("GPU Flow output layout is deterministic and grows source-locally", "[
     REQUIRE(reused.Valid());
     CHECK(reused.pointCount == first.pointCount);
     CHECK(reused.pointCapacity == 2048U);
-    CHECK(invisible_places::water::kWaterTrailScalarFieldCount == 31U);
+    CHECK(invisible_places::water::kWaterTrailScalarFieldCount == 36U);
+    const auto gpuScalarFields =
+        invisible_places::water::WaterTrailOverlayScalarFieldsForPointCount(
+            reused.pointCapacity,
+            true);
+    REQUIRE(gpuScalarFields.size() == 36U);
+    CHECK(gpuScalarFields[31U].name == "endpoint_fade_flags");
+    CHECK(gpuScalarFields[35U].name == "end_fade_random_begin_distance");
 
     const auto capped = invisible_places::water::BuildWaterFlowGpuOutputLayout(
         5U,
@@ -5230,6 +5278,135 @@ TEST_CASE("Manual Flow splines produce deterministic lane-ready anchors and trai
     CHECK(minimumLaneOffset < -settings.laneSpreadMeters * 0.25F);
     CHECK(maximumLaneOffset > settings.laneSpreadMeters * 0.25F);
     CHECK(checkedStartDirection);
+}
+
+TEST_CASE("Manual Flow node lane covers inherit, override, and smoothly scale the global width",
+          "[water][flow][manual-path][lane-width]") {
+    using invisible_places::water::BuildManualFlowPathAnchors;
+    using invisible_places::water::BuildWaterFlowGpuManualSplineInput;
+    using invisible_places::water::ResolveWaterManualFlowPathLaneWidth;
+    using invisible_places::water::WaterManualFlowPathLaneWidth;
+    using invisible_places::water::WaterManualFlowPathLaneWidthMode;
+    using invisible_places::water::WaterManualFlowPathSource;
+
+    constexpr float globalLaneCover = 0.50F;
+    CHECK(ResolveWaterManualFlowPathLaneWidth(
+              {.mode = WaterManualFlowPathLaneWidthMode::Inherit,
+               .value = 99.0F},
+              globalLaneCover) == Catch::Approx(globalLaneCover));
+    CHECK(ResolveWaterManualFlowPathLaneWidth(
+              {.mode = WaterManualFlowPathLaneWidthMode::Absolute,
+               .value = 0.20F},
+              globalLaneCover) == Catch::Approx(0.20F));
+    CHECK(ResolveWaterManualFlowPathLaneWidth(
+              {.mode = WaterManualFlowPathLaneWidthMode::Relative,
+               .value = 0.20F},
+              globalLaneCover) == Catch::Approx(0.10F));
+    CHECK(ResolveWaterManualFlowPathLaneWidth(
+              {.mode = WaterManualFlowPathLaneWidthMode::Relative,
+               .value = 2.30F},
+              globalLaneCover) == Catch::Approx(1.15F));
+
+    WaterManualFlowPathSource source;
+    source.id = 619U;
+    source.controlPoints = {
+        {0.0F, 0.0F, 0.0F},
+        {1.0F, 0.0F, 0.0F},
+        {2.0F, 0.0F, 0.0F},
+    };
+    source.controlPointLaneWidths = {
+        {.mode = WaterManualFlowPathLaneWidthMode::Inherit, .value = 1.0F},
+        {.mode = WaterManualFlowPathLaneWidthMode::Absolute, .value = 0.20F},
+        {.mode = WaterManualFlowPathLaneWidthMode::Relative, .value = 2.30F},
+    };
+
+    const auto compact = BuildWaterFlowGpuManualSplineInput(
+        source.controlPoints,
+        source.controlPointLaneWidths);
+    REQUIRE(compact.Valid());
+    REQUIRE(compact.points.size() == 3U);
+    CHECK(compact.points[0].laneWidth.mode ==
+          WaterManualFlowPathLaneWidthMode::Inherit);
+    CHECK(compact.points[1].laneWidth.mode ==
+          WaterManualFlowPathLaneWidthMode::Absolute);
+    CHECK(compact.points[1].laneWidth.value == Catch::Approx(0.20F));
+    CHECK(compact.points[2].laneWidth.mode ==
+          WaterManualFlowPathLaneWidthMode::Relative);
+    CHECK(compact.points[2].laneWidth.value == Catch::Approx(2.30F));
+
+    const auto anchors = BuildManualFlowPathAnchors(
+        source,
+        0.02F,
+        globalLaneCover);
+    REQUIRE(anchors.points.size() > 80U);
+    const auto closestToX = [&](float x) -> const auto& {
+        return *std::min_element(
+            anchors.points.begin(),
+            anchors.points.end(),
+            [x](const auto& left, const auto& right) {
+                return std::abs(left.position.x - x) <
+                       std::abs(right.position.x - x);
+            });
+    };
+    CHECK(closestToX(0.0F).laneSpanMeters ==
+          Catch::Approx(0.50F).margin(1.0e-4F));
+    CHECK(closestToX(1.0F).laneSpanMeters ==
+          Catch::Approx(0.20F).margin(1.0e-4F));
+    CHECK(closestToX(2.0F).laneSpanMeters ==
+          Catch::Approx(1.15F).margin(1.0e-4F));
+    CHECK(closestToX(0.5F).laneSpanMeters ==
+          Catch::Approx(0.35F).margin(0.01F));
+    CHECK(closestToX(1.5F).laneSpanMeters ==
+          Catch::Approx(0.675F).margin(0.02F));
+    for (const auto& anchor : anchors.points) {
+        CHECK(anchor.laneSpanMeters >= 0.20F);
+        CHECK(anchor.laneSpanMeters <= 1.15F);
+    }
+
+    invisible_places::water::WaterFlowTrailSettings settings;
+    settings.trailCountTotal = 3U;
+    settings.laneCount = 3U;
+    settings.laneSpreadMeters = globalLaneCover;
+    settings.trailLengthMeters = 2.0F;
+    settings.trailPointSpacingMeters = 0.02F;
+    settings.trailWidthMeters = 0.004F;
+    settings.surfaceFollow = 0.0F;
+    settings.turbulence = 0.0F;
+    settings.laneCrossing = 0.0F;
+    const auto trails =
+        invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(
+            anchors,
+            settings);
+    REQUIRE_FALSE(trails.samples.empty());
+    float narrowSpan = std::numeric_limits<float>::max();
+    float wideSpan = 0.0F;
+    float startEndpointOffset = 0.0F;
+    float endEndpointOffset = 0.0F;
+    for (const auto& sample : trails.samples) {
+        if (sample.trailRole >= 0.5F) {
+            if (sample.position.x < 0.01F) {
+                startEndpointOffset = std::max(
+                    startEndpointOffset,
+                    std::abs(sample.trailLateralOffset));
+            }
+            if (sample.position.x > 1.99F) {
+                endEndpointOffset = std::max(
+                    endEndpointOffset,
+                    std::abs(sample.trailLateralOffset));
+            }
+            continue;
+        }
+        if (sample.position.x > 0.90F && sample.position.x < 1.10F) {
+            narrowSpan = std::min(narrowSpan, sample.trailLaneSpan);
+        }
+        if (sample.position.x > 1.85F) {
+            wideSpan = std::max(wideSpan, sample.trailLaneSpan);
+        }
+    }
+    CHECK(narrowSpan < 0.30F);
+    CHECK(wideSpan > 0.90F);
+    CHECK(startEndpointOffset > 0.10F);
+    CHECK(endEndpointOffset > 0.25F);
 }
 
 TEST_CASE("Manual Flow turbulence is arc-distance stable and independent of sprite width",
@@ -10413,6 +10590,12 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     document.trailGeometry.pointSpacingMeters = 0.044F;
     document.trailGeometry.widthMeters = 0.018F;
     document.trailGeometry.streakLengthMeters = 0.12F;
+    document.trailGeometry.startFadeEnabled = true;
+    document.trailGeometry.startFadeFullDistanceMeters = 0.28F;
+    document.trailGeometry.startFadeRandomBeginDistanceMeters = 0.09F;
+    document.trailGeometry.endFadeEnabled = true;
+    document.trailGeometry.endFadeFullDistanceMeters = 0.39F;
+    document.trailGeometry.endFadeRandomBeginDistanceMeters = 0.14F;
     invisible_places::serialization::WaterPathProfileDocument sourcePathProfile;
     sourcePathProfile.name = "Source Path";
     sourcePathProfile.settings = document.sourceSettings.path;
@@ -10550,6 +10733,12 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     document.flowTrailSettings.trailCountTotal = 222U;
     document.flowTrailSettings.trailStreakLengthMeters = 0.052F;
     document.flowTrailSettings.laneCrossing = 0.31F;
+    document.flowTrailSettings.startFadeEnabled = true;
+    document.flowTrailSettings.startFadeFullDistanceMeters = 0.22F;
+    document.flowTrailSettings.startFadeRandomBeginDistanceMeters = 0.08F;
+    document.flowTrailSettings.endFadeEnabled = true;
+    document.flowTrailSettings.endFadeFullDistanceMeters = 0.41F;
+    document.flowTrailSettings.endFadeRandomBeginDistanceMeters = 0.16F;
     document.fieldSettings.corridorRadiusMeters = 0.38F;
     document.fieldTrailSettings.trailCount = 333U;
     document.fieldTrailSettings.trailLengthMeters = 0.94F;
@@ -10596,6 +10785,8 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
         CHECK(savedJson.find("\"source_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"temp_source_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"water_trail_geometry\"") != std::string::npos);
+        CHECK(savedJson.find("\"start_fade_full_distance_meters\"") != std::string::npos);
+        CHECK(savedJson.find("\"end_fade_random_begin_distance_meters\"") != std::string::npos);
         CHECK(savedJson.find("\"water_path_profiles\"") != std::string::npos);
         CHECK(savedJson.find("\"water_lane_profiles\"") != std::string::npos);
         CHECK(savedJson.find("\"water_trail_profiles\"") != std::string::npos);
@@ -10660,6 +10851,12 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     CHECK(loaded->trailGeometry.pointSpacingMeters == Catch::Approx(0.044F));
     CHECK(loaded->trailGeometry.widthMeters == Catch::Approx(0.018F));
     CHECK(loaded->trailGeometry.streakLengthMeters == Catch::Approx(0.12F));
+    CHECK(loaded->trailGeometry.startFadeEnabled);
+    CHECK(loaded->trailGeometry.startFadeFullDistanceMeters == Catch::Approx(0.28F));
+    CHECK(loaded->trailGeometry.startFadeRandomBeginDistanceMeters == Catch::Approx(0.09F));
+    CHECK(loaded->trailGeometry.endFadeEnabled);
+    CHECK(loaded->trailGeometry.endFadeFullDistanceMeters == Catch::Approx(0.39F));
+    CHECK(loaded->trailGeometry.endFadeRandomBeginDistanceMeters == Catch::Approx(0.14F));
     REQUIRE(loaded->pathProfiles.size() == 1U);
     CHECK(loaded->pathProfiles[0].name == "Source Path");
     CHECK(loaded->pathProfiles[0].settings.pathLength == Catch::Approx(12.5F));
@@ -10734,6 +10931,12 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     CHECK(loaded->flowTrailSettings.trailCountTotal == 222U);
     CHECK(loaded->flowTrailSettings.trailStreakLengthMeters == Catch::Approx(0.052F));
     CHECK(loaded->flowTrailSettings.laneCrossing == Catch::Approx(0.31F));
+    CHECK(loaded->flowTrailSettings.startFadeEnabled);
+    CHECK(loaded->flowTrailSettings.startFadeFullDistanceMeters == Catch::Approx(0.22F));
+    CHECK(loaded->flowTrailSettings.startFadeRandomBeginDistanceMeters == Catch::Approx(0.08F));
+    CHECK(loaded->flowTrailSettings.endFadeEnabled);
+    CHECK(loaded->flowTrailSettings.endFadeFullDistanceMeters == Catch::Approx(0.41F));
+    CHECK(loaded->flowTrailSettings.endFadeRandomBeginDistanceMeters == Catch::Approx(0.16F));
     CHECK(loaded->fieldSettings.corridorRadiusMeters == Catch::Approx(0.38F));
     CHECK(loaded->fieldTrailSettings.trailCount == 333U);
     CHECK(loaded->fieldTrailSettings.trailLengthMeters == Catch::Approx(0.94F));
@@ -11759,6 +11962,205 @@ TEST_CASE("Animation path perceived flow is zero for static paths and retimes ev
     CHECK(segmentFrames[1] == 45U);
 }
 
+TEST_CASE("Linked animation rotates to a keyed phase and applies signed padding",
+          "[camera][animation][linked-loop]") {
+    using invisible_places::camera::AnimationLinkedLoopBuildOptions;
+    using invisible_places::camera::AnimationPath;
+    const auto makeLinearPath = [](
+                                    const char* name,
+                                    const char* idPrefix,
+                                    float offset) {
+        AnimationPath path;
+        path.name = name;
+        path.durationFrames = 120U;
+        path.keys = {
+            {.id = std::string{idPrefix} + "1",
+             .cameraPosition = {offset, 0.0F, 0.0F},
+             .focusPoint = {offset, 1.0F, 0.0F},
+             .durationFrames = 30U},
+            {.id = std::string{idPrefix} + "2",
+             .cameraPosition = {offset + 30.0F, 0.0F, 0.0F},
+             .focusPoint = {offset + 30.0F, 1.0F, 0.0F},
+             .durationFrames = 30U},
+            {.id = std::string{idPrefix} + "3",
+             .cameraPosition = {offset + 60.0F, 0.0F, 0.0F},
+             .focusPoint = {offset + 60.0F, 1.0F, 0.0F},
+             .durationFrames = 30U},
+            {.id = std::string{idPrefix} + "4",
+             .cameraPosition = {offset + 90.0F, 0.0F, 0.0F},
+             .focusPoint = {offset + 90.0F, 1.0F, 0.0F},
+             .durationFrames = 30U},
+            {.id = std::string{idPrefix} + "5",
+             .cameraPosition = {offset + 120.0F, 0.0F, 0.0F},
+             .focusPoint = {offset + 120.0F, 1.0F, 0.0F},
+             .durationFrames = 30U},
+        };
+        return path;
+    };
+    const auto first = makeLinearPath("A", "a", 0.0F);
+    const auto second = makeLinearPath("B", "b", 100.0F);
+
+    const auto zeroPaddingTiming =
+        invisible_places::camera::ResolveLinkedLoopTiming(
+            first,
+            second,
+            0);
+    CHECK(zeroPaddingTiming.secondStartFrame == Catch::Approx(90.0F));
+    CHECK(zeroPaddingTiming.periodFrames == 180U);
+    const auto firstJoinAnchor =
+        invisible_places::camera::EvaluateLinkedLoopSourceSample(
+            first,
+            second,
+            0.0F,
+            0,
+            90.0F / 180.0F);
+    REQUIRE(firstJoinAnchor.valid);
+    REQUIRE(firstJoinAnchor.firstActive);
+    REQUIRE(firstJoinAnchor.secondActive);
+    CHECK(firstJoinAnchor.first.camera.position[0] ==
+          Catch::Approx(90.0F));
+    CHECK(firstJoinAnchor.second.camera.position[0] ==
+          Catch::Approx(100.0F));
+    CHECK(firstJoinAnchor.firstWeight == Catch::Approx(1.0F));
+    CHECK(firstJoinAnchor.secondWeight == Catch::Approx(0.0F));
+    const auto secondJoinAnchor =
+        invisible_places::camera::EvaluateLinkedLoopSourceSample(
+            first,
+            second,
+            0.0F,
+            0,
+            0.0F);
+    REQUIRE(secondJoinAnchor.valid);
+    REQUIRE(secondJoinAnchor.firstActive);
+    REQUIRE(secondJoinAnchor.secondActive);
+    CHECK(secondJoinAnchor.second.camera.position[0] ==
+          Catch::Approx(190.0F));
+    CHECK(secondJoinAnchor.first.camera.position[0] ==
+          Catch::Approx(0.0F));
+    CHECK(secondJoinAnchor.secondWeight == Catch::Approx(1.0F));
+    CHECK(secondJoinAnchor.firstWeight == Catch::Approx(0.0F));
+
+    std::string error;
+    const auto overlapped =
+        invisible_places::camera::BuildLinkedLoopAnimation(
+            first,
+            second,
+            AnimationLinkedLoopBuildOptions{
+                .name = "A B Linked",
+                .firstFileName = "A.ipanim.json",
+                .secondFileName = "B.ipanim.json",
+                .firstStartKeyIndex = 2U,
+                .paddingFrames = -10,
+            },
+            &error);
+    INFO(error);
+    REQUIRE(overlapped.has_value());
+    REQUIRE(overlapped->linkedLoop.has_value());
+    CHECK(overlapped->durationFrames == 160U);
+    REQUIRE(overlapped->keys.size() == 161U);
+    CHECK(overlapped->linkedLoop->firstStartKeyId == "a3");
+    CHECK(overlapped->linkedLoop->firstStartPosition ==
+          Catch::Approx(0.5F));
+    CHECK(overlapped->linkedLoop->paddingFrames == -10);
+    CHECK(overlapped->keys.front().cameraPosition[0] ==
+          Catch::Approx(60.0F));
+    CHECK(overlapped->keys.back().cameraPosition[0] ==
+          Catch::Approx(60.0F));
+    // B begins ten frames before A's penultimate key. That extends the
+    // complete A terminal-edge blend to forty frames.
+    CHECK(overlapped->keys[20U].cameraPosition[0] ==
+          Catch::Approx(80.0F));
+    CHECK(overlapped->keys[40U].cameraPosition[0] ==
+          Catch::Approx(110.0F));
+    CHECK(overlapped->keys[60U].cameraPosition[0] ==
+          Catch::Approx(140.0F));
+    // The wrapped B -> A seam receives the same overlap treatment.
+    CHECK(overlapped->keys[100U].cameraPosition[0] ==
+          Catch::Approx(180.0F));
+    CHECK(overlapped->keys[120U].cameraPosition[0] ==
+          Catch::Approx(110.0F));
+    CHECK(overlapped->keys[140U].cameraPosition[0] ==
+          Catch::Approx(40.0F));
+
+    const auto timing =
+        invisible_places::camera::ResolveLinkedLoopTiming(
+            first,
+            second,
+            -10);
+    CHECK(timing.firstTerminalStartFrame == 90U);
+    CHECK(timing.secondTerminalStartFrame == 90U);
+    CHECK(timing.secondStartFrame == Catch::Approx(80.0F));
+    CHECK(timing.periodFrames == 160U);
+    const auto overlapStart =
+        invisible_places::camera::EvaluateLinkedLoopSourceSample(
+            first,
+            second,
+            0.5F,
+            -10,
+            20.0F / 160.0F);
+    REQUIRE(overlapStart.valid);
+    CHECK(overlapStart.firstActive);
+    CHECK(overlapStart.secondActive);
+    CHECK(overlapStart.firstWeight == Catch::Approx(1.0F));
+    CHECK(overlapStart.secondWeight == Catch::Approx(0.0F));
+    CHECK(overlapStart.first.camera.position[0] ==
+          Catch::Approx(80.0F));
+    CHECK(overlapStart.second.camera.position[0] ==
+          Catch::Approx(100.0F));
+    const auto overlapMiddle =
+        invisible_places::camera::EvaluateLinkedLoopSourceSample(
+            first,
+            second,
+            0.5F,
+            -10,
+            40.0F / 160.0F);
+    REQUIRE(overlapMiddle.valid);
+    CHECK(overlapMiddle.firstWeight == Catch::Approx(0.5F));
+    CHECK(overlapMiddle.secondWeight == Catch::Approx(0.5F));
+    CHECK(overlapMiddle.blended.camera.position[0] ==
+          Catch::Approx(110.0F));
+
+    const auto held = invisible_places::camera::BuildLinkedLoopAnimation(
+        first,
+        second,
+        AnimationLinkedLoopBuildOptions{
+            .name = "Held Linked",
+            .firstFileName = "A.ipanim.json",
+            .secondFileName = "B.ipanim.json",
+            .firstStartKeyIndex = 0U,
+            .paddingFrames = 100,
+        },
+        &error);
+    INFO(error);
+    REQUIRE(held.has_value());
+    CHECK(held->durationFrames == 380U);
+    REQUIRE(held->keys.size() == 381U);
+    CHECK(held->keys[120U].cameraPosition[0] == Catch::Approx(120.0F));
+    CHECK(held->keys[189U].cameraPosition[0] == Catch::Approx(120.0F));
+    CHECK(held->keys[190U].cameraPosition[0] == Catch::Approx(100.0F));
+    CHECK(held->keys[310U].cameraPosition[0] == Catch::Approx(220.0F));
+    CHECK(held->keys[379U].cameraPosition[0] == Catch::Approx(220.0F));
+    CHECK(held->keys.back().cameraPosition[0] == Catch::Approx(0.0F));
+    const auto heldBetweenFrames =
+        invisible_places::camera::EvaluateAnimationPath(
+            held.value(),
+            188.5F / 30.0F);
+    CHECK(heldBetweenFrames.camera.position[0] == Catch::Approx(120.0F));
+
+    const auto heldTiming =
+        invisible_places::camera::ResolveLinkedLoopTiming(
+            first,
+            second,
+            100);
+    CHECK(heldTiming.secondStartFrame == Catch::Approx(190.0F));
+    CHECK(heldTiming.periodFrames == 380U);
+
+    CHECK(invisible_places::camera::ClampLinkedLoopPaddingFrames(
+              first,
+              second,
+              -100) == -30);
+}
+
 TEST_CASE("Loop endpoint corrections leave the complete middle interval unchanged", "[camera][animation][loop]") {
     using invisible_places::camera::AnimationLoopSmoothingMetadata;
     using invisible_places::camera::AnimationPath;
@@ -11848,6 +12250,14 @@ TEST_CASE("Loop transition smoothing improves both seams without retiming", "[ca
     };
     const auto originalFirst = first;
     const auto originalSecond = second;
+    const auto baselineMetrics =
+        invisible_places::camera::MeasureAnimationLoopTransitions(
+            first,
+            second);
+    REQUIRE(baselineMetrics.valid);
+    CHECK_FALSE(baselineMetrics.hasAppliedSmoothing);
+    CHECK(baselineMetrics.afterMismatch ==
+          Catch::Approx(baselineMetrics.beforeMismatch));
     const auto result = invisible_places::camera::SmoothAnimationLoopTransitions(
         &first,
         &second,
@@ -11862,6 +12272,8 @@ TEST_CASE("Loop transition smoothing improves both seams without retiming", "[ca
     CHECK(result.afterMismatch < result.beforeMismatch);
     CHECK(result.afterSeamMismatch[0U] < result.beforeSeamMismatch[0U]);
     CHECK(result.afterSeamMismatch[1U] < result.beforeSeamMismatch[1U]);
+    CHECK(result.maxCameraCapUsage <= Catch::Approx(1.0F).margin(1.0e-4F));
+    CHECK(result.maxFocusCapUsage <= Catch::Approx(1.0F).margin(1.0e-4F));
     REQUIRE(first.loopTransitionSmoothing.has_value());
     REQUIRE(second.loopTransitionSmoothing.has_value());
     CHECK(first.loopTransitionSmoothing->pairId == second.loopTransitionSmoothing->pairId);
@@ -11923,6 +12335,51 @@ TEST_CASE("Loop transition smoothing improves both seams without retiming", "[ca
     CHECK(weightedTerminalSpeedDeviation(originalFirst, first) < 0.30F);
     CHECK(weightedTerminalSpeedDeviation(originalSecond, second) < 0.30F);
 
+    const auto appliedMetrics =
+        invisible_places::camera::MeasureAnimationLoopTransitions(
+            first,
+            second);
+    REQUIRE(appliedMetrics.valid);
+    REQUIRE(appliedMetrics.hasAppliedSmoothing);
+    CHECK(appliedMetrics.beforeMismatch ==
+          Catch::Approx(result.beforeMismatch).epsilon(1.0e-5F));
+    CHECK(appliedMetrics.afterMismatch ==
+          Catch::Approx(result.afterMismatch).epsilon(1.0e-5F));
+    CHECK(appliedMetrics.afterSeamMismatch[0U] ==
+          Catch::Approx(result.afterSeamMismatch[0U]).epsilon(1.0e-5F));
+    CHECK(appliedMetrics.afterSeamMismatch[1U] ==
+          Catch::Approx(result.afterSeamMismatch[1U]).epsilon(1.0e-5F));
+    CHECK(appliedMetrics.terminalSpeedRmsChange[0U] ==
+          Catch::Approx(result.terminalSpeedRmsChange[0U]).epsilon(1.0e-5F));
+    CHECK(appliedMetrics.terminalSpeedRmsChange[1U] ==
+          Catch::Approx(result.terminalSpeedRmsChange[1U]).epsilon(1.0e-5F));
+    CHECK(appliedMetrics.maxCameraMove ==
+          Catch::Approx(result.maxCameraMove).epsilon(1.0e-5F));
+    CHECK(appliedMetrics.maxFocusMove ==
+          Catch::Approx(result.maxFocusMove).epsilon(1.0e-5F));
+
+    std::string roundTripError;
+    const auto roundTrippedFirst = invisible_places::serialization::
+        AnimationPathFromJson(
+            invisible_places::serialization::AnimationPathToJson(first),
+            &roundTripError);
+    const auto roundTrippedSecond = invisible_places::serialization::
+        AnimationPathFromJson(
+            invisible_places::serialization::AnimationPathToJson(second),
+            &roundTripError);
+    REQUIRE(roundTrippedFirst.has_value());
+    REQUIRE(roundTrippedSecond.has_value());
+    const auto roundTrippedMetrics =
+        invisible_places::camera::MeasureAnimationLoopTransitions(
+            roundTrippedFirst.value(),
+            roundTrippedSecond.value());
+    REQUIRE(roundTrippedMetrics.valid);
+    REQUIRE(roundTrippedMetrics.hasAppliedSmoothing);
+    CHECK(roundTrippedMetrics.beforeMismatch ==
+          Catch::Approx(appliedMetrics.beforeMismatch).epsilon(1.0e-5F));
+    CHECK(roundTrippedMetrics.afterMismatch ==
+          Catch::Approx(appliedMetrics.afterMismatch).epsilon(1.0e-5F));
+
     std::string unapplyError;
     REQUIRE(invisible_places::camera::UnapplyAnimationLoopSmoothing(&first, &unapplyError));
     REQUIRE(invisible_places::camera::UnapplyAnimationLoopSmoothing(&second, &unapplyError));
@@ -11938,6 +12395,53 @@ TEST_CASE("Loop transition smoothing improves both seams without retiming", "[ca
     CHECK(
         invisible_places::serialization::AnimationPathToJson(second) ==
         invisible_places::serialization::AnimationPathToJson(originalSecond));
+}
+
+TEST_CASE("Loop smoothing reports why an already matched pair is unchanged",
+          "[camera][animation][loop]") {
+    using invisible_places::camera::AnimationPath;
+    AnimationPath first;
+    first.name = "Already Matched A";
+    first.durationFrames = 120U;
+    first.keys = {
+        {.id = "a1", .cameraPosition = {0.0F, 4.0F, 1.0F}, .focusPoint = {3.0F, 4.0F, 1.0F}},
+        {.id = "a2", .cameraPosition = {0.1F, 3.0F, 1.0F}, .focusPoint = {3.1F, 3.0F, 1.0F}},
+        {.id = "a3", .cameraPosition = {0.2F, 2.0F, 1.0F}, .focusPoint = {3.2F, 2.0F, 1.0F}},
+        {.id = "a4", .cameraPosition = {0.3F, 1.0F, 1.0F}, .focusPoint = {3.3F, 1.0F, 1.0F}},
+        {.id = "a5", .cameraPosition = {0.4F, 0.0F, 1.0F}, .focusPoint = {3.4F, 0.0F, 1.0F}},
+    };
+    AnimationPath second = first;
+    second.name = "Already Matched B";
+    for (std::size_t keyIndex = 0U; keyIndex < second.keys.size(); ++keyIndex) {
+        second.keys[keyIndex].id = "b" + std::to_string(keyIndex + 1U);
+    }
+    const auto originalFirstJson =
+        invisible_places::serialization::AnimationPathToJson(first);
+    const auto originalSecondJson =
+        invisible_places::serialization::AnimationPathToJson(second);
+
+    const auto result =
+        invisible_places::camera::SmoothAnimationLoopTransitions(
+            &first,
+            &second,
+            {.maxEndMoveFraction = 0.10F});
+    REQUIRE(result.succeeded);
+    CHECK_FALSE(result.changed);
+    CHECK_FALSE(result.errorMessage.empty());
+    CHECK_FALSE(first.loopTransitionSmoothing.has_value());
+    CHECK_FALSE(second.loopTransitionSmoothing.has_value());
+    CHECK(invisible_places::serialization::AnimationPathToJson(first) ==
+          originalFirstJson);
+    CHECK(invisible_places::serialization::AnimationPathToJson(second) ==
+          originalSecondJson);
+
+    const auto metrics =
+        invisible_places::camera::MeasureAnimationLoopTransitions(
+            first,
+            second);
+    REQUIRE(metrics.valid);
+    CHECK_FALSE(metrics.hasAppliedSmoothing);
+    CHECK(metrics.afterMismatch == Catch::Approx(metrics.beforeMismatch));
 }
 
 TEST_CASE("Loop smoothing uses one bounded pose for shared endpoint cameras", "[camera][animation][loop]") {

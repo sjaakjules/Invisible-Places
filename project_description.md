@@ -197,8 +197,40 @@ key 2 through the second-from-last key remains unchanged. Reversible metadata
 stores both original endpoint poses. Applying and unapplying first create
 paired `_Edited` versions; Save Changes promotes both animation files and the
 active project atomically, while Discard Edits restores both saved versions.
+A persistent Loop Validation readout reports the normalized screen-flow
+mismatch before and after smoothing for both directions, endpoint movement and
+movement-cap use, and terminal perceived-speed deviation. **Validate Loop
+Metrics** is read-only; after restart it reconstructs the before state from the
+preserved endpoint metadata rather than changing either animation. Rejected
+optimizer candidates retain the same diagnostics and an explicit rejection
+reason, so a no-op is distinguishable from a very small accepted adjustment.
 A linked camera can participate
 only when all of its uses are movable endpoints in the selected pair.
+
+The same pair can be compiled into a separate linked animation. Its circular
+timeline draws both source bands with translucent colour, making overlap
+visibly darker and any endpoint hold visibly empty. At zero padding, the
+incoming first key aligns with the outgoing penultimate key at both joins, so
+the complete terminal edge crossfades. Signed padding offsets that anchor:
+negative values begin the blend earlier, while positive values delay it and
+create a hold only once the remaining terminal edge is exhausted. A stable key in the first
+source defines the loop phase, so playback can begin in the middle of A, run
+through B, wrap through the beginning of A, and finish on exactly that key.
+The viewport can ghost both source splines and paired samples across each
+complete overlap. Its **Live Camera** control defaults to **Overlay** and can
+isolate A or B; the former blended-camera preview has been removed. Overlay
+renders A and B on alternating display frames, retains each source's newest
+colour and depth image, and composites them with the linked weights. While one
+source renders, cached depth and the known current camera pose reproject the
+other source toward its present position. This reduces half-rate camera
+judder, with conservative fallback around sparse depth and newly revealed
+edges. It therefore keeps one frustum and one point-scene pass per display
+frame instead of drawing both point sets at once; full-screen
+copy/reprojection/composite bandwidth plus history memory remain.
+The linked file remains an
+ordinary renderable per-frame path, while schema-16 source, padding, and
+start-key metadata permits a deterministic rebuild after either saved or
+`_Edited` source changes.
 
 ### Animation versioning
 Every registered animation keeps its last saved, disk-backed version plus at

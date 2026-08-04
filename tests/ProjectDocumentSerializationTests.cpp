@@ -1014,6 +1014,7 @@ TEST_CASE("Point visual field-map bounds memory round-trips",
 TEST_CASE("Additional shoreline instances round-trip with their banks",
           "[project][serialization][water][shoreline]") {
   using invisible_places::renderer::pointcloud::PointCloudShorelineInstance;
+  using invisible_places::renderer::pointcloud::PointCloudShorelineWaveProfile;
   using invisible_places::renderer::pointcloud::
       PointCloudShorelineWaveAlgorithm;
   using invisible_places::serialization::LoadProjectDocument;
@@ -1025,6 +1026,8 @@ TEST_CASE("Additional shoreline instances round-trip with their banks",
   pool.id = 7U;
   pool.name = "Upper Pool";
   pool.enabled = true;
+  pool.profileName = "Calm_Upper Pool";
+  pool.baseProfileName = "Calm";
   pool.settings.enabled = true;
   pool.settings.algorithm = PointCloudShorelineWaveAlgorithm::ContinuousBands;
   pool.settings.foamFronts.boundaryZ = 2.35F;
@@ -1034,8 +1037,22 @@ TEST_CASE("Additional shoreline instances round-trip with their banks",
   terrace.id = 9U;
   terrace.name = "Terrace";
   terrace.enabled = false;
+  terrace.profileName = "Calm";
+  terrace.baseProfileName = "Calm";
   terrace.settings.algorithm = PointCloudShorelineWaveAlgorithm::HeightFoam;
   terrace.settings.heightFoam.runupZ = 3.1F;
+  PointCloudShorelineWaveProfile calm{
+      .name = "Calm",
+      .settings = terrace.settings,
+  };
+  PointCloudShorelineWaveProfile upperPoolCopy{
+      .name = "Calm_Upper Pool",
+      .settings = pool.settings,
+      .objectOverride = true,
+      .shorelineInstanceId = pool.id,
+      .baseProfileName = "Calm",
+  };
+  document.waterShorelineProfiles = {calm, upperPoolCopy};
   document.waterShorelineInstances = {pool, terrace};
   document.nextWaterShorelineInstanceId = 10U;
 
@@ -1050,11 +1067,22 @@ TEST_CASE("Additional shoreline instances round-trip with their banks",
   REQUIRE(savedJson.at("water_shoreline_instances").size() == 2U);
   CHECK(savedJson.at("water_shoreline_instances")[0].at("name") ==
         "Upper Pool");
+  CHECK(savedJson.at("water_shoreline_instances")[0].at("profile_name") ==
+        "Calm_Upper Pool");
+  CHECK(savedJson.at("water_shoreline_instances")[0].at("base_profile_name") ==
+        "Calm");
   CHECK(savedJson.at("water_shoreline_instances")[0]
             .at("settings")
             .at("foam_fronts")
             .at("boundary_z") == Catch::Approx(2.35F));
   CHECK(savedJson.at("next_water_shoreline_instance_id") == 10U);
+  REQUIRE(savedJson.at("water_shoreline_profiles").size() == 2U);
+  CHECK(savedJson.at("water_shoreline_profiles")[1].at("object_override") ==
+        true);
+  CHECK(savedJson.at("water_shoreline_profiles")[1]
+            .at("shoreline_instance_id") == 7U);
+  CHECK(savedJson.at("water_shoreline_profiles")[1]
+            .at("base_profile_name") == "Calm");
 
   const auto loaded = LoadProjectDocument(file.path, &errorMessage);
   INFO(errorMessage);
@@ -1064,6 +1092,8 @@ TEST_CASE("Additional shoreline instances round-trip with their banks",
   CHECK(loadedPool.id == 7U);
   CHECK(loadedPool.name == "Upper Pool");
   CHECK(loadedPool.enabled);
+  CHECK(loadedPool.profileName == "Calm_Upper Pool");
+  CHECK(loadedPool.baseProfileName == "Calm");
   CHECK(loadedPool.settings.algorithm ==
         PointCloudShorelineWaveAlgorithm::ContinuousBands);
   CHECK(loadedPool.settings.foamFronts.boundaryZ == Catch::Approx(2.35F));
@@ -1076,6 +1106,11 @@ TEST_CASE("Additional shoreline instances round-trip with their banks",
         PointCloudShorelineWaveAlgorithm::HeightFoam);
   CHECK(loadedTerrace.settings.heightFoam.runupZ == Catch::Approx(3.1F));
   CHECK(loaded->nextWaterShorelineInstanceId == 10U);
+  REQUIRE(loaded->waterShorelineProfiles.size() == 2U);
+  const auto& loadedCopy = loaded->waterShorelineProfiles[1];
+  CHECK(loadedCopy.objectOverride);
+  CHECK(loadedCopy.shorelineInstanceId == 7U);
+  CHECK(loadedCopy.baseProfileName == "Calm");
 }
 
 TEST_CASE("Schema 51 palette snapshots migrate without changing their animation model",
@@ -1180,9 +1215,10 @@ TEST_CASE("Schema 51 palette snapshots migrate without changing their animation 
                   .empty());
 }
 
-TEST_CASE("Shoreline profile libraries round-trip while legacy files retain their authored visual",
+TEST_CASE("Named Shoreline profiles round-trip without emitting legacy defaults",
           "[project][serialization][water][shoreline][profiles]") {
   using invisible_places::renderer::pointcloud::CalmPointCloudShorelineWaveSettings;
+  using invisible_places::renderer::pointcloud::PointCloudShorelineInstance;
   using invisible_places::renderer::pointcloud::PointCloudShorelineWaveAlgorithm;
   using invisible_places::renderer::pointcloud::PointCloudShorelineWaveProfile;
   using invisible_places::renderer::pointcloud::PointCloudStyleState;
@@ -1227,19 +1263,19 @@ TEST_CASE("Shoreline profile libraries round-trip while legacy files retain thei
       "invisible_places_shoreline_profiles_current.json"};
   std::string errorMessage;
   REQUIRE(SaveProjectDocument(project, projectFile.path, &errorMessage));
+  {
+    std::ifstream input{projectFile.path};
+    REQUIRE(input.is_open());
+    const auto savedJson = nlohmann::json::parse(input);
+    CHECK_FALSE(savedJson.contains("water_shoreline_default_settings"));
+    CHECK_FALSE(savedJson.contains("selected_water_shoreline_profile"));
+  }
   const auto loadedProject =
       LoadProjectDocument(projectFile.path, &errorMessage);
   INFO(errorMessage);
   REQUIRE(loadedProject.has_value());
-  REQUIRE(loadedProject->waterShorelineDefaultSettings.has_value());
-  CHECK(loadedProject->waterShorelineDefaultSettings->algorithm ==
-        PointCloudShorelineWaveAlgorithm::ContinuousBands);
-  CHECK(
-      loadedProject->waterShorelineDefaultSettings->foamFronts.phase ==
-      Catch::Approx(0.37F));
-  CHECK(
-      loadedProject->waterShorelineDefaultSettings->heightFoam.runupZ ==
-      Catch::Approx(2.12F));
+  CHECK(loadedProject->sourceSchemaVersion == kProjectDocumentSchemaVersion);
+  CHECK_FALSE(loadedProject->waterShorelineDefaultSettings.has_value());
   REQUIRE(loadedProject->waterShorelineProfiles.size() == 1U);
   CHECK(loadedProject->waterShorelineProfiles.front().name == "Storm");
   CHECK(
@@ -1251,7 +1287,7 @@ TEST_CASE("Shoreline profile libraries round-trip while legacy files retain thei
   CHECK(
       loadedProject->waterShorelineProfiles.front()
           .settings.heightFoam.colour[1] == Catch::Approx(0.52F));
-  CHECK(loadedProject->selectedWaterShorelineProfileName == "Storm");
+  CHECK(loadedProject->selectedWaterShorelineProfileName.empty());
 
   {
     std::ifstream input{projectFile.path};
@@ -1263,6 +1299,8 @@ TEST_CASE("Shoreline profile libraries round-trip while legacy files retain thei
     legacyJson.erase("water_shoreline_default_settings");
     legacyJson.erase("water_shoreline_profiles");
     legacyJson.erase("selected_water_shoreline_profile");
+    legacyJson.erase("water_shoreline_instances");
+    legacyJson.erase("next_water_shoreline_instance_id");
     std::ofstream output{projectFile.path};
     REQUIRE(output.is_open());
     output << legacyJson.dump(2);
@@ -1272,9 +1310,10 @@ TEST_CASE("Shoreline profile libraries round-trip while legacy files retain thei
   INFO(errorMessage);
   REQUIRE(legacyProject.has_value());
   CHECK(legacyProject->schemaVersion == kProjectDocumentSchemaVersion);
+  CHECK(legacyProject->sourceSchemaVersion == 47U);
   CHECK_FALSE(legacyProject->waterShorelineDefaultSettings.has_value());
   CHECK(legacyProject->waterShorelineProfiles.empty());
-  CHECK(legacyProject->selectedWaterShorelineProfileName == "Default");
+  CHECK(legacyProject->selectedWaterShorelineProfileName.empty());
   REQUIRE(legacyProject->pointVisuals.size() == 1U);
   CHECK(legacyProject->pointVisuals.front().style.exposure ==
         Catch::Approx(1.67F));
@@ -1283,26 +1322,51 @@ TEST_CASE("Shoreline profile libraries round-trip while legacy files retain thei
 
   WaterSourcesDocument sources;
   sources.shorelineDefaultSettings = defaultSettings;
-  sources.shorelineProfiles = {storm};
+  auto beachCopy = storm;
+  beachCopy.name = "Storm_Beach";
+  beachCopy.objectOverride = true;
+  beachCopy.shorelineInstanceId = 12U;
+  beachCopy.baseProfileName = "Storm";
+  PointCloudShorelineInstance beach;
+  beach.id = 12U;
+  beach.name = "Beach";
+  beach.profileName = beachCopy.name;
+  beach.baseProfileName = storm.name;
+  beach.settings = beachCopy.settings;
+  sources.shorelineProfiles = {storm, beachCopy};
   sources.selectedShorelineProfileName = "Storm";
+  sources.shorelineInstances = {beach};
+  sources.nextShorelineInstanceId = 13U;
   TemporaryProjectFile sourcesFile{
       "invisible_places_shoreline_profiles_sources.json"};
   REQUIRE(SaveWaterSourcesDocument(sources, sourcesFile.path, &errorMessage));
+  {
+    std::ifstream input{sourcesFile.path};
+    REQUIRE(input.is_open());
+    const auto savedJson = nlohmann::json::parse(input);
+    CHECK_FALSE(savedJson.contains("water_shoreline_default_settings"));
+    CHECK_FALSE(savedJson.contains("selected_water_shoreline_profile"));
+  }
   const auto loadedSources =
       LoadWaterSourcesDocument(sourcesFile.path, &errorMessage);
   INFO(errorMessage);
   REQUIRE(loadedSources.has_value());
   CHECK(loadedSources->schemaVersion == kWaterSourcesDocumentSchemaVersion);
-  REQUIRE(loadedSources->shorelineDefaultSettings.has_value());
-  CHECK(loadedSources->shorelineDefaultSettings->algorithm ==
-        PointCloudShorelineWaveAlgorithm::ContinuousBands);
-  CHECK(loadedSources->shorelineDefaultSettings->foamFronts.boundaryZ ==
-        Catch::Approx(1.595F));
-  REQUIRE(loadedSources->shorelineProfiles.size() == 1U);
+  CHECK_FALSE(loadedSources->shorelineDefaultSettings.has_value());
+  REQUIRE(loadedSources->shorelineProfiles.size() == 2U);
   CHECK(loadedSources->shorelineProfiles.front().name == "Storm");
   CHECK(loadedSources->shorelineProfiles.front()
             .settings.heightFoam.intensity == Catch::Approx(1.82F));
-  CHECK(loadedSources->selectedShorelineProfileName == "Storm");
+  CHECK(loadedSources->shorelineProfiles[1].objectOverride);
+  CHECK(loadedSources->shorelineProfiles[1].shorelineInstanceId == 12U);
+  CHECK(loadedSources->shorelineProfiles[1].baseProfileName == "Storm");
+  CHECK(loadedSources->selectedShorelineProfileName.empty());
+  REQUIRE(loadedSources->shorelineInstances.size() == 1U);
+  CHECK(loadedSources->shorelineInstances.front().profileName ==
+        "Storm_Beach");
+  CHECK(loadedSources->shorelineInstances.front().baseProfileName ==
+        "Storm");
+  CHECK(loadedSources->nextShorelineInstanceId == 13U);
 
   {
     std::ifstream input{sourcesFile.path};
@@ -1314,6 +1378,8 @@ TEST_CASE("Shoreline profile libraries round-trip while legacy files retain thei
     legacyJson.erase("water_shoreline_default_settings");
     legacyJson.erase("water_shoreline_profiles");
     legacyJson.erase("selected_water_shoreline_profile");
+    legacyJson.erase("water_shoreline_instances");
+    legacyJson.erase("next_water_shoreline_instance_id");
     std::ofstream output{sourcesFile.path};
     REQUIRE(output.is_open());
     output << legacyJson.dump(2);
@@ -1325,7 +1391,7 @@ TEST_CASE("Shoreline profile libraries round-trip while legacy files retain thei
   CHECK(legacySources->schemaVersion == 19U);
   CHECK_FALSE(legacySources->shorelineDefaultSettings.has_value());
   CHECK(legacySources->shorelineProfiles.empty());
-  CHECK(legacySources->selectedShorelineProfileName == "Default");
+  CHECK(legacySources->selectedShorelineProfileName.empty());
 }
 
 TEST_CASE("Schema 45 selects the explicit matching water scene instead of the first state",
@@ -1887,6 +1953,7 @@ TEST_CASE("Manual Flow paths round-trip through project scenes and water-source 
   using invisible_places::serialization::WaterSceneStateDocument;
   using invisible_places::serialization::WaterSourcesDocument;
   using invisible_places::water::WaterEmitter;
+  using invisible_places::water::WaterManualFlowPathLaneWidthMode;
   using invisible_places::water::WaterManualFlowPathSource;
 
   WaterEmitter spring;
@@ -1908,6 +1975,11 @@ TEST_CASE("Manual Flow paths round-trip through project scenes and water-source 
       {1.0F, 2.0F, 3.0F},
       {1.5F, 2.2F, 2.0F},
       {1.8F, 2.7F, 0.5F},
+  };
+  waterfall.controlPointLaneWidths = {
+      {.mode = WaterManualFlowPathLaneWidthMode::Inherit, .value = 1.0F},
+      {.mode = WaterManualFlowPathLaneWidthMode::Absolute, .value = 0.28F},
+      {.mode = WaterManualFlowPathLaneWidthMode::Relative, .value = 2.3F},
   };
   WaterManualFlowPathSource creek;
   creek.id = 31U;
@@ -1970,9 +2042,34 @@ TEST_CASE("Manual Flow paths round-trip through project scenes and water-source 
   CHECK(loadedWaterfall.showTrail);
   REQUIRE(loadedWaterfall.controlPoints.size() == waterfall.controlPoints.size());
   CHECK(loadedWaterfall.controlPoints[1].z == Catch::Approx(2.0F));
+  REQUIRE(loadedWaterfall.controlPointLaneWidths.size() ==
+          waterfall.controlPoints.size());
+  CHECK(loadedWaterfall.controlPointLaneWidths[0].mode ==
+        WaterManualFlowPathLaneWidthMode::Inherit);
+  CHECK(loadedWaterfall.controlPointLaneWidths[1].mode ==
+        WaterManualFlowPathLaneWidthMode::Absolute);
+  CHECK(loadedWaterfall.controlPointLaneWidths[1].value ==
+        Catch::Approx(0.28F));
+  CHECK(loadedWaterfall.controlPointLaneWidths[2].mode ==
+        WaterManualFlowPathLaneWidthMode::Relative);
+  CHECK(loadedWaterfall.controlPointLaneWidths[2].value ==
+        Catch::Approx(2.3F));
   CHECK(loadedProject->waterSceneStates[1].manualFlowPaths[0].id == creek.id);
   CHECK_FALSE(loadedProject->waterSceneStates[1].manualFlowPaths[0].useSurfaceGuide);
   CHECK_FALSE(loadedProject->waterSceneStates[1].manualFlowPaths[0].showTrail);
+  REQUIRE(loadedProject->waterSceneStates[1]
+              .manualFlowPaths[0]
+              .controlPointLaneWidths.size() == creek.controlPoints.size());
+  CHECK(std::all_of(
+      loadedProject->waterSceneStates[1]
+          .manualFlowPaths[0]
+          .controlPointLaneWidths.begin(),
+      loadedProject->waterSceneStates[1]
+          .manualFlowPaths[0]
+          .controlPointLaneWidths.end(),
+      [](const auto& width) {
+        return width.mode == WaterManualFlowPathLaneWidthMode::Inherit;
+      }));
   CHECK(loadedProject->waterFlowTrailSettings.surfaceFollow == Catch::Approx(0.71F));
   CHECK(loadedProject->waterFlowTrailSettings.downhillPull == Catch::Approx(0.29F));
   CHECK(loadedProject->waterFlowTrailSettings.terrainWidthResponse == Catch::Approx(0.58F));
@@ -2013,6 +2110,16 @@ TEST_CASE("Manual Flow paths round-trip through project scenes and water-source 
   REQUIRE(loadedSources->manualFlowPaths.size() == 2U);
   CHECK(loadedSources->manualFlowPaths[0].id == waterfall.id);
   CHECK(loadedSources->manualFlowPaths[0].controlPoints[2].z == Catch::Approx(0.5F));
+  REQUIRE(loadedSources->manualFlowPaths[0].controlPointLaneWidths.size() ==
+          waterfall.controlPoints.size());
+  CHECK(loadedSources->manualFlowPaths[0].controlPointLaneWidths[1].mode ==
+        WaterManualFlowPathLaneWidthMode::Absolute);
+  CHECK(loadedSources->manualFlowPaths[0].controlPointLaneWidths[1].value ==
+        Catch::Approx(0.28F));
+  CHECK(loadedSources->manualFlowPaths[0].controlPointLaneWidths[2].mode ==
+        WaterManualFlowPathLaneWidthMode::Relative);
+  CHECK(loadedSources->manualFlowPaths[0].controlPointLaneWidths[2].value ==
+        Catch::Approx(2.3F));
   CHECK(loadedSources->manualFlowPaths[0].useSurfaceGuide);
   CHECK(loadedSources->manualFlowPaths[0].showTrail);
   CHECK(loadedSources->manualFlowPaths[1].trailProfileName == creek.trailProfileName);
@@ -2916,7 +3023,7 @@ TEST_CASE("Project preserves independent Flow and Mesh Flow edited trail shadows
         "Default_edited");
 }
 
-TEST_CASE("Animation loop smoothing metadata round-trips in schema 15",
+TEST_CASE("Animation loop smoothing metadata round-trips in schema 16",
           "[animation][serialization][loop]") {
   using invisible_places::camera::AnimationLoopSmoothingMetadata;
   using invisible_places::camera::AnimationPath;
@@ -2978,6 +3085,54 @@ TEST_CASE("Animation loop smoothing metadata round-trips in schema 15",
       AnimationPathFromJson(mismatchedEndpointJson, &error);
   REQUIRE(mismatchedEndpoint.has_value());
   CHECK_FALSE(mismatchedEndpoint->loopTransitionSmoothing.has_value());
+}
+
+TEST_CASE("Linked animation source and phase metadata round-trips",
+          "[animation][serialization][linked-loop]") {
+  using invisible_places::camera::AnimationLinkedLoopMetadata;
+  using invisible_places::camera::AnimationPath;
+  using invisible_places::serialization::AnimationPathFromJson;
+  using invisible_places::serialization::AnimationPathToJson;
+  using invisible_places::serialization::kAnimationDocumentSchemaVersion;
+
+  AnimationPath path;
+  path.name = "Linked Loop";
+  path.durationFrames = 100U;
+  path.keys = {
+      {.id = "linked_frame_1", .cameraPosition = {1.0F, 2.0F, 3.0F},
+       .focusPoint = {1.0F, 3.0F, 3.0F}},
+      {.id = "linked_frame_2", .cameraPosition = {2.0F, 2.0F, 3.0F},
+       .focusPoint = {2.0F, 3.0F, 3.0F}},
+  };
+  path.linkedLoop = AnimationLinkedLoopMetadata{
+      .firstFileName = "Loop_A.ipanim.json",
+      .secondFileName = "Loop_B.ipanim.json",
+      .firstStartKeyId = "a_middle",
+      .firstStartPosition = 0.42F,
+      .paddingFrames = -12,
+  };
+
+  const auto json = AnimationPathToJson(path);
+  CHECK(json.at("schema_version") == kAnimationDocumentSchemaVersion);
+  REQUIRE(json.contains("linked_loop"));
+  CHECK(json.at("linked_loop").at("padding_frames") == -12);
+
+  std::string error;
+  const auto loaded = AnimationPathFromJson(json, &error);
+  INFO(error);
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->linkedLoop.has_value());
+  CHECK(loaded->linkedLoop->firstFileName == "Loop_A.ipanim.json");
+  CHECK(loaded->linkedLoop->secondFileName == "Loop_B.ipanim.json");
+  CHECK(loaded->linkedLoop->firstStartKeyId == "a_middle");
+  CHECK(loaded->linkedLoop->firstStartPosition == Catch::Approx(0.42F));
+  CHECK(loaded->linkedLoop->paddingFrames == -12);
+
+  auto missingSource = json;
+  missingSource["linked_loop"]["second_file_name"] = "";
+  const auto sanitized = AnimationPathFromJson(missingSource, &error);
+  REQUIRE(sanitized.has_value());
+  CHECK_FALSE(sanitized->linkedLoop.has_value());
 }
 
 TEST_CASE("Staged document bundle restores earlier files after a later commit failure",
