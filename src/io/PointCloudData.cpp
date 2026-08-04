@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -11,6 +12,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
 
 namespace invisible_places::io {
 
@@ -152,6 +154,71 @@ std::string ScalarFieldDisplayName(std::string_view propertyName) {
 
     return std::string{propertyName.substr(prefix.size())};
 }
+
+std::string LowerAscii(std::string_view value) {
+    std::string lowered;
+    lowered.reserve(value.size());
+    for (const char character : value) {
+        lowered.push_back(static_cast<char>(
+            std::tolower(static_cast<unsigned char>(character))));
+    }
+    return lowered;
+}
+
+// Mirrors the renderer's field-name normalization so containsPatterns match
+// the same fields its by-name heuristics (roughness, ground id) resolve.
+std::string NormalizedAlnumFieldName(std::string_view value) {
+    std::string normalized;
+    normalized.reserve(value.size());
+    for (const char character : value) {
+        const auto byte = static_cast<unsigned char>(character);
+        if (std::isalnum(byte) == 0) {
+            continue;
+        }
+        normalized.push_back(static_cast<char>(std::tolower(byte)));
+    }
+    return normalized;
+}
+
+}  // namespace
+
+bool PointCloudScalarFieldFilterSelects(
+    const PointCloudScalarFieldFilter& filter,
+    std::string_view displayName,
+    std::uint32_t sourceIndex) {
+    if (filter.LoadsAll()) {
+        return true;
+    }
+    if (std::find(
+            filter.sourceIndices.begin(),
+            filter.sourceIndices.end(),
+            sourceIndex) != filter.sourceIndices.end()) {
+        return true;
+    }
+    const auto loweredName = LowerAscii(displayName);
+    if (std::any_of(
+            filter.names.begin(),
+            filter.names.end(),
+            [&loweredName](const std::string& candidate) {
+                return LowerAscii(candidate) == loweredName;
+            })) {
+        return true;
+    }
+    if (filter.containsPatterns.empty()) {
+        return false;
+    }
+    const auto normalizedName = NormalizedAlnumFieldName(displayName);
+    return std::any_of(
+        filter.containsPatterns.begin(),
+        filter.containsPatterns.end(),
+        [&normalizedName](const std::string& pattern) {
+            return !pattern.empty() &&
+                   normalizedName.find(NormalizedAlnumFieldName(pattern)) !=
+                       std::string::npos;
+        });
+}
+
+namespace {
 
 struct PointCloudLayout {
     std::vector<PropertyLayout> properties;
@@ -369,7 +436,23 @@ std::size_t LoadedPointCloud::ScalarFieldValueIndex(std::size_t fieldIndex, std:
     return (fieldIndex * PointCount()) + pointIndex;
 }
 
-PointCloudLoadResult LoadPointCloud(const std::filesystem::path& filePath) {
+std::optional<std::size_t> LoadedPointCloud::ResidentSlotForSourceIndex(
+    std::int32_t sourceIndex) const {
+    if (sourceIndex < 0) {
+        return std::nullopt;
+    }
+    for (std::size_t slot = 0; slot < scalarFields.size(); ++slot) {
+        if (scalarFields[slot].sourceIndex == sourceIndex) {
+            return slot;
+        }
+    }
+    return std::nullopt;
+}
+
+PointCloudLoadResult LoadPointCloud(
+    const std::filesystem::path& filePath,
+    const PointCloudScalarFieldFilter& fieldFilter,
+    unsigned threadCount) {
     const auto headerResult = ParsePlyHeader(filePath);
     if (!headerResult.success) {
         return {.errorMessage = headerResult.errorMessage, .success = false};
@@ -402,19 +485,38 @@ PointCloudLoadResult LoadPointCloud(const std::filesystem::path& filePath) {
     cloud.hasSourceRgb = header.HasColorRgb();
     cloud.hasNormals = layout->hasNormals;
 
+    // File-order scalar slot -> resident matrix row, or -1 when the filter
+    // leaves the field on disk. Selected fields keep their relative file
+    // order so repeat loads with the same filter produce identical slots.
+    std::vector<std::int32_t> residentSlotBySourceIndex(layout->scalarFieldCount, -1);
     try {
         cloud.positions.resize(static_cast<std::size_t>(header.vertexCount));
         if (cloud.hasNormals) {
             cloud.normals.resize(static_cast<std::size_t>(header.vertexCount));
         }
         cloud.packedColors.resize(static_cast<std::size_t>(header.vertexCount), PackRgba8(255, 255, 255));
+        cloud.availableScalarFields.reserve(layout->scalarFieldCount);
         cloud.scalarFields.reserve(layout->scalarFieldCount);
+        std::uint32_t sourceIndex = 0;
         for (const auto& property : header.properties) {
             if (!StartsWith(property.name, "scalar_")) {
                 continue;
             }
 
-            cloud.scalarFields.push_back({.name = ScalarFieldDisplayName(property.name)});
+            auto displayName = ScalarFieldDisplayName(property.name);
+            cloud.availableScalarFields.push_back({
+                .name = displayName,
+                .sourceIndex = sourceIndex,
+            });
+            if (PointCloudScalarFieldFilterSelects(fieldFilter, displayName, sourceIndex)) {
+                residentSlotBySourceIndex[sourceIndex] =
+                    static_cast<std::int32_t>(cloud.scalarFields.size());
+                ScalarFieldStats stats;
+                stats.name = std::move(displayName);
+                stats.sourceIndex = static_cast<std::int32_t>(sourceIndex);
+                cloud.scalarFields.push_back(std::move(stats));
+            }
+            ++sourceIndex;
         }
 
         cloud.scalarFieldValues.resize(
@@ -423,86 +525,230 @@ PointCloudLoadResult LoadPointCloud(const std::filesystem::path& filePath) {
         return {.errorMessage = std::string{"Point cloud allocation failed: "} + error.what(), .success = false};
     }
 
-    const auto pointsPerChunk = RecommendedPointsPerChunk(layout->recordSize);
+    input.close();
+
+    // The record stride is fixed, so the payload splits into disjoint,
+    // independently parseable vertex ranges: each worker opens its own
+    // stream, seeks straight to its byte range, and writes its points into
+    // the shared destination arrays at disjoint indices. Only the property
+    // subset a record actually contributes survives into the flattened
+    // program below — with a field filter active this skips most of the
+    // record's ~40 properties per point.
+    struct ActiveProperty {
+        PropertySemantic semantic = PropertySemantic::Skip;
+        ScalarType type = ScalarType::Float32;
+        std::uint32_t offset = 0;
+        std::int32_t residentSlot = -1;
+    };
+    std::vector<ActiveProperty> activeProperties;
+    activeProperties.reserve(layout->properties.size());
+    for (const auto& property : layout->properties) {
+        if (property.semantic == PropertySemantic::Skip) {
+            continue;
+        }
+        std::int32_t residentSlot = -1;
+        if (property.semantic == PropertySemantic::ScalarField) {
+            residentSlot = residentSlotBySourceIndex[property.scalarFieldIndex];
+            if (residentSlot < 0) {
+                continue;
+            }
+        }
+        activeProperties.push_back({
+            .semantic = property.semantic,
+            .type = property.type,
+            .offset = property.offset,
+            .residentSlot = residentSlot,
+        });
+    }
+
     const auto focusSampleStride =
         std::max<std::uint64_t>(1ULL, header.vertexCount / static_cast<std::uint64_t>(kMaxFocusSamples));
-    std::vector<std::byte> chunkBuffer(pointsPerChunk * layout->recordSize);
-    std::vector<Float3> focusSamples;
-    focusSamples.reserve(std::min<std::uint64_t>(header.vertexCount, kMaxFocusSamples));
-
-    for (std::uint64_t pointStart = 0; pointStart < header.vertexCount; pointStart += pointsPerChunk) {
-        const auto remaining = header.vertexCount - pointStart;
-        const auto pointsThisChunk = static_cast<std::size_t>(std::min<std::uint64_t>(remaining, pointsPerChunk));
-        const auto bytesToRead = pointsThisChunk * layout->recordSize;
-
-        input.read(reinterpret_cast<char*>(chunkBuffer.data()), static_cast<std::streamsize>(bytesToRead));
-        if (input.gcount() != static_cast<std::streamsize>(bytesToRead)) {
-            return {.errorMessage = "Unexpected EOF while reading point cloud payload.", .success = false};
+    struct RangeParseOutput {
+        Bounds3f bounds;
+        std::vector<ScalarFieldStats> fieldStats;
+        std::vector<Float3> focusSamples;
+        std::string errorMessage;
+    };
+    const auto readFloat = [](const std::byte* bytes, ScalarType type) {
+        // Float32 dominates real exports; reading it directly skips the
+        // double round-trip (which is value-identical for floats anyway).
+        return type == ScalarType::Float32
+                   ? ReadScalar<float>(bytes)
+                   : static_cast<float>(ReadScalarAsDouble(bytes, type));
+    };
+    const auto parseRange = [&](std::uint64_t rangeBegin,
+                                std::uint64_t rangeEnd,
+                                RangeParseOutput* out) {
+        out->fieldStats.resize(cloud.scalarFields.size());
+        std::ifstream rangeInput{filePath, std::ios::binary};
+        if (!rangeInput.is_open()) {
+            out->errorMessage = "Unable to open point cloud file.";
+            return;
         }
+        rangeInput.seekg(
+            static_cast<std::streamoff>(
+                header.dataOffsetBytes + rangeBegin * layout->recordSize),
+            std::ios::beg);
+        if (!rangeInput.good()) {
+            out->errorMessage = "Failed to seek to PLY payload.";
+            return;
+        }
+        const auto pointsPerChunk = RecommendedPointsPerChunk(layout->recordSize);
+        std::vector<std::byte> chunkBuffer(pointsPerChunk * layout->recordSize);
+        for (std::uint64_t pointStart = rangeBegin; pointStart < rangeEnd; pointStart += pointsPerChunk) {
+            const auto remaining = rangeEnd - pointStart;
+            const auto pointsThisChunk = static_cast<std::size_t>(std::min<std::uint64_t>(remaining, pointsPerChunk));
+            const auto bytesToRead = pointsThisChunk * layout->recordSize;
 
-        for (std::size_t localIndex = 0; localIndex < pointsThisChunk; ++localIndex) {
-            const auto globalIndex = static_cast<std::size_t>(pointStart) + localIndex;
-            const auto* recordBytes = chunkBuffer.data() + (localIndex * layout->recordSize);
+            rangeInput.read(reinterpret_cast<char*>(chunkBuffer.data()), static_cast<std::streamsize>(bytesToRead));
+            if (rangeInput.gcount() != static_cast<std::streamsize>(bytesToRead)) {
+                out->errorMessage = "Unexpected EOF while reading point cloud payload.";
+                return;
+            }
 
-            Float3 position{};
-            Float3 normal{};
-            std::uint8_t red = 255;
-            std::uint8_t green = 255;
-            std::uint8_t blue = 255;
+            for (std::size_t localIndex = 0; localIndex < pointsThisChunk; ++localIndex) {
+                const auto globalIndex = static_cast<std::size_t>(pointStart) + localIndex;
+                const auto* recordBytes = chunkBuffer.data() + (localIndex * layout->recordSize);
 
-            for (const auto& property : layout->properties) {
-                const auto* propertyBytes = recordBytes + property.offset;
+                Float3 position{};
+                Float3 normal{};
+                std::uint8_t red = 255;
+                std::uint8_t green = 255;
+                std::uint8_t blue = 255;
 
-                switch (property.semantic) {
-                    case PropertySemantic::PositionX:
-                        position.x = static_cast<float>(ReadScalarAsDouble(propertyBytes, property.type));
-                        break;
-                    case PropertySemantic::PositionY:
-                        position.y = static_cast<float>(ReadScalarAsDouble(propertyBytes, property.type));
-                        break;
-                    case PropertySemantic::PositionZ:
-                        position.z = static_cast<float>(ReadScalarAsDouble(propertyBytes, property.type));
-                        break;
-                    case PropertySemantic::ColorR:
-                        red = ReadScalarAsByte(propertyBytes, property.type);
-                        break;
-                    case PropertySemantic::ColorG:
-                        green = ReadScalarAsByte(propertyBytes, property.type);
-                        break;
-                    case PropertySemantic::ColorB:
-                        blue = ReadScalarAsByte(propertyBytes, property.type);
-                        break;
-                    case PropertySemantic::NormalX:
-                        normal.x = static_cast<float>(ReadScalarAsDouble(propertyBytes, property.type));
-                        break;
-                    case PropertySemantic::NormalY:
-                        normal.y = static_cast<float>(ReadScalarAsDouble(propertyBytes, property.type));
-                        break;
-                    case PropertySemantic::NormalZ:
-                        normal.z = static_cast<float>(ReadScalarAsDouble(propertyBytes, property.type));
-                        break;
-                    case PropertySemantic::ScalarField: {
-                        const auto scalarValue =
-                            static_cast<float>(ReadScalarAsDouble(propertyBytes, property.type));
-                        cloud.scalarFieldValues[cloud.ScalarFieldValueIndex(property.scalarFieldIndex, globalIndex)] =
-                            scalarValue;
-                        cloud.scalarFields[property.scalarFieldIndex].Include(scalarValue);
-                        break;
+                for (const auto& property : activeProperties) {
+                    const auto* propertyBytes = recordBytes + property.offset;
+
+                    switch (property.semantic) {
+                        case PropertySemantic::PositionX:
+                            position.x = readFloat(propertyBytes, property.type);
+                            break;
+                        case PropertySemantic::PositionY:
+                            position.y = readFloat(propertyBytes, property.type);
+                            break;
+                        case PropertySemantic::PositionZ:
+                            position.z = readFloat(propertyBytes, property.type);
+                            break;
+                        case PropertySemantic::ColorR:
+                            red = ReadScalarAsByte(propertyBytes, property.type);
+                            break;
+                        case PropertySemantic::ColorG:
+                            green = ReadScalarAsByte(propertyBytes, property.type);
+                            break;
+                        case PropertySemantic::ColorB:
+                            blue = ReadScalarAsByte(propertyBytes, property.type);
+                            break;
+                        case PropertySemantic::NormalX:
+                            normal.x = readFloat(propertyBytes, property.type);
+                            break;
+                        case PropertySemantic::NormalY:
+                            normal.y = readFloat(propertyBytes, property.type);
+                            break;
+                        case PropertySemantic::NormalZ:
+                            normal.z = readFloat(propertyBytes, property.type);
+                            break;
+                        case PropertySemantic::ScalarField: {
+                            const auto scalarValue = readFloat(propertyBytes, property.type);
+                            cloud.scalarFieldValues[cloud.ScalarFieldValueIndex(
+                                static_cast<std::size_t>(property.residentSlot), globalIndex)] = scalarValue;
+                            out->fieldStats[static_cast<std::size_t>(property.residentSlot)]
+                                .Include(scalarValue);
+                            break;
+                        }
+                        case PropertySemantic::Skip:
+                            break;
                     }
-                    case PropertySemantic::Skip:
-                        break;
+                }
+
+                cloud.positions[globalIndex] = position;
+                if (cloud.hasNormals) {
+                    cloud.normals[globalIndex] = NormalizeNormal(normal);
+                }
+                cloud.packedColors[globalIndex] = PackRgba8(red, green, blue);
+                out->bounds.Expand(position);
+                if ((globalIndex % focusSampleStride) == 0) {
+                    out->focusSamples.push_back(position);
                 }
             }
+        }
+    };
 
-            cloud.positions[globalIndex] = position;
-            if (cloud.hasNormals) {
-                cloud.normals[globalIndex] = NormalizeNormal(normal);
+    // One range per worker, sized so small clouds stay single-threaded and
+    // the calling thread always parses the first range itself.
+    constexpr std::uint64_t kMinimumPointsPerParseThread = 1'000'000ULL;
+    const auto hardwareThreads = std::max(1U, std::thread::hardware_concurrency());
+    auto effectiveThreads = threadCount != 0U
+                                ? threadCount
+                                : std::min(hardwareThreads, 8U);
+    if (threadCount == 0U) {
+        const auto sizedThreads = static_cast<unsigned>(std::min<std::uint64_t>(
+            effectiveThreads,
+            std::max<std::uint64_t>(1ULL, header.vertexCount / kMinimumPointsPerParseThread)));
+        effectiveThreads = std::max(1U, sizedThreads);
+    }
+    effectiveThreads = static_cast<unsigned>(std::min<std::uint64_t>(
+        effectiveThreads,
+        std::max<std::uint64_t>(1ULL, header.vertexCount)));
+
+    std::vector<RangeParseOutput> outputs(effectiveThreads);
+    {
+        std::vector<std::jthread> workers;
+        workers.reserve(effectiveThreads > 0U ? effectiveThreads - 1U : 0U);
+        const auto pointsPerRange =
+            (header.vertexCount + effectiveThreads - 1U) / effectiveThreads;
+        for (unsigned workerIndex = 1U; workerIndex < effectiveThreads; ++workerIndex) {
+            const auto rangeBegin = std::min<std::uint64_t>(
+                header.vertexCount,
+                static_cast<std::uint64_t>(workerIndex) * pointsPerRange);
+            const auto rangeEnd = std::min<std::uint64_t>(
+                header.vertexCount,
+                rangeBegin + pointsPerRange);
+            workers.emplace_back([&parseRange, rangeBegin, rangeEnd, &outputs, workerIndex]() {
+                parseRange(rangeBegin, rangeEnd, &outputs[workerIndex]);
+            });
+        }
+        parseRange(
+            0U,
+            std::min<std::uint64_t>(header.vertexCount, pointsPerRange),
+            &outputs[0]);
+    }
+
+    // Deterministic merge: min/max/count folds are order-independent, and
+    // ranges are visited in index order so the concatenated focus samples
+    // (truncated to the sequential cap) match a single-threaded parse
+    // exactly.
+    std::vector<Float3> focusSamples;
+    focusSamples.reserve(std::min<std::uint64_t>(header.vertexCount, kMaxFocusSamples));
+    for (const auto& output : outputs) {
+        if (!output.errorMessage.empty()) {
+            return {.errorMessage = output.errorMessage, .success = false};
+        }
+        if (output.bounds.valid) {
+            cloud.bounds.Expand(output.bounds.minimum);
+            cloud.bounds.Expand(output.bounds.maximum);
+        }
+        for (std::size_t slot = 0; slot < output.fieldStats.size(); ++slot) {
+            const auto& local = output.fieldStats[slot];
+            if (!local.valid) {
+                continue;
             }
-            cloud.packedColors[globalIndex] = PackRgba8(red, green, blue);
-            cloud.bounds.Expand(position);
-            if ((globalIndex % focusSampleStride) == 0 && focusSamples.size() < kMaxFocusSamples) {
-                focusSamples.push_back(position);
+            auto& merged = cloud.scalarFields[slot];
+            if (!merged.valid) {
+                merged.minimum = local.minimum;
+                merged.maximum = local.maximum;
+                merged.count = local.count;
+                merged.valid = true;
+            } else {
+                merged.minimum = std::min(merged.minimum, local.minimum);
+                merged.maximum = std::max(merged.maximum, local.maximum);
+                merged.count += local.count;
             }
+        }
+        for (const auto& sample : output.focusSamples) {
+            if (focusSamples.size() >= kMaxFocusSamples) {
+                break;
+            }
+            focusSamples.push_back(sample);
         }
     }
 

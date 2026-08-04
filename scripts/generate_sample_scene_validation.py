@@ -24,7 +24,7 @@ from typing import Any
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
-PROJECT_SCHEMA_VERSION = 64
+PROJECT_SCHEMA_VERSION = 65
 DEFAULT_MAIN_PROJECT = REPOSITORY_ROOT / "Saved" / "exhibitionScene_project.json"
 DEFAULT_FIXTURE = REPOSITORY_ROOT / "tests" / "fixtures" / "sample_scene_water_sources.json"
 DEFAULT_VALIDATION_PROJECT = (
@@ -386,7 +386,7 @@ def build_water_fixture(project: dict[str, Any], state: dict[str, Any]) -> dict[
     seepage = copy.deepcopy(named_object(state["water_seepage_nodes"], "SampleSeepage"))
 
     fixture: dict[str, Any] = {
-        "schema_version": 20,
+        "schema_version": 21,
         "fixture_metadata": {
             "scene_group": "SampleScene",
             "display_spacing_micrometres": DISPLAY_SPACING,
@@ -440,8 +440,8 @@ def build_water_fixture(project: dict[str, Any], state: dict[str, Any]) -> dict[
 
 
 def validate_water_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
-    if fixture.get("schema_version") != 20:
-        raise ValueError("SampleScene water fixture must use water-source schema 20")
+    if fixture.get("schema_version") != 21:
+        raise ValueError("SampleScene water fixture must use water-source schema 21")
     metadata = fixture.get("fixture_metadata")
     if not isinstance(metadata, dict) or metadata.get("scene_group") != "SampleScene":
         raise ValueError("SampleScene water fixture has invalid fixture metadata")
