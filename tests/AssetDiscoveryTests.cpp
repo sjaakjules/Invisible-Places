@@ -30,6 +30,7 @@
 #include "scene/PointCloudVariants.hpp"
 #include "scene/SceneCatalog.hpp"
 #include "serialization/ProjectDocument.hpp"
+#include "serialization/ProjectDocumentJson.hpp"
 #include "style/RenderParameterBinding.hpp"
 #include "water/WaterFlow.hpp"
 
@@ -11714,6 +11715,15 @@ TEST_CASE("Animation path perceived flow rises when the subject is close", "[cam
         for (const auto& sample : flowSamples) {
             CHECK(std::isfinite(sample.screenSpeed));
             CHECK(sample.screenSpeed >= 0.0F);
+            CHECK(std::isfinite(sample.screenVelocity[0U]));
+            CHECK(std::isfinite(sample.screenVelocity[1U]));
+            if (sample.screenSpeed > 1.0e-5F) {
+                CHECK(
+                    std::hypot(
+                        sample.screenVelocity[0U],
+                        sample.screenVelocity[1U]) ==
+                    Catch::Approx(sample.screenSpeed).epsilon(1.0e-4F));
+            }
             totalFlow += sample.screenSpeed;
         }
         return totalFlow / static_cast<float>(flowSamples.size());
@@ -11747,6 +11757,370 @@ TEST_CASE("Animation path perceived flow is zero for static paths and retimes ev
     REQUIRE(segmentFrames.size() == 2U);
     CHECK(segmentFrames[0] == 45U);
     CHECK(segmentFrames[1] == 45U);
+}
+
+TEST_CASE("Loop endpoint corrections leave the complete middle interval unchanged", "[camera][animation][loop]") {
+    using invisible_places::camera::AnimationLoopSmoothingMetadata;
+    using invisible_places::camera::AnimationPath;
+    AnimationPath original;
+    original.durationFrames = 150U;
+    original.keys = {
+        {.id = "a", .cameraPosition = {0.0F, 4.0F, 1.0F}, .focusPoint = {3.0F, 4.0F, 1.0F}, .durationFrames = 30U},
+        {.id = "b", .cameraPosition = {0.2F, 3.0F, 1.0F}, .focusPoint = {3.2F, 3.0F, 1.0F}, .durationFrames = 31U},
+        {.id = "c", .cameraPosition = {0.3F, 2.0F, 1.0F}, .focusPoint = {3.3F, 2.0F, 1.0F}, .durationFrames = 37U},
+        {.id = "d", .cameraPosition = {0.4F, 1.0F, 1.0F}, .focusPoint = {3.4F, 1.0F, 1.0F}, .durationFrames = 39U},
+        {.id = "e", .cameraPosition = {0.5F, 0.0F, 1.0F}, .focusPoint = {3.5F, 0.0F, 1.0F}, .durationFrames = 43U},
+    };
+    auto smoothed = original;
+    smoothed.loopTransitionSmoothing = AnimationLoopSmoothingMetadata{
+        .pairId = "pair",
+        .partnerFileName = "other.ipanim.json",
+        .firstKeyId = "a",
+        .lastKeyId = "e",
+        .originalFirstCameraPosition = original.keys.front().cameraPosition,
+        .originalFirstFocusPoint = original.keys.front().focusPoint,
+        .originalLastCameraPosition = original.keys.back().cameraPosition,
+        .originalLastFocusPoint = original.keys.back().focusPoint,
+    };
+    smoothed.keys.front().cameraPosition[0] += 0.08F;
+    smoothed.keys.front().focusPoint[1] -= 0.06F;
+    smoothed.keys.back().cameraPosition[0] -= 0.07F;
+    smoothed.keys.back().focusPoint[1] += 0.05F;
+
+    const auto originalContext =
+        invisible_places::camera::PrepareAnimationPathEvaluation(original);
+    const auto smoothedContext =
+        invisible_places::camera::PrepareAnimationPathEvaluation(smoothed);
+    REQUIRE(originalContext.knots.size() == original.keys.size());
+    REQUIRE(smoothedContext.knots == originalContext.knots);
+    for (std::uint32_t sample = 0U; sample <= 64U; ++sample) {
+        const float amount = static_cast<float>(sample) / 64.0F;
+        const float time = std::lerp(
+            originalContext.knots[1U],
+            originalContext.knots[originalContext.knots.size() - 2U],
+            amount);
+        const auto before = invisible_places::camera::EvaluatePreparedAnimationPath(
+            originalContext,
+            time);
+        const auto after = invisible_places::camera::EvaluatePreparedAnimationPath(
+            smoothedContext,
+            time);
+        for (std::size_t component = 0U; component < 3U; ++component) {
+            CHECK(after.camera.position[component] == Catch::Approx(before.camera.position[component]).margin(1.0e-6F));
+            CHECK(after.focusPoint[component] == Catch::Approx(before.focusPoint[component]).margin(1.0e-6F));
+        }
+    }
+    CHECK(smoothed.keys.front().durationFrames == original.keys.front().durationFrames);
+    CHECK(smoothed.keys[1U].durationFrames == original.keys[1U].durationFrames);
+    CHECK(smoothed.keys.back().durationFrames == original.keys.back().durationFrames);
+}
+
+TEST_CASE("Loop transition smoothing improves both seams without retiming", "[camera][animation][loop]") {
+    using invisible_places::camera::AnimationLoopSmoothingOptions;
+    using invisible_places::camera::AnimationPath;
+    const auto makeKey = [](const char* id, float x, float y, std::uint32_t frames) {
+        return invisible_places::camera::AnimationPathKey{
+            .id = id,
+            .cameraPosition = {x, y, 1.0F},
+            .focusPoint = {x + 3.0F, y, 1.0F},
+            .durationFrames = frames,
+        };
+    };
+    AnimationPath first;
+    first.name = "First";
+    first.durationFrames = 150U;
+    first.keys = {
+        makeKey("a1", 0.0F, 4.0F, 30U),
+        makeKey("a2", 0.18F, 3.0F, 31U),
+        makeKey("a3", 0.28F, 2.0F, 37U),
+        makeKey("a4", 0.38F, 1.0F, 39U),
+        makeKey("a5", 0.48F, 0.0F, 43U),
+    };
+    AnimationPath second;
+    second.name = "Second";
+    second.durationFrames = 150U;
+    second.keys = {
+        makeKey("b1", 0.52F, 4.0F, 30U),
+        makeKey("b2", 0.92F, 3.0F, 31U),
+        makeKey("b3", 1.02F, 2.0F, 37U),
+        makeKey("b4", 1.12F, 1.0F, 39U),
+        makeKey("b5", 1.22F, 0.0F, 43U),
+    };
+    const auto originalFirst = first;
+    const auto originalSecond = second;
+    const auto result = invisible_places::camera::SmoothAnimationLoopTransitions(
+        &first,
+        &second,
+        AnimationLoopSmoothingOptions{
+            .maxEndMoveFraction = 0.10F,
+            .pairId = "test-pair",
+            .firstFileName = "First.ipanim.json",
+            .secondFileName = "Second.ipanim.json",
+        });
+    REQUIRE(result.succeeded);
+    REQUIRE(result.changed);
+    CHECK(result.afterMismatch < result.beforeMismatch);
+    CHECK(result.afterSeamMismatch[0U] < result.beforeSeamMismatch[0U]);
+    CHECK(result.afterSeamMismatch[1U] < result.beforeSeamMismatch[1U]);
+    REQUIRE(first.loopTransitionSmoothing.has_value());
+    REQUIRE(second.loopTransitionSmoothing.has_value());
+    CHECK(first.loopTransitionSmoothing->pairId == second.loopTransitionSmoothing->pairId);
+    CHECK(first.durationFrames == originalFirst.durationFrames);
+    CHECK(second.durationFrames == originalSecond.durationFrames);
+    for (std::size_t keyIndex = 0U; keyIndex < first.keys.size(); ++keyIndex) {
+        CHECK(first.keys[keyIndex].durationFrames == originalFirst.keys[keyIndex].durationFrames);
+        CHECK(second.keys[keyIndex].durationFrames == originalSecond.keys[keyIndex].durationFrames);
+        if (keyIndex > 0U && keyIndex + 1U < first.keys.size()) {
+            CHECK(first.keys[keyIndex].cameraPosition == originalFirst.keys[keyIndex].cameraPosition);
+            CHECK(first.keys[keyIndex].focusPoint == originalFirst.keys[keyIndex].focusPoint);
+            CHECK(second.keys[keyIndex].cameraPosition == originalSecond.keys[keyIndex].cameraPosition);
+            CHECK(second.keys[keyIndex].focusPoint == originalSecond.keys[keyIndex].focusPoint);
+        }
+    }
+    CHECK(result.maxCameraMove <= Catch::Approx(0.11F));
+    CHECK(result.maxFocusMove <= Catch::Approx(0.11F));
+
+    const auto weightedTerminalSpeedDeviation = [](
+                                                      const AnimationPath& before,
+                                                      const AnimationPath& after) {
+        const auto beforeContext =
+            invisible_places::camera::PrepareAnimationPathEvaluation(before);
+        const auto afterContext =
+            invisible_places::camera::PrepareAnimationPathEvaluation(after);
+        const auto beforeFlow = invisible_places::camera::
+            MeasurePreparedAnimationPathPerceivedFlow(beforeContext, 1025U);
+        const auto afterFlow = invisible_places::camera::
+            MeasurePreparedAnimationPathPerceivedFlow(afterContext, 1025U);
+        const float firstEnd = beforeContext.knots[1U] /
+                               beforeContext.durationSeconds;
+        const float lastStart = beforeContext.knots[
+                                    beforeContext.knots.size() - 2U] /
+                                beforeContext.durationSeconds;
+        float squaredDifference = 0.0F;
+        float squaredOriginal = 0.0F;
+        for (std::size_t index = 0U; index < beforeFlow.size(); ++index) {
+            const float position = beforeFlow[index].normalizedPosition;
+            float inward = 2.0F;
+            if (position <= firstEnd) {
+                inward = position / std::max(firstEnd, 1.0e-6F);
+            } else if (position >= lastStart) {
+                inward = (1.0F - position) /
+                         std::max(1.0F - lastStart, 1.0e-6F);
+            }
+            if (inward > 1.0F) {
+                continue;
+            }
+            const float weight = (1.0F - inward) * (1.0F - inward);
+            const float difference =
+                afterFlow[index].screenSpeed - beforeFlow[index].screenSpeed;
+            squaredDifference += weight * difference * difference;
+            squaredOriginal += weight * beforeFlow[index].screenSpeed *
+                               beforeFlow[index].screenSpeed;
+        }
+        return std::sqrt(
+            squaredDifference / std::max(squaredOriginal, 1.0e-8F));
+    };
+    CHECK(weightedTerminalSpeedDeviation(originalFirst, first) < 0.30F);
+    CHECK(weightedTerminalSpeedDeviation(originalSecond, second) < 0.30F);
+
+    std::string unapplyError;
+    REQUIRE(invisible_places::camera::UnapplyAnimationLoopSmoothing(&first, &unapplyError));
+    REQUIRE(invisible_places::camera::UnapplyAnimationLoopSmoothing(&second, &unapplyError));
+    CHECK(first.keys.front().cameraPosition == originalFirst.keys.front().cameraPosition);
+    CHECK(first.keys.back().focusPoint == originalFirst.keys.back().focusPoint);
+    CHECK(second.keys.front().focusPoint == originalSecond.keys.front().focusPoint);
+    CHECK(second.keys.back().cameraPosition == originalSecond.keys.back().cameraPosition);
+    CHECK_FALSE(first.loopTransitionSmoothing.has_value());
+    CHECK_FALSE(second.loopTransitionSmoothing.has_value());
+    CHECK(
+        invisible_places::serialization::AnimationPathToJson(first) ==
+        invisible_places::serialization::AnimationPathToJson(originalFirst));
+    CHECK(
+        invisible_places::serialization::AnimationPathToJson(second) ==
+        invisible_places::serialization::AnimationPathToJson(originalSecond));
+}
+
+TEST_CASE("Loop smoothing uses one bounded pose for shared endpoint cameras", "[camera][animation][loop]") {
+    using invisible_places::camera::AnimationPath;
+    const auto makeKey = [](const char* id, float x, float y) {
+        return invisible_places::camera::AnimationPathKey{
+            .id = id,
+            .cameraPosition = {x, y, 1.0F},
+            .focusPoint = {x + 3.0F, y, 1.0F},
+            .durationFrames = 30U,
+        };
+    };
+    AnimationPath first;
+    first.name = "Shared First";
+    first.durationFrames = 120U;
+    first.keys = {
+        makeKey("a1", 0.0F, 4.0F),
+        makeKey("a2", 0.2F, 3.0F),
+        makeKey("a3", 0.3F, 2.0F),
+        makeKey("a4", 0.4F, 1.0F),
+        makeKey("a5", 0.5F, 0.0F),
+    };
+    AnimationPath second;
+    second.name = "Shared Second";
+    second.durationFrames = 120U;
+    second.keys = {
+        makeKey("b1", 0.52F, 0.0F),
+        makeKey("b2", 0.9F, 1.0F),
+        makeKey("b3", 0.8F, 2.0F),
+        makeKey("b4", 0.3F, 3.0F),
+        makeKey("b5", 0.02F, 4.0F),
+    };
+    first.keys.front().linkedCameraId = "shared-endpoint";
+    second.keys.back().linkedCameraId = "shared-endpoint";
+    second.keys.back().focusPoint[1] += 0.06F;
+    const auto originalFirst = first;
+    const auto originalSecond = second;
+
+    const auto distance = [](const auto& left, const auto& right) {
+        const float x = right[0] - left[0];
+        const float y = right[1] - left[1];
+        const float z = right[2] - left[2];
+        return std::sqrt((x * x) + (y * y) + (z * z));
+    };
+    const auto result = invisible_places::camera::SmoothAnimationLoopTransitions(
+        &first,
+        &second,
+        {.maxEndMoveFraction = 0.10F});
+    REQUIRE(result.succeeded);
+    REQUIRE(result.changed);
+    CHECK(first.keys.front().cameraPosition == second.keys.back().cameraPosition);
+    CHECK(first.keys.front().focusPoint == second.keys.back().focusPoint);
+    CHECK(
+        distance(
+            originalFirst.keys.front().cameraPosition,
+            first.keys.front().cameraPosition) <=
+        0.10F * distance(
+                    originalFirst.keys.front().cameraPosition,
+                    originalFirst.keys[1U].cameraPosition) +
+            1.0e-5F);
+    CHECK(
+        distance(
+            originalSecond.keys.back().focusPoint,
+            second.keys.back().focusPoint) <=
+        0.10F * distance(
+                    originalSecond.keys.back().focusPoint,
+                    originalSecond.keys[originalSecond.keys.size() - 2U]
+                        .focusPoint) +
+            1.0e-5F);
+
+    std::string unapplyError;
+    REQUIRE(invisible_places::camera::UnapplyAnimationLoopSmoothing(
+        &first,
+        &unapplyError));
+    REQUIRE(invisible_places::camera::UnapplyAnimationLoopSmoothing(
+        &second,
+        &unapplyError));
+    CHECK(first.keys.front().cameraPosition ==
+          originalFirst.keys.front().cameraPosition);
+    CHECK(second.keys.back().focusPoint ==
+          originalSecond.keys.back().focusPoint);
+}
+
+TEST_CASE("Loop smoothing rejects a shared pose outside every movement cap", "[camera][animation][loop]") {
+    invisible_places::camera::AnimationPath first;
+    first.keys = {
+        {.id = "a1", .cameraPosition = {0.0F, 0.0F, 0.0F}, .focusPoint = {0.0F, 1.0F, 0.0F}},
+        {.id = "a2", .cameraPosition = {1.0F, 0.0F, 0.0F}, .focusPoint = {1.0F, 1.0F, 0.0F}},
+        {.id = "a3", .cameraPosition = {2.0F, 0.0F, 0.0F}, .focusPoint = {2.0F, 1.0F, 0.0F}},
+    };
+    invisible_places::camera::AnimationPath second = first;
+    second.keys.front().id = "b1";
+    second.keys[1U].id = "b2";
+    second.keys.back().id = "b3";
+    first.keys.front().linkedCameraId = "shared";
+    second.keys.back().linkedCameraId = "shared";
+    second.keys.back().cameraPosition = {20.0F, 0.0F, 0.0F};
+    second.keys.back().focusPoint = {20.0F, 1.0F, 0.0F};
+    const auto originalFirst = first;
+    const auto originalSecond = second;
+
+    const auto result = invisible_places::camera::SmoothAnimationLoopTransitions(
+        &first,
+        &second,
+        {.maxEndMoveFraction = 0.01F});
+    CHECK_FALSE(result.succeeded);
+    CHECK_FALSE(first.loopTransitionSmoothing.has_value());
+    CHECK_FALSE(second.loopTransitionSmoothing.has_value());
+    CHECK(first.keys.front().cameraPosition ==
+          originalFirst.keys.front().cameraPosition);
+    CHECK(second.keys.back().focusPoint ==
+          originalSecond.keys.back().focusPoint);
+}
+
+TEST_CASE("Loop smoothing respects independently immovable camera and focus tracks", "[camera][animation][loop]") {
+    using invisible_places::camera::AnimationPath;
+    const auto makePair = []() {
+        AnimationPath first;
+        first.durationFrames = 120U;
+        first.keys = {
+            {.id = "a1", .cameraPosition = {0.0F, 4.0F, 1.0F}, .focusPoint = {3.0F, 4.0F, 1.0F}},
+            {.id = "a2", .cameraPosition = {0.2F, 3.0F, 1.0F}, .focusPoint = {3.2F, 3.0F, 1.0F}},
+            {.id = "a3", .cameraPosition = {0.3F, 2.0F, 1.0F}, .focusPoint = {3.3F, 2.0F, 1.0F}},
+            {.id = "a4", .cameraPosition = {0.4F, 1.0F, 1.0F}, .focusPoint = {3.4F, 1.0F, 1.0F}},
+            {.id = "a5", .cameraPosition = {0.5F, 0.0F, 1.0F}, .focusPoint = {3.5F, 0.0F, 1.0F}},
+        };
+        AnimationPath second;
+        second.durationFrames = 120U;
+        second.keys = {
+            {.id = "b1", .cameraPosition = {0.52F, 4.0F, 1.0F}, .focusPoint = {3.52F, 4.0F, 1.0F}},
+            {.id = "b2", .cameraPosition = {0.9F, 3.0F, 1.0F}, .focusPoint = {3.9F, 3.0F, 1.0F}},
+            {.id = "b3", .cameraPosition = {1.0F, 2.0F, 1.0F}, .focusPoint = {4.0F, 2.0F, 1.0F}},
+            {.id = "b4", .cameraPosition = {1.1F, 1.0F, 1.0F}, .focusPoint = {4.1F, 1.0F, 1.0F}},
+            {.id = "b5", .cameraPosition = {1.2F, 0.0F, 1.0F}, .focusPoint = {4.2F, 0.0F, 1.0F}},
+        };
+        return std::pair{first, second};
+    };
+
+    SECTION("zero-length focus end segments remain fixed") {
+        auto [first, second] = makePair();
+        for (auto* path : {&first, &second}) {
+            path->keys.front().focusPoint = {3.0F, 2.0F, 1.0F};
+            path->keys[1U].focusPoint = path->keys.front().focusPoint;
+            path->keys[path->keys.size() - 2U].focusPoint = {3.0F, 2.0F, 1.0F};
+            path->keys.back().focusPoint = path->keys[path->keys.size() - 2U].focusPoint;
+        }
+        const auto originalFirst = first;
+        const auto originalSecond = second;
+        const auto result = invisible_places::camera::SmoothAnimationLoopTransitions(
+            &first,
+            &second,
+            {.maxEndMoveFraction = 0.10F});
+        REQUIRE(result.succeeded);
+        REQUIRE(result.changed);
+        CHECK(result.maxFocusMove == Catch::Approx(0.0F).margin(1.0e-7F));
+        CHECK(first.keys.front().focusPoint ==
+              originalFirst.keys.front().focusPoint);
+        CHECK(second.keys.back().focusPoint ==
+              originalSecond.keys.back().focusPoint);
+    }
+
+    SECTION("zero-length camera end segments remain fixed") {
+        auto [first, second] = makePair();
+        for (auto* path : {&first, &second}) {
+            path->keys.front().cameraPosition = {0.0F, 2.0F, 1.0F};
+            path->keys[1U].cameraPosition = path->keys.front().cameraPosition;
+            path->keys[path->keys.size() - 2U].cameraPosition = {0.0F, 2.0F, 1.0F};
+            path->keys.back().cameraPosition = path->keys[path->keys.size() - 2U].cameraPosition;
+        }
+        const auto originalFirst = first;
+        const auto originalSecond = second;
+        const auto result = invisible_places::camera::SmoothAnimationLoopTransitions(
+            &first,
+            &second,
+            {.maxEndMoveFraction = 0.10F});
+        REQUIRE(result.succeeded);
+        REQUIRE(result.changed);
+        CHECK(result.maxCameraMove == Catch::Approx(0.0F).margin(1.0e-7F));
+        CHECK(first.keys.front().cameraPosition ==
+              originalFirst.keys.front().cameraPosition);
+        CHECK(second.keys.back().cameraPosition ==
+              originalSecond.keys.back().cameraPosition);
+    }
 }
 
 TEST_CASE("Animation path keeps camera and focus derivatives smooth through middle keys", "[camera][animation]") {

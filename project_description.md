@@ -180,6 +180,35 @@ Shot data includes:
 
 Default frame rate: **30 fps**.
 
+### Loop-transition smoothing
+Two saved animations form one closed cycle after their perceived speed has
+been authored. There is no order control: A-to-B-to-A and B-to-A-to-B are the
+same cycle up to phase, and a canonical filename order makes the optimizer
+deterministic regardless of which member is active. Loop smoothing jointly compares the signed
+screen-space motion at both end-to-start seams and may move only each path's
+first and last camera and focus positions, with separate bounds derived from
+the adjacent terminal segment. It never changes total duration or per-key
+segment frames.
+
+The evaluated path retains its preserved original cubic spline and adds a
+quadratic correction only on the first or last segment. The correction and its
+velocity reach zero at the fixed adjacent key, so every evaluated frame from
+key 2 through the second-from-last key remains unchanged. Reversible metadata
+stores both original endpoint poses. Applying and unapplying first create
+paired `_Edited` versions; Save Changes promotes both animation files and the
+active project atomically, while Discard Edits restores both saved versions.
+A linked camera can participate
+only when all of its uses are movable endpoints in the selected pair.
+
+### Animation versioning
+Every registered animation keeps its last saved, disk-backed version plus at
+most one explicit in-memory `_Edited` version. Authoring, linked-camera edits,
+perceived-speed equalization, and loop smoothing target `_Edited`; normal load
+prefers it. The Animation list exposes Saved and `_Edited` separately for
+comparison, with the Saved view read-only while edits exist. Saving promotes
+`_Edited` over Saved and removes the shadow. Discarding removes only the
+shadow and reloads Saved.
+
 ### Timing scalar effects
 The Timings tab owns one ordered list of scalar-driven effects. The user can
 add either a **Colourise** effect or an **Emissive** effect, reorder them by

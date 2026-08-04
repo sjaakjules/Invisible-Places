@@ -300,10 +300,19 @@ struct PersistenceState {
     std::vector<QueuedLayerLoad> queuedLoads;
 };
 
+struct PreservedAnimationEdit {
+    std::filesystem::path filePath;
+    AnimationPath path;
+    std::string loopPairId;
+};
+
 struct PreservedAnimationRuntimeState {
     std::optional<AnimationPath> path;
     std::string filePath;
     std::optional<std::size_t> selectedFileIndex;
+    bool currentPathUsesEdited = false;
+    bool selectedFileUsesEdited = false;
+    std::vector<PreservedAnimationEdit> edits;
     float scrubAmount = 0.0F;
     invisible_places::timing::TimelineViewRange timelineViewRange{};
     bool dirty = false;
@@ -333,12 +342,33 @@ struct RenderSetupHistoryRuntimeState {
     std::string saveAsName;
 };
 
-struct SaveBeforeCloseState {
+enum class SaveChangesRequest {
+    Project,
+    Animation,
+    AnimationAs,
+    Closing
+};
+
+enum class SaveChangesItemKind {
+    Project,
+    Animation
+};
+
+struct SaveChangesItem {
+    SaveChangesItemKind kind = SaveChangesItemKind::Project;
+    std::filesystem::path targetPath;
+    bool currentAnimation = false;
+    bool selected = true;
+    std::string displayName;
+};
+
+struct SaveChangesDialogState {
     bool requested = false;
-    bool saveProject = true;
-    bool saveAnimation = false;
+    bool closeAfterSave = false;
+    bool allowItemSelection = true;
     bool waitingForRenderCancellation = false;
     bool exitConfirmed = false;
+    std::vector<SaveChangesItem> items;
     std::string errorMessage;
 };
 
@@ -631,7 +661,13 @@ struct AnimationPanelState {
     std::string draftAnimationName = "Animation 1";
     std::vector<std::filesystem::path> availableFiles;
     std::vector<std::vector<std::filesystem::path>> availableFileAssociatedLayerPaths;
+    // The loaded path is the last successfully saved, disk-backed version.
+    // Ordinary authoring never mutates it; edits live in the parallel shadow.
     std::vector<std::optional<AnimationPath>> availableFileLoadedPaths;
+    std::vector<std::optional<AnimationPath>> availableFileEditedPaths;
+    // Keeps paired save/discard atomic even after Unapply clears the
+    // serialized smoothing metadata from both edited paths.
+    std::vector<std::string> availableFileLoopEditPairIds;
     std::vector<bool> availableFileDirtyFlags;
     bool animationRegistryInitialized = false;
     std::vector<std::filesystem::path> selectedExportFiles;
@@ -640,6 +676,10 @@ struct AnimationPanelState {
     std::size_t quickMp4QueueCompleted = 0;
     std::size_t quickMp4QueueSkipped = 0;
     std::optional<std::size_t> selectedFileIndex;
+    bool selectedFileUsesEdited = false;
+    bool currentPathUsesEdited = false;
+    std::filesystem::path loopSmoothingPartnerPath;
+    float loopSmoothingMaxEndMovePercent = 10.0F;
     std::optional<std::size_t> renamingFileIndex;
     std::string fileRenameBuffer;
     bool focusFileRename = false;
@@ -1277,6 +1317,18 @@ std::optional<std::size_t> FindAnimationRegistryIndex(
 bool LoadAnimationPathFromFile(
     PreviewRuntimeState* runtimeState,
     const std::filesystem::path& inputPath);
+void RequestSaveChangesDialog(
+    PreviewRuntimeState* runtimeState,
+    SaveChangesRequest request);
+ProjectDocument BuildProjectDocumentForSave(
+    const PreviewRuntimeState& runtimeState);
+bool ApplyAnimationLoopSmoothing(
+    PreviewRuntimeState* runtimeState,
+    std::size_t partnerFileIndex,
+    float maxEndMoveFraction);
+bool UnapplyAnimationLoopSmoothing(
+    PreviewRuntimeState* runtimeState,
+    std::size_t partnerFileIndex);
 void ApplyAnimationScrub(PreviewRuntimeState* runtimeState);
 std::string NormalizeMotionScalarFieldName(std::string_view name);
 bool SessionHasWaterEffectCompositionFields(const PreviewLayerSession& session);
@@ -2199,6 +2251,7 @@ struct PreviewRuntimeState {
     ProjectSettings projectSettings{};
     ProjectPointVisualLibraryState pointVisualLibrary{};
     PersistenceState persistence{};
+    SaveChangesDialogState saveChanges{};
     RenderSetupHistoryRuntimeState renderSetupHistory{};
     std::optional<ActiveRenderSetupOverride> activeRenderSetupOverride;
     // Set by the first Export Current click when finest-density sources still
@@ -4211,6 +4264,17 @@ std::uint64_t AnimationPathMotionFingerprint(const AnimationPath& path) {
         HashFloat(&seed, key.nearPlane);
         HashFloat(&seed, key.farPlane);
         HashCombine(&seed, key.durationFrames);
+    }
+    HashBool(&seed, path.loopTransitionSmoothing.has_value());
+    if (path.loopTransitionSmoothing.has_value()) {
+        const auto& smoothing = path.loopTransitionSmoothing.value();
+        HashString(&seed, smoothing.pairId);
+        HashString(&seed, smoothing.firstKeyId);
+        HashString(&seed, smoothing.lastKeyId);
+        HashArray3(&seed, smoothing.originalFirstCameraPosition);
+        HashArray3(&seed, smoothing.originalFirstFocusPoint);
+        HashArray3(&seed, smoothing.originalLastCameraPosition);
+        HashArray3(&seed, smoothing.originalLastFocusPoint);
     }
     return seed;
 }
@@ -8452,6 +8516,13 @@ void CanonicalizeRuntimeSceneAssociations(PreviewRuntimeState* runtimeState) {
                 &loadedPath->associatedLayerPaths);
         }
     }
+    for (auto& editedPath : runtimeState->animationPanel.availableFileEditedPaths) {
+        if (editedPath.has_value()) {
+            CanonicalizeAssociatedLayerPathsForSceneGroups(
+                *runtimeState,
+                &editedPath->associatedLayerPaths);
+        }
+    }
     if (runtimeState->animationPanel.currentPath.has_value()) {
         CanonicalizeAssociatedLayerPathsForSceneGroups(
             *runtimeState,
@@ -10866,6 +10937,10 @@ bool SaveAnimationPathToFile(
 const AnimationPath* RegistryAnimationPath(
     const PreviewRuntimeState& runtimeState,
     std::size_t fileIndex);
+AnimationPath* MutableRegistryAnimationPath(
+    PreviewRuntimeState* runtimeState,
+    std::size_t fileIndex);
+void SyncCurrentAnimationToRegistry(PreviewRuntimeState* runtimeState);
 
 std::uint32_t NextWaterEmitterId(const PreviewRuntimeState& runtimeState) {
     std::uint32_t nextId = std::max<std::uint32_t>(1U, runtimeState.water.nextEmitterId);
@@ -11320,7 +11395,20 @@ AnimationPath* CurrentAnimationPath(PreviewRuntimeState* runtimeState) {
     if (runtimeState == nullptr || !runtimeState->animationPanel.currentPath.has_value()) {
         return nullptr;
     }
-    return &runtimeState->animationPanel.currentPath.value();
+    auto& panel = runtimeState->animationPanel;
+    if (panel.currentFilePath.empty()) {
+        panel.currentPathUsesEdited = true;
+        panel.dirty = true;
+        return &panel.currentPath.value();
+    }
+    const auto registryIndex = FindAnimationRegistryIndex(
+        panel,
+        std::filesystem::path{panel.currentFilePath});
+    return registryIndex.has_value()
+               ? MutableRegistryAnimationPath(
+                     runtimeState,
+                     registryIndex.value())
+               : &panel.currentPath.value();
 }
 
 const AnimationPath* CurrentAnimationPath(const PreviewRuntimeState& runtimeState) {
@@ -12009,15 +12097,10 @@ void SaveEditableWaterCausticLookSettings(PreviewRuntimeState* runtimeState) {
         animationPath->waterCausticLookSettings = animationPath->tempWaterCausticLookSettings.value();
         animationPath->tempWaterCausticLookSettings.reset();
         runtimeState->animationPanel.dirty = true;
-        if (!runtimeState->animationPanel.currentFilePath.empty()) {
-            SaveAnimationPathToFile(
-                runtimeState,
-                *animationPath,
-                runtimeState->animationPanel.currentFilePath);
-        } else {
-            runtimeState->statusMessage = "Saved caustic look to current animation.";
-            runtimeState->errorMessage.clear();
-        }
+        runtimeState->statusMessage =
+            "Applied the caustic look to the animation's _Edited version. "
+            "Use Save Changes to promote it.";
+        runtimeState->errorMessage.clear();
         return;
     }
     if (!runtimeState->water.tempDefaultCausticLookSettings.has_value()) {
@@ -12109,10 +12192,13 @@ void UnloadCurrentAnimationForWaterEditing(PreviewRuntimeState* runtimeState) {
     if (runtimeState == nullptr) {
         return;
     }
+    SyncCurrentAnimationToRegistry(runtimeState);
     runtimeState->animationPlayback.active = false;
     runtimeState->cameraPlayback.active = false;
     runtimeState->animationPanel.currentPath.reset();
     runtimeState->animationPanel.currentFilePath.clear();
+    runtimeState->animationPanel.currentPathUsesEdited = false;
+    runtimeState->animationPanel.selectedFileUsesEdited = false;
     runtimeState->animationPanel.draftAnimationName.clear();
     runtimeState->animationPanel.selectedKeyIndex.reset();
     runtimeState->animationPanel.scrubAmount = 0.0F;
@@ -22767,6 +22853,8 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->animationPlayback.active = false;
     runtimeState->animationPanel.currentPath.reset();
     runtimeState->animationPanel.currentFilePath.clear();
+    runtimeState->animationPanel.currentPathUsesEdited = false;
+    runtimeState->animationPanel.selectedFileUsesEdited = false;
     runtimeState->animationPanel.selectedFileIndex.reset();
     runtimeState->animationPanel.selectedKeyIndex.reset();
     runtimeState->animationPanel.scrubAmount = 0.0F;
@@ -23191,6 +23279,8 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->animationPanel.availableFiles.clear();
     runtimeState->animationPanel.availableFileAssociatedLayerPaths.clear();
     runtimeState->animationPanel.availableFileLoadedPaths.clear();
+    runtimeState->animationPanel.availableFileEditedPaths.clear();
+    runtimeState->animationPanel.availableFileLoopEditPairIds.clear();
     runtimeState->animationPanel.availableFileDirtyFlags.clear();
     runtimeState->animationPanel.selectedExportFiles.clear();
     if (document.hasSavedAnimationRegistry) {
@@ -23208,6 +23298,8 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->animationPanel.renamingFileIndex.reset();
     runtimeState->animationPanel.fileRenameBuffer.clear();
     runtimeState->animationPanel.focusFileRename = false;
+    runtimeState->animationPanel.currentPathUsesEdited = false;
+    runtimeState->animationPanel.selectedFileUsesEdited = false;
     if (runtimeState->cameraPanel.pathShotIndices.empty() &&
         document.schemaVersion < 9U &&
         !runtimeState->cameraShots.empty()) {
@@ -23405,6 +23497,8 @@ bool ApplyProjectDocumentToRuntime(
                     : runtimeState->errorMessage;
             runtimeState->animationPanel.currentPath.reset();
             runtimeState->animationPanel.currentFilePath.clear();
+            runtimeState->animationPanel.currentPathUsesEdited = false;
+            runtimeState->animationPanel.selectedFileUsesEdited = false;
             runtimeState->animationPanel.selectedFileIndex.reset();
             runtimeState->animationPanel.selectedKeyIndex.reset();
         }
@@ -23466,11 +23560,15 @@ std::string RenderSetupProjectIdentity(
 
 PreservedAnimationRuntimeState CaptureAnimationRuntimeState(
     const PreviewRuntimeState& runtimeState) {
-    return PreservedAnimationRuntimeState{
+    PreservedAnimationRuntimeState state{
         .path = runtimeState.animationPanel.currentPath,
         .filePath = runtimeState.animationPanel.currentFilePath,
         .selectedFileIndex =
             runtimeState.animationPanel.selectedFileIndex,
+        .currentPathUsesEdited =
+            runtimeState.animationPanel.currentPathUsesEdited,
+        .selectedFileUsesEdited =
+            runtimeState.animationPanel.selectedFileUsesEdited,
         .scrubAmount = std::clamp(
             runtimeState.animationPanel.scrubAmount,
             0.0F,
@@ -23480,6 +23578,55 @@ PreservedAnimationRuntimeState CaptureAnimationRuntimeState(
                 runtimeState.animationPanel.timelineViewRange),
         .dirty = runtimeState.animationPanel.dirty,
     };
+    const auto& panel = runtimeState.animationPanel;
+    const auto editCount = std::min(
+        panel.availableFiles.size(),
+        panel.availableFileEditedPaths.size());
+    state.edits.reserve(editCount);
+    for (std::size_t index = 0U; index < editCount; ++index) {
+        if (!panel.availableFileEditedPaths[index].has_value()) {
+            continue;
+        }
+        state.edits.push_back({
+            .filePath = panel.availableFiles[index],
+            .path = panel.availableFileEditedPaths[index].value(),
+            .loopPairId = index < panel.availableFileLoopEditPairIds.size()
+                              ? panel.availableFileLoopEditPairIds[index]
+                              : std::string{},
+        });
+    }
+    if (panel.dirty && panel.currentPath.has_value() &&
+        !panel.currentFilePath.empty()) {
+        const std::filesystem::path currentFilePath{
+            panel.currentFilePath};
+        const auto currentEdit = std::find_if(
+            state.edits.begin(),
+            state.edits.end(),
+            [&](const PreservedAnimationEdit& edit) {
+                return edit.filePath.lexically_normal() ==
+                       currentFilePath.lexically_normal();
+            });
+        if (currentEdit != state.edits.end()) {
+            currentEdit->path = panel.currentPath.value();
+        } else {
+            std::string loopPairId;
+            if (const auto currentIndex = FindAnimationRegistryIndex(
+                    panel,
+                    currentFilePath);
+                currentIndex.has_value() &&
+                currentIndex.value() <
+                    panel.availableFileLoopEditPairIds.size()) {
+                loopPairId = panel.availableFileLoopEditPairIds[
+                    currentIndex.value()];
+            }
+            state.edits.push_back({
+                .filePath = currentFilePath,
+                .path = panel.currentPath.value(),
+                .loopPairId = std::move(loopPairId),
+            });
+        }
+    }
+    return state;
 }
 
 void RestoreAnimationRuntimeState(
@@ -23492,6 +23639,34 @@ void RestoreAnimationRuntimeState(
     panel.currentPath = std::move(state.path);
     panel.currentFilePath = std::move(state.filePath);
     panel.selectedFileIndex = state.selectedFileIndex;
+    panel.currentPathUsesEdited =
+        state.currentPathUsesEdited || state.dirty;
+    panel.selectedFileUsesEdited =
+        state.selectedFileUsesEdited || state.dirty;
+    EnsureAnimationAssociationStorage(&panel);
+    for (auto& edit : state.edits) {
+        auto registryIndex = FindAnimationRegistryIndex(
+            panel,
+            edit.filePath);
+        if (!registryIndex.has_value()) {
+            AddAnimationFileToRegistry(
+                &panel,
+                edit.filePath,
+                edit.path.associatedLayerPaths);
+            registryIndex = FindAnimationRegistryIndex(
+                panel,
+                edit.filePath);
+        }
+        if (!registryIndex.has_value()) {
+            continue;
+        }
+        EnsureAnimationAssociationStorage(&panel);
+        panel.availableFileEditedPaths[registryIndex.value()] =
+            std::move(edit.path);
+        panel.availableFileLoopEditPairIds[registryIndex.value()] =
+            std::move(edit.loopPairId);
+        panel.availableFileDirtyFlags[registryIndex.value()] = true;
+    }
     panel.selectedKeyIndex.reset();
     panel.selectedWaterKeyIndex.reset();
     panel.selectedSeepageNodeKeyIndex.reset();
@@ -24019,6 +24194,8 @@ void EnsureAnimationAssociationStorage(AnimationPanelState* panelState) {
     }
     panelState->availableFileAssociatedLayerPaths.resize(panelState->availableFiles.size());
     panelState->availableFileLoadedPaths.resize(panelState->availableFiles.size());
+    panelState->availableFileEditedPaths.resize(panelState->availableFiles.size());
+    panelState->availableFileLoopEditPairIds.resize(panelState->availableFiles.size());
     panelState->availableFileDirtyFlags.resize(panelState->availableFiles.size(), false);
 }
 
@@ -24089,10 +24266,14 @@ void SortAnimationRegistry(AnimationPanelState* panelState) {
     std::vector<std::filesystem::path> sortedFiles;
     std::vector<std::vector<std::filesystem::path>> sortedAssociations;
     std::vector<std::optional<AnimationPath>> sortedLoadedPaths;
+    std::vector<std::optional<AnimationPath>> sortedEditedPaths;
+    std::vector<std::string> sortedLoopEditPairIds;
     std::vector<bool> sortedDirtyFlags;
     sortedFiles.reserve(panelState->availableFiles.size());
     sortedAssociations.reserve(panelState->availableFiles.size());
     sortedLoadedPaths.reserve(panelState->availableFiles.size());
+    sortedEditedPaths.reserve(panelState->availableFiles.size());
+    sortedLoopEditPairIds.reserve(panelState->availableFiles.size());
     sortedDirtyFlags.reserve(panelState->availableFiles.size());
     for (const auto index : indices) {
         if (!sortedFiles.empty() &&
@@ -24104,11 +24285,15 @@ void SortAnimationRegistry(AnimationPanelState* panelState) {
         sortedFiles.push_back(panelState->availableFiles[index].lexically_normal());
         sortedAssociations.push_back(std::move(associations));
         sortedLoadedPaths.push_back(panelState->availableFileLoadedPaths[index]);
+        sortedEditedPaths.push_back(panelState->availableFileEditedPaths[index]);
+        sortedLoopEditPairIds.push_back(panelState->availableFileLoopEditPairIds[index]);
         sortedDirtyFlags.push_back(panelState->availableFileDirtyFlags[index]);
     }
     panelState->availableFiles = std::move(sortedFiles);
     panelState->availableFileAssociatedLayerPaths = std::move(sortedAssociations);
     panelState->availableFileLoadedPaths = std::move(sortedLoadedPaths);
+    panelState->availableFileEditedPaths = std::move(sortedEditedPaths);
+    panelState->availableFileLoopEditPairIds = std::move(sortedLoopEditPairIds);
     panelState->availableFileDirtyFlags = std::move(sortedDirtyFlags);
 }
 
@@ -24133,6 +24318,8 @@ bool AddAnimationFileToRegistry(
     panelState->availableFiles.push_back(filePath.lexically_normal());
     panelState->availableFileAssociatedLayerPaths.push_back(std::move(associatedLayerPaths));
     panelState->availableFileLoadedPaths.push_back(std::move(loadedPath));
+    panelState->availableFileEditedPaths.push_back(std::nullopt);
+    panelState->availableFileLoopEditPairIds.emplace_back();
     panelState->availableFileDirtyFlags.push_back(false);
     SortAnimationRegistry(panelState);
     return true;
@@ -24206,6 +24393,14 @@ void RemoveAnimationFileFromRegistry(AnimationPanelState* panelState, std::size_
         panelState->availableFileLoadedPaths.erase(
             panelState->availableFileLoadedPaths.begin() + static_cast<std::ptrdiff_t>(fileIndex));
     }
+    if (fileIndex < panelState->availableFileEditedPaths.size()) {
+        panelState->availableFileEditedPaths.erase(
+            panelState->availableFileEditedPaths.begin() + static_cast<std::ptrdiff_t>(fileIndex));
+    }
+    if (fileIndex < panelState->availableFileLoopEditPairIds.size()) {
+        panelState->availableFileLoopEditPairIds.erase(
+            panelState->availableFileLoopEditPairIds.begin() + static_cast<std::ptrdiff_t>(fileIndex));
+    }
     if (fileIndex < panelState->availableFileDirtyFlags.size()) {
         panelState->availableFileDirtyFlags.erase(
             panelState->availableFileDirtyFlags.begin() + static_cast<std::ptrdiff_t>(fileIndex));
@@ -24221,8 +24416,10 @@ void RemoveAnimationFileFromRegistry(AnimationPanelState* panelState, std::size_
     if (panelState->selectedFileIndex.has_value()) {
         if (panelState->availableFiles.empty()) {
             panelState->selectedFileIndex.reset();
+            panelState->selectedFileUsesEdited = false;
         } else if (panelState->selectedFileIndex.value() >= panelState->availableFiles.size()) {
             panelState->selectedFileIndex = panelState->availableFiles.size() - 1U;
+            panelState->selectedFileUsesEdited = false;
         }
     }
 }
@@ -24279,6 +24476,10 @@ void RefreshAnimationFileList(AnimationPanelState* panelState, const std::filesy
     if (!panelState->animationRegistryInitialized) {
         panelState->availableFiles.clear();
         panelState->availableFileAssociatedLayerPaths.clear();
+        panelState->availableFileLoadedPaths.clear();
+        panelState->availableFileEditedPaths.clear();
+        panelState->availableFileLoopEditPairIds.clear();
+        panelState->availableFileDirtyFlags.clear();
         ImportAnimationFilesFromDirectory(panelState, animationDirectory);
         panelState->animationRegistryInitialized = true;
     }
@@ -24301,6 +24502,7 @@ void RefreshAnimationFileList(AnimationPanelState* panelState, const std::filesy
         panelState->selectedFileIndex = panelState->availableFiles.empty()
                                             ? std::nullopt
                                             : std::optional<std::size_t>{panelState->availableFiles.size() - 1U};
+        panelState->selectedFileUsesEdited = false;
     }
     if (panelState->renamingFileIndex.has_value() &&
         panelState->renamingFileIndex.value() >= panelState->availableFiles.size()) {
@@ -24384,19 +24586,69 @@ bool IsCurrentAnimationRegistryIndex(const AnimationPanelState& panel, std::size
            PathsLexicallyEqual(panel.availableFiles[fileIndex], std::filesystem::path{panel.currentFilePath});
 }
 
+bool RegistryAnimationHasEditedVersion(
+    const AnimationPanelState& panel,
+    std::size_t fileIndex) {
+    return fileIndex < panel.availableFileEditedPaths.size() &&
+           panel.availableFileEditedPaths[fileIndex].has_value();
+}
+
+const AnimationPath* SavedRegistryAnimationPath(
+    const PreviewRuntimeState& runtimeState,
+    std::size_t fileIndex) {
+    if (fileIndex >= runtimeState.animationPanel.availableFiles.size()) {
+        return nullptr;
+    }
+    const auto& panel = runtimeState.animationPanel;
+    if (fileIndex < panel.availableFileLoadedPaths.size() &&
+        panel.availableFileLoadedPaths[fileIndex].has_value()) {
+        return &panel.availableFileLoadedPaths[fileIndex].value();
+    }
+    if (IsCurrentAnimationRegistryIndex(panel, fileIndex) &&
+        panel.currentPath.has_value() &&
+        !panel.currentPathUsesEdited) {
+        return &panel.currentPath.value();
+    }
+    return nullptr;
+}
+
 AnimationPath* MutableRegistryAnimationPath(PreviewRuntimeState* runtimeState, std::size_t fileIndex) {
     if (runtimeState == nullptr || fileIndex >= runtimeState->animationPanel.availableFiles.size()) {
         return nullptr;
     }
     auto& panel = runtimeState->animationPanel;
-    if (IsCurrentAnimationRegistryIndex(panel, fileIndex) && panel.currentPath.has_value()) {
+    EnsureAnimationAssociationStorage(&panel);
+    const bool isCurrent = IsCurrentAnimationRegistryIndex(panel, fileIndex);
+    if (isCurrent && panel.currentPathUsesEdited && panel.currentPath.has_value()) {
+        panel.dirty = true;
+        panel.availableFileDirtyFlags[fileIndex] = true;
         return &panel.currentPath.value();
     }
-    if (fileIndex >= panel.availableFileLoadedPaths.size() ||
-        !panel.availableFileLoadedPaths[fileIndex].has_value()) {
-        return nullptr;
+
+    auto& editedPath = panel.availableFileEditedPaths[fileIndex];
+    bool createdFromCurrent = false;
+    if (!editedPath.has_value()) {
+        if (isCurrent && panel.currentPath.has_value()) {
+            editedPath = panel.currentPath.value();
+            createdFromCurrent = true;
+        } else if (panel.availableFileLoadedPaths[fileIndex].has_value()) {
+            editedPath = panel.availableFileLoadedPaths[fileIndex].value();
+        } else {
+            return nullptr;
+        }
     }
-    return &panel.availableFileLoadedPaths[fileIndex].value();
+
+    panel.availableFileDirtyFlags[fileIndex] = true;
+    if (isCurrent) {
+        if (!createdFromCurrent) {
+            panel.currentPath = editedPath.value();
+        }
+        panel.currentPathUsesEdited = true;
+        panel.selectedFileUsesEdited = true;
+        panel.dirty = true;
+        return &panel.currentPath.value();
+    }
+    return &editedPath.value();
 }
 
 const AnimationPath* RegistryAnimationPath(const PreviewRuntimeState& runtimeState, std::size_t fileIndex) {
@@ -24404,14 +24656,34 @@ const AnimationPath* RegistryAnimationPath(const PreviewRuntimeState& runtimeSta
         return nullptr;
     }
     const auto& panel = runtimeState.animationPanel;
-    if (IsCurrentAnimationRegistryIndex(panel, fileIndex) && panel.currentPath.has_value()) {
+    const bool isCurrent = IsCurrentAnimationRegistryIndex(panel, fileIndex);
+    if (isCurrent && panel.currentPath.has_value() &&
+        (panel.currentPathUsesEdited || panel.dirty)) {
         return &panel.currentPath.value();
     }
-    if (fileIndex >= panel.availableFileLoadedPaths.size() ||
-        !panel.availableFileLoadedPaths[fileIndex].has_value()) {
-        return nullptr;
+    if (RegistryAnimationHasEditedVersion(panel, fileIndex)) {
+        return &panel.availableFileEditedPaths[fileIndex].value();
     }
-    return &panel.availableFileLoadedPaths[fileIndex].value();
+    if (isCurrent && panel.currentPath.has_value()) {
+        return &panel.currentPath.value();
+    }
+    return SavedRegistryAnimationPath(runtimeState, fileIndex);
+}
+
+std::string AnimationRegistryDisplayLabel(
+    const PreviewRuntimeState& runtimeState,
+    std::size_t fileIndex) {
+    if (fileIndex >= runtimeState.animationPanel.availableFiles.size()) {
+        return "Missing animation";
+    }
+    auto label = AnimationDisplayNameFromPath(
+        runtimeState.animationPanel.availableFiles[fileIndex]);
+    if (RegistryAnimationHasEditedVersion(
+            runtimeState.animationPanel,
+            fileIndex)) {
+        label += "_Edited";
+    }
+    return label;
 }
 
 void MarkRegistryAnimationDirty(PreviewRuntimeState* runtimeState, std::size_t fileIndex) {
@@ -24419,13 +24691,17 @@ void MarkRegistryAnimationDirty(PreviewRuntimeState* runtimeState, std::size_t f
         return;
     }
     auto& panel = runtimeState->animationPanel;
+    EnsureAnimationAssociationStorage(&panel);
     if (IsCurrentAnimationRegistryIndex(panel, fileIndex)) {
+        if (panel.currentPath.has_value()) {
+            panel.availableFileEditedPaths[fileIndex] =
+                panel.currentPath.value();
+            panel.currentPathUsesEdited = true;
+            panel.selectedFileUsesEdited = true;
+        }
         panel.dirty = true;
     }
-    EnsureAnimationAssociationStorage(&panel);
-    if (fileIndex < panel.availableFileDirtyFlags.size()) {
-        panel.availableFileDirtyFlags[fileIndex] = true;
-    }
+    panel.availableFileDirtyFlags[fileIndex] = true;
 }
 
 void SyncCurrentAnimationToRegistry(PreviewRuntimeState* runtimeState) {
@@ -24440,9 +24716,15 @@ void SyncCurrentAnimationToRegistry(PreviewRuntimeState* runtimeState) {
         return;
     }
     EnsureAnimationAssociationStorage(&panel);
-    panel.availableFileLoadedPaths[registryIndex.value()] = panel.currentPath.value();
-    panel.availableFileAssociatedLayerPaths[registryIndex.value()] = panel.currentPath->associatedLayerPaths;
-    panel.availableFileDirtyFlags[registryIndex.value()] = panel.dirty;
+    if (!panel.currentPathUsesEdited && !panel.dirty) {
+        return;
+    }
+    panel.availableFileEditedPaths[registryIndex.value()] =
+        panel.currentPath.value();
+    panel.availableFileDirtyFlags[registryIndex.value()] = true;
+    panel.currentPathUsesEdited = true;
+    panel.selectedFileUsesEdited = true;
+    panel.dirty = true;
 }
 
 std::array<float, 3> FocusPointFromCameraState(const invisible_places::camera::CameraState& state) {
@@ -24565,6 +24847,16 @@ void PropagateCameraShotToLinkedAnimationKeys(
     }
 
     for (std::size_t fileIndex = 0; fileIndex < runtimeState->animationPanel.availableFiles.size(); ++fileIndex) {
+        const auto* viewedPath = RegistryAnimationPath(*runtimeState, fileIndex);
+        if (viewedPath == nullptr ||
+            std::none_of(
+                viewedPath->keys.begin(),
+                viewedPath->keys.end(),
+                [&](const auto& key) {
+                    return key.linkedCameraId == shot.id;
+                })) {
+            continue;
+        }
         auto* path = MutableRegistryAnimationPath(runtimeState, fileIndex);
         if (path == nullptr) {
             continue;
@@ -24642,6 +24934,16 @@ void UnlinkCameraFromAnimations(PreviewRuntimeState* runtimeState, const std::st
     }
 
     for (std::size_t fileIndex = 0; fileIndex < runtimeState->animationPanel.availableFiles.size(); ++fileIndex) {
+        const auto* viewedPath = RegistryAnimationPath(*runtimeState, fileIndex);
+        if (viewedPath == nullptr ||
+            std::none_of(
+                viewedPath->keys.begin(),
+                viewedPath->keys.end(),
+                [&](const auto& key) {
+                    return key.linkedCameraId == cameraId;
+                })) {
+            continue;
+        }
         auto* path = MutableRegistryAnimationPath(runtimeState, fileIndex);
         if (path == nullptr) {
             continue;
@@ -24687,6 +24989,23 @@ bool MoveLinkedAnimationKeyPoint(
         return false;
     }
 
+    auto& panel = runtimeState->animationPanel;
+    if (panel.currentPath.has_value() &&
+        path == &panel.currentPath.value() &&
+        !panel.currentFilePath.empty()) {
+        const auto registryIndex = FindAnimationRegistryIndex(
+            panel,
+            std::filesystem::path{panel.currentFilePath});
+        if (registryIndex.has_value()) {
+            path = MutableRegistryAnimationPath(
+                runtimeState,
+                registryIndex.value());
+            if (path == nullptr || keyIndex >= path->keys.size()) {
+                return false;
+            }
+        }
+    }
+
     auto& key = path->keys[keyIndex];
     if (!key.linkedCameraId.empty() &&
         !CanEditLinkedCamera(runtimeState, key.linkedCameraId, "Linked key edit blocked.")) {
@@ -24712,20 +25031,6 @@ bool MoveLinkedAnimationKeyPoint(
     shot.name = key.linkedCameraName.empty() ? shot.name : key.linkedCameraName;
     PropagateCameraShotToLinkedAnimationKeys(runtimeState, shot);
     return true;
-}
-
-void SyncAnimationSnapshotsFromLinkedCameras(PreviewRuntimeState* runtimeState, AnimationPath* path) {
-    if (runtimeState == nullptr || path == nullptr) {
-        return;
-    }
-
-    for (auto& key : path->keys) {
-        const auto shotIndex = FindCameraShotIndexById(*runtimeState, key.linkedCameraId);
-        if (!shotIndex.has_value() || shotIndex.value() >= runtimeState->cameraShots.size()) {
-            continue;
-        }
-        CopyCameraShotToAnimationKeySnapshot(runtimeState->cameraShots[shotIndex.value()], &key);
-    }
 }
 
 bool UntangleCameraAnimationLinks(PreviewRuntimeState* runtimeState, std::size_t shotIndex) {
@@ -24856,6 +25161,8 @@ bool SaveAnimationPathToFile(
     const bool savingCurrentPath =
         runtimeState->animationPanel.currentPath.has_value() &&
         &path == &runtimeState->animationPanel.currentPath.value();
+    const std::filesystem::path previousCurrentPath{
+        runtimeState->animationPanel.currentFilePath};
     auto pathToSave = path;
     const bool savingDuringRenderSetupOverride =
         runtimeState->activeRenderSetupOverride.has_value();
@@ -24915,11 +25222,30 @@ bool SaveAnimationPathToFile(
     }
     runtimeState->animationPanel.currentFilePath = outputPath.string();
     runtimeState->animationPanel.draftAnimationName = pathToSave.name;
+    runtimeState->animationPanel.currentPathUsesEdited = false;
+    runtimeState->animationPanel.selectedFileUsesEdited = false;
     runtimeState->animationPanel.dirty = false;
+    if (savingCurrentPath &&
+        !previousCurrentPath.empty() &&
+        !PathsLexicallyEqual(previousCurrentPath, outputPath)) {
+        if (const auto previousIndex = FindAnimationRegistryIndex(
+                runtimeState->animationPanel,
+                previousCurrentPath);
+            previousIndex.has_value()) {
+            runtimeState->animationPanel.availableFileEditedPaths[
+                previousIndex.value()].reset();
+            runtimeState->animationPanel.availableFileLoopEditPairIds[
+                previousIndex.value()].clear();
+            runtimeState->animationPanel.availableFileDirtyFlags[
+                previousIndex.value()] = false;
+        }
+    }
     if (const auto registryIndex = FindAnimationRegistryIndex(runtimeState->animationPanel, outputPath);
         registryIndex.has_value()) {
         EnsureAnimationAssociationStorage(&runtimeState->animationPanel);
         runtimeState->animationPanel.availableFileLoadedPaths[registryIndex.value()] = pathToSave;
+        runtimeState->animationPanel.availableFileEditedPaths[registryIndex.value()].reset();
+        runtimeState->animationPanel.availableFileLoopEditPairIds[registryIndex.value()].clear();
         runtimeState->animationPanel.availableFileDirtyFlags[registryIndex.value()] = false;
     }
     RefreshAnimationFileList(&runtimeState->animationPanel, AnimationDirectory(*runtimeState));
@@ -25047,28 +25373,57 @@ bool ImportLatestHoudiniCameraAnimation(PreviewRuntimeState* runtimeState) {
     return true;
 }
 
-bool LoadAnimationPathFromFile(PreviewRuntimeState* runtimeState, const std::filesystem::path& inputPath) {
+bool LoadAnimationPathVariant(
+    PreviewRuntimeState* runtimeState,
+    const std::filesystem::path& inputPath,
+    bool useEditedVersion) {
     if (runtimeState == nullptr) {
         return false;
     }
 
-    std::string errorMessage;
-    const auto path = invisible_places::serialization::LoadAnimationPath(inputPath, &errorMessage);
-    if (!path.has_value()) {
-        runtimeState->errorMessage = errorMessage.empty() ? "Failed to load animation path." : errorMessage;
+    SyncCurrentAnimationToRegistry(runtimeState);
+    auto& panel = runtimeState->animationPanel;
+    auto registryIndex = FindAnimationRegistryIndex(panel, inputPath);
+    if (!registryIndex.has_value()) {
+        AddAnimationFileToRegistry(
+            &panel,
+            inputPath,
+            LoadAnimationFileAssociations(inputPath));
+        registryIndex = FindAnimationRegistryIndex(panel, inputPath);
+    }
+    if (!registryIndex.has_value()) {
+        runtimeState->errorMessage = "Failed to register animation path.";
         runtimeState->statusMessage.clear();
         return false;
     }
 
-    auto loadedPath = path.value();
-    if (const auto registryIndex = FindAnimationRegistryIndex(runtimeState->animationPanel, inputPath);
-        registryIndex.has_value()) {
-        loadedPath.associatedLayerPaths =
-            AnimationRegistryAssociationPaths(runtimeState->animationPanel, registryIndex.value());
+    EnsureAnimationAssociationStorage(&panel);
+    const auto index = registryIndex.value();
+    if (!panel.availableFileLoadedPaths[index].has_value()) {
+        std::string errorMessage;
+        auto savedPath = invisible_places::serialization::LoadAnimationPath(
+            inputPath,
+            &errorMessage);
+        if (!savedPath.has_value()) {
+            runtimeState->errorMessage = errorMessage.empty()
+                                             ? "Failed to load animation path."
+                                             : errorMessage;
+            runtimeState->statusMessage.clear();
+            return false;
+        }
+        CanonicalizeAssociatedLayerPathsForSceneGroups(
+            *runtimeState,
+            &savedPath->associatedLayerPaths);
+        panel.availableFileLoadedPaths[index] = std::move(savedPath.value());
     }
-    CanonicalizeAssociatedLayerPathsForSceneGroups(*runtimeState, &loadedPath.associatedLayerPaths);
-    SyncAnimationSnapshotsFromLinkedCameras(runtimeState, &loadedPath);
-    loadedPath.name = AnimationNameFromFilePath(inputPath);
+
+    const bool editedVersionAvailable =
+        RegistryAnimationHasEditedVersion(panel, index);
+    const bool loadingEdited =
+        useEditedVersion && editedVersionAvailable;
+    auto loadedPath = loadingEdited
+                          ? panel.availableFileEditedPaths[index].value()
+                          : panel.availableFileLoadedPaths[index].value();
     const auto requestedTakeId =
         invisible_places::timing::NormalizeTimingTakeId(
             loadedPath.selectedTimingTakeId);
@@ -25076,56 +25431,156 @@ bool LoadAnimationPathFromFile(PreviewRuntimeState* runtimeState, const std::fil
         invisible_places::timing::FindTimingTakeDefinition(
             runtimeState->water.timingTakes,
             requestedTakeId) == nullptr;
-    loadedPath.selectedTimingTakeId =
-        repairedMissingTimingTake
-            ? std::string{
-                  invisible_places::timing::
-                      kAuthoredTimingTakeId}
-            : requestedTakeId;
-
-    runtimeState->animationPanel.currentPath = std::move(loadedPath);
-    if (runtimeState->animationPanel.currentPath->tempWaterPointVisualStyle.has_value()) {
-        ImportLegacyWaterPointVisualStyle(
-            runtimeState,
-            runtimeState->animationPanel.currentPath->tempWaterPointVisualStyle.value());
-    } else if (runtimeState->animationPanel.currentPath->waterPointVisualStyle.has_value()) {
-        ImportLegacyWaterPointVisualStyle(
-            runtimeState,
-            runtimeState->animationPanel.currentPath->waterPointVisualStyle.value());
+    if (repairedMissingTimingTake) {
+        loadedPath.selectedTimingTakeId = std::string{
+            invisible_places::timing::kAuthoredTimingTakeId};
+        if (!loadingEdited) {
+            panel.availableFileEditedPaths[index] = loadedPath;
+        }
+    } else {
+        loadedPath.selectedTimingTakeId = requestedTakeId;
     }
-    runtimeState->animationPanel.currentFilePath = inputPath.string();
-    runtimeState->animationPanel.draftAnimationName = runtimeState->animationPanel.currentPath->name;
+
+    const bool currentUsesEdited = loadingEdited || repairedMissingTimingTake;
+    panel.currentPath = std::move(loadedPath);
+    panel.currentPathUsesEdited = currentUsesEdited;
+    panel.selectedFileUsesEdited = currentUsesEdited;
+    panel.selectedFileIndex = index;
+    if (currentUsesEdited) {
+        panel.availableFileEditedPaths[index] = panel.currentPath.value();
+    }
+    panel.availableFileDirtyFlags[index] =
+        RegistryAnimationHasEditedVersion(panel, index);
+    if (panel.currentPath->tempWaterPointVisualStyle.has_value()) {
+        ImportLegacyWaterPointVisualStyle(
+            runtimeState,
+            panel.currentPath->tempWaterPointVisualStyle.value());
+    } else if (panel.currentPath->waterPointVisualStyle.has_value()) {
+        ImportLegacyWaterPointVisualStyle(
+            runtimeState,
+            panel.currentPath->waterPointVisualStyle.value());
+    }
+    panel.currentFilePath = inputPath.string();
+    panel.draftAnimationName = panel.currentPath->name;
     ApplyActiveExportPresetToRenderSettings(runtimeState);
-    runtimeState->animationPanel.selectedKeyIndex =
-        runtimeState->animationPanel.currentPath->keys.empty() ? std::nullopt : std::optional<std::size_t>{0};
-    runtimeState->animationPanel.scrubAmount = 0.0F;
-    runtimeState->animationPanel.timelineViewRange = {};
-    runtimeState->animationPanel.timelineViewDrag.reset();
-    runtimeState->animationPanel.previewDepthOfField = false;
+    panel.selectedKeyIndex =
+        panel.currentPath->keys.empty()
+            ? std::nullopt
+            : std::optional<std::size_t>{0};
+    panel.scrubAmount = 0.0F;
+    panel.timelineViewRange = {};
+    panel.timelineViewDrag.reset();
+    panel.previewDepthOfField = false;
     runtimeState->timingsPanel = TimingsPanelState{};
-    runtimeState->animationPanel.dirty =
-        repairedMissingTimingTake;
+    panel.dirty = currentUsesEdited;
     SyncWaterAnimationTrailProfileFromCurrentAnimation(runtimeState);
     ApplyWaterPointVisualStyleToGeneratedSessions(runtimeState);
     MarkWaterPathDirty(runtimeState);
-    if (const auto registryIndex = FindAnimationRegistryIndex(runtimeState->animationPanel, inputPath);
-        registryIndex.has_value()) {
-        EnsureAnimationAssociationStorage(&runtimeState->animationPanel);
-        runtimeState->animationPanel.availableFileLoadedPaths[registryIndex.value()] =
-            runtimeState->animationPanel.currentPath.value();
-        runtimeState->animationPanel.availableFileDirtyFlags[
-            registryIndex.value()] =
-            repairedMissingTimingTake;
-    }
     runtimeState->animationPlayback.active = false;
     runtimeState->cameraPlayback.active = false;
-    ApplyAnimationEvaluation(runtimeState, runtimeState->animationPanel.currentPath.value(), 0.0F, false);
+    ApplyAnimationEvaluation(runtimeState, panel.currentPath.value(), 0.0F, false);
     runtimeState->statusMessage =
-        "Loaded animation path: " +
-        inputPath.filename().string() +
+        "Loaded " +
+        std::string{currentUsesEdited ? "edited" : "saved"} +
+        " animation: " + inputPath.filename().string() +
         (repairedMissingTimingTake
              ? ". Its missing Timing Take was replaced with Authored Timing."
              : ".");
+    runtimeState->errorMessage.clear();
+    return true;
+}
+
+bool LoadAnimationPathFromFile(
+    PreviewRuntimeState* runtimeState,
+    const std::filesystem::path& inputPath) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+    SyncCurrentAnimationToRegistry(runtimeState);
+    const auto registryIndex = FindAnimationRegistryIndex(
+        runtimeState->animationPanel,
+        inputPath);
+    const bool preferEdited =
+        registryIndex.has_value() &&
+        RegistryAnimationHasEditedVersion(
+            runtimeState->animationPanel,
+            registryIndex.value());
+    return LoadAnimationPathVariant(
+        runtimeState,
+        inputPath,
+        preferEdited);
+}
+
+bool DiscardAnimationEdits(
+    PreviewRuntimeState* runtimeState,
+    std::size_t fileIndex) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+    auto& panel = runtimeState->animationPanel;
+    EnsureAnimationAssociationStorage(&panel);
+    SyncCurrentAnimationToRegistry(runtimeState);
+    if (fileIndex >= panel.availableFiles.size() ||
+        !RegistryAnimationHasEditedVersion(panel, fileIndex)) {
+        runtimeState->statusMessage = "This animation has no edits to discard.";
+        runtimeState->errorMessage.clear();
+        return false;
+    }
+
+    std::vector<std::size_t> discardIndices{fileIndex};
+    const auto pairId = panel.availableFileLoopEditPairIds[fileIndex];
+    if (!pairId.empty()) {
+        for (std::size_t index = 0U; index < panel.availableFiles.size(); ++index) {
+            if (index == fileIndex ||
+                !RegistryAnimationHasEditedVersion(panel, index)) {
+                continue;
+            }
+            if (panel.availableFileLoopEditPairIds[index] == pairId) {
+                discardIndices.push_back(index);
+            }
+        }
+    }
+
+    bool reloadCurrentSavedVersion = false;
+    for (const auto index : discardIndices) {
+        reloadCurrentSavedVersion |=
+            IsCurrentAnimationRegistryIndex(panel, index);
+        panel.availableFileEditedPaths[index].reset();
+        panel.availableFileLoopEditPairIds[index].clear();
+        panel.availableFileDirtyFlags[index] = false;
+    }
+
+    if (reloadCurrentSavedVersion) {
+        const auto currentIndex = FindAnimationRegistryIndex(
+            panel,
+            std::filesystem::path{panel.currentFilePath});
+        panel.currentPathUsesEdited = false;
+        panel.selectedFileUsesEdited = false;
+        panel.dirty = false;
+        if (currentIndex.has_value() &&
+            panel.availableFileLoadedPaths[currentIndex.value()].has_value()) {
+            panel.currentPath =
+                panel.availableFileLoadedPaths[currentIndex.value()].value();
+            panel.draftAnimationName = panel.currentPath->name;
+            panel.preparedPathCache = {};
+            panel.motionStatsCache = {};
+            panel.perceivedFlowCache = {};
+            runtimeState->animationPlayback.active = false;
+            SyncWaterAnimationTrailProfileFromCurrentAnimation(runtimeState);
+            ApplyAnimationScrub(runtimeState);
+        }
+    } else if (panel.selectedFileIndex.has_value() &&
+               std::find(
+                   discardIndices.begin(),
+                   discardIndices.end(),
+                   panel.selectedFileIndex.value()) != discardIndices.end()) {
+        panel.selectedFileUsesEdited = false;
+    }
+
+    runtimeState->statusMessage =
+        discardIndices.size() == 1U
+            ? "Discarded the edited animation and restored its saved version."
+            : "Discarded both edited loop animations and restored their saved versions.";
     runtimeState->errorMessage.clear();
     return true;
 }
@@ -25161,6 +25616,7 @@ void BeginAnimationFileRename(AnimationPanelState* panel, std::size_t fileIndex)
     }
 
     panel->selectedFileIndex = fileIndex;
+    panel->selectedFileUsesEdited = false;
     panel->renamingFileIndex = fileIndex;
     panel->fileRenameBuffer = AnimationDisplayNameFromPath(panel->availableFiles[fileIndex]);
     panel->focusFileRename = true;
@@ -25238,8 +25694,28 @@ bool CommitAnimationFileRename(PreviewRuntimeState* runtimeState, std::size_t fi
         }
     }
 
+    if (savedInternalName) {
+        std::string reloadError;
+        auto savedPath = invisible_places::serialization::LoadAnimationPath(
+            newPath,
+            &reloadError);
+        if (savedPath.has_value()) {
+            EnsureAnimationAssociationStorage(&panel);
+            panel.availableFileLoadedPaths[fileIndex] =
+                std::move(savedPath.value());
+            panel.availableFileEditedPaths[fileIndex].reset();
+            panel.availableFileLoopEditPairIds[fileIndex].clear();
+            panel.availableFileDirtyFlags[fileIndex] = false;
+        }
+        if (renamedCurrent) {
+            panel.currentPathUsesEdited = false;
+            panel.selectedFileUsesEdited = false;
+        }
+    }
+
     RefreshAnimationFileList(&panel, AnimationDirectory(*runtimeState));
     panel.selectedFileIndex = FindAnimationFileIndex(panel.availableFiles, newPath);
+    panel.selectedFileUsesEdited = false;
     runtimeState->statusMessage = "Renamed animation to " + newPath.filename().string() + ".";
     runtimeState->errorMessage =
         savedInternalName
@@ -38617,6 +39093,21 @@ void DrawAnimationViewportOverlay(
     }
 
     auto& panel = runtimeState->animationPanel;
+    const auto currentIndex =
+        panel.currentFilePath.empty()
+            ? std::nullopt
+            : FindAnimationRegistryIndex(
+                  panel,
+                  std::filesystem::path{panel.currentFilePath});
+    const bool readOnlySavedComparison =
+        currentIndex.has_value() &&
+        !panel.currentPathUsesEdited &&
+        RegistryAnimationHasEditedVersion(
+            panel,
+            currentIndex.value());
+    if (readOnlySavedComparison) {
+        panel.drag.active = false;
+    }
     auto& path = panel.currentPath.value();
     if (path.keys.empty()) {
         return;
@@ -38656,7 +39147,10 @@ void DrawAnimationViewportOverlay(
     }
 
     const bool canInteractWithRenderViewport =
-        panel.drag.active || (!viewport.UiWantsMouseCapture() && IsMouseOverRenderViewport(viewport));
+        !readOnlySavedComparison &&
+        (panel.drag.active ||
+         (!viewport.UiWantsMouseCapture() &&
+          IsMouseOverRenderViewport(viewport)));
 
     constexpr float kPickRadius = 10.0F;
     float bestDistance = kPickRadius;
@@ -40447,6 +40941,313 @@ void DrawCameraSection(
     EndPanelSection();
 }
 
+void CleanupStagedDocumentFiles(
+    std::span<const invisible_places::serialization::StagedDocumentReplacement>
+        documents) {
+    for (const auto& document : documents) {
+        std::error_code ignored;
+        std::filesystem::remove(document.stagedPath, ignored);
+        std::filesystem::remove(
+            document.stagedPath.string() + ".tmp",
+            ignored);
+    }
+}
+
+bool ValidateLoopSmoothingEndpointLinks(
+    const PreviewRuntimeState& runtimeState,
+    std::size_t currentFileIndex,
+    std::size_t partnerFileIndex,
+    std::string* errorMessage) {
+    const std::array<std::size_t, 2> pairIndices{
+        currentFileIndex,
+        partnerFileIndex,
+    };
+    std::unordered_set<std::string> movableCameraIds;
+    for (const auto fileIndex : pairIndices) {
+        const auto* path = RegistryAnimationPath(runtimeState, fileIndex);
+        if (path == nullptr || path->keys.size() < 3U) {
+            if (errorMessage != nullptr) {
+                *errorMessage = "Both loop animations must be loaded and contain at least three keys.";
+            }
+            return false;
+        }
+        for (const std::size_t keyIndex : {
+                 std::size_t{0U},
+                 path->keys.size() - 1U}) {
+            const auto& cameraId = path->keys[keyIndex].linkedCameraId;
+            if (cameraId.empty()) {
+                continue;
+            }
+            if (!FindCameraShotIndexById(runtimeState, cameraId).has_value()) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = "Endpoint camera " + cameraId +
+                                    " is no longer present in the project.";
+                }
+                return false;
+            }
+            movableCameraIds.insert(cameraId);
+        }
+    }
+
+    for (std::size_t fileIndex = 0U;
+         fileIndex < runtimeState.animationPanel.availableFiles.size();
+         ++fileIndex) {
+        std::optional<AnimationPath> diskPath;
+        const auto* path = RegistryAnimationPath(runtimeState, fileIndex);
+        if (path == nullptr) {
+            std::string loadError;
+            diskPath = invisible_places::serialization::LoadAnimationPath(
+                runtimeState.animationPanel.availableFiles[fileIndex],
+                &loadError);
+            if (!diskPath.has_value()) {
+                if (errorMessage != nullptr) {
+                    *errorMessage =
+                        "Could not validate linked cameras in " +
+                        runtimeState.animationPanel.availableFiles[fileIndex].filename().string() +
+                        ": " + loadError;
+                }
+                return false;
+            }
+            path = &diskPath.value();
+        }
+        for (std::size_t keyIndex = 0U; keyIndex < path->keys.size(); ++keyIndex) {
+            const auto& cameraId = path->keys[keyIndex].linkedCameraId;
+            if (!movableCameraIds.contains(cameraId)) {
+                continue;
+            }
+            const bool pairFile =
+                fileIndex == currentFileIndex || fileIndex == partnerFileIndex;
+            const bool movableEndpoint =
+                keyIndex == 0U || keyIndex + 1U == path->keys.size();
+            if (!pairFile || !movableEndpoint) {
+                if (errorMessage != nullptr) {
+                    *errorMessage =
+                        "Endpoint camera " + cameraId +
+                        " is also linked to a fixed key or another animation. Untangle that camera before smoothing.";
+                }
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void ApplyLoopEndpointsToCameraShots(
+    const AnimationPath& first,
+    const AnimationPath& second,
+    std::vector<CameraShot>* cameraShots) {
+    if (cameraShots == nullptr) {
+        return;
+    }
+    for (const auto* path : {&first, &second}) {
+        for (const auto* key : {&path->keys.front(), &path->keys.back()}) {
+            if (key->linkedCameraId.empty()) {
+                continue;
+            }
+            const auto shotIt = std::find_if(
+                cameraShots->begin(),
+                cameraShots->end(),
+                [&](const CameraShot& shot) {
+                    return shot.id == key->linkedCameraId;
+                });
+            if (shotIt != cameraShots->end()) {
+                CopyAnimationKeyToCameraShot(*key, &*shotIt);
+            }
+        }
+    }
+}
+
+bool ApplyAnimationLoopSmoothing(
+    PreviewRuntimeState* runtimeState,
+    std::size_t partnerFileIndex,
+    float maxEndMoveFraction) {
+    if (runtimeState == nullptr ||
+        runtimeState->activeRenderSetupOverride.has_value()) {
+        return false;
+    }
+    SyncCurrentAnimationToRegistry(runtimeState);
+    auto& panel = runtimeState->animationPanel;
+    if (panel.currentFilePath.empty() || !panel.currentPath.has_value()) {
+        runtimeState->errorMessage = "Save the current animation before smoothing its loop.";
+        return false;
+    }
+    const auto currentFileIndex = FindAnimationRegistryIndex(
+        panel,
+        std::filesystem::path{panel.currentFilePath});
+    if (!currentFileIndex.has_value() ||
+        partnerFileIndex >= panel.availableFiles.size() ||
+        partnerFileIndex == currentFileIndex.value()) {
+        runtimeState->errorMessage = "Choose another registered animation for the loop.";
+        return false;
+    }
+    std::string validationError;
+    if (!ValidateLoopSmoothingEndpointLinks(
+            *runtimeState,
+            currentFileIndex.value(),
+            partnerFileIndex,
+            &validationError)) {
+        runtimeState->errorMessage = std::move(validationError);
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    const auto* partner = RegistryAnimationPath(*runtimeState, partnerFileIndex);
+    if (partner == nullptr) {
+        runtimeState->errorMessage = "The selected loop animation is not loaded.";
+        return false;
+    }
+    const auto* current = RegistryAnimationPath(
+        *runtimeState,
+        currentFileIndex.value());
+    if (current == nullptr) {
+        runtimeState->errorMessage = "The current loop animation is not loaded.";
+        return false;
+    }
+    auto candidateCurrent = *current;
+    auto candidatePartner = *partner;
+    const auto pairId =
+        "loop_" + std::to_string(
+                      std::chrono::steady_clock::now().time_since_epoch().count());
+    // A two-animation closed loop has no semantic "first" member. Use one
+    // stable file ordering so activating A or B produces the same optimizer
+    // inputs and sequence metadata.
+    const bool currentIsCanonicalFirst =
+        NormalizePathKey(panel.availableFiles[currentFileIndex.value()]) <
+        NormalizePathKey(panel.availableFiles[partnerFileIndex]);
+    const auto smoothingResult =
+        currentIsCanonicalFirst
+            ? invisible_places::camera::SmoothAnimationLoopTransitions(
+                  &candidateCurrent,
+                  &candidatePartner,
+                  {.maxEndMoveFraction = maxEndMoveFraction,
+                   .pairId = pairId,
+                   .firstFileName = panel.availableFiles[currentFileIndex.value()].filename().string(),
+                   .secondFileName = panel.availableFiles[partnerFileIndex].filename().string()})
+            : invisible_places::camera::SmoothAnimationLoopTransitions(
+                  &candidatePartner,
+                  &candidateCurrent,
+                  {.maxEndMoveFraction = maxEndMoveFraction,
+                   .pairId = pairId,
+                   .firstFileName = panel.availableFiles[partnerFileIndex].filename().string(),
+                   .secondFileName = panel.availableFiles[currentFileIndex.value()].filename().string()});
+    if (!smoothingResult.succeeded || !smoothingResult.changed) {
+        runtimeState->errorMessage = smoothingResult.errorMessage.empty()
+                                         ? "The endpoints are already optimal within the selected movement limit."
+                                         : smoothingResult.errorMessage;
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    panel.availableFileEditedPaths[currentFileIndex.value()] =
+        candidateCurrent;
+    panel.availableFileEditedPaths[partnerFileIndex] =
+        candidatePartner;
+    panel.availableFileLoopEditPairIds[currentFileIndex.value()] = pairId;
+    panel.availableFileLoopEditPairIds[partnerFileIndex] = pairId;
+    panel.availableFileDirtyFlags[currentFileIndex.value()] = true;
+    panel.availableFileDirtyFlags[partnerFileIndex] = true;
+    panel.currentPath = std::move(candidateCurrent);
+    panel.currentPathUsesEdited = true;
+    panel.selectedFileUsesEdited = true;
+    panel.dirty = true;
+    panel.preparedPathCache = {};
+    panel.motionStatsCache = {};
+    panel.perceivedFlowCache = {};
+    runtimeState->animationPlayback.active = false;
+    runtimeState->cameraPlayback.active = false;
+    ApplyAnimationScrub(runtimeState);
+    const float improvement = smoothingResult.beforeMismatch <= 1.0e-8F
+                                  ? 0.0F
+                                  : 100.0F *
+                                        (1.0F - smoothingResult.afterMismatch /
+                                                    smoothingResult.beforeMismatch);
+    runtimeState->statusMessage =
+        "Created _Edited versions with both loop transitions smoothed (" +
+        std::to_string(static_cast<int>(std::lround(improvement))) +
+        "% lower screen-flow mismatch; max camera move " +
+        std::to_string(smoothingResult.maxCameraMove) +
+        ", focus move " + std::to_string(smoothingResult.maxFocusMove) +
+        "). Save Changes to promote both animations and the project together.";
+    runtimeState->errorMessage.clear();
+    return true;
+}
+
+bool UnapplyAnimationLoopSmoothing(
+    PreviewRuntimeState* runtimeState,
+    std::size_t partnerFileIndex) {
+    if (runtimeState == nullptr ||
+        runtimeState->activeRenderSetupOverride.has_value()) {
+        return false;
+    }
+    SyncCurrentAnimationToRegistry(runtimeState);
+    auto& panel = runtimeState->animationPanel;
+    const auto currentFileIndex = FindAnimationRegistryIndex(
+        panel,
+        std::filesystem::path{panel.currentFilePath});
+    if (!currentFileIndex.has_value() ||
+        partnerFileIndex >= panel.availableFiles.size() ||
+        partnerFileIndex == currentFileIndex.value() ||
+        !panel.currentPath.has_value()) {
+        runtimeState->errorMessage = "Choose the paired animation before unapplying end smoothing.";
+        return false;
+    }
+    const auto* current = RegistryAnimationPath(
+        *runtimeState,
+        currentFileIndex.value());
+    const auto* partner = RegistryAnimationPath(*runtimeState, partnerFileIndex);
+    if (current == nullptr || partner == nullptr ||
+        !current->loopTransitionSmoothing.has_value() ||
+        !partner->loopTransitionSmoothing.has_value() ||
+        current->loopTransitionSmoothing->pairId !=
+            partner->loopTransitionSmoothing->pairId) {
+        runtimeState->errorMessage = "The selected animations do not contain the same reversible smoothing pair.";
+        return false;
+    }
+    std::string validationError;
+    if (!ValidateLoopSmoothingEndpointLinks(
+            *runtimeState,
+            currentFileIndex.value(),
+            partnerFileIndex,
+            &validationError)) {
+        runtimeState->errorMessage = std::move(validationError);
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    auto candidateCurrent = *current;
+    auto candidatePartner = *partner;
+    const auto pairId = current->loopTransitionSmoothing->pairId;
+    std::string unapplyError;
+    if (!invisible_places::camera::UnapplyAnimationLoopSmoothing(
+            &candidateCurrent,
+            &unapplyError) ||
+        !invisible_places::camera::UnapplyAnimationLoopSmoothing(
+            &candidatePartner,
+            &unapplyError)) {
+        runtimeState->errorMessage = std::move(unapplyError);
+        return false;
+    }
+    panel.availableFileEditedPaths[currentFileIndex.value()] =
+        candidateCurrent;
+    panel.availableFileEditedPaths[partnerFileIndex] =
+        candidatePartner;
+    panel.availableFileLoopEditPairIds[currentFileIndex.value()] = pairId;
+    panel.availableFileLoopEditPairIds[partnerFileIndex] = pairId;
+    panel.availableFileDirtyFlags[currentFileIndex.value()] = true;
+    panel.availableFileDirtyFlags[partnerFileIndex] = true;
+    panel.currentPath = std::move(candidateCurrent);
+    panel.currentPathUsesEdited = true;
+    panel.selectedFileUsesEdited = true;
+    panel.dirty = true;
+    panel.preparedPathCache = {};
+    panel.motionStatsCache = {};
+    panel.perceivedFlowCache = {};
+    runtimeState->animationPlayback.active = false;
+    ApplyAnimationScrub(runtimeState);
+    runtimeState->statusMessage =
+        "Restored the original endpoint cameras and focus points in both "
+        "_Edited versions. Save Changes to promote them.";
+    runtimeState->errorMessage.clear();
+    return true;
+}
+
 void DrawAnimationSection(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell& viewport) {
@@ -40464,11 +41265,25 @@ void DrawAnimationSection(
     }
     EnsureRuntimeCameraShotIds(runtimeState);
     SyncCurrentAnimationToRegistry(runtimeState);
+    const auto activeRegistryIndex =
+        panel.currentFilePath.empty()
+            ? std::nullopt
+            : FindAnimationRegistryIndex(
+                  panel,
+                  std::filesystem::path{panel.currentFilePath});
+    const bool showingSavedComparison =
+        activeRegistryIndex.has_value() &&
+        !panel.currentPathUsesEdited &&
+        RegistryAnimationHasEditedVersion(
+            panel,
+            activeRegistryIndex.value());
     if (BeginPanelSection("Animation")) {
+    ImGui::BeginDisabled(showingSavedComparison);
     if (InputTextString("Animation Name", &panel.draftAnimationName) && panel.currentPath.has_value()) {
         panel.currentPath->name = panel.draftAnimationName;
         panel.dirty = true;
     }
+    ImGui::EndDisabled();
     if (ImGui::Button("Refresh")) {
         RefreshAnimationFileList(&panel, AnimationDirectory(*runtimeState));
     }
@@ -40504,11 +41319,15 @@ void DrawAnimationSection(
 
     if (panel.availableFiles.empty()) {
         ImGui::TextDisabled("No project animation paths are registered.");
-    } else if (ImGui::BeginListBox("Saved Animations", ImVec2{-FLT_MIN, 128.0F})) {
+    } else if (ImGui::BeginListBox("Animation Versions", ImVec2{-FLT_MIN, 160.0F})) {
         bool animationListChanged = false;
         for (std::size_t index = 0; index < panel.availableFiles.size(); ++index) {
-            const bool selected = panel.selectedFileIndex.has_value() && panel.selectedFileIndex.value() == index;
-            ImGui::PushID(static_cast<int>(index));
+            const bool selectedSaved =
+                panel.selectedFileIndex.has_value() &&
+                panel.selectedFileIndex.value() == index &&
+                !panel.selectedFileUsesEdited;
+            const auto stableId = panel.availableFiles[index].generic_string();
+            ImGui::PushID(stableId.c_str());
             if (panel.renamingFileIndex.has_value() && panel.renamingFileIndex.value() == index) {
                 if (panel.focusFileRename) {
                     ImGui::SetKeyboardFocusHere();
@@ -40531,23 +41350,42 @@ void DrawAnimationSection(
                     panel.focusFileRename = false;
                 }
             } else {
-                const auto modified =
-                    index < panel.availableFileDirtyFlags.size() && panel.availableFileDirtyFlags[index]
-                        ? std::string{" *"}
-                        : std::string{};
                 const auto displayName =
-                    AnimationDisplayNameFromPath(panel.availableFiles[index]) + modified;
-                if (ImGui::Selectable(displayName.c_str(), selected)) {
+                    AnimationDisplayNameFromPath(panel.availableFiles[index]);
+                if (ImGui::Selectable(displayName.c_str(), selectedSaved)) {
                     panel.selectedFileIndex = index;
+                    panel.selectedFileUsesEdited = false;
                 }
                 if (!renderSetupLocksAnimationSwitching &&
+                    !RegistryAnimationHasEditedVersion(panel, index) &&
                     ImGui::IsItemHovered() &&
                     ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                     BeginAnimationFileRename(&panel, index);
                 }
             }
-            if (selected) {
+            if (selectedSaved) {
                 ImGui::SetItemDefaultFocus();
+            }
+
+            if (RegistryAnimationHasEditedVersion(panel, index)) {
+                const bool selectedEdited =
+                    panel.selectedFileIndex.has_value() &&
+                    panel.selectedFileIndex.value() == index &&
+                    panel.selectedFileUsesEdited;
+                const auto editedDisplayName =
+                    AnimationDisplayNameFromPath(panel.availableFiles[index]) +
+                    "_Edited";
+                ImGui::PushID("edited");
+                if (ImGui::Selectable(
+                        editedDisplayName.c_str(),
+                        selectedEdited)) {
+                    panel.selectedFileIndex = index;
+                    panel.selectedFileUsesEdited = true;
+                }
+                if (selectedEdited) {
+                    ImGui::SetItemDefaultFocus();
+                }
+                ImGui::PopID();
             }
             ImGui::PopID();
             if (animationListChanged) {
@@ -40559,25 +41397,52 @@ void DrawAnimationSection(
 
     if (panel.selectedFileIndex.has_value() && panel.selectedFileIndex.value() < panel.availableFiles.size()) {
         ImGui::BeginDisabled(renderSetupLocksAnimationSwitching);
-        if (ImGui::Button("Load")) {
-            LoadAnimationPathFromFile(runtimeState, panel.availableFiles[panel.selectedFileIndex.value()]);
+        const auto selectedAnimationIndex = panel.selectedFileIndex.value();
+        const char* loadLabel = panel.selectedFileUsesEdited
+                                    ? "Load _Edited"
+                                    : "Load Saved";
+        if (ImGui::Button(loadLabel)) {
+            LoadAnimationPathVariant(
+                runtimeState,
+                panel.availableFiles[selectedAnimationIndex],
+                panel.selectedFileUsesEdited);
         }
         ImGui::SameLine();
+        const bool selectedHasEdits =
+            RegistryAnimationHasEditedVersion(
+                panel,
+                selectedAnimationIndex);
+        ImGui::BeginDisabled(!selectedHasEdits);
+        if (ImGui::Button("Discard Edits")) {
+            DiscardAnimationEdits(runtimeState, selectedAnimationIndex);
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(selectedHasEdits);
         if (ImGui::Button("Remove From Project")) {
-            const auto removedPath = panel.availableFiles[panel.selectedFileIndex.value()];
+            const auto removedPath = panel.availableFiles[selectedAnimationIndex];
             if (!panel.currentFilePath.empty() &&
                 PathsLexicallyEqual(std::filesystem::path{panel.currentFilePath}, removedPath)) {
                 panel.currentFilePath.clear();
                 panel.currentPath.reset();
+                panel.currentPathUsesEdited = false;
+                panel.selectedFileUsesEdited = false;
+                panel.dirty = false;
                 panel.selectedKeyIndex.reset();
             }
-            RemoveAnimationFileFromRegistry(&panel, panel.selectedFileIndex.value());
+            RemoveAnimationFileFromRegistry(&panel, selectedAnimationIndex);
             RefreshAnimationFileList(&panel, AnimationDirectory(*runtimeState));
             runtimeState->statusMessage =
                 "Removed animation from project: " + removedPath.filename().string() + ".";
             runtimeState->errorMessage.clear();
         }
         ImGui::EndDisabled();
+        ImGui::EndDisabled();
+        if (selectedHasEdits && ImGui::IsItemHovered(
+                                    ImGuiHoveredFlags_DelayNormal |
+                                    ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("Save or discard the _Edited version before removing this animation.");
+        }
         if (renderSetupLocksAnimationSwitching) {
             ImGui::TextDisabled(
                 "Clear the Render Setup before switching, renaming, or "
@@ -40593,10 +41458,76 @@ void DrawAnimationSection(
     }
 
     auto& animationPath = panel.currentPath.value();
-    animationPath.name = panel.draftAnimationName.empty() ? animationPath.name : panel.draftAnimationName;
+    const auto currentVersionIndex =
+        panel.currentFilePath.empty()
+            ? std::nullopt
+            : FindAnimationRegistryIndex(
+                  panel,
+                  std::filesystem::path{panel.currentFilePath});
+    const bool currentIsSavedComparison =
+        currentVersionIndex.has_value() &&
+        !panel.currentPathUsesEdited &&
+        RegistryAnimationHasEditedVersion(
+            panel,
+            currentVersionIndex.value());
+    if (!currentIsSavedComparison) {
+        animationPath.name = panel.draftAnimationName.empty()
+                                 ? animationPath.name
+                                 : panel.draftAnimationName;
+    }
+
+    if (currentIsSavedComparison) {
+        if (BeginPanelSection("Current Path")) {
+            ImGui::Text(
+                "File: %s",
+                panel.currentFilePath.c_str());
+            ImGui::Text("Version: Saved (read-only comparison)");
+            ImGui::Text("Keys: %zu", animationPath.keys.size());
+            ImGui::Text(
+                "Duration: %u frames (%.3f seconds)",
+                animationPath.durationFrames,
+                AnimationDurationSeconds(animationPath));
+            const auto motionStats = CachedAnimationPathMotionStats(
+                &panel,
+                animationPath,
+                panel.scrubAmount);
+            ImGui::TextDisabled(
+                "World distance: camera %.3f | target %.3f",
+                motionStats.cameraDistance,
+                motionStats.targetDistance);
+            DrawAnimationScrubControl(runtimeState);
+            ImGui::TextWrapped(
+                "This saved version is read-only while _Edited exists. "
+                "Load _Edited to continue authoring, or discard edits to "
+                "return to the saved version.");
+            if (ImGui::Button("Load _Edited")) {
+                LoadAnimationPathVariant(
+                    runtimeState,
+                    panel.availableFiles[currentVersionIndex.value()],
+                    true);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Save _Edited")) {
+                RequestSaveChangesDialog(
+                    runtimeState,
+                    SaveChangesRequest::Animation);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Discard Edits")) {
+                DiscardAnimationEdits(
+                    runtimeState,
+                    currentVersionIndex.value());
+            }
+            EndPanelSection();
+        }
+        return;
+    }
 
     if (BeginPanelSection("Current Path")) {
     ImGui::Text("File: %s", panel.currentFilePath.empty() ? "unsaved" : panel.currentFilePath.c_str());
+    ImGui::Text(
+        "Version: %s",
+        panel.currentPathUsesEdited ? "_Edited" : "Saved");
     ImGui::Text("Keys: %zu", animationPath.keys.size());
 
     int durationFrames = static_cast<int>(animationPath.durationFrames);
@@ -40861,24 +41792,181 @@ void DrawAnimationSection(
                 "segment frames, editable in the Keys section. Knot "
                 "respacing can subtly reshape the camera spline.");
         }
+
+        const auto currentLoopFileIndex =
+            panel.currentFilePath.empty()
+                ? std::nullopt
+                : FindAnimationRegistryIndex(
+                      panel,
+                      std::filesystem::path{panel.currentFilePath});
+        auto resolveLoopPartnerIndex = [&]() -> std::optional<std::size_t> {
+            if (panel.loopSmoothingPartnerPath.empty()) {
+                return std::nullopt;
+            }
+            return FindAnimationRegistryIndex(
+                panel,
+                panel.loopSmoothingPartnerPath);
+        };
+        auto loopPartnerIndex = resolveLoopPartnerIndex();
+        if (animationPath.loopTransitionSmoothing.has_value()) {
+            const auto& smoothing =
+                animationPath.loopTransitionSmoothing.value();
+            for (std::size_t fileIndex = 0U;
+                 fileIndex < panel.availableFiles.size();
+                 ++fileIndex) {
+                if (currentLoopFileIndex.has_value() &&
+                    fileIndex == currentLoopFileIndex.value()) {
+                    continue;
+                }
+                const auto* candidate =
+                    RegistryAnimationPath(*runtimeState, fileIndex);
+                if (candidate != nullptr &&
+                    candidate->loopTransitionSmoothing.has_value() &&
+                    candidate->loopTransitionSmoothing->pairId ==
+                        smoothing.pairId) {
+                    panel.loopSmoothingPartnerPath =
+                        panel.availableFiles[fileIndex];
+                    loopPartnerIndex = fileIndex;
+                    break;
+                }
+            }
+        }
+
+        std::string loopPartnerLabel = "Select another animation";
+        if (loopPartnerIndex.has_value() &&
+            loopPartnerIndex.value() < panel.availableFiles.size()) {
+            loopPartnerLabel = AnimationRegistryDisplayLabel(
+                *runtimeState,
+                loopPartnerIndex.value());
+        }
+        ImGui::BeginDisabled(renderSetupLocksAnimationSwitching);
+        if (ImGui::BeginCombo("Loop Partner", loopPartnerLabel.c_str())) {
+            for (std::size_t fileIndex = 0U;
+                 fileIndex < panel.availableFiles.size();
+                 ++fileIndex) {
+                if (currentLoopFileIndex.has_value() &&
+                    fileIndex == currentLoopFileIndex.value()) {
+                    continue;
+                }
+                const auto label = AnimationRegistryDisplayLabel(
+                    *runtimeState,
+                    fileIndex);
+                const bool selected = loopPartnerIndex.has_value() &&
+                                      loopPartnerIndex.value() == fileIndex;
+                const auto stableId =
+                    panel.availableFiles[fileIndex].generic_string();
+                ImGui::PushID(stableId.c_str());
+                if (ImGui::Selectable(label.c_str(), selected)) {
+                    panel.loopSmoothingPartnerPath =
+                        panel.availableFiles[fileIndex];
+                    loopPartnerIndex = fileIndex;
+                }
+                if (selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Pairs this animation with another animation. Its _Edited "
+                "version is used automatically when present. Both "
+                "end-to-start overlaps are optimized as one closed loop.");
+        }
+
+        const auto* loopPartner =
+            loopPartnerIndex.has_value()
+                ? RegistryAnimationPath(
+                      *runtimeState,
+                      loopPartnerIndex.value())
+                : nullptr;
+        const bool matchingAppliedPair =
+            loopPartner != nullptr &&
+            animationPath.loopTransitionSmoothing.has_value() &&
+            loopPartner->loopTransitionSmoothing.has_value() &&
+            animationPath.loopTransitionSmoothing->pairId ==
+                loopPartner->loopTransitionSmoothing->pairId;
+        ImGui::BeginDisabled(
+            renderSetupLocksAnimationSwitching || matchingAppliedPair);
+        ImGui::SliderFloat(
+            "Max End Move",
+            &panel.loopSmoothingMaxEndMovePercent,
+            1.0F,
+            25.0F,
+            "%.0f%%");
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(
+                ImGuiHoveredFlags_DelayNormal |
+                ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip(
+                "Separate camera and focus limits, each measured as a "
+                "percentage of that track's adjacent end segment.");
+        }
+
+        const bool canSmoothLoop =
+            !renderSetupLocksAnimationSwitching &&
+            currentLoopFileIndex.has_value() &&
+            loopPartnerIndex.has_value() &&
+            currentLoopFileIndex.value() != loopPartnerIndex.value() &&
+            animationPath.keys.size() >= 3U &&
+            loopPartner != nullptr && loopPartner->keys.size() >= 3U &&
+            !animationPath.loopTransitionSmoothing.has_value() &&
+            !loopPartner->loopTransitionSmoothing.has_value();
+        ImGui::BeginDisabled(!canSmoothLoop);
+        if (ImGui::Button("Smooth Loop Transitions")) {
+            ApplyAnimationLoopSmoothing(
+                runtimeState,
+                loopPartnerIndex.value(),
+                std::clamp(
+                    panel.loopSmoothingMaxEndMovePercent / 100.0F,
+                    0.01F,
+                    0.25F));
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(
+                ImGuiHoveredFlags_DelayNormal |
+                ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip(
+                "Moves only the first and last camera/focus positions. "
+                "Timings and the complete middle interval stay unchanged; "
+                "the paired results appear as _Edited versions until saved.");
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(
+            renderSetupLocksAnimationSwitching || !matchingAppliedPair);
+        if (ImGui::Button("Unapply End Smoothing")) {
+            UnapplyAnimationLoopSmoothing(
+                runtimeState,
+                loopPartnerIndex.value());
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(
+                ImGuiHoveredFlags_DelayNormal |
+                ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip(
+                "Restores only the four saved endpoint camera/focus poses "
+                "and keeps every later middle-key or timing edit.");
+        }
+        if (animationPath.loopTransitionSmoothing.has_value()) {
+            ImGui::TextDisabled(
+                "End smoothing applied at %.0f%% maximum movement.",
+                100.0F * animationPath.loopTransitionSmoothing
+                               ->maxEndMoveFraction);
+        }
     }
 
     if (ImGui::Button("Save")) {
-        const auto outputPath = panel.currentFilePath.empty()
-                                    ? UniqueAnimationFilePathForName(*runtimeState, animationPath.name)
-                                    : std::filesystem::path{panel.currentFilePath};
-        auto pathToSave = animationPath;
-        if (panel.currentFilePath.empty()) {
-            pathToSave.name = AnimationNameFromFilePath(outputPath);
-        }
-        SaveAnimationPathToFile(runtimeState, pathToSave, outputPath);
+        RequestSaveChangesDialog(
+            runtimeState,
+            SaveChangesRequest::Animation);
     }
     ImGui::SameLine();
     if (ImGui::Button("Save As")) {
-        const auto outputPath = UniqueAnimationFilePathForName(*runtimeState, animationPath.name);
-        auto pathToSave = animationPath;
-        pathToSave.name = AnimationNameFromFilePath(outputPath);
-        SaveAnimationPathToFile(runtimeState, pathToSave, outputPath);
+        RequestSaveChangesDialog(
+            runtimeState,
+            SaveChangesRequest::AnimationAs);
     }
     ImGui::SameLine();
     if (ImGui::Button("Refocus To Surface")) {
@@ -40945,7 +42033,7 @@ void DrawAnimationSection(
         if (!houdiniNoticeVisible) {
             ImGui::SameLine();
         }
-        ImGui::TextDisabled("Modified");
+        ImGui::TextDisabled("_Edited");
     }
     EndPanelSection();
     }
@@ -41697,8 +42785,9 @@ void DrawAnimationSection(
         if (panel.waterKeyCopySourceIndex.has_value() &&
             panel.waterKeyCopySourceIndex.value() < panel.availableFiles.size()) {
             static std::string copySourceStorage;
-            copySourceStorage = AnimationDisplayNameFromPath(
-                panel.availableFiles[panel.waterKeyCopySourceIndex.value()]);
+            copySourceStorage = AnimationRegistryDisplayLabel(
+                *runtimeState,
+                panel.waterKeyCopySourceIndex.value());
             copySourceLabel = copySourceStorage.c_str();
         }
         const bool copyWaterOpen = ImGui::BeginCombo("Copy Water Keying From", copySourceLabel);
@@ -41711,26 +42800,32 @@ void DrawAnimationSection(
                     PathsLexicallyEqual(panel.availableFiles[index], panel.currentFilePath)) {
                     continue;
                 }
-                const auto label = AnimationDisplayNameFromPath(panel.availableFiles[index]);
+                const auto label = AnimationRegistryDisplayLabel(
+                    *runtimeState,
+                    index);
                 const bool selected = panel.waterKeyCopySourceIndex.has_value() &&
                                       panel.waterKeyCopySourceIndex.value() == index;
+                const auto stableId = panel.availableFiles[index].generic_string();
+                ImGui::PushID(stableId.c_str());
                 if (ImGui::Selectable(label.c_str(), selected)) {
                     panel.waterKeyCopySourceIndex = index;
                 }
+                ImGui::PopID();
             }
             ImGui::EndCombo();
         }
-        const bool canCopy = panel.waterKeyCopySourceIndex.has_value() &&
-                             panel.waterKeyCopySourceIndex.value() <
-                                 panel.availableFileLoadedPaths.size() &&
-                             panel.availableFileLoadedPaths[panel.waterKeyCopySourceIndex.value()].has_value();
+        const auto* copySource =
+            panel.waterKeyCopySourceIndex.has_value()
+                ? RegistryAnimationPath(
+                      *runtimeState,
+                      panel.waterKeyCopySourceIndex.value())
+                : nullptr;
+        const bool canCopy = copySource != nullptr;
         if (!canCopy) {
             ImGui::BeginDisabled();
         }
         if (ImGui::Button("Copy Water Keying")) {
-            const auto& source = panel.availableFileLoadedPaths[
-                panel.waterKeyCopySourceIndex.value()].value();
-            for (const auto& sourceTrack : source.waterScenarioTracks) {
+            for (const auto& sourceTrack : copySource->waterScenarioTracks) {
                 const auto destinationIt = std::find_if(
                     animationPath.waterScenarioTracks.begin(),
                     animationPath.waterScenarioTracks.end(),
@@ -41975,49 +43070,11 @@ ProjectDocument BuildProjectDocumentForSave(
     return document;
 }
 
-bool SaveProjectToCurrentFile(PreviewRuntimeState* runtimeState) {
-    if (runtimeState == nullptr) {
-        return false;
-    }
-    if (runtimeState->persistence.projectFilePath.empty()) {
-        runtimeState->errorMessage =
-            "Choose a project file before saving.";
-        runtimeState->statusMessage.clear();
-        return false;
-    }
-
-    const bool savingUnderlyingProject =
-        runtimeState->activeRenderSetupOverride.has_value();
-    const auto document = BuildProjectDocumentForSave(*runtimeState);
-    std::string errorMessage;
-    if (!invisible_places::serialization::SaveProjectDocument(
-            document,
-            runtimeState->persistence.projectFilePath,
-            &errorMessage)) {
-        runtimeState->errorMessage =
-            errorMessage.empty() ? "Failed to save the project."
-                                 : std::move(errorMessage);
-        runtimeState->statusMessage.clear();
-        return false;
-    }
-
-    if (savingUnderlyingProject &&
-        runtimeState->activeRenderSetupOverride.has_value()) {
-        runtimeState->activeRenderSetupOverride->underlyingProject =
-            document;
-    }
-
-    runtimeState->statusMessage =
-        "Saved project to " +
-        runtimeState->persistence.projectFilePath + ".";
-    runtimeState->errorMessage.clear();
-    return true;
-}
-
-std::filesystem::path CurrentAnimationCloseSavePath(
-    const PreviewRuntimeState& runtimeState) {
+std::filesystem::path CurrentAnimationSavePath(
+    const PreviewRuntimeState& runtimeState,
+    bool saveAs) {
     const auto& panel = runtimeState.animationPanel;
-    if (!panel.currentFilePath.empty()) {
+    if (!saveAs && !panel.currentFilePath.empty()) {
         return std::filesystem::path{panel.currentFilePath};
     }
     if (!panel.currentPath.has_value()) {
@@ -42029,130 +43086,523 @@ std::filesystem::path CurrentAnimationCloseSavePath(
     return UniqueAnimationFilePathForName(runtimeState, name);
 }
 
-bool SaveCurrentAnimationBeforeClose(PreviewRuntimeState* runtimeState) {
-    if (runtimeState == nullptr ||
-        !runtimeState->animationPanel.currentPath.has_value()) {
-        return true;
-    }
-
-    auto& panel = runtimeState->animationPanel;
-    auto& animation = panel.currentPath.value();
-    if (!panel.draftAnimationName.empty()) {
-        animation.name = panel.draftAnimationName;
-    }
-    const auto outputPath = CurrentAnimationCloseSavePath(*runtimeState);
-    if (outputPath.empty()) {
-        runtimeState->errorMessage =
-            "Choose an animation file before saving.";
-        runtimeState->statusMessage.clear();
-        return false;
-    }
-    if (panel.currentFilePath.empty()) {
-        animation.name = AnimationNameFromFilePath(outputPath);
-    }
-    return SaveAnimationPathToFile(
-        runtimeState,
-        animation,
-        outputPath);
-}
-
-std::size_t DirtyNonCurrentAnimationCount(
-    const AnimationPanelState& panel) {
-    const auto count = std::min(
-        panel.availableFiles.size(),
-        panel.availableFileDirtyFlags.size());
-    std::size_t dirtyCount = 0U;
-    for (std::size_t index = 0; index < count; ++index) {
-        if (panel.availableFileDirtyFlags[index] &&
-            !IsCurrentAnimationRegistryIndex(panel, index)) {
-            ++dirtyCount;
-        }
-    }
-    return dirtyCount;
-}
-
-bool SaveDirtyNonCurrentAnimationsBeforeClose(
-    PreviewRuntimeState* runtimeState) {
-    if (runtimeState == nullptr) {
-        return false;
-    }
-
-    auto& panel = runtimeState->animationPanel;
-    EnsureAnimationAssociationStorage(&panel);
-    std::size_t savedCount = 0U;
-    for (std::size_t index = 0;
-         index < panel.availableFiles.size();
-         ++index) {
-        if (!panel.availableFileDirtyFlags[index] ||
-            IsCurrentAnimationRegistryIndex(panel, index)) {
-            continue;
-        }
-        if (!panel.availableFileLoadedPaths[index].has_value()) {
-            runtimeState->errorMessage =
-                "Cannot save modified animation " +
-                panel.availableFiles[index].filename().string() +
-                " because its in-memory path is unavailable.";
-            runtimeState->statusMessage.clear();
-            return false;
-        }
-
-        auto pathToSave =
-            panel.availableFileLoadedPaths[index].value();
-        CanonicalizeAssociatedLayerPathsForSceneGroups(
-            *runtimeState,
-            &pathToSave.associatedLayerPaths);
-        std::string errorMessage;
-        if (!invisible_places::serialization::SaveAnimationPath(
-                pathToSave,
-                panel.availableFiles[index],
-                &errorMessage)) {
-            runtimeState->errorMessage =
-                errorMessage.empty()
-                    ? "Failed to save modified animation " +
-                          panel.availableFiles[index].filename().string() +
-                          "."
-                    : std::move(errorMessage);
-            runtimeState->statusMessage.clear();
-            return false;
-        }
-
-        panel.availableFileLoadedPaths[index] = pathToSave;
-        panel.availableFileAssociatedLayerPaths[index] =
-            pathToSave.associatedLayerPaths;
-        panel.availableFileDirtyFlags[index] = false;
-        ++savedCount;
-    }
-
-    if (savedCount > 0U) {
-        runtimeState->statusMessage =
-            "Saved " + std::to_string(savedCount) +
-            " linked animation" +
-            (savedCount == 1U ? "." : "s.");
-        runtimeState->errorMessage.clear();
-    }
-    return true;
-}
-
-bool SaveAnimationsBeforeClose(PreviewRuntimeState* runtimeState) {
-    if (runtimeState == nullptr) {
-        return false;
-    }
-    if (runtimeState->animationPanel.currentPath.has_value() &&
-        !SaveCurrentAnimationBeforeClose(runtimeState)) {
-        return false;
-    }
-    return SaveDirtyNonCurrentAnimationsBeforeClose(runtimeState);
-}
-
-void DrawSaveBeforeCloseModal(
+void RequestSaveChangesDialog(
     PreviewRuntimeState* runtimeState,
-    SaveBeforeCloseState* closeState) {
-    if (runtimeState == nullptr || closeState == nullptr) {
+    SaveChangesRequest request) {
+    if (runtimeState == nullptr) {
         return;
     }
 
-    constexpr const char* kPopupName = "Save before closing?";
-    if (closeState->requested && !ImGui::IsPopupOpen(kPopupName)) {
+    auto& dialog = runtimeState->saveChanges;
+    auto& panel = runtimeState->animationPanel;
+    EnsureAnimationAssociationStorage(&panel);
+    SyncCurrentAnimationToRegistry(runtimeState);
+    dialog = {};
+    dialog.requested = true;
+    dialog.closeAfterSave = request == SaveChangesRequest::Closing;
+    dialog.allowItemSelection = !dialog.closeAfterSave;
+
+    if (!runtimeState->persistence.projectFilePath.empty() ||
+        request == SaveChangesRequest::Project) {
+        const std::filesystem::path projectPath{
+            runtimeState->persistence.projectFilePath};
+        dialog.items.push_back({
+            .kind = SaveChangesItemKind::Project,
+            .targetPath = projectPath,
+            .currentAnimation = false,
+            .selected = !projectPath.empty(),
+            .displayName = projectPath.empty()
+                               ? std::string{"Project (no file selected)"}
+                               : std::string{"Project — "} +
+                                     projectPath.filename().string(),
+        });
+    }
+
+    const bool explicitlySavingAnimation =
+        request == SaveChangesRequest::Animation ||
+        request == SaveChangesRequest::AnimationAs;
+    const auto currentRegistryIndex =
+        panel.currentFilePath.empty()
+            ? std::nullopt
+            : FindAnimationRegistryIndex(
+                  panel,
+                  std::filesystem::path{panel.currentFilePath});
+    const bool currentHasEditedVersion =
+        currentRegistryIndex.has_value() &&
+        RegistryAnimationHasEditedVersion(
+            panel,
+            currentRegistryIndex.value());
+    const bool currentAnimationNeedsSave =
+        panel.currentPath.has_value() &&
+        (explicitlySavingAnimation || currentHasEditedVersion || panel.dirty ||
+         panel.currentFilePath.empty());
+    if (currentAnimationNeedsSave) {
+        const bool saveAs = request == SaveChangesRequest::AnimationAs;
+        const auto targetPath =
+            CurrentAnimationSavePath(*runtimeState, saveAs);
+        const auto& animation =
+            currentHasEditedVersion
+                ? panel.availableFileEditedPaths[
+                      currentRegistryIndex.value()].value()
+                : panel.currentPath.value();
+        const auto displayName =
+            !targetPath.empty()
+                ? AnimationDisplayNameFromPath(targetPath)
+                : currentHasEditedVersion || panel.draftAnimationName.empty()
+                      ? animation.name
+                      : panel.draftAnimationName;
+        dialog.items.push_back({
+            .kind = SaveChangesItemKind::Animation,
+            .targetPath = targetPath,
+            .currentAnimation = true,
+            .selected = !targetPath.empty(),
+            .displayName =
+                "Animation — " +
+                (displayName.empty()
+                     ? targetPath.filename().string()
+                     : displayName) +
+                (currentHasEditedVersion ? "_Edited" : "") +
+                (saveAs ? " (new file)" : ""),
+        });
+    }
+
+    for (std::size_t index = 0U;
+         index < panel.availableFiles.size();
+         ++index) {
+        if (!RegistryAnimationHasEditedVersion(panel, index) ||
+            (currentAnimationNeedsSave &&
+             currentRegistryIndex.has_value() &&
+             index == currentRegistryIndex.value())) {
+            continue;
+        }
+        const auto displayName = AnimationDisplayNameFromPath(
+            panel.availableFiles[index]);
+        dialog.items.push_back({
+            .kind = SaveChangesItemKind::Animation,
+            .targetPath = panel.availableFiles[index],
+            .currentAnimation = false,
+            .selected = true,
+            .displayName = "Animation — " + displayName + "_Edited",
+        });
+    }
+
+    runtimeState->errorMessage.clear();
+}
+
+struct PreparedAnimationSave {
+    std::filesystem::path targetPath;
+    AnimationPath path;
+    bool currentAnimation = false;
+    std::optional<std::size_t> sourceRegistryIndex;
+    std::filesystem::path sourcePath;
+    std::string loopEditPairId;
+};
+
+std::optional<PreparedAnimationSave> PrepareAnimationSave(
+    PreviewRuntimeState* runtimeState,
+    const SaveChangesItem& item,
+    std::string* errorMessage) {
+    if (runtimeState == nullptr ||
+        item.kind != SaveChangesItemKind::Animation ||
+        item.targetPath.empty()) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Choose an animation file before saving.";
+        }
+        return std::nullopt;
+    }
+
+    auto& panel = runtimeState->animationPanel;
+    PreparedAnimationSave prepared;
+    prepared.targetPath = item.targetPath;
+    prepared.currentAnimation = item.currentAnimation;
+    if (item.currentAnimation) {
+        if (!panel.currentPath.has_value()) {
+            if (errorMessage != nullptr) {
+                *errorMessage = "The current animation is no longer available.";
+            }
+            return std::nullopt;
+        }
+        if (!panel.currentFilePath.empty()) {
+            prepared.sourceRegistryIndex = FindAnimationRegistryIndex(
+                panel,
+                std::filesystem::path{panel.currentFilePath});
+        }
+        const bool sourceHasEditedVersion =
+            prepared.sourceRegistryIndex.has_value() &&
+            RegistryAnimationHasEditedVersion(
+                panel,
+                prepared.sourceRegistryIndex.value());
+        prepared.path = sourceHasEditedVersion
+                            ? panel.availableFileEditedPaths[
+                                  prepared.sourceRegistryIndex.value()].value()
+                            : panel.currentPath.value();
+        if (prepared.sourceRegistryIndex.has_value()) {
+            prepared.sourcePath = panel.availableFiles[
+                prepared.sourceRegistryIndex.value()];
+            prepared.loopEditPairId =
+                panel.availableFileLoopEditPairIds[
+                    prepared.sourceRegistryIndex.value()];
+        }
+        if (!sourceHasEditedVersion &&
+            !panel.draftAnimationName.empty()) {
+            prepared.path.name = panel.draftAnimationName;
+        }
+        if (panel.currentFilePath.empty() ||
+            !PathsLexicallyEqual(
+                std::filesystem::path{panel.currentFilePath},
+                item.targetPath)) {
+            prepared.path.name = AnimationNameFromFilePath(item.targetPath);
+        }
+
+        const bool savingDuringRenderSetupOverride =
+            runtimeState->activeRenderSetupOverride.has_value();
+        if (savingDuringRenderSetupOverride) {
+            const auto& underlying =
+                runtimeState->activeRenderSetupOverride
+                    ->underlyingAnimation;
+            if (underlying.path.has_value()) {
+                prepared.path.selectedTimingTakeId =
+                    underlying.path->selectedTimingTakeId;
+            }
+        } else if (!sourceHasEditedVersion ||
+                   panel.currentPathUsesEdited) {
+            prepared.path.waterAnimationTrailSettings =
+                ViewedWaterAnimationTrailSettings(*runtimeState);
+            prepared.path.tempWaterAnimationTrailSettings.reset();
+        }
+    } else {
+        const auto registryIndex =
+            FindAnimationRegistryIndex(panel, item.targetPath);
+        if (!registryIndex.has_value() ||
+            !RegistryAnimationHasEditedVersion(
+                panel,
+                registryIndex.value())) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "Cannot save modified animation " +
+                    item.targetPath.filename().string() +
+                    " because its in-memory path is unavailable.";
+            }
+            return std::nullopt;
+        }
+        prepared.sourceRegistryIndex = registryIndex;
+        prepared.sourcePath = panel.availableFiles[registryIndex.value()];
+        prepared.path =
+            panel.availableFileEditedPaths[registryIndex.value()].value();
+        prepared.loopEditPairId =
+            panel.availableFileLoopEditPairIds[registryIndex.value()];
+    }
+
+    EmbedAnimationWaterScenarioFallbacks(
+        &prepared.path,
+        runtimeState->water.seepageScenarios);
+    CanonicalizeAssociatedLayerPathsForSceneGroups(
+        *runtimeState,
+        &prepared.path.associatedLayerPaths);
+    return prepared;
+}
+
+void UpsertProjectSavedAnimation(
+    ProjectDocument* project,
+    const PreparedAnimationSave& prepared) {
+    if (project == nullptr) {
+        return;
+    }
+    auto entry = std::find_if(
+        project->savedAnimations.begin(),
+        project->savedAnimations.end(),
+        [&](const ProjectDocument::SavedAnimation& candidate) {
+            return PathsLexicallyEqual(
+                candidate.filePath,
+                prepared.targetPath);
+        });
+    if (entry == project->savedAnimations.end()) {
+        project->savedAnimations.push_back({
+            .filePath = prepared.targetPath,
+            .associatedLayerPaths =
+                prepared.path.associatedLayerPaths,
+        });
+    } else {
+        entry->associatedLayerPaths =
+            prepared.path.associatedLayerPaths;
+    }
+    project->hasSavedAnimationRegistry = true;
+}
+
+bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+
+    auto& dialog = runtimeState->saveChanges;
+    std::vector<PreparedAnimationSave> animations;
+    const SaveChangesItem* projectItem = nullptr;
+    std::string saveError;
+    for (const auto& item : dialog.items) {
+        if (!item.selected) {
+            continue;
+        }
+        if (item.kind == SaveChangesItemKind::Project) {
+            projectItem = &item;
+            continue;
+        }
+        auto prepared = PrepareAnimationSave(
+            runtimeState,
+            item,
+            &saveError);
+        if (!prepared.has_value()) {
+            dialog.errorMessage = saveError;
+            return false;
+        }
+        animations.push_back(std::move(prepared.value()));
+    }
+
+    if (projectItem != nullptr && projectItem->targetPath.empty()) {
+        dialog.errorMessage = "Choose a project file before saving.";
+        return false;
+    }
+    if (projectItem == nullptr && animations.empty()) {
+        dialog.errorMessage = "Select at least one file to save.";
+        return false;
+    }
+
+    std::unordered_map<
+        std::string,
+        std::vector<const PreparedAnimationSave*>> loopPairSaves;
+    std::unordered_set<std::size_t> selectedSourceIndices;
+    for (const auto& animation : animations) {
+        if (animation.sourceRegistryIndex.has_value()) {
+            selectedSourceIndices.insert(
+                animation.sourceRegistryIndex.value());
+        }
+        if (!animation.loopEditPairId.empty()) {
+            if (!PathsLexicallyEqual(
+                    animation.sourcePath,
+                    animation.targetPath)) {
+                dialog.errorMessage =
+                    "Paired loop edits must be saved over their existing "
+                    "animation files; Save As would break the pair.";
+                return false;
+            }
+            loopPairSaves[animation.loopEditPairId].push_back(
+                &animation);
+        }
+    }
+    for (const auto& [pairId, pairAnimations] : loopPairSaves) {
+        if (projectItem == nullptr) {
+            dialog.errorMessage =
+                "Select the project and both _Edited animations so the "
+                "linked loop endpoints can be saved atomically.";
+            return false;
+        }
+        std::size_t expectedPairMembers = 0U;
+        for (std::size_t index = 0U;
+             index < runtimeState->animationPanel.availableFiles.size();
+             ++index) {
+            if (runtimeState->animationPanel.availableFileLoopEditPairIds[index] !=
+                pairId) {
+                continue;
+            }
+            ++expectedPairMembers;
+            if (!selectedSourceIndices.contains(index)) {
+                dialog.errorMessage =
+                    "Select both _Edited loop animations; this pair cannot "
+                    "be saved partially.";
+                return false;
+            }
+        }
+        if (expectedPairMembers != 2U || pairAnimations.size() != 2U) {
+            dialog.errorMessage =
+                "The edited loop pair is incomplete. Discard the pair or "
+                "reapply smoothing before saving.";
+            return false;
+        }
+    }
+
+    std::optional<ProjectDocument> project;
+    if (projectItem != nullptr) {
+        project = BuildProjectDocumentForSave(*runtimeState);
+        for (const auto& animation : animations) {
+            UpsertProjectSavedAnimation(&project.value(), animation);
+            if (animation.currentAnimation) {
+                project->lastAnimationPath = animation.targetPath;
+                project->activeAnimationPath = animation.targetPath;
+                project->activeAnimationPosition = std::clamp(
+                    runtimeState->animationPanel.scrubAmount,
+                    0.0F,
+                    1.0F);
+            }
+        }
+        for (const auto& [pairId, pairAnimations] : loopPairSaves) {
+            (void)pairId;
+            ApplyLoopEndpointsToCameraShots(
+                pairAnimations[0U]->path,
+                pairAnimations[1U]->path,
+                &project->cameraShots);
+        }
+    }
+
+    const auto transactionSuffix =
+        ".save-changes." +
+        std::to_string(
+            std::chrono::steady_clock::now()
+                .time_since_epoch()
+                .count());
+    std::vector<
+        invisible_places::serialization::StagedDocumentReplacement>
+        replacements;
+    replacements.reserve(
+        animations.size() + (projectItem != nullptr ? 1U : 0U));
+    for (const auto& animation : animations) {
+        replacements.push_back({
+            .targetPath = animation.targetPath,
+            .stagedPath = animation.targetPath.string() +
+                          transactionSuffix + ".pending",
+        });
+        if (!invisible_places::serialization::SaveAnimationPath(
+                animation.path,
+                replacements.back().stagedPath,
+                &saveError)) {
+            CleanupStagedDocumentFiles(
+                std::span{replacements});
+            dialog.errorMessage =
+                saveError.empty()
+                    ? "Could not stage all selected animations."
+                    : std::move(saveError);
+            return false;
+        }
+    }
+    if (projectItem != nullptr) {
+        replacements.push_back({
+            .targetPath = projectItem->targetPath,
+            .stagedPath = projectItem->targetPath.string() +
+                          transactionSuffix + ".pending",
+        });
+        if (!invisible_places::serialization::SaveProjectDocument(
+                project.value(),
+                replacements.back().stagedPath,
+                &saveError)) {
+            CleanupStagedDocumentFiles(
+                std::span{replacements});
+            dialog.errorMessage =
+                saveError.empty()
+                    ? "Could not stage the selected project."
+                    : std::move(saveError);
+            return false;
+        }
+    }
+    if (!invisible_places::serialization::
+            CommitStagedDocumentReplacements(
+                replacements,
+                &saveError)) {
+        CleanupStagedDocumentFiles(
+            std::span{replacements});
+        dialog.errorMessage =
+            saveError.empty()
+                ? "Could not commit the selected files."
+                : std::move(saveError);
+        return false;
+    }
+
+    auto& panel = runtimeState->animationPanel;
+    for (const auto& animation : animations) {
+        if (!animation.sourcePath.empty() &&
+            !PathsLexicallyEqual(
+                animation.sourcePath,
+                animation.targetPath)) {
+            if (const auto sourceIndex = FindAnimationRegistryIndex(
+                    panel,
+                    animation.sourcePath);
+                sourceIndex.has_value()) {
+                panel.availableFileEditedPaths[sourceIndex.value()].reset();
+                panel.availableFileLoopEditPairIds[sourceIndex.value()].clear();
+                panel.availableFileDirtyFlags[sourceIndex.value()] = false;
+            }
+        }
+
+        AddAnimationFileToRegistry(
+            &panel,
+            animation.targetPath,
+            animation.path.associatedLayerPaths);
+        SetAnimationRegistryAssociations(
+            &panel,
+            animation.targetPath,
+            animation.path.associatedLayerPaths);
+        if (const auto targetIndex = FindAnimationRegistryIndex(
+                panel,
+                animation.targetPath);
+            targetIndex.has_value()) {
+            EnsureAnimationAssociationStorage(&panel);
+            panel.availableFileLoadedPaths[targetIndex.value()] =
+                animation.path;
+            panel.availableFileEditedPaths[targetIndex.value()].reset();
+            panel.availableFileLoopEditPairIds[targetIndex.value()].clear();
+            panel.availableFileAssociatedLayerPaths[targetIndex.value()] =
+                animation.path.associatedLayerPaths;
+            panel.availableFileDirtyFlags[targetIndex.value()] = false;
+        }
+
+        if (animation.currentAnimation) {
+            panel.currentPath = animation.path;
+            panel.currentFilePath = animation.targetPath.string();
+            panel.draftAnimationName = animation.path.name;
+            panel.currentPathUsesEdited = false;
+            panel.selectedFileUsesEdited = false;
+            panel.dirty = false;
+            panel.selectedFileIndex =
+                FindAnimationRegistryIndex(
+                    panel,
+                    animation.targetPath);
+            if (runtimeState->activeRenderSetupOverride.has_value()) {
+                auto& active =
+                    runtimeState->activeRenderSetupOverride.value();
+                active.underlyingAnimation.path = animation.path;
+                active.underlyingAnimation.filePath =
+                    animation.targetPath.string();
+                active.underlyingAnimation.dirty = false;
+                panel.currentPath->selectedTimingTakeId =
+                    invisible_places::timing::
+                        NormalizeTimingTakeId(
+                            active.document.timingTakeId);
+            }
+            panel.preparedPathCache = {};
+            panel.motionStatsCache = {};
+            panel.perceivedFlowCache = {};
+            runtimeState->animationPlayback.active = false;
+            ApplyAnimationScrub(runtimeState);
+        }
+    }
+    if (!animations.empty()) {
+        panel.animationRegistryInitialized = true;
+    }
+    if (project.has_value() &&
+        runtimeState->activeRenderSetupOverride.has_value()) {
+        runtimeState->activeRenderSetupOverride->underlyingProject =
+            project.value();
+    }
+    if (project.has_value() && !loopPairSaves.empty()) {
+        runtimeState->cameraShots = project->cameraShots;
+        EnsureRuntimeCameraShotIds(runtimeState);
+        runtimeState->cameraPlayback.active = false;
+    }
+
+    runtimeState->statusMessage =
+        "Saved " + std::to_string(replacements.size()) +
+        (replacements.size() == 1U ? " file." : " files.");
+    runtimeState->errorMessage.clear();
+    dialog.errorMessage.clear();
+    return true;
+}
+
+void DrawSaveChangesDialog(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+
+    auto& dialog = runtimeState->saveChanges;
+    constexpr const char* kPopupName =
+        "Save Changes##save_changes_dialog";
+    if (dialog.requested && !ImGui::IsPopupOpen(kPopupName)) {
         ImGui::OpenPopup(kPopupName);
     }
     ImGui::SetNextWindowSizeConstraints(
@@ -42165,11 +43615,11 @@ void DrawSaveBeforeCloseModal(
         return;
     }
 
-    if (closeState->waitingForRenderCancellation &&
+    if (dialog.waitingForRenderCancellation &&
         !runtimeState->offlineRenderJob.active) {
-        closeState->waitingForRenderCancellation = false;
-        closeState->requested = false;
-        closeState->exitConfirmed = true;
+        dialog.waitingForRenderCancellation = false;
+        dialog.requested = false;
+        dialog.exitConfirmed = true;
         ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
         return;
@@ -42179,112 +43629,115 @@ void DrawSaveBeforeCloseModal(
         if (runtimeState->offlineRenderJob.active) {
             RequestOfflineRenderCancellation(
                 &runtimeState->offlineRenderJob);
-            closeState->waitingForRenderCancellation = true;
+            dialog.waitingForRenderCancellation = true;
             return;
         }
-        closeState->requested = false;
-        closeState->exitConfirmed = true;
+        dialog.requested = false;
+        dialog.exitConfirmed = true;
         ImGui::CloseCurrentPopup();
     };
 
-    ImGui::TextWrapped(
-        "Choose what to save before Invisible Places closes.");
+    ImGui::TextWrapped(dialog.closeAfterSave
+                           ? "These files contain the session state that can be saved before Invisible Places closes."
+                           : "Select the changed files to save together.");
     ImGui::Spacing();
 
     ImGui::BeginDisabled(
-        closeState->waitingForRenderCancellation);
+        dialog.waitingForRenderCancellation);
 
-    ImGui::Checkbox("Project", &closeState->saveProject);
-    ImGui::Indent();
-    ImGui::TextWrapped(
-        "File: %s",
-        runtimeState->persistence.projectFilePath.empty()
-            ? "No project file selected"
-            : runtimeState->persistence.projectFilePath.c_str());
-    ImGui::Unindent();
-
-    const auto dirtyLinkedAnimationCount =
-        DirtyNonCurrentAnimationCount(
-            runtimeState->animationPanel);
-    const bool hasAnimations =
-        runtimeState->animationPanel.currentPath.has_value() ||
-        dirtyLinkedAnimationCount > 0U;
-    ImGui::BeginDisabled(!hasAnimations);
-    ImGui::Checkbox("Animations", &closeState->saveAnimation);
-    ImGui::EndDisabled();
-    ImGui::Indent();
-    if (runtimeState->animationPanel.currentPath.has_value()) {
-        const auto animationPath =
-            CurrentAnimationCloseSavePath(*runtimeState);
-        const auto animationPathLabel = animationPath.string();
-        ImGui::TextWrapped(
-            "File: %s%s",
-            animationPath.empty()
-                ? "No animation file selected"
-                : animationPathLabel.c_str(),
-            runtimeState->animationPanel.dirty
-                ? "  [modified]"
-                : "");
-    } else {
-        ImGui::TextDisabled("No current animation");
+    if (dialog.items.empty()) {
+        ImGui::TextDisabled("No changed files were found.");
     }
-    if (dirtyLinkedAnimationCount > 0U) {
-        ImGui::TextWrapped(
-            "%zu additional linked animation%s modified by camera edits",
-            dirtyLinkedAnimationCount,
-            dirtyLinkedAnimationCount == 1U ? "" : "s");
+    for (std::size_t index = 0U;
+         index < dialog.items.size();
+         ++index) {
+        auto& item = dialog.items[index];
+        ImGui::PushID(static_cast<int>(index));
+        const auto stableId = item.targetPath.generic_string();
+        ImGui::PushID(stableId.c_str());
+        if (dialog.allowItemSelection) {
+            ImGui::Checkbox("##save_item", &item.selected);
+            ImGui::SameLine();
+            ImGui::TextUnformatted(item.displayName.c_str());
+        } else {
+            ImGui::BulletText("%s", item.displayName.c_str());
+        }
+        ImGui::Indent();
+        const auto pathLabel = item.targetPath.empty()
+                                   ? std::string{"No file selected"}
+                                   : item.targetPath.string();
+        ImGui::TextDisabled("%s", pathLabel.c_str());
+        ImGui::Unindent();
+        ImGui::PopID();
+        ImGui::PopID();
     }
-    ImGui::Unindent();
 
     if (runtimeState->activeRenderSetupOverride.has_value() &&
-        closeState->saveProject) {
+        std::any_of(
+            dialog.items.begin(),
+            dialog.items.end(),
+            [](const SaveChangesItem& item) {
+                return item.kind == SaveChangesItemKind::Project &&
+                       item.selected;
+            })) {
         ImGui::Spacing();
         ImGui::TextWrapped(
             "The loaded Render Setup is a temporary preview. The underlying "
             "project will be saved without writing the preview into it.");
     }
-    if (closeState->waitingForRenderCancellation) {
+    if (dialog.waitingForRenderCancellation) {
         ImGui::Spacing();
         ImGui::TextWrapped(
             "Cancelling the active render before closing...");
-    } else if (runtimeState->offlineRenderJob.active) {
+    } else if (dialog.closeAfterSave &&
+               runtimeState->offlineRenderJob.active) {
         ImGui::Spacing();
         ImGui::TextWrapped(
             "The active render will finish cancelling before the application "
             "closes.");
     }
-    if (!closeState->errorMessage.empty()) {
+    if (!dialog.errorMessage.empty()) {
         ImGui::Spacing();
         ImGui::TextColored(
             ImVec4{0.95F, 0.35F, 0.30F, 1.0F},
             "%s",
-            closeState->errorMessage.c_str());
+            dialog.errorMessage.c_str());
     }
 
     ImGui::Spacing();
-    if (ImGui::Button("Save Selected and Close")) {
-        closeState->errorMessage.clear();
-        if (closeState->saveAnimation &&
-            !SaveAnimationsBeforeClose(runtimeState)) {
-            closeState->errorMessage = runtimeState->errorMessage;
-        } else if (closeState->saveProject) {
-            if (!SaveProjectToCurrentFile(runtimeState)) {
-                closeState->errorMessage = runtimeState->errorMessage;
-            } else {
+    const bool anySelected = std::any_of(
+        dialog.items.begin(),
+        dialog.items.end(),
+        [](const SaveChangesItem& item) {
+            return item.selected;
+        });
+    ImGui::BeginDisabled(!anySelected);
+    const char* saveButtonLabel =
+        dialog.closeAfterSave
+            ? "Save All and Close"
+            : "Save Selected";
+    if (ImGui::Button(saveButtonLabel)) {
+        dialog.errorMessage.clear();
+        if (SaveSelectedChanges(runtimeState)) {
+            if (dialog.closeAfterSave) {
                 beginOrderlyClose();
+            } else {
+                dialog.requested = false;
+                ImGui::CloseCurrentPopup();
             }
-        } else {
+        }
+    }
+    ImGui::EndDisabled();
+    if (dialog.closeAfterSave) {
+        ImGui::SameLine();
+        if (ImGui::Button("Close Without Saving")) {
             beginOrderlyClose();
         }
     }
     ImGui::SameLine();
-    if (ImGui::Button("Close Without Saving")) {
-        beginOrderlyClose();
-    }
-    ImGui::SameLine();
     if (ImGui::Button("Cancel")) {
-        closeState->requested = false;
-        closeState->errorMessage.clear();
+        dialog.requested = false;
+        dialog.errorMessage.clear();
         ImGui::CloseCurrentPopup();
     }
 
@@ -42302,7 +43755,9 @@ void DrawProjectSection(
 
     InputTextString("Project File", &runtimeState->persistence.projectFilePath);
     if (ImGui::Button("Save Project")) {
-        SaveProjectToCurrentFile(runtimeState);
+        RequestSaveChangesDialog(
+            runtimeState,
+            SaveChangesRequest::Project);
     }
 
     ImGui::SameLine();
@@ -50914,9 +52369,18 @@ void SaveEditedWaterScenario(PreviewRuntimeState* runtimeState) {
     water.editedScenario.reset();
     // Refresh the loaded animation's embedded snapshots so its file stays
     // reproducible with the newly saved state, then recompile timing runs.
-    if (runtimeState->animationPanel.currentPath.has_value()) {
-        auto& animationPath = runtimeState->animationPanel.currentPath.value();
-        for (auto& track : animationPath.waterScenarioTracks) {
+    const auto* viewedAnimationPath = CurrentAnimationPath(*runtimeState);
+    const bool refreshesEmbeddedTrack =
+        viewedAnimationPath != nullptr &&
+        std::any_of(
+            viewedAnimationPath->waterScenarioTracks.begin(),
+            viewedAnimationPath->waterScenarioTracks.end(),
+            [&](const auto& track) {
+                return track.scenarioId == scenarioId;
+            });
+    if (refreshesEmbeddedTrack) {
+        auto* animationPath = CurrentAnimationPath(runtimeState);
+        for (auto& track : animationPath->waterScenarioTracks) {
             if (track.scenarioId == scenarioId) {
                 track.scenarioName = savedIt->name;
                 track.fallbackScenario = *savedIt;
@@ -53395,23 +54859,16 @@ void DrawTimingsPanel(PreviewRuntimeState* runtimeState) {
     if (BeginPanelSection("Save")) {
         if (panel.currentPath.has_value() &&
             ImGui::Button("Save Animation##Timings")) {
-            const auto outputPath = panel.currentFilePath.empty()
-                                        ? (AnimationDirectory(*runtimeState) /
-                                           (panel.currentPath->name +
-                                            ".ipanim.json"))
-                                        : std::filesystem::path{panel.currentFilePath};
-            auto pathToSave = panel.currentPath.value();
-            if (panel.currentFilePath.empty()) {
-                pathToSave.name = AnimationNameFromFilePath(outputPath);
-            }
-            SaveAnimationPathToFile(runtimeState, pathToSave, outputPath);
+            RequestSaveChangesDialog(
+                runtimeState,
+                SaveChangesRequest::Animation);
         }
         DrawWaterSeepageParameterTooltip(
             "Feature runs and their keys are saved with the project; the "
             "animation file carries the camera path and scenario choice.");
         if (panel.dirty) {
             ImGui::SameLine();
-            ImGui::TextDisabled("Modified");
+            ImGui::TextDisabled("_Edited");
         }
         EndPanelSection();
     }
@@ -61164,6 +62621,18 @@ void DrawAuthoredTimingsPanel(
         panel.currentPath.has_value()
             ? &panel.currentPath.value()
             : nullptr;
+    const auto animationRegistryIndex =
+        panel.currentFilePath.empty()
+            ? std::nullopt
+            : FindAnimationRegistryIndex(
+                  panel,
+                  std::filesystem::path{panel.currentFilePath});
+    const bool readOnlySavedComparison =
+        animationRegistryIndex.has_value() &&
+        !panel.currentPathUsesEdited &&
+        RegistryAnimationHasEditedVersion(
+            panel,
+            animationRegistryIndex.value());
     std::string selectedTakeId =
         animationPath != nullptr
             ? invisible_places::timing::NormalizeTimingTakeId(
@@ -61179,7 +62648,7 @@ void DrawAuthoredTimingsPanel(
                 invisible_places::timing::
                     kAuthoredTimingTakeId};
         water.selectedTimingTakeId = selectedTakeId;
-        if (animationPath != nullptr) {
+        if (animationPath != nullptr && !readOnlySavedComparison) {
             animationPath->selectedTimingTakeId =
                 selectedTakeId;
             panel.dirty = true;
@@ -61204,6 +62673,12 @@ void DrawAuthoredTimingsPanel(
                     AnimationDurationSeconds(
                         *animationPath)));
         }
+        if (readOnlySavedComparison) {
+            ImGui::TextDisabled(
+                "The saved animation is a read-only comparison. Load "
+                "_Edited before changing its Timing Take link.");
+        }
+        ImGui::BeginDisabled(readOnlySavedComparison);
         const char* takePreview =
             selectedTake != nullptr
                 ? selectedTake->name.c_str()
@@ -61368,6 +62843,7 @@ void DrawAuthoredTimingsPanel(
                     ? "The reserved Authored Timing take keeps its fixed name."
                     : "Rename the selected Timing Take.");
         }
+        ImGui::EndDisabled();
         EndPanelSection();
     }
 
@@ -61377,33 +62853,19 @@ void DrawAuthoredTimingsPanel(
     if (BeginPanelSection("Save")) {
         if (panel.currentPath.has_value() &&
             ImGui::Button("Save Animation##Timings")) {
-            const auto outputPath =
-                panel.currentFilePath.empty()
-                    ? AnimationDirectory(*runtimeState) /
-                          (panel.currentPath->name +
-                           ".ipanim.json")
-                    : std::filesystem::path{
-                          panel.currentFilePath};
-            auto pathToSave =
-                panel.currentPath.value();
-            if (panel.currentFilePath.empty()) {
-                pathToSave.name =
-                    AnimationNameFromFilePath(
-                        outputPath);
-            }
-            SaveAnimationPathToFile(
+            RequestSaveChangesDialog(
                 runtimeState,
-                pathToSave,
-                outputPath);
+                SaveChangesRequest::Animation);
         }
         DrawTimingControlTooltip(
             "Save the animation camera path and its Timing Take selection. Runs, Colourise / Emissive effects, and saved palettes are stored with the project.");
         if (panel.dirty) {
             ImGui::SameLine();
-            ImGui::TextDisabled("Modified");
+            ImGui::TextDisabled("_Edited");
         }
         EndPanelSection();
     }
+    SyncCurrentAnimationToRegistry(runtimeState);
 }
 
 // Key markers for one feature's setting tracks under the global bar. One
@@ -75621,8 +77083,7 @@ int Application::Run(ApplicationRunOptions options) const {
         return benchmarkExitCode;
     }
 
-    SaveBeforeCloseState saveBeforeClose;
-    while (!saveBeforeClose.exitConfirmed) {
+    while (!runtimeState.saveChanges.exitConfirmed) {
         // Escape's ImGui meaning (cancel the active drag or text edit) wins
         // over the quit shortcut while any widget interaction is live; the
         // previous frame's ImGui state is the correct gate here because the
@@ -75639,15 +77100,11 @@ int Application::Run(ApplicationRunOptions options) const {
                 break;
             }
             window.CancelCloseRequest();
-            if (!saveBeforeClose.requested) {
-                saveBeforeClose.requested = true;
-                saveBeforeClose.saveProject = true;
-                saveBeforeClose.saveAnimation =
-                    runtimeState.animationPanel.currentPath.has_value() ||
-                    DirtyNonCurrentAnimationCount(
-                        runtimeState.animationPanel) > 0U;
-                saveBeforeClose.waitingForRenderCancellation = false;
-                saveBeforeClose.errorMessage.clear();
+            if (!runtimeState.saveChanges.requested ||
+                !runtimeState.saveChanges.closeAfterSave) {
+                RequestSaveChangesDialog(
+                    &runtimeState,
+                    SaveChangesRequest::Closing);
             }
         }
 
@@ -75687,9 +77144,7 @@ int Application::Run(ApplicationRunOptions options) const {
             DrawDiagnosticsWindow(&runtimeState, viewport.value());
             DrawLoadingOverlay(runtimeState);
             DrawOfflineRenderOverlay(&runtimeState);
-            DrawSaveBeforeCloseModal(
-                &runtimeState,
-                &saveBeforeClose);
+            DrawSaveChangesDialog(&runtimeState);
             if (!pauseLiveViewport) {
                 HandleAnimationPlaybackShortcut(&runtimeState);
                 DrawAnimationViewportOverlay(&runtimeState, viewport.value());

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
@@ -26,6 +27,7 @@ using nlohmann::json;
 using invisible_places::camera::AnimationExportSettings;
 using invisible_places::camera::AnimationPath;
 using invisible_places::camera::AnimationPathKey;
+using invisible_places::camera::AnimationLoopSmoothingMetadata;
 using invisible_places::camera::CameraShot;
 using invisible_places::camera::CameraState;
 using invisible_places::output::AnimationExportMode;
@@ -2357,6 +2359,62 @@ AnimationPathKey ParseAnimationPathKey(const json& keyJson) {
     return key;
 }
 
+json SerializeAnimationLoopSmoothingMetadata(
+    const AnimationLoopSmoothingMetadata& smoothing) {
+    return json{
+        {"pair_id", smoothing.pairId},
+        {"partner_file_name", smoothing.partnerFileName},
+        {"sequence_index", smoothing.sequenceIndex},
+        {"max_end_move_fraction", smoothing.maxEndMoveFraction},
+        {"first_key_id", smoothing.firstKeyId},
+        {"last_key_id", smoothing.lastKeyId},
+        {"original_first_camera_position", smoothing.originalFirstCameraPosition},
+        {"original_first_focus_point", smoothing.originalFirstFocusPoint},
+        {"original_last_camera_position", smoothing.originalLastCameraPosition},
+        {"original_last_focus_point", smoothing.originalLastFocusPoint},
+    };
+}
+
+std::optional<AnimationLoopSmoothingMetadata>
+ParseAnimationLoopSmoothingMetadata(const json& smoothingJson) {
+    if (!smoothingJson.is_object()) {
+        return std::nullopt;
+    }
+    AnimationLoopSmoothingMetadata smoothing;
+    smoothing.pairId = smoothingJson.value("pair_id", std::string{});
+    smoothing.partnerFileName =
+        smoothingJson.value("partner_file_name", std::string{});
+    smoothing.sequenceIndex =
+        std::min<std::uint32_t>(1U, smoothingJson.value("sequence_index", 0U));
+    smoothing.maxEndMoveFraction = std::clamp(
+        smoothingJson.value("max_end_move_fraction", 0.10F),
+        0.01F,
+        0.25F);
+    smoothing.firstKeyId = smoothingJson.value("first_key_id", std::string{});
+    smoothing.lastKeyId = smoothingJson.value("last_key_id", std::string{});
+    try {
+        smoothing.originalFirstCameraPosition =
+            smoothingJson.at("original_first_camera_position")
+                .get<std::array<float, 3>>();
+        smoothing.originalFirstFocusPoint =
+            smoothingJson.at("original_first_focus_point")
+                .get<std::array<float, 3>>();
+        smoothing.originalLastCameraPosition =
+            smoothingJson.at("original_last_camera_position")
+                .get<std::array<float, 3>>();
+        smoothing.originalLastFocusPoint =
+            smoothingJson.at("original_last_focus_point")
+                .get<std::array<float, 3>>();
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+    if (smoothing.pairId.empty() || smoothing.firstKeyId.empty() ||
+        smoothing.lastKeyId.empty()) {
+        return std::nullopt;
+    }
+    return smoothing;
+}
+
 json SerializeAnimationExportSettings(const AnimationExportSettings& settings) {
     return json{
         {"output_directory", settings.outputDirectory},
@@ -2406,6 +2464,11 @@ json SerializeAnimationPath(const AnimationPath& path) {
         pathJson["water_animation_trail_settings"] =
             SerializeWaterAnimationTrailSettings(path.waterAnimationTrailSettings.value());
     }
+    if (path.loopTransitionSmoothing.has_value()) {
+        pathJson["loop_transition_smoothing"] =
+            SerializeAnimationLoopSmoothingMetadata(
+                path.loopTransitionSmoothing.value());
+    }
     if (path.tempWaterAnimationTrailSettings.has_value()) {
         pathJson["temp_water_animation_trail_settings"] =
             SerializeWaterAnimationTrailSettings(path.tempWaterAnimationTrailSettings.value());
@@ -2447,6 +2510,10 @@ AnimationPath ParseAnimationPath(const json& pathJson) {
                 path.selectedWaterScenarioId));
     if (pathJson.contains("export_settings")) {
         path.exportSettings = ParseAnimationExportSettings(pathJson.at("export_settings"));
+    }
+    if (pathJson.contains("loop_transition_smoothing")) {
+        path.loopTransitionSmoothing = ParseAnimationLoopSmoothingMetadata(
+            pathJson.at("loop_transition_smoothing"));
     }
     if (pathJson.contains("water_animation_trail_settings")) {
         path.waterAnimationTrailSettings =
@@ -2533,6 +2600,12 @@ AnimationPath ParseAnimationPath(const json& pathJson) {
         }
     }
     EnsureAnimationPathKeyIds(&path);
+    if (path.loopTransitionSmoothing.has_value() &&
+        (path.keys.size() < 3U ||
+         path.keys.front().id != path.loopTransitionSmoothing->firstKeyId ||
+         path.keys.back().id != path.loopTransitionSmoothing->lastKeyId)) {
+        path.loopTransitionSmoothing.reset();
+    }
     return path;
 }
 
@@ -8133,6 +8206,181 @@ void LoadWaterPathSidecars(
 }
 
 }  // namespace
+
+bool CommitStagedDocumentReplacements(
+    std::span<const StagedDocumentReplacement> replacements,
+    std::string* errorMessage) {
+    struct RuntimeReplacement {
+        std::filesystem::path targetPath;
+        std::filesystem::path stagedPath;
+        std::filesystem::path rollbackPath;
+        bool hadOriginal = false;
+        bool committed = false;
+    };
+
+    if (replacements.empty()) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "No staged documents were supplied.";
+        }
+        return false;
+    }
+
+    const auto transactionSuffix =
+        ".document-bundle." +
+        std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()) +
+        ".rollback";
+    std::vector<RuntimeReplacement> runtimeReplacements;
+    runtimeReplacements.reserve(replacements.size());
+    for (const auto& replacement : replacements) {
+        if (replacement.targetPath.empty() || replacement.stagedPath.empty() ||
+            replacement.targetPath.lexically_normal() ==
+                replacement.stagedPath.lexically_normal()) {
+            if (errorMessage != nullptr) {
+                *errorMessage = "Each staged document needs distinct target and staged paths.";
+            }
+            return false;
+        }
+        const bool duplicateTarget = std::any_of(
+            runtimeReplacements.begin(),
+            runtimeReplacements.end(),
+            [&](const RuntimeReplacement& existing) {
+                return existing.targetPath.lexically_normal() ==
+                       replacement.targetPath.lexically_normal();
+            });
+        if (duplicateTarget) {
+            if (errorMessage != nullptr) {
+                *errorMessage = "A staged document bundle contains the same target more than once.";
+            }
+            return false;
+        }
+        std::error_code stagedError;
+        const bool stagedExists = std::filesystem::is_regular_file(
+            replacement.stagedPath,
+            stagedError);
+        if (stagedError || !stagedExists) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "Staged document is unavailable: " +
+                    replacement.stagedPath.string();
+                if (stagedError) {
+                    *errorMessage += ": " + stagedError.message();
+                }
+            }
+            return false;
+        }
+        runtimeReplacements.push_back({
+            .targetPath = replacement.targetPath,
+            .stagedPath = replacement.stagedPath,
+            .rollbackPath = replacement.targetPath.string() +
+                            transactionSuffix,
+        });
+    }
+
+    const auto cleanupRollbackCopies = [&]() {
+        for (const auto& replacement : runtimeReplacements) {
+            std::error_code ignored;
+            std::filesystem::remove(replacement.rollbackPath, ignored);
+        }
+    };
+    for (auto& replacement : runtimeReplacements) {
+        std::error_code existsError;
+        replacement.hadOriginal = std::filesystem::is_regular_file(
+            replacement.targetPath,
+            existsError);
+        if (existsError) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "Could not inspect " + replacement.targetPath.string() +
+                    ": " + existsError.message();
+            }
+            cleanupRollbackCopies();
+            return false;
+        }
+        if (!replacement.hadOriginal) {
+            continue;
+        }
+        std::error_code backupError;
+        std::filesystem::copy_file(
+            replacement.targetPath,
+            replacement.rollbackPath,
+            std::filesystem::copy_options::overwrite_existing,
+            backupError);
+        if (backupError) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "Could not prepare rollback copy for " +
+                    replacement.targetPath.string() + ": " +
+                    backupError.message();
+            }
+            cleanupRollbackCopies();
+            return false;
+        }
+    }
+
+    for (auto& replacement : runtimeReplacements) {
+        std::error_code commitError;
+        std::filesystem::rename(
+            replacement.stagedPath,
+            replacement.targetPath,
+            commitError);
+        if (!commitError) {
+            replacement.committed = true;
+            continue;
+        }
+
+        bool rollbackSucceeded = true;
+        std::string rollbackFailure;
+        for (auto rollbackIt = runtimeReplacements.rbegin();
+             rollbackIt != runtimeReplacements.rend();
+             ++rollbackIt) {
+            if (!rollbackIt->committed) {
+                continue;
+            }
+            std::error_code restoreError;
+            if (rollbackIt->hadOriginal) {
+                std::filesystem::copy_file(
+                    rollbackIt->rollbackPath,
+                    rollbackIt->targetPath,
+                    std::filesystem::copy_options::overwrite_existing,
+                    restoreError);
+            } else {
+                std::filesystem::remove(
+                    rollbackIt->targetPath,
+                    restoreError);
+            }
+            if (restoreError) {
+                rollbackSucceeded = false;
+                if (rollbackFailure.empty()) {
+                    rollbackFailure = rollbackIt->targetPath.string() +
+                                      ": " + restoreError.message();
+                }
+            }
+        }
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "Could not commit staged document to " +
+                replacement.targetPath.string() + ": " +
+                commitError.message();
+            if (!rollbackSucceeded) {
+                *errorMessage +=
+                    ". Automatic rollback also failed for " +
+                    rollbackFailure +
+                    "; rollback copies were retained beside their targets.";
+            }
+        }
+        if (rollbackSucceeded) {
+            cleanupRollbackCopies();
+        }
+        return false;
+    }
+
+    cleanupRollbackCopies();
+    if (errorMessage != nullptr) {
+        errorMessage->clear();
+    }
+    return true;
+}
 
 void MigrateAbsoluteTimingColourisePalettePhaseKeys(
     nlohmann::json* timingTakeSceneStateJson) {

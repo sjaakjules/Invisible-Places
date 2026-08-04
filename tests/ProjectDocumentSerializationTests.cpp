@@ -1,5 +1,6 @@
 #include "InvisiblePlacesBuildConfig.hpp"
 #include "serialization/ProjectDocument.hpp"
+#include "serialization/ProjectDocumentJson.hpp"
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -2913,4 +2914,113 @@ TEST_CASE("Project preserves independent Flow and Mesh Flow edited trail shadows
         Catch::Approx(0.8F));
   CHECK(loaded->waterDynamicMeshFlowSettings.trailProfileName ==
         "Default_edited");
+}
+
+TEST_CASE("Animation loop smoothing metadata round-trips in schema 15",
+          "[animation][serialization][loop]") {
+  using invisible_places::camera::AnimationLoopSmoothingMetadata;
+  using invisible_places::camera::AnimationPath;
+  using invisible_places::serialization::AnimationPathFromJson;
+  using invisible_places::serialization::AnimationPathToJson;
+  using invisible_places::serialization::kAnimationDocumentSchemaVersion;
+
+  AnimationPath path;
+  path.name = "Loop A";
+  path.keys = {
+      {.id = "first", .cameraPosition = {1.0F, 2.0F, 3.0F},
+       .focusPoint = {4.0F, 5.0F, 6.0F}},
+      {.id = "middle", .cameraPosition = {2.0F, 3.0F, 4.0F},
+       .focusPoint = {5.0F, 6.0F, 7.0F}},
+      {.id = "last", .cameraPosition = {3.0F, 4.0F, 5.0F},
+       .focusPoint = {6.0F, 7.0F, 8.0F}},
+  };
+  path.loopTransitionSmoothing = AnimationLoopSmoothingMetadata{
+      .pairId = "pair-123",
+      .partnerFileName = "Loop_B.ipanim.json",
+      .sequenceIndex = 1U,
+      .maxEndMoveFraction = 0.12F,
+      .firstKeyId = "first",
+      .lastKeyId = "last",
+      .originalFirstCameraPosition = {0.9F, 2.0F, 3.0F},
+      .originalFirstFocusPoint = {4.0F, 4.9F, 6.0F},
+      .originalLastCameraPosition = {3.1F, 4.0F, 5.0F},
+      .originalLastFocusPoint = {6.0F, 7.1F, 8.0F},
+  };
+
+  const auto json = AnimationPathToJson(path);
+  CHECK(json.at("schema_version") == kAnimationDocumentSchemaVersion);
+  REQUIRE(json.contains("loop_transition_smoothing"));
+  CHECK(json.at("loop_transition_smoothing").at("pair_id") == "pair-123");
+
+  std::string error;
+  const auto loaded = AnimationPathFromJson(json, &error);
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->loopTransitionSmoothing.has_value());
+  CHECK(loaded->loopTransitionSmoothing->partnerFileName ==
+        "Loop_B.ipanim.json");
+  CHECK(loaded->loopTransitionSmoothing->sequenceIndex == 1U);
+  CHECK(loaded->loopTransitionSmoothing->maxEndMoveFraction ==
+        Catch::Approx(0.12F));
+  CHECK(loaded->loopTransitionSmoothing->originalFirstCameraPosition[0] ==
+        Catch::Approx(0.9F));
+
+  auto legacyJson = json;
+  legacyJson["schema_version"] = 14U;
+  legacyJson.erase("loop_transition_smoothing");
+  const auto legacy = AnimationPathFromJson(legacyJson, &error);
+  REQUIRE(legacy.has_value());
+  CHECK_FALSE(legacy->loopTransitionSmoothing.has_value());
+
+  auto mismatchedEndpointJson = json;
+  mismatchedEndpointJson["loop_transition_smoothing"]["first_key_id"] =
+      "missing-key";
+  const auto mismatchedEndpoint =
+      AnimationPathFromJson(mismatchedEndpointJson, &error);
+  REQUIRE(mismatchedEndpoint.has_value());
+  CHECK_FALSE(mismatchedEndpoint->loopTransitionSmoothing.has_value());
+}
+
+TEST_CASE("Staged document bundle restores earlier files after a later commit failure",
+          "[serialization][transaction]") {
+  using invisible_places::serialization::CommitStagedDocumentReplacements;
+  using invisible_places::serialization::StagedDocumentReplacement;
+
+  TemporaryProjectDirectory temporary{
+      "invisible_places_document_bundle_rollback"};
+  const auto firstTarget = temporary.path / "first.json";
+  const auto firstStaged = temporary.path / "first.pending";
+  const auto secondStaged = temporary.path / "second.pending";
+  const auto secondTarget =
+      temporary.path / "missing-parent" / "second.json";
+  const auto writeText = [](const std::filesystem::path &path,
+                            const std::string &text) {
+    std::ofstream output{path, std::ios::trunc};
+    REQUIRE(output.is_open());
+    output << text;
+    output.close();
+    REQUIRE_FALSE(output.fail());
+  };
+  writeText(firstTarget, "original-first");
+  writeText(firstStaged, "updated-first");
+  writeText(secondStaged, "updated-second");
+
+  const std::array replacements{
+      StagedDocumentReplacement{firstTarget, firstStaged},
+      StagedDocumentReplacement{secondTarget, secondStaged},
+  };
+  std::string error;
+  CHECK_FALSE(CommitStagedDocumentReplacements(replacements, &error));
+  CHECK_FALSE(error.empty());
+  CHECK_FALSE(std::filesystem::exists(secondTarget));
+
+  std::ifstream restoredInput{firstTarget};
+  REQUIRE(restoredInput.is_open());
+  std::string restoredText;
+  std::getline(restoredInput, restoredText);
+  CHECK(restoredText == "original-first");
+  for (const auto &entry :
+       std::filesystem::directory_iterator{temporary.path}) {
+    CHECK(entry.path().filename().string().find(".document-bundle.") ==
+          std::string::npos);
+  }
 }

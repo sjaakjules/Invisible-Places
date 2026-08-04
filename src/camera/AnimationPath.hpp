@@ -45,6 +45,19 @@ struct AnimationExportSettings {
     std::uint32_t endFrame = 0;
 };
 
+struct AnimationLoopSmoothingMetadata {
+    std::string pairId;
+    std::string partnerFileName;
+    std::uint32_t sequenceIndex = 0U;
+    float maxEndMoveFraction = 0.10F;
+    std::string firstKeyId;
+    std::string lastKeyId;
+    std::array<float, 3> originalFirstCameraPosition{0.0F, 0.0F, 0.0F};
+    std::array<float, 3> originalFirstFocusPoint{0.0F, 0.0F, 0.0F};
+    std::array<float, 3> originalLastCameraPosition{0.0F, 0.0F, 0.0F};
+    std::array<float, 3> originalLastFocusPoint{0.0F, 0.0F, 0.0F};
+};
+
 struct AnimationPath {
     std::string name = "Animation";
     std::uint32_t durationFrames = 180;
@@ -54,6 +67,10 @@ struct AnimationPath {
     float apertureFStops = 8.0F;
     float depthOfFieldMaxBlurPixels = 24.0F;
     AnimationExportSettings exportSettings{};
+    // Present only while reversible loop-end smoothing is applied. The
+    // visible endpoint keys contain the adjusted poses; these originals are
+    // used to evaluate the unchanged middle spline and to unapply exactly.
+    std::optional<AnimationLoopSmoothingMetadata> loopTransitionSmoothing;
     std::string selectedTimingTakeId =
         std::string{invisible_places::timing::kAuthoredTimingTakeId};
     // Retained for legacy animation round-trip. Runtime timing resolves
@@ -107,6 +124,11 @@ struct PreparedAnimationPathEvaluationContext {
     AnimationPreparedScalarSpline focusDistance;
     AnimationPreparedScalarSpline apertureFStopsSpline;
     std::vector<std::array<float, 4>> orientationQuaternions;
+    bool hasLoopEndpointCorrections = false;
+    std::array<float, 3> firstCameraCorrection{0.0F, 0.0F, 0.0F};
+    std::array<float, 3> firstFocusCorrection{0.0F, 0.0F, 0.0F};
+    std::array<float, 3> lastCameraCorrection{0.0F, 0.0F, 0.0F};
+    std::array<float, 3> lastFocusCorrection{0.0F, 0.0F, 0.0F};
 };
 
 enum class AnimationPathMotionTarget {
@@ -127,6 +149,29 @@ struct AnimationPathMotionStats {
 struct AnimationPerceivedFlowSample {
     float normalizedPosition = 0.0F;
     float screenSpeed = 0.0F;
+    // Signed image-plane movement in screen heights per second. X is screen
+    // right and Y is screen up; its length equals screenSpeed when a stable
+    // direction can be resolved.
+    std::array<float, 2> screenVelocity{0.0F, 0.0F};
+};
+
+struct AnimationLoopSmoothingOptions {
+    float maxEndMoveFraction = 0.10F;
+    std::string pairId;
+    std::string firstFileName;
+    std::string secondFileName;
+};
+
+struct AnimationLoopSmoothingResult {
+    bool succeeded = false;
+    bool changed = false;
+    float beforeMismatch = 0.0F;
+    float afterMismatch = 0.0F;
+    std::array<float, 2> beforeSeamMismatch{0.0F, 0.0F};
+    std::array<float, 2> afterSeamMismatch{0.0F, 0.0F};
+    float maxCameraMove = 0.0F;
+    float maxFocusMove = 0.0F;
+    std::string errorMessage;
 };
 
 AnimationPath BuildAnimationPathFromCameraShots(
@@ -174,6 +219,18 @@ AnimationPath BuildAnimationPathFromCameraShots(
 [[nodiscard]] std::vector<std::uint32_t> ComputeConstantPerceivedSpeedSegmentFrames(
     const AnimationPath& path,
     std::uint32_t samplesPerSegment = 24U);
+
+// Jointly adjusts only the first and last camera/focus keys of two paths.
+// durationFrames and every per-key durationFrames value are never written.
+// Applied paths evaluate their original natural cubic spline everywhere,
+// plus a quadratic correction confined to their first and last segments.
+[[nodiscard]] AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
+    AnimationPath* first,
+    AnimationPath* second,
+    const AnimationLoopSmoothingOptions& options = {});
+[[nodiscard]] bool UnapplyAnimationLoopSmoothing(
+    AnimationPath* path,
+    std::string* errorMessage = nullptr);
 
 AnimationPathEvaluation EvaluateAnimationPath(
     const AnimationPath& path,

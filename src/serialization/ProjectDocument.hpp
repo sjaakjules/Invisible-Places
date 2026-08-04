@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -23,7 +24,7 @@ namespace invisible_places::serialization {
 inline constexpr std::size_t kMaxSerializedWaterRippleRuntimeCacheMemberships = 250'000U;
 inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 64U;
 inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 21U;
-inline constexpr std::uint32_t kAnimationDocumentSchemaVersion = 14U;
+inline constexpr std::uint32_t kAnimationDocumentSchemaVersion = 15U;
 inline constexpr std::uint32_t kWaterPathCacheSidecarSchemaVersion = 1U;
 inline constexpr std::uint64_t kMaximumPersistedWaterCacheBytes = 5ULL * 1024ULL * 1024ULL * 1024ULL;
 
@@ -332,6 +333,18 @@ struct WaterSourcesDocument {
     std::optional<invisible_places::water::WaterPathCache> pathCache;
     std::vector<WaterRippleRuntimeCacheDocument> rippleRuntimeCaches;
 };
+
+struct StagedDocumentReplacement {
+    std::filesystem::path targetPath;
+    std::filesystem::path stagedPath;
+};
+
+// Replaces every target only after all staged files are present and rollback
+// copies are ready. If a later replacement fails, earlier targets are
+// restored before this returns false.
+bool CommitStagedDocumentReplacements(
+    std::span<const StagedDocumentReplacement> replacements,
+    std::string* errorMessage);
 
 bool SaveProjectDocument(
     const ProjectDocument& document,
