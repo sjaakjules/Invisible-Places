@@ -480,7 +480,10 @@ glm::vec3 SafeCentripetalWaterMix(
     float t) {
     const float denominator = tb - ta;
     return std::abs(denominator) > 1.0e-6F
-        ? glm::mix(a, b, std::clamp((t - ta) / denominator, 0.0F, 1.0F))
+        // Barry-Goldman requires A1/A3 to extrapolate while t is on the
+        // P1-P2 knot interval. A saturated weight reduces the curve to the
+        // straight control polygon and disagrees with the CPU trail builder.
+        ? glm::mix(a, b, (t - ta) / denominator)
         : a;
 }
 

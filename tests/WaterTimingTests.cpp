@@ -1,3 +1,4 @@
+#include "InvisiblePlacesBuildConfig.hpp"
 #include "serialization/ProjectDocument.hpp"
 #include "timing/TimelineView.hpp"
 #include "water/WaterFlow.hpp"
@@ -8,6 +9,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <string>
 #include <utility>
@@ -1476,4 +1478,80 @@ TEST_CASE("Timing runs evaluate Monotone Spline and Catmull-Rom within clamped l
             CHECK(value <= 1.0F);
         }
     }
+}
+
+TEST_CASE("Water trail Catmull-Rom implementations retain required knot extrapolation",
+          "[water][flow][spline][shader]") {
+    const auto sourceRoot =
+        std::filesystem::path{INVISIBLE_PLACES_DEFAULT_DATA_DIR}.parent_path();
+    const auto readSource = [](const std::filesystem::path& path) {
+        std::ifstream input{path};
+        REQUIRE(input.good());
+        return std::string{
+            std::istreambuf_iterator<char>{input},
+            std::istreambuf_iterator<char>{}};
+    };
+
+    const std::vector<std::filesystem::path> shaderPaths{
+        sourceRoot / "shaders" / "water_flow_gpu_common.glsl",
+        sourceRoot / "shaders" / "pointcloud_preview.vert",
+        sourceRoot / "shaders" / "pointcloud_fast_basic.vert",
+        sourceRoot / "shaders" / "pointcloud_surfel.vert",
+    };
+    for (const auto& shaderPath : shaderPaths) {
+        const auto source = readSource(shaderPath);
+        CAPTURE(shaderPath);
+        CHECK(source.find("mix(a, b, (t - ta) / denominator)") !=
+              std::string::npos);
+        CHECK(source.find(
+                  "mix(a, b, clamp((t - ta) / denominator") ==
+              std::string::npos);
+    }
+
+    const auto offlineSource =
+        readSource(sourceRoot / "src" / "output" / "OfflinePointRenderer.cpp");
+    CHECK(offlineSource.find("glm::mix(a, b, (t - ta) / denominator)") !=
+          std::string::npos);
+    CHECK(offlineSource.find(
+              "glm::mix(a, b, std::clamp((t - ta) / denominator") ==
+          std::string::npos);
+}
+
+TEST_CASE("Manual Flow lane handle drags preserve explicit width modes",
+          "[water][flow][manual-path][lane-width][handles]") {
+    using invisible_places::water::ApplyWaterManualFlowPathLaneWidthHandleDrag;
+    using invisible_places::water::WaterManualFlowPathLaneWidth;
+    using invisible_places::water::WaterManualFlowPathLaneWidthMode;
+
+    const auto absolute = ApplyWaterManualFlowPathLaneWidthHandleDrag(
+        {.mode = WaterManualFlowPathLaneWidthMode::Absolute, .value = 0.20F},
+        0.35F,
+        0.50F);
+    CHECK(absolute.mode == WaterManualFlowPathLaneWidthMode::Absolute);
+    CHECK(absolute.value == Approx(0.35F));
+
+    const auto relative = ApplyWaterManualFlowPathLaneWidthHandleDrag(
+        {.mode = WaterManualFlowPathLaneWidthMode::Relative, .value = 2.30F},
+        0.35F,
+        0.50F);
+    CHECK(relative.mode == WaterManualFlowPathLaneWidthMode::Relative);
+    CHECK(relative.value == Approx(0.70F));
+
+    const auto standard = ApplyWaterManualFlowPathLaneWidthHandleDrag(
+        WaterManualFlowPathLaneWidth{},
+        0.35F,
+        0.50F);
+    CHECK(standard.mode == WaterManualFlowPathLaneWidthMode::Relative);
+    CHECK(standard.value == Approx(0.70F));
+
+    const auto zeroBasisRelative =
+        ApplyWaterManualFlowPathLaneWidthHandleDrag(
+            {.mode = WaterManualFlowPathLaneWidthMode::Relative,
+             .value = 2.30F},
+            0.35F,
+            0.0F);
+    CHECK(
+        zeroBasisRelative.mode ==
+        WaterManualFlowPathLaneWidthMode::Relative);
+    CHECK(zeroBasisRelative.value == Approx(2.30F));
 }

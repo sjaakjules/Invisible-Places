@@ -17071,6 +17071,56 @@ float ResolveWaterManualFlowPathLaneWidth(
     }
 }
 
+WaterManualFlowPathLaneWidth ApplyWaterManualFlowPathLaneWidthHandleDrag(
+    const WaterManualFlowPathLaneWidth& laneWidth,
+    float resolvedWidthMeters,
+    float globalLaneSpanMeters) {
+    const float resolvedWidth = std::clamp(
+        std::isfinite(resolvedWidthMeters) ? resolvedWidthMeters : 0.0F,
+        0.0F,
+        100.0F);
+    const float globalLaneSpan = std::clamp(
+        std::isfinite(globalLaneSpanMeters) ? globalLaneSpanMeters : 0.0F,
+        0.0F,
+        100.0F);
+    WaterManualFlowPathLaneWidth updated = laneWidth;
+    switch (laneWidth.mode) {
+        case WaterManualFlowPathLaneWidthMode::Absolute:
+            updated.value = resolvedWidth;
+            break;
+        case WaterManualFlowPathLaneWidthMode::Relative:
+            // A multiplier cannot express a visible width while its global
+            // basis is zero. Preserve both its mode and last useful value so
+            // it becomes meaningful again when the global width is restored.
+            updated.value = globalLaneSpan > 1.0e-5F
+                                ? std::clamp(
+                                      resolvedWidth / globalLaneSpan,
+                                      0.0F,
+                                      100.0F)
+                                : std::clamp(
+                                      std::isfinite(laneWidth.value)
+                                          ? laneWidth.value
+                                          : 1.0F,
+                                      0.0F,
+                                      100.0F);
+            break;
+        case WaterManualFlowPathLaneWidthMode::Inherit:
+        default:
+            if (globalLaneSpan > 1.0e-5F) {
+                updated.mode = WaterManualFlowPathLaneWidthMode::Relative;
+                updated.value = std::clamp(
+                    resolvedWidth / globalLaneSpan,
+                    0.0F,
+                    100.0F);
+            } else {
+                updated.mode = WaterManualFlowPathLaneWidthMode::Absolute;
+                updated.value = resolvedWidth;
+            }
+            break;
+    }
+    return updated;
+}
+
 WaterOverlay BuildManualFlowPathAnchors(
     const WaterManualFlowPathSource& source,
     float sampleSpacingMeters,

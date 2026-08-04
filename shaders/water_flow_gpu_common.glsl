@@ -435,7 +435,10 @@ FlowSurfaceQuery FlowQuerySurface(
 
 vec3 FlowSafeSegmentMix(vec3 a, vec3 b, float ta, float tb, float t) {
     const float denominator = tb - ta;
-    return abs(denominator) > 1e-6 ? mix(a, b, clamp((t - ta) / denominator, 0.0, 1.0)) : a;
+    // The recursive Barry-Goldman construction deliberately extrapolates A1
+    // and A3 while t lies on the P1-P2 knot interval. Clamping this weight
+    // collapses every Catmull-Rom span onto the straight P1-P2 chord.
+    return abs(denominator) > 1e-6 ? mix(a, b, (t - ta) / denominator) : a;
 }
 
 vec3 FlowCentripetalCatmullRom(vec3 p0, vec3 p1, vec3 p2, vec3 p3, float u) {

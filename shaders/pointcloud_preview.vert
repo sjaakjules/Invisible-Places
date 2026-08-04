@@ -507,7 +507,9 @@ vec3 CatmullRomWater(vec3 p0, vec3 p1, vec3 p2, vec3 p3, float t) {
 vec3 SafeCentripetalWaterMix(vec3 a, vec3 b, float ta, float tb, float t) {
     const float denominator = tb - ta;
     return abs(denominator) > 1e-6
-        ? mix(a, b, clamp((t - ta) / denominator, 0.0, 1.0))
+        // A1 and A3 must extrapolate on the P1-P2 knot interval. Clamping
+        // here degenerates the spline into its piecewise-linear control hull.
+        ? mix(a, b, (t - ta) / denominator)
         : a;
 }
 

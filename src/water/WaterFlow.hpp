@@ -2580,6 +2580,15 @@ void EnsureWaterPathAnalysis(WaterPathCache* cache);
 [[nodiscard]] float ResolveWaterManualFlowPathLaneWidth(
     const WaterManualFlowPathLaneWidth& laneWidth,
     float globalLaneSpanMeters);
+// Applies a viewport cross-bar drag without changing an existing override's
+// mode. A Standard node becomes Relative on its first customization; when the
+// global width is zero, Absolute is the only representation of a non-zero
+// customized width.
+[[nodiscard]] WaterManualFlowPathLaneWidth
+ApplyWaterManualFlowPathLaneWidthHandleDrag(
+    const WaterManualFlowPathLaneWidth& laneWidth,
+    float resolvedWidthMeters,
+    float globalLaneSpanMeters);
 [[nodiscard]] WaterFieldCache BuildFieldCacheFromPathAnchors(
     const WaterOverlay& pathAnchors,
     const WaterFieldSettings& settings);
