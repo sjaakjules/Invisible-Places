@@ -8242,6 +8242,7 @@ bool SaveProjectDocument(
         {"live_visual_effects", document.liveVisualEffects},
         {"preview_performance_mode", document.previewPerformanceMode},
         {"load_all_scalar_fields", document.loadAllScalarFields},
+        {"scalar_field_budget_gb", document.scalarFieldBudgetGigabytes},
         {"side_panel_pinned", document.sidePanelPinned},
         {"orbit_control_mode", OrbitControlModeName(document.orbitControlMode)},
         {"show_lidar_tab", document.showLidarTab},
@@ -8535,6 +8536,8 @@ std::optional<ProjectDocument> LoadProjectDocument(
     document.liveVisualEffects = projectJson->value("live_visual_effects", false);
     document.previewPerformanceMode = projectJson->value("preview_performance_mode", false);
     document.loadAllScalarFields = projectJson->value("load_all_scalar_fields", false);
+    document.scalarFieldBudgetGigabytes =
+        std::max(0.0F, projectJson->value("scalar_field_budget_gb", 0.0F));
     document.sidePanelPinned = projectJson->value("side_panel_pinned", false);
     if (projectJson->contains("orbit_control_mode")) {
         document.orbitControlMode =

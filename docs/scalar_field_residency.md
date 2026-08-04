@@ -102,8 +102,30 @@ session's required fields are resident, starting the streams itself while
 it waits, so frozen exports render with exactly the field data the preview
 resolves.
 
+## Budget and eviction
+
+The residency sweep stamps each resident field with the sweep tick
+whenever the required-field set still references it. With a non-zero
+**Budget (GB)** (Debug window; persisted as `scalar_field_budget_gb`), a
+sweep whose combined CPU+GPU scalar payload exceeds the budget evicts the
+least-recently-referenced disk-backed fields — never required fields,
+never runtime-generated ones — through the same compact-and-replace path
+the water systems use, one session's batch per sweep to bound the stall.
+Evicted fields stream back on demand (from the field cache when warm) the
+moment something references them again, so toggling an effect off and on
+costs nothing while the budget has headroom, and a sub-second column read
+otherwise. Slot-keyed histogram caches for the compacted session are
+dropped because eviction renumbers surviving slots. Eviction defers, like
+field appends, while the colourise histogram worker or a Flow trail build
+holds the resident cloud.
+
+Field streams run at utility QoS on macOS so prefetch and backfill never
+compete with the render loop for performance cores. Because the required
+set already spans every Timing Take and saved visual, the sweep doubles as
+the low-priority prefetch of animation-relevant fields after startup.
+
 ## Diagnostics
 
 The Debug window's **Scalar Field Residency** section reports per-session
-resident/available field counts, the total CPU scalar payload, and the
-field currently streaming.
+resident/available field counts, the total CPU scalar payload, the budget
+control, and the field currently streaming.

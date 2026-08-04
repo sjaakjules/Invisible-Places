@@ -180,6 +180,10 @@ struct ProjectDocument {
     // (the pre-schema-65 behaviour). Off = filtered loads with on-demand
     // field streaming.
     bool loadAllScalarFields = false;
+    // Soft ceiling (in GB) for the combined CPU+GPU scalar-field payload;
+    // above it the least-recently-referenced disk-backed fields are freed.
+    // Zero disables eviction.
+    float scalarFieldBudgetGigabytes = 0.0F;
     bool sidePanelPinned = false;
     bool showLidarTab = false;
     bool showGsplatTab = false;

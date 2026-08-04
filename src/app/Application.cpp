@@ -29,8 +29,13 @@
 #include "renderer/pointcloud/PointCloudPreviewState.hpp"
 #include "scene/SceneCatalog.hpp"
 #include "scene/PointCloudVariants.hpp"
+#include "app/ScalarFieldResidencyPolicy.hpp"
 #include "app/UsedScalarFields.hpp"
 #include "io/PointCloudFieldCache.hpp"
+
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
 #include "serialization/ProjectDocument.hpp"
 #include "serialization/RenderSetupDocument.hpp"
 #include "style/RenderParameterBinding.hpp"
@@ -289,6 +294,11 @@ struct ProjectSettings {
     // materialise every on-disk scalar field exactly as before field
     // filtering existed. Takes effect on the next load of each cloud.
     bool loadAllScalarFields = false;
+    // Soft ceiling for the combined CPU+GPU scalar-field payload. When the
+    // resident total exceeds it, the residency sweep evicts the least-
+    // recently-referenced disk-backed fields (the on-demand loader streams
+    // them back if referenced again). Zero disables eviction.
+    float scalarFieldBudgetGigabytes = 0.0F;
     bool autoLowerGsplatQualityWhileNavigating = true;
     PointCloudPreviewLodMode pointCloudPreviewLodMode = PointCloudPreviewLodMode::FullResolution;
     std::uint64_t interactivePointCap = kDefaultInteractivePointCap;
@@ -1540,6 +1550,9 @@ struct PreviewLayerSession {
     // scalarFields plus the fields the load filter left on disk, which the
     // on-demand loader can stream in later.
     std::vector<invisible_places::io::AvailableScalarField> availableScalarFields;
+    // Residency sweep clock value from the last sweep whose required set
+    // contained each field; drives least-recently-referenced eviction.
+    std::unordered_map<std::string, std::uint64_t> scalarFieldLastRequiredTick;
     std::vector<invisible_places::io::Float3> pivotSamples;
     std::shared_ptr<invisible_places::io::LoadedPointCloud> offlinePointCloud;
     // Lazily computed per-field histograms for the Visuals-tab bounds
@@ -9793,6 +9806,12 @@ void StartScalarFieldLoad(
                                    fieldName,
                                    sourceIndex,
                                    expectedPointCount](std::stop_token stopToken) {
+#ifdef __APPLE__
+        // Field streams are opportunistic prefetch/backfill: run them at
+        // utility QoS so they never compete with the render loop for
+        // performance cores.
+        pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+#endif
         ScalarFieldLoadResult result;
         result.stats.name = fieldName;
         result.stats.sourceIndex = sourceIndex;
@@ -9874,12 +9893,116 @@ void StartScalarFieldLoad(
         session.displayName + " in the background...";
 }
 
-// Streams at most one missing required field at a time, checked on a small
-// frame cadence. Loads are only started while the app is otherwise idle for
-// heavy work: never during an offline export, a whole-cloud load, or the
-// shared-cache high-memory slot.
-void EnsureRequiredScalarFieldsResident(PreviewRuntimeState* runtimeState) {
-    if (runtimeState == nullptr ||
+bool RemoveGeneratedScalarFieldsFromSession(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    std::size_t sessionIndex,
+    std::span<const std::string_view> fieldNames);
+
+// Combined CPU+GPU bytes one resident field costs: the field-major CPU
+// column plus, for GPU-resident sessions, its share of the host-visible
+// scalar buffer.
+std::uint64_t SessionScalarFieldBytesPerField(const PreviewLayerSession& session) {
+    const auto pointCount =
+        session.offlinePointCloud != nullptr
+            ? session.offlinePointCloud->PointCount()
+            : 0U;
+    return static_cast<std::uint64_t>(pointCount) * sizeof(float) *
+           (session.gpuResident ? 2U : 1U);
+}
+
+// Runs the least-recently-referenced eviction pass once the resident
+// scalar payload exceeds the configured budget. One session's batch per
+// sweep: each removal compacts that session's field matrix and replaces
+// its GPU scalar buffer, so batching per session bounds the stall.
+void EvictScalarFieldsOverBudget(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    const auto budgetGigabytes =
+        runtimeState->projectSettings.scalarFieldBudgetGigabytes;
+    if (!(budgetGigabytes > 0.0F)) {
+        return;
+    }
+    const auto budgetBytes = static_cast<std::uint64_t>(
+        static_cast<double>(budgetGigabytes) * 1024.0 * 1024.0 * 1024.0);
+
+    std::vector<invisible_places::app::ScalarFieldResidencyCandidate> candidates;
+    std::uint64_t residentBytes = 0U;
+    for (std::size_t sessionIndex = 0U;
+         sessionIndex < runtimeState->sessions.size();
+         ++sessionIndex) {
+        const auto& session = runtimeState->sessions[sessionIndex];
+        if (session.kind != LayerKind::PointCloud ||
+            session.offlinePointCloud == nullptr) {
+            continue;
+        }
+        const auto bytesPerField = SessionScalarFieldBytesPerField(session);
+        const auto required =
+            CollectRequiredScalarFieldNames(*runtimeState, session);
+        for (const auto& field : session.scalarFields) {
+            residentBytes += bytesPerField;
+            std::uint64_t lastTick = 0U;
+            if (const auto tickIt =
+                    session.scalarFieldLastRequiredTick.find(field.name);
+                tickIt != session.scalarFieldLastRequiredTick.end()) {
+                lastTick = tickIt->second;
+            }
+            candidates.push_back({
+                .sessionIndex = sessionIndex,
+                .fieldName = field.name,
+                .bytes = bytesPerField,
+                .lastRequiredTick = lastTick,
+                .required = required.Contains(field.name),
+                // Only disk-backed fields can be streamed back on demand;
+                // eviction also needs the loaded/GPU path the removal
+                // helper requires.
+                .evictable = field.sourceIndex >= 0 && session.loaded,
+            });
+        }
+    }
+    const auto selected = invisible_places::app::SelectScalarFieldEvictions(
+        candidates,
+        residentBytes,
+        budgetBytes);
+    if (selected.empty()) {
+        return;
+    }
+    const auto targetSession = candidates[selected.front()].sessionIndex;
+    std::vector<std::string> names;
+    for (const auto index : selected) {
+        if (candidates[index].sessionIndex == targetSession) {
+            names.push_back(candidates[index].fieldName);
+        }
+    }
+    std::vector<std::string_view> nameViews{names.begin(), names.end()};
+    if (!RemoveGeneratedScalarFieldsFromSession(
+            runtimeState,
+            viewport,
+            targetSession,
+            nameViews)) {
+        return;
+    }
+    auto& session = runtimeState->sessions[targetSession];
+    // Removal renumbers the surviving slots, so slot-keyed histogram
+    // caches for this session are stale.
+    session.visualsFieldHistograms.clear();
+    for (const auto& name : names) {
+        session.scalarFieldLastRequiredTick.erase(name);
+    }
+    runtimeState->statusMessage =
+        "Freed " + std::to_string(names.size()) +
+        " unused scalar field" + (names.size() == 1U ? "" : "s") + " from " +
+        session.displayName + " (over the scalar-field budget).";
+}
+
+// Streams at most one missing required field at a time and applies the
+// budget eviction pass, checked on a small frame cadence. Heavy work only
+// starts while the app is otherwise idle for it: never during an offline
+// export, a whole-cloud load, or the shared-cache high-memory slot.
+void EnsureRequiredScalarFieldsResident(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || viewport == nullptr ||
         runtimeState->pendingScalarFieldLoad.has_value() ||
         runtimeState->pendingLoad.has_value() ||
         runtimeState->offlineRenderJob.active ||
@@ -9892,17 +10015,39 @@ void EnsureRequiredScalarFieldsResident(PreviewRuntimeState* runtimeState) {
          kResidencyCheckIntervalFrames) != 0U) {
         return;
     }
+    const auto sweepTick = runtimeState->scalarFieldResidencyPollCounter;
     for (std::size_t sessionIndex = 0U;
          sessionIndex < runtimeState->sessions.size();
          ++sessionIndex) {
-        const auto missing = SessionMissingRequiredScalarFieldName(
-            *runtimeState,
-            runtimeState->sessions[sessionIndex]);
+        auto& session = runtimeState->sessions[sessionIndex];
+        if (session.kind == LayerKind::PointCloud &&
+            session.offlinePointCloud != nullptr &&
+            !session.scalarFields.empty()) {
+            // Stamp every currently referenced resident field; fields that
+            // drop out of the required set age from their last stamp.
+            const auto required =
+                CollectRequiredScalarFieldNames(*runtimeState, session);
+            for (const auto& field : session.scalarFields) {
+                if (required.Contains(field.name)) {
+                    session.scalarFieldLastRequiredTick[field.name] = sweepTick;
+                }
+            }
+        }
+        const auto missing =
+            SessionMissingRequiredScalarFieldName(*runtimeState, session);
         if (missing.has_value()) {
             StartScalarFieldLoad(runtimeState, sessionIndex, missing.value());
             return;
         }
     }
+    // The histogram/flow-worker guard matches the append deferral: both
+    // mutate the field-major arrays those workers may be reading.
+    if (runtimeState->timingColouriseHistogram.worker.joinable() ||
+        runtimeState->water.flowTrailBuildJob.worker.joinable() ||
+        runtimeState->water.flowTrailBuildJob.pendingCapture) {
+        return;
+    }
+    EvictScalarFieldsOverBudget(runtimeState, viewport);
 }
 
 void BeginLayerLoad(
@@ -10135,7 +10280,7 @@ void PollPendingLayerLoad(
     // live loop, smokes, benchmarks — services field streams without extra
     // wiring. Both calls are cheap no-ops in the common case.
     PollPendingScalarFieldLoad(runtimeState, viewport);
-    EnsureRequiredScalarFieldsResident(runtimeState);
+    EnsureRequiredScalarFieldsResident(runtimeState, viewport);
     if (!runtimeState->pendingLoad.has_value()) {
         return;
     }
@@ -22291,6 +22436,8 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
     document.liveVisualEffects = runtimeState.projectSettings.liveVisualEffects;
     document.previewPerformanceMode = runtimeState.projectSettings.previewPerformanceMode;
     document.loadAllScalarFields = runtimeState.projectSettings.loadAllScalarFields;
+    document.scalarFieldBudgetGigabytes =
+        runtimeState.projectSettings.scalarFieldBudgetGigabytes;
     document.sidePanelPinned = runtimeState.sidePanel.pinned;
     document.showLidarTab = runtimeState.showLidarTab;
     document.showGsplatTab = runtimeState.showGsplatTab;
@@ -23294,6 +23441,8 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->projectSettings.liveVisualEffects = document.liveVisualEffects;
     runtimeState->projectSettings.previewPerformanceMode = document.previewPerformanceMode;
     runtimeState->projectSettings.loadAllScalarFields = document.loadAllScalarFields;
+    runtimeState->projectSettings.scalarFieldBudgetGigabytes =
+        std::max(0.0F, document.scalarFieldBudgetGigabytes);
     runtimeState->sidePanel.pinned = document.sidePanelPinned;
     runtimeState->showLidarTab = document.showLidarTab;
     runtimeState->showGsplatTab = document.showGsplatTab;
@@ -50659,6 +50808,24 @@ void DrawProjectPanel(
         ImGui::Text(
             "CPU scalar-field payload: %.2f GB",
             static_cast<double>(residentCpuBytes) / (1024.0 * 1024.0 * 1024.0));
+        float budgetGigabytes =
+            runtimeState->projectSettings.scalarFieldBudgetGigabytes;
+        if (ImGui::DragFloat(
+                "Budget (GB)",
+                &budgetGigabytes,
+                0.5F,
+                0.0F,
+                256.0F,
+                budgetGigabytes > 0.0F ? "%.1f GB" : "off")) {
+            runtimeState->projectSettings.scalarFieldBudgetGigabytes =
+                std::max(0.0F, budgetGigabytes);
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Soft ceiling for the combined CPU+GPU scalar-field payload. Above it, the"
+                " least-recently-referenced disk-backed fields are freed (they stream back on"
+                " demand if referenced again). 0 disables eviction.");
+        }
         if (runtimeState->pendingScalarFieldLoad.has_value()) {
             ImGui::TextDisabled(
                 "Streaming '%s'...",

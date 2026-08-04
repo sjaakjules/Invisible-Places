@@ -1,3 +1,4 @@
+#include "app/ScalarFieldResidencyPolicy.hpp"
 #include "app/UsedScalarFields.hpp"
 #include "io/PointCloudData.hpp"
 
@@ -283,4 +284,51 @@ TEST_CASE("Used scalar field sets aggregate bindings and Visual Features",
         invisible_places::app::AlwaysResidentScalarFieldPatterns();
     CHECK(std::find(patterns.begin(), patterns.end(), "roughness") !=
           patterns.end());
+}
+
+TEST_CASE("Scalar-field eviction frees the least recently referenced fields",
+          "[pointcloud][fields][residency]") {
+    using invisible_places::app::ScalarFieldResidencyCandidate;
+    using invisible_places::app::SelectScalarFieldEvictions;
+
+    const std::vector<ScalarFieldResidencyCandidate> candidates{
+        // index 0: required — never selected, however old.
+        {.sessionIndex = 0, .fieldName = "Height", .bytes = 100,
+         .lastRequiredTick = 1, .required = true, .evictable = true},
+        // index 1: generated — not evictable.
+        {.sessionIndex = 0, .fieldName = "water_effect_value", .bytes = 100,
+         .lastRequiredTick = 0, .required = false, .evictable = false},
+        // index 2: oldest evictable.
+        {.sessionIndex = 0, .fieldName = "A_Slope_deg", .bytes = 100,
+         .lastRequiredTick = 2, .required = false, .evictable = true},
+        // index 3: newer evictable on another session.
+        {.sessionIndex = 1, .fieldName = "Curvature", .bytes = 100,
+         .lastRequiredTick = 9, .required = false, .evictable = true},
+        // index 4: never stamped — evicts before everything stamped.
+        {.sessionIndex = 1, .fieldName = "Anisotropy", .bytes = 100,
+         .lastRequiredTick = 0, .required = false, .evictable = true},
+    };
+
+    SECTION("a zero budget disables eviction") {
+        CHECK(SelectScalarFieldEvictions(candidates, 500, 0).empty());
+    }
+    SECTION("under budget selects nothing") {
+        CHECK(SelectScalarFieldEvictions(candidates, 500, 500).empty());
+    }
+    SECTION("evicts oldest-first until the projection meets the budget") {
+        const auto selected = SelectScalarFieldEvictions(candidates, 500, 350);
+        REQUIRE(selected.size() == 2U);
+        CHECK(selected[0] == 4U);  // never stamped
+        CHECK(selected[1] == 2U);  // oldest stamped
+    }
+    SECTION("required and non-evictable fields survive any deficit") {
+        const auto selected = SelectScalarFieldEvictions(candidates, 500, 1);
+        REQUIRE(selected.size() == 3U);
+        CHECK(selected[0] == 4U);
+        CHECK(selected[1] == 2U);
+        CHECK(selected[2] == 3U);
+    }
+    SECTION("empty candidate lists are harmless") {
+        CHECK(SelectScalarFieldEvictions({}, 500, 10).empty());
+    }
 }
