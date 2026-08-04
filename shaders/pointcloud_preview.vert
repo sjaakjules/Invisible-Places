@@ -169,6 +169,11 @@ const uint kWaterTrailLanePitchFieldSlot = 27u;
 const uint kWaterTrailLaneSpanFieldSlot = 28u;
 const uint kWaterTrailLaneCrossingFieldSlot = 29u;
 const uint kWaterTrailCrossSeedFieldSlot = 30u;
+const uint kWaterTrailEndpointFadeFlagsFieldSlot = 31u;
+const uint kWaterTrailStartFadeFullDistanceFieldSlot = 32u;
+const uint kWaterTrailStartFadeRandomBeginDistanceFieldSlot = 33u;
+const uint kWaterTrailEndFadeFullDistanceFieldSlot = 34u;
+const uint kWaterTrailEndFadeRandomBeginDistanceFieldSlot = 35u;
 const float kWaterParticleSpeedScale = 0.12;
 
 float LoadScalarFieldValueForPoint(uint fieldSlot, uint pointIndex) {
@@ -499,6 +504,27 @@ vec3 CatmullRomWater(vec3 p0, vec3 p1, vec3 p2, vec3 p3, float t) {
         (-p0 + (3.0 * p1) - (3.0 * p2) + p3) * t3);
 }
 
+vec3 SafeCentripetalWaterMix(vec3 a, vec3 b, float ta, float tb, float t) {
+    const float denominator = tb - ta;
+    return abs(denominator) > 1e-6
+        ? mix(a, b, clamp((t - ta) / denominator, 0.0, 1.0))
+        : a;
+}
+
+vec3 CentripetalCatmullRomWater(vec3 p0, vec3 p1, vec3 p2, vec3 p3, float u) {
+    const float t0 = 0.0;
+    const float t1 = t0 + sqrt(max(length(p1 - p0), 1e-6));
+    const float t2 = t1 + sqrt(max(length(p2 - p1), 1e-6));
+    const float t3 = t2 + sqrt(max(length(p3 - p2), 1e-6));
+    const float t = mix(t1, t2, clamp(u, 0.0, 1.0));
+    const vec3 a1 = SafeCentripetalWaterMix(p0, p1, t0, t1, t);
+    const vec3 a2 = SafeCentripetalWaterMix(p1, p2, t1, t2, t);
+    const vec3 a3 = SafeCentripetalWaterMix(p2, p3, t2, t3, t);
+    const vec3 b1 = SafeCentripetalWaterMix(a1, a2, t0, t2, t);
+    const vec3 b2 = SafeCentripetalWaterMix(a2, a3, t1, t3, t);
+    return SafeCentripetalWaterMix(b1, b2, t1, t2, t);
+}
+
 vec3 JitteredWaterAnchorPosition(
     uint pathStart,
     uint pathCount,
@@ -610,6 +636,68 @@ float WaterTrailStreakLength(uint pointIndex) {
     return streakLength * mix(0.55, 1.0, WaterFlowActivity());
 }
 
+float WaterTrailEndpointFadeRamp(
+    float distanceFromEndpoint,
+    float fullDistance,
+    float randomBeginDistance,
+    float randomAmount) {
+    const float full = max(0.0, fullDistance);
+    if (full <= 1e-5) {
+        return 1.0;
+    }
+    const float begin = min(
+        max(0.0, randomBeginDistance) * clamp(randomAmount, 0.0, 1.0),
+        max(0.0, full - 1e-5));
+    return smoothstep(begin, full, max(0.0, distanceFromEndpoint));
+}
+
+float WaterTrailEndpointFadeVisibility(
+    uint pointIndex,
+    float phase,
+    float routeLength) {
+    if (styleData.globalControl.z <= kWaterTrailEndFadeRandomBeginDistanceFieldSlot) {
+        return 1.0;
+    }
+    const uint flags = uint(max(
+        0.0,
+        floor(LoadScalarFieldValueForPoint(
+                  kWaterTrailEndpointFadeFlagsFieldSlot,
+                  pointIndex) +
+              0.5)));
+    if (flags == 0u) {
+        return 1.0;
+    }
+    const float trailSeed = clamp(
+        LoadScalarFieldValueForPoint(kWaterTrailSeedFieldSlot, pointIndex),
+        0.0,
+        1.0);
+    const float distanceFromStart = fract(phase) * routeLength;
+    float visibility = 1.0;
+    if ((flags & 1u) != 0u) {
+        visibility *= WaterTrailEndpointFadeRamp(
+            distanceFromStart,
+            LoadScalarFieldValueForPoint(
+                kWaterTrailStartFadeFullDistanceFieldSlot,
+                pointIndex),
+            LoadScalarFieldValueForPoint(
+                kWaterTrailStartFadeRandomBeginDistanceFieldSlot,
+                pointIndex),
+            fract(trailSeed * 0.754877666 + 0.137));
+    }
+    if ((flags & 2u) != 0u) {
+        visibility *= WaterTrailEndpointFadeRamp(
+            routeLength - distanceFromStart,
+            LoadScalarFieldValueForPoint(
+                kWaterTrailEndFadeFullDistanceFieldSlot,
+                pointIndex),
+            LoadScalarFieldValueForPoint(
+                kWaterTrailEndFadeRandomBeginDistanceFieldSlot,
+                pointIndex),
+            fract(trailSeed * 0.569840291 + 0.731));
+    }
+    return visibility;
+}
+
 vec2 WaterTrailRouteSegment(uint pointIndex, float phase) {
     const uint routeStart = WaterTrailRouteStart(pointIndex);
     const uint routeCount = WaterTrailRouteCount(pointIndex);
@@ -648,7 +736,8 @@ float WaterTrailVisibility(uint pointIndex) {
                   0.0,
                   1.0)
             : 1.0;
-    return WaterTrailActivityGate() * routeEndFade * meshTerminalFade;
+    return WaterTrailActivityGate() * routeEndFade * meshTerminalFade *
+           WaterTrailEndpointFadeVisibility(pointIndex, phase, routeLength);
 }
 
 vec3 WaterTrailRoutePosition(uint pointIndex, float phase, vec3 fallbackPosition) {
@@ -661,15 +750,17 @@ vec3 WaterTrailRoutePosition(uint pointIndex, float phase, vec3 fallbackPosition
     const vec2 segment = WaterTrailRouteSegment(pointIndex, phase);
     const uint anchorOffset = min(uint(segment.x), routeCount - 2u);
     const float t = segment.y;
-    const uint p0Offset = anchorOffset > 0u ? anchorOffset - 1u : anchorOffset;
     const uint p1Offset = anchorOffset;
     const uint p2Offset = min(anchorOffset + 1u, routeCount - 1u);
-    const uint p3Offset = min(anchorOffset + 2u, routeCount - 1u);
-    const vec3 p0 = pointPositions.positions[routeStart + p0Offset].xyz;
     const vec3 p1 = pointPositions.positions[routeStart + p1Offset].xyz;
     const vec3 p2 = pointPositions.positions[routeStart + p2Offset].xyz;
-    const vec3 p3 = pointPositions.positions[routeStart + p3Offset].xyz;
-    return CatmullRomWater(p0, p1, p2, p3, t);
+    const vec3 p0 = anchorOffset > 0u
+        ? pointPositions.positions[routeStart + anchorOffset - 1u].xyz
+        : p1 + (p1 - p2);
+    const vec3 p3 = anchorOffset + 2u < routeCount
+        ? pointPositions.positions[routeStart + anchorOffset + 2u].xyz
+        : p2 + (p2 - p1);
+    return CentripetalCatmullRomWater(p0, p1, p2, p3, t);
 }
 
 vec3 WaterTrailRouteTangent(uint pointIndex, float phase) {
@@ -685,12 +776,25 @@ vec3 WaterTrailRouteTangent(uint pointIndex, float phase) {
 
     const vec2 segment = WaterTrailRouteSegment(pointIndex, phase);
     const uint anchorOffset = min(uint(segment.x), routeCount - 2u);
-    const uint prevOffset = anchorOffset;
-    const uint nextOffset = min(anchorOffset + 1u, routeCount - 1u);
-    const vec3 previous = pointPositions.positions[routeStart + prevOffset].xyz;
-    const vec3 next = pointPositions.positions[routeStart + nextOffset].xyz;
-    const vec3 tangent = next - previous;
-    return dot(tangent, tangent) > 1e-8 ? normalize(tangent) : vec3(1.0, 0.0, 0.0);
+    const float t = segment.y;
+    const vec3 p1 = pointPositions.positions[routeStart + anchorOffset].xyz;
+    const vec3 p2 = pointPositions.positions[routeStart + anchorOffset + 1u].xyz;
+    const vec3 p0 = anchorOffset > 0u
+        ? pointPositions.positions[routeStart + anchorOffset - 1u].xyz
+        : p1 + (p1 - p2);
+    const vec3 p3 = anchorOffset + 2u < routeCount
+        ? pointPositions.positions[routeStart + anchorOffset + 2u].xyz
+        : p2 + (p2 - p1);
+    const float tangentProbe = 0.01;
+    const vec3 tangent =
+        CentripetalCatmullRomWater(p0, p1, p2, p3, min(1.0, t + tangentProbe)) -
+        CentripetalCatmullRomWater(p0, p1, p2, p3, max(0.0, t - tangentProbe));
+    const vec3 fallbackTangent = p2 - p1;
+    return dot(tangent, tangent) > 1e-8
+        ? normalize(tangent)
+        : (dot(fallbackTangent, fallbackTangent) > 1e-8
+            ? normalize(fallbackTangent)
+            : vec3(1.0, 0.0, 0.0));
 }
 
 vec3 WaterTrailRouteNormal(uint pointIndex, float phase) {

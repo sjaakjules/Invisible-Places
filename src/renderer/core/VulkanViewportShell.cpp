@@ -661,12 +661,14 @@ struct alignas(16) WaterFlowSourceUniformsGpu {
     glm::vec4 guide0{0.85F, 0.35F, 0.65F, 0.85F};
     glm::vec4 trail0{0.75F, 0.010F, 0.45F, 0.045F};
     glm::vec4 shape0{0.22F, 0.85F, 0.08F, 0.0F};
+    glm::vec4 fade0{0.25F, 0.10F, 0.25F, 0.10F};
 };
 
 struct alignas(16) WaterFlowInputPointGpu {
     glm::vec4 positionDistance{0.0F, 0.0F, 0.0F, 0.0F};
     glm::vec4 normalConfidence{0.0F, 0.0F, 1.0F, 1.0F};
     glm::vec4 outgoingArcDistances{0.0F, 0.0F, 0.0F, 0.0F};
+    glm::vec4 laneWidth{0.0F, 1.0F, 0.0F, 0.0F};
 };
 
 // std430-compatible, source-local branch table. Route/trail output offsets are
@@ -679,8 +681,8 @@ struct alignas(16) WaterFlowBranchGpu {
     glm::vec4 metrics{0.0F, 0.010F, 0.0F, 0.0F};
 };
 
-static_assert(sizeof(WaterFlowSourceUniformsGpu) == 160U);
-static_assert(sizeof(WaterFlowInputPointGpu) == 48U);
+static_assert(sizeof(WaterFlowSourceUniformsGpu) == 176U);
+static_assert(sizeof(WaterFlowInputPointGpu) == 64U);
 static_assert(sizeof(WaterFlowBranchGpu) == 64U);
 
 struct alignas(16) DynamicMeshSurfaceCellGpu {
@@ -1179,7 +1181,16 @@ struct alignas(16) HighQualityGaussianPushConstants {
 struct alignas(16) PostProcessPushConstants {
     glm::vec4 edl{0.0F, 24.0F, 0.35F, 1.0F};
     glm::vec4 preview{0.0F, 0.0F, 0.0F, 0.0F};
+    glm::vec4 temporalOverlay{0.0F, 1.0F, 0.0F, 0.0F};
+    // x: stale source (1=A, 2=B, 0=off); y/z: cached projection scale;
+    // w: cached focus depth used where sparse point depth has no sample.
+    glm::vec4 temporalReprojection{0.0F, 1.0F, 1.0F, 1.0F};
+    glm::mat4 staleViewToCurrentClip{1.0F};
 };
+
+static_assert(
+    sizeof(PostProcessPushConstants) == 128U,
+    "Post-process push constants must fit Vulkan's portable 128-byte floor.");
 
 struct alignas(16) EyeDomeLightingExportPushConstants {
     glm::vec4 edl{1.0F, 24.0F, 0.35F, 1.0F};
@@ -2527,6 +2538,53 @@ void VulkanViewportShell::SetSceneCachingEnabled(bool enabled) {
     sceneCachingEnabled_ = enabled;
     if (!sceneCachingEnabled_) {
         ++sceneRevision_;
+    }
+}
+
+void VulkanViewportShell::SetTemporalCameraOverlay(
+    bool enabled,
+    std::uint32_t renderedSourceIndex,
+    float firstWeight,
+    float secondWeight,
+    const std::array<glm::mat4, 2U>* currentSourceViewProjections) {
+    if (enabled &&
+        (temporalCameraOverlayColorImages_[0U].image == VK_NULL_HANDLE ||
+         temporalCameraOverlayDepthImages_[0U].image == VK_NULL_HANDLE)) {
+        // The optional history costs four viewport-sized images. Allocate it
+        // only on first use, after every descriptor that may still reference
+        // the fallback scene images has finished.
+        Check(
+            vkDeviceWaitIdle(device_),
+            "vkDeviceWaitIdle(temporal camera overlay allocation)");
+        CreateTemporalCameraOverlayResources();
+        CreateOrUpdatePostProcessDescriptorSets();
+    }
+    const std::uint32_t sourceIndex = std::min(renderedSourceIndex, 1U);
+    const bool modeChanged = temporalCameraOverlayEnabled_ != enabled;
+    const bool sourceChanged =
+        enabled &&
+        temporalCameraOverlayRenderedSourceIndex_ != sourceIndex;
+    if (modeChanged) {
+        temporalCameraOverlayHistoryValid_ = {false, false};
+    }
+    temporalCameraOverlayEnabled_ = enabled;
+    temporalCameraOverlayRenderedSourceIndex_ = sourceIndex;
+    temporalCameraOverlayWeights_[0U] =
+        std::clamp(firstWeight, 0.0F, 1.0F);
+    temporalCameraOverlayWeights_[1U] =
+        std::clamp(secondWeight, 0.0F, 1.0F);
+    temporalCameraOverlayCurrentViewProjectionsValid_ =
+        enabled && currentSourceViewProjections != nullptr;
+    if (temporalCameraOverlayCurrentViewProjectionsValid_) {
+        temporalCameraOverlayCurrentViewProjections_ =
+            *currentSourceViewProjections;
+    }
+    if (!enabled) {
+        temporalCameraOverlayHistoryValid_ = {false, false};
+    }
+    if (modeChanged || sourceChanged) {
+        ++sceneRevision_;
+        lastSubmittedSceneImageValid_ = false;
     }
 }
 
@@ -4458,6 +4516,12 @@ WaterFlowGpuSourceUploadResult VulkanViewportShell::UploadWaterFlowGpuSource(
             sourcePoint.outgoingSegmentArcDistancesMeters[2U],
             sourcePoint.outgoingSegmentArcDistancesMeters[3U],
         };
+        point.laneWidth = glm::vec4{
+            static_cast<float>(sourcePoint.laneWidth.mode),
+            sourcePoint.laneWidth.value,
+            0.0F,
+            0.0F,
+        };
         inputPoints.push_back(point);
     }
 
@@ -4574,7 +4638,10 @@ WaterFlowGpuSourceUploadResult VulkanViewportShell::UploadWaterFlowGpuSource(
         useSurfaceGuide ? 1U : 0U,
         static_cast<std::uint32_t>(request.sourceRevision),
     };
-    uniforms.identity = glm::uvec4{request.sourceId, 0U, 0U, 0U};
+    const std::uint32_t endpointFadeFlags =
+        (request.settings.startFadeEnabled ? 1U : 0U) |
+        (request.settings.endFadeEnabled ? 2U : 0U);
+    uniforms.identity = glm::uvec4{request.sourceId, endpointFadeFlags, 0U, 0U};
     uniforms.route0 = glm::vec4{
         result.layout.routeLengthMeters,
         std::max(0.001F, request.settings.trailPointSpacingMeters),
@@ -4608,6 +4675,18 @@ WaterFlowGpuSourceUploadResult VulkanViewportShell::UploadWaterFlowGpuSource(
         std::clamp(request.settings.trailSmoothness, 0.0F, 1.0F),
         std::clamp(request.settings.trailLooseness, 0.0F, 1.0F),
         0.0F,
+    };
+    uniforms.fade0 = glm::vec4{
+        std::clamp(request.settings.startFadeFullDistanceMeters, 0.0F, 50.0F),
+        std::clamp(
+            request.settings.startFadeRandomBeginDistanceMeters,
+            0.0F,
+            50.0F),
+        std::clamp(request.settings.endFadeFullDistanceMeters, 0.0F, 50.0F),
+        std::clamp(
+            request.settings.endFadeRandomBeginDistanceMeters,
+            0.0F,
+            50.0F),
     };
 
     const bool reusedOutputCapacity =
@@ -8164,9 +8243,17 @@ void VulkanViewportShell::CreateCompositeDescriptorSetLayout() {
 }
 
 void VulkanViewportShell::CreatePostProcessDescriptorSetLayout() {
-    std::array<VkDescriptorSetLayoutBinding, 2> bindings{};
-    bindings[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
-    bindings[1] = {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    std::array<VkDescriptorSetLayoutBinding, 6> bindings{};
+    for (std::uint32_t bindingIndex = 0U;
+         bindingIndex < bindings.size();
+         ++bindingIndex) {
+        bindings[bindingIndex] = {
+            bindingIndex,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            1,
+            VK_SHADER_STAGE_FRAGMENT_BIT,
+            nullptr};
+    }
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     layoutInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
@@ -10824,6 +10911,12 @@ void VulkanViewportShell::CreateLinearDepthResources() {
     for (auto& image : linearDepthImages_) {
         DestroyImage(&image);
     }
+    for (auto& image : temporalCameraOverlayColorImages_) {
+        DestroyImage(&image);
+    }
+    for (auto& image : temporalCameraOverlayDepthImages_) {
+        DestroyImage(&image);
+    }
     linearDepthImages_.clear();
     linearDepthImages_.reserve(swapchainImages_.size());
     for (std::size_t imageIndex = 0; imageIndex < swapchainImages_.size(); ++imageIndex) {
@@ -10833,6 +10926,27 @@ void VulkanViewportShell::CreateLinearDepthResources() {
                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
             VK_IMAGE_ASPECT_COLOR_BIT));
     }
+}
+
+void VulkanViewportShell::CreateTemporalCameraOverlayResources() {
+    for (auto& image : temporalCameraOverlayColorImages_) {
+        DestroyImage(&image);
+        image = CreateAttachmentImage(
+            swapchainImageFormat_,
+            VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                VK_IMAGE_USAGE_SAMPLED_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT);
+    }
+    for (auto& image : temporalCameraOverlayDepthImages_) {
+        DestroyImage(&image);
+        image = CreateAttachmentImage(
+            linearDepthFormat_,
+            VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                VK_IMAGE_USAGE_SAMPLED_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT);
+    }
+    temporalCameraOverlayResourcesInitialized_ = false;
+    temporalCameraOverlayHistoryValid_ = {false, false};
 }
 
 void VulkanViewportShell::CreateCommandPool() {
@@ -13299,7 +13413,31 @@ void VulkanViewportShell::CreateOrUpdatePostProcessDescriptorSets() {
         linearDepthInfo.imageView = linearDepthImages_[imageIndex].view;
         linearDepthInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-        std::array<VkWriteDescriptorSet, 2> writes{};
+        std::array<VkDescriptorImageInfo, 2U> temporalColorInfos{};
+        std::array<VkDescriptorImageInfo, 2U> temporalDepthInfos{};
+        const bool temporalResourcesReady =
+            temporalCameraOverlayColorImages_[0U].view != VK_NULL_HANDLE &&
+            temporalCameraOverlayColorImages_[1U].view != VK_NULL_HANDLE &&
+            temporalCameraOverlayDepthImages_[0U].view != VK_NULL_HANDLE &&
+            temporalCameraOverlayDepthImages_[1U].view != VK_NULL_HANDLE;
+        for (std::size_t sourceIndex = 0U;
+             sourceIndex < temporalColorInfos.size();
+             ++sourceIndex) {
+            temporalColorInfos[sourceIndex].sampler = postProcessSampler_;
+            temporalColorInfos[sourceIndex].imageView = temporalResourcesReady
+                                                            ? temporalCameraOverlayColorImages_[sourceIndex].view
+                                                            : sceneColorImages_[imageIndex].view;
+            temporalColorInfos[sourceIndex].imageLayout =
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            temporalDepthInfos[sourceIndex].sampler = postProcessSampler_;
+            temporalDepthInfos[sourceIndex].imageView = temporalResourcesReady
+                                                            ? temporalCameraOverlayDepthImages_[sourceIndex].view
+                                                            : linearDepthImages_[imageIndex].view;
+            temporalDepthInfos[sourceIndex].imageLayout =
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
+
+        std::array<VkWriteDescriptorSet, 6> writes{};
         writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         writes[0].dstSet = descriptorSet;
         writes[0].dstBinding = 0;
@@ -13313,6 +13451,33 @@ void VulkanViewportShell::CreateOrUpdatePostProcessDescriptorSets() {
         writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         writes[1].descriptorCount = 1;
         writes[1].pImageInfo = &linearDepthInfo;
+
+        for (std::size_t sourceIndex = 0U;
+             sourceIndex < temporalColorInfos.size();
+             ++sourceIndex) {
+            const std::size_t colorWriteIndex = 2U + sourceIndex * 2U;
+            const std::size_t depthWriteIndex = colorWriteIndex + 1U;
+            writes[colorWriteIndex] = {
+                VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            writes[colorWriteIndex].dstSet = descriptorSet;
+            writes[colorWriteIndex].dstBinding =
+                static_cast<std::uint32_t>(colorWriteIndex);
+            writes[colorWriteIndex].descriptorType =
+                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[colorWriteIndex].descriptorCount = 1;
+            writes[colorWriteIndex].pImageInfo =
+                &temporalColorInfos[sourceIndex];
+            writes[depthWriteIndex] = {
+                VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            writes[depthWriteIndex].dstSet = descriptorSet;
+            writes[depthWriteIndex].dstBinding =
+                static_cast<std::uint32_t>(depthWriteIndex);
+            writes[depthWriteIndex].descriptorType =
+                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[depthWriteIndex].descriptorCount = 1;
+            writes[depthWriteIndex].pImageInfo =
+                &temporalDepthInfos[sourceIndex];
+        }
 
         vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
@@ -13866,6 +14031,8 @@ void VulkanViewportShell::CleanupSwapchain() {
     revealageImages_.clear();
     emissiveImages_.clear();
     linearDepthImages_.clear();
+    temporalCameraOverlayResourcesInitialized_ = false;
+    temporalCameraOverlayHistoryValid_ = {false, false};
 
     for (const auto imageView : imageViews_) {
         vkDestroyImageView(device_, imageView, nullptr);
@@ -14221,6 +14388,9 @@ void VulkanViewportShell::RecreateSwapchain() {
     CreateDepthResources();
     CreateAccumulationResources();
     CreateLinearDepthResources();
+    if (temporalCameraOverlayEnabled_) {
+        CreateTemporalCameraOverlayResources();
+    }
     CreateFramebuffers();
     CreatePresentFramebuffers();
     CreateCommandBuffers();
@@ -15809,6 +15979,181 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     Check(vkEndCommandBuffer(resources.commandBuffer), "vkEndCommandBuffer(exr)");
 }
 
+void VulkanViewportShell::RecordTemporalCameraOverlayHistory(
+    VkCommandBuffer commandBuffer,
+    std::uint32_t imageIndex,
+    bool sceneRendered) {
+    const bool resourcesReady =
+        temporalCameraOverlayColorImages_[0U].image != VK_NULL_HANDLE &&
+        temporalCameraOverlayColorImages_[1U].image != VK_NULL_HANDLE &&
+        temporalCameraOverlayDepthImages_[0U].image != VK_NULL_HANDLE &&
+        temporalCameraOverlayDepthImages_[1U].image != VK_NULL_HANDLE;
+    if (!resourcesReady) {
+        return;
+    }
+    if (!temporalCameraOverlayResourcesInitialized_) {
+        std::array<VkImageMemoryBarrier, 4U> initializeBarriers{};
+        for (std::size_t sourceIndex = 0U;
+             sourceIndex < temporalCameraOverlayColorImages_.size();
+             ++sourceIndex) {
+            auto initializeImage = [&](VkImage image,
+                                       VkImageMemoryBarrier* barrier) {
+                *barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                barrier->srcAccessMask = 0U;
+                barrier->dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                barrier->oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                barrier->newLayout =
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                barrier->srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barrier->dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barrier->image = image;
+                barrier->subresourceRange.aspectMask =
+                    VK_IMAGE_ASPECT_COLOR_BIT;
+                barrier->subresourceRange.baseMipLevel = 0U;
+                barrier->subresourceRange.levelCount = 1U;
+                barrier->subresourceRange.baseArrayLayer = 0U;
+                barrier->subresourceRange.layerCount = 1U;
+            };
+            initializeImage(
+                temporalCameraOverlayColorImages_[sourceIndex].image,
+                &initializeBarriers[sourceIndex * 2U]);
+            initializeImage(
+                temporalCameraOverlayDepthImages_[sourceIndex].image,
+                &initializeBarriers[sourceIndex * 2U + 1U]);
+        }
+        vkCmdPipelineBarrier(
+            commandBuffer,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0U,
+            0U,
+            nullptr,
+            0U,
+            nullptr,
+            static_cast<std::uint32_t>(initializeBarriers.size()),
+            initializeBarriers.data());
+        temporalCameraOverlayResourcesInitialized_ = true;
+    }
+
+    if (!temporalCameraOverlayEnabled_ || !sceneRendered ||
+        imageIndex >= sceneColorImages_.size() ||
+        imageIndex >= linearDepthImages_.size()) {
+        return;
+    }
+
+    const std::size_t sourceIndex = std::min<std::size_t>(
+        temporalCameraOverlayRenderedSourceIndex_,
+        temporalCameraOverlayColorImages_.size() - 1U);
+    std::array<VkImageMemoryBarrier, 4U> copyBarriers{};
+    const auto prepareCopy = [](VkImage image,
+                                VkImageLayout newLayout,
+                                VkAccessFlags destinationAccess,
+                                VkImageMemoryBarrier* barrier) {
+        *barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        barrier->srcAccessMask =
+            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        barrier->dstAccessMask = destinationAccess;
+        barrier->oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier->newLayout = newLayout;
+        barrier->srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier->dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier->image = image;
+        barrier->subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier->subresourceRange.baseMipLevel = 0U;
+        barrier->subresourceRange.levelCount = 1U;
+        barrier->subresourceRange.baseArrayLayer = 0U;
+        barrier->subresourceRange.layerCount = 1U;
+    };
+    prepareCopy(
+        sceneColorImages_[imageIndex].image,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_ACCESS_TRANSFER_READ_BIT,
+        &copyBarriers[0U]);
+    prepareCopy(
+        linearDepthImages_[imageIndex].image,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_ACCESS_TRANSFER_READ_BIT,
+        &copyBarriers[1U]);
+    prepareCopy(
+        temporalCameraOverlayColorImages_[sourceIndex].image,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_ACCESS_TRANSFER_WRITE_BIT,
+        &copyBarriers[2U]);
+    prepareCopy(
+        temporalCameraOverlayDepthImages_[sourceIndex].image,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_ACCESS_TRANSFER_WRITE_BIT,
+        &copyBarriers[3U]);
+    vkCmdPipelineBarrier(
+        commandBuffer,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0U,
+        0U,
+        nullptr,
+        0U,
+        nullptr,
+        static_cast<std::uint32_t>(copyBarriers.size()),
+        copyBarriers.data());
+
+    VkImageCopy copyRegion{};
+    copyRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copyRegion.srcSubresource.mipLevel = 0U;
+    copyRegion.srcSubresource.baseArrayLayer = 0U;
+    copyRegion.srcSubresource.layerCount = 1U;
+    copyRegion.dstSubresource = copyRegion.srcSubresource;
+    copyRegion.extent = {swapchainWidth_, swapchainHeight_, 1U};
+    vkCmdCopyImage(
+        commandBuffer,
+        sceneColorImages_[imageIndex].image,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        temporalCameraOverlayColorImages_[sourceIndex].image,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1U,
+        &copyRegion);
+    vkCmdCopyImage(
+        commandBuffer,
+        linearDepthImages_[imageIndex].image,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        temporalCameraOverlayDepthImages_[sourceIndex].image,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1U,
+        &copyRegion);
+
+    for (std::size_t barrierIndex = 0U;
+         barrierIndex < copyBarriers.size();
+         ++barrierIndex) {
+        auto& barrier = copyBarriers[barrierIndex];
+        const bool sourceImage = barrierIndex < 2U;
+        barrier.srcAccessMask = sourceImage
+                                    ? VK_ACCESS_TRANSFER_READ_BIT
+                                    : VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        barrier.oldLayout = sourceImage
+                                ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                                : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+    vkCmdPipelineBarrier(
+        commandBuffer,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        0U,
+        0U,
+        nullptr,
+        0U,
+        nullptr,
+        static_cast<std::uint32_t>(copyBarriers.size()),
+        copyBarriers.data());
+    temporalCameraOverlayHistoryViews_[sourceIndex] = renderState_.view;
+    temporalCameraOverlayHistoryProjections_[sourceIndex] =
+        renderState_.projection;
+    temporalCameraOverlayHistoryReferenceDepths_[sourceIndex] =
+        std::max(0.001F, renderState_.focusDistance);
+    temporalCameraOverlayHistoryValid_[sourceIndex] = true;
+}
+
 void VulkanViewportShell::RecordCommandBuffer(
     VkCommandBuffer commandBuffer,
     std::uint32_t imageIndex,
@@ -16342,6 +16687,11 @@ void VulkanViewportShell::RecordCommandBuffer(
         }
     }
 
+    RecordTemporalCameraOverlayHistory(
+        commandBuffer,
+        imageIndex,
+        drawLiveScene);
+
     const bool presentScene =
         liveSceneRenderingEnabled_ &&
         imageIndex < sceneImageRevisions_.size() &&
@@ -16388,6 +16738,47 @@ void VulkanViewportShell::RecordCommandBuffer(
             0.0F,
             0.0F,
         };
+        const std::uint32_t temporalValidityMask =
+            (temporalCameraOverlayHistoryValid_[0U] ? 1U : 0U) |
+            (temporalCameraOverlayHistoryValid_[1U] ? 2U : 0U);
+        pushConstants.temporalOverlay = glm::vec4{
+            temporalCameraOverlayEnabled_ ? 1.0F : 0.0F,
+            temporalCameraOverlayWeights_[0U],
+            temporalCameraOverlayWeights_[1U],
+            static_cast<float>(temporalValidityMask),
+        };
+        if (temporalCameraOverlayEnabled_ &&
+            temporalCameraOverlayCurrentViewProjectionsValid_) {
+            const std::size_t staleSourceIndex =
+                1U - std::min<std::size_t>(
+                         temporalCameraOverlayRenderedSourceIndex_,
+                         1U);
+            const float projectionX =
+                temporalCameraOverlayHistoryProjections_
+                    [staleSourceIndex][0U][0U];
+            const float projectionY =
+                temporalCameraOverlayHistoryProjections_
+                    [staleSourceIndex][1U][1U];
+            if (temporalCameraOverlayHistoryValid_[staleSourceIndex] &&
+                std::isfinite(projectionX) &&
+                std::isfinite(projectionY) &&
+                std::abs(projectionX) > 1.0e-6F &&
+                std::abs(projectionY) > 1.0e-6F) {
+                pushConstants.temporalReprojection = glm::vec4{
+                    static_cast<float>(staleSourceIndex + 1U),
+                    projectionX,
+                    projectionY,
+                    temporalCameraOverlayHistoryReferenceDepths_
+                        [staleSourceIndex],
+                };
+                pushConstants.staleViewToCurrentClip =
+                    temporalCameraOverlayCurrentViewProjections_
+                        [staleSourceIndex] *
+                    glm::inverse(
+                        temporalCameraOverlayHistoryViews_
+                            [staleSourceIndex]);
+            }
+        }
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, postProcessPipeline_);
         vkCmdBindDescriptorSets(
             commandBuffer,

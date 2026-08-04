@@ -1754,6 +1754,13 @@ WaterOverlayPoint BlendPathAnchor(
     point.normal = FromGlm(SafeOverlayNormal(glm::mix(ToGlm(left.normal), ToGlm(right.normal), t)));
     point.pathDistance = left.pathDistance + ((right.pathDistance - left.pathDistance) * t);
     point.width = left.width + ((right.width - left.width) * t);
+    if (left.laneSpanMeters >= 0.0F && right.laneSpanMeters >= 0.0F) {
+        point.laneSpanMeters =
+            left.laneSpanMeters + ((right.laneSpanMeters - left.laneSpanMeters) * t);
+    } else {
+        point.laneSpanMeters =
+            left.laneSpanMeters >= 0.0F ? left.laneSpanMeters : right.laneSpanMeters;
+    }
     point.confidence = left.confidence + ((right.confidence - left.confidence) * t);
     point.accumulation = left.accumulation + ((right.accumulation - left.accumulation) * t);
     point.pooling = left.pooling + ((right.pooling - left.pooling) * t);
@@ -2772,6 +2779,14 @@ WaterTrailGeometrySettings FitWaterTrailGeometryForContinuousLines(
         AutoWaterTrailPointSpacingMeters(geometry.trailLengthMeters, geometry.widthMeters);
     geometry.streakLengthMeters =
         AutoWaterTrailStreakLengthMeters(geometry.pointSpacingMeters, geometry.widthMeters);
+    geometry.startFadeFullDistanceMeters =
+        std::clamp(geometry.startFadeFullDistanceMeters, 0.0F, 50.0F);
+    geometry.startFadeRandomBeginDistanceMeters =
+        std::clamp(geometry.startFadeRandomBeginDistanceMeters, 0.0F, 50.0F);
+    geometry.endFadeFullDistanceMeters =
+        std::clamp(geometry.endFadeFullDistanceMeters, 0.0F, 50.0F);
+    geometry.endFadeRandomBeginDistanceMeters =
+        std::clamp(geometry.endFadeRandomBeginDistanceMeters, 0.0F, 50.0F);
     return geometry;
 }
 
@@ -2782,6 +2797,14 @@ WaterTrailGeometrySettings WaterTrailGeometryFromFlowTrailSettings(
     geometry.pointSpacingMeters = settings.trailPointSpacingMeters;
     geometry.widthMeters = settings.trailWidthMeters;
     geometry.streakLengthMeters = settings.trailStreakLengthMeters;
+    geometry.startFadeEnabled = settings.startFadeEnabled;
+    geometry.startFadeFullDistanceMeters = settings.startFadeFullDistanceMeters;
+    geometry.startFadeRandomBeginDistanceMeters =
+        settings.startFadeRandomBeginDistanceMeters;
+    geometry.endFadeEnabled = settings.endFadeEnabled;
+    geometry.endFadeFullDistanceMeters = settings.endFadeFullDistanceMeters;
+    geometry.endFadeRandomBeginDistanceMeters =
+        settings.endFadeRandomBeginDistanceMeters;
     return geometry;
 }
 
@@ -2792,6 +2815,14 @@ WaterFlowTrailSettings ApplyWaterTrailGeometryToFlowTrailSettings(
     settings.trailPointSpacingMeters = geometry.pointSpacingMeters;
     settings.trailWidthMeters = geometry.widthMeters;
     settings.trailStreakLengthMeters = geometry.streakLengthMeters;
+    settings.startFadeEnabled = geometry.startFadeEnabled;
+    settings.startFadeFullDistanceMeters = geometry.startFadeFullDistanceMeters;
+    settings.startFadeRandomBeginDistanceMeters =
+        geometry.startFadeRandomBeginDistanceMeters;
+    settings.endFadeEnabled = geometry.endFadeEnabled;
+    settings.endFadeFullDistanceMeters = geometry.endFadeFullDistanceMeters;
+    settings.endFadeRandomBeginDistanceMeters =
+        geometry.endFadeRandomBeginDistanceMeters;
     return settings;
 }
 
@@ -2845,12 +2876,21 @@ WaterFlowGpuCompactInput BuildWaterFlowGpuSampledInput(
 
 WaterFlowGpuCompactInput BuildWaterFlowGpuManualSplineInput(
     std::span<const invisible_places::io::Float3> controlPoints) {
+    return BuildWaterFlowGpuManualSplineInput(controlPoints, {});
+}
+
+WaterFlowGpuCompactInput BuildWaterFlowGpuManualSplineInput(
+    std::span<const invisible_places::io::Float3> controlPoints,
+    std::span<const WaterManualFlowPathLaneWidth> laneWidths) {
     constexpr float kDuplicateDistance = 1.0e-5F;
     constexpr std::uint32_t kArcLengthSubdivisions = 16U;
     constexpr std::uint32_t kSubdivisionsPerCheckpoint = 4U;
     WaterFlowGpuCompactInput input;
     input.points.reserve(controlPoints.size());
-    for (const auto& controlPoint : controlPoints) {
+    for (std::size_t controlIndex = 0U;
+         controlIndex < controlPoints.size();
+         ++controlIndex) {
+        const auto& controlPoint = controlPoints[controlIndex];
         const glm::vec3 position = ToGlm(controlPoint);
         if (!std::isfinite(position.x) || !std::isfinite(position.y) ||
             !std::isfinite(position.z)) {
@@ -2864,6 +2904,28 @@ WaterFlowGpuCompactInput BuildWaterFlowGpuManualSplineInput(
         }
         WaterFlowGpuCompactInputPoint point;
         point.position = controlPoint;
+        if (controlIndex < laneWidths.size()) {
+            point.laneWidth = laneWidths[controlIndex];
+            if (!std::isfinite(point.laneWidth.value)) {
+                point.laneWidth = {};
+            }
+            switch (point.laneWidth.mode) {
+                case WaterManualFlowPathLaneWidthMode::Inherit:
+                    point.laneWidth.value = 1.0F;
+                    break;
+                case WaterManualFlowPathLaneWidthMode::Absolute:
+                    point.laneWidth.value =
+                        std::clamp(point.laneWidth.value, 0.0F, 100.0F);
+                    break;
+                case WaterManualFlowPathLaneWidthMode::Relative:
+                    point.laneWidth.value =
+                        std::clamp(point.laneWidth.value, 0.0F, 100.0F);
+                    break;
+                default:
+                    point.laneWidth = {};
+                    break;
+            }
+        }
         input.points.push_back(point);
     }
 
@@ -3237,7 +3299,15 @@ bool WaterTrailGeometryGenerationInputsEqual(
     const WaterTrailGeometrySettings& left,
     const WaterTrailGeometrySettings& right) {
     return left.trailLengthMeters == right.trailLengthMeters &&
-           left.pointSpacingMeters == right.pointSpacingMeters;
+           left.pointSpacingMeters == right.pointSpacingMeters &&
+           left.startFadeEnabled == right.startFadeEnabled &&
+           left.startFadeFullDistanceMeters == right.startFadeFullDistanceMeters &&
+           left.startFadeRandomBeginDistanceMeters ==
+               right.startFadeRandomBeginDistanceMeters &&
+           left.endFadeEnabled == right.endFadeEnabled &&
+           left.endFadeFullDistanceMeters == right.endFadeFullDistanceMeters &&
+           left.endFadeRandomBeginDistanceMeters ==
+               right.endFadeRandomBeginDistanceMeters;
 }
 
 bool WaterTrailGeometryLiveVisualOnlyEdit(
@@ -3256,6 +3326,14 @@ bool WaterFlowLaneRouteInputsEqual(
            left.laneCount == right.laneCount &&
            left.trailLengthMeters == right.trailLengthMeters &&
            left.trailPointSpacingMeters == right.trailPointSpacingMeters &&
+           left.startFadeEnabled == right.startFadeEnabled &&
+           left.startFadeFullDistanceMeters == right.startFadeFullDistanceMeters &&
+           left.startFadeRandomBeginDistanceMeters ==
+               right.startFadeRandomBeginDistanceMeters &&
+           left.endFadeEnabled == right.endFadeEnabled &&
+           left.endFadeFullDistanceMeters == right.endFadeFullDistanceMeters &&
+           left.endFadeRandomBeginDistanceMeters ==
+               right.endFadeRandomBeginDistanceMeters &&
            left.surfaceOffsetMeters == right.surfaceOffsetMeters &&
            left.pathAttraction == right.pathAttraction &&
            left.laneSpreadMeters == right.laneSpreadMeters &&
@@ -15596,15 +15674,6 @@ std::vector<WaterOverlayPoint> BuildSurfaceGuidedFlowPath(
         return options.stopToken != nullptr && options.stopToken->stop_requested();
     };
     const float resolution = std::clamp(cache->resolutionMeters, 0.001F, 1.0F);
-    const float laneHalfWidth = std::max(0.0F, laneSpanMeters) * 0.5F;
-    // Authored nodes are surface-snapped, so only query the immediately local
-    // sheet. Keeping this independent of a very wide lane cover prevents a
-    // large cubic neighbourhood scan in the CPU reference implementation.
-    const float localLaneSupport = std::min(laneHalfWidth, resolution * 2.0F);
-    const float searchRadius = std::clamp(
-        std::max(resolution * 2.5F, localLaneSupport),
-        resolution,
-        std::max(resolution, 0.10F));
     const float spacing = std::max(0.001F, sampleSpacingMeters);
     const std::uint32_t pointCount = std::max<std::uint32_t>(
         2U,
@@ -15623,7 +15692,21 @@ std::vector<WaterOverlayPoint> BuildSurfaceGuidedFlowPath(
             authoredPath.lengthMeters,
             static_cast<float>(index) * spacing);
         auto anchor = InterpolatePreparedPathByArcLength(authoredPath, distance);
-        anchor.width = 1.0F;
+        const float authoredLaneSpan =
+            anchor.laneSpanMeters >= 0.0F
+                ? std::max(0.0F, anchor.laneSpanMeters)
+                : std::max(0.0F, laneSpanMeters);
+        const float localLaneHalfWidth = authoredLaneSpan * 0.5F;
+        // Authored nodes are surface-snapped, so only query the immediately
+        // local sheet. The node's resolved cover controls this corridor while
+        // the cap prevents a wide lane from causing a cubic neighbourhood
+        // scan in the CPU reference implementation.
+        const float localLaneSupport =
+            std::min(localLaneHalfWidth, resolution * 2.0F);
+        const float searchRadius = std::clamp(
+            std::max(resolution * 2.5F, localLaneSupport),
+            resolution,
+            std::max(resolution, 0.10F));
         const glm::vec3 authoredPosition = ToGlm(anchor.position);
         const glm::vec3 authoredNormal = SafeOverlayNormal(ToGlm(anchor.normal));
         const glm::vec3 referenceNormal =
@@ -15662,16 +15745,17 @@ std::vector<WaterOverlayPoint> BuildSurfaceGuidedFlowPath(
         displacement -= authoredTangent * glm::dot(displacement, authoredTangent);
         glm::vec3 projectedGravity = kGravity - surfaceNormal * glm::dot(kGravity, surfaceNormal);
         projectedGravity -= authoredTangent * glm::dot(projectedGravity, authoredTangent);
-        if (laneHalfWidth > 1.0e-6F && glm::dot(projectedGravity, projectedGravity) > kNormalEpsilon) {
-            displacement += glm::normalize(projectedGravity) * laneHalfWidth * 0.5F *
+        if (localLaneHalfWidth > 1.0e-6F &&
+            glm::dot(projectedGravity, projectedGravity) > kNormalEpsilon) {
+            displacement += glm::normalize(projectedGravity) * localLaneHalfWidth * 0.5F *
                             std::clamp(downhillPull, 0.0F, 1.0F);
         }
-        if (laneHalfWidth <= 1.0e-6F) {
+        if (localLaneHalfWidth <= 1.0e-6F) {
             displacement = {0.0F, 0.0F, 0.0F};
         } else {
             const float displacementLength = glm::length(displacement);
-            if (displacementLength > laneHalfWidth) {
-                displacement *= laneHalfWidth / displacementLength;
+            if (displacementLength > localLaneHalfWidth) {
+                displacement *= localLaneHalfWidth / displacementLength;
             }
         }
 
@@ -15706,6 +15790,7 @@ std::vector<WaterOverlayPoint> BuildSurfaceGuidedFlowPath(
         const float widthInfluence =
             std::clamp(terrainWidthResponse, 0.0F, 1.0F) * follow;
         anchor.width = 1.0F + (terrainSpanScale - 1.0F) * widthInfluence;
+        anchor.laneSpanMeters = authoredLaneSpan * anchor.width;
         guided.push_back(anchor);
     }
 
@@ -15719,6 +15804,12 @@ WaterTrailOverlay BuildTrailOverlayFromPaths(
     float pointSpacingMeters,
     float trailWidthMeters,
     float trailStreakLengthMeters,
+    bool startFadeEnabled,
+    float startFadeFullDistanceMeters,
+    float startFadeRandomBeginDistanceMeters,
+    bool endFadeEnabled,
+    float endFadeFullDistanceMeters,
+    float endFadeRandomBeginDistanceMeters,
     float surfaceOffsetMeters,
     float laneSpreadMeters,
     std::uint32_t requestedLaneCount,
@@ -15745,6 +15836,32 @@ WaterTrailOverlay BuildTrailOverlayFromPaths(
     };
 
     const float safeTrailWidth = std::max(0.0005F, trailWidthMeters);
+    const float endpointFadeFlags =
+        (startFadeEnabled ? 1.0F : 0.0F) + (endFadeEnabled ? 2.0F : 0.0F);
+    const float safeStartFadeFullDistance = std::clamp(
+        std::isfinite(startFadeFullDistanceMeters)
+            ? startFadeFullDistanceMeters
+            : 0.25F,
+        0.0F,
+        50.0F);
+    const float safeStartFadeRandomBeginDistance = std::clamp(
+        std::isfinite(startFadeRandomBeginDistanceMeters)
+            ? startFadeRandomBeginDistanceMeters
+            : 0.10F,
+        0.0F,
+        50.0F);
+    const float safeEndFadeFullDistance = std::clamp(
+        std::isfinite(endFadeFullDistanceMeters)
+            ? endFadeFullDistanceMeters
+            : 0.25F,
+        0.0F,
+        50.0F);
+    const float safeEndFadeRandomBeginDistance = std::clamp(
+        std::isfinite(endFadeRandomBeginDistanceMeters)
+            ? endFadeRandomBeginDistanceMeters
+            : 0.10F,
+        0.0F,
+        50.0F);
     const float laneSpan = std::max(0.0F, laneSpreadMeters);
     const float lanePitch = std::max(safeTrailWidth * 0.5F, 0.00025F);
     const float safeSurfaceFollow =
@@ -15903,12 +16020,16 @@ WaterTrailOverlay BuildTrailOverlayFromPaths(
             }
             tangent = glm::normalize(tangent);
             const auto localAnalysis = SampleLaneAnalysis(analysisBranch, routeDistance);
+            const float authoredLocalSpan =
+                anchor.laneSpanMeters >= 0.0F
+                    ? std::max(0.0F, anchor.laneSpanMeters)
+                    : laneSpan;
             float localSpan =
-                LaneAnalysisSpan(localAnalysis, laneSpan, safeTrailWidth, analysisGuideInfluence);
-            if (!surfaceGuidedPath.empty()) {
-                localSpan = std::min(localSpan, laneSpan) *
-                            std::clamp(anchor.width, 0.45F, 1.0F);
-            }
+                LaneAnalysisSpan(
+                    localAnalysis,
+                    authoredLocalSpan,
+                    safeTrailWidth,
+                    analysisGuideInfluence);
             const float localPitch = LaneAnalysisPitch(localAnalysis, lanePitch, localSpan, potentialLaneCount);
             const float localSpeed = std::max(
                 0.01F,
@@ -15950,6 +16071,13 @@ WaterTrailOverlay BuildTrailOverlayFromPaths(
             routeSample.trailLaneSpan = localSpan;
             routeSample.trailLaneCrossing = laneCrossingAmount;
             routeSample.trailCrossSeed = RegionHash01(seed + branchId, routeIndex, 7029U);
+            routeSample.endpointFadeFlags = endpointFadeFlags;
+            routeSample.startFadeFullDistanceMeters = safeStartFadeFullDistance;
+            routeSample.startFadeRandomBeginDistanceMeters =
+                safeStartFadeRandomBeginDistance;
+            routeSample.endFadeFullDistanceMeters = safeEndFadeFullDistance;
+            routeSample.endFadeRandomBeginDistanceMeters =
+                safeEndFadeRandomBeginDistance;
             IncludeTrailSample(&overlay, routeSample);
         }
 
@@ -16014,12 +16142,16 @@ WaterTrailOverlay BuildTrailOverlayFromPaths(
                 }
                 const float pointAge = safeLength > 1.0e-5F ? localDistance / safeLength : 0.0F;
                 const auto localAnalysis = SampleLaneAnalysis(analysisBranch, pathDistance);
+                const float authoredLocalSpan =
+                    anchor.laneSpanMeters >= 0.0F
+                        ? std::max(0.0F, anchor.laneSpanMeters)
+                        : laneSpan;
                 float localSpan =
-                    LaneAnalysisSpan(localAnalysis, laneSpan, safeTrailWidth, analysisGuideInfluence);
-                if (!surfaceGuidedPath.empty()) {
-                    localSpan = std::min(localSpan, laneSpan) *
-                                std::clamp(anchor.width, 0.45F, 1.0F);
-                }
+                    LaneAnalysisSpan(
+                        localAnalysis,
+                        authoredLocalSpan,
+                        safeTrailWidth,
+                        analysisGuideInfluence);
                 const float localPitch = LaneAnalysisPitch(localAnalysis, lanePitch, localSpan, potentialLaneCount);
                 const float localTurbulence =
                     localAnalysis.available
@@ -16042,12 +16174,14 @@ WaterTrailOverlay BuildTrailOverlayFromPaths(
                     0.12F,
                     1.0F);
                 const float smoothness = std::clamp(trailSmoothness, 0.0F, 1.0F);
+                const float authoredLaneOffset =
+                    laneSpan > 1.0e-6F
+                        ? laneOffset * (localSpan / laneSpan)
+                        : (baseLaneUnit + laneJitterUnit) * localSpan;
                 const float dynamicBaseOffset =
                     localAnalysis.available
                         ? (baseLaneUnit + laneJitterUnit) * localSpan * (1.0F - attraction * 0.18F)
-                        : (!surfaceGuidedPath.empty()
-                               ? (baseLaneUnit + laneJitterUnit) * localSpan
-                               : laneOffset);
+                        : authoredLaneOffset;
                 const float turbulenceDrive =
                     std::sqrt(std::max(0.0F, localTurbulence)) +
                     localAnalysis.ripplePotential * 0.65F * analysisGuideInfluence;
@@ -16091,7 +16225,11 @@ WaterTrailOverlay BuildTrailOverlayFromPaths(
                         : localSpan * 0.5F;
                 const float lateralOffset =
                     std::clamp(
-                        dynamicBaseOffset * endpointFade + wobble + curl + crossing,
+                        // Keep the authored lane cover at both endpoints.
+                        // Endpoint easing is reserved for the non-authored
+                        // wobble/curl terms above, so trails start and finish
+                        // across the lane instead of converging to a point.
+                        dynamicBaseOffset + wobble + curl + crossing,
                         -lateralLimit,
                         lateralLimit);
                 position += lateral * lateralOffset;
@@ -16151,6 +16289,13 @@ WaterTrailOverlay BuildTrailOverlayFromPaths(
                 sample.trailLaneSpan = localSpan;
                 sample.trailLaneCrossing = laneCrossingAmount;
                 sample.trailCrossSeed = trailCrossSeed;
+                sample.endpointFadeFlags = endpointFadeFlags;
+                sample.startFadeFullDistanceMeters = safeStartFadeFullDistance;
+                sample.startFadeRandomBeginDistanceMeters =
+                    safeStartFadeRandomBeginDistance;
+                sample.endFadeFullDistanceMeters = safeEndFadeFullDistance;
+                sample.endFadeRandomBeginDistanceMeters =
+                    safeEndFadeRandomBeginDistance;
                 IncludeTrailSample(&overlay, sample);
             }
         }
@@ -16221,8 +16366,20 @@ WaterFlowGpuCompactSourceInput BuildWaterFlowGpuManualSplineSourceInput(
     std::span<const invisible_places::io::Float3> controlPoints,
     std::uint32_t branchId,
     std::uint32_t pathId) {
+    return BuildWaterFlowGpuManualSplineSourceInput(
+        controlPoints,
+        {},
+        branchId,
+        pathId);
+}
+
+WaterFlowGpuCompactSourceInput BuildWaterFlowGpuManualSplineSourceInput(
+    std::span<const invisible_places::io::Float3> controlPoints,
+    std::span<const WaterManualFlowPathLaneWidth> laneWidths,
+    std::uint32_t branchId,
+    std::uint32_t pathId) {
     WaterFlowGpuCompactSourceInput source;
-    auto compact = BuildWaterFlowGpuManualSplineInput(controlPoints);
+    auto compact = BuildWaterFlowGpuManualSplineInput(controlPoints, laneWidths);
     if (!compact.Valid() || compact.points.size() > std::numeric_limits<std::uint32_t>::max()) {
         return source;
     }
@@ -16892,20 +17049,56 @@ std::string WaterFieldSettingsFingerprint(const WaterFieldSettings& settings) {
     return stream.str();
 }
 
+float ResolveWaterManualFlowPathLaneWidth(
+    const WaterManualFlowPathLaneWidth& laneWidth,
+    float globalLaneSpanMeters) {
+    const float global = std::clamp(
+        std::isfinite(globalLaneSpanMeters) ? globalLaneSpanMeters : 0.12F,
+        0.0F,
+        100.0F);
+    const float value = std::clamp(
+        std::isfinite(laneWidth.value) ? laneWidth.value : 1.0F,
+        0.0F,
+        100.0F);
+    switch (laneWidth.mode) {
+        case WaterManualFlowPathLaneWidthMode::Absolute:
+            return value;
+        case WaterManualFlowPathLaneWidthMode::Relative:
+            return global * value;
+        case WaterManualFlowPathLaneWidthMode::Inherit:
+        default:
+            return global;
+    }
+}
+
 WaterOverlay BuildManualFlowPathAnchors(
     const WaterManualFlowPathSource& source,
-    float sampleSpacingMeters) {
+    float sampleSpacingMeters,
+    float globalLaneSpanMeters) {
     constexpr float kDuplicateDistance = 1.0e-5F;
     constexpr std::size_t kMaxSampleCount = 32768U;
     std::vector<glm::vec3> controls;
+    std::vector<float> controlLaneSpans;
     controls.reserve(source.controlPoints.size());
-    for (const auto& controlPoint : source.controlPoints) {
+    controlLaneSpans.reserve(source.controlPoints.size());
+    for (std::size_t controlIndex = 0U;
+         controlIndex < source.controlPoints.size();
+         ++controlIndex) {
+        const auto& controlPoint = source.controlPoints[controlIndex];
         const glm::vec3 point = ToGlm(controlPoint);
         if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) {
             continue;
         }
         if (controls.empty() || glm::length(point - controls.back()) > kDuplicateDistance) {
             controls.push_back(point);
+            const WaterManualFlowPathLaneWidth laneWidth =
+                controlIndex < source.controlPointLaneWidths.size()
+                    ? source.controlPointLaneWidths[controlIndex]
+                    : WaterManualFlowPathLaneWidth{};
+            controlLaneSpans.push_back(
+                ResolveWaterManualFlowPathLaneWidth(
+                    laneWidth,
+                    globalLaneSpanMeters));
         }
     }
     if (controls.size() < 2U) {
@@ -16917,8 +17110,11 @@ WaterOverlay BuildManualFlowPathAnchors(
         0.001F,
         25.0F);
     std::vector<glm::vec3> positions;
+    std::vector<float> laneSpans;
     positions.reserve(std::min<std::size_t>(kMaxSampleCount, controls.size() * 16U));
+    laneSpans.reserve(std::min<std::size_t>(kMaxSampleCount, controls.size() * 16U));
     positions.push_back(controls.front());
+    laneSpans.push_back(controlLaneSpans.front());
     for (std::size_t segmentIndex = 0U;
          segmentIndex + 1U < controls.size() && positions.size() < kMaxSampleCount;
          ++segmentIndex) {
@@ -16944,6 +17140,15 @@ WaterOverlay BuildManualFlowPathAnchors(
                                            : glm::mix(p1, p2, t);
             if (glm::length(position - positions.back()) > kDuplicateDistance) {
                 positions.push_back(position);
+                // Width is an exact node attribute with a bounded C1 blend.
+                // Smoothstep prevents the negative/overshooting widths a
+                // scalar Catmull interpolation could create while matching
+                // the route's control-node boundaries without a visible kink.
+                const float eased = t * t * (3.0F - 2.0F * t);
+                laneSpans.push_back(std::lerp(
+                    controlLaneSpans[segmentIndex],
+                    controlLaneSpans[segmentIndex + 1U],
+                    eased));
             }
         }
     }
@@ -17000,6 +17205,10 @@ WaterOverlay BuildManualFlowPathAnchors(
         anchor.phase = std::fmod((distance * 0.37F) + (static_cast<float>(source.id) * 0.173F), 1.0F);
         anchor.speed = 1.0F;
         anchor.width = 1.0F;
+        anchor.laneSpanMeters =
+            index < laneSpans.size()
+                ? laneSpans[index]
+                : std::clamp(globalLaneSpanMeters, 0.0F, 100.0F);
         anchor.confidence = 1.0F;
         anchor.accumulation = 0.0F;
         anchor.pooling = 0.0F;
@@ -17030,6 +17239,12 @@ WaterTrailOverlay BuildAnimatedWaterTrailOverlay(
         settings.trailPointSpacingMeters,
         settings.trailWidthMeters,
         settings.trailStreakLengthMeters,
+        settings.startFadeEnabled,
+        settings.startFadeFullDistanceMeters,
+        settings.startFadeRandomBeginDistanceMeters,
+        settings.endFadeEnabled,
+        settings.endFadeFullDistanceMeters,
+        settings.endFadeRandomBeginDistanceMeters,
         settings.surfaceOffsetMeters,
         settings.laneSpreadMeters,
         settings.laneCount,
@@ -17096,6 +17311,12 @@ WaterTrailOverlay BuildFlowTrailOverlayFromPathAnchors(
         settings.trailPointSpacingMeters,
         settings.trailWidthMeters,
         settings.trailStreakLengthMeters,
+        settings.startFadeEnabled,
+        settings.startFadeFullDistanceMeters,
+        settings.startFadeRandomBeginDistanceMeters,
+        settings.endFadeEnabled,
+        settings.endFadeFullDistanceMeters,
+        settings.endFadeRandomBeginDistanceMeters,
         settings.surfaceOffsetMeters,
         settings.laneSpreadMeters,
         settings.laneCount,
@@ -19433,6 +19654,11 @@ invisible_places::io::LoadedPointCloud BuildWaterTrailOverlayPointCloud(
         {"trail_lane_span", [](const WaterTrailSample& sample) { return sample.trailLaneSpan; }},
         {"trail_lane_crossing", [](const WaterTrailSample& sample) { return sample.trailLaneCrossing; }},
         {"trail_cross_seed", [](const WaterTrailSample& sample) { return sample.trailCrossSeed; }},
+        {"endpoint_fade_flags", [](const WaterTrailSample& sample) { return sample.endpointFadeFlags; }},
+        {"start_fade_full_distance", [](const WaterTrailSample& sample) { return sample.startFadeFullDistanceMeters; }},
+        {"start_fade_random_begin_distance", [](const WaterTrailSample& sample) { return sample.startFadeRandomBeginDistanceMeters; }},
+        {"end_fade_full_distance", [](const WaterTrailSample& sample) { return sample.endFadeFullDistanceMeters; }},
+        {"end_fade_random_begin_distance", [](const WaterTrailSample& sample) { return sample.endFadeRandomBeginDistanceMeters; }},
     };
 
     cloud.scalarFields.reserve(std::size(fields));
@@ -19459,7 +19685,8 @@ invisible_places::io::LoadedPointCloud BuildWaterTrailOverlayPointCloud(
 }
 
 std::vector<invisible_places::io::ScalarFieldStats> WaterTrailOverlayScalarFieldsForPointCount(
-    std::uint64_t pointCount) {
+    std::uint64_t pointCount,
+    bool includeEndpointFadeFields) {
     constexpr std::string_view names[] = {
         "trail_role",
         "trail_id",
@@ -19492,11 +19719,19 @@ std::vector<invisible_places::io::ScalarFieldStats> WaterTrailOverlayScalarField
         "trail_lane_span",
         "trail_lane_crossing",
         "trail_cross_seed",
+        "endpoint_fade_flags",
+        "start_fade_full_distance",
+        "start_fade_random_begin_distance",
+        "end_fade_full_distance",
+        "end_fade_random_begin_distance",
     };
 
     std::vector<invisible_places::io::ScalarFieldStats> fields;
-    fields.reserve(std::size(names));
-    for (const auto name : names) {
+    const std::size_t fieldCount = includeEndpointFadeFields
+                                       ? std::size(names)
+                                       : 31U;
+    fields.reserve(fieldCount);
+    for (const auto name : std::span{names, fieldCount}) {
         invisible_places::io::ScalarFieldStats stats;
         stats.name = std::string{name};
         stats.minimum = 0.0F;
@@ -19509,8 +19744,15 @@ std::vector<invisible_places::io::ScalarFieldStats> WaterTrailOverlayScalarField
             name == "path_id" ||
             name == "branch_id") {
             stats.maximum = static_cast<float>(std::max<std::uint64_t>(1U, pointCount));
-        } else if (name == "trail_distance" || name == "trail_length" || name == "route_length") {
+        } else if (name == "trail_distance" || name == "trail_length" ||
+                   name == "route_length" ||
+                   name == "start_fade_full_distance" ||
+                   name == "start_fade_random_begin_distance" ||
+                   name == "end_fade_full_distance" ||
+                   name == "end_fade_random_begin_distance") {
             stats.maximum = 100.0F;
+        } else if (name == "endpoint_fade_flags") {
+            stats.maximum = 3.0F;
         } else if (name == "tangent_x" || name == "tangent_y" || name == "tangent_z" ||
                    name == "trail_lateral_offset") {
             stats.minimum = -1.0F;

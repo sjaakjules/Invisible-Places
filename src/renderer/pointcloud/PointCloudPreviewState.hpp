@@ -170,7 +170,7 @@ struct PointCloudHeightFoamShorelineSettings {
 // Bands intentionally shares this control bank because it is an alternate
 // motion model for the same foam look. Keeping the bank separate from Height
 // Foam lets named Shoreline profiles preserve both control families while
-// changing only the water settings on an existing point visual.
+// changing only the settings of a Water-owned Shoreline profile or effect.
 struct PointCloudFoamFrontsShorelineSettings {
     float boundaryZ = 1.55F;
     float heightReachMeters = 0.45F;
@@ -204,25 +204,38 @@ struct PointCloudShorelineWaveSettings {
 };
 
 struct PointCloudShorelineWaveProfile {
-    std::string name = "Default";
+    std::string name;
     PointCloudShorelineWaveSettings settings{};
+    // Object edits are ordinary project-owned Water profiles, but retain
+    // explicit ownership metadata so an object's next edit overwrites its
+    // one derived <base>_<object name> copy instead of creating a chain of
+    // point-visual-style `_edited` profiles.
+    bool objectOverride = false;
+    std::uint32_t shorelineInstanceId = 0U;
+    std::string baseProfileName;
 };
 
-// An additional shoreline rendered on SAND clouds alongside the primary
-// style shoreline: a second bay, pool line, or terrace at its own boundary
-// height. Instances are project water state rather than part of a point
-// visual, and each is keyable per instance through the water feature timing
-// runs (level plus the visual response scalars).
+// One shoreline effect in the project-owned Water list. `profileName` is the
+// currently applied saved profile; `baseProfileName` remains the named source
+// when `profileName` is this object's derived override. Settings are retained
+// as the resolved snapshot used by rendering and legacy recovery, never as
+// part of a saved point visual.
 struct PointCloudShorelineInstance {
     std::uint32_t id = 0U;
     std::string name = "Shoreline";
     bool enabled = true;
+    std::string profileName;
+    std::string baseProfileName;
     PointCloudShorelineWaveSettings settings{};
 };
 
-// Shader-side uniform capacity for additional shoreline instances; the UI
-// blocks adding more and the packer drops any beyond the cap.
+// The renderer retains one legacy primary uniform bank plus four additive
+// banks. Water authoring treats all five identically in one ordered list; the
+// first resolved effect is packed through the primary bank only as an
+// internal transport detail.
 inline constexpr std::size_t kMaxAdditionalShorelineInstances = 4U;
+inline constexpr std::size_t kMaxShorelineInstances =
+    kMaxAdditionalShorelineInstances + 1U;
 
 struct PointCloudDensityCompensation {
     float footprintScale = 1.0F;

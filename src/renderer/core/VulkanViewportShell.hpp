@@ -620,6 +620,16 @@ class VulkanViewportShell {
     }
     void SetSceneCachingEnabled(bool enabled);
     [[nodiscard]] bool SceneCachingEnabled() const { return sceneCachingEnabled_; }
+    // Linked-animation preview can alternate one camera source per display
+    // frame. The renderer caches the newest A/B scene colour and depth, then
+    // composites both histories while still issuing only one scene pass.
+    void SetTemporalCameraOverlay(
+        bool enabled,
+        std::uint32_t renderedSourceIndex = 0U,
+        float firstWeight = 1.0F,
+        float secondWeight = 0.0F,
+        const std::array<glm::mat4, 2U>* currentSourceViewProjections =
+            nullptr);
 
   private:
     static constexpr std::size_t kFramesInFlight = 2U;
@@ -1132,6 +1142,7 @@ class VulkanViewportShell {
     void CreateAccumulationResources();
     void CreateSceneColorResources();
     void CreateLinearDepthResources();
+    void CreateTemporalCameraOverlayResources();
     void CreateCommandPool();
     void CreateCommandBuffers();
     void CreateSyncObjects();
@@ -1239,6 +1250,10 @@ class VulkanViewportShell {
     void CleanupExrExportResources();
     void RecreateSwapchain();
     void RecordCommandBuffer(VkCommandBuffer commandBuffer, std::uint32_t imageIndex, std::size_t frameIndex);
+    void RecordTemporalCameraOverlayHistory(
+        VkCommandBuffer commandBuffer,
+        std::uint32_t imageIndex,
+        bool sceneRendered);
     void RecordExrExportCommandBuffer(const PointCloudExrFrameRequest& request);
     [[nodiscard]] invisible_places::output::HalfRgbaExrImage
     ReadCompletedExrExportFrame(PointCloudExrReadbackMask readbackMask, std::uint32_t width, std::uint32_t height);
@@ -1427,6 +1442,8 @@ class VulkanViewportShell {
     std::vector<ImageAllocation> revealageImages_;
     std::vector<ImageAllocation> emissiveImages_;
     std::vector<ImageAllocation> linearDepthImages_;
+    std::array<ImageAllocation, 2U> temporalCameraOverlayColorImages_{};
+    std::array<ImageAllocation, 2U> temporalCameraOverlayDepthImages_{};
     std::vector<ActivePointCloudResources> pointCloudResources_;
     std::vector<ActiveGaussianSplatResources> gaussianSplatResources_;
     HighQualityGaussianSceneResources highQualityGaussianScene_{};
@@ -1451,6 +1468,24 @@ class VulkanViewportShell {
     bool liveRainSimulationEnabled_ = true;
     bool liveSceneReadbackCaptureEnabled_ = false;
     bool sceneCachingEnabled_ = false;
+    bool temporalCameraOverlayEnabled_ = false;
+    bool temporalCameraOverlayResourcesInitialized_ = false;
+    std::uint32_t temporalCameraOverlayRenderedSourceIndex_ = 0U;
+    std::array<float, 2U> temporalCameraOverlayWeights_{1.0F, 0.0F};
+    std::array<bool, 2U> temporalCameraOverlayHistoryValid_{false, false};
+    std::array<glm::mat4, 2U> temporalCameraOverlayHistoryViews_{
+        glm::mat4{1.0F},
+        glm::mat4{1.0F}};
+    std::array<glm::mat4, 2U> temporalCameraOverlayHistoryProjections_{
+        glm::mat4{1.0F},
+        glm::mat4{1.0F}};
+    std::array<float, 2U> temporalCameraOverlayHistoryReferenceDepths_{
+        1.0F,
+        1.0F};
+    std::array<glm::mat4, 2U> temporalCameraOverlayCurrentViewProjections_{
+        glm::mat4{1.0F},
+        glm::mat4{1.0F}};
+    bool temporalCameraOverlayCurrentViewProjectionsValid_ = false;
     std::uint32_t pointCloudMutationBatchDepth_ = 0U;
     std::uint32_t pointCloudMutationBatchWaitCount_ = 0U;
     std::uint32_t lastPointCloudMutationBatchWaitCount_ = 0U;

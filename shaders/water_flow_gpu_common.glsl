@@ -32,13 +32,19 @@ const uint kLanePitchFieldSlot = 27u;
 const uint kLaneSpanFieldSlot = 28u;
 const uint kLaneCrossingFieldSlot = 29u;
 const uint kCrossSeedFieldSlot = 30u;
-const uint kWaterTrailScalarFieldCount = 31u;
+const uint kEndpointFadeFlagsFieldSlot = 31u;
+const uint kStartFadeFullDistanceFieldSlot = 32u;
+const uint kStartFadeRandomBeginDistanceFieldSlot = 33u;
+const uint kEndFadeFullDistanceFieldSlot = 34u;
+const uint kEndFadeRandomBeginDistanceFieldSlot = 35u;
+const uint kWaterTrailScalarFieldCount = 36u;
 const int kEmptyCoordinate = -2147483648;
 
 struct WaterFlowInputPoint {
     vec4 positionDistance;
     vec4 normalConfidence;
     vec4 outgoingArcDistances;
+    vec4 laneWidth; // mode, value, reserved, reserved
 };
 
 struct WaterFlowBranch {
@@ -60,12 +66,13 @@ layout(set = 0, binding = 0, std140) uniform WaterFlowSourceUniforms {
     uvec4 counts1;  // trails, samples/trail, active points, point capacity
     uvec4 surface0; // table mask, max probe, valid, source id
     uvec4 metadata; // seed, input kind, use surface guide, source revision low
-    uvec4 identity; // source id, reserved
+    uvec4 identity; // source id, endpoint fade flags, reserved
     vec4 route0;    // aggregate route length, nominal spacing, surface resolution, surface offset
     vec4 lane0;     // lane span, trail width, turbulence, turbulence scale
     vec4 guide0;    // surface follow, downhill pull, terrain width response, path attraction
     vec4 trail0;    // trail length, point spacing, speed, streak length
     vec4 shape0;    // lane crossing, smoothness, looseness, reserved
+    vec4 fade0;     // start full, start random begin, end full, end random begin
 } flow;
 
 layout(set = 0, binding = 1, std430) readonly buffer WaterFlowInputPoints {
@@ -477,7 +484,8 @@ void FlowEvaluateAuthored(
     WaterFlowBranch branch,
     out vec3 position,
     out vec3 normal,
-    out float confidence) {
+    out float confidence,
+    out float laneSpanMeters) {
     const uint start = branch.inputRoute.x;
     const uint count = branch.inputRoute.y;
     const float routeLength = max(branch.metrics.x, 0.0);
@@ -511,6 +519,21 @@ void FlowEvaluateAuthored(
         mix(a.normalConfidence.xyz, b.normalConfidence.xyz, local),
         vec3(0.0, 0.0, 1.0));
     confidence = clamp(mix(a.normalConfidence.w, b.normalConfidence.w, local), 0.0, 1.0);
+    const float globalLaneSpan = max(0.0, flow.lane0.x);
+    const float aLaneSpan = a.laneWidth.x > 1.5
+        ? globalLaneSpan * max(0.0, a.laneWidth.y)
+        : (a.laneWidth.x > 0.5
+               ? max(0.0, a.laneWidth.y)
+               : globalLaneSpan);
+    const float bLaneSpan = b.laneWidth.x > 1.5
+        ? globalLaneSpan * max(0.0, b.laneWidth.y)
+        : (b.laneWidth.x > 0.5
+               ? max(0.0, b.laneWidth.y)
+               : globalLaneSpan);
+    // Exact at every authored node, C1 across node boundaries, and bounded
+    // between its two widths (unlike an unconstrained scalar Catmull curve).
+    const float widthAmount = smoothstep(0.0, 1.0, local);
+    laneSpanMeters = mix(aLaneSpan, bLaneSpan, widthAmount);
 }
 
 float FlowEndpointFade(float distanceMeters, float routeLengthMeters, float routeSpacingMeters) {

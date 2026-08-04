@@ -12,6 +12,25 @@ float FlowRouteField(uint slot, uint routeStart, uint lowerSample, uint upperSam
         amount);
 }
 
+vec3 FlowRoutePosition(
+    uint routeStart,
+    uint routePointCount,
+    uint lowerSample,
+    uint upperSample,
+    float amount) {
+    const vec3 p1 = flowPositions.positions[routeStart + lowerSample].xyz;
+    const vec3 p2 = flowPositions.positions[routeStart + upperSample].xyz;
+    // Reflected phantom endpoints keep the first and last derivative aligned
+    // with the authored route instead of flattening the spline at either end.
+    const vec3 p0 = lowerSample > 0u
+        ? flowPositions.positions[routeStart + lowerSample - 1u].xyz
+        : p1 + (p1 - p2);
+    const vec3 p3 = upperSample + 1u < routePointCount
+        ? flowPositions.positions[routeStart + upperSample + 1u].xyz
+        : p2 + (p2 - p1);
+    return FlowCentripetalCatmullRom(p0, p1, p2, p3, amount);
+}
+
 float FlowTrailEndpointFade(
     float distanceMeters,
     float routeLengthMeters) {
@@ -85,12 +104,14 @@ void main() {
         const float routeCoordinate = routeLength > 1e-5
             ? pathDistance / routeLength * float(routePointCount - 1u)
             : 0.0;
-        const uint lowerSample = min(uint(floor(routeCoordinate)), routePointCount - 1u);
-        const uint upperSample = min(lowerSample + 1u, routePointCount - 1u);
+        const uint lowerSample = min(uint(floor(routeCoordinate)), routePointCount - 2u);
+        const uint upperSample = lowerSample + 1u;
         const float routeAmount = clamp(routeCoordinate - float(lowerSample), 0.0, 1.0);
-        vec3 position = mix(
-            flowPositions.positions[routeStart + lowerSample].xyz,
-            flowPositions.positions[routeStart + upperSample].xyz,
+        vec3 position = FlowRoutePosition(
+            routeStart,
+            routePointCount,
+            lowerSample,
+            upperSample,
             routeAmount);
         const vec3 normal = FlowSafeNormalize(
             mix(
@@ -98,7 +119,20 @@ void main() {
                 flowNormals.normals[routeStart + upperSample].xyz,
                 routeAmount),
             vec3(0.0, 0.0, 1.0));
+        const float tangentProbe = 0.01;
         const vec3 tangent = FlowSafeNormalize(
+            FlowRoutePosition(
+                routeStart,
+                routePointCount,
+                lowerSample,
+                upperSample,
+                min(1.0, routeAmount + tangentProbe)) -
+            FlowRoutePosition(
+                routeStart,
+                routePointCount,
+                lowerSample,
+                upperSample,
+                max(0.0, routeAmount - tangentProbe)),
             vec3(
                 FlowRouteField(
                     kTangentXFieldSlot,
@@ -117,8 +151,7 @@ void main() {
                     routeStart,
                     lowerSample,
                     upperSample,
-                    routeAmount)),
-            vec3(1.0, 0.0, 0.0));
+                    routeAmount)));
         const vec3 lateral = FlowSafeNormalize(
             cross(normal, tangent),
             FlowSafeNormalize(cross(vec3(0.0, 0.0, 1.0), tangent), vec3(1.0, 0.0, 0.0)));
@@ -217,5 +250,10 @@ void main() {
         FlowStoreField(kLaneSpanFieldSlot, outputIndex, laneSpan);
         FlowStoreField(kLaneCrossingFieldSlot, outputIndex, crossing);
         FlowStoreField(kCrossSeedFieldSlot, outputIndex, crossSeed);
+        FlowStoreField(kEndpointFadeFlagsFieldSlot, outputIndex, float(flow.identity.y));
+        FlowStoreField(kStartFadeFullDistanceFieldSlot, outputIndex, flow.fade0.x);
+        FlowStoreField(kStartFadeRandomBeginDistanceFieldSlot, outputIndex, flow.fade0.y);
+        FlowStoreField(kEndFadeFullDistanceFieldSlot, outputIndex, flow.fade0.z);
+        FlowStoreField(kEndFadeRandomBeginDistanceFieldSlot, outputIndex, flow.fade0.w);
     }
 }

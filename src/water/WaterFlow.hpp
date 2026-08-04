@@ -1088,6 +1088,12 @@ struct WaterFlowTrailSettings {
     float trailPointSpacingMeters = 0.010F;
     float trailWidthMeters = 0.006F;
     float trailStreakLengthMeters = 0.045F;
+    bool startFadeEnabled = false;
+    float startFadeFullDistanceMeters = 0.25F;
+    float startFadeRandomBeginDistanceMeters = 0.10F;
+    bool endFadeEnabled = false;
+    float endFadeFullDistanceMeters = 0.25F;
+    float endFadeRandomBeginDistanceMeters = 0.10F;
     float surfaceOffsetMeters = 0.004F;
     float pathAttraction = 0.85F;
     float laneSpreadMeters = 0.12F;
@@ -1112,11 +1118,26 @@ struct WaterFlowTrailBuildOptions {
 
 // Keep this value in lock-step with WaterTrailSample serialization and every
 // GPU Flow writer. Scalar storage is field-major: field * pointCapacity + point.
-inline constexpr std::uint32_t kWaterTrailScalarFieldCount = 31U;
+inline constexpr std::uint32_t kWaterTrailScalarFieldCount = 36U;
 
 enum class WaterFlowGpuInputKind : std::uint32_t {
     SampledAnchors = 0U,
     ManualCatmullRomControlPoints = 1U,
+};
+
+// Per-node lane-cover control for authored Flow paths. Inherit follows the
+// selected Lane profile, Absolute stores metres independently of that
+// profile, and Relative multiplies it (0.2 = 20%, 2.3 = 230%).
+enum class WaterManualFlowPathLaneWidthMode : std::uint32_t {
+    Inherit = 0U,
+    Absolute = 1U,
+    Relative = 2U,
+};
+
+struct WaterManualFlowPathLaneWidth {
+    WaterManualFlowPathLaneWidthMode mode =
+        WaterManualFlowPathLaneWidthMode::Inherit;
+    float value = 1.0F;
 };
 
 struct WaterOverlayPoint;
@@ -1132,6 +1153,7 @@ struct WaterFlowGpuCompactInputPoint {
     float confidence = 1.0F;
     float cumulativeDistanceMeters = 0.0F;
     std::array<float, 4> outgoingSegmentArcDistancesMeters{};
+    WaterManualFlowPathLaneWidth laneWidth{};
 };
 
 struct WaterFlowGpuCompactInput {
@@ -1166,6 +1188,9 @@ struct WaterFlowGpuCompactSourceInput {
     std::span<const WaterOverlayPoint> anchors);
 [[nodiscard]] WaterFlowGpuCompactInput BuildWaterFlowGpuManualSplineInput(
     std::span<const invisible_places::io::Float3> controlPoints);
+[[nodiscard]] WaterFlowGpuCompactInput BuildWaterFlowGpuManualSplineInput(
+    std::span<const invisible_places::io::Float3> controlPoints,
+    std::span<const WaterManualFlowPathLaneWidth> laneWidths);
 
 // Generated point sources can contain several consecutive path branches. This
 // contract flattens them without joining branch endpoints and carries the same
@@ -1176,6 +1201,11 @@ struct WaterFlowGpuCompactSourceInput {
     const WaterPathAnalysisCache* analysis = nullptr);
 [[nodiscard]] WaterFlowGpuCompactSourceInput BuildWaterFlowGpuManualSplineSourceInput(
     std::span<const invisible_places::io::Float3> controlPoints,
+    std::uint32_t branchId = 0U,
+    std::uint32_t pathId = 1U);
+[[nodiscard]] WaterFlowGpuCompactSourceInput BuildWaterFlowGpuManualSplineSourceInput(
+    std::span<const invisible_places::io::Float3> controlPoints,
+    std::span<const WaterManualFlowPathLaneWidth> laneWidths,
     std::uint32_t branchId = 0U,
     std::uint32_t pathId = 1U);
 
@@ -1277,6 +1307,12 @@ struct WaterTrailGeometrySettings {
     float pointSpacingMeters = 0.010F;
     float widthMeters = 0.006F;
     float streakLengthMeters = 0.045F;
+    bool startFadeEnabled = false;
+    float startFadeFullDistanceMeters = 0.25F;
+    float startFadeRandomBeginDistanceMeters = 0.10F;
+    bool endFadeEnabled = false;
+    float endFadeFullDistanceMeters = 0.25F;
+    float endFadeRandomBeginDistanceMeters = 0.10F;
 };
 
 [[nodiscard]] WaterTrailGeometrySettings DefaultWaterTrailGeometrySettings();
@@ -1979,6 +2015,11 @@ struct WaterTrailSample {
     float trailLaneSpan = 0.0F;
     float trailLaneCrossing = 0.22F;
     float trailCrossSeed = 0.0F;
+    float endpointFadeFlags = 0.0F;
+    float startFadeFullDistanceMeters = 0.0F;
+    float startFadeRandomBeginDistanceMeters = 0.0F;
+    float endFadeFullDistanceMeters = 0.0F;
+    float endFadeRandomBeginDistanceMeters = 0.0F;
 };
 
 struct WaterFieldTrailDiagnostics {
@@ -2137,6 +2178,9 @@ struct WaterManualFlowPathSource {
     std::uint32_t id = 0;
     std::string name = "Path Source";
     std::vector<invisible_places::io::Float3> controlPoints;
+    // Parallel to controlPoints. Missing legacy entries inherit the global
+    // Lane Cover Width and are normalized by editors/serialization on write.
+    std::vector<WaterManualFlowPathLaneWidth> controlPointLaneWidths;
     std::string laneProfileName = "Global";
     std::string trailProfileName = "Global";
     // Manual paths share the same saved-versus-live profile assignment rule.
@@ -2169,6 +2213,10 @@ struct WaterOverlayPoint {
     float phase = 0.0F;
     float speed = 1.0F;
     float width = 1.0F;
+    // Negative means use the global Lane Cover Width. Manual spline anchors
+    // carry a resolved local width in metres so the CPU reference follows the
+    // same per-node lane envelope as the GPU route pass.
+    float laneSpanMeters = -1.0F;
     float confidence = 1.0F;
     float accumulation = 0.0F;
     float pooling = 0.0F;
@@ -2208,6 +2256,12 @@ struct WaterAnimatedTrailBuildSettings {
     float trailPointSpacingMeters = 0.010F;
     float trailWidthMeters = 0.006F;
     float trailStreakLengthMeters = 0.045F;
+    bool startFadeEnabled = false;
+    float startFadeFullDistanceMeters = 0.25F;
+    float startFadeRandomBeginDistanceMeters = 0.10F;
+    bool endFadeEnabled = false;
+    float endFadeFullDistanceMeters = 0.25F;
+    float endFadeRandomBeginDistanceMeters = 0.10F;
     float surfaceOffsetMeters = 0.004F;
     float pathAttraction = 0.85F;
     float laneSpreadMeters = 0.12F;
@@ -2521,7 +2575,11 @@ void EnsureWaterPathAnalysis(WaterPathCache* cache);
     const WaterFlowTrailBuildOptions& options);
 [[nodiscard]] WaterOverlay BuildManualFlowPathAnchors(
     const WaterManualFlowPathSource& source,
-    float sampleSpacingMeters = 0.025F);
+    float sampleSpacingMeters = 0.025F,
+    float globalLaneSpanMeters = 0.12F);
+[[nodiscard]] float ResolveWaterManualFlowPathLaneWidth(
+    const WaterManualFlowPathLaneWidth& laneWidth,
+    float globalLaneSpanMeters);
 [[nodiscard]] WaterFieldCache BuildFieldCacheFromPathAnchors(
     const WaterOverlay& pathAnchors,
     const WaterFieldSettings& settings);
@@ -2579,7 +2637,8 @@ void EnsureWaterPathAnalysis(WaterPathCache* cache);
     std::string_view layerName,
     const std::stop_token* stopToken);
 [[nodiscard]] std::vector<invisible_places::io::ScalarFieldStats> WaterTrailOverlayScalarFieldsForPointCount(
-    std::uint64_t pointCount);
+    std::uint64_t pointCount,
+    bool includeEndpointFadeFields = false);
 [[nodiscard]] invisible_places::io::LoadedPointCloud BuildWaterEffectOverlayPointCloud(
     const WaterEffectOverlay& overlay,
     const std::filesystem::path& sourcePath,

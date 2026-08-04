@@ -51,6 +51,11 @@ constexpr std::size_t kWaterTrailStreakLengthFieldSlot = 18U;
 constexpr std::size_t kWaterTrailTangentXFieldSlot = 22U;
 constexpr std::size_t kWaterTrailTangentYFieldSlot = 23U;
 constexpr std::size_t kWaterTrailTangentZFieldSlot = 24U;
+constexpr std::size_t kWaterTrailEndpointFadeFlagsFieldSlot = 31U;
+constexpr std::size_t kWaterTrailStartFadeFullDistanceFieldSlot = 32U;
+constexpr std::size_t kWaterTrailStartFadeRandomBeginDistanceFieldSlot = 33U;
+constexpr std::size_t kWaterTrailEndFadeFullDistanceFieldSlot = 34U;
+constexpr std::size_t kWaterTrailEndFadeRandomBeginDistanceFieldSlot = 35U;
 constexpr float kWaterParticleSpeedScale = 0.12F;
 constexpr float kPointCloudAntialiasFeatherPixels = 1.0F;
 
@@ -467,6 +472,37 @@ glm::vec3 CatmullRomWater(
         (-p0 + (3.0F * p1) - (3.0F * p2) + p3) * t3);
 }
 
+glm::vec3 SafeCentripetalWaterMix(
+    const glm::vec3& a,
+    const glm::vec3& b,
+    float ta,
+    float tb,
+    float t) {
+    const float denominator = tb - ta;
+    return std::abs(denominator) > 1.0e-6F
+        ? glm::mix(a, b, std::clamp((t - ta) / denominator, 0.0F, 1.0F))
+        : a;
+}
+
+glm::vec3 CentripetalCatmullRomWater(
+    const glm::vec3& p0,
+    const glm::vec3& p1,
+    const glm::vec3& p2,
+    const glm::vec3& p3,
+    float u) {
+    const float t0 = 0.0F;
+    const float t1 = t0 + std::sqrt(std::max(glm::length(p1 - p0), 1.0e-6F));
+    const float t2 = t1 + std::sqrt(std::max(glm::length(p2 - p1), 1.0e-6F));
+    const float t3 = t2 + std::sqrt(std::max(glm::length(p3 - p2), 1.0e-6F));
+    const float t = std::lerp(t1, t2, std::clamp(u, 0.0F, 1.0F));
+    const glm::vec3 a1 = SafeCentripetalWaterMix(p0, p1, t0, t1, t);
+    const glm::vec3 a2 = SafeCentripetalWaterMix(p1, p2, t1, t2, t);
+    const glm::vec3 a3 = SafeCentripetalWaterMix(p2, p3, t2, t3, t);
+    const glm::vec3 b1 = SafeCentripetalWaterMix(a1, a2, t0, t2, t);
+    const glm::vec3 b2 = SafeCentripetalWaterMix(a2, a3, t1, t3, t);
+    return SafeCentripetalWaterMix(b1, b2, t1, t2, t);
+}
+
 std::size_t WaterTrailRouteStart(
     const invisible_places::io::LoadedPointCloud& cloud,
     std::size_t pointIndex) {
@@ -572,7 +608,59 @@ float WaterTrailVisibility(
     const float routeLength = std::max(0.001F, ScalarFieldValueBySlot(cloud, kWaterTrailRouteLengthFieldSlot, pointIndex));
     const float trailStreakLength = WaterTrailStreakLength(cloud, pointIndex, style);
     const float endFeather = std::clamp(trailStreakLength / routeLength, 0.001F, 0.10F);
-    return activity.trailVisibility *
+    float endpointVisibility = 1.0F;
+    if (cloud.scalarFields.size() > kWaterTrailEndFadeRandomBeginDistanceFieldSlot) {
+        const auto flags = static_cast<std::uint32_t>(std::max(
+            0.0F,
+            std::floor(
+                ScalarFieldValueBySlot(
+                    cloud,
+                    kWaterTrailEndpointFadeFlagsFieldSlot,
+                    pointIndex) +
+                0.5F)));
+        const float trailSeed = std::clamp(
+            ScalarFieldValueBySlot(cloud, kWaterTrailSeedFieldSlot, pointIndex),
+            0.0F,
+            1.0F);
+        const float distanceFromStart = PositiveFract(phase) * routeLength;
+        const auto fadeRamp = [](float distance, float fullDistance, float randomDistance, float randomAmount) {
+            const float full = std::max(0.0F, fullDistance);
+            if (full <= 1.0e-5F) {
+                return 1.0F;
+            }
+            const float begin = std::min(
+                std::max(0.0F, randomDistance) * std::clamp(randomAmount, 0.0F, 1.0F),
+                std::max(0.0F, full - 1.0e-5F));
+            return SmoothStep(begin, full, std::max(0.0F, distance));
+        };
+        if ((flags & 1U) != 0U) {
+            endpointVisibility *= fadeRamp(
+                distanceFromStart,
+                ScalarFieldValueBySlot(
+                    cloud,
+                    kWaterTrailStartFadeFullDistanceFieldSlot,
+                    pointIndex),
+                ScalarFieldValueBySlot(
+                    cloud,
+                    kWaterTrailStartFadeRandomBeginDistanceFieldSlot,
+                    pointIndex),
+                PositiveFract(trailSeed * 0.754877666F + 0.137F));
+        }
+        if ((flags & 2U) != 0U) {
+            endpointVisibility *= fadeRamp(
+                routeLength - distanceFromStart,
+                ScalarFieldValueBySlot(
+                    cloud,
+                    kWaterTrailEndFadeFullDistanceFieldSlot,
+                    pointIndex),
+                ScalarFieldValueBySlot(
+                    cloud,
+                    kWaterTrailEndFadeRandomBeginDistanceFieldSlot,
+                    pointIndex),
+                PositiveFract(trailSeed * 0.569840291F + 0.731F));
+        }
+    }
+    return activity.trailVisibility * endpointVisibility *
            (1.0F - SmoothStep(1.0F - endFeather, 1.0F, phase));
 }
 
@@ -615,18 +703,15 @@ glm::vec3 WaterTrailRoutePosition(
     }
 
     const auto [anchorOffset, t] = WaterTrailRouteSegment(cloud, pointIndex, phase);
-    const auto p0Offset = anchorOffset > 0U ? anchorOffset - 1U : anchorOffset;
-    const auto p1Offset = anchorOffset;
-    const auto p2Offset = std::min<std::size_t>(anchorOffset + 1U, routeCount - 1U);
-    const auto p3Offset = std::min<std::size_t>(anchorOffset + 2U, routeCount - 1U);
-    const glm::vec3 p1 = ToGlm(cloud.positions[routeStart + p1Offset]);
-    const glm::vec3 p2 = ToGlm(cloud.positions[routeStart + p2Offset]);
-    return CatmullRomWater(
-        ToGlm(cloud.positions[routeStart + p0Offset]),
-        p1,
-        p2,
-        ToGlm(cloud.positions[routeStart + p3Offset]),
-        t);
+    const glm::vec3 p1 = ToGlm(cloud.positions[routeStart + anchorOffset]);
+    const glm::vec3 p2 = ToGlm(cloud.positions[routeStart + anchorOffset + 1U]);
+    const glm::vec3 p0 = anchorOffset > 0U
+        ? ToGlm(cloud.positions[routeStart + anchorOffset - 1U])
+        : p1 + (p1 - p2);
+    const glm::vec3 p3 = anchorOffset + 2U < routeCount
+        ? ToGlm(cloud.positions[routeStart + anchorOffset + 2U])
+        : p2 + (p2 - p1);
+    return CentripetalCatmullRomWater(p0, p1, p2, p3, t);
 }
 
 glm::vec3 WaterTrailRouteTangent(
@@ -644,13 +729,24 @@ glm::vec3 WaterTrailRouteTangent(
     }
 
     const auto [anchorOffset, t] = WaterTrailRouteSegment(cloud, pointIndex, phase);
-    (void)t;
-    const auto previousOffset = anchorOffset;
-    const auto nextOffset = std::min<std::size_t>(anchorOffset + 1U, routeCount - 1U);
+    const glm::vec3 p1 = ToGlm(cloud.positions[routeStart + anchorOffset]);
+    const glm::vec3 p2 = ToGlm(cloud.positions[routeStart + anchorOffset + 1U]);
+    const glm::vec3 p0 = anchorOffset > 0U
+        ? ToGlm(cloud.positions[routeStart + anchorOffset - 1U])
+        : p1 + (p1 - p2);
+    const glm::vec3 p3 = anchorOffset + 2U < routeCount
+        ? ToGlm(cloud.positions[routeStart + anchorOffset + 2U])
+        : p2 + (p2 - p1);
+    constexpr float kTangentProbe = 0.01F;
     const glm::vec3 tangent =
-        ToGlm(cloud.positions[routeStart + nextOffset]) -
-        ToGlm(cloud.positions[routeStart + previousOffset]);
-    return glm::dot(tangent, tangent) > 1.0e-8F ? glm::normalize(tangent) : glm::vec3{1.0F, 0.0F, 0.0F};
+        CentripetalCatmullRomWater(p0, p1, p2, p3, std::min(1.0F, t + kTangentProbe)) -
+        CentripetalCatmullRomWater(p0, p1, p2, p3, std::max(0.0F, t - kTangentProbe));
+    const glm::vec3 fallbackTangent = p2 - p1;
+    return glm::dot(tangent, tangent) > 1.0e-8F
+        ? glm::normalize(tangent)
+        : (glm::dot(fallbackTangent, fallbackTangent) > 1.0e-8F
+            ? glm::normalize(fallbackTangent)
+            : glm::vec3{1.0F, 0.0F, 0.0F});
 }
 
 glm::vec3 WaterTrailRouteNormal(

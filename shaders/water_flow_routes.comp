@@ -47,29 +47,34 @@ void main() {
         vec3 authoredPosition;
         vec3 authoredNormal;
         float confidence;
+        float authoredLaneSpan;
         FlowEvaluateAuthored(
             distanceMeters,
             branch,
             authoredPosition,
             authoredNormal,
-            confidence);
+            confidence,
+            authoredLaneSpan);
 
         vec3 previousPosition;
         vec3 nextPosition;
         vec3 unusedNormal;
         float unusedConfidence;
+        float unusedLaneSpan;
         FlowEvaluateAuthored(
             max(0.0, distanceMeters - routeSpacing),
             branch,
             previousPosition,
             unusedNormal,
-            unusedConfidence);
+            unusedConfidence,
+            unusedLaneSpan);
         FlowEvaluateAuthored(
             min(routeLength, distanceMeters + routeSpacing),
             branch,
             nextPosition,
             unusedNormal,
-            unusedConfidence);
+            unusedConfidence,
+            unusedLaneSpan);
         vec3 tangent = FlowSafeNormalize(nextPosition - previousPosition, vec3(1.0, 0.0, 0.0));
         const vec3 frameSeed = routeIndex == 0u ? authoredNormal : previousNormal;
         vec3 transportedNormal = frameSeed - tangent * dot(frameSeed, tangent);
@@ -96,9 +101,12 @@ void main() {
             distanceMeters,
             routeLength,
             routeSpacing);
-        const float halfSpan = max(0.0, flow.lane0.x) * 0.5;
-        float routeLaneSpan = max(0.0, flow.lane0.x);
-        float localLaneOffset = laneCoordinate * routeLaneSpan * endpointFade;
+        const float halfSpan = max(0.0, authoredLaneSpan) * 0.5;
+        float routeLaneSpan = max(0.0, authoredLaneSpan);
+        // Lane cover is authored at every control point, including the two
+        // endpoints.  Only the surface-guide displacement eases into the
+        // authored curve; the lane itself must not pinch back to its centre.
+        float localLaneOffset = laneCoordinate * routeLaneSpan;
         vec3 routePosition = authoredPosition + lateral * localLaneOffset;
         vec3 routeNormal = authoredNormal;
 
@@ -143,9 +151,8 @@ void main() {
                     1.0,
                     widthScale,
                     clamp(flow.guide0.z, 0.0, 1.0) * supportWeight);
-                routeLaneSpan = max(0.0, flow.lane0.x) * terrainWidth;
-                localLaneOffset =
-                    laneCoordinate * routeLaneSpan * endpointFade;
+                routeLaneSpan = max(0.0, authoredLaneSpan) * terrainWidth;
+                localLaneOffset = laneCoordinate * routeLaneSpan;
                 routePosition = authoredPosition + lateral * localLaneOffset;
 
                 vec3 displacement = support.position - routePosition;
@@ -196,11 +203,6 @@ void main() {
             routePosition = authoredPosition + corridorDelta * (corridorLimit / corridorDistance);
         }
 
-        // Every lane begins and ends at the authored endpoints.
-        if (routeIndex == 0u || routeIndex + 1u == routePointCount) {
-            routePosition = authoredPosition;
-            routeNormal = authoredNormal;
-        }
         if (dot(routeNormal, previousNormal) < 0.0) {
             routeNormal = -routeNormal;
         }
@@ -246,5 +248,10 @@ void main() {
             kCrossSeedFieldSlot,
             outputIndex,
             FlowHash01(flow.metadata.x + branchId, routeIndex, 7029u));
+        FlowStoreField(kEndpointFadeFlagsFieldSlot, outputIndex, float(flow.identity.y));
+        FlowStoreField(kStartFadeFullDistanceFieldSlot, outputIndex, flow.fade0.x);
+        FlowStoreField(kStartFadeRandomBeginDistanceFieldSlot, outputIndex, flow.fade0.y);
+        FlowStoreField(kEndFadeFullDistanceFieldSlot, outputIndex, flow.fade0.z);
+        FlowStoreField(kEndFadeRandomBeginDistanceFieldSlot, outputIndex, flow.fade0.w);
     }
 }
