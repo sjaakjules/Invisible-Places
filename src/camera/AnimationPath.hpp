@@ -58,6 +58,19 @@ struct AnimationLoopSmoothingMetadata {
     std::array<float, 3> originalLastFocusPoint{0.0F, 0.0F, 0.0F};
 };
 
+// A linked loop is a renderable snapshot compiled from two source animation
+// files. The source names and phase controls remain attached so the snapshot
+// can be rebuilt after either source changes. Negative padding overlaps and
+// crossfades both source clips; positive padding holds the outgoing endpoint
+// before the next clip begins.
+struct AnimationLinkedLoopMetadata {
+    std::string firstFileName;
+    std::string secondFileName;
+    std::string firstStartKeyId;
+    float firstStartPosition = 0.0F;
+    std::int32_t paddingFrames = 0;
+};
+
 struct AnimationPath {
     std::string name = "Animation";
     std::uint32_t durationFrames = 180;
@@ -71,6 +84,7 @@ struct AnimationPath {
     // visible endpoint keys contain the adjusted poses; these originals are
     // used to evaluate the unchanged middle spline and to unapply exactly.
     std::optional<AnimationLoopSmoothingMetadata> loopTransitionSmoothing;
+    std::optional<AnimationLinkedLoopMetadata> linkedLoop;
     std::string selectedTimingTakeId =
         std::string{invisible_places::timing::kAuthoredTimingTakeId};
     // Retained for legacy animation round-trip. Runtime timing resolves
@@ -162,6 +176,35 @@ struct AnimationLoopSmoothingOptions {
     std::string secondFileName;
 };
 
+struct AnimationLinkedLoopBuildOptions {
+    std::string name;
+    std::string firstFileName;
+    std::string secondFileName;
+    std::size_t firstStartKeyIndex = 0U;
+    std::int32_t paddingFrames = 0;
+};
+
+struct AnimationLinkedLoopTiming {
+    std::uint32_t firstDurationFrames = 0U;
+    std::uint32_t secondDurationFrames = 0U;
+    std::uint32_t firstTerminalStartFrame = 0U;
+    std::uint32_t secondTerminalStartFrame = 0U;
+    std::int32_t paddingFrames = 0;
+    std::uint32_t periodFrames = 0U;
+    float secondStartFrame = 0.0F;
+};
+
+struct AnimationLinkedLoopSourceSample {
+    AnimationPathEvaluation blended;
+    AnimationPathEvaluation first;
+    AnimationPathEvaluation second;
+    bool valid = false;
+    bool firstActive = false;
+    bool secondActive = false;
+    float firstWeight = 0.0F;
+    float secondWeight = 0.0F;
+};
+
 struct AnimationLoopSmoothingResult {
     bool succeeded = false;
     bool changed = false;
@@ -169,8 +212,32 @@ struct AnimationLoopSmoothingResult {
     float afterMismatch = 0.0F;
     std::array<float, 2> beforeSeamMismatch{0.0F, 0.0F};
     std::array<float, 2> afterSeamMismatch{0.0F, 0.0F};
+    // Weighted RMS change from each animation's original terminal perceived-
+    // speed curve, normalized by the local seam speed. Index 0 is `first`.
+    std::array<float, 2> terminalSpeedRmsChange{0.0F, 0.0F};
     float maxCameraMove = 0.0F;
     float maxFocusMove = 0.0F;
+    float maxCameraCapUsage = 0.0F;
+    float maxFocusCapUsage = 0.0F;
+    std::string errorMessage;
+};
+
+// Read-only validation for a selected loop pair. With no applied smoothing,
+// before and after are the same current baseline. With matching reversible
+// metadata, the preserved endpoints reconstruct the exact pre-smoothing
+// baseline so the improvement remains measurable after saving and restarting.
+struct AnimationLoopTransitionMetrics {
+    bool valid = false;
+    bool hasAppliedSmoothing = false;
+    float beforeMismatch = 0.0F;
+    float afterMismatch = 0.0F;
+    std::array<float, 2> beforeSeamMismatch{0.0F, 0.0F};
+    std::array<float, 2> afterSeamMismatch{0.0F, 0.0F};
+    std::array<float, 2> terminalSpeedRmsChange{0.0F, 0.0F};
+    float maxCameraMove = 0.0F;
+    float maxFocusMove = 0.0F;
+    float maxCameraCapUsage = 0.0F;
+    float maxFocusCapUsage = 0.0F;
     std::string errorMessage;
 };
 
@@ -220,6 +287,36 @@ AnimationPath BuildAnimationPathFromCameraShots(
     const AnimationPath& path,
     std::uint32_t samplesPerSegment = 24U);
 
+// Builds one closed, phase-rotated animation from two source paths. The
+// resulting path contains one ordinary key per 30 fps source frame, so it can
+// be previewed and exported without the source files being present. At zero
+// padding, each incoming first key aligns with the outgoing penultimate key
+// and the complete terminal edge is smooth-crossfaded. Signed padding offsets
+// that anchor; a positive value becomes an endpoint hold only after it exceeds
+// the remaining terminal-edge duration.
+[[nodiscard]] std::int32_t ClampLinkedLoopPaddingFrames(
+    const AnimationPath& first,
+    const AnimationPath& second,
+    std::int32_t requestedPaddingFrames);
+[[nodiscard]] AnimationLinkedLoopTiming ResolveLinkedLoopTiming(
+    const AnimationPath& first,
+    const AnimationPath& second,
+    std::int32_t requestedPaddingFrames);
+[[nodiscard]] float AnimationPathKeyNormalizedPosition(
+    const AnimationPath& path,
+    std::size_t keyIndex);
+[[nodiscard]] AnimationLinkedLoopSourceSample EvaluateLinkedLoopSourceSample(
+    const AnimationPath& first,
+    const AnimationPath& second,
+    float firstStartPosition,
+    std::int32_t paddingFrames,
+    float linkedNormalizedPosition);
+[[nodiscard]] std::optional<AnimationPath> BuildLinkedLoopAnimation(
+    const AnimationPath& first,
+    const AnimationPath& second,
+    const AnimationLinkedLoopBuildOptions& options,
+    std::string* errorMessage = nullptr);
+
 // Jointly adjusts only the first and last camera/focus keys of two paths.
 // durationFrames and every per-key durationFrames value are never written.
 // Applied paths evaluate their original natural cubic spline everywhere,
@@ -228,6 +325,9 @@ AnimationPath BuildAnimationPathFromCameraShots(
     AnimationPath* first,
     AnimationPath* second,
     const AnimationLoopSmoothingOptions& options = {});
+[[nodiscard]] AnimationLoopTransitionMetrics MeasureAnimationLoopTransitions(
+    const AnimationPath& first,
+    const AnimationPath& second);
 [[nodiscard]] bool UnapplyAnimationLoopSmoothing(
     AnimationPath* path,
     std::string* errorMessage = nullptr);

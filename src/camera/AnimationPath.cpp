@@ -603,18 +603,32 @@ PreparedAnimationPathEvaluationContext PrepareAnimationPathEvaluation(const Anim
             smoothing.originalLastFocusPoint);
     }
 
-    context.cameraX = BuildNaturalCubicSpline(context.knots, cameraX);
-    context.cameraY = BuildNaturalCubicSpline(context.knots, cameraY);
-    context.cameraZ = BuildNaturalCubicSpline(context.knots, cameraZ);
-    context.focusX = BuildNaturalCubicSpline(context.knots, focusX);
-    context.focusY = BuildNaturalCubicSpline(context.knots, focusY);
-    context.focusZ = BuildNaturalCubicSpline(context.knots, focusZ);
-    context.fovDegrees = BuildNaturalCubicSpline(context.knots, BuildKeySamples(path, ReadFovDegrees));
-    context.nearPlane = BuildNaturalCubicSpline(context.knots, BuildKeySamples(path, ReadNearPlane));
-    context.farPlane = BuildNaturalCubicSpline(context.knots, BuildKeySamples(path, ReadFarPlane));
-    context.focusDistance = BuildNaturalCubicSpline(context.knots, focusDistances);
+    // Linked-loop keys are already per-frame samples of the source clips and
+    // crossfades. Linear interpolation preserves holds and avoids natural-
+    // cubic ringing before a cut; ordinary authored paths retain their cubic
+    // pass-through interpolation.
+    const auto buildSpline = [&](std::vector<float> values) {
+        if (path.linkedLoop.has_value()) {
+            return AnimationPreparedScalarSpline{
+                .values = std::move(values),
+                .secondDerivatives =
+                    std::vector<float>(path.keys.size(), 0.0F),
+            };
+        }
+        return BuildNaturalCubicSpline(context.knots, values);
+    };
+    context.cameraX = buildSpline(std::move(cameraX));
+    context.cameraY = buildSpline(std::move(cameraY));
+    context.cameraZ = buildSpline(std::move(cameraZ));
+    context.focusX = buildSpline(std::move(focusX));
+    context.focusY = buildSpline(std::move(focusY));
+    context.focusZ = buildSpline(std::move(focusZ));
+    context.fovDegrees = buildSpline(BuildKeySamples(path, ReadFovDegrees));
+    context.nearPlane = buildSpline(BuildKeySamples(path, ReadNearPlane));
+    context.farPlane = buildSpline(BuildKeySamples(path, ReadFarPlane));
+    context.focusDistance = buildSpline(std::move(focusDistances));
     context.apertureFStopsSpline =
-        BuildNaturalCubicSpline(context.knots, BuildKeySamples(path, ReadApertureFStops));
+        buildSpline(BuildKeySamples(path, ReadApertureFStops));
     context.orientationQuaternions.reserve(path.keys.size());
     for (std::size_t keyIndex = 0; keyIndex < path.keys.size(); ++keyIndex) {
         const auto& key = keyIndex == 0U
@@ -942,6 +956,420 @@ std::vector<std::uint32_t> ComputeConstantPerceivedSpeedSegmentFrames(
     return frames;
 }
 
+float AnimationPathKeyNormalizedPosition(
+    const AnimationPath& path,
+    std::size_t keyIndex) {
+    if (path.keys.empty()) {
+        return 0.0F;
+    }
+    if (keyIndex + 1U >= path.keys.size()) {
+        return 1.0F;
+    }
+    const auto knots = BuildAnimationKnots(path);
+    if (keyIndex >= knots.size() || knots.empty() ||
+        knots.back() <= 1.0e-6F) {
+        return 0.0F;
+    }
+    return std::clamp(knots[keyIndex] / knots.back(), 0.0F, 1.0F);
+}
+
+std::int32_t ClampLinkedLoopPaddingFrames(
+    const AnimationPath& first,
+    const AnimationPath& second,
+    std::int32_t requestedPaddingFrames) {
+    constexpr std::int64_t kMaximumPositivePaddingFrames = 3600LL;
+    const auto firstFrames = std::max(
+        first.durationFrames,
+        MinimumAnimationDurationFrames(first));
+    const auto secondFrames = std::max(
+        second.durationFrames,
+        MinimumAnimationDurationFrames(second));
+    const auto firstTerminalStart = static_cast<std::int64_t>(std::lround(
+        AnimationPathKeyNormalizedPosition(
+            first,
+            first.keys.size() >= 2U ? first.keys.size() - 2U : 0U) *
+        static_cast<float>(firstFrames)));
+    const auto secondTerminalStart = static_cast<std::int64_t>(std::lround(
+        AnimationPathKeyNormalizedPosition(
+            second,
+            second.keys.size() >= 2U ? second.keys.size() - 2U : 0U) *
+        static_cast<float>(secondFrames)));
+    const std::int64_t basePeriod =
+        firstTerminalStart + secondTerminalStart;
+    const std::int64_t largestSource = std::max<std::int64_t>(
+        firstFrames,
+        secondFrames);
+    const auto ceilHalf = [](std::int64_t value) {
+        return value >= 0LL ? (value + 1LL) / 2LL : value / 2LL;
+    };
+    // A and B each recur once per period. Keep the period at least as long
+    // as either source so copies of the same source never overlap; that caps
+    // the live blend at one A sample and one B sample.
+    const std::int64_t minimumPadding = std::max({
+        -firstTerminalStart,
+        -secondTerminalStart,
+        ceilHalf(largestSource - basePeriod),
+        ceilHalf(2LL - basePeriod),
+    });
+    const std::int64_t maximumPadding = std::max(
+        kMaximumPositivePaddingFrames,
+        minimumPadding);
+    return static_cast<std::int32_t>(std::clamp<std::int64_t>(
+        requestedPaddingFrames,
+        minimumPadding,
+        maximumPadding));
+}
+
+AnimationLinkedLoopTiming ResolveLinkedLoopTiming(
+    const AnimationPath& first,
+    const AnimationPath& second,
+    std::int32_t requestedPaddingFrames) {
+    AnimationLinkedLoopTiming timing;
+    timing.firstDurationFrames = std::max(
+        first.durationFrames,
+        MinimumAnimationDurationFrames(first));
+    timing.secondDurationFrames = std::max(
+        second.durationFrames,
+        MinimumAnimationDurationFrames(second));
+    timing.firstTerminalStartFrame = static_cast<std::uint32_t>(std::clamp<long>(
+        std::lround(
+            AnimationPathKeyNormalizedPosition(
+                first,
+                first.keys.size() >= 2U
+                    ? first.keys.size() - 2U
+                    : 0U) *
+            static_cast<float>(timing.firstDurationFrames)),
+        0L,
+        static_cast<long>(timing.firstDurationFrames)));
+    timing.secondTerminalStartFrame = static_cast<std::uint32_t>(std::clamp<long>(
+        std::lround(
+            AnimationPathKeyNormalizedPosition(
+                second,
+                second.keys.size() >= 2U
+                    ? second.keys.size() - 2U
+                    : 0U) *
+            static_cast<float>(timing.secondDurationFrames)),
+        0L,
+        static_cast<long>(timing.secondDurationFrames)));
+    timing.paddingFrames = ClampLinkedLoopPaddingFrames(
+        first,
+        second,
+        requestedPaddingFrames);
+    const std::int64_t periodFrames =
+        static_cast<std::int64_t>(timing.firstTerminalStartFrame) +
+        static_cast<std::int64_t>(timing.secondTerminalStartFrame) +
+        (2LL * static_cast<std::int64_t>(timing.paddingFrames));
+    timing.periodFrames = static_cast<std::uint32_t>(std::max<std::int64_t>(
+        2LL,
+        periodFrames));
+    timing.secondStartFrame =
+        static_cast<float>(timing.firstTerminalStartFrame) +
+        static_cast<float>(timing.paddingFrames);
+    return timing;
+}
+
+namespace {
+
+struct ActiveLinkedClip {
+    const PreparedAnimationPathEvaluationContext* context = nullptr;
+    bool first = false;
+    float startFrame = 0.0F;
+    float durationFrames = 0.0F;
+};
+
+AnimationPathEvaluation EvaluateActiveLinkedClip(
+    const ActiveLinkedClip& clip,
+    float frame) {
+    const float localFrame = std::clamp(
+        frame - clip.startFrame,
+        0.0F,
+        clip.durationFrames);
+    return EvaluatePreparedAnimationPath(
+        *clip.context,
+        localFrame / kAnimationFramesPerSecond);
+}
+
+AnimationPathEvaluation BlendLinkedEvaluations(
+    const AnimationPathEvaluation& outgoing,
+    const AnimationPathEvaluation& incoming,
+    float amount) {
+    const float t = std::clamp(amount, 0.0F, 1.0F);
+    AnimationPathEvaluation result;
+    result.camera = InterpolateCameraStates(
+        outgoing.camera,
+        incoming.camera,
+        t);
+    for (std::size_t component = 0U; component < 3U; ++component) {
+        result.focusPoint[component] = LerpFloat(
+            outgoing.focusPoint[component],
+            incoming.focusPoint[component],
+            t);
+    }
+    result.focusDistance = LerpFloat(
+        outgoing.focusDistance,
+        incoming.focusDistance,
+        t);
+    result.camera.target = result.focusPoint;
+    result.camera.orbitCenter = result.focusPoint;
+    result.camera.hasOrbitCenter = true;
+    result.camera.focusDistance = result.focusDistance;
+    return result;
+}
+
+AnimationLinkedLoopSourceSample EvaluatePreparedLinkedLoopSourceSample(
+    const PreparedAnimationPathEvaluationContext& firstContext,
+    const PreparedAnimationPathEvaluationContext& secondContext,
+    const AnimationLinkedLoopTiming& timing,
+    float firstStartPosition,
+    float linkedNormalizedPosition) {
+    AnimationLinkedLoopSourceSample sample;
+    sample.valid = true;
+    const float periodFrameCount = static_cast<float>(timing.periodFrames);
+    const float firstStartFrame =
+        std::clamp(firstStartPosition, 0.0F, 1.0F) *
+        static_cast<float>(timing.firstDurationFrames);
+    float frame = std::fmod(
+        std::clamp(linkedNormalizedPosition, 0.0F, 1.0F) *
+                periodFrameCount +
+            firstStartFrame,
+        periodFrameCount);
+    if (frame < 0.0F) {
+        frame += periodFrameCount;
+    }
+
+    std::vector<ActiveLinkedClip> active;
+    active.reserve(2U);
+    std::optional<ActiveLinkedClip> latestCompleted;
+    float latestEndFrame = -std::numeric_limits<float>::infinity();
+    for (int cycleOffset = -1; cycleOffset <= 1; ++cycleOffset) {
+        const float cycleStart =
+            static_cast<float>(cycleOffset) * periodFrameCount;
+        const std::array<ActiveLinkedClip, 2> clips{{
+            {.context = &firstContext,
+             .first = true,
+             .startFrame = cycleStart,
+             .durationFrames =
+                 static_cast<float>(timing.firstDurationFrames)},
+            {.context = &secondContext,
+             .first = false,
+             .startFrame = cycleStart + timing.secondStartFrame,
+             .durationFrames =
+                 static_cast<float>(timing.secondDurationFrames)},
+        }};
+        for (const auto& clip : clips) {
+            const float clipEnd = clip.startFrame + clip.durationFrames;
+            if (frame >= clip.startFrame && frame < clipEnd) {
+                active.push_back(clip);
+            }
+            if (clipEnd <= frame && clipEnd > latestEndFrame) {
+                latestEndFrame = clipEnd;
+                latestCompleted = clip;
+            }
+        }
+    }
+
+    if (active.empty()) {
+        if (latestCompleted.has_value()) {
+            sample.blended = EvaluateActiveLinkedClip(
+                latestCompleted.value(),
+                latestCompleted->startFrame +
+                    latestCompleted->durationFrames);
+        } else {
+            sample.blended = EvaluatePreparedAnimationPath(
+                firstContext,
+                0.0F);
+        }
+        return sample;
+    }
+
+    const auto assignSource = [&](const ActiveLinkedClip& clip,
+                                  const AnimationPathEvaluation& evaluation,
+                                  float weight,
+                                  AnimationLinkedLoopSourceSample* output) {
+        if (clip.first) {
+            output->first = evaluation;
+            output->firstActive = true;
+            output->firstWeight = weight;
+        } else {
+            output->second = evaluation;
+            output->secondActive = true;
+            output->secondWeight = weight;
+        }
+    };
+    if (active.size() == 1U) {
+        const auto evaluation = EvaluateActiveLinkedClip(
+            active.front(),
+            frame);
+        assignSource(active.front(), evaluation, 1.0F, &sample);
+        sample.blended = evaluation;
+        return sample;
+    }
+
+    std::sort(
+        active.begin(),
+        active.end(),
+        [](const auto& left, const auto& right) {
+            return left.startFrame < right.startFrame;
+        });
+    const auto& outgoing = active[active.size() - 2U];
+    const auto& incoming = active.back();
+    const float overlapEnd = std::min(
+        outgoing.startFrame + outgoing.durationFrames,
+        incoming.startFrame + incoming.durationFrames);
+    const float overlapFrames = std::max(
+        1.0F,
+        overlapEnd - incoming.startFrame);
+    const float linearAmount = std::clamp(
+        (frame - incoming.startFrame) / overlapFrames,
+        0.0F,
+        1.0F);
+    const float smoothAmount =
+        linearAmount * linearAmount * (3.0F - (2.0F * linearAmount));
+    const auto outgoingEvaluation = EvaluateActiveLinkedClip(
+        outgoing,
+        frame);
+    const auto incomingEvaluation = EvaluateActiveLinkedClip(
+        incoming,
+        frame);
+    assignSource(outgoing, outgoingEvaluation, 1.0F - smoothAmount, &sample);
+    assignSource(incoming, incomingEvaluation, smoothAmount, &sample);
+    sample.blended = BlendLinkedEvaluations(
+        outgoingEvaluation,
+        incomingEvaluation,
+        smoothAmount);
+    return sample;
+}
+
+}  // namespace
+
+AnimationLinkedLoopSourceSample EvaluateLinkedLoopSourceSample(
+    const AnimationPath& first,
+    const AnimationPath& second,
+    float firstStartPosition,
+    std::int32_t paddingFrames,
+    float linkedNormalizedPosition) {
+    const auto firstContext = PrepareAnimationPathEvaluation(first);
+    const auto secondContext = PrepareAnimationPathEvaluation(second);
+    if (!firstContext.valid || !secondContext.valid) {
+        return {};
+    }
+    return EvaluatePreparedLinkedLoopSourceSample(
+        firstContext,
+        secondContext,
+        ResolveLinkedLoopTiming(first, second, paddingFrames),
+        firstStartPosition,
+        linkedNormalizedPosition);
+}
+
+std::optional<AnimationPath> BuildLinkedLoopAnimation(
+    const AnimationPath& first,
+    const AnimationPath& second,
+    const AnimationLinkedLoopBuildOptions& options,
+    std::string* errorMessage) {
+    const auto fail = [&](std::string message)
+        -> std::optional<AnimationPath> {
+        if (errorMessage != nullptr) {
+            *errorMessage = std::move(message);
+        }
+        return std::nullopt;
+    };
+    if (first.keys.size() < 3U || second.keys.size() < 3U) {
+        return fail(
+            "A linked loop requires at least three keys in each source animation so each terminal edge is defined.");
+    }
+    if (options.firstStartKeyIndex >= first.keys.size()) {
+        return fail("The linked-loop start key is no longer present in the first animation.");
+    }
+
+    const auto firstContext = PrepareAnimationPathEvaluation(first);
+    const auto secondContext = PrepareAnimationPathEvaluation(second);
+    if (!firstContext.valid || firstContext.singleKey ||
+        !secondContext.valid || secondContext.singleKey) {
+        return fail("One of the linked-loop source animations cannot be evaluated.");
+    }
+
+    const auto timing = ResolveLinkedLoopTiming(
+        first,
+        second,
+        options.paddingFrames);
+    constexpr std::int64_t kMaximumGeneratedLinkedFrames = 36000LL;
+    if (timing.periodFrames > kMaximumGeneratedLinkedFrames) {
+        return fail(
+            "The linked loop would exceed 36,000 generated frames. Shorten the sources or padding.");
+    }
+
+    const float firstStartPosition = AnimationPathKeyNormalizedPosition(
+        first,
+        options.firstStartKeyIndex);
+
+    AnimationPath linked = first;
+    linked.name = options.name.empty()
+                      ? first.name + " + " + second.name + " Linked"
+                      : options.name;
+    linked.durationFrames = timing.periodFrames;
+    linked.keys.clear();
+    linked.keys.reserve(static_cast<std::size_t>(timing.periodFrames) + 1U);
+    linked.loopTransitionSmoothing.reset();
+    linked.linkedLoop = AnimationLinkedLoopMetadata{
+        .firstFileName = options.firstFileName.empty()
+                             ? first.name
+                             : options.firstFileName,
+        .secondFileName = options.secondFileName.empty()
+                              ? second.name
+                              : options.secondFileName,
+        .firstStartKeyId = first.keys[options.firstStartKeyIndex].id,
+        .firstStartPosition = firstStartPosition,
+        .paddingFrames = timing.paddingFrames,
+    };
+    linked.depthOfFieldEnabled =
+        first.depthOfFieldEnabled || second.depthOfFieldEnabled;
+    for (const auto& layerPath : second.associatedLayerPaths) {
+        if (std::find(
+                linked.associatedLayerPaths.begin(),
+                linked.associatedLayerPaths.end(),
+                layerPath) == linked.associatedLayerPaths.end()) {
+            linked.associatedLayerPaths.push_back(layerPath);
+        }
+    }
+
+    for (std::uint32_t frameIndex = 0U;
+         frameIndex <= timing.periodFrames;
+         ++frameIndex) {
+        const auto sourceSample = EvaluatePreparedLinkedLoopSourceSample(
+            firstContext,
+            secondContext,
+            timing,
+            firstStartPosition,
+            static_cast<float>(frameIndex) /
+                static_cast<float>(timing.periodFrames));
+        const auto& evaluation = sourceSample.blended;
+        AnimationPathKey key;
+        key.id = "linked_frame_" + std::to_string(frameIndex + 1U);
+        key.cameraPosition = evaluation.camera.position;
+        key.focusPoint = evaluation.focusPoint;
+        key.hasOrientation = true;
+        key.orientation = evaluation.camera.orientation;
+        key.hasFocusDistance = true;
+        key.focusDistance = std::max(0.001F, evaluation.focusDistance);
+        key.hasApertureFStops = true;
+        key.apertureFStops = std::max(
+            0.1F,
+            evaluation.camera.apertureFStops);
+        key.fovDegrees = evaluation.camera.fovDegrees;
+        key.nearPlane = evaluation.camera.nearPlane;
+        key.farPlane = evaluation.camera.farPlane;
+        key.durationFrames = 1U;
+        key.sourceShotName = "Linked frame " +
+                             std::to_string(frameIndex + 1U);
+        linked.keys.push_back(std::move(key));
+    }
+
+    if (errorMessage != nullptr) {
+        errorMessage->clear();
+    }
+    return linked;
+}
+
 namespace {
 
 struct LoopEndpointOccurrence {
@@ -1075,6 +1503,7 @@ struct LoopScore {
     float objective = 0.0F;
     float mismatch = 0.0F;
     std::array<float, 2> seamMismatch{0.0F, 0.0F};
+    std::array<float, 2> terminalSpeedRmsChange{0.0F, 0.0F};
 };
 
 LoopScore ScoreLoopPair(
@@ -1101,6 +1530,7 @@ LoopScore ScoreLoopPair(
     LoopScore score;
     float totalWeight = 0.0F;
     std::array<float, 2> seamWeights{0.0F, 0.0F};
+    std::array<float, 2> speedErrorWeights{0.0F, 0.0F};
     const std::array<std::pair<std::size_t, std::size_t>, 2> seams{{
         {0U, 1U},
         {1U, 0U},
@@ -1149,6 +1579,12 @@ LoopScore ScoreLoopPair(
             const float incomingSpeedError =
                 (incomingFlow.screenSpeed - originalIncomingFlow.screenSpeed) / scale;
             score.seamMismatch[seamIndex] += weight * normalizedMismatch;
+            score.terminalSpeedRmsChange[outgoingIndex] +=
+                weight * outgoingSpeedError * outgoingSpeedError;
+            score.terminalSpeedRmsChange[incomingIndex] +=
+                weight * incomingSpeedError * incomingSpeedError;
+            speedErrorWeights[outgoingIndex] += weight;
+            speedErrorWeights[incomingIndex] += weight;
             score.objective +=
                 weight *
                 (normalizedMismatch +
@@ -1168,6 +1604,15 @@ LoopScore ScoreLoopPair(
     }
     score.mismatch =
         0.5F * (score.seamMismatch[0U] + score.seamMismatch[1U]);
+    for (std::size_t pathIndex = 0U;
+         pathIndex < score.terminalSpeedRmsChange.size();
+         ++pathIndex) {
+        if (speedErrorWeights[pathIndex] > 0.0F) {
+            score.terminalSpeedRmsChange[pathIndex] = std::sqrt(
+                score.terminalSpeedRmsChange[pathIndex] /
+                speedErrorWeights[pathIndex]);
+        }
+    }
     if (totalWeight > 0.0F) {
         score.objective /= totalWeight;
     }
@@ -1194,6 +1639,75 @@ LoopScore ScoreLoopPair(
         }
     }
     return score;
+}
+
+void RestoreLoopSmoothingOriginalEndpoints(AnimationPath* path) {
+    if (path == nullptr || !ValidLoopSmoothingMetadata(*path)) {
+        return;
+    }
+    const auto smoothing = path->loopTransitionSmoothing.value();
+    path->keys.front().cameraPosition = smoothing.originalFirstCameraPosition;
+    path->keys.front().focusPoint = smoothing.originalFirstFocusPoint;
+    path->keys.back().cameraPosition = smoothing.originalLastCameraPosition;
+    path->keys.back().focusPoint = smoothing.originalLastFocusPoint;
+    path->loopTransitionSmoothing.reset();
+}
+
+void AccumulateLoopEndpointMovement(
+    const AnimationPath& path,
+    const AnimationLoopSmoothingMetadata& smoothing,
+    AnimationLoopTransitionMetrics* metrics) {
+    if (metrics == nullptr || path.keys.size() < 3U) {
+        return;
+    }
+    const float moveFraction = std::clamp(
+        smoothing.maxEndMoveFraction,
+        0.01F,
+        0.25F);
+    const auto accumulateTrack = [](
+                                     const std::array<float, 3>& current,
+                                     const std::array<float, 3>& original,
+                                     const std::array<float, 3>& adjacent,
+                                     float fraction,
+                                     float* maximumMove,
+                                     float* maximumCapUsage) {
+        const float movement = Distance(current, original);
+        const float cap = fraction * Distance(original, adjacent);
+        *maximumMove = std::max(*maximumMove, movement);
+        if (cap > 1.0e-8F) {
+            *maximumCapUsage = std::max(
+                *maximumCapUsage,
+                movement / cap);
+        }
+    };
+    accumulateTrack(
+        path.keys.front().cameraPosition,
+        smoothing.originalFirstCameraPosition,
+        path.keys[1U].cameraPosition,
+        moveFraction,
+        &metrics->maxCameraMove,
+        &metrics->maxCameraCapUsage);
+    accumulateTrack(
+        path.keys.back().cameraPosition,
+        smoothing.originalLastCameraPosition,
+        path.keys[path.keys.size() - 2U].cameraPosition,
+        moveFraction,
+        &metrics->maxCameraMove,
+        &metrics->maxCameraCapUsage);
+    accumulateTrack(
+        path.keys.front().focusPoint,
+        smoothing.originalFirstFocusPoint,
+        path.keys[1U].focusPoint,
+        moveFraction,
+        &metrics->maxFocusMove,
+        &metrics->maxFocusCapUsage);
+    accumulateTrack(
+        path.keys.back().focusPoint,
+        smoothing.originalLastFocusPoint,
+        path.keys[path.keys.size() - 2U].focusPoint,
+        moveFraction,
+        &metrics->maxFocusMove,
+        &metrics->maxFocusCapUsage);
 }
 
 }  // namespace
@@ -1375,14 +1889,25 @@ AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
     const auto finalScore = ScoreLoopPair(*first, *second, originalFirst, originalSecond, groups);
     result.afterMismatch = finalScore.mismatch;
     result.afterSeamMismatch = finalScore.seamMismatch;
+    result.terminalSpeedRmsChange = finalScore.terminalSpeedRmsChange;
     for (const auto& group : groups) {
         for (const auto& occurrence : group.occurrences) {
-            result.maxCameraMove = std::max(
-                result.maxCameraMove,
-                Distance(group.cameraPosition, occurrence.originalCamera));
-            result.maxFocusMove = std::max(
-                result.maxFocusMove,
-                Distance(group.focusPoint, occurrence.originalFocus));
+            const float cameraMove =
+                Distance(group.cameraPosition, occurrence.originalCamera);
+            const float focusMove =
+                Distance(group.focusPoint, occurrence.originalFocus);
+            result.maxCameraMove = std::max(result.maxCameraMove, cameraMove);
+            result.maxFocusMove = std::max(result.maxFocusMove, focusMove);
+            if (occurrence.cameraCap > 1.0e-8F) {
+                result.maxCameraCapUsage = std::max(
+                    result.maxCameraCapUsage,
+                    cameraMove / occurrence.cameraCap);
+            }
+            if (occurrence.focusCap > 1.0e-8F) {
+                result.maxFocusCapUsage = std::max(
+                    result.maxFocusCapUsage,
+                    focusMove / occurrence.focusCap);
+            }
         }
     }
     const auto seamDidNotWorsen = [&](std::size_t seamIndex) {
@@ -1394,20 +1919,119 @@ AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
     };
     const bool neitherSeamWorsened =
         seamDidNotWorsen(0U) && seamDidNotWorsen(1U);
-    result.changed =
-        result.afterMismatch + 1.0e-5F < result.beforeMismatch &&
-        neitherSeamWorsened &&
-        (result.maxCameraMove > 1.0e-6F || result.maxFocusMove > 1.0e-6F);
+    const float requiredOverallImprovement = std::max(
+        1.0e-7F,
+        1.0e-4F * result.beforeMismatch);
+    const bool overallImproved =
+        result.afterMismatch + requiredOverallImprovement <
+        result.beforeMismatch;
+    const bool endpointsMoved =
+        result.maxCameraMove > 1.0e-6F ||
+        result.maxFocusMove > 1.0e-6F;
+    result.changed = overallImproved && neitherSeamWorsened && endpointsMoved;
     result.succeeded = true;
     if (!result.changed) {
         *first = std::move(originalFirstPath);
         *second = std::move(originalSecondPath);
-        result.afterMismatch = result.beforeMismatch;
-        result.afterSeamMismatch = result.beforeSeamMismatch;
-        result.maxCameraMove = 0.0F;
-        result.maxFocusMove = 0.0F;
+        if (!endpointsMoved) {
+            result.errorMessage =
+                "No endpoint movement produced a measurable improvement "
+                "within the selected limit.";
+        } else if (!overallImproved) {
+            result.errorMessage =
+                "The best bounded endpoint movement did not measurably lower "
+                "the combined screen-flow mismatch.";
+        } else {
+            result.errorMessage =
+                "The best combined candidate was rejected because it made "
+                "one loop direction worse.";
+        }
     }
     return result;
+}
+
+AnimationLoopTransitionMetrics MeasureAnimationLoopTransitions(
+    const AnimationPath& first,
+    const AnimationPath& second) {
+    AnimationLoopTransitionMetrics metrics;
+    if (&first == &second) {
+        metrics.errorMessage = "Choose two different animations.";
+        return metrics;
+    }
+    if (first.keys.size() < 3U || second.keys.size() < 3U) {
+        metrics.errorMessage =
+            "Loop validation requires at least three camera keys in each animation.";
+        return metrics;
+    }
+
+    const bool firstHasSmoothing = first.loopTransitionSmoothing.has_value();
+    const bool secondHasSmoothing = second.loopTransitionSmoothing.has_value();
+    if (firstHasSmoothing != secondHasSmoothing) {
+        metrics.errorMessage =
+            "Only one animation contains reversible loop-smoothing metadata.";
+        return metrics;
+    }
+    if (firstHasSmoothing &&
+        (!ValidLoopSmoothingMetadata(first) ||
+         !ValidLoopSmoothingMetadata(second) ||
+         first.loopTransitionSmoothing->pairId !=
+             second.loopTransitionSmoothing->pairId)) {
+        metrics.errorMessage =
+            "The animations do not contain the same valid reversible smoothing pair.";
+        return metrics;
+    }
+
+    AnimationPath originalFirst = first;
+    AnimationPath originalSecond = second;
+    if (firstHasSmoothing) {
+        RestoreLoopSmoothingOriginalEndpoints(&originalFirst);
+        RestoreLoopSmoothingOriginalEndpoints(&originalSecond);
+    }
+    const auto originalFirstContext =
+        PrepareAnimationPathEvaluation(originalFirst);
+    const auto originalSecondContext =
+        PrepareAnimationPathEvaluation(originalSecond);
+    if (!originalFirstContext.valid || !originalSecondContext.valid ||
+        originalFirstContext.knots.size() < 3U ||
+        originalSecondContext.knots.size() < 3U) {
+        metrics.errorMessage = "One of the animation paths cannot be evaluated.";
+        return metrics;
+    }
+
+    const std::vector<LoopEndpointGroup> noMovementGroups;
+    const auto beforeScore = ScoreLoopPair(
+        originalFirst,
+        originalSecond,
+        originalFirstContext,
+        originalSecondContext,
+        noMovementGroups);
+    const auto afterScore = firstHasSmoothing
+                                ? ScoreLoopPair(
+                                      first,
+                                      second,
+                                      originalFirstContext,
+                                      originalSecondContext,
+                                      noMovementGroups)
+                                : beforeScore;
+    metrics.valid = true;
+    metrics.hasAppliedSmoothing = firstHasSmoothing;
+    metrics.beforeMismatch = beforeScore.mismatch;
+    metrics.afterMismatch = afterScore.mismatch;
+    metrics.beforeSeamMismatch = beforeScore.seamMismatch;
+    metrics.afterSeamMismatch = afterScore.seamMismatch;
+    metrics.terminalSpeedRmsChange =
+        afterScore.terminalSpeedRmsChange;
+    if (firstHasSmoothing) {
+        AccumulateLoopEndpointMovement(
+            first,
+            first.loopTransitionSmoothing.value(),
+            &metrics);
+        AccumulateLoopEndpointMovement(
+            second,
+            second.loopTransitionSmoothing.value(),
+            &metrics);
+    }
+    return metrics;
 }
 
 bool UnapplyAnimationLoopSmoothing(
