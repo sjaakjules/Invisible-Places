@@ -289,6 +289,78 @@ TEST_CASE("Used scalar field sets aggregate bindings and Visual Features",
           patterns.end());
 }
 
+TEST_CASE("The legacy water-shader span keeps file fields at their file slots",
+          "[pointcloud][fields][compat]") {
+    // The point shaders read hard-coded slots (water jitter seed 12 up to
+    // feature type 15) on flow-animated clouds, so filtered loads pin file
+    // fields 0..15 to resident slots 0..15 by whitelisting their source
+    // indices. This fixture has 20 fields with values encoding their file
+    // index, so both alignment and content are checkable.
+    constexpr std::size_t kFieldCount = 20U;
+    constexpr std::size_t kPoints = 3U;
+    const auto path =
+        std::filesystem::temp_directory_path() /
+        "invisible-places-field-residency" / "legacy-span.ply";
+    std::filesystem::create_directories(path.parent_path());
+    {
+        std::ofstream output{path, std::ios::binary | std::ios::trunc};
+        REQUIRE(output.is_open());
+        output << "ply\n"
+               << "format binary_little_endian 1.0\n"
+               << "element vertex " << kPoints << "\n"
+               << "property float x\n"
+               << "property float y\n"
+               << "property float z\n";
+        for (std::size_t field = 0; field < kFieldCount; ++field) {
+            output << "property float scalar_F"
+                   << (field < 10U ? "0" : "") << field << "\n";
+        }
+        output << "end_header\n";
+        for (std::size_t point = 0; point < kPoints; ++point) {
+            WriteBinaryValue(&output, static_cast<float>(point));
+            WriteBinaryValue(&output, 0.0F);
+            WriteBinaryValue(&output, 0.0F);
+            for (std::size_t field = 0; field < kFieldCount; ++field) {
+                WriteBinaryValue(
+                    &output,
+                    static_cast<float>(field) * 1000.0F +
+                        static_cast<float>(point));
+            }
+        }
+    }
+
+    PointCloudScalarFieldFilter filter;
+    filter.mode = PointCloudScalarFieldFilter::Mode::Selected;
+    filter.names = {"F18"};
+    for (std::uint32_t sourceIndex = 0U;
+         sourceIndex <
+         invisible_places::app::kLegacyWaterShaderCompatibilitySourceIndexCount;
+         ++sourceIndex) {
+        filter.sourceIndices.push_back(sourceIndex);
+    }
+    const auto result = LoadPointCloud(path, filter);
+    REQUIRE(result.success);
+    const auto& cloud = result.cloud;
+
+    REQUIRE(cloud.scalarFields.size() ==
+            invisible_places::app::kLegacyWaterShaderCompatibilitySourceIndexCount + 1U);
+    for (std::uint32_t slot = 0U;
+         slot <
+         invisible_places::app::kLegacyWaterShaderCompatibilitySourceIndexCount;
+         ++slot) {
+        // Resident slot == file index across the whole compatibility span,
+        // so the shader's fixed-slot reads hit the same fields they always
+        // did.
+        CHECK(cloud.scalarFields[slot].sourceIndex ==
+              static_cast<std::int32_t>(slot));
+        CHECK(cloud.scalarFieldValues[cloud.ScalarFieldValueIndex(slot, 1U)] ==
+              Catch::Approx(static_cast<float>(slot) * 1000.0F + 1.0F));
+    }
+    const auto& tail = cloud.scalarFields.back();
+    CHECK(tail.name == "F18");
+    CHECK(tail.sourceIndex == 18);
+}
+
 TEST_CASE("Parallel PLY parsing matches the single-threaded result exactly",
           "[pointcloud][fields][parallel]") {
     // Enough points that four forced ranges each cover thousands of

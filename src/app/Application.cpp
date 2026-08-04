@@ -9800,6 +9800,18 @@ CollectScalarFieldLoadFilter(
     filter.names = CollectRequiredScalarFieldNames(runtimeState, session).Names();
     filter.containsPatterns =
         invisible_places::app::AlwaysResidentScalarFieldPatterns();
+    // Slot-stability floor: the point shaders sniff generated water clouds
+    // by field count and read hard-coded slots (jitter seed 12 .. feature
+    // type 15) on any flow-animated cloud, so file fields 0..15 must keep
+    // their exact resident rows. Selection preserves file order, so
+    // including every one of these indices pins resident slots 0..15 to
+    // file fields 0..15 — the historical layout the look was tuned on.
+    for (std::uint32_t sourceIndex = 0U;
+         sourceIndex <
+         invisible_places::app::kLegacyWaterShaderCompatibilitySourceIndexCount;
+         ++sourceIndex) {
+        filter.sourceIndices.push_back(sourceIndex);
+    }
     // Caustic assignments are persisted as file-order slots; whitelist them
     // by index so the styles that reference them keep working, then
     // MakeSceneRenderStyle translates the slot to the resident row.
@@ -10032,8 +10044,16 @@ void EvictScalarFieldsOverBudget(
                 .required = required.Contains(field.name),
                 // Only disk-backed fields can be streamed back on demand;
                 // eviction also needs the loaded/GPU path the removal
-                // helper requires.
-                .evictable = field.sourceIndex >= 0 && session.loaded,
+                // helper requires. Fields inside the legacy water-shader
+                // compatibility span stay pinned: removing one would
+                // renumber resident slots 0..15 away from file order,
+                // which the shaders' hard-coded slot reads depend on.
+                .evictable =
+                    field.sourceIndex >=
+                        static_cast<std::int32_t>(
+                            invisible_places::app::
+                                kLegacyWaterShaderCompatibilitySourceIndexCount) &&
+                    session.loaded,
             });
         }
     }

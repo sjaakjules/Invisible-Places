@@ -29,6 +29,19 @@ session) additionally records `availableScalarFields` — every on-disk field
 with its file-order `sourceIndex` — whether or not the values are resident.
 The GUI smoke runners keep calling the unfiltered loader deliberately.
 
+One structural floor applies to every filtered load: the point shaders
+identify generated water clouds by sniffing the bound field count against
+hard-coded slot constants (water jitter seed 12 through feature type 15),
+and a display cloud whose style animates flow takes those per-slot reads
+too — historically reading whichever survey field sat at that file
+position. Source indices 0..15 are therefore always whitelisted
+(`kLegacyWaterShaderCompatibilitySourceIndexCount`) and never evicted, so
+resident slots 0..15 stay equal to file fields 0..15 and the flow shimmer
+keeps its historical seed data. Compacting a cloud below that span turns
+the shimmer into structured contour banding. Shrinking the floor requires
+the shaders to take explicit water-slot indirection instead of
+count-sniffing.
+
 `Load All Scalar Fields` (Debug window; persisted as
 `load_all_scalar_fields`, schema 65) restores the historical
 load-everything behaviour on each cloud's next load.

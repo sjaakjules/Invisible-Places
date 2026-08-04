@@ -50,4 +50,17 @@ class UsedScalarFieldSet {
 // them via PointCloudScalarFieldFilter::containsPatterns.
 [[nodiscard]] const std::vector<std::string>& AlwaysResidentScalarFieldPatterns();
 
+// The point shaders identify generated water clouds by sniffing the bound
+// field count against hard-coded slot constants (kWaterJitterSeedFieldSlot
+// = 12 up to kWaterFeatureTypeFieldSlot = 15), and a display cloud whose
+// style animates flow takes those per-slot reads too: historically it read
+// whichever survey field sat at that file position. Filtered loads must
+// therefore keep the first sixteen on-disk fields resident in file order —
+// otherwise a different field lands at slot 12 and the flow shimmer turns
+// into structured banding. Every filtered load whitelists source indices
+// [0, this count) and eviction never removes them, so resident slots
+// 0..15 always equal file fields 0..15. Shrinking this floor requires the
+// shaders to take explicit water-slot indirection instead of sniffing.
+inline constexpr std::uint32_t kLegacyWaterShaderCompatibilitySourceIndexCount = 16U;
+
 }  // namespace invisible_places::app
