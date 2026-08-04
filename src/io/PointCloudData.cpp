@@ -179,7 +179,9 @@ std::string NormalizedAlnumFieldName(std::string_view value) {
     return normalized;
 }
 
-bool FieldFilterSelects(
+}  // namespace
+
+bool PointCloudScalarFieldFilterSelects(
     const PointCloudScalarFieldFilter& filter,
     std::string_view displayName,
     std::uint32_t sourceIndex) {
@@ -214,6 +216,8 @@ bool FieldFilterSelects(
                        std::string::npos;
         });
 }
+
+namespace {
 
 struct PointCloudLayout {
     std::vector<PropertyLayout> properties;
@@ -502,7 +506,7 @@ PointCloudLoadResult LoadPointCloud(
                 .name = displayName,
                 .sourceIndex = sourceIndex,
             });
-            if (FieldFilterSelects(fieldFilter, displayName, sourceIndex)) {
+            if (PointCloudScalarFieldFilterSelects(fieldFilter, displayName, sourceIndex)) {
                 residentSlotBySourceIndex[sourceIndex] =
                     static_cast<std::int32_t>(cloud.scalarFields.size());
                 ScalarFieldStats stats;

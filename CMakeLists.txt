@@ -161,6 +161,7 @@ add_library(
     src/io/GaussianSplatData.cpp
     src/io/MeshData.cpp
     src/io/PointCloudData.cpp
+    src/io/PointCloudFieldCache.cpp
     src/io/PlyHeader.cpp
     src/io/TransformMatrix.cpp
     src/output/ExrWriter.cpp
@@ -271,6 +272,7 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
             tests/AnimationFocusTests.cpp
             tests/AssetDiscoveryTests.cpp
             tests/PointCloudDensityCompensationTests.cpp
+            tests/PointCloudFieldCacheTests.cpp
             tests/PointCloudFieldResidencyTests.cpp
             tests/PointCloudVariantsTests.cpp
             tests/ProjectDocumentSerializationTests.cpp

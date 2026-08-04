@@ -30,6 +30,7 @@
 #include "scene/SceneCatalog.hpp"
 #include "scene/PointCloudVariants.hpp"
 #include "app/UsedScalarFields.hpp"
+#include "io/PointCloudFieldCache.hpp"
 #include "serialization/ProjectDocument.hpp"
 #include "serialization/RenderSetupDocument.hpp"
 #include "style/RenderParameterBinding.hpp"
@@ -9804,6 +9805,21 @@ void StartScalarFieldLoad(
             backgroundState->result = std::move(result);
             return;
         }
+        // A cached column is a single contiguous read; the interleaved PLY
+        // scan is the fallback, written through for next time.
+        if (invisible_places::io::ReadPointCloudCachedField(
+                sourcePath,
+                fieldName,
+                result.values,
+                &result.stats)) {
+            result.success = true;
+            std::scoped_lock lock(backgroundState->mutex);
+            backgroundState->result = std::move(result);
+            return;
+        }
+        result.stats = {};
+        result.stats.name = fieldName;
+        result.stats.sourceIndex = sourceIndex;
         const auto streamResult =
             invisible_places::io::StreamPointCloudSelectedValues(
                 sourcePath,
@@ -9833,6 +9849,13 @@ void StartScalarFieldLoad(
                 "Scalar field stream returned an unexpected point count.";
         } else {
             result.success = true;
+            if (!invisible_places::io::WritePointCloudCachedField(
+                    sourcePath,
+                    result.stats,
+                    result.values)) {
+                std::cerr << "Field cache write-through failed for '"
+                          << fieldName << "'." << std::endl;
+            }
         }
         std::scoped_lock lock(backgroundState->mutex);
         backgroundState->result = std::move(result);
@@ -9978,7 +10001,9 @@ void BeginLayerLoad(
 
             LayerLoadResult result =
                 layerKind == LayerKind::PointCloud
-                    ? LayerLoadResult{invisible_places::io::LoadPointCloud(filePath, scalarFieldFilter)}
+                    ? LayerLoadResult{invisible_places::io::LoadPointCloudWithFieldCache(
+                          filePath,
+                          scalarFieldFilter)}
                     : LayerLoadResult{
                           invisible_places::io::LoadGaussianSplat(filePath, transformPath)};
             if (stopToken.stop_requested()) {
@@ -10013,6 +10038,15 @@ void PollPendingScalarFieldLoad(
     if (runtimeState == nullptr || viewport == nullptr ||
         !runtimeState->pendingScalarFieldLoad.has_value() ||
         runtimeState->offlineRenderJob.active) {
+        return;
+    }
+    // Appending grows the field-major value vector, which may reallocate.
+    // Workers that hold the cloud's shared_ptr and read those arrays
+    // (colourise histograms, Flow trail builds) must not be mid-read when
+    // that happens; defer completion until they settle.
+    if (runtimeState->timingColouriseHistogram.worker.joinable() ||
+        runtimeState->water.flowTrailBuildJob.worker.joinable() ||
+        runtimeState->water.flowTrailBuildJob.pendingCapture) {
         return;
     }
     auto& pending = runtimeState->pendingScalarFieldLoad.value();

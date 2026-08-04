@@ -68,6 +68,13 @@ struct PointCloudScalarFieldFilter {
     [[nodiscard]] bool LoadsAll() const { return mode == Mode::All; }
 };
 
+// The selection predicate LoadPointCloud applies, shared with the field
+// cache so cache assembly and PLY loads pick identical field sets.
+[[nodiscard]] bool PointCloudScalarFieldFilterSelects(
+    const PointCloudScalarFieldFilter& filter,
+    std::string_view displayName,
+    std::uint32_t sourceIndex);
+
 struct LoadedPointCloud {
     std::filesystem::path sourcePath;
     std::string layerName;
