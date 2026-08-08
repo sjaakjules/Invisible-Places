@@ -3329,6 +3329,8 @@ TEST_CASE("Flow profile object copies round-trip owner metadata",
   using invisible_places::serialization::WaterPathProfileDocument;
   using invisible_places::serialization::WaterSourcesDocument;
   using invisible_places::serialization::WaterTrailProfileDocument;
+  using invisible_places::water::WaterSeepageLookProfile;
+  using invisible_places::water::WaterSeepageResponseProfile;
 
   WaterPathProfileDocument basePath;
   basePath.name = "Rocky";
@@ -3355,11 +3357,30 @@ TEST_CASE("Flow profile object copies round-trip owner metadata",
   springTrail.ownerObjectId = 19U;
   springTrail.baseProfileName = "Fine Silver";
 
+  WaterSeepageLookProfile baseLook;
+  baseLook.name = "Mossy";
+  baseLook.settings.baseWetness = 0.41F;
+  WaterSeepageLookProfile nodeLook;
+  nodeLook.name = "Mossy_Seep 3";
+  nodeLook.settings.baseWetness = 0.77F;
+  nodeLook.objectOverride = true;
+  nodeLook.ownerObjectId = 3U;
+  nodeLook.baseProfileName = "Mossy";
+
+  WaterSeepageResponseProfile nodeResponse;
+  nodeResponse.name = "Standard_Seep 3";
+  nodeResponse.response.intensity = 1.31F;
+  nodeResponse.objectOverride = true;
+  nodeResponse.ownerObjectId = 3U;
+  nodeResponse.baseProfileName = "Standard_preset";
+
   ProjectDocument project;
   project.projectName = "flow-object-profiles";
   project.waterPathProfiles = {basePath, springPath};
   project.waterLaneProfiles = {creekLanes};
   project.waterTrailProfiles = {springTrail};
+  project.waterSeepageLookProfiles = {baseLook, nodeLook};
+  project.waterSeepageResponseProfiles = {nodeResponse};
 
   TemporaryProjectFile projectFile{
       "invisible_places_flow_object_profiles.json"};
@@ -3401,11 +3422,29 @@ TEST_CASE("Flow profile object copies round-trip owner metadata",
   CHECK(loaded->waterTrailProfiles[0].baseProfileName == "Fine Silver");
   CHECK(loaded->waterTrailProfiles[0].geometry.widthMeters ==
         Catch::Approx(0.021F));
+  REQUIRE(loaded->waterSeepageLookProfiles.size() == 2U);
+  CHECK_FALSE(loaded->waterSeepageLookProfiles[0].objectOverride);
+  CHECK(loaded->waterSeepageLookProfiles[0].baseProfileName.empty());
+  CHECK(loaded->waterSeepageLookProfiles[1].name == "Mossy_Seep 3");
+  CHECK(loaded->waterSeepageLookProfiles[1].objectOverride);
+  CHECK(loaded->waterSeepageLookProfiles[1].ownerObjectId == 3U);
+  CHECK(loaded->waterSeepageLookProfiles[1].baseProfileName == "Mossy");
+  CHECK(loaded->waterSeepageLookProfiles[1].settings.baseWetness ==
+        Catch::Approx(0.77F));
+  REQUIRE(loaded->waterSeepageResponseProfiles.size() == 1U);
+  CHECK(loaded->waterSeepageResponseProfiles[0].objectOverride);
+  CHECK(loaded->waterSeepageResponseProfiles[0].ownerObjectId == 3U);
+  CHECK(loaded->waterSeepageResponseProfiles[0].baseProfileName ==
+        "Standard_preset");
+  CHECK(loaded->waterSeepageResponseProfiles[0].response.intensity ==
+        Catch::Approx(1.31F));
 
   WaterSourcesDocument sources;
   sources.pathProfiles = {basePath, springPath};
   sources.laneProfiles = {creekLanes};
   sources.trailProfiles = {springTrail};
+  sources.seepageLookProfiles = {baseLook, nodeLook};
+  sources.seepageResponseProfiles = {nodeResponse};
   TemporaryProjectFile sourcesFile{
       "invisible_places_flow_object_profiles_sources.json"};
   REQUIRE(SaveWaterSourcesDocument(sources, sourcesFile.path, &errorMessage));
@@ -3424,4 +3463,13 @@ TEST_CASE("Flow profile object copies round-trip owner metadata",
   REQUIRE(loadedSources->trailProfiles.size() == 1U);
   CHECK(loadedSources->trailProfiles[0].objectOverride);
   CHECK(loadedSources->trailProfiles[0].baseProfileName == "Fine Silver");
+  REQUIRE(loadedSources->seepageLookProfiles.size() == 2U);
+  CHECK_FALSE(loadedSources->seepageLookProfiles[0].objectOverride);
+  CHECK(loadedSources->seepageLookProfiles[1].objectOverride);
+  CHECK(loadedSources->seepageLookProfiles[1].ownerObjectId == 3U);
+  CHECK(loadedSources->seepageLookProfiles[1].baseProfileName == "Mossy");
+  REQUIRE(loadedSources->seepageResponseProfiles.size() == 1U);
+  CHECK(loadedSources->seepageResponseProfiles[0].objectOverride);
+  CHECK(loadedSources->seepageResponseProfiles[0].baseProfileName ==
+        "Standard_preset");
 }

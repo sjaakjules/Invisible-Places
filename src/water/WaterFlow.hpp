@@ -286,18 +286,28 @@ struct WaterSeepageLookSettings {
 // ignored at resolve time; nodes pair a settings profile with an independent
 // response profile so the effect and how much it changes the underlying
 // cloud can be mixed and matched.
+// Object-specific copies ("<base>_<node name>") carry their owning node id
+// and base profile; any node may reference another node's copy by name, but
+// only the owner's edits rewrite it.
 struct WaterSeepageLookProfile {
     std::string name = "Default";
     WaterSeepageLookSettings settings{};
+    bool objectOverride = false;
+    std::uint32_t ownerObjectId = 0U;
+    std::string baseProfileName;
 };
 
 // Named visual-response profile: how strongly seepage changes the underlying
 // cloud (emission/opacity/size/colour response and blend), independent of
-// which pattern produces the effect.
+// which pattern produces the effect. Object-copy fields follow the look
+// profile's convention.
 struct WaterSeepageResponseProfile {
     std::string name = "Default";
     WaterEffectResponseSettings response{};
     WaterEffectBlendMode blendMode = WaterEffectBlendMode::Max;
+    bool objectOverride = false;
+    std::uint32_t ownerObjectId = 0U;
+    std::string baseProfileName;
 };
 
 struct WaterScenarioState {

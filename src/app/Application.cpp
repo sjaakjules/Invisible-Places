@@ -5958,13 +5958,18 @@ struct WaterProfileKeyingContext {
 bool DrawWaterSeepageLookControls(
     WaterSeepageLookSettings* look,
     const WaterProfileKeyingContext* keying = nullptr);
+// `baseline` values are the saved base a copy or edited shadow derives from;
+// rows whose values differ show the base in brackets after the edited value.
 bool DrawWaterSeepageSettingsControls(
     WaterSeepageLookSettings* look,
-    const WaterProfileKeyingContext* keying = nullptr);
+    const WaterProfileKeyingContext* keying = nullptr,
+    const WaterSeepageLookSettings* baseline = nullptr);
 bool DrawWaterSeepageResponseControls(
     invisible_places::water::WaterEffectResponseSettings* response,
     WaterEffectBlendMode* blendMode,
-    const WaterProfileKeyingContext* keying = nullptr);
+    const WaterProfileKeyingContext* keying = nullptr,
+    const invisible_places::water::WaterEffectResponseSettings* baselineResponse = nullptr,
+    const WaterEffectBlendMode* baselineBlendMode = nullptr);
 void StartDynamicMeshSurfaceCacheWarmup(PreviewRuntimeState* runtimeState, bool publishStatus = false);
 std::shared_ptr<MeshSurfaceCache> EnsureDynamicMeshSurfaceCache(
     PreviewRuntimeState* runtimeState,
@@ -14595,6 +14600,136 @@ WaterFlowObjectProfileRemoval RemoveWaterFlowSourceObjectProfiles(
     return removal;
 }
 
+// ---------------------------------------------------------------------------
+// Seepage object-copy helpers: the same per-object fork model over the
+// node-referenced look/response libraries. Renames and removals also follow
+// keyed profile tracks, which reference these profiles by (group, name).
+// ---------------------------------------------------------------------------
+
+void ReplaceWaterSeepageProfileReferences(
+    WaterWorkflowState* water,
+    bool responseHalf,
+    std::string_view previousName,
+    std::string_view nextName) {
+    const auto previous = NormalizedWaterSeepageProfileName(previousName);
+    for (auto& node : water->seepageNodes) {
+        auto& reference =
+            responseHalf ? node.responseProfileName : node.lookProfileName;
+        if (NormalizedWaterSeepageProfileName(reference) == previous) {
+            reference = std::string{nextName};
+        }
+    }
+    const std::string_view group =
+        responseHalf ? "seepage_response" : "seepage_look";
+    for (auto& entry : water->featureTimingRunsByScenario) {
+        for (auto& run : entry.runs) {
+            for (auto& feature : run.features) {
+                for (auto& track : feature.settings) {
+                    if (track.profileGroup == group &&
+                        NormalizedWaterSeepageProfileName(track.profileName) ==
+                            previous) {
+                        track.profileName = std::string{nextName};
+                    }
+                }
+            }
+        }
+    }
+}
+
+void RenameWaterSeepageNodeObjectProfiles(
+    WaterWorkflowState* water,
+    std::uint32_t nodeId,
+    std::string_view nodeName) {
+    const auto renameIn = [&](auto* profiles, bool responseHalf) {
+        for (auto& profile : *profiles) {
+            if (!profile.objectOverride || profile.ownerObjectId != nodeId) {
+                continue;
+            }
+            const auto renamed = UniqueWaterFlowObjectProfileName(
+                *profiles,
+                WaterFlowObjectProfileName(profile.baseProfileName, nodeName),
+                &profile);
+            if (renamed == NormalizedWaterSeepageProfileName(profile.name)) {
+                continue;
+            }
+            const auto previous = profile.name;
+            profile.name = renamed;
+            ReplaceWaterSeepageProfileReferences(
+                water,
+                responseHalf,
+                previous,
+                renamed);
+        }
+    };
+    renameIn(&water->seepageLookProfiles, false);
+    renameIn(&water->seepageResponseProfiles, true);
+}
+
+void RemoveWaterSeepageNodeObjectProfiles(
+    WaterWorkflowState* water,
+    std::uint32_t nodeId) {
+    const auto removeIn = [&](auto* profiles, bool responseHalf) {
+        for (std::size_t index = profiles->size(); index > 0U; --index) {
+            auto& profile = (*profiles)[index - 1U];
+            if (!profile.objectOverride || profile.ownerObjectId != nodeId) {
+                continue;
+            }
+            const auto removedName = profile.name;
+            const auto baseName =
+                NormalizedWaterSeepageProfileName(profile.baseProfileName);
+            profiles->erase(
+                profiles->begin() + static_cast<std::ptrdiff_t>(index - 1U));
+            ReplaceWaterSeepageProfileReferences(
+                water,
+                responseHalf,
+                removedName,
+                baseName);
+        }
+    };
+    removeIn(&water->seepageLookProfiles, false);
+    removeIn(&water->seepageResponseProfiles, true);
+}
+
+// Load-time hygiene: orphaned copies dissolve to their base for every
+// referencing node, and copies whose owner was renamed outside this session
+// re-sync to "<base>_<node name>".
+void ReconcileWaterSeepageObjectProfiles(WaterWorkflowState* water) {
+    std::unordered_set<std::uint32_t> nodeIds;
+    for (const auto& node : water->seepageNodes) {
+        nodeIds.insert(node.id);
+    }
+    const auto dropOrphans = [&](auto* profiles, bool responseHalf) {
+        for (std::size_t index = profiles->size(); index > 0U; --index) {
+            auto& profile = (*profiles)[index - 1U];
+            if (!profile.objectOverride) {
+                continue;
+            }
+            profile.baseProfileName =
+                NormalizedWaterSeepageProfileName(profile.baseProfileName);
+            if (nodeIds.contains(profile.ownerObjectId)) {
+                continue;
+            }
+            const auto removedName = profile.name;
+            const auto baseName = profile.baseProfileName;
+            profiles->erase(
+                profiles->begin() + static_cast<std::ptrdiff_t>(index - 1U));
+            ReplaceWaterSeepageProfileReferences(
+                water,
+                responseHalf,
+                removedName,
+                baseName);
+        }
+    };
+    dropOrphans(&water->seepageLookProfiles, false);
+    dropOrphans(&water->seepageResponseProfiles, true);
+    for (const auto& node : water->seepageNodes) {
+        RenameWaterSeepageNodeObjectProfiles(
+            water,
+            node.id,
+            WaterFlowSourceDisplayName(node.name, node.id));
+    }
+}
+
 std::optional<WaterPathGenerationSettings> BuiltInWaterPathProfileSettings(std::string_view name) {
     const auto normalized = NormalizeWaterProfileName(name);
     if (normalized == "Aerial_preset") {
@@ -19143,6 +19278,7 @@ void LoadWaterSources(
         &runtimeState->water,
         !document->seepageResponseProfiles.empty());
     SeedWaterSeepageProfilePresets(&runtimeState->water);
+    ReconcileWaterSeepageObjectProfiles(&runtimeState->water);
     runtimeState->water.rippleLayers = document->rippleLayers;
     runtimeState->water.fieldLayers = document->fieldLayers;
     if (kRippleWaterRuntimeEnabled) {
@@ -24976,6 +25112,9 @@ bool ApplyProjectDocumentToRuntime(
         document.waterKeyedSettingsProfiles;
     runtimeState->water.nextFeatureTimingRunSequence =
         document.waterFeatureTimingRunSequence;
+    // After nodes, profiles, and keyed tracks are all loaded so orphan drops
+    // and owner-rename syncs can rewrite every reference kind.
+    ReconcileWaterSeepageObjectProfiles(&runtimeState->water);
     runtimeState->water.timingTakes = document.timingTakes;
     runtimeState->water.selectedTimingTakeId =
         invisible_places::timing::NormalizeTimingTakeId(
@@ -58510,13 +58649,26 @@ std::string_view WaterSeepageResponseTimingSettingId(
 
 bool DrawWaterSeepageSettingsControls(
     WaterSeepageLookSettings* look,
-    const WaterProfileKeyingContext* keying) {
+    const WaterProfileKeyingContext* keying,
+    const WaterSeepageLookSettings* baseline) {
     if (look == nullptr) {
         return false;
     }
     bool changed = false;
     const auto tooltip = [](const char* text) {
         DrawWaterSeepageParameterTooltip(text);
+    };
+    // Maps a field of *look to the same field of *baseline by offset so the
+    // one slider funnel can bracket every row without a per-field table.
+    const auto baselineValue = [&](const float* value) -> std::optional<float> {
+        if (baseline == nullptr) {
+            return std::nullopt;
+        }
+        const auto offset =
+            reinterpret_cast<const char*>(value) -
+            reinterpret_cast<const char*>(look);
+        return *reinterpret_cast<const float*>(
+            reinterpret_cast<const char*>(baseline) + offset);
     };
     const auto slider = [&](
                             const char* label,
@@ -58527,6 +58679,8 @@ bool DrawWaterSeepageSettingsControls(
                             const char* help,
                             ImGuiSliderFlags flags = ImGuiSliderFlags_None) {
         bool valueChanged = false;
+        const std::string rowFormat =
+            WaterProfileValueFormat(format, *value, baselineValue(value));
         if (keying != nullptr &&
             keying->runtimeState != nullptr &&
             !keying->features.empty()) {
@@ -58541,7 +58695,7 @@ bool DrawWaterSeepageSettingsControls(
                 *value,
                 minimum,
                 maximum,
-                format,
+                rowFormat.c_str(),
                 flags,
                 false,
                 &edited,
@@ -58558,7 +58712,7 @@ bool DrawWaterSeepageSettingsControls(
                 value,
                 minimum,
                 maximum,
-                format,
+                rowFormat.c_str(),
                 flags);
             tooltip(help);
         }
@@ -58590,6 +58744,10 @@ bool DrawWaterSeepageSettingsControls(
         }
         ImGui::EndCombo();
     }
+    if (baseline != nullptr && baseline->quality != look->quality) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(%s)", WaterSeepageQualityLabel(baseline->quality));
+    }
     constexpr std::array<WaterSeepagePattern, 4> patterns{{
         WaterSeepagePattern::WetRockSheen,
         WaterSeepagePattern::ChaoticBloom,
@@ -58615,6 +58773,10 @@ bool DrawWaterSeepageSettingsControls(
             }
         }
         ImGui::EndCombo();
+    }
+    if (baseline != nullptr && baseline->pattern != look->pattern) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(%s)", WaterSeepagePatternLabel(baseline->pattern));
     }
     slider(
         "Base Wetness",
@@ -58908,13 +59070,25 @@ bool DrawWaterSeepageSettingsControls(
 bool DrawWaterSeepageResponseControls(
     invisible_places::water::WaterEffectResponseSettings* response,
     WaterEffectBlendMode* blendMode,
-    const WaterProfileKeyingContext* keying) {
+    const WaterProfileKeyingContext* keying,
+    const invisible_places::water::WaterEffectResponseSettings* baselineResponse,
+    const WaterEffectBlendMode* baselineBlendMode) {
     if (response == nullptr || blendMode == nullptr) {
         return false;
     }
     bool changed = false;
     const auto tooltip = [](const char* text) {
         DrawWaterSeepageParameterTooltip(text);
+    };
+    const auto baselineValue = [&](const float* value) -> std::optional<float> {
+        if (baselineResponse == nullptr) {
+            return std::nullopt;
+        }
+        const auto offset =
+            reinterpret_cast<const char*>(value) -
+            reinterpret_cast<const char*>(response);
+        return *reinterpret_cast<const float*>(
+            reinterpret_cast<const char*>(baselineResponse) + offset);
     };
     const auto slider = [&](
                             const char* label,
@@ -58924,6 +59098,8 @@ bool DrawWaterSeepageResponseControls(
                             const char* format,
                             const char* help) {
         bool valueChanged = false;
+        const std::string rowFormat =
+            WaterProfileValueFormat(format, *value, baselineValue(value));
         if (keying != nullptr &&
             keying->runtimeState != nullptr &&
             !keying->features.empty()) {
@@ -58940,7 +59116,7 @@ bool DrawWaterSeepageResponseControls(
                 *value,
                 minimum,
                 maximum,
-                format,
+                rowFormat.c_str(),
                 ImGuiSliderFlags_None,
                 false,
                 &edited,
@@ -58958,7 +59134,7 @@ bool DrawWaterSeepageResponseControls(
                     value,
                     minimum,
                     maximum,
-                    format);
+                    rowFormat.c_str());
             tooltip(help);
         }
         changed |= valueChanged;
@@ -58986,6 +59162,10 @@ bool DrawWaterSeepageResponseControls(
             }
         }
         ImGui::EndCombo();
+    }
+    if (baselineBlendMode != nullptr && *baselineBlendMode != *blendMode) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(%s)", WaterEffectBlendModeLabel(*baselineBlendMode));
     }
     slider(
         "Prominence",
@@ -59077,6 +59257,17 @@ bool DrawWaterSeepageResponseControls(
         response->colouriseGreen = editedTint[1];
         response->colouriseBlue = editedTint[2];
         changed = true;
+    }
+    if (baselineResponse != nullptr &&
+        (std::abs(baselineResponse->colouriseRed - response->colouriseRed) > 1.0e-4F ||
+         std::abs(baselineResponse->colouriseGreen - response->colouriseGreen) > 1.0e-4F ||
+         std::abs(baselineResponse->colouriseBlue - response->colouriseBlue) > 1.0e-4F)) {
+        ImGui::SameLine();
+        ImGui::TextDisabled(
+            "(%.2f %.2f %.2f)",
+            baselineResponse->colouriseRed,
+            baselineResponse->colouriseGreen,
+            baselineResponse->colouriseBlue);
     }
     return changed;
 }
@@ -59888,7 +60079,12 @@ void DrawWaterSeepagePanel(
                 "Name, Position, and Move In View edit the primary node only; "
                 "select a single node to use them.");
         } else {
-            InputTextString("Name", &node->name);
+            if (InputTextString("Name", &node->name)) {
+                RenameWaterSeepageNodeObjectProfiles(
+                    &water,
+                    node->id,
+                    WaterFlowSourceDisplayName(node->name, node->id));
+            }
         }
         bool viewportEnabled = node->enabledInViewport;
         if (ImGui::Checkbox("Visible", &viewportEnabled)) {
@@ -60168,11 +60364,19 @@ void DrawWaterSeepagePanel(
     }
 
     if (deleteSelected) {
+        std::vector<std::uint32_t> deletedNodeIds;
+        deletedNodeIds.reserve(selectedSeepageIndices.size());
+        for (const auto index : selectedSeepageIndices) {
+            deletedNodeIds.push_back(water.seepageNodes[index].id);
+        }
         for (auto it = selectedSeepageIndices.rbegin();
              it != selectedSeepageIndices.rend();
              ++it) {
             water.seepageNodes.erase(
                 water.seepageNodes.begin() + static_cast<std::ptrdiff_t>(*it));
+        }
+        for (const auto nodeId : deletedNodeIds) {
+            RemoveWaterSeepageNodeObjectProfiles(&water, nodeId);
         }
         const auto deletedCount = selectedSeepageIndices.size();
         ClearWaterSeepageSelection(&water);
@@ -60268,11 +60472,16 @@ void DrawWaterSeepagePanel(
             "node. Editing creates a '<name>_edited' entry so you can switch between the saved "
             "and edited versions before overwriting. '_preset' entries cannot be saved over.");
         if (lookProfileOpen) {
-            const auto selectProfile = [&](std::string_view profileName) {
+            const auto selectProfile = [&](std::string_view profileName,
+                                           bool objectCopy = false) {
                 const std::string normalized =
                     NormalizedWaterSeepageProfileName(profileName);
                 const bool selected = namesIdentical && assignedName == normalized;
-                if (ImGui::Selectable(normalized.c_str(), selected)) {
+                // Other nodes may select a copy; only its owner's edits
+                // rewrite it.
+                const std::string displayLabel =
+                    objectCopy ? normalized + " (object copy)" : normalized;
+                if (ImGui::Selectable(displayLabel.c_str(), selected)) {
                     assignSeepageProfileToSelection(normalized, false);
                 }
                 if (selected) {
@@ -60281,7 +60490,14 @@ void DrawWaterSeepagePanel(
             };
             selectProfile("Default");
             for (const auto& profile : water.seepageLookProfiles) {
-                selectProfile(profile.name);
+                if (!profile.objectOverride) {
+                    selectProfile(profile.name);
+                }
+            }
+            for (const auto& profile : water.seepageLookProfiles) {
+                if (profile.objectOverride) {
+                    selectProfile(profile.name, true);
+                }
             }
             ImGui::EndCombo();
         }
@@ -60311,24 +60527,36 @@ void DrawWaterSeepagePanel(
                     "Editing %s",
                     BasePointVisualName(assignedName).c_str());
             } else if (IsPresetPointVisualName(assignedName)) {
-                ImGui::TextDisabled("Preset (read-only; saving creates a copy)");
+                ImGui::TextDisabled("Preset (read-only; editing saves this node's copy)");
             }
             const std::string shadowName =
                 EditedPointVisualName(BasePointVisualName(assignedName));
-            // A base assignment whose edited shadow already exists locks the
-            // editors: edits belong on the shadow so the saved profile stays
-            // intact until the user chooses to overwrite or discard it.
-            if (!assignedIsEdited &&
-                FindWaterSeepageLookProfileIndex(water, shadowName).has_value()) {
-                ImGui::TextColored(
-                    kSeepageNoticeColour,
-                    "An edited version '%s' exists; switch to it to edit these nodes.",
-                    shadowName.c_str());
-                const std::string switchLabel = "Switch to " + shadowName;
-                if (ImGui::Button(switchLabel.c_str())) {
-                    assignSeepageProfileToSelection(shadowName, false);
+            {
+                DrawWaterFlowObjectEditCaption(
+                    water.seepageLookProfiles,
+                    assignedName,
+                    assignedName,
+                    node->id,
+                    WaterFlowSourceDisplayName(node->name, node->id));
+                // The bracket baseline is the saved base a copy or a legacy
+                // edited shadow derives from.
+                const auto lookSettingsByName =
+                    [&](std::string_view name) -> WaterSeepageLookSettings {
+                    const auto index = FindWaterSeepageLookProfileIndex(water, name);
+                    return index.has_value()
+                        ? water.seepageLookProfiles[index.value()].settings
+                        : water.defaultSeepageLook;
+                };
+                std::optional<WaterSeepageLookSettings> lookBaseline;
+                if (const auto* copy = FindWaterFlowObjectProfileByName(
+                        water.seepageLookProfiles,
+                        assignedName);
+                    copy != nullptr) {
+                    lookBaseline = lookSettingsByName(copy->baseProfileName);
+                } else if (assignedIsEdited) {
+                    lookBaseline = lookSettingsByName(
+                        BasePointVisualName(assignedName));
                 }
-            } else {
                 WaterSeepageLookSettings editedLook = ViewedWaterSeepageLook(water, *node);
                 const WaterProfileKeyingContext keying{
                     .runtimeState = runtimeState,
@@ -60338,16 +60566,23 @@ void DrawWaterSeepagePanel(
                 };
                 if (DrawWaterSeepageSettingsControls(
                         &editedLook,
-                        &keying)) {
-                    if (const auto shadowIndex =
-                            FindWaterSeepageLookProfileIndex(water, shadowName);
-                        shadowIndex.has_value()) {
-                        water.seepageLookProfiles[shadowIndex.value()].settings = editedLook;
-                    } else {
-                        water.seepageLookProfiles.push_back(
-                            {.name = shadowName, .settings = editedLook});
-                    }
-                    assignSeepageProfileToSelection(shadowName, false);
+                        &keying,
+                        lookBaseline.has_value() ? &lookBaseline.value() : nullptr)) {
+                    // Edits land in the primary node's own copy; every other
+                    // selected node references that copy read-only.
+                    const auto copyName = CommitWaterFlowObjectProfileEdit(
+                        &water.seepageLookProfiles,
+                        &node->lookProfileName,
+                        assignedName,
+                        node->id,
+                        WaterFlowSourceDisplayName(node->name, node->id),
+                        [&](WaterSeepageLookProfile* profile) {
+                            profile->settings = editedLook;
+                        });
+                    assignSeepageProfileToSelection(copyName, false);
+                    runtimeState->statusMessage =
+                        "Saved seepage look edits to \"" + copyName + "\".";
+                    runtimeState->errorMessage.clear();
                 }
 
                 InputTextString("Look Name", &water.seepageLookNameBuffer);
@@ -60356,35 +60591,44 @@ void DrawWaterSeepagePanel(
                     const std::string targetName = BasePointVisualName(
                         trimmedName.empty() ? assignedName : trimmedName);
                     const auto settings = ViewedWaterSeepageLook(water, *node);
-                    if (targetName == "Default") {
-                        // The default look keeps its response half; only the
-                        // settings half is being saved here.
-                        const auto response = water.defaultSeepageLook.response;
-                        const auto blendMode = water.defaultSeepageLook.blendMode;
-                        water.defaultSeepageLook = settings;
-                        water.defaultSeepageLook.response = response;
-                        water.defaultSeepageLook.blendMode = blendMode;
-                    } else if (const auto profileIndex =
-                                   FindWaterSeepageLookProfileIndex(water, targetName);
-                               profileIndex.has_value()) {
-                        water.seepageLookProfiles[profileIndex.value()].settings = settings;
+                    if (FindWaterFlowObjectProfileByName(
+                            water.seepageLookProfiles,
+                            targetName) != nullptr) {
+                        runtimeState->errorMessage =
+                            "\"" + targetName +
+                            "\" is a node-specific copy; select its owner node to edit it.";
+                        runtimeState->statusMessage.clear();
                     } else {
-                        water.seepageLookProfiles.push_back(
-                            {.name = targetName, .settings = settings});
+                        if (targetName == "Default") {
+                            // The default look keeps its response half; only
+                            // the settings half is being saved here.
+                            const auto response = water.defaultSeepageLook.response;
+                            const auto blendMode = water.defaultSeepageLook.blendMode;
+                            water.defaultSeepageLook = settings;
+                            water.defaultSeepageLook.response = response;
+                            water.defaultSeepageLook.blendMode = blendMode;
+                        } else if (const auto profileIndex =
+                                       FindWaterSeepageLookProfileIndex(water, targetName);
+                                   profileIndex.has_value()) {
+                            water.seepageLookProfiles[profileIndex.value()].settings = settings;
+                        } else {
+                            water.seepageLookProfiles.push_back(
+                                {.name = targetName, .settings = settings});
+                        }
+                        const std::string savedShadowName = EditedPointVisualName(targetName);
+                        if (const auto shadowIndex =
+                                FindWaterSeepageLookProfileIndex(water, savedShadowName);
+                            shadowIndex.has_value()) {
+                            water.seepageLookProfiles.erase(
+                                water.seepageLookProfiles.begin() +
+                                static_cast<std::ptrdiff_t>(shadowIndex.value()));
+                        }
+                        reassignSeepageProfileNodes(savedShadowName, targetName, false);
+                        assignSeepageProfileToSelection(targetName, false);
+                        water.seepageLookNameBuffer = targetName;
+                        runtimeState->statusMessage = "Saved seepage look " + targetName + ".";
+                        runtimeState->errorMessage.clear();
                     }
-                    const std::string savedShadowName = EditedPointVisualName(targetName);
-                    if (const auto shadowIndex =
-                            FindWaterSeepageLookProfileIndex(water, savedShadowName);
-                        shadowIndex.has_value()) {
-                        water.seepageLookProfiles.erase(
-                            water.seepageLookProfiles.begin() +
-                            static_cast<std::ptrdiff_t>(shadowIndex.value()));
-                    }
-                    reassignSeepageProfileNodes(savedShadowName, targetName, false);
-                    assignSeepageProfileToSelection(targetName, false);
-                    water.seepageLookNameBuffer = targetName;
-                    runtimeState->statusMessage = "Saved seepage look " + targetName + ".";
-                    runtimeState->errorMessage.clear();
                 }
                 DrawWaterSeepageParameterTooltip(
                     "Saves the current settings under the base name in the Look Name field (suffixes "
@@ -60427,11 +60671,14 @@ void DrawWaterSeepagePanel(
             "seepage settings so the effect and its response can be mixed and matched. "
             "Editing creates a '<name>_edited' entry until saved or discarded.");
         if (responseProfileOpen) {
-            const auto selectProfile = [&](std::string_view profileName) {
+            const auto selectProfile = [&](std::string_view profileName,
+                                           bool objectCopy = false) {
                 const std::string normalized =
                     NormalizedWaterSeepageProfileName(profileName);
                 const bool selected = namesIdentical && assignedResponseName == normalized;
-                if (ImGui::Selectable(normalized.c_str(), selected)) {
+                const std::string displayLabel =
+                    objectCopy ? normalized + " (object copy)" : normalized;
+                if (ImGui::Selectable(displayLabel.c_str(), selected)) {
                     assignSeepageProfileToSelection(normalized, true);
                 }
                 if (selected) {
@@ -60440,7 +60687,14 @@ void DrawWaterSeepagePanel(
             };
             selectProfile("Default");
             for (const auto& profile : water.seepageResponseProfiles) {
-                selectProfile(profile.name);
+                if (!profile.objectOverride) {
+                    selectProfile(profile.name);
+                }
+            }
+            for (const auto& profile : water.seepageResponseProfiles) {
+                if (profile.objectOverride) {
+                    selectProfile(profile.name, true);
+                }
             }
             ImGui::EndCombo();
         }
@@ -60471,23 +60725,40 @@ void DrawWaterSeepagePanel(
                     "Editing %s",
                     BasePointVisualName(assignedResponseName).c_str());
             } else if (IsPresetPointVisualName(assignedResponseName)) {
-                ImGui::TextDisabled("Preset (read-only; saving creates a copy)");
+                ImGui::TextDisabled("Preset (read-only; editing saves this node's copy)");
             }
-            const std::string shadowName =
-                EditedPointVisualName(BasePointVisualName(assignedResponseName));
-            // A base assignment whose edited shadow already exists locks the
-            // editors; edits belong on the shadow.
-            if (!assignedIsEdited &&
-                FindWaterSeepageResponseProfileIndex(water, shadowName).has_value()) {
-                ImGui::TextColored(
-                    kSeepageNoticeColour,
-                    "An edited version '%s' exists; switch to it to edit these nodes.",
-                    shadowName.c_str());
-                const std::string switchLabel = "Switch to " + shadowName;
-                if (ImGui::Button(switchLabel.c_str())) {
-                    assignSeepageProfileToSelection(shadowName, true);
+            {
+                DrawWaterFlowObjectEditCaption(
+                    water.seepageResponseProfiles,
+                    assignedResponseName,
+                    assignedResponseName,
+                    node->id,
+                    WaterFlowSourceDisplayName(node->name, node->id));
+                const auto responseByName =
+                    [&](std::string_view name)
+                    -> invisible_places::water::WaterSeepageResponseProfile {
+                    if (const auto index =
+                            FindWaterSeepageResponseProfileIndex(water, name);
+                        index.has_value()) {
+                        return water.seepageResponseProfiles[index.value()];
+                    }
+                    return {
+                        .name = std::string{name},
+                        .response = water.defaultSeepageLook.response,
+                        .blendMode = water.defaultSeepageLook.blendMode,
+                    };
+                };
+                std::optional<invisible_places::water::WaterSeepageResponseProfile>
+                    responseBaseline;
+                if (const auto* copy = FindWaterFlowObjectProfileByName(
+                        water.seepageResponseProfiles,
+                        assignedResponseName);
+                    copy != nullptr) {
+                    responseBaseline = responseByName(copy->baseProfileName);
+                } else if (assignedIsEdited) {
+                    responseBaseline = responseByName(
+                        BasePointVisualName(assignedResponseName));
                 }
-            } else {
                 auto viewedLook = ViewedWaterSeepageLook(water, *node);
                 auto editedResponse = viewedLook.response;
                 auto editedBlendMode = viewedLook.blendMode;
@@ -60500,20 +60771,26 @@ void DrawWaterSeepagePanel(
                 if (DrawWaterSeepageResponseControls(
                         &editedResponse,
                         &editedBlendMode,
-                        &keying)) {
-                    const invisible_places::water::WaterSeepageResponseProfile shadow{
-                        .name = shadowName,
-                        .response = editedResponse,
-                        .blendMode = editedBlendMode,
-                    };
-                    if (const auto shadowIndex =
-                            FindWaterSeepageResponseProfileIndex(water, shadowName);
-                        shadowIndex.has_value()) {
-                        water.seepageResponseProfiles[shadowIndex.value()] = shadow;
-                    } else {
-                        water.seepageResponseProfiles.push_back(shadow);
-                    }
-                    assignSeepageProfileToSelection(shadowName, true);
+                        &keying,
+                        responseBaseline.has_value() ? &responseBaseline->response
+                                                     : nullptr,
+                        responseBaseline.has_value() ? &responseBaseline->blendMode
+                                                     : nullptr)) {
+                    const auto copyName = CommitWaterFlowObjectProfileEdit(
+                        &water.seepageResponseProfiles,
+                        &node->responseProfileName,
+                        assignedResponseName,
+                        node->id,
+                        WaterFlowSourceDisplayName(node->name, node->id),
+                        [&](invisible_places::water::WaterSeepageResponseProfile*
+                                profile) {
+                            profile->response = editedResponse;
+                            profile->blendMode = editedBlendMode;
+                        });
+                    assignSeepageProfileToSelection(copyName, true);
+                    runtimeState->statusMessage =
+                        "Saved seepage response edits to \"" + copyName + "\".";
+                    runtimeState->errorMessage.clear();
                 }
 
                 InputTextString("Response Name", &water.seepageResponseNameBuffer);
@@ -60522,36 +60799,45 @@ void DrawWaterSeepagePanel(
                     const std::string targetName = BasePointVisualName(
                         trimmedName.empty() ? assignedResponseName : trimmedName);
                     const auto resolved = ViewedWaterSeepageLook(water, *node);
-                    if (targetName == "Default") {
-                        water.defaultSeepageLook.response = resolved.response;
-                        water.defaultSeepageLook.blendMode = resolved.blendMode;
+                    if (FindWaterFlowObjectProfileByName(
+                            water.seepageResponseProfiles,
+                            targetName) != nullptr) {
+                        runtimeState->errorMessage =
+                            "\"" + targetName +
+                            "\" is a node-specific copy; select its owner node to edit it.";
+                        runtimeState->statusMessage.clear();
                     } else {
-                        const invisible_places::water::WaterSeepageResponseProfile saved{
-                            .name = targetName,
-                            .response = resolved.response,
-                            .blendMode = resolved.blendMode,
-                        };
-                        if (const auto profileIndex =
-                                FindWaterSeepageResponseProfileIndex(water, targetName);
-                            profileIndex.has_value()) {
-                            water.seepageResponseProfiles[profileIndex.value()] = saved;
+                        if (targetName == "Default") {
+                            water.defaultSeepageLook.response = resolved.response;
+                            water.defaultSeepageLook.blendMode = resolved.blendMode;
                         } else {
-                            water.seepageResponseProfiles.push_back(saved);
+                            const invisible_places::water::WaterSeepageResponseProfile saved{
+                                .name = targetName,
+                                .response = resolved.response,
+                                .blendMode = resolved.blendMode,
+                            };
+                            if (const auto profileIndex =
+                                    FindWaterSeepageResponseProfileIndex(water, targetName);
+                                profileIndex.has_value()) {
+                                water.seepageResponseProfiles[profileIndex.value()] = saved;
+                            } else {
+                                water.seepageResponseProfiles.push_back(saved);
+                            }
                         }
+                        const std::string savedShadowName = EditedPointVisualName(targetName);
+                        if (const auto shadowIndex =
+                                FindWaterSeepageResponseProfileIndex(water, savedShadowName);
+                            shadowIndex.has_value()) {
+                            water.seepageResponseProfiles.erase(
+                                water.seepageResponseProfiles.begin() +
+                                static_cast<std::ptrdiff_t>(shadowIndex.value()));
+                        }
+                        reassignSeepageProfileNodes(savedShadowName, targetName, true);
+                        assignSeepageProfileToSelection(targetName, true);
+                        water.seepageResponseNameBuffer = targetName;
+                        runtimeState->statusMessage = "Saved seepage response " + targetName + ".";
+                        runtimeState->errorMessage.clear();
                     }
-                    const std::string savedShadowName = EditedPointVisualName(targetName);
-                    if (const auto shadowIndex =
-                            FindWaterSeepageResponseProfileIndex(water, savedShadowName);
-                        shadowIndex.has_value()) {
-                        water.seepageResponseProfiles.erase(
-                            water.seepageResponseProfiles.begin() +
-                            static_cast<std::ptrdiff_t>(shadowIndex.value()));
-                    }
-                    reassignSeepageProfileNodes(savedShadowName, targetName, true);
-                    assignSeepageProfileToSelection(targetName, true);
-                    water.seepageResponseNameBuffer = targetName;
-                    runtimeState->statusMessage = "Saved seepage response " + targetName + ".";
-                    runtimeState->errorMessage.clear();
                 }
                 DrawWaterSeepageParameterTooltip(
                     "Saves the current response under the base name in the Response Name field and "

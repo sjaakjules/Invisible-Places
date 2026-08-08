@@ -3772,11 +3772,37 @@ WaterSeepageLookSettings ParseWaterSeepageLookSettings(const json& settingsJson)
     return settings;
 }
 
+// Object-copy metadata is emitted only for object-specific copies so shared
+// base profiles keep their pre-copy-schema shape byte for byte.
+template <typename ProfileDocument>
+void SerializeWaterProfileObjectCopyFields(
+    const ProfileDocument& profile,
+    json* profileJson) {
+    if (!profile.objectOverride) {
+        return;
+    }
+    (*profileJson)["object_override"] = true;
+    (*profileJson)["owner_object_id"] = profile.ownerObjectId;
+    (*profileJson)["base_profile_name"] = profile.baseProfileName;
+}
+
+template <typename ProfileDocument>
+void ParseWaterProfileObjectCopyFields(
+    const json& profileJson,
+    ProfileDocument* profile) {
+    profile->objectOverride = profileJson.value("object_override", false);
+    profile->ownerObjectId = profileJson.value("owner_object_id", 0U);
+    profile->baseProfileName =
+        profileJson.value("base_profile_name", std::string{});
+}
+
 json SerializeWaterSeepageLookProfile(const WaterSeepageLookProfile& profile) {
-    return json{
+    json profileJson{
         {"name", profile.name},
         {"settings", SerializeWaterSeepageLookSettings(profile.settings)},
     };
+    SerializeWaterProfileObjectCopyFields(profile, &profileJson);
+    return profileJson;
 }
 
 WaterSeepageLookProfile ParseWaterSeepageLookProfile(const json& profileJson) {
@@ -3785,16 +3811,19 @@ WaterSeepageLookProfile ParseWaterSeepageLookProfile(const json& profileJson) {
     if (profileJson.contains("settings")) {
         profile.settings = ParseWaterSeepageLookSettings(profileJson.at("settings"));
     }
+    ParseWaterProfileObjectCopyFields(profileJson, &profile);
     return profile;
 }
 
 json SerializeWaterSeepageResponseProfile(
     const invisible_places::water::WaterSeepageResponseProfile& profile) {
-    return json{
+    json profileJson{
         {"name", profile.name},
         {"response", SerializeWaterEffectResponseSettings(profile.response)},
         {"blend_mode", WaterEffectBlendModeName(profile.blendMode)},
     };
+    SerializeWaterProfileObjectCopyFields(profile, &profileJson);
+    return profileJson;
 }
 
 invisible_places::water::WaterSeepageResponseProfile ParseWaterSeepageResponseProfile(
@@ -3808,6 +3837,7 @@ invisible_places::water::WaterSeepageResponseProfile ParseWaterSeepageResponsePr
     if (profileJson.contains("blend_mode")) {
         profile.blendMode = ParseWaterEffectBlendMode(profileJson.at("blend_mode"));
     }
+    ParseWaterProfileObjectCopyFields(profileJson, &profile);
     return profile;
 }
 
@@ -7200,30 +7230,6 @@ WaterTrailGeometrySettings ParseWaterTrailGeometrySettings(const json& settingsJ
         0.0F,
         50.0F);
     return settings;
-}
-
-// Object-copy metadata is emitted only for object-specific copies so shared
-// base profiles keep their pre-schema-68/23 shape byte for byte.
-template <typename ProfileDocument>
-void SerializeWaterProfileObjectCopyFields(
-    const ProfileDocument& profile,
-    json* profileJson) {
-    if (!profile.objectOverride) {
-        return;
-    }
-    (*profileJson)["object_override"] = true;
-    (*profileJson)["owner_object_id"] = profile.ownerObjectId;
-    (*profileJson)["base_profile_name"] = profile.baseProfileName;
-}
-
-template <typename ProfileDocument>
-void ParseWaterProfileObjectCopyFields(
-    const json& profileJson,
-    ProfileDocument* profile) {
-    profile->objectOverride = profileJson.value("object_override", false);
-    profile->ownerObjectId = profileJson.value("owner_object_id", 0U);
-    profile->baseProfileName =
-        profileJson.value("base_profile_name", std::string{});
 }
 
 json SerializeWaterPathProfile(const WaterPathProfileDocument& profile) {
