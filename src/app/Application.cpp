@@ -78619,6 +78619,352 @@ int RunRendererFrameTimingScene3Smoke(
     return finish();
 }
 
+// Profiles the live viewport exactly as the interactive main loop renders a
+// saved project — water effects, overlays, and redraw gating included — then
+// re-samples with one water feature at a time removed from the uploaded
+// render state. The feature ablations never change authored runtime state
+// (rain/shoreline edits apply to the per-frame render-state copy only;
+// seepage toggles viewport enablement and restores it), so the report
+// attributes frame time to features without perturbing the project.
+int RunRendererFrameTimingProjectSmoke(
+    const GuiSmokeOptions& options,
+    const invisible_places::io::AssetCatalog& assetCatalog,
+    platform::Window* window,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    PreviewRuntimeState* runtimeState) {
+    const auto outputDirectory =
+        options.outputDirectory.empty()
+            ? std::filesystem::path{"build/macos-debug/renderer-frame-timing-project"}
+            : options.outputDirectory;
+    const auto reportPath =
+        outputDirectory / "renderer-frame-timing-project.json";
+    std::vector<std::string> passes;
+    std::vector<std::string> failures;
+
+    struct AblationSpec {
+        std::string name;
+        bool disableRain = false;
+        bool disableShoreline = false;
+        bool hideGeneratedWaterOverlays = false;
+        bool disableSeepage = false;
+        bool cachedScene = false;
+    };
+    const std::array<AblationSpec, 7> phases{{
+        {.name = "baseline"},
+        {.name = "rain_off", .disableRain = true},
+        {.name = "shoreline_off", .disableShoreline = true},
+        {.name = "seepage_off", .disableSeepage = true},
+        {.name = "flow_overlays_off", .hideGeneratedWaterOverlays = true},
+        {.name = "all_water_off",
+         .disableRain = true,
+         .disableShoreline = true,
+         .hideGeneratedWaterOverlays = true,
+         .disableSeepage = true},
+        {.name = "cached_scene",
+         .disableRain = true,
+         .disableShoreline = true,
+         .hideGeneratedWaterOverlays = true,
+         .disableSeepage = true,
+         .cachedScene = true},
+    }};
+    std::vector<std::pair<std::string, RendererFrameTimingSamples>> phaseSamples;
+    nlohmann::json layerReport = nlohmann::json::array();
+
+    auto finish = [&]() {
+        std::error_code createError;
+        std::filesystem::create_directories(outputDirectory, createError);
+        nlohmann::json report{
+            {"scenario", options.scenario},
+            {"passed", failures.empty()},
+            {"passes", passes},
+            {"failures", failures},
+            {"layers", layerReport},
+        };
+        for (const auto& [name, samples] : phaseSamples) {
+            report["phases"][name] = RendererFrameTimingSampleSummary(samples);
+        }
+        if (viewport != nullptr) {
+            const auto& diagnostics = viewport->Diagnostics();
+            report["present_mode"] = diagnostics.presentMode;
+            report["swapchain_image_count"] = diagnostics.swapchainImageCount;
+            report["frames_in_flight"] = diagnostics.framesInFlight;
+            report["gpu_timestamp_supported"] =
+                diagnostics.gpuTimestampsSupported;
+            report["viewport_width"] = diagnostics.width;
+            report["viewport_height"] = diagnostics.height;
+        }
+        std::ofstream output{reportPath, std::ios::trunc};
+        if (!output.is_open()) {
+            std::cerr << "Failed to write renderer project timing report: "
+                      << reportPath.string() << "\n";
+            return 1;
+        }
+        output << report.dump(2) << '\n';
+        std::cout << "Renderer project timing report: " << reportPath.string()
+                  << "\n";
+        return failures.empty() ? 0 : 1;
+    };
+
+    if (window == nullptr || viewport == nullptr || runtimeState == nullptr) {
+        failures.emplace_back(
+            "Project timing smoke requires a live window, viewport, and runtime.");
+        return finish();
+    }
+
+    const auto projectPath = options.projectPath.empty()
+        ? assetCatalog.dataRoot.parent_path() / "Saved" /
+              "ExhibitionFinal_project.json"
+        : options.projectPath;
+    std::string loadError;
+    const auto project = invisible_places::serialization::LoadProjectDocument(
+        projectPath,
+        &loadError);
+    if (!project.has_value()) {
+        failures.emplace_back("Project did not load: " + loadError);
+        return finish();
+    }
+    if (!ApplyProjectDocumentToRuntime(project.value(), runtimeState, viewport)) {
+        failures.emplace_back(
+            "Project could not be applied: " +
+            (runtimeState->errorMessage.empty() ? runtimeState->statusMessage
+                                                : runtimeState->errorMessage));
+        return finish();
+    }
+    passes.emplace_back("Loaded project " + projectPath.filename().string() + ".");
+
+    const auto startedAt = std::chrono::steady_clock::now();
+    const auto liveSeconds = [&]() {
+        return std::chrono::duration<float>(
+                   std::chrono::steady_clock::now() - startedAt)
+            .count();
+    };
+
+    // One frame of the interactive loop's render path, minus panels/input.
+    // Ablations mutate only the local render-state copy before upload.
+    // capturedState is filled on request only: an unconditional per-frame
+    // copy-out would tax the sampled CPU timings.
+    const auto pumpFrame = [&](const AblationSpec& spec,
+                               RendererFrameTimingSamples* samples,
+                               invisible_places::renderer::core::
+                                   SceneRenderState* capturedState =
+                                       nullptr) {
+        window->PollEvents();
+        PollPendingLayerLoad(runtimeState, viewport);
+        PollTimingColouriseHistogram(runtimeState);
+        EnsureWaterSurfaceCacheReady(runtimeState, viewport);
+        PollWaterRegionPointPreviewJob(runtimeState);
+        PollWaterFlowTrailBuildJob(runtimeState, viewport);
+        PollWaterRippleLiveEffectRefresh(runtimeState, viewport);
+        SyncWaterRegionPointPreviewHighlights(runtimeState, viewport);
+        CommitReadySceneDisplaySwitches(runtimeState, viewport);
+        StartQueuedLayerLoadIfIdle(runtimeState);
+        viewport->BeginUiFrame();
+        const auto waterFrameState = ResolveWaterFrameState(runtimeState);
+        EnsureWaterSeepageRuntimeUpToDate(
+            runtimeState,
+            viewport,
+            &waterFrameState);
+        const float liveWaterTimeSeconds = liveSeconds();
+        EnsureWaterDynamicMeshFlowGpuUpToDate(
+            runtimeState,
+            viewport,
+            waterFrameState,
+            liveWaterTimeSeconds);
+        viewport->SetDiagnosticsEnabled(true);
+        viewport->SetSceneCachingEnabled(spec.cachedScene);
+        viewport->SetLiveSceneRenderingEnabled(true);
+        viewport->SetLiveRainSimulationEnabled(!spec.disableRain);
+        const bool previewLiveEffectsAffectScene =
+            PreviewLiveVisualEffectsRequireSceneRedraw(
+                *runtimeState,
+                *viewport,
+                liveWaterTimeSeconds);
+        const float previewFlowTimeSeconds =
+            previewLiveEffectsAffectScene ? liveWaterTimeSeconds : 0.0F;
+        auto renderState = BuildRenderState(
+            *runtimeState,
+            *viewport,
+            previewFlowTimeSeconds,
+            &waterFrameState);
+        if (spec.disableRain) {
+            renderState.rainSettings.enabled = false;
+        }
+        if (spec.disableShoreline) {
+            renderState.additionalShorelines.clear();
+            for (auto& layer : renderState.pointCloudLayers) {
+                ClearPointCloudStyleShoreline(&layer.style);
+            }
+        }
+        if (spec.hideGeneratedWaterOverlays) {
+            std::erase_if(
+                renderState.pointCloudLayers,
+                [](const auto& layer) { return layer.generatedWaterOverlay; });
+        }
+        const auto renderStateSignature = RenderStateSignature(renderState);
+        const bool renderStateChanged =
+            !runtimeState->previewRenderStateSignatureValid ||
+            runtimeState->previewRenderStateSignature != renderStateSignature;
+        if (renderStateChanged ||
+            runtimeState->projectSettings.constantUpdateView ||
+            (previewLiveEffectsAffectScene && !spec.cachedScene)) {
+            viewport->UpdateRenderState(renderState);
+            runtimeState->previewRenderStateSignature = renderStateSignature;
+            runtimeState->previewRenderStateSignatureValid = true;
+        }
+        viewport->DrawFrame();
+        const auto& diagnostics = viewport->Diagnostics();
+        if (samples != nullptr) {
+            samples->cpuMilliseconds.push_back(diagnostics.frameRenderMs);
+            samples->cpuUiFinalizeMilliseconds.push_back(
+                diagnostics.frameUiRenderMs);
+            samples->cpuFrameSlotFenceWaitMilliseconds.push_back(
+                diagnostics.frameFenceWaitMs);
+            samples->cpuCompletedMaintenanceMilliseconds.push_back(
+                diagnostics.frameCompletedMaintenanceMs);
+            samples->cpuHighQualityGaussianPrepareMilliseconds.push_back(
+                diagnostics.frameHighQualityGaussianPrepareMs);
+            samples->cpuUniformResourceUploadMilliseconds.push_back(
+                diagnostics.frameUniformResourceUploadMs);
+            samples->cpuAcquireMilliseconds.push_back(
+                diagnostics.frameAcquireMs);
+            samples->imageOwnerWaitMilliseconds.push_back(
+                diagnostics.frameImageWaitMs);
+            samples->cpuResetRetirePollingMilliseconds.push_back(
+                diagnostics.frameResetRetirePollingMs);
+            samples->cpuCommandEncodingMilliseconds.push_back(
+                diagnostics.frameCommandBufferMs);
+            samples->cpuSubmitMilliseconds.push_back(
+                diagnostics.frameSubmitMs);
+            samples->cpuPresentMilliseconds.push_back(
+                diagnostics.framePresentMs);
+            samples->cpuPlatformWindowsMilliseconds.push_back(
+                diagnostics.framePlatformWindowsMs);
+            if (diagnostics.gpuTimestampResultsAvailable) {
+                samples->gpuMilliseconds.push_back(
+                    diagnostics.gpuTotal.milliseconds);
+                const auto appendActive =
+                    [](std::vector<double>* values,
+                       const invisible_places::renderer::core::
+                           GpuPhaseDiagnostics& phase) {
+                        if (phase.active) {
+                            values->push_back(phase.milliseconds);
+                        }
+                    };
+                appendActive(
+                    &samples->gpuRainComputeMilliseconds,
+                    diagnostics.gpuRainCompute);
+                appendActive(
+                    &samples->gpuDepthMilliseconds,
+                    diagnostics.gpuDepth);
+                appendActive(
+                    &samples->gpuWeightedAccumulationMilliseconds,
+                    diagnostics.gpuWeightedAccumulation);
+                appendActive(
+                    &samples->gpuCompositeMilliseconds,
+                    diagnostics.gpuComposite);
+                appendActive(
+                    &samples->gpuOpaqueAndHighQualityMilliseconds,
+                    diagnostics.gpuOpaqueAndHighQuality);
+                appendActive(
+                    &samples->gpuPostProcessMilliseconds,
+                    diagnostics.gpuPostProcess);
+                appendActive(
+                    &samples->gpuImGuiMilliseconds,
+                    diagnostics.gpuImGui);
+            }
+        }
+        if (capturedState != nullptr) {
+            *capturedState = std::move(renderState);
+        }
+    };
+
+    // Let the project's scene displays, water caches, and overlays settle.
+    const AblationSpec baselineSpec = phases.front();
+    const auto loadDeadline =
+        std::chrono::steady_clock::now() + std::chrono::minutes{12};
+    while (std::chrono::steady_clock::now() < loadDeadline &&
+           !window->ShouldClose() &&
+           (runtimeState->pendingLoad.has_value() ||
+            !runtimeState->persistence.queuedLoads.empty())) {
+        pumpFrame(baselineSpec, nullptr);
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+    if (runtimeState->pendingLoad.has_value() ||
+        !runtimeState->persistence.queuedLoads.empty()) {
+        failures.emplace_back(
+            "The project's layer loads did not settle before the deadline.");
+        return finish();
+    }
+    for (std::uint32_t frame = 0U; frame < 180U; ++frame) {
+        pumpFrame(baselineSpec, nullptr);
+    }
+    passes.emplace_back("Scene loads and water caches settled.");
+
+    // Seepage viewport enablement is runtime state (its topology lives on the
+    // GPU), so its ablation toggles the authored flags and restores them.
+    std::vector<bool> stashedSeepageEnablement;
+    for (const auto& node : runtimeState->water.seepageNodes) {
+        stashedSeepageEnablement.push_back(node.enabledInViewport);
+    }
+    const auto setSeepageEnabled = [&](bool enabled) {
+        for (std::size_t nodeIndex = 0U;
+             nodeIndex < runtimeState->water.seepageNodes.size();
+             ++nodeIndex) {
+            runtimeState->water.seepageNodes[nodeIndex].enabledInViewport =
+                enabled
+                    ? stashedSeepageEnablement[nodeIndex]
+                    : false;
+        }
+    };
+
+    constexpr std::uint32_t kSettleFrames = 45U;
+    constexpr std::uint32_t kSampleFrames = 180U;
+    for (const auto& spec : phases) {
+        setSeepageEnabled(!spec.disableSeepage);
+        for (std::uint32_t frame = 0U; frame < kSettleFrames; ++frame) {
+            pumpFrame(spec, nullptr);
+        }
+        RendererFrameTimingSamples samples;
+        invisible_places::renderer::core::SceneRenderState lastRenderState;
+        for (std::uint32_t frame = 0U; frame + 1U < kSampleFrames; ++frame) {
+            pumpFrame(spec, &samples);
+        }
+        pumpFrame(spec, &samples, &lastRenderState);
+        if (spec.name == "baseline") {
+            for (const auto& layer : lastRenderState.pointCloudLayers) {
+                layerReport.push_back({
+                    {"layer_id", layer.layerId},
+                    {"draw_point_count", layer.drawPointCount},
+                    {"generated_water_overlay", layer.generatedWaterOverlay},
+                    {"world_z_bounds_valid", layer.worldZBoundsValid},
+                    {"world_min_z", layer.worldMinZ},
+                    {"world_max_z", layer.worldMaxZ},
+                    {"rain_band_reachable",
+                     !layer.worldZBoundsValid ||
+                         invisible_places::water::RainImpactEffectsCanReachZRange(
+                             lastRenderState.rainSettings,
+                             layer.worldMinZ,
+                             layer.worldMaxZ,
+                             1.0F)},
+                    {"shoreline_style",
+                     invisible_places::renderer::pointcloud::
+                         PointCloudStyleHasShorelineWaveRegion(layer.style)},
+                    {"shoreline_instances_eligible",
+                     layer.shorelineInstancesEligible},
+                    {"flow_animation", layer.style.flowAnimation},
+                    {"water_trail_overlay", layer.style.waterTrailOverlay},
+                });
+            }
+        }
+        phaseSamples.emplace_back(spec.name, std::move(samples));
+    }
+    setSeepageEnabled(true);
+    passes.emplace_back("Captured all timing phases.");
+
+    viewport->WaitIdle();
+    return finish();
+}
+
 int RunGpuCollisionRainSmoke(
     const GuiSmokeOptions& options,
     const invisible_places::io::AssetCatalog& assetCatalog,
@@ -87925,6 +88271,17 @@ int Application::Run(ApplicationRunOptions options) const {
         }
         if (options.guiSmoke->scenario == "renderer-frame-timing-scene3-5mm") {
             const auto smokeExitCode = RunRendererFrameTimingScene3Smoke(
+                options.guiSmoke.value(),
+                assetCatalog,
+                &window,
+                &viewport.value(),
+                &runtimeState);
+            StopBackgroundWorkForShutdown(&runtimeState);
+            viewport->WaitIdle();
+            return smokeExitCode;
+        }
+        if (options.guiSmoke->scenario == "renderer-frame-timing-project") {
+            const auto smokeExitCode = RunRendererFrameTimingProjectSmoke(
                 options.guiSmoke.value(),
                 assetCatalog,
                 &window,

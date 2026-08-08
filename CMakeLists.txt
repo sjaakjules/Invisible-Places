@@ -372,6 +372,23 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
                 TIMEOUT 900
         )
         add_test(
+            NAME renderer-frame-timing-project
+            COMMAND
+                $<TARGET_FILE:invisible_places>
+                "${CMAKE_CURRENT_SOURCE_DIR}/Data"
+                --gui-smoke renderer-frame-timing-project
+                --smoke-project "${CMAKE_CURRENT_SOURCE_DIR}/Saved/ExhibitionFinal_project.json"
+                --smoke-output "${CMAKE_CURRENT_BINARY_DIR}/renderer-frame-timing-project"
+        )
+        set_tests_properties(
+            renderer-frame-timing-project
+            PROPERTIES
+                LABELS "gui_smoke;renderer_timing;full_site"
+                RUN_SERIAL TRUE
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                TIMEOUT 1800
+        )
+        add_test(
             NAME water-region-sample-terrestrial-gui-smoke
             COMMAND
                 $<TARGET_FILE:invisible_places>
