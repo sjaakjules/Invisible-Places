@@ -76,6 +76,75 @@ Right now the debug target is most useful for:
 - Fast Preview MP4 and preview-density EXR animation export,
 - EXR writer and offline LiDAR tile-rendering tests.
 
+## Export memory telemetry
+
+Animation export logs record macOS `TASK_VM_INFO` memory ledgers at export
+start, after GPU readback, when each frame is ready for the writer, and at
+export finish. The live export summary shows the latest and peak process
+footprint plus graphics and compressed memory. It also shows macOS system
+thermal pressure (`nominal`, `fair`, `serious`, or `critical`) and retains the
+worst state sampled during the export. This is the operating system's thermal
+pressure signal, not a raw temperature sensor reading; `serious` or `critical`
+alongside slower GPU samples is strong evidence of protective throttling.
+
+On macOS, the log's pressure metric uses the full physical footprint. Export
+admission, queue sizing, and the hard memory safety threshold deliberately use
+ordinary resident memory: Apple Silicon's physical-footprint ledger includes
+the scene's large shared Vulkan/MoltenVK allocations and could otherwise reject
+a valid export before it starts. Linux currently has resident-memory telemetry
+only.
+
+Completed export logs end with a `Memory Samples (CSV)` section. For repeated
+render comparisons, use the same scene, resolution, supersampling, renderer,
+and frame range, then compare:
+
+- `physical_footprint_bytes` for total process pressure,
+- `graphics_footprint_bytes` for GPU/driver retention,
+- `compressed_bytes` for accumulated compressed allocations,
+- `resident_bytes` for ordinary mapped process pages,
+- `thermal_state` for OS-reported thermal pressure at that sample,
+- readback and frame-ready rows to distinguish temporary per-frame allocation
+  cycles from a rising baseline.
+
+The memory summary also records the app's directly tracked point-cloud
+allocations at export start: CPU geometry/colour capacity, CPU scalar-field
+capacity, and Vulkan point-buffer bytes. These values explain the stable scene
+payload; growth in the OS physical or graphics footprint while the tracked
+point buffers stay fixed points instead to export/driver retention or
+per-frame churn.
+
+The resident, compressed, and graphics values are overlapping accounting
+views; do not add them together. Use `physical_footprint_bytes` as the total
+pressure metric and the other columns to identify its likely source.
+
+### Camera-path culling
+
+`Camera-path frustum mask: yes` means the export computed one conservative
+union of the frusta for every requested frame, then submitted only point-cloud
+cells that can contribute somewhere along that frozen path. This is still full
+authored density inside the retained cells; it is not playback-density
+sampling. `Frustum-mask retained` and the retained/full point counts show the
+actual vertex-work reduction. The mask deliberately expands every retained
+grid cell by one neighbouring cell in each direction so boundary points are
+not lost.
+
+The union is prepared once and uploaded once. A separate point-index upload on
+every frame could cull more aggressively, but would add large CPU work,
+transfer traffic, and GPU synchronization to the frame loop. If a useful union
+cannot be formed, the log says `Camera-path frustum mask: no` and the renderer
+falls back to the full source; GPU clip-space rejection still protects the
+image, but it does not avoid fetching and shading those off-camera vertices.
+
+Full-density scene sessions loaded only for export are reused across one batch
+to avoid needless reloads, then released after an independent export or the
+final batch item. A coarser committed display bundle stays GPU resident, CPU
+analysis sources used by Shoreline/Seepage/Rain/Flow remain available, and the
+shared 10 mm water-surface cache stays warm. This bounds back-to-back GPU
+residency without changing output or making every item in a batch pay the
+full-density load cost again. The export log's finish sample is deliberately
+taken before teardown so comparisons still record the complete render's end
+pressure; the UI status and console report the subsequent release.
+
 As richer AOVs, full-density final-output validation, command-line rendering, and procedural motion are added, the same debug flow should keep working with the same debug preset and LLDB launch configs.
 
 ## Console noise on macOS

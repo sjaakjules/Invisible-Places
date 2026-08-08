@@ -152,6 +152,7 @@ add_library(
     invisible_places_core
     src/app/Application.cpp
     src/app/PointVisualSelection.cpp
+    src/app/ProcessMemoryTelemetry.cpp
     src/app/UsedScalarFields.cpp
     src/app/WaterPathDiagnostics.cpp
     src/camera/AnimationPath.cpp
@@ -313,6 +314,7 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
             tests/PointCloudFieldCacheTests.cpp
             tests/PointCloudFieldResidencyTests.cpp
             tests/PointCloudVariantsTests.cpp
+            tests/ProcessMemoryTelemetryTests.cpp
             tests/ProjectDocumentSerializationTests.cpp
             tests/RenderSetupDocumentTests.cpp
             tests/RainImpactGpuEquivalenceTests.cpp
