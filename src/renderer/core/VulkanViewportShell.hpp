@@ -228,6 +228,13 @@ struct SceneRenderState {
         // SAND-role layers render the scene's additional shoreline
         // instances alongside (or without) the style's own shoreline.
         bool shorelineInstancesEligible = false;
+        // World-space Z extent of the layer's points. Rain impact shading is
+        // gated per point by world-Z height bands, so a layer whose extent no
+        // enabled band can reach may skip the impact-capable material variant
+        // entirely. Invalid bounds keep the conservative all-layers forcing.
+        bool worldZBoundsValid = false;
+        float worldMinZ = 0.0F;
+        float worldMaxZ = 0.0F;
         std::uint32_t drawPointCount = 0;
         renderer::pointcloud::PointCloudDensityCompensation densityCompensation{};
         invisible_places::water::WaterSurfaceRole rainCollisionRole =

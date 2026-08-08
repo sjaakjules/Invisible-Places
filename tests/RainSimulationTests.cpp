@@ -317,6 +317,49 @@ void WritePreGroundSurfaceCache(
 
 }  // namespace
 
+TEST_CASE("rain impact band reach gates layers by world Z extent", "[water][rain][impact]") {
+    invisible_places::water::RainRuntimeSettings settings;
+    settings.enabled = true;
+    settings.impactEffectsEnabled = true;
+    settings.sandEffectsEnabled = true;
+    settings.rockEffectsEnabled = false;
+    settings.vegetationEffectsEnabled = false;
+    settings.sandImpactBand = {-1.0F, 2.0F, 0.30F};
+
+    using invisible_places::water::RainImpactEffectsCanReachZRange;
+    // Layer straddling the band.
+    CHECK(RainImpactEffectsCanReachZRange(settings, 0.0F, 5.0F, 1.0F));
+    // Layer entirely above the band, beyond fade + margin.
+    CHECK_FALSE(RainImpactEffectsCanReachZRange(settings, 4.0F, 12.0F, 1.0F));
+    // Layer above the band but within fade + margin of its top edge.
+    CHECK(RainImpactEffectsCanReachZRange(settings, 3.0F, 12.0F, 1.0F));
+    // Layer entirely below the band, beyond fade + margin.
+    CHECK_FALSE(RainImpactEffectsCanReachZRange(settings, -12.0F, -3.0F, 1.0F));
+
+    // An unbounded band edge reaches arbitrarily far.
+    settings.sandImpactBand = {
+        -invisible_places::water::kRainImpactBandUnbounded,
+        2.0F,
+        0.30F};
+    CHECK(RainImpactEffectsCanReachZRange(settings, -500.0F, -400.0F, 1.0F));
+    CHECK_FALSE(RainImpactEffectsCanReachZRange(settings, 4.0F, 12.0F, 1.0F));
+
+    // A second enabled effect extends the reachable union.
+    settings.vegetationEffectsEnabled = true;
+    settings.vegetationImpactBand = {
+        2.5F,
+        invisible_places::water::kRainImpactBandUnbounded,
+        0.30F};
+    CHECK(RainImpactEffectsCanReachZRange(settings, 4.0F, 12.0F, 1.0F));
+
+    // Master toggles gate everything.
+    settings.impactEffectsEnabled = false;
+    CHECK_FALSE(RainImpactEffectsCanReachZRange(settings, 0.0F, 5.0F, 1.0F));
+    settings.impactEffectsEnabled = true;
+    settings.enabled = false;
+    CHECK_FALSE(RainImpactEffectsCanReachZRange(settings, 0.0F, 5.0F, 1.0F));
+}
+
 TEST_CASE("rain collision input streams only positions and normals", "[water][rain][cache]") {
     TemporaryDirectory temporary;
     const auto path = temporary.path / "points.ply";

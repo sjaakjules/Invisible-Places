@@ -1533,6 +1533,31 @@ std::uint32_t RainImpactEffectMask(const RainRuntimeSettings& settings) {
     return mask;
 }
 
+bool RainImpactEffectsCanReachZRange(
+    const RainRuntimeSettings& settings,
+    float minZ,
+    float maxZ,
+    float marginMeters) {
+    const std::uint32_t mask = RainImpactEffectMask(settings);
+    if (mask == 0U) {
+        return false;
+    }
+    const auto bandReaches = [&](const RainImpactHeightBand& band) {
+        const auto sanitized = SanitizeRainImpactHeightBand(band);
+        const float reach =
+            std::max(1.0e-3F, sanitized.fadeMeters) +
+            std::max(0.0F, marginMeters);
+        return maxZ >= sanitized.minZ - reach &&
+               minZ <= sanitized.maxZ + reach;
+    };
+    return ((mask & kRainImpactEffectRingsBit) != 0U &&
+            bandReaches(settings.sandImpactBand)) ||
+           ((mask & kRainImpactEffectWetnessBit) != 0U &&
+            bandReaches(settings.rockImpactBand)) ||
+           ((mask & kRainImpactEffectDropletsBit) != 0U &&
+            bandReaches(settings.vegetationImpactBand));
+}
+
 RainParticleVisualShape EvaluateRainParticleVisualShape(
     float authoredWidthMeters,
     float authoredLengthMeters,

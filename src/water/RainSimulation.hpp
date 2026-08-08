@@ -208,6 +208,17 @@ struct RainIntensityMultipliers {
 [[nodiscard]] std::uint32_t RainImpactEffectMask(
     const RainRuntimeSettings& settings);
 
+// True when at least one enabled impact effect's sanitized height band —
+// extended by its fade feather plus marginMeters — can reach points whose
+// world Z lies within [minZ, maxZ]. A layer this returns false for shades
+// every impact model to exactly zero, so it may keep a cheaper material
+// variant than the impact-capable one.
+[[nodiscard]] bool RainImpactEffectsCanReachZRange(
+    const RainRuntimeSettings& settings,
+    float minZ,
+    float maxZ,
+    float marginMeters);
+
 [[nodiscard]] RainIntensityMultipliers RainIntensityValues(RainIntensityPreset preset);
 [[nodiscard]] WaterRainVisualSettings RainVisualPreset(std::string_view name);
 [[nodiscard]] std::array<std::string_view, 3> RainVisualPresetNames();

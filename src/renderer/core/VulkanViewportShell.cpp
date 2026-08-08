@@ -2683,15 +2683,27 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     const bool rainCanShadeThisFrame =
         renderState_.rainSettings.rainLevel > 1.0e-5F ||
         RainImpactEffectsRequireRedraw(renderState_.flowTimeSeconds);
+    // The impact models shade any layer's points inside their world-Z height
+    // bands, independent of the layer's collision role — but a layer whose Z
+    // extent no enabled band can reach evaluates every model to exactly zero,
+    // so it may keep its cheaper (early-z) material variant. The margin
+    // covers surface-motion vertical offsets on top of each band's fade
+    // feather.
+    constexpr float kRainImpactLayerBoundsMarginMeters = 1.0F;
     for (auto& layer : renderState_.pointCloudLayers) {
-        // Every layer takes the impact-capable material variant while the
-        // effects are on: the models shade all clouds' points inside their
-        // height bands, independent of the layer's collision role.
+        const bool impactCanReachLayer =
+            !layer.worldZBoundsValid ||
+            invisible_places::water::RainImpactEffectsCanReachZRange(
+                renderState_.rainSettings,
+                layer.worldMinZ,
+                layer.worldMaxZ,
+                kRainImpactLayerBoundsMarginMeters);
         layer.style.rainImpactEffects =
             liveRainSimulationEnabled_ &&
             renderState_.rainSettings.enabled &&
             renderState_.rainSettings.impactEffectsEnabled &&
-            rainCanShadeThisFrame;
+            rainCanShadeThisFrame &&
+            impactCanReachLayer;
     }
     ++sceneRevision_;
 
@@ -14592,10 +14604,19 @@ VulkanViewportShell::ResolvePointCloudLayerMaterialVariant(
     const bool hasTimingColourise =
         renderer::pointcloud::TimingColouriseStackHasActiveEffects(
             layer.timingColourise);
+    // Shoreline waves are evaluated only by the unified procedural shader,
+    // and historically rode along on the rain forcing that put every layer
+    // on it. Rain forcing is now band-gated per layer, so shoreline must
+    // claim the unified material explicitly.
+    const bool hasShorelineWaves =
+        renderer::pointcloud::PointCloudStyleHasShorelineWaveRegion(
+            layer.style) ||
+        (layer.shorelineInstancesEligible &&
+         !renderState_.additionalShorelines.empty());
     return renderer::pointcloud::ResolvePointCloudMaterialVariant(
         layer.style,
         layer.densityCompensation,
-        hasAttachedSeepage || hasTimingColourise);
+        hasAttachedSeepage || hasTimingColourise || hasShorelineWaves);
 }
 
 bool VulkanViewportShell::LayerUsesDepthTestedAccumulation(
@@ -14606,8 +14627,18 @@ bool VulkanViewportShell::LayerUsesDepthTestedAccumulation(
     // seepage, rain shading) were not forcing the unified material. Those
     // layers are opaque-styled, so depth-testing their weighted accumulation
     // against the prepass depth culls only fragments an opaque pass would
-    // hide anyway. Genuinely translucent layers never qualify.
+    // hide anyway. Genuinely translucent layers never qualify. Shoreline
+    // waves author partially transparent points (opacity multipliers below
+    // one), so a wave layer's prepass depth would wrongly cull geometry
+    // behind its translucent crests — shoreline-forced layers stay on plain
+    // weighted accumulation.
+    const bool hasShorelineWaves =
+        renderer::pointcloud::PointCloudStyleHasShorelineWaveRegion(
+            layer.style) ||
+        (layer.shorelineInstancesEligible &&
+         !renderState_.additionalShorelines.empty());
     return renderState_.previewPerformanceMode &&
+           !hasShorelineWaves &&
            materialVariant ==
                renderer::pointcloud::PointCloudMaterialVariant::Unified &&
            renderer::pointcloud::ResolvePointCloudMaterialVariant(

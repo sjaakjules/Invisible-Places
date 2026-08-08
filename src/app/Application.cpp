@@ -75961,6 +75961,9 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                      IsAuthoredTimingColouriseLayer(session),
                  .shorelineInstancesEligible =
                      SceneRoleIs(session.sceneRole, "sand"),
+                 .worldZBoundsValid = session.bounds.valid,
+                 .worldMinZ = session.bounds.minimum.z,
+                 .worldMaxZ = session.bounds.maximum.z,
                  .drawPointCount = static_cast<std::uint32_t>(drawPointCount),
                  .densityCompensation = ResolveSessionDensityCompensation(runtimeState, session),
                  .rainCollisionRole = RainCollisionRoleForSession(session)});
