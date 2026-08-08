@@ -1176,6 +1176,37 @@ void main() {
     vec4 viewPosition = uniforms.view * worldPosition;
     const float viewDepth = -viewPosition.z;
     gl_Position = uniforms.viewProjection * worldPosition;
+    // Point primitives are clipped by their centre, so a centre outside the
+    // clip volume never rasterises and its effect resolution is
+    // unobservable. Skip the whole procedural stack for those points: with
+    // the camera inside the scene, a large share of the cloud sits behind
+    // or beside the frustum yet runs this shader every frame. The 5% slack
+    // keeps partially conformant point-clipping implementations exact at
+    // the viewport edge; visible points resolve identically to before.
+    const float effectCullLimit = gl_Position.w * 1.05;
+    if (gl_Position.w <= 0.0 ||
+        abs(gl_Position.x) > effectCullLimit ||
+        abs(gl_Position.y) > effectCullLimit ||
+        gl_Position.z < -0.05 * gl_Position.w ||
+        gl_Position.z > effectCullLimit) {
+        gl_PointSize = max(1.0, styleData.renderParams3.y);
+        outOpacity = 0.0;
+        outDepthFade = 0.0;
+        outViewDepth = viewDepth;
+        outPointIndex = pointIndex;
+#ifndef DEPTH_PREPASS
+        outSourceColor = inColor;
+        outColormapValue = 0.0;
+        outEmissive = 0.0;
+        outSurfaceAngleMask = 0.0;
+        outAovNormal = vec3(0.0);
+        outCaustic = 0.0;
+        outWaterColourTransform = vec4(0.0, 0.0, 0.0, 1.0);
+        outTimingColouriseTransform = vec4(0.0, 0.0, 0.0, 1.0);
+        outTimingColouriseEmissionAdd = 0.0;
+#endif
+        return;
+    }
     float previewTint = 0.0;
     const float caustic = ResolveCausticStrength(worldPosition.xyz, pointIndex, previewTint);
     const float waterEffectScale = ResolveRippleEffectScale(pointIndex);
