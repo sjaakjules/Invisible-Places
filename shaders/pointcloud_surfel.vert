@@ -726,8 +726,7 @@ vec2 WaterTrailRouteSegment(uint pointIndex, float phase) {
     return vec2(float(anchorOffset), fract(routePosition));
 }
 
-float WaterTrailVisibility(uint pointIndex) {
-    const float phase = WaterTrailTravelPhase(pointIndex);
+float WaterTrailVisibility(uint pointIndex, float phase) {
     const float routeLength = max(0.001, LoadScalarFieldValue(kWaterTrailRouteLengthFieldSlot, pointIndex));
     const float trailStreakLength = WaterTrailStreakLength(pointIndex);
     const float endFeather = clamp(trailStreakLength / routeLength, 0.001, 0.10);
@@ -834,13 +833,15 @@ vec3 WaterTrailRouteNormal(uint pointIndex, float phase) {
     return dot(normal, normal) > 1e-8 ? normalize(normal) : vec3(0.0, 0.0, 1.0);
 }
 
-vec3 ResolveWaterTrailPosition(vec3 basePosition, uint pointIndex) {
-    const float trailRole = LoadScalarFieldValue(kWaterTrailRoleFieldSlot, pointIndex);
+vec3 ResolveWaterTrailPosition(
+    vec3 basePosition,
+    uint pointIndex,
+    float trailRole,
+    float phase) {
     if (trailRole < 0.5) {
         return basePosition;
     }
 
-    const float phase = WaterTrailTravelPhase(pointIndex);
     const vec3 routePosition = WaterTrailRoutePosition(pointIndex, phase, basePosition);
     const vec3 routeTangent = WaterTrailRouteTangent(pointIndex, phase);
     const vec3 routeNormal = WaterTrailRouteNormal(pointIndex, phase);
@@ -860,12 +861,20 @@ vec3 ResolveWaterTrailPosition(vec3 basePosition, uint pointIndex) {
     return routePosition + lateral * (lateralOffset + microMotion);
 }
 
-vec3 ResolveWaterFlowPosition(vec3 basePosition, uint pointIndex) {
+vec3 ResolveWaterFlowPosition(
+    vec3 basePosition,
+    uint pointIndex,
+    float trailRole,
+    float trailPhase) {
     if (!HasWaterParticleFields()) {
         return basePosition;
     }
     if (WaterTrailOverlayEnabled()) {
-        return ResolveWaterTrailPosition(basePosition, pointIndex);
+        return ResolveWaterTrailPosition(
+            basePosition,
+            pointIndex,
+            trailRole,
+            trailPhase);
     }
     if (WaterPathViewEnabled()) {
         return basePosition;
@@ -898,12 +907,12 @@ vec3 ResolveWaterFlowPosition(vec3 basePosition, uint pointIndex) {
     return CatmullRomWater(p0, p1, p2, p3, t);
 }
 
-vec3 ResolveWaterFlowTangent(uint pointIndex) {
+vec3 ResolveWaterFlowTangent(uint pointIndex, float trailPhase) {
     if (!HasWaterParticleFields()) {
         return vec3(0.0);
     }
     if (WaterTrailOverlayEnabled()) {
-        return WaterTrailRouteTangent(pointIndex, WaterTrailTravelPhase(pointIndex));
+        return WaterTrailRouteTangent(pointIndex, trailPhase);
     }
 
     const uint pathStart = uint(max(0.0, floor(LoadScalarFieldValue(kWaterPathStartFieldSlot, pointIndex) + 0.5)));
@@ -951,17 +960,20 @@ float EvaluateBinding(RenderParameterBindingGpu binding, uint pointIndex) {
     return binding.range.z + ((binding.range.w - binding.range.z) * normalized);
 }
 
-vec2 ApplyWaterFlowAnimation(float opacity, float emissive, uint pointIndex, vec3 center) {
+vec2 ApplyWaterFlowAnimation(
+    float opacity,
+    float emissive,
+    uint pointIndex,
+    float trailRole,
+    float trailVisibility) {
     if (styleData.pointMeta.w == 0u || styleData.globalControl.z <= kWaterSpeedFieldSlot) {
         return vec2(opacity, emissive);
     }
 
     if (WaterTrailOverlayEnabled()) {
-        const float trailRole = LoadScalarFieldValue(kWaterTrailRoleFieldSlot, pointIndex);
         if (trailRole < 0.5) {
             return vec2(0.0);
         }
-        const float trailVisibility = WaterTrailVisibility(pointIndex);
         const float appearance = WaterFlowAppearanceScale();
         return vec2(
             opacity * trailVisibility * appearance,
@@ -1065,6 +1077,7 @@ vec3 CameraUp() {
 void ResolveBasis(
     vec3 center,
     uint pointIndex,
+    float trailPhase,
     out vec3 tangent,
     out vec3 bitangent,
     out float surfaceAngleMask) {
@@ -1084,7 +1097,7 @@ void ResolveBasis(
             normal = normalize(normal);
         }
         if (waterStreakAspect > 1.0001) {
-            tangent = ResolveWaterFlowTangent(pointIndex);
+            tangent = ResolveWaterFlowTangent(pointIndex, trailPhase);
             tangent -= normal * dot(tangent, normal);
             if (dot(tangent, tangent) > 1e-8) {
                 tangent = normalize(tangent);
@@ -1102,7 +1115,7 @@ void ResolveBasis(
     normal = normalize(normal);
     surfaceAngleMask = clamp(1.0 - abs(dot(normal, normalize(uniforms.cameraPosition.xyz - center))), 0.0, 1.0);
     if (waterStreakAspect > 1.0001) {
-        tangent = ResolveWaterFlowTangent(pointIndex);
+        tangent = ResolveWaterFlowTangent(pointIndex, trailPhase);
         tangent -= normal * dot(tangent, normal);
         if (dot(tangent, tangent) > 1e-8) {
             tangent = normalize(tangent);
@@ -1168,6 +1181,51 @@ vec3 ApplyResolvedWaterColour(
         meshFlowContact);
 }
 
+// Every stage above mixes with an amount that does not depend on the input
+// colour, so resolving two probe colours only needs the field reads once.
+// The per-stage maths must stay identical to ApplyResolvedWaterColour.
+void ApplyWaterEffectColorPair(
+    inout vec3 colorA,
+    inout vec3 colorB,
+    uint pointIndex,
+    float waterEffectScale) {
+    const float mixAmount =
+        clamp(WaterEffectField(styleData.waterEffectSlots0.z, pointIndex, 0.0) * waterEffectScale, 0.0, 1.0);
+    if (mixAmount <= 1e-5) {
+        return;
+    }
+    const vec3 effectColor = vec3(
+        clamp(WaterEffectField(styleData.waterEffectSlots0.w, pointIndex, 0.62), 0.0, 1.0),
+        clamp(WaterEffectField(styleData.waterEffectSlots1.x, pointIndex, 0.88), 0.0, 1.0),
+        clamp(WaterEffectField(styleData.waterEffectSlots1.y, pointIndex, 1.0), 0.0, 1.0));
+    colorA = mix(colorA, effectColor, mixAmount);
+    colorB = mix(colorB, effectColor, mixAmount);
+}
+
+void ApplyResolvedWaterColourPair(
+    vec3 baseColorA,
+    vec3 baseColorB,
+    uint pointIndex,
+    float caustic,
+    float previewTint,
+    float waterEffectScale,
+    SparseRippleComposite sparseRipple,
+    RainImpactComposite rainImpact,
+    MeshFlowContactComposite meshFlowContact,
+    out vec3 resolvedA,
+    out vec3 resolvedB) {
+    const float causticMix = CausticColorMixAmount(caustic, previewTint);
+    vec3 colorA = mix(baseColorA, styleData.causticTint.rgb, causticMix);
+    vec3 colorB = mix(baseColorB, styleData.causticTint.rgb, causticMix);
+    ApplyWaterEffectColorPair(colorA, colorB, pointIndex, waterEffectScale);
+    colorA = ApplySparseRippleColor(colorA, sparseRipple);
+    colorB = ApplySparseRippleColor(colorB, sparseRipple);
+    colorA = ApplyRainImpactColour(colorA, rainImpact);
+    colorB = ApplyRainImpactColour(colorB, rainImpact);
+    resolvedA = ApplyMeshFlowContactColour(colorA, meshFlowContact);
+    resolvedB = ApplyMeshFlowContactColour(colorB, meshFlowContact);
+}
+
 float ResolveDepthOfFieldBlurPixels(float viewDepth) {
     if (uniforms.depthOfFieldParameters.x <= 0.5) {
         return 0.0;
@@ -1197,12 +1255,31 @@ void main() {
     const uint cornerIndex = encodedVertexIndex - (pointIndex * kSurfelVerticesPerPoint);
     const vec2 corner = kSurfelCorners[int(cornerIndex)];
 
-    const vec3 flowPosition = ResolveWaterFlowPosition(surfelPositions.positions[pointIndex].xyz, pointIndex);
+    // Trail role, travel phase, and visibility feed the flow position, the
+    // streak basis, the opacity/emissive animation, and the effect-visibility
+    // gate below. Resolve them once per invocation: each re-derivation costs
+    // the same strided scalar column reads.
+    const bool waterTrailOverlay = WaterTrailOverlayEnabled();
+    float waterTrailRole = 0.0;
+    float waterTrailPhase = 0.0;
+    float waterTrailVisibility = 1.0;
+    if (waterTrailOverlay) {
+        waterTrailRole =
+            LoadScalarFieldValue(kWaterTrailRoleFieldSlot, pointIndex);
+        waterTrailPhase = WaterTrailTravelPhase(pointIndex);
+        waterTrailVisibility = WaterTrailVisibility(pointIndex, waterTrailPhase);
+    }
+
+    const vec3 flowPosition = ResolveWaterFlowPosition(
+        surfelPositions.positions[pointIndex].xyz,
+        pointIndex,
+        waterTrailRole,
+        waterTrailPhase);
     const vec3 center = ResolveSurfaceMotionPosition(flowPosition, pointIndex);
     vec3 tangent;
     vec3 bitangent;
     float surfaceAngleMask;
-    ResolveBasis(center, pointIndex, tangent, bitangent, surfaceAngleMask);
+    ResolveBasis(center, pointIndex, waterTrailPhase, tangent, bitangent, surfaceAngleMask);
 
     const vec4 centerViewPosition = uniforms.view * vec4(center, 1.0);
     const float centerDepth = -centerViewPosition.z;
@@ -1294,16 +1371,10 @@ void main() {
         outTimingColouriseTransform,
         outTimingColouriseEmissionAdd);
     if (styleData.timingColouriseControl.x != 0u) {
-        const vec3 waterFromZero = ApplyResolvedWaterColour(
+        vec3 waterFromZero;
+        vec3 waterFromOne;
+        ApplyResolvedWaterColourPair(
             vec3(0.0),
-            pointIndex,
-            caustic,
-            previewTint,
-            waterEffectScale,
-            sparseRipple,
-            rainImpact,
-            meshFlowContact);
-        const vec3 waterFromOne = ApplyResolvedWaterColour(
             vec3(1.0),
             pointIndex,
             caustic,
@@ -1311,7 +1382,9 @@ void main() {
             waterEffectScale,
             sparseRipple,
             rainImpact,
-            meshFlowContact);
+            meshFlowContact,
+            waterFromZero,
+            waterFromOne);
         const float retainedBase = dot(
             waterFromOne - waterFromZero,
             vec3(1.0 / 3.0));
@@ -1338,9 +1411,10 @@ void main() {
         EvaluateBinding(styleData.opacityBinding, pointIndex),
         EvaluateBinding(styleData.emissiveBinding, pointIndex),
         pointIndex,
-        center);
-    const float flowEffectVisibility = WaterTrailOverlayEnabled()
-        ? WaterTrailVisibility(pointIndex) * WaterFlowAppearanceScale()
+        waterTrailRole,
+        waterTrailVisibility);
+    const float flowEffectVisibility = waterTrailOverlay
+        ? waterTrailVisibility * WaterFlowAppearanceScale()
         : 1.0;
     outOpacity = clamp(
         (animatedFlow.x * (1.0 + caustic * max(0.0, styleData.causticParams1.z)) *

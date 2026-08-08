@@ -281,7 +281,10 @@ MeshFlowContactComposite ResolveMeshFlowContactComposite(
     MeshFlowContactComposite composite = EmptyMeshFlowContactComposite();
     const uint eventCapacity = uint(meshFlowContactEvents.length());
     const uint gridCapacity = uint(meshFlowContactIndicesPlusOne.length());
-    if (eventCapacity == 0u || gridCapacity == 0u ||
+    // A single-bucket grid is the inactive placeholder binding (Vulkan
+    // buffers cannot be empty). Real contact grids are always larger, so
+    // skip the 3x3 cell scan instead of walking 36 empty references.
+    if (eventCapacity == 0u || gridCapacity <= 1u ||
         (gridCapacity & (gridCapacity - 1u)) != 0u) {
         return composite;
     }
