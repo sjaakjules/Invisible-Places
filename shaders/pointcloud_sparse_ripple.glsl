@@ -3291,6 +3291,16 @@ SparseRippleComposite EvaluateShorelineWaveContributionFrom(
             waveParams2.w,
             float(waveControl.y),
             timePhase);
+        // Background Wash (waveParams4.w): one keeps the authored look; below
+        // one the faded body wash between crests sharpens toward line-like
+        // peaks, above one it lifts. Zero means a document from before the
+        // control existed and stays neutral.
+        const float backgroundWash = waveParams4.w;
+        if (backgroundWash > 1.0e-4 && abs(backgroundWash - 1.0) > 1.0e-4) {
+            pattern = pow(
+                clamp(pattern, 0.0, 1.0),
+                1.0 / clamp(backgroundWash, 0.05, 2.0));
+        }
     }
 
     const float normalMask =

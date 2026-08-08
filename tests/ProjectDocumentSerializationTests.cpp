@@ -1033,6 +1033,7 @@ TEST_CASE("Additional shoreline instances round-trip with their banks",
   pool.settings.foamFronts.boundaryZ = 2.35F;
   pool.settings.foamFronts.intensity = 0.62F;
   pool.settings.foamFronts.colourMix = 0.41F;
+  pool.settings.foamFronts.backgroundWash = 0.35F;
   PointCloudShorelineInstance terrace;
   terrace.id = 9U;
   terrace.name = "Terrace";
@@ -1099,6 +1100,10 @@ TEST_CASE("Additional shoreline instances round-trip with their banks",
   CHECK(loadedPool.settings.foamFronts.boundaryZ == Catch::Approx(2.35F));
   CHECK(loadedPool.settings.foamFronts.intensity == Catch::Approx(0.62F));
   CHECK(loadedPool.settings.foamFronts.colourMix == Catch::Approx(0.41F));
+  CHECK(loadedPool.settings.foamFronts.backgroundWash == Catch::Approx(0.35F));
+  // An instance that never set the control keeps the neutral wash.
+  CHECK(loaded->waterShorelineInstances[1].settings.foamFronts.backgroundWash ==
+        Catch::Approx(1.0F));
   const auto& loadedTerrace = loaded->waterShorelineInstances[1];
   CHECK(loadedTerrace.id == 9U);
   CHECK_FALSE(loadedTerrace.enabled);

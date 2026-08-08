@@ -1,5 +1,5 @@
 {
-  "schema_version": 24,
+  "schema_version": 25,
   "fixture_metadata": {
     "scene_group": "SampleScene",
     "display_spacing_micrometres": 3000,
@@ -464,7 +464,8 @@
         },
         "water_path_view": false,
         "water_streak_aspect": 5.499999523162842,
-        "water_trail_overlay": true
+        "water_trail_overlay": true,
+        "shoreline_background_wash": 1.0
       }
     },
     {
@@ -734,7 +735,8 @@
         },
         "water_path_view": false,
         "water_streak_aspect": 5.499999523162842,
-        "water_trail_overlay": true
+        "water_trail_overlay": true,
+        "shoreline_background_wash": 1.0
       }
     },
     {
@@ -1004,7 +1006,8 @@
         },
         "water_path_view": false,
         "water_streak_aspect": 7.499999523162842,
-        "water_trail_overlay": true
+        "water_trail_overlay": true,
+        "shoreline_background_wash": 1.0
       }
     },
     {
@@ -1274,7 +1277,8 @@
         },
         "water_path_view": false,
         "water_streak_aspect": 7.499999523162842,
-        "water_trail_overlay": true
+        "water_trail_overlay": true,
+        "shoreline_background_wash": 1.0
       }
     },
     {
@@ -1544,7 +1548,8 @@
         },
         "water_path_view": false,
         "water_streak_aspect": 7.499999523162842,
-        "water_trail_overlay": true
+        "water_trail_overlay": true,
+        "shoreline_background_wash": 1.0
       }
     }
   ],

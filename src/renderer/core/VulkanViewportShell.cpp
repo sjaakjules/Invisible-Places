@@ -15040,7 +15040,10 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
                        : std::clamp(layer.style.shorelinePointSizeMultiply, 0.0F, 8.0F),
             heightFoam ? std::clamp(foam.colourMix, 0.0F, 1.0F)
                        : std::clamp(layer.style.shorelineColourMix, 0.0F, 1.0F),
-            0.0F,
+            // Foam Fronts Background Wash; the shader treats zero (older
+            // documents and Height Foam) as the neutral 1.
+            heightFoam ? 0.0F
+                       : std::clamp(layer.style.shorelineBackgroundWash, 0.05F, 2.0F),
         };
         styleGpu.shorelineWaveParams5 = glm::vec4{
             breakZ,
@@ -15161,7 +15164,9 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
                     : std::clamp(ff.pointSizeMultiply, 0.0F, 8.0F),
                 instanceHeightFoam ? std::clamp(hf.colourMix, 0.0F, 1.0F)
                                    : std::clamp(ff.colourMix, 0.0F, 1.0F),
-                0.0F,
+                instanceHeightFoam
+                    ? 0.0F
+                    : std::clamp(ff.backgroundWash, 0.05F, 2.0F),
             };
             styleGpu.additionalShorelineParams5[slot] = glm::vec4{
                 instanceBreakZ,

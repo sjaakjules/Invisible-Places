@@ -418,6 +418,7 @@ PointCloudShorelineWaveSettings ExtractPointCloudShorelineWaveSettings(
     foam.warp = style.shorelineWarp;
     foam.turbulence = style.shorelineTurbulence;
     foam.density = style.shorelineDensity;
+    foam.backgroundWash = style.shorelineBackgroundWash;
     foam.phase = style.shorelinePhase;
     foam.intensity = style.shorelineIntensity;
     foam.emissionAdd = style.shorelineEmissionAdd;
@@ -452,6 +453,7 @@ void ApplyPointCloudShorelineWaveSettings(
     style->shorelineWarp = foam.warp;
     style->shorelineTurbulence = foam.turbulence;
     style->shorelineDensity = foam.density;
+    style->shorelineBackgroundWash = foam.backgroundWash;
     style->shorelinePhase = foam.phase;
     style->shorelineIntensity = foam.intensity;
     style->shorelineEmissionAdd = foam.emissionAdd;
@@ -756,6 +758,7 @@ PointCloudStyleState MakeFastBasicPointCloudStyle(
     style.shorelineWarp = sourceStyle.shorelineWarp;
     style.shorelineTurbulence = sourceStyle.shorelineTurbulence;
     style.shorelineDensity = sourceStyle.shorelineDensity;
+    style.shorelineBackgroundWash = sourceStyle.shorelineBackgroundWash;
     style.shorelinePhase = sourceStyle.shorelinePhase;
     style.shorelineIntensity = sourceStyle.shorelineIntensity;
     style.shorelineEmissionAdd = sourceStyle.shorelineEmissionAdd;

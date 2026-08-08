@@ -4996,6 +4996,7 @@ void HashPointStyle(std::uint64_t* seed, const PointCloudStyleState& style) {
     HashFloat(seed, style.shorelineWarp);
     HashFloat(seed, style.shorelineTurbulence);
     HashFloat(seed, style.shorelineDensity);
+    HashFloat(seed, style.shorelineBackgroundWash);
     HashFloat(seed, style.shorelinePhase);
     HashFloat(seed, style.shorelineIntensity);
     HashFloat(seed, style.shorelineEmissionAdd);
@@ -8379,6 +8380,7 @@ void CopyShorelineWaveSettings(PointCloudStyleState* target, const PointCloudSty
     target->shorelineWarp = source.shorelineWarp;
     target->shorelineTurbulence = source.shorelineTurbulence;
     target->shorelineDensity = source.shorelineDensity;
+    target->shorelineBackgroundWash = source.shorelineBackgroundWash;
     target->shorelinePhase = source.shorelinePhase;
     target->shorelineIntensity = source.shorelineIntensity;
     target->shorelineEmissionAdd = source.shorelineEmissionAdd;
@@ -44145,6 +44147,19 @@ bool DrawPointCloudShorelineWavesSection(PreviewLayerSession* session) {
                 "Band Density",
                 &style.shorelineDensity,
                 {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 1.0F});
+            if (style.shorelineWaveAlgorithm ==
+                PointCloudShorelineWaveAlgorithm::FoamFronts) {
+                changed |= DrawRangedFloatControl(
+                    "Background Wash",
+                    &style.shorelineBackgroundWash,
+                    {.visualMin = 0.05F, .visualMax = 2.0F, .format = "%.2f", .hardMin = 0.05F, .hardMax = 2.0F});
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+                    ImGui::SetTooltip(
+                        "Response curve for the faded wash between foam crests. 1 keeps the "
+                        "authored look; lower values dim the wash toward sharp line-like "
+                        "peaks; higher values lift it. The crest peaks themselves stay put.");
+                }
+            }
 
             ImGui::Spacing();
             changed |= DrawRangedFloatControl(

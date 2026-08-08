@@ -185,6 +185,10 @@ struct PointCloudFoamFrontsShorelineSettings {
     float density = 0.55F;
     float phase = 0.0F;
     float intensity = 1.15F;
+    // Response curve for the faded body wash between crests: 1 keeps the
+    // authored look, lower values sharpen it toward line-like peaks, higher
+    // values lift it. Foam Fronts only.
+    float backgroundWash = 1.0F;
     float emissionAdd = 0.65F;
     float opacityAdd = 0.08F;
     float opacityMultiply = 1.25F;
@@ -339,6 +343,7 @@ struct PointCloudStyleState {
     float shorelineWarp = 0.35F;
     float shorelineTurbulence = 0.06F;
     float shorelineDensity = 0.55F;
+    float shorelineBackgroundWash = 1.0F;
     float shorelinePhase = 0.0F;
     float shorelineIntensity = 1.15F;
     float shorelineEmissionAdd = 0.65F;

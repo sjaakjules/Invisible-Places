@@ -822,6 +822,7 @@ json SerializeFoamFrontsShorelineSettings(
         {"warp", settings.warp},
         {"turbulence", settings.turbulence},
         {"density", settings.density},
+        {"background_wash", settings.backgroundWash},
         {"phase", settings.phase},
         {"intensity", settings.intensity},
         {"emission_add", settings.emissionAdd},
@@ -876,6 +877,10 @@ PointCloudFoamFrontsShorelineSettings ParseFoamFrontsShorelineSettings(
         settingsJson.value("density", settings.density),
         0.0F,
         1.0F);
+    settings.backgroundWash = std::clamp(
+        settingsJson.value("background_wash", settings.backgroundWash),
+        0.05F,
+        2.0F);
     settings.phase = settingsJson.value("phase", settings.phase);
     settings.intensity = std::clamp(
         settingsJson.value("intensity", settings.intensity),
@@ -1237,6 +1242,7 @@ json SerializePointCloudStyle(const PointCloudStyleState& style) {
         {"shoreline_warp", style.shorelineWarp},
         {"shoreline_turbulence", style.shorelineTurbulence},
         {"shoreline_density", style.shorelineDensity},
+        {"shoreline_background_wash", style.shorelineBackgroundWash},
         {"shoreline_phase", style.shorelinePhase},
         {"shoreline_intensity", style.shorelineIntensity},
         {"shoreline_emission_add", style.shorelineEmissionAdd},
@@ -1405,6 +1411,7 @@ void CopyLegacyShorelineSettings(PointCloudStyleState* target, const PointCloudS
     target->shorelineWarp = source.shorelineWarp;
     target->shorelineTurbulence = source.shorelineTurbulence;
     target->shorelineDensity = source.shorelineDensity;
+    target->shorelineBackgroundWash = source.shorelineBackgroundWash;
     target->shorelinePhase = source.shorelinePhase;
     target->shorelineIntensity = source.shorelineIntensity;
     target->shorelineEmissionAdd = source.shorelineEmissionAdd;
@@ -1921,6 +1928,10 @@ PointCloudStyleState ParsePointCloudStyle(const json& styleJson) {
     style.shorelineTurbulence =
         std::clamp(styleJson.value("shoreline_turbulence", style.shorelineTurbulence), 0.0F, 1.0F);
     style.shorelineDensity = std::clamp(styleJson.value("shoreline_density", style.shorelineDensity), 0.0F, 1.0F);
+    style.shorelineBackgroundWash = std::clamp(
+        styleJson.value("shoreline_background_wash", style.shorelineBackgroundWash),
+        0.05F,
+        2.0F);
     style.shorelinePhase = styleJson.value("shoreline_phase", style.shorelinePhase);
     style.shorelineIntensity =
         std::clamp(styleJson.value("shoreline_intensity", style.shorelineIntensity), 0.0F, 5.0F);
