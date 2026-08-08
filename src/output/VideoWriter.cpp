@@ -472,6 +472,32 @@ struct OpaqueBlackRgb16OutputWriter {
     }
 };
 
+// The rgba-layout twins of OpaqueBlackRgb16OutputWriter (same
+// display-referred matte-over-black, see its note) for encoders whose raw
+// input stays rgba/rgba64le: the matte is pre-applied and alpha forced
+// opaque so the existing ffmpeg commands need no format change.
+struct OpaqueBlackRgba8OutputWriter {
+    static constexpr std::size_t kBytesPerPixel = 4U;
+
+    void operator()(std::uint8_t* destination, float red, float green, float blue, float alpha) const {
+        destination[0] = UnitFloatToByte(LinearToSrgb(red) * alpha);
+        destination[1] = UnitFloatToByte(LinearToSrgb(green) * alpha);
+        destination[2] = UnitFloatToByte(LinearToSrgb(blue) * alpha);
+        destination[3] = 0xFFU;
+    }
+};
+
+struct OpaqueBlackRgba16OutputWriter {
+    static constexpr std::size_t kBytesPerPixel = 8U;
+
+    void operator()(std::uint8_t* destination, float red, float green, float blue, float alpha) const {
+        WriteLittleEndianWord(destination + 0U, UnitFloatToWord(LinearToSrgb(red) * alpha));
+        WriteLittleEndianWord(destination + 2U, UnitFloatToWord(LinearToSrgb(green) * alpha));
+        WriteLittleEndianWord(destination + 4U, UnitFloatToWord(LinearToSrgb(blue) * alpha));
+        WriteLittleEndianWord(destination + 6U, 0xFFFFU);
+    }
+};
+
 bool IsExactTwoTimesResolve(
     std::uint32_t sourceWidth,
     std::uint32_t sourceHeight,
@@ -954,13 +980,48 @@ std::string BuildAnimationExportFilenameStem(
     bool externalAlphaMatte,
     const RenderJobSettings& settings,
     std::string_view visualName) {
-    (void)mode;
     (void)quality;
     (void)useVideoToolbox;
     (void)externalAlphaMatte;
     (void)settings;
     (void)visualName;
-    return SanitizeFileStem(animationName, "Animation");
+    auto stem = SanitizeFileStem(animationName, "Animation");
+    // Test renders sit beside their final deliverables in the same output
+    // directory; the marker keeps them distinguishable at a glance.
+    if (CompactAnimationExportMode(mode) == AnimationExportMode::TestMp4) {
+        stem += "_test";
+    }
+    return stem;
+}
+
+std::string SanitizeExportOutputNameSuffix(std::string_view suffix) {
+    auto sanitized = SanitizeFileStem(suffix, "");
+    while (!sanitized.empty() && sanitized.front() == '_') {
+        sanitized.erase(sanitized.begin());
+    }
+    return sanitized;
+}
+
+std::filesystem::path AppendExportOutputNameSuffix(
+    const std::filesystem::path& path,
+    std::string_view sanitizedSuffix) {
+    if (path.empty() || sanitizedSuffix.empty()) {
+        return path;
+    }
+    const auto directory = path.parent_path();
+    const auto stem = path.stem().string();
+    const auto extension = path.extension().string();
+    auto candidate =
+        directory / (stem + "_" + std::string{sanitizedSuffix} + extension);
+    // The un-suffixed name was already unique, so suffixed batch siblings
+    // stay unique against each other; only survivors of earlier suffixed
+    // runs on disk need the counter.
+    for (std::uint32_t counter = 2U; std::filesystem::exists(candidate);
+         ++counter) {
+        candidate = directory / (stem + "_" + std::string{sanitizedSuffix} +
+                                 "_" + std::to_string(counter) + extension);
+    }
+    return candidate;
 }
 
 std::filesystem::path BuildUniqueAnimationExportMediaOutputPath(
@@ -2291,6 +2352,46 @@ std::vector<std::uint8_t> ConvertHalfRgbaToSrgbRgb16OpaqueBlack(
         outputHeight,
         spatialAntialiasing,
         OpaqueBlackRgb16OutputWriter{});
+}
+
+std::vector<std::uint8_t> ConvertHalfRgbaToSrgbRgba8OpaqueBlack(
+    const HalfRgbaExrImage& image,
+    std::uint32_t outputWidth,
+    std::uint32_t outputHeight,
+    bool spatialAntialiasing) {
+    if (image.width == 0 ||
+        image.height == 0 ||
+        outputWidth == 0 ||
+        outputHeight == 0) {
+        return {};
+    }
+
+    return ResolveHalfRgba(
+        image,
+        outputWidth,
+        outputHeight,
+        spatialAntialiasing,
+        OpaqueBlackRgba8OutputWriter{});
+}
+
+std::vector<std::uint8_t> ConvertHalfRgbaToSrgbRgba16OpaqueBlack(
+    const HalfRgbaExrImage& image,
+    std::uint32_t outputWidth,
+    std::uint32_t outputHeight,
+    bool spatialAntialiasing) {
+    if (image.width == 0 ||
+        image.height == 0 ||
+        outputWidth == 0 ||
+        outputHeight == 0) {
+        return {};
+    }
+
+    return ResolveHalfRgba(
+        image,
+        outputWidth,
+        outputHeight,
+        spatialAntialiasing,
+        OpaqueBlackRgba16OutputWriter{});
 }
 
 }  // namespace invisible_places::output

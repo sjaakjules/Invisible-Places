@@ -101,6 +101,16 @@ HevcAlphaMp4OutputPaths BuildUniqueHevcAlphaMp4OutputPaths(
     const RenderJobSettings& settings,
     std::string_view visualName = {},
     const std::vector<std::filesystem::path>& reservedPaths = {});
+// User-typed output-name suffix support: sanitize to filename-safe form
+// (empty when nothing survives), then append as "_<suffix>" ahead of the
+// extension, deduplicating against files already on disk. Directories
+// (PNG/EXR stacks) take the suffix on their final path component.
+[[nodiscard]] std::string SanitizeExportOutputNameSuffix(
+    std::string_view suffix);
+[[nodiscard]] std::filesystem::path AppendExportOutputNameSuffix(
+    const std::filesystem::path& path,
+    std::string_view sanitizedSuffix);
+
 HevcAlphaMp4OutputPaths BuildUniqueMp4AlphaMatteOutputPaths(
     const std::filesystem::path& outputDirectory,
     std::string_view animationName,
@@ -382,6 +392,19 @@ std::vector<std::uint8_t> ConvertHalfRgbaToSrgbRgba16(
     std::uint32_t outputHeight,
     bool spatialAntialiasing = true);
 std::vector<std::uint8_t> ConvertHalfRgbaToSrgbRgb16OpaqueBlack(
+    const HalfRgbaExrImage& image,
+    std::uint32_t outputWidth,
+    std::uint32_t outputHeight,
+    bool spatialAntialiasing = true);
+// rgba-layout twins of the rgb48 opaque-black conversion: the After
+// Effects display-referred luma matte is pre-applied over black and alpha
+// is forced opaque, so encoders keep their rgba/rgba64le raw input.
+std::vector<std::uint8_t> ConvertHalfRgbaToSrgbRgba8OpaqueBlack(
+    const HalfRgbaExrImage& image,
+    std::uint32_t outputWidth,
+    std::uint32_t outputHeight,
+    bool spatialAntialiasing = true);
+std::vector<std::uint8_t> ConvertHalfRgbaToSrgbRgba16OpaqueBlack(
     const HalfRgbaExrImage& image,
     std::uint32_t outputWidth,
     std::uint32_t outputHeight,

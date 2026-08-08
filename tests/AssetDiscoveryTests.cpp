@@ -14319,7 +14319,17 @@ TEST_CASE("Test MP4 names omit render format settings and visual details", "[out
         true,
         settings,
         "Painty");
-    CHECK(stem == "Site_1");
+    CHECK(stem == "Site_1_test");
+
+    const auto finalStem = invisible_places::output::BuildAnimationExportFilenameStem(
+        "Site 1",
+        invisible_places::output::AnimationExportMode::ProRes422Mov,
+        invisible_places::output::AnimationExportQuality::Normal,
+        true,
+        true,
+        settings,
+        "Painty");
+    CHECK(finalStem == "Site_1");
 }
 
 TEST_CASE("Test MP4 ffmpeg command motion-interpolates low-rate RGB to one 30 fps H265 file", "[output][video]") {
@@ -14902,6 +14912,104 @@ TEST_CASE("ProRes conversion downsamples straight alpha without transparent RGB 
     CHECK(readWord(2) == 0U);
     CHECK(readWord(4) == 0U);
     CHECK(static_cast<int>(readWord(6)) == Catch::Approx(16384).margin(1));
+}
+
+TEST_CASE("Opaque-black rgba conversions bake the display-referred luma matte", "[output][video]") {
+    const auto zero = Imath::half{0.0F}.bits();
+    const auto half = Imath::half{0.5F}.bits();
+    const auto one = Imath::half{1.0F}.bits();
+
+    invisible_places::output::HalfRgbaExrImage image;
+    image.width = 2;
+    image.height = 2;
+    image.rgbaHalf.resize(static_cast<std::size_t>(image.width) * image.height * 4U);
+    for (std::size_t pixelIndex = 0; pixelIndex < image.rgbaHalf.size() / 4U; ++pixelIndex) {
+        const auto offset = pixelIndex * 4U;
+        image.rgbaHalf[offset + 0U] = one;
+        image.rgbaHalf[offset + 1U] = half;
+        image.rgbaHalf[offset + 2U] = zero;
+        image.rgbaHalf[offset + 3U] = half;
+    }
+
+    // The matte is applied after the sRGB transfer (After Effects
+    // display-referred luma matte) and alpha leaves as fully opaque.
+    const auto rgba8 = invisible_places::output::ConvertHalfRgbaToSrgbRgba8OpaqueBlack(
+        image,
+        1,
+        1,
+        true);
+    REQUIRE(rgba8.size() == 4U);
+    CHECK(static_cast<int>(rgba8[0]) == Catch::Approx(128).margin(1));
+    CHECK(static_cast<int>(rgba8[1]) == Catch::Approx(94).margin(1));
+    CHECK(rgba8[2] == 0U);
+    CHECK(rgba8[3] == 255U);
+
+    const auto rgba16 = invisible_places::output::ConvertHalfRgbaToSrgbRgba16OpaqueBlack(
+        image,
+        1,
+        1,
+        true);
+    REQUIRE(rgba16.size() == 8U);
+    const auto readWord = [&rgba16](std::size_t offset) {
+        return static_cast<std::uint16_t>(
+            static_cast<std::uint16_t>(rgba16[offset]) |
+            (static_cast<std::uint16_t>(rgba16[offset + 1U]) << 8U));
+    };
+    CHECK(static_cast<int>(readWord(0)) == Catch::Approx(32768).margin(2));
+    CHECK(static_cast<int>(readWord(2)) == Catch::Approx(24096).margin(4));
+    CHECK(readWord(4) == 0U);
+    CHECK(readWord(6) == 65535U);
+
+    // The rgb48 conversion (Test MP4's) must agree on the colour lanes.
+    const auto rgb16 = invisible_places::output::ConvertHalfRgbaToSrgbRgb16OpaqueBlack(
+        image,
+        1,
+        1,
+        true);
+    REQUIRE(rgb16.size() == 6U);
+    const auto readRgbWord = [&rgb16](std::size_t offset) {
+        return static_cast<std::uint16_t>(
+            static_cast<std::uint16_t>(rgb16[offset]) |
+            (static_cast<std::uint16_t>(rgb16[offset + 1U]) << 8U));
+    };
+    CHECK(readRgbWord(0) == readWord(0));
+    CHECK(readRgbWord(2) == readWord(2));
+    CHECK(readRgbWord(4) == readWord(4));
+}
+
+TEST_CASE("Export output name suffix sanitizes and appends before the extension", "[output][video]") {
+    using invisible_places::output::AppendExportOutputNameSuffix;
+    using invisible_places::output::SanitizeExportOutputNameSuffix;
+
+    CHECK(SanitizeExportOutputNameSuffix("take 2!") == "take_2");
+    CHECK(SanitizeExportOutputNameSuffix("   ") == "");
+    CHECK(SanitizeExportOutputNameSuffix("_client") == "client");
+
+    const auto temporaryRoot =
+        std::filesystem::temp_directory_path() /
+        "invisible_places_output_suffix_test";
+    std::filesystem::remove_all(temporaryRoot);
+    std::filesystem::create_directories(temporaryRoot);
+
+    const auto videoPath = temporaryRoot / "Animation_Colour.mov";
+    CHECK(AppendExportOutputNameSuffix(videoPath, "") == videoPath);
+    CHECK(AppendExportOutputNameSuffix({}, "take2").empty());
+    const auto suffixed = AppendExportOutputNameSuffix(videoPath, "take2");
+    CHECK(suffixed == temporaryRoot / "Animation_Colour_take2.mov");
+
+    // A survivor from an earlier suffixed run must not be overwritten.
+    { std::ofstream existing{suffixed}; existing << "x"; }
+    const auto deduplicated = AppendExportOutputNameSuffix(videoPath, "take2");
+    CHECK(deduplicated == temporaryRoot / "Animation_Colour_take2_2.mov");
+
+    // Directory outputs (PNG/EXR stacks) take the suffix on the last
+    // component.
+    const auto stackDirectory = temporaryRoot / "Animation_PNG";
+    CHECK(
+        AppendExportOutputNameSuffix(stackDirectory, "take2") ==
+        temporaryRoot / "Animation_PNG_take2");
+
+    std::filesystem::remove_all(temporaryRoot);
 }
 
 TEST_CASE("SS2x conversion resolves parallel rows without changing uniform color", "[output][video]") {

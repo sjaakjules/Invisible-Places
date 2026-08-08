@@ -841,6 +841,10 @@ struct AnimationPanelState {
     std::size_t quickMp4QueueTotal = 0;
     std::size_t quickMp4QueueCompleted = 0;
     std::size_t quickMp4QueueSkipped = 0;
+    // User-typed text appended to export output names. Read when each job
+    // starts (sanitized), so editing it mid-batch tags every job that has
+    // not opened its output yet.
+    std::string exportOutputNameSuffix;
     std::optional<std::size_t> selectedFileIndex;
     bool selectedFileUsesEdited = false;
     bool currentPathUsesEdited = false;
@@ -32614,6 +32618,12 @@ std::string WriteExportLog(
             job.externalAlphaMatte) {
             log << "Alpha baked onto black: yes\n";
         }
+        if (job.mode != invisible_places::output::AnimationExportMode::TestMp4 &&
+            !job.externalAlphaMatte &&
+            !AnimationExportPreservesAlpha(job.mode) &&
+            AnimationExportWritesVideo(job.mode)) {
+            log << "Alpha baked onto black (After Effects luma matte): yes\n";
+        }
         log << "Output supersample scale: " << std::max<std::uint32_t>(1U, job.mp4SupersampleScale) << "x\n";
         log << "Spatial AA/downscale: " << (job.spatialAntialiasing ? "yes" : "no") << '\n';
         log << "Temporal supersampling: " << (job.settings.temporalSupersampling ? "yes" : "no") << '\n';
@@ -33540,6 +33550,16 @@ void RunAnimationExportWriter(
                 const bool writesHighQualityMp4 =
                     writesMp4 &&
                     outputOptions.quality != invisible_places::output::AnimationExportQuality::Normal;
+                // With the external matte unchecked, single-file video
+                // exports still render the alpha and bake it as the same
+                // display-referred After Effects luma matte over black that
+                // Test MP4 uses — without Test MP4's frame interpolation.
+                // Modes that carry a real alpha channel keep it instead.
+                const bool bakesAlphaOntoBlack =
+                    !outputOptions.externalAlphaMatte &&
+                    mode != invisible_places::output::AnimationExportMode::TestMp4 &&
+                    !AnimationExportPreservesAlpha(mode) &&
+                    (writesMp4 || writesProRes);
                 const auto convertStartedAt = std::chrono::steady_clock::now();
                 if (mode == invisible_places::output::AnimationExportMode::TestMp4) {
                     if (outputOptions.externalAlphaMatte) {
@@ -33558,39 +33578,61 @@ void RunAnimationExportWriter(
                             std::span<const std::uint8_t>{rgba16Bytes.data(), rgba16Bytes.size()});
                     }
                 } else if (writesProRes) {
-                    const auto rgba16Bytes = invisible_places::output::ConvertHalfRgbaToSrgbRgba16(
-                        mp4Image,
-                        settings.width,
-                        settings.height,
-                        outputOptions.spatialAntialiasing);
-                    const auto rgba16Span =
-                        std::span<const std::uint8_t>{rgba16Bytes.data(), rgba16Bytes.size()};
-                    frameBytes = writesCombinedColorAlphaMatte
-                                     ? rgba16Bytes
-                                     : writesProRes422
-                                           ? ExtractRgb48FromRgba64(rgba16Span)
-                                           : rgba16Bytes;
-                    if (writesAlphaMattePair && !writesCombinedColorAlphaMatte) {
-                        alphaMatteBytes = ExtractAlphaMatteRgb48FromRgba64(rgba16Span);
+                    if (bakesAlphaOntoBlack && writesProRes422) {
+                        frameBytes = invisible_places::output::ConvertHalfRgbaToSrgbRgb16OpaqueBlack(
+                            mp4Image,
+                            settings.width,
+                            settings.height,
+                            outputOptions.spatialAntialiasing);
+                    } else {
+                        const auto rgba16Bytes = invisible_places::output::ConvertHalfRgbaToSrgbRgba16(
+                            mp4Image,
+                            settings.width,
+                            settings.height,
+                            outputOptions.spatialAntialiasing);
+                        const auto rgba16Span =
+                            std::span<const std::uint8_t>{rgba16Bytes.data(), rgba16Bytes.size()};
+                        frameBytes = writesCombinedColorAlphaMatte
+                                         ? rgba16Bytes
+                                         : writesProRes422
+                                               ? ExtractRgb48FromRgba64(rgba16Span)
+                                               : rgba16Bytes;
+                        if (writesAlphaMattePair && !writesCombinedColorAlphaMatte) {
+                            alphaMatteBytes = ExtractAlphaMatteRgb48FromRgba64(rgba16Span);
+                        }
                     }
                 } else if (writesHighQualityMp4) {
-                    const auto rgba16Bytes = invisible_places::output::ConvertHalfRgbaToSrgbRgba16(
-                        mp4Image,
-                        settings.width,
-                        settings.height,
-                        outputOptions.spatialAntialiasing);
-                    frameBytes = rgba16Bytes;
-                    if (writesAlphaMattePair && !writesCombinedColorAlphaMatte) {
-                        alphaMatteBytes = ExtractAlphaMatteGray16FromRgba64(
-                            std::span<const std::uint8_t>{rgba16Bytes.data(), rgba16Bytes.size()});
+                    if (bakesAlphaOntoBlack) {
+                        frameBytes = invisible_places::output::ConvertHalfRgbaToSrgbRgba16OpaqueBlack(
+                            mp4Image,
+                            settings.width,
+                            settings.height,
+                            outputOptions.spatialAntialiasing);
+                    } else {
+                        const auto rgba16Bytes = invisible_places::output::ConvertHalfRgbaToSrgbRgba16(
+                            mp4Image,
+                            settings.width,
+                            settings.height,
+                            outputOptions.spatialAntialiasing);
+                        frameBytes = rgba16Bytes;
+                        if (writesAlphaMattePair && !writesCombinedColorAlphaMatte) {
+                            alphaMatteBytes = ExtractAlphaMatteGray16FromRgba64(
+                                std::span<const std::uint8_t>{rgba16Bytes.data(), rgba16Bytes.size()});
+                        }
                     }
                 } else if (writesFastPng || writesMp4) {
-                    frameBytes = invisible_places::output::ConvertHalfRgbaToSrgbRgba8(
-                        mp4Image,
-                        settings.width,
-                        settings.height,
-                        {},
-                        outputOptions.spatialAntialiasing);
+                    frameBytes = bakesAlphaOntoBlack
+                        ? invisible_places::output::ConvertHalfRgbaToSrgbRgba8OpaqueBlack(
+                              mp4Image,
+                              settings.width,
+                              settings.height,
+                              outputOptions.spatialAntialiasing)
+                        : invisible_places::output::ConvertHalfRgbaToSrgbRgba8(
+                              mp4Image,
+                              settings.width,
+                              settings.height,
+                              {},
+                              outputOptions.spatialAntialiasing);
                     if (writesAlphaMattePair && !writesCombinedColorAlphaMatte) {
                         alphaMatteBytes = ExtractAlphaMatteRgba8(
                             std::span<const std::uint8_t>{frameBytes.data(), frameBytes.size()});
@@ -34541,15 +34583,33 @@ QuickMp4ExportStartResult StartQuickMp4ExportJob(
         request.animationPath.name,
         request.waterScenarios,
         request.animationPath);
+    // Queue-time names stay stable for collision reservation; the suffix is
+    // sampled here — as the job starts — so a value typed while an earlier
+    // batch item was encoding still tags every remaining item.
+    const auto outputNameSuffix =
+        invisible_places::output::SanitizeExportOutputNameSuffix(
+            runtimeState->animationPanel.exportOutputNameSuffix);
+    const auto suffixedVideoOutputPath =
+        invisible_places::output::AppendExportOutputNameSuffix(
+            request.videoOutputPath,
+            outputNameSuffix);
+    const auto suffixedAlphaMatteVideoPath =
+        invisible_places::output::AppendExportOutputNameSuffix(
+            request.alphaMatteVideoPath,
+            outputNameSuffix);
+    const auto suffixedPngStackDirectory =
+        invisible_places::output::AppendExportOutputNameSuffix(
+            request.pngStackDirectory,
+            outputNameSuffix);
     const auto outputOptions = MakeAnimationExportOutputOptions(
         request.mode,
         settings,
-        request.videoOutputPath,
+        suffixedVideoOutputPath,
         false,
         {},
-        request.pngStackDirectory,
+        suffixedPngStackDirectory,
         outputAnimationName,
-        request.alphaMatteVideoPath,
+        suffixedAlphaMatteVideoPath,
         request.quality,
         request.useVideoToolbox,
         request.externalAlphaMatte);
@@ -34574,9 +34634,9 @@ QuickMp4ExportStartResult StartQuickMp4ExportJob(
         .currentFrame = 0,
         .currentTile = 0,
         .startedAt = std::chrono::steady_clock::now(),
-        .videoOutputPath = request.videoOutputPath,
-        .alphaMatteVideoPath = request.alphaMatteVideoPath,
-        .pngStackDirectory = request.pngStackDirectory,
+        .videoOutputPath = suffixedVideoOutputPath,
+        .alphaMatteVideoPath = suffixedAlphaMatteVideoPath,
+        .pngStackDirectory = suffixedPngStackDirectory,
         .pngStackFrameStem = outputOptions.pngStackFrameStem,
         .writeExrStack = outputOptions.writeExrStack,
         .writePreviewMp4 = outputOptions.writePreviewMp4,
@@ -35326,7 +35386,13 @@ void StartStillCameraExportJob(
     if (!CheckVideoExportMemoryBudget(runtimeState, mode, settings, externalAlphaMatte)) {
         return;
     }
-    const std::string stillName = "StillCamera";
+    std::string stillName = "StillCamera";
+    if (const auto stillNameSuffix =
+            invisible_places::output::SanitizeExportOutputNameSuffix(
+                runtimeState->animationPanel.exportOutputNameSuffix);
+        !stillNameSuffix.empty()) {
+        stillName += "_" + stillNameSuffix;
+    }
     const auto outputRoot = std::filesystem::path{settings.outputDirectory};
     if (AnimationExportWritesExr(mode)) {
         settings.outputDirectory =
@@ -35648,9 +35714,17 @@ void StartAnimationExportJob(
         animationPathSnapshot.name,
         runtimeState->water.seepageScenarios,
         animationPathSnapshot);
+    // Output files (not logs or status text) carry the user-typed suffix.
+    auto outputFileName = animationName;
+    if (const auto outputNameSuffix =
+            invisible_places::output::SanitizeExportOutputNameSuffix(
+                runtimeState->animationPanel.exportOutputNameSuffix);
+        !outputNameSuffix.empty()) {
+        outputFileName += "_" + outputNameSuffix;
+    }
     if (AnimationExportWritesExr(activeMode)) {
         settings.outputDirectory =
-            BuildUniqueAnimationExportDirectory(outputRoot, animationName, activeMode, settings).string();
+            BuildUniqueAnimationExportDirectory(outputRoot, outputFileName, activeMode, settings).string();
     }
 
     std::filesystem::path videoOutputPath;
@@ -35673,7 +35747,7 @@ void StartAnimationExportJob(
                 activeQuality,
                 activeUseVideoToolbox,
                 outputRoot,
-                animationName,
+                outputFileName,
                 settings);
             videoOutputPath = outputPaths.colorPath;
             alphaMatteVideoPath = outputPaths.alphaMattePath;
@@ -35684,14 +35758,14 @@ void StartAnimationExportJob(
                 activeUseVideoToolbox,
                 activeExternalAlphaMatte,
                 outputRoot,
-                animationName,
+                outputFileName,
                 settings);
         }
     }
     if (AnimationExportWritesPngStack(activeMode)) {
         pngStackDirectory = invisible_places::output::BuildUniquePngStackOutputDirectory(
             outputRoot,
-            animationName,
+            outputFileName,
             settings,
             {},
             {},
@@ -36857,9 +36931,27 @@ void DrawAnimationExportSection(
             preset.externalAlphaMatte = externalAlphaMatte;
             SanitizeExportPreset(&preset);
         }
-        if (testMp4 && ImGui::IsItemHovered()) {
+        if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(
-                "Bakes renderer alpha onto black before interpolation. The result is one opaque MP4, not an alpha sidecar.");
+                testMp4
+                    ? "Bakes renderer alpha onto black before interpolation. The result is one opaque MP4, not an alpha sidecar."
+                    : "Checked: writes a separate _Alpha matte video beside the colour file.\n"
+                      "Unchecked: still renders alpha and bakes it onto black as an After Effects\n"
+                      "display-referred luma matte — one opaque file, no interpolation.");
+        }
+        ImGui::SetNextItemWidth(220.0F);
+        InputTextString(
+            "Append To Output Name",
+            &panel.exportOutputNameSuffix);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Sanitized and appended to every export output file name, e.g. Name_%s.mov.\n"
+                "Editable during a batch render: every job that has not started its file yet picks it up.",
+                invisible_places::output::SanitizeExportOutputNameSuffix(
+                    panel.exportOutputNameSuffix.empty()
+                        ? std::string{"take2"}
+                        : panel.exportOutputNameSuffix)
+                    .c_str());
         }
         ImGui::TextDisabled(
             "%s",
@@ -37370,6 +37462,18 @@ void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
             runtimeState->animationPanel.quickMp4QueueCompleted + 1U,
             runtimeState->animationPanel.quickMp4QueueTotal);
         ImGui::Text("Visual: %s", job.exportVisualName.c_str());
+    }
+    if (!runtimeState->animationPanel.quickMp4Queue.empty()) {
+        // The in-flight file's name is already fixed; the suffix reaches
+        // every queued job whose output has not opened yet.
+        ImGui::SetNextItemWidth(220.0F);
+        InputTextString(
+            "Append To Output Name",
+            &runtimeState->animationPanel.exportOutputNameSuffix);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Appended to the output file names of the remaining queued jobs.");
+        }
     }
     if (job.preparingExport && job.preparationState != nullptr) {
         std::size_t completedRequests = 0;
