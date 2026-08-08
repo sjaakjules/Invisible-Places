@@ -68,6 +68,7 @@ SOURCE_SCAN_IDS = (10, 11)
 REPLACEMENT_SCAN_ID = 12
 ADDITION_SCAN_ID = 13
 COMPONENT_CELL_METRES = 0.020
+PATCH_04_CELL_METRES = 0.005
 SUPPORT_Z_MARGIN_METRES = 0.030
 REFERENCE_MARGIN_METRES = 0.100
 MAX_PAIR_DISTANCE_METRES = 0.080
@@ -97,12 +98,76 @@ PATCH_04_JAGGED_MAX_WIDTH_METRES = 0.440
 PATCH_04_JAGGED_CORE_WIDTH_METRES = 0.030
 PATCH_04_JAGGED_PLANARITY_METRES = 0.040
 PATCH_04_JAGGED_NOISE_SEED = 9041309
+# The latest Patch 04 review asks for three distinct high-density plateaus:
+# two small islands above the main view and one large two-lobed "B" region.
+# These controls were mapped from the Patch 04 screenshot into the fitted
+# edge's along/signed coordinate system.  Widths are the full-density reach
+# outside the measured ScanID 9 edge; the later taper extends beyond them.
+PATCH_04_LOBED_CORE_CONTROLS: tuple[tuple[float, float], ...] = (
+    (-1.50, 0.000),
+    (-0.84, 0.000),
+    (-0.79, 0.025),
+    (-0.75, 0.075),
+    (-0.70, 0.085),
+    (-0.65, 0.000),
+    (-0.54, 0.000),
+    (-0.50, 0.025),
+    (-0.46, 0.085),
+    (-0.41, 0.000),
+    (-0.30, 0.000),
+    (-0.26, 0.050),
+    (-0.22, 0.090),
+    (-0.18, 0.140),
+    (-0.14, 0.210),
+    (-0.10, 0.230),
+    (0.02, 0.220),
+    (0.10, 0.190),
+    (0.18, 0.105),
+    (0.22, 0.090),
+    (0.30, 0.160),
+    (0.38, 0.170),
+    (0.46, 0.150),
+    (0.54, 0.130),
+    (0.62, 0.080),
+    (0.68, 0.030),
+    (0.72, 0.000),
+    (1.50, 0.000),
+)
+PATCH_04_LOBED_MAX_WIDTH_METRES = 0.620
+PATCH_04_LOBED_BASE_TAPER_METRES = 0.100
+PATCH_04_LOBED_EXTRA_TAPER_METRES = 0.220
+PATCH_04_LOBED_PLANARITY_METRES = 0.030
+PATCH_04_LOBED_NOISE_METRES = 0.035
+PATCH_04_LOBED_NOISE_SEED = 9041327
+PATCH_04_SEALED_SEAM_CORE_METRES = 0.045
+PATCH_04_SEALED_SEAM_VARIATION_METRES = 0.012
+PATCH_04_SEALED_TANGENT_LIMIT_METRES = 0.020
+PATCH_04_SEALED_TRANSFER_LIMIT_METRES = 0.025
+PATCH_04_CONTACT_NEIGHBOURHOOD_METRES = 0.030
+PATCH_04_CONTACT_SPACING_QUANTILE = 0.99
+PATCH_04_CONTACT_SPACING_MIN_METRES = 0.001
+PATCH_04_CONTACT_SPACING_MAX_METRES = 0.0015
+PATCH_04_CONTACT_BRIDGE_REACH_FACTOR = 1.50
+PATCH_04_CONTACT_BRIDGE_MIN_REACH_FACTOR = 1.35
+# Reviewed Patch 04 density lobes occupy this camera-visible part of the
+# measured edge.  The mesh sampling patch ends beyond the negative endpoint;
+# auditing that unrelated scan perimeter produced a false 200 mm outlier.
+PATCH_04_CONTACT_ALONG_MIN_METRES = -0.90
+PATCH_04_CONTACT_ALONG_MAX_METRES = 0.72
 PATCH_04_EDGE_FIT_RADIUS_METRES = 0.450
 PATCH_04_EDGE_END_MARGIN_METRES = 0.030
 PATCH_04_GEOMETRY_MAX_DISTANCE_METRES = 0.002
 PATCH_04_GEOMETRY_NORMAL_DOT_MIN = 0.75
 PATCH_04_RGB_NEIGHBOURS = 8
 PATCH_04_RGB_RADIUS_METRES = 0.015
+PATCH_06_CELL_METRES = 0.005
+PATCH_06_LEFT_COMPONENT_ZERO_INDEX = 3
+PATCH_06_LEFT_HOST_SCAN_ID = 1
+PATCH_06_RIGHT_SOURCE_SCAN_ID = 1
+PATCH_06_RIGHT_SEED_XY = np.array([310.390643815, 80.5602466135])
+PATCH_06_RIGHT_CROP_CENTER_XY = np.array([310.10, 80.90])
+PATCH_06_RIGHT_CROP_HALF_METRES = 0.75
+PATCH_06_GENERATED_TRANSFER_LIMIT_METRES = 0.010
 DISCOVERY_IGNORE_MARKER = ".invisible_places-ignore"
 
 
@@ -304,21 +369,22 @@ class ComponentSupport:
     mask: np.ndarray
     boundary: np.ndarray
     outside_ring: np.ndarray
+    cell_metres: float = COMPONENT_CELL_METRES
 
     @property
     def name(self) -> str:
         return f"Patch{self.cleanmesh_index}"
 
     def grid_coordinates(self, x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        ix = np.floor(np.asarray(x, dtype=np.float64) / COMPONENT_CELL_METRES).astype(np.int64)
-        iy = np.floor(np.asarray(y, dtype=np.float64) / COMPONENT_CELL_METRES).astype(np.int64)
+        ix = np.floor(np.asarray(x, dtype=np.float64) / self.cell_metres).astype(np.int64)
+        iy = np.floor(np.asarray(y, dtype=np.float64) / self.cell_metres).astype(np.int64)
         gx, gy = ix - self.origin_ix, iy - self.origin_iy
         within = (gx >= 0) & (gx < self.mask.shape[1]) & (gy >= 0) & (gy < self.mask.shape[0])
         return gx, gy, within
 
     def contains(self, x: np.ndarray, y: np.ndarray, z: np.ndarray) -> np.ndarray:
-        ix = np.floor(np.asarray(x, dtype=np.float64) / COMPONENT_CELL_METRES).astype(np.int64)
-        iy = np.floor(np.asarray(y, dtype=np.float64) / COMPONENT_CELL_METRES).astype(np.int64)
+        ix = np.floor(np.asarray(x, dtype=np.float64) / self.cell_metres).astype(np.int64)
+        iy = np.floor(np.asarray(y, dtype=np.float64) / self.cell_metres).astype(np.int64)
         keys = _pack_cells(ix, iy)
         positions = np.searchsorted(self.cell_keys, keys)
         present = positions < len(self.cell_keys)
@@ -378,8 +444,12 @@ class LinearEdgeSupport:
     along_max: float
     blend_width_metres: float
     fit_rms_metres: float
+    edge_distance: np.ndarray | None = None
+    contact_source_mask: np.ndarray | None = None
+    contact_boundary_mask: np.ndarray | None = None
     edge_profile: str = "linear"
     fade_width_map: np.ndarray | None = None
+    core_width_map: np.ndarray | None = None
     surface_planarity_map: np.ndarray | None = None
     core_width_metres: float = 0.0
     noise_seed: int = 0
@@ -429,18 +499,113 @@ def _grid_counts_for_scan(
     return total, selected_scan
 
 
-def _target_edge_component(mask: np.ndarray, origin_ix: int, origin_iy: int) -> np.ndarray:
+def _target_edge_component(
+    mask: np.ndarray,
+    origin_ix: int,
+    origin_iy: int,
+    cell_metres: float,
+) -> np.ndarray:
     count, labels = cv2.connectedComponents(mask.astype(np.uint8), connectivity=8)
     if count <= 1:
         raise ValueError("Patch 04 ScanID 9 footprint has no connected component")
     y, x = np.nonzero(mask)
     xy = np.column_stack((
-        (x + origin_ix + 0.5) * COMPONENT_CELL_METRES,
-        (y + origin_iy + 0.5) * COMPONENT_CELL_METRES,
+        (x + origin_ix + 0.5) * cell_metres,
+        (y + origin_iy + 0.5) * cell_metres,
     ))
     nearest = int(np.argmin(np.sum((xy - PATCH_04_TARGET_XY[None, :]) ** 2, axis=1)))
     label = int(labels[y[nearest], x[nearest]])
     return labels == label
+
+
+def _patch04_contact_geometry(
+    id9_counts: np.ndarray,
+    high_density_mask: np.ndarray,
+    cell_metres: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Measure the seam from real ScanID 9 cells, not its blurred footprint.
+
+    The density footprint is intentionally blurred and morphologically closed
+    to fit one stable connected edge.  At 5 mm resolution that mask can extend
+    several cells beyond the last measured ScanID 9 point and create a visible
+    moat even when the requested density ramp starts at distance zero.  Keep
+    only raw occupied cells associated with the selected connected footprint,
+    then measure the contact distance from those cells directly.
+    """
+    raw_occupied = np.asarray(id9_counts) > 0
+    neighbourhood_cells = max(
+        1,
+        int(math.ceil(PATCH_04_CONTACT_NEIGHBOURHOOD_METRES / cell_metres)),
+    )
+    associated = cv2.dilate(
+        np.asarray(high_density_mask, dtype=np.uint8),
+        _ellipse_kernel(neighbourhood_cells),
+    ) > 0
+    raw_contact = raw_occupied & associated
+    if np.count_nonzero(raw_contact) < 25:
+        raise ValueError("Patch 04 has too few raw ScanID 9 contact cells")
+
+    # XY occupancy contains real cavities and can also split where a steep
+    # rock face crosses several Z layers.  Treating every such opening as the
+    # scan perimeter caused the contact audit to follow internal holes.  A
+    # deeply eroded copy of the stable density footprint supplies only an
+    # interior spine; the measured cells still define the exterior contour.
+    interior_spine = cv2.erode(
+        np.asarray(high_density_mask, dtype=np.uint8),
+        _ellipse_kernel(neighbourhood_cells),
+    ) > 0
+    seeded = raw_contact | interior_spine
+    close_cells = max(1, int(round(0.010 / cell_metres)))
+    connected = cv2.morphologyEx(
+        seeded.astype(np.uint8),
+        cv2.MORPH_CLOSE,
+        _ellipse_kernel(close_cells),
+    ) > 0
+    label_count, labels = cv2.connectedComponents(
+        connected.astype(np.uint8),
+        connectivity=8,
+    )
+    if label_count <= 1:
+        raise ValueError("Patch 04 measured contact footprint is disconnected from its interior")
+    scores = np.bincount(
+        labels.ravel(),
+        weights=(raw_contact & np.asarray(high_density_mask, dtype=bool)).ravel(),
+        minlength=label_count,
+    )
+    scores[0] = -1.0
+    selected_label = int(np.argmax(scores))
+    connected = labels == selected_label
+
+    # Fill only external contours.  This removes internal rock cavities from
+    # the seam while retaining the actual, irregular outer ScanID 9 edge.
+    contours, _ = cv2.findContours(
+        connected.astype(np.uint8),
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_NONE,
+    )
+    contact_source = np.zeros_like(connected, dtype=np.uint8)
+    cv2.drawContours(contact_source, contours, -1, 1, thickness=cv2.FILLED)
+    contact_source = contact_source > 0
+    outer_boundary = contact_source & ~(
+        cv2.erode(
+            contact_source.astype(np.uint8),
+            np.ones((3, 3), dtype=np.uint8),
+        ) > 0
+    )
+    contact_boundary = raw_contact & (
+        cv2.dilate(
+            outer_boundary.astype(np.uint8),
+            np.ones((3, 3), dtype=np.uint8),
+        ) > 0
+    )
+    if np.count_nonzero(contact_boundary) < 4:
+        raise ValueError("Patch 04 has too few measured exterior contact cells")
+    contact_distance = cv2.distanceTransform(
+        (~contact_source).astype(np.uint8),
+        cv2.DIST_L2,
+        cv2.DIST_MASK_PRECISE,
+    ).astype(np.float64) * cell_metres
+    return contact_source, contact_boundary, contact_distance
 
 
 def build_patch04_edge_support(
@@ -449,15 +614,18 @@ def build_patch04_edge_support(
     mesh_bounds_min: np.ndarray,
     mesh_bounds_max: np.ndarray,
     blend_width_metres: float,
+    *,
+    cell_metres: float = COMPONENT_CELL_METRES,
+    include_empty_cells: bool = False,
 ) -> LinearEdgeSupport:
     if cv2 is None:
         raise RuntimeError("OpenCV (cv2) is required for the Patch 04 edge model")
-    if blend_width_metres <= COMPONENT_CELL_METRES:
+    if blend_width_metres <= cell_metres:
         raise ValueError("Patch 04 blend width must exceed one planning cell")
-    origin_ix = int(math.floor(mesh_bounds_min[0] / COMPONENT_CELL_METRES))
-    origin_iy = int(math.floor(mesh_bounds_min[1] / COMPONENT_CELL_METRES))
-    maximum_ix = int(math.floor(mesh_bounds_max[0] / COMPONENT_CELL_METRES))
-    maximum_iy = int(math.floor(mesh_bounds_max[1] / COMPONENT_CELL_METRES))
+    origin_ix = int(math.floor(mesh_bounds_min[0] / cell_metres))
+    origin_iy = int(math.floor(mesh_bounds_min[1] / cell_metres))
+    maximum_ix = int(math.floor(mesh_bounds_max[0] / cell_metres))
+    maximum_iy = int(math.floor(mesh_bounds_max[1] / cell_metres))
     width = maximum_ix - origin_ix + 1
     height = maximum_iy - origin_iy + 1
     if width <= 0 or height <= 0:
@@ -477,6 +645,7 @@ def build_patch04_edge_support(
         mask=np.zeros((height, width), dtype=bool),
         boundary=np.zeros((height, width), dtype=bool),
         outside_ring=np.zeros((height, width), dtype=bool),
+        cell_metres=cell_metres,
     )
     total, id9 = _grid_counts_for_scan(
         local_1mm,
@@ -484,25 +653,37 @@ def build_patch04_edge_support(
         placeholder,
         PATCH_04_SOURCE_SCAN_ID,
     )
-    smoothed_id9 = cv2.GaussianBlur(id9.astype(np.float32), (0, 0), 1.0)
+    density_sigma_cells = max(1.0, 0.020 / cell_metres)
+    smoothed_id9 = cv2.GaussianBlur(
+        id9.astype(np.float32),
+        (0, 0),
+        density_sigma_cells,
+    )
     high_density = smoothed_id9 >= 3.0
+    close_radius = max(1, int(round(0.040 / cell_metres)))
+    open_radius = max(1, int(round(0.020 / cell_metres)))
     high_density = cv2.morphologyEx(
         high_density.astype(np.uint8),
         cv2.MORPH_CLOSE,
-        _ellipse_kernel(2),
+        _ellipse_kernel(close_radius),
     ) > 0
     high_density = cv2.morphologyEx(
         high_density.astype(np.uint8),
         cv2.MORPH_OPEN,
-        _ellipse_kernel(1),
+        _ellipse_kernel(open_radius),
     ) > 0
-    high_density = _target_edge_component(high_density, origin_ix, origin_iy)
+    high_density = _target_edge_component(
+        high_density,
+        origin_ix,
+        origin_iy,
+        cell_metres,
+    )
     eroded = cv2.erode(high_density.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
     boundary = high_density & ~eroded
     by, bx = np.nonzero(boundary)
     boundary_xy = np.column_stack((
-        (bx + origin_ix + 0.5) * COMPONENT_CELL_METRES,
-        (by + origin_iy + 0.5) * COMPONENT_CELL_METRES,
+        (bx + origin_ix + 0.5) * cell_metres,
+        (by + origin_iy + 0.5) * cell_metres,
     ))
     fit_points = boundary_xy[
         np.linalg.norm(boundary_xy - PATCH_04_TARGET_XY[None, :], axis=1)
@@ -518,8 +699,8 @@ def build_patch04_edge_support(
     edge_origin = fit_centre + direction * float(np.dot(PATCH_04_TARGET_XY - fit_centre, direction))
 
     grid_x, grid_y = np.meshgrid(
-        (np.arange(width) + origin_ix + 0.5) * COMPONENT_CELL_METRES,
-        (np.arange(height) + origin_iy + 0.5) * COMPONENT_CELL_METRES,
+        (np.arange(width) + origin_ix + 0.5) * cell_metres,
+        (np.arange(height) + origin_iy + 0.5) * cell_metres,
     )
     grid_xy = np.column_stack((grid_x.ravel(), grid_y.ravel()))
     signed = ((grid_xy - edge_origin[None, :]) @ normal).reshape(height, width)
@@ -530,6 +711,9 @@ def build_patch04_edge_support(
     if float(np.median(signed[high_near_line])) > 0.0:
         normal *= -1.0
         signed *= -1.0
+    fit_rms = float(
+        np.sqrt(np.mean(((fit_points - edge_origin[None, :]) @ normal) ** 2))
+    )
 
     corners = np.array([
         [mesh_bounds_min[0], mesh_bounds_min[1]],
@@ -540,27 +724,48 @@ def build_patch04_edge_support(
     projected_corners = (corners - edge_origin[None, :]) @ direction
     along_min = float(np.min(projected_corners) + PATCH_04_EDGE_END_MARGIN_METRES)
     along_max = float(np.max(projected_corners) - PATCH_04_EDGE_END_MARGIN_METRES)
+    contact_source, contact_boundary, contact_distance = _patch04_contact_geometry(
+        id9,
+        high_density,
+        cell_metres,
+    )
+    edge_footprint = contact_source if include_empty_cells else high_density
+    edge_distance = (
+        contact_distance
+        if include_empty_cells
+        else cv2.distanceTransform(
+            (~high_density).astype(np.uint8),
+            cv2.DIST_L2,
+            cv2.DIST_MASK_PRECISE,
+        ).astype(np.float64) * cell_metres
+    )
+    # The straight line remains useful for choosing the intended side and
+    # limiting the along-edge extent, but density is measured from the actual
+    # ScanID 9 boundary.  Allow a narrow negative signed margin because the
+    # measured edge meanders around the least-squares fit.
+    signed_inside_margin = max(0.040, 4.0 * fit_rms)
+    occupancy_gate = np.ones_like(total, dtype=bool) if include_empty_cells else total > 0
     transition = (
-        ~high_density
-        & (signed >= 0.0)
+        ~edge_footprint
+        & (signed >= -signed_inside_margin)
         & (signed <= blend_width_metres)
+        & (edge_distance <= blend_width_metres)
         & (along >= along_min)
         & (along <= along_max)
-        & (total > 0)
+        & occupancy_gate
     )
     if np.count_nonzero(transition) < 25:
         raise ValueError("Patch 04 transition belt contains too few occupied cells")
     ambient_ring = (
         ~high_density
-        & (signed >= blend_width_metres * 0.70)
-        & (signed <= blend_width_metres)
+        & (edge_distance >= blend_width_metres * 0.70)
+        & (edge_distance <= blend_width_metres)
         & (along >= along_min)
         & (along <= along_max)
         & (total > 0)
     )
-    fit_rms = float(np.sqrt(np.mean(((fit_points - edge_origin[None, :]) @ normal) ** 2)))
     placeholder.mask = transition
-    placeholder.boundary = boundary
+    placeholder.boundary = contact_boundary if include_empty_cells else boundary
     placeholder.outside_ring = ambient_ring
     return LinearEdgeSupport(
         component=placeholder,
@@ -576,6 +781,9 @@ def build_patch04_edge_support(
         along_max=along_max,
         blend_width_metres=blend_width_metres,
         fit_rms_metres=fit_rms,
+        edge_distance=edge_distance,
+        contact_source_mask=contact_source,
+        contact_boundary_mask=contact_boundary,
     )
 
 
@@ -649,7 +857,7 @@ def _grid_surface_planarity(
     ))
     for index in range(products.shape[1]):
         np.add.at(tensor[..., index], (gy, gx), products[:, index])
-    sigma_cells = 1.5
+    sigma_cells = max(1.5, 0.030 / component.cell_metres)
     blurred_count = cv2.GaussianBlur(count, (0, 0), sigma_cells)
     blurred = np.stack([
         cv2.GaussianBlur(tensor[..., index], (0, 0), sigma_cells)
@@ -679,8 +887,9 @@ def _grid_surface_planarity(
     scaled = np.clip((raw - low) / span, 0.0, 1.0)
     scaled = scaled * scaled * (3.0 - 2.0 * scaled)
     observed = (blurred_count > 1.0e-4).astype(np.float64)
-    numerator = cv2.GaussianBlur(scaled * observed, (0, 0), 1.25)
-    denominator = cv2.GaussianBlur(observed, (0, 0), 1.25)
+    interpolation_sigma = max(1.25, 0.025 / component.cell_metres)
+    numerator = cv2.GaussianBlur(scaled * observed, (0, 0), interpolation_sigma)
+    denominator = cv2.GaussianBlur(observed, (0, 0), interpolation_sigma)
     planarity = np.divide(
         numerator,
         np.maximum(denominator, 1.0e-8),
@@ -775,6 +984,220 @@ def configure_patch04_jagged_fade(
     }
 
 
+def configure_patch04_lobed_fade(
+    support: LinearEdgeSupport,
+    local_1mm: np.ndarray,
+    info_1mm: PlyInfo,
+    *,
+    maximum_width_metres: float,
+    noise_seed: int,
+) -> dict[str, Any]:
+    """Author broad full-density islands before a slower irregular taper.
+
+    The old jagged profile varied only the outer reach and retained a 30 mm
+    core everywhere.  That softened the mathematical step but left one
+    perceptually coherent line.  This profile instead interpolates the
+    reviewed plateau outline in edge coordinates, then gives those plateaus a
+    long surface-aware falloff.  Cells outside the lobes receive only a short
+    baseline taper so the three plateaus read as connected rock areas rather
+    than another continuous stripe.
+    """
+    if maximum_width_metres <= 0.30:
+        raise ValueError("Lobed Patch 04 maximum width must exceed 300 mm")
+    if maximum_width_metres > support.blend_width_metres + 1.0e-9:
+        raise ValueError("Lobed Patch 04 maximum width exceeds its support belt")
+
+    controls = np.asarray(PATCH_04_LOBED_CORE_CONTROLS, dtype=np.float64)
+    along = support.along_distance
+    core = np.interp(
+        along,
+        controls[:, 0],
+        controls[:, 1],
+        left=0.0,
+        right=0.0,
+    )
+    # A small spatial blur rounds hand-drawn joins without erasing the narrow
+    # waist between the two large lobes.
+    core = cv2.GaussianBlur(core.astype(np.float64), (0, 0), 0.70)
+    core = np.clip(core, 0.0, float(np.max(controls[:, 1])))
+
+    lobe_strength = np.clip(
+        core / max(float(np.max(controls[:, 1])), 1.0e-6),
+        0.0,
+        1.0,
+    )
+    lobe_strength = lobe_strength * lobe_strength * (3.0 - 2.0 * lobe_strength)
+    broad = _smooth_value_noise_1d(along, 0.51, noise_seed + 13)
+    fine = _smooth_value_noise_1d(along, 0.21, noise_seed + 47)
+    connected_noise = 0.72 * broad + 0.28 * fine
+    planarity, planarity_report = _grid_surface_planarity(
+        local_1mm,
+        info_1mm,
+        support.component,
+    )
+    taper = (
+        PATCH_04_LOBED_BASE_TAPER_METRES
+        + PATCH_04_LOBED_EXTRA_TAPER_METRES * lobe_strength
+        + PATCH_04_LOBED_NOISE_METRES * connected_noise
+        + PATCH_04_LOBED_PLANARITY_METRES * (2.0 * planarity - 1.0)
+    )
+    taper = np.clip(taper, 0.065, PATCH_04_LOBED_BASE_TAPER_METRES + PATCH_04_LOBED_EXTRA_TAPER_METRES)
+    fade = cv2.GaussianBlur((core + taper).astype(np.float64), (0, 0), 0.65)
+    fade = np.clip(
+        fade,
+        core + 0.060,
+        maximum_width_metres,
+    )
+
+    support.edge_profile = "lobed"
+    support.core_width_map = core
+    support.fade_width_map = fade
+    support.surface_planarity_map = planarity
+    support.core_width_metres = 0.0
+    support.noise_seed = noise_seed
+    active = support.transition_mask
+    active_core = core[active]
+    active_fade = fade[active]
+    active_planarity = planarity[active]
+    plateau_cells = active & (core >= support.component.cell_metres)
+    island_count, _ = cv2.connectedComponents(
+        plateau_cells.astype(np.uint8),
+        connectivity=8,
+    )
+    return {
+        "profile": "reviewed-lobed-plateaus",
+        "source_annotation": "Screenshot 2026-08-05 at 5.27.22 am / Patch 04",
+        "coordinate_system": "fitted edge along/signed metres",
+        "core_controls": [
+            {"along_m": float(along_value), "core_width_m": float(width_value)}
+            for along_value, width_value in PATCH_04_LOBED_CORE_CONTROLS
+        ],
+        "plateau_island_count": int(max(island_count - 1, 0)),
+        "quota_model": "cellwise total-density deficit to the ScanID 9 reference",
+        "noise": "two-octave connected smooth value noise",
+        "noise_seed": int(noise_seed),
+        "noise_wavelengths_m": [0.51, 0.21],
+        "maximum_width_m": float(maximum_width_metres),
+        "base_taper_m": PATCH_04_LOBED_BASE_TAPER_METRES,
+        "extra_lobe_taper_m": PATCH_04_LOBED_EXTRA_TAPER_METRES,
+        "planarity_modulation_m": PATCH_04_LOBED_PLANARITY_METRES,
+        "noise_modulation_m": PATCH_04_LOBED_NOISE_METRES,
+        "core_width_min_m": float(np.min(active_core)),
+        "core_width_p50_m": float(np.percentile(active_core, 50)),
+        "core_width_p95_m": float(np.percentile(active_core, 95)),
+        "core_width_max_m": float(np.max(active_core)),
+        "fade_width_min_m": float(np.min(active_fade)),
+        "fade_width_p50_m": float(np.percentile(active_fade, 50)),
+        "fade_width_p95_m": float(np.percentile(active_fade, 95)),
+        "fade_width_max_m": float(np.max(active_fade)),
+        "planarity_p05": float(np.percentile(active_planarity, 5)),
+        "planarity_p50": float(np.percentile(active_planarity, 50)),
+        "planarity_p95": float(np.percentile(active_planarity, 95)),
+        **planarity_report,
+    }
+
+
+def configure_patch04_sealed_fade(
+    support: LinearEdgeSupport,
+    local_1mm: np.ndarray,
+    info_1mm: PlyInfo,
+    *,
+    maximum_width_metres: float,
+    noise_seed: int,
+) -> dict[str, Any]:
+    """Seal the immediate measured seam, then retain the reviewed broad lobes.
+
+    The earlier profile measured every quota from a fitted straight line and
+    ignored empty planning cells.  In the close ``Patch 04_new`` view that
+    leaves a coherent low-density moat.  This revision measures distance from
+    the actual ScanID 9 footprint on a 5 mm grid, guarantees a narrow irregular
+    full-density ribbon, and strengthens the reviewed upper island without
+    changing any existing record.
+    """
+    if support.edge_distance is None:
+        raise ValueError("Sealed Patch 04 profile requires actual-edge distances")
+    report = configure_patch04_lobed_fade(
+        support,
+        local_1mm,
+        info_1mm,
+        maximum_width_metres=maximum_width_metres,
+        noise_seed=noise_seed,
+    )
+    assert support.core_width_map is not None
+    assert support.fade_width_map is not None
+    along = support.along_distance
+    broad = _smooth_value_noise_1d(along, 0.43, noise_seed + 101)
+    fine = _smooth_value_noise_1d(along, 0.17, noise_seed + 149)
+    seam = (
+        PATCH_04_SEALED_SEAM_CORE_METRES
+        + PATCH_04_SEALED_SEAM_VARIATION_METRES * (0.72 * broad + 0.28 * fine)
+    )
+    seam = np.clip(seam, 0.032, 0.060)
+
+    # The upper annotation in Patch 04_new lies around along=-0.47 and reaches
+    # roughly 160 mm from the real boundary.  A smooth connected island avoids
+    # introducing a rectangular or circular authored edge.
+    upper_repair = 0.180 * np.exp(-0.5 * np.square((along + 0.47) / 0.095))
+    upper_cap = 0.120 * np.exp(-0.5 * np.square((along + 0.72) / 0.070))
+    old_core = support.core_width_map
+    old_fade = support.fade_width_map
+    core = np.maximum.reduce((old_core, seam, upper_repair, upper_cap))
+    core = cv2.GaussianBlur(
+        core.astype(np.float64),
+        (0, 0),
+        max(0.65, 0.008 / support.component.cell_metres),
+    )
+    taper = np.maximum(old_fade - old_core, 0.080)
+    fade = np.clip(core + taper, core + 0.070, maximum_width_metres)
+    fade = cv2.GaussianBlur(
+        fade.astype(np.float64),
+        (0, 0),
+        max(0.65, 0.008 / support.component.cell_metres),
+    )
+    fade = np.clip(fade, core + 0.065, maximum_width_metres)
+
+    support.edge_profile = "sealed"
+    support.core_width_map = core
+    support.fade_width_map = fade
+    support.core_width_metres = 0.0
+    support.noise_seed = noise_seed
+    active = support.transition_mask
+    active_core = core[active]
+    active_fade = fade[active]
+    report.update({
+        "profile": "actual-edge-sealed-lobes",
+        "source_annotation": "Screenshot 2026-08-05 at 11.16.45 pm / Patch 04_new",
+        "coordinate_system": "distance from measured ScanID 9 boundary plus fitted along coordinate",
+        "planning_cell_m": support.component.cell_metres,
+        "seam_core_base_m": PATCH_04_SEALED_SEAM_CORE_METRES,
+        "seam_core_variation_m": PATCH_04_SEALED_SEAM_VARIATION_METRES,
+        "upper_repair_center_along_m": -0.47,
+        "upper_repair_core_m": 0.180,
+        "contact_source_cell_count": int(
+            np.count_nonzero(support.contact_source_mask)
+            if support.contact_source_mask is not None
+            else 0
+        ),
+        "contact_boundary_cell_count": int(
+            np.count_nonzero(support.contact_boundary_mask)
+            if support.contact_boundary_mask is not None
+            else 0
+        ),
+        "contact_audit_along_min_m": PATCH_04_CONTACT_ALONG_MIN_METRES,
+        "contact_audit_along_max_m": PATCH_04_CONTACT_ALONG_MAX_METRES,
+        "core_width_min_m": float(np.min(active_core)),
+        "core_width_p50_m": float(np.percentile(active_core, 50)),
+        "core_width_p95_m": float(np.percentile(active_core, 95)),
+        "core_width_max_m": float(np.max(active_core)),
+        "fade_width_min_m": float(np.min(active_fade)),
+        "fade_width_p50_m": float(np.percentile(active_fade, 50)),
+        "fade_width_p95_m": float(np.percentile(active_fade, 95)),
+        "fade_width_max_m": float(np.max(active_fade)),
+        "quota_model": "cellwise raw total-density deficit on actual-edge grid",
+    })
+    return report
+
+
 def _srgb_to_oklab(rgb: np.ndarray) -> np.ndarray:
     srgb = np.asarray(rgb, dtype=np.float64) / 255.0
     linear = np.where(srgb <= 0.04045, srgb / 12.92, ((srgb + 0.055) / 1.055) ** 2.4)
@@ -843,12 +1266,34 @@ def _load_component_definitions(report_path: Path) -> list[dict[str, Any]]:
     return result
 
 
+def _load_selected_component_definition(
+    report_path: Path,
+    zero_index: int,
+    camera_name: str,
+    host_scan_id: int,
+) -> dict[str, Any]:
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    components = report.get("components", [])
+    if zero_index < 0 or zero_index >= len(components):
+        raise ValueError(f"CleanMesh report does not contain component {zero_index + 1}")
+    source = components[zero_index]
+    return {
+        "camera_name": camera_name,
+        "cleanmesh_index": zero_index + 1,
+        "host_scan_id": host_scan_id,
+        "bounds_min": np.asarray(source["bounds_min"], dtype=np.float64),
+        "bounds_max": np.asarray(source["bounds_max"], dtype=np.float64),
+    }
+
+
 def build_component_supports(
     dense_info: PlyInfo,
     report_path: Path,
     chunk_records: int,
+    definitions: Sequence[dict[str, Any]] | None = None,
+    cell_metres: float = COMPONENT_CELL_METRES,
 ) -> list[ComponentSupport]:
-    definitions = _load_component_definitions(report_path)
+    definitions = list(definitions) if definitions is not None else _load_component_definitions(report_path)
     dense = records(dense_info)
     pieces: list[list[np.ndarray]] = [[] for _ in definitions]
     started = time.monotonic()
@@ -875,8 +1320,8 @@ def build_component_supports(
         x = np.asarray(component_records[dense_info.fields["x"]], dtype=np.float64)
         y = np.asarray(component_records[dense_info.fields["y"]], dtype=np.float64)
         z = np.asarray(component_records[dense_info.fields["z"]], dtype=np.float64)
-        ix = np.floor(x / COMPONENT_CELL_METRES).astype(np.int64)
-        iy = np.floor(y / COMPONENT_CELL_METRES).astype(np.int64)
+        ix = np.floor(x / cell_metres).astype(np.int64)
+        iy = np.floor(y / cell_metres).astype(np.int64)
         keys = _pack_cells(ix, iy)
         order = np.argsort(keys, kind="stable")
         unique, starts = np.unique(keys[order], return_index=True)
@@ -884,7 +1329,7 @@ def build_component_supports(
         z_min = np.minimum.reduceat(z_sorted, starts)
         z_max = np.maximum.reduceat(z_sorted, starts)
         cell_ix, cell_iy = _unpack_cells(unique)
-        padding = 6
+        padding = max(2, int(round(0.120 / cell_metres)))
         origin_ix = int(np.min(cell_ix)) - padding
         origin_iy = int(np.min(cell_iy)) - padding
         width = int(np.max(cell_ix)) - origin_ix + padding + 1
@@ -893,9 +1338,19 @@ def build_component_supports(
         mask[cell_iy - origin_iy, cell_ix - origin_ix] = 1
         # Close one-cell sampling pinholes, but retain the measured component
         # outline and require a matching per-cell Z range during selection.
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _ellipse_kernel(1))
-        eroded = cv2.erode(mask, _ellipse_kernel(2))
-        dilated = cv2.dilate(mask, _ellipse_kernel(4))
+        mask = cv2.morphologyEx(
+            mask,
+            cv2.MORPH_CLOSE,
+            _ellipse_kernel(max(1, int(round(0.020 / cell_metres)))),
+        )
+        eroded = cv2.erode(
+            mask,
+            _ellipse_kernel(max(1, int(round(0.040 / cell_metres)))),
+        )
+        dilated = cv2.dilate(
+            mask,
+            _ellipse_kernel(max(1, int(round(0.080 / cell_metres)))),
+        )
         supports.append(ComponentSupport(
             camera_name=definition["camera_name"],
             cleanmesh_index=definition["cleanmesh_index"],
@@ -911,6 +1366,7 @@ def build_component_supports(
             mask=mask.astype(bool),
             boundary=mask.astype(bool) & ~eroded.astype(bool),
             outside_ring=dilated.astype(bool) & ~mask.astype(bool),
+            cell_metres=cell_metres,
         ))
         print(
             f"  {definition['camera_name']}: {len(component_records):,} dense points, "
@@ -919,6 +1375,68 @@ def build_component_supports(
         )
     print(f"  dense support construction: {time.monotonic()-started:.1f}s", flush=True)
     return supports
+
+
+def component_support_from_dense_records(
+    dense_records: np.ndarray,
+    dense_info: PlyInfo,
+    *,
+    camera_name: str,
+    cleanmesh_index: int,
+    host_scan_id: int,
+    cell_metres: float,
+) -> ComponentSupport:
+    if not len(dense_records):
+        raise ValueError(f"No dense points found for {camera_name}")
+    x = np.asarray(dense_records[dense_info.fields["x"]], dtype=np.float64)
+    y = np.asarray(dense_records[dense_info.fields["y"]], dtype=np.float64)
+    z = np.asarray(dense_records[dense_info.fields["z"]], dtype=np.float64)
+    ix = np.floor(x / cell_metres).astype(np.int64)
+    iy = np.floor(y / cell_metres).astype(np.int64)
+    keys = _pack_cells(ix, iy)
+    order = np.argsort(keys, kind="stable")
+    unique, starts = np.unique(keys[order], return_index=True)
+    sorted_z = z[order]
+    z_min = np.minimum.reduceat(sorted_z, starts)
+    z_max = np.maximum.reduceat(sorted_z, starts)
+    cell_ix, cell_iy = _unpack_cells(unique)
+    padding = max(2, int(round(0.120 / cell_metres)))
+    origin_ix = int(np.min(cell_ix)) - padding
+    origin_iy = int(np.min(cell_iy)) - padding
+    width = int(np.max(cell_ix)) - origin_ix + padding + 1
+    height = int(np.max(cell_iy)) - origin_iy + padding + 1
+    mask = np.zeros((height, width), dtype=np.uint8)
+    mask[cell_iy - origin_iy, cell_ix - origin_ix] = 1
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_CLOSE,
+        _ellipse_kernel(max(1, int(round(0.020 / cell_metres)))),
+    )
+    eroded = cv2.erode(
+        mask,
+        _ellipse_kernel(max(1, int(round(0.040 / cell_metres)))),
+    )
+    dilated = cv2.dilate(
+        mask,
+        _ellipse_kernel(max(1, int(round(0.080 / cell_metres)))),
+    )
+    return ComponentSupport(
+        camera_name=camera_name,
+        cleanmesh_index=cleanmesh_index,
+        host_scan_id=host_scan_id,
+        bounds_min=np.array([np.min(x), np.min(y), np.min(z)], dtype=np.float64),
+        bounds_max=np.array([np.max(x), np.max(y), np.max(z)], dtype=np.float64),
+        dense_records=dense_records,
+        cell_keys=unique,
+        cell_z_min=z_min,
+        cell_z_max=z_max,
+        origin_ix=origin_ix,
+        origin_iy=origin_iy,
+        mask=mask.astype(bool),
+        boundary=mask.astype(bool) & ~eroded.astype(bool),
+        outside_ring=dilated.astype(bool) & ~mask.astype(bool),
+        cell_metres=cell_metres,
+    )
 
 
 def collect_local_records(
@@ -1325,22 +1843,33 @@ def plan_density_additions(
     local: np.ndarray,
     info: PlyInfo,
     component: ComponentSupport,
+    *,
+    match_total_density: bool | None = None,
+    fill_fraction: float | None = None,
 ) -> tuple[dict[int, int], dict[str, Any]]:
     total, target, host, other = _grid_counts(local, info, component)
     ring_known = component.outside_ring & (total > 0)
     fill = component.mask | component.outside_ring
     expected_total = _harmonic_density(total, ring_known, fill)
     expected_host = _harmonic_density(host, component.outside_ring & (host > 0), fill)
-    match_total_density = component.cleanmesh_index == 1
+    match_total_density = (
+        component.cleanmesh_index == 1
+        if match_total_density is None
+        else match_total_density
+    )
     desired = (
         expected_total
         if match_total_density
         else np.minimum(expected_total, other + expected_host)
     )
     fill_fraction = (
-        PATCH_01_DENSITY_DEFICIT_FILL_FRACTION
-        if match_total_density
-        else DENSITY_DEFICIT_FILL_FRACTION
+        (
+            PATCH_01_DENSITY_DEFICIT_FILL_FRACTION
+            if match_total_density
+            else DENSITY_DEFICIT_FILL_FRACTION
+        )
+        if fill_fraction is None
+        else fill_fraction
     )
     raw_deficit = np.maximum(0.0, desired - total)
     threshold = np.maximum(2.0, np.ceil(desired * 0.10))
@@ -1389,8 +1918,8 @@ def select_dense_additions(
     dy = np.asarray(dense[dense_info.fields["y"]], dtype=np.float64)
     dz = np.asarray(dense[dense_info.fields["z"]], dtype=np.float64)
     dense_cells = _pack_cells(
-        np.floor(dx / COMPONENT_CELL_METRES).astype(np.int64),
-        np.floor(dy / COMPONENT_CELL_METRES).astype(np.int64),
+        np.floor(dx / component.cell_metres).astype(np.int64),
+        np.floor(dy / component.cell_metres).astype(np.int64),
     )
     requested_keys = np.asarray(sorted(requested), dtype=np.int64)
     wanted = np.isin(dense_cells, requested_keys, assume_unique=False)
@@ -1532,6 +2061,22 @@ def collect_patch04_mesh_belt(
     source = records(mesh_info)
     pieces: list[np.ndarray] = []
     component = support.component
+    mesh_candidate_mask = support.transition_mask
+    if support.edge_profile == "sealed" and support.contact_boundary_mask is not None:
+        reachable_contact = (
+            support.contact_boundary_mask
+            & (
+                cv2.dilate(
+                    support.transition_mask.astype(np.uint8),
+                    np.ones((3, 3), dtype=np.uint8),
+                ) > 0
+            )
+        )
+        # The true scan perimeter can cross anywhere inside a 5 mm planning
+        # cell.  Retain mesh samples from the measured boundary cell for the
+        # later exact 3D bridge; density quotas still select only exterior
+        # transition cells.
+        mesh_candidate_mask = support.transition_mask | reachable_contact
     for start in range(0, mesh_info.vertex_count, chunk_records):
         end = min(start + chunk_records, mesh_info.vertex_count)
         chunk = source[start:end]
@@ -1540,7 +2085,7 @@ def collect_patch04_mesh_belt(
         gx, gy, within = component.grid_coordinates(x, y)
         selected = np.zeros(len(chunk), dtype=bool)
         if np.any(within):
-            selected[within] = support.transition_mask[gy[within], gx[within]]
+            selected[within] = mesh_candidate_mask[gy[within], gx[within]]
         if np.any(selected):
             pieces.append(np.array(chunk[selected], copy=True))
         if start == 0 or end == mesh_info.vertex_count or end // chunk_records % 10 == 0:
@@ -1559,6 +2104,8 @@ def filter_patch04_mesh_geometry(
     mesh_info: PlyInfo,
     local_1mm: np.ndarray,
     info_1mm: PlyInfo,
+    *,
+    maximum_tangent_distance_metres: float | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     if cv2 is None:
         raise RuntimeError("OpenCV (cv2) is required for Patch 04 geometry filtering")
@@ -1572,12 +2119,21 @@ def filter_patch04_mesh_geometry(
         local_1mm[info_1mm.fields[channel]]
         for channel in ("nx", "ny", "nz")
     ]).astype(np.float32, copy=False)
+    measured_lengths = np.linalg.norm(measured_normals, axis=1)
+    measured_normals = np.divide(
+        measured_normals,
+        np.maximum(measured_lengths[:, None], 1.0e-12),
+        out=np.zeros_like(measured_normals),
+        where=measured_lengths[:, None] > 1.0e-8,
+    )
     nearest_index = cv2.flann_Index(
         measured_xyz,
         {"algorithm": 1, "trees": 4},
     )
     kept: list[np.ndarray] = []
     distances: list[np.ndarray] = []
+    euclidean_distances: list[np.ndarray] = []
+    tangent_distances: list[np.ndarray] = []
     normal_dots: list[np.ndarray] = []
     nearest_scan_counts: collections.Counter[int] = collections.Counter()
     query_chunk = 250_000
@@ -1594,21 +2150,47 @@ def filter_patch04_mesh_geometry(
             params={"checks": 64},
         )
         nearest = nearest[:, 0]
-        distance = np.sqrt(np.maximum(distance_squared[:, 0], 0.0))
+        euclidean_distance = np.sqrt(np.maximum(distance_squared[:, 0], 0.0))
         query_normals = np.column_stack([
             subset[mesh_info.fields[channel]]
             for channel in ("nx", "ny", "nz")
         ]).astype(np.float32, copy=False)
-        dot = np.abs(np.sum(query_normals * measured_normals[nearest], axis=1))
+        query_lengths = np.linalg.norm(query_normals, axis=1)
+        query_normals = np.divide(
+            query_normals,
+            np.maximum(query_lengths[:, None], 1.0e-12),
+            out=np.zeros_like(query_normals),
+            where=query_lengths[:, None] > 1.0e-8,
+        )
+        nearest_normals = measured_normals[nearest]
+        dot = np.abs(np.sum(query_normals * nearest_normals, axis=1))
+        tangent_distance = np.zeros_like(euclidean_distance)
+        distance = euclidean_distance
+        if maximum_tangent_distance_metres is not None:
+            displacement = query_xyz - measured_xyz[nearest]
+            signed_plane_distance = np.sum(displacement * nearest_normals, axis=1)
+            distance = np.abs(signed_plane_distance)
+            tangent_distance = np.sqrt(np.maximum(
+                np.sum(displacement * displacement, axis=1)
+                - signed_plane_distance * signed_plane_distance,
+                0.0,
+            ))
         accepted = (
             np.isfinite(distance)
             & np.isfinite(dot)
             & (distance <= PATCH_04_GEOMETRY_MAX_DISTANCE_METRES)
             & (dot >= PATCH_04_GEOMETRY_NORMAL_DOT_MIN)
         )
+        if maximum_tangent_distance_metres is not None:
+            accepted &= (
+                np.isfinite(tangent_distance)
+                & (tangent_distance <= maximum_tangent_distance_metres)
+            )
         if np.any(accepted):
             kept.append(np.array(subset[accepted], copy=True))
         distances.append(distance)
+        euclidean_distances.append(euclidean_distance)
+        tangent_distances.append(tangent_distance)
         normal_dots.append(dot)
         nearest_ids, valid_ids = _scan_ids(local_1mm[nearest], info_1mm)
         values, counts = np.unique(nearest_ids[valid_ids], return_counts=True)
@@ -1620,6 +2202,8 @@ def filter_patch04_mesh_geometry(
             )
     del nearest_index, measured_xyz, measured_normals
     all_distances = np.concatenate(distances)
+    all_euclidean_distances = np.concatenate(euclidean_distances)
+    all_tangent_distances = np.concatenate(tangent_distances)
     all_dots = np.concatenate(normal_dots)
     result = np.concatenate(kept) if kept else np.empty(0, dtype=mesh_info.dtype)
     report = {
@@ -1628,9 +2212,17 @@ def filter_patch04_mesh_geometry(
         "rejected": int(len(mesh) - len(result)),
         "acceptance_fraction": float(len(result) / len(mesh)),
         "maximum_distance_m": PATCH_04_GEOMETRY_MAX_DISTANCE_METRES,
+        "distance_metric": (
+            "point-to-plane-with-tangent-limit"
+            if maximum_tangent_distance_metres is not None
+            else "euclidean"
+        ),
+        "maximum_tangent_distance_m": maximum_tangent_distance_metres,
         "minimum_abs_normal_dot": PATCH_04_GEOMETRY_NORMAL_DOT_MIN,
         "distance_p50_m": float(np.percentile(all_distances, 50)),
         "distance_p95_m": float(np.percentile(all_distances, 95)),
+        "euclidean_distance_p95_m": float(np.percentile(all_euclidean_distances, 95)),
+        "tangent_distance_p95_m": float(np.percentile(all_tangent_distances, 95)),
         "normal_dot_p05": float(np.percentile(all_dots, 5)),
         "nearest_scan_counts": dict(sorted(nearest_scan_counts.items())),
     }
@@ -1642,13 +2234,14 @@ def filter_patch04_mesh_geometry(
 def _surface_cell_ranges(
     points: np.ndarray,
     info: PlyInfo,
+    cell_metres: float = COMPONENT_CELL_METRES,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     x = np.asarray(points[info.fields["x"]], dtype=np.float64)
     y = np.asarray(points[info.fields["y"]], dtype=np.float64)
     z = np.asarray(points[info.fields["z"]], dtype=np.float64)
     keys = _pack_cells(
-        np.floor(x / COMPONENT_CELL_METRES).astype(np.int64),
-        np.floor(y / COMPONENT_CELL_METRES).astype(np.int64),
+        np.floor(x / cell_metres).astype(np.int64),
+        np.floor(y / cell_metres).astype(np.int64),
     )
     order = np.argsort(keys, kind="stable")
     unique, starts = np.unique(keys[order], return_index=True)
@@ -1667,6 +2260,369 @@ def _robust_density_level(values: np.ndarray) -> float:
     return float(np.mean(np.clip(finite, low, high)))
 
 
+def _patch04_contact_boundary_records(
+    local: np.ndarray,
+    info: PlyInfo,
+    support: LinearEdgeSupport,
+) -> tuple[np.ndarray, np.ndarray]:
+    if support.contact_boundary_mask is None or not len(local):
+        return np.empty(0, dtype=local.dtype), np.empty(0, dtype=np.int64)
+    scan_ids, valid_scan_ids = _scan_ids(local, info)
+    x = np.asarray(local[info.fields["x"]], dtype=np.float64)
+    y = np.asarray(local[info.fields["y"]], dtype=np.float64)
+    gx, gy, within = support.component.grid_coordinates(x, y)
+    reachable = cv2.dilate(
+        support.transition_mask.astype(np.uint8),
+        np.ones((3, 3), dtype=np.uint8),
+    ) > 0
+    selected = valid_scan_ids & (scan_ids == support.source_scan_id) & within
+    within_indices = np.flatnonzero(selected)
+    if len(within_indices):
+        selected[within_indices] &= (
+            support.contact_boundary_mask[gy[within_indices], gx[within_indices]]
+            & reachable[gy[within_indices], gx[within_indices]]
+            & (
+                support.along_distance[gy[within_indices], gx[within_indices]]
+                >= PATCH_04_CONTACT_ALONG_MIN_METRES
+            )
+            & (
+                support.along_distance[gy[within_indices], gx[within_indices]]
+                <= PATCH_04_CONTACT_ALONG_MAX_METRES
+            )
+        )
+    indices = np.flatnonzero(selected)
+    if not len(indices):
+        return np.empty(0, dtype=local.dtype), np.empty(0, dtype=np.int64)
+    keys = _pack_cells(
+        np.floor(x[indices] / support.component.cell_metres).astype(np.int64),
+        np.floor(y[indices] / support.component.cell_metres).astype(np.int64),
+    )
+    return local[indices], keys
+
+
+def estimate_patch04_contact_spacing(
+    local: np.ndarray,
+    info: PlyInfo,
+    support: LinearEdgeSupport,
+) -> tuple[float, dict[str, Any]]:
+    boundary, _ = _patch04_contact_boundary_records(local, info, support)
+    if len(boundary) < 100:
+        raise ValueError("Patch 04 has too few measured boundary points to estimate contact spacing")
+    xyz = np.column_stack([
+        boundary[info.fields[channel]]
+        for channel in ("x", "y", "z")
+    ]).astype(np.float32, copy=False)
+    index = cv2.flann_Index(xyz, {"algorithm": 1, "trees": 8})
+    _, distance_squared = index.knnSearch(
+        xyz,
+        2,
+        params={"checks": 128},
+    )
+    del index
+    nearest_spacing = np.sqrt(np.maximum(distance_squared[:, 1], 0.0))
+    finite = nearest_spacing[np.isfinite(nearest_spacing) & (nearest_spacing > 0.0)]
+    if len(finite) < 100:
+        raise ValueError("Patch 04 boundary spacing estimate has too few finite neighbours")
+    measured = float(np.quantile(finite, PATCH_04_CONTACT_SPACING_QUANTILE))
+    target = float(np.clip(
+        measured,
+        PATCH_04_CONTACT_SPACING_MIN_METRES,
+        PATCH_04_CONTACT_SPACING_MAX_METRES,
+    ))
+    return target, {
+        "boundary_point_count": int(len(boundary)),
+        "nearest_spacing_p50_m": float(np.quantile(finite, 0.50)),
+        "nearest_spacing_p95_m": float(np.quantile(finite, 0.95)),
+        "nearest_spacing_p99_m": float(np.quantile(finite, 0.99)),
+        "target_contact_spacing_m": target,
+        "target_quantile": PATCH_04_CONTACT_SPACING_QUANTILE,
+    }
+
+
+def audit_patch04_contact_spacing(
+    additions: np.ndarray,
+    additions_info: PlyInfo,
+    local: np.ndarray,
+    local_info: PlyInfo,
+    support: LinearEdgeSupport,
+    target_spacing_metres: float,
+) -> dict[str, Any]:
+    boundary, boundary_keys = _patch04_contact_boundary_records(
+        local,
+        local_info,
+        support,
+    )
+    if not len(boundary) or not len(additions):
+        raise ValueError("Patch 04 contact audit requires boundary and addition points")
+    additions_xyz = np.column_stack([
+        additions[additions_info.fields[channel]]
+        for channel in ("x", "y", "z")
+    ]).astype(np.float32, copy=False)
+    boundary_xyz = np.column_stack([
+        boundary[local_info.fields[channel]]
+        for channel in ("x", "y", "z")
+    ]).astype(np.float32, copy=False)
+    index = cv2.flann_Index(additions_xyz, {"algorithm": 1, "trees": 8})
+    _, distance_squared = index.knnSearch(
+        boundary_xyz,
+        1,
+        params={"checks": 128},
+    )
+    del index
+    distances = np.sqrt(np.maximum(distance_squared[:, 0], 0.0))
+    order = np.argsort(boundary_keys, kind="stable")
+    _, starts = np.unique(boundary_keys[order], return_index=True)
+    cell_minimum = np.minimum.reduceat(distances[order], starts)
+    finite = cell_minimum[np.isfinite(cell_minimum)]
+    if not len(finite):
+        raise ValueError("Patch 04 contact audit produced no finite cell distances")
+    threshold = max(target_spacing_metres * 1.5, target_spacing_metres + 0.00035)
+    point_finite = distances[np.isfinite(distances)]
+    return {
+        "boundary_point_count": int(len(point_finite)),
+        "boundary_cell_count": int(len(finite)),
+        "minimum_contact_distance_m": float(np.min(finite)),
+        "contact_distance_p50_m": float(np.quantile(finite, 0.50)),
+        "contact_distance_p95_m": float(np.quantile(finite, 0.95)),
+        "contact_distance_p99_m": float(np.quantile(finite, 0.99)),
+        "maximum_contact_distance_m": float(np.max(finite)),
+        "target_contact_spacing_m": float(target_spacing_metres),
+        "accepted_contact_threshold_m": float(threshold),
+        "cells_within_contact_threshold": int(np.count_nonzero(finite <= threshold)),
+        "contact_fraction": float(np.mean(finite <= threshold)),
+        "point_contact_distance_p50_m": float(np.quantile(point_finite, 0.50)),
+        "point_contact_distance_p95_m": float(np.quantile(point_finite, 0.95)),
+        "points_within_contact_threshold": int(np.count_nonzero(point_finite <= threshold)),
+        "point_contact_fraction": float(np.mean(point_finite <= threshold)),
+    }
+
+
+def seal_patch04_contact(
+    selected: np.ndarray,
+    selected_info: PlyInfo,
+    candidates: np.ndarray,
+    candidate_info: PlyInfo,
+    local: np.ndarray,
+    local_info: PlyInfo,
+    support: LinearEdgeSupport,
+    spacing_metres: float,
+    target_spacing_metres: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Add a narrowly packed 3D bridge against the measured ScanID 9 edge.
+
+    The normal density plan works in XY cells and therefore cannot distinguish
+    two rock surfaces that occupy the same cell.  This pass operates on the
+    actual 3D boundary points and mesh samples.  It only adds samples within
+    the measured contact threshold, so it closes the seam without extending
+    or straightening the authored lobe profile.
+    """
+    boundary, _ = _patch04_contact_boundary_records(local, local_info, support)
+    if not len(boundary):
+        raise ValueError("Patch 04 contact bridge has no measured boundary points")
+    before = audit_patch04_contact_spacing(
+        selected,
+        selected_info,
+        local,
+        local_info,
+        support,
+        target_spacing_metres,
+    )
+
+    cx = np.asarray(candidates[candidate_info.fields["x"]], dtype=np.float64)
+    cy = np.asarray(candidates[candidate_info.fields["y"]], dtype=np.float64)
+    cz = np.asarray(candidates[candidate_info.fields["z"]], dtype=np.float64)
+    gx, gy, within = support.component.grid_coordinates(cx, cy)
+    contact_reach = max(
+        target_spacing_metres * PATCH_04_CONTACT_BRIDGE_REACH_FACTOR,
+        spacing_metres * PATCH_04_CONTACT_BRIDGE_MIN_REACH_FACTOR,
+    )
+    # The first exterior 5 mm planning cell can contain samples only a fraction
+    # of a millimetre from the true contour.  Keep two such cells, then make the
+    # final decision using exact 3D distance below.
+    grid_reach = max(
+        contact_reach + support.component.cell_metres,
+        2.0 * support.component.cell_metres,
+    )
+    bridge_cells = support.transition_mask
+    if support.contact_boundary_mask is not None:
+        bridge_cells = bridge_cells | (
+            support.contact_boundary_mask
+            & (
+                cv2.dilate(
+                    support.transition_mask.astype(np.uint8),
+                    np.ones((3, 3), dtype=np.uint8),
+                ) > 0
+            )
+        )
+    candidate_mask = np.zeros(len(candidates), dtype=bool)
+    within_indices = np.flatnonzero(within)
+    if len(within_indices):
+        candidate_mask[within_indices] = (
+            bridge_cells[gy[within_indices], gx[within_indices]]
+            & (support.edge_distance[gy[within_indices], gx[within_indices]] <= grid_reach)
+        )
+    candidate_indices = np.flatnonzero(candidate_mask)
+    raw_contact_candidates = int(len(candidate_indices))
+    if not len(candidate_indices):
+        raise ValueError("Patch 04 contact bridge has no mesh samples near the measured edge")
+
+    boundary_xyz = np.column_stack([
+        boundary[local_info.fields[channel]]
+        for channel in ("x", "y", "z")
+    ]).astype(np.float32, copy=False)
+    boundary_index = cv2.flann_Index(boundary_xyz, {"algorithm": 1, "trees": 8})
+    exact_keep = np.empty(len(candidate_indices), dtype=bool)
+    exact_distances = np.empty(len(candidate_indices), dtype=np.float32)
+    for begin in range(0, len(candidate_indices), 250_000):
+        end = min(begin + 250_000, len(candidate_indices))
+        subset = candidate_indices[begin:end]
+        query = np.column_stack((cx[subset], cy[subset], cz[subset])).astype(
+            np.float32,
+            copy=False,
+        )
+        _, squared = boundary_index.knnSearch(query, 1, params={"checks": 128})
+        exact_distances[begin:end] = np.sqrt(np.maximum(squared[:, 0], 0.0))
+        exact_keep[begin:end] = exact_distances[begin:end] <= contact_reach
+    del boundary_index, boundary_xyz
+    candidate_indices = candidate_indices[exact_keep]
+    exact_distances = exact_distances[exact_keep]
+    within_exact_reach = int(len(candidate_indices))
+    if not len(candidate_indices):
+        raise ValueError(
+            "Patch 04 mesh does not reach the measured ScanID 9 boundary within "
+            f"{contact_reach * 1000.0:.2f} mm"
+        )
+
+    source_clearance = spacing_metres * SOURCE_CLEARANCE_FACTOR
+    local_xyz = np.column_stack([
+        local[local_info.fields[channel]]
+        for channel in ("x", "y", "z")
+    ]).astype(np.float32, copy=False)
+    local_index = cv2.flann_Index(local_xyz, {"algorithm": 1, "trees": 8})
+    query = np.column_stack((
+        cx[candidate_indices],
+        cy[candidate_indices],
+        cz[candidate_indices],
+    )).astype(np.float32, copy=False)
+    _, squared = local_index.knnSearch(query, 1, params={"checks": 128})
+    del local_index, local_xyz
+    clear = squared[:, 0] >= source_clearance * source_clearance
+    source_clearance_rejected = int(np.count_nonzero(~clear))
+    candidate_indices = candidate_indices[clear]
+    exact_distances = exact_distances[clear]
+
+    packing_spacing = spacing_metres * RANDOM_PACKING_SPACING_FACTOR
+    if len(candidate_indices) and len(selected):
+        selected_xyz = np.column_stack([
+            selected[selected_info.fields[channel]]
+            for channel in ("x", "y", "z")
+        ]).astype(np.float32, copy=False)
+        selected_index = cv2.flann_Index(selected_xyz, {"algorithm": 1, "trees": 8})
+        query = np.column_stack((
+            cx[candidate_indices],
+            cy[candidate_indices],
+            cz[candidate_indices],
+        )).astype(np.float32, copy=False)
+        _, squared = selected_index.knnSearch(query, 1, params={"checks": 128})
+        del selected_index, selected_xyz
+        clear = squared[:, 0] >= packing_spacing * packing_spacing
+        selected_clearance_rejected = int(np.count_nonzero(~clear))
+        candidate_indices = candidate_indices[clear]
+        exact_distances = exact_distances[clear]
+    else:
+        selected_clearance_rejected = 0
+
+    if not len(candidate_indices):
+        return np.array(selected, copy=True), {
+            "raw_contact_candidates": raw_contact_candidates,
+            "within_exact_reach": within_exact_reach,
+            "source_clearance_rejected": source_clearance_rejected,
+            "selected_clearance_rejected": selected_clearance_rejected,
+            "added": 0,
+            "contact_reach_m": contact_reach,
+            "before": before,
+            "after": before,
+        }
+
+    voxels = _pack_voxels(
+        cx[candidate_indices],
+        cy[candidate_indices],
+        cz[candidate_indices],
+        packing_spacing,
+    )
+    priority = _splitmix64(
+        candidate_indices.astype(np.uint64) ^ np.uint64(0xA0761D6478BD642F)
+    )
+    # Prefer the closest candidate inside each voxel; hash breaks exact ties.
+    order = np.lexsort((priority, exact_distances, voxels))
+    _, first = np.unique(voxels[order], return_index=True)
+    candidate_indices = candidate_indices[order[first]]
+
+    priority = _splitmix64(
+        candidate_indices.astype(np.uint64) ^ np.uint64(0xE7037ED1A0B428DB)
+    )
+    order = np.argsort(priority, kind="stable")
+    bx = np.floor(cx[candidate_indices] / packing_spacing).astype(np.int64)
+    by = np.floor(cy[candidate_indices] / packing_spacing).astype(np.int64)
+    bz = np.floor(cz[candidate_indices] / packing_spacing).astype(np.int64)
+    accepted: list[int] = []
+    buckets: dict[tuple[int, int, int], list[int]] = {}
+    minimum_squared = packing_spacing * packing_spacing
+    poisson_rejected = 0
+    for position in order:
+        source_index = int(candidate_indices[position])
+        key = (int(bx[position]), int(by[position]), int(bz[position]))
+        separated = True
+        for oz in (-1, 0, 1):
+            if not separated:
+                break
+            for oy in (-1, 0, 1):
+                if not separated:
+                    break
+                for ox in (-1, 0, 1):
+                    for accepted_index in buckets.get(
+                        (key[0] + ox, key[1] + oy, key[2] + oz),
+                        (),
+                    ):
+                        delta_x = cx[source_index] - cx[accepted_index]
+                        delta_y = cy[source_index] - cy[accepted_index]
+                        delta_z = cz[source_index] - cz[accepted_index]
+                        if delta_x*delta_x + delta_y*delta_y + delta_z*delta_z < minimum_squared:
+                            separated = False
+                            break
+                    if not separated:
+                        break
+        if separated:
+            accepted.append(source_index)
+            buckets.setdefault(key, []).append(source_index)
+        else:
+            poisson_rejected += 1
+
+    bridge = np.array(candidates[np.asarray(accepted, dtype=np.int64)], copy=True)
+    combined = np.concatenate((selected, bridge)) if len(bridge) else np.array(selected, copy=True)
+    after = audit_patch04_contact_spacing(
+        combined,
+        selected_info,
+        local,
+        local_info,
+        support,
+        target_spacing_metres,
+    )
+    return combined, {
+        "raw_contact_candidates": raw_contact_candidates,
+        "within_exact_reach": within_exact_reach,
+        "source_clearance_rejected": source_clearance_rejected,
+        "selected_clearance_rejected": selected_clearance_rejected,
+        "poisson_rejected": poisson_rejected,
+        "added": int(len(bridge)),
+        "contact_reach_m": contact_reach,
+        "source_clearance_m": source_clearance,
+        "packing_spacing_m": packing_spacing,
+        "before": before,
+        "after": after,
+    }
+
+
 def plan_patch04_edge_additions(
     local: np.ndarray,
     info: PlyInfo,
@@ -1679,8 +2635,18 @@ def plan_patch04_edge_additions(
         component,
         support.source_scan_id,
     )
-    smoothed_total = cv2.GaussianBlur(total.astype(np.float32), (0, 0), 1.0)
+    reference_sigma = max(1.0, 0.020 / component.cell_metres)
+    smoothed_total = cv2.GaussianBlur(
+        total.astype(np.float32),
+        (0, 0),
+        reference_sigma,
+    )
     signed = support.signed_distance
+    edge_distance = (
+        support.edge_distance
+        if support.edge_profile == "sealed" and support.edge_distance is not None
+        else signed
+    )
     along = support.along_distance
     along_mask = (along >= support.along_min) & (along <= support.along_max)
     high_strip = (
@@ -1692,8 +2658,8 @@ def plan_patch04_edge_additions(
     )
     ambient_strip = (
         ~support.high_density_mask
-        & (signed >= support.blend_width_metres * 0.70)
-        & (signed <= support.blend_width_metres)
+        & (edge_distance >= support.blend_width_metres * 0.70)
+        & (edge_distance <= support.blend_width_metres)
         & along_mask
         & (total > 0)
     )
@@ -1702,28 +2668,55 @@ def plan_patch04_edge_additions(
     amplitude = max(0.0, high_level - ambient_level)
     if high_level <= 0.0 or ambient_level <= 0.0:
         raise ValueError("Patch 04 density reference strips are empty")
-    if amplitude < max(1.0, ambient_level * 0.02):
+    minimum_material_step = (
+        0.05
+        if component.cell_metres <= PATCH_04_CELL_METRES + 1.0e-9
+        else 1.0
+    )
+    if amplitude < max(minimum_material_step, ambient_level * 0.02):
         raise ValueError(
             f"Patch 04 has no material ScanID 9 density step ({high_level:.2f} vs {ambient_level:.2f})"
         )
     if support.fade_width_map is not None:
         fade_width = support.fade_width_map
-        fade_span = np.maximum(
-            fade_width - support.core_width_metres,
-            COMPONENT_CELL_METRES,
+        core_width = (
+            support.core_width_map
+            if support.core_width_map is not None
+            else np.full_like(fade_width, support.core_width_metres)
         )
-        fade_distance = np.maximum(signed - support.core_width_metres, 0.0)
+        fade_span = np.maximum(
+            fade_width - core_width,
+            component.cell_metres,
+        )
+        fade_distance = np.maximum(edge_distance - core_width, 0.0)
         u = np.clip(1.0 - fade_distance / fade_span, 0.0, 1.0)
-        active_transition = support.transition_mask & (signed <= fade_width)
-        density_target = "scan9-jagged-edge-ramp"
-        falloff_name = "cubic smoothstep over connected jagged reach"
+        active_transition = support.transition_mask & (edge_distance <= fade_width)
+        if support.edge_profile == "sealed":
+            density_target = "scan9-sealed-actual-edge-ramp"
+            falloff_name = "actual-edge full-density seam and reviewed lobes with cubic outer taper"
+        elif support.edge_profile == "lobed":
+            density_target = "scan9-lobed-plateau-ramp"
+            falloff_name = "full-density reviewed plateaus with cubic outer taper"
+        else:
+            density_target = "scan9-jagged-edge-ramp"
+            falloff_name = "cubic smoothstep over connected jagged reach"
     else:
         u = np.clip(1.0 - signed / support.blend_width_metres, 0.0, 1.0)
         active_transition = support.transition_mask
         density_target = "scan9-linear-edge-ramp"
         falloff_name = "cubic smoothstep"
     falloff = u * u * (3.0 - 2.0 * u)
-    additions = np.rint(amplitude * falloff).astype(np.int64)
+    if support.edge_profile in {"lobed", "sealed"}:
+        # Match the measured total density cell by cell.  Adding a fixed
+        # amplitude would overfill naturally dense blobs and recreate the
+        # patchiness this revision is intended to remove.
+        target_density = ambient_level + amplitude * falloff
+        measured_density = total if support.edge_profile == "sealed" else smoothed_total
+        additions = np.rint(np.maximum(target_density - measured_density, 0.0)).astype(np.int64)
+        quota_model = "cellwise-total-density-deficit"
+    else:
+        additions = np.rint(amplitude * falloff).astype(np.int64)
+        quota_model = "reference-step-amplitude"
     additions[~active_transition] = 0
     y, x = np.nonzero(additions > 0)
     keys = _pack_cells(x + component.origin_ix, y + component.origin_iy)
@@ -1732,7 +2725,7 @@ def plan_patch04_edge_additions(
         for key, count in zip(keys, additions[y, x], strict=True)
     }
     transition_values = total[active_transition]
-    near_edge = active_transition & (signed <= COMPONENT_CELL_METRES * 1.5)
+    near_edge = active_transition & (edge_distance <= component.cell_metres * 1.5)
     report = {
         "density_target": density_target,
         "source_scan_id": support.source_scan_id,
@@ -1749,7 +2742,10 @@ def plan_patch04_edge_additions(
         "near_edge_current_points_per_cell": float(np.mean(total[near_edge])) if np.any(near_edge) else 0.0,
         "near_edge_target_points_per_cell": high_level,
         "falloff": falloff_name,
+        "quota_model": quota_model,
         "existing_records_modified": 0,
+        "planning_cell_m": component.cell_metres,
+        "empty_transition_cell_count": int(np.count_nonzero(active_transition & (total == 0))),
     }
     if support.fade_width_map is not None:
         active_widths = support.fade_width_map[active_transition]
@@ -1769,6 +2765,19 @@ def plan_patch04_edge_additions(
             "fade_width_max_m": float(np.max(active_widths)),
             "surface_planarity_p50": float(np.percentile(active_planarity, 50)),
         })
+        if support.core_width_map is not None:
+            active_core = support.core_width_map[active_transition]
+            report.update({
+                "core_width_min_m": float(np.min(active_core)),
+                "core_width_p50_m": float(np.percentile(active_core, 50)),
+                "core_width_p95_m": float(np.percentile(active_core, 95)),
+                "core_width_max_m": float(np.max(active_core)),
+                "full_density_cell_count": int(np.count_nonzero(
+                    active_transition
+                    & (support.core_width_map >= component.cell_metres)
+                    & (edge_distance <= support.core_width_map)
+                )),
+            })
     return requested, report
 
 
@@ -1901,6 +2910,9 @@ def transfer_full_nearest_1mm(
     output_info: PlyInfo,
     source_1mm: np.ndarray,
     source_info: PlyInfo,
+    *,
+    transfer_limit_metres: float | None = None,
+    rgb_radius_metres: float = PATCH_04_RGB_RADIUS_METRES,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Copy scalar bundles from the nearest 1 mm point and blend measured RGB."""
     if cv2 is None:
@@ -1940,7 +2952,11 @@ def transfer_full_nearest_1mm(
     del index, source_xyz
     nearest = np.concatenate(nearest_parts)
     distances = np.concatenate(distance_parts)
-    transfer_limit = PATCH_04_GEOMETRY_MAX_DISTANCE_METRES * 1.5
+    transfer_limit = (
+        PATCH_04_GEOMETRY_MAX_DISTANCE_METRES * 1.5
+        if transfer_limit_metres is None
+        else transfer_limit_metres
+    )
     valid = np.isfinite(distances[:, 0]) & (distances[:, 0] <= transfer_limit)
     transferred = np.array(additions[valid], copy=True)
     nearest = nearest[valid]
@@ -1980,7 +2996,7 @@ def transfer_full_nearest_1mm(
         len(transferred), neighbours, 3
     )
     weights = 1.0 / np.square(distances + 0.0005)
-    weights[distances > PATCH_04_RGB_RADIUS_METRES] = 0.0
+    weights[distances > rgb_radius_metres] = 0.0
     empty_weights = np.sum(weights, axis=1) <= 0.0
     if np.any(empty_weights):
         weights[empty_weights, 0] = 1.0
@@ -2006,7 +3022,7 @@ def transfer_full_nearest_1mm(
         "copied_scalar_fields": copied_fields,
         "copied_scalar_field_count": len(copied_fields),
         "rgb_neighbours": neighbours,
-        "rgb_radius_m": PATCH_04_RGB_RADIUS_METRES,
+        "rgb_radius_m": rgb_radius_metres,
         "rgb_source": "inverse-distance Oklab blend of measured 1 mm neighbours",
         "mesh_to_blended_rgb_delta_e_median": float(
             np.median(np.linalg.norm(original_lab - blended_lab, axis=1))
@@ -2143,6 +3159,140 @@ def write_subset_ply(path: Path, info: PlyInfo, subset: np.ndarray) -> str:
     digest.update(header)
     digest.update(subset.tobytes(order="C"))
     return digest.hexdigest()
+
+
+MINIMAL_GEOMETRY_DTYPE = np.dtype([
+    ("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+    ("red", "u1"), ("green", "u1"), ("blue", "u1"),
+    ("nx", "<f4"), ("ny", "<f4"), ("nz", "<f4"),
+], align=False)
+
+
+def write_minimal_geometry_crop(
+    path: Path,
+    info: PlyInfo,
+    bounds_min: np.ndarray,
+    bounds_max: np.ndarray,
+    chunk_records: int,
+) -> dict[str, Any]:
+    source = records(info)
+    pieces: list[np.ndarray] = []
+    scan_counts: collections.Counter[int] = collections.Counter()
+    for start in range(0, info.vertex_count, chunk_records):
+        end = min(start + chunk_records, info.vertex_count)
+        chunk = source[start:end]
+        x = np.asarray(chunk[info.fields["x"]], dtype=np.float64)
+        y = np.asarray(chunk[info.fields["y"]], dtype=np.float64)
+        z = np.asarray(chunk[info.fields["z"]], dtype=np.float64)
+        selected = (
+            np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+            & (x >= bounds_min[0]) & (x <= bounds_max[0])
+            & (y >= bounds_min[1]) & (y <= bounds_max[1])
+            & (z >= bounds_min[2]) & (z <= bounds_max[2])
+        )
+        if np.any(selected):
+            output = np.empty(int(np.count_nonzero(selected)), dtype=MINIMAL_GEOMETRY_DTYPE)
+            for field in MINIMAL_GEOMETRY_DTYPE.names or ():
+                output[field] = chunk[info.fields[field]][selected]
+            pieces.append(output)
+            scan_ids, valid = _scan_ids(chunk[selected], info)
+            values, counts = np.unique(scan_ids[valid], return_counts=True)
+            scan_counts.update({
+                int(value): int(count)
+                for value, count in zip(values, counts, strict=True)
+            })
+        if start == 0 or end == info.vertex_count or end // chunk_records % 10 == 0:
+            print(
+                f"  {info.path.name} geometry crop: {100*end/info.vertex_count:5.1f}%",
+                flush=True,
+            )
+    del source
+    cropped = np.concatenate(pieces) if pieces else np.empty(0, dtype=MINIMAL_GEOMETRY_DTYPE)
+    if not len(cropped):
+        raise ValueError(f"Geometry crop is empty: {path}")
+    header = (
+        "ply\n"
+        "format binary_little_endian 1.0\n"
+        "comment Patch 06 measured geometry crop for CleanMesh\n"
+        f"element vertex {len(cropped)}\n"
+        "property float x\nproperty float y\nproperty float z\n"
+        "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+        "property float nx\nproperty float ny\nproperty float nz\n"
+        "end_header\n"
+    ).encode("ascii")
+    with path.open("wb") as stream:
+        stream.write(header)
+        stream.write(cropped.tobytes(order="C"))
+    return {
+        "path": str(path.resolve()),
+        "sha256": sha256_path(path),
+        "point_count": int(len(cropped)),
+        "scan_id_counts": dict(sorted(scan_counts.items())),
+        "bounds_min": bounds_min.tolist(),
+        "bounds_max": bounds_max.tolist(),
+    }
+
+
+def run_cleanmesh_patch_gapfill(
+    source_crop: Path,
+    output_dir: Path,
+    cleanmesh_binary: Path,
+    poisson_binary: Path,
+) -> tuple[Path, dict[str, Any]]:
+    stem = source_crop.stem
+    report_path = output_dir / f"{stem}-gapfill-report.json"
+    fill_path = output_dir / f"{stem}-gapfill.ply"
+    reused = report_path.is_file() and fill_path.is_file()
+    if output_dir.exists() and not reused:
+        raise ValueError(f"Incomplete CleanMesh output already exists: {output_dir}")
+    output_dir.mkdir(parents=True, exist_ok=reused)
+    work_dir = output_dir / ".work"
+    command = [
+        str(cleanmesh_binary),
+        "--input", str(source_crop),
+        "--output-dir", str(output_dir),
+        "--work-dir", str(work_dir),
+        "--poisson-exe", str(poisson_binary),
+        "--grid-cell", format(PATCH_06_CELL_METRES, ".12g"),
+        "--smooth-radius", "0.020",
+        "--close-radius", "0.015",
+        "--mask-dilation", "0.015",
+        "--support-padding", "0.200",
+        "--width", "0.001",
+        "--final-spacing", "0.001",
+        "--max-fill-points", "10000000",
+    ]
+    if reused:
+        print("Reusing the completed CleanMesh Patch 06 reconstruction", flush=True)
+    else:
+        print("Running CleanMesh reconstruction for the Patch 06 ScanID 1 hole", flush=True)
+        result = subprocess.run(command, check=False)
+        if result.returncode != 0 or not report_path.is_file() or not fill_path.is_file():
+            raise ValueError(
+                "CleanMesh Patch 06 reconstruction failed; retained diagnostics at "
+                f"{output_dir}"
+            )
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if report.get("success") is not True:
+        raise ValueError(f"CleanMesh Patch 06 report did not pass: {report_path}")
+    mask = report.get("mask", {})
+    centre = np.asarray(mask.get("center", []), dtype=np.float64)
+    radius = float(mask.get("circular_core_radius_m", 0.0))
+    mask_bounds_min = np.asarray(mask.get("bounds_min", []), dtype=np.float64)
+    mask_bounds_max = np.asarray(mask.get("bounds_max", []), dtype=np.float64)
+    extent = mask_bounds_max - mask_bounds_min if mask_bounds_min.shape == (2,) and mask_bounds_max.shape == (2,) else np.zeros(2)
+    if centre.shape != (2,) or np.linalg.norm(centre - PATCH_06_RIGHT_SEED_XY) > 0.20:
+        raise ValueError(
+            f"CleanMesh detected the wrong Patch 06 hole at {centre.tolist()}"
+        )
+    if not np.all((extent >= 0.60) & (extent <= 1.40)):
+        raise ValueError(f"CleanMesh Patch 06 hole extent is implausible: {extent.tolist()}")
+    if int(mask.get("cells", 0)) < 5_000:
+        raise ValueError("CleanMesh Patch 06 mask contains too few cells")
+    report["command"] = command
+    report["reused"] = reused
+    report["gapfill_sha256"] = sha256_path(fill_path)
+    return fill_path, report
 
 
 def build_density_candidate(
@@ -2325,7 +3475,15 @@ def _prefix_info_from_installed_edge(
     current_info: PlyInfo,
     installed_entry: dict[str, Any],
 ) -> PlyInfo:
-    base_count = int(installed_entry["source_vertex_count"])
+    # A first-generation edge run is source-prefix + additions.  A later run
+    # replaces that complete tail, so its own source count includes the tail
+    # it superseded.  In both cases candidate_base_vertex_count identifies the
+    # immutable pre-Patch04 prefix and lets another reviewed revision safely
+    # replace only the currently installed ScanID 13 tail.
+    base_count = int(installed_entry.get(
+        "candidate_base_vertex_count",
+        installed_entry["source_vertex_count"],
+    ))
     installed_count = int(installed_entry["candidate_vertex_count"])
     if current_info.vertex_count != installed_count:
         raise ValueError(
@@ -2334,7 +3492,10 @@ def _prefix_info_from_installed_edge(
         )
     if installed_count != base_count + int(installed_entry["addition_count"]):
         raise ValueError("Installed edge manifest is not a simple append-only candidate")
-    base_header = bytes.fromhex(installed_entry["source_header_hex"])
+    base_header = bytes.fromhex(installed_entry.get(
+        "base_prefix_header_hex",
+        installed_entry["source_header_hex"],
+    ))
     if len(base_header) != current_info.header_size:
         raise ValueError("Installed edge base/current PLY header sizes differ")
     property_names = tuple(installed_entry.get("property_names", ()))
@@ -2428,7 +3589,11 @@ def build_tail_replacement_candidate(
         raise ValueError(
             f"Canonical {spacing_mm} mm ROCK cloud is not the installed edge candidate"
         )
-    if base_sha != installed_entry["source_sha256"]:
+    expected_base_sha = installed_entry.get(
+        "base_prefix_sha256",
+        installed_entry["source_sha256"],
+    )
+    if base_sha != expected_base_sha:
         raise ValueError(
             f"Canonical {spacing_mm} mm base prefix no longer matches the pre-edge cloud"
         )
@@ -2527,20 +3692,88 @@ def generate_validation_project(
     project_path: Path,
     replacements: dict[str, str],
     output_path: Path,
+    *,
+    scene_role: str = "ROCK",
+    validation_camera_name: str = "Patch 04",
 ) -> None:
     document = json.loads(project_path.read_text(encoding="utf-8"))
     document = _replace_candidate_paths(document, replacements)
     document["selected_point_visual"] = "Projector-01"
+    document["point_cloud_preview_lod_mode"] = "full_resolution"
     document["live_visual_effects"] = False
+
+    scene_role = scene_role.upper()
+    selected_filename = f"Site3-{scene_role}-1mm.ply"
+    selected_1mm_path = replacements.get(selected_filename)
+    if selected_1mm_path is None:
+        raise ValueError(f"Validation data has no {selected_filename} replacement")
+    document["selected_layer_path"] = selected_1mm_path
+
+    camera_shots = document.get("camera_shots", [])
+    source_shot = next(
+        (
+            shot for shot in camera_shots
+            if isinstance(shot, dict) and shot.get("name") == validation_camera_name
+        ),
+        None,
+    )
+    target_shot = next(
+        (
+            shot for shot in camera_shots
+            if isinstance(shot, dict) and shot.get("name") == "Patch 04"
+        ),
+        None,
+    )
+    if validation_camera_name != "Patch 04" and (source_shot is None or target_shot is None):
+        raise ValueError(
+            f"Validation project cannot alias camera {validation_camera_name!r} onto Patch 04"
+        )
+    if source_shot is not None and target_shot is not None and source_shot is not target_shot:
+        target_shot["camera"] = json.loads(json.dumps(source_shot["camera"]))
+        target_shot["associated_layer_paths"] = list(
+            source_shot.get("associated_layer_paths", target_shot.get("associated_layer_paths", []))
+        )
+
+    for layer in document.get("layers", []):
+        if not isinstance(layer, dict):
+            continue
+        if layer.get("scene_group") == "Scene3" and layer.get("scene_role") in {"ROCK", "SAND", "VEG"}:
+            is_selected_1mm = (
+                layer.get("scene_role") == scene_role
+                and Path(str(layer.get("source_path", ""))).name == selected_filename
+            )
+            if layer.get("scene_role") == scene_role:
+                layer["selected_scene_variant_path"] = selected_1mm_path
+            layer["loaded"] = is_selected_1mm
+            layer["visible"] = is_selected_1mm
+        if str(layer.get("kind", "")).lower() in {"gaussian_splat", "gsplat"}:
+            layer["visible"] = False
+
+    projector_found = False
+    for visual in document.get("point_visuals", []):
+        if not isinstance(visual, dict) or visual.get("name") != "Projector-01":
+            continue
+        projector_found = True
+        point_style = visual.setdefault("point_style", {})
+        point_style["screen_sprite_size_mode"] = "world_millimeters"
+        point_style["shoreline_wave_enabled"] = False
+        point_size = point_style.setdefault("point_size", {})
+        point_size["active"] = True
+        point_size["mode"] = "constant"
+        constant_value = point_size.setdefault("constant_value", [0.0, 0.0, 0.0, 0.0])
+        if not isinstance(constant_value, list) or len(constant_value) < 4:
+            constant_value = [0.0, 0.0, 0.0, 0.0]
+            point_size["constant_value"] = constant_value
+        constant_value[0] = 2.0
+    if not projector_found:
+        raise ValueError("Validation project has no Projector-01 point visual")
+
     if isinstance(document.get("water_rain_settings"), dict):
         document["water_rain_settings"]["enabled"] = False
         document["water_rain_settings"]["rain_level"] = 0.0
     if isinstance(document.get("water_dynamic_mesh_flow_settings"), dict):
         document["water_dynamic_mesh_flow_settings"]["enabled"] = False
     document["water_shoreline_instances"] = []
-    for layer in document.get("layers", []):
-        if isinstance(layer, dict) and str(layer.get("kind", "")).lower() in {"gaussian_splat", "gsplat"}:
-            layer["visible"] = False
     output_path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
 
 
@@ -2940,10 +4173,6 @@ def command_build_edge_augmentation(args: argparse.Namespace) -> int:
                 "Installed Patch 04 edge run is missing ROCK spacings: "
                 + ", ".join(str(value) for value in missing)
             )
-        if any(entry.get("tail_replacement") for entry in superseded_entries.values()):
-            raise ValueError(
-                "Replacing an already replaced edge tail requires first installing or restoring its parent"
-            )
     spacings = tuple(sorted(set(int(value) for value in args.spacings)))
     run_dir.mkdir(parents=True)
     (run_dir / DISCOVERY_IGNORE_MARKER).write_text(
@@ -3000,17 +4229,24 @@ def command_build_edge_augmentation(args: argparse.Namespace) -> int:
         [bootstrap],
         args.chunk_records,
     )[0]
-    support_width = (
-        args.jagged_max_width
-        if args.edge_profile == "jagged"
-        else args.blend_width
-    )
+    support_width = {
+        "linear": args.blend_width,
+        "jagged": args.jagged_max_width,
+        "lobed": args.lobed_max_width,
+        "sealed": args.lobed_max_width,
+    }[args.edge_profile]
     support = build_patch04_edge_support(
         local_1mm,
         canonical_1mm_info,
         mesh_bounds_min,
         mesh_bounds_max,
         support_width,
+        cell_metres=(
+            PATCH_04_CELL_METRES
+            if args.edge_profile == "sealed"
+            else COMPONENT_CELL_METRES
+        ),
+        include_empty_cells=args.edge_profile == "sealed",
     )
     edge_profile_report: dict[str, Any] = {
         "profile": "linear",
@@ -3027,6 +4263,31 @@ def command_build_edge_augmentation(args: argparse.Namespace) -> int:
             core_width_metres=args.jagged_core_width,
             noise_seed=args.noise_seed,
         )
+    elif args.edge_profile == "lobed":
+        edge_profile_report = configure_patch04_lobed_fade(
+            support,
+            local_1mm,
+            canonical_1mm_info,
+            maximum_width_metres=args.lobed_max_width,
+            noise_seed=args.lobed_noise_seed,
+        )
+    elif args.edge_profile == "sealed":
+        edge_profile_report = configure_patch04_sealed_fade(
+            support,
+            local_1mm,
+            canonical_1mm_info,
+            maximum_width_metres=args.lobed_max_width,
+            noise_seed=args.lobed_noise_seed,
+        )
+    contact_spacing_1mm = 0.0
+    contact_spacing_report: dict[str, Any] | None = None
+    if args.edge_profile == "sealed":
+        contact_spacing_1mm, contact_spacing_report = estimate_patch04_contact_spacing(
+            local_1mm,
+            canonical_1mm_info,
+            support,
+        )
+        edge_profile_report["measured_contact_spacing"] = contact_spacing_report
     print(
         "Patch 04 edge fit: "
         f"origin={support.edge_origin_xy.tolist()}, "
@@ -3041,8 +4302,17 @@ def command_build_edge_augmentation(args: argparse.Namespace) -> int:
         mesh_info,
         local_1mm,
         canonical_1mm_info,
+        maximum_tangent_distance_metres=(
+            PATCH_04_SEALED_TANGENT_LIMIT_METRES
+            if args.edge_profile == "sealed"
+            else None
+        ),
     )
-    cell_keys, cell_z_min, cell_z_max = _surface_cell_ranges(supported_mesh, mesh_info)
+    cell_keys, cell_z_min, cell_z_max = _surface_cell_ranges(
+        supported_mesh,
+        mesh_info,
+        support.component.cell_metres,
+    )
     support.component.dense_records = supported_mesh
     support.component.cell_keys = cell_keys
     support.component.cell_z_min = cell_z_min
@@ -3051,7 +4321,7 @@ def command_build_edge_augmentation(args: argparse.Namespace) -> int:
     manifest: dict[str, Any] = {
         "schema": 1,
         "kind": (
-            "replace-scan9-jagged-edge-augmentation"
+            f"replace-scan9-{args.edge_profile}-edge-augmentation"
             if superseded_manifest is not None
             else f"append-only-scan9-{args.edge_profile}-edge-augmentation"
         ),
@@ -3128,13 +4398,54 @@ def command_build_edge_augmentation(args: argparse.Namespace) -> int:
             requested,
             spacing_mm / 1000.0,
         )
+        contact_bridge_report = None
+        if args.edge_profile == "sealed":
+            density_quota_count = int(density_report["planned_additions"])
+            density_selected_count = int(selection_report["selected"])
+            selected_mesh, contact_bridge_report = seal_patch04_contact(
+                selected_mesh,
+                mesh_info,
+                supported_mesh,
+                mesh_info,
+                local,
+                info,
+                support,
+                spacing_mm / 1000.0,
+                contact_spacing_1mm * spacing_mm,
+            )
+            bridge_count = int(contact_bridge_report["added"])
+            density_report["density_quota_additions"] = density_quota_count
+            density_report["contact_bridge_additions"] = bridge_count
+            density_report["planned_additions"] = density_quota_count + bridge_count
+            selection_report["density_selected"] = density_selected_count
+            selection_report["contact_bridge"] = contact_bridge_report
+            selection_report["requested"] = int(selection_report["requested"]) + bridge_count
+            selection_report["selected"] = int(len(selected_mesh))
+            selection_report["shortfall"] = (
+                int(selection_report["requested"]) - int(selection_report["selected"])
+            )
         converted = _copy_dense_to_output_schema(selected_mesh, mesh_info, info)
         converted, transfer_report = transfer_full_nearest_1mm(
             converted,
             info,
             local_1mm,
             canonical_1mm_info,
+            transfer_limit_metres=(
+                PATCH_04_SEALED_TRANSFER_LIMIT_METRES
+                if args.edge_profile == "sealed"
+                else None
+            ),
         )
+        contact_audit = None
+        if args.edge_profile == "sealed":
+            contact_audit = audit_patch04_contact_spacing(
+                converted,
+                info,
+                local,
+                info,
+                support,
+                contact_spacing_1mm * spacing_mm,
+            )
         component_report = {
             "camera": "Patch 04",
             "component": 4,
@@ -3143,6 +4454,8 @@ def command_build_edge_augmentation(args: argparse.Namespace) -> int:
             "density": density_report,
             "selection": selection_report,
             "scalar_transfer": transfer_report,
+            "contact_audit": contact_audit,
+            "contact_bridge": contact_bridge_report,
             "accepted_additions": int(len(converted)),
             "existing_records_modified": 0,
         }
@@ -3176,6 +4489,14 @@ def command_build_edge_augmentation(args: argparse.Namespace) -> int:
             f"selected {selection_report['selected']:,}, accepted {len(converted):,}",
             flush=True,
         )
+        if contact_audit is not None:
+            print(
+                "    Contact cells: "
+                f"p50={contact_audit['contact_distance_p50_m'] * 1000.0:.2f} mm, "
+                f"p95={contact_audit['contact_distance_p95_m'] * 1000.0:.2f} mm, "
+                f"within={contact_audit['contact_fraction'] * 100.0:.1f}%",
+                flush=True,
+            )
         if spacing_mm != 1:
             del local
 
@@ -3186,19 +4507,335 @@ def command_build_edge_augmentation(args: argparse.Namespace) -> int:
         validation_data_root,
     )
     validation_project = run_dir / "ExhibitionFinal_patch-validation_project.json"
-    generate_validation_project(project_path, validation_replacements, validation_project)
+    generate_validation_project(
+        project_path,
+        validation_replacements,
+        validation_project,
+        scene_role="ROCK",
+        validation_camera_name=(
+            "Patch 04_new" if args.edge_profile == "sealed" else "Patch 04"
+        ),
+    )
     manifest["validation_project"] = str(validation_project.resolve())
     manifest["validation_data_root"] = str(validation_data_root.resolve())
     manifest["status"] = "built"
     manifest["elapsed_seconds"] = time.monotonic() - started
-    manifest["sampling_revision"] = (
-        "patch04-scan9-connected-jagged-density-taper-v2"
-        if args.edge_profile == "jagged"
-        else "patch04-scan9-linear-density-taper-v1"
-    )
+    manifest["sampling_revision"] = {
+        "linear": "patch04-scan9-linear-density-taper-v1",
+        "jagged": "patch04-scan9-connected-jagged-density-taper-v2",
+        "lobed": "patch04-scan9-reviewed-lobed-density-plateaus-v3",
+        "sealed": "patch04-scan9-measured-contact-seam-seal-v5",
+    }[args.edge_profile]
     _write_json(run_dir / "density-report.json", density_reports)
     _write_json(_manifest_path(run_dir), manifest)
     print(f"Built staged Patch 04 candidates in {run_dir}", flush=True)
+    return 0
+
+
+def command_build_patch06(args: argparse.Namespace) -> int:
+    """Build two append-only SAND scanner-footprint fills for Patch 06."""
+    if cv2 is None:
+        raise RuntimeError("OpenCV (cv2) is required for Patch 06 augmentation")
+    repo_root = args.repo_root.resolve()
+    run_dir = args.run_dir.resolve()
+    base_run_dir = args.base_run_dir.resolve()
+    dense_path = args.cleanmesh_patch.resolve()
+    report_path = args.cleanmesh_report.resolve()
+    project_path = args.project.resolve()
+    cleanmesh_binary = args.cleanmesh_binary.resolve()
+    poisson_binary = args.poisson_binary.resolve()
+    for executable in (cleanmesh_binary, poisson_binary):
+        if not executable.is_file() or not os.access(executable, os.X_OK):
+            raise ValueError(f"Required CleanMesh executable is unavailable: {executable}")
+    if run_dir.exists():
+        if not args.resume or not (run_dir / DISCOVERY_IGNORE_MARKER).is_file():
+            raise ValueError(f"Run directory already exists: {run_dir}")
+    base_manifest = _load_manifest(base_run_dir)
+    if not base_manifest.get("installed"):
+        raise ValueError("Patch 06 augmentation requires the installed SAND base run")
+    base_entries = {
+        int(entry["spacing_mm"]): entry
+        for entry in base_manifest.get("densities", [])
+        if entry.get("role", "SAND") == "SAND"
+    }
+    if set(base_entries) != set(SPACINGS_MM):
+        raise ValueError("Installed SAND base run does not contain complete 1/2/3/5 mm entries")
+
+    if not run_dir.exists():
+        run_dir.mkdir(parents=True)
+        (run_dir / DISCOVERY_IGNORE_MARKER).write_text(
+            "Patch 06 scanner-hole staging; discover validation-data explicitly.\n",
+            encoding="utf-8",
+        )
+    started = time.monotonic()
+    source_paths = [
+        repo_root / "Data" / "Scene3" / f"Site3-SAND-{spacing}mm.ply"
+        for spacing in SPACINGS_MM
+    ]
+    current_infos = [read_ply_info(path) for path in source_paths]
+    cleanmesh_info = read_ply_info(dense_path)
+    _validate_schema(current_infos, cleanmesh_info)
+
+    print("Extracting the existing colour-matched Patch 06 component", flush=True)
+    left_definition = _load_selected_component_definition(
+        report_path,
+        PATCH_06_LEFT_COMPONENT_ZERO_INDEX,
+        "Patch 06 / colour-matched hole",
+        PATCH_06_LEFT_HOST_SCAN_ID,
+    )
+    left_support = build_component_supports(
+        cleanmesh_info,
+        report_path,
+        args.chunk_records,
+        definitions=[left_definition],
+        cell_metres=PATCH_06_CELL_METRES,
+    )[0]
+
+    crop_bounds_min = np.array([
+        PATCH_06_RIGHT_CROP_CENTER_XY[0] - PATCH_06_RIGHT_CROP_HALF_METRES,
+        PATCH_06_RIGHT_CROP_CENTER_XY[1] - PATCH_06_RIGHT_CROP_HALF_METRES,
+        0.80,
+    ])
+    crop_bounds_max = np.array([
+        PATCH_06_RIGHT_CROP_CENTER_XY[0] + PATCH_06_RIGHT_CROP_HALF_METRES,
+        PATCH_06_RIGHT_CROP_CENTER_XY[1] + PATCH_06_RIGHT_CROP_HALF_METRES,
+        1.80,
+    ])
+    source_crop = run_dir / "patch06-scan1-source.ply"
+    crop_report = write_minimal_geometry_crop(
+        source_crop,
+        current_infos[0],
+        crop_bounds_min,
+        crop_bounds_max,
+        args.chunk_records,
+    )
+    generated_dir = run_dir / "cleanmesh-scan1"
+    generated_path, generated_report = run_cleanmesh_patch_gapfill(
+        source_crop,
+        generated_dir,
+        cleanmesh_binary,
+        poisson_binary,
+    )
+    generated_info = read_ply_info(
+        generated_path,
+        required_fields=("x", "y", "z", "red", "green", "blue", "nx", "ny", "nz"),
+    )
+    generated_records = np.array(records(generated_info), copy=True)
+    right_support = component_support_from_dense_records(
+        generated_records,
+        generated_info,
+        camera_name="Patch 06 / reconstructed ScanID 1 hole",
+        cleanmesh_index=6,
+        host_scan_id=PATCH_06_RIGHT_SOURCE_SCAN_ID,
+        cell_metres=PATCH_06_CELL_METRES,
+    )
+    supports = [left_support, right_support]
+
+    print("Collecting exact 1 mm SAND references for both Patch 06 holes", flush=True)
+    local_1mm = collect_local_records(
+        current_infos[0],
+        supports,
+        args.chunk_records,
+    )
+    dense_infos = [cleanmesh_info, generated_info]
+    geometry_reports: list[dict[str, Any]] = []
+    for component_index, (support, dense_info, local) in enumerate(
+        zip(supports, dense_infos, local_1mm, strict=True)
+    ):
+        filtered, geometry_report = filter_patch04_mesh_geometry(
+            support.dense_records,
+            dense_info,
+            local,
+            current_infos[0],
+            maximum_tangent_distance_metres=(
+                0.010 if component_index == 1 else None
+            ),
+        )
+        minimum_acceptance = 0.35 if component_index == 1 else 0.50
+        if geometry_report["acceptance_fraction"] < minimum_acceptance:
+            raise ValueError(
+                f"{support.camera_name} geometry agreement is too low "
+                f"({geometry_report['acceptance_fraction']:.1%}); refusing to stage it"
+            )
+        support.dense_records = filtered
+        support.cell_keys, support.cell_z_min, support.cell_z_max = _surface_cell_ranges(
+            filtered,
+            dense_info,
+            support.cell_metres,
+        )
+        geometry_reports.append(geometry_report)
+
+    manifest: dict[str, Any] = {
+        "schema": 1,
+        "kind": "append-only-patch06-scanner-hole-augmentation",
+        "status": "building",
+        "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "repo_root": str(repo_root),
+        "run_dir": str(run_dir),
+        "base_run_dir": str(base_run_dir),
+        "cleanmesh_patch": str(dense_path),
+        "cleanmesh_patch_sha256": sha256_path(dense_path),
+        "cleanmesh_report": str(report_path),
+        "project": str(project_path),
+        "generated_geometry": {
+            "source_crop": crop_report,
+            "cleanmesh_report": generated_report,
+            "gapfill": str(generated_path.resolve()),
+        },
+        "scan_id_contract": {
+            "preserved_existing_ids": list(range(0, 14)),
+            "source_ids_referenced": [7, PATCH_06_RIGHT_SOURCE_SCAN_ID],
+            "replacement_id": REPLACEMENT_SCAN_ID,
+            "addition_id": ADDITION_SCAN_ID,
+            "existing_records_modified": 0,
+        },
+        "components": [
+            {
+                "camera": support.camera_name,
+                "role": "SAND",
+                "cleanmesh_component": support.cleanmesh_index,
+                "host_scan_id": support.host_scan_id,
+                "bounds_min": support.bounds_min.tolist(),
+                "bounds_max": support.bounds_max.tolist(),
+                "dense_point_count": int(len(support.dense_records)),
+                "support_cell_count": int(len(support.cell_keys)),
+                "geometry_filter": geometry_report,
+            }
+            for support, geometry_report in zip(supports, geometry_reports, strict=True)
+        ],
+        "models": [],
+        "requested_spacings_mm": list(SPACINGS_MM),
+        "densities": [],
+        "verified": False,
+        "installed": False,
+    }
+    _write_json(_manifest_path(run_dir), manifest)
+
+    density_reports: dict[str, Any] = {}
+    for info, spacing_mm in zip(current_infos, SPACINGS_MM, strict=True):
+        print(f"Preparing SAND {spacing_mm} mm Patch 06 augmentation", flush=True)
+        local = (
+            local_1mm
+            if spacing_mm == 1
+            else collect_local_records(info, supports, args.chunk_records)
+        )
+        additions_by_component: list[np.ndarray] = []
+        component_reports: list[dict[str, Any]] = []
+        for component_index, (support, dense_info, nearby, exact_1mm) in enumerate(
+            zip(supports, dense_infos, local, local_1mm, strict=True)
+        ):
+            requested, density_report = plan_density_additions(
+                nearby,
+                info,
+                support,
+                match_total_density=True,
+                fill_fraction=1.0,
+            )
+            selected, selection_report = select_dense_additions(
+                support.dense_records,
+                dense_info,
+                nearby,
+                info,
+                support,
+                requested,
+                spacing_mm / 1000.0,
+            )
+            converted = _copy_dense_to_output_schema(selected, dense_info, info)
+            converted, transfer_report = transfer_full_nearest_1mm(
+                converted,
+                info,
+                exact_1mm,
+                current_infos[0],
+                transfer_limit_metres=(
+                    PATCH_06_GENERATED_TRANSFER_LIMIT_METRES
+                    if component_index == 1
+                    else None
+                ),
+            )
+            additions_by_component.append(converted)
+            component_report = {
+                "camera": support.camera_name,
+                "component": support.cleanmesh_index,
+                "role": "SAND",
+                "host_scan_id": support.host_scan_id,
+                "density": density_report,
+                "selection": selection_report,
+                "scalar_transfer": transfer_report,
+                "accepted_additions": int(len(converted)),
+                "existing_records_modified": 0,
+            }
+            component_reports.append(component_report)
+            print(
+                f"    {support.camera_name}: planned {density_report['planned_additions']:,}, "
+                f"selected {selection_report['selected']:,}, accepted {len(converted):,}",
+                flush=True,
+            )
+        additions = (
+            np.concatenate(additions_by_component)
+            if additions_by_component
+            else np.empty(0, dtype=info.dtype)
+        )
+        entry = build_append_only_density_candidate(
+            spacing_mm,
+            info,
+            additions,
+            run_dir / f"SAND-{spacing_mm}mm",
+            args.chunk_records,
+            role="SAND",
+        )
+        expected_hash = base_entries[spacing_mm].get("candidate_sha256")
+        if expected_hash and entry["source_sha256"] != expected_hash:
+            raise ValueError(
+                f"Canonical SAND {spacing_mm} mm cloud is not the installed base-run candidate"
+            )
+        entry["component_reports"] = component_reports
+        manifest["densities"].append(entry)
+        density_reports[f"SAND-{spacing_mm}mm"] = component_reports
+        _write_json(_manifest_path(run_dir), manifest)
+        if spacing_mm != 1:
+            del local
+
+    validation_data_root = run_dir / "validation-data"
+    validation_replacements = build_validation_data_root(
+        repo_root,
+        manifest["densities"],
+        validation_data_root,
+    )
+    validation_project = run_dir / "ExhibitionFinal_patch06-validation_project.json"
+    generate_validation_project(
+        project_path,
+        validation_replacements,
+        validation_project,
+        scene_role="SAND",
+        validation_camera_name="Patch 06",
+    )
+    manifest["validation_project"] = str(validation_project.resolve())
+    manifest["validation_data_root"] = str(validation_data_root.resolve())
+    manifest["status"] = "built"
+    manifest["elapsed_seconds"] = time.monotonic() - started
+    manifest["sampling_revision"] = "patch06-two-hole-measured-cleanmesh-density-v1"
+    _write_json(run_dir / "density-report.json", density_reports)
+    _write_json(_manifest_path(run_dir), manifest)
+
+    # The exact additions, source hashes, CleanMesh gapfill, and report are
+    # sufficient for review and rollback.  Remove large one-off QA duplicates
+    # and the raw crop immediately so staging cannot consume the remaining disk.
+    removed_intermediates: list[str] = []
+    for name in (
+        f"{source_crop.stem}-qa-before-1mm.ply",
+        f"{source_crop.stem}-qa-after-1mm.ply",
+        f"{source_crop.stem}-gapfill-survivors-1mm.ply",
+    ):
+        path = generated_dir / name
+        if path.is_file():
+            path.unlink()
+            removed_intermediates.append(str(path))
+    if source_crop.is_file():
+        source_crop.unlink()
+        removed_intermediates.append(str(source_crop))
+    manifest["staging_cleanup"] = {"removed_paths": removed_intermediates}
+    _write_json(_manifest_path(run_dir), manifest)
+    print(f"Built staged Patch 06 candidates in {run_dir}", flush=True)
     return 0
 
 
@@ -3621,6 +5258,8 @@ def verify_component_additions(component: dict[str, Any]) -> tuple[dict[str, Any
     if density.get("density_target") in {
         "scan9-linear-edge-ramp",
         "scan9-jagged-edge-ramp",
+        "scan9-lobed-plateau-ramp",
+        "scan9-sealed-actual-edge-ramp",
     }:
         result.update({
             "density_target": density["density_target"],
@@ -3654,6 +5293,68 @@ def verify_component_additions(component: dict[str, Any]) -> tuple[dict[str, Any
                 "fade_width_max_m": maximum,
                 "noise_seed": int(density.get("noise_seed", 0)),
             })
+        if density["density_target"] in {
+            "scan9-lobed-plateau-ramp",
+            "scan9-sealed-actual-edge-ramp",
+        }:
+            core_maximum = float(density.get("core_width_max_m", 0.0))
+            fade_maximum = float(density.get("fade_width_max_m", 0.0))
+            full_density_cells = int(density.get("full_density_cell_count", 0))
+            if core_maximum < 0.18:
+                failures.append(f"{camera}: reviewed lobe has no broad high-density plateau")
+            if fade_maximum < core_maximum + 0.15:
+                failures.append(f"{camera}: reviewed lobe outer fade is too abrupt")
+            if full_density_cells < 20:
+                failures.append(f"{camera}: reviewed lobe contains too few full-density cells")
+            if density.get("quota_model") != "cellwise-total-density-deficit":
+                failures.append(f"{camera}: reviewed lobe does not match density cell by cell")
+            if int(density.get("noise_seed", 0)) == 0:
+                failures.append(f"{camera}: reviewed lobe has no deterministic taper seed")
+            result.update({
+                "core_width_max_m": core_maximum,
+                "fade_width_max_m": fade_maximum,
+                "full_density_cell_count": full_density_cells,
+                "quota_model": density.get("quota_model", ""),
+                "noise_seed": int(density.get("noise_seed", 0)),
+            })
+            if density["density_target"] == "scan9-sealed-actual-edge-ramp":
+                planning_cell = float(density.get("planning_cell_m", 0.0))
+                empty_cells = int(density.get("empty_transition_cell_count", 0))
+                contact = component.get("contact_audit")
+                if planning_cell > PATCH_04_CELL_METRES + 1.0e-9:
+                    failures.append(f"{camera}: sealed edge is not planned on the 5 mm grid")
+                if empty_cells <= 0:
+                    failures.append(f"{camera}: sealed edge did not include any empty seam cells")
+                if not isinstance(contact, dict):
+                    failures.append(f"{camera}: sealed edge has no measured 3D contact audit")
+                else:
+                    contact_p95 = float(contact.get("contact_distance_p95_m", math.inf))
+                    contact_limit = float(contact.get("accepted_contact_threshold_m", 0.0))
+                    contact_fraction = float(contact.get("contact_fraction", 0.0))
+                    if contact_p95 > contact_limit:
+                        failures.append(
+                            f"{camera}: 3D seam p95 {contact_p95 * 1000.0:.2f} mm "
+                            f"exceeds {contact_limit * 1000.0:.2f} mm"
+                        )
+                    if contact_fraction < 0.95:
+                        failures.append(
+                            f"{camera}: only {contact_fraction * 100.0:.1f}% of measured "
+                            "boundary cells meet the contact-spacing limit"
+                        )
+                result.update({
+                    "planning_cell_m": planning_cell,
+                    "empty_transition_cell_count": empty_cells,
+                    "contact_distance_p95_m": (
+                        float(contact.get("contact_distance_p95_m", math.inf))
+                        if isinstance(contact, dict)
+                        else None
+                    ),
+                    "contact_fraction": (
+                        float(contact.get("contact_fraction", 0.0))
+                        if isinstance(contact, dict)
+                        else 0.0
+                    ),
+                })
         if int(transfer.get("copied_scalar_field_count", 0)) <= 0:
             failures.append(f"{camera}: no scalar fields were transferred from the 1 mm cloud")
         if "Oklab" not in str(transfer.get("rgb_source", "")):
@@ -3791,10 +5492,53 @@ def _run_patch_smoke(
     return report_path
 
 
+def _finalize_prepared_install(
+    run_dir: Path,
+    manifest: dict[str, Any],
+    journal: dict[str, Any],
+    candidate_smoke_report: Path,
+    post_install_smoke_report: Path,
+) -> None:
+    entries = manifest["densities"]
+    states = journal.get("files", [])
+    if len(states) != len(entries):
+        raise ValueError("Prepared install journal does not cover every density")
+    _read_smoke_report(candidate_smoke_report)
+    _read_smoke_report(post_install_smoke_report)
+    for entry, state in zip(entries, states, strict=True):
+        canonical = Path(state["canonical"])
+        temporary = Path(state["temporary_original"])
+        if canonical != Path(entry["source_path"]):
+            raise ValueError("Prepared install journal canonical path changed")
+        if sha256_path(canonical) != entry["candidate_sha256"]:
+            raise ValueError(f"Installed candidate hash changed before finalization: {canonical}")
+        if not temporary.is_file() or sha256_path(temporary) != entry["source_sha256"]:
+            raise ValueError(f"Temporary rollback source changed before finalization: {temporary}")
+    for state in states:
+        Path(state["temporary_original"]).unlink()
+    journal["state"] = "complete"
+    journal["completed_utc"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    _write_json(run_dir / "install-journal.json", journal)
+    manifest["installed"] = True
+    manifest["status"] = "installed"
+    manifest["candidate_smoke_report"] = str(candidate_smoke_report.resolve())
+    manifest["post_install_smoke_report"] = str(post_install_smoke_report.resolve())
+    manifest["installed_utc"] = journal["completed_utc"]
+    _write_json(_manifest_path(run_dir), manifest)
+
+
 def command_install(args: argparse.Namespace) -> int:
     run_dir = args.run_dir.resolve()
     manifest = _load_manifest(run_dir)
     _recover_interrupted_install(run_dir, manifest)
+    journal_path = run_dir / "install-journal.json"
+    if journal_path.is_file():
+        existing_journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        if existing_journal.get("state") == "awaiting-external-smoke":
+            raise ValueError(
+                "This install is awaiting an external smoke; finalize-install or "
+                "rollback-install before starting another transaction"
+            )
     if not manifest.get("verified"):
         raise ValueError("The run has not passed verify")
     if manifest.get("installed"):
@@ -3821,7 +5565,6 @@ def command_install(args: argparse.Namespace) -> int:
         if sha256_path(candidate) != entry["candidate_sha256"]:
             raise ValueError(f"Candidate changed since verify: {candidate}")
     run_id = run_dir.name
-    journal_path = run_dir / "install-journal.json"
     journal: dict[str, Any] = {
         "state": "swapping",
         "started_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -3844,6 +5587,20 @@ def command_install(args: argparse.Namespace) -> int:
             journal["files"].append(state)
             _write_json(journal_path, journal)
             os.replace(candidate, canonical)
+        if args.defer_post_install_smoke:
+            journal["state"] = "awaiting-external-smoke"
+            journal["candidate_smoke_report"] = str(candidate_smoke_report.resolve())
+            journal["expected_post_install_smoke_report"] = str(
+                (run_dir / "post-install-render" / "scene3-patch-boundaries.json").resolve()
+            )
+            _write_json(journal_path, journal)
+            print(
+                "Prepared all four canonical patch clouds; run the GUI smoke as a "
+                "top-level process, then finalize-install with its report. Full "
+                "temporary sources remain available for immediate rollback.",
+                flush=True,
+            )
+            return 0
         journal["state"] = "post-install-smoke"
         _write_json(journal_path, journal)
         post_report = _run_patch_smoke(
@@ -3852,18 +5609,13 @@ def command_install(args: argparse.Namespace) -> int:
             Path(manifest["project"]),
             run_dir / "post-install-render",
         )
-        for state in journal["files"]:
-            temporary = Path(state["temporary_original"])
-            temporary.unlink()
-        journal["state"] = "complete"
-        journal["completed_utc"] = dt.datetime.now(dt.timezone.utc).isoformat()
-        _write_json(journal_path, journal)
-        manifest["installed"] = True
-        manifest["status"] = "installed"
-        manifest["candidate_smoke_report"] = str(candidate_smoke_report)
-        manifest["post_install_smoke_report"] = str(post_report)
-        manifest["installed_utc"] = journal["completed_utc"]
-        _write_json(_manifest_path(run_dir), manifest)
+        _finalize_prepared_install(
+            run_dir,
+            manifest,
+            journal,
+            candidate_smoke_report,
+            post_report,
+        )
     except Exception:
         journal["state"] = "smoke-failed"
         _rollback_install(manifest["densities"], journal)
@@ -3874,6 +5626,56 @@ def command_install(args: argparse.Namespace) -> int:
         f"Installed all four canonical patch clouds ({installed_names}); "
         "compact rollback artifacts remain in the run directory."
     )
+    return 0
+
+
+def command_finalize_install(args: argparse.Namespace) -> int:
+    run_dir = args.run_dir.resolve()
+    manifest = _load_manifest(run_dir)
+    if manifest.get("installed"):
+        raise ValueError("This run is already installed")
+    journal_path = run_dir / "install-journal.json"
+    if not journal_path.is_file():
+        raise ValueError("Prepared install journal is missing")
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    if journal.get("state") != "awaiting-external-smoke":
+        raise ValueError("Install journal is not awaiting an external smoke")
+    if _application_running():
+        raise ValueError("Invisible Places is still running; wait for the smoke process to exit")
+    candidate_report = Path(journal["candidate_smoke_report"])
+    post_report = args.post_install_smoke_report.resolve()
+    _finalize_prepared_install(
+        run_dir,
+        manifest,
+        journal,
+        candidate_report,
+        post_report,
+    )
+    installed_names = ", ".join(
+        Path(entry["source_path"]).name for entry in manifest["densities"]
+    )
+    print(
+        f"Finalized all four canonical patch clouds ({installed_names}); "
+        "compact rollback artifacts remain in the run directory.",
+        flush=True,
+    )
+    return 0
+
+
+def command_rollback_install(args: argparse.Namespace) -> int:
+    run_dir = args.run_dir.resolve()
+    manifest = _load_manifest(run_dir)
+    if manifest.get("installed"):
+        raise ValueError("Installed runs must use restore, not rollback-install")
+    journal_path = run_dir / "install-journal.json"
+    if not journal_path.is_file():
+        raise ValueError("Prepared install journal is missing")
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    if journal.get("state") != "awaiting-external-smoke":
+        raise ValueError("Install journal is not awaiting an external smoke")
+    _rollback_install(manifest["densities"], journal)
+    _write_json(journal_path, journal)
+    print("Rolled back the prepared install to every original canonical cloud.", flush=True)
     return 0
 
 
@@ -4247,9 +6049,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     edge_augmentation.add_argument(
         "--edge-profile",
-        choices=("linear", "jagged"),
-        default="jagged",
-        help="Use a constant reach or connected, surface-aware jagged fade",
+        choices=("linear", "jagged", "lobed", "sealed"),
+        default="sealed",
+        help=(
+            "Use a constant reach, a connected jagged fade, reviewed "
+            "full-density lobes, or a fine actual-edge seam seal"
+        ),
     )
     edge_augmentation.add_argument(
         "--blend-width",
@@ -4287,8 +6092,60 @@ def build_parser() -> argparse.ArgumentParser:
         default=PATCH_04_JAGGED_NOISE_SEED,
         help="Deterministic connected-zone seed",
     )
+    edge_augmentation.add_argument(
+        "--lobed-max-width",
+        type=float,
+        default=PATCH_04_LOBED_MAX_WIDTH_METRES,
+        help="Maximum reviewed-lobe core plus outer-fade reach in metres",
+    )
+    edge_augmentation.add_argument(
+        "--lobed-noise-seed",
+        type=int,
+        default=PATCH_04_LOBED_NOISE_SEED,
+        help="Deterministic broad-taper variation for the reviewed lobes",
+    )
     edge_augmentation.add_argument("--chunk-records", type=int, default=2_000_000)
     edge_augmentation.set_defaults(handler=command_build_edge_augmentation)
+
+    patch06 = subparsers.add_parser(
+        "build-patch06",
+        help="Build staged colour-matched and reconstructed Patch 06 SAND hole fills",
+    )
+    patch06.add_argument("--repo-root", type=Path, default=repo_root)
+    patch06.add_argument("--run-dir", type=Path, required=True)
+    patch06.add_argument("--base-run-dir", type=Path, required=True)
+    patch06.add_argument(
+        "--cleanmesh-patch",
+        type=Path,
+        default=Path("/Users/juju/Documents/Repositories/CleanMesh/Output/Site3-SAND-ScanID11-colour-matched.ply"),
+    )
+    patch06.add_argument(
+        "--cleanmesh-report",
+        type=Path,
+        default=Path("/Users/juju/Documents/Repositories/CleanMesh/Output/Site3-SAND-colour-match-report.json"),
+    )
+    patch06.add_argument(
+        "--cleanmesh-binary",
+        type=Path,
+        default=Path("/Users/juju/Documents/Repositories/CleanMesh/build/cleanmesh_patch_fill"),
+    )
+    patch06.add_argument(
+        "--poisson-binary",
+        type=Path,
+        default=Path("/Users/juju/Documents/Repositories/CleanMesh/build/cleanmesh_kazhdan_poisson"),
+    )
+    patch06.add_argument(
+        "--project",
+        type=Path,
+        default=repo_root / "Saved" / "ExhibitionFinal_project.json",
+    )
+    patch06.add_argument(
+        "--resume",
+        action="store_true",
+        help="Reuse a completed CleanMesh reconstruction in an interrupted Patch 06 run",
+    )
+    patch06.add_argument("--chunk-records", type=int, default=2_000_000)
+    patch06.set_defaults(handler=command_build_patch06)
 
     refresh = subparsers.add_parser(
         "refresh-additions",
@@ -4310,7 +6167,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--app", type=Path,
         default=repo_root / "build" / "macos-debug" / "invisible_places.app" / "Contents" / "MacOS" / "invisible_places",
     )
+    install.add_argument(
+        "--defer-post-install-smoke",
+        action="store_true",
+        help=(
+            "Leave the verified candidates installed with full temporary rollback "
+            "sources until a top-level GUI smoke is supplied to finalize-install"
+        ),
+    )
     install.set_defaults(handler=command_install)
+
+    finalize = subparsers.add_parser(
+        "finalize-install",
+        help="Finalize a prepared install after a top-level GUI smoke passes",
+    )
+    finalize.add_argument("--run-dir", type=Path, required=True)
+    finalize.add_argument("--post-install-smoke-report", type=Path, required=True)
+    finalize.set_defaults(handler=command_finalize_install)
+
+    rollback_install = subparsers.add_parser(
+        "rollback-install",
+        help="Rollback a prepared install that has not yet been finalized",
+    )
+    rollback_install.add_argument("--run-dir", type=Path, required=True)
+    rollback_install.set_defaults(handler=command_rollback_install)
 
     remove = subparsers.add_parser("remove-additions", help="Remove only appended ScanID 13 points")
     remove.add_argument("--run-dir", type=Path, required=True)

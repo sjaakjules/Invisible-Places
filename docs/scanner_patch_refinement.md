@@ -1,11 +1,11 @@
 # Scene3 scanner-patch refinement
 
 `scripts/refine_scene3_scanner_patches.py` improves the terrestrial scanner
-artifacts seen by the saved `Patch 01` through `Patch 04` cameras. Patch 01-03
-cover scanner-base holes; Patch 04 covers the straight density edge of the
-high-density ScanID 9 ROCK scan. The tool builds complete candidates first and
-does not alter a canonical PLY until the numerical and GUI validations have
-passed.
+artifacts seen by the saved `Patch 01` through `Patch 06` cameras. Patch 01-03
+cover scanner-base holes; Patch 04 covers the density edge of the high-density
+ScanID 9 ROCK scan; Patch 06 covers two SAND scanner footprints. The tool
+builds complete candidates first and does not alter a canonical PLY until the
+numerical and GUI validations have passed.
 
 ## Fixed mapping and ScanID contract
 
@@ -30,6 +30,10 @@ passed.
   hash-identified ScanID 13 tail from an earlier Patch 04 run; the pre-Patch04
   prefix remains byte-identical and the superseded tail is retained for exact
   rollback.
+- Patch 06 is append-only. Both accepted scanner-footprint fills are ScanID 13;
+  existing ScanID 0-11 records remain byte-identical, so its ScanID 12 subsets
+  are intentionally empty. Each addition copies the complete scalar bundle
+  from a measured 1 mm SAND neighbour.
 
 ## Matching and sampling method
 
@@ -54,12 +58,35 @@ passed.
 Patch 04 uses a separate edge model:
 
 - The connected ScanID 9 footprint is measured from the canonical 1 mm ROCK
-  cloud. Its boundary near the saved camera target is fitted as a straight line,
-  but the default fade is not parallel to that line. A deterministic
-  three-octave smooth-value field varies its reach from 80 to 440 mm along the
-  edge, while a sign-independent local-normal planarity field expands connected
-  flat areas by up to 40 mm. A 30 mm full-density core protects the original
-  edge and each variable-width lobe ends with a cubic smoothstep.
+  cloud. Its boundary near the saved camera target is fitted as a straight
+  reference, but the default density field is no longer one continuous fade.
+  The reviewed Patch 04 profile maps the two small upper islands and the large
+  two-lobed “B” outline from the 5 August camera annotation into fitted-edge
+  coordinates. Those areas carry 75-230 mm full-density plateaus; each then
+  fades for roughly another 100-320 mm with connected noise and local-planarity
+  modulation. The gaps retain only a short baseline taper, breaking the
+  perceptual line without producing a hard empty seam.
+- The default `sealed` revision measures distance from the actual ScanID 9
+  footprint on a 5 mm planning grid, includes empty seam cells, and guarantees
+  an irregular 32-60 mm full-density ribbon before retaining the reviewed
+  lobes. This removes the faded moat and rectangular saw-tooth visible in the
+  close `Patch 04_new` camera. The fitted line is retained only to choose the
+  intended side and along-edge extent.
+- The measured-contact revision additionally fills the sub-cell seam that a
+  5 mm XY planning grid cannot represent. It extracts only the exterior
+  ScanID 9 contour (internal rock cavities are filled in the contour mask),
+  admits mesh samples from the shared boundary cell, and applies an exact 3D
+  source-clearance/Poisson pass. The camera-visible authored span is audited
+  against the ScanID 9 nearest-neighbour scale: the reviewed 1 mm candidate
+  has a 0.66 mm median and 1.13 mm p95 cell contact distance, with 99.5% of
+  boundary cells inside the 1.98 mm acceptance limit. Added bridge samples
+  remain ScanID 13; no ScanID 0-9 record is edited.
+- Quotas for the sealed profile are true cellwise deficits: each 5 mm cell
+  is filled only up to its interpolated target between measured ambient and
+  ScanID 9 density. This prevents already-dense blobs from receiving the same
+  fixed addition count as sparse cells. The earlier `jagged` profile remains
+  available for reproduction and varies an 80-440 mm outer reach around a
+  30 mm core.
 - `Data/Scene3/LinearNoisePAtchPoints.ply` supplies geometry candidates only.
   Candidates farther than 2 mm from measured 1 mm geometry, or whose normal
   agreement is below 0.75, are rejected so smoothed mesh corners cannot replace
@@ -71,6 +98,21 @@ Patch 04 uses a separate edge model:
 - The same measured transition is independently quota-sampled for the 1, 2, 3,
   and 5 mm display bundles. Existing payload bytes are copied without
   rewriting them.
+
+Patch 06 uses two geometry sources:
+
+- The colour-matched CleanMesh component supplies the first scanner footprint.
+  It must remain within 2 mm of measured 1 mm geometry and pass the normal
+  agreement gate before density sampling.
+- The second footprint is reconstructed from a tightly cropped measured SAND
+  neighbourhood with CleanMesh Poisson reconstruction. Its candidates use a
+  stricter 2 mm point-to-plane, 10 mm tangent-distance, and 0.75 normal-dot
+  gate. If the reconstruction cannot retain a sufficient measured-supported
+  subset, the build fails instead of installing a smoothed disc.
+- Both footprints are independently quota-sampled against their surrounding
+  total density for every 1, 2, 3, and 5 mm cloud. RGB is blended in Oklab from
+  up to eight measured 1 mm neighbours; normals and all 31 non-ScanID scalar
+  fields come from the closest eligible 1 mm record.
 
 ## Build and validate
 
@@ -116,9 +158,11 @@ Its compact restore returns exactly to the installed base run. Restore the
 density run first if the original pre-patch clouds are later restored through
 the base run.
 
-Build Patch 04 as a ROCK descendant of the installed Patch 01-03 run. The
-connected jagged profile is the default; `--edge-profile linear --blend-width
-0.22` reproduces the earlier constant 220 mm taper:
+Build Patch 04 as a ROCK descendant of the installed Patch 01-03 run. The fine
+actual-edge `sealed` profile is the default; `--edge-profile lobed` reproduces
+the reviewed v3 profile, `--edge-profile jagged` reproduces v2, and
+`--edge-profile linear --blend-width 0.22` reproduces the earlier constant
+220 mm taper:
 
 ```sh
 /opt/homebrew/bin/python3 scripts/refine_scene3_scanner_patches.py build-edge-augmentation \
@@ -133,8 +177,9 @@ The edge build refuses an uninstalled base, a material absence of the ScanID 9
 density step, geometry/source-schema disagreement, modified existing records,
 or an incomplete nearest-neighbour scalar transfer.
 
-To stage a revised edge while an earlier append-only Patch 04 run remains
-installed, identify that installed run explicitly:
+To stage a revised edge while an earlier Patch 04 run remains installed,
+identify that installed run explicitly. Tail replacement can be chained while
+retaining the complete superseded tail for byte-exact rollback:
 
 ```sh
 /opt/homebrew/bin/python3 scripts/refine_scene3_scanner_patches.py build-edge-augmentation \
@@ -148,6 +193,19 @@ candidate consists of the verified pre-edge prefix plus the new ScanID 13 tail;
 the previous tail is stored separately. The validation root therefore renders
 the exact eventual merged cloud rather than drawing new points on top of the
 currently installed edge.
+
+Build both Patch 06 SAND scanner footprints from an installed base run. The
+second reconstruction uses the CleanMesh binaries and measured source crop;
+`--resume` reuses a completed reconstruction after an interrupted build:
+
+```sh
+/opt/homebrew/bin/python3 scripts/refine_scene3_scanner_patches.py build-patch06 \
+  --base-run-dir Data/Scene3/PatchRefinement/<installed-run> \
+  --run-dir Data/Scene3/PatchRefinement/<patch06-run>
+
+/opt/homebrew/bin/python3 scripts/refine_scene3_scanner_patches.py verify \
+  --run-dir Data/Scene3/PatchRefinement/<patch06-run>
+```
 
 Each density folder contains the full candidate, original ID-10/11 backup
 records, their source vertex indices, corrected ID-12 records, and ID-13
@@ -165,19 +223,26 @@ production files:
 build/macos-debug/invisible_places.app/Contents/MacOS/invisible_places \
   Data/Scene3/PatchRefinement/<run-name>/validation-data \
   --gui-smoke scene3-patch-boundaries \
-  --smoke-project Data/Scene3/PatchRefinement/<run-name>/ExhibitionFinal_patch-validation_project.json \
+  --smoke-project Data/Scene3/PatchRefinement/<run-name>/<validation-project>.json \
   --smoke-output Data/Scene3/PatchRefinement/<run-name>/validation-render
 ```
 
-The smoke forces the full 1 mm Scene3 bundle and exact `Projector-01` visual,
-overrides its point footprint to a fixed 2 mm world-space diameter, disables
-gSplat/water/live effects, clears every Shoreline instance, asserts the
-resolved render styles have shoreline waves disabled, and renders all four
-saved cameras. Inspect the unannotated PNGs and contact sheet at 100%. The
+The generated filename is `ExhibitionFinal_patch-validation_project.json` for
+Patch 04 and `ExhibitionFinal_patch06-validation_project.json` for Patch 06;
+the manifest records its absolute path.
+
+The generated validation project preselects the full 1 mm Scene3 candidate for
+the changed role (ROCK for Patch 04, SAND for Patch 06) and aliases
+`Patch 04_new` or `Patch 06` onto the smoke camera slot. It selects the exact
+`Projector-01` visual with a fixed 2 mm world-space diameter. The smoke
+reasserts those settings, disables gSplat/water/live effects, clears every
+Shoreline instance, asserts the resolved render styles have shoreline waves
+disabled, and renders all four saved cameras. Inspect the unannotated PNGs and
+contact sheet at 100%. The
 Patch 01-03 `_boundary.png` copies show the approximate component perimeter
 only as a review aid; those overlays are not included in the unannotated
-acceptance images. Patch 04 is always rendered unannotated so the density edge
-can be judged directly.
+acceptance images. The aliased Patch 04 slot is always rendered unannotated so
+the Patch 04 density edge or Patch 06 footprints can be judged directly.
 
 ## Install and rollback
 
@@ -198,6 +263,32 @@ record backups remain. A tail-replacement run also retains the small
 superseded-ScanID13 tail, so restoring it reproduces the previously installed
 edge byte-for-byte. Field and water caches are not manually deleted; source
 size/mtime invalidation causes them to rebuild naturally.
+
+On macOS, when the GUI smoke must be launched as a separate top-level process,
+use the guarded two-phase form. The first command swaps all four files but
+retains every complete original; the install remains explicitly unfinished:
+
+```sh
+/opt/homebrew/bin/python3 scripts/refine_scene3_scanner_patches.py install \
+  --run-dir Data/Scene3/PatchRefinement/<run-name> \
+  --defer-post-install-smoke
+
+build/macos-debug/invisible_places.app/Contents/MacOS/invisible_places Data \
+  --gui-smoke scene3-patch-boundaries \
+  --smoke-project Saved/ExhibitionFinal_project.json \
+  --smoke-output Data/Scene3/PatchRefinement/<run-name>/post-install-render
+
+/opt/homebrew/bin/python3 scripts/refine_scene3_scanner_patches.py finalize-install \
+  --run-dir Data/Scene3/PatchRefinement/<run-name> \
+  --post-install-smoke-report \
+    Data/Scene3/PatchRefinement/<run-name>/post-install-render/scene3-patch-boundaries.json
+```
+
+`finalize-install` accepts only a passing patch-boundary report, re-hashes all
+four live candidates and all four temporary originals, and only then deletes
+the full copies. If the external smoke fails, `rollback-install --run-dir
+<run-name>` restores all four originals instead. Starting another install is
+refused while this transaction is awaiting either decision.
 
 Once an installed result has been accepted, remove its redundant replacement
 clouds, addition subsets, validation aliases, and large render intermediates
