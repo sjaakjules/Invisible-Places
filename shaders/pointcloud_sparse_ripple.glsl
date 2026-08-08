@@ -578,6 +578,10 @@ float SandCloudShorelineWaveValue(vec2 uv, float shoreDistance, float edgeBlendW
         const float shoreEnd = 0.0;
         const float shoreBreakup = smoothstep(0.24, 0.92, scallopNoise + turbulence01 * 0.22);
         const float shorewardMask = 1.0 - smoothstep(frontWidth * 0.45, frontWidth * 2.20, x - shoreEnd);
+        // Brightness the incoming front holds when it stops at the shore.
+        // The return branch's carry starts from this same level so the
+        // incoming-to-return handoff never dims in a single frame.
+        const float peakArrivalLevel = 0.86;
 
         if (cycle < incomingShare) {
             const float incomingProgress = smoothstep(0.0, 1.0, cycle / incomingShare);
@@ -633,7 +637,10 @@ float SandCloudShorelineWaveValue(vec2 uv, float shoreDistance, float edgeBlendW
             const float incomingBodyFoam =
                 incomingMask * incomingBodyFade * (0.10 + density01 * 0.12) * foamContinuity;
             const float arrivalFade = smoothstep(0.01, 0.12, cycle);
-            const float peakSoftening = 1.0 - smoothstep(0.84, 1.0, incomingProgress) * 0.28;
+            // Arriving fronts must stay the brighter half of the cycle, so
+            // the arrival dip stays mild compared to the receding crest.
+            const float peakSoftening =
+                1.0 - smoothstep(0.84, 1.0, incomingProgress) * (1.0 - peakArrivalLevel);
             const float incomingEdgeFoam =
                 (crest * (0.70 + shoreBreakup * 0.22) * foamContinuity +
                  crestHalo * (0.08 + density01 * 0.06) * foamContinuity +
@@ -696,9 +703,15 @@ float SandCloudShorelineWaveValue(vec2 uv, float shoreDistance, float edgeBlendW
                 smoothstep(frontWidth * 0.35, frontWidth * 1.70, trailDistance) *
                 returnFollowMask;
             const float edgeFade = 1.0 - smoothstep(0.78, 1.0, returnProgress);
+            // Mirror of incomingDeepSideMask: the receding crest keeps only
+            // its shoreward half, matching the incoming front's lit width so
+            // the outgoing wave reads slightly dimmer, never brighter.
+            const float returnCrestSideMask =
+                smoothstep(-frontWidth * 0.15, frontWidth * 0.35, front);
             const float edgeValue =
-                (crest * (0.62 + shoreBreakup * 0.20) * foamContinuity +
-                 crestHalo * (0.10 + density01 * 0.06) * foamContinuity +
+                ((crest * (0.62 + shoreBreakup * 0.20) * foamContinuity +
+                  crestHalo * (0.10 + density01 * 0.06) * foamContinuity) *
+                     returnCrestSideMask +
                  trailingFoam * (0.38 + density01 * 0.24) * breakup) *
                 edgeFade;
             const float edgeIntroduce = smoothstep(0.0, 0.18, returnProgress);
@@ -710,11 +723,24 @@ float SandCloudShorelineWaveValue(vec2 uv, float shoreDistance, float edgeBlendW
                 smoothstep(frontWidth * 0.35, frontWidth * 1.70, peakTrailDistance) *
                 (1.0 - smoothstep(trailLength * 0.18, trailLength * 0.50, peakTrailDistance));
             const float peakCarryFade = 1.0 - smoothstep(0.0, 0.20, returnProgress);
+            // The carry reproduces the incoming front's exact end state —
+            // crest, trailing foam, and body wash at the arrival level — and
+            // only then fades, so the wave settles without a one-frame dip
+            // while the dimmer receding front introduces underneath.
+            const float peakCarryStartMask =
+                smoothstep(offshoreStart - frontWidth * 1.25, offshoreStart + frontWidth * 1.25, x);
+            const float peakCarryBodyFade =
+                1.0 - smoothstep(waveTravel * 0.72, waveTravel * 1.02, peakTrailDistance);
+            const float peakCarryBodyFoam =
+                peakCarryMask * peakCarryStartMask * peakCarryBodyFade *
+                (0.10 + density01 * 0.12) * foamContinuity;
+            const float peakCarryEdgeFoam =
+                (RippleLine(peakFront, frontWidth) * (0.70 + shoreBreakup * 0.22) * foamContinuity +
+                 RippleLine(peakFront, frontWidth * 1.70) * (0.08 + density01 * 0.06) * foamContinuity +
+                 peakCarryFoam * (0.42 + density01 * 0.28) * breakup) *
+                peakCarryMask * peakCarryStartMask;
             const float peakCarryValue =
-                (RippleLine(peakFront, frontWidth) * (0.62 + shoreBreakup * 0.20) * foamContinuity +
-                 RippleLine(peakFront, frontWidth * 1.70) * (0.10 + density01 * 0.06) * foamContinuity +
-                 peakCarryFoam * (0.38 + density01 * 0.24) * breakup) *
-                peakCarryMask * peakCarryFade * 0.72;
+                max(peakCarryBodyFoam, peakCarryEdgeFoam) * peakArrivalLevel * peakCarryFade;
             const float value = max(max(heldValue, peakCarryValue), edgeValue * edgeIntroduce);
             combined = max(combined, value * shorewardMask * frontWeight);
         }
