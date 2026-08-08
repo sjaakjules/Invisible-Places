@@ -1637,20 +1637,34 @@ struct SavedWaterAnimationTrailProfileState {
     WaterAnimationTrailSettings settings{};
 };
 
+// Flow profiles come in two flavours sharing one list: shared base profiles,
+// and object-specific copies created when a selected Flow source edits its
+// settings. Copies are keyed by (ownerObjectId, baseProfileName) and named
+// "<base>_<source name>". Any source may reference another object's copy by
+// name, but only the owner's edits rewrite it.
 struct SavedWaterPathProfileState {
     std::string name = "Default";
     WaterPathGenerationSettings settings{};
+    bool objectOverride = false;
+    std::uint32_t ownerObjectId = 0U;
+    std::string baseProfileName;
 };
 
 struct SavedWaterLaneProfileState {
     std::string name = "Default";
     WaterFlowTrailSettings settings{};
+    bool objectOverride = false;
+    std::uint32_t ownerObjectId = 0U;
+    std::string baseProfileName;
 };
 
 struct SavedWaterTrailProfileState {
     std::string name = "Default";
     WaterTrailGeometrySettings geometry{};
     PointCloudStyleState style{};
+    bool objectOverride = false;
+    std::uint32_t ownerObjectId = 0U;
+    std::string baseProfileName;
 };
 
 struct WaterTrailOverlayGroup {
@@ -14318,6 +14332,269 @@ std::optional<std::size_t> FindWaterTrailProfileIndex(
     return std::nullopt;
 }
 
+enum class WaterProfileKind {
+    Path,
+    Lane,
+    Trail
+};
+
+// ---------------------------------------------------------------------------
+// Object-specific Flow profile copies. Editing Path/Lanes/Trail settings with
+// a Flow source selected saves into a copy named "<base>_<source name>" owned
+// by that source; other sources may reference the copy but never rewrite it —
+// their own edits fork into their own copy of the same base.
+// ---------------------------------------------------------------------------
+
+std::string WaterFlowSourceDisplayName(std::string_view name, std::uint32_t sourceId) {
+    const auto trimmed = TrimText(name);
+    return trimmed.empty() ? "Source " + std::to_string(sourceId) : std::string{trimmed};
+}
+
+// baseProfileName stays resolvable (it may name a "_preset" built-in); only
+// the human-facing copy name drops decorations: "Mid_preset" + "Spring" →
+// "Mid_Spring".
+std::string WaterFlowObjectProfileName(
+    std::string_view baseProfileName,
+    std::string_view objectName) {
+    const auto base = BaseWaterProfileName(baseProfileName);
+    const auto object = TrimText(objectName);
+    return base + "_" + (object.empty() ? std::string{"Source"} : std::string{object});
+}
+
+template <typename ProfileState>
+std::optional<std::size_t> FindWaterFlowObjectProfileIndexIn(
+    const std::vector<ProfileState>& profiles,
+    std::uint32_t ownerObjectId,
+    std::string_view baseProfileName) {
+    const auto base = NormalizeWaterProfileName(baseProfileName);
+    for (std::size_t index = 0; index < profiles.size(); ++index) {
+        const auto& profile = profiles[index];
+        if (profile.objectOverride &&
+            profile.ownerObjectId == ownerObjectId &&
+            NormalizeWaterProfileName(profile.baseProfileName) == base) {
+            return index;
+        }
+    }
+    return std::nullopt;
+}
+
+template <typename ProfileState>
+const ProfileState* FindWaterFlowObjectProfileByName(
+    const std::vector<ProfileState>& profiles,
+    std::string_view name) {
+    const auto normalized = NormalizeWaterProfileName(name, kWaterProfileGlobalName);
+    for (const auto& profile : profiles) {
+        if (profile.objectOverride &&
+            NormalizeWaterProfileName(profile.name) == normalized) {
+            return &profile;
+        }
+    }
+    return nullptr;
+}
+
+template <typename ProfileState>
+bool WaterFlowObjectProfileNameInUse(
+    const std::vector<ProfileState>& profiles,
+    std::string_view name,
+    const ProfileState* exclude) {
+    const auto normalized = NormalizeWaterProfileName(name);
+    if (normalized == kWaterProfileGlobalName || normalized == kWaterProfileDefaultName) {
+        return true;
+    }
+    for (const auto& profile : profiles) {
+        if (&profile != exclude &&
+            NormalizeWaterProfileName(profile.name) == normalized) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Copy names are human-readable and can collide with a base profile or a
+// same-named source's copy; the (owner, base) metadata stays authoritative,
+// so a numeric suffix only keeps by-name references unambiguous.
+template <typename ProfileState>
+std::string UniqueWaterFlowObjectProfileName(
+    const std::vector<ProfileState>& profiles,
+    std::string_view preferredName,
+    const ProfileState* exclude) {
+    const auto preferred = NormalizeWaterProfileName(preferredName);
+    if (!WaterFlowObjectProfileNameInUse(profiles, preferred, exclude)) {
+        return preferred;
+    }
+    for (std::uint32_t suffix = 2U; suffix < 10000U; ++suffix) {
+        const auto candidate = preferred + " " + std::to_string(suffix);
+        if (!WaterFlowObjectProfileNameInUse(profiles, candidate, exclude)) {
+            return candidate;
+        }
+    }
+    return preferred + " Copy";
+}
+
+// The base a selected source's edit derives from: a Global assignment follows
+// the globally selected profile, another object's copy contributes its own
+// base, and anything else (saved profile, preset, Default) is its own base.
+// The result stays resolvable — "_preset" built-in names are kept, only an
+// "_edited" suffix is dropped.
+template <typename ProfileState>
+std::string WaterFlowObjectEditBaseName(
+    const std::vector<ProfileState>& profiles,
+    std::string_view assignedProfileName,
+    std::string_view selectedProfileName) {
+    const auto assigned = NormalizeWaterProfileName(assignedProfileName, kWaterProfileGlobalName);
+    if (IsGlobalWaterProfileName(assigned)) {
+        return UneditedWaterProfileName(selectedProfileName);
+    }
+    for (const auto& profile : profiles) {
+        if (profile.objectOverride &&
+            NormalizeWaterProfileName(profile.name) == assigned) {
+            return NormalizeWaterProfileName(profile.baseProfileName);
+        }
+    }
+    return UneditedWaterProfileName(assigned);
+}
+
+// Upserts the owner's copy of the derived base and points the assignment at
+// it. Returns the copy name that received the edit.
+template <typename ProfileState, typename ApplySettings>
+std::string CommitWaterFlowObjectProfileEdit(
+    std::vector<ProfileState>* profiles,
+    std::string* assignedProfileName,
+    std::string_view selectedProfileName,
+    std::uint32_t ownerObjectId,
+    std::string_view ownerName,
+    ApplySettings&& applySettings) {
+    const auto baseName = WaterFlowObjectEditBaseName(
+        *profiles,
+        *assignedProfileName,
+        selectedProfileName);
+    const auto existing = FindWaterFlowObjectProfileIndexIn(
+        *profiles,
+        ownerObjectId,
+        baseName);
+    ProfileState* profile = nullptr;
+    if (existing.has_value()) {
+        profile = &(*profiles)[existing.value()];
+    } else {
+        profiles->push_back({});
+        profile = &profiles->back();
+        profile->objectOverride = true;
+        profile->ownerObjectId = ownerObjectId;
+        profile->baseProfileName = baseName;
+        profile->name = UniqueWaterFlowObjectProfileName(
+            *profiles,
+            WaterFlowObjectProfileName(baseName, ownerName),
+            profile);
+    }
+    applySettings(profile);
+    *assignedProfileName = profile->name;
+    return profile->name;
+}
+
+// Rewrites every by-name reference to a profile and returns the ids of the
+// Flow sources whose assignment changed.
+std::vector<std::uint32_t> ReplaceWaterFlowProfileAssignment(
+    WaterWorkflowState* water,
+    WaterProfileKind kind,
+    std::string_view previousName,
+    std::string_view nextName) {
+    const auto previous = NormalizeWaterProfileName(previousName);
+    std::vector<std::uint32_t> changedSourceIds;
+    const auto replace = [&](std::string* assignment, std::uint32_t sourceId) {
+        if (NormalizeWaterProfileName(*assignment, kWaterProfileGlobalName) == previous) {
+            *assignment = std::string{nextName};
+            changedSourceIds.push_back(sourceId);
+        }
+    };
+    for (auto& emitter : water->emitters) {
+        if (kind == WaterProfileKind::Path) {
+            replace(&emitter.pathProfileName, emitter.id);
+        } else if (kind == WaterProfileKind::Lane) {
+            replace(&emitter.laneProfileName, emitter.id);
+        } else {
+            replace(&emitter.trailProfileName, emitter.id);
+        }
+    }
+    for (auto& source : water->manualFlowPaths) {
+        if (kind == WaterProfileKind::Lane) {
+            replace(&source.laneProfileName, source.id);
+        } else if (kind == WaterProfileKind::Trail) {
+            replace(&source.trailProfileName, source.id);
+        }
+    }
+    if (kind == WaterProfileKind::Trail &&
+        NormalizeWaterProfileName(
+            water->dynamicMeshFlowSettings.trailProfileName,
+            kWaterProfileGlobalName) == previous) {
+        water->dynamicMeshFlowSettings.trailProfileName = std::string{nextName};
+    }
+    return changedSourceIds;
+}
+
+// Renaming a source renames its copies so the "<base>_<source name>"
+// convention keeps holding; every by-name reference follows the rename.
+void RenameWaterFlowSourceObjectProfiles(
+    WaterWorkflowState* water,
+    std::uint32_t ownerObjectId,
+    std::string_view ownerName) {
+    const auto renameIn = [&](auto* profiles, WaterProfileKind kind) {
+        for (auto& profile : *profiles) {
+            if (!profile.objectOverride || profile.ownerObjectId != ownerObjectId) {
+                continue;
+            }
+            const auto renamed = UniqueWaterFlowObjectProfileName(
+                *profiles,
+                WaterFlowObjectProfileName(profile.baseProfileName, ownerName),
+                &profile);
+            if (renamed == NormalizeWaterProfileName(profile.name)) {
+                continue;
+            }
+            const auto previous = profile.name;
+            profile.name = renamed;
+            ReplaceWaterFlowProfileAssignment(water, kind, previous, renamed);
+        }
+    };
+    renameIn(&water->pathProfiles, WaterProfileKind::Path);
+    renameIn(&water->laneProfiles, WaterProfileKind::Lane);
+    renameIn(&water->trailProfiles, WaterProfileKind::Trail);
+}
+
+// Deleting a source removes its copies; sources referencing a removed copy
+// fall back to the copy's base so their look changes predictably instead of
+// dangling on a missing name.
+struct WaterFlowObjectProfileRemoval {
+    // Sources whose Path assignment fell back to a base (path bake inputs
+    // changed) and sources whose Lane/Trail assignment fell back.
+    std::vector<std::uint32_t> pathRemappedSourceIds;
+    std::vector<std::uint32_t> laneOrTrailRemappedSourceIds;
+};
+
+WaterFlowObjectProfileRemoval RemoveWaterFlowSourceObjectProfiles(
+    WaterWorkflowState* water,
+    std::uint32_t ownerObjectId) {
+    WaterFlowObjectProfileRemoval removal;
+    const auto removeIn = [&](auto* profiles, WaterProfileKind kind) {
+        for (std::size_t index = profiles->size(); index > 0U; --index) {
+            auto& profile = (*profiles)[index - 1U];
+            if (!profile.objectOverride || profile.ownerObjectId != ownerObjectId) {
+                continue;
+            }
+            const auto removedName = profile.name;
+            const auto baseName = NormalizeWaterProfileName(profile.baseProfileName);
+            profiles->erase(profiles->begin() + static_cast<std::ptrdiff_t>(index - 1U));
+            auto remapped = ReplaceWaterFlowProfileAssignment(water, kind, removedName, baseName);
+            auto& target = kind == WaterProfileKind::Path
+                ? removal.pathRemappedSourceIds
+                : removal.laneOrTrailRemappedSourceIds;
+            target.insert(target.end(), remapped.begin(), remapped.end());
+        }
+    };
+    removeIn(&water->pathProfiles, WaterProfileKind::Path);
+    removeIn(&water->laneProfiles, WaterProfileKind::Lane);
+    removeIn(&water->trailProfiles, WaterProfileKind::Trail);
+    return removal;
+}
+
 std::optional<WaterPathGenerationSettings> BuiltInWaterPathProfileSettings(std::string_view name) {
     const auto normalized = NormalizeWaterProfileName(name);
     if (normalized == "Aerial_preset") {
@@ -14530,12 +14807,76 @@ void EnsureWaterProfiles(PreviewRuntimeState* runtimeState) {
             source.keyedSettingsProfileName.clear();
         }
     }
+    // Object copies must reference a live owner: orphans dissolve back to
+    // their base for every referencing source, and copies whose owner was
+    // renamed outside this session re-sync to "<base>_<source name>".
+    std::unordered_set<std::uint32_t> flowSourceIds;
+    for (const auto& emitter : water.emitters) {
+        flowSourceIds.insert(emitter.id);
+    }
+    for (const auto& source : water.manualFlowPaths) {
+        flowSourceIds.insert(source.id);
+    }
+    const auto dropOrphanCopies = [&](auto* profiles, WaterProfileKind kind) {
+        for (std::size_t index = profiles->size(); index > 0U; --index) {
+            auto& profile = (*profiles)[index - 1U];
+            if (!profile.objectOverride) {
+                continue;
+            }
+            profile.baseProfileName =
+                NormalizeWaterProfileName(profile.baseProfileName);
+            if (flowSourceIds.contains(profile.ownerObjectId)) {
+                continue;
+            }
+            const auto removedName = profile.name;
+            const auto baseName = profile.baseProfileName;
+            profiles->erase(
+                profiles->begin() + static_cast<std::ptrdiff_t>(index - 1U));
+            (void)ReplaceWaterFlowProfileAssignment(
+                &water,
+                kind,
+                removedName,
+                baseName);
+        }
+    };
+    dropOrphanCopies(&water.pathProfiles, WaterProfileKind::Path);
+    dropOrphanCopies(&water.laneProfiles, WaterProfileKind::Lane);
+    dropOrphanCopies(&water.trailProfiles, WaterProfileKind::Trail);
+    for (const auto& emitter : water.emitters) {
+        RenameWaterFlowSourceObjectProfiles(
+            &water,
+            emitter.id,
+            WaterFlowSourceDisplayName(emitter.name, emitter.id));
+    }
+    for (const auto& source : water.manualFlowPaths) {
+        RenameWaterFlowSourceObjectProfiles(
+            &water,
+            source.id,
+            WaterFlowSourceDisplayName(source.name, source.id));
+    }
+    // The global selectors only ever hold shared names; a selection left on
+    // an object copy falls back to the copy's base.
+    const auto selectBase = [](const auto& profiles, std::string* selectedName) {
+        if (const auto* copy = FindWaterFlowObjectProfileByName(profiles, *selectedName);
+            copy != nullptr) {
+            *selectedName = NormalizeWaterProfileName(copy->baseProfileName);
+        }
+    };
+    selectBase(water.pathProfiles, &water.selectedPathProfileName);
+    selectBase(water.laneProfiles, &water.selectedLaneProfileName);
+    selectBase(water.trailProfiles, &water.selectedTrailProfileName);
+    water.pathProfileNameBuffer = BaseWaterProfileName(water.selectedPathProfileName);
+    water.laneProfileNameBuffer = BaseWaterProfileName(water.selectedLaneProfileName);
+    water.trailProfileNameBuffer = BaseWaterProfileName(water.selectedTrailProfileName);
 }
 
 WaterPathProfileDocument MakeWaterPathProfileDocument(const SavedWaterPathProfileState& profile) {
     return {
         .name = NormalizeWaterProfileName(profile.name),
         .settings = profile.settings,
+        .objectOverride = profile.objectOverride,
+        .ownerObjectId = profile.ownerObjectId,
+        .baseProfileName = profile.baseProfileName,
     };
 }
 
@@ -14543,6 +14884,9 @@ SavedWaterPathProfileState MakeWaterPathProfileState(const WaterPathProfileDocum
     return {
         .name = NormalizeWaterProfileName(document.name),
         .settings = document.settings,
+        .objectOverride = document.objectOverride,
+        .ownerObjectId = document.ownerObjectId,
+        .baseProfileName = document.baseProfileName,
     };
 }
 
@@ -14550,6 +14894,9 @@ WaterLaneProfileDocument MakeWaterLaneProfileDocument(const SavedWaterLaneProfil
     return {
         .name = NormalizeWaterProfileName(profile.name),
         .settings = profile.settings,
+        .objectOverride = profile.objectOverride,
+        .ownerObjectId = profile.ownerObjectId,
+        .baseProfileName = profile.baseProfileName,
     };
 }
 
@@ -14557,6 +14904,9 @@ SavedWaterLaneProfileState MakeWaterLaneProfileState(const WaterLaneProfileDocum
     return {
         .name = NormalizeWaterProfileName(document.name),
         .settings = document.settings,
+        .objectOverride = document.objectOverride,
+        .ownerObjectId = document.ownerObjectId,
+        .baseProfileName = document.baseProfileName,
     };
 }
 
@@ -14565,11 +14915,18 @@ WaterTrailProfileDocument MakeWaterTrailProfileDocument(const SavedWaterTrailPro
         .name = NormalizeWaterProfileName(profile.name),
         .geometry = profile.geometry,
         .style = MakeWaterTrailSessionStyle(profile.style, profile.geometry),
+        .objectOverride = profile.objectOverride,
+        .ownerObjectId = profile.ownerObjectId,
+        .baseProfileName = profile.baseProfileName,
     };
 }
 
 SavedWaterTrailProfileState MakeWaterTrailProfileState(const WaterTrailProfileDocument& document) {
-    return MakeWaterTrailProfile(document.name, document.geometry, document.style);
+    auto profile = MakeWaterTrailProfile(document.name, document.geometry, document.style);
+    profile.objectOverride = document.objectOverride;
+    profile.ownerObjectId = document.ownerObjectId;
+    profile.baseProfileName = document.baseProfileName;
+    return profile;
 }
 
 void ImportLegacyWaterVisualsAsTrailProfiles(PreviewRuntimeState* runtimeState) {
@@ -14887,15 +15244,17 @@ void StoreManualFlowPathLaneProfileEdit(
     if (water == nullptr || source == nullptr) {
         return;
     }
-    const auto baseName = WaterSourceSavedProfileName(
-        source->laneProfileName,
-        water->selectedLaneProfileName);
-    water->editedLaneProfileSettings = settings;
-    water->selectedLaneProfileName = EditedWaterProfileName(baseName);
-    water->laneProfileNameBuffer = BaseWaterProfileName(baseName);
-    // Moving a base value creates/updates the normal profile's `_edited`
-    // shadow. Keyed slider edits never call this path.
-    source->laneProfileLocked = false;
+    // Moving a base value writes this source's own profile copy. Keyed
+    // slider edits never call this path.
+    CommitWaterFlowObjectProfileEdit(
+        &water->laneProfiles,
+        &source->laneProfileName,
+        water->selectedLaneProfileName,
+        source->id,
+        WaterFlowSourceDisplayName(source->name, source->id),
+        [&](SavedWaterLaneProfileState* profile) {
+            profile->settings = settings;
+        });
 }
 
 void StoreManualFlowPathTrailProfileEdit(
@@ -14906,16 +15265,16 @@ void StoreManualFlowPathTrailProfileEdit(
         return;
     }
     auto& water = runtimeState->water;
-    const auto baseName = WaterSourceSavedProfileName(
-        source->trailProfileName,
-        water.selectedTrailProfileName);
-    water.editedTrailProfile = MakeWaterTrailProfile(
-        EditedWaterProfileName(baseName),
-        profile.geometry,
-        profile.style);
-    water.selectedTrailProfileName = EditedWaterProfileName(baseName);
-    water.trailProfileNameBuffer = BaseWaterProfileName(baseName);
-    source->trailProfileLocked = false;
+    CommitWaterFlowObjectProfileEdit(
+        &water.trailProfiles,
+        &source->trailProfileName,
+        water.selectedTrailProfileName,
+        source->id,
+        WaterFlowSourceDisplayName(source->name, source->id),
+        [&](SavedWaterTrailProfileState* copy) {
+            copy->geometry = profile.geometry;
+            copy->style = MakeWaterTrailSessionStyle(profile.style, profile.geometry);
+        });
 }
 
 WaterSourceSettings ActiveProfileDefaultWaterSourceSettings(const WaterWorkflowState& water) {
@@ -53897,12 +54256,6 @@ void DrawWaterFieldPanel(
     }
 }
 
-enum class WaterProfileKind {
-    Path,
-    Lane,
-    Trail
-};
-
 bool DrawWaterSourceProfileAssignmentCombo(
     const WaterWorkflowState& water,
     WaterProfileKind kind,
@@ -54172,6 +54525,147 @@ constexpr std::string_view kBuiltInWaterTrailProfileNames[] = {
     "Blue Silver Threads_preset",
 };
 
+// While an edited shadow or an object copy is active, differing slider
+// values append the base profile's original in brackets — e.g. "0.62 (0.35)".
+std::string WaterProfileValueFormat(
+    const char* format,
+    float currentValue,
+    const std::optional<float>& baseValue) {
+    if (!baseValue.has_value() ||
+        std::abs(baseValue.value() - currentValue) <= 1.0e-4F) {
+        return std::string{format};
+    }
+    std::array<char, 64> baseText{};
+    (void)std::snprintf(
+        baseText.data(),
+        baseText.size(),
+        format,
+        static_cast<double>(baseValue.value()));
+    return std::string{format} + " (" + baseText.data() + ")";
+}
+
+std::string WaterProfileValueFormat(
+    const char* format,
+    int currentValue,
+    const std::optional<int>& baseValue) {
+    if (!baseValue.has_value() || baseValue.value() == currentValue) {
+        return std::string{format};
+    }
+    std::array<char, 64> baseText{};
+    (void)std::snprintf(baseText.data(), baseText.size(), format, baseValue.value());
+    return std::string{format} + " (" + baseText.data() + ")";
+}
+
+void DrawWaterProfileBaseBoolHint(bool currentValue, const std::optional<bool>& baseValue) {
+    if (!baseValue.has_value() || baseValue.value() == currentValue) {
+        return;
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(%s)", baseValue.value() ? "on" : "off");
+}
+
+// Base settings the Path editor's bracket annotations compare against: the
+// saved base under an object copy, or the saved profile under a global
+// `_edited` shadow. Empty while the editor shows unedited saved values.
+std::optional<WaterPathGenerationSettings> WaterPathEditorBaseline(
+    const WaterWorkflowState& water,
+    const WaterEmitter* selectedEmitter) {
+    if (selectedEmitter != nullptr) {
+        if (const auto* copy = FindWaterFlowObjectProfileByName(
+                water.pathProfiles,
+                selectedEmitter->pathProfileName);
+            copy != nullptr) {
+            return WaterPathProfileSettingsByName(water, copy->baseProfileName);
+        }
+        return std::nullopt;
+    }
+    if (water.editedPathProfileSettings.has_value()) {
+        return WaterPathProfileSettingsByName(
+            water,
+            UneditedWaterProfileName(water.selectedPathProfileName));
+    }
+    return std::nullopt;
+}
+
+std::optional<WaterFlowTrailSettings> WaterLaneEditorBaseline(
+    const WaterWorkflowState& water,
+    const std::string* assignedProfileName) {
+    if (assignedProfileName != nullptr) {
+        if (const auto* copy = FindWaterFlowObjectProfileByName(
+                water.laneProfiles,
+                *assignedProfileName);
+            copy != nullptr) {
+            return WaterLaneProfileSettingsByName(water, copy->baseProfileName);
+        }
+        return std::nullopt;
+    }
+    if (water.editedLaneProfileSettings.has_value()) {
+        return WaterLaneProfileSettingsByName(
+            water,
+            UneditedWaterProfileName(water.selectedLaneProfileName));
+    }
+    return std::nullopt;
+}
+
+std::optional<WaterTrailGeometrySettings> WaterTrailEditorBaselineGeometry(
+    const PreviewRuntimeState& runtimeState,
+    const std::string* assignedProfileName) {
+    const auto& water = runtimeState.water;
+    if (assignedProfileName != nullptr) {
+        if (const auto* copy = FindWaterFlowObjectProfileByName(
+                water.trailProfiles,
+                *assignedProfileName);
+            copy != nullptr) {
+            return WaterTrailProfileByName(runtimeState, copy->baseProfileName).geometry;
+        }
+        return std::nullopt;
+    }
+    if (water.editedTrailProfile.has_value()) {
+        return WaterTrailProfileByName(
+                   runtimeState,
+                   UneditedWaterProfileName(water.selectedTrailProfileName))
+            .geometry;
+    }
+    return std::nullopt;
+}
+
+// Caption for a settings panel editing the selected source: names the copy
+// edits save to, and flags read-only use of another source's copy.
+template <typename ProfileState>
+void DrawWaterFlowObjectEditCaption(
+    const std::vector<ProfileState>& profiles,
+    std::string_view selectedProfileName,
+    std::string_view assignedProfileName,
+    std::uint32_t ownerObjectId,
+    std::string_view ownerName) {
+    const auto* assignedCopy = FindWaterFlowObjectProfileByName(profiles, assignedProfileName);
+    if (assignedCopy != nullptr && assignedCopy->ownerObjectId == ownerObjectId) {
+        ImGui::TextDisabled(
+            "Editing %.*s — changes save to \"%s\".",
+            static_cast<int>(ownerName.size()),
+            ownerName.data(),
+            assignedCopy->name.c_str());
+        return;
+    }
+    const auto baseName = WaterFlowObjectEditBaseName(
+        profiles,
+        assignedProfileName,
+        selectedProfileName);
+    const auto targetName = WaterFlowObjectProfileName(baseName, ownerName);
+    if (assignedCopy != nullptr) {
+        ImGui::TextDisabled(
+            "Using \"%s\" (another source's copy, read-only) — editing saves your own \"%s\".",
+            assignedCopy->name.c_str(),
+            targetName.c_str());
+        return;
+    }
+    ImGui::TextDisabled(
+        "Editing %.*s — the first change saves \"%s\".",
+        static_cast<int>(ownerName.size()),
+        ownerName.data(),
+        targetName.c_str());
+}
+
 bool DrawWaterSourceProfileAssignmentCombo(
     const WaterWorkflowState& water,
     WaterProfileKind kind,
@@ -54184,15 +54678,34 @@ bool DrawWaterSourceProfileAssignmentCombo(
     const auto currentName = NormalizeWaterProfileName(*profileName, kWaterProfileGlobalName);
     bool changed = false;
     if (ImGui::BeginCombo(label, currentName.c_str())) {
-        auto option = [&](std::string_view name) {
+        auto option = [&](std::string_view name, bool objectCopy = false) {
             const auto normalized = NormalizeWaterProfileName(name, kWaterProfileGlobalName);
             const bool selected = currentName == normalized;
-            if (ImGui::Selectable(normalized.c_str(), selected)) {
+            // Other sources may select an object copy; only its owner's
+            // edits rewrite it.
+            const std::string displayLabel =
+                objectCopy ? normalized + " (object copy)" : normalized;
+            if (ImGui::Selectable(displayLabel.c_str(), selected)) {
                 *profileName = normalized;
                 changed = true;
             }
             if (selected) {
                 ImGui::SetItemDefaultFocus();
+            }
+        };
+        auto profileOptions = [&](const auto& profiles) {
+            if (!profiles.empty()) {
+                ImGui::Separator();
+            }
+            for (const auto& profile : profiles) {
+                if (!profile.objectOverride) {
+                    option(profile.name);
+                }
+            }
+            for (const auto& profile : profiles) {
+                if (profile.objectOverride) {
+                    option(profile.name, true);
+                }
             }
         };
         option(kWaterProfileGlobalName);
@@ -54202,32 +54715,17 @@ bool DrawWaterSourceProfileAssignmentCombo(
             for (const auto name : kBuiltInWaterPathProfileNames) {
                 option(name);
             }
-            if (!water.pathProfiles.empty()) {
-                ImGui::Separator();
-            }
-            for (const auto& profile : water.pathProfiles) {
-                option(profile.name);
-            }
+            profileOptions(water.pathProfiles);
         } else if (kind == WaterProfileKind::Lane) {
             for (const auto name : kBuiltInWaterLaneProfileNames) {
                 option(name);
             }
-            if (!water.laneProfiles.empty()) {
-                ImGui::Separator();
-            }
-            for (const auto& profile : water.laneProfiles) {
-                option(profile.name);
-            }
+            profileOptions(water.laneProfiles);
         } else {
             for (const auto name : kBuiltInWaterTrailProfileNames) {
                 option(name);
             }
-            if (!water.trailProfiles.empty()) {
-                ImGui::Separator();
-            }
-            for (const auto& profile : water.trailProfiles) {
-                option(profile.name);
-            }
+            profileOptions(water.trailProfiles);
         }
         ImGui::EndCombo();
     }
@@ -54306,6 +54804,11 @@ void DrawWaterPathProfileSelector(PreviewRuntimeState* runtimeState) {
             ImGui::Separator();
         }
         for (const auto& profile : water.pathProfiles) {
+            // Object copies are edited through their owning source, never
+            // through the global selector.
+            if (profile.objectOverride) {
+                continue;
+            }
             DrawWaterProfileSelectionOption<SavedWaterPathProfileState>(
                 profile.name,
                 &water.selectedPathProfileName,
@@ -54335,6 +54838,10 @@ void DrawWaterPathProfileSelector(PreviewRuntimeState* runtimeState) {
                 : water.pathProfileNameBuffer);
         if (IsProtectedWaterPathProfileName(targetName)) {
             runtimeState->errorMessage = "Protected Path presets must be saved with a new custom name.";
+            runtimeState->statusMessage.clear();
+        } else if (FindWaterFlowObjectProfileByName(water.pathProfiles, targetName) != nullptr) {
+            runtimeState->errorMessage =
+                "\"" + targetName + "\" is an object-specific Path copy; edit it with its source selected.";
             runtimeState->statusMessage.clear();
         } else if (targetName == kWaterProfileDefaultName) {
             water.defaultSourceSettings.path = currentSettings;
@@ -54398,6 +54905,9 @@ void DrawWaterLaneProfileSelector(PreviewRuntimeState* runtimeState) {
             ImGui::Separator();
         }
         for (const auto& profile : water.laneProfiles) {
+            if (profile.objectOverride) {
+                continue;
+            }
             DrawWaterProfileSelectionOption<SavedWaterLaneProfileState>(
                 profile.name,
                 &water.selectedLaneProfileName,
@@ -54423,6 +54933,10 @@ void DrawWaterLaneProfileSelector(PreviewRuntimeState* runtimeState) {
                 : water.laneProfileNameBuffer);
         if (IsProtectedWaterLaneProfileName(targetName)) {
             runtimeState->errorMessage = "Protected Lane presets must be saved with a new custom name.";
+            runtimeState->statusMessage.clear();
+        } else if (FindWaterFlowObjectProfileByName(water.laneProfiles, targetName) != nullptr) {
+            runtimeState->errorMessage =
+                "\"" + targetName + "\" is an object-specific Lane copy; edit it with its source selected.";
             runtimeState->statusMessage.clear();
         } else if (targetName == kWaterProfileDefaultName) {
             water.flowTrailSettings = currentSettings;
@@ -54487,6 +55001,9 @@ void DrawWaterTrailProfileSelector(
             ImGui::Separator();
         }
         for (const auto& profile : water.trailProfiles) {
+            if (profile.objectOverride) {
+                continue;
+            }
             DrawWaterProfileSelectionOption<SavedWaterTrailProfileState>(
                 profile.name,
                 &water.selectedTrailProfileName,
@@ -54512,6 +55029,10 @@ void DrawWaterTrailProfileSelector(
                 : water.trailProfileNameBuffer);
         if (IsProtectedWaterTrailProfileName(*runtimeState, targetName)) {
             runtimeState->errorMessage = "Protected Trail presets must be saved with a new custom name.";
+            runtimeState->statusMessage.clear();
+        } else if (FindWaterFlowObjectProfileByName(water.trailProfiles, targetName) != nullptr) {
+            runtimeState->errorMessage =
+                "\"" + targetName + "\" is an object-specific Trail copy; edit it with its source selected.";
             runtimeState->statusMessage.clear();
         } else if (targetName == kWaterProfileDefaultName) {
             water.defaultTrailGeometry = currentProfile.geometry;
@@ -54672,11 +55193,27 @@ std::size_t ApplyWaterTrailLiveVisualProfile(
     return updatedCount;
 }
 
-void DrawWaterTrailStyleEditor(
+struct WaterTrailStyleEditResult {
+    bool generationChanged = false;
+    bool generationRefreshRequested = false;
+    bool visualChanged = false;
+    bool styleChanged = false;
+    WaterTrailGeometrySettings geometry{};
+    PointCloudStyleState style{};
+
+    [[nodiscard]] bool changed() const {
+        return generationChanged || visualChanged || styleChanged;
+    }
+};
+
+// Draws the Trail geometry and style controls without committing; callers
+// decide whether the edit lands in the global edited shadow or a source's
+// object copy. Differing geometry values show the base in brackets.
+WaterTrailStyleEditResult DrawWaterTrailStyleEditorCore(
     PreviewRuntimeState* runtimeState,
-    invisible_places::renderer::core::VulkanViewportShell* viewport,
-    SavedWaterTrailProfileState profile) {
-    auto& water = runtimeState->water;
+    SavedWaterTrailProfileState profile,
+    const std::optional<WaterTrailGeometrySettings>& baselineGeometry) {
+    WaterTrailStyleEditResult result;
     const auto previousGeometry = profile.geometry;
     bool generationChanged = false;
     bool generationRefreshRequested = false;
@@ -54686,12 +55223,30 @@ void DrawWaterTrailStyleEditor(
             ImGui::SetTooltip("%s", text);
         }
     };
+    const auto trailFormat = [&](const char* format, float current, auto member) {
+        return WaterProfileValueFormat(
+            format,
+            current,
+            baselineGeometry.has_value()
+                ? std::optional<float>{baselineGeometry.value().*member}
+                : std::nullopt);
+    };
+    const auto trailBoolHint = [&](bool current, auto member) {
+        DrawWaterProfileBaseBoolHint(
+            current,
+            baselineGeometry.has_value()
+                ? std::optional<bool>{baselineGeometry.value().*member}
+                : std::nullopt);
+    };
     if (ImGui::SliderFloat(
         "Trail Length",
         &profile.geometry.trailLengthMeters,
         0.03F,
         5.0F,
-        "%.2f m",
+        trailFormat(
+            "%.2f m",
+            profile.geometry.trailLengthMeters,
+            &WaterTrailGeometrySettings::trailLengthMeters).c_str(),
         ImGuiSliderFlags_Logarithmic)) {
         profile.geometry =
             invisible_places::water::FitWaterTrailGeometryForContinuousLines(profile.geometry);
@@ -54708,7 +55263,10 @@ void DrawWaterTrailStyleEditor(
         &profile.geometry.widthMeters,
         0.001F,
         0.08F,
-        "%.3f m",
+        trailFormat(
+            "%.3f m",
+            profile.geometry.widthMeters,
+            &WaterTrailGeometrySettings::widthMeters).c_str(),
         ImGuiSliderFlags_Logarithmic)) {
         visualChanged = true;
     }
@@ -54727,7 +55285,10 @@ void DrawWaterTrailStyleEditor(
             &profile.geometry.pointSpacingMeters,
             0.002F,
             0.20F,
-            "%.3f m",
+            trailFormat(
+                "%.3f m",
+                profile.geometry.pointSpacingMeters,
+                &WaterTrailGeometrySettings::pointSpacingMeters).c_str(),
             ImGuiSliderFlags_Logarithmic)) {
             generationChanged = true;
         }
@@ -54741,7 +55302,10 @@ void DrawWaterTrailStyleEditor(
             &profile.geometry.streakLengthMeters,
             0.002F,
             1.0F,
-            "%.3f m",
+            trailFormat(
+                "%.3f m",
+                profile.geometry.streakLengthMeters,
+                &WaterTrailGeometrySettings::streakLengthMeters).c_str(),
             ImGuiSliderFlags_Logarithmic)) {
             visualChanged = true;
         }
@@ -54754,6 +55318,9 @@ void DrawWaterTrailStyleEditor(
         trailTooltip(
             "Fade trail points near the beginning of the route. Each trail "
             "uses a stable random fade-begin distance.");
+        trailBoolHint(
+            profile.geometry.startFadeEnabled,
+            &WaterTrailGeometrySettings::startFadeEnabled);
         if (profile.geometry.startFadeEnabled) {
             if (ImGui::DragFloat(
                     "Start Fully Visible At",
@@ -54761,7 +55328,10 @@ void DrawWaterTrailStyleEditor(
                     0.01F,
                     0.0F,
                     50.0F,
-                    "%.2f m")) {
+                    trailFormat(
+                        "%.2f m",
+                        profile.geometry.startFadeFullDistanceMeters,
+                        &WaterTrailGeometrySettings::startFadeFullDistanceMeters).c_str())) {
                 generationChanged = true;
             }
             if (ImGui::IsItemDeactivatedAfterEdit()) {
@@ -54775,7 +55345,10 @@ void DrawWaterTrailStyleEditor(
                     0.01F,
                     0.0F,
                     50.0F,
-                    "%.2f m")) {
+                    trailFormat(
+                        "%.2f m",
+                        profile.geometry.startFadeRandomBeginDistanceMeters,
+                        &WaterTrailGeometrySettings::startFadeRandomBeginDistanceMeters).c_str())) {
                 generationChanged = true;
             }
             if (ImGui::IsItemDeactivatedAfterEdit()) {
@@ -54790,6 +55363,9 @@ void DrawWaterTrailStyleEditor(
         }
         trailTooltip(
             "Fade trail points as they approach the route end, independently of the start fade.");
+        trailBoolHint(
+            profile.geometry.endFadeEnabled,
+            &WaterTrailGeometrySettings::endFadeEnabled);
         if (profile.geometry.endFadeEnabled) {
             if (ImGui::DragFloat(
                     "End Fully Visible At",
@@ -54797,7 +55373,10 @@ void DrawWaterTrailStyleEditor(
                     0.01F,
                     0.0F,
                     50.0F,
-                    "%.2f m")) {
+                    trailFormat(
+                        "%.2f m",
+                        profile.geometry.endFadeFullDistanceMeters,
+                        &WaterTrailGeometrySettings::endFadeFullDistanceMeters).c_str())) {
                 generationChanged = true;
             }
             if (ImGui::IsItemDeactivatedAfterEdit()) {
@@ -54811,7 +55390,10 @@ void DrawWaterTrailStyleEditor(
                     0.01F,
                     0.0F,
                     50.0F,
-                    "%.2f m")) {
+                    trailFormat(
+                        "%.2f m",
+                        profile.geometry.endFadeRandomBeginDistanceMeters,
+                        &WaterTrailGeometrySettings::endFadeRandomBeginDistanceMeters).c_str())) {
                 generationChanged = true;
             }
             if (ImGui::IsItemDeactivatedAfterEdit()) {
@@ -54866,30 +55448,92 @@ void DrawWaterTrailStyleEditor(
          .hardMax = 1.0F});
     styleChanged |= DrawPointCloudEmissionSection(nullptr, &editSession);
 
-    if (generationChanged || visualChanged || styleChanged) {
-        const auto editedName = EditedWaterProfileName(water.selectedTrailProfileName);
-        water.selectedTrailProfileName = editedName;
-        water.trailProfileNameBuffer = BaseWaterProfileName(editedName);
-        auto editedProfile = MakeWaterTrailProfile(editedName, profile.geometry, editSession.pointStyle);
-        water.editedTrailProfile = editedProfile;
-        if (generationRefreshRequested) {
-            QueueEditedWaterProfileUserRefresh(
-                runtimeState,
-                false,
-                WaterOverlayRefreshPersistence::InMemoryOnly,
-                std::chrono::milliseconds{150});
-        } else if (visualChanged || styleChanged) {
-            const auto updatedCount = ApplyWaterTrailLiveVisualProfile(runtimeState, editedProfile, false);
-            if (updatedCount > 0U) {
-                runtimeState->statusMessage = "Water trail visuals updated without rebuilding trails.";
-                runtimeState->errorMessage.clear();
-            } else {
-                runtimeState->statusMessage =
-                    "Water trail visuals saved; they will apply when a Flow source is visible.";
-                runtimeState->errorMessage.clear();
-            }
+    result.generationChanged = generationChanged;
+    result.generationRefreshRequested = generationRefreshRequested;
+    result.visualChanged = visualChanged;
+    result.styleChanged = styleChanged;
+    result.geometry = profile.geometry;
+    result.style = editSession.pointStyle;
+    return result;
+}
+
+void DrawWaterTrailStyleEditor(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    SavedWaterTrailProfileState profile) {
+    (void)viewport;
+    auto& water = runtimeState->water;
+    const auto result = DrawWaterTrailStyleEditorCore(
+        runtimeState,
+        std::move(profile),
+        WaterTrailEditorBaselineGeometry(*runtimeState, nullptr));
+    if (!result.changed()) {
+        return;
+    }
+    const auto editedName = EditedWaterProfileName(water.selectedTrailProfileName);
+    water.selectedTrailProfileName = editedName;
+    water.trailProfileNameBuffer = BaseWaterProfileName(editedName);
+    auto editedProfile = MakeWaterTrailProfile(editedName, result.geometry, result.style);
+    water.editedTrailProfile = editedProfile;
+    if (result.generationRefreshRequested) {
+        QueueEditedWaterProfileUserRefresh(
+            runtimeState,
+            false,
+            WaterOverlayRefreshPersistence::InMemoryOnly,
+            std::chrono::milliseconds{150});
+    } else if (result.visualChanged || result.styleChanged) {
+        const auto updatedCount = ApplyWaterTrailLiveVisualProfile(runtimeState, editedProfile, false);
+        if (updatedCount > 0U) {
+            runtimeState->statusMessage = "Water trail visuals updated without rebuilding trails.";
+            runtimeState->errorMessage.clear();
+        } else {
+            runtimeState->statusMessage =
+                "Water trail visuals saved; they will apply when a Flow source is visible.";
+            runtimeState->errorMessage.clear();
         }
     }
+}
+
+// Trail editor variant for a selected Flow source: edits land in the
+// source's object copy instead of the global edited shadow, so no other
+// source's look changes unless it references the same copy.
+void DrawWaterTrailStyleEditorForSource(
+    PreviewRuntimeState* runtimeState,
+    std::string* assignedProfileName,
+    std::uint32_t ownerObjectId,
+    std::string_view ownerName,
+    const SavedWaterTrailProfileState& resolvedProfile) {
+    auto& water = runtimeState->water;
+    const auto result = DrawWaterTrailStyleEditorCore(
+        runtimeState,
+        resolvedProfile,
+        WaterTrailEditorBaselineGeometry(*runtimeState, assignedProfileName));
+    if (!result.changed()) {
+        return;
+    }
+    const auto copyName = CommitWaterFlowObjectProfileEdit(
+        &water.trailProfiles,
+        assignedProfileName,
+        water.selectedTrailProfileName,
+        ownerObjectId,
+        ownerName,
+        [&](SavedWaterTrailProfileState* copy) {
+            copy->geometry = result.geometry;
+            copy->style = MakeWaterTrailSessionStyle(result.style, result.geometry);
+        });
+    if (result.generationRefreshRequested) {
+        RefreshResolvedWaterFlowSourceSettings(runtimeState);
+    } else if (result.visualChanged || result.styleChanged) {
+        if (const auto index = FindWaterTrailProfileIndex(water, copyName);
+            index.has_value()) {
+            (void)ApplyWaterTrailLiveVisualProfile(
+                runtimeState,
+                water.trailProfiles[index.value()],
+                false);
+        }
+    }
+    runtimeState->statusMessage = "Saved Trail edits to \"" + copyName + "\".";
+    runtimeState->errorMessage.clear();
 }
 
 void DrawWaterDynamicMeshTrailProfileSelector(
@@ -54924,6 +55568,11 @@ void DrawWaterDynamicMeshTrailProfileSelector(
             ImGui::Separator();
         }
         for (const auto& profileState : water.trailProfiles) {
+            // Flow-source object copies stay out of the mesh selector; only
+            // their owning Flow source may rewrite them.
+            if (profileState.objectOverride) {
+                continue;
+            }
             option(profileState.name);
         }
         ImGui::EndCombo();
@@ -54942,6 +55591,10 @@ void DrawWaterDynamicMeshTrailProfileSelector(
                 : water.dynamicMeshTrailProfileNameBuffer);
         if (IsProtectedWaterTrailProfileName(*runtimeState, targetName)) {
             runtimeState->errorMessage = "Protected Trail presets must be saved with a new custom name.";
+            runtimeState->statusMessage.clear();
+        } else if (FindWaterFlowObjectProfileByName(water.trailProfiles, targetName) != nullptr) {
+            runtimeState->errorMessage =
+                "\"" + targetName + "\" is an object-specific Trail copy; edit it with its Flow source selected.";
             runtimeState->statusMessage.clear();
         } else if (targetName == kWaterProfileDefaultName) {
             water.defaultTrailGeometry = currentProfile.geometry;
@@ -60530,7 +61183,14 @@ void DrawWaterPanel(
             ImGui::Separator();
 
             if (selectedEmitter != nullptr && !water.manualFlowPathEditor.active) {
-                InputTextString("Name", &selectedEmitter->name);
+                if (InputTextString("Name", &selectedEmitter->name)) {
+                    RenameWaterFlowSourceObjectProfiles(
+                        &water,
+                        selectedEmitter->id,
+                        WaterFlowSourceDisplayName(
+                            selectedEmitter->name,
+                            selectedEmitter->id));
+                }
                 float position[3] = {
                     selectedEmitter->position.x,
                     selectedEmitter->position.y,
@@ -60732,7 +61392,12 @@ void DrawWaterPanel(
                         ResolveManualFlowPathLaneSettings(water, source),
                         previousTrailProfile.geometry);
                 const bool previousUseSurfaceGuide = source.useSurfaceGuide;
-                InputTextString("Name", &source.name);
+                if (InputTextString("Name", &source.name)) {
+                    RenameWaterFlowSourceObjectProfiles(
+                        &water,
+                        source.id,
+                        WaterFlowSourceDisplayName(source.name, source.id));
+                }
                 const invisible_places::water::WaterKeyedFeatureId feature{
                     .kind = invisible_places::water::WaterKeyedFeatureKind::
                         FlowPath,
@@ -61014,7 +61679,10 @@ void DrawWaterPanel(
                 ImGui::TextDisabled(
                     "Finish or cancel the active path edit first.");
             } else {
-                ImGui::TextDisabled("No source selected; profile sections edit Global.");
+                ImGui::TextDisabled(
+                    "No source selected; the Path, Lanes and Trail sections "
+                    "edit the global profiles. Select a source to edit its "
+                    "own object copy.");
             }
 
             const bool hasSelectedSource =
@@ -61079,6 +61747,15 @@ void DrawWaterPanel(
                         water.selectedEmitterIndex.value());
                 }
             }
+            const auto removedProfiles = RemoveWaterFlowSourceObjectProfiles(
+                &water,
+                deletedEmitterId);
+            for (const auto sourceId : removedProfiles.pathRemappedSourceIds) {
+                MarkWaterPathDirty(runtimeState, sourceId);
+            }
+            if (!removedProfiles.laneOrTrailRemappedSourceIds.empty()) {
+                RefreshResolvedWaterFlowSourceSettings(runtimeState);
+            }
             MarkWaterPathDirty(runtimeState, deletedEmitterId);
             ValidateWaterSourceSettingLinks(runtimeState);
         }
@@ -61104,6 +61781,15 @@ void DrawWaterPanel(
                                profile.ownerObjectId == deletedSourceId;
                     }),
                 water.keyedSettingsProfiles.end());
+            const auto removedProfiles = RemoveWaterFlowSourceObjectProfiles(
+                &water,
+                deletedSourceId);
+            for (const auto sourceId : removedProfiles.pathRemappedSourceIds) {
+                MarkWaterPathDirty(runtimeState, sourceId);
+            }
+            if (!removedProfiles.laneOrTrailRemappedSourceIds.empty()) {
+                RefreshResolvedWaterFlowSourceSettings(runtimeState);
+            }
             water.selectedManualFlowPathIndex.reset();
             water.manualFlowPathEditor = {};
             QueueWaterFlowTrailRefresh(
@@ -61135,28 +61821,89 @@ void DrawWaterPanel(
         // these controls there was both irrelevant and easy to mistake for
         // settings on the selected path.
         if (!manualPathSourceSelected && BeginPanelSection("Path")) {
-            DrawWaterPathProfileSelector(runtimeState);
-            auto pathSettings = ViewedGlobalWaterPathSettings(water);
+            // With a Point Source selected the panel shows and edits that
+            // source's resolved settings; edits save into its object copy.
+            // Without a selection it edits the global profile as before.
+            auto* pathEditEmitter = SelectedWaterEmitter(runtimeState);
+            if (pathEditEmitter != nullptr) {
+                DrawWaterFlowObjectEditCaption(
+                    water.pathProfiles,
+                    water.selectedPathProfileName,
+                    pathEditEmitter->pathProfileName,
+                    pathEditEmitter->id,
+                    WaterFlowSourceDisplayName(pathEditEmitter->name, pathEditEmitter->id));
+            } else {
+                DrawWaterPathProfileSelector(runtimeState);
+            }
+            auto pathSettings = pathEditEmitter != nullptr
+                ? ResolveEmitterWaterPathSettings(water, *pathEditEmitter)
+                : ViewedGlobalWaterPathSettings(water);
             const auto previousPathSettings = pathSettings;
+            const auto pathBaseline = WaterPathEditorBaseline(water, pathEditEmitter);
+            const auto pathFormat = [&](const char* format, float current, auto member) {
+                return WaterProfileValueFormat(
+                    format,
+                    current,
+                    pathBaseline.has_value()
+                        ? std::optional<float>{pathBaseline.value().*member}
+                        : std::nullopt);
+            };
+            const auto pathIntFormat = [&](const char* format, int current, auto member) {
+                return WaterProfileValueFormat(
+                    format,
+                    current,
+                    pathBaseline.has_value()
+                        ? std::optional<int>{static_cast<int>(pathBaseline.value().*member)}
+                        : std::nullopt);
+            };
+            const auto pathBoolHint = [&](bool current, auto member) {
+                DrawWaterProfileBaseBoolHint(
+                    current,
+                    pathBaseline.has_value()
+                        ? std::optional<bool>{pathBaseline.value().*member}
+                        : std::nullopt);
+            };
             bool pathChanged = false;
             pathChanged |= ImGui::Checkbox("Auto Tune", &pathSettings.autoTune);
-            pathChanged |= ImGui::SliderFloat("Branching Flats", &pathSettings.branching, 0.0F, 1.0F, "%.2f");
-            pathChanged |= ImGui::SliderFloat("Dense Coverage", &pathSettings.coverage, 0.0F, 1.0F, "%.2f");
-            pathChanged |= ImGui::SliderFloat("Gap Tolerance", &pathSettings.gapTolerance, 0.0F, 1.0F, "%.2f");
+            pathBoolHint(pathSettings.autoTune, &WaterPathGenerationSettings::autoTune);
+            pathChanged |= ImGui::SliderFloat(
+                "Branching Flats",
+                &pathSettings.branching,
+                0.0F,
+                1.0F,
+                pathFormat("%.2f", pathSettings.branching, &WaterPathGenerationSettings::branching).c_str());
+            pathChanged |= ImGui::SliderFloat(
+                "Dense Coverage",
+                &pathSettings.coverage,
+                0.0F,
+                1.0F,
+                pathFormat("%.2f", pathSettings.coverage, &WaterPathGenerationSettings::coverage).c_str());
+            pathChanged |= ImGui::SliderFloat(
+                "Gap Tolerance",
+                &pathSettings.gapTolerance,
+                0.0F,
+                1.0F,
+                pathFormat("%.2f", pathSettings.gapTolerance, &WaterPathGenerationSettings::gapTolerance).c_str());
             pathChanged |= ImGui::SliderFloat(
                 "Path Reach",
                 &pathSettings.pathLength,
                 0.5F,
                 250.0F,
-                "%.1f m",
+                pathFormat("%.1f m", pathSettings.pathLength, &WaterPathGenerationSettings::pathLength).c_str(),
                 ImGuiSliderFlags_Logarithmic);
-            pathChanged |= ImGui::SliderFloat("Smoothing", &pathSettings.smoothing, 0.0F, 1.0F, "%.2f");
+            pathChanged |= ImGui::SliderFloat(
+                "Smoothing",
+                &pathSettings.smoothing,
+                0.0F,
+                1.0F,
+                pathFormat("%.2f", pathSettings.smoothing, &WaterPathGenerationSettings::smoothing).c_str());
             if (ImGui::Checkbox("Attractor", &pathSettings.attractorEnabled)) {
                 if (pathSettings.attractorEnabled && pathSettings.attractorStrength <= 1.0e-4F) {
                     pathSettings.attractorStrength = 0.35F;
                 }
                 pathChanged = true;
             }
+            pathBoolHint(pathSettings.attractorEnabled, &WaterPathGenerationSettings::attractorEnabled);
             ImGui::SameLine();
             if (ImGui::Button(water.pathAttractorPlacementArmed ? "Click Attractor..." : "Place Attractor")) {
                 const bool armPlacement = !water.pathAttractorPlacementArmed;
@@ -61185,7 +61932,10 @@ void DrawWaterPanel(
                     &pathSettings.attractorStrength,
                     0.0F,
                     1.0F,
-                    "%.2f");
+                    pathFormat(
+                        "%.2f",
+                        pathSettings.attractorStrength,
+                        &WaterPathGenerationSettings::attractorStrength).c_str());
                 float attractorPosition[3] = {
                     pathSettings.attractorPosition.x,
                     pathSettings.attractorPosition.y,
@@ -61206,29 +61956,51 @@ void DrawWaterPanel(
                     &pathSettings.supportVoxelSize,
                     0.001F,
                     4.0F,
-                    "%.3f m",
+                    pathFormat(
+                        "%.3f m",
+                        pathSettings.supportVoxelSize,
+                        &WaterPathGenerationSettings::supportVoxelSize).c_str(),
                     ImGuiSliderFlags_Logarithmic);
                 pathChanged |= ImGui::SliderFloat(
                     "Bridge Upper Limit",
                     &pathSettings.maxBridgeDistance,
                     0.002F,
                     8.0F,
-                    "%.3f m",
+                    pathFormat(
+                        "%.3f m",
+                        pathSettings.maxBridgeDistance,
+                        &WaterPathGenerationSettings::maxBridgeDistance).c_str(),
                     ImGuiSliderFlags_Logarithmic);
                 pathChanged |= ImGui::SliderFloat(
                     "Path Sample Spacing",
                     &pathSettings.pathSampleSpacing,
                     0.001F,
                     2.0F,
-                    "%.3f m",
+                    pathFormat(
+                        "%.3f m",
+                        pathSettings.pathSampleSpacing,
+                        &WaterPathGenerationSettings::pathSampleSpacing).c_str(),
                     ImGuiSliderFlags_Logarithmic);
                 int maxSteps = static_cast<int>(pathSettings.maxSteps);
-                if (ImGui::SliderInt("Max Steps", &maxSteps, 16, 20000)) {
+                if (ImGui::SliderInt(
+                        "Max Steps",
+                        &maxSteps,
+                        16,
+                        20000,
+                        pathIntFormat("%d", maxSteps, &WaterPathGenerationSettings::maxSteps).c_str())) {
                     pathSettings.maxSteps = static_cast<std::uint32_t>(std::max(16, maxSteps));
                     pathChanged = true;
                 }
                 int sampleLimit = static_cast<int>(pathSettings.supportSampleLimit);
-                if (ImGui::SliderInt("Support Samples", &sampleLimit, 512, 5000000)) {
+                if (ImGui::SliderInt(
+                        "Support Samples",
+                        &sampleLimit,
+                        512,
+                        5000000,
+                        pathIntFormat(
+                            "%d",
+                            sampleLimit,
+                            &WaterPathGenerationSettings::supportSampleLimit).c_str())) {
                     pathSettings.supportSampleLimit = static_cast<std::uint32_t>(std::max(512, sampleLimit));
                     pathChanged = true;
                 }
@@ -61253,26 +62025,67 @@ void DrawWaterPanel(
                 afterSettings.path = pathSettings;
                 const bool bakeInputsChanged =
                     !invisible_places::water::WaterSourceBakeInputsEqual(beforeSettings, afterSettings);
-                water.editedPathProfileSettings = pathSettings;
-                water.selectedPathProfileName = EditedWaterProfileName(water.selectedPathProfileName);
-                water.pathProfileNameBuffer = BaseWaterProfileName(water.selectedPathProfileName);
-                if (bakeInputsChanged) {
-                    MarkWaterPathProfileUsersDirty(
-                        runtimeState,
+                const bool smoothingChanged =
+                    previousPathSettings.smoothing != pathSettings.smoothing;
+                if (pathEditEmitter != nullptr) {
+                    const auto copyName = CommitWaterFlowObjectProfileEdit(
+                        &water.pathProfiles,
+                        &pathEditEmitter->pathProfileName,
                         water.selectedPathProfileName,
-                        true);
-                    runtimeState->statusMessage =
-                        water.pathDirty
-                            ? "Water Path profile changed; path bake required."
-                            : "Water Path edits are not used by any unlocked source.";
-                } else if (previousPathSettings.smoothing != pathSettings.smoothing) {
-                    if (water.pathCacheLoaded && !water.pathCache.branches.empty()) {
+                        pathEditEmitter->id,
+                        WaterFlowSourceDisplayName(pathEditEmitter->name, pathEditEmitter->id),
+                        [&](SavedWaterPathProfileState* profile) {
+                            profile->settings = pathSettings;
+                        });
+                    if (!bakeInputsChanged && smoothingChanged &&
+                        water.pathCacheLoaded && !water.pathCache.branches.empty()) {
                         water.pathAnchors =
                             WaterPathAnchorsFromCacheWithProfileSettings(*runtimeState);
                     }
-                    QueueWaterFlowTrailRefresh(
-                        runtimeState,
-                        WaterOverlayRefreshPersistence::InMemoryOnly);
+                    // The owner and every read-only referencer of the copy
+                    // resolve the same before→after delta.
+                    for (const auto& emitter : water.emitters) {
+                        if (NormalizeWaterProfileName(
+                                emitter.pathProfileName,
+                                kWaterProfileGlobalName) != copyName) {
+                            continue;
+                        }
+                        if (bakeInputsChanged) {
+                            MarkWaterPathDirty(runtimeState, emitter.id);
+                        } else if (smoothingChanged) {
+                            QueueWaterFlowTrailRefresh(
+                                runtimeState,
+                                WaterOverlayRefreshPersistence::InMemoryOnly,
+                                std::chrono::milliseconds{0},
+                                emitter.id);
+                        }
+                    }
+                    runtimeState->statusMessage =
+                        water.pathDirty
+                            ? "Saved Path edits to \"" + copyName + "\"; path bake required."
+                            : "Saved Path edits to \"" + copyName + "\".";
+                } else {
+                    water.editedPathProfileSettings = pathSettings;
+                    water.selectedPathProfileName = EditedWaterProfileName(water.selectedPathProfileName);
+                    water.pathProfileNameBuffer = BaseWaterProfileName(water.selectedPathProfileName);
+                    if (bakeInputsChanged) {
+                        MarkWaterPathProfileUsersDirty(
+                            runtimeState,
+                            water.selectedPathProfileName,
+                            true);
+                        runtimeState->statusMessage =
+                            water.pathDirty
+                                ? "Water Path profile changed; path bake required."
+                                : "Water Path edits are not used by any unlocked source.";
+                    } else if (smoothingChanged) {
+                        if (water.pathCacheLoaded && !water.pathCache.branches.empty()) {
+                            water.pathAnchors =
+                                WaterPathAnchorsFromCacheWithProfileSettings(*runtimeState);
+                        }
+                        QueueWaterFlowTrailRefresh(
+                            runtimeState,
+                            WaterOverlayRefreshPersistence::InMemoryOnly);
+                    }
                 }
                 runtimeState->errorMessage.clear();
             }
@@ -61340,8 +62153,64 @@ void DrawWaterPanel(
             }
             BeginWaterRegenerativeSettingLabels(
                 manualPathSourceInRun);
-            DrawWaterLaneProfileSelector(runtimeState);
-            auto laneSettings = ViewedGlobalWaterLaneSettings(water);
+            // With a Flow source selected the panel shows and edits that
+            // source's resolved Lane settings; edits save into its object
+            // copy. Without a selection it edits the global profile.
+            auto* laneEditEmitter = SelectedWaterEmitter(runtimeState);
+            WaterManualFlowPathSource* laneEditManualPath =
+                laneEditEmitter == nullptr && manualPathSourceSelected &&
+                        !water.manualFlowPathEditor.active
+                    ? &water.manualFlowPaths
+                          [water.selectedManualFlowPathIndex.value()]
+                    : nullptr;
+            std::string* laneAssignment =
+                laneEditEmitter != nullptr ? &laneEditEmitter->laneProfileName
+                : laneEditManualPath != nullptr
+                    ? &laneEditManualPath->laneProfileName
+                    : nullptr;
+            const std::uint32_t laneOwnerId =
+                laneEditEmitter != nullptr ? laneEditEmitter->id
+                : laneEditManualPath != nullptr ? laneEditManualPath->id
+                                                : 0U;
+            const std::string laneOwnerName =
+                laneEditEmitter != nullptr
+                    ? WaterFlowSourceDisplayName(laneEditEmitter->name, laneEditEmitter->id)
+                : laneEditManualPath != nullptr
+                    ? WaterFlowSourceDisplayName(laneEditManualPath->name, laneEditManualPath->id)
+                    : std::string{};
+            if (laneAssignment != nullptr) {
+                DrawWaterFlowObjectEditCaption(
+                    water.laneProfiles,
+                    water.selectedLaneProfileName,
+                    *laneAssignment,
+                    laneOwnerId,
+                    laneOwnerName);
+            } else {
+                DrawWaterLaneProfileSelector(runtimeState);
+            }
+            auto laneSettings =
+                laneEditEmitter != nullptr
+                    ? ResolveEmitterWaterLaneSettings(water, *laneEditEmitter)
+                : laneEditManualPath != nullptr
+                    ? ResolveManualFlowPathLaneSettings(water, *laneEditManualPath)
+                    : ViewedGlobalWaterLaneSettings(water);
+            const auto laneBaseline = WaterLaneEditorBaseline(water, laneAssignment);
+            const auto laneFormat = [&](const char* format, float current, auto member) {
+                return WaterProfileValueFormat(
+                    format,
+                    current,
+                    laneBaseline.has_value()
+                        ? std::optional<float>{laneBaseline.value().*member}
+                        : std::nullopt);
+            };
+            const auto laneIntFormat = [&](const char* format, int current, auto member) {
+                return WaterProfileValueFormat(
+                    format,
+                    current,
+                    laneBaseline.has_value()
+                        ? std::optional<int>{static_cast<int>(laneBaseline.value().*member)}
+                        : std::nullopt);
+            };
             const auto previousLaneSettings = laneSettings;
             bool lanesChanged = false;
             bool refreshLanes = false;
@@ -61356,15 +62225,30 @@ void DrawWaterPanel(
             }
             laneTooltip(
                 "Advanced topology control. Disabling it removes generated Trail geometry; use Show Trail for immediate visibility.");
+            DrawWaterProfileBaseBoolHint(
+                laneSettings.enabled,
+                laneBaseline.has_value()
+                    ? std::optional<bool>{laneBaseline->enabled}
+                    : std::nullopt);
             int trailCount = static_cast<int>(laneSettings.trailCountTotal);
-            if (ImGui::SliderInt("Trail Count", &trailCount, 1, 8000)) {
+            if (ImGui::SliderInt(
+                    "Trail Count",
+                    &trailCount,
+                    1,
+                    8000,
+                    laneIntFormat("%d", trailCount, &WaterFlowTrailSettings::trailCountTotal).c_str())) {
                 laneSettings.trailCountTotal = static_cast<std::uint32_t>(std::max(1, trailCount));
                 lanesChanged = true;
             }
             refreshLanes |= ImGui::IsItemDeactivatedAfterEdit();
             laneTooltip("Number of active moving trail segments per source.");
             int laneCount = static_cast<int>(laneSettings.laneCount);
-            if (ImGui::SliderInt("Lane Count", &laneCount, 0, 64)) {
+            if (ImGui::SliderInt(
+                    "Lane Count",
+                    &laneCount,
+                    0,
+                    64,
+                    laneIntFormat("%d", laneCount, &WaterFlowTrailSettings::laneCount).c_str())) {
                 laneSettings.laneCount = static_cast<std::uint32_t>(std::max(0, laneCount));
                 lanesChanged = true;
             }
@@ -61375,7 +62259,10 @@ void DrawWaterPanel(
                 &laneSettings.laneSpreadMeters,
                 0.0F,
                 1.0F,
-                "%.2f m")) {
+                laneFormat(
+                    "%.2f m",
+                    laneSettings.laneSpreadMeters,
+                    &WaterFlowTrailSettings::laneSpreadMeters).c_str())) {
                 lanesChanged = true;
             }
             refreshLanes |= ImGui::IsItemDeactivatedAfterEdit();
@@ -61385,12 +62272,23 @@ void DrawWaterPanel(
                 &laneSettings.laneCrossing,
                 0.0F,
                 1.0F,
-                "%.2f")) {
+                laneFormat(
+                    "%.2f",
+                    laneSettings.laneCrossing,
+                    &WaterFlowTrailSettings::laneCrossing).c_str())) {
                 lanesChanged = true;
             }
             refreshLanes |= ImGui::IsItemDeactivatedAfterEdit();
             laneTooltip("Chance and strength for trails to ease into neighboring lanes while moving.");
-            if (ImGui::SliderFloat("Turbulence", &laneSettings.turbulence, 0.0F, 1.0F, "%.2f")) {
+            if (ImGui::SliderFloat(
+                    "Turbulence",
+                    &laneSettings.turbulence,
+                    0.0F,
+                    1.0F,
+                    laneFormat(
+                        "%.2f",
+                        laneSettings.turbulence,
+                        &WaterFlowTrailSettings::turbulence).c_str())) {
                 lanesChanged = true;
             }
             refreshLanes |= ImGui::IsItemDeactivatedAfterEdit();
@@ -61400,7 +62298,10 @@ void DrawWaterPanel(
                 &laneSettings.speedMetersPerSecond,
                 0.01F,
                 3.0F,
-                "%.2f m/s",
+                laneFormat(
+                    "%.2f m/s",
+                    laneSettings.speedMetersPerSecond,
+                    &WaterFlowTrailSettings::speedMetersPerSecond).c_str(),
                 ImGuiSliderFlags_Logarithmic)) {
                 lanesChanged = true;
             }
@@ -61411,7 +62312,10 @@ void DrawWaterPanel(
                 &laneSettings.surfaceOffsetMeters,
                 -0.20F,
                 0.20F,
-                "%.3f m")) {
+                laneFormat(
+                    "%.3f m",
+                    laneSettings.surfaceOffsetMeters,
+                    &WaterFlowTrailSettings::surfaceOffsetMeters).c_str())) {
                 lanesChanged = true;
             }
             refreshLanes |= ImGui::IsItemDeactivatedAfterEdit();
@@ -61422,7 +62326,10 @@ void DrawWaterPanel(
                     &laneSettings.pathAttraction,
                     0.0F,
                     1.0F,
-                    "%.2f")) {
+                    laneFormat(
+                        "%.2f",
+                        laneSettings.pathAttraction,
+                        &WaterFlowTrailSettings::pathAttraction).c_str())) {
                     lanesChanged = true;
                 }
                 refreshLanes |= ImGui::IsItemDeactivatedAfterEdit();
@@ -61431,7 +62338,10 @@ void DrawWaterPanel(
                     &laneSettings.trailSmoothness,
                     0.0F,
                     1.0F,
-                    "%.2f")) {
+                    laneFormat(
+                        "%.2f",
+                        laneSettings.trailSmoothness,
+                        &WaterFlowTrailSettings::trailSmoothness).c_str())) {
                     lanesChanged = true;
                 }
                 refreshLanes |= ImGui::IsItemDeactivatedAfterEdit();
@@ -61440,7 +62350,10 @@ void DrawWaterPanel(
                     &laneSettings.trailLooseness,
                     0.0F,
                     1.0F,
-                    "%.2f")) {
+                    laneFormat(
+                        "%.2f",
+                        laneSettings.trailLooseness,
+                        &WaterFlowTrailSettings::trailLooseness).c_str())) {
                     lanesChanged = true;
                 }
                 refreshLanes |= ImGui::IsItemDeactivatedAfterEdit();
@@ -61449,7 +62362,10 @@ void DrawWaterPanel(
                     &laneSettings.surfaceFollow,
                     0.0F,
                     1.0F,
-                    "%.2f")) {
+                    laneFormat(
+                        "%.2f",
+                        laneSettings.surfaceFollow,
+                        &WaterFlowTrailSettings::surfaceFollow).c_str())) {
                     lanesChanged = true;
                 }
                 refreshLanes |= ImGui::IsItemDeactivatedAfterEdit();
@@ -61459,7 +62375,10 @@ void DrawWaterPanel(
                     &laneSettings.downhillPull,
                     0.0F,
                     1.0F,
-                    "%.2f")) {
+                    laneFormat(
+                        "%.2f",
+                        laneSettings.downhillPull,
+                        &WaterFlowTrailSettings::downhillPull).c_str())) {
                     lanesChanged = true;
                 }
                 refreshLanes |= ImGui::IsItemDeactivatedAfterEdit();
@@ -61469,7 +62388,10 @@ void DrawWaterPanel(
                     &laneSettings.terrainWidthResponse,
                     0.0F,
                     1.0F,
-                    "%.2f")) {
+                    laneFormat(
+                        "%.2f",
+                        laneSettings.terrainWidthResponse,
+                        &WaterFlowTrailSettings::terrainWidthResponse).c_str())) {
                     lanesChanged = true;
                 }
                 refreshLanes |= ImGui::IsItemDeactivatedAfterEdit();
@@ -61479,7 +62401,10 @@ void DrawWaterPanel(
                     &laneSettings.turbulenceScaleMeters,
                     0.01F,
                     2.0F,
-                    "%.3f m",
+                    laneFormat(
+                        "%.3f m",
+                        laneSettings.turbulenceScaleMeters,
+                        &WaterFlowTrailSettings::turbulenceScaleMeters).c_str(),
                     ImGuiSliderFlags_Logarithmic)) {
                     lanesChanged = true;
                 }
@@ -61494,6 +62419,10 @@ void DrawWaterPanel(
                 refreshLanes = true;
             }
             laneTooltip("Deterministic random seed for lane placement and crossing.");
+            if (laneBaseline.has_value() && laneBaseline->seed != laneSettings.seed) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("(%u)", laneBaseline->seed);
+            }
             laneSettings.laneSpreadMeters = std::clamp(laneSettings.laneSpreadMeters, 0.0F, 10.0F);
             laneSettings.laneCrossing = std::clamp(laneSettings.laneCrossing, 0.0F, 1.0F);
             laneSettings.turbulence = std::clamp(laneSettings.turbulence, 0.0F, 5.0F);
@@ -61506,32 +62435,60 @@ void DrawWaterPanel(
             laneSettings.terrainWidthResponse = std::clamp(laneSettings.terrainWidthResponse, 0.0F, 1.0F);
             laneSettings.turbulenceScaleMeters = std::clamp(laneSettings.turbulenceScaleMeters, 0.005F, 10.0F);
             if (lanesChanged) {
-                water.editedLaneProfileSettings = laneSettings;
-                water.selectedLaneProfileName = EditedWaterProfileName(water.selectedLaneProfileName);
-                water.laneProfileNameBuffer = BaseWaterProfileName(water.selectedLaneProfileName);
-                if (!invisible_places::water::WaterFlowLaneSpeedOnlyEdit(
-                        previousLaneSettings,
-                        laneSettings)) {
-                    QueueEditedWaterProfileUserRefresh(
-                        runtimeState,
-                        true,
-                        WaterOverlayRefreshPersistence::InMemoryOnly,
-                        std::chrono::milliseconds{150});
+                if (laneAssignment != nullptr) {
+                    const auto copyName = CommitWaterFlowObjectProfileEdit(
+                        &water.laneProfiles,
+                        laneAssignment,
+                        water.selectedLaneProfileName,
+                        laneOwnerId,
+                        laneOwnerName,
+                        [&](SavedWaterLaneProfileState* profile) {
+                            profile->settings = laneSettings;
+                        });
+                    // Re-resolving every source scopes the update to the
+                    // owner and any read-only referencer of the copy.
+                    if (!invisible_places::water::WaterFlowLaneSpeedOnlyEdit(
+                            previousLaneSettings,
+                            laneSettings)) {
+                        RefreshResolvedWaterFlowSourceSettings(
+                            runtimeState,
+                            std::chrono::milliseconds{150});
+                    }
+                    runtimeState->statusMessage =
+                        "Saved Lane edits to \"" + copyName + "\".";
+                    runtimeState->errorMessage.clear();
+                } else {
+                    water.editedLaneProfileSettings = laneSettings;
+                    water.selectedLaneProfileName = EditedWaterProfileName(water.selectedLaneProfileName);
+                    water.laneProfileNameBuffer = BaseWaterProfileName(water.selectedLaneProfileName);
+                    if (!invisible_places::water::WaterFlowLaneSpeedOnlyEdit(
+                            previousLaneSettings,
+                            laneSettings)) {
+                        QueueEditedWaterProfileUserRefresh(
+                            runtimeState,
+                            true,
+                            WaterOverlayRefreshPersistence::InMemoryOnly,
+                            std::chrono::milliseconds{150});
+                    }
                 }
             }
             if (refreshLanes) {
-                const auto installedLaneSettings =
-                    water.lastInstalledLaneSettings.value_or(previousLaneSettings);
-                if (!ScaleWaterFlowTrailSpeedScalars(
-                        runtimeState,
-                        viewport,
-                        installedLaneSettings,
-                        laneSettings)) {
-                    QueueEditedWaterProfileUserRefresh(
-                        runtimeState,
-                        true,
-                        WaterOverlayRefreshPersistence::InMemoryOnly,
-                        std::chrono::milliseconds{0});
+                if (laneAssignment != nullptr) {
+                    RefreshResolvedWaterFlowSourceSettings(runtimeState);
+                } else {
+                    const auto installedLaneSettings =
+                        water.lastInstalledLaneSettings.value_or(previousLaneSettings);
+                    if (!ScaleWaterFlowTrailSpeedScalars(
+                            runtimeState,
+                            viewport,
+                            installedLaneSettings,
+                            laneSettings)) {
+                        QueueEditedWaterProfileUserRefresh(
+                            runtimeState,
+                            true,
+                            WaterOverlayRefreshPersistence::InMemoryOnly,
+                            std::chrono::milliseconds{0});
+                    }
                 }
             }
             if (ImGui::Button("Regenerate Lanes")) {
@@ -61551,8 +62508,46 @@ void DrawWaterPanel(
             }
             BeginWaterRegenerativeSettingLabels(
                 manualPathSourceInRun);
-            DrawWaterTrailProfileSelector(runtimeState, viewport);
-            DrawWaterTrailStyleEditor(runtimeState, viewport, ViewedGlobalWaterTrailProfile(*runtimeState));
+            // With a Flow source selected the panel shows and edits that
+            // source's resolved Trail profile; edits save into its object
+            // copy. Without a selection it edits the global profile.
+            auto* trailEditEmitter = SelectedWaterEmitter(runtimeState);
+            WaterManualFlowPathSource* trailEditManualPath =
+                trailEditEmitter == nullptr && manualPathSourceSelected &&
+                        !water.manualFlowPathEditor.active
+                    ? &water.manualFlowPaths
+                          [water.selectedManualFlowPathIndex.value()]
+                    : nullptr;
+            if (trailEditEmitter != nullptr) {
+                DrawWaterFlowObjectEditCaption(
+                    water.trailProfiles,
+                    water.selectedTrailProfileName,
+                    trailEditEmitter->trailProfileName,
+                    trailEditEmitter->id,
+                    WaterFlowSourceDisplayName(trailEditEmitter->name, trailEditEmitter->id));
+                DrawWaterTrailStyleEditorForSource(
+                    runtimeState,
+                    &trailEditEmitter->trailProfileName,
+                    trailEditEmitter->id,
+                    WaterFlowSourceDisplayName(trailEditEmitter->name, trailEditEmitter->id),
+                    ResolveEmitterWaterTrailProfile(*runtimeState, *trailEditEmitter));
+            } else if (trailEditManualPath != nullptr) {
+                DrawWaterFlowObjectEditCaption(
+                    water.trailProfiles,
+                    water.selectedTrailProfileName,
+                    trailEditManualPath->trailProfileName,
+                    trailEditManualPath->id,
+                    WaterFlowSourceDisplayName(trailEditManualPath->name, trailEditManualPath->id));
+                DrawWaterTrailStyleEditorForSource(
+                    runtimeState,
+                    &trailEditManualPath->trailProfileName,
+                    trailEditManualPath->id,
+                    WaterFlowSourceDisplayName(trailEditManualPath->name, trailEditManualPath->id),
+                    ResolveManualFlowPathTrailProfile(*runtimeState, *trailEditManualPath));
+            } else {
+                DrawWaterTrailProfileSelector(runtimeState, viewport);
+                DrawWaterTrailStyleEditor(runtimeState, viewport, ViewedGlobalWaterTrailProfile(*runtimeState));
+            }
             if (ImGui::Button("Regenerate Trails")) {
                 QueueWaterFlowTrailRefresh(
                     runtimeState,

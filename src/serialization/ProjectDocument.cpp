@@ -7202,11 +7202,37 @@ WaterTrailGeometrySettings ParseWaterTrailGeometrySettings(const json& settingsJ
     return settings;
 }
 
+// Object-copy metadata is emitted only for object-specific copies so shared
+// base profiles keep their pre-schema-68/23 shape byte for byte.
+template <typename ProfileDocument>
+void SerializeWaterProfileObjectCopyFields(
+    const ProfileDocument& profile,
+    json* profileJson) {
+    if (!profile.objectOverride) {
+        return;
+    }
+    (*profileJson)["object_override"] = true;
+    (*profileJson)["owner_object_id"] = profile.ownerObjectId;
+    (*profileJson)["base_profile_name"] = profile.baseProfileName;
+}
+
+template <typename ProfileDocument>
+void ParseWaterProfileObjectCopyFields(
+    const json& profileJson,
+    ProfileDocument* profile) {
+    profile->objectOverride = profileJson.value("object_override", false);
+    profile->ownerObjectId = profileJson.value("owner_object_id", 0U);
+    profile->baseProfileName =
+        profileJson.value("base_profile_name", std::string{});
+}
+
 json SerializeWaterPathProfile(const WaterPathProfileDocument& profile) {
-    return json{
+    json profileJson{
         {"name", profile.name},
         {"settings", SerializeWaterPathGenerationSettings(profile.settings)},
     };
+    SerializeWaterProfileObjectCopyFields(profile, &profileJson);
+    return profileJson;
 }
 
 WaterPathProfileDocument ParseWaterPathProfile(const json& profileJson) {
@@ -7215,14 +7241,17 @@ WaterPathProfileDocument ParseWaterPathProfile(const json& profileJson) {
     if (profileJson.contains("settings")) {
         profile.settings = ParseWaterPathGenerationSettings(profileJson.at("settings"));
     }
+    ParseWaterProfileObjectCopyFields(profileJson, &profile);
     return profile;
 }
 
 json SerializeWaterLaneProfile(const WaterLaneProfileDocument& profile) {
-    return json{
+    json profileJson{
         {"name", profile.name},
         {"settings", SerializeWaterFlowTrailSettings(profile.settings)},
     };
+    SerializeWaterProfileObjectCopyFields(profile, &profileJson);
+    return profileJson;
 }
 
 WaterLaneProfileDocument ParseWaterLaneProfile(const json& profileJson) {
@@ -7231,15 +7260,18 @@ WaterLaneProfileDocument ParseWaterLaneProfile(const json& profileJson) {
     if (profileJson.contains("settings")) {
         profile.settings = ParseWaterFlowTrailSettings(profileJson.at("settings"));
     }
+    ParseWaterProfileObjectCopyFields(profileJson, &profile);
     return profile;
 }
 
 json SerializeWaterTrailProfile(const WaterTrailProfileDocument& profile) {
-    return json{
+    json profileJson{
         {"name", profile.name},
         {"geometry", SerializeWaterTrailGeometrySettings(profile.geometry)},
         {"style", SerializePointCloudStyle(profile.style)},
     };
+    SerializeWaterProfileObjectCopyFields(profile, &profileJson);
+    return profileJson;
 }
 
 WaterTrailProfileDocument ParseWaterTrailProfile(const json& profileJson) {
@@ -7251,6 +7283,7 @@ WaterTrailProfileDocument ParseWaterTrailProfile(const json& profileJson) {
     if (profileJson.contains("style")) {
         profile.style = ParsePointCloudStyle(profileJson.at("style"));
     }
+    ParseWaterProfileObjectCopyFields(profileJson, &profile);
     return profile;
 }
 

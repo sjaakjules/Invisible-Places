@@ -3317,3 +3317,111 @@ TEST_CASE("Staged document bundle creates a new target without requiring an orig
   std::getline(input, contents);
   CHECK(contents == "new-animation");
 }
+
+TEST_CASE("Flow profile object copies round-trip owner metadata",
+          "[project][serialization][water][flow-profiles]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::LoadWaterSourcesDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::serialization::SaveWaterSourcesDocument;
+  using invisible_places::serialization::WaterLaneProfileDocument;
+  using invisible_places::serialization::WaterPathProfileDocument;
+  using invisible_places::serialization::WaterSourcesDocument;
+  using invisible_places::serialization::WaterTrailProfileDocument;
+
+  WaterPathProfileDocument basePath;
+  basePath.name = "Rocky";
+  basePath.settings.branching = 0.31F;
+  WaterPathProfileDocument springPath;
+  springPath.name = "Rocky_Spring";
+  springPath.settings.branching = 0.84F;
+  springPath.objectOverride = true;
+  springPath.ownerObjectId = 19U;
+  springPath.baseProfileName = "Rocky";
+
+  WaterLaneProfileDocument creekLanes;
+  creekLanes.name = "Default_Creek bend";
+  creekLanes.settings.laneCount = 9U;
+  creekLanes.settings.speedMetersPerSecond = 0.82F;
+  creekLanes.objectOverride = true;
+  creekLanes.ownerObjectId = 31U;
+  creekLanes.baseProfileName = "Default";
+
+  WaterTrailProfileDocument springTrail;
+  springTrail.name = "Fine Silver_Spring";
+  springTrail.geometry.widthMeters = 0.021F;
+  springTrail.objectOverride = true;
+  springTrail.ownerObjectId = 19U;
+  springTrail.baseProfileName = "Fine Silver";
+
+  ProjectDocument project;
+  project.projectName = "flow-object-profiles";
+  project.waterPathProfiles = {basePath, springPath};
+  project.waterLaneProfiles = {creekLanes};
+  project.waterTrailProfiles = {springTrail};
+
+  TemporaryProjectFile projectFile{
+      "invisible_places_flow_object_profiles.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(project, projectFile.path, &errorMessage));
+
+  {
+    std::ifstream savedInput{projectFile.path};
+    REQUIRE(savedInput.is_open());
+    const auto savedJson = nlohmann::json::parse(savedInput);
+    REQUIRE(savedJson.at("water_path_profiles").size() == 2U);
+    // Shared base profiles keep their pre-schema-68 shape.
+    CHECK_FALSE(savedJson.at("water_path_profiles")[0].contains("object_override"));
+    CHECK(savedJson.at("water_path_profiles")[1].at("object_override") == true);
+    CHECK(savedJson.at("water_path_profiles")[1].at("owner_object_id") == 19U);
+    CHECK(savedJson.at("water_path_profiles")[1].at("base_profile_name") == "Rocky");
+  }
+
+  const auto loaded = LoadProjectDocument(projectFile.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  CHECK(loaded->schemaVersion == kProjectDocumentSchemaVersion);
+  REQUIRE(loaded->waterPathProfiles.size() == 2U);
+  CHECK_FALSE(loaded->waterPathProfiles[0].objectOverride);
+  CHECK(loaded->waterPathProfiles[0].baseProfileName.empty());
+  CHECK(loaded->waterPathProfiles[1].name == "Rocky_Spring");
+  CHECK(loaded->waterPathProfiles[1].objectOverride);
+  CHECK(loaded->waterPathProfiles[1].ownerObjectId == 19U);
+  CHECK(loaded->waterPathProfiles[1].baseProfileName == "Rocky");
+  CHECK(loaded->waterPathProfiles[1].settings.branching == Catch::Approx(0.84F));
+  REQUIRE(loaded->waterLaneProfiles.size() == 1U);
+  CHECK(loaded->waterLaneProfiles[0].objectOverride);
+  CHECK(loaded->waterLaneProfiles[0].ownerObjectId == 31U);
+  CHECK(loaded->waterLaneProfiles[0].baseProfileName == "Default");
+  CHECK(loaded->waterLaneProfiles[0].settings.laneCount == 9U);
+  REQUIRE(loaded->waterTrailProfiles.size() == 1U);
+  CHECK(loaded->waterTrailProfiles[0].objectOverride);
+  CHECK(loaded->waterTrailProfiles[0].ownerObjectId == 19U);
+  CHECK(loaded->waterTrailProfiles[0].baseProfileName == "Fine Silver");
+  CHECK(loaded->waterTrailProfiles[0].geometry.widthMeters ==
+        Catch::Approx(0.021F));
+
+  WaterSourcesDocument sources;
+  sources.pathProfiles = {basePath, springPath};
+  sources.laneProfiles = {creekLanes};
+  sources.trailProfiles = {springTrail};
+  TemporaryProjectFile sourcesFile{
+      "invisible_places_flow_object_profiles_sources.json"};
+  REQUIRE(SaveWaterSourcesDocument(sources, sourcesFile.path, &errorMessage));
+  const auto loadedSources =
+      LoadWaterSourcesDocument(sourcesFile.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loadedSources.has_value());
+  CHECK(loadedSources->schemaVersion == kWaterSourcesDocumentSchemaVersion);
+  REQUIRE(loadedSources->pathProfiles.size() == 2U);
+  CHECK_FALSE(loadedSources->pathProfiles[0].objectOverride);
+  CHECK(loadedSources->pathProfiles[1].objectOverride);
+  CHECK(loadedSources->pathProfiles[1].ownerObjectId == 19U);
+  CHECK(loadedSources->pathProfiles[1].baseProfileName == "Rocky");
+  REQUIRE(loadedSources->laneProfiles.size() == 1U);
+  CHECK(loadedSources->laneProfiles[0].objectOverride);
+  REQUIRE(loadedSources->trailProfiles.size() == 1U);
+  CHECK(loadedSources->trailProfiles[0].objectOverride);
+  CHECK(loadedSources->trailProfiles[0].baseProfileName == "Fine Silver");
+}

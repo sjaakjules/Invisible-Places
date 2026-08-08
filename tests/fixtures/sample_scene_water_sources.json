@@ -1,5 +1,5 @@
 {
-  "schema_version": 22,
+  "schema_version": 23,
   "fixture_metadata": {
     "scene_group": "SampleScene",
     "display_spacing_micrometres": 3000,

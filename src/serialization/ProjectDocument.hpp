@@ -22,8 +22,8 @@
 namespace invisible_places::serialization {
 
 inline constexpr std::size_t kMaxSerializedWaterRippleRuntimeCacheMemberships = 250'000U;
-inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 67U;
-inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 22U;
+inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 68U;
+inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 23U;
 inline constexpr std::uint32_t kWaterOwnedShorelineProjectSchemaVersion = 66U;
 inline constexpr std::uint32_t kWaterOwnedShorelineSourcesSchemaVersion = 22U;
 inline constexpr std::uint32_t kAnimationDocumentSchemaVersion = 19U;
@@ -62,20 +62,32 @@ struct WaterAnimationTrailProfileDocument {
     invisible_places::water::WaterAnimationTrailSettings settings{};
 };
 
+// Object-specific Flow profile copies carry their owning source id and the
+// shared base profile they derive from. Any Flow object may reference another
+// object's copy by name, but only the owner's edits rewrite it.
 struct WaterPathProfileDocument {
     std::string name = "Default";
     invisible_places::water::WaterPathGenerationSettings settings{};
+    bool objectOverride = false;
+    std::uint32_t ownerObjectId = 0U;
+    std::string baseProfileName;
 };
 
 struct WaterLaneProfileDocument {
     std::string name = "Default";
     invisible_places::water::WaterFlowTrailSettings settings{};
+    bool objectOverride = false;
+    std::uint32_t ownerObjectId = 0U;
+    std::string baseProfileName;
 };
 
 struct WaterTrailProfileDocument {
     std::string name = "Default";
     invisible_places::water::WaterTrailGeometrySettings geometry{};
     invisible_places::renderer::pointcloud::PointCloudStyleState style{};
+    bool objectOverride = false;
+    std::uint32_t ownerObjectId = 0U;
+    std::string baseProfileName;
 };
 
 struct WaterRippleRuntimeCacheDocument {
