@@ -518,6 +518,10 @@ struct WaterKeyableSettingInfo {
     float minimum = 0.0F;
     float maximum = 1.0F;
     float defaultValue = 1.0F;
+    // Large parameter surfaces such as Rain stay discoverable beside their
+    // authored controls without filling an empty timeline with dozens of
+    // guides. Once keyed, these settings appear in the graph normally.
+    bool showUnauthoredInTimeline = true;
 };
 
 [[nodiscard]] std::span<const WaterKeyableSettingInfo> WaterKeyableSettings(
@@ -1617,6 +1621,13 @@ struct WaterDynamicMeshFlowDiagnostics {
 [[nodiscard]] std::string_view WaterRainIntensityPresetNameForStorage(WaterRainIntensityPreset preset);
 [[nodiscard]] std::optional<WaterRainIntensityPreset> ParseWaterRainIntensityPresetName(std::string_view value);
 [[nodiscard]] WaterRainSettings DefaultWaterRainSettings();
+// Applies Rain's active scalar tracks to a per-frame copy. Every supported
+// value maps to an existing GPU/offline runtime parameter; authored settings,
+// collision caches, particle capacities, and topology remain untouched.
+void ApplyWaterFeatureTimingOverlayToRainSettings(
+    const WaterFeatureTimingOverlay& overlay,
+    WaterRainSettings* settings,
+    WaterRainVisualSettings* visual);
 [[nodiscard]] WaterDynamicMeshFlowSettings DefaultWaterDynamicMeshFlowSettings();
 [[nodiscard]] WaterDynamicMeshFlowSettings SanitizeWaterDynamicMeshFlowSettings(
     WaterDynamicMeshFlowSettings settings);

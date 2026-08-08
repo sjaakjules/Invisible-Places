@@ -1070,6 +1070,147 @@ TEST_CASE("Authored water response settings are keyable and overlays stay transi
     CHECK(mesh.moisturePersistenceMultiplier == Approx(2.0F));
 }
 
+TEST_CASE("Rain runtime uniforms key smoothly without changing authored lifecycle state",
+          "[water][rain][timing][keyed]") {
+    using Catch::Approx;
+    using invisible_places::water::ApplyWaterFeatureTimingOverlayToRainSettings;
+    using invisible_places::water::BuildWaterFeatureTimingOverlay;
+    using invisible_places::water::FindWaterKeyableSetting;
+    using invisible_places::water::RainIntensityPreset;
+    using invisible_places::water::WaterFeatureTimingRun;
+    using invisible_places::water::WaterKeyedFeatureKind;
+    using invisible_places::water::WaterKeyedSettingTrack;
+    using invisible_places::water::WaterRainSettings;
+    using invisible_places::water::WaterRainVisualSettings;
+    using invisible_places::water::WaterScenarioInterpolation;
+
+    const auto rainSettings = invisible_places::water::WaterKeyableSettings(
+        WaterKeyedFeatureKind::Rain);
+    CHECK(rainSettings.size() > 40U);
+    const auto* levelInfo = FindWaterKeyableSetting(
+        WaterKeyedFeatureKind::Rain,
+        "level");
+    REQUIRE(levelInfo != nullptr);
+    CHECK(levelInfo->showUnauthoredInTimeline);
+    const auto* densityInfo = FindWaterKeyableSetting(
+        WaterKeyedFeatureKind::Rain,
+        "density");
+    REQUIRE(densityInfo != nullptr);
+    CHECK_FALSE(densityInfo->showUnauthoredInTimeline);
+    for (const char* authoredOnly :
+         {"seed",
+          "particle_limit",
+          "intensity_preset",
+          "spawn_height",
+          "spawn_radius",
+          "camera_death_distance",
+          "impact_effects_enabled"}) {
+        CHECK(
+            FindWaterKeyableSetting(
+                WaterKeyedFeatureKind::Rain,
+                authoredOnly) == nullptr);
+    }
+
+    const auto track = [](const char* settingId,
+                          float first,
+                          float second,
+                          WaterScenarioInterpolation interpolation =
+                              WaterScenarioInterpolation::Linear) {
+        WaterKeyedSettingTrack result;
+        result.settingId = settingId;
+        result.keys = {
+            {.position = 0.0F,
+             .value = first,
+             .interpolation = interpolation},
+            {.position = 1.0F,
+             .value = second,
+             .interpolation = interpolation},
+        };
+        return result;
+    };
+
+    WaterFeatureTimingRun run;
+    run.features.push_back({
+        .feature = {.kind = WaterKeyedFeatureKind::Rain},
+        .settings = {
+            track(
+                "level",
+                0.0F,
+                1.0F,
+                WaterScenarioInterpolation::Smooth),
+            track("density", 0.20F, 1.0F),
+            track("fall_speed", 4.0F, 12.0F),
+            track("visual.width", 0.002F, 0.006F),
+            track("visual.colour_red", 0.2F, 1.0F),
+            track("weather.wind_direction_x", -1.0F, 1.0F),
+            track("weather.wind_speed", 0.0F, 4.0F),
+            track("near_surface.squish", 0.20F, 0.80F),
+            track("effects.wetness_response", 0.0F, 2.0F),
+            track("wetness.spread_speed", 0.50F, 2.50F),
+            track("droplets.propagation", 0.10F, 1.30F),
+            track("rings.band_max_z", 1.0F, 3.0F),
+        },
+    });
+    const std::array runs{run};
+    const auto overlay = BuildWaterFeatureTimingOverlay(runs, 0.25F);
+
+    WaterRainSettings authored;
+    authored.enabled = false;
+    authored.activeParticleCount = 12'345U;
+    authored.seed = 987U;
+    authored.intensityPreset = RainIntensityPreset::HeavyDownpour;
+    authored.spawnHeightMeters = 9.0F;
+    authored.spawnRadiusMeters = 11.0F;
+    authored.cameraDeathDistanceMeters = 42.0F;
+    authored.impactEffectsEnabled = false;
+    WaterRainVisualSettings authoredVisual;
+    authoredVisual.colour = {0.4F, 0.5F, 0.6F};
+    const auto originalAuthored = authored;
+    const auto originalVisual = authoredVisual;
+
+    auto resolved = authored;
+    auto resolvedVisual = authoredVisual;
+    ApplyWaterFeatureTimingOverlayToRainSettings(
+        overlay,
+        &resolved,
+        &resolvedVisual);
+
+    // Smooth Step at one quarter is 0.15625; the remaining tracks are linear.
+    CHECK(resolved.enabled);
+    CHECK(resolved.rainLevel == Approx(0.15625F));
+    CHECK(resolved.density == Approx(0.40F));
+    CHECK(resolved.fallSpeedMetersPerSecond == Approx(6.0F));
+    CHECK(resolved.windDirectionX == Approx(-0.50F));
+    CHECK(resolved.windSpeedMetersPerSecond == Approx(1.0F));
+    CHECK(resolved.nearSurface.squish == Approx(0.35F));
+    CHECK(resolved.rockEffectScale == Approx(0.50F));
+    CHECK(resolved.rockImpact.spreadSpeed == Approx(1.0F));
+    CHECK(
+        resolved.vegetationImpact.propagationMetersPerSecond ==
+        Approx(0.40F));
+    CHECK(resolved.sandImpactBand.maxZ == Approx(1.50F));
+    CHECK(resolvedVisual.widthMeters == Approx(0.003F));
+    CHECK(resolvedVisual.colour[0] == Approx(0.40F));
+
+    CHECK(resolved.activeParticleCount == originalAuthored.activeParticleCount);
+    CHECK(resolved.seed == originalAuthored.seed);
+    CHECK(resolved.intensityPreset == originalAuthored.intensityPreset);
+    CHECK(resolved.spawnHeightMeters == Approx(originalAuthored.spawnHeightMeters));
+    CHECK(resolved.spawnRadiusMeters == Approx(originalAuthored.spawnRadiusMeters));
+    CHECK(
+        resolved.cameraDeathDistanceMeters ==
+        Approx(originalAuthored.cameraDeathDistanceMeters));
+    CHECK(
+        resolved.impactEffectsEnabled ==
+        originalAuthored.impactEffectsEnabled);
+
+    // Evaluation is transient: the project-owned base values stay untouched.
+    CHECK(authored.enabled == originalAuthored.enabled);
+    CHECK(authored.density == Approx(originalAuthored.density));
+    CHECK(authoredVisual.widthMeters == Approx(originalVisual.widthMeters));
+    CHECK(authoredVisual.colour == originalVisual.colour);
+}
+
 TEST_CASE("Per-scenario feature timing runs round-trip through the project document",
           "[water][timing][keyed][serialization]") {
     using Catch::Approx;
@@ -1105,6 +1246,20 @@ TEST_CASE("Per-scenario feature timing runs round-trip through the project docum
             },
         }},
     });
+    run.features.push_back({
+        .feature = {.kind = WaterKeyedFeatureKind::Rain},
+        .settings = {
+            {.settingId = "density",
+             .label = "Density",
+             .keys = {
+                 {.position = 0.0F, .value = 0.10F},
+                 {.position = 1.0F, .value = 0.90F},
+             }},
+            {.settingId = "visual.width",
+             .label = "Width",
+             .keys = {{.position = 0.5F, .value = 0.004F}}},
+        },
+    });
     entry.runs.push_back(run);
     document.waterFeatureTimingRuns.push_back(entry);
     document.waterKeyedSettingsProfiles.push_back({
@@ -1139,7 +1294,7 @@ TEST_CASE("Per-scenario feature timing runs round-trip through the project docum
     const auto& loadedRun = loadedEntry.runs.front();
     CHECK(loadedRun.id == 7U);
     CHECK(loadedRun.name == "Rain + Seeps");
-    REQUIRE(loadedRun.features.size() == 1U);
+    REQUIRE(loadedRun.features.size() == 2U);
     const auto& timeline = loadedRun.features.front();
     CHECK(timeline.feature.kind == WaterKeyedFeatureKind::SeepageNode);
     CHECK(timeline.feature.objectId == 4U);
@@ -1153,6 +1308,14 @@ TEST_CASE("Per-scenario feature timing runs round-trip through the project docum
     CHECK(timeline.settings.front().keys[0].interpolation ==
           WaterScenarioInterpolation::Hold);
     CHECK(timeline.settings.front().keys[1].value == Approx(1.2F));
+    const auto& rainTimeline = loadedRun.features[1U];
+    CHECK(rainTimeline.feature.kind == WaterKeyedFeatureKind::Rain);
+    REQUIRE(rainTimeline.settings.size() == 2U);
+    CHECK(rainTimeline.settings[0].settingId == "density");
+    REQUIRE(rainTimeline.settings[0].keys.size() == 2U);
+    CHECK(rainTimeline.settings[0].keys.back().value == Approx(0.90F));
+    CHECK(rainTimeline.settings[1].settingId == "visual.width");
+    CHECK(rainTimeline.settings[1].keys.front().value == Approx(0.004F));
     CHECK(loaded->waterFeatureTimingRunSequence == 8U);
     REQUIRE(loaded->waterKeyedSettingsProfiles.size() == 1U);
     const auto& keyedProfile =

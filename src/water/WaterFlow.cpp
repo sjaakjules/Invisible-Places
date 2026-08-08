@@ -7715,6 +7715,337 @@ constexpr std::array<WaterKeyableSettingInfo, 1> kWaterGlobalLevelSettings{{
      .defaultValue = 1.0F},
 }};
 
+// Rain simulation, appearance, weather, and impact response all live in
+// persistent GPU buffers and frame uniforms. These scalar controls can
+// therefore be sampled per frame without reseeding particles or rebuilding
+// the collision cache. Discrete presets/toggles, particle capacity, seed,
+// and spawn/death bounds intentionally remain authored-only.
+constexpr WaterKeyableSettingInfo kWaterRainSettings[]{
+    {.id = "level",
+     .label = "Rain Amount",
+     .minimum = 0.0F,
+     .maximum = 1.0F,
+     .defaultValue = 1.0F},
+    {.id = "density",
+     .label = "Density",
+     .minimum = 0.0F,
+     .maximum = 1.0F,
+     .defaultValue = 0.55F,
+     .showUnauthoredInTimeline = false},
+    {.id = "fall_speed",
+     .label = "Fall Speed",
+     .minimum = 0.2F,
+     .maximum = 35.0F,
+     .defaultValue = 8.0F,
+     .showUnauthoredInTimeline = false},
+    {.id = "drop_scale",
+     .label = "Drop Scale",
+     .minimum = 0.2F,
+     .maximum = 4.0F,
+     .defaultValue = 1.0F,
+     .showUnauthoredInTimeline = false},
+    {.id = "visibility",
+     .label = "Visibility",
+     .minimum = 0.0F,
+     .maximum = 3.0F,
+     .defaultValue = 1.0F,
+     .showUnauthoredInTimeline = false},
+    {.id = "glow",
+     .label = "Glow",
+     .minimum = 0.0F,
+     .maximum = 4.0F,
+     .defaultValue = 1.0F,
+     .showUnauthoredInTimeline = false},
+    {.id = "visual.colour_red",
+     .label = "Colour Red",
+     .minimum = 0.0F,
+     .maximum = 1.0F,
+     .defaultValue = 0.68F,
+     .showUnauthoredInTimeline = false},
+    {.id = "visual.colour_green",
+     .label = "Colour Green",
+     .minimum = 0.0F,
+     .maximum = 1.0F,
+     .defaultValue = 0.82F,
+     .showUnauthoredInTimeline = false},
+    {.id = "visual.colour_blue",
+     .label = "Colour Blue",
+     .minimum = 0.0F,
+     .maximum = 1.0F,
+     .defaultValue = 0.92F,
+     .showUnauthoredInTimeline = false},
+    {.id = "visual.width",
+     .label = "Width",
+     .minimum = 0.0003F,
+     .maximum = 0.020F,
+     .defaultValue = 0.003F,
+     .showUnauthoredInTimeline = false},
+    {.id = "visual.streak_length",
+     .label = "Streak Length",
+     .minimum = 0.005F,
+     .maximum = 0.80F,
+     .defaultValue = 0.16F,
+     .showUnauthoredInTimeline = false},
+    {.id = "visual.softness",
+     .label = "Softness",
+     .minimum = 0.0F,
+     .maximum = 1.0F,
+     .defaultValue = 0.42F,
+     .showUnauthoredInTimeline = false},
+    {.id = "visual.opacity",
+     .label = "Opacity",
+     .minimum = 0.0F,
+     .maximum = 1.0F,
+     .defaultValue = 0.58F,
+     .showUnauthoredInTimeline = false},
+    {.id = "visual.emission",
+     .label = "Emission",
+     .minimum = 0.0F,
+     .maximum = 2.0F,
+     .defaultValue = 0.16F,
+     .showUnauthoredInTimeline = false},
+    {.id = "visual.minimum_pixels",
+     .label = "Minimum Pixels",
+     .minimum = 0.0F,
+     .maximum = 3.0F,
+     .defaultValue = 0.65F,
+     .showUnauthoredInTimeline = false},
+    {.id = "visual.maximum_pixels",
+     .label = "Maximum Pixels",
+     .minimum = 0.5F,
+     .maximum = 12.0F,
+     .defaultValue = 4.0F,
+     .showUnauthoredInTimeline = false},
+    {.id = "weather.wind_direction_x",
+     .label = "Wind Direction X",
+     .minimum = -1.0F,
+     .maximum = 1.0F,
+     .defaultValue = 1.0F,
+     .showUnauthoredInTimeline = false},
+    {.id = "weather.wind_direction_y",
+     .label = "Wind Direction Y",
+     .minimum = -1.0F,
+     .maximum = 1.0F,
+     .defaultValue = 0.0F,
+     .showUnauthoredInTimeline = false},
+    {.id = "weather.wind_speed",
+     .label = "Wind Speed",
+     .minimum = 0.0F,
+     .maximum = 8.0F,
+     .defaultValue = 0.30F,
+     .showUnauthoredInTimeline = false},
+    {.id = "weather.turbulence",
+     .label = "Turbulence",
+     .minimum = 0.0F,
+     .maximum = 2.0F,
+     .defaultValue = 0.45F,
+     .showUnauthoredInTimeline = false},
+    {.id = "weather.gust_strength",
+     .label = "Gust Strength",
+     .minimum = 0.0F,
+     .maximum = 1.5F,
+     .defaultValue = 0.35F,
+     .showUnauthoredInTimeline = false},
+    {.id = "weather.gust_scale",
+     .label = "Gust Scale",
+     .minimum = 0.2F,
+     .maximum = 50.0F,
+     .defaultValue = 8.0F,
+     .showUnauthoredInTimeline = false},
+    {.id = "weather.gust_speed",
+     .label = "Gust Speed",
+     .minimum = 0.0F,
+     .maximum = 12.0F,
+     .defaultValue = 2.5F,
+     .showUnauthoredInTimeline = false},
+    {.id = "weather.front_strength",
+     .label = "Front Strength",
+     .minimum = 0.0F,
+     .maximum = 1.0F,
+     .defaultValue = 0.40F,
+     .showUnauthoredInTimeline = false},
+    {.id = "weather.front_scale",
+     .label = "Front Scale",
+     .minimum = 0.5F,
+     .maximum = 100.0F,
+     .defaultValue = 12.0F,
+     .showUnauthoredInTimeline = false},
+    {.id = "weather.front_speed",
+     .label = "Front Speed",
+     .minimum = 0.0F,
+     .maximum = 12.0F,
+     .defaultValue = 1.5F,
+     .showUnauthoredInTimeline = false},
+    {.id = "effects.rings_response",
+     .label = "Rings Response",
+     .minimum = 0.0F,
+     .maximum = 3.0F,
+     .defaultValue = 1.0F,
+     .showUnauthoredInTimeline = false},
+    {.id = "effects.ring_thickness",
+     .label = "Ring Thickness",
+     .minimum = 0.25F,
+     .maximum = 2.0F,
+     .defaultValue = 1.0F,
+     .showUnauthoredInTimeline = false},
+    {.id = "effects.wetness_response",
+     .label = "Wetness Response",
+     .minimum = 0.0F,
+     .maximum = 3.0F,
+     .defaultValue = 1.0F,
+     .showUnauthoredInTimeline = false},
+    {.id = "effects.droplets_response",
+     .label = "Droplets Response",
+     .minimum = 0.0F,
+     .maximum = 3.0F,
+     .defaultValue = 1.0F,
+     .showUnauthoredInTimeline = false},
+    {.id = "near_surface.approach_distance",
+     .label = "Approach Distance",
+     .minimum = 0.01F,
+     .maximum = 1.0F,
+     .defaultValue = 0.18F,
+     .showUnauthoredInTimeline = false},
+    {.id = "near_surface.minimum_speed",
+     .label = "Minimum Speed",
+     .minimum = 0.05F,
+     .maximum = 1.0F,
+     .defaultValue = 0.30F,
+     .showUnauthoredInTimeline = false},
+    {.id = "near_surface.squish",
+     .label = "Squish",
+     .minimum = 0.0F,
+     .maximum = 1.0F,
+     .defaultValue = 0.65F,
+     .showUnauthoredInTimeline = false},
+    {.id = "near_surface.normal_alignment",
+     .label = "Normal Alignment",
+     .minimum = 0.0F,
+     .maximum = 1.0F,
+     .defaultValue = 0.75F,
+     .showUnauthoredInTimeline = false},
+    {.id = "rings.band_min_z",
+     .label = "Rings Band Min Z",
+     .minimum = -2.0F,
+     .maximum = 12.0F,
+     .defaultValue = -2.0F,
+     .showUnauthoredInTimeline = false},
+    {.id = "rings.band_max_z",
+     .label = "Rings Band Max Z",
+     .minimum = -2.0F,
+     .maximum = 12.0F,
+     .defaultValue = 2.0F,
+     .showUnauthoredInTimeline = false},
+    {.id = "rings.band_fade",
+     .label = "Rings Band Fade",
+     .minimum = 0.01F,
+     .maximum = 2.0F,
+     .defaultValue = 0.30F,
+     .showUnauthoredInTimeline = false},
+    {.id = "wetness.edge_breakup",
+     .label = "Wetness Edge Breakup",
+     .minimum = 0.0F,
+     .maximum = 1.0F,
+     .defaultValue = 0.35F,
+     .showUnauthoredInTimeline = false},
+    {.id = "wetness.spread_speed",
+     .label = "Wetness Spread Speed",
+     .minimum = 0.25F,
+     .maximum = 3.0F,
+     .defaultValue = 1.60F,
+     .showUnauthoredInTimeline = false},
+    {.id = "wetness.centre_falloff",
+     .label = "Wetness Centre Falloff",
+     .minimum = 0.0F,
+     .maximum = 1.0F,
+     .defaultValue = 0.65F,
+     .showUnauthoredInTimeline = false},
+    {.id = "wetness.height_bias",
+     .label = "Wetness Height Bias",
+     .minimum = 0.0F,
+     .maximum = 2.0F,
+     .defaultValue = 0.75F,
+     .showUnauthoredInTimeline = false},
+    {.id = "wetness.persistence",
+     .label = "Wetness Persistence",
+     .minimum = 0.25F,
+     .maximum = 3.0F,
+     .defaultValue = 1.35F,
+     .showUnauthoredInTimeline = false},
+    {.id = "wetness.downhill_stretch",
+     .label = "Wetness Downhill Stretch",
+     .minimum = 0.0F,
+     .maximum = 2.0F,
+     .defaultValue = 1.0F,
+     .showUnauthoredInTimeline = false},
+    {.id = "wetness.band_min_z",
+     .label = "Wetness Band Min Z",
+     .minimum = -2.0F,
+     .maximum = 12.0F,
+     .defaultValue = 1.5F,
+     .showUnauthoredInTimeline = false},
+    {.id = "wetness.band_max_z",
+     .label = "Wetness Band Max Z",
+     .minimum = -2.0F,
+     .maximum = 12.0F,
+     .defaultValue = 2.4F,
+     .showUnauthoredInTimeline = false},
+    {.id = "wetness.band_fade",
+     .label = "Wetness Band Fade",
+     .minimum = 0.01F,
+     .maximum = 2.0F,
+     .defaultValue = 0.30F,
+     .showUnauthoredInTimeline = false},
+    {.id = "droplets.twinkle",
+     .label = "Droplets Twinkle",
+     .minimum = 0.0F,
+     .maximum = 4.0F,
+     .defaultValue = 1.80F,
+     .showUnauthoredInTimeline = false},
+    {.id = "droplets.propagation",
+     .label = "Droplets Propagation",
+     .minimum = 0.05F,
+     .maximum = 3.0F,
+     .defaultValue = 0.65F,
+     .showUnauthoredInTimeline = false},
+    {.id = "droplets.hop_spacing",
+     .label = "Droplets Hop Spacing",
+     .minimum = 0.01F,
+     .maximum = 0.30F,
+     .defaultValue = 0.070F,
+     .showUnauthoredInTimeline = false},
+    {.id = "droplets.stream_width",
+     .label = "Droplets Stream Width",
+     .minimum = 0.001F,
+     .maximum = 0.08F,
+     .defaultValue = 0.010F,
+     .showUnauthoredInTimeline = false},
+    {.id = "droplets.stream_spread",
+     .label = "Droplets Stream Spread",
+     .minimum = 0.0F,
+     .maximum = 2.0F,
+     .defaultValue = 0.65F,
+     .showUnauthoredInTimeline = false},
+    {.id = "droplets.band_min_z",
+     .label = "Droplets Band Min Z",
+     .minimum = -2.0F,
+     .maximum = 12.0F,
+     .defaultValue = 2.5F,
+     .showUnauthoredInTimeline = false},
+    {.id = "droplets.band_max_z",
+     .label = "Droplets Band Max Z",
+     .minimum = -2.0F,
+     .maximum = 12.0F,
+     .defaultValue = 12.0F,
+     .showUnauthoredInTimeline = false},
+    {.id = "droplets.band_fade",
+     .label = "Droplets Band Fade",
+     .minimum = 0.01F,
+     .maximum = 2.0F,
+     .defaultValue = 0.30F,
+     .showUnauthoredInTimeline = false},
+};
+
 constexpr std::array<WaterKeyableSettingInfo, 5> kWaterMeshFlowSettings{{
     // Keep "level" as the stable identity for existing Timings-v2 tracks;
     // authored Mesh Flow now calls the same parameter Activity.
@@ -7866,6 +8197,7 @@ std::span<const WaterKeyableSettingInfo> WaterKeyableSettings(
     WaterKeyedFeatureKind kind) {
     switch (kind) {
         case WaterKeyedFeatureKind::Rain:
+            return kWaterRainSettings;
         case WaterKeyedFeatureKind::Shoreline:
             return kWaterGlobalLevelSettings;
         case WaterKeyedFeatureKind::MeshFlow:
@@ -7896,6 +8228,117 @@ const WaterKeyableSettingInfo* FindWaterKeyableSetting(
         }
     }
     return nullptr;
+}
+
+void ApplyWaterFeatureTimingOverlayToRainSettings(
+    const WaterFeatureTimingOverlay& overlay,
+    WaterRainSettings* settings,
+    WaterRainVisualSettings* visual) {
+    const WaterKeyedFeatureId feature{
+        .kind = WaterKeyedFeatureKind::Rain,
+    };
+    const auto apply = [&](std::string_view settingId, float* target) {
+        if (target == nullptr) {
+            return false;
+        }
+        const auto* value = overlay.Find(feature, settingId);
+        const auto* info = FindWaterKeyableSetting(feature.kind, settingId);
+        if (value == nullptr || info == nullptr) {
+            return false;
+        }
+        *target = std::clamp(
+            SeepageFiniteOr(*value, info->defaultValue),
+            info->minimum,
+            info->maximum);
+        return true;
+    };
+
+    if (settings != nullptr) {
+        if (apply("level", &settings->rainLevel)) {
+            // A keyed zero is still an active Rain runtime: it stops births
+            // while allowing impacts emitted by earlier frames to finish.
+            settings->enabled = true;
+        }
+        apply("density", &settings->density);
+        apply("fall_speed", &settings->fallSpeedMetersPerSecond);
+        apply("drop_scale", &settings->dropletSizeScale);
+        apply("visibility", &settings->opacityScale);
+        apply("glow", &settings->emissionScale);
+        apply("weather.wind_direction_x", &settings->windDirectionX);
+        apply("weather.wind_direction_y", &settings->windDirectionY);
+        apply("weather.wind_speed", &settings->windSpeedMetersPerSecond);
+        apply("weather.turbulence", &settings->turbulence);
+        apply("weather.gust_strength", &settings->gustStrength);
+        apply("weather.gust_scale", &settings->gustScaleMeters);
+        apply("weather.gust_speed", &settings->gustSpeedMetersPerSecond);
+        apply("weather.front_strength", &settings->weatherFrontStrength);
+        apply("weather.front_scale", &settings->weatherFrontScaleMeters);
+        apply("weather.front_speed", &settings->weatherFrontSpeedMetersPerSecond);
+        apply("effects.rings_response", &settings->sandEffectScale);
+        apply("effects.ring_thickness", &settings->ringImpact.thicknessScale);
+        apply("effects.wetness_response", &settings->rockEffectScale);
+        apply("effects.droplets_response", &settings->vegetationEffectScale);
+        apply(
+            "near_surface.approach_distance",
+            &settings->nearSurface.approachDistanceMeters);
+        apply(
+            "near_surface.minimum_speed",
+            &settings->nearSurface.minimumSpeedFactor);
+        apply("near_surface.squish", &settings->nearSurface.squish);
+        apply(
+            "near_surface.normal_alignment",
+            &settings->nearSurface.normalAlignment);
+        apply("rings.band_min_z", &settings->sandImpactBand.minZ);
+        apply("rings.band_max_z", &settings->sandImpactBand.maxZ);
+        apply("rings.band_fade", &settings->sandImpactBand.fadeMeters);
+        apply("wetness.edge_breakup", &settings->rockImpact.edgeBreakup);
+        apply("wetness.spread_speed", &settings->rockImpact.spreadSpeed);
+        apply("wetness.centre_falloff", &settings->rockImpact.centreFalloff);
+        apply("wetness.height_bias", &settings->rockImpact.heightBias);
+        apply("wetness.persistence", &settings->rockImpact.persistence);
+        apply("wetness.downhill_stretch", &settings->rockImpact.downhillStretch);
+        apply("wetness.band_min_z", &settings->rockImpactBand.minZ);
+        apply("wetness.band_max_z", &settings->rockImpactBand.maxZ);
+        apply("wetness.band_fade", &settings->rockImpactBand.fadeMeters);
+        apply("droplets.twinkle", &settings->vegetationImpact.twinkle);
+        apply(
+            "droplets.propagation",
+            &settings->vegetationImpact.propagationMetersPerSecond);
+        apply(
+            "droplets.hop_spacing",
+            &settings->vegetationImpact.hopSpacingMeters);
+        apply(
+            "droplets.stream_width",
+            &settings->vegetationImpact.streamWidthMeters);
+        apply(
+            "droplets.stream_spread",
+            &settings->vegetationImpact.streamSpread);
+        apply("droplets.band_min_z", &settings->vegetationImpactBand.minZ);
+        apply("droplets.band_max_z", &settings->vegetationImpactBand.maxZ);
+        apply("droplets.band_fade", &settings->vegetationImpactBand.fadeMeters);
+        settings->sandImpactBand =
+            SanitizeRainImpactHeightBand(settings->sandImpactBand);
+        settings->rockImpactBand =
+            SanitizeRainImpactHeightBand(settings->rockImpactBand);
+        settings->vegetationImpactBand =
+            SanitizeRainImpactHeightBand(settings->vegetationImpactBand);
+    }
+
+    if (visual != nullptr) {
+        apply("visual.colour_red", &visual->colour[0]);
+        apply("visual.colour_green", &visual->colour[1]);
+        apply("visual.colour_blue", &visual->colour[2]);
+        apply("visual.width", &visual->widthMeters);
+        apply("visual.streak_length", &visual->streakLengthMeters);
+        apply("visual.softness", &visual->softness);
+        apply("visual.opacity", &visual->opacity);
+        apply("visual.emission", &visual->emission);
+        apply("visual.minimum_pixels", &visual->minimumScreenPixels);
+        apply("visual.maximum_pixels", &visual->maximumScreenPixels);
+        visual->maximumScreenPixels = std::max(
+            visual->minimumScreenPixels,
+            visual->maximumScreenPixels);
+    }
 }
 
 std::string_view WaterKeyedFeatureKindLabel(WaterKeyedFeatureKind kind) {
