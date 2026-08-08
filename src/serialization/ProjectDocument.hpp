@@ -22,11 +22,11 @@
 namespace invisible_places::serialization {
 
 inline constexpr std::size_t kMaxSerializedWaterRippleRuntimeCacheMemberships = 250'000U;
-inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 66U;
+inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 67U;
 inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 22U;
 inline constexpr std::uint32_t kWaterOwnedShorelineProjectSchemaVersion = 66U;
 inline constexpr std::uint32_t kWaterOwnedShorelineSourcesSchemaVersion = 22U;
-inline constexpr std::uint32_t kAnimationDocumentSchemaVersion = 16U;
+inline constexpr std::uint32_t kAnimationDocumentSchemaVersion = 19U;
 inline constexpr std::uint32_t kWaterPathCacheSidecarSchemaVersion = 1U;
 inline constexpr std::uint64_t kMaximumPersistedWaterCacheBytes = 5ULL * 1024ULL * 1024ULL * 1024ULL;
 
@@ -147,6 +147,9 @@ struct ProjectDocument {
     struct SavedAnimation {
         std::filesystem::path filePath;
         std::vector<std::filesystem::path> associatedLayerPaths;
+        std::optional<
+            invisible_places::camera::AnimationVelocityBlendLinkMetadata>
+            velocityBlendLink;
     };
 
     std::uint32_t schemaVersion = kProjectDocumentSchemaVersion;

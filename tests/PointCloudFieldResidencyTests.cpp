@@ -246,8 +246,9 @@ TEST_CASE("Used scalar field sets aggregate bindings and Visual Features",
     mapped.fieldMap.fieldName = "Height";
     used.AddBinding(mapped);
 
-    // A binding parked on Constant still contributes its remembered field:
-    // flipping the mode back must not wait on a disk load.
+    // A binding parked on Constant keeps its authored mapping but does not
+    // pin a point-count-sized column. Switching it back uses the on-demand
+    // loader.
     invisible_places::style::RenderParameterBinding constant;
     constant.mode = invisible_places::style::ParameterSourceMode::Constant;
     constant.fieldMap.fieldName = "A_Slope_deg";
@@ -269,33 +270,29 @@ TEST_CASE("Used scalar field sets aggregate bindings and Visual Features",
     normalEffect.field.scalarFieldName = "IgnoredForNormals";
     used.AddColouriseEffect(normalEffect);
 
-    REQUIRE(used.Names().size() == 3U);
+    REQUIRE(used.Names().size() == 2U);
     CHECK(used.Names()[0] == "Height");
-    CHECK(used.Names()[1] == "A_Slope_deg");
-    CHECK(used.Names()[2] == "Intensity");
+    CHECK(used.Names()[1] == "Intensity");
     CHECK(used.Contains("height"));
-    CHECK(used.Contains("a_slope_deg"));
-    CHECK(used.Contains("ASlopeDeg"));  // normalization ignores punctuation
+    CHECK_FALSE(used.Contains("a_slope_deg"));
     CHECK_FALSE(used.Contains("IgnoredForNormals"));
     CHECK_FALSE(used.Contains("Roughness"));
 
     // Duplicate spellings of an existing entry collapse.
     used.AddFieldName("HEIGHT");
-    CHECK(used.Names().size() == 3U);
+    CHECK(used.Names().size() == 2U);
 
     const auto& patterns =
         invisible_places::app::AlwaysResidentScalarFieldPatterns();
-    CHECK(std::find(patterns.begin(), patterns.end(), "roughness") !=
-          patterns.end());
+    CHECK(patterns.empty());
 }
 
-TEST_CASE("The legacy water-shader span keeps file fields at their file slots",
-          "[pointcloud][fields][compat]") {
-    // The point shaders read hard-coded slots (water jitter seed 12 up to
-    // feature type 15) on flow-animated clouds, so filtered loads pin file
-    // fields 0..15 to resident slots 0..15 by whitelisting their source
-    // indices. This fixture has 20 fields with values encoding their file
-    // index, so both alignment and content are checkable.
+TEST_CASE("Filtered source loads materialize only explicitly requested fields",
+          "[pointcloud][fields][filter]") {
+    // Generated Water layers now carry explicit content metadata, so source
+    // clouds no longer retain file slots 0..15 for shader heuristics. This
+    // fixture proves a field near the end of a 20-field source is the only
+    // resident column and still retains its original source index.
     constexpr std::size_t kFieldCount = 20U;
     constexpr std::size_t kPoints = 3U;
     const auto path =
@@ -332,33 +329,15 @@ TEST_CASE("The legacy water-shader span keeps file fields at their file slots",
     PointCloudScalarFieldFilter filter;
     filter.mode = PointCloudScalarFieldFilter::Mode::Selected;
     filter.names = {"F18"};
-    for (std::uint32_t sourceIndex = 0U;
-         sourceIndex <
-         invisible_places::app::kLegacyWaterShaderCompatibilitySourceIndexCount;
-         ++sourceIndex) {
-        filter.sourceIndices.push_back(sourceIndex);
-    }
     const auto result = LoadPointCloud(path, filter);
     REQUIRE(result.success);
     const auto& cloud = result.cloud;
 
-    REQUIRE(cloud.scalarFields.size() ==
-            invisible_places::app::kLegacyWaterShaderCompatibilitySourceIndexCount + 1U);
-    for (std::uint32_t slot = 0U;
-         slot <
-         invisible_places::app::kLegacyWaterShaderCompatibilitySourceIndexCount;
-         ++slot) {
-        // Resident slot == file index across the whole compatibility span,
-        // so the shader's fixed-slot reads hit the same fields they always
-        // did.
-        CHECK(cloud.scalarFields[slot].sourceIndex ==
-              static_cast<std::int32_t>(slot));
-        CHECK(cloud.scalarFieldValues[cloud.ScalarFieldValueIndex(slot, 1U)] ==
-              Catch::Approx(static_cast<float>(slot) * 1000.0F + 1.0F));
-    }
-    const auto& tail = cloud.scalarFields.back();
-    CHECK(tail.name == "F18");
-    CHECK(tail.sourceIndex == 18);
+    REQUIRE(cloud.scalarFields.size() == 1U);
+    CHECK(cloud.scalarFields.front().name == "F18");
+    CHECK(cloud.scalarFields.front().sourceIndex == 18);
+    CHECK(cloud.scalarFieldValues[cloud.ScalarFieldValueIndex(0U, 1U)] ==
+          Catch::Approx(18'001.0F));
 }
 
 TEST_CASE("Parallel PLY parsing matches the single-threaded result exactly",

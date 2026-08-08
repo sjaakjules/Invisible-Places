@@ -13,34 +13,33 @@ Every point-cloud load resolves a `PointCloudScalarFieldFilter`
 (`CollectScalarFieldLoadFilter`) against the session's authored state at the
 moment the load starts:
 
-- the six field-mapped render parameter bindings of the live style and every
-  saved point visual (a binding contributes its field even while parked on
-  Constant);
-- every Visual Feature (colourise/emissive) of every Timing Take, enabled or
-  dormant — takes can be selected at any time, and the same field set ships
-  in every density variant and role;
-- caustic mask/edge/seed assignments, whitelisted by their persisted
-  file-order slot;
-- the always-resident patterns (`roughness`, `groundid`) the renderer
-  resolves by name on every cloud.
+- the six bindings that are currently `FieldMapped` in the live style and
+  saved point visuals;
+- every Visual Feature (colourise/emissive) in every exportable Timing Take,
+  including dormant effects that animation can activate later in a take.
+
+Constant bindings retain their field names in authored state without retaining
+their point-count-sized columns. Switching one back to `FieldMapped` invokes
+the existing on-demand streamer before rendering. All takes and visuals remain
+covered so a queued batch can select a different authored snapshot safely.
+There are currently no unconditional name patterns: retired Field/Mesh Flow
+rendering no longer pins `roughness` or `groundid`, and inactive Ripple
+caustic slots do not contribute to the filter. Active Roughness Motion still
+loads matching `roughness`/`groundid` fields for an ungrouped layer that uses
+them; grouped VEG motion is the existing full-layer mode and needs neither
+column.
 
 Geometry, colour, and normals always load. `LoadedPointCloud` (and the
 session) additionally records `availableScalarFields` — every on-disk field
 with its file-order `sourceIndex` — whether or not the values are resident.
 The GUI smoke runners keep calling the unfiltered loader deliberately.
 
-One structural floor applies to every filtered load: the point shaders
-identify generated water clouds by sniffing the bound field count against
-hard-coded slot constants (water jitter seed 12 through feature type 15),
-and a display cloud whose style animates flow takes those per-slot reads
-too — historically reading whichever survey field sat at that file
-position. Source indices 0..15 are therefore always whitelisted
-(`kLegacyWaterShaderCompatibilitySourceIndexCount`) and never evicted, so
-resident slots 0..15 stay equal to file fields 0..15 and the flow shimmer
-keeps its historical seed data. Compacting a cloud below that span turns
-the shimmer into structured contour banding. Shrinking the floor requires
-the shaders to take explicit water-slot indirection instead of
-count-sniffing.
+There is no longer a structural 0..15 residency floor. Live and offline
+layer snapshots carry an explicit `generatedWaterOverlay` semantic bit, and
+only those generated layers may interpret the fixed Water scalar slots
+(jitter seed 12 through feature type 15). An ordinary survey cloud can no
+longer be misclassified from its field count or `flowAnimation` style flag,
+so every disk-backed source field is compactable and evictable.
 
 `Load All Scalar Fields` (Debug window; persisted as
 `load_all_scalar_fields`, schema 65) restores the historical
@@ -48,16 +47,20 @@ load-everything behaviour on each cloud's next load.
 
 ## On-demand streaming
 
-`EnsureRequiredScalarFieldsResident` sweeps sessions on a small frame
-cadence (piggybacked on the layer-load poll used by the live loop, smokes,
-and benchmarks). When authored state references a field that is available
+`EnsureRequiredScalarFieldsResident` sweeps GPU-renderable sessions on a
+small frame cadence (piggybacked on the layer-load poll used by the live
+loop, smokes, and benchmarks). CPU-only canonical analysis sources and
+retired display bundles are deliberately excluded: their point material is
+never drawn, so populating their visual fields would duplicate both PLY I/O
+and memory. Export readiness checks its selected full-density sessions
+explicitly. When authored state references a field that is available
 on disk but not resident — e.g. the user picks an `(on demand)` entry in a
 binding's Field combo or a Visual Feature field catalog entry — one
 background thread streams that single field via
 `StreamPointCloudSelectedValues`, computes its stats, and the main thread
 appends it to the resident matrix. Appends never renumber existing slots,
-so name-resolved bindings, resolved colourise slots, per-slot histogram
-caches, and translated caustic slots all stay valid; GPU-resident sessions
+so name-resolved bindings, resolved colourise slots, and per-slot histogram
+caches stay valid; GPU-resident sessions
 then replace the scalar buffer through the existing
 `UploadPointCloudScalarFields` path. Streams never start while a
 whole-cloud load, an offline export, or the shared-cache high-memory slot
@@ -121,14 +124,14 @@ state and a single sample (a still camera has no motion blur). It shares
 Render Frame Preview's readiness gate, so required clouds and scalar
 fields load first and the render then fires automatically.
 
-## Caustic slots
+## Inactive caustic slots
 
 `caustic_*_field_slot` values persist as file-order indices (the resident
 slot of the load-everything era) and keep that meaning on disk.
-`MakeSceneRenderStyle` translates them to the field's current resident row
-(or -1 until the field arrives) for every consumer — live rendering, the
-redraw predicate, offline snapshots, and animation export — via
-`TranslateCausticFieldSlotsToResident`. Sessions without an
+`MakeSceneRenderStyle` can still translate them to the field's current
+resident row via `TranslateCausticFieldSlotsToResident`, preserving project
+compatibility if Ripple is reintroduced. Ripple rendering is currently
+inactive, so these slots do not request or consume source columns. Sessions without an
 `availableScalarFields` catalog (runtime-generated overlays) skip the
 translation because file order and resident order are identical there.
 
@@ -141,8 +144,10 @@ resolves.
 
 ## Budget and eviction
 
-The residency sweep stamps each resident field with the sweep tick
-whenever the required-field set still references it. With a non-zero
+The residency sweep stamps each GPU-renderable session's resident field with
+the sweep tick whenever the required-field set still references it. Fields
+held only by CPU analysis/retired bundles are not pinned by visual state and
+remain evictable. With a non-zero
 **Budget (GB)** (Debug window; persisted as `scalar_field_budget_gb`), a
 sweep whose combined CPU+GPU scalar payload exceeds the budget evicts the
 least-recently-referenced disk-backed fields — never required fields,
@@ -156,10 +161,10 @@ dropped because eviction renumbers surviving slots. Eviction defers, like
 field appends, while the colourise histogram worker or a Flow trail build
 holds the resident cloud.
 
-Field streams run at utility QoS on macOS so prefetch and backfill never
-compete with the render loop for performance cores. Because the required
-set already spans every Timing Take and saved visual, the sweep doubles as
-the low-priority prefetch of animation-relevant fields after startup.
+Field streams run at utility QoS on macOS so backfill never competes with
+the render loop for performance cores. The residency sweep covers every
+mapped exportable visual/take while excluding dormant Constant bindings and
+retired Water-only compatibility fields.
 
 ## Diagnostics
 

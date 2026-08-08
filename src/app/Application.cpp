@@ -2,6 +2,7 @@
 
 #include "app/ManualFlowPathEditMath.hpp"
 #include "app/PointVisualSelection.hpp"
+#include "app/ProcessMemoryTelemetry.hpp"
 #include "app/WaterSurfaceCacheReadiness.hpp"
 #include "app/WaterPathDiagnostics.hpp"
 #include "camera/AnimationPath.hpp"
@@ -95,7 +96,6 @@
 #include <vector>
 
 #if defined(__APPLE__)
-#include <mach/mach.h>
 #include <pthread/qos.h>
 #include <sys/sysctl.h>
 #elif defined(__linux__)
@@ -231,6 +231,14 @@ using LayerLoadResult = std::variant<
 
 constexpr float kPi = 3.14159265358979323846F;
 constexpr std::size_t kMaxPivotSamples = 65536;
+constexpr std::size_t kAnimationMatchingFrameGhostLayerId =
+    std::numeric_limits<std::size_t>::max() - 64U;
+constexpr invisible_places::scene::PointSpacingMicrometres
+    kAnimationMatchingFrameGhostSpacingMicrometres = 5'000U;
+constexpr std::size_t kAnimationMatchingFrameGhostSourceSampleLimit =
+    2'000'000U;
+constexpr std::size_t kAnimationMatchingFrameGhostGridWidth = 640U;
+constexpr std::size_t kAnimationMatchingFrameGhostGridHeight = 360U;
 constexpr std::uint64_t kWaterSourcePickSampleLimit = 3'000'000ULL;
 constexpr std::size_t kWaterSeepageSurfaceGuideSampleLimit = 220'000U;
 constexpr float kWaterSourcePickRadiusPixels = 22.0F;
@@ -244,6 +252,12 @@ constexpr std::size_t kMaxAdaptiveQueuedExportFrames = 6U;
 constexpr std::uint64_t kAdaptiveExportQueueMemoryPercent = 85ULL;
 constexpr std::uint64_t kHardExportMemoryStopPercent = 92ULL;
 constexpr auto kPerformanceInteractionHold = std::chrono::milliseconds{300};
+// These authored features remain serializable and inspectable, but are
+// deliberately excluded from live/export rendering. Their old runtime paths
+// duplicate work now covered by Shoreline, Seepage, Rain, and Flow.
+constexpr bool kRippleWaterRuntimeEnabled = false;
+constexpr bool kMeshFlowWaterRuntimeEnabled = false;
+constexpr bool kFieldWaterRuntimeEnabled = false;
 constexpr std::string_view kDefaultPointVisualName = invisible_places::app::point_visual::kDefaultName;
 constexpr std::string_view kPresetPointVisualSuffix = invisible_places::app::point_visual::kPresetSuffix;
 constexpr std::string_view kEditedPointVisualSuffix = invisible_places::app::point_visual::kEditedSuffix;
@@ -384,6 +398,9 @@ struct SaveChangesDialogState {
     bool allowItemSelection = true;
     bool waitingForRenderCancellation = false;
     bool exitConfirmed = false;
+    bool animationSaveAs = false;
+    bool focusAnimationSaveAsName = false;
+    std::string animationSaveAsName;
     std::vector<SaveChangesItem> items;
     std::string errorMessage;
 };
@@ -430,12 +447,6 @@ enum class AnimationEditTarget {
     Focus
 };
 
-enum class LinkedLoopLiveCameraMode : std::uint8_t {
-    InterleavedOverlay = 0,
-    SourceA,
-    SourceB,
-};
-
 enum class ManualFlowPathGizmoDragKind {
     None,
     Axis,
@@ -462,8 +473,12 @@ struct ManualFlowPathGizmoDragState {
 // points; the gizmo maths lives in the shared ManualFlowPathGizmoDragState.
 struct AnimationViewportDragState {
     bool active = false;
+    bool partnerPath = false;
+    std::filesystem::path partnerFilePath;
     AnimationEditTarget target = AnimationEditTarget::Camera;
     std::size_t keyIndex = 0;
+    invisible_places::camera::AnimationCameraFrameTransform
+        partnerToCurrentFrame{};
     ManualFlowPathGizmoDragState gizmo{};
 };
 
@@ -693,6 +708,117 @@ struct AnimationLoopDiagnostics {
     std::string message;
 };
 
+struct AnimationLoopTimelineState {
+    std::filesystem::path currentFilePath;
+    std::filesystem::path partnerFilePath;
+    std::uint64_t currentMotionFingerprint = 0U;
+    std::uint64_t partnerMotionFingerprint = 0U;
+    float currentStartOverlapSeconds = 0.0F;
+    float currentEndOverlapSeconds = 0.0F;
+    bool horizontalBlend = false;
+    bool panRight = true;
+    std::unordered_set<std::string> currentMovableKeyIds;
+    std::unordered_set<std::string> partnerMovableKeyIds;
+    int strongDestinationRow = -1;
+    std::string strongDestinationKeyId;
+    float strongCounterpartNormalizedPosition = 0.0F;
+    std::array<ImVec2, 2> rowTrackMinimum{};
+    std::array<ImVec2, 2> rowTrackMaximum{};
+    std::array<bool, 2> rowTrackValid{false, false};
+    std::optional<std::filesystem::path> requestedScrubFilePath;
+    float requestedScrubPosition = 0.0F;
+    // The animation whose empty timeline space owned the initial mouse-down.
+    // It keeps the gesture until release even when the pointer crosses keys
+    // or overlap bounds, or loading that animation swaps the displayed rows.
+    std::optional<std::filesystem::path> scrubDragFilePath;
+    // 0 is idle, 1 drags the start-overlap bound, 2 drags the end bound.
+    int dragHandle = 0;
+    bool previewDirty = true;
+    bool previewInProgress = false;
+    std::optional<
+        invisible_places::camera::AnimationLoopSmoothingResult>
+        preview;
+    std::string previewError;
+};
+
+struct AnimationVelocityDraftKeyDelta {
+    std::string keyId;
+    std::array<float, 3> cameraDelta{0.0F, 0.0F, 0.0F};
+    std::array<float, 3> focusDelta{0.0F, 0.0F, 0.0F};
+    bool addedLocalizedCorrection = false;
+};
+
+struct AnimationVelocityAlignmentDraft {
+    std::filesystem::path firstFilePath;
+    std::filesystem::path secondFilePath;
+    std::string pairId;
+    std::array<std::vector<AnimationVelocityDraftKeyDelta>, 2> keyDeltas;
+    std::array<std::vector<AnimationVelocityDraftKeyDelta>, 2>
+        strongKeyDeltas;
+};
+
+struct AnimationVelocityLinkSettingsUpdate {
+    std::array<std::filesystem::path, 2> filePaths;
+    std::string pairId;
+    std::array<float, 2> startOverlapSeconds{};
+    std::array<float, 2> endOverlapSeconds{};
+    float maxEndMoveFraction = 0.10F;
+    float strongAlignMaxMoveFraction = 0.50F;
+    bool horizontalBlend = false;
+    bool panRight = true;
+    std::array<std::vector<std::string>, 2> movableKeyIds;
+};
+
+struct AnimationLowerFrameAlignmentRequest {
+    std::array<std::filesystem::path, 2> filePaths;
+    int destinationRow = -1;
+    std::string destinationKeyId;
+    float counterpartNormalizedPosition = 0.0F;
+    float aspectRatio = 16.0F / 9.0F;
+};
+
+struct AnimationMatchingFrameGhostCaptureRequest {
+    std::array<std::filesystem::path, 2> filePaths;
+    float currentNormalizedPosition = 0.0F;
+    float partnerNormalizedPosition = 0.0F;
+    float aspectRatio = 16.0F / 9.0F;
+    bool automatic = false;
+};
+
+struct AnimationMatchingFrameGhostState {
+    bool uploaded = false;
+    bool visible = false;
+    bool automaticUpdate = true;
+    bool showPartnerSplines = true;
+    bool updateInProgress = false;
+    bool matchingFrameAvailable = true;
+    bool captureMatchesCurrentFrame = true;
+    float opacity = 0.32F;
+    float pointSizeMillimeters = 5.0F;
+    std::filesystem::path currentFilePath;
+    std::filesystem::path partnerFilePath;
+    std::string pairId;
+    std::string commonSceneKey;
+    std::string sourceDescription;
+    float sourceSpacingMillimeters = 0.0F;
+    float currentNormalizedPosition = 0.0F;
+    float partnerNormalizedPosition = 0.0F;
+    float requestedCurrentNormalizedPosition = 0.0F;
+    float requestedPartnerNormalizedPosition = 0.0F;
+    float observedCurrentNormalizedPosition =
+        std::numeric_limits<float>::quiet_NaN();
+    float observedPartnerNormalizedPosition =
+        std::numeric_limits<float>::quiet_NaN();
+    std::array<std::uint64_t, 2> capturedMotionFingerprints{};
+    std::array<std::uint64_t, 2> observedMotionFingerprints{};
+    std::size_t sourcePointCount = 0U;
+    std::size_t sourceSamplePointCount = 0U;
+    std::size_t frustumVisiblePointCount = 0U;
+    std::size_t capturedPointCount = 0U;
+    std::chrono::steady_clock::time_point lastPositionChangeAt{};
+    std::chrono::steady_clock::time_point lastAutomaticRequestAt{};
+};
+
 struct AnimationPanelState {
     std::optional<AnimationPath> currentPath;
     std::string currentFilePath;
@@ -707,6 +833,8 @@ struct AnimationPanelState {
     // serialized smoothing metadata from both edited paths.
     std::vector<std::string> availableFileLoopEditPairIds;
     std::vector<bool> availableFileDirtyFlags;
+    std::unordered_set<std::string> brokenVelocityLinkPathKeys;
+    bool projectVelocityLinksDirty = false;
     bool animationRegistryInitialized = false;
     std::vector<std::filesystem::path> selectedExportFiles;
     std::deque<QueuedQuickMp4Export> quickMp4Queue;
@@ -716,20 +844,36 @@ struct AnimationPanelState {
     std::optional<std::size_t> selectedFileIndex;
     bool selectedFileUsesEdited = false;
     bool currentPathUsesEdited = false;
+    bool savedEditedComparisonHoldActive = false;
+    bool velocityPartnerComparisonHoldActive = false;
     std::filesystem::path loopSmoothingPartnerPath;
     float loopSmoothingMaxEndMovePercent = 10.0F;
+    float strongAlignmentMaxMovePercent = 50.0F;
     std::optional<AnimationLoopDiagnostics> loopSmoothingDiagnostics;
-    bool showLinkedLoopOverlap = true;
-    int linkedLoopPaddingFrames = 0;
-    std::string linkedLoopStartKeyId;
-    LinkedLoopLiveCameraMode linkedLoopLiveCameraMode =
-        LinkedLoopLiveCameraMode::InterleavedOverlay;
-    bool linkedLoopTemporalOverlayWasActive = false;
-    bool linkedLoopTemporalRenderFirstNext = true;
+    std::optional<
+        invisible_places::camera::AnimationStrongAlignmentResult>
+        strongAlignmentDiagnostics;
+    AnimationLoopTimelineState loopTimeline;
+    std::optional<AnimationVelocityAlignmentDraft> velocityAlignmentDraft;
+    std::optional<AnimationVelocityLinkSettingsUpdate>
+        pendingVelocityLinkSettingsUpdate;
+    std::optional<AnimationLowerFrameAlignmentRequest>
+        requestedLowerFrameAlignment;
+    AnimationMatchingFrameGhostState matchingFrameGhost;
+    std::optional<AnimationMatchingFrameGhostCaptureRequest>
+        requestedMatchingFrameGhostCapture;
+    bool requestedMatchingFrameGhostClear = false;
+    std::optional<std::array<std::filesystem::path, 2>>
+        requestedVelocityUnlink;
     std::optional<std::size_t> renamingFileIndex;
     std::string fileRenameBuffer;
     bool focusFileRename = false;
     std::optional<std::size_t> selectedKeyIndex;
+    bool viewportPartnerSelectionActive = false;
+    std::filesystem::path viewportPartnerSelectionPath;
+    std::optional<std::size_t> viewportPartnerKeyIndex;
+    AnimationEditTarget viewportPartnerEditTarget =
+        AnimationEditTarget::Camera;
     std::optional<std::size_t> selectedWaterKeyIndex;
     std::optional<std::size_t> selectedSeepageNodeKeyIndex;
     std::optional<std::size_t> waterKeyCopySourceIndex;
@@ -757,6 +901,9 @@ struct AnimationPanelState {
     bool previewDepthOfField = false;
     bool dirty = false;
     bool showSplines = true;
+    invisible_places::camera::AnimationSpeedEqualizationMode
+        speedEqualizationMode = invisible_places::camera::
+            AnimationSpeedEqualizationMode::PerceivedMotion;
     std::optional<WaterKeyPositionEditState> waterKeyPositionEdit;
     std::optional<TimingColouriseKeyPositionEditState>
         timingColouriseKeyPositionEdit;
@@ -977,7 +1124,7 @@ struct AnimationExportWriterState {
     std::size_t maxQueuedFrames = kDefaultQueuedExportFrames;
     std::uint64_t queueMemoryBudgetBytes = 0;
     std::uint64_t memoryStopThresholdBytes = 0;
-    std::uint64_t peakResidentMemoryBytes = 0;
+    std::uint64_t peakProcessMemoryBytes = 0;
     bool acceptingFrames = true;
     bool finishRequested = false;
     bool cancelRequested = false;
@@ -1002,13 +1149,46 @@ struct AnimationExportWriterState {
 
 struct StillCameraPreparationState;
 
+enum class ExportMemorySampleStage : std::uint8_t {
+    Start,
+    Readback,
+    FrameReady,
+    Finish,
+};
+
+struct ExportMemorySample {
+    double elapsedSeconds = 0.0;
+    ExportMemorySampleStage stage = ExportMemorySampleStage::Start;
+    std::uint32_t frameIndex = 0;
+    std::size_t completedSamples = 0;
+    std::uint32_t capturedFrames = 0;
+    std::uint32_t writtenFrames = 0;
+    std::size_t pendingFrames = 0;
+    ProcessMemorySnapshot memory{};
+    invisible_places::platform::SystemThermalState thermalState =
+        invisible_places::platform::SystemThermalState::Unavailable;
+};
+
 struct ExportLogState {
     std::filesystem::path path;
     std::chrono::system_clock::time_point startedWallTime{};
     std::chrono::steady_clock::time_point startedAt{};
-    std::uint64_t startResidentMemoryBytes = 0;
-    std::uint64_t peakResidentMemoryBytes = 0;
-    std::uint64_t endResidentMemoryBytes = 0;
+    ProcessMemorySnapshot startMemory{};
+    ProcessMemorySnapshot peakMemory{};
+    ProcessMemorySnapshot endMemory{};
+    invisible_places::platform::SystemThermalState startThermalState =
+        invisible_places::platform::SystemThermalState::Unavailable;
+    invisible_places::platform::SystemThermalState worstThermalState =
+        invisible_places::platform::SystemThermalState::Unavailable;
+    invisible_places::platform::SystemThermalState endThermalState =
+        invisible_places::platform::SystemThermalState::Unavailable;
+    std::uint64_t peakProcessMemoryBytes = 0;
+    std::uint64_t cpuPointCloudGeometryBytes = 0;
+    std::uint64_t cpuPointCloudScalarBytes = 0;
+    std::uint64_t gpuPointCloudBufferBytes = 0;
+    std::size_t cpuPointCloudPayloadCount = 0;
+    std::size_t gpuPointCloudSessionCount = 0;
+    std::vector<ExportMemorySample> memorySamples;
     std::chrono::steady_clock::duration gpuCaptureTotal{};
     std::chrono::steady_clock::duration gpuCaptureMin{};
     std::chrono::steady_clock::duration gpuCaptureMax{};
@@ -1113,6 +1293,7 @@ struct OfflineRenderJobState {
     bool exportFrustumMask = false;
     std::uint64_t exportFrustumMaskDrawPoints = 0;
     std::uint64_t exportFrustumMaskFullSourcePoints = 0;
+    std::chrono::steady_clock::duration exportFrustumMaskPreparationDuration{};
     PointCloudRendererMode pointCloudRendererMode = PointCloudRendererMode::Beauty;
     bool writerFinishRequested = false;
     bool quickMp4BatchJob = false;
@@ -1318,6 +1499,7 @@ std::string NextCameraShotName(const PreviewRuntimeState& runtimeState);
 void RequestAnimationExportWriterCancellation(OfflineRenderJobState* job);
 void FinishOfflineRenderJob(
     PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
     const std::string& statusMessage,
     const std::string& errorMessage = {});
 void NormalizeAnimationRenderSettings(RenderJobSettings* settings);
@@ -1368,11 +1550,14 @@ void RequestSaveChangesDialog(
     SaveChangesRequest request);
 ProjectDocument BuildProjectDocumentForSave(
     const PreviewRuntimeState& runtimeState);
+void ValidateProjectAnimationVelocityLinks(
+    const ProjectDocument& document,
+    PreviewRuntimeState* runtimeState);
 bool ApplyAnimationLoopSmoothing(
     PreviewRuntimeState* runtimeState,
     std::size_t partnerFileIndex,
-    float maxEndMoveFraction);
-bool UnapplyAnimationLoopSmoothing(
+    invisible_places::camera::AnimationLoopSmoothingOptions options);
+bool UnapplyAnimationVelocityDraft(
     PreviewRuntimeState* runtimeState,
     std::size_t partnerFileIndex);
 void ApplyAnimationScrub(PreviewRuntimeState* runtimeState);
@@ -1416,6 +1601,7 @@ struct OfflinePointLayerSnapshot {
     PointCloudStyleState style{};
     invisible_places::renderer::pointcloud::ResolvedTimingColouriseStack
         timingColourise{};
+    bool generatedWaterOverlay = false;
     bool hasSourceRgb = false;
     bool fastBasic = false;
     std::uint64_t drawPointCount = 0;
@@ -1594,6 +1780,9 @@ struct PreviewLayerSession {
     // Applies to both CPU fallback snapshots and GPU-native Flow outputs. It
     // records the speed encoded in the immutable scalar/output buffer.
     float waterFlowBakedSpeedMetersPerSecond = 0.45F;
+    // Runtime content semantics. Authored/source clouds remain false even if
+    // a user applies a Water-looking visual or enables flow animation.
+    bool generatedWaterOverlay = false;
     bool waterFlowGpuPreview = false;
     bool dynamicMeshFlowGpuPreview = false;
     float inferredPointSpacingMeters = 0.0F;
@@ -2072,6 +2261,11 @@ struct WaterWorkflowState {
     std::string seepageResponseNameBuffer = "Default";
     std::vector<WaterEffectLayer> rippleLayers;
     std::vector<WaterEffectLayer> fieldLayers;
+    // Inactive legacy panels are opt-in for inspection only and are not
+    // serialized. Closing one returns it to the trailing '+' menu.
+    bool showInactiveRippleTab = false;
+    bool showInactiveMeshFlowTab = false;
+    bool showInactiveFieldTab = false;
     WaterSourceSettings defaultSourceSettings = invisible_places::water::DefaultWaterSourceSettings(WaterScaleMode::Mid);
     std::optional<WaterSourceSettings> tempDefaultSourceSettings;
     std::vector<SavedWaterPathProfileState> pathProfiles;
@@ -2160,6 +2354,9 @@ struct WaterWorkflowState {
     WaterDynamicMeshFlowDiagnostics dynamicMeshFlowDiagnostics{};
     WaterOverlayViewMode overlayViewMode = WaterOverlayViewMode::Trail;
     bool showFlowSourceGuides = true;
+    // Session-only timing focus: retain selections while replacing Water's
+    // geometry-authoring overlays with compact, non-interactive cues.
+    bool subtleSelectedAuthoringCues = false;
     // Shared-gizmo interaction state for the emitter/attractor and Seepage
     // overlays. The hovered/captured flags are read by UpdateCameraFromInput
     // (which runs earlier in the frame) so camera navigation stays off gizmo
@@ -2316,6 +2513,91 @@ struct WaterWorkflowState {
     std::uint64_t flowPathAnalysisSnapshotFingerprint = 0U;
 };
 
+struct AnimationVelocityPreviewJobResult {
+    std::uint64_t generation = 0U;
+    std::array<std::filesystem::path, 2> filePaths;
+    std::array<std::uint64_t, 2> motionFingerprints{};
+    invisible_places::camera::AnimationLoopSmoothingResult result;
+};
+
+struct AnimationVelocityPreviewJobShared {
+    std::mutex mutex;
+    bool completed = false;
+    AnimationVelocityPreviewJobResult result;
+};
+
+struct AnimationVelocityPreviewJobRuntime {
+    std::uint64_t nextGeneration = 1U;
+    std::uint64_t activeGeneration = 0U;
+    std::jthread worker;
+    std::shared_ptr<AnimationVelocityPreviewJobShared> shared;
+};
+
+struct AnimationStrongAlignmentJobResult {
+    std::uint64_t generation = 0U;
+    std::array<std::filesystem::path, 2> filePaths;
+    std::filesystem::path destinationFilePath;
+    std::string pairId;
+    std::string commonSceneKey;
+    float maxMoveFraction = 0.50F;
+    std::array<std::uint64_t, 2> motionFingerprints{};
+    std::string destinationKeyId;
+    float referenceNormalizedPosition = 0.0F;
+    float aspectRatio = 16.0F / 9.0F;
+    float destinationStartOverlapSeconds = 0.0F;
+    float destinationEndOverlapSeconds = 0.0F;
+    AnimationPath adjustedDestination;
+    invisible_places::camera::AnimationStrongAlignmentResult result;
+};
+
+struct AnimationStrongAlignmentJobShared {
+    std::mutex mutex;
+    bool completed = false;
+    AnimationStrongAlignmentJobResult result;
+};
+
+struct AnimationStrongAlignmentJobRuntime {
+    std::uint64_t nextGeneration = 1U;
+    std::uint64_t activeGeneration = 0U;
+    std::jthread worker;
+    std::shared_ptr<AnimationStrongAlignmentJobShared> shared;
+};
+
+struct AnimationMatchingFrameGhostSourceSnapshot {
+    std::string associationKey;
+    std::string description;
+    float spacingMillimeters = 0.0F;
+    std::uint64_t fingerprint = 0U;
+    std::size_t sourcePointCount = 0U;
+    std::vector<std::size_t> sessionIndices;
+    std::vector<invisible_places::io::Float3> sampledPositions;
+};
+
+struct AnimationMatchingFrameGhostJobResult {
+    std::uint64_t generation = 0U;
+    AnimationMatchingFrameGhostCaptureRequest request;
+    std::string pairId;
+    std::array<std::uint64_t, 2> motionFingerprints{};
+    std::shared_ptr<const AnimationMatchingFrameGhostSourceSnapshot>
+        source;
+    invisible_places::camera::AnimationMatchingFrameGhostResult result;
+};
+
+struct AnimationMatchingFrameGhostJobShared {
+    std::mutex mutex;
+    bool completed = false;
+    AnimationMatchingFrameGhostJobResult result;
+};
+
+struct AnimationMatchingFrameGhostJobRuntime {
+    std::uint64_t nextGeneration = 1U;
+    std::uint64_t activeGeneration = 0U;
+    std::jthread worker;
+    std::shared_ptr<AnimationMatchingFrameGhostJobShared> shared;
+    std::shared_ptr<const AnimationMatchingFrameGhostSourceSnapshot>
+        sourceCache;
+};
+
 struct PreviewRuntimeState {
     std::vector<PreviewLayerSession> sessions;
     std::uint64_t nextPointCloudContentGeneration = 1U;
@@ -2333,6 +2615,10 @@ struct PreviewRuntimeState {
     CameraPanelState cameraPanel{};
     CameraPlaybackState cameraPlayback{};
     AnimationPanelState animationPanel{};
+    AnimationVelocityPreviewJobRuntime animationVelocityPreviewJob{};
+    AnimationStrongAlignmentJobRuntime animationStrongAlignmentJob{};
+    AnimationMatchingFrameGhostJobRuntime
+        animationMatchingFrameGhostJob{};
     AnimationPlaybackState animationPlayback{};
     TimingsPanelState timingsPanel{};
     TimingColouriseHistogramRuntime timingColouriseHistogram{};
@@ -3791,6 +4077,9 @@ void SyncWaterRegionPointPreviewHighlights(
     if (runtimeState == nullptr || viewport == nullptr) {
         return;
     }
+    if (!kRippleWaterRuntimeEnabled && !kFieldWaterRuntimeEnabled) {
+        return;
+    }
 
     std::unordered_set<std::uint64_t> desiredKeys;
     const auto uploadHighlight = [&](std::size_t targetIndex,
@@ -4458,11 +4747,15 @@ void HashArray4(std::uint64_t* seed, const std::array<float, 4>& value) {
 std::uint64_t AnimationPathMotionFingerprint(const AnimationPath& path) {
     std::uint64_t seed = 1469598103934665603ULL;
     HashCombine(&seed, path.durationFrames);
+    HashCombine(&seed, path.exportSettings.width);
+    HashCombine(&seed, path.exportSettings.height);
     HashBool(&seed, path.depthOfFieldEnabled);
     HashFloat(&seed, path.apertureFStops);
     HashFloat(&seed, path.depthOfFieldMaxBlurPixels);
     HashCombine(&seed, path.keys.size());
     for (const auto& key : path.keys) {
+        HashString(&seed, key.id);
+        HashString(&seed, key.linkedCameraId);
         HashArray3(&seed, key.cameraPosition);
         HashArray3(&seed, key.focusPoint);
         HashBool(&seed, key.hasOrientation);
@@ -4476,28 +4769,11 @@ std::uint64_t AnimationPathMotionFingerprint(const AnimationPath& path) {
         HashFloat(&seed, key.farPlane);
         HashCombine(&seed, key.durationFrames);
     }
-    HashBool(&seed, path.loopTransitionSmoothing.has_value());
-    if (path.loopTransitionSmoothing.has_value()) {
-        const auto& smoothing = path.loopTransitionSmoothing.value();
-        HashString(&seed, smoothing.pairId);
-        HashString(&seed, smoothing.firstKeyId);
-        HashString(&seed, smoothing.lastKeyId);
-        HashArray3(&seed, smoothing.originalFirstCameraPosition);
-        HashArray3(&seed, smoothing.originalFirstFocusPoint);
-        HashArray3(&seed, smoothing.originalLastCameraPosition);
-        HashArray3(&seed, smoothing.originalLastFocusPoint);
-    }
-    HashBool(&seed, path.linkedLoop.has_value());
-    if (path.linkedLoop.has_value()) {
-        const auto& linkedLoop = path.linkedLoop.value();
-        HashString(&seed, linkedLoop.firstFileName);
-        HashString(&seed, linkedLoop.secondFileName);
-        HashString(&seed, linkedLoop.firstStartKeyId);
-        HashFloat(&seed, linkedLoop.firstStartPosition);
-        HashCombine(
-            &seed,
-            static_cast<std::uint64_t>(
-                static_cast<std::int64_t>(linkedLoop.paddingFrames)));
+    HashCombine(&seed, path.localizedKeyCorrections.size());
+    for (const auto& correction : path.localizedKeyCorrections) {
+        HashString(&seed, correction.keyId);
+        HashArray3(&seed, correction.splineCameraPosition);
+        HashArray3(&seed, correction.splineFocusPoint);
     }
     return seed;
 }
@@ -4990,6 +5266,8 @@ std::uint64_t RenderStateSignature(
             &seed,
             layer.timingColourise);
         HashScalarFields(&seed, layer.scalarFields);
+        HashBool(&seed, layer.generatedWaterOverlay);
+        HashBool(&seed, layer.regionWaterEffectsEnabled);
         HashBool(&seed, layer.hasSourceRgb);
         HashBool(&seed, layer.hasNormals);
         HashBool(
@@ -5613,6 +5891,8 @@ bool PointStylesEqualForSelection(
 }
 
 bool IsGeneratedWaterOverlaySession(const PreviewLayerSession& session);
+bool IsInactiveLegacyWaterOverlaySession(
+    const PreviewLayerSession& session);
 bool IsGeneratedWaterFlowOverlaySession(const PreviewLayerSession& session);
 bool VisibleGeneratedWaterTrailOverlayPresent(const PreviewRuntimeState& runtimeState);
 bool IsProtectedWaterPointVisualName(std::string_view name);
@@ -7901,7 +8181,9 @@ bool IsCommittedDisplayPointCloudReady(
 bool IsRenderablePointCloudSource(
     const PreviewRuntimeState& runtimeState,
     const PreviewLayerSession& session) {
-    if (!IsCommittedDisplayPointCloudReady(runtimeState, session) || !session.visible) {
+    if (IsInactiveLegacyWaterOverlaySession(session) ||
+        !IsCommittedDisplayPointCloudReady(runtimeState, session) ||
+        !session.visible) {
         return false;
     }
     if (!IsSceneGroupedPointCloud(session)) {
@@ -7949,11 +8231,19 @@ PointCloudStyleState MakeSceneRenderStyle(
     const PreviewRuntimeState& runtimeState,
     const PreviewLayerSession& session,
     PointCloudStyleState style) {
+    (void)runtimeState;
     ResolveProjectVisualStyleBindingsByFieldName(&style, session);
-    TranslateCausticFieldSlotsToResident(&style, session);
+    if (kRippleWaterRuntimeEnabled) {
+        TranslateCausticFieldSlotsToResident(&style, session);
+    }
     style = invisible_places::renderer::pointcloud::MakePointCloudStyleForSceneRole(
         style,
         session.sceneRole);
+    if (!kRippleWaterRuntimeEnabled) {
+        style.causticAnimation = false;
+        style.causticIntensity = 0.0F;
+        style.causticPreviewTintAmount = 0.0F;
+    }
     return style;
 }
 
@@ -8560,12 +8850,10 @@ bool IsGeneratedWaterOverlaySession(const PreviewLayerSession& session) {
     }
 
     const auto stem = session.sourcePath.stem().string();
-    const auto waterVisualName = NormalizeWaterPointVisualName(session.selectedPointVisualName);
-    return session.pointStyle.flowAnimation ||
-           session.pointStyle.waterTrailOverlay ||
-           waterVisualName == "Water Flow_preset" ||
-           waterVisualName == "Ripples" ||
-           waterVisualName == "Field Surface" ||
+    return session.generatedWaterOverlay ||
+           session.waterFlowSourceId.has_value() ||
+           session.waterFlowGpuPreview ||
+           session.dynamicMeshFlowGpuPreview ||
            stem.ends_with("-WaterPreview") ||
            stem.ends_with("-WaterFlow") ||
            IsGeneratedWaterFlowTrailOverlayStem(stem) ||
@@ -8575,16 +8863,31 @@ bool IsGeneratedWaterOverlaySession(const PreviewLayerSession& session) {
            stem.ends_with("-FieldSurface");
 }
 
+bool IsInactiveLegacyWaterOverlaySession(
+    const PreviewLayerSession& session) {
+    if (session.kind != LayerKind::PointCloud) {
+        return false;
+    }
+    const auto stem = session.sourcePath.stem().string();
+    return (!kRippleWaterRuntimeEnabled && stem.ends_with("-Ripples")) ||
+           (!kMeshFlowWaterRuntimeEnabled &&
+            (session.dynamicMeshFlowGpuPreview ||
+             IsGeneratedWaterDynamicMeshTrailOverlayStem(stem))) ||
+           (!kFieldWaterRuntimeEnabled &&
+            (stem.ends_with("-FieldTrails") ||
+             stem.ends_with("-FieldSurface")));
+}
+
 bool IsGeneratedWaterFlowOverlaySession(const PreviewLayerSession& session) {
     if (session.kind != LayerKind::PointCloud) {
         return false;
     }
     const auto stem = session.sourcePath.stem().string();
-    return NormalizeWaterPointVisualName(session.selectedPointVisualName) == "Water Flow_preset" ||
+    return session.waterFlowSourceId.has_value() ||
+           session.waterFlowGpuPreview ||
            stem.ends_with("-WaterPreview") ||
            stem.ends_with("-WaterFlow") ||
-           IsGeneratedWaterFlowTrailOverlayStem(stem) ||
-           stem.ends_with("-FieldTrails");
+           IsGeneratedWaterFlowTrailOverlayStem(stem);
 }
 
 bool VisibleGeneratedWaterTrailOverlayPresent(const PreviewRuntimeState& runtimeState) {
@@ -9917,11 +10220,29 @@ void HandleScenePurposeLoadFailed(
     std::uint64_t sceneSwitchGeneration,
     std::string_view errorMessage);
 
-// The scalar fields a session's authored state can reference, aggregated
-// over every saved visual, the live style, and every Timing Take's Visual
-// Features. Deliberately animation-agnostic and take-agnostic: any take can
-// be selected at any time, so all of them contribute. Unknown names cost
-// nothing (the loader and on-demand streamer ignore them).
+// All potentially exportable visuals/takes contribute their genuinely mapped
+// scalar fields. This keeps queued/batch export snapshots self-contained
+// without retaining remembered mappings from Constant bindings.
+bool SessionPotentiallyNeedsRoughnessMotionFields(
+    const PreviewLayerSession& session) {
+    const auto needsFields = [&session](PointCloudStyleState style) {
+        style = invisible_places::renderer::pointcloud::
+            MakePointCloudStyleForSceneRole(style, session.sceneRole);
+        return invisible_places::renderer::pointcloud::
+                   PointCloudStyleHasActiveRoughnessMotion(style) &&
+               !style.roughnessMotionFullLayer;
+    };
+    if (needsFields(session.pointStyle)) {
+        return true;
+    }
+    return std::any_of(
+        session.pointVisuals.begin(),
+        session.pointVisuals.end(),
+        [&needsFields](const SavedPointVisualState& visual) {
+            return needsFields(visual.style);
+        });
+}
+
 invisible_places::app::UsedScalarFieldSet CollectRequiredScalarFieldNames(
     const PreviewRuntimeState& runtimeState,
     const PreviewLayerSession& session) {
@@ -9938,9 +10259,20 @@ invisible_places::app::UsedScalarFieldSet CollectRequiredScalarFieldNames(
     for (const auto& visual : session.pointVisuals) {
         addStyle(visual.style);
     }
+    if (SessionPotentiallyNeedsRoughnessMotionFields(session)) {
+        for (const auto& available : session.availableScalarFields) {
+            const auto normalized =
+                NormalizeMotionScalarFieldName(available.name);
+            if (normalized.find("roughness") != std::string::npos ||
+                normalized.find("groundid") != std::string::npos) {
+                used.AddFieldName(available.name);
+            }
+        }
+    }
     // Colourise selectors carry no per-role scoping, and the same field set
     // ships in every density variant and role of a scene, so every effect
-    // contributes to every session rather than risking a miss.
+    // in every exportable take contributes to every session rather than
+    // risking a miss when batch export selects a take not currently open.
     for (const auto& takeState : runtimeState.water.timingTakeSceneStates) {
         for (const auto& effect : takeState.colouriseEffects) {
             used.AddColouriseEffect(effect);
@@ -9962,34 +10294,9 @@ CollectScalarFieldLoadFilter(
     filter.names = CollectRequiredScalarFieldNames(runtimeState, session).Names();
     filter.containsPatterns =
         invisible_places::app::AlwaysResidentScalarFieldPatterns();
-    // Slot-stability floor: the point shaders sniff generated water clouds
-    // by field count and read hard-coded slots (jitter seed 12 .. feature
-    // type 15) on any flow-animated cloud, so file fields 0..15 must keep
-    // their exact resident rows. Selection preserves file order, so
-    // including every one of these indices pins resident slots 0..15 to
-    // file fields 0..15 — the historical layout the look was tuned on.
-    for (std::uint32_t sourceIndex = 0U;
-         sourceIndex <
-         invisible_places::app::kLegacyWaterShaderCompatibilitySourceIndexCount;
-         ++sourceIndex) {
-        filter.sourceIndices.push_back(sourceIndex);
-    }
-    // Caustic assignments are persisted as file-order slots; whitelist them
-    // by index so the styles that reference them keep working, then
-    // MakeSceneRenderStyle translates the slot to the resident row.
-    const auto addCausticSlots = [&filter](const PointCloudStyleState& style) {
-        for (const auto slot : {style.causticMaskFieldSlot,
-                                style.causticEdgeFieldSlot,
-                                style.causticSeedFieldSlot}) {
-            if (slot >= 0) {
-                filter.sourceIndices.push_back(
-                    static_cast<std::uint32_t>(slot));
-            }
-        }
-    };
-    addCausticSlots(session.pointStyle);
-    for (const auto& visual : session.pointVisuals) {
-        addCausticSlots(visual.style);
+    if (SessionPotentiallyNeedsRoughnessMotionFields(session)) {
+        filter.containsPatterns.push_back("roughness");
+        filter.containsPatterns.push_back("groundid");
     }
     return filter;
 }
@@ -10188,8 +10495,11 @@ void EvictScalarFieldsOverBudget(
             continue;
         }
         const auto bytesPerField = SessionScalarFieldBytesPerField(session);
-        const auto required =
-            CollectRequiredScalarFieldNames(*runtimeState, session);
+        const auto required = session.gpuResident
+                                  ? CollectRequiredScalarFieldNames(
+                                        *runtimeState,
+                                        session)
+                                  : invisible_places::app::UsedScalarFieldSet{};
         for (const auto& field : session.scalarFields) {
             residentBytes += bytesPerField;
             std::uint64_t lastTick = 0U;
@@ -10204,18 +10514,10 @@ void EvictScalarFieldsOverBudget(
                 .bytes = bytesPerField,
                 .lastRequiredTick = lastTick,
                 .required = required.Contains(field.name),
-                // Only disk-backed fields can be streamed back on demand;
-                // eviction also needs the loaded/GPU path the removal
-                // helper requires. Fields inside the legacy water-shader
-                // compatibility span stay pinned: removing one would
-                // renumber resident slots 0..15 away from file order,
-                // which the shaders' hard-coded slot reads depend on.
-                .evictable =
-                    field.sourceIndex >=
-                        static_cast<std::int32_t>(
-                            invisible_places::app::
-                                kLegacyWaterShaderCompatibilitySourceIndexCount) &&
-                    session.loaded,
+                // Every disk-backed field can be streamed back on demand.
+                // Generated Water overlays carry explicit content semantics,
+                // so source-cloud slots no longer need a compatibility floor.
+                .evictable = field.sourceIndex >= 0 && session.loaded,
             });
         }
     }
@@ -10279,6 +10581,13 @@ void EnsureRequiredScalarFieldsResident(
          sessionIndex < runtimeState->sessions.size();
          ++sessionIndex) {
         auto& session = runtimeState->sessions[sessionIndex];
+        // CPU-only canonical analysis and retired display bundles never
+        // render their point material. Backfilling visual fields into those
+        // large support clouds wastes I/O and memory; export sessions are
+        // checked explicitly by EnsureFullDensityExportSourcesReady.
+        if (!session.gpuResident) {
+            continue;
+        }
         if (session.kind == LayerKind::PointCloud &&
             session.offlinePointCloud != nullptr &&
             !session.scalarFields.empty()) {
@@ -10535,6 +10844,11 @@ void PollPendingLayerLoad(
     if (runtimeState == nullptr || viewport == nullptr) {
         return;
     }
+    // Retire completed histogram readers before scalar-field completion
+    // considers mutating the same field-major arrays. Keeping this in the
+    // shared poll makes smokes and benchmarks follow the live-loop ordering;
+    // a finished-but-unpolled jthread must not look permanently active.
+    PollTimingColouriseHistogram(runtimeState);
     // Scalar-field residency shares this poll site so every frame pump —
     // live loop, smokes, benchmarks — services field streams without extra
     // wiring. Both calls are cheap no-ops in the common case.
@@ -13140,6 +13454,10 @@ void UnloadCurrentAnimationForWaterEditing(PreviewRuntimeState* runtimeState) {
     runtimeState->animationPanel.timelineViewRange = {};
     runtimeState->animationPanel.timelineViewDrag.reset();
     runtimeState->animationPanel.dirty = false;
+    runtimeState->animationPanel.requestedMatchingFrameGhostCapture.reset();
+    runtimeState->animationPanel.requestedMatchingFrameGhostClear =
+        runtimeState->animationPanel.matchingFrameGhost.uploaded;
+    runtimeState->animationPanel.matchingFrameGhost.visible = false;
     SyncWaterAnimationTrailProfileFromCurrentAnimation(runtimeState);
     runtimeState->water.pathAnchors = {};
     runtimeState->water.pathDirty = true;
@@ -15635,6 +15953,7 @@ std::size_t AddOrRefreshWaterOverlaySession(
     session.kind = LayerKind::PointCloud;
     session.sourcePath = overlayPath;
     session.displayName = overlayPath.stem().string();
+    session.generatedWaterOverlay = true;
     session.hasSourceRgb = headerResult.header.HasColorRgb();
     session.totalPrimitives = headerResult.header.vertexCount;
     session.pointBudget = invisible_places::renderer::pointcloud::MakePointBudgetState(
@@ -15697,6 +16016,7 @@ std::size_t AddOrRefreshWaterFlowOverlaySession(
     session.kind = LayerKind::PointCloud;
     session.sourcePath = overlayPath;
     session.displayName = overlayPath.stem().string();
+    session.generatedWaterOverlay = true;
     if (!existingIndex.has_value() || session.pointVisuals.empty()) {
         session.pointStyle = MakeWaterOverlayDisplayStyle(*runtimeState);
         session.selectedPointVisualName = "Water Flow_preset";
@@ -15769,6 +16089,7 @@ std::size_t AddOrRefreshWaterTrailOverlaySession(
     session.kind = LayerKind::PointCloud;
     session.sourcePath = overlayPath;
     session.displayName = overlayPath.stem().string();
+    session.generatedWaterOverlay = true;
     session.waterFlowSourceId = flowSourceId;
     if (defaultStyle.has_value()) {
         const auto profileName = NormalizeWaterProfileName(visualName);
@@ -15853,6 +16174,7 @@ std::size_t AddOrRefreshDynamicMeshGpuTrailOverlaySession(
     session.kind = LayerKind::PointCloud;
     session.sourcePath = overlayPath;
     session.displayName = overlayPath.stem().string();
+    session.generatedWaterOverlay = true;
     session.hasSourceRgb = true;
     session.hasNormals = true;
     session.totalPrimitives = result.pointCount;
@@ -16307,6 +16629,7 @@ std::size_t AddOrRefreshWaterEffectOverlaySession(
     session.kind = LayerKind::PointCloud;
     session.sourcePath = overlayPath;
     session.displayName = overlayPath.stem().string();
+    session.generatedWaterOverlay = true;
     if (!existingIndex.has_value() || session.pointVisuals.empty()) {
         session.pointStyle = MakeWaterEffectOverlayStyle(visualName);
         session.selectedPointVisualName = std::string{visualName};
@@ -18131,6 +18454,9 @@ std::size_t RestoreWaterRippleRuntimeCachesForLoadedSessions(
     invisible_places::renderer::core::VulkanViewportShell* viewport,
     std::size_t* restoredMembershipCount,
     std::size_t* restoredRegionCount) {
+    if (!kRippleWaterRuntimeEnabled) {
+        return 0U;
+    }
     if (runtimeState == nullptr || viewport == nullptr) {
         return 0U;
     }
@@ -18163,6 +18489,9 @@ std::size_t RestoreWaterRippleRuntimeCachesForLoadedSessions(
 std::vector<WaterRippleRuntimeCacheDocument> CurrentWaterRippleRuntimeCachesForDocument(
     const PreviewRuntimeState& runtimeState) {
     std::vector<WaterRippleRuntimeCacheDocument> caches;
+    if (!kRippleWaterRuntimeEnabled) {
+        return caches;
+    }
     for (const auto& cache : runtimeState.water.rippleRuntimeCaches) {
         if (cache.stale ||
             cache.memberships.empty() ||
@@ -18453,7 +18782,11 @@ void LoadWaterSources(
     SeedWaterSeepageProfilePresets(&runtimeState->water);
     runtimeState->water.rippleLayers = document->rippleLayers;
     runtimeState->water.fieldLayers = document->fieldLayers;
-    runtimeState->water.rippleRuntimeCaches = document->rippleRuntimeCaches;
+    if (kRippleWaterRuntimeEnabled) {
+        runtimeState->water.rippleRuntimeCaches = document->rippleRuntimeCaches;
+    } else {
+        runtimeState->water.rippleRuntimeCaches.clear();
+    }
     runtimeState->water.flowTrailSettings = document->flowTrailSettings;
     runtimeState->water.showFlowTrails = document->showFlowTrails;
     runtimeState->water.defaultTrailGeometry = document->trailGeometry;
@@ -19347,6 +19680,9 @@ bool RefreshWaterRippleEffects(
     if (runtimeState == nullptr || viewport == nullptr) {
         return false;
     }
+    if (!kRippleWaterRuntimeEnabled) {
+        return false;
+    }
     if (!EnsureSceneAnalysisReadyForAction(
             runtimeState,
             DeferredSceneAnalysisAction::RefreshWaterRipple,
@@ -19643,6 +19979,12 @@ void QueueWaterRippleLiveEffectRefresh(
 void PollWaterRippleLiveEffectRefresh(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (!kRippleWaterRuntimeEnabled) {
+        if (runtimeState != nullptr) {
+            runtimeState->water.pendingRippleLiveEffectKey.reset();
+        }
+        return;
+    }
     if (runtimeState == nullptr || viewport == nullptr ||
         !runtimeState->water.pendingRippleLiveEffectKey.has_value()) {
         return;
@@ -20391,6 +20733,9 @@ void StartDynamicMeshSurfaceCacheWarmup(PreviewRuntimeState* runtimeState, bool 
     if (runtimeState == nullptr) {
         return;
     }
+    if (!kMeshFlowWaterRuntimeEnabled) {
+        return;
+    }
     auto& water = runtimeState->water;
     // This cache is only useful to the enabled Mesh Flow feature. In particular,
     // avoid parsing and indexing a multi-million-triangle mesh in parallel with
@@ -20658,12 +21003,16 @@ bool RefreshWaterDynamicMeshFlowOverlay(
         return false;
     }
     auto& water = runtimeState->water;
-    if (!water.dynamicMeshFlowSettings.enabled) {
+    if (!kMeshFlowWaterRuntimeEnabled ||
+        !water.dynamicMeshFlowSettings.enabled) {
         water.dynamicMeshTrailOverlay = {};
         water.dynamicMeshFlowDiagnostics = {};
         water.lastDynamicMeshTrailOverlayPath.clear();
         UnloadGeneratedWaterOverlaySessionsWithStemSuffix(runtimeState, viewport, "-DynamicMeshTrails");
-        runtimeState->statusMessage = "Dynamic mesh flow disabled.";
+        runtimeState->statusMessage =
+            kMeshFlowWaterRuntimeEnabled
+                ? "Dynamic mesh flow disabled."
+                : "Mesh Flow is inactive; authored settings were preserved.";
         runtimeState->errorMessage.clear();
         return true;
     }
@@ -20815,6 +21164,16 @@ bool EnsureWaterDynamicMeshFlowGpuUpToDate(
     }
     auto& water = runtimeState->water;
     auto& liveSettings = water.dynamicMeshFlowSettings;
+    if (!kMeshFlowWaterRuntimeEnabled) {
+        if (water.dynamicMeshFlowGpuSessionIndex.has_value() &&
+            water.dynamicMeshFlowGpuSessionIndex.value() <
+                runtimeState->sessions.size()) {
+            runtimeState
+                ->sessions[water.dynamicMeshFlowGpuSessionIndex.value()]
+                .visible = false;
+        }
+        return false;
+    }
     // Disabled is the common idle state: skip the ground-view and active-
     // scene lookups (they normalize scene/session paths every frame) and
     // only keep the overlay session hidden.
@@ -21125,7 +21484,8 @@ bool EnsureWaterDynamicMeshFlowGpuUpToDate(
 bool RefreshWaterDynamicMeshFlowOverlayIfWarm(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
-    if (runtimeState == nullptr || viewport == nullptr) {
+    if (runtimeState == nullptr || viewport == nullptr ||
+        !kMeshFlowWaterRuntimeEnabled) {
         return false;
     }
     if (!runtimeState->water.dynamicMeshFlowSettings.enabled ||
@@ -21139,7 +21499,8 @@ bool RefreshWaterDynamicMeshFlowOverlayIfWarm(
 bool RefreshWaterDynamicMeshFlowOverlayFromUiEdit(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
-    if (runtimeState == nullptr || viewport == nullptr) {
+    if (runtimeState == nullptr || viewport == nullptr ||
+        !kMeshFlowWaterRuntimeEnabled) {
         return false;
     }
     if (!runtimeState->water.dynamicMeshFlowSettings.enabled) {
@@ -21218,6 +21579,9 @@ bool RefreshWaterFieldOverlays(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
     if (runtimeState == nullptr || viewport == nullptr) {
+        return false;
+    }
+    if (!kFieldWaterRuntimeEnabled) {
         return false;
     }
     if (!EnsureSceneAnalysisReadyForAction(
@@ -21644,7 +22008,8 @@ bool ApplyWaterEffectCompositionToDisplaySources(
 
 std::vector<WaterEffectOverlay> CurrentFilteredWaterEffectOverlays(const WaterWorkflowState& water) {
     std::vector<WaterEffectOverlay> overlays;
-    if (!water.fieldSurfaceEffectOverlay.points.empty()) {
+    if (kFieldWaterRuntimeEnabled &&
+        !water.fieldSurfaceEffectOverlay.points.empty()) {
         overlays.push_back(water.fieldSurfaceEffectOverlay);
     }
     return overlays;
@@ -22073,7 +22438,8 @@ bool QueueWaterRegionPointPreviewForLayer(
 void QueueWaterRegionPointPreviewsForAllRegions(
     PreviewRuntimeState* runtimeState,
     const invisible_places::renderer::core::VulkanViewportShell* viewport) {
-    if (runtimeState == nullptr) {
+    if (runtimeState == nullptr ||
+        (!kRippleWaterRuntimeEnabled && !kFieldWaterRuntimeEnabled)) {
         return;
     }
     std::vector<WaterEffectLayer> layers;
@@ -22097,7 +22463,8 @@ void QueueWaterRegionPointPreviewsForAllRegions(
 void QueueWaterRegionPointPreviewsForDirtyRegions(
     PreviewRuntimeState* runtimeState,
     const invisible_places::renderer::core::VulkanViewportShell* viewport) {
-    if (runtimeState == nullptr) {
+    if (runtimeState == nullptr ||
+        (!kRippleWaterRuntimeEnabled && !kFieldWaterRuntimeEnabled)) {
         return;
     }
 
@@ -23011,9 +23378,16 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
         auto associatedLayerPaths =
             AnimationRegistryAssociationPaths(runtimeState.animationPanel, index);
         CanonicalizeAssociatedLayerPathsForSceneGroups(runtimeState, &associatedLayerPaths);
+        const auto* registryPath = RegistryAnimationPath(
+            runtimeState,
+            index);
         document.savedAnimations.push_back(
             {.filePath = runtimeState.animationPanel.availableFiles[index],
-             .associatedLayerPaths = std::move(associatedLayerPaths)});
+             .associatedLayerPaths = std::move(associatedLayerPaths),
+             .velocityBlendLink =
+                 registryPath != nullptr
+                     ? registryPath->velocityBlendLink
+                     : std::nullopt});
     }
     document.renderJobSettings = RenderSettingsFromExportPreset(
         ViewedExportPreset(runtimeState),
@@ -23466,7 +23840,8 @@ bool IsExportPointCloudSourceCandidate(
     }
 
     const auto& session = runtimeState.sessions[sessionIndex];
-    if (session.kind != LayerKind::PointCloud) {
+    if (session.kind != LayerKind::PointCloud ||
+        IsInactiveLegacyWaterOverlaySession(session)) {
         return false;
     }
     if (!IsSceneGroupedPointCloud(session)) {
@@ -23651,6 +24026,116 @@ bool EnsureFullDensityExportSourcesReady(
     return true;
 }
 
+struct ExportSourceReleaseSummary {
+    std::size_t gpuSessionCount = 0U;
+    std::size_t cpuSessionCount = 0U;
+    std::size_t retainedAnalysisCpuSessionCount = 0U;
+    std::string warning;
+};
+
+ExportSourceReleaseSummary ReleaseExportOnlyPointCloudSources(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    ExportSourceReleaseSummary summary;
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return summary;
+    }
+
+    // Finest-density scene roles can be loaded and uploaded solely for an
+    // export while the viewport continues to show a coarser committed bundle.
+    // Reuse them throughout one batch, then retire only sessions with no live
+    // display owner. Analysis sources keep their CPU payload because Shoreline,
+    // Seepage, Rain, and Flow may still use it; their export-only GPU copy is
+    // safe to release. The shared WaterSurfaceCache is independent and remains
+    // warm.
+    std::vector<std::size_t> releaseIndices;
+    for (const auto& scene : runtimeState->pointCloudScenes) {
+        for (const auto sessionIndex :
+             SceneFullDensityExportSessionIndices(scene)) {
+            if (!sessionIndex.has_value() ||
+                sessionIndex.value() >= runtimeState->sessions.size() ||
+                std::find(
+                    releaseIndices.begin(),
+                    releaseIndices.end(),
+                    sessionIndex.value()) != releaseIndices.end()) {
+                continue;
+            }
+            const auto& session =
+                runtimeState->sessions[sessionIndex.value()];
+            if (session.committedDisplaySource ||
+                session.pendingDisplaySource) {
+                continue;
+            }
+            const bool hasExportOnlyGpuCopy =
+                session.gpuResident || session.loaded;
+            const bool hasUnownedCpuCopy =
+                session.cpuResident && !session.analysisSource;
+            if (hasExportOnlyGpuCopy || hasUnownedCpuCopy) {
+                releaseIndices.push_back(sessionIndex.value());
+            }
+        }
+    }
+    if (releaseIndices.empty()) {
+        return summary;
+    }
+
+    const bool hasGpuResources = std::any_of(
+        releaseIndices.begin(),
+        releaseIndices.end(),
+        [&](std::size_t index) {
+            return runtimeState->sessions[index].gpuResident ||
+                   runtimeState->sessions[index].loaded;
+        });
+    std::optional<PointCloudMutationBatchScope> mutationBatch;
+    try {
+        // Removing all role buffers under one resource mutation avoids a
+        // separate device settle for ROCK, SAND, and VEG.
+        if (hasGpuResources) {
+            mutationBatch.emplace(viewport);
+        }
+        for (const auto index : releaseIndices) {
+            auto& session = runtimeState->sessions[index];
+            const bool hadGpuResources =
+                session.gpuResident || session.loaded;
+            const bool hadCpuResources = session.cpuResident;
+            const bool releaseCpuResources = !session.analysisSource;
+            UnloadLayerByIndex(
+                runtimeState,
+                viewport,
+                index,
+                releaseCpuResources);
+            if (hadGpuResources &&
+                !session.gpuResident && !session.loaded) {
+                ++summary.gpuSessionCount;
+            }
+            if (hadCpuResources && releaseCpuResources &&
+                !session.cpuResident) {
+                ++summary.cpuSessionCount;
+            } else if (hadCpuResources && !releaseCpuResources &&
+                       session.cpuResident) {
+                ++summary.retainedAnalysisCpuSessionCount;
+            }
+        }
+        if (mutationBatch.has_value()) {
+            mutationBatch->Finish();
+        }
+        if (summary.gpuSessionCount > 0U) {
+            runtimeState->previewRenderStateSignatureValid = false;
+        }
+        std::cout
+            << "Released export-only point-cloud residency: "
+            << summary.gpuSessionCount << " GPU session(s), "
+            << summary.cpuSessionCount << " unowned CPU session(s); retained "
+            << summary.retainedAnalysisCpuSessionCount
+            << " analysis CPU session(s)." << std::endl;
+    } catch (const std::exception& error) {
+        summary.warning =
+            "Could not fully release export-only point-cloud resources: " +
+            std::string{error.what()};
+    }
+    return summary;
+}
+
 void StopBackgroundWorkForShutdown(PreviewRuntimeState* runtimeState) {
     if (runtimeState == nullptr) {
         return;
@@ -23685,6 +24170,22 @@ void StopBackgroundWorkForShutdown(PreviewRuntimeState* runtimeState) {
     }
     histogramJob.shared.reset();
     histogramJob.activeBatchId.clear();
+    if (runtimeState->animationVelocityPreviewJob.worker.joinable()) {
+        runtimeState->animationVelocityPreviewJob.worker.request_stop();
+        runtimeState->animationVelocityPreviewJob.worker = std::jthread{};
+    }
+    runtimeState->animationVelocityPreviewJob.shared.reset();
+    if (runtimeState->animationStrongAlignmentJob.worker.joinable()) {
+        runtimeState->animationStrongAlignmentJob.worker.request_stop();
+        runtimeState->animationStrongAlignmentJob.worker = std::jthread{};
+    }
+    runtimeState->animationStrongAlignmentJob.shared.reset();
+    if (runtimeState->animationMatchingFrameGhostJob.worker.joinable()) {
+        runtimeState->animationMatchingFrameGhostJob.worker.request_stop();
+        runtimeState->animationMatchingFrameGhostJob.worker = std::jthread{};
+    }
+    runtimeState->animationMatchingFrameGhostJob.shared.reset();
+    runtimeState->animationMatchingFrameGhostJob.sourceCache.reset();
 
     if (!runtimeState->pendingLoad.has_value()) {
         return;
@@ -23975,6 +24476,17 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->animationPanel.timelineViewRange = {};
     runtimeState->animationPanel.timelineViewDrag.reset();
     runtimeState->animationPanel.dirty = false;
+    if (runtimeState->animationMatchingFrameGhostJob.worker.joinable()) {
+        runtimeState->animationMatchingFrameGhostJob.worker.request_stop();
+        runtimeState->animationMatchingFrameGhostJob.worker =
+            std::jthread{};
+    }
+    runtimeState->animationMatchingFrameGhostJob.shared.reset();
+    runtimeState->animationMatchingFrameGhostJob.sourceCache.reset();
+    viewport->RemovePointCloud(kAnimationMatchingFrameGhostLayerId);
+    runtimeState->animationPanel.matchingFrameGhost = {};
+    runtimeState->animationPanel.requestedMatchingFrameGhostCapture.reset();
+    runtimeState->animationPanel.requestedMatchingFrameGhostClear = false;
 
     CancelWaterFlowTrailBuildJob(&runtimeState->water);
     runtimeState->water.flowTrailSourceRequests.clear();
@@ -24172,7 +24684,12 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->water.rippleEffectOverlay = {};
     runtimeState->water.fieldSurfaceEffectOverlay = {};
     runtimeState->water.fieldCache = {};
-    runtimeState->water.rippleRuntimeCaches = document.waterRippleRuntimeCaches;
+    if (kRippleWaterRuntimeEnabled) {
+        runtimeState->water.rippleRuntimeCaches =
+            document.waterRippleRuntimeCaches;
+    } else {
+        runtimeState->water.rippleRuntimeCaches.clear();
+    }
     runtimeState->water.fieldCacheRevision = 0U;
     runtimeState->water.regionPointPreviews.clear();
     runtimeState->water.regionPointPreviewOverrides.clear();
@@ -24398,6 +24915,8 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->animationPanel.availableFileEditedPaths.clear();
     runtimeState->animationPanel.availableFileLoopEditPairIds.clear();
     runtimeState->animationPanel.availableFileDirtyFlags.clear();
+    runtimeState->animationPanel.brokenVelocityLinkPathKeys.clear();
+    runtimeState->animationPanel.projectVelocityLinksDirty = false;
     runtimeState->animationPanel.selectedExportFiles.clear();
     if (document.hasSavedAnimationRegistry) {
         for (const auto& animation : document.savedAnimations) {
@@ -24411,6 +24930,7 @@ bool ApplyProjectDocumentToRuntime(
         runtimeState->animationPanel.animationRegistryInitialized = false;
         RefreshAnimationFileList(&runtimeState->animationPanel, AnimationDirectory(*runtimeState));
     }
+    ValidateProjectAnimationVelocityLinks(document, runtimeState);
     runtimeState->animationPanel.renamingFileIndex.reset();
     runtimeState->animationPanel.fileRenameBuffer.clear();
     runtimeState->animationPanel.focusFileRename = false;
@@ -25333,14 +25853,20 @@ std::optional<std::size_t> FindAnimationRegistryIndexByFileName(
     if (fileName.empty()) {
         return std::nullopt;
     }
+    std::optional<std::size_t> match;
     for (std::size_t index = 0U;
          index < panelState.availableFiles.size();
          ++index) {
         if (panelState.availableFiles[index].filename().string() == fileName) {
-            return index;
+            if (match.has_value()) {
+                // Pair metadata is filename-based by design. Never guess
+                // when two registry roots contain the same filename.
+                return std::nullopt;
+            }
+            match = index;
         }
     }
-    return std::nullopt;
+    return match;
 }
 
 std::vector<std::filesystem::path>* AnimationRegistryAssociationPaths(
@@ -25802,6 +26328,200 @@ const AnimationPath* RegistryAnimationPath(const PreviewRuntimeState& runtimeSta
     return SavedRegistryAnimationPath(runtimeState, fileIndex);
 }
 
+enum class AnimationVelocityLinkDisplayState : std::uint8_t {
+    None = 0,
+    Linked,
+    Dirty,
+    Broken,
+};
+
+AnimationVelocityLinkDisplayState AnimationVelocityLinkState(
+    const PreviewRuntimeState& runtimeState,
+    std::size_t fileIndex) {
+    if (fileIndex < runtimeState.animationPanel.availableFiles.size() &&
+        runtimeState.animationPanel.brokenVelocityLinkPathKeys.contains(
+            NormalizePathKey(
+                runtimeState.animationPanel.availableFiles[fileIndex]))) {
+        return AnimationVelocityLinkDisplayState::Broken;
+    }
+    const auto* path = RegistryAnimationPath(runtimeState, fileIndex);
+    if (path == nullptr || !path->velocityBlendLink.has_value()) {
+        return AnimationVelocityLinkDisplayState::None;
+    }
+    const auto partnerIndex = FindAnimationRegistryIndexByFileName(
+        runtimeState.animationPanel,
+        path->velocityBlendLink->partnerFileName);
+    if (!partnerIndex.has_value()) {
+        return AnimationVelocityLinkDisplayState::Broken;
+    }
+    const auto* partner = RegistryAnimationPath(
+        runtimeState,
+        partnerIndex.value());
+    if (partner == nullptr || !partner->velocityBlendLink.has_value() ||
+        partner->velocityBlendLink->pairId !=
+            path->velocityBlendLink->pairId ||
+        partner->velocityBlendLink->partnerFileName !=
+            runtimeState.animationPanel.availableFiles[fileIndex]
+                .filename()
+                .string()) {
+        return AnimationVelocityLinkDisplayState::Broken;
+    }
+    const auto& panel = runtimeState.animationPanel;
+    const bool dirty =
+        (fileIndex < panel.availableFileDirtyFlags.size() &&
+         panel.availableFileDirtyFlags[fileIndex]) ||
+        (partnerIndex.value() < panel.availableFileDirtyFlags.size() &&
+         panel.availableFileDirtyFlags[partnerIndex.value()]);
+    return dirty ? AnimationVelocityLinkDisplayState::Dirty
+                 : AnimationVelocityLinkDisplayState::Linked;
+}
+
+const char* AnimationVelocityLinkSuffix(
+    AnimationVelocityLinkDisplayState state) {
+    switch (state) {
+        case AnimationVelocityLinkDisplayState::Linked:
+            return " [Linked]";
+        case AnimationVelocityLinkDisplayState::Dirty:
+            return " [Linked-dirty]";
+        case AnimationVelocityLinkDisplayState::Broken:
+            return " [Link broken]";
+        case AnimationVelocityLinkDisplayState::None:
+        default:
+            return "";
+    }
+}
+
+bool AnimationVelocityLinksEquivalent(
+    const invisible_places::camera::AnimationVelocityBlendLinkMetadata& left,
+    const invisible_places::camera::AnimationVelocityBlendLinkMetadata& right) {
+    const auto close = [](float a, float b) {
+        return std::abs(a - b) <= 1.0e-5F;
+    };
+    auto leftMovable = left.movableKeyIds;
+    auto rightMovable = right.movableKeyIds;
+    std::sort(leftMovable.begin(), leftMovable.end());
+    std::sort(rightMovable.begin(), rightMovable.end());
+    if (left.pairId != right.pairId ||
+        left.partnerFileName != right.partnerFileName ||
+        !close(left.maxEndMoveFraction, right.maxEndMoveFraction) ||
+        !close(
+            left.strongAlignMaxMoveFraction,
+            right.strongAlignMaxMoveFraction) ||
+        !close(left.startOverlapSeconds, right.startOverlapSeconds) ||
+        !close(left.endOverlapSeconds, right.endOverlapSeconds) ||
+        left.horizontalBlend != right.horizontalBlend ||
+        left.panRight != right.panRight ||
+        leftMovable != rightMovable) {
+        return false;
+    }
+    return true;
+}
+
+void ValidateProjectAnimationVelocityLinks(
+    const ProjectDocument& document,
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    auto& panel = runtimeState->animationPanel;
+    panel.brokenVelocityLinkPathKeys.clear();
+    panel.projectVelocityLinksDirty = false;
+    std::vector<std::size_t> missingProjectRecords;
+
+    for (std::size_t index = 0U; index < panel.availableFiles.size(); ++index) {
+        const auto* saved = SavedRegistryAnimationPath(*runtimeState, index);
+        if (saved == nullptr) {
+            continue;
+        }
+        const auto projectEntry = std::find_if(
+            document.savedAnimations.begin(),
+            document.savedAnimations.end(),
+            [&](const ProjectDocument::SavedAnimation& animation) {
+                return PathsLexicallyEqual(
+                    animation.filePath,
+                    panel.availableFiles[index]);
+            });
+        const auto projectLink =
+            projectEntry != document.savedAnimations.end()
+                ? projectEntry->velocityBlendLink
+                : std::nullopt;
+
+        if (saved->sourceSchemaVersion <
+                invisible_places::serialization::
+                    kAnimationDocumentSchemaVersion &&
+            saved->velocityBlendLink.has_value()) {
+            auto migrated = *saved;
+            migrated.sourceSchemaVersion =
+                invisible_places::serialization::
+                    kAnimationDocumentSchemaVersion;
+            panel.availableFileEditedPaths[index] = std::move(migrated);
+            panel.availableFileDirtyFlags[index] = true;
+            panel.availableFileLoopEditPairIds[index] =
+                saved->velocityBlendLink->pairId;
+            panel.projectVelocityLinksDirty = true;
+        }
+
+        if (saved->velocityBlendLink.has_value() &&
+            projectLink.has_value()) {
+            if (!AnimationVelocityLinksEquivalent(
+                    saved->velocityBlendLink.value(),
+                    projectLink.value())) {
+                panel.brokenVelocityLinkPathKeys.insert(
+                    NormalizePathKey(panel.availableFiles[index]));
+            }
+        } else if (saved->velocityBlendLink.has_value()) {
+            missingProjectRecords.push_back(index);
+        } else if (projectLink.has_value()) {
+            panel.brokenVelocityLinkPathKeys.insert(
+                NormalizePathKey(panel.availableFiles[index]));
+        }
+    }
+
+    for (const auto index : missingProjectRecords) {
+        const auto* saved = SavedRegistryAnimationPath(*runtimeState, index);
+        if (saved == nullptr || !saved->velocityBlendLink.has_value()) {
+            continue;
+        }
+        const auto partnerIndex = FindAnimationRegistryIndexByFileName(
+            panel,
+            saved->velocityBlendLink->partnerFileName);
+        const auto* partner = partnerIndex.has_value()
+                                  ? SavedRegistryAnimationPath(
+                                        *runtimeState,
+                                        partnerIndex.value())
+                                  : nullptr;
+        const bool reciprocal =
+            partner != nullptr && partner->velocityBlendLink.has_value() &&
+            partner->velocityBlendLink->pairId ==
+                saved->velocityBlendLink->pairId &&
+            partner->velocityBlendLink->partnerFileName ==
+                panel.availableFiles[index].filename().string();
+        if (reciprocal) {
+            panel.projectVelocityLinksDirty = true;
+        } else {
+            panel.brokenVelocityLinkPathKeys.insert(
+                NormalizePathKey(panel.availableFiles[index]));
+            if (partnerIndex.has_value()) {
+                panel.brokenVelocityLinkPathKeys.insert(
+                    NormalizePathKey(
+                        panel.availableFiles[partnerIndex.value()]));
+            }
+        }
+    }
+
+    if (document.sourceSchemaVersion <
+            invisible_places::serialization::kProjectDocumentSchemaVersion &&
+        std::any_of(
+            panel.availableFileLoadedPaths.begin(),
+            panel.availableFileLoadedPaths.end(),
+            [](const auto& path) {
+                return path.has_value() &&
+                       path->velocityBlendLink.has_value();
+            })) {
+        panel.projectVelocityLinksDirty = true;
+    }
+}
+
 std::string AnimationRegistryDisplayLabel(
     const PreviewRuntimeState& runtimeState,
     std::size_t fileIndex) {
@@ -25815,6 +26535,8 @@ std::string AnimationRegistryDisplayLabel(
             fileIndex)) {
         label += "_Edited";
     }
+    label += AnimationVelocityLinkSuffix(
+        AnimationVelocityLinkState(runtimeState, fileIndex));
     return label;
 }
 
@@ -26270,116 +26992,6 @@ void ApplyAnimationEvaluationResult(
     runtimeState->pivotOverlay.lastSetAt = std::chrono::steady_clock::now();
 }
 
-bool EvaluateLinkedLoopLiveCamera(
-    const PreviewRuntimeState& runtimeState,
-    const AnimationPath& path,
-    float amount,
-    invisible_places::camera::AnimationPathEvaluation* evaluation,
-    invisible_places::camera::AnimationLinkedLoopSourceSample*
-        sourceSample = nullptr) {
-    if (evaluation == nullptr || !path.linkedLoop.has_value()) {
-        return false;
-    }
-
-    const auto& metadata = path.linkedLoop.value();
-    const auto firstIndex = FindAnimationRegistryIndexByFileName(
-        runtimeState.animationPanel,
-        metadata.firstFileName);
-    const auto secondIndex = FindAnimationRegistryIndexByFileName(
-        runtimeState.animationPanel,
-        metadata.secondFileName);
-    if (!firstIndex.has_value() || !secondIndex.has_value()) {
-        return false;
-    }
-    const auto* first = RegistryAnimationPath(
-        runtimeState,
-        firstIndex.value());
-    const auto* second = RegistryAnimationPath(
-        runtimeState,
-        secondIndex.value());
-    if (first == nullptr || second == nullptr ||
-        first->keys.size() < 2U || second->keys.size() < 2U) {
-        return false;
-    }
-
-    const auto& panel = runtimeState.animationPanel;
-    const bool isCurrentLinkedPath =
-        panel.currentPath.has_value() &&
-        panel.currentPath->linkedLoop.has_value() &&
-        panel.currentPath->linkedLoop->firstFileName ==
-            metadata.firstFileName &&
-        panel.currentPath->linkedLoop->secondFileName ==
-            metadata.secondFileName;
-    const std::int32_t paddingFrames =
-        isCurrentLinkedPath
-            ? static_cast<std::int32_t>(panel.linkedLoopPaddingFrames)
-            : metadata.paddingFrames;
-    const std::string_view startKeyId =
-        isCurrentLinkedPath && !panel.linkedLoopStartKeyId.empty()
-            ? std::string_view{panel.linkedLoopStartKeyId}
-            : std::string_view{metadata.firstStartKeyId};
-    float firstStartPosition = metadata.firstStartPosition;
-    const auto startKey = std::find_if(
-        first->keys.begin(),
-        first->keys.end(),
-        [startKeyId](const auto& key) {
-            return key.id == startKeyId;
-        });
-    if (startKey != first->keys.end()) {
-        firstStartPosition = invisible_places::camera::
-            AnimationPathKeyNormalizedPosition(
-                *first,
-                static_cast<std::size_t>(
-                    std::distance(first->keys.begin(), startKey)));
-    }
-
-    const auto sample = invisible_places::camera::
-        EvaluateLinkedLoopSourceSample(
-            *first,
-            *second,
-            firstStartPosition,
-            paddingFrames,
-            std::clamp(amount, 0.0F, 1.0F));
-    if (!sample.valid) {
-        return false;
-    }
-    if (sourceSample != nullptr) {
-        *sourceSample = sample;
-    }
-    const auto dominantEvaluation = [&]() -> const auto& {
-        if (sample.firstActive &&
-            (!sample.secondActive ||
-             sample.firstWeight >= sample.secondWeight)) {
-            return sample.first;
-        }
-        if (sample.secondActive) {
-            return sample.second;
-        }
-        // Positive padding can leave a held interval with no active clip.
-        return sample.blended;
-    };
-    switch (panel.linkedLoopLiveCameraMode) {
-        case LinkedLoopLiveCameraMode::SourceA:
-            *evaluation = sample.firstActive
-                              ? sample.first
-                              : dominantEvaluation();
-            break;
-        case LinkedLoopLiveCameraMode::SourceB:
-            *evaluation = sample.secondActive
-                              ? sample.second
-                              : dominantEvaluation();
-            break;
-        case LinkedLoopLiveCameraMode::InterleavedOverlay:
-        default:
-            // Overlay owns the overlap presentation. Any evaluation that
-            // happens before its alternating render update uses the dominant
-            // source rather than resurrecting the removed movement blend.
-            *evaluation = dominantEvaluation();
-            break;
-    }
-    return true;
-}
-
 void ApplyAnimationEvaluation(
     PreviewRuntimeState* runtimeState,
     const AnimationPath& path,
@@ -26389,104 +27001,14 @@ void ApplyAnimationEvaluation(
         return;
     }
 
-    invisible_places::camera::AnimationPathEvaluation evaluation;
-    if (!EvaluateLinkedLoopLiveCamera(
-            *runtimeState,
-            path,
-            amount,
-            &evaluation)) {
-        evaluation = invisible_places::camera::EvaluateAnimationPath(
-            path,
-            AnimationDurationSeconds(path) *
-                std::clamp(amount, 0.0F, 1.0F));
-    }
+    auto evaluation = invisible_places::camera::EvaluateAnimationPath(
+        path,
+        AnimationDurationSeconds(path) *
+            std::clamp(amount, 0.0F, 1.0F));
     ApplyAnimationEvaluationResult(
         runtimeState,
         std::move(evaluation),
         allowDepthOfField);
-}
-
-void UpdateLinkedLoopTemporalCameraOverlay(
-    PreviewRuntimeState* runtimeState,
-    invisible_places::renderer::core::VulkanViewportShell* viewport) {
-    if (runtimeState == nullptr || viewport == nullptr) {
-        return;
-    }
-    auto& panel = runtimeState->animationPanel;
-    const bool requested =
-        panel.linkedLoopLiveCameraMode ==
-            LinkedLoopLiveCameraMode::InterleavedOverlay &&
-        panel.currentPath.has_value() &&
-        panel.currentPath->linkedLoop.has_value() &&
-        !runtimeState->cameraPlayback.active;
-    if (!requested) {
-        panel.linkedLoopTemporalOverlayWasActive = false;
-        panel.linkedLoopTemporalRenderFirstNext = true;
-        viewport->SetTemporalCameraOverlay(false);
-        return;
-    }
-
-    invisible_places::camera::AnimationPathEvaluation fallbackEvaluation;
-    invisible_places::camera::AnimationLinkedLoopSourceSample sourceSample;
-    if (!EvaluateLinkedLoopLiveCamera(
-            *runtimeState,
-            panel.currentPath.value(),
-            panel.scrubAmount,
-            &fallbackEvaluation,
-            &sourceSample)) {
-        panel.linkedLoopTemporalOverlayWasActive = false;
-        panel.linkedLoopTemporalRenderFirstNext = true;
-        viewport->SetTemporalCameraOverlay(false);
-        return;
-    }
-
-    const bool allowDepthOfField =
-        runtimeState->animationPlayback.active ||
-        panel.previewDepthOfField;
-    if (!sourceSample.firstActive || !sourceSample.secondActive) {
-        panel.linkedLoopTemporalOverlayWasActive = false;
-        panel.linkedLoopTemporalRenderFirstNext = true;
-        viewport->SetTemporalCameraOverlay(false);
-        ApplyAnimationEvaluationResult(
-            runtimeState,
-            std::move(fallbackEvaluation),
-            allowDepthOfField);
-        return;
-    }
-
-    bool renderFirst = panel.linkedLoopTemporalRenderFirstNext;
-    if (!panel.linkedLoopTemporalOverlayWasActive) {
-        // The first cached image should be the dominant source so entering an
-        // overlap never flashes the nominally zero-weight camera.
-        renderFirst =
-            sourceSample.firstWeight >= sourceSample.secondWeight;
-        panel.linkedLoopTemporalOverlayWasActive = true;
-    }
-    panel.linkedLoopTemporalRenderFirstNext = !renderFirst;
-    ApplyAnimationEvaluationResult(
-        runtimeState,
-        renderFirst ? sourceSample.first : sourceSample.second,
-        allowDepthOfField);
-    const float aspectRatio = CurrentAspectRatio(*viewport);
-    std::array<glm::mat4, 2U> currentSourceViewProjections{};
-    const auto sourceViewProjection =
-        [aspectRatio](
-            const invisible_places::camera::AnimationPathEvaluation&
-                evaluation) {
-            invisible_places::camera::OrbitCamera sourceCamera;
-            sourceCamera.ApplyState(evaluation.camera);
-            return sourceCamera.Matrices(aspectRatio).viewProjection;
-        };
-    currentSourceViewProjections[0U] =
-        sourceViewProjection(sourceSample.first);
-    currentSourceViewProjections[1U] =
-        sourceViewProjection(sourceSample.second);
-    viewport->SetTemporalCameraOverlay(
-        true,
-        renderFirst ? 0U : 1U,
-        sourceSample.firstWeight,
-        sourceSample.secondWeight,
-        &currentSourceViewProjections);
 }
 
 void EmbedAnimationWaterScenarioFallbacks(
@@ -26808,19 +27330,6 @@ bool LoadAnimationPathVariant(
     }
     panel.currentFilePath = inputPath.string();
     panel.draftAnimationName = panel.currentPath->name;
-    if (panel.currentPath->linkedLoop.has_value()) {
-        panel.linkedLoopPaddingFrames =
-            panel.currentPath->linkedLoop->paddingFrames;
-        panel.linkedLoopStartKeyId =
-            panel.currentPath->linkedLoop->firstStartKeyId;
-    } else {
-        panel.linkedLoopPaddingFrames = 0;
-        panel.linkedLoopStartKeyId.clear();
-    }
-    panel.linkedLoopLiveCameraMode =
-        LinkedLoopLiveCameraMode::InterleavedOverlay;
-    panel.linkedLoopTemporalOverlayWasActive = false;
-    panel.linkedLoopTemporalRenderFirstNext = true;
     ApplyActiveExportPresetToRenderSettings(runtimeState);
     panel.selectedKeyIndex =
         panel.currentPath->keys.empty()
@@ -26899,6 +27408,23 @@ bool DiscardAnimationEdits(
             }
         }
     }
+    if (panel.velocityAlignmentDraft.has_value()) {
+        const auto& draft = panel.velocityAlignmentDraft.value();
+        const bool discardsDraftMember = std::any_of(
+            discardIndices.begin(),
+            discardIndices.end(),
+            [&](std::size_t index) {
+                return PathsLexicallyEqual(
+                           panel.availableFiles[index],
+                           draft.firstFilePath) ||
+                       PathsLexicallyEqual(
+                           panel.availableFiles[index],
+                           draft.secondFilePath);
+            });
+        if (discardsDraftMember) {
+            panel.velocityAlignmentDraft.reset();
+        }
+    }
 
     bool reloadCurrentSavedVersion = false;
     for (const auto index : discardIndices) {
@@ -26940,7 +27466,9 @@ bool DiscardAnimationEdits(
     runtimeState->statusMessage =
         discardIndices.size() == 1U
             ? "Discarded the edited animation and restored its saved version."
-            : "Discarded both edited loop animations and restored their saved versions.";
+            : "Discarded all " +
+                  std::to_string(discardIndices.size()) +
+                  " velocity-blend dependency edits and restored their saved versions.";
     runtimeState->errorMessage.clear();
     return true;
 }
@@ -27541,6 +28069,9 @@ void BuildOfflineRippleRuntimeForSession(
     }
     memberships->clear();
     params->clear();
+    if (!kRippleWaterRuntimeEnabled) {
+        return;
+    }
     if (!session.loaded ||
         session.offlinePointCloud == nullptr ||
         !IsAssociableLidarSession(session)) {
@@ -27709,6 +28240,7 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
                            activeWater.normalizedTime)
                      : invisible_places::renderer::pointcloud::
                            ResolvedTimingColouriseStack{},
+             .generatedWaterOverlay = IsGeneratedWaterOverlaySession(session),
              .hasSourceRgb = session.hasSourceRgb,
              .fastBasic = fastBasicRenderer,
              // A settled GPU Flow resource and its deterministic CPU export
@@ -27806,6 +28338,7 @@ std::vector<invisible_places::output::OfflinePointLayer> BuildOfflinePointLayers
             .cloud = snapshot.cloud.get(),
             .style = snapshot.style,
             .timingColourise = snapshot.timingColourise,
+            .generatedWaterOverlay = snapshot.generatedWaterOverlay,
             .hasSourceRgb = snapshot.hasSourceRgb,
             .fastBasic = snapshot.fastBasic,
             .drawPointCount = snapshot.drawPointCount,
@@ -27868,6 +28401,9 @@ std::vector<invisible_places::output::OfflinePointLayer> BuildOfflinePointLayers
         }
         auto setWaterEffectSlot = [&](std::size_t invisible_places::output::OfflinePointLayer::*member,
                                       std::string_view fieldName) {
+            if (!kFieldWaterRuntimeEnabled) {
+                return;
+            }
             if (const auto slot = FindScalarFieldByName(snapshot.cloud->scalarFields, fieldName);
                 slot.has_value() && slot.value() < snapshot.cloud->scalarFields.size()) {
                 layer.*member = slot.value();
@@ -28063,6 +28599,7 @@ struct AnimationExportFrustumMaskSummary {
     bool enabled = false;
     std::uint64_t effectiveDrawPoints = 0;
     std::uint64_t fullSourcePoints = 0;
+    std::chrono::steady_clock::duration preparationDuration{};
 };
 
 std::vector<glm::mat4> BuildAnimationExportViewProjections(
@@ -28094,8 +28631,11 @@ AnimationExportFrustumMaskSummary PrepareAnimationExportFrustumMasks(
         return summary;
     }
 
+    const auto preparationStartedAt = std::chrono::steady_clock::now();
     const auto viewProjections = BuildAnimationExportViewProjections(frames, settings);
     if (viewProjections.empty()) {
+        summary.preparationDuration =
+            std::chrono::steady_clock::now() - preparationStartedAt;
         return summary;
     }
 
@@ -28171,6 +28711,8 @@ AnimationExportFrustumMaskSummary PrepareAnimationExportFrustumMasks(
         summary.effectiveDrawPoints += session.previewLodSampledDrawCount;
     }
 
+    summary.preparationDuration =
+        std::chrono::steady_clock::now() - preparationStartedAt;
     return summary;
 }
 
@@ -28240,6 +28782,10 @@ BuildAnimationExportPointCloudLayerSnapshot(
             {.layerId = sessionIndex,
              .style = effectiveStyle,
              .scalarFields = session.scalarFields,
+             .generatedWaterOverlay =
+                 IsGeneratedWaterOverlaySession(session),
+             .regionWaterEffectsEnabled =
+                 kRippleWaterRuntimeEnabled || kFieldWaterRuntimeEnabled,
              .hasSourceRgb = session.hasSourceRgb,
              .hasNormals = session.hasNormals,
              .timingColouriseEligible =
@@ -29069,11 +29615,10 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
     }
     const auto scenarioState = waterFrame.rawScenarioState.value_or(
         invisible_places::water::WaterScenarioState{});
-    renderState.rainSettings =
-        invisible_places::water::
-            RainSettingsForOptionalTimingLevel(
-                renderState.rainSettings,
-                WaterFrameExplicitRainLevel(waterFrame));
+    invisible_places::water::ApplyWaterFeatureTimingOverlayToRainSettings(
+        waterFrame.featureOverlay,
+        &renderState.rainSettings,
+        &renderState.rainVisual);
     for (const auto& frozenSource : job.frozenFlowSourceLayers) {
         const auto layerIt = std::find_if(
             renderState.pointCloudLayers.begin(),
@@ -29389,8 +29934,9 @@ bool RenderCurrentAnimationFramePreview(
         std::optional<PointVisualExportOverride>{
             currentVisual.visualOverride};
     bool exportUsesPreviewDensity = false;
+    AnimationExportFrustumMaskSummary frustumMaskSummary;
     if (AnimationExportWritesMp4(activeMode) || AnimationExportWritesPngStack(activeMode)) {
-        const auto frustumMaskSummary = PrepareAnimationExportFrustumMasks(
+        frustumMaskSummary = PrepareAnimationExportFrustumMasks(
             runtimeState,
             viewport,
             std::span<const invisible_places::camera::CameraState>{
@@ -29434,6 +29980,11 @@ bool RenderCurrentAnimationFramePreview(
     job.setupViewportWidth = static_cast<std::uint32_t>(std::max(1.0F, setupSize.x));
     job.setupViewportHeight = static_cast<std::uint32_t>(std::max(1.0F, setupSize.y));
     job.previewDensity = exportUsesPreviewDensity;
+    job.exportFrustumMask = frustumMaskSummary.enabled;
+    job.exportFrustumMaskDrawPoints = frustumMaskSummary.effectiveDrawPoints;
+    job.exportFrustumMaskFullSourcePoints = frustumMaskSummary.fullSourcePoints;
+    job.exportFrustumMaskPreparationDuration =
+        frustumMaskSummary.preparationDuration;
     job.pointCloudRendererMode = exportRendererMode;
     job.animationName = AnimationNameWithWaterScenario(
         animationPathSnapshot.name,
@@ -29768,31 +30319,6 @@ std::string ExportTimingStatusSuffix(const OfflineRenderJobState& job) {
     return suffix;
 }
 
-std::uint64_t CurrentResidentMemoryBytes() {
-#if defined(__APPLE__)
-    mach_task_basic_info_data_t info{};
-    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
-    const kern_return_t result = task_info(
-        mach_task_self(),
-        MACH_TASK_BASIC_INFO,
-        reinterpret_cast<task_info_t>(&info),
-        &count);
-    return result == KERN_SUCCESS ? static_cast<std::uint64_t>(info.resident_size) : 0U;
-#elif defined(__linux__)
-    std::ifstream statm{"/proc/self/statm"};
-    long totalPages = 0;
-    long residentPages = 0;
-    statm >> totalPages >> residentPages;
-    const long pageSize = sysconf(_SC_PAGESIZE);
-    if (residentPages <= 0 || pageSize <= 0) {
-        return 0U;
-    }
-    return static_cast<std::uint64_t>(residentPages) * static_cast<std::uint64_t>(pageSize);
-#else
-    return 0U;
-#endif
-}
-
 std::uint64_t SystemPhysicalMemoryBytes() {
 #if defined(__APPLE__)
     std::uint64_t memoryBytes = 0;
@@ -29877,6 +30403,8 @@ std::uint64_t EstimateVideoExportWorkingSetBytes(
         deliveryPixelCount *
         (AnimationExportWritesPngStack(mode)
              ? 4ULL
+             : mode == invisible_places::output::AnimationExportMode::TestMp4
+                   ? 3ULL * sizeof(std::uint16_t)
              : AnimationExportWritesAlphaMatteVideoPair(mode, externalAlphaMatte)
                    ? 4ULL * sizeof(std::uint16_t)
              : AnimationExportPreservesAlpha(mode, externalAlphaMatte)
@@ -29897,7 +30425,13 @@ void ConfigureAnimationExportWriterQueue(
     }
 
     const auto physicalBytes = SystemPhysicalMemoryBytes();
-    const auto residentBytes = CurrentResidentMemoryBytes();
+    const auto processMemory = ReadCurrentProcessMemorySnapshot();
+    // Keep export admission and queue sizing on the legacy resident-memory
+    // metric. The full physical footprint is intentionally telemetry-only:
+    // on Apple silicon it includes the scene's large shared GPU allocations,
+    // so using it here can reject an otherwise valid export before it starts.
+    const auto residentBytes = processMemory.residentBytes;
+    const auto processMemoryBytes = ProcessMemoryPressureBytes(processMemory);
     std::size_t queueLimit = kDefaultQueuedExportFrames;
     std::uint64_t queueBudgetBytes =
         EstimateVideoExportWorkingSetBytes(mode, settings, externalAlphaMatte, queueLimit);
@@ -29921,7 +30455,7 @@ void ConfigureAnimationExportWriterQueue(
     writerState->maxQueuedFrames = queueLimit;
     writerState->queueMemoryBudgetBytes = queueBudgetBytes;
     writerState->memoryStopThresholdBytes = memoryStopThresholdBytes;
-    writerState->peakResidentMemoryBytes = residentBytes;
+    writerState->peakProcessMemoryBytes = processMemoryBytes;
     (void)combinedColorAlphaMattePipe;
 }
 
@@ -29938,8 +30472,10 @@ bool CheckVideoExportMemoryBudget(
     if (physicalBytes == 0U || estimateBytes == 0U) {
         return true;
     }
-    const auto residentBytes = CurrentResidentMemoryBytes();
-    if (residentBytes > 0U && residentBytes + estimateBytes > (physicalBytes * 9ULL) / 10ULL) {
+    const auto processMemory = ReadCurrentProcessMemorySnapshot();
+    const auto residentBytes = processMemory.residentBytes;
+    if (residentBytes > 0U &&
+        residentBytes + estimateBytes > (physicalBytes * 9ULL) / 10ULL) {
         runtimeState->errorMessage =
             std::string{AnimationExportModeLabel(mode)} +
             " export would need about " + FormatByteCount(estimateBytes) +
@@ -29992,6 +30528,7 @@ std::string FormatLocalTime(
 
 bool AnimationExportWritesMp4(invisible_places::output::AnimationExportMode mode) {
     return mode == invisible_places::output::AnimationExportMode::FastPreviewMp4 ||
+           mode == invisible_places::output::AnimationExportMode::TestMp4 ||
            mode == invisible_places::output::AnimationExportMode::HevcAlphaMp4;
 }
 
@@ -30009,6 +30546,7 @@ bool AnimationExportWritesProRes(invisible_places::output::AnimationExportMode m
         case invisible_places::output::AnimationExportMode::ProRes4444XqVideoToolboxMov:
             return true;
         case invisible_places::output::AnimationExportMode::FastPreviewMp4:
+        case invisible_places::output::AnimationExportMode::TestMp4:
         case invisible_places::output::AnimationExportMode::HevcAlphaMp4:
         case invisible_places::output::AnimationExportMode::PngStack:
         case invisible_places::output::AnimationExportMode::FastPngStack:
@@ -30019,7 +30557,8 @@ bool AnimationExportWritesProRes(invisible_places::output::AnimationExportMode m
 }
 
 bool AnimationExportUsesVideoToolbox(invisible_places::output::AnimationExportMode mode) {
-    return mode == invisible_places::output::AnimationExportMode::HevcAlphaMp4 ||
+    return mode == invisible_places::output::AnimationExportMode::TestMp4 ||
+           mode == invisible_places::output::AnimationExportMode::HevcAlphaMp4 ||
            mode == invisible_places::output::AnimationExportMode::ProRes422VideoToolboxMov ||
            mode == invisible_places::output::AnimationExportMode::ProRes422HqVideoToolboxMov ||
            mode == invisible_places::output::AnimationExportMode::ProRes4444VideoToolboxMov ||
@@ -30070,7 +30609,9 @@ bool AnimationExportWritesAlphaMatteVideoPair(invisible_places::output::Animatio
 bool AnimationExportWritesAlphaMatteVideoPair(
     invisible_places::output::AnimationExportMode mode,
     bool externalAlphaMatte) {
-    return externalAlphaMatte && AnimationExportWritesVideo(mode);
+    return externalAlphaMatte &&
+           mode != invisible_places::output::AnimationExportMode::TestMp4 &&
+           AnimationExportWritesVideo(mode);
 }
 
 bool AnimationExportPreservesAlpha(invisible_places::output::AnimationExportMode mode) {
@@ -30086,6 +30627,7 @@ bool AnimationExportPreservesAlpha(invisible_places::output::AnimationExportMode
         case invisible_places::output::AnimationExportMode::ProRes4444XqVideoToolboxMov:
             return true;
         case invisible_places::output::AnimationExportMode::FastPreviewMp4:
+        case invisible_places::output::AnimationExportMode::TestMp4:
         case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
         case invisible_places::output::AnimationExportMode::ProRes422Mov:
         case invisible_places::output::AnimationExportMode::ProRes422HqMov:
@@ -30158,6 +30700,9 @@ invisible_places::output::AnimationExportQuality NormalizeExportQualityForMode(
         mode == invisible_places::output::AnimationExportMode::ProRes4444XqVideoToolboxMov) {
         return invisible_places::output::AnimationExportQuality::Xq;
     }
+    if (mode == invisible_places::output::AnimationExportMode::TestMp4) {
+        return invisible_places::output::AnimationExportQuality::Normal;
+    }
     if (mode == invisible_places::output::AnimationExportMode::FastPreviewMp4 ||
         mode == invisible_places::output::AnimationExportMode::ProRes422Mov ||
         mode == invisible_places::output::AnimationExportMode::ProRes422AlphaMatteMov ||
@@ -30199,16 +30744,19 @@ AnimationExportOutputOptions MakeAnimationExportOutputOptions(
     options.quality = resolvedQuality;
     options.useVideoToolbox = AnimationExportUsesVideoToolbox(mode, useVideoToolbox);
     options.externalAlphaMatte =
-        AnimationExportWritesAlphaMatteVideoPair(mode, externalAlphaMatte);
+        externalAlphaMatte && AnimationExportWritesVideo(mode);
     options.combinedColorAlphaMattePipe =
-        options.externalAlphaMatte && (options.writePreviewMp4 || options.writeProResMov);
+        AnimationExportWritesAlphaMatteVideoPair(mode, options.externalAlphaMatte) &&
+        (options.writePreviewMp4 || options.writeProResMov);
     options.mp4SupersampleScale = AnimationExportUsesSupersampledRgbaFrames(mode)
                                       ? std::max<std::uint32_t>(1U, settings.supersampleScale)
                                       : 1U;
     options.spatialAntialiasing = settings.spatialAntialiasing;
     options.previewVideoPath = std::move(videoOutputPath);
     options.alphaMatteVideoPath =
-        options.externalAlphaMatte ? std::move(alphaMatteVideoPath) : std::filesystem::path{};
+        AnimationExportWritesAlphaMatteVideoPair(mode, options.externalAlphaMatte)
+            ? std::move(alphaMatteVideoPath)
+            : std::filesystem::path{};
     options.pngStackDirectory = std::move(pngStackDirectory);
     options.pngStackFrameStem = std::move(pngStackFrameStem);
     options.previewVideoWarning = std::move(previewVideoWarning);
@@ -30219,6 +30767,8 @@ const char* AnimationExportModeLabel(invisible_places::output::AnimationExportMo
     switch (mode) {
         case invisible_places::output::AnimationExportMode::FastPreviewMp4:
             return "MP4";
+        case invisible_places::output::AnimationExportMode::TestMp4:
+            return "Test MP4";
         case invisible_places::output::AnimationExportMode::HevcAlphaMp4:
             return "MP4 Alpha Matte Pair";
         case invisible_places::output::AnimationExportMode::PngStack:
@@ -30280,7 +30830,12 @@ std::string AnimationExportPresetSummaryLabel(
     bool useVideoToolbox,
     bool externalAlphaMatte) {
     std::string label{AnimationExportModeLabel(mode)};
-    if (AnimationExportWritesVideo(mode)) {
+    if (mode == invisible_places::output::AnimationExportMode::TestMp4) {
+        label += useVideoToolbox ? " H.265 30 fps VideoToolbox" : " H.265 30 fps CPU";
+        if (externalAlphaMatte) {
+            label += " Alpha on Black";
+        }
+    } else if (AnimationExportWritesVideo(mode)) {
         label += " ";
         label += AnimationExportQualityLabel(mode, quality);
         label += useVideoToolbox ? " VideoToolbox" : " CPU";
@@ -30295,6 +30850,8 @@ const char* AnimationExportCaptureLabel(invisible_places::output::AnimationExpor
     switch (mode) {
         case invisible_places::output::AnimationExportMode::FastPreviewMp4:
             return "MP4";
+        case invisible_places::output::AnimationExportMode::TestMp4:
+            return "Test MP4";
         case invisible_places::output::AnimationExportMode::HevcAlphaMp4:
             return "MP4 Alpha Matte Pair";
         case invisible_places::output::AnimationExportMode::PngStack:
@@ -30323,6 +30880,8 @@ const char* AnimationExportOverlayLabel(invisible_places::output::AnimationExpor
     switch (mode) {
         case invisible_places::output::AnimationExportMode::FastPreviewMp4:
             return "Encoding MP4";
+        case invisible_places::output::AnimationExportMode::TestMp4:
+            return "Interpolating Test MP4";
         case invisible_places::output::AnimationExportMode::HevcAlphaMp4:
             return "Encoding MP4 Alpha Matte Pair";
         case invisible_places::output::AnimationExportMode::PngStack:
@@ -30360,6 +30919,8 @@ const char* StillCameraExportOverlayLabel(invisible_places::output::AnimationExp
     switch (mode) {
         case invisible_places::output::AnimationExportMode::FastPreviewMp4:
             return "Exporting Still Camera MP4";
+        case invisible_places::output::AnimationExportMode::TestMp4:
+            return "Exporting Still Camera Test MP4";
         case invisible_places::output::AnimationExportMode::HevcAlphaMp4:
             return "Exporting Still Camera MP4 Alpha Matte Pair";
         case invisible_places::output::AnimationExportMode::PngStack:
@@ -30392,6 +30953,8 @@ const char* ExportLogPrefix(invisible_places::output::AnimationExportMode mode) 
     switch (mode) {
         case invisible_places::output::AnimationExportMode::FastPreviewMp4:
             return "ExportLog_MP4_";
+        case invisible_places::output::AnimationExportMode::TestMp4:
+            return "ExportLog_TestMP4_";
         case invisible_places::output::AnimationExportMode::HevcAlphaMp4:
             return "ExportLog_MP4AlphaMatte_";
         case invisible_places::output::AnimationExportMode::PngStack:
@@ -30487,49 +31050,18 @@ AlphaMatteVideoOutputPaths BuildUniqueAlphaMatteVideoOutputPathsForMode(
         return {.colorPath = paths.colorPath, .alphaMattePath = paths.alphaMattePath};
     }
     if (AnimationExportWritesProRes(mode)) {
-        const auto compactMode =
-            mode == invisible_places::output::AnimationExportMode::ProRes422Mov ||
-                    mode == invisible_places::output::AnimationExportMode::ProRes422HqMov ||
-                    mode == invisible_places::output::AnimationExportMode::ProRes422AlphaMatteMov ||
-                    mode == invisible_places::output::AnimationExportMode::ProRes422HqAlphaMatteMov ||
-                    mode == invisible_places::output::AnimationExportMode::ProRes422VideoToolboxMov ||
-                    mode == invisible_places::output::AnimationExportMode::ProRes422HqVideoToolboxMov
-                ? invisible_places::output::AnimationExportMode::ProRes422Mov
-                : invisible_places::output::AnimationExportMode::ProRes4444Mov;
-        const auto directory = outputDirectory.empty() ? std::filesystem::path{"."} : outputDirectory;
-        const auto baseStem = invisible_places::output::BuildAnimationExportFilenameStem(
-            animationName,
-            compactMode,
-            NormalizeExportQualityForMode(mode, quality),
-            AnimationExportUsesVideoToolbox(mode, useVideoToolbox),
-            true,
-            settings,
-            visualName);
-        const auto reserved = [&reservedOutputPaths](const std::filesystem::path& path) {
-            const auto normalized = path.lexically_normal();
-            return std::any_of(
-                reservedOutputPaths.begin(),
-                reservedOutputPaths.end(),
-                [&normalized](const std::filesystem::path& reservedPath) {
-                    return reservedPath.lexically_normal() == normalized;
-                });
+        const auto paths =
+            invisible_places::output::BuildUniqueProResAlphaMatteOutputPaths(
+                outputDirectory,
+                animationName,
+                mode,
+                settings,
+                visualName,
+                reservedOutputPaths);
+        return {
+            .colorPath = paths.colorPath,
+            .alphaMattePath = paths.alphaMattePath,
         };
-        const auto makePaths = [&](std::string_view stem) {
-            return AlphaMatteVideoOutputPaths{
-                .colorPath = directory / (std::string{stem} + "_color.mov"),
-                .alphaMattePath = directory / (std::string{stem} + "_alpha.mov"),
-            };
-        };
-        auto candidate = makePaths(baseStem);
-        for (std::uint32_t suffix = 1U;
-             std::filesystem::exists(candidate.colorPath) ||
-             std::filesystem::exists(candidate.alphaMattePath) ||
-             reserved(candidate.colorPath) ||
-             reserved(candidate.alphaMattePath);
-             ++suffix) {
-            candidate = makePaths(baseStem + "_" + std::to_string(suffix));
-        }
-        return candidate;
     }
     return {};
 }
@@ -30568,7 +31100,8 @@ std::filesystem::path BuildUniqueAnimationVideoOutputPathForMode(
             visualName,
             reservedOutputPaths);
     }
-    if (mode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
+    if (mode == invisible_places::output::AnimationExportMode::FastPreviewMp4 ||
+        mode == invisible_places::output::AnimationExportMode::TestMp4) {
         return invisible_places::output::BuildUniqueAnimationExportMediaOutputPath(
             outputDirectory,
             animationName,
@@ -30759,24 +31292,86 @@ std::filesystem::path BuildUniqueExportLogPath(
 
 ExportLogState MakeExportLogState(
     const std::filesystem::path& outputDirectory,
-    invisible_places::output::AnimationExportMode mode) {
+    invisible_places::output::AnimationExportMode mode,
+    const PreviewRuntimeState& runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport) {
     ExportLogState log;
     log.startedWallTime = std::chrono::system_clock::now();
     log.startedAt = std::chrono::steady_clock::now();
     log.path = BuildUniqueExportLogPath(outputDirectory, mode, log.startedWallTime);
-    log.startResidentMemoryBytes = CurrentResidentMemoryBytes();
-    log.peakResidentMemoryBytes = log.startResidentMemoryBytes;
+    log.startMemory = ReadCurrentProcessMemorySnapshot();
+    log.peakMemory = log.startMemory;
+    log.peakProcessMemoryBytes = ProcessMemoryPressureBytes(log.startMemory);
+    log.startThermalState = invisible_places::platform::CurrentSystemThermalState();
+    log.worstThermalState = log.startThermalState;
+    std::unordered_set<const invisible_places::io::LoadedPointCloud*>
+        countedPointClouds;
+    for (const auto& session : runtimeState.sessions) {
+        if (session.kind == LayerKind::PointCloud && session.gpuResident) {
+            ++log.gpuPointCloudSessionCount;
+        }
+        const auto* cloud = session.offlinePointCloud.get();
+        if (cloud == nullptr || !countedPointClouds.insert(cloud).second) {
+            continue;
+        }
+        ++log.cpuPointCloudPayloadCount;
+        log.cpuPointCloudGeometryBytes +=
+            static_cast<std::uint64_t>(cloud->positions.capacity()) *
+                sizeof(invisible_places::io::Float3) +
+            static_cast<std::uint64_t>(cloud->normals.capacity()) *
+                sizeof(invisible_places::io::Float3) +
+            static_cast<std::uint64_t>(cloud->packedColors.capacity()) *
+                sizeof(std::uint32_t);
+        log.cpuPointCloudScalarBytes +=
+            static_cast<std::uint64_t>(cloud->scalarFieldValues.capacity()) *
+            sizeof(float);
+    }
+    log.gpuPointCloudBufferBytes = viewport.PointCloudResidentBytes();
+    log.memorySamples.push_back(
+        {.elapsedSeconds = 0.0,
+         .stage = ExportMemorySampleStage::Start,
+         .memory = log.startMemory,
+         .thermalState = log.startThermalState});
     return log;
 }
 
-void SampleExportLogMemory(OfflineRenderJobState* job) {
+void SampleExportLogMemory(
+    OfflineRenderJobState* job,
+    std::optional<ExportMemorySampleStage> stage = std::nullopt) {
     if (job == nullptr || job->exportLog.path.empty()) {
         return;
     }
 
-    const auto memoryBytes = CurrentResidentMemoryBytes();
-    if (memoryBytes > job->exportLog.peakResidentMemoryBytes) {
-        job->exportLog.peakResidentMemoryBytes = memoryBytes;
+    const auto memory = ReadCurrentProcessMemorySnapshot();
+    const auto thermalState = invisible_places::platform::CurrentSystemThermalState();
+    auto& log = job->exportLog;
+    AccumulateProcessMemoryPeaks(&log.peakMemory, memory);
+    log.peakProcessMemoryBytes = std::max(
+        log.peakProcessMemoryBytes,
+        ProcessMemoryPressureBytes(memory));
+    if (static_cast<std::uint8_t>(thermalState) >
+        static_cast<std::uint8_t>(log.worstThermalState)) {
+        log.worstThermalState = thermalState;
+    }
+    if (stage.has_value()) {
+        const auto sampledFrameIndex =
+            job->frames.empty()
+                ? job->currentFrame
+                : std::min<std::uint32_t>(
+                      job->currentFrame,
+                      static_cast<std::uint32_t>(job->frames.size() - 1U));
+        log.memorySamples.push_back(
+            {.elapsedSeconds = std::chrono::duration<double>(
+                                    std::chrono::steady_clock::now() - log.startedAt)
+                                    .count(),
+             .stage = stage.value(),
+             .frameIndex = sampledFrameIndex,
+             .completedSamples = job->frameSampleState.nextSampleIndex,
+             .capturedFrames = log.capturedFrames,
+             .writtenFrames = job->writtenFrameCount,
+             .pendingFrames = job->pendingFrameCount,
+             .memory = memory,
+             .thermalState = thermalState});
     }
 }
 
@@ -31714,6 +32309,20 @@ std::uint64_t WrittenOutputByteCount(const OfflineRenderJobState& job) {
     return bytes;
 }
 
+const char* ExportMemorySampleStageLabel(ExportMemorySampleStage stage) {
+    switch (stage) {
+        case ExportMemorySampleStage::Start:
+            return "start";
+        case ExportMemorySampleStage::Readback:
+            return "readback";
+        case ExportMemorySampleStage::FrameReady:
+            return "frame-ready";
+        case ExportMemorySampleStage::Finish:
+            return "finish";
+    }
+    return "unknown";
+}
+
 std::string WriteExportLog(
     const OfflineRenderJobState& job,
     const std::string& statusMessage,
@@ -31757,6 +32366,9 @@ std::string WriteExportLog(
     const auto rawBytesPerPixel = [&]() -> std::uint64_t {
         if (job.writePngStack) {
             return 4U;
+        }
+        if (job.mode == invisible_places::output::AnimationExportMode::TestMp4) {
+            return 3U * sizeof(std::uint16_t);
         }
         if (writesExternalMatte) {
             if (job.writePreviewMp4) {
@@ -31819,7 +32431,12 @@ std::string WriteExportLog(
             << '\n';
         log << "Quality: " << AnimationExportQualityLabel(job.mode, job.quality) << '\n';
         log << "Encoder: " << (job.useVideoToolbox ? "VideoToolbox" : "CPU ffmpeg") << '\n';
-        log << "External alpha matte: " << (job.externalAlphaMatte ? "yes" : "no") << '\n';
+        if (job.mode == invisible_places::output::AnimationExportMode::TestMp4) {
+            log << "Alpha composited on black: " << (job.externalAlphaMatte ? "yes" : "no") << '\n';
+            log << "Interpolation: motion-compensated optical flow\n";
+        } else {
+            log << "External alpha matte: " << (job.externalAlphaMatte ? "yes" : "no") << '\n';
+        }
         log << "Combined color/matte ffmpeg pipe: "
             << (job.exportLog.combinedColorAlphaMattePipe ? "yes" : "no") << '\n';
     }
@@ -31942,7 +32559,12 @@ std::string WriteExportLog(
 
     log << "Settings\n";
     log << "Resolution: " << job.settings.width << " x " << job.settings.height << '\n';
-    log << "FPS: " << job.settings.framesPerSecond << '\n';
+    if (job.mode == invisible_places::output::AnimationExportMode::TestMp4) {
+        log << "Render FPS: " << job.settings.framesPerSecond << '\n';
+        log << "Output FPS: " << invisible_places::output::kTestMp4OutputFramesPerSecond << '\n';
+    } else {
+        log << "FPS: " << job.settings.framesPerSecond << '\n';
+    }
     log << "Still camera duration: " << job.settings.stillCameraDurationSeconds << " seconds\n";
     log << "Start frame: " << job.settings.startFrame << '\n';
     log << "End frame setting: " << job.settings.endFrame << '\n';
@@ -31951,9 +32573,30 @@ std::string WriteExportLog(
     log << "Frames written: " << job.writtenFrameCount << '\n';
     log << "Preview density: " << (job.previewDensity && !job.exportFrustumMask ? "yes" : "no") << '\n';
     log << "Camera-path frustum mask: " << (job.exportFrustumMask ? "yes" : "no") << '\n';
+    if (job.exportFrustumMaskPreparationDuration >
+        std::chrono::steady_clock::duration::zero()) {
+        log << "Frustum-mask preparation: "
+            << FormatDurationForLog(
+                   job.exportFrustumMaskPreparationDuration)
+            << '\n';
+    }
     if (job.exportFrustumMask) {
         log << "Frustum-mask draw points: " << job.exportFrustumMaskDrawPoints << '\n';
         log << "Full-source visible-layer points: " << job.exportFrustumMaskFullSourcePoints << '\n';
+        const double retainedPercent =
+            job.exportFrustumMaskFullSourcePoints == 0U
+                ? 100.0
+                : 100.0 *
+                      static_cast<double>(job.exportFrustumMaskDrawPoints) /
+                      static_cast<double>(job.exportFrustumMaskFullSourcePoints);
+        log << "Frustum-mask retained: "
+            << FormatFixed(retainedPercent, 1) << "%\n";
+        log << "Frustum-mask points excluded from every requested frame: "
+            << (job.exportFrustumMaskFullSourcePoints -
+                std::min(
+                    job.exportFrustumMaskDrawPoints,
+                    job.exportFrustumMaskFullSourcePoints))
+            << '\n';
     }
     log << "Point renderer: " << PointCloudRendererModeLabel(job.pointCloudRendererMode) << '\n';
     log << "Export renderer: Beauty Raster\n";
@@ -31966,6 +32609,10 @@ std::string WriteExportLog(
         }
         if (AnimationExportPreservesAlpha(job.mode, job.externalAlphaMatte)) {
             log << "Alpha preserved: yes\n";
+        }
+        if (job.mode == invisible_places::output::AnimationExportMode::TestMp4 &&
+            job.externalAlphaMatte) {
+            log << "Alpha baked onto black: yes\n";
         }
         log << "Output supersample scale: " << std::max<std::uint32_t>(1U, job.mp4SupersampleScale) << "x\n";
         log << "Spatial AA/downscale: " << (job.spatialAntialiasing ? "yes" : "no") << '\n';
@@ -32029,13 +32676,127 @@ std::string WriteExportLog(
     log << '\n';
 
     log << "Memory\n";
-    log << "Process resident at start: " << FormatByteCount(job.exportLog.startResidentMemoryBytes) << '\n';
-    log << "Process resident at finish: " << FormatByteCount(job.exportLog.endResidentMemoryBytes) << '\n';
-    log << "Peak sampled process resident: " << FormatByteCount(job.exportLog.peakResidentMemoryBytes) << '\n';
+    log << "System thermal state at start: "
+        << invisible_places::platform::SystemThermalStateLabel(
+               job.exportLog.startThermalState)
+        << '\n';
+    log << "System thermal state at finish: "
+        << invisible_places::platform::SystemThermalStateLabel(
+               job.exportLog.endThermalState)
+        << '\n';
+    log << "Worst sampled system thermal state: "
+        << invisible_places::platform::SystemThermalStateLabel(
+               job.exportLog.worstThermalState)
+        << '\n';
+    log << "Pressure metric: "
+        << (job.exportLog.startMemory.fullFootprintAvailable
+                ? "physical footprint (includes graphics and compressed memory)"
+                : "resident memory fallback")
+        << '\n';
+    log << "Process pressure at start: "
+        << FormatByteCount(ProcessMemoryPressureBytes(job.exportLog.startMemory)) << '\n';
+    log << "Process pressure at finish: "
+        << FormatByteCount(ProcessMemoryPressureBytes(job.exportLog.endMemory)) << '\n';
+    log << "Peak sampled process pressure: "
+        << FormatByteCount(job.exportLog.peakProcessMemoryBytes) << '\n';
+    log << "Process resident at start: "
+        << FormatByteCount(job.exportLog.startMemory.residentBytes) << '\n';
+    log << "Process resident at finish: "
+        << FormatByteCount(job.exportLog.endMemory.residentBytes) << '\n';
+    log << "Peak sampled process resident: "
+        << FormatByteCount(job.exportLog.peakMemory.residentBytes) << '\n';
+    log << "OS lifetime resident peak: "
+        << FormatByteCount(job.exportLog.peakMemory.peakResidentBytes) << '\n';
+    log << "Physical footprint at start: "
+        << FormatByteCount(job.exportLog.startMemory.physicalFootprintBytes) << '\n';
+    log << "Physical footprint at finish: "
+        << FormatByteCount(job.exportLog.endMemory.physicalFootprintBytes) << '\n';
+    log << "Peak sampled physical footprint: "
+        << FormatByteCount(job.exportLog.peakMemory.physicalFootprintBytes) << '\n';
+    log << "OS lifetime physical-footprint peak: "
+        << FormatByteCount(job.exportLog.peakMemory.peakPhysicalFootprintBytes) << '\n';
+    log << "Compressed process memory at start: "
+        << FormatByteCount(job.exportLog.startMemory.compressedBytes) << '\n';
+    log << "Compressed process memory at finish: "
+        << FormatByteCount(job.exportLog.endMemory.compressedBytes) << '\n';
+    log << "Peak sampled compressed process memory: "
+        << FormatByteCount(job.exportLog.peakMemory.compressedBytes) << '\n';
+    log << "Graphics footprint at start: "
+        << FormatByteCount(job.exportLog.startMemory.graphicsFootprintBytes) << '\n';
+    log << "Graphics footprint at finish: "
+        << FormatByteCount(job.exportLog.endMemory.graphicsFootprintBytes) << '\n';
+    log << "Peak sampled graphics footprint: "
+        << FormatByteCount(job.exportLog.peakMemory.graphicsFootprintBytes) << '\n';
+    log << "Graphics compressed footprint at start: "
+        << FormatByteCount(
+               job.exportLog.startMemory.graphicsFootprintCompressedBytes)
+        << '\n';
+    log << "Graphics compressed footprint at finish: "
+        << FormatByteCount(
+               job.exportLog.endMemory.graphicsFootprintCompressedBytes)
+        << '\n';
+    log << "Peak sampled graphics compressed footprint: "
+        << FormatByteCount(
+               job.exportLog.peakMemory.graphicsFootprintCompressedBytes)
+        << '\n';
+    log << "Internal memory at start: "
+        << FormatByteCount(job.exportLog.startMemory.internalBytes) << '\n';
+    log << "Internal memory at finish: "
+        << FormatByteCount(job.exportLog.endMemory.internalBytes) << '\n';
+    log << "Peak sampled internal memory: "
+        << FormatByteCount(job.exportLog.peakMemory.internalBytes) << '\n';
+    log << "Device memory at start: "
+        << FormatByteCount(job.exportLog.startMemory.deviceBytes) << '\n';
+    log << "Device memory at finish: "
+        << FormatByteCount(job.exportLog.endMemory.deviceBytes) << '\n';
+    log << "Peak sampled device memory: "
+        << FormatByteCount(job.exportLog.peakMemory.deviceBytes) << '\n';
+    log << "VM regions at start: " << job.exportLog.startMemory.regionCount << '\n';
+    log << "VM regions at finish: " << job.exportLog.endMemory.regionCount << '\n';
+    log << "Peak sampled VM regions: " << job.exportLog.peakMemory.regionCount << '\n';
+    log << "CPU point-cloud payloads at start: "
+        << job.exportLog.cpuPointCloudPayloadCount << '\n';
+    log << "CPU point-cloud geometry/color capacity at start: "
+        << FormatByteCount(job.exportLog.cpuPointCloudGeometryBytes) << '\n';
+    log << "CPU point-cloud scalar capacity at start: "
+        << FormatByteCount(job.exportLog.cpuPointCloudScalarBytes) << '\n';
+    log << "GPU-resident point-cloud sessions at start: "
+        << job.exportLog.gpuPointCloudSessionCount << '\n';
+    log << "Tracked GPU point-cloud buffers at start: "
+        << FormatByteCount(job.exportLog.gpuPointCloudBufferBytes) << '\n';
     log << "GPU readback frame buffer: " << FormatByteCount(readbackBytes) << '\n';
     if (job.writePreviewMp4 || job.writeProResMov || job.writePngStack) {
         log << "Supersampled GPU readback frame buffer: " << FormatByteCount(videoReadbackBytes) << '\n';
         log << "Raw output frame bytes: " << FormatByteCount(videoRawFrameBytes) << '\n';
+    }
+    log << "Memory sample count: " << job.exportLog.memorySamples.size() << '\n';
+    log << '\n';
+
+    log << "Memory Samples (CSV)\n";
+    log << "elapsed_seconds,stage,frame_index_zero_based,completed_samples,"
+           "captured_frames,written_frames,pending_frames,resident_bytes,"
+           "physical_footprint_bytes,compressed_bytes,internal_bytes,device_bytes,"
+           "graphics_footprint_bytes,graphics_footprint_compressed_bytes,region_count,"
+           "thermal_state\n";
+    log << std::fixed << std::setprecision(3);
+    for (const auto& sample : job.exportLog.memorySamples) {
+        log << sample.elapsedSeconds << ','
+            << ExportMemorySampleStageLabel(sample.stage) << ','
+            << sample.frameIndex << ','
+            << sample.completedSamples << ','
+            << sample.capturedFrames << ','
+            << sample.writtenFrames << ','
+            << sample.pendingFrames << ','
+            << sample.memory.residentBytes << ','
+            << sample.memory.physicalFootprintBytes << ','
+            << sample.memory.compressedBytes << ','
+            << sample.memory.internalBytes << ','
+            << sample.memory.deviceBytes << ','
+            << sample.memory.graphicsFootprintBytes << ','
+            << sample.memory.graphicsFootprintCompressedBytes << ','
+            << sample.memory.regionCount << ','
+            << invisible_places::platform::SystemThermalStateLabel(sample.thermalState)
+            << '\n';
     }
 
     return {};
@@ -32228,16 +32989,18 @@ bool QueueAnimationExportFrame(
 
     {
         std::scoped_lock lock(job->writerState->mutex);
-        const auto residentBytes = CurrentResidentMemoryBytes();
-        if (residentBytes > 0U) {
-            job->writerState->peakResidentMemoryBytes =
-                std::max(job->writerState->peakResidentMemoryBytes, residentBytes);
+        const auto processMemory = ReadCurrentProcessMemorySnapshot();
+        const auto processMemoryBytes = ProcessMemoryPressureBytes(processMemory);
+        if (processMemoryBytes > 0U) {
+            job->writerState->peakProcessMemoryBytes =
+                std::max(job->writerState->peakProcessMemoryBytes, processMemoryBytes);
             if (job->writerState->memoryStopThresholdBytes > 0U &&
-                residentBytes > job->writerState->memoryStopThresholdBytes) {
+                processMemory.residentBytes > job->writerState->memoryStopThresholdBytes) {
                 job->writerState->acceptingFrames = false;
                 job->writerState->errorMessage =
                     "Export stopped before queueing frame " + std::to_string(outputFrameIndex + 1U) +
-                    " because process memory reached " + FormatByteCount(residentBytes) +
+                    " because process resident memory reached " +
+                    FormatByteCount(processMemory.residentBytes) +
                     " above the " + FormatByteCount(job->writerState->memoryStopThresholdBytes) +
                     " export safety threshold.";
                 return false;
@@ -32271,8 +33034,8 @@ void RefreshAnimationExportWriterProgress(OfflineRenderJobState* job) {
     job->exportLog.writerQueueFrameLimit = job->writerState->maxQueuedFrames;
     job->exportLog.writerQueueMemoryBudgetBytes = job->writerState->queueMemoryBudgetBytes;
     job->exportLog.writerMemoryStopThresholdBytes = job->writerState->memoryStopThresholdBytes;
-    job->exportLog.peakResidentMemoryBytes =
-        std::max(job->exportLog.peakResidentMemoryBytes, job->writerState->peakResidentMemoryBytes);
+    job->exportLog.peakProcessMemoryBytes =
+        std::max(job->exportLog.peakProcessMemoryBytes, job->writerState->peakProcessMemoryBytes);
     job->exportLog.writerConvertTotal = job->writerState->writerConvertTotal;
     job->exportLog.writerConvertMax = job->writerState->writerConvertMax;
     job->exportLog.writerPipeWriteTotal = job->writerState->writerPipeWriteTotal;
@@ -32446,30 +33209,35 @@ void RunAnimationExportWriter(
         }
     };
     auto sampleWriterMemoryThreshold = [&](std::uint32_t outputFrameIndex) {
-        const auto residentBytes = CurrentResidentMemoryBytes();
-        if (residentBytes == 0U) {
+        const auto processMemory = ReadCurrentProcessMemorySnapshot();
+        const auto processMemoryBytes = ProcessMemoryPressureBytes(processMemory);
+        if (processMemoryBytes == 0U) {
             return std::string{};
         }
 
         std::uint64_t thresholdBytes = 0;
         {
             std::scoped_lock lock(writerState->mutex);
-            writerState->peakResidentMemoryBytes =
-                std::max(writerState->peakResidentMemoryBytes, residentBytes);
+            writerState->peakProcessMemoryBytes =
+                std::max(writerState->peakProcessMemoryBytes, processMemoryBytes);
             thresholdBytes = writerState->memoryStopThresholdBytes;
         }
-        if (thresholdBytes == 0U || residentBytes <= thresholdBytes) {
+        if (thresholdBytes == 0U ||
+            processMemory.residentBytes <= thresholdBytes) {
             return std::string{};
         }
         return "Export stopped while writing frame " + std::to_string(outputFrameIndex + 1U) +
-               " because process memory reached " + FormatByteCount(residentBytes) +
+               " because process resident memory reached " +
+               FormatByteCount(processMemory.residentBytes) +
                " above the " + FormatByteCount(thresholdBytes) + " export safety threshold.";
     };
     try {
         bool writesMp4 = outputOptions.writePreviewMp4 && !outputOptions.previewVideoPath.empty();
         bool writesProRes = outputOptions.writeProResMov && !outputOptions.previewVideoPath.empty();
+        const bool requestsAlphaMattePair =
+            AnimationExportWritesAlphaMatteVideoPair(mode, outputOptions.externalAlphaMatte);
         if ((writesMp4 || writesProRes) &&
-            outputOptions.externalAlphaMatte &&
+            requestsAlphaMattePair &&
             outputOptions.alphaMatteVideoPath.empty()) {
             CompleteAnimationExportWriter(
                 writerState,
@@ -32479,7 +33247,7 @@ void RunAnimationExportWriter(
         }
         const bool writesAlphaMattePair =
             (writesMp4 || writesProRes) &&
-            outputOptions.externalAlphaMatte &&
+            requestsAlphaMattePair &&
             !outputOptions.alphaMatteVideoPath.empty();
         const bool writesCombinedColorAlphaMatte =
             writesAlphaMattePair && outputOptions.combinedColorAlphaMattePipe;
@@ -32535,7 +33303,16 @@ void RunAnimationExportWriter(
                         outputOptions.previewVideoPath);
                 }
             } else if (writesMp4) {
-                if (writesCombinedColorAlphaMatte) {
+                if (mode == invisible_places::output::AnimationExportMode::TestMp4) {
+                    command = invisible_places::output::BuildFfmpegTestMp4Command(
+                        invisible_places::output::DefaultFfmpegExecutablePath(),
+                        settings.width,
+                        settings.height,
+                        settings.framesPerSecond,
+                        totalFrames,
+                        outputOptions.previewVideoPath,
+                        outputOptions.useVideoToolbox);
+                } else if (writesCombinedColorAlphaMatte) {
                     command = BuildFfmpegColorAndAlphaMatteCommandForMode(
                         mode,
                         outputOptions.quality,
@@ -32764,7 +33541,23 @@ void RunAnimationExportWriter(
                     writesMp4 &&
                     outputOptions.quality != invisible_places::output::AnimationExportQuality::Normal;
                 const auto convertStartedAt = std::chrono::steady_clock::now();
-                if (writesProRes) {
+                if (mode == invisible_places::output::AnimationExportMode::TestMp4) {
+                    if (outputOptions.externalAlphaMatte) {
+                        frameBytes = invisible_places::output::ConvertHalfRgbaToSrgbRgb16OpaqueBlack(
+                            mp4Image,
+                            settings.width,
+                            settings.height,
+                            outputOptions.spatialAntialiasing);
+                    } else {
+                        const auto rgba16Bytes = invisible_places::output::ConvertHalfRgbaToSrgbRgba16(
+                            mp4Image,
+                            settings.width,
+                            settings.height,
+                            outputOptions.spatialAntialiasing);
+                        frameBytes = ExtractRgb48FromRgba64(
+                            std::span<const std::uint8_t>{rgba16Bytes.data(), rgba16Bytes.size()});
+                    }
+                } else if (writesProRes) {
                     const auto rgba16Bytes = invisible_places::output::ConvertHalfRgbaToSrgbRgba16(
                         mp4Image,
                         settings.width,
@@ -33306,6 +34099,9 @@ void FreezeAnimationDynamicMeshFlow(
             settingsOverride != nullptr
                 ? *settingsOverride
                 : runtimeState.water.dynamicMeshFlowSettings);
+    if (!kMeshFlowWaterRuntimeEnabled) {
+        job->frozenDynamicMeshFlowSettings.enabled = false;
+    }
     job->meshFlowRainEnvelope = {};
     if (job->animationPath.has_value()) {
         job->meshFlowRainEnvelope =
@@ -33479,6 +34275,9 @@ bool UpdateFrozenAnimationDynamicMeshFlow(
     float sampleTimeSeconds) {
     if (runtimeState == nullptr || viewport == nullptr || job == nullptr) {
         return false;
+    }
+    if (!kMeshFlowWaterRuntimeEnabled) {
+        return true;
     }
     if (!job->frozenDynamicMeshFlowSettings.enabled ||
         !job->frozenDynamicMeshFlowLayerId.has_value()) {
@@ -33794,6 +34593,8 @@ QuickMp4ExportStartResult StartQuickMp4ExportJob(
         .exportFrustumMask = frustumMaskSummary.enabled,
         .exportFrustumMaskDrawPoints = frustumMaskSummary.effectiveDrawPoints,
         .exportFrustumMaskFullSourcePoints = frustumMaskSummary.fullSourcePoints,
+        .exportFrustumMaskPreparationDuration =
+            frustumMaskSummary.preparationDuration,
         .pointCloudRendererMode = exportRendererMode,
         .quickMp4BatchJob = true,
         .quickMp4BatchIndex =
@@ -33824,7 +34625,9 @@ QuickMp4ExportStartResult StartQuickMp4ExportJob(
             request.pngStackDirectory.empty()
                 ? request.videoOutputPath.parent_path()
                 : request.pngStackDirectory.parent_path(),
-            request.mode),
+            request.mode,
+            *runtimeState,
+            *viewport),
         .exportBackgroundColor = glm::vec4{
             frozenRenderer.backgroundColor[0],
             frozenRenderer.backgroundColor[1],
@@ -33903,6 +34706,16 @@ bool StartNextQueuedQuickMp4Export(
     }
 
     auto& panel = runtimeState->animationPanel;
+    auto releaseTerminalExportSources = [&]() {
+        const auto released =
+            ReleaseExportOnlyPointCloudSources(runtimeState, viewport);
+        if (!released.warning.empty()) {
+            if (!runtimeState->errorMessage.empty()) {
+                runtimeState->errorMessage += " ";
+            }
+            runtimeState->errorMessage += released.warning;
+        }
+    };
     std::string lastRenderSetupError;
     while (!panel.quickMp4Queue.empty()) {
         auto request = std::move(panel.quickMp4Queue.front());
@@ -33924,6 +34737,7 @@ bool StartNextQueuedQuickMp4Export(
         panel.quickMp4QueueTotal = 0;
         panel.quickMp4QueueCompleted = 0;
         panel.quickMp4QueueSkipped = 0;
+        releaseTerminalExportSources();
         return false;
     }
 
@@ -33939,6 +34753,7 @@ bool StartNextQueuedQuickMp4Export(
         runtimeState->statusMessage += ".";
     }
     runtimeState->errorMessage = std::move(lastRenderSetupError);
+    releaseTerminalExportSources();
     return false;
 }
 
@@ -33982,7 +34797,9 @@ void StartSelectedQuickMp4Batch(
     const bool activeUseVideoToolbox =
         AnimationExportUsesVideoToolbox(activeMode, activePreset.useVideoToolbox);
     const bool activeExternalAlphaMatte =
-        AnimationExportWritesAlphaMatteVideoPair(activeMode, activePreset.externalAlphaMatte);
+        activeMode == invisible_places::output::AnimationExportMode::TestMp4
+            ? activePreset.externalAlphaMatte
+            : AnimationExportWritesAlphaMatteVideoPair(activeMode, activePreset.externalAlphaMatte);
     panel.exportMode = activeMode;
     if (!AnimationExportWritesVideo(activeMode) && !AnimationExportWritesPngStack(activeMode)) {
         runtimeState->errorMessage =
@@ -34281,6 +35098,7 @@ void StartStillCameraExportCapture(
     if (!savedVisual.has_value()) {
         FinishOfflineRenderJob(
             runtimeState,
+            viewport,
             {},
             "The saved point visual is no longer available; still-camera export "
             "cannot fall back to the live style.");
@@ -34292,7 +35110,11 @@ void StartStillCameraExportCapture(
         savedVisual->visualOverride,
         job.pointCloudRendererMode);
     if (exportPointCloudLayers.empty()) {
-        FinishOfflineRenderJob(runtimeState, {}, "No visible loaded LiDAR layers are available for still-camera export.");
+        FinishOfflineRenderJob(
+            runtimeState,
+            viewport,
+            {},
+            "No visible loaded LiDAR layers are available for still-camera export.");
         return;
     }
 
@@ -34343,7 +35165,8 @@ void StartStillCameraExportCapture(
         .pngStackFrameStem = job.pngStackFrameStem.empty() ? job.animationName : job.pngStackFrameStem,
         .previewVideoWarning = job.previewVideoWarning,
         .combinedColorAlphaMattePipe =
-            job.externalAlphaMatte && (job.writePreviewMp4 || job.writeProResMov),
+            AnimationExportWritesAlphaMatteVideoPair(job.mode, job.externalAlphaMatte) &&
+            (job.writePreviewMp4 || job.writeProResMov),
     };
     ConfigureAnimationExportWriterQueue(
         writerState,
@@ -34424,11 +35247,14 @@ void ProcessStillCameraPreparationStep(
     }
 
     if (!errorMessage.empty()) {
-        FinishOfflineRenderJob(runtimeState, {}, errorMessage);
+        FinishOfflineRenderJob(runtimeState, viewport, {}, errorMessage);
         return;
     }
     if (cancelled || job.cancelRequested) {
-        FinishOfflineRenderJob(runtimeState, "Still-camera export cancelled.");
+        FinishOfflineRenderJob(
+            runtimeState,
+            viewport,
+            "Still-camera export cancelled.");
         return;
     }
 
@@ -34494,7 +35320,9 @@ void StartStillCameraExportJob(
     const bool useVideoToolbox =
         AnimationExportUsesVideoToolbox(mode, activePreset.useVideoToolbox);
     const bool externalAlphaMatte =
-        AnimationExportWritesAlphaMatteVideoPair(mode, activePreset.externalAlphaMatte);
+        mode == invisible_places::output::AnimationExportMode::TestMp4
+            ? activePreset.externalAlphaMatte
+            : AnimationExportWritesAlphaMatteVideoPair(mode, activePreset.externalAlphaMatte);
     if (!CheckVideoExportMemoryBudget(runtimeState, mode, settings, externalAlphaMatte)) {
         return;
     }
@@ -34652,6 +35480,8 @@ void StartStillCameraExportJob(
         .exportFrustumMask = frustumMaskSummary.enabled,
         .exportFrustumMaskDrawPoints = frustumMaskSummary.effectiveDrawPoints,
         .exportFrustumMaskFullSourcePoints = frustumMaskSummary.fullSourcePoints,
+        .exportFrustumMaskPreparationDuration =
+            frustumMaskSummary.preparationDuration,
         .pointCloudRendererMode = exportRendererMode,
         .stillCameraJob = true,
         .animationName = stillName,
@@ -34670,8 +35500,12 @@ void StartStillCameraExportJob(
             1.0F),
         .exportVisualName = "Current View",
         .exportLog = MakeExportLogState(
-            pngStackDirectory.empty() ? std::filesystem::path{settings.outputDirectory} : pngStackDirectory.parent_path(),
-            mode),
+            pngStackDirectory.empty()
+                ? std::filesystem::path{settings.outputDirectory}
+                : pngStackDirectory.parent_path(),
+            mode,
+            *runtimeState,
+            *viewport),
         .exportBackgroundColor = glm::vec4{
             runtimeState->projectSettings.backgroundColor[0],
             runtimeState->projectSettings.backgroundColor[1],
@@ -34758,7 +35592,9 @@ void StartAnimationExportJob(
     const bool activeUseVideoToolbox =
         AnimationExportUsesVideoToolbox(activeMode, activePreset.useVideoToolbox);
     const bool activeExternalAlphaMatte =
-        AnimationExportWritesAlphaMatteVideoPair(activeMode, activePreset.externalAlphaMatte);
+        activeMode == invisible_places::output::AnimationExportMode::TestMp4
+            ? activePreset.externalAlphaMatte
+            : AnimationExportWritesAlphaMatteVideoPair(activeMode, activePreset.externalAlphaMatte);
     runtimeState->animationPanel.exportMode = activeMode;
 
     auto settings = RenderSettingsFromExportPreset(activePreset, runtimeState->renderSettings.outputDirectory);
@@ -34861,11 +35697,6 @@ void StartAnimationExportJob(
             {},
             activeMode);
     }
-    // Export Current is always the finest complete authored bundle. Playback
-    // density remains available only to the explicitly labelled one-frame
-    // preview above.
-    constexpr bool exportUsesPreviewDensity = false;
-
     auto frames = invisible_places::output::BuildAnimationRenderSequence(
         animationPathSnapshot,
         settings);
@@ -34877,10 +35708,27 @@ void StartAnimationExportJob(
 
     const auto exportRendererMode =
         renderSnapshot.document.renderer.pointCloudRendererMode;
+    // Keep every point at full authored density when it can contribute to any
+    // requested frame, but do not submit cells that remain off camera for the
+    // entire frozen path. The one union buffer avoids per-frame uploads and
+    // descriptor churn while preserving deterministic frame output.
+    const auto currentVisualOverride =
+        std::optional<PointVisualExportOverride>{
+            currentVisual.visualOverride};
+    const auto frustumMaskSummary = PrepareAnimationExportFrustumMasks(
+        runtimeState,
+        viewport,
+        std::span<const invisible_places::camera::CameraState>{
+            frames.data(),
+            frames.size()},
+        settings,
+        currentVisualOverride,
+        exportRendererMode);
+    const bool exportUsesPreviewDensity = frustumMaskSummary.enabled;
     auto exportPointCloudLayers = BuildAnimationExportPointCloudLayerSnapshot(
         *runtimeState,
         exportUsesPreviewDensity,
-        currentVisual.visualOverride,
+        currentVisualOverride,
         exportRendererMode);
     if (exportPointCloudLayers.empty()) {
         runtimeState->errorMessage = "No visible loaded LiDAR layers are available for animation export.";
@@ -34969,6 +35817,11 @@ void StartAnimationExportJob(
         .setupViewportWidth = static_cast<std::uint32_t>(std::max(1.0F, setupSize.x)),
         .setupViewportHeight = static_cast<std::uint32_t>(std::max(1.0F, setupSize.y)),
         .previewDensity = exportUsesPreviewDensity,
+        .exportFrustumMask = frustumMaskSummary.enabled,
+        .exportFrustumMaskDrawPoints = frustumMaskSummary.effectiveDrawPoints,
+        .exportFrustumMaskFullSourcePoints = frustumMaskSummary.fullSourcePoints,
+        .exportFrustumMaskPreparationDuration =
+            frustumMaskSummary.preparationDuration,
         .pointCloudRendererMode = exportRendererMode,
         .animationName = animationName,
         .animationPath = animationPathSnapshot,
@@ -34992,7 +35845,9 @@ void StartAnimationExportJob(
         .renderSetupDocument = renderSnapshot.document,
         .exportLog = MakeExportLogState(
             logDirectory,
-            activeMode),
+            activeMode,
+            *runtimeState,
+            *viewport),
         .exportBackgroundColor = glm::vec4{
             renderSnapshot.document.renderer.backgroundColor[0],
             renderSnapshot.document.renderer.backgroundColor[1],
@@ -35060,6 +35915,7 @@ void StartAnimationExportJob(
 
 void FinishOfflineRenderJob(
     PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
     const std::string& statusMessage,
     const std::string& errorMessage) {
     if (runtimeState == nullptr) {
@@ -35077,15 +35933,21 @@ void FinishOfflineRenderJob(
         }
         job.worker = std::jthread{};
     }
-    job.exportLog.endResidentMemoryBytes = CurrentResidentMemoryBytes();
-    if (job.exportLog.endResidentMemoryBytes > job.exportLog.peakResidentMemoryBytes) {
-        job.exportLog.peakResidentMemoryBytes = job.exportLog.endResidentMemoryBytes;
+    SampleExportLogMemory(&job, ExportMemorySampleStage::Finish);
+    if (!job.exportLog.memorySamples.empty()) {
+        job.exportLog.endMemory = job.exportLog.memorySamples.back().memory;
+        job.exportLog.endThermalState =
+            job.exportLog.memorySamples.back().thermalState;
     }
 
     const bool renderWasCancelled =
         job.cancelRequested ||
         finalStatusMessage.find("cancelled") != std::string::npos ||
         finalStatusMessage.find("Cancelling") != std::string::npos;
+    const bool retainExportSourcesForNextBatchItem =
+        job.quickMp4BatchJob && !renderWasCancelled &&
+        finalErrorMessage.empty() &&
+        !runtimeState->animationPanel.quickMp4Queue.empty();
     const auto renderSetupStatus =
         renderWasCancelled
             ? RenderSetupStatus::Cancelled
@@ -35121,6 +35983,24 @@ void FinishOfflineRenderJob(
             finalStatusMessage += " Export log failed: " + logError + ".";
         } else {
             finalStatusMessage = "Export log failed: " + logError + ".";
+        }
+    }
+
+    if (!retainExportSourcesForNextBatchItem) {
+        const auto released =
+            ReleaseExportOnlyPointCloudSources(runtimeState, viewport);
+        if (!released.warning.empty()) {
+            if (!finalStatusMessage.empty()) {
+                finalStatusMessage += " ";
+            }
+            finalStatusMessage += released.warning;
+        } else if (released.gpuSessionCount > 0U ||
+                   released.cpuSessionCount > 0U) {
+            if (!finalStatusMessage.empty()) {
+                finalStatusMessage += " ";
+            }
+            finalStatusMessage +=
+                "Released full-density export-only resources.";
         }
     }
 
@@ -35170,7 +36050,11 @@ void ProcessOfflineRenderJobStep(
         return;
     }
     if (viewport == nullptr) {
-        FinishOfflineRenderJob(runtimeState, {}, "GPU EXR export requires an active Vulkan viewport.");
+        FinishOfflineRenderJob(
+            runtimeState,
+            viewport,
+            {},
+            "GPU EXR export requires an active Vulkan viewport.");
         return;
     }
 
@@ -35206,7 +36090,11 @@ void ProcessOfflineRenderJobStep(
             }
             const bool wasQuickMp4BatchJob = job.quickMp4BatchJob;
             const bool wasCancelled = job.cancelRequested;
-            FinishOfflineRenderJob(runtimeState, writerStatus, writerError);
+            FinishOfflineRenderJob(
+                runtimeState,
+                viewport,
+                writerStatus,
+                writerError);
             if (wasQuickMp4BatchJob) {
                 if (wasCancelled || !writerError.empty()) {
                     runtimeState->animationPanel.quickMp4Queue.clear();
@@ -35402,7 +36290,9 @@ void ProcessOfflineRenderJobStep(
                 }
                 sampleState.gpuSampleInFlight = false;
                 sampleState.gpuSamplePreviewPass = false;
-                SampleExportLogMemory(&job);
+                SampleExportLogMemory(
+                    &job,
+                    ExportMemorySampleStage::Readback);
             }
 
             if (sampleState.nextSampleIndex >= sampleCount && !sampleState.previewPassPending) {
@@ -35463,9 +36353,15 @@ void ProcessOfflineRenderJobStep(
         }
 
         RecordExportGpuCaptureDuration(&job, std::chrono::steady_clock::now() - sampleState.startedAt);
-        SampleExportLogMemory(&job);
+        SampleExportLogMemory(
+            &job,
+            ExportMemorySampleStage::FrameReady);
         if (!QueueAnimationExportFrame(&job, outputFrameIndex, std::move(image), std::move(previewImage))) {
-            FinishOfflineRenderJob(runtimeState, {}, "Animation export writer stopped accepting frames.");
+            FinishOfflineRenderJob(
+                runtimeState,
+                viewport,
+                {},
+                "Animation export writer stopped accepting frames.");
             return;
         }
         ++job.currentFrame;
@@ -35475,7 +36371,12 @@ void ProcessOfflineRenderJobStep(
             viewport->CancelPointCloudExrFrame();
         }
         job.frameSampleState = {};
-        FinishOfflineRenderJob(runtimeState, {}, "GPU animation export failed: " + std::string{error.what()});
+        FinishOfflineRenderJob(
+            runtimeState,
+            viewport,
+            {},
+            "GPU animation export failed: " +
+                std::string{error.what()});
         return;
     }
 
@@ -35583,6 +36484,38 @@ void DrawExportTimingSummary(const OfflineRenderJobState& job, bool stableLayout
     } else if (stableLayout) {
         ImGui::TextDisabled("Writer wait: idle");
     }
+    if (!job.exportLog.memorySamples.empty()) {
+        const auto& latestSample = job.exportLog.memorySamples.back();
+        const auto& memory = latestSample.memory;
+        ImGui::Text(
+            "Process footprint: %s (peak %s)",
+            FormatByteCount(ProcessMemoryPressureBytes(memory)).c_str(),
+            FormatByteCount(job.exportLog.peakProcessMemoryBytes).c_str());
+        ImGui::Text(
+            "Thermal state: %s (worst %s)",
+            invisible_places::platform::SystemThermalStateLabel(
+                latestSample.thermalState).data(),
+            invisible_places::platform::SystemThermalStateLabel(
+                job.exportLog.worstThermalState).data());
+        if (memory.graphicsLedgerAvailable) {
+            ImGui::Text(
+                "Graphics / compressed: %s / %s",
+                FormatByteCount(memory.graphicsFootprintBytes).c_str(),
+                FormatByteCount(memory.compressedBytes).c_str());
+        } else {
+            ImGui::TextDisabled(
+                "Graphics / compressed: unavailable / %s",
+                FormatByteCount(memory.compressedBytes).c_str());
+        }
+    } else if (stableLayout) {
+        ImGui::TextDisabled("Process footprint: calculating...");
+        ImGui::TextDisabled("Thermal state: calculating...");
+        ImGui::TextDisabled("Graphics / compressed: calculating...");
+    }
+    ImGui::Text(
+        "Point buffers GPU / CPU scalar: %s / %s",
+        FormatByteCount(job.exportLog.gpuPointCloudBufferBytes).c_str(),
+        FormatByteCount(job.exportLog.cpuPointCloudScalarBytes).c_str());
     const auto remaining = RemainingExportRenderDuration(job);
     if (remaining.has_value()) {
         ImGui::Text(
@@ -35821,6 +36754,7 @@ void DrawAnimationExportSection(
 
     const char* exportModeLabels[] = {
         "MP4",
+        "Test MP4",
         "ProRes 422",
         "ProRes 4444",
         "PNG Stack",
@@ -35833,33 +36767,37 @@ void DrawAnimationExportSection(
         case invisible_places::output::AnimationExportMode::HevcAlphaMp4:
             exportModeIndex = 0;
             break;
+        case invisible_places::output::AnimationExportMode::TestMp4:
+            exportModeIndex = 1;
+            break;
         case invisible_places::output::AnimationExportMode::ProRes422Mov:
         case invisible_places::output::AnimationExportMode::ProRes422HqMov:
         case invisible_places::output::AnimationExportMode::ProRes422AlphaMatteMov:
         case invisible_places::output::AnimationExportMode::ProRes422HqAlphaMatteMov:
         case invisible_places::output::AnimationExportMode::ProRes422VideoToolboxMov:
         case invisible_places::output::AnimationExportMode::ProRes422HqVideoToolboxMov:
-            exportModeIndex = 1;
+            exportModeIndex = 2;
             break;
         case invisible_places::output::AnimationExportMode::ProRes4444Mov:
         case invisible_places::output::AnimationExportMode::ProRes4444XqMov:
         case invisible_places::output::AnimationExportMode::ProRes4444VideoToolboxMov:
         case invisible_places::output::AnimationExportMode::ProRes4444XqVideoToolboxMov:
-            exportModeIndex = 2;
-            break;
-        case invisible_places::output::AnimationExportMode::PngStack:
             exportModeIndex = 3;
             break;
-        case invisible_places::output::AnimationExportMode::FastPngStack:
+        case invisible_places::output::AnimationExportMode::PngStack:
             exportModeIndex = 4;
             break;
-        case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
+        case invisible_places::output::AnimationExportMode::FastPngStack:
             exportModeIndex = 5;
+            break;
+        case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
+            exportModeIndex = 6;
             break;
     }
     if (ImGui::Combo("Format", &exportModeIndex, exportModeLabels, IM_ARRAYSIZE(exportModeLabels))) {
         const invisible_places::output::AnimationExportMode exportModes[] = {
             invisible_places::output::AnimationExportMode::FastPreviewMp4,
+            invisible_places::output::AnimationExportMode::TestMp4,
             invisible_places::output::AnimationExportMode::ProRes422Mov,
             invisible_places::output::AnimationExportMode::ProRes4444Mov,
             invisible_places::output::AnimationExportMode::PngStack,
@@ -35878,6 +36816,8 @@ void DrawAnimationExportSection(
 
     if (AnimationExportWritesVideo(panel.exportMode)) {
         const auto viewedPreset = ViewedExportPreset(*runtimeState);
+        const bool testMp4 =
+            panel.exportMode == invisible_places::output::AnimationExportMode::TestMp4;
         const bool proRes4444 =
             panel.exportMode == invisible_places::output::AnimationExportMode::ProRes4444Mov ||
             panel.exportMode == invisible_places::output::AnimationExportMode::ProRes4444XqMov ||
@@ -35886,7 +36826,8 @@ void DrawAnimationExportSection(
         auto quality = NormalizeExportQualityForMode(panel.exportMode, viewedPreset.quality);
         int qualityIndex = quality == invisible_places::output::AnimationExportQuality::Normal ? 0 : 1;
         const char* qualityLabels[] = {"Normal", proRes4444 ? "XQ" : "HQ"};
-        if (ImGui::Combo("Quality", &qualityIndex, qualityLabels, IM_ARRAYSIZE(qualityLabels))) {
+        if (!testMp4 &&
+            ImGui::Combo("Quality", &qualityIndex, qualityLabels, IM_ARRAYSIZE(qualityLabels))) {
             auto& preset = EditActiveExportPreset(runtimeState);
             preset.quality = qualityIndex == 0
                                  ? invisible_places::output::AnimationExportQuality::Normal
@@ -35906,11 +36847,19 @@ void DrawAnimationExportSection(
             SanitizeExportPreset(&preset);
         }
         bool externalAlphaMatte =
-            AnimationExportWritesAlphaMatteVideoPair(panel.exportMode, viewedPreset.externalAlphaMatte);
-        if (ImGui::Checkbox("External Alpha Matte", &externalAlphaMatte)) {
+            testMp4
+                ? viewedPreset.externalAlphaMatte
+                : AnimationExportWritesAlphaMatteVideoPair(
+                      panel.exportMode,
+                      viewedPreset.externalAlphaMatte);
+        if (ImGui::Checkbox(testMp4 ? "Alpha" : "External Alpha Matte", &externalAlphaMatte)) {
             auto& preset = EditActiveExportPreset(runtimeState);
             preset.externalAlphaMatte = externalAlphaMatte;
             SanitizeExportPreset(&preset);
+        }
+        if (testMp4 && ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Bakes renderer alpha onto black before interpolation. The result is one opaque MP4, not an alpha sidecar.");
         }
         ImGui::TextDisabled(
             "%s",
@@ -35922,7 +36871,10 @@ void DrawAnimationExportSection(
                 .c_str());
     }
 
-    if (panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4 ||
+    if (panel.exportMode == invisible_places::output::AnimationExportMode::TestMp4) {
+        ImGui::TextDisabled(
+            "Test MP4 renders at the selected low frame rate, motion-interpolates to 30 fps, and writes one H.265 MP4.");
+    } else if (panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4 ||
         panel.exportMode == invisible_places::output::AnimationExportMode::HevcAlphaMp4) {
         ImGui::TextDisabled("MP4 uses HEVC color plus an optional grayscale luma matte for Adobe compositing.");
     } else if (panel.exportMode == invisible_places::output::AnimationExportMode::PngStack) {
@@ -35945,14 +36897,14 @@ void DrawAnimationExportSection(
         const auto viewedPreset = ViewedExportPreset(*runtimeState);
         ImGui::TextDisabled(
             AnimationExportWritesPngStack(panel.exportMode)
-                ? "PNG Stack folders are generated beside video files as Animation_Visual_Format_Settings."
+                ? "PNG Stack folders use the animation name; numeric suffixes prevent overwrites."
                 : AnimationExportWritesAlphaMatteVideoPair(
                       panel.exportMode,
                       viewedPreset.externalAlphaMatte)
-                      ? "Paired video names are generated as Animation_Format_Settings_color and _alpha."
+                      ? "Paired video names are Animation_Colour and Animation_Alpha; _2, _3, etc. prevent overwrites."
                 : AnimationExportWritesProRes(panel.exportMode)
-                      ? "MOV names are generated as Animation_Visual_Format.mov."
-                      : "MP4 names are generated as Animation_Visual.mp4.");
+                      ? "MOV files use the animation name; numeric suffixes prevent overwrites."
+                      : "MP4 files use the animation name; numeric suffixes prevent overwrites.");
     }
 
     int width = static_cast<int>(settings.width);
@@ -35969,12 +36921,20 @@ void DrawAnimationExportSection(
         settings.height = static_cast<std::uint32_t>(std::max(1, height));
         settingsChanged = true;
     }
-    if (ImGui::InputInt("Frame Rate", &fps)) {
+    const bool testMp4 =
+        panel.exportMode == invisible_places::output::AnimationExportMode::TestMp4;
+    if (ImGui::InputInt(testMp4 ? "Render Frame Rate" : "Frame Rate", &fps)) {
         settings.framesPerSecond = static_cast<std::uint32_t>(std::max(1, fps));
         settingsChanged = true;
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Changes output samples per second; animation duration and world-space speed stay fixed.");
+        ImGui::SetTooltip(
+            testMp4
+                ? "Sets how many frames the app renders each second. Optical flow creates a fixed 30 fps delivery file."
+                : "Changes output samples per second; animation duration and world-space speed stay fixed.");
+    }
+    if (testMp4) {
+        ImGui::TextDisabled("Delivery: 30 fps H.265, motion-compensated optical-flow interpolation.");
     }
     if (ImGui::InputInt("Start Frame", &startFrame)) {
         settings.startFrame = static_cast<std::uint32_t>(std::max(0, startFrame));
@@ -36446,6 +37406,21 @@ void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
     }
     if (job.exportFrustumMask) {
         ImGui::TextUnformatted("Renderer: GPU frustum mask, full visible density");
+        const double retainedPercent =
+            job.exportFrustumMaskFullSourcePoints == 0U
+                ? 100.0
+                : 100.0 *
+                      static_cast<double>(job.exportFrustumMaskDrawPoints) /
+                      static_cast<double>(job.exportFrustumMaskFullSourcePoints);
+        ImGui::Text(
+            "Path mask: %s / %s points (%.1f%% retained)",
+            FormatPointCount(job.exportFrustumMaskDrawPoints).c_str(),
+            FormatPointCount(job.exportFrustumMaskFullSourcePoints).c_str(),
+            retainedPercent);
+        ImGui::Text(
+            "Mask prepared once in %s",
+            FormatDurationForLog(
+                job.exportFrustumMaskPreparationDuration).c_str());
     } else {
         ImGui::TextUnformatted(job.previewDensity ? "Renderer: GPU preview density" : "Renderer: GPU full source");
     }
@@ -37135,6 +38110,44 @@ std::vector<ImVec2> ProjectWaterRegionPoints(
     return projectedPoints;
 }
 
+void DrawSubtleWaterCueDot(
+    ImDrawList* drawList,
+    ImVec2 center,
+    ImU32 colour,
+    float radius = 2.8F) {
+    if (drawList == nullptr) {
+        return;
+    }
+    drawList->AddCircleFilled(
+        center,
+        radius + 1.4F,
+        IM_COL32(0, 0, 0, 115),
+        16);
+    drawList->AddCircleFilled(center, radius, colour, 16);
+    drawList->AddCircle(
+        center,
+        radius + 0.6F,
+        IM_COL32(224, 252, 248, 125),
+        16,
+        0.8F);
+}
+
+void DrawSubtleWaterCueLabel(
+    ImDrawList* drawList,
+    ImVec2 anchor,
+    const std::string& label,
+    ImU32 colour) {
+    if (drawList == nullptr || label.empty()) {
+        return;
+    }
+    const ImVec2 position{anchor.x + 8.0F, anchor.y - 9.0F};
+    drawList->AddText(
+        ImVec2{position.x + 1.0F, position.y + 1.0F},
+        IM_COL32(0, 0, 0, 150),
+        label.c_str());
+    drawList->AddText(position, colour, label.c_str());
+}
+
 std::optional<WaterRegionVertexRef> PickWaterRegionVertexAtScreenPoint(
     const PreviewRuntimeState& runtimeState,
     const invisible_places::renderer::core::VulkanViewportShell& viewport,
@@ -37171,6 +38184,60 @@ void DrawWaterRegionOverlay(
     if (editor.drag.active &&
         (editor.drag.vertex.feature != feature || !WaterRegionVertexRefValid(*runtimeState, editor.drag.vertex))) {
         editor.drag = {};
+    }
+
+    if (water.subtleSelectedAuthoringCues) {
+        editor.hoveredVertex.reset();
+        editor.drag = {};
+        const auto selectedIndex = SelectedWaterRegionIndex(water, feature);
+        if (!selectedIndex.has_value()) {
+            return;
+        }
+        const auto* vertices = WaterRegionVertices(
+            *runtimeState,
+            feature,
+            selectedIndex.value());
+        if (vertices == nullptr || vertices->empty()) {
+            return;
+        }
+        const auto matrices = runtimeState->camera.Matrices(
+            CurrentAspectRatio(viewport));
+        auto* drawList = ImGui::GetBackgroundDrawList(
+            ImGui::GetMainViewport());
+        const auto palette = WaterRegionPalette(
+            feature,
+            true,
+            WaterRegionMaskStale(
+                *runtimeState,
+                feature,
+                selectedIndex.value()));
+        for (std::size_t vertexIndex = 0U;
+             vertexIndex < vertices->size();
+             ++vertexIndex) {
+            const auto projected = ProjectWorldPoint(
+                matrices,
+                viewport,
+                ToGlm((*vertices)[vertexIndex]));
+            if (!projected.has_value()) {
+                continue;
+            }
+            DrawSubtleWaterCueDot(
+                drawList,
+                projected->screen,
+                palette.handle,
+                vertexIndex == 0U ? 3.0F : 2.4F);
+            if (vertexIndex == 0U) {
+                DrawSubtleWaterCueLabel(
+                    drawList,
+                    projected->screen,
+                    WaterRegionName(
+                        *runtimeState,
+                        feature,
+                        selectedIndex.value()),
+                    palette.handle);
+            }
+        }
+        return;
     }
 
     const auto& io = ImGui::GetIO();
@@ -37809,6 +38876,56 @@ void DrawManualFlowPathOverlay(
                     water.manualFlowPaths.size()
             ? water.selectedManualFlowPathIndex
             : std::nullopt;
+    if (water.subtleSelectedAuthoringCues) {
+        editor.hoveredNodeIndex.reset();
+        editor.drag = {};
+        editor.laneWidthDrag = {};
+        editor.pointerCapturedUntilRelease = false;
+        const WaterManualFlowPathSource* selectedSource = nullptr;
+        if (editor.active) {
+            selectedSource = &editor.draft;
+        } else if (liveSelectedSourceIndex.has_value()) {
+            selectedSource =
+                &water.manualFlowPaths[liveSelectedSourceIndex.value()];
+        }
+        if (selectedSource == nullptr ||
+            selectedSource->controlPoints.empty()) {
+            return;
+        }
+        for (std::size_t index = 0U;
+             index < selectedSource->controlPoints.size();
+             ++index) {
+            const auto projected = ProjectWorldPoint(
+                matrices,
+                viewport,
+                ToGlm(selectedSource->controlPoints[index]));
+            if (!projected.has_value()) {
+                continue;
+            }
+            const bool selectedNode =
+                editor.selectedNodeIndex.has_value() &&
+                editor.selectedNodeIndex.value() == index;
+            DrawSubtleWaterCueDot(
+                drawList,
+                projected->screen,
+                index == 0U
+                    ? IM_COL32(255, 203, 95, 205)
+                    : (selectedNode
+                           ? IM_COL32(220, 251, 255, 205)
+                           : IM_COL32(91, 211, 230, 180)),
+                index == 0U ? 3.1F : (selectedNode ? 2.8F : 2.3F));
+            if (index == 0U) {
+                DrawSubtleWaterCueLabel(
+                    drawList,
+                    projected->screen,
+                    selectedSource->name.empty()
+                        ? std::string{"Flow path"}
+                        : selectedSource->name,
+                    IM_COL32(191, 240, 247, 205));
+            }
+        }
+        return;
+    }
     const std::optional<std::size_t> interactiveStoredSourceIndex =
         editor.active && !editor.creating && editor.sourceIndex.has_value() &&
                 editor.sourceIndex.value() < water.manualFlowPaths.size()
@@ -38623,6 +39740,51 @@ void DrawWaterEmitterOverlay(
     const auto matrices = runtimeState->camera.Matrices(CurrentAspectRatio(viewport));
     ImDrawList* drawList = ImGui::GetBackgroundDrawList(ImGui::GetMainViewport());
     const auto& io = ImGui::GetIO();
+    if (runtimeState->water.subtleSelectedAuthoringCues) {
+        auto& water = runtimeState->water;
+        water.emitterGizmoDrag = {};
+        water.emitterGizmoPointerCaptured = false;
+        water.emitterGizmoHoveredLastFrame = false;
+        if (water.selectedEmitterIndex.has_value() &&
+            water.selectedEmitterIndex.value() < water.emitters.size()) {
+            const auto& emitter =
+                water.emitters[water.selectedEmitterIndex.value()];
+            if (const auto projected = ProjectWorldPoint(
+                    matrices,
+                    viewport,
+                    ToGlm(emitter.position));
+                projected.has_value()) {
+                DrawSubtleWaterCueDot(
+                    drawList,
+                    projected->screen,
+                    IM_COL32(126, 228, 239, 190),
+                    3.0F);
+                DrawSubtleWaterCueLabel(
+                    drawList,
+                    projected->screen,
+                    emitter.name,
+                    IM_COL32(191, 240, 247, 205));
+            }
+        } else if (water.pathAttractorSelected && attractorVisible) {
+            if (const auto projected = ProjectWorldPoint(
+                    matrices,
+                    viewport,
+                    ToGlm(pathSettings.attractorPosition));
+                projected.has_value()) {
+                DrawSubtleWaterCueDot(
+                    drawList,
+                    projected->screen,
+                    IM_COL32(238, 122, 218, 190),
+                    3.0F);
+                DrawSubtleWaterCueLabel(
+                    drawList,
+                    projected->screen,
+                    std::string{"Flow attractor"},
+                    IM_COL32(244, 186, 234, 205));
+            }
+        }
+        return;
+    }
     const bool renderViewportHovered = IsMouseOverRenderViewport(viewport);
     const bool canPick =
         !RenderSetupAuthoringLocked(runtimeState) &&
@@ -38979,6 +40141,45 @@ void DrawWaterSeepageOverlay(
     const auto matrices = runtimeState->camera.Matrices(CurrentAspectRatio(viewport));
     auto* drawList = ImGui::GetBackgroundDrawList(ImGui::GetMainViewport());
     const auto& io = ImGui::GetIO();
+    if (runtimeState->water.subtleSelectedAuthoringCues) {
+        auto& water = runtimeState->water;
+        water.seepageGizmoDrag = {};
+        water.seepageGizmoPointerCaptured = false;
+        water.seepageGizmoHoveredLastFrame = false;
+        water.seepageSurfaceGuideWarning.clear();
+        for (const auto index : water.selectedSeepageNodeIndices) {
+            if (index >= water.seepageNodes.size()) {
+                continue;
+            }
+            const auto& node = water.seepageNodes[index];
+            const auto projected = ProjectWorldPoint(
+                matrices,
+                viewport,
+                ToGlm(node.position));
+            if (!projected.has_value()) {
+                continue;
+            }
+            const bool primary =
+                water.selectedSeepageNodeIndex.has_value() &&
+                water.selectedSeepageNodeIndex.value() == index;
+            DrawSubtleWaterCueDot(
+                drawList,
+                projected->screen,
+                primary
+                    ? IM_COL32(166, 235, 215, 195)
+                    : IM_COL32(111, 205, 179, 155),
+                primary ? 3.0F : 2.3F);
+            ++water.seepageOverlayMarkerCount;
+            if (primary) {
+                DrawSubtleWaterCueLabel(
+                    drawList,
+                    projected->screen,
+                    node.name,
+                    IM_COL32(184, 235, 220, 205));
+            }
+        }
+        return;
+    }
     const auto evaluatedWaterFrame = frameState == nullptr
                                          ? ResolveWaterFrameState(runtimeState)
                                          : WaterFrameState{};
@@ -40514,9 +41715,14 @@ bool UndoWaterPathBranchEdit(
 bool HandleWaterPathViewInput(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
-    if (runtimeState == nullptr ||
-        viewport == nullptr ||
-        RenderSetupAuthoringLocked(runtimeState) ||
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return false;
+    }
+    if (runtimeState->water.subtleSelectedAuthoringCues) {
+        runtimeState->water.hoveredPathBranchId.reset();
+        return false;
+    }
+    if (RenderSetupAuthoringLocked(runtimeState) ||
         runtimeState->water.manualFlowPathEditor.active ||
         runtimeState->water.overlayViewMode != WaterOverlayViewMode::Path ||
         !runtimeState->water.pathCacheLoaded ||
@@ -40675,6 +41881,7 @@ void DrawWaterPathDebugOverlay(
     PreviewRuntimeState* runtimeState,
     const invisible_places::renderer::core::VulkanViewportShell& viewport) {
     if (runtimeState == nullptr ||
+        runtimeState->water.subtleSelectedAuthoringCues ||
         runtimeState->water.overlayViewMode != WaterOverlayViewMode::Path ||
         !runtimeState->water.pathCacheLoaded ||
         runtimeState->water.pathCache.branches.empty() ||
@@ -40829,7 +42036,9 @@ void DrawAnimationCurveOverlay(
     const invisible_places::camera::OrbitCameraMatrices& matrices,
     const invisible_places::renderer::core::VulkanViewportShell& viewport,
     ImU32 color,
-    bool drawCameraCurve) {
+    bool drawCameraCurve,
+    const invisible_places::camera::AnimationCameraFrameTransform*
+        frameTransform = nullptr) {
     if (!preparedPath.valid || preparedPath.singleKey) {
         return;
     }
@@ -40841,15 +42050,20 @@ void DrawAnimationCurveOverlay(
         const auto evaluation = invisible_places::camera::EvaluatePreparedAnimationPath(
             preparedPath,
             preparedPath.durationSeconds * amount);
-        const auto point = drawCameraCurve
-                               ? glm::vec3{
-                                     evaluation.camera.position[0],
-                                     evaluation.camera.position[1],
-                                     evaluation.camera.position[2]}
-                               : glm::vec3{
-                                     evaluation.focusPoint[0],
-                                     evaluation.focusPoint[1],
-                                     evaluation.focusPoint[2]};
+        std::array<float, 3> pointArray = drawCameraCurve
+            ? evaluation.camera.position
+            : evaluation.focusPoint;
+        if (frameTransform != nullptr) {
+            pointArray = invisible_places::camera::
+                ApplyAnimationCameraFrameTransform(
+                    *frameTransform,
+                    pointArray);
+        }
+        const glm::vec3 point{
+            pointArray[0U],
+            pointArray[1U],
+            pointArray[2U],
+        };
         const auto projected = ProjectWorldPoint(matrices, viewport, point);
         if (projected.has_value() && previous.has_value()) {
             ImGui::GetBackgroundDrawList(ImGui::GetMainViewport())->AddLine(
@@ -40861,473 +42075,6 @@ void DrawAnimationCurveOverlay(
         previous = projected.has_value() ? std::optional<ImVec2>{projected->screen} : std::nullopt;
     }
 }
-
-std::size_t ResolveLinkedLoopStartKeyIndex(
-    const AnimationPath& path,
-    std::string_view keyId,
-    float fallbackPosition = 0.5F) {
-    if (path.keys.empty()) {
-        return 0U;
-    }
-    if (!keyId.empty()) {
-        const auto keyIt = std::find_if(
-            path.keys.begin(),
-            path.keys.end(),
-            [&](const auto& key) { return key.id == keyId; });
-        if (keyIt != path.keys.end()) {
-            return static_cast<std::size_t>(
-                std::distance(path.keys.begin(), keyIt));
-        }
-    }
-    std::size_t closestIndex = 0U;
-    float closestDistance = std::numeric_limits<float>::max();
-    for (std::size_t index = 0U; index < path.keys.size(); ++index) {
-        const float position = invisible_places::camera::
-            AnimationPathKeyNormalizedPosition(path, index);
-        const float distance = std::abs(position - fallbackPosition);
-        if (distance < closestDistance) {
-            closestDistance = distance;
-            closestIndex = index;
-        }
-    }
-    return closestIndex;
-}
-
-void DrawLinkedLoopTimelinePreview(
-    const AnimationPath& first,
-    const AnimationPath& second,
-    std::int32_t paddingFrames,
-    float firstStartPosition) {
-    const auto timing = invisible_places::camera::ResolveLinkedLoopTiming(
-        first,
-        second,
-        paddingFrames);
-    paddingFrames = timing.paddingFrames;
-    const float periodFrames =
-        static_cast<float>(timing.periodFrames);
-
-    const ImVec2 size{
-        std::max(80.0F, ImGui::GetContentRegionAvail().x),
-        54.0F};
-    ImGui::InvisibleButton(
-        "##LinkedLoopOverlapTimeline",
-        size);
-    const ImVec2 minimum = ImGui::GetItemRectMin();
-    const ImVec2 maximum = ImGui::GetItemRectMax();
-    auto* drawList = ImGui::GetWindowDrawList();
-    drawList->AddRectFilled(
-        minimum,
-        maximum,
-        ImGui::GetColorU32(ImGuiCol_FrameBg),
-        3.0F);
-    const float width = std::max(1.0F, maximum.x - minimum.x);
-    const auto xAtFrame = [&](float frame) {
-        return minimum.x + width * std::clamp(
-            frame / periodFrames,
-            0.0F,
-            1.0F);
-    };
-    const float bandTop = minimum.y + 8.0F;
-    const float bandBottom = maximum.y - 8.0F;
-    const auto drawBand = [&](float start, float end, ImU32 color) {
-        if (end <= start) {
-            return;
-        }
-        drawList->AddRectFilled(
-            ImVec2{xAtFrame(start), bandTop},
-            ImVec2{xAtFrame(end), bandBottom},
-            color,
-            2.0F);
-    };
-    const auto drawCircularBand = [&](float start,
-                                      float duration,
-                                      ImU32 color) {
-        if (duration <= 0.0F) {
-            return;
-        }
-        if (duration >= periodFrames) {
-            drawBand(0.0F, periodFrames, color);
-            return;
-        }
-        float wrappedStart = std::fmod(start, periodFrames);
-        if (wrappedStart < 0.0F) {
-            wrappedStart += periodFrames;
-        }
-        const float end = wrappedStart + duration;
-        drawBand(
-            wrappedStart,
-            std::min(end, periodFrames),
-            color);
-        if (end > periodFrames) {
-            drawBand(0.0F, end - periodFrames, color);
-        }
-    };
-    const ImU32 firstColor = IM_COL32(70, 155, 255, 82);
-    const ImU32 secondColor = IM_COL32(255, 150, 70, 82);
-    drawCircularBand(
-        0.0F,
-        static_cast<float>(timing.firstDurationFrames),
-        firstColor);
-    const float secondStart = timing.secondStartFrame;
-    const float secondEnd =
-        secondStart + static_cast<float>(timing.secondDurationFrames);
-    drawCircularBand(
-        secondStart,
-        static_cast<float>(timing.secondDurationFrames),
-        secondColor);
-
-    const float startFrame = std::clamp(firstStartPosition, 0.0F, 1.0F) *
-                             static_cast<float>(
-                                 timing.firstDurationFrames);
-    const float markerX = xAtFrame(startFrame);
-    drawList->AddLine(
-        ImVec2{markerX, minimum.y + 2.0F},
-        ImVec2{markerX, maximum.y - 2.0F},
-        IM_COL32(255, 235, 140, 245),
-        2.0F);
-    drawList->AddTriangleFilled(
-        ImVec2{markerX, minimum.y + 2.0F},
-        ImVec2{markerX - 4.0F, minimum.y + 7.0F},
-        ImVec2{markerX + 4.0F, minimum.y + 7.0F},
-        IM_COL32(255, 235, 140, 245));
-    drawList->AddText(
-        ImVec2{minimum.x + 5.0F, bandTop + 3.0F},
-        IM_COL32(170, 215, 255, 220),
-        "A");
-    drawList->AddText(
-        ImVec2{std::min(
-                   maximum.x - 16.0F,
-                   xAtFrame(std::fmod(secondStart, periodFrames)) + 5.0F),
-               bandTop + 3.0F},
-        IM_COL32(255, 205, 165, 220),
-        "B");
-    drawList->AddRect(
-        minimum,
-        maximum,
-        ImGui::GetColorU32(ImGuiCol_Border),
-        3.0F);
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
-        ImGui::SetTooltip(
-            "Both clips share one translucent lane. Darker regions are "
-            "real crossfade overlaps; empty regions are held gaps. The "
-            "yellow marker is the linked loop's phase start. At zero "
-            "padding, each incoming first key aligns with the outgoing "
-            "penultimate key, blending the complete terminal edge.");
-    }
-    if (paddingFrames == 0) {
-        ImGui::TextDisabled(
-            "Each incoming first key starts at the outgoing penultimate key.");
-    } else {
-        ImGui::TextDisabled(
-            "Each incoming first key starts %+d frames from the outgoing penultimate key.",
-            paddingFrames);
-    }
-
-    const float firstEnd =
-        static_cast<float>(timing.firstDurationFrames);
-    const float nextFirstStart = periodFrames;
-    const float firstToSecondOverlap = std::max(
-        0.0F,
-        std::min(firstEnd, secondEnd) -
-            std::max(0.0F, secondStart));
-    const float firstToSecondGap = std::max(
-        0.0F,
-        secondStart - firstEnd);
-    const float secondToFirstOverlap = std::max(
-        0.0F,
-        std::min(
-            secondEnd,
-            nextFirstStart +
-                static_cast<float>(timing.firstDurationFrames)) -
-            std::max(secondStart, nextFirstStart));
-    const float secondToFirstGap = std::max(
-        0.0F,
-        nextFirstStart - secondEnd);
-    const auto joinLabel = [](float overlap, float gap) {
-        if (overlap > 0.0F) {
-            return std::to_string(static_cast<int>(std::lround(overlap))) +
-                   "-frame overlap";
-        }
-        if (gap > 0.0F) {
-            return std::to_string(static_cast<int>(std::lround(gap))) +
-                   "-frame hold";
-        }
-        return std::string{"endpoint meet"};
-    };
-    const auto firstJoin = joinLabel(
-        firstToSecondOverlap,
-        firstToSecondGap);
-    const auto secondJoin = joinLabel(
-        secondToFirstOverlap,
-        secondToFirstGap);
-    ImGui::TextDisabled(
-        "A->B: %s; B->A: %s.",
-        firstJoin.c_str(),
-        secondJoin.c_str());
-}
-
-void DrawLinkedLoopLiveCameraControls(
-    PreviewRuntimeState* runtimeState) {
-    if (runtimeState == nullptr) {
-        return;
-    }
-    auto& panel = runtimeState->animationPanel;
-    bool changed = false;
-    ImGui::TextUnformatted("Live Camera");
-    ImGui::SameLine();
-    ImGui::PushID("LinkedLoopLiveCamera");
-    if (ImGui::RadioButton(
-            "Overlay",
-            panel.linkedLoopLiveCameraMode ==
-                LinkedLoopLiveCameraMode::InterleavedOverlay)) {
-        panel.linkedLoopLiveCameraMode =
-            LinkedLoopLiveCameraMode::InterleavedOverlay;
-        changed = true;
-    }
-    ImGui::SameLine();
-    if (ImGui::RadioButton(
-            "A",
-            panel.linkedLoopLiveCameraMode ==
-                LinkedLoopLiveCameraMode::SourceA)) {
-        panel.linkedLoopLiveCameraMode =
-            LinkedLoopLiveCameraMode::SourceA;
-        changed = true;
-    }
-    ImGui::SameLine();
-    if (ImGui::RadioButton(
-            "B",
-            panel.linkedLoopLiveCameraMode ==
-                LinkedLoopLiveCameraMode::SourceB)) {
-        panel.linkedLoopLiveCameraMode =
-            LinkedLoopLiveCameraMode::SourceB;
-        changed = true;
-    }
-    ImGui::PopID();
-    if (changed && panel.currentPath.has_value()) {
-        ApplyAnimationEvaluation(
-            runtimeState,
-            panel.currentPath.value(),
-            panel.scrubAmount,
-            runtimeState->animationPlayback.active ||
-                panel.previewDepthOfField);
-    }
-    ImGui::TextDisabled(
-        "Overlay alternates A/B and motion-warps the cached partner between renders.");
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
-        ImGui::SetTooltip(
-            "Overlay renders A and B on alternate display frames, retains "
-            "both colour/depth images, and composites them with the linked "
-            "weights. While one source renders, the cached partner is "
-            "reprojected toward its camera pose at the current time, reducing "
-            "half-rate camera judder without a second point pass. Newly "
-            "revealed edges fall back conservatively, so very fast movement "
-            "can still show a small temporal trail. A or B isolates that "
-            "source; outside overlaps the active source or held endpoint "
-            "remains visible.");
-    }
-}
-
-void PreserveLinkedAnimationOwnedSettings(
-    const AnimationPath& previous,
-    AnimationPath* rebuilt) {
-    if (rebuilt == nullptr) {
-        return;
-    }
-    rebuilt->exportSettings = previous.exportSettings;
-    rebuilt->selectedTimingTakeId = previous.selectedTimingTakeId;
-    rebuilt->selectedWaterScenarioId = previous.selectedWaterScenarioId;
-    rebuilt->waterScenarioTracks = previous.waterScenarioTracks;
-    rebuilt->waterAnimationTrailSettings =
-        previous.waterAnimationTrailSettings;
-    rebuilt->tempWaterAnimationTrailSettings =
-        previous.tempWaterAnimationTrailSettings;
-    rebuilt->waterPointVisualStyle = previous.waterPointVisualStyle;
-    rebuilt->tempWaterPointVisualStyle =
-        previous.tempWaterPointVisualStyle;
-    rebuilt->waterCausticLookSettings =
-        previous.waterCausticLookSettings;
-    rebuilt->tempWaterCausticLookSettings =
-        previous.tempWaterCausticLookSettings;
-    rebuilt->waterVisualSettings = previous.waterVisualSettings;
-    rebuilt->tempWaterVisualSettings = previous.tempWaterVisualSettings;
-    rebuilt->waterSettings = previous.waterSettings;
-    rebuilt->tempWaterSettings = previous.tempWaterSettings;
-}
-
-void DrawLinkedLoopEndpointGhosts(
-    const AnimationPath& first,
-    const AnimationPath& second,
-    std::int32_t paddingFrames,
-    const invisible_places::camera::OrbitCameraMatrices& matrices,
-    const invisible_places::renderer::core::VulkanViewportShell& viewport) {
-    const auto firstContext =
-        invisible_places::camera::PrepareAnimationPathEvaluation(first);
-    const auto secondContext =
-        invisible_places::camera::PrepareAnimationPathEvaluation(second);
-    if (!firstContext.valid || !secondContext.valid) {
-        return;
-    }
-    const auto timing = invisible_places::camera::ResolveLinkedLoopTiming(
-        first,
-        second,
-        paddingFrames);
-    auto* drawList = ImGui::GetBackgroundDrawList(
-        ImGui::GetMainViewport());
-    const auto drawPair = [&](const auto& outgoing,
-                              const auto& incoming,
-                              bool outgoingIsFirst) {
-        const ImU32 outgoingCameraColor = outgoingIsFirst
-                                              ? IM_COL32(80, 160, 255, 72)
-                                              : IM_COL32(255, 150, 70, 72);
-        const ImU32 incomingCameraColor = outgoingIsFirst
-                                              ? IM_COL32(255, 150, 70, 72)
-                                              : IM_COL32(80, 160, 255, 72);
-        const ImU32 outgoingFocusColor = outgoingIsFirst
-                                             ? IM_COL32(80, 160, 255, 58)
-                                             : IM_COL32(255, 150, 70, 58);
-        const ImU32 incomingFocusColor = outgoingIsFirst
-                                             ? IM_COL32(255, 150, 70, 58)
-                                             : IM_COL32(80, 160, 255, 58);
-        const auto outgoingCamera = ProjectWorldPoint(
-            matrices,
-            viewport,
-            glm::vec3{
-                outgoing.camera.position[0],
-                outgoing.camera.position[1],
-                outgoing.camera.position[2]});
-        const auto incomingCamera = ProjectWorldPoint(
-            matrices,
-            viewport,
-            glm::vec3{
-                incoming.camera.position[0],
-                incoming.camera.position[1],
-                incoming.camera.position[2]});
-        const auto outgoingFocus = ProjectWorldPoint(
-            matrices,
-            viewport,
-            glm::vec3{
-                outgoing.focusPoint[0],
-                outgoing.focusPoint[1],
-                outgoing.focusPoint[2]});
-        const auto incomingFocus = ProjectWorldPoint(
-            matrices,
-            viewport,
-            glm::vec3{
-                incoming.focusPoint[0],
-                incoming.focusPoint[1],
-                incoming.focusPoint[2]});
-        if (outgoingCamera.has_value() && incomingCamera.has_value()) {
-            drawList->AddLine(
-                outgoingCamera->screen,
-                incomingCamera->screen,
-                IM_COL32(255, 255, 255, 34),
-                1.0F);
-            drawList->AddCircleFilled(
-                outgoingCamera->screen,
-                4.0F,
-                outgoingCameraColor,
-                16);
-            drawList->AddCircleFilled(
-                incomingCamera->screen,
-                4.0F,
-                incomingCameraColor,
-                16);
-        }
-        if (outgoingCamera.has_value() && outgoingFocus.has_value()) {
-            drawList->AddLine(
-                outgoingCamera->screen,
-                outgoingFocus->screen,
-                outgoingIsFirst
-                    ? IM_COL32(80, 160, 255, 52)
-                    : IM_COL32(255, 150, 70, 52),
-                1.0F);
-            drawList->AddCircleFilled(
-                outgoingFocus->screen,
-                2.5F,
-                outgoingFocusColor,
-                12);
-        }
-        if (incomingCamera.has_value() && incomingFocus.has_value()) {
-            drawList->AddLine(
-                incomingCamera->screen,
-                incomingFocus->screen,
-                outgoingIsFirst
-                    ? IM_COL32(255, 150, 70, 52)
-                    : IM_COL32(80, 160, 255, 52),
-                1.0F);
-            drawList->AddCircleFilled(
-                incomingFocus->screen,
-                2.5F,
-                incomingFocusColor,
-                12);
-        }
-    };
-    const auto drawJoin = [&](const auto& outgoingContext,
-                              const auto& incomingContext,
-                              float outgoingStart,
-                              float incomingStart,
-                              float outgoingDuration,
-                              float incomingDuration,
-                              bool outgoingIsFirst) {
-        const float overlapStart = std::max(
-            outgoingStart,
-            incomingStart);
-        const float overlapEnd = std::min(
-            outgoingStart + outgoingDuration,
-            incomingStart + incomingDuration);
-        const float overlapFrames = std::max(
-            0.0F,
-            overlapEnd - overlapStart);
-        const int sampleCount = overlapFrames > 0.0F ? 7 : 1;
-        for (int sampleIndex = 0;
-             sampleIndex < sampleCount;
-             ++sampleIndex) {
-            const float amount = sampleCount == 1
-                                     ? 0.0F
-                                     : static_cast<float>(sampleIndex) /
-                                           static_cast<float>(
-                                               sampleCount - 1);
-            const float globalFrame = overlapFrames > 0.0F
-                                          ? overlapStart +
-                                                overlapFrames * amount
-                                          : outgoingStart +
-                                                outgoingDuration;
-            const float outgoingFrame = overlapFrames > 0.0F
-                                            ? globalFrame - outgoingStart
-                                            : outgoingDuration;
-            const float incomingFrame = overlapFrames > 0.0F
-                                            ? globalFrame - incomingStart
-                                            : 0.0F;
-            drawPair(
-                invisible_places::camera::
-                    EvaluatePreparedAnimationPath(
-                        outgoingContext,
-                        outgoingFrame / 30.0F),
-                invisible_places::camera::
-                    EvaluatePreparedAnimationPath(
-                        incomingContext,
-                        incomingFrame / 30.0F),
-                outgoingIsFirst);
-        }
-    };
-    drawJoin(
-        firstContext,
-        secondContext,
-        0.0F,
-        timing.secondStartFrame,
-        static_cast<float>(timing.firstDurationFrames),
-        static_cast<float>(timing.secondDurationFrames),
-        true);
-    drawJoin(
-        secondContext,
-        firstContext,
-        timing.secondStartFrame,
-        static_cast<float>(timing.periodFrames),
-        static_cast<float>(timing.secondDurationFrames),
-        static_cast<float>(timing.firstDurationFrames),
-        false);
-}
-
 void DrawAnimationViewportOverlay(
     PreviewRuntimeState* runtimeState,
     const invisible_places::renderer::core::VulkanViewportShell& viewport) {
@@ -41364,106 +42111,206 @@ void DrawAnimationViewportOverlay(
     const ImU32 cameraColor = IM_COL32(80, 160, 255, 230);
     const ImU32 focusColor = IM_COL32(88, 220, 150, 230);
     const ImU32 selectedColor = IM_COL32(255, 232, 128, 255);
+    const ImU32 partnerCameraColor = IM_COL32(255, 138, 60, 238);
+    const ImU32 partnerFocusColor = IM_COL32(240, 105, 210, 238);
     const auto& preparedPath = CachedPreparedAnimationPath(&panel, path);
     DrawAnimationCurveOverlay(preparedPath, matrices, viewport, cameraColor, true);
     DrawAnimationCurveOverlay(preparedPath, matrices, viewport, focusColor, false);
 
-    if (panel.showLinkedLoopOverlap) {
-        const AnimationPath* linkedFirst = nullptr;
-        const AnimationPath* linkedSecond = nullptr;
-        std::int32_t linkedPaddingFrames =
-            static_cast<std::int32_t>(panel.linkedLoopPaddingFrames);
-        if (path.linkedLoop.has_value()) {
-            const auto firstIndex = FindAnimationRegistryIndexByFileName(
-                panel,
-                path.linkedLoop->firstFileName);
-            const auto secondIndex = FindAnimationRegistryIndexByFileName(
-                panel,
-                path.linkedLoop->secondFileName);
-            if (firstIndex.has_value()) {
-                linkedFirst = RegistryAnimationPath(
-                    *runtimeState,
-                    firstIndex.value());
-            }
-            if (secondIndex.has_value()) {
-                linkedSecond = RegistryAnimationPath(
-                    *runtimeState,
-                    secondIndex.value());
-            }
-            linkedPaddingFrames = static_cast<std::int32_t>(
-                panel.linkedLoopPaddingFrames);
-        } else if (!panel.loopSmoothingPartnerPath.empty()) {
-            const auto partnerIndex = FindAnimationRegistryIndex(
-                panel,
-                panel.loopSmoothingPartnerPath);
-            if (partnerIndex.has_value()) {
-                linkedFirst = &path;
-                linkedSecond = RegistryAnimationPath(
-                    *runtimeState,
-                    partnerIndex.value());
-            }
-        }
-        if (linkedFirst != nullptr && linkedSecond != nullptr) {
-            if (linkedFirst != &path) {
-                const auto firstGhost = invisible_places::camera::
-                    PrepareAnimationPathEvaluation(*linkedFirst);
-                DrawAnimationCurveOverlay(
-                    firstGhost,
-                    matrices,
-                    viewport,
-                    IM_COL32(80, 160, 255, 62),
-                    true);
-                DrawAnimationCurveOverlay(
-                    firstGhost,
-                    matrices,
-                    viewport,
-                    IM_COL32(88, 220, 150, 48),
-                    false);
-            }
-            const auto secondGhost = invisible_places::camera::
-                PrepareAnimationPathEvaluation(*linkedSecond);
+    struct PartnerOverlayContext {
+        std::size_t fileIndex = 0U;
+        std::filesystem::path filePath;
+        const AnimationPath* path = nullptr;
+        invisible_places::camera::AnimationCameraFrameTransform transform{};
+    };
+    std::optional<PartnerOverlayContext> partnerOverlay;
+    const auto& ghost = panel.matchingFrameGhost;
+    const bool partnerDragActive = panel.drag.active &&
+        panel.drag.partnerPath;
+    const bool ghostOwnsCurrentPath = ghost.uploaded && ghost.visible &&
+        ghost.showPartnerSplines && ghost.matchingFrameAvailable &&
+        !panel.currentFilePath.empty() &&
+        PathsLexicallyEqual(
+            std::filesystem::path{panel.currentFilePath},
+            ghost.currentFilePath);
+    if (ghostOwnsCurrentPath &&
+        (ghost.captureMatchesCurrentFrame || partnerDragActive)) {
+        const auto partnerIndex = FindAnimationRegistryIndex(
+            panel,
+            ghost.partnerFilePath);
+        const auto* partnerPath = partnerIndex.has_value()
+            ? RegistryAnimationPath(*runtimeState, partnerIndex.value())
+            : nullptr;
+        const bool pairStillMatches = partnerPath != nullptr &&
+            path.velocityBlendLink.has_value() &&
+            partnerPath->velocityBlendLink.has_value() &&
+            path.velocityBlendLink->pairId == ghost.pairId &&
+            partnerPath->velocityBlendLink->pairId == ghost.pairId;
+        if (pairStillMatches) {
+            auto transform = partnerDragActive &&
+                    PathsLexicallyEqual(
+                        panel.drag.partnerFilePath,
+                        ghost.partnerFilePath)
+                ? panel.drag.partnerToCurrentFrame
+                : invisible_places::camera::
+                      BuildAnimationCameraFrameTransform(
+                          invisible_places::camera::EvaluateAnimationPath(
+                              path,
+                              invisible_places::camera::
+                                      AnimationPathDurationSeconds(path) *
+                                  ghost.currentNormalizedPosition),
+                          invisible_places::camera::EvaluateAnimationPath(
+                              *partnerPath,
+                              invisible_places::camera::
+                                      AnimationPathDurationSeconds(
+                                          *partnerPath) *
+                                  ghost.partnerNormalizedPosition));
+            partnerOverlay = PartnerOverlayContext{
+                .fileIndex = partnerIndex.value(),
+                .filePath = ghost.partnerFilePath,
+                .path = partnerPath,
+                .transform = transform,
+            };
+            const auto preparedPartner = invisible_places::camera::
+                PrepareAnimationPathEvaluation(*partnerPath);
             DrawAnimationCurveOverlay(
-                secondGhost,
+                preparedPartner,
                 matrices,
                 viewport,
-                IM_COL32(255, 150, 70, 62),
-                true);
+                partnerCameraColor,
+                true,
+                &partnerOverlay->transform);
             DrawAnimationCurveOverlay(
-                secondGhost,
+                preparedPartner,
                 matrices,
                 viewport,
-                IM_COL32(255, 205, 120, 48),
-                false);
-            DrawLinkedLoopEndpointGhosts(
-                *linkedFirst,
-                *linkedSecond,
-                linkedPaddingFrames,
-                matrices,
-                viewport);
+                partnerFocusColor,
+                false,
+                &partnerOverlay->transform);
         }
     }
+    if (panel.viewportPartnerSelectionActive) {
+        const auto selectedPartnerIndex = FindAnimationRegistryIndex(
+            panel,
+            panel.viewportPartnerSelectionPath);
+        const auto* selectedPartner = selectedPartnerIndex.has_value()
+            ? RegistryAnimationPath(
+                  *runtimeState,
+                  selectedPartnerIndex.value())
+            : nullptr;
+        const bool selectionStillBelongsToGhost =
+            ghost.uploaded && ghost.visible &&
+            ghost.showPartnerSplines &&
+            !panel.currentFilePath.empty() &&
+            PathsLexicallyEqual(
+                std::filesystem::path{panel.currentFilePath},
+                ghost.currentFilePath) &&
+            PathsLexicallyEqual(
+                panel.viewportPartnerSelectionPath,
+                ghost.partnerFilePath);
+        if (!selectionStillBelongsToGhost ||
+            selectedPartner == nullptr ||
+            !panel.viewportPartnerKeyIndex.has_value() ||
+            panel.viewportPartnerKeyIndex.value() >=
+                selectedPartner->keys.size()) {
+            panel.viewportPartnerSelectionActive = false;
+            panel.viewportPartnerKeyIndex.reset();
+        }
+    }
+
+    const auto applyPartnerTransform = [](const auto& transform,
+                                          const glm::vec3& point) {
+        const auto transformed = invisible_places::camera::
+            ApplyAnimationCameraFrameTransform(
+                transform,
+                {point.x, point.y, point.z});
+        return glm::vec3{
+            transformed[0U],
+            transformed[1U],
+            transformed[2U],
+        };
+    };
 
     const auto& io = ImGui::GetIO();
     if (panel.drag.active) {
         if (!io.MouseDown[0]) {
             panel.drag.active = false;
-        } else if (const auto nextPoint = UpdateViewportGizmoDrag(
-                       panel.drag.gizmo,
-                       matrices,
-                       viewport,
-                       io.MousePos);
-                   nextPoint.has_value() &&
-                   MoveLinkedAnimationKeyPoint(
-                       runtimeState,
-                       &path,
-                       panel.drag.keyIndex,
-                       panel.drag.target,
-                       nextPoint.value())) {
-            panel.selectedKeyIndex = panel.drag.keyIndex;
-            panel.editTarget = panel.drag.target;
-            panel.dirty = true;
         } else {
-            panel.drag.active = false;
+            const auto nextPoint = UpdateViewportGizmoDrag(
+                panel.drag.gizmo,
+                matrices,
+                viewport,
+                io.MousePos);
+            bool moved = false;
+            if (nextPoint.has_value() && panel.drag.partnerPath) {
+                const auto partnerIndex = FindAnimationRegistryIndex(
+                    panel,
+                    panel.drag.partnerFilePath);
+                auto* editablePartner = partnerIndex.has_value()
+                    ? MutableRegistryAnimationPath(
+                          runtimeState,
+                          partnerIndex.value())
+                    : nullptr;
+                const auto sourcePointArray = invisible_places::camera::
+                    InvertAnimationCameraFrameTransform(
+                        panel.drag.partnerToCurrentFrame,
+                        {
+                            nextPoint->x,
+                            nextPoint->y,
+                            nextPoint->z,
+                        });
+                moved = editablePartner != nullptr &&
+                    MoveLinkedAnimationKeyPoint(
+                        runtimeState,
+                        editablePartner,
+                        panel.drag.keyIndex,
+                        panel.drag.target,
+                        {
+                            sourcePointArray[0U],
+                            sourcePointArray[1U],
+                            sourcePointArray[2U],
+                        });
+                if (moved) {
+                    MarkRegistryAnimationDirty(
+                        runtimeState,
+                        partnerIndex.value());
+                    panel.viewportPartnerSelectionActive = true;
+                    panel.viewportPartnerSelectionPath =
+                        panel.drag.partnerFilePath;
+                    panel.viewportPartnerKeyIndex = panel.drag.keyIndex;
+                    panel.viewportPartnerEditTarget = panel.drag.target;
+                    panel.loopTimeline.previewDirty = true;
+                    panel.loopTimeline.preview.reset();
+                    panel.loopSmoothingDiagnostics.reset();
+                    panel.strongAlignmentDiagnostics.reset();
+                    panel.preparedPathCache = {};
+                    panel.motionStatsCache = {};
+                    panel.perceivedFlowCache = {};
+                    runtimeState->animationPlayback.active = false;
+                    runtimeState->cameraPlayback.active = false;
+                    runtimeState->statusMessage =
+                        panel.drag.target == AnimationEditTarget::Camera
+                            ? "Moved B's camera key in A-space; matching points are refreshing."
+                            : "Moved B's focus key in A-space; matching points are refreshing.";
+                    runtimeState->errorMessage.clear();
+                }
+            } else if (nextPoint.has_value()) {
+                moved = MoveLinkedAnimationKeyPoint(
+                    runtimeState,
+                    &path,
+                    panel.drag.keyIndex,
+                    panel.drag.target,
+                    nextPoint.value());
+                if (moved) {
+                    panel.selectedKeyIndex = panel.drag.keyIndex;
+                    panel.editTarget = panel.drag.target;
+                    panel.viewportPartnerSelectionActive = false;
+                    panel.dirty = true;
+                }
+            }
+            if (!moved) {
+                panel.drag.active = false;
+            }
         }
     }
 
@@ -41475,8 +42322,13 @@ void DrawAnimationViewportOverlay(
 
     constexpr float kPickRadius = 10.0F;
     float bestDistance = kPickRadius;
-    std::optional<std::size_t> bestKeyIndex;
-    std::optional<AnimationEditTarget> bestTarget;
+    struct AnimationOverlayKeyHit {
+        bool partner = false;
+        std::size_t keyIndex = 0U;
+        AnimationEditTarget target = AnimationEditTarget::Camera;
+        glm::vec3 displayedPoint{0.0F};
+    };
+    std::optional<AnimationOverlayKeyHit> bestHit;
 
     for (std::size_t keyIndex = 0; keyIndex < path.keys.size(); ++keyIndex) {
         for (const auto target : {AnimationEditTarget::Camera, AnimationEditTarget::Focus}) {
@@ -41486,7 +42338,9 @@ void DrawAnimationViewportOverlay(
                 continue;
             }
 
-            const bool selected = panel.selectedKeyIndex.has_value() &&
+            const bool selected =
+                                  !panel.viewportPartnerSelectionActive &&
+                                  panel.selectedKeyIndex.has_value() &&
                                   panel.selectedKeyIndex.value() == keyIndex &&
                                   panel.editTarget == target;
             const bool multiLinkedCamera =
@@ -41507,26 +42361,142 @@ void DrawAnimationViewportOverlay(
                 const float distance = ScreenDistance(io.MousePos, projected->screen);
                 if (distance < bestDistance) {
                     bestDistance = distance;
-                    bestKeyIndex = keyIndex;
-                    bestTarget = target;
+                    bestHit = AnimationOverlayKeyHit{
+                        .partner = false,
+                        .keyIndex = keyIndex,
+                        .target = target,
+                        .displayedPoint = worldPoint,
+                    };
                 }
             }
         }
     }
 
-    if (!panel.selectedKeyIndex.has_value() || panel.selectedKeyIndex.value() >= path.keys.size()) {
+    if (partnerOverlay.has_value()) {
+        const auto& partnerPath = *partnerOverlay->path;
+        for (std::size_t keyIndex = 0U;
+             keyIndex < partnerPath.keys.size();
+             ++keyIndex) {
+            for (const auto target : {
+                     AnimationEditTarget::Camera,
+                     AnimationEditTarget::Focus}) {
+                const glm::vec3 sourcePoint = AnimationKeyPointWorld(
+                    partnerPath,
+                    keyIndex,
+                    target);
+                const glm::vec3 displayedPoint = applyPartnerTransform(
+                    partnerOverlay->transform,
+                    sourcePoint);
+                const auto projected = ProjectWorldPoint(
+                    matrices,
+                    viewport,
+                    displayedPoint);
+                if (!projected.has_value()) {
+                    continue;
+                }
+                const bool selected =
+                    panel.viewportPartnerSelectionActive &&
+                    PathsLexicallyEqual(
+                        panel.viewportPartnerSelectionPath,
+                        partnerOverlay->filePath) &&
+                    panel.viewportPartnerKeyIndex.has_value() &&
+                    panel.viewportPartnerKeyIndex.value() == keyIndex &&
+                    panel.viewportPartnerEditTarget == target;
+                const ImU32 color = selected
+                    ? selectedColor
+                    : target == AnimationEditTarget::Camera
+                        ? partnerCameraColor
+                        : partnerFocusColor;
+                const float radius = selected ? 7.0F : 5.5F;
+                drawList->AddQuadFilled(
+                    ImVec2{projected->screen.x, projected->screen.y - radius},
+                    ImVec2{projected->screen.x + radius, projected->screen.y},
+                    ImVec2{projected->screen.x, projected->screen.y + radius},
+                    ImVec2{projected->screen.x - radius, projected->screen.y},
+                    color);
+                drawList->AddQuad(
+                    ImVec2{projected->screen.x, projected->screen.y - radius - 2.0F},
+                    ImVec2{projected->screen.x + radius + 2.0F, projected->screen.y},
+                    ImVec2{projected->screen.x, projected->screen.y + radius + 2.0F},
+                    ImVec2{projected->screen.x - radius - 2.0F, projected->screen.y},
+                    IM_COL32(0, 0, 0, 200),
+                    2.0F);
+                if (canInteractWithRenderViewport) {
+                    const float distance = ScreenDistance(
+                        io.MousePos,
+                        projected->screen);
+                    // B diamonds win close ties with A circles while the
+                    // explicit B-control overlay is enabled.
+                    if (distance <= bestDistance) {
+                        bestDistance = distance;
+                        bestHit = AnimationOverlayKeyHit{
+                            .partner = true,
+                            .keyIndex = keyIndex,
+                            .target = target,
+                            .displayedPoint = displayedPoint,
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    const bool partnerSelectionValid =
+        panel.viewportPartnerSelectionActive &&
+        partnerOverlay.has_value() &&
+        panel.viewportPartnerKeyIndex.has_value() &&
+        panel.viewportPartnerKeyIndex.value() <
+            partnerOverlay->path->keys.size();
+    const bool currentSelectionValid =
+        !panel.viewportPartnerSelectionActive &&
+        panel.selectedKeyIndex.has_value() &&
+        panel.selectedKeyIndex.value() < path.keys.size();
+    const auto selectHit = [&](const AnimationOverlayKeyHit& hit) {
+        if (hit.partner && partnerOverlay.has_value()) {
+            panel.viewportPartnerSelectionActive = true;
+            panel.viewportPartnerSelectionPath = partnerOverlay->filePath;
+            panel.viewportPartnerKeyIndex = hit.keyIndex;
+            panel.viewportPartnerEditTarget = hit.target;
+            runtimeState->statusMessage =
+                hit.target == AnimationEditTarget::Camera
+                    ? "Selected B's transformed camera key."
+                    : "Selected B's transformed focus key.";
+            runtimeState->errorMessage.clear();
+        } else {
+            panel.viewportPartnerSelectionActive = false;
+            panel.viewportPartnerKeyIndex.reset();
+            panel.selectedKeyIndex = hit.keyIndex;
+            panel.editTarget = hit.target;
+        }
+    };
+    if (!partnerSelectionValid && !currentSelectionValid) {
         if (canInteractWithRenderViewport &&
             !panel.drag.active &&
             ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
-            bestKeyIndex.has_value() &&
-            bestTarget.has_value()) {
-            panel.selectedKeyIndex = bestKeyIndex.value();
-            panel.editTarget = bestTarget.value();
+            bestHit.has_value()) {
+            selectHit(bestHit.value());
         }
         return;
     }
 
-    const auto selectedPoint = AnimationKeyPointWorld(path, panel.selectedKeyIndex.value(), panel.editTarget);
+    const bool selectedIsPartner = partnerSelectionValid;
+    const std::size_t selectedKeyIndex = selectedIsPartner
+        ? panel.viewportPartnerKeyIndex.value()
+        : panel.selectedKeyIndex.value();
+    const AnimationEditTarget selectedTarget = selectedIsPartner
+        ? panel.viewportPartnerEditTarget
+        : panel.editTarget;
+    const glm::vec3 selectedPoint = selectedIsPartner
+        ? applyPartnerTransform(
+              partnerOverlay->transform,
+              AnimationKeyPointWorld(
+                  *partnerOverlay->path,
+                  selectedKeyIndex,
+                  selectedTarget))
+        : AnimationKeyPointWorld(
+              path,
+              selectedKeyIndex,
+              selectedTarget);
     const auto gizmoHandles = BuildAndDrawViewportGizmo(drawList, matrices, viewport, selectedPoint);
 
     if (!canInteractWithRenderViewport || panel.drag.active) {
@@ -41534,20 +42504,29 @@ void DrawAnimationViewportOverlay(
     }
 
     const auto gizmoHit = HitTestViewportGizmo(gizmoHandles, io.MousePos);
-    if (gizmoHit.has_value() || bestKeyIndex.has_value()) {
+    if (gizmoHit.has_value() || bestHit.has_value()) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
     }
     if (!ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         return;
     }
 
-    const auto beginDrag = [&](const ViewportGizmoHit& hit, const glm::vec3& point) {
+    const auto beginDrag = [&](const ViewportGizmoHit& hit,
+                               const glm::vec3& point) {
         if (auto drag = BeginViewportGizmoDrag(hit, gizmoHandles, matrices, viewport, io.MousePos, point);
             drag.has_value()) {
             panel.drag = {
                 .active = true,
-                .target = panel.editTarget,
-                .keyIndex = panel.selectedKeyIndex.value(),
+                .partnerPath = selectedIsPartner,
+                .partnerFilePath = selectedIsPartner
+                    ? partnerOverlay->filePath
+                    : std::filesystem::path{},
+                .target = selectedTarget,
+                .keyIndex = selectedKeyIndex,
+                .partnerToCurrentFrame = selectedIsPartner
+                    ? partnerOverlay->transform
+                    : invisible_places::camera::
+                          AnimationCameraFrameTransform{},
                 .gizmo = drag.value(),
             };
         }
@@ -41560,15 +42539,16 @@ void DrawAnimationViewportOverlay(
         beginDrag(gizmoHit.value(), selectedPoint);
         return;
     }
-    if (bestKeyIndex.has_value() && bestTarget.has_value()) {
-        const bool alreadySelected = panel.selectedKeyIndex.value() == bestKeyIndex.value() &&
-                                     panel.editTarget == bestTarget.value();
-        panel.selectedKeyIndex = bestKeyIndex.value();
-        panel.editTarget = bestTarget.value();
+    if (bestHit.has_value()) {
+        const auto& hit = bestHit.value();
+        const bool alreadySelected = hit.partner == selectedIsPartner &&
+            hit.keyIndex == selectedKeyIndex &&
+            hit.target == selectedTarget;
+        selectHit(hit);
         if (alreadySelected) {
             beginDrag(
                 ViewportGizmoHit{.kind = ManualFlowPathGizmoDragKind::ViewPlane},
-                AnimationKeyPointWorld(path, bestKeyIndex.value(), bestTarget.value()));
+                hit.displayedPoint);
         }
     }
 }
@@ -43274,34 +44254,43 @@ void CleanupStagedDocumentFiles(
     }
 }
 
-bool ValidateLoopSmoothingEndpointLinks(
+bool ValidateLoopSmoothingMovableLinks(
     const PreviewRuntimeState& runtimeState,
     std::size_t currentFileIndex,
     std::size_t partnerFileIndex,
+    const std::unordered_set<std::string>& currentMovableKeyIds,
+    const std::unordered_set<std::string>& partnerMovableKeyIds,
     std::string* errorMessage) {
     const std::array<std::size_t, 2> pairIndices{
         currentFileIndex,
         partnerFileIndex,
     };
     std::unordered_set<std::string> movableCameraIds;
-    for (const auto fileIndex : pairIndices) {
+    for (std::size_t pairPathIndex = 0U;
+         pairPathIndex < pairIndices.size();
+         ++pairPathIndex) {
+        const auto fileIndex = pairIndices[pairPathIndex];
         const auto* path = RegistryAnimationPath(runtimeState, fileIndex);
         if (path == nullptr || path->keys.size() < 3U) {
             if (errorMessage != nullptr) {
-                *errorMessage = "Both loop animations must be loaded and contain at least three keys.";
+                *errorMessage = "Both velocity-pair animations must be loaded and contain at least three keys.";
             }
             return false;
         }
-        for (const std::size_t keyIndex : {
-                 std::size_t{0U},
-                 path->keys.size() - 1U}) {
-            const auto& cameraId = path->keys[keyIndex].linkedCameraId;
+        const auto& movableKeyIds = pairPathIndex == 0U
+                                        ? currentMovableKeyIds
+                                        : partnerMovableKeyIds;
+        for (const auto& key : path->keys) {
+            if (!movableKeyIds.contains(key.id)) {
+                continue;
+            }
+            const auto& cameraId = key.linkedCameraId;
             if (cameraId.empty()) {
                 continue;
             }
             if (!FindCameraShotIndexById(runtimeState, cameraId).has_value()) {
                 if (errorMessage != nullptr) {
-                    *errorMessage = "Endpoint camera " + cameraId +
+                    *errorMessage = "Movable camera " + cameraId +
                                     " is no longer present in the project.";
                 }
                 return false;
@@ -43338,13 +44327,18 @@ bool ValidateLoopSmoothingEndpointLinks(
             }
             const bool pairFile =
                 fileIndex == currentFileIndex || fileIndex == partnerFileIndex;
-            const bool movableEndpoint =
-                keyIndex == 0U || keyIndex + 1U == path->keys.size();
-            if (!pairFile || !movableEndpoint) {
+            const auto& allowedKeyIds =
+                fileIndex == currentFileIndex
+                    ? currentMovableKeyIds
+                    : partnerMovableKeyIds;
+            const bool movableKey =
+                pairFile && allowedKeyIds.contains(path->keys[keyIndex].id);
+            if (!movableKey) {
                 if (errorMessage != nullptr) {
                     *errorMessage =
-                        "Endpoint camera " + cameraId +
-                        " is also linked to a fixed key or another animation. Untangle that camera before smoothing.";
+                        "Movable camera " + cameraId +
+                        " is also linked to a locked key or another animation. "
+                        "Enable every linked use in this pair, or untangle that camera before velocity alignment.";
                 }
                 return false;
             }
@@ -43353,7 +44347,7 @@ bool ValidateLoopSmoothingEndpointLinks(
     return true;
 }
 
-void ApplyLoopEndpointsToCameraShots(
+void ApplyLoopMovableKeysToCameraShots(
     const AnimationPath& first,
     const AnimationPath& second,
     std::vector<CameraShot>* cameraShots) {
@@ -43361,18 +44355,23 @@ void ApplyLoopEndpointsToCameraShots(
         return;
     }
     for (const auto* path : {&first, &second}) {
-        for (const auto* key : {&path->keys.front(), &path->keys.back()}) {
-            if (key->linkedCameraId.empty()) {
+        std::unordered_set<std::string> adjustedKeyIds;
+        for (const auto& correction : path->localizedKeyCorrections) {
+            adjustedKeyIds.insert(correction.keyId);
+        }
+        for (const auto& key : path->keys) {
+            if (!adjustedKeyIds.contains(key.id) ||
+                key.linkedCameraId.empty()) {
                 continue;
             }
             const auto shotIt = std::find_if(
                 cameraShots->begin(),
                 cameraShots->end(),
                 [&](const CameraShot& shot) {
-                    return shot.id == key->linkedCameraId;
+                    return shot.id == key.linkedCameraId;
                 });
             if (shotIt != cameraShots->end()) {
-                CopyAnimationKeyToCameraShot(*key, &*shotIt);
+                CopyAnimationKeyToCameraShot(key, &*shotIt);
             }
         }
     }
@@ -43409,6 +44408,25 @@ LoopMetricsFromSmoothingAttempt(
     metrics.maxFocusMove = result.maxFocusMove;
     metrics.maxCameraCapUsage = result.maxCameraCapUsage;
     metrics.maxFocusCapUsage = result.maxFocusCapUsage;
+    if (currentIsCanonicalFirst) {
+        metrics.keyMovements = result.keyMovements;
+        metrics.screenDisplacementSamples =
+            result.screenDisplacementSamples;
+        metrics.maxScreenDisplacement = result.maxScreenDisplacement;
+    } else {
+        metrics.keyMovements = {
+            result.keyMovements[1U],
+            result.keyMovements[0U],
+        };
+        metrics.screenDisplacementSamples = {
+            result.screenDisplacementSamples[1U],
+            result.screenDisplacementSamples[0U],
+        };
+        metrics.maxScreenDisplacement = {
+            result.maxScreenDisplacement[1U],
+            result.maxScreenDisplacement[0U],
+        };
+    }
     metrics.errorMessage = result.errorMessage;
     return metrics;
 }
@@ -43436,7 +44454,8 @@ void StoreInvalidAnimationLoopDiagnostics(
 
 bool RefreshAnimationLoopDiagnostics(
     PreviewRuntimeState* runtimeState,
-    std::size_t partnerFileIndex) {
+    std::size_t partnerFileIndex,
+    const invisible_places::camera::AnimationLoopSmoothingOptions& options = {}) {
     if (runtimeState == nullptr) {
         return false;
     }
@@ -43462,7 +44481,8 @@ bool RefreshAnimationLoopDiagnostics(
 
     auto metrics = invisible_places::camera::MeasureAnimationLoopTransitions(
         *current,
-        *partner);
+        *partner,
+        options);
     AnimationLoopDiagnostics diagnostics{
         .firstFilePath = panel.availableFiles[currentFileIndex.value()],
         .secondFilePath = panel.availableFiles[partnerFileIndex],
@@ -43475,10 +44495,10 @@ bool RefreshAnimationLoopDiagnostics(
     };
     if (diagnostics.status == AnimationLoopDiagnosticsStatus::Applied) {
         diagnostics.message =
-            "Validated against the original endpoints preserved with the smoothing.";
+            "Validated against the preserved pre-alignment selected-key poses.";
     } else if (diagnostics.status == AnimationLoopDiagnosticsStatus::Baseline) {
         diagnostics.message =
-            "Current unsmoothed baseline; apply smoothing to create a before/after comparison.";
+            "Current unaligned baseline; apply velocity alignment to create a before/after comparison.";
     } else {
         diagnostics.message = diagnostics.metrics.errorMessage;
     }
@@ -43486,10 +44506,294 @@ bool RefreshAnimationLoopDiagnostics(
     return panel.loopSmoothingDiagnostics->metrics.valid;
 }
 
+std::unordered_set<std::string> LoopMovableKeyIdsFromMetadata(
+    const invisible_places::camera::AnimationVelocityBlendLinkMetadata&
+        link) {
+    return {
+        link.movableKeyIds.begin(),
+        link.movableKeyIds.end(),
+    };
+}
+
+std::vector<std::string> SortedLoopMovableKeyIds(
+    const std::unordered_set<std::string>& keyIds) {
+    std::vector<std::string> sorted(keyIds.begin(), keyIds.end());
+    std::sort(sorted.begin(), sorted.end());
+    return sorted;
+}
+
+invisible_places::camera::AnimationLoopSmoothingOptions
+CanonicalLoopSmoothingOptions(
+    const AnimationPanelState& panel,
+    std::size_t currentFileIndex,
+    std::size_t partnerFileIndex,
+    invisible_places::camera::AnimationLoopSmoothingOptions options,
+    std::string pairId,
+    bool* currentIsCanonicalFirst) {
+    const bool currentFirst =
+        NormalizePathKey(panel.availableFiles[currentFileIndex]) <
+        NormalizePathKey(panel.availableFiles[partnerFileIndex]);
+    if (currentIsCanonicalFirst != nullptr) {
+        *currentIsCanonicalFirst = currentFirst;
+    }
+    options.pairId = std::move(pairId);
+    options.firstFileName =
+        panel.availableFiles[currentFileIndex].filename().string();
+    options.secondFileName =
+        panel.availableFiles[partnerFileIndex].filename().string();
+    if (!currentFirst) {
+        std::swap(options.firstFileName, options.secondFileName);
+        std::swap(
+            options.firstMovableKeyIds,
+            options.secondMovableKeyIds);
+        std::swap(
+            options.firstStartOverlapSeconds,
+            options.secondStartOverlapSeconds);
+        std::swap(
+            options.firstEndOverlapSeconds,
+            options.secondEndOverlapSeconds);
+    }
+    return options;
+}
+
+std::vector<AnimationVelocityDraftKeyDelta> BuildVelocityDraftKeyDeltas(
+    const AnimationPath& before,
+    const AnimationPath& after) {
+    std::vector<AnimationVelocityDraftKeyDelta> deltas;
+    for (const auto& afterKey : after.keys) {
+        const auto beforeKey = std::find_if(
+            before.keys.begin(),
+            before.keys.end(),
+            [&](const auto& key) { return key.id == afterKey.id; });
+        if (beforeKey == before.keys.end()) {
+            continue;
+        }
+        AnimationVelocityDraftKeyDelta delta{
+            .keyId = afterKey.id,
+            .cameraDelta = {
+                afterKey.cameraPosition[0U] - beforeKey->cameraPosition[0U],
+                afterKey.cameraPosition[1U] - beforeKey->cameraPosition[1U],
+                afterKey.cameraPosition[2U] - beforeKey->cameraPosition[2U],
+            },
+            .focusDelta = {
+                afterKey.focusPoint[0U] - beforeKey->focusPoint[0U],
+                afterKey.focusPoint[1U] - beforeKey->focusPoint[1U],
+                afterKey.focusPoint[2U] - beforeKey->focusPoint[2U],
+            },
+            .addedLocalizedCorrection =
+                std::none_of(
+                    before.localizedKeyCorrections.begin(),
+                    before.localizedKeyCorrections.end(),
+                    [&](const auto& correction) {
+                        return correction.keyId == afterKey.id;
+                    }) &&
+                std::any_of(
+                    after.localizedKeyCorrections.begin(),
+                    after.localizedKeyCorrections.end(),
+                    [&](const auto& correction) {
+                        return correction.keyId == afterKey.id;
+                    }),
+        };
+        const float cameraLength = std::hypot(
+            delta.cameraDelta[0U],
+            std::hypot(delta.cameraDelta[1U], delta.cameraDelta[2U]));
+        const float focusLength = std::hypot(
+            delta.focusDelta[0U],
+            std::hypot(delta.focusDelta[1U], delta.focusDelta[2U]));
+        if (cameraLength > 1.0e-8F || focusLength > 1.0e-8F ||
+            delta.addedLocalizedCorrection) {
+            deltas.push_back(std::move(delta));
+        }
+    }
+    return deltas;
+}
+
+bool RemoveAnimationAlignmentDraftDeltas(
+    PreviewRuntimeState* runtimeState,
+    bool removeVelocity,
+    bool removeStrong,
+    bool reportStatus) {
+    if (runtimeState == nullptr ||
+        !runtimeState->animationPanel.velocityAlignmentDraft.has_value() ||
+        (!removeVelocity && !removeStrong)) {
+        return false;
+    }
+    SyncCurrentAnimationToRegistry(runtimeState);
+    auto& panel = runtimeState->animationPanel;
+    auto draft = panel.velocityAlignmentDraft.value();
+    const std::array<std::filesystem::path, 2> paths{
+        draft.firstFilePath,
+        draft.secondFilePath,
+    };
+    std::array<std::size_t, 2> indices{};
+    std::array<AnimationPath, 2> restored{};
+    for (std::size_t member = 0U; member < 2U; ++member) {
+        const auto registryIndex = FindAnimationRegistryIndex(
+            panel,
+            paths[member]);
+        if (!registryIndex.has_value()) {
+            runtimeState->errorMessage =
+                "An alignment-draft animation is no longer registered.";
+            return false;
+        }
+        indices[member] = registryIndex.value();
+        const auto* current = RegistryAnimationPath(
+            *runtimeState,
+            indices[member]);
+        if (current == nullptr) {
+            runtimeState->errorMessage =
+                "An alignment-draft animation is no longer loaded.";
+            return false;
+        }
+        restored[member] = *current;
+        std::vector<std::string> correctionCandidates;
+        const auto subtract = [&](const auto& deltas) {
+            for (const auto& delta : deltas) {
+                const auto keyIt = std::find_if(
+                    restored[member].keys.begin(),
+                    restored[member].keys.end(),
+                    [&](const auto& key) {
+                        return key.id == delta.keyId;
+                    });
+                if (keyIt == restored[member].keys.end()) {
+                    runtimeState->errorMessage =
+                        "An alignment-draft key was deleted or renamed. "
+                        "Restore that key before unapplying the draft.";
+                    return false;
+                }
+                for (std::size_t component = 0U;
+                     component < 3U;
+                     ++component) {
+                    keyIt->cameraPosition[component] -=
+                        delta.cameraDelta[component];
+                    keyIt->focusPoint[component] -=
+                        delta.focusDelta[component];
+                }
+                if (delta.addedLocalizedCorrection) {
+                    correctionCandidates.push_back(delta.keyId);
+                }
+            }
+            return true;
+        };
+        if (removeVelocity && !subtract(draft.keyDeltas[member])) {
+            return false;
+        }
+        if (removeStrong && !subtract(draft.strongKeyDeltas[member])) {
+            return false;
+        }
+        const auto remainingTouchesKey = [&](std::string_view keyId) {
+            const auto contains = [&](const auto& deltas) {
+                return std::any_of(
+                    deltas.begin(),
+                    deltas.end(),
+                    [&](const auto& delta) {
+                        return delta.keyId == keyId;
+                    });
+            };
+            return (!removeVelocity && contains(draft.keyDeltas[member])) ||
+                   (!removeStrong &&
+                    contains(draft.strongKeyDeltas[member]));
+        };
+        for (const auto& keyId : correctionCandidates) {
+            if (remainingTouchesKey(keyId)) {
+                continue;
+            }
+            const auto keyIt = std::find_if(
+                restored[member].keys.begin(),
+                restored[member].keys.end(),
+                [&](const auto& key) { return key.id == keyId; });
+            const auto correctionIt = std::find_if(
+                restored[member].localizedKeyCorrections.begin(),
+                restored[member].localizedKeyCorrections.end(),
+                [&](const auto& correction) {
+                    return correction.keyId == keyId;
+                });
+            if (keyIt == restored[member].keys.end() ||
+                correctionIt ==
+                    restored[member].localizedKeyCorrections.end()) {
+                continue;
+            }
+            const auto difference = [](const auto& left, const auto& right) {
+                return std::hypot(
+                    left[0U] - right[0U],
+                    std::hypot(
+                        left[1U] - right[1U],
+                        left[2U] - right[2U]));
+            };
+            // A manual edit made after alignment remains visible after the
+            // exact draft delta is subtracted. Keep its localized spline
+            // base instead of silently broadening that edit.
+            if (difference(
+                    keyIt->cameraPosition,
+                    correctionIt->splineCameraPosition) <= 1.0e-6F &&
+                difference(
+                    keyIt->focusPoint,
+                    correctionIt->splineFocusPoint) <= 1.0e-6F) {
+                restored[member].localizedKeyCorrections.erase(
+                    correctionIt);
+            }
+        }
+    }
+
+    if (removeVelocity) {
+        draft.keyDeltas = {};
+    }
+    if (removeStrong) {
+        draft.strongKeyDeltas = {};
+    }
+    const auto hasAnyDeltas = [](const auto& memberDeltas) {
+        return std::any_of(
+            memberDeltas.begin(),
+            memberDeltas.end(),
+            [](const auto& deltas) { return !deltas.empty(); });
+    };
+    for (std::size_t member = 0U; member < 2U; ++member) {
+        panel.availableFileEditedPaths[indices[member]] = restored[member];
+        panel.availableFileDirtyFlags[indices[member]] = true;
+        panel.availableFileLoopEditPairIds[indices[member]] = draft.pairId;
+    }
+    panel.velocityAlignmentDraft =
+        hasAnyDeltas(draft.keyDeltas) ||
+                hasAnyDeltas(draft.strongKeyDeltas)
+            ? std::optional<AnimationVelocityAlignmentDraft>{
+                  std::move(draft)}
+            : std::nullopt;
+    const auto activeIndex = panel.currentFilePath.empty()
+                                 ? std::nullopt
+                                 : FindAnimationRegistryIndex(
+                                       panel,
+                                       std::filesystem::path{
+                                           panel.currentFilePath});
+    if (activeIndex.has_value()) {
+        for (std::size_t member = 0U; member < 2U; ++member) {
+            if (activeIndex.value() == indices[member]) {
+                panel.currentPath = restored[member];
+                panel.currentPathUsesEdited = true;
+                panel.selectedFileUsesEdited = true;
+                panel.dirty = true;
+                break;
+            }
+        }
+    }
+    panel.preparedPathCache = {};
+    panel.motionStatsCache = {};
+    panel.perceivedFlowCache = {};
+    panel.loopTimeline.previewDirty = true;
+    panel.loopSmoothingDiagnostics.reset();
+    runtimeState->animationPlayback.active = false;
+    ApplyAnimationScrub(runtimeState);
+    if (reportStatus) {
+        runtimeState->statusMessage =
+            "Removed the unconfirmed alignment deltas. Manual edits and confirmed corrections were retained.";
+        runtimeState->errorMessage.clear();
+    }
+    return true;
+}
+
 bool ApplyAnimationLoopSmoothing(
     PreviewRuntimeState* runtimeState,
     std::size_t partnerFileIndex,
-    float maxEndMoveFraction) {
+    invisible_places::camera::AnimationLoopSmoothingOptions options) {
     if (runtimeState == nullptr ||
         runtimeState->activeRenderSetupOverride.has_value()) {
         return false;
@@ -43497,7 +44801,8 @@ bool ApplyAnimationLoopSmoothing(
     SyncCurrentAnimationToRegistry(runtimeState);
     auto& panel = runtimeState->animationPanel;
     if (panel.currentFilePath.empty() || !panel.currentPath.has_value()) {
-        runtimeState->errorMessage = "Save the current animation before smoothing its loop.";
+        runtimeState->errorMessage =
+            "Save the current animation before creating a velocity blend.";
         return false;
     }
     const auto currentFileIndex = FindAnimationRegistryIndex(
@@ -43506,14 +44811,64 @@ bool ApplyAnimationLoopSmoothing(
     if (!currentFileIndex.has_value() ||
         partnerFileIndex >= panel.availableFiles.size() ||
         partnerFileIndex == currentFileIndex.value()) {
-        runtimeState->errorMessage = "Choose another registered animation for the loop.";
+        runtimeState->errorMessage =
+            "Choose another registered animation for the velocity blend.";
         return false;
     }
+    std::optional<AnimationPanelState> panelBeforeDraftReplacement;
+    const auto rollbackDraftReplacement = [&]() {
+        if (!panelBeforeDraftReplacement.has_value()) {
+            return;
+        }
+        const auto errorMessage = runtimeState->errorMessage;
+        const auto statusMessage = runtimeState->statusMessage;
+        panel = std::move(panelBeforeDraftReplacement.value());
+        ApplyAnimationScrub(runtimeState);
+        runtimeState->errorMessage = errorMessage;
+        runtimeState->statusMessage = statusMessage;
+    };
+    if (panel.velocityAlignmentDraft.has_value()) {
+        panelBeforeDraftReplacement = panel;
+        const auto& draft = panel.velocityAlignmentDraft.value();
+        const auto matchesDraftMember = [&](const auto& path) {
+            return PathsLexicallyEqual(path, draft.firstFilePath) ||
+                   PathsLexicallyEqual(path, draft.secondFilePath);
+        };
+        const bool sameDraftPair =
+            matchesDraftMember(
+                panel.availableFiles[currentFileIndex.value()]) &&
+            matchesDraftMember(panel.availableFiles[partnerFileIndex]);
+        const bool removed = sameDraftPair
+            ? RemoveAnimationAlignmentDraftDeltas(
+                  runtimeState,
+                  true,
+                  false,
+                  false)
+            : UnapplyAnimationVelocityDraft(
+                  runtimeState,
+                  partnerFileIndex);
+        if (!removed) {
+            rollbackDraftReplacement();
+            return false;
+        }
+    }
+    SyncCurrentAnimationToRegistry(runtimeState);
+    const auto requestedOptions = options;
+    const std::unordered_set<std::string> currentMovableKeyIds{
+        options.firstMovableKeyIds.begin(),
+        options.firstMovableKeyIds.end(),
+    };
+    const std::unordered_set<std::string> partnerMovableKeyIds{
+        options.secondMovableKeyIds.begin(),
+        options.secondMovableKeyIds.end(),
+    };
     std::string validationError;
-    if (!ValidateLoopSmoothingEndpointLinks(
+    if (!ValidateLoopSmoothingMovableLinks(
             *runtimeState,
             currentFileIndex.value(),
             partnerFileIndex,
+            currentMovableKeyIds,
+            partnerMovableKeyIds,
             &validationError)) {
         StoreInvalidAnimationLoopDiagnostics(
             &panel,
@@ -43522,18 +44877,20 @@ bool ApplyAnimationLoopSmoothing(
             validationError);
         runtimeState->errorMessage = std::move(validationError);
         runtimeState->statusMessage.clear();
+        rollbackDraftReplacement();
         return false;
     }
     const auto* partner = RegistryAnimationPath(*runtimeState, partnerFileIndex);
     if (partner == nullptr) {
         const std::string message =
-            "The selected loop animation is not loaded.";
+            "The selected velocity-blend animation is not loaded.";
         StoreInvalidAnimationLoopDiagnostics(
             &panel,
             currentFileIndex.value(),
             partnerFileIndex,
             message);
         runtimeState->errorMessage = message;
+        rollbackDraftReplacement();
         return false;
     }
     const auto* current = RegistryAnimationPath(
@@ -43541,42 +44898,52 @@ bool ApplyAnimationLoopSmoothing(
         currentFileIndex.value());
     if (current == nullptr) {
         const std::string message =
-            "The current loop animation is not loaded.";
+            "The current velocity-blend animation is not loaded.";
         StoreInvalidAnimationLoopDiagnostics(
             &panel,
             currentFileIndex.value(),
             partnerFileIndex,
             message);
         runtimeState->errorMessage = message;
+        rollbackDraftReplacement();
         return false;
     }
-    auto candidateCurrent = *current;
-    auto candidatePartner = *partner;
-    const auto pairId =
-        "loop_" + std::to_string(
-                      std::chrono::steady_clock::now().time_since_epoch().count());
+    const auto beforeCurrent = *current;
+    const auto beforePartner = *partner;
+    auto candidateCurrent = beforeCurrent;
+    auto candidatePartner = beforePartner;
+    const bool alreadyPaired =
+        current->velocityBlendLink.has_value() &&
+        partner->velocityBlendLink.has_value() &&
+        current->velocityBlendLink->pairId ==
+            partner->velocityBlendLink->pairId;
+    const auto pairId = alreadyPaired
+                            ? current->velocityBlendLink->pairId
+                            : "velocity_" + std::to_string(
+                                  std::chrono::steady_clock::now()
+                                      .time_since_epoch()
+                                      .count());
     // A two-animation closed loop has no semantic "first" member. Use one
     // stable file ordering so activating A or B produces the same optimizer
     // inputs and sequence metadata.
-    const bool currentIsCanonicalFirst =
-        NormalizePathKey(panel.availableFiles[currentFileIndex.value()]) <
-        NormalizePathKey(panel.availableFiles[partnerFileIndex]);
+    bool currentIsCanonicalFirst = true;
+    options = CanonicalLoopSmoothingOptions(
+        panel,
+        currentFileIndex.value(),
+        partnerFileIndex,
+        std::move(options),
+        pairId,
+        &currentIsCanonicalFirst);
     const auto smoothingResult =
         currentIsCanonicalFirst
             ? invisible_places::camera::SmoothAnimationLoopTransitions(
                   &candidateCurrent,
                   &candidatePartner,
-                  {.maxEndMoveFraction = maxEndMoveFraction,
-                   .pairId = pairId,
-                   .firstFileName = panel.availableFiles[currentFileIndex.value()].filename().string(),
-                   .secondFileName = panel.availableFiles[partnerFileIndex].filename().string()})
+                  options)
             : invisible_places::camera::SmoothAnimationLoopTransitions(
                   &candidatePartner,
                   &candidateCurrent,
-                  {.maxEndMoveFraction = maxEndMoveFraction,
-                   .pairId = pairId,
-                   .firstFileName = panel.availableFiles[partnerFileIndex].filename().string(),
-                   .secondFileName = panel.availableFiles[currentFileIndex.value()].filename().string()});
+                  options);
     panel.loopSmoothingDiagnostics = AnimationLoopDiagnostics{
         .firstFilePath = panel.availableFiles[currentFileIndex.value()],
         .secondFilePath = panel.availableFiles[partnerFileIndex],
@@ -43592,17 +44959,135 @@ bool ApplyAnimationLoopSmoothing(
     };
     if (!smoothingResult.succeeded || !smoothingResult.changed) {
         runtimeState->errorMessage = smoothingResult.errorMessage.empty()
-                                         ? "The endpoints are already optimal within the selected movement limit."
+                                         ? "The enabled keys are already optimal within the selected movement limit."
                                          : smoothingResult.errorMessage;
         runtimeState->statusMessage.clear();
+        rollbackDraftReplacement();
         return false;
     }
+
+    const auto makeLink = [&](const AnimationPath& previous,
+                              std::string partnerFileName,
+                              float startOverlapSeconds,
+                              float endOverlapSeconds,
+                              const std::vector<std::string>& movableKeyIds) {
+        invisible_places::camera::AnimationVelocityBlendLinkMetadata link{
+            .pairId = pairId,
+            .partnerFileName = std::move(partnerFileName),
+            .maxEndMoveFraction = requestedOptions.maxEndMoveFraction,
+            .strongAlignMaxMoveFraction = 0.50F,
+            .startOverlapSeconds = startOverlapSeconds,
+            .endOverlapSeconds = endOverlapSeconds,
+            .horizontalBlend = requestedOptions.horizontalBlend,
+            .panRight = requestedOptions.panRight,
+            .movableKeyIds = movableKeyIds,
+        };
+        if (alreadyPaired && previous.velocityBlendLink.has_value()) {
+            link.strongAlignMaxMoveFraction =
+                previous.velocityBlendLink->strongAlignMaxMoveFraction;
+        }
+        return link;
+    };
+    candidateCurrent.velocityBlendLink = makeLink(
+        beforeCurrent,
+        panel.availableFiles[partnerFileIndex].filename().string(),
+        requestedOptions.firstStartOverlapSeconds,
+        requestedOptions.firstEndOverlapSeconds,
+        requestedOptions.firstMovableKeyIds);
+    candidatePartner.velocityBlendLink = makeLink(
+        beforePartner,
+        panel.availableFiles[currentFileIndex.value()].filename().string(),
+        requestedOptions.secondStartOverlapSeconds,
+        requestedOptions.secondEndOverlapSeconds,
+        requestedOptions.secondMovableKeyIds);
+
+    std::unordered_set<std::string> replacedPairIds;
+    std::unordered_set<std::string> replacedDependencyIds;
+    for (const auto fileIndex : {
+             currentFileIndex.value(),
+             partnerFileIndex}) {
+        const auto& dependencyId =
+            panel.availableFileLoopEditPairIds[fileIndex];
+        if (!dependencyId.empty() && dependencyId != pairId) {
+            replacedDependencyIds.insert(dependencyId);
+        }
+    }
+    for (const auto* previous : {&beforeCurrent, &beforePartner}) {
+        if (previous->velocityBlendLink.has_value() &&
+            previous->velocityBlendLink->pairId != pairId) {
+            replacedPairIds.insert(previous->velocityBlendLink->pairId);
+        }
+    }
+    std::unordered_set<std::size_t> dependencyIndices{
+        currentFileIndex.value(),
+        partnerFileIndex,
+    };
+    for (std::size_t fileIndex = 0U;
+         fileIndex < panel.availableFiles.size();
+         ++fileIndex) {
+        if (fileIndex == currentFileIndex.value() ||
+            fileIndex == partnerFileIndex) {
+            continue;
+        }
+        if (replacedDependencyIds.contains(
+                panel.availableFileLoopEditPairIds[fileIndex])) {
+            dependencyIndices.insert(fileIndex);
+        }
+        const auto* registered = RegistryAnimationPath(*runtimeState, fileIndex);
+        if (registered == nullptr ||
+            !registered->velocityBlendLink.has_value() ||
+            !replacedPairIds.contains(
+                registered->velocityBlendLink->pairId)) {
+            continue;
+        }
+        auto unlinked = *registered;
+        unlinked.velocityBlendLink.reset();
+        panel.availableFileEditedPaths[fileIndex] = std::move(unlinked);
+        panel.availableFileDirtyFlags[fileIndex] = true;
+        dependencyIndices.insert(fileIndex);
+    }
+    std::array<std::vector<AnimationVelocityDraftKeyDelta>, 2>
+        retainedStrongDeltas;
+    if (panel.velocityAlignmentDraft.has_value()) {
+        const auto& previousDraft = panel.velocityAlignmentDraft.value();
+        const std::array<std::filesystem::path, 2> requestedPaths{
+            panel.availableFiles[currentFileIndex.value()],
+            panel.availableFiles[partnerFileIndex],
+        };
+        for (std::size_t requestedMember = 0U;
+             requestedMember < 2U;
+             ++requestedMember) {
+            if (PathsLexicallyEqual(
+                    requestedPaths[requestedMember],
+                    previousDraft.firstFilePath)) {
+                retainedStrongDeltas[requestedMember] =
+                    previousDraft.strongKeyDeltas[0U];
+            } else if (PathsLexicallyEqual(
+                           requestedPaths[requestedMember],
+                           previousDraft.secondFilePath)) {
+                retainedStrongDeltas[requestedMember] =
+                    previousDraft.strongKeyDeltas[1U];
+            }
+        }
+    }
+    panel.velocityAlignmentDraft = AnimationVelocityAlignmentDraft{
+        .firstFilePath = panel.availableFiles[currentFileIndex.value()],
+        .secondFilePath = panel.availableFiles[partnerFileIndex],
+        .pairId = pairId,
+        .keyDeltas = {
+            BuildVelocityDraftKeyDeltas(beforeCurrent, candidateCurrent),
+            BuildVelocityDraftKeyDeltas(beforePartner, candidatePartner),
+        },
+        .strongKeyDeltas = std::move(retainedStrongDeltas),
+    };
     panel.availableFileEditedPaths[currentFileIndex.value()] =
         candidateCurrent;
     panel.availableFileEditedPaths[partnerFileIndex] =
         candidatePartner;
-    panel.availableFileLoopEditPairIds[currentFileIndex.value()] = pairId;
-    panel.availableFileLoopEditPairIds[partnerFileIndex] = pairId;
+    for (const auto fileIndex : dependencyIndices) {
+        panel.availableFileLoopEditPairIds[fileIndex] = pairId;
+    }
+    panel.projectVelocityLinksDirty = true;
     panel.availableFileDirtyFlags[currentFileIndex.value()] = true;
     panel.availableFileDirtyFlags[partnerFileIndex] = true;
     panel.currentPath = std::move(candidateCurrent);
@@ -43621,7 +45106,13 @@ bool ApplyAnimationLoopSmoothing(
                                         (1.0F - smoothingResult.afterMismatch /
                                                     smoothingResult.beforeMismatch);
     runtimeState->statusMessage =
-        "Created _Edited versions with both loop transitions smoothed (" +
+        "Created linked _Edited versions with both seam velocities aligned for " +
+        std::string{options.horizontalBlend
+                        ? (options.panRight
+                               ? "the rightward horizontal wipe"
+                               : "the leftward horizontal wipe")
+                        : "the full frame"} +
+        " (" +
         std::to_string(static_cast<int>(std::lround(improvement))) +
         "% lower screen-flow mismatch; max camera move " +
         std::to_string(smoothingResult.maxCameraMove) +
@@ -43631,83 +45122,2643 @@ bool ApplyAnimationLoopSmoothing(
     return true;
 }
 
-bool UnapplyAnimationLoopSmoothing(
+bool UnapplyAnimationVelocityDraft(
     PreviewRuntimeState* runtimeState,
-    std::size_t partnerFileIndex) {
+    std::size_t /*partnerFileIndex*/) {
     if (runtimeState == nullptr ||
         runtimeState->activeRenderSetupOverride.has_value()) {
         return false;
     }
-    SyncCurrentAnimationToRegistry(runtimeState);
+    if (!runtimeState->animationPanel.velocityAlignmentDraft.has_value()) {
+        runtimeState->errorMessage =
+            "There is no unconfirmed alignment to unapply.";
+        return false;
+    }
+    return RemoveAnimationAlignmentDraftDeltas(
+        runtimeState,
+        true,
+        true,
+        true);
+}
+
+bool UnlinkAnimationVelocityPair(
+    PreviewRuntimeState* runtimeState,
+    std::size_t firstIndex,
+    std::size_t secondIndex) {
+    if (runtimeState == nullptr || firstIndex == secondIndex) {
+        return false;
+    }
     auto& panel = runtimeState->animationPanel;
-    const auto currentFileIndex = FindAnimationRegistryIndex(
+    if (panel.velocityAlignmentDraft.has_value() &&
+        !UnapplyAnimationVelocityDraft(runtimeState, secondIndex)) {
+        return false;
+    }
+    const auto* first = RegistryAnimationPath(*runtimeState, firstIndex);
+    const auto* second = RegistryAnimationPath(*runtimeState, secondIndex);
+    if (first == nullptr || second == nullptr ||
+        !first->velocityBlendLink.has_value() ||
+        !second->velocityBlendLink.has_value() ||
+        first->velocityBlendLink->pairId !=
+            second->velocityBlendLink->pairId) {
+        runtimeState->errorMessage =
+            "The selected animations are not the same velocity pair.";
+        return false;
+    }
+    const auto pairId = first->velocityBlendLink->pairId;
+    std::array<AnimationPath, 2> unlinked{*first, *second};
+    unlinked[0U].velocityBlendLink.reset();
+    unlinked[1U].velocityBlendLink.reset();
+    const std::array<std::size_t, 2> indices{firstIndex, secondIndex};
+    for (std::size_t pairIndex = 0U; pairIndex < indices.size(); ++pairIndex) {
+        panel.availableFileEditedPaths[indices[pairIndex]] =
+            unlinked[pairIndex];
+        panel.availableFileDirtyFlags[indices[pairIndex]] = true;
+        panel.availableFileLoopEditPairIds[indices[pairIndex]] = pairId;
+    }
+    panel.projectVelocityLinksDirty = true;
+    const auto activeIndex = panel.currentFilePath.empty()
+                                 ? std::nullopt
+                                 : FindAnimationRegistryIndex(
+                                       panel,
+                                       std::filesystem::path{
+                                           panel.currentFilePath});
+    if (activeIndex.has_value()) {
+        for (std::size_t pairIndex = 0U;
+             pairIndex < indices.size();
+             ++pairIndex) {
+            if (activeIndex.value() == indices[pairIndex]) {
+                panel.currentPath = unlinked[pairIndex];
+                panel.currentPathUsesEdited = true;
+                panel.selectedFileUsesEdited = true;
+                panel.dirty = true;
+                break;
+            }
+        }
+    }
+    panel.loopTimeline = {};
+    panel.loopSmoothingDiagnostics.reset();
+    panel.preparedPathCache = {};
+    panel.motionStatsCache = {};
+    panel.perceivedFlowCache = {};
+    ApplyAnimationScrub(runtimeState);
+    runtimeState->statusMessage =
+        "Unlinked the velocity pair. Confirmed camera corrections were kept.";
+    runtimeState->errorMessage.clear();
+    return true;
+}
+
+bool ApplyPendingAnimationVelocityLinkSettings(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+    auto& panel = runtimeState->animationPanel;
+    if (!panel.pendingVelocityLinkSettingsUpdate.has_value()) {
+        return true;
+    }
+    const auto update =
+        panel.pendingVelocityLinkSettingsUpdate.value();
+    panel.pendingVelocityLinkSettingsUpdate.reset();
+
+    std::array<std::size_t, 2> indices{};
+    std::array<AnimationPath, 2> edited{};
+    bool invalidatedLowerFrameAlignment = false;
+    for (std::size_t member = 0U; member < 2U; ++member) {
+        const auto registryIndex = FindAnimationRegistryIndex(
+            panel,
+            update.filePaths[member]);
+        if (!registryIndex.has_value()) {
+            runtimeState->errorMessage =
+                "A velocity-pair member is no longer registered.";
+            return false;
+        }
+        indices[member] = registryIndex.value();
+        const auto* path = RegistryAnimationPath(
+            *runtimeState,
+            indices[member]);
+        if (path == nullptr || !path->velocityBlendLink.has_value() ||
+            path->velocityBlendLink->pairId != update.pairId) {
+            runtimeState->errorMessage =
+                "The velocity-pair settings were not changed because the link changed.";
+            return false;
+        }
+        edited[member] = *path;
+    }
+
+    for (std::size_t member = 0U; member < 2U; ++member) {
+        auto& link = edited[member].velocityBlendLink.value();
+        const bool invalidatesLowerFrameAlignment =
+            link.startOverlapSeconds != update.startOverlapSeconds[member] ||
+            link.endOverlapSeconds != update.endOverlapSeconds[member] ||
+            link.strongAlignMaxMoveFraction !=
+                update.strongAlignMaxMoveFraction ||
+            link.horizontalBlend != update.horizontalBlend ||
+            link.panRight != update.panRight;
+        link.partnerFileName =
+            update.filePaths[1U - member].filename().string();
+        link.startOverlapSeconds = update.startOverlapSeconds[member];
+        link.endOverlapSeconds = update.endOverlapSeconds[member];
+        link.maxEndMoveFraction = update.maxEndMoveFraction;
+        link.strongAlignMaxMoveFraction =
+            update.strongAlignMaxMoveFraction;
+        link.horizontalBlend = update.horizontalBlend;
+        link.panRight = update.panRight;
+        link.movableKeyIds = update.movableKeyIds[member];
+        invalidatedLowerFrameAlignment |= invalidatesLowerFrameAlignment;
+        panel.availableFileEditedPaths[indices[member]] = edited[member];
+        panel.availableFileDirtyFlags[indices[member]] = true;
+        panel.availableFileLoopEditPairIds[indices[member]] = update.pairId;
+    }
+    if (invalidatedLowerFrameAlignment &&
+        runtimeState->animationStrongAlignmentJob.worker.joinable()) {
+        runtimeState->animationStrongAlignmentJob.worker.request_stop();
+    }
+    panel.projectVelocityLinksDirty = true;
+
+    const auto activeIndex = panel.currentFilePath.empty()
+                                 ? std::nullopt
+                                 : FindAnimationRegistryIndex(
+                                       panel,
+                                       std::filesystem::path{
+                                           panel.currentFilePath});
+    if (activeIndex.has_value()) {
+        for (std::size_t member = 0U; member < 2U; ++member) {
+            if (activeIndex.value() == indices[member]) {
+                panel.currentPath = edited[member];
+                panel.currentPathUsesEdited = true;
+                panel.selectedFileUsesEdited = true;
+                panel.dirty = true;
+                break;
+            }
+        }
+    }
+    panel.loopSmoothingDiagnostics.reset();
+    panel.preparedPathCache = {};
+    panel.motionStatsCache = {};
+    panel.perceivedFlowCache = {};
+    return true;
+}
+
+struct ResidentAnimationAlignmentScene {
+    std::string key;
+    std::vector<invisible_places::io::Float3> points;
+};
+
+std::optional<ResidentAnimationAlignmentScene>
+SnapshotCommonResidentAnimationScene(
+    const PreviewRuntimeState& runtimeState,
+    const AnimationPath& first,
+    const AnimationPath& second,
+    std::string* errorMessage,
+    bool includePointSnapshot = true) {
+    auto firstAssociations = first.associatedLayerPaths;
+    auto secondAssociations = second.associatedLayerPaths;
+    CanonicalizeAssociatedLayerPathsForSceneGroups(
+        runtimeState,
+        &firstAssociations);
+    CanonicalizeAssociatedLayerPathsForSceneGroups(
+        runtimeState,
+        &secondAssociations);
+    std::vector<std::filesystem::path> commonAssociations;
+    for (const auto& association : firstAssociations) {
+        if (AssociatedLayerPathsContain(
+                secondAssociations,
+                association)) {
+            commonAssociations.push_back(association);
+        }
+    }
+    if (commonAssociations.empty()) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "Animation geometry matching requires both animations to reference the same associated point-cloud scene.";
+        }
+        return std::nullopt;
+    }
+
+    ResidentAnimationAlignmentScene snapshot;
+    constexpr std::size_t kMaximumSamples = 65'536U;
+    std::size_t residentPointCount = 0U;
+    for (const auto& association : commonAssociations) {
+        const auto associationKey = NormalizePathKey(association);
+        std::size_t associationPointCount = 0U;
+        for (const auto& session : runtimeState.sessions) {
+            if (session.kind != LayerKind::PointCloud ||
+                session.pivotSamples.empty() ||
+                IsGeneratedWaterOverlaySession(session) ||
+                NormalizePathKey(AssociationPathForSession(session)) !=
+                    associationKey) {
+                continue;
+            }
+            const std::size_t remaining =
+                std::numeric_limits<std::size_t>::max() -
+                associationPointCount;
+            associationPointCount +=
+                std::min(session.pivotSamples.size(), remaining);
+        }
+        if (associationPointCount > 0U) {
+            snapshot.key = associationKey;
+            residentPointCount = associationPointCount;
+            break;
+        }
+    }
+    if (residentPointCount < 32U) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The animations share a scene, but it has too few already-resident pivot positions for geometry matching.";
+        }
+        return std::nullopt;
+    }
+    if (!includePointSnapshot) {
+        return snapshot;
+    }
+    const std::size_t stride = std::max<std::size_t>(
+        1U,
+        1U + (residentPointCount - 1U) / kMaximumSamples);
+    snapshot.points.reserve(std::min(residentPointCount, kMaximumSamples));
+    std::size_t globalOffset = 0U;
+    std::size_t nextSampleIndex = 0U;
+    for (const auto& session : runtimeState.sessions) {
+        if (session.kind != LayerKind::PointCloud ||
+            session.pivotSamples.empty() ||
+            IsGeneratedWaterOverlaySession(session) ||
+            NormalizePathKey(AssociationPathForSession(session)) !=
+                snapshot.key) {
+            continue;
+        }
+        const std::size_t sourceEnd = globalOffset +
+            session.pivotSamples.size();
+        while (nextSampleIndex < sourceEnd &&
+               snapshot.points.size() < kMaximumSamples) {
+            snapshot.points.push_back(
+                session.pivotSamples[nextSampleIndex - globalOffset]);
+            nextSampleIndex += stride;
+        }
+        globalOffset = sourceEnd;
+    }
+    return snapshot;
+}
+
+struct AnimationMatchingFrameGhostSourceSelection {
+    std::string associationKey;
+    std::string description;
+    float spacingMillimeters = 0.0F;
+    std::vector<std::size_t> sessionIndices;
+};
+
+bool AnimationPathsShareAssociationKey(
+    const PreviewRuntimeState& runtimeState,
+    const AnimationPath& current,
+    const AnimationPath& partner,
+    std::string_view associationKey) {
+    auto currentAssociations = current.associatedLayerPaths;
+    auto partnerAssociations = partner.associatedLayerPaths;
+    CanonicalizeAssociatedLayerPathsForSceneGroups(
+        runtimeState,
+        &currentAssociations);
+    CanonicalizeAssociatedLayerPathsForSceneGroups(
+        runtimeState,
+        &partnerAssociations);
+    const auto containsKey = [&](const auto& associations) {
+        return std::any_of(
+            associations.begin(),
+            associations.end(),
+            [&](const auto& association) {
+                return NormalizePathKey(association) == associationKey;
+            });
+    };
+    return containsKey(currentAssociations) &&
+           containsKey(partnerAssociations);
+}
+
+std::optional<std::uint64_t>
+AnimationMatchingFrameGhostSourceFingerprint(
+    const PreviewRuntimeState& runtimeState,
+    const AnimationMatchingFrameGhostSourceSelection& selection,
+    std::size_t* sourcePointCount = nullptr) {
+    std::uint64_t fingerprint = 1469598103934665603ULL;
+    HashString(&fingerprint, selection.associationKey);
+    HashFloat(&fingerprint, selection.spacingMillimeters);
+    std::size_t totalPointCount = 0U;
+    for (const auto sessionIndex : selection.sessionIndices) {
+        if (sessionIndex >= runtimeState.sessions.size()) {
+            return std::nullopt;
+        }
+        const auto& session = runtimeState.sessions[sessionIndex];
+        if (!session.cpuResident || session.offlinePointCloud == nullptr ||
+            session.offlinePointCloud->positions.empty()) {
+            return std::nullopt;
+        }
+        HashString(
+            &fingerprint,
+            NormalizePathKey(session.sourcePath));
+        HashCombine(
+            &fingerprint,
+            session.pointCloudContentGeneration);
+        HashCombine(
+            &fingerprint,
+            session.offlinePointCloud->PointCount());
+        const std::size_t remaining =
+            std::numeric_limits<std::size_t>::max() - totalPointCount;
+        totalPointCount += std::min(
+            session.offlinePointCloud->PointCount(),
+            remaining);
+    }
+    if (sourcePointCount != nullptr) {
+        *sourcePointCount = totalPointCount;
+    }
+    return fingerprint;
+}
+
+std::optional<AnimationMatchingFrameGhostSourceSelection>
+ResolveAnimationMatchingFrameGhostSource(
+    const PreviewRuntimeState& runtimeState,
+    const AnimationPath& current,
+    const AnimationPath& partner,
+    std::string* errorMessage) {
+    auto currentAssociations = current.associatedLayerPaths;
+    auto partnerAssociations = partner.associatedLayerPaths;
+    CanonicalizeAssociatedLayerPathsForSceneGroups(
+        runtimeState,
+        &currentAssociations);
+    CanonicalizeAssociatedLayerPathsForSceneGroups(
+        runtimeState,
+        &partnerAssociations);
+    std::vector<std::filesystem::path> commonAssociations;
+    for (const auto& association : currentAssociations) {
+        if (AssociatedLayerPathsContain(
+                partnerAssociations,
+                association)) {
+            commonAssociations.push_back(association);
+        }
+    }
+    if (commonAssociations.empty()) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "Matching points require A and B to reference a common point-cloud scene.";
+        }
+        return std::nullopt;
+    }
+
+    std::string unavailableDescription;
+    for (const auto& association : commonAssociations) {
+        const auto associationKey = NormalizePathKey(association);
+        if (const auto sceneGroupName =
+                SceneGroupNameFromAssociationPath(association);
+            sceneGroupName.has_value()) {
+            for (const auto& scene : runtimeState.pointCloudScenes) {
+                if (scene.sceneGroupName != sceneGroupName.value()) {
+                    continue;
+                }
+                const auto* bundle = FindSceneDisplayBundle(
+                    scene,
+                    kAnimationMatchingFrameGhostSpacingMicrometres);
+                if (bundle == nullptr) {
+                    unavailableDescription =
+                        scene.sceneGroupName +
+                        " has no complete 5 mm display bundle.";
+                    continue;
+                }
+                AnimationMatchingFrameGhostSourceSelection selection{
+                    .associationKey = associationKey,
+                    .description = scene.sceneGroupName +
+                        " 5 mm display cloud",
+                    .spacingMillimeters = 5.0F,
+                };
+                selection.sessionIndices.assign(
+                    bundle->sessionIndices.begin(),
+                    bundle->sessionIndices.end());
+                if (AnimationMatchingFrameGhostSourceFingerprint(
+                        runtimeState,
+                        selection)
+                        .has_value()) {
+                    return selection;
+                }
+                unavailableDescription =
+                    scene.sceneGroupName +
+                    " has a 5 mm bundle, but its position arrays are not CPU-resident.";
+            }
+            continue;
+        }
+
+        const auto sessionIndex = FindSessionIndexBySourcePath(
+            runtimeState,
+            association);
+        if (!sessionIndex.has_value() ||
+            sessionIndex.value() >= runtimeState.sessions.size()) {
+            continue;
+        }
+        const auto& session =
+            runtimeState.sessions[sessionIndex.value()];
+        const float spacingMeters =
+            session.inferredPointSpacingMeters > 0.0F
+                ? session.inferredPointSpacingMeters
+                : session.pointSpacingMeters;
+        const auto spacing = invisible_places::scene::
+            QuantizePointSpacingMicrometres(spacingMeters);
+        if (!spacing.has_value() || spacing.value() !=
+                kAnimationMatchingFrameGhostSpacingMicrometres) {
+            unavailableDescription =
+                session.displayName + " is not a 5 mm point cloud.";
+            continue;
+        }
+        AnimationMatchingFrameGhostSourceSelection selection{
+            .associationKey = associationKey,
+            .description = session.displayName + " 5 mm cloud",
+            .spacingMillimeters = 5.0F,
+            .sessionIndices = {sessionIndex.value()},
+        };
+        if (AnimationMatchingFrameGhostSourceFingerprint(
+                runtimeState,
+                selection)
+                .has_value()) {
+            return selection;
+        }
+        unavailableDescription =
+            session.displayName +
+            " is 5 mm, but its position array is not CPU-resident.";
+    }
+    if (errorMessage != nullptr) {
+        *errorMessage = unavailableDescription.empty()
+            ? "No exact 5 mm point cloud is available for the linked animations."
+            : unavailableDescription +
+                  " Switch the scene display to 5 mm and wait for it to finish loading.";
+    }
+    return std::nullopt;
+}
+
+std::shared_ptr<const AnimationMatchingFrameGhostSourceSnapshot>
+SnapshotAnimationMatchingFrameGhostSource(
+    PreviewRuntimeState* runtimeState,
+    const AnimationPath& current,
+    const AnimationPath& partner,
+    std::string* errorMessage) {
+    if (runtimeState == nullptr) {
+        return nullptr;
+    }
+    auto& job = runtimeState->animationMatchingFrameGhostJob;
+    const auto selection = ResolveAnimationMatchingFrameGhostSource(
+        *runtimeState,
+        current,
+        partner,
+        errorMessage);
+    if (!selection.has_value()) {
+        if (job.sourceCache != nullptr &&
+            AnimationPathsShareAssociationKey(
+                *runtimeState,
+                current,
+                partner,
+                job.sourceCache->associationKey)) {
+            if (errorMessage != nullptr) {
+                errorMessage->clear();
+            }
+            return job.sourceCache;
+        }
+        return nullptr;
+    }
+    std::size_t sourcePointCount = 0U;
+    const auto fingerprint =
+        AnimationMatchingFrameGhostSourceFingerprint(
+            *runtimeState,
+            selection.value(),
+            &sourcePointCount);
+    if (!fingerprint.has_value() || sourcePointCount < 32U) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The 5 mm matching cloud has too few resident positions.";
+        }
+        return nullptr;
+    }
+    if (job.sourceCache != nullptr &&
+        job.sourceCache->fingerprint == fingerprint.value() &&
+        job.sourceCache->associationKey ==
+            selection->associationKey) {
+        return job.sourceCache;
+    }
+
+    auto snapshot =
+        std::make_shared<AnimationMatchingFrameGhostSourceSnapshot>();
+    snapshot->associationKey = selection->associationKey;
+    snapshot->description = selection->description;
+    snapshot->spacingMillimeters = selection->spacingMillimeters;
+    snapshot->fingerprint = fingerprint.value();
+    snapshot->sourcePointCount = sourcePointCount;
+    snapshot->sessionIndices = selection->sessionIndices;
+    const std::size_t stride = std::max<std::size_t>(
+        1U,
+        1U + (sourcePointCount - 1U) /
+                 kAnimationMatchingFrameGhostSourceSampleLimit);
+    snapshot->sampledPositions.reserve(std::min(
+        sourcePointCount,
+        kAnimationMatchingFrameGhostSourceSampleLimit));
+    std::size_t globalOffset = 0U;
+    std::size_t nextSampleIndex = 0U;
+    for (const auto sessionIndex : selection->sessionIndices) {
+        const auto& positions = runtimeState->sessions[sessionIndex]
+                                    .offlinePointCloud->positions;
+        const std::size_t sourceEnd = globalOffset + positions.size();
+        while (nextSampleIndex < sourceEnd &&
+               snapshot->sampledPositions.size() <
+                   kAnimationMatchingFrameGhostSourceSampleLimit) {
+            snapshot->sampledPositions.push_back(
+                positions[nextSampleIndex - globalOffset]);
+            nextSampleIndex += stride;
+        }
+        globalOffset = sourceEnd;
+    }
+    if (snapshot->sampledPositions.size() < 32U) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The 5 mm matching-cloud sample contains too few positions.";
+        }
+        return nullptr;
+    }
+    job.sourceCache = snapshot;
+    return snapshot;
+}
+
+std::optional<float> AnimationLoopCounterpartNormalizedPosition(
+    const AnimationPath& path,
+    float normalizedPosition,
+    float startOverlapSeconds,
+    float endOverlapSeconds,
+    float counterpartDurationSeconds);
+
+bool QueueAnimationMatchingFrameGhostCapture(
+    PreviewRuntimeState* runtimeState,
+    const AnimationMatchingFrameGhostCaptureRequest& request) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+    auto& panel = runtimeState->animationPanel;
+    const auto currentIndex = FindAnimationRegistryIndex(
         panel,
-        std::filesystem::path{panel.currentFilePath});
-    if (!currentFileIndex.has_value() ||
-        partnerFileIndex >= panel.availableFiles.size() ||
-        partnerFileIndex == currentFileIndex.value() ||
-        !panel.currentPath.has_value()) {
-        runtimeState->errorMessage = "Choose the paired animation before unapplying end smoothing.";
+        request.filePaths[0U]);
+    const auto partnerIndex = FindAnimationRegistryIndex(
+        panel,
+        request.filePaths[1U]);
+    if (!currentIndex.has_value() || !partnerIndex.has_value()) {
+        if (!request.automatic) {
+            runtimeState->errorMessage =
+                "The animation pair changed before matching points could update.";
+        }
         return false;
     }
     const auto* current = RegistryAnimationPath(
         *runtimeState,
-        currentFileIndex.value());
-    const auto* partner = RegistryAnimationPath(*runtimeState, partnerFileIndex);
+        currentIndex.value());
+    const auto* partner = RegistryAnimationPath(
+        *runtimeState,
+        partnerIndex.value());
     if (current == nullptr || partner == nullptr ||
-        !current->loopTransitionSmoothing.has_value() ||
-        !partner->loopTransitionSmoothing.has_value() ||
-        current->loopTransitionSmoothing->pairId !=
-            partner->loopTransitionSmoothing->pairId) {
-        runtimeState->errorMessage = "The selected animations do not contain the same reversible smoothing pair.";
+        !current->velocityBlendLink.has_value() ||
+        !partner->velocityBlendLink.has_value() ||
+        current->velocityBlendLink->pairId.empty() ||
+        current->velocityBlendLink->pairId !=
+            partner->velocityBlendLink->pairId) {
+        if (!request.automatic) {
+            runtimeState->errorMessage =
+                "Apply the velocity blend before capturing matching points.";
+        }
         return false;
     }
-    std::string validationError;
-    if (!ValidateLoopSmoothingEndpointLinks(
+
+    std::string sourceError;
+    const auto source = SnapshotAnimationMatchingFrameGhostSource(
+        runtimeState,
+        *current,
+        *partner,
+        &sourceError);
+    if (source == nullptr) {
+        if (!request.automatic) {
+            runtimeState->errorMessage = std::move(sourceError);
+        }
+        return false;
+    }
+    const float currentPosition = std::clamp(
+        request.currentNormalizedPosition,
+        0.0F,
+        1.0F);
+    const float partnerPosition = std::clamp(
+        request.partnerNormalizedPosition,
+        0.0F,
+        1.0F);
+    const auto currentEvaluation =
+        invisible_places::camera::EvaluateAnimationPath(
+            *current,
+            invisible_places::camera::AnimationPathDurationSeconds(
+                *current) * currentPosition);
+    const auto partnerEvaluation =
+        invisible_places::camera::EvaluateAnimationPath(
+            *partner,
+            invisible_places::camera::AnimationPathDurationSeconds(
+                *partner) * partnerPosition);
+
+    auto& job = runtimeState->animationMatchingFrameGhostJob;
+    if (job.worker.joinable()) {
+        job.worker.request_stop();
+        job.worker = std::jthread{};
+    }
+    const std::uint64_t generation = job.nextGeneration++;
+    job.activeGeneration = generation;
+    job.shared =
+        std::make_shared<AnimationMatchingFrameGhostJobShared>();
+    const auto shared = job.shared;
+    const auto pairId = current->velocityBlendLink->pairId;
+    const std::array<std::uint64_t, 2> motionFingerprints{
+        AnimationPathMotionFingerprint(*current),
+        AnimationPathMotionFingerprint(*partner),
+    };
+    auto queuedRequest = request;
+    queuedRequest.currentNormalizedPosition = currentPosition;
+    queuedRequest.partnerNormalizedPosition = partnerPosition;
+    job.worker = std::jthread(
+        [shared,
+         generation,
+         queuedRequest,
+         pairId,
+         motionFingerprints,
+         source,
+         currentEvaluation,
+         partnerEvaluation](std::stop_token stopToken) {
+            AnimationMatchingFrameGhostJobResult completed{
+                .generation = generation,
+                .request = queuedRequest,
+                .pairId = pairId,
+                .motionFingerprints = motionFingerprints,
+                .source = source,
+            };
+            completed.result = invisible_places::camera::
+                BuildAnimationMatchingFrameGhost(
+                    currentEvaluation,
+                    partnerEvaluation,
+                    source->sampledPositions,
+                    {
+                        .aspectRatio = queuedRequest.aspectRatio,
+                        .screenGridWidth =
+                            kAnimationMatchingFrameGhostGridWidth,
+                        .screenGridHeight =
+                            kAnimationMatchingFrameGhostGridHeight,
+                        .maximumPointSamples =
+                            source->sampledPositions.size(),
+                        .stopToken = stopToken,
+                    });
+            std::scoped_lock lock{shared->mutex};
+            shared->result = std::move(completed);
+            shared->completed = true;
+        });
+    auto& state = panel.matchingFrameGhost;
+    state.updateInProgress = true;
+    state.requestedCurrentNormalizedPosition = currentPosition;
+    state.requestedPartnerNormalizedPosition = partnerPosition;
+    if (request.automatic) {
+        state.lastAutomaticRequestAt =
+            std::chrono::steady_clock::now();
+    } else {
+        runtimeState->statusMessage =
+            "Capturing B's matching frame from the resident 5 mm cloud in the background.";
+        runtimeState->errorMessage.clear();
+    }
+    return true;
+}
+
+void PollAnimationMatchingFrameGhostJob(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    auto& job = runtimeState->animationMatchingFrameGhostJob;
+    if (job.shared == nullptr) {
+        return;
+    }
+    std::optional<AnimationMatchingFrameGhostJobResult> completed;
+    {
+        std::scoped_lock lock{job.shared->mutex};
+        if (!job.shared->completed) {
+            return;
+        }
+        completed = std::move(job.shared->result);
+    }
+    job.shared.reset();
+    if (job.worker.joinable()) {
+        job.worker = std::jthread{};
+    }
+    auto& state = runtimeState->animationPanel.matchingFrameGhost;
+    state.updateInProgress = false;
+    if (!completed.has_value() ||
+        completed->generation != job.activeGeneration) {
+        return;
+    }
+    if (!completed->result.succeeded) {
+        if (!completed->request.automatic &&
+            completed->result.errorMessage.find("cancelled") ==
+                std::string::npos) {
+            runtimeState->errorMessage =
+                completed->result.errorMessage;
+            runtimeState->statusMessage.clear();
+        }
+        return;
+    }
+
+    auto& panel = runtimeState->animationPanel;
+    const auto currentIndex = FindAnimationRegistryIndex(
+        panel,
+        completed->request.filePaths[0U]);
+    const auto partnerIndex = FindAnimationRegistryIndex(
+        panel,
+        completed->request.filePaths[1U]);
+    const auto* current = currentIndex.has_value()
+        ? RegistryAnimationPath(*runtimeState, currentIndex.value())
+        : nullptr;
+    const auto* partner = partnerIndex.has_value()
+        ? RegistryAnimationPath(*runtimeState, partnerIndex.value())
+        : nullptr;
+    const bool pairUnchanged =
+        current != nullptr && partner != nullptr &&
+        current->velocityBlendLink.has_value() &&
+        partner->velocityBlendLink.has_value() &&
+        current->velocityBlendLink->pairId == completed->pairId &&
+        partner->velocityBlendLink->pairId == completed->pairId &&
+        AnimationPathMotionFingerprint(*current) ==
+            completed->motionFingerprints[0U] &&
+        AnimationPathMotionFingerprint(*partner) ==
+            completed->motionFingerprints[1U];
+    AnimationMatchingFrameGhostSourceSelection sourceSelection{
+        .associationKey = completed->source->associationKey,
+        .description = completed->source->description,
+        .spacingMillimeters = completed->source->spacingMillimeters,
+        .sessionIndices = completed->source->sessionIndices,
+    };
+    const auto liveSourceFingerprint =
+        AnimationMatchingFrameGhostSourceFingerprint(
             *runtimeState,
-            currentFileIndex.value(),
-            partnerFileIndex,
-            &validationError)) {
-        runtimeState->errorMessage = std::move(validationError);
+            sourceSelection);
+    const bool sourceStillAssociated =
+        current != nullptr && partner != nullptr &&
+        AnimationPathsShareAssociationKey(
+            *runtimeState,
+            *current,
+            *partner,
+            completed->source->associationKey);
+    const bool sourceUnchanged =
+        sourceStillAssociated &&
+        ((liveSourceFingerprint.has_value() &&
+          liveSourceFingerprint.value() ==
+              completed->source->fingerprint) ||
+         (!liveSourceFingerprint.has_value() &&
+          job.sourceCache == completed->source));
+    const float allowedFrameLag =
+        runtimeState->animationPlayback.active ? 8.0F : 0.75F;
+    const float frameTolerance = current != nullptr
+        ? allowedFrameLag /
+              static_cast<float>(std::max<std::uint32_t>(
+                  current->durationFrames,
+                  1U))
+        : 0.0F;
+    const bool requestedFrameStillCurrent =
+        !panel.currentFilePath.empty() &&
+        PathsLexicallyEqual(
+            std::filesystem::path{panel.currentFilePath},
+            completed->request.filePaths[0U]) &&
+        std::abs(
+            std::clamp(panel.scrubAmount, 0.0F, 1.0F) -
+            completed->request.currentNormalizedPosition) <=
+            frameTolerance;
+    const float partnerFrameTolerance = partner != nullptr
+        ? allowedFrameLag /
+              static_cast<float>(std::max<std::uint32_t>(
+                  partner->durationFrames,
+                  1U))
+        : 0.0F;
+    const float partnerDuration = partner != nullptr
+        ? invisible_places::camera::AnimationPathDurationSeconds(
+              *partner)
+        : 0.0F;
+    const auto expectedPartnerPosition = pairUnchanged
+        ? AnimationLoopCounterpartNormalizedPosition(
+              *current,
+              std::clamp(panel.scrubAmount, 0.0F, 1.0F),
+              current->velocityBlendLink->startOverlapSeconds,
+              current->velocityBlendLink->endOverlapSeconds,
+              partnerDuration)
+        : std::nullopt;
+    const bool requestedPartnerStillCurrent =
+        expectedPartnerPosition.has_value() &&
+        std::abs(
+            expectedPartnerPosition.value() -
+            completed->request.partnerNormalizedPosition) <=
+            partnerFrameTolerance;
+    if (!pairUnchanged || !sourceUnchanged ||
+        !requestedFrameStillCurrent ||
+        !requestedPartnerStillCurrent) {
+        if (!completed->request.automatic) {
+            runtimeState->errorMessage =
+                "Discarded the matching-point result because the pair, 5 mm source, current frame, or counterpart changed while it was being calculated.";
+            runtimeState->statusMessage.clear();
+        }
+        return;
+    }
+
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.layerName = "Matching Frame Ghost";
+    cloud.positions = std::move(completed->result.positions);
+    cloud.packedColors.assign(cloud.positions.size(), 0xFFFFFFFFU);
+    for (const auto& position : cloud.positions) {
+        cloud.bounds.Expand(position);
+    }
+    try {
+        viewport.UploadPointCloud(
+            kAnimationMatchingFrameGhostLayerId,
+            cloud,
+            {});
+    } catch (const std::exception& error) {
+        runtimeState->errorMessage =
+            "Could not upload the matching-frame point ghost: " +
+            std::string{error.what()};
+        return;
+    }
+
+    const bool wasUploaded = state.uploaded;
+    state.uploaded = true;
+    if (!wasUploaded) {
+        state.visible = true;
+    }
+    state.matchingFrameAvailable = true;
+    state.captureMatchesCurrentFrame = true;
+    state.currentFilePath = completed->request.filePaths[0U];
+    state.partnerFilePath = completed->request.filePaths[1U];
+    state.pairId = completed->pairId;
+    state.commonSceneKey = completed->source->associationKey;
+    state.sourceDescription = completed->source->description;
+    state.sourceSpacingMillimeters =
+        completed->source->spacingMillimeters;
+    state.currentNormalizedPosition =
+        completed->request.currentNormalizedPosition;
+    state.partnerNormalizedPosition =
+        completed->request.partnerNormalizedPosition;
+    state.capturedMotionFingerprints = completed->motionFingerprints;
+    state.observedMotionFingerprints = completed->motionFingerprints;
+    state.sourcePointCount = completed->source->sourcePointCount;
+    state.sourceSamplePointCount =
+        completed->source->sampledPositions.size();
+    state.frustumVisiblePointCount =
+        completed->result.frustumVisiblePointCount;
+    state.capturedPointCount = cloud.positions.size();
+    if (!completed->request.automatic) {
+        runtimeState->statusMessage =
+            "Captured " +
+            std::to_string(state.capturedPointCount) +
+            " front-visible points from " +
+            state.sourceDescription + ".";
+        runtimeState->errorMessage.clear();
+    }
+}
+
+bool ApplyAnimationLowerFrameAlignment(
+    PreviewRuntimeState* runtimeState,
+    std::size_t currentIndex,
+    std::size_t partnerIndex,
+    int destinationRow,
+    std::string destinationKeyId,
+    float counterpartPosition,
+    float aspectRatio) {
+    if (runtimeState == nullptr || destinationRow < 0 ||
+        destinationRow > 1 || currentIndex == partnerIndex) {
+        return false;
+    }
+    auto& panel = runtimeState->animationPanel;
+    if (currentIndex >= panel.availableFiles.size() ||
+        partnerIndex >= panel.availableFiles.size()) {
+        return false;
+    }
+    std::optional<AnimationPanelState> panelBeforeStrongReplacement;
+    const auto rollbackStrongReplacement = [&]() {
+        if (!panelBeforeStrongReplacement.has_value()) {
+            return;
+        }
+        const auto errorMessage = runtimeState->errorMessage;
+        const auto statusMessage = runtimeState->statusMessage;
+        panel = std::move(panelBeforeStrongReplacement.value());
+        ApplyAnimationScrub(runtimeState);
+        runtimeState->errorMessage = errorMessage;
+        runtimeState->statusMessage = statusMessage;
+    };
+    if (panel.velocityAlignmentDraft.has_value()) {
+        const auto& draft = panel.velocityAlignmentDraft.value();
+        const bool samePair =
+            (PathsLexicallyEqual(
+                 panel.availableFiles[currentIndex],
+                 draft.firstFilePath) ||
+             PathsLexicallyEqual(
+                 panel.availableFiles[currentIndex],
+                 draft.secondFilePath)) &&
+            (PathsLexicallyEqual(
+                 panel.availableFiles[partnerIndex],
+                 draft.firstFilePath) ||
+             PathsLexicallyEqual(
+                 panel.availableFiles[partnerIndex],
+                 draft.secondFilePath));
+        const bool hasStrongDraft = std::any_of(
+            draft.strongKeyDeltas.begin(),
+            draft.strongKeyDeltas.end(),
+            [](const auto& deltas) { return !deltas.empty(); });
+        if (samePair && hasStrongDraft) {
+            panelBeforeStrongReplacement = panel;
+            if (!RemoveAnimationAlignmentDraftDeltas(
+                    runtimeState,
+                    false,
+                    true,
+                    false)) {
+                rollbackStrongReplacement();
+                return false;
+            }
+        }
+    }
+    const auto* current = RegistryAnimationPath(*runtimeState, currentIndex);
+    const auto* partner = RegistryAnimationPath(*runtimeState, partnerIndex);
+    if (current == nullptr || partner == nullptr ||
+        !current->velocityBlendLink.has_value() ||
+        !partner->velocityBlendLink.has_value() ||
+        current->velocityBlendLink->pairId !=
+            partner->velocityBlendLink->pairId) {
+        runtimeState->errorMessage =
+            "Apply the velocity blend before aligning lower-frame geometry.";
+        rollbackStrongReplacement();
+        return false;
+    }
+    std::string sceneError;
+    auto commonScene = SnapshotCommonResidentAnimationScene(
+        *runtimeState,
+        *current,
+        *partner,
+        &sceneError);
+    if (!commonScene.has_value()) {
+        runtimeState->errorMessage = std::move(sceneError);
+        rollbackStrongReplacement();
+        return false;
+    }
+
+    const std::array<std::size_t, 2> indices{currentIndex, partnerIndex};
+    std::array<AnimationPath, 2> paths{*current, *partner};
+    const std::size_t destinationMember =
+        static_cast<std::size_t>(destinationRow);
+    const std::size_t referenceMember = 1U - destinationMember;
+    const auto& destination = paths[destinationMember];
+    const auto& reference = paths[referenceMember];
+    const auto destinationKey = std::find_if(
+        destination.keys.begin(),
+        destination.keys.end(),
+        [&](const auto& key) { return key.id == destinationKeyId; });
+    if (destinationKey == destination.keys.end()) {
+        runtimeState->errorMessage =
+            "The selected lower-frame alignment key no longer exists.";
+        rollbackStrongReplacement();
+        return false;
+    }
+    const std::unordered_set<std::string> currentMovableKeyIds =
+        destinationMember == 0U
+            ? std::unordered_set<std::string>{destinationKeyId}
+            : std::unordered_set<std::string>{};
+    const std::unordered_set<std::string> partnerMovableKeyIds =
+        destinationMember == 1U
+            ? std::unordered_set<std::string>{destinationKeyId}
+            : std::unordered_set<std::string>{};
+    std::string linkValidationError;
+    if (!ValidateLoopSmoothingMovableLinks(
+            *runtimeState,
+            currentIndex,
+            partnerIndex,
+            currentMovableKeyIds,
+            partnerMovableKeyIds,
+            &linkValidationError)) {
+        runtimeState->errorMessage =
+            "Lower-frame alignment cannot move this key: " +
+            linkValidationError;
         runtimeState->statusMessage.clear();
+        rollbackStrongReplacement();
         return false;
     }
-    auto candidateCurrent = *current;
-    auto candidatePartner = *partner;
-    const auto pairId = current->loopTransitionSmoothing->pairId;
-    std::string unapplyError;
-    if (!invisible_places::camera::UnapplyAnimationLoopSmoothing(
-            &candidateCurrent,
-            &unapplyError) ||
-        !invisible_places::camera::UnapplyAnimationLoopSmoothing(
-            &candidatePartner,
-            &unapplyError)) {
-        runtimeState->errorMessage = std::move(unapplyError);
-        return false;
+    auto& job = runtimeState->animationStrongAlignmentJob;
+    if (job.worker.joinable()) {
+        job.worker.request_stop();
+        job.worker = std::jthread{};
     }
-    panel.availableFileEditedPaths[currentFileIndex.value()] =
-        candidateCurrent;
-    panel.availableFileEditedPaths[partnerFileIndex] =
-        candidatePartner;
-    panel.availableFileLoopEditPairIds[currentFileIndex.value()] = pairId;
-    panel.availableFileLoopEditPairIds[partnerFileIndex] = pairId;
-    panel.availableFileDirtyFlags[currentFileIndex.value()] = true;
-    panel.availableFileDirtyFlags[partnerFileIndex] = true;
-    panel.currentPath = std::move(candidateCurrent);
-    panel.currentPathUsesEdited = true;
-    panel.selectedFileUsesEdited = true;
-    panel.dirty = true;
+    const auto generation = job.nextGeneration++;
+    job.activeGeneration = generation;
+    job.shared = std::make_shared<AnimationStrongAlignmentJobShared>();
+    auto shared = job.shared;
+    const std::array<std::filesystem::path, 2> filePaths{
+        panel.availableFiles[currentIndex],
+        panel.availableFiles[partnerIndex],
+    };
+    const auto destinationFilePath =
+        panel.availableFiles[indices[destinationMember]];
+    const auto pairId = current->velocityBlendLink->pairId;
+    const std::array<std::uint64_t, 2> fingerprints{
+        AnimationPathMotionFingerprint(*current),
+        AnimationPathMotionFingerprint(*partner),
+    };
+    const auto commonSceneKey = commonScene->key;
+    const float maxMoveFraction = std::clamp(
+        panel.strongAlignmentMaxMovePercent / 100.0F,
+        0.01F,
+        1.0F);
+    const float referenceNormalizedPosition = std::clamp(
+        counterpartPosition,
+        0.0F,
+        1.0F);
+    const float alignmentAspectRatio = std::clamp(
+        aspectRatio,
+        0.25F,
+        8.0F);
+    const float destinationStartOverlapSeconds =
+        destination.velocityBlendLink->startOverlapSeconds;
+    const float destinationEndOverlapSeconds =
+        destination.velocityBlendLink->endOverlapSeconds;
+    auto adjusted = destination;
+    auto referenceSnapshot = reference;
+    auto points = std::move(commonScene->points);
+    job.worker = std::jthread(
+        [shared,
+         generation,
+         filePaths,
+         destinationFilePath,
+         pairId,
+         commonSceneKey,
+         maxMoveFraction,
+         fingerprints,
+         destinationKeyId = std::move(destinationKeyId),
+         referenceNormalizedPosition,
+         alignmentAspectRatio,
+         destinationStartOverlapSeconds,
+         destinationEndOverlapSeconds,
+         adjusted = std::move(adjusted),
+         referenceSnapshot = std::move(referenceSnapshot),
+         points = std::move(points)](std::stop_token stopToken) mutable {
+            AnimationStrongAlignmentJobResult completed{
+                .generation = generation,
+                .filePaths = filePaths,
+                .destinationFilePath = destinationFilePath,
+                .pairId = pairId,
+                .commonSceneKey = commonSceneKey,
+                .maxMoveFraction = maxMoveFraction,
+                .motionFingerprints = fingerprints,
+                .destinationKeyId = destinationKeyId,
+                .referenceNormalizedPosition =
+                    referenceNormalizedPosition,
+                .aspectRatio = alignmentAspectRatio,
+                .destinationStartOverlapSeconds =
+                    destinationStartOverlapSeconds,
+                .destinationEndOverlapSeconds =
+                    destinationEndOverlapSeconds,
+            };
+            try {
+                completed.result = invisible_places::camera::
+                    StrongAlignAnimationKeyToReference(
+                        &adjusted,
+                        referenceSnapshot,
+                        points,
+                        {
+                            .destinationKeyId = destinationKeyId,
+                            .referenceNormalizedPosition =
+                                referenceNormalizedPosition,
+                            .aspectRatio = alignmentAspectRatio,
+                            .maxMoveFraction = maxMoveFraction,
+                            .stopToken = stopToken,
+                        });
+                completed.adjustedDestination = std::move(adjusted);
+            } catch (const std::exception& error) {
+                completed.result.errorMessage =
+                    "Lower-frame alignment failed: " +
+                    std::string{error.what()};
+            }
+            std::scoped_lock lock{shared->mutex};
+            shared->result = std::move(completed);
+            shared->completed = true;
+        });
+    panel.strongAlignmentDiagnostics.reset();
+    runtimeState->statusMessage =
+        "Matching common frontmost points in the lower 55% of both frames in the background.";
+    runtimeState->errorMessage.clear();
+    return true;
+}
+
+void PollAnimationStrongAlignmentJob(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    auto& job = runtimeState->animationStrongAlignmentJob;
+    if (job.shared == nullptr) {
+        return;
+    }
+    std::optional<AnimationStrongAlignmentJobResult> completed;
+    {
+        std::scoped_lock lock{job.shared->mutex};
+        if (!job.shared->completed) {
+            return;
+        }
+        completed = std::move(job.shared->result);
+    }
+    job.shared.reset();
+    if (job.worker.joinable()) {
+        job.worker = std::jthread{};
+    }
+    if (!completed.has_value() ||
+        completed->generation != job.activeGeneration) {
+        return;
+    }
+
+    auto& panel = runtimeState->animationPanel;
+    const auto currentIndex = FindAnimationRegistryIndex(
+        panel,
+        completed->filePaths[0U]);
+    const auto partnerIndex = FindAnimationRegistryIndex(
+        panel,
+        completed->filePaths[1U]);
+    if (!currentIndex.has_value() || !partnerIndex.has_value()) {
+        runtimeState->statusMessage =
+            "Discarded a stale lower-frame alignment because a pair member was removed.";
+        return;
+    }
+    const auto* current = RegistryAnimationPath(
+        *runtimeState,
+        currentIndex.value());
+    const auto* partner = RegistryAnimationPath(
+        *runtimeState,
+        partnerIndex.value());
+    if (current == nullptr || partner == nullptr ||
+        !current->velocityBlendLink.has_value() ||
+        !partner->velocityBlendLink.has_value() ||
+        current->velocityBlendLink->pairId != completed->pairId ||
+        partner->velocityBlendLink->pairId != completed->pairId) {
+        runtimeState->statusMessage =
+            "Discarded a stale lower-frame alignment because the pair changed.";
+        return;
+    }
+    const bool destinationIsCurrent = PathsLexicallyEqual(
+        completed->destinationFilePath,
+        completed->filePaths[0U]);
+    const auto* liveDestination = destinationIsCurrent
+                                      ? current
+                                      : partner;
+    const auto destinationKey = std::find_if(
+        liveDestination->keys.begin(),
+        liveDestination->keys.end(),
+        [&](const auto& key) {
+            return key.id == completed->destinationKeyId;
+        });
+    const auto close = [](float first, float second) {
+        return std::abs(first - second) <= 1.0e-5F;
+    };
+    const bool requestSettingsUnchanged =
+        destinationKey != liveDestination->keys.end() &&
+        close(
+            liveDestination->velocityBlendLink->startOverlapSeconds,
+            completed->destinationStartOverlapSeconds) &&
+        close(
+            liveDestination->velocityBlendLink->endOverlapSeconds,
+            completed->destinationEndOverlapSeconds) &&
+        close(
+            liveDestination->velocityBlendLink
+                ->strongAlignMaxMoveFraction,
+            completed->maxMoveFraction);
+    const bool motionUnchanged =
+        AnimationPathMotionFingerprint(*current) ==
+            completed->motionFingerprints[0U] &&
+        AnimationPathMotionFingerprint(*partner) ==
+            completed->motionFingerprints[1U];
+    std::string sceneError;
+    const auto liveCommonScene =
+        motionUnchanged && requestSettingsUnchanged
+        ? SnapshotCommonResidentAnimationScene(
+              *runtimeState,
+              *current,
+              *partner,
+              &sceneError,
+              false)
+        : std::nullopt;
+    if (!motionUnchanged || !requestSettingsUnchanged ||
+        !liveCommonScene.has_value() ||
+        liveCommonScene->key != completed->commonSceneKey) {
+        runtimeState->errorMessage =
+            "Discarded the stale lower-frame alignment because a camera, timing map, or common resident scene changed.";
+        runtimeState->statusMessage.clear();
+        return;
+    }
+
+    panel.strongAlignmentDiagnostics = completed->result;
+    if (!completed->result.succeeded || !completed->result.changed) {
+        runtimeState->errorMessage = completed->result.errorMessage;
+        runtimeState->statusMessage.clear();
+        return;
+    }
+    const std::size_t destinationIndex = destinationIsCurrent
+                                             ? currentIndex.value()
+                                             : partnerIndex.value();
+    const auto beforeDestination = destinationIsCurrent
+                                       ? *current
+                                       : *partner;
+    if (!panel.velocityAlignmentDraft.has_value()) {
+        panel.velocityAlignmentDraft = AnimationVelocityAlignmentDraft{
+            .firstFilePath = completed->filePaths[0U],
+            .secondFilePath = completed->filePaths[1U],
+            .pairId = completed->pairId,
+        };
+    }
+    auto& draft = panel.velocityAlignmentDraft.value();
+    std::optional<std::size_t> draftDestinationMember;
+    if (PathsLexicallyEqual(
+            completed->destinationFilePath,
+            draft.firstFilePath)) {
+        draftDestinationMember = 0U;
+    } else if (PathsLexicallyEqual(
+                   completed->destinationFilePath,
+                   draft.secondFilePath)) {
+        draftDestinationMember = 1U;
+    }
+    if (!draftDestinationMember.has_value() ||
+        draft.pairId != completed->pairId) {
+        runtimeState->errorMessage =
+            "The alignment draft changed while lower-frame matching was running; no pose was applied.";
+        return;
+    }
+    draft.strongKeyDeltas[draftDestinationMember.value()] =
+        BuildVelocityDraftKeyDeltas(
+            beforeDestination,
+            completed->adjustedDestination);
+    std::array<AnimationPath, 2> updated{*current, *partner};
+    updated[destinationIsCurrent ? 0U : 1U] =
+        std::move(completed->adjustedDestination);
+    const std::array<std::size_t, 2> indices{
+        currentIndex.value(),
+        partnerIndex.value(),
+    };
+    for (std::size_t member = 0U; member < 2U; ++member) {
+        updated[member].velocityBlendLink->strongAlignMaxMoveFraction =
+            std::clamp(
+                completed->maxMoveFraction,
+                0.01F,
+                1.0F);
+        panel.availableFileEditedPaths[indices[member]] = updated[member];
+        panel.availableFileDirtyFlags[indices[member]] = true;
+        panel.availableFileLoopEditPairIds[indices[member]] =
+            completed->pairId;
+    }
+    panel.projectVelocityLinksDirty = true;
+    const auto activeIndex = panel.currentFilePath.empty()
+                                 ? std::nullopt
+                                 : FindAnimationRegistryIndex(
+                                       panel,
+                                       std::filesystem::path{
+                                           panel.currentFilePath});
+    if (activeIndex.has_value()) {
+        for (std::size_t member = 0U; member < 2U; ++member) {
+            if (activeIndex.value() == indices[member]) {
+                panel.currentPath = updated[member];
+                panel.currentPathUsesEdited = true;
+                panel.selectedFileUsesEdited = true;
+                panel.dirty = true;
+                break;
+            }
+        }
+    }
+    panel.loopTimeline.previewDirty = true;
+    panel.loopSmoothingDiagnostics.reset();
     panel.preparedPathCache = {};
     panel.motionStatsCache = {};
     panel.perceivedFlowCache = {};
-    runtimeState->animationPlayback.active = false;
     ApplyAnimationScrub(runtimeState);
-    RefreshAnimationLoopDiagnostics(runtimeState, partnerFileIndex);
     runtimeState->statusMessage =
-        "Restored the original endpoint cameras and focus points in both "
-        "_Edited versions. Save Changes to promote them.";
+        "Lower-frame alignment improved common-point RMS from " +
+        FormatFixed(
+            completed->result.metrics.beforeForegroundReprojectionRms1080,
+            1) +
+        " to " +
+        FormatFixed(
+            completed->result.metrics.afterForegroundReprojectionRms1080,
+            1) +
+        " px @1080; vertical offset " +
+        FormatFixed(
+            completed->result.metrics.beforeVerticalOffset1080,
+            1) +
+        " to " +
+        FormatFixed(
+            completed->result.metrics.afterVerticalOffset1080,
+            1) +
+        " px across " +
+        std::to_string(
+            completed->result.metrics.foregroundSampleCount) +
+        " cached foreground points.";
     runtimeState->errorMessage.clear();
-    return true;
+    return;
+}
+
+float AnimationLoopKeyTimeSeconds(
+    const AnimationPath& path,
+    std::size_t keyIndex) {
+    return invisible_places::camera::AnimationPathKeyNormalizedPosition(
+               path,
+               keyIndex) *
+           invisible_places::camera::AnimationPathDurationSeconds(path);
+}
+
+std::optional<float> AnimationLoopCounterpartNormalizedPosition(
+    const AnimationPath& path,
+    float normalizedPosition,
+    float startOverlapSeconds,
+    float endOverlapSeconds,
+    float counterpartDurationSeconds) {
+    const float duration =
+        invisible_places::camera::AnimationPathDurationSeconds(path);
+    if (duration <= 1.0e-6F || counterpartDurationSeconds <= 1.0e-6F) {
+        return std::nullopt;
+    }
+    const float timeSeconds =
+        std::clamp(normalizedPosition, 0.0F, 1.0F) * duration;
+    const float startOverlap = std::clamp(
+        startOverlapSeconds,
+        0.0F,
+        duration);
+    const float endOverlap = std::clamp(
+        endOverlapSeconds,
+        0.0F,
+        duration);
+    const bool insideStart =
+        startOverlap > 0.0F && timeSeconds <= startOverlap + 1.0e-5F;
+    const bool insideEnd =
+        endOverlap > 0.0F &&
+        timeSeconds >= duration - endOverlap - 1.0e-5F;
+    if (!insideStart && !insideEnd) {
+        return std::nullopt;
+    }
+    const bool useStartSeam =
+        insideStart &&
+        (!insideEnd || timeSeconds <= duration - timeSeconds);
+    const float counterpartTime = useStartSeam
+        ? counterpartDurationSeconds -
+              std::min(startOverlap, counterpartDurationSeconds) +
+              timeSeconds
+        : timeSeconds - (duration - endOverlap);
+    return std::clamp(
+        counterpartTime / counterpartDurationSeconds,
+        0.0F,
+        1.0F);
+}
+
+void UpdateAnimationMatchingFrameGhostRuntime(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    auto& panel = runtimeState->animationPanel;
+    auto& state = panel.matchingFrameGhost;
+    auto& job = runtimeState->animationMatchingFrameGhostJob;
+    if (panel.requestedMatchingFrameGhostClear) {
+        panel.requestedMatchingFrameGhostClear = false;
+        panel.requestedMatchingFrameGhostCapture.reset();
+        if (job.worker.joinable()) {
+            job.worker.request_stop();
+            job.worker = std::jthread{};
+        }
+        job.shared.reset();
+        job.sourceCache.reset();
+        viewport.RemovePointCloud(kAnimationMatchingFrameGhostLayerId);
+        const float opacity = state.opacity;
+        const float pointSize = state.pointSizeMillimeters;
+        const bool automaticUpdate = state.automaticUpdate;
+        const bool showPartnerSplines = state.showPartnerSplines;
+        state = {};
+        state.opacity = opacity;
+        state.pointSizeMillimeters = pointSize;
+        state.automaticUpdate = automaticUpdate;
+        state.showPartnerSplines = showPartnerSplines;
+        runtimeState->statusMessage =
+            "Cleared the matching-frame 5 mm point ghost.";
+        runtimeState->errorMessage.clear();
+        return;
+    }
+
+    PollAnimationMatchingFrameGhostJob(runtimeState, viewport);
+    if (panel.requestedMatchingFrameGhostCapture.has_value()) {
+        const auto request =
+            panel.requestedMatchingFrameGhostCapture.value();
+        panel.requestedMatchingFrameGhostCapture.reset();
+        QueueAnimationMatchingFrameGhostCapture(
+            runtimeState,
+            request);
+    }
+    if (!state.uploaded || !state.visible ||
+        !state.automaticUpdate || runtimeState->offlineRenderJob.active ||
+        panel.currentFilePath.empty() ||
+        !PathsLexicallyEqual(
+            std::filesystem::path{panel.currentFilePath},
+            state.currentFilePath)) {
+        return;
+    }
+    const auto currentIndex = FindAnimationRegistryIndex(
+        panel,
+        state.currentFilePath);
+    const auto partnerIndex = FindAnimationRegistryIndex(
+        panel,
+        state.partnerFilePath);
+    const auto* current = currentIndex.has_value()
+        ? RegistryAnimationPath(*runtimeState, currentIndex.value())
+        : nullptr;
+    const auto* partner = partnerIndex.has_value()
+        ? RegistryAnimationPath(*runtimeState, partnerIndex.value())
+        : nullptr;
+    if (current == nullptr || partner == nullptr ||
+        !current->velocityBlendLink.has_value() ||
+        !partner->velocityBlendLink.has_value() ||
+        current->velocityBlendLink->pairId != state.pairId ||
+        partner->velocityBlendLink->pairId != state.pairId ||
+        !AnimationPathsShareAssociationKey(
+            *runtimeState,
+            *current,
+            *partner,
+            state.commonSceneKey)) {
+        state.matchingFrameAvailable = false;
+        state.captureMatchesCurrentFrame = false;
+        return;
+    }
+    const float currentPosition = std::clamp(
+        panel.scrubAmount,
+        0.0F,
+        1.0F);
+    const float partnerDuration =
+        invisible_places::camera::AnimationPathDurationSeconds(*partner);
+    const auto partnerPosition =
+        AnimationLoopCounterpartNormalizedPosition(
+            *current,
+            currentPosition,
+            current->velocityBlendLink->startOverlapSeconds,
+            current->velocityBlendLink->endOverlapSeconds,
+            partnerDuration);
+    state.matchingFrameAvailable = partnerPosition.has_value();
+    if (!partnerPosition.has_value()) {
+        state.captureMatchesCurrentFrame = false;
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const std::array<std::uint64_t, 2> liveMotionFingerprints{
+        AnimationPathMotionFingerprint(*current),
+        AnimationPathMotionFingerprint(*partner),
+    };
+    const bool observedMotionChanged =
+        state.observedMotionFingerprints != liveMotionFingerprints;
+    const bool observedFrameChanged =
+        !std::isfinite(state.observedCurrentNormalizedPosition) ||
+        !std::isfinite(state.observedPartnerNormalizedPosition) ||
+        std::abs(
+            state.observedCurrentNormalizedPosition -
+            currentPosition) > 1.0e-7F ||
+        std::abs(
+            state.observedPartnerNormalizedPosition -
+            partnerPosition.value()) > 1.0e-7F;
+    if (observedFrameChanged || observedMotionChanged) {
+        state.observedCurrentNormalizedPosition = currentPosition;
+        state.observedPartnerNormalizedPosition =
+            partnerPosition.value();
+        state.observedMotionFingerprints = liveMotionFingerprints;
+        state.lastPositionChangeAt = now;
+    }
+    const float currentFrameDelta = std::abs(
+        currentPosition - state.currentNormalizedPosition) *
+        static_cast<float>(std::max<std::uint32_t>(
+            current->durationFrames,
+            1U));
+    const float partnerFrameDelta = std::abs(
+        partnerPosition.value() - state.partnerNormalizedPosition) *
+        static_cast<float>(std::max<std::uint32_t>(
+            partner->durationFrames,
+            1U));
+    const bool playbackActive =
+        runtimeState->animationPlayback.active;
+    const float largestFrameDelta =
+        std::max(currentFrameDelta, partnerFrameDelta);
+    const bool motionChanged =
+        state.capturedMotionFingerprints != liveMotionFingerprints;
+    state.captureMatchesCurrentFrame =
+        !motionChanged &&
+        largestFrameDelta <= (playbackActive ? 8.0F : 0.75F);
+    if ((!motionChanged && largestFrameDelta < 0.5F) ||
+        job.worker.joinable()) {
+        return;
+    }
+    const auto sinceChange = now - state.lastPositionChangeAt;
+    const auto sinceRequest = now - state.lastAutomaticRequestAt;
+    const bool updateDue = playbackActive
+        ? sinceRequest >= std::chrono::milliseconds{200}
+        : sinceChange >= std::chrono::milliseconds{80} &&
+              sinceRequest >= std::chrono::milliseconds{80};
+    if (!updateDue) {
+        return;
+    }
+    state.lastAutomaticRequestAt = now;
+    QueueAnimationMatchingFrameGhostCapture(
+        runtimeState,
+        {
+            .filePaths = {
+                state.currentFilePath,
+                state.partnerFilePath,
+            },
+            .currentNormalizedPosition = currentPosition,
+            .partnerNormalizedPosition = partnerPosition.value(),
+            .aspectRatio = CurrentAspectRatio(viewport),
+            .automatic = true,
+        });
+}
+
+float DefaultAnimationLoopStartOverlapSeconds(
+    const AnimationPath& path) {
+    return path.keys.size() >= 2U
+               ? AnimationLoopKeyTimeSeconds(path, 1U)
+               : 0.0F;
+}
+
+float DefaultAnimationLoopEndOverlapSeconds(
+    const AnimationPath& path) {
+    if (path.keys.size() < 2U) {
+        return 0.0F;
+    }
+    return std::max(
+        0.0F,
+        invisible_places::camera::AnimationPathDurationSeconds(path) -
+            AnimationLoopKeyTimeSeconds(
+                path,
+                path.keys.size() - 2U));
+}
+
+bool AnimationLoopKeyIsEligible(
+    const AnimationPath& path,
+    std::size_t keyIndex,
+    float startOverlapSeconds,
+    float endOverlapSeconds,
+    float nearSeconds) {
+    const float duration =
+        invisible_places::camera::AnimationPathDurationSeconds(path);
+    const float keyTime = AnimationLoopKeyTimeSeconds(path, keyIndex);
+    const float minimumMargin = std::max(nearSeconds, 0.0F);
+    float startMargin = minimumMargin;
+    if (keyIndex > 0U) {
+        startMargin = std::max(
+            startMargin,
+            0.5F * std::max(
+                       0.0F,
+                       keyTime - AnimationLoopKeyTimeSeconds(
+                                     path,
+                                     keyIndex - 1U)));
+    }
+    float endMargin = minimumMargin;
+    if (keyIndex + 1U < path.keys.size()) {
+        endMargin = std::max(
+            endMargin,
+            0.5F * std::max(
+                       0.0F,
+                       AnimationLoopKeyTimeSeconds(
+                           path,
+                           keyIndex + 1U) -
+                           keyTime));
+    }
+    return keyTime <= startOverlapSeconds + startMargin ||
+           keyTime >= duration - endOverlapSeconds - endMargin;
+}
+
+void InitializeAnimationLoopTimelineState(
+    AnimationLoopTimelineState* state,
+    const std::filesystem::path& currentFilePath,
+    const std::filesystem::path& partnerFilePath,
+    const AnimationPath& current,
+    const AnimationPath& partner) {
+    if (state == nullptr) {
+        return;
+    }
+    const bool samePair =
+        NormalizePathKey(state->currentFilePath) ==
+            NormalizePathKey(currentFilePath) &&
+        NormalizePathKey(state->partnerFilePath) ==
+            NormalizePathKey(partnerFilePath);
+    if (samePair) {
+        return;
+    }
+    const auto scrubDragFilePath =
+        ImGui::IsMouseDown(ImGuiMouseButton_Left)
+            ? state->scrubDragFilePath
+            : std::nullopt;
+    *state = {};
+    state->scrubDragFilePath = scrubDragFilePath;
+    state->currentFilePath = currentFilePath;
+    state->partnerFilePath = partnerFilePath;
+    state->currentMotionFingerprint =
+        AnimationPathMotionFingerprint(current);
+    state->partnerMotionFingerprint =
+        AnimationPathMotionFingerprint(partner);
+    state->currentStartOverlapSeconds =
+        DefaultAnimationLoopStartOverlapSeconds(current);
+    state->currentEndOverlapSeconds =
+        DefaultAnimationLoopEndOverlapSeconds(current);
+
+    const bool appliedPair =
+        current.velocityBlendLink.has_value() &&
+        partner.velocityBlendLink.has_value() &&
+        current.velocityBlendLink->pairId ==
+            partner.velocityBlendLink->pairId;
+    if (appliedPair) {
+        const auto& smoothing = current.velocityBlendLink.value();
+        if (smoothing.startOverlapSeconds > 0.0F) {
+            state->currentStartOverlapSeconds =
+                smoothing.startOverlapSeconds;
+        }
+        if (smoothing.endOverlapSeconds > 0.0F) {
+            state->currentEndOverlapSeconds =
+                smoothing.endOverlapSeconds;
+        }
+        state->currentMovableKeyIds =
+            LoopMovableKeyIdsFromMetadata(smoothing);
+        state->partnerMovableKeyIds =
+            LoopMovableKeyIdsFromMetadata(
+                partner.velocityBlendLink.value());
+        state->horizontalBlend = smoothing.horizontalBlend;
+        state->panRight = smoothing.panRight;
+    } else {
+        const float partnerDuration =
+            invisible_places::camera::AnimationPathDurationSeconds(partner);
+        const float partnerStartOverlap = std::min(
+            state->currentEndOverlapSeconds,
+            partnerDuration);
+        const float partnerEndOverlap = std::min(
+            state->currentStartOverlapSeconds,
+            partnerDuration);
+        for (std::size_t keyIndex = 0U;
+             keyIndex < current.keys.size();
+             ++keyIndex) {
+            if (AnimationLoopKeyIsEligible(
+                    current,
+                    keyIndex,
+                    state->currentStartOverlapSeconds,
+                    state->currentEndOverlapSeconds,
+                    1.0e-5F)) {
+                state->currentMovableKeyIds.insert(
+                    current.keys[keyIndex].id);
+            }
+        }
+        for (std::size_t keyIndex = 0U;
+             keyIndex < partner.keys.size();
+             ++keyIndex) {
+            if (AnimationLoopKeyIsEligible(
+                    partner,
+                    keyIndex,
+                    partnerStartOverlap,
+                    partnerEndOverlap,
+                    1.0e-5F)) {
+                state->partnerMovableKeyIds.insert(
+                    partner.keys[keyIndex].id);
+            }
+        }
+    }
+    state->previewDirty = !appliedPair;
+}
+
+void SanitizeAnimationLoopMovableKeyIds(
+    const AnimationPath& path,
+    float startOverlapSeconds,
+    float endOverlapSeconds,
+    float nearSeconds,
+    std::unordered_set<std::string>* keyIds) {
+    if (keyIds == nullptr) {
+        return;
+    }
+    for (auto keyIt = keyIds->begin(); keyIt != keyIds->end();) {
+        const auto pathKeyIt = std::find_if(
+            path.keys.begin(),
+            path.keys.end(),
+            [&](const invisible_places::camera::AnimationPathKey& key) {
+                return key.id == *keyIt;
+            });
+        const bool eligible =
+            pathKeyIt != path.keys.end() &&
+            AnimationLoopKeyIsEligible(
+                path,
+                static_cast<std::size_t>(pathKeyIt - path.keys.begin()),
+                startOverlapSeconds,
+                endOverlapSeconds,
+                nearSeconds);
+        if (!eligible) {
+            keyIt = keyIds->erase(keyIt);
+        } else {
+            ++keyIt;
+        }
+    }
+}
+
+invisible_places::camera::AnimationLoopSmoothingOptions
+AnimationLoopTimelineOptions(
+    const AnimationLoopTimelineState& state,
+    const AnimationPath& partner,
+    float maxEndMoveFraction) {
+    const float partnerDuration =
+        invisible_places::camera::AnimationPathDurationSeconds(partner);
+    return {
+        .maxEndMoveFraction = maxEndMoveFraction,
+        .useExplicitKeySelection = true,
+        .firstMovableKeyIds =
+            SortedLoopMovableKeyIds(state.currentMovableKeyIds),
+        .secondMovableKeyIds =
+            SortedLoopMovableKeyIds(state.partnerMovableKeyIds),
+        .firstStartOverlapSeconds = state.currentStartOverlapSeconds,
+        .firstEndOverlapSeconds = state.currentEndOverlapSeconds,
+        // A end -> B start, and B end -> A start. The second timeline is
+        // therefore derived by equal elapsed seconds, not equal width or
+        // key count.
+        .secondStartOverlapSeconds = std::min(
+            state.currentEndOverlapSeconds,
+            partnerDuration),
+        .secondEndOverlapSeconds = std::min(
+            state.currentStartOverlapSeconds,
+            partnerDuration),
+        .horizontalBlend = state.horizontalBlend,
+        .panRight = state.panRight,
+    };
+}
+
+void OrientLoopSmoothingResultToCurrent(
+    bool currentIsCanonicalFirst,
+    invisible_places::camera::AnimationLoopSmoothingResult* result) {
+    if (result == nullptr || currentIsCanonicalFirst) {
+        return;
+    }
+    std::swap(
+        result->beforeSeamMismatch[0U],
+        result->beforeSeamMismatch[1U]);
+    std::swap(
+        result->afterSeamMismatch[0U],
+        result->afterSeamMismatch[1U]);
+    std::swap(
+        result->terminalSpeedRmsChange[0U],
+        result->terminalSpeedRmsChange[1U]);
+    std::swap(result->keyMovements[0U], result->keyMovements[1U]);
+    std::swap(
+        result->screenDisplacementSamples[0U],
+        result->screenDisplacementSamples[1U]);
+    std::swap(
+        result->maxScreenDisplacement[0U],
+        result->maxScreenDisplacement[1U]);
+}
+
+void RefreshAnimationLoopTimelinePreview(
+    PreviewRuntimeState* runtimeState,
+    std::size_t currentFileIndex,
+    std::size_t partnerFileIndex,
+    invisible_places::camera::AnimationLoopSmoothingOptions options) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    auto& panel = runtimeState->animationPanel;
+    auto& state = panel.loopTimeline;
+    state.previewDirty = false;
+    state.preview.reset();
+    state.previewError.clear();
+    // An in-flight preview from an earlier refresh must not outlive an
+    // error return: its late result would clear previewInProgress and mask
+    // the validation message with a stale preview.
+    const auto cancelInFlightPreviewJob = [&] {
+        auto& job = runtimeState->animationVelocityPreviewJob;
+        if (job.worker.joinable()) {
+            job.worker.request_stop();
+            job.worker = std::jthread{};
+        }
+        job.shared.reset();
+        state.previewInProgress = false;
+    };
+    const auto* current =
+        RegistryAnimationPath(*runtimeState, currentFileIndex);
+    const auto* partner =
+        RegistryAnimationPath(*runtimeState, partnerFileIndex);
+    if (current == nullptr || partner == nullptr) {
+        cancelInFlightPreviewJob();
+        state.previewError =
+            "Both animations must be loaded to assess the overlap.";
+        return;
+    }
+    const std::unordered_set<std::string> currentMovableKeyIds{
+        options.firstMovableKeyIds.begin(),
+        options.firstMovableKeyIds.end(),
+    };
+    const std::unordered_set<std::string> partnerMovableKeyIds{
+        options.secondMovableKeyIds.begin(),
+        options.secondMovableKeyIds.end(),
+    };
+    if (!ValidateLoopSmoothingMovableLinks(
+            *runtimeState,
+            currentFileIndex,
+            partnerFileIndex,
+            currentMovableKeyIds,
+            partnerMovableKeyIds,
+            &state.previewError)) {
+        cancelInFlightPreviewJob();
+        return;
+    }
+    options.maxOptimizationSweeps = 6U;
+    options.minimumStepFraction = 0.03F;
+    bool currentIsCanonicalFirst = true;
+    options = CanonicalLoopSmoothingOptions(
+        panel,
+        currentFileIndex,
+        partnerFileIndex,
+        std::move(options),
+        "loop_preview",
+        &currentIsCanonicalFirst);
+    auto& job = runtimeState->animationVelocityPreviewJob;
+    if (job.worker.joinable()) {
+        job.worker.request_stop();
+        job.worker = std::jthread{};
+    }
+    const auto generation = job.nextGeneration++;
+    job.activeGeneration = generation;
+    job.shared =
+        std::make_shared<AnimationVelocityPreviewJobShared>();
+    auto shared = job.shared;
+    const std::array<std::filesystem::path, 2> filePaths{
+        panel.availableFiles[currentFileIndex],
+        panel.availableFiles[partnerFileIndex],
+    };
+    const std::array<std::uint64_t, 2> fingerprints{
+        AnimationPathMotionFingerprint(*current),
+        AnimationPathMotionFingerprint(*partner),
+    };
+    auto currentSnapshot = *current;
+    auto partnerSnapshot = *partner;
+    state.previewInProgress = true;
+    job.worker = std::jthread(
+        [shared,
+         generation,
+         filePaths,
+         fingerprints,
+         currentSnapshot = std::move(currentSnapshot),
+         partnerSnapshot = std::move(partnerSnapshot),
+         options = std::move(options),
+         currentIsCanonicalFirst](std::stop_token stopToken) mutable {
+            AnimationVelocityPreviewJobResult completed{
+                .generation = generation,
+                .filePaths = filePaths,
+                .motionFingerprints = fingerprints,
+            };
+            try {
+                options.stopToken = stopToken;
+                completed.result = currentIsCanonicalFirst
+                    ? invisible_places::camera::
+                          SmoothAnimationLoopTransitions(
+                              &currentSnapshot,
+                              &partnerSnapshot,
+                              options)
+                    : invisible_places::camera::
+                          SmoothAnimationLoopTransitions(
+                              &partnerSnapshot,
+                              &currentSnapshot,
+                              options);
+                OrientLoopSmoothingResultToCurrent(
+                    currentIsCanonicalFirst,
+                    &completed.result);
+            } catch (const std::exception& error) {
+                completed.result.errorMessage =
+                    "Rough velocity assessment failed: " +
+                    std::string{error.what()};
+            }
+            std::scoped_lock lock{shared->mutex};
+            shared->result = std::move(completed);
+            shared->completed = true;
+        });
+}
+
+void PollAnimationVelocityPreviewJob(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    auto& job = runtimeState->animationVelocityPreviewJob;
+    if (job.shared == nullptr) {
+        return;
+    }
+    std::optional<AnimationVelocityPreviewJobResult> completed;
+    {
+        std::scoped_lock lock{job.shared->mutex};
+        if (!job.shared->completed) {
+            return;
+        }
+        completed = std::move(job.shared->result);
+    }
+    job.shared.reset();
+    if (job.worker.joinable()) {
+        job.worker = std::jthread{};
+    }
+    if (!completed.has_value() ||
+        completed->generation != job.activeGeneration) {
+        return;
+    }
+    auto& panel = runtimeState->animationPanel;
+    auto& state = panel.loopTimeline;
+    state.previewInProgress = false;
+    const auto currentIndex = FindAnimationRegistryIndex(
+        panel,
+        completed->filePaths[0U]);
+    const auto partnerIndex = FindAnimationRegistryIndex(
+        panel,
+        completed->filePaths[1U]);
+    const auto* current = currentIndex.has_value()
+                              ? RegistryAnimationPath(
+                                    *runtimeState,
+                                    currentIndex.value())
+                              : nullptr;
+    const auto* partner = partnerIndex.has_value()
+                              ? RegistryAnimationPath(
+                                    *runtimeState,
+                                    partnerIndex.value())
+                              : nullptr;
+    if (current == nullptr || partner == nullptr ||
+        AnimationPathMotionFingerprint(*current) !=
+            completed->motionFingerprints[0U] ||
+        AnimationPathMotionFingerprint(*partner) !=
+            completed->motionFingerprints[1U]) {
+        state.previewDirty = true;
+        state.preview.reset();
+        return;
+    }
+    if (!completed->result.succeeded &&
+        !completed->result.errorMessage.empty()) {
+        state.previewError = completed->result.errorMessage;
+    } else {
+        state.previewError.clear();
+    }
+    state.preview = std::move(completed->result);
+}
+
+bool DrawAnimationLoopTimelineRow(
+    const char* label,
+    const std::filesystem::path& filePath,
+    const AnimationPath& path,
+    float counterpartDurationSeconds,
+    int rowIndex,
+    AnimationLoopTimelineState* timelineState,
+    float startOverlapSeconds,
+    float endOverlapSeconds,
+    float nearSeconds,
+    bool boundsAreInteractive,
+    bool keysAreInteractive,
+    float displayedFrameNormalizedPosition,
+    bool displaysCurrentAnimation,
+    std::unordered_set<std::string>* movableKeyIds,
+    float* interactiveStartOverlapSeconds,
+    float* interactiveEndOverlapSeconds,
+    int* dragHandle,
+    const std::vector<
+        invisible_places::camera::AnimationLoopScreenDisplacementSample>*
+        displacementSamples,
+    float maxDisplacement,
+    const std::vector<
+        invisible_places::camera::AnimationLoopKeyMovement>* keyMovements) {
+    const float duration = std::max(
+        invisible_places::camera::AnimationPathDurationSeconds(path),
+        1.0e-4F);
+    const bool hasDisplayedFrame =
+        std::isfinite(displayedFrameNormalizedPosition);
+    const float clampedDisplayedFramePosition = std::clamp(
+        hasDisplayedFrame ? displayedFrameNormalizedPosition : 0.0F,
+        0.0F,
+        1.0F);
+    const auto displayedFrame = static_cast<std::uint32_t>(std::lround(
+        clampedDisplayedFramePosition *
+        static_cast<float>(path.durationFrames)));
+    if (hasDisplayedFrame) {
+        ImGui::Text(
+            "%s  %.2fs start / %.2fs end | %s frame %u/%u (%.2fs)",
+            label,
+            startOverlapSeconds,
+            endOverlapSeconds,
+            displaysCurrentAnimation ? "current" : "matching",
+            static_cast<unsigned>(displayedFrame),
+            static_cast<unsigned>(path.durationFrames),
+            clampedDisplayedFramePosition * duration);
+    } else {
+        ImGui::Text(
+            "%s  %.2fs start / %.2fs end | no matching blend frame",
+            label,
+            startOverlapSeconds,
+            endOverlapSeconds);
+    }
+    const float width = std::max(ImGui::GetContentRegionAvail().x, 180.0F);
+    constexpr float kRowHeight = 48.0F;
+    ImGui::InvisibleButton(
+        "##loop-key-timeline",
+        ImVec2{width, kRowHeight},
+        ImGuiButtonFlags_MouseButtonLeft);
+    const ImVec2 rowMin = ImGui::GetItemRectMin();
+    const ImVec2 rowMax = ImGui::GetItemRectMax();
+    const float x0 = rowMin.x + 7.0F;
+    const float x1 = rowMax.x - 7.0F;
+    const float timelineWidth = std::max(x1 - x0, 1.0F);
+    const ImVec2 mouse = ImGui::GetIO().MousePos;
+    const float trackY = rowMin.y + 16.0F;
+    const float graphBaseY = rowMax.y - 4.0F;
+    const float startBoundX =
+        x0 + timelineWidth *
+                 std::clamp(startOverlapSeconds / duration, 0.0F, 1.0F);
+    const float endBoundX =
+        x0 + timelineWidth *
+                 (1.0F -
+                  std::clamp(endOverlapSeconds / duration, 0.0F, 1.0F));
+    if (timelineState != nullptr && rowIndex >= 0 && rowIndex < 2) {
+        timelineState->rowTrackMinimum[static_cast<std::size_t>(rowIndex)] =
+            ImVec2{x0, trackY};
+        timelineState->rowTrackMaximum[static_cast<std::size_t>(rowIndex)] =
+            ImVec2{x1, trackY};
+        timelineState->rowTrackValid[static_cast<std::size_t>(rowIndex)] =
+            true;
+    }
+    auto* drawList = ImGui::GetWindowDrawList();
+    drawList->AddRectFilled(
+        ImVec2{x0, trackY - 9.0F},
+        ImVec2{startBoundX, trackY + 9.0F},
+        IM_COL32(80, 145, 220, 40));
+    drawList->AddRectFilled(
+        ImVec2{endBoundX, trackY - 9.0F},
+        ImVec2{x1, trackY + 9.0F},
+        IM_COL32(235, 145, 70, 40));
+    drawList->AddLine(
+        ImVec2{x0, trackY},
+        ImVec2{x1, trackY},
+        IM_COL32(150, 150, 150, 180),
+        1.5F);
+
+    if (displacementSamples != nullptr &&
+        displacementSamples->size() >= 2U &&
+        maxDisplacement > 1.0e-8F) {
+        std::vector<ImVec2> graphPoints;
+        graphPoints.reserve(displacementSamples->size());
+        for (const auto& sample : *displacementSamples) {
+            graphPoints.push_back({
+                x0 + timelineWidth *
+                         std::clamp(sample.normalizedPosition, 0.0F, 1.0F),
+                graphBaseY - 12.0F * std::clamp(
+                                           sample.screenDisplacement /
+                                               maxDisplacement,
+                                           0.0F,
+                                           1.0F),
+            });
+        }
+        drawList->AddPolyline(
+            graphPoints.data(),
+            static_cast<int>(graphPoints.size()),
+            IM_COL32(110, 220, 235, 210),
+            ImDrawFlags_None,
+            1.5F);
+    }
+
+    const bool scrubGestureOwnsPath =
+        timelineState != nullptr &&
+        timelineState->scrubDragFilePath.has_value() &&
+        NormalizePathKey(
+            timelineState->scrubDragFilePath.value()) ==
+            NormalizePathKey(filePath);
+    const float playheadPosition =
+        scrubGestureOwnsPath &&
+                ImGui::IsMouseDown(ImGuiMouseButton_Left)
+            ? std::clamp(
+                  (mouse.x - x0) / timelineWidth,
+                  0.0F,
+                  1.0F)
+            : clampedDisplayedFramePosition;
+    const float playheadX = x0 + timelineWidth * playheadPosition;
+    const ImU32 playheadColor = displaysCurrentAnimation
+                                    ? IM_COL32(245, 245, 250, 245)
+                                    : IM_COL32(205, 210, 220, 155);
+    if (hasDisplayedFrame || scrubGestureOwnsPath) {
+        drawList->AddLine(
+            ImVec2{playheadX, rowMin.y + 2.0F},
+            ImVec2{playheadX, rowMax.y - 2.0F},
+            playheadColor,
+            displaysCurrentAnimation ? 2.0F : 1.25F);
+        drawList->AddTriangleFilled(
+            ImVec2{playheadX - 4.0F, rowMin.y + 2.0F},
+            ImVec2{playheadX + 4.0F, rowMin.y + 2.0F},
+            ImVec2{playheadX, rowMin.y + 7.0F},
+            playheadColor);
+    }
+
+    std::optional<std::size_t> hoveredKeyIndex;
+    float hoveredKeyDistance = 9.0F;
+    for (std::size_t keyIndex = 0U;
+         keyIndex < path.keys.size();
+         ++keyIndex) {
+        const float normalized =
+            invisible_places::camera::AnimationPathKeyNormalizedPosition(
+                path,
+                keyIndex);
+        const float keyX = x0 + timelineWidth * normalized;
+        const bool enabled =
+            movableKeyIds != nullptr &&
+            movableKeyIds->contains(path.keys[keyIndex].id);
+        const bool eligible = enabled || AnimationLoopKeyIsEligible(
+                                              path,
+                                              keyIndex,
+                                              startOverlapSeconds,
+                                              endOverlapSeconds,
+                                              nearSeconds);
+        const bool strongDestination = timelineState != nullptr &&
+            timelineState->strongDestinationRow == rowIndex &&
+            timelineState->strongDestinationKeyId ==
+                path.keys[keyIndex].id;
+        const ImU32 color = strongDestination
+                                ? IM_COL32(70, 225, 245, 255)
+                            : enabled
+                                ? IM_COL32(88, 220, 150, 255)
+                            : eligible
+                                ? IM_COL32(245, 185, 80, 235)
+                                : IM_COL32(105, 105, 105, 180);
+        drawList->AddCircleFilled(
+            ImVec2{keyX, trackY},
+            enabled ? 6.0F : 4.5F,
+            color);
+        if (eligible && !enabled) {
+            drawList->AddCircle(
+                ImVec2{keyX, trackY},
+                6.0F,
+                IM_COL32(255, 220, 145, 210),
+                0,
+                1.0F);
+        }
+        const float distance = std::hypot(
+            mouse.x - keyX,
+            mouse.y - trackY);
+        if (ImGui::IsItemHovered() && distance < hoveredKeyDistance) {
+            hoveredKeyDistance = distance;
+            hoveredKeyIndex = keyIndex;
+        }
+    }
+
+    bool changed = false;
+    if (hoveredKeyIndex.has_value()) {
+        const std::size_t keyIndex = hoveredKeyIndex.value();
+        const auto& key = path.keys[keyIndex];
+        const bool enabled =
+            movableKeyIds != nullptr && movableKeyIds->contains(key.id);
+        const bool eligible = enabled || AnimationLoopKeyIsEligible(
+                                              path,
+                                              keyIndex,
+                                              startOverlapSeconds,
+                                              endOverlapSeconds,
+                                              nearSeconds);
+        float cameraMove = 0.0F;
+        float focusMove = 0.0F;
+        if (keyMovements != nullptr) {
+            const auto movementIt = std::find_if(
+                keyMovements->begin(),
+                keyMovements->end(),
+                [&](const auto& movement) {
+                    return movement.keyId == key.id;
+                });
+            if (movementIt != keyMovements->end()) {
+                cameraMove = movementIt->cameraMove;
+                focusMove = movementIt->focusMove;
+            }
+        }
+        ImGui::SetTooltip(
+            "Key %zu%s\n%s\nCamera %.4f, focus %.4f%s",
+            keyIndex + 1U,
+            key.sourceShotName.empty()
+                ? ""
+                : ("  " + key.sourceShotName).c_str(),
+            eligible
+                ? (enabled ? "Enabled for velocity movement" : "Eligible; velocity movement is off")
+                : "Locked: outside the overlap neighborhood",
+            cameraMove,
+            focusMove,
+            keysAreInteractive && eligible
+                ? "\nClick toggles velocity movement; double-click selects lower-frame alignment when the key is inside the overlap."
+                : "");
+        if (keysAreInteractive && eligible &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+            movableKeyIds != nullptr) {
+            if (timelineState != nullptr) {
+                timelineState->scrubDragFilePath.reset();
+            }
+            const bool doubleClicked =
+                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+            if (doubleClicked) {
+                // The first click of a double-click already toggled velocity.
+                // Toggle it back, then give the independent cyan selection to
+                // lower-frame geometry alignment.
+                if (enabled) {
+                    movableKeyIds->erase(key.id);
+                } else {
+                    movableKeyIds->insert(key.id);
+                }
+                if (timelineState != nullptr) {
+                    const float keyPosition = invisible_places::camera::
+                        AnimationPathKeyNormalizedPosition(path, keyIndex);
+                    const auto counterpart =
+                        AnimationLoopCounterpartNormalizedPosition(
+                            path,
+                            keyPosition,
+                            startOverlapSeconds,
+                            endOverlapSeconds,
+                            counterpartDurationSeconds);
+                    timelineState->strongDestinationRow =
+                        counterpart.has_value() ? rowIndex : -1;
+                    timelineState->strongDestinationKeyId =
+                        counterpart.has_value() ? key.id : std::string{};
+                    if (counterpart.has_value()) {
+                        timelineState
+                            ->strongCounterpartNormalizedPosition =
+                            counterpart.value();
+                    }
+                }
+            } else {
+                if (enabled) {
+                    movableKeyIds->erase(key.id);
+                } else {
+                    movableKeyIds->insert(key.id);
+                }
+            }
+            if (dragHandle != nullptr) {
+                *dragHandle = 0;
+            }
+            changed = true;
+        }
+    } else if (keysAreInteractive && ImGui::IsItemHovered() &&
+               ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        const float startHandleDistance =
+            std::abs(mouse.x - startBoundX);
+        const float endHandleDistance = std::abs(mouse.x - endBoundX);
+        const bool clickedBound = boundsAreInteractive &&
+            std::min(startHandleDistance, endHandleDistance) <= 12.0F;
+        if (!clickedBound && timelineState != nullptr) {
+            timelineState->scrubDragFilePath = filePath;
+            if (dragHandle != nullptr) {
+                *dragHandle = 0;
+            }
+        }
+    }
+
+    if (boundsAreInteractive && dragHandle != nullptr &&
+        interactiveStartOverlapSeconds != nullptr &&
+        interactiveEndOverlapSeconds != nullptr) {
+        drawList->AddLine(
+            ImVec2{startBoundX, trackY - 13.0F},
+            ImVec2{startBoundX, trackY + 13.0F},
+            IM_COL32(95, 175, 255, 245),
+            2.0F);
+        drawList->AddLine(
+            ImVec2{endBoundX, trackY - 13.0F},
+            ImVec2{endBoundX, trackY + 13.0F},
+            IM_COL32(255, 165, 85, 245),
+            2.0F);
+        if (ImGui::IsItemActivated() &&
+            !hoveredKeyIndex.has_value() &&
+            !ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            const float startDistance = std::abs(mouse.x - startBoundX);
+            const float endDistance = std::abs(mouse.x - endBoundX);
+            if (std::min(startDistance, endDistance) <= 12.0F) {
+                if (timelineState != nullptr) {
+                    timelineState->scrubDragFilePath.reset();
+                }
+                *dragHandle = startDistance <= endDistance ? 1 : 2;
+            } else {
+                *dragHandle = 0;
+            }
+        }
+        if (ImGui::IsItemActive() &&
+            ImGui::IsMouseDragging(ImGuiMouseButton_Left) &&
+            *dragHandle != 0) {
+            const float mouseTime = duration * std::clamp(
+                (mouse.x - x0) / timelineWidth,
+                0.0F,
+                1.0F);
+            if (*dragHandle == 1) {
+                const float updated = std::clamp(
+                    mouseTime,
+                    0.0F,
+                    duration - *interactiveEndOverlapSeconds);
+                changed = changed ||
+                          std::abs(
+                              updated -
+                              *interactiveStartOverlapSeconds) >
+                              1.0e-5F;
+                *interactiveStartOverlapSeconds = updated;
+            } else {
+                const float updated = std::clamp(
+                    duration - mouseTime,
+                    0.0F,
+                    duration - *interactiveStartOverlapSeconds);
+                changed = changed ||
+                          std::abs(
+                              updated -
+                              *interactiveEndOverlapSeconds) >
+                              1.0e-5F;
+                *interactiveEndOverlapSeconds = updated;
+            }
+        }
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            *dragHandle = 0;
+        }
+    }
+    if (keysAreInteractive && timelineState != nullptr &&
+        timelineState->scrubDragFilePath.has_value() &&
+        NormalizePathKey(
+            timelineState->scrubDragFilePath.value()) ==
+            NormalizePathKey(filePath) &&
+        ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        timelineState->requestedScrubFilePath = filePath;
+        timelineState->requestedScrubPosition = std::clamp(
+            (mouse.x - x0) / timelineWidth,
+            0.0F,
+            1.0F);
+    }
+    if (timelineState != nullptr &&
+        !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        timelineState->scrubDragFilePath.reset();
+    }
+    return changed;
+}
+
+bool LiveCameraMatchesAnimationFrame(
+    const PreviewRuntimeState& runtimeState,
+    const AnimationPath& path,
+    float normalizedPosition) {
+    const auto expected = invisible_places::camera::EvaluateAnimationPath(
+        path,
+        invisible_places::camera::AnimationPathDurationSeconds(path) *
+            std::clamp(normalizedPosition, 0.0F, 1.0F));
+    const auto live = runtimeState.camera.CaptureState();
+    const auto distance = [](const auto& left, const auto& right) {
+        const float x = left[0U] - right[0U];
+        const float y = left[1U] - right[1U];
+        const float z = left[2U] - right[2U];
+        return std::hypot(x, std::hypot(y, z));
+    };
+    const float scale = std::max(
+        1.0F,
+        std::max(
+            distance(expected.camera.position, expected.focusPoint),
+            distance(live.position, live.target)));
+    return distance(live.position, expected.camera.position) <=
+               2.0e-4F * scale &&
+           distance(live.target, expected.focusPoint) <=
+               2.0e-4F * scale &&
+           std::abs(live.fovDegrees - expected.camera.fovDegrees) <=
+               1.0e-3F;
+}
+
+std::uint32_t EffectiveAnimationKeyDurationFrames(
+    const AnimationPath& path) {
+    return std::max<std::uint32_t>(
+        path.durationFrames,
+        path.keys.size() > 1U
+            ? static_cast<std::uint32_t>(path.keys.size() - 1U)
+            : 1U);
+}
+
+invisible_places::camera::AnimationPathKey
+MakeAnimationKeyFromEvaluation(
+    const AnimationPath& path,
+    const invisible_places::camera::AnimationPathEvaluation& evaluation,
+    std::string sourceName) {
+    invisible_places::camera::AnimationPathKey key;
+    key.cameraPosition = evaluation.camera.position;
+    key.focusPoint = evaluation.focusPoint;
+    key.fovDegrees = evaluation.camera.fovDegrees;
+    key.nearPlane = evaluation.camera.nearPlane;
+    key.farPlane = evaluation.camera.farPlane;
+    key.sourceShotName = std::move(sourceName);
+    key.hasOrientation = std::any_of(
+        path.keys.begin(),
+        path.keys.end(),
+        [](const auto& existing) { return existing.hasOrientation; });
+    if (key.hasOrientation) {
+        key.orientation = evaluation.camera.orientation;
+    }
+    key.hasFocusDistance = std::any_of(
+        path.keys.begin(),
+        path.keys.end(),
+        [](const auto& existing) { return existing.hasFocusDistance; });
+    if (key.hasFocusDistance) {
+        key.focusDistance = evaluation.focusDistance;
+    }
+    key.hasApertureFStops = std::any_of(
+        path.keys.begin(),
+        path.keys.end(),
+        [](const auto& existing) {
+            return existing.hasApertureFStops;
+        });
+    if (key.hasApertureFStops) {
+        key.apertureFStops = evaluation.camera.apertureFStops;
+    }
+    return key;
+}
+
+struct LiveAnimationKeyFocus {
+    std::array<float, 3> point{0.0F, 0.0F, -1.0F};
+    float distance = 1.0F;
+    bool surfaceHit = false;
+};
+
+LiveAnimationKeyFocus ResolveLiveAnimationKeyFocus(
+    const PreviewRuntimeState& runtimeState,
+    const AnimationPath& path,
+    const invisible_places::camera::CameraState& camera) {
+    const glm::vec3 origin{
+        camera.position[0U],
+        camera.position[1U],
+        camera.position[2U]};
+    glm::vec3 direction =
+        invisible_places::camera::QuaternionFromCameraState(camera) *
+        glm::vec3{0.0F, 0.0F, -1.0F};
+    const auto finiteDirection = [](const glm::vec3& value) {
+        return std::isfinite(value.x) && std::isfinite(value.y) &&
+               std::isfinite(value.z) &&
+               glm::dot(value, value) > 1.0e-10F;
+    };
+    if (!finiteDirection(direction)) {
+        direction = glm::vec3{
+                        camera.target[0U],
+                        camera.target[1U],
+                        camera.target[2U]} -
+                    origin;
+    }
+    if (!finiteDirection(direction)) {
+        direction = {0.0F, 0.0F, -1.0F};
+    }
+    direction = glm::normalize(direction);
+
+    const auto hit = ProbeSurfaceDistanceAlongRay(
+        runtimeState,
+        {origin.x, origin.y, origin.z},
+        {direction.x, direction.y, direction.z});
+    float focusDistance = 0.0F;
+    bool usedSurfaceHit = false;
+    if (hit.has_value() && std::isfinite(hit.value()) &&
+        hit.value() > 1.0e-4F) {
+        focusDistance = hit.value();
+        usedSurfaceHit = true;
+    } else {
+        double totalDistance = 0.0;
+        std::size_t validKeyCount = 0U;
+        for (const auto& key : path.keys) {
+            const float distance = std::hypot(
+                key.focusPoint[0U] - key.cameraPosition[0U],
+                std::hypot(
+                    key.focusPoint[1U] - key.cameraPosition[1U],
+                    key.focusPoint[2U] - key.cameraPosition[2U]));
+            if (!std::isfinite(distance) || distance <= 1.0e-4F) {
+                continue;
+            }
+            totalDistance += distance;
+            ++validKeyCount;
+        }
+        focusDistance = validKeyCount > 0U
+            ? static_cast<float>(
+                  totalDistance / static_cast<double>(validKeyCount))
+            : std::max(camera.focusDistance, 1.0F);
+    }
+    const glm::vec3 focus = origin + direction * focusDistance;
+    return {
+        .point = {focus.x, focus.y, focus.z},
+        .distance = focusDistance,
+        .surfaceHit = usedSurfaceHit,
+    };
+}
+
+AnimationPath* MutableCurrentAnimationForKeyEditing(
+    PreviewRuntimeState* runtimeState,
+    std::optional<std::size_t>* registryIndex = nullptr) {
+    if (runtimeState == nullptr ||
+        !runtimeState->animationPanel.currentPath.has_value()) {
+        return nullptr;
+    }
+    auto& panel = runtimeState->animationPanel;
+    const auto currentIndex = panel.currentFilePath.empty()
+        ? std::nullopt
+        : FindAnimationRegistryIndex(
+              panel,
+              std::filesystem::path{panel.currentFilePath});
+    if (registryIndex != nullptr) {
+        *registryIndex = currentIndex;
+    }
+    if (!currentIndex.has_value()) {
+        panel.dirty = true;
+        return &panel.currentPath.value();
+    }
+    return MutableRegistryAnimationPath(
+        runtimeState,
+        currentIndex.value());
+}
+
+bool FinalizeAnimationKeyStructureEdit(
+    PreviewRuntimeState* runtimeState,
+    std::optional<std::size_t> registryIndex) {
+    if (runtimeState == nullptr ||
+        !runtimeState->animationPanel.currentPath.has_value()) {
+        return false;
+    }
+    auto& panel = runtimeState->animationPanel;
+    bool confirmedAlignmentDraft = false;
+    if (panel.velocityAlignmentDraft.has_value() &&
+        !panel.currentFilePath.empty()) {
+        const auto& draft = panel.velocityAlignmentDraft.value();
+        const std::filesystem::path currentPath{panel.currentFilePath};
+        if (PathsLexicallyEqual(currentPath, draft.firstFilePath) ||
+            PathsLexicallyEqual(currentPath, draft.secondFilePath)) {
+            panel.velocityAlignmentDraft.reset();
+            confirmedAlignmentDraft = true;
+        }
+    }
+    panel.pendingVelocityLinkSettingsUpdate.reset();
+    panel.requestedLowerFrameAlignment.reset();
+    if (runtimeState->animationVelocityPreviewJob.worker.joinable()) {
+        runtimeState->animationVelocityPreviewJob.worker.request_stop();
+    }
+    if (runtimeState->animationStrongAlignmentJob.worker.joinable()) {
+        runtimeState->animationStrongAlignmentJob.worker.request_stop();
+    }
+    panel.loopTimeline.previewDirty = true;
+    panel.loopTimeline.previewInProgress = false;
+    panel.loopTimeline.preview.reset();
+    panel.loopTimeline.previewError.clear();
+    panel.loopTimeline.strongDestinationRow = -1;
+    panel.loopTimeline.strongDestinationKeyId.clear();
+    panel.loopSmoothingDiagnostics.reset();
+    panel.strongAlignmentDiagnostics.reset();
+    panel.preparedPathCache = {};
+    panel.motionStatsCache = {};
+    panel.perceivedFlowCache = {};
+    panel.dirty = true;
+    if (panel.currentPath->velocityBlendLink.has_value()) {
+        panel.projectVelocityLinksDirty = true;
+    }
+    if (registryIndex.has_value()) {
+        MarkRegistryAnimationDirty(
+            runtimeState,
+            registryIndex.value());
+    }
+    SyncCurrentAnimationToRegistry(runtimeState);
+    runtimeState->animationPlayback.active = false;
+    runtimeState->cameraPlayback.active = false;
+    ApplyAnimationScrub(runtimeState);
+    return confirmedAlignmentDraft;
+}
+
+void SwitchSavedEditedAnimationVariant(
+    PreviewRuntimeState* runtimeState,
+    std::size_t registryIndex) {
+    if (runtimeState == nullptr ||
+        !runtimeState->animationPanel.currentPath.has_value() ||
+        registryIndex >=
+            runtimeState->animationPanel.availableFiles.size()) {
+        return;
+    }
+    auto& panel = runtimeState->animationPanel;
+    const float elapsedSeconds =
+        invisible_places::camera::AnimationPathDurationSeconds(
+            panel.currentPath.value()) *
+        std::clamp(panel.scrubAmount, 0.0F, 1.0F);
+    std::string selectedKeyId;
+    if (panel.selectedKeyIndex.has_value() &&
+        panel.selectedKeyIndex.value() < panel.currentPath->keys.size()) {
+        selectedKeyId =
+            panel.currentPath->keys[panel.selectedKeyIndex.value()].id;
+    }
+    const bool loadEdited = !panel.currentPathUsesEdited;
+    if (!LoadAnimationPathVariant(
+            runtimeState,
+            panel.availableFiles[registryIndex],
+            loadEdited) ||
+        !panel.currentPath.has_value()) {
+        return;
+    }
+    panel.scrubAmount = std::clamp(
+        elapsedSeconds /
+            std::max(
+                invisible_places::camera::AnimationPathDurationSeconds(
+                    panel.currentPath.value()),
+                1.0e-6F),
+        0.0F,
+        1.0F);
+    if (!selectedKeyId.empty()) {
+        const auto selected = std::find_if(
+            panel.currentPath->keys.begin(),
+            panel.currentPath->keys.end(),
+            [&](const auto& key) { return key.id == selectedKeyId; });
+        panel.selectedKeyIndex =
+            selected != panel.currentPath->keys.end()
+                ? std::optional<std::size_t>{
+                      static_cast<std::size_t>(std::distance(
+                          panel.currentPath->keys.begin(),
+                          selected))}
+                : std::nullopt;
+    }
+    ApplyAnimationScrub(runtimeState);
 }
 
 void DrawAnimationSection(
@@ -43718,6 +47769,66 @@ void DrawAnimationSection(
     }
 
     auto& panel = runtimeState->animationPanel;
+    PollAnimationVelocityPreviewJob(runtimeState);
+    PollAnimationStrongAlignmentJob(runtimeState);
+    ApplyPendingAnimationVelocityLinkSettings(runtimeState);
+    if (panel.requestedLowerFrameAlignment.has_value()) {
+        const auto request =
+            panel.requestedLowerFrameAlignment.value();
+        panel.requestedLowerFrameAlignment.reset();
+        const auto currentIndex = FindAnimationRegistryIndex(
+            panel,
+            request.filePaths[0U]);
+        const auto partnerIndex = FindAnimationRegistryIndex(
+            panel,
+            request.filePaths[1U]);
+        if (currentIndex.has_value() && partnerIndex.has_value()) {
+            ApplyAnimationLowerFrameAlignment(
+                runtimeState,
+                currentIndex.value(),
+                partnerIndex.value(),
+                request.destinationRow,
+                request.destinationKeyId,
+                request.counterpartNormalizedPosition,
+                request.aspectRatio);
+        }
+    }
+    if (panel.requestedVelocityUnlink.has_value()) {
+        const auto requested = panel.requestedVelocityUnlink.value();
+        panel.requestedVelocityUnlink.reset();
+        const auto firstIndex = FindAnimationRegistryIndex(panel, requested[0U]);
+        const auto secondIndex = FindAnimationRegistryIndex(panel, requested[1U]);
+        if (firstIndex.has_value() && secondIndex.has_value()) {
+            UnlinkAnimationVelocityPair(
+                runtimeState,
+                firstIndex.value(),
+                secondIndex.value());
+        }
+    }
+    if (panel.loopTimeline.requestedScrubFilePath.has_value()) {
+        const auto requestedPath =
+            panel.loopTimeline.requestedScrubFilePath.value();
+        const float requestedPosition =
+            panel.loopTimeline.requestedScrubPosition;
+        panel.loopTimeline.requestedScrubFilePath.reset();
+        const auto requestedIndex = FindAnimationRegistryIndex(
+            panel,
+            requestedPath);
+        if (requestedIndex.has_value()) {
+            const bool useEdited = RegistryAnimationHasEditedVersion(
+                panel,
+                requestedIndex.value());
+            LoadAnimationPathVariant(
+                runtimeState,
+                requestedPath,
+                useEdited);
+            panel.scrubAmount = std::clamp(
+                requestedPosition,
+                0.0F,
+                1.0F);
+            ApplyAnimationScrub(runtimeState);
+        }
+    }
     const bool renderSetupLocksAnimationSwitching =
         runtimeState->activeRenderSetupOverride.has_value();
     if (renderSetupLocksAnimationSwitching) {
@@ -43812,11 +47923,27 @@ void DrawAnimationSection(
                     panel.focusFileRename = false;
                 }
             } else {
+                const auto linkState = AnimationVelocityLinkState(
+                    *runtimeState,
+                    index);
                 const auto displayName =
-                    AnimationDisplayNameFromPath(panel.availableFiles[index]);
+                    AnimationDisplayNameFromPath(panel.availableFiles[index]) +
+                    AnimationVelocityLinkSuffix(linkState);
+                if (linkState != AnimationVelocityLinkDisplayState::None) {
+                    const ImVec4 colour =
+                        linkState == AnimationVelocityLinkDisplayState::Linked
+                            ? ImVec4{0.35F, 0.80F, 0.45F, 1.0F}
+                        : linkState == AnimationVelocityLinkDisplayState::Dirty
+                            ? ImVec4{0.95F, 0.68F, 0.25F, 1.0F}
+                            : ImVec4{0.95F, 0.35F, 0.35F, 1.0F};
+                    ImGui::PushStyleColor(ImGuiCol_Text, colour);
+                }
                 if (ImGui::Selectable(displayName.c_str(), selectedSaved)) {
                     panel.selectedFileIndex = index;
                     panel.selectedFileUsesEdited = false;
+                }
+                if (linkState != AnimationVelocityLinkDisplayState::None) {
+                    ImGui::PopStyleColor();
                 }
                 if (!renderSetupLocksAnimationSwitching &&
                     !RegistryAnimationHasEditedVersion(panel, index) &&
@@ -43834,15 +47961,30 @@ void DrawAnimationSection(
                     panel.selectedFileIndex.has_value() &&
                     panel.selectedFileIndex.value() == index &&
                     panel.selectedFileUsesEdited;
+                const auto linkState = AnimationVelocityLinkState(
+                    *runtimeState,
+                    index);
                 const auto editedDisplayName =
                     AnimationDisplayNameFromPath(panel.availableFiles[index]) +
-                    "_Edited";
+                    "_Edited" + AnimationVelocityLinkSuffix(linkState);
                 ImGui::PushID("edited");
+                if (linkState != AnimationVelocityLinkDisplayState::None) {
+                    const ImVec4 colour =
+                        linkState == AnimationVelocityLinkDisplayState::Linked
+                            ? ImVec4{0.35F, 0.80F, 0.45F, 1.0F}
+                        : linkState == AnimationVelocityLinkDisplayState::Dirty
+                            ? ImVec4{0.95F, 0.68F, 0.25F, 1.0F}
+                            : ImVec4{0.95F, 0.35F, 0.35F, 1.0F};
+                    ImGui::PushStyleColor(ImGuiCol_Text, colour);
+                }
                 if (ImGui::Selectable(
                         editedDisplayName.c_str(),
                         selectedEdited)) {
                     panel.selectedFileIndex = index;
                     panel.selectedFileUsesEdited = true;
+                }
+                if (linkState != AnimationVelocityLinkDisplayState::None) {
+                    ImGui::PopStyleColor();
                 }
                 if (selectedEdited) {
                     ImGui::SetItemDefaultFocus();
@@ -43879,6 +48021,20 @@ void DrawAnimationSection(
             DiscardAnimationEdits(runtimeState, selectedAnimationIndex);
         }
         ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!panel.currentPath.has_value());
+        if (ImGui::Button("Save As...")) {
+            RequestSaveChangesDialog(
+                runtimeState,
+                SaveChangesRequest::AnimationAs);
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(
+                ImGuiHoveredFlags_DelayNormal |
+                ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip(
+                "Save the currently loaded animation under a new name and switch to that new file. The source file is not overwritten.");
+        }
         ImGui::SameLine();
         ImGui::BeginDisabled(selectedHasEdits);
         if (ImGui::Button("Remove From Project")) {
@@ -43919,13 +48075,86 @@ void DrawAnimationSection(
         return;
     }
 
-    auto& animationPath = panel.currentPath.value();
     const auto currentVersionIndex =
         panel.currentFilePath.empty()
             ? std::nullopt
             : FindAnimationRegistryIndex(
                   panel,
                   std::filesystem::path{panel.currentFilePath});
+    if (currentVersionIndex.has_value() &&
+        RegistryAnimationHasEditedVersion(
+            panel,
+            currentVersionIndex.value()) &&
+        panel.availableFileLoadedPaths[currentVersionIndex.value()]
+            .has_value()) {
+        const auto* opposite = panel.currentPathUsesEdited
+                                   ? &panel.availableFileLoadedPaths[
+                                          currentVersionIndex.value()]
+                                          .value()
+                                   : &panel.availableFileEditedPaths[
+                                          currentVersionIndex.value()]
+                                          .value();
+        const bool cameraMatches =
+            panel.savedEditedComparisonHoldActive ||
+            LiveCameraMatchesAnimationFrame(
+                *runtimeState,
+                panel.currentPath.value(),
+                panel.scrubAmount);
+        ImGui::BeginDisabled(
+            renderSetupLocksAnimationSwitching || !cameraMatches);
+        ImGui::PushID("saved-edited-compare");
+        ImGui::Button(
+            panel.currentPathUsesEdited
+                ? "Hold: Saved"
+                : "Hold: _Edited");
+        const bool doubleClicked =
+            ImGui::IsItemHovered() &&
+            ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+        const bool held = ImGui::IsItemActive() &&
+                          ImGui::IsMouseDown(ImGuiMouseButton_Left);
+        const bool released = ImGui::IsItemDeactivated();
+        if (doubleClicked) {
+            panel.savedEditedComparisonHoldActive = false;
+            SwitchSavedEditedAnimationVariant(
+                runtimeState,
+                currentVersionIndex.value());
+            ImGui::PopID();
+            ImGui::EndDisabled();
+            return;
+        }
+        if (held) {
+            panel.savedEditedComparisonHoldActive = true;
+            const float elapsedSeconds =
+                invisible_places::camera::AnimationPathDurationSeconds(
+                    panel.currentPath.value()) *
+                std::clamp(panel.scrubAmount, 0.0F, 1.0F);
+            ApplyAnimationEvaluation(
+                runtimeState,
+                *opposite,
+                elapsedSeconds /
+                    std::max(
+                        invisible_places::camera::AnimationPathDurationSeconds(
+                            *opposite),
+                        1.0e-6F),
+                runtimeState->animationPlayback.active ||
+                    panel.previewDepthOfField);
+        } else if (released &&
+                   panel.savedEditedComparisonHoldActive) {
+            panel.savedEditedComparisonHoldActive = false;
+            ApplyAnimationScrub(runtimeState);
+        }
+        ImGui::PopID();
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(
+                ImGuiHoveredFlags_DelayNormal |
+                ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip(
+                "Hold to view the opposite version at the same elapsed "
+                "seconds; release to return. Double-click makes it active. "
+                "Re-scrub if manual viewport movement disables comparison.");
+        }
+    }
+    auto& animationPath = panel.currentPath.value();
     const bool currentIsSavedComparison =
         currentVersionIndex.has_value() &&
         !panel.currentPathUsesEdited &&
@@ -43939,6 +48168,7 @@ void DrawAnimationSection(
     }
 
     if (currentIsSavedComparison) {
+        bool comparisonActionTaken = false;
         if (BeginPanelSection("Current Path")) {
             ImGui::Text(
                 "File: %s",
@@ -43961,8 +48191,10 @@ void DrawAnimationSection(
             ImGui::TextWrapped(
                 "This saved version is read-only while _Edited exists. "
                 "Load _Edited to continue authoring, or discard edits to "
-                "return to the saved version.");
+                "return to the saved version. Detailed values and graphs "
+                "remain visible below for comparison.");
             if (ImGui::Button("Load _Edited")) {
+                comparisonActionTaken = true;
                 LoadAnimationPathVariant(
                     runtimeState,
                     panel.availableFiles[currentVersionIndex.value()],
@@ -43970,23 +48202,29 @@ void DrawAnimationSection(
             }
             ImGui::SameLine();
             if (ImGui::Button("Save _Edited")) {
+                comparisonActionTaken = true;
                 RequestSaveChangesDialog(
                     runtimeState,
                     SaveChangesRequest::Animation);
             }
             ImGui::SameLine();
             if (ImGui::Button("Discard Edits")) {
+                comparisonActionTaken = true;
                 DiscardAnimationEdits(
                     runtimeState,
                     currentVersionIndex.value());
             }
             EndPanelSection();
         }
-        return;
+        if (comparisonActionTaken) {
+            return;
+        }
     }
 
-    std::optional<AnimationPath> pendingLinkedPath;
-    bool pendingLinkedPathIsNew = false;
+    ImGui::BeginDisabled(currentIsSavedComparison);
+    struct SavedComparisonDisabledScope {
+        ~SavedComparisonDisabledScope() { ImGui::EndDisabled(); }
+    } savedComparisonDisabledScope;
 
     if (BeginPanelSection("Current Path")) {
     ImGui::Text("File: %s", panel.currentFilePath.empty() ? "unsaved" : panel.currentFilePath.c_str());
@@ -44127,21 +48365,163 @@ void DrawAnimationSection(
     {
         const auto& perceivedFlow =
             CachedAnimationPathPerceivedFlow(&panel, animationPath);
+        const float flowAspectRatio = std::clamp(
+            static_cast<float>(std::max<std::uint32_t>(
+                1U,
+                runtimeState->renderSettings.width)) /
+                static_cast<float>(std::max<std::uint32_t>(
+                    1U,
+                    runtimeState->renderSettings.height)),
+            0.25F,
+            8.0F);
+        const auto frameCrossingRate = [flowAspectRatio](
+                                           const auto& sample) {
+            // Diagnostic X/Y values are measured in screen heights per
+            // second. One complete frame is `aspectRatio` units wide and
+            // one unit high, so this is the reciprocal of the centre-line
+            // chord crossing time for the current motion direction.
+            return std::max(
+                std::abs(sample.middleScreenVelocity[0U]) /
+                    flowAspectRatio,
+                std::abs(sample.middleScreenVelocity[1U]));
+        };
         float peakScreenSpeed = 0.0F;
+        float peakCenterScreenSpeed = 0.0F;
+        float peakFrameCrossingRate = 0.0F;
+        float peakStablePanMotion = 0.0F;
         for (const auto& sample : perceivedFlow) {
             peakScreenSpeed = std::max(peakScreenSpeed, sample.screenSpeed);
+            const float centerScreenSpeed = std::hypot(
+                sample.middleScreenVelocity[0U],
+                sample.middleScreenVelocity[1U]);
+            peakCenterScreenSpeed = std::max(
+                peakCenterScreenSpeed,
+                centerScreenSpeed);
+            peakFrameCrossingRate = std::max(
+                peakFrameCrossingRate,
+                frameCrossingRate(sample));
+            const float verticalVariation = std::max(
+                std::hypot(
+                    sample.topScreenVelocity[0U] -
+                        sample.middleScreenVelocity[0U],
+                    sample.topScreenVelocity[1U] -
+                        sample.middleScreenVelocity[1U]),
+                std::hypot(
+                    sample.bottomScreenVelocity[0U] -
+                        sample.middleScreenVelocity[0U],
+                    sample.bottomScreenVelocity[1U] -
+                        sample.middleScreenVelocity[1U]));
+            peakStablePanMotion = std::max(
+                peakStablePanMotion,
+                centerScreenSpeed + verticalVariation +
+                    0.35F * std::abs(glm::radians(
+                        sample.imageRotationDegreesPerSecond)));
         }
+        const float flowDurationSeconds = std::max(
+            preparedAnimationPath.durationSeconds,
+            0.0F);
+        float perceivedTravel = 0.0F;
+        float squaredSpeedIntegral = 0.0F;
+        float frameCrossingIntegral = 0.0F;
+        if (perceivedFlow.size() == 1U &&
+            flowDurationSeconds > 0.0F) {
+            perceivedTravel = perceivedFlow.front().screenSpeed *
+                flowDurationSeconds;
+            squaredSpeedIntegral =
+                perceivedFlow.front().screenSpeed *
+                perceivedFlow.front().screenSpeed *
+                flowDurationSeconds;
+            frameCrossingIntegral =
+                frameCrossingRate(perceivedFlow.front()) *
+                flowDurationSeconds;
+        } else {
+            for (std::size_t sampleIndex = 1U;
+                 sampleIndex < perceivedFlow.size();
+                 ++sampleIndex) {
+                const auto& previous = perceivedFlow[sampleIndex - 1U];
+                const auto& current = perceivedFlow[sampleIndex];
+                const float intervalSeconds = flowDurationSeconds *
+                    std::max(
+                        current.normalizedPosition -
+                            previous.normalizedPosition,
+                        0.0F);
+                perceivedTravel += 0.5F * intervalSeconds *
+                    (previous.screenSpeed + current.screenSpeed);
+                squaredSpeedIntegral += 0.5F * intervalSeconds *
+                    (previous.screenSpeed * previous.screenSpeed +
+                     current.screenSpeed * current.screenSpeed);
+                frameCrossingIntegral += 0.5F * intervalSeconds *
+                    (frameCrossingRate(previous) +
+                     frameCrossingRate(current));
+            }
+        }
+        const float averageScreenSpeed = flowDurationSeconds > 1.0e-6F
+            ? perceivedTravel / flowDurationSeconds
+            : 0.0F;
+        const float averageFrameCrossingRate =
+            flowDurationSeconds > 1.0e-6F
+                ? frameCrossingIntegral / flowDurationSeconds
+                : 0.0F;
+        const float screenSpeedDeviation =
+            flowDurationSeconds > 1.0e-6F
+                ? std::sqrt(std::max(
+                      squaredSpeedIntegral / flowDurationSeconds -
+                          averageScreenSpeed * averageScreenSpeed,
+                      0.0F))
+                : 0.0F;
+        const float screenSpeedVariationPercent =
+            averageScreenSpeed > 1.0e-6F
+                ? 100.0F * screenSpeedDeviation / averageScreenSpeed
+                : 0.0F;
         const float scrubPosition = std::clamp(panel.scrubAmount, 0.0F, 1.0F);
+        const std::size_t scrubSampleIndex = perceivedFlow.empty()
+                                                  ? 0U
+                                                  : static_cast<std::size_t>(
+                                                        std::lround(
+                                                            scrubPosition *
+                                                            static_cast<float>(
+                                                                perceivedFlow.size() - 1U)));
         float atPositionScreenSpeed = 0.0F;
+        float atPositionCenterScreenSpeed = 0.0F;
+        float atPositionFrameCrossingRate = 0.0F;
         if (!perceivedFlow.empty()) {
-            const auto sampleIndex = static_cast<std::size_t>(std::lround(
-                scrubPosition *
-                static_cast<float>(perceivedFlow.size() - 1U)));
-            atPositionScreenSpeed = perceivedFlow[sampleIndex].screenSpeed;
+            const auto& sample = perceivedFlow[scrubSampleIndex];
+            atPositionScreenSpeed = sample.screenSpeed;
+            atPositionCenterScreenSpeed = std::hypot(
+                sample.middleScreenVelocity[0U],
+                sample.middleScreenVelocity[1U]);
+            atPositionFrameCrossingRate = frameCrossingRate(sample);
         }
+        const auto crossingTimeLabel = [](float rate) {
+            return rate > 1.0e-6F && std::isfinite(rate)
+                ? FormatFixed(1.0F / rate, 2) + " s"
+                : std::string{"--"};
+        };
+        const auto atPositionCrossingTime =
+            crossingTimeLabel(atPositionFrameCrossingRate);
+        const auto averageCrossingTime =
+            crossingTimeLabel(averageFrameCrossingRate);
+        const auto fastestCrossingTime =
+            crossingTimeLabel(peakFrameCrossingRate);
+        const auto exportFramesPerSecond = std::max<std::uint32_t>(
+            1U,
+            runtimeState->renderSettings.framesPerSecond);
+        const auto exportHeight = std::max<std::uint32_t>(
+            1U,
+            runtimeState->renderSettings.height);
+        const float currentScreenHeightsPerFrame =
+            atPositionCenterScreenSpeed /
+            static_cast<float>(exportFramesPerSecond);
+        const float currentPixelsPerFrame =
+            currentScreenHeightsPerFrame *
+            static_cast<float>(exportHeight);
+        const float peakPixelsPerFrame = peakCenterScreenSpeed /
+            static_cast<float>(exportFramesPerSecond) *
+            static_cast<float>(exportHeight);
         ImGui::TextDisabled(
-            "Perceived speed: %.2f screens/s (peak %.2f)",
+            "Perceived: now %.5f | average %.5f | peak %.5f screen-heights/s",
             atPositionScreenSpeed,
+            averageScreenSpeed,
             peakScreenSpeed);
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
             ImGui::SetTooltip(
@@ -44150,83 +48530,322 @@ void DrawAnimationSection(
                 "distance, in screen heights per second. Use it to judge "
                 "how fast the scene appears to move along the pan.");
         }
+        ImGui::TextDisabled(
+            "Full-frame crossing: now %s | typical %s | fastest %s",
+            atPositionCrossingTime.c_str(),
+            averageCrossingTime.c_str(),
+            fastestCrossingTime.c_str());
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Estimated from centre-screen X/Y flow and the frame aspect ratio. "
+                "For a horizontal pan this is the time to travel the complete image width; "
+                "for a vertical move it is the complete image height.");
+        }
+        ImGui::TextDisabled(
+            "Animation travel: %.5f screen-heights in %.3f s | speed variation %.2f%%",
+            perceivedTravel,
+            flowDurationSeconds,
+            screenSpeedVariationPercent);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Travel is cumulative perceived motion, not net displacement. "
+                "Variation is the time-weighted standard deviation divided by the average; "
+                "lower values indicate more even perceived speed.");
+        }
+        ImGui::TextDisabled(
+            "%u fps / %up: %.6f screen-heights/frame | %.3f px/frame now (peak %.3f)",
+            exportFramesPerSecond,
+            exportHeight,
+            currentScreenHeightsPerFrame,
+            currentPixelsPerFrame,
+            peakPixelsPerFrame);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Centre-screen displacement per exported frame at the current output "
+                "frame rate and height. This is useful for judging motion sampling and judder.");
+        }
 
-        const ImVec2 plotSize{
-            std::max(24.0F, ImGui::GetContentRegionAvail().x),
-            56.0F};
-        ImGui::InvisibleButton(
-            "##PerceivedSpeedPlot",
-            plotSize,
-            ImGuiButtonFlags_MouseButtonLeft);
-        const ImVec2 plotMin = ImGui::GetItemRectMin();
-        const ImVec2 plotMax = ImGui::GetItemRectMax();
-        const float plotWidth = std::max(1.0F, plotMax.x - plotMin.x);
-        const float plotHeight = std::max(1.0F, plotMax.y - plotMin.y);
+        const std::array<const char*, 4> rowNames{
+            "Magnitude",
+            "X velocity",
+            "Y velocity",
+            "Rotation",
+        };
+        const std::array<ImU32, 4> rowColours{
+            IM_COL32(235, 205, 86, 255),
+            IM_COL32(84, 178, 255, 255),
+            IM_COL32(95, 220, 156, 255),
+            IM_COL32(226, 110, 220, 255),
+        };
+        std::array<std::vector<float>, 4> rowValues;
+        for (auto& values : rowValues) {
+            values.reserve(perceivedFlow.size());
+        }
+        for (const auto& sample : perceivedFlow) {
+            rowValues[0U].push_back(sample.screenSpeed);
+            rowValues[1U].push_back(sample.middleScreenVelocity[0U]);
+            rowValues[2U].push_back(sample.middleScreenVelocity[1U]);
+            rowValues[3U].push_back(
+                sample.imageRotationDegreesPerSecond);
+        }
         auto* drawList = ImGui::GetWindowDrawList();
-        drawList->AddRectFilled(
-            plotMin,
-            plotMax,
-            ImGui::GetColorU32(ImGuiCol_FrameBg),
-            2.0F);
-        if (perceivedFlow.size() >= 2U && peakScreenSpeed > 1.0e-6F) {
-            const ImU32 curveColour =
-                ImGui::GetColorU32(ImGuiCol_SliderGrabActive);
+        for (std::size_t rowIndex = 0U;
+             rowIndex < rowValues.size();
+             ++rowIndex) {
+            float rowMinimum = rowIndex == 0U ? 0.0F : 0.0F;
+            float rowMaximum = 0.0F;
+            if (!rowValues[rowIndex].empty()) {
+                const auto [minimumIt, maximumIt] = std::minmax_element(
+                    rowValues[rowIndex].begin(),
+                    rowValues[rowIndex].end());
+                rowMinimum = rowIndex == 0U
+                                 ? 0.0F
+                                 : std::min(0.0F, *minimumIt);
+                rowMaximum = std::max(0.0F, *maximumIt);
+            }
+            if (rowMaximum - rowMinimum < 1.0e-5F) {
+                const float centre = 0.5F * (rowMaximum + rowMinimum);
+                rowMinimum = centre - 0.5F;
+                rowMaximum = centre + 0.5F;
+                if (rowIndex == 0U) {
+                    rowMinimum = 0.0F;
+                    rowMaximum = 1.0F;
+                }
+            }
+            ImGui::PushID(static_cast<int>(rowIndex));
+            ImGui::TextColored(
+                ImGui::ColorConvertU32ToFloat4(rowColours[rowIndex]),
+                rowIndex == 3U ? "%s  %.3f" : "%s  %.5f",
+                rowNames[rowIndex],
+                rowValues[rowIndex].empty()
+                    ? 0.0F
+                    : rowValues[rowIndex][scrubSampleIndex]);
+            const ImVec2 plotSize{
+                std::max(24.0F, ImGui::GetContentRegionAvail().x),
+                44.0F};
+            ImGui::InvisibleButton(
+                "##motion-row",
+                plotSize,
+                ImGuiButtonFlags_MouseButtonLeft);
+            const ImVec2 plotMin = ImGui::GetItemRectMin();
+            const ImVec2 plotMax = ImGui::GetItemRectMax();
+            const float plotWidth =
+                std::max(1.0F, plotMax.x - plotMin.x);
+            const float plotHeight =
+                std::max(1.0F, plotMax.y - plotMin.y);
+            const auto yForValue = [&](float value) {
+                return plotMax.y - 3.0F -
+                       (plotHeight - 6.0F) *
+                           std::clamp(
+                               (value - rowMinimum) /
+                                   (rowMaximum - rowMinimum),
+                               0.0F,
+                               1.0F);
+            };
+            drawList->AddRectFilled(
+                plotMin,
+                plotMax,
+                ImGui::GetColorU32(ImGuiCol_FrameBg),
+                2.0F);
+            if (rowMinimum < 0.0F && rowMaximum > 0.0F) {
+                const float zeroY = yForValue(0.0F);
+                drawList->AddLine(
+                    ImVec2{plotMin.x, zeroY},
+                    ImVec2{plotMax.x, zeroY},
+                    IM_COL32(180, 180, 180, 70));
+            }
             ImVec2 previousPoint{};
-            for (std::size_t index = 0; index < perceivedFlow.size();
-                 ++index) {
-                const auto& sample = perceivedFlow[index];
+            for (std::size_t sampleIndex = 0U;
+                 sampleIndex < perceivedFlow.size();
+                 ++sampleIndex) {
                 const ImVec2 point{
-                    plotMin.x + plotWidth * sample.normalizedPosition,
-                    plotMax.y -
-                        plotHeight *
-                            std::clamp(
-                                sample.screenSpeed / peakScreenSpeed,
-                                0.0F,
-                                1.0F) *
-                            0.92F -
-                        2.0F,
+                    plotMin.x + plotWidth *
+                                    perceivedFlow[sampleIndex]
+                                        .normalizedPosition,
+                    yForValue(rowValues[rowIndex][sampleIndex]),
                 };
-                if (index > 0U) {
+                if (sampleIndex > 0U) {
                     drawList->AddLine(
                         previousPoint,
                         point,
-                        curveColour,
+                        rowColours[rowIndex],
                         1.5F);
                 }
                 previousPoint = point;
             }
-        }
-        if (ImGui::IsItemActive() &&
-            ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-            panel.scrubAmount = std::clamp(
-                (ImGui::GetIO().MousePos.x - plotMin.x) / plotWidth,
-                0.0F,
-                1.0F);
-            ApplyAnimationScrub(runtimeState);
-        }
-        const float playheadX = plotMin.x + plotWidth * scrubPosition;
-        drawList->AddLine(
-            ImVec2{playheadX, plotMin.y + 1.0F},
-            ImVec2{playheadX, plotMax.y - 1.0F},
-            ImGui::GetColorU32(ImGuiCol_Text),
-            1.0F);
-        drawList->AddRect(
-            plotMin,
-            plotMax,
-            ImGui::GetColorU32(ImGuiCol_Border),
-            2.0F);
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
-            ImGui::SetTooltip(
-                "Estimated perceived scene speed over the animation. Click "
-                "or drag to scrub.");
+            const float playheadX =
+                plotMin.x + plotWidth * scrubPosition;
+            if (!perceivedFlow.empty() &&
+                (rowIndex == 1U || rowIndex == 2U)) {
+                const auto& sample = perceivedFlow[scrubSampleIndex];
+                const std::size_t component = rowIndex - 1U;
+                const float top =
+                    sample.topScreenVelocity[component];
+                const float middle =
+                    sample.middleScreenVelocity[component];
+                const float bottom =
+                    sample.bottomScreenVelocity[component];
+                drawList->AddLine(
+                    ImVec2{playheadX, yForValue(top)},
+                    ImVec2{playheadX, yForValue(bottom)},
+                    rowColours[rowIndex],
+                    3.0F);
+                drawList->AddCircleFilled(
+                    ImVec2{playheadX, yForValue(middle)},
+                    3.0F,
+                    IM_COL32(255, 255, 255, 245));
+            } else {
+                drawList->AddLine(
+                    ImVec2{playheadX, plotMin.y + 1.0F},
+                    ImVec2{playheadX, plotMax.y - 1.0F},
+                    ImGui::GetColorU32(ImGuiCol_Text),
+                    1.0F);
+            }
+            drawList->AddText(
+                ImVec2{plotMin.x + 3.0F, plotMin.y + 1.0F},
+                rowColours[rowIndex],
+                FormatFixed(rowMaximum, rowIndex == 3U ? 2 : 5).c_str());
+            drawList->AddText(
+                ImVec2{plotMin.x + 3.0F, plotMax.y - 14.0F},
+                rowColours[rowIndex],
+                FormatFixed(rowMinimum, rowIndex == 3U ? 2 : 5).c_str());
+            drawList->AddRect(
+                plotMin,
+                plotMax,
+                ImGui::GetColorU32(ImGuiCol_Border),
+                2.0F);
+            if (ImGui::IsItemActive() &&
+                ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                panel.scrubAmount = std::clamp(
+                    (ImGui::GetIO().MousePos.x - plotMin.x) /
+                        plotWidth,
+                    0.0F,
+                    1.0F);
+                ApplyAnimationScrub(runtimeState);
+            }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+                ImGui::SetTooltip(
+                    "Independently autoscaled %s. Click or drag to scrub.%s",
+                    rowNames[rowIndex],
+                    rowIndex == 1U || rowIndex == 2U
+                        ? " The whisker shows top/middle/bottom screen flow."
+                        : "");
+            }
+            ImGui::PopID();
         }
 
+        using SpeedMode = invisible_places::camera::
+            AnimationSpeedEqualizationMode;
+        constexpr std::array<SpeedMode, 3> speedModes{
+            SpeedMode::PerceivedMotion,
+            SpeedMode::CenterScreenPan,
+            SpeedMode::StabilizedPan,
+        };
+        constexpr std::array<const char*, 3> speedModeNames{
+            "Perceived Motion (current)",
+            "Centre-Screen Pan",
+            "Stabilized Pan",
+        };
+        constexpr std::array<const char*, 3> speedModeDescriptions{
+            "Uses the established view-angle plus sideways-camera-motion/focus-distance estimate. Best for mixed orbit, tilt, dolly, and pan shots; it preserves the previous Equalize behavior.",
+            "Equalizes projected motion at the centre of the focus plane. Best when the viewer follows a central subject or central rock edge and edge parallax should not dominate timing.",
+            "Prioritizes centre motion, then gives extra time to off-axis drift, roll, and motion variation across a 3x3 focus-plane grid. Best for a primarily horizontal pan with small framing corrections.",
+        };
+        const auto selectedModeIt = std::find(
+            speedModes.begin(),
+            speedModes.end(),
+            panel.speedEqualizationMode);
+        std::size_t selectedModeIndex = selectedModeIt == speedModes.end()
+            ? 0U
+            : static_cast<std::size_t>(
+                  selectedModeIt - speedModes.begin());
+        ImGui::SetNextItemWidth(260.0F);
+        if (ImGui::BeginCombo(
+                "Speed Method",
+                speedModeNames[selectedModeIndex])) {
+            for (std::size_t modeIndex = 0U;
+                 modeIndex < speedModes.size();
+                 ++modeIndex) {
+                const bool selected = modeIndex == selectedModeIndex;
+                if (ImGui::Selectable(
+                        speedModeNames[modeIndex],
+                        selected)) {
+                    panel.speedEqualizationMode =
+                        speedModes[modeIndex];
+                    selectedModeIndex = modeIndex;
+                }
+                if (ImGui::IsItemHovered(
+                        ImGuiHoveredFlags_DelayNormal)) {
+                    ImGui::SetTooltip(
+                        "%s",
+                        speedModeDescriptions[modeIndex]);
+                }
+                if (selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("?##speed-equalization-help")) {
+            ImGui::OpenPopup("Speed Equalization Help");
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Compare the timing metrics and their limitations.");
+        }
+        ImGui::SetNextWindowSizeConstraints(
+            ImVec2{460.0F, 0.0F},
+            ImVec2{620.0F, FLT_MAX});
+        if (ImGui::BeginPopup("Speed Equalization Help")) {
+            ImGui::TextUnformatted("Equalization methods");
+            ImGui::Separator();
+            for (std::size_t modeIndex = 0U;
+                 modeIndex < speedModes.size();
+                 ++modeIndex) {
+                ImGui::TextColored(
+                    ImVec4{0.35F, 0.70F, 0.95F, 1.0F},
+                    "%s",
+                    speedModeNames[modeIndex]);
+                ImGui::TextWrapped(
+                    "%s",
+                    speedModeDescriptions[modeIndex]);
+                ImGui::Spacing();
+            }
+            ImGui::Separator();
+            ImGui::TextWrapped(
+                "All methods change only Segment Frames and preserve the total duration and every authored key pose. Because spline knots use those times, the interpolated path between keys can shift slightly.");
+            ImGui::TextWrapped(
+                "Parallax note: these are fast camera/focus-plane estimates. They do not sample point-cloud depth, scalar fields, or renderer pixels, so real near/far parallax can still make parts of the image move at different speeds.");
+            ImGui::TextWrapped(
+                "Cinematography note: constant angular motion and gentle starts/stops help a pan, but frame rate and shutter motion blur still determine whether the exported image judders. This command does not change export or shutter settings.");
+            ImGui::EndPopup();
+        }
+        ImGui::PushStyleColor(
+            ImGuiCol_Text,
+            ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped(
+            "%s",
+            speedModeDescriptions[selectedModeIndex]);
+        ImGui::PopStyleColor();
+
+        const float selectedMotionPeak =
+            panel.speedEqualizationMode == SpeedMode::PerceivedMotion
+                ? peakScreenSpeed
+            : panel.speedEqualizationMode == SpeedMode::CenterScreenPan
+                ? peakCenterScreenSpeed
+                : peakStablePanMotion;
         const bool canEqualize =
-            animationPath.keys.size() >= 2U && peakScreenSpeed > 1.0e-6F;
+            animationPath.keys.size() >= 2U &&
+            selectedMotionPeak > 1.0e-6F;
         ImGui::BeginDisabled(!canEqualize);
         if (ImGui::Button("Equalize Perceived Speed")) {
             const auto segmentFrames = invisible_places::camera::
-                ComputeConstantPerceivedSpeedSegmentFrames(animationPath);
+                ComputeEqualizedAnimationSegmentFrames(
+                    animationPath,
+                    {
+                        .mode = panel.speedEqualizationMode,
+                    });
             if (segmentFrames.size() + 1U == animationPath.keys.size()) {
                 for (std::size_t segmentIndex = 0;
                      segmentIndex < segmentFrames.size();
@@ -44241,7 +48860,9 @@ void DrawAnimationSection(
                 }
                 runtimeState->statusMessage =
                     "Retimed " + std::to_string(segmentFrames.size()) +
-                    " segments for constant perceived speed. Fine-tune "
+                    " segments using " +
+                    speedModeNames[selectedModeIndex] +
+                    ". Fine-tune "
                     "each key's Segment Frames in the Keys section.";
                 runtimeState->errorMessage.clear();
             }
@@ -44251,179 +48872,14 @@ void DrawAnimationSection(
                 ImGuiHoveredFlags_DelayNormal |
                 ImGuiHoveredFlags_AllowWhenDisabled)) {
             ImGui::SetTooltip(
-                "Redistributes the animation's total frames between keys so "
-                "the pan reads at one constant perceived speed. The total "
+                "%s Redistributes the animation's total frames between keys. The total "
                 "duration is unchanged and the result is ordinary per-key "
                 "segment frames, editable in the Keys section. Knot "
-                "respacing can subtly reshape the camera spline.");
+                "respacing can subtly reshape the camera spline.",
+                speedModeDescriptions[selectedModeIndex]);
         }
 
-        if (animationPath.linkedLoop.has_value()) {
-            const auto& linkedMetadata = animationPath.linkedLoop.value();
-            ImGui::SeparatorText("Linked Animation");
-            ImGui::TextWrapped(
-                "%s + %s",
-                linkedMetadata.firstFileName.c_str(),
-                linkedMetadata.secondFileName.c_str());
-            ImGui::Checkbox(
-                "Preview Source Overlap",
-                &panel.showLinkedLoopOverlap);
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
-                ImGui::SetTooltip(
-                    "Draws both source splines and paired samples across the "
-                    "complete A-to-B and B-to-A overlap sections at high "
-                    "transparency.");
-            }
-
-            const auto firstSourceIndex =
-                FindAnimationRegistryIndexByFileName(
-                    panel,
-                    linkedMetadata.firstFileName);
-            const auto secondSourceIndex =
-                FindAnimationRegistryIndexByFileName(
-                    panel,
-                    linkedMetadata.secondFileName);
-            const auto* firstSource = firstSourceIndex.has_value()
-                                          ? RegistryAnimationPath(
-                                                *runtimeState,
-                                                firstSourceIndex.value())
-                                          : nullptr;
-            const auto* secondSource = secondSourceIndex.has_value()
-                                           ? RegistryAnimationPath(
-                                                 *runtimeState,
-                                                 secondSourceIndex.value())
-                                           : nullptr;
-            if (firstSource == nullptr || secondSource == nullptr) {
-                ImGui::TextColored(
-                    ImVec4{0.95F, 0.55F, 0.22F, 1.0F},
-                    "A linked source is missing from the project. The compiled animation remains playable.");
-            } else {
-                DrawLinkedLoopLiveCameraControls(runtimeState);
-                int requestedPaddingFrames =
-                    panel.linkedLoopPaddingFrames;
-                ImGui::BeginDisabled(renderSetupLocksAnimationSwitching);
-                if (ImGui::InputInt(
-                        "Padding Frames",
-                        &requestedPaddingFrames)) {
-                    panel.linkedLoopPaddingFrames =
-                        invisible_places::camera::
-                            ClampLinkedLoopPaddingFrames(
-                                *firstSource,
-                                *secondSource,
-                                requestedPaddingFrames);
-                }
-                ImGui::EndDisabled();
-                if (ImGui::IsItemHovered(
-                        ImGuiHoveredFlags_DelayNormal |
-                        ImGuiHoveredFlags_AllowWhenDisabled)) {
-                    ImGui::SetTooltip(
-                        "Padding is measured from the outgoing penultimate "
-                        "key to the incoming first key at both joins. Zero "
-                        "blends the complete terminal edge. Positive values "
-                        "delay the incoming key; a hold begins only after the "
-                        "terminal edge is exhausted. Negative values begin "
-                        "the blend earlier.");
-                }
-
-                const std::size_t startKeyIndex =
-                    ResolveLinkedLoopStartKeyIndex(
-                        *firstSource,
-                        panel.linkedLoopStartKeyId.empty()
-                            ? linkedMetadata.firstStartKeyId
-                            : panel.linkedLoopStartKeyId,
-                        linkedMetadata.firstStartPosition);
-                if (panel.linkedLoopStartKeyId.empty() &&
-                    startKeyIndex < firstSource->keys.size()) {
-                    panel.linkedLoopStartKeyId =
-                        firstSource->keys[startKeyIndex].id;
-                }
-                const auto& startKey =
-                    firstSource->keys[startKeyIndex];
-                const float startPosition = invisible_places::camera::
-                    AnimationPathKeyNormalizedPosition(
-                        *firstSource,
-                        startKeyIndex);
-                const std::string startLabel =
-                    "Key " + std::to_string(startKeyIndex + 1U) +
-                    "  (" + FormatFixed(startPosition, 3) + ")";
-                ImGui::BeginDisabled(renderSetupLocksAnimationSwitching);
-                if (ImGui::BeginCombo(
-                        "Loop Start Key",
-                        startLabel.c_str())) {
-                    for (std::size_t keyIndex = 0U;
-                         keyIndex < firstSource->keys.size();
-                         ++keyIndex) {
-                        const float position = invisible_places::camera::
-                            AnimationPathKeyNormalizedPosition(
-                                *firstSource,
-                                keyIndex);
-                        const std::string label =
-                            "Key " + std::to_string(keyIndex + 1U) +
-                            "  (" + FormatFixed(position, 3) + ")";
-                        const bool selected = keyIndex == startKeyIndex;
-                        if (ImGui::Selectable(
-                                label.c_str(),
-                                selected)) {
-                            panel.linkedLoopStartKeyId =
-                                firstSource->keys[keyIndex].id;
-                        }
-                        if (selected) {
-                            ImGui::SetItemDefaultFocus();
-                        }
-                    }
-                    ImGui::EndCombo();
-                }
-                ImGui::EndDisabled();
-                DrawLinkedLoopTimelinePreview(
-                    *firstSource,
-                    *secondSource,
-                    static_cast<std::int32_t>(
-                        panel.linkedLoopPaddingFrames),
-                    startPosition);
-
-                ImGui::BeginDisabled(renderSetupLocksAnimationSwitching);
-                if (ImGui::Button("Rebuild Linked Animation")) {
-                    std::string buildError;
-                    auto rebuilt = invisible_places::camera::
-                        BuildLinkedLoopAnimation(
-                            *firstSource,
-                            *secondSource,
-                            {.name = animationPath.name,
-                             .firstFileName =
-                                 panel.availableFiles[
-                                     firstSourceIndex.value()]
-                                     .filename()
-                                     .string(),
-                             .secondFileName =
-                                 panel.availableFiles[
-                                     secondSourceIndex.value()]
-                                     .filename()
-                                     .string(),
-                             .firstStartKeyIndex =
-                                 ResolveLinkedLoopStartKeyIndex(
-                                     *firstSource,
-                                     panel.linkedLoopStartKeyId,
-                                     startPosition),
-                             .paddingFrames =
-                                 static_cast<std::int32_t>(
-                                     panel.linkedLoopPaddingFrames)},
-                            &buildError);
-                    if (rebuilt.has_value()) {
-                        PreserveLinkedAnimationOwnedSettings(
-                            animationPath,
-                            &rebuilt.value());
-                        pendingLinkedPath = std::move(rebuilt.value());
-                        pendingLinkedPathIsNew = false;
-                    } else {
-                        runtimeState->errorMessage = std::move(buildError);
-                        runtimeState->statusMessage.clear();
-                    }
-                }
-                ImGui::EndDisabled();
-                ImGui::TextDisabled(
-                    "Rebuild refreshes the compiled frames from the current saved/_Edited source versions.");
-            }
-        } else {
+        {
         const auto currentLoopFileIndex =
             panel.currentFilePath.empty()
                 ? std::nullopt
@@ -44439,27 +48895,13 @@ void DrawAnimationSection(
                 panel.loopSmoothingPartnerPath);
         };
         auto loopPartnerIndex = resolveLoopPartnerIndex();
-        if (animationPath.loopTransitionSmoothing.has_value()) {
-            const auto& smoothing =
-                animationPath.loopTransitionSmoothing.value();
-            for (std::size_t fileIndex = 0U;
-                 fileIndex < panel.availableFiles.size();
-                 ++fileIndex) {
-                if (currentLoopFileIndex.has_value() &&
-                    fileIndex == currentLoopFileIndex.value()) {
-                    continue;
-                }
-                const auto* candidate =
-                    RegistryAnimationPath(*runtimeState, fileIndex);
-                if (candidate != nullptr &&
-                    candidate->loopTransitionSmoothing.has_value() &&
-                    candidate->loopTransitionSmoothing->pairId ==
-                        smoothing.pairId) {
-                    panel.loopSmoothingPartnerPath =
-                        panel.availableFiles[fileIndex];
-                    loopPartnerIndex = fileIndex;
-                    break;
-                }
+        if (animationPath.velocityBlendLink.has_value()) {
+            loopPartnerIndex = FindAnimationRegistryIndexByFileName(
+                panel,
+                animationPath.velocityBlendLink->partnerFileName);
+            if (loopPartnerIndex.has_value()) {
+                panel.loopSmoothingPartnerPath =
+                    panel.availableFiles[loopPartnerIndex.value()];
             }
         }
 
@@ -44471,7 +48913,7 @@ void DrawAnimationSection(
                 loopPartnerIndex.value());
         }
         ImGui::BeginDisabled(renderSetupLocksAnimationSwitching);
-        if (ImGui::BeginCombo("Loop Partner", loopPartnerLabel.c_str())) {
+        if (ImGui::BeginCombo("Blend Partner", loopPartnerLabel.c_str())) {
             for (std::size_t fileIndex = 0U;
                  fileIndex < panel.availableFiles.size();
                  ++fileIndex) {
@@ -44514,226 +48956,808 @@ void DrawAnimationSection(
                       loopPartnerIndex.value())
                 : nullptr;
 
-        ImGui::SeparatorText("Linked Animation");
-        ImGui::Checkbox(
-            "Preview Source Overlap",
-            &panel.showLinkedLoopOverlap);
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
-            ImGui::SetTooltip(
-                "Draws the partner spline and paired samples across the "
-                "complete A-to-B and B-to-A overlap sections at high "
-                "transparency.");
-        }
-        if (loopPartner == nullptr) {
-            ImGui::TextDisabled(
-                "Choose a Loop Partner to preview or create a linked loop.");
-        } else {
-            int requestedPaddingFrames =
-                panel.linkedLoopPaddingFrames;
-            ImGui::BeginDisabled(renderSetupLocksAnimationSwitching);
-            if (ImGui::InputInt(
-                    "Padding Frames",
-                    &requestedPaddingFrames)) {
-                panel.linkedLoopPaddingFrames =
-                    invisible_places::camera::
-                        ClampLinkedLoopPaddingFrames(
-                            animationPath,
-                            *loopPartner,
-                            requestedPaddingFrames);
-            }
-            ImGui::EndDisabled();
-            if (ImGui::IsItemHovered(
-                    ImGuiHoveredFlags_DelayNormal |
-                    ImGuiHoveredFlags_AllowWhenDisabled)) {
-                ImGui::SetTooltip(
-                    "Padding is measured from the outgoing penultimate "
-                    "key to the incoming first key at both joins. Zero "
-                    "blends the complete terminal edge. Positive values "
-                    "delay the incoming key; a hold begins only after the "
-                    "terminal edge is exhausted. Negative values begin "
-                    "the blend earlier.");
-            }
 
-            std::size_t linkedStartKeyIndex =
-                ResolveLinkedLoopStartKeyIndex(
-                    animationPath,
-                    panel.linkedLoopStartKeyId,
-                    0.5F);
-            if (linkedStartKeyIndex < animationPath.keys.size() &&
-                (panel.linkedLoopStartKeyId.empty() ||
-                 animationPath.keys[linkedStartKeyIndex].id !=
-                     panel.linkedLoopStartKeyId)) {
-                panel.linkedLoopStartKeyId =
-                    animationPath.keys[linkedStartKeyIndex].id;
-            }
-            const float linkedStartPosition =
-                invisible_places::camera::
-                    AnimationPathKeyNormalizedPosition(
-                        animationPath,
-                        linkedStartKeyIndex);
-            const std::string linkedStartLabel =
-                "Key " + std::to_string(linkedStartKeyIndex + 1U) +
-                "  (" + FormatFixed(linkedStartPosition, 3) + ")";
-            ImGui::BeginDisabled(renderSetupLocksAnimationSwitching);
-            if (ImGui::BeginCombo(
-                    "Loop Start Key",
-                    linkedStartLabel.c_str())) {
-                for (std::size_t keyIndex = 0U;
-                     keyIndex < animationPath.keys.size();
-                     ++keyIndex) {
-                    const float position = invisible_places::camera::
-                        AnimationPathKeyNormalizedPosition(
-                            animationPath,
-                            keyIndex);
-                    std::string label =
-                        "Key " + std::to_string(keyIndex + 1U) +
-                        "  (" + FormatFixed(position, 3) + ")";
-                    if (!animationPath.keys[keyIndex]
-                             .sourceShotName.empty()) {
-                        label += "  " + animationPath.keys[keyIndex]
-                                              .sourceShotName;
-                    }
-                    const bool selected =
-                        keyIndex == linkedStartKeyIndex;
-                    if (ImGui::Selectable(
-                            label.c_str(),
-                            selected)) {
-                        panel.linkedLoopStartKeyId =
-                            animationPath.keys[keyIndex].id;
-                        linkedStartKeyIndex = keyIndex;
-                    }
-                    if (selected) {
-                        ImGui::SetItemDefaultFocus();
-                    }
-                }
-                ImGui::EndCombo();
-            }
-            ImGui::EndDisabled();
-            DrawLinkedLoopTimelinePreview(
-                animationPath,
-                *loopPartner,
-                static_cast<std::int32_t>(
-                    panel.linkedLoopPaddingFrames),
-                invisible_places::camera::
-                    AnimationPathKeyNormalizedPosition(
-                        animationPath,
-                        ResolveLinkedLoopStartKeyIndex(
-                            animationPath,
-                            panel.linkedLoopStartKeyId,
-                            linkedStartPosition)));
-
-            const bool canCreateLinked =
-                !renderSetupLocksAnimationSwitching &&
-                currentLoopFileIndex.has_value() &&
-                loopPartnerIndex.has_value() &&
-                animationPath.keys.size() >= 3U &&
-                loopPartner->keys.size() >= 3U;
-            ImGui::BeginDisabled(!canCreateLinked);
-            if (ImGui::Button("Create Linked Animation")) {
-                std::string buildError;
-                auto linked = invisible_places::camera::
-                    BuildLinkedLoopAnimation(
-                        animationPath,
-                        *loopPartner,
-                        {.name = animationPath.name + " + " +
-                                 loopPartner->name + " Linked",
-                         .firstFileName =
-                             panel.availableFiles[
-                                 currentLoopFileIndex.value()]
-                                 .filename()
-                                 .string(),
-                         .secondFileName =
-                             panel.availableFiles[
-                                 loopPartnerIndex.value()]
-                                 .filename()
-                                 .string(),
-                         .firstStartKeyIndex =
-                             ResolveLinkedLoopStartKeyIndex(
-                                 animationPath,
-                                 panel.linkedLoopStartKeyId,
-                                 linkedStartPosition),
-                         .paddingFrames =
-                             static_cast<std::int32_t>(
-                                 panel.linkedLoopPaddingFrames)},
-                        &buildError);
-                if (linked.has_value()) {
-                    pendingLinkedPath = std::move(linked.value());
-                    pendingLinkedPathIsNew = true;
-                } else {
-                    runtimeState->errorMessage =
-                        std::move(buildError);
-                    runtimeState->statusMessage.clear();
-                }
-            }
-            ImGui::EndDisabled();
-            if (ImGui::IsItemHovered(
-                    ImGuiHoveredFlags_DelayNormal |
-                    ImGuiHoveredFlags_AllowWhenDisabled)) {
-                ImGui::SetTooltip(
-                    "Creates an unsaved, renderable animation beginning at "
-                    "the selected key in A, continuing through B, then "
-                    "wrapping through A to that same key. Each source needs "
-                    "at least three keys so its complete terminal edge is "
-                    "defined.");
-            }
-        }
-
+        const auto* loopCurrent =
+            currentLoopFileIndex.has_value()
+                ? (currentIsSavedComparison
+                       ? &animationPath
+                       : RegistryAnimationPath(
+                             *runtimeState,
+                             currentLoopFileIndex.value()))
+                : nullptr;
         const bool matchingAppliedPair =
-            loopPartner != nullptr &&
-            animationPath.loopTransitionSmoothing.has_value() &&
-            loopPartner->loopTransitionSmoothing.has_value() &&
-            animationPath.loopTransitionSmoothing->pairId ==
-                loopPartner->loopTransitionSmoothing->pairId;
-        ImGui::BeginDisabled(
-            renderSetupLocksAnimationSwitching || matchingAppliedPair);
-        ImGui::SliderFloat(
+            loopCurrent != nullptr && loopPartner != nullptr &&
+            loopCurrent->velocityBlendLink.has_value() &&
+            loopPartner->velocityBlendLink.has_value() &&
+            loopCurrent->velocityBlendLink->pairId ==
+                loopPartner->velocityBlendLink->pairId;
+
+        invisible_places::camera::AnimationLoopSmoothingOptions
+            loopTimelineOptions;
+        bool velocityLinkSettingsChanged = false;
+        if (loopCurrent != nullptr && loopPartner != nullptr &&
+            currentLoopFileIndex.has_value() &&
+            loopPartnerIndex.has_value()) {
+            auto& timeline = panel.loopTimeline;
+            const bool timelinePairChanged =
+                NormalizePathKey(timeline.currentFilePath) !=
+                    NormalizePathKey(
+                        panel.availableFiles[
+                            currentLoopFileIndex.value()]) ||
+                NormalizePathKey(timeline.partnerFilePath) !=
+                    NormalizePathKey(
+                        panel.availableFiles[
+                            loopPartnerIndex.value()]);
+            InitializeAnimationLoopTimelineState(
+                &timeline,
+                panel.availableFiles[currentLoopFileIndex.value()],
+                panel.availableFiles[loopPartnerIndex.value()],
+                *loopCurrent,
+                *loopPartner);
+            if (timelinePairChanged && matchingAppliedPair) {
+                panel.loopSmoothingMaxEndMovePercent = 100.0F *
+                    loopCurrent->velocityBlendLink->maxEndMoveFraction;
+                panel.strongAlignmentMaxMovePercent = 100.0F *
+                    loopCurrent->velocityBlendLink
+                        ->strongAlignMaxMoveFraction;
+            }
+            const auto currentFingerprint =
+                AnimationPathMotionFingerprint(*loopCurrent);
+            const auto partnerFingerprint =
+                AnimationPathMotionFingerprint(*loopPartner);
+            if (timeline.currentMotionFingerprint != currentFingerprint ||
+                timeline.partnerMotionFingerprint != partnerFingerprint) {
+                timeline.currentMotionFingerprint = currentFingerprint;
+                timeline.partnerMotionFingerprint = partnerFingerprint;
+                timeline.previewDirty = true;
+            }
+            const float currentDuration = std::max(
+                invisible_places::camera::AnimationPathDurationSeconds(
+                    *loopCurrent),
+                0.0F);
+            timeline.currentStartOverlapSeconds = std::clamp(
+                timeline.currentStartOverlapSeconds,
+                0.0F,
+                std::max(
+                    0.0F,
+                    currentDuration -
+                        timeline.currentEndOverlapSeconds));
+            timeline.currentEndOverlapSeconds = std::clamp(
+                timeline.currentEndOverlapSeconds,
+                0.0F,
+                std::max(
+                    0.0F,
+                    currentDuration -
+                        timeline.currentStartOverlapSeconds));
+            const float partnerDuration =
+                invisible_places::camera::AnimationPathDurationSeconds(
+                    *loopPartner);
+            float partnerStartOverlap = std::min(
+                timeline.currentEndOverlapSeconds,
+                partnerDuration);
+            float partnerEndOverlap = std::min(
+                timeline.currentStartOverlapSeconds,
+                partnerDuration);
+            const float currentNearSeconds = 1.0F / 30.0F;
+            const float partnerNearSeconds = 1.0F / 30.0F;
+            const std::size_t selectedBeforeSanitize =
+                timeline.currentMovableKeyIds.size() +
+                timeline.partnerMovableKeyIds.size();
+            SanitizeAnimationLoopMovableKeyIds(
+                *loopCurrent,
+                timeline.currentStartOverlapSeconds,
+                timeline.currentEndOverlapSeconds,
+                currentNearSeconds,
+                &timeline.currentMovableKeyIds);
+            SanitizeAnimationLoopMovableKeyIds(
+                *loopPartner,
+                partnerStartOverlap,
+                partnerEndOverlap,
+                partnerNearSeconds,
+                &timeline.partnerMovableKeyIds);
+            if (selectedBeforeSanitize !=
+                timeline.currentMovableKeyIds.size() +
+                    timeline.partnerMovableKeyIds.size()) {
+                timeline.previewDirty = true;
+            }
+
+            const std::vector<invisible_places::camera::
+                                  AnimationLoopScreenDisplacementSample>*
+                currentDisplacement = nullptr;
+            const std::vector<invisible_places::camera::
+                                  AnimationLoopScreenDisplacementSample>*
+                partnerDisplacement = nullptr;
+            const std::vector<invisible_places::camera::
+                                  AnimationLoopKeyMovement>*
+                currentKeyMovements = nullptr;
+            const std::vector<invisible_places::camera::
+                                  AnimationLoopKeyMovement>*
+                partnerKeyMovements = nullptr;
+            float currentMaxDisplacement = 0.0F;
+            float partnerMaxDisplacement = 0.0F;
+            if (timeline.preview.has_value()) {
+                currentDisplacement =
+                    &timeline.preview->screenDisplacementSamples[0U];
+                partnerDisplacement =
+                    &timeline.preview->screenDisplacementSamples[1U];
+                currentKeyMovements =
+                    &timeline.preview->keyMovements[0U];
+                partnerKeyMovements =
+                    &timeline.preview->keyMovements[1U];
+                currentMaxDisplacement =
+                    timeline.preview->maxScreenDisplacement[0U];
+                partnerMaxDisplacement =
+                    timeline.preview->maxScreenDisplacement[1U];
+            }
+            const bool diagnosticsMatchPair =
+                panel.loopSmoothingDiagnostics.has_value() &&
+                NormalizePathKey(
+                    panel.loopSmoothingDiagnostics->firstFilePath) ==
+                    NormalizePathKey(
+                        panel.availableFiles[
+                            currentLoopFileIndex.value()]) &&
+                NormalizePathKey(
+                    panel.loopSmoothingDiagnostics->secondFilePath) ==
+                    NormalizePathKey(
+                        panel.availableFiles[
+                            loopPartnerIndex.value()]);
+            if (matchingAppliedPair && diagnosticsMatchPair) {
+                const auto& metrics =
+                    panel.loopSmoothingDiagnostics->metrics;
+                currentDisplacement =
+                    &metrics.screenDisplacementSamples[0U];
+                partnerDisplacement =
+                    &metrics.screenDisplacementSamples[1U];
+                currentKeyMovements = &metrics.keyMovements[0U];
+                partnerKeyMovements = &metrics.keyMovements[1U];
+                currentMaxDisplacement =
+                    metrics.maxScreenDisplacement[0U];
+                partnerMaxDisplacement =
+                    metrics.maxScreenDisplacement[1U];
+            }
+
+            ImGui::SeparatorText("Velocity Blend");
+            ImGui::TextDisabled(
+                "Drag A's bounds. B follows by the same seconds; a key unlocks once a bound passes the midpoint from its neighbor.");
+            const bool timelineInteractive =
+                !renderSetupLocksAnimationSwitching;
+            bool timelineChanged = false;
+            ImGui::BeginDisabled(!timelineInteractive);
+            const char* alignmentModes[] = {
+                "Full frame",
+                "Horizontal cross-wipe",
+            };
+            int alignmentMode = timeline.horizontalBlend ? 1 : 0;
+            ImGui::SetNextItemWidth(220.0F);
+            if (ImGui::Combo(
+                    "Alignment Model",
+                    &alignmentMode,
+                    alignmentModes,
+                    IM_ARRAYSIZE(alignmentModes))) {
+                timeline.horizontalBlend = alignmentMode == 1;
+                timelineChanged = true;
+            }
+            if (timeline.horizontalBlend) {
+                const char* panDirections[] = {
+                    "Right",
+                    "Left",
+                };
+                int panDirection = timeline.panRight ? 0 : 1;
+                ImGui::SetNextItemWidth(220.0F);
+                if (ImGui::Combo(
+                        "Pan Direction",
+                        &panDirection,
+                        panDirections,
+                        IM_ARRAYSIZE(panDirections))) {
+                    timeline.panRight = panDirection == 0;
+                    timelineChanged = true;
+                }
+            }
+            const float currentFramePosition =
+                std::clamp(panel.scrubAmount, 0.0F, 1.0F);
+            const auto matchingPartnerFramePosition =
+                AnimationLoopCounterpartNormalizedPosition(
+                    *loopCurrent,
+                    currentFramePosition,
+                    timeline.currentStartOverlapSeconds,
+                    timeline.currentEndOverlapSeconds,
+                    partnerDuration);
+            const bool cameraMatchesCurrentFrame =
+                panel.velocityPartnerComparisonHoldActive ||
+                LiveCameraMatchesAnimationFrame(
+                    *runtimeState,
+                    *loopCurrent,
+                    currentFramePosition);
+            ImGui::BeginDisabled(
+                !matchingPartnerFramePosition.has_value() ||
+                !cameraMatchesCurrentFrame);
+            ImGui::Button("Hold: View Matching B");
+            const bool matchingViewHeld =
+                ImGui::IsItemActive() &&
+                ImGui::IsMouseDown(ImGuiMouseButton_Left);
+            const bool matchingViewReleased = ImGui::IsItemDeactivated();
+            if (matchingViewHeld &&
+                matchingPartnerFramePosition.has_value()) {
+                panel.velocityPartnerComparisonHoldActive = true;
+                ApplyAnimationEvaluation(
+                    runtimeState,
+                    *loopPartner,
+                    matchingPartnerFramePosition.value(),
+                    runtimeState->animationPlayback.active ||
+                        panel.previewDepthOfField);
+            } else if (matchingViewReleased &&
+                       panel.velocityPartnerComparisonHoldActive) {
+                panel.velocityPartnerComparisonHoldActive = false;
+                ApplyAnimationEvaluation(
+                    runtimeState,
+                    *loopCurrent,
+                    currentFramePosition,
+                    runtimeState->animationPlayback.active ||
+                        panel.previewDepthOfField);
+            }
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(
+                    ImGuiHoveredFlags_DelayNormal |
+                    ImGuiHoveredFlags_AllowWhenDisabled)) {
+                if (!matchingPartnerFramePosition.has_value()) {
+                    ImGui::SetTooltip(
+                        "Scrub A into its start or end overlap to view the exact frame blended from B.");
+                } else if (!cameraMatchesCurrentFrame) {
+                    ImGui::SetTooltip(
+                        "Reapply or scrub A's current frame before comparing it with B.");
+                } else {
+                    ImGui::SetTooltip(
+                        "Hold to show B's exact counterpart at this loop seam. Release restores A without changing the active animation or scrub time.");
+                }
+            }
+            ImGui::SeparatorText("Matching-Frame Point Ghost");
+            const bool ghostMatchesPair =
+                panel.matchingFrameGhost.uploaded &&
+                loopCurrent->velocityBlendLink.has_value() &&
+                loopPartner->velocityBlendLink.has_value() &&
+                loopCurrent->velocityBlendLink->pairId ==
+                    panel.matchingFrameGhost.pairId &&
+                loopPartner->velocityBlendLink->pairId ==
+                    panel.matchingFrameGhost.pairId &&
+                PathsLexicallyEqual(
+                    panel.matchingFrameGhost.currentFilePath,
+                    panel.availableFiles[
+                        currentLoopFileIndex.value()]) &&
+                PathsLexicallyEqual(
+                    panel.matchingFrameGhost.partnerFilePath,
+                    panel.availableFiles[
+                        loopPartnerIndex.value()]);
+            ImGui::BeginDisabled(
+                !matchingPartnerFramePosition.has_value() ||
+                panel.matchingFrameGhost.updateInProgress);
+            if (ImGui::Button(
+                    panel.matchingFrameGhost.updateInProgress
+                        ? "Updating Matching Points..."
+                    : ghostMatchesPair
+                        ? "Update Matching Points"
+                        : "Capture Matching Points")) {
+                panel.requestedMatchingFrameGhostCapture =
+                    AnimationMatchingFrameGhostCaptureRequest{
+                        .filePaths = {
+                            panel.availableFiles[
+                                currentLoopFileIndex.value()],
+                            panel.availableFiles[
+                                loopPartnerIndex.value()],
+                        },
+                        .currentNormalizedPosition =
+                            currentFramePosition,
+                        .partnerNormalizedPosition =
+                            matchingPartnerFramePosition.value(),
+                        .aspectRatio = CurrentAspectRatio(viewport),
+                    };
+            }
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(
+                    ImGuiHoveredFlags_DelayNormal |
+                    ImGuiHoveredFlags_AllowWhenDisabled)) {
+                ImGui::SetTooltip(
+                    matchingPartnerFramePosition.has_value()
+                        ? "Sample B's exact resident 5 mm display cloud, retain its front-visible surface, and rigidly transplant it from B's matching camera pose into A's current camera pose."
+                        : "Scrub A into a blend overlap before capturing its matching B frame.");
+            }
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!ghostMatchesPair);
+            ImGui::Checkbox(
+                "Show Ghost",
+                &panel.matchingFrameGhost.visible);
+            ImGui::SameLine();
+            ImGui::Checkbox(
+                "Auto Update",
+                &panel.matchingFrameGhost.automaticUpdate);
+            ImGui::SameLine();
+            ImGui::Checkbox(
+                "B Spline Controls",
+                &panel.matchingFrameGhost.showPartnerSplines);
+            ImGui::EndDisabled();
+            if (panel.matchingFrameGhost.uploaded) {
+                ImGui::SameLine();
+                if (ImGui::Button("Clear Ghost")) {
+                    panel.requestedMatchingFrameGhostClear = true;
+                }
+            }
+            if (ghostMatchesPair) {
+                ImGui::SetNextItemWidth(220.0F);
+                ImGui::SliderFloat(
+                    "Ghost Opacity",
+                    &panel.matchingFrameGhost.opacity,
+                    0.02F,
+                    1.0F,
+                    "%.2f");
+                ImGui::SetNextItemWidth(220.0F);
+                ImGui::SliderFloat(
+                    "Ghost Point Size",
+                    &panel.matchingFrameGhost.pointSizeMillimeters,
+                    0.5F,
+                    50.0F,
+                    "%.1f mm",
+                    ImGuiSliderFlags_Logarithmic);
+                ImGui::TextDisabled(
+                    "%zu front points (%zu in B's frustum) | A %.2fs, B %.2fs",
+                    panel.matchingFrameGhost.capturedPointCount,
+                    panel.matchingFrameGhost
+                        .frustumVisiblePointCount,
+                    panel.matchingFrameGhost
+                            .currentNormalizedPosition *
+                        invisible_places::camera::
+                            AnimationPathDurationSeconds(*loopCurrent),
+                    panel.matchingFrameGhost
+                            .partnerNormalizedPosition *
+                        partnerDuration);
+                ImGui::TextDisabled(
+                    "%s | sampled %s of %s source positions",
+                    panel.matchingFrameGhost.sourceDescription.c_str(),
+                    FormatPointCount(
+                        panel.matchingFrameGhost
+                            .sourceSamplePointCount)
+                        .c_str(),
+                    FormatPointCount(
+                        panel.matchingFrameGhost.sourcePointCount)
+                        .c_str());
+                if (!panel.matchingFrameGhost
+                         .matchingFrameAvailable) {
+                    ImGui::TextColored(
+                        ImVec4{0.95F, 0.70F, 0.30F, 1.0F},
+                        "Ghost hidden: A is outside the linked blend overlap.");
+                } else if (panel.matchingFrameGhost
+                               .updateInProgress) {
+                    ImGui::TextDisabled(
+                        "Refreshing the matching 5 mm surface in the background...");
+                } else if (!panel.matchingFrameGhost
+                                .captureMatchesCurrentFrame) {
+                    ImGui::TextDisabled(
+                        "Ghost hidden until the matching 5 mm frame refreshes.");
+                }
+                ImGui::TextDisabled(
+                    "The latest white layer is frozen in A's world space; orbit the live camera freely to inspect the offset.");
+                if (panel.matchingFrameGhost.showPartnerSplines) {
+                    ImGui::TextDisabled(
+                        "B camera: orange spline/diamonds | B focus: pink spline/diamonds. Select a diamond, then drag its gizmo; B's _Edited path and the ghost refresh automatically.");
+                    ImGui::TextDisabled(
+                        "The matching B camera is anchored on A's camera; every B point and control uses the same rigid transform (no per-point warp).");
+                }
+            }
+            ImGui::EndDisabled();
+            if (timeline.horizontalBlend) {
+                ImGui::TextDisabled(
+                    "Outgoing visibility shrinks 2/3 -> 1/3 while incoming grows 1/3 -> 2/3; direction mirrors the retained sides.");
+            }
+            const std::string currentTimelineLabel =
+                "A  " + AnimationRegistryDisplayLabel(
+                              *runtimeState,
+                              currentLoopFileIndex.value());
+            const std::string partnerTimelineLabel =
+                "B  " + AnimationRegistryDisplayLabel(
+                              *runtimeState,
+                              loopPartnerIndex.value());
+            const float partnerFramePosition =
+                matchingPartnerFramePosition.value_or(
+                    std::numeric_limits<float>::quiet_NaN());
+            ImGui::PushID("loop-timeline-current");
+            timelineChanged |= DrawAnimationLoopTimelineRow(
+                currentTimelineLabel.c_str(),
+                panel.availableFiles[currentLoopFileIndex.value()],
+                *loopCurrent,
+                partnerDuration,
+                0,
+                &timeline,
+                timeline.currentStartOverlapSeconds,
+                timeline.currentEndOverlapSeconds,
+                currentNearSeconds,
+                timelineInteractive,
+                timelineInteractive,
+                currentFramePosition,
+                true,
+                &timeline.currentMovableKeyIds,
+                &timeline.currentStartOverlapSeconds,
+                &timeline.currentEndOverlapSeconds,
+                &timeline.dragHandle,
+                currentDisplacement,
+                currentMaxDisplacement,
+                currentKeyMovements);
+            ImGui::PopID();
+
+            partnerStartOverlap = std::min(
+                timeline.currentEndOverlapSeconds,
+                partnerDuration);
+            partnerEndOverlap = std::min(
+                timeline.currentStartOverlapSeconds,
+                partnerDuration);
+            SanitizeAnimationLoopMovableKeyIds(
+                *loopCurrent,
+                timeline.currentStartOverlapSeconds,
+                timeline.currentEndOverlapSeconds,
+                currentNearSeconds,
+                &timeline.currentMovableKeyIds);
+            SanitizeAnimationLoopMovableKeyIds(
+                *loopPartner,
+                partnerStartOverlap,
+                partnerEndOverlap,
+                partnerNearSeconds,
+                &timeline.partnerMovableKeyIds);
+            int partnerDragHandle = 0;
+            ImGui::PushID("loop-timeline-partner");
+            timelineChanged |= DrawAnimationLoopTimelineRow(
+                partnerTimelineLabel.c_str(),
+                panel.availableFiles[loopPartnerIndex.value()],
+                *loopPartner,
+                currentDuration,
+                1,
+                &timeline,
+                partnerStartOverlap,
+                partnerEndOverlap,
+                partnerNearSeconds,
+                false,
+                timelineInteractive,
+                partnerFramePosition,
+                false,
+                &timeline.partnerMovableKeyIds,
+                nullptr,
+                nullptr,
+                &partnerDragHandle,
+                partnerDisplacement,
+                partnerMaxDisplacement,
+                partnerKeyMovements);
+            ImGui::PopID();
+            if (timeline.strongDestinationRow >= 0 &&
+                timeline.strongDestinationRow < 2 &&
+                timeline.rowTrackValid[0U] &&
+                timeline.rowTrackValid[1U]) {
+                const int destinationRow =
+                    timeline.strongDestinationRow;
+                const int counterpartRow = 1 - destinationRow;
+                const auto* destinationPath = destinationRow == 0
+                                                  ? loopCurrent
+                                                  : loopPartner;
+                const auto keyIt = std::find_if(
+                    destinationPath->keys.begin(),
+                    destinationPath->keys.end(),
+                    [&](const auto& key) {
+                        return key.id ==
+                               timeline.strongDestinationKeyId;
+                    });
+                if (keyIt != destinationPath->keys.end()) {
+                    const float destinationPosition =
+                        invisible_places::camera::
+                            AnimationPathKeyNormalizedPosition(
+                                *destinationPath,
+                                static_cast<std::size_t>(std::distance(
+                                    destinationPath->keys.begin(),
+                                    keyIt)));
+                    const float destinationStartOverlap = destinationRow == 0
+                        ? timeline.currentStartOverlapSeconds
+                        : partnerStartOverlap;
+                    const float destinationEndOverlap = destinationRow == 0
+                        ? timeline.currentEndOverlapSeconds
+                        : partnerEndOverlap;
+                    const float counterpartDuration = destinationRow == 0
+                        ? partnerDuration
+                        : currentDuration;
+                    const auto counterpartPosition =
+                        AnimationLoopCounterpartNormalizedPosition(
+                            *destinationPath,
+                            destinationPosition,
+                            destinationStartOverlap,
+                            destinationEndOverlap,
+                            counterpartDuration);
+                    if (!counterpartPosition.has_value()) {
+                        timeline.strongDestinationRow = -1;
+                        timeline.strongDestinationKeyId.clear();
+                    } else {
+                        timeline.strongCounterpartNormalizedPosition =
+                            counterpartPosition.value();
+                        const auto pointAt = [&](int row, float amount) {
+                            const auto& minimum = timeline.rowTrackMinimum[
+                                static_cast<std::size_t>(row)];
+                            const auto& maximum = timeline.rowTrackMaximum[
+                                static_cast<std::size_t>(row)];
+                            return ImVec2{
+                                std::lerp(
+                                    minimum.x,
+                                    maximum.x,
+                                    std::clamp(amount, 0.0F, 1.0F)),
+                                minimum.y,
+                            };
+                        };
+                        ImGui::GetWindowDrawList()->AddLine(
+                            pointAt(destinationRow, destinationPosition),
+                            pointAt(
+                                counterpartRow,
+                                timeline
+                                    .strongCounterpartNormalizedPosition),
+                            IM_COL32(70, 225, 245, 220),
+                            2.0F);
+                    }
+                }
+            }
+            if (timelineChanged) {
+                timeline.previewDirty = true;
+                velocityLinkSettingsChanged = true;
+            }
+            ImGui::TextDisabled(
+                "Mouse-down on a node toggles movement (double-click selects cyan lower-frame alignment); mouse-down elsewhere scrubs until release. A's overlap bounds keep priority."
+            );
+
+            loopTimelineOptions = AnimationLoopTimelineOptions(
+                timeline,
+                *loopPartner,
+                std::clamp(
+                    panel.loopSmoothingMaxEndMovePercent / 100.0F,
+                    0.01F,
+                    0.25F));
+            if (timeline.previewDirty &&
+                timeline.dragHandle == 0 &&
+                !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                RefreshAnimationLoopTimelinePreview(
+                    runtimeState,
+                    currentLoopFileIndex.value(),
+                    loopPartnerIndex.value(),
+                    loopTimelineOptions);
+            }
+            if (timeline.previewInProgress) {
+                ImGui::TextDisabled(
+                    "Assessing the selected velocity overlap in the background...");
+            } else if (!timeline.previewError.empty()) {
+                ImGui::TextColored(
+                    ImVec4{0.95F, 0.52F, 0.30F, 1.0F},
+                    "%s",
+                    timeline.previewError.c_str());
+            } else if (timeline.preview.has_value()) {
+                const auto& preview = timeline.preview.value();
+                const float improvement =
+                    preview.beforeMismatch > 1.0e-8F
+                        ? 100.0F *
+                              (preview.beforeMismatch -
+                               preview.afterMismatch) /
+                              preview.beforeMismatch
+                        : 0.0F;
+                ImGui::Text(
+                    "%s assessment: mismatch %.5f -> %.5f (%+.1f%%), max displacement %.1f / %.1f px @1080",
+                    timeline.horizontalBlend ? "Rough wipe" : "Rough full-frame",
+                    preview.beforeMismatch,
+                    preview.afterMismatch,
+                    improvement,
+                    1080.0F * preview.maxScreenDisplacement[0U],
+                    1080.0F * preview.maxScreenDisplacement[1U]);
+                if (!preview.errorMessage.empty()) {
+                    ImGui::TextDisabled(
+                        "%s",
+                        preview.errorMessage.c_str());
+                }
+            }
+        }
+        ImGui::BeginDisabled(renderSetupLocksAnimationSwitching);
+        const bool maxEndMoveChanged = ImGui::SliderFloat(
             "Max End Move",
             &panel.loopSmoothingMaxEndMovePercent,
             1.0F,
             25.0F,
             "%.0f%%");
+        if (maxEndMoveChanged) {
+            panel.loopTimeline.previewDirty = true;
+            velocityLinkSettingsChanged = true;
+        }
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered(
                 ImGuiHoveredFlags_DelayNormal |
                 ImGuiHoveredFlags_AllowWhenDisabled)) {
             ImGui::SetTooltip(
                 "Separate camera and focus limits, each measured as a "
-                "percentage of that track's adjacent end segment.");
+                "percentage of that key's shortest neighboring track segment.");
         }
-
-        const bool canSmoothLoop =
-            !renderSetupLocksAnimationSwitching &&
-            currentLoopFileIndex.has_value() &&
-            loopPartnerIndex.has_value() &&
-            currentLoopFileIndex.value() != loopPartnerIndex.value() &&
-            animationPath.keys.size() >= 3U &&
-            loopPartner != nullptr && loopPartner->keys.size() >= 3U &&
-            !animationPath.loopTransitionSmoothing.has_value() &&
-            !loopPartner->loopTransitionSmoothing.has_value();
-        ImGui::BeginDisabled(!canSmoothLoop);
-        if (ImGui::Button("Smooth Loop Transitions")) {
-            ApplyAnimationLoopSmoothing(
-                runtimeState,
-                loopPartnerIndex.value(),
-                std::clamp(
-                    panel.loopSmoothingMaxEndMovePercent / 100.0F,
-                    0.01F,
-                    0.25F));
+        ImGui::BeginDisabled(renderSetupLocksAnimationSwitching);
+        const bool strongMoveChanged = ImGui::SliderFloat(
+            "Lower-Frame Align Max Move",
+            &panel.strongAlignmentMaxMovePercent,
+            1.0F,
+            100.0F,
+            "%.0f%%");
+        if (strongMoveChanged) {
+            velocityLinkSettingsChanged = true;
         }
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered(
                 ImGuiHoveredFlags_DelayNormal |
                 ImGuiHoveredFlags_AllowWhenDisabled)) {
             ImGui::SetTooltip(
-                "Moves only the first and last camera/focus positions. "
-                "Timings and the complete middle interval stay unchanged; "
+                "Independent camera and focus cap for the one cyan lower-frame destination key, measured from its shortest neighboring segment.");
+        }
+        if (matchingAppliedPair && velocityLinkSettingsChanged &&
+            currentLoopFileIndex.has_value() &&
+            loopPartnerIndex.has_value()) {
+            loopTimelineOptions.maxEndMoveFraction = std::clamp(
+                panel.loopSmoothingMaxEndMovePercent / 100.0F,
+                0.01F,
+                0.25F);
+            panel.pendingVelocityLinkSettingsUpdate =
+                AnimationVelocityLinkSettingsUpdate{
+                    .filePaths = {
+                        panel.availableFiles[currentLoopFileIndex.value()],
+                        panel.availableFiles[loopPartnerIndex.value()],
+                    },
+                    .pairId = loopCurrent->velocityBlendLink->pairId,
+                    .startOverlapSeconds = {
+                        loopTimelineOptions.firstStartOverlapSeconds,
+                        loopTimelineOptions.secondStartOverlapSeconds,
+                    },
+                    .endOverlapSeconds = {
+                        loopTimelineOptions.firstEndOverlapSeconds,
+                        loopTimelineOptions.secondEndOverlapSeconds,
+                    },
+                    .maxEndMoveFraction =
+                        loopTimelineOptions.maxEndMoveFraction,
+                    .strongAlignMaxMoveFraction = std::clamp(
+                        panel.strongAlignmentMaxMovePercent / 100.0F,
+                        0.01F,
+                        1.0F),
+                    .horizontalBlend =
+                        loopTimelineOptions.horizontalBlend,
+                    .panRight = loopTimelineOptions.panRight,
+                    .movableKeyIds = {
+                        loopTimelineOptions.firstMovableKeyIds,
+                        loopTimelineOptions.secondMovableKeyIds,
+                    },
+                };
+        }
+
+        const bool strongAlignmentInProgress =
+            runtimeState->animationStrongAlignmentJob.shared != nullptr;
+        if (matchingAppliedPair && currentLoopFileIndex.has_value() &&
+            loopPartnerIndex.has_value()) {
+            ImGui::SeparatorText("Lower-Frame Geometry Alignment");
+            if (strongAlignmentInProgress) {
+                ImGui::TextDisabled(
+                    "Matching cached lower-frame geometry in the background...");
+            }
+            const bool hasStrongDestination =
+                panel.loopTimeline.strongDestinationRow >= 0 &&
+                panel.loopTimeline.strongDestinationRow < 2 &&
+                !panel.loopTimeline.strongDestinationKeyId.empty();
+            if (!hasStrongDestination) {
+                ImGui::TextDisabled(
+                    "Double-click one eligible timeline key to choose the cyan destination.");
+            } else {
+                const auto requestPaths =
+                    std::array<std::filesystem::path, 2>{
+                        panel.availableFiles[
+                            currentLoopFileIndex.value()],
+                        panel.availableFiles[
+                            loopPartnerIndex.value()],
+                    };
+                ImGui::BeginDisabled(
+                    renderSetupLocksAnimationSwitching ||
+                    strongAlignmentInProgress);
+                if (ImGui::Button(
+                        "Align Selected Key To Matching Frame")) {
+                    panel.requestedLowerFrameAlignment =
+                        AnimationLowerFrameAlignmentRequest{
+                            .filePaths = requestPaths,
+                            .destinationRow = panel.loopTimeline
+                                                  .strongDestinationRow,
+                            .destinationKeyId = panel.loopTimeline
+                                                    .strongDestinationKeyId,
+                            .counterpartNormalizedPosition = panel.loopTimeline
+                                .strongCounterpartNormalizedPosition,
+                            .aspectRatio = CurrentAspectRatio(viewport),
+                        };
+                }
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(
+                        ImGuiHoveredFlags_DelayNormal |
+                        ImGuiHoveredFlags_AllowWhenDisabled)) {
+                    ImGui::SetTooltip(
+                        "Keeps the matching animation fixed and adjusts only the selected key. It compares spatially balanced, frontmost common points in the lower 55%% of both frames using the already-resident pivot-position cache. No cloud, scalar-field, or renderer readback is requested.");
+                }
+                ImGui::TextDisabled(
+                    "Destination %c / %s; matching position %.2f%% on %c.",
+                    panel.loopTimeline.strongDestinationRow == 0 ? 'A' : 'B',
+                    panel.loopTimeline.strongDestinationKeyId.c_str(),
+                    100.0F * panel.loopTimeline
+                                  .strongCounterpartNormalizedPosition,
+                    panel.loopTimeline.strongDestinationRow == 0 ? 'B' : 'A');
+            }
+            if (panel.strongAlignmentDiagnostics.has_value()) {
+                const auto& strong =
+                    panel.strongAlignmentDiagnostics.value();
+                const auto& metrics = strong.metrics;
+                const ImVec4 resultColor = strong.changed
+                    ? ImVec4{0.35F, 0.80F, 0.45F, 1.0F}
+                    : ImVec4{0.95F, 0.58F, 0.25F, 1.0F};
+                ImGui::TextColored(
+                    resultColor,
+                    "Common lower-frame RMS %.1f -> %.1f px @1080",
+                    metrics.beforeForegroundReprojectionRms1080,
+                    metrics.afterForegroundReprojectionRms1080);
+                ImGui::Text(
+                    "Centre offset X %.1f -> %.1f px; Y %.1f -> %.1f px",
+                    metrics.beforeHorizontalOffset1080,
+                    metrics.afterHorizontalOffset1080,
+                    metrics.beforeVerticalOffset1080,
+                    metrics.afterVerticalOffset1080);
+                ImGui::Text(
+                    "Scale mismatch %.2f%% -> %.2f%%; rotation %.2f -> %.2f deg",
+                    metrics.beforeScaleMismatchPercent,
+                    metrics.afterScaleMismatchPercent,
+                    metrics.beforeRotationMismatchDegrees,
+                    metrics.afterRotationMismatchDegrees);
+                ImGui::Text(
+                    "%zu common foreground points; coverage destination %.0f%% / reference %.0f%% (%zu / %zu cells)",
+                    metrics.foregroundSampleCount,
+                    100.0F * metrics.destinationCoverage,
+                    100.0F * metrics.referenceCoverage,
+                    metrics.destinationOccupiedCellCount,
+                    metrics.referenceOccupiedCellCount);
+                ImGui::Text(
+                    "Move camera %.5f (%.0f%% cap), focus %.5f (%.0f%% cap)",
+                    metrics.cameraMove,
+                    100.0F * metrics.cameraCapUsage,
+                    metrics.focusMove,
+                    100.0F * metrics.focusCapUsage);
+                if (!strong.errorMessage.empty()) {
+                    ImGui::TextWrapped("%s", strong.errorMessage.c_str());
+                }
+            }
+        }
+
+        const bool canSmoothLoop =
+            !renderSetupLocksAnimationSwitching &&
+            !strongAlignmentInProgress &&
+            currentLoopFileIndex.has_value() &&
+            loopPartnerIndex.has_value() &&
+            currentLoopFileIndex.value() != loopPartnerIndex.value() &&
+            loopCurrent != nullptr && loopCurrent->keys.size() >= 3U &&
+            loopPartner != nullptr && loopPartner->keys.size() >= 3U;
+        ImGui::BeginDisabled(!canSmoothLoop);
+        if (ImGui::Button(
+                matchingAppliedPair
+                    ? "Reapply Velocity Alignment"
+                    : "Apply Velocity Alignment")) {
+            ApplyAnimationLoopSmoothing(
+                runtimeState,
+                loopPartnerIndex.value(),
+                loopTimelineOptions);
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(
+                ImGuiHoveredFlags_DelayNormal |
+                ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip(
+                "Moves only the enabled camera/focus keys within the overlap. "
+                "Locked keys and every timing value stay unchanged; "
                 "the paired results appear as _Edited versions until saved.");
         }
         ImGui::SameLine();
         ImGui::BeginDisabled(
-            renderSetupLocksAnimationSwitching || !matchingAppliedPair);
-        if (ImGui::Button("Unapply End Smoothing")) {
-            UnapplyAnimationLoopSmoothing(
+            renderSetupLocksAnimationSwitching ||
+            strongAlignmentInProgress ||
+            !loopPartnerIndex.has_value() ||
+            !panel.velocityAlignmentDraft.has_value());
+        if (ImGui::Button("Unapply Draft Alignment")) {
+            UnapplyAnimationVelocityDraft(
                 runtimeState,
                 loopPartnerIndex.value());
         }
@@ -44742,22 +49766,58 @@ void DrawAnimationSection(
                 ImGuiHoveredFlags_DelayNormal |
                 ImGuiHoveredFlags_AllowWhenDisabled)) {
             ImGui::SetTooltip(
-                "Restores only the four saved endpoint camera/focus poses "
-                "and keeps every later middle-key or timing edit.");
+                "Subtracts only the current velocity draft. Manual edits and "
+                "previously confirmed corrections remain.");
         }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(
+            renderSetupLocksAnimationSwitching ||
+            strongAlignmentInProgress ||
+            !panel.velocityAlignmentDraft.has_value());
+        if (ImGui::Button("Confirm Blend")) {
+            panel.velocityAlignmentDraft.reset();
+            runtimeState->statusMessage =
+                "Confirmed the visible alignment as the new local _Edited baseline. No files were written.";
+            runtimeState->errorMessage.clear();
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(
+                ImGuiHoveredFlags_DelayNormal |
+                ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip(
+                "Keeps the current corrections and clears only their draft "
+                "rollback delta, allowing another alignment pass. Saving an "
+                "unconfirmed result does this automatically.");
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(
+            renderSetupLocksAnimationSwitching ||
+            strongAlignmentInProgress ||
+            !matchingAppliedPair ||
+            !currentLoopFileIndex.has_value() ||
+            !loopPartnerIndex.has_value());
+        if (ImGui::Button("Unlink")) {
+            panel.requestedVelocityUnlink =
+                std::array<std::filesystem::path, 2>{
+                    panel.availableFiles[currentLoopFileIndex.value()],
+                    panel.availableFiles[loopPartnerIndex.value()],
+                };
+        }
+        ImGui::EndDisabled();
         const bool canValidateLoop =
             currentLoopFileIndex.has_value() &&
             loopPartnerIndex.has_value() &&
             currentLoopFileIndex.value() != loopPartnerIndex.value() &&
-            animationPath.keys.size() >= 3U &&
+            loopCurrent != nullptr && loopCurrent->keys.size() >= 3U &&
             loopPartner != nullptr && loopPartner->keys.size() >= 3U;
         ImGui::BeginDisabled(!canValidateLoop);
-        if (ImGui::Button("Validate Loop Metrics")) {
+        if (ImGui::Button("Validate Blend Metrics")) {
             if (RefreshAnimationLoopDiagnostics(
                     runtimeState,
-                    loopPartnerIndex.value())) {
+                    loopPartnerIndex.value(),
+                    loopTimelineOptions)) {
                 runtimeState->statusMessage =
-                    "Loop-transition metrics refreshed.";
+                    "Velocity-blend metrics refreshed.";
                 runtimeState->errorMessage.clear();
             } else {
                 const auto& diagnostics =
@@ -44766,7 +49826,7 @@ void DrawAnimationSection(
                     diagnostics.has_value() &&
                             !diagnostics->metrics.errorMessage.empty()
                         ? diagnostics->metrics.errorMessage
-                        : "The selected loop pair could not be measured.";
+                        : "The selected velocity pair could not be measured.";
                 runtimeState->statusMessage.clear();
             }
         }
@@ -44776,8 +49836,8 @@ void DrawAnimationSection(
                 ImGuiHoveredFlags_AllowWhenDisabled)) {
             ImGui::SetTooltip(
                 "Measures both transition directions without changing either "
-                "animation. Saved smoothing is compared with the original "
-                "endpoints stored in its reversible metadata.");
+                "animation. Confirmed alignment is compared with the original "
+                "selected-key poses stored in its reversible metadata.");
         }
 
         const auto diagnosticsMatchSelection = [&]() {
@@ -44815,7 +49875,7 @@ void DrawAnimationSection(
             const auto partnerLabel = AnimationRegistryDisplayLabel(
                 *runtimeState,
                 loopPartnerIndex.value());
-            ImGui::SeparatorText("Loop Validation");
+            ImGui::SeparatorText("Velocity Blend Validation");
             switch (diagnostics.status) {
                 case AnimationLoopDiagnosticsStatus::Applied:
                     ImGui::TextColored(
@@ -44828,7 +49888,7 @@ void DrawAnimationSection(
                         "Best candidate was not applied");
                     break;
                 case AnimationLoopDiagnosticsStatus::Baseline:
-                    ImGui::TextDisabled("Current unsmoothed baseline");
+                    ImGui::TextDisabled("Current unaligned baseline");
                     break;
                 case AnimationLoopDiagnosticsStatus::Invalid:
                     ImGui::TextColored(
@@ -44879,27 +49939,56 @@ void DrawAnimationSection(
                             metrics.beforeSeamMismatch[1U],
                             metrics.afterSeamMismatch[1U]));
                     ImGui::Text(
-                        "Endpoint move: camera %.6f (%.1f%% cap), focus %.6f (%.1f%% cap)",
+                        "Enabled-key move: camera %.6f (%.1f%% cap), focus %.6f (%.1f%% cap)",
                         metrics.maxCameraMove,
                         100.0F * metrics.maxCameraCapUsage,
                         metrics.maxFocusMove,
                         100.0F * metrics.maxFocusCapUsage);
+                    ImGui::Text(
+                        "Approx. max screen displacement @1080: %s %.1f px, %s %.1f px",
+                        currentLabel.c_str(),
+                        1080.0F * metrics.maxScreenDisplacement[0U],
+                        partnerLabel.c_str(),
+                        1080.0F * metrics.maxScreenDisplacement[1U]);
                     ImGui::Text(
                         "Terminal speed RMS change: %s %.1f%%, %s %.1f%%",
                         currentLabel.c_str(),
                         100.0F * metrics.terminalSpeedRmsChange[0U],
                         partnerLabel.c_str(),
                         100.0F * metrics.terminalSpeedRmsChange[1U]);
+                    if (ImGui::TreeNode("Per-key movement")) {
+                        const std::array<const char*, 2> labels{
+                            currentLabel.c_str(),
+                            partnerLabel.c_str(),
+                        };
+                        for (std::size_t pathIndex = 0U;
+                             pathIndex < metrics.keyMovements.size();
+                             ++pathIndex) {
+                            ImGui::TextDisabled("%s", labels[pathIndex]);
+                            for (const auto& movement :
+                                 metrics.keyMovements[pathIndex]) {
+                                ImGui::BulletText(
+                                    "%s: camera %.5f (%.0f%% cap), focus %.5f (%.0f%% cap)",
+                                    movement.keyId.c_str(),
+                                    movement.cameraMove,
+                                    100.0F * movement.cameraCapUsage,
+                                    movement.focusMove,
+                                    100.0F * movement.focusCapUsage);
+                            }
+                        }
+                        ImGui::TreePop();
+                    }
                 }
             }
             if (!diagnostics.message.empty()) {
                 ImGui::TextWrapped("%s", diagnostics.message.c_str());
             }
         }
-        if (animationPath.loopTransitionSmoothing.has_value()) {
+        if (loopCurrent != nullptr &&
+            loopCurrent->velocityBlendLink.has_value()) {
             ImGui::TextDisabled(
-                "End smoothing applied at %.0f%% maximum movement.",
-                100.0F * animationPath.loopTransitionSmoothing
+                "Velocity blend linked at %.0f%% maximum movement.",
+                100.0F * loopCurrent->velocityBlendLink
                                ->maxEndMoveFraction);
         }
         }
@@ -44986,53 +50075,6 @@ void DrawAnimationSection(
     EndPanelSection();
     }
 
-    if (pendingLinkedPath.has_value()) {
-        if (pendingLinkedPathIsNew) {
-            // Preserve any unsaved source edits in its registry shadow before
-            // replacing the active panel with the new linked draft.
-            SyncCurrentAnimationToRegistry(runtimeState);
-            panel.currentFilePath.clear();
-            panel.selectedFileIndex.reset();
-            panel.selectedFileUsesEdited = false;
-            panel.currentPathUsesEdited = false;
-            panel.linkedLoopLiveCameraMode =
-                LinkedLoopLiveCameraMode::InterleavedOverlay;
-            panel.linkedLoopTemporalOverlayWasActive = false;
-            panel.linkedLoopTemporalRenderFirstNext = true;
-        }
-        panel.currentPath = std::move(pendingLinkedPath.value());
-        panel.draftAnimationName = panel.currentPath->name;
-        panel.linkedLoopPaddingFrames =
-            panel.currentPath->linkedLoop.has_value()
-                ? panel.currentPath->linkedLoop->paddingFrames
-                : 0;
-        panel.linkedLoopStartKeyId =
-            panel.currentPath->linkedLoop.has_value()
-                ? panel.currentPath->linkedLoop->firstStartKeyId
-                : std::string{};
-        panel.selectedKeyIndex = 0U;
-        panel.scrubAmount = 0.0F;
-        panel.dirty = true;
-        panel.preparedPathCache = {};
-        panel.motionStatsCache = {};
-        panel.perceivedFlowCache = {};
-        runtimeState->animationPlayback.active = false;
-        runtimeState->cameraPlayback.active = false;
-        if (!pendingLinkedPathIsNew && currentVersionIndex.has_value()) {
-            panel.currentPathUsesEdited = true;
-            panel.selectedFileUsesEdited = true;
-            MarkRegistryAnimationDirty(
-                runtimeState,
-                currentVersionIndex.value());
-        }
-        SyncWaterAnimationTrailProfileFromCurrentAnimation(runtimeState);
-        ApplyAnimationScrub(runtimeState);
-        runtimeState->statusMessage = pendingLinkedPathIsNew
-                                          ? "Created an unsaved linked loop. Save it to add the linked animation to the project."
-                                          : "Rebuilt the linked animation from its current source versions. Save Changes to promote it.";
-        runtimeState->errorMessage.clear();
-        return;
-    }
 
     // Legacy scenario tracks remain serialized for round-trip compatibility,
     // but authored Timing Takes are the only reachable animation-water UI.
@@ -45862,28 +50904,304 @@ void DrawAnimationSection(
         panel.editTarget = editTargetIndex == 0 ? AnimationEditTarget::Camera : AnimationEditTarget::Focus;
     }
 
+    const auto playheadFrameForPath = [](const AnimationPath& path,
+                                         float normalizedPosition) {
+        return static_cast<std::uint32_t>(std::lround(
+            std::clamp(normalizedPosition, 0.0F, 1.0F) *
+            static_cast<float>(
+                EffectiveAnimationKeyDurationFrames(path))));
+    };
+    const auto insertKeyAtPlayhead = [&](bool captureLiveCamera) {
+        const std::uint32_t totalFrames =
+            EffectiveAnimationKeyDurationFrames(animationPath);
+        const std::uint32_t playheadFrame =
+            playheadFrameForPath(animationPath, panel.scrubAmount);
+        const bool existingKeyAtFrame = std::any_of(
+            animationPath.keys.begin(),
+            animationPath.keys.end(),
+            [&](const auto& existing) {
+                const auto index = static_cast<std::size_t>(
+                    &existing - animationPath.keys.data());
+                return static_cast<std::uint32_t>(std::lround(
+                           invisible_places::camera::
+                               AnimationPathKeyNormalizedPosition(
+                                   animationPath,
+                                   index) *
+                           static_cast<float>(totalFrames))) ==
+                       playheadFrame;
+            });
+        if (animationPath.keys.size() < 2U || playheadFrame == 0U ||
+            playheadFrame >= totalFrames || existingKeyAtFrame) {
+            runtimeState->errorMessage = existingKeyAtFrame
+                ? "A key already occupies the current playhead frame. Scrub between keys before adding another."
+                : "Scrub between the first and last animation frames before adding a key.";
+            runtimeState->statusMessage.clear();
+            return;
+        }
+
+        invisible_places::camera::AnimationPathKey insertedKey;
+        bool usedSurfaceHit = false;
+        float resolvedFocusDistance = 0.0F;
+        if (captureLiveCamera) {
+            auto camera = runtimeState->camera.CaptureState();
+            const auto focus = ResolveLiveAnimationKeyFocus(
+                *runtimeState,
+                animationPath,
+                camera);
+            camera.target = focus.point;
+            camera.focusDistance = focus.distance;
+            invisible_places::camera::AnimationPathEvaluation evaluation;
+            evaluation.camera = camera;
+            evaluation.focusPoint = focus.point;
+            evaluation.focusDistance = focus.distance;
+            insertedKey = MakeAnimationKeyFromEvaluation(
+                animationPath,
+                evaluation,
+                "Current Camera");
+            usedSurfaceHit = focus.surfaceHit;
+            resolvedFocusDistance = focus.distance;
+        } else {
+            const float normalizedFrame =
+                static_cast<float>(playheadFrame) /
+                static_cast<float>(totalFrames);
+            const auto evaluation =
+                invisible_places::camera::EvaluateAnimationPath(
+                    animationPath,
+                    invisible_places::camera::
+                            AnimationPathDurationSeconds(animationPath) *
+                        normalizedFrame);
+            insertedKey = MakeAnimationKeyFromEvaluation(
+                animationPath,
+                evaluation,
+                "Animation Playhead");
+        }
+
+        std::optional<std::size_t> registryIndex;
+        auto* editablePath = MutableCurrentAnimationForKeyEditing(
+            runtimeState,
+            &registryIndex);
+        if (editablePath == nullptr) {
+            runtimeState->errorMessage =
+                "The active animation is no longer editable.";
+            runtimeState->statusMessage.clear();
+            return;
+        }
+        std::string insertionError;
+        const auto insertionIndex = invisible_places::camera::
+            InsertAnimationPathKeyAtFrame(
+                editablePath,
+                std::move(insertedKey),
+                playheadFrame,
+                &insertionError);
+        if (!insertionIndex.has_value()) {
+            runtimeState->errorMessage = insertionError;
+            runtimeState->statusMessage.clear();
+            return;
+        }
+        panel.selectedKeyIndex = insertionIndex.value();
+        panel.scrubAmount =
+            static_cast<float>(playheadFrame) /
+            static_cast<float>(totalFrames);
+        const bool confirmedDraft = FinalizeAnimationKeyStructureEdit(
+            runtimeState,
+            registryIndex);
+        runtimeState->statusMessage = captureLiveCamera
+            ? "Added the current camera as key " +
+                  std::to_string(insertionIndex.value() + 1U) +
+                  " at frame " + std::to_string(playheadFrame) +
+                  (usedSurfaceHit
+                       ? "; focus ray hit the point cloud at "
+                       : "; no point-cloud hit, so focus used the other keys' mean distance of ") +
+                  FormatFixed(resolvedFocusDistance, 3) + " m."
+            : "Added an evaluated animation key at frame " +
+                  std::to_string(playheadFrame) + ".";
+        if (confirmedDraft) {
+            runtimeState->statusMessage +=
+                " The visible velocity alignment was confirmed before the structural edit.";
+        }
+        runtimeState->errorMessage.clear();
+    };
+
+    const auto playheadFrame =
+        playheadFrameForPath(animationPath, panel.scrubAmount);
+    ImGui::TextDisabled(
+        "Playhead frame %u / %u",
+        static_cast<unsigned>(playheadFrame),
+        static_cast<unsigned>(
+            EffectiveAnimationKeyDurationFrames(animationPath)));
+    if (ImGui::Button("Add Key at Playhead")) {
+        insertKeyAtPlayhead(false);
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+        ImGui::SetTooltip(
+            "Inserts the animation's evaluated camera and focus at the current playhead. The containing segment is split without changing total duration.");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Add Current Camera Key")) {
+        insertKeyAtPlayhead(true);
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+        ImGui::SetTooltip(
+            "Inserts the live viewport camera at the playhead. Focus raycasts from the screen centre; if no cloud is hit, it uses the mean camera-to-focus distance of the existing keys.");
+    }
+
+    std::optional<std::array<std::size_t, 2>> requestedKeyReorder;
     if (ImGui::BeginListBox("Animation Keys", ImVec2{-FLT_MIN, 110.0F})) {
         for (std::size_t index = 0; index < animationPath.keys.size(); ++index) {
             const auto& listKey = animationPath.keys[index];
             const auto keyCameraLabel =
                 !listKey.linkedCameraName.empty()
                     ? listKey.linkedCameraName
-                    : (!listKey.linkedCameraId.empty() ? std::string{"Linked Camera"} : std::string{"Unlinked"});
-            const auto label = std::to_string(index + 1U) + "  " + keyCameraLabel;
+                : !listKey.linkedCameraId.empty()
+                    ? std::string{"Linked Camera"}
+                : !listKey.sourceShotName.empty()
+                    ? listKey.sourceShotName
+                    : std::string{"Unlinked"};
+            const auto keyFrame = static_cast<std::uint32_t>(std::lround(
+                invisible_places::camera::
+                    AnimationPathKeyNormalizedPosition(
+                        animationPath,
+                        index) *
+                static_cast<float>(
+                    EffectiveAnimationKeyDurationFrames(animationPath))));
+            const auto label = std::to_string(index + 1U) +
+                "  [" + std::to_string(keyFrame) + "f]  " +
+                keyCameraLabel;
             const bool selected = panel.selectedKeyIndex.has_value() && panel.selectedKeyIndex.value() == index;
+            ImGui::PushID(static_cast<int>(index));
             if (ImGui::Selectable(label.c_str(), selected)) {
                 panel.selectedKeyIndex = index;
             }
             if (selected) {
                 ImGui::SetItemDefaultFocus();
             }
+            if (ImGui::BeginDragDropSource()) {
+                ImGui::SetDragDropPayload(
+                    "ANIMATION_KEY_REORDER",
+                    &index,
+                    sizeof(index));
+                ImGui::Text("Move key %zu", index + 1U);
+                ImGui::EndDragDropSource();
+            }
+            if (ImGui::BeginDragDropTarget()) {
+                if (const auto* payload = ImGui::AcceptDragDropPayload(
+                        "ANIMATION_KEY_REORDER");
+                    payload != nullptr &&
+                    payload->DataSize == sizeof(std::size_t)) {
+                    const auto sourceIndex =
+                        *static_cast<const std::size_t*>(payload->Data);
+                    if (sourceIndex != index) {
+                        requestedKeyReorder =
+                            std::array<std::size_t, 2>{
+                                sourceIndex,
+                                index,
+                            };
+                    }
+                }
+                ImGui::EndDragDropTarget();
+            }
+            ImGui::PopID();
         }
         ImGui::EndListBox();
+    }
+    ImGui::TextDisabled(
+        "Drag a key onto another row to change pose order; frame slots stay fixed.");
+
+    if (requestedKeyReorder.has_value()) {
+        const auto sourceIndex = requestedKeyReorder.value()[0U];
+        const auto destinationIndex = requestedKeyReorder.value()[1U];
+        if (sourceIndex < animationPath.keys.size() &&
+            destinationIndex < animationPath.keys.size()) {
+            const std::string movedKeyId =
+                animationPath.keys[sourceIndex].id;
+            std::optional<std::size_t> registryIndex;
+            auto* editablePath = MutableCurrentAnimationForKeyEditing(
+                runtimeState,
+                &registryIndex);
+            if (editablePath != nullptr &&
+                invisible_places::camera::ReorderAnimationPathKey(
+                    editablePath,
+                    sourceIndex,
+                    destinationIndex)) {
+                const auto selected = std::find_if(
+                    editablePath->keys.begin(),
+                    editablePath->keys.end(),
+                    [&](const auto& candidate) {
+                        return candidate.id == movedKeyId;
+                    });
+                panel.selectedKeyIndex = selected != editablePath->keys.end()
+                    ? std::optional<std::size_t>{
+                          static_cast<std::size_t>(std::distance(
+                              editablePath->keys.begin(),
+                              selected))}
+                    : std::nullopt;
+                const bool confirmedDraft =
+                    FinalizeAnimationKeyStructureEdit(
+                        runtimeState,
+                        registryIndex);
+                runtimeState->statusMessage =
+                    "Moved the animation key to position " +
+                    std::to_string(destinationIndex + 1U) +
+                    " while retaining the timeline's frame slots.";
+                if (confirmedDraft) {
+                    runtimeState->statusMessage +=
+                        " The visible velocity alignment was confirmed before the structural edit.";
+                }
+                runtimeState->errorMessage.clear();
+            }
+        }
     }
 
     if (!panel.selectedKeyIndex.has_value() || panel.selectedKeyIndex.value() >= animationPath.keys.size()) {
         EndPanelSection();
         return;
+    }
+
+    ImGui::BeginDisabled(animationPath.keys.size() <= 2U);
+    if (ImGui::Button("Remove Selected Key")) {
+        const auto removedIndex = panel.selectedKeyIndex.value();
+        const auto removedName =
+            animationPath.keys[removedIndex].sourceShotName;
+        std::optional<std::size_t> registryIndex;
+        auto* editablePath = MutableCurrentAnimationForKeyEditing(
+            runtimeState,
+            &registryIndex);
+        std::string removalError;
+        if (editablePath != nullptr &&
+            invisible_places::camera::RemoveAnimationPathKey(
+                editablePath,
+                removedIndex,
+                &removalError)) {
+            panel.selectedKeyIndex = std::min(
+                removedIndex,
+                editablePath->keys.size() - 1U);
+            const bool confirmedDraft = FinalizeAnimationKeyStructureEdit(
+                runtimeState,
+                registryIndex);
+            runtimeState->statusMessage =
+                "Removed animation key " +
+                std::to_string(removedIndex + 1U) +
+                (removedName.empty()
+                     ? "."
+                     : " (" + removedName + ").");
+            if (confirmedDraft) {
+                runtimeState->statusMessage +=
+                    " The visible velocity alignment was confirmed before the structural edit.";
+            }
+            runtimeState->errorMessage.clear();
+        } else if (!removalError.empty()) {
+            runtimeState->errorMessage = removalError;
+            runtimeState->statusMessage.clear();
+        }
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(
+            ImGuiHoveredFlags_DelayNormal |
+            ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip(
+            animationPath.keys.size() <= 2U
+                ? "An animation must retain at least two keys."
+                : "Removes only this animation key. Linked camera shots remain available; Discard Edits restores the saved animation.");
     }
 
     auto& key = animationPath.keys[panel.selectedKeyIndex.value()];
@@ -46068,7 +51386,8 @@ ProjectDocument BuildProjectDocumentForSave(
 
 std::filesystem::path CurrentAnimationSavePath(
     const PreviewRuntimeState& runtimeState,
-    bool saveAs) {
+    bool saveAs,
+    std::string_view saveAsName = {}) {
     const auto& panel = runtimeState.animationPanel;
     if (!saveAs && !panel.currentFilePath.empty()) {
         return std::filesystem::path{panel.currentFilePath};
@@ -46076,10 +51395,42 @@ std::filesystem::path CurrentAnimationSavePath(
     if (!panel.currentPath.has_value()) {
         return {};
     }
-    const auto name = panel.draftAnimationName.empty()
+    const auto name = saveAs && !TrimText(std::string{saveAsName}).empty()
+                          ? NormalizeAnimationNameFromInput(
+                                std::string{saveAsName})
+                      : panel.draftAnimationName.empty()
                           ? panel.currentPath->name
                           : panel.draftAnimationName;
     return UniqueAnimationFilePathForName(runtimeState, name);
+}
+
+void UpdateAnimationSaveAsDialogTarget(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr ||
+        !runtimeState->saveChanges.animationSaveAs) {
+        return;
+    }
+    auto& dialog = runtimeState->saveChanges;
+    const auto enteredName = TrimText(dialog.animationSaveAsName);
+    const auto targetPath = enteredName.empty()
+        ? std::filesystem::path{}
+        : CurrentAnimationSavePath(
+              *runtimeState,
+              true,
+              enteredName);
+    for (auto& item : dialog.items) {
+        if (item.kind != SaveChangesItemKind::Animation ||
+            !item.currentAnimation) {
+            continue;
+        }
+        item.targetPath = targetPath;
+        item.displayName = targetPath.empty()
+            ? "Animation — enter a new name"
+            : "Animation — " +
+                  AnimationDisplayNameFromPath(targetPath) +
+                  " (new standalone file)";
+        break;
+    }
 }
 
 void RequestSaveChangesDialog(
@@ -46097,6 +51448,15 @@ void RequestSaveChangesDialog(
     dialog.requested = true;
     dialog.closeAfterSave = request == SaveChangesRequest::Closing;
     dialog.allowItemSelection = !dialog.closeAfterSave;
+    dialog.animationSaveAs =
+        request == SaveChangesRequest::AnimationAs;
+    if (dialog.animationSaveAs && panel.currentPath.has_value()) {
+        dialog.animationSaveAsName =
+            panel.draftAnimationName.empty()
+                ? panel.currentPath->name
+                : panel.draftAnimationName;
+        dialog.focusAnimationSaveAsName = true;
+    }
 
     if (!runtimeState->persistence.projectFilePath.empty() ||
         request == SaveChangesRequest::Project) {
@@ -46135,7 +51495,10 @@ void RequestSaveChangesDialog(
     if (currentAnimationNeedsSave) {
         const bool saveAs = request == SaveChangesRequest::AnimationAs;
         const auto targetPath =
-            CurrentAnimationSavePath(*runtimeState, saveAs);
+            CurrentAnimationSavePath(
+                *runtimeState,
+                saveAs,
+                dialog.animationSaveAsName);
         const auto& animation =
             currentHasEditedVersion
                 ? panel.availableFileEditedPaths[
@@ -46177,10 +51540,12 @@ void RequestSaveChangesDialog(
             .kind = SaveChangesItemKind::Animation,
             .targetPath = panel.availableFiles[index],
             .currentAnimation = false,
-            .selected = true,
+            .selected = !dialog.animationSaveAs,
             .displayName = "Animation — " + displayName + "_Edited",
         });
     }
+
+    UpdateAnimationSaveAsDialogTarget(runtimeState);
 
     runtimeState->errorMessage.clear();
 }
@@ -46189,6 +51554,8 @@ struct PreparedAnimationSave {
     std::filesystem::path targetPath;
     AnimationPath path;
     bool currentAnimation = false;
+    bool saveAsCopy = false;
+    bool detachedForSaveAs = false;
     std::optional<std::size_t> sourceRegistryIndex;
     std::filesystem::path sourcePath;
     std::string loopEditPairId;
@@ -46247,7 +51614,21 @@ std::optional<PreparedAnimationSave> PrepareAnimationSave(
             !PathsLexicallyEqual(
                 std::filesystem::path{panel.currentFilePath},
                 item.targetPath)) {
+            prepared.saveAsCopy = true;
             prepared.path.name = AnimationNameFromFilePath(item.targetPath);
+            prepared.detachedForSaveAs =
+                prepared.path.velocityBlendLink.has_value() ||
+                std::any_of(
+                    prepared.path.keys.begin(),
+                    prepared.path.keys.end(),
+                    [](const auto& key) {
+                        return !key.linkedCameraId.empty();
+                    });
+            prepared.path.velocityBlendLink.reset();
+            for (auto& key : prepared.path.keys) {
+                key.linkedCameraId.clear();
+                key.linkedCameraName.clear();
+            }
         }
 
         const bool savingDuringRenderSetupOverride =
@@ -46295,6 +51676,8 @@ std::optional<PreparedAnimationSave> PrepareAnimationSave(
     CanonicalizeAssociatedLayerPathsForSceneGroups(
         *runtimeState,
         &prepared.path.associatedLayerPaths);
+    prepared.path.sourceSchemaVersion =
+        invisible_places::serialization::kAnimationDocumentSchemaVersion;
     return prepared;
 }
 
@@ -46317,10 +51700,12 @@ void UpsertProjectSavedAnimation(
             .filePath = prepared.targetPath,
             .associatedLayerPaths =
                 prepared.path.associatedLayerPaths,
+            .velocityBlendLink = prepared.path.velocityBlendLink,
         });
     } else {
         entry->associatedLayerPaths =
             prepared.path.associatedLayerPaths;
+        entry->velocityBlendLink = prepared.path.velocityBlendLink;
     }
     project->hasSavedAnimationRegistry = true;
 }
@@ -46331,6 +51716,14 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
     }
 
     auto& dialog = runtimeState->saveChanges;
+    if (dialog.animationSaveAs) {
+        UpdateAnimationSaveAsDialogTarget(runtimeState);
+        if (TrimText(dialog.animationSaveAsName).empty()) {
+            dialog.errorMessage =
+                "Enter a name for the new animation.";
+            return false;
+        }
+    }
     std::vector<PreparedAnimationSave> animations;
     const SaveChangesItem* projectItem = nullptr;
     std::string saveError;
@@ -46367,18 +51760,20 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
         std::vector<const PreparedAnimationSave*>> loopPairSaves;
     std::unordered_set<std::size_t> selectedSourceIndices;
     for (const auto& animation : animations) {
-        if (animation.sourceRegistryIndex.has_value()) {
+        const bool overwritesSource =
+            animation.sourceRegistryIndex.has_value() &&
+            PathsLexicallyEqual(
+                animation.sourcePath,
+                animation.targetPath);
+        if (overwritesSource) {
             selectedSourceIndices.insert(
                 animation.sourceRegistryIndex.value());
         }
         if (!animation.loopEditPairId.empty()) {
-            if (!PathsLexicallyEqual(
-                    animation.sourcePath,
-                    animation.targetPath)) {
-                dialog.errorMessage =
-                    "Paired loop edits must be saved over their existing "
-                    "animation files; Save As would break the pair.";
-                return false;
+            if (animation.saveAsCopy) {
+                // Save As is a detached snapshot. It neither commits nor
+                // consumes the source pair's joint _Edited dependency.
+                continue;
             }
             loopPairSaves[animation.loopEditPairId].push_back(
                 &animation);
@@ -46387,8 +51782,8 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
     for (const auto& [pairId, pairAnimations] : loopPairSaves) {
         if (projectItem == nullptr) {
             dialog.errorMessage =
-                "Select the project and both _Edited animations so the "
-                "linked loop endpoints can be saved atomically.";
+                "Select the project and every affected _Edited animation "
+                "so the velocity-blend changes can be saved atomically.";
             return false;
         }
         std::size_t expectedPairMembers = 0U;
@@ -46402,15 +51797,16 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
             ++expectedPairMembers;
             if (!selectedSourceIndices.contains(index)) {
                 dialog.errorMessage =
-                    "Select both _Edited loop animations; this pair cannot "
-                    "be saved partially.";
+                    "Select every _Edited animation in this velocity-blend "
+                    "dependency group; it cannot be saved partially.";
                 return false;
             }
         }
-        if (expectedPairMembers != 2U || pairAnimations.size() != 2U) {
+        if (expectedPairMembers < 2U ||
+            pairAnimations.size() != expectedPairMembers) {
             dialog.errorMessage =
-                "The edited loop pair is incomplete. Discard the pair or "
-                "reapply smoothing before saving.";
+                "The edited velocity-blend dependency group is incomplete. "
+                "Discard its edits or reapply alignment before saving.";
             return false;
         }
     }
@@ -46418,6 +51814,47 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
     std::optional<ProjectDocument> project;
     if (projectItem != nullptr) {
         project = BuildProjectDocumentForSave(*runtimeState);
+        // BuildProjectDocumentForSave reflects the preferred in-memory
+        // _Edited variants. A save-window deselection must not leak those
+        // animation-only edits into the project registry, so restore every
+        // source that is not being overwritten in this transaction.
+        const auto& panel = runtimeState->animationPanel;
+        for (std::size_t index = 0U;
+             index < panel.availableFiles.size();
+             ++index) {
+            const bool overwritesSource = std::any_of(
+                animations.begin(),
+                animations.end(),
+                [&](const PreparedAnimationSave& animation) {
+                    return animation.sourceRegistryIndex == index &&
+                           PathsLexicallyEqual(
+                               animation.sourcePath,
+                               animation.targetPath);
+                });
+            if (overwritesSource) {
+                continue;
+            }
+            const auto* saved = SavedRegistryAnimationPath(
+                *runtimeState,
+                index);
+            if (saved == nullptr) {
+                continue;
+            }
+            const auto projectEntry = std::find_if(
+                project->savedAnimations.begin(),
+                project->savedAnimations.end(),
+                [&](const ProjectDocument::SavedAnimation& candidate) {
+                    return PathsLexicallyEqual(
+                        candidate.filePath,
+                        panel.availableFiles[index]);
+                });
+            if (projectEntry != project->savedAnimations.end()) {
+                projectEntry->associatedLayerPaths =
+                    saved->associatedLayerPaths;
+                projectEntry->velocityBlendLink =
+                    saved->velocityBlendLink;
+            }
+        }
         for (const auto& animation : animations) {
             UpsertProjectSavedAnimation(&project.value(), animation);
             if (animation.currentAnimation) {
@@ -46431,10 +51868,31 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
         }
         for (const auto& [pairId, pairAnimations] : loopPairSaves) {
             (void)pairId;
-            ApplyLoopEndpointsToCameraShots(
-                pairAnimations[0U]->path,
-                pairAnimations[1U]->path,
-                &project->cameraShots);
+            bool appliedLinkedPair = false;
+            for (std::size_t first = 0U;
+                 first < pairAnimations.size() && !appliedLinkedPair;
+                 ++first) {
+                const auto& firstPath = pairAnimations[first]->path;
+                if (!firstPath.velocityBlendLink.has_value()) {
+                    continue;
+                }
+                for (std::size_t second = first + 1U;
+                     second < pairAnimations.size();
+                     ++second) {
+                    const auto& secondPath = pairAnimations[second]->path;
+                    if (!secondPath.velocityBlendLink.has_value() ||
+                        firstPath.velocityBlendLink->pairId !=
+                            secondPath.velocityBlendLink->pairId) {
+                        continue;
+                    }
+                    ApplyLoopMovableKeysToCameraShots(
+                        firstPath,
+                        secondPath,
+                        &project->cameraShots);
+                    appliedLinkedPair = true;
+                    break;
+                }
+            }
         }
     }
 
@@ -46501,21 +51959,32 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
     }
 
     auto& panel = runtimeState->animationPanel;
+    const std::array<std::filesystem::path, 2> draftPaths =
+        panel.velocityAlignmentDraft.has_value()
+            ? std::array<std::filesystem::path, 2>{
+                  panel.velocityAlignmentDraft->firstFilePath,
+                  panel.velocityAlignmentDraft->secondFilePath,
+              }
+            : std::array<std::filesystem::path, 2>{};
+    const bool savedVelocityDraft =
+        panel.velocityAlignmentDraft.has_value() &&
+        std::all_of(
+            draftPaths.begin(),
+            draftPaths.end(),
+            [&](const std::filesystem::path& draftPath) {
+                return std::any_of(
+                    animations.begin(),
+                    animations.end(),
+                    [&](const PreparedAnimationSave& animation) {
+                        return PathsLexicallyEqual(
+                                   animation.sourcePath,
+                                   draftPath) &&
+                               PathsLexicallyEqual(
+                                   animation.targetPath,
+                                   draftPath);
+                    });
+            });
     for (const auto& animation : animations) {
-        if (!animation.sourcePath.empty() &&
-            !PathsLexicallyEqual(
-                animation.sourcePath,
-                animation.targetPath)) {
-            if (const auto sourceIndex = FindAnimationRegistryIndex(
-                    panel,
-                    animation.sourcePath);
-                sourceIndex.has_value()) {
-                panel.availableFileEditedPaths[sourceIndex.value()].reset();
-                panel.availableFileLoopEditPairIds[sourceIndex.value()].clear();
-                panel.availableFileDirtyFlags[sourceIndex.value()] = false;
-            }
-        }
-
         AddAnimationFileToRegistry(
             &panel,
             animation.targetPath,
@@ -46536,6 +52005,8 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
             panel.availableFileAssociatedLayerPaths[targetIndex.value()] =
                 animation.path.associatedLayerPaths;
             panel.availableFileDirtyFlags[targetIndex.value()] = false;
+            panel.brokenVelocityLinkPathKeys.erase(
+                NormalizePathKey(animation.targetPath));
         }
 
         if (animation.currentAnimation) {
@@ -46571,6 +52042,17 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
     if (!animations.empty()) {
         panel.animationRegistryInitialized = true;
     }
+    if (savedVelocityDraft) {
+        panel.velocityAlignmentDraft.reset();
+    }
+    if (project.has_value()) {
+        panel.projectVelocityLinksDirty = std::any_of(
+            panel.availableFileLoopEditPairIds.begin(),
+            panel.availableFileLoopEditPairIds.end(),
+            [](const std::string& dependencyId) {
+                return !dependencyId.empty();
+            });
+    }
     if (project.has_value() &&
         runtimeState->activeRenderSetupOverride.has_value()) {
         runtimeState->activeRenderSetupOverride->underlyingProject =
@@ -46582,9 +52064,30 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
         runtimeState->cameraPlayback.active = false;
     }
 
+    const bool detachedSaveAs = std::any_of(
+        animations.begin(),
+        animations.end(),
+        [](const PreparedAnimationSave& animation) {
+            return animation.detachedForSaveAs;
+        });
+    const bool savedAsCopy = std::any_of(
+        animations.begin(),
+        animations.end(),
+        [](const PreparedAnimationSave& animation) {
+            return animation.saveAsCopy;
+        });
     runtimeState->statusMessage =
         "Saved " + std::to_string(replacements.size()) +
-        (replacements.size() == 1U ? " file." : " files.");
+        (replacements.size() == 1U ? " file." : " files.") +
+        (savedVelocityDraft
+             ? " The visible velocity draft was confirmed automatically."
+             : "") +
+        (detachedSaveAs
+             ? " The new animation is independent of the source's velocity pair and linked camera controls."
+             : "") +
+        (savedAsCopy
+             ? " The source animation and any _Edited state were left unchanged."
+             : "");
     runtimeState->errorMessage.clear();
     dialog.errorMessage.clear();
     return true;
@@ -46636,6 +52139,21 @@ void DrawSaveChangesDialog(PreviewRuntimeState* runtimeState) {
     ImGui::TextWrapped(dialog.closeAfterSave
                            ? "These files contain the session state that can be saved before Invisible Places closes."
                            : "Select the changed files to save together.");
+    if (dialog.animationSaveAs) {
+        ImGui::Spacing();
+        if (dialog.focusAnimationSaveAsName) {
+            ImGui::SetKeyboardFocusHere();
+            dialog.focusAnimationSaveAsName = false;
+        }
+        if (InputTextString(
+                "New Animation Name",
+                &dialog.animationSaveAsName)) {
+            dialog.errorMessage.clear();
+        }
+        UpdateAnimationSaveAsDialogTarget(runtimeState);
+        ImGui::TextDisabled(
+            "A unique .ipanim.json file will be created; the source file is not overwritten.");
+    }
     ImGui::Spacing();
 
     ImGui::BeginDisabled(
@@ -46652,7 +52170,60 @@ void DrawSaveChangesDialog(PreviewRuntimeState* runtimeState) {
         const auto stableId = item.targetPath.generic_string();
         ImGui::PushID(stableId.c_str());
         if (dialog.allowItemSelection) {
-            ImGui::Checkbox("##save_item", &item.selected);
+            const bool selectionChanged =
+                ImGui::Checkbox("##save_item", &item.selected);
+            if (selectionChanged &&
+                item.kind == SaveChangesItemKind::Animation &&
+                !(dialog.animationSaveAs &&
+                  item.currentAnimation)) {
+                const auto sourcePath =
+                    item.currentAnimation &&
+                            !runtimeState->animationPanel.currentFilePath.empty()
+                        ? std::filesystem::path{
+                              runtimeState->animationPanel.currentFilePath}
+                        : item.targetPath;
+                const auto sourceIndex = FindAnimationRegistryIndex(
+                    runtimeState->animationPanel,
+                    sourcePath);
+                if (sourceIndex.has_value()) {
+                    const auto dependencyId =
+                        runtimeState->animationPanel
+                            .availableFileLoopEditPairIds[
+                                sourceIndex.value()];
+                    if (!dependencyId.empty()) {
+                        for (auto& candidate : dialog.items) {
+                            if (candidate.kind !=
+                                SaveChangesItemKind::Animation) {
+                                if (item.selected &&
+                                    candidate.kind ==
+                                        SaveChangesItemKind::Project) {
+                                    candidate.selected = true;
+                                }
+                                continue;
+                            }
+                            const auto candidateSourcePath =
+                                candidate.currentAnimation &&
+                                        !runtimeState->animationPanel
+                                             .currentFilePath.empty()
+                                    ? std::filesystem::path{
+                                          runtimeState->animationPanel
+                                              .currentFilePath}
+                                    : candidate.targetPath;
+                            const auto candidateIndex =
+                                FindAnimationRegistryIndex(
+                                    runtimeState->animationPanel,
+                                    candidateSourcePath);
+                            if (candidateIndex.has_value() &&
+                                runtimeState->animationPanel
+                                        .availableFileLoopEditPairIds[
+                                            candidateIndex.value()] ==
+                                    dependencyId) {
+                                candidate.selected = item.selected;
+                            }
+                        }
+                    }
+                }
+            }
             ImGui::SameLine();
             ImGui::TextUnformatted(item.displayName.c_str());
         } else {
@@ -46707,7 +52278,10 @@ void DrawSaveChangesDialog(PreviewRuntimeState* runtimeState) {
         [](const SaveChangesItem& item) {
             return item.selected;
         });
-    ImGui::BeginDisabled(!anySelected);
+    const bool saveAsNameMissing =
+        dialog.animationSaveAs &&
+        TrimText(dialog.animationSaveAsName).empty();
+    ImGui::BeginDisabled(!anySelected || saveAsNameMissing);
     const char* saveButtonLabel =
         dialog.closeAfterSave
             ? "Save All and Close"
@@ -51354,22 +56928,47 @@ void DrawWaterGpuRainPanel(
     }
     auto& water = runtimeState->water;
     auto& settings = water.collisionRainSettings;
+    const invisible_places::water::WaterKeyedFeatureId rainFeature{
+        .kind = invisible_places::water::WaterKeyedFeatureKind::Rain};
+    const std::array<invisible_places::water::WaterKeyedFeatureId, 1>
+        rainFeatures{rainFeature};
+    bool liveChanged = false;
+    const auto drawRainSlider =
+        [&](const char* settingId,
+            const char* label,
+            float* value,
+            float minimum,
+            float maximum,
+            const char* format,
+            ImGuiSliderFlags flags = ImGuiSliderFlags_None,
+            const char* help = nullptr) {
+            float edited = *value;
+            const auto result = DrawKeyedWaterSettingSlider(
+                runtimeState,
+                rainFeatures,
+                settingId,
+                label,
+                *value,
+                minimum,
+                maximum,
+                format,
+                flags,
+                false,
+                &edited,
+                {},
+                {},
+                help);
+            if (result.authoredChanged) {
+                *value = edited;
+                liveChanged = true;
+            }
+        };
 
     if (BeginPanelSection("Rain")) {
-        {
-            const auto scenario = ResolveActiveWaterScenarioState(*runtimeState);
-            DrawKeyedGlobalLevelRow(
-                runtimeState,
-                invisible_places::water::WaterKeyedFeatureKind::Rain,
-                "Rain Level",
-                scenario.has_value()
-                    ? std::clamp(scenario->rainLevel, 0.0F, 1.0F)
-                    : 0.0F);
-        }
         DrawEmbeddedWaterFeatureTimeline(
             runtimeState,
-            {.kind = invisible_places::water::WaterKeyedFeatureKind::Rain});
-        ImGui::Checkbox("Enabled##GpuRain", &settings.enabled);
+            rainFeature);
+        liveChanged |= ImGui::Checkbox("Enabled##GpuRain", &settings.enabled);
         const auto intensityLabel = invisible_places::water::WaterRainIntensityPresetLabel(
             static_cast<WaterRainIntensityPreset>(settings.intensityPreset));
         if (ImGui::BeginCombo("Intensity", intensityLabel.data())) {
@@ -51379,6 +56978,7 @@ void DrawWaterGpuRainPanel(
                 const auto label = invisible_places::water::WaterRainIntensityPresetLabel(preset);
                 if (ImGui::Selectable(label.data(), selected)) {
                     settings.intensityPreset = runtimePreset;
+                    liveChanged = true;
                 }
                 if (selected) {
                     ImGui::SetItemDefaultFocus();
@@ -51386,22 +56986,62 @@ void DrawWaterGpuRainPanel(
             }
             ImGui::EndCombo();
         }
-        ImGui::SliderFloat("Rain Amount", &settings.rainLevel, 0.0F, 1.0F, "%.2f");
+        drawRainSlider(
+            "level",
+            "Rain Amount",
+            &settings.rainLevel,
+            0.0F,
+            1.0F,
+            "%.2f",
+            ImGuiSliderFlags_None,
+            "Animates rain births continuously. A keyed zero stops new rain "
+            "while existing impact effects finish fading.");
         int activeParticles = static_cast<int>(settings.activeParticleCount);
         if (ImGui::SliderInt("Particle Limit", &activeParticles, 1, 32768)) {
             settings.activeParticleCount = static_cast<std::uint32_t>(std::clamp(activeParticles, 1, 32768));
+            liveChanged = true;
         }
-        ImGui::SliderFloat("Density", &settings.density, 0.0F, 1.0F, "%.2f");
-        ImGui::SliderFloat(
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "The integer particle cap is immediate but not keyable. Use "
+                "Rain Amount or Density for a smooth population change.");
+        }
+        drawRainSlider(
+            "density",
+            "Density",
+            &settings.density,
+            0.0F,
+            1.0F,
+            "%.2f");
+        drawRainSlider(
+            "fall_speed",
             "Fall Speed",
             &settings.fallSpeedMetersPerSecond,
             0.2F,
             35.0F,
             "%.1f m/s",
             ImGuiSliderFlags_Logarithmic);
-        ImGui::SliderFloat("Drop Scale", &settings.dropletSizeScale, 0.2F, 4.0F, "%.2f");
-        ImGui::SliderFloat("Visibility", &settings.opacityScale, 0.0F, 3.0F, "%.2f");
-        ImGui::SliderFloat("Glow", &settings.emissionScale, 0.0F, 4.0F, "%.2f");
+        drawRainSlider(
+            "drop_scale",
+            "Drop Scale",
+            &settings.dropletSizeScale,
+            0.2F,
+            4.0F,
+            "%.2f");
+        drawRainSlider(
+            "visibility",
+            "Visibility",
+            &settings.opacityScale,
+            0.0F,
+            3.0F,
+            "%.2f");
+        drawRainSlider(
+            "glow",
+            "Glow",
+            &settings.emissionScale,
+            0.0F,
+            4.0F,
+            "%.2f");
         int seed = static_cast<int>(settings.seed);
         const bool rainInRun = WaterFeatureIsInTimingRun(
             *runtimeState,
@@ -51409,6 +57049,7 @@ void DrawWaterGpuRainPanel(
         BeginWaterRegenerativeSettingLabels(rainInRun);
         if (ImGui::InputInt("Seed", &seed)) {
             settings.seed = static_cast<std::uint32_t>(std::max(0, seed));
+            liveChanged = true;
         }
         EndWaterRegenerativeSettingLabels(rainInRun);
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
@@ -51426,6 +57067,7 @@ void DrawWaterGpuRainPanel(
                 if (ImGui::Selectable(name.data(), selected)) {
                     settings.visualProfileName = std::string{name};
                     water.rainVisual = invisible_places::water::RainVisualPreset(name);
+                    liveChanged = true;
                 }
                 if (selected) {
                     ImGui::SetItemDefaultFocus();
@@ -51433,26 +57075,73 @@ void DrawWaterGpuRainPanel(
             }
             ImGui::EndCombo();
         }
-        ImGui::ColorEdit3("Colour", water.rainVisual.colour.data());
-        ImGui::SliderFloat(
+        auto editedColour = water.rainVisual.colour;
+        const auto colourResult = DrawKeyedWaterColourSetting(
+            runtimeState,
+            rainFeatures,
+            {"visual.colour_red",
+             "visual.colour_green",
+             "visual.colour_blue"},
+            "Colour",
+            water.rainVisual.colour,
+            &editedColour,
+            "rain_visual",
+            settings.visualProfileName);
+        if (colourResult.authoredChanged) {
+            water.rainVisual.colour = editedColour;
+            liveChanged = true;
+        }
+        drawRainSlider(
+            "visual.width",
             "Width",
             &water.rainVisual.widthMeters,
             0.0003F,
             0.020F,
             "%.4f m",
             ImGuiSliderFlags_Logarithmic);
-        ImGui::SliderFloat(
+        drawRainSlider(
+            "visual.streak_length",
             "Streak Length",
             &water.rainVisual.streakLengthMeters,
             0.005F,
             0.80F,
             "%.3f m",
             ImGuiSliderFlags_Logarithmic);
-        ImGui::SliderFloat("Softness", &water.rainVisual.softness, 0.0F, 1.0F, "%.2f");
-        ImGui::SliderFloat("Opacity", &water.rainVisual.opacity, 0.0F, 1.0F, "%.2f");
-        ImGui::SliderFloat("Emission", &water.rainVisual.emission, 0.0F, 2.0F, "%.2f");
-        ImGui::SliderFloat("Minimum Pixels", &water.rainVisual.minimumScreenPixels, 0.0F, 3.0F, "%.2f px");
-        ImGui::SliderFloat("Maximum Pixels", &water.rainVisual.maximumScreenPixels, 0.5F, 12.0F, "%.2f px");
+        drawRainSlider(
+            "visual.softness",
+            "Softness",
+            &water.rainVisual.softness,
+            0.0F,
+            1.0F,
+            "%.2f");
+        drawRainSlider(
+            "visual.opacity",
+            "Opacity",
+            &water.rainVisual.opacity,
+            0.0F,
+            1.0F,
+            "%.2f");
+        drawRainSlider(
+            "visual.emission",
+            "Emission",
+            &water.rainVisual.emission,
+            0.0F,
+            2.0F,
+            "%.2f");
+        drawRainSlider(
+            "visual.minimum_pixels",
+            "Minimum Pixels",
+            &water.rainVisual.minimumScreenPixels,
+            0.0F,
+            3.0F,
+            "%.2f px");
+        drawRainSlider(
+            "visual.maximum_pixels",
+            "Maximum Pixels",
+            &water.rainVisual.maximumScreenPixels,
+            0.5F,
+            12.0F,
+            "%.2f px");
         water.rainVisual.maximumScreenPixels = std::max(
             water.rainVisual.minimumScreenPixels,
             water.rainVisual.maximumScreenPixels);
@@ -51460,33 +57149,116 @@ void DrawWaterGpuRainPanel(
     }
 
     if (BeginPanelSection("Weather")) {
-        float windDirection[2] = {settings.windDirectionX, settings.windDirectionY};
-        if (ImGui::InputFloat2("Wind Direction", windDirection, "%.2f")) {
-            settings.windDirectionX = windDirection[0];
-            settings.windDirectionY = windDirection[1];
+        drawRainSlider(
+            "weather.wind_direction_x",
+            "Wind Direction X",
+            &settings.windDirectionX,
+            -1.0F,
+            1.0F,
+            "%.2f");
+        drawRainSlider(
+            "weather.wind_direction_y",
+            "Wind Direction Y",
+            &settings.windDirectionY,
+            -1.0F,
+            1.0F,
+            "%.2f");
+        drawRainSlider(
+            "weather.wind_speed",
+            "Wind Speed",
+            &settings.windSpeedMetersPerSecond,
+            0.0F,
+            8.0F,
+            "%.2f m/s");
+        drawRainSlider(
+            "weather.turbulence",
+            "Turbulence",
+            &settings.turbulence,
+            0.0F,
+            2.0F,
+            "%.2f");
+        drawRainSlider(
+            "weather.gust_strength",
+            "Gust Strength",
+            &settings.gustStrength,
+            0.0F,
+            1.5F,
+            "%.2f");
+        drawRainSlider(
+            "weather.gust_scale",
+            "Gust Scale",
+            &settings.gustScaleMeters,
+            0.2F,
+            50.0F,
+            "%.1f m");
+        drawRainSlider(
+            "weather.gust_speed",
+            "Gust Speed",
+            &settings.gustSpeedMetersPerSecond,
+            0.0F,
+            12.0F,
+            "%.1f m/s");
+        drawRainSlider(
+            "weather.front_strength",
+            "Front Strength",
+            &settings.weatherFrontStrength,
+            0.0F,
+            1.0F,
+            "%.2f");
+        drawRainSlider(
+            "weather.front_scale",
+            "Front Scale",
+            &settings.weatherFrontScaleMeters,
+            0.5F,
+            100.0F,
+            "%.1f m");
+        drawRainSlider(
+            "weather.front_speed",
+            "Front Speed",
+            &settings.weatherFrontSpeedMetersPerSecond,
+            0.0F,
+            12.0F,
+            "%.1f m/s");
+        liveChanged |= ImGui::SliderFloat(
+            "Spawn Height",
+            &settings.spawnHeightMeters,
+            0.1F,
+            80.0F,
+            "%.1f m");
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Applies to newly born drops only, so it remains authored "
+                "rather than mixing old and new spawn heights in a key.");
         }
-        ImGui::SliderFloat("Wind Speed", &settings.windSpeedMetersPerSecond, 0.0F, 8.0F, "%.2f m/s");
-        ImGui::SliderFloat("Turbulence", &settings.turbulence, 0.0F, 2.0F, "%.2f");
-        ImGui::SliderFloat("Gust Strength", &settings.gustStrength, 0.0F, 1.5F, "%.2f");
-        ImGui::SliderFloat("Gust Scale", &settings.gustScaleMeters, 0.2F, 50.0F, "%.1f m");
-        ImGui::SliderFloat("Gust Speed", &settings.gustSpeedMetersPerSecond, 0.0F, 12.0F, "%.1f m/s");
-        ImGui::SliderFloat("Front Strength", &settings.weatherFrontStrength, 0.0F, 1.0F, "%.2f");
-        ImGui::SliderFloat("Front Scale", &settings.weatherFrontScaleMeters, 0.5F, 100.0F, "%.1f m");
-        ImGui::SliderFloat("Front Speed", &settings.weatherFrontSpeedMetersPerSecond, 0.0F, 12.0F, "%.1f m/s");
-        ImGui::SliderFloat("Spawn Height", &settings.spawnHeightMeters, 0.1F, 80.0F, "%.1f m");
-        ImGui::SliderFloat("Spawn Radius", &settings.spawnRadiusMeters, 0.5F, 80.0F, "%.1f m");
-        ImGui::SliderFloat(
+        liveChanged |= ImGui::SliderFloat(
+            "Spawn Radius",
+            &settings.spawnRadiusMeters,
+            0.5F,
+            80.0F,
+            "%.1f m");
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Applies to newly born drops only and is not keyable.");
+        }
+        liveChanged |= ImGui::SliderFloat(
             "Camera Death",
             &settings.cameraDeathDistanceMeters,
             1.0F,
             250.0F,
             "%.1f m",
             ImGuiSliderFlags_Logarithmic);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "This threshold kills drops abruptly, so it remains "
+                "authored-only.");
+        }
         EndPanelSection();
     }
 
     if (BeginPanelSection("Impact Effects")) {
-        ImGui::Checkbox("Enabled##RainImpacts", &settings.impactEffectsEnabled);
+        liveChanged |= ImGui::Checkbox(
+            "Enabled##RainImpacts",
+            &settings.impactEffectsEnabled);
         if (!settings.impactEffectsEnabled) {
             ImGui::BeginDisabled();
         }
@@ -51495,40 +57267,53 @@ void DrawWaterGpuRainPanel(
         // Rings and Wetness consume every ground impact, while Droplets
         // consume vegetation impacts. Each response is applied by effect
         // after collision, so none of these sliders selects a cloud role.
-        ImGui::Checkbox("Rings", &settings.sandEffectsEnabled);
+        liveChanged |= ImGui::Checkbox("Rings", &settings.sandEffectsEnabled);
         ImGui::SameLine();
-        ImGui::Checkbox("Wetness", &settings.rockEffectsEnabled);
+        liveChanged |= ImGui::Checkbox("Wetness", &settings.rockEffectsEnabled);
         ImGui::SameLine();
-        ImGui::Checkbox("Droplets", &settings.vegetationEffectsEnabled);
-        ImGui::SliderFloat("Rings Response", &settings.sandEffectScale, 0.0F, 3.0F, "%.2f");
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
-            ImGui::SetTooltip(
-                "Scales expanding rings around every eligible ground impact "
-                "and on every rendered cloud inside the Rings height band.");
-        }
-        ImGui::SliderFloat(
+        liveChanged |= ImGui::Checkbox(
+            "Droplets",
+            &settings.vegetationEffectsEnabled);
+        drawRainSlider(
+            "effects.rings_response",
+            "Rings Response",
+            &settings.sandEffectScale,
+            0.0F,
+            3.0F,
+            "%.2f",
+            ImGuiSliderFlags_None,
+            "Scales expanding rings around every eligible ground impact "
+            "and on every rendered cloud inside the Rings height band.");
+        drawRainSlider(
+            "effects.ring_thickness",
             "Ring Thickness",
             &settings.ringImpact.thicknessScale,
             0.25F,
             2.0F,
-            "%.2f x");
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
-            ImGui::SetTooltip(
-                "Scales the width of each expanding ring without changing "
-                "its radius or travel speed. 0.50 is half the legacy width.");
-        }
-        ImGui::SliderFloat("Wetness Response", &settings.rockEffectScale, 0.0F, 3.0F, "%.2f");
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
-            ImGui::SetTooltip(
-                "Scales the wet-surface response around every eligible "
-                "ground impact and on every cloud inside the Wetness band.");
-        }
-        ImGui::SliderFloat("Droplets Response", &settings.vegetationEffectScale, 0.0F, 3.0F, "%.2f");
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
-            ImGui::SetTooltip(
-                "Scales vegetation-impact droplets on every rendered cloud "
-                "inside the Droplets height band.");
-        }
+            "%.2f x",
+            ImGuiSliderFlags_None,
+            "Scales the width of each expanding ring without changing its "
+            "radius or travel speed. 0.50 is half the legacy width.");
+        drawRainSlider(
+            "effects.wetness_response",
+            "Wetness Response",
+            &settings.rockEffectScale,
+            0.0F,
+            3.0F,
+            "%.2f",
+            ImGuiSliderFlags_None,
+            "Scales the wet-surface response around every eligible ground "
+            "impact and on every cloud inside the Wetness band.");
+        drawRainSlider(
+            "effects.droplets_response",
+            "Droplets Response",
+            &settings.vegetationEffectScale,
+            0.0F,
+            3.0F,
+            "%.2f",
+            ImGuiSliderFlags_None,
+            "Scales vegetation-impact droplets on every rendered cloud "
+            "inside the Droplets height band.");
         if (!settings.impactEffectsEnabled) {
             ImGui::EndDisabled();
         }
@@ -51536,21 +57321,30 @@ void DrawWaterGpuRainPanel(
     }
 
     if (BeginPanelSection("Near Surface")) {
-        ImGui::SliderFloat(
+        drawRainSlider(
+            "near_surface.approach_distance",
             "Approach Distance",
             &settings.nearSurface.approachDistanceMeters,
             0.01F,
             1.0F,
             "%.2f m",
             ImGuiSliderFlags_Logarithmic);
-        ImGui::SliderFloat(
+        drawRainSlider(
+            "near_surface.minimum_speed",
             "Minimum Speed",
             &settings.nearSurface.minimumSpeedFactor,
             0.05F,
             1.0F,
             "%.2f");
-        ImGui::SliderFloat("Squish", &settings.nearSurface.squish, 0.0F, 1.0F, "%.2f");
-        ImGui::SliderFloat(
+        drawRainSlider(
+            "near_surface.squish",
+            "Squish",
+            &settings.nearSurface.squish,
+            0.0F,
+            1.0F,
+            "%.2f");
+        drawRainSlider(
+            "near_surface.normal_alignment",
             "Normal Alignment",
             &settings.nearSurface.normalAlignment,
             0.0F,
@@ -51564,7 +57358,10 @@ void DrawWaterGpuRainPanel(
     // strength inside [Min Z, Max Z] and fade linearly to zero over the fade
     // distance beyond each bounded edge. Unchecking a limit opens that edge.
     const auto drawImpactHeightBand =
-        [](invisible_places::water::RainImpactHeightBand* band) {
+        [&](invisible_places::water::RainImpactHeightBand* band,
+            const char* minimumSettingId,
+            const char* maximumSettingId,
+            const char* fadeSettingId) {
             constexpr float kUnbounded =
                 invisible_places::water::kRainImpactBandUnbounded;
             bool lowerBounded = band->minZ > -kUnbounded * 0.5F;
@@ -51574,9 +57371,16 @@ void DrawWaterGpuRainPanel(
                                         ? band->maxZ - 1.0F
                                         : 0.0F)
                                  : -kUnbounded;
+                liveChanged = true;
             }
             if (lowerBounded) {
-                ImGui::SliderFloat("Band Min Z", &band->minZ, -2.0F, 12.0F, "%.2f m");
+                drawRainSlider(
+                    minimumSettingId,
+                    "Band Min Z",
+                    &band->minZ,
+                    -2.0F,
+                    12.0F,
+                    "%.2f m");
             }
             bool upperBounded = band->maxZ < kUnbounded * 0.5F;
             if (ImGui::Checkbox("Limit Upper Z", &upperBounded)) {
@@ -51585,77 +57389,145 @@ void DrawWaterGpuRainPanel(
                                         ? band->minZ + 1.0F
                                         : 2.0F)
                                  : kUnbounded;
+                liveChanged = true;
             }
             if (upperBounded) {
-                ImGui::SliderFloat("Band Max Z", &band->maxZ, -2.0F, 12.0F, "%.2f m");
+                drawRainSlider(
+                    maximumSettingId,
+                    "Band Max Z",
+                    &band->maxZ,
+                    -2.0F,
+                    12.0F,
+                    "%.2f m");
                 band->maxZ = std::max(band->maxZ, std::min(band->minZ, 12.0F));
             }
-            ImGui::SliderFloat("Band Fade", &band->fadeMeters, 0.01F, 2.0F, "%.2f m");
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "The effect fades from full strength at the band edge to "
-                    "none this many metres beyond it.");
-            }
+            drawRainSlider(
+                fadeSettingId,
+                "Band Fade",
+                &band->fadeMeters,
+                0.01F,
+                2.0F,
+                "%.2f m",
+                ImGuiSliderFlags_None,
+                "The effect fades from full strength at the band edge to "
+                "none this many metres beyond it.");
         };
 
     if (BeginPanelSection("Rings Tuning")) {
         ImGui::PushID("SandImpactBand");
-        drawImpactHeightBand(&settings.sandImpactBand);
+        drawImpactHeightBand(
+            &settings.sandImpactBand,
+            "rings.band_min_z",
+            "rings.band_max_z",
+            "rings.band_fade");
         ImGui::PopID();
         EndPanelSection();
     }
 
     if (BeginPanelSection("Wetness Tuning")) {
-        ImGui::SliderFloat("Edge Breakup", &settings.rockImpact.edgeBreakup, 0.0F, 1.0F, "%.2f");
-        ImGui::SliderFloat("Spread Speed", &settings.rockImpact.spreadSpeed, 0.25F, 3.0F, "%.2f");
-        ImGui::SliderFloat("Centre Falloff", &settings.rockImpact.centreFalloff, 0.0F, 1.0F, "%.2f");
-        ImGui::SliderFloat("Height Bias", &settings.rockImpact.heightBias, 0.0F, 2.0F, "%.2f");
-        ImGui::SliderFloat("Persistence", &settings.rockImpact.persistence, 0.25F, 3.0F, "%.2f");
-        ImGui::SliderFloat(
+        drawRainSlider(
+            "wetness.edge_breakup",
+            "Edge Breakup",
+            &settings.rockImpact.edgeBreakup,
+            0.0F,
+            1.0F,
+            "%.2f");
+        drawRainSlider(
+            "wetness.spread_speed",
+            "Spread Speed",
+            &settings.rockImpact.spreadSpeed,
+            0.25F,
+            3.0F,
+            "%.2f");
+        drawRainSlider(
+            "wetness.centre_falloff",
+            "Centre Falloff",
+            &settings.rockImpact.centreFalloff,
+            0.0F,
+            1.0F,
+            "%.2f");
+        drawRainSlider(
+            "wetness.height_bias",
+            "Height Bias",
+            &settings.rockImpact.heightBias,
+            0.0F,
+            2.0F,
+            "%.2f");
+        drawRainSlider(
+            "wetness.persistence",
+            "Persistence",
+            &settings.rockImpact.persistence,
+            0.25F,
+            3.0F,
+            "%.2f");
+        drawRainSlider(
+            "wetness.downhill_stretch",
             "Downhill Stretch",
             &settings.rockImpact.downhillStretch,
             0.0F,
             2.0F,
-            "%.2f");
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip(
-                "How strongly Wetness runs downhill on steep surfaces. Steep impacts spawn "
-                "larger and put the extra footprint into the downhill run only, so walls show "
-                "narrow rivulets while flat ground keeps an even spread. Zero restores the "
-                "isotropic footprint; flat surfaces are unaffected at any value.");
-        }
+            "%.2f",
+            ImGuiSliderFlags_None,
+            "How strongly Wetness runs downhill on steep surfaces. Steep "
+            "impacts spawn larger and put the extra footprint into the "
+            "downhill run only, so walls show narrow rivulets while flat "
+            "ground keeps an even spread. Zero restores the isotropic "
+            "footprint; flat surfaces are unaffected at any value.");
         ImGui::PushID("RockImpactBand");
-        drawImpactHeightBand(&settings.rockImpactBand);
+        drawImpactHeightBand(
+            &settings.rockImpactBand,
+            "wetness.band_min_z",
+            "wetness.band_max_z",
+            "wetness.band_fade");
         ImGui::PopID();
         EndPanelSection();
     }
 
     if (BeginPanelSection("Droplets Tuning")) {
-        ImGui::SliderFloat("Twinkle", &settings.vegetationImpact.twinkle, 0.0F, 4.0F, "%.2f");
-        ImGui::SliderFloat(
+        drawRainSlider(
+            "droplets.twinkle",
+            "Twinkle",
+            &settings.vegetationImpact.twinkle,
+            0.0F,
+            4.0F,
+            "%.2f");
+        drawRainSlider(
+            "droplets.propagation",
             "Propagation",
             &settings.vegetationImpact.propagationMetersPerSecond,
             0.05F,
             3.0F,
             "%.2f m/s",
             ImGuiSliderFlags_Logarithmic);
-        ImGui::SliderFloat(
+        drawRainSlider(
+            "droplets.hop_spacing",
             "Hop Spacing",
             &settings.vegetationImpact.hopSpacingMeters,
             0.01F,
             0.30F,
             "%.3f m",
             ImGuiSliderFlags_Logarithmic);
-        ImGui::SliderFloat(
+        drawRainSlider(
+            "droplets.stream_width",
             "Stream Width",
             &settings.vegetationImpact.streamWidthMeters,
             0.001F,
             0.08F,
             "%.3f m",
             ImGuiSliderFlags_Logarithmic);
-        ImGui::SliderFloat("Stream Spread", &settings.vegetationImpact.streamSpread, 0.0F, 2.0F, "%.2f");
+        drawRainSlider(
+            "droplets.stream_spread",
+            "Stream Spread",
+            &settings.vegetationImpact.streamSpread,
+            0.0F,
+            2.0F,
+            "%.2f");
         ImGui::PushID("VegetationImpactBand");
-        drawImpactHeightBand(&settings.vegetationImpactBand);
+        drawImpactHeightBand(
+            &settings.vegetationImpactBand,
+            "droplets.band_min_z",
+            "droplets.band_max_z",
+            "droplets.band_fade");
         ImGui::PopID();
         EndPanelSection();
     }
@@ -51754,6 +57626,9 @@ void DrawWaterGpuRainPanel(
             ImGui::TextDisabled("%s", warning.c_str());
         }
         EndPanelSection();
+    }
+    if (liveChanged) {
+        runtimeState->previewRenderStateSignatureValid = false;
     }
 }
 
@@ -54123,24 +59998,52 @@ void DrawWaterPanel(
     const bool analysisReady = true;
     constexpr ImGuiWindowFlags waterScrollFlags =
         ImGuiWindowFlags_AlwaysVerticalScrollbar;
+    if (ImGui::Checkbox(
+            "Subtle Selected Cues",
+            &water.subtleSelectedAuthoringCues) &&
+        water.subtleSelectedAuthoringCues) {
+        water.regionEditor.hoveredVertex.reset();
+        water.regionEditor.drag = {};
+        water.manualFlowPathEditor.hoveredNodeIndex.reset();
+        water.manualFlowPathEditor.drag = {};
+        water.manualFlowPathEditor.laneWidthDrag = {};
+        water.manualFlowPathEditor.pointerCapturedUntilRelease = false;
+        water.emitterGizmoDrag = {};
+        water.emitterGizmoPointerCaptured = false;
+        water.emitterGizmoHoveredLastFrame = false;
+        water.seepageGizmoDrag = {};
+        water.seepageGizmoPointerCaptured = false;
+        water.seepageGizmoHoveredLastFrame = false;
+        water.hoveredPathBranchId.reset();
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Show only selected Water objects as compact dots and labels. "
+            "Paths, boundaries, structure guides, and movement gizmos are "
+            "hidden; switch this off to edit their geometry. Water effects "
+            "and timing previews are unchanged.");
+    }
+    ImGui::Separator();
     if (!ImGui::BeginTabBar("WaterFeatureTabs")) {
         return;
     }
-    if (ImGui::BeginTabItem("Ripples")) {
+    if (water.showInactiveRippleTab &&
+        ImGui::BeginTabItem(
+            "Ripples (inactive)",
+            &water.showInactiveRippleTab)) {
         if (ImGui::BeginChild(
                 "WaterRipplesScroll",
                 ImVec2{0.0F, 0.0F},
                 false,
                 waterScrollFlags)) {
-        if (!analysisReady) {
-            ImGui::BeginDisabled();
-        }
-        water.activeRegionFeature = WaterRegionFeature::Ripple;
+        water.activeRegionFeature = WaterRegionFeature::None;
         water.activeKeyingFeature.reset();
+        ImGui::TextDisabled(
+            "Inactive legacy feature. Settings remain available for inspection, but do not run or render.");
+        ImGui::Separator();
+        ImGui::BeginDisabled();
         DrawWaterRipplesPanel(runtimeState, viewport);
-        if (!analysisReady) {
-            ImGui::EndDisabled();
-        }
+        ImGui::EndDisabled();
         }
         ImGui::EndChild();
         ImGui::EndTabItem();
@@ -55566,39 +61469,74 @@ void DrawWaterPanel(
     ImGui::EndTabItem();
     }
 
-    if (ImGui::BeginTabItem("Mesh Flow")) {
+    if (water.showInactiveMeshFlowTab &&
+        ImGui::BeginTabItem(
+            "Mesh Flow (inactive)",
+            &water.showInactiveMeshFlowTab)) {
         if (ImGui::BeginChild(
                 "WaterMeshFlowScroll",
                 ImVec2{0.0F, 0.0F},
                 false,
                 waterScrollFlags)) {
         water.activeRegionFeature = WaterRegionFeature::None;
-        water.activeKeyingFeature = invisible_places::water::WaterKeyedFeatureId{
-            .kind = invisible_places::water::WaterKeyedFeatureKind::MeshFlow};
+        water.activeKeyingFeature.reset();
+        ImGui::TextDisabled(
+            "Inactive legacy feature. Settings remain available for inspection, but do not run or render.");
+        ImGui::Separator();
+        ImGui::BeginDisabled();
         DrawWaterDynamicMeshFlowPanel(runtimeState, viewport);
+        ImGui::EndDisabled();
         }
         ImGui::EndChild();
         ImGui::EndTabItem();
     }
 
-    if (ImGui::BeginTabItem("Field")) {
+    if (water.showInactiveFieldTab &&
+        ImGui::BeginTabItem(
+            "Field (inactive)",
+            &water.showInactiveFieldTab)) {
         if (ImGui::BeginChild(
                 "WaterFieldScroll",
                 ImVec2{0.0F, 0.0F},
                 false,
                 waterScrollFlags)) {
-        if (!analysisReady) {
-            ImGui::BeginDisabled();
-        }
-        water.activeRegionFeature = WaterRegionFeature::Field;
+        water.activeRegionFeature = WaterRegionFeature::None;
         water.activeKeyingFeature.reset();
+        ImGui::TextDisabled(
+            "Inactive legacy feature. Settings remain available for inspection, but do not run or render.");
+        ImGui::Separator();
+        ImGui::BeginDisabled();
         DrawWaterFieldPanel(runtimeState, viewport);
-        if (!analysisReady) {
-            ImGui::EndDisabled();
-        }
+        ImGui::EndDisabled();
         }
         ImGui::EndChild();
         ImGui::EndTabItem();
+    }
+    if (ImGui::TabItemButton(
+            "+",
+            ImGuiTabItemFlags_Trailing |
+                ImGuiTabItemFlags_NoTooltip)) {
+        ImGui::OpenPopup("WaterAddInactiveTabs");
+    }
+    if (ImGui::BeginPopup("WaterAddInactiveTabs")) {
+        if (!water.showInactiveRippleTab &&
+            ImGui::MenuItem("Ripples (inactive)")) {
+            water.showInactiveRippleTab = true;
+        }
+        if (!water.showInactiveMeshFlowTab &&
+            ImGui::MenuItem("Mesh Flow (inactive)")) {
+            water.showInactiveMeshFlowTab = true;
+        }
+        if (!water.showInactiveFieldTab &&
+            ImGui::MenuItem("Field (inactive)")) {
+            water.showInactiveFieldTab = true;
+        }
+        if (water.showInactiveRippleTab &&
+            water.showInactiveMeshFlowTab &&
+            water.showInactiveFieldTab) {
+            ImGui::TextDisabled("All inactive tabs are visible.");
+        }
+        ImGui::EndPopup();
     }
     ImGui::EndTabBar();
 }
@@ -57131,12 +63069,16 @@ void BuildWaterFeatureGraphSeries(
     for (const auto& info :
          invisible_places::water::WaterKeyableSettings(
              timeline.feature.kind)) {
+        auto* track = trackFor(info.id);
+        if (!info.showUnauthoredInTimeline && track == nullptr) {
+            continue;
+        }
         out->push_back(WaterRunGraphSeries{
             .feature = timeline.feature,
             .settingId = std::string{info.id},
             .label = std::string{info.label},
             .colour = seriesColour(settingIndex),
-            .track = trackFor(info.id),
+            .track = track,
             .timeline = &timeline,
             .minimum = info.minimum,
             .maximum = info.maximum,
@@ -68778,7 +74720,8 @@ bool CtrlClickMoveSelectedViewportEntity(
         return false;
     }
     auto& water = runtimeState->water;
-    if (!RenderSetupAuthoringLocked(runtimeState)) {
+    if (!RenderSetupAuthoringLocked(runtimeState) &&
+        !water.subtleSelectedAuthoringCues) {
         if (water.seepageTabActive &&
             water.selectedSeepageNodeIndex.has_value() &&
             water.selectedSeepageNodeIndex.value() < water.seepageNodes.size()) {
@@ -68882,6 +74825,9 @@ void UpdateCameraFromInput(
     }
     const bool waterAuthoringAllowed =
         !RenderSetupAuthoringLocked(runtimeState);
+    const bool waterGeometryAuthoringAllowed =
+        waterAuthoringAllowed &&
+        !runtimeState->water.subtleSelectedAuthoringCues;
     bool navigatedThisFrame = false;
     if (runtimeState->animationPanel.drag.active) {
         runtimeState->cameraInteraction.navigationActive = false;
@@ -68935,7 +74881,7 @@ void UpdateCameraFromInput(
         runtimeState->cameraInteraction.navigationActive = false;
         return;
     }
-    if (waterAuthoringAllowed &&
+    if (waterGeometryAuthoringAllowed &&
         runtimeState->water.seepageTabActive &&
         runtimeState->water.movingSeepageNodeIndex.has_value() &&
         renderViewportHovered &&
@@ -68945,7 +74891,7 @@ void UpdateCameraFromInput(
         runtimeState->cameraInteraction.navigationActive = false;
         return;
     }
-    if (waterAuthoringAllowed &&
+    if (waterGeometryAuthoringAllowed &&
         runtimeState->water.seepageTabActive &&
         runtimeState->water.seepagePlacementArmed &&
         renderViewportHovered &&
@@ -68955,7 +74901,7 @@ void UpdateCameraFromInput(
         runtimeState->cameraInteraction.navigationActive = false;
         return;
     }
-    if (waterAuthoringAllowed &&
+    if (waterGeometryAuthoringAllowed &&
         runtimeState->water.movingEmitterIndex.has_value() &&
         renderViewportHovered &&
         !viewport.UiWantsMouseCapture() &&
@@ -68964,7 +74910,7 @@ void UpdateCameraFromInput(
         runtimeState->cameraInteraction.navigationActive = false;
         return;
     }
-    if (waterAuthoringAllowed &&
+    if (waterGeometryAuthoringAllowed &&
         runtimeState->water.placementArmed &&
         renderViewportHovered &&
         !viewport.UiWantsMouseCapture() &&
@@ -68973,7 +74919,7 @@ void UpdateCameraFromInput(
         runtimeState->cameraInteraction.navigationActive = false;
         return;
     }
-    if (waterAuthoringAllowed &&
+    if (waterGeometryAuthoringAllowed &&
         runtimeState->water.pathAttractorPlacementArmed &&
         renderViewportHovered &&
         !viewport.UiWantsMouseCapture() &&
@@ -68982,7 +74928,7 @@ void UpdateCameraFromInput(
         runtimeState->cameraInteraction.navigationActive = false;
         return;
     }
-    if (waterAuthoringAllowed &&
+    if (waterGeometryAuthoringAllowed &&
         runtimeState->water.rippleRegionPlacementArmed &&
         renderViewportHovered &&
         !viewport.UiWantsMouseCapture() &&
@@ -68991,7 +74937,7 @@ void UpdateCameraFromInput(
         runtimeState->cameraInteraction.navigationActive = false;
         return;
     }
-    if (waterAuthoringAllowed &&
+    if (waterGeometryAuthoringAllowed &&
         runtimeState->water.fieldRegionPlacementArmed &&
         renderViewportHovered &&
         !viewport.UiWantsMouseCapture() &&
@@ -69777,10 +75723,10 @@ bool PreviewLiveVisualEffectsRequireSceneRedraw(
     const PreviewRuntimeState& runtimeState,
     const invisible_places::renderer::core::VulkanViewportShell& viewport,
     float currentFlowTimeSeconds) {
-    // Keyed rain must advance the rain clock even while the standalone Rain
-    // panel checkbox is off: the effective per-frame enable comes from the
-    // Timing Take level with its explicit overlay applied, not the authored
-    // checkbox.
+    // Evaluate the same transient Rain state as BuildRenderState. A keyed
+    // level can activate authored-disabled Rain, while a run that keys only
+    // wind or appearance must continue advancing authored-enabled Rain.
+    auto effectiveRain = runtimeState.water.collisionRainSettings;
     auto scenario = ResolveActiveWaterScenarioState(runtimeState);
     invisible_places::water::WaterFeatureTimingOverlay overlay;
     const invisible_places::water::WaterFeatureTimingOverlay* overlayPtr =
@@ -69796,29 +75742,31 @@ bool PreviewLiveVisualEffectsRequireSceneRedraw(
                 0.0F,
                 1.0F));
         overlayPtr = &overlay;
+        invisible_places::water::ApplyWaterFeatureTimingOverlayToRainSettings(
+            overlay,
+            &effectiveRain,
+            nullptr);
         if (scenario.has_value()) {
             invisible_places::water::ApplyWaterFeatureTimingOverlayToScenario(
                 overlay,
                 &scenario.value());
         }
     }
-    if (scenario.has_value()) {
-        if (scenario->rainLevel > 1.0e-5F) {
-            return true;
-        }
-        // Once emission reaches zero, keep advancing only until the last
-        // possible GPU impact has aged out. Otherwise scene caching would
-        // freeze wetness/rings on their final rainy frame.
-        if (viewport.RainImpactEffectsRequireRedraw(
-                currentFlowTimeSeconds)) {
-            return true;
-        }
+    if (effectiveRain.enabled && effectiveRain.rainLevel > 1.0e-5F) {
+        return true;
+    }
+    // Once emission reaches zero, keep advancing only until the last
+    // possible GPU impact has aged out. Otherwise scene caching would freeze
+    // wetness/rings on their final rainy frame.
+    if (viewport.RainImpactEffectsRequireRedraw(currentFlowTimeSeconds)) {
+        return true;
     }
     // While an offline render owns the frame pump, the live Mesh Flow update
     // (and with it the activity stamp) is paused, so the quiescence tail
     // cannot be compared against the still-advancing live clock — keep the
     // pre-existing always-redraw behaviour for the export's duration.
-    if (runtimeState.water.dynamicMeshFlowSettings.enabled &&
+    if (kMeshFlowWaterRuntimeEnabled &&
+        runtimeState.water.dynamicMeshFlowSettings.enabled &&
         runtimeState.water.dynamicMeshFlowSettings.showTrails &&
         (runtimeState.offlineRenderJob.active ||
          !DynamicMeshFlowIsQuiescent(runtimeState, currentFlowTimeSeconds))) {
@@ -69867,7 +75815,8 @@ bool PreviewLiveVisualEffectsRequireSceneRedraw(
              trailOverlayContentVisible) ||
             invisible_places::renderer::pointcloud::PointCloudStyleHasActiveRoughnessMotion(renderStyle) ||
             invisible_places::renderer::pointcloud::PointCloudStyleHasActiveCaustics(renderStyle) ||
-            viewport.SparseWaterRippleEffectCount(sessionIndex) > 0U) {
+            (kRippleWaterRuntimeEnabled &&
+             viewport.SparseWaterRippleEffectCount(sessionIndex) > 0U)) {
             return true;
         }
     }
@@ -69939,12 +75888,11 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
     const auto& activeWaterScenario = waterFrame.rawScenarioState;
     const auto* activeColouriseEffects =
         ActiveTimingColouriseEffects(runtimeState);
-    renderState.rainSettings =
-        invisible_places::water::
-            RainSettingsForOptionalTimingLevel(
-                renderState.rainSettings,
-                WaterFrameExplicitRainLevel(waterFrame));
     renderState.rainVisual = runtimeState.water.rainVisual;
+    invisible_places::water::ApplyWaterFeatureTimingOverlayToRainSettings(
+        waterFrame.featureOverlay,
+        &renderState.rainSettings,
+        &renderState.rainVisual);
     renderState.rainSpawnCentre = runtimeState.camera.OrbitCenter();
     const auto resolvedShorelines = ResolveShorelinesForFrame(
         runtimeState.water.shorelineInstances,
@@ -70000,8 +75948,13 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                                session.hasNormals,
                                waterFrame.normalizedTime)
                          : invisible_places::renderer::pointcloud::
-                               ResolvedTimingColouriseStack{},
+                           ResolvedTimingColouriseStack{},
                  .scalarFields = session.scalarFields,
+                 .generatedWaterOverlay =
+                     IsGeneratedWaterOverlaySession(session),
+                 .regionWaterEffectsEnabled =
+                     kRippleWaterRuntimeEnabled ||
+                     kFieldWaterRuntimeEnabled,
                  .hasSourceRgb = session.hasSourceRgb,
                  .hasNormals = session.hasNormals,
                  .timingColouriseEligible =
@@ -70028,6 +75981,92 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                  .style = effectiveStyle,
                  .localToWorld = EffectiveGsplatLocalToWorld(runtimeState.projectSettings, session)});
         }
+    }
+
+    const auto& ghost = runtimeState.animationPanel.matchingFrameGhost;
+    const bool ghostOwnsActiveAnimation =
+        ghost.uploaded && ghost.visible &&
+        ghost.matchingFrameAvailable &&
+        ghost.captureMatchesCurrentFrame &&
+        !runtimeState.offlineRenderJob.active &&
+        !runtimeState.activeRenderSetupOverride.has_value() &&
+        !runtimeState.animationPanel.currentFilePath.empty() &&
+        PathsLexicallyEqual(
+            std::filesystem::path{
+                runtimeState.animationPanel.currentFilePath},
+            ghost.currentFilePath);
+    const auto ghostPartnerIndex = ghostOwnsActiveAnimation
+        ? FindAnimationRegistryIndex(
+              runtimeState.animationPanel,
+              ghost.partnerFilePath)
+        : std::nullopt;
+    const auto* ghostPartner = ghostPartnerIndex.has_value()
+        ? RegistryAnimationPath(
+              runtimeState,
+              ghostPartnerIndex.value())
+        : nullptr;
+    const bool ghostPairStillValid =
+        ghostOwnsActiveAnimation &&
+        runtimeState.animationPanel.currentPath.has_value() &&
+        runtimeState.animationPanel.currentPath->velocityBlendLink
+            .has_value() &&
+        ghostPartner != nullptr &&
+        ghostPartner->velocityBlendLink.has_value() &&
+        runtimeState.animationPanel.currentPath->velocityBlendLink
+                ->pairId == ghost.pairId &&
+        ghostPartner->velocityBlendLink->pairId == ghost.pairId;
+    if (ghostPairStillValid && ghost.capturedPointCount > 0U) {
+        PointCloudStyleState ghostStyle;
+        ghostStyle.geometryMode = PointCloudGeometryMode::ScreenSprites;
+        ghostStyle.screenSpriteSizeMode =
+            PointCloudScreenSpriteSizeMode::WorldMillimeters;
+        ghostStyle.falloffProfile = PointCloudFalloffProfile::HardDisc;
+        ghostStyle.colorMode = PointCloudColorMode::SolidColor;
+        ghostStyle.solidColor = {1.0F, 1.0F, 1.0F, 1.0F};
+        ghostStyle.exposure = 1.0F;
+        ghostStyle.flowAnimation = false;
+        ghostStyle.waterPathView = false;
+        ghostStyle.waterTrailOverlay = false;
+        ghostStyle.rainImpactEffects = false;
+        ghostStyle.causticAnimation = false;
+        ghostStyle.causticIntensity = 0.0F;
+        ghostStyle.roughnessMotionStrength = 0.0F;
+        ghostStyle.shorelineWaveEnabled = false;
+        ghostStyle.depthFade.active = false;
+        invisible_places::style::SetScalarConstant(
+            &ghostStyle.pointSize,
+            1.0F);
+        invisible_places::style::SetScalarConstant(
+            &ghostStyle.surfelDiameter,
+            std::clamp(
+                ghost.pointSizeMillimeters,
+                0.5F,
+                50.0F) /
+                1000.0F);
+        invisible_places::style::SetScalarConstant(
+            &ghostStyle.opacity,
+            std::clamp(ghost.opacity, 0.02F, 1.0F));
+        invisible_places::style::SetScalarConstant(
+            &ghostStyle.emissiveStrength,
+            0.0F);
+        invisible_places::style::SetScalarConstant(
+            &ghostStyle.depthFade,
+            0.0F);
+        renderState.pointCloudLayers.push_back(
+            {.layerId = kAnimationMatchingFrameGhostLayerId,
+             .style = ghostStyle,
+             .generatedWaterOverlay = false,
+             .regionWaterEffectsEnabled = false,
+             .hasSourceRgb = false,
+             .hasNormals = false,
+             .timingColouriseEligible = false,
+             .shorelineInstancesEligible = false,
+             .drawPointCount = static_cast<std::uint32_t>(
+                 std::min<std::size_t>(
+                     ghost.capturedPointCount,
+                     std::numeric_limits<std::uint32_t>::max())),
+             .densityCompensation = {},
+             .rainCollisionRole = WaterSurfaceRole::None});
     }
 
     return renderState;
@@ -70230,6 +76269,8 @@ std::string BenchmarkFormatLabel(invisible_places::output::AnimationExportMode m
         case invisible_places::output::AnimationExportMode::FastPreviewMp4:
         case invisible_places::output::AnimationExportMode::HevcAlphaMp4:
             return "MP4";
+        case invisible_places::output::AnimationExportMode::TestMp4:
+            return "Test MP4";
         case invisible_places::output::AnimationExportMode::ProRes422Mov:
         case invisible_places::output::AnimationExportMode::ProRes422HqMov:
         case invisible_places::output::AnimationExportMode::ProRes422AlphaMatteMov:
@@ -72263,14 +78304,14 @@ int RunRendererFrameTimingScene3Smoke(
     scene.displayLoaded = true;
     scene.displayVisible = true;
     scene.mixedDisplay = false;
-    if (selectedPointCount != 14'832'063U) {
+    if (selectedPointCount != 14'884'723U) {
         failures.emplace_back(
             "Scene3 5 mm ROCK/SAND/VEG count was " +
-            std::to_string(selectedPointCount) + ", expected 14,832,063.");
+            std::to_string(selectedPointCount) + ", expected 14,884,723.");
         return finish();
     }
     passes.emplace_back(
-        "Loaded only Scene3 ROCK/SAND/VEG 5 mm display files (14,832,063 points).");
+        "Loaded only Scene3 ROCK/SAND/VEG 5 mm display files (14,884,723 points).");
 
     runtimeState->selectedSessionIndex =
         scene.committedDisplaySessionIndices.front();
@@ -72726,10 +78767,10 @@ int RunGpuCollisionRainSmoke(
                 return source.spacingMicrometres == 5'000U &&
                        !source.isFallback;
             }) &&
-        cacheResult.cache.sourcePointCount == 14'832'063U) {
+        cacheResult.cache.sourcePointCount == 14'884'723U) {
         report.Pass(
             "Scene3 collision used only the 5 mm ROCK, SAND, and VEG display "
-            "sources (14,832,063 points).");
+            "sources (14,884,723 points).");
     } else if (std::none_of(
                    scene.waterSurfaceSources.begin(),
                    scene.waterSurfaceSources.end(),
@@ -73280,6 +79321,10 @@ int RunWaterSeepageSmoke(
     const auto structureSupportFingerprintsBefore =
         runtimeState->water.seepageSupportNodeFingerprints;
     const auto selectedSeepageNodeBefore = runtimeState->water.selectedSeepageNodeIndex;
+    const auto selectedSeepageNodesBefore =
+        runtimeState->water.selectedSeepageNodeIndices;
+    const bool subtleSelectedCuesBefore =
+        runtimeState->water.subtleSelectedAuthoringCues;
     const auto exportTopologyFingerprintBefore =
         exportGridReady
             ? invisible_places::water::WaterSeepageTopologyFingerprint(exportGridIt->seepageGrid)
@@ -73314,6 +79359,39 @@ int RunWaterSeepageSmoke(
             std::to_string(structureMarkerCount) + " markers/" +
             std::to_string(structureRibbonCount) + " structures.");
     }
+
+    if (!runtimeState->water.seepageNodes.empty()) {
+        SetWaterSeepageSingleSelection(&runtimeState->water, 0U);
+        runtimeState->water.showSeepageStructure = true;
+        runtimeState->water.subtleSelectedAuthoringCues = true;
+        PumpGuiSmokeFrame(window, runtimeState, viewport);
+        const bool compactSelectionOnly =
+            runtimeState->water.seepageOverlayMarkerCount == 1U &&
+            runtimeState->water.seepageOverlayStructureCount == 0U;
+
+        runtimeState->water.subtleSelectedAuthoringCues = false;
+        PumpGuiSmokeFrame(window, runtimeState, viewport);
+        const bool fullOverlayRestored =
+            runtimeState->water.seepageOverlayMarkerCount == 8U &&
+            runtimeState->water.seepageOverlayStructureCount == 8U;
+        if (compactSelectionOnly && fullOverlayRestored) {
+            report.Pass(
+                "Subtle Selected Cues showed only the selected Seepage dot, "
+                "suppressed structure, and restored the authored overlay when disabled.");
+        } else {
+            report.Fail(
+                "Subtle Selected Cues did not isolate one Seepage marker or "
+                "restore the full authored overlay.");
+        }
+    }
+    runtimeState->water.subtleSelectedAuthoringCues =
+        subtleSelectedCuesBefore;
+    runtimeState->water.selectedSeepageNodeIndex =
+        selectedSeepageNodeBefore;
+    runtimeState->water.selectedSeepageNodeIndices =
+        selectedSeepageNodesBefore;
+    runtimeState->water.showSeepageStructure = false;
+    PumpGuiSmokeFrame(window, runtimeState, viewport);
 
     const auto exportSnapshotsAfterStructureToggle = BuildOfflinePointLayerSnapshots(*runtimeState);
     const auto exportGridAfterStructureIt = std::find_if(
@@ -73989,7 +80067,7 @@ int RunDynamicMeshFlowGroundSmoke(
     const bool sceneScaleReady =
         !scene3Visual ||
         (exactScene3FiveMillimetreSources &&
-         water.waterSurfaceCache->sourcePointCount == 14'832'063U &&
+         water.waterSurfaceCache->sourcePointCount == 14'884'723U &&
          water.waterSurfaceCache->groundSourcePointCount == 9'514'537U &&
          water.waterSurfaceCache->groundCells.size() == 2'534'557U &&
          groundView.occupiedCellCount == 2'534'557U &&
@@ -76733,11 +82811,11 @@ std::optional<WaterIntegrationCapturedFrame> RenderWaterIntegrationOfflineCompar
     }
 
     auto rainSettings = runtimeState->water.collisionRainSettings;
-    rainSettings =
-        invisible_places::water::
-            RainSettingsForOptionalTimingLevel(
-                rainSettings,
-                WaterFrameExplicitRainLevel(frameState));
+    auto rainVisual = runtimeState->water.rainVisual;
+    invisible_places::water::ApplyWaterFeatureTimingOverlayToRainSettings(
+        frameState.featureOverlay,
+        &rainSettings,
+        &rainVisual);
     invisible_places::output::OfflineRainSimulationState rainState;
     constexpr float kDeltaSeconds = 1.0F / 30.0F;
     for (std::uint32_t step = 0U; step < 12U; ++step) {
@@ -76745,7 +82823,7 @@ std::optional<WaterIntegrationCapturedFrame> RenderWaterIntegrationOfflineCompar
             &rainState,
             *runtimeState->water.waterSurfaceCache,
             rainSettings,
-            runtimeState->water.rainVisual,
+            rainVisual,
             cameraState,
             60.0F + (static_cast<float>(step) * kDeltaSeconds),
             kDeltaSeconds);
@@ -77149,6 +83227,121 @@ int RunAnimationExportFrameSmoke(
         return finish();
     }
     report.Pass("Frame preview recovered from an abandoned in-flight EXR frame.");
+
+    // Final-job teardown must retire only the finest-density sessions loaded
+    // for export. The live committed display and CPU analysis ownership are
+    // independent and must survive so the app can continue immediately.
+    std::vector<std::size_t> teardownCandidates;
+    std::vector<std::size_t> residentAnalysisCpuCandidates;
+    std::size_t expectedGpuReleaseCount = 0U;
+    std::size_t expectedRetainedAnalysisCpuCount = 0U;
+    for (const auto& scene : runtimeState->pointCloudScenes) {
+        for (const auto sessionIndex :
+             SceneFullDensityExportSessionIndices(scene)) {
+            if (!sessionIndex.has_value() ||
+                sessionIndex.value() >= runtimeState->sessions.size() ||
+                std::find(
+                    teardownCandidates.begin(),
+                    teardownCandidates.end(),
+                    sessionIndex.value()) != teardownCandidates.end()) {
+                continue;
+            }
+            teardownCandidates.push_back(sessionIndex.value());
+            const auto& session =
+                runtimeState->sessions[sessionIndex.value()];
+            if (session.committedDisplaySource ||
+                session.pendingDisplaySource) {
+                continue;
+            }
+            if (session.gpuResident || session.loaded) {
+                ++expectedGpuReleaseCount;
+            }
+            if (session.analysisSource && session.cpuResident) {
+                residentAnalysisCpuCandidates.push_back(
+                    sessionIndex.value());
+                ++expectedRetainedAnalysisCpuCount;
+            }
+        }
+    }
+    const auto releaseSummary =
+        ReleaseExportOnlyPointCloudSources(runtimeState, viewport);
+    if (!releaseSummary.warning.empty()) {
+        report.Fail(releaseSummary.warning);
+        return finish();
+    }
+    std::vector<std::string> teardownIssues;
+    if (releaseSummary.gpuSessionCount != expectedGpuReleaseCount) {
+        teardownIssues.push_back(
+            "released GPU " +
+            std::to_string(releaseSummary.gpuSessionCount) +
+            " / expected " + std::to_string(expectedGpuReleaseCount));
+    }
+    if (releaseSummary.retainedAnalysisCpuSessionCount !=
+        expectedRetainedAnalysisCpuCount) {
+        teardownIssues.push_back(
+            "retained analysis CPU " +
+            std::to_string(
+                releaseSummary.retainedAnalysisCpuSessionCount) +
+            " / expected " +
+            std::to_string(expectedRetainedAnalysisCpuCount));
+    }
+    for (const auto index : teardownCandidates) {
+        const auto& session = runtimeState->sessions[index];
+        if (session.committedDisplaySource ||
+            session.pendingDisplaySource) {
+            if (!session.gpuResident || !session.loaded) {
+                teardownIssues.push_back(
+                    session.sourcePath.filename().string() +
+                    " lost committed display residency");
+            }
+        } else {
+            if (session.gpuResident || session.loaded) {
+                teardownIssues.push_back(
+                    session.sourcePath.filename().string() +
+                    " retained export-only GPU residency");
+            }
+            if (std::find(
+                    residentAnalysisCpuCandidates.begin(),
+                    residentAnalysisCpuCandidates.end(),
+                    index) != residentAnalysisCpuCandidates.end() &&
+                (!session.cpuResident ||
+                 session.offlinePointCloud == nullptr)) {
+                teardownIssues.push_back(
+                    session.sourcePath.filename().string() +
+                    " lost analysis CPU residency");
+            }
+        }
+    }
+    const bool committedDisplayPreserved = std::all_of(
+        runtimeState->sessions.begin(),
+        runtimeState->sessions.end(),
+        [](const PreviewLayerSession& session) {
+            return !session.committedDisplaySource ||
+                   (session.gpuResident && session.loaded);
+        });
+    if (!committedDisplayPreserved) {
+        teardownIssues.push_back("one or more committed display sessions lost residency");
+    }
+    if (!teardownIssues.empty()) {
+        std::string detail;
+        for (const auto& issue : teardownIssues) {
+            if (!detail.empty()) {
+                detail += "; ";
+            }
+            detail += issue;
+        }
+        report.Fail(
+            "Final export teardown did not preserve display/analysis ownership: " +
+            detail + ".");
+        return finish();
+    }
+    report.Pass(
+        "Final export teardown released " +
+        std::to_string(releaseSummary.gpuSessionCount) +
+        " export-only GPU session(s), retained " +
+        std::to_string(
+            releaseSummary.retainedAnalysisCpuSessionCount) +
+        " analysis CPU session(s), and preserved the committed display.");
 
     return finish();
 }
@@ -78313,12 +84506,12 @@ int RunScene3SeepageNodeSmoke(
                 session.offlinePointCloud->PointCount();
         }
     }
-    constexpr std::uint64_t kExpectedScene3DisplayPoints = 14'832'063ULL;
+    constexpr std::uint64_t kExpectedScene3DisplayPoints = 14'884'723ULL;
     if (report.displayPointCount == kExpectedScene3DisplayPoints) {
-        report.Pass("Scene3 committed all 14,832,063 authored 5 mm display points.");
+        report.Pass("Scene3 committed all 14,884,723 authored 5 mm display points.");
     } else {
         report.Fail(
-            "Scene3 5 mm display point count differed from 14,832,063 (" +
+            "Scene3 5 mm display point count differed from 14,884,723 (" +
             FormatPointCount(report.displayPointCount) + ").");
     }
 
@@ -79198,6 +85391,7 @@ int RunScene3SeepageNodeSmoke(
     return finish();
 }
 
+
 int RunWaterIntegrationSmoke(
     const GuiSmokeOptions& options,
     platform::Window* window,
@@ -79544,14 +85738,14 @@ int RunWaterIntegrationSmoke(
             "to the expected scene.");
     }
     if (!sampleScene && runtimeState->water.waterSurfaceCache != nullptr) {
-        constexpr std::uint64_t expectedScene3SourcePoints = 73'862'216ULL;
+        constexpr std::uint64_t expectedScene3SourcePoints = 74'248'463ULL;
         if (runtimeState->water.waterSurfaceCache->sourcePointCount == expectedScene3SourcePoints) {
             report.Pass(
-                "Scene3 cache consumed the expected 73,862,216 terrain points "
+                "Scene3 cache consumed the expected 74,248,463 terrain points "
                 "plus its separate 9,514,537-point sampled Ground.");
         } else {
             report.Fail(
-                "Scene3 cache terrain source-point count differed from 73,862,216 (" +
+                "Scene3 cache terrain source-point count differed from 74,248,463 (" +
                 FormatPointCount(runtimeState->water.waterSurfaceCache->sourcePointCount) + ").");
         }
     }
@@ -80361,6 +86555,49 @@ int RunWaterIntegrationSmoke(
     }
 
     InstallWaterIntegrationScenario(runtimeState);
+    // The smoke authors its Timing effects after the point clouds are already
+    // resident. Production projects include saved effects in the initial load
+    // filter; this deliberately exercises the lower-priority on-demand path.
+    // Let every required field settle before asserting the full stack rather
+    // than restoring the old always-resident scalar compatibility floor.
+    const auto requiredScalarFieldsSettled = [&]() {
+        if (runtimeState->pendingScalarFieldLoad.has_value()) {
+            return false;
+        }
+        return std::none_of(
+            runtimeState->sessions.begin(),
+            runtimeState->sessions.end(),
+            [&](const auto& session) {
+                return session.gpuResident &&
+                       SessionMissingRequiredScalarFieldName(
+                           *runtimeState,
+                           session)
+                           .has_value();
+            });
+    };
+    const auto scalarFieldDeadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds{120};
+    while (!requiredScalarFieldsSettled() &&
+           std::chrono::steady_clock::now() < scalarFieldDeadline &&
+           !window->ShouldClose()) {
+        PumpWaterIntegrationSmokeFrame(
+            window,
+            runtimeState,
+            viewport,
+            0.0F,
+            false);
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+    if (!requiredScalarFieldsSettled()) {
+        report.Fail(
+            "On-demand Timing scalar fields did not settle before the water integration checks" +
+            (runtimeState->errorMessage.empty()
+                 ? std::string{"."}
+                 : std::string{" ("} + runtimeState->errorMessage + ")."));
+        return finish();
+    }
+    report.Pass(
+        "The post-load Timing stack resolved through bounded on-demand scalar residency.");
     runtimeState->animationPanel.scrubAmount = 0.35F;
     StartAnimationPlayback(runtimeState);
     const bool playbackStartedFromCurrent =
@@ -81356,12 +87593,12 @@ int RunWaterIntegrationSmoke(
             before.meshFlowDescriptorGeneration &&
         after.meshFlowGroundUploadRevision ==
             before.meshFlowGroundUploadRevision &&
-        after.meshFlowParameterRevision >
+        after.meshFlowParameterRevision ==
             before.meshFlowParameterRevision &&
-        after.meshFlowDispatches > before.meshFlowDispatches) {
+        after.meshFlowDispatches == before.meshFlowDispatches) {
         report.Pass(
-            "The 120-second Rain/Flow/Seepage/Mesh Flow cycle performed "
-            "parameter and fixed-capacity GPU updates only.");
+            "The 120-second Rain/Flow/Seepage cycle performed parameter-only "
+            "updates while inactive Mesh Flow remained quiescent.");
     } else {
         report.Fail(
             "The parameter-only cycle advanced a scan/build/upload/bake/"
@@ -81953,13 +88190,12 @@ int Application::Run(ApplicationRunOptions options) const {
                 UpdateCameraShotPlayback(&runtimeState);
                 UpdatePerformanceInteractionState(&runtimeState, viewport.value());
             }
-            if (!pauseLiveViewport) {
-                UpdateLinkedLoopTemporalCameraOverlay(
+            if (!runtimeState.offlineRenderJob.active) {
+                UpdateAnimationMatchingFrameGhostRuntime(
                     &runtimeState,
-                    &viewport.value());
-            } else {
-                viewport->SetTemporalCameraOverlay(false);
+                    viewport.value());
             }
+            viewport->SetTemporalCameraOverlay(false);
             const auto waterFrameState = ResolveWaterFrameState(&runtimeState);
             // Playback advances compact water parameters. Upload Seepage after
             // that evaluation so the current frame never renders the previous

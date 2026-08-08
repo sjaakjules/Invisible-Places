@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <vector>
 
@@ -45,33 +46,35 @@ struct AnimationExportSettings {
     std::uint32_t endFrame = 0;
 };
 
-struct AnimationLoopSmoothingMetadata {
-    std::string pairId;
-    std::string partnerFileName;
-    std::uint32_t sequenceIndex = 0U;
-    float maxEndMoveFraction = 0.10F;
-    std::string firstKeyId;
-    std::string lastKeyId;
-    std::array<float, 3> originalFirstCameraPosition{0.0F, 0.0F, 0.0F};
-    std::array<float, 3> originalFirstFocusPoint{0.0F, 0.0F, 0.0F};
-    std::array<float, 3> originalLastCameraPosition{0.0F, 0.0F, 0.0F};
-    std::array<float, 3> originalLastFocusPoint{0.0F, 0.0F, 0.0F};
+struct AnimationLocalizedKeyCorrection {
+    std::string keyId;
+    std::array<float, 3> splineCameraPosition{0.0F, 0.0F, 0.0F};
+    std::array<float, 3> splineFocusPoint{0.0F, 0.0F, 0.0F};
 };
 
-// A linked loop is a renderable snapshot compiled from two source animation
-// files. The source names and phase controls remain attached so the snapshot
-// can be rebuilt after either source changes. Negative padding overlaps and
-// crossfades both source clips; positive padding holds the outgoing endpoint
-// before the next clip begins.
-struct AnimationLinkedLoopMetadata {
-    std::string firstFileName;
-    std::string secondFileName;
-    std::string firstStartKeyId;
-    float firstStartPosition = 0.0F;
-    std::int32_t paddingFrames = 0;
+struct AnimationVelocityBlendLinkMetadata {
+    std::string pairId;
+    std::string partnerFileName;
+    float maxEndMoveFraction = 0.10F;
+    float strongAlignMaxMoveFraction = 0.50F;
+    // Path-local overlap extents. This path's start overlaps the partner's
+    // end and this path's end overlaps the partner's start for the same
+    // number of seconds.
+    float startOverlapSeconds = 0.0F;
+    float endOverlapSeconds = 0.0F;
+    // When enabled, seam scoring follows a horizontal cross-wipe instead of
+    // treating the complete frame as equally visible. A rightward pan keeps
+    // the outgoing left side and introduces the incoming right side; a
+    // leftward pan mirrors those regions.
+    bool horizontalBlend = false;
+    bool panRight = true;
+    std::vector<std::string> movableKeyIds;
 };
 
 struct AnimationPath {
+    // Original file schema retained only for application-level migration
+    // bookkeeping. Serialization always writes the current schema.
+    std::uint32_t sourceSchemaVersion = 19U;
     std::string name = "Animation";
     std::uint32_t durationFrames = 180;
     std::vector<AnimationPathKey> keys;
@@ -80,11 +83,11 @@ struct AnimationPath {
     float apertureFStops = 8.0F;
     float depthOfFieldMaxBlurPixels = 24.0F;
     AnimationExportSettings exportSettings{};
-    // Present only while reversible loop-end smoothing is applied. The
-    // visible endpoint keys contain the adjusted poses; these originals are
-    // used to evaluate the unchanged middle spline and to unapply exactly.
-    std::optional<AnimationLoopSmoothingMetadata> loopTransitionSmoothing;
-    std::optional<AnimationLinkedLoopMetadata> linkedLoop;
+    // Pair ownership and localized path evaluation are intentionally
+    // independent. A confirmed pose remains localized after the animation is
+    // unlinked or paired with another animation.
+    std::optional<AnimationVelocityBlendLinkMetadata> velocityBlendLink;
+    std::vector<AnimationLocalizedKeyCorrection> localizedKeyCorrections;
     std::string selectedTimingTakeId =
         std::string{invisible_places::timing::kAuthoredTimingTakeId};
     // Retained for legacy animation round-trip. Runtime timing resolves
@@ -109,6 +112,21 @@ struct AnimationPathEvaluation {
     float focusDistance = 1.0F;
 };
 
+// One rigid source-camera -> destination-camera frame transform. It is the
+// same mapping used by the matching-point ghost: no point-specific warping
+// occurs. Applying it to a complete partner spline therefore shows exactly
+// how that path is positioned around the destination animation frame.
+struct AnimationCameraFrameTransform {
+    std::array<float, 3> sourceCameraPosition{0.0F, 0.0F, 0.0F};
+    std::array<float, 3> destinationCameraPosition{0.0F, 0.0F, 0.0F};
+    std::array<float, 4> sourceToDestinationRotation{
+        0.0F,
+        0.0F,
+        0.0F,
+        1.0F,
+    };
+};
+
 struct AnimationPreparedScalarSpline {
     std::vector<float> values;
     std::vector<float> secondDerivatives;
@@ -118,6 +136,7 @@ struct PreparedAnimationPathEvaluationContext {
     bool valid = false;
     bool singleKey = false;
     float durationSeconds = 0.0F;
+    float aspectRatio = 16.0F / 9.0F;
     bool depthOfFieldEnabled = false;
     float apertureFStops = 8.0F;
     float depthOfFieldMaxBlurPixels = 24.0F;
@@ -138,11 +157,16 @@ struct PreparedAnimationPathEvaluationContext {
     AnimationPreparedScalarSpline focusDistance;
     AnimationPreparedScalarSpline apertureFStopsSpline;
     std::vector<std::array<float, 4>> orientationQuaternions;
-    bool hasLoopEndpointCorrections = false;
-    std::array<float, 3> firstCameraCorrection{0.0F, 0.0F, 0.0F};
-    std::array<float, 3> firstFocusCorrection{0.0F, 0.0F, 0.0F};
-    std::array<float, 3> lastCameraCorrection{0.0F, 0.0F, 0.0F};
-    std::array<float, 3> lastFocusCorrection{0.0F, 0.0F, 0.0F};
+    // Localized confirmed corrections. The authored path's preserved
+    // spline stays the base; compact cubic-Hermite offsets affect only
+    // segments touching a user-enabled key and terminate with zero velocity
+    // at every locked key.
+    bool hasLoopKeyCorrections = false;
+    std::vector<std::uint8_t> loopCorrectionKeyEnabled;
+    std::vector<std::array<float, 3>> loopCameraCorrections;
+    std::vector<std::array<float, 3>> loopFocusCorrections;
+    std::vector<std::array<float, 3>> loopCameraCorrectionTangents;
+    std::vector<std::array<float, 3>> loopFocusCorrectionTangents;
 };
 
 enum class AnimationPathMotionTarget {
@@ -167,6 +191,35 @@ struct AnimationPerceivedFlowSample {
     // right and Y is screen up; its length equals screenSpeed when a stable
     // direction can be resolved.
     std::array<float, 2> screenVelocity{0.0F, 0.0F};
+    // Diagnostic focus-plane flow. The legacy scalar and signed velocity
+    // above stay unchanged so perceived-speed equalization and velocity-blend
+    // scoring retain their established behavior.
+    std::array<float, 2> topScreenVelocity{0.0F, 0.0F};
+    std::array<float, 2> middleScreenVelocity{0.0F, 0.0F};
+    std::array<float, 2> bottomScreenVelocity{0.0F, 0.0F};
+    float imageRotationDegreesPerSecond = 0.0F;
+};
+
+enum class AnimationSpeedEqualizationMode : std::uint8_t {
+    // Preserves the established angular-view plus focus-distance-scaled
+    // sideways-motion proxy exactly.
+    PerceivedMotion = 0,
+    // Uses the projected motion at the centre of the focus plane. This is
+    // useful when the viewer's attention stays near the centre of a pan.
+    CenterScreenPan,
+    // Adds penalties for motion away from the dominant pan axis, focus-plane
+    // flow variation, and image roll so visually complex sections receive
+    // more time.
+    StabilizedPan,
+};
+
+struct AnimationSpeedEqualizationOptions {
+    AnimationSpeedEqualizationMode mode =
+        AnimationSpeedEqualizationMode::PerceivedMotion;
+    std::uint32_t samplesPerSegment = 24U;
+    float offAxisWeight = 0.75F;
+    float flowVariationWeight = 0.50F;
+    float rollWeight = 0.25F;
 };
 
 struct AnimationLoopSmoothingOptions {
@@ -174,35 +227,52 @@ struct AnimationLoopSmoothingOptions {
     std::string pairId;
     std::string firstFileName;
     std::string secondFileName;
+    // Omitted selections preserve the legacy endpoint-only behavior used by
+    // older callers. The UI sets this true even if one path has no enabled
+    // keys, allowing camera-A-only or camera-B-only correction.
+    bool useExplicitKeySelection = false;
+    std::vector<std::string> firstMovableKeyIds;
+    std::vector<std::string> secondMovableKeyIds;
+    float firstStartOverlapSeconds = 0.0F;
+    float firstEndOverlapSeconds = 0.0F;
+    float secondStartOverlapSeconds = 0.0F;
+    float secondEndOverlapSeconds = 0.0F;
+    // Horizontal cross-wipe scoring compares the portions that remain
+    // visible during the overlap: outgoing 2/3 -> 1/3 and incoming
+    // 1/3 -> 2/3. `panRight` selects outgoing-left/incoming-right; false
+    // mirrors the regions.
+    bool horizontalBlend = false;
+    bool panRight = true;
+    // A small value is used only for the interactive rough preview. Full
+    // apply retains the default multi-resolution search.
+    std::uint32_t maxOptimizationSweeps = 40U;
+    float minimumStepFraction = 0.005F;
+    // Runtime-only cancellation for immutable background previews. It is
+    // never serialized and has no effect for ordinary foreground calls.
+    std::stop_token stopToken{};
 };
 
-struct AnimationLinkedLoopBuildOptions {
-    std::string name;
-    std::string firstFileName;
-    std::string secondFileName;
-    std::size_t firstStartKeyIndex = 0U;
-    std::int32_t paddingFrames = 0;
+struct AnimationLoopHorizontalBlendRegions {
+    float outgoingVisibleFraction = 2.0F / 3.0F;
+    float incomingVisibleFraction = 1.0F / 3.0F;
+    // Normalized horizontal screen coordinates in [-1, 1].
+    std::array<float, 2> outgoingRange{-1.0F, 1.0F / 3.0F};
+    std::array<float, 2> incomingRange{1.0F / 3.0F, 1.0F};
 };
 
-struct AnimationLinkedLoopTiming {
-    std::uint32_t firstDurationFrames = 0U;
-    std::uint32_t secondDurationFrames = 0U;
-    std::uint32_t firstTerminalStartFrame = 0U;
-    std::uint32_t secondTerminalStartFrame = 0U;
-    std::int32_t paddingFrames = 0;
-    std::uint32_t periodFrames = 0U;
-    float secondStartFrame = 0.0F;
+struct AnimationLoopScreenDisplacementSample {
+    float normalizedPosition = 0.0F;
+    // Approximate framing displacement from the preserved path in screen
+    // heights. Multiply by a viewport height for an equivalent pixel value.
+    float screenDisplacement = 0.0F;
 };
 
-struct AnimationLinkedLoopSourceSample {
-    AnimationPathEvaluation blended;
-    AnimationPathEvaluation first;
-    AnimationPathEvaluation second;
-    bool valid = false;
-    bool firstActive = false;
-    bool secondActive = false;
-    float firstWeight = 0.0F;
-    float secondWeight = 0.0F;
+struct AnimationLoopKeyMovement {
+    std::string keyId;
+    float cameraMove = 0.0F;
+    float focusMove = 0.0F;
+    float cameraCapUsage = 0.0F;
+    float focusCapUsage = 0.0F;
 };
 
 struct AnimationLoopSmoothingResult {
@@ -219,6 +289,10 @@ struct AnimationLoopSmoothingResult {
     float maxFocusMove = 0.0F;
     float maxCameraCapUsage = 0.0F;
     float maxFocusCapUsage = 0.0F;
+    std::array<std::vector<AnimationLoopKeyMovement>, 2> keyMovements;
+    std::array<std::vector<AnimationLoopScreenDisplacementSample>, 2>
+        screenDisplacementSamples;
+    std::array<float, 2> maxScreenDisplacement{0.0F, 0.0F};
     std::string errorMessage;
 };
 
@@ -238,6 +312,76 @@ struct AnimationLoopTransitionMetrics {
     float maxFocusMove = 0.0F;
     float maxCameraCapUsage = 0.0F;
     float maxFocusCapUsage = 0.0F;
+    std::array<std::vector<AnimationLoopKeyMovement>, 2> keyMovements;
+    std::array<std::vector<AnimationLoopScreenDisplacementSample>, 2>
+        screenDisplacementSamples;
+    std::array<float, 2> maxScreenDisplacement{0.0F, 0.0F};
+    std::string errorMessage;
+};
+
+struct AnimationStrongAlignmentOptions {
+    std::string destinationKeyId;
+    float referenceNormalizedPosition = 0.0F;
+    float aspectRatio = 16.0F / 9.0F;
+    float maxMoveFraction = 0.50F;
+    // Normalized height measured upward from the bottom of each image. A
+    // small margin above one half retains the rock/sand transition when the
+    // two cameras are initially vertically misregistered.
+    float lowerFrameFraction = 0.55F;
+    std::size_t maximumPointSamples = 65'536U;
+    // Runtime-only cancellation for resident-point background matching.
+    std::stop_token stopToken{};
+};
+
+struct AnimationStrongAlignmentMetrics {
+    float beforeForegroundReprojectionRms1080 = 0.0F;
+    float afterForegroundReprojectionRms1080 = 0.0F;
+    float beforeHorizontalOffset1080 = 0.0F;
+    float afterHorizontalOffset1080 = 0.0F;
+    float beforeVerticalOffset1080 = 0.0F;
+    float afterVerticalOffset1080 = 0.0F;
+    float beforeScaleMismatchPercent = 0.0F;
+    float afterScaleMismatchPercent = 0.0F;
+    float beforeRotationMismatchDegrees = 0.0F;
+    float afterRotationMismatchDegrees = 0.0F;
+    std::size_t foregroundSampleCount = 0U;
+    std::size_t destinationOccupiedCellCount = 0U;
+    std::size_t referenceOccupiedCellCount = 0U;
+    float destinationCoverage = 0.0F;
+    float referenceCoverage = 0.0F;
+    float cameraMove = 0.0F;
+    float focusMove = 0.0F;
+    float cameraCapUsage = 0.0F;
+    float focusCapUsage = 0.0F;
+};
+
+struct AnimationStrongAlignmentResult {
+    bool succeeded = false;
+    bool changed = false;
+    AnimationStrongAlignmentMetrics metrics{};
+    std::string errorMessage;
+};
+
+struct AnimationMatchingFrameGhostOptions {
+    float aspectRatio = 16.0F / 9.0F;
+    std::size_t screenGridWidth = 160U;
+    std::size_t screenGridHeight = 90U;
+    // Retain the nearest surface band in each screen cell. The absolute
+    // tolerance keeps thin nearby surfaces intact; the relative tolerance
+    // scales for distant survey geometry.
+    float frontDepthToleranceMeters = 0.01F;
+    float frontDepthToleranceFraction = 0.015F;
+    std::size_t maximumPointSamples = 65'536U;
+    // Runtime-only cancellation for automatic matching-frame refreshes.
+    std::stop_token stopToken{};
+};
+
+struct AnimationMatchingFrameGhostResult {
+    bool succeeded = false;
+    std::size_t inputPointCount = 0U;
+    std::size_t sampledPointCount = 0U;
+    std::size_t frustumVisiblePointCount = 0U;
+    std::vector<invisible_places::io::Float3> positions;
     std::string errorMessage;
 };
 
@@ -283,58 +427,85 @@ AnimationPath BuildAnimationPathFromCameraShots(
 [[nodiscard]] std::vector<AnimationPerceivedFlowSample> MeasurePreparedAnimationPathPerceivedFlow(
     const PreparedAnimationPathEvaluationContext& context,
     std::uint32_t sampleCount = 160U);
+// Compatibility entry point for the established PerceivedMotion mode.
 [[nodiscard]] std::vector<std::uint32_t> ComputeConstantPerceivedSpeedSegmentFrames(
     const AnimationPath& path,
     std::uint32_t samplesPerSegment = 24U);
+// Retimes segment frame counts only. CenterScreenPan follows the focus-plane
+// centre; StabilizedPan also gives extra time to off-axis motion, roll, and
+// focus-plane flow variation. Total frames and authored key poses are not
+// changed by this calculation.
+[[nodiscard]] std::vector<std::uint32_t> ComputeEqualizedAnimationSegmentFrames(
+    const AnimationPath& path,
+    const AnimationSpeedEqualizationOptions& options);
 
-// Builds one closed, phase-rotated animation from two source paths. The
-// resulting path contains one ordinary key per 30 fps source frame, so it can
-// be previewed and exported without the source files being present. At zero
-// padding, each incoming first key aligns with the outgoing penultimate key
-// and the complete terminal edge is smooth-crossfaded. Signed padding offsets
-// that anchor; a positive value becomes an endpoint hold only after it exceeds
-// the remaining terminal-edge duration.
-[[nodiscard]] std::int32_t ClampLinkedLoopPaddingFrames(
-    const AnimationPath& first,
-    const AnimationPath& second,
-    std::int32_t requestedPaddingFrames);
-[[nodiscard]] AnimationLinkedLoopTiming ResolveLinkedLoopTiming(
-    const AnimationPath& first,
-    const AnimationPath& second,
-    std::int32_t requestedPaddingFrames);
 [[nodiscard]] float AnimationPathKeyNormalizedPosition(
     const AnimationPath& path,
     std::size_t keyIndex);
-[[nodiscard]] AnimationLinkedLoopSourceSample EvaluateLinkedLoopSourceSample(
-    const AnimationPath& first,
-    const AnimationPath& second,
-    float firstStartPosition,
-    std::int32_t paddingFrames,
-    float linkedNormalizedPosition);
-[[nodiscard]] std::optional<AnimationPath> BuildLinkedLoopAnimation(
-    const AnimationPath& first,
-    const AnimationPath& second,
-    const AnimationLinkedLoopBuildOptions& options,
-    std::string* errorMessage = nullptr);
 
-// Jointly adjusts only the first and last camera/focus keys of two paths.
-// durationFrames and every per-key durationFrames value are never written.
-// Applied paths evaluate their original natural cubic spline everywhere,
-// plus a quadratic correction confined to their first and last segments.
+// Jointly adjusts the explicitly selected camera/focus keys of two paths
+// (or endpoints for legacy callers). durationFrames and every per-key
+// durationFrames value are never written. Applied paths evaluate their
+// preserved natural cubic spline plus compact Hermite corrections confined
+// to segments touching a selected key; locked-key positions and correction
+// derivatives remain exact.
 [[nodiscard]] AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
     AnimationPath* first,
     AnimationPath* second,
     const AnimationLoopSmoothingOptions& options = {});
+[[nodiscard]] AnimationLoopHorizontalBlendRegions
+ResolveAnimationLoopHorizontalBlendRegions(
+    float blendProgress,
+    bool panRight);
 [[nodiscard]] AnimationLoopTransitionMetrics MeasureAnimationLoopTransitions(
     const AnimationPath& first,
-    const AnimationPath& second);
-[[nodiscard]] bool UnapplyAnimationLoopSmoothing(
-    AnimationPath* path,
-    std::string* errorMessage = nullptr);
-
+    const AnimationPath& second,
+    const AnimationLoopSmoothingOptions& options = {});
+[[nodiscard]] AnimationStrongAlignmentResult StrongAlignAnimationKeyToReference(
+    AnimationPath* destination,
+    const AnimationPath& reference,
+    std::span<const invisible_places::io::Float3> residentPoints,
+    const AnimationStrongAlignmentOptions& options);
+// Captures the front-visible resident surface from `reference`, then applies
+// the rigid reference-camera -> destination-camera transform. The returned
+// world positions therefore remain frozen while the live camera orbits.
+[[nodiscard]] AnimationMatchingFrameGhostResult BuildAnimationMatchingFrameGhost(
+    const AnimationPathEvaluation& destination,
+    const AnimationPathEvaluation& reference,
+    std::span<const invisible_places::io::Float3> residentPoints,
+    const AnimationMatchingFrameGhostOptions& options = {});
 AnimationPathEvaluation EvaluateAnimationPath(
     const AnimationPath& path,
     float timeSeconds);
+[[nodiscard]] AnimationCameraFrameTransform
+BuildAnimationCameraFrameTransform(
+    const AnimationPathEvaluation& destination,
+    const AnimationPathEvaluation& source);
+[[nodiscard]] std::array<float, 3> ApplyAnimationCameraFrameTransform(
+    const AnimationCameraFrameTransform& transform,
+    const std::array<float, 3>& sourcePoint);
+[[nodiscard]] std::array<float, 3> InvertAnimationCameraFrameTransform(
+    const AnimationCameraFrameTransform& transform,
+    const std::array<float, 3>& destinationPoint);
+
+// Structural key edits retain the path's total duration. Insertion splits
+// the segment containing `frame`; interior removal merges the two adjacent
+// segments; reordering moves poses while retaining the existing timing slots.
+// The first and last frames cannot host duplicate keys because every segment
+// must contain at least one frame.
+[[nodiscard]] std::optional<std::size_t> InsertAnimationPathKeyAtFrame(
+    AnimationPath* path,
+    AnimationPathKey key,
+    std::uint32_t frame,
+    std::string* errorMessage = nullptr);
+[[nodiscard]] bool RemoveAnimationPathKey(
+    AnimationPath* path,
+    std::size_t keyIndex,
+    std::string* errorMessage = nullptr);
+[[nodiscard]] bool ReorderAnimationPathKey(
+    AnimationPath* path,
+    std::size_t sourceIndex,
+    std::size_t destinationIndex);
 
 // Surface-focus probing. CollectRayHitDistancesAlongRay appends the along-ray
 // distance of every point lying within perpendicularRadiusMeters of the ray

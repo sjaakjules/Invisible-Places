@@ -382,7 +382,8 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
         set_tests_properties(
             water-region-sample-terrestrial-gui-smoke
             PROPERTIES
-                LABELS gui_smoke
+                DISABLED TRUE
+                LABELS "gui_smoke;legacy_water_inactive"
                 RUN_SERIAL TRUE
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         )
@@ -397,7 +398,8 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
         set_tests_properties(
             water-region-test-points-gui-smoke
             PROPERTIES
-                LABELS gui_smoke
+                DISABLED TRUE
+                LABELS "gui_smoke;legacy_water_inactive"
                 RUN_SERIAL TRUE
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         )
@@ -412,7 +414,8 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
         set_tests_properties(
             water-ripple-patterns-test-points-gui-smoke
             PROPERTIES
-                LABELS gui_smoke
+                DISABLED TRUE
+                LABELS "gui_smoke;legacy_water_inactive"
                 RUN_SERIAL TRUE
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         )
@@ -442,7 +445,8 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
         set_tests_properties(
             dynamic-mesh-flow-ground-gui-smoke
             PROPERTIES
-                LABELS gui_smoke
+                DISABLED TRUE
+                LABELS "gui_smoke;legacy_water_inactive"
                 RUN_SERIAL TRUE
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         )
@@ -457,7 +461,8 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
         set_tests_properties(
             dynamic-mesh-flow-scene3-5mm-visual-gui-smoke
             PROPERTIES
-                LABELS "gui_smoke;water_integration"
+                DISABLED TRUE
+                LABELS "gui_smoke;legacy_water_inactive"
                 RUN_SERIAL TRUE
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
                 TIMEOUT 600

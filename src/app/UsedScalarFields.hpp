@@ -17,13 +17,13 @@ namespace invisible_places::app {
 // combination of styles, effects, and constant name lists, and the tests
 // can drive it directly.
 //
-// Membership is deliberately generous: a binding contributes its field name
-// even while switched to Constant (flipping the mode back should not wait
-// on a disk load), and a Visual Feature contributes its field whether or
-// not the effect is currently enabled (a dormant effect can activate at any
-// animation position). Names the source file does not contain are harmless
-// — the load filter and the on-demand loader both ignore unknown names —
-// so runtime-generated names (water_effect_*, ripple_*) may pass through.
+// A binding contributes its field only while mapped. Switching a dormant
+// binding back to FieldMapped may therefore trigger the on-demand loader,
+// but does not keep a full point-count column resident while the binding is
+// constant. A Visual Feature still contributes its field while disabled
+// because animation can activate it at another position. Names the source
+// file does not contain are harmless — the load filter and the on-demand
+// loader both ignore unknown names.
 class UsedScalarFieldSet {
   public:
     void AddFieldName(std::string_view name);
@@ -43,24 +43,11 @@ class UsedScalarFieldSet {
     std::vector<std::string> orderedNames_;
 };
 
-// Normalized-substring patterns for scalar fields the renderer resolves by
-// well-known name on every source cloud (rock roughness for motion shading,
-// mesh-flow ground ids). They are cheap relative to the full field set and
-// several subsystems assume their presence, so every filtered load keeps
-// them via PointCloudScalarFieldFilter::containsPatterns.
+// Normalized-substring patterns for scalar fields that genuinely need to be
+// resident on every source cloud. Retired Field/Mesh Flow rendering no longer
+// needs roughness/ground-id columns, so the global policy is intentionally
+// empty. Active non-full-layer Roughness Motion adds those patterns only to
+// the affected session; explicit bindings and Timing effects load by name.
 [[nodiscard]] const std::vector<std::string>& AlwaysResidentScalarFieldPatterns();
-
-// The point shaders identify generated water clouds by sniffing the bound
-// field count against hard-coded slot constants (kWaterJitterSeedFieldSlot
-// = 12 up to kWaterFeatureTypeFieldSlot = 15), and a display cloud whose
-// style animates flow takes those per-slot reads too: historically it read
-// whichever survey field sat at that file position. Filtered loads must
-// therefore keep the first sixteen on-disk fields resident in file order —
-// otherwise a different field lands at slot 12 and the flow shimmer turns
-// into structured banding. Every filtered load whitelists source indices
-// [0, this count) and eviction never removes them, so resident slots
-// 0..15 always equal file fields 0..15. Shrinking this floor requires the
-// shaders to take explicit water-slot indirection instead of sniffing.
-inline constexpr std::uint32_t kLegacyWaterShaderCompatibilitySourceIndexCount = 16U;
 
 }  // namespace invisible_places::app

@@ -37,6 +37,9 @@ void UsedScalarFieldSet::AddFieldName(std::string_view name) {
 
 void UsedScalarFieldSet::AddBinding(
     const style::RenderParameterBinding& binding) {
+    if (binding.mode != style::ParameterSourceMode::FieldMapped) {
+        return;
+    }
     AddFieldName(binding.fieldMap.fieldName);
 }
 
@@ -53,10 +56,7 @@ bool UsedScalarFieldSet::Contains(std::string_view name) const {
 }
 
 const std::vector<std::string>& AlwaysResidentScalarFieldPatterns() {
-    static const std::vector<std::string> patterns{
-        "roughness",
-        "groundid",
-    };
+    static const std::vector<std::string> patterns;
     return patterns;
 }
 

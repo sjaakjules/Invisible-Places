@@ -110,6 +110,7 @@ invisible_places::output::ExrImage RenderSingleWaterTrail(
     const invisible_places::output::OfflinePointLayer layer{
         .cloud = &cloud,
         .style = style,
+        .generatedWaterOverlay = true,
         .hasSourceRgb = true,
         .fastBasic = fastBasic,
         .localToWorld = glm::mat4{1.0F},
@@ -188,6 +189,7 @@ invisible_places::output::ExrImage RenderMovingWaterTrail(
     const invisible_places::output::OfflinePointLayer layer{
         .cloud = &cloud,
         .style = style,
+        .generatedWaterOverlay = true,
         .hasSourceRgb = true,
         .fastBasic = fastBasic,
         .localToWorld = glm::mat4{1.0F},

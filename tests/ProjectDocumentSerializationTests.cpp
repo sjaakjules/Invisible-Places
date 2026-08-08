@@ -2273,7 +2273,7 @@ TEST_CASE("SampleScene authored water fixture is current, canonical, and cache f
   CHECK_FALSE(roundTrip->pathCache.has_value());
 }
 
-TEST_CASE("Generated SampleScene validation project round-trips current schema without derived caches",
+TEST_CASE("Generated SampleScene validation project migrates and round-trips without derived caches",
           "[project][serialization][water][sample][validation]") {
   using invisible_places::serialization::LoadProjectDocument;
   using invisible_places::serialization::SaveProjectDocument;
@@ -2288,7 +2288,9 @@ TEST_CASE("Generated SampleScene validation project round-trips current schema w
   std::ifstream validationInput{validationPath};
   REQUIRE(validationInput.is_open());
   const auto validationJson = nlohmann::json::parse(validationInput);
-  CHECK(validationJson.at("schema_version") == kProjectDocumentSchemaVersion);
+  const auto fixtureSchemaVersion =
+      validationJson.at("schema_version").get<std::uint32_t>();
+  CHECK(fixtureSchemaVersion <= kProjectDocumentSchemaVersion);
   CHECK(validationJson.at("active_water_scene_group") == "SampleScene");
   CHECK_FALSE(validationJson.contains("water_path_cache"));
   CHECK_FALSE(validationJson.contains("water_path_cache_manifest"));
@@ -2320,6 +2322,7 @@ TEST_CASE("Generated SampleScene validation project round-trips current schema w
   const auto validation = LoadProjectDocument(validationPath, &errorMessage);
   INFO(errorMessage);
   REQUIRE(validation.has_value());
+  CHECK(validation->sourceSchemaVersion == fixtureSchemaVersion);
   CHECK(validation->schemaVersion == kProjectDocumentSchemaVersion);
   CHECK(validation->activeWaterSceneGroupName == "SampleScene");
   REQUIRE(validation->scenePointCloudGroups.size() == 1U);
@@ -3023,10 +3026,11 @@ TEST_CASE("Project preserves independent Flow and Mesh Flow edited trail shadows
         "Default_edited");
 }
 
-TEST_CASE("Animation loop smoothing metadata round-trips in schema 16",
-          "[animation][serialization][loop]") {
-  using invisible_places::camera::AnimationLoopSmoothingMetadata;
+TEST_CASE("Animation velocity blend metadata and localized corrections round-trip",
+          "[animation][serialization][velocity-blend]") {
+  using invisible_places::camera::AnimationLocalizedKeyCorrection;
   using invisible_places::camera::AnimationPath;
+  using invisible_places::camera::AnimationVelocityBlendLinkMetadata;
   using invisible_places::serialization::AnimationPathFromJson;
   using invisible_places::serialization::AnimationPathToJson;
   using invisible_places::serialization::kAnimationDocumentSchemaVersion;
@@ -3041,98 +3045,200 @@ TEST_CASE("Animation loop smoothing metadata round-trips in schema 16",
       {.id = "last", .cameraPosition = {3.0F, 4.0F, 5.0F},
        .focusPoint = {6.0F, 7.0F, 8.0F}},
   };
-  path.loopTransitionSmoothing = AnimationLoopSmoothingMetadata{
+  path.velocityBlendLink = AnimationVelocityBlendLinkMetadata{
       .pairId = "pair-123",
       .partnerFileName = "Loop_B.ipanim.json",
-      .sequenceIndex = 1U,
       .maxEndMoveFraction = 0.12F,
-      .firstKeyId = "first",
-      .lastKeyId = "last",
-      .originalFirstCameraPosition = {0.9F, 2.0F, 3.0F},
-      .originalFirstFocusPoint = {4.0F, 4.9F, 6.0F},
-      .originalLastCameraPosition = {3.1F, 4.0F, 5.0F},
-      .originalLastFocusPoint = {6.0F, 7.1F, 8.0F},
+      .strongAlignMaxMoveFraction = 0.65F,
+      .startOverlapSeconds = 1.25F,
+      .endOverlapSeconds = 1.75F,
+      .horizontalBlend = true,
+      .panRight = false,
+      .movableKeyIds = {"first", "last"},
+  };
+  path.localizedKeyCorrections = {
+      AnimationLocalizedKeyCorrection{
+          .keyId = "first",
+          .splineCameraPosition = {0.9F, 2.0F, 3.0F},
+          .splineFocusPoint = {4.0F, 4.9F, 6.0F},
+      },
+      AnimationLocalizedKeyCorrection{
+          .keyId = "last",
+          .splineCameraPosition = {3.1F, 4.0F, 5.0F},
+          .splineFocusPoint = {6.0F, 7.1F, 8.0F},
+      },
   };
 
-  const auto json = AnimationPathToJson(path);
+  auto json = AnimationPathToJson(path);
   CHECK(json.at("schema_version") == kAnimationDocumentSchemaVersion);
-  REQUIRE(json.contains("loop_transition_smoothing"));
-  CHECK(json.at("loop_transition_smoothing").at("pair_id") == "pair-123");
-
-  std::string error;
-  const auto loaded = AnimationPathFromJson(json, &error);
-  REQUIRE(loaded.has_value());
-  REQUIRE(loaded->loopTransitionSmoothing.has_value());
-  CHECK(loaded->loopTransitionSmoothing->partnerFileName ==
-        "Loop_B.ipanim.json");
-  CHECK(loaded->loopTransitionSmoothing->sequenceIndex == 1U);
-  CHECK(loaded->loopTransitionSmoothing->maxEndMoveFraction ==
-        Catch::Approx(0.12F));
-  CHECK(loaded->loopTransitionSmoothing->originalFirstCameraPosition[0] ==
-        Catch::Approx(0.9F));
-
-  auto legacyJson = json;
-  legacyJson["schema_version"] = 14U;
-  legacyJson.erase("loop_transition_smoothing");
-  const auto legacy = AnimationPathFromJson(legacyJson, &error);
-  REQUIRE(legacy.has_value());
-  CHECK_FALSE(legacy->loopTransitionSmoothing.has_value());
-
-  auto mismatchedEndpointJson = json;
-  mismatchedEndpointJson["loop_transition_smoothing"]["first_key_id"] =
-      "missing-key";
-  const auto mismatchedEndpoint =
-      AnimationPathFromJson(mismatchedEndpointJson, &error);
-  REQUIRE(mismatchedEndpoint.has_value());
-  CHECK_FALSE(mismatchedEndpoint->loopTransitionSmoothing.has_value());
-}
-
-TEST_CASE("Linked animation source and phase metadata round-trips",
-          "[animation][serialization][linked-loop]") {
-  using invisible_places::camera::AnimationLinkedLoopMetadata;
-  using invisible_places::camera::AnimationPath;
-  using invisible_places::serialization::AnimationPathFromJson;
-  using invisible_places::serialization::AnimationPathToJson;
-  using invisible_places::serialization::kAnimationDocumentSchemaVersion;
-
-  AnimationPath path;
-  path.name = "Linked Loop";
-  path.durationFrames = 100U;
-  path.keys = {
-      {.id = "linked_frame_1", .cameraPosition = {1.0F, 2.0F, 3.0F},
-       .focusPoint = {1.0F, 3.0F, 3.0F}},
-      {.id = "linked_frame_2", .cameraPosition = {2.0F, 2.0F, 3.0F},
-       .focusPoint = {2.0F, 3.0F, 3.0F}},
+  REQUIRE(json.contains("velocity_blend_link"));
+  REQUIRE(json.contains("localized_key_corrections"));
+  CHECK_FALSE(json.contains("linked_loop"));
+  CHECK(json.at("velocity_blend_link").at("pair_id") == "pair-123");
+  CHECK_FALSE(json.at("velocity_blend_link")
+                  .contains("pending_strong_alignment"));
+  // Schema-19 files written by the removed guide workflow are accepted, but
+  // their obsolete screen annotation is deliberately discarded.
+  json["velocity_blend_link"]["pending_strong_alignment"] = {
+      {"destination_key_id", "last"},
+      {"destination_line", {{0.1F, 0.6F}, {0.9F, 0.55F}}},
+      {"partner_line", {{0.2F, 0.52F}, {0.8F, 0.48F}}},
   };
-  path.linkedLoop = AnimationLinkedLoopMetadata{
-      .firstFileName = "Loop_A.ipanim.json",
-      .secondFileName = "Loop_B.ipanim.json",
-      .firstStartKeyId = "a_middle",
-      .firstStartPosition = 0.42F,
-      .paddingFrames = -12,
-  };
-
-  const auto json = AnimationPathToJson(path);
-  CHECK(json.at("schema_version") == kAnimationDocumentSchemaVersion);
-  REQUIRE(json.contains("linked_loop"));
-  CHECK(json.at("linked_loop").at("padding_frames") == -12);
 
   std::string error;
   const auto loaded = AnimationPathFromJson(json, &error);
   INFO(error);
   REQUIRE(loaded.has_value());
-  REQUIRE(loaded->linkedLoop.has_value());
-  CHECK(loaded->linkedLoop->firstFileName == "Loop_A.ipanim.json");
-  CHECK(loaded->linkedLoop->secondFileName == "Loop_B.ipanim.json");
-  CHECK(loaded->linkedLoop->firstStartKeyId == "a_middle");
-  CHECK(loaded->linkedLoop->firstStartPosition == Catch::Approx(0.42F));
-  CHECK(loaded->linkedLoop->paddingFrames == -12);
+  REQUIRE(loaded->velocityBlendLink.has_value());
+  CHECK(loaded->velocityBlendLink->partnerFileName ==
+        "Loop_B.ipanim.json");
+  CHECK(loaded->velocityBlendLink->maxEndMoveFraction ==
+        Catch::Approx(0.12F));
+  CHECK(loaded->velocityBlendLink->strongAlignMaxMoveFraction ==
+        Catch::Approx(0.65F));
+  CHECK(loaded->velocityBlendLink->startOverlapSeconds ==
+        Catch::Approx(1.25F));
+  CHECK(loaded->velocityBlendLink->endOverlapSeconds ==
+        Catch::Approx(1.75F));
+  CHECK(loaded->velocityBlendLink->horizontalBlend);
+  CHECK_FALSE(loaded->velocityBlendLink->panRight);
+  CHECK_FALSE(AnimationPathToJson(*loaded)
+                  .at("velocity_blend_link")
+                  .contains("pending_strong_alignment"));
+  REQUIRE(loaded->localizedKeyCorrections.size() == 2U);
+  CHECK(loaded->localizedKeyCorrections[0U].keyId == "first");
+  CHECK(loaded->localizedKeyCorrections[0U].splineCameraPosition[0U] ==
+        Catch::Approx(0.9F));
+  CHECK(loaded->localizedKeyCorrections[1U].splineFocusPoint[1U] ==
+        Catch::Approx(7.1F));
+}
 
-  auto missingSource = json;
-  missingSource["linked_loop"]["second_file_name"] = "";
-  const auto sanitized = AnimationPathFromJson(missingSource, &error);
-  REQUIRE(sanitized.has_value());
-  CHECK_FALSE(sanitized->linkedLoop.has_value());
+TEST_CASE("Schema 18 velocity smoothing migrates without changing evaluation or timing",
+          "[animation][serialization][velocity-blend][migration]") {
+  using invisible_places::camera::AnimationLocalizedKeyCorrection;
+  using invisible_places::camera::AnimationPath;
+  using invisible_places::serialization::AnimationPathFromJson;
+  using invisible_places::serialization::AnimationPathToJson;
+
+  AnimationPath path;
+  path.name = "Exhibition migration sample";
+  path.durationFrames = 150U;
+  path.keys = {
+      {.id = "first", .cameraPosition = {1.1F, 2.0F, 3.0F},
+       .focusPoint = {4.0F, 5.1F, 6.0F}, .durationFrames = 31U},
+      {.id = "middle", .cameraPosition = {2.0F, 3.0F, 4.0F},
+       .focusPoint = {5.0F, 6.0F, 7.0F}, .durationFrames = 47U},
+      {.id = "last", .cameraPosition = {2.9F, 4.0F, 5.0F},
+       .focusPoint = {6.0F, 6.9F, 8.0F}, .durationFrames = 73U},
+  };
+  auto expected = path;
+  expected.localizedKeyCorrections = {
+      AnimationLocalizedKeyCorrection{
+          .keyId = "first",
+          .splineCameraPosition = {1.0F, 2.0F, 3.0F},
+          .splineFocusPoint = {4.0F, 5.0F, 6.0F},
+      },
+      AnimationLocalizedKeyCorrection{
+          .keyId = "last",
+          .splineCameraPosition = {3.0F, 4.0F, 5.0F},
+          .splineFocusPoint = {6.0F, 7.0F, 8.0F},
+      },
+  };
+
+  auto json = AnimationPathToJson(path);
+  json["schema_version"] = 18U;
+  json.erase("velocity_blend_link");
+  json.erase("localized_key_corrections");
+  json["loop_transition_smoothing"] = {
+      {"pair_id", "exhibition-pair"},
+      {"partner_file_name", "Exhibition_SECOND.ipanim.json"},
+      {"sequence_index", 0U},
+      {"max_end_move_fraction", 0.10F},
+      {"first_key_id", "first"},
+      {"last_key_id", "last"},
+      {"original_first_camera_position", {1.0F, 2.0F, 3.0F}},
+      {"original_first_focus_point", {4.0F, 5.0F, 6.0F}},
+      {"original_last_camera_position", {3.0F, 4.0F, 5.0F}},
+      {"original_last_focus_point", {6.0F, 7.0F, 8.0F}},
+      {"start_overlap_seconds", 45.0F},
+      {"end_overlap_seconds", 45.0F},
+      {"horizontal_blend", true},
+      {"pan_right", true},
+      {"uses_key_adjustments", false},
+      {"key_adjustments", nlohmann::json::array()},
+  };
+
+  std::string error;
+  const auto loaded = AnimationPathFromJson(json, &error);
+  INFO(error);
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->velocityBlendLink.has_value());
+  CHECK(loaded->velocityBlendLink->pairId == "exhibition-pair");
+  CHECK(loaded->velocityBlendLink->startOverlapSeconds ==
+        Catch::Approx(45.0F));
+  CHECK(loaded->velocityBlendLink->endOverlapSeconds ==
+        Catch::Approx(45.0F));
+  CHECK(loaded->velocityBlendLink->horizontalBlend);
+  CHECK(loaded->velocityBlendLink->panRight);
+  CHECK(loaded->velocityBlendLink->movableKeyIds ==
+        std::vector<std::string>{"first", "last"});
+  CHECK(loaded->durationFrames == path.durationFrames);
+  REQUIRE(loaded->keys.size() == path.keys.size());
+  for (std::size_t keyIndex = 0U; keyIndex < path.keys.size(); ++keyIndex) {
+    CHECK(loaded->keys[keyIndex].durationFrames ==
+          path.keys[keyIndex].durationFrames);
+  }
+
+  const auto expectedContext =
+      invisible_places::camera::PrepareAnimationPathEvaluation(expected);
+  const auto loadedContext =
+      invisible_places::camera::PrepareAnimationPathEvaluation(*loaded);
+  REQUIRE(expectedContext.valid);
+  REQUIRE(loadedContext.valid);
+  REQUIRE(expectedContext.knots == loadedContext.knots);
+  for (std::uint32_t sample = 0U; sample <= 256U; ++sample) {
+    const float time = expectedContext.durationSeconds *
+                       static_cast<float>(sample) / 256.0F;
+    const auto expectedFrame =
+        invisible_places::camera::EvaluatePreparedAnimationPath(
+            expectedContext, time);
+    const auto loadedFrame =
+        invisible_places::camera::EvaluatePreparedAnimationPath(
+            loadedContext, time);
+    for (std::size_t component = 0U; component < 3U; ++component) {
+      CHECK(loadedFrame.camera.position[component] ==
+            Catch::Approx(expectedFrame.camera.position[component])
+                .margin(1.0e-6F));
+      CHECK(loadedFrame.focusPoint[component] ==
+            Catch::Approx(expectedFrame.focusPoint[component])
+                .margin(1.0e-6F));
+    }
+  }
+
+  auto compiledLegacy = AnimationPathToJson(path);
+  compiledLegacy["schema_version"] = 18U;
+  compiledLegacy["linked_loop"] = {
+      {"first_file_name", "Loop_A.ipanim.json"},
+      {"second_file_name", "Loop_B.ipanim.json"},
+      {"first_start_key_id", "middle"},
+      {"first_start_position", 0.42F},
+      {"padding_frames", -12},
+  };
+  const auto standalone = AnimationPathFromJson(compiledLegacy, &error);
+  REQUIRE(standalone.has_value());
+  REQUIRE(standalone->keys.size() == path.keys.size());
+  for (std::size_t keyIndex = 0U; keyIndex < path.keys.size(); ++keyIndex) {
+    CHECK(standalone->keys[keyIndex].id == path.keys[keyIndex].id);
+    CHECK(standalone->keys[keyIndex].cameraPosition ==
+          path.keys[keyIndex].cameraPosition);
+    CHECK(standalone->keys[keyIndex].focusPoint ==
+          path.keys[keyIndex].focusPoint);
+    CHECK(standalone->keys[keyIndex].durationFrames ==
+          path.keys[keyIndex].durationFrames);
+  }
+  CHECK_FALSE(standalone->velocityBlendLink.has_value());
+  CHECK(standalone->localizedKeyCorrections.empty());
+  CHECK_FALSE(AnimationPathToJson(*standalone).contains("linked_loop"));
 }
 
 TEST_CASE("Staged document bundle restores earlier files after a later commit failure",
@@ -3178,4 +3284,36 @@ TEST_CASE("Staged document bundle restores earlier files after a later commit fa
     CHECK(entry.path().filename().string().find(".document-bundle.") ==
           std::string::npos);
   }
+}
+
+TEST_CASE("Staged document bundle creates a new target without requiring an original file",
+          "[serialization][transaction]") {
+  using invisible_places::serialization::CommitStagedDocumentReplacements;
+  using invisible_places::serialization::StagedDocumentReplacement;
+
+  TemporaryProjectDirectory temporary{
+      "invisible_places_document_bundle_new_target"};
+  const auto target = temporary.path / "new-animation.ipanim.json";
+  const auto staged = temporary.path / "new-animation.pending";
+  {
+    std::ofstream output{staged, std::ios::trunc};
+    REQUIRE(output.is_open());
+    output << "new-animation";
+  }
+  REQUIRE_FALSE(std::filesystem::exists(target));
+
+  const std::array replacements{
+      StagedDocumentReplacement{target, staged},
+  };
+  std::string error;
+  REQUIRE(CommitStagedDocumentReplacements(replacements, &error));
+  CHECK(error.empty());
+  CHECK(std::filesystem::is_regular_file(target));
+  CHECK_FALSE(std::filesystem::exists(staged));
+
+  std::ifstream input{target};
+  REQUIRE(input.is_open());
+  std::string contents;
+  std::getline(input, contents);
+  CHECK(contents == "new-animation");
 }

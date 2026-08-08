@@ -25,10 +25,10 @@ namespace {
 
 using nlohmann::json;
 using invisible_places::camera::AnimationExportSettings;
+using invisible_places::camera::AnimationLocalizedKeyCorrection;
 using invisible_places::camera::AnimationPath;
 using invisible_places::camera::AnimationPathKey;
-using invisible_places::camera::AnimationLinkedLoopMetadata;
-using invisible_places::camera::AnimationLoopSmoothingMetadata;
+using invisible_places::camera::AnimationVelocityBlendLinkMetadata;
 using invisible_places::camera::CameraShot;
 using invisible_places::camera::CameraState;
 using invisible_places::output::AnimationExportMode;
@@ -53,6 +53,32 @@ using invisible_places::renderer::pointcloud::PointCloudStylisationMode;
 using invisible_places::renderer::pointcloud::PointCloudShorelineWaveAlgorithm;
 using invisible_places::renderer::pointcloud::PointCloudShorelineWaveProfile;
 using invisible_places::renderer::pointcloud::PointCloudShorelineWaveSettings;
+
+struct LegacyAnimationLoopSmoothingKeyAdjustment {
+    std::string keyId;
+    std::array<float, 3> originalCameraPosition{};
+    std::array<float, 3> originalFocusPoint{};
+};
+
+struct AnimationLoopSmoothingMetadata {
+    std::string pairId;
+    std::string partnerFileName;
+    std::uint32_t sequenceIndex = 0U;
+    float maxEndMoveFraction = 0.10F;
+    std::string firstKeyId;
+    std::string lastKeyId;
+    std::array<float, 3> originalFirstCameraPosition{};
+    std::array<float, 3> originalFirstFocusPoint{};
+    std::array<float, 3> originalLastCameraPosition{};
+    std::array<float, 3> originalLastFocusPoint{};
+    float startOverlapSeconds = 0.0F;
+    float endOverlapSeconds = 0.0F;
+    bool horizontalBlend = false;
+    bool panRight = true;
+    bool usesKeyAdjustments = false;
+    std::vector<LegacyAnimationLoopSmoothingKeyAdjustment> keyAdjustments;
+};
+
 using invisible_places::style::FieldMapConfig;
 using invisible_places::style::ParameterSourceMode;
 using invisible_places::style::RenderParameterBinding;
@@ -2377,22 +2403,6 @@ AnimationPathKey ParseAnimationPathKey(const json& keyJson) {
     return key;
 }
 
-json SerializeAnimationLoopSmoothingMetadata(
-    const AnimationLoopSmoothingMetadata& smoothing) {
-    return json{
-        {"pair_id", smoothing.pairId},
-        {"partner_file_name", smoothing.partnerFileName},
-        {"sequence_index", smoothing.sequenceIndex},
-        {"max_end_move_fraction", smoothing.maxEndMoveFraction},
-        {"first_key_id", smoothing.firstKeyId},
-        {"last_key_id", smoothing.lastKeyId},
-        {"original_first_camera_position", smoothing.originalFirstCameraPosition},
-        {"original_first_focus_point", smoothing.originalFirstFocusPoint},
-        {"original_last_camera_position", smoothing.originalLastCameraPosition},
-        {"original_last_focus_point", smoothing.originalLastFocusPoint},
-    };
-}
-
 std::optional<AnimationLoopSmoothingMetadata>
 ParseAnimationLoopSmoothingMetadata(const json& smoothingJson) {
     if (!smoothingJson.is_object()) {
@@ -2410,6 +2420,24 @@ ParseAnimationLoopSmoothingMetadata(const json& smoothingJson) {
         0.25F);
     smoothing.firstKeyId = smoothingJson.value("first_key_id", std::string{});
     smoothing.lastKeyId = smoothingJson.value("last_key_id", std::string{});
+    smoothing.startOverlapSeconds = std::max(
+        0.0F,
+        smoothingJson.value("start_overlap_seconds", 0.0F));
+    smoothing.endOverlapSeconds = std::max(
+        0.0F,
+        smoothingJson.value("end_overlap_seconds", 0.0F));
+    smoothing.horizontalBlend =
+        smoothingJson.value("horizontal_blend", false);
+    smoothing.panRight = smoothingJson.value("pan_right", true);
+    smoothing.usesKeyAdjustments = smoothingJson.value(
+        "uses_key_adjustments",
+        smoothingJson.contains("key_adjustments") &&
+            smoothingJson.at("key_adjustments").is_array() &&
+            !smoothingJson.at("key_adjustments").empty());
+    if (!std::isfinite(smoothing.startOverlapSeconds) ||
+        !std::isfinite(smoothing.endOverlapSeconds)) {
+        return std::nullopt;
+    }
     try {
         smoothing.originalFirstCameraPosition =
             smoothingJson.at("original_first_camera_position")
@@ -2423,6 +2451,33 @@ ParseAnimationLoopSmoothingMetadata(const json& smoothingJson) {
         smoothing.originalLastFocusPoint =
             smoothingJson.at("original_last_focus_point")
                 .get<std::array<float, 3>>();
+        if (smoothingJson.contains("key_adjustments")) {
+            if (!smoothingJson.at("key_adjustments").is_array()) {
+                return std::nullopt;
+            }
+            std::unordered_set<std::string> adjustmentIds;
+            for (const auto& adjustmentJson :
+                 smoothingJson.at("key_adjustments")) {
+                if (!adjustmentJson.is_object()) {
+                    return std::nullopt;
+                }
+                LegacyAnimationLoopSmoothingKeyAdjustment adjustment;
+                adjustment.keyId =
+                    adjustmentJson.value("key_id", std::string{});
+                adjustment.originalCameraPosition =
+                    adjustmentJson.at("original_camera_position")
+                        .get<std::array<float, 3>>();
+                adjustment.originalFocusPoint =
+                    adjustmentJson.at("original_focus_point")
+                        .get<std::array<float, 3>>();
+                if (adjustment.keyId.empty() ||
+                    !adjustmentIds.insert(adjustment.keyId).second) {
+                    return std::nullopt;
+                }
+                smoothing.keyAdjustments.push_back(
+                    std::move(adjustment));
+            }
+        }
     } catch (const std::exception&) {
         return std::nullopt;
     }
@@ -2433,42 +2488,120 @@ ParseAnimationLoopSmoothingMetadata(const json& smoothingJson) {
     return smoothing;
 }
 
-json SerializeAnimationLinkedLoopMetadata(
-    const AnimationLinkedLoopMetadata& linkedLoop) {
-    return json{
-        {"first_file_name", linkedLoop.firstFileName},
-        {"second_file_name", linkedLoop.secondFileName},
-        {"first_start_key_id", linkedLoop.firstStartKeyId},
-        {"first_start_position", linkedLoop.firstStartPosition},
-        {"padding_frames", linkedLoop.paddingFrames},
+json SerializeAnimationVelocityBlendLink(
+    const AnimationVelocityBlendLinkMetadata& link) {
+    json linkJson{
+        {"pair_id", link.pairId},
+        {"partner_file_name", link.partnerFileName},
+        {"max_end_move_fraction", link.maxEndMoveFraction},
+        {"strong_align_max_move_fraction",
+         link.strongAlignMaxMoveFraction},
+        {"start_overlap_seconds", link.startOverlapSeconds},
+        {"end_overlap_seconds", link.endOverlapSeconds},
+        {"horizontal_blend", link.horizontalBlend},
+        {"pan_right", link.panRight},
+        {"movable_key_ids", link.movableKeyIds},
     };
+    return linkJson;
 }
 
-std::optional<AnimationLinkedLoopMetadata>
-ParseAnimationLinkedLoopMetadata(const json& linkedLoopJson) {
-    if (!linkedLoopJson.is_object()) {
+std::optional<AnimationVelocityBlendLinkMetadata>
+ParseAnimationVelocityBlendLink(const json& linkJson) {
+    if (!linkJson.is_object()) {
         return std::nullopt;
     }
-    AnimationLinkedLoopMetadata linkedLoop;
-    linkedLoop.firstFileName =
-        linkedLoopJson.value("first_file_name", std::string{});
-    linkedLoop.secondFileName =
-        linkedLoopJson.value("second_file_name", std::string{});
-    linkedLoop.firstStartKeyId =
-        linkedLoopJson.value("first_start_key_id", std::string{});
-    linkedLoop.firstStartPosition = std::clamp(
-        linkedLoopJson.value("first_start_position", 0.0F),
-        0.0F,
+    AnimationVelocityBlendLinkMetadata link;
+    link.pairId = linkJson.value("pair_id", std::string{});
+    link.partnerFileName =
+        linkJson.value("partner_file_name", std::string{});
+    link.maxEndMoveFraction = std::clamp(
+        linkJson.value("max_end_move_fraction", 0.10F),
+        0.01F,
+        0.25F);
+    link.strongAlignMaxMoveFraction = std::clamp(
+        linkJson.value("strong_align_max_move_fraction", 0.50F),
+        0.01F,
         1.0F);
-    linkedLoop.paddingFrames = std::clamp<std::int32_t>(
-        linkedLoopJson.value("padding_frames", 0),
-        -3600,
-        3600);
-    if (linkedLoop.firstFileName.empty() ||
-        linkedLoop.secondFileName.empty()) {
+    link.startOverlapSeconds = std::max(
+        0.0F,
+        linkJson.value("start_overlap_seconds", 0.0F));
+    link.endOverlapSeconds = std::max(
+        0.0F,
+        linkJson.value("end_overlap_seconds", 0.0F));
+    link.horizontalBlend =
+        linkJson.value("horizontal_blend", false);
+    link.panRight = linkJson.value("pan_right", true);
+    if (linkJson.contains("movable_key_ids") &&
+        linkJson.at("movable_key_ids").is_array()) {
+        std::unordered_set<std::string> uniqueIds;
+        for (const auto& idJson : linkJson.at("movable_key_ids")) {
+            if (!idJson.is_string()) {
+                return std::nullopt;
+            }
+            auto id = idJson.get<std::string>();
+            if (id.empty() || !uniqueIds.insert(id).second) {
+                return std::nullopt;
+            }
+            link.movableKeyIds.push_back(std::move(id));
+        }
+    }
+    if (link.pairId.empty() || link.partnerFileName.empty() ||
+        !std::isfinite(link.startOverlapSeconds) ||
+        !std::isfinite(link.endOverlapSeconds)) {
         return std::nullopt;
     }
-    return linkedLoop;
+    return link;
+}
+
+json SerializeAnimationLocalizedKeyCorrections(
+    const std::vector<AnimationLocalizedKeyCorrection>& corrections) {
+    json correctionsJson = json::array();
+    for (const auto& correction : corrections) {
+        correctionsJson.push_back(json{
+            {"key_id", correction.keyId},
+            {"spline_camera_position", correction.splineCameraPosition},
+            {"spline_focus_point", correction.splineFocusPoint},
+        });
+    }
+    return correctionsJson;
+}
+
+std::optional<std::vector<AnimationLocalizedKeyCorrection>>
+ParseAnimationLocalizedKeyCorrections(const json& correctionsJson) {
+    if (!correctionsJson.is_array()) {
+        return std::nullopt;
+    }
+    std::vector<AnimationLocalizedKeyCorrection> corrections;
+    std::unordered_set<std::string> uniqueIds;
+    try {
+        for (const auto& correctionJson : correctionsJson) {
+            AnimationLocalizedKeyCorrection correction;
+            correction.keyId =
+                correctionJson.value("key_id", std::string{});
+            correction.splineCameraPosition =
+                correctionJson.at("spline_camera_position")
+                    .get<std::array<float, 3>>();
+            correction.splineFocusPoint =
+                correctionJson.at("spline_focus_point")
+                    .get<std::array<float, 3>>();
+            const auto finite = [](const auto& position) {
+                return std::all_of(
+                    position.begin(),
+                    position.end(),
+                    [](float value) { return std::isfinite(value); });
+            };
+            if (correction.keyId.empty() ||
+                !uniqueIds.insert(correction.keyId).second ||
+                !finite(correction.splineCameraPosition) ||
+                !finite(correction.splineFocusPoint)) {
+                return std::nullopt;
+            }
+            corrections.push_back(std::move(correction));
+        }
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+    return corrections;
 }
 
 json SerializeAnimationExportSettings(const AnimationExportSettings& settings) {
@@ -2520,14 +2653,15 @@ json SerializeAnimationPath(const AnimationPath& path) {
         pathJson["water_animation_trail_settings"] =
             SerializeWaterAnimationTrailSettings(path.waterAnimationTrailSettings.value());
     }
-    if (path.loopTransitionSmoothing.has_value()) {
-        pathJson["loop_transition_smoothing"] =
-            SerializeAnimationLoopSmoothingMetadata(
-                path.loopTransitionSmoothing.value());
+    if (path.velocityBlendLink.has_value()) {
+        pathJson["velocity_blend_link"] =
+            SerializeAnimationVelocityBlendLink(
+                path.velocityBlendLink.value());
     }
-    if (path.linkedLoop.has_value()) {
-        pathJson["linked_loop"] = SerializeAnimationLinkedLoopMetadata(
-            path.linkedLoop.value());
+    if (!path.localizedKeyCorrections.empty()) {
+        pathJson["localized_key_corrections"] =
+            SerializeAnimationLocalizedKeyCorrections(
+                path.localizedKeyCorrections);
     }
     if (path.tempWaterAnimationTrailSettings.has_value()) {
         pathJson["temp_water_animation_trail_settings"] =
@@ -2552,6 +2686,8 @@ json SerializeAnimationPath(const AnimationPath& path) {
 
 AnimationPath ParseAnimationPath(const json& pathJson) {
     AnimationPath path;
+    path.sourceSchemaVersion = pathJson.value("schema_version", 1U);
+    std::optional<AnimationLoopSmoothingMetadata> legacySmoothing;
     path.name = pathJson.value("name", path.name);
     path.durationFrames = pathJson.value("duration_frames", path.durationFrames);
     if (pathJson.contains("associated_layer_paths")) {
@@ -2571,13 +2707,19 @@ AnimationPath ParseAnimationPath(const json& pathJson) {
     if (pathJson.contains("export_settings")) {
         path.exportSettings = ParseAnimationExportSettings(pathJson.at("export_settings"));
     }
-    if (pathJson.contains("loop_transition_smoothing")) {
-        path.loopTransitionSmoothing = ParseAnimationLoopSmoothingMetadata(
-            pathJson.at("loop_transition_smoothing"));
+    if (pathJson.contains("velocity_blend_link")) {
+        path.velocityBlendLink = ParseAnimationVelocityBlendLink(
+            pathJson.at("velocity_blend_link"));
     }
-    if (pathJson.contains("linked_loop")) {
-        path.linkedLoop = ParseAnimationLinkedLoopMetadata(
-            pathJson.at("linked_loop"));
+    if (pathJson.contains("localized_key_corrections")) {
+        const auto corrections = ParseAnimationLocalizedKeyCorrections(
+            pathJson.at("localized_key_corrections"));
+        if (corrections.has_value()) {
+            path.localizedKeyCorrections = corrections.value();
+        }
+    } else if (pathJson.contains("loop_transition_smoothing")) {
+        legacySmoothing = ParseAnimationLoopSmoothingMetadata(
+            pathJson.at("loop_transition_smoothing"));
     }
     if (pathJson.contains("water_animation_trail_settings")) {
         path.waterAnimationTrailSettings =
@@ -2664,12 +2806,94 @@ AnimationPath ParseAnimationPath(const json& pathJson) {
         }
     }
     EnsureAnimationPathKeyIds(&path);
-    if (path.loopTransitionSmoothing.has_value() &&
-        (path.keys.size() < 3U ||
-         path.keys.front().id != path.loopTransitionSmoothing->firstKeyId ||
-         path.keys.back().id != path.loopTransitionSmoothing->lastKeyId)) {
-        path.loopTransitionSmoothing.reset();
+    if (legacySmoothing.has_value() && path.keys.size() >= 3U &&
+        path.keys.front().id == legacySmoothing->firstKeyId &&
+        path.keys.back().id == legacySmoothing->lastKeyId) {
+        const bool hadExplicitVelocityBlendLink =
+            path.velocityBlendLink.has_value();
+        if (!legacySmoothing->partnerFileName.empty() &&
+            !hadExplicitVelocityBlendLink) {
+            path.velocityBlendLink =
+                AnimationVelocityBlendLinkMetadata{
+                    .pairId = legacySmoothing->pairId,
+                    .partnerFileName =
+                        legacySmoothing->partnerFileName,
+                    .maxEndMoveFraction =
+                        legacySmoothing->maxEndMoveFraction,
+                    .strongAlignMaxMoveFraction = 0.50F,
+                    .startOverlapSeconds =
+                        legacySmoothing->startOverlapSeconds,
+                    .endOverlapSeconds =
+                        legacySmoothing->endOverlapSeconds,
+                    .horizontalBlend =
+                        legacySmoothing->horizontalBlend,
+                    .panRight = legacySmoothing->panRight,
+                };
+        }
+        const auto keyIdMatchesExactlyOne = [&](const std::string& keyId) {
+            return std::count_if(
+                       path.keys.begin(),
+                       path.keys.end(),
+                       [&](const AnimationPathKey& key) {
+                           return key.id == keyId;
+                       }) == 1;
+        };
+        const auto addCorrection = [&](
+                                       std::string keyId,
+                                       const std::array<float, 3>& camera,
+                                       const std::array<float, 3>& focus) {
+            if (!keyIdMatchesExactlyOne(keyId)) {
+                return;
+            }
+            path.localizedKeyCorrections.push_back({
+                .keyId = std::move(keyId),
+                .splineCameraPosition = camera,
+                .splineFocusPoint = focus,
+            });
+        };
+        if (legacySmoothing->usesKeyAdjustments &&
+            !legacySmoothing->keyAdjustments.empty()) {
+            for (const auto& adjustment :
+                 legacySmoothing->keyAdjustments) {
+                addCorrection(
+                    adjustment.keyId,
+                    adjustment.originalCameraPosition,
+                    adjustment.originalFocusPoint);
+                if (path.velocityBlendLink.has_value() &&
+                    !hadExplicitVelocityBlendLink &&
+                    keyIdMatchesExactlyOne(adjustment.keyId)) {
+                    path.velocityBlendLink->movableKeyIds.push_back(
+                        adjustment.keyId);
+                }
+            }
+        } else {
+            addCorrection(
+                legacySmoothing->firstKeyId,
+                legacySmoothing->originalFirstCameraPosition,
+                legacySmoothing->originalFirstFocusPoint);
+            addCorrection(
+                legacySmoothing->lastKeyId,
+                legacySmoothing->originalLastCameraPosition,
+                legacySmoothing->originalLastFocusPoint);
+            if (path.velocityBlendLink.has_value() &&
+                !hadExplicitVelocityBlendLink) {
+                path.velocityBlendLink->movableKeyIds = {
+                    legacySmoothing->firstKeyId,
+                    legacySmoothing->lastKeyId,
+                };
+            }
+        }
     }
+    std::erase_if(
+        path.localizedKeyCorrections,
+        [&](const AnimationLocalizedKeyCorrection& correction) {
+            return std::count_if(
+                       path.keys.begin(),
+                       path.keys.end(),
+                       [&](const AnimationPathKey& key) {
+                           return key.id == correction.keyId;
+                       }) != 1;
+        });
     return path;
 }
 
@@ -2733,6 +2957,8 @@ const char* AnimationExportModeName(AnimationExportMode mode) {
     switch (mode) {
         case AnimationExportMode::FastPreviewMp4:
             return "fast_preview_mp4";
+        case AnimationExportMode::TestMp4:
+            return "test_mp4";
         case AnimationExportMode::HevcAlphaMp4:
             return "hevc_alpha_mp4";
         case AnimationExportMode::PngStack:
@@ -2795,6 +3021,9 @@ AnimationExportMode ParseAnimationExportMode(const json& modeJson) {
                           : std::string{AnimationExportModeName(AnimationExportMode::FastPreviewMp4)};
     if (mode == "hq_preview_density_exr" || mode == "hq_exr") {
         return AnimationExportMode::HqPreviewDensityExr;
+    }
+    if (mode == "test_mp4" || mode == "test_h265_mp4" || mode == "test_hevc_mp4") {
+        return AnimationExportMode::TestMp4;
     }
     if (mode == "hevc_alpha_mp4" || mode == "h265_alpha_mp4" || mode == "h_265_alpha_mp4") {
         return AnimationExportMode::HevcAlphaMp4;
@@ -2873,10 +3102,16 @@ ExportPreset ParseExportPreset(const json& presetJson) {
 }
 
 json SerializeSavedAnimation(const ProjectDocument::SavedAnimation& animation) {
-    return json{
+    json animationJson{
         {"file_path", animation.filePath.generic_string()},
         {"associated_layer_paths", SerializePathArray(animation.associatedLayerPaths)},
     };
+    if (animation.velocityBlendLink.has_value()) {
+        animationJson["velocity_blend_link"] =
+            SerializeAnimationVelocityBlendLink(
+                animation.velocityBlendLink.value());
+    }
+    return animationJson;
 }
 
 ProjectDocument::SavedAnimation ParseSavedAnimation(const json& animationJson) {
@@ -2884,6 +3119,10 @@ ProjectDocument::SavedAnimation ParseSavedAnimation(const json& animationJson) {
     animation.filePath = animationJson.value("file_path", std::string{});
     if (animationJson.contains("associated_layer_paths")) {
         animation.associatedLayerPaths = ParsePathArray(animationJson.at("associated_layer_paths"));
+    }
+    if (animationJson.contains("velocity_blend_link")) {
+        animation.velocityBlendLink = ParseAnimationVelocityBlendLink(
+            animationJson.at("velocity_blend_link"));
     }
     return animation;
 }
@@ -8575,7 +8814,7 @@ bool CommitStagedDocumentReplacements(
     };
     for (auto& replacement : runtimeReplacements) {
         std::error_code existsError;
-        replacement.hadOriginal = std::filesystem::is_regular_file(
+        const bool targetExists = std::filesystem::exists(
             replacement.targetPath,
             existsError);
         if (existsError) {
@@ -8587,8 +8826,25 @@ bool CommitStagedDocumentReplacements(
             cleanupRollbackCopies();
             return false;
         }
-        if (!replacement.hadOriginal) {
+        if (!targetExists) {
+            replacement.hadOriginal = false;
             continue;
+        }
+        std::error_code typeError;
+        replacement.hadOriginal = std::filesystem::is_regular_file(
+            replacement.targetPath,
+            typeError);
+        if (typeError || !replacement.hadOriginal) {
+            if (errorMessage != nullptr) {
+                *errorMessage = typeError
+                    ? "Could not inspect " +
+                          replacement.targetPath.string() + ": " +
+                          typeError.message()
+                    : "Document target is not a regular file: " +
+                          replacement.targetPath.string();
+            }
+            cleanupRollbackCopies();
+            return false;
         }
         std::error_code backupError;
         std::filesystem::copy_file(

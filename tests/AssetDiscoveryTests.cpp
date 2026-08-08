@@ -61,6 +61,7 @@
 #include <set>
 #include <span>
 #include <sstream>
+#include <stop_token>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -2574,6 +2575,11 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     fastPngStackPreset.settings.temporalSupersampling = true;
     fastPngStackPreset.settings.temporalSampleCount = 2;
     document.exportPresets.push_back(fastPngStackPreset);
+    auto testMp4Preset = invisible_places::output::MakeTestMp4ExportPreset();
+    testMp4Preset.name = "Optical Flow Review";
+    testMp4Preset.settings.outputDirectory = "Saved/renders/TestMP4";
+    testMp4Preset.settings.framesPerSecond = 5;
+    document.exportPresets.push_back(testMp4Preset);
     document.selectedExportPresetName = proResPreset.name;
     auto editedExportPreset = invisible_places::output::MakeFastPreviewMp4ExportPreset();
     editedExportPreset.name =
@@ -3063,6 +3069,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         CHECK(savedJson.find("\"layer_tint\"") != std::string::npos);
         CHECK(savedJson.find("\"associated_layer_paths\"") != std::string::npos);
         CHECK(savedJson.find("\"saved_animations\"") != std::string::npos);
+        CHECK(savedJson.find("\"mode\": \"test_mp4\"") != std::string::npos);
         CHECK(
             savedJson.find(
                 std::string{"\"schema_version\": "} +
@@ -3104,7 +3111,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(loadedDocument->renderJobSettings.motionBlur);
     CHECK(loadedDocument->renderJobSettings.motionBlurSampleCount == 6U);
     CHECK(loadedDocument->renderJobSettings.motionBlurShutterAngleDegrees == Catch::Approx(180.0F));
-    REQUIRE(loadedDocument->exportPresets.size() == 7U);
+    REQUIRE(loadedDocument->exportPresets.size() == 8U);
     CHECK(loadedDocument->exportPresets.front().name == "AE ProRes XQ VT");
     CHECK(
         loadedDocument->exportPresets.front().mode ==
@@ -3178,6 +3185,13 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(loadedDocument->exportPresets[6].settings.outputDirectory == "Saved/renders/FastPNG");
     CHECK(loadedDocument->exportPresets[6].settings.temporalSupersampling);
     CHECK(loadedDocument->exportPresets[6].settings.temporalSampleCount == 2U);
+    CHECK(loadedDocument->exportPresets[7].name == "Optical Flow Review");
+    CHECK(
+        loadedDocument->exportPresets[7].mode ==
+        invisible_places::output::AnimationExportMode::TestMp4);
+    CHECK(loadedDocument->exportPresets[7].settings.outputDirectory == "Saved/renders/TestMP4");
+    CHECK(loadedDocument->exportPresets[7].settings.framesPerSecond == 5U);
+    CHECK(loadedDocument->exportPresets[7].externalAlphaMatte);
     CHECK(loadedDocument->selectedExportPresetName == "AE ProRes XQ VT");
     REQUIRE(loadedDocument->tempExportPreset.has_value());
     CHECK(
@@ -11960,6 +11974,159 @@ TEST_CASE("Animation path perceived flow rises when the subject is close", "[cam
     CHECK(closeMeanFlow > farMeanFlow);
 }
 
+TEST_CASE("Animation flow diagnostics preserve scalar speed and report signed translation and roll",
+          "[camera][animation][flow-diagnostics]") {
+    using invisible_places::camera::AnimationPath;
+    const auto measureMiddle = [](const AnimationPath& path) {
+        const auto context =
+            invisible_places::camera::PrepareAnimationPathEvaluation(path);
+        REQUIRE(context.valid);
+        const auto samples = invisible_places::camera::
+            MeasurePreparedAnimationPathPerceivedFlow(context, 33U);
+        REQUIRE(samples.size() == 33U);
+        return samples[samples.size() / 2U];
+    };
+
+    AnimationPath horizontal;
+    horizontal.durationFrames = 30U;
+    horizontal.keys = {
+        {.id = "left",
+         .cameraPosition = {0.0F, 0.0F, 0.0F},
+         .focusPoint = {0.0F, 10.0F, 0.0F},
+         .fovDegrees = 60.0F,
+         .durationFrames = 30U},
+        {.id = "right",
+         .cameraPosition = {1.0F, 0.0F, 0.0F},
+         .focusPoint = {1.0F, 10.0F, 0.0F},
+         .fovDegrees = 60.0F,
+         .durationFrames = 30U},
+    };
+    const auto horizontalFlow = measureMiddle(horizontal);
+    const float legacyScalar =
+        (1.0F / 10.0F) / glm::radians(60.0F);
+    CHECK(horizontalFlow.screenSpeed ==
+          Catch::Approx(legacyScalar).epsilon(2.0e-3F));
+    CHECK(horizontalFlow.screenVelocity[0U] < 0.0F);
+    CHECK(std::abs(horizontalFlow.screenVelocity[1U]) < 1.0e-4F);
+    CHECK(horizontalFlow.middleScreenVelocity[0U] < 0.0F);
+    CHECK(horizontalFlow.topScreenVelocity[0U] ==
+          Catch::Approx(horizontalFlow.middleScreenVelocity[0U])
+              .margin(1.0e-4F));
+    CHECK(horizontalFlow.bottomScreenVelocity[0U] ==
+          Catch::Approx(horizontalFlow.middleScreenVelocity[0U])
+              .margin(1.0e-4F));
+    CHECK(std::abs(horizontalFlow.imageRotationDegreesPerSecond) < 1.0e-3F);
+
+    auto vertical = horizontal;
+    vertical.keys[1U].cameraPosition = {0.0F, 0.0F, 1.0F};
+    vertical.keys[1U].focusPoint = {0.0F, 10.0F, 1.0F};
+    const auto verticalFlow = measureMiddle(vertical);
+    CHECK(verticalFlow.screenVelocity[1U] < 0.0F);
+    CHECK(std::abs(verticalFlow.screenVelocity[0U]) < 1.0e-4F);
+
+    const auto makeRoll = [](float degrees) {
+        AnimationPath roll;
+        roll.durationFrames = 30U;
+        const float halfAngle = glm::radians(degrees) * 0.5F;
+        roll.keys = {
+            {.id = "roll-start",
+             .cameraPosition = {0.0F, 0.0F, 0.0F},
+             .focusPoint = {0.0F, 0.0F, -10.0F},
+             .hasOrientation = true,
+             .orientation = {0.0F, 0.0F, 0.0F, 1.0F},
+             .durationFrames = 30U},
+            {.id = "roll-end",
+             .cameraPosition = {0.0F, 0.0F, 0.0F},
+             .focusPoint = {0.0F, 0.0F, -10.0F},
+             .hasOrientation = true,
+             .orientation = {
+                 0.0F,
+                 0.0F,
+                 std::sin(halfAngle),
+                 std::cos(halfAngle)},
+             .durationFrames = 30U},
+        };
+        return roll;
+    };
+    const auto clockwise = measureMiddle(makeRoll(20.0F));
+    const auto counterClockwise = measureMiddle(makeRoll(-20.0F));
+    CHECK(std::abs(clockwise.imageRotationDegreesPerSecond) > 10.0F);
+    CHECK(std::abs(counterClockwise.imageRotationDegreesPerSecond) > 10.0F);
+    CHECK(clockwise.imageRotationDegreesPerSecond *
+              counterClockwise.imageRotationDegreesPerSecond <
+          0.0F);
+    CHECK(clockwise.topScreenVelocity[0U] *
+              clockwise.bottomScreenVelocity[0U] <
+          0.0F);
+}
+
+TEST_CASE("Animation speed equalization preserves the legacy mode and gives framing roll more time",
+          "[camera][animation][speed-equalization]") {
+    using invisible_places::camera::AnimationPath;
+    using invisible_places::camera::AnimationSpeedEqualizationMode;
+
+    AnimationPath path;
+    path.durationFrames = 120U;
+    const float halfRoll = 0.5F * glm::radians(60.0F);
+    path.keys = {
+        {.id = "steady-start",
+         .cameraPosition = {0.0F, 0.0F, 0.0F},
+         .focusPoint = {0.0F, 0.0F, -10.0F},
+         .hasOrientation = true,
+         .orientation = {0.0F, 0.0F, 0.0F, 1.0F},
+         .durationFrames = 60U},
+        {.id = "steady-end",
+         .cameraPosition = {0.0F, 0.0F, 0.0F},
+         .focusPoint = {0.0F, 0.0F, -10.0F},
+         .hasOrientation = true,
+         .orientation = {0.0F, 0.0F, 0.0F, 1.0F},
+         .durationFrames = 60U},
+        {.id = "roll-end",
+         .cameraPosition = {0.0F, 0.0F, 0.0F},
+         .focusPoint = {0.0F, 0.0F, -10.0F},
+         .hasOrientation = true,
+         .orientation = {
+             0.0F,
+             0.0F,
+             std::sin(halfRoll),
+             std::cos(halfRoll)},
+         .durationFrames = 60U},
+    };
+
+    const auto established = invisible_places::camera::
+        ComputeConstantPerceivedSpeedSegmentFrames(path, 32U);
+    const auto explicitLegacy = invisible_places::camera::
+        ComputeEqualizedAnimationSegmentFrames(
+            path,
+            {
+                .mode = AnimationSpeedEqualizationMode::PerceivedMotion,
+                .samplesPerSegment = 32U,
+            });
+    CHECK(explicitLegacy == established);
+
+    const auto centrePan = invisible_places::camera::
+        ComputeEqualizedAnimationSegmentFrames(
+            path,
+            {
+                .mode = AnimationSpeedEqualizationMode::CenterScreenPan,
+                .samplesPerSegment = 32U,
+            });
+    REQUIRE(centrePan.size() == 2U);
+    CHECK(centrePan[0U] == 60U);
+    CHECK(centrePan[1U] == 60U);
+
+    const auto stabilizedPan = invisible_places::camera::
+        ComputeEqualizedAnimationSegmentFrames(
+            path,
+            {
+                .mode = AnimationSpeedEqualizationMode::StabilizedPan,
+                .samplesPerSegment = 32U,
+            });
+    REQUIRE(stabilizedPan.size() == 2U);
+    CHECK(stabilizedPan[0U] + stabilizedPan[1U] == 120U);
+    CHECK(stabilizedPan[1U] > stabilizedPan[0U]);
+}
+
 TEST_CASE("Animation path perceived flow is zero for static paths and retimes evenly", "[camera][animation]") {
     invisible_places::camera::AnimationPath path;
     path.durationFrames = 90;
@@ -11985,207 +12152,8 @@ TEST_CASE("Animation path perceived flow is zero for static paths and retimes ev
     CHECK(segmentFrames[1] == 45U);
 }
 
-TEST_CASE("Linked animation rotates to a keyed phase and applies signed padding",
-          "[camera][animation][linked-loop]") {
-    using invisible_places::camera::AnimationLinkedLoopBuildOptions;
-    using invisible_places::camera::AnimationPath;
-    const auto makeLinearPath = [](
-                                    const char* name,
-                                    const char* idPrefix,
-                                    float offset) {
-        AnimationPath path;
-        path.name = name;
-        path.durationFrames = 120U;
-        path.keys = {
-            {.id = std::string{idPrefix} + "1",
-             .cameraPosition = {offset, 0.0F, 0.0F},
-             .focusPoint = {offset, 1.0F, 0.0F},
-             .durationFrames = 30U},
-            {.id = std::string{idPrefix} + "2",
-             .cameraPosition = {offset + 30.0F, 0.0F, 0.0F},
-             .focusPoint = {offset + 30.0F, 1.0F, 0.0F},
-             .durationFrames = 30U},
-            {.id = std::string{idPrefix} + "3",
-             .cameraPosition = {offset + 60.0F, 0.0F, 0.0F},
-             .focusPoint = {offset + 60.0F, 1.0F, 0.0F},
-             .durationFrames = 30U},
-            {.id = std::string{idPrefix} + "4",
-             .cameraPosition = {offset + 90.0F, 0.0F, 0.0F},
-             .focusPoint = {offset + 90.0F, 1.0F, 0.0F},
-             .durationFrames = 30U},
-            {.id = std::string{idPrefix} + "5",
-             .cameraPosition = {offset + 120.0F, 0.0F, 0.0F},
-             .focusPoint = {offset + 120.0F, 1.0F, 0.0F},
-             .durationFrames = 30U},
-        };
-        return path;
-    };
-    const auto first = makeLinearPath("A", "a", 0.0F);
-    const auto second = makeLinearPath("B", "b", 100.0F);
-
-    const auto zeroPaddingTiming =
-        invisible_places::camera::ResolveLinkedLoopTiming(
-            first,
-            second,
-            0);
-    CHECK(zeroPaddingTiming.secondStartFrame == Catch::Approx(90.0F));
-    CHECK(zeroPaddingTiming.periodFrames == 180U);
-    const auto firstJoinAnchor =
-        invisible_places::camera::EvaluateLinkedLoopSourceSample(
-            first,
-            second,
-            0.0F,
-            0,
-            90.0F / 180.0F);
-    REQUIRE(firstJoinAnchor.valid);
-    REQUIRE(firstJoinAnchor.firstActive);
-    REQUIRE(firstJoinAnchor.secondActive);
-    CHECK(firstJoinAnchor.first.camera.position[0] ==
-          Catch::Approx(90.0F));
-    CHECK(firstJoinAnchor.second.camera.position[0] ==
-          Catch::Approx(100.0F));
-    CHECK(firstJoinAnchor.firstWeight == Catch::Approx(1.0F));
-    CHECK(firstJoinAnchor.secondWeight == Catch::Approx(0.0F));
-    const auto secondJoinAnchor =
-        invisible_places::camera::EvaluateLinkedLoopSourceSample(
-            first,
-            second,
-            0.0F,
-            0,
-            0.0F);
-    REQUIRE(secondJoinAnchor.valid);
-    REQUIRE(secondJoinAnchor.firstActive);
-    REQUIRE(secondJoinAnchor.secondActive);
-    CHECK(secondJoinAnchor.second.camera.position[0] ==
-          Catch::Approx(190.0F));
-    CHECK(secondJoinAnchor.first.camera.position[0] ==
-          Catch::Approx(0.0F));
-    CHECK(secondJoinAnchor.secondWeight == Catch::Approx(1.0F));
-    CHECK(secondJoinAnchor.firstWeight == Catch::Approx(0.0F));
-
-    std::string error;
-    const auto overlapped =
-        invisible_places::camera::BuildLinkedLoopAnimation(
-            first,
-            second,
-            AnimationLinkedLoopBuildOptions{
-                .name = "A B Linked",
-                .firstFileName = "A.ipanim.json",
-                .secondFileName = "B.ipanim.json",
-                .firstStartKeyIndex = 2U,
-                .paddingFrames = -10,
-            },
-            &error);
-    INFO(error);
-    REQUIRE(overlapped.has_value());
-    REQUIRE(overlapped->linkedLoop.has_value());
-    CHECK(overlapped->durationFrames == 160U);
-    REQUIRE(overlapped->keys.size() == 161U);
-    CHECK(overlapped->linkedLoop->firstStartKeyId == "a3");
-    CHECK(overlapped->linkedLoop->firstStartPosition ==
-          Catch::Approx(0.5F));
-    CHECK(overlapped->linkedLoop->paddingFrames == -10);
-    CHECK(overlapped->keys.front().cameraPosition[0] ==
-          Catch::Approx(60.0F));
-    CHECK(overlapped->keys.back().cameraPosition[0] ==
-          Catch::Approx(60.0F));
-    // B begins ten frames before A's penultimate key. That extends the
-    // complete A terminal-edge blend to forty frames.
-    CHECK(overlapped->keys[20U].cameraPosition[0] ==
-          Catch::Approx(80.0F));
-    CHECK(overlapped->keys[40U].cameraPosition[0] ==
-          Catch::Approx(110.0F));
-    CHECK(overlapped->keys[60U].cameraPosition[0] ==
-          Catch::Approx(140.0F));
-    // The wrapped B -> A seam receives the same overlap treatment.
-    CHECK(overlapped->keys[100U].cameraPosition[0] ==
-          Catch::Approx(180.0F));
-    CHECK(overlapped->keys[120U].cameraPosition[0] ==
-          Catch::Approx(110.0F));
-    CHECK(overlapped->keys[140U].cameraPosition[0] ==
-          Catch::Approx(40.0F));
-
-    const auto timing =
-        invisible_places::camera::ResolveLinkedLoopTiming(
-            first,
-            second,
-            -10);
-    CHECK(timing.firstTerminalStartFrame == 90U);
-    CHECK(timing.secondTerminalStartFrame == 90U);
-    CHECK(timing.secondStartFrame == Catch::Approx(80.0F));
-    CHECK(timing.periodFrames == 160U);
-    const auto overlapStart =
-        invisible_places::camera::EvaluateLinkedLoopSourceSample(
-            first,
-            second,
-            0.5F,
-            -10,
-            20.0F / 160.0F);
-    REQUIRE(overlapStart.valid);
-    CHECK(overlapStart.firstActive);
-    CHECK(overlapStart.secondActive);
-    CHECK(overlapStart.firstWeight == Catch::Approx(1.0F));
-    CHECK(overlapStart.secondWeight == Catch::Approx(0.0F));
-    CHECK(overlapStart.first.camera.position[0] ==
-          Catch::Approx(80.0F));
-    CHECK(overlapStart.second.camera.position[0] ==
-          Catch::Approx(100.0F));
-    const auto overlapMiddle =
-        invisible_places::camera::EvaluateLinkedLoopSourceSample(
-            first,
-            second,
-            0.5F,
-            -10,
-            40.0F / 160.0F);
-    REQUIRE(overlapMiddle.valid);
-    CHECK(overlapMiddle.firstWeight == Catch::Approx(0.5F));
-    CHECK(overlapMiddle.secondWeight == Catch::Approx(0.5F));
-    CHECK(overlapMiddle.blended.camera.position[0] ==
-          Catch::Approx(110.0F));
-
-    const auto held = invisible_places::camera::BuildLinkedLoopAnimation(
-        first,
-        second,
-        AnimationLinkedLoopBuildOptions{
-            .name = "Held Linked",
-            .firstFileName = "A.ipanim.json",
-            .secondFileName = "B.ipanim.json",
-            .firstStartKeyIndex = 0U,
-            .paddingFrames = 100,
-        },
-        &error);
-    INFO(error);
-    REQUIRE(held.has_value());
-    CHECK(held->durationFrames == 380U);
-    REQUIRE(held->keys.size() == 381U);
-    CHECK(held->keys[120U].cameraPosition[0] == Catch::Approx(120.0F));
-    CHECK(held->keys[189U].cameraPosition[0] == Catch::Approx(120.0F));
-    CHECK(held->keys[190U].cameraPosition[0] == Catch::Approx(100.0F));
-    CHECK(held->keys[310U].cameraPosition[0] == Catch::Approx(220.0F));
-    CHECK(held->keys[379U].cameraPosition[0] == Catch::Approx(220.0F));
-    CHECK(held->keys.back().cameraPosition[0] == Catch::Approx(0.0F));
-    const auto heldBetweenFrames =
-        invisible_places::camera::EvaluateAnimationPath(
-            held.value(),
-            188.5F / 30.0F);
-    CHECK(heldBetweenFrames.camera.position[0] == Catch::Approx(120.0F));
-
-    const auto heldTiming =
-        invisible_places::camera::ResolveLinkedLoopTiming(
-            first,
-            second,
-            100);
-    CHECK(heldTiming.secondStartFrame == Catch::Approx(190.0F));
-    CHECK(heldTiming.periodFrames == 380U);
-
-    CHECK(invisible_places::camera::ClampLinkedLoopPaddingFrames(
-              first,
-              second,
-              -100) == -30);
-}
-
 TEST_CASE("Loop endpoint corrections leave the complete middle interval unchanged", "[camera][animation][loop]") {
-    using invisible_places::camera::AnimationLoopSmoothingMetadata;
+    using invisible_places::camera::AnimationLocalizedKeyCorrection;
     using invisible_places::camera::AnimationPath;
     AnimationPath original;
     original.durationFrames = 150U;
@@ -12197,15 +12165,17 @@ TEST_CASE("Loop endpoint corrections leave the complete middle interval unchange
         {.id = "e", .cameraPosition = {0.5F, 0.0F, 1.0F}, .focusPoint = {3.5F, 0.0F, 1.0F}, .durationFrames = 43U},
     };
     auto smoothed = original;
-    smoothed.loopTransitionSmoothing = AnimationLoopSmoothingMetadata{
-        .pairId = "pair",
-        .partnerFileName = "other.ipanim.json",
-        .firstKeyId = "a",
-        .lastKeyId = "e",
-        .originalFirstCameraPosition = original.keys.front().cameraPosition,
-        .originalFirstFocusPoint = original.keys.front().focusPoint,
-        .originalLastCameraPosition = original.keys.back().cameraPosition,
-        .originalLastFocusPoint = original.keys.back().focusPoint,
+    smoothed.localizedKeyCorrections = {
+        AnimationLocalizedKeyCorrection{
+            .keyId = "a",
+            .splineCameraPosition = original.keys.front().cameraPosition,
+            .splineFocusPoint = original.keys.front().focusPoint,
+        },
+        AnimationLocalizedKeyCorrection{
+            .keyId = "e",
+            .splineCameraPosition = original.keys.back().cameraPosition,
+            .splineFocusPoint = original.keys.back().focusPoint,
+        },
     };
     smoothed.keys.front().cameraPosition[0] += 0.08F;
     smoothed.keys.front().focusPoint[1] -= 0.06F;
@@ -12238,6 +12208,319 @@ TEST_CASE("Loop endpoint corrections leave the complete middle interval unchange
     CHECK(smoothed.keys.front().durationFrames == original.keys.front().durationFrames);
     CHECK(smoothed.keys[1U].durationFrames == original.keys[1U].durationFrames);
     CHECK(smoothed.keys.back().durationFrames == original.keys.back().durationFrames);
+}
+
+TEST_CASE("Loop key corrections remain local to enabled-key neighborhoods",
+          "[camera][animation][loop]") {
+    using invisible_places::camera::AnimationLocalizedKeyCorrection;
+    using invisible_places::camera::AnimationPath;
+    AnimationPath original;
+    original.durationFrames = 180U;
+    for (std::size_t keyIndex = 0U; keyIndex < 7U; ++keyIndex) {
+        original.keys.push_back({
+            .id = "key-" + std::to_string(keyIndex + 1U),
+            .cameraPosition = {
+                static_cast<float>(keyIndex) * 0.2F,
+                6.0F - static_cast<float>(keyIndex),
+                1.0F},
+            .focusPoint = {
+                3.0F + static_cast<float>(keyIndex) * 0.2F,
+                6.0F - static_cast<float>(keyIndex),
+                1.0F},
+            .durationFrames = 30U,
+        });
+    }
+    auto adjusted = original;
+    adjusted.localizedKeyCorrections = {
+        AnimationLocalizedKeyCorrection{
+            .keyId = original.keys[1U].id,
+            .splineCameraPosition = original.keys[1U].cameraPosition,
+            .splineFocusPoint = original.keys[1U].focusPoint,
+        },
+        AnimationLocalizedKeyCorrection{
+            .keyId = original.keys[5U].id,
+            .splineCameraPosition = original.keys[5U].cameraPosition,
+            .splineFocusPoint = original.keys[5U].focusPoint,
+        },
+    };
+    adjusted.keys[1U].cameraPosition[0U] += 0.08F;
+    adjusted.keys[1U].focusPoint[1U] -= 0.05F;
+    adjusted.keys[5U].cameraPosition[2U] += 0.07F;
+    adjusted.keys[5U].focusPoint[0U] -= 0.04F;
+
+    const auto beforeContext =
+        invisible_places::camera::PrepareAnimationPathEvaluation(original);
+    const auto afterContext =
+        invisible_places::camera::PrepareAnimationPathEvaluation(adjusted);
+    REQUIRE(beforeContext.knots.size() == original.keys.size());
+    REQUIRE(afterContext.knots == beforeContext.knots);
+    // Corrections touch only segments adjacent to keys 2 and 6. The dense
+    // interval bounded by locked keys 3..5 is exactly the preserved spline.
+    for (std::uint32_t sample = 0U; sample <= 96U; ++sample) {
+        const float amount = static_cast<float>(sample) / 96.0F;
+        const float time = std::lerp(
+            beforeContext.knots[2U],
+            beforeContext.knots[4U],
+            amount);
+        const auto before =
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                beforeContext,
+                time);
+        const auto after =
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                afterContext,
+                time);
+        for (std::size_t component = 0U; component < 3U; ++component) {
+            CHECK(after.camera.position[component] ==
+                  Catch::Approx(before.camera.position[component])
+                      .margin(1.0e-6F));
+            CHECK(after.focusPoint[component] ==
+                  Catch::Approx(before.focusPoint[component])
+                      .margin(1.0e-6F));
+        }
+    }
+    CHECK(adjusted.keys[2U].cameraPosition ==
+          original.keys[2U].cameraPosition);
+    CHECK(adjusted.keys[4U].focusPoint ==
+          original.keys[4U].focusPoint);
+}
+
+TEST_CASE("Loop smoothing supports explicit terminal keys with unequal path density",
+          "[camera][animation][loop]") {
+    using invisible_places::camera::AnimationLoopSmoothingOptions;
+    using invisible_places::camera::AnimationPath;
+    const auto makeKey = [](
+                             std::string id,
+                             float x,
+                             float y,
+                             std::uint32_t frames) {
+        return invisible_places::camera::AnimationPathKey{
+            .id = std::move(id),
+            .cameraPosition = {x, y, 1.0F},
+            .focusPoint = {x + 3.0F, y, 1.0F},
+            .durationFrames = frames,
+        };
+    };
+    AnimationPath first;
+    first.name = "Sparse A";
+    first.durationFrames = 150U;
+    first.keys = {
+        makeKey("a1", 0.0F, 4.0F, 30U),
+        makeKey("a2", 0.18F, 3.0F, 31U),
+        makeKey("a3", 0.28F, 2.0F, 37U),
+        makeKey("a4", 0.38F, 1.0F, 39U),
+        makeKey("a5", 0.48F, 0.0F, 43U),
+    };
+    AnimationPath second;
+    second.name = "Dense B";
+    second.durationFrames = 120U;
+    for (std::size_t keyIndex = 0U; keyIndex < 7U; ++keyIndex) {
+        const float amount = static_cast<float>(keyIndex) / 6.0F;
+        second.keys.push_back(makeKey(
+            "b" + std::to_string(keyIndex + 1U),
+            0.52F + 0.70F * amount,
+            4.0F * (1.0F - amount),
+            20U));
+    }
+    const AnimationPath originalFirst = first;
+    const AnimationPath originalSecond = second;
+    const auto firstContext =
+        invisible_places::camera::PrepareAnimationPathEvaluation(first);
+    REQUIRE(firstContext.knots.size() == first.keys.size());
+    const float firstStartOverlap =
+        firstContext.knots[1U] - firstContext.knots.front();
+    const float firstEndOverlap =
+        firstContext.knots.back() -
+        firstContext.knots[firstContext.knots.size() - 2U];
+
+    const AnimationLoopSmoothingOptions smoothingOptions{
+                .maxEndMoveFraction = 0.10F,
+                .pairId = "explicit-density-pair",
+                .firstFileName = "Sparse_A.ipanim.json",
+                .secondFileName = "Dense_B.ipanim.json",
+                .useExplicitKeySelection = true,
+                .firstMovableKeyIds = {"a1", "a2", "a4", "a5"},
+                .secondMovableKeyIds = {"b1", "b2", "b6", "b7"},
+                .firstStartOverlapSeconds = firstStartOverlap,
+                .firstEndOverlapSeconds = firstEndOverlap,
+                .secondStartOverlapSeconds = firstEndOverlap,
+                .secondEndOverlapSeconds = firstStartOverlap,
+                .horizontalBlend = true,
+                .panRight = true,
+            };
+    const auto result =
+        invisible_places::camera::SmoothAnimationLoopTransitions(
+            &first,
+            &second,
+            smoothingOptions);
+    INFO(result.errorMessage);
+    REQUIRE(result.succeeded);
+    REQUIRE(result.changed);
+    CHECK(result.afterMismatch < result.beforeMismatch);
+    CHECK(result.afterSeamMismatch[0U] <= result.beforeSeamMismatch[0U]);
+    CHECK(result.afterSeamMismatch[1U] <= result.beforeSeamMismatch[1U]);
+    CHECK(result.terminalSpeedRmsChange[0U] < 0.30F);
+    CHECK(result.terminalSpeedRmsChange[1U] < 0.30F);
+    REQUIRE(first.localizedKeyCorrections.size() == 4U);
+    REQUIRE(second.localizedKeyCorrections.size() == 4U);
+    CHECK(first.localizedKeyCorrections[0U].keyId == "a1");
+    CHECK(first.localizedKeyCorrections[3U].keyId == "a5");
+    CHECK(second.localizedKeyCorrections[0U].keyId == "b1");
+    CHECK(second.localizedKeyCorrections[3U].keyId == "b7");
+    CHECK(result.keyMovements[0U].size() == 4U);
+    CHECK(result.keyMovements[1U].size() == 4U);
+    CHECK(result.screenDisplacementSamples[0U].size() == 16U);
+    CHECK(result.screenDisplacementSamples[1U].size() == 13U);
+    CHECK(result.maxScreenDisplacement[0U] >= 0.0F);
+    CHECK(result.maxScreenDisplacement[1U] >= 0.0F);
+
+    const auto appliedMetrics =
+        invisible_places::camera::MeasureAnimationLoopTransitions(
+            first,
+            second,
+            smoothingOptions);
+    REQUIRE(appliedMetrics.valid);
+    REQUIRE(appliedMetrics.hasAppliedSmoothing);
+    CHECK(appliedMetrics.beforeMismatch ==
+          Catch::Approx(result.beforeMismatch).epsilon(1.0e-5F));
+    CHECK(appliedMetrics.afterMismatch ==
+          Catch::Approx(result.afterMismatch).epsilon(1.0e-5F));
+
+    CHECK(first.keys[2U].cameraPosition ==
+          originalFirst.keys[2U].cameraPosition);
+    CHECK(first.keys[2U].focusPoint ==
+          originalFirst.keys[2U].focusPoint);
+    for (std::size_t keyIndex = 2U; keyIndex <= 4U; ++keyIndex) {
+        CHECK(second.keys[keyIndex].cameraPosition ==
+              originalSecond.keys[keyIndex].cameraPosition);
+        CHECK(second.keys[keyIndex].focusPoint ==
+              originalSecond.keys[keyIndex].focusPoint);
+    }
+    for (std::size_t keyIndex = 0U;
+         keyIndex < first.keys.size();
+         ++keyIndex) {
+        CHECK(first.keys[keyIndex].durationFrames ==
+              originalFirst.keys[keyIndex].durationFrames);
+    }
+    for (std::size_t keyIndex = 0U;
+         keyIndex < second.keys.size();
+         ++keyIndex) {
+        CHECK(second.keys[keyIndex].durationFrames ==
+              originalSecond.keys[keyIndex].durationFrames);
+    }
+
+    const auto afterFirstContext =
+        invisible_places::camera::PrepareAnimationPathEvaluation(first);
+    const auto afterSecondContext =
+        invisible_places::camera::PrepareAnimationPathEvaluation(second);
+    const auto firstMiddleBefore =
+        invisible_places::camera::EvaluateAnimationPath(
+            originalFirst,
+            firstContext.knots[2U]);
+    const auto firstMiddleAfter =
+        invisible_places::camera::EvaluatePreparedAnimationPath(
+            afterFirstContext,
+            firstContext.knots[2U]);
+    for (std::size_t component = 0U; component < 3U; ++component) {
+        CHECK(firstMiddleAfter.camera.position[component] ==
+              Catch::Approx(firstMiddleBefore.camera.position[component])
+                  .margin(1.0e-6F));
+        CHECK(firstMiddleAfter.focusPoint[component] ==
+              Catch::Approx(firstMiddleBefore.focusPoint[component])
+                  .margin(1.0e-6F));
+    }
+    const auto originalSecondContext =
+        invisible_places::camera::PrepareAnimationPathEvaluation(
+            originalSecond);
+    for (std::uint32_t sample = 0U; sample <= 64U; ++sample) {
+        const float amount = static_cast<float>(sample) / 64.0F;
+        const float time = std::lerp(
+            originalSecondContext.knots[2U],
+            originalSecondContext.knots[4U],
+            amount);
+        const auto before =
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                originalSecondContext,
+                time);
+        const auto after =
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                afterSecondContext,
+                time);
+        for (std::size_t component = 0U; component < 3U; ++component) {
+            CHECK(after.camera.position[component] ==
+                  Catch::Approx(before.camera.position[component])
+                      .margin(1.0e-6F));
+            CHECK(after.focusPoint[component] ==
+                  Catch::Approx(before.focusPoint[component])
+                      .margin(1.0e-6F));
+        }
+    }
+
+    const auto restoreLocalizedCorrections = [](AnimationPath* path) {
+        REQUIRE(path != nullptr);
+        for (const auto& correction : path->localizedKeyCorrections) {
+            const auto key = std::find_if(
+                path->keys.begin(),
+                path->keys.end(),
+                [&](const auto& candidate) {
+                    return candidate.id == correction.keyId;
+                });
+            REQUIRE(key != path->keys.end());
+            key->cameraPosition = correction.splineCameraPosition;
+            key->focusPoint = correction.splineFocusPoint;
+        }
+        path->localizedKeyCorrections.clear();
+    };
+    restoreLocalizedCorrections(&first);
+    restoreLocalizedCorrections(&second);
+    CHECK(invisible_places::serialization::AnimationPathToJson(first) ==
+          invisible_places::serialization::AnimationPathToJson(
+              originalFirst));
+    CHECK(invisible_places::serialization::AnimationPathToJson(second) ==
+          invisible_places::serialization::AnimationPathToJson(
+              originalSecond));
+}
+
+TEST_CASE("Horizontal loop blend regions follow the directional thirds wipe",
+          "[camera][animation][loop][horizontal-blend]") {
+    using invisible_places::camera::
+        ResolveAnimationLoopHorizontalBlendRegions;
+
+    const auto rightStart =
+        ResolveAnimationLoopHorizontalBlendRegions(0.0F, true);
+    CHECK(rightStart.outgoingVisibleFraction ==
+          Catch::Approx(2.0F / 3.0F));
+    CHECK(rightStart.incomingVisibleFraction ==
+          Catch::Approx(1.0F / 3.0F));
+    CHECK(rightStart.outgoingRange[0U] == Catch::Approx(-1.0F));
+    CHECK(rightStart.outgoingRange[1U] == Catch::Approx(1.0F / 3.0F));
+    CHECK(rightStart.incomingRange[0U] == Catch::Approx(1.0F / 3.0F));
+    CHECK(rightStart.incomingRange[1U] == Catch::Approx(1.0F));
+
+    const auto rightMiddle =
+        ResolveAnimationLoopHorizontalBlendRegions(0.5F, true);
+    CHECK(rightMiddle.outgoingVisibleFraction == Catch::Approx(0.5F));
+    CHECK(rightMiddle.incomingVisibleFraction == Catch::Approx(0.5F));
+    CHECK(rightMiddle.outgoingRange[0U] == Catch::Approx(-1.0F));
+    CHECK(rightMiddle.outgoingRange[1U] == Catch::Approx(0.0F));
+    CHECK(rightMiddle.incomingRange[0U] == Catch::Approx(0.0F));
+    CHECK(rightMiddle.incomingRange[1U] == Catch::Approx(1.0F));
+
+    const auto rightEnd =
+        ResolveAnimationLoopHorizontalBlendRegions(1.0F, true);
+    CHECK(rightEnd.outgoingVisibleFraction ==
+          Catch::Approx(1.0F / 3.0F));
+    CHECK(rightEnd.incomingVisibleFraction ==
+          Catch::Approx(2.0F / 3.0F));
+    CHECK(rightEnd.outgoingRange[1U] == Catch::Approx(-1.0F / 3.0F));
+    CHECK(rightEnd.incomingRange[0U] == Catch::Approx(-1.0F / 3.0F));
+
+    const auto leftStart =
+        ResolveAnimationLoopHorizontalBlendRegions(0.0F, false);
+    CHECK(leftStart.outgoingRange[0U] == Catch::Approx(-1.0F / 3.0F));
+    CHECK(leftStart.outgoingRange[1U] == Catch::Approx(1.0F));
+    CHECK(leftStart.incomingRange[0U] == Catch::Approx(-1.0F));
+    CHECK(leftStart.incomingRange[1U] == Catch::Approx(-1.0F / 3.0F));
 }
 
 TEST_CASE("Loop transition smoothing improves both seams without retiming", "[camera][animation][loop]") {
@@ -12292,14 +12575,31 @@ TEST_CASE("Loop transition smoothing improves both seams without retiming", "[ca
         });
     REQUIRE(result.succeeded);
     REQUIRE(result.changed);
+    // The smoother writes only localized key corrections; the app installs
+    // the pair's velocity-blend link when the user links the two animations.
+    // Install it here the same way so the metric and round-trip sections
+    // below exercise link-aware behavior.
+    first.velocityBlendLink =
+        invisible_places::camera::AnimationVelocityBlendLinkMetadata{
+            .pairId = "test-pair",
+            .partnerFileName = "Second.ipanim.json",
+            .maxEndMoveFraction = 0.10F,
+            .movableKeyIds = {"a1", "a5"},
+        };
+    second.velocityBlendLink =
+        invisible_places::camera::AnimationVelocityBlendLinkMetadata{
+            .pairId = "test-pair",
+            .partnerFileName = "First.ipanim.json",
+            .maxEndMoveFraction = 0.10F,
+            .movableKeyIds = {"b1", "b5"},
+        };
     CHECK(result.afterMismatch < result.beforeMismatch);
     CHECK(result.afterSeamMismatch[0U] < result.beforeSeamMismatch[0U]);
     CHECK(result.afterSeamMismatch[1U] < result.beforeSeamMismatch[1U]);
     CHECK(result.maxCameraCapUsage <= Catch::Approx(1.0F).margin(1.0e-4F));
     CHECK(result.maxFocusCapUsage <= Catch::Approx(1.0F).margin(1.0e-4F));
-    REQUIRE(first.loopTransitionSmoothing.has_value());
-    REQUIRE(second.loopTransitionSmoothing.has_value());
-    CHECK(first.loopTransitionSmoothing->pairId == second.loopTransitionSmoothing->pairId);
+    CHECK(first.localizedKeyCorrections.size() == 2U);
+    CHECK(second.localizedKeyCorrections.size() == 2U);
     CHECK(first.durationFrames == originalFirst.durationFrames);
     CHECK(second.durationFrames == originalSecond.durationFrames);
     for (std::size_t keyIndex = 0U; keyIndex < first.keys.size(); ++keyIndex) {
@@ -12403,15 +12703,30 @@ TEST_CASE("Loop transition smoothing improves both seams without retiming", "[ca
     CHECK(roundTrippedMetrics.afterMismatch ==
           Catch::Approx(appliedMetrics.afterMismatch).epsilon(1.0e-5F));
 
-    std::string unapplyError;
-    REQUIRE(invisible_places::camera::UnapplyAnimationLoopSmoothing(&first, &unapplyError));
-    REQUIRE(invisible_places::camera::UnapplyAnimationLoopSmoothing(&second, &unapplyError));
+    const auto restoreLocalizedCorrections = [](AnimationPath* path) {
+        REQUIRE(path != nullptr);
+        for (const auto& correction : path->localizedKeyCorrections) {
+            const auto key = std::find_if(
+                path->keys.begin(),
+                path->keys.end(),
+                [&](const auto& candidate) {
+                    return candidate.id == correction.keyId;
+                });
+            REQUIRE(key != path->keys.end());
+            key->cameraPosition = correction.splineCameraPosition;
+            key->focusPoint = correction.splineFocusPoint;
+        }
+        path->localizedKeyCorrections.clear();
+        path->velocityBlendLink.reset();
+    };
+    restoreLocalizedCorrections(&first);
+    restoreLocalizedCorrections(&second);
     CHECK(first.keys.front().cameraPosition == originalFirst.keys.front().cameraPosition);
     CHECK(first.keys.back().focusPoint == originalFirst.keys.back().focusPoint);
     CHECK(second.keys.front().focusPoint == originalSecond.keys.front().focusPoint);
     CHECK(second.keys.back().cameraPosition == originalSecond.keys.back().cameraPosition);
-    CHECK_FALSE(first.loopTransitionSmoothing.has_value());
-    CHECK_FALSE(second.loopTransitionSmoothing.has_value());
+    CHECK_FALSE(first.velocityBlendLink.has_value());
+    CHECK_FALSE(second.velocityBlendLink.has_value());
     CHECK(
         invisible_places::serialization::AnimationPathToJson(first) ==
         invisible_places::serialization::AnimationPathToJson(originalFirst));
@@ -12451,8 +12766,8 @@ TEST_CASE("Loop smoothing reports why an already matched pair is unchanged",
     REQUIRE(result.succeeded);
     CHECK_FALSE(result.changed);
     CHECK_FALSE(result.errorMessage.empty());
-    CHECK_FALSE(first.loopTransitionSmoothing.has_value());
-    CHECK_FALSE(second.loopTransitionSmoothing.has_value());
+    CHECK(first.localizedKeyCorrections.empty());
+    CHECK(second.localizedKeyCorrections.empty());
     CHECK(invisible_places::serialization::AnimationPathToJson(first) ==
           originalFirstJson);
     CHECK(invisible_places::serialization::AnimationPathToJson(second) ==
@@ -12535,16 +12850,11 @@ TEST_CASE("Loop smoothing uses one bounded pose for shared endpoint cameras", "[
                         .focusPoint) +
             1.0e-5F);
 
-    std::string unapplyError;
-    REQUIRE(invisible_places::camera::UnapplyAnimationLoopSmoothing(
-        &first,
-        &unapplyError));
-    REQUIRE(invisible_places::camera::UnapplyAnimationLoopSmoothing(
-        &second,
-        &unapplyError));
-    CHECK(first.keys.front().cameraPosition ==
+    REQUIRE_FALSE(first.localizedKeyCorrections.empty());
+    REQUIRE_FALSE(second.localizedKeyCorrections.empty());
+    CHECK(first.localizedKeyCorrections.front().splineCameraPosition ==
           originalFirst.keys.front().cameraPosition);
-    CHECK(second.keys.back().focusPoint ==
+    CHECK(second.localizedKeyCorrections.back().splineFocusPoint ==
           originalSecond.keys.back().focusPoint);
 }
 
@@ -12571,8 +12881,8 @@ TEST_CASE("Loop smoothing rejects a shared pose outside every movement cap", "[c
         &second,
         {.maxEndMoveFraction = 0.01F});
     CHECK_FALSE(result.succeeded);
-    CHECK_FALSE(first.loopTransitionSmoothing.has_value());
-    CHECK_FALSE(second.loopTransitionSmoothing.has_value());
+    CHECK(first.localizedKeyCorrections.empty());
+    CHECK(second.localizedKeyCorrections.empty());
     CHECK(first.keys.front().cameraPosition ==
           originalFirst.keys.front().cameraPosition);
     CHECK(second.keys.back().focusPoint ==
@@ -12648,6 +12958,226 @@ TEST_CASE("Loop smoothing respects independently immovable camera and focus trac
         CHECK(second.keys.back().cameraPosition ==
               originalSecond.keys.back().cameraPosition);
     }
+}
+
+TEST_CASE("Lower-frame geometry alignment improves cached common foreground within its key cap",
+          "[camera][animation][strong-alignment]") {
+    using invisible_places::camera::AnimationPath;
+    const auto makeKey = [](
+                             std::string id,
+                             std::array<float, 3> camera,
+                             std::array<float, 3> focus) {
+        return invisible_places::camera::AnimationPathKey{
+            .id = std::move(id),
+            .cameraPosition = camera,
+            .focusPoint = focus,
+            .fovDegrees = 58.0F,
+            .nearPlane = 0.01F,
+            .farPlane = 100.0F,
+            .durationFrames = 30U,
+        };
+    };
+
+    AnimationPath reference;
+    reference.durationFrames = 90U;
+    reference.keys = {
+        makeKey("r1", {-2.0F, -10.0F, 5.0F}, {-2.0F, 1.0F, 0.0F}),
+        makeKey("r2", {0.0F, -10.0F, 5.0F}, {0.0F, 1.0F, 0.0F}),
+        makeKey("r3", {2.0F, -10.0F, 5.0F}, {2.0F, 1.0F, 0.0F}),
+    };
+    AnimationPath destination;
+    destination.durationFrames = 90U;
+    destination.keys = {
+        makeKey("d1", {-3.5F, -10.0F, 5.0F}, {-3.5F, 1.0F, 0.0F}),
+        makeKey("destination", {0.55F, -10.0F, 5.25F},
+                {0.40F, 1.0F, 0.20F}),
+        makeKey("d3", {4.5F, -10.0F, 5.0F}, {4.5F, 1.0F, 0.0F}),
+    };
+    const auto originalReference = reference;
+    const auto originalDestination = destination;
+
+    std::vector<invisible_places::io::Float3> residentPoints;
+    for (std::uint32_t yIndex = 0U; yIndex <= 80U; ++yIndex) {
+        const float y = -2.0F + 0.20F * static_cast<float>(yIndex);
+        for (std::uint32_t xIndex = 0U; xIndex <= 100U; ++xIndex) {
+            const float x = -10.0F + 0.20F * static_cast<float>(xIndex);
+            residentPoints.push_back({x, y, 0.0F});
+        }
+    }
+
+    const auto result = invisible_places::camera::
+        StrongAlignAnimationKeyToReference(
+            &destination,
+            reference,
+            residentPoints,
+            {
+                .destinationKeyId = "destination",
+                .referenceNormalizedPosition = 0.5F,
+                .aspectRatio = 16.0F / 9.0F,
+                .maxMoveFraction = 0.50F,
+            });
+    INFO(result.errorMessage);
+    INFO("foreground samples: " << result.metrics.foregroundSampleCount);
+    INFO("destination coverage: " << result.metrics.destinationCoverage);
+    INFO("reference coverage: " << result.metrics.referenceCoverage);
+    REQUIRE(result.succeeded);
+    REQUIRE(result.changed);
+    CHECK(result.metrics.foregroundSampleCount >= 24U);
+    CHECK(result.metrics.destinationOccupiedCellCount >= 12U);
+    CHECK(result.metrics.referenceOccupiedCellCount >= 12U);
+    CHECK(result.metrics.destinationCoverage > 0.0F);
+    CHECK(result.metrics.referenceCoverage > 0.0F);
+    CHECK(result.metrics.afterForegroundReprojectionRms1080 <
+          result.metrics.beforeForegroundReprojectionRms1080);
+    CHECK(result.metrics.afterVerticalOffset1080 <=
+          result.metrics.beforeVerticalOffset1080);
+    CHECK(result.metrics.cameraCapUsage <=
+          Catch::Approx(1.0F).margin(1.0e-5F));
+    CHECK(result.metrics.focusCapUsage <=
+          Catch::Approx(1.0F).margin(1.0e-5F));
+    CHECK(reference.keys[1U].cameraPosition ==
+          originalReference.keys[1U].cameraPosition);
+    CHECK(reference.keys[1U].focusPoint ==
+          originalReference.keys[1U].focusPoint);
+    CHECK(destination.keys[0U].cameraPosition ==
+          originalDestination.keys[0U].cameraPosition);
+    CHECK(destination.keys[2U].focusPoint ==
+          originalDestination.keys[2U].focusPoint);
+    REQUIRE(destination.localizedKeyCorrections.size() == 1U);
+    CHECK(destination.localizedKeyCorrections.front().keyId ==
+          "destination");
+    CHECK(destination.localizedKeyCorrections.front()
+              .splineCameraPosition ==
+          originalDestination.keys[1U].cameraPosition);
+}
+
+TEST_CASE("Cancelled animation alignment jobs leave their snapshots unchanged",
+          "[camera][animation][velocity-blend][strong-alignment]") {
+    using invisible_places::camera::AnimationPath;
+    const auto makePath = [](std::string prefix, float offset) {
+        AnimationPath path;
+        path.durationFrames = 90U;
+        for (std::size_t keyIndex = 0U; keyIndex < 3U; ++keyIndex) {
+            const float x = offset + static_cast<float>(keyIndex);
+            path.keys.push_back({
+                .id = prefix + std::to_string(keyIndex + 1U),
+                .cameraPosition = {x, -4.0F, 2.0F},
+                .focusPoint = {x, 2.0F, 0.0F},
+                .durationFrames = 30U,
+            });
+        }
+        return path;
+    };
+
+    auto first = makePath("a", 0.0F);
+    auto second = makePath("b", 4.0F);
+    const auto originalFirst = first;
+    const auto originalSecond = second;
+    std::stop_source stopSource;
+    stopSource.request_stop();
+    const auto velocityResult = invisible_places::camera::
+        SmoothAnimationLoopTransitions(
+            &first,
+            &second,
+            {
+                .maxEndMoveFraction = 0.10F,
+                .stopToken = stopSource.get_token(),
+            });
+    CHECK_FALSE(velocityResult.succeeded);
+    CHECK(velocityResult.errorMessage.find("cancelled") !=
+          std::string::npos);
+    CHECK(first.keys.front().cameraPosition ==
+          originalFirst.keys.front().cameraPosition);
+    CHECK(first.keys.back().focusPoint ==
+          originalFirst.keys.back().focusPoint);
+    CHECK(second.keys.front().cameraPosition ==
+          originalSecond.keys.front().cameraPosition);
+    CHECK(second.keys.back().focusPoint ==
+          originalSecond.keys.back().focusPoint);
+    CHECK(first.localizedKeyCorrections.empty());
+    CHECK(second.localizedKeyCorrections.empty());
+
+    auto destination = originalFirst;
+    const auto strongResult = invisible_places::camera::
+        StrongAlignAnimationKeyToReference(
+            &destination,
+            originalSecond,
+            {},
+            {
+                .destinationKeyId = "a1",
+                .stopToken = stopSource.get_token(),
+            });
+    CHECK_FALSE(strongResult.succeeded);
+    CHECK(strongResult.errorMessage.find("cancelled") !=
+          std::string::npos);
+    CHECK(destination.keys.front().cameraPosition ==
+          originalFirst.keys.front().cameraPosition);
+    CHECK(destination.keys.front().focusPoint ==
+          originalFirst.keys.front().focusPoint);
+    CHECK(destination.localizedKeyCorrections.empty());
+}
+
+TEST_CASE("Exhibition velocity pair fixture loads as the 45 second right pan",
+          "[camera][animation][velocity-blend][migration][exhibition]") {
+    // Schema-pinned copies of the authored Exhibition pair. Never read the
+    // live Saved/ authoring output here: its content drifts with authoring.
+    const auto fixtureDirectory =
+        DataRoot().parent_path() / "tests" / "fixtures";
+    const auto firstPath =
+        fixtureDirectory / "Exhibition_FIRST.ipanim.json";
+    const auto secondPath =
+        fixtureDirectory / "Exhibition_SECOND.ipanim.json";
+    if (!std::filesystem::is_regular_file(firstPath) ||
+        !std::filesystem::is_regular_file(secondPath)) {
+        SKIP("The pinned Exhibition pair fixtures are not present.");
+    }
+
+    std::string errorMessage;
+    const auto first = invisible_places::serialization::LoadAnimationPath(
+        firstPath,
+        &errorMessage);
+    INFO(errorMessage);
+    REQUIRE(first.has_value());
+    const auto second = invisible_places::serialization::LoadAnimationPath(
+        secondPath,
+        &errorMessage);
+    INFO(errorMessage);
+    REQUIRE(second.has_value());
+    REQUIRE(first->velocityBlendLink.has_value());
+    REQUIRE(second->velocityBlendLink.has_value());
+    CHECK(first->velocityBlendLink->pairId ==
+          second->velocityBlendLink->pairId);
+    CHECK(first->velocityBlendLink->partnerFileName ==
+          secondPath.filename().string());
+    CHECK(second->velocityBlendLink->partnerFileName ==
+          firstPath.filename().string());
+    for (const auto* path : {&first.value(), &second.value()}) {
+        CHECK(path->durationFrames == 5400U);
+        REQUIRE(path->keys.size() == 5U);
+        CHECK(path->velocityBlendLink->startOverlapSeconds ==
+              Catch::Approx(45.0F));
+        CHECK(path->velocityBlendLink->endOverlapSeconds ==
+              Catch::Approx(45.0F));
+        CHECK(path->velocityBlendLink->horizontalBlend);
+        CHECK(path->velocityBlendLink->panRight);
+        CHECK(path->velocityBlendLink->movableKeyIds ==
+              std::vector<std::string>{
+                  "key_1", "key_2", "key_4", "key_5"});
+        REQUIRE(path->localizedKeyCorrections.size() == 4U);
+    }
+
+    const auto metrics = invisible_places::camera::
+        MeasureAnimationLoopTransitions(first.value(), second.value());
+    INFO(metrics.errorMessage);
+    INFO("Exhibition mismatch " << metrics.beforeMismatch << " -> "
+                                 << metrics.afterMismatch);
+    REQUIRE(metrics.valid);
+    REQUIRE(metrics.hasAppliedSmoothing);
+    CHECK(metrics.afterMismatch < metrics.beforeMismatch);
+    CHECK(metrics.afterSeamMismatch[0U] <=
+          metrics.beforeSeamMismatch[0U] + 1.0e-5F);
+    CHECK(metrics.afterSeamMismatch[1U] <=
+          metrics.beforeSeamMismatch[1U] + 1.0e-5F);
 }
 
 TEST_CASE("Animation path keeps camera and focus derivatives smooth through middle keys", "[camera][animation]") {
@@ -13603,6 +14133,7 @@ TEST_CASE("Export frame sample plans are centered for temporal and motion blur",
 }
 
 TEST_CASE("Point-cloud EXR readback masks keep AOV channels independent", "[renderer][export]") {
+    using invisible_places::renderer::core::ContainsPointCloudExrReadbacks;
     using invisible_places::renderer::core::HasPointCloudExrReadback;
     using invisible_places::renderer::core::PointCloudExrFrameRequest;
     using invisible_places::renderer::core::PointCloudExrReadbackMask;
@@ -13616,6 +14147,12 @@ TEST_CASE("Point-cloud EXR readback masks keep AOV channels independent", "[rend
     const auto proResMask = PointCloudExrReadbackMask::Color;
     CHECK(HasPointCloudExrReadback(proResMask, PointCloudExrReadbackMask::Color));
     CHECK_FALSE(HasPointCloudExrReadback(proResMask, PointCloudExrReadbackMask::Depth));
+    CHECK(ContainsPointCloudExrReadbacks(
+        PointCloudExrReadbackMask::All,
+        proResMask));
+    CHECK_FALSE(ContainsPointCloudExrReadbacks(
+        proResMask,
+        PointCloudExrReadbackMask::All));
 
     const PointCloudExrFrameRequest defaultRequest;
     CHECK(HasPointCloudExrReadback(defaultRequest.readbackMask, PointCloudExrReadbackMask::Color));
@@ -13637,10 +14174,13 @@ TEST_CASE("Built-in export presets use compact codec settings with legacy aliase
         });
     };
 
-    REQUIRE(presets.size() == 6U);
+    REQUIRE(presets.size() == 7U);
     CHECK(containsPreset(
         invisible_places::output::kMp4PresetName,
         invisible_places::output::AnimationExportMode::FastPreviewMp4));
+    CHECK(containsPreset(
+        invisible_places::output::kTestMp4PresetName,
+        invisible_places::output::AnimationExportMode::TestMp4));
     CHECK(containsPreset(
         invisible_places::output::kPngStackPresetName,
         invisible_places::output::AnimationExportMode::PngStack));
@@ -13657,6 +14197,7 @@ TEST_CASE("Built-in export presets use compact codec settings with legacy aliase
         invisible_places::output::kHqPreviewDensityExrPresetName,
         invisible_places::output::AnimationExportMode::HqPreviewDensityExr));
     CHECK(invisible_places::output::IsBuiltInExportPresetName(invisible_places::output::kMp4PresetName));
+    CHECK(invisible_places::output::IsBuiltInExportPresetName(invisible_places::output::kTestMp4PresetName));
     CHECK(invisible_places::output::IsBuiltInExportPresetName(invisible_places::output::kHevcAlphaMp4PresetName));
     CHECK(invisible_places::output::IsBuiltInExportPresetName(invisible_places::output::kPngStackPresetName));
     CHECK(invisible_places::output::IsBuiltInExportPresetName(invisible_places::output::kFastPngStackPresetName));
@@ -13683,6 +14224,16 @@ TEST_CASE("Built-in export presets use compact codec settings with legacy aliase
     CHECK(mp4->quality == invisible_places::output::AnimationExportQuality::Normal);
     CHECK(mp4->useVideoToolbox);
     CHECK(mp4->externalAlphaMatte);
+    const auto testMp4 = findPreset(invisible_places::output::kTestMp4PresetName);
+    REQUIRE(testMp4 != presets.end());
+    CHECK(testMp4->mode == invisible_places::output::AnimationExportMode::TestMp4);
+    CHECK(testMp4->settings.width == 3840U);
+    CHECK(testMp4->settings.height == 2160U);
+    CHECK(testMp4->settings.framesPerSecond == 5U);
+    CHECK(testMp4->settings.supersampleScale == 2U);
+    CHECK(testMp4->quality == invisible_places::output::AnimationExportQuality::Normal);
+    CHECK(testMp4->useVideoToolbox);
+    CHECK(testMp4->externalAlphaMatte);
     const auto pngStack = findPreset(invisible_places::output::kPngStackPresetName);
     REQUIRE(pngStack != presets.end());
     CHECK(pngStack->settings.width == 3840U);
@@ -13708,7 +14259,7 @@ TEST_CASE("Built-in export presets use compact codec settings with legacy aliase
     CHECK(proRes4444->externalAlphaMatte);
 }
 
-TEST_CASE("Quick MP4 output paths include mode settings visual names and collision suffixes", "[output][video]") {
+TEST_CASE("Quick MP4 output paths use only animation names and collision suffixes", "[output][video]") {
     const auto outputDirectory = std::filesystem::temp_directory_path() / "invisible_places_quick_mp4_names";
     std::filesystem::remove_all(outputDirectory);
     std::filesystem::create_directories(outputDirectory);
@@ -13722,7 +14273,7 @@ TEST_CASE("Quick MP4 output paths include mode settings visual names and collisi
     settings.motionBlur = true;
     settings.motionBlurSampleCount = 3;
     settings.motionBlurShutterAngleDegrees = 90.0F;
-    const auto stem = std::string{"Site_1_MP4_Normal_VT_3840x2160_24fps_SS2x_AA_TS4_MB3_90deg_Painty"};
+    const auto stem = std::string{"Site_1"};
     const auto firstPath = outputDirectory / (stem + ".mp4");
     const auto secondPath = outputDirectory / (stem + "_1.mp4");
     const auto reservedPath = outputDirectory / (stem + "_2.mp4");
@@ -13744,10 +14295,76 @@ TEST_CASE("Quick MP4 output paths include mode settings visual names and collisi
         {reservedPath});
     CHECK(uniquePath == outputDirectory / (stem + "_3.mp4"));
 
+    const auto legacyPath = invisible_places::output::BuildUniqueQuickMp4OutputPath(
+        outputDirectory,
+        "Site 2",
+        "Painty");
+    CHECK(legacyPath == outputDirectory / "Site_2.mp4");
+
     std::filesystem::remove_all(outputDirectory);
 }
 
-TEST_CASE("PNG Stack output directories include mode settings visual names and collision suffixes", "[output][png]") {
+TEST_CASE("Test MP4 names omit render format settings and visual details", "[output][video]") {
+    invisible_places::output::RenderJobSettings settings;
+    settings.width = 3840;
+    settings.height = 2160;
+    settings.framesPerSecond = 5;
+    settings.supersampleScale = 2;
+
+    const auto stem = invisible_places::output::BuildAnimationExportFilenameStem(
+        "Site 1",
+        invisible_places::output::AnimationExportMode::TestMp4,
+        invisible_places::output::AnimationExportQuality::Normal,
+        true,
+        true,
+        settings,
+        "Painty");
+    CHECK(stem == "Site_1");
+}
+
+TEST_CASE("Test MP4 ffmpeg command motion-interpolates low-rate RGB to one 30 fps H265 file", "[output][video]") {
+    const auto command = invisible_places::output::BuildFfmpegTestMp4Command(
+        "/opt/homebrew/bin/ffmpeg",
+        3840,
+        2160,
+        5,
+        51,
+        "/tmp/Invisible Places/test output.mp4",
+        true);
+
+    CHECK(command.find("'/opt/homebrew/bin/ffmpeg'") != std::string::npos);
+    CHECK(command.find("-f rawvideo") != std::string::npos);
+    CHECK(command.find("-pix_fmt rgb48le") != std::string::npos);
+    CHECK(command.find("-s:v 3840x2160") != std::string::npos);
+    CHECK(command.find("-r 5") != std::string::npos);
+    CHECK(command.find("tpad=stop_mode=clone:stop=2") != std::string::npos);
+    CHECK(command.find("minterpolate=fps=30:mi_mode=mci:mc_mode=aobmc") != std::string::npos);
+    CHECK(command.find(":me_mode=bilat:me=epzs:mb_size=8:") != std::string::npos);
+    CHECK(command.find("vsbmc=1") != std::string::npos);
+    CHECK(command.find("-c:v hevc_videotoolbox") != std::string::npos);
+    CHECK(command.find("-b:v 25000k") != std::string::npos);
+    CHECK(command.find("-maxrate 40000k") != std::string::npos);
+    CHECK(command.find("-frames:v 306") != std::string::npos);
+    CHECK(command.find("-fps_mode cfr") != std::string::npos);
+    CHECK(command.find("-pix_fmt yuv420p") != std::string::npos);
+    CHECK(command.find("alphaextract") == std::string::npos);
+    CHECK(command.find("'/tmp/Invisible Places/test output.mp4'") != std::string::npos);
+    CHECK(command.find("'/tmp/Invisible Places/test output.mp4'") ==
+          command.rfind("'/tmp/Invisible Places/test output.mp4'"));
+
+    const auto cpuCommand = invisible_places::output::BuildFfmpegTestMp4Command(
+        "/opt/homebrew/bin/ffmpeg",
+        1920,
+        1080,
+        5,
+        1,
+        "/tmp/test-cpu.mp4",
+        false);
+    CHECK(cpuCommand.find("-c:v libx265") != std::string::npos);
+    CHECK(cpuCommand.find("-frames:v 6") != std::string::npos);
+}
+
+TEST_CASE("PNG Stack output directories use only animation names and collision suffixes", "[output][png]") {
     const auto outputDirectory = std::filesystem::temp_directory_path() / "invisible_places_png_stack_names";
     std::filesystem::remove_all(outputDirectory);
     std::filesystem::create_directories(outputDirectory);
@@ -13761,7 +14378,7 @@ TEST_CASE("PNG Stack output directories include mode settings visual names and c
     settings.motionBlur = true;
     settings.motionBlurSampleCount = 3;
     settings.motionBlurShutterAngleDegrees = 90.0F;
-    const auto stem = std::string{"Site_1_PNG_3840x2160_24fps_SS2x_AA_TS4_MB3_90deg_Painty"};
+    const auto stem = std::string{"Site_1"};
     const auto firstDirectory = outputDirectory / stem;
     const auto reservedDirectory = outputDirectory / (stem + "_1");
     std::filesystem::create_directories(firstDirectory);
@@ -13779,7 +14396,7 @@ TEST_CASE("PNG Stack output directories include mode settings visual names and c
     CHECK(
         invisible_places::output::PngStackFramePath(uniqueDirectory, "Site 1", 41) ==
         uniqueDirectory / "Site_1_0042.png");
-    const auto fastStem = std::string{"Site_1_FastPNG_3840x2160_24fps_SS2x_AA_TS4_MB3_90deg_Painty"};
+    const auto fastStem = std::string{"Site_1_1"};
     const auto fastDirectory = invisible_places::output::BuildUniquePngStackOutputDirectory(
         outputDirectory,
         "Site 1",
@@ -13818,6 +14435,7 @@ TEST_CASE("PNG Stack output directories include mode settings visual names and c
 
 TEST_CASE("Legacy HEVC alpha helpers map to MP4 HQ color plus matte pair", "[output][video]") {
     const auto outputDirectory = std::filesystem::temp_directory_path() / "invisible_places_hevc_alpha_names";
+    std::filesystem::remove_all(outputDirectory);
     invisible_places::output::RenderJobSettings settings;
     settings.width = 3840;
     settings.height = 2160;
@@ -13836,7 +14454,7 @@ TEST_CASE("Legacy HEVC alpha helpers map to MP4 HQ color plus matte pair", "[out
         "Painty");
     CHECK(
         path ==
-        outputDirectory / "Site_1_MP4_HQ_VT_Alpha_3840x2160_24fps_SS2x_AA_TS4_MB3_90deg_Painty_color.mp4");
+        outputDirectory / "Site_1_Colour.mp4");
     const auto outputPaths = invisible_places::output::BuildUniqueHevcAlphaMp4OutputPaths(
         outputDirectory,
         "Site 1",
@@ -13845,7 +14463,21 @@ TEST_CASE("Legacy HEVC alpha helpers map to MP4 HQ color plus matte pair", "[out
     CHECK(outputPaths.colorPath == path);
     CHECK(
         outputPaths.alphaMattePath ==
-        outputDirectory / "Site_1_MP4_HQ_VT_Alpha_3840x2160_24fps_SS2x_AA_TS4_MB3_90deg_Painty_alpha.mp4");
+        outputDirectory / "Site_1_Alpha.mp4");
+
+    std::filesystem::create_directories(outputDirectory);
+    {
+        std::ofstream occupiedAlpha{outputPaths.alphaMattePath};
+        occupiedAlpha << "occupied";
+    }
+    const auto indexedOutputPaths =
+        invisible_places::output::BuildUniqueHevcAlphaMp4OutputPaths(
+            outputDirectory,
+            "Site 1",
+            settings,
+            "Painty");
+    CHECK(indexedOutputPaths.colorPath == outputDirectory / "Site_1_Colour_2.mp4");
+    CHECK(indexedOutputPaths.alphaMattePath == outputDirectory / "Site_1_Alpha_2.mp4");
 
     const auto colorCommand = invisible_places::output::BuildFfmpegHevcColorMp4Command(
         "/opt/homebrew/bin/ffmpeg",
@@ -13913,6 +14545,8 @@ TEST_CASE("Legacy HEVC alpha helpers map to MP4 HQ color plus matte pair", "[out
     CHECK(combinedCommand.find("'/tmp/Invisible Places/final color.mp4'") != std::string::npos);
     CHECK(combinedCommand.find("'/tmp/Invisible Places/final alpha matte.mp4'") != std::string::npos);
     CHECK(combinedCommand.find("-i -") == combinedCommand.rfind("-i -"));
+
+    std::filesystem::remove_all(outputDirectory);
 }
 
 TEST_CASE("ProRes 4444 output paths and ffmpeg command preserve alpha", "[output][video]") {
@@ -13930,7 +14564,7 @@ TEST_CASE("ProRes 4444 output paths and ffmpeg command preserve alpha", "[output
         "Glow Pass");
     CHECK(
         proResPath ==
-        outputDirectory / "Scene_Take_ProRes4444_Normal_CPU_4096x2160_30fps_SS2x_AA_Glow_Pass.mov");
+        outputDirectory / "Scene_Take.mov");
     const auto proResXqPath = invisible_places::output::BuildUniqueProRes4444XqOutputPath(
         outputDirectory,
         "Scene Take",
@@ -13938,7 +14572,7 @@ TEST_CASE("ProRes 4444 output paths and ffmpeg command preserve alpha", "[output
         "Glow Pass");
     CHECK(
         proResXqPath ==
-        outputDirectory / "Scene_Take_ProRes4444_XQ_CPU_4096x2160_30fps_SS2x_AA_Glow_Pass.mov");
+        outputDirectory / "Scene_Take.mov");
     const auto proResVtPath = invisible_places::output::BuildUniqueProRes4444VideoToolboxOutputPath(
         outputDirectory,
         "Scene Take",
@@ -13946,7 +14580,7 @@ TEST_CASE("ProRes 4444 output paths and ffmpeg command preserve alpha", "[output
         "Glow Pass");
     CHECK(
         proResVtPath ==
-        outputDirectory / "Scene_Take_ProRes4444_Normal_VT_4096x2160_30fps_SS2x_AA_Glow_Pass.mov");
+        outputDirectory / "Scene_Take.mov");
     const auto proResXqVtPath = invisible_places::output::BuildUniqueProRes4444XqVideoToolboxOutputPath(
         outputDirectory,
         "Scene Take",
@@ -13954,7 +14588,7 @@ TEST_CASE("ProRes 4444 output paths and ffmpeg command preserve alpha", "[output
         "Glow Pass");
     CHECK(
         proResXqVtPath ==
-        outputDirectory / "Scene_Take_ProRes4444_XQ_VT_4096x2160_30fps_SS2x_AA_Glow_Pass.mov");
+        outputDirectory / "Scene_Take.mov");
 
     const auto command = invisible_places::output::BuildFfmpegProRes4444Command(
         "/opt/homebrew/bin/ffmpeg",
@@ -14048,7 +14682,7 @@ TEST_CASE("ProRes 422 output paths and ffmpeg commands are opaque", "[output][vi
         "Base Layer");
     CHECK(
         proRes422Path ==
-        outputDirectory / "Scene_Take_ProRes422_Normal_CPU_4096x2160_30fps_SS2x_AA_Base_Layer.mov");
+        outputDirectory / "Scene_Take.mov");
     const auto proRes422HqPath = invisible_places::output::BuildUniqueProRes422HqOutputPath(
         outputDirectory,
         "Scene Take",
@@ -14056,7 +14690,7 @@ TEST_CASE("ProRes 422 output paths and ffmpeg commands are opaque", "[output][vi
         "Base Layer");
     CHECK(
         proRes422HqPath ==
-        outputDirectory / "Scene_Take_ProRes422_HQ_CPU_4096x2160_30fps_SS2x_AA_Base_Layer.mov");
+        outputDirectory / "Scene_Take.mov");
     const auto proRes422AlphaPaths = invisible_places::output::BuildUniqueProRes422AlphaMatteOutputPaths(
         outputDirectory,
         "Scene Take",
@@ -14064,21 +14698,22 @@ TEST_CASE("ProRes 422 output paths and ffmpeg commands are opaque", "[output][vi
         "Base Layer");
     CHECK(
         proRes422AlphaPaths.colorPath ==
-        outputDirectory / "Scene_Take_ProRes422_Normal_CPU_Alpha_4096x2160_30fps_SS2x_AA_Base_Layer_color.mov");
+        outputDirectory / "Scene_Take_Colour.mov");
     CHECK(
         proRes422AlphaPaths.alphaMattePath ==
-        outputDirectory / "Scene_Take_ProRes422_Normal_CPU_Alpha_4096x2160_30fps_SS2x_AA_Base_Layer_alpha.mov");
+        outputDirectory / "Scene_Take_Alpha.mov");
     const auto proRes422HqAlphaPaths = invisible_places::output::BuildUniqueProRes422HqAlphaMatteOutputPaths(
         outputDirectory,
         "Scene Take",
         settings,
-        "Base Layer");
+        "Base Layer",
+        {proRes422AlphaPaths.colorPath, proRes422AlphaPaths.alphaMattePath});
     CHECK(
         proRes422HqAlphaPaths.colorPath ==
-        outputDirectory / "Scene_Take_ProRes422_HQ_CPU_Alpha_4096x2160_30fps_SS2x_AA_Base_Layer_color.mov");
+        outputDirectory / "Scene_Take_Colour_2.mov");
     CHECK(
         proRes422HqAlphaPaths.alphaMattePath ==
-        outputDirectory / "Scene_Take_ProRes422_HQ_CPU_Alpha_4096x2160_30fps_SS2x_AA_Base_Layer_alpha.mov");
+        outputDirectory / "Scene_Take_Alpha_2.mov");
     const auto proRes422VtPath = invisible_places::output::BuildUniqueProRes422VideoToolboxOutputPath(
         outputDirectory,
         "Scene Take",
@@ -14086,7 +14721,7 @@ TEST_CASE("ProRes 422 output paths and ffmpeg commands are opaque", "[output][vi
         "Base Layer");
     CHECK(
         proRes422VtPath ==
-        outputDirectory / "Scene_Take_ProRes422_Normal_VT_4096x2160_30fps_SS2x_AA_Base_Layer.mov");
+        outputDirectory / "Scene_Take.mov");
     const auto proRes422HqVtPath = invisible_places::output::BuildUniqueProRes422HqVideoToolboxOutputPath(
         outputDirectory,
         "Scene Take",
@@ -14094,10 +14729,10 @@ TEST_CASE("ProRes 422 output paths and ffmpeg commands are opaque", "[output][vi
         "Base Layer");
     CHECK(
         proRes422HqVtPath ==
-        outputDirectory / "Scene_Take_ProRes422_HQ_VT_4096x2160_30fps_SS2x_AA_Base_Layer.mov");
+        outputDirectory / "Scene_Take.mov");
 
     const auto reservedPath =
-        outputDirectory / "Scene_Take_ProRes422_Normal_CPU_4096x2160_30fps_SS2x_AA_Base_Layer_1.mov";
+        outputDirectory / "Scene_Take_1.mov";
     std::filesystem::create_directories(outputDirectory);
     {
         std::ofstream existing{proRes422Path, std::ios::trunc};
@@ -14111,7 +14746,7 @@ TEST_CASE("ProRes 422 output paths and ffmpeg commands are opaque", "[output][vi
         {reservedPath});
     CHECK(
         collisionPath ==
-        outputDirectory / "Scene_Take_ProRes422_Normal_CPU_4096x2160_30fps_SS2x_AA_Base_Layer_2.mov");
+        outputDirectory / "Scene_Take_2.mov");
     std::filesystem::remove_all(outputDirectory);
 
     const auto command = invisible_places::output::BuildFfmpegProRes422Command(
@@ -14335,7 +14970,7 @@ TEST_CASE("Non-SS2x conversion preserves uniform half-float RGBA", "[output][vid
     }
 }
 
-TEST_CASE("ProRes 422 conversion flattens alpha over black", "[output][video]") {
+TEST_CASE("Test MP4 matches After Effects display-space luma matte over black", "[output][video]") {
     const auto zero = Imath::half{0.0F}.bits();
     const auto half = Imath::half{0.5F}.bits();
     const auto one = Imath::half{1.0F}.bits();
@@ -14361,7 +14996,9 @@ TEST_CASE("ProRes 422 conversion flattens alpha over black", "[output][video]") 
             static_cast<std::uint16_t>(bytes[offset]) |
             (static_cast<std::uint16_t>(bytes[offset + 1U]) << 8U));
     };
-    CHECK(static_cast<int>(readWord(0)) == Catch::Approx(48192).margin(2));
+    // AE's default non-linear composition first encodes opaque red to 1.0,
+    // then applies the 0.5 matte, rather than encoding linear 0.5 to ~0.735.
+    CHECK(static_cast<int>(readWord(0)) == Catch::Approx(32768).margin(2));
     CHECK(readWord(2) == 0U);
     CHECK(readWord(4) == 0U);
     CHECK(readWord(6) == 0U);
@@ -15401,6 +16038,7 @@ TEST_CASE("Offline water streaks follow projected flow tangent", "[output][offli
     const invisible_places::output::OfflinePointLayer layer{
         .cloud = &cloud,
         .style = style,
+        .generatedWaterOverlay = true,
         .hasSourceRgb = false,
         .localToWorld = glm::mat4{1.0F},
     };
@@ -15526,6 +16164,7 @@ TEST_CASE("Offline water trail overlays use trail tangent and streak length", "[
     const invisible_places::output::OfflinePointLayer layer{
         .cloud = &cloud,
         .style = style,
+        .generatedWaterOverlay = true,
         .hasSourceRgb = false,
         .localToWorld = glm::mat4{1.0F},
     };
@@ -15665,6 +16304,7 @@ TEST_CASE("Offline water trail overlays animate through time playback", "[output
     const invisible_places::output::OfflinePointLayer layer{
         .cloud = &cloud,
         .style = style,
+        .generatedWaterOverlay = true,
         .hasSourceRgb = false,
         .localToWorld = glm::mat4{1.0F},
     };
@@ -15801,6 +16441,7 @@ TEST_CASE("Offline water trail placement uses baked lateral offsets", "[output][
     const invisible_places::output::OfflinePointLayer layer{
         .cloud = &cloud,
         .style = style,
+        .generatedWaterOverlay = true,
         .hasSourceRgb = false,
         .localToWorld = glm::mat4{1.0F},
     };

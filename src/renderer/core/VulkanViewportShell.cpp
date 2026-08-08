@@ -7170,12 +7170,16 @@ bool VulkanViewportShell::BeginPointCloudExrFrame(const PointCloudExrFrameReques
     if (exrExportResources_.framebuffer == VK_NULL_HANDLE ||
         exrExportResources_.width != request.width ||
         exrExportResources_.height != request.height ||
+        !ContainsPointCloudExrReadbacks(
+            exrExportResources_.readbackMask,
+            request.readbackMask) ||
         (needsEyeDomeLightingResources &&
          exrExportResources_.eyeDomeLightingDescriptorSet == VK_NULL_HANDLE)) {
         CreateExrExportResources(
             request.width,
             request.height,
-            needsEyeDomeLightingResources);
+            needsEyeDomeLightingResources,
+            request.readbackMask);
     }
 
     if (exrExportResources_.fence == VK_NULL_HANDLE ||
@@ -9356,7 +9360,8 @@ void VulkanViewportShell::CreateWaterSurfacePreprocessPipeline() {
 void VulkanViewportShell::CreateExrExportResources(
     std::uint32_t width,
     std::uint32_t height,
-    bool enableEyeDomeLighting) {
+    bool enableEyeDomeLighting,
+    PointCloudExrReadbackMask readbackMask) {
     if (width == 0 || height == 0) {
         throw std::runtime_error{"GPU EXR export requires a non-zero frame size."};
     }
@@ -9391,6 +9396,7 @@ void VulkanViewportShell::CreateExrExportResources(
     auto& resources = stagedResources;
     resources.width = width;
     resources.height = height;
+    resources.readbackMask = readbackMask;
 
     std::vector<PendingPointDescriptorGeneration> stagedPointGenerations;
     try {
@@ -9466,18 +9472,41 @@ void VulkanViewportShell::CreateExrExportResources(
             CreateExrExportEyeDomeLightingResources(&resources);
         }
 
-        resources.colorReadbackBuffer = CreateHostVisibleBuffer(
-            static_cast<VkDeviceSize>(width) * static_cast<VkDeviceSize>(height) * 4U * sizeof(std::uint16_t),
-            VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        resources.depthReadbackBuffer = CreateHostVisibleBuffer(static_cast<VkDeviceSize>(width) *
-                                                                    static_cast<VkDeviceSize>(height) * sizeof(float),
-                                                                VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        resources.normalReadbackBuffer = CreateHostVisibleBuffer(
-            static_cast<VkDeviceSize>(width) * static_cast<VkDeviceSize>(height) * 4U * sizeof(std::uint16_t),
-            VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        resources.albedoReadbackBuffer = CreateHostVisibleBuffer(
-            static_cast<VkDeviceSize>(width) * static_cast<VkDeviceSize>(height) * 4U * sizeof(std::uint16_t),
-            VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        if (HasPointCloudExrReadback(
+                readbackMask,
+                PointCloudExrReadbackMask::Color)) {
+            resources.colorReadbackBuffer = CreateHostVisibleBuffer(
+                static_cast<VkDeviceSize>(width) *
+                    static_cast<VkDeviceSize>(height) * 4U *
+                    sizeof(std::uint16_t),
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        }
+        if (HasPointCloudExrReadback(
+                readbackMask,
+                PointCloudExrReadbackMask::Depth)) {
+            resources.depthReadbackBuffer = CreateHostVisibleBuffer(
+                static_cast<VkDeviceSize>(width) *
+                    static_cast<VkDeviceSize>(height) * sizeof(float),
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        }
+        if (HasPointCloudExrReadback(
+                readbackMask,
+                PointCloudExrReadbackMask::Normal)) {
+            resources.normalReadbackBuffer = CreateHostVisibleBuffer(
+                static_cast<VkDeviceSize>(width) *
+                    static_cast<VkDeviceSize>(height) * 4U *
+                    sizeof(std::uint16_t),
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        }
+        if (HasPointCloudExrReadback(
+                readbackMask,
+                PointCloudExrReadbackMask::Albedo)) {
+            resources.albedoReadbackBuffer = CreateHostVisibleBuffer(
+                static_cast<VkDeviceSize>(width) *
+                    static_cast<VkDeviceSize>(height) * 4U *
+                    sizeof(std::uint16_t),
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        }
         resources.uniformBuffer = CreateHostVisibleBuffer(sizeof(FrameUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
 
         VkCommandBufferAllocateInfo commandBufferInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -14738,12 +14767,21 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
     // Preserve that resource invariant even if a caller supplies a plain
     // point style while a topology update is settling.
     const bool waterTrailOverlay =
-        layer.style.waterTrailOverlay || resources->waterFlowSourceActive;
+        layer.generatedWaterOverlay &&
+        (layer.style.waterTrailOverlay || resources->waterFlowSourceActive);
+    const std::uint32_t waterContentKind =
+        !layer.generatedWaterOverlay
+            ? 0U
+            : (waterTrailOverlay
+                   ? 3U
+                   : (layer.style.flowAnimation
+                          ? (layer.style.waterPathView ? 2U : 1U)
+                          : 0U));
     styleGpu.pointMeta = glm::uvec4{
         resources->pointCount,
         plan.drawPointCount,
         resources->hasNormals ? 1U : 0U,
-        waterTrailOverlay ? 3U : (layer.style.flowAnimation ? (layer.style.waterPathView ? 2U : 1U) : 0U),
+        waterContentKind,
     };
     const auto densityCompensation =
         renderer::pointcloud::SanitizePointCloudDensityCompensation(layer.densityCompensation);
@@ -15118,6 +15156,7 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         }
         styleGpu.additionalShorelineCount.x = packedShorelineCount;
     }
+    if (layer.regionWaterEffectsEnabled) {
     const auto waterEffectEmissionAddSlot = FindExactScalarFieldSlot(layer.scalarFields, "water_effect_emission_add");
     const auto waterEffectOpacityAddSlot = FindExactScalarFieldSlot(layer.scalarFields, "water_effect_opacity_add");
     const auto waterEffectOpacityMultiplySlot =
@@ -15208,6 +15247,7 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
             resources->sparseRippleParamCount,
             0U,
         };
+    }
     }
     const bool seepageDescriptorReady =
         exrStyle

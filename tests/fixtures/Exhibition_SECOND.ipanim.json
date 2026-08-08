@@ -1,0 +1,257 @@
+{
+  "aperture_f_stops": 8.0,
+  "associated_layer_paths": [
+    "__scene_group__/Scene3"
+  ],
+  "depth_of_field_enabled": false,
+  "depth_of_field_max_blur_px": 24.0,
+  "duration_frames": 5400,
+  "export_settings": {
+    "end_frame": 0,
+    "fps": 30,
+    "height": 2160,
+    "output_directory": "/Users/juju/Documents/Repositories/Invisible Places/Saved/renders/Invisible Places",
+    "start_frame": 0,
+    "still_camera_duration_seconds": 5.0,
+    "width": 3840
+  },
+  "keys": [
+    {
+      "aperture_f_stops": 8.0,
+      "camera_position": [
+        305.57159423828125,
+        86.51065063476563,
+        3.345752477645874
+      ],
+      "duration_frames": 90,
+      "far_plane": 79.14785766601563,
+      "focus_distance": 1.0,
+      "focus_point": [
+        309.76202392578125,
+        87.5862808227539,
+        1.7608964443206787
+      ],
+      "fov_degrees": 55.0,
+      "has_aperture_f_stops": false,
+      "has_focus_distance": false,
+      "has_orientation": false,
+      "id": "key_1",
+      "linked_camera_id": "camera_loop_Exhibition_SECOND_key_1",
+      "linked_camera_name": "c_Exhibition_SECOND_001 Loop Transition",
+      "near_plane": 0.0005000000237487257,
+      "orientation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "source_shot_name": "c_Exhibition_SECOND_001 Loop Transition"
+    },
+    {
+      "aperture_f_stops": 8.0,
+      "camera_position": [
+        306.5594177246094,
+        83.17061614990234,
+        3.4151339530944824
+      ],
+      "duration_frames": 1059,
+      "far_plane": 80.5775375366211,
+      "focus_distance": 1.0,
+      "focus_point": [
+        310.80462646484375,
+        84.6351089477539,
+        1.7750219106674194
+      ],
+      "fov_degrees": 55.0,
+      "has_aperture_f_stops": false,
+      "has_focus_distance": false,
+      "has_orientation": false,
+      "id": "key_2",
+      "linked_camera_id": "camera_loop_Exhibition_SECOND_key_2",
+      "linked_camera_name": "c_Exhibition_SECOND_002 Loop Transition",
+      "near_plane": 0.0005000000237487257,
+      "orientation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "source_shot_name": "c_Exhibition_SECOND_002 Loop Transition"
+    },
+    {
+      "aperture_f_stops": 8.0,
+      "camera_position": [
+        308.5188293457031,
+        78.18415832519531,
+        3.4070215225219727
+      ],
+      "duration_frames": 1446,
+      "far_plane": 84.13525390625,
+      "focus_distance": 1.0,
+      "focus_point": [
+        313.0008850097656,
+        79.67428588867188,
+        1.8818118572235107
+      ],
+      "fov_degrees": 55.0,
+      "has_aperture_f_stops": false,
+      "has_focus_distance": false,
+      "has_orientation": false,
+      "id": "key_3",
+      "linked_camera_id": "camera_29",
+      "linked_camera_name": "c_Exhibition_SECOND_003",
+      "near_plane": 0.0005000000237487257,
+      "orientation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "source_shot_name": "c_Exhibition_SECOND_003"
+    },
+    {
+      "aperture_f_stops": 8.0,
+      "camera_position": [
+        309.4976501464844,
+        73.94084930419922,
+        3.4973928928375244
+      ],
+      "duration_frames": 1222,
+      "far_plane": 80.02259826660156,
+      "focus_distance": 1.0,
+      "focus_point": [
+        313.7096862792969,
+        75.44999694824219,
+        1.7701797485351563
+      ],
+      "fov_degrees": 55.0,
+      "has_aperture_f_stops": false,
+      "has_focus_distance": false,
+      "has_orientation": false,
+      "id": "key_4",
+      "linked_camera_id": "camera_loop_Exhibition_SECOND_key_4",
+      "linked_camera_name": "c_Exhibition_SECOND_004 Loop Transition",
+      "near_plane": 0.0005000000237487257,
+      "orientation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "source_shot_name": "c_Exhibition_SECOND_004 Loop Transition"
+    },
+    {
+      "aperture_f_stops": 8.0,
+      "camera_position": [
+        310.67431640625,
+        71.19010162353516,
+        3.5032734870910645
+      ],
+      "duration_frames": 773,
+      "far_plane": 80.75265502929688,
+      "focus_distance": 1.0,
+      "focus_point": [
+        315.3357849121094,
+        72.79239654541016,
+        1.6071419715881348
+      ],
+      "fov_degrees": 55.0,
+      "has_aperture_f_stops": false,
+      "has_focus_distance": false,
+      "has_orientation": false,
+      "id": "key_5",
+      "linked_camera_id": "camera_loop_Exhibition_SECOND_key_5",
+      "linked_camera_name": "c_Exhibition_SECOND_005 Loop Transition",
+      "near_plane": 0.0005000000237487257,
+      "orientation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "source_shot_name": "c_Exhibition_SECOND_005 Loop Transition"
+    }
+  ],
+  "localized_key_corrections": [
+    {
+      "key_id": "key_1",
+      "spline_camera_position": [
+        305.522705078125,
+        86.51608276367188,
+        3.3647639751434326
+      ],
+      "spline_focus_point": [
+        309.7808837890625,
+        87.51557159423828,
+        1.7231839895248413
+      ]
+    },
+    {
+      "key_id": "key_2",
+      "spline_camera_position": [
+        306.5404052734375,
+        83.19234466552734,
+        3.4151339530944824
+      ],
+      "spline_focus_point": [
+        310.82818603515625,
+        84.68695831298828,
+        1.7891640663146973
+      ]
+    },
+    {
+      "key_id": "key_4",
+      "spline_camera_position": [
+        309.4835510253906,
+        73.92207336425781,
+        3.516170024871826
+      ],
+      "spline_focus_point": [
+        313.7335205078125,
+        75.46429443359375,
+        1.7272769212722778
+      ]
+    },
+    {
+      "key_id": "key_5",
+      "spline_camera_position": [
+        310.6367492675781,
+        71.14785766601563,
+        3.512661933898926
+      ],
+      "spline_focus_point": [
+        315.31671142578125,
+        72.859130859375,
+        1.6071419715881348
+      ]
+    }
+  ],
+  "name": "Exhibition_SECOND",
+  "schema_version": 19,
+  "selected_timing_take_id": "timing-take-7",
+  "selected_water_scenario_id": "",
+  "velocity_blend_link": {
+    "end_overlap_seconds": 45.0,
+    "horizontal_blend": true,
+    "max_end_move_fraction": 0.10000000149011612,
+    "movable_key_ids": [
+      "key_1",
+      "key_2",
+      "key_4",
+      "key_5"
+    ],
+    "pair_id": "loop_crosswipe_20260805T091656Z",
+    "pan_right": true,
+    "partner_file_name": "Exhibition_FIRST.ipanim.json",
+    "start_overlap_seconds": 45.0,
+    "strong_align_max_move_fraction": 0.5
+  },
+  "water_animation_trail_settings": {
+    "color_variation": 1.0,
+    "particle_density": 3.2899999618530273,
+    "particle_speed": 0.23999999463558197,
+    "trail_length_meters": 0.75,
+    "trail_sample_spacing_meters": 0.0
+  },
+  "water_scenario_tracks": []
+}

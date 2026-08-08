@@ -214,6 +214,14 @@ struct SceneRenderState {
         renderer::pointcloud::PointCloudStyleState style{};
         renderer::pointcloud::ResolvedTimingColouriseStack timingColourise{};
         std::vector<invisible_places::io::ScalarFieldStats> scalarFields;
+        // Explicit content semantics replace the old field-count/style
+        // heuristic. Only generated Water overlays may interpret the fixed
+        // water scalar slots; survey clouds never do.
+        bool generatedWaterOverlay = false;
+        // Ripple/Field authored state may remain serialized while its legacy
+        // runtime is inactive. This gate prevents scalar-slot discovery and
+        // sparse-region shading without mutating that authored state.
+        bool regionWaterEffectsEnabled = true;
         bool hasSourceRgb = true;
         bool hasNormals = false;
         bool timingColouriseEligible = false;
@@ -271,6 +279,15 @@ inline bool HasPointCloudExrReadback(
     PointCloudExrReadbackMask mask,
     PointCloudExrReadbackMask flag) {
     return (mask & flag) != PointCloudExrReadbackMask::None;
+}
+
+inline bool ContainsPointCloudExrReadbacks(
+    PointCloudExrReadbackMask available,
+    PointCloudExrReadbackMask requested) {
+    using Underlying = std::underlying_type_t<PointCloudExrReadbackMask>;
+    const auto availableBits = static_cast<Underlying>(available);
+    const auto requestedBits = static_cast<Underlying>(requested);
+    return (availableBits & requestedBits) == requestedBits;
 }
 
 enum class PointCloudExrFrameStatus {
@@ -932,6 +949,8 @@ class VulkanViewportShell {
     struct ExrExportResources {
         std::uint32_t width = 0;
         std::uint32_t height = 0;
+        PointCloudExrReadbackMask readbackMask =
+            PointCloudExrReadbackMask::None;
         VkRenderPass renderPass = VK_NULL_HANDLE;
         VkFramebuffer framebuffer = VK_NULL_HANDLE;
         VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
@@ -1132,7 +1151,8 @@ class VulkanViewportShell {
     void CreateExrExportResources(
         std::uint32_t width,
         std::uint32_t height,
-        bool enableEyeDomeLighting);
+        bool enableEyeDomeLighting,
+        PointCloudExrReadbackMask readbackMask);
     void CreateExrExportRenderPass(ExrExportResources* resources);
     void CreateExrExportPipelines(ExrExportResources* resources);
     void CreateExrExportEyeDomeLightingResources(ExrExportResources* resources);
