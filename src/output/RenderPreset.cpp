@@ -183,6 +183,17 @@ ExportPreset MakeFastPreviewMp4ExportPreset() {
     return MakeMp4ExportPreset();
 }
 
+ExportPreset MakeTestMp4ExportPreset() {
+    auto preset = MakeMp4ExportPreset();
+    preset.name = std::string{kTestMp4PresetName};
+    preset.mode = AnimationExportMode::TestMp4;
+    preset.quality = AnimationExportQuality::Normal;
+    preset.useVideoToolbox = true;
+    preset.externalAlphaMatte = true;
+    preset.settings.framesPerSecond = 5;
+    return preset;
+}
+
 ExportPreset MakeHevcAlphaMp4ExportPreset() {
     auto preset = MakeMp4ExportPreset();
     preset.quality = AnimationExportQuality::Hq;
@@ -344,6 +355,7 @@ ExportPreset NormalizeExportPresetForCurrentSchema(ExportPreset preset) {
             preset.useVideoToolbox = true;
             break;
         case AnimationExportMode::FastPreviewMp4:
+        case AnimationExportMode::TestMp4:
             break;
         case AnimationExportMode::PngStack:
         case AnimationExportMode::FastPngStack:
@@ -359,6 +371,9 @@ ExportPreset NormalizeExportPresetForCurrentSchema(ExportPreset preset) {
         preset.externalAlphaMatte = false;
         preset.useVideoToolbox = false;
         preset.quality = AnimationExportQuality::Normal;
+    } else if (preset.mode == AnimationExportMode::TestMp4) {
+        preset.quality = AnimationExportQuality::Normal;
+        preset.settings.framesPerSecond = std::max<std::uint32_t>(1U, preset.settings.framesPerSecond);
     } else if (preset.mode == AnimationExportMode::FastPreviewMp4) {
         if (preset.quality == AnimationExportQuality::Xq) {
             preset.quality = AnimationExportQuality::Hq;
@@ -374,6 +389,7 @@ ExportPreset NormalizeExportPresetForCurrentSchema(ExportPreset preset) {
 std::vector<ExportPreset> BuiltInExportPresets() {
     return {
         MakeMp4ExportPreset(),
+        MakeTestMp4ExportPreset(),
         MakePngStackExportPreset(),
         MakeFastPngStackExportPreset(),
         MakeProRes422ExportPreset(),
@@ -384,6 +400,7 @@ std::vector<ExportPreset> BuiltInExportPresets() {
 bool IsBuiltInExportPresetName(std::string_view name) {
     const auto normalized = NormalizeExportPresetName(name);
     return normalized == kMp4PresetName ||
+           normalized == kTestMp4PresetName ||
            normalized == kFastPreviewMp4PresetName ||
            normalized == kHevcAlphaMp4PresetName ||
            normalized == kPngStackPresetName ||

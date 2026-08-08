@@ -21,6 +21,10 @@ struct OfflinePointLayer {
     const invisible_places::io::LoadedPointCloud* cloud = nullptr;
     invisible_places::renderer::pointcloud::PointCloudStyleState style{};
     invisible_places::renderer::pointcloud::ResolvedTimingColouriseStack timingColourise{};
+    // Fixed water scalar slots are valid only for app-generated Water
+    // overlays, never for an authored/source point cloud with a coincidental
+    // field count or flow-style flag.
+    bool generatedWaterOverlay = false;
     bool hasSourceRgb = false;
     bool fastBasic = false;
     std::uint64_t drawPointCount = 0;

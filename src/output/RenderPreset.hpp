@@ -43,6 +43,7 @@ struct RenderJobSettings {
 
 enum class AnimationExportMode {
     FastPreviewMp4,
+    TestMp4,
     HevcAlphaMp4,
     PngStack,
     FastPngStack,
@@ -75,6 +76,7 @@ struct ExportPreset {
 };
 
 constexpr std::string_view kMp4PresetName = "MP4_preset";
+constexpr std::string_view kTestMp4PresetName = "Test MP4_preset";
 constexpr std::string_view kFastPreviewMp4PresetName = "Fast Preview MP4_preset";
 constexpr std::string_view kHevcAlphaMp4PresetName = "H.265 Alpha MP4_preset";
 constexpr std::string_view kPngStackPresetName = "PNG Stack_preset";
@@ -93,6 +95,7 @@ constexpr std::string_view kProRes4444XqVideoToolboxPresetName = "ProRes 4444 XQ
 
 [[nodiscard]] ExportPreset MakeFastPreviewMp4ExportPreset();
 [[nodiscard]] ExportPreset MakeMp4ExportPreset();
+[[nodiscard]] ExportPreset MakeTestMp4ExportPreset();
 [[nodiscard]] ExportPreset MakeHevcAlphaMp4ExportPreset();
 [[nodiscard]] ExportPreset MakePngStackExportPreset();
 [[nodiscard]] ExportPreset MakeFastPngStackExportPreset();

@@ -165,6 +165,50 @@ std::string SanitizeFileStem(std::string_view name, std::string_view fallback) {
     return stem.empty() ? std::string{fallback} : stem;
 }
 
+struct SimpleAlphaMatteOutputPaths {
+    std::filesystem::path colorPath;
+    std::filesystem::path alphaMattePath;
+};
+
+SimpleAlphaMatteOutputPaths BuildUniqueSimpleAlphaMatteOutputPaths(
+    const std::filesystem::path& outputDirectory,
+    std::string_view animationName,
+    std::string_view extension,
+    const std::vector<std::filesystem::path>& reservedPaths) {
+    const auto directory =
+        outputDirectory.empty() ? std::filesystem::path{"."} : outputDirectory;
+    const auto baseStem = SanitizeFileStem(animationName, "Animation");
+    const auto reserved = [&reservedPaths](const std::filesystem::path& path) {
+        const auto normalized = path.lexically_normal();
+        return std::any_of(
+            reservedPaths.begin(),
+            reservedPaths.end(),
+            [&normalized](const std::filesystem::path& reservedPath) {
+                return reservedPath.lexically_normal() == normalized;
+            });
+    };
+    const auto makePaths = [&](std::uint32_t index) {
+        const auto suffix =
+            index > 1U ? "_" + std::to_string(index) : std::string{};
+        return SimpleAlphaMatteOutputPaths{
+            .colorPath = directory /
+                         (baseStem + "_Colour" + suffix + std::string{extension}),
+            .alphaMattePath = directory /
+                              (baseStem + "_Alpha" + suffix + std::string{extension}),
+        };
+    };
+
+    auto candidate = makePaths(1U);
+    for (std::uint32_t index = 2U;
+         std::filesystem::exists(candidate.colorPath) ||
+         std::filesystem::exists(candidate.alphaMattePath) ||
+         reserved(candidate.colorPath) || reserved(candidate.alphaMattePath);
+         ++index) {
+        candidate = makePaths(index);
+    }
+    return candidate;
+}
+
 bool IsProRes422Mode(AnimationExportMode mode) {
     return mode == AnimationExportMode::ProRes422Mov ||
            mode == AnimationExportMode::ProRes422HqMov ||
@@ -205,6 +249,7 @@ AnimationExportQuality LegacyQualityForMode(AnimationExportMode mode) {
         case AnimationExportMode::ProRes4444XqVideoToolboxMov:
             return AnimationExportQuality::Xq;
         case AnimationExportMode::FastPreviewMp4:
+        case AnimationExportMode::TestMp4:
         case AnimationExportMode::PngStack:
         case AnimationExportMode::FastPngStack:
         case AnimationExportMode::HqPreviewDensityExr:
@@ -220,6 +265,7 @@ AnimationExportQuality LegacyQualityForMode(AnimationExportMode mode) {
 
 bool LegacyUsesVideoToolbox(AnimationExportMode mode) {
     return mode == AnimationExportMode::FastPreviewMp4 ||
+           mode == AnimationExportMode::TestMp4 ||
            mode == AnimationExportMode::HevcAlphaMp4 ||
            mode == AnimationExportMode::ProRes422VideoToolboxMov ||
            mode == AnimationExportMode::ProRes422HqVideoToolboxMov ||
@@ -228,7 +274,8 @@ bool LegacyUsesVideoToolbox(AnimationExportMode mode) {
 }
 
 bool LegacyWritesExternalAlphaMatte(AnimationExportMode mode) {
-    return mode == AnimationExportMode::HevcAlphaMp4 ||
+    return mode == AnimationExportMode::TestMp4 ||
+           mode == AnimationExportMode::HevcAlphaMp4 ||
            mode == AnimationExportMode::ProRes422AlphaMatteMov ||
            mode == AnimationExportMode::ProRes422HqAlphaMatteMov;
 }
@@ -415,9 +462,13 @@ struct OpaqueBlackRgb16OutputWriter {
     static constexpr std::size_t kBytesPerPixel = 6U;
 
     void operator()(std::uint8_t* destination, float red, float green, float blue, float alpha) const {
-        WriteLittleEndianWord(destination + 0U, UnitFloatToWord(LinearToSrgb(red * alpha)));
-        WriteLittleEndianWord(destination + 2U, UnitFloatToWord(LinearToSrgb(green * alpha)));
-        WriteLittleEndianWord(destination + 4U, UnitFloatToWord(LinearToSrgb(blue * alpha)));
+        // Match After Effects' default display-referred luma-matte workflow:
+        // encode the straight RGB first, then apply the matte over black.
+        // Applying alpha in linear light before this transfer makes partially
+        // transparent point splats substantially brighter than the AE result.
+        WriteLittleEndianWord(destination + 0U, UnitFloatToWord(LinearToSrgb(red) * alpha));
+        WriteLittleEndianWord(destination + 2U, UnitFloatToWord(LinearToSrgb(green) * alpha));
+        WriteLittleEndianWord(destination + 4U, UnitFloatToWord(LinearToSrgb(blue) * alpha));
     }
 };
 
@@ -781,6 +832,8 @@ const char* AnimationExportModeFilenameToken(AnimationExportMode mode) {
     switch (mode) {
         case AnimationExportMode::FastPreviewMp4:
             return "MP4";
+        case AnimationExportMode::TestMp4:
+            return "TestMP4";
         case AnimationExportMode::HevcAlphaMp4:
             return "MP4";
         case AnimationExportMode::PngStack:
@@ -832,7 +885,13 @@ std::string AnimationExportModeFilenameToken(
     bool externalAlphaMatte) {
     const auto compactMode = CompactAnimationExportMode(mode);
     std::string token{AnimationExportModeFilenameToken(compactMode)};
-    if (compactMode == AnimationExportMode::FastPreviewMp4 ||
+    if (compactMode == AnimationExportMode::TestMp4) {
+        token += "_30fps";
+        token += useVideoToolbox ? "_VT" : "_CPU";
+        if (externalAlphaMatte) {
+            token += "_AlphaBlack";
+        }
+    } else if (compactMode == AnimationExportMode::FastPreviewMp4 ||
         compactMode == AnimationExportMode::ProRes422Mov ||
         compactMode == AnimationExportMode::ProRes4444Mov) {
         token += "_";
@@ -895,18 +954,13 @@ std::string BuildAnimationExportFilenameStem(
     bool externalAlphaMatte,
     const RenderJobSettings& settings,
     std::string_view visualName) {
-    auto stem = SanitizeFileStem(animationName, "Animation");
-    stem += "_";
-    stem += AnimationExportModeFilenameToken(mode, quality, useVideoToolbox, externalAlphaMatte);
-    stem += "_";
-    stem += AnimationExportSettingsFilenameToken(settings, mode);
-
-    const auto safeVisualName = SanitizeFileStem(visualName, "");
-    if (!safeVisualName.empty()) {
-        stem += "_";
-        stem += safeVisualName;
-    }
-    return stem;
+    (void)mode;
+    (void)quality;
+    (void)useVideoToolbox;
+    (void)externalAlphaMatte;
+    (void)settings;
+    (void)visualName;
+    return SanitizeFileStem(animationName, "Animation");
 }
 
 std::filesystem::path BuildUniqueAnimationExportMediaOutputPath(
@@ -1036,38 +1090,14 @@ HevcAlphaMp4OutputPaths BuildUniqueHevcAlphaMp4OutputPaths(
     const RenderJobSettings& settings,
     std::string_view visualName,
     const std::vector<std::filesystem::path>& reservedPaths) {
-    const auto directory = outputDirectory.empty() ? std::filesystem::path{"."} : outputDirectory;
-    const auto baseStem = BuildAnimationExportFilenameStem(
+    return BuildUniqueMp4AlphaMatteOutputPaths(
+        outputDirectory,
         animationName,
-        AnimationExportMode::HevcAlphaMp4,
         settings,
-        visualName);
-    const auto reserved = [&reservedPaths](const std::filesystem::path& path) {
-        const auto normalized = path.lexically_normal();
-        return std::any_of(
-            reservedPaths.begin(),
-            reservedPaths.end(),
-            [&normalized](const std::filesystem::path& reservedPath) {
-                return reservedPath.lexically_normal() == normalized;
-            });
-    };
-    const auto makePaths = [&](std::string_view stem) {
-        return HevcAlphaMp4OutputPaths{
-            .colorPath = directory / (std::string{stem} + "_color.mp4"),
-            .alphaMattePath = directory / (std::string{stem} + "_alpha.mp4"),
-        };
-    };
-
-    auto candidate = makePaths(baseStem);
-    for (std::uint32_t suffix = 1U;
-         std::filesystem::exists(candidate.colorPath) ||
-         std::filesystem::exists(candidate.alphaMattePath) ||
-         reserved(candidate.colorPath) ||
-         reserved(candidate.alphaMattePath);
-         ++suffix) {
-        candidate = makePaths(baseStem + "_" + std::to_string(suffix));
-    }
-    return candidate;
+        AnimationExportQuality::Hq,
+        true,
+        visualName,
+        reservedPaths);
 }
 
 HevcAlphaMp4OutputPaths BuildUniqueMp4AlphaMatteOutputPaths(
@@ -1078,41 +1108,19 @@ HevcAlphaMp4OutputPaths BuildUniqueMp4AlphaMatteOutputPaths(
     bool useVideoToolbox,
     std::string_view visualName,
     const std::vector<std::filesystem::path>& reservedPaths) {
-    const auto directory = outputDirectory.empty() ? std::filesystem::path{"."} : outputDirectory;
-    const auto baseStem = BuildAnimationExportFilenameStem(
+    (void)settings;
+    (void)quality;
+    (void)useVideoToolbox;
+    (void)visualName;
+    const auto paths = BuildUniqueSimpleAlphaMatteOutputPaths(
+        outputDirectory,
         animationName,
-        AnimationExportMode::FastPreviewMp4,
-        quality,
-        useVideoToolbox,
-        true,
-        settings,
-        visualName);
-    const auto reserved = [&reservedPaths](const std::filesystem::path& path) {
-        const auto normalized = path.lexically_normal();
-        return std::any_of(
-            reservedPaths.begin(),
-            reservedPaths.end(),
-            [&normalized](const std::filesystem::path& reservedPath) {
-                return reservedPath.lexically_normal() == normalized;
-            });
+        ".mp4",
+        reservedPaths);
+    return {
+        .colorPath = paths.colorPath,
+        .alphaMattePath = paths.alphaMattePath,
     };
-    const auto makePaths = [&](std::string_view stem) {
-        return HevcAlphaMp4OutputPaths{
-            .colorPath = directory / (std::string{stem} + "_color.mp4"),
-            .alphaMattePath = directory / (std::string{stem} + "_alpha.mp4"),
-        };
-    };
-
-    auto candidate = makePaths(baseStem);
-    for (std::uint32_t suffix = 1U;
-         std::filesystem::exists(candidate.colorPath) ||
-         std::filesystem::exists(candidate.alphaMattePath) ||
-         reserved(candidate.colorPath) ||
-         reserved(candidate.alphaMattePath);
-         ++suffix) {
-        candidate = makePaths(baseStem + "_" + std::to_string(suffix));
-    }
-    return candidate;
 }
 
 ProResAlphaMatteOutputPaths BuildUniqueProResAlphaMatteOutputPaths(
@@ -1122,38 +1130,18 @@ ProResAlphaMatteOutputPaths BuildUniqueProResAlphaMatteOutputPaths(
     const RenderJobSettings& settings,
     std::string_view visualName,
     const std::vector<std::filesystem::path>& reservedPaths) {
-    const auto directory = outputDirectory.empty() ? std::filesystem::path{"."} : outputDirectory;
-    const auto baseStem = BuildAnimationExportFilenameStem(
+    (void)mode;
+    (void)settings;
+    (void)visualName;
+    const auto paths = BuildUniqueSimpleAlphaMatteOutputPaths(
+        outputDirectory,
         animationName,
-        mode,
-        settings,
-        visualName);
-    const auto reserved = [&reservedPaths](const std::filesystem::path& path) {
-        const auto normalized = path.lexically_normal();
-        return std::any_of(
-            reservedPaths.begin(),
-            reservedPaths.end(),
-            [&normalized](const std::filesystem::path& reservedPath) {
-                return reservedPath.lexically_normal() == normalized;
-            });
+        ".mov",
+        reservedPaths);
+    return {
+        .colorPath = paths.colorPath,
+        .alphaMattePath = paths.alphaMattePath,
     };
-    const auto makePaths = [&](std::string_view stem) {
-        return ProResAlphaMatteOutputPaths{
-            .colorPath = directory / (std::string{stem} + "_color.mov"),
-            .alphaMattePath = directory / (std::string{stem} + "_alpha.mov"),
-        };
-    };
-
-    auto candidate = makePaths(baseStem);
-    for (std::uint32_t suffix = 1U;
-         std::filesystem::exists(candidate.colorPath) ||
-         std::filesystem::exists(candidate.alphaMattePath) ||
-         reserved(candidate.colorPath) ||
-         reserved(candidate.alphaMattePath);
-         ++suffix) {
-        candidate = makePaths(baseStem + "_" + std::to_string(suffix));
-    }
-    return candidate;
 }
 
 std::filesystem::path BuildUniquePngStackOutputDirectory(
@@ -1209,13 +1197,9 @@ std::filesystem::path BuildUniqueVideoOutputPath(
     std::string_view formatSuffix,
     std::string_view extension,
     const std::vector<std::filesystem::path>& reservedPaths) {
-    const auto baseStem =
-        SanitizeFileStem(animationName, "Animation") + "_" + SanitizeFileStem(visualName, "Visual");
-    const auto safeSuffix = SanitizeFileStem(formatSuffix, "");
-    std::string fullStem = baseStem;
-    if (!safeSuffix.empty()) {
-        fullStem += "_" + safeSuffix;
-    }
+    (void)visualName;
+    (void)formatSuffix;
+    const auto fullStem = SanitizeFileStem(animationName, "Animation");
     std::string safeExtension{extension};
     if (safeExtension.empty()) {
         safeExtension = ".mov";
@@ -1474,6 +1458,67 @@ std::string BuildFfmpegRawRgbaCommand(
             << " -preset veryfast"
             << " -crf 18"
             << " -pix_fmt yuv420p "
+            << ShellQuote(outputPath.string());
+    return command.str();
+}
+
+std::string BuildFfmpegTestMp4Command(
+    const std::filesystem::path& executablePath,
+    std::uint32_t width,
+    std::uint32_t height,
+    std::uint32_t sourceFramesPerSecond,
+    std::uint32_t sourceFrameCount,
+    const std::filesystem::path& outputPath,
+    bool useVideoToolbox) {
+    const auto sourceFps = std::max<std::uint32_t>(1U, sourceFramesPerSecond);
+    const auto sourceFrames = std::max<std::uint32_t>(1U, sourceFrameCount);
+    const auto outputFrameCount = std::max<std::uint64_t>(
+        1ULL,
+        ((static_cast<std::uint64_t>(sourceFrames) * kTestMp4OutputFramesPerSecond) +
+         static_cast<std::uint64_t>(sourceFps) - 1ULL) /
+            static_cast<std::uint64_t>(sourceFps));
+
+    std::ostringstream command;
+    command << ShellQuote(executablePath.string())
+            << " -y"
+            << " -loglevel error"
+            << " -f rawvideo"
+            << " -pix_fmt rgb48le"
+            << " -s:v " << std::max<std::uint32_t>(1U, width) << "x"
+            << std::max<std::uint32_t>(1U, height)
+            << " -r " << sourceFps
+            << " -i -"
+            << " -an"
+            << " -vf format=yuv444p,tpad=stop_mode=clone:stop=2,"
+               "minterpolate=fps=" << kTestMp4OutputFramesPerSecond
+            << ":mi_mode=mci:mc_mode=aobmc:me_mode=bilat:me=epzs:mb_size=8:"
+               "search_param=32:vsbmc=1:scd=fdiff:scd_threshold=10,format=yuv420p";
+    if (useVideoToolbox) {
+        command << " -c:v hevc_videotoolbox"
+                << " -b:v 25000k"
+                << " -maxrate 40000k"
+                << " -bufsize 50000k"
+                << " -tag:v hvc1"
+                << " -pix_fmt yuv420p"
+                << " -allow_sw 1"
+                << " -power_efficient 0"
+                << " -spatial_aq 1";
+    } else {
+        command << " -c:v libx265"
+                << " -preset medium"
+                << " -b:v 25000k"
+                << " -maxrate 40000k"
+                << " -bufsize 50000k"
+                << " -tag:v hvc1"
+                << " -pix_fmt yuv420p"
+                << " -x265-params log-level=error";
+    }
+    command << " -fps_mode cfr"
+            << " -frames:v " << outputFrameCount
+            << " -movflags +faststart"
+            << " -color_primaries bt709"
+            << " -color_trc iec61966-2-1"
+            << " -colorspace bt709 "
             << ShellQuote(outputPath.string());
     return command.str();
 }

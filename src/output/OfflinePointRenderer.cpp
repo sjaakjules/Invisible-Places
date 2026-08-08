@@ -184,19 +184,19 @@ glm::vec3 ApplyWaterEffectColour(
     return glm::mix(baseColor, effectColor, mixAmount);
 }
 
-bool HasWaterParticleFields(
-    const invisible_places::io::LoadedPointCloud& cloud,
-    const invisible_places::renderer::pointcloud::PointCloudStyleState& style) {
-    return style.flowAnimation &&
-           !style.waterTrailOverlay &&
-           cloud.scalarFields.size() > kWaterJitterSeedFieldSlot;
+bool HasWaterParticleFields(const OfflinePointLayer& layer) {
+    return layer.generatedWaterOverlay &&
+           layer.cloud != nullptr &&
+           layer.style.flowAnimation &&
+           !layer.style.waterTrailOverlay &&
+           layer.cloud->scalarFields.size() > kWaterJitterSeedFieldSlot;
 }
 
-bool HasWaterTrailFields(
-    const invisible_places::io::LoadedPointCloud& cloud,
-    const invisible_places::renderer::pointcloud::PointCloudStyleState& style) {
-    return style.waterTrailOverlay &&
-           cloud.scalarFields.size() > kWaterTrailTangentZFieldSlot;
+bool HasWaterTrailFields(const OfflinePointLayer& layer) {
+    return layer.generatedWaterOverlay &&
+           layer.cloud != nullptr &&
+           layer.style.waterTrailOverlay &&
+           layer.cloud->scalarFields.size() > kWaterTrailTangentZFieldSlot;
 }
 
 float WaterParticleTravel(
@@ -2050,7 +2050,7 @@ bool BuildOfflinePointSample(
     const auto densityCompensation =
         invisible_places::renderer::pointcloud::SanitizePointCloudDensityCompensation(
             layer.densityCompensation);
-    const bool waterTrails = HasWaterTrailFields(cloud, layer.style);
+    const bool waterTrails = HasWaterTrailFields(layer);
     float waterTrailPhase = 0.0F;
     float waterTrailVisibility = 1.0F;
     invisible_places::renderer::pointcloud::WaterFlowActivityScales waterFlowActivity;
@@ -2064,7 +2064,7 @@ bool BuildOfflinePointSample(
             pointIndex,
             stylisationTimeSeconds);
     }
-    const bool waterParticles = HasWaterParticleFields(cloud, layer.style);
+    const bool waterParticles = HasWaterParticleFields(layer);
     float waterParticleRole = 0.0F;
     if (waterParticles) {
         waterParticleRole = ScalarFieldValueBySlot(cloud, kWaterParticleRoleFieldSlot, pointIndex);
@@ -2911,7 +2911,7 @@ void RenderFastBasicPointCloudTile(
         }
 
         const auto& cloud = *layer.cloud;
-        const bool waterTrails = HasWaterTrailFields(cloud, layer.style);
+        const bool waterTrails = HasWaterTrailFields(layer);
         const auto sourcePointCount = cloud.positions.size();
         const auto drawPointCount =
             static_cast<std::size_t>(std::min<std::uint64_t>(

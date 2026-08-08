@@ -10,6 +10,22 @@
 
 namespace invisible_places::platform {
 
+SystemThermalState CurrentSystemThermalState() {
+    @autoreleasepool {
+        switch ([[NSProcessInfo processInfo] thermalState]) {
+            case NSProcessInfoThermalStateNominal:
+                return SystemThermalState::Nominal;
+            case NSProcessInfoThermalStateFair:
+                return SystemThermalState::Fair;
+            case NSProcessInfoThermalStateSerious:
+                return SystemThermalState::Serious;
+            case NSProcessInfoThermalStateCritical:
+                return SystemThermalState::Critical;
+        }
+    }
+    return SystemThermalState::Unavailable;
+}
+
 void PrepareMacWindowingRuntime() {
     @autoreleasepool {
         [NSApplication sharedApplication];

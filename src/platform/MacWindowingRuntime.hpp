@@ -6,6 +6,33 @@
 
 namespace invisible_places::platform {
 
+enum class SystemThermalState : std::uint8_t {
+    Unavailable = 0,
+    Nominal,
+    Fair,
+    Serious,
+    Critical,
+};
+
+[[nodiscard]] SystemThermalState CurrentSystemThermalState();
+
+[[nodiscard]] constexpr std::string_view SystemThermalStateLabel(
+    SystemThermalState state) {
+    switch (state) {
+        case SystemThermalState::Nominal:
+            return "nominal";
+        case SystemThermalState::Fair:
+            return "fair";
+        case SystemThermalState::Serious:
+            return "serious";
+        case SystemThermalState::Critical:
+            return "critical";
+        case SystemThermalState::Unavailable:
+            return "unavailable";
+    }
+    return "unavailable";
+}
+
 void PrepareMacWindowingRuntime();
 
 class ScopedPowerAssertion {

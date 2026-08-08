@@ -4,6 +4,10 @@
 
 namespace invisible_places::platform {
 
+SystemThermalState CurrentSystemThermalState() {
+    return SystemThermalState::Unavailable;
+}
+
 void PrepareMacWindowingRuntime() {}
 
 ScopedPowerAssertion::ScopedPowerAssertion(std::string reason) {

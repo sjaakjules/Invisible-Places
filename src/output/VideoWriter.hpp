@@ -11,6 +11,8 @@
 
 namespace invisible_places::output {
 
+constexpr std::uint32_t kTestMp4OutputFramesPerSecond = 30U;
+
 std::filesystem::path DefaultFfmpegExecutablePath();
 
 bool FfmpegExecutableAvailable(const std::filesystem::path& executablePath);
@@ -152,6 +154,13 @@ ProResAlphaMatteOutputPaths BuildUniqueProRes422HqAlphaMatteOutputPaths(
     const RenderJobSettings& settings,
     std::string_view visualName = {},
     const std::vector<std::filesystem::path>& reservedPaths = {});
+ProResAlphaMatteOutputPaths BuildUniqueProResAlphaMatteOutputPaths(
+    const std::filesystem::path& outputDirectory,
+    std::string_view animationName,
+    AnimationExportMode mode,
+    const RenderJobSettings& settings,
+    std::string_view visualName = {},
+    const std::vector<std::filesystem::path>& reservedPaths = {});
 std::filesystem::path BuildUniqueProRes422VideoToolboxOutputPath(
     const std::filesystem::path& outputDirectory,
     std::string_view animationName,
@@ -215,6 +224,14 @@ std::string BuildFfmpegRawRgbaCommand(
     std::uint32_t height,
     std::uint32_t framesPerSecond,
     const std::filesystem::path& outputPath);
+std::string BuildFfmpegTestMp4Command(
+    const std::filesystem::path& executablePath,
+    std::uint32_t width,
+    std::uint32_t height,
+    std::uint32_t sourceFramesPerSecond,
+    std::uint32_t sourceFrameCount,
+    const std::filesystem::path& outputPath,
+    bool useVideoToolbox);
 std::string BuildFfmpegHevcAlphaMp4Command(
     const std::filesystem::path& executablePath,
     std::uint32_t width,
