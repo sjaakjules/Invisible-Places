@@ -143,6 +143,8 @@ constexpr std::array<char, 8> kWaterPathCacheSidecarMagic{'I', 'P', 'F', 'L', 'O
 constexpr std::uint32_t kManualFlowSurfaceGuideProjectSchemaVersion = 40U;
 constexpr std::uint32_t kManualFlowSurfaceGuideSourcesSchemaVersion = 16U;
 constexpr std::uint32_t kSmoothVelocityProjectSchemaVersion = 61U;
+constexpr std::uint32_t kTrackDefaultInterpolationProjectSchemaVersion = 71U;
+constexpr std::uint32_t kTrackDefaultInterpolationSourcesSchemaVersion = 26U;
 constexpr std::uint32_t kRelativePalettePhaseProjectSchemaVersion = 62U;
 constexpr std::uint32_t kFieldMapBoundsMemoryProjectSchemaVersion = 63U;
 constexpr std::uint32_t kShorelineInstancesProjectSchemaVersion = 64U;
@@ -3864,6 +3866,8 @@ const char* WaterScenarioInterpolationName(WaterScenarioInterpolation interpolat
             return "smooth_velocity";
         case WaterScenarioInterpolation::CentripetalCatmullRom:
             return "centripetal_catmull_rom";
+        case WaterScenarioInterpolation::TrackDefault:
+            return "track_default";
     }
     return "smooth";
 }
@@ -3884,6 +3888,9 @@ WaterScenarioInterpolation ParseWaterScenarioInterpolation(const json& interpola
     }
     if (name == "centripetal_catmull_rom") {
         return WaterScenarioInterpolation::CentripetalCatmullRom;
+    }
+    if (name == "track_default") {
+        return WaterScenarioInterpolation::TrackDefault;
     }
     return WaterScenarioInterpolation::Smooth;
 }
@@ -4164,8 +4171,26 @@ json SerializeWaterKeyedSettingTrack(
         {"label", setting.label},
         {"profile_group", setting.profileGroup},
         {"profile_name", setting.profileName},
+        {"default_interpolation",
+         WaterScenarioInterpolationName(setting.defaultInterpolation)},
         {"keys", std::move(keysJson)},
     };
+}
+
+// Pre-71/26 setting tracks wrote a concrete Smooth on every key (the old
+// creation default). Those keys become TrackDefault on a track whose default
+// is Smooth: the saved motion is unchanged while the whole setting can now
+// restyle through its track default in one edit. Deliberate Linear/Hold and
+// spline keys keep their concrete modes.
+void MigrateLegacySmoothSettingTrackKeys(
+    invisible_places::water::WaterKeyedSettingTrack* track) {
+    using invisible_places::water::WaterScenarioInterpolation;
+    track->defaultInterpolation = WaterScenarioInterpolation::Smooth;
+    for (auto& key : track->keys) {
+        if (key.interpolation == WaterScenarioInterpolation::Smooth) {
+            key.interpolation = WaterScenarioInterpolation::TrackDefault;
+        }
+    }
 }
 
 invisible_places::water::WaterKeyedSettingTrack
@@ -4180,6 +4205,14 @@ ParseWaterKeyedSettingTrack(const json& settingJson) {
     track.profileName = settingJson.value(
         "profile_name",
         std::string{});
+    // Absent on pre-71/26 documents, whose keys all carried a concrete
+    // Smooth; the migration below turns those keys into TrackDefault, so
+    // Smooth here preserves their motion exactly.
+    track.defaultInterpolation =
+        settingJson.contains("default_interpolation")
+            ? ParseWaterScenarioInterpolation(
+                  settingJson.at("default_interpolation"))
+            : invisible_places::water::WaterScenarioInterpolation::Smooth;
     if (settingJson.contains("keys") &&
         settingJson.at("keys").is_array()) {
         for (const auto& keyJson : settingJson.at("keys")) {
@@ -10039,6 +10072,32 @@ std::optional<ProjectDocument> LoadProjectDocument(
         MigrateLegacySmoothPalettePhaseKeys(
             &document.timingTakeStates);
     }
+    if (document.schemaVersion <
+        kTrackDefaultInterpolationProjectSchemaVersion) {
+        for (auto& entry : document.waterFeatureTimingRuns) {
+            for (auto& run : entry.runs) {
+                for (auto& feature : run.features) {
+                    for (auto& setting : feature.settings) {
+                        MigrateLegacySmoothSettingTrackKeys(&setting);
+                    }
+                }
+            }
+        }
+        for (auto& state : document.timingTakeStates) {
+            for (auto& run : state.waterFeatureTimingRuns) {
+                for (auto& feature : run.features) {
+                    for (auto& setting : feature.settings) {
+                        MigrateLegacySmoothSettingTrackKeys(&setting);
+                    }
+                }
+            }
+        }
+        for (auto& profile : document.waterKeyedSettingsProfiles) {
+            for (auto& setting : profile.settings) {
+                MigrateLegacySmoothSettingTrackKeys(&setting);
+            }
+        }
+    }
     if (document.schemaVersion < kProjectDocumentSchemaVersion) {
         document.schemaVersion = kProjectDocumentSchemaVersion;
     }
@@ -10468,6 +10527,14 @@ static WaterSourcesDocument ParseWaterSourcesDocumentJsonValue(
             auto cache = ParseWaterRippleRuntimeCache(cacheJson);
             if (!cache.memberships.empty() && !cache.params.empty()) {
                 document.rippleRuntimeCaches.push_back(std::move(cache));
+            }
+        }
+    }
+    if (document.schemaVersion <
+        kTrackDefaultInterpolationSourcesSchemaVersion) {
+        for (auto& profile : document.keyedSettingsProfiles) {
+            for (auto& setting : profile.settings) {
+                MigrateLegacySmoothSettingTrackKeys(&setting);
             }
         }
     }

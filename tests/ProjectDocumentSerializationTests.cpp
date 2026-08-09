@@ -3478,3 +3478,95 @@ TEST_CASE("Flow profile object copies round-trip owner metadata",
   CHECK(loadedSources->seepageResponseProfiles[0].baseProfileName ==
         "Standard_preset");
 }
+
+TEST_CASE("Keyed setting tracks round-trip their default interpolation and migrate legacy smooth keys",
+          "[project][serialization][water][timings][interpolation]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::water::WaterFeatureTimeline;
+  using invisible_places::water::WaterFeatureTimingRun;
+  using invisible_places::water::WaterKeyedFeatureKind;
+  using invisible_places::water::WaterKeyedSettingTrack;
+  using invisible_places::water::WaterScenarioFeatureRuns;
+  using invisible_places::water::WaterScenarioInterpolation;
+
+  WaterKeyedSettingTrack track;
+  track.settingId = "level";
+  track.defaultInterpolation =
+      WaterScenarioInterpolation::CentripetalCatmullRom;
+  track.keys = {
+      {.position = 0.20F,
+       .value = 0.10F,
+       .interpolation = WaterScenarioInterpolation::TrackDefault},
+      {.position = 0.70F,
+       .value = 0.90F,
+       .interpolation = WaterScenarioInterpolation::Linear},
+  };
+  WaterFeatureTimeline timeline;
+  timeline.feature = {.kind = WaterKeyedFeatureKind::Rain};
+  timeline.settings.push_back(track);
+  WaterFeatureTimingRun run;
+  run.id = 4U;
+  run.name = "Rain Run";
+  run.features.push_back(timeline);
+  WaterScenarioFeatureRuns entry;
+  entry.scenarioId = "take-a";
+  entry.runs.push_back(run);
+
+  ProjectDocument document;
+  document.projectName = "keyed-track-interpolation";
+  document.waterFeatureTimingRuns.push_back(entry);
+
+  TemporaryProjectFile file{
+      "invisible_places_keyed_track_interpolation.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->waterFeatureTimingRuns.size() == 1U);
+  REQUIRE(loaded->waterFeatureTimingRuns[0].runs.size() == 1U);
+  REQUIRE(loaded->waterFeatureTimingRuns[0].runs[0].features.size() == 1U);
+  const auto& loadedTrack =
+      loaded->waterFeatureTimingRuns[0].runs[0].features[0].settings.at(0);
+  CHECK(loadedTrack.defaultInterpolation ==
+        WaterScenarioInterpolation::CentripetalCatmullRom);
+  REQUIRE(loadedTrack.keys.size() == 2U);
+  CHECK(loadedTrack.keys[0].interpolation ==
+        WaterScenarioInterpolation::TrackDefault);
+  CHECK(loadedTrack.keys[1].interpolation ==
+        WaterScenarioInterpolation::Linear);
+
+  // A pre-71 document carries concrete "smooth" keys and no track default:
+  // migration turns those keys into TrackDefault on a Smooth default, so
+  // the saved motion is unchanged but the track restyles in one edit.
+  std::ifstream savedInput{file.path};
+  REQUIRE(savedInput.is_open());
+  auto legacyJson = nlohmann::json::parse(savedInput);
+  savedInput.close();
+  legacyJson["schema_version"] = 70U;
+  auto& legacyTrack =
+      legacyJson["water_feature_timing_runs"][0]["runs"][0]["features"][0]
+                ["settings"][0];
+  legacyTrack.erase("default_interpolation");
+  legacyTrack["keys"][0]["interpolation"] = "smooth";
+  legacyTrack["keys"][1]["interpolation"] = "smooth";
+  {
+    std::ofstream output{file.path, std::ios::trunc};
+    REQUIRE(output.is_open());
+    output << legacyJson.dump(2);
+  }
+  const auto migrated = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(migrated.has_value());
+  const auto& migratedTrack =
+      migrated->waterFeatureTimingRuns[0].runs[0].features[0].settings.at(0);
+  CHECK(migratedTrack.defaultInterpolation ==
+        WaterScenarioInterpolation::Smooth);
+  REQUIRE(migratedTrack.keys.size() == 2U);
+  CHECK(migratedTrack.keys[0].interpolation ==
+        WaterScenarioInterpolation::TrackDefault);
+  CHECK(migratedTrack.keys[1].interpolation ==
+        WaterScenarioInterpolation::TrackDefault);
+}

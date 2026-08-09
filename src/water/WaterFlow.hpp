@@ -155,7 +155,12 @@ enum class WaterScenarioInterpolation {
     // Chord-length-aware Catmull-Rom interpolation using alpha = 0.5. This
     // follows a fluid C1 curve through every key without the uniform
     // Catmull-Rom loops and cusps caused by unevenly spaced control points.
-    CentripetalCatmullRom
+    CentripetalCatmullRom,
+    // Keyed-setting tracks only: the key follows its track's
+    // defaultInterpolation, so restyling the whole setting is one edit while
+    // explicitly overridden keys keep their own mode. Never valid on
+    // scenario or node keys; evaluation resolves it before segment math.
+    TrackDefault
 };
 
 enum class WaterFieldOutputMode {
@@ -484,6 +489,11 @@ struct WaterKeyedSettingTrack {
     std::string label;
     std::string profileGroup;
     std::string profileName;
+    // Curve style applied to every key set to TrackDefault. New tracks flow
+    // through keys on a centripetal Catmull-Rom spline; pre-existing tracks
+    // migrate to Smooth so saved motion is unchanged until restyled.
+    WaterScenarioInterpolation defaultInterpolation =
+        WaterScenarioInterpolation::CentripetalCatmullRom;
     std::vector<WaterSettingKey> keys;
 };
 
@@ -578,7 +588,7 @@ void AddOrUpdateWaterSettingKey(
     float position,
     float value,
     WaterScenarioInterpolation interpolation =
-        WaterScenarioInterpolation::Smooth);
+        WaterScenarioInterpolation::TrackDefault);
 // Moves one key without overwriting another key in the same setting track.
 // Source matching and destination occupancy use the same 1e-4 tolerance as
 // insertion and navigation.

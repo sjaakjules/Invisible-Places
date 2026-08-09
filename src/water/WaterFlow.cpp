@@ -8429,6 +8429,11 @@ bool WaterKeyedFeatureKindIsGlobal(WaterKeyedFeatureKind kind) {
 
 WaterKeyedSettingTrack SanitizeWaterKeyedSettingTrack(
     WaterKeyedSettingTrack track) {
+    if (track.defaultInterpolation ==
+        WaterScenarioInterpolation::TrackDefault) {
+        track.defaultInterpolation =
+            WaterScenarioInterpolation::CentripetalCatmullRom;
+    }
     for (auto& key : track.keys) {
         key.position = Clamp01(SeepageFiniteOr(key.position, 0.0F));
         key.value = SeepageFiniteOr(key.value, 0.0F);
@@ -8596,9 +8601,22 @@ std::optional<float> EvaluateWaterKeyedSettingTrack(
         return std::nullopt;
     }
     normalizedPosition = Clamp01(SeepageFiniteOr(normalizedPosition, 0.0F));
+    // TrackDefault keys resolve to the track's default style before any
+    // segment math, because the spline segments read neighbouring keys'
+    // interpolation to find mode boundaries.
+    const auto trackDefault =
+        track.defaultInterpolation == WaterScenarioInterpolation::TrackDefault
+            ? WaterScenarioInterpolation::CentripetalCatmullRom
+            : track.defaultInterpolation;
+    std::vector<WaterSettingKey> resolved = track.keys;
+    for (auto& key : resolved) {
+        if (key.interpolation == WaterScenarioInterpolation::TrackDefault) {
+            key.interpolation = trackDefault;
+        }
+    }
     std::vector<const WaterSettingKey*> ordered;
-    ordered.reserve(track.keys.size());
-    for (const auto& key : track.keys) {
+    ordered.reserve(resolved.size());
+    for (const auto& key : resolved) {
         ordered.push_back(&key);
     }
     std::stable_sort(

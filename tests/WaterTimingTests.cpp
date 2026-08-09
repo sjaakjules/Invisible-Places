@@ -557,6 +557,69 @@ TEST_CASE("Keyed setting tracks hold endpoints and step at exact Hold keys",
           Approx(0.2F));
 }
 
+TEST_CASE("Track-default keys follow the track's default interpolation",
+          "[water][timing][keyed][interpolation]") {
+    using Catch::Approx;
+    using invisible_places::water::EvaluateWaterKeyedSettingTrack;
+    using invisible_places::water::WaterKeyedSettingTrack;
+    using invisible_places::water::WaterScenarioInterpolation;
+
+    const auto makeTrack = [](WaterScenarioInterpolation keyMode,
+                              WaterScenarioInterpolation defaultMode) {
+        WaterKeyedSettingTrack track;
+        track.settingId = "strength";
+        track.defaultInterpolation = defaultMode;
+        track.keys = {
+            {.position = 0.00F, .value = 0.0F, .interpolation = keyMode},
+            {.position = 0.40F, .value = 1.0F, .interpolation = keyMode},
+            {.position = 0.60F, .value = 1.4F, .interpolation = keyMode},
+            {.position = 1.00F, .value = 0.2F, .interpolation = keyMode},
+        };
+        return track;
+    };
+
+    // TrackDefault keys evaluate exactly like keys carrying the default
+    // concretely — here the fluid Catmull-Rom spline...
+    const auto inherited = makeTrack(
+        WaterScenarioInterpolation::TrackDefault,
+        WaterScenarioInterpolation::CentripetalCatmullRom);
+    const auto concrete = makeTrack(
+        WaterScenarioInterpolation::CentripetalCatmullRom,
+        WaterScenarioInterpolation::Smooth);
+    for (const float position : {0.1F, 0.35F, 0.5F, 0.62F, 0.9F}) {
+        CHECK(EvaluateWaterKeyedSettingTrack(inherited, position).value() ==
+              Approx(EvaluateWaterKeyedSettingTrack(concrete, position)
+                         .value()));
+    }
+    // ...and restyling the default alone restyles the whole track: the same
+    // keys under a Smooth default match concrete Smooth keys.
+    const auto smoothDefault = makeTrack(
+        WaterScenarioInterpolation::TrackDefault,
+        WaterScenarioInterpolation::Smooth);
+    const auto smoothConcrete = makeTrack(
+        WaterScenarioInterpolation::Smooth,
+        WaterScenarioInterpolation::CentripetalCatmullRom);
+    for (const float position : {0.1F, 0.5F, 0.9F}) {
+        CHECK(
+            EvaluateWaterKeyedSettingTrack(smoothDefault, position).value() ==
+            Approx(EvaluateWaterKeyedSettingTrack(smoothConcrete, position)
+                       .value()));
+    }
+    // The spline default carries speed through a monotonic interior key
+    // (values still rising on both sides at 0.40) where the Smooth default
+    // has eased to a standstill. Reversals like the 0.60 peak still rest —
+    // that part of the behaviour is deliberate.
+    const float nearKey = 0.395F;
+    const float atKey = 0.40F;
+    const float splineStep = std::abs(
+        EvaluateWaterKeyedSettingTrack(inherited, atKey).value() -
+        EvaluateWaterKeyedSettingTrack(inherited, nearKey).value());
+    const float smoothStep = std::abs(
+        EvaluateWaterKeyedSettingTrack(smoothDefault, atKey).value() -
+        EvaluateWaterKeyedSettingTrack(smoothDefault, nearKey).value());
+    CHECK(splineStep > smoothStep * 2.0F);
+}
+
 TEST_CASE("Adding a key between keys preserves surrounding blends and order",
           "[water][timing][keyed]") {
     using Catch::Approx;

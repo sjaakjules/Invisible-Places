@@ -679,6 +679,17 @@ struct WaterRunKeyEditState {
     std::string errorMessage;
 };
 
+// The last grabbed or edited run-graph key. It backs the read-only-selection
+// interpolation row drawn beneath every run graph (Timings tab and the
+// embedded Water-tab timelines share the editor).
+struct WaterRunKeySelectionState {
+    std::string scenarioId;
+    std::uint32_t runId = 0U;
+    invisible_places::water::WaterKeyedFeatureId feature{};
+    std::string settingId;
+    float position = 0.0F;
+};
+
 enum class AnimationTimelineViewDragPart : std::uint8_t {
     Start = 0,
     Body,
@@ -998,8 +1009,18 @@ struct TimingsPanelState {
     };
     bool waterRunGraphSplit = false;
     std::vector<WaterRunGraphViewState> waterRunGraphViews;
+    // Feature settings pinned from the Timings run list onto the Global
+    // Animation Position bar as always-visible, read-only curve overlays.
+    // Keyed by take so switching takes swaps the overlay set.
+    struct WaterPinnedSettingOverlay {
+        std::string scenarioId;
+        invisible_places::water::WaterKeyedFeatureId feature{};
+        std::string settingId;
+    };
+    std::vector<WaterPinnedSettingOverlay> waterPinnedSettingOverlays;
     std::optional<WaterRunKeyDragState> waterRunKeyDrag;
     std::optional<WaterRunKeyEditState> waterRunKeyEdit;
+    std::optional<WaterRunKeySelectionState> waterRunKeySelection;
     // Timing-take and Colourise authoring state. The selected effect is
     // intentionally UI-only; effects themselves are project-owned by the
     // active (take, scene-group) pair.
@@ -51123,6 +51144,9 @@ void DrawAnimationSection(
                             return "Monotone Spline";
                         case invisible_places::water::WaterScenarioInterpolation::CentripetalCatmullRom:
                             return "Centripetal Catmull–Rom";
+                        // Setting-track-only sentinel; node keys never carry it.
+                        case invisible_places::water::WaterScenarioInterpolation::TrackDefault:
+                            return "Smooth Step";
                     }
                     return "Smooth";
                 };
@@ -51401,6 +51425,10 @@ void DrawAnimationSection(
                                 return "Monotone Spline";
                             case invisible_places::water::WaterScenarioInterpolation::CentripetalCatmullRom:
                                 return "Centripetal Catmull–Rom";
+                            // Setting-track-only sentinel; node keys never
+                            // carry it.
+                            case invisible_places::water::WaterScenarioInterpolation::TrackDefault:
+                                return "Smooth Step";
                         }
                         return "Smooth";
                     };
@@ -64387,10 +64415,13 @@ BuildAvailableKeyingFeatures(
 // Defined with the Timing helpers further down; declared here so the water
 // run graph editor can share the interpolation combo and control tooltips.
 void DrawTimingControlTooltip(const char* text);
+const char* TimingInterpolationLabel(
+    invisible_places::water::WaterScenarioInterpolation interpolation);
 bool DrawTimingInterpolationCombo(
     const char* label,
     invisible_places::water::WaterScenarioInterpolation* interpolation,
-    bool includeSplineModes);
+    bool includeSplineModes,
+    bool includeTrackDefault);
 
 // ---- Water run timeline graph ----
 // The Timings-tab editor for a selected run's keyed setting tracks, visually
@@ -64644,8 +64675,10 @@ void DrawWaterRunTimingGraph(
     const auto interpolationForNewKey =
         [&](std::size_t index, float position) {
             const auto& keys = sortedKeys[index];
+            // New keys inherit the track default unless the preceding key
+            // carries an explicit override worth continuing.
             WaterScenarioInterpolation interpolation =
-                WaterScenarioInterpolation::Smooth;
+                WaterScenarioInterpolation::TrackDefault;
             for (const auto& key : keys) {
                 if (key.position <= position + kKeyTolerance) {
                     interpolation = key.interpolation;
@@ -64789,10 +64822,20 @@ void DrawWaterRunTimingGraph(
         runtimeState->animationPanel.scrubAmount = position;
         ApplyAnimationScrub(runtimeState);
     };
+    const auto selectKey = [&](std::size_t index, float position) {
+        timings.waterRunKeySelection = WaterRunKeySelectionState{
+            .scenarioId = scenarioId,
+            .runId = run->id,
+            .feature = series[index].feature,
+            .settingId = series[index].settingId,
+            .position = position,
+        };
+    };
     const auto armDrag = [&](std::size_t index,
                              float position,
                              float keyValue,
                              bool value) {
+        selectKey(index, position);
         timings.waterRunKeyDrag = WaterRunKeyDragState{
             .scenarioId = scenarioId,
             .runId = run->id,
@@ -64816,6 +64859,7 @@ void DrawWaterRunTimingGraph(
                 break;
             }
         }
+        selectKey(index, position);
         timings.waterRunKeyDrag.reset();
         timings.waterRunKeyEdit = WaterRunKeyEditState{
             .scenarioId = scenarioId,
@@ -64851,7 +64895,7 @@ void DrawWaterRunTimingGraph(
         float position = 0.0F;
         float value = 0.0F;
         WaterScenarioInterpolation interpolation =
-            WaterScenarioInterpolation::Smooth;
+            WaterScenarioInterpolation::TrackDefault;
     };
     std::optional<PendingKeyAdd> pendingAdd;
     const auto addKey = [&](std::size_t index, float position, float value) {
@@ -65005,6 +65049,15 @@ void DrawWaterRunTimingGraph(
                         track,
                         drag.currentPosition,
                         destination)) {
+                    if (timings.waterRunKeySelection.has_value() &&
+                        matchesSeries(
+                            timings.waterRunKeySelection.value(),
+                            draggedSeries.value()) &&
+                        std::abs(
+                            timings.waterRunKeySelection->position -
+                            drag.currentPosition) <= kKeyTolerance) {
+                        timings.waterRunKeySelection->position = destination;
+                    }
                     drag.currentPosition = destination;
                     scrubTo(destination);
                     mutated = true;
@@ -65285,7 +65338,16 @@ void DrawWaterRunTimingGraph(
             DrawTimingInterpolationCombo(
                 "To Next Key##WaterRunKey",
                 &editor->draftInterpolation,
-                /*includeSplineModes=*/true);
+                /*includeSplineModes=*/true,
+                /*includeTrackDefault=*/true);
+            if (editor->draftInterpolation ==
+                invisible_places::water::WaterScenarioInterpolation::
+                    TrackDefault) {
+                ImGui::TextDisabled(
+                    "Follows the setting default: %s.",
+                    TimingInterpolationLabel(
+                        track->defaultInterpolation));
+            }
             const bool validPosition =
                 std::isfinite(editor->draftPosition) &&
                 editor->draftPosition >= 0.0F &&
@@ -65322,6 +65384,15 @@ void DrawWaterRunTimingGraph(
                     RemoveWaterSettingKeysAtPosition(
                         track,
                         editor->sourcePosition);
+                if (timings.waterRunKeySelection.has_value() &&
+                    matchesSeries(
+                        timings.waterRunKeySelection.value(),
+                        index) &&
+                    std::abs(
+                        timings.waterRunKeySelection->position -
+                        editor->sourcePosition) <= kKeyTolerance) {
+                    timings.waterRunKeySelection.reset();
+                }
                 mutated = true;
                 ImGui::CloseCurrentPopup();
                 closeEditor = true;
@@ -65363,6 +65434,16 @@ void DrawWaterRunTimingGraph(
                         editor->draftPosition,
                         appliedValue,
                         editor->draftInterpolation);
+                    if (timings.waterRunKeySelection.has_value() &&
+                        matchesSeries(
+                            timings.waterRunKeySelection.value(),
+                            index) &&
+                        std::abs(
+                            timings.waterRunKeySelection->position -
+                            editor->sourcePosition) <= kKeyTolerance) {
+                        timings.waterRunKeySelection->position =
+                            editor->draftPosition;
+                    }
                     mutated = true;
                     scrubTo(editor->draftPosition);
                     ImGui::CloseCurrentPopup();
@@ -65407,6 +65488,55 @@ void DrawWaterRunTimingGraph(
                 add.position,
                 add.value,
                 add.interpolation);
+        }
+    }
+
+    // Selected-key interpolation row: the last grabbed or edited key stays
+    // adjustable beneath the graph without reopening the popup. Timings-tab
+    // graphs and the embedded Water-tab timelines share this editor, so the
+    // row appears under both.
+    if (timings.waterRunKeySelection.has_value()) {
+        const auto selectionSeries =
+            findMatchingSeries(timings.waterRunKeySelection.value());
+        if (selectionSeries.has_value() &&
+            series[selectionSeries.value()].track != nullptr) {
+            auto* track = series[selectionSeries.value()].track;
+            auto* selectedKey = [&]() -> WaterSettingKey* {
+                for (auto& key : track->keys) {
+                    if (std::abs(
+                            key.position -
+                            timings.waterRunKeySelection->position) <=
+                        kKeyTolerance) {
+                        return &key;
+                    }
+                }
+                return nullptr;
+            }();
+            if (selectedKey != nullptr) {
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextDisabled(
+                    "Key: %s at %.2f s",
+                    seriesKeyLabel(
+                        selectionSeries.value(),
+                        selectedKey->position)
+                        .c_str(),
+                    selectedKey->position * durationSeconds);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(200.0F);
+                (void)DrawTimingInterpolationCombo(
+                    "##SelectedRunKeyInterpolation",
+                    &selectedKey->interpolation,
+                    /*includeSplineModes=*/true,
+                    /*includeTrackDefault=*/true);
+                if (selectedKey->interpolation ==
+                    WaterScenarioInterpolation::TrackDefault) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled(
+                        "= %s",
+                        TimingInterpolationLabel(
+                            track->defaultInterpolation));
+                }
+            }
         }
     }
     ImGui::PopID();
@@ -65612,81 +65742,12 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                 return kWaterKeyedSettingColours[
                     featureIndex % kWaterKeyedSettingColours.size()];
             };
-
-            std::optional<std::size_t> removeFeatureIndex;
-            for (std::size_t featureIndex = 0U;
-                 featureIndex < run.features.size();
-                 ++featureIndex) {
-                auto& timeline = run.features[featureIndex];
-                ImGui::PushID(static_cast<int>(featureIndex));
-                const auto label =
-                    WaterKeyedFeatureDisplayLabel(
-                        *runtimeState,
-                        timeline.feature);
-                std::size_t keyCount = 0U;
-                for (const auto& setting : timeline.settings) {
-                    keyCount += setting.keys.size();
-                }
-                const auto hiddenIt = std::find(
-                    graphView.hiddenFeatures.begin(),
-                    graphView.hiddenFeatures.end(),
-                    timeline.feature);
-                bool visible = hiddenIt == graphView.hiddenFeatures.end();
-                if (ImGui::Checkbox("##Visible", &visible)) {
-                    if (visible) {
-                        graphView.hiddenFeatures.erase(hiddenIt);
-                    } else {
-                        graphView.hiddenFeatures.push_back(
-                            timeline.feature);
-                    }
-                }
-                DrawWaterSeepageParameterTooltip(
-                    "Show this feature on the timeline graph below.");
-                ImGui::SameLine();
-                ImGui::TextColored(
-                    ImGui::ColorConvertU32ToFloat4(
-                        featureBaseColour(featureIndex)),
-                    "%s — %zu key%s",
-                    label.c_str(),
-                    keyCount,
-                    keyCount == 1U ? "" : "s");
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Remove")) {
-                    removeFeatureIndex = featureIndex;
-                }
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(140.0F);
-                if (ImGui::BeginCombo("##MoveTo", "Move to...")) {
-                    for (std::size_t runIndex = 0U;
-                         runIndex < entry.waterFeatureTimingRuns.size();
-                         ++runIndex) {
-                        if (runIndex ==
-                            timings.selectedFeatureRunIndex.value()) {
-                            continue;
-                        }
-                        if (ImGui::Selectable(
-                                entry.waterFeatureTimingRuns[runIndex].name.c_str(),
-                                false)) {
-                            entry.waterFeatureTimingRuns[runIndex].features.push_back(
-                                timeline);
-                            removeFeatureIndex = featureIndex;
-                        }
-                    }
-                    ImGui::EndCombo();
-                }
-                ImGui::PopID();
-            }
-            if (removeFeatureIndex.has_value()) {
-                run.features.erase(
-                    run.features.begin() +
-                    static_cast<std::ptrdiff_t>(removeFeatureIndex.value()));
-            }
-
-            // ---- Timeline graphs ----
             // Builds the graph series for one feature. Split graphs list
             // every registry setting (unauthored ones as dashed guides that
             // accept a first key); the combined graph overlays only keyed
-            // tracks so many dashed defaults do not bury the curves.
+            // tracks so many dashed defaults do not bury the curves. The
+            // feature rows reuse it so their per-setting summaries keep the
+            // exact colours of the graphs below.
             const auto buildFeatureSeries =
                 [&](invisible_places::water::WaterFeatureTimeline& timeline,
                     std::size_t featureIndex,
@@ -65792,6 +65853,159 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                     }
                 };
 
+            std::optional<std::size_t> removeFeatureIndex;
+            for (std::size_t featureIndex = 0U;
+                 featureIndex < run.features.size();
+                 ++featureIndex) {
+                auto& timeline = run.features[featureIndex];
+                ImGui::PushID(static_cast<int>(featureIndex));
+                const auto label =
+                    WaterKeyedFeatureDisplayLabel(
+                        *runtimeState,
+                        timeline.feature);
+                std::size_t keyCount = 0U;
+                for (const auto& setting : timeline.settings) {
+                    keyCount += setting.keys.size();
+                }
+                const auto hiddenIt = std::find(
+                    graphView.hiddenFeatures.begin(),
+                    graphView.hiddenFeatures.end(),
+                    timeline.feature);
+                bool visible = hiddenIt == graphView.hiddenFeatures.end();
+                if (ImGui::Checkbox("##Visible", &visible)) {
+                    if (visible) {
+                        graphView.hiddenFeatures.erase(hiddenIt);
+                    } else {
+                        graphView.hiddenFeatures.push_back(
+                            timeline.feature);
+                    }
+                }
+                DrawWaterSeepageParameterTooltip(
+                    "Show this feature on the timeline graph below.");
+                ImGui::SameLine();
+                ImGui::TextColored(
+                    ImGui::ColorConvertU32ToFloat4(
+                        featureBaseColour(featureIndex)),
+                    "%s — %zu key%s",
+                    label.c_str(),
+                    keyCount,
+                    keyCount == 1U ? "" : "s");
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Remove")) {
+                    removeFeatureIndex = featureIndex;
+                }
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(140.0F);
+                if (ImGui::BeginCombo("##MoveTo", "Move to...")) {
+                    for (std::size_t runIndex = 0U;
+                         runIndex < entry.waterFeatureTimingRuns.size();
+                         ++runIndex) {
+                        if (runIndex ==
+                            timings.selectedFeatureRunIndex.value()) {
+                            continue;
+                        }
+                        if (ImGui::Selectable(
+                                entry.waterFeatureTimingRuns[runIndex].name.c_str(),
+                                false)) {
+                            entry.waterFeatureTimingRuns[runIndex].features.push_back(
+                                timeline);
+                            removeFeatureIndex = featureIndex;
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                // Per-setting summary in the same colours as the graphs
+                // below: which settings are keyed, and how many keys each
+                // holds. Pin overlays a setting's curve on the Global
+                // Animation Position bar, read-only and always visible.
+                std::vector<WaterRunGraphSeries> splitSeries;
+                BuildWaterFeatureGraphSeries(timeline, &splitSeries);
+                std::vector<WaterRunGraphSeries> combinedSeries;
+                if (!timings.waterRunGraphSplit) {
+                    buildFeatureSeries(
+                        timeline,
+                        featureIndex,
+                        true,
+                        &combinedSeries);
+                }
+                const auto chipColour =
+                    [&](const WaterRunGraphSeries& series) -> ImU32 {
+                    if (timings.waterRunGraphSplit) {
+                        return series.colour;
+                    }
+                    for (const auto& candidate : combinedSeries) {
+                        if (candidate.settingId == series.settingId) {
+                            return candidate.colour;
+                        }
+                    }
+                    return series.colour;
+                };
+                ImGui::Indent(26.0F);
+                for (const auto& series : splitSeries) {
+                    if (series.track == nullptr ||
+                        !series.track->active ||
+                        series.track->keys.empty()) {
+                        continue;
+                    }
+                    ImGui::PushID(series.settingId.c_str());
+                    ImGui::TextColored(
+                        ImGui::ColorConvertU32ToFloat4(chipColour(series)),
+                        "%s — %zu key%s",
+                        series.label.c_str(),
+                        series.track->keys.size(),
+                        series.track->keys.size() == 1U ? "" : "s");
+                    ImGui::SameLine();
+                    auto& pins = timings.waterPinnedSettingOverlays;
+                    const auto pinIt = std::find_if(
+                        pins.begin(),
+                        pins.end(),
+                        [&](const auto& pin) {
+                            return pin.scenarioId == scenarioId &&
+                                   pin.feature == timeline.feature &&
+                                   pin.settingId == series.settingId;
+                        });
+                    const bool pinned = pinIt != pins.end();
+                    if (ImGui::SmallButton(pinned ? "Unpin" : "Pin")) {
+                        if (pinned) {
+                            pins.erase(pinIt);
+                        } else {
+                            pins.push_back({
+                                .scenarioId = scenarioId,
+                                .feature = timeline.feature,
+                                .settingId = series.settingId,
+                            });
+                        }
+                    }
+                    DrawWaterSeepageParameterTooltip(
+                        pinned
+                            ? "Remove this setting's overlay from the Global "
+                              "Animation Position bar."
+                            : "Overlay this setting's curve on the Global "
+                              "Animation Position bar — always visible on "
+                              "every tab, and read-only.");
+                    // The setting's curve style: every key left on
+                    // "Default (setting)" follows it, so one edit restyles
+                    // the whole track while overridden keys keep their own
+                    // mode.
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(190.0F);
+                    (void)DrawTimingInterpolationCombo(
+                        "##SettingDefaultInterpolation",
+                        &series.track->defaultInterpolation,
+                        /*includeSplineModes=*/true,
+                        /*includeTrackDefault=*/false);
+                    ImGui::PopID();
+                }
+                ImGui::Unindent(26.0F);
+                ImGui::PopID();
+            }
+            if (removeFeatureIndex.has_value()) {
+                run.features.erase(
+                    run.features.begin() +
+                    static_cast<std::ptrdiff_t>(removeFeatureIndex.value()));
+            }
+
+            // ---- Timeline graphs ----
             ImGui::SeparatorText("Timeline");
             if (ImGui::Checkbox(
                     "Split Graphs",
@@ -66412,6 +66626,8 @@ const char* TimingInterpolationLabel(
             return "Monotone Spline";
         case WaterScenarioInterpolation::CentripetalCatmullRom:
             return "Centripetal Catmull–Rom";
+        case WaterScenarioInterpolation::TrackDefault:
+            return "Default (setting)";
         case WaterScenarioInterpolation::Smooth:
             return "Smooth Step";
     }
@@ -66421,10 +66637,13 @@ const char* TimingInterpolationLabel(
 // includeSplineModes adds Monotone Spline and Centripetal Catmull–Rom —
 // pass it only where the underlying evaluator truly honours those curves
 // (water setting tracks); the colourise stop keys still ease per segment.
+// includeTrackDefault additionally offers "Default (setting)", which follows
+// the owning track's default style — setting-track keys only.
 bool DrawTimingInterpolationCombo(
     const char* label,
     invisible_places::water::WaterScenarioInterpolation* interpolation,
-    bool includeSplineModes = false) {
+    bool includeSplineModes = false,
+    bool includeTrackDefault = false) {
     if (interpolation == nullptr) {
         return false;
     }
@@ -66454,6 +66673,10 @@ bool DrawTimingInterpolationCombo(
                 ImGui::SetItemDefaultFocus();
             }
         };
+        if (includeTrackDefault) {
+            drawOption(WaterScenarioInterpolation::TrackDefault);
+            ImGui::Separator();
+        }
         for (const auto option : baseOptions) {
             drawOption(option);
         }
@@ -66466,7 +66689,8 @@ bool DrawTimingInterpolationCombo(
     }
     DrawTimingControlTooltip(
         includeSplineModes
-            ? "Interpolation from this key to the next: Smooth Step, Linear, "
+            ? "Interpolation from this key to the next: Default follows the "
+              "setting's own style from the run list; Smooth Step, Linear, "
               "or Hold ease this segment alone; Monotone Spline follows the "
               "neighbouring keys without overshoot and rests at reversals; "
               "Centripetal Catmull–Rom curves smoothly through the "
@@ -75375,6 +75599,172 @@ bool DrawAnimationTimelineViewRangeSelector(
 // here always repositions the camera (and every keyed water setting follows
 // the frame resolve), and the marker strip below shows the keys of the
 // feature the user is focused on in the Water tab.
+// Resolves the colour and value frame for one pinned setting the same way
+// BuildWaterFeatureGraphSeries does for the split run graphs, so a pinned
+// curve keeps the setting's colour from the Timings list and run graphs.
+struct PinnedWaterSettingSeries {
+    ImU32 colour = IM_COL32_WHITE;
+    float minimum = 0.0F;
+    float maximum = 1.0F;
+    const invisible_places::water::WaterKeyedSettingTrack* track = nullptr;
+};
+
+std::optional<PinnedWaterSettingSeries> ResolvePinnedWaterSettingSeries(
+    const invisible_places::water::WaterFeatureTimeline& timeline,
+    std::string_view settingId) {
+    const auto trackFor =
+        [&](std::string_view id)
+        -> const invisible_places::water::WaterKeyedSettingTrack* {
+        for (const auto& setting : timeline.settings) {
+            if (setting.settingId == id) {
+                return &setting;
+            }
+        }
+        return nullptr;
+    };
+    std::size_t settingIndex = 0U;
+    for (const auto& info :
+         invisible_places::water::WaterKeyableSettings(
+             timeline.feature.kind)) {
+        const auto* track = trackFor(info.id);
+        if (!info.showUnauthoredInTimeline && track == nullptr) {
+            continue;
+        }
+        if (settingId == info.id) {
+            return PinnedWaterSettingSeries{
+                .colour = kWaterKeyedSettingColours[
+                    settingIndex % kWaterKeyedSettingColours.size()],
+                .minimum = info.minimum,
+                .maximum = info.maximum,
+                .track = track,
+            };
+        }
+        ++settingIndex;
+    }
+    for (const auto& setting : timeline.settings) {
+        if (invisible_places::water::FindWaterKeyableSetting(
+                timeline.feature.kind,
+                setting.settingId) != nullptr) {
+            continue;
+        }
+        if (!setting.active || setting.keys.empty()) {
+            continue;
+        }
+        if (setting.settingId == settingId) {
+            float minimum = std::numeric_limits<float>::max();
+            float maximum = std::numeric_limits<float>::lowest();
+            for (const auto& key : setting.keys) {
+                minimum = std::min(minimum, key.value);
+                maximum = std::max(maximum, key.value);
+            }
+            const float magnitude =
+                std::max(std::abs(minimum), std::abs(maximum));
+            if (maximum - minimum <=
+                std::max(1.0e-6F, magnitude * 1.0e-6F)) {
+                const float padding = std::max(1.0e-3F, magnitude * 0.05F);
+                minimum -= padding;
+                maximum += padding;
+            }
+            return PinnedWaterSettingSeries{
+                .colour = kWaterKeyedSettingColours[
+                    settingIndex % kWaterKeyedSettingColours.size()],
+                .minimum = minimum,
+                .maximum = maximum,
+                .track = &setting,
+            };
+        }
+        ++settingIndex;
+    }
+    return std::nullopt;
+}
+
+// Read-only value curves for settings pinned from the Timings run list,
+// drawn over the Global Animation Position bar on every tab. Pure overlay:
+// the slider keeps every interaction, and a pin whose feature or keys are
+// gone simply draws nothing until they return.
+void DrawPinnedWaterSettingOverlays(
+    PreviewRuntimeState* runtimeState,
+    ImVec2 barMin,
+    ImVec2 barMax) {
+    const auto& pins =
+        runtimeState->timingsPanel.waterPinnedSettingOverlays;
+    if (pins.empty()) {
+        return;
+    }
+    const auto scenarioId = ActiveWaterTimingScenarioId(*runtimeState);
+    const auto* entry = FindScenarioFeatureRuns(
+        runtimeState->water,
+        scenarioId);
+    if (entry == nullptr) {
+        return;
+    }
+    const float barWidth = std::max(1.0F, barMax.x - barMin.x);
+    const float barHeight = std::max(1.0F, barMax.y - barMin.y);
+    auto* drawList = ImGui::GetWindowDrawList();
+    drawList->PushClipRect(barMin, barMax, true);
+    constexpr float kOverlayPad = 2.0F;
+    for (const auto& pin : pins) {
+        if (pin.scenarioId != scenarioId) {
+            continue;
+        }
+        const auto* run =
+            invisible_places::water::FindWaterFeatureRunContaining(
+                entry->waterFeatureTimingRuns,
+                pin.feature);
+        const auto* timeline =
+            invisible_places::water::FindWaterFeatureTimeline(
+                run,
+                pin.feature);
+        if (timeline == nullptr) {
+            continue;
+        }
+        const auto series =
+            ResolvePinnedWaterSettingSeries(*timeline, pin.settingId);
+        if (!series.has_value() || series->track == nullptr ||
+            series->track->keys.empty()) {
+            continue;
+        }
+        const float range =
+            std::max(1.0e-6F, series->maximum - series->minimum);
+        const auto pointAt = [&](float position01) {
+            const float value =
+                invisible_places::water::EvaluateWaterKeyedSettingTrack(
+                    *series->track,
+                    position01)
+                    .value_or(series->minimum);
+            const float normalized = std::clamp(
+                (value - series->minimum) / range,
+                0.0F,
+                1.0F);
+            return ImVec2{
+                barMin.x + barWidth * position01,
+                barMax.y - kOverlayPad -
+                    normalized * (barHeight - kOverlayPad * 2.0F)};
+        };
+        const int sampleCount = std::clamp(
+            static_cast<int>(barWidth / 2.0F),
+            32,
+            256);
+        const ImU32 colour =
+            (series->colour & 0x00FFFFFFU) | 0xD2000000U;
+        ImVec2 previous = pointAt(0.0F);
+        for (int sample = 1; sample <= sampleCount; ++sample) {
+            const ImVec2 current = pointAt(
+                static_cast<float>(sample) /
+                static_cast<float>(sampleCount));
+            drawList->AddLine(previous, current, colour, 1.5F);
+            previous = current;
+        }
+        for (const auto& key : series->track->keys) {
+            drawList->AddCircleFilled(
+                pointAt(std::clamp(key.position, 0.0F, 1.0F)),
+                2.0F,
+                colour);
+        }
+    }
+    drawList->PopClipRect();
+}
+
 void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
     auto& panel = runtimeState->animationPanel;
     if (!panel.currentPath.has_value()) {
@@ -75474,6 +75864,7 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
         panel.timelineViewRange,
         barMin,
         barMax);
+    DrawPinnedWaterSettingOverlays(runtimeState, barMin, barMax);
 
     const float scrubPosition = std::clamp(panel.scrubAmount, 0.0F, 1.0F);
     const auto relevantEffectKeyPositions =

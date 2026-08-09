@@ -54,6 +54,8 @@ bool IsValidInterpolation(
             return true;
         case WaterScenarioInterpolation::Linear:
         case WaterScenarioInterpolation::Hold:
+        // Setting-track-only sentinel; colourise keys never carry it.
+        case WaterScenarioInterpolation::TrackDefault:
             return false;
     }
     return false;
