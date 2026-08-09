@@ -1291,6 +1291,15 @@ struct OfflineRenderJobState {
     std::vector<invisible_places::camera::CameraState> frames;
     std::vector<invisible_places::output::OfflineRenderTile> tiles;
     std::uint32_t currentFrame = 0;
+    // Capture duration of each completed frame in seconds, appended as its
+    // samples finish. Drives the duration-column progress bar, the detail
+    // timing graph, and the trend-aware remaining-time estimate.
+    std::vector<float> frameRenderSeconds;
+    // When the first frame finished: the steady-pace elapsed rate measures
+    // from here so one-time setup (path masks, pipeline warm-up) cannot
+    // inflate the estimate.
+    std::optional<std::chrono::steady_clock::time_point>
+        firstFrameCompletedAt;
     OfflineRenderFrameSampleState frameSampleState{};
     std::uint32_t currentTile = 0;
     invisible_places::output::ExrImage image{};
@@ -30810,10 +30819,36 @@ std::optional<std::chrono::steady_clock::duration> AverageExportFrameRenderDurat
     return std::nullopt;
 }
 
+// Frames excluded from pace statistics and graph scaling: the first frames
+// carry pipeline warm-up and pre-queue capture bursts that say nothing
+// about the steady rendering pace.
+std::size_t ExportFrameTimingWarmupCount(std::size_t frameCount) {
+    return frameCount > 4U ? 2U : 0U;
+}
+
+// Robust graph ceiling: the 95th percentile of post-warm-up frame times
+// with headroom, so a single outlier frame cannot flatten every other
+// column to the baseline.
+float ExportFrameDurationDisplayCeiling(const std::vector<float>& durations) {
+    const std::size_t warmup = ExportFrameTimingWarmupCount(durations.size());
+    std::vector<float> usable(
+        durations.begin() + static_cast<std::ptrdiff_t>(warmup),
+        durations.end());
+    if (usable.empty()) {
+        usable = durations;
+    }
+    if (usable.empty()) {
+        return 1.0e-3F;
+    }
+    std::sort(usable.begin(), usable.end());
+    const float percentile = usable[static_cast<std::size_t>(
+        static_cast<double>(usable.size() - 1U) * 0.95)];
+    return std::max(1.0e-3F, percentile * 1.2F);
+}
+
 std::optional<std::chrono::steady_clock::duration> RemainingExportRenderDuration(
     const OfflineRenderJobState& job) {
-    const auto average = AverageExportFrameRenderDuration(job);
-    if (!average.has_value() || job.frames.empty()) {
+    if (job.frames.empty()) {
         return std::nullopt;
     }
     const double completedFrames =
@@ -30823,6 +30858,53 @@ std::optional<std::chrono::steady_clock::duration> RemainingExportRenderDuration
         ExportCurrentFrameSampleFraction(job);
     const double remainingFrames =
         std::max(0.0, static_cast<double>(job.frames.size()) - completedFrames);
+    const auto& durations = job.frameRenderSeconds;
+    if (durations.size() >= 5U) {
+        // Weighted recent pace: warm-up frames are ignored, and an
+        // exponential moving average (weighted over roughly the last sixty
+        // frames) follows drift without the jitter a fitted slope amplifies
+        // across thousands of remaining frames. An elapsed-rate floor,
+        // measured from the first completed frame so one-time setup cannot
+        // inflate it, keeps writer stalls and inter-frame overhead counted —
+        // that floor is what stops the estimate undershooting the final
+        // elapsed time.
+        const std::size_t warmup =
+            ExportFrameTimingWarmupCount(durations.size());
+        constexpr double kEmaAlpha = 2.0 / 61.0;
+        double weightedPace = 0.0;
+        bool seeded = false;
+        for (std::size_t index = warmup; index < durations.size(); ++index) {
+            const double value = durations[index];
+            if (!seeded) {
+                weightedPace = value;
+                seeded = true;
+            } else {
+                weightedPace += kEmaAlpha * (value - weightedPace);
+            }
+        }
+        const double paceRemaining =
+            seeded ? weightedPace * remainingFrames : 0.0;
+        double elapsedRemaining = 0.0;
+        if (job.firstFrameCompletedAt.has_value()) {
+            const double sinceFirstFrame =
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() -
+                    job.firstFrameCompletedAt.value())
+                    .count();
+            const double framesSinceFirst = completedFrames - 1.0;
+            if (framesSinceFirst > 0.5) {
+                elapsedRemaining =
+                    sinceFirstFrame / framesSinceFirst * remainingFrames;
+            }
+        }
+        return std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>{
+                std::max(paceRemaining, elapsedRemaining)});
+    }
+    const auto average = AverageExportFrameRenderDuration(job);
+    if (!average.has_value()) {
+        return std::nullopt;
+    }
     const double remainingSeconds =
         std::chrono::duration<double>(average.value()).count() * remainingFrames;
     return std::chrono::duration_cast<std::chrono::steady_clock::duration>(
@@ -36948,6 +37030,15 @@ void ProcessOfflineRenderJobStep(
         }
 
         RecordExportGpuCaptureDuration(&job, std::chrono::steady_clock::now() - sampleState.startedAt);
+        // Recorded regardless of the export-log path so the progress graphs
+        // and trend estimate work on every job.
+        job.frameRenderSeconds.push_back(
+            std::chrono::duration<float>(
+                std::chrono::steady_clock::now() - sampleState.startedAt)
+                .count());
+        if (!job.firstFrameCompletedAt.has_value()) {
+            job.firstFrameCompletedAt = std::chrono::steady_clock::now();
+        }
         SampleExportLogMemory(
             &job,
             ExportMemorySampleStage::FrameReady);
@@ -37949,6 +38040,321 @@ void DrawAnimationFramePreviewWindow(
     }
 }
 
+// The render-progress bar drawn as a per-frame duration graph: each
+// completed frame adds a column whose height is its capture time relative
+// to the slowest frame so far, so the fill itself shows pace changes.
+void DrawExportFrameDurationProgressBar(const OfflineRenderJobState& job) {
+    const float fraction = ExportRenderProgressFraction(job);
+    const ImVec2 size{
+        std::max(ImGui::GetContentRegionAvail().x, 60.0F),
+        ImGui::GetFrameHeight()};
+    ImGui::InvisibleButton("##ExportDurationProgress", size);
+    const ImVec2 minimum = ImGui::GetItemRectMin();
+    const ImVec2 maximum = ImGui::GetItemRectMax();
+    auto* drawList = ImGui::GetWindowDrawList();
+    const float rounding = ImGui::GetStyle().FrameRounding;
+    drawList->AddRectFilled(
+        minimum,
+        maximum,
+        ImGui::GetColorU32(ImGuiCol_FrameBg),
+        rounding);
+    const auto& durations = job.frameRenderSeconds;
+    const std::size_t totalFrames = std::max<std::size_t>(job.frames.size(), 1U);
+    const float width = std::max(1.0F, maximum.x - minimum.x);
+    const float height = std::max(1.0F, maximum.y - minimum.y);
+    // Robust ceiling: warm-up outliers clip at the top instead of squashing
+    // every steady frame to the baseline.
+    const float ceiling = ExportFrameDurationDisplayCeiling(durations);
+    const ImU32 fill = ImGui::GetColorU32(ImGuiCol_PlotHistogram);
+    if (!durations.empty()) {
+        const int pixelCount = static_cast<int>(width);
+        for (int pixel = 0; pixel < pixelCount; ++pixel) {
+            const auto frameBegin = static_cast<std::size_t>(
+                static_cast<double>(pixel) / width *
+                static_cast<double>(totalFrames));
+            auto frameEnd = static_cast<std::size_t>(
+                static_cast<double>(pixel + 1) / width *
+                static_cast<double>(totalFrames));
+            frameEnd = std::max(frameEnd, frameBegin + 1U);
+            float bucketSeconds = 0.0F;
+            bool bucketHasFrame = false;
+            for (std::size_t frame = frameBegin;
+                 frame < std::min(frameEnd, durations.size());
+                 ++frame) {
+                bucketSeconds = std::max(bucketSeconds, durations[frame]);
+                bucketHasFrame = true;
+            }
+            if (!bucketHasFrame) {
+                continue;
+            }
+            // The floor keeps fast frames visible so the bar still reads as
+            // filled progress.
+            const float normalized =
+                std::clamp(bucketSeconds / ceiling, 0.10F, 1.0F);
+            const float columnTop =
+                maximum.y - 1.0F - normalized * (height - 2.0F);
+            drawList->AddRectFilled(
+                ImVec2{minimum.x + static_cast<float>(pixel), columnTop},
+                ImVec2{
+                    minimum.x + static_cast<float>(pixel) + 1.0F,
+                    maximum.y - 1.0F},
+                fill);
+        }
+    }
+    // Dim sliver for the frame currently rendering, at the last frame's
+    // height, growing with its sample progress.
+    if (durations.size() < totalFrames) {
+        const auto partial =
+            static_cast<float>(ExportCurrentFrameSampleFraction(job));
+        if (partial > 0.0F) {
+            const float frameWidth =
+                width / static_cast<float>(totalFrames);
+            const float xBegin =
+                minimum.x +
+                frameWidth * static_cast<float>(durations.size());
+            const float recent =
+                durations.empty()
+                    ? 0.6F
+                    : std::clamp(durations.back() / ceiling, 0.10F, 1.0F);
+            const float columnTop =
+                maximum.y - 1.0F - recent * (height - 2.0F);
+            drawList->AddRectFilled(
+                ImVec2{xBegin, columnTop},
+                ImVec2{
+                    xBegin + std::max(1.0F, frameWidth * partial),
+                    maximum.y - 1.0F},
+                (fill & 0x00FFFFFFU) | 0x50000000U);
+        }
+    }
+    drawList->AddRect(
+        minimum,
+        maximum,
+        ImGui::GetColorU32(ImGuiCol_Border),
+        rounding);
+    const std::string overlay = FormatFixed(fraction * 100.0F, 0) + "%";
+    const ImVec2 textSize = ImGui::CalcTextSize(overlay.c_str());
+    drawList->AddText(
+        ImVec2{
+            minimum.x + (width - textSize.x) * 0.5F,
+            minimum.y + (height - textSize.y) * 0.5F},
+        ImGui::GetColorU32(ImGuiCol_Text),
+        overlay.c_str());
+}
+
+// Detailed per-frame timing graph under the elapsed time: duration columns
+// with overall and recent-average guides, the extremes, and the pace trend,
+// so a slowdown is visible long before it lands in the estimate.
+void DrawExportRenderTimingDetail(const OfflineRenderJobState& job) {
+    const auto& durations = job.frameRenderSeconds;
+    if (durations.empty()) {
+        ImGui::TextDisabled(
+            "Per-frame timing appears after the first captured frame.");
+        return;
+    }
+    const auto formatSeconds = [](double seconds) -> std::string {
+        if (seconds < 1.0) {
+            return std::to_string(
+                       static_cast<int>(std::lround(seconds * 1000.0))) +
+                   " ms";
+        }
+        if (seconds < 60.0) {
+            return FormatFixed(seconds, 2) + " s";
+        }
+        return FormatAdaptiveDuration(
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::duration<double>{seconds}));
+    };
+    // Warm-up frames are excluded from every statistic: the first frames
+    // carry pipeline warm-up and pre-queue bursts that would otherwise
+    // dominate the extremes and the averages.
+    const std::size_t warmup =
+        ExportFrameTimingWarmupCount(durations.size());
+    const std::size_t usableCount = durations.size() - warmup;
+    float minSeconds = std::numeric_limits<float>::max();
+    float maxSeconds = 0.0F;
+    std::size_t minFrame = warmup;
+    std::size_t maxFrame = warmup;
+    double totalSeconds = 0.0;
+    for (std::size_t frame = warmup; frame < durations.size(); ++frame) {
+        const float seconds = durations[frame];
+        if (seconds < minSeconds) {
+            minSeconds = seconds;
+            minFrame = frame;
+        }
+        if (seconds > maxSeconds) {
+            maxSeconds = seconds;
+            maxFrame = frame;
+        }
+        totalSeconds += seconds;
+    }
+    const double overallAverage =
+        totalSeconds / static_cast<double>(std::max<std::size_t>(1U, usableCount));
+    const std::size_t recentCount =
+        std::min<std::size_t>(20U, usableCount == 0U ? durations.size() : usableCount);
+    double recentSum = 0.0;
+    for (std::size_t index = durations.size() - recentCount;
+         index < durations.size();
+         ++index) {
+        recentSum += durations[index];
+    }
+    const double recentAverage =
+        recentSum / static_cast<double>(recentCount);
+
+    const ImVec2 size{
+        std::max(ImGui::GetContentRegionAvail().x, 120.0F),
+        64.0F};
+    ImGui::InvisibleButton("##ExportTimingDetailGraph", size);
+    const bool hovered = ImGui::IsItemHovered();
+    const ImVec2 minimum = ImGui::GetItemRectMin();
+    const ImVec2 maximum = ImGui::GetItemRectMax();
+    auto* drawList = ImGui::GetWindowDrawList();
+    drawList->AddRectFilled(
+        minimum,
+        maximum,
+        ImGui::GetColorU32(ImGuiCol_FrameBg));
+    const float width = std::max(1.0F, maximum.x - minimum.x);
+    const float height = std::max(1.0F, maximum.y - minimum.y);
+    const std::size_t totalFrames = std::max<std::size_t>(job.frames.size(), 1U);
+    // Robust ceiling: warm-up outliers clip at the top of the graph rather
+    // than compressing the steady frames' fluctuations into a flat line.
+    const float ceiling = ExportFrameDurationDisplayCeiling(durations);
+    const auto valueToY = [&](double seconds) {
+        const float normalized = std::clamp(
+            static_cast<float>(seconds) / ceiling,
+            0.0F,
+            1.0F);
+        return maximum.y - 1.0F - normalized * (height - 2.0F);
+    };
+    const ImU32 columnColour =
+        (ImGui::GetColorU32(ImGuiCol_PlotHistogram) & 0x00FFFFFFU) |
+        0x58000000U;
+    const ImU32 lineColour = ImGui::GetColorU32(ImGuiCol_PlotLines);
+    const int pixelCount = static_cast<int>(width);
+    std::optional<ImVec2> previousPoint;
+    for (int pixel = 0; pixel < pixelCount; ++pixel) {
+        const auto frameBegin = static_cast<std::size_t>(
+            static_cast<double>(pixel) / width *
+            static_cast<double>(totalFrames));
+        auto frameEnd = static_cast<std::size_t>(
+            static_cast<double>(pixel + 1) / width *
+            static_cast<double>(totalFrames));
+        frameEnd = std::max(frameEnd, frameBegin + 1U);
+        float bucketMax = 0.0F;
+        double bucketSum = 0.0;
+        std::size_t bucketCount = 0U;
+        for (std::size_t frame = frameBegin;
+             frame < std::min(frameEnd, durations.size());
+             ++frame) {
+            bucketMax = std::max(bucketMax, durations[frame]);
+            bucketSum += durations[frame];
+            ++bucketCount;
+        }
+        if (bucketCount == 0U) {
+            previousPoint.reset();
+            continue;
+        }
+        const float x = minimum.x + static_cast<float>(pixel);
+        drawList->AddRectFilled(
+            ImVec2{x, valueToY(bucketMax)},
+            ImVec2{x + 1.0F, maximum.y - 1.0F},
+            columnColour);
+        const ImVec2 meanPoint{
+            x,
+            valueToY(bucketSum / static_cast<double>(bucketCount))};
+        if (previousPoint.has_value()) {
+            drawList->AddLine(previousPoint.value(), meanPoint, lineColour, 1.0F);
+        }
+        previousPoint = meanPoint;
+    }
+    // Average guides: overall in muted text colour, recent pace in the
+    // hovered-plot accent.
+    const ImU32 overallColour =
+        (ImGui::GetColorU32(ImGuiCol_TextDisabled) & 0x00FFFFFFU) |
+        0xA0000000U;
+    const ImU32 recentColour =
+        ImGui::GetColorU32(ImGuiCol_PlotLinesHovered);
+    const float overallY = valueToY(overallAverage);
+    drawList->AddLine(
+        ImVec2{minimum.x, overallY},
+        ImVec2{maximum.x, overallY},
+        overallColour,
+        1.0F);
+    const float recentY = valueToY(recentAverage);
+    drawList->AddLine(
+        ImVec2{minimum.x, recentY},
+        ImVec2{maximum.x, recentY},
+        recentColour,
+        1.0F);
+    drawList->AddRect(
+        minimum,
+        maximum,
+        ImGui::GetColorU32(ImGuiCol_Border));
+    if (hovered) {
+        const float mouseX = ImGui::GetIO().MousePos.x;
+        const auto frame = static_cast<std::size_t>(std::clamp(
+            (mouseX - minimum.x) / width *
+                static_cast<float>(totalFrames),
+            0.0F,
+            static_cast<float>(totalFrames - 1U)));
+        if (frame < durations.size()) {
+            const double deviation =
+                overallAverage > 1.0e-9
+                    ? (durations[frame] / overallAverage - 1.0) * 100.0
+                    : 0.0;
+            ImGui::SetTooltip(
+                "Frame %zu: %s (%+.0f%% vs average)",
+                frame + 1U,
+                formatSeconds(durations[frame]).c_str(),
+                deviation);
+        }
+    }
+
+    ImGui::Text(
+        "Last %s  |  Recent avg (%zu) %s  |  Overall avg %s",
+        formatSeconds(durations.back()).c_str(),
+        recentCount,
+        formatSeconds(recentAverage).c_str(),
+        formatSeconds(overallAverage).c_str());
+    if (usableCount > 0U) {
+        ImGui::Text(
+            "Fastest %s (frame %zu)  |  Slowest %s (frame %zu)",
+            formatSeconds(minSeconds).c_str(),
+            minFrame + 1U,
+            formatSeconds(maxSeconds).c_str(),
+            maxFrame + 1U);
+    }
+    if (warmup > 0U) {
+        ImGui::TextDisabled(
+            "First %zu warm-up frame%s excluded from statistics and scale.",
+            warmup,
+            warmup == 1U ? "" : "s");
+    }
+    const double trendPercent =
+        overallAverage > 1.0e-9
+            ? (recentAverage / overallAverage - 1.0) * 100.0
+            : 0.0;
+    if (durations.size() < 5U) {
+        ImGui::TextDisabled("Trend: gathering frames...");
+    } else if (std::abs(trendPercent) < 3.0) {
+        ImGui::TextUnformatted("Trend: holding steady.");
+    } else if (trendPercent > 0.0) {
+        ImGui::Text(
+            "Trend: slowing down - recent frames %.0f%% over the overall average.",
+            trendPercent);
+    } else {
+        ImGui::Text(
+            "Trend: speeding up - recent frames %.0f%% under the overall average.",
+            -trendPercent);
+    }
+    const auto remaining = RemainingExportRenderDuration(job);
+    if (remaining.has_value()) {
+        ImGui::Text(
+            "Remaining (trend-aware): %s (~%s)",
+            FormatAdaptiveDuration(remaining.value()).c_str(),
+            FormatEtaClock(remaining.value()).c_str());
+    }
+}
+
 void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
     if (runtimeState == nullptr || !runtimeState->offlineRenderJob.active) {
         return;
@@ -38016,8 +38422,12 @@ void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
             ImGui::TextWrapped("Layer: %s", currentLayerName.c_str());
         }
     } else {
-        const float frameProgress = ExportRenderProgressFraction(job);
-        ImGui::ProgressBar(frameProgress, ImVec2{-FLT_MIN, 0.0F});
+        DrawExportFrameDurationProgressBar(job);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Each column is one rendered frame; its height is the "
+                "frame's render time relative to the slowest frame so far.");
+        }
         ImGui::Text(
             "Captured: %u / %zu",
             std::min<std::uint32_t>(job.currentFrame, static_cast<std::uint32_t>(job.frames.size())),
@@ -38065,6 +38475,8 @@ void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
     ImGui::Text(
         "Elapsed: %s",
         FormatElapsedTime(std::chrono::steady_clock::now() - job.startedAt).c_str());
+    ImGui::SeparatorText("Frame Timing");
+    DrawExportRenderTimingDetail(job);
 
     if (ImGui::CollapsingHeader(
             "Frozen Render Setup",
