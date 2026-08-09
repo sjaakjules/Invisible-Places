@@ -2193,6 +2193,10 @@ float SeepageConnectedSupportMask(
                           reverseFrontRun - reverseFrontFeather),
                       reverseFrontRun,
                       run);
+        // Intensity builds with the reveal instead of saturating behind the
+        // front (CPU parity: EvaluateConnectedSeepageLiveMask), reaching one
+        // exactly when the front meets the node.
+        budgetMask *= smoothstep(0.0, 1.0, routeProgress);
 
         const float nodewardStation = clamp(
             1.0 - run / upstreamExtent,
@@ -2283,9 +2287,19 @@ float SeepageConnectedSupportMask(
     const bool upstreamReachedNode =
         upstreamLeadFraction <= 0.0 ||
         sequenceProgress + 1e-6 >= upstreamLeadFraction;
+    // The below-node source disk eases in after the upstream front arrives
+    // (CPU parity: EvaluateConnectedSeepageLiveMask) instead of switching on
+    // in a single step at the release strength.
+    const float releaseEase =
+        upstreamLeadFraction > 0.0
+            ? smoothstep(
+                  upstreamLeadFraction,
+                  upstreamLeadFraction * 1.5,
+                  sequenceProgress)
+            : smoothstep(0.0, 0.04, sequenceProgress);
     const float releasedSourceMask =
         !upstream && upstreamReachedNode
-            ? sourceMask
+            ? sourceMask * releaseEase
             : 0.0;
     const float coreMask = clamp(
         max(releasedSourceMask, budgetMask * widthMask),

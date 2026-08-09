@@ -10470,6 +10470,11 @@ ConnectedSeepageLiveMask EvaluateConnectedSeepageLiveMask(
                           reverseFrontRun - reverseFrontFeather),
                       reverseFrontRun,
                       run);
+        // Intensity builds with the reveal instead of saturating behind the
+        // front, so low Strength no longer pops the whole upstream support
+        // to full brightness; it reaches one exactly when the front meets
+        // the node and stays there afterwards.
+        budgetMask *= SmoothStep(0.0F, 1.0F, routeProgress);
 
         const float nodewardStation = Clamp01(
             1.0F - run / upstreamExtent);
@@ -10565,9 +10570,19 @@ ConnectedSeepageLiveMask EvaluateConnectedSeepageLiveMask(
     const bool upstreamReachedNode =
         upstreamLeadFraction <= 0.0F ||
         sequenceProgress + 1.0e-6F >= upstreamLeadFraction;
+    // The below-node half of the source disk eases in over the next half of
+    // the lead range once the upstream front arrives, instead of switching
+    // on in a single step at the release strength.
+    const float releaseEase =
+        upstreamLeadFraction > 0.0F
+            ? SmoothStep(
+                  upstreamLeadFraction,
+                  upstreamLeadFraction * 1.5F,
+                  sequenceProgress)
+            : SmoothStep(0.0F, 0.04F, sequenceProgress);
     const float releasedSourceMask =
         !upstream && upstreamReachedNode
-            ? sourceMask
+            ? sourceMask * releaseEase
             : 0.0F;
     result.mask = Clamp01(std::max(
         releasedSourceMask,

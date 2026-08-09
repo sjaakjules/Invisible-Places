@@ -4071,19 +4071,31 @@ TEST_CASE("Connected Seepage reveals its highest wick back to the node before re
                 cell);
         };
 
-    // The old node-outward reveal produced the opposite ordering here.
-    CHECK(maskAtStrength(0.02F, highestUpstream) > 0.90F);
+    // The old node-outward reveal produced the opposite ordering here. The
+    // reveal also builds intensity with its progress instead of saturating
+    // behind the front, so early-phase cells are present-but-dim and reach
+    // full brightness exactly when the front meets the node.
+    CHECK(maskAtStrength(0.02F, highestUpstream) > 0.02F);
+    CHECK(maskAtStrength(0.02F, highestUpstream) < 0.30F);
     CHECK(maskAtStrength(0.02F, middleUpstream) < 1.0e-4F);
     CHECK(maskAtStrength(0.02F, nodewardUpstream) < 1.0e-4F);
     CHECK(maskAtStrength(0.02F, sourceDownstream) < 1.0e-4F);
 
-    CHECK(maskAtStrength(0.11F, highestUpstream) > 0.90F);
-    CHECK(maskAtStrength(0.11F, middleUpstream) > 0.90F);
+    CHECK(maskAtStrength(0.11F, highestUpstream) > 0.70F);
+    CHECK(maskAtStrength(0.11F, middleUpstream) > 0.70F);
+    CHECK(maskAtStrength(0.11F, middleUpstream) < 0.95F);
+    CHECK(
+        maskAtStrength(0.11F, highestUpstream) >
+        maskAtStrength(0.02F, highestUpstream));
     CHECK(maskAtStrength(0.11F, nodewardUpstream) < 1.0e-4F);
     CHECK(maskAtStrength(0.11F, sourceDownstream) < 1.0e-4F);
 
     CHECK(maskAtStrength(0.15F, nodewardUpstream) > 0.90F);
-    CHECK(maskAtStrength(0.15F, sourceDownstream) > 0.90F);
+    // The below-node source disk eases in after the front arrives instead of
+    // switching on in one step at the release strength.
+    CHECK(maskAtStrength(0.15F, sourceDownstream) > 0.0F);
+    CHECK(maskAtStrength(0.15F, sourceDownstream) < 0.30F);
+    CHECK(maskAtStrength(0.22F, sourceDownstream) > 0.90F);
     CHECK(maskAtStrength(0.15F, firstRouteDownstream) < 1.0e-4F);
     CHECK(maskAtStrength(0.21F, firstRouteDownstream) > 0.90F);
 }
@@ -4171,10 +4183,13 @@ TEST_CASE("Connected Seepage recentres a winding upstream route without widening
 
     CHECK(highSpine->crossContourMeters < 0.001F);
     CHECK(highBranch->crossContourMeters > 0.065F);
+    // At this early reveal progress the centreline tip is dim (intensity
+    // builds with the reveal) but decisively present, while the same-station
+    // branch stays excluded by the centreline width.
     CHECK(EvaluateWaterSeepageSupportCellMask(
               grid.nodes.front(),
               *highSpine) >
-          0.90F);
+          0.02F);
     CHECK(EvaluateWaterSeepageSupportCellMask(
               grid.nodes.front(),
               *highBranch) <
