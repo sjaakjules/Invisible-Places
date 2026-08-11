@@ -250,6 +250,48 @@ whether the view sits forward, perpendicular, or backward relative to travel
 without moving the partner. Keys outside the overlap have no counterpart and
 cannot run this alignment.
 
+For paired slow pans that need more material beneath both wipes,
+**Extend Both Seams…** opens a guided Matching-Frame assistant while A remains
+the active animation. No velocity alignment has to exist first: A-start against
+B-end and B-start against A-end are treated as the two already-authored 50%
+blend poses. For each seam the user marks an ordered triangle—the main feature,
+a point along the pan, and a ground point towards the camera—on both endpoint
+views, then scrubs inward from the source start to choose how much motion should
+continue beyond the partner's current end. The selected triangle remains
+editable before fitting: any node can be selected, re-raycast from either live
+view, or moved with the world-axis gizmo.
+
+The fit first makes a small localized correction to each existing destination
+terminal so its triangle overlays the opposite source-start triangle. It then
+tracks the source feature's signed pixel translation, in-plane rotation, and
+perspective scale through the chosen inward span and copies that motion into an
+outward partner tail. A simple span appends two unlinked keys; a span crossing
+an authored key or screen-motion inflection appends three. The added frame
+duration equals the selected source span, so the bulk pan speed and every old
+key time remain unchanged. The exact base-spline continuation preserves all
+samples through the penultimate key; only the old final segment and generated
+tail may change.
+
+A Preview can isolate A, B, or their overlay, inspect the extended timeline
+bands and residuals, and compare baseline/candidate poses. Nothing enters the
+animation registry until **Apply Both** creates paired `_Edited` paths and the
+reciprocal blend metadata. Back, Cancel, and Escape discard the private
+candidates and restore the launch camera, playhead, pivot, and matching ghost.
+
+Camera duration grows on the same 30 fps timebase. Every normalized timing,
+water, and visual-effect key or finite activation boundary is rescaled by the
+old-to-new frame-count ratio, so its marker and keyed event remain at the same
+absolute frame. A full-range activation end remains a through-animation-end
+sentinel. Added tails naturally hold the last keyed values, but procedural
+waves, rain, trails, and other motion use a separate effect clock rather than
+the camera-path position. They keep advancing from steady elapsed time in live
+view even while the camera is paused; offline renders instead sample them from
+the full deterministic output frame/subframe time. Explicit export start/end
+frames remain unchanged; an end frame of zero still means the complete,
+now-extended animation. The four reciprocal overlap extents and project link
+mirror update with the paths, and A, B, and the project retain one atomic
+save/discard dependency.
+
 ### Animation versioning
 Every registered animation keeps its last saved, disk-backed version plus at
 most one explicit in-memory `_Edited` version. Authoring, linked-camera edits,

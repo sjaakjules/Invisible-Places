@@ -77,6 +77,13 @@ struct AnimationLocalizedKeyCorrection {
     std::string keyId;
     std::array<float, 3> splineCameraPosition{0.0F, 0.0F, 0.0F};
     std::array<float, 3> splineFocusPoint{0.0F, 0.0F, 0.0F};
+    // Optional d(correction)/dt values in world units per second. Legacy
+    // records derive their tangent from adjacent corrections. Materialized
+    // tangents make a correction independent of later terminal-key appends.
+    bool hasCameraCorrectionTangent = false;
+    std::array<float, 3> cameraCorrectionTangent{0.0F, 0.0F, 0.0F};
+    bool hasFocusCorrectionTangent = false;
+    std::array<float, 3> focusCorrectionTangent{0.0F, 0.0F, 0.0F};
 };
 
 struct AnimationVelocityBlendLinkMetadata {
@@ -101,9 +108,14 @@ struct AnimationVelocityBlendLinkMetadata {
 struct AnimationPath {
     // Original file schema retained only for application-level migration
     // bookkeeping. Serialization always writes the current schema.
-    std::uint32_t sourceSchemaVersion = 21U;
+    std::uint32_t sourceSchemaVersion = 22U;
     std::string name = "Animation";
     std::uint32_t durationFrames = 180;
+    // Deprecated schema-22 migration marker. A nonzero value identifies the
+    // old frame domain of unscaled timing/water positions written by the
+    // initial reciprocal-extension implementation. Extension/migration
+    // physically retimes those positions and clears this back to zero.
+    std::uint32_t authoredTrackDurationFrames = 0U;
     // Zero means a legacy/unset preference. Newly authored animations
     // capture the live application window and request it again when loaded.
     std::uint32_t defaultLiveViewWindowWidth = 0U;
@@ -292,6 +304,87 @@ struct AnimationCameraSpatialSmoothingResult {
     float afterXVelocityDeviation = 0.0F;
     std::size_t beforeRotationDirectionChanges = 0U;
     std::size_t afterRotationDirectionChanges = 0U;
+    std::string errorMessage;
+};
+
+// A stable, ordered world-space triangle observed while authoring a pan
+// extension. Point zero is the anchor; points one and two preserve user node
+// identity and winding while constraining projected translation, rotation,
+// scale, shear, and perspective.
+struct AnimationSurfacePatchObservation {
+    std::uint32_t pointCount = 0U;
+    std::array<std::array<float, 3>, 3> worldPoints{};
+};
+
+// The source motion from frame zero through sourceTailFrame is appended to
+// the other animation. The two ordered three-point observations describe
+// corresponding geometry at the source seam and destination terminal seam.
+struct AnimationTerminalExtensionSpec {
+    // The source path always begins at frame zero, which is the existing 50%
+    // seam against the destination's current terminal frame. This later
+    // source frame defines the length and motion of the appended tail.
+    std::uint32_t sourceTailFrame = 0U;
+    AnimationSurfacePatchObservation sourcePatch{};
+    AnimationSurfacePatchObservation destinationEndPatch{};
+};
+
+struct AnimationReciprocalPanExtensionOptions {
+    // firstDrivesSecond appends the observed first-path motion to second.
+    // secondDrivesFirst performs the reciprocal append to first.
+    AnimationTerminalExtensionSpec firstDrivesSecond{};
+    AnimationTerminalExtensionSpec secondDrivesFirst{};
+    float aspectRatio = 16.0F / 9.0F;
+    std::uint32_t sampleCount = 17U;
+    std::uint32_t optimizationSweeps = 24U;
+};
+
+struct AnimationReciprocalPanExtensionMetrics {
+    // Array order is first candidate, then second candidate.
+    std::array<std::uint32_t, 2> extensionFrames{};
+    std::array<std::uint32_t, 2> appendedKeyCount{};
+    std::array<std::size_t, 2> sourceInteriorKeyCount{};
+    std::array<std::size_t, 2> sourceInflectionCount{};
+    std::array<bool, 2> rotationConstrained{};
+    std::array<float, 2> beforeVelocityRmsScreenHeightsPerSecond{};
+    std::array<float, 2> afterVelocityRmsScreenHeightsPerSecond{};
+    std::array<float, 2> beforeRotationRmsDegreesPerSecond{};
+    std::array<float, 2> afterRotationRmsDegreesPerSecond{};
+    std::array<float, 2> anchorOverlayRmsScreenHeights{};
+    std::array<float, 2> anchorOverlayMaxScreenHeights{};
+    std::array<float, 2> patchNodeOverlayRmsScreenHeights{};
+    std::array<float, 2> patchNodeOverlayMaxScreenHeights{};
+    std::array<std::array<float, 2>, 2>
+        signedVelocityResidualScreenHeightsPerSecond{};
+    std::array<float, 2> rotationRateResidualDegreesPerSecond{};
+    std::array<float, 2> perspectiveScaleResidualPercent{};
+    std::array<float, 2> patchConfidence{};
+    std::array<std::string, 2> patchDiagnostic{};
+    std::array<float, 2> maxPrefixPositionError{};
+    std::array<float, 2> formerTerminalCameraMove{};
+    std::array<float, 2> formerTerminalFocusMove{};
+};
+
+struct AnimationReciprocalPanExtensionResult {
+    bool succeeded = false;
+    bool changed = false;
+    AnimationPath firstCandidate{};
+    AnimationPath secondCandidate{};
+    AnimationReciprocalPanExtensionMetrics metrics{};
+    std::string errorMessage;
+};
+
+// Conservative, pair-wide clip normalization used before reciprocal pan
+// fitting. Candidate copies retain every authored pose, timing, lens value,
+// and metadata field except near/far clipping. The smallest valid near plane
+// and largest valid far plane preserve the union of both paths' visibility.
+struct AnimationClipPlaneNormalizationResult {
+    bool succeeded = false;
+    bool changed = false;
+    float nearPlane = 0.0F;
+    float farPlane = 0.0F;
+    AnimationPath firstCandidate{};
+    AnimationPath secondCandidate{};
+    std::vector<std::string> linkedCameraIds;
     std::string errorMessage;
 };
 
@@ -556,6 +649,20 @@ OptimizeAnimationCameraKeysForSmoothRotation(
 [[nodiscard]] float AnimationPathKeyNormalizedPosition(
     const AnimationPath& path,
     std::size_t keyIndex);
+
+// Builds both terminal extensions from immutable A/B snapshots. The returned
+// candidates are atomic: failure returns neither partially extended path.
+// The current implementation accepts target-driven, fixed-lens paths only.
+[[nodiscard]] AnimationReciprocalPanExtensionResult
+BuildAnimationReciprocalPanExtension(
+    const AnimationPath& first,
+    const AnimationPath& second,
+    const AnimationReciprocalPanExtensionOptions& options = {});
+
+[[nodiscard]] AnimationClipPlaneNormalizationResult
+BuildConservativeAnimationClipPlaneNormalization(
+    const AnimationPath& first,
+    const AnimationPath& second);
 
 // Jointly adjusts the explicitly selected camera/focus keys of two paths
 // (or endpoints for legacy callers). durationFrames and every per-key

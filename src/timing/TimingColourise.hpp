@@ -437,6 +437,16 @@ SanitizeTimingColourisePaletteDefinition(
     TimingTakeDefinition definition);
 [[nodiscard]] TimingTakeSceneState SanitizeTimingTakeSceneState(
     TimingTakeSceneState state);
+// Moves every animation-time coordinate owned by one Timing Take scene from
+// sourceDurationFrames onto destinationDurationFrames while preserving its
+// absolute 30 fps frame. A terminal activation end of exactly one remains a
+// "through animation end" sentinel so a full-range effect stays active in an
+// appended camera tail. Returns false without mutation for an invalid state
+// pointer or zero duration.
+[[nodiscard]] bool RetimeTimingTakeSceneStateNormalizedPositions(
+    TimingTakeSceneState* state,
+    std::uint32_t sourceDurationFrames,
+    std::uint32_t destinationDurationFrames);
 // Upserts the live bounds authoring (base bounds, key mode, both key
 // vectors, edited flag) into the effect's per-selector memory under its
 // current field selector.

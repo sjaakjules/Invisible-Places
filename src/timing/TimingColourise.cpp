@@ -2190,6 +2190,65 @@ TimingTakeSceneState SanitizeTimingTakeSceneState(
     return state;
 }
 
+bool RetimeTimingTakeSceneStateNormalizedPositions(
+    TimingTakeSceneState* state,
+    std::uint32_t sourceDurationFrames,
+    std::uint32_t destinationDurationFrames) {
+    if (state == nullptr || sourceDurationFrames == 0U ||
+        destinationDurationFrames == 0U) {
+        return false;
+    }
+
+    const double scale =
+        static_cast<double>(sourceDurationFrames) /
+        static_cast<double>(destinationDurationFrames);
+    const auto retimePosition = [scale](float position) {
+        const double finitePosition = std::isfinite(position)
+                                          ? static_cast<double>(position)
+                                          : 0.0;
+        return static_cast<float>(std::clamp(
+            finitePosition * scale,
+            0.0,
+            1.0));
+    };
+    const auto retimeKeys = [&](auto* keys) {
+        for (auto& key : *keys) {
+            key.position = retimePosition(key.position);
+        }
+    };
+
+    for (auto& run : state->waterFeatureTimingRuns) {
+        for (auto& feature : run.features) {
+            for (auto& setting : feature.settings) {
+                retimeKeys(&setting.keys);
+            }
+        }
+    }
+
+    for (auto& effect : state->colouriseEffects) {
+        effect.activationRange = SanitizeTimingColouriseActivationRange(
+            effect.activationRange);
+        const bool extendsThroughAnimationEnd =
+            effect.activationRange.end == 1.0F;
+        effect.activationRange.start =
+            retimePosition(effect.activationRange.start);
+        effect.activationRange.end = extendsThroughAnimationEnd
+                                         ? 1.0F
+                                         : retimePosition(
+                                               effect.activationRange.end);
+        retimeKeys(&effect.effectParameterKeys);
+        retimeKeys(&effect.paletteKeys);
+        retimeKeys(&effect.paletteStopParameterKeys);
+        retimeKeys(&effect.boundsParameterKeys);
+        retimeKeys(&effect.boundsKeys);
+        for (auto& memory : effect.fieldBoundsMemory) {
+            retimeKeys(&memory.boundsParameterKeys);
+            retimeKeys(&memory.boundsKeys);
+        }
+    }
+    return true;
+}
+
 void StashTimingColouriseFieldBounds(TimingColouriseEffect* effect) {
     if (effect == nullptr) {
         return;

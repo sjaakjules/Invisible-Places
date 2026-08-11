@@ -116,6 +116,60 @@ pose. Focus shall use the first stable point-cloud hit along the live view ray,
 falling back to the selected key's previous camera-to-focus distance when the
 ray misses.
 
+#### FR-CAM-11
+Matching-Frame Key Alignment shall provide an **Extend Both Seams** assistant
+for two target-driven, fixed-lens animations that share a CPU-ready point-cloud
+scene. The animations need not already have velocity-blend metadata; their
+crossed endpoints are treated as the two existing 50%-blend seam poses.
+
+#### FR-CAM-12
+The assistant shall collect ordered three-point correspondences for A-start
+against B-end and B-start against A-end, then let the user select a later source
+frame inside A and B. It shall align each existing destination end to the
+opposite source start and constrain signed screen X/Y velocity, in-plane patch
+rotation, overlay position, and perspective scale on the 30 fps animation
+timebase.
+
+#### FR-CAM-13
+Each successful reciprocal extension shall append, to each destination
+animation, two unlinked terminal keys for a simple source span, or three when
+the span crosses an authored key or screen-motion inflection. It may align the
+former terminal pose and change only the former final segment plus the new
+tail. Every older key frame and every camera/focus/lens sample through the
+penultimate key shall remain unchanged.
+
+#### FR-CAM-14
+Extension candidates shall remain immutable and outside the animation registry
+until Preview. Apply shall create both paired `_Edited` paths atomically; Back,
+Cancel, or Escape shall restore the launch camera, playhead, pivot, and ghost
+state without mutation.
+
+#### FR-CAM-15
+During the assistant, ordinary inspection scrubbing shall snap back on release,
+source-tail frame pickers shall commit integer frames, and generic playback,
+key editing, file switching, saving, and alignment controls shall remain locked.
+
+#### FR-CAM-16
+Extending a camera path shall preserve every pre-existing authored timing,
+water, and effect value at its original absolute frame and hold the terminal
+authored state throughout the added tail. Existing explicit export bounds shall
+not move. Camera position shall select keyed values only: procedural waves,
+Rain, trails, and related motion shall continue from the steady live clock even
+while the camera is paused, and shall use the full deterministic output sample
+time during offline export.
+
+#### FR-CAM-17
+Apply shall create reciprocal blend metadata when A and B were unlinked, or
+update their existing reciprocal pair. The overlap metadata, eligible terminal
+key IDs, saved-animation link mirror, and pair dependency shall update together
+so A, B, and the project save or discard as one transaction.
+
+#### FR-CAM-18
+Before fitting, the assistant shall let the user flip between A and B, select
+any of the three correspondence nodes, re-raycast it from the viewport, and
+move it with a world-axis gizmo. Candidate fitting shall not begin until both
+ordered endpoint triangles and both source-tail extents are defined.
+
 ### 5.4 Side Panel Behaviour
 #### FR-UI-1
 The application shall include a side panel for render and style controls.

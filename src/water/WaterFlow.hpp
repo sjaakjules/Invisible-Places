@@ -431,9 +431,10 @@ struct WaterSeepageNodeAnimationStateEntry {
 };
 
 // Water timing runs are reusable per-feature key sequences authored in the
-// Timings panel. Positions are normalized 0..1 along an animation, so duration
-// or frame-count edits never move their timing. Applied runs compile into the
-// owning track's complete-snapshot keys; runs are never evaluated per frame.
+// Timings panel. Positions are stored normalized 0..1 along an animation.
+// Camera-tail extension workflows rescale these positions so existing keys
+// retain their absolute frames. Applied runs compile into the owning track's
+// complete-snapshot keys; runs are never evaluated per frame.
 enum class WaterTimingFeature {
     Shoreline,
     Seepage,
@@ -476,9 +477,10 @@ struct WaterScenarioTrack {
 
 // ---- Timings v2: per-feature, per-setting keyframing ----
 // A run groups scene water features whose individual settings are keyed
-// along the linked animation (positions normalized 0..1, so duration edits
-// never move timing). Runs are scenario-scoped and evaluated directly per
-// frame; within one scenario a feature belongs to at most one run. Key
+// along the linked animation. Positions are stored normalized 0..1; camera-
+// tail extensions rescale them to retain existing absolute frames. Runs are
+// scenario-scoped and evaluated directly per frame; within one scenario a
+// feature belongs to at most one run. Key
 // display names are derived ("<run name> <n>" in time order), never stored,
 // so inserting a key between two others renumbers the later ones for free.
 enum class WaterKeyedFeatureKind : std::uint8_t {

@@ -2618,6 +2618,18 @@ json SerializeAnimationLocalizedKeyCorrections(
             {"key_id", correction.keyId},
             {"spline_camera_position", correction.splineCameraPosition},
             {"spline_focus_point", correction.splineFocusPoint},
+            {"has_camera_correction_tangent",
+             correction.hasCameraCorrectionTangent},
+            {"camera_correction_tangent",
+             correction.hasCameraCorrectionTangent
+                 ? correction.cameraCorrectionTangent
+                 : std::array<float, 3>{}},
+            {"has_focus_correction_tangent",
+             correction.hasFocusCorrectionTangent},
+            {"focus_correction_tangent",
+             correction.hasFocusCorrectionTangent
+                 ? correction.focusCorrectionTangent
+                 : std::array<float, 3>{}},
         });
     }
     return correctionsJson;
@@ -2641,6 +2653,32 @@ ParseAnimationLocalizedKeyCorrections(const json& correctionsJson) {
             correction.splineFocusPoint =
                 correctionJson.at("spline_focus_point")
                     .get<std::array<float, 3>>();
+            const bool hasCameraTangentValue =
+                correctionJson.contains("camera_correction_tangent");
+            correction.hasCameraCorrectionTangent = correctionJson.value(
+                "has_camera_correction_tangent",
+                hasCameraTangentValue);
+            if (correction.hasCameraCorrectionTangent) {
+                if (!hasCameraTangentValue) {
+                    return std::nullopt;
+                }
+                correction.cameraCorrectionTangent =
+                    correctionJson.at("camera_correction_tangent")
+                        .get<std::array<float, 3>>();
+            }
+            const bool hasFocusTangentValue =
+                correctionJson.contains("focus_correction_tangent");
+            correction.hasFocusCorrectionTangent = correctionJson.value(
+                "has_focus_correction_tangent",
+                hasFocusTangentValue);
+            if (correction.hasFocusCorrectionTangent) {
+                if (!hasFocusTangentValue) {
+                    return std::nullopt;
+                }
+                correction.focusCorrectionTangent =
+                    correctionJson.at("focus_correction_tangent")
+                        .get<std::array<float, 3>>();
+            }
             const auto finite = [](const auto& position) {
                 return std::all_of(
                     position.begin(),
@@ -2650,7 +2688,9 @@ ParseAnimationLocalizedKeyCorrections(const json& correctionsJson) {
             if (correction.keyId.empty() ||
                 !uniqueIds.insert(correction.keyId).second ||
                 !finite(correction.splineCameraPosition) ||
-                !finite(correction.splineFocusPoint)) {
+                !finite(correction.splineFocusPoint) ||
+                !finite(correction.cameraCorrectionTangent) ||
+                !finite(correction.focusCorrectionTangent)) {
                 return std::nullopt;
             }
             corrections.push_back(std::move(correction));
@@ -2694,6 +2734,10 @@ json SerializeAnimationPath(const AnimationPath& path) {
         {"schema_version", kAnimationDocumentSchemaVersion},
         {"name", path.name},
         {"duration_frames", path.durationFrames},
+        {"authored_track_duration_frames",
+         std::min(
+             path.durationFrames,
+             path.authoredTrackDurationFrames)},
         {"associated_layer_paths", SerializePathArray(path.associatedLayerPaths)},
         {"depth_of_field_enabled", path.depthOfFieldEnabled},
         {"aperture_f_stops", path.apertureFStops},
@@ -2754,6 +2798,11 @@ AnimationPath ParseAnimationPath(const json& pathJson) {
     std::optional<AnimationLoopSmoothingMetadata> legacySmoothing;
     path.name = pathJson.value("name", path.name);
     path.durationFrames = pathJson.value("duration_frames", path.durationFrames);
+    path.authoredTrackDurationFrames = std::min(
+        path.durationFrames,
+        pathJson.value(
+            "authored_track_duration_frames",
+            path.authoredTrackDurationFrames));
     if (pathJson.contains("default_live_view_window_size") &&
         pathJson.at("default_live_view_window_size").is_object()) {
         const auto& sizeJson = pathJson.at("default_live_view_window_size");

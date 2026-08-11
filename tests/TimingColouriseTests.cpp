@@ -25,6 +25,7 @@ using invisible_places::timing::TimingColouriseBoundsParameter;
 using invisible_places::timing::TimingColouriseAmountOverrideMode;
 using invisible_places::timing::TimingColouriseEffect;
 using invisible_places::timing::TimingColouriseEffectParameter;
+using invisible_places::timing::TimingColouriseFieldBoundsMemory;
 using invisible_places::timing::TimingColouriseLocalPaletteEdit;
 using invisible_places::timing::TimingColourisePalette;
 using invisible_places::timing::TimingColourisePaletteDefinition;
@@ -2241,6 +2242,204 @@ TEST_CASE(
     CHECK(peak == Approx(1.0F));
     CHECK(std::abs(approachVelocity) < 0.02F);
     CHECK(std::abs(departureVelocity) < 0.02F);
+}
+
+TEST_CASE(
+    "Timing Take retiming preserves every keyed frame and full-range activation sentinel",
+    "[timing][colourise][pan-extension]") {
+    constexpr std::uint32_t sourceFrames = 90U;
+    constexpr std::uint32_t destinationFrames = 135U;
+    constexpr float scale =
+        static_cast<float>(sourceFrames) /
+        static_cast<float>(destinationFrames);
+
+    invisible_places::timing::TimingTakeSceneState state;
+    invisible_places::water::WaterFeatureTimingRun waterRun;
+    waterRun.enabled = false;
+    invisible_places::water::WaterFeatureTimeline waterFeature;
+    waterFeature.feature = {
+        .kind = invisible_places::water::WaterKeyedFeatureKind::Rain,
+    };
+    invisible_places::water::WaterKeyedSettingTrack waterSetting;
+    waterSetting.settingId = "strength";
+    waterSetting.active = false;
+    waterSetting.keys = {
+        {.position = 0.18F, .value = 0.2F},
+        {.position = 0.91F, .value = 0.8F},
+    };
+    waterFeature.settings.push_back(std::move(waterSetting));
+    waterRun.features.push_back(std::move(waterFeature));
+    state.waterFeatureTimingRuns.push_back(std::move(waterRun));
+
+    TimingColouriseEffect effect;
+    effect.enabled = false;
+    effect.activationRange = {.start = 0.12F, .end = 1.0F};
+    effect.basePalette.stops = {
+        {.id = "base-stop", .position = 0.77F},
+    };
+    effect.effectParameterKeys = {
+        {.parameter = TimingColouriseEffectParameter::PalettePhase,
+         .position = 0.0F,
+         .value = -0.2F,
+         .interpolation = WaterScenarioInterpolation::SmoothVelocity},
+        {.parameter = TimingColouriseEffectParameter::PalettePhase,
+         .position = 0.37F,
+         .value = 0.9F,
+         .interpolation = WaterScenarioInterpolation::SmoothVelocity},
+        {.parameter = TimingColouriseEffectParameter::PalettePhase,
+         .position = 0.72F,
+         .value = 0.1F,
+         .interpolation = WaterScenarioInterpolation::SmoothVelocity},
+        {.parameter = TimingColouriseEffectParameter::PalettePhase,
+         .position = 1.0F,
+         .value = 0.6F,
+         .interpolation = WaterScenarioInterpolation::SmoothVelocity},
+    };
+    effect.paletteKeys = {
+        {.position = 0.31F,
+         .palette = {.stops = {{.id = "snapshot-stop",
+                               .position = 0.66F}}}},
+    };
+    effect.paletteStopParameterKeys = {
+        {.stopId = "base-stop",
+         .parameter = TimingColourisePaletteStopParameter::Position,
+         .position = 0.42F,
+         .scalarValue = 0.81F},
+    };
+    effect.boundsParameterKeys = {
+        {.parameter = TimingColouriseBoundsParameter::Lower,
+         .position = 0.51F,
+         .value = 0.2F},
+    };
+    effect.boundsKeys = {
+        {.position = 0.60F, .bounds = {.lower = 0.1F, .upper = 0.9F}},
+    };
+    TimingColouriseFieldBoundsMemory memory;
+    memory.boundsParameterKeys = {
+        {.parameter = TimingColouriseBoundsParameter::Upper,
+         .position = 0.69F,
+         .value = 0.9F},
+    };
+    memory.boundsKeys = {
+        {.position = 0.78F, .bounds = {.lower = 0.2F, .upper = 0.8F}},
+    };
+    effect.fieldBoundsMemory.push_back(std::move(memory));
+    state.colouriseEffects.push_back(effect);
+
+    TimingColouriseEffect partialRange;
+    partialRange.activationRange = {.start = 0.24F, .end = 0.81F};
+    state.colouriseEffects.push_back(std::move(partialRange));
+
+    const auto original = state;
+    REQUIRE(invisible_places::timing::
+                RetimeTimingTakeSceneStateNormalizedPositions(
+                    &state,
+                    sourceFrames,
+                    destinationFrames));
+
+    REQUIRE(state.waterFeatureTimingRuns.size() == 1U);
+    REQUIRE(state.waterFeatureTimingRuns.front().features.size() == 1U);
+    const auto& retimedWater = state.waterFeatureTimingRuns.front()
+                                   .features.front()
+                                   .settings.front();
+    CHECK_FALSE(state.waterFeatureTimingRuns.front().enabled);
+    CHECK_FALSE(retimedWater.active);
+    REQUIRE(retimedWater.keys.size() == 2U);
+    CHECK(retimedWater.keys[0U].position == Approx(0.18F * scale));
+    CHECK(retimedWater.keys[1U].position == Approx(0.91F * scale));
+    CHECK(retimedWater.keys[1U].value == Approx(0.8F));
+
+    REQUIRE(state.colouriseEffects.size() == 2U);
+    const auto& retimed = state.colouriseEffects[0U];
+    CHECK_FALSE(retimed.enabled);
+    CHECK(retimed.activationRange.start == Approx(0.12F * scale));
+    CHECK(retimed.activationRange.end == Approx(1.0F));
+    CHECK(state.colouriseEffects[1U].activationRange.start ==
+          Approx(0.24F * scale));
+    CHECK(state.colouriseEffects[1U].activationRange.end ==
+          Approx(0.81F * scale));
+    REQUIRE(retimed.effectParameterKeys.size() == 4U);
+    CHECK(retimed.effectParameterKeys[1U].position ==
+          Approx(0.37F * scale));
+    CHECK(retimed.effectParameterKeys.back().position == Approx(scale));
+    REQUIRE(retimed.paletteKeys.size() == 1U);
+    CHECK(retimed.paletteKeys.front().position == Approx(0.31F * scale));
+    REQUIRE(retimed.paletteStopParameterKeys.size() == 1U);
+    CHECK(retimed.paletteStopParameterKeys.front().position ==
+          Approx(0.42F * scale));
+    REQUIRE(retimed.boundsParameterKeys.size() == 1U);
+    CHECK(retimed.boundsParameterKeys.front().position ==
+          Approx(0.51F * scale));
+    REQUIRE(retimed.boundsKeys.size() == 1U);
+    CHECK(retimed.boundsKeys.front().position == Approx(0.60F * scale));
+    REQUIRE(retimed.fieldBoundsMemory.size() == 1U);
+    CHECK(retimed.fieldBoundsMemory.front()
+              .boundsParameterKeys.front()
+              .position == Approx(0.69F * scale));
+    CHECK(retimed.fieldBoundsMemory.front().boundsKeys.front().position ==
+          Approx(0.78F * scale));
+
+    // Palette-space coordinates and authored values are not animation-time
+    // coordinates and must not be touched by the retime.
+    CHECK(retimed.basePalette.stops.front().position == Approx(0.77F));
+    CHECK(retimed.paletteKeys.front().palette.stops.front().position ==
+          Approx(0.66F));
+    CHECK(retimed.paletteStopParameterKeys.front().scalarValue ==
+          Approx(0.81F));
+
+    const auto evaluate = [](const TimingColouriseEffect& value,
+                             float position) {
+        return invisible_places::timing::
+            EvaluateTimingColouriseEffectParameter(
+                value,
+                TimingColouriseEffectParameter::PalettePhase,
+                position);
+    };
+
+    for (std::uint32_t frame = 0U; frame <= sourceFrames; ++frame) {
+        const float sourcePosition = static_cast<float>(frame) /
+            static_cast<float>(sourceFrames);
+        const float destinationPosition = static_cast<float>(frame) /
+            static_cast<float>(destinationFrames);
+        CHECK(evaluate(retimed, destinationPosition) ==
+              Approx(evaluate(
+                         original.colouriseEffects.front(),
+                         sourcePosition))
+                  .margin(1.0e-6F));
+    }
+    const float terminal = evaluate(
+        original.colouriseEffects.front(),
+        1.0F);
+    for (std::uint32_t frame = sourceFrames + 1U;
+         frame <= destinationFrames;
+         ++frame) {
+        CHECK(evaluate(
+                  retimed,
+                  static_cast<float>(frame) /
+                      static_cast<float>(destinationFrames)) ==
+              Approx(terminal).margin(1.0e-6F));
+    }
+
+    const float unchangedPosition =
+        state.colouriseEffects.front().effectParameterKeys[1U].position;
+    CHECK_FALSE(invisible_places::timing::
+                    RetimeTimingTakeSceneStateNormalizedPositions(
+                        &state,
+                        sourceFrames,
+                        0U));
+    CHECK_FALSE(invisible_places::timing::
+                    RetimeTimingTakeSceneStateNormalizedPositions(
+                        &state,
+                        0U,
+                        destinationFrames));
+    CHECK(state.colouriseEffects.front()
+              .effectParameterKeys[1U]
+              .position == Approx(unchangedPosition));
+    CHECK_FALSE(invisible_places::timing::
+                    RetimeTimingTakeSceneStateNormalizedPositions(
+                        nullptr,
+                        sourceFrames,
+                        destinationFrames));
 }
 
 TEST_CASE(

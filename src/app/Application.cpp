@@ -850,6 +850,95 @@ struct AnimationMatchingFrameGhostState {
     std::chrono::steady_clock::time_point lastAutomaticRequestAt{};
 };
 
+enum class AnimationReciprocalPanWizardStage : std::uint8_t {
+    Idle = 0,
+    Seam1SourceTriangle,
+    Seam1DestinationTriangle,
+    Seam1TailExtent,
+    Seam2SourceTriangle,
+    Seam2DestinationTriangle,
+    Seam2TailExtent,
+    EditCorrespondences,
+    Preview,
+};
+
+struct AnimationReciprocalPanObservation {
+    bool captured = false;
+    int pathRole = 0;  // 0 = A/current, 1 = B/partner.
+    std::uint32_t frame = 0U;
+    float normalizedPosition = 0.0F;
+    std::array<ImVec2, 3> normalizedScreens{
+        ImVec2{0.5F, 0.5F},
+        ImVec2{0.5F, 0.5F},
+        ImVec2{0.5F, 0.5F},
+    };
+    invisible_places::camera::AnimationSurfacePatchObservation patch{};
+};
+
+struct AnimationReciprocalPanWizardState {
+    AnimationReciprocalPanWizardStage stage =
+        AnimationReciprocalPanWizardStage::Idle;
+    std::array<std::filesystem::path, 2> filePaths;
+    std::array<AnimationPath, 2> baselinePaths;
+    std::array<std::uint64_t, 2> baselineFingerprints{};
+    std::array<std::optional<
+        invisible_places::camera::AnimationVelocityBlendLinkMetadata>, 2>
+        baselineLinks;
+    // Clip normalization performed only on the wizard's private baselines.
+    // The registry remains untouched until Apply Both commits the fitted
+    // candidates, so Cancel restores the launch state without an undo write.
+    bool clipPlanesNormalizedForExtension = false;
+    float normalizedNearPlane = 0.0F;
+    float normalizedFarPlane = 0.0F;
+    // Ordered as A-start, B-end, B-start, A-end. Corresponding triangle
+    // nodes keep the same 0..2 index on both sides of each seam.
+    std::array<AnimationReciprocalPanObservation, 4> endpointTriangles;
+    std::array<std::uint32_t, 2> sourceTailFrames{};
+    std::array<std::uint32_t, 2> sourceTailFrameDrafts{};
+    std::optional<
+        invisible_places::camera::AnimationReciprocalPanExtensionResult>
+        candidate;
+    std::string dependencyPairId;
+    std::string commonSceneKey;
+    bool horizontalBlend = true;
+    bool panRight = true;
+    float aspectRatio = 16.0F / 9.0F;
+    float launchElapsedSeconds = 0.0F;
+    float launchScrubAmount = 0.0F;
+    std::string launchSelectedKeyId;
+    invisible_places::camera::CameraState launchCamera{};
+    bool launchPivotVisible = false;
+    invisible_places::io::Float3 launchPivot{};
+    std::chrono::steady_clock::time_point launchPivotLastSetAt{};
+    bool launchGhostVisible = false;
+    bool launchGhostAutomaticUpdate = true;
+    bool anchorPickArmed = false;
+    bool reraycastSelectedNode = false;
+    bool viewportClickConsumed = false;
+    int selectedTriangleIndex = 0;
+    int selectedNodeIndex = 0;
+    ManualFlowPathGizmoDragState nodeGizmoDrag{};
+    bool nodeGizmoPointerCaptured = false;
+    bool fitInProgress = false;
+    bool inspectionActive = false;
+    int inspectionPathRole = 0;
+    float inspectionNormalizedPosition = 0.0F;
+    int previewPose = 0;
+    int previewMode = 2;
+    bool previewBaselineHold = false;
+    std::uint64_t generation = 0U;
+    std::string errorMessage;
+
+    [[nodiscard]] bool Active() const {
+        return stage != AnimationReciprocalPanWizardStage::Idle;
+    }
+};
+
+struct ReciprocalPanTimingTakeCloneJournal {
+    std::vector<std::string> createdTakeIds;
+    std::uint32_t preAllocationNextSequence = 1U;
+};
+
 struct AnimationPanelState {
     std::optional<AnimationPath> currentPath;
     std::string currentFilePath;
@@ -863,8 +952,18 @@ struct AnimationPanelState {
     // Keeps paired save/discard atomic even after Unapply clears the
     // serialized smoothing metadata from both edited paths.
     std::vector<std::string> availableFileLoopEditPairIds;
+    // Timing Takes copied and retimed by an unsaved reciprocal pan edit.
+    // The project owns these copies, so they follow the same pair dependency
+    // through atomic Save/Discard as the two animation shadows.
+    std::unordered_map<
+        std::string,
+        ReciprocalPanTimingTakeCloneJournal>
+        reciprocalPanTimingTakeCloneIds;
     std::vector<bool> availableFileDirtyFlags;
     std::unordered_set<std::string> brokenVelocityLinkPathKeys;
+    // Retains project-mirror work discovered when the project was loaded;
+    // edit dependency IDs account separately for unsaved pair operations.
+    bool projectVelocityLinksBaselineDirty = false;
     bool projectVelocityLinksDirty = false;
     bool animationRegistryInitialized = false;
     std::vector<std::filesystem::path> selectedExportFiles;
@@ -900,6 +999,9 @@ struct AnimationPanelState {
     std::optional<AnimationMatchingFrameGhostCaptureRequest>
         requestedMatchingFrameGhostCapture;
     bool requestedMatchingFrameGhostClear = false;
+    AnimationReciprocalPanWizardState reciprocalPanWizard;
+    std::optional<std::array<std::filesystem::path, 2>>
+        requestedClipPlaneNormalization;
     std::optional<std::array<std::filesystem::path, 2>>
         requestedVelocityUnlink;
     std::optional<std::size_t> renamingFileIndex;
@@ -929,9 +1031,8 @@ struct AnimationPanelState {
     std::string exportPresetNameBuffer = "MP4";
     std::optional<ExportPreset> editedExportPreset;
     float scrubAmount = 0.0F;
-    // Session-only editing lens shared by every Feature Run graph. Authored
-    // animation/key positions and export sampling always remain normalized
-    // over the complete 0..1 animation.
+    // Session-only editing lens shared by every Feature Run graph. Timing
+    // keys use the same normalized 0..1 domain as the complete animation.
     invisible_places::timing::TimelineViewRange timelineViewRange{};
     std::optional<AnimationTimelineViewDragState> timelineViewDrag;
     bool liveApply = true;
@@ -1466,6 +1567,8 @@ struct QueuedQuickMp4WaterSnapshot {
 struct PreviewRuntimeState;
 struct WaterFrameState;
 struct ResolvedRenderSetupSnapshot;
+void InvalidateReciprocalPanWizardCandidate(
+    AnimationReciprocalPanWizardState* wizard);
 std::vector<OfflineRenderJobState::FrozenSeepageLayer> BuildFrozenAnimationSeepageLayers(
     PreviewRuntimeState* runtimeState,
     std::span<const invisible_places::renderer::core::SceneRenderState::PointCloudLayerState> exportLayers,
@@ -2672,6 +2775,26 @@ struct AnimationMatchingFrameGhostJobRuntime {
         sourceCache;
 };
 
+struct AnimationReciprocalPanFitJobResult {
+    std::uint64_t generation = 0U;
+    std::array<std::filesystem::path, 2> filePaths;
+    std::array<std::uint64_t, 2> motionFingerprints{};
+    float aspectRatio = 16.0F / 9.0F;
+    invisible_places::camera::AnimationReciprocalPanExtensionResult result;
+};
+
+struct AnimationReciprocalPanFitJobShared {
+    std::mutex mutex;
+    bool completed = false;
+    AnimationReciprocalPanFitJobResult result;
+};
+
+struct AnimationReciprocalPanFitJobRuntime {
+    std::uint64_t activeGeneration = 0U;
+    std::jthread worker;
+    std::shared_ptr<AnimationReciprocalPanFitJobShared> shared;
+};
+
 struct PreviewRuntimeState {
     std::vector<PreviewLayerSession> sessions;
     std::uint64_t nextPointCloudContentGeneration = 1U;
@@ -2693,6 +2816,7 @@ struct PreviewRuntimeState {
     AnimationStrongAlignmentJobRuntime animationStrongAlignmentJob{};
     AnimationMatchingFrameGhostJobRuntime
         animationMatchingFrameGhostJob{};
+    AnimationReciprocalPanFitJobRuntime animationReciprocalPanFitJob{};
     AnimationPlaybackState animationPlayback{};
     TimingsPanelState timingsPanel{};
     TimingColouriseHistogramRuntime timingColouriseHistogram{};
@@ -3381,6 +3505,85 @@ ResolveTimingColouriseStack(
     return result;
 }
 
+std::uint32_t EffectiveAnimationDurationFramesForTracks(
+    const AnimationPath& path) {
+    return std::max<std::uint32_t>(
+        path.durationFrames,
+        path.keys.size() > 1U
+            ? static_cast<std::uint32_t>(path.keys.size() - 1U)
+            : 1U);
+}
+
+std::uint32_t AuthoredAnimationTrackDurationFrames(
+    const AnimationPath& path) {
+    const std::uint32_t cameraFrames =
+        EffectiveAnimationDurationFramesForTracks(path);
+    // Compatibility for files written by the initial schema-22 extension.
+    // Current extensions physically retime their keys and clear this marker,
+    // so ordinary paths always use the full camera duration.
+    return path.authoredTrackDurationFrames == 0U
+               ? cameraFrames
+               : std::clamp(
+                     path.authoredTrackDurationFrames,
+                     1U,
+                     cameraFrames);
+}
+
+float AuthoredAnimationTrackDurationSeconds(
+    const AnimationPath& path) {
+    return static_cast<float>(
+               AuthoredAnimationTrackDurationFrames(path)) /
+           30.0F;
+}
+
+float AuthoredTrackNormalizedToCameraNormalized(
+    const AnimationPath& path,
+    float trackNormalizedPosition) {
+    const float cameraFrames = static_cast<float>(
+        EffectiveAnimationDurationFramesForTracks(path));
+    const float trackFrames = static_cast<float>(
+        AuthoredAnimationTrackDurationFrames(path));
+    return std::clamp(
+        trackNormalizedPosition,
+        0.0F,
+        1.0F) * trackFrames / cameraFrames;
+}
+
+float CurrentAuthoredTrackPosition(
+    const PreviewRuntimeState& runtimeState) {
+    const float cameraPosition = std::clamp(
+        runtimeState.animationPanel.scrubAmount,
+        0.0F,
+        1.0F);
+    if (!runtimeState.animationPanel.currentPath.has_value()) {
+        return cameraPosition;
+    }
+    const auto& path = runtimeState.animationPanel.currentPath.value();
+    const float cameraFrames = static_cast<float>(
+        EffectiveAnimationDurationFramesForTracks(path));
+    const float trackFrames = static_cast<float>(
+        AuthoredAnimationTrackDurationFrames(path));
+    return std::clamp(
+        cameraPosition * cameraFrames / trackFrames,
+        0.0F,
+        1.0F);
+}
+
+void SetCurrentAnimationPositionFromAuthoredTrack(
+    PreviewRuntimeState* runtimeState,
+    float trackPosition) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    float cameraPosition = std::clamp(trackPosition, 0.0F, 1.0F);
+    if (runtimeState->animationPanel.currentPath.has_value()) {
+        cameraPosition = AuthoredTrackNormalizedToCameraNormalized(
+            runtimeState->animationPanel.currentPath.value(),
+            cameraPosition);
+    }
+    runtimeState->animationPanel.scrubAmount = cameraPosition;
+}
+
 struct WaterFrameState {
     float normalizedTime = 0.0F;
     float sampleTimeSeconds = 0.0F;
@@ -3489,7 +3692,11 @@ WaterFrameState ResolveWaterFrameStateBase(
     if (runtimeState == nullptr) {
         return result;
     }
-    result.normalizedTime = std::clamp(runtimeState->animationPanel.scrubAmount, 0.0F, 1.0F);
+    // This is the keyed-settings position, not the procedural effect clock.
+    // Marker-zero/current paths map directly to the camera position; the
+    // helper only preserves files written by the initial schema-22 extension
+    // until their keys are physically migrated by a later extension.
+    result.normalizedTime = CurrentAuthoredTrackPosition(*runtimeState);
     result.rawScenarioState = ResolveActiveWaterScenarioState(*runtimeState);
     result.seepageScenarioState = result.rawScenarioState;
     if (result.rawScenarioState.has_value()) {
@@ -3503,8 +3710,9 @@ WaterFrameState ResolveWaterFrameStateBase(
     const auto& animation = runtimeState->animationPanel.currentPath.value();
     const float durationSeconds = std::max(
         1.0e-6F,
-        invisible_places::camera::AnimationPathDurationSeconds(animation));
-    result.sampleTimeSeconds = result.normalizedTime * durationSeconds;
+        AuthoredAnimationTrackDurationSeconds(animation));
+    result.sampleTimeSeconds =
+        result.normalizedTime * durationSeconds;
     return result;
 }
 
@@ -3557,7 +3765,7 @@ WaterFrameState ResolveWaterFrameState(
         if (runtimeState->animationPanel.currentPath.has_value()) {
             const float durationSeconds = std::max(
                 1.0e-6F,
-                invisible_places::camera::AnimationPathDurationSeconds(
+                AuthoredAnimationTrackDurationSeconds(
                     runtimeState->animationPanel.currentPath.value()));
             const auto meshFingerprint =
                 invisible_places::water::
@@ -4906,6 +5114,7 @@ void HashArray4(std::uint64_t* seed, const std::array<float, 4>& value) {
 std::uint64_t AnimationPathMotionFingerprint(const AnimationPath& path) {
     std::uint64_t seed = 1469598103934665603ULL;
     HashCombine(&seed, path.durationFrames);
+    HashCombine(&seed, path.authoredTrackDurationFrames);
     HashCombine(&seed, path.exportSettings.width);
     HashCombine(&seed, path.exportSettings.height);
     HashBool(&seed, path.depthOfFieldEnabled);
@@ -4927,12 +5136,24 @@ std::uint64_t AnimationPathMotionFingerprint(const AnimationPath& path) {
         HashFloat(&seed, key.nearPlane);
         HashFloat(&seed, key.farPlane);
         HashCombine(&seed, key.durationFrames);
+        HashFloat(&seed, key.splineParameterWeight);
+        HashBool(&seed, key.hasSplineEndpointTangent);
+        HashArray3(&seed, key.splineCameraEndpointTangent);
+        HashArray3(&seed, key.splineFocusEndpointTangent);
+        HashArray4(&seed, key.splineOrientationEndpointTangent);
+        for (const float component : key.splineLensEndpointTangent) {
+            HashFloat(&seed, component);
+        }
     }
     HashCombine(&seed, path.localizedKeyCorrections.size());
     for (const auto& correction : path.localizedKeyCorrections) {
         HashString(&seed, correction.keyId);
         HashArray3(&seed, correction.splineCameraPosition);
         HashArray3(&seed, correction.splineFocusPoint);
+        HashBool(&seed, correction.hasCameraCorrectionTangent);
+        HashArray3(&seed, correction.cameraCorrectionTangent);
+        HashBool(&seed, correction.hasFocusCorrectionTangent);
+        HashArray3(&seed, correction.focusCorrectionTangent);
     }
     return seed;
 }
@@ -9853,6 +10074,157 @@ std::optional<ResolvedPivot> ResolveSurfacePivot(
                           : 0.0F,
         .matchedSurface = true,
         .sampleCount = cluster.size()};
+}
+
+std::optional<invisible_places::camera::AnimationSurfacePatchObservation>
+ResolveReciprocalPanSurfacePatch(
+    const PreviewRuntimeState& runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    ImVec2 screenPoint,
+    std::string_view commonSceneKey) {
+    if (commonSceneKey.empty() ||
+        !IsInsideRenderViewport(viewport, screenPoint)) {
+        return std::nullopt;
+    }
+    const auto matrices = runtimeState.camera.Matrices(CurrentAspectRatio(viewport));
+    const auto ray = MakeScreenRay(matrices, viewport, screenPoint);
+    if (!ray.has_value()) {
+        return std::nullopt;
+    }
+
+    constexpr float kPickRadiusPixels = 48.0F;
+    const auto viewportSize = CurrentUiViewportSize(viewport);
+    const float viewportHeight = std::max(1.0F, viewportSize.y);
+    const float tanHalfFov = std::tan(
+        runtimeState.camera.FovDegrees() * kPi / 360.0F);
+    std::vector<PivotCandidate> candidates;
+    candidates.reserve(256U);
+    for (const auto& session : runtimeState.sessions) {
+        const bool usable =
+            IsAssociableLidarSession(session) &&
+            !session.pivotSamples.empty() &&
+            IsCpuReadyAnalysisPointCloudSource(session);
+        if (!usable ||
+            NormalizePathKey(AssociationPathForSession(session)) !=
+                commonSceneKey) {
+            continue;
+        }
+        for (const auto& sample : session.pivotSamples) {
+            const glm::vec3 worldPoint{sample.x, sample.y, sample.z};
+            const auto projected = ProjectWorldPoint(
+                matrices,
+                viewport,
+                worldPoint);
+            if (!projected.has_value()) {
+                continue;
+            }
+            const glm::vec3 fromOrigin = worldPoint - ray->origin;
+            const float alongRay = glm::dot(fromOrigin, ray->direction);
+            if (alongRay <= runtimeState.camera.NearPlane()) {
+                continue;
+            }
+            const float dx = projected->screen.x - screenPoint.x;
+            const float dy = projected->screen.y - screenPoint.y;
+            const float screenDistance = std::sqrt(dx * dx + dy * dy);
+            if (screenDistance > kPickRadiusPixels) {
+                continue;
+            }
+            const float worldUnitsPerPixel =
+                2.0F * std::max(0.001F, alongRay) * tanHalfFov /
+                viewportHeight;
+            const float pickRadiusWorld = std::max(
+                0.0001F,
+                worldUnitsPerPixel * kPickRadiusPixels);
+            const glm::vec3 closest =
+                ray->origin + ray->direction * alongRay;
+            const float rayDistance = glm::length(worldPoint - closest);
+            if (rayDistance > pickRadiusWorld) {
+                continue;
+            }
+            candidates.push_back({
+                .point = worldPoint,
+                .sceneRole = session.sceneRole,
+                .rayDistance = rayDistance,
+                .alongRay = alongRay,
+                .depth = projected->depth,
+                .screenDistance = screenDistance,
+                .pickRadiusWorld = pickRadiusWorld,
+                .confidence = std::clamp(
+                    1.0F - std::max(
+                               screenDistance / kPickRadiusPixels,
+                               rayDistance / pickRadiusWorld),
+                    0.0F,
+                    1.0F),
+            });
+        }
+    }
+    if (candidates.empty()) {
+        return std::nullopt;
+    }
+
+    auto cluster = SelectPivotDepthCluster(std::move(candidates));
+    const glm::vec3 anchor = BulkCenter(cluster);
+    invisible_places::camera::AnimationSurfacePatchObservation observation;
+    observation.pointCount = 1U;
+    observation.worldPoints[0] = {anchor.x, anchor.y, anchor.z};
+    if (cluster.size() < 5U) {
+        return observation;
+    }
+
+    // PCA of the depth-cluster gives a stable local surface frame. Power
+    // iteration finds the two largest covariance directions; the observed
+    // anchor remains the actual picked point.
+    glm::mat3 covariance{0.0F};
+    glm::vec3 mean{0.0F};
+    for (const auto& candidate : cluster) {
+        mean += candidate.point;
+    }
+    mean /= static_cast<float>(cluster.size());
+    for (const auto& candidate : cluster) {
+        const glm::vec3 delta = candidate.point - mean;
+        covariance += glm::outerProduct(delta, delta);
+    }
+    covariance /= static_cast<float>(cluster.size());
+    auto principalDirection = [&](glm::vec3 direction,
+                                  const glm::vec3* reject) {
+        for (int iteration = 0; iteration < 20; ++iteration) {
+            direction = covariance * direction;
+            if (reject != nullptr) {
+                direction -= *reject * glm::dot(direction, *reject);
+            }
+            if (!PivotNormalValid(direction)) {
+                return glm::vec3{0.0F};
+            }
+            direction = glm::normalize(direction);
+        }
+        return direction;
+    };
+    glm::vec3 tangentX = principalDirection(
+        glm::vec3{1.0F, 0.37F, 0.13F},
+        nullptr);
+    glm::vec3 tangentY = principalDirection(
+        glm::vec3{-0.23F, 0.51F, 0.83F},
+        &tangentX);
+    if (!PivotNormalValid(tangentX) || !PivotNormalValid(tangentY) ||
+        std::abs(glm::dot(tangentX, tangentY)) > 0.15F) {
+        return observation;
+    }
+    const float varianceX = std::max(
+        0.0F,
+        glm::dot(tangentX, covariance * tangentX));
+    const float varianceY = std::max(
+        0.0F,
+        glm::dot(tangentY, covariance * tangentY));
+    const float frameScale = std::clamp(
+        std::sqrt(std::max(varianceX, varianceY)),
+        0.001F,
+        std::max(0.001F, cluster.front().pickRadiusWorld));
+    const glm::vec3 pointX = anchor + tangentX * frameScale;
+    const glm::vec3 pointY = anchor + tangentY * frameScale;
+    observation.pointCount = 3U;
+    observation.worldPoints[1] = {pointX.x, pointX.y, pointX.z};
+    observation.worldPoints[2] = {pointY.x, pointY.y, pointY.z};
+    return observation;
 }
 
 // Finds the distance of the first point-cloud surface along a world-space
@@ -25361,6 +25733,7 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->animationPanel.matchingFrameGhost = {};
     runtimeState->animationPanel.requestedMatchingFrameGhostCapture.reset();
     runtimeState->animationPanel.requestedMatchingFrameGhostClear = false;
+    runtimeState->animationPanel.requestedClipPlaneNormalization.reset();
 
     CancelWaterFlowTrailBuildJob(&runtimeState->water);
     runtimeState->water.flowTrailSourceRequests.clear();
@@ -25818,8 +26191,10 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->animationPanel.availableFileLoadedPaths.clear();
     runtimeState->animationPanel.availableFileEditedPaths.clear();
     runtimeState->animationPanel.availableFileLoopEditPairIds.clear();
+    runtimeState->animationPanel.reciprocalPanTimingTakeCloneIds.clear();
     runtimeState->animationPanel.availableFileDirtyFlags.clear();
     runtimeState->animationPanel.brokenVelocityLinkPathKeys.clear();
+    runtimeState->animationPanel.projectVelocityLinksBaselineDirty = false;
     runtimeState->animationPanel.projectVelocityLinksDirty = false;
     runtimeState->animationPanel.selectedExportFiles.clear();
     if (document.hasSavedAnimationRegistry) {
@@ -27431,6 +27806,8 @@ void ValidateProjectAnimationVelocityLinks(
             })) {
         panel.projectVelocityLinksDirty = true;
     }
+    panel.projectVelocityLinksBaselineDirty =
+        panel.projectVelocityLinksDirty;
 }
 
 std::string AnimationRegistryDisplayLabel(
@@ -28311,6 +28688,77 @@ bool LoadAnimationPathFromFile(
         preferEdited);
 }
 
+bool DiscardReciprocalPanTimingTakeClones(
+    PreviewRuntimeState* runtimeState,
+    std::string_view pairId,
+    std::span<const std::size_t> discardedAnimationIndices) {
+    if (runtimeState == nullptr || pairId.empty()) {
+        return false;
+    }
+    auto& panel = runtimeState->animationPanel;
+    const auto pending = panel.reciprocalPanTimingTakeCloneIds.find(
+        std::string{pairId});
+    if (pending == panel.reciprocalPanTimingTakeCloneIds.end()) {
+        return false;
+    }
+
+    const std::unordered_set<std::size_t> discarded{
+        discardedAnimationIndices.begin(),
+        discardedAnimationIndices.end()};
+    bool retainedReferencedClone = false;
+    for (const auto& takeId : pending->second.createdTakeIds) {
+        const bool referencedElsewhere = [&] {
+            for (std::size_t index = 0U;
+                 index < panel.availableFiles.size();
+                 ++index) {
+                if (discarded.contains(index)) {
+                    continue;
+                }
+                const auto* path = RegistryAnimationPath(
+                    *runtimeState,
+                    index);
+                if (path != nullptr &&
+                    invisible_places::timing::NormalizeTimingTakeId(
+                        path->selectedTimingTakeId) == takeId) {
+                    return true;
+                }
+            }
+            if (runtimeState->activeRenderSetupOverride.has_value() &&
+                runtimeState->activeRenderSetupOverride
+                    ->underlyingAnimation.path.has_value()) {
+                return invisible_places::timing::NormalizeTimingTakeId(
+                           runtimeState->activeRenderSetupOverride
+                               ->underlyingAnimation.path
+                               ->selectedTimingTakeId) == takeId;
+            }
+            return false;
+        }();
+        if (referencedElsewhere) {
+            retainedReferencedClone = true;
+            continue;
+        }
+        std::erase_if(
+            runtimeState->water.timingTakes,
+            [&](const auto& take) { return take.id == takeId; });
+        std::erase_if(
+            runtimeState->water.timingTakeSceneStates,
+            [&](const auto& state) { return state.takeId == takeId; });
+        if (invisible_places::timing::NormalizeTimingTakeId(
+                runtimeState->water.selectedTimingTakeId) == takeId) {
+            runtimeState->water.selectedTimingTakeId = std::string{
+                invisible_places::timing::kAuthoredTimingTakeId};
+        }
+    }
+    runtimeState->water.nextTimingTakeSequence = std::min(
+        runtimeState->water.nextTimingTakeSequence,
+        std::max(
+            1U,
+            pending->second.preAllocationNextSequence));
+    panel.reciprocalPanTimingTakeCloneIds.erase(pending);
+    runtimeState->previewRenderStateSignatureValid = false;
+    return retainedReferencedClone;
+}
+
 bool DiscardAnimationEdits(
     PreviewRuntimeState* runtimeState,
     std::size_t fileIndex) {
@@ -28365,6 +28813,22 @@ bool DiscardAnimationEdits(
         panel.availableFileEditedPaths[index].reset();
         panel.availableFileLoopEditPairIds[index].clear();
         panel.availableFileDirtyFlags[index] = false;
+    }
+    const bool retainedTimingTakeWork =
+        DiscardReciprocalPanTimingTakeClones(
+            runtimeState,
+            pairId,
+            discardIndices);
+    if (!pairId.empty()) {
+        panel.projectVelocityLinksDirty =
+            panel.projectVelocityLinksBaselineDirty ||
+            retainedTimingTakeWork ||
+            std::any_of(
+                panel.availableFileLoopEditPairIds.begin(),
+                panel.availableFileLoopEditPairIds.end(),
+                [](const std::string& dependencyId) {
+                    return !dependencyId.empty();
+                });
     }
     panel.loopSmoothingDiagnostics.reset();
 
@@ -28606,7 +29070,9 @@ void ApplyAnimationScrub(PreviewRuntimeState* runtimeState) {
 }
 
 void StartAnimationPlayback(PreviewRuntimeState* runtimeState) {
-    if (runtimeState == nullptr || !runtimeState->animationPanel.currentPath.has_value()) {
+    if (runtimeState == nullptr ||
+        runtimeState->animationPanel.reciprocalPanWizard.Active() ||
+        !runtimeState->animationPanel.currentPath.has_value()) {
         return;
     }
 
@@ -28721,6 +29187,7 @@ void UpdateAnimationPlayback(PreviewRuntimeState* runtimeState) {
 
 void HandleAnimationPlaybackShortcut(PreviewRuntimeState* runtimeState) {
     if (runtimeState == nullptr ||
+        runtimeState->animationPanel.reciprocalPanWizard.Active() ||
         !runtimeState->animationPanel.currentPath.has_value()) {
         return;
     }
@@ -34948,7 +35415,7 @@ void FreezeAuthoredTimingState(
     }
     const float durationSeconds = std::max(
         1.0e-6F,
-        invisible_places::camera::AnimationPathDurationSeconds(
+        AuthoredAnimationTrackDurationSeconds(
             job->animationPath.value()));
     job->frozenSeepageRainEnvelopes.reserve(
         runtimeState.water.seepageNodes.size());
@@ -35010,7 +35477,7 @@ void FreezeQueuedQuickMp4AuthoredTimingState(
     }
     const float durationSeconds = std::max(
         1.0e-6F,
-        invisible_places::camera::AnimationPathDurationSeconds(
+        AuthoredAnimationTrackDurationSeconds(
             job->animationPath.value()));
     job->frozenSeepageRainEnvelopes.reserve(
         snapshot.seepageNodes.size());
@@ -35145,7 +35612,7 @@ BuildFrozenAnimationMeshFlowRainEnvelope(
         *definition,
         std::max(
             1.0e-6F,
-            invisible_places::camera::AnimationPathDurationSeconds(path)));
+            AuthoredAnimationTrackDurationSeconds(path)));
 }
 
 void FreezeAnimationDynamicMeshFlow(
@@ -35175,9 +35642,8 @@ void FreezeAnimationDynamicMeshFlow(
                     job->frozenAuthoredRainLevel,
                     std::max(
                         1.0e-6F,
-                        invisible_places::camera::
-                            AnimationPathDurationSeconds(
-                                job->animationPath.value())));
+                        AuthoredAnimationTrackDurationSeconds(
+                            job->animationPath.value())));
     }
     job->frozenDynamicMeshFlowLayerId.reset();
     job->frozenDynamicMeshFlowLayerExported = false;
@@ -35230,18 +35696,31 @@ WaterFrameState ResolveFrozenWaterFrameState(
     WaterFrameState result;
     result.sampleTimeSeconds = std::max(0.0F, sampleTimeSeconds);
     if (job.animationPath.has_value()) {
-        const float durationSeconds = std::max(
+        const auto& path = job.animationPath.value();
+        const float cameraDurationSeconds = std::max(
             1.0e-6F,
             invisible_places::camera::AnimationPathDurationSeconds(
-                job.animationPath.value()));
-        result.sampleTimeSeconds = std::clamp(
+                path));
+        const float cameraSampleTimeSeconds = std::clamp(
             result.sampleTimeSeconds,
             0.0F,
-            durationSeconds);
-        result.normalizedTime = std::clamp(
-            result.sampleTimeSeconds / durationSeconds,
+            cameraDurationSeconds);
+        const float cameraPosition = std::clamp(
+            cameraSampleTimeSeconds / cameraDurationSeconds,
             0.0F,
             1.0F);
+        const float cameraFrames = static_cast<float>(
+            EffectiveAnimationDurationFramesForTracks(path));
+        const float trackFrames = static_cast<float>(
+            AuthoredAnimationTrackDurationFrames(path));
+        result.normalizedTime = std::clamp(
+            cameraPosition * cameraFrames / trackFrames,
+            0.0F,
+            1.0F);
+        // This field drives keyed envelopes. Procedural export motion receives
+        // the original full output sample time separately.
+        result.sampleTimeSeconds =
+            result.normalizedTime * trackFrames / 30.0F;
     } else {
         result.normalizedTime =
             std::clamp(job.frozenNormalizedTime, 0.0F, 1.0F);
@@ -35690,10 +36169,8 @@ QuickMp4ExportStartResult StartQuickMp4ExportJob(
         .waterRainVisual = waterSnapshot.rainVisual,
         .frozenPreviewWaterScenario =
             waterSnapshot.authoredFrameControlState,
-        .frozenNormalizedTime = std::clamp(
-            runtimeState->animationPanel.scrubAmount,
-            0.0F,
-            1.0F),
+        .frozenNormalizedTime =
+            CurrentAuthoredTrackPosition(*runtimeState),
         .effectiveSeepageInvocations = effectiveSeepageInvocations,
         .frozenSeepageLayers = std::move(frozenSeepageLayers),
         .frozenFlowSourceLayers = std::move(frozenFlowSourceLayers),
@@ -36581,10 +37058,8 @@ void StartStillCameraExportJob(
         .frozenFeatureTimingRuns =
             SnapshotActiveWaterFeatureTimingRuns(*runtimeState),
         .frozenShorelineInstances = runtimeState->water.shorelineInstances,
-        .frozenNormalizedTime = std::clamp(
-            runtimeState->animationPanel.scrubAmount,
-            0.0F,
-            1.0F),
+        .frozenNormalizedTime =
+            CurrentAuthoredTrackPosition(*runtimeState),
         .exportVisualName = "Current View",
         .exportLog = MakeExportLogState(
             pngStackDirectory.empty()
@@ -43566,17 +44041,304 @@ void DrawAnimationCurveOverlay(
         previous = projected.has_value() ? std::optional<ImVec2>{projected->screen} : std::nullopt;
     }
 }
+
+void DrawReciprocalPanViewportOverlay(
+    PreviewRuntimeState* runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    auto& wizard = runtimeState->animationPanel.reciprocalPanWizard;
+    if (!wizard.Active()) {
+        return;
+    }
+    wizard.viewportClickConsumed = false;
+    auto* drawList =
+        ImGui::GetBackgroundDrawList(ImGui::GetMainViewport());
+    const auto matrices =
+        runtimeState->camera.Matrices(CurrentAspectRatio(viewport));
+    if (wizard.stage == AnimationReciprocalPanWizardStage::Preview &&
+        wizard.candidate.has_value()) {
+        auto& panel = runtimeState->animationPanel;
+        if (wizard.previewMode == 0 || wizard.previewMode == 2) {
+            const auto& prepared = CachedPreparedAnimationPath(
+                &panel,
+                wizard.previewBaselineHold
+                    ? wizard.baselinePaths[0U]
+                    : wizard.candidate->firstCandidate);
+            DrawAnimationCurveOverlay(
+                prepared,
+                matrices,
+                viewport,
+                IM_COL32(55, 205, 255, 225),
+                true);
+        }
+        if (wizard.previewMode == 1 || wizard.previewMode == 2) {
+            const auto& prepared = CachedPreparedAnimationPath(
+                &panel,
+                wizard.previewBaselineHold
+                    ? wizard.baselinePaths[1U]
+                    : wizard.candidate->secondCandidate);
+            DrawAnimationCurveOverlay(
+                prepared,
+                matrices,
+                viewport,
+                IM_COL32(255, 130, 75, 225),
+                true);
+        }
+    }
+    const auto origin = CurrentUiViewportOrigin();
+    const auto size = CurrentUiViewportSize(viewport);
+    const auto screenFromNormalized = [&](ImVec2 point) {
+        return ImVec2{
+            origin.x + std::clamp(point.x, 0.0F, 1.0F) * size.x,
+            origin.y + std::clamp(point.y, 0.0F, 1.0F) * size.y,
+        };
+    };
+    static constexpr const char* kTriangleLabels[] = {
+        "A start",
+        "B end",
+        "B start",
+        "A end",
+    };
+    static constexpr const char* kNodeLabels[] = {
+        "anchor",
+        "pan",
+        "ground",
+    };
+    const std::array<ImU32, 4> triangleColors{
+        IM_COL32(70, 205, 255, 245),
+        IM_COL32(255, 156, 70, 245),
+        IM_COL32(65, 245, 175, 245),
+        IM_COL32(235, 105, 220, 245),
+    };
+    const std::size_t activeTriangle = static_cast<std::size_t>(
+        std::clamp(wizard.selectedTriangleIndex, 0, 3));
+    std::array<std::array<std::optional<ImVec2>, 3>, 4> projectedPoints{};
+    for (std::size_t triangleIndex = 0U;
+         triangleIndex < wizard.endpointTriangles.size();
+         ++triangleIndex) {
+        const auto& triangle = wizard.endpointTriangles[triangleIndex];
+        const std::size_t pointCount = std::min<std::size_t>(
+            triangle.patch.pointCount,
+            3U);
+        for (std::size_t node = 0U; node < pointCount; ++node) {
+            const auto& point = triangle.patch.worldPoints[node];
+            const auto projected = ProjectWorldPoint(
+                matrices,
+                viewport,
+                glm::vec3{point[0U], point[1U], point[2U]});
+            projectedPoints[triangleIndex][node] =
+                projected.has_value()
+                    ? std::optional<ImVec2>{projected->screen}
+                    : std::optional<ImVec2>{screenFromNormalized(
+                          triangle.normalizedScreens[node])};
+        }
+        if (pointCount >= 2U) {
+            for (std::size_t node = 1U; node < pointCount; ++node) {
+                if (projectedPoints[triangleIndex][node - 1U].has_value() &&
+                    projectedPoints[triangleIndex][node].has_value()) {
+                    drawList->AddLine(
+                        projectedPoints[triangleIndex][node - 1U].value(),
+                        projectedPoints[triangleIndex][node].value(),
+                        triangleColors[triangleIndex],
+                        triangleIndex == activeTriangle ? 2.8F : 1.4F);
+                }
+            }
+            if (pointCount == 3U &&
+                projectedPoints[triangleIndex][0U].has_value() &&
+                projectedPoints[triangleIndex][2U].has_value()) {
+                drawList->AddLine(
+                    projectedPoints[triangleIndex][2U].value(),
+                    projectedPoints[triangleIndex][0U].value(),
+                    triangleColors[triangleIndex],
+                    triangleIndex == activeTriangle ? 2.8F : 1.4F);
+            }
+        }
+        for (std::size_t node = 0U; node < pointCount; ++node) {
+            if (!projectedPoints[triangleIndex][node].has_value()) {
+                continue;
+            }
+            const ImVec2 point = projectedPoints[triangleIndex][node].value();
+            const bool selected = triangleIndex == activeTriangle &&
+                                  static_cast<int>(node) ==
+                                      wizard.selectedNodeIndex;
+            drawList->AddCircleFilled(
+                point,
+                selected ? 7.0F : 4.8F,
+                triangleColors[triangleIndex],
+                20);
+            drawList->AddCircle(
+                point,
+                selected ? 11.0F : 8.0F,
+                IM_COL32(0, 0, 0, 220),
+                20,
+                selected ? 2.6F : 1.8F);
+            const std::string label =
+                std::string{kTriangleLabels[triangleIndex]} + " " +
+                std::to_string(node + 1U) + " " + kNodeLabels[node];
+            drawList->AddText(
+                ImVec2{point.x + 10.0F, point.y - 18.0F},
+                IM_COL32(255, 255, 255, 245),
+                label.c_str());
+        }
+    }
+
+    const auto& io = ImGui::GetIO();
+    const bool viewportInteractive =
+        wizard.stage != AnimationReciprocalPanWizardStage::Preview &&
+        !wizard.inspectionActive && IsMouseOverRenderViewport(viewport) &&
+        !viewport.UiWantsMouseCapture();
+    auto& selectedTriangle = wizard.endpointTriangles[activeTriangle];
+    const bool selectedNodeExists =
+        wizard.selectedNodeIndex >= 0 &&
+        static_cast<std::uint32_t>(wizard.selectedNodeIndex) <
+            selectedTriangle.patch.pointCount;
+    if (wizard.nodeGizmoDrag.kind !=
+        ManualFlowPathGizmoDragKind::None) {
+        wizard.nodeGizmoPointerCaptured = true;
+        wizard.viewportClickConsumed = true;
+        if (!io.MouseDown[ImGuiMouseButton_Left]) {
+            wizard.nodeGizmoDrag = {};
+            wizard.nodeGizmoPointerCaptured = false;
+        } else if (const auto nextPoint = UpdateViewportGizmoDrag(
+                       wizard.nodeGizmoDrag,
+                       matrices,
+                       viewport,
+                       io.MousePos);
+                   nextPoint.has_value() && selectedNodeExists) {
+            auto& point = selectedTriangle.patch.worldPoints[
+                static_cast<std::size_t>(wizard.selectedNodeIndex)];
+            point = {nextPoint->x, nextPoint->y, nextPoint->z};
+            InvalidateReciprocalPanWizardCandidate(&wizard);
+        }
+    } else if (selectedNodeExists && viewportInteractive &&
+               !wizard.reraycastSelectedNode) {
+        const auto& point = selectedTriangle.patch.worldPoints[
+            static_cast<std::size_t>(wizard.selectedNodeIndex)];
+        const glm::vec3 worldPoint{point[0U], point[1U], point[2U]};
+        const auto gizmo = BuildAndDrawViewportGizmo(
+            drawList,
+            matrices,
+            viewport,
+            worldPoint);
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+            !ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            if (const auto hit = HitTestViewportGizmo(
+                    gizmo,
+                    io.MousePos);
+                hit.has_value()) {
+                if (const auto drag = BeginViewportGizmoDrag(
+                        hit.value(),
+                        gizmo,
+                        matrices,
+                        viewport,
+                        io.MousePos,
+                        worldPoint);
+                    drag.has_value()) {
+                    wizard.nodeGizmoDrag = drag.value();
+                    wizard.nodeGizmoPointerCaptured = true;
+                    wizard.viewportClickConsumed = true;
+                    wizard.anchorPickArmed = false;
+                    wizard.reraycastSelectedNode = false;
+                }
+            }
+        }
+    }
+
+    if (viewportInteractive && !wizard.nodeGizmoPointerCaptured &&
+        ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        std::optional<std::size_t> hitNode;
+        float hitDistance = 12.0F;
+        for (std::size_t node = 0U; node < 3U; ++node) {
+            if (!projectedPoints[activeTriangle][node].has_value()) {
+                continue;
+            }
+            const float distance = ScreenDistance(
+                io.MousePos,
+                projectedPoints[activeTriangle][node].value());
+            if (distance < hitDistance) {
+                hitDistance = distance;
+                hitNode = node;
+            }
+        }
+        if (hitNode.has_value()) {
+            const bool explicitReraycast = wizard.reraycastSelectedNode;
+            const std::size_t replacementNode = explicitReraycast
+                                                    ? static_cast<std::size_t>(
+                                                          std::clamp(
+                                                              wizard.selectedNodeIndex,
+                                                              0,
+                                                              2))
+                                                    : hitNode.value();
+            if (!explicitReraycast) {
+                wizard.selectedNodeIndex =
+                    static_cast<int>(hitNode.value());
+            }
+            wizard.viewportClickConsumed = true;
+            if (explicitReraycast ||
+                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                const auto patch = ResolveReciprocalPanSurfacePatch(
+                    *runtimeState,
+                    viewport,
+                    io.MousePos,
+                    wizard.commonSceneKey);
+                if (patch.has_value()) {
+                    selectedTriangle.patch.worldPoints[replacementNode] =
+                        patch->worldPoints[0U];
+                    const auto local = ToRenderViewportLocal(
+                        viewport,
+                        io.MousePos);
+                    selectedTriangle.normalizedScreens[replacementNode] = {
+                        std::clamp(
+                            local.x / std::max(1.0F, size.x),
+                            0.0F,
+                            1.0F),
+                        std::clamp(
+                            local.y / std::max(1.0F, size.y),
+                            0.0F,
+                            1.0F),
+                    };
+                    selectedTriangle.captured =
+                        selectedTriangle.patch.pointCount == 3U;
+                    wizard.reraycastSelectedNode = false;
+                    wizard.anchorPickArmed = false;
+                    InvalidateReciprocalPanWizardCandidate(&wizard);
+                    runtimeState->statusMessage =
+                        "Re-raycast the selected correspondence node.";
+                    runtimeState->errorMessage.clear();
+                } else {
+                    wizard.errorMessage =
+                        "No cached common-scene surface was found under that node.";
+                }
+            }
+        }
+    }
+
+    if (wizard.anchorPickArmed && !wizard.inspectionActive) {
+        drawList->AddText(
+            ImVec2{origin.x + 18.0F, origin.y + 18.0F},
+            IM_COL32(255, 235, 150, 255),
+            wizard.reraycastSelectedNode
+                ? "Reciprocal Pan Extension: click to replace the selected triangle node"
+                : "Reciprocal Pan Extension: click the next anchor / pan / ground node");
+    }
+}
+
 void DrawAnimationViewportOverlay(
     PreviewRuntimeState* runtimeState,
     const invisible_places::renderer::core::VulkanViewportShell& viewport) {
     if (runtimeState == nullptr ||
         runtimeState->water.manualFlowPathEditor.active ||
-        !runtimeState->animationPanel.showSplines ||
+        (!runtimeState->animationPanel.showSplines &&
+         !runtimeState->animationPanel.reciprocalPanWizard.Active()) ||
         !runtimeState->animationPanel.currentPath.has_value()) {
         return;
     }
 
     auto& panel = runtimeState->animationPanel;
+    if (panel.reciprocalPanWizard.Active()) {
+        DrawReciprocalPanViewportOverlay(runtimeState, viewport);
+        panel.drag.active = false;
+        return;
+    }
     const auto currentIndex =
         panel.currentFilePath.empty()
             ? std::nullopt
@@ -45775,9 +46537,9 @@ bool ValidateLoopSmoothingMovableLinks(
          ++pairPathIndex) {
         const auto fileIndex = pairIndices[pairPathIndex];
         const auto* path = RegistryAnimationPath(runtimeState, fileIndex);
-        if (path == nullptr || path->keys.size() < 3U) {
+        if (path == nullptr || path->keys.size() < 2U) {
             if (errorMessage != nullptr) {
-                *errorMessage = "Both selected animations must be loaded and contain at least three keys.";
+                *errorMessage = "Both selected animations must be loaded and contain at least two keys.";
             }
             return false;
         }
@@ -49580,6 +50342,2310 @@ void SwitchSavedEditedAnimationVariant(
     ApplyAnimationScrub(runtimeState);
 }
 
+const char* ReciprocalPanWizardStageLabel(
+    AnimationReciprocalPanWizardStage stage) {
+    switch (stage) {
+        case AnimationReciprocalPanWizardStage::Seam1SourceTriangle:
+            return "1 / 8 - Seam 1: triangle at A start";
+        case AnimationReciprocalPanWizardStage::Seam1DestinationTriangle:
+            return "2 / 8 - Seam 1: corresponding triangle at B end";
+        case AnimationReciprocalPanWizardStage::Seam1TailExtent:
+            return "3 / 8 - Seam 1: choose A opening span (drives B tail)";
+        case AnimationReciprocalPanWizardStage::Seam2SourceTriangle:
+            return "4 / 8 - Seam 2: triangle at B start";
+        case AnimationReciprocalPanWizardStage::Seam2DestinationTriangle:
+            return "5 / 8 - Seam 2: corresponding triangle at A end";
+        case AnimationReciprocalPanWizardStage::Seam2TailExtent:
+            return "6 / 8 - Seam 2: choose B opening span (drives A tail)";
+        case AnimationReciprocalPanWizardStage::EditCorrespondences:
+            return "7 / 8 - Review triangle correspondences";
+        case AnimationReciprocalPanWizardStage::Preview:
+            return "8 / 8 - Preview both generated tails";
+        case AnimationReciprocalPanWizardStage::Idle:
+            break;
+    }
+    return "Reciprocal Pan Extension";
+}
+
+std::uint32_t ReciprocalPanPathFrameCount(const AnimationPath& path) {
+    return std::max<std::uint32_t>(
+        path.durationFrames,
+        path.keys.size() > 1U
+            ? static_cast<std::uint32_t>(path.keys.size() - 1U)
+            : 1U);
+}
+
+float ReciprocalPanFramePosition(
+    const AnimationPath& path,
+    std::uint32_t frame) {
+    return std::clamp(
+        static_cast<float>(frame) /
+            static_cast<float>(ReciprocalPanPathFrameCount(path)),
+        0.0F,
+        1.0F);
+}
+
+std::uint32_t ReciprocalPanSourceTailMaximumFrame(
+    const AnimationPath& path) {
+    if (path.keys.size() < 2U) {
+        return 0U;
+    }
+    const std::uint32_t totalFrames = ReciprocalPanPathFrameCount(path);
+    if (path.keys.size() == 2U) {
+        return totalFrames > 1U ? totalFrames - 1U : 0U;
+    }
+    const float penultimatePosition = invisible_places::camera::
+        AnimationPathKeyNormalizedPosition(path, path.keys.size() - 2U);
+    return std::min(
+        totalFrames,
+        static_cast<std::uint32_t>(std::lround(
+            std::clamp(penultimatePosition, 0.0F, 1.0F) *
+            static_cast<float>(totalFrames))));
+}
+
+std::optional<std::string> ResolveReciprocalPanCommonSceneKey(
+    const PreviewRuntimeState& runtimeState,
+    const AnimationPath& first,
+    const AnimationPath& second) {
+    auto firstAssociations = first.associatedLayerPaths;
+    auto secondAssociations = second.associatedLayerPaths;
+    CanonicalizeAssociatedLayerPathsForSceneGroups(
+        runtimeState,
+        &firstAssociations);
+    CanonicalizeAssociatedLayerPathsForSceneGroups(
+        runtimeState,
+        &secondAssociations);
+    for (const auto& association : firstAssociations) {
+        if (!AssociatedLayerPathsContain(secondAssociations, association)) {
+            continue;
+        }
+        const auto key = NormalizePathKey(association);
+        const bool resident = std::any_of(
+            runtimeState.sessions.begin(),
+            runtimeState.sessions.end(),
+            [&](const PreviewLayerSession& session) {
+                return IsAssociableLidarSession(session) &&
+                       !session.pivotSamples.empty() &&
+                       NormalizePathKey(AssociationPathForSession(session)) ==
+                           key &&
+                       IsCpuReadyAnalysisPointCloudSource(session);
+            });
+        if (resident) {
+            return key;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> ReciprocalPanPreflightFailure(
+    const PreviewRuntimeState& runtimeState,
+    const AnimationPath& first,
+    const AnimationPath& second) {
+    if (runtimeState.camera.ParallelProjection()) {
+        return "Reciprocal pan extension needs a perspective live view. Switch Parallel off before launching so viewport anchors use the same FOV projection as the fit.";
+    }
+    if (first.keys.size() < 2U || second.keys.size() < 2U) {
+        return "Both animations need at least two camera keys.";
+    }
+    const auto hasValidUniqueKeys = [](const AnimationPath& path) {
+        std::unordered_set<std::string> ids;
+        for (const auto& key : path.keys) {
+            const auto finiteVector = [](const auto& value) {
+                return std::all_of(
+                    value.begin(),
+                    value.end(),
+                    [](float component) {
+                        return std::isfinite(component);
+                    });
+            };
+            if (key.id.empty() || !ids.insert(key.id).second ||
+                !finiteVector(key.cameraPosition) ||
+                !finiteVector(key.focusPoint) ||
+                !std::isfinite(key.fovDegrees) || key.fovDegrees <= 0.0F ||
+                !std::isfinite(key.nearPlane) || key.nearPlane <= 0.0F ||
+                !std::isfinite(key.farPlane) ||
+                key.farPlane <= key.nearPlane ||
+                (key.hasFocusDistance &&
+                 (!std::isfinite(key.focusDistance) ||
+                  key.focusDistance <= 0.0F)) ||
+                (key.hasApertureFStops &&
+                 (!std::isfinite(key.apertureFStops) ||
+                  key.apertureFStops <= 0.0F))) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!hasValidUniqueKeys(first) || !hasValidUniqueKeys(second)) {
+        return "Both animations need finite camera/lens values and non-empty, unique camera-key IDs.";
+    }
+    const auto incomingTimingFits = [](const AnimationPath& path) {
+        std::uint64_t total = 0U;
+        for (std::size_t keyIndex = 1U;
+             keyIndex < path.keys.size();
+             ++keyIndex) {
+            total += std::max<std::uint32_t>(
+                1U,
+                path.keys[keyIndex].durationFrames);
+            if (total > std::numeric_limits<std::uint32_t>::max()) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!incomingTimingFits(first) || !incomingTimingFits(second)) {
+        return "A or B has malformed segment timing whose incoming-frame sum exceeds the supported 32-bit animation duration. Repair its key durations before extending the pair.";
+    }
+    const auto targetDriven = [](const AnimationPath& path) {
+        return std::none_of(
+            path.keys.begin(),
+            path.keys.end(),
+            [](const auto& key) { return key.hasOrientation; });
+    };
+    if (!targetDriven(first) || !targetDriven(second)) {
+        return "Both animations must be target-driven. Remove explicit orientation keys before extending their pans.";
+    }
+    const auto fixedLensFailure = [](const AnimationPath& path) {
+        const auto& lens = path.keys.front();
+        const bool authoredFocusDistance = std::any_of(
+            path.keys.begin(),
+            path.keys.end(),
+            [](const auto& key) { return key.hasFocusDistance; });
+        const bool authoredAperture = std::any_of(
+            path.keys.begin(),
+            path.keys.end(),
+            [](const auto& key) { return key.hasApertureFStops; });
+        const auto endpointHasLensMotion = [&](const auto& key) {
+            if (!key.hasSplineEndpointTangent) {
+                return false;
+            }
+            for (std::size_t channel = 0U;
+                 channel < key.splineLensEndpointTangent.size();
+                 ++channel) {
+                const float tangent =
+                    key.splineLensEndpointTangent[channel];
+                const bool active = channel < 3U ||
+                    (channel == 3U && authoredFocusDistance) ||
+                    (channel == 4U && authoredAperture);
+                if (!std::isfinite(tangent) ||
+                    (active && std::abs(tangent) > 1.0e-7F)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        const bool animatedLensTangent =
+            endpointHasLensMotion(path.keys.front()) ||
+            endpointHasLensMotion(path.keys.back());
+        return animatedLensTangent || std::any_of(
+            path.keys.begin() + 1,
+            path.keys.end(),
+            [&](const auto& key) {
+                return std::abs(key.fovDegrees - lens.fovDegrees) > 1.0e-4F ||
+                       std::abs(key.nearPlane - lens.nearPlane) > 1.0e-5F ||
+                       std::abs(key.farPlane - lens.farPlane) > 1.0e-3F ||
+                       key.hasApertureFStops != lens.hasApertureFStops ||
+                       key.hasFocusDistance != lens.hasFocusDistance ||
+                       (key.hasFocusDistance &&
+                        std::abs(key.focusDistance - lens.focusDistance) >
+                            1.0e-4F) ||
+                       (key.hasApertureFStops &&
+                        std::abs(key.apertureFStops -
+                                 lens.apertureFStops) > 1.0e-4F);
+            });
+    };
+    if (fixedLensFailure(first) || fixedLensFailure(second)) {
+        return "Both animations need a fixed lens (FOV, clipping planes, and aperture must stay constant).";
+    }
+    if (!ResolveReciprocalPanCommonSceneKey(
+             runtimeState,
+             first,
+             second)
+             .has_value()) {
+        return "A and B need one common, currently resident point-cloud scene for anchor picking.";
+    }
+    if (ReciprocalPanSourceTailMaximumFrame(first) < 2U ||
+        ReciprocalPanSourceTailMaximumFrame(second) < 2U) {
+        return "Each animation needs at least two source frames before the allowed tail limit. Lengthen the animation or move/add its penultimate key.";
+    }
+    return std::nullopt;
+}
+
+std::optional<
+    invisible_places::camera::AnimationClipPlaneNormalizationResult>
+ReciprocalPanClipPlaneNormalizationForPair(
+    const AnimationPath& first,
+    const AnimationPath& second) {
+    auto normalization = invisible_places::camera::
+        BuildConservativeAnimationClipPlaneNormalization(first, second);
+    if (!normalization.succeeded || !normalization.changed) {
+        return std::nullopt;
+    }
+    return normalization;
+}
+
+std::optional<std::string> ReciprocalPanClipPlaneLinkFailure(
+    const AnimationPath& first,
+    const AnimationPath& second) {
+    const auto linkedKey = [](const AnimationPath& path) {
+        return std::find_if(
+            path.keys.begin(),
+            path.keys.end(),
+            [](const auto& key) {
+                return !key.linkedCameraId.empty();
+            });
+    };
+    if (linkedKey(first) != first.keys.end() ||
+        linkedKey(second) != second.keys.end()) {
+        return "A/B clip normalization is intentionally path-local. Unlink or untangle linked CameraShots first so an unsaved two-animation repair cannot silently alter other animations or the project camera library.";
+    }
+    return std::nullopt;
+}
+
+bool NormalizeReciprocalPanClipPlanes(
+    PreviewRuntimeState* runtimeState,
+    std::size_t firstIndex,
+    std::size_t secondIndex) {
+    if (runtimeState == nullptr || firstIndex == secondIndex) {
+        return false;
+    }
+    auto& panel = runtimeState->animationPanel;
+    if (firstIndex >= panel.availableFiles.size() ||
+        secondIndex >= panel.availableFiles.size() ||
+        panel.currentFilePath.empty() ||
+        !PathsLexicallyEqual(
+            panel.availableFiles[firstIndex],
+            std::filesystem::path{panel.currentFilePath})) {
+        runtimeState->errorMessage =
+            "The active A animation changed before clip normalization could run. Select the pair and try again.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    const auto* first = RegistryAnimationPath(*runtimeState, firstIndex);
+    const auto* second = RegistryAnimationPath(*runtimeState, secondIndex);
+    if (first == nullptr || second == nullptr) {
+        runtimeState->errorMessage =
+            "Both animations must remain loaded while normalizing their clip planes.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    if (const auto linkFailure = ReciprocalPanClipPlaneLinkFailure(
+            *first,
+            *second);
+        linkFailure.has_value()) {
+        runtimeState->errorMessage = linkFailure.value();
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    auto normalization = invisible_places::camera::
+        BuildConservativeAnimationClipPlaneNormalization(*first, *second);
+    if (!normalization.succeeded || !normalization.changed) {
+        runtimeState->errorMessage = normalization.errorMessage.empty()
+            ? "A/B clip planes are already normalized."
+            : normalization.errorMessage;
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    // Validation above is read-only. Commit both editable shadows together
+    // and keep the current A animation active; neither saved source changes
+    // until the user explicitly saves its _Edited version.
+    EnsureAnimationAssociationStorage(&panel);
+    panel.availableFileEditedPaths[firstIndex] =
+        normalization.firstCandidate;
+    panel.availableFileEditedPaths[secondIndex] =
+        normalization.secondCandidate;
+    panel.availableFileDirtyFlags[firstIndex] = true;
+    panel.availableFileDirtyFlags[secondIndex] = true;
+    panel.currentPath = normalization.firstCandidate;
+    panel.currentPathUsesEdited = true;
+    panel.selectedFileUsesEdited = true;
+    panel.dirty = true;
+    panel.preparedPathCache = {};
+    panel.motionStatsCache = {};
+    panel.perceivedFlowCache = {};
+    panel.loopTimeline.previewDirty = true;
+    panel.loopTimeline.previewInProgress = false;
+    panel.loopTimeline.preview.reset();
+    panel.loopTimeline.previewError.clear();
+    panel.loopSmoothingDiagnostics.reset();
+    panel.strongAlignmentDiagnostics.reset();
+    panel.matchingFrameGhost.captureMatchesCurrentFrame = false;
+    panel.matchingFrameGhost.capturedMotionFingerprints = {};
+    runtimeState->previewRenderStateSignatureValid = false;
+    runtimeState->animationPlayback.active = false;
+    runtimeState->cameraPlayback.active = false;
+    if (runtimeState->animationVelocityPreviewJob.worker.joinable()) {
+        runtimeState->animationVelocityPreviewJob.worker.request_stop();
+    }
+    if (runtimeState->animationStrongAlignmentJob.worker.joinable()) {
+        runtimeState->animationStrongAlignmentJob.worker.request_stop();
+    }
+    if (runtimeState->animationMatchingFrameGhostJob.worker.joinable()) {
+        runtimeState->animationMatchingFrameGhostJob.worker.request_stop();
+    }
+    ApplyAnimationScrub(runtimeState);
+    runtimeState->statusMessage =
+        "Normalized A/B clip planes to near " +
+        FormatFixed(normalization.nearPlane, 4) + " m and far " +
+        FormatFixed(normalization.farPlane, 3) +
+        " m. Both _Edited animations now share the same conservative visible range.";
+    runtimeState->errorMessage.clear();
+    return true;
+}
+
+std::optional<std::string> AppliedReciprocalPairFailure(
+    const AnimationPath& first,
+    const std::filesystem::path& firstFilePath,
+    const AnimationPath& second,
+    const std::filesystem::path& secondFilePath) {
+    if (!first.velocityBlendLink.has_value() ||
+        !second.velocityBlendLink.has_value() ||
+        first.velocityBlendLink->pairId.empty() ||
+        first.velocityBlendLink->pairId !=
+            second.velocityBlendLink->pairId) {
+        return "A reciprocal blend pair has not been applied yet.";
+    }
+    const auto& firstLink = first.velocityBlendLink.value();
+    const auto& secondLink = second.velocityBlendLink.value();
+    if (firstLink.partnerFileName !=
+            secondFilePath.filename().string() ||
+        secondLink.partnerFileName !=
+            firstFilePath.filename().string()) {
+        return "The applied blend link is not reciprocal: A and B do not name each other as partners.";
+    }
+    const auto finiteNonnegative = [](float value) {
+        return std::isfinite(value) && value >= 0.0F;
+    };
+    if (!finiteNonnegative(firstLink.startOverlapSeconds) ||
+        !finiteNonnegative(firstLink.endOverlapSeconds) ||
+        !finiteNonnegative(secondLink.startOverlapSeconds) ||
+        !finiteNonnegative(secondLink.endOverlapSeconds)) {
+        return "The applied reciprocal overlap bounds are not finite and non-negative.";
+    }
+    constexpr float kHalfFrameSeconds = (0.5F / 30.0F) + 1.0e-5F;
+    const float firstDuration = invisible_places::camera::
+        AnimationPathDurationSeconds(first);
+    const float secondDuration = invisible_places::camera::
+        AnimationPathDurationSeconds(second);
+    if (firstLink.startOverlapSeconds + firstLink.endOverlapSeconds >
+            firstDuration + kHalfFrameSeconds ||
+        secondLink.startOverlapSeconds + secondLink.endOverlapSeconds >
+            secondDuration + kHalfFrameSeconds) {
+        return "The applied reciprocal overlap bands cross inside A or B.";
+    }
+    const auto sameCanonicalFrame = [](float left, float right) {
+        return std::lround(30.0F * left) ==
+               std::lround(30.0F * right);
+    };
+    if (std::abs(firstLink.startOverlapSeconds -
+                 secondLink.endOverlapSeconds) >
+            kHalfFrameSeconds ||
+        std::abs(firstLink.endOverlapSeconds -
+                 secondLink.startOverlapSeconds) >
+            kHalfFrameSeconds ||
+        !sameCanonicalFrame(
+            firstLink.startOverlapSeconds,
+            secondLink.endOverlapSeconds) ||
+        !sameCanonicalFrame(
+            firstLink.endOverlapSeconds,
+            secondLink.startOverlapSeconds)) {
+        return "The applied A/B overlap bounds are not reciprocal at frame precision (A start must equal B end, and A end must equal B start).";
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> ReciprocalPanExistingLinkConflict(
+    const AnimationPath& first,
+    const std::filesystem::path& firstFilePath,
+    const AnimationPath& second,
+    const std::filesystem::path& secondFilePath) {
+    if (!first.velocityBlendLink.has_value() &&
+        !second.velocityBlendLink.has_value()) {
+        return std::nullopt;
+    }
+    if (first.velocityBlendLink.has_value() &&
+        second.velocityBlendLink.has_value() &&
+        !first.velocityBlendLink->pairId.empty() &&
+        first.velocityBlendLink->pairId ==
+            second.velocityBlendLink->pairId &&
+        first.velocityBlendLink->partnerFileName ==
+            secondFilePath.filename().string() &&
+        second.velocityBlendLink->partnerFileName ==
+            firstFilePath.filename().string()) {
+        return std::nullopt;
+    }
+    return "A or B already has a different or one-sided velocity-blend partner. Unlink that pair first; this assistant can create a new A/B pair or update the overlap metadata of an existing reciprocal A/B pair.";
+}
+
+int ReciprocalPanTrianglePathRole(std::size_t triangleIndex) {
+    return triangleIndex == 0U || triangleIndex == 3U ? 0 : 1;
+}
+
+std::size_t ReciprocalPanStageTriangleIndex(
+    const AnimationReciprocalPanWizardState& wizard) {
+    switch (wizard.stage) {
+        case AnimationReciprocalPanWizardStage::Seam1SourceTriangle:
+        case AnimationReciprocalPanWizardStage::Seam1TailExtent:
+            return 0U;
+        case AnimationReciprocalPanWizardStage::Seam1DestinationTriangle:
+            return 1U;
+        case AnimationReciprocalPanWizardStage::Seam2SourceTriangle:
+        case AnimationReciprocalPanWizardStage::Seam2TailExtent:
+            return 2U;
+        case AnimationReciprocalPanWizardStage::Seam2DestinationTriangle:
+            return 3U;
+        case AnimationReciprocalPanWizardStage::EditCorrespondences:
+            return static_cast<std::size_t>(
+                std::clamp(wizard.selectedTriangleIndex, 0, 3));
+        case AnimationReciprocalPanWizardStage::Preview:
+        case AnimationReciprocalPanWizardStage::Idle:
+            return 0U;
+    }
+    return 0U;
+}
+
+int ReciprocalPanStagePathRole(
+    const AnimationReciprocalPanWizardState& wizard) {
+    switch (wizard.stage) {
+        case AnimationReciprocalPanWizardStage::Seam1SourceTriangle:
+        case AnimationReciprocalPanWizardStage::Seam1TailExtent:
+        case AnimationReciprocalPanWizardStage::Seam2DestinationTriangle:
+            return 0;
+        case AnimationReciprocalPanWizardStage::Seam1DestinationTriangle:
+        case AnimationReciprocalPanWizardStage::Seam2SourceTriangle:
+        case AnimationReciprocalPanWizardStage::Seam2TailExtent:
+            return 1;
+        case AnimationReciprocalPanWizardStage::EditCorrespondences:
+            return ReciprocalPanTrianglePathRole(
+                ReciprocalPanStageTriangleIndex(wizard));
+        case AnimationReciprocalPanWizardStage::Preview:
+        case AnimationReciprocalPanWizardStage::Idle:
+            return 0;
+    }
+    return 0;
+}
+
+std::uint32_t ReciprocalPanStageFrame(
+    const AnimationReciprocalPanWizardState& wizard) {
+    switch (wizard.stage) {
+        case AnimationReciprocalPanWizardStage::Seam1SourceTriangle:
+        case AnimationReciprocalPanWizardStage::Seam1TailExtent:
+        case AnimationReciprocalPanWizardStage::Seam2SourceTriangle:
+        case AnimationReciprocalPanWizardStage::Seam2TailExtent:
+            return 0U;
+        case AnimationReciprocalPanWizardStage::Seam1DestinationTriangle:
+            return ReciprocalPanPathFrameCount(wizard.baselinePaths[1U]);
+        case AnimationReciprocalPanWizardStage::Seam2DestinationTriangle:
+            return ReciprocalPanPathFrameCount(wizard.baselinePaths[0U]);
+        case AnimationReciprocalPanWizardStage::EditCorrespondences: {
+            const std::size_t triangle =
+                ReciprocalPanStageTriangleIndex(wizard);
+            return triangle == 1U
+                       ? ReciprocalPanPathFrameCount(
+                             wizard.baselinePaths[1U])
+                   : triangle == 3U
+                       ? ReciprocalPanPathFrameCount(
+                             wizard.baselinePaths[0U])
+                       : 0U;
+        }
+        case AnimationReciprocalPanWizardStage::Preview:
+        case AnimationReciprocalPanWizardStage::Idle:
+            return 0U;
+    }
+    return 0U;
+}
+
+void ShowReciprocalPanWizardCanonicalPose(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr ||
+        !runtimeState->animationPanel.reciprocalPanWizard.Active()) {
+        return;
+    }
+    auto& wizard = runtimeState->animationPanel.reciprocalPanWizard;
+    wizard.inspectionActive = false;
+    if (wizard.stage == AnimationReciprocalPanWizardStage::Preview &&
+        wizard.candidate.has_value()) {
+        const int role = std::clamp(wizard.previewPose, 0, 3) % 2;
+        const auto& path = wizard.previewBaselineHold
+                               ? wizard.baselinePaths[
+                                     static_cast<std::size_t>(role)]
+                           : role == 0
+                               ? wizard.candidate->firstCandidate
+                               : wizard.candidate->secondCandidate;
+        const bool newTerminal = wizard.previewPose >= 2;
+        const std::uint32_t frame = newTerminal
+                                        ? ReciprocalPanPathFrameCount(path)
+                                        : wizard.sourceTailFrames[
+                                              static_cast<std::size_t>(role)];
+        ApplyAnimationEvaluation(
+            runtimeState,
+            path,
+            ReciprocalPanFramePosition(path, frame),
+            false);
+        return;
+    }
+    const int role = ReciprocalPanStagePathRole(wizard);
+    wizard.selectedTriangleIndex = static_cast<int>(
+        ReciprocalPanStageTriangleIndex(wizard));
+    const auto& path = wizard.baselinePaths[static_cast<std::size_t>(role)];
+    ApplyAnimationEvaluation(
+        runtimeState,
+        path,
+        ReciprocalPanFramePosition(path, ReciprocalPanStageFrame(wizard)),
+        false);
+}
+
+void CancelReciprocalPanWizard(
+    PreviewRuntimeState* runtimeState,
+    std::string_view status = {}) {
+    if (runtimeState == nullptr ||
+        !runtimeState->animationPanel.reciprocalPanWizard.Active()) {
+        return;
+    }
+    auto& panel = runtimeState->animationPanel;
+    const auto launch = panel.reciprocalPanWizard;
+    panel.reciprocalPanWizard = {};
+    runtimeState->animationPlayback.active = false;
+    runtimeState->cameraPlayback.active = false;
+    panel.scrubAmount = launch.launchScrubAmount;
+    panel.matchingFrameGhost.visible = launch.launchGhostVisible;
+    panel.matchingFrameGhost.automaticUpdate =
+        launch.launchGhostAutomaticUpdate;
+    runtimeState->camera.ApplyState(launch.launchCamera);
+    runtimeState->pivotOverlay.visible = launch.launchPivotVisible;
+    runtimeState->pivotOverlay.pivot = launch.launchPivot;
+    runtimeState->pivotOverlay.lastSetAt = launch.launchPivotLastSetAt;
+    if (panel.currentPath.has_value() &&
+        !launch.launchSelectedKeyId.empty()) {
+        const auto selected = std::find_if(
+            panel.currentPath->keys.begin(),
+            panel.currentPath->keys.end(),
+            [&](const auto& key) {
+                return key.id == launch.launchSelectedKeyId;
+            });
+        panel.selectedKeyIndex = selected != panel.currentPath->keys.end()
+                                     ? std::optional<std::size_t>{
+                                           static_cast<std::size_t>(
+                                               std::distance(
+                                                   panel.currentPath->keys.begin(),
+                                                   selected))}
+                                     : std::nullopt;
+    }
+    if (!status.empty()) {
+        runtimeState->statusMessage = std::string{status};
+        runtimeState->errorMessage.clear();
+    }
+}
+
+bool ValidateReciprocalPanWizardStaleState(
+    const PreviewRuntimeState& runtimeState,
+    float currentAspectRatio,
+    std::string* errorMessage) {
+    const auto& wizard = runtimeState.animationPanel.reciprocalPanWizard;
+    if (!wizard.Active()) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "The reciprocal pan session is no longer active.";
+        }
+        return false;
+    }
+    if (std::abs(wizard.aspectRatio - currentAspectRatio) > 1.0e-3F) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "The live-view aspect ratio changed. Cancel and relaunch the extension so screen motion is measured consistently.";
+        }
+        return false;
+    }
+    if (runtimeState.camera.ParallelProjection()) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "The live view switched to Parallel projection. Cancel and relaunch in Perspective before fitting triangle motion.";
+        }
+        return false;
+    }
+    if (runtimeState.animationPanel.currentFilePath.empty() ||
+        !PathsLexicallyEqual(
+            std::filesystem::path{
+                runtimeState.animationPanel.currentFilePath},
+            wizard.filePaths[0U])) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "A is no longer the active animation. Cancel and relaunch the extension.";
+        }
+        return false;
+    }
+    std::array<const AnimationPath*, 2> currentPaths{};
+    for (std::size_t role = 0U; role < 2U; ++role) {
+        const auto index = FindAnimationRegistryIndex(
+            runtimeState.animationPanel,
+            wizard.filePaths[role]);
+        const auto* path = index.has_value()
+                               ? RegistryAnimationPath(
+                                     runtimeState,
+                                     index.value())
+                               : nullptr;
+        if (path == nullptr ||
+            AnimationPathMotionFingerprint(*path) !=
+                wizard.baselineFingerprints[role]) {
+            if (errorMessage != nullptr) {
+                *errorMessage = "A or B changed after the wizard opened. Cancel and relaunch to avoid applying a stale fit.";
+            }
+            return false;
+        }
+        currentPaths[role] = path;
+        const auto& baselineLink = wizard.baselineLinks[role];
+        const bool linkChanged =
+            path->velocityBlendLink.has_value() !=
+                baselineLink.has_value() ||
+            (path->velocityBlendLink.has_value() &&
+             baselineLink.has_value() &&
+             !AnimationVelocityLinksEquivalent(
+                 path->velocityBlendLink.value(),
+                 baselineLink.value()));
+        if (linkChanged) {
+            if (errorMessage != nullptr) {
+                *errorMessage = "A or B's velocity-blend metadata changed after launch. Cancel and relaunch before creating or updating the pair.";
+            }
+            return false;
+        }
+    }
+    const auto commonScene = ResolveReciprocalPanCommonSceneKey(
+        runtimeState,
+        *currentPaths[0U],
+        *currentPaths[1U]);
+    if (!commonScene.has_value() ||
+        commonScene.value() != wizard.commonSceneKey) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "The captured common scene is no longer resident or associated with both animations.";
+        }
+        return false;
+    }
+    return true;
+}
+
+bool RebuildReciprocalPanCandidate(
+    PreviewRuntimeState* runtimeState,
+    float currentAspectRatio) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+    auto& wizard = runtimeState->animationPanel.reciprocalPanWizard;
+    std::string validationError;
+    if (!ValidateReciprocalPanWizardStaleState(
+            *runtimeState,
+            currentAspectRatio,
+            &validationError)) {
+        wizard.candidate.reset();
+        wizard.errorMessage = std::move(validationError);
+        return false;
+    }
+    if (std::any_of(
+            wizard.endpointTriangles.begin(),
+            wizard.endpointTriangles.end(),
+            [](const auto& observation) {
+                return !observation.captured ||
+                       observation.patch.pointCount != 3U;
+            })) {
+        wizard.candidate.reset();
+        wizard.errorMessage =
+            "Capture all three ordered nodes at all four seam endpoints first.";
+        return false;
+    }
+    invisible_places::camera::AnimationReciprocalPanExtensionOptions options;
+    options.firstDrivesSecond.sourceTailFrame =
+        wizard.sourceTailFrames[0U];
+    options.firstDrivesSecond.sourcePatch =
+        wizard.endpointTriangles[0U].patch;
+    options.firstDrivesSecond.destinationEndPatch =
+        wizard.endpointTriangles[1U].patch;
+    options.secondDrivesFirst.sourceTailFrame =
+        wizard.sourceTailFrames[1U];
+    options.secondDrivesFirst.sourcePatch =
+        wizard.endpointTriangles[2U].patch;
+    options.secondDrivesFirst.destinationEndPatch =
+        wizard.endpointTriangles[3U].patch;
+    options.aspectRatio = wizard.aspectRatio;
+    options.sampleCount = 65U;
+    options.optimizationSweeps = 24U;
+    auto& job = runtimeState->animationReciprocalPanFitJob;
+    if (job.shared != nullptr) {
+        wizard.errorMessage =
+            "The previous reciprocal fit is still finishing in the background.";
+        return false;
+    }
+    const std::uint64_t generation = ++wizard.generation;
+    job.activeGeneration = generation;
+    job.shared = std::make_shared<AnimationReciprocalPanFitJobShared>();
+    const auto shared = job.shared;
+    const auto first = wizard.baselinePaths[0U];
+    const auto second = wizard.baselinePaths[1U];
+    const auto filePaths = wizard.filePaths;
+    const auto fingerprints = wizard.baselineFingerprints;
+    job.worker = std::jthread(
+        [shared,
+         generation,
+         first,
+         second,
+         filePaths,
+         fingerprints,
+         options](std::stop_token /*stopToken*/) mutable {
+            AnimationReciprocalPanFitJobResult completed{
+                .generation = generation,
+                .filePaths = filePaths,
+                .motionFingerprints = fingerprints,
+                .aspectRatio = options.aspectRatio,
+            };
+            completed.result = invisible_places::camera::
+                BuildAnimationReciprocalPanExtension(
+                    first,
+                    second,
+                    options);
+            std::scoped_lock lock{shared->mutex};
+            shared->result = std::move(completed);
+            shared->completed = true;
+        });
+    wizard.fitInProgress = true;
+    wizard.candidate.reset();
+    wizard.errorMessage.clear();
+    return true;
+}
+
+void PollAnimationReciprocalPanFitJob(
+    PreviewRuntimeState* runtimeState,
+    float currentAspectRatio) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    auto& job = runtimeState->animationReciprocalPanFitJob;
+    if (job.shared == nullptr) {
+        return;
+    }
+    std::optional<AnimationReciprocalPanFitJobResult> completed;
+    {
+        std::scoped_lock lock{job.shared->mutex};
+        if (!job.shared->completed) {
+            return;
+        }
+        completed = std::move(job.shared->result);
+    }
+    job.shared.reset();
+    if (job.worker.joinable()) {
+        job.worker = std::jthread{};
+    }
+    if (!completed.has_value()) {
+        return;
+    }
+    auto& wizard = runtimeState->animationPanel.reciprocalPanWizard;
+    if (!wizard.Active() ||
+        completed->generation != wizard.generation ||
+        completed->generation != job.activeGeneration ||
+        completed->filePaths != wizard.filePaths ||
+        completed->motionFingerprints != wizard.baselineFingerprints ||
+        std::abs(completed->aspectRatio - wizard.aspectRatio) > 1.0e-5F) {
+        return;
+    }
+    wizard.fitInProgress = false;
+    std::string staleError;
+    if (!ValidateReciprocalPanWizardStaleState(
+            *runtimeState,
+            currentAspectRatio,
+            &staleError)) {
+        wizard.candidate.reset();
+        wizard.errorMessage = std::move(staleError);
+        return;
+    }
+    auto& result = completed->result;
+    if (!result.succeeded || !result.changed) {
+        wizard.candidate.reset();
+        wizard.errorMessage = result.errorMessage.empty()
+                                  ? "The selected motion did not produce a usable terminal extension."
+                                  : result.errorMessage;
+        return;
+    }
+    const auto generatedTailValid = [](const AnimationPath& baseline,
+                                       const AnimationPath& candidate,
+                                       std::uint32_t expectedCount) {
+        if (candidate.keys.size() < baseline.keys.size() + 2U ||
+            candidate.keys.size() > baseline.keys.size() + 3U ||
+            candidate.keys.size() - baseline.keys.size() != expectedCount) {
+            return false;
+        }
+        std::unordered_set<std::string> ids;
+        for (const auto& key : baseline.keys) {
+            ids.insert(key.id);
+        }
+        return std::all_of(
+            candidate.keys.begin() +
+                static_cast<std::ptrdiff_t>(baseline.keys.size()),
+            candidate.keys.end(),
+            [&](const auto& key) {
+                return key.linkedCameraId.empty() &&
+                       !key.id.empty() && ids.insert(key.id).second;
+            });
+    };
+    if (!generatedTailValid(
+            wizard.baselinePaths[0U],
+            result.firstCandidate,
+            result.metrics.appendedKeyCount[0U]) ||
+        !generatedTailValid(
+            wizard.baselinePaths[1U],
+            result.secondCandidate,
+            result.metrics.appendedKeyCount[1U])) {
+        wizard.candidate.reset();
+        wizard.errorMessage =
+            "The fit did not create the expected two or three independent, unlinked tail keys per animation.";
+        return;
+    }
+    wizard.errorMessage.clear();
+    wizard.candidate = std::move(result);
+    if (wizard.stage == AnimationReciprocalPanWizardStage::Preview) {
+        ShowReciprocalPanWizardCanonicalPose(runtimeState);
+    }
+}
+
+bool StartReciprocalPanWizard(
+    PreviewRuntimeState* runtimeState,
+    std::size_t firstIndex,
+    std::size_t secondIndex,
+    float aspectRatio,
+    bool horizontalBlend,
+    bool panRight) {
+    if (runtimeState == nullptr ||
+        firstIndex >= runtimeState->animationPanel.availableFiles.size() ||
+        secondIndex >= runtimeState->animationPanel.availableFiles.size() ||
+        firstIndex == secondIndex) {
+        return false;
+    }
+    auto& panel = runtimeState->animationPanel;
+    if ((firstIndex < panel.availableFileLoopEditPairIds.size() &&
+         !panel.availableFileLoopEditPairIds[firstIndex].empty()) ||
+        (secondIndex < panel.availableFileLoopEditPairIds.size() &&
+         !panel.availableFileLoopEditPairIds[secondIndex].empty())) {
+        runtimeState->errorMessage =
+            "Save or discard the existing paired animation edits before extending these seams again.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    if (runtimeState->activeRenderSetupOverride.has_value() ||
+        runtimeState->offlineRenderJob.active ||
+        runtimeState->saveChanges.requested ||
+        runtimeState->pendingCurrentRenderSnapshot != nullptr ||
+        runtimeState->pendingFramePreviewSnapshot != nullptr) {
+        runtimeState->errorMessage =
+            "Finish or cancel the active render, render setup, or save operation before extending the pan pair.";
+        return false;
+    }
+    if (panel.velocityAlignmentDraft.has_value()) {
+        runtimeState->errorMessage =
+            "Confirm or unapply the current velocity-alignment draft before extending both seams.";
+        return false;
+    }
+    if (panel.drag.active ||
+        runtimeState->water.emitterGizmoPointerCaptured ||
+        runtimeState->water.seepageGizmoPointerCaptured ||
+        runtimeState->water.manualFlowPathEditor.pointerCapturedUntilRelease) {
+        runtimeState->errorMessage =
+            "Release the active viewport gizmo before starting the reciprocal extension.";
+        return false;
+    }
+    const auto* first = RegistryAnimationPath(*runtimeState, firstIndex);
+    const auto* second = RegistryAnimationPath(*runtimeState, secondIndex);
+    if (first == nullptr || second == nullptr) {
+        runtimeState->errorMessage =
+            "Load both animation variants before extending their pans.";
+        return false;
+    }
+    if (const auto pairFailure = ReciprocalPanExistingLinkConflict(
+            *first,
+            panel.availableFiles[firstIndex],
+            *second,
+            panel.availableFiles[secondIndex]);
+        pairFailure.has_value()) {
+        runtimeState->errorMessage = pairFailure.value();
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    const auto originalPreflightFailure = ReciprocalPanPreflightFailure(
+        *runtimeState,
+        *first,
+        *second);
+    const auto clipPlaneNormalization =
+        ReciprocalPanClipPlaneNormalizationForPair(
+            *first,
+            *second);
+    const auto normalizedPreflightFailure =
+        clipPlaneNormalization.has_value()
+            ? ReciprocalPanPreflightFailure(
+                  *runtimeState,
+                  clipPlaneNormalization->firstCandidate,
+                  clipPlaneNormalization->secondCandidate)
+            : std::optional<std::string>{};
+    const bool normalizationMakesExtensionReady =
+        clipPlaneNormalization.has_value() &&
+        !normalizedPreflightFailure.has_value();
+    const auto normalizationLinkFailure =
+        clipPlaneNormalization.has_value()
+            ? ReciprocalPanClipPlaneLinkFailure(*first, *second)
+            : std::optional<std::string>{};
+    if (originalPreflightFailure.has_value() &&
+        (!normalizationMakesExtensionReady ||
+         normalizationLinkFailure.has_value())) {
+        runtimeState->errorMessage =
+            normalizationMakesExtensionReady &&
+                    normalizationLinkFailure.has_value()
+                ? normalizationLinkFailure.value()
+                : originalPreflightFailure.value();
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    std::array<AnimationPath, 2> wizardBaselines{*first, *second};
+    bool normalizeClipPlanesInsideWizard = false;
+    float normalizedNearPlane = 0.0F;
+    float normalizedFarPlane = 0.0F;
+    if (normalizationMakesExtensionReady &&
+        !normalizationLinkFailure.has_value()) {
+        wizardBaselines = {
+            clipPlaneNormalization->firstCandidate,
+            clipPlaneNormalization->secondCandidate,
+        };
+        normalizeClipPlanesInsideWizard = true;
+        normalizedNearPlane = clipPlaneNormalization->nearPlane;
+        normalizedFarPlane = clipPlaneNormalization->farPlane;
+    }
+    const std::unordered_set<std::string> firstMovable{
+        first->keys.back().id};
+    const std::unordered_set<std::string> secondMovable{
+        second->keys.back().id};
+    std::string linkedError;
+    if (!ValidateLoopSmoothingMovableLinks(
+            *runtimeState,
+            firstIndex,
+            secondIndex,
+            firstMovable,
+            secondMovable,
+            &linkedError)) {
+        runtimeState->errorMessage = std::move(linkedError);
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    if (runtimeState->animationVelocityPreviewJob.worker.joinable()) {
+        runtimeState->animationVelocityPreviewJob.worker.request_stop();
+        runtimeState->animationVelocityPreviewJob.worker = std::jthread{};
+    }
+    runtimeState->animationVelocityPreviewJob.shared.reset();
+    if (runtimeState->animationStrongAlignmentJob.worker.joinable()) {
+        runtimeState->animationStrongAlignmentJob.worker.request_stop();
+        runtimeState->animationStrongAlignmentJob.worker = std::jthread{};
+    }
+    runtimeState->animationStrongAlignmentJob.shared.reset();
+    if (runtimeState->animationMatchingFrameGhostJob.worker.joinable()) {
+        runtimeState->animationMatchingFrameGhostJob.worker.request_stop();
+        runtimeState->animationMatchingFrameGhostJob.worker = std::jthread{};
+    }
+    runtimeState->animationMatchingFrameGhostJob.shared.reset();
+    panel.loopTimeline.previewInProgress = false;
+    panel.requestedCameraRigAlignment.reset();
+    panel.requestedLowerFrameAlignment.reset();
+    panel.pendingVelocityLinkSettingsUpdate.reset();
+    panel.requestedMatchingFrameGhostCapture.reset();
+
+    AnimationReciprocalPanWizardState wizard;
+    wizard.stage =
+        AnimationReciprocalPanWizardStage::Seam1SourceTriangle;
+    wizard.filePaths = {
+        panel.availableFiles[firstIndex],
+        panel.availableFiles[secondIndex],
+    };
+    wizard.baselinePaths = std::move(wizardBaselines);
+    wizard.baselineFingerprints = {
+        AnimationPathMotionFingerprint(*first),
+        AnimationPathMotionFingerprint(*second),
+    };
+    wizard.baselineLinks = {
+        first->velocityBlendLink,
+        second->velocityBlendLink,
+    };
+    wizard.clipPlanesNormalizedForExtension =
+        normalizeClipPlanesInsideWizard;
+    wizard.normalizedNearPlane = normalizedNearPlane;
+    wizard.normalizedFarPlane = normalizedFarPlane;
+    for (std::size_t role = 0U; role < 2U; ++role) {
+        const std::uint32_t end = ReciprocalPanSourceTailMaximumFrame(
+            wizard.baselinePaths[role]);
+        wizard.sourceTailFrames[role] = std::min(
+            end,
+            std::max<std::uint32_t>(2U, std::min<std::uint32_t>(30U, end)));
+        wizard.sourceTailFrameDrafts[role] =
+            wizard.sourceTailFrames[role];
+    }
+    wizard.dependencyPairId =
+        first->velocityBlendLink.has_value()
+            ? first->velocityBlendLink->pairId
+            : "reciprocal_pan_" + std::to_string(
+                  std::chrono::steady_clock::now()
+                      .time_since_epoch()
+                      .count());
+    wizard.horizontalBlend = horizontalBlend;
+    wizard.panRight = panRight;
+    const std::array<int, 4> triangleRoles{0, 1, 1, 0};
+    const std::array<std::uint32_t, 4> triangleFrames{
+        0U,
+        ReciprocalPanPathFrameCount(*second),
+        0U,
+        ReciprocalPanPathFrameCount(*first),
+    };
+    for (std::size_t triangle = 0U;
+         triangle < wizard.endpointTriangles.size();
+         ++triangle) {
+        auto& observation = wizard.endpointTriangles[triangle];
+        observation.pathRole = triangleRoles[triangle];
+        observation.frame = triangleFrames[triangle];
+        observation.normalizedPosition = ReciprocalPanFramePosition(
+            wizard.baselinePaths[
+                static_cast<std::size_t>(observation.pathRole)],
+            observation.frame);
+    }
+    wizard.commonSceneKey = ResolveReciprocalPanCommonSceneKey(
+                                *runtimeState,
+                                wizard.baselinePaths[0U],
+                                wizard.baselinePaths[1U])
+                                .value();
+    wizard.aspectRatio = aspectRatio;
+    wizard.launchScrubAmount = panel.scrubAmount;
+    wizard.launchElapsedSeconds =
+        invisible_places::camera::AnimationPathDurationSeconds(*first) *
+        std::clamp(panel.scrubAmount, 0.0F, 1.0F);
+    if (panel.selectedKeyIndex.has_value() &&
+        panel.selectedKeyIndex.value() < first->keys.size()) {
+        wizard.launchSelectedKeyId =
+            first->keys[panel.selectedKeyIndex.value()].id;
+    }
+    wizard.launchCamera = runtimeState->camera.CaptureState();
+    wizard.launchPivotVisible = runtimeState->pivotOverlay.visible;
+    wizard.launchPivot = runtimeState->pivotOverlay.pivot;
+    wizard.launchPivotLastSetAt = runtimeState->pivotOverlay.lastSetAt;
+    wizard.launchGhostVisible = panel.matchingFrameGhost.visible;
+    wizard.launchGhostAutomaticUpdate =
+        panel.matchingFrameGhost.automaticUpdate;
+    wizard.anchorPickArmed = true;
+    wizard.selectedTriangleIndex = 0;
+    wizard.selectedNodeIndex = 0;
+    wizard.inspectionPathRole = 0;
+    wizard.inspectionNormalizedPosition = 0.0F;
+    panel.reciprocalPanWizard = std::move(wizard);
+    panel.matchingFrameGhost.visible = false;
+    panel.matchingFrameGhost.automaticUpdate = false;
+    runtimeState->animationPlayback.active = false;
+    runtimeState->cameraPlayback.active = false;
+    runtimeState->statusMessage =
+        panel.reciprocalPanWizard.clipPlanesNormalizedForExtension
+            ? "Reciprocal Pan Extension started with a private A/B clip-plane normalization. It is committed only by Apply Both; Cancel leaves both animations unchanged."
+            : "Reciprocal Pan Extension started at seam 1. Capture anchor / pan / ground on A start, match those nodes at B end, then scrub A inward to set B's new tail.";
+    runtimeState->errorMessage.clear();
+    ShowReciprocalPanWizardCanonicalPose(runtimeState);
+    return true;
+}
+
+void AddUniqueAnimationKeyId(
+    std::vector<std::string>* ids,
+    std::string_view id) {
+    if (ids == nullptr || id.empty() ||
+        std::find(ids->begin(), ids->end(), id) != ids->end()) {
+        return;
+    }
+    ids->emplace_back(id);
+}
+
+struct ReciprocalPanTimingTakeClonePlan {
+    std::array<std::string, 2> assignedTakeIds;
+    std::vector<invisible_places::timing::TimingTakeDefinition> definitions;
+    std::vector<invisible_places::timing::TimingTakeSceneState> sceneStates;
+    std::vector<std::string> createdTakeIds;
+    std::uint32_t nextSequence = 1U;
+};
+
+bool TimingTakeSceneStateHasAnimationCoordinates(
+    const invisible_places::timing::TimingTakeSceneState& state) {
+    for (const auto& run : state.waterFeatureTimingRuns) {
+        for (const auto& feature : run.features) {
+            for (const auto& setting : feature.settings) {
+                if (!setting.keys.empty()) {
+                    return true;
+                }
+            }
+        }
+    }
+    for (const auto& effect : state.colouriseEffects) {
+        if (effect.activationRange.start != 0.0F ||
+            effect.activationRange.end != 1.0F ||
+            !effect.effectParameterKeys.empty() ||
+            !effect.paletteKeys.empty() ||
+            !effect.paletteStopParameterKeys.empty() ||
+            !effect.boundsParameterKeys.empty() ||
+            !effect.boundsKeys.empty() ||
+            std::any_of(
+                effect.fieldBoundsMemory.begin(),
+                effect.fieldBoundsMemory.end(),
+                [](const auto& memory) {
+                    return !memory.boundsParameterKeys.empty() ||
+                           !memory.boundsKeys.empty();
+                })) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool BuildReciprocalPanTimingTakeClonePlan(
+    const PreviewRuntimeState& runtimeState,
+    const std::array<AnimationPath, 2>& baselines,
+    std::array<AnimationPath*, 2> candidates,
+    ReciprocalPanTimingTakeClonePlan* plan,
+    std::string* errorMessage) {
+    if (plan == nullptr || candidates[0U] == nullptr ||
+        candidates[1U] == nullptr) {
+        return false;
+    }
+    *plan = {};
+    plan->nextSequence = runtimeState.water.nextTimingTakeSequence;
+    auto definitionsForAllocation = runtimeState.water.timingTakes;
+    struct SharedClone {
+        std::string sourceTakeId;
+        std::string clonedTakeId;
+        std::uint32_t sourceFrames = 0U;
+        std::uint32_t destinationFrames = 0U;
+    };
+    std::vector<SharedClone> sharedClones;
+
+    for (std::size_t role = 0U; role < candidates.size(); ++role) {
+        candidates[role]->authoredTrackDurationFrames = 0U;
+        const std::string sourceTakeId =
+            invisible_places::timing::NormalizeTimingTakeId(
+                baselines[role].selectedTimingTakeId);
+        const auto* sourceDefinition =
+            invisible_places::timing::FindTimingTakeDefinition(
+                runtimeState.water.timingTakes,
+                sourceTakeId);
+        if (sourceDefinition == nullptr) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "The selected Timing Take is missing; choose an available take before applying the pan extension.";
+            }
+            return false;
+        }
+        const bool hasAnimationCoordinates = std::any_of(
+            runtimeState.water.timingTakeSceneStates.begin(),
+            runtimeState.water.timingTakeSceneStates.end(),
+            [&](const auto& state) {
+                return state.takeId == sourceTakeId &&
+                       TimingTakeSceneStateHasAnimationCoordinates(state);
+            });
+        if (!hasAnimationCoordinates) {
+            plan->assignedTakeIds[role] = sourceTakeId;
+            candidates[role]->selectedTimingTakeId = sourceTakeId;
+            continue;
+        }
+
+        const std::uint32_t sourceFrames = std::max<std::uint32_t>(
+            1U,
+            baselines[role].authoredTrackDurationFrames != 0U
+                ? baselines[role].authoredTrackDurationFrames
+                : ReciprocalPanPathFrameCount(baselines[role]));
+        const std::uint32_t destinationFrames = std::max<std::uint32_t>(
+            1U,
+            ReciprocalPanPathFrameCount(*candidates[role]));
+        const auto shared = std::find_if(
+            sharedClones.begin(),
+            sharedClones.end(),
+            [&](const SharedClone& candidate) {
+                return candidate.sourceTakeId == sourceTakeId &&
+                       static_cast<std::uint64_t>(candidate.sourceFrames) *
+                               destinationFrames ==
+                           static_cast<std::uint64_t>(sourceFrames) *
+                               candidate.destinationFrames;
+            });
+        if (shared != sharedClones.end()) {
+            plan->assignedTakeIds[role] = shared->clonedTakeId;
+            candidates[role]->selectedTimingTakeId = shared->clonedTakeId;
+            continue;
+        }
+
+        auto cloneDefinition = *sourceDefinition;
+        cloneDefinition.id =
+            invisible_places::timing::AllocateTimingTakeId(
+                definitionsForAllocation,
+                &plan->nextSequence);
+        cloneDefinition.name += " - Pan Extension";
+        definitionsForAllocation.push_back(cloneDefinition);
+        plan->definitions.push_back(cloneDefinition);
+        plan->createdTakeIds.push_back(cloneDefinition.id);
+        for (const auto& state : runtimeState.water.timingTakeSceneStates) {
+            if (state.takeId != sourceTakeId) {
+                continue;
+            }
+            auto cloneState = state;
+            cloneState.takeId = cloneDefinition.id;
+            if (!invisible_places::timing::
+                    RetimeTimingTakeSceneStateNormalizedPositions(
+                        &cloneState,
+                        sourceFrames,
+                        destinationFrames)) {
+                if (errorMessage != nullptr) {
+                    *errorMessage =
+                        "The selected Timing Take could not be retimed for the extended camera path.";
+                }
+                return false;
+            }
+            plan->sceneStates.push_back(std::move(cloneState));
+        }
+        sharedClones.push_back({
+            .sourceTakeId = sourceTakeId,
+            .clonedTakeId = cloneDefinition.id,
+            .sourceFrames = sourceFrames,
+            .destinationFrames = destinationFrames,
+        });
+        plan->assignedTakeIds[role] = cloneDefinition.id;
+        candidates[role]->selectedTimingTakeId = cloneDefinition.id;
+    }
+    return true;
+}
+
+bool ApplyReciprocalPanCandidate(
+    PreviewRuntimeState* runtimeState,
+    float currentAspectRatio) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+    auto& panel = runtimeState->animationPanel;
+    auto& wizard = panel.reciprocalPanWizard;
+    if (!wizard.Active() || !wizard.candidate.has_value()) {
+        return false;
+    }
+    std::string error;
+    if (!ValidateReciprocalPanWizardStaleState(
+            *runtimeState,
+            currentAspectRatio,
+            &error)) {
+        wizard.errorMessage = std::move(error);
+        return false;
+    }
+    const auto firstIndex = FindAnimationRegistryIndex(
+        panel,
+        wizard.filePaths[0U]);
+    const auto secondIndex = FindAnimationRegistryIndex(
+        panel,
+        wizard.filePaths[1U]);
+    if (!firstIndex.has_value() || !secondIndex.has_value()) {
+        wizard.errorMessage = "The A/B registry pair is no longer available.";
+        return false;
+    }
+    const std::unordered_set<std::string> firstMovable{
+        wizard.baselinePaths[0U].keys.back().id};
+    const std::unordered_set<std::string> secondMovable{
+        wizard.baselinePaths[1U].keys.back().id};
+    if (!ValidateLoopSmoothingMovableLinks(
+            *runtimeState,
+            firstIndex.value(),
+            secondIndex.value(),
+            firstMovable,
+            secondMovable,
+            &error)) {
+        wizard.errorMessage = std::move(error);
+        return false;
+    }
+
+    auto first = wizard.candidate->firstCandidate;
+    auto second = wizard.candidate->secondCandidate;
+    const auto generatedTailValid = [](
+                                        const AnimationPath& baseline,
+                                        const AnimationPath& candidate,
+                                        std::uint32_t expectedCount) {
+        if (expectedCount < 2U || expectedCount > 3U ||
+            candidate.keys.size() != baseline.keys.size() + expectedCount) {
+            return false;
+        }
+        std::unordered_set<std::string> ids;
+        for (const auto& key : baseline.keys) {
+            ids.insert(key.id);
+        }
+        return std::all_of(
+            candidate.keys.begin() +
+                static_cast<std::ptrdiff_t>(baseline.keys.size()),
+            candidate.keys.end(),
+            [&](const auto& key) {
+                return key.linkedCameraId.empty() && !key.id.empty() &&
+                       ids.insert(key.id).second;
+            });
+    };
+    if (!generatedTailValid(
+            wizard.baselinePaths[0U],
+            first,
+            wizard.candidate->metrics.appendedKeyCount[0U]) ||
+        !generatedTailValid(
+            wizard.baselinePaths[1U],
+            second,
+            wizard.candidate->metrics.appendedKeyCount[1U])) {
+        wizard.errorMessage =
+            "Each generated tail must contain two or three new, path-local, unlinked camera keys.";
+        return false;
+    }
+    const auto& firstOldTerminal = wizard.baselinePaths[0U].keys.back();
+    const auto& secondOldTerminal = wizard.baselinePaths[1U].keys.back();
+    if (!firstOldTerminal.linkedCameraId.empty() &&
+        firstOldTerminal.linkedCameraId ==
+            secondOldTerminal.linkedCameraId) {
+        const auto findKey = [](const AnimationPath& path,
+                                std::string_view id)
+            -> const invisible_places::camera::AnimationPathKey* {
+            const auto found = std::find_if(
+                path.keys.begin(),
+                path.keys.end(),
+                [&](const auto& key) { return key.id == id; });
+            return found != path.keys.end() ? &*found : nullptr;
+        };
+        const auto* adjustedFirst = findKey(first, firstOldTerminal.id);
+        const auto* adjustedSecond = findKey(second, secondOldTerminal.id);
+        const auto arraysNear = [](const auto& left, const auto& right) {
+            for (std::size_t index = 0U; index < left.size(); ++index) {
+                if (std::abs(left[index] - right[index]) > 1.0e-5F) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        const bool samePose = adjustedFirst != nullptr &&
+                              adjustedSecond != nullptr &&
+                              arraysNear(
+                                  adjustedFirst->cameraPosition,
+                                  adjustedSecond->cameraPosition) &&
+                              arraysNear(
+                                  adjustedFirst->focusPoint,
+                                  adjustedSecond->focusPoint) &&
+                              std::abs(adjustedFirst->fovDegrees -
+                                       adjustedSecond->fovDegrees) <=
+                                  1.0e-5F &&
+                              std::abs(adjustedFirst->nearPlane -
+                                       adjustedSecond->nearPlane) <=
+                                  1.0e-6F &&
+                              std::abs(adjustedFirst->farPlane -
+                                       adjustedSecond->farPlane) <=
+                                  1.0e-4F &&
+                              adjustedFirst->hasFocusDistance ==
+                                  adjustedSecond->hasFocusDistance &&
+                              (!adjustedFirst->hasFocusDistance ||
+                               std::abs(adjustedFirst->focusDistance -
+                                        adjustedSecond->focusDistance) <=
+                                   1.0e-5F) &&
+                              adjustedFirst->hasApertureFStops ==
+                                  adjustedSecond->hasApertureFStops &&
+                              (!adjustedFirst->hasApertureFStops ||
+                               std::abs(adjustedFirst->apertureFStops -
+                                        adjustedSecond->apertureFStops) <=
+                                   1.0e-5F);
+        if (!samePose) {
+            wizard.errorMessage =
+                "A and B's former terminals share one linked CameraShot, but the two reciprocal fits move it differently. Unlink or duplicate that shot before applying.";
+            return false;
+        }
+    }
+    const auto makeLink = [&](std::size_t role,
+                              std::string partnerFileName,
+                              float startOverlap,
+                              float endOverlap,
+                              const AnimationPath& candidate) {
+        auto link = wizard.baselineLinks[role].value_or(
+            invisible_places::camera::AnimationVelocityBlendLinkMetadata{});
+        link.pairId = wizard.dependencyPairId;
+        link.partnerFileName = std::move(partnerFileName);
+        link.startOverlapSeconds = startOverlap;
+        link.endOverlapSeconds = endOverlap;
+        link.horizontalBlend = wizard.horizontalBlend;
+        link.panRight = wizard.panRight;
+        AddUniqueAnimationKeyId(
+            &link.movableKeyIds,
+            wizard.baselinePaths[role].keys.back().id);
+        for (auto key = candidate.keys.begin() +
+                        static_cast<std::ptrdiff_t>(
+                            wizard.baselinePaths[role].keys.size());
+             key != candidate.keys.end();
+             ++key) {
+            AddUniqueAnimationKeyId(&link.movableKeyIds, key->id);
+        }
+        return link;
+    };
+    const float newFirstStart =
+        static_cast<float>(wizard.sourceTailFrames[0U]) / 30.0F;
+    const float newSecondStart =
+        static_cast<float>(wizard.sourceTailFrames[1U]) / 30.0F;
+    const float combinedOverlap = newFirstStart + newSecondStart;
+    const float firstDuration = invisible_places::camera::
+        AnimationPathDurationSeconds(first);
+    const float secondDuration = invisible_places::camera::
+        AnimationPathDurationSeconds(second);
+    if (combinedOverlap > firstDuration + 1.0e-5F ||
+        combinedOverlap > secondDuration + 1.0e-5F) {
+        wizard.errorMessage =
+            "The two generated overlap bands would cross inside A or B. Shorten one or both source-tail extents, then rebuild the preview.";
+        return false;
+    }
+    ReciprocalPanTimingTakeClonePlan timingTakePlan;
+    if (!BuildReciprocalPanTimingTakeClonePlan(
+            *runtimeState,
+            wizard.baselinePaths,
+            {&first, &second},
+            &timingTakePlan,
+            &wizard.errorMessage)) {
+        return false;
+    }
+    first.velocityBlendLink = makeLink(
+        0U,
+        wizard.filePaths[1U].filename().string(),
+        newFirstStart,
+        newSecondStart,
+        first);
+    second.velocityBlendLink = makeLink(
+        1U,
+        wizard.filePaths[0U].filename().string(),
+        newSecondStart,
+        newFirstStart,
+        second);
+
+    // All validation above is read-only. These assignments are the atomic
+    // commit point for the two animation shadows and their private retimed
+    // Timing Takes. Linked CameraShots remain untouched until Save Changes
+    // stages the pair and project together, so Discard Edits can restore the
+    // dependency without a project snapshot.
+    const std::uint32_t preAllocationNextSequence =
+        runtimeState->water.nextTimingTakeSequence;
+    runtimeState->water.nextTimingTakeSequence =
+        timingTakePlan.nextSequence;
+    runtimeState->water.timingTakes.insert(
+        runtimeState->water.timingTakes.end(),
+        std::make_move_iterator(timingTakePlan.definitions.begin()),
+        std::make_move_iterator(timingTakePlan.definitions.end()));
+    runtimeState->water.timingTakeSceneStates.insert(
+        runtimeState->water.timingTakeSceneStates.end(),
+        std::make_move_iterator(timingTakePlan.sceneStates.begin()),
+        std::make_move_iterator(timingTakePlan.sceneStates.end()));
+    if (!timingTakePlan.createdTakeIds.empty()) {
+        panel.reciprocalPanTimingTakeCloneIds[
+            wizard.dependencyPairId] = {
+                .createdTakeIds =
+                    std::move(timingTakePlan.createdTakeIds),
+                .preAllocationNextSequence =
+                    preAllocationNextSequence,
+            };
+    }
+    panel.availableFileEditedPaths[firstIndex.value()] = first;
+    panel.availableFileEditedPaths[secondIndex.value()] = second;
+    panel.availableFileDirtyFlags[firstIndex.value()] = true;
+    panel.availableFileDirtyFlags[secondIndex.value()] = true;
+    panel.availableFileLoopEditPairIds[firstIndex.value()] =
+        wizard.dependencyPairId;
+    panel.availableFileLoopEditPairIds[secondIndex.value()] =
+        wizard.dependencyPairId;
+    panel.projectVelocityLinksDirty = true;
+    runtimeState->previewRenderStateSignatureValid = false;
+    panel.velocityAlignmentDraft.reset();
+    panel.currentPath = first;
+    panel.currentPathUsesEdited = true;
+    panel.selectedFileUsesEdited = true;
+    panel.dirty = true;
+    panel.preparedPathCache = {};
+    panel.motionStatsCache = {};
+    panel.perceivedFlowCache = {};
+    panel.loopTimeline = {};
+    panel.loopSmoothingDiagnostics.reset();
+    panel.strongAlignmentDiagnostics.reset();
+    panel.requestedMatchingFrameGhostClear = true;
+    panel.matchingFrameGhost.captureMatchesCurrentFrame = false;
+    panel.matchingFrameGhost.capturedMotionFingerprints = {};
+    panel.requestedCameraRigAlignment.reset();
+    panel.requestedLowerFrameAlignment.reset();
+    panel.pendingVelocityLinkSettingsUpdate.reset();
+    if (runtimeState->animationVelocityPreviewJob.worker.joinable()) {
+        runtimeState->animationVelocityPreviewJob.worker.request_stop();
+    }
+    if (runtimeState->animationStrongAlignmentJob.worker.joinable()) {
+        runtimeState->animationStrongAlignmentJob.worker.request_stop();
+    }
+    if (runtimeState->animationMatchingFrameGhostJob.worker.joinable()) {
+        runtimeState->animationMatchingFrameGhostJob.worker.request_stop();
+    }
+    const auto launch = wizard;
+    const auto metrics = wizard.candidate->metrics;
+    panel.reciprocalPanWizard = {};
+    panel.matchingFrameGhost.visible = launch.launchGhostVisible;
+    panel.matchingFrameGhost.automaticUpdate =
+        launch.launchGhostAutomaticUpdate;
+    panel.scrubAmount = std::clamp(
+        launch.launchElapsedSeconds /
+            std::max(
+                invisible_places::camera::AnimationPathDurationSeconds(first),
+                1.0e-6F),
+        0.0F,
+        1.0F);
+    if (!launch.launchSelectedKeyId.empty()) {
+        const auto selected = std::find_if(
+            first.keys.begin(),
+            first.keys.end(),
+            [&](const auto& key) {
+                return key.id == launch.launchSelectedKeyId;
+            });
+        panel.selectedKeyIndex = selected != first.keys.end()
+                                     ? std::optional<std::size_t>{
+                                           static_cast<std::size_t>(
+                                               std::distance(
+                                                   first.keys.begin(),
+                                                   selected))}
+                                     : std::nullopt;
+    }
+    runtimeState->animationPlayback.active = false;
+    runtimeState->cameraPlayback.active = false;
+    ApplyAnimationScrub(runtimeState);
+    runtimeState->pivotOverlay.visible = launch.launchPivotVisible;
+    runtimeState->pivotOverlay.pivot = launch.launchPivot;
+    runtimeState->pivotOverlay.lastSetAt = launch.launchPivotLastSetAt;
+    runtimeState->statusMessage =
+        std::string{
+            launch.clipPlanesNormalizedForExtension
+                ? "Normalized A/B clip planes and created reciprocal _Edited pan extensions (A +"
+                : "Created reciprocal _Edited pan extensions (A +"} +
+        std::to_string(metrics.extensionFrames[0U]) +
+        " frames / " +
+        std::to_string(metrics.appendedKeyCount[0U]) +
+        " keys, B +" +
+        std::to_string(metrics.extensionFrames[1U]) +
+        " frames / " +
+        std::to_string(metrics.appendedKeyCount[1U]) +
+        " keys). Save Changes writes the pair and project link together.";
+    runtimeState->errorMessage.clear();
+    return true;
+}
+
+void InvalidateReciprocalPanWizardCandidate(
+    AnimationReciprocalPanWizardState* wizard) {
+    if (wizard == nullptr) {
+        return;
+    }
+    ++wizard->generation;
+    wizard->candidate.reset();
+    wizard->fitInProgress = false;
+    wizard->errorMessage.clear();
+}
+
+bool ReciprocalPanTriangleValid(
+    const invisible_places::camera::AnimationSurfacePatchObservation& patch) {
+    if (patch.pointCount != 3U ||
+        std::any_of(
+            patch.worldPoints.begin(),
+            patch.worldPoints.end(),
+            [](const auto& point) {
+                return std::any_of(
+                    point.begin(),
+                    point.end(),
+                    [](float component) { return !std::isfinite(component); });
+            })) {
+        return false;
+    }
+    const glm::vec3 anchor{
+        patch.worldPoints[0U][0U],
+        patch.worldPoints[0U][1U],
+        patch.worldPoints[0U][2U],
+    };
+    const glm::vec3 first = glm::vec3{
+        patch.worldPoints[1U][0U],
+        patch.worldPoints[1U][1U],
+        patch.worldPoints[1U][2U],
+    } - anchor;
+    const glm::vec3 second = glm::vec3{
+        patch.worldPoints[2U][0U],
+        patch.worldPoints[2U][1U],
+        patch.worldPoints[2U][2U],
+    } - anchor;
+    const float firstLength = glm::length(first);
+    const float secondLength = glm::length(second);
+    if (!std::isfinite(firstLength) || !std::isfinite(secondLength) ||
+        firstLength <= 1.0e-6F || secondLength <= 1.0e-6F) {
+        return false;
+    }
+    const float normalizedArea = glm::length(glm::cross(first, second)) /
+                                 (firstLength * secondLength);
+    return std::isfinite(normalizedArea) && normalizedArea > 1.0e-4F;
+}
+
+void BackReciprocalPanWizard(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    auto& wizard = runtimeState->animationPanel.reciprocalPanWizard;
+    if (!wizard.Active() ||
+        wizard.stage ==
+            AnimationReciprocalPanWizardStage::Seam1SourceTriangle) {
+        return;
+    }
+    InvalidateReciprocalPanWizardCandidate(&wizard);
+    switch (wizard.stage) {
+        case AnimationReciprocalPanWizardStage::Seam1DestinationTriangle:
+            wizard.endpointTriangles[1U].patch = {};
+            wizard.endpointTriangles[1U].captured = false;
+            wizard.stage =
+                AnimationReciprocalPanWizardStage::Seam1SourceTriangle;
+            break;
+        case AnimationReciprocalPanWizardStage::Seam1TailExtent:
+            wizard.stage =
+                AnimationReciprocalPanWizardStage::Seam1DestinationTriangle;
+            break;
+        case AnimationReciprocalPanWizardStage::Seam2SourceTriangle:
+            wizard.endpointTriangles[2U].patch = {};
+            wizard.endpointTriangles[2U].captured = false;
+            wizard.stage =
+                AnimationReciprocalPanWizardStage::Seam1TailExtent;
+            break;
+        case AnimationReciprocalPanWizardStage::Seam2DestinationTriangle:
+            wizard.endpointTriangles[3U].patch = {};
+            wizard.endpointTriangles[3U].captured = false;
+            wizard.stage =
+                AnimationReciprocalPanWizardStage::Seam2SourceTriangle;
+            break;
+        case AnimationReciprocalPanWizardStage::Seam2TailExtent:
+            wizard.stage =
+                AnimationReciprocalPanWizardStage::Seam2DestinationTriangle;
+            break;
+        case AnimationReciprocalPanWizardStage::EditCorrespondences:
+            wizard.stage =
+                AnimationReciprocalPanWizardStage::Seam2TailExtent;
+            break;
+        case AnimationReciprocalPanWizardStage::Preview:
+            wizard.stage =
+                AnimationReciprocalPanWizardStage::EditCorrespondences;
+            break;
+        case AnimationReciprocalPanWizardStage::Idle:
+        case AnimationReciprocalPanWizardStage::Seam1SourceTriangle:
+            break;
+    }
+    const bool triangleStage =
+        wizard.stage == AnimationReciprocalPanWizardStage::Seam1SourceTriangle ||
+        wizard.stage == AnimationReciprocalPanWizardStage::Seam1DestinationTriangle ||
+        wizard.stage == AnimationReciprocalPanWizardStage::Seam2SourceTriangle ||
+        wizard.stage == AnimationReciprocalPanWizardStage::Seam2DestinationTriangle ||
+        wizard.stage == AnimationReciprocalPanWizardStage::EditCorrespondences;
+    wizard.anchorPickArmed = triangleStage &&
+        wizard.stage != AnimationReciprocalPanWizardStage::EditCorrespondences;
+    wizard.reraycastSelectedNode = false;
+    wizard.nodeGizmoDrag = {};
+    wizard.nodeGizmoPointerCaptured = false;
+    if (triangleStage) {
+        const auto triangleIndex =
+            ReciprocalPanStageTriangleIndex(wizard);
+        wizard.selectedTriangleIndex = static_cast<int>(triangleIndex);
+        wizard.selectedNodeIndex = static_cast<int>(std::min<std::uint32_t>(
+            wizard.endpointTriangles[triangleIndex].patch.pointCount,
+            2U));
+    }
+    ShowReciprocalPanWizardCanonicalPose(runtimeState);
+}
+
+bool ReciprocalPanStageHasRequiredObservation(
+    const AnimationReciprocalPanWizardState& wizard) {
+    switch (wizard.stage) {
+        case AnimationReciprocalPanWizardStage::Seam1SourceTriangle:
+        case AnimationReciprocalPanWizardStage::Seam1DestinationTriangle:
+        case AnimationReciprocalPanWizardStage::Seam2SourceTriangle:
+        case AnimationReciprocalPanWizardStage::Seam2DestinationTriangle: {
+            const auto& triangle = wizard.endpointTriangles[
+                ReciprocalPanStageTriangleIndex(wizard)];
+            return triangle.captured &&
+                   ReciprocalPanTriangleValid(triangle.patch);
+        }
+        case AnimationReciprocalPanWizardStage::Seam1TailExtent:
+            return wizard.sourceTailFrames[0U] >= 2U &&
+                   wizard.sourceTailFrames[0U] <=
+                       ReciprocalPanSourceTailMaximumFrame(
+                           wizard.baselinePaths[0U]);
+        case AnimationReciprocalPanWizardStage::Seam2TailExtent:
+            return wizard.sourceTailFrames[1U] >= 2U &&
+                   wizard.sourceTailFrames[1U] <=
+                       ReciprocalPanSourceTailMaximumFrame(
+                           wizard.baselinePaths[1U]);
+        case AnimationReciprocalPanWizardStage::EditCorrespondences:
+            return std::all_of(
+                wizard.endpointTriangles.begin(),
+                wizard.endpointTriangles.end(),
+                [](const auto& triangle) {
+                    return triangle.captured &&
+                           ReciprocalPanTriangleValid(triangle.patch);
+                });
+        case AnimationReciprocalPanWizardStage::Preview:
+        case AnimationReciprocalPanWizardStage::Idle:
+            return true;
+    }
+    return false;
+}
+
+bool ReciprocalPanExpandedOverlapsFit(
+    const AnimationReciprocalPanWizardState& wizard) {
+    const std::uint64_t combinedOverlapFrames =
+        static_cast<std::uint64_t>(wizard.sourceTailFrames[0U]) +
+        static_cast<std::uint64_t>(wizard.sourceTailFrames[1U]);
+    const std::uint64_t firstCandidateFrames =
+        ReciprocalPanPathFrameCount(wizard.baselinePaths[0U]) +
+        static_cast<std::uint64_t>(wizard.sourceTailFrames[1U]);
+    const std::uint64_t secondCandidateFrames =
+        ReciprocalPanPathFrameCount(wizard.baselinePaths[1U]) +
+        static_cast<std::uint64_t>(wizard.sourceTailFrames[0U]);
+    return combinedOverlapFrames <= firstCandidateFrames &&
+           combinedOverlapFrames <= secondCandidateFrames;
+}
+
+void AdvanceReciprocalPanWizard(
+    PreviewRuntimeState* runtimeState,
+    float currentAspectRatio) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    auto& wizard = runtimeState->animationPanel.reciprocalPanWizard;
+    if (!wizard.Active() ||
+        !ReciprocalPanStageHasRequiredObservation(wizard)) {
+        return;
+    }
+    if (wizard.stage ==
+            AnimationReciprocalPanWizardStage::EditCorrespondences &&
+        !ReciprocalPanExpandedOverlapsFit(wizard)) {
+        wizard.errorMessage =
+            "Those source extents make the reciprocal overlap bands cross. Go Back and shorten A's or B's tail extent.";
+        return;
+    }
+    switch (wizard.stage) {
+        case AnimationReciprocalPanWizardStage::Seam1SourceTriangle:
+            wizard.stage =
+                AnimationReciprocalPanWizardStage::Seam1DestinationTriangle;
+            break;
+        case AnimationReciprocalPanWizardStage::Seam1DestinationTriangle:
+            wizard.stage =
+                AnimationReciprocalPanWizardStage::Seam1TailExtent;
+            break;
+        case AnimationReciprocalPanWizardStage::Seam1TailExtent:
+            wizard.stage =
+                AnimationReciprocalPanWizardStage::Seam2SourceTriangle;
+            break;
+        case AnimationReciprocalPanWizardStage::Seam2SourceTriangle:
+            wizard.stage =
+                AnimationReciprocalPanWizardStage::Seam2DestinationTriangle;
+            break;
+        case AnimationReciprocalPanWizardStage::Seam2DestinationTriangle:
+            wizard.stage =
+                AnimationReciprocalPanWizardStage::Seam2TailExtent;
+            break;
+        case AnimationReciprocalPanWizardStage::Seam2TailExtent:
+            wizard.stage =
+                AnimationReciprocalPanWizardStage::EditCorrespondences;
+            break;
+        case AnimationReciprocalPanWizardStage::EditCorrespondences:
+            wizard.stage = AnimationReciprocalPanWizardStage::Preview;
+            RebuildReciprocalPanCandidate(
+                runtimeState,
+                currentAspectRatio);
+            break;
+        case AnimationReciprocalPanWizardStage::Preview:
+        case AnimationReciprocalPanWizardStage::Idle:
+            return;
+    }
+    const bool triangleStage =
+        wizard.stage == AnimationReciprocalPanWizardStage::Seam1SourceTriangle ||
+        wizard.stage == AnimationReciprocalPanWizardStage::Seam1DestinationTriangle ||
+        wizard.stage == AnimationReciprocalPanWizardStage::Seam2SourceTriangle ||
+        wizard.stage == AnimationReciprocalPanWizardStage::Seam2DestinationTriangle ||
+        wizard.stage == AnimationReciprocalPanWizardStage::EditCorrespondences;
+    wizard.anchorPickArmed = triangleStage &&
+        wizard.stage != AnimationReciprocalPanWizardStage::EditCorrespondences;
+    wizard.reraycastSelectedNode = false;
+    if (triangleStage) {
+        const auto triangleIndex =
+            ReciprocalPanStageTriangleIndex(wizard);
+        wizard.selectedTriangleIndex = static_cast<int>(triangleIndex);
+        wizard.selectedNodeIndex = static_cast<int>(std::min<std::uint32_t>(
+            wizard.endpointTriangles[triangleIndex].patch.pointCount,
+            2U));
+    }
+    const int role = ReciprocalPanStagePathRole(wizard);
+    wizard.inspectionPathRole = role;
+    if (wizard.stage != AnimationReciprocalPanWizardStage::Preview) {
+        const auto& path = wizard.baselinePaths[
+            static_cast<std::size_t>(role)];
+        wizard.inspectionNormalizedPosition =
+            ReciprocalPanFramePosition(
+                path,
+                ReciprocalPanStageFrame(wizard));
+    }
+    ShowReciprocalPanWizardCanonicalPose(runtimeState);
+}
+
+void DrawReciprocalPanWizard(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    auto& wizard = runtimeState->animationPanel.reciprocalPanWizard;
+    const float aspectRatio = CurrentAspectRatio(viewport);
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        CancelReciprocalPanWizard(
+            runtimeState,
+            "Cancelled Reciprocal Pan Extension; the launch view was restored.");
+        return;
+    }
+    ImGui::SeparatorText("Reciprocal Pan Extension");
+    ImGui::TextUnformatted(ReciprocalPanWizardStageLabel(wizard.stage));
+    ImGui::TextWrapped(
+        "A: %s\nB: %s",
+        AnimationDisplayNameFromPath(wizard.filePaths[0U]).c_str(),
+        AnimationDisplayNameFromPath(wizard.filePaths[1U]).c_str());
+    ImGui::TextDisabled(
+        "Assumption: A start <-> B end and B start <-> A end are the manually tuned visual 50%%-blend poses.");
+    if (wizard.clipPlanesNormalizedForExtension) {
+        ImGui::TextColored(
+            ImVec4{0.35F, 0.82F, 0.48F, 1.0F},
+            "Private clip preparation: near %.4f m / far %.3f m. Apply Both commits it; Cancel discards it.",
+            wizard.normalizedNearPlane,
+            wizard.normalizedFarPlane);
+    }
+    if (wizard.baselinePaths[0U].keys.size() == 2U ||
+        wizard.baselinePaths[1U].keys.size() == 2U) {
+        ImGui::TextColored(
+            ImVec4{0.95F, 0.72F, 0.28F, 1.0F},
+            "Best-fit warning: a two-key pan has only one segment, so its source motion also belongs to the terminal segment adjusted by the reciprocal fit. Review the overlay before Apply.");
+    }
+
+    std::string staleError;
+    const bool stateValid = ValidateReciprocalPanWizardStaleState(
+        *runtimeState,
+        aspectRatio,
+        &staleError);
+    if (!stateValid) {
+        ImGui::TextColored(
+            ImVec4{0.95F, 0.38F, 0.30F, 1.0F},
+            "%s",
+            staleError.c_str());
+    }
+
+    const bool tailExtentStage =
+        wizard.stage == AnimationReciprocalPanWizardStage::Seam1TailExtent ||
+        wizard.stage == AnimationReciprocalPanWizardStage::Seam2TailExtent;
+    const int role = ReciprocalPanStagePathRole(wizard);
+    if (tailExtentStage) {
+        const std::size_t sourceRole = static_cast<std::size_t>(role);
+        int frame = static_cast<int>(
+            wizard.sourceTailFrameDrafts[sourceRole]);
+        const int maximumFrame = static_cast<int>(
+            ReciprocalPanSourceTailMaximumFrame(
+                wizard.baselinePaths[sourceRole]));
+        if (ImGui::SliderInt(
+                role == 0 ? "A opening-span end frame (drives B tail)"
+                          : "B opening-span end frame (drives A tail)",
+                &frame,
+                2,
+                maximumFrame)) {
+            wizard.sourceTailFrameDrafts[sourceRole] =
+                static_cast<std::uint32_t>(frame);
+            wizard.inspectionActive = true;
+            wizard.anchorPickArmed = false;
+            const auto& draftPath = wizard.baselinePaths[sourceRole];
+            ApplyAnimationEvaluation(
+                runtimeState,
+                draftPath,
+                ReciprocalPanFramePosition(
+                    draftPath,
+                    wizard.sourceTailFrameDrafts[sourceRole]),
+                false);
+        }
+        if (ImGui::IsItemDeactivated()) {
+            wizard.inspectionActive = false;
+            wizard.sourceTailFrames[sourceRole] =
+                wizard.sourceTailFrameDrafts[sourceRole];
+            InvalidateReciprocalPanWizardCandidate(&wizard);
+            wizard.anchorPickArmed = false;
+            ShowReciprocalPanWizardCanonicalPose(runtimeState);
+        }
+        ImGui::TextDisabled(
+            "Drag inward until this source motion covers the desired wipe. Releasing commits the integer extent and snaps back to frame 0.");
+        ImGui::TextDisabled(
+            wizard.baselinePaths[sourceRole].keys.size() > 2U
+                ? "The limit is the penultimate key frame, keeping the sampled source clear of the terminal segment the reciprocal fit may adjust."
+                : "With two keys the limit is one frame before the end; this is a best-fit source because the sole segment is also terminal alignment motion.");
+    } else if (wizard.stage !=
+               AnimationReciprocalPanWizardStage::Preview) {
+        const auto& path = wizard.baselinePaths[
+            static_cast<std::size_t>(role)];
+        int inspectFrame = static_cast<int>(std::lround(
+            wizard.inspectionNormalizedPosition *
+            static_cast<float>(ReciprocalPanPathFrameCount(path))));
+        if (!wizard.inspectionActive) {
+            inspectFrame = static_cast<int>(ReciprocalPanStageFrame(wizard));
+        }
+        if (ImGui::SliderInt(
+                role == 0 ? "Inspect A frame" : "Inspect B frame",
+                &inspectFrame,
+                0,
+                static_cast<int>(ReciprocalPanPathFrameCount(path)))) {
+            wizard.inspectionActive = true;
+            wizard.inspectionNormalizedPosition =
+                ReciprocalPanFramePosition(
+                    path,
+                    static_cast<std::uint32_t>(inspectFrame));
+            ApplyAnimationEvaluation(
+                runtimeState,
+                path,
+                wizard.inspectionNormalizedPosition,
+                false);
+        }
+        if (ImGui::IsItemDeactivated()) {
+            wizard.inspectionActive = false;
+            ShowReciprocalPanWizardCanonicalPose(runtimeState);
+        }
+        ImGui::TextDisabled(
+            "Inspection is temporary; releasing the scrubber snaps back to this step's required frame.");
+    }
+
+    switch (wizard.stage) {
+        case AnimationReciprocalPanWizardStage::Seam1SourceTriangle:
+            ImGui::TextWrapped(
+                "At A's first frame, click three non-collinear points on the blend object. Node order is preserved at B's existing end.");
+            break;
+        case AnimationReciprocalPanWizardStage::Seam1TailExtent:
+            ImGui::TextWrapped(
+                "Temporarily scrub A inward to choose how much of its opening motion becomes B's generated terminal tail.");
+            break;
+        case AnimationReciprocalPanWizardStage::Seam1DestinationTriangle:
+            ImGui::TextWrapped(
+                "Now viewing B's existing last frame. Click the same three physical points in the same node order as A start.");
+            break;
+        case AnimationReciprocalPanWizardStage::Seam2SourceTriangle:
+            ImGui::TextWrapped(
+                "At B's first frame, capture a new ordered three-node triangle for seam 2 (B start to A end).");
+            break;
+        case AnimationReciprocalPanWizardStage::Seam2TailExtent:
+            ImGui::TextWrapped(
+                "Temporarily scrub B inward to choose how much of its opening motion becomes A's generated terminal tail.");
+            break;
+        case AnimationReciprocalPanWizardStage::Seam2DestinationTriangle:
+            ImGui::TextWrapped(
+                "Now viewing A's existing last frame. Click the same three physical points in the same node order as B start.");
+            break;
+        case AnimationReciprocalPanWizardStage::EditCorrespondences:
+            ImGui::TextWrapped(
+                "Review all four endpoint triangles. Select a node to re-raycast it, edit its XYZ values, or move it with the viewport axis/plane gizmo before fitting.");
+            break;
+        case AnimationReciprocalPanWizardStage::Preview:
+        case AnimationReciprocalPanWizardStage::Idle:
+            break;
+    }
+
+    const bool triangleStage =
+        wizard.stage == AnimationReciprocalPanWizardStage::Seam1SourceTriangle ||
+        wizard.stage == AnimationReciprocalPanWizardStage::Seam1DestinationTriangle ||
+        wizard.stage == AnimationReciprocalPanWizardStage::Seam2SourceTriangle ||
+        wizard.stage == AnimationReciprocalPanWizardStage::Seam2DestinationTriangle ||
+        wizard.stage == AnimationReciprocalPanWizardStage::EditCorrespondences;
+    if (triangleStage) {
+        static constexpr const char* kTriangleLabels[] = {
+            "A start (seam 1 source)",
+            "B end (seam 1 destination)",
+            "B start (seam 2 source)",
+            "A end (seam 2 destination)",
+        };
+        if (wizard.stage ==
+            AnimationReciprocalPanWizardStage::EditCorrespondences) {
+            int triangleIndex = std::clamp(
+                wizard.selectedTriangleIndex,
+                0,
+                3);
+            if (ImGui::Combo(
+                    "Endpoint triangle",
+                    &triangleIndex,
+                    kTriangleLabels,
+                    4)) {
+                wizard.selectedTriangleIndex = triangleIndex;
+                wizard.selectedNodeIndex = 0;
+                wizard.reraycastSelectedNode = false;
+                wizard.anchorPickArmed = false;
+                ShowReciprocalPanWizardCanonicalPose(runtimeState);
+            }
+            const int counterpart = triangleIndex == 0 ? 1
+                                  : triangleIndex == 1 ? 0
+                                  : triangleIndex == 2 ? 3
+                                                       : 2;
+            if (ImGui::Button("Flip to counterpart")) {
+                wizard.selectedTriangleIndex = counterpart;
+                wizard.selectedNodeIndex = std::clamp(
+                    wizard.selectedNodeIndex,
+                    0,
+                    2);
+                wizard.reraycastSelectedNode = false;
+                wizard.anchorPickArmed = false;
+                ShowReciprocalPanWizardCanonicalPose(runtimeState);
+            }
+        } else {
+            wizard.selectedTriangleIndex = static_cast<int>(
+                ReciprocalPanStageTriangleIndex(wizard));
+            ImGui::TextDisabled(
+                "%s",
+                kTriangleLabels[wizard.selectedTriangleIndex]);
+        }
+
+        const std::size_t triangleIndex = static_cast<std::size_t>(
+            std::clamp(wizard.selectedTriangleIndex, 0, 3));
+        auto& triangle = wizard.endpointTriangles[triangleIndex];
+        int capturedNodes = static_cast<int>(
+            std::min<std::uint32_t>(triangle.patch.pointCount, 3U));
+        ImGui::Text(
+            "Triangle nodes: %d / 3 (fixed roles: anchor -> pan -> ground)",
+            capturedNodes);
+        static constexpr const char* kNodeLabels[] = {
+            "1 Anchor",
+            "2 Pan",
+            "3 Ground",
+        };
+        for (int node = 0; node < 3; ++node) {
+            if (node > 0) {
+                ImGui::SameLine();
+            }
+            if (ImGui::RadioButton(
+                    kNodeLabels[node],
+                    wizard.selectedNodeIndex == node)) {
+                wizard.selectedNodeIndex = node;
+                wizard.reraycastSelectedNode = false;
+                wizard.anchorPickArmed = false;
+            }
+        }
+        const bool selectedExists =
+            wizard.selectedNodeIndex >= 0 &&
+            static_cast<std::uint32_t>(wizard.selectedNodeIndex) <
+                triangle.patch.pointCount;
+        ImGui::BeginDisabled(!selectedExists);
+        if (ImGui::Button("Re-raycast selected node")) {
+            wizard.reraycastSelectedNode = true;
+            wizard.anchorPickArmed = true;
+            wizard.errorMessage.clear();
+        }
+        ImGui::SameLine();
+        if (selectedExists) {
+            auto& point = triangle.patch.worldPoints[
+                static_cast<std::size_t>(wizard.selectedNodeIndex)];
+            ImGui::SetNextItemWidth(210.0F);
+            if (ImGui::DragFloat3(
+                    "Node XYZ",
+                    point.data(),
+                    0.01F,
+                    0.0F,
+                    0.0F,
+                    "%.4f")) {
+                InvalidateReciprocalPanWizardCandidate(&wizard);
+            }
+        }
+        ImGui::EndDisabled();
+        if (ImGui::Button("Clear this triangle")) {
+            triangle.patch = {};
+            triangle.captured = false;
+            wizard.selectedNodeIndex = 0;
+            wizard.reraycastSelectedNode = false;
+            wizard.anchorPickArmed = true;
+            InvalidateReciprocalPanWizardCandidate(&wizard);
+            capturedNodes = 0;
+        }
+        if (capturedNodes == 3) {
+            const bool validTriangle =
+                ReciprocalPanTriangleValid(triangle.patch);
+            ImGui::TextColored(
+                validTriangle
+                    ? ImVec4{0.35F, 0.82F, 0.48F, 1.0F}
+                    : ImVec4{0.95F, 0.38F, 0.30F, 1.0F},
+                validTriangle
+                    ? "Triangle complete. Double-click a viewport node or use Re-raycast to replace it."
+                    : "These nodes are duplicate, collinear, or non-finite. Move or re-raycast a node before Next.");
+            if (!wizard.reraycastSelectedNode) {
+                wizard.anchorPickArmed = false;
+            }
+        } else {
+            ImGui::TextColored(
+                ImVec4{0.95F, 0.72F, 0.28F, 1.0F},
+                "Click %s on the common scene; roles are never reordered after editing.",
+                kNodeLabels[capturedNodes]);
+            wizard.selectedNodeIndex = capturedNodes;
+            wizard.anchorPickArmed = true;
+        }
+    }
+
+    if (wizard.stage == AnimationReciprocalPanWizardStage::Preview) {
+        if (wizard.fitInProgress) {
+            ImGui::TextDisabled(
+                "Fitting both immutable candidates in the background...");
+        } else if (!wizard.errorMessage.empty()) {
+            ImGui::TextColored(
+                ImVec4{0.95F, 0.42F, 0.30F, 1.0F},
+                "%s",
+                wizard.errorMessage.c_str());
+            if (ImGui::Button("Retry fit")) {
+                RebuildReciprocalPanCandidate(
+                    runtimeState,
+                    aspectRatio);
+            }
+        } else if (wizard.candidate.has_value()) {
+            const auto& metrics = wizard.candidate->metrics;
+            ImGui::Text(
+                "A +%u frames / %u keys | B +%u frames / %u keys",
+                metrics.extensionFrames[0U],
+                metrics.appendedKeyCount[0U],
+                metrics.extensionFrames[1U],
+                metrics.appendedKeyCount[1U]);
+            ImGui::Text(
+                "Velocity RMS A %.5f -> %.5f | B %.5f -> %.5f screen-heights/s",
+                metrics.beforeVelocityRmsScreenHeightsPerSecond[0U],
+                metrics.afterVelocityRmsScreenHeightsPerSecond[0U],
+                metrics.beforeVelocityRmsScreenHeightsPerSecond[1U],
+                metrics.afterVelocityRmsScreenHeightsPerSecond[1U]);
+            ImGui::Text(
+                "Rotation residual A %.3f / B %.3f deg/s | scale A %.3f%% / B %.3f%%",
+                metrics.rotationRateResidualDegreesPerSecond[0U],
+                metrics.rotationRateResidualDegreesPerSecond[1U],
+                metrics.perspectiveScaleResidualPercent[0U],
+                metrics.perspectiveScaleResidualPercent[1U]);
+            ImGui::Text(
+                "Anchor overlay RMS A %.5f / B %.5f screen heights (confidence %.0f%% / %.0f%%)",
+                metrics.anchorOverlayRmsScreenHeights[0U],
+                metrics.anchorOverlayRmsScreenHeights[1U],
+                100.0F * metrics.patchConfidence[0U],
+                100.0F * metrics.patchConfidence[1U]);
+            ImGui::Text(
+                "3-node overlay RMS A %.5f / B %.5f | max A %.5f / B %.5f screen heights",
+                metrics.patchNodeOverlayRmsScreenHeights[0U],
+                metrics.patchNodeOverlayRmsScreenHeights[1U],
+                metrics.patchNodeOverlayMaxScreenHeights[0U],
+                metrics.patchNodeOverlayMaxScreenHeights[1U]);
+            ImGui::Text(
+                "Former terminal move camera A %.5f / B %.5f | focus A %.5f / B %.5f",
+                metrics.formerTerminalCameraMove[0U],
+                metrics.formerTerminalCameraMove[1U],
+                metrics.formerTerminalFocusMove[0U],
+                metrics.formerTerminalFocusMove[1U]);
+            for (std::size_t candidateIndex = 0U;
+                 candidateIndex < 2U;
+                 ++candidateIndex) {
+                const auto& baseline = wizard.baselinePaths[candidateIndex];
+                const auto& candidate = candidateIndex == 0U
+                                            ? wizard.candidate->firstCandidate
+                                            : wizard.candidate->secondCandidate;
+                const float oldFrames = static_cast<float>(
+                    ReciprocalPanPathFrameCount(baseline));
+                const float newFrames = static_cast<float>(
+                    ReciprocalPanPathFrameCount(candidate));
+                const std::string bandLabel =
+                    std::string{candidateIndex == 0U ? "A  " : "B  "} +
+                    std::to_string(static_cast<std::uint32_t>(oldFrames)) +
+                    " authored | +" +
+                    std::to_string(metrics.extensionFrames[candidateIndex]) +
+                    " frames / " +
+                    std::to_string(metrics.appendedKeyCount[candidateIndex]) +
+                    " generated keys";
+                ImGui::ProgressBar(
+                    newFrames > 0.0F ? oldFrames / newFrames : 1.0F,
+                    ImVec2{-FLT_MIN, 0.0F},
+                    bandLabel.c_str());
+            }
+            ImGui::TextUnformatted("Viewport paths:");
+            if (ImGui::RadioButton("A", wizard.previewMode == 0)) {
+                wizard.previewMode = 0;
+            }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("B", wizard.previewMode == 1)) {
+                wizard.previewMode = 1;
+            }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Overlay", wizard.previewMode == 2)) {
+                wizard.previewMode = 2;
+            }
+            const char* poseLabels[] = {
+                "A opening-span end",
+                "B opening-span end",
+                "A generated end",
+                "B generated end",
+            };
+            if (ImGui::Combo(
+                    "Preview pose",
+                    &wizard.previewPose,
+                    poseLabels,
+                    4)) {
+                ShowReciprocalPanWizardCanonicalPose(runtimeState);
+            }
+            ImGui::Button("Hold baseline", ImVec2{-FLT_MIN, 0.0F});
+            const bool holdBaseline = ImGui::IsItemActive();
+            if (holdBaseline != wizard.previewBaselineHold) {
+                wizard.previewBaselineHold = holdBaseline;
+                ShowReciprocalPanWizardCanonicalPose(runtimeState);
+            }
+            if (!metrics.patchDiagnostic[0U].empty() ||
+                !metrics.patchDiagnostic[1U].empty()) {
+                ImGui::TextDisabled(
+                    "A: %s\nB: %s",
+                    metrics.patchDiagnostic[0U].c_str(),
+                    metrics.patchDiagnostic[1U].c_str());
+            }
+        }
+    } else if (!wizard.errorMessage.empty()) {
+        ImGui::TextColored(
+            ImVec4{0.95F, 0.42F, 0.30F, 1.0F},
+            "%s",
+            wizard.errorMessage.c_str());
+    }
+
+    ImGui::Separator();
+    if (wizard.stage !=
+        AnimationReciprocalPanWizardStage::Seam1SourceTriangle) {
+        if (ImGui::Button("Back")) {
+            BackReciprocalPanWizard(runtimeState);
+            return;
+        }
+        ImGui::SameLine();
+    }
+    if (wizard.stage == AnimationReciprocalPanWizardStage::Preview) {
+        ImGui::BeginDisabled(
+            !stateValid || wizard.fitInProgress ||
+            !wizard.candidate.has_value());
+        if (ImGui::Button("Apply Both Extensions")) {
+            ApplyReciprocalPanCandidate(runtimeState, aspectRatio);
+            ImGui::EndDisabled();
+            return;
+        }
+        ImGui::EndDisabled();
+    } else {
+        ImGui::BeginDisabled(
+            !stateValid ||
+            !ReciprocalPanStageHasRequiredObservation(wizard));
+        const char* nextLabel =
+            wizard.stage == AnimationReciprocalPanWizardStage::Seam1SourceTriangle
+                ? "Next: flip to B end"
+            : wizard.stage == AnimationReciprocalPanWizardStage::Seam1DestinationTriangle
+                ? "Next: choose A tail"
+            : wizard.stage == AnimationReciprocalPanWizardStage::Seam1TailExtent
+                ? "Next: B start"
+            : wizard.stage == AnimationReciprocalPanWizardStage::Seam2SourceTriangle
+                ? "Next: flip to A end"
+            : wizard.stage == AnimationReciprocalPanWizardStage::Seam2DestinationTriangle
+                ? "Next: choose B tail"
+            : wizard.stage == AnimationReciprocalPanWizardStage::Seam2TailExtent
+                ? "Next: review triangles"
+                : "Build Preview";
+        if (ImGui::Button(nextLabel)) {
+            AdvanceReciprocalPanWizard(runtimeState, aspectRatio);
+            ImGui::EndDisabled();
+            return;
+        }
+        ImGui::EndDisabled();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel")) {
+        CancelReciprocalPanWizard(
+            runtimeState,
+            "Cancelled Reciprocal Pan Extension; no animation data changed.");
+    }
+}
+
 void DrawAnimationSection(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell& viewport) {
@@ -49588,9 +52654,40 @@ void DrawAnimationSection(
     }
 
     auto& panel = runtimeState->animationPanel;
+    PollAnimationReciprocalPanFitJob(
+        runtimeState,
+        CurrentAspectRatio(viewport));
+    if (panel.reciprocalPanWizard.Active()) {
+        if (BeginPanelSection("Animation")) {
+            DrawReciprocalPanWizard(runtimeState, viewport);
+            EndPanelSection();
+        }
+        return;
+    }
     PollAnimationVelocityPreviewJob(runtimeState);
     PollAnimationStrongAlignmentJob(runtimeState);
     ApplyPendingAnimationVelocityLinkSettings(runtimeState);
+    if (panel.requestedClipPlaneNormalization.has_value()) {
+        const auto requested =
+            panel.requestedClipPlaneNormalization.value();
+        panel.requestedClipPlaneNormalization.reset();
+        const auto firstIndex = FindAnimationRegistryIndex(
+            panel,
+            requested[0U]);
+        const auto secondIndex = FindAnimationRegistryIndex(
+            panel,
+            requested[1U]);
+        if (firstIndex.has_value() && secondIndex.has_value()) {
+            NormalizeReciprocalPanClipPlanes(
+                runtimeState,
+                firstIndex.value(),
+                secondIndex.value());
+        } else {
+            runtimeState->errorMessage =
+                "A or B was removed before its clip planes could be normalized.";
+            runtimeState->statusMessage.clear();
+        }
+    }
     if (panel.requestedCameraRigAlignment.has_value()) {
         const auto request =
             panel.requestedCameraRigAlignment.value();
@@ -51212,12 +54309,19 @@ void DrawAnimationSection(
                              *runtimeState,
                              currentLoopFileIndex.value()))
                 : nullptr;
-        const bool matchingAppliedPair =
+        const auto reciprocalPairFailure =
             loopCurrent != nullptr && loopPartner != nullptr &&
-            loopCurrent->velocityBlendLink.has_value() &&
-            loopPartner->velocityBlendLink.has_value() &&
-            loopCurrent->velocityBlendLink->pairId ==
-                loopPartner->velocityBlendLink->pairId;
+                    currentLoopFileIndex.has_value() &&
+                    loopPartnerIndex.has_value()
+                ? AppliedReciprocalPairFailure(
+                      *loopCurrent,
+                      panel.availableFiles[currentLoopFileIndex.value()],
+                      *loopPartner,
+                      panel.availableFiles[loopPartnerIndex.value()])
+                : std::optional<std::string>{
+                      "Select two available animations."};
+        const bool matchingAppliedPair =
+            !reciprocalPairFailure.has_value();
 
         invisible_places::camera::AnimationLoopSmoothingOptions
             loopTimelineOptions;
@@ -51881,6 +54985,145 @@ void DrawAnimationSection(
                 ImGui::TextDisabled(
                     "Matching cached lower-frame geometry in the background...");
             }
+            const std::optional<std::string> extensionLinkFailure =
+                ReciprocalPanExistingLinkConflict(
+                    *loopCurrent,
+                    panel.availableFiles[currentLoopFileIndex.value()],
+                    *loopPartner,
+                    panel.availableFiles[loopPartnerIndex.value()]);
+            std::optional<std::string> extensionFailure =
+                extensionLinkFailure;
+            if (!extensionFailure.has_value()) {
+                extensionFailure = ReciprocalPanPreflightFailure(
+                    *runtimeState,
+                    *loopCurrent,
+                    *loopPartner);
+            }
+            const auto clipPlaneNormalization =
+                ReciprocalPanClipPlaneNormalizationForPair(
+                    *loopCurrent,
+                    *loopPartner);
+            const auto clipPlaneLinkFailure =
+                clipPlaneNormalization.has_value()
+                    ? ReciprocalPanClipPlaneLinkFailure(
+                          *loopCurrent,
+                          *loopPartner)
+                    : std::optional<std::string>{};
+            const auto normalizedExtensionFailure =
+                clipPlaneNormalization.has_value()
+                    ? ReciprocalPanPreflightFailure(
+                          *runtimeState,
+                          clipPlaneNormalization->firstCandidate,
+                          clipPlaneNormalization->secondCandidate)
+                    : std::optional<std::string>{};
+            const bool extensionCanNormalizePrivately =
+                !extensionLinkFailure.has_value() &&
+                clipPlaneNormalization.has_value() &&
+                !normalizedExtensionFailure.has_value() &&
+                !clipPlaneLinkFailure.has_value();
+            std::optional<std::string> extensionLaunchFailure =
+                extensionFailure;
+            if (extensionCanNormalizePrivately) {
+                extensionLaunchFailure.reset();
+            } else if (extensionFailure.has_value() &&
+                       !extensionLinkFailure.has_value() &&
+                       clipPlaneNormalization.has_value() &&
+                       !normalizedExtensionFailure.has_value() &&
+                       clipPlaneLinkFailure.has_value()) {
+                extensionLaunchFailure = clipPlaneLinkFailure;
+            }
+            ImGui::BeginDisabled(
+                renderSetupLocksAnimationSwitching ||
+                strongAlignmentInProgress ||
+                extensionLaunchFailure.has_value());
+            if (ImGui::Button("Extend Both Seams...")) {
+                StartReciprocalPanWizard(
+                    runtimeState,
+                    currentLoopFileIndex.value(),
+                    loopPartnerIndex.value(),
+                    CurrentAspectRatio(viewport),
+                    loopTimelineOptions.horizontalBlend,
+                    loopTimelineOptions.panRight);
+            }
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(
+                    ImGuiHoveredFlags_DelayNormal |
+                    ImGuiHoveredFlags_AllowWhenDisabled)) {
+                ImGui::SetTooltip(
+                    "%s",
+                    extensionLaunchFailure.has_value()
+                        ? extensionLaunchFailure->c_str()
+                    : extensionCanNormalizePrivately
+                        ? "First normalizes A/B clip planes in private wizard snapshots, then captures and fits both seams. Apply Both commits normalization with the extensions; Cancel leaves the animations unchanged."
+                        : "Treats A-start/B-end and B-start/A-end as the manually tuned visual 50%-blend poses, captures ordered anchor/pan/ground triangles, selects each opening source span, then previews 2-3 generated keys per destination before creating or updating the reciprocal _Edited pair.");
+            }
+            if (extensionLaunchFailure.has_value()) {
+                ImGui::PushStyleColor(
+                    ImGuiCol_Text,
+                    ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                ImGui::TextWrapped(
+                    "Extend unavailable: %s",
+                    extensionLaunchFailure->c_str());
+                ImGui::PopStyleColor();
+            } else if (extensionCanNormalizePrivately) {
+                ImGui::TextDisabled(
+                    "Extend will privately normalize clips to near %.4f m / far %.3f m; Cancel discards that preparation.",
+                    clipPlaneNormalization->nearPlane,
+                    clipPlaneNormalization->farPlane);
+            }
+            if (clipPlaneNormalization.has_value()) {
+                const bool clipPlaneRepairDisabled =
+                    renderSetupLocksAnimationSwitching ||
+                    strongAlignmentInProgress ||
+                    panel.velocityAlignmentDraft.has_value() ||
+                    clipPlaneLinkFailure.has_value();
+                ImGui::BeginDisabled(clipPlaneRepairDisabled);
+                if (ImGui::Button("Normalize A/B Clip Planes")) {
+                    panel.requestedClipPlaneNormalization =
+                        std::array<std::filesystem::path, 2>{
+                            panel.availableFiles[
+                                currentLoopFileIndex.value()],
+                            panel.availableFiles[
+                                loopPartnerIndex.value()],
+                        };
+                }
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(
+                        ImGuiHoveredFlags_DelayNormal |
+                        ImGuiHoveredFlags_AllowWhenDisabled)) {
+                    const auto repairBlocker =
+                        clipPlaneLinkFailure.has_value()
+                            ? clipPlaneLinkFailure.value()
+                        : panel.velocityAlignmentDraft.has_value()
+                            ? std::string{
+                                  "Confirm or unapply the current velocity-alignment draft first."}
+                            : std::string{};
+                    ImGui::SetTooltip(
+                        "%s",
+                        repairBlocker.empty()
+                            ? ("Sets every A/B key to the least restrictive values already present: near " +
+                               FormatFixed(
+                                   clipPlaneNormalization->nearPlane,
+                                   4) +
+                               " m, far " +
+                               FormatFixed(
+                                   clipPlaneNormalization->farPlane,
+                                   3) +
+                               " m. Camera/focus positions, FOV, aperture, and timing are unchanged.")
+                                  .c_str()
+                            : repairBlocker.c_str());
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled(
+                    "near %.4f m / far %.3f m",
+                    clipPlaneNormalization->nearPlane,
+                    clipPlaneNormalization->farPlane);
+                if (clipPlaneLinkFailure.has_value()) {
+                    ImGui::TextDisabled(
+                        "%s",
+                        clipPlaneLinkFailure->c_str());
+                }
+            }
             const bool hasStrongDestination =
                 panel.loopTimeline.strongDestinationRow >= 0 &&
                 panel.loopTimeline.strongDestinationRow < 2 &&
@@ -52449,7 +55692,7 @@ void DrawAnimationSection(
                 return;
             }
             invisible_places::water::WaterScenarioKey key;
-            key.position = std::clamp(panel.scrubAmount, 0.0F, 1.0F);
+            key.position = CurrentAuthoredTrackPosition(*runtimeState);
             key.state = std::move(state);
             key.interpolation = invisible_places::water::WaterScenarioInterpolation::Smooth;
             const auto existingIt = std::find_if(
@@ -52475,7 +55718,10 @@ void DrawAnimationSection(
                 track->keys.begin(),
                 track->keys.end(),
                 [&](const auto& candidate) {
-                    return std::abs(candidate.position - panel.scrubAmount) <= 0.0001F;
+                    return std::abs(
+                               candidate.position -
+                               CurrentAuthoredTrackPosition(*runtimeState)) <=
+                           0.0001F;
                 });
             panel.selectedWaterKeyIndex = selectedIt != track->keys.end()
                                               ? std::optional<std::size_t>{
@@ -52494,7 +55740,7 @@ void DrawAnimationSection(
                 return;
             }
             invisible_places::water::WaterSeepageNodeKey key;
-            key.position = std::clamp(panel.scrubAmount, 0.0F, 1.0F);
+            key.position = CurrentAuthoredTrackPosition(*runtimeState);
             key.state = state;
             key.interpolation = invisible_places::water::WaterScenarioInterpolation::Smooth;
             auto nodeTrackIt = std::find_if(
@@ -52539,7 +55785,10 @@ void DrawAnimationSection(
                     nodeTrackIt->keys.begin(),
                     nodeTrackIt->keys.end(),
                     [&](const auto& candidate) {
-                        return std::abs(candidate.position - panel.scrubAmount) <= 0.0001F;
+                        return std::abs(
+                                   candidate.position -
+                                   CurrentAuthoredTrackPosition(*runtimeState)) <=
+                               0.0001F;
                     });
                 panel.selectedSeepageNodeKeyIndex =
                     selectedIt == nodeTrackIt->keys.end()
@@ -52567,7 +55816,10 @@ void DrawAnimationSection(
                 for (std::size_t index = 0U; index < currentTrack->keys.size(); ++index) {
                     const auto& key = currentTrack->keys[index];
                     const float keySeconds =
-                        key.position * std::max(0.0F, AnimationDurationSeconds(animationPath));
+                        key.position * static_cast<float>(
+                            AuthoredAnimationTrackDurationFrames(
+                                animationPath)) /
+                        30.0F;
                     const auto label = std::to_string(index + 1U) + "  t=" +
                                        FormatFixed(key.position, 4) + "  (" +
                                        FormatFixed(keySeconds, 2) + " s)";
@@ -52575,7 +55827,9 @@ void DrawAnimationSection(
                                           panel.selectedWaterKeyIndex.value() == index;
                     if (ImGui::Selectable(label.c_str(), selected)) {
                         panel.selectedWaterKeyIndex = index;
-                        panel.scrubAmount = key.position;
+                        SetCurrentAnimationPositionFromAuthoredTrack(
+                            runtimeState,
+                            key.position);
                         if (panel.liveApply) {
                             ApplyAnimationScrub(runtimeState);
                         }
@@ -52631,7 +55885,12 @@ void DrawAnimationSection(
                 auto& selectedKey = currentTrack->keys[panel.selectedWaterKeyIndex.value()];
                 bool keyStateChanged = false;
                 const float animationDurationSeconds =
-                    std::max(0.001F, AnimationDurationSeconds(animationPath));
+                    std::max(
+                        1.0F / 30.0F,
+                        static_cast<float>(
+                            AuthoredAnimationTrackDurationFrames(
+                                animationPath)) /
+                            30.0F);
                 float keyTimeSeconds = selectedKey.position * animationDurationSeconds;
                 if (ImGui::InputFloat("Key Time (s)", &keyTimeSeconds, 0.1F, 1.0F, "%.2f")) {
                     const auto selectedKeyId = selectedKey.id;
@@ -52946,7 +56205,10 @@ void DrawAnimationSection(
                     for (std::size_t index = 0U; index < nodeTrack->keys.size(); ++index) {
                         const auto& nodeKey = nodeTrack->keys[index];
                         const float keySeconds = nodeKey.position *
-                            std::max(0.0F, AnimationDurationSeconds(animationPath));
+                            static_cast<float>(
+                                AuthoredAnimationTrackDurationFrames(
+                                    animationPath)) /
+                            30.0F;
                         const auto label = std::to_string(index + 1U) + "  t=" +
                                            FormatFixed(nodeKey.position, 4) + "  (" +
                                            FormatFixed(keySeconds, 2) + " s)";
@@ -52954,7 +56216,9 @@ void DrawAnimationSection(
                                               panel.selectedSeepageNodeKeyIndex.value() == index;
                         if (ImGui::Selectable(label.c_str(), selected)) {
                             panel.selectedSeepageNodeKeyIndex = index;
-                            panel.scrubAmount = nodeKey.position;
+                            SetCurrentAnimationPositionFromAuthoredTrack(
+                                runtimeState,
+                                nodeKey.position);
                             if (panel.liveApply) {
                                 ApplyAnimationScrub(runtimeState);
                             }
@@ -52967,7 +56231,12 @@ void DrawAnimationSection(
                     auto& selectedNodeKey =
                         nodeTrack->keys[panel.selectedSeepageNodeKeyIndex.value()];
                     const float animationDurationSeconds =
-                        std::max(0.001F, AnimationDurationSeconds(animationPath));
+                        std::max(
+                            1.0F / 30.0F,
+                            static_cast<float>(
+                                AuthoredAnimationTrackDurationFrames(
+                                    animationPath)) /
+                                30.0F);
                     float nodeKeyTimeSeconds =
                         selectedNodeKey.position * animationDurationSeconds;
                     if (ImGui::InputFloat(
@@ -53968,6 +57237,15 @@ std::optional<PreparedAnimationSave> PrepareAnimationSave(
             !PathsLexicallyEqual(
                 std::filesystem::path{panel.currentFilePath},
                 item.targetPath)) {
+            if (!prepared.loopEditPairId.empty() &&
+                panel.reciprocalPanTimingTakeCloneIds.contains(
+                    prepared.loopEditPairId)) {
+                if (errorMessage != nullptr) {
+                    *errorMessage =
+                        "Save or discard the reciprocal pan pair before using Save As; its retimed Timing Takes belong to the pending project transaction.";
+                }
+                return std::nullopt;
+            }
             prepared.saveAsCopy = true;
             prepared.path.name = AnimationNameFromFilePath(item.targetPath);
             prepared.detachedForSaveAs =
@@ -54134,6 +57412,18 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
             }
             loopPairSaves[animation.loopEditPairId].push_back(
                 &animation);
+        }
+    }
+    if (projectItem != nullptr) {
+        for (const auto& [pairId, takeIds] :
+             runtimeState->animationPanel
+                 .reciprocalPanTimingTakeCloneIds) {
+            (void)takeIds;
+            if (!loopPairSaves.contains(pairId)) {
+                dialog.errorMessage =
+                    "Select both reciprocal pan _Edited animations with the project; their retimed Timing Takes cannot be saved separately.";
+                return false;
+            }
         }
     }
     for (const auto& [pairId, pairAnimations] : loopPairSaves) {
@@ -54402,7 +57692,12 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
     if (savedVelocityDraft) {
         panel.velocityAlignmentDraft.reset();
     }
+    for (const auto& [pairId, pairAnimations] : loopPairSaves) {
+        (void)pairAnimations;
+        panel.reciprocalPanTimingTakeCloneIds.erase(pairId);
+    }
     if (project.has_value()) {
+        panel.projectVelocityLinksBaselineDirty = false;
         panel.projectVelocityLinksDirty = std::any_of(
             panel.availableFileLoopEditPairIds.begin(),
             panel.availableFileLoopEditPairIds.end(),
@@ -56195,7 +59490,7 @@ void DrawWaterSourceList(
     std::optional<std::pair<std::size_t, std::size_t>> requestedEmitterReorder;
     std::optional<std::pair<std::size_t, std::size_t>> requestedManualPathReorder;
     const float scrubPosition =
-        std::clamp(runtimeState->animationPanel.scrubAmount, 0.0F, 1.0F);
+        CurrentAuthoredTrackPosition(*runtimeState);
     const auto drawKeyNavigation =
         [&](const invisible_places::water::WaterFeatureTimeline* timeline) {
             if (timeline == nullptr) {
@@ -56212,14 +59507,18 @@ void DrawWaterSourceList(
             ImGui::SameLine();
             ImGui::BeginDisabled(!previous.has_value());
             if (ImGui::SmallButton("<")) {
-                runtimeState->animationPanel.scrubAmount = previous.value();
+                SetCurrentAnimationPositionFromAuthoredTrack(
+                    runtimeState,
+                    previous.value());
                 ApplyAnimationScrub(runtimeState);
             }
             ImGui::EndDisabled();
             ImGui::SameLine(0.0F, 2.0F);
             ImGui::BeginDisabled(!next.has_value());
             if (ImGui::SmallButton(">")) {
-                runtimeState->animationPanel.scrubAmount = next.value();
+                SetCurrentAnimationPositionFromAuthoredTrack(
+                    runtimeState,
+                    next.value());
                 ApplyAnimationScrub(runtimeState);
             }
             ImGui::EndDisabled();
@@ -58491,8 +61790,7 @@ KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
             }
         }
     }
-    const float position =
-        std::clamp(runtimeState->animationPanel.scrubAmount, 0.0F, 1.0F);
+    const float position = CurrentAuthoredTrackPosition(*runtimeState);
     const bool keyingActive = track != nullptr && track->active;
     const bool keyed =
         keyingActive && track != nullptr && !track->keys.empty();
@@ -58652,7 +61950,9 @@ KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
     ImGui::PushID(label);
     ImGui::BeginDisabled(!previous.has_value());
     if (ImGui::SmallButton("<")) {
-        runtimeState->animationPanel.scrubAmount = previous.value();
+        SetCurrentAnimationPositionFromAuthoredTrack(
+            runtimeState,
+            previous.value());
         ApplyAnimationScrub(runtimeState);
     }
     ImGui::EndDisabled();
@@ -58663,7 +61963,9 @@ KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
     ImGui::SameLine(0.0F, 2.0F);
     ImGui::BeginDisabled(!next.has_value());
     if (ImGui::SmallButton(">")) {
-        runtimeState->animationPanel.scrubAmount = next.value();
+        SetCurrentAnimationPositionFromAuthoredTrack(
+            runtimeState,
+            next.value());
         ApplyAnimationScrub(runtimeState);
     }
     ImGui::EndDisabled();
@@ -58826,8 +62128,7 @@ KeyedWaterSliderResult DrawKeyedWaterColourSetting(
         }
     }
 
-    const float position =
-        std::clamp(runtimeState->animationPanel.scrubAmount, 0.0F, 1.0F);
+    const float position = CurrentAuthoredTrackPosition(*runtimeState);
     const bool keyingActive = std::any_of(
         tracks.begin(),
         tracks.end(),
@@ -59016,8 +62317,9 @@ KeyedWaterSliderResult DrawKeyedWaterColourSetting(
     ImGui::PushID(label);
     ImGui::BeginDisabled(!previous.has_value());
     if (ImGui::SmallButton("<")) {
-        runtimeState->animationPanel.scrubAmount =
-            previous.value();
+        SetCurrentAnimationPositionFromAuthoredTrack(
+            runtimeState,
+            previous.value());
         ApplyAnimationScrub(runtimeState);
     }
     ImGui::EndDisabled();
@@ -59028,7 +62330,9 @@ KeyedWaterSliderResult DrawKeyedWaterColourSetting(
     ImGui::SameLine(0.0F, 2.0F);
     ImGui::BeginDisabled(!next.has_value());
     if (ImGui::SmallButton(">")) {
-        runtimeState->animationPanel.scrubAmount = next.value();
+        SetCurrentAnimationPositionFromAuthoredTrack(
+            runtimeState,
+            next.value());
         ApplyAnimationScrub(runtimeState);
     }
     ImGui::EndDisabled();
@@ -61083,10 +64387,8 @@ void DrawWaterKeyedProfilesCombo(
                       profileGroup)
             : std::vector<float>{};
     constexpr float kPositionTolerance = 1.0e-4F;
-    const float currentPosition = std::clamp(
-        runtimeState->animationPanel.scrubAmount,
-        0.0F,
-        1.0F);
+    const float currentPosition =
+        CurrentAuthoredTrackPosition(*runtimeState);
     std::optional<std::size_t> currentIndex;
     for (std::size_t index = 0U; index < positions.size();
          ++index) {
@@ -61118,8 +64420,9 @@ void DrawWaterKeyedProfilesCombo(
             if (ImGui::Selectable(
                     option.c_str(),
                     currentIndex == index)) {
-                runtimeState->animationPanel.scrubAmount =
-                    positions[index];
+                SetCurrentAnimationPositionFromAuthoredTrack(
+                    runtimeState,
+                    positions[index]);
                 ApplyAnimationScrub(runtimeState);
             }
             if (currentIndex == index) {
@@ -66866,7 +70169,9 @@ void DrawWaterRunTimingGraph(
     };
 
     const auto scrubTo = [&](float position) {
-        runtimeState->animationPanel.scrubAmount = position;
+        SetCurrentAnimationPositionFromAuthoredTrack(
+            runtimeState,
+            position);
         ApplyAnimationScrub(runtimeState);
     };
     const auto selectKey = [&](std::size_t index, float position) {
@@ -66971,7 +70276,7 @@ void DrawWaterRunTimingGraph(
     const bool scrubOnKey =
         [&](float position) {
             return std::abs(
-                       runtimeState->animationPanel.scrubAmount -
+                       CurrentAuthoredTrackPosition(*runtimeState) -
                        position) <= kKeyTolerance;
         }(hoveredDotSeries.has_value() ? hoveredDotPosition
                                        : nearestMarkerPosition);
@@ -67066,7 +70371,7 @@ void DrawWaterRunTimingGraph(
         // Visual Features lanes.
         const float scrubPosition = positionForX(mouse.x);
         if (std::abs(
-                runtimeState->animationPanel.scrubAmount -
+                CurrentAuthoredTrackPosition(*runtimeState) -
                 scrubPosition) >
             std::numeric_limits<float>::epsilon()) {
             scrubTo(scrubPosition);
@@ -67277,7 +70582,7 @@ void DrawWaterRunTimingGraph(
                     2.0F);
             }
             if (std::abs(
-                    runtimeState->animationPanel.scrubAmount -
+                    CurrentAuthoredTrackPosition(*runtimeState) -
                     key.position) <= kKeyTolerance) {
                 drawList->AddLine(
                     ImVec2{x - 3.0F, axisY - 5.5F},
@@ -67311,7 +70616,7 @@ void DrawWaterRunTimingGraph(
     // section by pinning it to the corresponding edge of the graph.
     const float scrubX = xForPosition(
         std::clamp(
-            runtimeState->animationPanel.scrubAmount,
+            CurrentAuthoredTrackPosition(*runtimeState),
             viewRange.start,
             viewRange.end));
     const float playheadTipY = graphTopY + 7.0F;
@@ -67629,7 +70934,7 @@ void DrawEmbeddedWaterFeatureTimeline(
     }
     const float durationSeconds = std::max(
         0.0F,
-        AnimationDurationSeconds(
+        AuthoredAnimationTrackDurationSeconds(
             *runtimeState->animationPanel.currentPath));
     std::vector<WaterRunGraphSeries> series;
     BuildWaterFeatureGraphSeries(*timeline, &series);
@@ -67662,7 +70967,7 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
         runtimeState->animationPanel.currentPath.has_value()
             ? std::max(
                   0.0F,
-                  AnimationDurationSeconds(
+                  AuthoredAnimationTrackDurationSeconds(
                       runtimeState->animationPanel.currentPath.value()))
             : 0.0F;
 
@@ -69757,7 +73062,7 @@ void DrawTimingKeyLaneGroup(
     if (markerHovered) {
         const bool onKey =
             std::abs(
-                runtimeState->animationPanel.scrubAmount -
+                CurrentAuthoredTrackPosition(*runtimeState) -
                 nearestPosition) <=
             invisible_places::timing::
                 kTimingColouriseKeyTolerance;
@@ -69814,15 +73119,17 @@ void DrawTimingKeyLaneGroup(
                 ImGui::OpenPopup(
                     "Edit Local Effect Key Position");
             } else {
-                runtimeState->animationPanel.scrubAmount =
-                    nearestPosition;
+                SetCurrentAnimationPositionFromAuthoredTrack(
+                    runtimeState,
+                    nearestPosition);
                 ApplyAnimationScrub(runtimeState);
             }
         } else if (ImGui::IsMouseClicked(
                        ImGuiMouseButton_Left)) {
             handledMarkerInteraction = true;
-            runtimeState->animationPanel.scrubAmount =
-                nearestPosition;
+            SetCurrentAnimationPositionFromAuthoredTrack(
+                runtimeState,
+                nearestPosition);
             ApplyAnimationScrub(runtimeState);
             timings.colouriseLocalKeyDrag =
                 TimingColouriseLocalKeyDragState{
@@ -69882,10 +73189,12 @@ void DrawTimingKeyLaneGroup(
         ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
         const float scrubPosition = positionForX(mouseX);
         if (std::abs(
-                runtimeState->animationPanel.scrubAmount -
+                CurrentAuthoredTrackPosition(*runtimeState) -
                 scrubPosition) >
             std::numeric_limits<float>::epsilon()) {
-            runtimeState->animationPanel.scrubAmount = scrubPosition;
+            SetCurrentAnimationPositionFromAuthoredTrack(
+                runtimeState,
+                scrubPosition);
             ApplyAnimationScrub(runtimeState);
         }
     }
@@ -69910,8 +73219,9 @@ void DrawTimingKeyLaneGroup(
             movedSourcePosition = drag.currentPosition;
             movedDestinationPosition = destination;
             drag.currentPosition = destination;
-            runtimeState->animationPanel.scrubAmount =
-                destination;
+            SetCurrentAnimationPositionFromAuthoredTrack(
+                runtimeState,
+                destination);
             ApplyAnimationScrub(runtimeState);
             runtimeState
                 ->previewRenderStateSignatureValid =
@@ -70365,10 +73675,8 @@ void DrawTimingKeyLaneGroup(
         ImVec2{minimum.x, axisY},
         ImVec2{maximum.x, axisY},
         ImGui::GetColorU32(ImGuiCol_Border));
-    const float scrubPosition = std::clamp(
-        runtimeState->animationPanel.scrubAmount,
-        0.0F,
-        1.0F);
+    const float scrubPosition =
+        CurrentAuthoredTrackPosition(*runtimeState);
     const float scrubX = xForPosition(scrubPosition);
     for (const auto& lane : series) {
         for (const float position : lane.positions) {
@@ -70405,7 +73713,7 @@ void DrawTimingKeyLaneGroup(
                     2.0F);
             }
             if (std::abs(
-                    runtimeState->animationPanel.scrubAmount -
+                    CurrentAuthoredTrackPosition(*runtimeState) -
                     drawnPosition) <=
                 invisible_places::timing::
                     kTimingColouriseKeyTolerance) {
@@ -70570,8 +73878,9 @@ void DrawTimingKeyLaneGroup(
                         *editorSeries,
                         editor->sourcePosition,
                         editor->draftPosition)) {
-                    runtimeState->animationPanel.scrubAmount =
-                        editor->draftPosition;
+                    SetCurrentAnimationPositionFromAuthoredTrack(
+                        runtimeState,
+                        editor->draftPosition);
                     ApplyAnimationScrub(runtimeState);
                     runtimeState
                         ->previewRenderStateSignatureValid =
@@ -70824,10 +74133,7 @@ void DrawTimingColouriseTrackButtons(
     if (runtimeState == nullptr || effect == nullptr) {
         return;
     }
-    const float position = std::clamp(
-        runtimeState->animationPanel.scrubAmount,
-        0.0F,
-        1.0F);
+    const float position = CurrentAuthoredTrackPosition(*runtimeState);
     const auto previous =
         paletteTrack
             ? invisible_places::timing::
@@ -70860,8 +74166,9 @@ void DrawTimingColouriseTrackButtons(
                       position);
     ImGui::BeginDisabled(!previous.has_value());
     if (ImGui::SmallButton("<")) {
-        runtimeState->animationPanel.scrubAmount =
-            previous.value();
+        SetCurrentAnimationPositionFromAuthoredTrack(
+            runtimeState,
+            previous.value());
         ApplyAnimationScrub(runtimeState);
     }
     ImGui::EndDisabled();
@@ -70872,7 +74179,9 @@ void DrawTimingColouriseTrackButtons(
     ImGui::SameLine(0.0F, 2.0F);
     ImGui::BeginDisabled(!next.has_value());
     if (ImGui::SmallButton(">")) {
-        runtimeState->animationPanel.scrubAmount = next.value();
+        SetCurrentAnimationPositionFromAuthoredTrack(
+            runtimeState,
+            next.value());
         ApplyAnimationScrub(runtimeState);
     }
     ImGui::EndDisabled();
@@ -71048,10 +74357,7 @@ bool DrawTimingColouriseEffectParameterTrackButtons(
         return false;
     }
     bool changed = false;
-    const float position = std::clamp(
-        runtimeState->animationPanel.scrubAmount,
-        0.0F,
-        1.0F);
+    const float position = CurrentAuthoredTrackPosition(*runtimeState);
     const auto previous = invisible_places::timing::
         PreviousTimingColouriseEffectParameterKeyPosition(
             *effect,
@@ -71069,7 +74375,9 @@ bool DrawTimingColouriseEffectParameterTrackButtons(
             position);
     ImGui::BeginDisabled(!previous.has_value());
     if (ImGui::SmallButton("<")) {
-        runtimeState->animationPanel.scrubAmount = previous.value();
+        SetCurrentAnimationPositionFromAuthoredTrack(
+            runtimeState,
+            previous.value());
         ApplyAnimationScrub(runtimeState);
     }
     ImGui::EndDisabled();
@@ -71080,7 +74388,9 @@ bool DrawTimingColouriseEffectParameterTrackButtons(
     ImGui::SameLine(0.0F, 2.0F);
     ImGui::BeginDisabled(!next.has_value());
     if (ImGui::SmallButton(">")) {
-        runtimeState->animationPanel.scrubAmount = next.value();
+        SetCurrentAnimationPositionFromAuthoredTrack(
+            runtimeState,
+            next.value());
         ApplyAnimationScrub(runtimeState);
     }
     ImGui::EndDisabled();
@@ -71134,10 +74444,7 @@ bool DrawTimingColouriseEffectParameterEditor(
     if (runtimeState == nullptr || effect == nullptr) {
         return false;
     }
-    const float position = std::clamp(
-        runtimeState->animationPanel.scrubAmount,
-        0.0F,
-        1.0F);
+    const float position = CurrentAuthoredTrackPosition(*runtimeState);
     const auto exact = std::find_if(
         effect->effectParameterKeys.begin(),
         effect->effectParameterKeys.end(),
@@ -71426,10 +74733,7 @@ void DrawTimingColourisePaletteEditor(
 
     auto& timings = runtimeState->timingsPanel;
     auto& water = runtimeState->water;
-    const float position = std::clamp(
-        runtimeState->animationPanel.scrubAmount,
-        0.0F,
-        1.0F);
+    const float position = CurrentAuthoredTrackPosition(*runtimeState);
     const auto stopIndexById =
         [](const TimingColourisePalette& palette,
            std::string_view stopId)
@@ -72019,8 +75323,9 @@ void DrawTimingColourisePaletteEditor(
                 if (DrawTimingPaletteComboEntry(
                         keyed,
                         selected)) {
-                    runtimeState->animationPanel.scrubAmount =
-                        keyPosition;
+                    SetCurrentAnimationPositionFromAuthoredTrack(
+                        runtimeState,
+                        keyPosition);
                     ApplyAnimationScrub(runtimeState);
                 }
             }
@@ -74045,10 +77350,7 @@ void DrawTimingColouriseHistogram(
         }
         return;
     }
-    const float position = std::clamp(
-        runtimeState->animationPanel.scrubAmount,
-        0.0F,
-        1.0F);
+    const float position = CurrentAuthoredTrackPosition(*runtimeState);
     const ImVec2 size{
         std::max(160.0F, ImGui::GetContentRegionAvail().x),
         92.0F};
@@ -74489,10 +77791,7 @@ void DrawTimingColouriseBoundsParameterTrackButtons(
     ImGui::PushStyleVar(
         ImGuiStyleVar_FramePadding,
         ImVec2{2.0F, 1.0F});
-    const float position = std::clamp(
-        runtimeState->animationPanel.scrubAmount,
-        0.0F,
-        1.0F);
+    const float position = CurrentAuthoredTrackPosition(*runtimeState);
     const auto previous =
         invisible_places::timing::
             PreviousTimingColouriseBoundsParameterKeyPosition(
@@ -74557,8 +77856,9 @@ void DrawTimingColouriseBoundsParameterTrackButtons(
     ImGui::SameLine(0.0F, 2.0F);
     ImGui::BeginDisabled(!previous.has_value());
     if (ImGui::SmallButton("<")) {
-        runtimeState->animationPanel.scrubAmount =
-            previous.value();
+        SetCurrentAnimationPositionFromAuthoredTrack(
+            runtimeState,
+            previous.value());
         ApplyAnimationScrub(runtimeState);
     }
     ImGui::EndDisabled();
@@ -74569,7 +77869,9 @@ void DrawTimingColouriseBoundsParameterTrackButtons(
     ImGui::SameLine(0.0F, 2.0F);
     ImGui::BeginDisabled(!next.has_value());
     if (ImGui::SmallButton(">")) {
-        runtimeState->animationPanel.scrubAmount = next.value();
+        SetCurrentAnimationPositionFromAuthoredTrack(
+            runtimeState,
+            next.value());
         ApplyAnimationScrub(runtimeState);
     }
     ImGui::EndDisabled();
@@ -74617,10 +77919,7 @@ void DrawTimingColouriseBoundsParameterEditor(
     if (runtimeState == nullptr || effect == nullptr) {
         return;
     }
-    const float position = std::clamp(
-        runtimeState->animationPanel.scrubAmount,
-        0.0F,
-        1.0F);
+    const float position = CurrentAuthoredTrackPosition(*runtimeState);
     const auto evaluatedBounds =
         invisible_places::timing::EvaluateTimingColouriseBounds(
             *effect,
@@ -75528,14 +78827,14 @@ void DrawTimingColouriseActivationOverview(
                 ImVec2{drawnEndX, centreY + 3.0F},
                 3.0F,
                 handleColour);
-            const float scrubX = xForPosition(
-                runtimeState->animationPanel.scrubAmount);
+            const float trackScrubPosition =
+                CurrentAuthoredTrackPosition(*runtimeState);
+            const float scrubX = xForPosition(trackScrubPosition);
             drawList->AddLine(
                 ImVec2{scrubX, itemMinimum.y + 1.0F},
                 ImVec2{scrubX, itemMaximum.y - 1.0F},
                 ImGui::GetColorU32(
-                    rangeContains(
-                        runtimeState->animationPanel.scrubAmount)
+                    rangeContains(trackScrubPosition)
                         ? ImGuiCol_Text
                         : ImGuiCol_TextDisabled),
                 1.0F);
@@ -75612,7 +78911,7 @@ void DrawTimingColouriseActivationOverview(
                     runtimeState->animationPanel.currentPath.has_value()
                         ? std::max(
                               0.0F,
-                              AnimationDurationSeconds(
+                              AuthoredAnimationTrackDurationSeconds(
                                   runtimeState->animationPanel
                                       .currentPath.value()))
                         : 0.0F;
@@ -76667,6 +79966,7 @@ void DrawWaterKeyMarkerStrip(
     struct NearestKey {
         float distance = 1.0e9F;
         float position = 0.0F;
+        float cameraPosition = 0.0F;
         std::size_t settingIndex = 0U;
         std::size_t keyNumber = 0U;
         float value = 0.0F;
@@ -76691,7 +79991,13 @@ void DrawWaterKeyMarkerStrip(
         for (std::size_t keyIndex = 0U; keyIndex < ordered.size();
              ++keyIndex) {
             const auto& key = ordered[keyIndex];
-            const float x = barMin.x + barWidth * key.position;
+            const float cameraPosition =
+                runtimeState->animationPanel.currentPath.has_value()
+                    ? AuthoredTrackNormalizedToCameraNormalized(
+                          runtimeState->animationPanel.currentPath.value(),
+                          key.position)
+                    : key.position;
+            const float x = barMin.x + barWidth * cameraPosition;
             drawList->AddRectFilled(
                 ImVec2{x - 1.5F, stripTop},
                 ImVec2{x + 1.5F, stripTop + kStripHeight},
@@ -76702,6 +80008,7 @@ void DrawWaterKeyMarkerStrip(
                     nearest = {
                         .distance = distance,
                         .position = key.position,
+                        .cameraPosition = cameraPosition,
                         .settingIndex = settingIndex,
                         .keyNumber = keyIndex + 1U,
                         .value = key.value,
@@ -76731,7 +80038,7 @@ void DrawWaterKeyMarkerStrip(
         const bool positionIsOnKey =
             std::abs(
                 runtimeState->animationPanel.scrubAmount -
-                nearest.position) <= 1.0e-4F;
+                nearest.cameraPosition) <= 1.0e-4F;
         ImGui::SetTooltip(
             positionIsOnKey
                 ? "%s %zu — %s = %.3f at %.2f s (double-click to edit position)"
@@ -76740,7 +80047,7 @@ void DrawWaterKeyMarkerStrip(
             nearest.keyNumber,
             settingLabel,
             nearest.value,
-            nearest.position * durationSeconds);
+            nearest.cameraPosition * durationSeconds);
         if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
             if (positionIsOnKey) {
                 runtimeState->animationPanel.waterKeyPositionEdit =
@@ -76755,7 +80062,7 @@ void DrawWaterKeyMarkerStrip(
                 ImGui::OpenPopup("Edit Water Key Position");
             } else {
                 runtimeState->animationPanel.scrubAmount =
-                    nearest.position;
+                    nearest.cameraPosition;
                 ApplyAnimationScrub(runtimeState);
             }
         }
@@ -76822,7 +80129,7 @@ void DrawWaterKeyMarkerStrip(
                                std::abs(
                                    candidate.position -
                                    edit->draftPosition) <=
-                                   kKeyTolerance;
+                               kKeyTolerance;
                     });
             if (!validPosition) {
                 ImGui::TextColored(
@@ -76867,7 +80174,11 @@ void DrawWaterKeyMarkerStrip(
                         edit->sourcePosition,
                         edit->draftPosition)) {
                     runtimeState->animationPanel.scrubAmount =
-                        edit->draftPosition;
+                        runtimeState->animationPanel.currentPath.has_value()
+                            ? AuthoredTrackNormalizedToCameraNormalized(
+                                  runtimeState->animationPanel.currentPath.value(),
+                                  edit->draftPosition)
+                            : edit->draftPosition;
                     ApplyAnimationScrub(runtimeState);
                     InvalidateWaterSeepageParams(&water);
                     runtimeState->previewRenderStateSignatureValid =
@@ -77002,10 +80313,17 @@ void DrawTimingColouriseGlobalMarkerLanes(
             ImVec2{width, kLaneHeight});
         const bool hovered = ImGui::IsItemHovered();
         auto* drawList = ImGui::GetWindowDrawList();
+        const auto cameraPosition = [&](float trackPosition) {
+            return runtimeState->animationPanel.currentPath.has_value()
+                       ? AuthoredTrackNormalizedToCameraNormalized(
+                             runtimeState->animationPanel.currentPath.value(),
+                             trackPosition)
+                       : trackPosition;
+        };
         const float activationStartX =
-            barMin.x + width * activation.start;
+            barMin.x + width * cameraPosition(activation.start);
         const float activationEndX =
-            barMin.x + width * activation.end;
+            barMin.x + width * cameraPosition(activation.end);
         drawList->AddRectFilled(
             ImVec2{activationStartX, top + 2.0F},
             ImVec2{activationEndX, top + kLaneHeight - 1.0F},
@@ -77030,11 +80348,14 @@ void DrawTimingColouriseGlobalMarkerLanes(
         float nearestDistance =
             std::numeric_limits<float>::max();
         float nearestPosition = 0.0F;
+        float nearestCameraPosition = 0.0F;
         for (const float keyPosition : lane.positions) {
+            const float keyCameraPosition =
+                cameraPosition(keyPosition);
             const float x =
                 barMin.x +
                 width *
-                    std::clamp(keyPosition, 0.0F, 1.0F);
+                    std::clamp(keyCameraPosition, 0.0F, 1.0F);
             auto markerColour = lane.colour;
             if (!invisible_places::timing::
                     TimingColouriseActivationRangeContains(
@@ -77057,13 +80378,14 @@ void DrawTimingColouriseGlobalMarkerLanes(
             if (distance < nearestDistance) {
                 nearestDistance = distance;
                 nearestPosition = keyPosition;
+                nearestCameraPosition = keyCameraPosition;
             }
         }
         if (hovered && nearestDistance <= 6.0F) {
             const bool onKey =
                 std::abs(
                     runtimeState->animationPanel.scrubAmount -
-                    nearestPosition) <=
+                    nearestCameraPosition) <=
                 invisible_places::timing::
                     kTimingColouriseKeyTolerance;
             ImGui::SetTooltip(
@@ -77091,7 +80413,7 @@ void DrawTimingColouriseGlobalMarkerLanes(
                         "Edit Effect Key Position");
                 } else {
                     runtimeState->animationPanel.scrubAmount =
-                        nearestPosition;
+                        nearestCameraPosition;
                     ApplyAnimationScrub(runtimeState);
                 }
             }
@@ -77255,7 +80577,11 @@ void DrawTimingColouriseGlobalMarkerLanes(
                                   edit->draftPosition);
                 if (moved) {
                     runtimeState->animationPanel.scrubAmount =
-                        edit->draftPosition;
+                        runtimeState->animationPanel.currentPath.has_value()
+                            ? AuthoredTrackNormalizedToCameraNormalized(
+                                  runtimeState->animationPanel.currentPath.value(),
+                                  edit->draftPosition)
+                            : edit->draftPosition;
                     ApplyAnimationScrub(runtimeState);
                     runtimeState
                         ->previewRenderStateSignatureValid =
@@ -77410,16 +80736,26 @@ std::size_t RemoveTimingEffectRelevantKeysAtPosition(
 }
 
 void DrawAnimationTimelineViewBoundsOverlay(
+    const PreviewRuntimeState& runtimeState,
     invisible_places::timing::TimelineViewRange range,
     ImVec2 barMin,
     ImVec2 barMax) {
     range = invisible_places::timing::SanitizeTimelineViewRange(range);
-    if (invisible_places::timing::TimelineViewRangeIsFull(range)) {
+    const auto cameraPosition = [&](float trackPosition) {
+        return runtimeState.animationPanel.currentPath.has_value()
+                   ? AuthoredTrackNormalizedToCameraNormalized(
+                         runtimeState.animationPanel.currentPath.value(),
+                         trackPosition)
+                   : std::clamp(trackPosition, 0.0F, 1.0F);
+    };
+    const float cameraStart = cameraPosition(range.start);
+    const float cameraEnd = cameraPosition(range.end);
+    if (cameraStart <= 1.0e-6F && cameraEnd >= 1.0F - 1.0e-6F) {
         return;
     }
     const float width = std::max(1.0F, barMax.x - barMin.x);
-    const float startX = barMin.x + width * range.start;
-    const float endX = barMin.x + width * range.end;
+    const float startX = barMin.x + width * cameraStart;
+    const float endX = barMin.x + width * cameraEnd;
     auto* drawList = ImGui::GetWindowDrawList();
     drawList->AddRectFilled(
         barMin,
@@ -77648,7 +80984,7 @@ bool DrawAnimationTimelineViewRangeSelector(
         2.0F);
     const float playheadX =
         minimum.x +
-        width * std::clamp(panel.scrubAmount, 0.0F, 1.0F);
+        width * CurrentAuthoredTrackPosition(*runtimeState);
     drawList->AddLine(
         ImVec2{playheadX, minimum.y + 2.0F},
         ImVec2{playheadX, maximum.y - 2.0F},
@@ -77809,7 +81145,12 @@ void DrawPinnedWaterSettingOverlays(
                 0.0F,
                 1.0F);
             return ImVec2{
-                barMin.x + barWidth * position01,
+                barMin.x + barWidth *
+                    (runtimeState->animationPanel.currentPath.has_value()
+                         ? AuthoredTrackNormalizedToCameraNormalized(
+                               runtimeState->animationPanel.currentPath.value(),
+                               position01)
+                         : position01),
                 barMax.y - kOverlayPad -
                     normalized * (barHeight - kOverlayPad * 2.0F)};
         };
@@ -77933,12 +81274,13 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
         runtimeState,
         durationSeconds);
     DrawAnimationTimelineViewBoundsOverlay(
+        *runtimeState,
         panel.timelineViewRange,
         barMin,
         barMax);
     DrawPinnedWaterSettingOverlays(runtimeState, barMin, barMax);
 
-    const float scrubPosition = std::clamp(panel.scrubAmount, 0.0F, 1.0F);
+    const float scrubPosition = CurrentAuthoredTrackPosition(*runtimeState);
     const auto relevantEffectKeyPositions =
         colouriseEffect != nullptr
             ? TimingEffectRelevantKeyPositions(*colouriseEffect)
@@ -78052,7 +81394,9 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
     ImGui::SameLine(0.0F, navigationGap);
     ImGui::BeginDisabled(!previous.has_value());
     if (ImGui::SmallButton("<")) {
-        panel.scrubAmount = previous.value();
+        SetCurrentAnimationPositionFromAuthoredTrack(
+            runtimeState,
+            previous.value());
         ApplyAnimationScrub(runtimeState);
     }
     ImGui::EndDisabled();
@@ -78083,7 +81427,9 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
     ImGui::SameLine(0.0F, 2.0F);
     ImGui::BeginDisabled(!next.has_value());
     if (ImGui::SmallButton(">")) {
-        panel.scrubAmount = next.value();
+        SetCurrentAnimationPositionFromAuthoredTrack(
+            runtimeState,
+            next.value());
         ApplyAnimationScrub(runtimeState);
     }
     ImGui::EndDisabled();
@@ -78354,6 +81700,8 @@ void DrawControlsWindow(
     constexpr ImGuiWindowFlags flags =
         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
     ImGui::Begin("Invisible Places Controls", nullptr, flags);
+    const bool reciprocalPanWizardActive =
+        runtimeState->animationPanel.reciprocalPanWizard.Active();
 
     const auto applyLiveView =
         [&](const char* name,
@@ -78379,6 +81727,7 @@ void DrawControlsWindow(
     ImGui::PushStyleVar(
         ImGuiStyleVar_CellPadding,
         ImVec2{2.0F, ImGui::GetStyle().CellPadding.y});
+    ImGui::BeginDisabled(reciprocalPanWizardActive);
     if (ImGui::BeginTable(
             "##LiveViewCameraControls",
             6,
@@ -78473,6 +81822,7 @@ void DrawControlsWindow(
         }
         ImGui::EndTable();
     }
+    ImGui::EndDisabled();
     ImGui::PopStyleVar(2);
 
     // Tab hit rectangles are captured below. Resolve this frame's click
@@ -78482,7 +81832,7 @@ void DrawControlsWindow(
     // A popup that remains open here (notably a modal confirmation) continues
     // to block tab changes intentionally.
     std::optional<ControlsTab> requestedControlsTab;
-    if (!popupOpen &&
+    if (!popupOpen && !reciprocalPanWizardActive &&
         ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         constexpr std::array tabValues{
             ControlsTab::Visuals,
@@ -78510,6 +81860,10 @@ void DrawControlsWindow(
                 break;
             }
         }
+    }
+    if (reciprocalPanWizardActive) {
+        runtimeState->activeControlsTab = ControlsTab::Animation;
+        requestedControlsTab = ControlsTab::Animation;
     }
     if (requestedControlsTab.has_value() &&
         requestedControlsTab.value() != ControlsTab::Timings) {
@@ -78545,8 +81899,14 @@ void DrawControlsWindow(
     ImGui::SetCursorPosX(fpsCursorX);
     ImGui::TextDisabled("%s", fpsLabel.c_str());
 
+    ImGui::BeginDisabled(reciprocalPanWizardActive);
     DrawGlobalAnimationTimingBar(runtimeState);
     DrawFocusedWaterRunCombo(runtimeState);
+    ImGui::EndDisabled();
+    if (reciprocalPanWizardActive) {
+        ImGui::TextDisabled(
+            "Position controlled by the reciprocal seam-extension assistant.");
+    }
 
     sidePanel.hovered = ImGui::IsWindowHovered(
         ImGuiHoveredFlags_AllowWhenBlockedByActiveItem | ImGuiHoveredFlags_RootAndChildWindows);
@@ -78562,9 +81922,16 @@ void DrawControlsWindow(
                 ControlsTab tab,
                 bool* open = nullptr) {
                 const ImGuiTabItemFlags tabFlags =
-                    requestedControlsTab == tab
+                    requestedControlsTab == tab ||
+                            (reciprocalPanWizardActive &&
+                             tab == ControlsTab::Animation)
                         ? ImGuiTabItemFlags_SetSelected
                         : ImGuiTabItemFlags_None;
+                const bool locked = reciprocalPanWizardActive &&
+                                    tab != ControlsTab::Animation;
+                if (locked) {
+                    ImGui::BeginDisabled();
+                }
                 const bool selected =
                     ImGui::BeginTabItem(label, open, tabFlags);
                 const auto minimum =
@@ -78578,6 +81945,9 @@ void DrawControlsWindow(
                         minimum.y,
                         maximum.x,
                         maximum.y};
+                if (locked) {
+                    ImGui::EndDisabled();
+                }
                 return selected;
             };
         if (beginControlsTabItem("Visuals", ControlsTab::Visuals)) {
@@ -78796,6 +82166,106 @@ void UpdateCameraFromInput(
     if (VisibleLayerCount(*runtimeState) == 0) {
         runtimeState->cameraInteraction.navigationActive = false;
         runtimeState->cameraInteraction.trackballOrbitActive = false;
+        return;
+    }
+
+    auto& reciprocalWizard =
+        runtimeState->animationPanel.reciprocalPanWizard;
+    if (reciprocalWizard.Active()) {
+        runtimeState->cameraInteraction.navigationActive = false;
+        runtimeState->cameraInteraction.trackballOrbitActive = false;
+        if (reciprocalWizard.viewportClickConsumed ||
+            reciprocalWizard.nodeGizmoPointerCaptured) {
+            reciprocalWizard.viewportClickConsumed = false;
+            return;
+        }
+        const auto& input = ImGui::GetIO();
+        const bool editDoubleClick =
+            reciprocalWizard.stage ==
+                AnimationReciprocalPanWizardStage::EditCorrespondences &&
+            ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+        const bool canCapture =
+            (reciprocalWizard.anchorPickArmed || editDoubleClick) &&
+            !reciprocalWizard.inspectionActive &&
+            IsMouseOverRenderViewport(viewport) &&
+            !viewport.UiWantsMouseCapture() &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+        if (!canCapture) {
+            return;
+        }
+        const auto patch = ResolveReciprocalPanSurfacePatch(
+            *runtimeState,
+            viewport,
+            input.MousePos,
+            reciprocalWizard.commonSceneKey);
+        if (!patch.has_value()) {
+            reciprocalWizard.errorMessage =
+                "No cached point-cloud surface from the common scene was found within 48 pixels. Click a denser, visible part of the anchor object.";
+            return;
+        }
+        const auto viewportSize = CurrentUiViewportSize(viewport);
+        const auto local = ToRenderViewportLocal(viewport, input.MousePos);
+        const std::size_t triangleIndex =
+            ReciprocalPanStageTriangleIndex(reciprocalWizard);
+        if (triangleIndex >= reciprocalWizard.endpointTriangles.size()) {
+            return;
+        }
+        auto& observation =
+            reciprocalWizard.endpointTriangles[triangleIndex];
+        observation.pathRole = ReciprocalPanTrianglePathRole(triangleIndex);
+        observation.frame = ReciprocalPanStageFrame(reciprocalWizard);
+        observation.normalizedPosition = ReciprocalPanFramePosition(
+            reciprocalWizard.baselinePaths[
+                static_cast<std::size_t>(observation.pathRole)],
+            observation.frame);
+        const bool replacing = reciprocalWizard.reraycastSelectedNode ||
+                               editDoubleClick ||
+                               observation.patch.pointCount >= 3U;
+        const std::size_t nodeIndex = replacing
+                                          ? static_cast<std::size_t>(
+                                                std::clamp(
+                                                    reciprocalWizard
+                                                        .selectedNodeIndex,
+                                                    0,
+                                                    2))
+                                          : std::min<std::size_t>(
+                                                observation.patch.pointCount,
+                                                2U);
+        observation.patch.worldPoints[nodeIndex] =
+            patch->worldPoints[0U];
+        observation.patch.pointCount = std::max<std::uint32_t>(
+            observation.patch.pointCount,
+            static_cast<std::uint32_t>(nodeIndex + 1U));
+        observation.normalizedScreens[nodeIndex] = ImVec2{
+            std::clamp(local.x / std::max(1.0F, viewportSize.x),
+                       0.0F,
+                       1.0F),
+            std::clamp(local.y / std::max(1.0F, viewportSize.y),
+                       0.0F,
+                       1.0F),
+        };
+        observation.captured = observation.patch.pointCount == 3U;
+        reciprocalWizard.selectedTriangleIndex =
+            static_cast<int>(triangleIndex);
+        reciprocalWizard.selectedNodeIndex = observation.captured
+                                                   ? static_cast<int>(nodeIndex)
+                                                   : static_cast<int>(
+                                                         observation.patch
+                                                             .pointCount);
+        reciprocalWizard.selectedNodeIndex = std::clamp(
+            reciprocalWizard.selectedNodeIndex,
+            0,
+            2);
+        reciprocalWizard.reraycastSelectedNode = false;
+        reciprocalWizard.anchorPickArmed = !observation.captured;
+        InvalidateReciprocalPanWizardCandidate(&reciprocalWizard);
+        runtimeState->statusMessage =
+            observation.captured
+                ? "Captured the ordered anchor / pan / ground triangle. Use Next, or select a node to replace or move it."
+                : "Captured triangle node " +
+                      std::to_string(observation.patch.pointCount) +
+                      " of 3.";
+        runtimeState->errorMessage.clear();
         return;
     }
 
@@ -79720,10 +83190,7 @@ bool PreviewLiveVisualEffectsRequireSceneRedraw(
         entry != nullptr) {
         overlay = invisible_places::water::BuildWaterFeatureTimingOverlay(
             entry->waterFeatureTimingRuns,
-            std::clamp(
-                runtimeState.animationPanel.scrubAmount,
-                0.0F,
-                1.0F));
+            CurrentAuthoredTrackPosition(runtimeState));
         overlayPtr = &overlay;
         invisible_places::water::ApplyWaterFeatureTimingOverlayToRainSettings(
             overlay,
@@ -92468,6 +95935,7 @@ int Application::Run(ApplicationRunOptions options) const {
         // poll runs before this frame's UI is built.
         if (ImGui::GetCurrentContext() != nullptr) {
             window.SetEscapeCloseSuppressed(
+                runtimeState.animationPanel.reciprocalPanWizard.Active() ||
                 ImGui::GetIO().WantCaptureKeyboard ||
                 ImGui::IsAnyItemActive() ||
                 ImGui::IsAnyMouseDown());
@@ -92480,6 +95948,11 @@ int Application::Run(ApplicationRunOptions options) const {
             window.CancelCloseRequest();
             if (!runtimeState.saveChanges.requested ||
                 !runtimeState.saveChanges.closeAfterSave) {
+                if (runtimeState.animationPanel.reciprocalPanWizard.Active()) {
+                    CancelReciprocalPanWizard(
+                        &runtimeState,
+                        "Cancelled Reciprocal Pan Extension and restored its launch view before closing.");
+                }
                 RequestSaveChangesDialog(
                     &runtimeState,
                     SaveChangesRequest::Closing);
@@ -92584,7 +96057,9 @@ int Application::Run(ApplicationRunOptions options) const {
                         viewport.value(),
                         liveWaterTimeSeconds);
                 const float previewFlowTimeSeconds =
-                    previewLiveEffectsAffectScene ? liveWaterTimeSeconds : 0.0F;
+                    previewLiveEffectsAffectScene
+                        ? liveWaterTimeSeconds
+                        : 0.0F;
                 const auto renderState = BuildRenderState(
                     runtimeState,
                     viewport.value(),

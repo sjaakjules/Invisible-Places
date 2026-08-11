@@ -7,8 +7,10 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <utility>
 
@@ -3169,6 +3171,183 @@ TEST_CASE("Animation velocity blend metadata and localized corrections round-tri
         Catch::Approx(1.0F));
   CHECK(loaded->keys.front().splineLensEndpointTangent[4U] ==
         Catch::Approx(1.5F));
+}
+
+TEST_CASE(
+    "Animation schema 22 legacy extension marker and correction tangents round-trip",
+    "[animation][serialization][timing][localized-correction]") {
+  using invisible_places::camera::AnimationLocalizedKeyCorrection;
+  using invisible_places::camera::AnimationPath;
+  using invisible_places::serialization::AnimationPathFromJson;
+  using invisible_places::serialization::AnimationPathToJson;
+  using invisible_places::serialization::kAnimationDocumentSchemaVersion;
+
+  AnimationPath path;
+  path.name = "Legacy extended timing path";
+  path.durationFrames = 360U;
+  path.authoredTrackDurationFrames = 240U;
+  path.keys = {
+      {.id = "first", .cameraPosition = {1.0F, 2.0F, 3.0F},
+       .focusPoint = {4.0F, 5.0F, 6.0F}},
+      {.id = "last", .cameraPosition = {7.0F, 8.0F, 9.0F},
+       .focusPoint = {10.0F, 11.0F, 12.0F}},
+  };
+  path.localizedKeyCorrections = {
+      AnimationLocalizedKeyCorrection{
+          .keyId = "first",
+          .splineCameraPosition = {0.5F, 2.0F, 3.0F},
+          .splineFocusPoint = {4.0F, 4.5F, 6.0F},
+          .hasCameraCorrectionTangent = true,
+          .cameraCorrectionTangent = {0.25F, -0.5F, 0.75F},
+      },
+      AnimationLocalizedKeyCorrection{
+          .keyId = "last",
+          .splineCameraPosition = {7.5F, 8.0F, 9.0F},
+          .splineFocusPoint = {10.0F, 11.5F, 12.0F},
+          .hasFocusCorrectionTangent = true,
+          .focusCorrectionTangent = {-1.25F, 1.5F, -1.75F},
+      },
+  };
+
+  const auto json = AnimationPathToJson(path);
+  CHECK(json.at("schema_version") == kAnimationDocumentSchemaVersion);
+  CHECK(json.at("authored_track_duration_frames") == 240U);
+  REQUIRE(json.at("localized_key_corrections").size() == 2U);
+  const auto& firstJson = json.at("localized_key_corrections")[0U];
+  CHECK(firstJson.at("has_camera_correction_tangent") == true);
+  CHECK(firstJson.at("camera_correction_tangent")[1U] ==
+        Catch::Approx(-0.5F));
+  CHECK(firstJson.at("has_focus_correction_tangent") == false);
+  const auto& lastJson = json.at("localized_key_corrections")[1U];
+  CHECK(lastJson.at("has_camera_correction_tangent") == false);
+  CHECK(lastJson.at("has_focus_correction_tangent") == true);
+  CHECK(lastJson.at("focus_correction_tangent")[2U] ==
+        Catch::Approx(-1.75F));
+
+  std::string error;
+  const auto loaded = AnimationPathFromJson(json, &error);
+  INFO(error);
+  REQUIRE(loaded.has_value());
+  CHECK(loaded->sourceSchemaVersion == kAnimationDocumentSchemaVersion);
+  CHECK(loaded->durationFrames == 360U);
+  CHECK(loaded->authoredTrackDurationFrames == 240U);
+  REQUIRE(loaded->localizedKeyCorrections.size() == 2U);
+  const auto& first = loaded->localizedKeyCorrections[0U];
+  CHECK(first.hasCameraCorrectionTangent);
+  CHECK(first.cameraCorrectionTangent[0U] == Catch::Approx(0.25F));
+  CHECK(first.cameraCorrectionTangent[1U] == Catch::Approx(-0.5F));
+  CHECK(first.cameraCorrectionTangent[2U] == Catch::Approx(0.75F));
+  CHECK_FALSE(first.hasFocusCorrectionTangent);
+  const auto& last = loaded->localizedKeyCorrections[1U];
+  CHECK_FALSE(last.hasCameraCorrectionTangent);
+  CHECK(last.hasFocusCorrectionTangent);
+  CHECK(last.focusCorrectionTangent[0U] == Catch::Approx(-1.25F));
+  CHECK(last.focusCorrectionTangent[1U] == Catch::Approx(1.5F));
+  CHECK(last.focusCorrectionTangent[2U] == Catch::Approx(-1.75F));
+
+  auto ignoredTangentJson = json;
+  ignoredTangentJson["localized_key_corrections"][0U]
+                    ["focus_correction_tangent"] =
+      {9.0F, 8.0F, 7.0F};
+  ignoredTangentJson["localized_key_corrections"][1U]
+                    ["camera_correction_tangent"] =
+      {6.0F, 5.0F, 4.0F};
+  const auto ignoredTangentLoaded =
+      AnimationPathFromJson(ignoredTangentJson, &error);
+  INFO(error);
+  REQUIRE(ignoredTangentLoaded.has_value());
+  REQUIRE(ignoredTangentLoaded->localizedKeyCorrections.size() == 2U);
+  CHECK((ignoredTangentLoaded->localizedKeyCorrections[0U]
+             .focusCorrectionTangent ==
+         std::array<float, 3>{0.0F, 0.0F, 0.0F}));
+  CHECK((ignoredTangentLoaded->localizedKeyCorrections[1U]
+             .cameraCorrectionTangent ==
+         std::array<float, 3>{0.0F, 0.0F, 0.0F}));
+
+  auto nonFiniteTangentJson = json;
+  nonFiniteTangentJson["localized_key_corrections"][0U]
+                      ["camera_correction_tangent"][0U] =
+      std::numeric_limits<float>::infinity();
+  const auto nonFiniteTangentLoaded =
+      AnimationPathFromJson(nonFiniteTangentJson, &error);
+  INFO(error);
+  REQUIRE(nonFiniteTangentLoaded.has_value());
+  CHECK(nonFiniteTangentLoaded->localizedKeyCorrections.empty());
+
+  auto oversizedTimebaseJson = json;
+  oversizedTimebaseJson["authored_track_duration_frames"] = 900U;
+  const auto oversizedTimebaseLoaded =
+      AnimationPathFromJson(oversizedTimebaseJson, &error);
+  INFO(error);
+  REQUIRE(oversizedTimebaseLoaded.has_value());
+  CHECK(oversizedTimebaseLoaded->authoredTrackDurationFrames == 360U);
+}
+
+TEST_CASE(
+    "Animation schema 21 defaults the extension migration marker and correction tangents",
+    "[animation][serialization][timing][localized-correction][migration]") {
+  using invisible_places::camera::AnimationLocalizedKeyCorrection;
+  using invisible_places::camera::AnimationPath;
+  using invisible_places::serialization::AnimationPathFromJson;
+  using invisible_places::serialization::AnimationPathToJson;
+  using invisible_places::serialization::kAnimationDocumentSchemaVersion;
+
+  AnimationPath path;
+  path.name = "Schema 21 extension defaults";
+  path.durationFrames = 210U;
+  path.authoredTrackDurationFrames = 150U;
+  path.keys = {
+      {.id = "first", .cameraPosition = {1.0F, 2.0F, 3.0F},
+       .focusPoint = {4.0F, 5.0F, 6.0F}},
+      {.id = "last", .cameraPosition = {7.0F, 8.0F, 9.0F},
+       .focusPoint = {10.0F, 11.0F, 12.0F}},
+  };
+  path.localizedKeyCorrections = {
+      AnimationLocalizedKeyCorrection{
+          .keyId = "last",
+          .splineCameraPosition = {7.5F, 8.0F, 9.0F},
+          .splineFocusPoint = {10.0F, 11.5F, 12.0F},
+          .hasCameraCorrectionTangent = true,
+          .cameraCorrectionTangent = {0.1F, 0.2F, 0.3F},
+          .hasFocusCorrectionTangent = true,
+          .focusCorrectionTangent = {0.4F, 0.5F, 0.6F},
+      },
+  };
+
+  auto legacyJson = AnimationPathToJson(path);
+  legacyJson["schema_version"] = 21U;
+  legacyJson.erase("authored_track_duration_frames");
+  auto& legacyCorrection =
+      legacyJson.at("localized_key_corrections").front();
+  legacyCorrection.erase("has_camera_correction_tangent");
+  legacyCorrection.erase("camera_correction_tangent");
+  legacyCorrection.erase("has_focus_correction_tangent");
+  legacyCorrection.erase("focus_correction_tangent");
+
+  std::string error;
+  const auto loaded = AnimationPathFromJson(legacyJson, &error);
+  INFO(error);
+  REQUIRE(loaded.has_value());
+  CHECK(loaded->sourceSchemaVersion == 21U);
+  CHECK(loaded->durationFrames == 210U);
+  CHECK(loaded->authoredTrackDurationFrames == 0U);
+  REQUIRE(loaded->localizedKeyCorrections.size() == 1U);
+  const auto& correction = loaded->localizedKeyCorrections.front();
+  CHECK_FALSE(correction.hasCameraCorrectionTangent);
+  CHECK((correction.cameraCorrectionTangent ==
+         std::array<float, 3>{0.0F, 0.0F, 0.0F}));
+  CHECK_FALSE(correction.hasFocusCorrectionTangent);
+  CHECK((correction.focusCorrectionTangent ==
+         std::array<float, 3>{0.0F, 0.0F, 0.0F}));
+
+  const auto migratedJson = AnimationPathToJson(*loaded);
+  CHECK(migratedJson.at("schema_version") ==
+        kAnimationDocumentSchemaVersion);
+  CHECK(migratedJson.at("authored_track_duration_frames") == 0U);
+  const auto& migratedCorrection =
+      migratedJson.at("localized_key_corrections").front();
+  CHECK(migratedCorrection.at("has_camera_correction_tangent") == false);
+  CHECK(migratedCorrection.at("has_focus_correction_tangent") == false);
 }
 
 TEST_CASE("Schema 18 velocity smoothing migrates without changing evaluation or timing",

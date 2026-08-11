@@ -3,8 +3,13 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
+#include <string>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -23,6 +28,140 @@ std::vector<Float3> PlaneOfPoints(float x, float extent, float spacing) {
         }
     }
     return points;
+}
+
+invisible_places::camera::AnimationPath MakeReciprocalPanTestPath(
+    std::string name,
+    float direction,
+    std::uint32_t firstSegmentFrames,
+    std::uint32_t secondSegmentFrames) {
+    invisible_places::camera::AnimationPath path;
+    path.name = std::move(name);
+    path.durationFrames = firstSegmentFrames + secondSegmentFrames;
+    path.exportSettings.startFrame = 7U;
+    path.exportSettings.endFrame = 91U;
+    path.keys = {
+        {.id = "start",
+         .cameraPosition = {-1.4F * direction, -8.0F, 2.0F},
+         .focusPoint = {-0.3F * direction, 0.0F, 1.0F}},
+        {.id = "middle",
+         .cameraPosition = {-0.4F * direction, -8.0F, 2.0F},
+         .focusPoint = {0.0F, 0.0F, 1.0F},
+         .durationFrames = firstSegmentFrames},
+        {.id = "end",
+         .cameraPosition = {0.6F * direction, -8.0F, 2.0F},
+         .focusPoint = {0.3F * direction, 0.0F, 1.0F},
+         .durationFrames = secondSegmentFrames},
+    };
+    for (std::size_t index = 0U; index < path.keys.size(); ++index) {
+        path.keys[index].id = path.name + "_" + path.keys[index].id;
+    }
+    return path;
+}
+
+void AddLegacyWaterTracks(
+    invisible_places::camera::AnimationPath* path) {
+    REQUIRE(path != nullptr);
+    invisible_places::water::WaterScenarioTrack scenarioTrack;
+    scenarioTrack.scenarioId = "legacy-water";
+    scenarioTrack.keys = {
+        {.id = "scenario-quarter", .position = 0.25F},
+        {.id = "scenario-terminal", .position = 1.0F},
+    };
+    invisible_places::water::WaterSeepageNodeTrack nodeTrack;
+    nodeTrack.nodeId = 42U;
+    nodeTrack.keys = {
+        {.id = "node-half", .position = 0.50F},
+        {.id = "node-terminal", .position = 1.0F},
+    };
+    scenarioTrack.seepageNodeTracks.push_back(std::move(nodeTrack));
+    invisible_places::water::WaterTimingRunAssignment assignment;
+    assignment.feature = invisible_places::water::WaterTimingFeature::Rain;
+    assignment.fallbackRun.id = "fallback-rain";
+    assignment.fallbackRun.keys = {
+        {.id = "rain-three-quarter", .position = 0.75F, .level = 0.4F},
+        {.id = "rain-terminal", .position = 1.0F, .level = 0.8F},
+    };
+    scenarioTrack.timingAssignments.push_back(std::move(assignment));
+    path->waterScenarioTracks = {std::move(scenarioTrack)};
+}
+
+void CheckLegacyWaterTracksRetimed(
+    const invisible_places::camera::AnimationPath& path,
+    float scale) {
+    REQUIRE(path.waterScenarioTracks.size() == 1U);
+    const auto& scenarioTrack = path.waterScenarioTracks.front();
+    REQUIRE(scenarioTrack.keys.size() == 2U);
+    CHECK(scenarioTrack.keys[0U].id == "scenario-quarter");
+    CHECK(scenarioTrack.keys[0U].position == Approx(0.25F * scale));
+    CHECK(scenarioTrack.keys[1U].position == Approx(scale));
+    REQUIRE(scenarioTrack.seepageNodeTracks.size() == 1U);
+    const auto& nodeTrack = scenarioTrack.seepageNodeTracks.front();
+    CHECK(nodeTrack.nodeId == 42U);
+    REQUIRE(nodeTrack.keys.size() == 2U);
+    CHECK(nodeTrack.keys[0U].position == Approx(0.50F * scale));
+    CHECK(nodeTrack.keys[1U].position == Approx(scale));
+    REQUIRE(scenarioTrack.timingAssignments.size() == 1U);
+    const auto& fallback =
+        scenarioTrack.timingAssignments.front().fallbackRun;
+    CHECK(fallback.id == "fallback-rain");
+    REQUIRE(fallback.keys.size() == 2U);
+    CHECK(fallback.keys[0U].position == Approx(0.75F * scale));
+    CHECK(fallback.keys[0U].level == Approx(0.4F));
+    CHECK(fallback.keys[1U].position == Approx(scale));
+}
+
+invisible_places::camera::AnimationSurfacePatchObservation
+MakeReciprocalPanTestPatch() {
+    invisible_places::camera::AnimationSurfacePatchObservation patch;
+    patch.pointCount = 3U;
+    patch.worldPoints[0U] = {0.0F, 0.0F, 1.0F};
+    patch.worldPoints[1U] = {0.25F, 0.0F, 1.0F};
+    patch.worldPoints[2U] = {0.0F, 0.0F, 1.25F};
+    return patch;
+}
+
+invisible_places::camera::AnimationReciprocalPanExtensionOptions
+MakeReciprocalPanTestOptions() {
+    invisible_places::camera::AnimationReciprocalPanExtensionOptions options;
+    const auto patch = MakeReciprocalPanTestPatch();
+    options.firstDrivesSecond.sourceTailFrame = 35U;
+    options.firstDrivesSecond.sourcePatch = patch;
+    auto actualBTerminalPatch = patch;
+    actualBTerminalPatch.worldPoints[0U][0U] = 2.0F;
+    actualBTerminalPatch.worldPoints[1U][0U] = 3.0F;
+    actualBTerminalPatch.worldPoints[2U][0U] = 2.0F;
+    options.firstDrivesSecond.destinationEndPatch = actualBTerminalPatch;
+    options.secondDrivesFirst.sourceTailFrame = 44U;
+    options.secondDrivesFirst.sourcePatch = patch;
+    auto actualATerminalPatch = patch;
+    actualATerminalPatch.worldPoints[0U][0U] = 1.5F;
+    actualATerminalPatch.worldPoints[1U][0U] = 2.5F;
+    actualATerminalPatch.worldPoints[2U][0U] = 1.5F;
+    options.secondDrivesFirst.destinationEndPatch = actualATerminalPatch;
+    options.sampleCount = 9U;
+    options.optimizationSweeps = 12U;
+    return options;
+}
+
+void CheckPanEvaluationNear(
+    const invisible_places::camera::AnimationPathEvaluation& left,
+    const invisible_places::camera::AnimationPathEvaluation& right,
+    float margin = 2.0e-4F) {
+    for (std::size_t component = 0U; component < 3U; ++component) {
+        CHECK(left.camera.position[component] ==
+              Approx(right.camera.position[component]).margin(margin));
+        CHECK(left.focusPoint[component] ==
+              Approx(right.focusPoint[component]).margin(margin));
+    }
+    CHECK(left.camera.fovDegrees ==
+          Approx(right.camera.fovDegrees).margin(1.0e-5F));
+    CHECK(left.camera.nearPlane ==
+          Approx(right.camera.nearPlane).margin(1.0e-6F));
+    CHECK(left.camera.farPlane ==
+          Approx(right.camera.farPlane).margin(1.0e-4F));
+    CHECK(left.camera.apertureFStops ==
+          Approx(right.camera.apertureFStops).margin(1.0e-5F));
 }
 
 }  // namespace
@@ -866,4 +1005,782 @@ TEST_CASE("Focus-relative rig alignment rejects paths without a travel direction
     CHECK_FALSE(result.errorMessage.empty());
     CHECK(destination.keys[0U].cameraPosition == originalCamera);
     CHECK(destination.localizedKeyCorrections.empty());
+}
+
+TEST_CASE(
+    "Pair clip normalization preserves animation motion and keeps the widest visible range",
+    "[camera][animation][clip-planes][pan-extension]") {
+    auto first = MakeReciprocalPanTestPath("A", 1.0F, 41U, 79U);
+    auto second = MakeReciprocalPanTestPath("B", -1.0F, 54U, 96U);
+    first.keys[0U].nearPlane = 0.020F;
+    first.keys[1U].nearPlane = 0.010F;
+    first.keys[2U].nearPlane = 0.015F;
+    first.keys[0U].farPlane = 90.0F;
+    first.keys[1U].farPlane = 120.0F;
+    first.keys[2U].farPlane = 100.0F;
+    second.keys[0U].nearPlane = 0.005F;
+    second.keys[1U].nearPlane = 0.008F;
+    second.keys[2U].nearPlane = 0.006F;
+    second.keys[0U].farPlane = 80.0F;
+    second.keys[1U].farPlane = 150.0F;
+    second.keys[2U].farPlane = 130.0F;
+    first.keys.front().hasSplineEndpointTangent = true;
+    first.keys.front().splineLensEndpointTangent = {
+        0.25F,
+        0.01F,
+        -2.0F,
+        0.5F,
+        0.75F,
+    };
+    first.keys.back().hasSplineEndpointTangent = true;
+    first.keys.back().splineLensEndpointTangent = {
+        -0.20F,
+        -0.01F,
+        3.0F,
+        -0.4F,
+        -0.6F,
+    };
+    first.keys.front().linkedCameraId = "camera-a";
+    first.keys.back().linkedCameraId = "camera-a";
+    second.keys[1U].linkedCameraId = "camera-b";
+
+    const auto originalFirst = first;
+    const auto originalSecond = second;
+    const auto firstBefore = invisible_places::camera::
+        PrepareAnimationPathEvaluation(first);
+    const auto secondBefore = invisible_places::camera::
+        PrepareAnimationPathEvaluation(second);
+    REQUIRE(firstBefore.valid);
+    REQUIRE(secondBefore.valid);
+
+    const auto result = invisible_places::camera::
+        BuildConservativeAnimationClipPlaneNormalization(first, second);
+    INFO(result.errorMessage);
+    REQUIRE(result.succeeded);
+    REQUIRE(result.changed);
+    CHECK(result.nearPlane == Approx(0.005F));
+    CHECK(result.farPlane == Approx(150.0F));
+    CHECK(result.linkedCameraIds ==
+          std::vector<std::string>{"camera-a", "camera-b"});
+    CHECK(first.keys.front().nearPlane ==
+          Approx(originalFirst.keys.front().nearPlane));
+    CHECK(second.keys[1U].farPlane ==
+          Approx(originalSecond.keys[1U].farPlane));
+
+    for (const auto* path :
+         {&result.firstCandidate, &result.secondCandidate}) {
+        for (const auto& key : path->keys) {
+            CHECK(key.nearPlane == Approx(0.005F));
+            CHECK(key.farPlane == Approx(150.0F));
+            if (key.hasSplineEndpointTangent) {
+                CHECK(key.splineLensEndpointTangent[1U] == Approx(0.0F));
+                CHECK(key.splineLensEndpointTangent[2U] == Approx(0.0F));
+            }
+        }
+    }
+    CHECK(result.firstCandidate.durationFrames == first.durationFrames);
+    CHECK(result.firstCandidate.exportSettings.startFrame ==
+          first.exportSettings.startFrame);
+    CHECK(result.firstCandidate.exportSettings.endFrame ==
+          first.exportSettings.endFrame);
+    CHECK(result.firstCandidate.keys.front().splineLensEndpointTangent[0U] ==
+          Approx(0.25F));
+    CHECK(result.firstCandidate.keys.front().splineLensEndpointTangent[3U] ==
+          Approx(0.5F));
+    CHECK(result.firstCandidate.keys.front().splineLensEndpointTangent[4U] ==
+          Approx(0.75F));
+    CHECK(result.firstCandidate.keys.back().splineLensEndpointTangent[0U] ==
+          Approx(-0.20F));
+    CHECK(result.firstCandidate.keys.back().splineLensEndpointTangent[3U] ==
+          Approx(-0.4F));
+    CHECK(result.firstCandidate.keys.back().splineLensEndpointTangent[4U] ==
+          Approx(-0.6F));
+
+    const auto firstAfter = invisible_places::camera::
+        PrepareAnimationPathEvaluation(result.firstCandidate);
+    const auto secondAfter = invisible_places::camera::
+        PrepareAnimationPathEvaluation(result.secondCandidate);
+    REQUIRE(firstAfter.valid);
+    REQUIRE(secondAfter.valid);
+    for (std::uint32_t sample = 0U; sample <= 64U; ++sample) {
+        const float amount = static_cast<float>(sample) / 64.0F;
+        for (const auto& [before, after] :
+             {std::pair{&firstBefore, &firstAfter},
+              std::pair{&secondBefore, &secondAfter}}) {
+            const auto beforeValue = invisible_places::camera::
+                EvaluatePreparedAnimationPath(
+                    *before,
+                    before->durationSeconds * amount);
+            const auto afterValue = invisible_places::camera::
+                EvaluatePreparedAnimationPath(
+                    *after,
+                    after->durationSeconds * amount);
+            CHECK(afterValue.camera.position == beforeValue.camera.position);
+            CHECK(afterValue.focusPoint == beforeValue.focusPoint);
+            CHECK(afterValue.camera.fovDegrees ==
+                  Approx(beforeValue.camera.fovDegrees).margin(1.0e-6F));
+            CHECK(afterValue.camera.nearPlane == Approx(0.005F));
+            CHECK(afterValue.camera.farPlane == Approx(150.0F));
+        }
+    }
+
+    const auto alreadyNormalized = invisible_places::camera::
+        BuildConservativeAnimationClipPlaneNormalization(
+            result.firstCandidate,
+            result.secondCandidate);
+    REQUIRE(alreadyNormalized.succeeded);
+    CHECK_FALSE(alreadyNormalized.changed);
+
+    auto invalid = first;
+    invalid.keys[1U].farPlane = invalid.keys[1U].nearPlane;
+    const auto invalidResult = invisible_places::camera::
+        BuildConservativeAnimationClipPlaneNormalization(invalid, second);
+    CHECK_FALSE(invalidResult.succeeded);
+    CHECK_FALSE(invalidResult.changed);
+    CHECK(invalidResult.firstCandidate.keys.empty());
+    CHECK(invalid.keys[1U].farPlane ==
+          Approx(first.keys[1U].nearPlane));
+}
+
+TEST_CASE("Reciprocal pan extension appends a short unlinked tail without retiming the old prefix",
+          "[camera][animation][pan-extension]") {
+    auto first = MakeReciprocalPanTestPath("A", 1.0F, 41U, 79U);
+    auto second = MakeReciprocalPanTestPath("B", -1.0F, 54U, 96U);
+    AddLegacyWaterTracks(&first);
+    AddLegacyWaterTracks(&second);
+    first.keys.back().sourceShotName = "terminal shot";
+    first.keys.back().linkedCameraId = "camera-a";
+    first.keys.back().linkedCameraName = "Camera A";
+    second.keys.back().sourceShotName = "partner terminal shot";
+    second.keys.back().linkedCameraId = "camera-b";
+    second.keys.back().linkedCameraName = "Camera B";
+
+    const auto middleSplineCamera = first.keys[1U].cameraPosition;
+    const auto middleSplineFocus = first.keys[1U].focusPoint;
+    first.keys[1U].cameraPosition[0U] += 0.12F;
+    first.keys[1U].focusPoint[0U] += 0.04F;
+    first.localizedKeyCorrections.push_back({
+        .keyId = first.keys[1U].id,
+        .splineCameraPosition = middleSplineCamera,
+        .splineFocusPoint = middleSplineFocus,
+    });
+
+    const auto firstBefore = invisible_places::camera::
+        PrepareAnimationPathEvaluation(first);
+    const auto secondBefore = invisible_places::camera::
+        PrepareAnimationPathEvaluation(second);
+    REQUIRE(firstBefore.valid);
+    REQUIRE(secondBefore.valid);
+    const auto result = invisible_places::camera::
+        BuildAnimationReciprocalPanExtension(
+            first,
+            second,
+            MakeReciprocalPanTestOptions());
+
+    INFO(result.errorMessage);
+    REQUIRE(result.succeeded);
+    REQUIRE(result.changed);
+    REQUIRE(result.firstCandidate.keys.size() == first.keys.size() + 2U);
+    REQUIRE(result.secondCandidate.keys.size() == second.keys.size() + 2U);
+    CHECK(result.firstCandidate.durationFrames == 164U);
+    CHECK(result.secondCandidate.durationFrames == 185U);
+    CHECK(result.metrics.extensionFrames[0U] == 44U);
+    CHECK(result.metrics.extensionFrames[1U] == 35U);
+    CHECK(result.metrics.appendedKeyCount[0U] == 2U);
+    CHECK(result.metrics.appendedKeyCount[1U] == 2U);
+    CHECK(result.metrics.sourceInteriorKeyCount[0U] == 0U);
+    CHECK(result.metrics.sourceInteriorKeyCount[1U] == 0U);
+    CHECK(result.firstCandidate.authoredTrackDurationFrames == 0U);
+    CHECK(result.secondCandidate.authoredTrackDurationFrames == 0U);
+    CheckLegacyWaterTracksRetimed(
+        result.firstCandidate,
+        120.0F / 164.0F);
+    CheckLegacyWaterTracksRetimed(
+        result.secondCandidate,
+        150.0F / 185.0F);
+
+    CHECK(result.firstCandidate.keys[1U].durationFrames == 41U);
+    CHECK(result.firstCandidate.keys[2U].durationFrames == 79U);
+    CHECK(result.firstCandidate.keys[3U].durationFrames == 22U);
+    CHECK(result.firstCandidate.keys[4U].durationFrames == 22U);
+    CHECK(result.secondCandidate.keys[1U].durationFrames == 54U);
+    CHECK(result.secondCandidate.keys[2U].durationFrames == 96U);
+    CHECK(result.secondCandidate.keys[3U].durationFrames == 18U);
+    CHECK(result.secondCandidate.keys[4U].durationFrames == 17U);
+    CHECK(result.firstCandidate.exportSettings.startFrame == 7U);
+    CHECK(result.firstCandidate.exportSettings.endFrame == 91U);
+    CHECK(result.secondCandidate.exportSettings.startFrame == 7U);
+    CHECK(result.secondCandidate.exportSettings.endFrame == 91U);
+
+    for (std::size_t index = first.keys.size();
+         index < result.firstCandidate.keys.size();
+         ++index) {
+        CHECK(result.firstCandidate.keys[index].sourceShotName.empty());
+        CHECK(result.firstCandidate.keys[index].linkedCameraId.empty());
+        CHECK(result.firstCandidate.keys[index].linkedCameraName.empty());
+        CHECK(result.firstCandidate.keys[index].id != first.keys.back().id);
+    }
+    std::unordered_set<std::string> firstAppendedIds;
+    for (std::size_t index = first.keys.size();
+         index < result.firstCandidate.keys.size();
+         ++index) {
+        CHECK(firstAppendedIds.insert(
+                  result.firstCandidate.keys[index].id).second);
+    }
+    for (std::size_t index = second.keys.size();
+         index < result.secondCandidate.keys.size();
+         ++index) {
+        CHECK(result.secondCandidate.keys[index].sourceShotName.empty());
+        CHECK(result.secondCandidate.keys[index].linkedCameraId.empty());
+        CHECK(result.secondCandidate.keys[index].linkedCameraName.empty());
+        CHECK(result.secondCandidate.keys[index].id != second.keys.back().id);
+    }
+    std::unordered_set<std::string> secondAppendedIds;
+    for (std::size_t index = second.keys.size();
+         index < result.secondCandidate.keys.size();
+         ++index) {
+        CHECK(secondAppendedIds.insert(
+                  result.secondCandidate.keys[index].id).second);
+    }
+
+    REQUIRE(result.firstCandidate.localizedKeyCorrections.size() >= 3U);
+    const auto preservedMiddleCorrection = std::find_if(
+        result.firstCandidate.localizedKeyCorrections.begin(),
+        result.firstCandidate.localizedKeyCorrections.end(),
+        [&](const auto& correction) {
+            return correction.keyId == first.keys[1U].id;
+        });
+    REQUIRE(preservedMiddleCorrection !=
+            result.firstCandidate.localizedKeyCorrections.end());
+    CHECK(preservedMiddleCorrection->hasCameraCorrectionTangent);
+    CHECK(preservedMiddleCorrection->hasFocusCorrectionTangent);
+
+    const auto firstAfter = invisible_places::camera::
+        PrepareAnimationPathEvaluation(result.firstCandidate);
+    const auto secondAfter = invisible_places::camera::
+        PrepareAnimationPathEvaluation(result.secondCandidate);
+    REQUIRE(firstAfter.valid);
+    REQUIRE(secondAfter.valid);
+    const float firstPrefixEnd = 41.0F / 30.0F;
+    const float secondPrefixEnd = 54.0F / 30.0F;
+    for (std::uint32_t sample = 0U; sample <= 120U; ++sample) {
+        const float amount = static_cast<float>(sample) / 120.0F;
+        CheckPanEvaluationNear(
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                firstBefore,
+                firstPrefixEnd * amount),
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                firstAfter,
+                firstPrefixEnd * amount));
+        CheckPanEvaluationNear(
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                secondBefore,
+                secondPrefixEnd * amount),
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                secondAfter,
+                secondPrefixEnd * amount));
+    }
+    CHECK(result.metrics.maxPrefixPositionError[0U] < 2.0e-4F);
+    CHECK(result.metrics.maxPrefixPositionError[1U] < 2.0e-4F);
+    CHECK(result.metrics.rotationConstrained[0U]);
+    CHECK(result.metrics.rotationConstrained[1U]);
+    CHECK(std::isfinite(result.metrics.anchorOverlayRmsScreenHeights[0U]));
+    CHECK(std::isfinite(result.metrics.anchorOverlayRmsScreenHeights[1U]));
+    CHECK(std::isfinite(
+        result.metrics.patchNodeOverlayRmsScreenHeights[0U]));
+    CHECK(std::isfinite(
+        result.metrics.patchNodeOverlayRmsScreenHeights[1U]));
+    CHECK(std::isfinite(
+        result.metrics.perspectiveScaleResidualPercent[0U]));
+    CHECK(std::isfinite(
+        result.metrics.perspectiveScaleResidualPercent[1U]));
+}
+
+TEST_CASE("Reciprocal pan extension is argument-order independent and atomic on invalid input",
+          "[camera][animation][pan-extension]") {
+    const auto first = MakeReciprocalPanTestPath("A", 1.0F, 41U, 79U);
+    const auto second = MakeReciprocalPanTestPath("B", -1.0F, 54U, 96U);
+    const auto options = MakeReciprocalPanTestOptions();
+    const auto forward = invisible_places::camera::
+        BuildAnimationReciprocalPanExtension(first, second, options);
+    INFO(forward.errorMessage);
+    REQUIRE(forward.succeeded);
+
+    auto previouslyExtendedFirst = first;
+    auto previouslyExtendedSecond = second;
+    AddLegacyWaterTracks(&previouslyExtendedFirst);
+    AddLegacyWaterTracks(&previouslyExtendedSecond);
+    previouslyExtendedFirst.authoredTrackDurationFrames = 90U;
+    previouslyExtendedSecond.authoredTrackDurationFrames = 110U;
+    const auto retainedTrackDurations = invisible_places::camera::
+        BuildAnimationReciprocalPanExtension(
+            previouslyExtendedFirst,
+            previouslyExtendedSecond,
+            options);
+    INFO(retainedTrackDurations.errorMessage);
+    REQUIRE(retainedTrackDurations.succeeded);
+    CHECK(retainedTrackDurations.firstCandidate.authoredTrackDurationFrames ==
+          0U);
+    CHECK(retainedTrackDurations.secondCandidate.authoredTrackDurationFrames ==
+          0U);
+    CheckLegacyWaterTracksRetimed(
+        retainedTrackDurations.firstCandidate,
+        90.0F / 164.0F);
+    CheckLegacyWaterTracksRetimed(
+        retainedTrackDurations.secondCandidate,
+        110.0F / 185.0F);
+
+    auto swappedOptions = options;
+    swappedOptions.firstDrivesSecond = options.secondDrivesFirst;
+    swappedOptions.secondDrivesFirst = options.firstDrivesSecond;
+    const auto swapped = invisible_places::camera::
+        BuildAnimationReciprocalPanExtension(
+            second,
+            first,
+            swappedOptions);
+    INFO(swapped.errorMessage);
+    REQUIRE(swapped.succeeded);
+    CHECK(swapped.firstCandidate.durationFrames ==
+          forward.secondCandidate.durationFrames);
+    CHECK(swapped.secondCandidate.durationFrames ==
+          forward.firstCandidate.durationFrames);
+    REQUIRE(swapped.firstCandidate.keys.size() ==
+            forward.secondCandidate.keys.size());
+    REQUIRE(swapped.secondCandidate.keys.size() ==
+            forward.firstCandidate.keys.size());
+    const auto swappedFirst = invisible_places::camera::
+        PrepareAnimationPathEvaluation(swapped.firstCandidate);
+    const auto swappedSecond = invisible_places::camera::
+        PrepareAnimationPathEvaluation(swapped.secondCandidate);
+    const auto forwardFirst = invisible_places::camera::
+        PrepareAnimationPathEvaluation(forward.firstCandidate);
+    const auto forwardSecond = invisible_places::camera::
+        PrepareAnimationPathEvaluation(forward.secondCandidate);
+    REQUIRE(swappedFirst.valid);
+    REQUIRE(swappedSecond.valid);
+    REQUIRE(forwardFirst.valid);
+    REQUIRE(forwardSecond.valid);
+    CheckPanEvaluationNear(
+        invisible_places::camera::EvaluatePreparedAnimationPath(
+            swappedFirst,
+            swappedFirst.durationSeconds),
+        invisible_places::camera::EvaluatePreparedAnimationPath(
+            forwardSecond,
+            forwardSecond.durationSeconds));
+    CheckPanEvaluationNear(
+        invisible_places::camera::EvaluatePreparedAnimationPath(
+            swappedSecond,
+            swappedSecond.durationSeconds),
+        invisible_places::camera::EvaluatePreparedAnimationPath(
+            forwardFirst,
+            forwardFirst.durationSeconds));
+
+    auto animatedLens = second;
+    animatedLens.keys[1U].fovDegrees += 5.0F;
+    const auto rejected = invisible_places::camera::
+        BuildAnimationReciprocalPanExtension(
+            first,
+            animatedLens,
+            options);
+    CHECK_FALSE(rejected.succeeded);
+    CHECK_FALSE(rejected.changed);
+    CHECK(rejected.firstCandidate.keys.empty());
+    CHECK(rejected.secondCandidate.keys.empty());
+    CHECK_FALSE(rejected.errorMessage.empty());
+    CHECK(first.durationFrames == 120U);
+    CHECK(second.durationFrames == 150U);
+
+    auto authoredOrientation = second;
+    authoredOrientation.keys[1U].hasOrientation = true;
+    const auto orientationRejected = invisible_places::camera::
+        BuildAnimationReciprocalPanExtension(
+            first,
+            authoredOrientation,
+            options);
+    CHECK_FALSE(orientationRejected.succeeded);
+    CHECK(orientationRejected.firstCandidate.keys.empty());
+    CHECK(orientationRejected.secondCandidate.keys.empty());
+
+    auto hiddenLensMotion = second;
+    hiddenLensMotion.keys.front().hasSplineEndpointTangent = true;
+    hiddenLensMotion.keys.front().splineLensEndpointTangent[0U] = 0.25F;
+    const auto tangentRejected = invisible_places::camera::
+        BuildAnimationReciprocalPanExtension(
+            first,
+            hiddenLensMotion,
+            options);
+    CHECK_FALSE(tangentRejected.succeeded);
+    CHECK(tangentRejected.firstCandidate.keys.empty());
+    CHECK(tangentRejected.secondCandidate.keys.empty());
+
+    auto inactiveFocusTangent = second;
+    inactiveFocusTangent.keys.front().hasSplineEndpointTangent = true;
+    inactiveFocusTangent.keys.front().splineLensEndpointTangent[3U] = 0.25F;
+    const auto inactiveTangentAccepted = invisible_places::camera::
+        BuildAnimationReciprocalPanExtension(
+            first,
+            inactiveFocusTangent,
+            options);
+    INFO(inactiveTangentAccepted.errorMessage);
+    CHECK(inactiveTangentAccepted.succeeded);
+
+    auto overflowing = first;
+    overflowing.durationFrames =
+        std::numeric_limits<std::uint32_t>::max() - 10U;
+    overflowing.keys[1U].durationFrames = 1U;
+    overflowing.keys[2U].durationFrames =
+        std::numeric_limits<std::uint32_t>::max() - 11U;
+    const auto overflowRejected = invisible_places::camera::
+        BuildAnimationReciprocalPanExtension(
+            overflowing,
+            second,
+            options);
+    CHECK_FALSE(overflowRejected.succeeded);
+    CHECK(overflowRejected.firstCandidate.keys.empty());
+    CHECK(overflowRejected.secondCandidate.keys.empty());
+
+    auto incomingDurationOverflow = first;
+    incomingDurationOverflow.keys[1U].durationFrames =
+        std::numeric_limits<std::uint32_t>::max();
+    incomingDurationOverflow.keys[2U].durationFrames =
+        std::numeric_limits<std::uint32_t>::max();
+    const auto durationSumRejected = invisible_places::camera::
+        BuildAnimationReciprocalPanExtension(
+            incomingDurationOverflow,
+            second,
+            options);
+    CHECK_FALSE(durationSumRejected.succeeded);
+    CHECK(durationSumRejected.firstCandidate.keys.empty());
+    CHECK(durationSumRejected.secondCandidate.keys.empty());
+    CHECK(durationSumRejected.errorMessage.find("overflow") !=
+          std::string::npos);
+}
+
+TEST_CASE("Reciprocal pan extension chooses three keys for an interior source key and caps unstable source tails",
+          "[camera][animation][pan-extension]") {
+    const auto makeFourKeyPan = [](std::string name, float offset) {
+        invisible_places::camera::AnimationPath path;
+        path.name = name;
+        path.durationFrames = 60U;
+        path.keys = {
+            {.id = name + "-0",
+             .cameraPosition = {offset - 1.5F, -8.0F, 2.0F},
+             .focusPoint = {-0.4F, 0.0F, 1.0F}},
+            {.id = name + "-1",
+             .cameraPosition = {offset - 1.0F, -8.0F, 2.0F},
+             .focusPoint = {-0.2F, 0.0F, 1.0F},
+             .durationFrames = 10U},
+            {.id = name + "-2",
+             .cameraPosition = {offset, -8.0F, 2.0F},
+             .focusPoint = {0.0F, 0.0F, 1.0F},
+             .durationFrames = 20U},
+            {.id = name + "-3",
+             .cameraPosition = {offset + 1.0F, -8.0F, 2.0F},
+             .focusPoint = {0.3F, 0.0F, 1.0F},
+             .durationFrames = 30U},
+        };
+        return path;
+    };
+    const auto first = makeFourKeyPan("four-a", 0.0F);
+    const auto second = makeFourKeyPan("four-b", 0.5F);
+    const auto firstBefore = invisible_places::camera::
+        PrepareAnimationPathEvaluation(first);
+    const auto secondBefore = invisible_places::camera::
+        PrepareAnimationPathEvaluation(second);
+    REQUIRE(firstBefore.valid);
+    REQUIRE(secondBefore.valid);
+
+    invisible_places::camera::AnimationReciprocalPanExtensionOptions options;
+    options.firstDrivesSecond.sourceTailFrame = 29U;
+    options.secondDrivesFirst.sourceTailFrame = 29U;
+    options.firstDrivesSecond.sourcePatch = MakeReciprocalPanTestPatch();
+    options.firstDrivesSecond.destinationEndPatch =
+        MakeReciprocalPanTestPatch();
+    options.secondDrivesFirst.sourcePatch = MakeReciprocalPanTestPatch();
+    options.secondDrivesFirst.destinationEndPatch =
+        MakeReciprocalPanTestPatch();
+    options.sampleCount = 9U;
+    options.optimizationSweeps = 8U;
+
+    const auto result = invisible_places::camera::
+        BuildAnimationReciprocalPanExtension(first, second, options);
+    INFO(result.errorMessage);
+    REQUIRE(result.succeeded);
+    REQUIRE(result.firstCandidate.keys.size() == first.keys.size() + 3U);
+    REQUIRE(result.secondCandidate.keys.size() == second.keys.size() + 3U);
+    CHECK(result.metrics.appendedKeyCount[0U] == 3U);
+    CHECK(result.metrics.appendedKeyCount[1U] == 3U);
+    CHECK(result.metrics.sourceInteriorKeyCount[0U] == 1U);
+    CHECK(result.metrics.sourceInteriorKeyCount[1U] == 1U);
+    CHECK(result.firstCandidate.durationFrames == 89U);
+    CHECK(result.secondCandidate.durationFrames == 89U);
+    const std::array<std::uint32_t, 3> expectedTailDurations{10U, 9U, 10U};
+    std::uint32_t firstTailFrameSum = 0U;
+    std::uint32_t secondTailFrameSum = 0U;
+    for (std::size_t index = 0U; index < expectedTailDurations.size(); ++index) {
+        const auto firstDuration =
+            result.firstCandidate.keys[first.keys.size() + index]
+                .durationFrames;
+        const auto secondDuration =
+            result.secondCandidate.keys[second.keys.size() + index]
+                .durationFrames;
+        CHECK(firstDuration == expectedTailDurations[index]);
+        CHECK(secondDuration == expectedTailDurations[index]);
+        CHECK(firstDuration > 0U);
+        CHECK(secondDuration > 0U);
+        firstTailFrameSum += firstDuration;
+        secondTailFrameSum += secondDuration;
+    }
+    CHECK(firstTailFrameSum == 29U);
+    CHECK(secondTailFrameSum == 29U);
+    const auto firstAfter = invisible_places::camera::
+        PrepareAnimationPathEvaluation(result.firstCandidate);
+    const auto secondAfter = invisible_places::camera::
+        PrepareAnimationPathEvaluation(result.secondCandidate);
+    REQUIRE(firstAfter.valid);
+    REQUIRE(secondAfter.valid);
+    for (std::uint32_t sample = 0U; sample <= 60U; ++sample) {
+        const float time = static_cast<float>(sample) / 60.0F;
+        CheckPanEvaluationNear(
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                firstBefore,
+                time),
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                firstAfter,
+                time));
+        CheckPanEvaluationNear(
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                secondBefore,
+                time),
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                secondAfter,
+                time));
+    }
+
+    auto unstable = options;
+    unstable.firstDrivesSecond.sourceTailFrame = 31U;
+    const auto rejected = invisible_places::camera::
+        BuildAnimationReciprocalPanExtension(first, second, unstable);
+    CHECK_FALSE(rejected.succeeded);
+    CHECK(rejected.firstCandidate.keys.empty());
+    CHECK(rejected.secondCandidate.keys.empty());
+    CHECK(rejected.errorMessage.find("penultimate") != std::string::npos);
+}
+
+TEST_CASE("Reciprocal two-key pans allow a pre-terminal best-fit source tail",
+          "[camera][animation][pan-extension]") {
+    const auto makeTwoKeyPan = [](std::string name, float offset) {
+        invisible_places::camera::AnimationPath path;
+        path.name = name;
+        path.durationFrames = 40U;
+        path.keys = {
+            {.id = name + "-start",
+             .cameraPosition = {offset - 1.0F, -8.0F, 2.0F},
+             .focusPoint = {-0.2F, 0.0F, 1.0F}},
+            {.id = name + "-end",
+             .cameraPosition = {offset + 1.0F, -8.0F, 2.0F},
+             .focusPoint = {0.2F, 0.0F, 1.0F},
+             .durationFrames = 40U},
+        };
+        return path;
+    };
+    invisible_places::camera::AnimationReciprocalPanExtensionOptions options;
+    options.firstDrivesSecond.sourceTailFrame = 20U;
+    options.secondDrivesFirst.sourceTailFrame = 20U;
+    options.firstDrivesSecond.sourcePatch = MakeReciprocalPanTestPatch();
+    options.firstDrivesSecond.destinationEndPatch =
+        MakeReciprocalPanTestPatch();
+    options.secondDrivesFirst.sourcePatch = MakeReciprocalPanTestPatch();
+    options.secondDrivesFirst.destinationEndPatch =
+        MakeReciprocalPanTestPatch();
+    options.sampleCount = 7U;
+    options.optimizationSweeps = 6U;
+    const auto result = invisible_places::camera::
+        BuildAnimationReciprocalPanExtension(
+            makeTwoKeyPan("two-a", 0.0F),
+            makeTwoKeyPan("two-b", 0.5F),
+            options);
+    INFO(result.errorMessage);
+    REQUIRE(result.succeeded);
+    CHECK(result.metrics.appendedKeyCount[0U] == 2U);
+    CHECK(result.metrics.appendedKeyCount[1U] == 2U);
+    CHECK(result.metrics.patchDiagnostic[0U].find("best fit") !=
+          std::string::npos);
+    CHECK(result.metrics.patchDiagnostic[1U].find("best fit") !=
+          std::string::npos);
+}
+
+TEST_CASE("Reciprocal pan extension rejects incomplete, degenerate, and behind-camera triangles",
+          "[camera][animation][pan-extension]") {
+    const auto first = MakeReciprocalPanTestPath("A", 1.0F, 41U, 79U);
+    const auto second = MakeReciprocalPanTestPath("B", -1.0F, 54U, 96U);
+    auto pointOptions = MakeReciprocalPanTestOptions();
+    pointOptions.firstDrivesSecond.sourcePatch.pointCount = 1U;
+    const auto incomplete = invisible_places::camera::
+        BuildAnimationReciprocalPanExtension(
+            first,
+            second,
+            pointOptions);
+    CHECK_FALSE(incomplete.succeeded);
+    CHECK(incomplete.firstCandidate.keys.empty());
+
+    auto degenerateOptions = MakeReciprocalPanTestOptions();
+    degenerateOptions.firstDrivesSecond.sourcePatch.worldPoints[2U] =
+        degenerateOptions.firstDrivesSecond.sourcePatch.worldPoints[1U];
+    const auto degenerate = invisible_places::camera::
+        BuildAnimationReciprocalPanExtension(
+            first,
+            second,
+            degenerateOptions);
+    CHECK_FALSE(degenerate.succeeded);
+    CHECK(degenerate.firstCandidate.keys.empty());
+
+    auto behindOptions = MakeReciprocalPanTestOptions();
+    invisible_places::camera::AnimationSurfacePatchObservation behind;
+    behind.pointCount = 3U;
+    behind.worldPoints[0U] = {0.0F, -20.0F, 1.0F};
+    behind.worldPoints[1U] = {0.25F, -20.0F, 1.0F};
+    behind.worldPoints[2U] = {0.0F, -20.0F, 1.25F};
+    behindOptions.firstDrivesSecond.sourcePatch = behind;
+    behindOptions.firstDrivesSecond.destinationEndPatch = behind;
+    const auto rejected = invisible_places::camera::
+        BuildAnimationReciprocalPanExtension(
+            first,
+            second,
+            behindOptions);
+    CHECK_FALSE(rejected.succeeded);
+    CHECK_FALSE(rejected.changed);
+    CHECK(rejected.firstCandidate.keys.empty());
+    CHECK(rejected.secondCandidate.keys.empty());
+    CHECK_FALSE(rejected.errorMessage.empty());
+
+    auto tangentBehindOptions = MakeReciprocalPanTestOptions();
+    auto tangentBehind = MakeReciprocalPanTestPatch();
+    tangentBehind.worldPoints[1U] = {0.25F, -20.0F, 1.0F};
+    tangentBehindOptions.firstDrivesSecond.sourcePatch = tangentBehind;
+    const auto tangentRejected = invisible_places::camera::
+        BuildAnimationReciprocalPanExtension(
+            first,
+            second,
+            tangentBehindOptions);
+    CHECK_FALSE(tangentRejected.succeeded);
+    CHECK(tangentRejected.firstCandidate.keys.empty());
+    CHECK(tangentRejected.secondCandidate.keys.empty());
+}
+
+TEST_CASE("Reciprocal parallel pans match signed patch velocity through both appended seams",
+          "[camera][animation][pan-extension][velocity]") {
+    const auto makeParallelPan = [](std::string name, float offset) {
+        invisible_places::camera::AnimationPath path;
+        path.name = name;
+        path.durationFrames = 60U;
+        for (std::size_t index = 0U; index < 3U; ++index) {
+            const float x = offset + static_cast<float>(index);
+            path.keys.push_back({
+                .id = name + "-" + std::to_string(index),
+                .cameraPosition = {x, 0.0F, 0.0F},
+                .focusPoint = {x, 10.0F, 0.0F},
+                .durationFrames = 30U,
+            });
+        }
+        return path;
+    };
+    invisible_places::camera::AnimationSurfacePatchObservation patch;
+    patch.pointCount = 3U;
+    patch.worldPoints[0U] = {0.0F, 10.0F, 0.0F};
+    patch.worldPoints[1U] = {1.0F, 10.0F, 0.0F};
+    patch.worldPoints[2U] = {0.0F, 10.0F, 1.0F};
+    invisible_places::camera::AnimationReciprocalPanExtensionOptions options;
+    options.firstDrivesSecond.sourceTailFrame = 20U;
+    options.firstDrivesSecond.sourcePatch = patch;
+    auto actualBTerminalPatch = patch;
+    actualBTerminalPatch.worldPoints[0U][0U] = 2.0F;
+    actualBTerminalPatch.worldPoints[1U][0U] = 3.0F;
+    actualBTerminalPatch.worldPoints[2U][0U] = 2.0F;
+    options.firstDrivesSecond.destinationEndPatch = actualBTerminalPatch;
+    options.secondDrivesFirst.sourceTailFrame = 30U;
+    options.secondDrivesFirst.sourcePatch = patch;
+    auto actualATerminalPatch = patch;
+    actualATerminalPatch.worldPoints[0U][0U] = 1.5F;
+    actualATerminalPatch.worldPoints[1U][0U] = 2.5F;
+    actualATerminalPatch.worldPoints[2U][0U] = 1.5F;
+    options.secondDrivesFirst.destinationEndPatch = actualATerminalPatch;
+    options.sampleCount = 9U;
+    options.optimizationSweeps = 4U;
+
+    const auto result = invisible_places::camera::
+        BuildAnimationReciprocalPanExtension(
+            makeParallelPan("A", 0.0F),
+            makeParallelPan("B", 0.5F),
+            options);
+    INFO(result.errorMessage);
+    REQUIRE(result.succeeded);
+    CHECK(result.firstCandidate.durationFrames == 90U);
+    CHECK(result.secondCandidate.durationFrames == 80U);
+    for (std::size_t side = 0U; side < 2U; ++side) {
+        CHECK(result.metrics.afterVelocityRmsScreenHeightsPerSecond[side] <
+              1.0e-5F);
+        CHECK(std::abs(
+                  result.metrics
+                      .signedVelocityResidualScreenHeightsPerSecond[side][0U]) <
+              1.0e-5F);
+        CHECK(std::abs(
+                  result.metrics
+                      .signedVelocityResidualScreenHeightsPerSecond[side][1U]) <
+              1.0e-5F);
+        CHECK(result.metrics.anchorOverlayRmsScreenHeights[side] <
+              1.0e-4F);
+    }
+}
+
+TEST_CASE("Reciprocal off-centre orbit pans continue projected patch rotation",
+          "[camera][animation][pan-extension][rotation]") {
+    const auto makeOrbitPan = [](std::string name) {
+        invisible_places::camera::AnimationPath path;
+        path.name = name;
+        path.durationFrames = 60U;
+        path.keys = {
+            {.id = name + "-0",
+             .cameraPosition = {-4.0F, -6.0F, 2.0F},
+             .focusPoint = {0.0F, 0.0F, 1.0F}},
+            {.id = name + "-1",
+             .cameraPosition = {0.0F, -7.0F, 3.0F},
+             .focusPoint = {0.0F, 0.0F, 1.0F},
+             .durationFrames = 30U},
+            {.id = name + "-2",
+             .cameraPosition = {4.0F, -6.0F, 2.0F},
+             .focusPoint = {0.0F, 0.0F, 1.0F},
+             .durationFrames = 30U},
+        };
+        return path;
+    };
+    invisible_places::camera::AnimationSurfacePatchObservation patch;
+    patch.pointCount = 3U;
+    patch.worldPoints[0U] = {2.0F, 0.0F, 1.0F};
+    patch.worldPoints[1U] = {2.5F, 0.0F, 1.0F};
+    patch.worldPoints[2U] = {2.0F, 0.0F, 1.5F};
+    invisible_places::camera::AnimationReciprocalPanExtensionOptions options;
+    options.firstDrivesSecond.sourceTailFrame = 20U;
+    options.firstDrivesSecond.sourcePatch = patch;
+    options.firstDrivesSecond.destinationEndPatch = patch;
+    options.secondDrivesFirst = options.firstDrivesSecond;
+    options.sampleCount = 17U;
+    options.optimizationSweeps = 24U;
+
+    const auto result = invisible_places::camera::
+        BuildAnimationReciprocalPanExtension(
+            makeOrbitPan("left"),
+            makeOrbitPan("right"),
+            options);
+    INFO(result.errorMessage);
+    REQUIRE(result.succeeded);
+    for (std::size_t side = 0U; side < 2U; ++side) {
+        CHECK(result.metrics.rotationConstrained[side]);
+        CHECK(std::isfinite(
+            result.metrics.rotationRateResidualDegreesPerSecond[side]));
+        CHECK(result.metrics.rotationRateResidualDegreesPerSecond[side] <
+              0.5F);
+        CHECK(result.metrics.afterRotationRmsDegreesPerSecond[side] <=
+              result.metrics.beforeRotationRmsDegreesPerSecond[side]);
+    }
 }

@@ -1,7 +1,9 @@
 #include "InvisiblePlacesBuildConfig.hpp"
 #include "serialization/ProjectDocument.hpp"
+#include "timing/TimingColourise.hpp"
 #include "timing/TimelineView.hpp"
 #include "water/WaterFlow.hpp"
+#include "water/WaterSeepagePulseField.hpp"
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -136,6 +138,151 @@ TEST_CASE("Timing run evaluation holds endpoints and interpolates", "[water][tim
     const float amount = 0.25F;
     const float eased = amount * amount * (3.0F - 2.0F * amount);
     CHECK(EvaluateWaterTimingRun(run, 0.3F + amount * 0.2F, 0.75F) == Approx(eased));
+}
+
+TEST_CASE(
+    "Timing Take retiming preserves every nonlinear water frame and holds its terminal value",
+    "[water][timing][pan-extension]") {
+    constexpr std::uint32_t sourceFrames = 120U;
+    constexpr std::uint32_t destinationFrames = 180U;
+    invisible_places::timing::TimingTakeSceneState state;
+    invisible_places::water::WaterKeyedSettingTrack setting;
+    setting.settingId = "rain-rate";
+    // SmoothVelocity is a time-domain spline and therefore has exact affine
+    // retime equivalence. Centripetal Catmull-Rom keeps its keys and segment
+    // semantics, but its 2D time/value chord lengths intentionally make its
+    // between-key shape sensitive to horizontal timeline scaling.
+    setting.defaultInterpolation =
+        WaterScenarioInterpolation::SmoothVelocity;
+    setting.keys = {
+        {.position = 0.0F,
+         .value = 0.1F,
+         .interpolation = WaterScenarioInterpolation::TrackDefault},
+        {.position = 0.23F,
+         .value = 0.9F,
+         .interpolation = WaterScenarioInterpolation::TrackDefault},
+        {.position = 0.61F,
+         .value = 0.3F,
+         .interpolation = WaterScenarioInterpolation::TrackDefault},
+        {.position = 1.0F,
+         .value = 0.75F,
+         .interpolation = WaterScenarioInterpolation::TrackDefault},
+    };
+    invisible_places::water::WaterFeatureTimeline feature;
+    feature.feature = {
+        .kind = invisible_places::water::WaterKeyedFeatureKind::Rain,
+    };
+    feature.settings.push_back(setting);
+    invisible_places::water::WaterFeatureTimingRun run;
+    run.features.push_back(std::move(feature));
+    state.waterFeatureTimingRuns.push_back(std::move(run));
+
+    const auto originalTrack = setting;
+    REQUIRE(invisible_places::timing::
+                RetimeTimingTakeSceneStateNormalizedPositions(
+                    &state,
+                    sourceFrames,
+                    destinationFrames));
+    const auto& retimedTrack = state.waterFeatureTimingRuns.front()
+                                   .features.front()
+                                   .settings.front();
+    REQUIRE(retimedTrack.keys.size() == originalTrack.keys.size());
+    for (std::size_t index = 0U;
+         index < originalTrack.keys.size();
+         ++index) {
+        CHECK(retimedTrack.keys[index].position ==
+              Approx(
+                  originalTrack.keys[index].position *
+                  static_cast<float>(sourceFrames) /
+                  static_cast<float>(destinationFrames)));
+        CHECK(retimedTrack.keys[index].value ==
+              Approx(originalTrack.keys[index].value));
+        CHECK(retimedTrack.keys[index].interpolation ==
+              originalTrack.keys[index].interpolation);
+    }
+
+    using invisible_places::water::EvaluateWaterKeyedSettingTrack;
+    for (std::uint32_t frame = 0U; frame <= sourceFrames; ++frame) {
+        const auto originalValue = EvaluateWaterKeyedSettingTrack(
+            originalTrack,
+            static_cast<float>(frame) /
+                static_cast<float>(sourceFrames));
+        const auto retimedValue = EvaluateWaterKeyedSettingTrack(
+            retimedTrack,
+            static_cast<float>(frame) /
+                static_cast<float>(destinationFrames));
+        REQUIRE(originalValue.has_value());
+        REQUIRE(retimedValue.has_value());
+        CHECK(*retimedValue == Approx(*originalValue).margin(1.0e-6F));
+    }
+    const auto terminalValue =
+        EvaluateWaterKeyedSettingTrack(originalTrack, 1.0F);
+    REQUIRE(terminalValue.has_value());
+    for (std::uint32_t frame = sourceFrames + 1U;
+         frame <= destinationFrames;
+         ++frame) {
+        const auto value = EvaluateWaterKeyedSettingTrack(
+            retimedTrack,
+            static_cast<float>(frame) /
+                static_cast<float>(destinationFrames));
+        REQUIRE(value.has_value());
+        CHECK(*value == Approx(*terminalValue).margin(1.0e-6F));
+    }
+}
+
+TEST_CASE(
+    "Paused camera keys stay fixed while procedural effects use independent time",
+    "[water][timing][clock][pan-extension]") {
+    invisible_places::water::WaterKeyedSettingTrack keyedRain;
+    keyedRain.settingId = "level";
+    keyedRain.defaultInterpolation = WaterScenarioInterpolation::Linear;
+    keyedRain.keys = {
+        {.position = 0.0F,
+         .value = 0.2F,
+         .interpolation = WaterScenarioInterpolation::TrackDefault},
+        {.position = 2.0F / 3.0F,
+         .value = 0.8F,
+         .interpolation = WaterScenarioInterpolation::TrackDefault},
+    };
+
+    // This is a paused camera in the added tail of a 120 -> 180 frame
+    // extension. Its keyed value is selected only by camera position.
+    constexpr float pausedCameraPosition = 5.0F / 6.0F;
+    const auto keyedBefore =
+        invisible_places::water::EvaluateWaterKeyedSettingTrack(
+            keyedRain,
+            pausedCameraPosition);
+    const auto keyedLater =
+        invisible_places::water::EvaluateWaterKeyedSettingTrack(
+            keyedRain,
+            pausedCameraPosition);
+    REQUIRE(keyedBefore.has_value());
+    REQUIRE(keyedLater.has_value());
+    CHECK(*keyedBefore == Approx(0.8F));
+    CHECK(*keyedLater == Approx(*keyedBefore));
+
+    invisible_places::water::WaterSeepagePulseFieldSettings pulse;
+    pulse.seed = 2027808452U;
+    pulse.nodeId = 4U;
+    pulse.stableSpanMeters = 3.125F;
+    const auto samplePulse = [&](float effectTimeSeconds) {
+        pulse.timeSeconds = effectTimeSeconds;
+        return invisible_places::water::BuildWaterSeepagePulseField(pulse)
+            .samples;
+    };
+
+    // Live time keeps advancing while the camera position above remains fixed.
+    const auto liveBefore = samplePulse(4.0F);
+    const auto liveLater = samplePulse(4.83F);
+    CHECK(liveLater != liveBefore);
+
+    // Export samples the full frame/subframe time, including past the old
+    // four-second camera end, and is repeatable for the same output sample.
+    constexpr float outputTimeSeconds = (151.0F + 0.5F) / 30.0F;
+    static_assert(outputTimeSeconds > 120.0F / 30.0F);
+    const auto exported = samplePulse(outputTimeSeconds);
+    CHECK(exported == samplePulse(outputTimeSeconds));
+    CHECK(exported != samplePulse(120.0F / 30.0F));
 }
 
 TEST_CASE("Timing run evaluation respects Linear and Hold modes", "[water][timing]") {

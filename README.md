@@ -20,7 +20,7 @@ The central idea is that data already present in the point cloud can become visu
 - **Data-driven art direction:** render parameters can be constant values or field-mapped controls with input/output ranges, layer statistics, clamp, invert, and gamma shaping.
 - **Hybrid capture scenes:** point-cloud layers and Gaussian splat layers share the same camera, scene, and project workflow, so survey geometry and photogrammetric/3DGS material can be composed together.
 - **Postproduction-friendly output:** preview-density EXR stacks currently write `beauty.RGB`, `alpha.A`, and `depth.Z`, while Quick MP4 export gives fast review movies through `ffmpeg`.
-- **Portable project state:** schema-73 project JSON, schema-21 animation JSON, and schema-27 standalone water-source JSON store authored scenes, explicit active water-scene ownership, animation, styles, water controls, live-view window preferences, and compact cache manifests; derived shared-surface and settled Flow-path payloads live in validated sidecars rather than bloating the project file.
+- **Portable project state:** schema-73 project JSON, schema-22 animation JSON, and schema-27 standalone water-source JSON store authored scenes, explicit active water-scene ownership, animation, styles, water controls, live-view window preferences, and compact cache manifests; derived shared-surface and settled Flow-path payloads live in validated sidecars rather than bloating the project file.
 
 ## Current capabilities
 
@@ -62,6 +62,8 @@ The central idea is that data already present in the point cloud can become visu
 - Builds weighted camera paths from ordered shots, using segment distance and rotation to distribute timing.
 - Converts shots into editable animation paths.
 - Plays, scrubs, edits, and saves animation paths.
+- Extends both seams of two slow pans from their existing 50%-blend endpoint poses. Editable three-point correspondences align A-start with B-end and B-start with A-end; two or three generated keys per destination animation then copy each source pan's inward screen motion into the partner's outward tail before both immutable candidates are previewed and applied together. Apply creates a reciprocal blend link when the selected pair was previously unlinked, or updates their existing pair.
+- Keeps every pre-extension timing, water, and keyed-effect event on its original 30 fps frame by rescaling normalized key positions when the camera duration grows. Added tails hold the last keyed values, while procedural waves, rain, and trails advance independently of camera position: from the steady clock in live view, including while paused, and from deterministic full output time during export.
 - Stores a default live-view window size per animation and applies it when the animation loads; a project-level size lock overrides animation defaults.
 - Uses a 30 fps project timebase for camera and animation evaluation.
 
@@ -82,7 +84,7 @@ The central idea is that data already present in the point cloud can become visu
 
 ### Export and persistence
 
-- Saves and reloads schema-73 project JSON containing authoritative scene density groups, explicit active water-scene ownership, point-cloud styles, camera shots, animation paths, saved visuals, the live-view window preference and lock, water state/cache manifests, and export selections. Animation documents use schema 21 and standalone water-source documents use schema 27.
+- Saves and reloads schema-73 project JSON containing authoritative scene density groups, explicit active water-scene ownership, point-cloud styles, camera shots, animation paths, saved visuals, the live-view window preference and lock, water state/cache manifests, and export selections. Animation documents use schema 22 and standalone water-source documents use schema 27.
 - Persists the shared schema-4 water surface cache as a scene-local `.surfacecache` and settled generated Flow branches as `.flowpathcache`, with project-local fallback paths when scene storage is unavailable.
 - Builds the shared 10 mm Rain/Flow/Seepage surface from one complete 2 mm ROCK/SAND/VEG bundle (or the nearest complete fallback bundle), and folds the explicitly active scene's unambiguous 5 mm `MESHSampled` point cloud into a separate Ground-v3 tier for Mesh Flow. Density changes and effect tuning therefore do not rescan or mix role sources.
 - Keeps Rain near-surface squish, ROCK/VEG response tuning, Flow trail visibility, and Seepage reach/width/prominence as live parameter updates over settled cache-derived support.

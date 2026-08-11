@@ -1376,6 +1376,27 @@ PreparedAnimationPathEvaluationContext PrepareAnimationPathEvaluation(const Anim
                 context.knots,
                 context.loopFocusCorrections,
                 context.loopCorrectionKeyEnabled);
+        for (const auto& correction : path.localizedKeyCorrections) {
+            const auto keyIt = std::find_if(
+                path.keys.begin(),
+                path.keys.end(),
+                [&](const AnimationPathKey& key) {
+                    return key.id == correction.keyId;
+                });
+            if (keyIt == path.keys.end()) {
+                continue;
+            }
+            const std::size_t keyIndex = static_cast<std::size_t>(
+                std::distance(path.keys.begin(), keyIt));
+            if (correction.hasCameraCorrectionTangent) {
+                context.loopCameraCorrectionTangents[keyIndex] =
+                    correction.cameraCorrectionTangent;
+            }
+            if (correction.hasFocusCorrectionTangent) {
+                context.loopFocusCorrectionTangents[keyIndex] =
+                    correction.focusCorrectionTangent;
+            }
+        }
     }
 
     context.orientationQuaternions.reserve(path.keys.size());
@@ -1619,6 +1640,2069 @@ AnimationPathEvaluation EvaluatePreparedAnimationPath(
             : context.apertureFStops;
     evaluation.camera.depthOfFieldMaxBlurPixels = context.depthOfFieldMaxBlurPixels;
     return evaluation;
+}
+
+namespace {
+
+struct PanPatchDescriptor {
+    bool valid = false;
+    bool rotationValid = false;
+    std::array<float, 2> anchor{};
+    std::array<std::array<float, 2>, 3> projectedPoints{};
+    float angleRadians = 0.0F;
+    float scale = 0.0F;
+    float conditioning = 0.0F;
+};
+
+struct PanTrackVelocity {
+    bool valid = false;
+    bool rotationValid = false;
+    std::array<float, 2> translation{};
+    float rotationDegreesPerSecond = 0.0F;
+};
+
+struct PanTerminalBuildMetrics {
+    std::uint32_t extensionFrames = 0U;
+    std::uint32_t appendedKeyCount = 0U;
+    std::size_t sourceInteriorKeyCount = 0U;
+    std::size_t sourceInflectionCount = 0U;
+    bool rotationConstrained = false;
+    float beforeVelocityRms = 0.0F;
+    float afterVelocityRms = 0.0F;
+    float beforeRotationRms = 0.0F;
+    float afterRotationRms = 0.0F;
+    float anchorOverlayRms = 0.0F;
+    float anchorOverlayMax = 0.0F;
+    float patchNodeOverlayRms = 0.0F;
+    float patchNodeOverlayMax = 0.0F;
+    std::array<float, 2> signedVelocityResidual{};
+    float rotationRateResidual = 0.0F;
+    float perspectiveScaleResidualPercent = 0.0F;
+    float patchConfidence = 0.0F;
+    std::string patchDiagnostic;
+    float maxPrefixPositionError = 0.0F;
+    float formerTerminalCameraMove = 0.0F;
+    float formerTerminalFocusMove = 0.0F;
+};
+
+bool FinitePanVector(const std::array<float, 3>& value) {
+    return std::all_of(
+        value.begin(),
+        value.end(),
+        [](float component) { return std::isfinite(component); });
+}
+
+bool ValidPanPatch(const AnimationSurfacePatchObservation& patch) {
+    if (patch.pointCount == 0U || patch.pointCount > patch.worldPoints.size()) {
+        return false;
+    }
+    return std::all_of(
+        patch.worldPoints.begin(),
+        patch.worldPoints.begin() +
+            static_cast<std::ptrdiff_t>(patch.pointCount),
+        [](const auto& point) { return FinitePanVector(point); });
+}
+
+bool ValidOrderedPanTriangle(const AnimationSurfacePatchObservation& patch) {
+    if (patch.pointCount != 3U || !ValidPanPatch(patch)) {
+        return false;
+    }
+    const glm::vec3 anchor = ToGlm(patch.worldPoints[0U]);
+    const glm::vec3 first = ToGlm(patch.worldPoints[1U]) - anchor;
+    const glm::vec3 second = ToGlm(patch.worldPoints[2U]) - anchor;
+    const float firstLength = glm::length(first);
+    const float secondLength = glm::length(second);
+    if (!std::isfinite(firstLength) || !std::isfinite(secondLength) ||
+        firstLength <= 1.0e-6F || secondLength <= 1.0e-6F) {
+        return false;
+    }
+    const float normalizedArea =
+        glm::length(glm::cross(first, second)) /
+        (firstLength * secondLength);
+    return std::isfinite(normalizedArea) && normalizedArea > 1.0e-4F;
+}
+
+struct PanTriangleSimilarity {
+    bool valid = false;
+    glm::quat rotation{1.0F, 0.0F, 0.0F, 0.0F};
+    float scale = 1.0F;
+    glm::vec3 sourceAnchor{};
+    glm::vec3 destinationAnchor{};
+};
+
+PanTriangleSimilarity BuildPanTriangleSimilarity(
+    const AnimationSurfacePatchObservation& source,
+    const AnimationSurfacePatchObservation& destination) {
+    PanTriangleSimilarity similarity;
+    if (!ValidOrderedPanTriangle(source) ||
+        !ValidOrderedPanTriangle(destination)) {
+        return similarity;
+    }
+    const auto makeFrame = [](const AnimationSurfacePatchObservation& patch) {
+        const glm::vec3 anchor = ToGlm(patch.worldPoints[0U]);
+        const glm::vec3 first = ToGlm(patch.worldPoints[1U]) - anchor;
+        const glm::vec3 second = ToGlm(patch.worldPoints[2U]) - anchor;
+        const glm::vec3 x = glm::normalize(first);
+        const glm::vec3 z = glm::normalize(glm::cross(first, second));
+        const glm::vec3 y = glm::normalize(glm::cross(z, x));
+        return glm::mat3{x, y, z};
+    };
+    const glm::mat3 sourceFrame = makeFrame(source);
+    const glm::mat3 destinationFrame = makeFrame(destination);
+    const glm::mat3 rotationMatrix =
+        destinationFrame * glm::transpose(sourceFrame);
+    similarity.rotation = glm::normalize(glm::quat_cast(rotationMatrix));
+    similarity.sourceAnchor = ToGlm(source.worldPoints[0U]);
+    similarity.destinationAnchor = ToGlm(destination.worldPoints[0U]);
+    const float sourceArea = glm::length(glm::cross(
+        ToGlm(source.worldPoints[1U]) - similarity.sourceAnchor,
+        ToGlm(source.worldPoints[2U]) - similarity.sourceAnchor));
+    const float destinationArea = glm::length(glm::cross(
+        ToGlm(destination.worldPoints[1U]) - similarity.destinationAnchor,
+        ToGlm(destination.worldPoints[2U]) - similarity.destinationAnchor));
+    similarity.scale = std::sqrt(destinationArea / sourceArea);
+    similarity.valid = std::isfinite(similarity.scale) &&
+        similarity.scale > 1.0e-6F;
+    return similarity;
+}
+
+glm::vec3 TransformPanSimilarityPoint(
+    const PanTriangleSimilarity& similarity,
+    const glm::vec3& point) {
+    return similarity.destinationAnchor + similarity.scale *
+        (similarity.rotation * (point - similarity.sourceAnchor));
+}
+
+float WrappedAngleDelta(float value, float reference) {
+    float delta = value - reference;
+    while (delta > glm::pi<float>()) {
+        delta -= glm::two_pi<float>();
+    }
+    while (delta < -glm::pi<float>()) {
+        delta += glm::two_pi<float>();
+    }
+    return delta;
+}
+
+PanPatchDescriptor DescribePanPatch(
+    const AnimationPathEvaluation& evaluation,
+    const AnimationSurfacePatchObservation& patch) {
+    PanPatchDescriptor descriptor;
+    if (!ValidPanPatch(patch) ||
+        !ProjectWorldPointToScreenHeightCoordinates(
+            evaluation,
+            ToGlm(patch.worldPoints[0U]),
+            &descriptor.anchor)) {
+        return descriptor;
+    }
+    descriptor.projectedPoints[0U] = descriptor.anchor;
+    if (patch.pointCount < 3U) {
+        descriptor.valid = true;
+        return descriptor;
+    }
+    std::array<float, 2> tangentU{};
+    std::array<float, 2> tangentV{};
+    if (!ProjectWorldPointToScreenHeightCoordinates(
+            evaluation,
+            ToGlm(patch.worldPoints[1U]),
+            &tangentU) ||
+        !ProjectWorldPointToScreenHeightCoordinates(
+            evaluation,
+            ToGlm(patch.worldPoints[2U]),
+            &tangentV)) {
+        return descriptor;
+    }
+    descriptor.projectedPoints[1U] = tangentU;
+    descriptor.projectedPoints[2U] = tangentV;
+    descriptor.valid = true;
+    const std::array<float, 2> u{
+        tangentU[0U] - descriptor.anchor[0U],
+        tangentU[1U] - descriptor.anchor[1U],
+    };
+    const std::array<float, 2> v{
+        tangentV[0U] - descriptor.anchor[0U],
+        tangentV[1U] - descriptor.anchor[1U],
+    };
+    const float uLength = std::hypot(u[0U], u[1U]);
+    const float vLength = std::hypot(v[0U], v[1U]);
+    if (uLength <= 1.0e-7F || vLength <= 1.0e-7F) {
+        return descriptor;
+    }
+    const float determinant =
+        u[0U] * v[1U] - u[1U] * v[0U];
+    descriptor.conditioning = std::clamp(
+        std::abs(determinant) / (uLength * vLength),
+        0.0F,
+        1.0F);
+    descriptor.scale = std::sqrt(std::abs(determinant));
+    const float polarCosine = u[0U] + v[1U];
+    const float polarSine = u[1U] - v[0U];
+    if (descriptor.conditioning <= 1.0e-3F ||
+        descriptor.scale <= 1.0e-7F ||
+        std::hypot(polarCosine, polarSine) <= 1.0e-7F) {
+        return descriptor;
+    }
+    // The orthogonal factor of the projected 2x2 tangent matrix gives the
+    // local image rotation without conflating it with shear or perspective
+    // foreshortening.
+    descriptor.angleRadians = std::atan2(polarSine, polarCosine);
+    descriptor.rotationValid = std::isfinite(descriptor.angleRadians);
+    return descriptor;
+}
+
+PanPatchDescriptor DescribePreparedPanPatch(
+    const PreparedAnimationPathEvaluationContext& context,
+    float timeSeconds,
+    const AnimationSurfacePatchObservation& patch) {
+    return DescribePanPatch(
+        EvaluatePreparedAnimationPath(context, timeSeconds),
+        patch);
+}
+
+AnimationPathEvaluation PanEvaluationFromPose(
+    const std::array<float, 3>& cameraPosition,
+    const std::array<float, 3>& focusPoint,
+    const AnimationPathKey& lens) {
+    AnimationPathEvaluation evaluation;
+    evaluation.camera.position = cameraPosition;
+    evaluation.focusPoint = focusPoint;
+    evaluation.focusDistance = std::max(
+        0.001F,
+        Distance(cameraPosition, focusPoint));
+    evaluation.camera.target = focusPoint;
+    evaluation.camera.orbitCenter = focusPoint;
+    evaluation.camera.hasOrbitCenter = true;
+    WriteQuaternionToCameraState(
+        LookAtOrientation(ToGlm(cameraPosition), ToGlm(focusPoint)),
+        &evaluation.camera);
+    evaluation.camera.fovDegrees = lens.fovDegrees;
+    evaluation.camera.nearPlane = lens.nearPlane;
+    evaluation.camera.farPlane = lens.farPlane;
+    evaluation.camera.focusDistance = lens.hasFocusDistance
+                                          ? std::max(0.001F, lens.focusDistance)
+                                          : evaluation.focusDistance;
+    evaluation.camera.apertureFStops = lens.hasApertureFStops
+                                           ? std::max(0.1F, lens.apertureFStops)
+                                           : 8.0F;
+    return evaluation;
+}
+
+
+bool FixedLensTargetPanPath(
+    const AnimationPath& path,
+    std::string* errorMessage) {
+    if (path.keys.size() < 2U) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Each pan needs at least two camera keys.";
+        }
+        return false;
+    }
+    std::uint64_t incomingFrameTotal = 0U;
+    for (std::size_t keyIndex = 1U;
+         keyIndex < path.keys.size();
+         ++keyIndex) {
+        incomingFrameTotal += std::max<std::uint32_t>(
+            1U,
+            path.keys[keyIndex].durationFrames);
+        if (incomingFrameTotal >
+            std::numeric_limits<std::uint32_t>::max()) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "The path's incoming key durations overflow the supported frame range.";
+            }
+            return false;
+        }
+    }
+    if (AnyKeyHasOrientation(path)) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "Reciprocal pan extension currently supports target-driven paths only; explicit orientation keys are not supported.";
+        }
+        return false;
+    }
+    if (!ValidLocalizedKeyCorrections(path)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "The path contains invalid localized correction metadata.";
+        }
+        return false;
+    }
+    std::unordered_set<std::string> keyIds;
+    for (const auto& key : path.keys) {
+        if (key.id.empty() || !keyIds.insert(key.id).second) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "Reciprocal pan extension requires non-empty, unique camera-key IDs.";
+            }
+            return false;
+        }
+    }
+    const auto& lens = path.keys.front();
+    if (!FinitePanVector(lens.cameraPosition) ||
+        !FinitePanVector(lens.focusPoint) ||
+        !std::isfinite(lens.fovDegrees) || lens.fovDegrees <= 0.0F ||
+        !std::isfinite(lens.nearPlane) || lens.nearPlane <= 0.0F ||
+        !std::isfinite(lens.farPlane) || lens.farPlane <= lens.nearPlane) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "The path contains a non-finite camera pose or invalid lens.";
+        }
+        return false;
+    }
+    for (const auto& key : path.keys) {
+        const bool invalidLens =
+            !std::isfinite(key.fovDegrees) || key.fovDegrees <= 0.0F ||
+            !std::isfinite(key.nearPlane) || key.nearPlane <= 0.0F ||
+            !std::isfinite(key.farPlane) || key.farPlane <= key.nearPlane ||
+            (key.hasFocusDistance &&
+             (!std::isfinite(key.focusDistance) ||
+              key.focusDistance <= 0.0F)) ||
+            (key.hasApertureFStops &&
+             (!std::isfinite(key.apertureFStops) ||
+              key.apertureFStops <= 0.0F));
+        const bool lensChanged = invalidLens ||
+            std::abs(key.fovDegrees - lens.fovDegrees) > 1.0e-4F ||
+            std::abs(key.nearPlane - lens.nearPlane) > 1.0e-5F ||
+            std::abs(key.farPlane - lens.farPlane) > 1.0e-3F ||
+            key.hasFocusDistance != lens.hasFocusDistance ||
+            (key.hasFocusDistance &&
+             std::abs(key.focusDistance - lens.focusDistance) > 1.0e-4F) ||
+            key.hasApertureFStops != lens.hasApertureFStops ||
+            (key.hasApertureFStops &&
+             std::abs(key.apertureFStops - lens.apertureFStops) > 1.0e-4F);
+        if (!FinitePanVector(key.cameraPosition) ||
+            !FinitePanVector(key.focusPoint) || lensChanged) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "Reciprocal pan extension requires a fixed lens, clipping range, focus-distance policy, and aperture.";
+            }
+            return false;
+        }
+    }
+    const bool authoredFocusDistance = AnyKeyHasFocusDistance(path);
+    const bool authoredAperture = AnyKeyHasApertureFStops(path);
+    const auto endpointHasLensMotion = [&](const AnimationPathKey& key) {
+        if (!key.hasSplineEndpointTangent) {
+            return false;
+        }
+        for (std::size_t channel = 0U;
+             channel < key.splineLensEndpointTangent.size();
+             ++channel) {
+            const float tangent = key.splineLensEndpointTangent[channel];
+            if (!std::isfinite(tangent)) {
+                return true;
+            }
+            const bool active = channel < 3U ||
+                (channel == 3U && authoredFocusDistance) ||
+                (channel == 4U && authoredAperture);
+            if (active && std::abs(tangent) > 1.0e-6F) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (endpointHasLensMotion(path.keys.front()) ||
+        endpointHasLensMotion(path.keys.back())) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "Reciprocal pan extension requires a fixed lens; authored lens spline tangents animate this path.";
+        }
+        return false;
+    }
+    for (const auto& correction : path.localizedKeyCorrections) {
+        if (!FinitePanVector(correction.splineCameraPosition) ||
+            !FinitePanVector(correction.splineFocusPoint) ||
+            (correction.hasCameraCorrectionTangent &&
+             !FinitePanVector(correction.cameraCorrectionTangent)) ||
+            (correction.hasFocusCorrectionTangent &&
+             !FinitePanVector(correction.focusCorrectionTangent))) {
+            if (errorMessage != nullptr) {
+                *errorMessage = "The path contains a non-finite localized correction.";
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+std::array<float, 3> PreparedSplineEndpointValue(
+    const PreparedAnimationPathEvaluationContext& context,
+    bool cameraTrack) {
+    return cameraTrack
+               ? std::array<float, 3>{
+                     context.cameraX.values.back(),
+                     context.cameraY.values.back(),
+                     context.cameraZ.values.back()}
+               : std::array<float, 3>{
+                     context.focusX.values.back(),
+                     context.focusY.values.back(),
+                     context.focusZ.values.back()};
+}
+
+std::array<float, 3> PreparedSplineEndpointDerivative(
+    const PreparedAnimationPathEvaluationContext& context,
+    bool cameraTrack,
+    bool firstEndpoint) {
+    const auto derivative = [&](const AnimationPreparedScalarSpline& spline) {
+        return EvaluatePreparedScalarSplineEndpointDerivative(
+            context.geometryKnots,
+            spline,
+            firstEndpoint);
+    };
+    return cameraTrack
+               ? std::array<float, 3>{
+                     derivative(context.cameraX),
+                     derivative(context.cameraY),
+                     derivative(context.cameraZ)}
+               : std::array<float, 3>{
+                     derivative(context.focusX),
+                     derivative(context.focusY),
+                     derivative(context.focusZ)};
+}
+
+std::array<float, 3> PreparedSplineEndpointSecondDerivative(
+    const PreparedAnimationPathEvaluationContext& context,
+    bool cameraTrack) {
+    return cameraTrack
+               ? std::array<float, 3>{
+                     context.cameraX.secondDerivatives.back(),
+                     context.cameraY.secondDerivatives.back(),
+                     context.cameraZ.secondDerivatives.back()}
+               : std::array<float, 3>{
+                     context.focusX.secondDerivatives.back(),
+                     context.focusY.secondDerivatives.back(),
+                     context.focusZ.secondDerivatives.back()};
+}
+
+std::array<float, 3> PanPathPoseDerivative(
+    const PreparedAnimationPathEvaluationContext& context,
+    float timeSeconds,
+    bool cameraTrack,
+    bool forward) {
+    const float delta = std::min(
+        1.0F / kAnimationFramesPerSecond,
+        std::max(context.durationSeconds, 0.0F));
+    const float fromTime = forward
+                               ? std::clamp(timeSeconds, 0.0F, context.durationSeconds)
+                               : std::max(0.0F, timeSeconds - delta);
+    const float toTime = forward
+                             ? std::min(context.durationSeconds, timeSeconds + delta)
+                             : std::clamp(timeSeconds, 0.0F, context.durationSeconds);
+    const float span = toTime - fromTime;
+    if (span <= 1.0e-6F) {
+        return {};
+    }
+    const auto from = EvaluatePreparedAnimationPath(context, fromTime);
+    const auto to = EvaluatePreparedAnimationPath(context, toTime);
+    const auto& fromValue = cameraTrack ? from.camera.position : from.focusPoint;
+    const auto& toValue = cameraTrack ? to.camera.position : to.focusPoint;
+    return {
+        (toValue[0U] - fromValue[0U]) / span,
+        (toValue[1U] - fromValue[1U]) / span,
+        (toValue[2U] - fromValue[2U]) / span,
+    };
+}
+
+std::array<float, 3> RotatePanVector(
+    const glm::quat& rotation,
+    const std::array<float, 3>& value) {
+    const glm::vec3 rotated = rotation * ToGlm(value);
+    return {rotated.x, rotated.y, rotated.z};
+}
+
+float ExactExtendedEndpointDerivative(
+    float oldValue,
+    float oldDerivative,
+    float oldSecondDerivative,
+    float newValue,
+    float span) {
+    return (3.0F * (newValue - oldValue) / span) -
+           (2.0F * oldDerivative) -
+           (0.5F * span * oldSecondDerivative);
+}
+
+std::string UniquePanExtensionKeyId(const AnimationPath& path) {
+    std::unordered_set<std::string> ids;
+    for (const auto& key : path.keys) {
+        ids.insert(key.id);
+    }
+    const std::string base = "pan_extension_" +
+                             std::to_string(path.keys.size() + 1U);
+    std::string candidate = base;
+    for (std::uint32_t suffix = 2U; ids.contains(candidate); ++suffix) {
+        candidate = base + "_" + std::to_string(suffix);
+    }
+    return candidate;
+}
+
+AnimationLocalizedKeyCorrection* UpsertPanCorrection(
+    AnimationPath* path,
+    std::string_view keyId,
+    const std::array<float, 3>& splineCamera,
+    const std::array<float, 3>& splineFocus) {
+    if (path == nullptr) {
+        return nullptr;
+    }
+    const auto existing = std::find_if(
+        path->localizedKeyCorrections.begin(),
+        path->localizedKeyCorrections.end(),
+        [&](const auto& correction) { return correction.keyId == keyId; });
+    if (existing != path->localizedKeyCorrections.end()) {
+        return &*existing;
+    }
+    path->localizedKeyCorrections.push_back({
+        .keyId = std::string{keyId},
+        .splineCameraPosition = splineCamera,
+        .splineFocusPoint = splineFocus,
+    });
+    return &path->localizedKeyCorrections.back();
+}
+
+void MaterializePanCorrectionTangents(
+    AnimationPath* path,
+    const PreparedAnimationPathEvaluationContext& context) {
+    if (path == nullptr || !context.hasLoopKeyCorrections) {
+        return;
+    }
+    for (auto& correction : path->localizedKeyCorrections) {
+        const auto key = std::find_if(
+            path->keys.begin(),
+            path->keys.end(),
+            [&](const auto& candidate) { return candidate.id == correction.keyId; });
+        if (key == path->keys.end()) {
+            continue;
+        }
+        const std::size_t index = static_cast<std::size_t>(
+            std::distance(path->keys.begin(), key));
+        correction.hasCameraCorrectionTangent = true;
+        correction.cameraCorrectionTangent =
+            context.loopCameraCorrectionTangents[index];
+        correction.hasFocusCorrectionTangent = true;
+        correction.focusCorrectionTangent =
+            context.loopFocusCorrectionTangents[index];
+    }
+}
+
+float PanEndpointPoseScore(
+    const std::array<float, 3>& cameraPosition,
+    const std::array<float, 3>& focusPoint,
+    const AnimationPathKey& lens,
+    const AnimationSurfacePatchObservation& patch,
+    const PanPatchDescriptor& desired) {
+    const auto descriptor = DescribePanPatch(
+        PanEvaluationFromPose(cameraPosition, focusPoint, lens),
+        patch);
+    if (!descriptor.valid) {
+        return std::numeric_limits<float>::infinity();
+    }
+    float pointSquared = 0.0F;
+    for (std::size_t point = 0U;
+         point < descriptor.projectedPoints.size();
+         ++point) {
+        const float x = descriptor.projectedPoints[point][0U] -
+            desired.projectedPoints[point][0U];
+        const float y = descriptor.projectedPoints[point][1U] -
+            desired.projectedPoints[point][1U];
+        pointSquared += x * x + y * y;
+    }
+    float score = 100.0F * pointSquared;
+    if (descriptor.rotationValid && desired.rotationValid) {
+        const float rotation = WrappedAngleDelta(
+            descriptor.angleRadians,
+            desired.angleRadians);
+        // Endpoint angle is the integral constraint for the extension's
+        // rotation rate. A loose endpoint fit cannot be repaired by changing
+        // Hermite tangents without leaving a persistent rate bias.
+        score += 256.0F * rotation * rotation;
+    }
+    if (descriptor.scale > 1.0e-7F && desired.scale > 1.0e-7F) {
+        const float scale = std::log(descriptor.scale / desired.scale);
+        score += 0.25F * scale * scale;
+    }
+    return std::isfinite(score)
+               ? score
+               : std::numeric_limits<float>::infinity();
+}
+
+void OptimizePanEndpointPose(
+    std::array<float, 3>* cameraPosition,
+    std::array<float, 3>* focusPoint,
+    const AnimationPathKey& lens,
+    const AnimationSurfacePatchObservation& patch,
+    const PanPatchDescriptor& desired,
+    std::uint32_t sweeps) {
+    if (cameraPosition == nullptr || focusPoint == nullptr) {
+        return;
+    }
+    float step = std::clamp(
+        0.02F * Distance(*cameraPosition, *focusPoint),
+        1.0e-4F,
+        1.0F);
+    float bestScore = PanEndpointPoseScore(
+        *cameraPosition,
+        *focusPoint,
+        lens,
+        patch,
+        desired);
+    const std::uint32_t passCount = std::clamp(
+        std::max(sweeps, 48U),
+        1U,
+        48U);
+    for (std::uint32_t pass = 0U; pass < passCount; ++pass) {
+        bool improved = false;
+        for (std::size_t variable = 0U; variable < 6U; ++variable) {
+            for (const float direction : {-1.0F, 1.0F}) {
+                auto candidateCamera = *cameraPosition;
+                auto candidateFocus = *focusPoint;
+                auto& value = variable < 3U
+                                  ? candidateCamera[variable]
+                                  : candidateFocus[variable - 3U];
+                value += direction * step;
+                if (Distance(candidateCamera, candidateFocus) <= 1.0e-4F) {
+                    continue;
+                }
+                const float score = PanEndpointPoseScore(
+                    candidateCamera,
+                    candidateFocus,
+                    lens,
+                    patch,
+                    desired);
+                if (score + 1.0e-10F < bestScore) {
+                    *cameraPosition = candidateCamera;
+                    *focusPoint = candidateFocus;
+                    bestScore = score;
+                    improved = true;
+                }
+            }
+        }
+        step *= improved ? 0.82F : 0.5F;
+        if (step <= 1.0e-6F) {
+            break;
+        }
+    }
+}
+
+PanTrackVelocity PanPatchVelocity(
+    const PreparedAnimationPathEvaluationContext& context,
+    float timeSeconds,
+    bool forward,
+    const AnimationSurfacePatchObservation& patch) {
+    PanTrackVelocity velocity;
+    const float delta = std::min(
+        1.0F / kAnimationFramesPerSecond,
+        context.durationSeconds);
+    const float firstTime = forward
+                                ? std::clamp(timeSeconds, 0.0F, context.durationSeconds)
+                                : std::max(0.0F, timeSeconds - delta);
+    const float secondTime = forward
+                                 ? std::min(context.durationSeconds, timeSeconds + delta)
+                                 : std::clamp(timeSeconds, 0.0F, context.durationSeconds);
+    const float span = secondTime - firstTime;
+    if (span <= 1.0e-6F) {
+        return velocity;
+    }
+    const auto first = DescribePreparedPanPatch(context, firstTime, patch);
+    const auto second = DescribePreparedPanPatch(context, secondTime, patch);
+    if (!first.valid || !second.valid) {
+        return velocity;
+    }
+    velocity.valid = true;
+    velocity.translation = {
+        (second.anchor[0U] - first.anchor[0U]) / span,
+        (second.anchor[1U] - first.anchor[1U]) / span,
+    };
+    if (first.rotationValid && second.rotationValid) {
+        velocity.rotationValid = true;
+        velocity.rotationDegreesPerSecond = glm::degrees(
+            WrappedAngleDelta(second.angleRadians, first.angleRadians) /
+            span);
+    }
+    return velocity;
+}
+
+float PanTerminalTangentScore(
+    const AnimationPath& candidate,
+    float destinationJoinTime,
+    const AnimationSurfacePatchObservation& destinationPatch,
+    const PreparedAnimationPathEvaluationContext& sourceContext,
+    float sourceTailTime,
+    const AnimationSurfacePatchObservation& sourcePatch,
+    std::uint32_t sampleCount) {
+    const auto candidateContext = PrepareAnimationPathEvaluation(candidate);
+    if (!candidateContext.valid) {
+        return std::numeric_limits<float>::infinity();
+    }
+    const auto sourceStartDescriptor = DescribePreparedPanPatch(
+        sourceContext,
+        0.0F,
+        sourcePatch);
+    const auto destinationDescriptor = DescribePreparedPanPatch(
+        candidateContext,
+        destinationJoinTime,
+        destinationPatch);
+    if (!sourceStartDescriptor.valid || !destinationDescriptor.valid) {
+        return std::numeric_limits<float>::infinity();
+    }
+
+    float score = 0.0F;
+    const std::array<PanTrackVelocity, 2> desiredEndpoints{
+        PanPatchVelocity(
+            sourceContext,
+            0.0F,
+            true,
+            sourcePatch),
+        PanPatchVelocity(
+            sourceContext,
+            sourceTailTime,
+            false,
+            sourcePatch),
+    };
+    const std::array<PanTrackVelocity, 2> actualEndpoints{
+        PanPatchVelocity(
+            candidateContext,
+            destinationJoinTime,
+            true,
+            destinationPatch),
+        PanPatchVelocity(
+            candidateContext,
+            candidateContext.durationSeconds,
+            false,
+            destinationPatch),
+    };
+    for (std::size_t endpoint = 0U;
+         endpoint < desiredEndpoints.size();
+         ++endpoint) {
+        if (!desiredEndpoints[endpoint].valid ||
+            !actualEndpoints[endpoint].valid) {
+            return std::numeric_limits<float>::infinity();
+        }
+        const float x = actualEndpoints[endpoint].translation[0U] -
+            desiredEndpoints[endpoint].translation[0U];
+        const float y = actualEndpoints[endpoint].translation[1U] -
+            desiredEndpoints[endpoint].translation[1U];
+        score += 16.0F * ((x * x) + (y * y));
+        if (actualEndpoints[endpoint].rotationValid &&
+            desiredEndpoints[endpoint].rotationValid) {
+            const float rotation = 0.25F * glm::radians(
+                actualEndpoints[endpoint].rotationDegreesPerSecond -
+                desiredEndpoints[endpoint].rotationDegreesPerSecond);
+            score += 4096.0F * rotation * rotation;
+        }
+    }
+    PanPatchDescriptor previousDesired;
+    PanPatchDescriptor previousActual;
+    float previousTime = destinationJoinTime;
+    const std::uint32_t samples = std::clamp(sampleCount, 3U, 65U);
+    for (std::uint32_t sampleIndex = 0U;
+         sampleIndex < samples;
+         ++sampleIndex) {
+        const float amount = static_cast<float>(sampleIndex) /
+            static_cast<float>(samples - 1U);
+        const float sourceTime = sourceTailTime * amount;
+        const float candidateTime = std::lerp(
+            destinationJoinTime,
+            candidateContext.durationSeconds,
+            amount);
+        const auto desired = DescribePreparedPanPatch(
+            sourceContext,
+            sourceTime,
+            sourcePatch);
+        const auto actual = DescribePreparedPanPatch(
+            candidateContext,
+            candidateTime,
+            destinationPatch);
+        if (!desired.valid || !actual.valid ||
+            !desired.rotationValid || !actual.rotationValid ||
+            desired.scale <= 1.0e-7F || actual.scale <= 1.0e-7F) {
+            return std::numeric_limits<float>::infinity();
+        }
+
+        for (std::size_t point = 0U;
+             point < actual.projectedPoints.size();
+             ++point) {
+            const float pointX = actual.projectedPoints[point][0U] -
+                desired.projectedPoints[point][0U];
+            const float pointY = actual.projectedPoints[point][1U] -
+                desired.projectedPoints[point][1U];
+            score += 8.0F * (pointX * pointX + pointY * pointY);
+        }
+        if (actual.scale > 1.0e-7F && desired.scale > 1.0e-7F) {
+            const float scaleError = std::log(actual.scale / desired.scale);
+            score += 0.25F * scaleError * scaleError;
+        }
+        if (sampleIndex > 0U) {
+            const float span = candidateTime - previousTime;
+            for (std::size_t point = 0U;
+                 point < actual.projectedPoints.size();
+                 ++point) {
+                const float actualX =
+                    (actual.projectedPoints[point][0U] -
+                     previousActual.projectedPoints[point][0U]) /
+                    span;
+                const float actualY =
+                    (actual.projectedPoints[point][1U] -
+                     previousActual.projectedPoints[point][1U]) /
+                    span;
+                const float desiredX =
+                    (desired.projectedPoints[point][0U] -
+                     previousDesired.projectedPoints[point][0U]) /
+                    span;
+                const float desiredY =
+                    (desired.projectedPoints[point][1U] -
+                     previousDesired.projectedPoints[point][1U]) /
+                    span;
+                const float velocityX = actualX - desiredX;
+                const float velocityY = actualY - desiredY;
+                score += 4.0F *
+                    (velocityX * velocityX + velocityY * velocityY);
+            }
+            if (actual.rotationValid && desired.rotationValid &&
+                previousActual.rotationValid &&
+                previousDesired.rotationValid) {
+                const float actualRate = WrappedAngleDelta(
+                    actual.angleRadians,
+                    previousActual.angleRadians) / span;
+                const float desiredRate = WrappedAngleDelta(
+                    desired.angleRadians,
+                    previousDesired.angleRadians) / span;
+                const float representativeScreenMotion =
+                    0.25F * (actualRate - desiredRate);
+                // Give the explicitly requested patch-rotation rate the same
+                // practical authority as its anchor velocity. The quarter-
+                // screen radius converts angular rate to screen-height flow;
+                // the remaining factor prevents translation from masking an
+                // obvious several-degree-per-second rotational mismatch.
+                score += 1024.0F * representativeScreenMotion *
+                    representativeScreenMotion;
+            }
+        }
+        previousDesired = desired;
+        previousActual = actual;
+        previousTime = candidateTime;
+    }
+    return std::isfinite(score)
+               ? score
+               : std::numeric_limits<float>::infinity();
+}
+
+void OptimizePanTerminalCorrectionTangents(
+    AnimationPath* candidate,
+    const std::vector<std::string>& correctionKeyIds,
+    float destinationJoinTime,
+    const AnimationSurfacePatchObservation& destinationPatch,
+    const PreparedAnimationPathEvaluationContext& sourceContext,
+    float sourceTailTime,
+    const AnimationSurfacePatchObservation& sourcePatch,
+    std::uint32_t sampleCount,
+    std::uint32_t sweeps) {
+    if (candidate == nullptr || correctionKeyIds.empty()) {
+        return;
+    }
+    std::vector<float*> variables;
+    variables.reserve(correctionKeyIds.size() * 6U);
+    const auto appendVariables = [&](std::array<float, 3>* values) {
+        for (auto& value : *values) {
+            variables.push_back(&value);
+        }
+    };
+    for (const auto& keyId : correctionKeyIds) {
+        const auto correction = std::find_if(
+            candidate->localizedKeyCorrections.begin(),
+            candidate->localizedKeyCorrections.end(),
+            [&](const auto& value) { return value.keyId == keyId; });
+        if (correction == candidate->localizedKeyCorrections.end()) {
+            return;
+        }
+        appendVariables(&correction->cameraCorrectionTangent);
+        appendVariables(&correction->focusCorrectionTangent);
+    }
+
+    const float extensionSeconds = std::max(
+        1.0F / kAnimationFramesPerSecond,
+        AnimationPathDurationSeconds(*candidate) - destinationJoinTime);
+    const auto joinEvaluation = EvaluateAnimationPath(
+        *candidate,
+        destinationJoinTime);
+    float step = std::clamp(
+        0.20F * joinEvaluation.focusDistance / extensionSeconds,
+        0.01F,
+        10.0F);
+    float bestScore = PanTerminalTangentScore(
+        *candidate,
+        destinationJoinTime,
+        destinationPatch,
+        sourceContext,
+        sourceTailTime,
+        sourcePatch,
+        sampleCount);
+    const std::uint32_t passCount = std::clamp(
+        std::max(sweeps, 48U),
+        1U,
+        48U);
+    for (std::uint32_t pass = 0U; pass < passCount; ++pass) {
+        bool improved = false;
+        for (std::size_t variableIndex = 0U;
+             variableIndex < variables.size();
+             ++variableIndex) {
+            float* value = variables[variableIndex];
+            const float original = *value;
+            float selected = original;
+            float selectedScore = bestScore;
+            for (const float direction : {-1.0F, 1.0F}) {
+                *value = original + direction * step;
+                const float score = PanTerminalTangentScore(
+                    *candidate,
+                    destinationJoinTime,
+                    destinationPatch,
+                    sourceContext,
+                    sourceTailTime,
+                    sourcePatch,
+                    sampleCount);
+                if (score + 1.0e-10F < selectedScore) {
+                    selected = *value;
+                    selectedScore = score;
+                }
+            }
+            *value = selected;
+            if (selectedScore + 1.0e-10F < bestScore) {
+                bestScore = selectedScore;
+                improved = true;
+            }
+        }
+        step *= improved ? 0.82F : 0.5F;
+        if (step <= 1.0e-5F) {
+            break;
+        }
+    }
+}
+
+void RetimeAnimationPathLegacyWaterTracks(
+    AnimationPath* path,
+    std::uint32_t sourceDurationFrames,
+    std::uint32_t destinationDurationFrames) {
+    if (path == nullptr || sourceDurationFrames == 0U ||
+        destinationDurationFrames == 0U) {
+        return;
+    }
+    const double scale =
+        static_cast<double>(sourceDurationFrames) /
+        static_cast<double>(destinationDurationFrames);
+    const auto retimePosition = [scale](float position) {
+        const double finitePosition = std::isfinite(position)
+                                          ? static_cast<double>(position)
+                                          : 0.0;
+        return static_cast<float>(std::clamp(
+            finitePosition * scale,
+            0.0,
+            1.0));
+    };
+    for (auto& track : path->waterScenarioTracks) {
+        for (auto& key : track.keys) {
+            key.position = retimePosition(key.position);
+        }
+        for (auto& nodeTrack : track.seepageNodeTracks) {
+            for (auto& key : nodeTrack.keys) {
+                key.position = retimePosition(key.position);
+            }
+        }
+        for (auto& assignment : track.timingAssignments) {
+            for (auto& key : assignment.fallbackRun.keys) {
+                key.position = retimePosition(key.position);
+            }
+        }
+    }
+}
+
+std::size_t CountPanInteriorKeys(
+    const AnimationPath& path,
+    std::uint32_t tailFrame) {
+    const auto durations = BuildSegmentDurations(path);
+    std::uint32_t frame = 0U;
+    std::size_t count = 0U;
+    for (const auto duration : durations) {
+        frame += duration;
+        if (frame > 0U && frame < tailFrame) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+std::size_t CountPanScreenInflections(
+    const PreparedAnimationPathEvaluationContext& context,
+    std::uint32_t tailFrame,
+    const AnimationSurfacePatchObservation& patch) {
+    if (tailFrame == 0U) {
+        return 0U;
+    }
+    const std::uint32_t sampleCount = static_cast<std::uint32_t>(
+        std::clamp<std::uint64_t>(
+            static_cast<std::uint64_t>(tailFrame) + 1U,
+            5U,
+            65U));
+    std::vector<std::array<float, 2>> anchors;
+    anchors.reserve(sampleCount);
+    for (std::uint32_t sample = 0U; sample < sampleCount; ++sample) {
+        const float amount = static_cast<float>(sample) /
+            static_cast<float>(sampleCount - 1U);
+        const float frame = static_cast<float>(tailFrame) * amount;
+        const auto descriptor = DescribePreparedPanPatch(
+            context,
+            frame / kAnimationFramesPerSecond,
+            patch);
+        if (!descriptor.valid) {
+            return 0U;
+        }
+        anchors.push_back(descriptor.anchor);
+    }
+
+    constexpr float kMotionEpsilon = 1.0e-7F;
+    int previousCurvatureSign = 0;
+    std::size_t inflections = 0U;
+    for (std::size_t index = 2U; index < anchors.size(); ++index) {
+        const std::array<float, 2> firstVelocity{
+            anchors[index - 1U][0U] - anchors[index - 2U][0U],
+            anchors[index - 1U][1U] - anchors[index - 2U][1U],
+        };
+        const std::array<float, 2> secondVelocity{
+            anchors[index][0U] - anchors[index - 1U][0U],
+            anchors[index][1U] - anchors[index - 1U][1U],
+        };
+        const float firstLength = std::hypot(
+            firstVelocity[0U],
+            firstVelocity[1U]);
+        const float secondLength = std::hypot(
+            secondVelocity[0U],
+            secondVelocity[1U]);
+        if (firstLength <= kMotionEpsilon || secondLength <= kMotionEpsilon) {
+            continue;
+        }
+        const float directionDot =
+            (firstVelocity[0U] * secondVelocity[0U] +
+             firstVelocity[1U] * secondVelocity[1U]) /
+            (firstLength * secondLength);
+        if (directionDot < -0.05F) {
+            ++inflections;
+            previousCurvatureSign = 0;
+            continue;
+        }
+        const float normalizedCross =
+            (firstVelocity[0U] * secondVelocity[1U] -
+             firstVelocity[1U] * secondVelocity[0U]) /
+            (firstLength * secondLength);
+        const int curvatureSign = normalizedCross > 1.0e-3F
+                                      ? 1
+                                  : normalizedCross < -1.0e-3F
+                                      ? -1
+                                      : 0;
+        if (curvatureSign == 0) {
+            continue;
+        }
+        if (previousCurvatureSign != 0 &&
+            curvatureSign != previousCurvatureSign) {
+            ++inflections;
+        }
+        previousCurvatureSign = curvatureSign;
+    }
+    return inflections;
+}
+
+
+float PanCubicContinuationValue(
+    float startValue,
+    float startDerivative,
+    float startSecondDerivative,
+    float endValue,
+    float totalSpan,
+    float offset) {
+    const float cubic =
+        (endValue - startValue - startDerivative * totalSpan -
+         0.5F * startSecondDerivative * totalSpan * totalSpan) /
+        (totalSpan * totalSpan * totalSpan);
+    return startValue + startDerivative * offset +
+           0.5F * startSecondDerivative * offset * offset +
+           cubic * offset * offset * offset;
+}
+
+float PanCubicContinuationDerivative(
+    float startValue,
+    float startDerivative,
+    float startSecondDerivative,
+    float endValue,
+    float totalSpan,
+    float offset) {
+    const float cubic =
+        (endValue - startValue - startDerivative * totalSpan -
+         0.5F * startSecondDerivative * totalSpan * totalSpan) /
+        (totalSpan * totalSpan * totalSpan);
+    return startDerivative + startSecondDerivative * offset +
+           3.0F * cubic * offset * offset;
+}
+
+bool AppendPanTerminal(
+    const AnimationPath& destination,
+    const AnimationPath& source,
+    const AnimationTerminalExtensionSpec& specification,
+    const AnimationReciprocalPanExtensionOptions& options,
+    AnimationPath* candidate,
+    PanTerminalBuildMetrics* metrics,
+    std::string* errorMessage) {
+    if (candidate == nullptr || metrics == nullptr) {
+        return false;
+    }
+
+    const std::uint32_t sourceFrames = std::max(
+        source.durationFrames,
+        MinimumAnimationDurationFrames(source));
+    if (specification.sourceTailFrame < 2U ||
+        specification.sourceTailFrame > sourceFrames) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The inward source frame must be at least two frames after the frame-zero seam and remain inside the source animation.";
+        }
+        return false;
+    }
+    if (!ValidOrderedPanTriangle(specification.sourcePatch) ||
+        !ValidOrderedPanTriangle(specification.destinationEndPatch)) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "Each seam needs an ordered, finite three-point source and destination patch.";
+        }
+        return false;
+    }
+
+    const auto destinationContext = PrepareAnimationPathEvaluation(destination);
+    const auto sourceContext = PrepareAnimationPathEvaluation(source);
+    if (!destinationContext.valid || destinationContext.singleKey ||
+        !sourceContext.valid || sourceContext.singleKey) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Both source paths must prepare as multi-key animations.";
+        }
+        return false;
+    }
+
+    const auto sourceDurations = BuildSegmentDurations(source);
+    const std::uint32_t maximumStableTailFrame =
+        source.keys.size() == 2U
+            ? sourceFrames - 1U
+            : static_cast<std::uint32_t>(std::accumulate(
+                  sourceDurations.begin(),
+                  sourceDurations.end() - 1,
+                  std::uint64_t{0U}));
+    if (specification.sourceTailFrame > maximumStableTailFrame) {
+        if (errorMessage != nullptr) {
+            *errorMessage = source.keys.size() == 2U
+                ? "A two-key source tail must stop at least one frame before the animation end."
+                : "The inward source frame must not pass its penultimate camera key, because the reciprocal seam may adjust the original final segment.";
+        }
+        return false;
+    }
+
+    const std::size_t interiorKeyCount = CountPanInteriorKeys(
+        source,
+        specification.sourceTailFrame);
+    const std::size_t inflectionCount = CountPanScreenInflections(
+        sourceContext,
+        specification.sourceTailFrame,
+        specification.sourcePatch);
+    const std::uint32_t appendedKeyCount =
+        (interiorKeyCount > 0U || inflectionCount > 0U) &&
+                specification.sourceTailFrame >= 3U
+            ? 3U
+            : 2U;
+
+    const auto destinationDurations = BuildSegmentDurations(destination);
+    const std::uint64_t oldFrames64 = std::accumulate(
+        destinationDurations.begin(),
+        destinationDurations.end(),
+        std::uint64_t{0U});
+    const std::uint32_t extensionFrames = specification.sourceTailFrame;
+    if (oldFrames64 == 0U ||
+        oldFrames64 + extensionFrames >
+            std::numeric_limits<std::uint32_t>::max()) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The reciprocal extension would overflow the animation frame count.";
+        }
+        return false;
+    }
+    const std::uint32_t oldFrames = static_cast<std::uint32_t>(oldFrames64);
+    const float sourceTailTime =
+        static_cast<float>(extensionFrames) / kAnimationFramesPerSecond;
+    const float destinationEndTime = destinationContext.durationSeconds;
+    const auto sourceStart = EvaluatePreparedAnimationPath(sourceContext, 0.0F);
+    const auto sourceStartDescriptor = DescribePanPatch(
+        sourceStart,
+        specification.sourcePatch);
+    const auto sourceTailDescriptor = DescribePreparedPanPatch(
+        sourceContext,
+        sourceTailTime,
+        specification.sourcePatch);
+    const auto destinationEnd = EvaluatePreparedAnimationPath(
+        destinationContext,
+        destinationEndTime);
+    const auto destinationBeforeDescriptor = DescribePanPatch(
+        destinationEnd,
+        specification.destinationEndPatch);
+    if (!sourceStartDescriptor.valid || !sourceStartDescriptor.rotationValid ||
+        !sourceTailDescriptor.valid || !sourceTailDescriptor.rotationValid ||
+        !destinationBeforeDescriptor.valid ||
+        !destinationBeforeDescriptor.rotationValid) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "A seam triangle is degenerate or falls behind a source or destination camera.";
+        }
+        return false;
+    }
+
+    const auto patchSimilarity = BuildPanTriangleSimilarity(
+        specification.sourcePatch,
+        specification.destinationEndPatch);
+    if (!patchSimilarity.valid) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "The corresponding seam triangles cannot define a stable local transform.";
+        }
+        return false;
+    }
+    const glm::vec3 alignedCameraSeed = TransformPanSimilarityPoint(
+        patchSimilarity,
+        ToGlm(sourceStart.camera.position));
+    const glm::vec3 alignedFocusSeed = TransformPanSimilarityPoint(
+        patchSimilarity,
+        ToGlm(sourceStart.focusPoint));
+    std::array<float, 3> alignedEndCamera{
+        alignedCameraSeed.x,
+        alignedCameraSeed.y,
+        alignedCameraSeed.z};
+    std::array<float, 3> alignedEndFocus{
+        alignedFocusSeed.x,
+        alignedFocusSeed.y,
+        alignedFocusSeed.z};
+    OptimizePanEndpointPose(
+        &alignedEndCamera,
+        &alignedEndFocus,
+        destination.keys.back(),
+        specification.destinationEndPatch,
+        sourceStartDescriptor,
+        std::max(options.optimizationSweeps, 48U));
+    const auto alignedDescriptor = DescribePanPatch(
+        PanEvaluationFromPose(
+            alignedEndCamera,
+            alignedEndFocus,
+            destination.keys.back()),
+        specification.destinationEndPatch);
+    if (!alignedDescriptor.valid) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "The destination terminal patch could not be aligned.";
+        }
+        return false;
+    }
+
+    const glm::quat sourceToDestination = patchSimilarity.rotation;
+    const float sourceToDestinationScale = patchSimilarity.scale;
+    std::vector<std::uint32_t> cumulativeFrames;
+    cumulativeFrames.reserve(appendedKeyCount);
+    std::uint32_t previousCumulative = 0U;
+    for (std::uint32_t keyIndex = 1U;
+         keyIndex <= appendedKeyCount;
+         ++keyIndex) {
+        std::uint32_t cumulative = static_cast<std::uint32_t>(
+            (static_cast<std::uint64_t>(keyIndex) * extensionFrames +
+             appendedKeyCount / 2U) /
+            appendedKeyCount);
+        cumulative = std::clamp(
+            cumulative,
+            previousCumulative + 1U,
+            extensionFrames - (appendedKeyCount - keyIndex));
+        cumulativeFrames.push_back(cumulative);
+        previousCumulative = cumulative;
+    }
+    cumulativeFrames.back() = extensionFrames;
+
+    std::vector<std::array<float, 3>> actualCameras;
+    std::vector<std::array<float, 3>> actualFocusPoints;
+    actualCameras.reserve(appendedKeyCount);
+    actualFocusPoints.reserve(appendedKeyCount);
+    for (const std::uint32_t frame : cumulativeFrames) {
+        const float sourceTime =
+            static_cast<float>(frame) / kAnimationFramesPerSecond;
+        const auto sourceSample = EvaluatePreparedAnimationPath(
+            sourceContext,
+            sourceTime);
+        const auto desiredDescriptor = DescribePanPatch(
+            sourceSample,
+            specification.sourcePatch);
+        if (!desiredDescriptor.valid || !desiredDescriptor.rotationValid) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "The source seam triangle becomes degenerate during the selected inward motion.";
+            }
+            return false;
+        }
+        const glm::vec3 seededCamera = ToGlm(alignedEndCamera) +
+            sourceToDestinationScale * sourceToDestination *
+                (ToGlm(sourceSample.camera.position) -
+                 ToGlm(sourceStart.camera.position));
+        const glm::vec3 seededFocus = ToGlm(alignedEndFocus) +
+            sourceToDestinationScale * sourceToDestination *
+                (ToGlm(sourceSample.focusPoint) - ToGlm(sourceStart.focusPoint));
+        std::array<float, 3> camera{
+            seededCamera.x,
+            seededCamera.y,
+            seededCamera.z};
+        std::array<float, 3> focus{
+            seededFocus.x,
+            seededFocus.y,
+            seededFocus.z};
+        OptimizePanEndpointPose(
+            &camera,
+            &focus,
+            destination.keys.back(),
+            specification.destinationEndPatch,
+            desiredDescriptor,
+            std::max(options.optimizationSweeps, 48U));
+        actualCameras.push_back(camera);
+        actualFocusPoints.push_back(focus);
+    }
+
+    const float previousGeometrySpan =
+        destinationContext.geometryKnots.back() -
+        destinationContext.geometryKnots[
+            destinationContext.geometryKnots.size() - 2U];
+    const float previousTimeSpan =
+        destinationContext.knots.back() -
+        destinationContext.knots[destinationContext.knots.size() - 2U];
+    const float extensionSeconds = sourceTailTime;
+    const float geometryTimeVelocity = previousTimeSpan > 1.0e-6F
+                                           ? previousGeometrySpan /
+                                                 previousTimeSpan
+                                           : 0.0F;
+    const float geometrySpan = geometryTimeVelocity * extensionSeconds;
+    if (!std::isfinite(geometrySpan) || geometrySpan <= 1.0e-6F) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "The destination's final spatial segment is degenerate.";
+        }
+        return false;
+    }
+
+    *candidate = destination;
+    candidate->sourceSchemaVersion = 22U;
+    MaterializePanCorrectionTangents(candidate, destinationContext);
+    for (std::size_t segment = 0U;
+         segment < destinationDurations.size();
+         ++segment) {
+        candidate->keys[segment + 1U].durationFrames =
+            destinationDurations[segment];
+        candidate->keys[segment + 1U].splineParameterWeight =
+            destinationContext.geometryKnots[segment + 1U] -
+            destinationContext.geometryKnots[segment];
+    }
+    candidate->durationFrames = oldFrames + extensionFrames;
+    const std::uint32_t sourceTrackDurationFrames =
+        candidate->authoredTrackDurationFrames == 0U
+            ? oldFrames
+            : std::clamp(
+                  candidate->authoredTrackDurationFrames,
+                  1U,
+                  oldFrames);
+    RetimeAnimationPathLegacyWaterTracks(
+        candidate,
+        sourceTrackDurationFrames,
+        candidate->durationFrames);
+    // Nonzero values are accepted only as a one-time schema-22 migration
+    // source. New candidates store ordinary normalized positions directly.
+    candidate->authoredTrackDurationFrames = 0U;
+    candidate->keys.back().cameraPosition = alignedEndCamera;
+    candidate->keys.back().focusPoint = alignedEndFocus;
+    candidate->keys.back().hasOrientation = false;
+
+    auto& firstKey = candidate->keys.front();
+    firstKey.hasSplineEndpointTangent = true;
+    firstKey.splineCameraEndpointTangent =
+        PreparedSplineEndpointDerivative(destinationContext, true, true);
+    firstKey.splineFocusEndpointTangent =
+        PreparedSplineEndpointDerivative(destinationContext, false, true);
+    const auto firstEndpointDerivative = [&](const auto& spline) {
+        return EvaluatePreparedScalarSplineEndpointDerivative(
+            destinationContext.geometryKnots,
+            spline,
+            true);
+    };
+    firstKey.splineLensEndpointTangent = {
+        firstEndpointDerivative(destinationContext.fovDegrees),
+        firstEndpointDerivative(destinationContext.nearPlane),
+        firstEndpointDerivative(destinationContext.farPlane),
+        firstEndpointDerivative(destinationContext.focusDistance),
+        firstEndpointDerivative(destinationContext.apertureFStopsSpline),
+    };
+    firstKey.splineOrientationEndpointTangent = {
+        firstEndpointDerivative(destinationContext.orientationX),
+        firstEndpointDerivative(destinationContext.orientationY),
+        firstEndpointDerivative(destinationContext.orientationZ),
+        firstEndpointDerivative(destinationContext.orientationW),
+    };
+
+    const auto oldBaseCamera = PreparedSplineEndpointValue(
+        destinationContext,
+        true);
+    const auto oldBaseFocus = PreparedSplineEndpointValue(
+        destinationContext,
+        false);
+    const auto oldCameraDerivative = PreparedSplineEndpointDerivative(
+        destinationContext,
+        true,
+        false);
+    const auto oldFocusDerivative = PreparedSplineEndpointDerivative(
+        destinationContext,
+        false,
+        false);
+    const auto oldCameraSecond = PreparedSplineEndpointSecondDerivative(
+        destinationContext,
+        true);
+    const auto oldFocusSecond = PreparedSplineEndpointSecondDerivative(
+        destinationContext,
+        false);
+    std::array<float, 3> continuationEndCamera{};
+    std::array<float, 3> continuationEndFocus{};
+    for (std::size_t component = 0U; component < 3U; ++component) {
+        continuationEndCamera[component] = oldBaseCamera[component] +
+            oldCameraDerivative[component] * geometrySpan +
+            0.5F * oldCameraSecond[component] * geometrySpan * geometrySpan;
+        continuationEndFocus[component] = oldBaseFocus[component] +
+            oldFocusDerivative[component] * geometrySpan +
+            0.5F * oldFocusSecond[component] * geometrySpan * geometrySpan;
+    }
+
+    std::vector<std::array<float, 3>> baseCameras;
+    std::vector<std::array<float, 3>> baseFocusPoints;
+    std::vector<std::string> correctionKeyIds;
+    baseCameras.reserve(appendedKeyCount);
+    baseFocusPoints.reserve(appendedKeyCount);
+    correctionKeyIds.reserve(appendedKeyCount + 1U);
+    correctionKeyIds.push_back(destination.keys.back().id);
+    previousCumulative = 0U;
+    for (std::size_t index = 0U; index < cumulativeFrames.size(); ++index) {
+        const std::uint32_t cumulative = cumulativeFrames[index];
+        const std::uint32_t incomingFrames = cumulative - previousCumulative;
+        const float geometryOffset = geometryTimeVelocity *
+            static_cast<float>(cumulative) / kAnimationFramesPerSecond;
+        std::array<float, 3> baseCamera{};
+        std::array<float, 3> baseFocus{};
+        for (std::size_t component = 0U; component < 3U; ++component) {
+            baseCamera[component] = PanCubicContinuationValue(
+                oldBaseCamera[component],
+                oldCameraDerivative[component],
+                oldCameraSecond[component],
+                continuationEndCamera[component],
+                geometrySpan,
+                geometryOffset);
+            baseFocus[component] = PanCubicContinuationValue(
+                oldBaseFocus[component],
+                oldFocusDerivative[component],
+                oldFocusSecond[component],
+                continuationEndFocus[component],
+                geometrySpan,
+                geometryOffset);
+        }
+        baseCameras.push_back(baseCamera);
+        baseFocusPoints.push_back(baseFocus);
+
+        AnimationPathKey key = destination.keys.back();
+        key.id = UniquePanExtensionKeyId(*candidate);
+        key.cameraPosition = actualCameras[index];
+        key.focusPoint = actualFocusPoints[index];
+        key.hasOrientation = false;
+        key.durationFrames = incomingFrames;
+        key.splineParameterWeight = geometryTimeVelocity *
+            static_cast<float>(incomingFrames) /
+            kAnimationFramesPerSecond;
+        key.hasSplineEndpointTangent = false;
+        key.sourceShotName.clear();
+        key.linkedCameraId.clear();
+        key.linkedCameraName.clear();
+        candidate->keys.push_back(key);
+        correctionKeyIds.push_back(key.id);
+        previousCumulative = cumulative;
+    }
+
+    auto& finalKey = candidate->keys.back();
+    finalKey.hasSplineEndpointTangent = true;
+    for (std::size_t component = 0U; component < 3U; ++component) {
+        finalKey.splineCameraEndpointTangent[component] =
+            ExactExtendedEndpointDerivative(
+                oldBaseCamera[component],
+                oldCameraDerivative[component],
+                oldCameraSecond[component],
+                baseCameras.back()[component],
+                geometrySpan);
+        finalKey.splineFocusEndpointTangent[component] =
+            ExactExtendedEndpointDerivative(
+                oldBaseFocus[component],
+                oldFocusDerivative[component],
+                oldFocusSecond[component],
+                baseFocusPoints.back()[component],
+                geometrySpan);
+    }
+    const std::array<float, 5> finalLensValues{
+        finalKey.fovDegrees,
+        finalKey.nearPlane,
+        finalKey.farPlane,
+        ReadFocusDistance(finalKey),
+        ReadApertureFStops(finalKey),
+    };
+    const std::array<const AnimationPreparedScalarSpline*, 5> lensSplines{
+        &destinationContext.fovDegrees,
+        &destinationContext.nearPlane,
+        &destinationContext.farPlane,
+        &destinationContext.focusDistance,
+        &destinationContext.apertureFStopsSpline,
+    };
+    for (std::size_t component = 0U; component < lensSplines.size(); ++component) {
+        const auto& spline = *lensSplines[component];
+        finalKey.splineLensEndpointTangent[component] =
+            ExactExtendedEndpointDerivative(
+                spline.values.back(),
+                EvaluatePreparedScalarSplineEndpointDerivative(
+                    destinationContext.geometryKnots,
+                    spline,
+                    false),
+                spline.secondDerivatives.back(),
+                finalLensValues[component],
+                geometrySpan);
+    }
+    auto finalOrientation = QuaternionToArray(LookAtOrientation(
+        ToGlm(baseCameras.back()),
+        ToGlm(baseFocusPoints.back())));
+    if (glm::dot(
+            QuaternionFromArray(destinationContext.orientationQuaternions.back()),
+            QuaternionFromArray(finalOrientation)) < 0.0F) {
+        for (auto& component : finalOrientation) {
+            component = -component;
+        }
+    }
+    const std::array<const AnimationPreparedScalarSpline*, 4> orientationSplines{
+        &destinationContext.orientationX,
+        &destinationContext.orientationY,
+        &destinationContext.orientationZ,
+        &destinationContext.orientationW,
+    };
+    for (std::size_t component = 0U;
+         component < orientationSplines.size();
+         ++component) {
+        const auto& spline = *orientationSplines[component];
+        finalKey.splineOrientationEndpointTangent[component] =
+            ExactExtendedEndpointDerivative(
+                spline.values.back(),
+                EvaluatePreparedScalarSplineEndpointDerivative(
+                    destinationContext.geometryKnots,
+                    spline,
+                    false),
+                spline.secondDerivatives.back(),
+                finalOrientation[component],
+                geometrySpan);
+    }
+
+    candidate->localizedKeyCorrections.reserve(
+        candidate->localizedKeyCorrections.size() + appendedKeyCount + 1U);
+    auto* oldCorrection = UpsertPanCorrection(
+        candidate,
+        destination.keys.back().id,
+        oldBaseCamera,
+        oldBaseFocus);
+    if (oldCorrection == nullptr) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Could not create the terminal seam correction.";
+        }
+        return false;
+    }
+    oldCorrection->splineCameraPosition = oldBaseCamera;
+    oldCorrection->splineFocusPoint = oldBaseFocus;
+    std::vector<AnimationLocalizedKeyCorrection*> tailCorrections;
+    tailCorrections.reserve(appendedKeyCount + 1U);
+    tailCorrections.push_back(oldCorrection);
+    const std::size_t firstNewKey = candidate->keys.size() - appendedKeyCount;
+    for (std::size_t index = 0U; index < appendedKeyCount; ++index) {
+        auto* correction = UpsertPanCorrection(
+            candidate,
+            candidate->keys[firstNewKey + index].id,
+            baseCameras[index],
+            baseFocusPoints[index]);
+        if (correction == nullptr) {
+            if (errorMessage != nullptr) {
+                *errorMessage = "Could not create an appended tail correction.";
+            }
+            return false;
+        }
+        correction->splineCameraPosition = baseCameras[index];
+        correction->splineFocusPoint = baseFocusPoints[index];
+        tailCorrections.push_back(correction);
+    }
+
+    for (std::size_t correctionIndex = 0U;
+         correctionIndex < tailCorrections.size();
+         ++correctionIndex) {
+        const float sourceTime = correctionIndex == 0U
+                                     ? 0.0F
+                                     : static_cast<float>(
+                                           cumulativeFrames[correctionIndex - 1U]) /
+                                           kAnimationFramesPerSecond;
+        const bool forward = correctionIndex + 1U < tailCorrections.size();
+        auto desiredCameraVelocity = RotatePanVector(
+            sourceToDestination,
+            PanPathPoseDerivative(
+                sourceContext,
+                sourceTime,
+                true,
+                forward));
+        auto desiredFocusVelocity = RotatePanVector(
+            sourceToDestination,
+            PanPathPoseDerivative(
+                sourceContext,
+                sourceTime,
+                false,
+                forward));
+        for (std::size_t component = 0U; component < 3U; ++component) {
+            desiredCameraVelocity[component] *= sourceToDestinationScale;
+            desiredFocusVelocity[component] *= sourceToDestinationScale;
+        }
+        const float geometryOffset = geometryTimeVelocity * sourceTime;
+        auto* correction = tailCorrections[correctionIndex];
+        correction->hasCameraCorrectionTangent = true;
+        correction->hasFocusCorrectionTangent = true;
+        for (std::size_t component = 0U; component < 3U; ++component) {
+            const float baseCameraVelocity = geometryTimeVelocity *
+                PanCubicContinuationDerivative(
+                    oldBaseCamera[component],
+                    oldCameraDerivative[component],
+                    oldCameraSecond[component],
+                    baseCameras.back()[component],
+                    geometrySpan,
+                    geometryOffset);
+            const float baseFocusVelocity = geometryTimeVelocity *
+                PanCubicContinuationDerivative(
+                    oldBaseFocus[component],
+                    oldFocusDerivative[component],
+                    oldFocusSecond[component],
+                    baseFocusPoints.back()[component],
+                    geometrySpan,
+                    geometryOffset);
+            correction->cameraCorrectionTangent[component] =
+                desiredCameraVelocity[component] - baseCameraVelocity;
+            correction->focusCorrectionTangent[component] =
+                desiredFocusVelocity[component] - baseFocusVelocity;
+        }
+    }
+
+    OptimizePanTerminalCorrectionTangents(
+        candidate,
+        correctionKeyIds,
+        destinationEndTime,
+        specification.destinationEndPatch,
+        sourceContext,
+        sourceTailTime,
+        specification.sourcePatch,
+        options.sampleCount,
+        options.optimizationSweeps);
+
+    const auto candidateContext = PrepareAnimationPathEvaluation(*candidate);
+    if (!candidateContext.valid) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "The extended path could not be prepared for evaluation.";
+        }
+        return false;
+    }
+    const auto destinationVelocity = PanPatchVelocity(
+        destinationContext,
+        destinationEndTime,
+        false,
+        specification.destinationEndPatch);
+    const auto sourceVelocity = PanPatchVelocity(
+        sourceContext,
+        0.0F,
+        true,
+        specification.sourcePatch);
+    if (destinationVelocity.valid && sourceVelocity.valid) {
+        metrics->beforeVelocityRms = std::hypot(
+            destinationVelocity.translation[0U] -
+                sourceVelocity.translation[0U],
+            destinationVelocity.translation[1U] -
+                sourceVelocity.translation[1U]);
+        if (destinationVelocity.rotationValid &&
+            sourceVelocity.rotationValid) {
+            metrics->beforeRotationRms = std::abs(
+                destinationVelocity.rotationDegreesPerSecond -
+                sourceVelocity.rotationDegreesPerSecond);
+        }
+    }
+
+    const std::uint32_t samples = std::clamp(
+        options.sampleCount,
+        3U,
+        std::max<std::uint32_t>(3U, extensionFrames + 1U));
+    float anchorSquared = 0.0F;
+    float velocitySquared = 0.0F;
+    float rotationRateSquared = 0.0F;
+    float scalePercentSum = 0.0F;
+    std::size_t scaleSampleCount = 0U;
+    std::size_t descriptorCount = 0U;
+    std::size_t velocityCount = 0U;
+    std::size_t rotationRateCount = 0U;
+    float patchNodeSquared = 0.0F;
+    std::size_t patchNodeCount = 0U;
+    std::array<float, 2> signedVelocitySum{};
+    bool rotationTrackValid = true;
+    float minimumPatchConditioning = 1.0F;
+    PanPatchDescriptor previousDesired;
+    PanPatchDescriptor previousActual;
+    float previousTime = destinationEndTime;
+    for (std::uint32_t sampleIndex = 0U;
+         sampleIndex < samples;
+         ++sampleIndex) {
+        const float amount = static_cast<float>(sampleIndex) /
+            static_cast<float>(samples - 1U);
+        const float sourceTime = sourceTailTime * amount;
+        const float candidateTime = destinationEndTime +
+            extensionSeconds * amount;
+        const auto desired = DescribePreparedPanPatch(
+            sourceContext,
+            sourceTime,
+            specification.sourcePatch);
+        const auto actual = DescribePreparedPanPatch(
+            candidateContext,
+            candidateTime,
+            specification.destinationEndPatch);
+        if (!desired.valid || !actual.valid) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "A tracked seam triangle moved behind a camera during the proposed extension.";
+            }
+            return false;
+        }
+        if (!desired.rotationValid || !actual.rotationValid ||
+            desired.scale <= 1.0e-7F || actual.scale <= 1.0e-7F) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "A tracked seam triangle becomes degenerate or edge-on during the proposed extension.";
+            }
+            return false;
+        }
+        const float xError = actual.anchor[0U] - desired.anchor[0U];
+        const float yError = actual.anchor[1U] - desired.anchor[1U];
+        const float anchorError = std::hypot(xError, yError);
+        anchorSquared += anchorError * anchorError;
+        metrics->anchorOverlayMax = std::max(
+            metrics->anchorOverlayMax,
+            anchorError);
+        for (std::size_t point = 0U;
+             point < actual.projectedPoints.size();
+             ++point) {
+            const float nodeX = actual.projectedPoints[point][0U] -
+                desired.projectedPoints[point][0U];
+            const float nodeY = actual.projectedPoints[point][1U] -
+                desired.projectedPoints[point][1U];
+            const float nodeError = std::hypot(nodeX, nodeY);
+            patchNodeSquared += nodeError * nodeError;
+            metrics->patchNodeOverlayMax = std::max(
+                metrics->patchNodeOverlayMax,
+                nodeError);
+            ++patchNodeCount;
+        }
+        rotationTrackValid = rotationTrackValid &&
+            actual.rotationValid && desired.rotationValid;
+        if (actual.rotationValid && desired.rotationValid) {
+            minimumPatchConditioning = std::min({
+                minimumPatchConditioning,
+                actual.conditioning,
+                desired.conditioning});
+        }
+        if (actual.scale > 1.0e-7F && desired.scale > 1.0e-7F) {
+            scalePercentSum += 100.0F * std::abs(
+                actual.scale / desired.scale - 1.0F);
+            ++scaleSampleCount;
+        }
+        if (sampleIndex > 0U) {
+            const float span = candidateTime - previousTime;
+            const std::array<float, 2> desiredVelocity{
+                (desired.anchor[0U] - previousDesired.anchor[0U]) / span,
+                (desired.anchor[1U] - previousDesired.anchor[1U]) / span,
+            };
+            const std::array<float, 2> actualVelocity{
+                (actual.anchor[0U] - previousActual.anchor[0U]) / span,
+                (actual.anchor[1U] - previousActual.anchor[1U]) / span,
+            };
+            const std::array<float, 2> residual{
+                actualVelocity[0U] - desiredVelocity[0U],
+                actualVelocity[1U] - desiredVelocity[1U],
+            };
+            velocitySquared += residual[0U] * residual[0U] +
+                residual[1U] * residual[1U];
+            signedVelocitySum[0U] += residual[0U];
+            signedVelocitySum[1U] += residual[1U];
+            if (actual.rotationValid && desired.rotationValid &&
+                previousActual.rotationValid &&
+                previousDesired.rotationValid) {
+                const float actualRate = WrappedAngleDelta(
+                    actual.angleRadians,
+                    previousActual.angleRadians) / span;
+                const float desiredRate = WrappedAngleDelta(
+                    desired.angleRadians,
+                    previousDesired.angleRadians) / span;
+                const float residualDegrees = glm::degrees(
+                    actualRate - desiredRate);
+                rotationRateSquared += residualDegrees * residualDegrees;
+                ++rotationRateCount;
+            }
+            ++velocityCount;
+        }
+        previousDesired = desired;
+        previousActual = actual;
+        previousTime = candidateTime;
+        ++descriptorCount;
+    }
+
+    metrics->extensionFrames = extensionFrames;
+    metrics->appendedKeyCount = appendedKeyCount;
+    metrics->sourceInteriorKeyCount = interiorKeyCount;
+    metrics->sourceInflectionCount = inflectionCount;
+    metrics->rotationConstrained = rotationTrackValid;
+    metrics->anchorOverlayRms = descriptorCount > 0U
+                                    ? std::sqrt(
+                                          anchorSquared /
+                                          static_cast<float>(descriptorCount))
+                                    : 0.0F;
+    metrics->patchNodeOverlayRms = patchNodeCount > 0U
+                                       ? std::sqrt(
+                                             patchNodeSquared /
+                                             static_cast<float>(patchNodeCount))
+                                       : 0.0F;
+    metrics->afterVelocityRms = velocityCount > 0U
+                                    ? std::sqrt(
+                                          velocitySquared /
+                                          static_cast<float>(velocityCount))
+                                    : 0.0F;
+    metrics->signedVelocityResidual = velocityCount > 0U
+        ? std::array<float, 2>{
+              signedVelocitySum[0U] / static_cast<float>(velocityCount),
+              signedVelocitySum[1U] / static_cast<float>(velocityCount)}
+        : std::array<float, 2>{};
+    metrics->afterRotationRms = rotationRateCount > 0U
+                                    ? std::sqrt(
+                                          rotationRateSquared /
+                                          static_cast<float>(rotationRateCount))
+                                    : 0.0F;
+    metrics->rotationRateResidual = metrics->afterRotationRms;
+    metrics->perspectiveScaleResidualPercent = scaleSampleCount > 0U
+        ? scalePercentSum / static_cast<float>(scaleSampleCount)
+        : 0.0F;
+    metrics->patchConfidence = rotationTrackValid
+        ? std::clamp(minimumPatchConditioning, 0.0F, 1.0F)
+        : 0.0F;
+    metrics->patchDiagnostic =
+        "Ordered three-point seam patches constrained absolute translation, rotation, and projected-area scale; " +
+        std::to_string(appendedKeyCount) + " tail keys were generated.";
+    if (source.keys.size() == 2U) {
+        metrics->patchDiagnostic +=
+            " The source has only one authored segment, so its inward sample is a documented best fit and stops before the final frame.";
+    }
+    if (interiorKeyCount > 0U) {
+        metrics->patchDiagnostic += " The source interval crosses " +
+            std::to_string(interiorKeyCount) + " authored key(s).";
+    }
+    if (inflectionCount > 0U) {
+        metrics->patchDiagnostic += " The source track contains " +
+            std::to_string(inflectionCount) + " screen-space inflection(s).";
+    }
+
+    const float prefixEnd = destinationContext.knots.size() >= 2U
+                                ? destinationContext.knots[
+                                      destinationContext.knots.size() - 2U]
+                                : 0.0F;
+    for (std::uint32_t sample = 0U; sample <= 128U; ++sample) {
+        const float time = prefixEnd * static_cast<float>(sample) / 128.0F;
+        const auto before = EvaluatePreparedAnimationPath(
+            destinationContext,
+            time);
+        const auto after = EvaluatePreparedAnimationPath(
+            candidateContext,
+            time);
+        metrics->maxPrefixPositionError = std::max(
+            metrics->maxPrefixPositionError,
+            std::max(
+                Distance(before.camera.position, after.camera.position),
+                Distance(before.focusPoint, after.focusPoint)));
+    }
+    const std::size_t oldTerminalIndex = destination.keys.size() - 1U;
+    metrics->formerTerminalCameraMove = Distance(
+        destination.keys.back().cameraPosition,
+        candidate->keys[oldTerminalIndex].cameraPosition);
+    metrics->formerTerminalFocusMove = Distance(
+        destination.keys.back().focusPoint,
+        candidate->keys[oldTerminalIndex].focusPoint);
+    return true;
+}
+
+}  // namespace
+
+AnimationReciprocalPanExtensionResult
+BuildAnimationReciprocalPanExtension(
+    const AnimationPath& first,
+    const AnimationPath& second,
+    const AnimationReciprocalPanExtensionOptions& options) {
+    AnimationReciprocalPanExtensionResult result;
+    if (!std::isfinite(options.aspectRatio) || options.aspectRatio <= 0.0F) {
+        result.errorMessage = "The viewport aspect ratio is invalid.";
+        return result;
+    }
+    if (!FixedLensTargetPanPath(first, &result.errorMessage) ||
+        !FixedLensTargetPanPath(second, &result.errorMessage)) {
+        return result;
+    }
+
+    PanTerminalBuildMetrics firstMetrics;
+    PanTerminalBuildMetrics secondMetrics;
+    AnimationPath firstCandidate;
+    AnimationPath secondCandidate;
+    // Build both from immutable originals. A uses B's observed interval and
+    // B uses A's; neither candidate can influence the reciprocal solve.
+    if (!AppendPanTerminal(
+            first,
+            second,
+            options.secondDrivesFirst,
+            options,
+            &firstCandidate,
+            &firstMetrics,
+            &result.errorMessage) ||
+        !AppendPanTerminal(
+            second,
+            first,
+            options.firstDrivesSecond,
+            options,
+            &secondCandidate,
+            &secondMetrics,
+            &result.errorMessage)) {
+        return result;
+    }
+
+    const std::array<PanTerminalBuildMetrics, 2> metrics{
+        firstMetrics,
+        secondMetrics};
+    for (std::size_t index = 0U; index < metrics.size(); ++index) {
+        result.metrics.extensionFrames[index] =
+            metrics[index].extensionFrames;
+        result.metrics.appendedKeyCount[index] =
+            metrics[index].appendedKeyCount;
+        result.metrics.sourceInteriorKeyCount[index] =
+            metrics[index].sourceInteriorKeyCount;
+        result.metrics.sourceInflectionCount[index] =
+            metrics[index].sourceInflectionCount;
+        result.metrics.rotationConstrained[index] =
+            metrics[index].rotationConstrained;
+        result.metrics.beforeVelocityRmsScreenHeightsPerSecond[index] =
+            metrics[index].beforeVelocityRms;
+        result.metrics.afterVelocityRmsScreenHeightsPerSecond[index] =
+            metrics[index].afterVelocityRms;
+        result.metrics.beforeRotationRmsDegreesPerSecond[index] =
+            metrics[index].beforeRotationRms;
+        result.metrics.afterRotationRmsDegreesPerSecond[index] =
+            metrics[index].afterRotationRms;
+        result.metrics.anchorOverlayRmsScreenHeights[index] =
+            metrics[index].anchorOverlayRms;
+        result.metrics.anchorOverlayMaxScreenHeights[index] =
+            metrics[index].anchorOverlayMax;
+        result.metrics.patchNodeOverlayRmsScreenHeights[index] =
+            metrics[index].patchNodeOverlayRms;
+        result.metrics.patchNodeOverlayMaxScreenHeights[index] =
+            metrics[index].patchNodeOverlayMax;
+        result.metrics.signedVelocityResidualScreenHeightsPerSecond[index] =
+            metrics[index].signedVelocityResidual;
+        result.metrics.rotationRateResidualDegreesPerSecond[index] =
+            metrics[index].rotationRateResidual;
+        result.metrics.perspectiveScaleResidualPercent[index] =
+            metrics[index].perspectiveScaleResidualPercent;
+        result.metrics.patchConfidence[index] =
+            metrics[index].patchConfidence;
+        result.metrics.patchDiagnostic[index] =
+            metrics[index].patchDiagnostic;
+        result.metrics.maxPrefixPositionError[index] =
+            metrics[index].maxPrefixPositionError;
+        result.metrics.formerTerminalCameraMove[index] =
+            metrics[index].formerTerminalCameraMove;
+        result.metrics.formerTerminalFocusMove[index] =
+            metrics[index].formerTerminalFocusMove;
+    }
+    result.succeeded = true;
+    result.changed = true;
+    result.firstCandidate = std::move(firstCandidate);
+    result.secondCandidate = std::move(secondCandidate);
+    return result;
+}
+
+AnimationClipPlaneNormalizationResult
+BuildConservativeAnimationClipPlaneNormalization(
+    const AnimationPath& first,
+    const AnimationPath& second) {
+    AnimationClipPlaneNormalizationResult result;
+    if (first.keys.empty() || second.keys.empty()) {
+        result.errorMessage =
+            "Both animations need at least one camera key before their clip planes can be normalized.";
+        return result;
+    }
+
+    float normalizedNear = std::numeric_limits<float>::infinity();
+    float normalizedFar = 0.0F;
+    std::vector<std::string> linkedCameraIds;
+    std::unordered_set<std::string> seenLinkedCameraIds;
+    const auto inspectPath = [&](const AnimationPath& path) {
+        for (const auto& key : path.keys) {
+            if (!std::isfinite(key.nearPlane) || key.nearPlane <= 0.0F ||
+                !std::isfinite(key.farPlane) ||
+                key.farPlane <= key.nearPlane) {
+                return false;
+            }
+            normalizedNear = std::min(normalizedNear, key.nearPlane);
+            normalizedFar = std::max(normalizedFar, key.farPlane);
+            if (!key.linkedCameraId.empty() &&
+                seenLinkedCameraIds.insert(key.linkedCameraId).second) {
+                linkedCameraIds.push_back(key.linkedCameraId);
+            }
+        }
+        return true;
+    };
+    if (!inspectPath(first) || !inspectPath(second) ||
+        !std::isfinite(normalizedNear) ||
+        !std::isfinite(normalizedFar) ||
+        normalizedFar <= normalizedNear) {
+        result.errorMessage =
+            "Every animation key needs finite clip planes with 0 < near < far before normalization.";
+        return result;
+    }
+
+    result.firstCandidate = first;
+    result.secondCandidate = second;
+    const auto normalizePath = [&](AnimationPath* path) {
+        for (auto& key : path->keys) {
+            result.changed = result.changed ||
+                key.nearPlane != normalizedNear ||
+                key.farPlane != normalizedFar;
+            key.nearPlane = normalizedNear;
+            key.farPlane = normalizedFar;
+            if (key.hasSplineEndpointTangent) {
+                // Lens tangent channels are FOV, near, far, focus distance,
+                // and aperture. Clip normalization must not alter the other
+                // three authored lens channels.
+                result.changed = result.changed ||
+                    key.splineLensEndpointTangent[1U] != 0.0F ||
+                    key.splineLensEndpointTangent[2U] != 0.0F;
+                key.splineLensEndpointTangent[1U] = 0.0F;
+                key.splineLensEndpointTangent[2U] = 0.0F;
+            }
+        }
+    };
+    normalizePath(&result.firstCandidate);
+    normalizePath(&result.secondCandidate);
+    result.succeeded = true;
+    result.nearPlane = normalizedNear;
+    result.farPlane = normalizedFar;
+    result.linkedCameraIds = std::move(linkedCameraIds);
+    return result;
 }
 
 AnimationPathMotionStats MeasurePreparedAnimationPathMotion(
