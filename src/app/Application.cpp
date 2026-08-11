@@ -31220,31 +31220,49 @@ std::optional<std::chrono::steady_clock::duration> AverageExportFrameRenderDurat
     return std::nullopt;
 }
 
-// Frames excluded from pace statistics and graph scaling: the first frames
+constexpr std::size_t kExportFrameTimingWarmupFrames = 10U;
+
+// Frames excluded from pace statistics and graph scaling: the first ten
 // carry pipeline warm-up and pre-queue capture bursts that say nothing
 // about the steady rendering pace.
 std::size_t ExportFrameTimingWarmupCount(std::size_t frameCount) {
-    return frameCount > 4U ? 2U : 0U;
+    return std::min(frameCount, kExportFrameTimingWarmupFrames);
 }
 
-// Robust graph ceiling: the 95th percentile of post-warm-up frame times
-// with headroom, so a single outlier frame cannot flatten every other
-// column to the baseline.
-float ExportFrameDurationDisplayCeiling(const std::vector<float>& durations) {
-    const std::size_t warmup = ExportFrameTimingWarmupCount(durations.size());
-    std::vector<float> usable(
-        durations.begin() + static_cast<std::ptrdiff_t>(warmup),
-        durations.end());
-    if (usable.empty()) {
-        usable = durations;
+// One canonical post-warm-up view is shared by graph bounds, averages, and
+// pace estimation. Passing this already-trimmed span to the bounds helper
+// makes it impossible for an omitted warm-up frame to affect the Y scale.
+std::span<const float> SteadyExportFrameDurations(
+    const std::vector<float>& durations) {
+    return std::span<const float>{durations}.subspan(
+        ExportFrameTimingWarmupCount(durations.size()));
+}
+
+struct ExportFrameDurationDisplayBounds {
+    float minimumSeconds{0.0F};
+    float maximumSeconds{1.0e-3F};
+};
+
+// Tight graph bounds: ten per cent below the fastest post-warm-up frame and
+// ten per cent above the slowest. Warm-up values are never used as a
+// fallback, so the graph has no timing scale until frame eleven completes.
+ExportFrameDurationDisplayBounds ExportFrameDurationBounds(
+    std::span<const float> steadyDurations) {
+    if (steadyDurations.empty()) {
+        return {};
     }
-    if (usable.empty()) {
-        return 1.0e-3F;
-    }
-    std::sort(usable.begin(), usable.end());
-    const float percentile = usable[static_cast<std::size_t>(
-        static_cast<double>(usable.size() - 1U) * 0.95)];
-    return std::max(1.0e-3F, percentile * 1.2F);
+    const auto [minimumIt, maximumIt] =
+        std::minmax_element(
+            steadyDurations.begin(),
+            steadyDurations.end());
+    const float minimumSeconds = std::max(0.0F, *minimumIt * 0.90F);
+    const float maximumSeconds = std::max(
+        minimumSeconds + 1.0e-6F,
+        *maximumIt * 1.10F);
+    return {
+        .minimumSeconds = minimumSeconds,
+        .maximumSeconds = maximumSeconds,
+    };
 }
 
 std::optional<std::chrono::steady_clock::duration> RemainingExportRenderDuration(
@@ -31260,7 +31278,8 @@ std::optional<std::chrono::steady_clock::duration> RemainingExportRenderDuration
     const double remainingFrames =
         std::max(0.0, static_cast<double>(job.frames.size()) - completedFrames);
     const auto& durations = job.frameRenderSeconds;
-    if (durations.size() >= 5U) {
+    const auto steadyDurations = SteadyExportFrameDurations(durations);
+    if (!steadyDurations.empty()) {
         // Weighted recent pace: warm-up frames are ignored, and an
         // exponential moving average (weighted over roughly the last sixty
         // frames) follows drift without the jitter a fitted slope amplifies
@@ -31269,13 +31288,11 @@ std::optional<std::chrono::steady_clock::duration> RemainingExportRenderDuration
         // inflate it, keeps writer stalls and inter-frame overhead counted —
         // that floor is what stops the estimate undershooting the final
         // elapsed time.
-        const std::size_t warmup =
-            ExportFrameTimingWarmupCount(durations.size());
         constexpr double kEmaAlpha = 2.0 / 61.0;
         double weightedPace = 0.0;
         bool seeded = false;
-        for (std::size_t index = warmup; index < durations.size(); ++index) {
-            const double value = durations[index];
+        for (const float seconds : steadyDurations) {
+            const double value = seconds;
             if (!seeded) {
                 weightedPace = value;
                 seeded = true;
@@ -38442,8 +38459,8 @@ void DrawAnimationFramePreviewWindow(
 }
 
 // The render-progress bar drawn as a per-frame duration graph: each
-// completed frame adds a column whose height is its capture time relative
-// to the slowest frame so far, so the fill itself shows pace changes.
+// completed frame adds a column positioned within the steady timing range,
+// so small pace changes remain legible.
 void DrawExportFrameDurationProgressBar(const OfflineRenderJobState& job) {
     const float fraction = ExportRenderProgressFraction(job);
     const ImVec2 size{
@@ -38460,14 +38477,23 @@ void DrawExportFrameDurationProgressBar(const OfflineRenderJobState& job) {
         ImGui::GetColorU32(ImGuiCol_FrameBg),
         rounding);
     const auto& durations = job.frameRenderSeconds;
+    const auto steadyDurations = SteadyExportFrameDurations(durations);
+    const std::size_t warmup = durations.size() - steadyDurations.size();
     const std::size_t totalFrames = std::max<std::size_t>(job.frames.size(), 1U);
     const float width = std::max(1.0F, maximum.x - minimum.x);
     const float height = std::max(1.0F, maximum.y - minimum.y);
-    // Robust ceiling: warm-up outliers clip at the top instead of squashing
-    // every steady frame to the baseline.
-    const float ceiling = ExportFrameDurationDisplayCeiling(durations);
+    const auto bounds = ExportFrameDurationBounds(steadyDurations);
+    const float boundsSpan = std::max(
+        1.0e-6F,
+        bounds.maximumSeconds - bounds.minimumSeconds);
+    const auto durationToHeight = [&](float seconds) {
+        return std::clamp(
+            (seconds - bounds.minimumSeconds) / boundsSpan,
+            0.0F,
+            1.0F);
+    };
     const ImU32 fill = ImGui::GetColorU32(ImGuiCol_PlotHistogram);
-    if (!durations.empty()) {
+    if (!steadyDurations.empty()) {
         const int pixelCount = static_cast<int>(width);
         for (int pixel = 0; pixel < pixelCount; ++pixel) {
             const auto frameBegin = static_cast<std::size_t>(
@@ -38479,7 +38505,8 @@ void DrawExportFrameDurationProgressBar(const OfflineRenderJobState& job) {
             frameEnd = std::max(frameEnd, frameBegin + 1U);
             float bucketSeconds = 0.0F;
             bool bucketHasFrame = false;
-            for (std::size_t frame = frameBegin;
+            for (std::size_t frame =
+                     std::max(frameBegin, warmup);
                  frame < std::min(frameEnd, durations.size());
                  ++frame) {
                 bucketSeconds = std::max(bucketSeconds, durations[frame]);
@@ -38488,10 +38515,7 @@ void DrawExportFrameDurationProgressBar(const OfflineRenderJobState& job) {
             if (!bucketHasFrame) {
                 continue;
             }
-            // The floor keeps fast frames visible so the bar still reads as
-            // filled progress.
-            const float normalized =
-                std::clamp(bucketSeconds / ceiling, 0.10F, 1.0F);
+            const float normalized = durationToHeight(bucketSeconds);
             const float columnTop =
                 maximum.y - 1.0F - normalized * (height - 2.0F);
             drawList->AddRectFilled(
@@ -38504,7 +38528,8 @@ void DrawExportFrameDurationProgressBar(const OfflineRenderJobState& job) {
     }
     // Dim sliver for the frame currently rendering, at the last frame's
     // height, growing with its sample progress.
-    if (durations.size() < totalFrames) {
+    if (!steadyDurations.empty() &&
+        durations.size() < totalFrames) {
         const auto partial =
             static_cast<float>(ExportCurrentFrameSampleFraction(job));
         if (partial > 0.0F) {
@@ -38516,7 +38541,7 @@ void DrawExportFrameDurationProgressBar(const OfflineRenderJobState& job) {
             const float recent =
                 durations.empty()
                     ? 0.6F
-                    : std::clamp(durations.back() / ceiling, 0.10F, 1.0F);
+                    : durationToHeight(durations.back());
             const float columnTop =
                 maximum.y - 1.0F - recent * (height - 2.0F);
             drawList->AddRectFilled(
@@ -38568,9 +38593,10 @@ void DrawExportRenderTimingDetail(const OfflineRenderJobState& job) {
     // Warm-up frames are excluded from every statistic: the first frames
     // carry pipeline warm-up and pre-queue bursts that would otherwise
     // dominate the extremes and the averages.
-    const std::size_t warmup =
-        ExportFrameTimingWarmupCount(durations.size());
-    const std::size_t usableCount = durations.size() - warmup;
+    const auto steadyDurations = SteadyExportFrameDurations(durations);
+    const std::size_t warmup = durations.size() - steadyDurations.size();
+    const std::size_t usableCount = steadyDurations.size();
+    const bool hasSteadySamples = usableCount > 0U;
     float minSeconds = std::numeric_limits<float>::max();
     float maxSeconds = 0.0F;
     std::size_t minFrame = warmup;
@@ -38589,17 +38615,23 @@ void DrawExportRenderTimingDetail(const OfflineRenderJobState& job) {
         totalSeconds += seconds;
     }
     const double overallAverage =
-        totalSeconds / static_cast<double>(std::max<std::size_t>(1U, usableCount));
+        hasSteadySamples
+            ? totalSeconds / static_cast<double>(usableCount)
+            : 0.0;
     const std::size_t recentCount =
-        std::min<std::size_t>(20U, usableCount == 0U ? durations.size() : usableCount);
+        std::min<std::size_t>(20U, usableCount);
     double recentSum = 0.0;
-    for (std::size_t index = durations.size() - recentCount;
-         index < durations.size();
-         ++index) {
-        recentSum += durations[index];
+    if (recentCount > 0U) {
+        for (std::size_t index = durations.size() - recentCount;
+             index < durations.size();
+             ++index) {
+            recentSum += durations[index];
+        }
     }
     const double recentAverage =
-        recentSum / static_cast<double>(recentCount);
+        recentCount > 0U
+            ? recentSum / static_cast<double>(recentCount)
+            : 0.0;
 
     const ImVec2 size{
         std::max(ImGui::GetContentRegionAvail().x, 120.0F),
@@ -38616,12 +38648,13 @@ void DrawExportRenderTimingDetail(const OfflineRenderJobState& job) {
     const float width = std::max(1.0F, maximum.x - minimum.x);
     const float height = std::max(1.0F, maximum.y - minimum.y);
     const std::size_t totalFrames = std::max<std::size_t>(job.frames.size(), 1U);
-    // Robust ceiling: warm-up outliers clip at the top of the graph rather
-    // than compressing the steady frames' fluctuations into a flat line.
-    const float ceiling = ExportFrameDurationDisplayCeiling(durations);
+    const auto bounds = ExportFrameDurationBounds(steadyDurations);
+    const float boundsSpan = std::max(
+        1.0e-6F,
+        bounds.maximumSeconds - bounds.minimumSeconds);
     const auto valueToY = [&](double seconds) {
         const float normalized = std::clamp(
-            static_cast<float>(seconds) / ceiling,
+            (static_cast<float>(seconds) - bounds.minimumSeconds) / boundsSpan,
             0.0F,
             1.0F);
         return maximum.y - 1.0F - normalized * (height - 2.0F);
@@ -38643,7 +38676,8 @@ void DrawExportRenderTimingDetail(const OfflineRenderJobState& job) {
         float bucketMax = 0.0F;
         double bucketSum = 0.0;
         std::size_t bucketCount = 0U;
-        for (std::size_t frame = frameBegin;
+        for (std::size_t frame =
+                 std::max(frameBegin, warmup);
              frame < std::min(frameEnd, durations.size());
              ++frame) {
             bucketMax = std::max(bucketMax, durations[frame]);
@@ -38669,23 +38703,25 @@ void DrawExportRenderTimingDetail(const OfflineRenderJobState& job) {
     }
     // Average guides: overall in muted text colour, recent pace in the
     // hovered-plot accent.
-    const ImU32 overallColour =
-        (ImGui::GetColorU32(ImGuiCol_TextDisabled) & 0x00FFFFFFU) |
-        0xA0000000U;
-    const ImU32 recentColour =
-        ImGui::GetColorU32(ImGuiCol_PlotLinesHovered);
-    const float overallY = valueToY(overallAverage);
-    drawList->AddLine(
-        ImVec2{minimum.x, overallY},
-        ImVec2{maximum.x, overallY},
-        overallColour,
-        1.0F);
-    const float recentY = valueToY(recentAverage);
-    drawList->AddLine(
-        ImVec2{minimum.x, recentY},
-        ImVec2{maximum.x, recentY},
-        recentColour,
-        1.0F);
+    if (hasSteadySamples) {
+        const ImU32 overallColour =
+            (ImGui::GetColorU32(ImGuiCol_TextDisabled) & 0x00FFFFFFU) |
+            0xA0000000U;
+        const ImU32 recentColour =
+            ImGui::GetColorU32(ImGuiCol_PlotLinesHovered);
+        const float overallY = valueToY(overallAverage);
+        drawList->AddLine(
+            ImVec2{minimum.x, overallY},
+            ImVec2{maximum.x, overallY},
+            overallColour,
+            1.0F);
+        const float recentY = valueToY(recentAverage);
+        drawList->AddLine(
+            ImVec2{minimum.x, recentY},
+            ImVec2{maximum.x, recentY},
+            recentColour,
+            1.0F);
+    }
     drawList->AddRect(
         minimum,
         maximum,
@@ -38698,44 +38734,60 @@ void DrawExportRenderTimingDetail(const OfflineRenderJobState& job) {
             0.0F,
             static_cast<float>(totalFrames - 1U)));
         if (frame < durations.size()) {
-            const double deviation =
-                overallAverage > 1.0e-9
-                    ? (durations[frame] / overallAverage - 1.0) * 100.0
-                    : 0.0;
-            ImGui::SetTooltip(
-                "Frame %zu: %s (%+.0f%% vs average)",
-                frame + 1U,
-                formatSeconds(durations[frame]).c_str(),
-                deviation);
+            if (frame < warmup) {
+                ImGui::SetTooltip(
+                    "Frame %zu: %s (warm-up; excluded from scale and statistics)",
+                    frame + 1U,
+                    formatSeconds(durations[frame]).c_str());
+            } else {
+                const double deviation =
+                    overallAverage > 1.0e-9
+                        ? (durations[frame] / overallAverage - 1.0) * 100.0
+                        : 0.0;
+                ImGui::SetTooltip(
+                    "Frame %zu: %s (%+.0f%% vs average)",
+                    frame + 1U,
+                    formatSeconds(durations[frame]).c_str(),
+                    deviation);
+            }
         }
     }
 
-    ImGui::Text(
-        "Last %s  |  Recent avg (%zu) %s  |  Overall avg %s",
-        formatSeconds(durations.back()).c_str(),
-        recentCount,
-        formatSeconds(recentAverage).c_str(),
-        formatSeconds(overallAverage).c_str());
-    if (usableCount > 0U) {
+    if (hasSteadySamples) {
+        ImGui::Text(
+            "Last %s  |  Recent avg (%zu) %s  |  Overall avg %s",
+            formatSeconds(durations.back()).c_str(),
+            recentCount,
+            formatSeconds(recentAverage).c_str(),
+            formatSeconds(overallAverage).c_str());
         ImGui::Text(
             "Fastest %s (frame %zu)  |  Slowest %s (frame %zu)",
             formatSeconds(minSeconds).c_str(),
             minFrame + 1U,
             formatSeconds(maxSeconds).c_str(),
             maxFrame + 1U);
-    }
-    if (warmup > 0U) {
         ImGui::TextDisabled(
-            "First %zu warm-up frame%s excluded from statistics and scale.",
+            "Scale %s - %s (10%% padded); bounds use frames %zu-%zu only "
+            "(%zu warm-up frames excluded before scaling).",
+            formatSeconds(bounds.minimumSeconds).c_str(),
+            formatSeconds(bounds.maximumSeconds).c_str(),
+            warmup + 1U,
+            durations.size(),
+            warmup);
+    } else {
+        ImGui::Text("Last %s", formatSeconds(durations.back()).c_str());
+        ImGui::TextDisabled(
+            "Warm-up: %zu / %zu frames. Timing graph begins with frame %zu.",
             warmup,
-            warmup == 1U ? "" : "s");
+            kExportFrameTimingWarmupFrames,
+            kExportFrameTimingWarmupFrames + 1U);
     }
     const double trendPercent =
         overallAverage > 1.0e-9
             ? (recentAverage / overallAverage - 1.0) * 100.0
             : 0.0;
-    if (durations.size() < 5U) {
-        ImGui::TextDisabled("Trend: gathering frames...");
+    if (usableCount < 5U) {
+        ImGui::TextDisabled("Trend: gathering steady-rate frames...");
     } else if (std::abs(trendPercent) < 3.0) {
         ImGui::TextUnformatted("Trend: holding steady.");
     } else if (trendPercent > 0.0) {
@@ -38827,7 +38879,8 @@ void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
             ImGui::SetTooltip(
                 "Each column is one rendered frame; its height is the "
-                "frame's render time relative to the slowest frame so far.");
+                "frame's render time within the post-warm-up min/max range. "
+                "Warm-up frames are omitted.");
         }
         ImGui::Text(
             "Captured: %u / %zu",
