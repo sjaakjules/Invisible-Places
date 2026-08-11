@@ -9693,6 +9693,45 @@ std::optional<ProjectedPoint> ProjectWorldPoint(
     };
 }
 
+// Unlike ProjectWorldPoint, this keeps finite points which are in front of the
+// camera even when their projection falls beyond the image bounds or clip
+// range. Correspondence overlays use it so a tracked world-space triangle can
+// leave frame continuously without snapping back to its last clicked screen
+// coordinate. The render-viewport clip rect still prevents drawing over the
+// surrounding UI.
+std::optional<ProjectedPoint> ProjectWorldPointBeyondViewport(
+    const invisible_places::camera::OrbitCameraMatrices& matrices,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    const glm::vec3& worldPoint) {
+    const auto viewportSize = CurrentUiViewportSize(viewport);
+    const auto viewportOrigin = CurrentUiViewportOrigin();
+    const float viewportWidth = std::max(1.0F, viewportSize.x);
+    const float viewportHeight = std::max(1.0F, viewportSize.y);
+    const glm::vec4 clip =
+        matrices.viewProjection * glm::vec4{worldPoint, 1.0F};
+    if (!std::isfinite(clip.x) || !std::isfinite(clip.y) ||
+        !std::isfinite(clip.z) || !std::isfinite(clip.w) ||
+        clip.w <= 1.0e-6F) {
+        return std::nullopt;
+    }
+
+    const glm::vec3 ndc = glm::vec3{clip} / clip.w;
+    if (!std::isfinite(ndc.x) || !std::isfinite(ndc.y) ||
+        !std::isfinite(ndc.z)) {
+        return std::nullopt;
+    }
+    return ProjectedPoint{
+        .screen =
+            ImVec2{
+                viewportOrigin.x +
+                    ((ndc.x * 0.5F + 0.5F) * viewportWidth),
+                viewportOrigin.y +
+                    ((ndc.y * 0.5F + 0.5F) * viewportHeight),
+            },
+        .depth = ndc.z,
+    };
+}
+
 std::optional<ScreenRay> MakeScreenRay(
     const invisible_places::camera::OrbitCameraMatrices& matrices,
     const invisible_places::renderer::core::VulkanViewportShell& viewport,
@@ -44266,10 +44305,57 @@ void DrawReciprocalPanViewportOverlay(
     }
     const auto origin = CurrentUiViewportOrigin();
     const auto size = CurrentUiViewportSize(viewport);
-    const auto screenFromNormalized = [&](ImVec2 point) {
+    const ImVec2 viewportMaximum{origin.x + size.x, origin.y + size.y};
+    const ImVec2 viewportCenter{
+        origin.x + size.x * 0.5F,
+        origin.y + size.y * 0.5F,
+    };
+    const auto pointInsideViewport = [&](ImVec2 point) {
+        return point.x >= origin.x && point.x <= viewportMaximum.x &&
+               point.y >= origin.y && point.y <= viewportMaximum.y;
+    };
+    const auto indicatorAtViewportEdge = [&](ImVec2 point)
+        -> std::optional<ImVec2> {
+        if (pointInsideViewport(point)) {
+            return std::nullopt;
+        }
+        const ImVec2 direction{
+            point.x - viewportCenter.x,
+            point.y - viewportCenter.y,
+        };
+        if (!std::isfinite(direction.x) || !std::isfinite(direction.y) ||
+            (std::abs(direction.x) <= 1.0e-6F &&
+             std::abs(direction.y) <= 1.0e-6F)) {
+            return std::nullopt;
+        }
+        constexpr float inset = 10.0F;
+        float scale = std::numeric_limits<float>::infinity();
+        if (direction.x > 1.0e-6F) {
+            scale = std::min(
+                scale,
+                (viewportMaximum.x - inset - viewportCenter.x) /
+                    direction.x);
+        } else if (direction.x < -1.0e-6F) {
+            scale = std::min(
+                scale,
+                (origin.x + inset - viewportCenter.x) / direction.x);
+        }
+        if (direction.y > 1.0e-6F) {
+            scale = std::min(
+                scale,
+                (viewportMaximum.y - inset - viewportCenter.y) /
+                    direction.y);
+        } else if (direction.y < -1.0e-6F) {
+            scale = std::min(
+                scale,
+                (origin.y + inset - viewportCenter.y) / direction.y);
+        }
+        if (!std::isfinite(scale) || scale < 0.0F) {
+            return std::nullopt;
+        }
         return ImVec2{
-            origin.x + std::clamp(point.x, 0.0F, 1.0F) * size.x,
-            origin.y + std::clamp(point.y, 0.0F, 1.0F) * size.y,
+            viewportCenter.x + direction.x * scale,
+            viewportCenter.y + direction.y * scale,
         };
     };
     static constexpr const char* kTriangleLabels[] = {
@@ -44301,16 +44387,16 @@ void DrawReciprocalPanViewportOverlay(
             3U);
         for (std::size_t node = 0U; node < pointCount; ++node) {
             const auto& point = triangle.patch.worldPoints[node];
-            const auto projected = ProjectWorldPoint(
+            const auto projected = ProjectWorldPointBeyondViewport(
                 matrices,
                 viewport,
                 glm::vec3{point[0U], point[1U], point[2U]});
             projectedPoints[triangleIndex][node] =
                 projected.has_value()
                     ? std::optional<ImVec2>{projected->screen}
-                    : std::optional<ImVec2>{screenFromNormalized(
-                          triangle.normalizedScreens[node])};
+                    : std::nullopt;
         }
+        drawList->PushClipRect(origin, viewportMaximum, true);
         if (pointCount >= 2U) {
             for (std::size_t node = 1U; node < pointCount; ++node) {
                 if (projectedPoints[triangleIndex][node - 1U].has_value() &&
@@ -44337,6 +44423,9 @@ void DrawReciprocalPanViewportOverlay(
                 continue;
             }
             const ImVec2 point = projectedPoints[triangleIndex][node].value();
+            if (!pointInsideViewport(point)) {
+                continue;
+            }
             const bool selected = triangleIndex == activeTriangle &&
                                   static_cast<int>(node) ==
                                       wizard.selectedNodeIndex;
@@ -44358,6 +44447,50 @@ void DrawReciprocalPanViewportOverlay(
                 ImVec2{point.x + 10.0F, point.y - 18.0F},
                 IM_COL32(255, 255, 255, 245),
                 label.c_str());
+        }
+        drawList->PopClipRect();
+
+        // The point remains at its true world-space projection. A hollow edge
+        // marker merely indicates which way it has left the image; it is never
+        // used by hit testing or by the reciprocal fit.
+        if (triangleIndex == activeTriangle) {
+            for (std::size_t node = 0U; node < pointCount; ++node) {
+                if (!projectedPoints[triangleIndex][node].has_value()) {
+                    continue;
+                }
+                const auto edge = indicatorAtViewportEdge(
+                    projectedPoints[triangleIndex][node].value());
+                if (!edge.has_value()) {
+                    continue;
+                }
+                drawList->AddCircle(
+                    edge.value(),
+                    6.0F,
+                    triangleColors[triangleIndex],
+                    16,
+                    2.0F);
+                const std::string label =
+                    std::string{kNodeLabels[node]} + " off-screen";
+                const ImVec2 labelSize = ImGui::CalcTextSize(label.c_str());
+                const ImVec2 labelPosition{
+                    std::clamp(
+                        edge->x + 9.0F,
+                        origin.x + 4.0F,
+                        std::max(
+                            origin.x + 4.0F,
+                            viewportMaximum.x - labelSize.x - 4.0F)),
+                    std::clamp(
+                        edge->y - labelSize.y * 0.5F,
+                        origin.y + 4.0F,
+                        std::max(
+                            origin.y + 4.0F,
+                            viewportMaximum.y - labelSize.y - 4.0F)),
+                };
+                drawList->AddText(
+                    labelPosition,
+                    triangleColors[triangleIndex],
+                    label.c_str());
+            }
         }
     }
 
@@ -52628,6 +52761,10 @@ void DrawReciprocalPanWizard(
             "Cancelled Reciprocal Pan Extension; the launch view was restored.");
         return;
     }
+    struct ScopedWizardTextWrap {
+        ScopedWizardTextWrap() { ImGui::PushTextWrapPos(0.0F); }
+        ~ScopedWizardTextWrap() { ImGui::PopTextWrapPos(); }
+    } textWrap;
     ImGui::SeparatorText("Reciprocal Pan Extension");
     ImGui::TextUnformatted(ReciprocalPanWizardStageLabel(wizard.stage));
     ImGui::TextWrapped(
@@ -52676,9 +52813,12 @@ void DrawReciprocalPanWizard(
         const int maximumFrame = static_cast<int>(
             ReciprocalPanSourceTailMaximumFrame(
                 wizard.baselinePaths[sourceRole]));
+        ImGui::TextDisabled(
+            role == 0 ? "A opening-span end frame (drives B tail)"
+                      : "B opening-span end frame (drives A tail)");
+        ImGui::SetNextItemWidth(-FLT_MIN);
         if (ImGui::SliderInt(
-                role == 0 ? "A opening-span end frame (drives B tail)"
-                          : "B opening-span end frame (drives A tail)",
+                "##ReciprocalPanSourceSpan",
                 &frame,
                 2,
                 maximumFrame)) {
@@ -52719,8 +52859,11 @@ void DrawReciprocalPanWizard(
         if (!wizard.inspectionActive) {
             inspectFrame = static_cast<int>(ReciprocalPanStageFrame(wizard));
         }
+        ImGui::TextDisabled(
+            role == 0 ? "Inspect A frame" : "Inspect B frame");
+        ImGui::SetNextItemWidth(-FLT_MIN);
         if (ImGui::SliderInt(
-                role == 0 ? "Inspect A frame" : "Inspect B frame",
+                "##ReciprocalPanInspectFrame",
                 &inspectFrame,
                 0,
                 static_cast<int>(ReciprocalPanPathFrameCount(path)))) {
@@ -52831,8 +52974,10 @@ void DrawReciprocalPanWizard(
             int offsetFrame = static_cast<int>(std::min(
                 wizard.seamReviewOffsetFrame,
                 wizard.sourceTailFrames[sourceRole]));
+            ImGui::TextDisabled("Synchronized seam offset");
+            ImGui::SetNextItemWidth(-FLT_MIN);
             if (ImGui::SliderInt(
-                    "Synchronized seam offset",
+                    "##ReciprocalPanSynchronizedSeamOffset",
                     &offsetFrame,
                     0,
                     static_cast<int>(wizard.sourceTailFrames[sourceRole]))) {
@@ -52967,13 +53112,13 @@ void DrawReciprocalPanWizard(
             wizard.anchorPickArmed = true;
             wizard.errorMessage.clear();
         }
-        ImGui::SameLine();
         if (selectedExists) {
             auto point = triangle.patch.worldPoints[
                 static_cast<std::size_t>(wizard.selectedNodeIndex)];
-            ImGui::SetNextItemWidth(210.0F);
+            ImGui::TextDisabled("Selected node world XYZ");
+            ImGui::SetNextItemWidth(-FLT_MIN);
             if (ImGui::DragFloat3(
-                    "Node XYZ",
+                    "##ReciprocalPanNodeXYZ",
                     point.data(),
                     0.01F,
                     0.0F,

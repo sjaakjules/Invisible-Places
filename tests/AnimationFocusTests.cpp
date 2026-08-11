@@ -1831,6 +1831,42 @@ TEST_CASE("Reciprocal parallel pans match signed patch velocity through both app
         CHECK(result.metrics.anchorOverlayRmsScreenHeights[side] <
               1.0e-4F);
     }
+
+    SECTION("in-front correspondence triangles remain valid beyond the image") {
+        auto offscreenOptions = options;
+        for (auto* specification : {
+                 &offscreenOptions.firstDrivesSecond,
+                 &offscreenOptions.secondDrivesFirst}) {
+            for (auto* observation : {
+                     &specification->sourcePatch,
+                     &specification->destinationEndPatch}) {
+                for (auto& point : observation->worldPoints) {
+                    // At depth 10 and the default 60-degree FOV this lies
+                    // several screen widths outside a 16:9 image, while
+                    // remaining fully in front of the camera.
+                    point[0U] += 20.0F;
+                }
+            }
+        }
+        const auto offscreenResult = invisible_places::camera::
+            BuildAnimationReciprocalPanExtension(
+                makeParallelPan("offscreen-A", 0.0F),
+                makeParallelPan("offscreen-B", 0.5F),
+                offscreenOptions);
+        INFO(offscreenResult.errorMessage);
+        REQUIRE(offscreenResult.succeeded);
+        CHECK(offscreenResult.firstCandidate.durationFrames == 90U);
+        CHECK(offscreenResult.secondCandidate.durationFrames == 80U);
+        for (std::size_t side = 0U; side < 2U; ++side) {
+            CHECK(std::isfinite(
+                offscreenResult.metrics
+                    .afterVelocityRmsScreenHeightsPerSecond[side]));
+            CHECK(std::isfinite(
+                offscreenResult.metrics
+                    .anchorOverlayRmsScreenHeights[side]));
+            CHECK(offscreenResult.metrics.patchConfidence[side] > 0.0F);
+        }
+    }
 }
 
 TEST_CASE("Reciprocal off-centre orbit pans continue projected patch rotation",
