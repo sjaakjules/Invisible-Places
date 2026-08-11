@@ -987,7 +987,9 @@ struct AnimationReciprocalPanWizardState {
     // two-frame history and composites a feature-following hard split.
     bool splitComparisonEnabled = true;
     std::array<float, 2U> splitAnchorOffsetPixels{0.0F, 0.0F};
-    bool splitAOnLeft = true;
+    // The projector seam convention places B on the left and A on the right.
+    // The user may still swap the sides for inspection during the wizard.
+    bool splitAOnLeft = false;
     std::uint32_t splitRenderedRole = 0U;
     int seamReviewEditableSide = 1;  // 0 = source, 1 = destination.
     int previewPose = 0;
@@ -44714,60 +44716,78 @@ void DrawReciprocalPanViewportOverlay(
         wizard.stage == AnimationReciprocalPanWizardStage::Preview &&
         wizard.candidate.has_value() && !wizard.previewLoopEnabled &&
         !wizard.previewBaselineHold && !wizard.smoothingInProgress &&
-        !wizard.orbitInspectionActive &&
         IsMouseOverRenderViewport(viewport) &&
         !viewport.UiWantsMouseCapture();
     if (wizard.stage == AnimationReciprocalPanWizardStage::Preview &&
         wizard.candidate.has_value() && !wizard.previewLoopEnabled) {
-        const std::size_t role = static_cast<std::size_t>(
+        const std::size_t selectedRole = static_cast<std::size_t>(
             std::clamp(wizard.smoothingSelectedRole, 0, 1));
-        const auto& path = ReciprocalPanEffectiveCandidatePath(wizard, role);
+        const auto& selectedPath = ReciprocalPanEffectiveCandidatePath(
+            wizard,
+            selectedRole);
         const bool cameraTrack = wizard.smoothingEditTarget ==
             AnimationEditTarget::Camera;
-        std::vector<std::optional<ImVec2>> projectedKeys(path.keys.size());
-        for (std::size_t keyIndex = 0U;
-             keyIndex < path.keys.size();
-             ++keyIndex) {
-            const auto& world = cameraTrack
-                ? path.keys[keyIndex].cameraPosition
-                : path.keys[keyIndex].focusPoint;
-            const auto projected = ProjectWorldPointBeyondViewport(
-                matrices,
-                viewport,
-                glm::vec3{world[0U], world[1U], world[2U]});
-            if (!projected.has_value() ||
-                !pointInsideViewport(projected->screen)) {
+        std::array<std::vector<std::optional<ImVec2>>, 2U> projectedKeys;
+        for (std::size_t role = 0U; role < 2U; ++role) {
+            const bool roleVisible = wizard.previewMode == 2 ||
+                wizard.previewMode == static_cast<int>(role);
+            if (!roleVisible) {
                 continue;
             }
-            projectedKeys[keyIndex] = projected->screen;
-            const bool enabled = wizard.smoothingMovableKeyIds[role].contains(
-                path.keys[keyIndex].id);
-            const bool selected = path.keys[keyIndex].id ==
-                wizard.smoothingSelectedKeyId;
-            const ImU32 colour = enabled
-                ? IM_COL32(75, 235, 140, 245)
-                : IM_COL32(238, 185, 75, 225);
-            drawList->AddCircleFilled(
-                projected->screen,
-                selected ? 7.0F : 5.0F,
-                colour,
-                20);
-            drawList->AddCircle(
-                projected->screen,
-                selected ? 11.0F : 8.0F,
-                IM_COL32(0, 0, 0, 230),
-                20,
-                selected ? 2.5F : 1.5F);
+            const auto& path = ReciprocalPanEffectiveCandidatePath(
+                wizard,
+                role);
+            projectedKeys[role].resize(path.keys.size());
+            const ImU32 roleColour = role == 0U
+                ? IM_COL32(55, 205, 255, 245)
+                : IM_COL32(255, 130, 75, 245);
+            for (std::size_t keyIndex = 0U;
+                 keyIndex < path.keys.size();
+                 ++keyIndex) {
+                const auto& world = cameraTrack
+                    ? path.keys[keyIndex].cameraPosition
+                    : path.keys[keyIndex].focusPoint;
+                const auto projected = ProjectWorldPointBeyondViewport(
+                    matrices,
+                    viewport,
+                    glm::vec3{world[0U], world[1U], world[2U]});
+                if (!projected.has_value() ||
+                    !pointInsideViewport(projected->screen)) {
+                    continue;
+                }
+                projectedKeys[role][keyIndex] = projected->screen;
+                const bool enabled =
+                    wizard.smoothingMovableKeyIds[role].contains(
+                        path.keys[keyIndex].id);
+                const bool selected = role == selectedRole &&
+                    path.keys[keyIndex].id ==
+                        wizard.smoothingSelectedKeyId;
+                const ImU32 fillColour = enabled
+                    ? IM_COL32(75, 235, 140, 245)
+                    : IM_COL32(238, 185, 75, 225);
+                drawList->AddCircleFilled(
+                    projected->screen,
+                    selected ? 7.0F : 5.0F,
+                    fillColour,
+                    20);
+                drawList->AddCircle(
+                    projected->screen,
+                    selected ? 11.0F : 8.0F,
+                    selected ? IM_COL32(255, 255, 255, 245) : roleColour,
+                    20,
+                    selected ? 2.5F : 1.5F);
+            }
         }
 
         const auto selectedKey = std::find_if(
-            path.keys.begin(),
-            path.keys.end(),
+            selectedPath.keys.begin(),
+            selectedPath.keys.end(),
             [&](const invisible_places::camera::AnimationPathKey& key) {
                 return key.id == wizard.smoothingSelectedKeyId;
             });
-        const bool selectedEnabled = selectedKey != path.keys.end() &&
-            wizard.smoothingMovableKeyIds[role].contains(selectedKey->id);
+        const bool selectedEnabled = selectedKey != selectedPath.keys.end() &&
+            wizard.smoothingMovableKeyIds[selectedRole].contains(
+                selectedKey->id);
         const auto& io = ImGui::GetIO();
         if (wizard.smoothingKeyGizmoDrag.kind !=
             ManualFlowPathGizmoDragKind::None) {
@@ -44784,7 +44804,7 @@ void DrawReciprocalPanViewportOverlay(
                        nextPoint.has_value() && selectedEnabled) {
                 MoveReciprocalPanSmoothingKey(
                     runtimeState,
-                    role,
+                    selectedRole,
                     wizard.smoothingSelectedKeyId,
                     wizard.smoothingEditTarget,
                     {nextPoint->x, nextPoint->y, nextPoint->z});
@@ -44823,25 +44843,32 @@ void DrawReciprocalPanViewportOverlay(
         if (previewKeyEditing &&
             !wizard.smoothingKeyGizmoPointerCaptured &&
             ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            std::optional<std::size_t> hitKey;
+            std::optional<std::pair<std::size_t, std::size_t>> hitKey;
             float hitDistance = 11.0F;
-            for (std::size_t keyIndex = 0U;
-                 keyIndex < projectedKeys.size();
-                 ++keyIndex) {
-                if (!projectedKeys[keyIndex].has_value()) {
-                    continue;
-                }
-                const float distance = ScreenDistance(
-                    io.MousePos,
-                    projectedKeys[keyIndex].value());
-                if (distance < hitDistance) {
-                    hitDistance = distance;
-                    hitKey = keyIndex;
+            for (std::size_t role = 0U; role < 2U; ++role) {
+                for (std::size_t keyIndex = 0U;
+                     keyIndex < projectedKeys[role].size();
+                     ++keyIndex) {
+                    if (!projectedKeys[role][keyIndex].has_value()) {
+                        continue;
+                    }
+                    const float distance = ScreenDistance(
+                        io.MousePos,
+                        projectedKeys[role][keyIndex].value());
+                    if (distance < hitDistance) {
+                        hitDistance = distance;
+                        hitKey = std::pair{role, keyIndex};
+                    }
                 }
             }
             if (hitKey.has_value()) {
-                const auto& key = path.keys[hitKey.value()];
+                const auto [role, keyIndex] = hitKey.value();
+                const auto& path = ReciprocalPanEffectiveCandidatePath(
+                    wizard,
+                    role);
+                const auto& key = path.keys[keyIndex];
                 if (wizard.smoothingMovableKeyIds[role].contains(key.id)) {
+                    wizard.smoothingSelectedRole = static_cast<int>(role);
                     wizard.smoothingSelectedKeyId = key.id;
                     wizard.previewScrubRole = static_cast<int>(role);
                     wizard.previewFrameScrub = true;
@@ -44850,10 +44877,32 @@ void DrawReciprocalPanViewportOverlay(
                             invisible_places::camera::
                                 AnimationPathKeyNormalizedPosition(
                                     path,
-                                    hitKey.value()) *
+                                    keyIndex) *
                             static_cast<float>(
                                 ReciprocalPanPathFrameCount(path))));
-                    ShowReciprocalPanWizardCanonicalPose(runtimeState);
+                    if (!wizard.orbitInspectionActive) {
+                        ShowReciprocalPanWizardCanonicalPose(runtimeState);
+                    } else {
+                        const auto& pivot = cameraTrack
+                            ? key.cameraPosition
+                            : key.focusPoint;
+                        runtimeState->camera.SetOrbitCenterPreservingView(
+                            glm::vec3{
+                                pivot[0U],
+                                pivot[1U],
+                                pivot[2U]});
+                        runtimeState->pivotOverlay.pivot = FromGlm(
+                            runtimeState->camera.OrbitCenter());
+                        runtimeState->pivotOverlay.lastSetAt =
+                            std::chrono::steady_clock::now();
+                        runtimeState->previewRenderStateSignatureValid =
+                            false;
+                        runtimeState->statusMessage =
+                            std::string{"Selected "} +
+                            (role == 0U ? "A" : "B") +
+                            (cameraTrack ? " camera" : " focus") +
+                            " key. Drag its viewport gizmo while the orbit view remains active.";
+                    }
                 } else {
                     wizard.smoothingError =
                         "That yellow key is locked. Toggle it green on the A/B smoothing timeline before moving it.";
@@ -54821,7 +54870,21 @@ void DrawReciprocalPanTransitionSmoothingControls(
                                 keyIndex) *
                         static_cast<float>(
                             ReciprocalPanPathFrameCount(editPath))));
-                ShowReciprocalPanWizardCanonicalPose(runtimeState);
+                if (wizard.orbitInspectionActive) {
+                    const auto& pivot = wizard.smoothingEditTarget ==
+                            AnimationEditTarget::Camera
+                        ? editPath.keys[keyIndex].cameraPosition
+                        : editPath.keys[keyIndex].focusPoint;
+                    runtimeState->camera.SetOrbitCenterPreservingView(
+                        glm::vec3{pivot[0U], pivot[1U], pivot[2U]});
+                    runtimeState->pivotOverlay.pivot = FromGlm(
+                        runtimeState->camera.OrbitCenter());
+                    runtimeState->pivotOverlay.lastSetAt =
+                        std::chrono::steady_clock::now();
+                    runtimeState->previewRenderStateSignatureValid = false;
+                } else {
+                    ShowReciprocalPanWizardCanonicalPose(runtimeState);
+                }
             }
         }
         ImGui::EndCombo();
@@ -54856,6 +54919,62 @@ void DrawReciprocalPanTransitionSmoothingControls(
                 wizard.smoothingSelectedKeyId,
                 wizard.smoothingEditTarget,
                 position);
+        }
+    }
+    if (selectedKeyIndex < editPath.keys.size()) {
+        if (wizard.orbitInspectionActive) {
+            if (ImGui::Button(
+                    "Return to selected animation key camera",
+                    ImVec2{-FLT_MIN, 0.0F})) {
+                ShowReciprocalPanWizardCanonicalPose(runtimeState);
+                runtimeState->statusMessage =
+                    "Restored the exact selected A/B animation-key camera.";
+            }
+            ImGui::TextWrapped(
+                "Orbit edit view: both A/B splines and their visible camera or focus nodes remain selectable. Left-drag empty space to orbit, Shift/secondary-drag to pan, use the wheel to dolly, and drag the selected green node's axis/plane gizmo to move it.");
+        } else {
+            if (ImGui::Button(
+                    wizard.smoothingEditTarget == AnimationEditTarget::Camera
+                        ? "Orbit around selected camera key"
+                        : "Orbit around selected focus key",
+                    ImVec2{-FLT_MIN, 0.0F})) {
+                wizard.previewLoopEnabled = false;
+                wizard.previewLoopPlaying = false;
+                wizard.previewBaselineHold = false;
+                wizard.previewFrameScrub = true;
+                wizard.previewMode = 2;
+                wizard.previewScrubRole = static_cast<int>(editRole);
+                wizard.previewScrubFrames[editRole] =
+                    static_cast<std::uint32_t>(std::lround(
+                        invisible_places::camera::
+                            AnimationPathKeyNormalizedPosition(
+                                editPath,
+                                selectedKeyIndex) *
+                        static_cast<float>(
+                            ReciprocalPanPathFrameCount(editPath))));
+                ShowReciprocalPanWizardCanonicalPose(runtimeState);
+                wizard.orbitInspectionActive = true;
+                wizard.orbitPickPressActive = false;
+                wizard.orbitPickDragged = false;
+                wizard.smoothingKeyGizmoDrag = {};
+                wizard.smoothingKeyGizmoPointerCaptured = false;
+                wizard.viewportClickConsumed = false;
+                const auto& pivot = wizard.smoothingEditTarget ==
+                        AnimationEditTarget::Camera
+                    ? editPath.keys[selectedKeyIndex].cameraPosition
+                    : editPath.keys[selectedKeyIndex].focusPoint;
+                runtimeState->camera.SetOrbitCenterPreservingView(
+                    glm::vec3{pivot[0U], pivot[1U], pivot[2U]});
+                runtimeState->pivotOverlay.pivot = FromGlm(
+                    runtimeState->camera.OrbitCenter());
+                runtimeState->pivotOverlay.lastSetAt =
+                    std::chrono::steady_clock::now();
+                runtimeState->previewRenderStateSignatureValid = false;
+                runtimeState->statusMessage =
+                    "Final spline orbit edit enabled. Click any visible green A/B key node, then drag its camera/focus gizmo.";
+            }
+            ImGui::TextDisabled(
+                "Opens both candidate splines without changing the selected animation key pose.");
         }
     }
     ImGui::EndDisabled();
@@ -85848,6 +85967,14 @@ void UpdateCameraFromInput(
         runtimeState->animationPanel.reciprocalPanWizard;
     if (reciprocalWizard.Active()) {
         if (reciprocalWizard.orbitInspectionActive) {
+            if (reciprocalWizard.viewportClickConsumed ||
+                reciprocalWizard.smoothingKeyGizmoPointerCaptured ||
+                reciprocalWizard.nodeGizmoPointerCaptured) {
+                reciprocalWizard.viewportClickConsumed = false;
+                runtimeState->cameraInteraction.navigationActive = false;
+                runtimeState->cameraInteraction.trackballOrbitActive = false;
+                return;
+            }
             UpdateReciprocalPanOrbitInspectionInput(
                 runtimeState,
                 viewport);
