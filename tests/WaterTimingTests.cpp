@@ -1026,6 +1026,93 @@ TEST_CASE("Feature timing overlay samples every keyed setting and drives scenari
           nullptr);
 }
 
+TEST_CASE("Muted timing runs keep their keys but stop driving water features",
+          "[water][timing][keyed][overlay][mute]") {
+    using Catch::Approx;
+    using invisible_places::water::BuildWaterFeatureTimingOverlay;
+    using invisible_places::water::BuildWaterMeshFlowRainEnvelope;
+    using invisible_places::water::FindWaterFeatureRunContaining;
+    using invisible_places::water::WaterDynamicMeshFlowSettings;
+    using invisible_places::water::WaterFeatureTimingRun;
+    using invisible_places::water::WaterKeyedFeatureKind;
+    using invisible_places::water::WaterScenarioInterpolation;
+
+    WaterFeatureTimingRun stormRun;
+    stormRun.id = 1U;
+    stormRun.name = "Storm";
+    stormRun.features.push_back({
+        .feature = {.kind = WaterKeyedFeatureKind::Rain},
+        .settings = {{
+            .settingId = "level",
+            .keys = {
+                {.position = 0.0F,
+                 .value = 1.0F,
+                 .interpolation = WaterScenarioInterpolation::Linear},
+                {.position = 1.0F,
+                 .value = 1.0F,
+                 .interpolation = WaterScenarioInterpolation::Linear},
+            },
+        }},
+    });
+    WaterFeatureTimingRun seepRun;
+    seepRun.id = 2U;
+    seepRun.name = "Seep";
+    seepRun.features.push_back({
+        .feature = {.kind = WaterKeyedFeatureKind::SeepageNode,
+                    .objectId = 4U},
+        .settings = {{
+            .settingId = "strength",
+            .keys = {{.position = 0.2F, .value = 1.5F}},
+        }},
+    });
+
+    std::vector<WaterFeatureTimingRun> runs{stormRun, seepRun};
+    runs[0].enabled = false;
+
+    // The muted Storm run contributes no samples; the enabled Seep run is
+    // untouched.
+    const auto overlay = BuildWaterFeatureTimingOverlay(runs, 0.5F);
+    CHECK(overlay.Find(
+              {.kind = WaterKeyedFeatureKind::Rain}, "level") == nullptr);
+    REQUIRE(overlay.Find(
+                {.kind = WaterKeyedFeatureKind::SeepageNode, .objectId = 4U},
+                "strength") != nullptr);
+
+    // "Which run drives this feature" resolves nothing for a muted run, but
+    // membership checks that pass includeDisabled still see the claim, so
+    // muting cannot free a feature for another run.
+    CHECK(FindWaterFeatureRunContaining(
+              runs,
+              {.kind = WaterKeyedFeatureKind::Rain}) == nullptr);
+    const auto* claimed = FindWaterFeatureRunContaining(
+        runs,
+        {.kind = WaterKeyedFeatureKind::Rain},
+        /*includeDisabled=*/true);
+    REQUIRE(claimed != nullptr);
+    CHECK(claimed->name == "Storm");
+
+    // Rain envelopes fall back to the authored level once the keyed rain
+    // run is muted.
+    const WaterDynamicMeshFlowSettings meshSettings{};
+    const auto mutedEnvelope = BuildWaterMeshFlowRainEnvelope(
+        meshSettings,
+        runs,
+        0.0F,
+        10.0F);
+    for (const float sample : mutedEnvelope.samples) {
+        CHECK(sample == Approx(0.0F).margin(1.0e-4F));
+    }
+    runs[0].enabled = true;
+    const auto drivenEnvelope = BuildWaterMeshFlowRainEnvelope(
+        meshSettings,
+        runs,
+        0.0F,
+        10.0F);
+    REQUIRE(!drivenEnvelope.samples.empty());
+    CHECK(drivenEnvelope.samples.back() > 0.5F);
+    CHECK(mutedEnvelope.fingerprint != drivenEnvelope.fingerprint);
+}
+
 TEST_CASE("Authored water response settings are keyable and overlays stay transient",
           "[water][timing][keyed][authored]") {
     using Catch::Approx;

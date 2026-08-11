@@ -4302,11 +4302,17 @@ json SerializeWaterFeatureTimingRun(
             {"settings", std::move(settingsJson)},
         });
     }
-    return {
+    json runJson{
         {"id", run.id},
         {"name", run.name},
         {"features", std::move(featuresJson)},
     };
+    // Enabled is the norm; emitting only the muted state keeps documents
+    // with all-enabled runs byte-identical to earlier schema output.
+    if (!run.enabled) {
+        runJson["enabled"] = false;
+    }
+    return runJson;
 }
 
 invisible_places::water::WaterFeatureTimingRun ParseWaterFeatureTimingRun(
@@ -4314,6 +4320,7 @@ invisible_places::water::WaterFeatureTimingRun ParseWaterFeatureTimingRun(
     invisible_places::water::WaterFeatureTimingRun run;
     run.id = runJson.value("id", 0U);
     run.name = runJson.value("name", std::string{"Run"});
+    run.enabled = runJson.value("enabled", true);
     if (runJson.contains("features") && runJson.at("features").is_array()) {
         for (const auto& featureJson : runJson.at("features")) {
             invisible_places::water::WaterFeatureTimeline timeline;

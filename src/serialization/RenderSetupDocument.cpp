@@ -484,8 +484,13 @@ std::string CurrentUtcTimestamp() {
 RenderSetupSummary SummarizeRenderSetupTiming(
     const invisible_places::timing::TimingTakeSceneState& state) {
     RenderSetupSummary summary;
-    summary.waterRunCount = state.waterFeatureTimingRuns.size();
     for (const auto& run : state.waterFeatureTimingRuns) {
+        // Like disabled colourise effects below, muted runs contribute
+        // nothing to the render, so the summary leaves them out.
+        if (!run.enabled) {
+            continue;
+        }
+        ++summary.waterRunCount;
         for (const auto& feature : run.features) {
             for (const auto& track : feature.settings) {
                 if (track.active) {

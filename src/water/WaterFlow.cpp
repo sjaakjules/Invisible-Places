@@ -8923,6 +8923,9 @@ WaterFeatureTimingOverlay BuildWaterFeatureTimingOverlay(
     float normalizedPosition) {
     WaterFeatureTimingOverlay overlay;
     for (const auto& run : runs) {
+        if (!run.enabled) {
+            continue;
+        }
         for (const auto& timeline : run.features) {
             for (const auto& setting : timeline.settings) {
                 const auto value = EvaluateWaterKeyedSettingTrack(
@@ -9151,6 +9154,9 @@ const WaterKeyedSettingTrack* FindAuthoredRainEnvelopeTrack(
     const WaterKeyedFeatureId& feature,
     std::string_view settingId) {
     for (const auto& run : runs) {
+        if (!run.enabled) {
+            continue;
+        }
         const auto* timeline = FindWaterFeatureTimeline(&run, feature);
         if (timeline == nullptr) {
             continue;
@@ -9543,8 +9549,12 @@ WaterMeshFlowRainEnvelope BuildWaterMeshFlowRainEnvelope(
 
 const WaterFeatureTimingRun* FindWaterFeatureRunContaining(
     std::span<const WaterFeatureTimingRun> runs,
-    const WaterKeyedFeatureId& feature) {
+    const WaterKeyedFeatureId& feature,
+    bool includeDisabled) {
     for (const auto& run : runs) {
+        if (!includeDisabled && !run.enabled) {
+            continue;
+        }
         if (FindWaterFeatureTimeline(&run, feature) != nullptr) {
             return &run;
         }

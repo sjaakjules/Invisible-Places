@@ -3570,3 +3570,57 @@ TEST_CASE("Keyed setting tracks round-trip their default interpolation and migra
   CHECK(migratedTrack.keys[1].interpolation ==
         WaterScenarioInterpolation::TrackDefault);
 }
+
+TEST_CASE("Timing runs round-trip their enabled flag and omit it while on",
+          "[project][serialization][water][timings][mute]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::water::WaterFeatureTimingRun;
+  using invisible_places::water::WaterKeyedFeatureKind;
+  using invisible_places::water::WaterScenarioFeatureRuns;
+
+  WaterFeatureTimingRun onRun;
+  onRun.id = 1U;
+  onRun.name = "Driving";
+  onRun.features.push_back(
+      {.feature = {.kind = WaterKeyedFeatureKind::Rain}});
+  WaterFeatureTimingRun mutedRun;
+  mutedRun.id = 2U;
+  mutedRun.name = "Parked";
+  mutedRun.enabled = false;
+  mutedRun.features.push_back(
+      {.feature = {.kind = WaterKeyedFeatureKind::MeshFlow}});
+  WaterScenarioFeatureRuns entry;
+  entry.scenarioId = "take-a";
+  entry.runs = {onRun, mutedRun};
+
+  ProjectDocument document;
+  document.projectName = "timing-run-enabled";
+  document.waterFeatureTimingRuns.push_back(entry);
+
+  TemporaryProjectFile file{"invisible_places_timing_run_enabled.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->waterFeatureTimingRuns.size() == 1U);
+  REQUIRE(loaded->waterFeatureTimingRuns[0].runs.size() == 2U);
+  CHECK(loaded->waterFeatureTimingRuns[0].runs[0].enabled);
+  CHECK_FALSE(loaded->waterFeatureTimingRuns[0].runs[1].enabled);
+
+  // Enabled runs carry no "enabled" key, so documents whose runs are all on
+  // stay byte-identical to earlier output, and older builds that drop the
+  // key simply load every run as on.
+  std::ifstream savedInput{file.path};
+  REQUIRE(savedInput.is_open());
+  const auto savedJson = nlohmann::json::parse(savedInput);
+  savedInput.close();
+  const auto& runsJson =
+      savedJson["water_feature_timing_runs"][0]["runs"];
+  CHECK_FALSE(runsJson[0].contains("enabled"));
+  REQUIRE(runsJson[1].contains("enabled"));
+  CHECK(runsJson[1]["enabled"] == false);
+}
+

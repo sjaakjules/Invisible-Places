@@ -65125,10 +65125,13 @@ BuildAvailableKeyingFeatures(
                             .objectId = instance.id});
     }
     if (entry != nullptr) {
+        // Membership, not drive: features in disabled runs stay claimed so
+        // muting a run cannot let another run capture its timelines.
         std::erase_if(features, [&](const WaterKeyedFeatureId& feature) {
             return invisible_places::water::FindWaterFeatureRunContaining(
                        entry->waterFeatureTimingRuns,
-                       feature) != nullptr;
+                       feature,
+                       /*includeDisabled=*/true) != nullptr;
         });
     }
     return features;
@@ -66367,14 +66370,33 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                     keyCount += setting.keys.size();
                 }
             }
+            (void)ImGui::Checkbox("##RunEnabled", &run.enabled);
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+                ImGui::SetTooltip(
+                    run.enabled
+                        ? "Run is on. Uncheck to mute it: its water "
+                          "features stop animating and play their base "
+                          "settings, while every key is kept."
+                        : "Run is muted. Its keys are kept but do not "
+                          "drive the water features until checked again.");
+            }
+            ImGui::SameLine();
             const std::string label =
                 run.name + " (" + std::to_string(run.features.size()) +
                 (run.features.size() == 1U ? " feature, " : " features, ") +
                 std::to_string(keyCount) +
                 (keyCount == 1U ? " key)" : " keys)");
+            if (!run.enabled) {
+                ImGui::PushStyleColor(
+                    ImGuiCol_Text,
+                    ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+            }
             if (ImGui::Selectable(label.c_str(), selected)) {
                 timings.selectedFeatureRunIndex = index;
                 timings.pendingRunDeleteIndex.reset();
+            }
+            if (!run.enabled) {
+                ImGui::PopStyleColor();
             }
             ImGui::PopID();
         }
@@ -66397,6 +66419,11 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                 timings.selectedFeatureRunIndex.value()];
             ImGui::Separator();
             InputTextString("Run Name", &run.name);
+            if (!run.enabled) {
+                ImGui::TextDisabled(
+                    "Muted: this run's features play their base settings. "
+                    "Keys stay editable here and return when re-enabled.");
+            }
             const bool deleteArmed =
                 timings.pendingRunDeleteIndex ==
                 timings.selectedFeatureRunIndex;
@@ -66908,7 +66935,8 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                         if (invisible_places::water::
                                 FindWaterFeatureRunContaining(
                                     entry.waterFeatureTimingRuns,
-                                    timeline.feature) != nullptr) {
+                                    timeline.feature,
+                                    /*includeDisabled=*/true) != nullptr) {
                             conflicts.push_back(timeline.feature);
                         }
                     }

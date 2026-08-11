@@ -521,6 +521,10 @@ struct WaterFeatureTimeline {
 struct WaterFeatureTimingRun {
     std::uint32_t id = 0U;
     std::string name = "Run";
+    // Unchecked runs keep their feature timelines and keys but stop driving
+    // the water features: the overlay, rain envelopes, and keyed sliders all
+    // treat their features as unkeyed until the run is enabled again.
+    bool enabled = true;
     std::vector<WaterFeatureTimeline> features;
 };
 
@@ -652,9 +656,14 @@ void ApplyWaterFeatureTimingOverlayToScenario(
     const WaterFeatureTimingOverlay& overlay,
     WaterScenarioState* state);
 
+// By default resolves only enabled runs, so callers asking "which run drives
+// this feature right now" see disabled runs as absent. Membership checks that
+// must also respect muted runs (assignment lists, import conflicts) pass
+// includeDisabled = true.
 [[nodiscard]] const WaterFeatureTimingRun* FindWaterFeatureRunContaining(
     std::span<const WaterFeatureTimingRun> runs,
-    const WaterKeyedFeatureId& feature);
+    const WaterKeyedFeatureId& feature,
+    bool includeDisabled = false);
 [[nodiscard]] WaterFeatureTimeline* FindWaterFeatureTimeline(
     WaterFeatureTimingRun* run,
     const WaterKeyedFeatureId& feature);
