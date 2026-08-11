@@ -2392,6 +2392,12 @@ json SerializeAnimationPathKey(const AnimationPathKey& key) {
         {"near_plane", key.nearPlane},
         {"far_plane", key.farPlane},
         {"duration_frames", key.durationFrames},
+        {"spline_parameter_weight", key.splineParameterWeight},
+        {"has_spline_endpoint_tangent", key.hasSplineEndpointTangent},
+        {"spline_camera_endpoint_tangent", key.splineCameraEndpointTangent},
+        {"spline_focus_endpoint_tangent", key.splineFocusEndpointTangent},
+        {"spline_orientation_endpoint_tangent", key.splineOrientationEndpointTangent},
+        {"spline_lens_endpoint_tangent", key.splineLensEndpointTangent},
         {"source_shot_name", key.sourceShotName},
         {"linked_camera_id", key.linkedCameraId},
         {"linked_camera_name", key.linkedCameraName},
@@ -2420,6 +2426,34 @@ AnimationPathKey ParseAnimationPathKey(const json& keyJson) {
     key.nearPlane = keyJson.value("near_plane", key.nearPlane);
     key.farPlane = keyJson.value("far_plane", key.farPlane);
     key.durationFrames = keyJson.value("duration_frames", key.durationFrames);
+    key.splineParameterWeight = std::max(
+        0.0F,
+        keyJson.value(
+            "spline_parameter_weight",
+            key.splineParameterWeight));
+    key.hasSplineEndpointTangent = keyJson.value(
+        "has_spline_endpoint_tangent",
+        key.hasSplineEndpointTangent);
+    if (keyJson.contains("spline_camera_endpoint_tangent")) {
+        key.splineCameraEndpointTangent =
+            keyJson.at("spline_camera_endpoint_tangent")
+                .get<std::array<float, 3>>();
+    }
+    if (keyJson.contains("spline_focus_endpoint_tangent")) {
+        key.splineFocusEndpointTangent =
+            keyJson.at("spline_focus_endpoint_tangent")
+                .get<std::array<float, 3>>();
+    }
+    if (keyJson.contains("spline_orientation_endpoint_tangent")) {
+        key.splineOrientationEndpointTangent =
+            keyJson.at("spline_orientation_endpoint_tangent")
+                .get<std::array<float, 4>>();
+    }
+    if (keyJson.contains("spline_lens_endpoint_tangent")) {
+        key.splineLensEndpointTangent =
+            keyJson.at("spline_lens_endpoint_tangent")
+                .get<std::array<float, 5>>();
+    }
     key.sourceShotName = keyJson.value("source_shot_name", std::string{});
     key.linkedCameraId = keyJson.value("linked_camera_id", std::string{});
     key.linkedCameraName = keyJson.value("linked_camera_name", std::string{});

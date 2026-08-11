@@ -27616,6 +27616,8 @@ void PropagateCameraShotToLinkedAnimationKeys(
         if (path == nullptr) {
             continue;
         }
+        invisible_places::camera::
+            BakeAnimationPathLocalizedCorrections(path);
         bool changed = false;
         for (auto& key : path->keys) {
             if (key.linkedCameraId != shot.id) {
@@ -27625,6 +27627,8 @@ void PropagateCameraShotToLinkedAnimationKeys(
             changed = true;
         }
         if (changed) {
+            invisible_places::camera::
+                RebuildAnimationPathGeometryFromKeys(path);
             MarkRegistryAnimationDirty(runtimeState, fileIndex);
         }
     }
@@ -27643,6 +27647,7 @@ std::size_t RefocusAnimationPathKeysToSurface(
     if (runtimeState == nullptr || path == nullptr) {
         return 0U;
     }
+    invisible_places::camera::BakeAnimationPathLocalizedCorrections(path);
     std::size_t changedCount = 0U;
     for (auto& key : path->keys) {
         const glm::vec3 origin{
@@ -27679,6 +27684,10 @@ std::size_t RefocusAnimationPathKeysToSurface(
         shotIt->state.target = key.focusPoint;
         shotIt->state.focusDistance = hit.value();
         PropagateCameraShotToLinkedAnimationKeys(runtimeState, *shotIt);
+    }
+    if (changedCount > 0U) {
+        invisible_places::camera::
+            RebuildAnimationPathGeometryFromKeys(path);
     }
     return changedCount;
 }
@@ -49711,6 +49720,8 @@ void DrawAnimationSection(
                                        : 1U;
         const auto clampedFrames = std::max<std::uint32_t>(minimumFrames, requestedFrames);
         if (animationPath.durationFrames != clampedFrames) {
+            invisible_places::camera::
+                BakeAnimationPathLocalizedCorrections(&animationPath);
             animationPath.durationFrames = clampedFrames;
             panel.dirty = true;
             runtimeState->animationPlayback.active = false;
@@ -50297,7 +50308,7 @@ void DrawAnimationSection(
             }
             ImGui::Separator();
             ImGui::TextWrapped(
-                "All methods change only Segment Frames and preserve the total duration and every authored key pose. Because spline knots use those times, the interpolated path between keys can shift slightly.");
+                "The Speed Method choices change only Segment Frames and preserve the total duration and every authored key pose. Spatial camera/focus geometry uses independent distance knots, so retiming changes traversal without bending either spline.");
             ImGui::TextWrapped(
                 "Equalize X/Y Velocity are separate spatial operations: they leave Segment Frames unchanged and move both interior camera and focus controls along their existing curves. Minimize Rotation and X + Rotation instead slide only interior camera controls while keeping every focus control fixed.");
             ImGui::TextWrapped(
@@ -50325,6 +50336,9 @@ void DrawAnimationSection(
             selectedMotionPeak > 1.0e-6F;
         const auto applySpeedEqualization =
             [&](SpeedMode mode, std::string_view methodName) {
+                invisible_places::camera::
+                    BakeAnimationPathLocalizedCorrections(
+                        &animationPath);
                 const auto segmentFrames = invisible_places::camera::
                     ComputeEqualizedAnimationSegmentFrames(
                         animationPath,
@@ -50655,9 +50669,56 @@ void DrawAnimationSection(
             ImGui::SetTooltip(
                 "%s Redistributes the animation's total frames between keys. The total "
                 "duration is unchanged and the result is ordinary per-key "
-                "segment frames, editable in the Keys section. Knot "
-                "respacing can subtly reshape the camera spline.",
+                "segment frames, editable in the Keys section. Camera/focus "
+                "geometry is unchanged and its velocity and acceleration "
+                "remain continuous.",
                 speedModeDescriptions[selectedModeIndex]);
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(animationPath.keys.size() < 2U);
+        if (ImGui::Button("Reset Timing Weights")) {
+            const bool bakedLocalizedCorrections =
+                !animationPath.localizedKeyCorrections.empty();
+            const bool changed = invisible_places::camera::
+                ResetAnimationPathTimingWeights(&animationPath);
+            if (changed) {
+                panel.dirty = true;
+                runtimeState->animationPlayback.active = false;
+                if (panel.liveApply) {
+                    ApplyAnimationScrub(runtimeState);
+                }
+                runtimeState->statusMessage =
+                    "Reset " +
+                    std::to_string(animationPath.keys.size() - 1U) +
+                    " segment timing weights to an even split. Total "
+                    "duration and every camera/focus key pose are unchanged.";
+                if (bakedLocalizedCorrections) {
+                    runtimeState->statusMessage +=
+                        " Existing alignment corrections were baked into a "
+                        "clean C2 spline through those poses.";
+                } else {
+                    runtimeState->statusMessage +=
+                        " The spatial camera/focus curves are unchanged.";
+                }
+            } else {
+                runtimeState->statusMessage =
+                    "Segment timing weights are already reset.";
+            }
+            runtimeState->errorMessage.clear();
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(
+                ImGuiHoveredFlags_DelayNormal |
+                ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip(
+                "Shares Full Duration Frames evenly across every segment, "
+                "removing equalization and manual Segment Frames weighting. "
+                "The total duration and all key poses stay unchanged. With "
+                "no localized alignment corrections, the spatial curves are "
+                "also exactly unchanged. Existing corrections are baked into "
+                "a clean distance-parameterized C2 spline through the same "
+                "poses; a separate smooth time map carries non-zero velocity "
+                "through the keys.");
         }
 
         {
@@ -52727,6 +52788,19 @@ void DrawAnimationSection(
             return;
         }
 
+        std::optional<std::size_t> registryIndex;
+        auto* editablePath = MutableCurrentAnimationForKeyEditing(
+            runtimeState,
+            &registryIndex);
+        if (editablePath == nullptr) {
+            runtimeState->errorMessage =
+                "The active animation is no longer editable.";
+            runtimeState->statusMessage.clear();
+            return;
+        }
+        invisible_places::camera::
+            BakeAnimationPathLocalizedCorrections(editablePath);
+
         invisible_places::camera::AnimationPathKey insertedKey;
         bool usedSurfaceHit = false;
         float resolvedFocusDistance = 0.0F;
@@ -52734,7 +52808,7 @@ void DrawAnimationSection(
             auto camera = runtimeState->camera.CaptureState();
             const auto focus = ResolveLiveAnimationKeyFocus(
                 *runtimeState,
-                animationPath,
+                *editablePath,
                 camera);
             camera.target = focus.point;
             camera.focusDistance = focus.distance;
@@ -52743,7 +52817,7 @@ void DrawAnimationSection(
             evaluation.focusPoint = focus.point;
             evaluation.focusDistance = focus.distance;
             insertedKey = MakeAnimationKeyFromEvaluation(
-                animationPath,
+                *editablePath,
                 evaluation,
                 "Current Camera");
             usedSurfaceHit = focus.surfaceHit;
@@ -52754,25 +52828,14 @@ void DrawAnimationSection(
                 static_cast<float>(totalFrames);
             const auto evaluation =
                 invisible_places::camera::EvaluateAnimationPath(
-                    animationPath,
+                    *editablePath,
                     invisible_places::camera::
-                            AnimationPathDurationSeconds(animationPath) *
+                            AnimationPathDurationSeconds(*editablePath) *
                         normalizedFrame);
             insertedKey = MakeAnimationKeyFromEvaluation(
-                animationPath,
+                *editablePath,
                 evaluation,
                 "Animation Playhead");
-        }
-
-        std::optional<std::size_t> registryIndex;
-        auto* editablePath = MutableCurrentAnimationForKeyEditing(
-            runtimeState,
-            &registryIndex);
-        if (editablePath == nullptr) {
-            runtimeState->errorMessage =
-                "The active animation is no longer editable.";
-            runtimeState->statusMessage.clear();
-            return;
         }
         std::string insertionError;
         const auto insertionIndex = invisible_places::camera::
@@ -53034,6 +53097,8 @@ void DrawAnimationSection(
             const auto clampedFrames =
                 static_cast<std::uint32_t>(std::max(1, segmentFrames));
             if (key.durationFrames != clampedFrames) {
+                invisible_places::camera::
+                    BakeAnimationPathLocalizedCorrections(&animationPath);
                 key.durationFrames = clampedFrames;
                 panel.dirty = true;
                 runtimeState->animationPlayback.active = false;

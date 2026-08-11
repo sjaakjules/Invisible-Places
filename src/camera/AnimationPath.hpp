@@ -31,6 +31,33 @@ struct AnimationPathKey {
     float nearPlane = 0.01F;
     float farPlane = 1000.0F;
     std::uint32_t durationFrames = 90;
+    // Incoming distance-domain span used only by camera/focus/orientation
+    // geometry. Zero is a legacy/automatic value derived from adjacent key
+    // poses. Insert-at-playhead materializes and splits these spans so adding
+    // an evaluated key does not reshape the existing curve.
+    float splineParameterWeight = 0.0F;
+    // Materialized d(position)/d(spline parameter) for a path endpoint.
+    // Evaluated-key insertion preserves these so splitting the first or last
+    // segment cannot alter the existing endpoint direction. Structural pose
+    // changes clear them and derive a fresh one-sided chord tangent.
+    bool hasSplineEndpointTangent = false;
+    std::array<float, 3> splineCameraEndpointTangent{0.0F, 0.0F, 0.0F};
+    std::array<float, 3> splineFocusEndpointTangent{0.0F, 0.0F, 0.0F};
+    // Quaternion component order is x, y, z, w. Lens order is field of view,
+    // near plane, far plane, focus distance, and aperture f-stop.
+    std::array<float, 4> splineOrientationEndpointTangent{
+        0.0F,
+        0.0F,
+        0.0F,
+        0.0F,
+    };
+    std::array<float, 5> splineLensEndpointTangent{
+        0.0F,
+        0.0F,
+        0.0F,
+        0.0F,
+        0.0F,
+    };
     std::string sourceShotName;
     std::string linkedCameraId;
     std::string linkedCameraName;
@@ -74,7 +101,7 @@ struct AnimationVelocityBlendLinkMetadata {
 struct AnimationPath {
     // Original file schema retained only for application-level migration
     // bookkeeping. Serialization always writes the current schema.
-    std::uint32_t sourceSchemaVersion = 20U;
+    std::uint32_t sourceSchemaVersion = 21U;
     std::string name = "Animation";
     std::uint32_t durationFrames = 180;
     // Zero means a legacy/unset preference. Newly authored animations
@@ -148,7 +175,15 @@ struct PreparedAnimationPathEvaluationContext {
     bool hasFocusDistance = false;
     bool hasApertureFStops = false;
     AnimationPathKey singleKeySnapshot{};
+    // Authored key times remain the public timeline knots. Camera, focus,
+    // lens, and orientation geometry is solved over independent cumulative
+    // motion-distance knots so retiming cannot bend the spatial curve.
     std::vector<float> knots;
+    std::vector<float> geometryKnots;
+    // Positive d(geometry)/dt values for the monotone quintic time map.
+    // Every key has zero time-map acceleration, keeping the composed path C2
+    // while carrying non-zero velocity through non-degenerate motion.
+    std::vector<float> geometryVelocities;
     AnimationPreparedScalarSpline cameraX;
     AnimationPreparedScalarSpline cameraY;
     AnimationPreparedScalarSpline cameraZ;
@@ -161,10 +196,14 @@ struct PreparedAnimationPathEvaluationContext {
     AnimationPreparedScalarSpline focusDistance;
     AnimationPreparedScalarSpline apertureFStopsSpline;
     std::vector<std::array<float, 4>> orientationQuaternions;
-    // Localized confirmed corrections. The authored path's preserved
-    // spline stays the base; compact cubic-Hermite offsets affect only
-    // segments touching a user-enabled key and terminate with zero velocity
-    // at every locked key.
+    AnimationPreparedScalarSpline orientationX;
+    AnimationPreparedScalarSpline orientationY;
+    AnimationPreparedScalarSpline orientationZ;
+    AnimationPreparedScalarSpline orientationW;
+    // Localized confirmed corrections. The authored path's preserved spline
+    // stays the base; compact quintic-Hermite offsets affect only segments
+    // touching a user-enabled key. Their shared acceleration is zero at each
+    // key, so the correction layer is C2 as well as velocity-continuous.
     bool hasLoopKeyCorrections = false;
     std::vector<std::uint8_t> loopCorrectionKeyEnabled;
     std::vector<std::array<float, 3>> loopCameraCorrections;
@@ -505,9 +544,9 @@ OptimizeAnimationCameraKeysForSmoothRotation(
 // Jointly adjusts the explicitly selected camera/focus keys of two paths
 // (or endpoints for legacy callers). durationFrames and every per-key
 // durationFrames value are never written. Applied paths evaluate their
-// preserved natural cubic spline plus compact Hermite corrections confined
-// to segments touching a selected key; locked-key positions and correction
-// derivatives remain exact.
+// preserved distance-parameterized C2 spline plus compact quintic-Hermite
+// corrections confined to segments touching a selected key; locked-key
+// positions and correction derivatives remain exact.
 [[nodiscard]] AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
     AnimationPath* first,
     AnimationPath* second,
@@ -565,6 +604,24 @@ BuildAnimationCameraFrameTransform(
     AnimationPath* path,
     std::size_t sourceIndex,
     std::size_t destinationIndex);
+
+// Makes the currently visible adjusted key poses the clean C2 spline baseline
+// and removes the localized correction overlay. Key poses and timing are not
+// changed. Structural/manual edits call this automatically so old velocity-
+// alignment weighting cannot survive a topology or control-point change.
+bool BakeAnimationPathLocalizedCorrections(AnimationPath* path);
+// Drops materialized distance-domain spans and endpoint derivatives so
+// evaluation derives a fresh, chord-aware parameterization and forward
+// one-sided endpoint tangents from the current key poses.
+void RebuildAnimationPathGeometryFromKeys(AnimationPath* path);
+
+// Removes authored/equalized timing bias by sharing the path's effective
+// total frame count as evenly as integer frames allow across every segment.
+// Camera/focus poses and total duration remain unchanged. Geometry is
+// distance-parameterized independently of these frame weights, so this only
+// resets traversal timing; localized corrections are baked first. Returns
+// true when either correction metadata or an incoming frame count changed.
+[[nodiscard]] bool ResetAnimationPathTimingWeights(AnimationPath* path);
 
 // Surface-focus probing. CollectRayHitDistancesAlongRay appends the along-ray
 // distance of every point lying within perpendicularRadiusMeters of the ray

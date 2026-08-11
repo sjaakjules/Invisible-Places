@@ -3076,11 +3076,18 @@ TEST_CASE("Animation velocity blend metadata and localized corrections round-tri
   path.name = "Loop A";
   path.keys = {
       {.id = "first", .cameraPosition = {1.0F, 2.0F, 3.0F},
-       .focusPoint = {4.0F, 5.0F, 6.0F}},
+       .focusPoint = {4.0F, 5.0F, 6.0F},
+       .hasSplineEndpointTangent = true,
+       .splineCameraEndpointTangent = {0.1F, 0.2F, 0.3F},
+       .splineFocusEndpointTangent = {0.4F, 0.5F, 0.6F},
+       .splineOrientationEndpointTangent = {0.7F, 0.8F, 0.9F, 1.0F},
+       .splineLensEndpointTangent = {1.1F, 1.2F, 1.3F, 1.4F, 1.5F}},
       {.id = "middle", .cameraPosition = {2.0F, 3.0F, 4.0F},
-       .focusPoint = {5.0F, 6.0F, 7.0F}},
+       .focusPoint = {5.0F, 6.0F, 7.0F},
+       .splineParameterWeight = 3.25F},
       {.id = "last", .cameraPosition = {3.0F, 4.0F, 5.0F},
-       .focusPoint = {6.0F, 7.0F, 8.0F}},
+       .focusPoint = {6.0F, 7.0F, 8.0F},
+       .splineParameterWeight = 7.5F},
   };
   path.velocityBlendLink = AnimationVelocityBlendLinkMetadata{
       .pairId = "pair-123",
@@ -3148,6 +3155,20 @@ TEST_CASE("Animation velocity blend metadata and localized corrections round-tri
         Catch::Approx(0.9F));
   CHECK(loaded->localizedKeyCorrections[1U].splineFocusPoint[1U] ==
         Catch::Approx(7.1F));
+  REQUIRE(loaded->keys.size() == 3U);
+  CHECK(loaded->keys[1U].splineParameterWeight ==
+        Catch::Approx(3.25F));
+  CHECK(loaded->keys[2U].splineParameterWeight ==
+        Catch::Approx(7.5F));
+  CHECK(loaded->keys.front().hasSplineEndpointTangent);
+  CHECK(loaded->keys.front().splineCameraEndpointTangent[1U] ==
+        Catch::Approx(0.2F));
+  CHECK(loaded->keys.front().splineFocusEndpointTangent[2U] ==
+        Catch::Approx(0.6F));
+  CHECK(loaded->keys.front().splineOrientationEndpointTangent[3U] ==
+        Catch::Approx(1.0F));
+  CHECK(loaded->keys.front().splineLensEndpointTangent[4U] ==
+        Catch::Approx(1.5F));
 }
 
 TEST_CASE("Schema 18 velocity smoothing migrates without changing evaluation or timing",

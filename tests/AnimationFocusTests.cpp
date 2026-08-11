@@ -3,6 +3,8 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
+#include <cmath>
 #include <vector>
 
 namespace {
@@ -314,3 +316,435 @@ TEST_CASE("Dragging animation keys changes pose order while retaining timing slo
             1U) == Approx(0.40F));
     CHECK(path.durationFrames == 100U);
 }
+
+TEST_CASE("Resetting animation timing weights clears retiming retained by key edits",
+          "[camera][animation][key-editing][timing-reset]") {
+    invisible_places::camera::AnimationPath path;
+    path.durationFrames = 100U;
+    path.keys.resize(3U);
+    path.keys[0U].id = "A";
+    path.keys[1U].id = "B";
+    path.keys[1U].durationFrames = 40U;
+    path.keys[2U].id = "C";
+    path.keys[2U].durationFrames = 60U;
+
+    invisible_places::camera::AnimationPathKey inserted;
+    inserted.id = "inserted";
+    REQUIRE(invisible_places::camera::InsertAnimationPathKeyAtFrame(
+                &path,
+                std::move(inserted),
+                25U)
+                .has_value());
+    REQUIRE(invisible_places::camera::RemoveAnimationPathKey(
+        &path,
+        1U));
+    REQUIRE(path.keys.size() == 3U);
+    CHECK(path.keys[1U].durationFrames == 40U);
+    CHECK(path.keys[2U].durationFrames == 60U);
+
+    REQUIRE(invisible_places::camera::ResetAnimationPathTimingWeights(
+        &path));
+    CHECK(path.durationFrames == 100U);
+    CHECK(path.keys[1U].durationFrames == 50U);
+    CHECK(path.keys[2U].durationFrames == 50U);
+    CHECK_FALSE(invisible_places::camera::ResetAnimationPathTimingWeights(
+        &path));
+}
+
+TEST_CASE("Reset timing uses distance geometry and C2 traversal without endpoint stop easing",
+          "[camera][animation][timing-reset]") {
+    invisible_places::camera::AnimationPath path;
+    path.durationFrames = 90U;
+    path.keys = {
+        {.id = "A",
+         .cameraPosition = {0.0F, 0.0F, 0.0F},
+         .focusPoint = {0.0F, 1.0F, 0.0F},
+         .durationFrames = 90U},
+        {.id = "B",
+         .cameraPosition = {1.0F, 2.0F, 0.5F},
+         .focusPoint = {2.0F, 2.5F, 0.5F},
+         .durationFrames = 8U},
+        {.id = "C",
+         .cameraPosition = {4.0F, -1.0F, 1.0F},
+         .focusPoint = {4.5F, -0.5F, 1.5F},
+         .durationFrames = 70U},
+        {.id = "D",
+         .cameraPosition = {7.0F, 1.0F, 0.0F},
+         .focusPoint = {7.0F, 1.0F, 1.0F},
+         .durationFrames = 12U},
+    };
+    const auto originalKeys = path.keys;
+
+    REQUIRE(invisible_places::camera::ResetAnimationPathTimingWeights(
+        &path));
+    REQUIRE(path.keys.size() == originalKeys.size());
+    for (std::size_t index = 0U; index < path.keys.size(); ++index) {
+        CHECK(path.keys[index].cameraPosition ==
+              originalKeys[index].cameraPosition);
+        CHECK(path.keys[index].focusPoint ==
+              originalKeys[index].focusPoint);
+        if (index > 0U) {
+            CHECK(path.keys[index].durationFrames == 30U);
+        }
+    }
+
+    const auto coordinateAt = [&path](
+                                  float seconds,
+                                  bool focus,
+                                  std::size_t component) {
+        const auto evaluation = invisible_places::camera::
+            EvaluateAnimationPath(path, seconds);
+        return focus
+            ? evaluation.focusPoint[component]
+            : evaluation.camera.position[component];
+    };
+    constexpr float kStepSeconds = 0.005F;
+    constexpr float kInteriorKnotSeconds = 1.0F;
+    for (const bool focus : {false, true}) {
+        float endpointSpeedSquared = 0.0F;
+        for (std::size_t component = 0U; component < 3U; ++component) {
+            const float startVelocity =
+                (coordinateAt(kStepSeconds, focus, component) -
+                 coordinateAt(0.0F, focus, component)) /
+                kStepSeconds;
+            endpointSpeedSquared += startVelocity * startVelocity;
+
+            const float velocityIn =
+                (coordinateAt(kInteriorKnotSeconds, focus, component) -
+                 coordinateAt(
+                     kInteriorKnotSeconds - kStepSeconds,
+                     focus,
+                     component)) /
+                kStepSeconds;
+            const float velocityOut =
+                (coordinateAt(
+                     kInteriorKnotSeconds + kStepSeconds,
+                     focus,
+                     component) -
+                 coordinateAt(kInteriorKnotSeconds, focus, component)) /
+                kStepSeconds;
+            const float accelerationIn =
+                (coordinateAt(kInteriorKnotSeconds, focus, component) -
+                 2.0F * coordinateAt(
+                            kInteriorKnotSeconds - kStepSeconds,
+                            focus,
+                            component) +
+                 coordinateAt(
+                     kInteriorKnotSeconds - 2.0F * kStepSeconds,
+                     focus,
+                     component)) /
+                (kStepSeconds * kStepSeconds);
+            const float accelerationOut =
+                (coordinateAt(
+                     kInteriorKnotSeconds + 2.0F * kStepSeconds,
+                     focus,
+                     component) -
+                 2.0F * coordinateAt(
+                            kInteriorKnotSeconds + kStepSeconds,
+                            focus,
+                            component) +
+                 coordinateAt(kInteriorKnotSeconds, focus, component)) /
+                (kStepSeconds * kStepSeconds);
+
+            CHECK(velocityOut == Approx(velocityIn).margin(0.08F));
+            CHECK(accelerationOut == Approx(accelerationIn).margin(0.8F));
+        }
+        CHECK(endpointSpeedSquared > 1.0e-4F);
+    }
+}
+
+TEST_CASE("Timing reset cannot bend camera or focus geometry and bakes stale corrections",
+          "[camera][animation][key-editing][timing-reset][smooth-spline]") {
+    invisible_places::camera::AnimationPath path;
+    path.durationFrames = 90U;
+    path.keys = {
+        {.id = "A",
+         .cameraPosition = {0.0F, 0.0F, 0.0F},
+         .focusPoint = {0.0F, -2.0F, 0.0F},
+         .durationFrames = 90U},
+        {.id = "B",
+         .cameraPosition = {1.0F, 0.4F, 0.2F},
+         .focusPoint = {0.8F, -1.8F, 0.1F},
+         .durationFrames = 8U},
+        {.id = "C",
+         .cameraPosition = {8.0F, -3.0F, 1.0F},
+         .focusPoint = {9.0F, 4.0F, 1.5F},
+         .durationFrames = 82U},
+    };
+    const auto before = invisible_places::camera::
+        PrepareAnimationPathEvaluation(path);
+    REQUIRE(before.valid);
+
+    REQUIRE(invisible_places::camera::ResetAnimationPathTimingWeights(
+        &path));
+    const auto after = invisible_places::camera::
+        PrepareAnimationPathEvaluation(path);
+    REQUIRE(after.valid);
+    CHECK(after.geometryKnots == before.geometryKnots);
+    CHECK(after.cameraX.values == before.cameraX.values);
+    CHECK(after.cameraX.secondDerivatives ==
+          before.cameraX.secondDerivatives);
+    CHECK(after.cameraY.secondDerivatives ==
+          before.cameraY.secondDerivatives);
+    CHECK(after.focusX.secondDerivatives ==
+          before.focusX.secondDerivatives);
+    CHECK(after.focusY.secondDerivatives ==
+          before.focusY.secondDerivatives);
+
+    constexpr float kProbeSeconds = 1.0F / 300.0F;
+    const auto start = invisible_places::camera::EvaluateAnimationPath(
+        path,
+        0.0F);
+    const auto next = invisible_places::camera::EvaluateAnimationPath(
+        path,
+        kProbeSeconds);
+    const auto forwardDot = [](const auto& movement, const auto& chord) {
+        return movement[0U] * chord[0U] +
+               movement[1U] * chord[1U] +
+               movement[2U] * chord[2U];
+    };
+    const auto difference = [](const auto& to, const auto& from) {
+        return std::array<float, 3>{
+            to[0U] - from[0U],
+            to[1U] - from[1U],
+            to[2U] - from[2U],
+        };
+    };
+    CHECK(forwardDot(
+              difference(next.camera.position, start.camera.position),
+              difference(
+                  path.keys[1U].cameraPosition,
+                  path.keys[0U].cameraPosition)) > 0.0F);
+    CHECK(forwardDot(
+              difference(next.focusPoint, start.focusPoint),
+              difference(
+                  path.keys[1U].focusPoint,
+                  path.keys[0U].focusPoint)) > 0.0F);
+
+    path.localizedKeyCorrections.push_back({
+        .keyId = "A",
+        .splineCameraPosition = path.keys[0U].cameraPosition,
+        .splineFocusPoint = path.keys[0U].focusPoint,
+    });
+    path.keys[0U].cameraPosition[2U] += 0.25F;
+    const auto adjustedPose = path.keys[0U].cameraPosition;
+    REQUIRE(invisible_places::camera::ResetAnimationPathTimingWeights(
+        &path));
+    CHECK(path.localizedKeyCorrections.empty());
+    CHECK(path.keys[0U].cameraPosition == adjustedPose);
+}
+
+TEST_CASE("Inserted then promoted endpoint travels toward its next camera and focus keys",
+          "[camera][animation][key-editing][smooth-spline]") {
+    invisible_places::camera::AnimationPath path;
+    path.durationFrames = 120U;
+    path.keys = {
+        {.id = "old-start",
+         .cameraPosition = {-3.0F, -1.0F, 0.0F},
+         .focusPoint = {-2.0F, 1.0F, 0.5F},
+         .durationFrames = 20U},
+        {.id = "next",
+         .cameraPosition = {1.0F, 0.0F, 0.4F},
+         .focusPoint = {1.5F, 1.2F, 0.8F},
+         .durationFrames = 35U},
+        {.id = "far",
+         .cameraPosition = {11.0F, -5.0F, 1.5F},
+         .focusPoint = {13.0F, 7.0F, 2.0F},
+         .durationFrames = 65U},
+    };
+    path.localizedKeyCorrections.push_back({
+        .keyId = "next",
+        .splineCameraPosition = path.keys[1U].cameraPosition,
+        .splineFocusPoint = path.keys[1U].focusPoint,
+    });
+    path.keys[1U].cameraPosition[1U] += 0.2F;
+    path.keys[1U].focusPoint[2U] += 0.15F;
+    REQUIRE(invisible_places::camera::
+                BakeAnimationPathLocalizedCorrections(&path));
+
+    constexpr std::uint32_t kInsertFrame = 10U;
+    const auto beforeInsertion = invisible_places::camera::
+        PrepareAnimationPathEvaluation(path);
+    const auto sampled = invisible_places::camera::EvaluateAnimationPath(
+        path,
+        static_cast<float>(kInsertFrame) / 30.0F);
+    invisible_places::camera::AnimationPathKey inserted{
+        .id = "inserted",
+        .cameraPosition = sampled.camera.position,
+        .focusPoint = sampled.focusPoint,
+    };
+    const auto insertedIndex = invisible_places::camera::
+        InsertAnimationPathKeyAtFrame(
+            &path,
+            std::move(inserted),
+            kInsertFrame);
+    REQUIRE(insertedIndex == 1U);
+    const auto afterInsertion = invisible_places::camera::
+        PrepareAnimationPathEvaluation(path);
+    REQUIRE(afterInsertion.geometryKnots.size() ==
+            beforeInsertion.geometryKnots.size() + 1U);
+    CHECK(afterInsertion.geometryKnots.front() ==
+          Approx(beforeInsertion.geometryKnots.front()));
+    for (std::size_t oldIndex = 1U;
+         oldIndex < beforeInsertion.geometryKnots.size();
+         ++oldIndex) {
+        CHECK(afterInsertion.geometryKnots[oldIndex + 1U] ==
+              Approx(beforeInsertion.geometryKnots[oldIndex]));
+    }
+    // A cubic already passing through the inserted evaluated point is the
+    // unique clamped C2 solution on the split knot set. Matching second
+    // derivatives at every original knot verifies that adding the key did
+    // not reshape either spatial track.
+    const auto checkOriginalSplineDerivatives = [](
+        const invisible_places::camera::AnimationPreparedScalarSpline& before,
+        const invisible_places::camera::AnimationPreparedScalarSpline& after) {
+        REQUIRE(after.secondDerivatives.size() ==
+                before.secondDerivatives.size() + 1U);
+        CHECK(after.secondDerivatives.front() ==
+              Approx(before.secondDerivatives.front()).margin(2.0e-4F));
+        for (std::size_t oldIndex = 1U;
+             oldIndex < before.secondDerivatives.size();
+             ++oldIndex) {
+            CHECK(after.secondDerivatives[oldIndex + 1U] ==
+                  Approx(before.secondDerivatives[oldIndex]).margin(2.0e-4F));
+        }
+    };
+    checkOriginalSplineDerivatives(
+        beforeInsertion.cameraX,
+        afterInsertion.cameraX);
+    checkOriginalSplineDerivatives(
+        beforeInsertion.cameraY,
+        afterInsertion.cameraY);
+    checkOriginalSplineDerivatives(
+        beforeInsertion.cameraZ,
+        afterInsertion.cameraZ);
+    checkOriginalSplineDerivatives(
+        beforeInsertion.focusX,
+        afterInsertion.focusX);
+    checkOriginalSplineDerivatives(
+        beforeInsertion.focusY,
+        afterInsertion.focusY);
+    checkOriginalSplineDerivatives(
+        beforeInsertion.focusZ,
+        afterInsertion.focusZ);
+    CHECK(path.keys[1U].splineParameterWeight > 0.0F);
+    CHECK(path.keys[2U].splineParameterWeight > 0.0F);
+    REQUIRE(invisible_places::camera::RemoveAnimationPathKey(
+        &path,
+        0U));
+    REQUIRE(path.keys.front().id == "inserted");
+    CHECK(path.localizedKeyCorrections.empty());
+
+    const auto start = invisible_places::camera::EvaluateAnimationPath(
+        path,
+        0.0F);
+    const auto justAfter = invisible_places::camera::EvaluateAnimationPath(
+        path,
+        1.0F / 300.0F);
+    const auto movesToward = [](const auto& from,
+                                const auto& to,
+                                const auto& nextKey) {
+        float dot = 0.0F;
+        for (std::size_t component = 0U; component < 3U; ++component) {
+            dot += (to[component] - from[component]) *
+                   (nextKey[component] - from[component]);
+        }
+        return dot;
+    };
+    CHECK(movesToward(
+              start.camera.position,
+              justAfter.camera.position,
+              path.keys[1U].cameraPosition) > 0.0F);
+    CHECK(movesToward(
+              start.focusPoint,
+              justAfter.focusPoint,
+              path.keys[1U].focusPoint) > 0.0F);
+}
+
+TEST_CASE("Explicit orientation has continuous angular velocity and acceleration at keys",
+          "[camera][animation][orientation][smooth-spline]") {
+    invisible_places::camera::AnimationPath path;
+    path.durationFrames = 120U;
+    const auto orientationAroundZ = [](float degrees) {
+        const float halfRadians =
+            0.5F * degrees * 3.14159265358979323846F / 180.0F;
+        return std::array<float, 4>{
+            0.0F,
+            0.0F,
+            std::sin(halfRadians),
+            std::cos(halfRadians),
+        };
+    };
+    path.keys = {
+        {.id = "A",
+         .cameraPosition = {0.0F, 0.0F, 0.0F},
+         .focusPoint = {0.0F, 0.0F, -4.0F},
+         .hasOrientation = true,
+         .orientation = orientationAroundZ(0.0F),
+         .durationFrames = 20U},
+        {.id = "B",
+         .cameraPosition = {1.0F, 0.2F, 0.0F},
+         .focusPoint = {1.0F, 0.2F, -4.0F},
+         .hasOrientation = true,
+         .orientation = orientationAroundZ(25.0F),
+         .durationFrames = 25U},
+        {.id = "C",
+         .cameraPosition = {5.0F, 1.0F, 0.5F},
+         .focusPoint = {5.0F, 1.0F, -3.5F},
+         .hasOrientation = true,
+         .orientation = orientationAroundZ(105.0F),
+         .durationFrames = 55U},
+        {.id = "D",
+         .cameraPosition = {8.0F, 2.0F, 1.0F},
+         .focusPoint = {8.0F, 2.0F, -3.0F},
+         .hasOrientation = true,
+         .orientation = orientationAroundZ(145.0F),
+         .durationFrames = 40U},
+    };
+    const auto context = invisible_places::camera::
+        PrepareAnimationPathEvaluation(path);
+    REQUIRE(context.valid);
+    REQUIRE(context.knots.size() == path.keys.size());
+    const float knot = context.knots[1U];
+    constexpr float kStep = 0.004F;
+    const auto orientationAt = [&](float seconds) {
+        return invisible_places::camera::EvaluatePreparedAnimationPath(
+                   context,
+                   seconds)
+            .camera.orientation;
+    };
+    const auto centre = orientationAt(knot);
+    const auto aligned = [&](std::array<float, 4> value) {
+        float dot = 0.0F;
+        for (std::size_t component = 0U; component < 4U; ++component) {
+            dot += value[component] * centre[component];
+        }
+        if (dot < 0.0F) {
+            for (auto& component : value) {
+                component = -component;
+            }
+        }
+        return value;
+    };
+    const auto minusTwo = aligned(orientationAt(knot - 2.0F * kStep));
+    const auto minusOne = aligned(orientationAt(knot - kStep));
+    const auto plusOne = aligned(orientationAt(knot + kStep));
+    const auto plusTwo = aligned(orientationAt(knot + 2.0F * kStep));
+    for (std::size_t component = 0U; component < 4U; ++component) {
+        const float velocityIn =
+            (centre[component] - minusOne[component]) / kStep;
+        const float velocityOut =
+            (plusOne[component] - centre[component]) / kStep;
+        const float accelerationIn =
+            (centre[component] - 2.0F * minusOne[component] +
+             minusTwo[component]) /
+            (kStep * kStep);
+        const float accelerationOut =
+            (plusTwo[component] - 2.0F * plusOne[component] +
+             centre[component]) /
+            (kStep * kStep);
+        CHECK(velocityOut == Approx(velocityIn).margin(0.03F));
+        CHECK(accelerationOut == Approx(accelerationIn).margin(0.35F));
+    }
+}
+

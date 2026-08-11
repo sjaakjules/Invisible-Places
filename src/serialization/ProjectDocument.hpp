@@ -26,7 +26,7 @@ inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 73U;
 inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 27U;
 inline constexpr std::uint32_t kWaterOwnedShorelineProjectSchemaVersion = 66U;
 inline constexpr std::uint32_t kWaterOwnedShorelineSourcesSchemaVersion = 22U;
-inline constexpr std::uint32_t kAnimationDocumentSchemaVersion = 20U;
+inline constexpr std::uint32_t kAnimationDocumentSchemaVersion = 21U;
 inline constexpr std::uint32_t kWaterPathCacheSidecarSchemaVersion = 1U;
 inline constexpr std::uint64_t kMaximumPersistedWaterCacheBytes = 5ULL * 1024ULL * 1024ULL * 1024ULL;
 
