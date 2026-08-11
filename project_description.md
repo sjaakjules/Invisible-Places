@@ -239,6 +239,17 @@ ordinary renderable per-frame path, while schema-16 source, padding, and
 start-key metadata permits a deterministic rebuild after either saved or
 `_Edited` source changes.
 
+After choosing a Blend Partner and setting the timeline bounds, the timeline
+can designate one key with a matching frame inside the start/end overlap;
+velocity alignment does not need to be applied first. **Match Camera Rig To
+Partner** keeps that key's focus fixed and moves only its camera position. It
+expresses the partner frame's focus-to-camera offset as signed along-path,
+lateral, and world-height components, then rebuilds the same rig in the
+selected animation's local path frame. This preserves focus distance and
+whether the view sits forward, perpendicular, or backward relative to travel
+without moving the partner. Keys outside the overlap have no counterpart and
+cannot run this alignment.
+
 ### Animation versioning
 Every registered animation keeps its last saved, disk-backed version plus at
 most one explicit in-memory `_Edited` version. Authoring, linked-camera edits,
@@ -269,6 +280,32 @@ best-effort operations: fixed focus controls, endpoints, and the available
 camera curve can make a perfectly constant or one-directional result
 impossible. They optimize the same 3x3 focus-plane flow proxy drawn by the UI;
 they do not render scene pixels or account for depth-dependent parallax.
+Spatial camera, focus, lens, and orientation splines use
+independent cumulative motion-distance knots, so ordinary Segment Frames
+changes traversal without bending the curves. A positive monotone C2 time map
+carries non-zero velocity through each non-degenerate key; the composed
+position and orientation retain continuous velocity and acceleration.
+Endpoints use one-sided forward chord tangents rather than being forced to
+start or finish at zero speed.
+
+**Add Key at Playhead** splits the existing spatial parameter span and
+materializes its endpoint tangents, making insertion of the evaluated pose a
+spatial no-op. Manual pose edits and topology changes rebuild distance spans
+from the resulting key order. **Reset Timing Weights** shares the full duration
+evenly across all segments without moving any key. It also bakes any localized
+alignment correction into a clean C2 spline through the adjusted poses, so
+stale correction weighting cannot survive later structural or timing edits.
+At the bottom of **Keys**, **Set Selected Key from Current Camera** replaces the
+selected camera pose with the live viewport pose. Its focus ray uses the first
+stable point-cloud surface hit; when no surface is hit, the key keeps its
+previous camera-to-focus distance along the new view direction.
+
+Each animation also stores a default live-view window size. Loading that
+animation resizes the live view to its authored dimensions. The Project panel
+stores its own window size and a **Lock Window Size** option; when locked, the
+project dimensions override every animation default and remain enforced.
+Legacy animations without a stored size keep the current window unchanged and
+capture it the next time they are saved.
 
 ### Timing scalar effects
 The Timings tab owns one ordered list of scalar-driven effects. The user can

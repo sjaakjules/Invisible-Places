@@ -110,6 +110,12 @@ The default playback and render timebase shall be 30 fps.
 #### FR-CAM-9
 The shot system should support both free-orientation shots and target-driven shots.
 
+#### FR-CAM-10
+The Animation Keys panel shall allow the selected key to adopt the live camera
+pose. Focus shall use the first stable point-cloud hit along the live view ray,
+falling back to the selected key's previous camera-to-focus distance when the
+ray misses.
+
 ### 5.4 Side Panel Behaviour
 #### FR-UI-1
 The application shall include a side panel for render and style controls.
@@ -152,6 +158,15 @@ The side panel shall expose both global render controls and per-layer overrides.
 
 #### FR-UI-10
 The side panel shall provide a reusable parameter editor for all field-drivable values.
+
+#### FR-UI-11
+Each saved animation shall store a default live-view window size and request
+that size when loaded.
+
+#### FR-UI-12
+The Project section shall store a preferred live-view window size and expose a
+lock that overrides animation defaults and restores the project size after a
+manual resize.
 
 ### 5.6 Parameter Source Modes
 #### FR-PARAM-1
