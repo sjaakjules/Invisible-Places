@@ -291,9 +291,11 @@ bands and residuals, and compare baseline/candidate poses. Nothing enters the
 animation registry until **Apply Both** creates paired `_Edited` paths and the
 reciprocal blend metadata. Before Apply, an optional transition-smoothing view
 shows every A/B key and lets the user choose which controls may absorb an
-abrupt alignment bend. The generated keys and up to two authored keys inward
-from each end are selected by default; the exact feature-aligned midpoint keys
-remain locked. A bounded background pass reduces changes in projected pan
+abrupt alignment bend. The generated keys, both feature-aligned midpoint pairs,
+and up to two authored keys inward from each end are selected by default. Each
+midpoint's A/B cameras move together through the triangle correspondence rather
+than remaining fixed; a hard three-node projection check preserves the feature
+alignment. A bounded background pass reduces changes in signed projected pan
 velocity and image-rotation rate without allowing either seam to worsen. Reset
 restores the immutable triangle fit, and a rejected pass does not replace it.
 Back, Cancel, and Escape discard all private candidates and restore the launch

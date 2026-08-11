@@ -50347,7 +50347,8 @@ bool DrawAnimationLoopTimelineRow(
     const std::vector<
         invisible_places::camera::AnimationLoopKeyMovement>* keyMovements,
     const std::unordered_set<std::string>* lockedKeyIds = nullptr,
-    const std::unordered_set<std::string>* generatedKeyIds = nullptr) {
+    const std::unordered_set<std::string>* generatedKeyIds = nullptr,
+    const std::unordered_set<std::string>* constrainedKeyIds = nullptr) {
     const float duration = std::max(
         invisible_places::camera::AnimationPathDurationSeconds(path),
         1.0e-4F);
@@ -50489,11 +50490,14 @@ bool DrawAnimationLoopTimelineRow(
         const bool locked =
             lockedKeyIds != nullptr &&
             lockedKeyIds->contains(path.keys[keyIndex].id);
+        const bool constrained =
+            constrainedKeyIds != nullptr &&
+            constrainedKeyIds->contains(path.keys[keyIndex].id);
         const bool enabled =
             !locked && movableKeyIds != nullptr &&
             movableKeyIds->contains(path.keys[keyIndex].id);
         const bool eligible = !locked &&
-            (enabled || AnimationLoopKeyIsEligible(
+            (constrained || enabled || AnimationLoopKeyIsEligible(
                             path,
                             keyIndex,
                             startOverlapSeconds,
@@ -50508,6 +50512,10 @@ bool DrawAnimationLoopTimelineRow(
                 path.keys[keyIndex].id;
         const ImU32 color = locked
                                 ? IM_COL32(70, 205, 245, 255)
+                            : constrained
+                                ? (enabled
+                                       ? IM_COL32(70, 215, 245, 255)
+                                       : IM_COL32(70, 165, 190, 210))
                             : strongDestination
                                 ? IM_COL32(70, 225, 245, 255)
                             : enabled
@@ -50553,11 +50561,14 @@ bool DrawAnimationLoopTimelineRow(
         const bool locked =
             lockedKeyIds != nullptr &&
             lockedKeyIds->contains(key.id);
+        const bool constrained =
+            constrainedKeyIds != nullptr &&
+            constrainedKeyIds->contains(key.id);
         const bool enabled =
             !locked && movableKeyIds != nullptr &&
             movableKeyIds->contains(key.id);
         const bool eligible = !locked &&
-            (enabled || AnimationLoopKeyIsEligible(
+            (constrained || enabled || AnimationLoopKeyIsEligible(
                             path,
                             keyIndex,
                             startOverlapSeconds,
@@ -50581,7 +50592,8 @@ bool DrawAnimationLoopTimelineRow(
             }
         }
         const bool smoothingSelection =
-            lockedKeyIds != nullptr || generatedKeyIds != nullptr;
+            lockedKeyIds != nullptr || generatedKeyIds != nullptr ||
+            constrainedKeyIds != nullptr;
         ImGui::SetTooltip(
             "Key %zu%s%s\n%s\nCamera %.4f, focus %.4f%s",
             keyIndex + 1U,
@@ -50591,6 +50603,10 @@ bool DrawAnimationLoopTimelineRow(
                 : ("  " + key.sourceShotName).c_str(),
             locked
                 ? "Feature lock: preserves the exact triangle-aligned midpoint"
+            : constrained
+                ? (enabled
+                       ? "Paired 50% triangle constraint: both A/B cameras move together"
+                       : "Paired 50% triangle constraint: coordinated movement is off")
             : eligible
                 ? (enabled
                        ? (smoothingSelection
@@ -52080,17 +52096,32 @@ void ResetReciprocalPanSmoothingResult(
     wizard->smoothingError.clear();
 }
 
-std::unordered_set<std::string> ReciprocalPanFeatureLockedKeyIds(
+std::unordered_set<std::string> ReciprocalPanMidpointKeyIds(
     const AnimationReciprocalPanWizardState& wizard,
     std::size_t role) {
-    std::unordered_set<std::string> locked;
+    std::unordered_set<std::string> midpoint;
     if (role >= wizard.baselinePaths.size() ||
         wizard.baselinePaths[role].keys.empty()) {
-        return locked;
+        return midpoint;
     }
-    locked.insert(wizard.baselinePaths[role].keys.front().id);
-    locked.insert(wizard.baselinePaths[role].keys.back().id);
-    return locked;
+    midpoint.insert(wizard.baselinePaths[role].keys.front().id);
+    midpoint.insert(wizard.baselinePaths[role].keys.back().id);
+    return midpoint;
+}
+
+std::array<std::pair<std::string, std::string>, 2U>
+ReciprocalPanMidpointKeyPairs(
+    const AnimationReciprocalPanWizardState& wizard) {
+    if (wizard.baselinePaths[0U].keys.empty() ||
+        wizard.baselinePaths[1U].keys.empty()) {
+        return {};
+    }
+    return {{
+        {wizard.baselinePaths[0U].keys.front().id,
+         wizard.baselinePaths[1U].keys.back().id},
+        {wizard.baselinePaths[0U].keys.back().id,
+         wizard.baselinePaths[1U].keys.front().id},
+    }};
 }
 
 std::unordered_set<std::string> ReciprocalPanGeneratedKeyIds(
@@ -52130,10 +52161,15 @@ void InitializeReciprocalPanSmoothingSelection(
             role);
         selected.insert(generated.begin(), generated.end());
 
+        // The exact 50% feature pose is a paired constraint, not a fixed
+        // camera. Select both original seam endpoints so the smoother can move
+        // them together while retaining all three projected-node matches.
+        const auto midpoint = ReciprocalPanMidpointKeyIds(*wizard, role);
+        selected.insert(midpoint.begin(), midpoint.end());
+
         // Spread a large endpoint correction into the two nearest authored
-        // controls by default. The triangle-defining old first/final keys are
-        // deliberately skipped, as are linked CameraShots whose wider edit
-        // scope needs an explicit user choice.
+        // controls by default. Linked CameraShots whose wider edit scope needs
+        // an explicit user choice remain excluded from these extra neighbours.
         const auto& baseline = wizard->baselinePaths[role];
         for (std::size_t distance = 1U; distance <= 2U; ++distance) {
             if (distance + 1U < baseline.keys.size()) {
@@ -52393,12 +52429,22 @@ bool StartReciprocalPanTransitionSmoothing(
         InitializeReciprocalPanSmoothingSelection(&wizard);
     }
 
+    const auto midpointPairs = ReciprocalPanMidpointKeyPairs(wizard);
+    for (const auto& [firstId, secondId] : midpointPairs) {
+        const bool firstSelected =
+            wizard.smoothingMovableKeyIds[0U].contains(firstId);
+        const bool secondSelected =
+            wizard.smoothingMovableKeyIds[1U].contains(secondId);
+        if (firstSelected != secondSelected) {
+            // A triangle-aligned midpoint is one logical control. Defensively
+            // complete the pair if an older UI state selected only one side.
+            wizard.smoothingMovableKeyIds[0U].insert(firstId);
+            wizard.smoothingMovableKeyIds[1U].insert(secondId);
+        }
+    }
+
     std::array<std::unordered_set<std::string>, 2U> selectedOriginalIds;
     for (std::size_t role = 0U; role < 2U; ++role) {
-        const auto locked = ReciprocalPanFeatureLockedKeyIds(wizard, role);
-        for (const auto& lockedId : locked) {
-            wizard.smoothingMovableKeyIds[role].erase(lockedId);
-        }
         for (const auto& key : wizard.baselinePaths[role].keys) {
             if (wizard.smoothingMovableKeyIds[role].contains(key.id)) {
                 selectedOriginalIds[role].insert(key.id);
@@ -52470,7 +52516,25 @@ bool StartReciprocalPanTransitionSmoothing(
     options.maxOptimizationSweeps = 16U;
     options.minimumStepFraction = 0.0125F;
     options.imageRotationMismatchWeight = 0.35F;
-    options.selectedNeighborhoodSmoothnessWeight = 0.75F;
+    options.selectedNeighborhoodSmoothnessWeight = 1.50F;
+    const auto addMidpointConstraint = [&](std::size_t seamIndex,
+                                           std::size_t firstTriangle,
+                                           std::size_t secondTriangle) {
+        const auto& [firstId, secondId] = midpointPairs[seamIndex];
+        if (!wizard.smoothingMovableKeyIds[0U].contains(firstId) ||
+            !wizard.smoothingMovableKeyIds[1U].contains(secondId)) {
+            return;
+        }
+        options.triangleAlignmentConstraints.push_back({
+            .firstKeyId = firstId,
+            .secondKeyId = secondId,
+            .firstPatch = wizard.endpointTriangles[firstTriangle].patch,
+            .secondPatch = wizard.endpointTriangles[secondTriangle].patch,
+        });
+    };
+    addMidpointConstraint(0U, 0U, 1U);  // A-start <-> B-end.
+    addMidpointConstraint(1U, 3U, 2U);  // A-end <-> B-start.
+    options.triangleAlignmentWeight = 8.0F;
 
     const std::uint64_t generation = ++wizard.smoothingGeneration;
     job.activeGeneration = generation;
@@ -52573,25 +52637,6 @@ void PollAnimationReciprocalPanSmoothingJob(
                 wizard.smoothingMovableKeyIds[role]) !=
                 completed->movableKeyIds[role]) {
             return;
-        }
-        const auto locked = ReciprocalPanFeatureLockedKeyIds(wizard, role);
-        for (const auto& lockedId : locked) {
-            const auto raw = std::find_if(
-                rawCandidates[role]->keys.begin(),
-                rawCandidates[role]->keys.end(),
-                [&](const auto& key) { return key.id == lockedId; });
-            const auto smoothed = std::find_if(
-                completed->candidates[role].keys.begin(),
-                completed->candidates[role].keys.end(),
-                [&](const auto& key) { return key.id == lockedId; });
-            if (raw == rawCandidates[role]->keys.end() ||
-                smoothed == completed->candidates[role].keys.end() ||
-                raw->cameraPosition != smoothed->cameraPosition ||
-                raw->focusPoint != smoothed->focusPoint) {
-                wizard.smoothingError =
-                    "Transition smoothing was rejected because a feature-locked midpoint key moved.";
-                return;
-            }
         }
     }
     wizard.smoothingResult = completed->result;
@@ -53903,7 +53948,7 @@ void DrawReciprocalPanTransitionSmoothingControls(
 
     ImGui::SeparatorText("Optional transition smoothing");
     ImGui::TextWrapped(
-        "Cyan authored keys are the exact triangle-aligned 50%% midpoint poses and stay locked. Green keys may move within the limit; amber keys are available. Diamonds are generated pre-roll/tail keys.");
+        "Cyan authored keys are paired 50%% triangle constraints: both A/B cameras may move together, while the three feature nodes stay aligned. Green keys may move independently within the limit; amber keys are available. Diamonds are generated pre-roll/tail keys.");
     ImGui::BeginDisabled(wizard.smoothingInProgress);
     if (ImGui::Button("Recommended selection")) {
         InitializeReciprocalPanSmoothingSelection(&wizard);
@@ -53926,6 +53971,18 @@ void DrawReciprocalPanTransitionSmoothingControls(
     }
 
     bool selectionChanged = false;
+    const auto midpointPairs = ReciprocalPanMidpointKeyPairs(wizard);
+    std::array<std::array<bool, 2U>, 2U> midpointSelectionBefore{};
+    for (std::size_t seamIndex = 0U;
+         seamIndex < midpointPairs.size();
+         ++seamIndex) {
+        midpointSelectionBefore[seamIndex] = {
+            wizard.smoothingMovableKeyIds[0U].contains(
+                midpointPairs[seamIndex].first),
+            wizard.smoothingMovableKeyIds[1U].contains(
+                midpointPairs[seamIndex].second),
+        };
+    }
     const std::array<float, 2U> startOverlaps{
         2.0F * static_cast<float>(wizard.sourceTailFrames[0U]) / 30.0F,
         2.0F * static_cast<float>(wizard.sourceTailFrames[1U]) / 30.0F,
@@ -53938,7 +53995,7 @@ void DrawReciprocalPanTransitionSmoothingControls(
         const auto& candidate = role == 0U
             ? wizard.candidate->firstCandidate
             : wizard.candidate->secondCandidate;
-        const auto locked = ReciprocalPanFeatureLockedKeyIds(wizard, role);
+        const auto midpoint = ReciprocalPanMidpointKeyIds(wizard, role);
         const auto generated = ReciprocalPanGeneratedKeyIds(wizard, role);
         const auto* movement =
             wizard.smoothingResult.has_value()
@@ -53983,9 +54040,36 @@ void DrawReciprocalPanTransitionSmoothingControls(
                 ? wizard.smoothingResult->maxScreenDisplacement[role]
                 : 0.0F,
             movement,
-            &locked,
-            &generated);
+            nullptr,
+            &generated,
+            &midpoint);
         ImGui::PopID();
+    }
+    if (selectionChanged) {
+        for (std::size_t seamIndex = 0U;
+             seamIndex < midpointPairs.size();
+             ++seamIndex) {
+            const auto& [firstId, secondId] = midpointPairs[seamIndex];
+            const bool firstSelected =
+                wizard.smoothingMovableKeyIds[0U].contains(firstId);
+            const bool secondSelected =
+                wizard.smoothingMovableKeyIds[1U].contains(secondId);
+            if (firstSelected == secondSelected) {
+                continue;
+            }
+            const bool firstChanged =
+                firstSelected != midpointSelectionBefore[seamIndex][0U];
+            const bool pairEnabled = firstChanged
+                ? firstSelected
+                : secondSelected;
+            if (pairEnabled) {
+                wizard.smoothingMovableKeyIds[0U].insert(firstId);
+                wizard.smoothingMovableKeyIds[1U].insert(secondId);
+            } else {
+                wizard.smoothingMovableKeyIds[0U].erase(firstId);
+                wizard.smoothingMovableKeyIds[1U].erase(secondId);
+            }
+        }
     }
     if (selectionChanged) {
         ResetReciprocalPanSmoothingResult(&wizard);
@@ -54051,12 +54135,20 @@ void DrawReciprocalPanTransitionSmoothingControls(
         const float afterRotation = 0.5F *
             (result.afterSeamRotationMismatch[0U] +
              result.afterSeamRotationMismatch[1U]);
+        const float beforeTrianglePixels = 540.0F *
+            (result.beforeTriangleAlignmentRms[0U] +
+             result.beforeTriangleAlignmentRms[1U]);
+        const float afterTrianglePixels = 540.0F *
+            (result.afterTriangleAlignmentRms[0U] +
+             result.afterTriangleAlignmentRms[1U]);
         ImGui::TextWrapped(
-            "Smoothed candidate active. Neighbourhood roughness %.5f -> %.5f; seam rotation mismatch %.5f -> %.5f; max camera move %.4f m, focus move %.4f m.",
+            "Smoothed candidate active. Neighbourhood speed/rotation roughness %.5f -> %.5f; seam rotation mismatch %.5f -> %.5f; paired-triangle RMS %.3f -> %.3f px @1080; max camera move %.4f m, focus move %.4f m.",
             beforeRoughness,
             afterRoughness,
             beforeRotation,
             afterRotation,
+            beforeTrianglePixels,
+            afterTrianglePixels,
             result.maxCameraMove,
             result.maxFocusMove);
     }

@@ -1537,17 +1537,18 @@ TEST_CASE("Bidirectional reciprocal pan extension generates pre-roll and tail fr
 }
 
 TEST_CASE(
-    "Selected transition smoothing keeps triangle midpoint keys fixed while spreading reciprocal motion",
+    "Selected transition smoothing moves paired midpoint cameras while preserving triangle alignment",
     "[camera][animation][pan-extension][transition-smoothing]") {
     const auto firstBaseline =
         MakeReciprocalPanTestPath("smooth-A", 1.0F, 41U, 79U);
     const auto secondBaseline =
         MakeReciprocalPanTestPath("smooth-B", -1.0F, 54U, 96U);
+    const auto extensionOptions = MakeReciprocalPanTestOptions();
     const auto extension = invisible_places::camera::
         BuildAnimationBidirectionalReciprocalPanExtension(
             firstBaseline,
             secondBaseline,
-            MakeReciprocalPanTestOptions());
+            extensionOptions);
     INFO(extension.errorMessage);
     REQUIRE(extension.succeeded);
     auto first = extension.firstCandidate;
@@ -1568,7 +1569,9 @@ TEST_CASE(
         }
         // The sole interior authored key is the nearest available control on
         // both sides of this compact test path.
+        result.push_back(baseline.keys.front().id);
         result.push_back(baseline.keys[1U].id);
+        result.push_back(baseline.keys.back().id);
         return result;
     };
     invisible_places::camera::AnimationLoopSmoothingOptions options;
@@ -1585,7 +1588,24 @@ TEST_CASE(
     options.maxOptimizationSweeps = 16U;
     options.minimumStepFraction = 0.0125F;
     options.imageRotationMismatchWeight = 0.35F;
-    options.selectedNeighborhoodSmoothnessWeight = 0.75F;
+    options.selectedNeighborhoodSmoothnessWeight = 1.50F;
+    options.triangleAlignmentConstraints = {
+        {
+            .firstKeyId = firstBaseline.keys.front().id,
+            .secondKeyId = secondBaseline.keys.back().id,
+            .firstPatch = extensionOptions.firstDrivesSecond.sourcePatch,
+            .secondPatch =
+                extensionOptions.firstDrivesSecond.destinationEndPatch,
+        },
+        {
+            .firstKeyId = firstBaseline.keys.back().id,
+            .secondKeyId = secondBaseline.keys.front().id,
+            .firstPatch =
+                extensionOptions.secondDrivesFirst.destinationEndPatch,
+            .secondPatch = extensionOptions.secondDrivesFirst.sourcePatch,
+        },
+    };
+    options.triangleAlignmentWeight = 8.0F;
 
     const auto smoothing = invisible_places::camera::
         SmoothAnimationLoopTransitions(&first, &second, options);
@@ -1605,6 +1625,12 @@ TEST_CASE(
           smoothing.beforeSeamRotationMismatch[0U] + 1.0e-5F);
     CHECK(smoothing.afterSeamRotationMismatch[1U] <=
           smoothing.beforeSeamRotationMismatch[1U] + 1.0e-5F);
+    for (std::size_t seam = 0U; seam < 2U; ++seam) {
+        CHECK(smoothing.afterTriangleAlignmentRms[seam] <=
+              smoothing.beforeTriangleAlignmentRms[seam] + 2.1e-5F);
+        CHECK(smoothing.afterTriangleAlignmentMax[seam] <=
+              smoothing.beforeTriangleAlignmentMax[seam] + 3.1e-5F);
+    }
 
     const auto findKey = [](const auto& path, std::string_view id)
         -> const invisible_places::camera::AnimationPathKey& {
@@ -1615,6 +1641,7 @@ TEST_CASE(
         REQUIRE(found != path.keys.end());
         return *found;
     };
+    std::size_t movedMidpointCount = 0U;
     for (const auto& [before, after, baseline] : {
              std::tuple{&firstBefore, &first, &firstBaseline},
              std::tuple{&secondBefore, &second, &secondBaseline}}) {
@@ -1623,12 +1650,42 @@ TEST_CASE(
                  &baseline->keys.back()}) {
             const auto& beforeKey = findKey(*before, midpoint->id);
             const auto& afterKey = findKey(*after, midpoint->id);
-            CHECK(afterKey.cameraPosition == beforeKey.cameraPosition);
-            CHECK(afterKey.focusPoint == beforeKey.focusPoint);
+            const bool moved =
+                afterKey.cameraPosition != beforeKey.cameraPosition ||
+                afterKey.focusPoint != beforeKey.focusPoint;
+            movedMidpointCount += moved ? 1U : 0U;
         }
         CHECK(after->keys.size() == before->keys.size());
         CHECK(after->durationFrames == before->durationFrames);
     }
+    CHECK(movedMidpointCount >= 2U);
+    const auto keyMoved = [&](const auto& before,
+                              const auto& after,
+                              std::string_view id) {
+        const auto& beforeKey = findKey(before, id);
+        const auto& afterKey = findKey(after, id);
+        return beforeKey.cameraPosition != afterKey.cameraPosition ||
+               beforeKey.focusPoint != afterKey.focusPoint;
+    };
+    const bool firstSeamDriverMoved = keyMoved(
+        firstBefore,
+        first,
+        firstBaseline.keys.front().id);
+    const bool firstSeamFollowerMoved = keyMoved(
+        secondBefore,
+        second,
+        secondBaseline.keys.back().id);
+    const bool secondSeamDriverMoved = keyMoved(
+        firstBefore,
+        first,
+        firstBaseline.keys.back().id);
+    const bool secondSeamFollowerMoved = keyMoved(
+        secondBefore,
+        second,
+        secondBaseline.keys.front().id);
+    CHECK(firstSeamDriverMoved == firstSeamFollowerMoved);
+    CHECK(secondSeamDriverMoved == secondSeamFollowerMoved);
+    CHECK((firstSeamDriverMoved || secondSeamDriverMoved));
 }
 
 TEST_CASE(

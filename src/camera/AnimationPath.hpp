@@ -434,6 +434,17 @@ struct AnimationClipPlaneNormalizationResult {
     std::string errorMessage;
 };
 
+// A runtime-only constraint for transition smoothing. The two ordered world-
+// space triangles describe corresponding features at one visual 50% seam.
+// Both identified keys remain movable, but they move as a coordinated pair so
+// all three projected nodes retain their alignment.
+struct AnimationLoopTriangleAlignmentConstraint {
+    std::string firstKeyId;
+    std::string secondKeyId;
+    AnimationSurfacePatchObservation firstPatch{};
+    AnimationSurfacePatchObservation secondPatch{};
+};
+
 struct AnimationLoopSmoothingOptions {
     float maxEndMoveFraction = 0.10F;
     std::string pairId;
@@ -464,6 +475,12 @@ struct AnimationLoopSmoothingOptions {
     // its historical screen-translation objective exactly.
     float imageRotationMismatchWeight = 0.0F;
     float selectedNeighborhoodSmoothnessWeight = 0.0F;
+    // Optional reciprocal-pan midpoint constraints. Each key pair must be in
+    // the explicit movable selection. These are intentionally not serialized:
+    // the assistant owns the captured feature triangles until Apply.
+    std::vector<AnimationLoopTriangleAlignmentConstraint>
+        triangleAlignmentConstraints;
+    float triangleAlignmentWeight = 0.0F;
     // Runtime-only cancellation for immutable background previews. It is
     // never serialized and has no effect for ordinary foreground calls.
     std::stop_token stopToken{};
@@ -503,6 +520,10 @@ struct AnimationLoopSmoothingResult {
     std::array<float, 2> afterSeamRotationMismatch{0.0F, 0.0F};
     std::array<float, 2> beforeNeighborhoodRoughness{0.0F, 0.0F};
     std::array<float, 2> afterNeighborhoodRoughness{0.0F, 0.0F};
+    std::array<float, 2> beforeTriangleAlignmentRms{0.0F, 0.0F};
+    std::array<float, 2> afterTriangleAlignmentRms{0.0F, 0.0F};
+    std::array<float, 2> beforeTriangleAlignmentMax{0.0F, 0.0F};
+    std::array<float, 2> afterTriangleAlignmentMax{0.0F, 0.0F};
     float beforeObjective = 0.0F;
     float afterObjective = 0.0F;
     // Weighted RMS change from each animation's original terminal perceived-
@@ -766,8 +787,9 @@ BuildAnimationCameraLocalSurfacePatch(
 // (or endpoints for legacy callers). durationFrames and every per-key
 // durationFrames value are never written. Applied paths evaluate their
 // preserved distance-parameterized C2 spline plus compact quintic-Hermite
-// corrections confined to segments touching a selected key; locked-key
-// positions and correction derivatives remain exact.
+// corrections confined to segments touching a selected key; unselected-key
+// positions and correction derivatives remain exact. Optional reciprocal
+// midpoint pairs move through their triangle-derived coupled transform.
 [[nodiscard]] AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
     AnimationPath* first,
     AnimationPath* second,

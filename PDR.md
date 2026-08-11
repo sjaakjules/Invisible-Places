@@ -193,13 +193,16 @@ open.
 
 #### FR-CAM-20
 Final Preview shall offer an optional selected-key transition-smoothing pass.
-The exact triangle-aligned midpoint keys shall remain locked; generated keys
-and up to two neighbouring authored keys on each side shall be recommended as
-movable. The user may toggle eligible keys per animation and set a bounded
-movement allowance before smoothing. The pass shall reduce local screen-flow
-and image-rotation discontinuities without worsening either seam, while Reset
-shall restore the immutable triangle fit. Applying without a successful pass
-shall preserve the unsmoothed fit.
+The two keys at each exact triangle-aligned midpoint shall be a coordinated
+movable pair rather than fixed poses. Generated keys, both midpoint pairs, and
+up to two neighbouring authored keys on each side shall be recommended as
+movable. Toggling either midpoint key shall toggle its partner. The user may
+toggle other eligible keys per animation and set a bounded movement allowance.
+The pass shall favour constant signed screen velocity and image-rotation rate
+through the seam, while a hard three-node projection check preserves each
+triangle alignment and neither seam may worsen. Reset shall restore the
+immutable triangle fit. Applying without a successful pass shall preserve the
+unsmoothed fit.
 
 ### 5.4 Side Panel Behaviour
 #### FR-UI-1

@@ -5426,6 +5426,26 @@ struct LoopEndpointGroup {
     float focusCap = 0.0F;
 };
 
+struct LoopTriangleAlignment {
+    std::size_t firstKeyIndex = 0U;
+    std::size_t secondKeyIndex = 0U;
+    std::size_t driverGroupIndex = 0U;
+    std::size_t followerGroupIndex = 0U;
+    AnimationSurfacePatchObservation firstPatch{};
+    AnimationSurfacePatchObservation secondPatch{};
+    PanTriangleSimilarity firstToSecond{};
+    std::array<float, 3> originalDriverCamera{};
+    std::array<float, 3> originalDriverFocus{};
+    std::array<float, 3> originalFollowerCamera{};
+    std::array<float, 3> originalFollowerFocus{};
+};
+
+struct LoopTriangleAlignmentMeasurement {
+    bool valid = true;
+    std::array<float, 2> rms{0.0F, 0.0F};
+    std::array<float, 2> maximum{0.0F, 0.0F};
+};
+
 void EnsureLocalizedKeyCorrections(
     AnimationPath* path,
     const std::vector<std::size_t>& movableKeyIndices) {
@@ -5624,6 +5644,182 @@ bool ProjectLoopEndpointPositionToCaps(
         });
 }
 
+std::optional<std::size_t> FindLoopEndpointGroup(
+    const std::vector<LoopEndpointGroup>& groups,
+    std::size_t pathIndex,
+    std::size_t keyIndex) {
+    for (std::size_t groupIndex = 0U;
+         groupIndex < groups.size();
+         ++groupIndex) {
+        const bool containsOccurrence = std::any_of(
+            groups[groupIndex].occurrences.begin(),
+            groups[groupIndex].occurrences.end(),
+            [&](const LoopEndpointOccurrence& occurrence) {
+                return occurrence.pathIndex == pathIndex &&
+                       occurrence.keyIndex == keyIndex;
+            });
+        if (containsOccurrence) {
+            return groupIndex;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::vector<LoopTriangleAlignment>>
+ResolveLoopTriangleAlignments(
+    const AnimationPath& first,
+    const AnimationPath& second,
+    const std::vector<LoopEndpointGroup>& groups,
+    const AnimationLoopSmoothingOptions& options,
+    std::string* errorMessage) {
+    if (options.triangleAlignmentConstraints.size() > 2U) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "Transition smoothing supports at most two reciprocal triangle seams.";
+        }
+        return std::nullopt;
+    }
+    std::vector<LoopTriangleAlignment> result;
+    result.reserve(options.triangleAlignmentConstraints.size());
+    std::unordered_set<std::size_t> usedGroups;
+    for (const auto& constraint : options.triangleAlignmentConstraints) {
+        const auto resolveKey = [&](const AnimationPath& path,
+                                    const std::string& keyId)
+            -> std::optional<std::size_t> {
+            if (keyId.empty()) {
+                return std::nullopt;
+            }
+            const auto found = std::find_if(
+                path.keys.begin(),
+                path.keys.end(),
+                [&](const AnimationPathKey& key) { return key.id == keyId; });
+            if (found == path.keys.end() ||
+                std::count_if(
+                    path.keys.begin(),
+                    path.keys.end(),
+                    [&](const AnimationPathKey& key) {
+                        return key.id == keyId;
+                    }) != 1) {
+                return std::nullopt;
+            }
+            return static_cast<std::size_t>(
+                std::distance(path.keys.begin(), found));
+        };
+        const auto firstKeyIndex = resolveKey(first, constraint.firstKeyId);
+        const auto secondKeyIndex = resolveKey(second, constraint.secondKeyId);
+        if (!firstKeyIndex.has_value() || !secondKeyIndex.has_value() ||
+            !ValidOrderedPanTriangle(constraint.firstPatch) ||
+            !ValidOrderedPanTriangle(constraint.secondPatch)) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "Each smoothed midpoint needs two valid, ordered three-node triangles and persistent key IDs.";
+            }
+            return std::nullopt;
+        }
+        const auto driverGroup = FindLoopEndpointGroup(
+            groups,
+            0U,
+            firstKeyIndex.value());
+        const auto followerGroup = FindLoopEndpointGroup(
+            groups,
+            1U,
+            secondKeyIndex.value());
+        if (!driverGroup.has_value() || !followerGroup.has_value()) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "Both keys at a triangle-aligned midpoint must be enabled together.";
+            }
+            return std::nullopt;
+        }
+        if (driverGroup.value() == followerGroup.value() ||
+            !usedGroups.insert(driverGroup.value()).second ||
+            !usedGroups.insert(followerGroup.value()).second) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "A midpoint camera cannot participate in more than one triangle-alignment constraint.";
+            }
+            return std::nullopt;
+        }
+        const auto similarity = BuildPanTriangleSimilarity(
+            constraint.firstPatch,
+            constraint.secondPatch);
+        if (!similarity.valid) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "The midpoint triangles cannot define a stable coordinated camera transform.";
+            }
+            return std::nullopt;
+        }
+        const auto& driver = groups[driverGroup.value()];
+        const auto& follower = groups[followerGroup.value()];
+        result.push_back({
+            .firstKeyIndex = firstKeyIndex.value(),
+            .secondKeyIndex = secondKeyIndex.value(),
+            .driverGroupIndex = driverGroup.value(),
+            .followerGroupIndex = followerGroup.value(),
+            .firstPatch = constraint.firstPatch,
+            .secondPatch = constraint.secondPatch,
+            .firstToSecond = similarity,
+            .originalDriverCamera = driver.cameraPosition,
+            .originalDriverFocus = driver.focusPoint,
+            .originalFollowerCamera = follower.cameraPosition,
+            .originalFollowerFocus = follower.focusPoint,
+        });
+    }
+    return result;
+}
+
+std::array<float, 3> TransformLoopTriangleDelta(
+    const LoopTriangleAlignment& alignment,
+    const std::array<float, 3>& driverPosition,
+    const std::array<float, 3>& originalDriverPosition,
+    const std::array<float, 3>& originalFollowerPosition) {
+    const glm::vec3 driverDelta =
+        ToGlm(driverPosition) - ToGlm(originalDriverPosition);
+    const glm::vec3 follower =
+        ToGlm(originalFollowerPosition) +
+        alignment.firstToSecond.scale *
+            (alignment.firstToSecond.rotation * driverDelta);
+    return {follower.x, follower.y, follower.z};
+}
+
+bool UpdateLoopTriangleFollowerGroups(
+    std::vector<LoopEndpointGroup>* groups,
+    const std::vector<LoopTriangleAlignment>& alignments) {
+    if (groups == nullptr) {
+        return false;
+    }
+    for (const auto& alignment : alignments) {
+        if (alignment.driverGroupIndex >= groups->size() ||
+            alignment.followerGroupIndex >= groups->size()) {
+            return false;
+        }
+        const auto& driver = (*groups)[alignment.driverGroupIndex];
+        auto& follower = (*groups)[alignment.followerGroupIndex];
+        follower.cameraPosition = TransformLoopTriangleDelta(
+            alignment,
+            driver.cameraPosition,
+            alignment.originalDriverCamera,
+            alignment.originalFollowerCamera);
+        follower.focusPoint = TransformLoopTriangleDelta(
+            alignment,
+            driver.focusPoint,
+            alignment.originalDriverFocus,
+            alignment.originalFollowerFocus);
+        if (!ProjectLoopEndpointPositionToCaps(
+                follower,
+                true,
+                &follower.cameraPosition) ||
+            !ProjectLoopEndpointPositionToCaps(
+                follower,
+                false,
+                &follower.focusPoint)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void ApplyLoopEndpointGroups(
     AnimationPath* first,
     AnimationPath* second,
@@ -5709,7 +5905,62 @@ struct LoopScore {
     std::array<float, 2> seamRotationMismatch{0.0F, 0.0F};
     std::array<float, 2> neighborhoodRoughness{0.0F, 0.0F};
     std::array<float, 2> terminalSpeedRmsChange{0.0F, 0.0F};
+    std::array<float, 2> triangleAlignmentRms{0.0F, 0.0F};
+    std::array<float, 2> triangleAlignmentMax{0.0F, 0.0F};
 };
+
+LoopTriangleAlignmentMeasurement MeasureLoopTriangleAlignments(
+    const PreparedAnimationPathEvaluationContext& first,
+    const PreparedAnimationPathEvaluationContext& second,
+    const std::vector<LoopTriangleAlignment>& alignments) {
+    LoopTriangleAlignmentMeasurement measurement;
+    const PreparedAnimationPathEvaluationContext* contexts[] = {
+        &first,
+        &second,
+    };
+    for (std::size_t alignmentIndex = 0U;
+         alignmentIndex < alignments.size();
+         ++alignmentIndex) {
+        const auto& alignment = alignments[alignmentIndex];
+        if (alignment.firstKeyIndex >= contexts[0U]->knots.size() ||
+            alignment.secondKeyIndex >= contexts[1U]->knots.size()) {
+            measurement.valid = false;
+            return measurement;
+        }
+        const auto firstDescriptor = DescribePreparedPanPatch(
+            *contexts[0U],
+            contexts[0U]->knots[alignment.firstKeyIndex],
+            alignment.firstPatch);
+        const auto secondDescriptor = DescribePreparedPanPatch(
+            *contexts[1U],
+            contexts[1U]->knots[alignment.secondKeyIndex],
+            alignment.secondPatch);
+        if (!firstDescriptor.valid || !secondDescriptor.valid) {
+            measurement.valid = false;
+            return measurement;
+        }
+        float squared = 0.0F;
+        float maximum = 0.0F;
+        for (std::size_t pointIndex = 0U;
+             pointIndex < firstDescriptor.projectedPoints.size();
+             ++pointIndex) {
+            const float x =
+                firstDescriptor.projectedPoints[pointIndex][0U] -
+                secondDescriptor.projectedPoints[pointIndex][0U];
+            const float y =
+                firstDescriptor.projectedPoints[pointIndex][1U] -
+                secondDescriptor.projectedPoints[pointIndex][1U];
+            const float distance = std::hypot(x, y);
+            squared += distance * distance;
+            maximum = std::max(maximum, distance);
+        }
+        measurement.rms[alignmentIndex] = std::sqrt(
+            squared /
+            static_cast<float>(firstDescriptor.projectedPoints.size()));
+        measurement.maximum[alignmentIndex] = maximum;
+    }
+    return measurement;
+}
 
 std::array<float, 2> HorizontalWipeRegion(
     bool outgoing,
@@ -5797,12 +6048,16 @@ LoopScore ScoreLoopPair(
     const PreparedAnimationPathEvaluationContext& originalFirst,
     const PreparedAnimationPathEvaluationContext& originalSecond,
     const std::vector<LoopEndpointGroup>& groups,
+    const std::vector<LoopTriangleAlignment>& triangleAlignments,
     const LoopOverlapDurations& overlaps,
     const AnimationLoopSmoothingOptions& options) {
     constexpr std::uint32_t kTerminalSampleIntervals = 12U;
-    // Keep the already-authored terminal speed curve dominant enough that
-    // the optimizer primarily rotates screen motion instead of retuning it.
-    constexpr float kOriginalSpeedCurveWeight = 1.50F;
+    // Ordinary velocity alignment preserves the authored speed curve. A
+    // triangle-constrained reciprocal seam intentionally permits retuning the
+    // small selected neighbourhood so signed screen velocity can remain
+    // constant through the movable 50% midpoint.
+    const float originalSpeedCurveWeight =
+        triangleAlignments.empty() ? 1.50F : 0.20F;
     constexpr float kEndpointMovementWeight = 0.02F;
     const auto candidateFirst = PrepareAnimationPathEvaluation(first);
     const auto candidateSecond = PrepareAnimationPathEvaluation(second);
@@ -5815,6 +6070,10 @@ LoopScore ScoreLoopPair(
         &originalSecond,
     };
     LoopScore score;
+    if (!candidateFirst.valid || !candidateSecond.valid) {
+        score.objective = std::numeric_limits<float>::infinity();
+        return score;
+    }
     if (options.stopToken.stop_requested()) {
         score.cancelled = true;
         return score;
@@ -5834,6 +6093,12 @@ LoopScore ScoreLoopPair(
             : 0.0F,
         0.0F,
         10.0F);
+    const float triangleAlignmentWeight = std::clamp(
+        std::isfinite(options.triangleAlignmentWeight)
+            ? options.triangleAlignmentWeight
+            : 0.0F,
+        0.0F,
+        100.0F);
     const std::array<std::pair<std::size_t, std::size_t>, 2> seams{{
         {0U, 1U},
         {1U, 0U},
@@ -5967,7 +6232,7 @@ LoopScore ScoreLoopPair(
                 weight *
                 (normalizedMismatch +
                  rotationWeight * normalizedRotationMismatch +
-                 kOriginalSpeedCurveWeight *
+                 originalSpeedCurveWeight *
                      ((outgoingSpeedError * outgoingSpeedError) +
                       (incomingSpeedError * incomingSpeedError)));
             totalWeight += weight;
@@ -6007,6 +6272,29 @@ LoopScore ScoreLoopPair(
     score.objective += smoothnessWeight * 0.5F *
         (score.neighborhoodRoughness[0U] +
          score.neighborhoodRoughness[1U]);
+    const auto triangleMeasurement = MeasureLoopTriangleAlignments(
+        candidateFirst,
+        candidateSecond,
+        triangleAlignments);
+    if (!triangleMeasurement.valid) {
+        score.objective = std::numeric_limits<float>::infinity();
+        return score;
+    }
+    score.triangleAlignmentRms = triangleMeasurement.rms;
+    score.triangleAlignmentMax = triangleMeasurement.maximum;
+    // Normalize screen-height error around a tenth of a pixel at 1080p.
+    // The paired parameterization normally keeps this term at its baseline;
+    // the strong weight prevents a smoother path from trading registration
+    // for lower velocity roughness.
+    constexpr float kTriangleAlignmentScale = 1.0e-4F;
+    for (std::size_t index = 0U;
+         index < triangleAlignments.size();
+         ++index) {
+        const float normalized =
+            score.triangleAlignmentRms[index] / kTriangleAlignmentScale;
+        score.objective +=
+            triangleAlignmentWeight * normalized * normalized;
+    }
     for (const auto& group : groups) {
         float movementPenalty = 0.0F;
         for (const auto& occurrence : group.occurrences) {
@@ -6325,6 +6613,21 @@ AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
             return result;
         }
     }
+    const auto triangleAlignments = ResolveLoopTriangleAlignments(
+        *first,
+        *second,
+        groups,
+        options,
+        &result.errorMessage);
+    if (!triangleAlignments.has_value()) {
+        *first = std::move(originalFirstPath);
+        *second = std::move(originalSecondPath);
+        return result;
+    }
+    std::unordered_set<std::size_t> triangleFollowerGroups;
+    for (const auto& alignment : triangleAlignments.value()) {
+        triangleFollowerGroups.insert(alignment.followerGroupIndex);
+    }
 
     // Each visible adjusted key is evaluated as a compact correction over
     // the preserved distance-parameterized C2 spline. Adding a zero-offset
@@ -6341,6 +6644,7 @@ AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
         originalFirst,
         originalSecond,
         noMovementGroups,
+        triangleAlignments.value(),
         overlaps,
         options);
     if (beforeScore.cancelled) {
@@ -6355,7 +6659,20 @@ AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
         beforeScore.seamRotationMismatch;
     result.beforeNeighborhoodRoughness =
         beforeScore.neighborhoodRoughness;
+    result.beforeTriangleAlignmentRms =
+        beforeScore.triangleAlignmentRms;
+    result.beforeTriangleAlignmentMax =
+        beforeScore.triangleAlignmentMax;
     result.beforeObjective = beforeScore.objective;
+    if (!UpdateLoopTriangleFollowerGroups(
+            &groups,
+            triangleAlignments.value())) {
+        *first = std::move(originalFirstPath);
+        *second = std::move(originalSecondPath);
+        result.errorMessage =
+            "The coordinated midpoint move exceeds one triangle key's selected movement limit.";
+        return result;
+    }
     ApplyLoopEndpointGroups(first, second, groups);
     LoopScore bestScore = ScoreLoopPair(
         *first,
@@ -6363,6 +6680,7 @@ AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
         originalFirst,
         originalSecond,
         groups,
+        triangleAlignments.value(),
         overlaps,
         options);
     if (bestScore.cancelled) {
@@ -6393,6 +6711,9 @@ AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
         }
         bool improved = false;
         for (std::size_t groupIndex = 0U; groupIndex < groups.size(); ++groupIndex) {
+            if (triangleFollowerGroups.contains(groupIndex)) {
+                continue;
+            }
             for (const bool cameraTrack : {true, false}) {
                 const float cap = cameraTrack ? groups[groupIndex].cameraCap : groups[groupIndex].focusCap;
                 if (cap <= 1.0e-8F) {
@@ -6414,6 +6735,11 @@ AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
                                 &position)) {
                             continue;
                         }
+                        if (!UpdateLoopTriangleFollowerGroups(
+                                &groups,
+                                triangleAlignments.value())) {
+                            continue;
+                        }
                         ApplyLoopEndpointGroups(first, second, groups);
                         const auto candidateScore =
                             ScoreLoopPair(
@@ -6422,6 +6748,7 @@ AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
                                 originalFirst,
                                 originalSecond,
                                 groups,
+                                triangleAlignments.value(),
                                 overlaps,
                                 options);
                         if (candidateScore.cancelled) {
@@ -6437,6 +6764,15 @@ AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
                         }
                     }
                     position = selectedPosition;
+                    if (!UpdateLoopTriangleFollowerGroups(
+                            &groups,
+                            triangleAlignments.value())) {
+                        *first = std::move(originalFirstPath);
+                        *second = std::move(originalSecondPath);
+                        result.errorMessage =
+                            "A coordinated midpoint move left the selected movement bounds.";
+                        return result;
+                    }
                     ApplyLoopEndpointGroups(first, second, groups);
                     if (selectedScore.objective + 1.0e-7F < bestScore.objective) {
                         bestScore = selectedScore;
@@ -6450,6 +6786,15 @@ AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
         }
     }
 
+    if (!UpdateLoopTriangleFollowerGroups(
+            &groups,
+            triangleAlignments.value())) {
+        *first = std::move(originalFirstPath);
+        *second = std::move(originalSecondPath);
+        result.errorMessage =
+            "A coordinated midpoint move left the selected movement bounds.";
+        return result;
+    }
     ApplyLoopEndpointGroups(first, second, groups);
     const auto finalScore = ScoreLoopPair(
         *first,
@@ -6457,6 +6802,7 @@ AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
         originalFirst,
         originalSecond,
         groups,
+        triangleAlignments.value(),
         overlaps,
         options);
     if (finalScore.cancelled) {
@@ -6471,6 +6817,10 @@ AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
         finalScore.seamRotationMismatch;
     result.afterNeighborhoodRoughness =
         finalScore.neighborhoodRoughness;
+    result.afterTriangleAlignmentRms =
+        finalScore.triangleAlignmentRms;
+    result.afterTriangleAlignmentMax =
+        finalScore.triangleAlignmentMax;
     result.afterObjective = finalScore.objective;
     result.terminalSpeedRmsChange = finalScore.terminalSpeedRmsChange;
     const AnimationPath* smoothedPaths[] = {first, second};
@@ -6531,10 +6881,32 @@ AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
     };
     const bool neitherRotationWorsened =
         rotationDidNotWorsen(0U) && rotationDidNotWorsen(1U);
+    const auto triangleAlignmentHeld = [&](std::size_t seamIndex) {
+        if (seamIndex >= triangleAlignments->size()) {
+            return true;
+        }
+        const float rmsTolerance = std::max(
+            2.0e-5F,
+            0.05F * result.beforeTriangleAlignmentRms[seamIndex]);
+        const float maxTolerance = std::max(
+            3.0e-5F,
+            0.05F * result.beforeTriangleAlignmentMax[seamIndex]);
+        return result.afterTriangleAlignmentRms[seamIndex] <=
+                   result.beforeTriangleAlignmentRms[seamIndex] +
+                       rmsTolerance &&
+               result.afterTriangleAlignmentMax[seamIndex] <=
+                   result.beforeTriangleAlignmentMax[seamIndex] +
+                       maxTolerance;
+    };
+    const bool allTriangleAlignmentsHeld =
+        triangleAlignmentHeld(0U) && triangleAlignmentHeld(1U);
     const bool extendedSmoothingObjective =
         requestedRotationWeight > 1.0e-8F ||
         (std::isfinite(options.selectedNeighborhoodSmoothnessWeight) &&
-         options.selectedNeighborhoodSmoothnessWeight > 1.0e-8F);
+         options.selectedNeighborhoodSmoothnessWeight > 1.0e-8F) ||
+        (!triangleAlignments->empty() &&
+         std::isfinite(options.triangleAlignmentWeight) &&
+         options.triangleAlignmentWeight > 1.0e-8F);
     const float beforeImprovementValue = extendedSmoothingObjective
         ? result.beforeObjective
         : result.beforeMismatch;
@@ -6552,7 +6924,8 @@ AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
         result.maxFocusMove > 1.0e-6F;
     result.changed =
         overallImproved && neitherSeamWorsened &&
-        neitherRotationWorsened && selectedKeysMoved;
+        neitherRotationWorsened && allTriangleAlignmentsHeld &&
+        selectedKeysMoved;
     result.succeeded = true;
     if (!result.changed) {
         *first = std::move(originalFirstPath);
@@ -6565,6 +6938,9 @@ AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
             result.errorMessage =
                 "The best bounded key movement did not measurably lower "
                 "the selected transition-smoothing objective.";
+        } else if (!allTriangleAlignmentsHeld) {
+            result.errorMessage =
+                "The smoother found a lower-roughness path, but rejected it because a 50% triangle pair lost screen alignment.";
         } else {
             result.errorMessage =
                 "The best combined candidate was rejected because it made "
@@ -6647,12 +7023,14 @@ AnimationLoopTransitionMetrics MeasureAnimationLoopTransitions(
         measurementOptions);
 
     const std::vector<LoopEndpointGroup> noMovementGroups;
+    const std::vector<LoopTriangleAlignment> noTriangleAlignments;
     const auto beforeScore = ScoreLoopPair(
         originalFirst,
         originalSecond,
         originalFirstContext,
         originalSecondContext,
         noMovementGroups,
+        noTriangleAlignments,
         overlaps,
         measurementOptions);
     const bool hasLocalizedCorrections =
@@ -6665,6 +7043,7 @@ AnimationLoopTransitionMetrics MeasureAnimationLoopTransitions(
                                       originalFirstContext,
                                       originalSecondContext,
                                       noMovementGroups,
+                                      noTriangleAlignments,
                                       overlaps,
                                       measurementOptions)
                                 : beforeScore;
