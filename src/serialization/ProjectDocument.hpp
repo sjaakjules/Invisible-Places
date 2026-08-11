@@ -22,11 +22,11 @@
 namespace invisible_places::serialization {
 
 inline constexpr std::size_t kMaxSerializedWaterRippleRuntimeCacheMemberships = 250'000U;
-inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 72U;
+inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 73U;
 inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 27U;
 inline constexpr std::uint32_t kWaterOwnedShorelineProjectSchemaVersion = 66U;
 inline constexpr std::uint32_t kWaterOwnedShorelineSourcesSchemaVersion = 22U;
-inline constexpr std::uint32_t kAnimationDocumentSchemaVersion = 19U;
+inline constexpr std::uint32_t kAnimationDocumentSchemaVersion = 20U;
 inline constexpr std::uint32_t kWaterPathCacheSidecarSchemaVersion = 1U;
 inline constexpr std::uint64_t kMaximumPersistedWaterCacheBytes = 5ULL * 1024ULL * 1024ULL * 1024ULL;
 
@@ -170,6 +170,9 @@ struct ProjectDocument {
     // a current file can never resurrect Shoreline from a saved Visual.
     std::uint32_t sourceSchemaVersion = kProjectDocumentSchemaVersion;
     std::string projectName;
+    std::uint32_t liveViewWindowWidth = 1440U;
+    std::uint32_t liveViewWindowHeight = 900U;
+    bool lockLiveViewWindowSize = false;
     std::vector<ProjectLayerDocument::PointVisual> pointVisuals;
     std::string selectedPointVisualName = "Unnamed";
     std::vector<ScenePointVisualStateDocument> sceneVisualStates;

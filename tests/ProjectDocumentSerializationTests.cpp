@@ -3679,3 +3679,79 @@ TEST_CASE("Timing runs round-trip their enabled flag and omit it while on",
   CHECK(runsJson[1]["enabled"] == false);
 }
 
+TEST_CASE("Project live-view window size and lock round-trip",
+          "[project][serialization][window]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+
+  ProjectDocument document;
+  document.projectName = "window-size-lock";
+  document.liveViewWindowWidth = 2560U;
+  document.liveViewWindowHeight = 1440U;
+  document.lockLiveViewWindowSize = true;
+
+  TemporaryProjectFile file{"invisible_places_window_size_lock.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+
+  std::ifstream savedInput{file.path};
+  REQUIRE(savedInput.is_open());
+  auto savedJson = nlohmann::json::parse(savedInput);
+  savedInput.close();
+  CHECK(savedJson["live_view_window_size"]["width"] == 2560U);
+  CHECK(savedJson["live_view_window_size"]["height"] == 1440U);
+  CHECK(savedJson["lock_live_view_window_size"] == true);
+
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  CHECK(loaded->liveViewWindowWidth == 2560U);
+  CHECK(loaded->liveViewWindowHeight == 1440U);
+  CHECK(loaded->lockLiveViewWindowSize);
+
+  savedJson["schema_version"] = 72U;
+  savedJson.erase("live_view_window_size");
+  savedJson.erase("lock_live_view_window_size");
+  {
+    std::ofstream legacyOutput{file.path, std::ios::trunc};
+    REQUIRE(legacyOutput.is_open());
+    legacyOutput << savedJson.dump(2);
+  }
+  const auto legacy = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(legacy.has_value());
+  CHECK(legacy->liveViewWindowWidth == 1440U);
+  CHECK(legacy->liveViewWindowHeight == 900U);
+  CHECK_FALSE(legacy->lockLiveViewWindowSize);
+}
+
+TEST_CASE("Animation default live-view window size round-trips and remains unset for legacy JSON",
+          "[animation][serialization][window]") {
+  using invisible_places::serialization::AnimationPathFromJson;
+  using invisible_places::serialization::AnimationPathToJson;
+
+  invisible_places::camera::AnimationPath animation;
+  animation.defaultLiveViewWindowWidth = 1920U;
+  animation.defaultLiveViewWindowHeight = 1080U;
+
+  auto animationJson = AnimationPathToJson(animation);
+  REQUIRE(animationJson.contains("default_live_view_window_size"));
+  CHECK(animationJson["default_live_view_window_size"]["width"] == 1920U);
+  CHECK(animationJson["default_live_view_window_size"]["height"] == 1080U);
+
+  std::string errorMessage;
+  const auto loaded = AnimationPathFromJson(animationJson, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  CHECK(loaded->defaultLiveViewWindowWidth == 1920U);
+  CHECK(loaded->defaultLiveViewWindowHeight == 1080U);
+
+  animationJson["schema_version"] = 19U;
+  animationJson.erase("default_live_view_window_size");
+  const auto legacy = AnimationPathFromJson(animationJson, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(legacy.has_value());
+  CHECK(legacy->defaultLiveViewWindowWidth == 0U);
+  CHECK(legacy->defaultLiveViewWindowHeight == 0U);
+}

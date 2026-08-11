@@ -255,6 +255,9 @@ constexpr std::size_t kDefaultQueuedExportFrames = 2U;
 constexpr std::size_t kMaxAdaptiveQueuedExportFrames = 6U;
 constexpr std::uint64_t kAdaptiveExportQueueMemoryPercent = 85ULL;
 constexpr std::uint64_t kHardExportMemoryStopPercent = 92ULL;
+constexpr int kMinimumLiveViewWindowWidth = 320;
+constexpr int kMinimumLiveViewWindowHeight = 180;
+constexpr int kMaximumLiveViewWindowDimension = 16'384;
 constexpr std::uint32_t kAnimationVelocityBlendSchemaVersion = 19U;
 constexpr std::uint32_t kProjectVelocityBlendMirrorSchemaVersion = 67U;
 constexpr auto kPerformanceInteractionHold = std::chrono::milliseconds{300};
@@ -301,6 +304,9 @@ enum class GsplatTransformConvention {
 
 struct ProjectSettings {
     std::array<float, 4> backgroundColor{0.0F, 0.0F, 0.0F, 1.0F};
+    int liveViewWindowWidth = 1440;
+    int liveViewWindowHeight = 900;
+    bool lockLiveViewWindowSize = false;
     bool eyeDomeLightingEnabled = false;
     bool proResAlphaPreviewEnabled = false;
     float eyeDomeLightingThickness = 1.0F;
@@ -2694,6 +2700,9 @@ struct PreviewRuntimeState {
     OfflineRenderJobState offlineRenderJob{};
     invisible_places::ui::SidePanelState sidePanel{};
     ProjectSettings projectSettings{};
+    invisible_places::platform::WindowSize liveViewWindowSize{};
+    std::optional<invisible_places::platform::WindowSize>
+        pendingLiveViewWindowSize;
     ProjectPointVisualLibraryState pointVisualLibrary{};
     PersistenceState persistence{};
     SaveChangesDialogState saveChanges{};
@@ -2733,6 +2742,88 @@ struct PreviewRuntimeState {
     std::string statusMessage;
     std::string errorMessage;
 };
+
+invisible_places::platform::WindowSize SanitizeLiveViewWindowSize(
+    invisible_places::platform::WindowSize size) {
+    return {
+        .width = std::clamp(
+            size.width,
+            kMinimumLiveViewWindowWidth,
+            kMaximumLiveViewWindowDimension),
+        .height = std::clamp(
+            size.height,
+            kMinimumLiveViewWindowHeight,
+            kMaximumLiveViewWindowDimension),
+    };
+}
+
+std::optional<invisible_places::platform::WindowSize>
+AnimationDefaultLiveViewWindowSize(const AnimationPath& path) {
+    if (path.defaultLiveViewWindowWidth == 0U ||
+        path.defaultLiveViewWindowHeight == 0U) {
+        return std::nullopt;
+    }
+    return SanitizeLiveViewWindowSize({
+        .width = static_cast<int>(std::min<std::uint32_t>(
+            path.defaultLiveViewWindowWidth,
+            static_cast<std::uint32_t>(kMaximumLiveViewWindowDimension))),
+        .height = static_cast<int>(std::min<std::uint32_t>(
+            path.defaultLiveViewWindowHeight,
+            static_cast<std::uint32_t>(kMaximumLiveViewWindowDimension))),
+    });
+}
+
+void EnsureAnimationDefaultLiveViewWindowSize(
+    AnimationPath* path,
+    invisible_places::platform::WindowSize currentSize) {
+    if (path == nullptr ||
+        (path->defaultLiveViewWindowWidth > 0U &&
+         path->defaultLiveViewWindowHeight > 0U)) {
+        return;
+    }
+    const auto size = SanitizeLiveViewWindowSize(currentSize);
+    path->defaultLiveViewWindowWidth =
+        static_cast<std::uint32_t>(size.width);
+    path->defaultLiveViewWindowHeight =
+        static_cast<std::uint32_t>(size.height);
+}
+
+invisible_places::platform::WindowSize ProjectLiveViewWindowSize(
+    const ProjectSettings& settings) {
+    return SanitizeLiveViewWindowSize({
+        .width = settings.liveViewWindowWidth,
+        .height = settings.liveViewWindowHeight,
+    });
+}
+
+void RequestAnimationLiveViewWindowSize(
+    PreviewRuntimeState* runtimeState,
+    const AnimationPath& path) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    const auto animationSize = AnimationDefaultLiveViewWindowSize(path);
+    if (animationSize.has_value()) {
+        runtimeState->pendingLiveViewWindowSize = animationSize;
+    }
+}
+
+void SynchronizeLiveViewWindow(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::platform::Window* window) {
+    if (runtimeState == nullptr || window == nullptr) {
+        return;
+    }
+    const auto currentSize = window->Size();
+    const auto preferredSize = invisible_places::platform::ResolvePreferredWindowSize(
+        currentSize,
+        runtimeState->pendingLiveViewWindowSize,
+        ProjectLiveViewWindowSize(runtimeState->projectSettings),
+        runtimeState->projectSettings.lockLiveViewWindowSize);
+    runtimeState->pendingLiveViewWindowSize.reset();
+    window->SetSize(preferredSize);
+    runtimeState->liveViewWindowSize = window->Size();
+}
 
 bool IsSceneGroupedPointCloud(const PreviewLayerSession& session);
 bool SessionsShareSceneFolder(
@@ -24097,6 +24188,14 @@ void PropagateWaterEmittersToActiveLayer(PreviewRuntimeState* runtimeState) {
 ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
     ProjectDocument document;
     document.projectName = runtimeState.persistence.projectName;
+    const auto projectWindowSize =
+        ProjectLiveViewWindowSize(runtimeState.projectSettings);
+    document.liveViewWindowWidth =
+        static_cast<std::uint32_t>(projectWindowSize.width);
+    document.liveViewWindowHeight =
+        static_cast<std::uint32_t>(projectWindowSize.height);
+    document.lockLiveViewWindowSize =
+        runtimeState.projectSettings.lockLiveViewWindowSize;
     document.backgroundColor = runtimeState.projectSettings.backgroundColor;
     document.eyeDomeLightingEnabled = runtimeState.projectSettings.eyeDomeLightingEnabled;
     document.proResAlphaPreviewEnabled = runtimeState.projectSettings.proResAlphaPreviewEnabled;
@@ -25258,6 +25357,28 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->water.flowTrailSourceArtifacts.clear();
 
     runtimeState->projectSettings.backgroundColor = document.backgroundColor;
+    runtimeState->projectSettings.liveViewWindowWidth =
+        static_cast<int>(std::min<std::uint32_t>(
+            document.liveViewWindowWidth,
+            static_cast<std::uint32_t>(
+                kMaximumLiveViewWindowDimension)));
+    runtimeState->projectSettings.liveViewWindowHeight =
+        static_cast<int>(std::min<std::uint32_t>(
+            document.liveViewWindowHeight,
+            static_cast<std::uint32_t>(
+                kMaximumLiveViewWindowDimension)));
+    const auto projectWindowSize =
+        ProjectLiveViewWindowSize(runtimeState->projectSettings);
+    runtimeState->projectSettings.liveViewWindowWidth =
+        projectWindowSize.width;
+    runtimeState->projectSettings.liveViewWindowHeight =
+        projectWindowSize.height;
+    runtimeState->projectSettings.lockLiveViewWindowSize =
+        document.lockLiveViewWindowSize;
+    runtimeState->pendingLiveViewWindowSize.reset();
+    if (runtimeState->projectSettings.lockLiveViewWindowSize) {
+        runtimeState->pendingLiveViewWindowSize = projectWindowSize;
+    }
     runtimeState->projectSettings.eyeDomeLightingEnabled = document.eyeDomeLightingEnabled;
     runtimeState->projectSettings.proResAlphaPreviewEnabled = document.proResAlphaPreviewEnabled;
     runtimeState->projectSettings.eyeDomeLightingThickness =
@@ -27812,6 +27933,9 @@ bool SaveAnimationPathToFile(
     const std::filesystem::path previousCurrentPath{
         runtimeState->animationPanel.currentFilePath};
     auto pathToSave = path;
+    EnsureAnimationDefaultLiveViewWindowSize(
+        &pathToSave,
+        runtimeState->liveViewWindowSize);
     const bool savingDuringRenderSetupOverride =
         runtimeState->activeRenderSetupOverride.has_value();
     if (savingDuringRenderSetupOverride) {
@@ -28119,6 +28243,9 @@ bool LoadAnimationPathVariant(
     panel.timelineViewRange = {};
     panel.timelineViewDrag.reset();
     panel.previewDepthOfField = false;
+    RequestAnimationLiveViewWindowSize(
+        runtimeState,
+        panel.currentPath.value());
     runtimeState->timingsPanel = TimingsPanelState{};
     panel.dirty = currentUsesEdited;
     SyncWaterAnimationTrailProfileFromCurrentAnimation(runtimeState);
@@ -28228,6 +28355,9 @@ bool DiscardAnimationEdits(
             panel.currentPath =
                 panel.availableFileLoadedPaths[currentIndex.value()].value();
             panel.draftAnimationName = panel.currentPath->name;
+            RequestAnimationLiveViewWindowSize(
+                runtimeState,
+                panel.currentPath.value());
             panel.preparedPathCache = {};
             panel.motionStatsCache = {};
             panel.perceivedFlowCache = {};
@@ -49529,6 +49659,51 @@ void DrawAnimationSection(
         panel.currentPathUsesEdited ? "_Edited" : "Saved");
     ImGui::Text("Keys: %zu", animationPath.keys.size());
 
+    const auto storedAnimationWindowSize =
+        AnimationDefaultLiveViewWindowSize(animationPath);
+    const auto initialAnimationWindowSize =
+        storedAnimationWindowSize.value_or(runtimeState->liveViewWindowSize);
+    int animationWindowSize[2] = {
+        initialAnimationWindowSize.width,
+        initialAnimationWindowSize.height,
+    };
+    const auto setAnimationWindowSize =
+        [&](invisible_places::platform::WindowSize requestedSize) {
+            const auto size = SanitizeLiveViewWindowSize(requestedSize);
+            if (animationPath.defaultLiveViewWindowWidth ==
+                    static_cast<std::uint32_t>(size.width) &&
+                animationPath.defaultLiveViewWindowHeight ==
+                    static_cast<std::uint32_t>(size.height)) {
+                return;
+            }
+            animationPath.defaultLiveViewWindowWidth =
+                static_cast<std::uint32_t>(size.width);
+            animationPath.defaultLiveViewWindowHeight =
+                static_cast<std::uint32_t>(size.height);
+            panel.dirty = true;
+            RequestAnimationLiveViewWindowSize(runtimeState, animationPath);
+    };
+    if (ImGui::InputInt2(
+            "Default Window Size",
+            animationWindowSize)) {
+        setAnimationWindowSize({
+            .width = animationWindowSize[0],
+            .height = animationWindowSize[1],
+        });
+    }
+    if (ImGui::Button("Use Current Live View Size")) {
+        setAnimationWindowSize(runtimeState->liveViewWindowSize);
+    }
+    if (!storedAnimationWindowSize.has_value()) {
+        ImGui::TextDisabled(
+            "Unset legacy animation; the current live view size is captured when saved.");
+    } else if (runtimeState->projectSettings.lockLiveViewWindowSize) {
+        ImGui::TextDisabled(
+            "Project window-size lock overrides this animation setting.");
+    } else {
+        ImGui::TextDisabled("Applied whenever this animation is loaded.");
+    }
+
     int durationFrames = static_cast<int>(animationPath.durationFrames);
     const auto setDurationFrames = [&](std::uint32_t requestedFrames) {
         const auto minimumFrames = animationPath.keys.size() > 1U
@@ -52986,6 +53161,12 @@ ProjectDocument BuildProjectDocumentForSave(
         std::move(runtimeDocument.cameraPathShotIndices);
     document.cameraPathDurationFrames =
         runtimeDocument.cameraPathDurationFrames;
+    document.liveViewWindowWidth =
+        runtimeDocument.liveViewWindowWidth;
+    document.liveViewWindowHeight =
+        runtimeDocument.liveViewWindowHeight;
+    document.lockLiveViewWindowSize =
+        runtimeDocument.lockLiveViewWindowSize;
     document.lastAnimationPath = runtimeDocument.lastAnimationPath;
     document.activeAnimationPath = runtimeDocument.activeAnimationPath;
     document.activeAnimationPosition =
@@ -53283,6 +53464,9 @@ std::optional<PreparedAnimationSave> PrepareAnimationSave(
             panel.availableFileLoopEditPairIds[registryIndex.value()];
     }
 
+    EnsureAnimationDefaultLiveViewWindowSize(
+        &prepared.path,
+        runtimeState->liveViewWindowSize);
     EmbedAnimationWaterScenarioFallbacks(
         &prepared.path,
         runtimeState->water.seepageScenarios);
@@ -64225,6 +64409,55 @@ void DrawProjectPanel(
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
     if (BeginPanelSection("Project Settings")) {
     auto& settings = runtimeState->projectSettings;
+    int projectWindowSize[2] = {
+        settings.liveViewWindowWidth,
+        settings.liveViewWindowHeight,
+    };
+    if (ImGui::InputInt2(
+            "Window Size",
+            projectWindowSize)) {
+        const auto size = SanitizeLiveViewWindowSize({
+            .width = projectWindowSize[0],
+            .height = projectWindowSize[1],
+        });
+        settings.liveViewWindowWidth = size.width;
+        settings.liveViewWindowHeight = size.height;
+        if (settings.lockLiveViewWindowSize) {
+            runtimeState->pendingLiveViewWindowSize = size;
+        }
+    }
+    if (ImGui::Button("Use Current Window Size")) {
+        const auto size = SanitizeLiveViewWindowSize(
+            runtimeState->liveViewWindowSize);
+        settings.liveViewWindowWidth = size.width;
+        settings.liveViewWindowHeight = size.height;
+        if (settings.lockLiveViewWindowSize) {
+            runtimeState->pendingLiveViewWindowSize = size;
+        }
+    }
+    bool lockLiveViewWindowSize = settings.lockLiveViewWindowSize;
+    if (ImGui::Checkbox(
+            "Lock Window Size",
+            &lockLiveViewWindowSize)) {
+        settings.lockLiveViewWindowSize = lockLiveViewWindowSize;
+        if (lockLiveViewWindowSize) {
+            runtimeState->pendingLiveViewWindowSize =
+                ProjectLiveViewWindowSize(settings);
+        } else if (runtimeState->animationPanel.currentPath.has_value()) {
+            RequestAnimationLiveViewWindowSize(
+                runtimeState,
+                runtimeState->animationPanel.currentPath.value());
+        }
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Keeps the live view at the project size and overrides animation defaults.");
+    }
+    ImGui::TextDisabled(
+        "Current live view: %d x %d",
+        runtimeState->liveViewWindowSize.width,
+        runtimeState->liveViewWindowSize.height);
+    ImGui::Separator();
     ImGui::ColorEdit3("Background Color", settings.backgroundColor.data());
     ImGui::Checkbox("ProRes Alpha Preview", &settings.proResAlphaPreviewEnabled);
     if (ImGui::IsItemHovered()) {
@@ -91357,6 +91590,7 @@ int Application::Run(ApplicationRunOptions options) const {
     }
 
     PreviewRuntimeState runtimeState;
+    runtimeState.liveViewWindowSize = window.Size();
     runtimeState.water.defaultPointVisualStyle = MakeDefaultWaterPointVisualStyle();
     runtimeState.sessions = BuildSessions(assetCatalog);
     runtimeState.pointCloudScenes = BuildScenePointCloudRuntimeStates(
@@ -91691,6 +91925,8 @@ int Application::Run(ApplicationRunOptions options) const {
                     SaveChangesRequest::Closing);
             }
         }
+
+        SynchronizeLiveViewWindow(&runtimeState, &window);
 
         if (viewport.has_value()) {
             PollPendingLayerLoad(&runtimeState, &viewport.value());

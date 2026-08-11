@@ -2672,6 +2672,13 @@ json SerializeAnimationPath(const AnimationPath& path) {
         {"water_scenario_tracks", json::array()},
         {"keys", json::array()},
     };
+    if (path.defaultLiveViewWindowWidth > 0U &&
+        path.defaultLiveViewWindowHeight > 0U) {
+        pathJson["default_live_view_window_size"] = {
+            {"width", path.defaultLiveViewWindowWidth},
+            {"height", path.defaultLiveViewWindowHeight},
+        };
+    }
     if (path.waterAnimationTrailSettings.has_value()) {
         pathJson["water_animation_trail_settings"] =
             SerializeWaterAnimationTrailSettings(path.waterAnimationTrailSettings.value());
@@ -2713,6 +2720,14 @@ AnimationPath ParseAnimationPath(const json& pathJson) {
     std::optional<AnimationLoopSmoothingMetadata> legacySmoothing;
     path.name = pathJson.value("name", path.name);
     path.durationFrames = pathJson.value("duration_frames", path.durationFrames);
+    if (pathJson.contains("default_live_view_window_size") &&
+        pathJson.at("default_live_view_window_size").is_object()) {
+        const auto& sizeJson = pathJson.at("default_live_view_window_size");
+        path.defaultLiveViewWindowWidth =
+            std::max(1U, sizeJson.value("width", 1440U));
+        path.defaultLiveViewWindowHeight =
+            std::max(1U, sizeJson.value("height", 900U));
+    }
     if (pathJson.contains("associated_layer_paths")) {
         path.associatedLayerPaths = ParsePathArray(pathJson.at("associated_layer_paths"));
     }
@@ -9232,6 +9247,12 @@ bool SaveProjectDocument(
     json projectJson{
         {"schema_version", kProjectDocumentSchemaVersion},
         {"project_name", document.projectName},
+        {"live_view_window_size",
+         {
+             {"width", std::max(1U, document.liveViewWindowWidth)},
+             {"height", std::max(1U, document.liveViewWindowHeight)},
+         }},
+        {"lock_live_view_window_size", document.lockLiveViewWindowSize},
         {"active_water_scene_group", activeWaterSceneGroupName},
         {"selected_layer_path", document.selectedLayerPath.generic_string()},
         {"active_scene_group", activeSceneGroupName},
@@ -9532,6 +9553,16 @@ std::optional<ProjectDocument> LoadProjectDocument(
     const bool defaultManualSurfaceGuide =
         document.schemaVersion >= kManualFlowSurfaceGuideProjectSchemaVersion;
     document.projectName = projectJson->value("project_name", std::string{"Invisible Places"});
+    if (projectJson->contains("live_view_window_size") &&
+        projectJson->at("live_view_window_size").is_object()) {
+        const auto& sizeJson = projectJson->at("live_view_window_size");
+        document.liveViewWindowWidth =
+            std::max(1U, sizeJson.value("width", document.liveViewWindowWidth));
+        document.liveViewWindowHeight =
+            std::max(1U, sizeJson.value("height", document.liveViewWindowHeight));
+    }
+    document.lockLiveViewWindowSize =
+        projectJson->value("lock_live_view_window_size", false);
     document.activeWaterSceneGroupName = TrimAsciiWhitespace(
         projectJson->value("active_water_scene_group", std::string{}));
     document.selectedLayerPath = projectJson->value("selected_layer_path", std::string{});

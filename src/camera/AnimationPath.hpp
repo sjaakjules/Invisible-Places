@@ -74,9 +74,13 @@ struct AnimationVelocityBlendLinkMetadata {
 struct AnimationPath {
     // Original file schema retained only for application-level migration
     // bookkeeping. Serialization always writes the current schema.
-    std::uint32_t sourceSchemaVersion = 19U;
+    std::uint32_t sourceSchemaVersion = 20U;
     std::string name = "Animation";
     std::uint32_t durationFrames = 180;
+    // Zero means a legacy/unset preference. Newly authored animations
+    // capture the live application window and request it again when loaded.
+    std::uint32_t defaultLiveViewWindowWidth = 0U;
+    std::uint32_t defaultLiveViewWindowHeight = 0U;
     std::vector<AnimationPathKey> keys;
     std::vector<std::filesystem::path> associatedLayerPaths;
     bool depthOfFieldEnabled = false;

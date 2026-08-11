@@ -1897,6 +1897,39 @@ TEST_CASE("Initial window size clamps only displays larger than 1080p", "[window
     CHECK(wideButNotTall.height == 900);
 }
 
+TEST_CASE("Project window lock overrides an animation window preference", "[window]") {
+    using invisible_places::platform::ResolvePreferredWindowSize;
+    using invisible_places::platform::WindowSize;
+
+    const WindowSize current{.width = 1440, .height = 900};
+    const WindowSize animation{.width = 1920, .height = 1080};
+    const WindowSize project{.width = 1280, .height = 720};
+
+    const auto animationPreferred = ResolvePreferredWindowSize(
+        current,
+        animation,
+        project,
+        false);
+    CHECK(animationPreferred.width == 1920);
+    CHECK(animationPreferred.height == 1080);
+
+    const auto projectLocked = ResolvePreferredWindowSize(
+        current,
+        animation,
+        project,
+        true);
+    CHECK(projectLocked.width == 1280);
+    CHECK(projectLocked.height == 720);
+
+    const auto unchanged = ResolvePreferredWindowSize(
+        current,
+        std::nullopt,
+        project,
+        false);
+    CHECK(unchanged.width == 1440);
+    CHECK(unchanged.height == 900);
+}
+
 TEST_CASE("Vulkan runtime description includes explicit ICD when present", "[vulkan][runtime]") {
     invisible_places::platform::VulkanRuntimeConfig config;
     config.injectedMoltenVkIcd = true;

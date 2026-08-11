@@ -24,6 +24,26 @@ WindowSize ResolveInitialWindowSizeForScreen(
     };
 }
 
+WindowSize ResolvePreferredWindowSize(
+    WindowSize currentSize,
+    std::optional<WindowSize> animationSize,
+    WindowSize projectSize,
+    bool lockToProjectSize) {
+    const auto clamp = [](WindowSize size) {
+        return WindowSize{
+            .width = std::max(1, size.width),
+            .height = std::max(1, size.height),
+        };
+    };
+    if (lockToProjectSize) {
+        return clamp(projectSize);
+    }
+    if (animationSize.has_value()) {
+        return clamp(animationSize.value());
+    }
+    return clamp(currentSize);
+}
+
 Window::Window(const WindowConfig& config) {
     PrepareMacWindowingRuntime();
 
@@ -100,6 +120,31 @@ void Window::SetTitle(const std::string& title) {
     }
 
     glfwSetWindowTitle(window_, title.c_str());
+}
+
+WindowSize Window::Size() const {
+    WindowSize size{};
+    if (window_ == nullptr) {
+        return size;
+    }
+    glfwGetWindowSize(window_, &size.width, &size.height);
+    size.width = std::max(1, size.width);
+    size.height = std::max(1, size.height);
+    return size;
+}
+
+void Window::SetSize(WindowSize size) {
+    if (window_ == nullptr) {
+        return;
+    }
+    size.width = std::max(1, size.width);
+    size.height = std::max(1, size.height);
+    const auto currentSize = Size();
+    if (currentSize.width == size.width &&
+        currentSize.height == size.height) {
+        return;
+    }
+    glfwSetWindowSize(window_, size.width, size.height);
 }
 
 void Window::ShowBootstrapContent(const BootstrapWindowContent& content) {

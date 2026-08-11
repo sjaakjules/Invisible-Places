@@ -2,6 +2,7 @@
 
 #include "platform/WindowBootstrapView.hpp"
 
+#include <optional>
 #include <string>
 
 struct GLFWwindow;
@@ -24,6 +25,14 @@ struct WindowSize {
     int screenHeight,
     WindowSize fallbackSize = {});
 
+// A project lock overrides an animation preference. Without either, retain
+// the size the artist selected interactively.
+[[nodiscard]] WindowSize ResolvePreferredWindowSize(
+    WindowSize currentSize,
+    std::optional<WindowSize> animationSize,
+    WindowSize projectSize,
+    bool lockToProjectSize);
+
 class Window {
   public:
     explicit Window(const WindowConfig& config);
@@ -43,6 +52,8 @@ class Window {
     // (cancel the active drag or text edit) without also quitting.
     void SetEscapeCloseSuppressed(bool suppressed);
     void SetTitle(const std::string& title);
+    [[nodiscard]] WindowSize Size() const;
+    void SetSize(WindowSize size);
     void ShowBootstrapContent(const BootstrapWindowContent& content);
     [[nodiscard]] GLFWwindow* NativeHandle() const { return window_; }
 
