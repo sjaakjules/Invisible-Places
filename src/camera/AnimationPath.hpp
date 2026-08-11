@@ -390,6 +390,35 @@ struct AnimationPanTerminalExtensionResult {
     std::string errorMessage;
 };
 
+// One visual 50%-blend seam expands in both temporal directions from the same
+// ordered triangle pair. sourceHead prepends motion sampled backwards from the
+// fitted destination end; destinationTail appends the source opening motion.
+// Both candidates are immutable and either both are returned or neither is.
+struct AnimationPanBidirectionalSeamResult {
+    bool succeeded = false;
+    bool changed = false;
+    AnimationPanTerminalExtensionResult sourceHead{};
+    AnimationPanTerminalExtensionResult destinationTail{};
+    std::string errorMessage;
+};
+
+struct AnimationBidirectionalReciprocalPanExtensionMetrics {
+    // Candidate order is first animation, then second animation. Outgoing
+    // metrics describe appended tails; incoming metrics describe prepended
+    // heads after reversing their time direction back into authored order.
+    AnimationReciprocalPanExtensionMetrics outgoing{};
+    AnimationReciprocalPanExtensionMetrics incoming{};
+};
+
+struct AnimationBidirectionalReciprocalPanExtensionResult {
+    bool succeeded = false;
+    bool changed = false;
+    AnimationPath firstCandidate{};
+    AnimationPath secondCandidate{};
+    AnimationBidirectionalReciprocalPanExtensionMetrics metrics{};
+    std::string errorMessage;
+};
+
 // Conservative, pair-wide clip normalization used before reciprocal pan
 // fitting. Candidate copies retain every authored pose, timing, lens value,
 // and metadata field except near/far clipping. The smallest valid near plane
@@ -684,6 +713,27 @@ BuildAnimationPanTerminalExtensionPreview(
     float aspectRatio = 16.0F / 9.0F,
     std::uint32_t sampleCount = 17U,
     std::uint32_t optimizationSweeps = 24U);
+
+// Builds both halves around one existing 50%-blend pose. `source` begins at
+// the pose and drives destination's appended tail; destination's fitted motion
+// leading into its old end drives a new pre-roll before source frame zero.
+[[nodiscard]] AnimationPanBidirectionalSeamResult
+BuildAnimationPanBidirectionalSeamPreview(
+    const AnimationPath& source,
+    const AnimationPath& destination,
+    const AnimationTerminalExtensionSpec& specification,
+    float aspectRatio = 16.0F / 9.0F,
+    std::uint32_t sampleCount = 17U,
+    std::uint32_t optimizationSweeps = 24U);
+
+// Expands A-start/B-end and B-start/A-end in both directions. Each final
+// candidate therefore receives one prepended head and one appended tail while
+// its original bulk motion is preserved between the two localized seams.
+[[nodiscard]] AnimationBidirectionalReciprocalPanExtensionResult
+BuildAnimationBidirectionalReciprocalPanExtension(
+    const AnimationPath& first,
+    const AnimationPath& second,
+    const AnimationReciprocalPanExtensionOptions& options = {});
 
 [[nodiscard]] AnimationClipPlaneNormalizationResult
 BuildConservativeAnimationClipPlaneNormalization(

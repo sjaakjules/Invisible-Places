@@ -2193,21 +2193,30 @@ TimingTakeSceneState SanitizeTimingTakeSceneState(
 bool RetimeTimingTakeSceneStateNormalizedPositions(
     TimingTakeSceneState* state,
     std::uint32_t sourceDurationFrames,
-    std::uint32_t destinationDurationFrames) {
+    std::uint32_t destinationDurationFrames,
+    std::uint32_t destinationStartFrame) {
     if (state == nullptr || sourceDurationFrames == 0U ||
-        destinationDurationFrames == 0U) {
+        destinationDurationFrames == 0U ||
+        static_cast<std::uint64_t>(destinationStartFrame) +
+                sourceDurationFrames >
+            destinationDurationFrames) {
         return false;
     }
 
-    const double scale =
-        static_cast<double>(sourceDurationFrames) /
+    const double sourceFrames = static_cast<double>(sourceDurationFrames);
+    const double destinationFrames =
         static_cast<double>(destinationDurationFrames);
-    const auto retimePosition = [scale](float position) {
+    const double destinationStart =
+        static_cast<double>(destinationStartFrame);
+    const auto retimePosition = [sourceFrames,
+                                 destinationFrames,
+                                 destinationStart](float position) {
         const double finitePosition = std::isfinite(position)
                                           ? static_cast<double>(position)
                                           : 0.0;
         return static_cast<float>(std::clamp(
-            finitePosition * scale,
+            (destinationStart + finitePosition * sourceFrames) /
+                destinationFrames,
             0.0,
             1.0));
     };
@@ -2228,10 +2237,14 @@ bool RetimeTimingTakeSceneStateNormalizedPositions(
     for (auto& effect : state->colouriseEffects) {
         effect.activationRange = SanitizeTimingColouriseActivationRange(
             effect.activationRange);
+        const bool beginsAtAnimationStart =
+            effect.activationRange.start == 0.0F;
         const bool extendsThroughAnimationEnd =
             effect.activationRange.end == 1.0F;
-        effect.activationRange.start =
-            retimePosition(effect.activationRange.start);
+        effect.activationRange.start = beginsAtAnimationStart
+                                           ? 0.0F
+                                           : retimePosition(
+                                                 effect.activationRange.start);
         effect.activationRange.end = extendsThroughAnimationEnd
                                          ? 1.0F
                                          : retimePosition(

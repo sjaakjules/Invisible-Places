@@ -903,12 +903,13 @@ struct AnimationReciprocalPanWizardState {
     std::array<std::uint32_t, 2> sourceTailFrames{};
     std::array<std::uint32_t, 2> sourceTailFrameDrafts{};
     std::array<std::optional<
-        invisible_places::camera::AnimationPanTerminalExtensionResult>, 2>
+        invisible_places::camera::AnimationPanBidirectionalSeamResult>, 2>
         seamPreviews;
     int seamReviewView = 1;  // 0 = source, 1 = fitted destination.
-    std::uint32_t seamReviewOffsetFrame = 0U;
+    std::int32_t seamReviewOffsetFrame = 0;
     std::optional<
-        invisible_places::camera::AnimationReciprocalPanExtensionResult>
+        invisible_places::camera::
+            AnimationBidirectionalReciprocalPanExtensionResult>
         candidate;
     std::string dependencyPairId;
     std::string commonSceneKey;
@@ -935,6 +936,17 @@ struct AnimationReciprocalPanWizardState {
     bool inspectionActive = false;
     int inspectionPathRole = 0;
     float inspectionNormalizedPosition = 0.0F;
+    // Every guided stage may temporarily show either authored animation
+    // without changing the stable A/B roles or the editable correspondence.
+    int stageViewRole = 0;
+    // Aligned seam review alternates the A/B cameras through the renderer's
+    // two-frame history and composites a feature-following horizontal wipe.
+    bool splitComparisonEnabled = true;
+    float splitOverlapPixels = 400.0F;
+    float splitAnchorOffsetPixels = 0.0F;
+    bool splitAOnLeft = true;
+    std::uint32_t splitRenderedRole = 0U;
+    int seamReviewEditableSide = 1;  // 0 = source, 1 = destination.
     int previewPose = 0;
     int previewMode = 2;
     bool previewBaselineHold = false;
@@ -1581,6 +1593,13 @@ struct WaterFrameState;
 struct ResolvedRenderSetupSnapshot;
 void InvalidateReciprocalPanWizardCandidate(
     AnimationReciprocalPanWizardState* wizard);
+std::uint32_t ReciprocalPanPathFrameCount(const AnimationPath& path);
+void ShowReciprocalPanWizardCanonicalPose(
+    PreviewRuntimeState* runtimeState);
+bool RebuildReciprocalPanSeamPreview(
+    PreviewRuntimeState* runtimeState,
+    std::size_t seamIndex,
+    float currentAspectRatio);
 std::vector<OfflineRenderJobState::FrozenSeepageLayer> BuildFrozenAnimationSeepageLayers(
     PreviewRuntimeState* runtimeState,
     std::span<const invisible_places::renderer::core::SceneRenderState::PointCloudLayerState> exportLayers,
@@ -2792,7 +2811,8 @@ struct AnimationReciprocalPanFitJobResult {
     std::array<std::filesystem::path, 2> filePaths;
     std::array<std::uint64_t, 2> motionFingerprints{};
     float aspectRatio = 16.0F / 9.0F;
-    invisible_places::camera::AnimationReciprocalPanExtensionResult result;
+    invisible_places::camera::
+        AnimationBidirectionalReciprocalPanExtensionResult result;
 };
 
 struct AnimationReciprocalPanFitJobShared {
@@ -2813,7 +2833,7 @@ struct AnimationPanSeamPreviewJobResult {
     std::array<std::filesystem::path, 2> filePaths;
     std::array<std::uint64_t, 2> motionFingerprints{};
     float aspectRatio = 16.0F / 9.0F;
-    invisible_places::camera::AnimationPanTerminalExtensionResult result;
+    invisible_places::camera::AnimationPanBidirectionalSeamResult result;
 };
 
 struct AnimationPanSeamPreviewJobShared {
@@ -44197,8 +44217,7 @@ void SetReciprocalPanTriangleNode(
         return;
     }
     auto& observation = wizard->endpointTriangles[triangleIndex];
-    if (IsReciprocalPanDestinationTriangle(triangleIndex) &&
-        nodeIndex == 0U && observation.patch.pointCount == 3U) {
+    if (nodeIndex == 0U && observation.patch.pointCount == 3U) {
         const glm::vec3 previous{
             observation.patch.worldPoints[0U][0U],
             observation.patch.worldPoints[0U][1U],
@@ -44232,6 +44251,130 @@ void SetReciprocalPanTriangleNode(
     }
 }
 
+struct ReciprocalPanComparisonView {
+    std::size_t seamIndex = 0U;
+    std::array<invisible_places::camera::CameraState, 2U> cameraStates{};
+    // Indexed by stable animation role: 0=A, 1=B.
+    std::array<std::size_t, 2U> triangleIndices{};
+    std::array<glm::vec3, 2U> anchors{};
+};
+
+std::optional<ReciprocalPanComparisonView>
+ResolveReciprocalPanComparisonView(
+    const AnimationReciprocalPanWizardState& wizard) {
+    std::size_t seamIndex = 0U;
+    std::int32_t offset = 0;
+    if (wizard.stage == AnimationReciprocalPanWizardStage::Seam1Review) {
+        seamIndex = 0U;
+        offset = std::clamp(
+            wizard.seamReviewOffsetFrame,
+            -static_cast<std::int32_t>(wizard.sourceTailFrames[0U]),
+            static_cast<std::int32_t>(wizard.sourceTailFrames[0U]));
+    } else if (
+        wizard.stage == AnimationReciprocalPanWizardStage::Seam2Review) {
+        seamIndex = 1U;
+        offset = std::clamp(
+            wizard.seamReviewOffsetFrame,
+            -static_cast<std::int32_t>(wizard.sourceTailFrames[1U]),
+            static_cast<std::int32_t>(wizard.sourceTailFrames[1U]));
+    } else if (
+        wizard.stage ==
+        AnimationReciprocalPanWizardStage::EditCorrespondences) {
+        seamIndex = std::clamp(wizard.selectedTriangleIndex, 0, 3) >= 2
+            ? 1U
+            : 0U;
+    } else {
+        return std::nullopt;
+    }
+    if (!wizard.seamPreviews[seamIndex].has_value()) {
+        return std::nullopt;
+    }
+
+    const std::size_t sourceRole = seamIndex;
+    const std::size_t destinationRole = seamIndex == 0U ? 1U : 0U;
+    const std::size_t sourceTriangle = seamIndex == 0U ? 0U : 2U;
+    const std::size_t destinationTriangle = sourceTriangle + 1U;
+    const auto& sourcePath =
+        wizard.seamPreviews[seamIndex]->sourceHead.candidate;
+    const auto& destinationPath =
+        wizard.seamPreviews[seamIndex]->destinationTail.candidate;
+    const std::int64_t sourceFrame =
+        static_cast<std::int64_t>(wizard.sourceTailFrames[sourceRole]) +
+        offset;
+    const auto sourceEvaluation = invisible_places::camera::
+        EvaluateAnimationPath(
+            sourcePath,
+            static_cast<float>(sourceFrame) / 30.0F);
+    const std::int64_t destinationFrame =
+        static_cast<std::int64_t>(ReciprocalPanPathFrameCount(
+            wizard.baselinePaths[destinationRole])) + offset;
+    const auto destinationEvaluation = invisible_places::camera::
+        EvaluateAnimationPath(
+            destinationPath,
+            static_cast<float>(destinationFrame) / 30.0F);
+
+    ReciprocalPanComparisonView comparison;
+    comparison.seamIndex = seamIndex;
+    comparison.cameraStates[sourceRole] = sourceEvaluation.camera;
+    comparison.cameraStates[destinationRole] = destinationEvaluation.camera;
+    comparison.cameraStates[0U].hasDepthOfField = false;
+    comparison.cameraStates[1U].hasDepthOfField = false;
+    comparison.triangleIndices[sourceRole] = sourceTriangle;
+    comparison.triangleIndices[destinationRole] = destinationTriangle;
+    for (std::size_t role = 0U; role < 2U; ++role) {
+        const auto& anchor = wizard.endpointTriangles[
+            comparison.triangleIndices[role]].patch.worldPoints[0U];
+        comparison.anchors[role] =
+            glm::vec3{anchor[0U], anchor[1U], anchor[2U]};
+    }
+    return comparison;
+}
+
+std::array<invisible_places::camera::OrbitCameraMatrices, 2U>
+ReciprocalPanComparisonMatrices(
+    const ReciprocalPanComparisonView& comparison,
+    float aspectRatio) {
+    std::array<invisible_places::camera::OrbitCameraMatrices, 2U> matrices;
+    for (std::size_t role = 0U; role < 2U; ++role) {
+        invisible_places::camera::OrbitCamera camera;
+        camera.ApplyState(comparison.cameraStates[role]);
+        matrices[role] = camera.Matrices(aspectRatio);
+    }
+    return matrices;
+}
+
+float ReciprocalPanFeatureFadeCentreNormalized(
+    const ReciprocalPanComparisonView& comparison,
+    const std::array<invisible_places::camera::OrbitCameraMatrices, 2U>&
+        matrices,
+    float viewportWidth,
+    float offsetPixels) {
+    float projectedSum = 0.0F;
+    std::size_t projectedCount = 0U;
+    for (std::size_t role = 0U; role < 2U; ++role) {
+        const glm::vec4 clip = matrices[role].viewProjection *
+            glm::vec4{comparison.anchors[role], 1.0F};
+        if (!std::isfinite(clip.x) || !std::isfinite(clip.w) ||
+            clip.w <= 1.0e-6F) {
+            continue;
+        }
+        const float ndcX = clip.x / clip.w;
+        if (!std::isfinite(ndcX)) {
+            continue;
+        }
+        projectedSum += ndcX * 0.5F + 0.5F;
+        ++projectedCount;
+    }
+    const float anchorCentre = projectedCount > 0U
+        ? projectedSum / static_cast<float>(projectedCount)
+        : 0.5F;
+    return std::clamp(
+        anchorCentre +
+            offsetPixels / std::max(1.0F, viewportWidth),
+        -2.0F,
+        3.0F);
+}
+
 void DrawReciprocalPanViewportOverlay(
     PreviewRuntimeState* runtimeState,
     const invisible_places::renderer::core::VulkanViewportShell& viewport) {
@@ -44244,6 +44387,15 @@ void DrawReciprocalPanViewportOverlay(
         ImGui::GetBackgroundDrawList(ImGui::GetMainViewport());
     const auto matrices =
         runtimeState->camera.Matrices(CurrentAspectRatio(viewport));
+    const auto comparison = ResolveReciprocalPanComparisonView(wizard);
+    const bool splitComparisonActive =
+        wizard.splitComparisonEnabled && comparison.has_value();
+    const auto comparisonMatrices = comparison.has_value()
+        ? std::optional{
+              ReciprocalPanComparisonMatrices(
+                  comparison.value(),
+                  CurrentAspectRatio(viewport))}
+        : std::nullopt;
     if ((wizard.stage == AnimationReciprocalPanWizardStage::Seam1Review ||
          wizard.stage == AnimationReciprocalPanWizardStage::Seam2Review)) {
         const std::size_t seamIndex =
@@ -44251,11 +44403,11 @@ void DrawReciprocalPanViewportOverlay(
                 ? 0U
                 : 1U;
         if (wizard.seamPreviews[seamIndex].has_value()) {
-            const std::size_t sourceRole = seamIndex;
             auto& panel = runtimeState->animationPanel;
             const auto& sourcePrepared = CachedPreparedAnimationPath(
                 &panel,
-                wizard.baselinePaths[sourceRole]);
+                wizard.seamPreviews[seamIndex]
+                    ->sourceHead.candidate);
             DrawAnimationCurveOverlay(
                 sourcePrepared,
                 matrices,
@@ -44264,7 +44416,8 @@ void DrawReciprocalPanViewportOverlay(
                 true);
             const auto& destinationPrepared = CachedPreparedAnimationPath(
                 &panel,
-                wizard.seamPreviews[seamIndex]->candidate);
+                wizard.seamPreviews[seamIndex]
+                    ->destinationTail.candidate);
             DrawAnimationCurveOverlay(
                 destinationPrepared,
                 matrices,
@@ -44377,18 +44530,90 @@ void DrawReciprocalPanViewportOverlay(
     };
     const std::size_t activeTriangle = static_cast<std::size_t>(
         std::clamp(wizard.selectedTriangleIndex, 0, 3));
+    const int viewedRole =
+        wizard.stage == AnimationReciprocalPanWizardStage::Seam1Review
+            ? (wizard.seamReviewView == 0 ? 0 : 1)
+        : wizard.stage == AnimationReciprocalPanWizardStage::Seam2Review
+            ? (wizard.seamReviewView == 0 ? 1 : 0)
+            : std::clamp(wizard.stageViewRole, 0, 1);
+    if (splitComparisonActive && comparisonMatrices.has_value()) {
+        const float centreNormalized =
+            ReciprocalPanFeatureFadeCentreNormalized(
+                comparison.value(),
+                comparisonMatrices.value(),
+                size.x,
+                wizard.splitAnchorOffsetPixels);
+        const float centreX = origin.x + centreNormalized * size.x;
+        const float halfWidth = 0.5F * std::clamp(
+            wizard.splitOverlapPixels,
+            1.0F,
+            std::max(1.0F, size.x * 2.0F));
+        drawList->PushClipRect(origin, viewportMaximum, true);
+        drawList->AddRectFilled(
+            ImVec2{centreX - halfWidth, origin.y},
+            ImVec2{centreX + halfWidth, viewportMaximum.y},
+            IM_COL32(255, 224, 128, 18));
+        drawList->AddLine(
+            ImVec2{centreX - halfWidth, origin.y},
+            ImVec2{centreX - halfWidth, viewportMaximum.y},
+            IM_COL32(255, 224, 128, 115),
+            1.0F);
+        drawList->AddLine(
+            ImVec2{centreX + halfWidth, origin.y},
+            ImVec2{centreX + halfWidth, viewportMaximum.y},
+            IM_COL32(255, 224, 128, 115),
+            1.0F);
+        drawList->AddLine(
+            ImVec2{centreX, origin.y},
+            ImVec2{centreX, viewportMaximum.y},
+            IM_COL32(255, 244, 180, 175),
+            1.5F);
+        drawList->PopClipRect();
+        const ImU32 leftLabelColor = wizard.splitAOnLeft
+            ? IM_COL32(110, 220, 255, 225)
+            : IM_COL32(255, 155, 95, 225);
+        const ImU32 rightLabelColor = wizard.splitAOnLeft
+            ? IM_COL32(255, 155, 95, 225)
+            : IM_COL32(110, 220, 255, 225);
+        drawList->AddText(
+            ImVec2{origin.x + 14.0F, origin.y + 42.0F},
+            leftLabelColor,
+            wizard.splitAOnLeft ? "A" : "B");
+        const char* rightLabel = wizard.splitAOnLeft ? "B" : "A";
+        const ImVec2 rightLabelSize = ImGui::CalcTextSize(rightLabel);
+        drawList->AddText(
+            ImVec2{
+                viewportMaximum.x - rightLabelSize.x - 14.0F,
+                origin.y + 42.0F},
+            rightLabelColor,
+            rightLabel);
+    }
     std::array<std::array<std::optional<ImVec2>, 3>, 4> projectedPoints{};
     for (std::size_t triangleIndex = 0U;
          triangleIndex < wizard.endpointTriangles.size();
          ++triangleIndex) {
         const auto& triangle = wizard.endpointTriangles[triangleIndex];
+        const std::size_t triangleRole = static_cast<std::size_t>(
+            std::clamp(triangle.pathRole, 0, 1));
+        if (splitComparisonActive) {
+            if (triangleIndex !=
+                comparison->triangleIndices[triangleRole]) {
+                continue;
+            }
+        } else if (triangle.pathRole != viewedRole) {
+            continue;
+        }
         const std::size_t pointCount = std::min<std::size_t>(
             triangle.patch.pointCount,
             3U);
+        const auto& triangleMatrices =
+            splitComparisonActive && comparisonMatrices.has_value()
+                ? comparisonMatrices.value()[triangleRole]
+                : matrices;
         for (std::size_t node = 0U; node < pointCount; ++node) {
             const auto& point = triangle.patch.worldPoints[node];
             const auto projected = ProjectWorldPointBeyondViewport(
-                matrices,
+                triangleMatrices,
                 viewport,
                 glm::vec3{point[0U], point[1U], point[2U]});
             projectedPoints[triangleIndex][node] =
@@ -44497,8 +44722,10 @@ void DrawReciprocalPanViewportOverlay(
     const auto& io = ImGui::GetIO();
     const bool viewportInteractive =
         wizard.stage != AnimationReciprocalPanWizardStage::Preview &&
-        !wizard.inspectionActive && IsMouseOverRenderViewport(viewport) &&
-        !viewport.UiWantsMouseCapture();
+        !wizard.inspectionActive && !wizard.fitInProgress &&
+        IsMouseOverRenderViewport(viewport) &&
+        !viewport.UiWantsMouseCapture() &&
+        viewedRole == wizard.endpointTriangles[activeTriangle].pathRole;
     auto& selectedTriangle = wizard.endpointTriangles[activeTriangle];
     const bool selectedNodeExists =
         wizard.selectedNodeIndex >= 0 &&
@@ -44511,6 +44738,20 @@ void DrawReciprocalPanViewportOverlay(
         if (!io.MouseDown[ImGuiMouseButton_Left]) {
             wizard.nodeGizmoDrag = {};
             wizard.nodeGizmoPointerCaptured = false;
+            if (wizard.stage ==
+                    AnimationReciprocalPanWizardStage::Seam1Review ||
+                wizard.stage ==
+                    AnimationReciprocalPanWizardStage::Seam2Review) {
+                const std::size_t seamIndex =
+                    wizard.stage ==
+                            AnimationReciprocalPanWizardStage::Seam1Review
+                        ? 0U
+                        : 1U;
+                RebuildReciprocalPanSeamPreview(
+                    runtimeState,
+                    seamIndex,
+                    CurrentAspectRatio(viewport));
+            }
         } else if (const auto nextPoint = UpdateViewportGizmoDrag(
                        wizard.nodeGizmoDrag,
                        matrices,
@@ -44630,6 +44871,21 @@ void DrawReciprocalPanViewportOverlay(
                     wizard.reraycastSelectedNode = false;
                     wizard.anchorPickArmed = false;
                     InvalidateReciprocalPanWizardCandidate(&wizard);
+                    if (wizard.stage ==
+                            AnimationReciprocalPanWizardStage::Seam1Review ||
+                        wizard.stage ==
+                            AnimationReciprocalPanWizardStage::Seam2Review) {
+                        const std::size_t seamIndex =
+                            wizard.stage ==
+                                    AnimationReciprocalPanWizardStage::
+                                        Seam1Review
+                                ? 0U
+                                : 1U;
+                        RebuildReciprocalPanSeamPreview(
+                            runtimeState,
+                            seamIndex,
+                            CurrentAspectRatio(viewport));
+                    }
                     runtimeState->statusMessage =
                         regeneratedDestination
                             ? "Re-picked the destination anchor and regenerated its camera-local front/side nodes."
@@ -50686,21 +50942,21 @@ const char* ReciprocalPanWizardStageLabel(
         case AnimationReciprocalPanWizardStage::Seam1DestinationTriangle:
             return "2 / 10 - Seam 1: matching anchor at B end";
         case AnimationReciprocalPanWizardStage::Seam1TailExtent:
-            return "3 / 10 - Seam 1: choose A opening span (drives B tail)";
+            return "3 / 10 - Seam 1: choose shared A-start / B-end span";
         case AnimationReciprocalPanWizardStage::Seam1Review:
-            return "4 / 10 - Seam 1: inspect aligned B tail";
+            return "4 / 10 - Seam 1: inspect A pre-roll + B tail";
         case AnimationReciprocalPanWizardStage::Seam2SourceTriangle:
             return "5 / 10 - Seam 2: triangle at B start";
         case AnimationReciprocalPanWizardStage::Seam2DestinationTriangle:
             return "6 / 10 - Seam 2: matching anchor at A end";
         case AnimationReciprocalPanWizardStage::Seam2TailExtent:
-            return "7 / 10 - Seam 2: choose B opening span (drives A tail)";
+            return "7 / 10 - Seam 2: choose shared B-start / A-end span";
         case AnimationReciprocalPanWizardStage::Seam2Review:
-            return "8 / 10 - Seam 2: inspect aligned A tail";
+            return "8 / 10 - Seam 2: inspect B pre-roll + A tail";
         case AnimationReciprocalPanWizardStage::EditCorrespondences:
             return "9 / 10 - Review triangle correspondences";
         case AnimationReciprocalPanWizardStage::Preview:
-            return "10 / 10 - Preview both generated tails";
+            return "10 / 10 - Preview both generated pre-rolls and tails";
         case AnimationReciprocalPanWizardStage::Idle:
             break;
     }
@@ -50743,6 +50999,18 @@ std::uint32_t ReciprocalPanSourceTailMaximumFrame(
             static_cast<float>(totalFrames))));
 }
 
+std::uint32_t ReciprocalPanBidirectionalSeamMaximumFrame(
+    const AnimationPath& source,
+    const AnimationPath& destination) {
+    const std::uint32_t destinationFrames =
+        ReciprocalPanPathFrameCount(destination);
+    const std::uint32_t destinationReverseLimit =
+        destinationFrames > 1U ? destinationFrames - 1U : 0U;
+    return std::min(
+        ReciprocalPanSourceTailMaximumFrame(source),
+        destinationReverseLimit);
+}
+
 std::optional<std::string> ResolveReciprocalPanCommonSceneKey(
     const PreviewRuntimeState& runtimeState,
     const AnimationPath& first,
@@ -50771,6 +51039,62 @@ std::optional<std::string> ResolveReciprocalPanCommonSceneKey(
         if (resident) {
             return key;
         }
+    }
+
+    // Animation associations are useful hints, but old camera paths can lack
+    // them even while the user is visibly working in one shared world-space
+    // point cloud. Prefer the currently selected pickable scene in that case;
+    // otherwise accept an unambiguous sole pickable scene. The captured key is
+    // frozen for the wizard so every A/B raycast still uses one geometry source.
+    if (runtimeState.selectedSessionIndex.has_value() &&
+        runtimeState.selectedSessionIndex.value() <
+            runtimeState.sessions.size()) {
+        const auto& selected = runtimeState.sessions[
+            runtimeState.selectedSessionIndex.value()];
+        if (IsReciprocalPanPickSession(runtimeState, selected)) {
+            return NormalizePathKey(AssociationPathForSession(selected));
+        }
+        if (const auto* scene = FindScenePointCloudRuntime(
+                runtimeState,
+                selected);
+            scene != nullptr) {
+            for (const auto sessionIndex : scene->analysisSessionIndices) {
+                if (sessionIndex.has_value() &&
+                    sessionIndex.value() < runtimeState.sessions.size() &&
+                    IsReciprocalPanPickSession(
+                        runtimeState,
+                        runtimeState.sessions[sessionIndex.value()])) {
+                    return NormalizePathKey(AssociationPathForSession(
+                        runtimeState.sessions[sessionIndex.value()]));
+                }
+            }
+            for (const auto sessionIndex :
+                 scene->committedDisplaySessionIndices) {
+                if (sessionIndex.has_value() &&
+                    sessionIndex.value() < runtimeState.sessions.size() &&
+                    IsReciprocalPanPickSession(
+                        runtimeState,
+                        runtimeState.sessions[sessionIndex.value()])) {
+                    return NormalizePathKey(AssociationPathForSession(
+                        runtimeState.sessions[sessionIndex.value()]));
+                }
+            }
+        }
+    }
+    std::optional<std::string> solePickableScene;
+    for (const auto& session : runtimeState.sessions) {
+        if (!IsReciprocalPanPickSession(runtimeState, session)) {
+            continue;
+        }
+        const auto key = NormalizePathKey(AssociationPathForSession(session));
+        if (solePickableScene.has_value() &&
+            solePickableScene.value() != key) {
+            return std::nullopt;
+        }
+        solePickableScene = key;
+    }
+    if (solePickableScene.has_value()) {
+        return solePickableScene;
     }
     return std::nullopt;
 }
@@ -50900,11 +51224,11 @@ std::optional<std::string> ReciprocalPanPreflightFailure(
              first,
              second)
              .has_value()) {
-        return "A and B need one shared associated point-cloud scene that is visible or CPU-resident for anchor picking. Their scene may be rendered while its association or display pick samples are not available; reload/show the shared scene and try again.";
+        return "No unambiguous pickable point-cloud scene is available. Select the rendered scene (or leave only that scene visible), ensure its display/analysis points are loaded, then launch the assistant.";
     }
-    if (ReciprocalPanSourceTailMaximumFrame(first) < 2U ||
-        ReciprocalPanSourceTailMaximumFrame(second) < 2U) {
-        return "Each animation needs at least two source frames before the allowed tail limit. Lengthen the animation or move/add its penultimate key.";
+    if (ReciprocalPanBidirectionalSeamMaximumFrame(first, second) < 2U ||
+        ReciprocalPanBidirectionalSeamMaximumFrame(second, first) < 2U) {
+        return "Each seam needs at least two frames in both directions around its original 50%-blend pose. Lengthen the animations or move/add their penultimate keys.";
     }
     return std::nullopt;
 }
@@ -51203,6 +51527,106 @@ std::uint32_t ReciprocalPanStageFrame(
     return 0U;
 }
 
+std::uint32_t ReciprocalPanStageFrameForRole(
+    const AnimationReciprocalPanWizardState& wizard,
+    int role) {
+    role = std::clamp(role, 0, 1);
+    switch (wizard.stage) {
+        case AnimationReciprocalPanWizardStage::Seam1SourceTriangle:
+        case AnimationReciprocalPanWizardStage::Seam1DestinationTriangle:
+        case AnimationReciprocalPanWizardStage::Seam1TailExtent:
+            return role == 0
+                ? 0U
+                : ReciprocalPanPathFrameCount(wizard.baselinePaths[1U]);
+        case AnimationReciprocalPanWizardStage::Seam2SourceTriangle:
+        case AnimationReciprocalPanWizardStage::Seam2DestinationTriangle:
+        case AnimationReciprocalPanWizardStage::Seam2TailExtent:
+            return role == 1
+                ? 0U
+                : ReciprocalPanPathFrameCount(wizard.baselinePaths[0U]);
+        case AnimationReciprocalPanWizardStage::EditCorrespondences: {
+            const bool seamTwo =
+                std::clamp(wizard.selectedTriangleIndex, 0, 3) >= 2;
+            if (seamTwo) {
+                return role == 1
+                    ? 0U
+                    : ReciprocalPanPathFrameCount(
+                          wizard.baselinePaths[0U]);
+            }
+            return role == 0
+                ? 0U
+                : ReciprocalPanPathFrameCount(wizard.baselinePaths[1U]);
+        }
+        case AnimationReciprocalPanWizardStage::Seam1Review:
+        case AnimationReciprocalPanWizardStage::Seam2Review:
+        case AnimationReciprocalPanWizardStage::Preview:
+        case AnimationReciprocalPanWizardStage::Idle:
+            return ReciprocalPanStageFrame(wizard);
+    }
+    return 0U;
+}
+
+int ReciprocalPanCurrentViewRole(
+    const AnimationReciprocalPanWizardState& wizard) {
+    if (wizard.stage == AnimationReciprocalPanWizardStage::Seam1Review) {
+        return wizard.seamReviewView == 0 ? 0 : 1;
+    }
+    if (wizard.stage == AnimationReciprocalPanWizardStage::Seam2Review) {
+        return wizard.seamReviewView == 0 ? 1 : 0;
+    }
+    return std::clamp(wizard.stageViewRole, 0, 1);
+}
+
+void SetReciprocalPanWizardViewRole(
+    PreviewRuntimeState* runtimeState,
+    int role) {
+    if (runtimeState == nullptr ||
+        !runtimeState->animationPanel.reciprocalPanWizard.Active()) {
+        return;
+    }
+    auto& wizard = runtimeState->animationPanel.reciprocalPanWizard;
+    role = std::clamp(role, 0, 1);
+    wizard.stageViewRole = role;
+    if (wizard.stage == AnimationReciprocalPanWizardStage::Seam1Review ||
+        wizard.stage == AnimationReciprocalPanWizardStage::Seam2Review) {
+        const std::size_t seamIndex =
+            wizard.stage == AnimationReciprocalPanWizardStage::Seam1Review
+                ? 0U
+                : 1U;
+        const std::size_t sourceRole = seamIndex;
+        wizard.seamReviewView =
+            role == static_cast<int>(sourceRole) ? 0 : 1;
+        wizard.seamReviewEditableSide = wizard.seamReviewView;
+        const int sourceTriangle = seamIndex == 0U ? 0 : 2;
+        wizard.selectedTriangleIndex = sourceTriangle +
+            wizard.seamReviewEditableSide;
+        wizard.selectedNodeIndex = std::clamp(
+            wizard.selectedNodeIndex,
+            0,
+            2);
+    } else if (
+        wizard.stage ==
+        AnimationReciprocalPanWizardStage::EditCorrespondences) {
+        const bool seamTwo =
+            std::clamp(wizard.selectedTriangleIndex, 0, 3) >= 2;
+        wizard.selectedTriangleIndex = seamTwo
+            ? (role == 1 ? 2 : 3)
+            : (role == 0 ? 0 : 1);
+    }
+    wizard.inspectionPathRole = role;
+    wizard.inspectionActive = false;
+    wizard.nodeGizmoDrag = {};
+    wizard.nodeGizmoPointerCaptured = false;
+    const auto& selected = wizard.endpointTriangles[
+        static_cast<std::size_t>(
+            std::clamp(wizard.selectedTriangleIndex, 0, 3))];
+    wizard.anchorPickArmed =
+        selected.pathRole == role &&
+        (wizard.reraycastSelectedNode ||
+         selected.patch.pointCount < 3U);
+    ShowReciprocalPanWizardCanonicalPose(runtimeState);
+}
+
 void ShowReciprocalPanWizardCanonicalPose(
     PreviewRuntimeState* runtimeState) {
     if (runtimeState == nullptr ||
@@ -51219,53 +51643,84 @@ void ShowReciprocalPanWizardCanonicalPose(
                 : 1U;
         const std::size_t sourceRole = seamIndex;
         const std::size_t destinationRole = seamIndex == 0U ? 1U : 0U;
-        const std::uint32_t offset = std::min(
+        const std::int32_t offset = std::clamp(
             wizard.seamReviewOffsetFrame,
-            wizard.sourceTailFrames[sourceRole]);
+            -static_cast<std::int32_t>(
+                wizard.sourceTailFrames[sourceRole]),
+            static_cast<std::int32_t>(
+                wizard.sourceTailFrames[sourceRole]));
         if (!wizard.seamPreviews[seamIndex].has_value()) {
-            const auto& destination =
-                wizard.baselinePaths[destinationRole];
-            ApplyAnimationEvaluation(
-                runtimeState,
-                destination,
-                1.0F,
-                false);
+            if (wizard.seamReviewView == 0) {
+                const auto& source = wizard.baselinePaths[sourceRole];
+                ApplyAnimationEvaluation(
+                    runtimeState,
+                    source,
+                    0.0F,
+                    false);
+            } else {
+                const auto& destination =
+                    wizard.baselinePaths[destinationRole];
+                ApplyAnimationEvaluation(
+                    runtimeState,
+                    destination,
+                    1.0F,
+                    false);
+            }
         } else if (wizard.seamReviewView == 0) {
-            const auto& source = wizard.baselinePaths[sourceRole];
+            const auto& source = wizard.seamPreviews[seamIndex]
+                                     ->sourceHead.candidate;
+            const std::int64_t sourceFrame =
+                static_cast<std::int64_t>(
+                    wizard.sourceTailFrames[sourceRole]) + offset;
             ApplyAnimationEvaluation(
                 runtimeState,
                 source,
-                ReciprocalPanFramePosition(source, offset),
+                ReciprocalPanFramePosition(
+                    source,
+                    static_cast<std::uint32_t>(sourceFrame)),
                 false);
         } else {
-            const auto& destination =
-                wizard.seamPreviews[seamIndex]->candidate;
-            const std::uint32_t destinationFrame =
-                ReciprocalPanPathFrameCount(
-                    wizard.baselinePaths[destinationRole]) +
-                offset;
+            const auto& destination = wizard.seamPreviews[seamIndex]
+                                          ->destinationTail.candidate;
+            const std::int64_t destinationFrame =
+                static_cast<std::int64_t>(
+                    ReciprocalPanPathFrameCount(
+                        wizard.baselinePaths[destinationRole])) + offset;
             ApplyAnimationEvaluation(
                 runtimeState,
                 destination,
-                ReciprocalPanFramePosition(destination, destinationFrame),
+                ReciprocalPanFramePosition(
+                    destination,
+                    static_cast<std::uint32_t>(destinationFrame)),
                 false);
         }
         return;
     }
     if (wizard.stage == AnimationReciprocalPanWizardStage::Preview &&
         wizard.candidate.has_value()) {
-        const int role = std::clamp(wizard.previewPose, 0, 3) % 2;
+        const int pose = std::clamp(wizard.previewPose, 0, 7);
+        const int role = pose / 4;
+        const int phase = pose % 4;
         const auto& path = wizard.previewBaselineHold
                                ? wizard.baselinePaths[
                                      static_cast<std::size_t>(role)]
                            : role == 0
                                ? wizard.candidate->firstCandidate
                                : wizard.candidate->secondCandidate;
-        const bool newTerminal = wizard.previewPose >= 2;
-        const std::uint32_t frame = newTerminal
-                                        ? ReciprocalPanPathFrameCount(path)
-                                        : wizard.sourceTailFrames[
-                                              static_cast<std::size_t>(role)];
+        const std::uint32_t oldFrames = ReciprocalPanPathFrameCount(
+            wizard.baselinePaths[static_cast<std::size_t>(role)]);
+        const std::uint32_t prependedFrames =
+            wizard.sourceTailFrames[static_cast<std::size_t>(role)];
+        std::uint32_t frame = 0U;
+        if (wizard.previewBaselineHold) {
+            frame = phase < 2 ? 0U : oldFrames;
+        } else if (phase == 1) {
+            frame = prependedFrames;
+        } else if (phase == 2) {
+            frame = prependedFrames + oldFrames;
+        } else if (phase == 3) {
+            frame = ReciprocalPanPathFrameCount(path);
+        }
         ApplyAnimationEvaluation(
             runtimeState,
             path,
@@ -51273,14 +51728,14 @@ void ShowReciprocalPanWizardCanonicalPose(
             false);
         return;
     }
-    const int role = ReciprocalPanStagePathRole(wizard);
-    wizard.selectedTriangleIndex = static_cast<int>(
-        ReciprocalPanStageTriangleIndex(wizard));
+    const int role = ReciprocalPanCurrentViewRole(wizard);
     const auto& path = wizard.baselinePaths[static_cast<std::size_t>(role)];
     ApplyAnimationEvaluation(
         runtimeState,
         path,
-        ReciprocalPanFramePosition(path, ReciprocalPanStageFrame(wizard)),
+        ReciprocalPanFramePosition(
+            path,
+            ReciprocalPanStageFrameForRole(wizard, role)),
         false);
 }
 
@@ -51294,6 +51749,7 @@ void CancelReciprocalPanWizard(
     auto& panel = runtimeState->animationPanel;
     const auto launch = panel.reciprocalPanWizard;
     panel.reciprocalPanWizard = {};
+    runtimeState->previewRenderStateSignatureValid = false;
     runtimeState->animationPlayback.active = false;
     runtimeState->cameraPlayback.active = false;
     panel.scrubAmount = launch.launchScrubAmount;
@@ -51481,7 +51937,7 @@ bool RebuildReciprocalPanCandidate(
                 .aspectRatio = options.aspectRatio,
             };
             completed.result = invisible_places::camera::
-                BuildAnimationReciprocalPanExtension(
+                BuildAnimationBidirectionalReciprocalPanExtension(
                     first,
                     second,
                     options);
@@ -51547,38 +52003,52 @@ void PollAnimationReciprocalPanFitJob(
                                   : result.errorMessage;
         return;
     }
-    const auto generatedTailValid = [](const AnimationPath& baseline,
-                                       const AnimationPath& candidate,
-                                       std::uint32_t expectedCount) {
-        if (candidate.keys.size() < baseline.keys.size() + 2U ||
-            candidate.keys.size() > baseline.keys.size() + 3U ||
-            candidate.keys.size() - baseline.keys.size() != expectedCount) {
+    const auto generatedExtensionsValid = [](
+                                             const AnimationPath& baseline,
+                                             const AnimationPath& candidate,
+                                             std::uint32_t prependedCount,
+                                             std::uint32_t appendedCount) {
+        if (prependedCount < 2U || prependedCount > 3U ||
+            appendedCount < 2U || appendedCount > 3U ||
+            candidate.keys.size() != baseline.keys.size() +
+                    prependedCount + appendedCount) {
             return false;
         }
         std::unordered_set<std::string> ids;
         for (const auto& key : baseline.keys) {
             ids.insert(key.id);
         }
-        return std::all_of(
-            candidate.keys.begin() +
-                static_cast<std::ptrdiff_t>(baseline.keys.size()),
-            candidate.keys.end(),
-            [&](const auto& key) {
-                return key.linkedCameraId.empty() &&
-                       !key.id.empty() && ids.insert(key.id).second;
-            });
+        for (std::size_t index = 0U; index < candidate.keys.size(); ++index) {
+            const bool original =
+                index >= prependedCount &&
+                index < prependedCount + baseline.keys.size();
+            const auto& key = candidate.keys[index];
+            if (original) {
+                if (key.id != baseline.keys[index - prependedCount].id) {
+                    return false;
+                }
+                continue;
+            }
+            if (!key.linkedCameraId.empty() || key.id.empty() ||
+                !ids.insert(key.id).second) {
+                return false;
+            }
+        }
+        return true;
     };
-    if (!generatedTailValid(
+    if (!generatedExtensionsValid(
             wizard.baselinePaths[0U],
             result.firstCandidate,
-            result.metrics.appendedKeyCount[0U]) ||
-        !generatedTailValid(
+            result.metrics.incoming.appendedKeyCount[0U],
+            result.metrics.outgoing.appendedKeyCount[0U]) ||
+        !generatedExtensionsValid(
             wizard.baselinePaths[1U],
             result.secondCandidate,
-            result.metrics.appendedKeyCount[1U])) {
+            result.metrics.incoming.appendedKeyCount[1U],
+            result.metrics.outgoing.appendedKeyCount[1U])) {
         wizard.candidate.reset();
         wizard.errorMessage =
-            "The fit did not create the expected two or three independent, unlinked tail keys per animation.";
+            "The fit did not create the expected two or three independent, unlinked pre-roll and tail keys per animation.";
         return;
     }
     wizard.errorMessage.clear();
@@ -51656,9 +52126,9 @@ bool RebuildReciprocalPanSeamPreview(
                 .aspectRatio = currentAspectRatio,
             };
             completed.result = invisible_places::camera::
-                BuildAnimationPanTerminalExtensionPreview(
-                    destination,
+                BuildAnimationPanBidirectionalSeamPreview(
                     source,
+                    destination,
                     specification,
                     currentAspectRatio,
                     65U,
@@ -51669,8 +52139,19 @@ bool RebuildReciprocalPanSeamPreview(
         });
     wizard.fitInProgress = true;
     wizard.seamPreviews[seamIndex].reset();
-    wizard.seamReviewView = 1;
+    wizard.seamReviewEditableSide = std::clamp(
+        wizard.seamReviewEditableSide,
+        0,
+        1);
+    wizard.seamReviewView = wizard.seamReviewEditableSide;
+    wizard.stageViewRole = wizard.seamReviewEditableSide == 0
+        ? static_cast<int>(sourceRole)
+        : static_cast<int>(destinationRole);
+    wizard.selectedTriangleIndex = wizard.seamReviewEditableSide == 0
+        ? static_cast<int>(sourceTriangle)
+        : static_cast<int>(destinationTriangle);
     wizard.seamReviewOffsetFrame = 0U;
+    wizard.splitRenderedRole = 0U;
     wizard.errorMessage.clear();
     return true;
 }
@@ -51902,8 +52383,10 @@ bool StartReciprocalPanWizard(
     wizard.normalizedNearPlane = normalizedNearPlane;
     wizard.normalizedFarPlane = normalizedFarPlane;
     for (std::size_t role = 0U; role < 2U; ++role) {
-        const std::uint32_t end = ReciprocalPanSourceTailMaximumFrame(
-            wizard.baselinePaths[role]);
+        const std::uint32_t end =
+            ReciprocalPanBidirectionalSeamMaximumFrame(
+                wizard.baselinePaths[role],
+                wizard.baselinePaths[1U - role]);
         wizard.sourceTailFrames[role] = std::min(
             end,
             std::max<std::uint32_t>(2U, std::min<std::uint32_t>(30U, end)));
@@ -51965,6 +52448,7 @@ bool StartReciprocalPanWizard(
     wizard.inspectionPathRole = 0;
     wizard.inspectionNormalizedPosition = 0.0F;
     panel.reciprocalPanWizard = std::move(wizard);
+    runtimeState->previewRenderStateSignatureValid = false;
     panel.matchingFrameGhost.visible = false;
     panel.matchingFrameGhost.automaticUpdate = false;
     runtimeState->animationPlayback.active = false;
@@ -51972,7 +52456,7 @@ bool StartReciprocalPanWizard(
     runtimeState->statusMessage =
         panel.reciprocalPanWizard.clipPlanesNormalizedForExtension
             ? "Reciprocal Pan Extension started with a private A/B clip-plane normalization. It is committed only by Apply Both; Cancel leaves both animations unchanged."
-            : "Reciprocal Pan Extension started at seam 1. Capture anchor / front / side on A start, click the matching B-end centre, then scrub A inward to set B's new tail.";
+            : "Reciprocal Pan Extension started at seam 1. Capture anchor / front / side on A start, click the matching B-end centre, then choose the shared span that creates A's pre-roll and B's tail.";
     runtimeState->errorMessage.clear();
     ShowReciprocalPanWizardCanonicalPose(runtimeState);
     return true;
@@ -52031,6 +52515,7 @@ bool TimingTakeSceneStateHasAnimationCoordinates(
 bool BuildReciprocalPanTimingTakeClonePlan(
     const PreviewRuntimeState& runtimeState,
     const std::array<AnimationPath, 2>& baselines,
+    const std::array<std::uint32_t, 2>& prependedFrames,
     std::array<AnimationPath*, 2> candidates,
     ReciprocalPanTimingTakeClonePlan* plan,
     std::string* errorMessage) {
@@ -52046,6 +52531,7 @@ bool BuildReciprocalPanTimingTakeClonePlan(
         std::string clonedTakeId;
         std::uint32_t sourceFrames = 0U;
         std::uint32_t destinationFrames = 0U;
+        std::uint32_t destinationStartFrame = 0U;
     };
     std::vector<SharedClone> sharedClones;
 
@@ -52086,15 +52572,16 @@ bool BuildReciprocalPanTimingTakeClonePlan(
         const std::uint32_t destinationFrames = std::max<std::uint32_t>(
             1U,
             ReciprocalPanPathFrameCount(*candidates[role]));
+        const std::uint32_t destinationStartFrame = prependedFrames[role];
         const auto shared = std::find_if(
             sharedClones.begin(),
             sharedClones.end(),
             [&](const SharedClone& candidate) {
                 return candidate.sourceTakeId == sourceTakeId &&
-                       static_cast<std::uint64_t>(candidate.sourceFrames) *
-                               destinationFrames ==
-                           static_cast<std::uint64_t>(sourceFrames) *
-                               candidate.destinationFrames;
+                       candidate.sourceFrames == sourceFrames &&
+                       candidate.destinationFrames == destinationFrames &&
+                       candidate.destinationStartFrame ==
+                           destinationStartFrame;
             });
         if (shared != sharedClones.end()) {
             plan->assignedTakeIds[role] = shared->clonedTakeId;
@@ -52121,7 +52608,8 @@ bool BuildReciprocalPanTimingTakeClonePlan(
                     RetimeTimingTakeSceneStateNormalizedPositions(
                         &cloneState,
                         sourceFrames,
-                        destinationFrames)) {
+                        destinationFrames,
+                        destinationStartFrame)) {
                 if (errorMessage != nullptr) {
                     *errorMessage =
                         "The selected Timing Take could not be retimed for the extended camera path.";
@@ -52135,6 +52623,7 @@ bool BuildReciprocalPanTimingTakeClonePlan(
             .clonedTakeId = cloneDefinition.id,
             .sourceFrames = sourceFrames,
             .destinationFrames = destinationFrames,
+            .destinationStartFrame = destinationStartFrame,
         });
         plan->assignedTakeIds[role] = cloneDefinition.id;
         candidates[role]->selectedTimingTakeId = cloneDefinition.id;
@@ -52172,8 +52661,10 @@ bool ApplyReciprocalPanCandidate(
         return false;
     }
     const std::unordered_set<std::string> firstMovable{
+        wizard.baselinePaths[0U].keys.front().id,
         wizard.baselinePaths[0U].keys.back().id};
     const std::unordered_set<std::string> secondMovable{
+        wizard.baselinePaths[1U].keys.front().id,
         wizard.baselinePaths[1U].keys.back().id};
     if (!ValidateLoopSmoothingMovableLinks(
             *runtimeState,
@@ -52188,96 +52679,121 @@ bool ApplyReciprocalPanCandidate(
 
     auto first = wizard.candidate->firstCandidate;
     auto second = wizard.candidate->secondCandidate;
-    const auto generatedTailValid = [](
-                                        const AnimationPath& baseline,
-                                        const AnimationPath& candidate,
-                                        std::uint32_t expectedCount) {
-        if (expectedCount < 2U || expectedCount > 3U ||
-            candidate.keys.size() != baseline.keys.size() + expectedCount) {
+    const auto generatedExtensionsValid = [](
+                                             const AnimationPath& baseline,
+                                             const AnimationPath& candidate,
+                                             std::uint32_t prependedCount,
+                                             std::uint32_t appendedCount) {
+        if (prependedCount < 2U || prependedCount > 3U ||
+            appendedCount < 2U || appendedCount > 3U ||
+            candidate.keys.size() != baseline.keys.size() +
+                    prependedCount + appendedCount) {
             return false;
         }
         std::unordered_set<std::string> ids;
         for (const auto& key : baseline.keys) {
             ids.insert(key.id);
         }
-        return std::all_of(
-            candidate.keys.begin() +
-                static_cast<std::ptrdiff_t>(baseline.keys.size()),
-            candidate.keys.end(),
-            [&](const auto& key) {
-                return key.linkedCameraId.empty() && !key.id.empty() &&
-                       ids.insert(key.id).second;
-            });
+        for (std::size_t index = 0U; index < candidate.keys.size(); ++index) {
+            const bool original =
+                index >= prependedCount &&
+                index < prependedCount + baseline.keys.size();
+            const auto& key = candidate.keys[index];
+            if (original) {
+                if (key.id != baseline.keys[index - prependedCount].id) {
+                    return false;
+                }
+                continue;
+            }
+            if (!key.linkedCameraId.empty() || key.id.empty() ||
+                !ids.insert(key.id).second) {
+                return false;
+            }
+        }
+        return true;
     };
-    if (!generatedTailValid(
+    if (!generatedExtensionsValid(
             wizard.baselinePaths[0U],
             first,
-            wizard.candidate->metrics.appendedKeyCount[0U]) ||
-        !generatedTailValid(
+            wizard.candidate->metrics.incoming.appendedKeyCount[0U],
+            wizard.candidate->metrics.outgoing.appendedKeyCount[0U]) ||
+        !generatedExtensionsValid(
             wizard.baselinePaths[1U],
             second,
-            wizard.candidate->metrics.appendedKeyCount[1U])) {
+            wizard.candidate->metrics.incoming.appendedKeyCount[1U],
+            wizard.candidate->metrics.outgoing.appendedKeyCount[1U])) {
         wizard.errorMessage =
-            "Each generated tail must contain two or three new, path-local, unlinked camera keys.";
+            "Each generated pre-roll and tail must contain two or three new, path-local, unlinked camera keys.";
         return false;
     }
-    const auto& firstOldTerminal = wizard.baselinePaths[0U].keys.back();
-    const auto& secondOldTerminal = wizard.baselinePaths[1U].keys.back();
-    if (!firstOldTerminal.linkedCameraId.empty() &&
-        firstOldTerminal.linkedCameraId ==
-            secondOldTerminal.linkedCameraId) {
-        const auto findKey = [](const AnimationPath& path,
-                                std::string_view id)
-            -> const invisible_places::camera::AnimationPathKey* {
-            const auto found = std::find_if(
-                path.keys.begin(),
-                path.keys.end(),
-                [&](const auto& key) { return key.id == id; });
-            return found != path.keys.end() ? &*found : nullptr;
-        };
-        const auto* adjustedFirst = findKey(first, firstOldTerminal.id);
-        const auto* adjustedSecond = findKey(second, secondOldTerminal.id);
-        const auto arraysNear = [](const auto& left, const auto& right) {
-            for (std::size_t index = 0U; index < left.size(); ++index) {
-                if (std::abs(left[index] - right[index]) > 1.0e-5F) {
+    const auto findKey = [](const AnimationPath& path,
+                            std::string_view id)
+        -> const invisible_places::camera::AnimationPathKey* {
+        const auto found = std::find_if(
+            path.keys.begin(),
+            path.keys.end(),
+            [&](const auto& key) { return key.id == id; });
+        return found != path.keys.end() ? &*found : nullptr;
+    };
+    const auto keyPosesNear = [](const auto& left, const auto& right) {
+        const auto arraysNear = [](const auto& a, const auto& b) {
+            for (std::size_t index = 0U; index < a.size(); ++index) {
+                if (std::abs(a[index] - b[index]) > 1.0e-5F) {
                     return false;
                 }
             }
             return true;
         };
-        const bool samePose = adjustedFirst != nullptr &&
-                              adjustedSecond != nullptr &&
-                              arraysNear(
-                                  adjustedFirst->cameraPosition,
-                                  adjustedSecond->cameraPosition) &&
-                              arraysNear(
-                                  adjustedFirst->focusPoint,
-                                  adjustedSecond->focusPoint) &&
-                              std::abs(adjustedFirst->fovDegrees -
-                                       adjustedSecond->fovDegrees) <=
-                                  1.0e-5F &&
-                              std::abs(adjustedFirst->nearPlane -
-                                       adjustedSecond->nearPlane) <=
-                                  1.0e-6F &&
-                              std::abs(adjustedFirst->farPlane -
-                                       adjustedSecond->farPlane) <=
-                                  1.0e-4F &&
-                              adjustedFirst->hasFocusDistance ==
-                                  adjustedSecond->hasFocusDistance &&
-                              (!adjustedFirst->hasFocusDistance ||
-                               std::abs(adjustedFirst->focusDistance -
-                                        adjustedSecond->focusDistance) <=
-                                   1.0e-5F) &&
-                              adjustedFirst->hasApertureFStops ==
-                                  adjustedSecond->hasApertureFStops &&
-                              (!adjustedFirst->hasApertureFStops ||
-                               std::abs(adjustedFirst->apertureFStops -
-                                        adjustedSecond->apertureFStops) <=
-                                   1.0e-5F);
-        if (!samePose) {
-            wizard.errorMessage =
-                "A and B's former terminals share one linked CameraShot, but the two reciprocal fits move it differently. Unlink or duplicate that shot before applying.";
-            return false;
+        return arraysNear(left.cameraPosition, right.cameraPosition) &&
+               arraysNear(left.focusPoint, right.focusPoint) &&
+               std::abs(left.fovDegrees - right.fovDegrees) <= 1.0e-5F &&
+               std::abs(left.nearPlane - right.nearPlane) <= 1.0e-6F &&
+               std::abs(left.farPlane - right.farPlane) <= 1.0e-4F &&
+               left.hasFocusDistance == right.hasFocusDistance &&
+               (!left.hasFocusDistance ||
+                std::abs(left.focusDistance - right.focusDistance) <=
+                    1.0e-5F) &&
+               left.hasApertureFStops == right.hasApertureFStops &&
+               (!left.hasApertureFStops ||
+                std::abs(left.apertureFStops - right.apertureFStops) <=
+                    1.0e-5F);
+    };
+    std::vector<std::pair<
+        std::string,
+        const invisible_places::camera::AnimationPathKey*>>
+        linkedCandidatePoses;
+    const std::array<const AnimationPath*, 2U> baselines{
+        &wizard.baselinePaths[0U],
+        &wizard.baselinePaths[1U]};
+    const std::array<const AnimationPath*, 2U> candidates{&first, &second};
+    for (std::size_t role = 0U; role < 2U; ++role) {
+        for (const auto& baselineKey : baselines[role]->keys) {
+            if (baselineKey.linkedCameraId.empty()) {
+                continue;
+            }
+            const auto* adjusted = findKey(*candidates[role], baselineKey.id);
+            if (adjusted == nullptr) {
+                wizard.errorMessage =
+                    "A linked endpoint key disappeared from the reciprocal candidate.";
+                return false;
+            }
+            const auto previous = std::find_if(
+                linkedCandidatePoses.begin(),
+                linkedCandidatePoses.end(),
+                [&](const auto& entry) {
+                    return entry.first == baselineKey.linkedCameraId;
+                });
+            if (previous != linkedCandidatePoses.end() &&
+                !keyPosesNear(*previous->second, *adjusted)) {
+                wizard.errorMessage =
+                    "One linked CameraShot is used by seam endpoints that the reciprocal fit moves differently. Unlink or duplicate that shot before applying.";
+                return false;
+            }
+            if (previous == linkedCandidatePoses.end()) {
+                linkedCandidatePoses.emplace_back(
+                    baselineKey.linkedCameraId,
+                    adjusted);
+            }
         }
     }
     const auto makeLink = [&](std::size_t role,
@@ -52295,20 +52811,25 @@ bool ApplyReciprocalPanCandidate(
         link.panRight = wizard.panRight;
         AddUniqueAnimationKeyId(
             &link.movableKeyIds,
+            wizard.baselinePaths[role].keys.front().id);
+        AddUniqueAnimationKeyId(
+            &link.movableKeyIds,
             wizard.baselinePaths[role].keys.back().id);
-        for (auto key = candidate.keys.begin() +
-                        static_cast<std::ptrdiff_t>(
-                            wizard.baselinePaths[role].keys.size());
-             key != candidate.keys.end();
-             ++key) {
-            AddUniqueAnimationKeyId(&link.movableKeyIds, key->id);
+        std::unordered_set<std::string> originalIds;
+        for (const auto& key : wizard.baselinePaths[role].keys) {
+            originalIds.insert(key.id);
+        }
+        for (const auto& key : candidate.keys) {
+            if (!originalIds.contains(key.id)) {
+                AddUniqueAnimationKeyId(&link.movableKeyIds, key.id);
+            }
         }
         return link;
     };
     const float newFirstStart =
-        static_cast<float>(wizard.sourceTailFrames[0U]) / 30.0F;
+        2.0F * static_cast<float>(wizard.sourceTailFrames[0U]) / 30.0F;
     const float newSecondStart =
-        static_cast<float>(wizard.sourceTailFrames[1U]) / 30.0F;
+        2.0F * static_cast<float>(wizard.sourceTailFrames[1U]) / 30.0F;
     const float combinedOverlap = newFirstStart + newSecondStart;
     const float firstDuration = invisible_places::camera::
         AnimationPathDurationSeconds(first);
@@ -52317,13 +52838,15 @@ bool ApplyReciprocalPanCandidate(
     if (combinedOverlap > firstDuration + 1.0e-5F ||
         combinedOverlap > secondDuration + 1.0e-5F) {
         wizard.errorMessage =
-            "The two generated overlap bands would cross inside A or B. Shorten one or both source-tail extents, then rebuild the preview.";
+            "The two generated overlap bands would cross inside A or B. Shorten one or both seam spans, then rebuild the preview.";
         return false;
     }
     ReciprocalPanTimingTakeClonePlan timingTakePlan;
     if (!BuildReciprocalPanTimingTakeClonePlan(
             *runtimeState,
             wizard.baselinePaths,
+            {wizard.sourceTailFrames[0U],
+             wizard.sourceTailFrames[1U]},
             {&first, &second},
             &timingTakePlan,
             &wizard.errorMessage)) {
@@ -52410,8 +52933,10 @@ bool ApplyReciprocalPanCandidate(
     panel.matchingFrameGhost.visible = launch.launchGhostVisible;
     panel.matchingFrameGhost.automaticUpdate =
         launch.launchGhostAutomaticUpdate;
+    const float firstPreRollSeconds =
+        static_cast<float>(launch.sourceTailFrames[0U]) / 30.0F;
     panel.scrubAmount = std::clamp(
-        launch.launchElapsedSeconds /
+        (firstPreRollSeconds + launch.launchElapsedSeconds) /
             std::max(
                 invisible_places::camera::AnimationPathDurationSeconds(first),
                 1.0e-6F),
@@ -52441,16 +52966,25 @@ bool ApplyReciprocalPanCandidate(
     runtimeState->statusMessage =
         std::string{
             launch.clipPlanesNormalizedForExtension
-                ? "Normalized A/B clip planes and created reciprocal _Edited pan extensions (A +"
-                : "Created reciprocal _Edited pan extensions (A +"} +
-        std::to_string(metrics.extensionFrames[0U]) +
-        " frames / " +
-        std::to_string(metrics.appendedKeyCount[0U]) +
-        " keys, B +" +
-        std::to_string(metrics.extensionFrames[1U]) +
-        " frames / " +
-        std::to_string(metrics.appendedKeyCount[1U]) +
-        " keys). Save Changes writes the pair and project link together.";
+                ? "Normalized A/B clip planes and created reciprocal _Edited pan extensions ("
+                : "Created reciprocal _Edited pan extensions ("} +
+        "A pre-roll " +
+        std::to_string(metrics.incoming.extensionFrames[0U]) +
+        "f / " +
+        std::to_string(metrics.incoming.appendedKeyCount[0U]) +
+        " keys, tail " +
+        std::to_string(metrics.outgoing.extensionFrames[0U]) +
+        "f / " +
+        std::to_string(metrics.outgoing.appendedKeyCount[0U]) +
+        " keys; B pre-roll " +
+        std::to_string(metrics.incoming.extensionFrames[1U]) +
+        "f / " +
+        std::to_string(metrics.incoming.appendedKeyCount[1U]) +
+        " keys, tail " +
+        std::to_string(metrics.outgoing.extensionFrames[1U]) +
+        "f / " +
+        std::to_string(metrics.outgoing.appendedKeyCount[1U]) +
+        " keys). Save Changes writes both animations and the project link together.";
     runtimeState->errorMessage.clear();
     return true;
 }
@@ -52582,6 +53116,7 @@ void BackReciprocalPanWizard(PreviewRuntimeState* runtimeState) {
     wizard.reraycastSelectedNode = false;
     wizard.nodeGizmoDrag = {};
     wizard.nodeGizmoPointerCaptured = false;
+    wizard.stageViewRole = ReciprocalPanStagePathRole(wizard);
     if (triangleStage) {
         const auto triangleIndex =
             ReciprocalPanStageTriangleIndex(wizard);
@@ -52589,6 +53124,15 @@ void BackReciprocalPanWizard(PreviewRuntimeState* runtimeState) {
         wizard.selectedNodeIndex = static_cast<int>(std::min<std::uint32_t>(
             wizard.endpointTriangles[triangleIndex].patch.pointCount,
             2U));
+    } else if (
+        wizard.stage == AnimationReciprocalPanWizardStage::Seam1Review ||
+        wizard.stage == AnimationReciprocalPanWizardStage::Seam2Review) {
+        const int sourceTriangle =
+            wizard.stage == AnimationReciprocalPanWizardStage::Seam1Review
+                ? 0
+                : 2;
+        wizard.selectedTriangleIndex =
+            sourceTriangle + std::clamp(wizard.seamReviewEditableSide, 0, 1);
     }
     ShowReciprocalPanWizardCanonicalPose(runtimeState);
 }
@@ -52608,13 +53152,15 @@ bool ReciprocalPanStageHasRequiredObservation(
         case AnimationReciprocalPanWizardStage::Seam1TailExtent:
             return wizard.sourceTailFrames[0U] >= 2U &&
                    wizard.sourceTailFrames[0U] <=
-                       ReciprocalPanSourceTailMaximumFrame(
-                           wizard.baselinePaths[0U]);
+                       ReciprocalPanBidirectionalSeamMaximumFrame(
+                           wizard.baselinePaths[0U],
+                           wizard.baselinePaths[1U]);
         case AnimationReciprocalPanWizardStage::Seam2TailExtent:
             return wizard.sourceTailFrames[1U] >= 2U &&
                    wizard.sourceTailFrames[1U] <=
-                       ReciprocalPanSourceTailMaximumFrame(
-                           wizard.baselinePaths[1U]);
+                       ReciprocalPanBidirectionalSeamMaximumFrame(
+                           wizard.baselinePaths[1U],
+                           wizard.baselinePaths[0U]);
         case AnimationReciprocalPanWizardStage::Seam1Review:
             return !wizard.fitInProgress &&
                    wizard.seamPreviews[0U].has_value();
@@ -52639,14 +53185,16 @@ bool ReciprocalPanStageHasRequiredObservation(
 bool ReciprocalPanExpandedOverlapsFit(
     const AnimationReciprocalPanWizardState& wizard) {
     const std::uint64_t combinedOverlapFrames =
-        static_cast<std::uint64_t>(wizard.sourceTailFrames[0U]) +
-        static_cast<std::uint64_t>(wizard.sourceTailFrames[1U]);
+        2U * (static_cast<std::uint64_t>(wizard.sourceTailFrames[0U]) +
+              static_cast<std::uint64_t>(wizard.sourceTailFrames[1U]));
     const std::uint64_t firstCandidateFrames =
         ReciprocalPanPathFrameCount(wizard.baselinePaths[0U]) +
+        static_cast<std::uint64_t>(wizard.sourceTailFrames[0U]) +
         static_cast<std::uint64_t>(wizard.sourceTailFrames[1U]);
     const std::uint64_t secondCandidateFrames =
         ReciprocalPanPathFrameCount(wizard.baselinePaths[1U]) +
-        static_cast<std::uint64_t>(wizard.sourceTailFrames[0U]);
+        static_cast<std::uint64_t>(wizard.sourceTailFrames[0U]) +
+        static_cast<std::uint64_t>(wizard.sourceTailFrames[1U]);
     return combinedOverlapFrames <= firstCandidateFrames &&
            combinedOverlapFrames <= secondCandidateFrames;
 }
@@ -52738,6 +53286,7 @@ void AdvanceReciprocalPanWizard(
             2U));
     }
     const int role = ReciprocalPanStagePathRole(wizard);
+    wizard.stageViewRole = role;
     wizard.inspectionPathRole = role;
     if (wizard.stage != AnimationReciprocalPanWizardStage::Preview) {
         const auto& path = wizard.baselinePaths[
@@ -52771,6 +53320,28 @@ void DrawReciprocalPanWizard(
         "A: %s\nB: %s",
         AnimationDisplayNameFromPath(wizard.filePaths[0U]).c_str(),
         AnimationDisplayNameFromPath(wizard.filePaths[1U]).c_str());
+    if (wizard.stage != AnimationReciprocalPanWizardStage::Preview) {
+        const int viewedRole = ReciprocalPanCurrentViewRole(wizard);
+        ImGui::BeginDisabled(wizard.inspectionActive);
+        if (ImGui::Button(
+                viewedRole == 0
+                    ? "Flip view: A -> B"
+                    : "Flip view: B -> A")) {
+            SetReciprocalPanWizardViewRole(
+                runtimeState,
+                1 - viewedRole);
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::TextDisabled(
+            (wizard.stage ==
+                     AnimationReciprocalPanWizardStage::Seam1Review ||
+                 wizard.stage ==
+                     AnimationReciprocalPanWizardStage::Seam2Review)
+                ? "Active/edit camera: %s"
+                : "Orientation view: %s",
+            viewedRole == 0 ? "A" : "B");
+    }
     ImGui::TextDisabled(
         "Assumption: A start <-> B end and B start <-> A end are the manually tuned visual 50%%-blend poses.");
     if (wizard.clipPlanesNormalizedForExtension) {
@@ -52805,17 +53376,62 @@ void DrawReciprocalPanWizard(
     const bool seamReviewStage =
         wizard.stage == AnimationReciprocalPanWizardStage::Seam1Review ||
         wizard.stage == AnimationReciprocalPanWizardStage::Seam2Review;
-    const int role = ReciprocalPanStagePathRole(wizard);
+    const bool comparisonControlsStage =
+        seamReviewStage ||
+        wizard.stage ==
+            AnimationReciprocalPanWizardStage::EditCorrespondences;
+    if (comparisonControlsStage) {
+        if (ImGui::Checkbox(
+                "Feature-following A/B split",
+                &wizard.splitComparisonEnabled)) {
+            runtimeState->previewRenderStateSignatureValid = false;
+        }
+        if (wizard.splitComparisonEnabled) {
+            const float viewportWidth = std::max(
+                1.0F,
+                CurrentUiViewportSize(viewport).x);
+            ImGui::TextDisabled("Fade overlap width (pixels)");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::SliderFloat(
+                "##ReciprocalPanSplitWidth",
+                &wizard.splitOverlapPixels,
+                40.0F,
+                std::max(400.0F, viewportWidth),
+                "%.0f px");
+            ImGui::TextDisabled(
+                "Fade centre offset from tracked anchors (pixels)");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::SliderFloat(
+                "##ReciprocalPanSplitOffset",
+                &wizard.splitAnchorOffsetPixels,
+                -viewportWidth,
+                viewportWidth,
+                "%+.0f px");
+            if (ImGui::Button(
+                    wizard.splitAOnLeft
+                        ? "Swap sides: put B on left"
+                        : "Swap sides: put A on left")) {
+                wizard.splitAOnLeft = !wizard.splitAOnLeft;
+            }
+            ImGui::TextDisabled(
+                "The fade centre follows the mean A/B anchor projection as the synchronized seam is scrubbed. The offset stays relative to that moving feature.");
+        }
+    }
+    const int role = tailExtentStage
+        ? ReciprocalPanStagePathRole(wizard)
+        : ReciprocalPanCurrentViewRole(wizard);
     if (tailExtentStage) {
         const std::size_t sourceRole = static_cast<std::size_t>(role);
         int frame = static_cast<int>(
             wizard.sourceTailFrameDrafts[sourceRole]);
         const int maximumFrame = static_cast<int>(
-            ReciprocalPanSourceTailMaximumFrame(
-                wizard.baselinePaths[sourceRole]));
+            ReciprocalPanBidirectionalSeamMaximumFrame(
+                wizard.baselinePaths[sourceRole],
+                wizard.baselinePaths[1U - sourceRole]));
         ImGui::TextDisabled(
-            role == 0 ? "A opening-span end frame (drives B tail)"
-                      : "B opening-span end frame (drives A tail)");
+            role == 0
+                ? "Seam 1 span (creates A pre-roll + B tail)"
+                : "Seam 2 span (creates B pre-roll + A tail)");
         ImGui::SetNextItemWidth(-FLT_MIN);
         if (ImGui::SliderInt(
                 "##ReciprocalPanSourceSpan",
@@ -52844,7 +53460,7 @@ void DrawReciprocalPanWizard(
             ShowReciprocalPanWizardCanonicalPose(runtimeState);
         }
         ImGui::TextDisabled(
-            "Drag inward until this source motion covers the desired wipe. Releasing commits the integer extent and snaps back to frame 0.");
+            "Drag inward until this source motion covers one half of the desired wipe. The same frame count is generated before the source start and after the matching destination end; release to commit.");
         ImGui::TextDisabled(
             wizard.baselinePaths[sourceRole].keys.size() > 2U
                 ? "The limit is the penultimate key frame, keeping the sampled source clear of the terminal segment the reciprocal fit may adjust."
@@ -52893,11 +53509,11 @@ void DrawReciprocalPanWizard(
             break;
         case AnimationReciprocalPanWizardStage::Seam1TailExtent:
             ImGui::TextWrapped(
-                "Temporarily scrub A inward to choose how much of its opening motion becomes B's generated terminal tail.");
+                "Temporarily scrub A inward to choose the seam span. That same tracked motion generates B's tail after its old end and A's pre-roll before its old start.");
             break;
         case AnimationReciprocalPanWizardStage::Seam1Review:
             ImGui::TextWrapped(
-                "Scrub the same frame offset on A's source motion and B's fitted old-end/new-tail motion. Flip views to verify that the selected feature tracks and leaves frame smoothly before continuing.");
+                "Scrub through negative offsets (new A pre-roll), zero (the original A-start/B-end 50%% pose), and positive offsets (new B tail). Flip or split the views to verify the same feature tracks continuously in both directions.");
             break;
         case AnimationReciprocalPanWizardStage::Seam1DestinationTriangle:
             ImGui::TextWrapped(
@@ -52909,11 +53525,11 @@ void DrawReciprocalPanWizard(
             break;
         case AnimationReciprocalPanWizardStage::Seam2TailExtent:
             ImGui::TextWrapped(
-                "Temporarily scrub B inward to choose how much of its opening motion becomes A's generated terminal tail.");
+                "Temporarily scrub B inward to choose the seam span. That same tracked motion generates A's tail after its old end and B's pre-roll before its old start.");
             break;
         case AnimationReciprocalPanWizardStage::Seam2Review:
             ImGui::TextWrapped(
-                "Scrub B's source motion against A's fitted old-end/new-tail motion. Re-pick or adjust the A-end feature if the overlay correspondence is not convincing.");
+                "Scrub through negative offsets (new B pre-roll), zero (the original B-start/A-end 50%% pose), and positive offsets (new A tail). Re-pick or adjust either triangle if the correspondence is not convincing.");
             break;
         case AnimationReciprocalPanWizardStage::Seam2DestinationTriangle:
             ImGui::TextWrapped(
@@ -52937,7 +53553,7 @@ void DrawReciprocalPanWizard(
         const std::size_t destinationRole = seamIndex == 0U ? 1U : 0U;
         if (wizard.fitInProgress) {
             ImGui::TextDisabled(
-                "Aligning the existing destination end and fitting its short generated tail in the background...");
+                "Aligning the original 50%% pose and fitting the generated pre-roll and tail in the background...");
         } else if (!wizard.errorMessage.empty()) {
             ImGui::TextColored(
                 ImVec4{0.95F, 0.42F, 0.30F, 1.0F},
@@ -52951,60 +53567,63 @@ void DrawReciprocalPanWizard(
             }
         } else if (wizard.seamPreviews[seamIndex].has_value()) {
             const auto& preview = wizard.seamPreviews[seamIndex].value();
-            ImGui::Text(
-                "Aligned %s end +%u frames / %u keys | anchor RMS %.5f | rotation residual %.3f deg/s",
+            ImGui::TextWrapped(
+                "Aligned %s end: +%u frames / %u tail keys | anchor RMS %.5f | rotation residual %.3f deg/s",
                 destinationRole == 0U ? "A" : "B",
-                preview.extensionFrames,
-                preview.appendedKeyCount,
-                preview.anchorOverlayRmsScreenHeights,
-                preview.rotationRateResidualDegreesPerSecond);
-            if (ImGui::RadioButton(
-                    sourceRole == 0U ? "View source A" : "View source B",
-                    wizard.seamReviewView == 0)) {
-                wizard.seamReviewView = 0;
-                ShowReciprocalPanWizardCanonicalPose(runtimeState);
-            }
-            ImGui::SameLine();
-            if (ImGui::RadioButton(
-                    destinationRole == 0U ? "View fitted A" : "View fitted B",
-                    wizard.seamReviewView == 1)) {
-                wizard.seamReviewView = 1;
-                ShowReciprocalPanWizardCanonicalPose(runtimeState);
-            }
-            int offsetFrame = static_cast<int>(std::min(
-                wizard.seamReviewOffsetFrame,
-                wizard.sourceTailFrames[sourceRole]));
+                preview.destinationTail.extensionFrames,
+                preview.destinationTail.appendedKeyCount,
+                preview.destinationTail.anchorOverlayRmsScreenHeights,
+                preview.destinationTail
+                    .rotationRateResidualDegreesPerSecond);
+            ImGui::TextWrapped(
+                "Generated %s pre-roll: -%u frames / %u head keys | anchor RMS %.5f | rotation residual %.3f deg/s",
+                sourceRole == 0U ? "A" : "B",
+                preview.sourceHead.extensionFrames,
+                preview.sourceHead.appendedKeyCount,
+                preview.sourceHead.anchorOverlayRmsScreenHeights,
+                preview.sourceHead
+                    .rotationRateResidualDegreesPerSecond);
+            ImGui::TextDisabled(
+                "Use Flip view above to make the %s or fitted %s triangle active for re-picking and gizmo edits.",
+                sourceRole == 0U ? "A" : "B",
+                destinationRole == 0U ? "A" : "B");
+            const int maximumOffset = static_cast<int>(
+                wizard.sourceTailFrames[sourceRole]);
+            int offsetFrame = std::clamp(
+                static_cast<int>(wizard.seamReviewOffsetFrame),
+                -maximumOffset,
+                maximumOffset);
             ImGui::TextDisabled("Synchronized seam offset");
             ImGui::SetNextItemWidth(-FLT_MIN);
             if (ImGui::SliderInt(
                     "##ReciprocalPanSynchronizedSeamOffset",
                     &offsetFrame,
-                    0,
-                    static_cast<int>(wizard.sourceTailFrames[sourceRole]))) {
+                    -maximumOffset,
+                    maximumOffset)) {
                 wizard.seamReviewOffsetFrame =
-                    static_cast<std::uint32_t>(offsetFrame);
+                    static_cast<std::int32_t>(offsetFrame);
                 ShowReciprocalPanWizardCanonicalPose(runtimeState);
             }
-            const std::uint32_t destinationFrame =
-                ReciprocalPanPathFrameCount(
-                    wizard.baselinePaths[destinationRole]) +
-                static_cast<std::uint32_t>(offsetFrame);
+            const int sourceFrame = maximumOffset + offsetFrame;
+            const std::int64_t destinationFrame =
+                static_cast<std::int64_t>(
+                    ReciprocalPanPathFrameCount(
+                        wizard.baselinePaths[destinationRole])) +
+                offsetFrame;
             ImGui::TextDisabled(
-                "Source frame %d <-> fitted %s frame %u. Offset 0 is the adjusted old terminal; the final offset is the generated end.",
-                offsetFrame,
+                "%s frame %d <-> fitted %s frame %lld. Negative offsets inspect the generated pre-roll; zero is the original 50%% pose; positive offsets inspect the generated tail.",
+                sourceRole == 0U ? "A" : "B",
+                sourceFrame,
                 destinationRole == 0U ? "A" : "B",
-                destinationFrame);
+                static_cast<long long>(destinationFrame));
             if (ImGui::Button(
                     destinationRole == 0U
                         ? "Re-pick A-end feature centre"
                         : "Re-pick B-end feature centre")) {
-                wizard.stage = seamIndex == 0U
-                    ? AnimationReciprocalPanWizardStage::
-                          Seam1DestinationTriangle
-                    : AnimationReciprocalPanWizardStage::
-                          Seam2DestinationTriangle;
-                wizard.selectedTriangleIndex =
-                    seamIndex == 0U ? 1 : 3;
+                SetReciprocalPanWizardViewRole(
+                    runtimeState,
+                    static_cast<int>(destinationRole));
+                wizard.selectedTriangleIndex = seamIndex == 0U ? 1 : 3;
                 wizard.selectedNodeIndex = 0;
                 wizard.anchorPickArmed = true;
                 wizard.reraycastSelectedNode = true;
@@ -53030,6 +53649,7 @@ void DrawReciprocalPanWizard(
         wizard.stage == AnimationReciprocalPanWizardStage::Seam1DestinationTriangle ||
         wizard.stage == AnimationReciprocalPanWizardStage::Seam2SourceTriangle ||
         wizard.stage == AnimationReciprocalPanWizardStage::Seam2DestinationTriangle ||
+        seamReviewStage ||
         wizard.stage == AnimationReciprocalPanWizardStage::EditCorrespondences;
     if (triangleStage) {
         static constexpr const char* kTriangleLabels[] = {
@@ -53053,7 +53673,9 @@ void DrawReciprocalPanWizard(
                 wizard.selectedNodeIndex = 0;
                 wizard.reraycastSelectedNode = false;
                 wizard.anchorPickArmed = false;
-                ShowReciprocalPanWizardCanonicalPose(runtimeState);
+                SetReciprocalPanWizardViewRole(
+                    runtimeState,
+                    wizard.endpointTriangles[triangleIndex].pathRole);
             }
             const int counterpart = triangleIndex == 0 ? 1
                                   : triangleIndex == 1 ? 0
@@ -53067,8 +53689,15 @@ void DrawReciprocalPanWizard(
                     2);
                 wizard.reraycastSelectedNode = false;
                 wizard.anchorPickArmed = false;
-                ShowReciprocalPanWizardCanonicalPose(runtimeState);
+                SetReciprocalPanWizardViewRole(
+                    runtimeState,
+                    wizard.endpointTriangles[counterpart].pathRole);
             }
+        } else if (seamReviewStage) {
+            ImGui::TextDisabled(
+                "Editable triangle: %s",
+                kTriangleLabels[
+                    std::clamp(wizard.selectedTriangleIndex, 0, 3)]);
         } else {
             wizard.selectedTriangleIndex = static_cast<int>(
                 ReciprocalPanStageTriangleIndex(wizard));
@@ -53106,7 +53735,10 @@ void DrawReciprocalPanWizard(
             wizard.selectedNodeIndex >= 0 &&
             static_cast<std::uint32_t>(wizard.selectedNodeIndex) <
                 triangle.patch.pointCount;
-        ImGui::BeginDisabled(!selectedExists);
+        const bool editingCurrentView =
+            triangle.pathRole == ReciprocalPanCurrentViewRole(wizard) &&
+            !wizard.fitInProgress;
+        ImGui::BeginDisabled(!selectedExists || !editingCurrentView);
         if (ImGui::Button("Re-raycast selected node")) {
             wizard.reraycastSelectedNode = true;
             wizard.anchorPickArmed = true;
@@ -53131,6 +53763,15 @@ void DrawReciprocalPanWizard(
                     point);
                 InvalidateReciprocalPanWizardCandidate(&wizard);
             }
+            if (ImGui::IsItemDeactivatedAfterEdit() && seamReviewStage) {
+                RebuildReciprocalPanSeamPreview(
+                    runtimeState,
+                    wizard.stage ==
+                            AnimationReciprocalPanWizardStage::Seam1Review
+                        ? 0U
+                        : 1U,
+                    aspectRatio);
+            }
         }
         ImGui::EndDisabled();
         if (ImGui::Button("Clear this triangle")) {
@@ -53139,7 +53780,7 @@ void DrawReciprocalPanWizard(
             triangle.cameraLocalAxesGenerated = false;
             wizard.selectedNodeIndex = 0;
             wizard.reraycastSelectedNode = false;
-            wizard.anchorPickArmed = true;
+            wizard.anchorPickArmed = editingCurrentView;
             InvalidateReciprocalPanWizardCandidate(&wizard);
             capturedNodes = 0;
         }
@@ -53162,7 +53803,7 @@ void DrawReciprocalPanWizard(
                 "Click %s on the common scene; roles are never reordered after editing.",
                 kNodeLabels[capturedNodes]);
             wizard.selectedNodeIndex = capturedNodes;
-            wizard.anchorPickArmed = true;
+            wizard.anchorPickArmed = editingCurrentView;
         }
     }
 
@@ -53182,42 +53823,35 @@ void DrawReciprocalPanWizard(
             }
         } else if (wizard.candidate.has_value()) {
             const auto& metrics = wizard.candidate->metrics;
-            ImGui::Text(
-                "A +%u frames / %u keys | B +%u frames / %u keys",
-                metrics.extensionFrames[0U],
-                metrics.appendedKeyCount[0U],
-                metrics.extensionFrames[1U],
-                metrics.appendedKeyCount[1U]);
-            ImGui::Text(
-                "Velocity RMS A %.5f -> %.5f | B %.5f -> %.5f screen-heights/s",
-                metrics.beforeVelocityRmsScreenHeightsPerSecond[0U],
-                metrics.afterVelocityRmsScreenHeightsPerSecond[0U],
-                metrics.beforeVelocityRmsScreenHeightsPerSecond[1U],
-                metrics.afterVelocityRmsScreenHeightsPerSecond[1U]);
-            ImGui::Text(
-                "Rotation residual A %.3f / B %.3f deg/s | scale A %.3f%% / B %.3f%%",
-                metrics.rotationRateResidualDegreesPerSecond[0U],
-                metrics.rotationRateResidualDegreesPerSecond[1U],
-                metrics.perspectiveScaleResidualPercent[0U],
-                metrics.perspectiveScaleResidualPercent[1U]);
-            ImGui::Text(
-                "Anchor overlay RMS A %.5f / B %.5f screen heights (confidence %.0f%% / %.0f%%)",
-                metrics.anchorOverlayRmsScreenHeights[0U],
-                metrics.anchorOverlayRmsScreenHeights[1U],
-                100.0F * metrics.patchConfidence[0U],
-                100.0F * metrics.patchConfidence[1U]);
-            ImGui::Text(
-                "3-node overlay RMS A %.5f / B %.5f | max A %.5f / B %.5f screen heights",
-                metrics.patchNodeOverlayRmsScreenHeights[0U],
-                metrics.patchNodeOverlayRmsScreenHeights[1U],
-                metrics.patchNodeOverlayMaxScreenHeights[0U],
-                metrics.patchNodeOverlayMaxScreenHeights[1U]);
-            ImGui::Text(
-                "Former terminal move camera A %.5f / B %.5f | focus A %.5f / B %.5f",
-                metrics.formerTerminalCameraMove[0U],
-                metrics.formerTerminalCameraMove[1U],
-                metrics.formerTerminalFocusMove[0U],
-                metrics.formerTerminalFocusMove[1U]);
+            const auto& heads = metrics.incoming;
+            const auto& tails = metrics.outgoing;
+            ImGui::TextWrapped(
+                "A: pre-roll %u frames / %u keys, tail %u frames / %u keys. B: pre-roll %u frames / %u keys, tail %u frames / %u keys.",
+                heads.extensionFrames[0U],
+                heads.appendedKeyCount[0U],
+                tails.extensionFrames[0U],
+                tails.appendedKeyCount[0U],
+                heads.extensionFrames[1U],
+                heads.appendedKeyCount[1U],
+                tails.extensionFrames[1U],
+                tails.appendedKeyCount[1U]);
+            for (std::size_t candidateIndex = 0U;
+                 candidateIndex < 2U;
+                 ++candidateIndex) {
+                ImGui::TextWrapped(
+                    "%s pre-roll: velocity %.5f, rotation %.3f deg/s, 3-node overlay %.5f. Tail: velocity %.5f, rotation %.3f deg/s, 3-node overlay %.5f.",
+                    candidateIndex == 0U ? "A" : "B",
+                    heads.afterVelocityRmsScreenHeightsPerSecond[
+                        candidateIndex],
+                    heads.rotationRateResidualDegreesPerSecond[
+                        candidateIndex],
+                    heads.patchNodeOverlayRmsScreenHeights[candidateIndex],
+                    tails.afterVelocityRmsScreenHeightsPerSecond[
+                        candidateIndex],
+                    tails.rotationRateResidualDegreesPerSecond[
+                        candidateIndex],
+                    tails.patchNodeOverlayRmsScreenHeights[candidateIndex]);
+            }
             for (std::size_t candidateIndex = 0U;
                  candidateIndex < 2U;
                  ++candidateIndex) {
@@ -53231,12 +53865,17 @@ void DrawReciprocalPanWizard(
                     ReciprocalPanPathFrameCount(candidate));
                 const std::string bandLabel =
                     std::string{candidateIndex == 0U ? "A  " : "B  "} +
+                    std::to_string(
+                        heads.extensionFrames[candidateIndex]) +
+                    " pre-roll + " +
                     std::to_string(static_cast<std::uint32_t>(oldFrames)) +
-                    " authored | +" +
-                    std::to_string(metrics.extensionFrames[candidateIndex]) +
-                    " frames / " +
-                    std::to_string(metrics.appendedKeyCount[candidateIndex]) +
-                    " generated keys";
+                    " authored + " +
+                    std::to_string(tails.extensionFrames[candidateIndex]) +
+                    " tail frames (" +
+                    std::to_string(
+                        heads.appendedKeyCount[candidateIndex] +
+                        tails.appendedKeyCount[candidateIndex]) +
+                    " generated keys)";
                 ImGui::ProgressBar(
                     newFrames > 0.0F ? oldFrames / newFrames : 1.0F,
                     ImVec2{-FLT_MIN, 0.0F},
@@ -53255,16 +53894,20 @@ void DrawReciprocalPanWizard(
                 wizard.previewMode = 2;
             }
             const char* poseLabels[] = {
-                "A opening-span end",
-                "B opening-span end",
-                "A generated end",
-                "B generated end",
+                "A new pre-roll start",
+                "A original start (seam 1 midpoint)",
+                "A original end (seam 2 midpoint)",
+                "A new tail end",
+                "B new pre-roll start",
+                "B original start (seam 2 midpoint)",
+                "B original end (seam 1 midpoint)",
+                "B new tail end",
             };
             if (ImGui::Combo(
                     "Preview pose",
                     &wizard.previewPose,
                     poseLabels,
-                    4)) {
+                    8)) {
                 ShowReciprocalPanWizardCanonicalPose(runtimeState);
             }
             ImGui::Button("Hold baseline", ImVec2{-FLT_MIN, 0.0F});
@@ -53273,12 +53916,16 @@ void DrawReciprocalPanWizard(
                 wizard.previewBaselineHold = holdBaseline;
                 ShowReciprocalPanWizardCanonicalPose(runtimeState);
             }
-            if (!metrics.patchDiagnostic[0U].empty() ||
-                !metrics.patchDiagnostic[1U].empty()) {
-                ImGui::TextDisabled(
-                    "A: %s\nB: %s",
-                    metrics.patchDiagnostic[0U].c_str(),
-                    metrics.patchDiagnostic[1U].c_str());
+            if (!heads.patchDiagnostic[0U].empty() ||
+                !heads.patchDiagnostic[1U].empty() ||
+                !tails.patchDiagnostic[0U].empty() ||
+                !tails.patchDiagnostic[1U].empty()) {
+                ImGui::TextWrapped(
+                    "A pre-roll: %s\nA tail: %s\nB pre-roll: %s\nB tail: %s",
+                    heads.patchDiagnostic[0U].c_str(),
+                    tails.patchDiagnostic[0U].c_str(),
+                    heads.patchDiagnostic[1U].c_str(),
+                    tails.patchDiagnostic[1U].c_str());
             }
         }
     } else if (!seamReviewStage && !wizard.errorMessage.empty()) {
@@ -53315,17 +53962,17 @@ void DrawReciprocalPanWizard(
             wizard.stage == AnimationReciprocalPanWizardStage::Seam1SourceTriangle
                 ? "Next: flip to B end"
             : wizard.stage == AnimationReciprocalPanWizardStage::Seam1DestinationTriangle
-                ? "Next: choose A tail"
+                ? "Next: choose seam 1 span"
             : wizard.stage == AnimationReciprocalPanWizardStage::Seam1TailExtent
-                ? "Build B seam preview"
+                ? "Build A pre-roll + B tail"
             : wizard.stage == AnimationReciprocalPanWizardStage::Seam1Review
                 ? "Next: B start"
             : wizard.stage == AnimationReciprocalPanWizardStage::Seam2SourceTriangle
                 ? "Next: flip to A end"
             : wizard.stage == AnimationReciprocalPanWizardStage::Seam2DestinationTriangle
-                ? "Next: choose B tail"
+                ? "Next: choose seam 2 span"
             : wizard.stage == AnimationReciprocalPanWizardStage::Seam2TailExtent
-                ? "Build A seam preview"
+                ? "Build B pre-roll + A tail"
             : wizard.stage == AnimationReciprocalPanWizardStage::Seam2Review
                 ? "Next: review triangles"
                 : "Build Preview";
@@ -55755,8 +56402,8 @@ void DrawAnimationSection(
                     extensionLaunchFailure.has_value()
                         ? extensionLaunchFailure->c_str()
                     : extensionCanNormalizePrivately
-                        ? "First normalizes A/B clip planes in private wizard snapshots, then captures and fits both seams. Apply Both commits normalization with the extensions; Cancel leaves the animations unchanged."
-                        : "Treats A-start/B-end and B-start/A-end as the manually tuned visual 50%-blend poses. Each source uses anchor/front/side clicks; one matching destination-centre click generates camera-local axes. It then fits and scrubs each seam before the final reciprocal preview.");
+                        ? "First normalizes A/B clip planes in private wizard snapshots, then captures and fits both directions around both seams. Apply Both commits normalization with the extensions; Cancel leaves the animations unchanged."
+                        : "Treats A-start/B-end and B-start/A-end as the manually tuned visual 50%-blend midpoints. Each source uses anchor/front/side clicks; one matching destination-centre click generates camera-local axes. Every selected seam span then creates a pre-roll before the source start and a tail after the partner end.");
             }
             if (extensionLaunchFailure.has_value()) {
                 ImGui::PushStyleColor(
@@ -84011,10 +84658,18 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
     PreviewRuntimeState& runtimeState,
     const invisible_places::renderer::core::VulkanViewportShell& viewport,
     float flowTimeSeconds,
-    const WaterFrameState* frameState = nullptr) {
+    const WaterFrameState* frameState = nullptr,
+    const invisible_places::camera::CameraState* cameraOverride = nullptr) {
     invisible_places::renderer::core::SceneRenderState renderState;
     const auto aspectRatio = CurrentAspectRatio(viewport);
-    const auto matrices = runtimeState.camera.Matrices(aspectRatio);
+    invisible_places::camera::OrbitCamera overrideCamera;
+    const invisible_places::camera::OrbitCamera* renderCamera =
+        &runtimeState.camera;
+    if (cameraOverride != nullptr) {
+        overrideCamera.ApplyState(*cameraOverride);
+        renderCamera = &overrideCamera;
+    }
+    const auto matrices = renderCamera->Matrices(aspectRatio);
     const bool fastBasicRenderer =
         FastBasicPointRendererActive(runtimeState.projectSettings) &&
         !VisibleGeneratedWaterTrailOverlayPresent(runtimeState);
@@ -84037,9 +84692,9 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
         runtimeState.projectSettings.eyeDomeLightingEnabled &&
         !fastBasicRenderer;
     renderState.eyeDomeLightingThickness = runtimeState.projectSettings.eyeDomeLightingThickness;
-    renderState.nearPlane = runtimeState.camera.NearPlane();
-    renderState.farPlane = runtimeState.camera.FarPlane();
-    const auto cameraState = runtimeState.camera.CaptureState();
+    renderState.nearPlane = renderCamera->NearPlane();
+    renderState.farPlane = renderCamera->FarPlane();
+    const auto cameraState = renderCamera->CaptureState();
     renderState.hasDepthOfField =
         cameraState.hasDepthOfField && !fastBasicRenderer;
     renderState.focusDistance = cameraState.focusDistance;
@@ -84061,7 +84716,7 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
         waterFrame.featureOverlay,
         &renderState.rainSettings,
         &renderState.rainVisual);
-    renderState.rainSpawnCentre = runtimeState.camera.OrbitCenter();
+    renderState.rainSpawnCentre = renderCamera->OrbitCenter();
     const auto resolvedShorelines = ResolveShorelinesForFrame(
         runtimeState.water.shorelineInstances,
         &waterFrame.featureOverlay,
@@ -84241,6 +84896,32 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
     }
 
     return renderState;
+}
+
+void SuppressWaterFeaturesForReciprocalPanWizard(
+    invisible_places::renderer::core::SceneRenderState* renderState) {
+    if (renderState == nullptr) {
+        return;
+    }
+    renderState->flowTimeSeconds = 0.0F;
+    renderState->rainSettings.enabled = false;
+    renderState->additionalShorelines.clear();
+    std::erase_if(
+        renderState->pointCloudLayers,
+        [](const auto& layer) { return layer.generatedWaterOverlay; });
+    for (auto& layer : renderState->pointCloudLayers) {
+        layer.regionWaterEffectsEnabled = false;
+        auto& style = layer.style;
+        style.flowAnimation = false;
+        style.waterPathView = false;
+        style.waterTrailOverlay = false;
+        style.rainImpactEffects = false;
+        style.causticAnimation = false;
+        style.causticIntensity = 0.0F;
+        style.roughnessMotionStrength = 0.0F;
+        style.roughnessMotionFullLayer = false;
+        style.shorelineWaveEnabled = false;
+    }
 }
 
 std::string JsonEscape(std::string_view value) {
@@ -96356,7 +97037,12 @@ int Application::Run(ApplicationRunOptions options) const {
             return 2;
         }
         if (options.guiSmoke->scenario ==
-            "temporal-camera-overlay") {
+                "temporal-camera-overlay" ||
+            options.guiSmoke->scenario ==
+                "temporal-camera-split") {
+            const bool splitSmoke =
+                options.guiSmoke->scenario ==
+                "temporal-camera-split";
             viewport->SetSceneCachingEnabled(false);
             viewport->SetLiveSceneRenderingEnabled(true);
             for (std::uint32_t frameIndex = 0U;
@@ -96414,14 +97100,20 @@ int Application::Run(ApplicationRunOptions options) const {
                     sourceIndex,
                     0.5F,
                     0.5F,
-                    &sourceViewProjections);
+                    &sourceViewProjections,
+                    splitSmoke,
+                    400.0F,
+                    0.35F +
+                        static_cast<float>(frameIndex) * 0.10F,
+                    frameIndex < 2U);
                 viewport->UpdateRenderState(renderState);
                 viewport->DrawFrame();
             }
             viewport->SetTemporalCameraOverlay(false);
             viewport->WaitIdle();
-            std::cout
-                << "Temporal camera overlay smoke passed.\n";
+            std::cout << (splitSmoke
+                              ? "Feature-following temporal camera split smoke passed.\n"
+                              : "Temporal camera overlay smoke passed.\n");
             StopBackgroundWorkForShutdown(&runtimeState);
             return 0;
         }
@@ -96682,14 +97374,30 @@ int Application::Run(ApplicationRunOptions options) const {
         if (viewport.has_value()) {
             PollPendingLayerLoad(&runtimeState, &viewport.value());
             PollTimingColouriseHistogram(&runtimeState);
-            EnsureWaterSurfaceCacheReady(&runtimeState, &viewport.value());
-            PollWaterRegionPointPreviewJob(&runtimeState);
-            PollWaterFlowTrailBuildJob(&runtimeState, &viewport.value());
-            PollWaterRippleLiveEffectRefresh(&runtimeState, &viewport.value());
-            SyncWaterRegionPointPreviewHighlights(&runtimeState, &viewport.value());
+            const bool reciprocalPanWizardActiveBeforeUi =
+                runtimeState.animationPanel.reciprocalPanWizard.Active();
+            if (!reciprocalPanWizardActiveBeforeUi) {
+                EnsureWaterSurfaceCacheReady(
+                    &runtimeState,
+                    &viewport.value());
+                PollWaterRegionPointPreviewJob(&runtimeState);
+                PollWaterFlowTrailBuildJob(
+                    &runtimeState,
+                    &viewport.value());
+                PollWaterRippleLiveEffectRefresh(
+                    &runtimeState,
+                    &viewport.value());
+                SyncWaterRegionPointPreviewHighlights(
+                    &runtimeState,
+                    &viewport.value());
+            }
             if (!runtimeState.offlineRenderJob.active) {
                 CommitReadySceneDisplaySwitches(&runtimeState, &viewport.value());
-                EnsureWaterSurfaceCacheReady(&runtimeState, &viewport.value());
+                if (!reciprocalPanWizardActiveBeforeUi) {
+                    EnsureWaterSurfaceCacheReady(
+                        &runtimeState,
+                        &viewport.value());
+                }
                 StartQueuedLayerLoadIfIdle(&runtimeState);
             }
             if (!runtimeState.offlineRenderJob.active &&
@@ -96716,12 +97424,20 @@ int Application::Run(ApplicationRunOptions options) const {
             DrawLoadingOverlay(runtimeState);
             DrawOfflineRenderOverlay(&runtimeState);
             DrawSaveChangesDialog(&runtimeState);
+            const bool reciprocalPanWizardActive =
+                runtimeState.animationPanel.reciprocalPanWizard.Active();
             if (!pauseLiveViewport) {
                 HandleAnimationPlaybackShortcut(&runtimeState);
                 DrawAnimationViewportOverlay(&runtimeState, viewport.value());
-                DrawWaterRegionOverlay(&runtimeState, viewport.value());
-                DrawWaterRegionPointPreviewOverlay(&runtimeState, viewport.value());
-                DrawManualFlowPathOverlay(&runtimeState, viewport.value());
+                if (!reciprocalPanWizardActive) {
+                    DrawWaterRegionOverlay(&runtimeState, viewport.value());
+                    DrawWaterRegionPointPreviewOverlay(
+                        &runtimeState,
+                        viewport.value());
+                    DrawManualFlowPathOverlay(
+                        &runtimeState,
+                        viewport.value());
+                }
                 UpdateCameraFromInput(&runtimeState, viewport.value());
                 UpdateAnimationPlayback(&runtimeState);
                 UpdateCameraShotPlayback(&runtimeState);
@@ -96732,21 +97448,23 @@ int Application::Run(ApplicationRunOptions options) const {
                     &runtimeState,
                     viewport.value());
             }
-            viewport->SetTemporalCameraOverlay(false);
             const auto waterFrameState = ResolveWaterFrameState(&runtimeState);
             // Playback advances compact water parameters. Upload Seepage after
             // that evaluation so the current frame never renders the previous
             // animation sample; paused export still receives panel edits.
-            EnsureWaterSeepageRuntimeUpToDate(
-                &runtimeState,
-                &viewport.value(),
-                &waterFrameState);
+            if (!reciprocalPanWizardActive) {
+                EnsureWaterSeepageRuntimeUpToDate(
+                    &runtimeState,
+                    &viewport.value(),
+                    &waterFrameState);
+            }
             const float liveWaterTimeSeconds =
                 std::chrono::duration<float>(
                     std::chrono::steady_clock::now() -
                     runtimeState.startedAt)
                     .count();
-            if (!runtimeState.offlineRenderJob.active) {
+            if (!runtimeState.offlineRenderJob.active &&
+                !reciprocalPanWizardActive) {
                 EnsureWaterDynamicMeshFlowGpuUpToDate(
                     &runtimeState,
                     &viewport.value(),
@@ -96756,20 +97474,28 @@ int Application::Run(ApplicationRunOptions options) const {
             PrunePreviewLodSampleCaches(&runtimeState);
             if (!pauseLiveViewport) {
                 DrawPivotOverlay(runtimeState, viewport.value());
-                DrawWaterPathDebugOverlay(&runtimeState, viewport.value());
-                DrawWaterEmitterOverlay(&runtimeState, viewport.value());
-                DrawWaterSeepageOverlay(
-                    &runtimeState,
-                    viewport.value(),
-                    &waterFrameState);
+                if (!reciprocalPanWizardActive) {
+                    DrawWaterPathDebugOverlay(
+                        &runtimeState,
+                        viewport.value());
+                    DrawWaterEmitterOverlay(
+                        &runtimeState,
+                        viewport.value());
+                    DrawWaterSeepageOverlay(
+                        &runtimeState,
+                        viewport.value(),
+                        &waterFrameState);
+                }
             }
             viewport->SetDiagnosticsEnabled(runtimeState.showDiagnosticsPanel);
             viewport->SetSceneCachingEnabled(!runtimeState.projectSettings.constantUpdateView);
             viewport->SetLiveSceneRenderingEnabled(!pauseLiveViewport);
             viewport->SetLiveRainSimulationEnabled(
-                !runtimeState.offlineRenderJob.active);
+                !runtimeState.offlineRenderJob.active &&
+                !reciprocalPanWizardActive);
             if (!pauseLiveViewport) {
                 const bool previewLiveEffectsAffectScene =
+                    !reciprocalPanWizardActive &&
                     PreviewLiveVisualEffectsRequireSceneRedraw(
                         runtimeState,
                         viewport.value(),
@@ -96778,16 +97504,85 @@ int Application::Run(ApplicationRunOptions options) const {
                     previewLiveEffectsAffectScene
                         ? liveWaterTimeSeconds
                         : 0.0F;
-                const auto renderState = BuildRenderState(
+                std::optional<ReciprocalPanComparisonView> comparison;
+                std::optional<std::array<
+                    invisible_places::camera::OrbitCameraMatrices,
+                    2U>> comparisonMatrices;
+                const invisible_places::camera::CameraState*
+                    comparisonCamera = nullptr;
+                if (reciprocalPanWizardActive) {
+                    auto& wizard = runtimeState.animationPanel
+                        .reciprocalPanWizard;
+                    if (wizard.splitComparisonEnabled) {
+                        comparison = ResolveReciprocalPanComparisonView(
+                            wizard);
+                    }
+                    if (comparison.has_value()) {
+                        comparisonMatrices =
+                            ReciprocalPanComparisonMatrices(
+                                comparison.value(),
+                                CurrentAspectRatio(viewport.value()));
+                        const std::uint32_t renderedRole =
+                            wizard.splitRenderedRole % 2U;
+                        wizard.splitRenderedRole = 1U - renderedRole;
+                        comparisonCamera = &comparison->cameraStates[
+                            renderedRole];
+                        const std::array<glm::mat4, 2U>
+                            viewProjections{
+                                comparisonMatrices.value()[0U]
+                                    .viewProjection,
+                                comparisonMatrices.value()[1U]
+                                    .viewProjection,
+                            };
+                        const float uiViewportWidth = std::max(
+                            1.0F,
+                            CurrentUiViewportSize(
+                                viewport.value()).x);
+                        const float framebufferWidth =
+                            static_cast<float>(
+                                std::max<std::uint32_t>(
+                                    1U,
+                                    viewport->Width()));
+                        const float fadeCentre =
+                            ReciprocalPanFeatureFadeCentreNormalized(
+                                comparison.value(),
+                                comparisonMatrices.value(),
+                                uiViewportWidth,
+                                wizard.splitAnchorOffsetPixels);
+                        const float framebufferOverlapPixels =
+                            wizard.splitOverlapPixels *
+                            framebufferWidth / uiViewportWidth;
+                        viewport->SetTemporalCameraOverlay(
+                            true,
+                            renderedRole,
+                            0.5F,
+                            0.5F,
+                            &viewProjections,
+                            true,
+                            framebufferOverlapPixels,
+                            fadeCentre,
+                            wizard.splitAOnLeft);
+                    }
+                }
+                if (!comparison.has_value()) {
+                    viewport->SetTemporalCameraOverlay(false);
+                }
+                auto renderState = BuildRenderState(
                     runtimeState,
                     viewport.value(),
                     previewFlowTimeSeconds,
-                    &waterFrameState);
+                    &waterFrameState,
+                    comparisonCamera);
+                if (reciprocalPanWizardActive) {
+                    SuppressWaterFeaturesForReciprocalPanWizard(
+                        &renderState);
+                }
                 const auto renderStateSignature = RenderStateSignature(renderState);
                 const bool renderStateChanged =
                     !runtimeState.previewRenderStateSignatureValid ||
                     runtimeState.previewRenderStateSignature != renderStateSignature;
                 if (renderStateChanged ||
+                    comparison.has_value() ||
                     runtimeState.projectSettings.constantUpdateView ||
                     previewLiveEffectsAffectScene) {
                     viewport->UpdateRenderState(renderState);

@@ -118,9 +118,10 @@ ray misses.
 
 #### FR-CAM-11
 Matching-Frame Key Alignment shall provide an **Extend Both Seams** assistant
-for two target-driven, fixed-lens animations that share an associated
+for two target-driven, fixed-lens animations and one unambiguous working
 point-cloud scene with either CPU analysis samples or a visible committed
-display source. The animations need not already have velocity-blend metadata;
+display source. A shared association is preferred; the selected or sole
+pickable scene is accepted for older unassociated paths. The animations need not already have velocity-blend metadata;
 their crossed endpoints are treated as the two existing 50%-blend seam poses.
 
 #### FR-CAM-12
@@ -134,12 +135,14 @@ constrain signed screen X/Y velocity, in-plane patch rotation, overlay position,
 and perspective scale on the 30 fps animation timebase.
 
 #### FR-CAM-13
-Each successful reciprocal extension shall append, to each destination
-animation, two unlinked terminal keys for a simple source span, or three when
-the span crosses an authored key or screen-motion inflection. It may align the
-former terminal pose and change only the former final segment plus the new
-tail. Every older key frame and every camera/focus/lens sample through the
-penultimate key shall remain unchanged.
+Each successful reciprocal seam shall add two unlinked keys at each generated
+end for a simple source span, or three at that end when the span crosses an
+authored key or screen-motion inflection. The same ordered triangle pair shall
+generate the source animation's pre-roll and the destination animation's tail,
+with the original crossed endpoints remaining the temporal midpoint. It may
+align the former first/last poses and change only the adjacent old boundary
+segments plus the new head/tail. Interior authored key frames and bulk motion
+shall keep their original spacing and 30 fps speed.
 
 #### FR-CAM-14
 Extension candidates shall remain immutable and outside the animation registry
@@ -149,14 +152,16 @@ state without mutation.
 
 #### FR-CAM-15
 During the assistant, ordinary inspection scrubbing shall snap back on release,
-source-tail frame pickers shall commit integer frames, and generic playback,
+seam-span frame pickers shall commit integer frames, and generic playback,
 key editing, file switching, saving, and alignment controls shall remain locked.
 
 #### FR-CAM-16
 Extending a camera path shall preserve every pre-existing authored timing,
-water, and effect value at its original absolute frame and hold the terminal
-authored state throughout the added tail. Existing explicit export bounds shall
-not move. Camera position shall select keyed values only: procedural waves,
+water, and effect value at the frame of the same old camera pose. Their
+normalized coordinates shall shift by the prepended frame count and rescale to
+the new duration; start/end sentinels continue through the generated ends.
+Explicit export bounds shall shift by the prepended count so they select the
+same old camera content. Camera position shall select keyed values only: procedural waves,
 Rain, trails, and related motion shall continue from the steady live clock even
 while the camera is paused, and shall use the full deterministic output sample
 time during offline export.
@@ -171,7 +176,16 @@ so A, B, and the project save or discard as one transaction.
 Before fitting, the assistant shall let the user flip between A and B, select
 any of the three correspondence nodes, re-raycast it from the viewport, and
 move it with a world-axis gizmo. Candidate fitting shall not begin until both
-ordered endpoint triangles and both source-tail extents are defined.
+ordered endpoint triangles and both seam spans are defined.
+
+#### FR-CAM-19
+Each fitted-seam review shall offer a two-camera A/B split. Its horizontal
+crossfade width and feature-relative offset shall be editable, while its centre
+continues to follow the paired anchor projections during synchronized scrubbing,
+including while the anchors are outside the image. Both correspondence triangles
+shall remain visible and the active A/B side shall remain editable. Procedural
+water rendering and simulation work shall be suppressed while the assistant is
+open.
 
 ### 5.4 Side Panel Behaviour
 #### FR-UI-1

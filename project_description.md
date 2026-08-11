@@ -259,25 +259,32 @@ feature, a ground/front point towards the camera, and a perpendicular side point
 along or opposite the pan. At the destination end, one matching feature-centre
 click generates the other two nodes with the same physical offsets rotated into
 that camera's local frame. Every generated node remains editable or
-re-raycastable. The user then scrubs inward from the source start to choose how
-much motion should continue beyond the partner's current end.
+re-raycastable. The user then scrubs inward from the source start to choose one
+half-span around that visual midpoint. The same triangle correspondence creates
+motion in both directions: a pre-roll before the source's old frame zero and a
+tail after the partner's old end.
 
 The fit first makes a small localized correction to each existing destination
 terminal so its triangle overlays the opposite source-start triangle. It then
 tracks the source feature's signed pixel translation, in-plane rotation, and
-perspective scale through the chosen inward span and copies that motion into an
-outward partner tail. A simple span appends two unlinked keys; a span crossing
-an authored key or screen-motion inflection appends three. The added frame
-duration equals the selected source span, so the bulk pan speed and every old
-key time remain unchanged. The exact base-spline continuation preserves all
-samples through the penultimate key; only the old final segment and generated
-tail may change.
+perspective scale through the chosen inward span. It copies that motion forward
+into the partner tail and backward into the source pre-roll. A simple generated
+end uses two unlinked keys; a crossed authored key or screen-motion inflection
+uses three. Each animation therefore grows at both ends while old segment
+durations and bulk pan speed remain unchanged. Localized endpoint corrections
+may change the old first/final segments; the interior authored motion is kept.
 
 After each seam is captured, a synchronized scrub review flips between the
-source interval and the privately fitted destination old-end/new-tail interval.
-Offset zero shows the adjusted existing terminal; the last offset shows the new
-generated end. This lets the user re-pick the destination feature and rebuild
-that seam before moving to the opposite endpoint.
+generated source pre-roll and privately fitted destination tail. Negative
+offsets show the pre-roll, offset zero shows the adjusted original 50% endpoint
+pair, and positive offsets show the tail. This lets the user re-pick the destination feature and rebuild
+that seam before moving to the opposite endpoint. The review can also composite
+the two camera renders as an A/B split. Its adjustable crossfade band follows
+the mean projected anchor position throughout the synchronized scrub, while a
+stored pixel offset lets the user place the wipe beside the feature without
+breaking that tracking. Both triangles remain visible, A/B can swap sides, and
+the active view remains editable. Water effects are temporarily suppressed to
+keep this comparison responsive.
 
 A Preview can isolate A, B, or their overlay, inspect the extended timeline
 bands and residuals, and compare baseline/candidate poses. Nothing enters the
@@ -286,16 +293,16 @@ reciprocal blend metadata. Back, Cancel, and Escape discard the private
 candidates and restore the launch camera, playhead, pivot, and matching ghost.
 
 Camera duration grows on the same 30 fps timebase. Every normalized timing,
-water, and visual-effect key or finite activation boundary is rescaled by the
-old-to-new frame-count ratio, so its marker and keyed event remain at the same
-absolute frame. A full-range activation end remains a through-animation-end
-sentinel. Added tails naturally hold the last keyed values, but procedural
+water, and visual-effect key or finite activation boundary is shifted by the
+prepended frame count and rescaled to the new duration, so it remains attached
+to the same old camera pose. Full-range start/end boundaries remain animation
+sentinels. Generated ends hold their nearest keyed values, but procedural
 waves, rain, trails, and other motion use a separate effect clock rather than
 the camera-path position. They keep advancing from steady elapsed time in live
 view even while the camera is paused; offline renders instead sample them from
 the full deterministic output frame/subframe time. Explicit export start/end
-frames remain unchanged; an end frame of zero still means the complete,
-now-extended animation. The four reciprocal overlap extents and project link
+frames shift by the prepended count to retain the same old camera content; an
+end frame of zero still means the complete, now-extended animation. The four reciprocal overlap extents and project link
 mirror update with the paths, and A, B, and the project retain one atomic
 save/discard dependency.
 

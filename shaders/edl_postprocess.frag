@@ -13,7 +13,8 @@ layout(set = 0, binding = 5) uniform sampler2D temporalDepthBInput;
 layout(push_constant) uniform PostProcessData {
     vec4 edl;
     vec4 preview;
-    // x: interleaved overlay enabled; y/z: A/B weights; w: validity mask.
+    // x: 0 off, 1 reprojected overlay, 2 feature-following split view;
+    // y/z: A/B weights; w: validity mask.
     vec4 temporalOverlay;
     // x: stale source (1=A, 2=B, 0=off); y/z: cached projection X/Y;
     // w: reference view depth for sparse/background reprojection.
@@ -270,21 +271,25 @@ void main() {
         return;
     }
 
+    const int overlayMode = int(round(postProcess.temporalOverlay.x));
+    const bool splitView = overlayMode == 2;
     const vec2 targetUv =
         (vec2(coord) + vec2(0.5)) / vec2(size);
     vec4 first = vec4(0.0);
     vec4 second = vec4(0.0);
     if (firstValid) {
-        const vec2 firstUv =
-            ReprojectTemporalUv(targetUv, size, 1);
+        const vec2 firstUv = splitView
+            ? targetUv
+            : ReprojectTemporalUv(targetUv, size, 1);
         const ivec2 firstCoord = TemporalCoord(firstUv, size);
         first = FinishSceneColor(
             TemporalColorAt(firstUv, size, 1),
             EyeDomeLightingShade(firstCoord, size, 1));
     }
     if (secondValid) {
-        const vec2 secondUv =
-            ReprojectTemporalUv(targetUv, size, 2);
+        const vec2 secondUv = splitView
+            ? targetUv
+            : ReprojectTemporalUv(targetUv, size, 2);
         const ivec2 secondCoord = TemporalCoord(secondUv, size);
         second = FinishSceneColor(
             TemporalColorAt(secondUv, size, 2),
@@ -296,6 +301,25 @@ void main() {
     }
     if (!secondValid) {
         outColor = first;
+        return;
+    }
+
+    if (splitView) {
+        const float overlapPixels = max(
+            1.0,
+            postProcess.temporalReprojection.y);
+        const float centre = postProcess.temporalReprojection.z;
+        const float halfWidth =
+            0.5 * overlapPixels / max(float(size.x), 1.0);
+        const float blend = smoothstep(
+            centre - halfWidth,
+            centre + halfWidth,
+            targetUv.x);
+        const bool firstOnLeft =
+            postProcess.temporalReprojection.w > 0.5;
+        outColor = firstOnLeft
+            ? mix(first, second, blend)
+            : mix(second, first, blend);
         return;
     }
 

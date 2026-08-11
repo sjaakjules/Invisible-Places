@@ -2546,7 +2546,11 @@ void VulkanViewportShell::SetTemporalCameraOverlay(
     std::uint32_t renderedSourceIndex,
     float firstWeight,
     float secondWeight,
-    const std::array<glm::mat4, 2U>* currentSourceViewProjections) {
+    const std::array<glm::mat4, 2U>* currentSourceViewProjections,
+    bool splitView,
+    float splitOverlapPixels,
+    float splitCenterNormalized,
+    bool firstSourceOnLeft) {
     if (enabled &&
         (temporalCameraOverlayColorImages_[0U].image == VK_NULL_HANDLE ||
          temporalCameraOverlayDepthImages_[0U].image == VK_NULL_HANDLE)) {
@@ -2564,6 +2568,14 @@ void VulkanViewportShell::SetTemporalCameraOverlay(
     const bool sourceChanged =
         enabled &&
         temporalCameraOverlayRenderedSourceIndex_ != sourceIndex;
+    const bool layoutChanged =
+        enabled &&
+        (temporalCameraOverlaySplitView_ != splitView ||
+         std::abs(temporalCameraOverlaySplitOverlapPixels_ -
+                  splitOverlapPixels) > 0.01F ||
+         std::abs(temporalCameraOverlaySplitCenterNormalized_ -
+                  splitCenterNormalized) > 1.0e-5F ||
+         temporalCameraOverlayFirstSourceOnLeft_ != firstSourceOnLeft);
     if (modeChanged) {
         temporalCameraOverlayHistoryValid_ = {false, false};
     }
@@ -2573,6 +2585,15 @@ void VulkanViewportShell::SetTemporalCameraOverlay(
         std::clamp(firstWeight, 0.0F, 1.0F);
     temporalCameraOverlayWeights_[1U] =
         std::clamp(secondWeight, 0.0F, 1.0F);
+    temporalCameraOverlaySplitView_ = splitView;
+    temporalCameraOverlaySplitOverlapPixels_ = std::max(
+        0.0F,
+        splitOverlapPixels);
+    temporalCameraOverlaySplitCenterNormalized_ = std::clamp(
+        splitCenterNormalized,
+        -2.0F,
+        3.0F);
+    temporalCameraOverlayFirstSourceOnLeft_ = firstSourceOnLeft;
     temporalCameraOverlayCurrentViewProjectionsValid_ =
         enabled && currentSourceViewProjections != nullptr;
     if (temporalCameraOverlayCurrentViewProjectionsValid_) {
@@ -2582,7 +2603,7 @@ void VulkanViewportShell::SetTemporalCameraOverlay(
     if (!enabled) {
         temporalCameraOverlayHistoryValid_ = {false, false};
     }
-    if (modeChanged || sourceChanged) {
+    if (modeChanged || sourceChanged || layoutChanged) {
         ++sceneRevision_;
         lastSubmittedSceneImageValid_ = false;
     }
@@ -16860,12 +16881,26 @@ void VulkanViewportShell::RecordCommandBuffer(
             (temporalCameraOverlayHistoryValid_[0U] ? 1U : 0U) |
             (temporalCameraOverlayHistoryValid_[1U] ? 2U : 0U);
         pushConstants.temporalOverlay = glm::vec4{
-            temporalCameraOverlayEnabled_ ? 1.0F : 0.0F,
+            temporalCameraOverlayEnabled_
+                ? (temporalCameraOverlaySplitView_ ? 2.0F : 1.0F)
+                : 0.0F,
             temporalCameraOverlayWeights_[0U],
             temporalCameraOverlayWeights_[1U],
             static_cast<float>(temporalValidityMask),
         };
         if (temporalCameraOverlayEnabled_ &&
+            temporalCameraOverlaySplitView_) {
+            // Split mode samples each cached camera in its own image space.
+            // Reprojection is unused, so this vector carries the wipe layout.
+            pushConstants.temporalReprojection = glm::vec4{
+                0.0F,
+                temporalCameraOverlaySplitOverlapPixels_,
+                temporalCameraOverlaySplitCenterNormalized_,
+                temporalCameraOverlayFirstSourceOnLeft_ ? 1.0F : 0.0F,
+            };
+        }
+        if (temporalCameraOverlayEnabled_ &&
+            !temporalCameraOverlaySplitView_ &&
             temporalCameraOverlayCurrentViewProjectionsValid_) {
             const std::size_t staleSourceIndex =
                 1U - std::min<std::size_t>(

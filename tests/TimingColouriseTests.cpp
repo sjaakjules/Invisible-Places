@@ -2417,7 +2417,47 @@ TEST_CASE(
                   retimed,
                   static_cast<float>(frame) /
                       static_cast<float>(destinationFrames)) ==
-              Approx(terminal).margin(1.0e-6F));
+                  Approx(terminal).margin(1.0e-6F));
+    }
+
+    SECTION("A prepended camera span shifts keyed frames without shifting range sentinels") {
+        constexpr std::uint32_t prependedFrames = 27U;
+        constexpr std::uint32_t bidirectionalDestinationFrames = 162U;
+        auto shifted = original;
+        TimingColouriseEffect fullRange;
+        fullRange.activationRange = {.start = 0.0F, .end = 1.0F};
+        shifted.colouriseEffects.push_back(fullRange);
+        REQUIRE(invisible_places::timing::
+                    RetimeTimingTakeSceneStateNormalizedPositions(
+                        &shifted,
+                        sourceFrames,
+                        bidirectionalDestinationFrames,
+                        prependedFrames));
+        const auto shiftedPosition = [](float position) {
+            return (27.0F + position * 90.0F) / 162.0F;
+        };
+        CHECK(shifted.waterFeatureTimingRuns.front()
+                  .features.front()
+                  .settings.front()
+                  .keys.front()
+                  .position == Approx(shiftedPosition(0.18F)));
+        CHECK(shifted.colouriseEffects.front()
+                  .effectParameterKeys.front()
+                  .position == Approx(shiftedPosition(0.0F)));
+        CHECK(shifted.colouriseEffects.front().activationRange.start ==
+              Approx(shiftedPosition(0.12F)));
+        CHECK(shifted.colouriseEffects.front().activationRange.end ==
+              Approx(1.0F));
+        CHECK(shifted.colouriseEffects.back().activationRange.start ==
+              Approx(0.0F));
+        CHECK(shifted.colouriseEffects.back().activationRange.end ==
+              Approx(1.0F));
+        CHECK_FALSE(invisible_places::timing::
+                        RetimeTimingTakeSceneStateNormalizedPositions(
+                            &shifted,
+                            sourceFrames,
+                            sourceFrames,
+                            1U));
     }
 
     const float unchangedPosition =

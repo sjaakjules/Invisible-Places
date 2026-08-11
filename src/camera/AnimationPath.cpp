@@ -2611,6 +2611,307 @@ void RetimeAnimationPathLegacyWaterTracks(
     }
 }
 
+template <typename Key>
+void ReversePanNormalizedKeyVector(std::vector<Key>* keys) {
+    if (keys == nullptr) {
+        return;
+    }
+    for (auto& key : *keys) {
+        const float position = std::isfinite(key.position)
+                                   ? std::clamp(key.position, 0.0F, 1.0F)
+                                   : 0.0F;
+        key.position = 1.0F - position;
+    }
+    std::reverse(keys->begin(), keys->end());
+}
+
+void ReversePanLegacyWaterTrackPositions(AnimationPath* path) {
+    if (path == nullptr) {
+        return;
+    }
+    for (auto& track : path->waterScenarioTracks) {
+        ReversePanNormalizedKeyVector(&track.keys);
+        for (auto& nodeTrack : track.seepageNodeTracks) {
+            ReversePanNormalizedKeyVector(&nodeTrack.keys);
+        }
+        for (auto& assignment : track.timingAssignments) {
+            ReversePanNormalizedKeyVector(&assignment.fallbackRun.keys);
+        }
+    }
+}
+
+void ReversePanExportRange(
+    AnimationExportSettings* settings,
+    std::uint32_t durationFrames) {
+    if (settings == nullptr || durationFrames == 0U) {
+        return;
+    }
+    const std::uint32_t start = std::min(
+        settings->startFrame,
+        durationFrames);
+    const std::uint32_t end = settings->endFrame == 0U
+        ? durationFrames
+        : std::clamp(settings->endFrame, start, durationFrames);
+    const std::uint32_t reversedStart = durationFrames - end;
+    const std::uint32_t reversedEnd = durationFrames - start;
+    settings->startFrame = reversedStart;
+    settings->endFrame = reversedEnd == durationFrames
+        ? 0U
+        : reversedEnd;
+}
+
+bool ReversePanPathForExtension(
+    const AnimationPath& path,
+    AnimationPath* reversed,
+    std::string* errorMessage) {
+    if (reversed == nullptr || path.keys.size() < 2U) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "A reciprocal pre-roll needs a multi-key animation.";
+        }
+        return false;
+    }
+    const auto context = PrepareAnimationPathEvaluation(path);
+    const auto durations = BuildSegmentDurations(path);
+    if (!context.valid || context.singleKey ||
+        context.geometryKnots.size() != path.keys.size() ||
+        durations.size() + 1U != path.keys.size()) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The animation could not be prepared for a time-reversed pre-roll fit.";
+        }
+        return false;
+    }
+    const std::uint64_t duration64 = std::accumulate(
+        durations.begin(),
+        durations.end(),
+        std::uint64_t{0U});
+    if (duration64 == 0U ||
+        duration64 > std::numeric_limits<std::uint32_t>::max()) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The animation duration is invalid for reciprocal pre-roll.";
+        }
+        return false;
+    }
+
+    AnimationPath candidate = path;
+    MaterializePanCorrectionTangents(&candidate, context);
+    const auto originalKeys = candidate.keys;
+    candidate.keys.assign(originalKeys.rbegin(), originalKeys.rend());
+    for (auto& key : candidate.keys) {
+        key.hasSplineEndpointTangent = false;
+        key.splineParameterWeight = 0.0F;
+        key.splineCameraEndpointTangent = {};
+        key.splineFocusEndpointTangent = {};
+        key.splineOrientationEndpointTangent = {};
+        key.splineLensEndpointTangent = {};
+    }
+    candidate.keys.front().durationFrames = 0U;
+    const std::size_t keyCount = candidate.keys.size();
+    for (std::size_t reversedIndex = 1U;
+         reversedIndex < keyCount;
+         ++reversedIndex) {
+        const std::size_t sourceSegment = keyCount - 1U - reversedIndex;
+        candidate.keys[reversedIndex].durationFrames =
+            durations[sourceSegment];
+        candidate.keys[reversedIndex].splineParameterWeight =
+            context.geometryKnots[sourceSegment + 1U] -
+            context.geometryKnots[sourceSegment];
+    }
+    candidate.durationFrames = static_cast<std::uint32_t>(duration64);
+
+    const auto negate3 = [](std::array<float, 3> value) {
+        for (auto& component : value) {
+            component = -component;
+        }
+        return value;
+    };
+    auto& first = candidate.keys.front();
+    auto& last = candidate.keys.back();
+    first.hasSplineEndpointTangent = true;
+    last.hasSplineEndpointTangent = true;
+    first.splineCameraEndpointTangent = negate3(
+        PreparedSplineEndpointDerivative(context, true, false));
+    first.splineFocusEndpointTangent = negate3(
+        PreparedSplineEndpointDerivative(context, false, false));
+    last.splineCameraEndpointTangent = negate3(
+        PreparedSplineEndpointDerivative(context, true, true));
+    last.splineFocusEndpointTangent = negate3(
+        PreparedSplineEndpointDerivative(context, false, true));
+    const auto setReversedScalarEndpointTangents = [
+        &context](
+            const AnimationPreparedScalarSpline& spline,
+            float* firstValue,
+            float* lastValue) {
+        *firstValue = -EvaluatePreparedScalarSplineEndpointDerivative(
+            context.geometryKnots,
+            spline,
+            false);
+        *lastValue = -EvaluatePreparedScalarSplineEndpointDerivative(
+            context.geometryKnots,
+            spline,
+            true);
+    };
+    const std::array<const AnimationPreparedScalarSpline*, 5U> lensSplines{
+        &context.fovDegrees,
+        &context.nearPlane,
+        &context.farPlane,
+        &context.focusDistance,
+        &context.apertureFStopsSpline,
+    };
+    for (std::size_t component = 0U;
+         component < lensSplines.size();
+         ++component) {
+        setReversedScalarEndpointTangents(
+            *lensSplines[component],
+            &first.splineLensEndpointTangent[component],
+            &last.splineLensEndpointTangent[component]);
+    }
+    const std::array<const AnimationPreparedScalarSpline*, 4U>
+        orientationSplines{
+            &context.orientationX,
+            &context.orientationY,
+            &context.orientationZ,
+            &context.orientationW,
+        };
+    for (std::size_t component = 0U;
+         component < orientationSplines.size();
+         ++component) {
+        setReversedScalarEndpointTangents(
+            *orientationSplines[component],
+            &first.splineOrientationEndpointTangent[component],
+            &last.splineOrientationEndpointTangent[component]);
+    }
+
+    for (auto& correction : candidate.localizedKeyCorrections) {
+        if (correction.hasCameraCorrectionTangent) {
+            correction.cameraCorrectionTangent = negate3(
+                correction.cameraCorrectionTangent);
+        }
+        if (correction.hasFocusCorrectionTangent) {
+            correction.focusCorrectionTangent = negate3(
+                correction.focusCorrectionTangent);
+        }
+    }
+    std::stable_sort(
+        candidate.localizedKeyCorrections.begin(),
+        candidate.localizedKeyCorrections.end(),
+        [&](const auto& left, const auto& right) {
+            const auto indexOf = [&](std::string_view id) {
+                const auto key = std::find_if(
+                    candidate.keys.begin(),
+                    candidate.keys.end(),
+                    [&](const auto& item) { return item.id == id; });
+                return static_cast<std::size_t>(
+                    key - candidate.keys.begin());
+            };
+            return indexOf(left.keyId) < indexOf(right.keyId);
+        });
+    ReversePanLegacyWaterTrackPositions(&candidate);
+    ReversePanExportRange(
+        &candidate.exportSettings,
+        candidate.durationFrames);
+    if (candidate.velocityBlendLink.has_value()) {
+        std::swap(
+            candidate.velocityBlendLink->startOverlapSeconds,
+            candidate.velocityBlendLink->endOverlapSeconds);
+    }
+    if (!PrepareAnimationPathEvaluation(candidate).valid) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The time-reversed animation could not be evaluated.";
+        }
+        return false;
+    }
+    *reversed = std::move(candidate);
+    return true;
+}
+
+bool BuildAdjustedPanPrefix(
+    const AnimationPath& original,
+    const AnimationPath& extended,
+    std::uint32_t appendedKeyCount,
+    AnimationPath* prefix,
+    std::string* errorMessage) {
+    if (prefix == nullptr || original.keys.size() < 2U ||
+        appendedKeyCount < 2U || appendedKeyCount > 3U ||
+        extended.keys.size() !=
+            original.keys.size() + appendedKeyCount) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The fitted destination tail cannot be reduced to its adjusted original span.";
+        }
+        return false;
+    }
+    const auto originalContext = PrepareAnimationPathEvaluation(original);
+    const auto durations = BuildSegmentDurations(original);
+    if (!originalContext.valid || originalContext.singleKey ||
+        durations.size() + 1U != original.keys.size()) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The original destination could not be prepared for reciprocal pre-roll tracking.";
+        }
+        return false;
+    }
+    const std::uint64_t duration64 = std::accumulate(
+        durations.begin(),
+        durations.end(),
+        std::uint64_t{0U});
+    if (duration64 == 0U ||
+        duration64 > std::numeric_limits<std::uint32_t>::max()) {
+        return false;
+    }
+    AnimationPath candidate = extended;
+    candidate.keys.resize(original.keys.size());
+    candidate.durationFrames = static_cast<std::uint32_t>(duration64);
+    std::unordered_set<std::string> retainedIds;
+    retainedIds.reserve(candidate.keys.size());
+    for (const auto& key : candidate.keys) {
+        retainedIds.insert(key.id);
+    }
+    std::erase_if(
+        candidate.localizedKeyCorrections,
+        [&](const auto& correction) {
+            return !retainedIds.contains(correction.keyId);
+        });
+    auto& last = candidate.keys.back();
+    last.hasSplineEndpointTangent = true;
+    last.splineCameraEndpointTangent =
+        PreparedSplineEndpointDerivative(originalContext, true, false);
+    last.splineFocusEndpointTangent =
+        PreparedSplineEndpointDerivative(originalContext, false, false);
+    const auto originalLastDerivative = [
+        &originalContext](const AnimationPreparedScalarSpline& spline) {
+        return EvaluatePreparedScalarSplineEndpointDerivative(
+            originalContext.geometryKnots,
+            spline,
+            false);
+    };
+    last.splineLensEndpointTangent = {
+        originalLastDerivative(originalContext.fovDegrees),
+        originalLastDerivative(originalContext.nearPlane),
+        originalLastDerivative(originalContext.farPlane),
+        originalLastDerivative(originalContext.focusDistance),
+        originalLastDerivative(originalContext.apertureFStopsSpline),
+    };
+    last.splineOrientationEndpointTangent = {
+        originalLastDerivative(originalContext.orientationX),
+        originalLastDerivative(originalContext.orientationY),
+        originalLastDerivative(originalContext.orientationZ),
+        originalLastDerivative(originalContext.orientationW),
+    };
+    if (!PrepareAnimationPathEvaluation(candidate).valid) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The adjusted destination prefix could not be evaluated for reciprocal pre-roll tracking.";
+        }
+        return false;
+    }
+    *prefix = std::move(candidate);
+    return true;
+}
+
 std::size_t CountPanInteriorKeys(
     const AnimationPath& path,
     std::uint32_t tailFrame) {
@@ -2744,7 +3045,8 @@ bool AppendPanTerminal(
     const AnimationReciprocalPanExtensionOptions& options,
     AnimationPath* candidate,
     PanTerminalBuildMetrics* metrics,
-    std::string* errorMessage) {
+    std::string* errorMessage,
+    bool restrictSourceToStablePrefix = true) {
     if (candidate == nullptr || metrics == nullptr) {
         return false;
     }
@@ -2781,7 +3083,7 @@ bool AppendPanTerminal(
 
     const auto sourceDurations = BuildSegmentDurations(source);
     const std::uint32_t maximumStableTailFrame =
-        source.keys.size() == 2U
+        !restrictSourceToStablePrefix || source.keys.size() == 2U
             ? sourceFrames - 1U
             : static_cast<std::uint32_t>(std::accumulate(
                   sourceDurations.begin(),
@@ -2789,7 +3091,10 @@ bool AppendPanTerminal(
                   std::uint64_t{0U}));
     if (specification.sourceTailFrame > maximumStableTailFrame) {
         if (errorMessage != nullptr) {
-            *errorMessage = source.keys.size() == 2U
+            *errorMessage =
+                !restrictSourceToStablePrefix
+                ? "The fitted destination source span must stop at least one frame before its opposite endpoint."
+                : source.keys.size() == 2U
                 ? "A two-key source tail must stop at least one frame before the animation end."
                 : "The inward source frame must not pass its penultimate camera key, because the reciprocal seam may adjust the original final segment.";
         }
@@ -3539,6 +3844,254 @@ bool AppendPanTerminal(
     return true;
 }
 
+struct PanBidirectionalSeamBuild {
+    AnimationPath sourceHeadCandidate{};
+    AnimationPath destinationTailCandidate{};
+    PanTerminalBuildMetrics headMetrics{};
+    PanTerminalBuildMetrics tailMetrics{};
+};
+
+bool BuildPanBidirectionalSeam(
+    const AnimationPath& source,
+    const AnimationPath& destination,
+    const AnimationTerminalExtensionSpec& specification,
+    const AnimationReciprocalPanExtensionOptions& options,
+    PanBidirectionalSeamBuild* build,
+    std::string* errorMessage) {
+    if (build == nullptr) {
+        return false;
+    }
+    PanBidirectionalSeamBuild candidate;
+    if (!AppendPanTerminal(
+            destination,
+            source,
+            specification,
+            options,
+            &candidate.destinationTailCandidate,
+            &candidate.tailMetrics,
+            errorMessage)) {
+        return false;
+    }
+
+    AnimationPath adjustedDestinationPrefix;
+    if (!BuildAdjustedPanPrefix(
+            destination,
+            candidate.destinationTailCandidate,
+            candidate.tailMetrics.appendedKeyCount,
+            &adjustedDestinationPrefix,
+            errorMessage)) {
+        return false;
+    }
+    AnimationPath reversedSource;
+    AnimationPath reversedAdjustedDestination;
+    if (!ReversePanPathForExtension(
+            source,
+            &reversedSource,
+            errorMessage) ||
+        !ReversePanPathForExtension(
+            adjustedDestinationPrefix,
+            &reversedAdjustedDestination,
+            errorMessage)) {
+        return false;
+    }
+    AnimationTerminalExtensionSpec reverseSpecification;
+    reverseSpecification.sourceTailFrame = specification.sourceTailFrame;
+    reverseSpecification.sourcePatch = specification.destinationEndPatch;
+    reverseSpecification.destinationEndPatch = specification.sourcePatch;
+    AnimationPath reversedHeadCandidate;
+    if (!AppendPanTerminal(
+            reversedSource,
+            reversedAdjustedDestination,
+            reverseSpecification,
+            options,
+            &reversedHeadCandidate,
+            &candidate.headMetrics,
+            errorMessage,
+            false)) {
+        return false;
+    }
+    if (!ReversePanPathForExtension(
+            reversedHeadCandidate,
+            &candidate.sourceHeadCandidate,
+            errorMessage)) {
+        return false;
+    }
+    candidate.headMetrics.patchDiagnostic +=
+        " The generated keys were reversed into a pre-roll before the source's former frame zero.";
+    *build = std::move(candidate);
+    return true;
+}
+
+const AnimationLocalizedKeyCorrection* FindPanCorrection(
+    const AnimationPath& path,
+    std::string_view keyId) {
+    const auto found = std::find_if(
+        path.localizedKeyCorrections.begin(),
+        path.localizedKeyCorrections.end(),
+        [&](const auto& correction) { return correction.keyId == keyId; });
+    return found != path.localizedKeyCorrections.end() ? &*found : nullptr;
+}
+
+bool MergePanBidirectionalEnds(
+    const AnimationPath& original,
+    const AnimationPath& headCandidate,
+    std::uint32_t headKeyCount,
+    const AnimationPath& tailCandidate,
+    std::uint32_t tailKeyCount,
+    AnimationPath* merged,
+    std::string* errorMessage) {
+    if (merged == nullptr || headKeyCount < 2U || headKeyCount > 3U ||
+        tailKeyCount < 2U || tailKeyCount > 3U ||
+        headCandidate.keys.size() != original.keys.size() + headKeyCount ||
+        tailCandidate.keys.size() != original.keys.size() + tailKeyCount) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The independently fitted pre-roll and tail could not be merged.";
+        }
+        return false;
+    }
+    for (std::size_t index = 0U; index < original.keys.size(); ++index) {
+        if (headCandidate.keys[headKeyCount + index].id !=
+                original.keys[index].id ||
+            tailCandidate.keys[index].id != original.keys[index].id) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "An original key changed identity while merging both generated ends.";
+            }
+            return false;
+        }
+    }
+    const std::uint32_t originalFrames = std::max(
+        original.durationFrames,
+        MinimumAnimationDurationFrames(original));
+    if (tailCandidate.durationFrames < originalFrames) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The combined pre-roll and tail overflow the animation duration.";
+        }
+        return false;
+    }
+    const std::uint64_t finalDuration =
+        static_cast<std::uint64_t>(headCandidate.durationFrames) +
+        (tailCandidate.durationFrames - originalFrames);
+    if (finalDuration > std::numeric_limits<std::uint32_t>::max()) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The combined pre-roll and tail overflow the animation duration.";
+        }
+        return false;
+    }
+
+    AnimationPath candidate = headCandidate;
+    const std::size_t candidateOriginalLast =
+        headKeyCount + original.keys.size() - 1U;
+    candidate.keys[candidateOriginalLast] =
+        tailCandidate.keys[original.keys.size() - 1U];
+    if (const auto* correction = FindPanCorrection(
+            tailCandidate,
+            original.keys.back().id);
+        correction != nullptr) {
+        auto existing = std::find_if(
+            candidate.localizedKeyCorrections.begin(),
+            candidate.localizedKeyCorrections.end(),
+            [&](const auto& value) {
+                return value.keyId == original.keys.back().id;
+            });
+        if (existing != candidate.localizedKeyCorrections.end()) {
+            *existing = *correction;
+        } else {
+            candidate.localizedKeyCorrections.push_back(*correction);
+        }
+    }
+
+    for (std::size_t tailIndex = 0U;
+         tailIndex < tailKeyCount;
+         ++tailIndex) {
+        const auto& fittedKey = tailCandidate.keys[
+            original.keys.size() + tailIndex];
+        AnimationPathKey key = fittedKey;
+        const std::string previousId = key.id;
+        key.id = UniquePanExtensionKeyId(candidate);
+        candidate.keys.push_back(key);
+        const auto* fittedCorrection = FindPanCorrection(
+            tailCandidate,
+            previousId);
+        if (fittedCorrection == nullptr) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "A generated tail key is missing its localized spline correction.";
+            }
+            return false;
+        }
+        auto correction = *fittedCorrection;
+        correction.keyId = key.id;
+        candidate.localizedKeyCorrections.push_back(std::move(correction));
+    }
+    const std::uint32_t headDuration = candidate.durationFrames;
+    candidate.durationFrames = static_cast<std::uint32_t>(finalDuration);
+    RetimeAnimationPathLegacyWaterTracks(
+        &candidate,
+        headDuration,
+        candidate.durationFrames);
+    candidate.authoredTrackDurationFrames = 0U;
+    if (!PrepareAnimationPathEvaluation(candidate).valid) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The merged pre-roll and tail spline could not be evaluated.";
+        }
+        return false;
+    }
+    *merged = std::move(candidate);
+    return true;
+}
+
+void StorePanBuildMetrics(
+    const PanTerminalBuildMetrics& source,
+    std::size_t index,
+    AnimationReciprocalPanExtensionMetrics* destination) {
+    if (destination == nullptr || index >= 2U) {
+        return;
+    }
+    destination->extensionFrames[index] = source.extensionFrames;
+    destination->appendedKeyCount[index] = source.appendedKeyCount;
+    destination->sourceInteriorKeyCount[index] =
+        source.sourceInteriorKeyCount;
+    destination->sourceInflectionCount[index] =
+        source.sourceInflectionCount;
+    destination->rotationConstrained[index] =
+        source.rotationConstrained;
+    destination->beforeVelocityRmsScreenHeightsPerSecond[index] =
+        source.beforeVelocityRms;
+    destination->afterVelocityRmsScreenHeightsPerSecond[index] =
+        source.afterVelocityRms;
+    destination->beforeRotationRmsDegreesPerSecond[index] =
+        source.beforeRotationRms;
+    destination->afterRotationRmsDegreesPerSecond[index] =
+        source.afterRotationRms;
+    destination->anchorOverlayRmsScreenHeights[index] =
+        source.anchorOverlayRms;
+    destination->anchorOverlayMaxScreenHeights[index] =
+        source.anchorOverlayMax;
+    destination->patchNodeOverlayRmsScreenHeights[index] =
+        source.patchNodeOverlayRms;
+    destination->patchNodeOverlayMaxScreenHeights[index] =
+        source.patchNodeOverlayMax;
+    destination->signedVelocityResidualScreenHeightsPerSecond[index] =
+        source.signedVelocityResidual;
+    destination->rotationRateResidualDegreesPerSecond[index] =
+        source.rotationRateResidual;
+    destination->perspectiveScaleResidualPercent[index] =
+        source.perspectiveScaleResidualPercent;
+    destination->patchConfidence[index] = source.patchConfidence;
+    destination->patchDiagnostic[index] = source.patchDiagnostic;
+    destination->maxPrefixPositionError[index] =
+        source.maxPrefixPositionError;
+    destination->formerTerminalCameraMove[index] =
+        source.formerTerminalCameraMove;
+    destination->formerTerminalFocusMove[index] =
+        source.formerTerminalFocusMove;
+}
+
 }  // namespace
 
 AnimationSurfacePatchObservation
@@ -3635,6 +4188,180 @@ BuildAnimationPanTerminalExtensionPreview(
         metrics.afterVelocityRms;
     result.rotationRateResidualDegreesPerSecond =
         metrics.rotationRateResidual;
+    return result;
+}
+
+AnimationPanBidirectionalSeamResult
+BuildAnimationPanBidirectionalSeamPreview(
+    const AnimationPath& source,
+    const AnimationPath& destination,
+    const AnimationTerminalExtensionSpec& specification,
+    float aspectRatio,
+    std::uint32_t sampleCount,
+    std::uint32_t optimizationSweeps) {
+    AnimationPanBidirectionalSeamResult result;
+    if (!std::isfinite(aspectRatio) || aspectRatio <= 0.0F) {
+        result.errorMessage = "The viewport aspect ratio is invalid.";
+        return result;
+    }
+    if (!FixedLensTargetPanPath(source, &result.errorMessage) ||
+        !FixedLensTargetPanPath(destination, &result.errorMessage)) {
+        return result;
+    }
+    AnimationReciprocalPanExtensionOptions options;
+    options.aspectRatio = aspectRatio;
+    options.sampleCount = sampleCount;
+    options.optimizationSweeps = optimizationSweeps;
+    PanBidirectionalSeamBuild build;
+    if (!BuildPanBidirectionalSeam(
+            source,
+            destination,
+            specification,
+            options,
+            &build,
+            &result.errorMessage)) {
+        return result;
+    }
+    result.sourceHead.succeeded = true;
+    result.sourceHead.changed = true;
+    result.sourceHead.candidate = std::move(build.sourceHeadCandidate);
+    result.sourceHead.extensionFrames = build.headMetrics.extensionFrames;
+    result.sourceHead.appendedKeyCount = build.headMetrics.appendedKeyCount;
+    result.sourceHead.anchorOverlayRmsScreenHeights =
+        build.headMetrics.anchorOverlayRms;
+    result.sourceHead.patchNodeOverlayRmsScreenHeights =
+        build.headMetrics.patchNodeOverlayRms;
+    result.sourceHead.velocityResidualScreenHeightsPerSecond =
+        build.headMetrics.afterVelocityRms;
+    result.sourceHead.rotationRateResidualDegreesPerSecond =
+        build.headMetrics.rotationRateResidual;
+    result.destinationTail.succeeded = true;
+    result.destinationTail.changed = true;
+    result.destinationTail.candidate =
+        std::move(build.destinationTailCandidate);
+    result.destinationTail.extensionFrames =
+        build.tailMetrics.extensionFrames;
+    result.destinationTail.appendedKeyCount =
+        build.tailMetrics.appendedKeyCount;
+    result.destinationTail.anchorOverlayRmsScreenHeights =
+        build.tailMetrics.anchorOverlayRms;
+    result.destinationTail.patchNodeOverlayRmsScreenHeights =
+        build.tailMetrics.patchNodeOverlayRms;
+    result.destinationTail.velocityResidualScreenHeightsPerSecond =
+        build.tailMetrics.afterVelocityRms;
+    result.destinationTail.rotationRateResidualDegreesPerSecond =
+        build.tailMetrics.rotationRateResidual;
+    result.succeeded = true;
+    result.changed = true;
+    return result;
+}
+
+AnimationBidirectionalReciprocalPanExtensionResult
+BuildAnimationBidirectionalReciprocalPanExtension(
+    const AnimationPath& first,
+    const AnimationPath& second,
+    const AnimationReciprocalPanExtensionOptions& options) {
+    AnimationBidirectionalReciprocalPanExtensionResult result;
+    if (!std::isfinite(options.aspectRatio) ||
+        options.aspectRatio <= 0.0F) {
+        result.errorMessage = "The viewport aspect ratio is invalid.";
+        return result;
+    }
+    if (!FixedLensTargetPanPath(first, &result.errorMessage) ||
+        !FixedLensTargetPanPath(second, &result.errorMessage)) {
+        return result;
+    }
+
+    // A deprecated nonzero authored-track duration means legacy normalized
+    // path-local water keys still live on that shorter physical frame domain.
+    // Materialize that mapping before reversing either path; `1 - position`
+    // is only a true time reversal once the keys use the full current duration.
+    auto preparedFirst = first;
+    auto preparedSecond = second;
+    const auto materializeLegacyTrackDomain = [](AnimationPath* path) {
+        if (path == nullptr || path->authoredTrackDurationFrames == 0U) {
+            return;
+        }
+        const std::uint32_t currentFrames = std::max(
+            path->durationFrames,
+            MinimumAnimationDurationFrames(*path));
+        const std::uint32_t sourceFrames = std::clamp(
+            path->authoredTrackDurationFrames,
+            1U,
+            currentFrames);
+        RetimeAnimationPathLegacyWaterTracks(
+            path,
+            sourceFrames,
+            currentFrames);
+        path->authoredTrackDurationFrames = 0U;
+    };
+    materializeLegacyTrackDomain(&preparedFirst);
+    materializeLegacyTrackDomain(&preparedSecond);
+
+    PanBidirectionalSeamBuild firstSeam;
+    if (!BuildPanBidirectionalSeam(
+            preparedFirst,
+            preparedSecond,
+            options.firstDrivesSecond,
+            options,
+            &firstSeam,
+            &result.errorMessage)) {
+        return result;
+    }
+    // Fit the opposite seam from the same immutable originals. Merging the two
+    // independently localized end fits below makes the result independent of
+    // whether the caller presents this pair as A/B or B/A.
+    PanBidirectionalSeamBuild secondSeam;
+    if (!BuildPanBidirectionalSeam(
+            preparedSecond,
+            preparedFirst,
+            options.secondDrivesFirst,
+            options,
+            &secondSeam,
+            &result.errorMessage)) {
+        return result;
+    }
+
+    if (!MergePanBidirectionalEnds(
+            preparedFirst,
+            firstSeam.sourceHeadCandidate,
+            firstSeam.headMetrics.appendedKeyCount,
+            secondSeam.destinationTailCandidate,
+            secondSeam.tailMetrics.appendedKeyCount,
+            &result.firstCandidate,
+            &result.errorMessage) ||
+        !MergePanBidirectionalEnds(
+            preparedSecond,
+            secondSeam.sourceHeadCandidate,
+            secondSeam.headMetrics.appendedKeyCount,
+            firstSeam.destinationTailCandidate,
+            firstSeam.tailMetrics.appendedKeyCount,
+            &result.secondCandidate,
+            &result.errorMessage)) {
+        result.firstCandidate = {};
+        result.secondCandidate = {};
+        return result;
+    }
+    // A receives its incoming head from seam 1 and outgoing tail from seam 2.
+    // B receives the opposite pair.
+    StorePanBuildMetrics(
+        firstSeam.headMetrics,
+        0U,
+        &result.metrics.incoming);
+    StorePanBuildMetrics(
+        secondSeam.headMetrics,
+        1U,
+        &result.metrics.incoming);
+    StorePanBuildMetrics(
+        secondSeam.tailMetrics,
+        0U,
+        &result.metrics.outgoing);
+    StorePanBuildMetrics(
+        firstSeam.tailMetrics,
+        1U,
+        &result.metrics.outgoing);
+    result.succeeded = true;
+    result.changed = true;
     return result;
 }
 

@@ -1296,6 +1296,245 @@ TEST_CASE("Reciprocal pan extension appends a short unlinked tail without retimi
         result.metrics.perspectiveScaleResidualPercent[1U]));
 }
 
+TEST_CASE("Bidirectional reciprocal pan extension generates pre-roll and tail from each seam triangle pair",
+          "[camera][animation][pan-extension][bidirectional]") {
+    auto first = MakeReciprocalPanTestPath("full-A", 1.0F, 41U, 79U);
+    auto second = MakeReciprocalPanTestPath("full-B", -1.0F, 54U, 96U);
+    AddLegacyWaterTracks(&first);
+    AddLegacyWaterTracks(&second);
+    const auto options = MakeReciprocalPanTestOptions();
+
+    const auto firstSeam = invisible_places::camera::
+        BuildAnimationPanBidirectionalSeamPreview(
+            first,
+            second,
+            options.firstDrivesSecond,
+            options.aspectRatio,
+            options.sampleCount,
+            options.optimizationSweeps);
+    INFO(firstSeam.errorMessage);
+    REQUIRE(firstSeam.succeeded);
+    REQUIRE(firstSeam.changed);
+    CHECK(firstSeam.sourceHead.candidate.durationFrames == 155U);
+    CHECK(firstSeam.destinationTail.candidate.durationFrames == 185U);
+    CHECK(firstSeam.sourceHead.appendedKeyCount == 2U);
+    CHECK(firstSeam.destinationTail.appendedKeyCount == 2U);
+    CHECK(firstSeam.sourceHead.candidate.exportSettings.startFrame == 42U);
+    CHECK(firstSeam.sourceHead.candidate.exportSettings.endFrame == 126U);
+    CHECK(firstSeam.destinationTail.candidate.exportSettings.startFrame == 7U);
+    CHECK(firstSeam.destinationTail.candidate.exportSettings.endFrame == 91U);
+
+    const auto result = invisible_places::camera::
+        BuildAnimationBidirectionalReciprocalPanExtension(
+            first,
+            second,
+            options);
+    INFO(result.errorMessage);
+    REQUIRE(result.succeeded);
+    REQUIRE(result.changed);
+    REQUIRE(result.firstCandidate.keys.size() == first.keys.size() + 4U);
+    REQUIRE(result.secondCandidate.keys.size() == second.keys.size() + 4U);
+    CHECK(result.firstCandidate.durationFrames == 199U);
+    CHECK(result.secondCandidate.durationFrames == 229U);
+    CHECK(result.metrics.incoming.extensionFrames[0U] == 35U);
+    CHECK(result.metrics.incoming.extensionFrames[1U] == 44U);
+    CHECK(result.metrics.outgoing.extensionFrames[0U] == 44U);
+    CHECK(result.metrics.outgoing.extensionFrames[1U] == 35U);
+    CHECK(result.metrics.incoming.appendedKeyCount[0U] == 2U);
+    CHECK(result.metrics.incoming.appendedKeyCount[1U] == 2U);
+    CHECK(result.metrics.outgoing.appendedKeyCount[0U] == 2U);
+    CHECK(result.metrics.outgoing.appendedKeyCount[1U] == 2U);
+
+    const auto secondSeam = invisible_places::camera::
+        BuildAnimationPanBidirectionalSeamPreview(
+            second,
+            first,
+            options.secondDrivesFirst,
+            options.aspectRatio,
+            options.sampleCount,
+            options.optimizationSweeps);
+    INFO(secondSeam.errorMessage);
+    REQUIRE(secondSeam.succeeded);
+    const auto mergedFirst = invisible_places::camera::
+        PrepareAnimationPathEvaluation(result.firstCandidate);
+    const auto mergedSecond = invisible_places::camera::
+        PrepareAnimationPathEvaluation(result.secondCandidate);
+    const auto expectedFirstHead = invisible_places::camera::
+        PrepareAnimationPathEvaluation(firstSeam.sourceHead.candidate);
+    const auto expectedFirstTail = invisible_places::camera::
+        PrepareAnimationPathEvaluation(secondSeam.destinationTail.candidate);
+    const auto expectedSecondHead = invisible_places::camera::
+        PrepareAnimationPathEvaluation(secondSeam.sourceHead.candidate);
+    const auto expectedSecondTail = invisible_places::camera::
+        PrepareAnimationPathEvaluation(firstSeam.destinationTail.candidate);
+    REQUIRE(mergedFirst.valid);
+    REQUIRE(mergedSecond.valid);
+    REQUIRE(expectedFirstHead.valid);
+    REQUIRE(expectedFirstTail.valid);
+    REQUIRE(expectedSecondHead.valid);
+    REQUIRE(expectedSecondTail.valid);
+    for (std::uint32_t sample = 0U; sample <= 12U; ++sample) {
+        const float amount = static_cast<float>(sample) / 12.0F;
+        const float firstHeadTime = amount * 35.0F / 30.0F;
+        const float firstTailTime =
+            (120.0F + amount * 44.0F) / 30.0F;
+        const float secondHeadTime = amount * 44.0F / 30.0F;
+        const float secondTailTime =
+            (150.0F + amount * 35.0F) / 30.0F;
+        CheckPanEvaluationNear(
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                mergedFirst,
+                firstHeadTime),
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                expectedFirstHead,
+                firstHeadTime),
+            3.0e-4F);
+        CheckPanEvaluationNear(
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                mergedFirst,
+                35.0F / 30.0F + firstTailTime),
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                expectedFirstTail,
+                firstTailTime),
+            3.0e-4F);
+        CheckPanEvaluationNear(
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                mergedSecond,
+                secondHeadTime),
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                expectedSecondHead,
+                secondHeadTime),
+            3.0e-4F);
+        CheckPanEvaluationNear(
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                mergedSecond,
+                44.0F / 30.0F + secondTailTime),
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                expectedSecondTail,
+                secondTailTime),
+            3.0e-4F);
+    }
+    CHECK(result.firstCandidate.exportSettings.startFrame == 42U);
+    CHECK(result.firstCandidate.exportSettings.endFrame == 126U);
+    CHECK(result.secondCandidate.exportSettings.startFrame == 51U);
+    CHECK(result.secondCandidate.exportSettings.endFrame == 135U);
+
+    const auto keyFrame = [](const auto& path, std::string_view id) {
+        std::uint32_t frame = 0U;
+        for (std::size_t index = 0U; index < path.keys.size(); ++index) {
+            if (path.keys[index].id == id) {
+                return frame;
+            }
+            if (index + 1U < path.keys.size()) {
+                frame += path.keys[index + 1U].durationFrames;
+            }
+        }
+        return std::numeric_limits<std::uint32_t>::max();
+    };
+    CHECK(keyFrame(result.firstCandidate, first.keys[0U].id) == 35U);
+    CHECK(keyFrame(result.firstCandidate, first.keys[1U].id) == 76U);
+    CHECK(keyFrame(result.firstCandidate, first.keys[2U].id) == 155U);
+    CHECK(keyFrame(result.secondCandidate, second.keys[0U].id) == 44U);
+    CHECK(keyFrame(result.secondCandidate, second.keys[1U].id) == 98U);
+    CHECK(keyFrame(result.secondCandidate, second.keys[2U].id) == 194U);
+
+    std::unordered_set<std::string> originalIds;
+    for (const auto& key : first.keys) {
+        originalIds.insert(key.id);
+    }
+    std::size_t generatedFirstKeys = 0U;
+    for (const auto& key : result.firstCandidate.keys) {
+        if (!originalIds.contains(key.id)) {
+            ++generatedFirstKeys;
+            CHECK(key.linkedCameraId.empty());
+            CHECK(key.linkedCameraName.empty());
+            CHECK(key.sourceShotName.empty());
+        }
+    }
+    CHECK(generatedFirstKeys == 4U);
+
+    REQUIRE(result.firstCandidate.waterScenarioTracks.size() == 1U);
+    REQUIRE(result.secondCandidate.waterScenarioTracks.size() == 1U);
+    const auto& firstWater =
+        result.firstCandidate.waterScenarioTracks.front();
+    const auto& secondWater =
+        result.secondCandidate.waterScenarioTracks.front();
+    CHECK(firstWater.keys[0U].position ==
+          Approx((35.0F + 0.25F * 120.0F) / 199.0F));
+    CHECK(firstWater.keys[1U].position ==
+          Approx((35.0F + 120.0F) / 199.0F));
+    CHECK(secondWater.keys[0U].position ==
+          Approx((44.0F + 0.25F * 150.0F) / 229.0F));
+    CHECK(secondWater.keys[1U].position ==
+          Approx((44.0F + 150.0F) / 229.0F));
+
+    auto migratedFirst = first;
+    auto migratedSecond = second;
+    migratedFirst.authoredTrackDurationFrames = 90U;
+    migratedSecond.authoredTrackDurationFrames = 110U;
+    const auto migrated = invisible_places::camera::
+        BuildAnimationBidirectionalReciprocalPanExtension(
+            migratedFirst,
+            migratedSecond,
+            options);
+    INFO(migrated.errorMessage);
+    REQUIRE(migrated.succeeded);
+    CHECK(migrated.firstCandidate.authoredTrackDurationFrames == 0U);
+    CHECK(migrated.secondCandidate.authoredTrackDurationFrames == 0U);
+    CHECK(migrated.firstCandidate.waterScenarioTracks.front()
+              .keys.front()
+              .position == Approx((35.0F + 0.25F * 90.0F) / 199.0F));
+    CHECK(migrated.secondCandidate.waterScenarioTracks.front()
+              .keys.front()
+              .position == Approx((44.0F + 0.25F * 110.0F) / 229.0F));
+
+    auto swappedOptions = options;
+    swappedOptions.firstDrivesSecond = options.secondDrivesFirst;
+    swappedOptions.secondDrivesFirst = options.firstDrivesSecond;
+    const auto swapped = invisible_places::camera::
+        BuildAnimationBidirectionalReciprocalPanExtension(
+            second,
+            first,
+            swappedOptions);
+    INFO(swapped.errorMessage);
+    REQUIRE(swapped.succeeded);
+    REQUIRE(swapped.firstCandidate.durationFrames ==
+            result.secondCandidate.durationFrames);
+    REQUIRE(swapped.secondCandidate.durationFrames ==
+            result.firstCandidate.durationFrames);
+    const auto forwardFirst = invisible_places::camera::
+        PrepareAnimationPathEvaluation(result.firstCandidate);
+    const auto forwardSecond = invisible_places::camera::
+        PrepareAnimationPathEvaluation(result.secondCandidate);
+    const auto swappedFirst = invisible_places::camera::
+        PrepareAnimationPathEvaluation(swapped.firstCandidate);
+    const auto swappedSecond = invisible_places::camera::
+        PrepareAnimationPathEvaluation(swapped.secondCandidate);
+    REQUIRE(forwardFirst.valid);
+    REQUIRE(forwardSecond.valid);
+    REQUIRE(swappedFirst.valid);
+    REQUIRE(swappedSecond.valid);
+    for (std::uint32_t sample = 0U; sample <= 24U; ++sample) {
+        const float amount = static_cast<float>(sample) / 24.0F;
+        CheckPanEvaluationNear(
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                forwardFirst,
+                amount * forwardFirst.durationSeconds),
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                swappedSecond,
+                amount * swappedSecond.durationSeconds),
+            3.0e-4F);
+        CheckPanEvaluationNear(
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                forwardSecond,
+                amount * forwardSecond.durationSeconds),
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                swappedFirst,
+                amount * swappedFirst.durationSeconds),
+            3.0e-4F);
+    }
+}
+
 TEST_CASE(
     "Destination seam axes preserve source dimensions in the destination camera frame",
     "[camera][animation][pan-extension][correspondence]") {
