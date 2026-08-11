@@ -5977,7 +5977,8 @@ std::array<float, 2> HorizontalWipeRegion(
 float MeasureLoopNeighborhoodRoughness(
     const PreparedAnimationPathEvaluationContext& context,
     float startOverlapSeconds,
-    float endOverlapSeconds) {
+    float endOverlapSeconds,
+    const AnimationLoopSmoothingOptions& options) {
     if (!context.valid || context.durationSeconds <= 1.0e-6F) {
         return 0.0F;
     }
@@ -5997,6 +5998,22 @@ float MeasureLoopNeighborhoodRoughness(
     }};
     float total = 0.0F;
     std::uint32_t count = 0U;
+    const float representativeDelta = LoopProbeDeltaSeconds(
+        context,
+        std::max(startOverlapSeconds, endOverlapSeconds));
+    const auto panAxis =
+        options.spatialObjective ==
+                AnimationLoopSpatialObjective::EqualizePerceivedSpeed &&
+            options.perceivedSpeedMode ==
+                AnimationSpeedEqualizationMode::StabilizedPan
+        ? EstimateDominantScreenPanAxis(
+              context,
+              96U,
+              representativeDelta)
+        : DominantScreenPanAxis{};
+    const AnimationSpeedEqualizationOptions perceivedOptions{
+        .mode = options.perceivedSpeedMode,
+    };
     for (const auto& [begin, end] : windows) {
         const float span = end - begin;
         if (span <= 1.0e-6F) {
@@ -6030,11 +6047,48 @@ float MeasureLoopNeighborhoodRoughness(
             const float rotationDelta =
                 current.imageRotationDegreesPerSecond -
                 previous.imageRotationDegreesPerSecond;
-            total +=
-                ((velocityX * velocityX) + (velocityY * velocityY)) /
-                    (speedScale * speedScale) +
-                0.25F * (rotationDelta * rotationDelta) /
-                    (rotationScale * rotationScale);
+            const float normalizedX =
+                (velocityX * velocityX) / (speedScale * speedScale);
+            const float normalizedY =
+                (velocityY * velocityY) / (speedScale * speedScale);
+            const float normalizedRotation =
+                (rotationDelta * rotationDelta) /
+                (rotationScale * rotationScale);
+            switch (options.spatialObjective) {
+                case AnimationLoopSpatialObjective::EqualizeScreenXVelocity:
+                    total += normalizedX;
+                    break;
+                case AnimationLoopSpatialObjective::EqualizeScreenYVelocity:
+                    total += normalizedY;
+                    break;
+                case AnimationLoopSpatialObjective::MinimizeImageRotation:
+                    total += normalizedRotation;
+                    break;
+                case AnimationLoopSpatialObjective::EqualizeScreenXAndRotation:
+                    total += normalizedX + normalizedRotation;
+                    break;
+                case AnimationLoopSpatialObjective::EqualizePerceivedSpeed: {
+                    const float previousSpeed = EqualizationScreenSpeed(
+                        previous,
+                        perceivedOptions,
+                        panAxis);
+                    const float currentSpeed = EqualizationScreenSpeed(
+                        current,
+                        perceivedOptions,
+                        panAxis);
+                    const float perceivedScale = std::max(
+                        0.5F * (previousSpeed + currentSpeed),
+                        1.0e-3F);
+                    const float difference = currentSpeed - previousSpeed;
+                    total += (difference * difference) /
+                        (perceivedScale * perceivedScale);
+                    break;
+                }
+                case AnimationLoopSpatialObjective::Balanced:
+                    total += normalizedX + normalizedY +
+                        0.25F * normalizedRotation;
+                    break;
+            }
             ++count;
             previous = current;
         }
@@ -6056,8 +6110,11 @@ LoopScore ScoreLoopPair(
     // triangle-constrained reciprocal seam intentionally permits retuning the
     // small selected neighbourhood so signed screen velocity can remain
     // constant through the movable 50% midpoint.
-    const float originalSpeedCurveWeight =
-        triangleAlignments.empty() ? 1.50F : 0.20F;
+    const bool customSpatialObjective =
+        options.spatialObjective != AnimationLoopSpatialObjective::Balanced;
+    const float originalSpeedCurveWeight = customSpatialObjective
+        ? 0.0F
+        : (triangleAlignments.empty() ? 1.50F : 0.20F);
     constexpr float kEndpointMovementWeight = 0.02F;
     const auto candidateFirst = PrepareAnimationPathEvaluation(first);
     const auto candidateSecond = PrepareAnimationPathEvaluation(second);
@@ -6081,12 +6138,42 @@ LoopScore ScoreLoopPair(
     float totalWeight = 0.0F;
     std::array<float, 2> seamWeights{0.0F, 0.0F};
     std::array<float, 2> speedErrorWeights{0.0F, 0.0F};
-    const float rotationWeight = std::clamp(
+    float rotationWeight = std::clamp(
         std::isfinite(options.imageRotationMismatchWeight)
             ? options.imageRotationMismatchWeight
             : 0.0F,
         0.0F,
         10.0F);
+    float xVelocityWeight = 1.0F;
+    float yVelocityWeight = 1.0F;
+    float perceivedSpeedWeight = 0.0F;
+    switch (options.spatialObjective) {
+        case AnimationLoopSpatialObjective::EqualizeScreenXVelocity:
+            yVelocityWeight = 0.0F;
+            rotationWeight = 0.0F;
+            break;
+        case AnimationLoopSpatialObjective::EqualizeScreenYVelocity:
+            xVelocityWeight = 0.0F;
+            rotationWeight = 0.0F;
+            break;
+        case AnimationLoopSpatialObjective::MinimizeImageRotation:
+            xVelocityWeight = 0.0F;
+            yVelocityWeight = 0.0F;
+            rotationWeight = std::max(rotationWeight, 1.0F);
+            break;
+        case AnimationLoopSpatialObjective::EqualizeScreenXAndRotation:
+            yVelocityWeight = 0.0F;
+            rotationWeight = std::max(rotationWeight, 1.0F);
+            break;
+        case AnimationLoopSpatialObjective::EqualizePerceivedSpeed:
+            xVelocityWeight = 0.0F;
+            yVelocityWeight = 0.0F;
+            rotationWeight = 0.0F;
+            perceivedSpeedWeight = 1.0F;
+            break;
+        case AnimationLoopSpatialObjective::Balanced:
+            break;
+    }
     const float smoothnessWeight = std::clamp(
         std::isfinite(options.selectedNeighborhoodSmoothnessWeight)
             ? options.selectedNeighborhoodSmoothnessWeight
@@ -6103,6 +6190,25 @@ LoopScore ScoreLoopPair(
         {0U, 1U},
         {1U, 0U},
     }};
+    const AnimationSpeedEqualizationOptions perceivedOptions{
+        .mode = options.perceivedSpeedMode,
+    };
+    std::array<DominantScreenPanAxis, 2U> perceivedPanAxes{};
+    if (options.spatialObjective ==
+            AnimationLoopSpatialObjective::EqualizePerceivedSpeed &&
+        options.perceivedSpeedMode ==
+            AnimationSpeedEqualizationMode::StabilizedPan) {
+        for (std::size_t pathIndex = 0U; pathIndex < 2U; ++pathIndex) {
+            perceivedPanAxes[pathIndex] = EstimateDominantScreenPanAxis(
+                *candidates[pathIndex],
+                96U,
+                LoopProbeDeltaSeconds(
+                    *candidates[pathIndex],
+                    std::max(
+                        overlaps.startSeconds[pathIndex],
+                        overlaps.endSeconds[pathIndex])));
+        }
+    }
     for (std::size_t seamIndex = 0U; seamIndex < seams.size(); ++seamIndex) {
         if (options.stopToken.stop_requested()) {
             score.cancelled = true;
@@ -6196,6 +6302,10 @@ LoopScore ScoreLoopPair(
             const float flowY = outgoingFlow.screenVelocity[1] - incomingFlow.screenVelocity[1];
             const float normalizedMismatch =
                 ((flowX * flowX) + (flowY * flowY)) / (scale * scale);
+            const float objectiveVelocityMismatch =
+                (xVelocityWeight * flowX * flowX +
+                 yVelocityWeight * flowY * flowY) /
+                (scale * scale);
             const float rotationScale = std::max(
                 0.5F *
                     (std::abs(
@@ -6211,6 +6321,24 @@ LoopScore ScoreLoopPair(
             const float normalizedRotationMismatch =
                 (rotationDifference * rotationDifference) /
                 (rotationScale * rotationScale);
+            const float normalizedRotationMagnitude =
+                0.5F *
+                (outgoingFlow.imageRotationDegreesPerSecond *
+                     outgoingFlow.imageRotationDegreesPerSecond +
+                 incomingFlow.imageRotationDegreesPerSecond *
+                     incomingFlow.imageRotationDegreesPerSecond) /
+                (rotationScale * rotationScale);
+            const float rotationObjective =
+                normalizedRotationMismatch +
+                (options.spatialObjective ==
+                         AnimationLoopSpatialObjective::MinimizeImageRotation
+                     ? 0.75F
+                 : options.spatialObjective ==
+                         AnimationLoopSpatialObjective::
+                             EqualizeScreenXAndRotation
+                     ? 0.25F
+                     : 0.0F) *
+                    normalizedRotationMagnitude;
             const float outgoingSpeedError =
                 (outgoingFlow.fullScreenSpeed -
                  originalOutgoingFlow.fullScreenSpeed) /
@@ -6219,6 +6347,34 @@ LoopScore ScoreLoopPair(
                 (incomingFlow.fullScreenSpeed -
                  originalIncomingFlow.fullScreenSpeed) /
                 fullScreenScale;
+            const float outgoingPerceivedSpeed = EqualizationScreenSpeed(
+                outgoingFlow,
+                perceivedOptions,
+                perceivedPanAxes[outgoingIndex]);
+            const float incomingPerceivedSpeed = EqualizationScreenSpeed(
+                incomingFlow,
+                perceivedOptions,
+                perceivedPanAxes[incomingIndex]);
+            const float originalOutgoingPerceivedSpeed =
+                EqualizationScreenSpeed(
+                    originalOutgoingFlow,
+                    perceivedOptions,
+                    perceivedPanAxes[outgoingIndex]);
+            const float originalIncomingPerceivedSpeed =
+                EqualizationScreenSpeed(
+                    originalIncomingFlow,
+                    perceivedOptions,
+                    perceivedPanAxes[incomingIndex]);
+            const float perceivedScale = std::max(
+                0.5F *
+                    (originalOutgoingPerceivedSpeed +
+                     originalIncomingPerceivedSpeed),
+                1.0e-3F);
+            const float perceivedDifference =
+                outgoingPerceivedSpeed - incomingPerceivedSpeed;
+            const float normalizedPerceivedMismatch =
+                (perceivedDifference * perceivedDifference) /
+                (perceivedScale * perceivedScale);
             score.seamMismatch[seamIndex] += weight * normalizedMismatch;
             score.seamRotationMismatch[seamIndex] +=
                 weight * normalizedRotationMismatch;
@@ -6230,8 +6386,9 @@ LoopScore ScoreLoopPair(
             speedErrorWeights[incomingIndex] += weight;
             score.objective +=
                 weight *
-                (normalizedMismatch +
-                 rotationWeight * normalizedRotationMismatch +
+                (objectiveVelocityMismatch +
+                 rotationWeight * rotationObjective +
+                 perceivedSpeedWeight * normalizedPerceivedMismatch +
                  originalSpeedCurveWeight *
                      ((outgoingSpeedError * outgoingSpeedError) +
                       (incomingSpeedError * incomingSpeedError)));
@@ -6267,7 +6424,8 @@ LoopScore ScoreLoopPair(
             MeasureLoopNeighborhoodRoughness(
                 *candidates[pathIndex],
                 overlaps.startSeconds[pathIndex],
-                overlaps.endSeconds[pathIndex]);
+                overlaps.endSeconds[pathIndex],
+                options);
     }
     score.objective += smoothnessWeight * 0.5F *
         (score.neighborhoodRoughness[0U] +
@@ -6863,7 +7021,8 @@ AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
                result.beforeSeamMismatch[seamIndex] + tolerance;
     };
     const bool neitherSeamWorsened =
-        seamDidNotWorsen(0U) && seamDidNotWorsen(1U);
+        options.spatialObjective != AnimationLoopSpatialObjective::Balanced ||
+        (seamDidNotWorsen(0U) && seamDidNotWorsen(1U));
     const float requestedRotationWeight = std::isfinite(
         options.imageRotationMismatchWeight)
         ? std::max(options.imageRotationMismatchWeight, 0.0F)
@@ -6880,7 +7039,8 @@ AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
                result.beforeSeamRotationMismatch[seamIndex] + tolerance;
     };
     const bool neitherRotationWorsened =
-        rotationDidNotWorsen(0U) && rotationDidNotWorsen(1U);
+        options.spatialObjective != AnimationLoopSpatialObjective::Balanced ||
+        (rotationDidNotWorsen(0U) && rotationDidNotWorsen(1U));
     const auto triangleAlignmentHeld = [&](std::size_t seamIndex) {
         if (seamIndex >= triangleAlignments->size()) {
             return true;
@@ -6901,6 +7061,7 @@ AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
     const bool allTriangleAlignmentsHeld =
         triangleAlignmentHeld(0U) && triangleAlignmentHeld(1U);
     const bool extendedSmoothingObjective =
+        options.spatialObjective != AnimationLoopSpatialObjective::Balanced ||
         requestedRotationWeight > 1.0e-8F ||
         (std::isfinite(options.selectedNeighborhoodSmoothnessWeight) &&
          options.selectedNeighborhoodSmoothnessWeight > 1.0e-8F) ||
@@ -6947,6 +7108,170 @@ AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
                 "one seam's translation or rotation continuity worse.";
         }
     }
+    return result;
+}
+
+AnimationLoopManualKeyEditResult MoveAnimationLoopSelectedKeySpatially(
+    AnimationPath* first,
+    AnimationPath* second,
+    const AnimationLoopSmoothingOptions& options,
+    std::size_t pathIndex,
+    std::string_view keyId,
+    bool cameraTrack,
+    const std::array<float, 3>& targetPosition) {
+    AnimationLoopManualKeyEditResult result;
+    if (first == nullptr || second == nullptr || first == second ||
+        pathIndex > 1U || keyId.empty() ||
+        !FinitePanVector(targetPosition)) {
+        result.errorMessage =
+            "Choose a finite camera/focus position on one valid A/B key.";
+        return result;
+    }
+    const auto& enabledIds = pathIndex == 0U
+        ? options.firstMovableKeyIds
+        : options.secondMovableKeyIds;
+    if (!options.useExplicitKeySelection ||
+        std::find(enabledIds.begin(), enabledIds.end(), keyId) ==
+            enabledIds.end()) {
+        result.errorMessage =
+            "That key is locked. Enable its green smoothing control first.";
+        return result;
+    }
+
+    AnimationPath originals[2U]{*first, *second};
+    AnimationPath* paths[2U]{first, second};
+    const auto findUniqueKey = [](AnimationPath& path,
+                                  std::string_view id)
+        -> std::optional<std::size_t> {
+        const auto found = std::find_if(
+            path.keys.begin(),
+            path.keys.end(),
+            [&](const AnimationPathKey& key) { return key.id == id; });
+        if (found == path.keys.end() ||
+            std::count_if(
+                path.keys.begin(),
+                path.keys.end(),
+                [&](const AnimationPathKey& key) { return key.id == id; }) !=
+                1) {
+            return std::nullopt;
+        }
+        return static_cast<std::size_t>(found - path.keys.begin());
+    };
+    const auto selectedIndex = findUniqueKey(*paths[pathIndex], keyId);
+    if (!selectedIndex.has_value()) {
+        result.errorMessage = "The enabled key no longer exists uniquely.";
+        return result;
+    }
+    const auto& selectedKey = paths[pathIndex]->keys[selectedIndex.value()];
+    if (!selectedKey.linkedCameraId.empty()) {
+        result.errorMessage =
+            "Manual viewport movement is disabled for a linked CameraShot; unlink it or use the background smoother after confirming its edit scope.";
+        return result;
+    }
+
+    struct PairedEdit {
+        std::size_t firstIndex = 0U;
+        std::size_t secondIndex = 0U;
+        PanTriangleSimilarity similarity{};
+    };
+    std::optional<PairedEdit> paired;
+    for (const auto& constraint : options.triangleAlignmentConstraints) {
+        const bool selectedFirst = pathIndex == 0U &&
+            constraint.firstKeyId == keyId;
+        const bool selectedSecond = pathIndex == 1U &&
+            constraint.secondKeyId == keyId;
+        if (!selectedFirst && !selectedSecond) {
+            continue;
+        }
+        const auto firstIndex = findUniqueKey(*first, constraint.firstKeyId);
+        const auto secondIndex = findUniqueKey(*second, constraint.secondKeyId);
+        const bool firstEnabled = std::find(
+            options.firstMovableKeyIds.begin(),
+            options.firstMovableKeyIds.end(),
+            constraint.firstKeyId) != options.firstMovableKeyIds.end();
+        const bool secondEnabled = std::find(
+            options.secondMovableKeyIds.begin(),
+            options.secondMovableKeyIds.end(),
+            constraint.secondKeyId) != options.secondMovableKeyIds.end();
+        const auto similarity = BuildPanTriangleSimilarity(
+            constraint.firstPatch,
+            constraint.secondPatch);
+        if (!firstIndex.has_value() || !secondIndex.has_value() ||
+            !firstEnabled || !secondEnabled || !similarity.valid ||
+            !first->keys[firstIndex.value()].linkedCameraId.empty() ||
+            !second->keys[secondIndex.value()].linkedCameraId.empty()) {
+            result.errorMessage =
+                "Both unlocked green midpoint keys and two valid ordered triangles are required for a coordinated manual move.";
+            return result;
+        }
+        paired = PairedEdit{
+            .firstIndex = firstIndex.value(),
+            .secondIndex = secondIndex.value(),
+            .similarity = similarity,
+        };
+        break;
+    }
+
+    if (!paired.has_value()) {
+        EnsureLocalizedKeyCorrections(
+            paths[pathIndex],
+            {selectedIndex.value()});
+        auto& position = cameraTrack
+            ? paths[pathIndex]->keys[selectedIndex.value()].cameraPosition
+            : paths[pathIndex]->keys[selectedIndex.value()].focusPoint;
+        result.changed = Distance(position, targetPosition) > 1.0e-7F;
+        position = targetPosition;
+    } else {
+        EnsureLocalizedKeyCorrections(first, {paired->firstIndex});
+        EnsureLocalizedKeyCorrections(second, {paired->secondIndex});
+        auto& firstPosition = cameraTrack
+            ? first->keys[paired->firstIndex].cameraPosition
+            : first->keys[paired->firstIndex].focusPoint;
+        auto& secondPosition = cameraTrack
+            ? second->keys[paired->secondIndex].cameraPosition
+            : second->keys[paired->secondIndex].focusPoint;
+        const glm::vec3 oldFirst = ToGlm(firstPosition);
+        const glm::vec3 oldSecond = ToGlm(secondPosition);
+        if (pathIndex == 0U) {
+            const glm::vec3 delta = ToGlm(targetPosition) - oldFirst;
+            firstPosition = targetPosition;
+            const glm::vec3 pairedPosition = oldSecond +
+                paired->similarity.scale *
+                    (paired->similarity.rotation * delta);
+            secondPosition = {
+                pairedPosition.x,
+                pairedPosition.y,
+                pairedPosition.z,
+            };
+        } else {
+            const glm::vec3 delta = ToGlm(targetPosition) - oldSecond;
+            const glm::vec3 driverDelta =
+                glm::inverse(paired->similarity.rotation) * delta /
+                std::max(paired->similarity.scale, 1.0e-8F);
+            const glm::vec3 pairedPosition = oldFirst + driverDelta;
+            firstPosition = {
+                pairedPosition.x,
+                pairedPosition.y,
+                pairedPosition.z,
+            };
+            secondPosition = targetPosition;
+        }
+        result.changed = glm::length(ToGlm(targetPosition) -
+            (pathIndex == 0U ? oldFirst : oldSecond)) > 1.0e-7F;
+        result.movedPairedTriangleKey = result.changed;
+    }
+
+    if (!PrepareAnimationPathEvaluation(*first).valid ||
+        !PrepareAnimationPathEvaluation(*second).valid) {
+        *first = std::move(originals[0U]);
+        *second = std::move(originals[1U]);
+        result.changed = false;
+        result.movedPairedTriangleKey = false;
+        result.errorMessage =
+            "That key move produced an invalid camera spline and was undone.";
+        return result;
+    }
+    result.succeeded = true;
     return result;
 }
 

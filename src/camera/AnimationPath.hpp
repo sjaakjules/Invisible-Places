@@ -445,6 +445,18 @@ struct AnimationLoopTriangleAlignmentConstraint {
     AnimationSurfacePatchObservation secondPatch{};
 };
 
+// Selects the spatial-only objective used by loop transition smoothing.
+// Every mode moves camera/focus controls only; key times and segment-frame
+// weights are immutable. `Balanced` preserves the established behaviour.
+enum class AnimationLoopSpatialObjective : std::uint8_t {
+    Balanced = 0,
+    EqualizeScreenXVelocity,
+    EqualizeScreenYVelocity,
+    MinimizeImageRotation,
+    EqualizeScreenXAndRotation,
+    EqualizePerceivedSpeed,
+};
+
 struct AnimationLoopSmoothingOptions {
     float maxEndMoveFraction = 0.10F;
     std::string pairId;
@@ -475,6 +487,13 @@ struct AnimationLoopSmoothingOptions {
     // its historical screen-translation objective exactly.
     float imageRotationMismatchWeight = 0.0F;
     float selectedNeighborhoodSmoothnessWeight = 0.0F;
+    AnimationLoopSpatialObjective spatialObjective =
+        AnimationLoopSpatialObjective::Balanced;
+    // Used only by EqualizePerceivedSpeed. Unlike the ordinary animation
+    // timing command, this remains a spatial objective and never writes a
+    // duration or incoming segment-frame value.
+    AnimationSpeedEqualizationMode perceivedSpeedMode =
+        AnimationSpeedEqualizationMode::PerceivedMotion;
     // Optional reciprocal-pan midpoint constraints. Each key pair must be in
     // the explicit movable selection. These are intentionally not serialized:
     // the assistant owns the captured feature triangles until Apply.
@@ -484,6 +503,13 @@ struct AnimationLoopSmoothingOptions {
     // Runtime-only cancellation for immutable background previews. It is
     // never serialized and has no effect for ordinary foreground calls.
     std::stop_token stopToken{};
+};
+
+struct AnimationLoopManualKeyEditResult {
+    bool succeeded = false;
+    bool changed = false;
+    bool movedPairedTriangleKey = false;
+    std::string errorMessage;
 };
 
 struct AnimationLoopHorizontalBlendRegions {
@@ -794,6 +820,19 @@ BuildAnimationCameraLocalSurfacePatch(
     AnimationPath* first,
     AnimationPath* second,
     const AnimationLoopSmoothingOptions& options = {});
+// Applies one absolute camera or focus position to an explicitly enabled
+// loop key. If that key participates in a triangle constraint, the paired
+// midpoint is moved through the same ordered-triangle similarity transform.
+// The operation is atomic and never changes timing weights.
+[[nodiscard]] AnimationLoopManualKeyEditResult
+MoveAnimationLoopSelectedKeySpatially(
+    AnimationPath* first,
+    AnimationPath* second,
+    const AnimationLoopSmoothingOptions& options,
+    std::size_t pathIndex,
+    std::string_view keyId,
+    bool cameraTrack,
+    const std::array<float, 3>& targetPosition);
 [[nodiscard]] AnimationLoopHorizontalBlendRegions
 ResolveAnimationLoopHorizontalBlendRegions(
     float blendProgress,

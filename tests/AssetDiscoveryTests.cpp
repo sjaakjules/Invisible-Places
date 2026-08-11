@@ -13056,6 +13056,103 @@ TEST_CASE("Horizontal loop blend regions follow the directional thirds wipe",
     CHECK(leftStart.incomingRange[1U] == Catch::Approx(-1.0F / 3.0F));
 }
 
+TEST_CASE(
+    "Selected loop spatial objectives never retime or move locked keys",
+    "[camera][animation][loop][spatial-objectives]") {
+    using invisible_places::camera::AnimationLoopSmoothingOptions;
+    using invisible_places::camera::AnimationLoopSpatialObjective;
+    using invisible_places::camera::AnimationPath;
+    using invisible_places::camera::AnimationSpeedEqualizationMode;
+    const auto makePath = [](std::string prefix, float offset) {
+        AnimationPath path;
+        path.name = prefix;
+        path.durationFrames = 120U;
+        for (std::size_t index = 0U; index < 5U; ++index) {
+            const float amount = static_cast<float>(index);
+            path.keys.push_back({
+                .id = prefix + "-" + std::to_string(index),
+                .cameraPosition = {
+                    offset + amount,
+                    0.18F * amount * amount,
+                    1.0F + 0.05F * amount,
+                },
+                .focusPoint = {
+                    offset + amount + 4.0F,
+                    0.1F * amount,
+                    1.0F,
+                },
+                .durationFrames = index == 0U
+                    ? 24U
+                    : static_cast<std::uint32_t>(18U + 4U * index),
+            });
+        }
+        return path;
+    };
+    const auto originalFirst = makePath("objective-A", 0.0F);
+    const auto originalSecond = makePath("objective-B", 0.6F);
+    const std::array objectives{
+        AnimationLoopSpatialObjective::EqualizeScreenXVelocity,
+        AnimationLoopSpatialObjective::EqualizeScreenYVelocity,
+        AnimationLoopSpatialObjective::MinimizeImageRotation,
+        AnimationLoopSpatialObjective::EqualizeScreenXAndRotation,
+        AnimationLoopSpatialObjective::EqualizePerceivedSpeed,
+    };
+    const std::array speedModes{
+        AnimationSpeedEqualizationMode::PerceivedMotion,
+        AnimationSpeedEqualizationMode::CenterScreenPan,
+        AnimationSpeedEqualizationMode::StabilizedPan,
+    };
+    for (const auto objective : objectives) {
+        const std::size_t speedPasses = objective ==
+                AnimationLoopSpatialObjective::EqualizePerceivedSpeed
+            ? speedModes.size()
+            : 1U;
+        for (std::size_t speedIndex = 0U;
+             speedIndex < speedPasses;
+             ++speedIndex) {
+            auto first = originalFirst;
+            auto second = originalSecond;
+            AnimationLoopSmoothingOptions options;
+            options.useExplicitKeySelection = true;
+            options.spatialObjective = objective;
+            options.perceivedSpeedMode = speedModes[speedIndex];
+            options.maxOptimizationSweeps = 2U;
+            options.minimumStepFraction = 0.125F;
+            options.firstStartOverlapSeconds = 1.0F;
+            options.firstEndOverlapSeconds = 1.0F;
+            options.secondStartOverlapSeconds = 1.0F;
+            options.secondEndOverlapSeconds = 1.0F;
+            options.selectedNeighborhoodSmoothnessWeight = 1.0F;
+            for (const auto index : {0U, 1U, 3U, 4U}) {
+                options.firstMovableKeyIds.push_back(first.keys[index].id);
+                options.secondMovableKeyIds.push_back(second.keys[index].id);
+            }
+            const auto result = invisible_places::camera::
+                SmoothAnimationLoopTransitions(&first, &second, options);
+            INFO(result.errorMessage);
+            CHECK(result.succeeded);
+            CHECK(first.durationFrames == originalFirst.durationFrames);
+            CHECK(second.durationFrames == originalSecond.durationFrames);
+            for (std::size_t keyIndex = 0U;
+                 keyIndex < first.keys.size();
+                 ++keyIndex) {
+                CHECK(first.keys[keyIndex].durationFrames ==
+                      originalFirst.keys[keyIndex].durationFrames);
+                CHECK(second.keys[keyIndex].durationFrames ==
+                      originalSecond.keys[keyIndex].durationFrames);
+            }
+            CHECK(first.keys[2U].cameraPosition ==
+                  originalFirst.keys[2U].cameraPosition);
+            CHECK(first.keys[2U].focusPoint ==
+                  originalFirst.keys[2U].focusPoint);
+            CHECK(second.keys[2U].cameraPosition ==
+                  originalSecond.keys[2U].cameraPosition);
+            CHECK(second.keys[2U].focusPoint ==
+                  originalSecond.keys[2U].focusPoint);
+        }
+    }
+}
+
 TEST_CASE("Loop transition smoothing improves both seams without retiming", "[camera][animation][loop]") {
     using invisible_places::camera::AnimationLoopSmoothingOptions;
     using invisible_places::camera::AnimationPath;

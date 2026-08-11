@@ -295,9 +295,15 @@ abrupt alignment bend. The generated keys, both feature-aligned midpoint pairs,
 and up to two authored keys inward from each end are selected by default. Each
 midpoint's A/B cameras move together through the triangle correspondence rather
 than remaining fixed; a hard three-node projection check preserves the feature
-alignment. A bounded background pass reduces changes in signed projected pan
-velocity and image-rotation rate without allowing either seam to worsen. Reset
-restores the immutable triangle fit, and a rejected pass does not replace it.
+alignment. Green controls can be moved directly with XYZ values or the viewport
+gizmo, and each edit becomes the starting point for the next pass. Separate
+spatial-only actions target X velocity, Y velocity, image rotation, X plus
+rotation, or perceived speed under all three speed methods; amber controls and
+every segment-frame weight remain unchanged. A/B motion graphs mark both exact
+50% poses. The final hard-split preview has a signed -1..1 full-cycle transport,
+two feature-relative split offsets, repeated-drag wrapping, and Space-key loop
+playback at each path's existing 30 fps rate. Reset restores the immutable
+triangle fit, and a rejected pass does not replace the current working edit.
 Back, Cancel, and Escape discard all private candidates and restore the launch
 camera, playhead, pivot, and matching ghost.
 

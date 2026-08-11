@@ -201,11 +201,18 @@ movable pair rather than fixed poses. Generated keys, both midpoint pairs, and
 up to two neighbouring authored keys on each side shall be recommended as
 movable. Toggling either midpoint key shall toggle its partner. The user may
 toggle other eligible keys per animation and set a bounded movement allowance.
-The pass shall favour constant signed screen velocity and image-rotation rate
-through the seam, while a hard three-node projection check preserves each
-triangle alignment and neither seam may worsen. Reset shall restore the
+Every enabled key shall also be manually movable; moving either member of a
+midpoint pair shall move its counterpart through the captured triangle
+transform. Spatial-only actions shall equalize X velocity, Y velocity, X plus
+rotation, image rotation, or perceived speed under each supported speed method.
+They shall move only green controls and shall never modify segment-frame
+weights. A/B motion graphs shall mark both 50% poses. A signed -1..1 transport
+shall run the complete A/B cycle, activate the appropriate feature-following
+hard split at either seam, retain independent per-seam boundary offsets, wrap
+repeated drags on release, and loop with Space. Reset shall restore the
 immutable triangle fit. Applying without a successful pass shall preserve the
-unsmoothed fit.
+unsmoothed fit, and applying either result shall create/update reciprocal blend
+durations from the generated spans.
 
 ### 5.4 Side Panel Behaviour
 #### FR-UI-1

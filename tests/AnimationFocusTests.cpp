@@ -1,4 +1,5 @@
 #include "camera/AnimationPath.hpp"
+#include "camera/OrbitCamera.hpp"
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -1686,6 +1687,196 @@ TEST_CASE(
     CHECK(firstSeamDriverMoved == firstSeamFollowerMoved);
     CHECK(secondSeamDriverMoved == secondSeamFollowerMoved);
     CHECK((firstSeamDriverMoved || secondSeamDriverMoved));
+}
+
+TEST_CASE(
+    "Manual reciprocal smoothing moves only green spatial controls and carries the paired triangle key",
+    "[camera][animation][pan-extension][transition-smoothing][manual]") {
+    const auto firstBaseline =
+        MakeReciprocalPanTestPath("manual-A", 1.0F, 41U, 79U);
+    const auto secondBaseline =
+        MakeReciprocalPanTestPath("manual-B", -1.0F, 54U, 96U);
+    const auto extensionOptions = MakeReciprocalPanTestOptions();
+    const auto extension = invisible_places::camera::
+        BuildAnimationBidirectionalReciprocalPanExtension(
+            firstBaseline,
+            secondBaseline,
+            extensionOptions);
+    INFO(extension.errorMessage);
+    REQUIRE(extension.succeeded);
+    auto first = extension.firstCandidate;
+    auto second = extension.secondCandidate;
+
+    invisible_places::camera::AnimationLoopSmoothingOptions options;
+    options.useExplicitKeySelection = true;
+    for (const auto& key : first.keys) {
+        options.firstMovableKeyIds.push_back(key.id);
+    }
+    for (const auto& key : second.keys) {
+        options.secondMovableKeyIds.push_back(key.id);
+    }
+    options.triangleAlignmentConstraints = {
+        {
+            .firstKeyId = firstBaseline.keys.front().id,
+            .secondKeyId = secondBaseline.keys.back().id,
+            .firstPatch = extensionOptions.firstDrivesSecond.sourcePatch,
+            .secondPatch =
+                extensionOptions.firstDrivesSecond.destinationEndPatch,
+        },
+        {
+            .firstKeyId = firstBaseline.keys.back().id,
+            .secondKeyId = secondBaseline.keys.front().id,
+            .firstPatch =
+                extensionOptions.secondDrivesFirst.destinationEndPatch,
+            .secondPatch = extensionOptions.secondDrivesFirst.sourcePatch,
+        },
+    };
+
+    const auto findKey = [](auto& path, std::string_view id) -> auto& {
+        const auto found = std::find_if(
+            path.keys.begin(),
+            path.keys.end(),
+            [&](const auto& key) { return key.id == id; });
+        REQUIRE(found != path.keys.end());
+        return *found;
+    };
+    const auto firstDurations = [&] {
+        std::vector<std::uint32_t> result;
+        for (const auto& key : first.keys) {
+            result.push_back(key.durationFrames);
+        }
+        return result;
+    }();
+    const auto secondDurations = [&] {
+        std::vector<std::uint32_t> result;
+        for (const auto& key : second.keys) {
+            result.push_back(key.durationFrames);
+        }
+        return result;
+    }();
+    const auto firstDuration = first.durationFrames;
+    const auto secondDuration = second.durationFrames;
+    const auto triangleScreenRms = [&]() {
+        const auto firstKeyIndex = static_cast<std::size_t>(
+            std::find_if(
+                first.keys.begin(),
+                first.keys.end(),
+                [&](const auto& key) {
+                    return key.id == firstBaseline.keys.front().id;
+                }) - first.keys.begin());
+        const auto secondKeyIndex = static_cast<std::size_t>(
+            std::find_if(
+                second.keys.begin(),
+                second.keys.end(),
+                [&](const auto& key) {
+                    return key.id == secondBaseline.keys.back().id;
+                }) - second.keys.begin());
+        const auto firstEvaluation = invisible_places::camera::
+            EvaluateAnimationPath(
+                first,
+                invisible_places::camera::AnimationPathKeyNormalizedPosition(
+                    first,
+                    firstKeyIndex) *
+                    invisible_places::camera::AnimationPathDurationSeconds(
+                        first));
+        const auto secondEvaluation = invisible_places::camera::
+            EvaluateAnimationPath(
+                second,
+                invisible_places::camera::AnimationPathKeyNormalizedPosition(
+                    second,
+                    secondKeyIndex) *
+                    invisible_places::camera::AnimationPathDurationSeconds(
+                        second));
+        invisible_places::camera::OrbitCamera firstCamera;
+        invisible_places::camera::OrbitCamera secondCamera;
+        firstCamera.ApplyState(firstEvaluation.camera);
+        secondCamera.ApplyState(secondEvaluation.camera);
+        const auto firstMatrices = firstCamera.Matrices(16.0F / 9.0F);
+        const auto secondMatrices = secondCamera.Matrices(16.0F / 9.0F);
+        const auto project = [](const auto& matrices,
+                                const std::array<float, 3>& point) {
+            const glm::vec4 clip = matrices.viewProjection * glm::vec4{
+                point[0U], point[1U], point[2U], 1.0F};
+            REQUIRE(clip.w > 1.0e-6F);
+            return glm::vec2{clip.x / clip.w, clip.y / clip.w};
+        };
+        float squared = 0.0F;
+        for (std::size_t node = 0U; node < 3U; ++node) {
+            const auto firstPoint = project(
+                firstMatrices,
+                extensionOptions.firstDrivesSecond.sourcePatch
+                    .worldPoints[node]);
+            const auto secondPoint = project(
+                secondMatrices,
+                extensionOptions.firstDrivesSecond.destinationEndPatch
+                    .worldPoints[node]);
+            const auto difference = firstPoint - secondPoint;
+            squared += glm::dot(difference, difference);
+        }
+        return std::sqrt(squared / 3.0F);
+    };
+    const float alignmentBefore = triangleScreenRms();
+    const auto driverBefore = findKey(
+        first,
+        firstBaseline.keys.front().id).cameraPosition;
+    const auto followerBefore = findKey(
+        second,
+        secondBaseline.keys.back().id).cameraPosition;
+    const std::array<float, 3> target{
+        driverBefore[0U] + 0.04F,
+        driverBefore[1U] - 0.02F,
+        driverBefore[2U] + 0.01F,
+    };
+    const auto moved = invisible_places::camera::
+        MoveAnimationLoopSelectedKeySpatially(
+            &first,
+            &second,
+            options,
+            0U,
+            firstBaseline.keys.front().id,
+            true,
+            target);
+    INFO(moved.errorMessage);
+    REQUIRE(moved.succeeded);
+    REQUIRE(moved.changed);
+    CHECK(moved.movedPairedTriangleKey);
+    CHECK(findKey(first, firstBaseline.keys.front().id).cameraPosition ==
+          target);
+    CHECK(findKey(second, secondBaseline.keys.back().id).cameraPosition !=
+          followerBefore);
+    CHECK(triangleScreenRms() <=
+          Catch::Approx(alignmentBefore).margin(2.0e-5F));
+    CHECK(first.durationFrames == firstDuration);
+    CHECK(second.durationFrames == secondDuration);
+    for (std::size_t index = 0U; index < first.keys.size(); ++index) {
+        CHECK(first.keys[index].durationFrames == firstDurations[index]);
+    }
+    for (std::size_t index = 0U; index < second.keys.size(); ++index) {
+        CHECK(second.keys[index].durationFrames == secondDurations[index]);
+    }
+
+    const auto lockedId = firstBaseline.keys[1U].id;
+    options.firstMovableKeyIds.erase(
+        std::remove(
+            options.firstMovableKeyIds.begin(),
+            options.firstMovableKeyIds.end(),
+            lockedId),
+        options.firstMovableKeyIds.end());
+    const auto lockedBefore = findKey(first, lockedId).focusPoint;
+    auto lockedTarget = lockedBefore;
+    lockedTarget[0U] += 1.0F;
+    const auto locked = invisible_places::camera::
+        MoveAnimationLoopSelectedKeySpatially(
+            &first,
+            &second,
+            options,
+            0U,
+            lockedId,
+            false,
+            lockedTarget);
+    CHECK_FALSE(locked.succeeded);
+    CHECK_FALSE(locked.changed);
+    CHECK(findKey(first, lockedId).focusPoint == lockedBefore);
 }
 
 TEST_CASE(

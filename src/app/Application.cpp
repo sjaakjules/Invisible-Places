@@ -934,6 +934,17 @@ struct AnimationReciprocalPanWizardState {
     bool smoothingSelectionInitialized = false;
     bool smoothingInProgress = false;
     float smoothingMaxMovePercent = 10.0F;
+    invisible_places::camera::AnimationLoopSpatialObjective
+        smoothingObjective = invisible_places::camera::
+            AnimationLoopSpatialObjective::Balanced;
+    invisible_places::camera::AnimationSpeedEqualizationMode
+        smoothingSpeedMethod = invisible_places::camera::
+            AnimationSpeedEqualizationMode::PerceivedMotion;
+    int smoothingSelectedRole = 0;
+    std::string smoothingSelectedKeyId;
+    AnimationEditTarget smoothingEditTarget = AnimationEditTarget::Camera;
+    ManualFlowPathGizmoDragState smoothingKeyGizmoDrag{};
+    bool smoothingKeyGizmoPointerCaptured = false;
     std::uint64_t smoothingGeneration = 0U;
     std::string smoothingError;
     std::string dependencyPairId;
@@ -975,7 +986,7 @@ struct AnimationReciprocalPanWizardState {
     // Aligned seam review alternates the A/B cameras through the renderer's
     // two-frame history and composites a feature-following hard split.
     bool splitComparisonEnabled = true;
-    float splitAnchorOffsetPixels = 0.0F;
+    std::array<float, 2U> splitAnchorOffsetPixels{0.0F, 0.0F};
     bool splitAOnLeft = true;
     std::uint32_t splitRenderedRole = 0U;
     int seamReviewEditableSide = 1;  // 0 = source, 1 = destination.
@@ -985,6 +996,9 @@ struct AnimationReciprocalPanWizardState {
     bool previewFrameScrub = false;
     int previewScrubRole = 0;
     std::array<std::uint32_t, 2U> previewScrubFrames{};
+    bool previewLoopEnabled = true;
+    bool previewLoopPlaying = false;
+    float previewLoopPosition = 0.0F;
     std::uint64_t generation = 0U;
     std::string errorMessage;
 
@@ -1647,6 +1661,12 @@ bool RebuildReciprocalPanSeamPreview(
     PreviewRuntimeState* runtimeState,
     std::size_t seamIndex,
     float currentAspectRatio);
+bool MoveReciprocalPanSmoothingKey(
+    PreviewRuntimeState* runtimeState,
+    std::size_t role,
+    std::string_view keyId,
+    AnimationEditTarget target,
+    const std::array<float, 3>& position);
 std::vector<OfflineRenderJobState::FrozenSeepageLayer> BuildFrozenAnimationSeepageLayers(
     PreviewRuntimeState* runtimeState,
     std::span<const invisible_places::renderer::core::SceneRenderState::PointCloudLayerState> exportLayers,
@@ -44396,11 +44416,96 @@ struct ReciprocalPanComparisonView {
     std::array<glm::vec3, 2U> anchors{};
 };
 
+float WrappedReciprocalPanLoopPosition(float position) {
+    if (!std::isfinite(position)) {
+        return 0.0F;
+    }
+    float wrapped = std::remainder(position, 2.0F);
+    if (wrapped >= 1.0F) {
+        wrapped -= 2.0F;
+    } else if (wrapped < -1.0F) {
+        wrapped += 2.0F;
+    }
+    return wrapped;
+}
+
 std::optional<ReciprocalPanComparisonView>
 ResolveReciprocalPanComparisonView(
     const AnimationReciprocalPanWizardState& wizard) {
     std::size_t seamIndex = 0U;
     std::int32_t offset = 0;
+    if (wizard.stage == AnimationReciprocalPanWizardStage::Preview &&
+        wizard.previewLoopEnabled && !wizard.previewBaselineHold &&
+        wizard.candidate.has_value()) {
+        const float loopPosition = WrappedReciprocalPanLoopPosition(
+            wizard.previewLoopPosition);
+        const std::int32_t oldA = static_cast<std::int32_t>(
+            ReciprocalPanPathFrameCount(wizard.baselinePaths[0U]));
+        const std::int32_t oldB = static_cast<std::int32_t>(
+            ReciprocalPanPathFrameCount(wizard.baselinePaths[1U]));
+        const std::int32_t seamOneOffset = loopPosition >= 0.0F
+            ? static_cast<std::int32_t>(std::lround(
+                  loopPosition * static_cast<float>(oldA)))
+            : static_cast<std::int32_t>(std::lround(
+                  loopPosition * static_cast<float>(oldB)));
+        const std::int32_t seamTwoOffset = loopPosition >= 0.0F
+            ? static_cast<std::int32_t>(std::lround(
+                  (loopPosition - 1.0F) * static_cast<float>(oldA)))
+            : static_cast<std::int32_t>(std::lround(
+                  (loopPosition + 1.0F) * static_cast<float>(oldB)));
+        if (std::abs(seamOneOffset) <=
+            static_cast<std::int32_t>(wizard.sourceTailFrames[0U])) {
+            seamIndex = 0U;
+            offset = seamOneOffset;
+        } else if (std::abs(seamTwoOffset) <=
+                   static_cast<std::int32_t>(
+                       wizard.sourceTailFrames[1U])) {
+            seamIndex = 1U;
+            offset = seamTwoOffset;
+        } else {
+            return std::nullopt;
+        }
+
+        const auto& first = ReciprocalPanEffectiveCandidatePath(wizard, 0U);
+        const auto& second = ReciprocalPanEffectiveCandidatePath(wizard, 1U);
+        const std::int64_t firstHead = wizard.sourceTailFrames[0U];
+        const std::int64_t secondHead = wizard.sourceTailFrames[1U];
+        const std::int64_t firstFrame = seamIndex == 0U
+            ? firstHead + offset
+            : firstHead + oldA + offset;
+        const std::int64_t secondFrame = seamIndex == 0U
+            ? secondHead + oldB + offset
+            : secondHead + offset;
+        if (firstFrame < 0 || secondFrame < 0 ||
+            firstFrame > static_cast<std::int64_t>(
+                ReciprocalPanPathFrameCount(first)) ||
+            secondFrame > static_cast<std::int64_t>(
+                ReciprocalPanPathFrameCount(second))) {
+            return std::nullopt;
+        }
+        ReciprocalPanComparisonView comparison;
+        comparison.seamIndex = seamIndex;
+        comparison.cameraStates[0U] = invisible_places::camera::
+            EvaluateAnimationPath(
+                first,
+                static_cast<float>(firstFrame) / 30.0F).camera;
+        comparison.cameraStates[1U] = invisible_places::camera::
+            EvaluateAnimationPath(
+                second,
+                static_cast<float>(secondFrame) / 30.0F).camera;
+        comparison.cameraStates[0U].hasDepthOfField = false;
+        comparison.cameraStates[1U].hasDepthOfField = false;
+        comparison.triangleIndices = seamIndex == 0U
+            ? std::array<std::size_t, 2U>{0U, 1U}
+            : std::array<std::size_t, 2U>{3U, 2U};
+        for (std::size_t role = 0U; role < 2U; ++role) {
+            const auto& anchor = wizard.endpointTriangles[
+                comparison.triangleIndices[role]].patch.worldPoints[0U];
+            comparison.anchors[role] =
+                glm::vec3{anchor[0U], anchor[1U], anchor[2U]};
+        }
+        return comparison;
+    }
     if (wizard.stage == AnimationReciprocalPanWizardStage::Seam1Review) {
         seamIndex = 0U;
         offset = std::clamp(
@@ -44605,6 +44710,158 @@ void DrawReciprocalPanViewportOverlay(
         return point.x >= origin.x && point.x <= viewportMaximum.x &&
                point.y >= origin.y && point.y <= viewportMaximum.y;
     };
+    const bool previewKeyEditing =
+        wizard.stage == AnimationReciprocalPanWizardStage::Preview &&
+        wizard.candidate.has_value() && !wizard.previewLoopEnabled &&
+        !wizard.previewBaselineHold && !wizard.smoothingInProgress &&
+        !wizard.orbitInspectionActive &&
+        IsMouseOverRenderViewport(viewport) &&
+        !viewport.UiWantsMouseCapture();
+    if (wizard.stage == AnimationReciprocalPanWizardStage::Preview &&
+        wizard.candidate.has_value() && !wizard.previewLoopEnabled) {
+        const std::size_t role = static_cast<std::size_t>(
+            std::clamp(wizard.smoothingSelectedRole, 0, 1));
+        const auto& path = ReciprocalPanEffectiveCandidatePath(wizard, role);
+        const bool cameraTrack = wizard.smoothingEditTarget ==
+            AnimationEditTarget::Camera;
+        std::vector<std::optional<ImVec2>> projectedKeys(path.keys.size());
+        for (std::size_t keyIndex = 0U;
+             keyIndex < path.keys.size();
+             ++keyIndex) {
+            const auto& world = cameraTrack
+                ? path.keys[keyIndex].cameraPosition
+                : path.keys[keyIndex].focusPoint;
+            const auto projected = ProjectWorldPointBeyondViewport(
+                matrices,
+                viewport,
+                glm::vec3{world[0U], world[1U], world[2U]});
+            if (!projected.has_value() ||
+                !pointInsideViewport(projected->screen)) {
+                continue;
+            }
+            projectedKeys[keyIndex] = projected->screen;
+            const bool enabled = wizard.smoothingMovableKeyIds[role].contains(
+                path.keys[keyIndex].id);
+            const bool selected = path.keys[keyIndex].id ==
+                wizard.smoothingSelectedKeyId;
+            const ImU32 colour = enabled
+                ? IM_COL32(75, 235, 140, 245)
+                : IM_COL32(238, 185, 75, 225);
+            drawList->AddCircleFilled(
+                projected->screen,
+                selected ? 7.0F : 5.0F,
+                colour,
+                20);
+            drawList->AddCircle(
+                projected->screen,
+                selected ? 11.0F : 8.0F,
+                IM_COL32(0, 0, 0, 230),
+                20,
+                selected ? 2.5F : 1.5F);
+        }
+
+        const auto selectedKey = std::find_if(
+            path.keys.begin(),
+            path.keys.end(),
+            [&](const invisible_places::camera::AnimationPathKey& key) {
+                return key.id == wizard.smoothingSelectedKeyId;
+            });
+        const bool selectedEnabled = selectedKey != path.keys.end() &&
+            wizard.smoothingMovableKeyIds[role].contains(selectedKey->id);
+        const auto& io = ImGui::GetIO();
+        if (wizard.smoothingKeyGizmoDrag.kind !=
+            ManualFlowPathGizmoDragKind::None) {
+            wizard.smoothingKeyGizmoPointerCaptured = true;
+            wizard.viewportClickConsumed = true;
+            if (!io.MouseDown[ImGuiMouseButton_Left]) {
+                wizard.smoothingKeyGizmoDrag = {};
+                wizard.smoothingKeyGizmoPointerCaptured = false;
+            } else if (const auto nextPoint = UpdateViewportGizmoDrag(
+                           wizard.smoothingKeyGizmoDrag,
+                           matrices,
+                           viewport,
+                           io.MousePos);
+                       nextPoint.has_value() && selectedEnabled) {
+                MoveReciprocalPanSmoothingKey(
+                    runtimeState,
+                    role,
+                    wizard.smoothingSelectedKeyId,
+                    wizard.smoothingEditTarget,
+                    {nextPoint->x, nextPoint->y, nextPoint->z});
+            }
+        } else if (selectedEnabled && previewKeyEditing) {
+            const auto& world = cameraTrack
+                ? selectedKey->cameraPosition
+                : selectedKey->focusPoint;
+            const glm::vec3 worldPoint{world[0U], world[1U], world[2U]};
+            const auto gizmo = BuildAndDrawViewportGizmo(
+                drawList,
+                matrices,
+                viewport,
+                worldPoint);
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+                !ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                if (const auto hit = HitTestViewportGizmo(
+                        gizmo,
+                        io.MousePos);
+                    hit.has_value()) {
+                    if (const auto drag = BeginViewportGizmoDrag(
+                            hit.value(),
+                            gizmo,
+                            matrices,
+                            viewport,
+                            io.MousePos,
+                            worldPoint);
+                        drag.has_value()) {
+                        wizard.smoothingKeyGizmoDrag = drag.value();
+                        wizard.smoothingKeyGizmoPointerCaptured = true;
+                        wizard.viewportClickConsumed = true;
+                    }
+                }
+            }
+        }
+        if (previewKeyEditing &&
+            !wizard.smoothingKeyGizmoPointerCaptured &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            std::optional<std::size_t> hitKey;
+            float hitDistance = 11.0F;
+            for (std::size_t keyIndex = 0U;
+                 keyIndex < projectedKeys.size();
+                 ++keyIndex) {
+                if (!projectedKeys[keyIndex].has_value()) {
+                    continue;
+                }
+                const float distance = ScreenDistance(
+                    io.MousePos,
+                    projectedKeys[keyIndex].value());
+                if (distance < hitDistance) {
+                    hitDistance = distance;
+                    hitKey = keyIndex;
+                }
+            }
+            if (hitKey.has_value()) {
+                const auto& key = path.keys[hitKey.value()];
+                if (wizard.smoothingMovableKeyIds[role].contains(key.id)) {
+                    wizard.smoothingSelectedKeyId = key.id;
+                    wizard.previewScrubRole = static_cast<int>(role);
+                    wizard.previewFrameScrub = true;
+                    wizard.previewScrubFrames[role] =
+                        static_cast<std::uint32_t>(std::lround(
+                            invisible_places::camera::
+                                AnimationPathKeyNormalizedPosition(
+                                    path,
+                                    hitKey.value()) *
+                            static_cast<float>(
+                                ReciprocalPanPathFrameCount(path))));
+                    ShowReciprocalPanWizardCanonicalPose(runtimeState);
+                } else {
+                    wizard.smoothingError =
+                        "That yellow key is locked. Toggle it green on the A/B smoothing timeline before moving it.";
+                }
+                wizard.viewportClickConsumed = true;
+            }
+        }
+    }
     const auto indicatorAtViewportEdge = [&](ImVec2 point)
         -> std::optional<ImVec2> {
         if (pointInsideViewport(point)) {
@@ -44680,7 +44937,8 @@ void DrawReciprocalPanViewportOverlay(
                 comparison.value(),
                 comparisonMatrices.value(),
                 size.x,
-                wizard.splitAnchorOffsetPixels);
+                wizard.splitAnchorOffsetPixels[
+                    std::min<std::size_t>(comparison->seamIndex, 1U)]);
         const float centreX = origin.x + centreNormalized * size.x;
         drawList->PushClipRect(origin, viewportMaximum, true);
         drawList->AddLine(
@@ -51809,6 +52067,40 @@ void SetReciprocalPanWizardViewRole(
     ShowReciprocalPanWizardCanonicalPose(runtimeState);
 }
 
+void ShowReciprocalPanWizardLoopPose(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    auto& wizard = runtimeState->animationPanel.reciprocalPanWizard;
+    if (wizard.stage != AnimationReciprocalPanWizardStage::Preview ||
+        !wizard.candidate.has_value()) {
+        return;
+    }
+    const float position = WrappedReciprocalPanLoopPosition(
+        wizard.previewLoopPosition);
+    const std::size_t role = position < 0.0F ? 1U : 0U;
+    const float pathAmount = role == 1U
+        ? position + 1.0F
+        : position;
+    const auto& path = ReciprocalPanEffectiveCandidatePath(wizard, role);
+    const std::uint32_t originalFrames = ReciprocalPanPathFrameCount(
+        wizard.baselinePaths[role]);
+    const std::uint32_t headFrames = wizard.sourceTailFrames[role];
+    const std::uint32_t frame = std::min(
+        ReciprocalPanPathFrameCount(path),
+        headFrames + static_cast<std::uint32_t>(std::lround(
+            std::clamp(pathAmount, 0.0F, 1.0F) *
+            static_cast<float>(originalFrames))));
+    wizard.previewScrubRole = static_cast<int>(role);
+    wizard.previewScrubFrames[role] = frame;
+    ApplyAnimationEvaluation(
+        runtimeState,
+        path,
+        ReciprocalPanFramePosition(path, frame),
+        false);
+}
+
 void ShowReciprocalPanWizardCanonicalPose(
     PreviewRuntimeState* runtimeState) {
     if (runtimeState == nullptr ||
@@ -51884,6 +52176,10 @@ void ShowReciprocalPanWizardCanonicalPose(
     }
     if (wizard.stage == AnimationReciprocalPanWizardStage::Preview &&
         wizard.candidate.has_value()) {
+        if (wizard.previewLoopEnabled && !wizard.previewBaselineHold) {
+            ShowReciprocalPanWizardLoopPose(runtimeState);
+            return;
+        }
         if (wizard.previewFrameScrub) {
             const std::size_t role = static_cast<std::size_t>(
                 std::clamp(wizard.previewScrubRole, 0, 1));
@@ -52102,6 +52398,17 @@ void ResetReciprocalPanSmoothingResult(
     wizard->smoothingError.clear();
 }
 
+void InvalidateReciprocalPanSmoothingDiagnostics(
+    AnimationReciprocalPanWizardState* wizard) {
+    if (wizard == nullptr) {
+        return;
+    }
+    ++wizard->smoothingGeneration;
+    wizard->smoothingResult.reset();
+    wizard->smoothingInProgress = false;
+    wizard->smoothingError.clear();
+}
+
 std::unordered_set<std::string> ReciprocalPanMidpointKeyIds(
     const AnimationReciprocalPanWizardState& wizard,
     std::size_t role) {
@@ -52194,6 +52501,14 @@ void InitializeReciprocalPanSmoothingSelection(
         wizard->previewScrubFrames[role] =
             wizard->sourceTailFrames[role];
     }
+    wizard->smoothingSelectedRole = 0;
+    wizard->smoothingSelectedKeyId =
+        wizard->baselinePaths[0U].keys.empty()
+        ? std::string{}
+        : wizard->baselinePaths[0U].keys.front().id;
+    wizard->smoothingEditTarget = AnimationEditTarget::Camera;
+    wizard->smoothingKeyGizmoDrag = {};
+    wizard->smoothingKeyGizmoPointerCaptured = false;
     wizard->smoothingSelectionInitialized = true;
 }
 
@@ -52411,9 +52726,135 @@ std::vector<std::string> OrderedReciprocalPanSmoothingKeyIds(
     return ordered;
 }
 
+invisible_places::camera::AnimationLoopSmoothingOptions
+BuildReciprocalPanSmoothingOptions(
+    const AnimationReciprocalPanWizardState& wizard,
+    invisible_places::camera::AnimationLoopSpatialObjective objective) {
+    invisible_places::camera::AnimationLoopSmoothingOptions options;
+    options.maxEndMoveFraction = std::clamp(
+        wizard.smoothingMaxMovePercent / 100.0F,
+        0.01F,
+        0.25F);
+    options.useExplicitKeySelection = true;
+    if (wizard.candidate.has_value()) {
+        options.firstMovableKeyIds = OrderedReciprocalPanSmoothingKeyIds(
+            ReciprocalPanEffectiveCandidatePath(wizard, 0U),
+            wizard.smoothingMovableKeyIds[0U]);
+        options.secondMovableKeyIds = OrderedReciprocalPanSmoothingKeyIds(
+            ReciprocalPanEffectiveCandidatePath(wizard, 1U),
+            wizard.smoothingMovableKeyIds[1U]);
+    }
+    options.firstStartOverlapSeconds =
+        2.0F * static_cast<float>(wizard.sourceTailFrames[0U]) / 30.0F;
+    options.firstEndOverlapSeconds =
+        2.0F * static_cast<float>(wizard.sourceTailFrames[1U]) / 30.0F;
+    options.secondStartOverlapSeconds =
+        2.0F * static_cast<float>(wizard.sourceTailFrames[1U]) / 30.0F;
+    options.secondEndOverlapSeconds =
+        2.0F * static_cast<float>(wizard.sourceTailFrames[0U]) / 30.0F;
+    options.horizontalBlend = wizard.horizontalBlend;
+    options.panRight = wizard.panRight;
+    options.maxOptimizationSweeps = 16U;
+    options.minimumStepFraction = 0.0125F;
+    options.imageRotationMismatchWeight = 0.35F;
+    options.selectedNeighborhoodSmoothnessWeight = 1.50F;
+    options.spatialObjective = objective;
+    options.perceivedSpeedMode = wizard.smoothingSpeedMethod;
+    const auto midpointPairs = ReciprocalPanMidpointKeyPairs(wizard);
+    const auto addMidpointConstraint = [&](std::size_t seamIndex,
+                                           std::size_t firstTriangle,
+                                           std::size_t secondTriangle) {
+        const auto& [firstId, secondId] = midpointPairs[seamIndex];
+        if (!wizard.smoothingMovableKeyIds[0U].contains(firstId) ||
+            !wizard.smoothingMovableKeyIds[1U].contains(secondId)) {
+            return;
+        }
+        options.triangleAlignmentConstraints.push_back({
+            .firstKeyId = firstId,
+            .secondKeyId = secondId,
+            .firstPatch = wizard.endpointTriangles[firstTriangle].patch,
+            .secondPatch = wizard.endpointTriangles[secondTriangle].patch,
+        });
+    };
+    addMidpointConstraint(0U, 0U, 1U);  // A-start <-> B-end.
+    addMidpointConstraint(1U, 3U, 2U);  // A-end <-> B-start.
+    options.triangleAlignmentWeight = 8.0F;
+    return options;
+}
+
+bool MoveReciprocalPanSmoothingKey(
+    PreviewRuntimeState* runtimeState,
+    std::size_t role,
+    std::string_view keyId,
+    AnimationEditTarget target,
+    const std::array<float, 3>& position) {
+    if (runtimeState == nullptr || role > 1U || keyId.empty()) {
+        return false;
+    }
+    auto& wizard = runtimeState->animationPanel.reciprocalPanWizard;
+    if (wizard.stage != AnimationReciprocalPanWizardStage::Preview ||
+        !wizard.candidate.has_value() || wizard.smoothingInProgress) {
+        return false;
+    }
+    std::array<AnimationPath, 2U> working{
+        ReciprocalPanEffectiveCandidatePath(wizard, 0U),
+        ReciprocalPanEffectiveCandidatePath(wizard, 1U),
+    };
+    const auto options = BuildReciprocalPanSmoothingOptions(
+        wizard,
+        wizard.smoothingObjective);
+    const auto result = invisible_places::camera::
+        MoveAnimationLoopSelectedKeySpatially(
+            &working[0U],
+            &working[1U],
+            options,
+            role,
+            keyId,
+            target == AnimationEditTarget::Camera,
+            position);
+    if (!result.succeeded) {
+        wizard.smoothingError = result.errorMessage;
+        return false;
+    }
+    if (!result.changed) {
+        return true;
+    }
+    ++wizard.smoothingGeneration;
+    wizard.smoothedCandidates = std::move(working);
+    wizard.smoothingResult.reset();
+    wizard.smoothingError.clear();
+    wizard.smoothingSelectedRole = static_cast<int>(role);
+    wizard.smoothingSelectedKeyId = std::string{keyId};
+    wizard.previewScrubRole = static_cast<int>(role);
+    const auto& editedPath = wizard.smoothedCandidates.value()[role];
+    const auto keyIt = std::find_if(
+        editedPath.keys.begin(),
+        editedPath.keys.end(),
+        [&](const invisible_places::camera::AnimationPathKey& key) {
+            return key.id == keyId;
+        });
+    if (keyIt != editedPath.keys.end()) {
+        const std::size_t keyIndex = static_cast<std::size_t>(
+            keyIt - editedPath.keys.begin());
+        wizard.previewScrubFrames[role] = static_cast<std::uint32_t>(
+            std::lround(
+                invisible_places::camera::AnimationPathKeyNormalizedPosition(
+                    editedPath,
+                    keyIndex) *
+                static_cast<float>(ReciprocalPanPathFrameCount(editedPath))));
+    }
+    runtimeState->animationPanel.preparedPathCache = {};
+    runtimeState->animationPanel.motionStatsCache = {};
+    runtimeState->animationPanel.perceivedFlowCache = {};
+    runtimeState->previewRenderStateSignatureValid = false;
+    return true;
+}
+
 bool StartReciprocalPanTransitionSmoothing(
     PreviewRuntimeState* runtimeState,
-    float currentAspectRatio) {
+    float currentAspectRatio,
+    invisible_places::camera::AnimationLoopSpatialObjective objective =
+        invisible_places::camera::AnimationLoopSpatialObjective::Balanced) {
     if (runtimeState == nullptr) {
         return false;
     }
@@ -52490,8 +52931,8 @@ bool StartReciprocalPanTransitionSmoothing(
         return false;
     }
     std::array<AnimationPath, 2U> candidates{
-        wizard.candidate->firstCandidate,
-        wizard.candidate->secondCandidate,
+        ReciprocalPanEffectiveCandidatePath(wizard, 0U),
+        ReciprocalPanEffectiveCandidatePath(wizard, 1U),
     };
     const std::array<std::vector<std::string>, 2U> movableIds{
         OrderedReciprocalPanSmoothingKeyIds(
@@ -52501,46 +52942,10 @@ bool StartReciprocalPanTransitionSmoothing(
             candidates[1U],
             wizard.smoothingMovableKeyIds[1U]),
     };
-    invisible_places::camera::AnimationLoopSmoothingOptions options;
-    options.maxEndMoveFraction = std::clamp(
-        wizard.smoothingMaxMovePercent / 100.0F,
-        0.01F,
-        0.25F);
-    options.useExplicitKeySelection = true;
+    auto options = BuildReciprocalPanSmoothingOptions(wizard, objective);
     options.firstMovableKeyIds = movableIds[0U];
     options.secondMovableKeyIds = movableIds[1U];
-    options.firstStartOverlapSeconds =
-        2.0F * static_cast<float>(wizard.sourceTailFrames[0U]) / 30.0F;
-    options.firstEndOverlapSeconds =
-        2.0F * static_cast<float>(wizard.sourceTailFrames[1U]) / 30.0F;
-    options.secondStartOverlapSeconds =
-        2.0F * static_cast<float>(wizard.sourceTailFrames[1U]) / 30.0F;
-    options.secondEndOverlapSeconds =
-        2.0F * static_cast<float>(wizard.sourceTailFrames[0U]) / 30.0F;
-    options.horizontalBlend = wizard.horizontalBlend;
-    options.panRight = wizard.panRight;
-    options.maxOptimizationSweeps = 16U;
-    options.minimumStepFraction = 0.0125F;
-    options.imageRotationMismatchWeight = 0.35F;
-    options.selectedNeighborhoodSmoothnessWeight = 1.50F;
-    const auto addMidpointConstraint = [&](std::size_t seamIndex,
-                                           std::size_t firstTriangle,
-                                           std::size_t secondTriangle) {
-        const auto& [firstId, secondId] = midpointPairs[seamIndex];
-        if (!wizard.smoothingMovableKeyIds[0U].contains(firstId) ||
-            !wizard.smoothingMovableKeyIds[1U].contains(secondId)) {
-            return;
-        }
-        options.triangleAlignmentConstraints.push_back({
-            .firstKeyId = firstId,
-            .secondKeyId = secondId,
-            .firstPatch = wizard.endpointTriangles[firstTriangle].patch,
-            .secondPatch = wizard.endpointTriangles[secondTriangle].patch,
-        });
-    };
-    addMidpointConstraint(0U, 0U, 1U);  // A-start <-> B-end.
-    addMidpointConstraint(1U, 3U, 2U);  // A-end <-> B-start.
-    options.triangleAlignmentWeight = 8.0F;
+    wizard.smoothingObjective = objective;
 
     const std::uint64_t generation = ++wizard.smoothingGeneration;
     job.activeGeneration = generation;
@@ -52581,7 +52986,6 @@ bool StartReciprocalPanTransitionSmoothing(
             shared->completed = true;
         });
     wizard.smoothingInProgress = true;
-    wizard.smoothedCandidates.reset();
     wizard.smoothingResult.reset();
     wizard.smoothingError.clear();
     return true;
@@ -52632,8 +53036,8 @@ void PollAnimationReciprocalPanSmoothingJob(
         return;
     }
     const std::array<const AnimationPath*, 2U> rawCandidates{
-        &wizard.candidate->firstCandidate,
-        &wizard.candidate->secondCandidate,
+        &ReciprocalPanEffectiveCandidatePath(wizard, 0U),
+        &ReciprocalPanEffectiveCandidatePath(wizard, 1U),
     };
     for (std::size_t role = 0U; role < 2U; ++role) {
         if (AnimationPathMotionFingerprint(*rawCandidates[role]) !=
@@ -52647,7 +53051,6 @@ void PollAnimationReciprocalPanSmoothingJob(
     }
     wizard.smoothingResult = completed->result;
     if (!completed->result.succeeded || !completed->result.changed) {
-        wizard.smoothedCandidates.reset();
         wizard.smoothingError = completed->result.errorMessage.empty()
             ? "No selected-key movement improved both seam transitions."
             : completed->result.errorMessage;
@@ -53946,6 +54349,161 @@ void AdvanceReciprocalPanWizard(
     ShowReciprocalPanWizardCanonicalPose(runtimeState);
 }
 
+void DrawReciprocalPanSpeedGraphs(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    const auto& wizard =
+        runtimeState->animationPanel.reciprocalPanWizard;
+    if (!wizard.candidate.has_value()) {
+        return;
+    }
+    const std::size_t role = static_cast<std::size_t>(
+        std::clamp(wizard.previewScrubRole, 0, 1));
+    const auto& path = ReciprocalPanEffectiveCandidatePath(wizard, role);
+    const auto& samples = CachedAnimationPathPerceivedFlow(
+        &runtimeState->animationPanel,
+        path);
+    if (samples.size() < 2U) {
+        return;
+    }
+    ImGui::Text(
+        "%s screen motion (current loop half)",
+        role == 0U ? "A" : "B");
+    const std::array<const char*, 4U> labels{
+        "Perceived speed",
+        "Centre X velocity",
+        "Centre Y velocity",
+        "Image rotation deg/s",
+    };
+    const std::array<ImU32, 4U> colours{
+        IM_COL32(235, 205, 95, 245),
+        IM_COL32(75, 180, 255, 245),
+        IM_COL32(90, 225, 150, 245),
+        IM_COL32(235, 115, 210, 245),
+    };
+    const auto sampleValue = [](const auto& sample, std::size_t row) {
+        return row == 0U ? sample.screenSpeed
+            : row == 1U ? sample.middleScreenVelocity[0U]
+            : row == 2U ? sample.middleScreenVelocity[1U]
+                        : sample.imageRotationDegreesPerSecond;
+    };
+    const float totalFrames = static_cast<float>(std::max<std::uint32_t>(
+        ReciprocalPanPathFrameCount(path),
+        1U));
+    const float firstMidpoint =
+        static_cast<float>(wizard.sourceTailFrames[role]) / totalFrames;
+    const float secondMidpoint =
+        static_cast<float>(
+            wizard.sourceTailFrames[role] +
+            ReciprocalPanPathFrameCount(wizard.baselinePaths[role])) /
+        totalFrames;
+    const float playhead = static_cast<float>(std::min(
+        wizard.previewScrubFrames[role],
+        ReciprocalPanPathFrameCount(path))) / totalFrames;
+    for (std::size_t row = 0U; row < labels.size(); ++row) {
+        float minimum = row == 0U
+            ? 0.0F
+            : std::numeric_limits<float>::infinity();
+        float maximum = row == 0U
+            ? 0.0F
+            : -std::numeric_limits<float>::infinity();
+        for (const auto& sample : samples) {
+            const float value = sampleValue(sample, row);
+            if (std::isfinite(value)) {
+                minimum = std::min(minimum, value);
+                maximum = std::max(maximum, value);
+            }
+        }
+        if (!std::isfinite(minimum) || !std::isfinite(maximum)) {
+            minimum = -1.0F;
+            maximum = 1.0F;
+        }
+        if (maximum - minimum < 1.0e-6F) {
+            const float padding = std::max(
+                std::abs(maximum) * 0.1F,
+                1.0e-3F);
+            minimum -= padding;
+            maximum += padding;
+        }
+        ImGui::PushID(static_cast<int>(row));
+        const ImVec2 plotMinimum = ImGui::GetCursorScreenPos();
+        const ImVec2 plotSize{
+            std::max(120.0F, ImGui::GetContentRegionAvail().x),
+            42.0F,
+        };
+        ImGui::InvisibleButton("##ReciprocalPanSpeedGraph", plotSize);
+        const ImVec2 plotMaximum{
+            plotMinimum.x + plotSize.x,
+            plotMinimum.y + plotSize.y,
+        };
+        auto* drawList = ImGui::GetWindowDrawList();
+        drawList->AddRectFilled(
+            plotMinimum,
+            plotMaximum,
+            IM_COL32(18, 22, 24, 165),
+            2.0F);
+        const auto yForValue = [&](float value) {
+            const float normalized = std::clamp(
+                (value - minimum) / (maximum - minimum),
+                0.0F,
+                1.0F);
+            return std::lerp(
+                plotMaximum.y - 3.0F,
+                plotMinimum.y + 3.0F,
+                normalized);
+        };
+        ImVec2 previous{
+            plotMinimum.x,
+            yForValue(sampleValue(samples.front(), row)),
+        };
+        for (std::size_t index = 1U; index < samples.size(); ++index) {
+            const ImVec2 current{
+                std::lerp(
+                    plotMinimum.x,
+                    plotMaximum.x,
+                    samples[index].normalizedPosition),
+                yForValue(sampleValue(samples[index], row)),
+            };
+            drawList->AddLine(previous, current, colours[row], 1.5F);
+            previous = current;
+        }
+        for (const float midpoint : {firstMidpoint, secondMidpoint}) {
+            const float x = std::lerp(
+                plotMinimum.x,
+                plotMaximum.x,
+                std::clamp(midpoint, 0.0F, 1.0F));
+            drawList->AddLine(
+                ImVec2{x, plotMinimum.y},
+                ImVec2{x, plotMaximum.y},
+                IM_COL32(90, 235, 235, 185),
+                1.25F);
+        }
+        const float playheadX = std::lerp(
+            plotMinimum.x,
+            plotMaximum.x,
+            std::clamp(playhead, 0.0F, 1.0F));
+        drawList->AddLine(
+            ImVec2{playheadX, plotMinimum.y},
+            ImVec2{playheadX, plotMaximum.y},
+            IM_COL32(255, 255, 255, 225),
+            1.0F);
+        drawList->AddText(
+            ImVec2{plotMinimum.x + 4.0F, plotMinimum.y + 2.0F},
+            colours[row],
+            labels[row]);
+        drawList->AddRect(
+            plotMinimum,
+            plotMaximum,
+            ImGui::GetColorU32(ImGuiCol_Border),
+            2.0F);
+        ImGui::PopID();
+    }
+    ImGui::TextDisabled(
+        "Cyan lines are the paired 50%% triangle poses; white is the current loop position.");
+}
+
 void DrawReciprocalPanTransitionSmoothingControls(
     PreviewRuntimeState* runtimeState,
     float aspectRatio) {
@@ -53974,13 +54532,13 @@ void DrawReciprocalPanTransitionSmoothingControls(
             wizard.smoothingMovableKeyIds[role] =
                 ReciprocalPanGeneratedKeyIds(wizard, role);
         }
-        ResetReciprocalPanSmoothingResult(&wizard);
+        InvalidateReciprocalPanSmoothingDiagnostics(&wizard);
         ShowReciprocalPanWizardCanonicalPose(runtimeState);
     }
     ImGui::SameLine();
     if (ImGui::Button("Clear")) {
         wizard.smoothingMovableKeyIds = {};
-        ResetReciprocalPanSmoothingResult(&wizard);
+        InvalidateReciprocalPanSmoothingDiagnostics(&wizard);
         ShowReciprocalPanWizardCanonicalPose(runtimeState);
     }
 
@@ -54014,9 +54572,9 @@ void DrawReciprocalPanTransitionSmoothingControls(
     ImGui::TextDisabled(
         "Apply Both creates or updates the reciprocal A/B link with these durations.");
     for (std::size_t role = 0U; role < 2U; ++role) {
-        const auto& candidate = role == 0U
-            ? wizard.candidate->firstCandidate
-            : wizard.candidate->secondCandidate;
+        const auto& candidate = ReciprocalPanEffectiveCandidatePath(
+            wizard,
+            role);
         const auto midpoint = ReciprocalPanMidpointKeyIds(wizard, role);
         const auto generated = ReciprocalPanGeneratedKeyIds(wizard, role);
         const auto* movement =
@@ -54041,8 +54599,8 @@ void DrawReciprocalPanTransitionSmoothingControls(
             candidate,
             invisible_places::camera::AnimationPathDurationSeconds(
                 role == 0U
-                    ? wizard.candidate->secondCandidate
-                    : wizard.candidate->firstCandidate),
+                    ? ReciprocalPanEffectiveCandidatePath(wizard, 1U)
+                    : ReciprocalPanEffectiveCandidatePath(wizard, 0U)),
             -1,
             nullptr,
             startOverlaps[role],
@@ -54094,7 +54652,7 @@ void DrawReciprocalPanTransitionSmoothingControls(
         }
     }
     if (selectionChanged) {
-        ResetReciprocalPanSmoothingResult(&wizard);
+        InvalidateReciprocalPanSmoothingDiagnostics(&wizard);
         runtimeState->animationPanel.preparedPathCache = {};
         runtimeState->previewRenderStateSignatureValid = false;
         ShowReciprocalPanWizardCanonicalPose(runtimeState);
@@ -54113,16 +54671,196 @@ void DrawReciprocalPanTransitionSmoothingControls(
             25.0F,
             "%.0f%% of adjacent travel")) {
         wizard.smoothingMaxMovePercent = maximumMove;
-        ResetReciprocalPanSmoothingResult(&wizard);
+        InvalidateReciprocalPanSmoothingDiagnostics(&wizard);
         ShowReciprocalPanWizardCanonicalPose(runtimeState);
     }
     ImGui::BeginDisabled(selectedCount == 0U);
-    if (ImGui::Button("Smooth selected transitions")) {
-        StartReciprocalPanTransitionSmoothing(
-            runtimeState,
-            aspectRatio);
+    using LoopObjective = invisible_places::camera::
+        AnimationLoopSpatialObjective;
+    const auto runSpatialPass = [&](const char* label,
+                                    LoopObjective objective) {
+        if (ImGui::Button(label)) {
+            StartReciprocalPanTransitionSmoothing(
+                runtimeState,
+                aspectRatio,
+                objective);
+        }
+    };
+    runSpatialPass("Smooth selected", LoopObjective::Balanced);
+    ImGui::SameLine();
+    runSpatialPass(
+        "Equalize X velocity",
+        LoopObjective::EqualizeScreenXVelocity);
+    runSpatialPass(
+        "Equalize Y velocity",
+        LoopObjective::EqualizeScreenYVelocity);
+    ImGui::SameLine();
+    runSpatialPass(
+        "Minimize rotation",
+        LoopObjective::MinimizeImageRotation);
+    runSpatialPass(
+        "Equalize X + rotation",
+        LoopObjective::EqualizeScreenXAndRotation);
+
+    using SpeedMode = invisible_places::camera::
+        AnimationSpeedEqualizationMode;
+    constexpr std::array<SpeedMode, 3U> speedModes{
+        SpeedMode::PerceivedMotion,
+        SpeedMode::CenterScreenPan,
+        SpeedMode::StabilizedPan,
+    };
+    constexpr std::array<const char*, 3U> speedModeNames{
+        "Perceived Motion",
+        "Centre-Screen Pan",
+        "Stabilized Pan",
+    };
+    const auto speedModeIt = std::find(
+        speedModes.begin(),
+        speedModes.end(),
+        wizard.smoothingSpeedMethod);
+    std::size_t speedModeIndex = speedModeIt == speedModes.end()
+        ? 0U
+        : static_cast<std::size_t>(speedModeIt - speedModes.begin());
+    ImGui::SetNextItemWidth(230.0F);
+    if (ImGui::BeginCombo(
+            "Spatial speed method",
+            speedModeNames[speedModeIndex])) {
+        for (std::size_t index = 0U; index < speedModes.size(); ++index) {
+            if (ImGui::Selectable(
+                    speedModeNames[index],
+                    index == speedModeIndex)) {
+                wizard.smoothingSpeedMethod = speedModes[index];
+                speedModeIndex = index;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    runSpatialPass(
+        "Equalize perceived speed",
+        LoopObjective::EqualizePerceivedSpeed);
+    ImGui::EndDisabled();
+    ImGui::TextDisabled(
+        "These passes move only enabled green camera/focus controls. Segment Frames, duration weights, and every amber locked key remain unchanged.");
+
+    ImGui::SeparatorText("Manual green-key adjustment");
+    if (ImGui::RadioButton(
+            "Edit A",
+            wizard.smoothingSelectedRole == 0)) {
+        wizard.smoothingSelectedRole = 0;
+        wizard.smoothingSelectedKeyId.clear();
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton(
+            "Edit B",
+            wizard.smoothingSelectedRole == 1)) {
+        wizard.smoothingSelectedRole = 1;
+        wizard.smoothingSelectedKeyId.clear();
+    }
+    const std::size_t editRole = static_cast<std::size_t>(
+        std::clamp(wizard.smoothingSelectedRole, 0, 1));
+    const auto& editPath = ReciprocalPanEffectiveCandidatePath(
+        wizard,
+        editRole);
+    std::vector<std::size_t> editableIndices;
+    for (std::size_t keyIndex = 0U;
+         keyIndex < editPath.keys.size();
+         ++keyIndex) {
+        if (wizard.smoothingMovableKeyIds[editRole].contains(
+                editPath.keys[keyIndex].id)) {
+            editableIndices.push_back(keyIndex);
+        }
+    }
+    const auto selectedEditable = std::find_if(
+        editableIndices.begin(),
+        editableIndices.end(),
+        [&](std::size_t keyIndex) {
+            return editPath.keys[keyIndex].id ==
+                wizard.smoothingSelectedKeyId;
+        });
+    if (selectedEditable == editableIndices.end()) {
+        wizard.smoothingSelectedKeyId = editableIndices.empty()
+            ? std::string{}
+            : editPath.keys[editableIndices.front()].id;
+    }
+    const auto selectedKeyIt = std::find_if(
+        editPath.keys.begin(),
+        editPath.keys.end(),
+        [&](const invisible_places::camera::AnimationPathKey& key) {
+            return key.id == wizard.smoothingSelectedKeyId;
+        });
+    const std::size_t selectedKeyIndex =
+        selectedKeyIt == editPath.keys.end()
+        ? editPath.keys.size()
+        : static_cast<std::size_t>(selectedKeyIt - editPath.keys.begin());
+    std::string selectedKeyLabel = selectedKeyIndex < editPath.keys.size()
+        ? "Key " + std::to_string(selectedKeyIndex + 1U)
+        : "No green keys";
+    ImGui::BeginDisabled(editableIndices.empty());
+    if (ImGui::BeginCombo("Green key", selectedKeyLabel.c_str())) {
+        for (const auto keyIndex : editableIndices) {
+            const bool selected = keyIndex == selectedKeyIndex;
+            const std::string label =
+                "Key " + std::to_string(keyIndex + 1U) +
+                (ReciprocalPanMidpointKeyIds(wizard, editRole).contains(
+                     editPath.keys[keyIndex].id)
+                     ? " (paired 50% pose)"
+                     : "");
+            if (ImGui::Selectable(label.c_str(), selected)) {
+                wizard.smoothingSelectedKeyId =
+                    editPath.keys[keyIndex].id;
+                wizard.previewLoopEnabled = false;
+                wizard.previewLoopPlaying = false;
+                wizard.previewFrameScrub = true;
+                wizard.previewScrubRole = static_cast<int>(editRole);
+                wizard.previewScrubFrames[editRole] =
+                    static_cast<std::uint32_t>(std::lround(
+                        invisible_places::camera::
+                            AnimationPathKeyNormalizedPosition(
+                                editPath,
+                                keyIndex) *
+                        static_cast<float>(
+                            ReciprocalPanPathFrameCount(editPath))));
+                ShowReciprocalPanWizardCanonicalPose(runtimeState);
+            }
+        }
+        ImGui::EndCombo();
+    }
+    if (ImGui::RadioButton(
+            "Camera control",
+            wizard.smoothingEditTarget == AnimationEditTarget::Camera)) {
+        wizard.smoothingEditTarget = AnimationEditTarget::Camera;
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton(
+            "Focus control",
+            wizard.smoothingEditTarget == AnimationEditTarget::Focus)) {
+        wizard.smoothingEditTarget = AnimationEditTarget::Focus;
+    }
+    if (selectedKeyIndex < editPath.keys.size()) {
+        auto position = wizard.smoothingEditTarget ==
+                AnimationEditTarget::Camera
+            ? editPath.keys[selectedKeyIndex].cameraPosition
+            : editPath.keys[selectedKeyIndex].focusPoint;
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::DragFloat3(
+                "World XYZ##ReciprocalPanManualKey",
+                position.data(),
+                0.01F,
+                0.0F,
+                0.0F,
+                "%.4f")) {
+            MoveReciprocalPanSmoothingKey(
+                runtimeState,
+                editRole,
+                wizard.smoothingSelectedKeyId,
+                wizard.smoothingEditTarget,
+                position);
+        }
     }
     ImGui::EndDisabled();
+    ImGui::TextDisabled(
+        "Moving either green 50%% key moves its counterpart through the captured triangle transform, so all three feature nodes remain registered. Continue with another spatial pass to iterate.");
     if (wizard.smoothedCandidates.has_value()) {
         ImGui::SameLine();
         if (ImGui::Button("Reset to triangle fit")) {
@@ -54175,10 +54913,55 @@ void DrawReciprocalPanTransitionSmoothingControls(
             result.maxFocusMove);
     }
 
+    ImGui::SeparatorText("Loop and split review");
+    if (ImGui::Checkbox(
+            "Signed full-cycle preview",
+            &wizard.previewLoopEnabled)) {
+        wizard.previewLoopPlaying = false;
+        wizard.previewFrameScrub = false;
+        wizard.previewLoopPosition = WrappedReciprocalPanLoopPosition(
+            wizard.previewLoopPosition);
+        ShowReciprocalPanWizardCanonicalPose(runtimeState);
+    }
+    if (wizard.previewLoopEnabled) {
+        if (ImGui::Button(
+                wizard.previewLoopPlaying ? "Pause loop" : "Play loop")) {
+            wizard.previewLoopPlaying = !wizard.previewLoopPlaying;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("Space toggles playback");
+        float loopPosition = wizard.previewLoopPosition;
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::DragFloat(
+                "Loop position##ReciprocalPanSignedLoop",
+                &loopPosition,
+                0.0025F,
+                0.0F,
+                0.0F,
+                "%+.3f")) {
+            wizard.previewLoopPlaying = false;
+            wizard.previewLoopPosition = loopPosition;
+            ShowReciprocalPanWizardLoopPose(runtimeState);
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            wizard.previewLoopPosition =
+                WrappedReciprocalPanLoopPosition(
+                    wizard.previewLoopPosition);
+            ShowReciprocalPanWizardLoopPose(runtimeState);
+        }
+        ImGui::TextDisabled(
+            "-1/1 = A-end <-> B-start; 0 = B-end <-> A-start. Drag through repeated cycles; release wraps to the closest equivalent position.");
+    }
+    DrawReciprocalPanSpeedGraphs(runtimeState);
+
     ImGui::SeparatorText("Full-path review");
     if (ImGui::Checkbox(
             "Scrub full candidate",
             &wizard.previewFrameScrub)) {
+        if (wizard.previewFrameScrub) {
+            wizard.previewLoopEnabled = false;
+            wizard.previewLoopPlaying = false;
+        }
         ShowReciprocalPanWizardCanonicalPose(runtimeState);
     }
     if (wizard.previewFrameScrub) {
@@ -54225,6 +55008,31 @@ void DrawReciprocalPanWizard(
             runtimeState,
             "Cancelled Reciprocal Pan Extension; the launch view was restored.");
         return;
+    }
+    if (wizard.stage == AnimationReciprocalPanWizardStage::Preview &&
+        wizard.candidate.has_value()) {
+        const auto& io = ImGui::GetIO();
+        if (!io.KeyCtrl && !io.KeyAlt && !io.KeyShift && !io.KeySuper &&
+            !io.WantTextInput && !ImGui::IsAnyItemActive() &&
+            ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
+            wizard.previewLoopEnabled = true;
+            wizard.previewLoopPlaying = !wizard.previewLoopPlaying;
+            wizard.previewFrameScrub = false;
+        }
+        if (wizard.previewLoopEnabled && wizard.previewLoopPlaying) {
+            const float wrapped = WrappedReciprocalPanLoopPosition(
+                wizard.previewLoopPosition);
+            const std::size_t activeRole = wrapped < 0.0F ? 1U : 0U;
+            const float halfDurationSeconds = std::max(
+                static_cast<float>(ReciprocalPanPathFrameCount(
+                    wizard.baselinePaths[activeRole])) /
+                    30.0F,
+                1.0F / 30.0F);
+            wizard.previewLoopPosition =
+                WrappedReciprocalPanLoopPosition(
+                    wrapped + io.DeltaTime / halfDurationSeconds);
+            ShowReciprocalPanWizardLoopPose(runtimeState);
+        }
     }
     struct ScopedWizardTextWrap {
         ScopedWizardTextWrap() { ImGui::PushTextWrapPos(0.0F); }
@@ -54295,7 +55103,8 @@ void DrawReciprocalPanWizard(
     const bool comparisonControlsStage =
         seamReviewStage ||
         wizard.stage ==
-            AnimationReciprocalPanWizardStage::EditCorrespondences;
+            AnimationReciprocalPanWizardStage::EditCorrespondences ||
+        wizard.stage == AnimationReciprocalPanWizardStage::Preview;
     if (comparisonControlsStage) {
         if (ImGui::Checkbox(
                 "Feature-following A/B split",
@@ -54306,15 +55115,41 @@ void DrawReciprocalPanWizard(
             const float viewportWidth = std::max(
                 1.0F,
                 CurrentUiViewportSize(viewport).x);
-            ImGui::TextDisabled(
-                "Split offset from tracked anchors (pixels)");
-            ImGui::SetNextItemWidth(-FLT_MIN);
-            ImGui::SliderFloat(
-                "##ReciprocalPanSplitOffset",
-                &wizard.splitAnchorOffsetPixels,
-                -viewportWidth,
-                viewportWidth,
-                "%+.0f px");
+            if (wizard.stage == AnimationReciprocalPanWizardStage::Preview) {
+                for (std::size_t seam = 0U; seam < 2U; ++seam) {
+                    ImGui::PushID(static_cast<int>(seam));
+                    ImGui::TextDisabled(
+                        seam == 0U
+                            ? "A-start / B-end split offset"
+                            : "A-end / B-start split offset");
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    ImGui::SliderFloat(
+                        "##ReciprocalPanSplitOffset",
+                        &wizard.splitAnchorOffsetPixels[seam],
+                        -viewportWidth,
+                        viewportWidth,
+                        "%+.0f px");
+                    ImGui::PopID();
+                }
+            } else {
+                const std::size_t seam =
+                    wizard.stage ==
+                            AnimationReciprocalPanWizardStage::Seam2Review ||
+                        (wizard.stage == AnimationReciprocalPanWizardStage::
+                                             EditCorrespondences &&
+                         wizard.selectedTriangleIndex >= 2)
+                    ? 1U
+                    : 0U;
+                ImGui::TextDisabled(
+                    "Split offset from tracked anchors (pixels)");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                ImGui::SliderFloat(
+                    "##ReciprocalPanSplitOffset",
+                    &wizard.splitAnchorOffsetPixels[seam],
+                    -viewportWidth,
+                    viewportWidth,
+                    "%+.0f px");
+            }
             if (ImGui::Button(
                     wizard.splitAOnLeft
                         ? "Swap sides: put B on left"
@@ -98955,7 +99790,10 @@ int Application::Run(ApplicationRunOptions options) const {
                                 comparison.value(),
                                 comparisonMatrices.value(),
                                 uiViewportWidth,
-                                wizard.splitAnchorOffsetPixels);
+                                wizard.splitAnchorOffsetPixels[
+                                    std::min<std::size_t>(
+                                        comparison->seamIndex,
+                                        1U)]);
                         viewport->SetTemporalCameraOverlay(
                             true,
                             renderedRole,
