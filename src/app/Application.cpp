@@ -243,6 +243,11 @@ constexpr std::size_t kAnimationMatchingFrameGhostSourceSampleLimit =
     2'000'000U;
 constexpr std::size_t kAnimationMatchingFrameGhostGridWidth = 640U;
 constexpr std::size_t kAnimationMatchingFrameGhostGridHeight = 360U;
+// Reciprocal-pan anchor placement is an infrequent, explicit click, so it can
+// afford a substantially denser CPU pass than the always-resident 65k pivot
+// cache used by ordinary camera navigation. The cap is shared across the
+// selected scene's roles to keep click latency bounded on full Scene3 clouds.
+constexpr std::size_t kReciprocalPanRayPickSampleLimit = 3'000'000U;
 constexpr std::uint64_t kWaterSourcePickSampleLimit = 3'000'000ULL;
 constexpr std::size_t kWaterSeepageSurfaceGuideSampleLimit = 220'000U;
 constexpr float kWaterSourcePickRadiusPixels = 22.0F;
@@ -10252,60 +10257,126 @@ ResolveReciprocalPanSurfacePatch(
     const float tanHalfFov = std::tan(
         runtimeState.camera.FovDegrees() * kPi / 360.0F);
     std::vector<PivotCandidate> candidates;
-    candidates.reserve(256U);
+    candidates.reserve(4'096U);
+
+    const auto belongsToCommonScene = [&](const auto& session) {
+        return IsReciprocalPanPickSession(runtimeState, session) &&
+               NormalizePathKey(AssociationPathForSession(session)) ==
+                   commonSceneKey;
+    };
+    const auto hasResidentPositions = [](const auto& session) {
+        return session.offlinePointCloud != nullptr &&
+               !session.offlinePointCloud->positions.empty();
+    };
+
+    // Prefer the scene's CPU analysis payload. It is normally the most
+    // complete geometry and remains independent of display LOD. If it is not
+    // resident, use the visible committed display payload; GPU-only sessions
+    // retain the legacy pivot-sample fallback below.
+    std::vector<const PreviewLayerSession*> denseSessions;
     for (const auto& session : runtimeState.sessions) {
-        if (!IsReciprocalPanPickSession(runtimeState, session) ||
-            NormalizePathKey(AssociationPathForSession(session)) !=
-                commonSceneKey) {
-            continue;
+        if (belongsToCommonScene(session) &&
+            IsCpuReadyAnalysisPointCloudSource(session) &&
+            hasResidentPositions(session)) {
+            denseSessions.push_back(&session);
         }
-        for (const auto& sample : session.pivotSamples) {
-            const glm::vec3 worldPoint{sample.x, sample.y, sample.z};
-            const auto projected = ProjectWorldPoint(
-                matrices,
-                viewport,
-                worldPoint);
-            if (!projected.has_value()) {
+    }
+    if (denseSessions.empty()) {
+        for (const auto& session : runtimeState.sessions) {
+            if (belongsToCommonScene(session) &&
+                IsRenderablePointCloudSource(runtimeState, session) &&
+                hasResidentPositions(session)) {
+                denseSessions.push_back(&session);
+            }
+        }
+    }
+
+    const auto collectCandidate = [&](const PreviewLayerSession& session,
+                                      const auto& sample) {
+        const glm::vec3 worldPoint{sample.x, sample.y, sample.z};
+        const auto projected = ProjectWorldPoint(
+            matrices,
+            viewport,
+            worldPoint);
+        if (!projected.has_value()) {
+            return;
+        }
+        const glm::vec3 fromOrigin = worldPoint - ray->origin;
+        const float alongRay = glm::dot(fromOrigin, ray->direction);
+        if (alongRay <= runtimeState.camera.NearPlane()) {
+            return;
+        }
+        const float dx = projected->screen.x - screenPoint.x;
+        const float dy = projected->screen.y - screenPoint.y;
+        const float screenDistance = std::sqrt(dx * dx + dy * dy);
+        if (screenDistance > kPickRadiusPixels) {
+            return;
+        }
+        const float worldUnitsPerPixel =
+            2.0F * std::max(0.001F, alongRay) * tanHalfFov /
+            viewportHeight;
+        const float pickRadiusWorld = std::max(
+            0.0001F,
+            worldUnitsPerPixel * kPickRadiusPixels);
+        const glm::vec3 closest =
+            ray->origin + ray->direction * alongRay;
+        const float rayDistance = glm::length(worldPoint - closest);
+        if (rayDistance > pickRadiusWorld) {
+            return;
+        }
+        candidates.push_back({
+            .point = worldPoint,
+            .sceneRole = session.sceneRole,
+            .rayDistance = rayDistance,
+            .alongRay = alongRay,
+            .depth = projected->depth,
+            .screenDistance = screenDistance,
+            .pickRadiusWorld = pickRadiusWorld,
+            .confidence = std::clamp(
+                1.0F - std::max(
+                           screenDistance / kPickRadiusPixels,
+                           rayDistance / pickRadiusWorld),
+                0.0F,
+                1.0F),
+        });
+    };
+
+    if (!denseSessions.empty()) {
+        std::size_t sourcePointCount = 0U;
+        for (const auto* session : denseSessions) {
+            const std::size_t remaining =
+                std::numeric_limits<std::size_t>::max() -
+                sourcePointCount;
+            sourcePointCount += std::min(
+                session->offlinePointCloud->positions.size(),
+                remaining);
+        }
+        const std::size_t stride = std::max<std::size_t>(
+            1U,
+            1U + (sourcePointCount - 1U) /
+                     kReciprocalPanRayPickSampleLimit);
+        std::size_t globalOffset = 0U;
+        std::size_t nextSampleIndex = 0U;
+        for (const auto* session : denseSessions) {
+            const auto& positions =
+                session->offlinePointCloud->positions;
+            const std::size_t sourceEnd = globalOffset + positions.size();
+            while (nextSampleIndex < sourceEnd) {
+                collectCandidate(
+                    *session,
+                    positions[nextSampleIndex - globalOffset]);
+                nextSampleIndex += stride;
+            }
+            globalOffset = sourceEnd;
+        }
+    } else {
+        for (const auto& session : runtimeState.sessions) {
+            if (!belongsToCommonScene(session)) {
                 continue;
             }
-            const glm::vec3 fromOrigin = worldPoint - ray->origin;
-            const float alongRay = glm::dot(fromOrigin, ray->direction);
-            if (alongRay <= runtimeState.camera.NearPlane()) {
-                continue;
+            for (const auto& sample : session.pivotSamples) {
+                collectCandidate(session, sample);
             }
-            const float dx = projected->screen.x - screenPoint.x;
-            const float dy = projected->screen.y - screenPoint.y;
-            const float screenDistance = std::sqrt(dx * dx + dy * dy);
-            if (screenDistance > kPickRadiusPixels) {
-                continue;
-            }
-            const float worldUnitsPerPixel =
-                2.0F * std::max(0.001F, alongRay) * tanHalfFov /
-                viewportHeight;
-            const float pickRadiusWorld = std::max(
-                0.0001F,
-                worldUnitsPerPixel * kPickRadiusPixels);
-            const glm::vec3 closest =
-                ray->origin + ray->direction * alongRay;
-            const float rayDistance = glm::length(worldPoint - closest);
-            if (rayDistance > pickRadiusWorld) {
-                continue;
-            }
-            candidates.push_back({
-                .point = worldPoint,
-                .sceneRole = session.sceneRole,
-                .rayDistance = rayDistance,
-                .alongRay = alongRay,
-                .depth = projected->depth,
-                .screenDistance = screenDistance,
-                .pickRadiusWorld = pickRadiusWorld,
-                .confidence = std::clamp(
-                    1.0F - std::max(
-                               screenDistance / kPickRadiusPixels,
-                               rayDistance / pickRadiusWorld),
-                    0.0F,
-                    1.0F),
-            });
         }
     }
     if (candidates.empty()) {
