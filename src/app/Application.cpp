@@ -987,9 +987,11 @@ struct AnimationReciprocalPanWizardState {
     // two-frame history and composites a feature-following hard split.
     bool splitComparisonEnabled = true;
     std::array<float, 2U> splitAnchorOffsetPixels{0.0F, 0.0F};
-    // The projector seam convention places B on the left and A on the right.
-    // The user may still swap the sides for inspection during the wizard.
-    bool splitAOnLeft = false;
+    // By default the animation contributing its end frame is on the left and
+    // the animation contributing its start frame is on the right. Their A/B
+    // identities swap at the other seam; this flag is only an explicit user
+    // override of that endpoint rule.
+    bool splitSidesReversed = false;
     std::uint32_t splitRenderedRole = 0U;
     int seamReviewEditableSide = 1;  // 0 = source, 1 = destination.
     int previewPose = 0;
@@ -44431,6 +44433,27 @@ float WrappedReciprocalPanLoopPosition(float position) {
     return wrapped;
 }
 
+constexpr bool ReciprocalPanAOnLeftForSeamRule(
+    bool sidesReversed,
+    std::size_t seamIndex) {
+    // Seam 0 pairs A-start (right) with B-end (left). Seam 1 pairs B-start
+    // (right) with A-end (left). This follows endpoint roles rather than
+    // assigning one permanent side to an A/B name.
+    const bool aContributesEndFrame = seamIndex == 1U;
+    return aContributesEndFrame != sidesReversed;
+}
+
+static_assert(!ReciprocalPanAOnLeftForSeamRule(false, 0U));
+static_assert(ReciprocalPanAOnLeftForSeamRule(false, 1U));
+
+bool ReciprocalPanAOnLeftForSeam(
+    const AnimationReciprocalPanWizardState& wizard,
+    std::size_t seamIndex) {
+    return ReciprocalPanAOnLeftForSeamRule(
+        wizard.splitSidesReversed,
+        seamIndex);
+}
+
 std::optional<ReciprocalPanComparisonView>
 ResolveReciprocalPanComparisonView(
     const AnimationReciprocalPanWizardState& wizard) {
@@ -44981,6 +45004,9 @@ void DrawReciprocalPanViewportOverlay(
             ? (wizard.seamReviewView == 0 ? 1 : 0)
             : std::clamp(wizard.stageViewRole, 0, 1);
     if (splitComparisonActive && comparisonMatrices.has_value()) {
+        const bool aOnLeft = ReciprocalPanAOnLeftForSeam(
+            wizard,
+            comparison->seamIndex);
         const float centreNormalized =
             ReciprocalPanFeatureSplitCentreNormalized(
                 comparison.value(),
@@ -44996,17 +45022,17 @@ void DrawReciprocalPanViewportOverlay(
             IM_COL32(255, 244, 180, 175),
             1.5F);
         drawList->PopClipRect();
-        const ImU32 leftLabelColor = wizard.splitAOnLeft
+        const ImU32 leftLabelColor = aOnLeft
             ? IM_COL32(110, 220, 255, 225)
             : IM_COL32(255, 155, 95, 225);
-        const ImU32 rightLabelColor = wizard.splitAOnLeft
+        const ImU32 rightLabelColor = aOnLeft
             ? IM_COL32(255, 155, 95, 225)
             : IM_COL32(110, 220, 255, 225);
         drawList->AddText(
             ImVec2{origin.x + 14.0F, origin.y + 42.0F},
             leftLabelColor,
-            wizard.splitAOnLeft ? "A" : "B");
-        const char* rightLabel = wizard.splitAOnLeft ? "B" : "A";
+            aOnLeft ? "A end" : "B end");
+        const char* rightLabel = aOnLeft ? "B start" : "A start";
         const ImVec2 rightLabelSize = ImGui::CalcTextSize(rightLabel);
         drawList->AddText(
             ImVec2{
@@ -55270,13 +55296,14 @@ void DrawReciprocalPanWizard(
                     "%+.0f px");
             }
             if (ImGui::Button(
-                    wizard.splitAOnLeft
-                        ? "Swap sides: put B on left"
-                        : "Swap sides: put A on left")) {
-                wizard.splitAOnLeft = !wizard.splitAOnLeft;
+                    wizard.splitSidesReversed
+                        ? "Restore end-left / start-right"
+                        : "Reverse start/end sides")) {
+                wizard.splitSidesReversed =
+                    !wizard.splitSidesReversed;
             }
             ImGui::TextDisabled(
-                "The hard split follows the mean A/B anchor projection as the synchronized seam is scrubbed. The offset stays relative to that moving feature.");
+                "The end-frame animation is left and the start-frame animation is right by default; A/B swap automatically at the other seam. The boundary follows the tracked anchors plus this seam's offset.");
         }
     }
     const int role = tailExtentStage
@@ -99929,7 +99956,9 @@ int Application::Run(ApplicationRunOptions options) const {
                             &viewProjections,
                             true,
                             splitCentre,
-                            wizard.splitAOnLeft);
+                            ReciprocalPanAOnLeftForSeam(
+                                wizard,
+                                comparison->seamIndex));
                     }
                 }
                 if (!comparison.has_value()) {
