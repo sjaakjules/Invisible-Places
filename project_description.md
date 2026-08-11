@@ -250,6 +250,14 @@ whether the view sits forward, perpendicular, or backward relative to travel
 without moving the partner. Keys outside the overlap have no counterpart and
 cannot run this alignment.
 
+**Fix A+B Lens** sits beside **Extend Both Seams…**. It writes paired edited
+paths with one median authored FOV, focus-distance policy/value, and aperture
+policy/value per animation, uses the smallest existing near plane and largest
+existing far plane across the pair, and clears lens-only endpoint tangents.
+Camera/focus paths and key timing are untouched. When this repair alone is
+needed for extension, the assistant applies it only to its private baselines;
+Cancel discards it and Apply Both commits it with the generated ends.
+
 For paired slow pans that need more material beneath both wipes,
 **Extend Both Seams…** opens a guided Matching-Frame assistant while A remains
 the active animation. No velocity alignment has to exist first: A-start against

@@ -123,6 +123,12 @@ point-cloud scene with either CPU analysis samples or a visible committed
 display source. A shared association is preferred; the selected or sole
 pickable scene is accepted for older unassociated paths. The animations need not already have velocity-blend metadata;
 their crossed endpoints are treated as the two existing 50%-blend seam poses.
+The adjacent **Fix A+B Lens** action shall normalize each animation to one
+median authored FOV/focus-distance/aperture profile, normalize both to the
+least restrictive combined clip range, and remove lens-only spline tangents
+without changing camera/focus positions or timing. If that repair alone makes
+the pair eligible, Extend shall apply it to private wizard baselines; Cancel
+shall discard it and Apply Both shall commit it with the extension.
 
 #### FR-CAM-12
 The assistant shall collect ordered anchor/front/side source triangles at

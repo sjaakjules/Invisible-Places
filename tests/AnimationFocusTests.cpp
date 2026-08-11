@@ -1144,6 +1144,174 @@ TEST_CASE(
           Approx(first.keys[1U].nearPlane));
 }
 
+TEST_CASE(
+    "Pair fixed-lens repair normalizes every lens channel without moving the paths",
+    "[camera][animation][fixed-lens][pan-extension]") {
+    auto first = MakeReciprocalPanTestPath("lens-A", 1.0F, 41U, 79U);
+    auto second = MakeReciprocalPanTestPath("lens-B", -1.0F, 54U, 96U);
+    const std::array<float, 3U> firstFov{54.0F, 56.0F, 55.0F};
+    const std::array<float, 3U> secondFov{62.0F, 60.0F, 61.0F};
+    for (std::size_t index = 0U; index < first.keys.size(); ++index) {
+        first.keys[index].fovDegrees = firstFov[index];
+        second.keys[index].fovDegrees = secondFov[index];
+    }
+    first.keys[0U].hasFocusDistance = true;
+    first.keys[0U].focusDistance = 8.0F;
+    first.keys[2U].hasFocusDistance = true;
+    first.keys[2U].focusDistance = 12.0F;
+    first.keys[0U].hasApertureFStops = true;
+    first.keys[0U].apertureFStops = 4.0F;
+    first.keys[2U].hasApertureFStops = true;
+    first.keys[2U].apertureFStops = 8.0F;
+    first.keys[0U].nearPlane = 0.02F;
+    second.keys[1U].nearPlane = 0.005F;
+    for (auto& key : first.keys) {
+        key.farPlane = 120.0F;
+    }
+    for (auto& key : second.keys) {
+        key.farPlane = 140.0F;
+    }
+    first.keys[1U].farPlane = 150.0F;
+    second.keys[2U].farPlane = 220.0F;
+    for (auto* path : {&first, &second}) {
+        path->keys.front().hasSplineEndpointTangent = true;
+        path->keys.front().splineLensEndpointTangent = {
+            0.25F,
+            0.01F,
+            -2.0F,
+            0.5F,
+            0.75F,
+        };
+        path->keys.back().hasSplineEndpointTangent = true;
+        path->keys.back().splineLensEndpointTangent = {
+            -0.20F,
+            -0.01F,
+            3.0F,
+            -0.4F,
+            -0.6F,
+        };
+    }
+    const auto firstBefore = first;
+    const auto secondBefore = second;
+    const auto firstBeforeEvaluation = invisible_places::camera::
+        PrepareAnimationPathEvaluation(firstBefore);
+    const auto secondBeforeEvaluation = invisible_places::camera::
+        PrepareAnimationPathEvaluation(secondBefore);
+    REQUIRE(firstBeforeEvaluation.valid);
+    REQUIRE(secondBeforeEvaluation.valid);
+
+    const auto repaired = invisible_places::camera::
+        BuildAnimationFixedLensNormalization(first, second);
+    INFO(repaired.errorMessage);
+    REQUIRE(repaired.succeeded);
+    REQUIRE(repaired.changed);
+    CHECK(repaired.nearPlane == Approx(0.005F));
+    CHECK(repaired.farPlane == Approx(220.0F));
+    CHECK(repaired.profiles[0U].fovDegrees == Approx(55.0F));
+    CHECK(repaired.profiles[0U].hasFocusDistance);
+    CHECK(repaired.profiles[0U].focusDistance == Approx(10.0F));
+    CHECK(repaired.profiles[0U].hasApertureFStops);
+    CHECK(repaired.profiles[0U].apertureFStops == Approx(6.0F));
+    CHECK(repaired.profiles[1U].fovDegrees == Approx(61.0F));
+    CHECK_FALSE(repaired.profiles[1U].hasFocusDistance);
+    CHECK_FALSE(repaired.profiles[1U].hasApertureFStops);
+
+    for (std::size_t role = 0U; role < 2U; ++role) {
+        const auto& candidate = role == 0U
+            ? repaired.firstCandidate
+            : repaired.secondCandidate;
+        const auto& original = role == 0U ? firstBefore : secondBefore;
+        REQUIRE(candidate.keys.size() == original.keys.size());
+        CHECK(candidate.durationFrames == original.durationFrames);
+        CHECK(candidate.exportSettings.startFrame ==
+              original.exportSettings.startFrame);
+        CHECK(candidate.exportSettings.endFrame ==
+              original.exportSettings.endFrame);
+        for (std::size_t index = 0U; index < candidate.keys.size(); ++index) {
+            const auto& key = candidate.keys[index];
+            CHECK(key.cameraPosition == original.keys[index].cameraPosition);
+            CHECK(key.focusPoint == original.keys[index].focusPoint);
+            CHECK(key.durationFrames == original.keys[index].durationFrames);
+            CHECK(key.fovDegrees ==
+                  Approx(repaired.profiles[role].fovDegrees));
+            CHECK(key.nearPlane == Approx(0.005F));
+            CHECK(key.farPlane == Approx(220.0F));
+            CHECK(std::all_of(
+                key.splineLensEndpointTangent.begin(),
+                key.splineLensEndpointTangent.end(),
+                [](float value) { return value == 0.0F; }));
+        }
+    }
+    for (const auto& key : repaired.firstCandidate.keys) {
+        CHECK(key.hasFocusDistance);
+        CHECK(key.focusDistance == Approx(10.0F));
+        CHECK(key.hasApertureFStops);
+        CHECK(key.apertureFStops == Approx(6.0F));
+    }
+    for (const auto& key : repaired.secondCandidate.keys) {
+        CHECK_FALSE(key.hasFocusDistance);
+        CHECK_FALSE(key.hasApertureFStops);
+    }
+    const auto firstAfterEvaluation = invisible_places::camera::
+        PrepareAnimationPathEvaluation(repaired.firstCandidate);
+    const auto secondAfterEvaluation = invisible_places::camera::
+        PrepareAnimationPathEvaluation(repaired.secondCandidate);
+    REQUIRE(firstAfterEvaluation.valid);
+    REQUIRE(secondAfterEvaluation.valid);
+    for (std::uint32_t sample = 0U; sample <= 64U; ++sample) {
+        const float amount = static_cast<float>(sample) / 64.0F;
+        for (const auto& [before, after] : {
+                 std::pair{&firstBeforeEvaluation, &firstAfterEvaluation},
+                 std::pair{&secondBeforeEvaluation, &secondAfterEvaluation},
+             }) {
+            const auto beforeValue = invisible_places::camera::
+                EvaluatePreparedAnimationPath(
+                    *before,
+                    before->durationSeconds * amount);
+            const auto afterValue = invisible_places::camera::
+                EvaluatePreparedAnimationPath(
+                    *after,
+                    after->durationSeconds * amount);
+            CHECK(afterValue.camera.position == beforeValue.camera.position);
+            CHECK(afterValue.focusPoint == beforeValue.focusPoint);
+        }
+    }
+    const auto extension = invisible_places::camera::
+        BuildAnimationBidirectionalReciprocalPanExtension(
+            repaired.firstCandidate,
+            repaired.secondCandidate,
+            MakeReciprocalPanTestOptions());
+    INFO(extension.errorMessage);
+    REQUIRE(extension.succeeded);
+
+    const auto alreadyFixed = invisible_places::camera::
+        BuildAnimationFixedLensNormalization(
+            repaired.firstCandidate,
+            repaired.secondCandidate);
+    REQUIRE(alreadyFixed.succeeded);
+    CHECK_FALSE(alreadyFixed.changed);
+
+    const auto swapped = invisible_places::camera::
+        BuildAnimationFixedLensNormalization(second, first);
+    REQUIRE(swapped.succeeded);
+    CHECK(swapped.nearPlane == Approx(repaired.nearPlane));
+    CHECK(swapped.farPlane == Approx(repaired.farPlane));
+    CHECK(swapped.profiles[0U].fovDegrees ==
+          Approx(repaired.profiles[1U].fovDegrees));
+    CHECK(swapped.profiles[1U].fovDegrees ==
+          Approx(repaired.profiles[0U].fovDegrees));
+
+    auto invalid = first;
+    invalid.keys[1U].fovDegrees =
+        std::numeric_limits<float>::quiet_NaN();
+    const auto invalidResult = invisible_places::camera::
+        BuildAnimationFixedLensNormalization(invalid, second);
+    CHECK_FALSE(invalidResult.succeeded);
+    CHECK_FALSE(invalidResult.changed);
+    CHECK(invalidResult.firstCandidate.keys.empty());
+    CHECK(std::isnan(invalid.keys[1U].fovDegrees));
+}
+
 TEST_CASE("Reciprocal pan extension appends a short unlinked tail without retiming the old prefix",
           "[camera][animation][pan-extension]") {
     auto first = MakeReciprocalPanTestPath("A", 1.0F, 41U, 79U);

@@ -434,6 +434,30 @@ struct AnimationClipPlaneNormalizationResult {
     std::string errorMessage;
 };
 
+struct AnimationFixedLensProfile {
+    float fovDegrees = 60.0F;
+    bool hasFocusDistance = false;
+    float focusDistance = 1.0F;
+    bool hasApertureFStops = false;
+    float apertureFStops = 8.0F;
+};
+
+// Explicit standalone repair for fixed-lens pan workflows. Near/far clipping
+// uses the conservative pair-wide union, while each animation receives its
+// own median authored FOV/focus/aperture profile. Camera/focus poses, spatial
+// splines, key timing, export bounds, and all non-lens metadata are retained.
+struct AnimationFixedLensNormalizationResult {
+    bool succeeded = false;
+    bool changed = false;
+    float nearPlane = 0.0F;
+    float farPlane = 0.0F;
+    std::array<AnimationFixedLensProfile, 2U> profiles{};
+    AnimationPath firstCandidate{};
+    AnimationPath secondCandidate{};
+    std::vector<std::string> linkedCameraIds;
+    std::string errorMessage;
+};
+
 // A runtime-only constraint for transition smoothing. The two ordered world-
 // space triangles describe corresponding features at one visual 50% seam.
 // Both identified keys remain movable, but they move as a coordinated pair so
@@ -804,6 +828,10 @@ BuildAnimationBidirectionalReciprocalPanExtension(
 
 [[nodiscard]] AnimationClipPlaneNormalizationResult
 BuildConservativeAnimationClipPlaneNormalization(
+    const AnimationPath& first,
+    const AnimationPath& second);
+[[nodiscard]] AnimationFixedLensNormalizationResult
+BuildAnimationFixedLensNormalization(
     const AnimationPath& first,
     const AnimationPath& second);
 

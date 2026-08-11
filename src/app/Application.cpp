@@ -901,10 +901,11 @@ struct AnimationReciprocalPanWizardState {
     std::array<std::optional<
         invisible_places::camera::AnimationVelocityBlendLinkMetadata>, 2>
         baselineLinks;
-    // Clip normalization performed only on the wizard's private baselines.
+    // Fixed-lens normalization performed only on the wizard's private baselines.
     // The registry remains untouched until Apply Both commits the fitted
     // candidates, so Cancel restores the launch state without an undo write.
-    bool clipPlanesNormalizedForExtension = false;
+    bool lensNormalizedForExtension = false;
+    std::array<float, 2U> normalizedFovDegrees{};
     float normalizedNearPlane = 0.0F;
     float normalizedFarPlane = 0.0F;
     // Ordered as A-start, B-end, B-start, A-end. Node roles are anchor,
@@ -1090,7 +1091,7 @@ struct AnimationPanelState {
     bool requestedMatchingFrameGhostClear = false;
     AnimationReciprocalPanWizardState reciprocalPanWizard;
     std::optional<std::array<std::filesystem::path, 2>>
-        requestedClipPlaneNormalization;
+        requestedFixedLensNormalization;
     std::optional<std::array<std::filesystem::path, 2>>
         requestedVelocityUnlink;
     std::optional<std::size_t> renamingFileIndex;
@@ -25992,7 +25993,7 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->animationPanel.matchingFrameGhost = {};
     runtimeState->animationPanel.requestedMatchingFrameGhostCapture.reset();
     runtimeState->animationPanel.requestedMatchingFrameGhostClear = false;
-    runtimeState->animationPanel.requestedClipPlaneNormalization.reset();
+    runtimeState->animationPanel.requestedFixedLensNormalization.reset();
 
     CancelWaterFlowTrailBuildJob(&runtimeState->water);
     runtimeState->water.flowTrailSourceRequests.clear();
@@ -51785,20 +51786,7 @@ std::optional<std::string> ReciprocalPanPreflightFailure(
     return std::nullopt;
 }
 
-std::optional<
-    invisible_places::camera::AnimationClipPlaneNormalizationResult>
-ReciprocalPanClipPlaneNormalizationForPair(
-    const AnimationPath& first,
-    const AnimationPath& second) {
-    auto normalization = invisible_places::camera::
-        BuildConservativeAnimationClipPlaneNormalization(first, second);
-    if (!normalization.succeeded || !normalization.changed) {
-        return std::nullopt;
-    }
-    return normalization;
-}
-
-std::optional<std::string> ReciprocalPanClipPlaneLinkFailure(
+std::optional<std::string> ReciprocalPanLensRepairLinkFailure(
     const AnimationPath& first,
     const AnimationPath& second) {
     const auto linkedKey = [](const AnimationPath& path) {
@@ -51811,12 +51799,12 @@ std::optional<std::string> ReciprocalPanClipPlaneLinkFailure(
     };
     if (linkedKey(first) != first.keys.end() ||
         linkedKey(second) != second.keys.end()) {
-        return "A/B clip normalization is intentionally path-local. Unlink or untangle linked CameraShots first so an unsaved two-animation repair cannot silently alter other animations or the project camera library.";
+        return "A/B lens repair is intentionally path-local. Unlink or untangle linked CameraShots first so an unsaved two-animation repair cannot silently alter other animations or the project camera library.";
     }
     return std::nullopt;
 }
 
-bool NormalizeReciprocalPanClipPlanes(
+bool FixReciprocalPanLens(
     PreviewRuntimeState* runtimeState,
     std::size_t firstIndex,
     std::size_t secondIndex) {
@@ -51831,7 +51819,7 @@ bool NormalizeReciprocalPanClipPlanes(
             panel.availableFiles[firstIndex],
             std::filesystem::path{panel.currentFilePath})) {
         runtimeState->errorMessage =
-            "The active A animation changed before clip normalization could run. Select the pair and try again.";
+            "The active A animation changed before its A/B lens repair could run. Select the pair and try again.";
         runtimeState->statusMessage.clear();
         return false;
     }
@@ -51839,11 +51827,11 @@ bool NormalizeReciprocalPanClipPlanes(
     const auto* second = RegistryAnimationPath(*runtimeState, secondIndex);
     if (first == nullptr || second == nullptr) {
         runtimeState->errorMessage =
-            "Both animations must remain loaded while normalizing their clip planes.";
+            "Both animations must remain loaded while fixing their lens profiles.";
         runtimeState->statusMessage.clear();
         return false;
     }
-    if (const auto linkFailure = ReciprocalPanClipPlaneLinkFailure(
+    if (const auto linkFailure = ReciprocalPanLensRepairLinkFailure(
             *first,
             *second);
         linkFailure.has_value()) {
@@ -51853,10 +51841,10 @@ bool NormalizeReciprocalPanClipPlanes(
     }
 
     auto normalization = invisible_places::camera::
-        BuildConservativeAnimationClipPlaneNormalization(*first, *second);
+        BuildAnimationFixedLensNormalization(*first, *second);
     if (!normalization.succeeded || !normalization.changed) {
         runtimeState->errorMessage = normalization.errorMessage.empty()
-            ? "A/B clip planes are already normalized."
+            ? "A/B already use fixed lens profiles."
             : normalization.errorMessage;
         runtimeState->statusMessage.clear();
         return false;
@@ -51900,10 +51888,14 @@ bool NormalizeReciprocalPanClipPlanes(
     }
     ApplyAnimationScrub(runtimeState);
     runtimeState->statusMessage =
-        "Normalized A/B clip planes to near " +
+        "Fixed A/B lens profiles: FOV A " +
+        FormatFixed(normalization.profiles[0U].fovDegrees, 3) +
+        " degrees / B " +
+        FormatFixed(normalization.profiles[1U].fovDegrees, 3) +
+        " degrees, near " +
         FormatFixed(normalization.nearPlane, 4) + " m and far " +
         FormatFixed(normalization.farPlane, 3) +
-        " m. Both _Edited animations now share the same conservative visible range.";
+        " m. Both _Edited animations now have constant lens values; camera/focus motion and timing were unchanged.";
     runtimeState->errorMessage.clear();
     return true;
 }
@@ -53472,23 +53464,23 @@ bool StartReciprocalPanWizard(
         *runtimeState,
         *first,
         *second);
-    const auto clipPlaneNormalization =
-        ReciprocalPanClipPlaneNormalizationForPair(
-            *first,
-            *second);
+    const auto lensNormalization = invisible_places::camera::
+        BuildAnimationFixedLensNormalization(*first, *second);
     const auto normalizedPreflightFailure =
-        clipPlaneNormalization.has_value()
+        lensNormalization.succeeded && lensNormalization.changed
             ? ReciprocalPanPreflightFailure(
                   *runtimeState,
-                  clipPlaneNormalization->firstCandidate,
-                  clipPlaneNormalization->secondCandidate)
+                  lensNormalization.firstCandidate,
+                  lensNormalization.secondCandidate)
             : std::optional<std::string>{};
     const bool normalizationMakesExtensionReady =
-        clipPlaneNormalization.has_value() &&
+        originalPreflightFailure.has_value() &&
+        lensNormalization.succeeded &&
+        lensNormalization.changed &&
         !normalizedPreflightFailure.has_value();
     const auto normalizationLinkFailure =
-        clipPlaneNormalization.has_value()
-            ? ReciprocalPanClipPlaneLinkFailure(*first, *second)
+        normalizationMakesExtensionReady
+            ? ReciprocalPanLensRepairLinkFailure(*first, *second)
             : std::optional<std::string>{};
     if (originalPreflightFailure.has_value() &&
         (!normalizationMakesExtensionReady ||
@@ -53503,18 +53495,23 @@ bool StartReciprocalPanWizard(
     }
 
     std::array<AnimationPath, 2> wizardBaselines{*first, *second};
-    bool normalizeClipPlanesInsideWizard = false;
+    bool normalizeLensInsideWizard = false;
+    std::array<float, 2U> normalizedFovDegrees{};
     float normalizedNearPlane = 0.0F;
     float normalizedFarPlane = 0.0F;
     if (normalizationMakesExtensionReady &&
         !normalizationLinkFailure.has_value()) {
         wizardBaselines = {
-            clipPlaneNormalization->firstCandidate,
-            clipPlaneNormalization->secondCandidate,
+            lensNormalization.firstCandidate,
+            lensNormalization.secondCandidate,
         };
-        normalizeClipPlanesInsideWizard = true;
-        normalizedNearPlane = clipPlaneNormalization->nearPlane;
-        normalizedFarPlane = clipPlaneNormalization->farPlane;
+        normalizeLensInsideWizard = true;
+        normalizedFovDegrees = {
+            lensNormalization.profiles[0U].fovDegrees,
+            lensNormalization.profiles[1U].fovDegrees,
+        };
+        normalizedNearPlane = lensNormalization.nearPlane;
+        normalizedFarPlane = lensNormalization.farPlane;
     }
     const std::unordered_set<std::string> firstMovable{
         first->keys.back().id};
@@ -53570,8 +53567,8 @@ bool StartReciprocalPanWizard(
         first->velocityBlendLink,
         second->velocityBlendLink,
     };
-    wizard.clipPlanesNormalizedForExtension =
-        normalizeClipPlanesInsideWizard;
+    wizard.lensNormalizedForExtension = normalizeLensInsideWizard;
+    wizard.normalizedFovDegrees = normalizedFovDegrees;
     wizard.normalizedNearPlane = normalizedNearPlane;
     wizard.normalizedFarPlane = normalizedFarPlane;
     for (std::size_t role = 0U; role < 2U; ++role) {
@@ -53646,8 +53643,8 @@ bool StartReciprocalPanWizard(
     runtimeState->animationPlayback.active = false;
     runtimeState->cameraPlayback.active = false;
     runtimeState->statusMessage =
-        panel.reciprocalPanWizard.clipPlanesNormalizedForExtension
-            ? "Reciprocal Pan Extension started with a private A/B clip-plane normalization. It is committed only by Apply Both; Cancel leaves both animations unchanged."
+        panel.reciprocalPanWizard.lensNormalizedForExtension
+            ? "Reciprocal Pan Extension started with a private A/B fixed-lens repair. It is committed only by Apply Both; Cancel leaves both animations unchanged."
             : "Reciprocal Pan Extension started at seam 1. Capture anchor / front / side on A start, click the matching B-end centre, then choose the shared span that creates A's pre-roll and B's tail.";
     runtimeState->errorMessage.clear();
     ShowReciprocalPanWizardCanonicalPose(runtimeState);
@@ -54176,8 +54173,8 @@ bool ApplyReciprocalPanCandidate(
     runtimeState->pivotOverlay.lastSetAt = launch.launchPivotLastSetAt;
     runtimeState->statusMessage =
         std::string{
-            launch.clipPlanesNormalizedForExtension
-                ? "Normalized A/B clip planes and created reciprocal _Edited pan extensions"
+            launch.lensNormalizedForExtension
+                ? "Fixed A/B lens profiles and created reciprocal _Edited pan extensions"
                 : "Created reciprocal _Edited pan extensions"} +
         (launch.smoothedCandidates.has_value()
              ? " with selected-key transition smoothing ("
@@ -55355,10 +55352,12 @@ void DrawReciprocalPanWizard(
     }
     ImGui::TextDisabled(
         "Assumption: A start <-> B end and B start <-> A end are the manually tuned visual 50%%-blend poses.");
-    if (wizard.clipPlanesNormalizedForExtension) {
+    if (wizard.lensNormalizedForExtension) {
         ImGui::TextColored(
             ImVec4{0.35F, 0.82F, 0.48F, 1.0F},
-            "Private clip preparation: near %.4f m / far %.3f m. Apply Both commits it; Cancel discards it.",
+            "Private lens preparation: FOV A %.3f / B %.3f degrees, near %.4f m / far %.3f m. Apply Both commits it; Cancel discards it.",
+            wizard.normalizedFovDegrees[0U],
+            wizard.normalizedFovDegrees[1U],
             wizard.normalizedNearPlane,
             wizard.normalizedFarPlane);
     }
@@ -56096,10 +56095,10 @@ void DrawAnimationSection(
     PollAnimationVelocityPreviewJob(runtimeState);
     PollAnimationStrongAlignmentJob(runtimeState);
     ApplyPendingAnimationVelocityLinkSettings(runtimeState);
-    if (panel.requestedClipPlaneNormalization.has_value()) {
+    if (panel.requestedFixedLensNormalization.has_value()) {
         const auto requested =
-            panel.requestedClipPlaneNormalization.value();
-        panel.requestedClipPlaneNormalization.reset();
+            panel.requestedFixedLensNormalization.value();
+        panel.requestedFixedLensNormalization.reset();
         const auto firstIndex = FindAnimationRegistryIndex(
             panel,
             requested[0U]);
@@ -56107,13 +56106,13 @@ void DrawAnimationSection(
             panel,
             requested[1U]);
         if (firstIndex.has_value() && secondIndex.has_value()) {
-            NormalizeReciprocalPanClipPlanes(
+            FixReciprocalPanLens(
                 runtimeState,
                 firstIndex.value(),
                 secondIndex.value());
         } else {
             runtimeState->errorMessage =
-                "A or B was removed before its clip planes could be normalized.";
+                "A or B was removed before its lens could be fixed.";
             runtimeState->statusMessage.clear();
         }
     }
@@ -58428,38 +58427,65 @@ void DrawAnimationSection(
                     *loopCurrent,
                     *loopPartner);
             }
-            const auto clipPlaneNormalization =
-                ReciprocalPanClipPlaneNormalizationForPair(
-                    *loopCurrent,
-                    *loopPartner);
-            const auto clipPlaneLinkFailure =
-                clipPlaneNormalization.has_value()
-                    ? ReciprocalPanClipPlaneLinkFailure(
+            const auto fixedLensNormalization =
+                invisible_places::camera::
+                    BuildAnimationFixedLensNormalization(
+                        *loopCurrent,
+                        *loopPartner);
+            const auto fixedLensLinkFailure =
+                fixedLensNormalization.succeeded &&
+                        fixedLensNormalization.changed
+                    ? ReciprocalPanLensRepairLinkFailure(
                           *loopCurrent,
                           *loopPartner)
                     : std::optional<std::string>{};
             const auto normalizedExtensionFailure =
-                clipPlaneNormalization.has_value()
+                fixedLensNormalization.succeeded &&
+                        fixedLensNormalization.changed
                     ? ReciprocalPanPreflightFailure(
                           *runtimeState,
-                          clipPlaneNormalization->firstCandidate,
-                          clipPlaneNormalization->secondCandidate)
+                          fixedLensNormalization.firstCandidate,
+                          fixedLensNormalization.secondCandidate)
                     : std::optional<std::string>{};
             const bool extensionCanNormalizePrivately =
+                extensionFailure.has_value() &&
                 !extensionLinkFailure.has_value() &&
-                clipPlaneNormalization.has_value() &&
+                fixedLensNormalization.succeeded &&
+                fixedLensNormalization.changed &&
                 !normalizedExtensionFailure.has_value() &&
-                !clipPlaneLinkFailure.has_value();
+                !fixedLensLinkFailure.has_value();
             std::optional<std::string> extensionLaunchFailure =
                 extensionFailure;
             if (extensionCanNormalizePrivately) {
                 extensionLaunchFailure.reset();
             } else if (extensionFailure.has_value() &&
                        !extensionLinkFailure.has_value() &&
-                       clipPlaneNormalization.has_value() &&
+                       fixedLensNormalization.succeeded &&
+                       fixedLensNormalization.changed &&
                        !normalizedExtensionFailure.has_value() &&
-                       clipPlaneLinkFailure.has_value()) {
-                extensionLaunchFailure = clipPlaneLinkFailure;
+                       fixedLensLinkFailure.has_value()) {
+                extensionLaunchFailure = fixedLensLinkFailure;
+            }
+            std::optional<std::string> fixedLensRepairFailure;
+            if (!fixedLensNormalization.succeeded) {
+                fixedLensRepairFailure =
+                    fixedLensNormalization.errorMessage.empty()
+                    ? "The A/B lens values could not be normalized."
+                    : fixedLensNormalization.errorMessage;
+            } else if (!fixedLensNormalization.changed) {
+                fixedLensRepairFailure =
+                    "A and B already use fixed lens profiles.";
+            } else if (fixedLensLinkFailure.has_value()) {
+                fixedLensRepairFailure = fixedLensLinkFailure;
+            } else if (panel.velocityAlignmentDraft.has_value()) {
+                fixedLensRepairFailure =
+                    "Confirm or unapply the current velocity-alignment draft first.";
+            } else if (renderSetupLocksAnimationSwitching) {
+                fixedLensRepairFailure =
+                    "Finish the active render setup or save operation first.";
+            } else if (strongAlignmentInProgress) {
+                fixedLensRepairFailure =
+                    "Wait for the current matching-frame job to finish.";
             }
             ImGui::BeginDisabled(
                 renderSetupLocksAnimationSwitching ||
@@ -58483,8 +58509,50 @@ void DrawAnimationSection(
                     extensionLaunchFailure.has_value()
                         ? extensionLaunchFailure->c_str()
                     : extensionCanNormalizePrivately
-                        ? "First normalizes A/B clip planes in private wizard snapshots, then captures and fits both directions around both seams. Apply Both commits normalization with the extensions; Cancel leaves the animations unchanged."
+                        ? "First fixes the A/B lens profiles in private wizard snapshots, then captures and fits both directions around both seams. Apply Both commits the lens repair with the extensions; Cancel leaves the animations unchanged."
                         : "Treats A-start/B-end and B-start/A-end as the manually tuned visual 50%-blend midpoints. Each source uses anchor/front/side clicks; one matching destination-centre click generates camera-local axes. Every selected seam span then creates a pre-roll before the source start and a tail after the partner end.");
+            }
+            ImGui::SameLine();
+            ImGui::BeginDisabled(
+                renderSetupLocksAnimationSwitching ||
+                strongAlignmentInProgress ||
+                fixedLensRepairFailure.has_value());
+            if (ImGui::Button("Fix A+B Lens")) {
+                panel.requestedFixedLensNormalization =
+                    std::array<std::filesystem::path, 2>{
+                        panel.availableFiles[
+                            currentLoopFileIndex.value()],
+                        panel.availableFiles[
+                            loopPartnerIndex.value()],
+                    };
+            }
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(
+                    ImGuiHoveredFlags_DelayNormal |
+                    ImGuiHoveredFlags_AllowWhenDisabled)) {
+                const std::string lensTooltip =
+                    fixedLensRepairFailure.has_value()
+                    ? fixedLensRepairFailure.value()
+                    : "Creates paired _Edited paths with one constant lens profile per animation: A FOV " +
+                          FormatFixed(
+                              fixedLensNormalization.profiles[0U]
+                                  .fovDegrees,
+                              3) +
+                          " degrees, B FOV " +
+                          FormatFixed(
+                              fixedLensNormalization.profiles[1U]
+                                  .fovDegrees,
+                              3) +
+                          " degrees, near " +
+                          FormatFixed(
+                              fixedLensNormalization.nearPlane,
+                              4) +
+                          " m, far " +
+                          FormatFixed(
+                              fixedLensNormalization.farPlane,
+                              3) +
+                          " m. Focus distance/aperture use each path's median authored values. Camera/focus positions and timing are unchanged.";
+                ImGui::SetTooltip("%s", lensTooltip.c_str());
             }
             if (extensionLaunchFailure.has_value()) {
                 ImGui::PushStyleColor(
@@ -58495,63 +58563,16 @@ void DrawAnimationSection(
                     extensionLaunchFailure->c_str());
                 ImGui::PopStyleColor();
             } else if (extensionCanNormalizePrivately) {
-                ImGui::TextDisabled(
-                    "Extend will privately normalize clips to near %.4f m / far %.3f m; Cancel discards that preparation.",
-                    clipPlaneNormalization->nearPlane,
-                    clipPlaneNormalization->farPlane);
-            }
-            if (clipPlaneNormalization.has_value()) {
-                const bool clipPlaneRepairDisabled =
-                    renderSetupLocksAnimationSwitching ||
-                    strongAlignmentInProgress ||
-                    panel.velocityAlignmentDraft.has_value() ||
-                    clipPlaneLinkFailure.has_value();
-                ImGui::BeginDisabled(clipPlaneRepairDisabled);
-                if (ImGui::Button("Normalize A/B Clip Planes")) {
-                    panel.requestedClipPlaneNormalization =
-                        std::array<std::filesystem::path, 2>{
-                            panel.availableFiles[
-                                currentLoopFileIndex.value()],
-                            panel.availableFiles[
-                                loopPartnerIndex.value()],
-                        };
-                }
-                ImGui::EndDisabled();
-                if (ImGui::IsItemHovered(
-                        ImGuiHoveredFlags_DelayNormal |
-                        ImGuiHoveredFlags_AllowWhenDisabled)) {
-                    const auto repairBlocker =
-                        clipPlaneLinkFailure.has_value()
-                            ? clipPlaneLinkFailure.value()
-                        : panel.velocityAlignmentDraft.has_value()
-                            ? std::string{
-                                  "Confirm or unapply the current velocity-alignment draft first."}
-                            : std::string{};
-                    ImGui::SetTooltip(
-                        "%s",
-                        repairBlocker.empty()
-                            ? ("Sets every A/B key to the least restrictive values already present: near " +
-                               FormatFixed(
-                                   clipPlaneNormalization->nearPlane,
-                                   4) +
-                               " m, far " +
-                               FormatFixed(
-                                   clipPlaneNormalization->farPlane,
-                                   3) +
-                               " m. Camera/focus positions, FOV, aperture, and timing are unchanged.")
-                                  .c_str()
-                            : repairBlocker.c_str());
-                }
-                ImGui::SameLine();
-                ImGui::TextDisabled(
-                    "near %.4f m / far %.3f m",
-                    clipPlaneNormalization->nearPlane,
-                    clipPlaneNormalization->farPlane);
-                if (clipPlaneLinkFailure.has_value()) {
-                    ImGui::TextDisabled(
-                        "%s",
-                        clipPlaneLinkFailure->c_str());
-                }
+                ImGui::PushStyleColor(
+                    ImGuiCol_Text,
+                    ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                ImGui::TextWrapped(
+                    "Extend will privately fix lens profiles to FOV A %.3f / B %.3f degrees, near %.4f m / far %.3f m; Cancel discards that preparation.",
+                    fixedLensNormalization.profiles[0U].fovDegrees,
+                    fixedLensNormalization.profiles[1U].fovDegrees,
+                    fixedLensNormalization.nearPlane,
+                    fixedLensNormalization.farPlane);
+                ImGui::PopStyleColor();
             }
             const bool hasStrongDestination =
                 panel.loopTimeline.strongDestinationRow >= 0 &&

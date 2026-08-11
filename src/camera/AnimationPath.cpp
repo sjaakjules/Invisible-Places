@@ -4529,6 +4529,129 @@ BuildConservativeAnimationClipPlaneNormalization(
     return result;
 }
 
+AnimationFixedLensNormalizationResult
+BuildAnimationFixedLensNormalization(
+    const AnimationPath& first,
+    const AnimationPath& second) {
+    AnimationFixedLensNormalizationResult result;
+    const auto clipNormalization =
+        BuildConservativeAnimationClipPlaneNormalization(first, second);
+    if (!clipNormalization.succeeded) {
+        result.errorMessage = clipNormalization.errorMessage;
+        return result;
+    }
+
+    const auto median = [](std::vector<float> values) {
+        std::sort(values.begin(), values.end());
+        const std::size_t middle = values.size() / 2U;
+        return values.size() % 2U == 0U
+            ? 0.5F * (values[middle - 1U] + values[middle])
+            : values[middle];
+    };
+    const auto buildProfile = [&](const AnimationPath& path,
+                                  AnimationFixedLensProfile* profile) {
+        if (profile == nullptr || path.keys.empty()) {
+            return false;
+        }
+        std::vector<float> fieldsOfView;
+        std::vector<float> focusDistances;
+        std::vector<float> apertures;
+        fieldsOfView.reserve(path.keys.size());
+        focusDistances.reserve(path.keys.size());
+        apertures.reserve(path.keys.size());
+        for (const auto& key : path.keys) {
+            if (!std::isfinite(key.fovDegrees) ||
+                key.fovDegrees <= 0.0F) {
+                return false;
+            }
+            fieldsOfView.push_back(key.fovDegrees);
+            if (key.hasFocusDistance) {
+                if (!std::isfinite(key.focusDistance) ||
+                    key.focusDistance <= 0.0F) {
+                    return false;
+                }
+                focusDistances.push_back(key.focusDistance);
+            }
+            if (key.hasApertureFStops) {
+                if (!std::isfinite(key.apertureFStops) ||
+                    key.apertureFStops <= 0.0F) {
+                    return false;
+                }
+                apertures.push_back(key.apertureFStops);
+            }
+        }
+        profile->fovDegrees = median(std::move(fieldsOfView));
+        profile->hasFocusDistance = !focusDistances.empty();
+        if (profile->hasFocusDistance) {
+            profile->focusDistance = median(std::move(focusDistances));
+        }
+        profile->hasApertureFStops = !apertures.empty();
+        if (profile->hasApertureFStops) {
+            profile->apertureFStops = median(std::move(apertures));
+        }
+        return std::isfinite(profile->fovDegrees) &&
+            (!profile->hasFocusDistance ||
+             std::isfinite(profile->focusDistance)) &&
+            (!profile->hasApertureFStops ||
+             std::isfinite(profile->apertureFStops));
+    };
+    if (!buildProfile(first, &result.profiles[0U]) ||
+        !buildProfile(second, &result.profiles[1U])) {
+        result.errorMessage =
+            "Every A/B key needs a finite positive FOV and finite positive values for any authored focus distance or aperture before its lens can be fixed.";
+        return result;
+    }
+
+    std::array<AnimationPath, 2U> candidates{
+        clipNormalization.firstCandidate,
+        clipNormalization.secondCandidate,
+    };
+    result.changed = clipNormalization.changed;
+    const auto applyProfile = [&](AnimationPath* path,
+                                  const AnimationFixedLensProfile& profile) {
+        for (auto& key : path->keys) {
+            result.changed = result.changed ||
+                key.fovDegrees != profile.fovDegrees ||
+                key.hasFocusDistance != profile.hasFocusDistance ||
+                (profile.hasFocusDistance &&
+                 key.focusDistance != profile.focusDistance) ||
+                key.hasApertureFStops != profile.hasApertureFStops ||
+                (profile.hasApertureFStops &&
+                 key.apertureFStops != profile.apertureFStops);
+            key.fovDegrees = profile.fovDegrees;
+            key.hasFocusDistance = profile.hasFocusDistance;
+            if (profile.hasFocusDistance) {
+                key.focusDistance = profile.focusDistance;
+            }
+            key.hasApertureFStops = profile.hasApertureFStops;
+            if (profile.hasApertureFStops) {
+                key.apertureFStops = profile.apertureFStops;
+            }
+            for (auto& tangent : key.splineLensEndpointTangent) {
+                result.changed = result.changed || tangent != 0.0F;
+                tangent = 0.0F;
+            }
+        }
+    };
+    applyProfile(&candidates[0U], result.profiles[0U]);
+    applyProfile(&candidates[1U], result.profiles[1U]);
+    if (!PrepareAnimationPathEvaluation(candidates[0U]).valid ||
+        !PrepareAnimationPathEvaluation(candidates[1U]).valid) {
+        result.changed = false;
+        result.errorMessage =
+            "The normalized A/B lens profiles did not produce valid animation evaluations; no path was changed.";
+        return result;
+    }
+
+    result.succeeded = true;
+    result.nearPlane = clipNormalization.nearPlane;
+    result.farPlane = clipNormalization.farPlane;
+    result.firstCandidate = std::move(candidates[0U]);
+    result.secondCandidate = std::move(candidates[1U]);
+    result.linkedCameraIds = clipNormalization.linkedCameraIds;
+    return result;
+}
+
 AnimationPathMotionStats MeasurePreparedAnimationPathMotion(
     const PreparedAnimationPathEvaluationContext& context,
     float normalizedTime,
