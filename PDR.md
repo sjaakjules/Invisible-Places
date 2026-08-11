@@ -135,7 +135,11 @@ The assistant shall collect ordered anchor/front/side source triangles at
 A-start and B-start. One corresponding feature-centre click at each destination
 end shall rotate those physical offsets into the destination camera frame;
 generated nodes remain individually editable. Each seam shall receive a fitted,
-synchronized source/destination scrub review before proceeding. The final fit
+synchronized source/destination scrub review before proceeding. That review
+shall expose generated and nearby authored keyframes on two selectable
+timelines, keep the paired 50% controls coordinated by the three-node triangle,
+and permit a spatial-only one-seam smoothing preview without changing segment
+frames. The selected authored controls shall carry into the final joint fit. The final fit
 shall align each existing destination end to the opposite source start and
 constrain signed screen X/Y velocity, in-plane patch rotation, overlay position,
 and perspective scale on the 30 fps animation timebase.

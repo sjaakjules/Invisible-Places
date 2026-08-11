@@ -6333,6 +6333,9 @@ LoopScore ScoreLoopPair(
         }
     }
     for (std::size_t seamIndex = 0U; seamIndex < seams.size(); ++seamIndex) {
+        if (!options.enabledSeams[seamIndex]) {
+            continue;
+        }
         if (options.stopToken.stop_requested()) {
             score.cancelled = true;
             return score;
@@ -6528,8 +6531,13 @@ LoopScore ScoreLoopPair(
                 seamWeights[seamIndex];
         }
     }
-    score.mismatch =
-        0.5F * (score.seamMismatch[0U] + score.seamMismatch[1U]);
+    const std::size_t enabledSeamCount = static_cast<std::size_t>(
+        options.enabledSeams[0U]) + static_cast<std::size_t>(
+        options.enabledSeams[1U]);
+    score.mismatch = enabledSeamCount > 0U
+        ? (score.seamMismatch[0U] + score.seamMismatch[1U]) /
+              static_cast<float>(enabledSeamCount)
+        : 0.0F;
     for (std::size_t pathIndex = 0U;
          pathIndex < score.terminalSpeedRmsChange.size();
          ++pathIndex) {
@@ -6770,6 +6778,11 @@ AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
     AnimationPath* second,
     const AnimationLoopSmoothingOptions& options) {
     AnimationLoopSmoothingResult result;
+    if (!options.enabledSeams[0U] && !options.enabledSeams[1U]) {
+        result.errorMessage =
+            "Enable at least one A/B transition seam to smooth.";
+        return result;
+    }
     if (options.stopToken.stop_requested()) {
         result.errorMessage = "Velocity-alignment preview cancelled.";
         return result;
@@ -6825,10 +6838,21 @@ AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
             "Enable at least one eligible camera key on either timeline.";
         return result;
     }
-    const auto overlaps = ResolveLoopOverlapDurations(
+    auto overlaps = ResolveLoopOverlapDurations(
         originalFirst,
         originalSecond,
         options);
+    // A one-seam review must not acquire the other path's default endpoint
+    // window merely because its requested overlap is zero. Clear both sides
+    // of each disabled transition before neighborhood scoring.
+    if (!options.enabledSeams[0U]) {
+        overlaps.endSeconds[0U] = 0.0F;
+        overlaps.startSeconds[1U] = 0.0F;
+    }
+    if (!options.enabledSeams[1U]) {
+        overlaps.endSeconds[1U] = 0.0F;
+        overlaps.startSeconds[0U] = 0.0F;
+    }
 
     AnimationPath originalFirstPath = *first;
     AnimationPath originalSecondPath = *second;

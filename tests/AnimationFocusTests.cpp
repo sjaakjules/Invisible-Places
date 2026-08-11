@@ -1855,6 +1855,67 @@ TEST_CASE(
     CHECK(firstSeamDriverMoved == firstSeamFollowerMoved);
     CHECK(secondSeamDriverMoved == secondSeamFollowerMoved);
     CHECK((firstSeamDriverMoved || secondSeamDriverMoved));
+
+    // The guided pre-roll review can smooth the B-end -> A-start seam before
+    // the opposite correspondence exists. The disabled A-end -> B-start seam
+    // must contribute no score or implicit default endpoint neighborhood.
+    auto reviewFirst = extension.firstCandidate;
+    auto reviewSecond = extension.secondCandidate;
+    auto reviewOptions = options;
+    reviewOptions.enabledSeams = {false, true};
+    reviewOptions.triangleAlignmentConstraints = {
+        options.triangleAlignmentConstraints.front()};
+    const auto review = invisible_places::camera::
+        SmoothAnimationLoopTransitions(
+            &reviewFirst,
+            &reviewSecond,
+            reviewOptions);
+    INFO(review.errorMessage);
+    REQUIRE(review.succeeded);
+    REQUIRE(review.changed);
+    CHECK(review.beforeSeamMismatch[0U] == Catch::Approx(0.0F));
+    CHECK(review.afterSeamMismatch[0U] == Catch::Approx(0.0F));
+    CHECK(review.beforeSeamRotationMismatch[0U] == Catch::Approx(0.0F));
+    CHECK(review.afterSeamRotationMismatch[0U] == Catch::Approx(0.0F));
+    CHECK(review.afterObjective < review.beforeObjective);
+    CHECK(review.afterSeamMismatch[1U] <=
+          review.beforeSeamMismatch[1U] + 1.0e-5F);
+    CHECK(review.afterTriangleAlignmentRms[0U] <=
+          review.beforeTriangleAlignmentRms[0U] + 2.1e-5F);
+
+    auto disabledFirst = extension.firstCandidate;
+    auto disabledSecond = extension.secondCandidate;
+    const auto disabledFirstBefore = disabledFirst;
+    const auto disabledSecondBefore = disabledSecond;
+    auto disabledOptions = options;
+    disabledOptions.enabledSeams = {false, false};
+    const auto disabled = invisible_places::camera::
+        SmoothAnimationLoopTransitions(
+            &disabledFirst,
+            &disabledSecond,
+            disabledOptions);
+    CHECK_FALSE(disabled.succeeded);
+    CHECK_FALSE(disabled.changed);
+    const auto unchanged = [](const auto& before, const auto& after) {
+        if (before.durationFrames != after.durationFrames ||
+            before.keys.size() != after.keys.size()) {
+            return false;
+        }
+        for (std::size_t index = 0U; index < before.keys.size(); ++index) {
+            if (before.keys[index].id != after.keys[index].id ||
+                before.keys[index].cameraPosition !=
+                    after.keys[index].cameraPosition ||
+                before.keys[index].focusPoint !=
+                    after.keys[index].focusPoint ||
+                before.keys[index].durationFrames !=
+                    after.keys[index].durationFrames) {
+                return false;
+            }
+        }
+        return true;
+    };
+    CHECK(unchanged(disabledFirstBefore, disabledFirst));
+    CHECK(unchanged(disabledSecondBefore, disabledSecond));
 }
 
 TEST_CASE(

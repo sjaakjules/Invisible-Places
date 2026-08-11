@@ -291,7 +291,11 @@ the two camera renders as an A/B hard split. Its adjustable boundary follows
 the mean projected anchor position throughout the synchronized scrub, while a
 stored pixel offset lets the user place the wipe beside the feature without
 breaking that tracking. Both triangles remain visible, A/B can swap sides, and
-the active view remains editable. Water effects are temporarily suppressed to
+the active view remains editable. Two key timelines expose the generated head,
+generated tail, paired 50% controls, and nearby authored controls during this
+review. Green controls can run a private one-seam smoothing pass; the midpoint
+pair stays triangle-constrained, all key timing remains fixed, and the authored
+selection is replayed by the final joint smoother. Water effects are temporarily suppressed to
 keep this comparison responsive.
 
 A Preview can isolate A, B, or their overlay, inspect the extended timeline

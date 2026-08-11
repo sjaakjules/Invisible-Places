@@ -917,6 +917,20 @@ struct AnimationReciprocalPanWizardState {
     std::array<std::optional<
         invisible_places::camera::AnimationPanBidirectionalSeamResult>, 2>
         seamPreviews;
+    // A seam review may smooth its private source-head/destination-tail pair
+    // before the opposite seam has been captured. Paths are kept in stable
+    // A/B role order so the viewport, timelines, and final selection replay
+    // all refer to the same persistent key IDs.
+    std::array<std::optional<std::array<AnimationPath, 2U>>, 2U>
+        seamReviewSmoothedCandidates;
+    std::array<std::optional<
+        invisible_places::camera::AnimationLoopSmoothingResult>, 2U>
+        seamReviewSmoothingResults;
+    std::array<std::array<std::unordered_set<std::string>, 2U>, 2U>
+        seamReviewMovableKeyIds;
+    std::array<bool, 2U> seamReviewSelectionInitialized{};
+    std::array<bool, 2U> seamReviewSmoothingInProgress{};
+    std::array<std::string, 2U> seamReviewSmoothingErrors;
     int seamReviewView = 1;  // 0 = source, 1 = fitted destination.
     std::int32_t seamReviewOffsetFrame = 0;
     std::optional<
@@ -1022,6 +1036,28 @@ const AnimationPath& ReciprocalPanEffectiveCandidatePath(
     return clampedRole == 0U
         ? wizard.candidate->firstCandidate
         : wizard.candidate->secondCandidate;
+}
+
+const AnimationPath* ReciprocalPanEffectiveSeamReviewPath(
+    const AnimationReciprocalPanWizardState& wizard,
+    std::size_t seamIndex,
+    std::size_t role) {
+    if (seamIndex > 1U || role > 1U ||
+        !wizard.seamPreviews[seamIndex].has_value()) {
+        return nullptr;
+    }
+    if (wizard.seamReviewSmoothedCandidates[seamIndex].has_value()) {
+        return &wizard.seamReviewSmoothedCandidates[seamIndex].value()[role];
+    }
+    const auto& preview = wizard.seamPreviews[seamIndex].value();
+    if (seamIndex == 0U) {
+        return role == 0U
+            ? &preview.sourceHead.candidate
+            : &preview.destinationTail.candidate;
+    }
+    return role == 0U
+        ? &preview.destinationTail.candidate
+        : &preview.sourceHead.candidate;
 }
 
 struct ReciprocalPanTimingTakeCloneJournal {
@@ -1666,6 +1702,10 @@ bool RebuildReciprocalPanSeamPreview(
     PreviewRuntimeState* runtimeState,
     std::size_t seamIndex,
     float currentAspectRatio);
+bool StartReciprocalPanTransitionSmoothing(
+    PreviewRuntimeState* runtimeState,
+    float currentAspectRatio,
+    invisible_places::camera::AnimationLoopSpatialObjective objective);
 bool MoveReciprocalPanSmoothingKey(
     PreviewRuntimeState* runtimeState,
     std::size_t role,
@@ -2928,6 +2968,9 @@ struct AnimationReciprocalPanSmoothingJobResult {
     std::array<std::vector<std::string>, 2U> movableKeyIds;
     std::array<AnimationPath, 2U> candidates;
     invisible_places::camera::AnimationLoopSmoothingResult result;
+    // Empty targets the final combined pair. A value targets that one seam's
+    // pre-roll review and keeps the result private to the review stage.
+    std::optional<std::size_t> seamReviewIndex;
 };
 
 struct AnimationReciprocalPanSmoothingJobShared {
@@ -44599,23 +44642,30 @@ ResolveReciprocalPanComparisonView(
     const std::size_t destinationRole = seamIndex == 0U ? 1U : 0U;
     const std::size_t sourceTriangle = seamIndex == 0U ? 0U : 2U;
     const std::size_t destinationTriangle = sourceTriangle + 1U;
-    const auto& sourcePath =
-        wizard.seamPreviews[seamIndex]->sourceHead.candidate;
-    const auto& destinationPath =
-        wizard.seamPreviews[seamIndex]->destinationTail.candidate;
+    const auto* sourcePath = ReciprocalPanEffectiveSeamReviewPath(
+        wizard,
+        seamIndex,
+        sourceRole);
+    const auto* destinationPath = ReciprocalPanEffectiveSeamReviewPath(
+        wizard,
+        seamIndex,
+        destinationRole);
+    if (sourcePath == nullptr || destinationPath == nullptr) {
+        return std::nullopt;
+    }
     const std::int64_t sourceFrame =
         static_cast<std::int64_t>(wizard.sourceTailFrames[sourceRole]) +
         offset;
     const auto sourceEvaluation = invisible_places::camera::
         EvaluateAnimationPath(
-            sourcePath,
+            *sourcePath,
             static_cast<float>(sourceFrame) / 30.0F);
     const std::int64_t destinationFrame =
         static_cast<std::int64_t>(ReciprocalPanPathFrameCount(
             wizard.baselinePaths[destinationRole])) + offset;
     const auto destinationEvaluation = invisible_places::camera::
         EvaluateAnimationPath(
-            destinationPath,
+            *destinationPath,
             static_cast<float>(destinationFrame) / 30.0F);
 
     ReciprocalPanComparisonView comparison;
@@ -44710,10 +44760,23 @@ void DrawReciprocalPanViewportOverlay(
                 : 1U;
         if (wizard.seamPreviews[seamIndex].has_value()) {
             auto& panel = runtimeState->animationPanel;
+            const std::size_t sourceRole = seamIndex;
+            const std::size_t destinationRole = seamIndex == 0U ? 1U : 0U;
+            const auto* sourcePath = ReciprocalPanEffectiveSeamReviewPath(
+                wizard,
+                seamIndex,
+                sourceRole);
+            const auto* destinationPath =
+                ReciprocalPanEffectiveSeamReviewPath(
+                    wizard,
+                    seamIndex,
+                    destinationRole);
+            if (sourcePath == nullptr || destinationPath == nullptr) {
+                return;
+            }
             const auto& sourcePrepared = CachedPreparedAnimationPath(
                 &panel,
-                wizard.seamPreviews[seamIndex]
-                    ->sourceHead.candidate);
+                *sourcePath);
             DrawAnimationCurveOverlay(
                 sourcePrepared,
                 matrices,
@@ -44722,8 +44785,7 @@ void DrawReciprocalPanViewportOverlay(
                 true);
             const auto& destinationPrepared = CachedPreparedAnimationPath(
                 &panel,
-                wizard.seamPreviews[seamIndex]
-                    ->destinationTail.candidate);
+                *destinationPath);
             DrawAnimationCurveOverlay(
                 destinationPrepared,
                 matrices,
@@ -45211,10 +45273,16 @@ void DrawReciprocalPanViewportOverlay(
     }
 
     const auto& io = ImGui::GetIO();
+    const bool seamReviewSmoothingActive =
+        std::any_of(
+            wizard.seamReviewSmoothingInProgress.begin(),
+            wizard.seamReviewSmoothingInProgress.end(),
+            [](bool active) { return active; });
     const bool viewportInteractive =
         wizard.stage != AnimationReciprocalPanWizardStage::Preview &&
         !wizard.orbitInspectionActive &&
         !wizard.inspectionActive && !wizard.fitInProgress &&
+        !seamReviewSmoothingActive &&
         IsMouseOverRenderViewport(viewport) &&
         !viewport.UiWantsMouseCapture() &&
         viewedRole == wizard.endpointTriangles[activeTriangle].pathRole;
@@ -50725,7 +50793,8 @@ bool DrawAnimationLoopTimelineRow(
         invisible_places::camera::AnimationLoopKeyMovement>* keyMovements,
     const std::unordered_set<std::string>* lockedKeyIds = nullptr,
     const std::unordered_set<std::string>* generatedKeyIds = nullptr,
-    const std::unordered_set<std::string>* constrainedKeyIds = nullptr) {
+    const std::unordered_set<std::string>* constrainedKeyIds = nullptr,
+    const std::unordered_set<std::string>* disabledKeyIds = nullptr) {
     const float duration = std::max(
         invisible_places::camera::AnimationPathDurationSeconds(path),
         1.0e-4F);
@@ -50867,13 +50936,16 @@ bool DrawAnimationLoopTimelineRow(
         const bool locked =
             lockedKeyIds != nullptr &&
             lockedKeyIds->contains(path.keys[keyIndex].id);
+        const bool disabled =
+            disabledKeyIds != nullptr &&
+            disabledKeyIds->contains(path.keys[keyIndex].id);
         const bool constrained =
             constrainedKeyIds != nullptr &&
             constrainedKeyIds->contains(path.keys[keyIndex].id);
         const bool enabled =
-            !locked && movableKeyIds != nullptr &&
+            !locked && !disabled && movableKeyIds != nullptr &&
             movableKeyIds->contains(path.keys[keyIndex].id);
-        const bool eligible = !locked &&
+        const bool eligible = !locked && !disabled &&
             (constrained || enabled || AnimationLoopKeyIsEligible(
                             path,
                             keyIndex,
@@ -50887,7 +50959,9 @@ bool DrawAnimationLoopTimelineRow(
             timelineState->strongDestinationRow == rowIndex &&
             timelineState->strongDestinationKeyId ==
                 path.keys[keyIndex].id;
-        const ImU32 color = locked
+        const ImU32 color = disabled
+                                ? IM_COL32(105, 105, 105, 180)
+                            : locked
                                 ? IM_COL32(70, 205, 245, 255)
                             : constrained
                                 ? (enabled
@@ -50938,13 +51012,16 @@ bool DrawAnimationLoopTimelineRow(
         const bool locked =
             lockedKeyIds != nullptr &&
             lockedKeyIds->contains(key.id);
+        const bool disabled =
+            disabledKeyIds != nullptr &&
+            disabledKeyIds->contains(key.id);
         const bool constrained =
             constrainedKeyIds != nullptr &&
             constrainedKeyIds->contains(key.id);
         const bool enabled =
-            !locked && movableKeyIds != nullptr &&
+            !locked && !disabled && movableKeyIds != nullptr &&
             movableKeyIds->contains(key.id);
-        const bool eligible = !locked &&
+        const bool eligible = !locked && !disabled &&
             (constrained || enabled || AnimationLoopKeyIsEligible(
                             path,
                             keyIndex,
@@ -50978,7 +51055,9 @@ bool DrawAnimationLoopTimelineRow(
             key.sourceShotName.empty()
                 ? ""
                 : ("  " + key.sourceShotName).c_str(),
-            locked
+            disabled
+                ? "Outside this seam's pre-roll/ending review band"
+            : locked
                 ? "Feature lock: preserves the exact triangle-aligned midpoint"
             : constrained
                 ? (enabled
@@ -52249,30 +52328,40 @@ void ShowReciprocalPanWizardCanonicalPose(
                     false);
             }
         } else if (wizard.seamReviewView == 0) {
-            const auto& source = wizard.seamPreviews[seamIndex]
-                                     ->sourceHead.candidate;
+            const auto* source = ReciprocalPanEffectiveSeamReviewPath(
+                wizard,
+                seamIndex,
+                sourceRole);
+            if (source == nullptr) {
+                return;
+            }
             const std::int64_t sourceFrame =
                 static_cast<std::int64_t>(
                     wizard.sourceTailFrames[sourceRole]) + offset;
             ApplyAnimationEvaluation(
                 runtimeState,
-                source,
+                *source,
                 ReciprocalPanFramePosition(
-                    source,
+                    *source,
                     static_cast<std::uint32_t>(sourceFrame)),
                 false);
         } else {
-            const auto& destination = wizard.seamPreviews[seamIndex]
-                                          ->destinationTail.candidate;
+            const auto* destination = ReciprocalPanEffectiveSeamReviewPath(
+                wizard,
+                seamIndex,
+                destinationRole);
+            if (destination == nullptr) {
+                return;
+            }
             const std::int64_t destinationFrame =
                 static_cast<std::int64_t>(
                     ReciprocalPanPathFrameCount(
                         wizard.baselinePaths[destinationRole])) + offset;
             ApplyAnimationEvaluation(
                 runtimeState,
-                destination,
+                *destination,
                 ReciprocalPanFramePosition(
-                    destination,
+                    *destination,
                     static_cast<std::uint32_t>(destinationFrame)),
                 false);
         }
@@ -52513,6 +52602,127 @@ void InvalidateReciprocalPanSmoothingDiagnostics(
     wizard->smoothingError.clear();
 }
 
+void ResetReciprocalPanSeamReviewSmoothing(
+    AnimationReciprocalPanWizardState* wizard,
+    std::size_t seamIndex,
+    bool resetSelection) {
+    if (wizard == nullptr || seamIndex > 1U) {
+        return;
+    }
+    ++wizard->smoothingGeneration;
+    wizard->seamReviewSmoothedCandidates[seamIndex].reset();
+    wizard->seamReviewSmoothingResults[seamIndex].reset();
+    wizard->seamReviewSmoothingInProgress[seamIndex] = false;
+    wizard->seamReviewSmoothingErrors[seamIndex].clear();
+    if (resetSelection) {
+        wizard->seamReviewMovableKeyIds[seamIndex] = {};
+        wizard->seamReviewSelectionInitialized[seamIndex] = false;
+    }
+}
+
+std::unordered_set<std::string> ReciprocalPanGeneratedKeyIds(
+    const AnimationPath& baseline,
+    const AnimationPath& candidate) {
+    std::unordered_set<std::string> originalIds;
+    for (const auto& key : baseline.keys) {
+        originalIds.insert(key.id);
+    }
+    std::unordered_set<std::string> generated;
+    for (const auto& key : candidate.keys) {
+        if (!originalIds.contains(key.id)) {
+            generated.insert(key.id);
+        }
+    }
+    return generated;
+}
+
+void InitializeReciprocalPanSeamReviewSelection(
+    AnimationReciprocalPanWizardState* wizard,
+    std::size_t seamIndex) {
+    if (wizard == nullptr || seamIndex > 1U ||
+        !wizard->seamPreviews[seamIndex].has_value()) {
+        return;
+    }
+    ResetReciprocalPanSeamReviewSmoothing(wizard, seamIndex, false);
+    auto& selections = wizard->seamReviewMovableKeyIds[seamIndex];
+    selections = {};
+    const std::size_t sourceRole = seamIndex;
+    const std::size_t destinationRole = seamIndex == 0U ? 1U : 0U;
+    const auto* sourcePath = ReciprocalPanEffectiveSeamReviewPath(
+        *wizard,
+        seamIndex,
+        sourceRole);
+    const auto* destinationPath = ReciprocalPanEffectiveSeamReviewPath(
+        *wizard,
+        seamIndex,
+        destinationRole);
+    if (sourcePath == nullptr || destinationPath == nullptr) {
+        return;
+    }
+    const auto addGenerated = [&](std::size_t role,
+                                  const AnimationPath& candidate) {
+        const auto generated = ReciprocalPanGeneratedKeyIds(
+            wizard->baselinePaths[role],
+            candidate);
+        selections[role].insert(generated.begin(), generated.end());
+    };
+    addGenerated(sourceRole, *sourcePath);
+    addGenerated(destinationRole, *destinationPath);
+
+    const auto& sourceBaseline = wizard->baselinePaths[sourceRole];
+    const auto& destinationBaseline = wizard->baselinePaths[destinationRole];
+    const float reviewSeconds =
+        2.0F * static_cast<float>(wizard->sourceTailFrames[sourceRole]) /
+        30.0F;
+    const auto keyTimeById = [](const AnimationPath& path,
+                                std::string_view id)
+        -> std::optional<float> {
+        const auto found = std::find_if(
+            path.keys.begin(),
+            path.keys.end(),
+            [&](const auto& key) { return key.id == id; });
+        if (found == path.keys.end()) {
+            return std::nullopt;
+        }
+        return AnimationLoopKeyTimeSeconds(
+            path,
+            static_cast<std::size_t>(found - path.keys.begin()));
+    };
+    if (!sourceBaseline.keys.empty()) {
+        selections[sourceRole].insert(sourceBaseline.keys.front().id);
+    }
+    if (!destinationBaseline.keys.empty()) {
+        selections[destinationRole].insert(
+            destinationBaseline.keys.back().id);
+    }
+    // Include the two nearest authored controls on the interior side. These
+    // are the controls that can spread a sharp 50% endpoint correction over
+    // the established pan without changing any segment timing.
+    for (std::size_t distance = 1U; distance <= 2U; ++distance) {
+        if (distance < sourceBaseline.keys.size()) {
+            const auto& key = sourceBaseline.keys[distance];
+            const auto keyTime = keyTimeById(*sourcePath, key.id);
+            if (key.linkedCameraId.empty() && keyTime.has_value() &&
+                keyTime.value() <= reviewSeconds + 1.0e-5F) {
+                selections[sourceRole].insert(key.id);
+            }
+        }
+        if (distance < destinationBaseline.keys.size()) {
+            const auto& key = destinationBaseline.keys[
+                destinationBaseline.keys.size() - 1U - distance];
+            const auto keyTime = keyTimeById(*destinationPath, key.id);
+            const float destinationDuration = invisible_places::camera::
+                AnimationPathDurationSeconds(*destinationPath);
+            if (key.linkedCameraId.empty() && keyTime.has_value() &&
+                keyTime.value() >=
+                    destinationDuration - reviewSeconds - 1.0e-5F) {
+                selections[destinationRole].insert(key.id);
+            }
+        }
+    }
+    wizard->seamReviewSelectionInitialized[seamIndex] = true;
+}
+
 std::unordered_set<std::string> ReciprocalPanMidpointKeyIds(
     const AnimationReciprocalPanWizardState& wizard,
     std::size_t role) {
@@ -52549,19 +52759,12 @@ std::unordered_set<std::string> ReciprocalPanGeneratedKeyIds(
         role >= wizard.baselinePaths.size()) {
         return generated;
     }
-    std::unordered_set<std::string> originalIds;
-    for (const auto& key : wizard.baselinePaths[role].keys) {
-        originalIds.insert(key.id);
-    }
     const auto& candidate = role == 0U
         ? wizard.candidate->firstCandidate
         : wizard.candidate->secondCandidate;
-    for (const auto& key : candidate.keys) {
-        if (!originalIds.contains(key.id)) {
-            generated.insert(key.id);
-        }
-    }
-    return generated;
+    return ReciprocalPanGeneratedKeyIds(
+        wizard.baselinePaths[role],
+        candidate);
 }
 
 void InitializeReciprocalPanSmoothingSelection(
@@ -52604,6 +52807,32 @@ void InitializeReciprocalPanSmoothingSelection(
         }
         wizard->previewScrubFrames[role] =
             wizard->sourceTailFrames[role];
+    }
+    const bool hasReviewedSelection = std::any_of(
+        wizard->seamReviewSelectionInitialized.begin(),
+        wizard->seamReviewSelectionInitialized.end(),
+        [](bool initialized) { return initialized; });
+    if (hasReviewedSelection) {
+        // Generated key IDs are rebuilt for the combined candidate, but every
+        // authored key keeps its persistent ID. Replay the user's per-seam
+        // authored choices and leave all newly generated controls enabled.
+        for (std::size_t role = 0U; role < 2U; ++role) {
+            auto& selected = wizard->smoothingMovableKeyIds[role];
+            for (const auto& key : wizard->baselinePaths[role].keys) {
+                selected.erase(key.id);
+            }
+            for (std::size_t seamIndex = 0U; seamIndex < 2U; ++seamIndex) {
+                if (!wizard->seamReviewSelectionInitialized[seamIndex]) {
+                    continue;
+                }
+                for (const auto& key : wizard->baselinePaths[role].keys) {
+                    if (wizard->seamReviewMovableKeyIds[seamIndex][role]
+                            .contains(key.id)) {
+                        selected.insert(key.id);
+                    }
+                }
+            }
+        }
     }
     wizard->smoothingSelectedRole = 0;
     wizard->smoothingSelectedKeyId =
@@ -52814,6 +53043,16 @@ void PollAnimationReciprocalPanFitJob(
     InitializeReciprocalPanSmoothingSelection(&wizard);
     if (wizard.stage == AnimationReciprocalPanWizardStage::Preview) {
         ShowReciprocalPanWizardCanonicalPose(runtimeState);
+        const bool replayReviewedSmoothing = std::any_of(
+            wizard.seamReviewSmoothedCandidates.begin(),
+            wizard.seamReviewSmoothedCandidates.end(),
+            [](const auto& candidate) { return candidate.has_value(); });
+        if (replayReviewedSmoothing) {
+            StartReciprocalPanTransitionSmoothing(
+                runtimeState,
+                currentAspectRatio,
+                wizard.smoothingObjective);
+        }
     }
 }
 
@@ -52884,6 +53123,243 @@ BuildReciprocalPanSmoothingOptions(
     addMidpointConstraint(1U, 3U, 2U);  // A-end <-> B-start.
     options.triangleAlignmentWeight = 8.0F;
     return options;
+}
+
+invisible_places::camera::AnimationLoopSmoothingOptions
+BuildReciprocalPanSeamReviewSmoothingOptions(
+    const AnimationReciprocalPanWizardState& wizard,
+    std::size_t seamIndex,
+    invisible_places::camera::AnimationLoopSpatialObjective objective) {
+    invisible_places::camera::AnimationLoopSmoothingOptions options;
+    if (seamIndex > 1U ||
+        !wizard.seamPreviews[seamIndex].has_value()) {
+        options.enabledSeams = {false, false};
+        return options;
+    }
+    options.maxEndMoveFraction = std::clamp(
+        wizard.smoothingMaxMovePercent / 100.0F,
+        0.01F,
+        0.25F);
+    options.useExplicitKeySelection = true;
+    const auto* first = ReciprocalPanEffectiveSeamReviewPath(
+        wizard,
+        seamIndex,
+        0U);
+    const auto* second = ReciprocalPanEffectiveSeamReviewPath(
+        wizard,
+        seamIndex,
+        1U);
+    if (first != nullptr && second != nullptr) {
+        options.firstMovableKeyIds = OrderedReciprocalPanSmoothingKeyIds(
+            *first,
+            wizard.seamReviewMovableKeyIds[seamIndex][0U]);
+        options.secondMovableKeyIds = OrderedReciprocalPanSmoothingKeyIds(
+            *second,
+            wizard.seamReviewMovableKeyIds[seamIndex][1U]);
+    }
+    const float overlapSeconds =
+        2.0F * static_cast<float>(wizard.sourceTailFrames[seamIndex]) /
+        30.0F;
+    if (seamIndex == 0U) {
+        // B-end -> A-start is the core solver's second-end -> first-start
+        // seam when candidates remain in stable A/B order.
+        options.firstStartOverlapSeconds = overlapSeconds;
+        options.secondEndOverlapSeconds = overlapSeconds;
+        options.enabledSeams = {false, true};
+    } else {
+        // A-end -> B-start is first-end -> second-start.
+        options.firstEndOverlapSeconds = overlapSeconds;
+        options.secondStartOverlapSeconds = overlapSeconds;
+        options.enabledSeams = {true, false};
+    }
+    options.horizontalBlend = wizard.horizontalBlend;
+    options.panRight = wizard.panRight;
+    options.maxOptimizationSweeps = 16U;
+    options.minimumStepFraction = 0.0125F;
+    options.imageRotationMismatchWeight = 0.35F;
+    options.selectedNeighborhoodSmoothnessWeight = 1.50F;
+    options.spatialObjective = objective;
+    options.perceivedSpeedMode = wizard.smoothingSpeedMethod;
+
+    const auto midpointPairs = ReciprocalPanMidpointKeyPairs(wizard);
+    const auto& midpoint = midpointPairs[seamIndex];
+    if (wizard.seamReviewMovableKeyIds[seamIndex][0U].contains(
+            midpoint.first) &&
+        wizard.seamReviewMovableKeyIds[seamIndex][1U].contains(
+            midpoint.second)) {
+        options.triangleAlignmentConstraints.push_back({
+            .firstKeyId = midpoint.first,
+            .secondKeyId = midpoint.second,
+            .firstPatch = seamIndex == 0U
+                ? wizard.endpointTriangles[0U].patch
+                : wizard.endpointTriangles[3U].patch,
+            .secondPatch = seamIndex == 0U
+                ? wizard.endpointTriangles[1U].patch
+                : wizard.endpointTriangles[2U].patch,
+        });
+    }
+    options.triangleAlignmentWeight = 8.0F;
+    return options;
+}
+
+bool StartReciprocalPanSeamReviewSmoothing(
+    PreviewRuntimeState* runtimeState,
+    std::size_t seamIndex,
+    float currentAspectRatio,
+    invisible_places::camera::AnimationLoopSpatialObjective objective) {
+    if (runtimeState == nullptr || seamIndex > 1U) {
+        return false;
+    }
+    auto& wizard = runtimeState->animationPanel.reciprocalPanWizard;
+    const auto expectedStage = seamIndex == 0U
+        ? AnimationReciprocalPanWizardStage::Seam1Review
+        : AnimationReciprocalPanWizardStage::Seam2Review;
+    if (wizard.stage != expectedStage ||
+        !wizard.seamPreviews[seamIndex].has_value() ||
+        wizard.fitInProgress ||
+        wizard.seamReviewSmoothingInProgress[seamIndex]) {
+        return false;
+    }
+    std::string validationError;
+    if (!ValidateReciprocalPanWizardStaleState(
+            *runtimeState,
+            currentAspectRatio,
+            &validationError)) {
+        wizard.seamReviewSmoothingErrors[seamIndex] =
+            std::move(validationError);
+        return false;
+    }
+    if (!wizard.seamReviewSelectionInitialized[seamIndex]) {
+        InitializeReciprocalPanSeamReviewSelection(&wizard, seamIndex);
+    }
+    const auto midpoint = ReciprocalPanMidpointKeyPairs(wizard)[seamIndex];
+    const bool firstMidpoint =
+        wizard.seamReviewMovableKeyIds[seamIndex][0U].contains(
+            midpoint.first);
+    const bool secondMidpoint =
+        wizard.seamReviewMovableKeyIds[seamIndex][1U].contains(
+            midpoint.second);
+    if (firstMidpoint != secondMidpoint) {
+        wizard.seamReviewMovableKeyIds[seamIndex][0U].insert(
+            midpoint.first);
+        wizard.seamReviewMovableKeyIds[seamIndex][1U].insert(
+            midpoint.second);
+    }
+    if (wizard.seamReviewMovableKeyIds[seamIndex][0U].empty() &&
+        wizard.seamReviewMovableKeyIds[seamIndex][1U].empty()) {
+        wizard.seamReviewSmoothingErrors[seamIndex] =
+            "Select at least one generated or authored key on the seam timelines.";
+        return false;
+    }
+
+    std::array<std::unordered_set<std::string>, 2U> selectedOriginalIds;
+    for (std::size_t role = 0U; role < 2U; ++role) {
+        for (const auto& key : wizard.baselinePaths[role].keys) {
+            if (wizard.seamReviewMovableKeyIds[seamIndex][role].contains(
+                    key.id)) {
+                selectedOriginalIds[role].insert(key.id);
+            }
+        }
+    }
+    const auto firstIndex = FindAnimationRegistryIndex(
+        runtimeState->animationPanel,
+        wizard.filePaths[0U]);
+    const auto secondIndex = FindAnimationRegistryIndex(
+        runtimeState->animationPanel,
+        wizard.filePaths[1U]);
+    if (!firstIndex.has_value() || !secondIndex.has_value() ||
+        !ValidateLoopSmoothingMovableLinks(
+            *runtimeState,
+            firstIndex.value(),
+            secondIndex.value(),
+            selectedOriginalIds[0U],
+            selectedOriginalIds[1U],
+            &validationError)) {
+        wizard.seamReviewSmoothingErrors[seamIndex] =
+            validationError.empty()
+            ? "The selected A/B seam keys are no longer available."
+            : std::move(validationError);
+        return false;
+    }
+
+    const auto* firstPath = ReciprocalPanEffectiveSeamReviewPath(
+        wizard,
+        seamIndex,
+        0U);
+    const auto* secondPath = ReciprocalPanEffectiveSeamReviewPath(
+        wizard,
+        seamIndex,
+        1U);
+    if (firstPath == nullptr || secondPath == nullptr) {
+        return false;
+    }
+    std::array<AnimationPath, 2U> candidates{*firstPath, *secondPath};
+    const std::array<std::vector<std::string>, 2U> movableIds{
+        OrderedReciprocalPanSmoothingKeyIds(
+            candidates[0U],
+            wizard.seamReviewMovableKeyIds[seamIndex][0U]),
+        OrderedReciprocalPanSmoothingKeyIds(
+            candidates[1U],
+            wizard.seamReviewMovableKeyIds[seamIndex][1U]),
+    };
+    auto options = BuildReciprocalPanSeamReviewSmoothingOptions(
+        wizard,
+        seamIndex,
+        objective);
+    options.firstMovableKeyIds = movableIds[0U];
+    options.secondMovableKeyIds = movableIds[1U];
+    wizard.smoothingObjective = objective;
+
+    auto& job = runtimeState->animationReciprocalPanSmoothingJob;
+    if (job.shared != nullptr) {
+        wizard.seamReviewSmoothingErrors[seamIndex] =
+            "The previous transition-smoothing pass is still finishing.";
+        return false;
+    }
+    const std::uint64_t generation = ++wizard.smoothingGeneration;
+    job.activeGeneration = generation;
+    job.shared =
+        std::make_shared<AnimationReciprocalPanSmoothingJobShared>();
+    const auto shared = job.shared;
+    const auto filePaths = wizard.filePaths;
+    const auto baselineFingerprints = wizard.baselineFingerprints;
+    const std::array<std::uint64_t, 2U> candidateFingerprints{
+        AnimationPathMotionFingerprint(candidates[0U]),
+        AnimationPathMotionFingerprint(candidates[1U]),
+    };
+    job.worker = std::jthread(
+        [shared,
+         generation,
+         seamIndex,
+         filePaths,
+         baselineFingerprints,
+         candidateFingerprints,
+         movableIds,
+         candidates = std::move(candidates),
+         options = std::move(options)](std::stop_token stopToken) mutable {
+            AnimationReciprocalPanSmoothingJobResult completed{
+                .generation = generation,
+                .filePaths = filePaths,
+                .baselineFingerprints = baselineFingerprints,
+                .candidateFingerprints = candidateFingerprints,
+                .movableKeyIds = movableIds,
+                .candidates = std::move(candidates),
+                .seamReviewIndex = seamIndex,
+            };
+            options.stopToken = stopToken;
+            completed.result = invisible_places::camera::
+                SmoothAnimationLoopTransitions(
+                    &completed.candidates[0U],
+                    &completed.candidates[1U],
+                    options);
+            std::scoped_lock lock{shared->mutex};
+            shared->result = std::move(completed);
+            shared->completed = true;
+        });
+    wizard.seamReviewSmoothingInProgress[seamIndex] = true;
+    wizard.seamReviewSmoothingResults[seamIndex].reset();
+    wizard.seamReviewSmoothingErrors[seamIndex].clear();
+    return true;
 }
 
 bool MoveReciprocalPanSmoothingKey(
@@ -53194,37 +53670,87 @@ void PollAnimationReciprocalPanSmoothingJob(
         return;
     }
     auto& wizard = runtimeState->animationPanel.reciprocalPanWizard;
-    if (!wizard.Active() ||
-        wizard.stage != AnimationReciprocalPanWizardStage::Preview ||
-        !wizard.candidate.has_value() ||
+    const bool seamReviewJob = completed->seamReviewIndex.has_value();
+    const std::size_t seamIndex = seamReviewJob
+        ? std::min<std::size_t>(completed->seamReviewIndex.value(), 1U)
+        : 0U;
+    const auto expectedSeamStage = seamIndex == 0U
+        ? AnimationReciprocalPanWizardStage::Seam1Review
+        : AnimationReciprocalPanWizardStage::Seam2Review;
+    const bool expectedTarget = seamReviewJob
+        ? wizard.stage == expectedSeamStage &&
+              wizard.seamPreviews[seamIndex].has_value()
+        : wizard.stage == AnimationReciprocalPanWizardStage::Preview &&
+              wizard.candidate.has_value();
+    if (!wizard.Active() || !expectedTarget ||
         completed->generation != wizard.smoothingGeneration ||
         completed->generation != job.activeGeneration ||
         completed->filePaths != wizard.filePaths ||
         completed->baselineFingerprints != wizard.baselineFingerprints) {
         return;
     }
-    wizard.smoothingInProgress = false;
+    if (seamReviewJob) {
+        wizard.seamReviewSmoothingInProgress[seamIndex] = false;
+    } else {
+        wizard.smoothingInProgress = false;
+    }
     std::string staleError;
     if (!ValidateReciprocalPanWizardStaleState(
             *runtimeState,
             currentAspectRatio,
             &staleError)) {
-        wizard.smoothingError = std::move(staleError);
+        if (seamReviewJob) {
+            wizard.seamReviewSmoothingErrors[seamIndex] =
+                std::move(staleError);
+        } else {
+            wizard.smoothingError = std::move(staleError);
+        }
         return;
     }
-    const std::array<const AnimationPath*, 2U> rawCandidates{
-        &ReciprocalPanEffectiveCandidatePath(wizard, 0U),
-        &ReciprocalPanEffectiveCandidatePath(wizard, 1U),
-    };
+    const std::array<const AnimationPath*, 2U> rawCandidates =
+        seamReviewJob
+        ? std::array<const AnimationPath*, 2U>{
+              ReciprocalPanEffectiveSeamReviewPath(
+                  wizard, seamIndex, 0U),
+              ReciprocalPanEffectiveSeamReviewPath(
+                  wizard, seamIndex, 1U),
+          }
+        : std::array<const AnimationPath*, 2U>{
+              &ReciprocalPanEffectiveCandidatePath(wizard, 0U),
+              &ReciprocalPanEffectiveCandidatePath(wizard, 1U),
+          };
     for (std::size_t role = 0U; role < 2U; ++role) {
-        if (AnimationPathMotionFingerprint(*rawCandidates[role]) !=
+        const auto& selected = seamReviewJob
+            ? wizard.seamReviewMovableKeyIds[seamIndex][role]
+            : wizard.smoothingMovableKeyIds[role];
+        if (rawCandidates[role] == nullptr ||
+            AnimationPathMotionFingerprint(*rawCandidates[role]) !=
                 completed->candidateFingerprints[role] ||
             OrderedReciprocalPanSmoothingKeyIds(
                 *rawCandidates[role],
-                wizard.smoothingMovableKeyIds[role]) !=
+                selected) !=
                 completed->movableKeyIds[role]) {
             return;
         }
+    }
+    if (seamReviewJob) {
+        wizard.seamReviewSmoothingResults[seamIndex] = completed->result;
+        if (!completed->result.succeeded || !completed->result.changed) {
+            wizard.seamReviewSmoothingErrors[seamIndex] =
+                completed->result.errorMessage.empty()
+                ? "No selected-key movement improved this seam transition."
+                : completed->result.errorMessage;
+            return;
+        }
+        wizard.seamReviewSmoothedCandidates[seamIndex] =
+            std::move(completed->candidates);
+        wizard.seamReviewSmoothingErrors[seamIndex].clear();
+        runtimeState->animationPanel.preparedPathCache = {};
+        runtimeState->animationPanel.motionStatsCache = {};
+        runtimeState->animationPanel.perceivedFlowCache = {};
+        runtimeState->previewRenderStateSignatureValid = false;
+        ShowReciprocalPanWizardCanonicalPose(runtimeState);
+        return;
     }
     wizard.smoothingResult = completed->result;
     if (!completed->result.succeeded || !completed->result.changed) {
@@ -53323,6 +53849,10 @@ bool RebuildReciprocalPanSeamPreview(
         });
     wizard.fitInProgress = true;
     wizard.seamPreviews[seamIndex].reset();
+    ResetReciprocalPanSeamReviewSmoothing(
+        &wizard,
+        seamIndex,
+        true);
     wizard.seamReviewEditableSide = std::clamp(
         wizard.seamReviewEditableSide,
         0,
@@ -53394,6 +53924,9 @@ void PollAnimationPanSeamPreviewJob(
     }
     wizard.seamPreviews[completed->seamIndex] =
         std::move(completed->result);
+    InitializeReciprocalPanSeamReviewSelection(
+        &wizard,
+        completed->seamIndex);
     wizard.errorMessage.clear();
     ShowReciprocalPanWizardCanonicalPose(runtimeState);
 }
@@ -54223,6 +54756,12 @@ void InvalidateReciprocalPanWizardCandidate(
     ++wizard->smoothingGeneration;
     wizard->smoothingError.clear();
     wizard->seamPreviews = {};
+    wizard->seamReviewSmoothedCandidates = {};
+    wizard->seamReviewSmoothingResults = {};
+    wizard->seamReviewMovableKeyIds = {};
+    wizard->seamReviewSelectionInitialized = {};
+    wizard->seamReviewSmoothingInProgress = {};
+    wizard->seamReviewSmoothingErrors = {};
     wizard->fitInProgress = false;
     wizard->errorMessage.clear();
 }
@@ -54300,6 +54839,10 @@ void BackReciprocalPanWizard(PreviewRuntimeState* runtimeState) {
                 AnimationReciprocalPanWizardStage::Seam1DestinationTriangle;
             break;
         case AnimationReciprocalPanWizardStage::Seam1Review:
+            ResetReciprocalPanSeamReviewSmoothing(
+                &wizard,
+                0U,
+                true);
             wizard.stage =
                 AnimationReciprocalPanWizardStage::Seam1TailExtent;
             break;
@@ -54322,6 +54865,10 @@ void BackReciprocalPanWizard(PreviewRuntimeState* runtimeState) {
                 AnimationReciprocalPanWizardStage::Seam2DestinationTriangle;
             break;
         case AnimationReciprocalPanWizardStage::Seam2Review:
+            ResetReciprocalPanSeamReviewSmoothing(
+                &wizard,
+                1U,
+                true);
             wizard.stage =
                 AnimationReciprocalPanWizardStage::Seam2TailExtent;
             break;
@@ -54395,9 +54942,11 @@ bool ReciprocalPanStageHasRequiredObservation(
                            wizard.baselinePaths[0U]);
         case AnimationReciprocalPanWizardStage::Seam1Review:
             return !wizard.fitInProgress &&
+                   !wizard.seamReviewSmoothingInProgress[0U] &&
                    wizard.seamPreviews[0U].has_value();
         case AnimationReciprocalPanWizardStage::Seam2Review:
             return !wizard.fitInProgress &&
+                   !wizard.seamReviewSmoothingInProgress[1U] &&
                    wizard.seamPreviews[1U].has_value();
         case AnimationReciprocalPanWizardStage::EditCorrespondences:
             return std::all_of(
@@ -54684,6 +55233,274 @@ void DrawReciprocalPanSpeedGraphs(
     }
     ImGui::TextDisabled(
         "Cyan lines are the paired 50%% triangle poses; white is the current loop position.");
+}
+
+void DrawReciprocalPanSeamReviewSmoothingControls(
+    PreviewRuntimeState* runtimeState,
+    std::size_t seamIndex,
+    float aspectRatio) {
+    if (runtimeState == nullptr || seamIndex > 1U) {
+        return;
+    }
+    auto& wizard = runtimeState->animationPanel.reciprocalPanWizard;
+    if (!wizard.seamPreviews[seamIndex].has_value()) {
+        return;
+    }
+    if (!wizard.seamReviewSelectionInitialized[seamIndex]) {
+        InitializeReciprocalPanSeamReviewSelection(&wizard, seamIndex);
+    }
+    const std::size_t sourceRole = seamIndex;
+    const std::size_t destinationRole = seamIndex == 0U ? 1U : 0U;
+    const auto* sourcePath = ReciprocalPanEffectiveSeamReviewPath(
+        wizard,
+        seamIndex,
+        sourceRole);
+    const auto* destinationPath = ReciprocalPanEffectiveSeamReviewPath(
+        wizard,
+        seamIndex,
+        destinationRole);
+    if (sourcePath == nullptr || destinationPath == nullptr) {
+        return;
+    }
+
+    ImGui::SeparatorText("Pre-roll transition keys");
+    ImGui::TextWrapped(
+        "Click timeline keys to choose which camera/focus controls may move around this 50%% perspective change. Cyan is the paired triangle pose, green may move, amber is available, and diamonds are generated. Segment frames and duration weights never move.");
+    const bool smoothingInProgress =
+        wizard.seamReviewSmoothingInProgress[seamIndex];
+    ImGui::BeginDisabled(smoothingInProgress);
+    if (ImGui::Button("Recommended keys")) {
+        InitializeReciprocalPanSeamReviewSelection(&wizard, seamIndex);
+        ShowReciprocalPanWizardCanonicalPose(runtimeState);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Generated only")) {
+        wizard.seamReviewMovableKeyIds[seamIndex] = {};
+        for (std::size_t role = 0U; role < 2U; ++role) {
+            const auto* path = ReciprocalPanEffectiveSeamReviewPath(
+                wizard,
+                seamIndex,
+                role);
+            if (path == nullptr) {
+                continue;
+            }
+            const auto generated = ReciprocalPanGeneratedKeyIds(
+                wizard.baselinePaths[role],
+                *path);
+            wizard.seamReviewMovableKeyIds[seamIndex][role].insert(
+                generated.begin(),
+                generated.end());
+        }
+        wizard.seamReviewSmoothingResults[seamIndex].reset();
+        wizard.seamReviewSmoothingErrors[seamIndex].clear();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Clear")) {
+        wizard.seamReviewMovableKeyIds[seamIndex] = {};
+        wizard.seamReviewSmoothingResults[seamIndex].reset();
+        wizard.seamReviewSmoothingErrors[seamIndex].clear();
+    }
+
+    const auto midpointPair =
+        ReciprocalPanMidpointKeyPairs(wizard)[seamIndex];
+    const std::array<bool, 2U> midpointSelectionBefore{
+        wizard.seamReviewMovableKeyIds[seamIndex][0U].contains(
+            midpointPair.first),
+        wizard.seamReviewMovableKeyIds[seamIndex][1U].contains(
+            midpointPair.second),
+    };
+    const float overlapSeconds =
+        2.0F * static_cast<float>(wizard.sourceTailFrames[sourceRole]) /
+        30.0F;
+    bool selectionChanged = false;
+    for (std::size_t role = 0U; role < 2U; ++role) {
+        const auto* path = role == sourceRole ? sourcePath : destinationPath;
+        const bool sourceSide = role == sourceRole;
+        const float startOverlap = sourceSide ? overlapSeconds : 0.0F;
+        const float endOverlap = sourceSide ? 0.0F : overlapSeconds;
+        const float durationSeconds = invisible_places::camera::
+            AnimationPathDurationSeconds(*path);
+        const auto generated = ReciprocalPanGeneratedKeyIds(
+            wizard.baselinePaths[role],
+            *path);
+        std::unordered_set<std::string> constrained;
+        constrained.insert(role == 0U
+            ? midpointPair.first
+            : midpointPair.second);
+        std::unordered_set<std::string> outsideReviewBand;
+        for (std::size_t keyIndex = 0U;
+             keyIndex < path->keys.size();
+             ++keyIndex) {
+            const float keySeconds = AnimationLoopKeyTimeSeconds(
+                *path,
+                keyIndex);
+            const bool inReviewBand = sourceSide
+                ? keySeconds <= overlapSeconds + 1.0e-5F
+                : keySeconds >=
+                      durationSeconds - overlapSeconds - 1.0e-5F;
+            if (!inReviewBand) {
+                outsideReviewBand.insert(path->keys[keyIndex].id);
+            }
+        }
+        const std::int64_t frame = sourceSide
+            ? static_cast<std::int64_t>(
+                  wizard.sourceTailFrames[sourceRole]) +
+                  wizard.seamReviewOffsetFrame
+            : static_cast<std::int64_t>(ReciprocalPanPathFrameCount(
+                  wizard.baselinePaths[destinationRole])) +
+                  wizard.seamReviewOffsetFrame;
+        const float displayedPosition =
+            static_cast<float>(std::clamp<std::int64_t>(
+                frame,
+                0,
+                ReciprocalPanPathFrameCount(*path))) /
+            static_cast<float>(std::max<std::uint32_t>(
+                ReciprocalPanPathFrameCount(*path),
+                1U));
+        const auto* result =
+            wizard.seamReviewSmoothingResults[seamIndex].has_value()
+            ? &wizard.seamReviewSmoothingResults[seamIndex].value()
+            : nullptr;
+        ImGui::PushID(static_cast<int>(100 + seamIndex * 2U + role));
+        selectionChanged |= DrawAnimationLoopTimelineRow(
+            sourceSide
+                ? (role == 0U ? "A pre-roll / opening keys"
+                              : "B pre-roll / opening keys")
+                : (role == 0U ? "A ending / generated-tail keys"
+                              : "B ending / generated-tail keys"),
+            wizard.filePaths[role],
+            *path,
+            invisible_places::camera::AnimationPathDurationSeconds(
+                role == sourceRole ? *destinationPath : *sourcePath),
+            -1,
+            nullptr,
+            startOverlap,
+            endOverlap,
+            1.0e-5F,
+            false,
+            true,
+            displayedPosition,
+            ReciprocalPanCurrentViewRole(wizard) ==
+                static_cast<int>(role),
+            &wizard.seamReviewMovableKeyIds[seamIndex][role],
+            nullptr,
+            nullptr,
+            nullptr,
+            result != nullptr
+                ? &result->screenDisplacementSamples[role]
+                : nullptr,
+            result != nullptr
+                ? result->maxScreenDisplacement[role]
+                : 0.0F,
+            result != nullptr ? &result->keyMovements[role] : nullptr,
+            nullptr,
+            &generated,
+            &constrained,
+            &outsideReviewBand);
+        ImGui::PopID();
+    }
+    if (selectionChanged) {
+        const bool firstSelected =
+            wizard.seamReviewMovableKeyIds[seamIndex][0U].contains(
+                midpointPair.first);
+        const bool secondSelected =
+            wizard.seamReviewMovableKeyIds[seamIndex][1U].contains(
+                midpointPair.second);
+        if (firstSelected != secondSelected) {
+            const bool firstChanged =
+                firstSelected != midpointSelectionBefore[0U];
+            const bool pairEnabled = firstChanged
+                ? firstSelected
+                : secondSelected;
+            if (pairEnabled) {
+                wizard.seamReviewMovableKeyIds[seamIndex][0U].insert(
+                    midpointPair.first);
+                wizard.seamReviewMovableKeyIds[seamIndex][1U].insert(
+                    midpointPair.second);
+            } else {
+                wizard.seamReviewMovableKeyIds[seamIndex][0U].erase(
+                    midpointPair.first);
+                wizard.seamReviewMovableKeyIds[seamIndex][1U].erase(
+                    midpointPair.second);
+            }
+        }
+        ++wizard.smoothingGeneration;
+        wizard.seamReviewSmoothingResults[seamIndex].reset();
+        wizard.seamReviewSmoothingErrors[seamIndex].clear();
+        runtimeState->animationPanel.preparedPathCache = {};
+        runtimeState->previewRenderStateSignatureValid = false;
+        ShowReciprocalPanWizardCanonicalPose(runtimeState);
+    }
+    const std::size_t selectedCount =
+        wizard.seamReviewMovableKeyIds[seamIndex][0U].size() +
+        wizard.seamReviewMovableKeyIds[seamIndex][1U].size();
+    ImGui::TextDisabled(
+        "%zu keys selected for this seam. The final combined fit replays the same authored-key choices across both seams.",
+        selectedCount);
+    float maximumMove = wizard.smoothingMaxMovePercent;
+    if (ImGui::SliderFloat(
+            "Maximum seam-key movement",
+            &maximumMove,
+            1.0F,
+            25.0F,
+            "%.0f%% of adjacent travel")) {
+        wizard.smoothingMaxMovePercent = maximumMove;
+        wizard.seamReviewSmoothingResults[seamIndex].reset();
+        wizard.seamReviewSmoothingErrors[seamIndex].clear();
+    }
+    using Objective = invisible_places::camera::
+        AnimationLoopSpatialObjective;
+    const auto runPass = [&](const char* label, Objective objective) {
+        if (ImGui::Button(label)) {
+            StartReciprocalPanSeamReviewSmoothing(
+                runtimeState,
+                seamIndex,
+                aspectRatio,
+                objective);
+        }
+    };
+    ImGui::BeginDisabled(selectedCount == 0U);
+    runPass("Smooth selected seam", Objective::Balanced);
+    ImGui::SameLine();
+    runPass("Equalize Y", Objective::EqualizeScreenYVelocity);
+    ImGui::SameLine();
+    runPass("Minimize rotation", Objective::MinimizeImageRotation);
+    ImGui::EndDisabled();
+    if (wizard.seamReviewSmoothedCandidates[seamIndex].has_value()) {
+        if (ImGui::Button("Reset this seam to triangle fit")) {
+            ResetReciprocalPanSeamReviewSmoothing(
+                &wizard,
+                seamIndex,
+                false);
+            runtimeState->animationPanel.preparedPathCache = {};
+            runtimeState->previewRenderStateSignatureValid = false;
+            ShowReciprocalPanWizardCanonicalPose(runtimeState);
+        }
+    }
+    ImGui::EndDisabled();
+
+    if (smoothingInProgress) {
+        ImGui::TextDisabled(
+            "Smoothing the selected pre-roll/ending controls in the background...");
+    } else if (!wizard.seamReviewSmoothingErrors[seamIndex].empty()) {
+        ImGui::TextColored(
+            ImVec4{0.95F, 0.52F, 0.28F, 1.0F},
+            "%s",
+            wizard.seamReviewSmoothingErrors[seamIndex].c_str());
+    } else if (wizard.seamReviewSmoothedCandidates[seamIndex].has_value() &&
+               wizard.seamReviewSmoothingResults[seamIndex].has_value()) {
+        const auto& result =
+            wizard.seamReviewSmoothingResults[seamIndex].value();
+        const std::size_t activeCoreSeam = seamIndex == 0U ? 1U : 0U;
+        ImGui::TextWrapped(
+            "Smoothed review active: velocity mismatch %.5f -> %.5f; rotation mismatch %.5f -> %.5f; max camera move %.4f m, focus move %.4f m.",
+            result.beforeSeamMismatch[activeCoreSeam],
+            result.afterSeamMismatch[activeCoreSeam],
+            result.beforeSeamRotationMismatch[activeCoreSeam],
+            result.afterSeamRotationMismatch[activeCoreSeam],
+            result.maxCameraMove,
+            result.maxFocusMove);
+    }
 }
 
 void DrawReciprocalPanTransitionSmoothingControls(
@@ -55646,6 +56463,12 @@ void DrawReciprocalPanWizard(
                 sourceFrame,
                 destinationRole == 0U ? "A" : "B",
                 static_cast<long long>(destinationFrame));
+            DrawReciprocalPanSeamReviewSmoothingControls(
+                runtimeState,
+                seamIndex,
+                aspectRatio);
+            ImGui::BeginDisabled(
+                wizard.seamReviewSmoothingInProgress[seamIndex]);
             if (ImGui::Button(
                     destinationRole == 0U
                         ? "Re-pick A-end feature centre"
@@ -55660,8 +56483,10 @@ void DrawReciprocalPanWizard(
                 runtimeState->statusMessage =
                     "Click the new matching destination feature centre; its camera-local front/side nodes will be regenerated.";
                 ShowReciprocalPanWizardCanonicalPose(runtimeState);
+                ImGui::EndDisabled();
                 return;
             }
+            ImGui::EndDisabled();
         } else {
             ImGui::TextDisabled(
                 "This seam preview is stale because its points or source span changed.");
@@ -55765,9 +56590,15 @@ void DrawReciprocalPanWizard(
             wizard.selectedNodeIndex >= 0 &&
             static_cast<std::uint32_t>(wizard.selectedNodeIndex) <
                 triangle.patch.pointCount;
+        const bool reviewSmoothingActive = seamReviewStage &&
+            wizard.seamReviewSmoothingInProgress[
+                wizard.stage ==
+                        AnimationReciprocalPanWizardStage::Seam1Review
+                    ? 0U
+                    : 1U];
         const bool editingCurrentView =
             triangle.pathRole == ReciprocalPanCurrentViewRole(wizard) &&
-            !wizard.fitInProgress;
+            !wizard.fitInProgress && !reviewSmoothingActive;
         if (wizard.orbitInspectionActive) {
             if (ImGui::Button(
                     "Return to animation camera",
@@ -86123,7 +86954,11 @@ void UpdateReciprocalPanOrbitInspectionInput(
         wizard.orbitPickPressActive = false;
         wizard.orbitPickDragged = false;
     }
-    if (releasedClick && wizard.anchorPickArmed) {
+    if (releasedClick && wizard.anchorPickArmed &&
+        !std::any_of(
+            wizard.seamReviewSmoothingInProgress.begin(),
+            wizard.seamReviewSmoothingInProgress.end(),
+            [](bool active) { return active; })) {
         CaptureReciprocalPanWizardNode(
             runtimeState,
             viewport,
@@ -86185,6 +87020,10 @@ void UpdateCameraFromInput(
         const bool canCapture =
             (reciprocalWizard.anchorPickArmed || editDoubleClick) &&
             !reciprocalWizard.inspectionActive &&
+            !std::any_of(
+                reciprocalWizard.seamReviewSmoothingInProgress.begin(),
+                reciprocalWizard.seamReviewSmoothingInProgress.end(),
+                [](bool active) { return active; }) &&
             IsMouseOverRenderViewport(viewport) &&
             !viewport.UiWantsMouseCapture() &&
             ImGui::IsMouseClicked(ImGuiMouseButton_Left);

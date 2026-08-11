@@ -496,6 +496,10 @@ struct AnimationLoopSmoothingOptions {
     float firstEndOverlapSeconds = 0.0F;
     float secondStartOverlapSeconds = 0.0F;
     float secondEndOverlapSeconds = 0.0F;
+    // Allows the reciprocal-pan assistant to preview/smooth one captured
+    // seam before the opposite seam exists. Seam zero is first-end ->
+    // second-start; seam one is second-end -> first-start.
+    std::array<bool, 2> enabledSeams{true, true};
     // Horizontal cross-wipe scoring compares the portions that remain
     // visible during the overlap: outgoing 2/3 -> 1/3 and incoming
     // 1/3 -> 2/3. `panRight` selects outgoing-left/incoming-right; false
