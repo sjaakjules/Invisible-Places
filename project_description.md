@@ -153,6 +153,13 @@ The Camera panel exposes two orbit-control styles:
 The selected orbit-control style is stored with the project and does not form
 part of saved camera shots.
 
+A persistent live-view row above Global Animation Position provides Top,
+Front, Left, Right, Isometric, and Parallel controls. The four orthogonal
+views use the documented project axes, Isometric is an elevated Front view,
+and every preset rotates around the current focal point without changing its
+camera distance. Parallel projection matches the perspective scale at that
+focal plane so switching projection does not introduce a zoom jump.
+
 ### Surface-inferred targeting
 The user should be able to orbit around what they are looking at.
 

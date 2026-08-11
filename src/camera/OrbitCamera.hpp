@@ -43,6 +43,14 @@ class OrbitCamera {
     void Dolly(float wheelDelta);
     void SetTargetPreservingPosition(const glm::vec3& target);
     void SetOrbitCenterPreservingView(const glm::vec3& center);
+    // Reorients around the existing focal point without changing the orbit
+    // radius. Directions are world-space camera-forward and screen-up axes.
+    void SetViewDirectionAroundOrbitCenter(
+        const glm::vec3& viewDirection,
+        const glm::vec3& screenUpDirection);
+    // Parallel scale is derived from the current perspective FOV at the
+    // focal plane, so toggling projection does not visibly zoom the subject.
+    void SetParallelProjection(bool enabled) { parallelProjection_ = enabled; }
     void ApplyState(const CameraState& state);
 
     [[nodiscard]] CameraState CaptureState() const;
@@ -58,6 +66,7 @@ class OrbitCamera {
     [[nodiscard]] float ApertureFStops() const { return apertureFStops_; }
     [[nodiscard]] float DepthOfFieldMaxBlurPixels() const { return depthOfFieldMaxBlurPixels_; }
     [[nodiscard]] bool HasFramedBounds() const { return framedBounds_.valid; }
+    [[nodiscard]] bool ParallelProjection() const { return parallelProjection_; }
 
   private:
     void ApplyPositionTarget(glm::vec3 position, glm::vec3 target);
@@ -86,6 +95,7 @@ class OrbitCamera {
     float fovDegrees_ = 55.0F;
     float nearPlane_ = 0.05F;
     float farPlane_ = 1000.0F;
+    bool parallelProjection_ = false;
     bool hasDepthOfField_ = false;
     float focusDistance_ = 1.0F;
     float apertureFStops_ = 8.0F;

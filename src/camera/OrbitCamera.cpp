@@ -245,6 +245,53 @@ void OrbitCamera::SetOrbitCenterPreservingView(const glm::vec3& center) {
     UpdateClippingPlanes();
 }
 
+void OrbitCamera::SetViewDirectionAroundOrbitCenter(
+    const glm::vec3& viewDirection,
+    const glm::vec3& screenUpDirection) {
+    if (glm::length(viewDirection) <= 1.0e-6F) {
+        return;
+    }
+
+    const glm::vec3 forward = glm::normalize(viewDirection);
+    glm::vec3 cameraUp =
+        screenUpDirection -
+        (forward * glm::dot(screenUpDirection, forward));
+    if (glm::length(cameraUp) <= 1.0e-6F) {
+        const glm::vec3 fallbackUp =
+            std::abs(forward.z) < 0.9F
+                ? glm::vec3{0.0F, 0.0F, 1.0F}
+                : glm::vec3{1.0F, 0.0F, 0.0F};
+        cameraUp = fallbackUp -
+                   (forward * glm::dot(fallbackUp, forward));
+    }
+    cameraUp = glm::normalize(cameraUp);
+    const glm::vec3 cameraRight =
+        glm::normalize(glm::cross(forward, cameraUp));
+    cameraUp = glm::normalize(glm::cross(cameraRight, forward));
+
+    const float orbitDistance = std::max(
+        minimumDistance_,
+        glm::length(position_ - orbitCenter_));
+    position_ = orbitCenter_ - (forward * orbitDistance);
+    target_ = orbitCenter_;
+    distance_ = orbitDistance;
+
+    const glm::mat3 cameraToWorld{
+        cameraRight,
+        cameraUp,
+        -forward,
+    };
+    explicitOrientation_ =
+        glm::normalize(glm::quat_cast(cameraToWorld));
+    hasExplicitOrientation_ = true;
+    yawRadians_ = std::atan2(forward.y, forward.x);
+    pitchRadians_ = std::clamp(
+        std::asin(std::clamp(forward.z, -1.0F, 1.0F)),
+        -kPitchLimit,
+        kPitchLimit);
+    UpdateClippingPlanes();
+}
+
 void OrbitCamera::ApplyState(const CameraState& state) {
     glm::vec3 position{
         state.position[0],
@@ -355,7 +402,27 @@ OrbitCameraMatrices OrbitCamera::Matrices(float aspectRatio) const {
     } else {
         matrices.view = glm::lookAtRH(matrices.position, target_, WorldUp());
     }
-    matrices.projection = glm::perspective(glm::radians(fovDegrees_), EffectiveAspectRatio(aspectRatio), nearPlane_, farPlane_);
+    const float effectiveAspectRatio = EffectiveAspectRatio(aspectRatio);
+    if (parallelProjection_) {
+        const float verticalHalfExtent = std::max(
+            minimumDistance_,
+            distance_ * std::tan(glm::radians(fovDegrees_) * 0.5F));
+        const float horizontalHalfExtent =
+            verticalHalfExtent * effectiveAspectRatio;
+        matrices.projection = glm::ortho(
+            -horizontalHalfExtent,
+            horizontalHalfExtent,
+            -verticalHalfExtent,
+            verticalHalfExtent,
+            nearPlane_,
+            farPlane_);
+    } else {
+        matrices.projection = glm::perspective(
+            glm::radians(fovDegrees_),
+            effectiveAspectRatio,
+            nearPlane_,
+            farPlane_);
+    }
     matrices.projection[1][1] *= -1.0F;
     matrices.viewProjection = matrices.projection * matrices.view;
     return matrices;

@@ -2301,6 +2301,140 @@ TEST_CASE("Orbit camera keeps repeated zoom-out wheel steps controlled", "[camer
     CHECK(camera.Distance() < zoomedOutDistance);
 }
 
+TEST_CASE(
+    "Canonical live views orbit around the focal point without changing distance",
+    "[camera][views]") {
+    invisible_places::camera::CameraState state;
+    state.position = {-7.0F, 2.0F, 6.0F};
+    state.target = {2.0F, -3.0F, 4.0F};
+    state.orbitCenter = state.target;
+    state.hasOrbitCenter = true;
+    state.orientation = {0.0F, 0.0F, 0.0F, 0.0F};
+
+    invisible_places::camera::OrbitCamera camera;
+    camera.ApplyState(state);
+    const glm::vec3 focalPoint = camera.OrbitCenter();
+    const float focalDistance = camera.Distance();
+
+    struct ViewPreset {
+        const char* name;
+        glm::vec3 forward;
+        glm::vec3 requestedUp;
+    };
+    const std::array presets{
+        ViewPreset{"Top", {0.0F, 0.0F, -1.0F}, {1.0F, 0.0F, 0.0F}},
+        ViewPreset{"Front", {1.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 1.0F}},
+        ViewPreset{"Left", {0.0F, -1.0F, 0.0F}, {0.0F, 0.0F, 1.0F}},
+        ViewPreset{"Right", {0.0F, 1.0F, 0.0F}, {0.0F, 0.0F, 1.0F}},
+        ViewPreset{
+            "Isometric",
+            glm::normalize(glm::vec3{1.0F, 0.0F, -1.0F}),
+            {0.0F, 0.0F, 1.0F}},
+    };
+
+    for (const auto& preset : presets) {
+        DYNAMIC_SECTION(preset.name) {
+            camera.SetViewDirectionAroundOrbitCenter(
+                preset.forward,
+                preset.requestedUp);
+            const auto cameraState = camera.CaptureState();
+            const glm::quat orientation{
+                cameraState.orientation[3],
+                cameraState.orientation[0],
+                cameraState.orientation[1],
+                cameraState.orientation[2],
+            };
+            const glm::vec3 actualForward =
+                orientation * glm::vec3{0.0F, 0.0F, -1.0F};
+            const glm::vec3 actualUp =
+                orientation * glm::vec3{0.0F, 1.0F, 0.0F};
+            const glm::vec3 expectedForward =
+                glm::normalize(preset.forward);
+            const glm::vec3 expectedUp = glm::normalize(
+                preset.requestedUp -
+                (expectedForward *
+                 glm::dot(preset.requestedUp, expectedForward)));
+            const glm::vec3 cameraPosition{
+                cameraState.position[0],
+                cameraState.position[1],
+                cameraState.position[2],
+            };
+
+            CHECK(glm::dot(actualForward, expectedForward) > 0.9999F);
+            CHECK(glm::dot(actualUp, expectedUp) > 0.9999F);
+            CHECK(
+                glm::length(cameraPosition - focalPoint) ==
+                Catch::Approx(focalDistance));
+            CHECK(
+                glm::length(
+                    cameraPosition -
+                    (focalPoint - (expectedForward * focalDistance))) <
+                0.0001F);
+
+            const auto matrices = camera.Matrices(1.6F);
+            const glm::vec4 focalClip =
+                matrices.viewProjection * glm::vec4{focalPoint, 1.0F};
+            REQUIRE(std::abs(focalClip.w) > 1.0e-6F);
+            CHECK(focalClip.x / focalClip.w == Catch::Approx(0.0F).margin(0.0001F));
+            CHECK(focalClip.y / focalClip.w == Catch::Approx(0.0F).margin(0.0001F));
+        }
+    }
+}
+
+TEST_CASE(
+    "Parallel projection matches perspective scale at the focal point",
+    "[camera][projection]") {
+    invisible_places::camera::CameraState state;
+    state.position = {-8.0F, 1.0F, 3.0F};
+    state.target = {2.0F, 1.0F, 3.0F};
+    state.orbitCenter = state.target;
+    state.hasOrbitCenter = true;
+    state.orientation = {0.0F, 0.0F, 0.0F, 0.0F};
+    state.fovDegrees = 55.0F;
+
+    invisible_places::camera::OrbitCamera camera;
+    camera.ApplyState(state);
+    camera.SetViewDirectionAroundOrbitCenter(
+        glm::vec3{1.0F, 0.0F, 0.0F},
+        glm::vec3{0.0F, 0.0F, 1.0F});
+    const auto beforeState = camera.CaptureState();
+    const auto perspective = camera.Matrices(1.6F);
+    const glm::vec3 focalPoint = camera.OrbitCenter();
+    const glm::vec3 focalPlanePoint =
+        focalPoint + glm::vec3{0.0F, 0.0F, 1.0F};
+    const auto projectNdc = [](
+                                const invisible_places::camera::OrbitCameraMatrices& matrices,
+                                const glm::vec3& point) {
+        const glm::vec4 clip =
+            matrices.viewProjection * glm::vec4{point, 1.0F};
+        return glm::vec3{clip} / clip.w;
+    };
+    const glm::vec3 perspectiveNdc =
+        projectNdc(perspective, focalPlanePoint);
+
+    CHECK_FALSE(camera.ParallelProjection());
+    camera.SetParallelProjection(true);
+    REQUIRE(camera.ParallelProjection());
+    const auto parallel = camera.Matrices(1.6F);
+    const auto afterState = camera.CaptureState();
+    const glm::vec3 parallelNdc =
+        projectNdc(parallel, focalPlanePoint);
+
+    CHECK(parallelNdc.x == Catch::Approx(perspectiveNdc.x).margin(0.0001F));
+    CHECK(parallelNdc.y == Catch::Approx(perspectiveNdc.y).margin(0.0001F));
+    for (std::size_t component = 0U; component < 3U; ++component) {
+        CHECK(
+            afterState.position[component] ==
+            Catch::Approx(beforeState.position[component]));
+        CHECK(
+            afterState.orbitCenter[component] ==
+            Catch::Approx(beforeState.orbitCenter[component]));
+    }
+
+    camera.SetParallelProjection(false);
+    CHECK_FALSE(camera.ParallelProjection());
+}
+
 TEST_CASE("CloudCompare trackball orbits freely and rolls at its rim", "[camera][orbit][trackball]") {
     invisible_places::io::Bounds3f bounds;
     bounds.Expand({-1.0F, -1.0F, -1.0F});

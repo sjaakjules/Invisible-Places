@@ -76695,6 +76695,126 @@ void DrawControlsWindow(
         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
     ImGui::Begin("Invisible Places Controls", nullptr, flags);
 
+    const auto applyLiveView =
+        [&](const char* name,
+            const glm::vec3& viewDirection,
+            const glm::vec3& screenUpDirection) {
+            runtimeState->camera.SetViewDirectionAroundOrbitCenter(
+                viewDirection,
+                screenUpDirection);
+            runtimeState->cameraPlayback.active = false;
+            runtimeState->animationPlayback.active = false;
+            runtimeState->cameraInteraction.trackballOrbitActive = false;
+            runtimeState->cameraInteraction.lastNavigationInputAt =
+                std::chrono::steady_clock::now();
+            runtimeState->statusMessage =
+                std::string{name} +
+                " view centred on the current focal point.";
+            runtimeState->errorMessage.clear();
+        };
+
+    ImGui::PushStyleVar(
+        ImGuiStyleVar_FramePadding,
+        ImVec2{3.0F, ImGui::GetStyle().FramePadding.y});
+    ImGui::PushStyleVar(
+        ImGuiStyleVar_CellPadding,
+        ImVec2{2.0F, ImGui::GetStyle().CellPadding.y});
+    if (ImGui::BeginTable(
+            "##LiveViewCameraControls",
+            6,
+            ImGuiTableFlags_SizingStretchSame |
+                ImGuiTableFlags_NoSavedSettings)) {
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        if (ImGui::Button("Top", ImVec2{-FLT_MIN, 0.0F})) {
+            applyLiveView(
+                "Top",
+                glm::vec3{0.0F, 0.0F, -1.0F},
+                glm::vec3{1.0F, 0.0F, 0.0F});
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Look along -Z with +X pointing up the screen. Keeps the current focal distance.");
+        }
+
+        ImGui::TableSetColumnIndex(1);
+        if (ImGui::Button("Front", ImVec2{-FLT_MIN, 0.0F})) {
+            applyLiveView(
+                "Front",
+                glm::vec3{1.0F, 0.0F, 0.0F},
+                glm::vec3{0.0F, 0.0F, 1.0F});
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Look along +X with +Z pointing up the screen. Keeps the current focal distance.");
+        }
+
+        ImGui::TableSetColumnIndex(2);
+        if (ImGui::Button("Left", ImVec2{-FLT_MIN, 0.0F})) {
+            applyLiveView(
+                "Left",
+                glm::vec3{0.0F, -1.0F, 0.0F},
+                glm::vec3{0.0F, 0.0F, 1.0F});
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Look along -Y with +Z pointing up the screen. Keeps the current focal distance.");
+        }
+
+        ImGui::TableSetColumnIndex(3);
+        if (ImGui::Button("Right", ImVec2{-FLT_MIN, 0.0F})) {
+            applyLiveView(
+                "Right",
+                glm::vec3{0.0F, 1.0F, 0.0F},
+                glm::vec3{0.0F, 0.0F, 1.0F});
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Look along +Y with +Z pointing up the screen. Keeps the current focal distance.");
+        }
+
+        ImGui::TableSetColumnIndex(4);
+        if (ImGui::Button("Isometric", ImVec2{-FLT_MIN, 0.0F})) {
+            applyLiveView(
+                "Isometric",
+                glm::normalize(glm::vec3{1.0F, 0.0F, -1.0F}),
+                glm::vec3{0.0F, 0.0F, 1.0F});
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Use an elevated Front view aimed down at the current focal point. Keeps the current focal distance.");
+        }
+
+        ImGui::TableSetColumnIndex(5);
+        const bool parallelProjection =
+            runtimeState->camera.ParallelProjection();
+        if (parallelProjection) {
+            ImGui::PushStyleColor(
+                ImGuiCol_Button,
+                ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+        }
+        const bool toggleParallel =
+            ImGui::Button("Parallel", ImVec2{-FLT_MIN, 0.0F});
+        if (parallelProjection) {
+            ImGui::PopStyleColor();
+        }
+        if (toggleParallel) {
+            runtimeState->camera.SetParallelProjection(
+                !parallelProjection);
+            runtimeState->statusMessage =
+                parallelProjection
+                    ? "Perspective projection enabled."
+                    : "Parallel projection enabled.";
+            runtimeState->errorMessage.clear();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Toggle parallel projection. Its scale matches the perspective view at the focal point.");
+        }
+        ImGui::EndTable();
+    }
+    ImGui::PopStyleVar(2);
+
     // Tab hit rectangles are captured below. Resolve this frame's click
     // before drawing the global header, then explicitly select that ImGui tab
     // below. This preserves one-click switching when a transient popup has
