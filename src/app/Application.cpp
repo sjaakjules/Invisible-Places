@@ -940,9 +940,8 @@ struct AnimationReciprocalPanWizardState {
     // without changing the stable A/B roles or the editable correspondence.
     int stageViewRole = 0;
     // Aligned seam review alternates the A/B cameras through the renderer's
-    // two-frame history and composites a feature-following horizontal wipe.
+    // two-frame history and composites a feature-following hard split.
     bool splitComparisonEnabled = true;
-    float splitOverlapPixels = 400.0F;
     float splitAnchorOffsetPixels = 0.0F;
     bool splitAOnLeft = true;
     std::uint32_t splitRenderedRole = 0U;
@@ -44343,7 +44342,7 @@ ReciprocalPanComparisonMatrices(
     return matrices;
 }
 
-float ReciprocalPanFeatureFadeCentreNormalized(
+float ReciprocalPanFeatureSplitCentreNormalized(
     const ReciprocalPanComparisonView& comparison,
     const std::array<invisible_places::camera::OrbitCameraMatrices, 2U>&
         matrices,
@@ -44538,31 +44537,13 @@ void DrawReciprocalPanViewportOverlay(
             : std::clamp(wizard.stageViewRole, 0, 1);
     if (splitComparisonActive && comparisonMatrices.has_value()) {
         const float centreNormalized =
-            ReciprocalPanFeatureFadeCentreNormalized(
+            ReciprocalPanFeatureSplitCentreNormalized(
                 comparison.value(),
                 comparisonMatrices.value(),
                 size.x,
                 wizard.splitAnchorOffsetPixels);
         const float centreX = origin.x + centreNormalized * size.x;
-        const float halfWidth = 0.5F * std::clamp(
-            wizard.splitOverlapPixels,
-            1.0F,
-            std::max(1.0F, size.x * 2.0F));
         drawList->PushClipRect(origin, viewportMaximum, true);
-        drawList->AddRectFilled(
-            ImVec2{centreX - halfWidth, origin.y},
-            ImVec2{centreX + halfWidth, viewportMaximum.y},
-            IM_COL32(255, 224, 128, 18));
-        drawList->AddLine(
-            ImVec2{centreX - halfWidth, origin.y},
-            ImVec2{centreX - halfWidth, viewportMaximum.y},
-            IM_COL32(255, 224, 128, 115),
-            1.0F);
-        drawList->AddLine(
-            ImVec2{centreX + halfWidth, origin.y},
-            ImVec2{centreX + halfWidth, viewportMaximum.y},
-            IM_COL32(255, 224, 128, 115),
-            1.0F);
         drawList->AddLine(
             ImVec2{centreX, origin.y},
             ImVec2{centreX, viewportMaximum.y},
@@ -53390,16 +53371,8 @@ void DrawReciprocalPanWizard(
             const float viewportWidth = std::max(
                 1.0F,
                 CurrentUiViewportSize(viewport).x);
-            ImGui::TextDisabled("Fade overlap width (pixels)");
-            ImGui::SetNextItemWidth(-FLT_MIN);
-            ImGui::SliderFloat(
-                "##ReciprocalPanSplitWidth",
-                &wizard.splitOverlapPixels,
-                40.0F,
-                std::max(400.0F, viewportWidth),
-                "%.0f px");
             ImGui::TextDisabled(
-                "Fade centre offset from tracked anchors (pixels)");
+                "Split offset from tracked anchors (pixels)");
             ImGui::SetNextItemWidth(-FLT_MIN);
             ImGui::SliderFloat(
                 "##ReciprocalPanSplitOffset",
@@ -53414,7 +53387,7 @@ void DrawReciprocalPanWizard(
                 wizard.splitAOnLeft = !wizard.splitAOnLeft;
             }
             ImGui::TextDisabled(
-                "The fade centre follows the mean A/B anchor projection as the synchronized seam is scrubbed. The offset stays relative to that moving feature.");
+                "The hard split follows the mean A/B anchor projection as the synchronized seam is scrubbed. The offset stays relative to that moving feature.");
         }
     }
     const int role = tailExtentStage
@@ -97102,7 +97075,6 @@ int Application::Run(ApplicationRunOptions options) const {
                     0.5F,
                     &sourceViewProjections,
                     splitSmoke,
-                    400.0F,
                     0.35F +
                         static_cast<float>(frameIndex) * 0.10F,
                     frameIndex < 2U);
@@ -97538,20 +97510,12 @@ int Application::Run(ApplicationRunOptions options) const {
                             1.0F,
                             CurrentUiViewportSize(
                                 viewport.value()).x);
-                        const float framebufferWidth =
-                            static_cast<float>(
-                                std::max<std::uint32_t>(
-                                    1U,
-                                    viewport->Width()));
-                        const float fadeCentre =
-                            ReciprocalPanFeatureFadeCentreNormalized(
+                        const float splitCentre =
+                            ReciprocalPanFeatureSplitCentreNormalized(
                                 comparison.value(),
                                 comparisonMatrices.value(),
                                 uiViewportWidth,
                                 wizard.splitAnchorOffsetPixels);
-                        const float framebufferOverlapPixels =
-                            wizard.splitOverlapPixels *
-                            framebufferWidth / uiViewportWidth;
                         viewport->SetTemporalCameraOverlay(
                             true,
                             renderedRole,
@@ -97559,8 +97523,7 @@ int Application::Run(ApplicationRunOptions options) const {
                             0.5F,
                             &viewProjections,
                             true,
-                            framebufferOverlapPixels,
-                            fadeCentre,
+                            splitCentre,
                             wizard.splitAOnLeft);
                     }
                 }

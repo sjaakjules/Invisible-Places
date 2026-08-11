@@ -655,7 +655,6 @@ class VulkanViewportShell {
         const std::array<glm::mat4, 2U>* currentSourceViewProjections =
             nullptr,
         bool splitView = false,
-        float splitOverlapPixels = 400.0F,
         float splitCenterNormalized = 0.5F,
         bool firstSourceOnLeft = true);
 
@@ -1504,7 +1503,6 @@ class VulkanViewportShell {
     std::uint32_t temporalCameraOverlayRenderedSourceIndex_ = 0U;
     std::array<float, 2U> temporalCameraOverlayWeights_{1.0F, 0.0F};
     bool temporalCameraOverlaySplitView_ = false;
-    float temporalCameraOverlaySplitOverlapPixels_ = 400.0F;
     float temporalCameraOverlaySplitCenterNormalized_ = 0.5F;
     bool temporalCameraOverlayFirstSourceOnLeft_ = true;
     std::array<bool, 2U> temporalCameraOverlayHistoryValid_{false, false};

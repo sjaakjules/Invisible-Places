@@ -279,7 +279,7 @@ generated source pre-roll and privately fitted destination tail. Negative
 offsets show the pre-roll, offset zero shows the adjusted original 50% endpoint
 pair, and positive offsets show the tail. This lets the user re-pick the destination feature and rebuild
 that seam before moving to the opposite endpoint. The review can also composite
-the two camera renders as an A/B split. Its adjustable crossfade band follows
+the two camera renders as an A/B hard split. Its adjustable boundary follows
 the mean projected anchor position throughout the synchronized scrub, while a
 stored pixel offset lets the user place the wipe beside the feature without
 breaking that tracking. Both triangles remain visible, A/B can swap sides, and

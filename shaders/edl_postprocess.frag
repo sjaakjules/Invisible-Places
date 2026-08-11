@@ -305,21 +305,13 @@ void main() {
     }
 
     if (splitView) {
-        const float overlapPixels = max(
-            1.0,
-            postProcess.temporalReprojection.y);
         const float centre = postProcess.temporalReprojection.z;
-        const float halfWidth =
-            0.5 * overlapPixels / max(float(size.x), 1.0);
-        const float blend = smoothstep(
-            centre - halfWidth,
-            centre + halfWidth,
-            targetUv.x);
+        const bool useLeft = targetUv.x < centre;
         const bool firstOnLeft =
             postProcess.temporalReprojection.w > 0.5;
         outColor = firstOnLeft
-            ? mix(first, second, blend)
-            : mix(second, first, blend);
+            ? (useLeft ? first : second)
+            : (useLeft ? second : first);
         return;
     }
 

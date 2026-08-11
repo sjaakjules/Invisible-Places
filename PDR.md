@@ -180,8 +180,8 @@ ordered endpoint triangles and both seam spans are defined.
 
 #### FR-CAM-19
 Each fitted-seam review shall offer a two-camera A/B split. Its horizontal
-crossfade width and feature-relative offset shall be editable, while its centre
-continues to follow the paired anchor projections during synchronized scrubbing,
+feature-relative offset shall be editable, while its hard boundary continues
+to follow the paired anchor projections during synchronized scrubbing,
 including while the anchors are outside the image. Both correspondence triangles
 shall remain visible and the active A/B side shall remain editable. Procedural
 water rendering and simulation work shall be suppressed while the assistant is

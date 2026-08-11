@@ -2548,7 +2548,6 @@ void VulkanViewportShell::SetTemporalCameraOverlay(
     float secondWeight,
     const std::array<glm::mat4, 2U>* currentSourceViewProjections,
     bool splitView,
-    float splitOverlapPixels,
     float splitCenterNormalized,
     bool firstSourceOnLeft) {
     if (enabled &&
@@ -2571,8 +2570,6 @@ void VulkanViewportShell::SetTemporalCameraOverlay(
     const bool layoutChanged =
         enabled &&
         (temporalCameraOverlaySplitView_ != splitView ||
-         std::abs(temporalCameraOverlaySplitOverlapPixels_ -
-                  splitOverlapPixels) > 0.01F ||
          std::abs(temporalCameraOverlaySplitCenterNormalized_ -
                   splitCenterNormalized) > 1.0e-5F ||
          temporalCameraOverlayFirstSourceOnLeft_ != firstSourceOnLeft);
@@ -2586,9 +2583,6 @@ void VulkanViewportShell::SetTemporalCameraOverlay(
     temporalCameraOverlayWeights_[1U] =
         std::clamp(secondWeight, 0.0F, 1.0F);
     temporalCameraOverlaySplitView_ = splitView;
-    temporalCameraOverlaySplitOverlapPixels_ = std::max(
-        0.0F,
-        splitOverlapPixels);
     temporalCameraOverlaySplitCenterNormalized_ = std::clamp(
         splitCenterNormalized,
         -2.0F,
@@ -16891,10 +16885,10 @@ void VulkanViewportShell::RecordCommandBuffer(
         if (temporalCameraOverlayEnabled_ &&
             temporalCameraOverlaySplitView_) {
             // Split mode samples each cached camera in its own image space.
-            // Reprojection is unused, so this vector carries the wipe layout.
+            // Reprojection is unused, so this vector carries the hard split.
             pushConstants.temporalReprojection = glm::vec4{
                 0.0F,
-                temporalCameraOverlaySplitOverlapPixels_,
+                0.0F,
                 temporalCameraOverlaySplitCenterNormalized_,
                 temporalCameraOverlayFirstSourceOnLeft_ ? 1.0F : 0.0F,
             };
