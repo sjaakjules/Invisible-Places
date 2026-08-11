@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Refresh the local SampleScene validation project from durable fixtures.
 
-The tracked schema-22 water fixture and the current validation project are the
+The tracked schema-27 water fixture and the current validation project are the
 default inputs, so regeneration never depends on or rewrites an authored
 exhibition project. An explicit main-project option can still refresh the water
 fixture while those authored objects exist. The helper builds a lightweight
@@ -24,8 +24,8 @@ from typing import Any
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
-PROJECT_SCHEMA_VERSION = 71
-WATER_SOURCES_SCHEMA_VERSION = 26
+PROJECT_SCHEMA_VERSION = 73
+WATER_SOURCES_SCHEMA_VERSION = 27
 DEFAULT_MAIN_PROJECT = REPOSITORY_ROOT / "Saved" / "exhibitionScene_project.json"
 DEFAULT_FIXTURE = REPOSITORY_ROOT / "tests" / "fixtures" / "sample_scene_water_sources.json"
 DEFAULT_VALIDATION_PROJECT = (
