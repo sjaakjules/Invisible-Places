@@ -748,3 +748,112 @@ TEST_CASE("Explicit orientation has continuous angular velocity and acceleration
     }
 }
 
+TEST_CASE("Focus-relative rig alignment rotates one matching camera into the destination path frame",
+          "[camera][animation][camera-rig-alignment]") {
+    invisible_places::camera::AnimationPath reference;
+    reference.durationFrames = 60U;
+    reference.keys = {
+        {.id = "reference-a",
+         .cameraPosition = {-2.0F, -6.0F, 3.0F},
+         .focusPoint = {0.0F, 0.0F, 0.0F},
+         .durationFrames = 30U},
+        {.id = "reference-b",
+         .cameraPosition = {8.0F, -6.0F, 3.0F},
+         .focusPoint = {10.0F, 0.0F, 0.0F},
+         .durationFrames = 30U},
+        {.id = "reference-c",
+         .cameraPosition = {18.0F, -6.0F, 3.0F},
+         .focusPoint = {20.0F, 0.0F, 0.0F},
+         .durationFrames = 30U},
+    };
+    invisible_places::camera::AnimationPath destination;
+    destination.durationFrames = 60U;
+    destination.keys = {
+        {.id = "destination-a",
+         .cameraPosition = {100.0F, -4.0F, 11.0F},
+         .focusPoint = {100.0F, 0.0F, 10.0F},
+         .durationFrames = 30U},
+        {.id = "destination-b",
+         .cameraPosition = {100.0F, 6.0F, 11.0F},
+         .focusPoint = {100.0F, 10.0F, 10.0F},
+         .durationFrames = 30U},
+        {.id = "destination-c",
+         .cameraPosition = {100.0F, 16.0F, 11.0F},
+         .focusPoint = {100.0F, 20.0F, 10.0F},
+         .durationFrames = 30U},
+    };
+    const auto originalReference = reference;
+    const auto originalDestination = destination;
+
+    const auto result = invisible_places::camera::
+        AlignAnimationKeyCameraToReferenceRig(
+            &destination,
+            reference,
+            {
+                .destinationKeyId = "destination-b",
+                .referenceNormalizedPosition = 0.5F,
+            });
+
+    INFO(result.errorMessage);
+    REQUIRE(result.succeeded);
+    REQUIRE(result.changed);
+    CHECK(result.referenceFocusDistance == Approx(7.0F));
+    CHECK(result.referenceAlongPathOffset == Approx(-2.0F));
+    CHECK(result.referenceLateralOffset == Approx(6.0F));
+    CHECK(result.referenceHeightOffset == Approx(3.0F));
+    CHECK(destination.keys[1U].cameraPosition[0U] == Approx(106.0F));
+    CHECK(destination.keys[1U].cameraPosition[1U] == Approx(8.0F));
+    CHECK(destination.keys[1U].cameraPosition[2U] == Approx(13.0F));
+    CHECK(destination.keys[1U].focusPoint ==
+          originalDestination.keys[1U].focusPoint);
+    CHECK(destination.keys[0U].cameraPosition ==
+          originalDestination.keys[0U].cameraPosition);
+    CHECK(destination.keys[2U].cameraPosition ==
+          originalDestination.keys[2U].cameraPosition);
+    REQUIRE(destination.localizedKeyCorrections.size() == 1U);
+    CHECK(destination.localizedKeyCorrections.front().keyId ==
+          "destination-b");
+    CHECK(destination.localizedKeyCorrections.front().splineCameraPosition ==
+          originalDestination.keys[1U].cameraPosition);
+    CHECK(reference.keys[0U].cameraPosition ==
+          originalReference.keys[0U].cameraPosition);
+    CHECK(reference.keys[1U].cameraPosition ==
+          originalReference.keys[1U].cameraPosition);
+    CHECK(reference.keys[2U].cameraPosition ==
+          originalReference.keys[2U].cameraPosition);
+}
+
+TEST_CASE("Focus-relative rig alignment rejects paths without a travel direction",
+          "[camera][animation][camera-rig-alignment]") {
+    invisible_places::camera::AnimationPath destination;
+    destination.durationFrames = 30U;
+    destination.keys = {
+        {.id = "destination",
+         .cameraPosition = {0.0F, -5.0F, 2.0F},
+         .focusPoint = {0.0F, 0.0F, 0.0F},
+         .durationFrames = 30U},
+        {.id = "destination-end",
+         .cameraPosition = {0.0F, -5.0F, 2.0F},
+         .focusPoint = {0.0F, 0.0F, 0.0F},
+         .durationFrames = 30U},
+    };
+    auto reference = destination;
+    reference.keys[0U].id = "reference";
+    reference.keys[1U].id = "reference-end";
+    const auto originalCamera = destination.keys[0U].cameraPosition;
+
+    const auto result = invisible_places::camera::
+        AlignAnimationKeyCameraToReferenceRig(
+            &destination,
+            reference,
+            {
+                .destinationKeyId = "destination",
+                .referenceNormalizedPosition = 0.0F,
+            });
+
+    CHECK_FALSE(result.succeeded);
+    CHECK_FALSE(result.changed);
+    CHECK_FALSE(result.errorMessage.empty());
+    CHECK(destination.keys[0U].cameraPosition == originalCamera);
+    CHECK(destination.localizedKeyCorrections.empty());
+}

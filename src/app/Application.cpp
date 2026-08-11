@@ -800,6 +800,14 @@ struct AnimationLowerFrameAlignmentRequest {
     float aspectRatio = 16.0F / 9.0F;
 };
 
+struct AnimationCameraRigAlignmentRequest {
+    std::array<std::filesystem::path, 2> filePaths;
+    int destinationRow = -1;
+    std::string destinationKeyId;
+    float destinationStartOverlapSeconds = 0.0F;
+    float destinationEndOverlapSeconds = 0.0F;
+};
+
 struct AnimationMatchingFrameGhostCaptureRequest {
     std::array<std::filesystem::path, 2> filePaths;
     float currentNormalizedPosition = 0.0F;
@@ -886,6 +894,8 @@ struct AnimationPanelState {
         pendingVelocityLinkSettingsUpdate;
     std::optional<AnimationLowerFrameAlignmentRequest>
         requestedLowerFrameAlignment;
+    std::optional<AnimationCameraRigAlignmentRequest>
+        requestedCameraRigAlignment;
     AnimationMatchingFrameGhostState matchingFrameGhost;
     std::optional<AnimationMatchingFrameGhostCaptureRequest>
         requestedMatchingFrameGhostCapture;
@@ -45708,7 +45718,7 @@ bool ValidateLoopSmoothingMovableLinks(
         const auto* path = RegistryAnimationPath(runtimeState, fileIndex);
         if (path == nullptr || path->keys.size() < 3U) {
             if (errorMessage != nullptr) {
-                *errorMessage = "Both velocity-pair animations must be loaded and contain at least three keys.";
+                *errorMessage = "Both selected animations must be loaded and contain at least three keys.";
             }
             return false;
         }
@@ -45773,7 +45783,7 @@ bool ValidateLoopSmoothingMovableLinks(
                     *errorMessage =
                         "Movable camera " + cameraId +
                         " is also linked to a locked key or another animation. "
-                        "Enable every linked use in this pair, or untangle that camera before velocity alignment.";
+                        "Enable every linked use in this pair, or untangle that camera before moving it.";
                 }
                 return false;
             }
@@ -47449,6 +47459,258 @@ void PollAnimationMatchingFrameGhostJob(
     }
 }
 
+bool ApplyAnimationCameraRigAlignment(
+    PreviewRuntimeState* runtimeState,
+    std::size_t currentIndex,
+    std::size_t partnerIndex,
+    int destinationRow,
+    std::string destinationKeyId,
+    float destinationStartOverlapSeconds,
+    float destinationEndOverlapSeconds) {
+    if (runtimeState == nullptr || destinationRow < 0 ||
+        destinationRow > 1 || currentIndex == partnerIndex) {
+        return false;
+    }
+    auto& panel = runtimeState->animationPanel;
+    if (currentIndex >= panel.availableFiles.size() ||
+        partnerIndex >= panel.availableFiles.size()) {
+        return false;
+    }
+
+    if (panel.velocityAlignmentDraft.has_value()) {
+        const auto& draft = panel.velocityAlignmentDraft.value();
+        const bool samePair =
+            (PathsLexicallyEqual(
+                 panel.availableFiles[currentIndex],
+                 draft.firstFilePath) ||
+             PathsLexicallyEqual(
+                 panel.availableFiles[currentIndex],
+                 draft.secondFilePath)) &&
+            (PathsLexicallyEqual(
+                 panel.availableFiles[partnerIndex],
+                 draft.firstFilePath) ||
+             PathsLexicallyEqual(
+                 panel.availableFiles[partnerIndex],
+                 draft.secondFilePath));
+        if (!samePair) {
+            runtimeState->errorMessage =
+                "Confirm or unapply the selected-key alignment draft for the other animation pair first.";
+            runtimeState->statusMessage.clear();
+            return false;
+        }
+    }
+
+    const auto* current = RegistryAnimationPath(*runtimeState, currentIndex);
+    const auto* partner = RegistryAnimationPath(*runtimeState, partnerIndex);
+    if (current == nullptr || partner == nullptr) {
+        runtimeState->errorMessage =
+            "Both selected blend animations must be loaded before matching a camera rig.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    const bool appliedVelocityPair =
+        current->velocityBlendLink.has_value() &&
+        partner->velocityBlendLink.has_value() &&
+        !current->velocityBlendLink->pairId.empty() &&
+        current->velocityBlendLink->pairId ==
+            partner->velocityBlendLink->pairId;
+
+    const std::array<std::size_t, 2> indices{currentIndex, partnerIndex};
+    std::array<AnimationPath, 2> paths{*current, *partner};
+    const std::size_t destinationMember =
+        static_cast<std::size_t>(destinationRow);
+    const std::size_t referenceMember = 1U - destinationMember;
+    auto& destination = paths[destinationMember];
+    const auto& reference = paths[referenceMember];
+    const auto destinationKey = std::find_if(
+        destination.keys.begin(),
+        destination.keys.end(),
+        [&](const auto& key) { return key.id == destinationKeyId; });
+    if (destinationKey == destination.keys.end()) {
+        runtimeState->errorMessage =
+            "The selected camera-rig alignment key no longer exists.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    const std::size_t destinationKeyIndex =
+        static_cast<std::size_t>(std::distance(
+            destination.keys.begin(),
+            destinationKey));
+    const float destinationPosition = invisible_places::camera::
+        AnimationPathKeyNormalizedPosition(
+            destination,
+            destinationKeyIndex);
+    const auto counterpartPosition =
+        AnimationLoopCounterpartNormalizedPosition(
+            destination,
+            destinationPosition,
+            destinationStartOverlapSeconds,
+            destinationEndOverlapSeconds,
+            invisible_places::camera::AnimationPathDurationSeconds(
+                reference));
+    if (!counterpartPosition.has_value()) {
+        runtimeState->errorMessage =
+            "The selected key is outside the current blend bounds, so the other animation has no matching frame.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    const std::unordered_set<std::string> currentMovableKeyIds =
+        destinationMember == 0U
+            ? std::unordered_set<std::string>{destinationKeyId}
+            : std::unordered_set<std::string>{};
+    const std::unordered_set<std::string> partnerMovableKeyIds =
+        destinationMember == 1U
+            ? std::unordered_set<std::string>{destinationKeyId}
+            : std::unordered_set<std::string>{};
+    std::string linkValidationError;
+    if (!ValidateLoopSmoothingMovableLinks(
+            *runtimeState,
+            currentIndex,
+            partnerIndex,
+            currentMovableKeyIds,
+            partnerMovableKeyIds,
+            &linkValidationError)) {
+        runtimeState->errorMessage =
+            "Camera-rig alignment cannot move only this key: " +
+            linkValidationError;
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    const auto beforeDestination = destination;
+    const auto alignment = invisible_places::camera::
+        AlignAnimationKeyCameraToReferenceRig(
+            &destination,
+            reference,
+            {
+                .destinationKeyId = destinationKeyId,
+                .referenceNormalizedPosition =
+                    counterpartPosition.value(),
+            });
+    if (!alignment.succeeded) {
+        runtimeState->errorMessage = alignment.errorMessage;
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    panel.strongAlignmentDiagnostics.reset();
+    if (!alignment.changed) {
+        runtimeState->statusMessage =
+            "The selected camera already matches the partner's focus-relative rig.";
+        runtimeState->errorMessage.clear();
+        return true;
+    }
+
+    std::string pairId;
+    if (panel.velocityAlignmentDraft.has_value()) {
+        pairId = panel.velocityAlignmentDraft->pairId;
+    } else if (appliedVelocityPair) {
+        pairId = current->velocityBlendLink->pairId;
+    }
+    if (pairId.empty()) {
+        pairId = "camera_rig_" + std::to_string(
+            std::chrono::steady_clock::now()
+                .time_since_epoch()
+                .count());
+    }
+    if (!panel.velocityAlignmentDraft.has_value()) {
+        panel.velocityAlignmentDraft = AnimationVelocityAlignmentDraft{
+            .firstFilePath = panel.availableFiles[currentIndex],
+            .secondFilePath = panel.availableFiles[partnerIndex],
+            .pairId = pairId,
+        };
+    }
+    auto& draft = panel.velocityAlignmentDraft.value();
+    const auto destinationFilePath =
+        panel.availableFiles[indices[destinationMember]];
+    std::optional<std::size_t> draftDestinationMember;
+    if (PathsLexicallyEqual(
+            destinationFilePath,
+            draft.firstFilePath)) {
+        draftDestinationMember = 0U;
+    } else if (PathsLexicallyEqual(
+                   destinationFilePath,
+                   draft.secondFilePath)) {
+        draftDestinationMember = 1U;
+    }
+    if (!draftDestinationMember.has_value() || draft.pairId != pairId) {
+        runtimeState->errorMessage =
+            "The alignment draft changed before the focus-relative camera rig could be applied.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    auto incrementalDeltas = BuildVelocityDraftKeyDeltas(
+        beforeDestination,
+        destination);
+    auto& storedDeltas =
+        draft.strongKeyDeltas[draftDestinationMember.value()];
+    for (auto& incremental : incrementalDeltas) {
+        const auto existing = std::find_if(
+            storedDeltas.begin(),
+            storedDeltas.end(),
+            [&](const auto& stored) {
+                return stored.keyId == incremental.keyId;
+            });
+        if (existing == storedDeltas.end()) {
+            storedDeltas.push_back(std::move(incremental));
+            continue;
+        }
+        for (std::size_t component = 0U; component < 3U; ++component) {
+            existing->cameraDelta[component] +=
+                incremental.cameraDelta[component];
+            existing->focusDelta[component] +=
+                incremental.focusDelta[component];
+        }
+        existing->addedLocalizedCorrection =
+            existing->addedLocalizedCorrection ||
+            incremental.addedLocalizedCorrection;
+    }
+
+    for (std::size_t member = 0U; member < 2U; ++member) {
+        panel.availableFileEditedPaths[indices[member]] = paths[member];
+        panel.availableFileDirtyFlags[indices[member]] = true;
+        panel.availableFileLoopEditPairIds[indices[member]] = pairId;
+    }
+    panel.projectVelocityLinksDirty = true;
+    const auto activeIndex = panel.currentFilePath.empty()
+                                 ? std::nullopt
+                                 : FindAnimationRegistryIndex(
+                                       panel,
+                                       std::filesystem::path{
+                                           panel.currentFilePath});
+    if (activeIndex.has_value()) {
+        for (std::size_t member = 0U; member < 2U; ++member) {
+            if (activeIndex.value() == indices[member]) {
+                panel.currentPath = paths[member];
+                panel.currentPathUsesEdited = true;
+                panel.selectedFileUsesEdited = true;
+                panel.dirty = true;
+                break;
+            }
+        }
+    }
+    panel.loopTimeline.previewDirty = true;
+    panel.loopSmoothingDiagnostics.reset();
+    panel.preparedPathCache = {};
+    panel.motionStatsCache = {};
+    panel.perceivedFlowCache = {};
+    ApplyAnimationScrub(runtimeState);
+    runtimeState->statusMessage =
+        "Matched the selected camera to the partner rig: focus distance " +
+        FormatFixed(alignment.referenceFocusDistance, 3) +
+        ", height " +
+        FormatFixed(alignment.referenceHeightOffset, 3) +
+        ", along-path " +
+        FormatFixed(alignment.referenceAlongPathOffset, 3) +
+        ", lateral " +
+        FormatFixed(alignment.referenceLateralOffset, 3) +
+        ". Camera move " + FormatFixed(alignment.cameraMove, 3) +
+        "; the focus and partner animation are unchanged.";
+    runtimeState->errorMessage.clear();
+    return true;
+}
+
 bool ApplyAnimationLowerFrameAlignment(
     PreviewRuntimeState* runtimeState,
     std::size_t currentIndex,
@@ -48771,7 +49033,7 @@ bool DrawAnimationLoopTimelineRow(
             cameraMove,
             focusMove,
             keysAreInteractive && eligible
-                ? "\nClick toggles velocity movement; double-click selects lower-frame alignment when the key is inside the overlap."
+                ? "\nClick toggles velocity movement; double-click selects matching-frame alignment when the key is inside the overlap."
                 : "");
         if (keysAreInteractive && eligible &&
             ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
@@ -48784,7 +49046,7 @@ bool DrawAnimationLoopTimelineRow(
             if (doubleClicked) {
                 // The first click of a double-click already toggled velocity.
                 // Toggle it back, then give the independent cyan selection to
-                // lower-frame geometry alignment.
+                // matching-frame alignment actions.
                 if (enabled) {
                     movableKeyIds->erase(key.id);
                 } else {
@@ -49111,6 +49373,7 @@ bool FinalizeAnimationKeyStructureEdit(
     }
     panel.pendingVelocityLinkSettingsUpdate.reset();
     panel.requestedLowerFrameAlignment.reset();
+    panel.requestedCameraRigAlignment.reset();
     if (runtimeState->animationVelocityPreviewJob.worker.joinable()) {
         runtimeState->animationVelocityPreviewJob.worker.request_stop();
     }
@@ -49207,6 +49470,27 @@ void DrawAnimationSection(
     PollAnimationVelocityPreviewJob(runtimeState);
     PollAnimationStrongAlignmentJob(runtimeState);
     ApplyPendingAnimationVelocityLinkSettings(runtimeState);
+    if (panel.requestedCameraRigAlignment.has_value()) {
+        const auto request =
+            panel.requestedCameraRigAlignment.value();
+        panel.requestedCameraRigAlignment.reset();
+        const auto currentIndex = FindAnimationRegistryIndex(
+            panel,
+            request.filePaths[0U]);
+        const auto partnerIndex = FindAnimationRegistryIndex(
+            panel,
+            request.filePaths[1U]);
+        if (currentIndex.has_value() && partnerIndex.has_value()) {
+            ApplyAnimationCameraRigAlignment(
+                runtimeState,
+                currentIndex.value(),
+                partnerIndex.value(),
+                request.destinationRow,
+                request.destinationKeyId,
+                request.destinationStartOverlapSeconds,
+                request.destinationEndOverlapSeconds);
+        }
+    }
     if (panel.requestedLowerFrameAlignment.has_value()) {
         const auto request =
             panel.requestedLowerFrameAlignment.value();
@@ -51341,7 +51625,7 @@ void DrawAnimationSection(
                 velocityLinkSettingsChanged = true;
             }
             ImGui::TextDisabled(
-                "Mouse-down on a node toggles movement (double-click selects cyan lower-frame alignment); mouse-down elsewhere scrubs until release. A's overlap bounds keep priority."
+                "Mouse-down on a node toggles movement (double-click selects cyan matching-frame alignment); mouse-down elsewhere scrubs until release. A's overlap bounds keep priority."
             );
 
             loopTimelineOptions = AnimationLoopTimelineOptions(
@@ -51468,9 +51752,10 @@ void DrawAnimationSection(
 
         const bool strongAlignmentInProgress =
             runtimeState->animationStrongAlignmentJob.shared != nullptr;
-        if (matchingAppliedPair && currentLoopFileIndex.has_value() &&
-            loopPartnerIndex.has_value()) {
-            ImGui::SeparatorText("Lower-Frame Geometry Alignment");
+        if (currentLoopFileIndex.has_value() &&
+            loopPartnerIndex.has_value() && loopCurrent != nullptr &&
+            loopPartner != nullptr) {
+            ImGui::SeparatorText("Matching-Frame Key Alignment");
             if (strongAlignmentInProgress) {
                 ImGui::TextDisabled(
                     "Matching cached lower-frame geometry in the background...");
@@ -51481,7 +51766,7 @@ void DrawAnimationSection(
                 !panel.loopTimeline.strongDestinationKeyId.empty();
             if (!hasStrongDestination) {
                 ImGui::TextDisabled(
-                    "Double-click one eligible timeline key to choose the cyan destination.");
+                    "Double-click one eligible timeline key to choose the cyan destination. Keys outside the overlap have no matching frame and cannot be aligned.");
             } else {
                 const auto requestPaths =
                     std::array<std::filesystem::path, 2>{
@@ -51490,11 +51775,47 @@ void DrawAnimationSection(
                         panel.availableFiles[
                             loopPartnerIndex.value()],
                     };
+                const bool destinationIsCurrent =
+                    panel.loopTimeline.strongDestinationRow == 0;
+                const float destinationStartOverlapSeconds =
+                    destinationIsCurrent
+                        ? loopTimelineOptions.firstStartOverlapSeconds
+                        : loopTimelineOptions.secondStartOverlapSeconds;
+                const float destinationEndOverlapSeconds =
+                    destinationIsCurrent
+                        ? loopTimelineOptions.firstEndOverlapSeconds
+                        : loopTimelineOptions.secondEndOverlapSeconds;
                 ImGui::BeginDisabled(
                     renderSetupLocksAnimationSwitching ||
                     strongAlignmentInProgress);
+                if (ImGui::Button("Match Camera Rig To Partner")) {
+                    panel.requestedCameraRigAlignment =
+                        AnimationCameraRigAlignmentRequest{
+                            .filePaths = requestPaths,
+                            .destinationRow = panel.loopTimeline
+                                                  .strongDestinationRow,
+                            .destinationKeyId = panel.loopTimeline
+                                                    .strongDestinationKeyId,
+                            .destinationStartOverlapSeconds =
+                                destinationStartOverlapSeconds,
+                            .destinationEndOverlapSeconds =
+                                destinationEndOverlapSeconds,
+                        };
+                }
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(
+                        ImGuiHoveredFlags_DelayNormal |
+                        ImGuiHoveredFlags_AllowWhenDisabled)) {
+                    ImGui::SetTooltip(
+                        "Works before velocity alignment using the selected Blend Partner and current bounds. Keeps the selected focus fixed and moves only its camera key. The matching frame's focus-to-camera offset is measured as path-forward/back, path-side, and world height, then reconstructed relative to this animation's path direction. Focus distance and viewing-side character therefore match without moving the partner animation.");
+                }
+                ImGui::SameLine();
+                ImGui::BeginDisabled(
+                    renderSetupLocksAnimationSwitching ||
+                    strongAlignmentInProgress ||
+                    !matchingAppliedPair);
                 if (ImGui::Button(
-                        "Align Selected Key To Matching Frame")) {
+                        "Refine Lower-Frame Geometry")) {
                     panel.requestedLowerFrameAlignment =
                         AnimationLowerFrameAlignmentRequest{
                             .filePaths = requestPaths,
@@ -51511,8 +51832,9 @@ void DrawAnimationSection(
                 if (ImGui::IsItemHovered(
                         ImGuiHoveredFlags_DelayNormal |
                         ImGuiHoveredFlags_AllowWhenDisabled)) {
-                    ImGui::SetTooltip(
-                        "Keeps the matching animation fixed and adjusts only the selected key. It compares spatially balanced, frontmost common points in the lower 55%% of both frames using the already-resident pivot-position cache. No cloud, scalar-field, or renderer readback is requested.");
+                    ImGui::SetTooltip(matchingAppliedPair
+                        ? "Keeps the matching animation fixed and adjusts only the selected key's camera and focus. It compares spatially balanced, frontmost common points in the lower 55%% of both frames using the already-resident pivot-position cache. No cloud, scalar-field, or renderer readback is requested."
+                        : "Apply Velocity Alignment before refining against cached lower-frame geometry. Camera-rig matching is already available without it.");
                 }
                 ImGui::TextDisabled(
                     "Destination %c / %s; matching position %.2f%% on %c.",

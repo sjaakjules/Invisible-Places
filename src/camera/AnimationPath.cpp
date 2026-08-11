@@ -4125,7 +4125,192 @@ float StrongScreenMovementRms(
                : 0.0F;
 }
 
+struct HorizontalAnimationPathFrame {
+    glm::vec3 forward{1.0F, 0.0F, 0.0F};
+    glm::vec3 lateral{0.0F, -1.0F, 0.0F};
+};
+
+std::optional<HorizontalAnimationPathFrame>
+ResolveHorizontalAnimationPathFrame(
+    const PreparedAnimationPathEvaluationContext& context,
+    float normalizedPosition) {
+    if (!context.valid || context.singleKey ||
+        context.durationSeconds <= 1.0e-6F) {
+        return std::nullopt;
+    }
+
+    const float centerSeconds =
+        std::clamp(normalizedPosition, 0.0F, 1.0F) *
+        context.durationSeconds;
+    float sampleHalfSpan = std::clamp(
+        context.durationSeconds / 600.0F,
+        1.0F / 240.0F,
+        1.0F / 30.0F);
+    sampleHalfSpan = std::min(
+        sampleHalfSpan,
+        0.25F * context.durationSeconds);
+    const float leftSeconds = std::max(
+        0.0F,
+        centerSeconds - sampleHalfSpan);
+    const float rightSeconds = std::min(
+        context.durationSeconds,
+        centerSeconds + sampleHalfSpan);
+    if (rightSeconds - leftSeconds <= 1.0e-7F) {
+        return std::nullopt;
+    }
+
+    const auto left = EvaluatePreparedAnimationPath(
+        context,
+        leftSeconds);
+    const auto right = EvaluatePreparedAnimationPath(
+        context,
+        rightSeconds);
+    auto horizontalDelta = [](const std::array<float, 3>& from,
+                              const std::array<float, 3>& to) {
+        return glm::vec3{
+            to[0U] - from[0U],
+            to[1U] - from[1U],
+            0.0F,
+        };
+    };
+    glm::vec3 travel = horizontalDelta(
+        left.focusPoint,
+        right.focusPoint);
+    if (glm::dot(travel, travel) <= 1.0e-12F) {
+        travel = horizontalDelta(
+            left.camera.position,
+            right.camera.position);
+    }
+    if (!std::isfinite(travel.x) || !std::isfinite(travel.y) ||
+        glm::dot(travel, travel) <= 1.0e-12F) {
+        return std::nullopt;
+    }
+
+    const glm::vec3 forward = glm::normalize(travel);
+    const glm::vec3 lateral = glm::cross(
+        forward,
+        glm::vec3{0.0F, 0.0F, 1.0F});
+    if (!std::isfinite(lateral.x) || !std::isfinite(lateral.y) ||
+        glm::dot(lateral, lateral) <= 1.0e-12F) {
+        return std::nullopt;
+    }
+    return HorizontalAnimationPathFrame{
+        .forward = forward,
+        .lateral = glm::normalize(lateral),
+    };
+}
+
 }  // namespace
+
+AnimationFocusRelativeCameraAlignmentResult
+AlignAnimationKeyCameraToReferenceRig(
+    AnimationPath* destination,
+    const AnimationPath& reference,
+    const AnimationFocusRelativeCameraAlignmentOptions& options) {
+    AnimationFocusRelativeCameraAlignmentResult result;
+    if (destination == nullptr || destination == &reference) {
+        result.errorMessage =
+            "Choose different destination and reference animations.";
+        return result;
+    }
+    const auto keyIt = std::find_if(
+        destination->keys.begin(),
+        destination->keys.end(),
+        [&](const AnimationPathKey& key) {
+            return key.id == options.destinationKeyId;
+        });
+    if (keyIt == destination->keys.end()) {
+        result.errorMessage =
+            "The selected camera-rig alignment key no longer exists.";
+        return result;
+    }
+
+    const std::size_t keyIndex = static_cast<std::size_t>(
+        std::distance(destination->keys.begin(), keyIt));
+    const float destinationPosition = AnimationPathKeyNormalizedPosition(
+        *destination,
+        keyIndex);
+    const float referencePosition = std::clamp(
+        options.referenceNormalizedPosition,
+        0.0F,
+        1.0F);
+    const auto destinationContext = PrepareAnimationPathEvaluation(
+        *destination);
+    const auto referenceContext = PrepareAnimationPathEvaluation(reference);
+    if (!destinationContext.valid || !referenceContext.valid) {
+        result.errorMessage = "One selected animation cannot be evaluated.";
+        return result;
+    }
+    const auto destinationFrame = ResolveHorizontalAnimationPathFrame(
+        destinationContext,
+        destinationPosition);
+    const auto referenceFrame = ResolveHorizontalAnimationPathFrame(
+        referenceContext,
+        referencePosition);
+    if (!referenceFrame.has_value()) {
+        result.errorMessage =
+            "The matching animation has no horizontal camera or focus travel at that frame to define forward along its path.";
+        return result;
+    }
+    if (!destinationFrame.has_value()) {
+        result.errorMessage =
+            "The selected animation has no horizontal camera or focus travel at that key to define its local path direction.";
+        return result;
+    }
+
+    const auto referenceEvaluation = EvaluatePreparedAnimationPath(
+        referenceContext,
+        referenceContext.durationSeconds * referencePosition);
+    const glm::vec3 referenceCamera = ToGlm(
+        referenceEvaluation.camera.position);
+    const glm::vec3 referenceFocus = ToGlm(
+        referenceEvaluation.focusPoint);
+    const glm::vec3 referenceOffset =
+        referenceCamera - referenceFocus;
+    result.referenceFocusDistance = glm::length(referenceOffset);
+    if (!std::isfinite(result.referenceFocusDistance) ||
+        result.referenceFocusDistance <= 1.0e-5F) {
+        result.errorMessage =
+            "The matching frame's camera is too close to its focus point to define a reusable camera rig.";
+        return result;
+    }
+
+    result.referenceAlongPathOffset = glm::dot(
+        referenceOffset,
+        referenceFrame->forward);
+    result.referenceLateralOffset = glm::dot(
+        referenceOffset,
+        referenceFrame->lateral);
+    result.referenceHeightOffset = referenceOffset.z;
+    const glm::vec3 destinationFocus = ToGlm(keyIt->focusPoint);
+    const glm::vec3 targetCamera =
+        destinationFocus +
+        result.referenceAlongPathOffset * destinationFrame->forward +
+        result.referenceLateralOffset * destinationFrame->lateral +
+        result.referenceHeightOffset * glm::vec3{0.0F, 0.0F, 1.0F};
+    if (!std::isfinite(targetCamera.x) || !std::isfinite(targetCamera.y) ||
+        !std::isfinite(targetCamera.z)) {
+        result.errorMessage =
+            "The matching frame produced an invalid focus-relative camera position.";
+        return result;
+    }
+
+    const std::array<float, 3> target{
+        targetCamera.x,
+        targetCamera.y,
+        targetCamera.z,
+    };
+    result.cameraMove = Distance(keyIt->cameraPosition, target);
+    result.succeeded = true;
+    if (result.cameraMove <= 1.0e-6F) {
+        return result;
+    }
+
+    EnsureLocalizedKeyCorrections(destination, {keyIndex});
+    destination->keys[keyIndex].cameraPosition = target;
+    result.changed = true;
+    return result;
+}
 
 AnimationStrongAlignmentResult StrongAlignAnimationKeyToReference(
     AnimationPath* destination,

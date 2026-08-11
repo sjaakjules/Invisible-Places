@@ -435,6 +435,22 @@ struct AnimationStrongAlignmentResult {
     std::string errorMessage;
 };
 
+struct AnimationFocusRelativeCameraAlignmentOptions {
+    std::string destinationKeyId;
+    float referenceNormalizedPosition = 0.0F;
+};
+
+struct AnimationFocusRelativeCameraAlignmentResult {
+    bool succeeded = false;
+    bool changed = false;
+    float referenceFocusDistance = 0.0F;
+    float referenceAlongPathOffset = 0.0F;
+    float referenceLateralOffset = 0.0F;
+    float referenceHeightOffset = 0.0F;
+    float cameraMove = 0.0F;
+    std::string errorMessage;
+};
+
 struct AnimationMatchingFrameGhostOptions {
     float aspectRatio = 16.0F / 9.0F;
     std::size_t screenGridWidth = 160U;
@@ -564,6 +580,17 @@ ResolveAnimationLoopHorizontalBlendRegions(
     const AnimationPath& reference,
     std::span<const invisible_places::io::Float3> residentPoints,
     const AnimationStrongAlignmentOptions& options);
+// Moves only one destination camera key. The destination focus stays fixed;
+// the reference frame's focus-to-camera vector is decomposed into horizontal
+// along-path, horizontal lateral, and world-Z components, then reconstructed
+// in the destination path's local travel frame. This preserves the matching
+// rig's distance, height, and forward/perpendicular/backward relationship
+// without moving or modifying the reference animation.
+[[nodiscard]] AnimationFocusRelativeCameraAlignmentResult
+AlignAnimationKeyCameraToReferenceRig(
+    AnimationPath* destination,
+    const AnimationPath& reference,
+    const AnimationFocusRelativeCameraAlignmentOptions& options);
 // Captures the front-visible resident surface from `reference`, then applies
 // the rigid reference-camera -> destination-camera transform. The returned
 // world positions therefore remain frozen while the live camera orbits.
