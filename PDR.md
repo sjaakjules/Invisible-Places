@@ -234,6 +234,18 @@ the unique A/B cycle is exactly 7,200 frames, and scale reciprocal overlaps and
 finite export bounds with them. Camera/focus/lens geometry, key order, triangle
 alignment, and the independent procedural-effects clock shall not change.
 
+After Apply, every valid reciprocal pair shall expose a persistent **Seamed
+View**. While either linked animation is scrubbed or played inside a saved
+start/end overlap, the viewport shall evaluate the exact reciprocal partner
+frame and composite a moving hard split. Newly applied pairs shall carry the
+captured anchor positions into the linked view for the active session; links
+without those transient observations shall use saved overlap progress as a
+deterministic fallback. The ending animation shall remain on
+the left and the starting animation on the right at both seams. The boundary
+shall pass through the aligned midpoint at 50% overlap progress, retain one
+artistic pixel offset per physical seam when the loaded A/B role reverses, and
+fall back to the ordinary single-animation view outside the overlap.
+
 ### 5.4 Side Panel Behaviour
 #### FR-UI-1
 The application shall include a side panel for render and style controls.

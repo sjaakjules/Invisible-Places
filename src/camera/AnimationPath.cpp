@@ -1281,6 +1281,88 @@ float AnimationPathDurationSeconds(const AnimationPath& path) {
            kAnimationFramesPerSecond;
 }
 
+std::optional<AnimationLinkedSeamSample>
+ResolveAnimationLinkedSeamSample(
+    const AnimationPath& current,
+    const AnimationPath& partner,
+    float currentNormalizedPosition) {
+    if (!current.velocityBlendLink.has_value() ||
+        !partner.velocityBlendLink.has_value() ||
+        current.velocityBlendLink->pairId.empty() ||
+        current.velocityBlendLink->pairId !=
+            partner.velocityBlendLink->pairId ||
+        !std::isfinite(currentNormalizedPosition)) {
+        return std::nullopt;
+    }
+    const float currentDuration = AnimationPathDurationSeconds(current);
+    const float partnerDuration = AnimationPathDurationSeconds(partner);
+    const auto& currentLink = current.velocityBlendLink.value();
+    const auto& partnerLink = partner.velocityBlendLink.value();
+    constexpr float kHalfFrameSeconds =
+        (0.5F / kAnimationFramesPerSecond) + 1.0e-5F;
+    const auto validOverlap = [](float value) {
+        return std::isfinite(value) && value >= 0.0F;
+    };
+    if (currentDuration <= 1.0e-6F || partnerDuration <= 1.0e-6F ||
+        !validOverlap(currentLink.startOverlapSeconds) ||
+        !validOverlap(currentLink.endOverlapSeconds) ||
+        !validOverlap(partnerLink.startOverlapSeconds) ||
+        !validOverlap(partnerLink.endOverlapSeconds) ||
+        currentLink.startOverlapSeconds + currentLink.endOverlapSeconds >
+            currentDuration + kHalfFrameSeconds ||
+        partnerLink.startOverlapSeconds + partnerLink.endOverlapSeconds >
+            partnerDuration + kHalfFrameSeconds ||
+        std::abs(currentLink.startOverlapSeconds -
+                 partnerLink.endOverlapSeconds) > kHalfFrameSeconds ||
+        std::abs(currentLink.endOverlapSeconds -
+                 partnerLink.startOverlapSeconds) > kHalfFrameSeconds) {
+        return std::nullopt;
+    }
+
+    const float currentPosition = std::clamp(
+        currentNormalizedPosition,
+        0.0F,
+        1.0F);
+    const float currentTime = currentPosition * currentDuration;
+    const float startOverlap = std::min(
+        currentLink.startOverlapSeconds,
+        currentDuration);
+    const float endOverlap = std::min(
+        currentLink.endOverlapSeconds,
+        currentDuration);
+    const bool insideStart = startOverlap > 1.0e-6F &&
+        currentTime <= startOverlap + 1.0e-5F;
+    const bool insideEnd = endOverlap > 1.0e-6F &&
+        currentTime >= currentDuration - endOverlap - 1.0e-5F;
+    if (!insideStart && !insideEnd) {
+        return std::nullopt;
+    }
+    const bool useStart = insideStart &&
+        (!insideEnd || currentTime <= currentDuration - currentTime);
+    const float overlap = useStart ? startOverlap : endOverlap;
+    const float overlapElapsed = useStart
+        ? currentTime
+        : currentTime - (currentDuration - endOverlap);
+    const float partnerTime = useStart
+        ? partnerDuration - std::min(startOverlap, partnerDuration) +
+              currentTime
+        : currentTime - (currentDuration - endOverlap);
+
+    return AnimationLinkedSeamSample{
+        .currentSeamIndex = useStart ? 0U : 1U,
+        .currentNormalizedPosition = currentPosition,
+        .partnerNormalizedPosition = std::clamp(
+            partnerTime / partnerDuration,
+            0.0F,
+            1.0F),
+        .overlapProgress = std::clamp(
+            overlapElapsed / std::max(overlap, 1.0e-6F),
+            0.0F,
+            1.0F),
+        .currentOnLeft = !useStart,
+    };
+}
+
 PreparedAnimationPathEvaluationContext PrepareAnimationPathEvaluation(const AnimationPath& path) {
     PreparedAnimationPathEvaluationContext context;
     if (path.keys.empty()) {

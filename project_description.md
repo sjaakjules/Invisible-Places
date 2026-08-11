@@ -328,6 +328,17 @@ triangle fit, and a rejected pass does not replace the current working edit.
 Back, Cancel, and Escape discard all private candidates and restore the launch
 camera, playhead, pivot, and matching ghost.
 
+Once the reciprocal metadata is applied, **Seamed View** keeps the same
+two-camera hard-split compositor available during ordinary linked-animation
+scrubbing and playback. It resolves the partner from the link rather than the
+current Blend Partner menu, maps both saved overlap bands at exact elapsed
+seconds, and follows captured feature anchors when the pair has just been
+applied in this session; reloaded links fall back to a deterministic sweep
+from saved overlap progress. The
+ending path is always left and the starting path right; switching which file
+is loaded preserves the physical seam and its artistic pixel offset. Outside
+an overlap, live view returns to the ordinary current animation.
+
 Camera duration grows on the same 30 fps timebase. Every normalized timing,
 water, and visual-effect key or finite activation boundary is shifted by the
 prepended frame count and rescaled to the new duration, so it remains attached

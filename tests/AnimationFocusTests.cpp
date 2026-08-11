@@ -3025,3 +3025,100 @@ TEST_CASE("Reciprocal off-centre orbit pans continue projected patch rotation",
               result.metrics.beforeRotationRmsDegreesPerSecond[side]);
     }
 }
+
+TEST_CASE("Linked seam sampling follows both reciprocal overlap bands",
+          "[camera][animation][linked-seam]") {
+    const auto makePath = [](
+                              std::string name,
+                              std::string pairId,
+                              float startOverlap,
+                              float endOverlap) {
+        invisible_places::camera::AnimationPath path;
+        path.name = std::move(name);
+        path.durationFrames = 300U;
+        path.keys = {
+            {.id = path.name + "-start",
+             .cameraPosition = {0.0F, 0.0F, 0.0F},
+             .focusPoint = {0.0F, 1.0F, 0.0F}},
+            {.id = path.name + "-end",
+             .cameraPosition = {1.0F, 0.0F, 0.0F},
+             .focusPoint = {1.0F, 1.0F, 0.0F},
+             .durationFrames = 300U},
+        };
+        path.velocityBlendLink = invisible_places::camera::
+            AnimationVelocityBlendLinkMetadata{
+                .pairId = std::move(pairId),
+                .partnerFileName = "partner.ipanim.json",
+                .startOverlapSeconds = startOverlap,
+                .endOverlapSeconds = endOverlap,
+                .horizontalBlend = true,
+            };
+        return path;
+    };
+    const auto first = makePath("A", "pair", 2.0F, 3.0F);
+    const auto second = makePath("B", "pair", 3.0F, 2.0F);
+
+    const auto start = invisible_places::camera::
+        ResolveAnimationLinkedSeamSample(first, second, 0.0F);
+    REQUIRE(start.has_value());
+    CHECK(start->currentSeamIndex == 0U);
+    CHECK(start->partnerNormalizedPosition == Approx(0.8F));
+    CHECK(start->overlapProgress == Approx(0.0F));
+    CHECK_FALSE(start->currentOnLeft);
+
+    const auto firstMidpoint = invisible_places::camera::
+        ResolveAnimationLinkedSeamSample(first, second, 0.1F);
+    REQUIRE(firstMidpoint.has_value());
+    CHECK(firstMidpoint->partnerNormalizedPosition == Approx(0.9F));
+    CHECK(firstMidpoint->overlapProgress == Approx(0.5F));
+    CHECK_FALSE(firstMidpoint->currentOnLeft);
+
+    const auto startEnd = invisible_places::camera::
+        ResolveAnimationLinkedSeamSample(first, second, 0.2F);
+    REQUIRE(startEnd.has_value());
+    CHECK(startEnd->partnerNormalizedPosition == Approx(1.0F));
+    CHECK(startEnd->overlapProgress == Approx(1.0F));
+    CHECK_FALSE(startEnd->currentOnLeft);
+    CHECK_FALSE(invisible_places::camera::ResolveAnimationLinkedSeamSample(
+                    first,
+                    second,
+                    0.5F)
+                    .has_value());
+
+    const auto endStart = invisible_places::camera::
+        ResolveAnimationLinkedSeamSample(first, second, 0.7F);
+    REQUIRE(endStart.has_value());
+    CHECK(endStart->currentSeamIndex == 1U);
+    CHECK(endStart->partnerNormalizedPosition == Approx(0.0F));
+    CHECK(endStart->overlapProgress == Approx(0.0F));
+    CHECK(endStart->currentOnLeft);
+
+    const auto secondMidpoint = invisible_places::camera::
+        ResolveAnimationLinkedSeamSample(first, second, 0.85F);
+    REQUIRE(secondMidpoint.has_value());
+    CHECK(secondMidpoint->partnerNormalizedPosition == Approx(0.15F));
+    CHECK(secondMidpoint->overlapProgress == Approx(0.5F));
+    CHECK(secondMidpoint->currentOnLeft);
+
+    const auto end = invisible_places::camera::
+        ResolveAnimationLinkedSeamSample(first, second, 1.0F);
+    REQUIRE(end.has_value());
+    CHECK(end->partnerNormalizedPosition == Approx(0.3F));
+    CHECK(end->overlapProgress == Approx(1.0F));
+    CHECK(end->currentOnLeft);
+
+    const auto reverseStart = invisible_places::camera::
+        ResolveAnimationLinkedSeamSample(second, first, 0.0F);
+    REQUIRE(reverseStart.has_value());
+    CHECK(reverseStart->partnerNormalizedPosition == Approx(0.7F));
+    CHECK(reverseStart->overlapProgress == Approx(0.0F));
+    CHECK_FALSE(reverseStart->currentOnLeft);
+
+    auto broken = second;
+    broken.velocityBlendLink->pairId = "other-pair";
+    CHECK_FALSE(invisible_places::camera::ResolveAnimationLinkedSeamSample(
+                    first,
+                    broken,
+                    0.1F)
+                    .has_value());
+}

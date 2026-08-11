@@ -105,6 +105,16 @@ struct AnimationVelocityBlendLinkMetadata {
     std::vector<std::string> movableKeyIds;
 };
 
+struct AnimationLinkedSeamSample {
+    // 0 = current-start/partner-end, 1 = current-end/partner-start.
+    std::uint32_t currentSeamIndex = 0U;
+    float currentNormalizedPosition = 0.0F;
+    float partnerNormalizedPosition = 0.0F;
+    float overlapProgress = 0.0F;
+    // Endpoint-role layout for a horizontal hard split.
+    bool currentOnLeft = false;
+};
+
 struct AnimationPath {
     // Original file schema retained only for application-level migration
     // bookkeeping. Serialization always writes the current schema.
@@ -751,6 +761,14 @@ AnimationPath BuildAnimationPathFromCameraShots(
     float apertureFStops = 8.0F);
 
 [[nodiscard]] float AnimationPathDurationSeconds(const AnimationPath& path);
+// Resolves the partner frame and 0..1 transition progress while the current
+// playhead lies inside either overlap of a reciprocal linked pair. Outside
+// those bands, or for inconsistent metadata, no seam sample is returned.
+[[nodiscard]] std::optional<AnimationLinkedSeamSample>
+ResolveAnimationLinkedSeamSample(
+    const AnimationPath& current,
+    const AnimationPath& partner,
+    float currentNormalizedPosition);
 [[nodiscard]] PreparedAnimationPathEvaluationContext PrepareAnimationPathEvaluation(
     const AnimationPath& path);
 [[nodiscard]] AnimationPathEvaluation EvaluatePreparedAnimationPath(

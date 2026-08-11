@@ -861,6 +861,25 @@ struct AnimationMatchingFrameGhostState {
     std::chrono::steady_clock::time_point lastAutomaticRequestAt{};
 };
 
+struct AnimationLinkedSeamedViewState {
+    // Linked pairs default to their authored hard-split view. The compositor
+    // is active only inside either saved reciprocal overlap, so ordinary
+    // single-animation inspection remains unchanged through the bulk.
+    bool enabled = true;
+    std::string pairId;
+    // Stable lexical file order gives both loaded members the same two seam
+    // slots. Seam 0 is first-start/second-end; seam 1 is
+    // first-end/second-start.
+    std::array<std::filesystem::path, 2U> orderedFilePaths;
+    std::array<float, 2U> splitOffsetPixels{0.0F, 0.0F};
+    // Optional in-session feature anchors copied from Apply Both. Each seam
+    // stores ordered-file 0/1 anchors so the exact feature-following boundary
+    // survives closing the wizard and swapping which member is loaded.
+    std::array<std::array<glm::vec3, 2U>, 2U> trackedAnchors{};
+    std::array<bool, 2U> trackedAnchorsValid{};
+    std::uint32_t renderedSourceIndex = 0U;
+};
+
 enum class AnimationReciprocalPanWizardStage : std::uint8_t {
     Idle = 0,
     Seam1SourceTriangle,
@@ -1126,6 +1145,7 @@ struct AnimationPanelState {
     std::optional<AnimationCameraRigAlignmentRequest>
         requestedCameraRigAlignment;
     AnimationMatchingFrameGhostState matchingFrameGhost;
+    AnimationLinkedSeamedViewState linkedSeamedView;
     std::optional<AnimationMatchingFrameGhostCaptureRequest>
         requestedMatchingFrameGhostCapture;
     bool requestedMatchingFrameGhostClear = false;
@@ -44690,20 +44710,29 @@ ResolveReciprocalPanComparisonView(
 }
 
 std::array<invisible_places::camera::OrbitCameraMatrices, 2U>
-ReciprocalPanComparisonMatrices(
-    const ReciprocalPanComparisonView& comparison,
+AnimationCameraComparisonMatrices(
+    const std::array<invisible_places::camera::CameraState, 2U>& cameraStates,
     float aspectRatio) {
     std::array<invisible_places::camera::OrbitCameraMatrices, 2U> matrices;
     for (std::size_t role = 0U; role < 2U; ++role) {
         invisible_places::camera::OrbitCamera camera;
-        camera.ApplyState(comparison.cameraStates[role]);
+        camera.ApplyState(cameraStates[role]);
         matrices[role] = camera.Matrices(aspectRatio);
     }
     return matrices;
 }
 
-float ReciprocalPanFeatureSplitCentreNormalized(
+std::array<invisible_places::camera::OrbitCameraMatrices, 2U>
+ReciprocalPanComparisonMatrices(
     const ReciprocalPanComparisonView& comparison,
+    float aspectRatio) {
+    return AnimationCameraComparisonMatrices(
+        comparison.cameraStates,
+        aspectRatio);
+}
+
+float AnimationFeatureSplitCentreNormalized(
+    const std::array<glm::vec3, 2U>& anchors,
     const std::array<invisible_places::camera::OrbitCameraMatrices, 2U>&
         matrices,
     float viewportWidth,
@@ -44712,7 +44741,7 @@ float ReciprocalPanFeatureSplitCentreNormalized(
     std::size_t projectedCount = 0U;
     for (std::size_t role = 0U; role < 2U; ++role) {
         const glm::vec4 clip = matrices[role].viewProjection *
-            glm::vec4{comparison.anchors[role], 1.0F};
+            glm::vec4{anchors[role], 1.0F};
         if (!std::isfinite(clip.x) || !std::isfinite(clip.w) ||
             clip.w <= 1.0e-6F) {
             continue;
@@ -44732,6 +44761,19 @@ float ReciprocalPanFeatureSplitCentreNormalized(
             offsetPixels / std::max(1.0F, viewportWidth),
         -2.0F,
         3.0F);
+}
+
+float ReciprocalPanFeatureSplitCentreNormalized(
+    const ReciprocalPanComparisonView& comparison,
+    const std::array<invisible_places::camera::OrbitCameraMatrices, 2U>&
+        matrices,
+    float viewportWidth,
+    float offsetPixels) {
+    return AnimationFeatureSplitCentreNormalized(
+        comparison.anchors,
+        matrices,
+        viewportWidth,
+        offsetPixels);
 }
 
 void DrawReciprocalPanViewportOverlay(
@@ -52068,6 +52110,169 @@ std::optional<std::string> AppliedReciprocalPairFailure(
     return std::nullopt;
 }
 
+void EnsureLinkedSeamedViewPair(
+    AnimationLinkedSeamedViewState* state,
+    std::string_view pairId,
+    const std::filesystem::path& firstFilePath,
+    const std::filesystem::path& secondFilePath) {
+    if (state == nullptr || pairId.empty()) {
+        return;
+    }
+    std::array<std::filesystem::path, 2U> ordered{
+        firstFilePath,
+        secondFilePath,
+    };
+    if (NormalizePathKey(ordered[1U]) < NormalizePathKey(ordered[0U])) {
+        std::swap(ordered[0U], ordered[1U]);
+    }
+    const bool samePair = state->pairId == pairId &&
+        PathsLexicallyEqual(state->orderedFilePaths[0U], ordered[0U]) &&
+        PathsLexicallyEqual(state->orderedFilePaths[1U], ordered[1U]);
+    if (samePair) {
+        return;
+    }
+    state->pairId = std::string{pairId};
+    state->orderedFilePaths = std::move(ordered);
+    state->splitOffsetPixels = {0.0F, 0.0F};
+    state->trackedAnchors = {};
+    state->trackedAnchorsValid = {};
+    state->renderedSourceIndex = 0U;
+}
+
+std::size_t LinkedSeamedViewOrderedSeamIndex(
+    const AnimationLinkedSeamedViewState& state,
+    const std::filesystem::path& currentFilePath,
+    std::size_t currentLocalSeamIndex) {
+    const bool currentIsOrderedFirst =
+        PathsLexicallyEqual(currentFilePath, state.orderedFilePaths[0U]);
+    return currentIsOrderedFirst
+        ? std::min<std::size_t>(currentLocalSeamIndex, 1U)
+        : 1U - std::min<std::size_t>(currentLocalSeamIndex, 1U);
+}
+
+struct LinkedAnimationSeamedComparison {
+    // Camera source 0 is always the currently loaded animation; source 1 is
+    // its reciprocal partner. `currentSourceOnLeft` follows endpoint roles,
+    // rather than assigning one permanent side to either filename.
+    std::array<invisible_places::camera::CameraState, 2U> cameraStates{};
+    std::size_t currentLocalSeamIndex = 0U;
+    std::size_t orderedSeamIndex = 0U;
+    float currentNormalizedPosition = 0.0F;
+    float partnerNormalizedPosition = 0.0F;
+    float overlapProgress = 0.0F;
+    float splitCenterNormalized = 0.5F;
+    std::array<glm::vec3, 2U> trackedAnchors{};
+    bool trackedAnchorsValid = false;
+    bool currentSourceOnLeft = false;
+};
+
+std::optional<LinkedAnimationSeamedComparison>
+ResolveLinkedAnimationSeamedComparison(
+    PreviewRuntimeState* runtimeState,
+    float viewportWidth) {
+    if (runtimeState == nullptr) {
+        return std::nullopt;
+    }
+    auto& panel = runtimeState->animationPanel;
+    auto& view = panel.linkedSeamedView;
+    if (!view.enabled || panel.currentFilePath.empty() ||
+        panel.savedEditedComparisonHoldActive ||
+        panel.velocityPartnerComparisonHoldActive) {
+        return std::nullopt;
+    }
+    const auto currentIndex = FindAnimationRegistryIndex(
+        panel,
+        std::filesystem::path{panel.currentFilePath});
+    const auto* current = currentIndex.has_value()
+        ? RegistryAnimationPath(*runtimeState, currentIndex.value())
+        : nullptr;
+    if (current == nullptr || !current->velocityBlendLink.has_value()) {
+        return std::nullopt;
+    }
+    const auto partnerIndex = FindAnimationRegistryIndexByFileName(
+        panel,
+        current->velocityBlendLink->partnerFileName);
+    const auto* partner = partnerIndex.has_value()
+        ? RegistryAnimationPath(*runtimeState, partnerIndex.value())
+        : nullptr;
+    if (partner == nullptr ||
+        AppliedReciprocalPairFailure(
+            *current,
+            panel.availableFiles[currentIndex.value()],
+            *partner,
+            panel.availableFiles[partnerIndex.value()])
+            .has_value()) {
+        return std::nullopt;
+    }
+    EnsureLinkedSeamedViewPair(
+        &view,
+        current->velocityBlendLink->pairId,
+        panel.availableFiles[currentIndex.value()],
+        panel.availableFiles[partnerIndex.value()]);
+
+    const float currentDuration = invisible_places::camera::
+        AnimationPathDurationSeconds(*current);
+    const float partnerDuration = invisible_places::camera::
+        AnimationPathDurationSeconds(*partner);
+    if (currentDuration <= 1.0e-6F || partnerDuration <= 1.0e-6F) {
+        return std::nullopt;
+    }
+    const auto seamSample = invisible_places::camera::
+        ResolveAnimationLinkedSeamSample(
+            *current,
+            *partner,
+            panel.scrubAmount);
+    if (!seamSample.has_value()) {
+        return std::nullopt;
+    }
+    const std::size_t localSeamIndex =
+        seamSample->currentSeamIndex;
+    const std::size_t orderedSeamIndex =
+        LinkedSeamedViewOrderedSeamIndex(
+            view,
+            panel.availableFiles[currentIndex.value()],
+            localSeamIndex);
+
+    LinkedAnimationSeamedComparison comparison;
+    comparison.currentLocalSeamIndex = localSeamIndex;
+    comparison.orderedSeamIndex = orderedSeamIndex;
+    comparison.currentNormalizedPosition =
+        seamSample->currentNormalizedPosition;
+    comparison.partnerNormalizedPosition =
+        seamSample->partnerNormalizedPosition;
+    comparison.overlapProgress = seamSample->overlapProgress;
+    comparison.currentSourceOnLeft = seamSample->currentOnLeft;
+    comparison.splitCenterNormalized = std::clamp(
+        1.0F - seamSample->overlapProgress +
+            view.splitOffsetPixels[orderedSeamIndex] /
+                std::max(viewportWidth, 1.0F),
+        -2.0F,
+        3.0F);
+    if (view.trackedAnchorsValid[orderedSeamIndex]) {
+        const bool currentIsOrderedFirst = PathsLexicallyEqual(
+            panel.availableFiles[currentIndex.value()],
+            view.orderedFilePaths[0U]);
+        comparison.trackedAnchors[0U] =
+            view.trackedAnchors[orderedSeamIndex]
+                [currentIsOrderedFirst ? 0U : 1U];
+        comparison.trackedAnchors[1U] =
+            view.trackedAnchors[orderedSeamIndex]
+                [currentIsOrderedFirst ? 1U : 0U];
+        comparison.trackedAnchorsValid = true;
+    }
+    comparison.cameraStates[0U] = invisible_places::camera::
+        EvaluateAnimationPath(
+            *current,
+            seamSample->currentNormalizedPosition * currentDuration).camera;
+    comparison.cameraStates[1U] = invisible_places::camera::
+        EvaluateAnimationPath(
+            *partner,
+            seamSample->partnerNormalizedPosition * partnerDuration).camera;
+    comparison.cameraStates[0U].hasDepthOfField = false;
+    comparison.cameraStates[1U].hasDepthOfField = false;
+    return comparison;
+}
+
 std::optional<std::string> ReciprocalPanExistingLinkConflict(
     const AnimationPath& first,
     const std::filesystem::path& firstFilePath,
@@ -54738,6 +54943,49 @@ bool ApplyReciprocalPanCandidate(
     panel.requestedCameraRigAlignment.reset();
     panel.requestedLowerFrameAlignment.reset();
     panel.pendingVelocityLinkSettingsUpdate.reset();
+    EnsureLinkedSeamedViewPair(
+        &panel.linkedSeamedView,
+        wizard.dependencyPairId,
+        wizard.filePaths[0U],
+        wizard.filePaths[1U]);
+    const bool wizardAIsOrderedFirst = PathsLexicallyEqual(
+        wizard.filePaths[0U],
+        panel.linkedSeamedView.orderedFilePaths[0U]);
+    panel.linkedSeamedView.splitOffsetPixels = wizardAIsOrderedFirst
+        ? wizard.splitAnchorOffsetPixels
+        : std::array<float, 2U>{
+              wizard.splitAnchorOffsetPixels[1U],
+              wizard.splitAnchorOffsetPixels[0U],
+          };
+    const auto wizardAnchor = [&](std::size_t triangleIndex) {
+        const auto& point = wizard.endpointTriangles[triangleIndex]
+                                .patch.worldPoints[0U];
+        return glm::vec3{point[0U], point[1U], point[2U]};
+    };
+    panel.linkedSeamedView.trackedAnchors = wizardAIsOrderedFirst
+        ? std::array<std::array<glm::vec3, 2U>, 2U>{
+              std::array<glm::vec3, 2U>{
+                  wizardAnchor(0U),
+                  wizardAnchor(1U),
+              },
+              std::array<glm::vec3, 2U>{
+                  wizardAnchor(3U),
+                  wizardAnchor(2U),
+              },
+          }
+        : std::array<std::array<glm::vec3, 2U>, 2U>{
+              std::array<glm::vec3, 2U>{
+                  wizardAnchor(2U),
+                  wizardAnchor(3U),
+              },
+              std::array<glm::vec3, 2U>{
+                  wizardAnchor(1U),
+                  wizardAnchor(0U),
+              },
+          };
+    panel.linkedSeamedView.trackedAnchorsValid = {true, true};
+    panel.linkedSeamedView.enabled = true;
+    panel.linkedSeamedView.renderedSourceIndex = 0U;
     if (runtimeState->animationVelocityPreviewJob.worker.joinable()) {
         runtimeState->animationVelocityPreviewJob.worker.request_stop();
     }
@@ -59380,6 +59628,70 @@ void DrawAnimationSection(
             if (strongAlignmentInProgress) {
                 ImGui::TextDisabled(
                     "Matching cached lower-frame geometry in the background...");
+            }
+            ImGui::BeginDisabled(!matchingAppliedPair);
+            if (matchingAppliedPair) {
+                EnsureLinkedSeamedViewPair(
+                    &panel.linkedSeamedView,
+                    loopCurrent->velocityBlendLink->pairId,
+                    panel.availableFiles[currentLoopFileIndex.value()],
+                    panel.availableFiles[loopPartnerIndex.value()]);
+            }
+            if (ImGui::Checkbox(
+                    "Seamed View",
+                    &panel.linkedSeamedView.enabled)) {
+                panel.linkedSeamedView.renderedSourceIndex = 0U;
+                runtimeState->previewRenderStateSignatureValid = false;
+            }
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(
+                    ImGuiHoveredFlags_DelayNormal |
+                    ImGuiHoveredFlags_AllowWhenDisabled)) {
+                ImGui::SetTooltip(
+                    "%s",
+                    matchingAppliedPair
+                        ? "Shows the reciprocal partner through a moving hard split whenever the current playhead enters either saved overlap. The ending animation stays on the left and the starting animation on the right."
+                        : reciprocalPairFailure->c_str());
+            }
+            if (matchingAppliedPair && panel.linkedSeamedView.enabled) {
+                const bool currentIsOrderedFirst = PathsLexicallyEqual(
+                    panel.availableFiles[currentLoopFileIndex.value()],
+                    panel.linkedSeamedView.orderedFilePaths[0U]);
+                const std::size_t currentStartSlot =
+                    currentIsOrderedFirst ? 0U : 1U;
+                const std::size_t currentEndSlot =
+                    currentIsOrderedFirst ? 1U : 0U;
+                const float viewportWidth = std::max(
+                    1.0F,
+                    CurrentUiViewportSize(viewport).x);
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                const bool startOffsetChanged = ImGui::SliderFloat(
+                    "Current start seam offset",
+                    &panel.linkedSeamedView
+                         .splitOffsetPixels[currentStartSlot],
+                    -viewportWidth,
+                    viewportWidth,
+                    "%+.0f px");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                const bool endOffsetChanged = ImGui::SliderFloat(
+                    "Current end seam offset",
+                    &panel.linkedSeamedView
+                         .splitOffsetPixels[currentEndSlot],
+                    -viewportWidth,
+                    viewportWidth,
+                    "%+.0f px");
+                if (startOffsetChanged || endOffsetChanged) {
+                    runtimeState->previewRenderStateSignatureValid = false;
+                }
+                if (ImGui::Button("Reset seam offsets")) {
+                    panel.linkedSeamedView.splitOffsetPixels = {
+                        0.0F,
+                        0.0F,
+                    };
+                    runtimeState->previewRenderStateSignatureValid = false;
+                }
+                ImGui::TextWrapped(
+                    "The split is visible only inside a linked overlap. After Apply it follows the captured feature anchors; a reloaded link falls back to an overlap-progress sweep. Both cross the aligned 50%% pose halfway through and retain these artistic offsets for this session.");
             }
             const std::optional<std::string> extensionLinkFailure =
                 ReciprocalPanExistingLinkConflict(
@@ -101044,6 +101356,8 @@ int Application::Run(ApplicationRunOptions options) const {
                         ? liveWaterTimeSeconds
                         : 0.0F;
                 std::optional<ReciprocalPanComparisonView> comparison;
+                std::optional<LinkedAnimationSeamedComparison>
+                    linkedSeamedComparison;
                 std::optional<std::array<
                     invisible_places::camera::OrbitCameraMatrices,
                     2U>> comparisonMatrices;
@@ -101099,8 +101413,60 @@ int Application::Run(ApplicationRunOptions options) const {
                                 wizard,
                                 comparison->seamIndex));
                     }
+                } else {
+                    const float uiViewportWidth = std::max(
+                        1.0F,
+                        CurrentUiViewportSize(viewport.value()).x);
+                    linkedSeamedComparison =
+                        ResolveLinkedAnimationSeamedComparison(
+                            &runtimeState,
+                            uiViewportWidth);
+                    if (linkedSeamedComparison.has_value()) {
+                        auto& linkedView = runtimeState.animationPanel
+                            .linkedSeamedView;
+                        comparisonMatrices =
+                            AnimationCameraComparisonMatrices(
+                                linkedSeamedComparison->cameraStates,
+                                CurrentAspectRatio(viewport.value()));
+                        const std::uint32_t renderedSource =
+                            linkedView.renderedSourceIndex % 2U;
+                        linkedView.renderedSourceIndex =
+                            1U - renderedSource;
+                        comparisonCamera =
+                            &linkedSeamedComparison->cameraStates[
+                                renderedSource];
+                        const std::array<glm::mat4, 2U>
+                            viewProjections{
+                                comparisonMatrices.value()[0U]
+                                    .viewProjection,
+                                comparisonMatrices.value()[1U]
+                                    .viewProjection,
+                            };
+                        const float splitCenter =
+                            linkedSeamedComparison->trackedAnchorsValid
+                            ? AnimationFeatureSplitCentreNormalized(
+                                  linkedSeamedComparison->trackedAnchors,
+                                  comparisonMatrices.value(),
+                                  uiViewportWidth,
+                                  linkedView.splitOffsetPixels[
+                                      linkedSeamedComparison
+                                          ->orderedSeamIndex])
+                            : linkedSeamedComparison
+                                  ->splitCenterNormalized;
+                        viewport->SetTemporalCameraOverlay(
+                            true,
+                            renderedSource,
+                            0.5F,
+                            0.5F,
+                            &viewProjections,
+                            true,
+                            splitCenter,
+                            linkedSeamedComparison
+                                ->currentSourceOnLeft);
+                    }
                 }
-                if (!comparison.has_value()) {
+                if (!comparison.has_value() &&
+                    !linkedSeamedComparison.has_value()) {
                     viewport->SetTemporalCameraOverlay(false);
                 }
                 auto renderState = BuildRenderState(
@@ -101119,6 +101485,7 @@ int Application::Run(ApplicationRunOptions options) const {
                     runtimeState.previewRenderStateSignature != renderStateSignature;
                 if (renderStateChanged ||
                     comparison.has_value() ||
+                    linkedSeamedComparison.has_value() ||
                     runtimeState.projectSettings.constantUpdateView ||
                     previewLiveEffectsAffectScene) {
                     viewport->UpdateRenderState(renderState);
