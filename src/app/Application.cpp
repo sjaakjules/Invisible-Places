@@ -49436,11 +49436,23 @@ void DrawAnimationSection(
                 std::abs(sample.middleScreenVelocity[1U]));
         };
         float peakScreenSpeed = 0.0F;
+        float peakXScreenVelocity = 0.0F;
+        float peakYScreenVelocity = 0.0F;
+        float peakImageRotation = 0.0F;
         float peakCenterScreenSpeed = 0.0F;
         float peakFrameCrossingRate = 0.0F;
         float peakStablePanMotion = 0.0F;
         for (const auto& sample : perceivedFlow) {
             peakScreenSpeed = std::max(peakScreenSpeed, sample.screenSpeed);
+            peakXScreenVelocity = std::max(
+                peakXScreenVelocity,
+                std::abs(sample.middleScreenVelocity[0U]));
+            peakYScreenVelocity = std::max(
+                peakYScreenVelocity,
+                std::abs(sample.middleScreenVelocity[1U]));
+            peakImageRotation = std::max(
+                peakImageRotation,
+                std::abs(sample.imageRotationDegreesPerSecond));
             const float centerScreenSpeed = std::hypot(
                 sample.middleScreenVelocity[0U],
                 sample.middleScreenVelocity[1U]);
@@ -49866,6 +49878,8 @@ void DrawAnimationSection(
             ImGui::TextWrapped(
                 "All methods change only Segment Frames and preserve the total duration and every authored key pose. Because spline knots use those times, the interpolated path between keys can shift slightly.");
             ImGui::TextWrapped(
+                "Equalize X/Y Velocity are separate spatial operations: they leave Segment Frames unchanged and move both interior camera and focus controls along their existing curves. Minimize Rotation and X + Rotation instead slide only interior camera controls while keeping every focus control fixed.");
+            ImGui::TextWrapped(
                 "Parallax note: these are fast camera/focus-plane estimates. They do not sample point-cloud depth, scalar fields, or renderer pixels, so real near/far parallax can still make parts of the image move at different speeds.");
             ImGui::TextWrapped(
                 "Cinematography note: constant angular motion and gentle starts/stops help a pan, but frame rate and shutter motion blur still determine whether the exported image judders. This command does not change export or shutter settings.");
@@ -49888,20 +49902,23 @@ void DrawAnimationSection(
         const bool canEqualize =
             animationPath.keys.size() >= 2U &&
             selectedMotionPeak > 1.0e-6F;
-        ImGui::BeginDisabled(!canEqualize);
-        if (ImGui::Button("Equalize Perceived Speed")) {
-            const auto segmentFrames = invisible_places::camera::
-                ComputeEqualizedAnimationSegmentFrames(
-                    animationPath,
-                    {
-                        .mode = panel.speedEqualizationMode,
-                    });
-            if (segmentFrames.size() + 1U == animationPath.keys.size()) {
-                for (std::size_t segmentIndex = 0;
+        const auto applySpeedEqualization =
+            [&](SpeedMode mode, std::string_view methodName) {
+                const auto segmentFrames = invisible_places::camera::
+                    ComputeEqualizedAnimationSegmentFrames(
+                        animationPath,
+                        {
+                            .mode = mode,
+                        });
+                if (segmentFrames.size() + 1U !=
+                    animationPath.keys.size()) {
+                    return;
+                }
+                for (std::size_t segmentIndex = 0U;
                      segmentIndex < segmentFrames.size();
                      ++segmentIndex) {
-                    animationPath.keys[segmentIndex + 1U].durationFrames =
-                        segmentFrames[segmentIndex];
+                    animationPath.keys[segmentIndex + 1U]
+                        .durationFrames = segmentFrames[segmentIndex];
                 }
                 panel.dirty = true;
                 runtimeState->animationPlayback.active = false;
@@ -49909,13 +49926,306 @@ void DrawAnimationSection(
                     ApplyAnimationScrub(runtimeState);
                 }
                 runtimeState->statusMessage =
-                    "Retimed " + std::to_string(segmentFrames.size()) +
-                    " segments using " +
-                    speedModeNames[selectedModeIndex] +
-                    ". Fine-tune "
-                    "each key's Segment Frames in the Keys section.";
+                    "Retimed " +
+                    std::to_string(segmentFrames.size()) +
+                    " segments using " + std::string{methodName} +
+                    ". Fine-tune each key's Segment Frames in the Keys "
+                    "section.";
                 runtimeState->errorMessage.clear();
+            };
+
+        const auto commitSpatialCandidate = [&](
+            invisible_places::camera::AnimationPath candidate,
+            std::string_view operationName,
+            std::string statusMessage) {
+            if (candidate.keys.size() != animationPath.keys.size()) {
+                runtimeState->errorMessage =
+                    std::string{operationName} +
+                    " produced an invalid key count.";
+                runtimeState->statusMessage.clear();
+                return false;
             }
+            const auto keyPoseChanged = [](
+                const auto& before,
+                const auto& after) {
+                const auto distance = [](const auto& left,
+                                         const auto& right) {
+                    return std::hypot(
+                        left[0U] - right[0U],
+                        std::hypot(
+                            left[1U] - right[1U],
+                            left[2U] - right[2U]));
+                };
+                return distance(
+                           before.cameraPosition,
+                           after.cameraPosition) > 1.0e-6F ||
+                       distance(
+                           before.focusPoint,
+                           after.focusPoint) > 1.0e-6F;
+            };
+            std::vector<std::size_t> movedKeyIndices;
+            std::unordered_set<std::string> movedCameraIds;
+            for (std::size_t keyIndex = 1U;
+                 keyIndex + 1U < animationPath.keys.size();
+                 ++keyIndex) {
+                const auto& before = animationPath.keys[keyIndex];
+                const auto& after = candidate.keys[keyIndex];
+                if (!keyPoseChanged(before, after)) {
+                    continue;
+                }
+                movedKeyIndices.push_back(keyIndex);
+                if (before.linkedCameraId.empty()) {
+                    continue;
+                }
+                const bool cameraUsedByAnotherMovedKey =
+                    !movedCameraIds.insert(
+                        before.linkedCameraId).second;
+                const auto links = FindCameraAnimationLinks(
+                    *runtimeState,
+                    before.linkedCameraId);
+                const bool onlyThisAnimationKey =
+                    links.empty() ||
+                    (links.size() == 1U &&
+                     !panel.currentFilePath.empty() &&
+                     PathsLexicallyEqual(
+                         links.front().filePath,
+                         std::filesystem::path{
+                             panel.currentFilePath}) &&
+                     links.front().keyId == before.id);
+                if (cameraUsedByAnotherMovedKey ||
+                    !onlyThisAnimationKey) {
+                    const std::string cameraLabel =
+                        before.linkedCameraName.empty()
+                            ? before.linkedCameraId
+                            : before.linkedCameraName;
+                    runtimeState->errorMessage =
+                        std::string{operationName} +
+                        " would move camera " + cameraLabel +
+                        " in more than one key or animation. Untangle "
+                        "that linked camera first.";
+                    runtimeState->statusMessage.clear();
+                    return false;
+                }
+            }
+
+            animationPath = std::move(candidate);
+            for (const auto keyIndex : movedKeyIndices) {
+                const auto& movedKey = animationPath.keys[keyIndex];
+                if (movedKey.linkedCameraId.empty()) {
+                    continue;
+                }
+                const auto shotIndex = FindCameraShotIndexById(
+                    *runtimeState,
+                    movedKey.linkedCameraId);
+                if (!shotIndex.has_value()) {
+                    continue;
+                }
+                CopyAnimationKeyToCameraShot(
+                    movedKey,
+                    &runtimeState->cameraShots[shotIndex.value()]);
+            }
+            panel.dirty = true;
+            runtimeState->animationPlayback.active = false;
+            runtimeState->cameraPlayback.active = false;
+            runtimeState->previewRenderStateSignatureValid = false;
+            if (panel.liveApply) {
+                ApplyAnimationScrub(runtimeState);
+            }
+            runtimeState->statusMessage = std::move(statusMessage);
+            runtimeState->errorMessage.clear();
+            return true;
+        };
+
+        const bool canEqualizeXVelocity =
+            animationPath.keys.size() >= 3U &&
+            peakXScreenVelocity > 1.0e-6F;
+        ImGui::BeginDisabled(!canEqualizeXVelocity);
+        if (ImGui::Button("Equalize X Velocity")) {
+            auto candidate = animationPath;
+            const auto result = invisible_places::camera::
+                RedistributeAnimationPathKeysForConstantScreenXVelocity(
+                    &candidate);
+            if (!result.succeeded) {
+                runtimeState->errorMessage = result.errorMessage;
+                runtimeState->statusMessage.clear();
+            } else if (!result.changed) {
+                runtimeState->statusMessage =
+                    "Camera and focus keys are already distributed for "
+                    "constant X velocity.";
+                runtimeState->errorMessage.clear();
+            } else {
+                commitSpatialCandidate(
+                    std::move(candidate),
+                    "X-velocity redistribution",
+                    "Moved " +
+                        std::to_string(result.movedKeyCount) +
+                        (result.movedKeyCount == 1U
+                             ? " interior camera/focus key"
+                             : " interior camera/focus keys") +
+                        " along their paths for roughly constant X "
+                        "velocity. All keyframe timings and both endpoints "
+                        "are unchanged.");
+            }
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(
+                ImGuiHoveredFlags_DelayNormal |
+                ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip(
+                "Keeps every keyframe time unchanged. Interior camera and focus keys move together to sampled positions on their existing paths, spaced by cumulative absolute blue X velocity. Endpoints stay fixed; a real direction reversal still crosses zero. At least three keys and measurable X motion are required.");
+        }
+        ImGui::SameLine();
+        const bool canEqualizeYVelocity =
+            animationPath.keys.size() >= 3U &&
+            peakYScreenVelocity > 1.0e-6F;
+        ImGui::BeginDisabled(!canEqualizeYVelocity);
+        if (ImGui::Button("Equalize Y Velocity")) {
+            auto candidate = animationPath;
+            const auto result = invisible_places::camera::
+                RedistributeAnimationPathKeysForConstantScreenYVelocity(
+                    &candidate);
+            if (!result.succeeded) {
+                runtimeState->errorMessage = result.errorMessage;
+                runtimeState->statusMessage.clear();
+            } else if (!result.changed) {
+                runtimeState->statusMessage =
+                    "Camera and focus keys are already distributed for "
+                    "constant Y velocity.";
+                runtimeState->errorMessage.clear();
+            } else {
+                commitSpatialCandidate(
+                    std::move(candidate),
+                    "Y-velocity redistribution",
+                    "Moved " +
+                        std::to_string(result.movedKeyCount) +
+                        (result.movedKeyCount == 1U
+                             ? " interior camera/focus key"
+                             : " interior camera/focus keys") +
+                        " along their paths for roughly constant Y "
+                        "velocity. All keyframe timings and both endpoints "
+                        "are unchanged.");
+            }
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(
+                ImGuiHoveredFlags_DelayNormal |
+                ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip(
+                "The Y equivalent of Equalize X Velocity. It keeps every keyframe time unchanged and moves interior camera and focus keys together along their existing paths, spaced by cumulative absolute green Y velocity. Endpoints and real direction reversals remain fixed.");
+        }
+
+        const bool canMinimizeRotation =
+            animationPath.keys.size() >= 3U &&
+            peakImageRotation > 1.0e-5F;
+        ImGui::BeginDisabled(!canMinimizeRotation);
+        if (ImGui::Button("Minimize Rotation")) {
+            auto candidate = animationPath;
+            const auto result = invisible_places::camera::
+                OptimizeAnimationCameraKeysForSmoothRotation(
+                    &candidate);
+            if (!result.succeeded) {
+                runtimeState->errorMessage = result.errorMessage;
+                runtimeState->statusMessage.clear();
+            } else if (!result.changed) {
+                runtimeState->statusMessage =
+                    "No camera-only redistribution along the current path "
+                    "improved the rotation curve.";
+                runtimeState->errorMessage.clear();
+            } else {
+                commitSpatialCandidate(
+                    std::move(candidate),
+                    "Rotation smoothing",
+                    "Moved " +
+                        std::to_string(result.movedKeyCount) +
+                        (result.movedKeyCount == 1U
+                             ? " interior camera key"
+                             : " interior camera keys") +
+                        " along the camera path. Rotation RMS " +
+                        FormatFixed(
+                            result.beforeRotationRmsDegreesPerSecond,
+                            3) +
+                        " -> " +
+                        FormatFixed(
+                            result.afterRotationRmsDegreesPerSecond,
+                            3) +
+                        " deg/s; direction changes " +
+                        std::to_string(
+                            result.beforeRotationDirectionChanges) +
+                        " -> " +
+                        std::to_string(
+                            result.afterRotationDirectionChanges) +
+                        ". Focus keys, timings, and endpoints are unchanged.");
+            }
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(
+                ImGuiHoveredFlags_DelayNormal |
+                ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip(
+                "Slides only interior camera keys along the existing camera curve while every focus key, keyframe time, and endpoint stays fixed. It minimizes magenta rotation magnitude, roughness, and opposite-direction energy, so zero crossings are removed when the fixed path permits it. This is a best-effort spatial optimization.");
+        }
+        ImGui::SameLine();
+        const bool canEqualizeXAndRotation =
+            animationPath.keys.size() >= 3U &&
+            peakXScreenVelocity > 1.0e-6F;
+        ImGui::BeginDisabled(!canEqualizeXAndRotation);
+        if (ImGui::Button("Equalize X + Rotation")) {
+            auto candidate = animationPath;
+            const auto result = invisible_places::camera::
+                OptimizeAnimationCameraKeysForSmoothRotation(
+                    &candidate,
+                    {
+                        .equalizeScreenXVelocity = true,
+                    });
+            if (!result.succeeded) {
+                runtimeState->errorMessage = result.errorMessage;
+                runtimeState->statusMessage.clear();
+            } else if (!result.changed) {
+                runtimeState->statusMessage =
+                    "No camera-only redistribution along the current path "
+                    "improved the combined X-velocity and rotation curves.";
+                runtimeState->errorMessage.clear();
+            } else {
+                commitSpatialCandidate(
+                    std::move(candidate),
+                    "Combined X/rotation smoothing",
+                    "Moved " +
+                        std::to_string(result.movedKeyCount) +
+                        (result.movedKeyCount == 1U
+                             ? " interior camera key"
+                             : " interior camera keys") +
+                        " along the camera path. X RMS deviation " +
+                        FormatFixed(
+                            result.beforeXVelocityDeviation,
+                            5) +
+                        " -> " +
+                        FormatFixed(
+                            result.afterXVelocityDeviation,
+                            5) +
+                        " screen-heights/s; rotation RMS " +
+                        FormatFixed(
+                            result.beforeRotationRmsDegreesPerSecond,
+                            3) +
+                        " -> " +
+                        FormatFixed(
+                            result.afterRotationRmsDegreesPerSecond,
+                            3) +
+                        " deg/s. Focus keys, timings, and endpoints are "
+                        "unchanged.");
+            }
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(
+                ImGuiHoveredFlags_DelayNormal |
+                ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip(
+                "Slides only interior camera keys along the existing camera curve, with every focus key fixed. It strongly favors a constant signed blue X velocity while also minimizing magenta rotation and direction reversals. Timings and endpoints stay fixed; the result is the best compromise allowed by the authored paths.");
+        }
+        ImGui::BeginDisabled(!canEqualize);
+        if (ImGui::Button("Equalize Perceived Speed")) {
+            applySpeedEqualization(
+                panel.speedEqualizationMode,
+                speedModeNames[selectedModeIndex]);
         }
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered(

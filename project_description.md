@@ -248,6 +248,28 @@ comparison, with the Saved view read-only while edits exist. Saving promotes
 `_Edited` over Saved and removes the shadow. Discarding removes only the
 shadow and reloads Saved.
 
+Perceived-speed equalization and manual **Segment Frames** edits write the
+incoming frame count on each key. **Equalize X Velocity** and **Equalize Y
+Velocity** are deliberately spatial instead: they keep every frame weight
+unchanged, integrate the absolute middle focus-plane velocity shown by the
+corresponding Scene Speed graph, and move each interior camera and focus key
+together to sampled positions on their existing curves. The first and last
+poses remain fixed. This gives a pan roughly constant screen speed on the
+chosen axis without time warping and preserves signed travel direction, so an
+authored reversal still passes through zero.
+
+**Minimize Rotation** also leaves frame weights and endpoints unchanged, but
+keeps every focus control fixed and slides only interior camera controls along
+the existing evaluated camera curve. Its bounded optimization reduces the
+magenta rotation curve's RMS magnitude, local roughness, and energy in the
+minority direction, explicitly discouraging new direction reversals.
+**Equalize X + Rotation** uses the same camera-only movement while strongly
+penalizing deviation from the animation's signed mean X velocity. Both are
+best-effort operations: fixed focus controls, endpoints, and the available
+camera curve can make a perfectly constant or one-directional result
+impossible. They optimize the same 3x3 focus-plane flow proxy drawn by the UI;
+they do not render scene pixels or account for depth-dependent parallax.
+
 ### Timing scalar effects
 The Timings tab owns one ordered list of scalar-driven effects. The user can
 add either a **Colourise** effect or an **Emissive** effect, reorder them by

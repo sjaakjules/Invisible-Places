@@ -222,6 +222,36 @@ struct AnimationSpeedEqualizationOptions {
     float rollWeight = 0.25F;
 };
 
+struct AnimationVelocitySpatialEqualizationResult {
+    bool succeeded = false;
+    bool changed = false;
+    std::size_t movedKeyCount = 0U;
+    float totalScreenTravel = 0.0F;
+    std::string errorMessage;
+};
+
+struct AnimationCameraSpatialSmoothingOptions {
+    // When false, the optimizer minimizes image rotation and direction
+    // reversals. When true, it also strongly penalizes variation from the
+    // animation's signed mean centre-screen X velocity.
+    bool equalizeScreenXVelocity = false;
+    std::uint32_t sampleCount = 129U;
+    std::uint32_t optimizationSweeps = 18U;
+};
+
+struct AnimationCameraSpatialSmoothingResult {
+    bool succeeded = false;
+    bool changed = false;
+    std::size_t movedKeyCount = 0U;
+    float beforeRotationRmsDegreesPerSecond = 0.0F;
+    float afterRotationRmsDegreesPerSecond = 0.0F;
+    float beforeXVelocityDeviation = 0.0F;
+    float afterXVelocityDeviation = 0.0F;
+    std::size_t beforeRotationDirectionChanges = 0U;
+    std::size_t afterRotationDirectionChanges = 0U;
+    std::string errorMessage;
+};
+
 struct AnimationLoopSmoothingOptions {
     float maxEndMoveFraction = 0.10F;
     std::string pairId;
@@ -427,6 +457,31 @@ AnimationPath BuildAnimationPathFromCameraShots(
 [[nodiscard]] std::vector<AnimationPerceivedFlowSample> MeasurePreparedAnimationPathPerceivedFlow(
     const PreparedAnimationPathEvaluationContext& context,
     std::uint32_t sampleCount = 160U);
+// Keeps every timeline frame weight unchanged. Each interior key's existing
+// time fraction selects the same fraction of cumulative absolute centre-screen
+// X or Y travel on the current evaluated path, then both its camera and focus
+// positions are sampled from that source location. Endpoints remain fixed.
+// These spatially redistribute the authored controls along their current
+// curves; they do not retime them. Direction reversals still pass through zero.
+[[nodiscard]] AnimationVelocitySpatialEqualizationResult
+RedistributeAnimationPathKeysForConstantScreenXVelocity(
+    AnimationPath* path,
+    std::uint32_t sampleCount = 1025U);
+[[nodiscard]] AnimationVelocitySpatialEqualizationResult
+RedistributeAnimationPathKeysForConstantScreenYVelocity(
+    AnimationPath* path,
+    std::uint32_t sampleCount = 1025U);
+// Slides only interior camera controls along the current evaluated camera
+// curve. Focus controls, endpoints, and all timeline frame weights remain
+// exact. The optimizer reduces rotation magnitude, roughness, and minority-
+// direction energy; the optional combined mode also holds centre-screen X
+// velocity close to its signed mean. This is a bounded best effort because a
+// fixed focus curve and fixed endpoints can make a perfectly flat solution
+// impossible.
+[[nodiscard]] AnimationCameraSpatialSmoothingResult
+OptimizeAnimationCameraKeysForSmoothRotation(
+    AnimationPath* path,
+    const AnimationCameraSpatialSmoothingOptions& options = {});
 // Compatibility entry point for the established PerceivedMotion mode.
 [[nodiscard]] std::vector<std::uint32_t> ComputeConstantPerceivedSpeedSegmentFrames(
     const AnimationPath& path,

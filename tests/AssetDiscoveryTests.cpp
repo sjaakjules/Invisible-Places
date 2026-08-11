@@ -12261,6 +12261,372 @@ TEST_CASE("Animation speed equalization preserves the legacy mode and gives fram
     CHECK(stabilizedPan[1U] > stabilizedPan[0U]);
 }
 
+TEST_CASE(
+    "Animation X-velocity equalization moves camera and focus keys without retiming",
+    "[camera][animation][speed-equalization][x-velocity]") {
+    using invisible_places::camera::AnimationPath;
+
+    AnimationPath path;
+    path.durationFrames = 120U;
+    path.keys = {
+        {.id = "start",
+         .cameraPosition = {0.0F, 0.0F, 0.0F},
+         .focusPoint = {0.0F, 10.0F, 0.0F},
+         .durationFrames = 40U},
+        {.id = "slow-a",
+         .cameraPosition = {1.0F, 0.0F, 0.0F},
+         .focusPoint = {1.0F, 10.0F, 0.0F},
+         .durationFrames = 40U},
+        {.id = "fast",
+         .cameraPosition = {5.0F, 0.0F, 0.0F},
+         .focusPoint = {5.0F, 10.0F, 0.0F},
+         .durationFrames = 40U},
+        {.id = "slow-b",
+         .cameraPosition = {6.0F, 0.0F, 0.0F},
+         .focusPoint = {6.0F, 10.0F, 0.0F},
+         .durationFrames = 40U},
+    };
+    path.keys[1U].linkedCameraId = "camera-slow-a";
+    path.keys[2U].linkedCameraId = "camera-fast";
+    const AnimationPath original = path;
+
+    const auto result = invisible_places::camera::
+        RedistributeAnimationPathKeysForConstantScreenXVelocity(
+            &path,
+            1025U);
+
+    REQUIRE(result.succeeded);
+    REQUIRE(result.changed);
+    CHECK(result.movedKeyCount == 2U);
+    CHECK(result.totalScreenTravel > 0.0F);
+    CHECK(path.durationFrames == original.durationFrames);
+    REQUIRE(path.keys.size() == original.keys.size());
+    for (std::size_t index = 0U;
+         index < path.keys.size();
+         ++index) {
+        CHECK(path.keys[index].durationFrames ==
+              original.keys[index].durationFrames);
+        CHECK(path.keys[index].id == original.keys[index].id);
+        CHECK(path.keys[index].linkedCameraId ==
+              original.keys[index].linkedCameraId);
+    }
+    CHECK(path.keys.front().cameraPosition ==
+          original.keys.front().cameraPosition);
+    CHECK(path.keys.front().focusPoint ==
+          original.keys.front().focusPoint);
+    CHECK(path.keys.back().cameraPosition ==
+          original.keys.back().cameraPosition);
+    CHECK(path.keys.back().focusPoint ==
+          original.keys.back().focusPoint);
+    CHECK(path.keys[1U].cameraPosition !=
+          original.keys[1U].cameraPosition);
+    CHECK(path.keys[1U].focusPoint !=
+          original.keys[1U].focusPoint);
+    CHECK(path.keys[2U].cameraPosition !=
+          original.keys[2U].cameraPosition);
+    CHECK(path.keys[2U].focusPoint !=
+          original.keys[2U].focusPoint);
+    CHECK(path.keys[1U].cameraPosition[0U] ==
+          Catch::Approx(2.0F).margin(0.03F));
+    CHECK(path.keys[1U].focusPoint[0U] ==
+          Catch::Approx(2.0F).margin(0.03F));
+    CHECK(path.keys[2U].cameraPosition[0U] ==
+          Catch::Approx(4.0F).margin(0.03F));
+    CHECK(path.keys[2U].focusPoint[0U] ==
+          Catch::Approx(4.0F).margin(0.03F));
+
+    const auto originalContext = invisible_places::camera::
+        PrepareAnimationPathEvaluation(original);
+    REQUIRE(originalContext.valid);
+    for (std::size_t keyIndex = 1U;
+         keyIndex + 1U < path.keys.size();
+         ++keyIndex) {
+        float nearestCameraDistance =
+            std::numeric_limits<float>::max();
+        float nearestFocusDistance =
+            std::numeric_limits<float>::max();
+        for (std::uint32_t sampleIndex = 0U;
+             sampleIndex <= 2000U;
+             ++sampleIndex) {
+            const auto sampled = invisible_places::camera::
+                EvaluatePreparedAnimationPath(
+                    originalContext,
+                    originalContext.durationSeconds *
+                        static_cast<float>(sampleIndex) / 2000.0F);
+            const auto distance = [](const auto& left,
+                                     const auto& right) {
+                return std::hypot(
+                    left[0U] - right[0U],
+                    std::hypot(
+                        left[1U] - right[1U],
+                        left[2U] - right[2U]));
+            };
+            nearestCameraDistance = std::min(
+                nearestCameraDistance,
+                distance(
+                    path.keys[keyIndex].cameraPosition,
+                    sampled.camera.position));
+            nearestFocusDistance = std::min(
+                nearestFocusDistance,
+                distance(
+                    path.keys[keyIndex].focusPoint,
+                    sampled.focusPoint));
+        }
+        CHECK(nearestCameraDistance < 0.01F);
+        CHECK(nearestFocusDistance < 0.01F);
+    }
+
+    const auto flow = invisible_places::camera::
+        MeasurePreparedAnimationPathPerceivedFlow(
+            invisible_places::camera::
+                PrepareAnimationPathEvaluation(path),
+            241U);
+    REQUIRE(flow.size() == 241U);
+    float minimumInteriorSpeed =
+        std::numeric_limits<float>::max();
+    float maximumInteriorSpeed = 0.0F;
+    for (std::size_t sampleIndex = 12U;
+         sampleIndex + 12U < flow.size();
+         ++sampleIndex) {
+        const float speed =
+            std::abs(flow[sampleIndex].middleScreenVelocity[0U]);
+        minimumInteriorSpeed = std::min(minimumInteriorSpeed, speed);
+        maximumInteriorSpeed = std::max(maximumInteriorSpeed, speed);
+        CHECK(flow[sampleIndex].middleScreenVelocity[0U] < 0.0F);
+    }
+    CHECK(minimumInteriorSpeed > 1.0e-5F);
+    CHECK(maximumInteriorSpeed / minimumInteriorSpeed < 1.35F);
+}
+
+TEST_CASE(
+    "Animation Y-velocity equalization moves camera and focus keys without retiming",
+    "[camera][animation][speed-equalization][y-velocity]") {
+    using invisible_places::camera::AnimationPath;
+
+    AnimationPath path;
+    path.durationFrames = 120U;
+    path.keys = {
+        {.id = "start",
+         .cameraPosition = {0.0F, 0.0F, 0.0F},
+         .focusPoint = {0.0F, 10.0F, 0.0F},
+         .durationFrames = 40U},
+        {.id = "slow-a",
+         .cameraPosition = {0.0F, 0.0F, 1.0F},
+         .focusPoint = {0.0F, 10.0F, 1.0F},
+         .durationFrames = 40U},
+        {.id = "fast",
+         .cameraPosition = {0.0F, 0.0F, 5.0F},
+         .focusPoint = {0.0F, 10.0F, 5.0F},
+         .durationFrames = 40U},
+        {.id = "slow-b",
+         .cameraPosition = {0.0F, 0.0F, 6.0F},
+         .focusPoint = {0.0F, 10.0F, 6.0F},
+         .durationFrames = 40U},
+    };
+    const AnimationPath original = path;
+
+    const auto result = invisible_places::camera::
+        RedistributeAnimationPathKeysForConstantScreenYVelocity(
+            &path,
+            1025U);
+
+    REQUIRE(result.succeeded);
+    REQUIRE(result.changed);
+    CHECK(result.movedKeyCount == 2U);
+    CHECK(result.totalScreenTravel > 0.0F);
+    CHECK(path.durationFrames == original.durationFrames);
+    REQUIRE(path.keys.size() == original.keys.size());
+    for (std::size_t index = 0U; index < path.keys.size(); ++index) {
+        CHECK(path.keys[index].durationFrames ==
+              original.keys[index].durationFrames);
+        CHECK(path.keys[index].id == original.keys[index].id);
+    }
+    CHECK(path.keys.front().cameraPosition ==
+          original.keys.front().cameraPosition);
+    CHECK(path.keys.front().focusPoint ==
+          original.keys.front().focusPoint);
+    CHECK(path.keys.back().cameraPosition ==
+          original.keys.back().cameraPosition);
+    CHECK(path.keys.back().focusPoint ==
+          original.keys.back().focusPoint);
+    CHECK(path.keys[1U].cameraPosition[2U] ==
+          Catch::Approx(2.0F).margin(0.03F));
+    CHECK(path.keys[1U].focusPoint[2U] ==
+          Catch::Approx(2.0F).margin(0.03F));
+    CHECK(path.keys[2U].cameraPosition[2U] ==
+          Catch::Approx(4.0F).margin(0.03F));
+    CHECK(path.keys[2U].focusPoint[2U] ==
+          Catch::Approx(4.0F).margin(0.03F));
+
+    const auto flow = invisible_places::camera::
+        MeasurePreparedAnimationPathPerceivedFlow(
+            invisible_places::camera::
+                PrepareAnimationPathEvaluation(path),
+            241U);
+    REQUIRE(flow.size() == 241U);
+    float minimumInteriorSpeed =
+        std::numeric_limits<float>::max();
+    float maximumInteriorSpeed = 0.0F;
+    for (std::size_t sampleIndex = 12U;
+         sampleIndex + 12U < flow.size();
+         ++sampleIndex) {
+        const float speed =
+            std::abs(flow[sampleIndex].middleScreenVelocity[1U]);
+        minimumInteriorSpeed = std::min(minimumInteriorSpeed, speed);
+        maximumInteriorSpeed = std::max(maximumInteriorSpeed, speed);
+        CHECK(flow[sampleIndex].middleScreenVelocity[1U] < 0.0F);
+    }
+    CHECK(minimumInteriorSpeed > 1.0e-5F);
+    CHECK(maximumInteriorSpeed / minimumInteriorSpeed < 1.35F);
+}
+
+TEST_CASE(
+    "Animation rotation smoothing moves only camera keys and reduces reversal",
+    "[camera][animation][speed-equalization][rotation]") {
+    using invisible_places::camera::AnimationPath;
+
+    AnimationPath path;
+    path.durationFrames = 4500U;
+    // A shallow, translated slow-pan rig. The position changes are subtle,
+    // but their coupled yaw/pitch corrections make the optical-flow curl
+    // cross zero repeatedly before smoothing.
+    path.keys = {
+        {.id = "k0",
+         .cameraPosition = {0.401215F, 3.285530F, 1.833562F},
+         .focusPoint = {4.316284F, 5.041542F, -0.085180F},
+         .fovDegrees = 55.0F,
+         .durationFrames = 364U},
+        {.id = "k1",
+         .cameraPosition = {1.298950F, 1.555252F, 1.832244F},
+         .focusPoint = {5.197174F, 3.309097F, -0.086153F},
+         .fovDegrees = 55.0F,
+         .durationFrames = 675U},
+        {.id = "k2",
+         .cameraPosition = {2.191345F, -0.176544F, 1.808198F},
+         .focusPoint = {6.097473F, 1.586357F, -0.101104F},
+         .fovDegrees = 55.0F,
+         .durationFrames = 675U},
+        {.id = "k3",
+         .cameraPosition = {2.901001F, -1.785889F, 1.793716F},
+         .focusPoint = {6.819031F, -0.205040F, -0.115999F},
+         .fovDegrees = 55.0F,
+         .durationFrames = 675U},
+        {.id = "k4",
+         .cameraPosition = {3.527985F, -3.697243F, 1.768171F},
+         .focusPoint = {7.300507F, -2.064919F, -0.168711F},
+         .fovDegrees = 55.0F,
+         .durationFrames = 675U},
+        {.id = "k5",
+         .cameraPosition = {3.883026F, -5.257271F, 1.738601F},
+         .focusPoint = {7.664276F, -3.920761F, -0.186801F},
+         .fovDegrees = 55.0F,
+         .durationFrames = 675U},
+        {.id = "k6",
+         .cameraPosition = {4.365967F, -6.979370F, 1.736156F},
+         .focusPoint = {8.128296F, -5.695709F, -0.140995F},
+         .fovDegrees = 55.0F,
+         .durationFrames = 675U},
+    };
+    const AnimationPath original = path;
+
+    const auto result = invisible_places::camera::
+        OptimizeAnimationCameraKeysForSmoothRotation(
+            &path,
+            {
+                .sampleCount = 97U,
+                .optimizationSweeps = 14U,
+            });
+
+    CAPTURE(
+        result.beforeRotationRmsDegreesPerSecond,
+        result.afterRotationRmsDegreesPerSecond,
+        result.beforeRotationDirectionChanges,
+        result.afterRotationDirectionChanges,
+        result.movedKeyCount);
+    REQUIRE(result.succeeded);
+    REQUIRE(result.changed);
+    CHECK(result.movedKeyCount > 0U);
+    CHECK(result.afterRotationRmsDegreesPerSecond <
+          result.beforeRotationRmsDegreesPerSecond);
+    CHECK(result.beforeRotationDirectionChanges > 0U);
+    CHECK(result.afterRotationDirectionChanges <
+          result.beforeRotationDirectionChanges);
+    REQUIRE(path.keys.size() == original.keys.size());
+    for (std::size_t index = 0U; index < path.keys.size(); ++index) {
+        CHECK(path.keys[index].focusPoint ==
+              original.keys[index].focusPoint);
+        CHECK(path.keys[index].durationFrames ==
+              original.keys[index].durationFrames);
+        CHECK(path.keys[index].id == original.keys[index].id);
+    }
+    CHECK(path.keys.front().cameraPosition ==
+          original.keys.front().cameraPosition);
+    CHECK(path.keys.back().cameraPosition ==
+          original.keys.back().cameraPosition);
+    const auto originalContext = invisible_places::camera::
+        PrepareAnimationPathEvaluation(original);
+    REQUIRE(originalContext.valid);
+    for (std::size_t keyIndex = 1U;
+         keyIndex + 1U < path.keys.size();
+         ++keyIndex) {
+        float nearestCameraDistance =
+            std::numeric_limits<float>::max();
+        for (std::uint32_t sampleIndex = 0U;
+             sampleIndex <= 2000U;
+             ++sampleIndex) {
+            const auto sampled = invisible_places::camera::
+                EvaluatePreparedAnimationPath(
+                    originalContext,
+                    originalContext.durationSeconds *
+                        static_cast<float>(sampleIndex) / 2000.0F);
+            nearestCameraDistance = std::min(
+                nearestCameraDistance,
+                std::hypot(
+                    path.keys[keyIndex].cameraPosition[0U] -
+                        sampled.camera.position[0U],
+                    std::hypot(
+                        path.keys[keyIndex].cameraPosition[1U] -
+                            sampled.camera.position[1U],
+                        path.keys[keyIndex].cameraPosition[2U] -
+                            sampled.camera.position[2U])));
+        }
+        CHECK(nearestCameraDistance < 0.01F);
+    }
+
+    auto combinedPath = original;
+    const auto combined = invisible_places::camera::
+        OptimizeAnimationCameraKeysForSmoothRotation(
+            &combinedPath,
+            {
+                .equalizeScreenXVelocity = true,
+                .sampleCount = 97U,
+                .optimizationSweeps = 14U,
+            });
+    CAPTURE(
+        combined.beforeRotationRmsDegreesPerSecond,
+        combined.afterRotationRmsDegreesPerSecond,
+        combined.beforeXVelocityDeviation,
+        combined.afterXVelocityDeviation,
+        combined.beforeRotationDirectionChanges,
+        combined.afterRotationDirectionChanges);
+    REQUIRE(combined.succeeded);
+    REQUIRE(combined.changed);
+    CHECK(combined.afterXVelocityDeviation <
+          combined.beforeXVelocityDeviation);
+    CHECK(combined.afterRotationRmsDegreesPerSecond <
+          combined.beforeRotationRmsDegreesPerSecond);
+    CHECK(combined.afterRotationDirectionChanges <
+          combined.beforeRotationDirectionChanges);
+    for (std::size_t index = 0U;
+         index < combinedPath.keys.size();
+         ++index) {
+        CHECK(combinedPath.keys[index].focusPoint ==
+              original.keys[index].focusPoint);
+        CHECK(combinedPath.keys[index].durationFrames ==
+              original.keys[index].durationFrames);
+    }
+}
+
 TEST_CASE("Animation path perceived flow is zero for static paths and retimes evenly", "[camera][animation]") {
     invisible_places::camera::AnimationPath path;
     path.durationFrames = 90;

@@ -1340,6 +1340,637 @@ std::vector<AnimationPerceivedFlowSample> MeasurePreparedAnimationPathPerceivedF
     return flow;
 }
 
+namespace {
+
+AnimationVelocitySpatialEqualizationResult
+RedistributeAnimationPathKeysForConstantScreenVelocity(
+    AnimationPath* path,
+    std::size_t component,
+    std::uint32_t sampleCount) {
+    AnimationVelocitySpatialEqualizationResult result;
+    const char axisName = component == 0U ? 'X' : 'Y';
+    if (path == nullptr) {
+        result.errorMessage = "The animation path is unavailable.";
+        return result;
+    }
+    if (path->keys.size() < 3U) {
+        result.errorMessage =
+            "At least three keys are required to redistribute interior "
+            "camera and focus positions.";
+        return result;
+    }
+
+    // Work on a copy so a failed or already-even operation cannot bake
+    // correction metadata or otherwise modify the authored path.
+    AnimationPath candidate = *path;
+    candidate.localizedKeyCorrections.clear();
+    const auto context = PrepareAnimationPathEvaluation(candidate);
+    if (!context.valid || context.singleKey ||
+        context.durationSeconds <= 1.0e-6F ||
+        context.knots.size() != candidate.keys.size()) {
+        result.errorMessage =
+            std::string{"The animation path could not be evaluated for "} +
+            axisName + " velocity.";
+        return result;
+    }
+
+    const auto samples = std::clamp<std::uint32_t>(
+        std::max<std::uint32_t>(sampleCount, 65U),
+        65U,
+        4096U);
+    const auto flow = MeasurePreparedAnimationPathPerceivedFlow(
+        context,
+        samples);
+    if (flow.size() < 2U) {
+        result.errorMessage =
+            std::string{"The animation path produced no usable "} +
+            axisName + "-velocity samples.";
+        return result;
+    }
+
+    std::vector<float> cumulativeTravel(flow.size(), 0.0F);
+    for (std::size_t sampleIndex = 1U;
+         sampleIndex < flow.size();
+         ++sampleIndex) {
+        const float intervalSeconds = context.durationSeconds *
+            std::max(
+                flow[sampleIndex].normalizedPosition -
+                    flow[sampleIndex - 1U].normalizedPosition,
+                0.0F);
+        const float previousSpeed = std::abs(
+            flow[sampleIndex - 1U].middleScreenVelocity[component]);
+        const float currentSpeed = std::abs(
+            flow[sampleIndex].middleScreenVelocity[component]);
+        const float intervalTravel =
+            std::isfinite(previousSpeed) &&
+                    std::isfinite(currentSpeed)
+                ? 0.5F * intervalSeconds *
+                      (previousSpeed + currentSpeed)
+                : 0.0F;
+        cumulativeTravel[sampleIndex] =
+            cumulativeTravel[sampleIndex - 1U] +
+            std::max(intervalTravel, 0.0F);
+    }
+    result.totalScreenTravel = cumulativeTravel.back();
+    if (!std::isfinite(result.totalScreenTravel) ||
+        result.totalScreenTravel <= 1.0e-6F) {
+        result.errorMessage =
+            std::string{"The animation has no measurable centre-screen "} +
+            axisName + " travel.";
+        return result;
+    }
+
+    float previousSourcePosition = 0.0F;
+    for (std::size_t keyIndex = 1U;
+         keyIndex + 1U < candidate.keys.size();
+         ++keyIndex) {
+        const float keyTimeFraction = std::clamp(
+            context.knots[keyIndex] / context.durationSeconds,
+            0.0F,
+            1.0F);
+        const float targetTravel =
+            result.totalScreenTravel * keyTimeFraction;
+        const auto rightIt = std::lower_bound(
+            cumulativeTravel.begin(),
+            cumulativeTravel.end(),
+            targetTravel);
+        const std::size_t rightIndex =
+            rightIt == cumulativeTravel.end()
+                ? cumulativeTravel.size() - 1U
+                : static_cast<std::size_t>(
+                      rightIt - cumulativeTravel.begin());
+        const std::size_t leftIndex =
+            rightIndex > 0U ? rightIndex - 1U : 0U;
+        const float leftTravel = cumulativeTravel[leftIndex];
+        const float rightTravel = cumulativeTravel[rightIndex];
+        const float amount = rightTravel - leftTravel > 1.0e-8F
+            ? std::clamp(
+                  (targetTravel - leftTravel) /
+                      (rightTravel - leftTravel),
+                  0.0F,
+                  1.0F)
+            : 0.0F;
+        float sourcePosition = std::lerp(
+            flow[leftIndex].normalizedPosition,
+            flow[rightIndex].normalizedPosition,
+            amount);
+        constexpr float kMinimumSourceSpacing = 1.0e-5F;
+        const float maximumSourcePosition =
+            1.0F -
+            kMinimumSourceSpacing * static_cast<float>(
+                candidate.keys.size() - 1U - keyIndex);
+        sourcePosition = std::clamp(
+            sourcePosition,
+            previousSourcePosition + kMinimumSourceSpacing,
+            maximumSourcePosition);
+        previousSourcePosition = sourcePosition;
+
+        const auto sampled = EvaluatePreparedAnimationPath(
+            context,
+            context.durationSeconds * sourcePosition);
+        auto& key = candidate.keys[keyIndex];
+        const float poseScale = std::max(
+            1.0F,
+            std::max(
+                Distance(key.cameraPosition, key.focusPoint),
+                Distance(
+                    sampled.camera.position,
+                    sampled.focusPoint)));
+        const bool moved =
+            Distance(key.cameraPosition, sampled.camera.position) >
+                1.0e-5F * poseScale ||
+            Distance(key.focusPoint, sampled.focusPoint) >
+                1.0e-5F * poseScale;
+        key.cameraPosition = sampled.camera.position;
+        key.focusPoint = sampled.focusPoint;
+        if (moved) {
+            ++result.movedKeyCount;
+        }
+    }
+
+    result.succeeded = true;
+    result.changed = result.movedKeyCount > 0U;
+    if (!result.changed) {
+        return result;
+    }
+    *path = std::move(candidate);
+    return result;
+}
+
+struct CameraSpatialFlowMetrics {
+    bool valid = false;
+    float xMean = 0.0F;
+    float xMeanAbsolute = 0.0F;
+    float xDeviationMeanSquare = 0.0F;
+    float xDeviationRms = 0.0F;
+    float rotationMeanSquare = 0.0F;
+    float rotationRms = 0.0F;
+    float rotationMinorityMeanSquare = 0.0F;
+    float rotationDifferenceMeanSquare = 0.0F;
+    std::size_t rotationDirectionChanges = 0U;
+};
+
+CameraSpatialFlowMetrics CalculateCameraSpatialFlowMetrics(
+    const std::vector<AnimationPerceivedFlowSample>& flow,
+    float targetXVelocity,
+    float rotationDirectionThreshold) {
+    CameraSpatialFlowMetrics metrics;
+    double xSum = 0.0;
+    double xAbsoluteSum = 0.0;
+    double rotationSquareSum = 0.0;
+    double positiveRotationSquareSum = 0.0;
+    double negativeRotationSquareSum = 0.0;
+    std::size_t validCount = 0U;
+    for (const auto& sample : flow) {
+        const float xVelocity = sample.middleScreenVelocity[0U];
+        const float rotation = sample.imageRotationDegreesPerSecond;
+        if (!std::isfinite(xVelocity) || !std::isfinite(rotation)) {
+            continue;
+        }
+        xSum += xVelocity;
+        xAbsoluteSum += std::abs(xVelocity);
+        const double rotationSquare =
+            static_cast<double>(rotation) * rotation;
+        rotationSquareSum += rotationSquare;
+        if (rotation > 0.0F) {
+            positiveRotationSquareSum += rotationSquare;
+        } else if (rotation < 0.0F) {
+            negativeRotationSquareSum += rotationSquare;
+        }
+        ++validCount;
+    }
+    if (validCount < 2U) {
+        return metrics;
+    }
+
+    const double divisor = static_cast<double>(validCount);
+    metrics.xMean = static_cast<float>(xSum / divisor);
+    metrics.xMeanAbsolute = static_cast<float>(xAbsoluteSum / divisor);
+    metrics.rotationMeanSquare = static_cast<float>(
+        rotationSquareSum / divisor);
+    metrics.rotationRms = std::sqrt(std::max(
+        metrics.rotationMeanSquare,
+        0.0F));
+    metrics.rotationMinorityMeanSquare = static_cast<float>(
+        std::min(
+            positiveRotationSquareSum,
+            negativeRotationSquareSum) /
+        divisor);
+
+    const float resolvedTargetX = std::isfinite(targetXVelocity)
+        ? targetXVelocity
+        : metrics.xMean;
+    double xDeviationSquareSum = 0.0;
+    double rotationDifferenceSquareSum = 0.0;
+    std::size_t rotationDifferenceCount = 0U;
+    const float directionThreshold =
+        std::isfinite(rotationDirectionThreshold)
+            ? std::max(rotationDirectionThreshold, 1.0e-4F)
+            : std::max(1.0e-4F, 0.05F * metrics.rotationRms);
+    int previousRotationDirection = 0;
+    bool havePreviousRotation = false;
+    float previousRotation = 0.0F;
+    for (const auto& sample : flow) {
+        const float xVelocity = sample.middleScreenVelocity[0U];
+        const float rotation = sample.imageRotationDegreesPerSecond;
+        if (!std::isfinite(xVelocity) || !std::isfinite(rotation)) {
+            continue;
+        }
+        const double xDifference =
+            static_cast<double>(xVelocity - resolvedTargetX);
+        xDeviationSquareSum += xDifference * xDifference;
+        if (havePreviousRotation) {
+            const double difference =
+                static_cast<double>(rotation - previousRotation);
+            rotationDifferenceSquareSum += difference * difference;
+            ++rotationDifferenceCount;
+        }
+        previousRotation = rotation;
+        havePreviousRotation = true;
+
+        const int direction = rotation > directionThreshold
+            ? 1
+            : rotation < -directionThreshold ? -1 : 0;
+        if (direction != 0) {
+            if (previousRotationDirection != 0 &&
+                direction != previousRotationDirection) {
+                ++metrics.rotationDirectionChanges;
+            }
+            previousRotationDirection = direction;
+        }
+    }
+    metrics.xDeviationMeanSquare = static_cast<float>(
+        xDeviationSquareSum / divisor);
+    metrics.xDeviationRms = std::sqrt(std::max(
+        metrics.xDeviationMeanSquare,
+        0.0F));
+    if (rotationDifferenceCount > 0U) {
+        metrics.rotationDifferenceMeanSquare = static_cast<float>(
+            rotationDifferenceSquareSum /
+            static_cast<double>(rotationDifferenceCount));
+    }
+    metrics.valid = true;
+    return metrics;
+}
+
+CameraSpatialFlowMetrics MeasureCameraSpatialFlowMetrics(
+    const AnimationPath& path,
+    std::uint32_t sampleCount,
+    float targetXVelocity,
+    float rotationDirectionThreshold =
+        std::numeric_limits<float>::quiet_NaN()) {
+    const auto context = PrepareAnimationPathEvaluation(path);
+    if (!context.valid || context.singleKey ||
+        context.durationSeconds <= 1.0e-6F) {
+        return {};
+    }
+    return CalculateCameraSpatialFlowMetrics(
+        MeasurePreparedAnimationPathPerceivedFlow(
+            context,
+            sampleCount),
+        targetXVelocity,
+        rotationDirectionThreshold);
+}
+
+AnimationPath CameraRedistributedPath(
+    const AnimationPath& base,
+    const PreparedAnimationPathEvaluationContext& sourceContext,
+    const std::vector<float>& sourcePositions) {
+    AnimationPath candidate = base;
+    for (std::size_t keyIndex = 1U;
+         keyIndex + 1U < candidate.keys.size();
+         ++keyIndex) {
+        const auto sampled = EvaluatePreparedAnimationPath(
+            sourceContext,
+            sourceContext.durationSeconds * sourcePositions[keyIndex]);
+        candidate.keys[keyIndex].cameraPosition =
+            sampled.camera.position;
+    }
+    return candidate;
+}
+
+float CameraSourceMovementPenalty(
+    const std::vector<float>& positions,
+    const std::vector<float>& initialPositions) {
+    if (positions.size() < 3U ||
+        positions.size() != initialPositions.size()) {
+        return 0.0F;
+    }
+    const float typicalSpacing =
+        1.0F / static_cast<float>(positions.size() - 1U);
+    double squareSum = 0.0;
+    for (std::size_t index = 1U;
+         index + 1U < positions.size();
+         ++index) {
+        const double normalizedDifference =
+            static_cast<double>(positions[index] - initialPositions[index]) /
+            std::max(typicalSpacing, 1.0e-6F);
+        squareSum += normalizedDifference * normalizedDifference;
+    }
+    return static_cast<float>(
+        squareSum /
+        static_cast<double>(positions.size() - 2U));
+}
+
+float CameraSpatialSmoothingObjective(
+    const CameraSpatialFlowMetrics& metrics,
+    const CameraSpatialFlowMetrics& baseline,
+    float rotationScale,
+    float xDeviationScale,
+    bool equalizeScreenXVelocity,
+    float movementPenalty) {
+    if (!metrics.valid) {
+        return std::numeric_limits<float>::infinity();
+    }
+    if (metrics.rotationDirectionChanges >
+        baseline.rotationDirectionChanges) {
+        return std::numeric_limits<float>::infinity();
+    }
+    const float rotationScaleSquared =
+        rotationScale * rotationScale;
+    float objective =
+        metrics.rotationMeanSquare / rotationScaleSquared +
+        1.75F * metrics.rotationMinorityMeanSquare /
+            rotationScaleSquared +
+        0.10F * metrics.rotationDifferenceMeanSquare /
+            rotationScaleSquared +
+        0.75F * static_cast<float>(
+            metrics.rotationDirectionChanges);
+    if (equalizeScreenXVelocity) {
+        const float xDeviationScaleSquared =
+            xDeviationScale * xDeviationScale;
+        objective += 6.0F * metrics.xDeviationMeanSquare /
+            xDeviationScaleSquared;
+
+        // Combined mode is Pareto-like: it never accepts a meaningful
+        // regression in either graph merely because the other one improved.
+        const float allowedRotation =
+            baseline.rotationRms + 1.0e-6F;
+        if (metrics.rotationRms > allowedRotation) {
+            return std::numeric_limits<float>::infinity();
+        }
+        const float allowedXDeviation =
+            baseline.xDeviationRms +
+            std::max(
+                {1.0e-7F,
+                 0.02F * baseline.xDeviationRms,
+                 0.0002F * baseline.xMeanAbsolute});
+        if (metrics.xDeviationRms > allowedXDeviation) {
+            return std::numeric_limits<float>::infinity();
+        }
+    }
+    return objective + 0.002F * movementPenalty;
+}
+
+}  // namespace
+
+AnimationVelocitySpatialEqualizationResult
+RedistributeAnimationPathKeysForConstantScreenXVelocity(
+    AnimationPath* path,
+    std::uint32_t sampleCount) {
+    return RedistributeAnimationPathKeysForConstantScreenVelocity(
+        path,
+        0U,
+        sampleCount);
+}
+
+AnimationVelocitySpatialEqualizationResult
+RedistributeAnimationPathKeysForConstantScreenYVelocity(
+    AnimationPath* path,
+    std::uint32_t sampleCount) {
+    return RedistributeAnimationPathKeysForConstantScreenVelocity(
+        path,
+        1U,
+        sampleCount);
+}
+
+AnimationCameraSpatialSmoothingResult
+OptimizeAnimationCameraKeysForSmoothRotation(
+    AnimationPath* path,
+    const AnimationCameraSpatialSmoothingOptions& options) {
+    AnimationCameraSpatialSmoothingResult result;
+    if (path == nullptr) {
+        result.errorMessage = "The animation path is unavailable.";
+        return result;
+    }
+    if (path->keys.size() < 3U) {
+        result.errorMessage =
+            "At least three keys are required to redistribute interior "
+            "camera positions.";
+        return result;
+    }
+
+    AnimationPath base = *path;
+    base.localizedKeyCorrections.clear();
+    const auto sourceContext = PrepareAnimationPathEvaluation(base);
+    if (!sourceContext.valid || sourceContext.singleKey ||
+        sourceContext.durationSeconds <= 1.0e-6F ||
+        sourceContext.knots.size() != base.keys.size()) {
+        result.errorMessage =
+            "The animation path could not be evaluated for rotation "
+            "smoothing.";
+        return result;
+    }
+
+    const std::uint32_t sampleCount = std::clamp<std::uint32_t>(
+        std::max<std::uint32_t>(options.sampleCount, 65U),
+        65U,
+        513U);
+    const auto baselineWithoutTarget = MeasureCameraSpatialFlowMetrics(
+        base,
+        sampleCount,
+        std::numeric_limits<float>::quiet_NaN());
+    if (!baselineWithoutTarget.valid) {
+        result.errorMessage =
+            "The animation produced no usable rotation samples.";
+        return result;
+    }
+    const float targetXVelocity = baselineWithoutTarget.xMean;
+    const float rotationDirectionThreshold = std::max(
+        1.0e-4F,
+        0.05F * baselineWithoutTarget.rotationRms);
+    const auto baseline = MeasureCameraSpatialFlowMetrics(
+        base,
+        sampleCount,
+        targetXVelocity,
+        rotationDirectionThreshold);
+    if (!baseline.valid) {
+        result.errorMessage =
+            "The animation produced no usable motion samples.";
+        return result;
+    }
+    if (options.equalizeScreenXVelocity &&
+        baseline.xMeanAbsolute <= 1.0e-6F) {
+        result.errorMessage =
+            "The animation has no measurable centre-screen X velocity.";
+        return result;
+    }
+
+    result.beforeRotationRmsDegreesPerSecond = baseline.rotationRms;
+    result.afterRotationRmsDegreesPerSecond = baseline.rotationRms;
+    result.beforeXVelocityDeviation = baseline.xDeviationRms;
+    result.afterXVelocityDeviation = baseline.xDeviationRms;
+    result.beforeRotationDirectionChanges =
+        baseline.rotationDirectionChanges;
+    result.afterRotationDirectionChanges =
+        baseline.rotationDirectionChanges;
+    result.succeeded = true;
+    if (baseline.rotationRms <= 1.0e-5F &&
+        !options.equalizeScreenXVelocity) {
+        return result;
+    }
+
+    std::vector<float> initialPositions(base.keys.size(), 0.0F);
+    for (std::size_t keyIndex = 0U;
+         keyIndex < initialPositions.size();
+         ++keyIndex) {
+        initialPositions[keyIndex] = std::clamp(
+            sourceContext.knots[keyIndex] /
+                sourceContext.durationSeconds,
+            0.0F,
+            1.0F);
+    }
+    std::vector<float> positions = initialPositions;
+    AnimationPath bestPath = base;
+    auto bestMetrics = baseline;
+    const float rotationScale = std::max(
+        baseline.rotationRms,
+        0.01F);
+    const float xDeviationScale = std::max(
+        {baseline.xDeviationRms,
+         0.002F * baseline.xMeanAbsolute,
+         1.0e-6F});
+    float bestObjective = CameraSpatialSmoothingObjective(
+        bestMetrics,
+        baseline,
+        rotationScale,
+        xDeviationScale,
+        options.equalizeScreenXVelocity,
+        0.0F);
+
+    float step = 0.75F /
+        static_cast<float>(base.keys.size() - 1U);
+    const float minimumStep = 0.0025F /
+        static_cast<float>(base.keys.size() - 1U);
+    const std::uint32_t sweeps = std::clamp<std::uint32_t>(
+        options.optimizationSweeps,
+        1U,
+        48U);
+    constexpr float kMinimumSourceSpacing = 1.0e-5F;
+    for (std::uint32_t sweep = 0U;
+         sweep < sweeps && step >= minimumStep;
+         ++sweep) {
+        bool sweepImproved = false;
+        for (std::size_t keyOffset = 0U;
+             keyOffset + 2U < base.keys.size();
+             ++keyOffset) {
+            const std::size_t keyIndex = sweep % 2U == 0U
+                ? keyOffset + 1U
+                : base.keys.size() - 2U - keyOffset;
+            const float lower =
+                positions[keyIndex - 1U] + kMinimumSourceSpacing;
+            const float upper =
+                positions[keyIndex + 1U] - kMinimumSourceSpacing;
+            if (upper <= lower) {
+                continue;
+            }
+
+            float keyBestObjective = bestObjective;
+            std::vector<float> keyBestPositions = positions;
+            AnimationPath keyBestPath = bestPath;
+            CameraSpatialFlowMetrics keyBestMetrics = bestMetrics;
+            for (const float direction : {-1.0F, 1.0F}) {
+                std::vector<float> trialPositions = positions;
+                trialPositions[keyIndex] = std::clamp(
+                    positions[keyIndex] + direction * step,
+                    lower,
+                    upper);
+                if (std::abs(
+                        trialPositions[keyIndex] -
+                        positions[keyIndex]) <= 1.0e-7F) {
+                    continue;
+                }
+                auto trialPath = CameraRedistributedPath(
+                    base,
+                    sourceContext,
+                    trialPositions);
+                const auto trialMetrics =
+                    MeasureCameraSpatialFlowMetrics(
+                        trialPath,
+                        sampleCount,
+                        targetXVelocity,
+                        rotationDirectionThreshold);
+                const float trialObjective =
+                    CameraSpatialSmoothingObjective(
+                        trialMetrics,
+                        baseline,
+                        rotationScale,
+                        xDeviationScale,
+                        options.equalizeScreenXVelocity,
+                        CameraSourceMovementPenalty(
+                            trialPositions,
+                            initialPositions));
+                if (trialObjective + 1.0e-5F <
+                    keyBestObjective) {
+                    keyBestObjective = trialObjective;
+                    keyBestPositions = std::move(trialPositions);
+                    keyBestPath = std::move(trialPath);
+                    keyBestMetrics = trialMetrics;
+                }
+            }
+            if (keyBestObjective + 1.0e-5F < bestObjective) {
+                positions = std::move(keyBestPositions);
+                bestPath = std::move(keyBestPath);
+                bestMetrics = keyBestMetrics;
+                bestObjective = keyBestObjective;
+                sweepImproved = true;
+            }
+        }
+        step *= sweepImproved ? 0.82F : 0.50F;
+    }
+
+    result.afterRotationRmsDegreesPerSecond = bestMetrics.rotationRms;
+    result.afterXVelocityDeviation = bestMetrics.xDeviationRms;
+    result.afterRotationDirectionChanges =
+        bestMetrics.rotationDirectionChanges;
+    for (std::size_t keyIndex = 1U;
+         keyIndex + 1U < base.keys.size();
+         ++keyIndex) {
+        const float poseScale = std::max(
+            1.0F,
+            Distance(
+                base.keys[keyIndex].cameraPosition,
+                base.keys[keyIndex].focusPoint));
+        if (Distance(
+                base.keys[keyIndex].cameraPosition,
+                bestPath.keys[keyIndex].cameraPosition) >
+            1.0e-5F * poseScale) {
+            ++result.movedKeyCount;
+        }
+    }
+    result.changed = result.movedKeyCount > 0U &&
+        bestObjective + 1.0e-5F <
+            CameraSpatialSmoothingObjective(
+                baseline,
+                baseline,
+                rotationScale,
+                xDeviationScale,
+                options.equalizeScreenXVelocity,
+                0.0F);
+    if (result.changed) {
+        *path = std::move(bestPath);
+    } else {
+        result.movedKeyCount = 0U;
+        result.afterRotationRmsDegreesPerSecond =
+            result.beforeRotationRmsDegreesPerSecond;
+        result.afterXVelocityDeviation =
+            result.beforeXVelocityDeviation;
+        result.afterRotationDirectionChanges =
+            result.beforeRotationDirectionChanges;
+    }
+    return result;
+}
+
 std::vector<std::uint32_t> ComputeEqualizedAnimationSegmentFrames(
     const AnimationPath& path,
     const AnimationSpeedEqualizationOptions& options) {
