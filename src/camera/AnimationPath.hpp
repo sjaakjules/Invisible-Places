@@ -512,6 +512,15 @@ struct AnimationLoopManualKeyEditResult {
     std::string errorMessage;
 };
 
+struct AnimationLoopTriangleRealignmentResult {
+    bool succeeded = false;
+    bool changed = false;
+    std::size_t alignedPairCount = 0U;
+    float beforeRmsScreenHeights = 0.0F;
+    float afterRmsScreenHeights = 0.0F;
+    std::string errorMessage;
+};
+
 struct AnimationLoopHorizontalBlendRegions {
     float outgoingVisibleFraction = 2.0F / 3.0F;
     float incomingVisibleFraction = 1.0F / 3.0F;
@@ -833,6 +842,16 @@ MoveAnimationLoopSelectedKeySpatially(
     std::string_view keyId,
     bool cameraTrack,
     const std::array<float, 3>& targetPosition);
+// Re-registers every enabled three-node midpoint pair on the current paths.
+// `referencePathIndex` remains fixed while the other path's paired camera and
+// focus controls are solved against its projected triangle. The operation is
+// atomic and never changes key timing.
+[[nodiscard]] AnimationLoopTriangleRealignmentResult
+ForceAlignAnimationLoopSelectedTriangles(
+    AnimationPath* first,
+    AnimationPath* second,
+    const AnimationLoopSmoothingOptions& options,
+    std::size_t referencePathIndex);
 [[nodiscard]] AnimationLoopHorizontalBlendRegions
 ResolveAnimationLoopHorizontalBlendRegions(
     float blendProgress,

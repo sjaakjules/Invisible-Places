@@ -1877,6 +1877,81 @@ TEST_CASE(
     CHECK_FALSE(locked.succeeded);
     CHECK_FALSE(locked.changed);
     CHECK(findKey(first, lockedId).focusPoint == lockedBefore);
+
+    // Iterative spatial smoothing or a manual rig edit can leave the two
+    // projected midpoint triangles slightly separated. Force alignment keeps
+    // the chosen reference path byte-for-byte fixed and re-solves the paired
+    // camera/focus controls on the other path without retiming either path.
+    const auto firstReferenceBefore = first;
+    const float registeredBeforeDrift = triangleScreenRms();
+    auto& driftedFollower = findKey(
+        second,
+        secondBaseline.keys.back().id);
+    driftedFollower.cameraPosition[0U] += 0.30F;
+    driftedFollower.focusPoint[0U] += 0.30F;
+    const float driftedRms = triangleScreenRms();
+    REQUIRE(driftedRms > registeredBeforeDrift + 1.0e-4F);
+
+    const auto realigned = invisible_places::camera::
+        ForceAlignAnimationLoopSelectedTriangles(
+            &first,
+            &second,
+            options,
+            0U);
+    INFO(realigned.errorMessage);
+    REQUIRE(realigned.succeeded);
+    REQUIRE(realigned.changed);
+    CHECK(realigned.alignedPairCount == 2U);
+    CHECK(realigned.afterRmsScreenHeights <
+          realigned.beforeRmsScreenHeights);
+    CHECK(triangleScreenRms() < driftedRms);
+    REQUIRE(first.keys.size() == firstReferenceBefore.keys.size());
+    CHECK(first.localizedKeyCorrections.size() ==
+          firstReferenceBefore.localizedKeyCorrections.size());
+    for (std::size_t index = 0U; index < first.keys.size(); ++index) {
+        CHECK(first.keys[index].id == firstReferenceBefore.keys[index].id);
+        CHECK(first.keys[index].cameraPosition ==
+              firstReferenceBefore.keys[index].cameraPosition);
+        CHECK(first.keys[index].focusPoint ==
+              firstReferenceBefore.keys[index].focusPoint);
+        CHECK(first.keys[index].durationFrames ==
+              firstReferenceBefore.keys[index].durationFrames);
+    }
+    CHECK(first.durationFrames == firstDuration);
+    CHECK(second.durationFrames == secondDuration);
+    for (std::size_t index = 0U; index < first.keys.size(); ++index) {
+        CHECK(first.keys[index].durationFrames == firstDurations[index]);
+    }
+    for (std::size_t index = 0U; index < second.keys.size(); ++index) {
+        CHECK(second.keys[index].durationFrames == secondDurations[index]);
+    }
+
+    const auto secondReferenceBefore = second;
+    auto& reverseFollower = findKey(
+        first,
+        firstBaseline.keys.back().id);
+    reverseFollower.cameraPosition[1U] -= 0.25F;
+    reverseFollower.focusPoint[1U] -= 0.25F;
+    const auto reverseRealigned = invisible_places::camera::
+        ForceAlignAnimationLoopSelectedTriangles(
+            &first,
+            &second,
+            options,
+            1U);
+    INFO(reverseRealigned.errorMessage);
+    REQUIRE(reverseRealigned.succeeded);
+    REQUIRE(reverseRealigned.changed);
+    CHECK(reverseRealigned.afterRmsScreenHeights <
+          reverseRealigned.beforeRmsScreenHeights);
+    REQUIRE(second.keys.size() == secondReferenceBefore.keys.size());
+    for (std::size_t index = 0U; index < second.keys.size(); ++index) {
+        CHECK(second.keys[index].cameraPosition ==
+              secondReferenceBefore.keys[index].cameraPosition);
+        CHECK(second.keys[index].focusPoint ==
+              secondReferenceBefore.keys[index].focusPoint);
+        CHECK(second.keys[index].durationFrames ==
+              secondReferenceBefore.keys[index].durationFrames);
+    }
 }
 
 TEST_CASE(

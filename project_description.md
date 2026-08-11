@@ -296,7 +296,11 @@ and up to two authored keys inward from each end are selected by default. Each
 midpoint's A/B cameras move together through the triangle correspondence rather
 than remaining fixed; a hard three-node projection check preserves the feature
 alignment. Green controls can be moved directly with XYZ values or the viewport
-gizmo, and each edit becomes the starting point for the next pass. Separate
+gizmo, and each edit becomes the starting point for the next pass. The displayed
+camera/focus splines are resampled per segment with exact key knots after each
+edit. If iterative edits leave projected drift, **Force-align triangles** keeps
+the selected A or B path fixed and re-solves the paired midpoint camera/focus
+controls against all three captured nodes. Separate
 spatial-only actions target X velocity, Y velocity, image rotation, X plus
 rotation, or perceived speed under all three speed methods; amber controls and
 every segment-frame weight remain unchanged. A/B motion graphs mark both exact

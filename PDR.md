@@ -203,7 +203,11 @@ movable. Toggling either midpoint key shall toggle its partner. The user may
 toggle other eligible keys per animation and set a bounded movement allowance.
 Every enabled key shall also be manually movable; moving either member of a
 midpoint pair shall move its counterpart through the captured triangle
-transform. Spatial-only actions shall equalize X velocity, Y velocity, X plus
+transform. The final view shall redraw every affected spline segment from the
+current evaluated candidate, including exact key knots. A force-alignment
+action shall keep the selected A or B reference path fixed and solve the paired
+midpoint camera/focus controls so all three projected triangle nodes overlap
+again, without changing timing or locked keys. Spatial-only actions shall equalize X velocity, Y velocity, X plus
 rotation, image rotation, or perceived speed under each supported speed method.
 They shall move only green controls and shall never modify segment-frame
 weights. A/B motion graphs shall mark both 50% poses. A signed -1..1 transport

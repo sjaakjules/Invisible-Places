@@ -7275,6 +7275,260 @@ AnimationLoopManualKeyEditResult MoveAnimationLoopSelectedKeySpatially(
     return result;
 }
 
+AnimationLoopTriangleRealignmentResult
+ForceAlignAnimationLoopSelectedTriangles(
+    AnimationPath* first,
+    AnimationPath* second,
+    const AnimationLoopSmoothingOptions& options,
+    std::size_t referencePathIndex) {
+    AnimationLoopTriangleRealignmentResult result;
+    if (first == nullptr || second == nullptr || first == second ||
+        referencePathIndex > 1U) {
+        result.errorMessage =
+            "Choose one valid A/B animation as the triangle reference.";
+        return result;
+    }
+    if (options.triangleAlignmentConstraints.empty()) {
+        result.errorMessage =
+            "Enable both green 50% keys for at least one seam before force-aligning its triangles.";
+        return result;
+    }
+
+    AnimationPath originals[2U]{*first, *second};
+    AnimationPath* paths[2U]{first, second};
+    const auto findUniqueKey = [](const AnimationPath& path,
+                                  std::string_view id)
+        -> std::optional<std::size_t> {
+        const auto found = std::find_if(
+            path.keys.begin(),
+            path.keys.end(),
+            [&](const AnimationPathKey& key) { return key.id == id; });
+        if (found == path.keys.end() ||
+            std::count_if(
+                path.keys.begin(),
+                path.keys.end(),
+                [&](const AnimationPathKey& key) {
+                    return key.id == id;
+                }) != 1) {
+            return std::nullopt;
+        }
+        return static_cast<std::size_t>(found - path.keys.begin());
+    };
+    const auto enabled = [&](std::size_t pathIndex,
+                             std::string_view id) {
+        if (!options.useExplicitKeySelection) {
+            return true;
+        }
+        const auto& ids = pathIndex == 0U
+            ? options.firstMovableKeyIds
+            : options.secondMovableKeyIds;
+        return std::find(ids.begin(), ids.end(), id) != ids.end();
+    };
+    const auto accumulateDescriptorError = [](
+                                               const PanPatchDescriptor& left,
+                                               const PanPatchDescriptor& right,
+                                               float* squared,
+                                               std::size_t* count) {
+        if (!left.valid || !right.valid || squared == nullptr ||
+            count == nullptr) {
+            return false;
+        }
+        for (std::size_t node = 0U;
+             node < left.projectedPoints.size();
+             ++node) {
+            const float x = left.projectedPoints[node][0U] -
+                right.projectedPoints[node][0U];
+            const float y = left.projectedPoints[node][1U] -
+                right.projectedPoints[node][1U];
+            *squared += x * x + y * y;
+            ++*count;
+        }
+        return true;
+    };
+
+    float beforeSquared = 0.0F;
+    float afterSquared = 0.0F;
+    std::size_t beforeCount = 0U;
+    std::size_t afterCount = 0U;
+    for (const auto& constraint : options.triangleAlignmentConstraints) {
+        const auto firstIndex = findUniqueKey(*first, constraint.firstKeyId);
+        const auto secondIndex = findUniqueKey(*second, constraint.secondKeyId);
+        if (!firstIndex.has_value() || !secondIndex.has_value() ||
+            !ValidOrderedPanTriangle(constraint.firstPatch) ||
+            !ValidOrderedPanTriangle(constraint.secondPatch) ||
+            !enabled(0U, constraint.firstKeyId) ||
+            !enabled(1U, constraint.secondKeyId)) {
+            *first = std::move(originals[0U]);
+            *second = std::move(originals[1U]);
+            result.errorMessage =
+                "Each force-aligned seam needs both green midpoint keys and two valid ordered triangles.";
+            return result;
+        }
+        const std::size_t indices[2U]{
+            firstIndex.value(),
+            secondIndex.value(),
+        };
+        const AnimationSurfacePatchObservation* patches[2U]{
+            &constraint.firstPatch,
+            &constraint.secondPatch,
+        };
+        const std::size_t followerPathIndex = 1U - referencePathIndex;
+        auto& followerKey =
+            paths[followerPathIndex]->keys[indices[followerPathIndex]];
+        if (!paths[referencePathIndex]
+                 ->keys[indices[referencePathIndex]]
+                 .linkedCameraId.empty() ||
+            !followerKey.linkedCameraId.empty()) {
+            *first = std::move(originals[0U]);
+            *second = std::move(originals[1U]);
+            result.errorMessage =
+                "Force alignment is disabled for a midpoint linked to a shared CameraShot.";
+            return result;
+        }
+
+        const auto referenceContext = PrepareAnimationPathEvaluation(
+            *paths[referencePathIndex]);
+        const auto followerContext = PrepareAnimationPathEvaluation(
+            *paths[followerPathIndex]);
+        if (!referenceContext.valid || !followerContext.valid ||
+            indices[referencePathIndex] >= referenceContext.knots.size() ||
+            indices[followerPathIndex] >= followerContext.knots.size()) {
+            *first = std::move(originals[0U]);
+            *second = std::move(originals[1U]);
+            result.errorMessage =
+                "The current A/B midpoint splines could not be evaluated.";
+            return result;
+        }
+        const auto referenceDescriptor = DescribePreparedPanPatch(
+            referenceContext,
+            referenceContext.knots[indices[referencePathIndex]],
+            *patches[referencePathIndex]);
+        const auto followerBeforeDescriptor = DescribePreparedPanPatch(
+            followerContext,
+            followerContext.knots[indices[followerPathIndex]],
+            *patches[followerPathIndex]);
+        if (!referenceDescriptor.valid ||
+            !referenceDescriptor.rotationValid ||
+            !followerBeforeDescriptor.valid ||
+            !followerBeforeDescriptor.rotationValid ||
+            !accumulateDescriptorError(
+                referenceDescriptor,
+                followerBeforeDescriptor,
+                &beforeSquared,
+                &beforeCount)) {
+            *first = std::move(originals[0U]);
+            *second = std::move(originals[1U]);
+            result.errorMessage =
+                "A midpoint triangle is degenerate or behind its current camera.";
+            return result;
+        }
+
+        const auto referenceToFollower = BuildPanTriangleSimilarity(
+            *patches[referencePathIndex],
+            *patches[followerPathIndex]);
+        if (!referenceToFollower.valid) {
+            *first = std::move(originals[0U]);
+            *second = std::move(originals[1U]);
+            result.errorMessage =
+                "The current midpoint triangles cannot define a stable 3D alignment transform.";
+            return result;
+        }
+        const auto referenceEvaluation = EvaluatePreparedAnimationPath(
+            referenceContext,
+            referenceContext.knots[indices[referencePathIndex]]);
+        const glm::vec3 cameraSeed = TransformPanSimilarityPoint(
+            referenceToFollower,
+            ToGlm(referenceEvaluation.camera.position));
+        const glm::vec3 focusSeed = TransformPanSimilarityPoint(
+            referenceToFollower,
+            ToGlm(referenceEvaluation.focusPoint));
+
+        EnsureLocalizedKeyCorrections(
+            paths[followerPathIndex],
+            {indices[followerPathIndex]});
+        std::array<float, 3> camera{
+            cameraSeed.x,
+            cameraSeed.y,
+            cameraSeed.z,
+        };
+        std::array<float, 3> focus{
+            focusSeed.x,
+            focusSeed.y,
+            focusSeed.z,
+        };
+        OptimizePanEndpointPose(
+            &camera,
+            &focus,
+            followerKey,
+            *patches[followerPathIndex],
+            referenceDescriptor,
+            96U);
+        result.changed = result.changed ||
+            Distance(camera, followerKey.cameraPosition) > 1.0e-7F ||
+            Distance(focus, followerKey.focusPoint) > 1.0e-7F;
+        followerKey.cameraPosition = camera;
+        followerKey.focusPoint = focus;
+
+        const auto followerAfterContext = PrepareAnimationPathEvaluation(
+            *paths[followerPathIndex]);
+        if (!followerAfterContext.valid ||
+            indices[followerPathIndex] >=
+                followerAfterContext.knots.size()) {
+            *first = std::move(originals[0U]);
+            *second = std::move(originals[1U]);
+            result.changed = false;
+            result.errorMessage =
+                "Triangle realignment produced an invalid follower spline and was undone.";
+            return result;
+        }
+        const auto followerAfterDescriptor = DescribePreparedPanPatch(
+            followerAfterContext,
+            followerAfterContext.knots[indices[followerPathIndex]],
+            *patches[followerPathIndex]);
+        if (!followerAfterDescriptor.valid ||
+            !followerAfterDescriptor.rotationValid ||
+            !accumulateDescriptorError(
+                referenceDescriptor,
+                followerAfterDescriptor,
+                &afterSquared,
+                &afterCount)) {
+            *first = std::move(originals[0U]);
+            *second = std::move(originals[1U]);
+            result.changed = false;
+            result.errorMessage =
+                "The aligned triangle left the follower camera view and was undone.";
+            return result;
+        }
+        ++result.alignedPairCount;
+    }
+
+    result.beforeRmsScreenHeights = beforeCount > 0U
+        ? std::sqrt(beforeSquared / static_cast<float>(beforeCount))
+        : 0.0F;
+    result.afterRmsScreenHeights = afterCount > 0U
+        ? std::sqrt(afterSquared / static_cast<float>(afterCount))
+        : 0.0F;
+    if (result.alignedPairCount == 0U ||
+        result.afterRmsScreenHeights >
+            result.beforeRmsScreenHeights + 1.0e-6F) {
+        *first = std::move(originals[0U]);
+        *second = std::move(originals[1U]);
+        result.changed = false;
+        result.errorMessage =
+            "The current reference pose could not improve the triangle registration; no path was changed.";
+        return result;
+    }
+    if (!result.changed) {
+        // EnsureLocalizedKeyCorrections may have materialized a zero-valued
+        // correction while measuring an already-aligned pair. A reported
+        // no-op must remain a structural no-op for callers as well.
+        *first = std::move(originals[0U]);
+        *second = std::move(originals[1U]);
+    }
+    result.succeeded = true;
+    return result;
+}
+
 AnimationLoopTransitionMetrics MeasureAnimationLoopTransitions(
     const AnimationPath& first,
     const AnimationPath& second,

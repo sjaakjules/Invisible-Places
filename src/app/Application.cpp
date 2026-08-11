@@ -44268,36 +44268,73 @@ void DrawAnimationCurveOverlay(
         return;
     }
 
+    // Sample every authored/generated segment independently and include both
+    // exact key knots. The previous fixed 80-sample whole-path pass could skip
+    // a short generated segment entirely on a multi-thousand-frame pan, which
+    // made a valid localized key edit look as though its spline had not moved.
+    const std::uint32_t totalSampleBudget = std::clamp<std::uint32_t>(
+        static_cast<std::uint32_t>(std::ceil(
+            preparedPath.durationSeconds * 12.0F)),
+        96U,
+        768U);
     std::optional<ImVec2> previous;
-    constexpr std::uint32_t kSampleCount = 80;
-    for (std::uint32_t sampleIndex = 0; sampleIndex <= kSampleCount; ++sampleIndex) {
-        const float amount = static_cast<float>(sampleIndex) / static_cast<float>(kSampleCount);
-        const auto evaluation = invisible_places::camera::EvaluatePreparedAnimationPath(
-            preparedPath,
-            preparedPath.durationSeconds * amount);
-        std::array<float, 3> pointArray = drawCameraCurve
-            ? evaluation.camera.position
-            : evaluation.focusPoint;
-        if (frameTransform != nullptr) {
-            pointArray = invisible_places::camera::
-                ApplyAnimationCameraFrameTransform(
-                    *frameTransform,
-                    pointArray);
+    for (std::size_t segment = 0U;
+         segment + 1U < preparedPath.knots.size();
+         ++segment) {
+        const float startTime = preparedPath.knots[segment];
+        const float endTime = preparedPath.knots[segment + 1U];
+        const float segmentFraction = std::clamp(
+            (endTime - startTime) /
+                std::max(preparedPath.durationSeconds, 1.0e-6F),
+            0.0F,
+            1.0F);
+        const std::uint32_t segmentSamples = std::max<std::uint32_t>(
+            4U,
+            static_cast<std::uint32_t>(std::ceil(
+                segmentFraction *
+                static_cast<float>(totalSampleBudget))));
+        for (std::uint32_t sampleIndex = 0U;
+             sampleIndex <= segmentSamples;
+             ++sampleIndex) {
+            if (segment > 0U && sampleIndex == 0U) {
+                continue;
+            }
+            const float amount = static_cast<float>(sampleIndex) /
+                static_cast<float>(segmentSamples);
+            const auto evaluation = invisible_places::camera::
+                EvaluatePreparedAnimationPath(
+                    preparedPath,
+                    std::lerp(startTime, endTime, amount));
+            std::array<float, 3> pointArray = drawCameraCurve
+                ? evaluation.camera.position
+                : evaluation.focusPoint;
+            if (frameTransform != nullptr) {
+                pointArray = invisible_places::camera::
+                    ApplyAnimationCameraFrameTransform(
+                        *frameTransform,
+                        pointArray);
+            }
+            const glm::vec3 point{
+                pointArray[0U],
+                pointArray[1U],
+                pointArray[2U],
+            };
+            const auto projected = ProjectWorldPoint(
+                matrices,
+                viewport,
+                point);
+            if (projected.has_value() && previous.has_value()) {
+                ImGui::GetBackgroundDrawList(
+                    ImGui::GetMainViewport())->AddLine(
+                        previous.value(),
+                        projected->screen,
+                        color,
+                        2.0F);
+            }
+            previous = projected.has_value()
+                ? std::optional<ImVec2>{projected->screen}
+                : std::nullopt;
         }
-        const glm::vec3 point{
-            pointArray[0U],
-            pointArray[1U],
-            pointArray[2U],
-        };
-        const auto projected = ProjectWorldPoint(matrices, viewport, point);
-        if (projected.has_value() && previous.has_value()) {
-            ImGui::GetBackgroundDrawList(ImGui::GetMainViewport())->AddLine(
-                previous.value(),
-                projected->screen,
-                color,
-                2.0F);
-        }
-        previous = projected.has_value() ? std::optional<ImVec2>{projected->screen} : std::nullopt;
     }
 }
 
@@ -52925,6 +52962,79 @@ bool MoveReciprocalPanSmoothingKey(
     return true;
 }
 
+bool ForceAlignReciprocalPanSmoothingTriangles(
+    PreviewRuntimeState* runtimeState,
+    float currentAspectRatio,
+    std::size_t referenceRole) {
+    if (runtimeState == nullptr || referenceRole > 1U) {
+        return false;
+    }
+    auto& panel = runtimeState->animationPanel;
+    auto& wizard = panel.reciprocalPanWizard;
+    if (wizard.stage != AnimationReciprocalPanWizardStage::Preview ||
+        !wizard.candidate.has_value() || wizard.fitInProgress ||
+        wizard.smoothingInProgress) {
+        return false;
+    }
+    std::string validationError;
+    if (!ValidateReciprocalPanWizardStaleState(
+            *runtimeState,
+            currentAspectRatio,
+            &validationError)) {
+        wizard.smoothingError = std::move(validationError);
+        return false;
+    }
+
+    std::array<AnimationPath, 2U> working{
+        ReciprocalPanEffectiveCandidatePath(wizard, 0U),
+        ReciprocalPanEffectiveCandidatePath(wizard, 1U),
+    };
+    const auto options = BuildReciprocalPanSmoothingOptions(
+        wizard,
+        wizard.smoothingObjective);
+    const auto result = invisible_places::camera::
+        ForceAlignAnimationLoopSelectedTriangles(
+            &working[0U],
+            &working[1U],
+            options,
+            referenceRole);
+    if (!result.succeeded) {
+        wizard.smoothingError = result.errorMessage;
+        return false;
+    }
+    if (!result.changed) {
+        wizard.smoothingError.clear();
+        runtimeState->statusMessage =
+            "The selected seam triangles are already aligned.";
+        return true;
+    }
+
+    ++wizard.smoothingGeneration;
+    wizard.smoothedCandidates = std::move(working);
+    wizard.smoothingResult.reset();
+    wizard.smoothingError.clear();
+    wizard.smoothingSelectedRole = static_cast<int>(referenceRole);
+    panel.preparedPathCache = {};
+    panel.motionStatsCache = {};
+    panel.perceivedFlowCache = {};
+    runtimeState->previewRenderStateSignatureValid = false;
+    if (!wizard.orbitInspectionActive) {
+        ShowReciprocalPanWizardCanonicalPose(runtimeState);
+    }
+    const float beforePixels =
+        result.beforeRmsScreenHeights * 1080.0F;
+    const float afterPixels =
+        result.afterRmsScreenHeights * 1080.0F;
+    runtimeState->statusMessage =
+        "Force-aligned " + std::to_string(result.alignedPairCount) +
+        " seam triangle" +
+        (result.alignedPairCount == 1U ? std::string{} : "s") +
+        " to " + (referenceRole == 0U ? "A" : "B") +
+        " (RMS " + FormatFixed(beforePixels, 2) + " -> " +
+        FormatFixed(afterPixels, 2) + " px @1080).";
+    return true;
+}
+
 bool StartReciprocalPanTransitionSmoothing(
     PreviewRuntimeState* runtimeState,
     float currentAspectRatio,
@@ -55004,8 +55114,40 @@ void DrawReciprocalPanTransitionSmoothingControls(
         }
     }
     ImGui::EndDisabled();
-    ImGui::TextDisabled(
-        "Moving either green 50%% key moves its counterpart through the captured triangle transform, so all three feature nodes remain registered. Continue with another spatial pass to iterate.");
+    const auto realignmentOptions = BuildReciprocalPanSmoothingOptions(
+        wizard,
+        wizard.smoothingObjective);
+    ImGui::BeginDisabled(
+        realignmentOptions.triangleAlignmentConstraints.empty());
+    const std::string forceAlignLabel = editRole == 0U
+        ? "Force-align triangles to A (keep A fixed)"
+        : "Force-align triangles to B (keep B fixed)";
+    if (ImGui::Button(
+            forceAlignLabel.c_str(),
+            ImVec2{-FLT_MIN, 0.0F})) {
+        ForceAlignReciprocalPanSmoothingTriangles(
+            runtimeState,
+            aspectRatio,
+            editRole);
+    }
+    ImGui::EndDisabled();
+    if (realignmentOptions.triangleAlignmentConstraints.empty()) {
+        ImGui::PushStyleColor(
+            ImGuiCol_Text,
+            ImGui::GetColorU32(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped(
+            "Turn on both green 50%% keys for a seam to enable force alignment.");
+        ImGui::PopStyleColor();
+    } else {
+        ImGui::TextWrapped(
+            "Force alignment preserves the selected A/B reference path and moves only the paired midpoint camera/focus controls on the other path until all three captured feature nodes overlap again. Timing and amber keys remain fixed.");
+    }
+    ImGui::PushStyleColor(
+        ImGuiCol_Text,
+        ImGui::GetColorU32(ImGuiCol_TextDisabled));
+    ImGui::TextWrapped(
+        "Ordinary midpoint moves carry the paired key through the captured 3D triangle transform. Use force alignment after iterative smoothing or manual edits to remove any remaining projected drift.");
+    ImGui::PopStyleColor();
     if (wizard.smoothedCandidates.has_value()) {
         ImGui::SameLine();
         if (ImGui::Button("Reset to triangle fit")) {
