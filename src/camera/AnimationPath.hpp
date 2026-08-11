@@ -670,6 +670,13 @@ void CollectRayHitDistancesAlongRay(
     float clusterDepthMeters,
     std::size_t minimumClusterSamples);
 
+// Uses a finite positive surface hit when one exists; otherwise preserves the
+// caller-provided focus distance. Invalid hit/fallback inputs resolve to a
+// conservative one-metre distance so focus placement always remains usable.
+[[nodiscard]] float ResolveSurfaceFocusDistance(
+    std::optional<float> surfaceHitDistance,
+    float fallbackFocusDistance);
+
 void MoveAnimationCameraKey(
     AnimationPath* path,
     std::size_t keyIndex,

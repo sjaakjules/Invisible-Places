@@ -27505,6 +27505,12 @@ void CopyCameraShotToAnimationKeySnapshot(const CameraShot& shot, invisible_plac
     key->fovDegrees = shot.state.fovDegrees;
     key->nearPlane = shot.state.nearPlane;
     key->farPlane = shot.state.farPlane;
+    if (key->hasOrientation) {
+        key->orientation = shot.state.orientation;
+    }
+    if (key->hasFocusDistance) {
+        key->focusDistance = shot.state.focusDistance;
+    }
     key->sourceShotName = shot.name;
     key->linkedCameraId = shot.id;
     key->linkedCameraName = shot.name;
@@ -49264,7 +49270,8 @@ struct LiveAnimationKeyFocus {
 LiveAnimationKeyFocus ResolveLiveAnimationKeyFocus(
     const PreviewRuntimeState& runtimeState,
     const AnimationPath& path,
-    const invisible_places::camera::CameraState& camera) {
+    const invisible_places::camera::CameraState& camera,
+    std::optional<float> fallbackFocusDistance = std::nullopt) {
     const glm::vec3 origin{
         camera.position[0U],
         camera.position[1U],
@@ -49293,13 +49300,12 @@ LiveAnimationKeyFocus ResolveLiveAnimationKeyFocus(
         runtimeState,
         {origin.x, origin.y, origin.z},
         {direction.x, direction.y, direction.z});
-    float focusDistance = 0.0F;
-    bool usedSurfaceHit = false;
-    if (hit.has_value() && std::isfinite(hit.value()) &&
-        hit.value() > 1.0e-4F) {
-        focusDistance = hit.value();
-        usedSurfaceHit = true;
-    } else {
+    const bool usedSurfaceHit =
+        hit.has_value() && std::isfinite(hit.value()) &&
+        hit.value() > 1.0e-4F;
+    float fallbackDistance = fallbackFocusDistance.value_or(0.0F);
+    if (!std::isfinite(fallbackDistance) ||
+        fallbackDistance <= 1.0e-4F) {
         double totalDistance = 0.0;
         std::size_t validKeyCount = 0U;
         for (const auto& key : path.keys) {
@@ -49314,17 +49320,79 @@ LiveAnimationKeyFocus ResolveLiveAnimationKeyFocus(
             totalDistance += distance;
             ++validKeyCount;
         }
-        focusDistance = validKeyCount > 0U
+        fallbackDistance = validKeyCount > 0U
             ? static_cast<float>(
                   totalDistance / static_cast<double>(validKeyCount))
             : std::max(camera.focusDistance, 1.0F);
     }
+    const float focusDistance = invisible_places::camera::
+        ResolveSurfaceFocusDistance(hit, fallbackDistance);
     const glm::vec3 focus = origin + direction * focusDistance;
     return {
         .point = {focus.x, focus.y, focus.z},
         .distance = focusDistance,
         .surfaceHit = usedSurfaceHit,
     };
+}
+
+bool SetAnimationKeyFromLiveCamera(
+    PreviewRuntimeState* runtimeState,
+    AnimationPath* path,
+    std::size_t keyIndex,
+    const invisible_places::camera::CameraState& camera,
+    const LiveAnimationKeyFocus& focus) {
+    if (runtimeState == nullptr || path == nullptr ||
+        keyIndex >= path->keys.size()) {
+        return false;
+    }
+
+    auto& key = path->keys[keyIndex];
+    if (!key.linkedCameraId.empty() &&
+        !CanEditLinkedCamera(
+            runtimeState,
+            key.linkedCameraId,
+            "Current-camera key update blocked.")) {
+        return false;
+    }
+
+    const bool pathStoresOrientation = std::any_of(
+        path->keys.begin(),
+        path->keys.end(),
+        [](const auto& candidate) { return candidate.hasOrientation; });
+    const bool pathStoresFocusDistance = std::any_of(
+        path->keys.begin(),
+        path->keys.end(),
+        [](const auto& candidate) { return candidate.hasFocusDistance; });
+    invisible_places::camera::BakeAnimationPathLocalizedCorrections(path);
+    key.cameraPosition = camera.position;
+    key.focusPoint = focus.point;
+    if (pathStoresOrientation) {
+        key.hasOrientation = true;
+        key.orientation = camera.orientation;
+    }
+    if (pathStoresFocusDistance) {
+        key.hasFocusDistance = true;
+        key.focusDistance = focus.distance;
+    }
+    invisible_places::camera::RebuildAnimationPathGeometryFromKeys(path);
+
+    if (key.linkedCameraId.empty()) {
+        return true;
+    }
+    const auto shotIndex = FindCameraShotIndexById(
+        *runtimeState,
+        key.linkedCameraId);
+    if (!shotIndex.has_value() ||
+        shotIndex.value() >= runtimeState->cameraShots.size()) {
+        return true;
+    }
+    auto& shot = runtimeState->cameraShots[shotIndex.value()];
+    CopyAnimationKeyToCameraShot(key, &shot);
+    shot.name = key.linkedCameraName.empty()
+        ? shot.name
+        : key.linkedCameraName;
+    PropagateCameraShotToLinkedAnimationKeys(runtimeState, shot);
+    return true;
 }
 
 AnimationPath* MutableCurrentAnimationForKeyEditing(
@@ -53437,6 +53505,58 @@ void DrawAnimationSection(
                 "raising one segment's share slows that stretch of the "
                 "camera move. Equalize Perceived Speed writes these.");
         }
+    }
+
+    ImGui::Separator();
+    if (ImGui::Button(
+            "Set Selected Key from Current Camera",
+            ImVec2{-FLT_MIN, 0.0F})) {
+        const std::size_t selectedIndex =
+            panel.selectedKeyIndex.value();
+        const auto& previousKey = animationPath.keys[selectedIndex];
+        const float previousFocusDistance = std::hypot(
+            previousKey.focusPoint[0U] - previousKey.cameraPosition[0U],
+            std::hypot(
+                previousKey.focusPoint[1U] -
+                    previousKey.cameraPosition[1U],
+                previousKey.focusPoint[2U] -
+                    previousKey.cameraPosition[2U]));
+        const auto camera = runtimeState->camera.CaptureState();
+        const auto focus = ResolveLiveAnimationKeyFocus(
+            *runtimeState,
+            animationPath,
+            camera,
+            previousFocusDistance);
+        auto* editablePath = MutableCurrentAnimationForKeyEditing(
+            runtimeState);
+        if (editablePath == nullptr ||
+            selectedIndex >= editablePath->keys.size()) {
+            runtimeState->errorMessage =
+                "The selected animation key is no longer editable.";
+            runtimeState->statusMessage.clear();
+        } else if (SetAnimationKeyFromLiveCamera(
+                       runtimeState,
+                       editablePath,
+                       selectedIndex,
+                       camera,
+                       focus)) {
+            panel.dirty = true;
+            runtimeState->animationPlayback.active = false;
+            runtimeState->cameraPlayback.active = false;
+            runtimeState->statusMessage =
+                "Updated animation key " +
+                std::to_string(selectedIndex + 1U) +
+                " from the current camera; " +
+                (focus.surfaceHit
+                     ? "the focus ray hit the point cloud at "
+                     : "no point-cloud hit was found, so its previous focus distance was retained at ") +
+                FormatFixed(focus.distance, 3) + " m.";
+            runtimeState->errorMessage.clear();
+        }
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+        ImGui::SetTooltip(
+            "Replaces the selected key's camera position and view direction with the live viewport camera. Focus raycasts into the point cloud; a miss keeps this key's previous camera-to-focus distance along the new view ray.");
     }
     EndPanelSection();
 }

@@ -5354,4 +5354,20 @@ std::optional<float> ResolveFirstRayHitCluster(
     return distances.front();
 }
 
+float ResolveSurfaceFocusDistance(
+    std::optional<float> surfaceHitDistance,
+    float fallbackFocusDistance) {
+    constexpr float kMinimumFocusDistance = 1.0e-4F;
+    if (surfaceHitDistance.has_value() &&
+        std::isfinite(surfaceHitDistance.value()) &&
+        surfaceHitDistance.value() > kMinimumFocusDistance) {
+        return surfaceHitDistance.value();
+    }
+    if (std::isfinite(fallbackFocusDistance) &&
+        fallbackFocusDistance > kMinimumFocusDistance) {
+        return fallbackFocusDistance;
+    }
+    return 1.0F;
+}
+
 }  // namespace invisible_places::camera

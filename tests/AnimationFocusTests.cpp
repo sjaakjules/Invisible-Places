@@ -12,6 +12,7 @@ namespace {
 using Catch::Approx;
 using invisible_places::camera::CollectRayHitDistancesAlongRay;
 using invisible_places::camera::ResolveFirstRayHitCluster;
+using invisible_places::camera::ResolveSurfaceFocusDistance;
 using invisible_places::io::Float3;
 
 std::vector<Float3> PlaneOfPoints(float x, float extent, float spacing) {
@@ -90,6 +91,15 @@ TEST_CASE("Nearest qualifying cluster wins over a farther denser one", "[camera]
     const auto hit = ResolveFirstRayHitCluster(distances, 0.5F, 3U);
     REQUIRE(hit.has_value());
     CHECK(hit.value() == Approx(6.075F).margin(0.05F));
+}
+
+TEST_CASE("Surface focus preserves the previous distance when the ray misses",
+          "[camera][focus][key-editing]") {
+    CHECK(ResolveSurfaceFocusDistance(std::nullopt, 7.25F) ==
+          Approx(7.25F));
+    CHECK(ResolveSurfaceFocusDistance(3.5F, 7.25F) == Approx(3.5F));
+    CHECK(ResolveSurfaceFocusDistance(-2.0F, 7.25F) ==
+          Approx(7.25F));
 }
 
 TEST_CASE("Matching-frame ghost keeps the linked view's front surface and freezes it at the destination pose",
