@@ -187,6 +187,16 @@ shall remain visible and the active A/B side shall remain editable. Procedural
 water rendering and simulation work shall be suppressed while the assistant is
 open.
 
+#### FR-CAM-20
+Final Preview shall offer an optional selected-key transition-smoothing pass.
+The exact triangle-aligned midpoint keys shall remain locked; generated keys
+and up to two neighbouring authored keys on each side shall be recommended as
+movable. The user may toggle eligible keys per animation and set a bounded
+movement allowance before smoothing. The pass shall reduce local screen-flow
+and image-rotation discontinuities without worsening either seam, while Reset
+shall restore the immutable triangle fit. Applying without a successful pass
+shall preserve the unsmoothed fit.
+
 ### 5.4 Side Panel Behaviour
 #### FR-UI-1
 The application shall include a side panel for render and style controls.

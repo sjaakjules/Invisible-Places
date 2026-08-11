@@ -8,6 +8,7 @@
 #include <cmath>
 #include <limits>
 #include <string>
+#include <tuple>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -1532,6 +1533,101 @@ TEST_CASE("Bidirectional reciprocal pan extension generates pre-roll and tail fr
                 swappedFirst,
                 amount * swappedFirst.durationSeconds),
             3.0e-4F);
+    }
+}
+
+TEST_CASE(
+    "Selected transition smoothing keeps triangle midpoint keys fixed while spreading reciprocal motion",
+    "[camera][animation][pan-extension][transition-smoothing]") {
+    const auto firstBaseline =
+        MakeReciprocalPanTestPath("smooth-A", 1.0F, 41U, 79U);
+    const auto secondBaseline =
+        MakeReciprocalPanTestPath("smooth-B", -1.0F, 54U, 96U);
+    const auto extension = invisible_places::camera::
+        BuildAnimationBidirectionalReciprocalPanExtension(
+            firstBaseline,
+            secondBaseline,
+            MakeReciprocalPanTestOptions());
+    INFO(extension.errorMessage);
+    REQUIRE(extension.succeeded);
+    auto first = extension.firstCandidate;
+    auto second = extension.secondCandidate;
+    const auto firstBefore = first;
+    const auto secondBefore = second;
+
+    const auto movableIds = [](const auto& baseline, const auto& candidate) {
+        std::unordered_set<std::string> originalIds;
+        for (const auto& key : baseline.keys) {
+            originalIds.insert(key.id);
+        }
+        std::vector<std::string> result;
+        for (const auto& key : candidate.keys) {
+            if (!originalIds.contains(key.id)) {
+                result.push_back(key.id);
+            }
+        }
+        // The sole interior authored key is the nearest available control on
+        // both sides of this compact test path.
+        result.push_back(baseline.keys[1U].id);
+        return result;
+    };
+    invisible_places::camera::AnimationLoopSmoothingOptions options;
+    options.maxEndMoveFraction = 0.15F;
+    options.useExplicitKeySelection = true;
+    options.firstMovableKeyIds = movableIds(firstBaseline, first);
+    options.secondMovableKeyIds = movableIds(secondBaseline, second);
+    options.firstStartOverlapSeconds = 70.0F / 30.0F;
+    options.firstEndOverlapSeconds = 88.0F / 30.0F;
+    options.secondStartOverlapSeconds = 88.0F / 30.0F;
+    options.secondEndOverlapSeconds = 70.0F / 30.0F;
+    options.horizontalBlend = true;
+    options.panRight = true;
+    options.maxOptimizationSweeps = 16U;
+    options.minimumStepFraction = 0.0125F;
+    options.imageRotationMismatchWeight = 0.35F;
+    options.selectedNeighborhoodSmoothnessWeight = 0.75F;
+
+    const auto smoothing = invisible_places::camera::
+        SmoothAnimationLoopTransitions(&first, &second, options);
+    INFO(smoothing.errorMessage);
+    REQUIRE(smoothing.succeeded);
+    REQUIRE(smoothing.changed);
+    CHECK(smoothing.afterObjective < smoothing.beforeObjective);
+    CHECK(smoothing.afterNeighborhoodRoughness[0U] +
+              smoothing.afterNeighborhoodRoughness[1U] <
+          smoothing.beforeNeighborhoodRoughness[0U] +
+              smoothing.beforeNeighborhoodRoughness[1U]);
+    CHECK(smoothing.afterSeamMismatch[0U] <=
+          smoothing.beforeSeamMismatch[0U] + 1.0e-5F);
+    CHECK(smoothing.afterSeamMismatch[1U] <=
+          smoothing.beforeSeamMismatch[1U] + 1.0e-5F);
+    CHECK(smoothing.afterSeamRotationMismatch[0U] <=
+          smoothing.beforeSeamRotationMismatch[0U] + 1.0e-5F);
+    CHECK(smoothing.afterSeamRotationMismatch[1U] <=
+          smoothing.beforeSeamRotationMismatch[1U] + 1.0e-5F);
+
+    const auto findKey = [](const auto& path, std::string_view id)
+        -> const invisible_places::camera::AnimationPathKey& {
+        const auto found = std::find_if(
+            path.keys.begin(),
+            path.keys.end(),
+            [&](const auto& key) { return key.id == id; });
+        REQUIRE(found != path.keys.end());
+        return *found;
+    };
+    for (const auto& [before, after, baseline] : {
+             std::tuple{&firstBefore, &first, &firstBaseline},
+             std::tuple{&secondBefore, &second, &secondBaseline}}) {
+        for (const auto* midpoint : {
+                 &baseline->keys.front(),
+                 &baseline->keys.back()}) {
+            const auto& beforeKey = findKey(*before, midpoint->id);
+            const auto& afterKey = findKey(*after, midpoint->id);
+            CHECK(afterKey.cameraPosition == beforeKey.cameraPosition);
+            CHECK(afterKey.focusPoint == beforeKey.focusPoint);
+        }
+        CHECK(after->keys.size() == before->keys.size());
+        CHECK(after->durationFrames == before->durationFrames);
     }
 }
 

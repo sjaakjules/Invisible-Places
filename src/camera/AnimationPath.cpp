@@ -5706,6 +5706,8 @@ struct LoopScore {
     float objective = 0.0F;
     float mismatch = 0.0F;
     std::array<float, 2> seamMismatch{0.0F, 0.0F};
+    std::array<float, 2> seamRotationMismatch{0.0F, 0.0F};
+    std::array<float, 2> neighborhoodRoughness{0.0F, 0.0F};
     std::array<float, 2> terminalSpeedRmsChange{0.0F, 0.0F};
 };
 
@@ -5719,6 +5721,74 @@ std::array<float, 2> HorizontalWipeRegion(
     return keepLeft
                ? std::array<float, 2>{-1.0F, -1.0F + 2.0F * fraction}
                : std::array<float, 2>{1.0F - 2.0F * fraction, 1.0F};
+}
+
+float MeasureLoopNeighborhoodRoughness(
+    const PreparedAnimationPathEvaluationContext& context,
+    float startOverlapSeconds,
+    float endOverlapSeconds) {
+    if (!context.valid || context.durationSeconds <= 1.0e-6F) {
+        return 0.0F;
+    }
+    constexpr std::uint32_t kIntervals = 12U;
+    const std::array<std::pair<float, float>, 2U> windows{{
+        {0.0F, std::clamp(
+                   startOverlapSeconds,
+                   0.0F,
+                   context.durationSeconds)},
+        {std::max(
+             0.0F,
+             context.durationSeconds - std::clamp(
+                                           endOverlapSeconds,
+                                           0.0F,
+                                           context.durationSeconds)),
+         context.durationSeconds},
+    }};
+    float total = 0.0F;
+    std::uint32_t count = 0U;
+    for (const auto& [begin, end] : windows) {
+        const float span = end - begin;
+        if (span <= 1.0e-6F) {
+            continue;
+        }
+        const float probeDelta = LoopProbeDeltaSeconds(context, span);
+        auto previous = ProbePerceivedFlow(
+            context,
+            begin,
+            probeDelta);
+        for (std::uint32_t sample = 1U; sample <= kIntervals; ++sample) {
+            const float amount = static_cast<float>(sample) /
+                                 static_cast<float>(kIntervals);
+            const auto current = ProbePerceivedFlow(
+                context,
+                std::lerp(begin, end, amount),
+                probeDelta);
+            const float speedScale = std::max(
+                0.5F *
+                    (previous.fullScreenSpeed + current.fullScreenSpeed),
+                1.0e-3F);
+            const float velocityX =
+                current.screenVelocity[0U] - previous.screenVelocity[0U];
+            const float velocityY =
+                current.screenVelocity[1U] - previous.screenVelocity[1U];
+            const float rotationScale = std::max(
+                0.5F *
+                    (std::abs(previous.imageRotationDegreesPerSecond) +
+                     std::abs(current.imageRotationDegreesPerSecond)),
+                1.0F);
+            const float rotationDelta =
+                current.imageRotationDegreesPerSecond -
+                previous.imageRotationDegreesPerSecond;
+            total +=
+                ((velocityX * velocityX) + (velocityY * velocityY)) /
+                    (speedScale * speedScale) +
+                0.25F * (rotationDelta * rotationDelta) /
+                    (rotationScale * rotationScale);
+            ++count;
+            previous = current;
+        }
+    }
+    return count > 0U ? total / static_cast<float>(count) : 0.0F;
 }
 
 LoopScore ScoreLoopPair(
@@ -5752,6 +5822,18 @@ LoopScore ScoreLoopPair(
     float totalWeight = 0.0F;
     std::array<float, 2> seamWeights{0.0F, 0.0F};
     std::array<float, 2> speedErrorWeights{0.0F, 0.0F};
+    const float rotationWeight = std::clamp(
+        std::isfinite(options.imageRotationMismatchWeight)
+            ? options.imageRotationMismatchWeight
+            : 0.0F,
+        0.0F,
+        10.0F);
+    const float smoothnessWeight = std::clamp(
+        std::isfinite(options.selectedNeighborhoodSmoothnessWeight)
+            ? options.selectedNeighborhoodSmoothnessWeight
+            : 0.0F,
+        0.0F,
+        10.0F);
     const std::array<std::pair<std::size_t, std::size_t>, 2> seams{{
         {0U, 1U},
         {1U, 0U},
@@ -5849,6 +5931,21 @@ LoopScore ScoreLoopPair(
             const float flowY = outgoingFlow.screenVelocity[1] - incomingFlow.screenVelocity[1];
             const float normalizedMismatch =
                 ((flowX * flowX) + (flowY * flowY)) / (scale * scale);
+            const float rotationScale = std::max(
+                0.5F *
+                    (std::abs(
+                         originalOutgoingFlow
+                             .imageRotationDegreesPerSecond) +
+                     std::abs(
+                         originalIncomingFlow
+                             .imageRotationDegreesPerSecond)),
+                1.0F);
+            const float rotationDifference =
+                outgoingFlow.imageRotationDegreesPerSecond -
+                incomingFlow.imageRotationDegreesPerSecond;
+            const float normalizedRotationMismatch =
+                (rotationDifference * rotationDifference) /
+                (rotationScale * rotationScale);
             const float outgoingSpeedError =
                 (outgoingFlow.fullScreenSpeed -
                  originalOutgoingFlow.fullScreenSpeed) /
@@ -5858,6 +5955,8 @@ LoopScore ScoreLoopPair(
                  originalIncomingFlow.fullScreenSpeed) /
                 fullScreenScale;
             score.seamMismatch[seamIndex] += weight * normalizedMismatch;
+            score.seamRotationMismatch[seamIndex] +=
+                weight * normalizedRotationMismatch;
             score.terminalSpeedRmsChange[outgoingIndex] +=
                 weight * outgoingSpeedError * outgoingSpeedError;
             score.terminalSpeedRmsChange[incomingIndex] +=
@@ -5867,6 +5966,7 @@ LoopScore ScoreLoopPair(
             score.objective +=
                 weight *
                 (normalizedMismatch +
+                 rotationWeight * normalizedRotationMismatch +
                  kOriginalSpeedCurveWeight *
                      ((outgoingSpeedError * outgoingSpeedError) +
                       (incomingSpeedError * incomingSpeedError)));
@@ -5879,6 +5979,8 @@ LoopScore ScoreLoopPair(
          ++seamIndex) {
         if (seamWeights[seamIndex] > 0.0F) {
             score.seamMismatch[seamIndex] /= seamWeights[seamIndex];
+            score.seamRotationMismatch[seamIndex] /=
+                seamWeights[seamIndex];
         }
     }
     score.mismatch =
@@ -5895,6 +5997,16 @@ LoopScore ScoreLoopPair(
     if (totalWeight > 0.0F) {
         score.objective /= totalWeight;
     }
+    for (std::size_t pathIndex = 0U; pathIndex < 2U; ++pathIndex) {
+        score.neighborhoodRoughness[pathIndex] =
+            MeasureLoopNeighborhoodRoughness(
+                *candidates[pathIndex],
+                overlaps.startSeconds[pathIndex],
+                overlaps.endSeconds[pathIndex]);
+    }
+    score.objective += smoothnessWeight * 0.5F *
+        (score.neighborhoodRoughness[0U] +
+         score.neighborhoodRoughness[1U]);
     for (const auto& group : groups) {
         float movementPenalty = 0.0F;
         for (const auto& occurrence : group.occurrences) {
@@ -6239,6 +6351,11 @@ AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
     }
     result.beforeMismatch = beforeScore.mismatch;
     result.beforeSeamMismatch = beforeScore.seamMismatch;
+    result.beforeSeamRotationMismatch =
+        beforeScore.seamRotationMismatch;
+    result.beforeNeighborhoodRoughness =
+        beforeScore.neighborhoodRoughness;
+    result.beforeObjective = beforeScore.objective;
     ApplyLoopEndpointGroups(first, second, groups);
     LoopScore bestScore = ScoreLoopPair(
         *first,
@@ -6350,6 +6467,11 @@ AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
     }
     result.afterMismatch = finalScore.mismatch;
     result.afterSeamMismatch = finalScore.seamMismatch;
+    result.afterSeamRotationMismatch =
+        finalScore.seamRotationMismatch;
+    result.afterNeighborhoodRoughness =
+        finalScore.neighborhoodRoughness;
+    result.afterObjective = finalScore.objective;
     result.terminalSpeedRmsChange = finalScore.terminalSpeedRmsChange;
     const AnimationPath* smoothedPaths[] = {first, second};
     const PreparedAnimationPathEvaluationContext* originals[] = {
@@ -6392,17 +6514,45 @@ AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
     };
     const bool neitherSeamWorsened =
         seamDidNotWorsen(0U) && seamDidNotWorsen(1U);
+    const float requestedRotationWeight = std::isfinite(
+        options.imageRotationMismatchWeight)
+        ? std::max(options.imageRotationMismatchWeight, 0.0F)
+        : 0.0F;
+    const auto rotationDidNotWorsen = [&](std::size_t seamIndex) {
+        if (requestedRotationWeight <= 1.0e-8F) {
+            return true;
+        }
+        const float tolerance = std::max(
+            1.0e-7F,
+            1.0e-4F *
+                result.beforeSeamRotationMismatch[seamIndex]);
+        return result.afterSeamRotationMismatch[seamIndex] <=
+               result.beforeSeamRotationMismatch[seamIndex] + tolerance;
+    };
+    const bool neitherRotationWorsened =
+        rotationDidNotWorsen(0U) && rotationDidNotWorsen(1U);
+    const bool extendedSmoothingObjective =
+        requestedRotationWeight > 1.0e-8F ||
+        (std::isfinite(options.selectedNeighborhoodSmoothnessWeight) &&
+         options.selectedNeighborhoodSmoothnessWeight > 1.0e-8F);
+    const float beforeImprovementValue = extendedSmoothingObjective
+        ? result.beforeObjective
+        : result.beforeMismatch;
+    const float afterImprovementValue = extendedSmoothingObjective
+        ? result.afterObjective
+        : result.afterMismatch;
     const float requiredOverallImprovement = std::max(
         1.0e-7F,
-        1.0e-4F * result.beforeMismatch);
+        1.0e-4F * beforeImprovementValue);
     const bool overallImproved =
-        result.afterMismatch + requiredOverallImprovement <
-        result.beforeMismatch;
+        afterImprovementValue + requiredOverallImprovement <
+        beforeImprovementValue;
     const bool selectedKeysMoved =
         result.maxCameraMove > 1.0e-6F ||
         result.maxFocusMove > 1.0e-6F;
     result.changed =
-        overallImproved && neitherSeamWorsened && selectedKeysMoved;
+        overallImproved && neitherSeamWorsened &&
+        neitherRotationWorsened && selectedKeysMoved;
     result.succeeded = true;
     if (!result.changed) {
         *first = std::move(originalFirstPath);
@@ -6414,11 +6564,11 @@ AnimationLoopSmoothingResult SmoothAnimationLoopTransitions(
         } else if (!overallImproved) {
             result.errorMessage =
                 "The best bounded key movement did not measurably lower "
-                "the combined screen-flow mismatch.";
+                "the selected transition-smoothing objective.";
         } else {
             result.errorMessage =
                 "The best combined candidate was rejected because it made "
-                "one seam direction worse.";
+                "one seam's translation or rotation continuity worse.";
         }
     }
     return result;

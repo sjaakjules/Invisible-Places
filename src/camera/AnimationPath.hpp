@@ -459,6 +459,11 @@ struct AnimationLoopSmoothingOptions {
     // apply retains the default multi-resolution search.
     std::uint32_t maxOptimizationSweeps = 40U;
     float minimumStepFraction = 0.005F;
+    // Optional final-pass terms used by the reciprocal-pan assistant. The
+    // ordinary Velocity Alignment workflow leaves both at zero, preserving
+    // its historical screen-translation objective exactly.
+    float imageRotationMismatchWeight = 0.0F;
+    float selectedNeighborhoodSmoothnessWeight = 0.0F;
     // Runtime-only cancellation for immutable background previews. It is
     // never serialized and has no effect for ordinary foreground calls.
     std::stop_token stopToken{};
@@ -494,6 +499,12 @@ struct AnimationLoopSmoothingResult {
     float afterMismatch = 0.0F;
     std::array<float, 2> beforeSeamMismatch{0.0F, 0.0F};
     std::array<float, 2> afterSeamMismatch{0.0F, 0.0F};
+    std::array<float, 2> beforeSeamRotationMismatch{0.0F, 0.0F};
+    std::array<float, 2> afterSeamRotationMismatch{0.0F, 0.0F};
+    std::array<float, 2> beforeNeighborhoodRoughness{0.0F, 0.0F};
+    std::array<float, 2> afterNeighborhoodRoughness{0.0F, 0.0F};
+    float beforeObjective = 0.0F;
+    float afterObjective = 0.0F;
     // Weighted RMS change from each animation's original terminal perceived-
     // speed curve, normalized by the local seam speed. Index 0 is `first`.
     std::array<float, 2> terminalSpeedRmsChange{0.0F, 0.0F};
