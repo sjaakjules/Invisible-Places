@@ -251,6 +251,8 @@ constexpr std::size_t kDefaultQueuedExportFrames = 2U;
 constexpr std::size_t kMaxAdaptiveQueuedExportFrames = 6U;
 constexpr std::uint64_t kAdaptiveExportQueueMemoryPercent = 85ULL;
 constexpr std::uint64_t kHardExportMemoryStopPercent = 92ULL;
+constexpr std::uint32_t kAnimationVelocityBlendSchemaVersion = 19U;
+constexpr std::uint32_t kProjectVelocityBlendMirrorSchemaVersion = 67U;
 constexpr auto kPerformanceInteractionHold = std::chrono::milliseconds{300};
 // These authored features remain serializable and inspectable, but are
 // deliberately excluded from live/export rendering. Their old runtime paths
@@ -26981,8 +26983,7 @@ void ValidateProjectAnimationVelocityLinks(
                 : std::nullopt;
 
         if (saved->sourceSchemaVersion <
-                invisible_places::serialization::
-                    kAnimationDocumentSchemaVersion &&
+                kAnimationVelocityBlendSchemaVersion &&
             saved->velocityBlendLink.has_value()) {
             auto migrated = *saved;
             migrated.sourceSchemaVersion =
@@ -27044,7 +27045,7 @@ void ValidateProjectAnimationVelocityLinks(
     }
 
     if (document.sourceSchemaVersion <
-            invisible_places::serialization::kProjectDocumentSchemaVersion &&
+            kProjectVelocityBlendMirrorSchemaVersion &&
         std::any_of(
             panel.availableFileLoadedPaths.begin(),
             panel.availableFileLoadedPaths.end(),
