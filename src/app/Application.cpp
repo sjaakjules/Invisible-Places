@@ -947,6 +947,14 @@ struct AnimationReciprocalPanWizardState {
     bool anchorPickArmed = false;
     bool reraycastSelectedNode = false;
     bool viewportClickConsumed = false;
+    // Triangle placement may temporarily leave the authored animation camera
+    // to inspect occluded geometry. A short click still places the armed
+    // world-space node; dragging navigates. ShowCanonicalPose exits this mode
+    // and restores the exact stage camera before fitting or advancing.
+    bool orbitInspectionActive = false;
+    bool orbitPickPressActive = false;
+    bool orbitPickDragged = false;
+    ImVec2 orbitPickPressScreen{};
     int selectedTriangleIndex = 0;
     int selectedNodeIndex = 0;
     ManualFlowPathGizmoDragState nodeGizmoDrag{};
@@ -44512,6 +44520,7 @@ void DrawReciprocalPanViewportOverlay(
         runtimeState->camera.Matrices(CurrentAspectRatio(viewport));
     const auto comparison = ResolveReciprocalPanComparisonView(wizard);
     const bool splitComparisonActive =
+        !wizard.orbitInspectionActive &&
         wizard.splitComparisonEnabled && comparison.has_value();
     const auto comparisonMatrices = comparison.has_value()
         ? std::optional{
@@ -44827,6 +44836,7 @@ void DrawReciprocalPanViewportOverlay(
     const auto& io = ImGui::GetIO();
     const bool viewportInteractive =
         wizard.stage != AnimationReciprocalPanWizardStage::Preview &&
+        !wizard.orbitInspectionActive &&
         !wizard.inspectionActive && !wizard.fitInProgress &&
         IsMouseOverRenderViewport(viewport) &&
         !viewport.UiWantsMouseCapture() &&
@@ -45011,7 +45021,9 @@ void DrawReciprocalPanViewportOverlay(
         drawList->AddText(
             ImVec2{origin.x + 18.0F, origin.y + 18.0F},
             IM_COL32(255, 235, 150, 255),
-            wizard.reraycastSelectedNode
+            wizard.orbitInspectionActive
+                ? "Orbit inspection: drag to navigate; short-click to place the armed node"
+            : wizard.reraycastSelectedNode
                 ? "Reciprocal Pan Extension: click to replace the selected triangle node"
             : destinationAnchor
                 ? "Reciprocal Pan Extension: click the matching feature centre (front/side are generated)"
@@ -51782,6 +51794,10 @@ void ShowReciprocalPanWizardCanonicalPose(
         return;
     }
     auto& wizard = runtimeState->animationPanel.reciprocalPanWizard;
+    wizard.orbitInspectionActive = false;
+    wizard.orbitPickPressActive = false;
+    wizard.orbitPickDragged = false;
+    runtimeState->cameraInteraction.trackballOrbitActive = false;
     wizard.inspectionActive = false;
     if (wizard.stage == AnimationReciprocalPanWizardStage::Seam1Review ||
         wizard.stage == AnimationReciprocalPanWizardStage::Seam2Review) {
@@ -54516,6 +54532,49 @@ void DrawReciprocalPanWizard(
         const bool editingCurrentView =
             triangle.pathRole == ReciprocalPanCurrentViewRole(wizard) &&
             !wizard.fitInProgress;
+        if (wizard.orbitInspectionActive) {
+            if (ImGui::Button(
+                    "Return to animation camera",
+                    ImVec2{-FLT_MIN, 0.0F})) {
+                ShowReciprocalPanWizardCanonicalPose(runtimeState);
+                runtimeState->statusMessage =
+                    "Restored the exact animation camera for this A/B stage.";
+            }
+            ImGui::TextWrapped(
+                "Inspection view: left-drag orbits, Shift/secondary-drag pans, and the wheel dollies. A short click still captures the armed node. Press P over the viewport to move the orbit pivot.");
+        } else {
+            if (ImGui::Button(
+                    selectedExists
+                        ? "Orbit around selected node"
+                        : "Orbit to inspect geometry",
+                    ImVec2{-FLT_MIN, 0.0F})) {
+                wizard.orbitInspectionActive = true;
+                wizard.orbitPickPressActive = false;
+                wizard.orbitPickDragged = false;
+                wizard.nodeGizmoDrag = {};
+                wizard.nodeGizmoPointerCaptured = false;
+                wizard.viewportClickConsumed = false;
+                if (selectedExists) {
+                    const auto& selectedPoint = triangle.patch.worldPoints[
+                        static_cast<std::size_t>(
+                            wizard.selectedNodeIndex)];
+                    runtimeState->camera.SetOrbitCenterPreservingView(
+                        glm::vec3{
+                            selectedPoint[0U],
+                            selectedPoint[1U],
+                            selectedPoint[2U]});
+                }
+                runtimeState->pivotOverlay.pivot =
+                    FromGlm(runtimeState->camera.OrbitCenter());
+                runtimeState->pivotOverlay.lastSetAt =
+                    std::chrono::steady_clock::now();
+                runtimeState->previewRenderStateSignatureValid = false;
+                runtimeState->statusMessage =
+                    "Orbit inspection enabled. Navigate freely, short-click to place an armed node, then return to the animation camera.";
+            }
+            ImGui::TextDisabled(
+                "Use orbit inspection to pick hidden geometry without changing the authored A/B camera pose.");
+        }
         ImGui::BeginDisabled(!selectedExists || !editingCurrentView);
         if (ImGui::Button("Re-raycast selected node")) {
             wizard.reraycastSelectedNode = true;
@@ -84293,6 +84352,266 @@ bool CtrlClickMoveSelectedViewportEntity(
     return false;
 }
 
+bool CaptureReciprocalPanWizardNode(
+    PreviewRuntimeState* runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    ImVec2 screenPoint) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+    auto& wizard = runtimeState->animationPanel.reciprocalPanWizard;
+    if (!wizard.Active() || wizard.inspectionActive ||
+        !IsInsideRenderViewport(viewport, screenPoint)) {
+        return false;
+    }
+    const auto patch = ResolveReciprocalPanSurfacePatch(
+        *runtimeState,
+        viewport,
+        screenPoint,
+        wizard.commonSceneKey);
+    if (!patch.has_value()) {
+        wizard.errorMessage =
+            "No pickable point-cloud surface from the shared scene was found within 48 pixels. Try a nearby visible part of the feature.";
+        return true;
+    }
+    const auto viewportSize = CurrentUiViewportSize(viewport);
+    const auto local = ToRenderViewportLocal(viewport, screenPoint);
+    const std::size_t triangleIndex =
+        ReciprocalPanStageTriangleIndex(wizard);
+    if (triangleIndex >= wizard.endpointTriangles.size()) {
+        return false;
+    }
+    auto& observation = wizard.endpointTriangles[triangleIndex];
+    observation.pathRole = ReciprocalPanTrianglePathRole(triangleIndex);
+    observation.frame = ReciprocalPanStageFrame(wizard);
+    observation.normalizedPosition = ReciprocalPanFramePosition(
+        wizard.baselinePaths[
+            static_cast<std::size_t>(observation.pathRole)],
+        observation.frame);
+    const bool replacing = wizard.reraycastSelectedNode ||
+                           observation.patch.pointCount >= 3U;
+    const std::size_t nodeIndex = replacing
+        ? static_cast<std::size_t>(
+              std::clamp(wizard.selectedNodeIndex, 0, 2))
+        : std::min<std::size_t>(observation.patch.pointCount, 2U);
+    const ImVec2 normalizedScreen{
+        std::clamp(
+            local.x / std::max(1.0F, viewportSize.x),
+            0.0F,
+            1.0F),
+        std::clamp(
+            local.y / std::max(1.0F, viewportSize.y),
+            0.0F,
+            1.0F),
+    };
+    const bool generatedDestination =
+        IsReciprocalPanDestinationTriangle(triangleIndex) &&
+        nodeIndex == 0U &&
+        BuildReciprocalPanCameraLocalDestinationTriangle(
+            &wizard,
+            triangleIndex,
+            patch->worldPoints[0U],
+            normalizedScreen);
+    if (!generatedDestination) {
+        SetReciprocalPanTriangleNode(
+            &wizard,
+            triangleIndex,
+            nodeIndex,
+            patch->worldPoints[0U]);
+        observation.patch.pointCount = std::max<std::uint32_t>(
+            observation.patch.pointCount,
+            static_cast<std::uint32_t>(nodeIndex + 1U));
+        observation.normalizedScreens[nodeIndex] = normalizedScreen;
+    }
+    observation.captured = observation.patch.pointCount == 3U;
+    wizard.selectedTriangleIndex = static_cast<int>(triangleIndex);
+    wizard.selectedNodeIndex = generatedDestination
+        ? 0
+        : observation.captured
+            ? static_cast<int>(nodeIndex)
+            : static_cast<int>(observation.patch.pointCount);
+    wizard.selectedNodeIndex = std::clamp(
+        wizard.selectedNodeIndex,
+        0,
+        2);
+    wizard.reraycastSelectedNode = false;
+    wizard.anchorPickArmed = !observation.captured;
+    InvalidateReciprocalPanWizardCandidate(&wizard);
+    if (wizard.stage == AnimationReciprocalPanWizardStage::Seam1Review ||
+        wizard.stage == AnimationReciprocalPanWizardStage::Seam2Review) {
+        RebuildReciprocalPanSeamPreview(
+            runtimeState,
+            wizard.stage ==
+                    AnimationReciprocalPanWizardStage::Seam1Review
+                ? 0U
+                : 1U,
+            CurrentAspectRatio(viewport));
+    }
+    runtimeState->statusMessage = generatedDestination
+        ? "Captured the destination anchor and generated front/side nodes in the destination animation-camera frame."
+        : observation.captured
+            ? "Captured the ordered anchor / front / side triangle."
+            : "Captured triangle node " +
+                  std::to_string(observation.patch.pointCount) +
+                  " of 3.";
+    runtimeState->errorMessage.clear();
+    return true;
+}
+
+void UpdateReciprocalPanOrbitInspectionInput(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    auto& wizard = runtimeState->animationPanel.reciprocalPanWizard;
+    auto& interaction = runtimeState->cameraInteraction;
+    const auto& io = ImGui::GetIO();
+    const bool viewportHovered = IsMouseOverRenderViewport(viewport);
+
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+        viewportHovered && !viewport.UiWantsMouseCapture()) {
+        wizard.orbitPickPressActive = true;
+        wizard.orbitPickDragged = false;
+        wizard.orbitPickPressScreen = io.MousePos;
+    }
+    if (wizard.orbitPickPressActive &&
+        io.MouseDown[ImGuiMouseButton_Left]) {
+        const float dx = io.MousePos.x - wizard.orbitPickPressScreen.x;
+        const float dy = io.MousePos.y - wizard.orbitPickPressScreen.y;
+        if (dx * dx + dy * dy > 16.0F) {
+            wizard.orbitPickDragged = true;
+        }
+    }
+
+    const bool anyMouseDown =
+        io.MouseDown[0] || io.MouseDown[1] || io.MouseDown[2];
+    if (!anyMouseDown) {
+        interaction.renderViewportMouseActive = false;
+    } else if (viewportHovered && !viewport.UiWantsMouseCapture()) {
+        interaction.renderViewportMouseActive = true;
+    }
+    const bool mouseCanNavigate =
+        !viewport.UiWantsMouseCapture() &&
+        (viewportHovered || interaction.renderViewportMouseActive);
+    const bool cloudCompareTrackball =
+        interaction.orbitControlMode ==
+        OrbitControlMode::CloudCompareTrackball;
+    bool navigated = false;
+    if (mouseCanNavigate) {
+        if (viewportHovered && io.MouseWheel != 0.0F) {
+            runtimeState->camera.Dolly(io.MouseWheel);
+            navigated = true;
+        }
+        const bool mouseMoved =
+            io.MouseDelta.x != 0.0F || io.MouseDelta.y != 0.0F;
+        const bool panning = io.MouseDown[1] || io.MouseDown[2] ||
+                             (io.KeyShift && io.MouseDown[0]);
+        if (panning && mouseMoved) {
+            const auto viewportSize = CurrentUiViewportSize(viewport);
+            runtimeState->camera.Pan(
+                io.MouseDelta.x,
+                io.MouseDelta.y,
+                viewportSize.x,
+                viewportSize.y);
+            interaction.trackballOrbitActive = false;
+            navigated = true;
+        } else if (io.MouseDown[0] && wizard.orbitPickDragged &&
+                   mouseMoved) {
+            if (cloudCompareTrackball) {
+                interaction.trackballOrbitActive = true;
+                const auto viewportSize = CurrentUiViewportSize(viewport);
+                const auto viewportOrigin = CurrentUiViewportOrigin();
+                const ImVec2 currentLocal{
+                    io.MousePos.x - viewportOrigin.x,
+                    io.MousePos.y - viewportOrigin.y,
+                };
+                const ImVec2 previousLocal{
+                    currentLocal.x - io.MouseDelta.x,
+                    currentLocal.y - io.MouseDelta.y,
+                };
+                ImVec2 pivotLocal{
+                    viewportSize.x * 0.5F,
+                    viewportSize.y * 0.5F,
+                };
+                const auto matrices = runtimeState->camera.Matrices(
+                    CurrentAspectRatio(viewport));
+                if (const auto projectedPivot = ProjectWorldPoint(
+                        matrices,
+                        viewport,
+                        runtimeState->camera.OrbitCenter());
+                    projectedPivot.has_value()) {
+                    pivotLocal = ImVec2{
+                        projectedPivot->screen.x - viewportOrigin.x,
+                        projectedPivot->screen.y - viewportOrigin.y,
+                    };
+                }
+                runtimeState->camera.OrbitTrackball(
+                    previousLocal.x,
+                    previousLocal.y,
+                    currentLocal.x,
+                    currentLocal.y,
+                    viewportSize.x,
+                    viewportSize.y,
+                    pivotLocal.x,
+                    pivotLocal.y);
+            } else {
+                runtimeState->camera.Orbit(
+                    io.MouseDelta.x,
+                    io.MouseDelta.y);
+            }
+            navigated = true;
+        }
+    }
+
+    if (!io.MouseDown[0]) {
+        interaction.trackballOrbitActive = false;
+    }
+    const bool keyboardCanNavigate =
+        !viewport.UiWantsKeyboardCapture() && IsRenderViewportFocused();
+    if (keyboardCanNavigate && ImGui::IsKeyPressed(ImGuiKey_P)) {
+        const auto pivotPatch = ResolveReciprocalPanSurfacePatch(
+            *runtimeState,
+            viewport,
+            io.MousePos,
+            wizard.commonSceneKey);
+        if (pivotPatch.has_value()) {
+            const auto& point = pivotPatch->worldPoints[0U];
+            runtimeState->camera.SetOrbitCenterPreservingView(
+                glm::vec3{point[0U], point[1U], point[2U]});
+            navigated = true;
+        } else {
+            wizard.errorMessage =
+                "No shared-scene surface was found under the pointer for the orbit pivot.";
+        }
+    }
+
+    const bool releasedClick = wizard.orbitPickPressActive &&
+        ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
+        !wizard.orbitPickDragged && viewportHovered &&
+        !viewport.UiWantsMouseCapture();
+    if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+        wizard.orbitPickPressActive = false;
+        wizard.orbitPickDragged = false;
+    }
+    if (releasedClick && wizard.anchorPickArmed) {
+        CaptureReciprocalPanWizardNode(
+            runtimeState,
+            viewport,
+            io.MousePos);
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (navigated) {
+        interaction.lastNavigationInputAt = now;
+        runtimeState->pivotOverlay.pivot =
+            FromGlm(runtimeState->camera.OrbitCenter());
+        runtimeState->pivotOverlay.lastSetAt = now;
+        runtimeState->previewRenderStateSignatureValid = false;
+    }
+    interaction.navigationActive = navigated ||
+        (interaction.lastNavigationInputAt.time_since_epoch().count() != 0 &&
+         now - interaction.lastNavigationInputAt <
+             std::chrono::milliseconds{180});
+}
+
 void UpdateCameraFromInput(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell& viewport) {
@@ -84305,6 +84624,12 @@ void UpdateCameraFromInput(
     auto& reciprocalWizard =
         runtimeState->animationPanel.reciprocalPanWizard;
     if (reciprocalWizard.Active()) {
+        if (reciprocalWizard.orbitInspectionActive) {
+            UpdateReciprocalPanOrbitInspectionInput(
+                runtimeState,
+                viewport);
+            return;
+        }
         runtimeState->cameraInteraction.navigationActive = false;
         runtimeState->cameraInteraction.trackballOrbitActive = false;
         if (reciprocalWizard.viewportClickConsumed ||
@@ -84326,96 +84651,10 @@ void UpdateCameraFromInput(
         if (!canCapture) {
             return;
         }
-        const auto patch = ResolveReciprocalPanSurfacePatch(
-            *runtimeState,
+        CaptureReciprocalPanWizardNode(
+            runtimeState,
             viewport,
-            input.MousePos,
-            reciprocalWizard.commonSceneKey);
-        if (!patch.has_value()) {
-            reciprocalWizard.errorMessage =
-                "No pickable point-cloud surface from the shared scene was found within 48 pixels. Click a denser visible part of the feature.";
-            return;
-        }
-        const auto viewportSize = CurrentUiViewportSize(viewport);
-        const auto local = ToRenderViewportLocal(viewport, input.MousePos);
-        const std::size_t triangleIndex =
-            ReciprocalPanStageTriangleIndex(reciprocalWizard);
-        if (triangleIndex >= reciprocalWizard.endpointTriangles.size()) {
-            return;
-        }
-        auto& observation =
-            reciprocalWizard.endpointTriangles[triangleIndex];
-        observation.pathRole = ReciprocalPanTrianglePathRole(triangleIndex);
-        observation.frame = ReciprocalPanStageFrame(reciprocalWizard);
-        observation.normalizedPosition = ReciprocalPanFramePosition(
-            reciprocalWizard.baselinePaths[
-                static_cast<std::size_t>(observation.pathRole)],
-            observation.frame);
-        const bool replacing = reciprocalWizard.reraycastSelectedNode ||
-                               editDoubleClick ||
-                               observation.patch.pointCount >= 3U;
-        const std::size_t nodeIndex = replacing
-                                          ? static_cast<std::size_t>(
-                                                std::clamp(
-                                                    reciprocalWizard
-                                                        .selectedNodeIndex,
-                                                    0,
-                                                    2))
-                                          : std::min<std::size_t>(
-                                                observation.patch.pointCount,
-                                                2U);
-        const ImVec2 normalizedScreen{
-            std::clamp(local.x / std::max(1.0F, viewportSize.x),
-                       0.0F,
-                       1.0F),
-            std::clamp(local.y / std::max(1.0F, viewportSize.y),
-                       0.0F,
-                       1.0F)};
-        const bool generatedDestination =
-            IsReciprocalPanDestinationTriangle(triangleIndex) &&
-            nodeIndex == 0U &&
-            BuildReciprocalPanCameraLocalDestinationTriangle(
-                &reciprocalWizard,
-                triangleIndex,
-                patch->worldPoints[0U],
-                normalizedScreen);
-        if (!generatedDestination) {
-            SetReciprocalPanTriangleNode(
-                &reciprocalWizard,
-                triangleIndex,
-                nodeIndex,
-                patch->worldPoints[0U]);
-            observation.patch.pointCount = std::max<std::uint32_t>(
-                observation.patch.pointCount,
-                static_cast<std::uint32_t>(nodeIndex + 1U));
-            observation.normalizedScreens[nodeIndex] = normalizedScreen;
-        }
-        observation.captured = observation.patch.pointCount == 3U;
-        reciprocalWizard.selectedTriangleIndex =
-            static_cast<int>(triangleIndex);
-        reciprocalWizard.selectedNodeIndex = generatedDestination
-                                                   ? 0
-                                             : observation.captured
-                                                   ? static_cast<int>(nodeIndex)
-                                                   : static_cast<int>(
-                                                         observation.patch
-                                                             .pointCount);
-        reciprocalWizard.selectedNodeIndex = std::clamp(
-            reciprocalWizard.selectedNodeIndex,
-            0,
-            2);
-        reciprocalWizard.reraycastSelectedNode = false;
-        reciprocalWizard.anchorPickArmed = !observation.captured;
-        InvalidateReciprocalPanWizardCandidate(&reciprocalWizard);
-        runtimeState->statusMessage =
-            generatedDestination
-                ? "Captured the destination anchor and generated front/side nodes in the destination camera frame. Use Next, or adjust any node first."
-            : observation.captured
-                ? "Captured the ordered anchor / front / side triangle. Use Next, or select a node to replace or move it."
-                : "Captured triangle node " +
-                      std::to_string(observation.patch.pointCount) +
-                      " of 3.";
-        runtimeState->errorMessage.clear();
+            input.MousePos);
         return;
     }
 
@@ -98297,7 +98536,8 @@ int Application::Run(ApplicationRunOptions options) const {
                 if (reciprocalPanWizardActive) {
                     auto& wizard = runtimeState.animationPanel
                         .reciprocalPanWizard;
-                    if (wizard.splitComparisonEnabled) {
+                    if (wizard.splitComparisonEnabled &&
+                        !wizard.orbitInspectionActive) {
                         comparison = ResolveReciprocalPanComparisonView(
                             wizard);
                     }

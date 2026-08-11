@@ -175,8 +175,12 @@ so A, B, and the project save or discard as one transaction.
 #### FR-CAM-18
 Before fitting, the assistant shall let the user flip between A and B, select
 any of the three correspondence nodes, re-raycast it from the viewport, and
-move it with a world-axis gizmo. Candidate fitting shall not begin until both
-ordered endpoint triangles and both seam spans are defined.
+move it with a world-axis gizmo. Triangle stages shall also provide a temporary
+orbit-inspection view: drag navigation may leave the authored perspective, a
+short click shall still capture the armed world-space node, and an explicit
+Return action shall restore the exact animation camera for that stage. The
+temporary view shall never alter either animation pose. Candidate fitting shall
+not begin until both ordered endpoint triangles and both seam spans are defined.
 
 #### FR-CAM-19
 Each fitted-seam review shall offer a two-camera A/B split. Its horizontal
