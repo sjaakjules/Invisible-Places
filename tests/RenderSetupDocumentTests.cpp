@@ -240,6 +240,10 @@ RenderSetupDocument MakeRenderSetup() {
     emitter.name = "Cliff source";
     emitter.strength = 0.72F;
     document.authoredWater.emitters.push_back(emitter);
+    document.authoredWater.seepageNodeSettingsProfiles.push_back({
+        .name = "Cliff footprint",
+        .settings = {.widthMeters = 0.72F},
+    });
     document.authoredWater.rainSettings.rainLevel = 0.63F;
     document.authoredWater.pathCache = invisible_places::water::WaterPathCache{};
     invisible_places::serialization::WaterRippleRuntimeCacheDocument cache;
@@ -375,6 +379,11 @@ TEST_CASE(
               .effectParameterKeys.size() == 2U);
     REQUIRE(loaded->authoredWater.emitters.size() == 1U);
     CHECK(loaded->authoredWater.emitters.front().strength == Approx(0.72F));
+    REQUIRE(loaded->authoredWater.seepageNodeSettingsProfiles.size() == 1U);
+    CHECK(loaded->authoredWater.seepageNodeSettingsProfiles.front().name ==
+          "Cliff footprint");
+    CHECK(loaded->authoredWater.seepageNodeSettingsProfiles.front()
+              .settings.widthMeters == Approx(0.72F));
     CHECK_FALSE(loaded->authoredWater.pathCache.has_value());
     CHECK(loaded->authoredWater.rippleRuntimeCaches.empty());
     CHECK(loaded->waterAnimationTrailSettings.particleDensity == Approx(2.5F));

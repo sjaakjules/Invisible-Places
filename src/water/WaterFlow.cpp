@@ -9654,6 +9654,54 @@ WaterSeepageLookSettings ResolveWaterSeepageLook(
         node.responseProfileName);
 }
 
+WaterSeepageNodeSettings ExtractWaterSeepageNodeSettings(
+    const WaterSeepageNode& node) {
+    return {
+        .widthMeters = node.widthMeters,
+        .prominence = node.prominence,
+        .selectionReachLimitMeters = node.selectionReachLimitMeters,
+        .selectionWidthLimitMeters = node.selectionWidthLimitMeters,
+        .edgeFeatherMeters = node.edgeFeatherMeters,
+        .depthToleranceMeters = node.depthToleranceMeters,
+        .normalAlignment = node.normalAlignment,
+        .strength = node.strength,
+        .rainDelaySeconds = node.rainDelaySeconds,
+        .rainRiseSeconds = node.rainRiseSeconds,
+        .rainRecessionSeconds = node.rainRecessionSeconds,
+        .targetSceneRoles = node.targetSceneRoles,
+    };
+}
+
+void ApplyWaterSeepageNodeSettings(
+    const WaterSeepageNodeSettings& settings,
+    WaterSeepageNode* node) {
+    if (node == nullptr) {
+        return;
+    }
+    node->widthMeters = std::max(0.0F, settings.widthMeters);
+    // Keep the legacy width aliases coherent for cache-less fallback paths.
+    node->startWidthMeters = node->widthMeters;
+    node->endWidthMeters = node->widthMeters;
+    node->prominence = std::max(0.0F, settings.prominence);
+    node->selectionReachLimitMeters =
+        std::max(0.05F, settings.selectionReachLimitMeters);
+    node->selectionWidthLimitMeters = std::max(
+        node->widthMeters,
+        settings.selectionWidthLimitMeters);
+    node->edgeFeatherMeters = std::max(0.0F, settings.edgeFeatherMeters);
+    node->depthToleranceMeters =
+        std::max(0.005F, settings.depthToleranceMeters);
+    node->normalAlignment = std::clamp(settings.normalAlignment, 0.0F, 1.0F);
+    node->strength = std::max(0.0F, settings.strength);
+    node->rainDelaySeconds =
+        std::clamp(settings.rainDelaySeconds, 0.0F, 86'400.0F);
+    node->rainRiseSeconds =
+        std::clamp(settings.rainRiseSeconds, 0.0F, 86'400.0F);
+    node->rainRecessionSeconds =
+        std::clamp(settings.rainRecessionSeconds, 0.0F, 86'400.0F);
+    node->targetSceneRoles = settings.targetSceneRoles;
+}
+
 WaterSeepageLookSettings ResolveWaterSeepageTimingLookBase(
     const WaterSeepageLookSettings& resolvedAuthoredLook,
     const std::optional<WaterScenarioState>& /*scenarioState*/) {

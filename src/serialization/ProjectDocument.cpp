@@ -124,6 +124,8 @@ using invisible_places::water::WaterSeepageLookSettings;
 using invisible_places::water::WaterSeepageNode;
 using invisible_places::water::WaterSeepageNodeAnimationState;
 using invisible_places::water::WaterSeepageNodeKey;
+using invisible_places::water::WaterSeepageNodeSettings;
+using invisible_places::water::WaterSeepageNodeSettingsProfile;
 using invisible_places::water::WaterSeepageNodeTrack;
 using invisible_places::water::WaterSeepagePattern;
 using invisible_places::water::WaterSeepageQuality;
@@ -145,6 +147,8 @@ constexpr std::uint32_t kManualFlowSurfaceGuideSourcesSchemaVersion = 16U;
 constexpr std::uint32_t kSmoothVelocityProjectSchemaVersion = 61U;
 constexpr std::uint32_t kTrackDefaultInterpolationProjectSchemaVersion = 71U;
 constexpr std::uint32_t kTrackDefaultInterpolationSourcesSchemaVersion = 26U;
+constexpr std::uint32_t kSeepageNodeSettingsProjectSchemaVersion = 72U;
+constexpr std::uint32_t kSeepageNodeSettingsSourcesSchemaVersion = 27U;
 constexpr std::uint32_t kRelativePalettePhaseProjectSchemaVersion = 62U;
 constexpr std::uint32_t kFieldMapBoundsMemoryProjectSchemaVersion = 63U;
 constexpr std::uint32_t kShorelineInstancesProjectSchemaVersion = 64U;
@@ -166,6 +170,12 @@ static_assert(
 static_assert(
     kWaterSourcesDocumentSchemaVersion >=
     kWaterOwnedShorelineSourcesSchemaVersion);
+static_assert(
+    kProjectDocumentSchemaVersion >=
+    kSeepageNodeSettingsProjectSchemaVersion);
+static_assert(
+    kWaterSourcesDocumentSchemaVersion >=
+    kSeepageNodeSettingsSourcesSchemaVersion);
 
 constexpr std::string_view kProjectVisualEditedSuffix = "_edited";
 constexpr std::string_view kProjectVisualLegacyEditedSuffix = "_Edited";
@@ -3818,6 +3828,111 @@ json SerializeWaterSeepageLookProfile(const WaterSeepageLookProfile& profile) {
     return profileJson;
 }
 
+json SerializeWaterSeepageNodeSettings(
+    const WaterSeepageNodeSettings& settings) {
+    return {
+        {"width_meters", settings.widthMeters},
+        {"prominence", settings.prominence},
+        {"selection_reach_limit_meters",
+         settings.selectionReachLimitMeters},
+        {"selection_width_limit_meters",
+         settings.selectionWidthLimitMeters},
+        {"edge_feather_meters", settings.edgeFeatherMeters},
+        {"depth_tolerance_meters", settings.depthToleranceMeters},
+        {"normal_alignment", settings.normalAlignment},
+        {"strength", settings.strength},
+        {"rain_delay_seconds", settings.rainDelaySeconds},
+        {"rain_rise_seconds", settings.rainRiseSeconds},
+        {"rain_recession_seconds", settings.rainRecessionSeconds},
+        {"target_scene_roles", settings.targetSceneRoles},
+    };
+}
+
+WaterSeepageNodeSettings ParseWaterSeepageNodeSettings(
+    const json& settingsJson) {
+    WaterSeepageNodeSettings settings;
+    settings.widthMeters = std::max(
+        0.0F,
+        settingsJson.value("width_meters", settings.widthMeters));
+    settings.prominence = std::max(
+        0.0F,
+        settingsJson.value("prominence", settings.prominence));
+    settings.selectionReachLimitMeters = std::max(
+        0.05F,
+        settingsJson.value(
+            "selection_reach_limit_meters",
+            settings.selectionReachLimitMeters));
+    settings.selectionWidthLimitMeters = std::max(
+        settings.widthMeters,
+        settingsJson.value(
+            "selection_width_limit_meters",
+            settings.selectionWidthLimitMeters));
+    settings.edgeFeatherMeters = std::max(
+        0.0F,
+        settingsJson.value(
+            "edge_feather_meters",
+            settings.edgeFeatherMeters));
+    settings.depthToleranceMeters = std::max(
+        0.005F,
+        settingsJson.value(
+            "depth_tolerance_meters",
+            settings.depthToleranceMeters));
+    settings.normalAlignment = std::clamp(
+        settingsJson.value("normal_alignment", settings.normalAlignment),
+        0.0F,
+        1.0F);
+    settings.strength = std::max(
+        0.0F,
+        settingsJson.value("strength", settings.strength));
+    settings.rainDelaySeconds = std::clamp(
+        settingsJson.value(
+            "rain_delay_seconds",
+            settings.rainDelaySeconds),
+        0.0F,
+        86'400.0F);
+    settings.rainRiseSeconds = std::clamp(
+        settingsJson.value(
+            "rain_rise_seconds",
+            settings.rainRiseSeconds),
+        0.0F,
+        86'400.0F);
+    settings.rainRecessionSeconds = std::clamp(
+        settingsJson.value(
+            "rain_recession_seconds",
+            settings.rainRecessionSeconds),
+        0.0F,
+        86'400.0F);
+    if (settingsJson.contains("target_scene_roles") &&
+        settingsJson.at("target_scene_roles").is_array()) {
+        settings.targetSceneRoles =
+            settingsJson.at("target_scene_roles")
+                .get<std::vector<std::string>>();
+    }
+    return settings;
+}
+
+json SerializeWaterSeepageNodeSettingsProfile(
+    const WaterSeepageNodeSettingsProfile& profile) {
+    json profileJson{
+        {"name", profile.name},
+        {"settings", SerializeWaterSeepageNodeSettings(profile.settings)},
+    };
+    SerializeWaterProfileObjectCopyFields(profile, &profileJson);
+    return profileJson;
+}
+
+WaterSeepageNodeSettingsProfile ParseWaterSeepageNodeSettingsProfile(
+    const json& profileJson) {
+    WaterSeepageNodeSettingsProfile profile;
+    profile.name = profileJson.value("name", profile.name);
+    if (profileJson.contains("settings")) {
+        profile.settings =
+            ParseWaterSeepageNodeSettings(profileJson.at("settings"));
+    }
+    ParseWaterProfileObjectCopyFields(profileJson, &profile);
+    return profile;
+}
+
 WaterSeepageLookProfile ParseWaterSeepageLookProfile(const json& profileJson) {
     WaterSeepageLookProfile profile;
     profile.name = profileJson.value("name", profile.name);
@@ -5585,6 +5700,7 @@ json SerializeWaterSeepageNode(const WaterSeepageNode& node) {
         {"enabled_in_viewport", node.enabledInViewport},
         {"enabled_in_export", node.enabledInExport},
         {"target_scene_roles", node.targetSceneRoles},
+        {"settings_profile_name", node.settingsProfileName},
         {"look_profile_name", node.lookProfileName},
         {"response_profile_name", node.responseProfileName},
     };
@@ -5663,6 +5779,11 @@ WaterSeepageNode ParseWaterSeepageNode(const json& nodeJson) {
     if (nodeJson.contains("target_scene_roles") && nodeJson.at("target_scene_roles").is_array()) {
         node.targetSceneRoles = nodeJson.at("target_scene_roles").get<std::vector<std::string>>();
     }
+    // Empty marks a pre-node-profile document. The app materializes a
+    // node-owned profile from these already-parsed fields so migration never
+    // changes the authored footprint or Rain response.
+    node.settingsProfileName =
+        nodeJson.value("settings_profile_name", std::string{});
     node.lookProfileName = nodeJson.value("look_profile_name", node.lookProfileName);
     // Empty means "unset" so the app-side migration can pair nodes from
     // pre-split documents with the response derived from their look profile.
@@ -9157,6 +9278,10 @@ bool SaveProjectDocument(
         {"water_caustic_look_settings", SerializeWaterCausticLookSettings(document.waterCausticLookSettings)},
         {"water_seepage_nodes", json::array()},
         {"water_shoreline_profiles", json::array()},
+        {"water_seepage_default_node_settings",
+         SerializeWaterSeepageNodeSettings(
+             document.waterSeepageDefaultNodeSettings)},
+        {"water_seepage_node_settings_profiles", json::array()},
         {"water_seepage_default_look", SerializeWaterSeepageLookSettings(document.waterSeepageDefaultLook)},
         {"water_seepage_look_profiles", json::array()},
         {"water_seepage_response_profiles", json::array()},
@@ -9244,6 +9369,10 @@ bool SaveProjectDocument(
     for (const auto& profile : document.waterShorelineProfiles) {
         projectJson["water_shoreline_profiles"].push_back(
             SerializePointCloudShorelineWaveProfile(profile));
+    }
+    for (const auto& profile : document.waterSeepageNodeSettingsProfiles) {
+        projectJson["water_seepage_node_settings_profiles"].push_back(
+            SerializeWaterSeepageNodeSettingsProfile(profile));
     }
     if (!document.waterShorelineInstances.empty()) {
         auto& instancesJson = projectJson["water_shoreline_instances"];
@@ -9551,6 +9680,19 @@ std::optional<ProjectDocument> LoadProjectDocument(
     document.nextWaterShorelineInstanceId = projectJson->value(
         "next_water_shoreline_instance_id",
         document.nextWaterShorelineInstanceId);
+    if (projectJson->contains("water_seepage_default_node_settings")) {
+        document.waterSeepageDefaultNodeSettings =
+            ParseWaterSeepageNodeSettings(
+                projectJson->at("water_seepage_default_node_settings"));
+    }
+    if (projectJson->contains("water_seepage_node_settings_profiles") &&
+        projectJson->at("water_seepage_node_settings_profiles").is_array()) {
+        for (const auto& profileJson :
+             projectJson->at("water_seepage_node_settings_profiles")) {
+            document.waterSeepageNodeSettingsProfiles.push_back(
+                ParseWaterSeepageNodeSettingsProfile(profileJson));
+        }
+    }
     if (projectJson->contains("water_seepage_default_look")) {
         document.waterSeepageDefaultLook =
             ParseWaterSeepageLookSettings(projectJson->at("water_seepage_default_look"));
@@ -10136,6 +10278,10 @@ nlohmann::json WaterSourcesDocumentToJson(
         {"water_manual_flow_paths", json::array()},
         {"water_seepage_nodes", json::array()},
         {"water_shoreline_profiles", json::array()},
+        {"water_seepage_default_node_settings",
+         SerializeWaterSeepageNodeSettings(
+             document.seepageDefaultNodeSettings)},
+        {"water_seepage_node_settings_profiles", json::array()},
         {"water_seepage_default_look", SerializeWaterSeepageLookSettings(document.seepageDefaultLook)},
         {"water_seepage_look_profiles", json::array()},
         {"water_seepage_response_profiles", json::array()},
@@ -10190,6 +10336,10 @@ nlohmann::json WaterSourcesDocumentToJson(
     for (const auto& profile : document.shorelineProfiles) {
         sourcesJson["water_shoreline_profiles"].push_back(
             SerializePointCloudShorelineWaveProfile(profile));
+    }
+    for (const auto& profile : document.seepageNodeSettingsProfiles) {
+        sourcesJson["water_seepage_node_settings_profiles"].push_back(
+            SerializeWaterSeepageNodeSettingsProfile(profile));
     }
     if (!document.shorelineInstances.empty()) {
         auto& instancesJson = sourcesJson["water_shoreline_instances"];
@@ -10310,6 +10460,19 @@ static WaterSourcesDocument ParseWaterSourcesDocumentJsonValue(
     document.nextShorelineInstanceId = sourcesJson->value(
         "next_water_shoreline_instance_id",
         document.nextShorelineInstanceId);
+    if (sourcesJson->contains("water_seepage_default_node_settings")) {
+        document.seepageDefaultNodeSettings =
+            ParseWaterSeepageNodeSettings(
+                sourcesJson->at("water_seepage_default_node_settings"));
+    }
+    if (sourcesJson->contains("water_seepage_node_settings_profiles") &&
+        sourcesJson->at("water_seepage_node_settings_profiles").is_array()) {
+        for (const auto& profileJson :
+             sourcesJson->at("water_seepage_node_settings_profiles")) {
+            document.seepageNodeSettingsProfiles.push_back(
+                ParseWaterSeepageNodeSettingsProfile(profileJson));
+        }
+    }
     if (sourcesJson->contains("water_seepage_default_look")) {
         document.seepageDefaultLook =
             ParseWaterSeepageLookSettings(sourcesJson->at("water_seepage_default_look"));

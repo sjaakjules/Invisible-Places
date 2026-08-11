@@ -17,6 +17,8 @@ using invisible_places::water::WaterEffectBlendMode;
 using invisible_places::water::WaterSeepageLookProfile;
 using invisible_places::water::WaterSeepageLookSettings;
 using invisible_places::water::WaterSeepageNode;
+using invisible_places::water::WaterSeepageNodeSettings;
+using invisible_places::water::WaterSeepageNodeSettingsProfile;
 using invisible_places::water::WaterSeepagePattern;
 using invisible_places::water::WaterSeepageQuality;
 
@@ -161,6 +163,7 @@ WaterSeepageNode MakeNode() {
     node.enabledInViewport = false;
     node.enabledInExport = true;
     node.targetSceneRoles = {"ROCK", "VEG"};
+    node.settingsProfileName = "Cliff footprint";
     node.lookProfileName = "Rain-darkened cliff";
     node.responseProfileName = "Strong response";
     return node;
@@ -197,11 +200,54 @@ void CheckNode(const WaterSeepageNode& actual, const WaterSeepageNode& expected)
     CHECK(actual.enabledInViewport == expected.enabledInViewport);
     CHECK(actual.enabledInExport == expected.enabledInExport);
     CHECK(actual.targetSceneRoles == expected.targetSceneRoles);
+    CHECK(actual.settingsProfileName == expected.settingsProfileName);
     CHECK(actual.lookProfileName == expected.lookProfileName);
     CHECK(actual.responseProfileName == expected.responseProfileName);
     // Legacy per-node overrides are migration-only inputs and never persist.
     CHECK_FALSE(actual.lookOverride.has_value());
     CHECK_FALSE(actual.tempLookOverride.has_value());
+}
+
+WaterSeepageNodeSettings MakeNodeSettings(float offset = 0.0F) {
+    WaterSeepageNodeSettings settings;
+    settings.widthMeters = 0.31F + offset;
+    settings.prominence = 1.21F + offset;
+    settings.selectionReachLimitMeters = 4.2F + offset;
+    settings.selectionWidthLimitMeters = 1.8F + offset;
+    settings.edgeFeatherMeters = 0.17F + offset;
+    settings.depthToleranceMeters = 0.28F + offset;
+    settings.normalAlignment = 0.63F + offset;
+    settings.strength = 1.47F + offset;
+    settings.rainDelaySeconds = 2.0F + offset;
+    settings.rainRiseSeconds = 7.0F + offset;
+    settings.rainRecessionSeconds = 19.0F + offset;
+    settings.targetSceneRoles = {"ROCK", "SAND"};
+    return settings;
+}
+
+void CheckNodeSettings(
+    const WaterSeepageNodeSettings& actual,
+    const WaterSeepageNodeSettings& expected) {
+    CHECK(actual.widthMeters == Catch::Approx(expected.widthMeters));
+    CHECK(actual.prominence == Catch::Approx(expected.prominence));
+    CHECK(
+        actual.selectionReachLimitMeters ==
+        Catch::Approx(expected.selectionReachLimitMeters));
+    CHECK(
+        actual.selectionWidthLimitMeters ==
+        Catch::Approx(expected.selectionWidthLimitMeters));
+    CHECK(actual.edgeFeatherMeters == Catch::Approx(expected.edgeFeatherMeters));
+    CHECK(
+        actual.depthToleranceMeters ==
+        Catch::Approx(expected.depthToleranceMeters));
+    CHECK(actual.normalAlignment == Catch::Approx(expected.normalAlignment));
+    CHECK(actual.strength == Catch::Approx(expected.strength));
+    CHECK(actual.rainDelaySeconds == Catch::Approx(expected.rainDelaySeconds));
+    CHECK(actual.rainRiseSeconds == Catch::Approx(expected.rainRiseSeconds));
+    CHECK(
+        actual.rainRecessionSeconds ==
+        Catch::Approx(expected.rainRecessionSeconds));
+    CHECK(actual.targetSceneRoles == expected.targetSceneRoles);
 }
 
 std::string ReadTextFile(const std::filesystem::path& path) {
@@ -213,9 +259,41 @@ std::string ReadTextFile(const std::filesystem::path& path) {
 
 }  // namespace
 
+TEST_CASE(
+    "Seepage Node Settings profiles leave Node Info and variation identity untouched",
+    "[water][seepage][profiles][node-settings]") {
+    auto node = MakeNode();
+    const auto originalName = node.name;
+    const auto originalPosition = node.position;
+    const auto originalSeed = node.seed;
+    const auto originalViewportVisibility = node.enabledInViewport;
+    const auto originalExportVisibility = node.enabledInExport;
+
+    const auto settings = MakeNodeSettings(0.07F);
+    invisible_places::water::ApplyWaterSeepageNodeSettings(settings, &node);
+
+    CheckNodeSettings(
+        invisible_places::water::ExtractWaterSeepageNodeSettings(node),
+        settings);
+    CHECK(node.name == originalName);
+    CHECK(node.position.x == Catch::Approx(originalPosition.x));
+    CHECK(node.position.y == Catch::Approx(originalPosition.y));
+    CHECK(node.position.z == Catch::Approx(originalPosition.z));
+    CHECK(node.seed == originalSeed);
+    CHECK(node.enabledInViewport == originalViewportVisibility);
+    CHECK(node.enabledInExport == originalExportVisibility);
+}
+
 TEST_CASE("Project documents round-trip Seepage nodes and shared looks", "[water][seepage][serialization]") {
     ProjectDocument document;
     document.projectName = "Seepage serialization";
+    document.waterSeepageDefaultNodeSettings = MakeNodeSettings(0.0F);
+    const WaterSeepageNodeSettingsProfile nodeSettingsProfile{
+        .name = "Cliff footprint",
+        .settings = MakeNodeSettings(0.03F),
+    };
+    document.waterSeepageNodeSettingsProfiles.push_back(
+        nodeSettingsProfile);
     document.waterSeepageDefaultLook =
         MakeLook(WaterSeepageQuality::Auto, 0.0F, WaterEffectBlendMode::Max);
     const WaterSeepageLookProfile profile{
@@ -277,6 +355,12 @@ TEST_CASE("Project documents round-trip Seepage nodes and shared looks", "[water
               std::to_string(invisible_places::serialization::kProjectDocumentSchemaVersion)) !=
           std::string::npos);
     CHECK(savedJson.find("\"water_seepage_nodes\"") != std::string::npos);
+    CHECK(savedJson.find("\"water_seepage_default_node_settings\"") !=
+          std::string::npos);
+    CHECK(savedJson.find("\"water_seepage_node_settings_profiles\"") !=
+          std::string::npos);
+    CHECK(savedJson.find("\"settings_profile_name\": \"Cliff footprint\"") !=
+          std::string::npos);
     CHECK(savedJson.find("\"water_seepage_default_look\"") != std::string::npos);
     CHECK(savedJson.find("\"water_seepage_look_profiles\"") != std::string::npos);
     CHECK(savedJson.find("\"water_seepage_response_profiles\"") != std::string::npos);
@@ -307,6 +391,16 @@ TEST_CASE("Project documents round-trip Seepage nodes and shared looks", "[water
         invisible_places::serialization::LoadProjectDocument(outputPath, &errorMessage);
     REQUIRE(loaded.has_value());
     CHECK(loaded->schemaVersion == invisible_places::serialization::kProjectDocumentSchemaVersion);
+    CheckNodeSettings(
+        loaded->waterSeepageDefaultNodeSettings,
+        document.waterSeepageDefaultNodeSettings);
+    REQUIRE(loaded->waterSeepageNodeSettingsProfiles.size() == 1U);
+    CHECK(
+        loaded->waterSeepageNodeSettingsProfiles.front().name ==
+        nodeSettingsProfile.name);
+    CheckNodeSettings(
+        loaded->waterSeepageNodeSettingsProfiles.front().settings,
+        nodeSettingsProfile.settings);
     CheckLook(loaded->waterSeepageDefaultLook, document.waterSeepageDefaultLook);
     REQUIRE(loaded->waterSeepageLookProfiles.size() == 4U);
     CHECK(loaded->waterSeepageLookProfiles.front().name == profile.name);
@@ -344,6 +438,12 @@ TEST_CASE("Project documents round-trip Seepage nodes and shared looks", "[water
 
 TEST_CASE("Water source documents round-trip Seepage state", "[water][seepage][serialization]") {
     WaterSourcesDocument document;
+    document.seepageDefaultNodeSettings = MakeNodeSettings(0.01F);
+    const WaterSeepageNodeSettingsProfile nodeSettingsProfile{
+        .name = "Cliff footprint",
+        .settings = MakeNodeSettings(0.04F),
+    };
+    document.seepageNodeSettingsProfiles.push_back(nodeSettingsProfile);
     document.seepageDefaultLook =
         MakeLook(WaterSeepageQuality::High, 0.04F, WaterEffectBlendMode::Add);
     const WaterSeepageLookProfile profile{
@@ -368,6 +468,10 @@ TEST_CASE("Water source documents round-trip Seepage state", "[water][seepage][s
               std::to_string(invisible_places::serialization::kWaterSourcesDocumentSchemaVersion)) !=
           std::string::npos);
     CHECK(savedJson.find("\"water_seepage_nodes\"") != std::string::npos);
+    CHECK(savedJson.find("\"water_seepage_default_node_settings\"") !=
+          std::string::npos);
+    CHECK(savedJson.find("\"water_seepage_node_settings_profiles\"") !=
+          std::string::npos);
     CHECK(savedJson.find("\"water_seepage_default_look\"") != std::string::npos);
     CHECK(savedJson.find("\"water_seepage_look_profiles\"") != std::string::npos);
 
@@ -375,6 +479,15 @@ TEST_CASE("Water source documents round-trip Seepage state", "[water][seepage][s
         invisible_places::serialization::LoadWaterSourcesDocument(outputPath, &errorMessage);
     REQUIRE(loaded.has_value());
     CHECK(loaded->schemaVersion == invisible_places::serialization::kWaterSourcesDocumentSchemaVersion);
+    CheckNodeSettings(
+        loaded->seepageDefaultNodeSettings,
+        document.seepageDefaultNodeSettings);
+    REQUIRE(loaded->seepageNodeSettingsProfiles.size() == 1U);
+    CHECK(loaded->seepageNodeSettingsProfiles.front().name ==
+          nodeSettingsProfile.name);
+    CheckNodeSettings(
+        loaded->seepageNodeSettingsProfiles.front().settings,
+        nodeSettingsProfile.settings);
     CheckLook(loaded->seepageDefaultLook, document.seepageDefaultLook);
     REQUIRE(loaded->seepageLookProfiles.size() == 1U);
     CHECK(loaded->seepageLookProfiles.front().name == profile.name);

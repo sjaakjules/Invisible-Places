@@ -1,5 +1,5 @@
 {
-  "schema_version": 26,
+  "schema_version": 27,
   "fixture_metadata": {
     "scene_group": "SampleScene",
     "display_spacing_micrometres": 3000,
@@ -1893,6 +1893,7 @@
       ],
       "reach_meters": 1.25,
       "seed": 2654435761,
+      "settings_profile_name": "Default_SampleSeepage",
       "strength": 1.0,
       "surface_normal": [
         -0.9592431783676147,
@@ -1907,6 +1908,48 @@
       "prominence": 1.0,
       "selection_reach_limit_meters": 2.34375,
       "selection_width_limit_meters": 1.215
+    }
+  ],
+  "water_seepage_default_node_settings": {
+    "width_meters": 0.10000000149011612,
+    "prominence": 1.0,
+    "selection_reach_limit_meters": 2.34375,
+    "selection_width_limit_meters": 1.215,
+    "edge_feather_meters": 0.10000000149011612,
+    "depth_tolerance_meters": 0.15000000596046448,
+    "normal_alignment": 0.20000000298023224,
+    "strength": 1.0,
+    "rain_delay_seconds": 0.0,
+    "rain_rise_seconds": 0.0,
+    "rain_recession_seconds": 0.0,
+    "target_scene_roles": [
+      "ROCK",
+      "VEG"
+    ]
+  },
+  "water_seepage_node_settings_profiles": [
+    {
+      "name": "Default_SampleSeepage",
+      "settings": {
+        "width_meters": 0.75,
+        "prominence": 1.0,
+        "selection_reach_limit_meters": 2.34375,
+        "selection_width_limit_meters": 1.215,
+        "edge_feather_meters": 0.10000000149011612,
+        "depth_tolerance_meters": 0.15000000596046448,
+        "normal_alignment": 0.20000000298023224,
+        "strength": 1.0,
+        "rain_delay_seconds": 0.0,
+        "rain_rise_seconds": 0.0,
+        "rain_recession_seconds": 0.0,
+        "target_scene_roles": [
+          "ROCK",
+          "VEG"
+        ]
+      },
+      "object_override": true,
+      "owner_object_id": 1,
+      "base_profile_name": "Default"
     }
   ],
   "water_seepage_default_look": {

@@ -2225,6 +2225,16 @@ TEST_CASE("SampleScene authored water fixture is current, canonical, and cache f
   CHECK(seepage.prominence == Catch::Approx(1.0F));
   CHECK(seepage.selectionReachLimitMeters == Catch::Approx(2.34375F));
   CHECK(seepage.selectionWidthLimitMeters == Catch::Approx(1.215F));
+  CHECK(seepage.settingsProfileName == "Default_SampleSeepage");
+  REQUIRE(fixture->seepageNodeSettingsProfiles.size() == 1U);
+  const auto &seepageSettingsProfile =
+      fixture->seepageNodeSettingsProfiles.front();
+  CHECK(seepageSettingsProfile.name == seepage.settingsProfileName);
+  CHECK(seepageSettingsProfile.objectOverride);
+  CHECK(seepageSettingsProfile.ownerObjectId == seepage.id);
+  CHECK(seepageSettingsProfile.baseProfileName == "Default");
+  CHECK(seepageSettingsProfile.settings.widthMeters ==
+        Catch::Approx(seepage.widthMeters));
 
   const auto niceFlow = std::find_if(
       fixture->laneProfiles.begin(), fixture->laneProfiles.end(),
@@ -2260,6 +2270,28 @@ TEST_CASE("SampleScene authored water fixture is current, canonical, and cache f
       roundTripSeepage.at("selection_width_limit_meters").get<float>() ==
       Catch::Approx(
           fixtureSeepage.at("selection_width_limit_meters").get<float>()));
+  CHECK(roundTripSeepage.at("settings_profile_name") ==
+        fixtureSeepage.at("settings_profile_name"));
+  CHECK(
+      roundTripJson.at("water_seepage_default_node_settings")
+          .at("width_meters")
+          .get<float>() ==
+      Catch::Approx(
+          fixtureJson.at("water_seepage_default_node_settings")
+              .at("width_meters")
+              .get<float>()));
+  REQUIRE(roundTripJson.at("water_seepage_node_settings_profiles").size() ==
+          1U);
+  const auto &roundTripSettingsProfile =
+      roundTripJson.at("water_seepage_node_settings_profiles").front();
+  CHECK(roundTripSettingsProfile.at("name") ==
+        fixtureJson.at("water_seepage_node_settings_profiles")
+            .front()
+            .at("name"));
+  CHECK(roundTripSettingsProfile.at("settings")
+            .at("width_meters")
+            .get<float>() ==
+        Catch::Approx(fixtureSeepage.at("width_meters").get<float>()));
   CHECK(roundTripJson.at("water_path_profiles") ==
         fixtureJson.at("water_path_profiles"));
   CHECK(roundTripJson.at("water_lane_profiles") ==
@@ -3335,6 +3367,7 @@ TEST_CASE("Flow profile object copies round-trip owner metadata",
   using invisible_places::serialization::WaterSourcesDocument;
   using invisible_places::serialization::WaterTrailProfileDocument;
   using invisible_places::water::WaterSeepageLookProfile;
+  using invisible_places::water::WaterSeepageNodeSettingsProfile;
   using invisible_places::water::WaterSeepageResponseProfile;
 
   WaterPathProfileDocument basePath;
@@ -3372,6 +3405,14 @@ TEST_CASE("Flow profile object copies round-trip owner metadata",
   nodeLook.ownerObjectId = 3U;
   nodeLook.baseProfileName = "Mossy";
 
+  WaterSeepageNodeSettingsProfile nodeSettings;
+  nodeSettings.name = "Wide_Default_Seep 3";
+  nodeSettings.settings.widthMeters = 0.73F;
+  nodeSettings.settings.strength = 1.62F;
+  nodeSettings.objectOverride = true;
+  nodeSettings.ownerObjectId = 3U;
+  nodeSettings.baseProfileName = "Wide Default";
+
   WaterSeepageResponseProfile nodeResponse;
   nodeResponse.name = "Standard_Seep 3";
   nodeResponse.response.intensity = 1.31F;
@@ -3384,6 +3425,7 @@ TEST_CASE("Flow profile object copies round-trip owner metadata",
   project.waterPathProfiles = {basePath, springPath};
   project.waterLaneProfiles = {creekLanes};
   project.waterTrailProfiles = {springTrail};
+  project.waterSeepageNodeSettingsProfiles = {nodeSettings};
   project.waterSeepageLookProfiles = {baseLook, nodeLook};
   project.waterSeepageResponseProfiles = {nodeResponse};
 
@@ -3427,6 +3469,13 @@ TEST_CASE("Flow profile object copies round-trip owner metadata",
   CHECK(loaded->waterTrailProfiles[0].baseProfileName == "Fine Silver");
   CHECK(loaded->waterTrailProfiles[0].geometry.widthMeters ==
         Catch::Approx(0.021F));
+  REQUIRE(loaded->waterSeepageNodeSettingsProfiles.size() == 1U);
+  CHECK(loaded->waterSeepageNodeSettingsProfiles[0].objectOverride);
+  CHECK(loaded->waterSeepageNodeSettingsProfiles[0].ownerObjectId == 3U);
+  CHECK(loaded->waterSeepageNodeSettingsProfiles[0].baseProfileName ==
+        "Wide Default");
+  CHECK(loaded->waterSeepageNodeSettingsProfiles[0].settings.widthMeters ==
+        Catch::Approx(0.73F));
   REQUIRE(loaded->waterSeepageLookProfiles.size() == 2U);
   CHECK_FALSE(loaded->waterSeepageLookProfiles[0].objectOverride);
   CHECK(loaded->waterSeepageLookProfiles[0].baseProfileName.empty());
@@ -3448,6 +3497,7 @@ TEST_CASE("Flow profile object copies round-trip owner metadata",
   sources.pathProfiles = {basePath, springPath};
   sources.laneProfiles = {creekLanes};
   sources.trailProfiles = {springTrail};
+  sources.seepageNodeSettingsProfiles = {nodeSettings};
   sources.seepageLookProfiles = {baseLook, nodeLook};
   sources.seepageResponseProfiles = {nodeResponse};
   TemporaryProjectFile sourcesFile{
@@ -3468,6 +3518,11 @@ TEST_CASE("Flow profile object copies round-trip owner metadata",
   REQUIRE(loadedSources->trailProfiles.size() == 1U);
   CHECK(loadedSources->trailProfiles[0].objectOverride);
   CHECK(loadedSources->trailProfiles[0].baseProfileName == "Fine Silver");
+  REQUIRE(loadedSources->seepageNodeSettingsProfiles.size() == 1U);
+  CHECK(loadedSources->seepageNodeSettingsProfiles[0].objectOverride);
+  CHECK(loadedSources->seepageNodeSettingsProfiles[0].ownerObjectId == 3U);
+  CHECK(loadedSources->seepageNodeSettingsProfiles[0].baseProfileName ==
+        "Wide Default");
   REQUIRE(loadedSources->seepageLookProfiles.size() == 2U);
   CHECK_FALSE(loadedSources->seepageLookProfiles[0].objectOverride);
   CHECK(loadedSources->seepageLookProfiles[1].objectOverride);

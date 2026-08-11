@@ -315,6 +315,39 @@ struct WaterSeepageResponseProfile {
     std::string baseProfileName;
 };
 
+// Reusable physical/behavioural settings for a Seepage node. Placement,
+// identity, viewport/export visibility, and the per-node variation seed stay
+// on WaterSeepageNode; this profile owns the footprint, strength, delayed Rain
+// response, and authored-role targeting shown in the Node Settings section.
+struct WaterSeepageNodeSettings {
+    float widthMeters = 0.10F;
+    float prominence = 1.0F;
+    float selectionReachLimitMeters = 2.34375F;
+    float selectionWidthLimitMeters = 1.215F;
+    float edgeFeatherMeters = 0.10F;
+    float depthToleranceMeters = 0.15F;
+    float normalAlignment = 0.20F;
+    float strength = 1.0F;
+    float rainDelaySeconds = 0.0F;
+    float rainRiseSeconds = 0.0F;
+    float rainRecessionSeconds = 0.0F;
+    std::vector<std::string> targetSceneRoles{"ROCK", "VEG"};
+
+    friend auto operator<=>(
+        const WaterSeepageNodeSettings&,
+        const WaterSeepageNodeSettings&) = default;
+};
+
+// Named Node Settings profile. Object-copy metadata follows the same
+// convention as Seepage Look and Visual Response profiles.
+struct WaterSeepageNodeSettingsProfile {
+    std::string name = "Default";
+    WaterSeepageNodeSettings settings{};
+    bool objectOverride = false;
+    std::uint32_t ownerObjectId = 0U;
+    std::string baseProfileName;
+};
+
 struct WaterScenarioState {
     WaterSeepageLookSettings seepageLook{};
     float seepageLevel = 1.0F;
@@ -762,6 +795,7 @@ struct WaterSeepageNode {
     bool enabledInViewport = true;
     bool enabledInExport = true;
     std::vector<std::string> targetSceneRoles{"ROCK", "VEG"};
+    std::string settingsProfileName = "Default";
     std::string lookProfileName = "Default";
     std::string responseProfileName = "Default";
     // Legacy migration only: older documents stored per-node look copies.
@@ -1685,6 +1719,11 @@ BuildWaterDynamicMeshFlowGroundEntries(const WaterSurfaceCache& cache);
 [[nodiscard]] float WaterRainPresetVisualStrength(WaterRainIntensityPreset preset);
 
 [[nodiscard]] WaterSeepageLookSettings DefaultWaterSeepageLookSettings();
+[[nodiscard]] WaterSeepageNodeSettings ExtractWaterSeepageNodeSettings(
+    const WaterSeepageNode& node);
+void ApplyWaterSeepageNodeSettings(
+    const WaterSeepageNodeSettings& settings,
+    WaterSeepageNode* node);
 // Applies one scalar Timings-v2 profile sample. IDs beginning with "look."
 // address the look half; "response." addresses the visual-response half.
 // Returns false for an unknown/non-scalar setting.

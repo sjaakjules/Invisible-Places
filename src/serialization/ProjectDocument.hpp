@@ -22,8 +22,8 @@
 namespace invisible_places::serialization {
 
 inline constexpr std::size_t kMaxSerializedWaterRippleRuntimeCacheMemberships = 250'000U;
-inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 71U;
-inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 26U;
+inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 72U;
+inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 27U;
 inline constexpr std::uint32_t kWaterOwnedShorelineProjectSchemaVersion = 66U;
 inline constexpr std::uint32_t kWaterOwnedShorelineSourcesSchemaVersion = 22U;
 inline constexpr std::uint32_t kAnimationDocumentSchemaVersion = 19U;
@@ -234,6 +234,10 @@ struct ProjectDocument {
     std::vector<invisible_places::renderer::pointcloud::PointCloudShorelineInstance>
         waterShorelineInstances;
     std::uint32_t nextWaterShorelineInstanceId = 1U;
+    invisible_places::water::WaterSeepageNodeSettings
+        waterSeepageDefaultNodeSettings{};
+    std::vector<invisible_places::water::WaterSeepageNodeSettingsProfile>
+        waterSeepageNodeSettingsProfiles;
     invisible_places::water::WaterSeepageLookSettings waterSeepageDefaultLook{};
     std::vector<invisible_places::water::WaterSeepageLookProfile> waterSeepageLookProfiles;
     std::vector<invisible_places::water::WaterSeepageResponseProfile>
@@ -336,6 +340,10 @@ struct WaterSourcesDocument {
     std::vector<invisible_places::renderer::pointcloud::PointCloudShorelineInstance>
         shorelineInstances;
     std::uint32_t nextShorelineInstanceId = 1U;
+    invisible_places::water::WaterSeepageNodeSettings
+        seepageDefaultNodeSettings{};
+    std::vector<invisible_places::water::WaterSeepageNodeSettingsProfile>
+        seepageNodeSettingsProfiles;
     invisible_places::water::WaterSeepageLookSettings seepageDefaultLook{};
     std::vector<invisible_places::water::WaterSeepageLookProfile> seepageLookProfiles;
     std::vector<invisible_places::water::WaterSeepageResponseProfile>
