@@ -1018,6 +1018,10 @@ struct AnimationReciprocalPanWizardState {
     bool previewLoopEnabled = true;
     bool previewLoopPlaying = false;
     float previewLoopPosition = 0.0F;
+    // The completed A/B pair is retimed as one reciprocal cycle at Apply.
+    // Camera/focus geometry and triangle alignment remain unchanged; only
+    // segment frames and both overlap durations share the new time scale.
+    bool fitFinalLoopToFourMinutes = true;
     std::uint64_t generation = 0U;
     std::string errorMessage;
 
@@ -51603,6 +51607,30 @@ std::uint32_t ReciprocalPanPathFrameCount(const AnimationPath& path) {
             : 1U);
 }
 
+constexpr std::uint32_t kReciprocalPanFourMinuteCycleFrames =
+    4U * 60U * 30U;
+
+std::uint32_t ReciprocalPanCandidateCycleFrames(
+    const AnimationReciprocalPanWizardState& wizard) {
+    if (!wizard.candidate.has_value()) {
+        return 0U;
+    }
+    const std::uint64_t first = ReciprocalPanPathFrameCount(
+        ReciprocalPanEffectiveCandidatePath(wizard, 0U));
+    const std::uint64_t second = ReciprocalPanPathFrameCount(
+        ReciprocalPanEffectiveCandidatePath(wizard, 1U));
+    const std::uint64_t duplicatedOverlap =
+        2U * (static_cast<std::uint64_t>(wizard.sourceTailFrames[0U]) +
+              wizard.sourceTailFrames[1U]);
+    if (first + second <= duplicatedOverlap ||
+        first + second - duplicatedOverlap >
+            std::numeric_limits<std::uint32_t>::max()) {
+        return 0U;
+    }
+    return static_cast<std::uint32_t>(
+        first + second - duplicatedOverlap);
+}
+
 float ReciprocalPanFramePosition(
     const AnimationPath& path,
     std::uint32_t frame) {
@@ -54238,6 +54266,7 @@ bool BuildReciprocalPanTimingTakeClonePlan(
     const PreviewRuntimeState& runtimeState,
     const std::array<AnimationPath, 2>& baselines,
     const std::array<std::uint32_t, 2>& prependedFrames,
+    const std::array<std::uint32_t, 2>& contentFrames,
     std::array<AnimationPath*, 2> candidates,
     ReciprocalPanTimingTakeClonePlan* plan,
     std::string* errorMessage) {
@@ -54251,7 +54280,7 @@ bool BuildReciprocalPanTimingTakeClonePlan(
     struct SharedClone {
         std::string sourceTakeId;
         std::string clonedTakeId;
-        std::uint32_t sourceFrames = 0U;
+        std::uint32_t contentFrames = 0U;
         std::uint32_t destinationFrames = 0U;
         std::uint32_t destinationStartFrame = 0U;
     };
@@ -54286,11 +54315,9 @@ bool BuildReciprocalPanTimingTakeClonePlan(
             continue;
         }
 
-        const std::uint32_t sourceFrames = std::max<std::uint32_t>(
+        const std::uint32_t contentSpanFrames = std::max<std::uint32_t>(
             1U,
-            baselines[role].authoredTrackDurationFrames != 0U
-                ? baselines[role].authoredTrackDurationFrames
-                : ReciprocalPanPathFrameCount(baselines[role]));
+            contentFrames[role]);
         const std::uint32_t destinationFrames = std::max<std::uint32_t>(
             1U,
             ReciprocalPanPathFrameCount(*candidates[role]));
@@ -54300,7 +54327,7 @@ bool BuildReciprocalPanTimingTakeClonePlan(
             sharedClones.end(),
             [&](const SharedClone& candidate) {
                 return candidate.sourceTakeId == sourceTakeId &&
-                       candidate.sourceFrames == sourceFrames &&
+                       candidate.contentFrames == contentSpanFrames &&
                        candidate.destinationFrames == destinationFrames &&
                        candidate.destinationStartFrame ==
                            destinationStartFrame;
@@ -54329,7 +54356,7 @@ bool BuildReciprocalPanTimingTakeClonePlan(
             if (!invisible_places::timing::
                     RetimeTimingTakeSceneStateNormalizedPositions(
                         &cloneState,
-                        sourceFrames,
+                        contentSpanFrames,
                         destinationFrames,
                         destinationStartFrame)) {
                 if (errorMessage != nullptr) {
@@ -54343,7 +54370,7 @@ bool BuildReciprocalPanTimingTakeClonePlan(
         sharedClones.push_back({
             .sourceTakeId = sourceTakeId,
             .clonedTakeId = cloneDefinition.id,
-            .sourceFrames = sourceFrames,
+            .contentFrames = contentSpanFrames,
             .destinationFrames = destinationFrames,
             .destinationStartFrame = destinationStartFrame,
         });
@@ -54413,6 +54440,39 @@ bool ApplyReciprocalPanCandidate(
 
     auto first = ReciprocalPanEffectiveCandidatePath(wizard, 0U);
     auto second = ReciprocalPanEffectiveCandidatePath(wizard, 1U);
+    std::array<std::uint32_t, 2U> appliedSeamHalfFrames{
+        wizard.sourceTailFrames[0U],
+        wizard.sourceTailFrames[1U],
+    };
+    std::array<std::uint32_t, 2U> appliedBulkFrames{
+        ReciprocalPanPathFrameCount(wizard.baselinePaths[0U]),
+        ReciprocalPanPathFrameCount(wizard.baselinePaths[1U]),
+    };
+    float appliedLoopTimeScale = 1.0F;
+    if (wizard.fitFinalLoopToFourMinutes) {
+        invisible_places::camera::
+            AnimationReciprocalLoopDurationRetimeOptions retimeOptions;
+        retimeOptions.targetCycleFrames =
+            kReciprocalPanFourMinuteCycleFrames;
+        retimeOptions.seamHalfFrames = appliedSeamHalfFrames;
+        auto retimed = invisible_places::camera::
+            BuildAnimationReciprocalLoopDurationRetime(
+                first,
+                second,
+                retimeOptions);
+        if (!retimed.succeeded) {
+            wizard.errorMessage = retimed.errorMessage.empty()
+                ? "The completed A/B pair could not be retimed to four minutes."
+                : std::move(retimed.errorMessage);
+            return false;
+        }
+        appliedSeamHalfFrames =
+            retimed.metrics.retimedSeamHalfFrames;
+        appliedBulkFrames = retimed.metrics.retimedBulkFrames;
+        appliedLoopTimeScale = retimed.metrics.timeScale;
+        first = std::move(retimed.firstCandidate);
+        second = std::move(retimed.secondCandidate);
+    }
     const auto generatedExtensionsValid = [](
                                              const AnimationPath& baseline,
                                              const AnimationPath& candidate,
@@ -54568,9 +54628,9 @@ bool ApplyReciprocalPanCandidate(
         return link;
     };
     const float newFirstStart =
-        2.0F * static_cast<float>(wizard.sourceTailFrames[0U]) / 30.0F;
+        2.0F * static_cast<float>(appliedSeamHalfFrames[0U]) / 30.0F;
     const float newSecondStart =
-        2.0F * static_cast<float>(wizard.sourceTailFrames[1U]) / 30.0F;
+        2.0F * static_cast<float>(appliedSeamHalfFrames[1U]) / 30.0F;
     const float combinedOverlap = newFirstStart + newSecondStart;
     const float firstDuration = invisible_places::camera::
         AnimationPathDurationSeconds(first);
@@ -54583,11 +54643,30 @@ bool ApplyReciprocalPanCandidate(
         return false;
     }
     ReciprocalPanTimingTakeClonePlan timingTakePlan;
+    std::array<std::uint32_t, 2U> timingContentFrames{};
+    for (std::size_t role = 0U; role < timingContentFrames.size(); ++role) {
+        const std::uint32_t baselineFrames = std::max<std::uint32_t>(
+            1U,
+            ReciprocalPanPathFrameCount(wizard.baselinePaths[role]));
+        const std::uint32_t sourceTrackFrames = std::clamp(
+            wizard.baselinePaths[role].authoredTrackDurationFrames == 0U
+                ? baselineFrames
+                : wizard.baselinePaths[role].authoredTrackDurationFrames,
+            1U,
+            baselineFrames);
+        timingContentFrames[role] = wizard.fitFinalLoopToFourMinutes
+            ? std::max<std::uint32_t>(
+                  1U,
+                  static_cast<std::uint32_t>(std::llround(
+                      static_cast<long double>(sourceTrackFrames) *
+                      appliedBulkFrames[role] / baselineFrames)))
+            : sourceTrackFrames;
+    }
     if (!BuildReciprocalPanTimingTakeClonePlan(
             *runtimeState,
             wizard.baselinePaths,
-            {wizard.sourceTailFrames[0U],
-             wizard.sourceTailFrames[1U]},
+            appliedSeamHalfFrames,
+            timingContentFrames,
             {&first, &second},
             &timingTakePlan,
             &wizard.errorMessage)) {
@@ -54674,13 +54753,22 @@ bool ApplyReciprocalPanCandidate(
     panel.matchingFrameGhost.visible = launch.launchGhostVisible;
     panel.matchingFrameGhost.automaticUpdate =
         launch.launchGhostAutomaticUpdate;
-    const float firstPreRollSeconds =
-        static_cast<float>(launch.sourceTailFrames[0U]) / 30.0F;
+    const std::uint32_t launchBaselineFrames =
+        std::max<std::uint32_t>(
+            1U,
+            ReciprocalPanPathFrameCount(launch.baselinePaths[0U]));
+    const long double launchBaselineFrame = std::clamp<long double>(
+        static_cast<long double>(launch.launchElapsedSeconds) * 30.0L,
+        0.0L,
+        launchBaselineFrames);
+    const long double mappedLaunchFrame =
+        appliedSeamHalfFrames[0U] +
+        launchBaselineFrame * appliedBulkFrames[0U] /
+            launchBaselineFrames;
     panel.scrubAmount = std::clamp(
-        (firstPreRollSeconds + launch.launchElapsedSeconds) /
-            std::max(
-                invisible_places::camera::AnimationPathDurationSeconds(first),
-                1.0e-6F),
+        static_cast<float>(
+            mappedLaunchFrame /
+            std::max<std::uint32_t>(1U, ReciprocalPanPathFrameCount(first))),
         0.0F,
         1.0F);
     if (!launch.launchSelectedKeyId.empty()) {
@@ -54736,7 +54824,13 @@ bool ApplyReciprocalPanCandidate(
         FormatFixed(newSecondStart, 2) +
         "s start / " +
         FormatFixed(newFirstStart, 2) +
-        "s end. Save Changes writes both animations and the project link together.";
+        "s end." +
+        (launch.fitFinalLoopToFourMinutes
+             ? " Final unique A/B cycle: 4:00 at 30 fps (shared time scale " +
+                   FormatFixed(appliedLoopTimeScale, 3) +
+                   "x)."
+             : "") +
+        " Save Changes writes both animations and the project link together.";
     runtimeState->errorMessage.clear();
     return true;
 }
@@ -56014,6 +56108,40 @@ void DrawReciprocalPanTransitionSmoothingControls(
             result.maxFocusMove);
     }
 
+    ImGui::SeparatorText("Final loop duration");
+    const std::uint32_t currentCycleFrames =
+        ReciprocalPanCandidateCycleFrames(wizard);
+    const float currentCycleSeconds =
+        static_cast<float>(currentCycleFrames) / 30.0F;
+    if (ImGui::Checkbox(
+            "Fit final A/B cycle to 4:00",
+            &wizard.fitFinalLoopToFourMinutes)) {
+        wizard.previewLoopPlaying = false;
+    }
+    if (currentCycleFrames > 0U) {
+        const float timeScale =
+            static_cast<float>(kReciprocalPanFourMinuteCycleFrames) /
+            static_cast<float>(currentCycleFrames);
+        if (wizard.fitFinalLoopToFourMinutes) {
+            ImGui::TextWrapped(
+                "Unique cycle now %d:%05.2f (%u frames). Apply Both will %s the A/B timelines and both overlap bands by %.3fx to exactly 4:00 / 7,200 frames.",
+                static_cast<int>(currentCycleSeconds) / 60,
+                std::fmod(currentCycleSeconds, 60.0F),
+                static_cast<unsigned>(currentCycleFrames),
+                timeScale >= 1.0F ? "slow" : "speed up",
+                timeScale);
+        } else {
+            ImGui::TextWrapped(
+                "Unique cycle remains %d:%05.2f (%u frames). Enable the option above to fit it to 4:00 (%.3fx timeline scale).",
+                static_cast<int>(currentCycleSeconds) / 60,
+                std::fmod(currentCycleSeconds, 60.0F),
+                static_cast<unsigned>(currentCycleFrames),
+                timeScale);
+        }
+    }
+    ImGui::TextDisabled(
+        "Camera, focus, lens, triangle alignment, and key order stay fixed. Camera-key frame weights and explicit export frames scale together; keyed effect settings stay on the same camera locations, while live procedural water/rain/trail motion keeps its independent clock.");
+
     ImGui::SeparatorText("Loop and split review");
     if (ImGui::Checkbox(
             "Signed full-cycle preview",
@@ -56124,10 +56252,19 @@ void DrawReciprocalPanWizard(
             const float wrapped = WrappedReciprocalPanLoopPosition(
                 wizard.previewLoopPosition);
             const std::size_t activeRole = wrapped < 0.0F ? 1U : 0U;
+            const std::uint32_t currentCycleFrames =
+                ReciprocalPanCandidateCycleFrames(wizard);
+            const float previewTimeScale =
+                wizard.fitFinalLoopToFourMinutes &&
+                        currentCycleFrames > 0U
+                    ? static_cast<float>(
+                          kReciprocalPanFourMinuteCycleFrames) /
+                          static_cast<float>(currentCycleFrames)
+                    : 1.0F;
             const float halfDurationSeconds = std::max(
                 static_cast<float>(ReciprocalPanPathFrameCount(
                     wizard.baselinePaths[activeRole])) /
-                    30.0F,
+                    30.0F * previewTimeScale,
                 1.0F / 30.0F);
             wizard.previewLoopPosition =
                 WrappedReciprocalPanLoopPosition(

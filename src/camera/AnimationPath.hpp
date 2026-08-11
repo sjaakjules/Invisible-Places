@@ -419,6 +419,42 @@ struct AnimationBidirectionalReciprocalPanExtensionResult {
     std::string errorMessage;
 };
 
+// Retimes a completed reciprocal A/B extension without changing any camera,
+// focus, lens, or triangle-alignment geometry. Each candidate consists of a
+// generated head, its authored bulk span, and a generated tail. The two bulk
+// spans are the unique loop content; the heads/tails are duplicated seam
+// overlap. One shared time scale is applied to all six spans, with stable
+// integer-frame apportionment making the unique cycle exactly
+// targetCycleFrames (7,200 frames is four minutes at the fixed 30 fps camera
+// timebase).
+struct AnimationReciprocalLoopDurationRetimeOptions {
+    std::uint32_t targetCycleFrames = 4U * 60U * 30U;
+    // Seam zero is first-start/second-end; seam one is
+    // second-start/first-end. Each value is one half of its full overlap.
+    std::array<std::uint32_t, 2U> seamHalfFrames{};
+};
+
+struct AnimationReciprocalLoopDurationRetimeMetrics {
+    std::uint32_t originalCycleFrames = 0U;
+    std::uint32_t targetCycleFrames = 0U;
+    float timeScale = 1.0F;
+    std::array<std::uint32_t, 2U> originalDurationFrames{};
+    std::array<std::uint32_t, 2U> retimedDurationFrames{};
+    std::array<std::uint32_t, 2U> originalBulkFrames{};
+    std::array<std::uint32_t, 2U> retimedBulkFrames{};
+    std::array<std::uint32_t, 2U> originalSeamHalfFrames{};
+    std::array<std::uint32_t, 2U> retimedSeamHalfFrames{};
+};
+
+struct AnimationReciprocalLoopDurationRetimeResult {
+    bool succeeded = false;
+    bool changed = false;
+    AnimationPath firstCandidate{};
+    AnimationPath secondCandidate{};
+    AnimationReciprocalLoopDurationRetimeMetrics metrics{};
+    std::string errorMessage;
+};
+
 // Conservative, pair-wide clip normalization used before reciprocal pan
 // fitting. Candidate copies retain every authored pose, timing, lens value,
 // and metadata field except near/far clipping. The smallest valid near plane
@@ -829,6 +865,12 @@ BuildAnimationBidirectionalReciprocalPanExtension(
     const AnimationPath& first,
     const AnimationPath& second,
     const AnimationReciprocalPanExtensionOptions& options = {});
+
+[[nodiscard]] AnimationReciprocalLoopDurationRetimeResult
+BuildAnimationReciprocalLoopDurationRetime(
+    const AnimationPath& first,
+    const AnimationPath& second,
+    const AnimationReciprocalLoopDurationRetimeOptions& options = {});
 
 [[nodiscard]] AnimationClipPlaneNormalizationResult
 BuildConservativeAnimationClipPlaneNormalization(

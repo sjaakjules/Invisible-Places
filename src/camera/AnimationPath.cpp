@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <limits>
 #include <numeric>
+#include <tuple>
 #include <unordered_set>
 
 #include <glm/geometric.hpp>
@@ -4362,6 +4363,560 @@ BuildAnimationBidirectionalReciprocalPanExtension(
         &result.metrics.outgoing);
     result.succeeded = true;
     result.changed = true;
+    return result;
+}
+
+namespace {
+
+struct ReciprocalLoopPathPartition {
+    std::vector<std::uint32_t> durations;
+    std::size_t headSegmentCount = 0U;
+    std::size_t tailSegmentStart = 0U;
+    std::uint32_t totalFrames = 0U;
+    std::uint32_t headFrames = 0U;
+    std::uint32_t bulkFrames = 0U;
+    std::uint32_t tailFrames = 0U;
+};
+
+bool BuildReciprocalLoopPathPartition(
+    const AnimationPath& path,
+    std::uint32_t headFrames,
+    std::uint32_t tailFrames,
+    ReciprocalLoopPathPartition* partition,
+    std::string* errorMessage) {
+    if (partition == nullptr || path.keys.size() < 2U) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "Each reciprocal loop animation needs at least two camera keys.";
+        }
+        return false;
+    }
+    std::uint64_t incomingTotal = 0U;
+    for (std::size_t keyIndex = 1U; keyIndex < path.keys.size(); ++keyIndex) {
+        incomingTotal += std::max<std::uint32_t>(
+            1U,
+            path.keys[keyIndex].durationFrames);
+        if (incomingTotal > std::numeric_limits<std::uint32_t>::max()) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "A reciprocal loop path's incoming frame weights overflow the supported range.";
+            }
+            return false;
+        }
+    }
+    auto durations = BuildSegmentDurations(path);
+    if (durations.size() + 1U != path.keys.size()) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "A reciprocal loop path's effective segment timing could not be resolved.";
+        }
+        return false;
+    }
+    const std::uint64_t total64 = std::accumulate(
+        durations.begin(),
+        durations.end(),
+        std::uint64_t{0U});
+    if (total64 == 0U ||
+        total64 > std::numeric_limits<std::uint32_t>::max() ||
+        static_cast<std::uint64_t>(headFrames) + tailFrames >= total64) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The generated seam spans leave no authored bulk motion to retime.";
+        }
+        return false;
+    }
+
+    std::size_t headCount = 0U;
+    std::uint64_t prefix = 0U;
+    while (headCount < durations.size() && prefix < headFrames) {
+        prefix += durations[headCount++];
+    }
+    if (prefix != headFrames) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The reciprocal loop's generated pre-roll does not end on a camera key.";
+        }
+        return false;
+    }
+
+    std::size_t tailStart = durations.size();
+    std::uint64_t suffix = 0U;
+    while (tailStart > 0U && suffix < tailFrames) {
+        suffix += durations[--tailStart];
+    }
+    if (suffix != tailFrames || headCount >= tailStart) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The reciprocal loop's generated tail does not begin on an independent camera key.";
+        }
+        return false;
+    }
+
+    *partition = {
+        .durations = std::move(durations),
+        .headSegmentCount = headCount,
+        .tailSegmentStart = tailStart,
+        .totalFrames = static_cast<std::uint32_t>(total64),
+        .headFrames = headFrames,
+        .bulkFrames = static_cast<std::uint32_t>(
+            total64 - headFrames - tailFrames),
+        .tailFrames = tailFrames,
+    };
+    return true;
+}
+
+bool AllocateReciprocalLoopSegmentFrames(
+    std::span<const std::uint32_t> source,
+    std::uint32_t targetFrames,
+    std::vector<std::uint32_t>* destination) {
+    if (destination == nullptr || source.empty() ||
+        targetFrames < source.size()) {
+        return false;
+    }
+    destination->assign(source.size(), 1U);
+    const std::uint64_t targetExtra =
+        static_cast<std::uint64_t>(targetFrames) - source.size();
+    std::uint64_t sourceExtra = 0U;
+    for (const auto frames : source) {
+        sourceExtra += std::max<std::uint32_t>(1U, frames) - 1U;
+    }
+    if (sourceExtra == 0U) {
+        const std::uint32_t base = targetFrames /
+            static_cast<std::uint32_t>(source.size());
+        const std::uint32_t remainder = targetFrames %
+            static_cast<std::uint32_t>(source.size());
+        for (std::size_t index = 0U; index < source.size(); ++index) {
+            (*destination)[index] =
+                base + (index < remainder ? 1U : 0U);
+        }
+        return true;
+    }
+
+    struct Remainder {
+        std::uint64_t numerator = 0U;
+        std::size_t index = 0U;
+    };
+    std::vector<Remainder> remainders;
+    remainders.reserve(source.size());
+    std::uint64_t assigned = source.size();
+    for (std::size_t index = 0U; index < source.size(); ++index) {
+        const std::uint64_t weight =
+            std::max<std::uint32_t>(1U, source[index]) - 1U;
+        const std::uint64_t numerator = targetExtra * weight;
+        const std::uint64_t whole = numerator / sourceExtra;
+        (*destination)[index] += static_cast<std::uint32_t>(whole);
+        assigned += whole;
+        remainders.push_back({
+            .numerator = numerator % sourceExtra,
+            .index = index,
+        });
+    }
+    std::stable_sort(
+        remainders.begin(),
+        remainders.end(),
+        [](const Remainder& left, const Remainder& right) {
+            return left.numerator > right.numerator;
+        });
+    std::size_t remainderIndex = 0U;
+    while (assigned < targetFrames && !remainders.empty()) {
+        ++(*destination)[remainders[remainderIndex].index];
+        ++assigned;
+        remainderIndex = (remainderIndex + 1U) % remainders.size();
+    }
+    return assigned == targetFrames;
+}
+
+std::uint32_t MapReciprocalLoopFrame(
+    std::uint32_t frame,
+    const ReciprocalLoopPathPartition& source,
+    std::uint32_t targetHeadFrames,
+    std::uint32_t targetBulkFrames,
+    std::uint32_t targetTailFrames) {
+    const auto mapSpan = [](std::uint32_t offset,
+                            std::uint32_t sourceFrames,
+                            std::uint32_t targetFrames) {
+        if (sourceFrames == 0U) {
+            return 0U;
+        }
+        return static_cast<std::uint32_t>(std::llround(
+            static_cast<long double>(offset) * targetFrames /
+            sourceFrames));
+    };
+    const std::uint32_t clamped = std::min(frame, source.totalFrames);
+    if (clamped <= source.headFrames) {
+        return std::min(
+            targetHeadFrames,
+            mapSpan(clamped, source.headFrames, targetHeadFrames));
+    }
+    const std::uint32_t bulkEnd =
+        source.headFrames + source.bulkFrames;
+    if (clamped <= bulkEnd) {
+        return targetHeadFrames + std::min(
+            targetBulkFrames,
+            mapSpan(
+                clamped - source.headFrames,
+                source.bulkFrames,
+                targetBulkFrames));
+    }
+    return targetHeadFrames + targetBulkFrames + std::min(
+        targetTailFrames,
+        mapSpan(
+            clamped - bulkEnd,
+            source.tailFrames,
+        targetTailFrames));
+}
+
+void RetimeReciprocalLoopLegacyWaterTracks(
+    AnimationPath* path,
+    const ReciprocalLoopPathPartition& source,
+    std::uint32_t targetHeadFrames,
+    std::uint32_t targetBulkFrames,
+    std::uint32_t targetTailFrames) {
+    if (path == nullptr || source.totalFrames == 0U) {
+        return;
+    }
+    const double targetTotal = static_cast<double>(targetHeadFrames) +
+        targetBulkFrames + targetTailFrames;
+    if (targetTotal <= 0.0) {
+        return;
+    }
+    const auto mapPosition = [&](float position) {
+        const double oldFrame = std::clamp(
+            std::isfinite(position) ? static_cast<double>(position) : 0.0,
+            0.0,
+            1.0) * source.totalFrames;
+        double newFrame = 0.0;
+        if (oldFrame <= source.headFrames) {
+            newFrame = source.headFrames == 0U
+                ? 0.0
+                : oldFrame * targetHeadFrames / source.headFrames;
+        } else if (oldFrame <=
+                   static_cast<double>(source.headFrames) +
+                       source.bulkFrames) {
+            newFrame = targetHeadFrames +
+                (oldFrame - source.headFrames) * targetBulkFrames /
+                    source.bulkFrames;
+        } else {
+            newFrame = targetHeadFrames + targetBulkFrames +
+                (oldFrame - source.headFrames - source.bulkFrames) *
+                    targetTailFrames / source.tailFrames;
+        }
+        return static_cast<float>(std::clamp(
+            newFrame / targetTotal,
+            0.0,
+            1.0));
+    };
+    for (auto& track : path->waterScenarioTracks) {
+        for (auto& key : track.keys) {
+            key.position = mapPosition(key.position);
+        }
+        for (auto& nodeTrack : track.seepageNodeTracks) {
+            for (auto& key : nodeTrack.keys) {
+                key.position = mapPosition(key.position);
+            }
+        }
+        for (auto& assignment : track.timingAssignments) {
+            for (auto& key : assignment.fallbackRun.keys) {
+                key.position = mapPosition(key.position);
+            }
+        }
+    }
+}
+
+bool ApplyReciprocalLoopPathRetime(
+    const AnimationPath& source,
+    const ReciprocalLoopPathPartition& partition,
+    std::uint32_t targetHeadFrames,
+    std::uint32_t targetBulkFrames,
+    std::uint32_t targetTailFrames,
+    float timeScale,
+    AnimationPath* candidate,
+    std::string* errorMessage) {
+    if (candidate == nullptr || !std::isfinite(timeScale) ||
+        timeScale <= 0.0F) {
+        return false;
+    }
+    const std::uint64_t targetTotal64 =
+        static_cast<std::uint64_t>(targetHeadFrames) +
+        targetBulkFrames + targetTailFrames;
+    if (targetTotal64 > std::numeric_limits<std::uint32_t>::max()) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The requested reciprocal loop duration exceeds the supported frame range.";
+        }
+        return false;
+    }
+
+    std::vector<std::uint32_t> head;
+    std::vector<std::uint32_t> bulk;
+    std::vector<std::uint32_t> tail;
+    if (!AllocateReciprocalLoopSegmentFrames(
+            std::span<const std::uint32_t>{
+                partition.durations.data(),
+                partition.headSegmentCount},
+            targetHeadFrames,
+            &head) ||
+        !AllocateReciprocalLoopSegmentFrames(
+            std::span<const std::uint32_t>{
+                partition.durations.data() + partition.headSegmentCount,
+                partition.tailSegmentStart - partition.headSegmentCount},
+            targetBulkFrames,
+            &bulk) ||
+        !AllocateReciprocalLoopSegmentFrames(
+            std::span<const std::uint32_t>{
+                partition.durations.data() + partition.tailSegmentStart,
+                partition.durations.size() - partition.tailSegmentStart},
+            targetTailFrames,
+            &tail)) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The requested loop is too short to retain every generated and authored camera segment.";
+        }
+        return false;
+    }
+
+    *candidate = source;
+    if (candidate->authoredTrackDurationFrames != 0U) {
+        const std::uint32_t legacyFrames = std::clamp(
+            candidate->authoredTrackDurationFrames,
+            1U,
+            partition.totalFrames);
+        RetimeAnimationPathLegacyWaterTracks(
+            candidate,
+            legacyFrames,
+            partition.totalFrames);
+        candidate->authoredTrackDurationFrames = 0U;
+    }
+    RetimeReciprocalLoopLegacyWaterTracks(
+        candidate,
+        partition,
+        targetHeadFrames,
+        targetBulkFrames,
+        targetTailFrames);
+    std::size_t segment = 0U;
+    for (const auto& group : {&head, &bulk, &tail}) {
+        for (const auto frames : *group) {
+            candidate->keys[++segment].durationFrames = frames;
+        }
+    }
+    candidate->durationFrames = static_cast<std::uint32_t>(targetTotal64);
+
+    // Localized correction tangents are authored in world units per second.
+    // Dividing them by the common time stretch preserves the same spatial
+    // correction curve while uniformly changing its velocity.
+    const float tangentScale = 1.0F / timeScale;
+    for (auto& correction : candidate->localizedKeyCorrections) {
+        if (correction.hasCameraCorrectionTangent) {
+            for (auto& value : correction.cameraCorrectionTangent) {
+                value *= tangentScale;
+            }
+        }
+        if (correction.hasFocusCorrectionTangent) {
+            for (auto& value : correction.focusCorrectionTangent) {
+                value *= tangentScale;
+            }
+        }
+    }
+
+    candidate->exportSettings.startFrame = MapReciprocalLoopFrame(
+        candidate->exportSettings.startFrame,
+        partition,
+        targetHeadFrames,
+        targetBulkFrames,
+        targetTailFrames);
+    if (candidate->exportSettings.endFrame != 0U) {
+        candidate->exportSettings.endFrame = std::max(
+            candidate->exportSettings.startFrame,
+            MapReciprocalLoopFrame(
+                candidate->exportSettings.endFrame,
+                partition,
+                targetHeadFrames,
+                targetBulkFrames,
+                targetTailFrames));
+    }
+    return true;
+}
+
+}  // namespace
+
+AnimationReciprocalLoopDurationRetimeResult
+BuildAnimationReciprocalLoopDurationRetime(
+    const AnimationPath& first,
+    const AnimationPath& second,
+    const AnimationReciprocalLoopDurationRetimeOptions& options) {
+    AnimationReciprocalLoopDurationRetimeResult result;
+    result.metrics.targetCycleFrames = options.targetCycleFrames;
+    result.metrics.originalSeamHalfFrames = options.seamHalfFrames;
+    if (options.targetCycleFrames == 0U) {
+        result.errorMessage =
+            "The reciprocal loop target duration must contain at least one frame.";
+        return result;
+    }
+
+    ReciprocalLoopPathPartition firstPartition;
+    ReciprocalLoopPathPartition secondPartition;
+    if (!BuildReciprocalLoopPathPartition(
+            first,
+            options.seamHalfFrames[0U],
+            options.seamHalfFrames[1U],
+            &firstPartition,
+            &result.errorMessage) ||
+        !BuildReciprocalLoopPathPartition(
+            second,
+            options.seamHalfFrames[1U],
+            options.seamHalfFrames[0U],
+            &secondPartition,
+            &result.errorMessage)) {
+        return result;
+    }
+
+    const std::uint64_t originalCycle64 =
+        static_cast<std::uint64_t>(firstPartition.bulkFrames) +
+        secondPartition.bulkFrames;
+    if (originalCycle64 == 0U ||
+        originalCycle64 > std::numeric_limits<std::uint32_t>::max()) {
+        result.errorMessage =
+            "The reciprocal loop's unique authored duration is invalid.";
+        return result;
+    }
+    const std::uint32_t originalCycle =
+        static_cast<std::uint32_t>(originalCycle64);
+    const float timeScale =
+        static_cast<float>(options.targetCycleFrames) /
+        static_cast<float>(originalCycle);
+    result.metrics.originalCycleFrames = originalCycle;
+    result.metrics.timeScale = timeScale;
+    result.metrics.originalDurationFrames = {
+        firstPartition.totalFrames,
+        secondPartition.totalFrames,
+    };
+    result.metrics.originalBulkFrames = {
+        firstPartition.bulkFrames,
+        secondPartition.bulkFrames,
+    };
+
+    bool seamScaleOverflow = false;
+    const auto scaledSeamFrames = [&](std::size_t seam) {
+        const std::uint32_t sourceFrames = options.seamHalfFrames[seam];
+        if (sourceFrames == 0U) {
+            return 0U;
+        }
+        const std::size_t firstSegments = seam == 0U
+            ? firstPartition.headSegmentCount
+            : firstPartition.durations.size() -
+                  firstPartition.tailSegmentStart;
+        const std::size_t secondSegments = seam == 0U
+            ? secondPartition.durations.size() -
+                  secondPartition.tailSegmentStart
+            : secondPartition.headSegmentCount;
+        const std::uint32_t minimum = static_cast<std::uint32_t>(
+            std::max<std::size_t>(1U, std::max(firstSegments, secondSegments)));
+        const long double ideal =
+            static_cast<long double>(sourceFrames) * timeScale;
+        if (!std::isfinite(ideal) ||
+            ideal > std::numeric_limits<std::uint32_t>::max()) {
+            seamScaleOverflow = true;
+            return 0U;
+        }
+        return std::max(
+            minimum,
+            static_cast<std::uint32_t>(std::llround(ideal)));
+    };
+    const std::array<std::uint32_t, 2U> retimedSeams{
+        scaledSeamFrames(0U),
+        scaledSeamFrames(1U),
+    };
+    if (seamScaleOverflow) {
+        result.errorMessage =
+            "The requested reciprocal loop scale exceeds the supported frame range.";
+        return result;
+    }
+
+    const std::uint32_t firstBulkMinimum = static_cast<std::uint32_t>(
+        firstPartition.tailSegmentStart -
+        firstPartition.headSegmentCount);
+    const std::uint32_t secondBulkMinimum = static_cast<std::uint32_t>(
+        secondPartition.tailSegmentStart -
+        secondPartition.headSegmentCount);
+    if (static_cast<std::uint64_t>(firstBulkMinimum) +
+            secondBulkMinimum >
+        options.targetCycleFrames) {
+        result.errorMessage =
+            "The requested reciprocal loop is too short to retain every authored camera segment.";
+        return result;
+    }
+
+    const std::uint64_t firstNumerator =
+        static_cast<std::uint64_t>(options.targetCycleFrames) *
+        firstPartition.bulkFrames;
+    std::uint32_t retimedFirstBulk = static_cast<std::uint32_t>(
+        firstNumerator / originalCycle);
+    const std::uint64_t remainder = firstNumerator % originalCycle;
+    if (remainder * 2U > originalCycle ||
+        (remainder * 2U == originalCycle &&
+         std::tie(first.name, first.keys.front().id) <
+             std::tie(second.name, second.keys.front().id))) {
+        ++retimedFirstBulk;
+    }
+    retimedFirstBulk = std::clamp(
+        retimedFirstBulk,
+        firstBulkMinimum,
+        options.targetCycleFrames - secondBulkMinimum);
+    const std::uint32_t retimedSecondBulk =
+        options.targetCycleFrames - retimedFirstBulk;
+
+    const std::uint64_t retimedFirstDuration64 =
+        static_cast<std::uint64_t>(retimedSeams[0U]) +
+        retimedFirstBulk + retimedSeams[1U];
+    const std::uint64_t retimedSecondDuration64 =
+        static_cast<std::uint64_t>(retimedSeams[1U]) +
+        retimedSecondBulk + retimedSeams[0U];
+    if (retimedFirstDuration64 >
+            std::numeric_limits<std::uint32_t>::max() ||
+        retimedSecondDuration64 >
+            std::numeric_limits<std::uint32_t>::max()) {
+        result.errorMessage =
+            "The requested reciprocal loop duration exceeds the supported path frame range.";
+        return result;
+    }
+    const std::uint32_t retimedFirstDuration =
+        static_cast<std::uint32_t>(retimedFirstDuration64);
+    const std::uint32_t retimedSecondDuration =
+        static_cast<std::uint32_t>(retimedSecondDuration64);
+    result.metrics.retimedSeamHalfFrames = retimedSeams;
+    result.metrics.retimedBulkFrames = {
+        retimedFirstBulk,
+        retimedSecondBulk,
+    };
+    result.metrics.retimedDurationFrames = {
+        retimedFirstDuration,
+        retimedSecondDuration,
+    };
+
+    if (!ApplyReciprocalLoopPathRetime(
+            first,
+            firstPartition,
+            retimedSeams[0U],
+            retimedFirstBulk,
+            retimedSeams[1U],
+            timeScale,
+            &result.firstCandidate,
+            &result.errorMessage) ||
+        !ApplyReciprocalLoopPathRetime(
+            second,
+            secondPartition,
+            retimedSeams[1U],
+            retimedSecondBulk,
+            retimedSeams[0U],
+            timeScale,
+            &result.secondCandidate,
+            &result.errorMessage)) {
+        result.firstCandidate = {};
+        result.secondCandidate = {};
+        return result;
+    }
+    result.succeeded = true;
+    result.changed = options.targetCycleFrames != originalCycle;
     return result;
 }
 

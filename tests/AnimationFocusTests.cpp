@@ -1706,6 +1706,224 @@ TEST_CASE("Bidirectional reciprocal pan extension generates pre-roll and tail fr
 }
 
 TEST_CASE(
+    "Reciprocal pan loop retime preserves aligned geometry and makes an exact four-minute cycle",
+    "[camera][animation][pan-extension][loop-retime]") {
+    auto firstBaseline =
+        MakeReciprocalPanTestPath("retime-A", 1.0F, 41U, 79U);
+    auto secondBaseline =
+        MakeReciprocalPanTestPath("retime-B", -1.0F, 54U, 96U);
+    AddLegacyWaterTracks(&firstBaseline);
+    AddLegacyWaterTracks(&secondBaseline);
+    const auto extended = invisible_places::camera::
+        BuildAnimationBidirectionalReciprocalPanExtension(
+            firstBaseline,
+            secondBaseline,
+            MakeReciprocalPanTestOptions());
+    INFO(extended.errorMessage);
+    REQUIRE(extended.succeeded);
+
+    invisible_places::camera::AnimationReciprocalLoopDurationRetimeOptions
+        options;
+    options.targetCycleFrames = 4U * 60U * 30U;
+    options.seamHalfFrames = {35U, 44U};
+    const auto result = invisible_places::camera::
+        BuildAnimationReciprocalLoopDurationRetime(
+            extended.firstCandidate,
+            extended.secondCandidate,
+            options);
+    INFO(result.errorMessage);
+    REQUIRE(result.succeeded);
+    REQUIRE(result.changed);
+    CHECK(result.metrics.originalCycleFrames == 270U);
+    CHECK(result.metrics.targetCycleFrames == 7200U);
+    CHECK(result.metrics.timeScale == Approx(7200.0F / 270.0F));
+    CHECK(result.metrics.originalBulkFrames ==
+          std::array<std::uint32_t, 2U>{120U, 150U});
+    CHECK(result.metrics.retimedBulkFrames ==
+          std::array<std::uint32_t, 2U>{3200U, 4000U});
+    CHECK(result.metrics.retimedSeamHalfFrames ==
+          std::array<std::uint32_t, 2U>{933U, 1173U});
+    CHECK(result.firstCandidate.durationFrames == 5306U);
+    CHECK(result.secondCandidate.durationFrames == 6106U);
+    CHECK(result.firstCandidate.exportSettings.startFrame == 1120U);
+    CHECK(result.firstCandidate.exportSettings.endFrame == 3360U);
+    CHECK(result.secondCandidate.exportSettings.startFrame == 1360U);
+    CHECK(result.secondCandidate.exportSettings.endFrame == 3600U);
+    CHECK(
+        result.firstCandidate.durationFrames +
+            result.secondCandidate.durationFrames -
+            2U * (result.metrics.retimedSeamHalfFrames[0U] +
+                  result.metrics.retimedSeamHalfFrames[1U]) ==
+        7200U);
+
+    const auto checkPath = [](
+                               const auto& original,
+                               const auto& retimed,
+                               std::uint32_t expectedDuration) {
+        REQUIRE(retimed.keys.size() == original.keys.size());
+        CHECK(retimed.durationFrames == expectedDuration);
+        std::uint64_t durationSum = 0U;
+        for (std::size_t index = 0U; index < original.keys.size(); ++index) {
+            const auto& before = original.keys[index];
+            const auto& after = retimed.keys[index];
+            CHECK(after.id == before.id);
+            CHECK(after.cameraPosition == before.cameraPosition);
+            CHECK(after.focusPoint == before.focusPoint);
+            CHECK(after.orientation == before.orientation);
+            CHECK(after.fovDegrees == before.fovDegrees);
+            CHECK(after.nearPlane == before.nearPlane);
+            CHECK(after.farPlane == before.farPlane);
+            CHECK(after.splineParameterWeight ==
+                  before.splineParameterWeight);
+            CHECK(after.splineCameraEndpointTangent ==
+                  before.splineCameraEndpointTangent);
+            CHECK(after.splineFocusEndpointTangent ==
+                  before.splineFocusEndpointTangent);
+            if (index > 0U) {
+                CHECK(after.durationFrames >= 1U);
+                durationSum += after.durationFrames;
+            }
+            const auto beforeAtKey = invisible_places::camera::
+                EvaluateAnimationPath(
+                    original,
+                    invisible_places::camera::AnimationPathDurationSeconds(
+                        original) *
+                        invisible_places::camera::
+                            AnimationPathKeyNormalizedPosition(
+                                original,
+                                index));
+            const auto afterAtKey = invisible_places::camera::
+                EvaluateAnimationPath(
+                    retimed,
+                    invisible_places::camera::AnimationPathDurationSeconds(
+                        retimed) *
+                        invisible_places::camera::
+                            AnimationPathKeyNormalizedPosition(
+                                retimed,
+                                index));
+            CheckPanEvaluationNear(beforeAtKey, afterAtKey, 4.0e-4F);
+        }
+        CHECK(durationSum == expectedDuration);
+    };
+    checkPath(
+        extended.firstCandidate,
+        result.firstCandidate,
+        5306U);
+    checkPath(
+        extended.secondCandidate,
+        result.secondCandidate,
+        6106U);
+    REQUIRE(result.firstCandidate.waterScenarioTracks.size() == 1U);
+    REQUIRE(result.secondCandidate.waterScenarioTracks.size() == 1U);
+    const auto& firstWater =
+        result.firstCandidate.waterScenarioTracks.front();
+    const auto& secondWater =
+        result.secondCandidate.waterScenarioTracks.front();
+    CHECK(firstWater.keys[0U].position ==
+          Approx((933.0F + 0.25F * 3200.0F) / 5306.0F));
+    CHECK(firstWater.keys[1U].position ==
+          Approx((933.0F + 3200.0F) / 5306.0F));
+    CHECK(secondWater.keys[0U].position ==
+          Approx((1173.0F + 0.25F * 4000.0F) / 6106.0F));
+    CHECK(secondWater.keys[1U].position ==
+          Approx((1173.0F + 4000.0F) / 6106.0F));
+
+    const auto sumPrefix = [](const auto& path, std::size_t segmentCount) {
+        std::uint32_t frames = 0U;
+        for (std::size_t segment = 0U; segment < segmentCount; ++segment) {
+            frames += path.keys[segment + 1U].durationFrames;
+        }
+        return frames;
+    };
+    const auto sumSuffix = [](const auto& path, std::size_t segmentCount) {
+        std::uint32_t frames = 0U;
+        for (std::size_t segment = 0U; segment < segmentCount; ++segment) {
+            frames += path.keys[path.keys.size() - 1U - segment]
+                          .durationFrames;
+        }
+        return frames;
+    };
+    CHECK(sumPrefix(
+              result.firstCandidate,
+              extended.metrics.incoming.appendedKeyCount[0U]) == 933U);
+    CHECK(sumSuffix(
+              result.firstCandidate,
+              extended.metrics.outgoing.appendedKeyCount[0U]) == 1173U);
+    CHECK(sumPrefix(
+              result.secondCandidate,
+              extended.metrics.incoming.appendedKeyCount[1U]) == 1173U);
+    CHECK(sumSuffix(
+              result.secondCandidate,
+              extended.metrics.outgoing.appendedKeyCount[1U]) == 933U);
+
+    auto swappedOptions = options;
+    swappedOptions.seamHalfFrames = {44U, 35U};
+    const auto swapped = invisible_places::camera::
+        BuildAnimationReciprocalLoopDurationRetime(
+            extended.secondCandidate,
+            extended.firstCandidate,
+            swappedOptions);
+    INFO(swapped.errorMessage);
+    REQUIRE(swapped.succeeded);
+    CHECK(swapped.firstCandidate.durationFrames ==
+          result.secondCandidate.durationFrames);
+    CHECK(swapped.secondCandidate.durationFrames ==
+          result.firstCandidate.durationFrames);
+    for (std::size_t index = 1U;
+         index < result.firstCandidate.keys.size();
+         ++index) {
+        CHECK(swapped.secondCandidate.keys[index].durationFrames ==
+              result.firstCandidate.keys[index].durationFrames);
+    }
+    for (std::size_t index = 1U;
+         index < result.secondCandidate.keys.size();
+         ++index) {
+        CHECK(swapped.firstCandidate.keys[index].durationFrames ==
+              result.secondCandidate.keys[index].durationFrames);
+    }
+
+    auto fasterOptions = options;
+    fasterOptions.targetCycleFrames = 135U;
+    const auto faster = invisible_places::camera::
+        BuildAnimationReciprocalLoopDurationRetime(
+            extended.firstCandidate,
+            extended.secondCandidate,
+            fasterOptions);
+    INFO(faster.errorMessage);
+    REQUIRE(faster.succeeded);
+    CHECK(faster.metrics.timeScale == Approx(0.5F));
+    CHECK(
+        faster.firstCandidate.durationFrames +
+            faster.secondCandidate.durationFrames -
+            2U * (faster.metrics.retimedSeamHalfFrames[0U] +
+                  faster.metrics.retimedSeamHalfFrames[1U]) ==
+        135U);
+    CHECK(faster.metrics.retimedBulkFrames[0U] == 60U);
+    CHECK(faster.metrics.retimedBulkFrames[1U] == 75U);
+
+    auto fullExportFirst = extended.firstCandidate;
+    fullExportFirst.exportSettings.endFrame = 0U;
+    const auto fullExport = invisible_places::camera::
+        BuildAnimationReciprocalLoopDurationRetime(
+            fullExportFirst,
+            extended.secondCandidate,
+            options);
+    REQUIRE(fullExport.succeeded);
+    CHECK(fullExport.firstCandidate.exportSettings.endFrame == 0U);
+
+    auto impossibleOptions = options;
+    impossibleOptions.targetCycleFrames = 1U;
+    const auto impossible = invisible_places::camera::
+        BuildAnimationReciprocalLoopDurationRetime(
+            extended.firstCandidate,
+            extended.secondCandidate,
+            impossibleOptions);
+    CHECK_FALSE(impossible.succeeded);
+    CHECK(impossible.firstCandidate.keys.empty());
+    CHECK(impossible.secondCandidate.keys.empty());
+}
+
+TEST_CASE(
     "Selected transition smoothing moves paired midpoint cameras while preserving triangle alignment",
     "[camera][animation][pan-extension][transition-smoothing]") {
     const auto firstBaseline =

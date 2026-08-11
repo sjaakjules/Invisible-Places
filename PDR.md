@@ -152,7 +152,8 @@ generate the source animation's pre-roll and the destination animation's tail,
 with the original crossed endpoints remaining the temporal midpoint. It may
 align the former first/last poses and change only the adjacent old boundary
 segments plus the new head/tail. Interior authored key frames and bulk motion
-shall keep their original spacing and 30 fps speed.
+shall keep their original spacing and 30 fps speed until the optional final
+whole-cycle duration fit described in FR-CAM-20.
 
 #### FR-CAM-14
 Extension candidates shall remain immutable and outside the animation registry
@@ -226,7 +227,12 @@ hard split at either seam, retain independent per-seam boundary offsets, wrap
 repeated drags on release, and loop with Space. Reset shall restore the
 immutable triangle fit. Applying without a successful pass shall preserve the
 unsmoothed fit, and applying either result shall create/update reciprocal blend
-durations from the generated spans.
+durations from the generated spans. Final Preview shall default to an optional
+4:00 whole-cycle fit. It shall scale both authored bulk timelines and every
+generated seam half by one common factor, apportion integer segment frames so
+the unique A/B cycle is exactly 7,200 frames, and scale reciprocal overlaps and
+finite export bounds with them. Camera/focus/lens geometry, key order, triangle
+alignment, and the independent procedural-effects clock shall not change.
 
 ### 5.4 Side Panel Behaviour
 #### FR-UI-1

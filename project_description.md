@@ -318,7 +318,12 @@ rotation, or perceived speed under all three speed methods; amber controls and
 every segment-frame weight remain unchanged. A/B motion graphs mark both exact
 50% poses. The final hard-split preview has a signed -1..1 full-cycle transport,
 two feature-relative split offsets, repeated-drag wrapping, and Space-key loop
-playback at each path's existing 30 fps rate. Reset restores the immutable
+playback. **Fit final A/B cycle to 4:00** is enabled by default: Preview slows
+or speeds the transport by the proposed shared factor, and Apply apportions the
+two authored bulk spans plus all four generated seam halves onto an exact
+7,200-frame unique cycle. Reciprocal blend durations and finite export bounds
+scale with the same timing; camera/focus/lens geometry, key order, and triangle
+alignment remain unchanged. Reset restores the immutable
 triangle fit, and a rejected pass does not replace the current working edit.
 Back, Cancel, and Escape discard all private candidates and restore the launch
 camera, playhead, pivot, and matching ghost.
