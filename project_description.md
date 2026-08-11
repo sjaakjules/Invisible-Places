@@ -313,7 +313,11 @@ the full deterministic output frame/subframe time. Explicit export start/end
 frames shift by the prepended count to retain the same old camera content; an
 end frame of zero still means the complete, now-extended animation. The four reciprocal overlap extents and project link
 mirror update with the paths, and A, B, and the project retain one atomic
-save/discard dependency.
+save/discard dependency. Saving that pending dependency under new names is a
+linked-pair Save As operation: both new animation files and the project are
+committed together, their partner filenames are retargeted to one another, and
+the calculated start/end blend durations are retained. The original files are
+not overwritten.
 
 ### Animation versioning
 Every registered animation keeps its last saved, disk-backed version plus at

@@ -404,6 +404,7 @@ enum class SaveChangesItemKind {
 struct SaveChangesItem {
     SaveChangesItemKind kind = SaveChangesItemKind::Project;
     std::filesystem::path targetPath;
+    std::filesystem::path sourcePath;
     bool currentAnimation = false;
     bool selected = true;
     std::string displayName;
@@ -416,8 +417,13 @@ struct SaveChangesDialogState {
     bool waitingForRenderCancellation = false;
     bool exitConfirmed = false;
     bool animationSaveAs = false;
+    bool animationPairSaveAs = false;
     bool focusAnimationSaveAsName = false;
     std::string animationSaveAsName;
+    std::string animationPairSaveAsPartnerName;
+    std::string animationPairSaveAsCurrentBaseName;
+    std::string animationPairSaveAsPartnerBaseName;
+    bool animationPairSaveAsPartnerNameEdited = false;
     std::vector<SaveChangesItem> items;
     std::string errorMessage;
 };
@@ -53604,7 +53610,15 @@ bool ApplyReciprocalPanCandidate(
         std::to_string(metrics.outgoing.extensionFrames[1U]) +
         "f / " +
         std::to_string(metrics.outgoing.appendedKeyCount[1U]) +
-        " keys). Save Changes writes both animations and the project link together.";
+        " keys). Linked blend: A " +
+        FormatFixed(newFirstStart, 2) +
+        "s start / " +
+        FormatFixed(newSecondStart, 2) +
+        "s end; B " +
+        FormatFixed(newSecondStart, 2) +
+        "s start / " +
+        FormatFixed(newFirstStart, 2) +
+        "s end. Save Changes writes both animations and the project link together.";
     runtimeState->errorMessage.clear();
     return true;
 }
@@ -53991,6 +54005,14 @@ void DrawReciprocalPanTransitionSmoothingControls(
         startOverlaps[1U],
         startOverlaps[0U],
     };
+    ImGui::Text(
+        "Calculated blend durations: A %.2fs start / %.2fs end; B %.2fs start / %.2fs end",
+        startOverlaps[0U],
+        endOverlaps[0U],
+        startOverlaps[1U],
+        endOverlaps[1U]);
+    ImGui::TextDisabled(
+        "Apply Both creates or updates the reciprocal A/B link with these durations.");
     for (std::size_t role = 0U; role < 2U; ++role) {
         const auto& candidate = role == 0U
             ? wizard.candidate->firstCandidate
@@ -55254,7 +55276,7 @@ void DrawAnimationSection(
                 ImGuiHoveredFlags_DelayNormal |
                 ImGuiHoveredFlags_AllowWhenDisabled)) {
             ImGui::SetTooltip(
-                "Save the currently loaded animation under a new name and switch to that new file. The source file is not overwritten.");
+                "Save the currently loaded animation under a new name and switch to that new file. If it belongs to a pending reciprocal-pan edit, both animations are saved as a new linked pair with their calculated blend durations. The source files are not overwritten.");
         }
         ImGui::SameLine();
         ImGui::BeginDisabled(selectedHasEdits);
@@ -59318,25 +59340,38 @@ void UpdateAnimationSaveAsDialogTarget(
         return;
     }
     auto& dialog = runtimeState->saveChanges;
-    const auto enteredName = TrimText(dialog.animationSaveAsName);
-    const auto targetPath = enteredName.empty()
+    const auto currentEnteredName = TrimText(dialog.animationSaveAsName);
+    const auto currentTargetPath = currentEnteredName.empty()
         ? std::filesystem::path{}
         : CurrentAnimationSavePath(
               *runtimeState,
               true,
-              enteredName);
+              currentEnteredName);
+    const auto partnerEnteredName = TrimText(
+        dialog.animationPairSaveAsPartnerName);
+    const auto partnerTargetPath = partnerEnteredName.empty()
+        ? std::filesystem::path{}
+        : UniqueAnimationFilePathForName(
+              *runtimeState,
+              NormalizeAnimationNameFromInput(partnerEnteredName));
     for (auto& item : dialog.items) {
-        if (item.kind != SaveChangesItemKind::Animation ||
-            !item.currentAnimation) {
+        if (item.kind != SaveChangesItemKind::Animation) {
             continue;
         }
-        item.targetPath = targetPath;
-        item.displayName = targetPath.empty()
+        if (item.currentAnimation) {
+            item.targetPath = currentTargetPath;
+        } else if (dialog.animationPairSaveAs) {
+            item.targetPath = partnerTargetPath;
+        } else {
+            continue;
+        }
+        item.displayName = item.targetPath.empty()
             ? "Animation — enter a new name"
             : "Animation — " +
-                  AnimationDisplayNameFromPath(targetPath) +
-                  " (new standalone file)";
-        break;
+                  AnimationDisplayNameFromPath(item.targetPath) +
+                  (dialog.animationPairSaveAs
+                       ? " (new linked-pair file)"
+                       : " (new standalone file)");
     }
 }
 
@@ -59357,21 +59392,78 @@ void RequestSaveChangesDialog(
     dialog.allowItemSelection = !dialog.closeAfterSave;
     dialog.animationSaveAs =
         request == SaveChangesRequest::AnimationAs;
+    const auto currentRegistryIndex =
+        panel.currentFilePath.empty()
+            ? std::nullopt
+            : FindAnimationRegistryIndex(
+                  panel,
+                  std::filesystem::path{panel.currentFilePath});
+    std::vector<std::size_t> pairSaveAsIndices;
+    if (dialog.animationSaveAs && currentRegistryIndex.has_value() &&
+        currentRegistryIndex.value() <
+            panel.availableFileLoopEditPairIds.size()) {
+        const auto& dependencyId = panel.availableFileLoopEditPairIds[
+            currentRegistryIndex.value()];
+        if (!dependencyId.empty()) {
+            for (std::size_t index = 0U;
+                 index < panel.availableFiles.size();
+                 ++index) {
+                if (panel.availableFileLoopEditPairIds[index] ==
+                        dependencyId &&
+                    RegistryAnimationHasEditedVersion(panel, index)) {
+                    pairSaveAsIndices.push_back(index);
+                }
+            }
+            dialog.animationPairSaveAs =
+                pairSaveAsIndices.size() == 2U &&
+                std::find(
+                    pairSaveAsIndices.begin(),
+                    pairSaveAsIndices.end(),
+                    currentRegistryIndex.value()) !=
+                    pairSaveAsIndices.end();
+        }
+    }
     if (dialog.animationSaveAs && panel.currentPath.has_value()) {
+        dialog.animationPairSaveAsCurrentBaseName =
+            AnimationNameFromFilePath(
+                currentRegistryIndex.has_value()
+                    ? panel.availableFiles[currentRegistryIndex.value()]
+                    : std::filesystem::path{panel.currentPath->name});
         dialog.animationSaveAsName =
-            panel.draftAnimationName.empty()
-                ? panel.currentPath->name
-                : panel.draftAnimationName;
+            dialog.animationPairSaveAsCurrentBaseName;
+        if (dialog.animationPairSaveAs) {
+            const auto partnerIndex =
+                pairSaveAsIndices[0U] == currentRegistryIndex.value()
+                    ? pairSaveAsIndices[1U]
+                    : pairSaveAsIndices[0U];
+            dialog.animationPairSaveAsPartnerBaseName =
+                AnimationNameFromFilePath(
+                    panel.availableFiles[partnerIndex]);
+            dialog.animationPairSaveAsPartnerName =
+                dialog.animationPairSaveAsPartnerBaseName.ends_with(
+                    "_Seamed")
+                    ? dialog.animationPairSaveAsPartnerBaseName
+                    : dialog.animationPairSaveAsPartnerBaseName +
+                          "_Seamed";
+            if (!dialog.animationSaveAsName.ends_with("_Seamed")) {
+                dialog.animationSaveAsName += "_Seamed";
+            }
+            dialog.allowItemSelection = false;
+        }
         dialog.focusAnimationSaveAsName = true;
     }
 
+    const bool projectRequiredForPairSaveAs =
+        dialog.animationPairSaveAs;
     if (!runtimeState->persistence.projectFilePath.empty() ||
-        request == SaveChangesRequest::Project) {
+        request == SaveChangesRequest::Project ||
+        projectRequiredForPairSaveAs) {
         const std::filesystem::path projectPath{
             runtimeState->persistence.projectFilePath};
         dialog.items.push_back({
             .kind = SaveChangesItemKind::Project,
             .targetPath = projectPath,
+            .sourcePath = {},
             .currentAnimation = false,
             .selected = !projectPath.empty(),
             .displayName = projectPath.empty()
@@ -59381,15 +59473,27 @@ void RequestSaveChangesDialog(
         });
     }
 
+    if (dialog.animationPairSaveAs) {
+        for (const auto index : pairSaveAsIndices) {
+            const bool isCurrent =
+                index == currentRegistryIndex.value();
+            dialog.items.push_back({
+                .kind = SaveChangesItemKind::Animation,
+                .targetPath = {},
+                .sourcePath = panel.availableFiles[index],
+                .currentAnimation = isCurrent,
+                .selected = true,
+                .displayName = "Animation — enter a new name",
+            });
+        }
+        UpdateAnimationSaveAsDialogTarget(runtimeState);
+        runtimeState->errorMessage.clear();
+        return;
+    }
+
     const bool explicitlySavingAnimation =
         request == SaveChangesRequest::Animation ||
         request == SaveChangesRequest::AnimationAs;
-    const auto currentRegistryIndex =
-        panel.currentFilePath.empty()
-            ? std::nullopt
-            : FindAnimationRegistryIndex(
-                  panel,
-                  std::filesystem::path{panel.currentFilePath});
     const bool currentHasEditedVersion =
         currentRegistryIndex.has_value() &&
         RegistryAnimationHasEditedVersion(
@@ -59420,6 +59524,10 @@ void RequestSaveChangesDialog(
         dialog.items.push_back({
             .kind = SaveChangesItemKind::Animation,
             .targetPath = targetPath,
+            .sourcePath = panel.currentFilePath.empty()
+                              ? std::filesystem::path{}
+                              : std::filesystem::path{
+                                    panel.currentFilePath},
             .currentAnimation = true,
             .selected = !targetPath.empty(),
             .displayName =
@@ -59446,6 +59554,7 @@ void RequestSaveChangesDialog(
         dialog.items.push_back({
             .kind = SaveChangesItemKind::Animation,
             .targetPath = panel.availableFiles[index],
+            .sourcePath = panel.availableFiles[index],
             .currentAnimation = false,
             .selected = !dialog.animationSaveAs,
             .displayName = "Animation — " + displayName + "_Edited",
@@ -59462,6 +59571,7 @@ struct PreparedAnimationSave {
     AnimationPath path;
     bool currentAnimation = false;
     bool saveAsCopy = false;
+    bool linkedPairSaveAsCopy = false;
     bool detachedForSaveAs = false;
     std::optional<std::size_t> sourceRegistryIndex;
     std::filesystem::path sourcePath;
@@ -59492,10 +59602,13 @@ std::optional<PreparedAnimationSave> PrepareAnimationSave(
             }
             return std::nullopt;
         }
-        if (!panel.currentFilePath.empty()) {
+        const auto currentSourcePath = !item.sourcePath.empty()
+            ? item.sourcePath
+            : std::filesystem::path{panel.currentFilePath};
+        if (!currentSourcePath.empty()) {
             prepared.sourceRegistryIndex = FindAnimationRegistryIndex(
                 panel,
-                std::filesystem::path{panel.currentFilePath});
+                currentSourcePath);
         }
         const bool sourceHasEditedVersion =
             prepared.sourceRegistryIndex.has_value() &&
@@ -59517,36 +59630,6 @@ std::optional<PreparedAnimationSave> PrepareAnimationSave(
             !panel.draftAnimationName.empty()) {
             prepared.path.name = panel.draftAnimationName;
         }
-        if (panel.currentFilePath.empty() ||
-            !PathsLexicallyEqual(
-                std::filesystem::path{panel.currentFilePath},
-                item.targetPath)) {
-            if (!prepared.loopEditPairId.empty() &&
-                panel.reciprocalPanTimingTakeCloneIds.contains(
-                    prepared.loopEditPairId)) {
-                if (errorMessage != nullptr) {
-                    *errorMessage =
-                        "Save or discard the reciprocal pan pair before using Save As; its retimed Timing Takes belong to the pending project transaction.";
-                }
-                return std::nullopt;
-            }
-            prepared.saveAsCopy = true;
-            prepared.path.name = AnimationNameFromFilePath(item.targetPath);
-            prepared.detachedForSaveAs =
-                prepared.path.velocityBlendLink.has_value() ||
-                std::any_of(
-                    prepared.path.keys.begin(),
-                    prepared.path.keys.end(),
-                    [](const auto& key) {
-                        return !key.linkedCameraId.empty();
-                    });
-            prepared.path.velocityBlendLink.reset();
-            for (auto& key : prepared.path.keys) {
-                key.linkedCameraId.clear();
-                key.linkedCameraName.clear();
-            }
-        }
-
         const bool savingDuringRenderSetupOverride =
             runtimeState->activeRenderSetupOverride.has_value();
         if (savingDuringRenderSetupOverride) {
@@ -59564,8 +59647,11 @@ std::optional<PreparedAnimationSave> PrepareAnimationSave(
             prepared.path.tempWaterAnimationTrailSettings.reset();
         }
     } else {
+        const auto sourcePath = item.sourcePath.empty()
+            ? item.targetPath
+            : item.sourcePath;
         const auto registryIndex =
-            FindAnimationRegistryIndex(panel, item.targetPath);
+            FindAnimationRegistryIndex(panel, sourcePath);
         if (!registryIndex.has_value() ||
             !RegistryAnimationHasEditedVersion(
                 panel,
@@ -59573,7 +59659,7 @@ std::optional<PreparedAnimationSave> PrepareAnimationSave(
             if (errorMessage != nullptr) {
                 *errorMessage =
                     "Cannot save modified animation " +
-                    item.targetPath.filename().string() +
+                    sourcePath.filename().string() +
                     " because its in-memory path is unavailable.";
             }
             return std::nullopt;
@@ -59584,6 +59670,51 @@ std::optional<PreparedAnimationSave> PrepareAnimationSave(
             panel.availableFileEditedPaths[registryIndex.value()].value();
         prepared.loopEditPairId =
             panel.availableFileLoopEditPairIds[registryIndex.value()];
+    }
+
+    const bool savesToDifferentPath =
+        prepared.sourcePath.empty() ||
+        !PathsLexicallyEqual(
+            prepared.sourcePath,
+            prepared.targetPath);
+    if (savesToDifferentPath) {
+        prepared.linkedPairSaveAsCopy =
+            runtimeState->saveChanges.animationPairSaveAs &&
+            prepared.sourceRegistryIndex.has_value() &&
+            !prepared.loopEditPairId.empty();
+        if (!prepared.linkedPairSaveAsCopy &&
+            !prepared.loopEditPairId.empty() &&
+            panel.reciprocalPanTimingTakeCloneIds.contains(
+                prepared.loopEditPairId)) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "Use Save Linked Pair As, Save Changes, or Discard for this reciprocal pan pair; its retimed Timing Takes belong to the pending project transaction.";
+            }
+            return std::nullopt;
+        }
+        prepared.saveAsCopy = true;
+        prepared.path.name = AnimationNameFromFilePath(
+            prepared.targetPath);
+        const bool hasLinkedCamera = std::any_of(
+            prepared.path.keys.begin(),
+            prepared.path.keys.end(),
+            [](const auto& key) {
+                return !key.linkedCameraId.empty();
+            });
+        prepared.detachedForSaveAs =
+            !prepared.linkedPairSaveAsCopy &&
+            (prepared.path.velocityBlendLink.has_value() ||
+             hasLinkedCamera);
+        if (!prepared.linkedPairSaveAsCopy) {
+            prepared.path.velocityBlendLink.reset();
+        }
+        // A copied animation must not keep editing the source project's
+        // shared CameraShots. Reciprocal blend metadata is independent and
+        // remains intact for a linked-pair copy.
+        for (auto& key : prepared.path.keys) {
+            key.linkedCameraId.clear();
+            key.linkedCameraName.clear();
+        }
     }
 
     EnsureAnimationDefaultLiveViewWindowSize(
@@ -59642,6 +59773,12 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
                 "Enter a name for the new animation.";
             return false;
         }
+        if (dialog.animationPairSaveAs &&
+            TrimText(dialog.animationPairSaveAsPartnerName).empty()) {
+            dialog.errorMessage =
+                "Enter a name for the partner animation.";
+            return false;
+        }
     }
     std::vector<PreparedAnimationSave> animations;
     const SaveChangesItem* projectItem = nullptr;
@@ -59674,6 +59811,91 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
         return false;
     }
 
+    if (dialog.animationPairSaveAs) {
+        if (projectItem == nullptr) {
+            dialog.errorMessage =
+                "Save Linked Pair As also updates the project. Save the project first, then try again.";
+            return false;
+        }
+        if (animations.size() != 2U ||
+            !std::all_of(
+                animations.begin(),
+                animations.end(),
+                [](const PreparedAnimationSave& animation) {
+                    return animation.linkedPairSaveAsCopy &&
+                           animation.path.velocityBlendLink.has_value();
+                })) {
+            dialog.errorMessage =
+                "The reciprocal pan pair is no longer complete. Reopen Save As from either _Edited member.";
+            return false;
+        }
+        if (PathsLexicallyEqual(
+                animations[0U].targetPath,
+                animations[1U].targetPath)) {
+            dialog.errorMessage =
+                "Choose two different animation names for the linked pair.";
+            return false;
+        }
+        if (animations[0U].loopEditPairId.empty() ||
+            animations[0U].loopEditPairId !=
+                animations[1U].loopEditPairId) {
+            dialog.errorMessage =
+                "The two _Edited animations no longer share one reciprocal-pan dependency.";
+            return false;
+        }
+
+        const auto& firstLink =
+            animations[0U].path.velocityBlendLink.value();
+        const auto& secondLink =
+            animations[1U].path.velocityBlendLink.value();
+        const auto finiteNonnegative = [](float value) {
+            return std::isfinite(value) && value >= 0.0F;
+        };
+        constexpr float kFrameSecondsTolerance =
+            1.0F / (30.0F * 1024.0F);
+        const bool reciprocalBounds =
+            finiteNonnegative(firstLink.startOverlapSeconds) &&
+            finiteNonnegative(firstLink.endOverlapSeconds) &&
+            finiteNonnegative(secondLink.startOverlapSeconds) &&
+            finiteNonnegative(secondLink.endOverlapSeconds) &&
+            std::abs(
+                firstLink.startOverlapSeconds -
+                secondLink.endOverlapSeconds) <=
+                kFrameSecondsTolerance &&
+            std::abs(
+                firstLink.endOverlapSeconds -
+                secondLink.startOverlapSeconds) <=
+                kFrameSecondsTolerance;
+        const float firstDuration = invisible_places::camera::
+            AnimationPathDurationSeconds(animations[0U].path);
+        const float secondDuration = invisible_places::camera::
+            AnimationPathDurationSeconds(animations[1U].path);
+        if (!reciprocalBounds ||
+            firstLink.startOverlapSeconds +
+                    firstLink.endOverlapSeconds >
+                firstDuration + kFrameSecondsTolerance ||
+            secondLink.startOverlapSeconds +
+                    secondLink.endOverlapSeconds >
+                secondDuration + kFrameSecondsTolerance) {
+            dialog.errorMessage =
+                "The calculated reciprocal blend durations are invalid or no longer match. Rebuild the seam preview before saving.";
+            return false;
+        }
+
+        const auto copiedPairId =
+            "reciprocal_pan_copy_" +
+            std::to_string(
+                std::chrono::steady_clock::now()
+                    .time_since_epoch()
+                    .count());
+        animations[0U].path.velocityBlendLink->pairId = copiedPairId;
+        animations[1U].path.velocityBlendLink->pairId = copiedPairId;
+        animations[0U].path.velocityBlendLink->partnerFileName =
+            animations[1U].targetPath.filename().string();
+        animations[1U].path.velocityBlendLink->partnerFileName =
+            animations[0U].targetPath.filename().string();
+    }
+
     std::unordered_map<
         std::string,
         std::vector<const PreparedAnimationSave*>> loopPairSaves;
@@ -59684,12 +59906,14 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
             PathsLexicallyEqual(
                 animation.sourcePath,
                 animation.targetPath);
-        if (overwritesSource) {
+        if (overwritesSource ||
+            animation.linkedPairSaveAsCopy) {
             selectedSourceIndices.insert(
                 animation.sourceRegistryIndex.value());
         }
         if (!animation.loopEditPairId.empty()) {
-            if (animation.saveAsCopy) {
+            if (animation.saveAsCopy &&
+                !animation.linkedPairSaveAsCopy) {
                 // Save As is a detached snapshot. It neither commits nor
                 // consumes the source pair's joint _Edited dependency.
                 continue;
@@ -59970,6 +60194,33 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
             ApplyAnimationScrub(runtimeState);
         }
     }
+    const bool savedLinkedPairAsCopy = std::any_of(
+        animations.begin(),
+        animations.end(),
+        [](const PreparedAnimationSave& animation) {
+            return animation.linkedPairSaveAsCopy;
+        });
+    if (savedLinkedPairAsCopy) {
+        // The source files remain untouched, but their joint in-memory edit
+        // has now been materialized as the new linked pair. Clear the source
+        // shadows by path after registry insertion (which may reorder it).
+        for (const auto& animation : animations) {
+            if (!animation.linkedPairSaveAsCopy ||
+                animation.sourcePath.empty()) {
+                continue;
+            }
+            const auto sourceIndex = FindAnimationRegistryIndex(
+                panel,
+                animation.sourcePath);
+            if (!sourceIndex.has_value()) {
+                continue;
+            }
+            EnsureAnimationAssociationStorage(&panel);
+            panel.availableFileEditedPaths[sourceIndex.value()].reset();
+            panel.availableFileLoopEditPairIds[sourceIndex.value()].clear();
+            panel.availableFileDirtyFlags[sourceIndex.value()] = false;
+        }
+    }
     if (!animations.empty()) {
         panel.animationRegistryInitialized = true;
     }
@@ -60010,8 +60261,21 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
         animations.begin(),
         animations.end(),
         [](const PreparedAnimationSave& animation) {
-            return animation.saveAsCopy;
+            return animation.saveAsCopy &&
+                   !animation.linkedPairSaveAsCopy;
         });
+    std::string linkedPairStatus;
+    if (savedLinkedPairAsCopy && animations.size() == 2U &&
+        animations[0U].path.velocityBlendLink.has_value()) {
+        const auto& link =
+            animations[0U].path.velocityBlendLink.value();
+        linkedPairStatus =
+            " The new A/B files remain reciprocally linked with " +
+            FormatFixed(link.startOverlapSeconds, 2) +
+            " s start and " +
+            FormatFixed(link.endOverlapSeconds, 2) +
+            " s end blend durations; the source files were left unchanged.";
+    }
     runtimeState->statusMessage =
         "Saved " + std::to_string(replacements.size()) +
         (replacements.size() == 1U ? " file." : " files.") +
@@ -60021,6 +60285,7 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
         (detachedSaveAs
              ? " The new animation is independent of the source's velocity pair and linked camera controls."
              : "") +
+        linkedPairStatus +
         (savedAsCopy
              ? " The source animation and any _Edited state were left unchanged."
              : "");
@@ -60072,9 +60337,12 @@ void DrawSaveChangesDialog(PreviewRuntimeState* runtimeState) {
         ImGui::CloseCurrentPopup();
     };
 
-    ImGui::TextWrapped(dialog.closeAfterSave
-                           ? "These files contain the session state that can be saved before Invisible Places closes."
-                           : "Select the changed files to save together.");
+    ImGui::TextWrapped(
+        dialog.closeAfterSave
+            ? "These files contain the session state that can be saved before Invisible Places closes."
+        : dialog.animationPairSaveAs
+            ? "Save the processed A/B animations as a new linked pair. Both animations and the project are written atomically."
+            : "Select the changed files to save together.");
     if (dialog.animationSaveAs) {
         ImGui::Spacing();
         if (dialog.focusAnimationSaveAsName) {
@@ -60085,10 +60353,31 @@ void DrawSaveChangesDialog(PreviewRuntimeState* runtimeState) {
                 "New Animation Name",
                 &dialog.animationSaveAsName)) {
             dialog.errorMessage.clear();
+            if (dialog.animationPairSaveAs &&
+                !dialog.animationPairSaveAsPartnerNameEdited &&
+                dialog.animationSaveAsName.starts_with(
+                    dialog.animationPairSaveAsCurrentBaseName)) {
+                dialog.animationPairSaveAsPartnerName =
+                    dialog.animationPairSaveAsPartnerBaseName +
+                    dialog.animationSaveAsName.substr(
+                        dialog.animationPairSaveAsCurrentBaseName.size());
+            }
+        }
+        if (dialog.animationPairSaveAs &&
+            InputTextString(
+                "Partner Animation Name",
+                &dialog.animationPairSaveAsPartnerName)) {
+            dialog.animationPairSaveAsPartnerNameEdited = true;
+            dialog.errorMessage.clear();
         }
         UpdateAnimationSaveAsDialogTarget(runtimeState);
-        ImGui::TextDisabled(
-            "A unique .ipanim.json file will be created; the source file is not overwritten.");
+        if (dialog.animationPairSaveAs) {
+            ImGui::TextWrapped(
+                "The reciprocal link, generated movable keys, and calculated start/end blend durations are preserved. The source animation files are not overwritten.");
+        } else {
+            ImGui::TextDisabled(
+                "A unique .ipanim.json file will be created; the source file is not overwritten.");
+        }
     }
     ImGui::Spacing();
 
@@ -60112,8 +60401,9 @@ void DrawSaveChangesDialog(PreviewRuntimeState* runtimeState) {
                 item.kind == SaveChangesItemKind::Animation &&
                 !(dialog.animationSaveAs &&
                   item.currentAnimation)) {
-                const auto sourcePath =
-                    item.currentAnimation &&
+                const auto sourcePath = !item.sourcePath.empty()
+                    ? item.sourcePath
+                    : item.currentAnimation &&
                             !runtimeState->animationPanel.currentFilePath.empty()
                         ? std::filesystem::path{
                               runtimeState->animationPanel.currentFilePath}
@@ -60138,7 +60428,9 @@ void DrawSaveChangesDialog(PreviewRuntimeState* runtimeState) {
                                 continue;
                             }
                             const auto candidateSourcePath =
-                                candidate.currentAnimation &&
+                                !candidate.sourcePath.empty()
+                                    ? candidate.sourcePath
+                                : candidate.currentAnimation &&
                                         !runtimeState->animationPanel
                                              .currentFilePath.empty()
                                     ? std::filesystem::path{
@@ -60216,11 +60508,15 @@ void DrawSaveChangesDialog(PreviewRuntimeState* runtimeState) {
         });
     const bool saveAsNameMissing =
         dialog.animationSaveAs &&
-        TrimText(dialog.animationSaveAsName).empty();
+        (TrimText(dialog.animationSaveAsName).empty() ||
+         (dialog.animationPairSaveAs &&
+          TrimText(dialog.animationPairSaveAsPartnerName).empty()));
     ImGui::BeginDisabled(!anySelected || saveAsNameMissing);
     const char* saveButtonLabel =
         dialog.closeAfterSave
             ? "Save All and Close"
+        : dialog.animationPairSaveAs
+            ? "Save Linked Pair As"
             : "Save Selected";
     if (ImGui::Button(saveButtonLabel)) {
         dialog.errorMessage.clear();

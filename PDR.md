@@ -170,7 +170,10 @@ time during offline export.
 Apply shall create reciprocal blend metadata when A and B were unlinked, or
 update their existing reciprocal pair. The overlap metadata, eligible terminal
 key IDs, saved-animation link mirror, and pair dependency shall update together
-so A, B, and the project save or discard as one transaction.
+so A, B, and the project save or discard as one transaction. Save As on this
+pending dependency shall create two newly named, reciprocally linked animation
+files, retarget their partner filenames, preserve the calculated start/end
+blend durations, and save both files with the project atomically.
 
 #### FR-CAM-18
 Before fitting, the assistant shall let the user flip between A and B, select
