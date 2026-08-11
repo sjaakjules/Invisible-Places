@@ -855,15 +855,21 @@ enum class AnimationReciprocalPanWizardStage : std::uint8_t {
     Seam1SourceTriangle,
     Seam1DestinationTriangle,
     Seam1TailExtent,
+    Seam1Review,
     Seam2SourceTriangle,
     Seam2DestinationTriangle,
     Seam2TailExtent,
+    Seam2Review,
     EditCorrespondences,
     Preview,
 };
 
 struct AnimationReciprocalPanObservation {
     bool captured = false;
+    // Destination triangles begin from one anchor click. Their front/side
+    // axes are copied from the source triangle in camera-local coordinates;
+    // manual destination-axis edits opt out of later automatic regeneration.
+    bool cameraLocalAxesGenerated = false;
     int pathRole = 0;  // 0 = A/current, 1 = B/partner.
     std::uint32_t frame = 0U;
     float normalizedPosition = 0.0F;
@@ -890,11 +896,17 @@ struct AnimationReciprocalPanWizardState {
     bool clipPlanesNormalizedForExtension = false;
     float normalizedNearPlane = 0.0F;
     float normalizedFarPlane = 0.0F;
-    // Ordered as A-start, B-end, B-start, A-end. Corresponding triangle
-    // nodes keep the same 0..2 index on both sides of each seam.
+    // Ordered as A-start, B-end, B-start, A-end. Node roles are anchor,
+    // ground/front (toward camera), and side (along the pan direction).
+    // Corresponding nodes keep the same 0..2 index on both sides.
     std::array<AnimationReciprocalPanObservation, 4> endpointTriangles;
     std::array<std::uint32_t, 2> sourceTailFrames{};
     std::array<std::uint32_t, 2> sourceTailFrameDrafts{};
+    std::array<std::optional<
+        invisible_places::camera::AnimationPanTerminalExtensionResult>, 2>
+        seamPreviews;
+    int seamReviewView = 1;  // 0 = source, 1 = fitted destination.
+    std::uint32_t seamReviewOffsetFrame = 0U;
     std::optional<
         invisible_places::camera::AnimationReciprocalPanExtensionResult>
         candidate;
@@ -2795,6 +2807,27 @@ struct AnimationReciprocalPanFitJobRuntime {
     std::shared_ptr<AnimationReciprocalPanFitJobShared> shared;
 };
 
+struct AnimationPanSeamPreviewJobResult {
+    std::uint64_t generation = 0U;
+    std::size_t seamIndex = 0U;
+    std::array<std::filesystem::path, 2> filePaths;
+    std::array<std::uint64_t, 2> motionFingerprints{};
+    float aspectRatio = 16.0F / 9.0F;
+    invisible_places::camera::AnimationPanTerminalExtensionResult result;
+};
+
+struct AnimationPanSeamPreviewJobShared {
+    std::mutex mutex;
+    bool completed = false;
+    AnimationPanSeamPreviewJobResult result;
+};
+
+struct AnimationPanSeamPreviewJobRuntime {
+    std::uint64_t activeGeneration = 0U;
+    std::jthread worker;
+    std::shared_ptr<AnimationPanSeamPreviewJobShared> shared;
+};
+
 struct PreviewRuntimeState {
     std::vector<PreviewLayerSession> sessions;
     std::uint64_t nextPointCloudContentGeneration = 1U;
@@ -2817,6 +2850,7 @@ struct PreviewRuntimeState {
     AnimationMatchingFrameGhostJobRuntime
         animationMatchingFrameGhostJob{};
     AnimationReciprocalPanFitJobRuntime animationReciprocalPanFitJob{};
+    AnimationPanSeamPreviewJobRuntime animationPanSeamPreviewJob{};
     AnimationPlaybackState animationPlayback{};
     TimingsPanelState timingsPanel{};
     TimingColouriseHistogramRuntime timingColouriseHistogram{};
@@ -9348,6 +9382,15 @@ std::filesystem::path AssociationPathForSession(const PreviewLayerSession& sessi
     return session.sourcePath.lexically_normal();
 }
 
+bool IsReciprocalPanPickSession(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& session) {
+    return IsAssociableLidarSession(session) &&
+        !session.pivotSamples.empty() &&
+        (IsCpuReadyAnalysisPointCloudSource(session) ||
+         IsRenderablePointCloudSource(runtimeState, session));
+}
+
 void NormalizeAssociatedLayerPaths(std::vector<std::filesystem::path>* paths) {
     if (paths == nullptr) {
         return;
@@ -10100,11 +10143,7 @@ ResolveReciprocalPanSurfacePatch(
     std::vector<PivotCandidate> candidates;
     candidates.reserve(256U);
     for (const auto& session : runtimeState.sessions) {
-        const bool usable =
-            IsAssociableLidarSession(session) &&
-            !session.pivotSamples.empty() &&
-            IsCpuReadyAnalysisPointCloudSource(session);
-        if (!usable ||
+        if (!IsReciprocalPanPickSession(runtimeState, session) ||
             NormalizePathKey(AssociationPathForSession(session)) !=
                 commonSceneKey) {
             continue;
@@ -44042,6 +44081,118 @@ void DrawAnimationCurveOverlay(
     }
 }
 
+bool IsReciprocalPanDestinationTriangle(std::size_t triangleIndex) {
+    return triangleIndex == 1U || triangleIndex == 3U;
+}
+
+std::size_t ReciprocalPanSourceTriangleForDestination(
+    std::size_t destinationTriangleIndex) {
+    return destinationTriangleIndex == 3U ? 2U : 0U;
+}
+
+// A destination seam needs only one user-picked anchor. Rotate the source
+// triangle's two physical offsets from its camera frame into the destination
+// camera frame, preserving distance, handedness, and the explicit
+// front/side node roles even when the two endpoint cameras have different
+// orientations. These are private wizard observations, never scene edits.
+bool BuildReciprocalPanCameraLocalDestinationTriangle(
+    AnimationReciprocalPanWizardState* wizard,
+    std::size_t destinationTriangleIndex,
+    const std::array<float, 3>& destinationAnchor,
+    ImVec2 normalizedAnchorScreen) {
+    if (wizard == nullptr ||
+        !IsReciprocalPanDestinationTriangle(destinationTriangleIndex)) {
+        return false;
+    }
+    const std::size_t sourceTriangleIndex =
+        ReciprocalPanSourceTriangleForDestination(destinationTriangleIndex);
+    const auto& sourceObservation =
+        wizard->endpointTriangles[sourceTriangleIndex];
+    if (!sourceObservation.captured ||
+        sourceObservation.patch.pointCount != 3U) {
+        return false;
+    }
+
+    const std::size_t sourceRole = sourceTriangleIndex == 0U ? 0U : 1U;
+    const std::size_t destinationRole =
+        destinationTriangleIndex == 1U ? 1U : 0U;
+    const auto& sourcePath = wizard->baselinePaths[sourceRole];
+    const auto& destinationPath = wizard->baselinePaths[destinationRole];
+    const auto sourceEvaluation = invisible_places::camera::EvaluateAnimationPath(
+        sourcePath,
+        static_cast<float>(sourceObservation.frame) / 30.0F);
+    const auto destinationEvaluation =
+        invisible_places::camera::EvaluateAnimationPath(
+            destinationPath,
+            static_cast<float>(
+                wizard->endpointTriangles[destinationTriangleIndex].frame) /
+                30.0F);
+    const auto generated = invisible_places::camera::
+        BuildAnimationCameraLocalSurfacePatch(
+            sourceEvaluation,
+            destinationEvaluation,
+            sourceObservation.patch,
+            destinationAnchor);
+    if (generated.pointCount != 3U) {
+        return false;
+    }
+    auto& destinationObservation =
+        wizard->endpointTriangles[destinationTriangleIndex];
+    destinationObservation.patch = generated;
+    destinationObservation.normalizedScreens[0U] = normalizedAnchorScreen;
+    for (std::size_t node = 1U; node < 3U; ++node) {
+        destinationObservation.normalizedScreens[node] =
+            normalizedAnchorScreen;
+    }
+    destinationObservation.captured = true;
+    destinationObservation.cameraLocalAxesGenerated = true;
+    return true;
+}
+
+void SetReciprocalPanTriangleNode(
+    AnimationReciprocalPanWizardState* wizard,
+    std::size_t triangleIndex,
+    std::size_t nodeIndex,
+    const std::array<float, 3>& point) {
+    if (wizard == nullptr || triangleIndex >= 4U || nodeIndex >= 3U) {
+        return;
+    }
+    auto& observation = wizard->endpointTriangles[triangleIndex];
+    if (IsReciprocalPanDestinationTriangle(triangleIndex) &&
+        nodeIndex == 0U && observation.patch.pointCount == 3U) {
+        const glm::vec3 previous{
+            observation.patch.worldPoints[0U][0U],
+            observation.patch.worldPoints[0U][1U],
+            observation.patch.worldPoints[0U][2U],
+        };
+        const glm::vec3 next{point[0U], point[1U], point[2U]};
+        const glm::vec3 delta = next - previous;
+        for (std::size_t node = 1U; node < 3U; ++node) {
+            auto& related = observation.patch.worldPoints[node];
+            related[0U] += delta.x;
+            related[1U] += delta.y;
+            related[2U] += delta.z;
+        }
+    } else if (IsReciprocalPanDestinationTriangle(triangleIndex) &&
+               nodeIndex > 0U) {
+        observation.cameraLocalAxesGenerated = false;
+    }
+    observation.patch.worldPoints[nodeIndex] = point;
+
+    if (triangleIndex == 0U || triangleIndex == 2U) {
+        const std::size_t destinationIndex = triangleIndex + 1U;
+        const auto& destination = wizard->endpointTriangles[destinationIndex];
+        if (observation.patch.pointCount == 3U &&
+            destination.captured && destination.cameraLocalAxesGenerated) {
+            BuildReciprocalPanCameraLocalDestinationTriangle(
+                wizard,
+                destinationIndex,
+                destination.patch.worldPoints[0U],
+                destination.normalizedScreens[0U]);
+        }
+    }
+}
+
 void DrawReciprocalPanViewportOverlay(
     PreviewRuntimeState* runtimeState,
     const invisible_places::renderer::core::VulkanViewportShell& viewport) {
@@ -44054,6 +44205,35 @@ void DrawReciprocalPanViewportOverlay(
         ImGui::GetBackgroundDrawList(ImGui::GetMainViewport());
     const auto matrices =
         runtimeState->camera.Matrices(CurrentAspectRatio(viewport));
+    if ((wizard.stage == AnimationReciprocalPanWizardStage::Seam1Review ||
+         wizard.stage == AnimationReciprocalPanWizardStage::Seam2Review)) {
+        const std::size_t seamIndex =
+            wizard.stage == AnimationReciprocalPanWizardStage::Seam1Review
+                ? 0U
+                : 1U;
+        if (wizard.seamPreviews[seamIndex].has_value()) {
+            const std::size_t sourceRole = seamIndex;
+            auto& panel = runtimeState->animationPanel;
+            const auto& sourcePrepared = CachedPreparedAnimationPath(
+                &panel,
+                wizard.baselinePaths[sourceRole]);
+            DrawAnimationCurveOverlay(
+                sourcePrepared,
+                matrices,
+                viewport,
+                IM_COL32(55, 205, 255, 205),
+                true);
+            const auto& destinationPrepared = CachedPreparedAnimationPath(
+                &panel,
+                wizard.seamPreviews[seamIndex]->candidate);
+            DrawAnimationCurveOverlay(
+                destinationPrepared,
+                matrices,
+                viewport,
+                IM_COL32(255, 130, 75, 225),
+                true);
+        }
+    }
     if (wizard.stage == AnimationReciprocalPanWizardStage::Preview &&
         wizard.candidate.has_value()) {
         auto& panel = runtimeState->animationPanel;
@@ -44100,8 +44280,8 @@ void DrawReciprocalPanViewportOverlay(
     };
     static constexpr const char* kNodeLabels[] = {
         "anchor",
-        "pan",
-        "ground",
+        "front",
+        "side",
     };
     const std::array<ImU32, 4> triangleColors{
         IM_COL32(70, 205, 255, 245),
@@ -44204,9 +44384,11 @@ void DrawReciprocalPanViewportOverlay(
                        viewport,
                        io.MousePos);
                    nextPoint.has_value() && selectedNodeExists) {
-            auto& point = selectedTriangle.patch.worldPoints[
-                static_cast<std::size_t>(wizard.selectedNodeIndex)];
-            point = {nextPoint->x, nextPoint->y, nextPoint->z};
+            SetReciprocalPanTriangleNode(
+                &wizard,
+                activeTriangle,
+                static_cast<std::size_t>(wizard.selectedNodeIndex),
+                {nextPoint->x, nextPoint->y, nextPoint->z});
             InvalidateReciprocalPanWizardCandidate(&wizard);
         }
     } else if (selectedNodeExists && viewportInteractive &&
@@ -44281,12 +44463,10 @@ void DrawReciprocalPanViewportOverlay(
                     io.MousePos,
                     wizard.commonSceneKey);
                 if (patch.has_value()) {
-                    selectedTriangle.patch.worldPoints[replacementNode] =
-                        patch->worldPoints[0U];
                     const auto local = ToRenderViewportLocal(
                         viewport,
                         io.MousePos);
-                    selectedTriangle.normalizedScreens[replacementNode] = {
+                    const ImVec2 normalizedScreen{
                         std::clamp(
                             local.x / std::max(1.0F, size.x),
                             0.0F,
@@ -44294,15 +44474,33 @@ void DrawReciprocalPanViewportOverlay(
                         std::clamp(
                             local.y / std::max(1.0F, size.y),
                             0.0F,
-                            1.0F),
-                    };
+                            1.0F)};
+                    const bool regeneratedDestination =
+                        IsReciprocalPanDestinationTriangle(activeTriangle) &&
+                        replacementNode == 0U &&
+                        BuildReciprocalPanCameraLocalDestinationTriangle(
+                            &wizard,
+                            activeTriangle,
+                            patch->worldPoints[0U],
+                            normalizedScreen);
+                    if (!regeneratedDestination) {
+                        SetReciprocalPanTriangleNode(
+                            &wizard,
+                            activeTriangle,
+                            replacementNode,
+                            patch->worldPoints[0U]);
+                        selectedTriangle.normalizedScreens[replacementNode] =
+                            normalizedScreen;
+                    }
                     selectedTriangle.captured =
                         selectedTriangle.patch.pointCount == 3U;
                     wizard.reraycastSelectedNode = false;
                     wizard.anchorPickArmed = false;
                     InvalidateReciprocalPanWizardCandidate(&wizard);
                     runtimeState->statusMessage =
-                        "Re-raycast the selected correspondence node.";
+                        regeneratedDestination
+                            ? "Re-picked the destination anchor and regenerated its camera-local front/side nodes."
+                            : "Re-raycast the selected correspondence node.";
                     runtimeState->errorMessage.clear();
                 } else {
                     wizard.errorMessage =
@@ -44313,12 +44511,17 @@ void DrawReciprocalPanViewportOverlay(
     }
 
     if (wizard.anchorPickArmed && !wizard.inspectionActive) {
+        const bool destinationAnchor =
+            IsReciprocalPanDestinationTriangle(activeTriangle) &&
+            wizard.endpointTriangles[activeTriangle].patch.pointCount == 0U;
         drawList->AddText(
             ImVec2{origin.x + 18.0F, origin.y + 18.0F},
             IM_COL32(255, 235, 150, 255),
             wizard.reraycastSelectedNode
                 ? "Reciprocal Pan Extension: click to replace the selected triangle node"
-                : "Reciprocal Pan Extension: click the next anchor / pan / ground node");
+            : destinationAnchor
+                ? "Reciprocal Pan Extension: click the matching feature centre (front/side are generated)"
+                : "Reciprocal Pan Extension: click anchor / front / side");
     }
 }
 
@@ -50346,21 +50549,25 @@ const char* ReciprocalPanWizardStageLabel(
     AnimationReciprocalPanWizardStage stage) {
     switch (stage) {
         case AnimationReciprocalPanWizardStage::Seam1SourceTriangle:
-            return "1 / 8 - Seam 1: triangle at A start";
+            return "1 / 10 - Seam 1: triangle at A start";
         case AnimationReciprocalPanWizardStage::Seam1DestinationTriangle:
-            return "2 / 8 - Seam 1: corresponding triangle at B end";
+            return "2 / 10 - Seam 1: matching anchor at B end";
         case AnimationReciprocalPanWizardStage::Seam1TailExtent:
-            return "3 / 8 - Seam 1: choose A opening span (drives B tail)";
+            return "3 / 10 - Seam 1: choose A opening span (drives B tail)";
+        case AnimationReciprocalPanWizardStage::Seam1Review:
+            return "4 / 10 - Seam 1: inspect aligned B tail";
         case AnimationReciprocalPanWizardStage::Seam2SourceTriangle:
-            return "4 / 8 - Seam 2: triangle at B start";
+            return "5 / 10 - Seam 2: triangle at B start";
         case AnimationReciprocalPanWizardStage::Seam2DestinationTriangle:
-            return "5 / 8 - Seam 2: corresponding triangle at A end";
+            return "6 / 10 - Seam 2: matching anchor at A end";
         case AnimationReciprocalPanWizardStage::Seam2TailExtent:
-            return "6 / 8 - Seam 2: choose B opening span (drives A tail)";
+            return "7 / 10 - Seam 2: choose B opening span (drives A tail)";
+        case AnimationReciprocalPanWizardStage::Seam2Review:
+            return "8 / 10 - Seam 2: inspect aligned A tail";
         case AnimationReciprocalPanWizardStage::EditCorrespondences:
-            return "7 / 8 - Review triangle correspondences";
+            return "9 / 10 - Review triangle correspondences";
         case AnimationReciprocalPanWizardStage::Preview:
-            return "8 / 8 - Preview both generated tails";
+            return "10 / 10 - Preview both generated tails";
         case AnimationReciprocalPanWizardStage::Idle:
             break;
     }
@@ -50424,11 +50631,9 @@ std::optional<std::string> ResolveReciprocalPanCommonSceneKey(
             runtimeState.sessions.begin(),
             runtimeState.sessions.end(),
             [&](const PreviewLayerSession& session) {
-                return IsAssociableLidarSession(session) &&
-                       !session.pivotSamples.empty() &&
+                return IsReciprocalPanPickSession(runtimeState, session) &&
                        NormalizePathKey(AssociationPathForSession(session)) ==
-                           key &&
-                       IsCpuReadyAnalysisPointCloudSource(session);
+                           key;
             });
         if (resident) {
             return key;
@@ -50562,7 +50767,7 @@ std::optional<std::string> ReciprocalPanPreflightFailure(
              first,
              second)
              .has_value()) {
-        return "A and B need one common, currently resident point-cloud scene for anchor picking.";
+        return "A and B need one shared associated point-cloud scene that is visible or CPU-resident for anchor picking. Their scene may be rendered while its association or display pick samples are not available; reload/show the shared scene and try again.";
     }
     if (ReciprocalPanSourceTailMaximumFrame(first) < 2U ||
         ReciprocalPanSourceTailMaximumFrame(second) < 2U) {
@@ -50787,11 +50992,13 @@ std::size_t ReciprocalPanStageTriangleIndex(
     switch (wizard.stage) {
         case AnimationReciprocalPanWizardStage::Seam1SourceTriangle:
         case AnimationReciprocalPanWizardStage::Seam1TailExtent:
+        case AnimationReciprocalPanWizardStage::Seam1Review:
             return 0U;
         case AnimationReciprocalPanWizardStage::Seam1DestinationTriangle:
             return 1U;
         case AnimationReciprocalPanWizardStage::Seam2SourceTriangle:
         case AnimationReciprocalPanWizardStage::Seam2TailExtent:
+        case AnimationReciprocalPanWizardStage::Seam2Review:
             return 2U;
         case AnimationReciprocalPanWizardStage::Seam2DestinationTriangle:
             return 3U;
@@ -50815,7 +51022,10 @@ int ReciprocalPanStagePathRole(
         case AnimationReciprocalPanWizardStage::Seam1DestinationTriangle:
         case AnimationReciprocalPanWizardStage::Seam2SourceTriangle:
         case AnimationReciprocalPanWizardStage::Seam2TailExtent:
+        case AnimationReciprocalPanWizardStage::Seam1Review:
             return 1;
+        case AnimationReciprocalPanWizardStage::Seam2Review:
+            return 0;
         case AnimationReciprocalPanWizardStage::EditCorrespondences:
             return ReciprocalPanTrianglePathRole(
                 ReciprocalPanStageTriangleIndex(wizard));
@@ -50834,6 +51044,10 @@ std::uint32_t ReciprocalPanStageFrame(
         case AnimationReciprocalPanWizardStage::Seam2SourceTriangle:
         case AnimationReciprocalPanWizardStage::Seam2TailExtent:
             return 0U;
+        case AnimationReciprocalPanWizardStage::Seam1Review:
+            return ReciprocalPanPathFrameCount(wizard.baselinePaths[1U]);
+        case AnimationReciprocalPanWizardStage::Seam2Review:
+            return ReciprocalPanPathFrameCount(wizard.baselinePaths[0U]);
         case AnimationReciprocalPanWizardStage::Seam1DestinationTriangle:
             return ReciprocalPanPathFrameCount(wizard.baselinePaths[1U]);
         case AnimationReciprocalPanWizardStage::Seam2DestinationTriangle:
@@ -50864,6 +51078,47 @@ void ShowReciprocalPanWizardCanonicalPose(
     }
     auto& wizard = runtimeState->animationPanel.reciprocalPanWizard;
     wizard.inspectionActive = false;
+    if (wizard.stage == AnimationReciprocalPanWizardStage::Seam1Review ||
+        wizard.stage == AnimationReciprocalPanWizardStage::Seam2Review) {
+        const std::size_t seamIndex =
+            wizard.stage == AnimationReciprocalPanWizardStage::Seam1Review
+                ? 0U
+                : 1U;
+        const std::size_t sourceRole = seamIndex;
+        const std::size_t destinationRole = seamIndex == 0U ? 1U : 0U;
+        const std::uint32_t offset = std::min(
+            wizard.seamReviewOffsetFrame,
+            wizard.sourceTailFrames[sourceRole]);
+        if (!wizard.seamPreviews[seamIndex].has_value()) {
+            const auto& destination =
+                wizard.baselinePaths[destinationRole];
+            ApplyAnimationEvaluation(
+                runtimeState,
+                destination,
+                1.0F,
+                false);
+        } else if (wizard.seamReviewView == 0) {
+            const auto& source = wizard.baselinePaths[sourceRole];
+            ApplyAnimationEvaluation(
+                runtimeState,
+                source,
+                ReciprocalPanFramePosition(source, offset),
+                false);
+        } else {
+            const auto& destination =
+                wizard.seamPreviews[seamIndex]->candidate;
+            const std::uint32_t destinationFrame =
+                ReciprocalPanPathFrameCount(
+                    wizard.baselinePaths[destinationRole]) +
+                offset;
+            ApplyAnimationEvaluation(
+                runtimeState,
+                destination,
+                ReciprocalPanFramePosition(destination, destinationFrame),
+                false);
+        }
+        return;
+    }
     if (wizard.stage == AnimationReciprocalPanWizardStage::Preview &&
         wizard.candidate.has_value()) {
         const int role = std::clamp(wizard.previewPose, 0, 3) % 2;
@@ -51013,7 +51268,7 @@ bool ValidateReciprocalPanWizardStaleState(
     if (!commonScene.has_value() ||
         commonScene.value() != wizard.commonSceneKey) {
         if (errorMessage != nullptr) {
-            *errorMessage = "The captured common scene is no longer resident or associated with both animations.";
+            *errorMessage = "The shared scene is no longer visible/CPU-resident or associated with both animations.";
         }
         return false;
     }
@@ -51198,6 +51453,151 @@ void PollAnimationReciprocalPanFitJob(
     if (wizard.stage == AnimationReciprocalPanWizardStage::Preview) {
         ShowReciprocalPanWizardCanonicalPose(runtimeState);
     }
+}
+
+bool RebuildReciprocalPanSeamPreview(
+    PreviewRuntimeState* runtimeState,
+    std::size_t seamIndex,
+    float currentAspectRatio) {
+    if (runtimeState == nullptr || seamIndex > 1U) {
+        return false;
+    }
+    auto& wizard = runtimeState->animationPanel.reciprocalPanWizard;
+    std::string validationError;
+    if (!ValidateReciprocalPanWizardStaleState(
+            *runtimeState,
+            currentAspectRatio,
+            &validationError)) {
+        wizard.errorMessage = std::move(validationError);
+        return false;
+    }
+    const std::size_t sourceTriangle = seamIndex == 0U ? 0U : 2U;
+    const std::size_t destinationTriangle = sourceTriangle + 1U;
+    const std::size_t sourceRole = seamIndex;
+    const std::size_t destinationRole = seamIndex == 0U ? 1U : 0U;
+    if (!wizard.endpointTriangles[sourceTriangle].captured ||
+        !wizard.endpointTriangles[destinationTriangle].captured ||
+        wizard.endpointTriangles[sourceTriangle].patch.pointCount != 3U ||
+        wizard.endpointTriangles[destinationTriangle].patch.pointCount != 3U ||
+        wizard.sourceTailFrames[sourceRole] < 2U) {
+        wizard.errorMessage =
+            "Capture the source triangle, destination anchor, and source span before reviewing this seam.";
+        return false;
+    }
+    auto& job = runtimeState->animationPanSeamPreviewJob;
+    if (job.shared != nullptr) {
+        wizard.errorMessage =
+            "The previous seam preview is still finishing in the background.";
+        return false;
+    }
+
+    invisible_places::camera::AnimationTerminalExtensionSpec specification;
+    specification.sourceTailFrame = wizard.sourceTailFrames[sourceRole];
+    specification.sourcePatch =
+        wizard.endpointTriangles[sourceTriangle].patch;
+    specification.destinationEndPatch =
+        wizard.endpointTriangles[destinationTriangle].patch;
+    const auto destination = wizard.baselinePaths[destinationRole];
+    const auto source = wizard.baselinePaths[sourceRole];
+    const auto filePaths = wizard.filePaths;
+    const auto fingerprints = wizard.baselineFingerprints;
+    const std::uint64_t generation = ++wizard.generation;
+    job.activeGeneration = generation;
+    job.shared = std::make_shared<AnimationPanSeamPreviewJobShared>();
+    const auto shared = job.shared;
+    job.worker = std::jthread(
+        [shared,
+         generation,
+         seamIndex,
+         filePaths,
+         fingerprints,
+         currentAspectRatio,
+         destination,
+         source,
+         specification](std::stop_token /*stopToken*/) mutable {
+            AnimationPanSeamPreviewJobResult completed{
+                .generation = generation,
+                .seamIndex = seamIndex,
+                .filePaths = filePaths,
+                .motionFingerprints = fingerprints,
+                .aspectRatio = currentAspectRatio,
+            };
+            completed.result = invisible_places::camera::
+                BuildAnimationPanTerminalExtensionPreview(
+                    destination,
+                    source,
+                    specification,
+                    currentAspectRatio,
+                    65U,
+                    24U);
+            std::scoped_lock lock{shared->mutex};
+            shared->result = std::move(completed);
+            shared->completed = true;
+        });
+    wizard.fitInProgress = true;
+    wizard.seamPreviews[seamIndex].reset();
+    wizard.seamReviewView = 1;
+    wizard.seamReviewOffsetFrame = 0U;
+    wizard.errorMessage.clear();
+    return true;
+}
+
+void PollAnimationPanSeamPreviewJob(
+    PreviewRuntimeState* runtimeState,
+    float currentAspectRatio) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    auto& job = runtimeState->animationPanSeamPreviewJob;
+    if (job.shared == nullptr) {
+        return;
+    }
+    std::optional<AnimationPanSeamPreviewJobResult> completed;
+    {
+        std::scoped_lock lock{job.shared->mutex};
+        if (!job.shared->completed) {
+            return;
+        }
+        completed = std::move(job.shared->result);
+    }
+    job.shared.reset();
+    if (job.worker.joinable()) {
+        job.worker = std::jthread{};
+    }
+    if (!completed.has_value()) {
+        return;
+    }
+    auto& wizard = runtimeState->animationPanel.reciprocalPanWizard;
+    const auto expectedStage = completed->seamIndex == 0U
+        ? AnimationReciprocalPanWizardStage::Seam1Review
+        : AnimationReciprocalPanWizardStage::Seam2Review;
+    if (!wizard.Active() || wizard.stage != expectedStage ||
+        completed->generation != wizard.generation ||
+        completed->generation != job.activeGeneration ||
+        completed->filePaths != wizard.filePaths ||
+        completed->motionFingerprints != wizard.baselineFingerprints ||
+        std::abs(completed->aspectRatio - wizard.aspectRatio) > 1.0e-5F) {
+        return;
+    }
+    wizard.fitInProgress = false;
+    std::string staleError;
+    if (!ValidateReciprocalPanWizardStaleState(
+            *runtimeState,
+            currentAspectRatio,
+            &staleError)) {
+        wizard.errorMessage = std::move(staleError);
+        return;
+    }
+    if (!completed->result.succeeded || !completed->result.changed) {
+        wizard.errorMessage = completed->result.errorMessage.empty()
+            ? "The selected seam did not produce a usable preview."
+            : completed->result.errorMessage;
+        return;
+    }
+    wizard.seamPreviews[completed->seamIndex] =
+        std::move(completed->result);
+    wizard.errorMessage.clear();
+    ShowReciprocalPanWizardCanonicalPose(runtimeState);
 }
 
 bool StartReciprocalPanWizard(
@@ -51439,7 +51839,7 @@ bool StartReciprocalPanWizard(
     runtimeState->statusMessage =
         panel.reciprocalPanWizard.clipPlanesNormalizedForExtension
             ? "Reciprocal Pan Extension started with a private A/B clip-plane normalization. It is committed only by Apply Both; Cancel leaves both animations unchanged."
-            : "Reciprocal Pan Extension started at seam 1. Capture anchor / pan / ground on A start, match those nodes at B end, then scrub A inward to set B's new tail.";
+            : "Reciprocal Pan Extension started at seam 1. Capture anchor / front / side on A start, click the matching B-end centre, then scrub A inward to set B's new tail.";
     runtimeState->errorMessage.clear();
     ShowReciprocalPanWizardCanonicalPose(runtimeState);
     return true;
@@ -51929,6 +52329,7 @@ void InvalidateReciprocalPanWizardCandidate(
     }
     ++wizard->generation;
     wizard->candidate.reset();
+    wizard->seamPreviews = {};
     wizard->fitInProgress = false;
     wizard->errorMessage.clear();
 }
@@ -51983,11 +52384,15 @@ void BackReciprocalPanWizard(PreviewRuntimeState* runtimeState) {
             AnimationReciprocalPanWizardStage::Seam1SourceTriangle) {
         return;
     }
-    InvalidateReciprocalPanWizardCandidate(&wizard);
+    ++wizard.generation;
+    wizard.candidate.reset();
+    wizard.fitInProgress = false;
+    wizard.errorMessage.clear();
     switch (wizard.stage) {
         case AnimationReciprocalPanWizardStage::Seam1DestinationTriangle:
             wizard.endpointTriangles[1U].patch = {};
             wizard.endpointTriangles[1U].captured = false;
+            wizard.endpointTriangles[1U].cameraLocalAxesGenerated = false;
             wizard.stage =
                 AnimationReciprocalPanWizardStage::Seam1SourceTriangle;
             break;
@@ -51995,15 +52400,21 @@ void BackReciprocalPanWizard(PreviewRuntimeState* runtimeState) {
             wizard.stage =
                 AnimationReciprocalPanWizardStage::Seam1DestinationTriangle;
             break;
+        case AnimationReciprocalPanWizardStage::Seam1Review:
+            wizard.stage =
+                AnimationReciprocalPanWizardStage::Seam1TailExtent;
+            break;
         case AnimationReciprocalPanWizardStage::Seam2SourceTriangle:
             wizard.endpointTriangles[2U].patch = {};
             wizard.endpointTriangles[2U].captured = false;
+            wizard.endpointTriangles[2U].cameraLocalAxesGenerated = false;
             wizard.stage =
-                AnimationReciprocalPanWizardStage::Seam1TailExtent;
+                AnimationReciprocalPanWizardStage::Seam1Review;
             break;
         case AnimationReciprocalPanWizardStage::Seam2DestinationTriangle:
             wizard.endpointTriangles[3U].patch = {};
             wizard.endpointTriangles[3U].captured = false;
+            wizard.endpointTriangles[3U].cameraLocalAxesGenerated = false;
             wizard.stage =
                 AnimationReciprocalPanWizardStage::Seam2SourceTriangle;
             break;
@@ -52011,9 +52422,13 @@ void BackReciprocalPanWizard(PreviewRuntimeState* runtimeState) {
             wizard.stage =
                 AnimationReciprocalPanWizardStage::Seam2DestinationTriangle;
             break;
-        case AnimationReciprocalPanWizardStage::EditCorrespondences:
+        case AnimationReciprocalPanWizardStage::Seam2Review:
             wizard.stage =
                 AnimationReciprocalPanWizardStage::Seam2TailExtent;
+            break;
+        case AnimationReciprocalPanWizardStage::EditCorrespondences:
+            wizard.stage =
+                AnimationReciprocalPanWizardStage::Seam2Review;
             break;
         case AnimationReciprocalPanWizardStage::Preview:
             wizard.stage =
@@ -52067,6 +52482,12 @@ bool ReciprocalPanStageHasRequiredObservation(
                    wizard.sourceTailFrames[1U] <=
                        ReciprocalPanSourceTailMaximumFrame(
                            wizard.baselinePaths[1U]);
+        case AnimationReciprocalPanWizardStage::Seam1Review:
+            return !wizard.fitInProgress &&
+                   wizard.seamPreviews[0U].has_value();
+        case AnimationReciprocalPanWizardStage::Seam2Review:
+            return !wizard.fitInProgress &&
+                   wizard.seamPreviews[1U].has_value();
         case AnimationReciprocalPanWizardStage::EditCorrespondences:
             return std::all_of(
                 wizard.endpointTriangles.begin(),
@@ -52126,6 +52547,14 @@ void AdvanceReciprocalPanWizard(
             break;
         case AnimationReciprocalPanWizardStage::Seam1TailExtent:
             wizard.stage =
+                AnimationReciprocalPanWizardStage::Seam1Review;
+            RebuildReciprocalPanSeamPreview(
+                runtimeState,
+                0U,
+                currentAspectRatio);
+            break;
+        case AnimationReciprocalPanWizardStage::Seam1Review:
+            wizard.stage =
                 AnimationReciprocalPanWizardStage::Seam2SourceTriangle;
             break;
         case AnimationReciprocalPanWizardStage::Seam2SourceTriangle:
@@ -52137,6 +52566,14 @@ void AdvanceReciprocalPanWizard(
                 AnimationReciprocalPanWizardStage::Seam2TailExtent;
             break;
         case AnimationReciprocalPanWizardStage::Seam2TailExtent:
+            wizard.stage =
+                AnimationReciprocalPanWizardStage::Seam2Review;
+            RebuildReciprocalPanSeamPreview(
+                runtimeState,
+                1U,
+                currentAspectRatio);
+            break;
+        case AnimationReciprocalPanWizardStage::Seam2Review:
             wizard.stage =
                 AnimationReciprocalPanWizardStage::EditCorrespondences;
             break;
@@ -52228,6 +52665,9 @@ void DrawReciprocalPanWizard(
     const bool tailExtentStage =
         wizard.stage == AnimationReciprocalPanWizardStage::Seam1TailExtent ||
         wizard.stage == AnimationReciprocalPanWizardStage::Seam2TailExtent;
+    const bool seamReviewStage =
+        wizard.stage == AnimationReciprocalPanWizardStage::Seam1Review ||
+        wizard.stage == AnimationReciprocalPanWizardStage::Seam2Review;
     const int role = ReciprocalPanStagePathRole(wizard);
     if (tailExtentStage) {
         const std::size_t sourceRole = static_cast<std::size_t>(role);
@@ -52269,8 +52709,8 @@ void DrawReciprocalPanWizard(
             wizard.baselinePaths[sourceRole].keys.size() > 2U
                 ? "The limit is the penultimate key frame, keeping the sampled source clear of the terminal segment the reciprocal fit may adjust."
                 : "With two keys the limit is one frame before the end; this is a best-fit source because the sole segment is also terminal alignment motion.");
-    } else if (wizard.stage !=
-               AnimationReciprocalPanWizardStage::Preview) {
+    } else if (!seamReviewStage &&
+               wizard.stage != AnimationReciprocalPanWizardStage::Preview) {
         const auto& path = wizard.baselinePaths[
             static_cast<std::size_t>(role)];
         int inspectFrame = static_cast<int>(std::lround(
@@ -52306,27 +52746,35 @@ void DrawReciprocalPanWizard(
     switch (wizard.stage) {
         case AnimationReciprocalPanWizardStage::Seam1SourceTriangle:
             ImGui::TextWrapped(
-                "At A's first frame, click three non-collinear points on the blend object. Node order is preserved at B's existing end.");
+                "At A's first frame, click the feature anchor, a ground point toward the camera, then a perpendicular side point along (or opposite) the pan direction.");
             break;
         case AnimationReciprocalPanWizardStage::Seam1TailExtent:
             ImGui::TextWrapped(
                 "Temporarily scrub A inward to choose how much of its opening motion becomes B's generated terminal tail.");
             break;
+        case AnimationReciprocalPanWizardStage::Seam1Review:
+            ImGui::TextWrapped(
+                "Scrub the same frame offset on A's source motion and B's fitted old-end/new-tail motion. Flip views to verify that the selected feature tracks and leaves frame smoothly before continuing.");
+            break;
         case AnimationReciprocalPanWizardStage::Seam1DestinationTriangle:
             ImGui::TextWrapped(
-                "Now viewing B's existing last frame. Click the same three physical points in the same node order as A start.");
+                "Now viewing B's existing last frame. Click only the matching feature centre. Front and side nodes are generated from A in B's local camera frame, then remain editable.");
             break;
         case AnimationReciprocalPanWizardStage::Seam2SourceTriangle:
             ImGui::TextWrapped(
-                "At B's first frame, capture a new ordered three-node triangle for seam 2 (B start to A end).");
+                "At B's first frame, capture anchor, ground/front, and pan-side nodes for seam 2 (B start to A end).");
             break;
         case AnimationReciprocalPanWizardStage::Seam2TailExtent:
             ImGui::TextWrapped(
                 "Temporarily scrub B inward to choose how much of its opening motion becomes A's generated terminal tail.");
             break;
+        case AnimationReciprocalPanWizardStage::Seam2Review:
+            ImGui::TextWrapped(
+                "Scrub B's source motion against A's fitted old-end/new-tail motion. Re-pick or adjust the A-end feature if the overlay correspondence is not convincing.");
+            break;
         case AnimationReciprocalPanWizardStage::Seam2DestinationTriangle:
             ImGui::TextWrapped(
-                "Now viewing A's existing last frame. Click the same three physical points in the same node order as B start.");
+                "Now viewing A's existing last frame. Click only the matching feature centre; the B-start front/side offsets are rotated into A's local camera frame automatically.");
             break;
         case AnimationReciprocalPanWizardStage::EditCorrespondences:
             ImGui::TextWrapped(
@@ -52335,6 +52783,101 @@ void DrawReciprocalPanWizard(
         case AnimationReciprocalPanWizardStage::Preview:
         case AnimationReciprocalPanWizardStage::Idle:
             break;
+    }
+
+    if (seamReviewStage) {
+        const std::size_t seamIndex =
+            wizard.stage == AnimationReciprocalPanWizardStage::Seam1Review
+                ? 0U
+                : 1U;
+        const std::size_t sourceRole = seamIndex;
+        const std::size_t destinationRole = seamIndex == 0U ? 1U : 0U;
+        if (wizard.fitInProgress) {
+            ImGui::TextDisabled(
+                "Aligning the existing destination end and fitting its short generated tail in the background...");
+        } else if (!wizard.errorMessage.empty()) {
+            ImGui::TextColored(
+                ImVec4{0.95F, 0.42F, 0.30F, 1.0F},
+                "%s",
+                wizard.errorMessage.c_str());
+            if (ImGui::Button("Retry seam preview")) {
+                RebuildReciprocalPanSeamPreview(
+                    runtimeState,
+                    seamIndex,
+                    aspectRatio);
+            }
+        } else if (wizard.seamPreviews[seamIndex].has_value()) {
+            const auto& preview = wizard.seamPreviews[seamIndex].value();
+            ImGui::Text(
+                "Aligned %s end +%u frames / %u keys | anchor RMS %.5f | rotation residual %.3f deg/s",
+                destinationRole == 0U ? "A" : "B",
+                preview.extensionFrames,
+                preview.appendedKeyCount,
+                preview.anchorOverlayRmsScreenHeights,
+                preview.rotationRateResidualDegreesPerSecond);
+            if (ImGui::RadioButton(
+                    sourceRole == 0U ? "View source A" : "View source B",
+                    wizard.seamReviewView == 0)) {
+                wizard.seamReviewView = 0;
+                ShowReciprocalPanWizardCanonicalPose(runtimeState);
+            }
+            ImGui::SameLine();
+            if (ImGui::RadioButton(
+                    destinationRole == 0U ? "View fitted A" : "View fitted B",
+                    wizard.seamReviewView == 1)) {
+                wizard.seamReviewView = 1;
+                ShowReciprocalPanWizardCanonicalPose(runtimeState);
+            }
+            int offsetFrame = static_cast<int>(std::min(
+                wizard.seamReviewOffsetFrame,
+                wizard.sourceTailFrames[sourceRole]));
+            if (ImGui::SliderInt(
+                    "Synchronized seam offset",
+                    &offsetFrame,
+                    0,
+                    static_cast<int>(wizard.sourceTailFrames[sourceRole]))) {
+                wizard.seamReviewOffsetFrame =
+                    static_cast<std::uint32_t>(offsetFrame);
+                ShowReciprocalPanWizardCanonicalPose(runtimeState);
+            }
+            const std::uint32_t destinationFrame =
+                ReciprocalPanPathFrameCount(
+                    wizard.baselinePaths[destinationRole]) +
+                static_cast<std::uint32_t>(offsetFrame);
+            ImGui::TextDisabled(
+                "Source frame %d <-> fitted %s frame %u. Offset 0 is the adjusted old terminal; the final offset is the generated end.",
+                offsetFrame,
+                destinationRole == 0U ? "A" : "B",
+                destinationFrame);
+            if (ImGui::Button(
+                    destinationRole == 0U
+                        ? "Re-pick A-end feature centre"
+                        : "Re-pick B-end feature centre")) {
+                wizard.stage = seamIndex == 0U
+                    ? AnimationReciprocalPanWizardStage::
+                          Seam1DestinationTriangle
+                    : AnimationReciprocalPanWizardStage::
+                          Seam2DestinationTriangle;
+                wizard.selectedTriangleIndex =
+                    seamIndex == 0U ? 1 : 3;
+                wizard.selectedNodeIndex = 0;
+                wizard.anchorPickArmed = true;
+                wizard.reraycastSelectedNode = true;
+                runtimeState->statusMessage =
+                    "Click the new matching destination feature centre; its camera-local front/side nodes will be regenerated.";
+                ShowReciprocalPanWizardCanonicalPose(runtimeState);
+                return;
+            }
+        } else {
+            ImGui::TextDisabled(
+                "This seam preview is stale because its points or source span changed.");
+            if (ImGui::Button("Build seam preview")) {
+                RebuildReciprocalPanSeamPreview(
+                    runtimeState,
+                    seamIndex,
+                    aspectRatio);
+            }
+        }
     }
 
     const bool triangleStage =
@@ -52395,12 +52938,12 @@ void DrawReciprocalPanWizard(
         int capturedNodes = static_cast<int>(
             std::min<std::uint32_t>(triangle.patch.pointCount, 3U));
         ImGui::Text(
-            "Triangle nodes: %d / 3 (fixed roles: anchor -> pan -> ground)",
+            "Triangle nodes: %d / 3 (fixed roles: anchor -> front -> side)",
             capturedNodes);
         static constexpr const char* kNodeLabels[] = {
             "1 Anchor",
-            "2 Pan",
-            "3 Ground",
+            "2 Front",
+            "3 Side",
         };
         for (int node = 0; node < 3; ++node) {
             if (node > 0) {
@@ -52426,7 +52969,7 @@ void DrawReciprocalPanWizard(
         }
         ImGui::SameLine();
         if (selectedExists) {
-            auto& point = triangle.patch.worldPoints[
+            auto point = triangle.patch.worldPoints[
                 static_cast<std::size_t>(wizard.selectedNodeIndex)];
             ImGui::SetNextItemWidth(210.0F);
             if (ImGui::DragFloat3(
@@ -52436,6 +52979,11 @@ void DrawReciprocalPanWizard(
                     0.0F,
                     0.0F,
                     "%.4f")) {
+                SetReciprocalPanTriangleNode(
+                    &wizard,
+                    triangleIndex,
+                    static_cast<std::size_t>(wizard.selectedNodeIndex),
+                    point);
                 InvalidateReciprocalPanWizardCandidate(&wizard);
             }
         }
@@ -52443,6 +52991,7 @@ void DrawReciprocalPanWizard(
         if (ImGui::Button("Clear this triangle")) {
             triangle.patch = {};
             triangle.captured = false;
+            triangle.cameraLocalAxesGenerated = false;
             wizard.selectedNodeIndex = 0;
             wizard.reraycastSelectedNode = false;
             wizard.anchorPickArmed = true;
@@ -52457,7 +53006,7 @@ void DrawReciprocalPanWizard(
                     ? ImVec4{0.35F, 0.82F, 0.48F, 1.0F}
                     : ImVec4{0.95F, 0.38F, 0.30F, 1.0F},
                 validTriangle
-                    ? "Triangle complete. Double-click a viewport node or use Re-raycast to replace it."
+                    ? "Triangle complete. Double-click a viewport node or use Re-raycast to replace it; destination anchor replacement regenerates its camera-local axes."
                     : "These nodes are duplicate, collinear, or non-finite. Move or re-raycast a node before Next.");
             if (!wizard.reraycastSelectedNode) {
                 wizard.anchorPickArmed = false;
@@ -52587,7 +53136,7 @@ void DrawReciprocalPanWizard(
                     metrics.patchDiagnostic[1U].c_str());
             }
         }
-    } else if (!wizard.errorMessage.empty()) {
+    } else if (!seamReviewStage && !wizard.errorMessage.empty()) {
         ImGui::TextColored(
             ImVec4{0.95F, 0.42F, 0.30F, 1.0F},
             "%s",
@@ -52623,12 +53172,16 @@ void DrawReciprocalPanWizard(
             : wizard.stage == AnimationReciprocalPanWizardStage::Seam1DestinationTriangle
                 ? "Next: choose A tail"
             : wizard.stage == AnimationReciprocalPanWizardStage::Seam1TailExtent
+                ? "Build B seam preview"
+            : wizard.stage == AnimationReciprocalPanWizardStage::Seam1Review
                 ? "Next: B start"
             : wizard.stage == AnimationReciprocalPanWizardStage::Seam2SourceTriangle
                 ? "Next: flip to A end"
             : wizard.stage == AnimationReciprocalPanWizardStage::Seam2DestinationTriangle
                 ? "Next: choose B tail"
             : wizard.stage == AnimationReciprocalPanWizardStage::Seam2TailExtent
+                ? "Build A seam preview"
+            : wizard.stage == AnimationReciprocalPanWizardStage::Seam2Review
                 ? "Next: review triangles"
                 : "Build Preview";
         if (ImGui::Button(nextLabel)) {
@@ -52655,6 +53208,9 @@ void DrawAnimationSection(
 
     auto& panel = runtimeState->animationPanel;
     PollAnimationReciprocalPanFitJob(
+        runtimeState,
+        CurrentAspectRatio(viewport));
+    PollAnimationPanSeamPreviewJob(
         runtimeState,
         CurrentAspectRatio(viewport));
     if (panel.reciprocalPanWizard.Active()) {
@@ -55055,7 +55611,7 @@ void DrawAnimationSection(
                         ? extensionLaunchFailure->c_str()
                     : extensionCanNormalizePrivately
                         ? "First normalizes A/B clip planes in private wizard snapshots, then captures and fits both seams. Apply Both commits normalization with the extensions; Cancel leaves the animations unchanged."
-                        : "Treats A-start/B-end and B-start/A-end as the manually tuned visual 50%-blend poses, captures ordered anchor/pan/ground triangles, selects each opening source span, then previews 2-3 generated keys per destination before creating or updating the reciprocal _Edited pair.");
+                        : "Treats A-start/B-end and B-start/A-end as the manually tuned visual 50%-blend poses. Each source uses anchor/front/side clicks; one matching destination-centre click generates camera-local axes. It then fits and scrubs each seam before the final reciprocal preview.");
             }
             if (extensionLaunchFailure.has_value()) {
                 ImGui::PushStyleColor(
@@ -82200,7 +82756,7 @@ void UpdateCameraFromInput(
             reciprocalWizard.commonSceneKey);
         if (!patch.has_value()) {
             reciprocalWizard.errorMessage =
-                "No cached point-cloud surface from the common scene was found within 48 pixels. Click a denser, visible part of the anchor object.";
+                "No pickable point-cloud surface from the shared scene was found within 48 pixels. Click a denser visible part of the feature.";
             return;
         }
         const auto viewportSize = CurrentUiViewportSize(viewport);
@@ -82231,23 +82787,38 @@ void UpdateCameraFromInput(
                                           : std::min<std::size_t>(
                                                 observation.patch.pointCount,
                                                 2U);
-        observation.patch.worldPoints[nodeIndex] =
-            patch->worldPoints[0U];
-        observation.patch.pointCount = std::max<std::uint32_t>(
-            observation.patch.pointCount,
-            static_cast<std::uint32_t>(nodeIndex + 1U));
-        observation.normalizedScreens[nodeIndex] = ImVec2{
+        const ImVec2 normalizedScreen{
             std::clamp(local.x / std::max(1.0F, viewportSize.x),
                        0.0F,
                        1.0F),
             std::clamp(local.y / std::max(1.0F, viewportSize.y),
                        0.0F,
-                       1.0F),
-        };
+                       1.0F)};
+        const bool generatedDestination =
+            IsReciprocalPanDestinationTriangle(triangleIndex) &&
+            nodeIndex == 0U &&
+            BuildReciprocalPanCameraLocalDestinationTriangle(
+                &reciprocalWizard,
+                triangleIndex,
+                patch->worldPoints[0U],
+                normalizedScreen);
+        if (!generatedDestination) {
+            SetReciprocalPanTriangleNode(
+                &reciprocalWizard,
+                triangleIndex,
+                nodeIndex,
+                patch->worldPoints[0U]);
+            observation.patch.pointCount = std::max<std::uint32_t>(
+                observation.patch.pointCount,
+                static_cast<std::uint32_t>(nodeIndex + 1U));
+            observation.normalizedScreens[nodeIndex] = normalizedScreen;
+        }
         observation.captured = observation.patch.pointCount == 3U;
         reciprocalWizard.selectedTriangleIndex =
             static_cast<int>(triangleIndex);
-        reciprocalWizard.selectedNodeIndex = observation.captured
+        reciprocalWizard.selectedNodeIndex = generatedDestination
+                                                   ? 0
+                                             : observation.captured
                                                    ? static_cast<int>(nodeIndex)
                                                    : static_cast<int>(
                                                          observation.patch
@@ -82260,8 +82831,10 @@ void UpdateCameraFromInput(
         reciprocalWizard.anchorPickArmed = !observation.captured;
         InvalidateReciprocalPanWizardCandidate(&reciprocalWizard);
         runtimeState->statusMessage =
-            observation.captured
-                ? "Captured the ordered anchor / pan / ground triangle. Use Next, or select a node to replace or move it."
+            generatedDestination
+                ? "Captured the destination anchor and generated front/side nodes in the destination camera frame. Use Next, or adjust any node first."
+            : observation.captured
+                ? "Captured the ordered anchor / front / side triangle. Use Next, or select a node to replace or move it."
                 : "Captured triangle node " +
                       std::to_string(observation.patch.pointCount) +
                       " of 3.";

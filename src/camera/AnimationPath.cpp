@@ -3541,6 +3541,103 @@ bool AppendPanTerminal(
 
 }  // namespace
 
+AnimationSurfacePatchObservation
+BuildAnimationCameraLocalSurfacePatch(
+    const AnimationPathEvaluation& source,
+    const AnimationPathEvaluation& destination,
+    const AnimationSurfacePatchObservation& sourcePatch,
+    const std::array<float, 3>& destinationAnchor) {
+    AnimationSurfacePatchObservation result;
+    if (!ValidOrderedPanTriangle(sourcePatch) ||
+        !FinitePanVector(destinationAnchor)) {
+        return result;
+    }
+    const glm::quat sourceOrientationRaw =
+        QuaternionFromArray(source.camera.orientation);
+    const glm::quat destinationOrientationRaw =
+        QuaternionFromArray(destination.camera.orientation);
+    const float sourceLengthSquared = glm::dot(
+        sourceOrientationRaw,
+        sourceOrientationRaw);
+    const float destinationLengthSquared = glm::dot(
+        destinationOrientationRaw,
+        destinationOrientationRaw);
+    if (!std::isfinite(sourceLengthSquared) ||
+        !std::isfinite(destinationLengthSquared) ||
+        sourceLengthSquared <= 1.0e-8F ||
+        destinationLengthSquared <= 1.0e-8F) {
+        return result;
+    }
+    const glm::quat sourceOrientation =
+        glm::normalize(sourceOrientationRaw);
+    const glm::quat destinationOrientation =
+        glm::normalize(destinationOrientationRaw);
+    const glm::quat cameraFrameRotation = glm::normalize(
+        destinationOrientation * glm::inverse(sourceOrientation));
+    const glm::vec3 sourceAnchor = ToGlm(sourcePatch.worldPoints[0U]);
+    const glm::vec3 targetAnchor = ToGlm(destinationAnchor);
+    result.pointCount = 3U;
+    result.worldPoints[0U] = destinationAnchor;
+    for (std::size_t node = 1U; node < 3U; ++node) {
+        const glm::vec3 targetPoint = targetAnchor +
+            cameraFrameRotation *
+                (ToGlm(sourcePatch.worldPoints[node]) - sourceAnchor);
+        result.worldPoints[node] = {
+            targetPoint.x,
+            targetPoint.y,
+            targetPoint.z,
+        };
+    }
+    return result;
+}
+
+AnimationPanTerminalExtensionResult
+BuildAnimationPanTerminalExtensionPreview(
+    const AnimationPath& destination,
+    const AnimationPath& source,
+    const AnimationTerminalExtensionSpec& specification,
+    float aspectRatio,
+    std::uint32_t sampleCount,
+    std::uint32_t optimizationSweeps) {
+    AnimationPanTerminalExtensionResult result;
+    if (!std::isfinite(aspectRatio) || aspectRatio <= 0.0F) {
+        result.errorMessage = "The viewport aspect ratio is invalid.";
+        return result;
+    }
+    if (!FixedLensTargetPanPath(destination, &result.errorMessage) ||
+        !FixedLensTargetPanPath(source, &result.errorMessage)) {
+        return result;
+    }
+    AnimationReciprocalPanExtensionOptions options;
+    options.aspectRatio = aspectRatio;
+    options.sampleCount = sampleCount;
+    options.optimizationSweeps = optimizationSweeps;
+    PanTerminalBuildMetrics metrics;
+    if (!AppendPanTerminal(
+            destination,
+            source,
+            specification,
+            options,
+            &result.candidate,
+            &metrics,
+            &result.errorMessage)) {
+        result.candidate = {};
+        return result;
+    }
+    result.succeeded = true;
+    result.changed = true;
+    result.extensionFrames = metrics.extensionFrames;
+    result.appendedKeyCount = metrics.appendedKeyCount;
+    result.anchorOverlayRmsScreenHeights = metrics.anchorOverlayRms;
+    result.patchNodeOverlayRmsScreenHeights =
+        metrics.patchNodeOverlayRms;
+    result.velocityResidualScreenHeightsPerSecond =
+        metrics.afterVelocityRms;
+    result.rotationRateResidualDegreesPerSecond =
+        metrics.rotationRateResidual;
+    return result;
+}
+
 AnimationReciprocalPanExtensionResult
 BuildAnimationReciprocalPanExtension(
     const AnimationPath& first,

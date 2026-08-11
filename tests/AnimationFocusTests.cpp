@@ -1296,6 +1296,106 @@ TEST_CASE("Reciprocal pan extension appends a short unlinked tail without retimi
         result.metrics.perspectiveScaleResidualPercent[1U]));
 }
 
+TEST_CASE(
+    "Destination seam axes preserve source dimensions in the destination camera frame",
+    "[camera][animation][pan-extension][correspondence]") {
+    invisible_places::camera::AnimationPathEvaluation source;
+    source.camera.orientation = {0.0F, 0.0F, 0.0F, 1.0F};
+    invisible_places::camera::AnimationPathEvaluation destination;
+    constexpr float kHalfSqrtTwo = 0.70710678118F;
+    destination.camera.orientation = {
+        0.0F,
+        0.0F,
+        kHalfSqrtTwo,
+        kHalfSqrtTwo,
+    };
+    invisible_places::camera::AnimationSurfacePatchObservation patch;
+    patch.pointCount = 3U;
+    patch.worldPoints[0U] = {10.0F, 10.0F, 10.0F};
+    patch.worldPoints[1U] = {11.0F, 10.0F, 10.0F};
+    patch.worldPoints[2U] = {10.0F, 12.0F, 10.0F};
+
+    const auto generated = invisible_places::camera::
+        BuildAnimationCameraLocalSurfacePatch(
+            source,
+            destination,
+            patch,
+            {2.0F, 3.0F, 4.0F});
+    REQUIRE(generated.pointCount == 3U);
+    CHECK(generated.worldPoints[0U][0U] == Approx(2.0F));
+    CHECK(generated.worldPoints[0U][1U] == Approx(3.0F));
+    CHECK(generated.worldPoints[0U][2U] == Approx(4.0F));
+    CHECK(generated.worldPoints[1U][0U] == Approx(2.0F).margin(1.0e-5F));
+    CHECK(generated.worldPoints[1U][1U] == Approx(4.0F).margin(1.0e-5F));
+    CHECK(generated.worldPoints[1U][2U] == Approx(4.0F).margin(1.0e-5F));
+    CHECK(generated.worldPoints[2U][0U] == Approx(0.0F).margin(1.0e-5F));
+    CHECK(generated.worldPoints[2U][1U] == Approx(3.0F).margin(1.0e-5F));
+    CHECK(generated.worldPoints[2U][2U] == Approx(4.0F).margin(1.0e-5F));
+
+    patch.worldPoints[2U] = patch.worldPoints[1U];
+    CHECK(invisible_places::camera::BuildAnimationCameraLocalSurfacePatch(
+              source,
+              destination,
+              patch,
+              {2.0F, 3.0F, 4.0F})
+              .pointCount == 0U);
+}
+
+TEST_CASE(
+    "One-seam pan preview uses the same fitted destination as the reciprocal build",
+    "[camera][animation][pan-extension]") {
+    const auto first = MakeReciprocalPanTestPath("A", 1.0F, 41U, 79U);
+    const auto second = MakeReciprocalPanTestPath("B", -1.0F, 54U, 96U);
+    const auto options = MakeReciprocalPanTestOptions();
+    const auto reciprocal = invisible_places::camera::
+        BuildAnimationReciprocalPanExtension(first, second, options);
+    INFO(reciprocal.errorMessage);
+    REQUIRE(reciprocal.succeeded);
+
+    const auto preview = invisible_places::camera::
+        BuildAnimationPanTerminalExtensionPreview(
+            second,
+            first,
+            options.firstDrivesSecond,
+            options.aspectRatio,
+            options.sampleCount,
+            options.optimizationSweeps);
+    INFO(preview.errorMessage);
+    REQUIRE(preview.succeeded);
+    REQUIRE(preview.changed);
+    CHECK(preview.extensionFrames ==
+          reciprocal.metrics.extensionFrames[1U]);
+    CHECK(preview.appendedKeyCount ==
+          reciprocal.metrics.appendedKeyCount[1U]);
+    CHECK(preview.candidate.durationFrames ==
+          reciprocal.secondCandidate.durationFrames);
+    CHECK(preview.candidate.keys.size() ==
+          reciprocal.secondCandidate.keys.size());
+    CHECK(preview.anchorOverlayRmsScreenHeights ==
+          Approx(reciprocal.metrics.anchorOverlayRmsScreenHeights[1U]));
+    CHECK(preview.patchNodeOverlayRmsScreenHeights == Approx(
+          reciprocal.metrics.patchNodeOverlayRmsScreenHeights[1U]));
+
+    const auto previewContext = invisible_places::camera::
+        PrepareAnimationPathEvaluation(preview.candidate);
+    const auto reciprocalContext = invisible_places::camera::
+        PrepareAnimationPathEvaluation(reciprocal.secondCandidate);
+    REQUIRE(previewContext.valid);
+    REQUIRE(reciprocalContext.valid);
+    for (std::uint32_t sample = 0U; sample <= 90U; ++sample) {
+        const float time = previewContext.durationSeconds *
+            static_cast<float>(sample) / 90.0F;
+        CheckPanEvaluationNear(
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                previewContext,
+                time),
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                reciprocalContext,
+                time),
+            1.0e-6F);
+    }
+}
+
 TEST_CASE("Reciprocal pan extension is argument-order independent and atomic on invalid input",
           "[camera][animation][pan-extension]") {
     const auto first = MakeReciprocalPanTestPath("A", 1.0F, 41U, 79U);

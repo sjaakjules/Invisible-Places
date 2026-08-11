@@ -373,6 +373,23 @@ struct AnimationReciprocalPanExtensionResult {
     std::string errorMessage;
 };
 
+// One-side preview used by the guided reciprocal workflow after each seam is
+// captured. It runs the same terminal solver as the final atomic reciprocal
+// build, but returns only the destination candidate and never mutates either
+// input path.
+struct AnimationPanTerminalExtensionResult {
+    bool succeeded = false;
+    bool changed = false;
+    AnimationPath candidate{};
+    std::uint32_t extensionFrames = 0U;
+    std::uint32_t appendedKeyCount = 0U;
+    float anchorOverlayRmsScreenHeights = 0.0F;
+    float patchNodeOverlayRmsScreenHeights = 0.0F;
+    float velocityResidualScreenHeightsPerSecond = 0.0F;
+    float rotationRateResidualDegreesPerSecond = 0.0F;
+    std::string errorMessage;
+};
+
 // Conservative, pair-wide clip normalization used before reciprocal pan
 // fitting. Candidate copies retain every authored pose, timing, lens value,
 // and metadata field except near/far clipping. The smallest valid near plane
@@ -659,10 +676,30 @@ BuildAnimationReciprocalPanExtension(
     const AnimationPath& second,
     const AnimationReciprocalPanExtensionOptions& options = {});
 
+[[nodiscard]] AnimationPanTerminalExtensionResult
+BuildAnimationPanTerminalExtensionPreview(
+    const AnimationPath& destination,
+    const AnimationPath& source,
+    const AnimationTerminalExtensionSpec& specification,
+    float aspectRatio = 16.0F / 9.0F,
+    std::uint32_t sampleCount = 17U,
+    std::uint32_t optimizationSweeps = 24U);
+
 [[nodiscard]] AnimationClipPlaneNormalizationResult
 BuildConservativeAnimationClipPlaneNormalization(
     const AnimationPath& first,
     const AnimationPath& second);
+
+// Copies an ordered source anchor/front/side triangle around a newly picked
+// destination anchor. The two offsets retain their physical lengths and
+// camera-local directions under the source-camera -> destination-camera
+// rotation. A zero-point result indicates invalid input.
+[[nodiscard]] AnimationSurfacePatchObservation
+BuildAnimationCameraLocalSurfacePatch(
+    const AnimationPathEvaluation& source,
+    const AnimationPathEvaluation& destination,
+    const AnimationSurfacePatchObservation& sourcePatch,
+    const std::array<float, 3>& destinationAnchor);
 
 // Jointly adjusts the explicitly selected camera/focus keys of two paths
 // (or endpoints for legacy callers). durationFrames and every per-key

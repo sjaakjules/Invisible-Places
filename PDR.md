@@ -118,17 +118,20 @@ ray misses.
 
 #### FR-CAM-11
 Matching-Frame Key Alignment shall provide an **Extend Both Seams** assistant
-for two target-driven, fixed-lens animations that share a CPU-ready point-cloud
-scene. The animations need not already have velocity-blend metadata; their
-crossed endpoints are treated as the two existing 50%-blend seam poses.
+for two target-driven, fixed-lens animations that share an associated
+point-cloud scene with either CPU analysis samples or a visible committed
+display source. The animations need not already have velocity-blend metadata;
+their crossed endpoints are treated as the two existing 50%-blend seam poses.
 
 #### FR-CAM-12
-The assistant shall collect ordered three-point correspondences for A-start
-against B-end and B-start against A-end, then let the user select a later source
-frame inside A and B. It shall align each existing destination end to the
-opposite source start and constrain signed screen X/Y velocity, in-plane patch
-rotation, overlay position, and perspective scale on the 30 fps animation
-timebase.
+The assistant shall collect ordered anchor/front/side source triangles at
+A-start and B-start. One corresponding feature-centre click at each destination
+end shall rotate those physical offsets into the destination camera frame;
+generated nodes remain individually editable. Each seam shall receive a fitted,
+synchronized source/destination scrub review before proceeding. The final fit
+shall align each existing destination end to the opposite source start and
+constrain signed screen X/Y velocity, in-plane patch rotation, overlay position,
+and perspective scale on the 30 fps animation timebase.
 
 #### FR-CAM-13
 Each successful reciprocal extension shall append, to each destination

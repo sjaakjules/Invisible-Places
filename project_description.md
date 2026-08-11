@@ -254,12 +254,13 @@ For paired slow pans that need more material beneath both wipes,
 **Extend Both Seams…** opens a guided Matching-Frame assistant while A remains
 the active animation. No velocity alignment has to exist first: A-start against
 B-end and B-start against A-end are treated as the two already-authored 50%
-blend poses. For each seam the user marks an ordered triangle—the main feature,
-a point along the pan, and a ground point towards the camera—on both endpoint
-views, then scrubs inward from the source start to choose how much motion should
-continue beyond the partner's current end. The selected triangle remains
-editable before fitting: any node can be selected, re-raycast from either live
-view, or moved with the world-axis gizmo.
+blend poses. For each seam the user marks an ordered source triangle—the main
+feature, a ground/front point towards the camera, and a perpendicular side point
+along or opposite the pan. At the destination end, one matching feature-centre
+click generates the other two nodes with the same physical offsets rotated into
+that camera's local frame. Every generated node remains editable or
+re-raycastable. The user then scrubs inward from the source start to choose how
+much motion should continue beyond the partner's current end.
 
 The fit first makes a small localized correction to each existing destination
 terminal so its triangle overlays the opposite source-start triangle. It then
@@ -271,6 +272,12 @@ duration equals the selected source span, so the bulk pan speed and every old
 key time remain unchanged. The exact base-spline continuation preserves all
 samples through the penultimate key; only the old final segment and generated
 tail may change.
+
+After each seam is captured, a synchronized scrub review flips between the
+source interval and the privately fitted destination old-end/new-tail interval.
+Offset zero shows the adjusted existing terminal; the last offset shows the new
+generated end. This lets the user re-pick the destination feature and rebuild
+that seam before moving to the opposite endpoint.
 
 A Preview can isolate A, B, or their overlay, inspect the extended timeline
 bands and residuals, and compare baseline/candidate poses. Nothing enters the
