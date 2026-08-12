@@ -2,13 +2,44 @@
 
 #include <cstdlib>
 #include <sstream>
+#include <vector>
 
 namespace invisible_places::platform {
 
 namespace {
 
-std::filesystem::path DefaultMoltenVkIcdPath() {
-    return "/opt/homebrew/share/vulkan/icd.d/MoltenVK_icd.json";
+void AppendInstallPrefixCandidates(
+    std::vector<std::filesystem::path>& candidates,
+    const std::filesystem::path& prefix) {
+    candidates.push_back(prefix / "etc/vulkan/icd.d/MoltenVK_icd.json");
+    candidates.push_back(prefix / "share/vulkan/icd.d/MoltenVK_icd.json");
+}
+
+std::filesystem::path FindMoltenVkIcdPath() {
+    std::vector<std::filesystem::path> candidates;
+
+    if (const auto* vulkanSdk = std::getenv("VULKAN_SDK");
+        vulkanSdk != nullptr && *vulkanSdk != '\0') {
+        candidates.emplace_back(
+            std::filesystem::path(vulkanSdk) / "share/vulkan/icd.d/MoltenVK_icd.json");
+    }
+
+    if (const auto* homebrewPrefix = std::getenv("HOMEBREW_PREFIX");
+        homebrewPrefix != nullptr && *homebrewPrefix != '\0') {
+        AppendInstallPrefixCandidates(candidates, homebrewPrefix);
+    }
+
+    AppendInstallPrefixCandidates(candidates, "/opt/homebrew");
+    AppendInstallPrefixCandidates(candidates, "/usr/local");
+
+    for (const auto& candidate : candidates) {
+        std::error_code error;
+        if (std::filesystem::is_regular_file(candidate, error)) {
+            return candidate;
+        }
+    }
+
+    return {};
 }
 
 }  // namespace
@@ -17,15 +48,18 @@ VulkanRuntimeConfig PrepareVulkanRuntime() {
     VulkanRuntimeConfig config;
 
 #if defined(__APPLE__)
-    if (std::getenv("VK_ICD_FILENAMES") == nullptr) {
-        const auto defaultIcd = DefaultMoltenVkIcdPath();
-        if (std::filesystem::exists(defaultIcd)) {
-            setenv("VK_ICD_FILENAMES", defaultIcd.string().c_str(), 0);
-            config.injectedMoltenVkIcd = true;
-            config.explicitIcdPath = defaultIcd;
-        }
+    if (const auto* driverFiles = std::getenv("VK_DRIVER_FILES"); driverFiles != nullptr) {
+        config.explicitIcdPath = driverFiles;
+    } else if (const auto* icdFilenames = std::getenv("VK_ICD_FILENAMES");
+               icdFilenames != nullptr) {
+        config.explicitIcdPath = icdFilenames;
     } else {
-        config.explicitIcdPath = std::getenv("VK_ICD_FILENAMES");
+        const auto moltenVkIcd = FindMoltenVkIcdPath();
+        if (!moltenVkIcd.empty()) {
+            setenv("VK_DRIVER_FILES", moltenVkIcd.string().c_str(), 0);
+            config.injectedMoltenVkIcd = true;
+            config.explicitIcdPath = moltenVkIcd;
+        }
     }
 #endif
 
