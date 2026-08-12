@@ -310,6 +310,7 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
             invisible_places_tests
             tests/AnimationFocusTests.cpp
             tests/AssetDiscoveryTests.cpp
+            tests/CompositionGuideTests.cpp
             tests/PointCloudDensityCompensationTests.cpp
             tests/PointCloudFieldCacheTests.cpp
             tests/PointCloudFieldResidencyTests.cpp

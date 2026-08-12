@@ -44,6 +44,7 @@
 #include "timing/TimingColourise.hpp"
 #include "timing/TimingColouriseHistogram.hpp"
 #include "timing/TimingColourisePresets.hpp"
+#include "ui/CompositionGuide.hpp"
 #include "ui/SidePanelState.hpp"
 #include "water/RainSimulation.hpp"
 #include "water/WaterSurfaceCache.hpp"
@@ -3121,6 +3122,7 @@ struct PreviewRuntimeState {
     CameraInteractionState cameraInteraction{};
     PerformanceInteractionState performanceInteraction{};
     PivotOverlayState pivotOverlay{};
+    invisible_places::ui::CompositionGuideState compositionGuide{};
     WaterWorkflowState water{};
     CameraPanelState cameraPanel{};
     CameraPlaybackState cameraPlayback{};
@@ -40917,6 +40919,95 @@ void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
         RequestOfflineRenderCancellation(&job);
     }
     ImGui::End();
+}
+
+void DrawCompositionGuideOverlay(
+    const PreviewRuntimeState& runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    const auto& guide = runtimeState.compositionGuide;
+    if (!guide.enabled) {
+        return;
+    }
+
+    const auto lines = invisible_places::ui::BuildCompositionGuideLines(
+        guide.showHalfway,
+        guide.showThirds);
+    if (lines.count == 0U) {
+        return;
+    }
+
+    const ImVec2 origin = CurrentUiViewportOrigin();
+    const ImVec2 size = CurrentUiViewportSize(viewport);
+    if (size.x <= 1.0F || size.y <= 1.0F) {
+        return;
+    }
+
+    const ImVec2 end{origin.x + size.x, origin.y + size.y};
+    const float opacity = std::clamp(guide.opacity, 0.0F, 1.0F);
+    const float lineThickness = std::clamp(
+        guide.lineThickness,
+        0.5F,
+        4.0F);
+    const float red = std::clamp(guide.colour[0], 0.0F, 1.0F);
+    const float green = std::clamp(guide.colour[1], 0.0F, 1.0F);
+    const float blue = std::clamp(guide.colour[2], 0.0F, 1.0F);
+    const float luminance =
+        (red * 0.2126F) + (green * 0.7152F) + (blue * 0.0722F);
+    const float contrast = luminance >= 0.5F ? 0.0F : 1.0F;
+
+    ImDrawList* drawList = ImGui::GetBackgroundDrawList(
+        ImGui::GetMainViewport());
+    drawList->PushClipRect(origin, end, true);
+    for (std::size_t index = 0U; index < lines.count; ++index) {
+        const auto& line = lines.values[index];
+        const float prominence = line.halfway ? 1.0F : 0.72F;
+        const float thickness =
+            lineThickness * (line.halfway ? 1.35F : 1.0F);
+        const ImU32 shadowColour = ImGui::ColorConvertFloat4ToU32(
+            ImVec4{
+                contrast,
+                contrast,
+                contrast,
+                std::clamp(opacity * prominence * 0.62F, 0.0F, 1.0F),
+            });
+        const ImU32 guideColour = ImGui::ColorConvertFloat4ToU32(
+            ImVec4{
+                red,
+                green,
+                blue,
+                std::clamp(opacity * prominence, 0.0F, 1.0F),
+            });
+        const float x = std::round(
+            origin.x + (size.x * line.normalizedPosition));
+        const float y = std::round(
+            origin.y + (size.y * line.normalizedPosition));
+        const ImVec2 verticalStart{x, origin.y};
+        const ImVec2 verticalEnd{x, end.y};
+        const ImVec2 horizontalStart{origin.x, y};
+        const ImVec2 horizontalEnd{end.x, y};
+
+        drawList->AddLine(
+            verticalStart,
+            verticalEnd,
+            shadowColour,
+            thickness + 1.75F);
+        drawList->AddLine(
+            horizontalStart,
+            horizontalEnd,
+            shadowColour,
+            thickness + 1.75F);
+        drawList->AddLine(
+            verticalStart,
+            verticalEnd,
+            guideColour,
+            thickness);
+        drawList->AddLine(
+            horizontalStart,
+            horizontalEnd,
+            guideColour,
+            thickness);
+    }
+    drawList->PopClipRect();
 }
 
 void DrawPivotOverlay(
@@ -89272,7 +89363,7 @@ void DrawControlsWindow(
     ImGui::BeginDisabled(reciprocalPanWizardActive);
     if (ImGui::BeginTable(
             "##LiveViewCameraControls",
-            6,
+            7,
             ImGuiTableFlags_SizingStretchSame |
                 ImGuiTableFlags_NoSavedSettings)) {
         ImGui::TableNextRow();
@@ -89364,6 +89455,92 @@ void DrawControlsWindow(
                 "Toggle parallel projection. Its scale matches the perspective view at the focal point.");
         }
         ImGui::EndDisabled();
+
+        ImGui::TableSetColumnIndex(6);
+        auto& guide = runtimeState->compositionGuide;
+        if (guide.enabled) {
+            ImGui::PushStyleColor(
+                ImGuiCol_Button,
+                ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+        }
+        const float settingsButtonWidth = ImGui::GetFrameHeight();
+        const float settingsSpacing = ImGui::GetStyle().ItemInnerSpacing.x;
+        const float guideButtonWidth = std::max(
+            1.0F,
+            ImGui::GetContentRegionAvail().x -
+                settingsButtonWidth - settingsSpacing);
+        const bool toggleGuide = ImGui::Button(
+            "Grid",
+            ImVec2{guideButtonWidth, 0.0F});
+        if (guide.enabled) {
+            ImGui::PopStyleColor();
+        }
+        if (toggleGuide) {
+            if (!guide.enabled &&
+                !guide.showHalfway &&
+                !guide.showThirds) {
+                guide.showHalfway = true;
+                guide.showThirds = true;
+            }
+            guide.enabled = !guide.enabled;
+            runtimeState->statusMessage = guide.enabled
+                                              ? "Composition grid enabled."
+                                              : "Composition grid hidden.";
+            runtimeState->errorMessage.clear();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Toggle live-view composition lines at one third, halfway, and two thirds. Preview only; never exported.");
+        }
+
+        ImGui::SameLine(0.0F, settingsSpacing);
+        if (ImGui::Button(
+                "...##CompositionGuideSettingsButton",
+                ImVec2{settingsButtonWidth, 0.0F})) {
+            ImGui::OpenPopup("Composition guide settings");
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Composition grid settings");
+        }
+        if (ImGui::BeginPopup("Composition guide settings")) {
+            ImGui::TextUnformatted("Composition grid");
+            ImGui::Separator();
+            bool groupsChanged = false;
+            groupsChanged |= ImGui::Checkbox(
+                "Halfway lines",
+                &guide.showHalfway);
+            groupsChanged |= ImGui::Checkbox(
+                "Third lines",
+                &guide.showThirds);
+            if (groupsChanged &&
+                !guide.showHalfway &&
+                !guide.showThirds) {
+                guide.enabled = false;
+            }
+            ImGui::SliderFloat(
+                "Opacity",
+                &guide.opacity,
+                0.05F,
+                1.0F,
+                "%.2f");
+            ImGui::SliderFloat(
+                "Line weight",
+                &guide.lineThickness,
+                0.5F,
+                4.0F,
+                "%.2f px");
+            ImGui::ColorEdit3(
+                "Colour",
+                guide.colour.data());
+            if (ImGui::Button("Reset guide settings")) {
+                const bool wasEnabled = guide.enabled;
+                guide = invisible_places::ui::CompositionGuideState{};
+                guide.enabled = wasEnabled;
+            }
+            ImGui::TextDisabled(
+                "Live-view overlay only; it is not included in exports.");
+            ImGui::EndPopup();
+        }
         ImGui::EndTable();
     }
     ImGui::EndDisabled();
@@ -103905,6 +104082,7 @@ int Application::Run(ApplicationRunOptions options) const {
                 runtimeState.animationPanel.reciprocalPanWizard.Active();
             if (!pauseLiveViewport) {
                 HandleAnimationPlaybackShortcut(&runtimeState);
+                DrawCompositionGuideOverlay(runtimeState, viewport.value());
                 DrawAnimationViewportOverlay(&runtimeState, viewport.value());
                 DrawAnimationLiveCameraEditOverlay(
                     &runtimeState,

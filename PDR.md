@@ -338,6 +338,15 @@ The Project section shall store a preferred live-view window size and expose a
 lock that overrides animation defaults and restores the project size after a
 manual resize.
 
+#### FR-UI-13
+The camera-view toolbar at the top of the controls panel shall expose an
+accessible **Grid** toggle for a live-view composition guide. The guide shall
+draw vertical and horizontal lines at one third, halfway, and two thirds, with
+the halfway lines visually stronger than the thirds. Adjacent settings shall
+allow halfway and thirds to be shown independently and shall expose colour,
+opacity, and line-weight controls. The guide shall be preview-only and shall
+not appear in frame previews or exported output.
+
 ### 5.6 Parameter Source Modes
 #### FR-PARAM-1
 Every eligible numeric or vector render parameter shall support `Constant` mode.

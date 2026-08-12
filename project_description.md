@@ -452,6 +452,14 @@ back onto that key. A faded red live-view border and a top-right
 the exact pre-edit animation and view. Other authoring controls remain locked
 for the transaction.
 
+The camera-view toolbar at the top of the controls window includes a direct
+**Grid** toggle for a preview-only composition guide. It draws horizontal and
+vertical thirds together with a visually stronger halfway line, so the 1/3,
+1/2, and 2/3 marks remain distinct rather than forming a uniform grid. The
+adjacent settings button can show halfway or thirds independently and adjusts
+the guide colour, opacity, and line weight. These ImGui guide lines appear only
+over the live view and are never included in frame previews or exports.
+
 Each animation also stores a default live-view window size. Loading that
 animation resizes the live view to its authored dimensions. The Project panel
 stores its own window size and a **Lock Window Size** option; when locked, the
