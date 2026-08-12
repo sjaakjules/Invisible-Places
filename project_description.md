@@ -490,9 +490,12 @@ Dragging it orbits that key's camera position around the focus without changing
 the camera's Z offset or focus distance; authored free orientation turns with
 the camera. Selecting either a camera or focus control draws a thin line
 between them and a small cube one-third of the way from focus to camera. The
-cube carries the standard X/Y/Z axes, XY/ZX/ZY planes, and centre view-plane
-drag; all translate the complete key rig by one equal delta while the ordinary
-node gizmo remains local to the selected camera or focus control. This replaces
+line is clipped at the live-view boundary, so its visible portion remains drawn
+when either endpoint is off screen, including a crossing whose two endpoints
+are both outside. The cube carries the standard X/Y/Z axes, XY/ZX/ZY planes,
+and centre view-plane drag; all translate the complete key rig by one equal
+delta while the ordinary node gizmo remains local to the selected camera or
+focus control. This replaces
 the detached secondary plane badges and preserves distance, view direction,
 authored orientation, and lens values. The same controls work on transformed
 partner nodes shown by matching-frame editing. The focus control retains its

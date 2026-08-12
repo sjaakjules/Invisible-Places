@@ -120,7 +120,10 @@ Selecting a viewport focus key shall expose a world-Z quarter-arc rotation
 handle from +Y to +X on its XY plane. Dragging it shall orbit the key camera
 around that focus while preserving Z offset and focus distance. Selecting
 either the camera or focus control shall draw a thin camera-to-focus line and a
-cube one-third of the way from focus to camera. The cube shall carry the
+cube one-third of the way from focus to camera. The line shall be clipped to
+the live viewport rather than suppressed when either endpoint is off screen;
+it shall also remain visible when both endpoints are outside but their segment
+crosses the view. The cube shall carry the
 ordinary world-axis, world-plane, and view-plane translation controls; dragging
 any of them shall apply one equal delta to camera and focus, preserving their
 relative geometry, authored orientation, and lens values. The ordinary gizmo

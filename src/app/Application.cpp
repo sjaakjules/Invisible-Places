@@ -10076,6 +10076,45 @@ std::optional<ProjectedPoint> ProjectWorldPoint(
     };
 }
 
+struct ProjectedSegment {
+    ProjectedPoint start{};
+    ProjectedPoint end{};
+};
+
+std::optional<ProjectedSegment> ProjectWorldSegment(
+    const invisible_places::camera::OrbitCameraMatrices& matrices,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    const glm::vec3& worldStart,
+    const glm::vec3& worldEnd) {
+    const auto clipped = invisible_places::camera::ProjectWorldSegmentToNdc(
+        matrices.viewProjection,
+        worldStart,
+        worldEnd);
+    if (!clipped.has_value()) {
+        return std::nullopt;
+    }
+
+    const auto viewportSize = CurrentUiViewportSize(viewport);
+    const auto viewportOrigin = CurrentUiViewportOrigin();
+    const float viewportWidth = std::max(1.0F, viewportSize.x);
+    const float viewportHeight = std::max(1.0F, viewportSize.y);
+    const auto projectNdc = [&](const glm::vec3& ndc) {
+        return ProjectedPoint{
+            .screen = ImVec2{
+                viewportOrigin.x +
+                    ((ndc.x * 0.5F + 0.5F) * viewportWidth),
+                viewportOrigin.y +
+                    ((ndc.y * 0.5F + 0.5F) * viewportHeight),
+            },
+            .depth = ndc.z,
+        };
+    };
+    return ProjectedSegment{
+        .start = projectNdc(clipped->start),
+        .end = projectNdc(clipped->end),
+    };
+}
+
 // Unlike ProjectWorldPoint, this keeps finite points which are in front of the
 // camera even when their projection falls beyond the image bounds or clip
 // range. Correspondence overlays use it so a tracked world-space triangle can
@@ -48416,24 +48455,20 @@ void DrawAnimationViewportOverlay(
         ? selectedCameraPoint
         : selectedFocusPoint;
 
-    const auto projectedSelectedCamera = ProjectWorldPoint(
+    const auto projectedCameraToFocus = ProjectWorldSegment(
         matrices,
         viewport,
-        selectedCameraPoint);
-    const auto projectedSelectedFocus = ProjectWorldPoint(
-        matrices,
-        viewport,
+        selectedCameraPoint,
         selectedFocusPoint);
-    if (projectedSelectedCamera.has_value() &&
-        projectedSelectedFocus.has_value()) {
+    if (projectedCameraToFocus.has_value()) {
         drawList->AddLine(
-            projectedSelectedCamera->screen,
-            projectedSelectedFocus->screen,
+            projectedCameraToFocus->start.screen,
+            projectedCameraToFocus->end.screen,
             IM_COL32(8, 8, 10, 210),
             3.0F);
         drawList->AddLine(
-            projectedSelectedCamera->screen,
-            projectedSelectedFocus->screen,
+            projectedCameraToFocus->start.screen,
+            projectedCameraToFocus->end.screen,
             IM_COL32(255, 232, 160, 235),
             1.15F);
     }

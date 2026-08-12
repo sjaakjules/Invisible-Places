@@ -243,6 +243,74 @@ TEST_CASE("Surface focus preserves the previous distance when the ray misses",
           Approx(7.25F));
 }
 
+TEST_CASE("World camera segments clip to the visible view-frustum interval",
+          "[camera][projection][frustum-clip]") {
+    const glm::mat4 identity{1.0F};
+
+    SECTION("an on-screen segment is unchanged") {
+        const auto segment = invisible_places::camera::
+            ProjectWorldSegmentToNdc(
+                identity,
+                {-0.5F, 0.25F, -0.25F},
+                {0.5F, -0.25F, 0.25F});
+        REQUIRE(segment.has_value());
+        CHECK(segment->start.x == Approx(-0.5F));
+        CHECK(segment->start.y == Approx(0.25F));
+        CHECK(segment->start.z == Approx(-0.25F));
+        CHECK(segment->end.x == Approx(0.5F));
+        CHECK(segment->end.y == Approx(-0.25F));
+        CHECK(segment->end.z == Approx(0.25F));
+    }
+
+    SECTION("one off-screen endpoint clips at the viewport edge") {
+        const auto segment = invisible_places::camera::
+            ProjectWorldSegmentToNdc(
+                identity,
+                {0.0F, 0.0F, 0.0F},
+                {2.0F, 0.5F, 0.0F});
+        REQUIRE(segment.has_value());
+        CHECK(segment->start.x == Approx(0.0F));
+        CHECK(segment->end.x == Approx(1.0F));
+        CHECK(segment->end.y == Approx(0.25F));
+    }
+
+    SECTION("two off-screen endpoints retain a crossing segment") {
+        const auto segment = invisible_places::camera::
+            ProjectWorldSegmentToNdc(
+                identity,
+                {-2.0F, 0.0F, 0.0F},
+                {2.0F, 0.0F, 0.0F});
+        REQUIRE(segment.has_value());
+        CHECK(segment->start.x == Approx(-1.0F));
+        CHECK(segment->end.x == Approx(1.0F));
+    }
+
+    SECTION("an endpoint behind the viewer clips at the near plane") {
+        invisible_places::camera::OrbitCamera camera;
+        const auto matrices = camera.Matrices(1.0F);
+        const glm::vec3 awayFromTarget = glm::normalize(
+            matrices.position - camera.Target());
+        const glm::vec3 behindViewer =
+            matrices.position + awayFromTarget;
+        const auto segment = invisible_places::camera::
+            ProjectWorldSegmentToNdc(
+                matrices.viewProjection,
+                camera.Target(),
+                behindViewer);
+        REQUIRE(segment.has_value());
+        CHECK(segment->end.x == Approx(0.0F).margin(1.0e-4F));
+        CHECK(segment->end.y == Approx(0.0F).margin(1.0e-4F));
+        CHECK(segment->end.z == Approx(-1.0F).margin(1.0e-4F));
+    }
+
+    SECTION("a segment outside one frustum side is rejected") {
+        CHECK_FALSE(invisible_places::camera::ProjectWorldSegmentToNdc(
+            identity,
+            {1.5F, -0.5F, 0.0F},
+            {2.0F, 0.5F, 0.0F}));
+    }
+}
+
 TEST_CASE("Focus Z rotation orbits the camera on XY without changing height or distance",
           "[camera][animation][key-editing][focus-orbit]") {
     const std::array<float, 3> focus{1.0F, 2.0F, 3.0F};

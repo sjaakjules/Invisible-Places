@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <limits>
 
 #include <glm/ext/matrix_clip_space.hpp>
 #include <glm/ext/matrix_transform.hpp>
@@ -76,6 +75,99 @@ glm::quat ShortestArcRotation(const glm::vec3& from, const glm::vec3& to) {
 }
 
 }  // namespace
+
+std::optional<ClippedNdcSegment> ProjectWorldSegmentToNdc(
+    const glm::mat4& viewProjection,
+    const glm::vec3& worldStart,
+    const glm::vec3& worldEnd) {
+    const glm::vec4 clipStart =
+        viewProjection * glm::vec4{worldStart, 1.0F};
+    const glm::vec4 clipEnd =
+        viewProjection * glm::vec4{worldEnd, 1.0F};
+    const auto finiteClipPoint = [](const glm::vec4& point) {
+        return std::isfinite(point.x) && std::isfinite(point.y) &&
+            std::isfinite(point.z) && std::isfinite(point.w);
+    };
+    if (!finiteClipPoint(clipStart) || !finiteClipPoint(clipEnd)) {
+        return std::nullopt;
+    }
+
+    float firstT = 0.0F;
+    float lastT = 1.0F;
+    const auto clipToHalfSpace = [&](float startDistance,
+                                     float endDistance) {
+        if (startDistance < 0.0F && endDistance < 0.0F) {
+            return false;
+        }
+        if (startDistance >= 0.0F && endDistance >= 0.0F) {
+            return true;
+        }
+
+        const float denominator = startDistance - endDistance;
+        if (!std::isfinite(denominator)) {
+            return false;
+        }
+        const float intersectionT = startDistance / denominator;
+        if (startDistance < 0.0F) {
+            firstT = std::max(firstT, intersectionT);
+        } else {
+            lastT = std::min(lastT, intersectionT);
+        }
+        return firstT <= lastT;
+    };
+
+    // GLM's projection matrices in this application use the OpenGL clip
+    // volume: -w <= x,y,z <= w. The positive-w half-space avoids attempting
+    // a perspective divide at the camera origin.
+    constexpr float kMinimumClipW = 1.0e-6F;
+    constexpr float kClippedW = 2.0F * kMinimumClipW;
+    if (!clipToHalfSpace(
+            clipStart.w - kClippedW,
+            clipEnd.w - kClippedW) ||
+        !clipToHalfSpace(
+            clipStart.x + clipStart.w,
+            clipEnd.x + clipEnd.w) ||
+        !clipToHalfSpace(
+            clipStart.w - clipStart.x,
+            clipEnd.w - clipEnd.x) ||
+        !clipToHalfSpace(
+            clipStart.y + clipStart.w,
+            clipEnd.y + clipEnd.w) ||
+        !clipToHalfSpace(
+            clipStart.w - clipStart.y,
+            clipEnd.w - clipEnd.y) ||
+        !clipToHalfSpace(
+            clipStart.z + clipStart.w,
+            clipEnd.z + clipEnd.w) ||
+        !clipToHalfSpace(
+            clipStart.w - clipStart.z,
+            clipEnd.w - clipEnd.z)) {
+        return std::nullopt;
+    }
+
+    const glm::vec4 clipDelta = clipEnd - clipStart;
+    const glm::vec4 clippedStart = clipStart + clipDelta * firstT;
+    const glm::vec4 clippedEnd = clipStart + clipDelta * lastT;
+    if (clippedStart.w <= kMinimumClipW || clippedEnd.w <= kMinimumClipW) {
+        return std::nullopt;
+    }
+
+    const auto toNdc = [](const glm::vec4& clipPoint) {
+        const glm::vec3 ndc = glm::vec3{clipPoint} / clipPoint.w;
+        return glm::clamp(
+            ndc,
+            glm::vec3{-1.0F},
+            glm::vec3{1.0F});
+    };
+    const glm::vec3 ndcStart = toNdc(clippedStart);
+    const glm::vec3 ndcEnd = toNdc(clippedEnd);
+    if (!std::isfinite(ndcStart.x) || !std::isfinite(ndcStart.y) ||
+        !std::isfinite(ndcStart.z) || !std::isfinite(ndcEnd.x) ||
+        !std::isfinite(ndcEnd.y) || !std::isfinite(ndcEnd.z)) {
+        return std::nullopt;
+    }
+    return ClippedNdcSegment{.start = ndcStart, .end = ndcEnd};
+}
 
 void OrbitCamera::FrameBounds(const invisible_places::io::Bounds3f& bounds, float aspectRatio) {
     if (!bounds.valid) {

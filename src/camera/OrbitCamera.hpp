@@ -7,6 +7,8 @@
 #include <glm/gtc/quaternion.hpp>
 #include <glm/vec3.hpp>
 
+#include <optional>
+
 namespace invisible_places::camera {
 
 struct OrbitCameraMatrices {
@@ -15,6 +17,20 @@ struct OrbitCameraMatrices {
     glm::mat4 viewProjection{1.0F};
     glm::vec3 position{0.0F, 0.0F, 1.0F};
 };
+
+struct ClippedNdcSegment {
+    glm::vec3 start{0.0F};
+    glm::vec3 end{0.0F};
+};
+
+// Clips a world-space segment against the complete homogeneous view frustum
+// before the perspective divide. The returned endpoints are normalized-device
+// coordinates inside [-1, 1], so callers can draw the visible part even when
+// either (or both) original endpoints are outside the viewport.
+[[nodiscard]] std::optional<ClippedNdcSegment> ProjectWorldSegmentToNdc(
+    const glm::mat4& viewProjection,
+    const glm::vec3& worldStart,
+    const glm::vec3& worldEnd);
 
 class OrbitCamera {
   public:
