@@ -1028,6 +1028,15 @@ struct AnimationReciprocalPanWizardState {
     std::array<AnimationReciprocalPanObservation, 4> endpointTriangles;
     std::array<std::uint32_t, 2> sourceTailFrames{};
     std::array<std::uint32_t, 2> sourceTailFrameDrafts{};
+    // Frames over which each seam's 50%-pose alignment eases in before the
+    // terminal. Follows the seam's tail extent until explicitly edited, so a
+    // defined pre-roll always widens the alignment ramp by default.
+    std::array<std::uint32_t, 2> alignmentRampFrames{};
+    std::array<bool, 2> alignmentRampCustomized{};
+    // Share of each seam's alignment carried by the source's frame-zero key
+    // instead of the destination terminal (0 = legacy destination-only,
+    // 0.5 = meet halfway, 1 = source only).
+    std::array<float, 2> sourceAlignmentFractions{};
     std::array<std::optional<
         invisible_places::camera::AnimationPanBidirectionalSeamResult>, 2>
         seamPreviews;
@@ -55689,12 +55698,25 @@ bool RebuildReciprocalPanCandidate(
         wizard.endpointTriangles[0U].patch;
     options.firstDrivesSecond.destinationEndPatch =
         wizard.endpointTriangles[1U].patch;
+    const std::uint32_t maximumAlignmentRamp = std::min(
+        ReciprocalPanPathFrameCount(wizard.baselinePaths[0U]),
+        ReciprocalPanPathFrameCount(wizard.baselinePaths[1U])) / 2U;
+    options.firstDrivesSecond.alignmentRampFrames = std::min(
+        wizard.alignmentRampFrames[0U],
+        maximumAlignmentRamp);
+    options.firstDrivesSecond.sourceAlignmentFraction =
+        wizard.sourceAlignmentFractions[0U];
     options.secondDrivesFirst.sourceTailFrame =
         wizard.sourceTailFrames[1U];
     options.secondDrivesFirst.sourcePatch =
         wizard.endpointTriangles[2U].patch;
     options.secondDrivesFirst.destinationEndPatch =
         wizard.endpointTriangles[3U].patch;
+    options.secondDrivesFirst.alignmentRampFrames = std::min(
+        wizard.alignmentRampFrames[1U],
+        maximumAlignmentRamp);
+    options.secondDrivesFirst.sourceAlignmentFraction =
+        wizard.sourceAlignmentFractions[1U];
     options.aspectRatio = wizard.aspectRatio;
     options.sampleCount = 65U;
     options.optimizationSweeps = 24U;
@@ -56616,6 +56638,13 @@ bool RebuildReciprocalPanSeamPreview(
         wizard.endpointTriangles[sourceTriangle].patch;
     specification.destinationEndPatch =
         wizard.endpointTriangles[destinationTriangle].patch;
+    specification.alignmentRampFrames = std::min(
+        wizard.alignmentRampFrames[sourceRole],
+        std::min(
+            ReciprocalPanPathFrameCount(wizard.baselinePaths[0U]),
+            ReciprocalPanPathFrameCount(wizard.baselinePaths[1U])) / 2U);
+    specification.sourceAlignmentFraction =
+        wizard.sourceAlignmentFractions[sourceRole];
     const auto destination = wizard.baselinePaths[destinationRole];
     const auto source = wizard.baselinePaths[sourceRole];
     const auto filePaths = wizard.filePaths;
@@ -56920,6 +56949,9 @@ bool StartReciprocalPanWizard(
             std::max<std::uint32_t>(2U, std::min<std::uint32_t>(30U, end)));
         wizard.sourceTailFrameDrafts[role] =
             wizard.sourceTailFrames[role];
+        wizard.alignmentRampFrames[role] = wizard.sourceTailFrames[role];
+        wizard.alignmentRampCustomized[role] = false;
+        wizard.sourceAlignmentFractions[role] = 0.5F;
     }
     wizard.dependencyPairId =
         first->velocityBlendLink.has_value()
@@ -59264,6 +59296,12 @@ void DrawReciprocalPanWizard(
             wizard.inspectionActive = false;
             wizard.sourceTailFrames[sourceRole] =
                 wizard.sourceTailFrameDrafts[sourceRole];
+            if (!wizard.alignmentRampCustomized[sourceRole]) {
+                // The alignment ramp keeps matching the defined pre-roll
+                // until the user explicitly chooses a different width.
+                wizard.alignmentRampFrames[sourceRole] =
+                    wizard.sourceTailFrames[sourceRole];
+            }
             InvalidateReciprocalPanWizardCandidate(&wizard);
             wizard.anchorPickArmed = false;
             ShowReciprocalPanWizardCanonicalPose(runtimeState);
@@ -59274,6 +59312,57 @@ void DrawReciprocalPanWizard(
             wizard.baselinePaths[sourceRole].keys.size() > 2U
                 ? "The limit is the penultimate key frame, keeping the sampled source clear of the terminal segment the reciprocal fit may adjust."
                 : "With two keys the limit is one frame before the end; this is a best-fit source because the sole segment is also terminal alignment motion.");
+        ImGui::Separator();
+        const int maximumRamp = static_cast<int>(std::min(
+            ReciprocalPanPathFrameCount(
+                wizard.baselinePaths[sourceRole]) / 2U,
+            ReciprocalPanPathFrameCount(
+                wizard.baselinePaths[1U - sourceRole]) / 2U));
+        if (wizard.alignmentRampFrames[sourceRole] >
+            static_cast<std::uint32_t>(maximumRamp)) {
+            wizard.alignmentRampFrames[sourceRole] =
+                static_cast<std::uint32_t>(maximumRamp);
+        }
+        int rampFrames = static_cast<int>(
+            wizard.alignmentRampFrames[sourceRole]);
+        ImGui::TextDisabled("Alignment ramp (frames)");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::SliderInt(
+                "##ReciprocalPanAlignmentRamp",
+                &rampFrames,
+                0,
+                maximumRamp)) {
+            wizard.alignmentRampFrames[sourceRole] =
+                static_cast<std::uint32_t>(std::max(rampFrames, 0));
+            wizard.alignmentRampCustomized[sourceRole] = true;
+            InvalidateReciprocalPanWizardCandidate(&wizard);
+        }
+        ImGui::TextDisabled(
+            "The 50%% poses are never perfectly aligned, so the fit must move the seam endpoints. This ramp eases that move in as a slow drift across the chosen frames instead of a sudden movement over the final key segment. Zero reproduces the legacy single-segment behaviour; it tracks the seam span until edited.");
+        const float fraction = wizard.sourceAlignmentFractions[sourceRole];
+        int shareIndex = fraction < 0.25F ? 0 : fraction > 0.75F ? 2 : 1;
+        const char* shareLabels[] = {
+            role == 0
+                ? "Move B's end fully onto A's start (legacy)"
+                : "Move A's end fully onto B's start (legacy)",
+            "Meet halfway (both 50% frames move)",
+            role == 0
+                ? "Move A's start fully onto B's end"
+                : "Move B's start fully onto A's end",
+        };
+        ImGui::TextDisabled("Seam alignment share");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::Combo(
+                "##ReciprocalPanAlignmentShare",
+                &shareIndex,
+                shareLabels,
+                3)) {
+            wizard.sourceAlignmentFractions[sourceRole] =
+                shareIndex == 0 ? 0.0F : shareIndex == 1 ? 0.5F : 1.0F;
+            InvalidateReciprocalPanWizardCandidate(&wizard);
+        }
+        ImGui::TextDisabled(
+            "Meeting halfway gives each animation half the alignment move, so each side's drift is half as strong and both scenes share the correction.");
     } else if (!seamReviewStage &&
                wizard.stage != AnimationReciprocalPanWizardStage::Preview) {
         const auto& path = wizard.baselinePaths[
