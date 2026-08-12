@@ -508,6 +508,19 @@ The project should build on Windows for stronger render hardware.
 #### NFR-PORT-3
 Project files shall remain portable across supported platforms.
 
+#### NFR-PORT-4
+Project and animation documents shall store relocatable source-data,
+authored-workspace, and machine-local render locations. A configured cloud
+source root may hold the production 1 mm/5 mm and mesh PLY subset, and a
+separate cloud folder may be the live authored workspace. Generated caches,
+renders, render history, validation, and build output remain local. Before an
+existing project or animation is replaced, Save shall verify that its bytes
+still match the version loaded by this session, recheck after staging, and
+refuse a stale overwrite while retaining in-memory edits. A mid-save conflict
+shall also preserve local recovery JSON. Because OneDrive cannot enforce an
+offline distributed lock, deliberate parallel edits to the same file shall use
+different Save As names.
+
 ### 6.3 Reliability
 #### NFR-REL-1
 Missing scalar fields shall not crash the renderer.

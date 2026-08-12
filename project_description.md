@@ -92,6 +92,20 @@ CloudCompare remains the main preprocessing and scalar-field authoring tool for 
 - Optional mapped-style AOVs
 - Project file containing shots, layers, styles, and render settings
 
+For multi-computer authoring, that project file and its animation paths, named
+render setups, style preset, and optional standalone water state can live in a
+single cloud-synchronized authored workspace. Durable path roles are stored
+independently of either computer's absolute folders: scene assets resolve below
+the configured source-data root, authored files below the shared workspace,
+and renders below the local output root. The production Scene3 1 mm/5 mm and
+mesh PLY subset may use a separate OneDrive source folder; 2 mm/3 mm clouds,
+gSplats, validation fixtures, generated caches, render history, renders, and
+builds remain local. Existing project and animation files use optimistic
+content revisions: a save refuses to overwrite bytes that changed since load,
+and preserves a local recovery copy when a peer update arrives during staging.
+Parallel offline work on the same file uses separate names because OneDrive is
+not a distributed locking service.
+
 ## Scene Layer Model
 The scene supports multiple layers.
 

@@ -14,7 +14,7 @@ New scenes select the finest complete bundle. A scene with no complete bundle re
 
 Each project-loaded scene has two independent source classifications:
 
-- **Analysis sources:** ROCK 1 mm, SAND 2 mm, and VEG 1 mm. These canonical files are catalogued at startup but load CPU-only on demand for explicit Bake Path and analysis-based Ripple/Field operations; they are not a startup prerequisite.
+- **Analysis sources:** the complete ROCK/SAND/VEG 1 mm bundle. These canonical files are catalogued at startup but load CPU-only on demand for explicit Bake Path and analysis-based Ripple/Field operations; they are not a startup prerequisite.
 - **Committed display sources:** the complete density bundle selected in the Visuals tab. Only these scene sources are renderable and GPU-resident after a switch completes.
 
 When one file belongs to both sets, ready CPU data can be reused. Obsolete display CPU/GPU resources are released after commit when no active purpose owns them. A staged target is CPU-only, neither a committed display source nor renderable. The transaction never holds complete old and new point buffers at the same time, bounding measured point-buffer bytes to the larger bundle plus fixed upload/descriptor staging. Native diagnostics report the transaction's settle count and byte high-water mark rather than estimating residency from point counts.

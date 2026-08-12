@@ -248,6 +248,20 @@ Suggested root structure:
   /renders
 ```
 
+The implemented authored-workspace layer keeps this logical structure
+relocatable with `@data`, `@workspace`, and `@local-renders` path tokens. The
+workspace root can come from `INVISIBLE_PLACES_WORKSPACE_DIR` or the ignored
+local `.invisible_places-workspace` marker. A distinct production source root
+comes from `INVISIBLE_PLACES_SHARED_DATA_DIR` or
+`.invisible_places-data-workspace`; it may be cloud-backed and currently holds
+only Scene3 1 mm/5 mm ROCK/SAND/VEG plus MESH/MESHSampled PLYs. Field, water,
+Flow, and histogram caches are redirected to local `Saved/`, alongside renders,
+render history, validation, and build products. Project/animation saves keep a
+content fingerprint from load, verify it before and after staging, refuse stale
+OneDrive overwrites, and copy mid-save conflicts to local recovery. The Project
+panel writes both local markers for the next launch, avoiding a destructive
+live context switch.
+
 ## 5. Point Attribute Strategy
 ### 5.1 CPU-side canonical layout
 Each point record should expose at minimum:

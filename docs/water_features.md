@@ -47,7 +47,7 @@ Implemented in the current repository:
 - Flow sources have Maximum Flow Strength, Rain Response, and a parameter-only **Show Trail** flag. **Show All Flow Trails** is the global master; effective trail visibility is the conjunction of both flags, while a keyable global Flow Level remains the animation control. Visibility changes do not regenerate routes or upload geometry.
 - Project-owned Flow emitters and point sources. Sources are no longer loaded from a separate global save into every project.
 - Clean generated Flow branches reload from validated scene-local `.flowpathcache` sidecars when support/settings signatures still match; schema-66 project JSON stores only the compact manifest.
-- Combined ROCK/SAND/VEG support sampling for grouped scenes. Flow sources and path baking use CPU-ready canonical ROCK 1 mm, SAND 2 mm, and VEG 1 mm analysis sources as one support surface; changing the visible density does not invalidate support or create a full merged GPU point buffer.
+- Combined ROCK/SAND/VEG support sampling for grouped scenes. Flow sources and path baking use the CPU-ready canonical complete 1 mm analysis bundle as one support surface; changing the visible density does not invalidate support or create a full merged GPU point buffer.
 - Field cache, Field Streamlines, and Field Surface Motion built from Flow path anchors or user-authored Field regions, with region Field caches saved and reused offline.
 - Field no-flow, bridge-allowed, and bridge-blocked control regions with visible diagnostics.
 - Shared animated trail visualization for Flow and Field streams; Flow moves along baked path anchors and Field moves along cached vector-field paths seeded from perturbed source points.
