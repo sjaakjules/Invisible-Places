@@ -552,7 +552,12 @@ Project and animation documents shall store relocatable source-data,
 authored-workspace, and machine-local render locations. A configured cloud
 source root may hold the production 1 mm/5 mm and mesh PLY subset, and a
 separate cloud folder may be the live authored workspace. Generated caches,
-renders, render history, validation, and build output remain local. Before an
+renders, render history, validation, and build output remain local. An exact
+complete 2 mm ROCK/SAND/VEG bundle shall be used for a water-surface cache when
+available; if it is absent, the complete 1 mm bundle shall be the explicit
+fallback. A new computer with only the shared 1 mm/5 mm source subset shall
+build and persist its 10 mm water-surface cache below its machine-local Saved
+root. Before an
 existing project or animation is replaced, Save shall verify that its bytes
 still match the version loaded by this session, recheck after staging, and
 refuse a stale overwrite while retaining in-memory edits. A mid-save conflict

@@ -1076,9 +1076,18 @@ TEST_CASE(
     CHECK(packedCentre->packedConvergenceConfidence != 0U);
 }
 
-TEST_CASE("water surface sources prefer exact two millimetre complete bundles",
+TEST_CASE("water surface sources prefer two millimetres then one millimetre",
           "[water][rain][cache]") {
     invisible_places::scene::ScenePointCloudGroup group;
+    const auto sortCompleteBundles = [&]() {
+        std::sort(
+            group.completeDisplayBundles.begin(),
+            group.completeDisplayBundles.end(),
+            [](const auto& left, const auto& right) {
+                return left.spacingMicrometres <
+                    right.spacingMicrometres;
+            });
+    };
     group.variantsByRole[0] = {
         {.role = invisible_places::scene::ScenePointCloudRole::Rock, .spacingMicrometres = 1'000U, .sourcePath = "rock1.ply"},
         {.role = invisible_places::scene::ScenePointCloudRole::Rock, .spacingMicrometres = 2'000U, .sourcePath = "rock2.ply"},
@@ -1115,10 +1124,37 @@ TEST_CASE("water surface sources prefer exact two millimetre complete bundles",
     group.completeDisplayBundles.insert(
         group.completeDisplayBundles.begin(),
         std::move(distantBundle));
+    sortCompleteBundles();
     const auto fallbackSources = invisible_places::water::SelectWaterSurfaceSources(group);
     REQUIRE(fallbackSources.size() == 3U);
     for (const auto& source : fallbackSources) {
         CHECK(source.spacingMicrometres == 3'000U);
+        CHECK(source.isFallback);
+    }
+
+    // The shared production subset omits 2 mm but includes a complete 1 mm
+    // bundle. It must win over a numerically nearer/coarser fallback so a new
+    // computer can rebuild its local cache from the synchronized sources.
+    group.completeDisplayBundles.push_back({
+        .spacingMicrometres = 1'000U,
+        .byRole = {{
+            {.role = invisible_places::scene::ScenePointCloudRole::Rock,
+             .spacingMicrometres = 1'000U,
+             .sourcePath = "rock1.ply"},
+            {.role = invisible_places::scene::ScenePointCloudRole::Sand,
+             .spacingMicrometres = 1'000U,
+             .sourcePath = "sand1.ply"},
+            {.role = invisible_places::scene::ScenePointCloudRole::Vegetation,
+             .spacingMicrometres = 1'000U,
+             .sourcePath = "veg1.ply"},
+        }},
+    });
+    sortCompleteBundles();
+    const auto oneMillimetreFallback =
+        invisible_places::water::SelectWaterSurfaceSources(group);
+    REQUIRE(oneMillimetreFallback.size() == 3U);
+    for (const auto& source : oneMillimetreFallback) {
+        CHECK(source.spacingMicrometres == 1'000U);
         CHECK(source.isFallback);
     }
 
@@ -1136,6 +1172,7 @@ TEST_CASE("water surface sources prefer exact two millimetre complete bundles",
              .sourcePath = "veg2.ply"},
         }},
     });
+    sortCompleteBundles();
     const auto sources = invisible_places::water::SelectWaterSurfaceSources(group);
     REQUIRE(sources.size() == 3U);
     CHECK(sources[0].sourcePath == "rock2.ply");
@@ -1479,9 +1516,9 @@ TEST_CASE("water surface warm loads do not rescan or rebuild tables", "[water][r
     const auto sceneDirectory = temporary.path / "Scene";
     std::filesystem::create_directories(sceneDirectory);
     const std::array<std::pair<std::string_view, WaterSurfaceRole>, 4> files{{
-        {"rock-2mm.ply", WaterSurfaceRole::Rock},
-        {"sand-2mm.ply", WaterSurfaceRole::Sand},
-        {"vegetation-2mm.ply", WaterSurfaceRole::Vegetation},
+        {"rock-1mm.ply", WaterSurfaceRole::Rock},
+        {"sand-1mm.ply", WaterSurfaceRole::Sand},
+        {"vegetation-1mm.ply", WaterSurfaceRole::Vegetation},
         {"ground-5mm.ply", WaterSurfaceRole::Ground},
     }};
     std::vector<invisible_places::water::WaterSurfaceSource> sources;
@@ -1502,7 +1539,7 @@ TEST_CASE("water surface warm loads do not rescan or rebuild tables", "[water][r
             .spacingMicrometres =
                 isGround
                     ? 5'000U
-                    : 2'000U,
+                    : 1'000U,
         });
     }
 
@@ -1516,7 +1553,7 @@ TEST_CASE("water surface warm loads do not rescan or rebuild tables", "[water][r
     for (const auto& source : cold.cache.sources) {
         CHECK(
             source.spacingMicrometres ==
-            (source.role == WaterSurfaceRole::Ground ? 5'000U : 2'000U));
+            (source.role == WaterSurfaceRole::Ground ? 5'000U : 1'000U));
     }
     CHECK(cold.cache.sourcePointCount == 3U);
     CHECK(cold.cache.groundSourcePointCount == 1U);
@@ -1547,7 +1584,7 @@ TEST_CASE("water surface warm loads do not rescan or rebuild tables", "[water][r
     for (const auto& source : warm.cache.sources) {
         CHECK(
             source.spacingMicrometres ==
-            (source.role == WaterSurfaceRole::Ground ? 5'000U : 2'000U));
+            (source.role == WaterSurfaceRole::Ground ? 5'000U : 1'000U));
     }
     CHECK(warm.cache.cacheIdentity == cold.cache.cacheIdentity);
     CHECK(warm.persistedPath == cachePath);

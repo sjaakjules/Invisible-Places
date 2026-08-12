@@ -1656,6 +1656,16 @@ std::vector<WaterSurfaceSource> SelectWaterSurfaceSources(
     std::uint32_t preferredSpacingMicrometres) {
     std::vector<WaterSurfaceSource> selected;
     const auto exactBundle = group.FindCompleteDisplayBundle(preferredSpacingMicrometres);
+    // Production's shared OneDrive subset intentionally carries the 1 mm and
+    // 5 mm bundles but not the locally generated 2 mm bundle. Make the 1 mm
+    // complete bundle the explicit canonical fallback so a fresh computer can
+    // rebuild its 10 mm cache locally without depending on missing 2 mm files.
+    const auto* canonicalFallbackBundle =
+        preferredSpacingMicrometres ==
+                kWaterSurfaceNormalSourceSpacingMicrometres
+            ? group.FindCompleteDisplayBundle(
+                  kWaterSurfaceFallbackSourceSpacingMicrometres)
+            : nullptr;
     const auto nearestBundle = std::min_element(
         group.completeDisplayBundles.begin(),
         group.completeDisplayBundles.end(),
@@ -1674,11 +1684,14 @@ std::vector<WaterSurfaceSource> SelectWaterSurfaceSources(
             // one-time fallback scan without ever mixing role spacings.
             return left.spacingMicrometres > right.spacingMicrometres;
         });
-    const auto* bundle = exactBundle != nullptr
-                             ? exactBundle
-                             : (nearestBundle == group.completeDisplayBundles.end()
-                                    ? nullptr
-                                    : &*nearestBundle);
+    const auto* bundle = exactBundle;
+    if (bundle == nullptr) {
+        bundle = canonicalFallbackBundle;
+    }
+    if (bundle == nullptr &&
+        nearestBundle != group.completeDisplayBundles.end()) {
+        bundle = &*nearestBundle;
+    }
     if (bundle == nullptr) {
         return selected;
     }

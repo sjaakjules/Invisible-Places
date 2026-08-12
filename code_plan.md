@@ -256,7 +256,10 @@ comes from `INVISIBLE_PLACES_SHARED_DATA_DIR` or
 `.invisible_places-data-workspace`; it may be cloud-backed and currently holds
 only Scene3 1 mm/5 mm ROCK/SAND/VEG plus MESH/MESHSampled PLYs. Field, water,
 Flow, and histogram caches are redirected to local `Saved/`, alongside renders,
-render history, validation, and build products. Project/animation saves keep a
+render history, validation, and build products. Water cache source selection is
+explicitly 2 mm first and complete 1 mm second, so a new machine with only the
+shared subset cold-builds the same 10 mm representation locally instead of
+requiring unsynchronized 2 mm files. Project/animation saves keep a
 content fingerprint from load, verify it before and after staging, refuse stale
 OneDrive overwrites, and copy mid-save conflicts to local recovery. The Project
 panel writes both local markers for the next launch, avoiding a destructive

@@ -100,8 +100,12 @@ the configured source-data root, authored files below the shared workspace,
 and renders below the local output root. The production Scene3 1 mm/5 mm and
 mesh PLY subset may use a separate OneDrive source folder; 2 mm/3 mm clouds,
 gSplats, validation fixtures, generated caches, render history, renders, and
-builds remain local. Existing project and animation files use optimistic
-content revisions: a save refuses to overwrite bytes that changed since load,
+builds remain local. Water-surface preprocessing prefers a complete 2 mm
+ROCK/SAND/VEG bundle when available, explicitly falls back to the synchronized
+complete 1 mm bundle when 2 mm is absent, and reduces either source into the
+same 10 mm cache. Consequently, a new computer can cold-build its own cache in
+its local `Saved/` root from OneDrive's 1 mm/5 mm subset. Existing project and
+animation files use optimistic content revisions: a save refuses to overwrite bytes that changed since load,
 and preserves a local recovery copy when a peer update arrives during staging.
 Parallel offline work on the same file uses separate names because OneDrive is
 not a distributed locking service.

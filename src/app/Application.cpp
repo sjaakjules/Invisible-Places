@@ -22061,7 +22061,8 @@ void StartWaterSurfaceCacheWarmup(
     auto shared = std::make_shared<WaterSurfaceCacheWarmupShared>();
     {
         std::scoped_lock lock(shared->mutex);
-        shared->stage = "Reading shared 2 mm role sources into 10 mm cells";
+        shared->stage =
+            "Reading shared ROCK/SAND/VEG sources into 10 mm cells";
     }
     const auto sources = scene->waterSurfaceSources;
     const auto cacheRoot = WaterSurfaceCacheRootForScene(*runtimeState, *scene);

@@ -23,6 +23,7 @@ namespace invisible_places::water {
 
 inline constexpr float kWaterSurfaceResolutionMeters = 0.010F;
 inline constexpr std::uint32_t kWaterSurfaceNormalSourceSpacingMicrometres = 2'000U;
+inline constexpr std::uint32_t kWaterSurfaceFallbackSourceSpacingMicrometres = 1'000U;
 inline constexpr std::uint32_t kWaterGroundSourceSpacingMicrometres = 5'000U;
 inline constexpr std::string_view kWaterSurfaceCacheAlgorithmId =
     "water-surface-10mm-normal-average-ground-v4";
@@ -444,6 +445,10 @@ struct WaterGroundHeightQueryResult {
     bool hit = false;
 };
 
+// Selects one complete ROCK/SAND/VEG density bundle without mixing spacings.
+// The normal-source order is exact requested spacing, then the canonical 1 mm
+// shared-data fallback for the default 2 mm request, then the nearest remaining
+// complete bundle.
 [[nodiscard]] std::vector<WaterSurfaceSource> SelectWaterSurfaceSources(
     const scene::ScenePointCloudGroup& group,
     std::uint32_t preferredSpacingMicrometres =
