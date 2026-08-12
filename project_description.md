@@ -303,20 +303,42 @@ half-span around that visual midpoint. The same triangle correspondence creates
 motion in both directions: a pre-roll before the source's old frame zero and a
 tail after the partner's old end.
 
-The fit first makes a small localized correction to each existing destination
-terminal so its triangle overlays the opposite source-start triangle. It then
-tracks the source feature's signed pixel translation, in-plane rotation, and
-perspective scale through the chosen inward span. It copies that motion forward
-into the partner tail and backward into the source pre-roll. A simple generated
-end uses two unlinked keys; a crossed authored key or screen-motion inflection
-uses three. Each animation therefore grows at both ends while old segment
-durations and bulk pan speed remain unchanged. Localized endpoint corrections
-may change the old first/final segments; the interior authored motion is kept.
+The fit first makes a localized correction to each existing destination
+terminal so its triangle overlays the opposite source-start triangle. Because
+the two 50% poses are never perfectly aligned, that correction used to land
+entirely on the final key segment and could read as a sudden movement. Each
+span stage therefore sets an **Alignment ramp** — following the chosen seam
+span until edited — that eases the endpoint move across the authored keys
+inside its window as fractional localized corrections with matching tangents,
+turning the lurch into a slow drift while the base spline, every frame count,
+and the path outside the window stay exact (a zero ramp reproduces the old
+behaviour). An **alignment share** additionally chooses who moves: the legacy
+destination-only move, **Meet halfway** (default — both 50% cameras solve
+toward a blended screen-space triangle target so each side absorbs half the
+transient), or source-only. The fit then tracks the source feature's signed
+pixel translation, in-plane rotation, and perspective scale through the chosen
+inward span. It copies that motion forward into the partner tail and backward
+into the source pre-roll. A simple generated end uses two unlinked keys; a
+crossed authored key or screen-motion inflection uses three. Each animation
+therefore grows at both ends while old segment durations and bulk pan speed
+remain unchanged. Interior authored motion outside the alignment window is
+kept exactly.
 
 After each seam is captured, a synchronized scrub review flips between the
 generated source pre-roll and privately fitted destination tail. Negative
 offsets show the pre-roll, offset zero shows the adjusted original 50% endpoint
-pair, and positive offsets show the tail. This lets the user re-pick the destination feature and rebuild
+pair, and positive offsets show the tail. The review reports each side's
+endpoint move, how many keys carry eased corrections, and the peak drift
+speed the alignment adds — the number a visible bump corresponds to. A
+ping-pong transport (Space) plays back and forth across the seam window, with
+single-frame steppers and a jump-to-seam button beside the slider. Tab flips
+the full A/B frame at the matched pose; while orbit-inspecting, Tab instead
+moves the free camera by the rigid transform between the two matched seam
+cameras, so the vantage holds still and the scene itself appears to swap —
+residual misalignment shows directly, with both seam cameras drawn as
+wireframe frusta. Green review keys can be dragged in the viewport (camera or
+focus target), and moving a 50% midpoint carries its partner through the
+captured triangles. This lets the user re-pick the destination feature and rebuild
 that seam before moving to the opposite endpoint. The review can also composite
 the two camera renders as an A/B hard split. Its adjustable boundary follows
 the mean projected anchor position throughout the synchronized scrub, while a

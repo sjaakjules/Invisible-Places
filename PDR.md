@@ -170,7 +170,16 @@ synchronized source/destination scrub review before proceeding. That review
 shall expose generated and nearby authored keyframes on two selectable
 timelines, keep the paired 50% controls coordinated by the three-node triangle,
 and permit a spatial-only one-seam smoothing preview without changing segment
-frames. The selected authored controls shall carry into the final joint fit. The final fit
+frames. The review shall report each side's endpoint alignment move, eased-key
+count, and peak incoming drift speed, provide a ping-pong seam transport with
+single-frame steps beside the synchronized offset, and allow direct viewport
+editing of enabled keys (camera or focus) with paired midpoints carried
+through the captured triangle transform. A single action shall flip the full
+A/B frame at the matched seam pose; during orbit inspection that flip shall
+instead move the free camera by the rigid matched-camera transform so the
+scene appears to swap in place beneath an unchanged vantage, with both matched
+seam camera frusta drawn as wireframes. The selected authored controls shall
+carry into the final joint fit. The final fit
 shall align each existing destination end to the opposite source start and
 constrain signed screen X/Y velocity, in-plane patch rotation, overlay position,
 and perspective scale on the 30 fps animation timebase.
@@ -181,8 +190,16 @@ end for a simple source span, or three at that end when the span crosses an
 authored key or screen-motion inflection. The same ordered triangle pair shall
 generate the source animation's pre-roll and the destination animation's tail,
 with the original crossed endpoints remaining the temporal midpoint. It may
-align the former first/last poses and change only the adjacent old boundary
-segments plus the new head/tail. Interior authored key frames and bulk motion
+align the former first/last poses. Because the two 50% poses are never
+perfectly aligned, each seam shall expose an **alignment ramp** (defaulting to
+the seam span) that eases the endpoint alignment move across the authored keys
+inside its window as fractional localized corrections with matched tangents;
+the base spline, every segment frame count, and the path outside the window
+stay exact, and a zero ramp reproduces the legacy single-segment behaviour.
+Each seam shall also expose an **alignment share** that solves both 50%
+endpoint cameras toward a blended screen-space triangle target:
+destination-only (legacy), meet-halfway (default, halving each side's
+transient), or source-only. Interior authored key frames and bulk motion
 shall keep their original spacing and 30 fps speed until the optional final
 whole-cycle duration fit described in FR-CAM-20.
 
