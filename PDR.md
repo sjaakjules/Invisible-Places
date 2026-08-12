@@ -118,15 +118,15 @@ ray misses.
 
 Selecting a viewport focus key shall expose a world-Z quarter-arc rotation
 handle from +Y to +X on its XY plane. Dragging it shall orbit the key camera
-around that focus while preserving Z offset and focus distance. It shall also
-expose compact secondary XY, ZX, and ZY plane handles for translating the key's
-camera and focus together. XY shall be drawn in the negative-X/negative-Y
-region, ZX offset along negative Y, and ZY offset along negative X. Hover shall
-expand only that handle to the ordinary plane-control size. Dragging shall
-apply one equal world-plane delta to camera and focus, preserving their relative
-geometry, authored orientation, and lens values; the ordinary gizmo shall keep
-moving only the selected focus control. Double-clicking a focus key shall enter
-a transactional Live Edit Mode at the complete evaluated
+around that focus while preserving Z offset and focus distance. Selecting
+either the camera or focus control shall draw a thin camera-to-focus line and a
+cube one-third of the way from focus to camera. The cube shall carry the
+ordinary world-axis, world-plane, and view-plane translation controls; dragging
+any of them shall apply one equal delta to camera and focus, preserving their
+relative geometry, authored orientation, and lens values. The ordinary gizmo
+at the selected node shall keep moving only that selected control. The former
+detached secondary plane handles shall not be drawn. Double-clicking a focus
+key shall enter a transactional Live Edit Mode at the complete evaluated
 key camera and lens state. Live camera navigation shall update the key preview;
 Enter or a tick commits, while Escape or a cross restores the prior animation
 and view. The live view shall show a faded red border and top-right mode card
@@ -155,11 +155,30 @@ than silently substituting another registered animation.
 
 On the ordinary paired matching-frame timelines, right-clicking a key shall
 select it by stable animation-file and key identity and show a red outline.
-**Copy Camera Alignment** shall capture world-Z orbit azimuth, elevation,
-geometric camera-to-focus distance, and the evaluated camera orientation.
-**Paste Camera Alignment** shall apply those values around another selected
-key's unchanged focus. It shall preserve target-driven orientation policy and
-copy horizon/roll only when the destination path already authors orientation.
+The alignment area shall show live values for the active scrub frame, the
+selected node, and the copied snapshot: geometric camera-to-focus distance,
+polar angle from world +Z, signed horizontal angle from the evaluated local
+path tangent, camera/focus height above the authored ground reference, and
+ground sample Z.
+Both heights shall use the same ground value sampled at the horizontal
+projection of the point one-third of the way from focus to camera, with only a
+bounded nearest-cell tolerance for a small sampling hole. The authored SAND
+channel in the shared 10 mm cache shall be authoritative. A MESH/MESHSampled
+Ground cell may substitute only when that exact retained cell is marked as
+vegetation-supported; unclassified MESH and MESH over ROCK/SAND shall never
+drive camera clearance. If the reference has no usable SAND or qualified MESH,
+sampling shall advance toward the camera until it finds one or reaches the
+camera. The selected-node readout shall name the source, state whether it
+advanced, and explain cache, geometry, or coverage failures rather than showing
+an unexplained blank. **Copy Camera Alignment** shall freeze all measurements
+and evaluated orientation by value; subsequent edits to the source node shall
+not alter the clipboard. **Paste Camera Alignment** shall offer independent
+checkboxes for distance, polar angle, camera ground height, focus ground
+height, tangent-relative angle, and horizon/roll. It shall preserve unchecked
+focus-relative destination components before ground constraints are applied:
+focus height translates the rig vertically and camera height then sets camera
+clearance exactly. It shall preserve target-driven orientation policy and copy
+horizon/roll only when the destination path already authors orientation.
 
 #### FR-CAM-12
 The assistant shall collect ordered anchor/front/side source triangles at

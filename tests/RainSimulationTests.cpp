@@ -836,6 +836,65 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "camera ground height prefers cached SAND and restricts MESH to vegetation",
+    "[water][cache][ground][camera-ground]") {
+    invisible_places::water::WaterSurfaceCache cache;
+    cache.resolutionMeters = 0.010F;
+    cache.surfaceCells = {{
+        .cellX = 0,
+        .cellY = 0,
+        .sandHeight = 0.250F,
+        .sandSampleCount = 4U,
+    }};
+    cache.groundCells = {
+        {
+            .cellX = 0,
+            .cellY = 0,
+            .height = 9.0F,
+            .flags = invisible_places::water::
+                kWaterGroundVegetationSupportedFlag,
+        },
+        {
+            .cellX = 10,
+            .cellY = 0,
+            .height = 0.100F,
+        },
+        {
+            .cellX = 20,
+            .cellY = 0,
+            .height = 0.150F,
+            .flags = invisible_places::water::
+                kWaterGroundVegetationSupportedFlag,
+        },
+    };
+
+    const auto sand = invisible_places::water::QueryWaterGroundHeightCache(
+        cache,
+        {0.005F, 0.005F, 100.0F},
+        0.006F);
+    REQUIRE(sand.hit);
+    CHECK(sand.source == invisible_places::water::
+        WaterGroundHeightSource::AuthoredSand);
+    CHECK(sand.height == Catch::Approx(0.250F));
+
+    CHECK_FALSE(invisible_places::water::QueryWaterGroundHeightCache(
+                    cache,
+                    {0.105F, 0.005F, 0.0F},
+                    0.006F)
+                    .hit);
+
+    const auto vegetationMesh = invisible_places::water::
+        QueryWaterGroundHeightCache(
+            cache,
+            {0.205F, 0.005F, -100.0F},
+            0.006F);
+    REQUIRE(vegetationMesh.hit);
+    CHECK(vegetationMesh.source == invisible_places::water::
+        WaterGroundHeightSource::VegetationSupportedMesh);
+    CHECK(vegetationMesh.height == Catch::Approx(0.150F));
+}
+
+TEST_CASE(
     "sampled Ground associates elevated VEG support by bounded vertical column",
     "[water][cache][ground][vegetation]") {
     constexpr float maximumAssociation = invisible_places::water::

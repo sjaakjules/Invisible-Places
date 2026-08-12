@@ -3108,6 +3108,134 @@ WaterGroundQueryResult QueryWaterGroundCache(
     return result;
 }
 
+WaterGroundHeightQueryResult QueryWaterGroundHeightCache(
+    const WaterSurfaceCache& cache,
+    const io::Float3& position,
+    float maximumDistanceMeters) {
+    WaterGroundHeightQueryResult result;
+    if ((cache.surfaceCells.empty() && cache.groundCells.empty()) ||
+        !std::isfinite(position.x) || !std::isfinite(position.y) ||
+        !std::isfinite(maximumDistanceMeters) ||
+        maximumDistanceMeters <= 0.0F ||
+        !std::isfinite(cache.resolutionMeters) ||
+        cache.resolutionMeters <= 0.0F) {
+        return result;
+    }
+
+    const auto minimumCell = PositionCell2(
+        Subtract(
+            position,
+            {maximumDistanceMeters, maximumDistanceMeters, 0.0F}),
+        cache.resolutionMeters);
+    const auto maximumCell = PositionCell2(
+        Add(
+            position,
+            {maximumDistanceMeters, maximumDistanceMeters, 0.0F}),
+        cache.resolutionMeters);
+    const float maximumDistanceSquared =
+        maximumDistanceMeters * maximumDistanceMeters;
+    const auto consider = [&](std::int32_t cellX,
+                              std::int32_t cellY,
+                              float height,
+                              WaterGroundHeightSource source,
+                              WaterGroundHeightQueryResult* candidate) {
+        if (candidate == nullptr || !std::isfinite(height)) {
+            return;
+        }
+        const float candidateX =
+            (static_cast<float>(cellX) + 0.5F) *
+            cache.resolutionMeters;
+        const float candidateY =
+            (static_cast<float>(cellY) + 0.5F) *
+            cache.resolutionMeters;
+        const float distanceSquared =
+            (candidateX - position.x) * (candidateX - position.x) +
+            (candidateY - position.y) * (candidateY - position.y);
+        if (!std::isfinite(distanceSquared) ||
+            distanceSquared > maximumDistanceSquared ||
+            (candidate->hit &&
+             distanceSquared >=
+                 candidate->distanceMeters * candidate->distanceMeters)) {
+            return;
+        }
+        candidate->height = height;
+        candidate->distanceMeters = std::sqrt(distanceSquared);
+        candidate->source = source;
+        candidate->hit = true;
+    };
+
+    // Any authored SAND cell inside the bounded search radius wins over MESH,
+    // even when the vegetation-supported MESH point is slightly closer.
+    for (std::int32_t cellX = minimumCell.x;
+         cellX <= maximumCell.x;
+         ++cellX) {
+        const auto first = std::lower_bound(
+            cache.surfaceCells.begin(),
+            cache.surfaceCells.end(),
+            std::pair{cellX, minimumCell.y},
+            [](const RainSurfaceCell& cell,
+               const std::pair<std::int32_t, std::int32_t>& coordinate) {
+                return std::tie(cell.cellX, cell.cellY) <
+                       std::tie(coordinate.first, coordinate.second);
+            });
+        for (auto candidate = first;
+             candidate != cache.surfaceCells.end() &&
+             candidate->cellX == cellX &&
+             candidate->cellY <= maximumCell.y;
+             ++candidate) {
+            if (candidate->sandSampleCount == 0U) {
+                continue;
+            }
+            consider(
+                candidate->cellX,
+                candidate->cellY,
+                candidate->sandHeight,
+                WaterGroundHeightSource::AuthoredSand,
+                &result);
+        }
+        if (cellX == std::numeric_limits<std::int32_t>::max()) {
+            break;
+        }
+    }
+    if (result.hit) {
+        return result;
+    }
+
+    for (std::int32_t cellX = minimumCell.x;
+         cellX <= maximumCell.x;
+         ++cellX) {
+        const auto first = std::lower_bound(
+            cache.groundCells.begin(),
+            cache.groundCells.end(),
+            std::pair{cellX, minimumCell.y},
+            [](const WaterGroundCell& cell,
+               const std::pair<std::int32_t, std::int32_t>& coordinate) {
+                return std::tie(cell.cellX, cell.cellY) <
+                       std::tie(coordinate.first, coordinate.second);
+            });
+        for (auto candidate = first;
+             candidate != cache.groundCells.end() &&
+             candidate->cellX == cellX &&
+             candidate->cellY <= maximumCell.y;
+             ++candidate) {
+            if ((candidate->flags &
+                 kWaterGroundVegetationSupportedFlag) == 0U) {
+                continue;
+            }
+            consider(
+                candidate->cellX,
+                candidate->cellY,
+                candidate->height,
+                WaterGroundHeightSource::VegetationSupportedMesh,
+                &result);
+        }
+        if (cellX == std::numeric_limits<std::int32_t>::max()) {
+            break;
+        }
+    }
+    return result;
+}
+
 RainSimulator::RainSimulator(std::uint32_t particleCapacity)
     : particles_(std::max(1U, particleCapacity)), events_(kRainImpactEventCapacity) {}
 

@@ -271,15 +271,31 @@ whether the view sits forward, perpendicular, or backward relative to travel
 without moving the partner. Keys outside the overlap have no counterpart and
 cannot run this alignment.
 
-The paired matching-frame timelines also provide a small camera-alignment
-clipboard. Right-clicking an ordinary key selects its stable animation/key ID
-and draws a red outline, so the selection stays attached to the same physical
-key when A and B are flipped. **Copy Camera Alignment** records its world-Z
-orbit azimuth, elevation, geometric camera-to-focus distance, and evaluated
-camera orientation. After right-clicking another key, **Paste Camera
-Alignment** rebuilds that framing around the destination's unchanged focus;
-target-driven paths remain target-driven, while paths that already author an
-orientation also receive the copied horizon/roll.
+The paired matching-frame timelines also provide a camera-alignment clipboard.
+Right-clicking an ordinary key selects its stable animation/key ID and draws a
+red outline, so the selection stays attached to the same physical key when A
+and B are flipped. A comparison table continuously reports the active scrub
+frame, selected node, and copied snapshot: geometric camera-to-focus distance,
+polar angle from world +Z, signed horizontal angle from the evaluated local
+path tangent, camera and focus height above the authored ground reference, and
+the shared ground sample Z. The ground reference starts at the horizontal
+projection of the point one-third of the way from focus to camera, using at
+most a small nearest-cell tolerance to bridge a sampling hole. It reads the authored SAND
+height already retained in the 10 mm cache, regardless of whether that cache's
+selected SAND source is the preferred analysis spacing or a complete-bundle
+fallback such as 5 mm. MESH/MESHSampled Ground is eligible only for a retained
+cell explicitly associated with vegetation, never as general sand or rock
+terrain. When the one-third point misses, the lookup advances toward the camera
+and takes the first usable SAND or vegetation-supported MESH cell. A
+selected-node note names that source, reports the fallback percentage, or
+explains why ground is unavailable. **Copy Camera
+Alignment** freezes all those values and the
+evaluated orientation by value, so later source-node edits cannot change the
+clipboard. Paste checkboxes independently select distance, polar angle,
+camera height, focus height, tangent-relative angle, and horizon/roll.
+Target-driven paths remain target-driven; focus-height paste translates the
+rig vertically, camera-height paste then sets its clearance exactly, and paths
+that already author orientation can receive the copied horizon/roll.
 
 **Fix A+B Lens** sits beside **Extend Both Seams…**. It writes paired edited
 paths with one median authored FOV, focus-distance policy/value, and aperture
@@ -472,15 +488,15 @@ Selecting a focus control in the live viewport also shows a blue world-Z
 rotation handle: a quarter arc from +Y to +X on the focus point's XY plane.
 Dragging it orbits that key's camera position around the focus without changing
 the camera's Z offset or focus distance; authored free orientation turns with
-the camera. Three compact secondary plane handles translate the complete key
-rig while leaving the ordinary focus gizmo local to the focus control. The XY
-handle sits in the negative-X/negative-Y region, ZX is offset along negative Y,
-and ZY is offset along negative X to reduce overlap with the positive-axis
-controls. Hovering one expands it to the ordinary plane-handle size; dragging
-it moves camera and focus by the same world-plane delta, preserving their
-distance, view direction, authored orientation, and lens values. The same
-controls work on the transformed partner focus nodes shown by matching-frame
-editing. Double-clicking a focus control opens **Live Edit Mode** at that
+the camera. Selecting either a camera or focus control draws a thin line
+between them and a small cube one-third of the way from focus to camera. The
+cube carries the standard X/Y/Z axes, XY/ZX/ZY planes, and centre view-plane
+drag; all translate the complete key rig by one equal delta while the ordinary
+node gizmo remains local to the selected camera or focus control. This replaces
+the detached secondary plane badges and preserves distance, view direction,
+authored orientation, and lens values. The same controls work on transformed
+partner nodes shown by matching-frame editing. The focus control retains its
+world-Z orbit handle. Double-clicking a focus control opens **Live Edit Mode** at that
 exact key frame with its evaluated pose, orientation, FOV, clip planes, focus,
 and aperture. Orbit, pan, dolly, and preset-view changes continuously preview
 back onto that key. A faded red live-view border and a top-right

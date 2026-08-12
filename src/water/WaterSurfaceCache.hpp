@@ -428,6 +428,22 @@ struct WaterGroundQueryResult {
     bool hit = false;
 };
 
+// Camera/framing ground height is authored SAND wherever possible. The
+// separate MESH-sampled Ground stream is only a valid substitute beneath a
+// column explicitly associated with VEG.
+enum class WaterGroundHeightSource : std::uint8_t {
+    None = 0U,
+    AuthoredSand = 1U,
+    VegetationSupportedMesh = 2U,
+};
+
+struct WaterGroundHeightQueryResult {
+    float height = 0.0F;
+    float distanceMeters = std::numeric_limits<float>::infinity();
+    WaterGroundHeightSource source = WaterGroundHeightSource::None;
+    bool hit = false;
+};
+
 [[nodiscard]] std::vector<WaterSurfaceSource> SelectWaterSurfaceSources(
     const scene::ScenePointCloudGroup& group,
     std::uint32_t preferredSpacingMicrometres =
@@ -483,6 +499,14 @@ struct WaterGroundQueryResult {
     const io::Float3& referenceNormal = {},
     std::uint32_t roleMask = kWaterSurfaceDefaultRoleMask);
 [[nodiscard]] WaterGroundQueryResult QueryWaterGroundCache(
+    const WaterSurfaceCache& cache,
+    const io::Float3& position,
+    float maximumDistanceMeters);
+
+// Finds the nearest cached height in XY, preferring the 10 mm authored-SAND
+// channel over every MESH candidate. MESH is considered only when the Ground
+// cell carries kWaterGroundVegetationSupportedFlag. Position Z is ignored.
+[[nodiscard]] WaterGroundHeightQueryResult QueryWaterGroundHeightCache(
     const WaterSurfaceCache& cache,
     const io::Float3& position,
     float maximumDistanceMeters);

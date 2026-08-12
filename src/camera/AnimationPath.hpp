@@ -64,14 +64,38 @@ struct AnimationPathKey {
 };
 
 // Portable focus-relative camera alignment copied between animation keys.
-// Angles are expressed in the world-Z spherical frame used by the focus-key
-// orbit handle. The evaluated orientation carries the source horizon/roll
-// when the destination path already uses the free-orientation channel.
+// Polar angle is measured from world +Z (0 overhead, 90 degrees level).
+// Path-tangent angle is the signed horizontal focus-to-camera angle from the
+// evaluated direction of travel, so it remains meaningful at another point
+// or on another animation path. Ground-relative heights share one sampled
+// ground reference supplied by the application. The complete record is a
+// value snapshot: later changes to the source path cannot change a paste.
 struct AnimationCameraAlignment {
-    float azimuthRadians = 0.0F;
-    float elevationRadians = 0.0F;
     float cameraToFocusDistance = 1.0F;
+    float polarAngleRadians = 1.57079632679F;
+    float worldAzimuthRadians = 0.0F;
+    bool hasPathTangentAngle = false;
+    float pathTangentAngleRadians = 0.0F;
+    bool hasGroundHeight = false;
+    float groundHeight = 0.0F;
+    float cameraHeightAboveGround = 0.0F;
+    float focusHeightAboveGround = 0.0F;
     std::array<float, 4> orientation{0.0F, 0.0F, 0.0F, 1.0F};
+};
+
+// Selects independent alignment components at paste time. Ground-relative
+// components require destinationGroundHeight, measured using the same ground
+// sampling rule as the captured source. Defaults preserve the established
+// focus-relative framing workflow while making horizontal orbit relative to
+// the local animation-path tangent.
+struct AnimationCameraAlignmentPasteOptions {
+    bool cameraToFocusDistance = true;
+    bool polarAngleToFocus = true;
+    bool cameraHeightAboveGround = false;
+    bool focusHeightAboveGround = false;
+    bool angleFromPathTangent = true;
+    bool horizonAndRoll = true;
+    std::optional<float> destinationGroundHeight;
 };
 
 struct AnimationExportSettings {
@@ -1102,18 +1126,39 @@ void CollectRayHitDistancesAlongRay(
     const std::array<float, 3>& focusPoint,
     float radians);
 
-// Captures and reapplies the focus-relative spherical camera alignment used
-// by the matching-frame timeline clipboard. Paste keeps the destination focus
-// fixed while copying orbit azimuth, elevation, distance, and—when that path
-// already authors orientation—the source's evaluated horizon/roll.
+// Places the shared camera/focus translation handle at a fraction of the
+// complete 3D focus-to-camera line. Degenerate or non-finite inputs do not
+// produce a handle.
+[[nodiscard]] std::optional<std::array<float, 3>>
+ResolveAnimationCameraRigHandlePoint(
+    const std::array<float, 3>& cameraPosition,
+    const std::array<float, 3>& focusPoint,
+    float fractionFromFocus = 1.0F / 3.0F);
+
+// Measures an evaluated frame for the live alignment readout. The optional
+// ground height is the application-provided authored-SAND value (or qualified
+// vegetation MESH fallback) beginning at the horizontal projection of the
+// one-third camera/focus rig point.
+[[nodiscard]] std::optional<AnimationCameraAlignment>
+MeasureAnimationCameraAlignment(
+    const AnimationPath& path,
+    float normalizedPosition,
+    std::optional<float> groundHeight = std::nullopt);
+
+// Captures and reapplies the focus-relative camera alignment used by the
+// matching-frame timeline clipboard. Capture returns an immutable value
+// snapshot. Paste combines only the selected components; target-driven paths
+// stay target-driven, while free-orientation paths can receive horizon/roll.
 [[nodiscard]] std::optional<AnimationCameraAlignment>
 CaptureAnimationCameraAlignment(
     const AnimationPath& path,
-    std::size_t keyIndex);
+    std::size_t keyIndex,
+    std::optional<float> groundHeight = std::nullopt);
 bool ApplyAnimationCameraAlignment(
     AnimationPath* path,
     std::size_t keyIndex,
-    const AnimationCameraAlignment& alignment);
+    const AnimationCameraAlignment& alignment,
+    const AnimationCameraAlignmentPasteOptions& options = {});
 
 // Replaces one key with a live camera snapshot while retaining the path's
 // existing authored-channel policy. Orientation, focus distance, and aperture
@@ -1138,7 +1183,7 @@ void MoveAnimationFocusKey(
 
 // Translates both spatial controls of one key by the same world-space delta.
 // Camera-to-focus geometry, authored orientation, and lens channels remain
-// unchanged. This backs the secondary focus-gizmo plane handles.
+// unchanged. This backs the shared camera/focus cube gizmo.
 void TranslateAnimationCameraAndFocusKey(
     AnimationPath* path,
     std::size_t keyIndex,

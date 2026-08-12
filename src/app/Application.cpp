@@ -544,8 +544,8 @@ struct AnimationFocusOrbitDragState {
 struct AnimationViewportDragState {
     bool active = false;
     bool partnerPath = false;
-    // Secondary focus-plane handles translate the complete camera rig while
-    // the ordinary focus gizmo continues to move only the focus control.
+    // The cube gizmo translates the complete camera rig while the ordinary
+    // selected-node gizmo continues to move only that one control.
     bool movesCameraAndFocus = false;
     std::filesystem::path partnerFilePath;
     AnimationEditTarget target = AnimationEditTarget::Camera;
@@ -553,6 +553,7 @@ struct AnimationViewportDragState {
     invisible_places::camera::AnimationCameraFrameTransform
         partnerToCurrentFrame{};
     ManualFlowPathGizmoDragState gizmo{};
+    invisible_places::io::Float3 rigFocusStartPoint{};
     std::optional<AnimationFocusOrbitDragState> focusOrbitZ;
 };
 
@@ -850,6 +851,8 @@ struct AnimationLoopTimelineState {
     // outline to the other row without silently changing its target.
     std::optional<AnimationLoopAlignmentKeyReference> alignmentSelection;
     std::optional<AnimationLoopAlignmentClipboard> alignmentClipboard;
+    invisible_places::camera::AnimationCameraAlignmentPasteOptions
+        alignmentPasteOptions{};
     // The animation whose empty timeline space owned the initial mouse-down.
     // It keeps the gesture until release even when the pointer crosses keys
     // or overlap bounds, or loading that animation swaps the displayed rows.
@@ -28739,12 +28742,7 @@ bool MoveLinkedAnimationKeyPoint(
         return false;
     }
 
-    if (target == AnimationEditTarget::Camera) {
-        invisible_places::camera::MoveAnimationCameraKey(path, keyIndex, {point.x, point.y, point.z});
-        if (cameraOrientation.has_value() && key.hasOrientation) {
-            key.orientation = cameraOrientation.value();
-        }
-    } else if (moveCameraWithFocus) {
+    if (moveCameraWithFocus) {
         const std::array<float, 3> translation{
             point.x - key.focusPoint[0U],
             point.y - key.focusPoint[1U],
@@ -28754,6 +28752,11 @@ bool MoveLinkedAnimationKeyPoint(
             path,
             keyIndex,
             translation);
+    } else if (target == AnimationEditTarget::Camera) {
+        invisible_places::camera::MoveAnimationCameraKey(path, keyIndex, {point.x, point.y, point.z});
+        if (cameraOrientation.has_value() && key.hasOrientation) {
+            key.orientation = cameraOrientation.value();
+        }
     } else {
         invisible_places::camera::MoveAnimationFocusKey(path, keyIndex, {point.x, point.y, point.z});
     }
@@ -28773,10 +28776,266 @@ bool MoveLinkedAnimationKeyPoint(
     return true;
 }
 
+enum class AnimationAlignmentGroundSampleStatus {
+    AvailableAtReference,
+    AvailableCloserToCamera,
+    CacheUnavailable,
+    InvalidGeometry,
+    NoNearbyGroundCell,
+};
+
+struct AnimationAlignmentGroundSample {
+    std::optional<float> height;
+    AnimationAlignmentGroundSampleStatus status =
+        AnimationAlignmentGroundSampleStatus::CacheUnavailable;
+    float fractionFromFocus = 1.0F / 3.0F;
+    invisible_places::water::WaterGroundHeightSource source =
+        invisible_places::water::WaterGroundHeightSource::None;
+};
+
+// Camera-alignment clearance starts one-third of the way from focus to camera
+// in the horizontal projection. Authored SAND in the 10 mm cache is the ground
+// authority; 5 mm MESH is accepted only for a cell explicitly associated with
+// VEG. A five-centimetre nearest-cell tolerance bridges only small sampling
+// holes. If that reference misses, sampling advances along the same line
+// through to the camera rather than snapping backward toward rocks near focus.
+AnimationAlignmentGroundSample ResolveAnimationAlignmentGroundSample(
+    const PreviewRuntimeState& runtimeState,
+    const std::array<float, 3>& cameraPosition,
+    const std::array<float, 3>& focusPoint) {
+    AnimationAlignmentGroundSample result;
+    const auto& cache = runtimeState.water.waterSurfaceCache;
+    if (cache == nullptr ||
+        (cache->surfaceCells.empty() && cache->groundCells.empty()) ||
+        !std::isfinite(cache->resolutionMeters) ||
+        cache->resolutionMeters <= 0.0F) {
+        return result;
+    }
+    if (!std::all_of(
+            cameraPosition.begin(),
+            cameraPosition.end(),
+            [](float value) { return std::isfinite(value); }) ||
+        !std::all_of(
+            focusPoint.begin(),
+            focusPoint.end(),
+            [](float value) { return std::isfinite(value); })) {
+        result.status =
+            AnimationAlignmentGroundSampleStatus::InvalidGeometry;
+        return result;
+    }
+    const float maximumDistance = std::max(
+        0.05F,
+        2.0F * cache->resolutionMeters);
+    const auto queryNear = [&](const glm::vec2& sample) {
+        return invisible_places::water::QueryWaterGroundHeightCache(
+            *cache,
+            {sample.x, sample.y, 0.0F},
+            maximumDistance);
+    };
+    constexpr float kReferenceFraction = 1.0F / 3.0F;
+    const glm::vec2 focusXy{focusPoint[0U], focusPoint[1U]};
+    const glm::vec2 cameraXy{cameraPosition[0U], cameraPosition[1U]};
+    const glm::vec2 horizontalSpan = cameraXy - focusXy;
+    const auto sampleAt = [&](float fraction) {
+        return focusXy + horizontalSpan * fraction;
+    };
+    if (const auto ground = queryNear(sampleAt(kReferenceFraction));
+        ground.hit) {
+        result.height = ground.height;
+        result.source = ground.source;
+        result.status =
+            AnimationAlignmentGroundSampleStatus::AvailableAtReference;
+        return result;
+    }
+
+    const float remainingDistance = glm::length(
+        horizontalSpan * (1.0F - kReferenceFraction));
+    if (std::isfinite(remainingDistance) && remainingDistance > 1.0e-6F) {
+        // At ordinary scene scales consecutive tolerance discs touch, so the
+        // fallback checks the whole focus-to-camera corridor. The cap protects
+        // interactive readouts from pathological coordinates while still
+        // distributing samples through to the camera.
+        const double requestedSampleCount = std::ceil(
+            static_cast<double>(remainingDistance) /
+            (2.0 * static_cast<double>(maximumDistance)));
+        const std::size_t sampleCount = static_cast<std::size_t>(
+            std::clamp(requestedSampleCount, 1.0, 4096.0));
+        for (std::size_t sampleIndex = 1U;
+             sampleIndex <= sampleCount;
+             ++sampleIndex) {
+            const float fraction = kReferenceFraction +
+                (1.0F - kReferenceFraction) *
+                    (static_cast<float>(sampleIndex) /
+                     static_cast<float>(sampleCount));
+            if (const auto ground = queryNear(sampleAt(fraction));
+                ground.hit) {
+                result.height = ground.height;
+                result.source = ground.source;
+                result.status = AnimationAlignmentGroundSampleStatus::
+                    AvailableCloserToCamera;
+                result.fractionFromFocus = fraction;
+                return result;
+            }
+        }
+    }
+
+    result.status =
+        AnimationAlignmentGroundSampleStatus::NoNearbyGroundCell;
+    return result;
+}
+
+std::string DescribeAnimationAlignmentGroundSample(
+    PreviewRuntimeState* runtimeState,
+    const AnimationAlignmentGroundSample& sample) {
+    const auto sourceDescription = [&]() {
+        const auto sourceSpacing = [&](invisible_places::water::
+                                           WaterSurfaceRole role)
+            -> std::optional<std::uint32_t> {
+            if (runtimeState == nullptr ||
+                runtimeState->water.waterSurfaceCache == nullptr) {
+                return std::nullopt;
+            }
+            const auto& sources =
+                runtimeState->water.waterSurfaceCache->sources;
+            const auto source = std::find_if(
+                sources.begin(),
+                sources.end(),
+                [&](const auto& candidate) {
+                    return candidate.role == role;
+                });
+            return source == sources.end() ||
+                    source->spacingMicrometres == 0U
+                ? std::nullopt
+                : std::optional<std::uint32_t>{
+                      source->spacingMicrometres};
+        };
+        switch (sample.source) {
+            case invisible_places::water::WaterGroundHeightSource::
+                AuthoredSand: {
+                const auto spacing = sourceSpacing(
+                    invisible_places::water::WaterSurfaceRole::Sand);
+                return std::string{"the 10 mm cached authored SAND channel"} +
+                    (spacing.has_value()
+                         ? " (from the " +
+                               FormatFixed(
+                                   static_cast<double>(spacing.value()) /
+                                       1000.0,
+                                   0) +
+                               " mm SAND cloud)"
+                         : "");
+            }
+            case invisible_places::water::WaterGroundHeightSource::
+                VegetationSupportedMesh: {
+                const auto spacing = sourceSpacing(
+                    invisible_places::water::WaterSurfaceRole::Ground);
+                return std::string{"vegetation-supported MESH"} +
+                    (spacing.has_value()
+                         ? " from the " +
+                               FormatFixed(
+                                   static_cast<double>(spacing.value()) /
+                                       1000.0,
+                                   0) +
+                               " mm Ground cloud"
+                         : "");
+            }
+            case invisible_places::water::WaterGroundHeightSource::None:
+                return std::string{"an unavailable ground source"};
+        }
+        return std::string{"an unavailable ground source"};
+    };
+    switch (sample.status) {
+        case AnimationAlignmentGroundSampleStatus::AvailableAtReference:
+            return "using " + sourceDescription() +
+                " at the one-third reference";
+        case AnimationAlignmentGroundSampleStatus::AvailableCloserToCamera:
+            return "the one-third reference had no usable authored SAND or vegetation-supported MESH, so sampling advanced to " +
+                FormatFixed(sample.fractionFromFocus * 100.0F, 0) +
+                "% of the focus-to-camera distance using " +
+                sourceDescription();
+        case AnimationAlignmentGroundSampleStatus::InvalidGeometry:
+            return "the evaluated camera or focus contains an invalid coordinate";
+        case AnimationAlignmentGroundSampleStatus::NoNearbyGroundCell:
+            return "no authored SAND or vegetation-supported MESH cell was found from the one-third reference through to the camera";
+        case AnimationAlignmentGroundSampleStatus::CacheUnavailable:
+            break;
+    }
+
+    const auto* scene = ActiveWaterSurfaceScene(runtimeState);
+    if (scene == nullptr) {
+        return "no single visible scene currently owns the shared surface cache";
+    }
+    switch (scene->waterSurfaceCacheStatus) {
+        case WaterSurfaceCacheRuntimeStatus::Building:
+            return "the active scene's shared surface cache is still building";
+        case WaterSurfaceCacheRuntimeStatus::Failed:
+            return "the active scene's shared surface cache failed to build";
+        case WaterSurfaceCacheRuntimeStatus::Missing:
+            return "the active scene's shared surface cache is not ready yet";
+        case WaterSurfaceCacheRuntimeStatus::Stale:
+            return "the active scene's shared surface cache is stale and awaiting rebuild";
+        case WaterSurfaceCacheRuntimeStatus::Valid:
+            return "the active cache contains no usable authored SAND or vegetation-supported MESH cells";
+    }
+    return "camera ground is unavailable";
+}
+
+std::optional<invisible_places::camera::AnimationCameraAlignment>
+MeasureAnimationAlignmentAtPosition(
+    const PreviewRuntimeState& runtimeState,
+    const AnimationPath& path,
+    float normalizedPosition) {
+    const float position = std::clamp(
+        normalizedPosition,
+        0.0F,
+        1.0F);
+    const auto evaluation = invisible_places::camera::EvaluateAnimationPath(
+        path,
+        invisible_places::camera::AnimationPathDurationSeconds(path) *
+            position);
+    const auto groundSample = ResolveAnimationAlignmentGroundSample(
+        runtimeState,
+        evaluation.camera.position,
+        evaluation.focusPoint);
+    return invisible_places::camera::MeasureAnimationCameraAlignment(
+        path,
+        position,
+        groundSample.height);
+}
+
+std::optional<invisible_places::camera::AnimationCameraAlignment>
+CaptureAnimationAlignmentAtKey(
+    const PreviewRuntimeState& runtimeState,
+    const AnimationPath& path,
+    std::size_t keyIndex,
+    AnimationAlignmentGroundSample* resolvedGroundSample = nullptr) {
+    if (keyIndex >= path.keys.size()) {
+        return std::nullopt;
+    }
+    const float position = invisible_places::camera::
+        AnimationPathKeyNormalizedPosition(path, keyIndex);
+    const auto evaluation = invisible_places::camera::EvaluateAnimationPath(
+        path,
+        invisible_places::camera::AnimationPathDurationSeconds(path) *
+            position);
+    const auto groundSample = ResolveAnimationAlignmentGroundSample(
+        runtimeState,
+        evaluation.camera.position,
+        evaluation.focusPoint);
+    if (resolvedGroundSample != nullptr) {
+        *resolvedGroundSample = groundSample;
+    }
+    return invisible_places::camera::CaptureAnimationCameraAlignment(
+        path,
+        keyIndex,
+        groundSample.height);
+}
+
 bool PasteAnimationCameraAlignment(
     PreviewRuntimeState* runtimeState,
     const AnimationLoopAlignmentKeyReference& destination,
-    const invisible_places::camera::AnimationCameraAlignment& alignment) {
+    const invisible_places::camera::AnimationCameraAlignment& alignment,
+    const invisible_places::camera::AnimationCameraAlignmentPasteOptions&
+        requestedOptions) {
     if (runtimeState == nullptr) {
         return false;
     }
@@ -28819,10 +29078,88 @@ bool PasteAnimationCameraAlignment(
             "Alignment paste blocked.")) {
         return false;
     }
+
+    const bool copiesGeometry =
+        requestedOptions.cameraToFocusDistance ||
+        requestedOptions.polarAngleToFocus ||
+        requestedOptions.cameraHeightAboveGround ||
+        requestedOptions.focusHeightAboveGround ||
+        requestedOptions.angleFromPathTangent;
+    if (!copiesGeometry && !requestedOptions.horizonAndRoll) {
+        runtimeState->errorMessage =
+            "Select at least one camera-alignment value to paste.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    if (requestedOptions.angleFromPathTangent &&
+        !alignment.hasPathTangentAngle) {
+        runtimeState->errorMessage =
+            "The copied frame has no horizontal path tangent for a normalized angle.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    const auto destinationDetails = CaptureAnimationAlignmentAtKey(
+        *runtimeState,
+        *path,
+        keyIndex);
+    if (requestedOptions.angleFromPathTangent &&
+        (!destinationDetails.has_value() ||
+         !destinationDetails->hasPathTangentAngle)) {
+        runtimeState->errorMessage =
+            "The destination frame has no horizontal path tangent for a normalized angle.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    auto options = requestedOptions;
+    const bool copiesGroundHeight =
+        options.cameraHeightAboveGround ||
+        options.focusHeightAboveGround;
+    if (copiesGroundHeight) {
+        if (!alignment.hasGroundHeight) {
+            runtimeState->errorMessage =
+                "The copied frame has no authored-SAND or qualified vegetation-MESH height reference.";
+            runtimeState->statusMessage.clear();
+            return false;
+        }
+        AnimationPath groundProbe = *path;
+        auto probeOptions = options;
+        probeOptions.cameraHeightAboveGround = false;
+        probeOptions.focusHeightAboveGround = false;
+        probeOptions.horizonAndRoll = false;
+        probeOptions.destinationGroundHeight.reset();
+        if (!invisible_places::camera::ApplyAnimationCameraAlignment(
+                &groundProbe,
+                keyIndex,
+                alignment,
+                probeOptions)) {
+            runtimeState->errorMessage =
+                "The destination camera could not be prepared for its ground-height sample.";
+            runtimeState->statusMessage.clear();
+            return false;
+        }
+        const auto& probeKey = groundProbe.keys[keyIndex];
+        const auto groundSample = ResolveAnimationAlignmentGroundSample(
+            *runtimeState,
+            probeKey.cameraPosition,
+            probeKey.focusPoint);
+        options.destinationGroundHeight = groundSample.height;
+        if (!options.destinationGroundHeight.has_value()) {
+            runtimeState->errorMessage =
+                "Destination ground height unavailable: " +
+                DescribeAnimationAlignmentGroundSample(
+                    runtimeState,
+                    groundSample) +
+                ".";
+            runtimeState->statusMessage.clear();
+            return false;
+        }
+    }
     if (!invisible_places::camera::ApplyAnimationCameraAlignment(
             path,
             keyIndex,
-            alignment)) {
+            alignment,
+            options)) {
         runtimeState->errorMessage =
             "The copied camera alignment is invalid and was not pasted.";
         runtimeState->statusMessage.clear();
@@ -42289,11 +42626,18 @@ struct ViewportGizmoHandles {
     std::optional<ImVec2> centerScreen;
 };
 
+enum class ViewportGizmoCenterStyle {
+    Point,
+    Cube,
+};
+
 ViewportGizmoHandles BuildAndDrawViewportGizmo(
     ImDrawList* drawList,
     const invisible_places::camera::OrbitCameraMatrices& matrices,
     const invisible_places::renderer::core::VulkanViewportShell& viewport,
-    const glm::vec3& worldPoint) {
+    const glm::vec3& worldPoint,
+    ViewportGizmoCenterStyle centerStyle =
+        ViewportGizmoCenterStyle::Point) {
     ViewportGizmoHandles handles;
     const auto projectedCenter = ProjectWorldPoint(matrices, viewport, worldPoint);
     if (!projectedCenter.has_value() || drawList == nullptr) {
@@ -42387,235 +42731,129 @@ ViewportGizmoHandles BuildAndDrawViewportGizmo(
             .quad = quad,
         });
     }
-    drawList->AddCircleFilled(projectedCenter->screen, 8.0F, IM_COL32(235, 235, 235, 255), 24);
-    drawList->AddCircle(projectedCenter->screen, 10.0F, IM_COL32(28, 28, 31, 255), 24, 2.0F);
-    return handles;
-}
-
-// A focus key gets a second set of plane controls for translating the whole
-// camera rig. These are deliberately drawn as detached badges in the
-// negative-axis regions requested by the author: XY at -X/-Y, ZX at -Y, and
-// ZY at -X. The badge itself may be parallel-offset from its movement plane;
-// dragging still resolves on the corresponding world plane through the focus.
-struct AnimationFocusRigPlaneHandles {
-    struct PlaneHandle {
-        glm::vec3 normal{};
-        const char* label = "";
-        ImVec2 screenCenter{};
-        std::array<ImVec2, 4> compactQuad{};
-        std::array<ImVec2, 4> expandedQuad{};
-        ImU32 compactColour = 0U;
-        ImU32 expandedColour = 0U;
-    };
-    std::vector<PlaneHandle> planes;
-    std::optional<std::size_t> hotPlaneIndex;
-};
-
-AnimationFocusRigPlaneHandles BuildAndDrawAnimationFocusRigPlaneHandles(
-    ImDrawList* drawList,
-    const invisible_places::camera::OrbitCameraMatrices& matrices,
-    const invisible_places::renderer::core::VulkanViewportShell& viewport,
-    const glm::vec3& focusPoint,
-    std::optional<ImVec2> mousePosition,
-    std::optional<glm::vec3> activePlaneNormal = std::nullopt) {
-    AnimationFocusRigPlaneHandles handles;
-    if (drawList == nullptr ||
-        !ProjectWorldPoint(matrices, viewport, focusPoint).has_value()) {
-        return handles;
-    }
-
-    const float cameraDistance = glm::length(focusPoint - matrices.position);
-    const float axisLength = std::max(0.05F, cameraDistance * 0.12F);
-    constexpr float kCompactHalfExtent = 0.050F;
-    // 0.19 of the standard axis length matches the existing plane-control
-    // side length (0.43 - 0.24) once a secondary badge is hovered.
-    constexpr float kExpandedHalfExtent = 0.095F;
-    struct PlaneDefinition {
-        glm::vec3 first{};
-        glm::vec3 second{};
-        glm::vec3 normal{};
-        glm::vec3 centerOffset{};
-        const char* label = "";
-        ImU32 compactColour = 0U;
-        ImU32 expandedColour = 0U;
-    };
-    const glm::vec3 worldX{1.0F, 0.0F, 0.0F};
-    const glm::vec3 worldY{0.0F, 1.0F, 0.0F};
-    const glm::vec3 worldZ{0.0F, 0.0F, 1.0F};
-    const std::array<PlaneDefinition, 3> definitions{
-        PlaneDefinition{
-            worldX,
-            worldY,
-            worldZ,
-            -0.50F * worldX - 0.50F * worldY,
-            "XY",
-            IM_COL32(245, 214, 70, 120),
-            IM_COL32(255, 226, 88, 225),
-        },
-        PlaneDefinition{
-            worldX,
-            worldZ,
-            worldY,
-            -0.62F * worldY,
-            "ZX",
-            IM_COL32(232, 80, 205, 120),
-            IM_COL32(245, 103, 218, 225),
-        },
-        PlaneDefinition{
-            worldY,
-            worldZ,
-            worldX,
-            -0.62F * worldX,
-            "ZY",
-            IM_COL32(71, 220, 210, 120),
-            IM_COL32(91, 235, 225, 225),
-        },
-    };
-    const auto projectQuad = [&](const glm::vec3& center,
-                                 const glm::vec3& first,
-                                 const glm::vec3& second,
-                                 float halfExtent)
-        -> std::optional<std::array<ImVec2, 4>> {
-        const float extent = axisLength * halfExtent;
-        const std::array<glm::vec3, 4> corners{
-            center - first * extent - second * extent,
-            center + first * extent - second * extent,
-            center + first * extent + second * extent,
-            center - first * extent + second * extent,
-        };
-        std::array<ImVec2, 4> quad{};
-        for (std::size_t index = 0U; index < corners.size(); ++index) {
+    if (centerStyle == ViewportGizmoCenterStyle::Point) {
+        drawList->AddCircleFilled(
+            projectedCenter->screen,
+            8.0F,
+            IM_COL32(235, 235, 235, 255),
+            24);
+        drawList->AddCircle(
+            projectedCenter->screen,
+            10.0F,
+            IM_COL32(28, 28, 31, 255),
+            24,
+            2.0F);
+    } else {
+        const float halfExtent = axisLength * 0.085F;
+        std::array<glm::vec3, 8> worldCorners{};
+        std::array<ImVec2, 8> screenCorners{};
+        bool cubeVisible = true;
+        for (std::size_t corner = 0U;
+             corner < worldCorners.size();
+             ++corner) {
+            worldCorners[corner] = worldPoint + glm::vec3{
+                (corner & 1U) != 0U ? halfExtent : -halfExtent,
+                (corner & 2U) != 0U ? halfExtent : -halfExtent,
+                (corner & 4U) != 0U ? halfExtent : -halfExtent,
+            };
             const auto projected = ProjectWorldPoint(
                 matrices,
                 viewport,
-                corners[index]);
+                worldCorners[corner]);
             if (!projected.has_value()) {
-                return std::nullopt;
-            }
-            quad[index] = projected->screen;
-        }
-        return quad;
-    };
-
-    handles.planes.reserve(definitions.size());
-    for (const auto& definition : definitions) {
-        const glm::vec3 center =
-            focusPoint + definition.centerOffset * axisLength;
-        const auto projectedCenter = ProjectWorldPoint(
-            matrices,
-            viewport,
-            center);
-        const auto compactQuad = projectQuad(
-            center,
-            definition.first,
-            definition.second,
-            kCompactHalfExtent);
-        const auto expandedQuad = projectQuad(
-            center,
-            definition.first,
-            definition.second,
-            kExpandedHalfExtent);
-        if (!projectedCenter.has_value() || !compactQuad.has_value() ||
-            !expandedQuad.has_value()) {
-            continue;
-        }
-        handles.planes.push_back({
-            .normal = definition.normal,
-            .label = definition.label,
-            .screenCenter = projectedCenter->screen,
-            .compactQuad = compactQuad.value(),
-            .expandedQuad = expandedQuad.value(),
-            .compactColour = definition.compactColour,
-            .expandedColour = definition.expandedColour,
-        });
-    }
-
-    std::optional<std::size_t> activeIndex;
-    if (activePlaneNormal.has_value() &&
-        glm::length(activePlaneNormal.value()) > 1.0e-5F) {
-        const glm::vec3 activeNormal = glm::normalize(
-            activePlaneNormal.value());
-        for (std::size_t index = 0U;
-             index < handles.planes.size();
-             ++index) {
-            if (std::abs(glm::dot(
-                    glm::normalize(handles.planes[index].normal),
-                    activeNormal)) > 0.999F) {
-                activeIndex = index;
+                cubeVisible = false;
                 break;
             }
+            screenCorners[corner] = projected->screen;
         }
-    }
-    if (activeIndex.has_value()) {
-        handles.hotPlaneIndex = activeIndex;
-    } else if (mousePosition.has_value()) {
-        float closestCenterDistance = std::numeric_limits<float>::max();
-        for (std::size_t index = 0U;
-             index < handles.planes.size();
-             ++index) {
-            const auto& plane = handles.planes[index];
-            if (!ManualFlowPathPointInQuad(
-                    mousePosition.value(),
-                    plane.expandedQuad)) {
-                continue;
+        if (cubeVisible) {
+            constexpr std::array<std::array<std::size_t, 4>, 6> faces{
+                std::array<std::size_t, 4>{0U, 2U, 6U, 4U},
+                std::array<std::size_t, 4>{1U, 5U, 7U, 3U},
+                std::array<std::size_t, 4>{0U, 4U, 5U, 1U},
+                std::array<std::size_t, 4>{2U, 3U, 7U, 6U},
+                std::array<std::size_t, 4>{0U, 1U, 3U, 2U},
+                std::array<std::size_t, 4>{4U, 6U, 7U, 5U},
+            };
+            struct ProjectedCubeFace {
+                std::array<ImVec2, 4> points{};
+                float cameraDistance = 0.0F;
+            };
+            std::array<ProjectedCubeFace, faces.size()> projectedFaces{};
+            for (std::size_t faceIndex = 0U;
+                 faceIndex < faces.size();
+                 ++faceIndex) {
+                float distance = 0.0F;
+                for (std::size_t vertex = 0U; vertex < 4U; ++vertex) {
+                    const std::size_t corner = faces[faceIndex][vertex];
+                    projectedFaces[faceIndex].points[vertex] =
+                        screenCorners[corner];
+                    distance += glm::length(
+                        worldCorners[corner] - matrices.position);
+                }
+                projectedFaces[faceIndex].cameraDistance = distance * 0.25F;
             }
-            const float distance = ScreenDistance(
-                mousePosition.value(),
-                plane.screenCenter);
-            if (distance < closestCenterDistance) {
-                closestCenterDistance = distance;
-                handles.hotPlaneIndex = index;
+            std::sort(
+                projectedFaces.begin(),
+                projectedFaces.end(),
+                [](const auto& left, const auto& right) {
+                    return left.cameraDistance > right.cameraDistance;
+                });
+            for (const auto& face : projectedFaces) {
+                drawList->AddConvexPolyFilled(
+                    face.points.data(),
+                    4,
+                    IM_COL32(255, 224, 132, 74));
             }
-        }
-    }
-
-    // Draw the expanded/hot badge last so it remains legible if a steep view
-    // projection brings two detached handles close together on screen.
-    for (int pass = 0; pass < 2; ++pass) {
-        for (std::size_t index = 0U;
-             index < handles.planes.size();
-             ++index) {
-            const bool emphasized =
-                handles.hotPlaneIndex.has_value() &&
-                handles.hotPlaneIndex.value() == index;
-            if (emphasized != (pass == 1)) {
-                continue;
+            constexpr std::array<std::array<std::size_t, 2>, 12> edges{
+                std::array<std::size_t, 2>{0U, 1U},
+                std::array<std::size_t, 2>{2U, 3U},
+                std::array<std::size_t, 2>{4U, 5U},
+                std::array<std::size_t, 2>{6U, 7U},
+                std::array<std::size_t, 2>{0U, 2U},
+                std::array<std::size_t, 2>{1U, 3U},
+                std::array<std::size_t, 2>{4U, 6U},
+                std::array<std::size_t, 2>{5U, 7U},
+                std::array<std::size_t, 2>{0U, 4U},
+                std::array<std::size_t, 2>{1U, 5U},
+                std::array<std::size_t, 2>{2U, 6U},
+                std::array<std::size_t, 2>{3U, 7U},
+            };
+            for (const auto& edge : edges) {
+                drawList->AddLine(
+                    screenCorners[edge[0U]],
+                    screenCorners[edge[1U]],
+                    IM_COL32(20, 18, 16, 235),
+                    3.8F);
+                drawList->AddLine(
+                    screenCorners[edge[0U]],
+                    screenCorners[edge[1U]],
+                    IM_COL32(255, 234, 174, 255),
+                    1.7F);
             }
-            const auto& plane = handles.planes[index];
-            const auto& quad = emphasized
-                ? plane.expandedQuad
-                : plane.compactQuad;
-            drawList->AddConvexPolyFilled(
-                quad.data(),
-                4,
-                emphasized
-                    ? plane.expandedColour
-                    : plane.compactColour);
-            drawList->AddPolyline(
-                quad.data(),
-                4,
-                IM_COL32(10, 8, 15, emphasized ? 225 : 185),
-                ImDrawFlags_Closed,
-                emphasized ? 5.0F : 3.5F);
-            drawList->AddPolyline(
-                quad.data(),
-                4,
-                IM_COL32(255, 91, 214, emphasized ? 255 : 210),
-                ImDrawFlags_Closed,
-                emphasized ? 2.5F : 1.4F);
-            drawList->AddCircleFilled(
-                plane.screenCenter,
-                emphasized ? 3.0F : 1.8F,
-                IM_COL32(255, 218, 248, emphasized ? 255 : 220),
-                16);
+        } else {
+            drawList->AddRectFilled(
+                ImVec2{
+                    projectedCenter->screen.x - 7.0F,
+                    projectedCenter->screen.y - 7.0F},
+                ImVec2{
+                    projectedCenter->screen.x + 7.0F,
+                    projectedCenter->screen.y + 7.0F},
+                IM_COL32(255, 224, 132, 245));
+            drawList->AddRect(
+                ImVec2{
+                    projectedCenter->screen.x - 8.0F,
+                    projectedCenter->screen.y - 8.0F},
+                ImVec2{
+                    projectedCenter->screen.x + 8.0F,
+                    projectedCenter->screen.y + 8.0F},
+                IM_COL32(28, 28, 31, 255),
+                0.0F,
+                0,
+                2.0F);
         }
     }
     return handles;
-}
-
-std::optional<std::size_t> HitTestAnimationFocusRigPlaneHandles(
-    const AnimationFocusRigPlaneHandles& handles) {
-    return handles.hotPlaneIndex;
 }
 
 struct ViewportGizmoHit {
@@ -47841,7 +48079,7 @@ void DrawAnimationViewportOverlay(
         if (!io.MouseDown[0]) {
             panel.drag = {};
         } else {
-            const auto nextPoint = panel.drag.focusOrbitZ.has_value()
+            auto nextPoint = panel.drag.focusOrbitZ.has_value()
                 ? UpdateAnimationFocusOrbitDrag(
                       &panel.drag.focusOrbitZ.value(),
                       matrices,
@@ -47852,6 +48090,13 @@ void DrawAnimationViewportOverlay(
                       matrices,
                       viewport,
                       io.MousePos);
+            if (nextPoint.has_value() &&
+                panel.drag.movesCameraAndFocus) {
+                const glm::vec3 handleStart = ToGlm(
+                    panel.drag.gizmo.startPoint);
+                nextPoint = ToGlm(panel.drag.rigFocusStartPoint) +
+                    (nextPoint.value() - handleStart);
+            }
             bool moved = false;
             if (nextPoint.has_value() && panel.drag.partnerPath) {
                 const auto partnerIndex = FindAnimationRegistryIndex(
@@ -47951,7 +48196,7 @@ void DrawAnimationViewportOverlay(
                     panel.dirty = true;
                     if (panel.drag.movesCameraAndFocus) {
                         runtimeState->statusMessage =
-                            "Moved the camera and focus key together on a world plane.";
+                            "Moved the camera and focus key together with the shared rig gizmo.";
                         runtimeState->errorMessage.clear();
                     } else if (panel.drag.focusOrbitZ.has_value()) {
                         runtimeState->statusMessage =
@@ -48150,18 +48395,83 @@ void DrawAnimationViewportOverlay(
     const AnimationEditTarget selectedTarget = selectedIsPartner
         ? panel.viewportPartnerEditTarget
         : panel.editTarget;
-    const glm::vec3 selectedPoint = selectedIsPartner
-        ? applyPartnerTransform(
-              partnerOverlay->transform,
-              AnimationKeyPointWorld(
-                  *partnerOverlay->path,
-                  selectedKeyIndex,
-                  selectedTarget))
-        : AnimationKeyPointWorld(
-              path,
-              selectedKeyIndex,
-              selectedTarget);
-    const auto gizmoHandles = BuildAndDrawViewportGizmo(drawList, matrices, viewport, selectedPoint);
+    const AnimationPath& selectedPath = selectedIsPartner
+        ? *partnerOverlay->path
+        : path;
+    const auto displaySelectedPoint = [&](AnimationEditTarget target) {
+        const glm::vec3 point = AnimationKeyPointWorld(
+            selectedPath,
+            selectedKeyIndex,
+            target);
+        return selectedIsPartner
+            ? applyPartnerTransform(partnerOverlay->transform, point)
+            : point;
+    };
+    const glm::vec3 selectedCameraPoint = displaySelectedPoint(
+        AnimationEditTarget::Camera);
+    const glm::vec3 selectedFocusPoint = displaySelectedPoint(
+        AnimationEditTarget::Focus);
+    const glm::vec3 selectedPoint = selectedTarget ==
+            AnimationEditTarget::Camera
+        ? selectedCameraPoint
+        : selectedFocusPoint;
+
+    const auto projectedSelectedCamera = ProjectWorldPoint(
+        matrices,
+        viewport,
+        selectedCameraPoint);
+    const auto projectedSelectedFocus = ProjectWorldPoint(
+        matrices,
+        viewport,
+        selectedFocusPoint);
+    if (projectedSelectedCamera.has_value() &&
+        projectedSelectedFocus.has_value()) {
+        drawList->AddLine(
+            projectedSelectedCamera->screen,
+            projectedSelectedFocus->screen,
+            IM_COL32(8, 8, 10, 210),
+            3.0F);
+        drawList->AddLine(
+            projectedSelectedCamera->screen,
+            projectedSelectedFocus->screen,
+            IM_COL32(255, 232, 160, 235),
+            1.15F);
+    }
+
+    std::optional<glm::vec3> rigHandlePoint;
+    if (const auto resolved = invisible_places::camera::
+            ResolveAnimationCameraRigHandlePoint(
+                {
+                    selectedCameraPoint.x,
+                    selectedCameraPoint.y,
+                    selectedCameraPoint.z,
+                },
+                {
+                    selectedFocusPoint.x,
+                    selectedFocusPoint.y,
+                    selectedFocusPoint.z,
+                });
+        resolved.has_value()) {
+        rigHandlePoint = glm::vec3{
+            resolved->at(0U),
+            resolved->at(1U),
+            resolved->at(2U),
+        };
+    }
+    const auto gizmoHandles = BuildAndDrawViewportGizmo(
+        drawList,
+        matrices,
+        viewport,
+        selectedPoint);
+    const auto rigGizmoHandles =
+        rigHandlePoint.has_value() && !panel.liveCameraEdit.active
+            ? BuildAndDrawViewportGizmo(
+                  drawList,
+                  matrices,
+                  viewport,
+                  rigHandlePoint.value(),
+                  ViewportGizmoCenterStyle::Cube)
+            : ViewportGizmoHandles{};
     const auto focusOrbitHandle =
         !selectedIsPartner &&
                 selectedTarget == AnimationEditTarget::Focus &&
@@ -48172,55 +48482,41 @@ void DrawAnimationViewportOverlay(
                   viewport,
                   selectedPoint)
             : AnimationFocusOrbitHandle{};
-    const std::optional<glm::vec3> activeRigPlaneNormal =
-        panel.drag.active && panel.drag.movesCameraAndFocus
-            ? std::optional<glm::vec3>{panel.drag.gizmo.planeNormal}
-            : std::nullopt;
-    const std::optional<ImVec2> rigHandleMousePosition =
-        canInteractWithRenderViewport && !panel.drag.active
-            ? std::optional<ImVec2>{io.MousePos}
-            : std::nullopt;
-    const auto focusRigPlaneHandles =
-        selectedTarget == AnimationEditTarget::Focus &&
-                !panel.liveCameraEdit.active
-            ? BuildAndDrawAnimationFocusRigPlaneHandles(
-                  drawList,
-                  matrices,
-                  viewport,
-                  selectedPoint,
-                  rigHandleMousePosition,
-                  activeRigPlaneNormal)
-            : AnimationFocusRigPlaneHandles{};
 
     if (!canInteractWithRenderViewport || panel.drag.active) {
         return;
     }
 
-    const auto focusRigPlaneHit =
-        HitTestAnimationFocusRigPlaneHandles(focusRigPlaneHandles);
+    const auto rigGizmoHit = HitTestViewportGizmo(
+        rigGizmoHandles,
+        io.MousePos);
     const auto gizmoHit = HitTestViewportGizmo(gizmoHandles, io.MousePos);
     const bool focusOrbitHit = HitTestAnimationFocusOrbitHandle(
         focusOrbitHandle,
         io.MousePos);
-    if (focusRigPlaneHit.has_value() || focusOrbitHit ||
+    if (rigGizmoHit.has_value() || focusOrbitHit ||
         gizmoHit.has_value() || bestHit.has_value()) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
     }
-    if (focusRigPlaneHit.has_value()) {
+    if (rigGizmoHit.has_value()) {
         ImGui::SetTooltip(
-            "Drag to move this key's camera and focus together on the world %s plane.",
-            focusRigPlaneHandles
-                .planes[focusRigPlaneHit.value()]
-                .label);
+            "Drag the cube, an axis, or a plane to move this key's camera and focus together.");
     }
     if (!ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         return;
     }
 
     const auto beginDrag = [&](const ViewportGizmoHit& hit,
+                               const ViewportGizmoHandles& handles,
                                const glm::vec3& point,
                                bool movesCameraAndFocus) {
-        if (auto drag = BeginViewportGizmoDrag(hit, gizmoHandles, matrices, viewport, io.MousePos, point);
+        if (auto drag = BeginViewportGizmoDrag(
+                hit,
+                handles,
+                matrices,
+                viewport,
+                io.MousePos,
+                point);
             drag.has_value()) {
             panel.drag = {
                 .active = true,
@@ -48229,32 +48525,26 @@ void DrawAnimationViewportOverlay(
                 .partnerFilePath = selectedIsPartner
                     ? partnerOverlay->filePath
                     : std::filesystem::path{},
-                .target = movesCameraAndFocus
-                    ? AnimationEditTarget::Focus
-                    : selectedTarget,
+                .target = selectedTarget,
                 .keyIndex = selectedKeyIndex,
                 .partnerToCurrentFrame = selectedIsPartner
                     ? partnerOverlay->transform
                     : invisible_places::camera::
                           AnimationCameraFrameTransform{},
                 .gizmo = drag.value(),
+                .rigFocusStartPoint = FromGlm(selectedFocusPoint),
             };
         }
     };
 
-    // Detached whole-rig handles claim the click before local focus controls;
+    // The shared-rig cube claims the click before local node controls;
     // otherwise a key click selects it, and clicking the already-selected key
     // again starts a camera-plane drag (the manual Flow-node standard).
-    if (focusRigPlaneHit.has_value() &&
-        selectedTarget == AnimationEditTarget::Focus) {
-        const auto& plane = focusRigPlaneHandles
-            .planes[focusRigPlaneHit.value()];
+    if (rigGizmoHit.has_value() && rigHandlePoint.has_value()) {
         beginDrag(
-            ViewportGizmoHit{
-                .kind = ManualFlowPathGizmoDragKind::Plane,
-                .planeNormal = plane.normal,
-            },
-            selectedPoint,
+            rigGizmoHit.value(),
+            rigGizmoHandles,
+            rigHandlePoint.value(),
             true);
         return;
     }
@@ -48290,7 +48580,11 @@ void DrawAnimationViewportOverlay(
         return;
     }
     if (gizmoHit.has_value()) {
-        beginDrag(gizmoHit.value(), selectedPoint, false);
+        beginDrag(
+            gizmoHit.value(),
+            gizmoHandles,
+            selectedPoint,
+            false);
         return;
     }
     if (bestHit.has_value()) {
@@ -48302,6 +48596,7 @@ void DrawAnimationViewportOverlay(
         if (alreadySelected) {
             beginDrag(
                 ViewportGizmoHit{.kind = ManualFlowPathGizmoDragKind::ViewPlane},
+                gizmoHandles,
                 hit.displayedPoint,
                 false);
         }
@@ -52785,10 +53080,12 @@ void InitializeAnimationLoopTimelineState(
             : std::nullopt;
     const auto alignmentSelection = state->alignmentSelection;
     const auto alignmentClipboard = state->alignmentClipboard;
+    const auto alignmentPasteOptions = state->alignmentPasteOptions;
     *state = {};
     state->scrubDragFilePath = scrubDragFilePath;
     state->alignmentSelection = alignmentSelection;
     state->alignmentClipboard = alignmentClipboard;
+    state->alignmentPasteOptions = alignmentPasteOptions;
     state->currentFilePath = currentFilePath;
     state->partnerFilePath = partnerFilePath;
     state->currentMotionFingerprint =
@@ -62991,53 +63288,31 @@ void DrawAnimationSection(
                     return reference.filePath.filename().string() +
                         " / key " + std::to_string(keyIndex + 1U);
                 };
-            ImGui::BeginDisabled(!selectedAlignmentKey.has_value());
-            if (ImGui::Button("Copy Camera Alignment")) {
-                const auto alignment = invisible_places::camera::
-                    CaptureAnimationCameraAlignment(
-                        *selectedAlignmentKey->first,
-                        selectedAlignmentKey->second);
-                if (alignment.has_value()) {
-                    panel.loopTimeline.alignmentClipboard =
-                        AnimationLoopAlignmentClipboard{
-                            .source = panel.loopTimeline
-                                          .alignmentSelection.value(),
-                            .alignment = alignment.value(),
-                        };
-                    runtimeState->statusMessage =
-                        "Copied camera alignment from " +
-                        describeAlignmentKey(
-                            panel.loopTimeline
-                                .alignmentSelection.value(),
-                            selectedAlignmentKey->second) +
-                        ".";
-                    runtimeState->errorMessage.clear();
-                } else {
-                    runtimeState->errorMessage =
-                        "That key's camera is too close to its focus to copy an alignment.";
-                    runtimeState->statusMessage.clear();
-                }
+            std::optional<AnimationAlignmentGroundSample>
+                selectedGroundSample;
+            std::optional<
+                invisible_places::camera::AnimationCameraAlignment>
+                selectedAlignmentDetails;
+            if (selectedAlignmentKey.has_value()) {
+                AnimationAlignmentGroundSample groundSample;
+                selectedAlignmentDetails = CaptureAnimationAlignmentAtKey(
+                    *runtimeState,
+                    *selectedAlignmentKey->first,
+                    selectedAlignmentKey->second,
+                    &groundSample);
+                selectedGroundSample = groundSample;
             }
-            ImGui::EndDisabled();
-            ImGui::SameLine();
-            ImGui::BeginDisabled(
-                !selectedAlignmentKey.has_value() ||
-                !panel.loopTimeline.alignmentClipboard.has_value() ||
-                renderSetupLocksAnimationSwitching ||
-                strongAlignmentInProgress);
-            if (ImGui::Button("Paste Camera Alignment")) {
-                PasteAnimationCameraAlignment(
-                    runtimeState,
-                    panel.loopTimeline.alignmentSelection.value(),
-                    panel.loopTimeline.alignmentClipboard->alignment);
-            }
-            ImGui::EndDisabled();
-            if (ImGui::IsItemHovered(
-                    ImGuiHoveredFlags_DelayNormal |
-                    ImGuiHoveredFlags_AllowWhenDisabled)) {
-                ImGui::SetTooltip(
-                    "Keeps the red-outlined destination focus fixed and copies the clipboard's world-Z orbit angle, elevation, and camera-to-focus distance. Existing free-orientation paths also receive the copied horizon/roll.");
-            }
+            const auto liveAlignmentDetails =
+                MeasureAnimationAlignmentAtPosition(
+                    *runtimeState,
+                    *loopCurrent,
+                    std::clamp(panel.scrubAmount, 0.0F, 1.0F));
+            const auto* copiedAlignmentDetails =
+                panel.loopTimeline.alignmentClipboard.has_value()
+                    ? &panel.loopTimeline
+                           .alignmentClipboard->alignment
+                    : nullptr;
+
             if (selectedAlignmentKey.has_value()) {
                 ImGui::TextColored(
                     ImVec4{0.95F, 0.30F, 0.34F, 1.0F},
@@ -63055,13 +63330,300 @@ void DrawAnimationSection(
                 const auto& clipboard =
                     panel.loopTimeline.alignmentClipboard.value();
                 ImGui::TextDisabled(
-                    "Copied: %s | azimuth %.1f deg, elevation %.1f deg, distance %.4f",
+                    "Copied snapshot: %s / %s (fixed until Copy is pressed again)",
                     clipboard.source.filePath.filename().string().c_str(),
-                    glm::degrees(
-                        clipboard.alignment.azimuthRadians),
-                    glm::degrees(
-                        clipboard.alignment.elevationRadians),
-                    clipboard.alignment.cameraToFocusDistance);
+                    clipboard.source.keyId.c_str());
+            } else {
+                ImGui::TextDisabled("Copied snapshot: --");
+            }
+
+            const auto alignmentValueText = [](
+                const invisible_places::camera::AnimationCameraAlignment*
+                    alignment,
+                int measurement) {
+                if (alignment == nullptr) {
+                    return std::string{"--"};
+                }
+                switch (measurement) {
+                    case 0:
+                        return FormatFixed(
+                                   alignment->cameraToFocusDistance,
+                                   3) +
+                            " m";
+                    case 1:
+                        return FormatFixed(
+                                   glm::degrees(
+                                       alignment->polarAngleRadians),
+                                   1) +
+                            " deg";
+                    case 2:
+                        return alignment->hasPathTangentAngle
+                            ? FormatFixed(
+                                  glm::degrees(
+                                      alignment
+                                          ->pathTangentAngleRadians),
+                                  1) +
+                                  " deg"
+                            : std::string{"--"};
+                    case 3:
+                        return alignment->hasGroundHeight
+                            ? FormatFixed(
+                                  alignment->cameraHeightAboveGround,
+                                  3) +
+                                  " m"
+                            : std::string{"--"};
+                    case 4:
+                        return alignment->hasGroundHeight
+                            ? FormatFixed(
+                                  alignment->focusHeightAboveGround,
+                                  3) +
+                                  " m"
+                            : std::string{"--"};
+                    case 5:
+                        return alignment->hasGroundHeight
+                            ? FormatFixed(alignment->groundHeight, 3) +
+                                  " m"
+                            : std::string{"--"};
+                    default:
+                        return std::string{"--"};
+                }
+            };
+            if (ImGui::BeginTable(
+                    "##camera-alignment-details",
+                    4,
+                    ImGuiTableFlags_BordersInnerV |
+                        ImGuiTableFlags_RowBg |
+                        ImGuiTableFlags_SizingStretchProp)) {
+                ImGui::TableSetupColumn(
+                    "Measurement",
+                    ImGuiTableColumnFlags_WidthStretch,
+                    1.4F);
+                ImGui::TableSetupColumn(
+                    "Live frame",
+                    ImGuiTableColumnFlags_WidthStretch,
+                    1.0F);
+                ImGui::TableSetupColumn(
+                    "Selected node",
+                    ImGuiTableColumnFlags_WidthStretch,
+                    1.0F);
+                ImGui::TableSetupColumn(
+                    "Copied snapshot",
+                    ImGuiTableColumnFlags_WidthStretch,
+                    1.0F);
+                ImGui::TableHeadersRow();
+                constexpr std::array<const char*, 6> measurementNames{
+                    "Distance to focus",
+                    "Polar angle to focus",
+                    "Angle from path tangent",
+                    "Camera height to ground",
+                    "Focus height to ground",
+                    "Ground sample Z",
+                };
+                for (std::size_t measurement = 0U;
+                     measurement < measurementNames.size();
+                     ++measurement) {
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::TextUnformatted(
+                        measurementNames[measurement]);
+                    const std::array<
+                        const invisible_places::camera::
+                            AnimationCameraAlignment*,
+                        3>
+                        alignments{
+                            liveAlignmentDetails.has_value()
+                                ? &liveAlignmentDetails.value()
+                                : nullptr,
+                            selectedAlignmentDetails.has_value()
+                                ? &selectedAlignmentDetails.value()
+                                : nullptr,
+                            copiedAlignmentDetails,
+                        };
+                    for (std::size_t column = 0U;
+                         column < alignments.size();
+                         ++column) {
+                        ImGui::TableSetColumnIndex(
+                            static_cast<int>(column + 1U));
+                        const auto text = alignmentValueText(
+                            alignments[column],
+                            static_cast<int>(measurement));
+                        ImGui::TextUnformatted(text.c_str());
+                    }
+                }
+                ImGui::EndTable();
+            }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+                ImGui::SetTooltip(
+                    "Live frame follows the active animation playhead. Ground starts one-third of the way from focus to camera and searches forward if needed. The 10 mm authored-SAND cache is authoritative; MESH is accepted only beneath a vegetation-supported cell. Polar is 0 degrees overhead and 90 degrees level.");
+            }
+            if (selectedGroundSample.has_value()) {
+                const std::string groundDescription =
+                    DescribeAnimationAlignmentGroundSample(
+                        runtimeState,
+                        selectedGroundSample.value());
+                if (!groundDescription.empty()) {
+                    const bool resolvedByFallback =
+                        selectedGroundSample->status ==
+                        AnimationAlignmentGroundSampleStatus::
+                            AvailableCloserToCamera;
+                    const bool available =
+                        selectedGroundSample->height.has_value();
+                    const bool usesVegetationMesh =
+                        selectedGroundSample->source ==
+                        invisible_places::water::WaterGroundHeightSource::
+                            VegetationSupportedMesh;
+                    ImGui::PushStyleColor(
+                        ImGuiCol_Text,
+                        !available
+                            ? ImVec4{0.95F, 0.42F, 0.30F, 1.0F}
+                        : resolvedByFallback || usesVegetationMesh
+                            ? ImVec4{0.95F, 0.72F, 0.24F, 1.0F}
+                            : ImVec4{0.48F, 0.82F, 0.58F, 1.0F});
+                    ImGui::TextWrapped(
+                        "Selected Ground: %s.",
+                        groundDescription.c_str());
+                    ImGui::PopStyleColor();
+                }
+            }
+            if (selectedAlignmentKey.has_value() &&
+                !selectedAlignmentDetails.has_value()) {
+                ImGui::TextColored(
+                    ImVec4{0.95F, 0.42F, 0.30F, 1.0F},
+                    "Selected Camera: camera and focus coincide, so alignment measurements are undefined.");
+            }
+
+            auto& pasteOptions =
+                panel.loopTimeline.alignmentPasteOptions;
+            ImGui::TextDisabled("Values to paste");
+            if (ImGui::BeginTable(
+                    "##camera-alignment-options",
+                    2,
+                    ImGuiTableFlags_SizingStretchSame)) {
+                const auto option = [](const char* label, bool* value) {
+                    ImGui::TableNextColumn();
+                    ImGui::Checkbox(label, value);
+                };
+                option(
+                    "Distance to focus",
+                    &pasteOptions.cameraToFocusDistance);
+                option(
+                    "Polar angle to focus",
+                    &pasteOptions.polarAngleToFocus);
+                option(
+                    "Camera height to ground",
+                    &pasteOptions.cameraHeightAboveGround);
+                option(
+                    "Focus height to ground",
+                    &pasteOptions.focusHeightAboveGround);
+                option(
+                    "Angle from path tangent",
+                    &pasteOptions.angleFromPathTangent);
+                option(
+                    "Horizon / roll",
+                    &pasteOptions.horizonAndRoll);
+                ImGui::EndTable();
+            }
+            ImGui::TextDisabled(
+                "Copy freezes every value; checkboxes mask Paste.");
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+                ImGui::SetTooltip(
+                    "Copy always freezes every displayed value. These checkboxes choose which frozen values Paste changes. Focus height translates the rig vertically; camera height then sets the camera clearance exactly.");
+            }
+
+            ImGui::BeginDisabled(!selectedAlignmentDetails.has_value());
+            if (ImGui::Button("Copy Camera Alignment")) {
+                if (selectedAlignmentDetails.has_value()) {
+                    panel.loopTimeline.alignmentClipboard =
+                        AnimationLoopAlignmentClipboard{
+                            .source = panel.loopTimeline
+                                          .alignmentSelection.value(),
+                            .alignment =
+                                selectedAlignmentDetails.value(),
+                        };
+                    runtimeState->statusMessage =
+                        "Copied an immutable camera-alignment snapshot from " +
+                        describeAlignmentKey(
+                            panel.loopTimeline
+                                .alignmentSelection.value(),
+                            selectedAlignmentKey->second) +
+                        ".";
+                    runtimeState->errorMessage.clear();
+                } else {
+                    runtimeState->errorMessage =
+                        "That key's camera is too close to its focus to copy an alignment.";
+                    runtimeState->statusMessage.clear();
+                }
+            }
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(
+                    ImGuiHoveredFlags_DelayNormal |
+                    ImGuiHoveredFlags_AllowWhenDisabled)) {
+                ImGui::SetTooltip(
+                    "Captures every displayed alignment value now. Editing the source node later does not change this copied snapshot.");
+            }
+            ImGui::SameLine();
+            const bool copiesGroundHeight =
+                pasteOptions.cameraHeightAboveGround ||
+                pasteOptions.focusHeightAboveGround;
+            const bool selectedPathStoresOrientation =
+                selectedAlignmentKey.has_value() &&
+                std::any_of(
+                    selectedAlignmentKey->first->keys.begin(),
+                    selectedAlignmentKey->first->keys.end(),
+                    [](const auto& key) {
+                        return key.hasOrientation;
+                    });
+            const bool selectsGeometry =
+                pasteOptions.cameraToFocusDistance ||
+                pasteOptions.polarAngleToFocus ||
+                copiesGroundHeight ||
+                pasteOptions.angleFromPathTangent;
+            const bool selectionCanAffectDestination =
+                selectsGeometry ||
+                (pasteOptions.horizonAndRoll &&
+                 selectedPathStoresOrientation);
+            const bool copiedValuesAvailable =
+                copiedAlignmentDetails != nullptr &&
+                (!pasteOptions.angleFromPathTangent ||
+                 copiedAlignmentDetails->hasPathTangentAngle) &&
+                (!copiesGroundHeight ||
+                 copiedAlignmentDetails->hasGroundHeight);
+            const bool destinationValuesAvailable =
+                selectedAlignmentDetails.has_value() &&
+                (!pasteOptions.angleFromPathTangent ||
+                 selectedAlignmentDetails->hasPathTangentAngle) &&
+                (!copiesGroundHeight ||
+                 selectedAlignmentDetails->hasGroundHeight);
+            const bool pasteDisabled =
+                !selectedAlignmentKey.has_value() ||
+                !panel.loopTimeline.alignmentClipboard.has_value() ||
+                !selectionCanAffectDestination ||
+                !copiedValuesAvailable ||
+                !destinationValuesAvailable ||
+                renderSetupLocksAnimationSwitching ||
+                strongAlignmentInProgress;
+            ImGui::BeginDisabled(
+                pasteDisabled);
+            if (ImGui::Button("Paste Camera Alignment")) {
+                PasteAnimationCameraAlignment(
+                    runtimeState,
+                    panel.loopTimeline.alignmentSelection.value(),
+                    panel.loopTimeline.alignmentClipboard->alignment,
+                    pasteOptions);
+            }
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(
+                    ImGuiHoveredFlags_DelayNormal |
+                    ImGuiHoveredFlags_AllowWhenDisabled)) {
+                const char* tooltip =
+                    !selectionCanAffectDestination
+                        ? "Select at least one value that the destination path can store."
+                    : !copiedValuesAvailable
+                        ? "The copied snapshot does not contain one of the selected ground/tangent measurements. Select its source again and Copy after authored SAND is cached."
+                    : !destinationValuesAvailable
+                        ? "The destination lacks one of the selected ground/tangent measurements. Ground requires cached authored SAND or vegetation-supported MESH; tangent angle requires horizontal animation travel."
+                        : "Applies only the checked values from the immutable copied snapshot. Angle from path tangent is transported into the destination's local direction of travel.";
+                ImGui::SetTooltip("%s", tooltip);
             }
             ImGui::BeginDisabled(!matchingAppliedPair);
             if (matchingAppliedPair) {

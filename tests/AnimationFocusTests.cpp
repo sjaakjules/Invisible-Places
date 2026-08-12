@@ -330,8 +330,13 @@ TEST_CASE("Camera alignment paste keeps the destination focus and copies spheric
         CaptureAnimationCameraAlignment(source, 0U);
     REQUIRE(alignment.has_value());
     CHECK(alignment->cameraToFocusDistance == Approx(13.0F));
-    CHECK(alignment->azimuthRadians ==
+    CHECK(alignment->worldAzimuthRadians ==
           Approx(std::atan2(4.0F, 3.0F)));
+    CHECK(alignment->polarAngleRadians ==
+          Approx(std::atan2(5.0F, 12.0F)));
+
+    // Clipboard records are values, not a live link back to the source key.
+    source.keys[0U].cameraPosition = {-20.0F, -30.0F, -40.0F};
 
     invisible_places::camera::AnimationPath destination;
     destination.keys = {
@@ -368,9 +373,9 @@ TEST_CASE("Camera alignment paste keeps target-driven paths target-driven",
          .focusPoint = {1.0F, 1.0F, 1.0F}},
     };
     const invisible_places::camera::AnimationCameraAlignment alignment{
-        .azimuthRadians = 0.0F,
-        .elevationRadians = 0.0F,
         .cameraToFocusDistance = 5.0F,
+        .polarAngleRadians = 1.57079632679F,
+        .worldAzimuthRadians = 0.0F,
         .orientation = {0.0F, 0.0F, 0.70710677F, 0.70710677F},
     };
     REQUIRE(invisible_places::camera::ApplyAnimationCameraAlignment(
@@ -382,8 +387,132 @@ TEST_CASE("Camera alignment paste keeps target-driven paths target-driven",
     CHECK_FALSE(path.keys[0U].hasOrientation);
 }
 
+TEST_CASE("Camera alignment normalizes orbit to path tangent and local ground",
+          "[camera][animation][key-editing][alignment-clipboard]") {
+    invisible_places::camera::AnimationPath source;
+    source.keys = {
+        {.id = "source-0",
+         .cameraPosition = {0.0F, -4.0F, 5.0F},
+         .focusPoint = {0.0F, 0.0F, 2.0F}},
+        {.id = "source-1",
+         .cameraPosition = {10.0F, -4.0F, 5.0F},
+         .focusPoint = {10.0F, 0.0F, 2.0F}},
+        {.id = "source-2",
+         .cameraPosition = {20.0F, -4.0F, 5.0F},
+         .focusPoint = {20.0F, 0.0F, 2.0F}},
+    };
+    const auto alignment = invisible_places::camera::
+        CaptureAnimationCameraAlignment(source, 1U, 1.0F);
+    REQUIRE(alignment.has_value());
+    REQUIRE(alignment->hasPathTangentAngle);
+    REQUIRE(alignment->hasGroundHeight);
+    CHECK(alignment->cameraToFocusDistance == Approx(5.0F));
+    CHECK(alignment->polarAngleRadians ==
+          Approx(std::atan2(4.0F, 3.0F)));
+    CHECK(alignment->pathTangentAngleRadians ==
+          Approx(1.57079632679F));
+    CHECK(alignment->cameraHeightAboveGround == Approx(4.0F));
+    CHECK(alignment->focusHeightAboveGround == Approx(1.0F));
+
+    invisible_places::camera::AnimationPath destination;
+    destination.keys = {
+        {.id = "destination-0",
+         .cameraPosition = {-4.0F, 0.0F, 4.0F},
+         .focusPoint = {0.0F, 0.0F, 1.0F}},
+        {.id = "destination-1",
+         .cameraPosition = {-4.0F, 10.0F, 4.0F},
+         .focusPoint = {0.0F, 10.0F, 1.0F}},
+        {.id = "destination-2",
+         .cameraPosition = {-4.0F, 20.0F, 4.0F},
+         .focusPoint = {0.0F, 20.0F, 1.0F}},
+    };
+    const invisible_places::camera::AnimationCameraAlignmentPasteOptions
+        options{
+            .cameraToFocusDistance = true,
+            .polarAngleToFocus = true,
+            .cameraHeightAboveGround = true,
+            .focusHeightAboveGround = true,
+            .angleFromPathTangent = true,
+            .horizonAndRoll = false,
+            .destinationGroundHeight = 10.0F,
+        };
+    REQUIRE(invisible_places::camera::ApplyAnimationCameraAlignment(
+        &destination,
+        1U,
+        alignment.value(),
+        options));
+
+    const auto& pasted = destination.keys[1U];
+    CHECK(pasted.focusPoint[0U] == Approx(0.0F));
+    CHECK(pasted.focusPoint[1U] == Approx(10.0F));
+    CHECK(pasted.focusPoint[2U] == Approx(11.0F));
+    CHECK(pasted.cameraPosition[0U] == Approx(4.0F));
+    CHECK(pasted.cameraPosition[1U] == Approx(10.0F));
+    CHECK(pasted.cameraPosition[2U] == Approx(14.0F));
+}
+
+TEST_CASE("Camera alignment paste changes only selected framing components",
+          "[camera][animation][key-editing][alignment-clipboard]") {
+    invisible_places::camera::AnimationPath destination;
+    destination.keys = {
+        {.id = "destination",
+         .cameraPosition = {3.0F, 4.0F, 12.0F},
+         .focusPoint = {0.0F, 0.0F, 0.0F}},
+    };
+    const auto before = invisible_places::camera::
+        CaptureAnimationCameraAlignment(destination, 0U);
+    REQUIRE(before.has_value());
+    const invisible_places::camera::AnimationCameraAlignment source{
+        .cameraToFocusDistance = 10.0F,
+        .polarAngleRadians = 0.25F,
+        .worldAzimuthRadians = -1.0F,
+    };
+    const invisible_places::camera::AnimationCameraAlignmentPasteOptions
+        options{
+            .cameraToFocusDistance = true,
+            .polarAngleToFocus = false,
+            .cameraHeightAboveGround = false,
+            .focusHeightAboveGround = false,
+            .angleFromPathTangent = false,
+            .horizonAndRoll = false,
+        };
+    REQUIRE(invisible_places::camera::ApplyAnimationCameraAlignment(
+        &destination,
+        0U,
+        source,
+        options));
+    const auto after = invisible_places::camera::
+        CaptureAnimationCameraAlignment(destination, 0U);
+    REQUIRE(after.has_value());
+    CHECK(after->cameraToFocusDistance == Approx(10.0F));
+    CHECK(after->polarAngleRadians ==
+          Approx(before->polarAngleRadians));
+    CHECK(after->worldAzimuthRadians ==
+          Approx(before->worldAzimuthRadians));
+    CHECK(destination.keys[0U].focusPoint ==
+          std::array<float, 3>{0.0F, 0.0F, 0.0F});
+}
+
+TEST_CASE("Shared camera rig handle sits one third of the way from focus to camera",
+          "[camera][animation][key-editing][focus-rig-gizmo]") {
+    const auto handle = invisible_places::camera::
+        ResolveAnimationCameraRigHandlePoint(
+            {4.0F, 8.0F, 12.0F},
+            {1.0F, 2.0F, 3.0F});
+    REQUIRE(handle.has_value());
+    CHECK(handle->at(0U) == Approx(2.0F));
+    CHECK(handle->at(1U) == Approx(4.0F));
+    CHECK(handle->at(2U) == Approx(6.0F));
+
+    CHECK_FALSE(invisible_places::camera::
+        ResolveAnimationCameraRigHandlePoint(
+            {1.0F, 2.0F, 3.0F},
+            {1.0F, 2.0F, 3.0F})
+            .has_value());
+}
+
 TEST_CASE("Focus rig translation moves camera and focus together without changing framing",
-          "[camera][animation][key-editing][focus-rig-plane]") {
+          "[camera][animation][key-editing][focus-rig-gizmo]") {
     invisible_places::camera::AnimationPath path;
     path.keys = {
         {.id = "rig-key",

@@ -10561,56 +10561,230 @@ std::array<float, 3> RotateAnimationCameraPositionAboutFocusZ(
     };
 }
 
-std::optional<AnimationCameraAlignment>
-CaptureAnimationCameraAlignment(
-    const AnimationPath& path,
-    std::size_t keyIndex) {
-    if (keyIndex >= path.keys.size()) {
+std::optional<std::array<float, 3>>
+ResolveAnimationCameraRigHandlePoint(
+    const std::array<float, 3>& cameraPosition,
+    const std::array<float, 3>& focusPoint,
+    float fractionFromFocus) {
+    if (!std::isfinite(fractionFromFocus) ||
+        fractionFromFocus <= 0.0F || fractionFromFocus >= 1.0F ||
+        !std::all_of(
+            cameraPosition.begin(),
+            cameraPosition.end(),
+            [](float value) { return std::isfinite(value); }) ||
+        !std::all_of(
+            focusPoint.begin(),
+            focusPoint.end(),
+            [](float value) { return std::isfinite(value); })) {
         return std::nullopt;
     }
-    const auto& key = path.keys[keyIndex];
-    const glm::vec3 camera = ToGlm(key.cameraPosition);
-    const glm::vec3 focus = ToGlm(key.focusPoint);
+
+    const glm::vec3 focus = ToGlm(focusPoint);
+    const glm::vec3 towardCamera = ToGlm(cameraPosition) - focus;
+    const float cameraDistance = glm::length(towardCamera);
+    if (!std::isfinite(cameraDistance) || cameraDistance <= 1.0e-6F) {
+        return std::nullopt;
+    }
+    const glm::vec3 handlePoint = focus + towardCamera * fractionFromFocus;
+    return std::array<float, 3>{
+        handlePoint.x,
+        handlePoint.y,
+        handlePoint.z,
+    };
+}
+
+std::optional<AnimationCameraAlignment>
+MeasureAnimationCameraAlignment(
+    const AnimationPath& path,
+    float normalizedPosition,
+    std::optional<float> groundHeight) {
+    if (!std::isfinite(normalizedPosition)) {
+        return std::nullopt;
+    }
+    const auto context = PrepareAnimationPathEvaluation(path);
+    if (!context.valid) {
+        return std::nullopt;
+    }
+    const float position = std::clamp(
+        normalizedPosition,
+        0.0F,
+        1.0F);
+    const auto evaluation = EvaluatePreparedAnimationPath(
+        context,
+        context.durationSeconds * position);
+    const glm::vec3 camera = ToGlm(evaluation.camera.position);
+    const glm::vec3 focus = ToGlm(evaluation.focusPoint);
     const glm::vec3 offset = camera - focus;
     const float distance = glm::length(offset);
     if (!std::isfinite(distance) || distance <= 1.0e-6F) {
         return std::nullopt;
     }
     const float horizontalDistance = std::hypot(offset.x, offset.y);
-    const float azimuth = std::atan2(offset.y, offset.x);
-    const float elevation = std::atan2(offset.z, horizontalDistance);
-    if (!std::isfinite(azimuth) || !std::isfinite(elevation)) {
+    const float polarAngle = std::atan2(horizontalDistance, offset.z);
+    const float worldAzimuth = horizontalDistance > 1.0e-6F
+        ? std::atan2(offset.y, offset.x)
+        : 0.0F;
+    if (!std::isfinite(polarAngle) || !std::isfinite(worldAzimuth)) {
         return std::nullopt;
     }
-    return AnimationCameraAlignment{
-        .azimuthRadians = azimuth,
-        .elevationRadians = elevation,
+
+    AnimationCameraAlignment result{
         .cameraToFocusDistance = distance,
-        .orientation = QuaternionToArray(OrientationFromKey(key)),
+        .polarAngleRadians = polarAngle,
+        .worldAzimuthRadians = worldAzimuth,
+        .orientation = evaluation.camera.orientation,
     };
+    const auto pathFrame = ResolveHorizontalAnimationPathFrame(
+        context,
+        position);
+    if (pathFrame.has_value() && horizontalDistance > 1.0e-6F) {
+        const glm::vec3 horizontalOffset{offset.x, offset.y, 0.0F};
+        result.hasPathTangentAngle = true;
+        result.pathTangentAngleRadians = std::atan2(
+            glm::dot(horizontalOffset, pathFrame->lateral),
+            glm::dot(horizontalOffset, pathFrame->forward));
+    }
+    if (groundHeight.has_value() &&
+        std::isfinite(groundHeight.value())) {
+        result.hasGroundHeight = true;
+        result.groundHeight = groundHeight.value();
+        result.cameraHeightAboveGround =
+            camera.z - groundHeight.value();
+        result.focusHeightAboveGround =
+            focus.z - groundHeight.value();
+    }
+    const bool finiteOrientation = std::all_of(
+        result.orientation.begin(),
+        result.orientation.end(),
+        [](float value) { return std::isfinite(value); });
+    if (!finiteOrientation ||
+        (result.hasPathTangentAngle &&
+         !std::isfinite(result.pathTangentAngleRadians)) ||
+        (result.hasGroundHeight &&
+         (!std::isfinite(result.cameraHeightAboveGround) ||
+          !std::isfinite(result.focusHeightAboveGround)))) {
+        return std::nullopt;
+    }
+    return result;
+}
+
+std::optional<AnimationCameraAlignment>
+CaptureAnimationCameraAlignment(
+    const AnimationPath& path,
+    std::size_t keyIndex,
+    std::optional<float> groundHeight) {
+    if (keyIndex >= path.keys.size()) {
+        return std::nullopt;
+    }
+    return MeasureAnimationCameraAlignment(
+        path,
+        AnimationPathKeyNormalizedPosition(path, keyIndex),
+        groundHeight);
 }
 
 bool ApplyAnimationCameraAlignment(
     AnimationPath* path,
     std::size_t keyIndex,
-    const AnimationCameraAlignment& alignment) {
-    const bool finiteOrientation = std::all_of(
-        alignment.orientation.begin(),
-        alignment.orientation.end(),
-        [](float value) { return std::isfinite(value); });
-    if (path == nullptr || keyIndex >= path->keys.size() ||
-        !std::isfinite(alignment.azimuthRadians) ||
-        !std::isfinite(alignment.elevationRadians) ||
-        !std::isfinite(alignment.cameraToFocusDistance) ||
-        alignment.cameraToFocusDistance <= 1.0e-6F ||
-        !finiteOrientation) {
+    const AnimationCameraAlignment& alignment,
+    const AnimationCameraAlignmentPasteOptions& options) {
+    if (path == nullptr || keyIndex >= path->keys.size()) {
+        return false;
+    }
+    const float normalizedPosition = AnimationPathKeyNormalizedPosition(
+        *path,
+        keyIndex);
+    const auto context = PrepareAnimationPathEvaluation(*path);
+    const auto destination = MeasureAnimationCameraAlignment(
+        *path,
+        normalizedPosition);
+    if (!context.valid || !destination.has_value()) {
         return false;
     }
 
-    const bool destinationStoresOrientation =
-        AnyKeyHasOrientation(*path);
+    const float distance = options.cameraToFocusDistance
+        ? alignment.cameraToFocusDistance
+        : destination->cameraToFocusDistance;
+    const float polarAngle = options.polarAngleToFocus
+        ? alignment.polarAngleRadians
+        : destination->polarAngleRadians;
+    if (!std::isfinite(distance) || distance <= 1.0e-6F ||
+        !std::isfinite(polarAngle) || polarAngle < 0.0F ||
+        polarAngle > glm::pi<float>()) {
+        return false;
+    }
+
+    const auto destinationFrame = ResolveHorizontalAnimationPathFrame(
+        context,
+        normalizedPosition);
+    glm::vec3 horizontalDirection{};
+    if (options.angleFromPathTangent &&
+        alignment.hasPathTangentAngle &&
+        destinationFrame.has_value()) {
+        if (!std::isfinite(alignment.pathTangentAngleRadians)) {
+            return false;
+        }
+        horizontalDirection =
+            std::cos(alignment.pathTangentAngleRadians) *
+                destinationFrame->forward +
+            std::sin(alignment.pathTangentAngleRadians) *
+                destinationFrame->lateral;
+    } else if (options.angleFromPathTangent) {
+        // A static/single-key path has no tangent. Retain the established
+        // world-azimuth behavior as a safe compatibility fallback; the UI
+        // exposes path-angle availability and does not label this fallback
+        // as a normalized tangent copy.
+        if (!std::isfinite(alignment.worldAzimuthRadians)) {
+            return false;
+        }
+        horizontalDirection = {
+            std::cos(alignment.worldAzimuthRadians),
+            std::sin(alignment.worldAzimuthRadians),
+            0.0F,
+        };
+    } else {
+        const auto& key = path->keys[keyIndex];
+        horizontalDirection = {
+            key.cameraPosition[0U] - key.focusPoint[0U],
+            key.cameraPosition[1U] - key.focusPoint[1U],
+            0.0F,
+        };
+        if (glm::dot(horizontalDirection, horizontalDirection) <=
+            1.0e-12F) {
+            horizontalDirection = destinationFrame.has_value()
+                ? destinationFrame->forward
+                : glm::vec3{1.0F, 0.0F, 0.0F};
+        }
+    }
+    if (!std::isfinite(horizontalDirection.x) ||
+        !std::isfinite(horizontalDirection.y) ||
+        glm::dot(horizontalDirection, horizontalDirection) <= 1.0e-12F) {
+        return false;
+    }
+    horizontalDirection.z = 0.0F;
+    horizontalDirection = glm::normalize(horizontalDirection);
+
+    const bool copiesGroundHeight =
+        options.cameraHeightAboveGround ||
+        options.focusHeightAboveGround;
+    if (copiesGroundHeight &&
+        (!alignment.hasGroundHeight ||
+         !options.destinationGroundHeight.has_value() ||
+         !std::isfinite(options.destinationGroundHeight.value()) ||
+         !std::isfinite(alignment.cameraHeightAboveGround) ||
+         !std::isfinite(alignment.focusHeightAboveGround))) {
+        return false;
+    }
+
+    const bool destinationStoresOrientation = AnyKeyHasOrientation(*path);
     std::optional<glm::quat> normalizedOrientation;
-    if (destinationStoresOrientation) {
+    if (options.horizonAndRoll && destinationStoresOrientation) {
+        const bool finiteOrientation = std::all_of(
+            alignment.orientation.begin(),
+            alignment.orientation.end(),
+            [](float value) { return std::isfinite(value); });
+        if (!finiteOrientation) {
+            return false;
+        }
         const glm::quat orientation = QuaternionFromArray(
             alignment.orientation);
         const float lengthSquared =
@@ -10623,23 +10797,41 @@ bool ApplyAnimationCameraAlignment(
         }
         normalizedOrientation = glm::normalize(orientation);
     }
-    BakeAnimationPathLocalizedCorrections(path);
-    auto& key = path->keys[keyIndex];
-    const float horizontalScale =
-        std::cos(alignment.elevationRadians);
-    const glm::vec3 direction{
-        horizontalScale * std::cos(alignment.azimuthRadians),
-        horizontalScale * std::sin(alignment.azimuthRadians),
-        std::sin(alignment.elevationRadians),
-    };
-    const glm::vec3 focus = ToGlm(key.focusPoint);
-    const glm::vec3 camera = focus +
-        direction * alignment.cameraToFocusDistance;
+
+    float horizontalScale = std::sin(polarAngle);
+    float verticalScale = std::cos(polarAngle);
+    if (std::abs(horizontalScale) <= 1.0e-7F) {
+        horizontalScale = 0.0F;
+    }
+    if (std::abs(verticalScale) <= 1.0e-7F) {
+        verticalScale = 0.0F;
+    }
+    glm::vec3 focus = ToGlm(path->keys[keyIndex].focusPoint);
+    glm::vec3 camera = focus +
+        horizontalDirection * (distance * horizontalScale) +
+        glm::vec3{0.0F, 0.0F, distance * verticalScale};
+    if (options.focusHeightAboveGround) {
+        const float targetFocusHeight =
+            options.destinationGroundHeight.value() +
+            alignment.focusHeightAboveGround;
+        const float verticalTranslation = targetFocusHeight - focus.z;
+        focus.z += verticalTranslation;
+        camera.z += verticalTranslation;
+    }
+    if (options.cameraHeightAboveGround) {
+        camera.z = options.destinationGroundHeight.value() +
+            alignment.cameraHeightAboveGround;
+    }
     if (!std::isfinite(camera.x) || !std::isfinite(camera.y) ||
-        !std::isfinite(camera.z)) {
+        !std::isfinite(camera.z) || !std::isfinite(focus.x) ||
+        !std::isfinite(focus.y) || !std::isfinite(focus.z)) {
         return false;
     }
+
+    BakeAnimationPathLocalizedCorrections(path);
+    auto& key = path->keys[keyIndex];
     key.cameraPosition = {camera.x, camera.y, camera.z};
+    key.focusPoint = {focus.x, focus.y, focus.z};
     if (normalizedOrientation.has_value()) {
         key.hasOrientation = true;
         key.orientation = QuaternionToArray(
