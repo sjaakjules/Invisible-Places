@@ -239,6 +239,13 @@ ordinary renderable per-frame path, while schema-16 source, padding, and
 start-key metadata permits a deterministic rebuild after either saved or
 `_Edited` source changes.
 
+The **Blend Partner** choice is saved with each `.ipanim.json` independently
+of reciprocal velocity-link metadata. Reloading an unlinked animation restores
+that preferred working partner, and flipping between A and B resolves the
+preference from the animation that is actually loaded instead of retaining a
+stale row assignment. A reciprocal link remains authoritative while present;
+unlinking preserves the former partner as the working preference.
+
 After choosing a Blend Partner and setting the timeline bounds, the timeline
 can designate one key with a matching frame inside the start/end overlap;
 velocity alignment does not need to be applied first. **Match Camera Rig To
@@ -249,6 +256,16 @@ selected animation's local path frame. This preserves focus distance and
 whether the view sits forward, perpendicular, or backward relative to travel
 without moving the partner. Keys outside the overlap have no counterpart and
 cannot run this alignment.
+
+The paired matching-frame timelines also provide a small camera-alignment
+clipboard. Right-clicking an ordinary key selects its stable animation/key ID
+and draws a red outline, so the selection stays attached to the same physical
+key when A and B are flipped. **Copy Camera Alignment** records its world-Z
+orbit azimuth, elevation, geometric camera-to-focus distance, and evaluated
+camera orientation. After right-clicking another key, **Paste Camera
+Alignment** rebuilds that framing around the destination's unchanged focus;
+target-driven paths remain target-driven, while paths that already author an
+orientation also receive the copied horizon/roll.
 
 **Fix A+B Lens** sits beside **Extend Both Seams…**. It writes paired edited
 paths with one median authored FOV, focus-distance policy/value, and aperture
@@ -339,6 +356,14 @@ ending path is always left and the starting path right; switching which file
 is loaded preserves the physical seam and its artistic pixel offset. Outside
 an overlap, live view returns to the ordinary current animation.
 
+An adjacent **Overlap** option replaces the hard boundary with complete-frame
+source-over composition while the playhead remains inside either saved overlap
+band. The bottom animation retains its full per-pixel alpha, and **Top opacity**
+multiplies rather than replaces the chosen top animation's authored alpha. A
+filename-based **Top animation** selector keeps the layer order stable when the
+loaded A/B role is switched. Turning Overlap off restores the feature-following
+split and its independent seam offsets.
+
 Camera duration grows on the same 30 fps timebase. Every normalized timing,
 water, and visual-effect key or finite activation boundary is shifted by the
 prepended frame count and rescaled to the new duration, so it remains attached
@@ -406,6 +431,26 @@ At the bottom of **Keys**, **Set Selected Key from Current Camera** replaces the
 selected camera pose with the live viewport pose. Its focus ray uses the first
 stable point-cloud surface hit; when no surface is hit, the key keeps its
 previous camera-to-focus distance along the new view direction.
+
+Selecting a focus control in the live viewport also shows a blue world-Z
+rotation handle: a quarter arc from +Y to +X on the focus point's XY plane.
+Dragging it orbits that key's camera position around the focus without changing
+the camera's Z offset or focus distance; authored free orientation turns with
+the camera. Three compact secondary plane handles translate the complete key
+rig while leaving the ordinary focus gizmo local to the focus control. The XY
+handle sits in the negative-X/negative-Y region, ZX is offset along negative Y,
+and ZY is offset along negative X to reduce overlap with the positive-axis
+controls. Hovering one expands it to the ordinary plane-handle size; dragging
+it moves camera and focus by the same world-plane delta, preserving their
+distance, view direction, authored orientation, and lens values. The same
+controls work on the transformed partner focus nodes shown by matching-frame
+editing. Double-clicking a focus control opens **Live Edit Mode** at that
+exact key frame with its evaluated pose, orientation, FOV, clip planes, focus,
+and aperture. Orbit, pan, dolly, and preset-view changes continuously preview
+back onto that key. A faded red live-view border and a top-right
+**Live Edit Mode** card expose tick/Enter to commit and cross/Escape to restore
+the exact pre-edit animation and view. Other authoring controls remain locked
+for the transaction.
 
 Each animation also stores a default live-view window size. Loading that
 animation resizes the live view to its authored dimensions. The Project panel

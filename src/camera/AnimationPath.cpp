@@ -10069,6 +10069,168 @@ bool ResetAnimationPathTimingWeights(AnimationPath* path) {
     return changed;
 }
 
+std::array<float, 3> RotateAnimationCameraPositionAboutFocusZ(
+    const std::array<float, 3>& cameraPosition,
+    const std::array<float, 3>& focusPoint,
+    float radians) {
+    if (!std::isfinite(radians) ||
+        !std::all_of(
+            cameraPosition.begin(),
+            cameraPosition.end(),
+            [](float value) { return std::isfinite(value); }) ||
+        !std::all_of(
+            focusPoint.begin(),
+            focusPoint.end(),
+            [](float value) { return std::isfinite(value); })) {
+        return cameraPosition;
+    }
+
+    const float cosine = std::cos(radians);
+    const float sine = std::sin(radians);
+    const float offsetX = cameraPosition[0U] - focusPoint[0U];
+    const float offsetY = cameraPosition[1U] - focusPoint[1U];
+    return {
+        focusPoint[0U] + cosine * offsetX - sine * offsetY,
+        focusPoint[1U] + sine * offsetX + cosine * offsetY,
+        cameraPosition[2U],
+    };
+}
+
+std::optional<AnimationCameraAlignment>
+CaptureAnimationCameraAlignment(
+    const AnimationPath& path,
+    std::size_t keyIndex) {
+    if (keyIndex >= path.keys.size()) {
+        return std::nullopt;
+    }
+    const auto& key = path.keys[keyIndex];
+    const glm::vec3 camera = ToGlm(key.cameraPosition);
+    const glm::vec3 focus = ToGlm(key.focusPoint);
+    const glm::vec3 offset = camera - focus;
+    const float distance = glm::length(offset);
+    if (!std::isfinite(distance) || distance <= 1.0e-6F) {
+        return std::nullopt;
+    }
+    const float horizontalDistance = std::hypot(offset.x, offset.y);
+    const float azimuth = std::atan2(offset.y, offset.x);
+    const float elevation = std::atan2(offset.z, horizontalDistance);
+    if (!std::isfinite(azimuth) || !std::isfinite(elevation)) {
+        return std::nullopt;
+    }
+    return AnimationCameraAlignment{
+        .azimuthRadians = azimuth,
+        .elevationRadians = elevation,
+        .cameraToFocusDistance = distance,
+        .orientation = QuaternionToArray(OrientationFromKey(key)),
+    };
+}
+
+bool ApplyAnimationCameraAlignment(
+    AnimationPath* path,
+    std::size_t keyIndex,
+    const AnimationCameraAlignment& alignment) {
+    const bool finiteOrientation = std::all_of(
+        alignment.orientation.begin(),
+        alignment.orientation.end(),
+        [](float value) { return std::isfinite(value); });
+    if (path == nullptr || keyIndex >= path->keys.size() ||
+        !std::isfinite(alignment.azimuthRadians) ||
+        !std::isfinite(alignment.elevationRadians) ||
+        !std::isfinite(alignment.cameraToFocusDistance) ||
+        alignment.cameraToFocusDistance <= 1.0e-6F ||
+        !finiteOrientation) {
+        return false;
+    }
+
+    const bool destinationStoresOrientation =
+        AnyKeyHasOrientation(*path);
+    std::optional<glm::quat> normalizedOrientation;
+    if (destinationStoresOrientation) {
+        const glm::quat orientation = QuaternionFromArray(
+            alignment.orientation);
+        const float lengthSquared =
+            orientation.x * orientation.x +
+            orientation.y * orientation.y +
+            orientation.z * orientation.z +
+            orientation.w * orientation.w;
+        if (!std::isfinite(lengthSquared) || lengthSquared <= 1.0e-8F) {
+            return false;
+        }
+        normalizedOrientation = glm::normalize(orientation);
+    }
+    BakeAnimationPathLocalizedCorrections(path);
+    auto& key = path->keys[keyIndex];
+    const float horizontalScale =
+        std::cos(alignment.elevationRadians);
+    const glm::vec3 direction{
+        horizontalScale * std::cos(alignment.azimuthRadians),
+        horizontalScale * std::sin(alignment.azimuthRadians),
+        std::sin(alignment.elevationRadians),
+    };
+    const glm::vec3 focus = ToGlm(key.focusPoint);
+    const glm::vec3 camera = focus +
+        direction * alignment.cameraToFocusDistance;
+    if (!std::isfinite(camera.x) || !std::isfinite(camera.y) ||
+        !std::isfinite(camera.z)) {
+        return false;
+    }
+    key.cameraPosition = {camera.x, camera.y, camera.z};
+    if (normalizedOrientation.has_value()) {
+        key.hasOrientation = true;
+        key.orientation = QuaternionToArray(
+            normalizedOrientation.value());
+    }
+    RebuildAnimationPathGeometryFromKeys(path);
+    return true;
+}
+
+void UpdateAnimationPathKeyFromCameraState(
+    AnimationPath* path,
+    std::size_t keyIndex,
+    const CameraState& camera,
+    const std::array<float, 3>& focusPoint,
+    float focusDistance) {
+    if (path == nullptr || keyIndex >= path->keys.size()) {
+        return;
+    }
+
+    const bool pathStoresOrientation = std::any_of(
+        path->keys.begin(),
+        path->keys.end(),
+        [](const auto& candidate) { return candidate.hasOrientation; });
+    const bool pathStoresFocusDistance = std::any_of(
+        path->keys.begin(),
+        path->keys.end(),
+        [](const auto& candidate) { return candidate.hasFocusDistance; });
+    const bool pathStoresAperture = std::any_of(
+        path->keys.begin(),
+        path->keys.end(),
+        [](const auto& candidate) {
+            return candidate.hasApertureFStops;
+        });
+
+    BakeAnimationPathLocalizedCorrections(path);
+    auto& key = path->keys[keyIndex];
+    key.cameraPosition = camera.position;
+    key.focusPoint = focusPoint;
+    key.fovDegrees = camera.fovDegrees;
+    key.nearPlane = camera.nearPlane;
+    key.farPlane = camera.farPlane;
+    if (pathStoresOrientation) {
+        key.hasOrientation = true;
+        key.orientation = camera.orientation;
+    }
+    if (pathStoresFocusDistance) {
+        key.hasFocusDistance = true;
+        key.focusDistance = focusDistance;
+    }
+    if (pathStoresAperture) {
+        key.hasApertureFStops = true;
+        key.apertureFStops = camera.apertureFStops;
+    }
+    RebuildAnimationPathGeometryFromKeys(path);
+}
+
 void MoveAnimationCameraKey(
     AnimationPath* path,
     std::size_t keyIndex,
@@ -10090,6 +10252,26 @@ void MoveAnimationFocusKey(
     }
     BakeAnimationPathLocalizedCorrections(path);
     path->keys[keyIndex].focusPoint = focusPoint;
+    RebuildAnimationPathGeometryFromKeys(path);
+}
+
+void TranslateAnimationCameraAndFocusKey(
+    AnimationPath* path,
+    std::size_t keyIndex,
+    const std::array<float, 3>& translation) {
+    if (path == nullptr || keyIndex >= path->keys.size() ||
+        !std::all_of(
+            translation.begin(),
+            translation.end(),
+            [](float value) { return std::isfinite(value); })) {
+        return;
+    }
+    BakeAnimationPathLocalizedCorrections(path);
+    auto& key = path->keys[keyIndex];
+    for (std::size_t component = 0U; component < 3U; ++component) {
+        key.cameraPosition[component] += translation[component];
+        key.focusPoint[component] += translation[component];
+    }
     RebuildAnimationPathGeometryFromKeys(path);
 }
 

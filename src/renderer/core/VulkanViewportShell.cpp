@@ -2547,9 +2547,9 @@ void VulkanViewportShell::SetTemporalCameraOverlay(
     float firstWeight,
     float secondWeight,
     const std::array<glm::mat4, 2U>* currentSourceViewProjections,
-    bool splitView,
+    TemporalCameraCompositionMode compositionMode,
     float splitCenterNormalized,
-    bool firstSourceOnLeft) {
+    bool firstSourcePrimary) {
     if (enabled &&
         (temporalCameraOverlayColorImages_[0U].image == VK_NULL_HANDLE ||
          temporalCameraOverlayDepthImages_[0U].image == VK_NULL_HANDLE)) {
@@ -2567,13 +2567,19 @@ void VulkanViewportShell::SetTemporalCameraOverlay(
     const bool sourceChanged =
         enabled &&
         temporalCameraOverlayRenderedSourceIndex_ != sourceIndex;
+    const bool primarySourceChanged =
+        enabled &&
+        temporalCameraOverlayFirstSourcePrimary_ != firstSourcePrimary;
     const bool layoutChanged =
         enabled &&
-        (temporalCameraOverlaySplitView_ != splitView ||
+        (temporalCameraOverlayCompositionMode_ != compositionMode ||
          std::abs(temporalCameraOverlaySplitCenterNormalized_ -
                   splitCenterNormalized) > 1.0e-5F ||
-         temporalCameraOverlayFirstSourceOnLeft_ != firstSourceOnLeft);
-    if (modeChanged) {
+         primarySourceChanged);
+    if (modeChanged || primarySourceChanged) {
+        // A current/partner role flip changes what history slots 0 and 1
+        // mean. Clearing both avoids displaying one or two stale frames with
+        // the newly selected left/top ordering.
         temporalCameraOverlayHistoryValid_ = {false, false};
     }
     temporalCameraOverlayEnabled_ = enabled;
@@ -2582,12 +2588,12 @@ void VulkanViewportShell::SetTemporalCameraOverlay(
         std::clamp(firstWeight, 0.0F, 1.0F);
     temporalCameraOverlayWeights_[1U] =
         std::clamp(secondWeight, 0.0F, 1.0F);
-    temporalCameraOverlaySplitView_ = splitView;
+    temporalCameraOverlayCompositionMode_ = compositionMode;
     temporalCameraOverlaySplitCenterNormalized_ = std::clamp(
         splitCenterNormalized,
         -2.0F,
         3.0F);
-    temporalCameraOverlayFirstSourceOnLeft_ = firstSourceOnLeft;
+    temporalCameraOverlayFirstSourcePrimary_ = firstSourcePrimary;
     temporalCameraOverlayCurrentViewProjectionsValid_ =
         enabled && currentSourceViewProjections != nullptr;
     if (temporalCameraOverlayCurrentViewProjectionsValid_) {
@@ -16876,25 +16882,30 @@ void VulkanViewportShell::RecordCommandBuffer(
             (temporalCameraOverlayHistoryValid_[1U] ? 2U : 0U);
         pushConstants.temporalOverlay = glm::vec4{
             temporalCameraOverlayEnabled_
-                ? (temporalCameraOverlaySplitView_ ? 2.0F : 1.0F)
+                ? static_cast<float>(static_cast<std::uint32_t>(
+                      temporalCameraOverlayCompositionMode_))
                 : 0.0F,
             temporalCameraOverlayWeights_[0U],
             temporalCameraOverlayWeights_[1U],
             static_cast<float>(temporalValidityMask),
         };
         if (temporalCameraOverlayEnabled_ &&
-            temporalCameraOverlaySplitView_) {
-            // Split mode samples each cached camera in its own image space.
-            // Reprojection is unused, so this vector carries the hard split.
+            temporalCameraOverlayCompositionMode_ !=
+                TemporalCameraCompositionMode::ReprojectedBlend) {
+            // Split and alpha-over modes sample both complete cached camera
+            // frames in their own image space. Reprojection is unused, so
+            // z carries the split location and w identifies source A as the
+            // left or top image, depending on the selected composition.
             pushConstants.temporalReprojection = glm::vec4{
                 0.0F,
                 0.0F,
                 temporalCameraOverlaySplitCenterNormalized_,
-                temporalCameraOverlayFirstSourceOnLeft_ ? 1.0F : 0.0F,
+                temporalCameraOverlayFirstSourcePrimary_ ? 1.0F : 0.0F,
             };
         }
         if (temporalCameraOverlayEnabled_ &&
-            !temporalCameraOverlaySplitView_ &&
+            temporalCameraOverlayCompositionMode_ ==
+                TemporalCameraCompositionMode::ReprojectedBlend &&
             temporalCameraOverlayCurrentViewProjectionsValid_) {
             const std::size_t staleSourceIndex =
                 1U - std::min<std::size_t>(

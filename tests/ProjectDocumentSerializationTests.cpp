@@ -3065,6 +3065,48 @@ TEST_CASE("Project preserves independent Flow and Mesh Flow edited trail shadows
         "Default_edited");
 }
 
+TEST_CASE("Animation preferred blend partner round-trips without a velocity link",
+          "[animation][serialization][blend-partner]") {
+  using invisible_places::camera::AnimationPath;
+  using invisible_places::serialization::AnimationPathFromJson;
+  using invisible_places::serialization::AnimationPathToJson;
+  using invisible_places::serialization::kAnimationDocumentSchemaVersion;
+
+  AnimationPath path;
+  path.name = "Manual A";
+  path.preferredBlendPartnerFileName = "Manual_B.ipanim.json";
+  path.keys = {
+      {.id = "first", .cameraPosition = {0.0F, 0.0F, 5.0F},
+       .focusPoint = {0.0F, 0.0F, 0.0F}},
+      {.id = "last", .cameraPosition = {2.0F, 0.0F, 5.0F},
+       .focusPoint = {2.0F, 0.0F, 0.0F}},
+  };
+
+  const auto json = AnimationPathToJson(path);
+  CHECK(json.at("schema_version") == kAnimationDocumentSchemaVersion);
+  CHECK(json.at("preferred_blend_partner_file_name") ==
+        "Manual_B.ipanim.json");
+  CHECK_FALSE(json.contains("velocity_blend_link"));
+
+  std::string error;
+  const auto loaded = AnimationPathFromJson(json, &error);
+  INFO(error);
+  REQUIRE(loaded.has_value());
+  CHECK(loaded->preferredBlendPartnerFileName ==
+        "Manual_B.ipanim.json");
+  CHECK_FALSE(loaded->velocityBlendLink.has_value());
+
+  auto schema22Json = json;
+  schema22Json["schema_version"] = 22U;
+  schema22Json.erase("preferred_blend_partner_file_name");
+  const auto schema22Loaded = AnimationPathFromJson(schema22Json, &error);
+  INFO(error);
+  REQUIRE(schema22Loaded.has_value());
+  CHECK(schema22Loaded->sourceSchemaVersion == 22U);
+  CHECK(schema22Loaded->preferredBlendPartnerFileName.empty());
+  CHECK_FALSE(schema22Loaded->velocityBlendLink.has_value());
+}
+
 TEST_CASE("Animation velocity blend metadata and localized corrections round-trip",
           "[animation][serialization][velocity-blend]") {
   using invisible_places::camera::AnimationLocalizedKeyCorrection;

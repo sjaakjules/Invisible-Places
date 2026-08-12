@@ -13,8 +13,9 @@ layout(set = 0, binding = 5) uniform sampler2D temporalDepthBInput;
 layout(push_constant) uniform PostProcessData {
     vec4 edl;
     vec4 preview;
-    // x: 0 off, 1 reprojected overlay, 2 feature-following split view;
-    // y/z: A/B weights; w: validity mask.
+    // x: 0 off, 1 reprojected blend, 2 feature-following split,
+    // 3 straight-alpha A-over-B/B-over-A; y/z: A/B weights or opacity;
+    // w: validity mask.
     vec4 temporalOverlay;
     // x: stale source (1=A, 2=B, 0=off); y/z: cached projection X/Y;
     // w: reference view depth for sparse/background reprojection.
@@ -98,6 +99,41 @@ vec4 FinishSceneColor(vec4 sceneColor, float shade) {
         color *= clamp(sceneColor.a, 0.0, 1.0);
     }
     return vec4(color * shade, sceneColor.a);
+}
+
+vec4 ShadeSceneColor(vec4 sceneColor, float shade) {
+    return vec4(sceneColor.rgb * shade, sceneColor.a);
+}
+
+vec4 ApplyAlphaPreview(vec4 sceneColor) {
+    if (postProcess.preview.x > 0.5) {
+        sceneColor.rgb *= clamp(sceneColor.a, 0.0, 1.0);
+    }
+    return sceneColor;
+}
+
+vec4 CompositeStraightAlphaOver(
+    vec4 top,
+    vec4 bottom,
+    float topOpacity,
+    float bottomOpacity) {
+    const float topAlpha = clamp(
+        top.a * clamp(topOpacity, 0.0, 1.0),
+        0.0,
+        1.0);
+    const float bottomAlpha = clamp(
+        bottom.a * clamp(bottomOpacity, 0.0, 1.0),
+        0.0,
+        1.0);
+    const float outputAlpha =
+        topAlpha + (bottomAlpha * (1.0 - topAlpha));
+    if (outputAlpha <= 1.0e-6) {
+        return vec4(0.0);
+    }
+    const vec3 premultiplied =
+        (top.rgb * topAlpha) +
+        (bottom.rgb * bottomAlpha * (1.0 - topAlpha));
+    return vec4(premultiplied / outputAlpha, outputAlpha);
 }
 
 ivec2 TemporalCoord(vec2 uv, ivec2 size) {
@@ -273,34 +309,56 @@ void main() {
 
     const int overlayMode = int(round(postProcess.temporalOverlay.x));
     const bool splitView = overlayMode == 2;
+    const bool alphaOverView = overlayMode == 3;
+    const bool imageSpaceView = splitView || alphaOverView;
     const vec2 targetUv =
         (vec2(coord) + vec2(0.5)) / vec2(size);
     vec4 first = vec4(0.0);
     vec4 second = vec4(0.0);
     if (firstValid) {
-        const vec2 firstUv = splitView
+        const vec2 firstUv = imageSpaceView
             ? targetUv
             : ReprojectTemporalUv(targetUv, size, 1);
         const ivec2 firstCoord = TemporalCoord(firstUv, size);
-        first = FinishSceneColor(
-            TemporalColorAt(firstUv, size, 1),
-            EyeDomeLightingShade(firstCoord, size, 1));
+        const vec4 firstScene = TemporalColorAt(firstUv, size, 1);
+        const float firstShade =
+            EyeDomeLightingShade(firstCoord, size, 1);
+        first = alphaOverView
+            ? ShadeSceneColor(firstScene, firstShade)
+            : FinishSceneColor(firstScene, firstShade);
     }
     if (secondValid) {
-        const vec2 secondUv = splitView
+        const vec2 secondUv = imageSpaceView
             ? targetUv
             : ReprojectTemporalUv(targetUv, size, 2);
         const ivec2 secondCoord = TemporalCoord(secondUv, size);
-        second = FinishSceneColor(
-            TemporalColorAt(secondUv, size, 2),
-            EyeDomeLightingShade(secondCoord, size, 2));
+        const vec4 secondScene = TemporalColorAt(secondUv, size, 2);
+        const float secondShade =
+            EyeDomeLightingShade(secondCoord, size, 2);
+        second = alphaOverView
+            ? ShadeSceneColor(secondScene, secondShade)
+            : FinishSceneColor(secondScene, secondShade);
     }
     if (!firstValid) {
-        outColor = second;
+        outColor = alphaOverView
+            ? ApplyAlphaPreview(
+                  CompositeStraightAlphaOver(
+                      second,
+                      vec4(0.0),
+                      postProcess.temporalOverlay.z,
+                      0.0))
+            : second;
         return;
     }
     if (!secondValid) {
-        outColor = first;
+        outColor = alphaOverView
+            ? ApplyAlphaPreview(
+                  CompositeStraightAlphaOver(
+                      first,
+                      vec4(0.0),
+                      postProcess.temporalOverlay.y,
+                      0.0))
+            : first;
         return;
     }
 
@@ -312,6 +370,24 @@ void main() {
         outColor = firstOnLeft
             ? (useLeft ? first : second)
             : (useLeft ? second : first);
+        return;
+    }
+
+    if (alphaOverView) {
+        const bool firstOnTop =
+            postProcess.temporalReprojection.w > 0.5;
+        outColor = ApplyAlphaPreview(
+            firstOnTop
+                ? CompositeStraightAlphaOver(
+                      first,
+                      second,
+                      postProcess.temporalOverlay.y,
+                      postProcess.temporalOverlay.z)
+                : CompositeStraightAlphaOver(
+                      second,
+                      first,
+                      postProcess.temporalOverlay.z,
+                      postProcess.temporalOverlay.y));
         return;
     }
 

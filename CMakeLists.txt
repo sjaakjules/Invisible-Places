@@ -324,6 +324,7 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
             tests/SeepageOfflineRendererTests.cpp
             tests/SeepageSerializationTests.cpp
             tests/SeepageWaterTests.cpp
+            tests/TemporalCameraCompositionTests.cpp
             tests/TimingColouriseHistogramTests.cpp
             tests/TimingColourisePresetTests.cpp
             tests/TimingColouriseTests.cpp

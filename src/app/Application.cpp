@@ -117,6 +117,7 @@
 
 #include <glm/mat4x4.hpp>
 #include <glm/geometric.hpp>
+#include <glm/gtc/quaternion.hpp>
 #include <glm/matrix.hpp>
 #include <glm/vec2.hpp>
 #include <glm/vec3.hpp>
@@ -517,18 +518,56 @@ struct ManualFlowPathGizmoDragState {
     bool axisUsesProjectedFallback = false;
 };
 
+struct AnimationFocusOrbitDragState {
+    glm::vec3 focusPoint{0.0F, 0.0F, 0.0F};
+    glm::vec3 startCameraPosition{0.0F, 0.0F, 0.0F};
+    std::array<float, 4> startOrientation{0.0F, 0.0F, 0.0F, 1.0F};
+    bool rotatesOrientation = false;
+    bool usesWorldXyPlane = true;
+    ImVec2 focusScreen{0.0F, 0.0F};
+    float previousPointerAngle = 0.0F;
+    float accumulatedAngle = 0.0F;
+};
+
 // Camera and focus keys share the standard viewport translation gizmo (axis
 // handles, plane quads, and centre view-plane drag) with the other movable
 // points; the gizmo maths lives in the shared ManualFlowPathGizmoDragState.
 struct AnimationViewportDragState {
     bool active = false;
     bool partnerPath = false;
+    // Secondary focus-plane handles translate the complete camera rig while
+    // the ordinary focus gizmo continues to move only the focus control.
+    bool movesCameraAndFocus = false;
     std::filesystem::path partnerFilePath;
     AnimationEditTarget target = AnimationEditTarget::Camera;
     std::size_t keyIndex = 0;
     invisible_places::camera::AnimationCameraFrameTransform
         partnerToCurrentFrame{};
     ManualFlowPathGizmoDragState gizmo{};
+    std::optional<AnimationFocusOrbitDragState> focusOrbitZ;
+};
+
+struct AnimationLiveCameraEditState {
+    bool active = false;
+    bool previewChanged = false;
+    bool viewportInputConsumedThisFrame = false;
+    std::size_t keyIndex = 0U;
+    std::string keyId;
+    std::string animationFilePath;
+    AnimationPath pathBeforeEdit{};
+    std::optional<std::size_t> registryIndex;
+    std::optional<AnimationPath> registryEditedPathBefore;
+    bool registryDirtyBefore = false;
+    bool currentPathUsesEditedBefore = false;
+    bool selectedFileUsesEditedBefore = false;
+    bool panelDirtyBefore = false;
+    float scrubAmountBefore = 0.0F;
+    invisible_places::camera::CameraState cameraBeforeEdit{};
+    invisible_places::camera::CameraState lastLiveCamera{};
+    bool parallelProjectionBefore = false;
+    bool pivotVisibleBefore = true;
+    invisible_places::io::Float3 pivotBefore{};
+    std::chrono::steady_clock::time_point pivotLastSetAtBefore{};
 };
 
 struct QueuedQuickMp4WaterSnapshot;
@@ -768,6 +807,16 @@ struct AnimationLoopDiagnostics {
     std::string message;
 };
 
+struct AnimationLoopAlignmentKeyReference {
+    std::filesystem::path filePath;
+    std::string keyId;
+};
+
+struct AnimationLoopAlignmentClipboard {
+    AnimationLoopAlignmentKeyReference source;
+    invisible_places::camera::AnimationCameraAlignment alignment{};
+};
+
 struct AnimationLoopTimelineState {
     std::filesystem::path currentFilePath;
     std::filesystem::path partnerFilePath;
@@ -787,6 +836,11 @@ struct AnimationLoopTimelineState {
     std::array<bool, 2> rowTrackValid{false, false};
     std::optional<std::filesystem::path> requestedScrubFilePath;
     float requestedScrubPosition = 0.0F;
+    // Right-click alignment selection is keyed by file and key ID rather
+    // than A/B row. Swapping which member is loaded therefore moves the red
+    // outline to the other row without silently changing its target.
+    std::optional<AnimationLoopAlignmentKeyReference> alignmentSelection;
+    std::optional<AnimationLoopAlignmentClipboard> alignmentClipboard;
     // The animation whose empty timeline space owned the initial mouse-down.
     // It keeps the gesture until release even when the pointer crosses keys
     // or overlap bounds, or loading that animation swaps the displayed rows.
@@ -892,6 +946,12 @@ struct AnimationLinkedSeamedViewState {
     // is active only inside either saved reciprocal overlap, so ordinary
     // single-animation inspection remains unchanged through the bulk.
     bool enabled = true;
+    // The ordinary seam is a hard split. Overlap instead layers both complete
+    // frames with straight-alpha source-over composition. Filename order,
+    // rather than the currently loaded A/B role, keeps the top layer stable.
+    bool overlapEnabled = false;
+    bool orderedFirstSourceOnTop = true;
+    float overlapTopOpacity = 0.5F;
     std::string pairId;
     // Stable lexical file order gives both loaded members the same two seam
     // slots. Seam 0 is first-start/second-end; seam 1 is
@@ -1233,6 +1293,7 @@ struct AnimationPanelState {
     AnimationMotionStatsCacheState motionStatsCache{};
     AnimationPerceivedFlowCacheState perceivedFlowCache{};
     AnimationViewportDragState drag{};
+    AnimationLiveCameraEditState liveCameraEdit{};
     AnimationFramePreviewState framePreview{};
 };
 
@@ -1913,6 +1974,17 @@ bool UnapplyAnimationVelocityDraft(
     PreviewRuntimeState* runtimeState,
     std::size_t partnerFileIndex);
 void ApplyAnimationScrub(PreviewRuntimeState* runtimeState);
+bool BeginAnimationLiveCameraEdit(
+    PreviewRuntimeState* runtimeState,
+    std::size_t keyIndex);
+void FinishAnimationLiveCameraEdit(
+    PreviewRuntimeState* runtimeState,
+    bool commit,
+    bool restoreCameraOnCancel = true);
+void UpdateAnimationLiveCameraEdit(PreviewRuntimeState* runtimeState);
+void DrawAnimationLiveCameraEditOverlay(
+    PreviewRuntimeState* runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport);
 std::string NormalizeMotionScalarFieldName(std::string_view name);
 bool SessionHasWaterEffectCompositionFields(const PreviewLayerSession& session);
 bool ApplyWaterEffectCompositionFieldsToSession(
@@ -28496,7 +28568,10 @@ bool MoveLinkedAnimationKeyPoint(
     AnimationPath* path,
     std::size_t keyIndex,
     AnimationEditTarget target,
-    glm::vec3 point) {
+    glm::vec3 point,
+    std::optional<std::array<float, 4>> cameraOrientation =
+        std::nullopt,
+    bool moveCameraWithFocus = false) {
     if (runtimeState == nullptr || path == nullptr || keyIndex >= path->keys.size()) {
         return false;
     }
@@ -28526,6 +28601,19 @@ bool MoveLinkedAnimationKeyPoint(
 
     if (target == AnimationEditTarget::Camera) {
         invisible_places::camera::MoveAnimationCameraKey(path, keyIndex, {point.x, point.y, point.z});
+        if (cameraOrientation.has_value() && key.hasOrientation) {
+            key.orientation = cameraOrientation.value();
+        }
+    } else if (moveCameraWithFocus) {
+        const std::array<float, 3> translation{
+            point.x - key.focusPoint[0U],
+            point.y - key.focusPoint[1U],
+            point.z - key.focusPoint[2U],
+        };
+        invisible_places::camera::TranslateAnimationCameraAndFocusKey(
+            path,
+            keyIndex,
+            translation);
     } else {
         invisible_places::camera::MoveAnimationFocusKey(path, keyIndex, {point.x, point.y, point.z});
     }
@@ -28542,6 +28630,112 @@ bool MoveLinkedAnimationKeyPoint(
     CopyAnimationKeyToCameraShot(key, &shot);
     shot.name = key.linkedCameraName.empty() ? shot.name : key.linkedCameraName;
     PropagateCameraShotToLinkedAnimationKeys(runtimeState, shot);
+    return true;
+}
+
+bool PasteAnimationCameraAlignment(
+    PreviewRuntimeState* runtimeState,
+    const AnimationLoopAlignmentKeyReference& destination,
+    const invisible_places::camera::AnimationCameraAlignment& alignment) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+    auto& panel = runtimeState->animationPanel;
+    const auto registryIndex = FindAnimationRegistryIndex(
+        panel,
+        destination.filePath);
+    if (!registryIndex.has_value()) {
+        runtimeState->errorMessage =
+            "The selected alignment animation is no longer registered.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    auto* path = MutableRegistryAnimationPath(
+        runtimeState,
+        registryIndex.value());
+    if (path == nullptr) {
+        runtimeState->errorMessage =
+            "The selected alignment animation could not be edited.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    const auto keyIt = std::find_if(
+        path->keys.begin(),
+        path->keys.end(),
+        [&](const auto& key) { return key.id == destination.keyId; });
+    if (keyIt == path->keys.end()) {
+        runtimeState->errorMessage =
+            "The selected alignment key no longer exists.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    const std::size_t keyIndex = static_cast<std::size_t>(
+        std::distance(path->keys.begin(), keyIt));
+    const std::string linkedCameraId = keyIt->linkedCameraId;
+    if (!linkedCameraId.empty() &&
+        !CanEditLinkedCamera(
+            runtimeState,
+            linkedCameraId,
+            "Alignment paste blocked.")) {
+        return false;
+    }
+    if (!invisible_places::camera::ApplyAnimationCameraAlignment(
+            path,
+            keyIndex,
+            alignment)) {
+        runtimeState->errorMessage =
+            "The copied camera alignment is invalid and was not pasted.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    const auto& updatedKey = path->keys[keyIndex];
+    if (!linkedCameraId.empty()) {
+        const auto shotIndex = FindCameraShotIndexById(
+            *runtimeState,
+            linkedCameraId);
+        if (shotIndex.has_value() &&
+            shotIndex.value() < runtimeState->cameraShots.size()) {
+            auto& shot = runtimeState->cameraShots[shotIndex.value()];
+            CopyAnimationKeyToCameraShot(updatedKey, &shot);
+            shot.name = updatedKey.linkedCameraName.empty()
+                ? shot.name
+                : updatedKey.linkedCameraName;
+            PropagateCameraShotToLinkedAnimationKeys(runtimeState, shot);
+        }
+    }
+    MarkRegistryAnimationDirty(runtimeState, registryIndex.value());
+    if (path->velocityBlendLink.has_value()) {
+        panel.projectVelocityLinksDirty = true;
+    }
+    if (panel.velocityAlignmentDraft.has_value() &&
+        (PathsLexicallyEqual(
+             destination.filePath,
+             panel.velocityAlignmentDraft->firstFilePath) ||
+         PathsLexicallyEqual(
+             destination.filePath,
+             panel.velocityAlignmentDraft->secondFilePath))) {
+        panel.velocityAlignmentDraft.reset();
+    }
+    panel.pendingVelocityLinkSettingsUpdate.reset();
+    panel.requestedLowerFrameAlignment.reset();
+    panel.requestedCameraRigAlignment.reset();
+    panel.loopTimeline.previewDirty = true;
+    panel.loopTimeline.preview.reset();
+    panel.loopSmoothingDiagnostics.reset();
+    panel.strongAlignmentDiagnostics.reset();
+    panel.preparedPathCache = {};
+    panel.motionStatsCache = {};
+    panel.perceivedFlowCache = {};
+    runtimeState->animationPlayback.active = false;
+    runtimeState->cameraPlayback.active = false;
+    runtimeState->previewRenderStateSignatureValid = false;
+    ApplyAnimationScrub(runtimeState);
+    runtimeState->statusMessage =
+        "Pasted focus-relative camera alignment into " +
+        destination.filePath.filename().string() + " / " +
+        destination.keyId + ".";
+    runtimeState->errorMessage.clear();
     return true;
 }
 
@@ -28991,6 +29185,20 @@ bool LoadAnimationPathVariant(
     }
     panel.currentFilePath = inputPath.string();
     panel.draftAnimationName = panel.currentPath->name;
+    panel.loopSmoothingPartnerPath.clear();
+    const std::string preferredPartnerFileName =
+        panel.currentPath->velocityBlendLink.has_value()
+            ? panel.currentPath->velocityBlendLink->partnerFileName
+            : panel.currentPath->preferredBlendPartnerFileName;
+    if (const auto preferredPartnerIndex =
+            FindAnimationRegistryIndexByFileName(
+                panel,
+                preferredPartnerFileName);
+        preferredPartnerIndex.has_value() &&
+        preferredPartnerIndex.value() != index) {
+        panel.loopSmoothingPartnerPath =
+            panel.availableFiles[preferredPartnerIndex.value()];
+    }
     ApplyActiveExportPresetToRenderSettings(runtimeState);
     panel.selectedKeyIndex =
         panel.currentPath->keys.empty()
@@ -29427,6 +29635,7 @@ void ApplyAnimationScrub(PreviewRuntimeState* runtimeState) {
 void StartAnimationPlayback(PreviewRuntimeState* runtimeState) {
     if (runtimeState == nullptr ||
         runtimeState->animationPanel.reciprocalPanWizard.Active() ||
+        runtimeState->animationPanel.liveCameraEdit.active ||
         !runtimeState->animationPanel.currentPath.has_value()) {
         return;
     }
@@ -29543,6 +29752,7 @@ void UpdateAnimationPlayback(PreviewRuntimeState* runtimeState) {
 void HandleAnimationPlaybackShortcut(PreviewRuntimeState* runtimeState) {
     if (runtimeState == nullptr ||
         runtimeState->animationPanel.reciprocalPanWizard.Active() ||
+        runtimeState->animationPanel.liveCameraEdit.active ||
         !runtimeState->animationPanel.currentPath.has_value()) {
         return;
     }
@@ -41834,6 +42044,232 @@ ViewportGizmoHandles BuildAndDrawViewportGizmo(
     return handles;
 }
 
+// A focus key gets a second set of plane controls for translating the whole
+// camera rig. These are deliberately drawn as detached badges in the
+// negative-axis regions requested by the author: XY at -X/-Y, ZX at -Y, and
+// ZY at -X. The badge itself may be parallel-offset from its movement plane;
+// dragging still resolves on the corresponding world plane through the focus.
+struct AnimationFocusRigPlaneHandles {
+    struct PlaneHandle {
+        glm::vec3 normal{};
+        const char* label = "";
+        ImVec2 screenCenter{};
+        std::array<ImVec2, 4> compactQuad{};
+        std::array<ImVec2, 4> expandedQuad{};
+        ImU32 compactColour = 0U;
+        ImU32 expandedColour = 0U;
+    };
+    std::vector<PlaneHandle> planes;
+    std::optional<std::size_t> hotPlaneIndex;
+};
+
+AnimationFocusRigPlaneHandles BuildAndDrawAnimationFocusRigPlaneHandles(
+    ImDrawList* drawList,
+    const invisible_places::camera::OrbitCameraMatrices& matrices,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    const glm::vec3& focusPoint,
+    std::optional<ImVec2> mousePosition,
+    std::optional<glm::vec3> activePlaneNormal = std::nullopt) {
+    AnimationFocusRigPlaneHandles handles;
+    if (drawList == nullptr ||
+        !ProjectWorldPoint(matrices, viewport, focusPoint).has_value()) {
+        return handles;
+    }
+
+    const float cameraDistance = glm::length(focusPoint - matrices.position);
+    const float axisLength = std::max(0.05F, cameraDistance * 0.12F);
+    constexpr float kCompactHalfExtent = 0.050F;
+    // 0.19 of the standard axis length matches the existing plane-control
+    // side length (0.43 - 0.24) once a secondary badge is hovered.
+    constexpr float kExpandedHalfExtent = 0.095F;
+    struct PlaneDefinition {
+        glm::vec3 first{};
+        glm::vec3 second{};
+        glm::vec3 normal{};
+        glm::vec3 centerOffset{};
+        const char* label = "";
+        ImU32 compactColour = 0U;
+        ImU32 expandedColour = 0U;
+    };
+    const glm::vec3 worldX{1.0F, 0.0F, 0.0F};
+    const glm::vec3 worldY{0.0F, 1.0F, 0.0F};
+    const glm::vec3 worldZ{0.0F, 0.0F, 1.0F};
+    const std::array<PlaneDefinition, 3> definitions{
+        PlaneDefinition{
+            worldX,
+            worldY,
+            worldZ,
+            -0.50F * worldX - 0.50F * worldY,
+            "XY",
+            IM_COL32(245, 214, 70, 120),
+            IM_COL32(255, 226, 88, 225),
+        },
+        PlaneDefinition{
+            worldX,
+            worldZ,
+            worldY,
+            -0.62F * worldY,
+            "ZX",
+            IM_COL32(232, 80, 205, 120),
+            IM_COL32(245, 103, 218, 225),
+        },
+        PlaneDefinition{
+            worldY,
+            worldZ,
+            worldX,
+            -0.62F * worldX,
+            "ZY",
+            IM_COL32(71, 220, 210, 120),
+            IM_COL32(91, 235, 225, 225),
+        },
+    };
+    const auto projectQuad = [&](const glm::vec3& center,
+                                 const glm::vec3& first,
+                                 const glm::vec3& second,
+                                 float halfExtent)
+        -> std::optional<std::array<ImVec2, 4>> {
+        const float extent = axisLength * halfExtent;
+        const std::array<glm::vec3, 4> corners{
+            center - first * extent - second * extent,
+            center + first * extent - second * extent,
+            center + first * extent + second * extent,
+            center - first * extent + second * extent,
+        };
+        std::array<ImVec2, 4> quad{};
+        for (std::size_t index = 0U; index < corners.size(); ++index) {
+            const auto projected = ProjectWorldPoint(
+                matrices,
+                viewport,
+                corners[index]);
+            if (!projected.has_value()) {
+                return std::nullopt;
+            }
+            quad[index] = projected->screen;
+        }
+        return quad;
+    };
+
+    handles.planes.reserve(definitions.size());
+    for (const auto& definition : definitions) {
+        const glm::vec3 center =
+            focusPoint + definition.centerOffset * axisLength;
+        const auto projectedCenter = ProjectWorldPoint(
+            matrices,
+            viewport,
+            center);
+        const auto compactQuad = projectQuad(
+            center,
+            definition.first,
+            definition.second,
+            kCompactHalfExtent);
+        const auto expandedQuad = projectQuad(
+            center,
+            definition.first,
+            definition.second,
+            kExpandedHalfExtent);
+        if (!projectedCenter.has_value() || !compactQuad.has_value() ||
+            !expandedQuad.has_value()) {
+            continue;
+        }
+        handles.planes.push_back({
+            .normal = definition.normal,
+            .label = definition.label,
+            .screenCenter = projectedCenter->screen,
+            .compactQuad = compactQuad.value(),
+            .expandedQuad = expandedQuad.value(),
+            .compactColour = definition.compactColour,
+            .expandedColour = definition.expandedColour,
+        });
+    }
+
+    std::optional<std::size_t> activeIndex;
+    if (activePlaneNormal.has_value() &&
+        glm::length(activePlaneNormal.value()) > 1.0e-5F) {
+        const glm::vec3 activeNormal = glm::normalize(
+            activePlaneNormal.value());
+        for (std::size_t index = 0U;
+             index < handles.planes.size();
+             ++index) {
+            if (std::abs(glm::dot(
+                    glm::normalize(handles.planes[index].normal),
+                    activeNormal)) > 0.999F) {
+                activeIndex = index;
+                break;
+            }
+        }
+    }
+    if (activeIndex.has_value()) {
+        handles.hotPlaneIndex = activeIndex;
+    } else if (mousePosition.has_value()) {
+        float closestCenterDistance = std::numeric_limits<float>::max();
+        for (std::size_t index = 0U;
+             index < handles.planes.size();
+             ++index) {
+            const auto& plane = handles.planes[index];
+            if (!ManualFlowPathPointInQuad(
+                    mousePosition.value(),
+                    plane.expandedQuad)) {
+                continue;
+            }
+            const float distance = ScreenDistance(
+                mousePosition.value(),
+                plane.screenCenter);
+            if (distance < closestCenterDistance) {
+                closestCenterDistance = distance;
+                handles.hotPlaneIndex = index;
+            }
+        }
+    }
+
+    // Draw the expanded/hot badge last so it remains legible if a steep view
+    // projection brings two detached handles close together on screen.
+    for (int pass = 0; pass < 2; ++pass) {
+        for (std::size_t index = 0U;
+             index < handles.planes.size();
+             ++index) {
+            const bool emphasized =
+                handles.hotPlaneIndex.has_value() &&
+                handles.hotPlaneIndex.value() == index;
+            if (emphasized != (pass == 1)) {
+                continue;
+            }
+            const auto& plane = handles.planes[index];
+            const auto& quad = emphasized
+                ? plane.expandedQuad
+                : plane.compactQuad;
+            drawList->AddConvexPolyFilled(
+                quad.data(),
+                4,
+                emphasized
+                    ? plane.expandedColour
+                    : plane.compactColour);
+            drawList->AddPolyline(
+                quad.data(),
+                4,
+                IM_COL32(10, 8, 15, emphasized ? 225 : 185),
+                ImDrawFlags_Closed,
+                emphasized ? 5.0F : 3.5F);
+            drawList->AddPolyline(
+                quad.data(),
+                4,
+                IM_COL32(255, 91, 214, emphasized ? 255 : 210),
+                ImDrawFlags_Closed,
+                emphasized ? 2.5F : 1.4F);
+            drawList->AddCircleFilled(
+                plane.screenCenter,
+                emphasized ? 3.0F : 1.8F,
+                IM_COL32(255, 218, 248, emphasized ? 255 : 220),
+                16);
+        }
+    }
+    return handles;
+}
+
+std::optional<std::size_t> HitTestAnimationFocusRigPlaneHandles(
+    const AnimationFocusRigPlaneHandles& handles) {
+    return handles.hotPlaneIndex;
+}
+
 struct ViewportGizmoHit {
     ManualFlowPathGizmoDragKind kind = ManualFlowPathGizmoDragKind::None;
     std::size_t axisIndex = 0U;
@@ -41981,6 +42417,248 @@ std::optional<glm::vec3> UpdateViewportGizmoDrag(
         return std::nullopt;
     }
     return nextPoint;
+}
+
+struct AnimationFocusOrbitHandle {
+    std::vector<ImVec2> screenPoints;
+    std::optional<ImVec2> focusScreen;
+};
+
+AnimationFocusOrbitHandle BuildAndDrawAnimationFocusOrbitHandle(
+    ImDrawList* drawList,
+    const invisible_places::camera::OrbitCameraMatrices& matrices,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    const glm::vec3& focusPoint) {
+    AnimationFocusOrbitHandle handle;
+    const auto projectedFocus = ProjectWorldPoint(
+        matrices,
+        viewport,
+        focusPoint);
+    if (drawList == nullptr || !projectedFocus.has_value()) {
+        return handle;
+    }
+    handle.focusScreen = projectedFocus->screen;
+
+    const float cameraDistance = glm::length(focusPoint - matrices.position);
+    const float worldRadius = std::max(0.06F, cameraDistance * 0.17F);
+    constexpr std::size_t kSegmentCount = 28U;
+    handle.screenPoints.reserve(kSegmentCount + 1U);
+    for (std::size_t segment = 0U; segment <= kSegmentCount; ++segment) {
+        const float amount =
+            static_cast<float>(segment) /
+            static_cast<float>(kSegmentCount);
+        // The authored handle is the world-XY quarter arc from +Y to +X,
+        // viewed along the positive Z rotation axis.
+        const float angle = 0.5F * kPi * (1.0F - amount);
+        const glm::vec3 worldPoint = focusPoint + glm::vec3{
+            std::cos(angle) * worldRadius,
+            std::sin(angle) * worldRadius,
+            0.0F,
+        };
+        const auto projected = ProjectWorldPoint(
+            matrices,
+            viewport,
+            worldPoint);
+        if (!projected.has_value()) {
+            handle.screenPoints.clear();
+            return handle;
+        }
+        handle.screenPoints.push_back(projected->screen);
+    }
+
+    const ImU32 outline = IM_COL32(8, 12, 20, 205);
+    const ImU32 zColour = IM_COL32(65, 151, 255, 255);
+    drawList->AddPolyline(
+        handle.screenPoints.data(),
+        static_cast<int>(handle.screenPoints.size()),
+        outline,
+        ImDrawFlags_None,
+        7.0F);
+    drawList->AddPolyline(
+        handle.screenPoints.data(),
+        static_cast<int>(handle.screenPoints.size()),
+        zColour,
+        ImDrawFlags_None,
+        3.4F);
+
+    if (handle.screenPoints.size() >= 2U) {
+        const ImVec2 tip = handle.screenPoints.back();
+        const ImVec2 previous =
+            handle.screenPoints[handle.screenPoints.size() - 2U];
+        const ImVec2 direction{tip.x - previous.x, tip.y - previous.y};
+        const float length = std::max(
+            1.0F,
+            std::hypot(direction.x, direction.y));
+        const ImVec2 unit{direction.x / length, direction.y / length};
+        const ImVec2 normal{-unit.y, unit.x};
+        const ImVec2 base{
+            tip.x - unit.x * 10.0F,
+            tip.y - unit.y * 10.0F,
+        };
+        drawList->AddTriangleFilled(
+            tip,
+            ImVec2{base.x + normal.x * 5.5F, base.y + normal.y * 5.5F},
+            ImVec2{base.x - normal.x * 5.5F, base.y - normal.y * 5.5F},
+            zColour);
+        const ImVec2 label = handle.screenPoints[kSegmentCount / 2U];
+        drawList->AddText(
+            ImVec2{label.x + 7.0F, label.y - 17.0F},
+            zColour,
+            "Z");
+    }
+    return handle;
+}
+
+bool HitTestAnimationFocusOrbitHandle(
+    const AnimationFocusOrbitHandle& handle,
+    ImVec2 mousePosition) {
+    for (std::size_t index = 1U;
+         index < handle.screenPoints.size();
+         ++index) {
+        if (DistanceToScreenSegment(
+                mousePosition,
+                handle.screenPoints[index - 1U],
+                handle.screenPoints[index]) <= 9.0F) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::optional<float> AnimationFocusOrbitPointerAngle(
+    const invisible_places::camera::OrbitCameraMatrices& matrices,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    ImVec2 mousePosition,
+    const glm::vec3& focusPoint,
+    ImVec2 focusScreen,
+    bool useWorldXyPlane) {
+    if (useWorldXyPlane) {
+        const auto ray = MakeScreenRay(matrices, viewport, mousePosition);
+        if (!ray.has_value()) {
+            return std::nullopt;
+        }
+        const auto intersection = IntersectManualFlowPathDragPlane(
+            ray.value(),
+            focusPoint,
+            glm::vec3{0.0F, 0.0F, 1.0F});
+        if (!intersection.has_value()) {
+            return std::nullopt;
+        }
+        const glm::vec2 offset{
+            intersection->x - focusPoint.x,
+            intersection->y - focusPoint.y,
+        };
+        if (glm::dot(offset, offset) <= 1.0e-10F) {
+            return std::nullopt;
+        }
+        return std::atan2(offset.y, offset.x);
+    }
+
+    const ImVec2 offset{
+        mousePosition.x - focusScreen.x,
+        focusScreen.y - mousePosition.y,
+    };
+    if (offset.x * offset.x + offset.y * offset.y <= 1.0e-4F) {
+        return std::nullopt;
+    }
+    return std::atan2(offset.y, offset.x);
+}
+
+std::optional<AnimationFocusOrbitDragState>
+BeginAnimationFocusOrbitDrag(
+    const AnimationFocusOrbitHandle& handle,
+    const invisible_places::camera::OrbitCameraMatrices& matrices,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    ImVec2 mousePosition,
+    const invisible_places::camera::AnimationPathKey& key) {
+    if (!handle.focusScreen.has_value()) {
+        return std::nullopt;
+    }
+    const glm::vec3 focusPoint{
+        key.focusPoint[0U],
+        key.focusPoint[1U],
+        key.focusPoint[2U],
+    };
+    const glm::vec3 cameraPosition{
+        key.cameraPosition[0U],
+        key.cameraPosition[1U],
+        key.cameraPosition[2U],
+    };
+    const glm::vec2 xyOffset{
+        cameraPosition.x - focusPoint.x,
+        cameraPosition.y - focusPoint.y,
+    };
+    if (glm::dot(xyOffset, xyOffset) <= 1.0e-10F) {
+        return std::nullopt;
+    }
+
+    bool useWorldXyPlane = true;
+    auto angle = AnimationFocusOrbitPointerAngle(
+        matrices,
+        viewport,
+        mousePosition,
+        focusPoint,
+        handle.focusScreen.value(),
+        true);
+    if (!angle.has_value()) {
+        useWorldXyPlane = false;
+        angle = AnimationFocusOrbitPointerAngle(
+            matrices,
+            viewport,
+            mousePosition,
+            focusPoint,
+            handle.focusScreen.value(),
+            false);
+    }
+    if (!angle.has_value()) {
+        return std::nullopt;
+    }
+    return AnimationFocusOrbitDragState{
+        .focusPoint = focusPoint,
+        .startCameraPosition = cameraPosition,
+        .startOrientation = key.orientation,
+        .rotatesOrientation = key.hasOrientation,
+        .usesWorldXyPlane = useWorldXyPlane,
+        .focusScreen = handle.focusScreen.value(),
+        .previousPointerAngle = angle.value(),
+    };
+}
+
+std::optional<glm::vec3> UpdateAnimationFocusOrbitDrag(
+    AnimationFocusOrbitDragState* drag,
+    const invisible_places::camera::OrbitCameraMatrices& matrices,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    ImVec2 mousePosition) {
+    if (drag == nullptr) {
+        return std::nullopt;
+    }
+    const auto angle = AnimationFocusOrbitPointerAngle(
+        matrices,
+        viewport,
+        mousePosition,
+        drag->focusPoint,
+        drag->focusScreen,
+        drag->usesWorldXyPlane);
+    if (!angle.has_value()) {
+        return std::nullopt;
+    }
+    float delta = angle.value() - drag->previousPointerAngle;
+    while (delta > kPi) {
+        delta -= 2.0F * kPi;
+    }
+    while (delta < -kPi) {
+        delta += 2.0F * kPi;
+    }
+    drag->accumulatedAngle += delta;
+    drag->previousPointerAngle = angle.value();
+    const auto rotated = invisible_places::camera::
+        RotateAnimationCameraPositionAboutFocusZ(
+            {drag->startCameraPosition.x,
+             drag->startCameraPosition.y,
+             drag->startCameraPosition.z},
+            {drag->focusPoint.x, drag->focusPoint.y, drag->focusPoint.z},
+            drag->accumulatedAngle);
+    return glm::vec3{rotated[0U], rotated[1U], rotated[2U]};
 }
 
 struct ManualFlowPathCurveHit {
@@ -46604,13 +47282,19 @@ void DrawAnimationViewportOverlay(
     const auto& io = ImGui::GetIO();
     if (panel.drag.active) {
         if (!io.MouseDown[0]) {
-            panel.drag.active = false;
+            panel.drag = {};
         } else {
-            const auto nextPoint = UpdateViewportGizmoDrag(
-                panel.drag.gizmo,
-                matrices,
-                viewport,
-                io.MousePos);
+            const auto nextPoint = panel.drag.focusOrbitZ.has_value()
+                ? UpdateAnimationFocusOrbitDrag(
+                      &panel.drag.focusOrbitZ.value(),
+                      matrices,
+                      viewport,
+                      io.MousePos)
+                : UpdateViewportGizmoDrag(
+                      panel.drag.gizmo,
+                      matrices,
+                      viewport,
+                      io.MousePos);
             bool moved = false;
             if (nextPoint.has_value() && panel.drag.partnerPath) {
                 const auto partnerIndex = FindAnimationRegistryIndex(
@@ -46639,7 +47323,9 @@ void DrawAnimationViewportOverlay(
                             sourcePointArray[0U],
                             sourcePointArray[1U],
                             sourcePointArray[2U],
-                        });
+                        },
+                        std::nullopt,
+                        panel.drag.movesCameraAndFocus);
                 if (moved) {
                     MarkRegistryAnimationDirty(
                         runtimeState,
@@ -46659,33 +47345,72 @@ void DrawAnimationViewportOverlay(
                     runtimeState->animationPlayback.active = false;
                     runtimeState->cameraPlayback.active = false;
                     runtimeState->statusMessage =
-                        panel.drag.target == AnimationEditTarget::Camera
+                        panel.drag.movesCameraAndFocus
+                            ? "Moved B's camera and focus together in A-space; matching points are refreshing."
+                        : panel.drag.target == AnimationEditTarget::Camera
                             ? "Moved B's camera key in A-space; matching points are refreshing."
                             : "Moved B's focus key in A-space; matching points are refreshing.";
                     runtimeState->errorMessage.clear();
                 }
             } else if (nextPoint.has_value()) {
+                std::optional<std::array<float, 4>> rotatedOrientation;
+                if (panel.drag.focusOrbitZ.has_value() &&
+                    panel.drag.keyIndex < path.keys.size()) {
+                    const auto& orbit = panel.drag.focusOrbitZ.value();
+                    if (orbit.rotatesOrientation) {
+                        const glm::quat startOrientation{
+                            orbit.startOrientation[3U],
+                            orbit.startOrientation[0U],
+                            orbit.startOrientation[1U],
+                            orbit.startOrientation[2U],
+                        };
+                        const glm::quat rotatedQuaternion = glm::normalize(
+                            glm::angleAxis(
+                                orbit.accumulatedAngle,
+                                glm::vec3{0.0F, 0.0F, 1.0F}) *
+                            startOrientation);
+                        rotatedOrientation = std::array<float, 4>{
+                            rotatedQuaternion.x,
+                            rotatedQuaternion.y,
+                            rotatedQuaternion.z,
+                            rotatedQuaternion.w,
+                        };
+                    }
+                }
                 moved = MoveLinkedAnimationKeyPoint(
                     runtimeState,
                     &path,
                     panel.drag.keyIndex,
                     panel.drag.target,
-                    nextPoint.value());
+                    nextPoint.value(),
+                    rotatedOrientation,
+                    panel.drag.movesCameraAndFocus);
                 if (moved) {
                     panel.selectedKeyIndex = panel.drag.keyIndex;
-                    panel.editTarget = panel.drag.target;
+                    panel.editTarget = panel.drag.focusOrbitZ.has_value()
+                        ? AnimationEditTarget::Focus
+                        : panel.drag.target;
                     panel.viewportPartnerSelectionActive = false;
                     panel.dirty = true;
+                    if (panel.drag.movesCameraAndFocus) {
+                        runtimeState->statusMessage =
+                            "Moved the camera and focus key together on a world plane.";
+                        runtimeState->errorMessage.clear();
+                    } else if (panel.drag.focusOrbitZ.has_value()) {
+                        runtimeState->statusMessage =
+                            "Rotated the camera key around its focus on the world XY plane.";
+                        runtimeState->errorMessage.clear();
+                    }
                 }
             }
             if (!moved) {
-                panel.drag.active = false;
+                panel.drag = {};
             }
         }
     }
 
     const bool canInteractWithRenderViewport =
-        !readOnlySavedComparison &&
+        !readOnlySavedComparison && !panel.liveCameraEdit.active &&
         (panel.drag.active ||
          (!viewport.UiWantsMouseCapture() &&
           IsMouseOverRenderViewport(viewport)));
@@ -46839,6 +47564,18 @@ void DrawAnimationViewportOverlay(
             panel.editTarget = hit.target;
         }
     };
+    const bool focusNodeDoubleClicked =
+        canInteractWithRenderViewport && !panel.drag.active &&
+        ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
+        bestHit.has_value() && !bestHit->partner &&
+        bestHit->target == AnimationEditTarget::Focus;
+    if (focusNodeDoubleClicked) {
+        selectHit(bestHit.value());
+        BeginAnimationLiveCameraEdit(
+            runtimeState,
+            bestHit->keyIndex);
+        return;
+    }
     if (!partnerSelectionValid && !currentSelectionValid) {
         if (canInteractWithRenderViewport &&
             !panel.drag.active &&
@@ -46868,30 +47605,76 @@ void DrawAnimationViewportOverlay(
               selectedKeyIndex,
               selectedTarget);
     const auto gizmoHandles = BuildAndDrawViewportGizmo(drawList, matrices, viewport, selectedPoint);
+    const auto focusOrbitHandle =
+        !selectedIsPartner &&
+                selectedTarget == AnimationEditTarget::Focus &&
+                !panel.liveCameraEdit.active
+            ? BuildAndDrawAnimationFocusOrbitHandle(
+                  drawList,
+                  matrices,
+                  viewport,
+                  selectedPoint)
+            : AnimationFocusOrbitHandle{};
+    const std::optional<glm::vec3> activeRigPlaneNormal =
+        panel.drag.active && panel.drag.movesCameraAndFocus
+            ? std::optional<glm::vec3>{panel.drag.gizmo.planeNormal}
+            : std::nullopt;
+    const std::optional<ImVec2> rigHandleMousePosition =
+        canInteractWithRenderViewport && !panel.drag.active
+            ? std::optional<ImVec2>{io.MousePos}
+            : std::nullopt;
+    const auto focusRigPlaneHandles =
+        selectedTarget == AnimationEditTarget::Focus &&
+                !panel.liveCameraEdit.active
+            ? BuildAndDrawAnimationFocusRigPlaneHandles(
+                  drawList,
+                  matrices,
+                  viewport,
+                  selectedPoint,
+                  rigHandleMousePosition,
+                  activeRigPlaneNormal)
+            : AnimationFocusRigPlaneHandles{};
 
     if (!canInteractWithRenderViewport || panel.drag.active) {
         return;
     }
 
+    const auto focusRigPlaneHit =
+        HitTestAnimationFocusRigPlaneHandles(focusRigPlaneHandles);
     const auto gizmoHit = HitTestViewportGizmo(gizmoHandles, io.MousePos);
-    if (gizmoHit.has_value() || bestHit.has_value()) {
+    const bool focusOrbitHit = HitTestAnimationFocusOrbitHandle(
+        focusOrbitHandle,
+        io.MousePos);
+    if (focusRigPlaneHit.has_value() || focusOrbitHit ||
+        gizmoHit.has_value() || bestHit.has_value()) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    }
+    if (focusRigPlaneHit.has_value()) {
+        ImGui::SetTooltip(
+            "Drag to move this key's camera and focus together on the world %s plane.",
+            focusRigPlaneHandles
+                .planes[focusRigPlaneHit.value()]
+                .label);
     }
     if (!ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         return;
     }
 
     const auto beginDrag = [&](const ViewportGizmoHit& hit,
-                               const glm::vec3& point) {
+                               const glm::vec3& point,
+                               bool movesCameraAndFocus) {
         if (auto drag = BeginViewportGizmoDrag(hit, gizmoHandles, matrices, viewport, io.MousePos, point);
             drag.has_value()) {
             panel.drag = {
                 .active = true,
                 .partnerPath = selectedIsPartner,
+                .movesCameraAndFocus = movesCameraAndFocus,
                 .partnerFilePath = selectedIsPartner
                     ? partnerOverlay->filePath
                     : std::filesystem::path{},
-                .target = selectedTarget,
+                .target = movesCameraAndFocus
+                    ? AnimationEditTarget::Focus
+                    : selectedTarget,
                 .keyIndex = selectedKeyIndex,
                 .partnerToCurrentFrame = selectedIsPartner
                     ? partnerOverlay->transform
@@ -46902,11 +47685,55 @@ void DrawAnimationViewportOverlay(
         }
     };
 
-    // Gizmo handles claim the click first; otherwise a key click selects it,
-    // and clicking the already-selected key again starts a camera-plane drag
-    // (the same standard as the manual Flow path nodes).
+    // Detached whole-rig handles claim the click before local focus controls;
+    // otherwise a key click selects it, and clicking the already-selected key
+    // again starts a camera-plane drag (the manual Flow-node standard).
+    if (focusRigPlaneHit.has_value() &&
+        selectedTarget == AnimationEditTarget::Focus) {
+        const auto& plane = focusRigPlaneHandles
+            .planes[focusRigPlaneHit.value()];
+        beginDrag(
+            ViewportGizmoHit{
+                .kind = ManualFlowPathGizmoDragKind::Plane,
+                .planeNormal = plane.normal,
+            },
+            selectedPoint,
+            true);
+        return;
+    }
+    if (focusOrbitHit && !selectedIsPartner &&
+        selectedTarget == AnimationEditTarget::Focus) {
+        const auto& selectedKey = path.keys[selectedKeyIndex];
+        if (!selectedKey.linkedCameraId.empty() &&
+            !CanEditLinkedCamera(
+                runtimeState,
+                selectedKey.linkedCameraId,
+                "Focus-orbit key edit blocked.")) {
+            return;
+        }
+        const auto orbitDrag = BeginAnimationFocusOrbitDrag(
+            focusOrbitHandle,
+            matrices,
+            viewport,
+            io.MousePos,
+            selectedKey);
+        if (orbitDrag.has_value()) {
+            panel.drag = {
+                .active = true,
+                .partnerPath = false,
+                .target = AnimationEditTarget::Camera,
+                .keyIndex = selectedKeyIndex,
+                .focusOrbitZ = orbitDrag.value(),
+            };
+        } else {
+            runtimeState->errorMessage =
+                "This camera is directly above the focus in XY, so a Z-axis orbit has no radius.";
+            runtimeState->statusMessage.clear();
+        }
+        return;
+    }
     if (gizmoHit.has_value()) {
-        beginDrag(gizmoHit.value(), selectedPoint);
+        beginDrag(gizmoHit.value(), selectedPoint, false);
         return;
     }
     if (bestHit.has_value()) {
@@ -46918,7 +47745,8 @@ void DrawAnimationViewportOverlay(
         if (alreadySelected) {
             beginDrag(
                 ViewportGizmoHit{.kind = ManualFlowPathGizmoDragKind::ViewPlane},
-                hit.displayedPoint);
+                hit.displayedPoint,
+                false);
         }
     }
 }
@@ -49383,6 +50211,10 @@ bool ApplyAnimationLoopSmoothing(
         requestedOptions.secondStartOverlapSeconds,
         requestedOptions.secondEndOverlapSeconds,
         requestedOptions.secondMovableKeyIds);
+    candidateCurrent.preferredBlendPartnerFileName =
+        panel.availableFiles[partnerFileIndex].filename().string();
+    candidatePartner.preferredBlendPartnerFileName =
+        panel.availableFiles[currentFileIndex.value()].filename().string();
 
     std::unordered_set<std::string> replacedPairIds;
     std::unordered_set<std::string> replacedDependencyIds;
@@ -49424,6 +50256,8 @@ bool ApplyAnimationLoopSmoothing(
             continue;
         }
         auto unlinked = *registered;
+        unlinked.preferredBlendPartnerFileName =
+            unlinked.velocityBlendLink->partnerFileName;
         unlinked.velocityBlendLink.reset();
         panel.availableFileEditedPaths[fileIndex] = std::move(unlinked);
         panel.availableFileDirtyFlags[fileIndex] = true;
@@ -49549,6 +50383,10 @@ bool UnlinkAnimationVelocityPair(
     }
     const auto pairId = first->velocityBlendLink->pairId;
     std::array<AnimationPath, 2> unlinked{*first, *second};
+    unlinked[0U].preferredBlendPartnerFileName =
+        first->velocityBlendLink->partnerFileName;
+    unlinked[1U].preferredBlendPartnerFileName =
+        second->velocityBlendLink->partnerFileName;
     unlinked[0U].velocityBlendLink.reset();
     unlinked[1U].velocityBlendLink.reset();
     const std::array<std::size_t, 2> indices{firstIndex, secondIndex};
@@ -49639,6 +50477,8 @@ bool ApplyPendingAnimationVelocityLinkSettings(
             link.panRight != update.panRight;
         link.partnerFileName =
             update.filePaths[1U - member].filename().string();
+        edited[member].preferredBlendPartnerFileName =
+            link.partnerFileName;
         link.startOverlapSeconds = update.startOverlapSeconds[member];
         link.endOverlapSeconds = update.endOverlapSeconds[member];
         link.maxEndMoveFraction = update.maxEndMoveFraction;
@@ -51383,8 +52223,12 @@ void InitializeAnimationLoopTimelineState(
         ImGui::IsMouseDown(ImGuiMouseButton_Left)
             ? state->scrubDragFilePath
             : std::nullopt;
+    const auto alignmentSelection = state->alignmentSelection;
+    const auto alignmentClipboard = state->alignmentClipboard;
     *state = {};
     state->scrubDragFilePath = scrubDragFilePath;
+    state->alignmentSelection = alignmentSelection;
+    state->alignmentClipboard = alignmentClipboard;
     state->currentFilePath = currentFilePath;
     state->partnerFilePath = partnerFilePath;
     state->currentMotionFingerprint =
@@ -51792,7 +52636,8 @@ bool DrawAnimationLoopTimelineRow(
     ImGui::InvisibleButton(
         "##loop-key-timeline",
         ImVec2{width, kRowHeight},
-        ImGuiButtonFlags_MouseButtonLeft);
+        ImGuiButtonFlags_MouseButtonLeft |
+            ImGuiButtonFlags_MouseButtonRight);
     const ImVec2 rowMin = ImGui::GetItemRectMin();
     const ImVec2 rowMax = ImGui::GetItemRectMax();
     const float x0 = rowMin.x + 7.0F;
@@ -51888,6 +52733,10 @@ bool DrawAnimationLoopTimelineRow(
 
     std::optional<std::size_t> hoveredKeyIndex;
     float hoveredKeyDistance = 9.0F;
+    const bool alignmentClipboardAvailable =
+        timelineState != nullptr && lockedKeyIds == nullptr &&
+        generatedKeyIds == nullptr && constrainedKeyIds == nullptr &&
+        disabledKeyIds == nullptr;
     for (std::size_t keyIndex = 0U;
          keyIndex < path.keys.size();
          ++keyIndex) {
@@ -51921,6 +52770,13 @@ bool DrawAnimationLoopTimelineRow(
         const bool strongDestination = timelineState != nullptr &&
             timelineState->strongDestinationRow == rowIndex &&
             timelineState->strongDestinationKeyId ==
+                path.keys[keyIndex].id;
+        const bool alignmentSelected = alignmentClipboardAvailable &&
+            timelineState->alignmentSelection.has_value() &&
+            PathsLexicallyEqual(
+                timelineState->alignmentSelection->filePath,
+                filePath) &&
+            timelineState->alignmentSelection->keyId ==
                 path.keys[keyIndex].id;
         const ImU32 color = disabled
                                 ? IM_COL32(105, 105, 105, 180)
@@ -51958,6 +52814,14 @@ bool DrawAnimationLoopTimelineRow(
                 IM_COL32(255, 220, 145, 210),
                 0,
                 1.0F);
+        }
+        if (alignmentSelected) {
+            drawList->AddCircle(
+                ImVec2{keyX, trackY},
+                9.0F,
+                IM_COL32(245, 62, 72, 255),
+                24,
+                2.5F);
         }
         const float distance = std::hypot(
             mouse.x - keyX,
@@ -52012,7 +52876,7 @@ bool DrawAnimationLoopTimelineRow(
             lockedKeyIds != nullptr || generatedKeyIds != nullptr ||
             constrainedKeyIds != nullptr;
         ImGui::SetTooltip(
-            "Key %zu%s%s\n%s\nCamera %.4f, focus %.4f%s",
+            "Key %zu%s%s\n%s\nCamera %.4f, focus %.4f%s%s",
             keyIndex + 1U,
             generated ? "  generated" : "  authored",
             key.sourceShotName.empty()
@@ -52041,7 +52905,19 @@ bool DrawAnimationLoopTimelineRow(
                 ? (smoothingSelection
                        ? "\nClick toggles transition smoothing for this key."
                        : "\nClick toggles velocity movement; double-click selects matching-frame alignment when the key is inside the overlap.")
+                : "",
+            keysAreInteractive && alignmentClipboardAvailable
+                ? "\nRight-click selects this node for alignment copy/paste."
                 : "");
+        if (keysAreInteractive && alignmentClipboardAvailable &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+            timelineState->alignmentSelection =
+                AnimationLoopAlignmentKeyReference{
+                    .filePath = filePath,
+                    .keyId = key.id,
+                };
+            timelineState->scrubDragFilePath.reset();
+        }
         if (keysAreInteractive && eligible &&
             ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
             movableKeyIds != nullptr) {
@@ -52357,26 +53233,12 @@ bool SetAnimationKeyFromLiveCamera(
         return false;
     }
 
-    const bool pathStoresOrientation = std::any_of(
-        path->keys.begin(),
-        path->keys.end(),
-        [](const auto& candidate) { return candidate.hasOrientation; });
-    const bool pathStoresFocusDistance = std::any_of(
-        path->keys.begin(),
-        path->keys.end(),
-        [](const auto& candidate) { return candidate.hasFocusDistance; });
-    invisible_places::camera::BakeAnimationPathLocalizedCorrections(path);
-    key.cameraPosition = camera.position;
-    key.focusPoint = focus.point;
-    if (pathStoresOrientation) {
-        key.hasOrientation = true;
-        key.orientation = camera.orientation;
-    }
-    if (pathStoresFocusDistance) {
-        key.hasFocusDistance = true;
-        key.focusDistance = focus.distance;
-    }
-    invisible_places::camera::RebuildAnimationPathGeometryFromKeys(path);
+    invisible_places::camera::UpdateAnimationPathKeyFromCameraState(
+        path,
+        keyIndex,
+        camera,
+        focus.point,
+        focus.distance);
 
     if (key.linkedCameraId.empty()) {
         return true;
@@ -52475,6 +53337,466 @@ bool FinalizeAnimationKeyStructureEdit(
     runtimeState->cameraPlayback.active = false;
     ApplyAnimationScrub(runtimeState);
     return confirmedAlignmentDraft;
+}
+
+bool AnimationLiveCameraStatesEquivalent(
+    const invisible_places::camera::CameraState& left,
+    const invisible_places::camera::CameraState& right) {
+    const auto arrayNear = [](const auto& first,
+                              const auto& second,
+                              float tolerance) {
+        for (std::size_t index = 0U; index < first.size(); ++index) {
+            if (std::abs(first[index] - second[index]) > tolerance) {
+                return false;
+            }
+        }
+        return true;
+    };
+    return arrayNear(left.position, right.position, 1.0e-6F) &&
+           arrayNear(left.target, right.target, 1.0e-6F) &&
+           arrayNear(left.orientation, right.orientation, 1.0e-6F) &&
+           std::abs(left.fovDegrees - right.fovDegrees) <= 1.0e-5F &&
+           std::abs(left.nearPlane - right.nearPlane) <= 1.0e-6F &&
+           std::abs(left.farPlane - right.farPlane) <= 1.0e-4F &&
+           std::abs(left.focusDistance - right.focusDistance) <= 1.0e-5F &&
+           std::abs(left.apertureFStops - right.apertureFStops) <= 1.0e-5F &&
+           left.hasDepthOfField == right.hasDepthOfField;
+}
+
+bool BeginAnimationLiveCameraEdit(
+    PreviewRuntimeState* runtimeState,
+    std::size_t keyIndex) {
+    if (runtimeState == nullptr ||
+        !runtimeState->animationPanel.currentPath.has_value()) {
+        return false;
+    }
+    auto& panel = runtimeState->animationPanel;
+    if (panel.liveCameraEdit.active ||
+        panel.reciprocalPanWizard.Active() ||
+        keyIndex >= panel.currentPath->keys.size()) {
+        return false;
+    }
+
+    const auto registryIndex = panel.currentFilePath.empty()
+        ? std::nullopt
+        : FindAnimationRegistryIndex(
+              panel,
+              std::filesystem::path{panel.currentFilePath});
+    const bool readOnlySavedComparison =
+        registryIndex.has_value() && !panel.currentPathUsesEdited &&
+        RegistryAnimationHasEditedVersion(panel, registryIndex.value());
+    if (readOnlySavedComparison) {
+        runtimeState->errorMessage =
+            "Switch to the _Edited animation before live-editing this key.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    const auto& key = panel.currentPath->keys[keyIndex];
+    if (!key.linkedCameraId.empty() &&
+        !CanEditLinkedCamera(
+            runtimeState,
+            key.linkedCameraId,
+            "Live camera key edit blocked.")) {
+        return false;
+    }
+
+    AnimationLiveCameraEditState edit;
+    edit.active = true;
+    edit.keyIndex = keyIndex;
+    edit.keyId = key.id;
+    edit.animationFilePath = panel.currentFilePath;
+    edit.pathBeforeEdit = panel.currentPath.value();
+    edit.registryIndex = registryIndex;
+    edit.currentPathUsesEditedBefore = panel.currentPathUsesEdited;
+    edit.selectedFileUsesEditedBefore = panel.selectedFileUsesEdited;
+    edit.panelDirtyBefore = panel.dirty;
+    edit.scrubAmountBefore = panel.scrubAmount;
+    edit.cameraBeforeEdit = runtimeState->camera.CaptureState();
+    edit.parallelProjectionBefore =
+        runtimeState->camera.ParallelProjection();
+    edit.pivotVisibleBefore = runtimeState->pivotOverlay.visible;
+    edit.pivotBefore = runtimeState->pivotOverlay.pivot;
+    edit.pivotLastSetAtBefore =
+        runtimeState->pivotOverlay.lastSetAt;
+    if (registryIndex.has_value()) {
+        EnsureAnimationAssociationStorage(&panel);
+        const auto index = registryIndex.value();
+        if (index < panel.availableFileEditedPaths.size()) {
+            edit.registryEditedPathBefore =
+                panel.availableFileEditedPaths[index];
+        }
+        if (index < panel.availableFileDirtyFlags.size()) {
+            edit.registryDirtyBefore =
+                panel.availableFileDirtyFlags[index];
+        }
+    }
+
+    const float normalizedPosition = invisible_places::camera::
+        AnimationPathKeyNormalizedPosition(
+            panel.currentPath.value(),
+            keyIndex);
+    const auto evaluation = invisible_places::camera::EvaluateAnimationPath(
+        panel.currentPath.value(),
+        invisible_places::camera::AnimationPathDurationSeconds(
+            panel.currentPath.value()) *
+            normalizedPosition);
+    panel.selectedKeyIndex = keyIndex;
+    panel.editTarget = AnimationEditTarget::Focus;
+    panel.viewportPartnerSelectionActive = false;
+    panel.viewportPartnerKeyIndex.reset();
+    panel.scrubAmount = normalizedPosition;
+    panel.drag = {};
+    runtimeState->animationPlayback.active = false;
+    runtimeState->cameraPlayback.active = false;
+    runtimeState->camera.SetParallelProjection(false);
+    ApplyAnimationEvaluationResult(runtimeState, evaluation, true);
+    edit.lastLiveCamera = runtimeState->camera.CaptureState();
+    edit.viewportInputConsumedThisFrame = true;
+    panel.liveCameraEdit = std::move(edit);
+    runtimeState->cameraInteraction.trackballOrbitActive = false;
+    runtimeState->cameraInteraction.navigationActive = false;
+    runtimeState->previewRenderStateSignatureValid = false;
+    runtimeState->statusMessage =
+        "Live Edit Mode: camera key " +
+        std::to_string(keyIndex + 1U) +
+        " is following the live view. Press Enter to save or Escape to cancel.";
+    runtimeState->errorMessage.clear();
+    return true;
+}
+
+void UpdateAnimationLiveCameraEdit(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr ||
+        !runtimeState->animationPanel.liveCameraEdit.active) {
+        return;
+    }
+    auto& panel = runtimeState->animationPanel;
+    auto& edit = panel.liveCameraEdit;
+    const bool sameAnimation = panel.currentPath.has_value() &&
+        panel.currentFilePath == edit.animationFilePath;
+    if (!sameAnimation) {
+        FinishAnimationLiveCameraEdit(runtimeState, false, false);
+        runtimeState->errorMessage =
+            "Live camera editing ended because the active animation changed.";
+        runtimeState->statusMessage.clear();
+        return;
+    }
+
+    const auto keyIt = std::find_if(
+        panel.currentPath->keys.begin(),
+        panel.currentPath->keys.end(),
+        [&](const auto& candidate) { return candidate.id == edit.keyId; });
+    if (keyIt == panel.currentPath->keys.end()) {
+        FinishAnimationLiveCameraEdit(runtimeState, false);
+        runtimeState->errorMessage =
+            "Live camera editing ended because its key no longer exists.";
+        runtimeState->statusMessage.clear();
+        return;
+    }
+
+    const auto camera = runtimeState->camera.CaptureState();
+    if (AnimationLiveCameraStatesEquivalent(
+            camera,
+            edit.lastLiveCamera)) {
+        return;
+    }
+    const std::size_t keyIndex = static_cast<std::size_t>(
+        std::distance(panel.currentPath->keys.begin(), keyIt));
+    const float geometricFocusDistance = std::hypot(
+        camera.target[0U] - camera.position[0U],
+        std::hypot(
+            camera.target[1U] - camera.position[1U],
+            camera.target[2U] - camera.position[2U]));
+    const float focusDistance =
+        std::isfinite(camera.focusDistance) &&
+                camera.focusDistance > 1.0e-4F
+            ? camera.focusDistance
+            : std::max(geometricFocusDistance, 0.001F);
+    invisible_places::camera::UpdateAnimationPathKeyFromCameraState(
+        &panel.currentPath.value(),
+        keyIndex,
+        camera,
+        camera.target,
+        focusDistance);
+    edit.keyIndex = keyIndex;
+    edit.lastLiveCamera = camera;
+    edit.previewChanged = true;
+    panel.selectedKeyIndex = keyIndex;
+    panel.editTarget = AnimationEditTarget::Focus;
+    panel.preparedPathCache = {};
+    panel.motionStatsCache = {};
+    panel.perceivedFlowCache = {};
+    runtimeState->previewRenderStateSignatureValid = false;
+}
+
+void FinishAnimationLiveCameraEdit(
+    PreviewRuntimeState* runtimeState,
+    bool commit,
+    bool restoreCameraOnCancel) {
+    if (runtimeState == nullptr ||
+        !runtimeState->animationPanel.liveCameraEdit.active) {
+        return;
+    }
+    auto& panel = runtimeState->animationPanel;
+    const AnimationLiveCameraEditState edit = panel.liveCameraEdit;
+    const bool commitRequested = commit;
+
+    if (commit && edit.previewChanged && panel.currentPath.has_value() &&
+        panel.currentFilePath == edit.animationFilePath) {
+        std::optional<std::size_t> registryIndex;
+        auto* editablePath = MutableCurrentAnimationForKeyEditing(
+            runtimeState,
+            &registryIndex);
+        std::optional<std::size_t> editableKeyIndex;
+        if (editablePath != nullptr) {
+            const auto keyIt = std::find_if(
+                editablePath->keys.begin(),
+                editablePath->keys.end(),
+                [&](const auto& candidate) {
+                    return candidate.id == edit.keyId;
+                });
+            if (keyIt != editablePath->keys.end()) {
+                editableKeyIndex = static_cast<std::size_t>(
+                    std::distance(editablePath->keys.begin(), keyIt));
+            }
+        }
+        if (editablePath != nullptr && editableKeyIndex.has_value()) {
+            const std::size_t keyIndex = editableKeyIndex.value();
+            const auto camera = runtimeState->camera.CaptureState();
+            const float geometricFocusDistance = std::hypot(
+                camera.target[0U] - camera.position[0U],
+                std::hypot(
+                    camera.target[1U] - camera.position[1U],
+                    camera.target[2U] - camera.position[2U]));
+            const LiveAnimationKeyFocus focus{
+                .point = camera.target,
+                .distance =
+                    std::isfinite(camera.focusDistance) &&
+                            camera.focusDistance > 1.0e-4F
+                        ? camera.focusDistance
+                        : std::max(geometricFocusDistance, 0.001F),
+                .surfaceHit = false,
+            };
+            if (SetAnimationKeyFromLiveCamera(
+                    runtimeState,
+                    editablePath,
+                    keyIndex,
+                    camera,
+                    focus)) {
+                panel.liveCameraEdit = {};
+                panel.selectedKeyIndex = keyIndex;
+                panel.editTarget = AnimationEditTarget::Focus;
+                FinalizeAnimationKeyStructureEdit(
+                    runtimeState,
+                    registryIndex);
+                runtimeState->statusMessage =
+                    "Saved Live Edit Mode changes to animation key " +
+                    std::to_string(keyIndex + 1U) + ".";
+                runtimeState->errorMessage.clear();
+                return;
+            }
+        }
+        commit = false;
+        runtimeState->errorMessage =
+            "The live camera change could not be saved; the key was restored.";
+    } else if (commit) {
+        panel.liveCameraEdit = {};
+        runtimeState->statusMessage =
+            "Exited Live Edit Mode; the camera key was unchanged.";
+        runtimeState->errorMessage.clear();
+        return;
+    }
+
+    const bool sameAnimation = panel.currentPath.has_value() &&
+        panel.currentFilePath == edit.animationFilePath;
+    if (sameAnimation) {
+        panel.currentPath = edit.pathBeforeEdit;
+        panel.currentPathUsesEdited = edit.currentPathUsesEditedBefore;
+        panel.selectedFileUsesEdited = edit.selectedFileUsesEditedBefore;
+        panel.dirty = edit.panelDirtyBefore;
+        panel.scrubAmount = edit.scrubAmountBefore;
+        panel.selectedKeyIndex = panel.currentPath->keys.empty()
+            ? std::nullopt
+            : std::optional<std::size_t>{std::min(
+                  edit.keyIndex,
+                  panel.currentPath->keys.size() - 1U)};
+        panel.editTarget = AnimationEditTarget::Focus;
+    }
+    if (edit.registryIndex.has_value()) {
+        EnsureAnimationAssociationStorage(&panel);
+        const auto index = edit.registryIndex.value();
+        if (index < panel.availableFileEditedPaths.size()) {
+            panel.availableFileEditedPaths[index] =
+                edit.registryEditedPathBefore;
+        }
+        if (index < panel.availableFileDirtyFlags.size()) {
+            panel.availableFileDirtyFlags[index] =
+                edit.registryDirtyBefore;
+        }
+    }
+    panel.liveCameraEdit = {};
+    panel.drag = {};
+    panel.preparedPathCache = {};
+    panel.motionStatsCache = {};
+    panel.perceivedFlowCache = {};
+    runtimeState->animationPlayback.active = false;
+    runtimeState->cameraPlayback.active = false;
+    runtimeState->camera.SetParallelProjection(
+        edit.parallelProjectionBefore);
+    if (restoreCameraOnCancel) {
+        runtimeState->camera.ApplyState(edit.cameraBeforeEdit);
+        runtimeState->pivotOverlay.visible = edit.pivotVisibleBefore;
+        runtimeState->pivotOverlay.pivot = edit.pivotBefore;
+        runtimeState->pivotOverlay.lastSetAt =
+            edit.pivotLastSetAtBefore;
+    }
+    runtimeState->previewRenderStateSignatureValid = false;
+    runtimeState->statusMessage =
+        "Cancelled Live Edit Mode and restored the animation key.";
+    if (commitRequested && runtimeState->errorMessage.empty()) {
+        runtimeState->errorMessage =
+            "The live camera change could not be saved.";
+    } else if (!commitRequested) {
+        runtimeState->errorMessage.clear();
+    }
+}
+
+void DrawAnimationLiveCameraEditOverlay(
+    PreviewRuntimeState* runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    if (runtimeState == nullptr ||
+        !runtimeState->animationPanel.liveCameraEdit.active) {
+        return;
+    }
+    ImGuiViewport* mainViewport = ImGui::GetMainViewport();
+    const ImVec2 origin = mainViewport != nullptr
+        ? mainViewport->Pos
+        : CurrentUiViewportOrigin();
+    const ImVec2 size = mainViewport != nullptr
+        ? mainViewport->Size
+        : CurrentUiViewportSize(viewport);
+    ImDrawList* foreground = mainViewport != nullptr
+        ? ImGui::GetForegroundDrawList(mainViewport)
+        : ImGui::GetForegroundDrawList();
+    if (foreground != nullptr) {
+        const ImVec2 minimum{origin.x + 3.0F, origin.y + 3.0F};
+        const ImVec2 maximum{
+            origin.x + size.x - 3.0F,
+            origin.y + size.y - 3.0F,
+        };
+        foreground->AddRect(
+            minimum,
+            maximum,
+            IM_COL32(205, 48, 58, 105),
+            0.0F,
+            ImDrawFlags_None,
+            7.0F);
+        foreground->AddRect(
+            ImVec2{minimum.x + 4.0F, minimum.y + 4.0F},
+            ImVec2{maximum.x - 4.0F, maximum.y - 4.0F},
+            IM_COL32(245, 92, 96, 48),
+            0.0F,
+            ImDrawFlags_None,
+            2.0F);
+    }
+
+    if (mainViewport != nullptr) {
+        ImGui::SetNextWindowViewport(mainViewport->ID);
+    }
+    ImGui::SetNextWindowPos(
+        ImVec2{origin.x + size.x - 18.0F, origin.y + 18.0F},
+        ImGuiCond_Always,
+        ImVec2{1.0F, 0.0F});
+    ImGui::SetNextWindowBgAlpha(0.88F);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 7.0F);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2{12.0F, 10.0F});
+    constexpr ImGuiWindowFlags flags =
+        ImGuiWindowFlags_NoDecoration |
+        ImGuiWindowFlags_AlwaysAutoResize |
+        ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoNav |
+        ImGuiWindowFlags_NoFocusOnAppearing;
+    ImGui::Begin("##AnimationLiveCameraEdit", nullptr, flags);
+    ImGui::TextColored(
+        ImVec4{1.0F, 0.48F, 0.50F, 1.0F},
+        "Live Edit Mode");
+    ImGui::TextDisabled(
+        "Camera key %zu",
+        runtimeState->animationPanel.liveCameraEdit.keyIndex + 1U);
+
+    const auto iconButton = [](const char* id, bool save) {
+        constexpr ImVec2 buttonSize{34.0F, 30.0F};
+        const bool clicked = ImGui::InvisibleButton(id, buttonSize);
+        const ImVec2 minimum = ImGui::GetItemRectMin();
+        const ImVec2 maximum = ImGui::GetItemRectMax();
+        auto* drawList = ImGui::GetWindowDrawList();
+        const bool hovered = ImGui::IsItemHovered();
+        const ImU32 background = save
+            ? IM_COL32(42, 112, 70, hovered ? 245 : 205)
+            : IM_COL32(132, 49, 55, hovered ? 245 : 205);
+        drawList->AddRectFilled(minimum, maximum, background, 5.0F);
+        drawList->AddRect(
+            minimum,
+            maximum,
+            IM_COL32(255, 255, 255, hovered ? 210 : 120),
+            5.0F,
+            ImDrawFlags_None,
+            1.4F);
+        if (save) {
+            drawList->AddLine(
+                ImVec2{minimum.x + 8.0F, minimum.y + 16.0F},
+                ImVec2{minimum.x + 14.0F, minimum.y + 22.0F},
+                IM_COL32(235, 255, 240, 255),
+                3.0F);
+            drawList->AddLine(
+                ImVec2{minimum.x + 14.0F, minimum.y + 22.0F},
+                ImVec2{minimum.x + 27.0F, minimum.y + 8.0F},
+                IM_COL32(235, 255, 240, 255),
+                3.0F);
+        } else {
+            drawList->AddLine(
+                ImVec2{minimum.x + 9.0F, minimum.y + 8.0F},
+                ImVec2{minimum.x + 25.0F, minimum.y + 22.0F},
+                IM_COL32(255, 236, 236, 255),
+                3.0F);
+            drawList->AddLine(
+                ImVec2{minimum.x + 25.0F, minimum.y + 8.0F},
+                ImVec2{minimum.x + 9.0F, minimum.y + 22.0F},
+                IM_COL32(255, 236, 236, 255),
+                3.0F);
+        }
+        return clicked;
+    };
+
+    const bool saveClicked = iconButton("##SaveLiveCameraEdit", true);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Save this camera-key edit (Enter).");
+    }
+    ImGui::SameLine();
+    const bool cancelClicked = iconButton("##CancelLiveCameraEdit", false);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Cancel and restore the previous key and view (Escape).");
+    }
+    ImGui::End();
+    ImGui::PopStyleVar(2);
+
+    const auto& io = ImGui::GetIO();
+    const bool keyboardShortcutAvailable =
+        !io.WantTextInput && !ImGui::IsAnyItemActive() &&
+        !ImGui::IsPopupOpen(
+            static_cast<const char*>(nullptr),
+            ImGuiPopupFlags_AnyPopupId);
+    const bool cancelRequested = cancelClicked ||
+        (keyboardShortcutAvailable &&
+         ImGui::IsKeyPressed(ImGuiKey_Escape));
+    const bool saveRequested = saveClicked ||
+        (keyboardShortcutAvailable &&
+         ImGui::IsKeyPressed(ImGuiKey_Enter));
+    if (cancelRequested) {
+        FinishAnimationLiveCameraEdit(runtimeState, false);
+    } else if (saveRequested) {
+        FinishAnimationLiveCameraEdit(runtimeState, true);
+    }
 }
 
 void SwitchSavedEditedAnimationVariant(
@@ -53050,6 +54372,9 @@ void EnsureLinkedSeamedViewPair(
     }
     state->pairId = std::string{pairId};
     state->orderedFilePaths = std::move(ordered);
+    state->overlapEnabled = false;
+    state->orderedFirstSourceOnTop = true;
+    state->overlapTopOpacity = 0.5F;
     state->splitOffsetPixels = {0.0F, 0.0F};
     state->trackedAnchors = {};
     state->trackedAnchorsValid = {};
@@ -55806,6 +57131,10 @@ bool ApplyReciprocalPanCandidate(
         newSecondStart,
         newFirstStart,
         second);
+    first.preferredBlendPartnerFileName =
+        wizard.filePaths[1U].filename().string();
+    second.preferredBlendPartnerFileName =
+        wizard.filePaths[0U].filename().string();
 
     // All validation above is read-only. These assignments are the atomic
     // commit point for the two animation shadows and their private retimed
@@ -59808,6 +61137,20 @@ void DrawAnimationSection(
                 panel.loopSmoothingPartnerPath =
                     panel.availableFiles[loopPartnerIndex.value()];
             }
+        } else if (!animationPath.preferredBlendPartnerFileName.empty() &&
+                   !loopPartnerIndex.has_value()) {
+            loopPartnerIndex = FindAnimationRegistryIndexByFileName(
+                panel,
+                animationPath.preferredBlendPartnerFileName);
+            if (loopPartnerIndex.has_value() &&
+                (!currentLoopFileIndex.has_value() ||
+                 loopPartnerIndex.value() !=
+                     currentLoopFileIndex.value())) {
+                panel.loopSmoothingPartnerPath =
+                    panel.availableFiles[loopPartnerIndex.value()];
+            } else {
+                loopPartnerIndex.reset();
+            }
         }
 
         std::string loopPartnerLabel = "Select another animation";
@@ -59817,8 +61160,30 @@ void DrawAnimationSection(
                 *runtimeState,
                 loopPartnerIndex.value());
         }
-        ImGui::BeginDisabled(renderSetupLocksAnimationSwitching);
+        const bool blendPartnerLockedByLink =
+            animationPath.velocityBlendLink.has_value();
+        ImGui::BeginDisabled(
+            renderSetupLocksAnimationSwitching ||
+            blendPartnerLockedByLink ||
+            currentIsSavedComparison);
         if (ImGui::BeginCombo("Blend Partner", loopPartnerLabel.c_str())) {
+            const bool noPartnerSelected = !loopPartnerIndex.has_value();
+            if (ImGui::Selectable(
+                    "No preferred partner",
+                    noPartnerSelected)) {
+                panel.loopSmoothingPartnerPath.clear();
+                loopPartnerIndex.reset();
+                if (!animationPath
+                         .preferredBlendPartnerFileName.empty()) {
+                    animationPath
+                        .preferredBlendPartnerFileName.clear();
+                    panel.dirty = true;
+                }
+                runtimeState->statusMessage =
+                    "Cleared this animation's preferred blend partner.";
+                runtimeState->errorMessage.clear();
+            }
+            ImGui::Separator();
             for (std::size_t fileIndex = 0U;
                  fileIndex < panel.availableFiles.size();
                  ++fileIndex) {
@@ -59838,6 +61203,23 @@ void DrawAnimationSection(
                     panel.loopSmoothingPartnerPath =
                         panel.availableFiles[fileIndex];
                     loopPartnerIndex = fileIndex;
+                    const std::string preferredFileName =
+                        panel.availableFiles[fileIndex]
+                            .filename()
+                            .string();
+                    if (animationPath
+                            .preferredBlendPartnerFileName !=
+                        preferredFileName) {
+                        animationPath
+                            .preferredBlendPartnerFileName =
+                            preferredFileName;
+                        panel.dirty = true;
+                    }
+                    runtimeState->statusMessage =
+                        "Preferred blend partner set to " +
+                        preferredFileName +
+                        "; save this animation to keep it.";
+                    runtimeState->errorMessage.clear();
                 }
                 if (selected) {
                     ImGui::SetItemDefaultFocus();
@@ -59847,11 +61229,16 @@ void DrawAnimationSection(
             ImGui::EndCombo();
         }
         ImGui::EndDisabled();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+        if (ImGui::IsItemHovered(
+                ImGuiHoveredFlags_DelayNormal |
+                ImGuiHoveredFlags_AllowWhenDisabled)) {
             ImGui::SetTooltip(
-                "Pairs this animation with another animation. Its _Edited "
-                "version is used automatically when present. Both "
-                "end-to-start overlaps are optimized as one closed loop.");
+                "%s",
+                blendPartnerLockedByLink
+                    ? "This partner is fixed by the reciprocal velocity link. Unlink the pair before choosing another."
+                : currentIsSavedComparison
+                    ? "The saved version is a read-only comparison. Load _Edited before changing its preferred blend partner."
+                    : "Remembers an unlinked working partner inside this animation file. Its _Edited version is used automatically when present, and loading either animation no longer reuses the previous A/B choice.");
         }
 
         const auto* loopPartner =
@@ -59906,6 +61293,32 @@ void DrawAnimationSection(
                 panel.availableFiles[loopPartnerIndex.value()],
                 *loopCurrent,
                 *loopPartner);
+            if (timeline.alignmentSelection.has_value()) {
+                const auto& selection =
+                    timeline.alignmentSelection.value();
+                const bool selectsCurrent = PathsLexicallyEqual(
+                    selection.filePath,
+                    panel.availableFiles[
+                        currentLoopFileIndex.value()]);
+                const bool selectsPartner = PathsLexicallyEqual(
+                    selection.filePath,
+                    panel.availableFiles[loopPartnerIndex.value()]);
+                const auto* selectedPath = selectsCurrent
+                    ? loopCurrent
+                    : selectsPartner
+                        ? loopPartner
+                        : nullptr;
+                const bool keyStillExists = selectedPath != nullptr &&
+                    std::any_of(
+                        selectedPath->keys.begin(),
+                        selectedPath->keys.end(),
+                        [&](const auto& key) {
+                            return key.id == selection.keyId;
+                        });
+                if (!keyStillExists) {
+                    timeline.alignmentSelection.reset();
+                }
+            }
             if (timelinePairChanged && matchingAppliedPair) {
                 panel.loopSmoothingMaxEndMovePercent = 100.0F *
                     loopCurrent->velocityBlendLink->maxEndMoveFraction;
@@ -60411,7 +61824,7 @@ void DrawAnimationSection(
                 velocityLinkSettingsChanged = true;
             }
             ImGui::TextDisabled(
-                "Mouse-down on a node toggles movement (double-click selects cyan matching-frame alignment); mouse-down elsewhere scrubs until release. A's overlap bounds keep priority."
+                "Left-click toggles movement; double-click selects cyan matching-frame alignment. Right-click selects a red-outlined node for camera-alignment copy/paste. Mouse-down elsewhere scrubs; A's overlap bounds keep priority."
             );
 
             loopTimelineOptions = AnimationLoopTimelineOptions(
@@ -60546,6 +61959,125 @@ void DrawAnimationSection(
                 ImGui::TextDisabled(
                     "Matching cached lower-frame geometry in the background...");
             }
+            const auto resolveAlignmentKey =
+                [&](const AnimationLoopAlignmentKeyReference& reference)
+                -> std::optional<std::pair<const AnimationPath*,
+                                           std::size_t>> {
+                const AnimationPath* selectedPath = nullptr;
+                if (PathsLexicallyEqual(
+                        reference.filePath,
+                        panel.availableFiles[
+                            currentLoopFileIndex.value()])) {
+                    selectedPath = loopCurrent;
+                } else if (PathsLexicallyEqual(
+                               reference.filePath,
+                               panel.availableFiles[
+                                   loopPartnerIndex.value()])) {
+                    selectedPath = loopPartner;
+                }
+                if (selectedPath == nullptr) {
+                    return std::nullopt;
+                }
+                const auto keyIt = std::find_if(
+                    selectedPath->keys.begin(),
+                    selectedPath->keys.end(),
+                    [&](const auto& key) {
+                        return key.id == reference.keyId;
+                    });
+                if (keyIt == selectedPath->keys.end()) {
+                    return std::nullopt;
+                }
+                return std::pair{
+                    selectedPath,
+                    static_cast<std::size_t>(std::distance(
+                        selectedPath->keys.begin(),
+                        keyIt)),
+                };
+            };
+            const auto selectedAlignmentKey =
+                panel.loopTimeline.alignmentSelection.has_value()
+                    ? resolveAlignmentKey(
+                          panel.loopTimeline
+                              .alignmentSelection.value())
+                    : std::nullopt;
+            const auto describeAlignmentKey =
+                [](const AnimationLoopAlignmentKeyReference& reference,
+                   std::size_t keyIndex) {
+                    return reference.filePath.filename().string() +
+                        " / key " + std::to_string(keyIndex + 1U);
+                };
+            ImGui::BeginDisabled(!selectedAlignmentKey.has_value());
+            if (ImGui::Button("Copy Camera Alignment")) {
+                const auto alignment = invisible_places::camera::
+                    CaptureAnimationCameraAlignment(
+                        *selectedAlignmentKey->first,
+                        selectedAlignmentKey->second);
+                if (alignment.has_value()) {
+                    panel.loopTimeline.alignmentClipboard =
+                        AnimationLoopAlignmentClipboard{
+                            .source = panel.loopTimeline
+                                          .alignmentSelection.value(),
+                            .alignment = alignment.value(),
+                        };
+                    runtimeState->statusMessage =
+                        "Copied camera alignment from " +
+                        describeAlignmentKey(
+                            panel.loopTimeline
+                                .alignmentSelection.value(),
+                            selectedAlignmentKey->second) +
+                        ".";
+                    runtimeState->errorMessage.clear();
+                } else {
+                    runtimeState->errorMessage =
+                        "That key's camera is too close to its focus to copy an alignment.";
+                    runtimeState->statusMessage.clear();
+                }
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::BeginDisabled(
+                !selectedAlignmentKey.has_value() ||
+                !panel.loopTimeline.alignmentClipboard.has_value() ||
+                renderSetupLocksAnimationSwitching ||
+                strongAlignmentInProgress);
+            if (ImGui::Button("Paste Camera Alignment")) {
+                PasteAnimationCameraAlignment(
+                    runtimeState,
+                    panel.loopTimeline.alignmentSelection.value(),
+                    panel.loopTimeline.alignmentClipboard->alignment);
+            }
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(
+                    ImGuiHoveredFlags_DelayNormal |
+                    ImGuiHoveredFlags_AllowWhenDisabled)) {
+                ImGui::SetTooltip(
+                    "Keeps the red-outlined destination focus fixed and copies the clipboard's world-Z orbit angle, elevation, and camera-to-focus distance. Existing free-orientation paths also receive the copied horizon/roll.");
+            }
+            if (selectedAlignmentKey.has_value()) {
+                ImGui::TextColored(
+                    ImVec4{0.95F, 0.30F, 0.34F, 1.0F},
+                    "Selected: %s",
+                    describeAlignmentKey(
+                        panel.loopTimeline
+                            .alignmentSelection.value(),
+                        selectedAlignmentKey->second)
+                        .c_str());
+            } else {
+                ImGui::TextDisabled(
+                    "Right-click a node on either timeline to select it.");
+            }
+            if (panel.loopTimeline.alignmentClipboard.has_value()) {
+                const auto& clipboard =
+                    panel.loopTimeline.alignmentClipboard.value();
+                ImGui::TextDisabled(
+                    "Copied: %s | azimuth %.1f deg, elevation %.1f deg, distance %.4f",
+                    clipboard.source.filePath.filename().string().c_str(),
+                    glm::degrees(
+                        clipboard.alignment.azimuthRadians),
+                    glm::degrees(
+                        clipboard.alignment.elevationRadians),
+                    clipboard.alignment.cameraToFocusDistance);
+            }
             ImGui::BeginDisabled(!matchingAppliedPair);
             if (matchingAppliedPair) {
                 EnsureLinkedSeamedViewPair(
@@ -60560,55 +62092,126 @@ void DrawAnimationSection(
                 panel.linkedSeamedView.renderedSourceIndex = 0U;
                 runtimeState->previewRenderStateSignatureValid = false;
             }
-            ImGui::EndDisabled();
             if (ImGui::IsItemHovered(
                     ImGuiHoveredFlags_DelayNormal |
                     ImGuiHoveredFlags_AllowWhenDisabled)) {
                 ImGui::SetTooltip(
                     "%s",
                     matchingAppliedPair
-                        ? "Shows the reciprocal partner through a moving hard split whenever the current playhead enters either saved overlap. The ending animation stays on the left and the starting animation on the right."
+                        ? "Shows the reciprocal partner whenever the current playhead enters either saved overlap. Disable Overlap for the moving hard split."
                         : reciprocalPairFailure->c_str());
             }
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!panel.linkedSeamedView.enabled);
+            if (ImGui::Checkbox(
+                    "Overlap",
+                    &panel.linkedSeamedView.overlapEnabled)) {
+                panel.linkedSeamedView.renderedSourceIndex = 0U;
+                runtimeState->previewRenderStateSignatureValid = false;
+            }
+            if (ImGui::IsItemHovered(
+                    ImGuiHoveredFlags_DelayNormal |
+                    ImGuiHoveredFlags_AllowWhenDisabled)) {
+                ImGui::SetTooltip(
+                    "Layer both complete camera frames inside the linked overlap. The selected top frame uses its own per-pixel alpha, multiplied by the Top opacity control.");
+            }
+            ImGui::EndDisabled();
+            ImGui::EndDisabled();
             if (matchingAppliedPair && panel.linkedSeamedView.enabled) {
                 const bool currentIsOrderedFirst = PathsLexicallyEqual(
                     panel.availableFiles[currentLoopFileIndex.value()],
                     panel.linkedSeamedView.orderedFilePaths[0U]);
-                const std::size_t currentStartSlot =
-                    currentIsOrderedFirst ? 0U : 1U;
-                const std::size_t currentEndSlot =
-                    currentIsOrderedFirst ? 1U : 0U;
-                const float viewportWidth = std::max(
-                    1.0F,
-                    CurrentUiViewportSize(viewport).x);
-                ImGui::SetNextItemWidth(-FLT_MIN);
-                const bool startOffsetChanged = ImGui::SliderFloat(
-                    "Current start seam offset",
-                    &panel.linkedSeamedView
-                         .splitOffsetPixels[currentStartSlot],
-                    -viewportWidth,
-                    viewportWidth,
-                    "%+.0f px");
-                ImGui::SetNextItemWidth(-FLT_MIN);
-                const bool endOffsetChanged = ImGui::SliderFloat(
-                    "Current end seam offset",
-                    &panel.linkedSeamedView
-                         .splitOffsetPixels[currentEndSlot],
-                    -viewportWidth,
-                    viewportWidth,
-                    "%+.0f px");
-                if (startOffsetChanged || endOffsetChanged) {
-                    runtimeState->previewRenderStateSignatureValid = false;
-                }
-                if (ImGui::Button("Reset seam offsets")) {
-                    panel.linkedSeamedView.splitOffsetPixels = {
-                        0.0F,
-                        0.0F,
+                if (panel.linkedSeamedView.overlapEnabled) {
+                    const std::array<std::string, 2U> layerLabels{
+                        panel.linkedSeamedView.orderedFilePaths[0U]
+                            .filename()
+                            .string(),
+                        panel.linkedSeamedView.orderedFilePaths[1U]
+                            .filename()
+                            .string(),
                     };
-                    runtimeState->previewRenderStateSignatureValid = false;
+                    const std::size_t topLayerIndex =
+                        panel.linkedSeamedView
+                                .orderedFirstSourceOnTop
+                            ? 0U
+                            : 1U;
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    if (ImGui::BeginCombo(
+                            "Top animation",
+                            layerLabels[topLayerIndex].c_str())) {
+                        for (std::size_t layerIndex = 0U;
+                             layerIndex < layerLabels.size();
+                             ++layerIndex) {
+                            const bool selected =
+                                layerIndex == topLayerIndex;
+                            if (ImGui::Selectable(
+                                    layerLabels[layerIndex].c_str(),
+                                    selected)) {
+                                panel.linkedSeamedView
+                                    .orderedFirstSourceOnTop =
+                                    layerIndex == 0U;
+                                runtimeState
+                                    ->previewRenderStateSignatureValid =
+                                    false;
+                            }
+                            if (selected) {
+                                ImGui::SetItemDefaultFocus();
+                            }
+                        }
+                        ImGui::EndCombo();
+                    }
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    if (ImGui::SliderFloat(
+                            "Top opacity",
+                            &panel.linkedSeamedView
+                                 .overlapTopOpacity,
+                            0.0F,
+                            1.0F,
+                            "%.2f")) {
+                        runtimeState
+                            ->previewRenderStateSignatureValid = false;
+                    }
+                    ImGui::TextWrapped(
+                        "Both complete frames occupy the live view. The bottom frame retains its alpha; Top opacity multiplies, rather than replaces, the selected frame's own transparency. Layer order remains tied to these filenames when A/B is switched.");
+                } else {
+                    const std::size_t currentStartSlot =
+                        currentIsOrderedFirst ? 0U : 1U;
+                    const std::size_t currentEndSlot =
+                        currentIsOrderedFirst ? 1U : 0U;
+                    const float viewportWidth = std::max(
+                        1.0F,
+                        CurrentUiViewportSize(viewport).x);
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    const bool startOffsetChanged = ImGui::SliderFloat(
+                        "Current start seam offset",
+                        &panel.linkedSeamedView
+                             .splitOffsetPixels[currentStartSlot],
+                        -viewportWidth,
+                        viewportWidth,
+                        "%+.0f px");
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    const bool endOffsetChanged = ImGui::SliderFloat(
+                        "Current end seam offset",
+                        &panel.linkedSeamedView
+                             .splitOffsetPixels[currentEndSlot],
+                        -viewportWidth,
+                        viewportWidth,
+                        "%+.0f px");
+                    if (startOffsetChanged || endOffsetChanged) {
+                        runtimeState->previewRenderStateSignatureValid =
+                            false;
+                    }
+                    if (ImGui::Button("Reset seam offsets")) {
+                        panel.linkedSeamedView.splitOffsetPixels = {
+                            0.0F,
+                            0.0F,
+                        };
+                        runtimeState->previewRenderStateSignatureValid =
+                            false;
+                    }
+                    ImGui::TextWrapped(
+                        "The split is visible only inside a linked overlap. After Apply it follows the captured feature anchors; a reloaded link falls back to an overlap-progress sweep. Both cross the aligned 50%% pose halfway through and retain these artistic offsets for this session.");
                 }
-                ImGui::TextWrapped(
-                    "The split is visible only inside a linked overlap. After Apply it follows the captured feature anchors; a reloaded link falls back to an overlap-progress sweep. Both cross the aligned 50%% pose halfway through and retain these artistic offsets for this session.");
             }
             const std::optional<std::string> extensionLinkFailure =
                 ReciprocalPanExistingLinkConflict(
@@ -62111,6 +63714,8 @@ void DrawAnimationSection(
     if (ImGui::Combo("Edit Target", &editTargetIndex, editTargetLabels, 2)) {
         panel.editTarget = editTargetIndex == 0 ? AnimationEditTarget::Camera : AnimationEditTarget::Focus;
     }
+    ImGui::TextDisabled(
+        "Focus selection adds a blue Z-orbit arc; double-click a focus node for Live Edit Mode.");
 
     const auto playheadFrameForPath = [](const AnimationPath& path,
                                          float normalizedPosition) {
@@ -62723,6 +64328,9 @@ void RequestSaveChangesDialog(
         return;
     }
 
+    if (runtimeState->animationPanel.liveCameraEdit.active) {
+        FinishAnimationLiveCameraEdit(runtimeState, false);
+    }
     auto& dialog = runtimeState->saveChanges;
     auto& panel = runtimeState->animationPanel;
     EnsureAnimationAssociationStorage(&panel);
@@ -63047,6 +64655,13 @@ std::optional<PreparedAnimationSave> PrepareAnimationSave(
             (prepared.path.velocityBlendLink.has_value() ||
              hasLinkedCamera);
         if (!prepared.linkedPairSaveAsCopy) {
+            if (prepared.path.velocityBlendLink.has_value() &&
+                prepared.path
+                    .preferredBlendPartnerFileName.empty()) {
+                prepared.path.preferredBlendPartnerFileName =
+                    prepared.path.velocityBlendLink
+                        ->partnerFileName;
+            }
             prepared.path.velocityBlendLink.reset();
         }
         // A copied animation must not keep editing the source project's
@@ -63234,6 +64849,10 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
         animations[0U].path.velocityBlendLink->partnerFileName =
             animations[1U].targetPath.filename().string();
         animations[1U].path.velocityBlendLink->partnerFileName =
+            animations[0U].targetPath.filename().string();
+        animations[0U].path.preferredBlendPartnerFileName =
+            animations[1U].targetPath.filename().string();
+        animations[1U].path.preferredBlendPartnerFileName =
             animations[0U].targetPath.filename().string();
     }
 
@@ -87623,6 +89242,8 @@ void DrawControlsWindow(
     ImGui::Begin("Invisible Places Controls", nullptr, flags);
     const bool reciprocalPanWizardActive =
         runtimeState->animationPanel.reciprocalPanWizard.Active();
+    const bool liveCameraEditActive =
+        runtimeState->animationPanel.liveCameraEdit.active;
 
     const auto applyLiveView =
         [&](const char* name,
@@ -87716,6 +89337,7 @@ void DrawControlsWindow(
         }
 
         ImGui::TableSetColumnIndex(5);
+        ImGui::BeginDisabled(liveCameraEditActive);
         const bool parallelProjection =
             runtimeState->camera.ParallelProjection();
         if (parallelProjection) {
@@ -87741,6 +89363,7 @@ void DrawControlsWindow(
             ImGui::SetTooltip(
                 "Toggle parallel projection. Its scale matches the perspective view at the focal point.");
         }
+        ImGui::EndDisabled();
         ImGui::EndTable();
     }
     ImGui::EndDisabled();
@@ -87754,6 +89377,7 @@ void DrawControlsWindow(
     // to block tab changes intentionally.
     std::optional<ControlsTab> requestedControlsTab;
     if (!popupOpen && !reciprocalPanWizardActive &&
+        !liveCameraEditActive &&
         ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         constexpr std::array tabValues{
             ControlsTab::Visuals,
@@ -87820,13 +89444,17 @@ void DrawControlsWindow(
     ImGui::SetCursorPosX(fpsCursorX);
     ImGui::TextDisabled("%s", fpsLabel.c_str());
 
-    ImGui::BeginDisabled(reciprocalPanWizardActive);
+    ImGui::BeginDisabled(
+        reciprocalPanWizardActive || liveCameraEditActive);
     DrawGlobalAnimationTimingBar(runtimeState);
     DrawFocusedWaterRunCombo(runtimeState);
     ImGui::EndDisabled();
     if (reciprocalPanWizardActive) {
         ImGui::TextDisabled(
             "Position controlled by the reciprocal seam-extension assistant.");
+    } else if (liveCameraEditActive) {
+        ImGui::TextDisabled(
+            "Live Edit Mode locks authoring controls; use Enter/\xE2\x9C\x93 or Escape/\xC3\x97 in the live view.");
     }
 
     sidePanel.hovered = ImGui::IsWindowHovered(
@@ -87837,6 +89465,7 @@ void DrawControlsWindow(
 
     constexpr ImGuiWindowFlags tabScrollFlags = ImGuiWindowFlags_AlwaysVerticalScrollbar;
     runtimeState->controlsTabHitRects.fill(ImVec4{});
+    ImGui::BeginDisabled(liveCameraEditActive);
     if (ImGui::BeginTabBar("ScenePanelTabs")) {
         const auto beginControlsTabItem =
             [&](const char* label,
@@ -87972,6 +89601,7 @@ void DrawControlsWindow(
         }
         ImGui::EndTabBar();
     }
+    ImGui::EndDisabled();
 
     sidePanel.interacting =
         popupOpen || ImGui::IsAnyItemActive() ||
@@ -88403,6 +90033,17 @@ void UpdateCameraFromInput(
         return;
     }
 
+    auto& liveCameraEdit =
+        runtimeState->animationPanel.liveCameraEdit;
+    const bool liveCameraEditActive = liveCameraEdit.active;
+    if (liveCameraEdit.active &&
+        liveCameraEdit.viewportInputConsumedThisFrame) {
+        liveCameraEdit.viewportInputConsumedThisFrame = false;
+        runtimeState->cameraInteraction.navigationActive = false;
+        runtimeState->cameraInteraction.trackballOrbitActive = false;
+        return;
+    }
+
     const auto& io = ImGui::GetIO();
     const bool cloudCompareTrackball =
         runtimeState->cameraInteraction.orbitControlMode ==
@@ -88411,6 +90052,7 @@ void UpdateCameraFromInput(
         runtimeState->cameraInteraction.trackballOrbitActive = false;
     }
     const bool waterAuthoringAllowed =
+        !liveCameraEditActive &&
         !RenderSetupAuthoringLocked(runtimeState);
     const bool waterGeometryAuthoringAllowed =
         waterAuthoringAllowed &&
@@ -88420,21 +90062,24 @@ void UpdateCameraFromInput(
         runtimeState->cameraInteraction.navigationActive = false;
         return;
     }
-    if (runtimeState->water.regionEditor.consumedViewportInputThisFrame ||
-        runtimeState->water.regionEditor.drag.active) {
+    if (!liveCameraEditActive &&
+        (runtimeState->water.regionEditor.consumedViewportInputThisFrame ||
+         runtimeState->water.regionEditor.drag.active)) {
         runtimeState->cameraInteraction.navigationActive = false;
         return;
     }
-    if (runtimeState->water.manualFlowPathEditor.consumedViewportInputThisFrame ||
-        runtimeState->water.manualFlowPathEditor.drag.kind != ManualFlowPathGizmoDragKind::None ||
-        runtimeState->water.manualFlowPathEditor.pointerCapturedUntilRelease) {
+    if (!liveCameraEditActive &&
+        (runtimeState->water.manualFlowPathEditor.consumedViewportInputThisFrame ||
+         runtimeState->water.manualFlowPathEditor.drag.kind != ManualFlowPathGizmoDragKind::None ||
+         runtimeState->water.manualFlowPathEditor.pointerCapturedUntilRelease)) {
         runtimeState->cameraInteraction.navigationActive = false;
         return;
     }
-    if (runtimeState->water.emitterGizmoDrag.kind != ManualFlowPathGizmoDragKind::None ||
-        runtimeState->water.emitterGizmoPointerCaptured ||
-        runtimeState->water.seepageGizmoDrag.kind != ManualFlowPathGizmoDragKind::None ||
-        runtimeState->water.seepageGizmoPointerCaptured) {
+    if (!liveCameraEditActive &&
+        (runtimeState->water.emitterGizmoDrag.kind != ManualFlowPathGizmoDragKind::None ||
+         runtimeState->water.emitterGizmoPointerCaptured ||
+         runtimeState->water.seepageGizmoDrag.kind != ManualFlowPathGizmoDragKind::None ||
+         runtimeState->water.seepageGizmoPointerCaptured)) {
         runtimeState->cameraInteraction.navigationActive = false;
         return;
     }
@@ -88442,7 +90087,8 @@ void UpdateCameraFromInput(
     // hover state is one frame old; treating a press over last frame's
     // handles as consumed keeps orbit and the click dispatch below away from
     // gizmo interactions that begin this frame.
-    if ((runtimeState->water.emitterGizmoHoveredLastFrame ||
+    if (!liveCameraEditActive &&
+        (runtimeState->water.emitterGizmoHoveredLastFrame ||
          runtimeState->water.seepageGizmoHoveredLastFrame) &&
         io.MouseDown[0]) {
         runtimeState->cameraInteraction.navigationActive = false;
@@ -88459,7 +90105,7 @@ void UpdateCameraFromInput(
     const bool mouseCanNavigate =
         !viewport.UiWantsMouseCapture() &&
         (renderViewportHovered || runtimeState->cameraInteraction.renderViewportMouseActive);
-    if (io.KeyCtrl &&
+    if (!liveCameraEditActive && io.KeyCtrl &&
         renderViewportHovered &&
         !viewport.UiWantsMouseCapture() &&
         !runtimeState->water.manualFlowPathEditor.active &&
@@ -88533,7 +90179,8 @@ void UpdateCameraFromInput(
         runtimeState->cameraInteraction.navigationActive = false;
         return;
     }
-    if (HandleWaterPathViewInput(runtimeState, &viewport)) {
+    if (!liveCameraEditActive &&
+        HandleWaterPathViewInput(runtimeState, &viewport)) {
         runtimeState->cameraInteraction.navigationActive = false;
         return;
     }
@@ -101826,10 +103473,15 @@ int Application::Run(ApplicationRunOptions options) const {
         if (options.guiSmoke->scenario ==
                 "temporal-camera-overlay" ||
             options.guiSmoke->scenario ==
-                "temporal-camera-split") {
+                "temporal-camera-split" ||
+            options.guiSmoke->scenario ==
+                "temporal-camera-overlap") {
             const bool splitSmoke =
                 options.guiSmoke->scenario ==
                 "temporal-camera-split";
+            const bool alphaOverSmoke =
+                options.guiSmoke->scenario ==
+                "temporal-camera-overlap";
             viewport->SetSceneCachingEnabled(false);
             viewport->SetLiveSceneRenderingEnabled(true);
             for (std::uint32_t frameIndex = 0U;
@@ -101868,12 +103520,16 @@ int Application::Run(ApplicationRunOptions options) const {
                                                         0.10F,
                                                         0.02F,
                                                         0.02F,
-                                                        1.0F}
+                                                        alphaOverSmoke
+                                                            ? 0.70F
+                                                            : 1.0F}
                                                   : glm::vec4{
                                                         0.02F,
                                                         0.04F,
                                                         0.12F,
-                                                        1.0F};
+                                                        alphaOverSmoke
+                                                            ? 0.65F
+                                                            : 1.0F};
                 const auto renderedMatrices =
                     sourceCameras[sourceIndex].Matrices(aspectRatio);
                 renderState.view = renderedMatrices.view;
@@ -101882,24 +103538,41 @@ int Application::Run(ApplicationRunOptions options) const {
                     renderedMatrices.viewProjection;
                 renderState.cameraPosition = renderedMatrices.position;
                 renderState.focusDistance = 4.0F;
+                const bool firstSourcePrimary = frameIndex < 2U;
+                const auto compositionMode = alphaOverSmoke
+                    ? renderer::core::
+                          TemporalCameraCompositionMode::AlphaOver
+                    : splitSmoke
+                    ? renderer::core::
+                          TemporalCameraCompositionMode::Split
+                    : renderer::core::
+                          TemporalCameraCompositionMode::
+                              ReprojectedBlend;
                 viewport->SetTemporalCameraOverlay(
                     true,
                     sourceIndex,
-                    0.5F,
-                    0.5F,
+                    alphaOverSmoke
+                        ? (firstSourcePrimary ? 0.55F : 1.0F)
+                        : 0.5F,
+                    alphaOverSmoke
+                        ? (firstSourcePrimary ? 1.0F : 0.55F)
+                        : 0.5F,
                     &sourceViewProjections,
-                    splitSmoke,
+                    compositionMode,
                     0.35F +
                         static_cast<float>(frameIndex) * 0.10F,
-                    frameIndex < 2U);
+                    firstSourcePrimary);
                 viewport->UpdateRenderState(renderState);
                 viewport->DrawFrame();
             }
             viewport->SetTemporalCameraOverlay(false);
             viewport->WaitIdle();
-            std::cout << (splitSmoke
-                              ? "Feature-following temporal camera split smoke passed.\n"
-                              : "Temporal camera overlay smoke passed.\n");
+            std::cout
+                << (alphaOverSmoke
+                        ? "Straight-alpha temporal camera overlap smoke passed.\n"
+                        : splitSmoke
+                        ? "Feature-following temporal camera split smoke passed.\n"
+                        : "Temporal camera overlay smoke passed.\n");
             StopBackgroundWorkForShutdown(&runtimeState);
             return 0;
         }
@@ -102149,6 +103822,7 @@ int Application::Run(ApplicationRunOptions options) const {
         if (ImGui::GetCurrentContext() != nullptr) {
             window.SetEscapeCloseSuppressed(
                 runtimeState.animationPanel.reciprocalPanWizard.Active() ||
+                runtimeState.animationPanel.liveCameraEdit.active ||
                 ImGui::GetIO().WantCaptureKeyboard ||
                 ImGui::IsAnyItemActive() ||
                 ImGui::IsAnyMouseDown());
@@ -102232,7 +103906,11 @@ int Application::Run(ApplicationRunOptions options) const {
             if (!pauseLiveViewport) {
                 HandleAnimationPlaybackShortcut(&runtimeState);
                 DrawAnimationViewportOverlay(&runtimeState, viewport.value());
-                if (!reciprocalPanWizardActive) {
+                DrawAnimationLiveCameraEditOverlay(
+                    &runtimeState,
+                    viewport.value());
+                if (!reciprocalPanWizardActive &&
+                    !runtimeState.animationPanel.liveCameraEdit.active) {
                     DrawWaterRegionOverlay(&runtimeState, viewport.value());
                     DrawWaterRegionPointPreviewOverlay(
                         &runtimeState,
@@ -102242,6 +103920,7 @@ int Application::Run(ApplicationRunOptions options) const {
                         viewport.value());
                 }
                 UpdateCameraFromInput(&runtimeState, viewport.value());
+                UpdateAnimationLiveCameraEdit(&runtimeState);
                 UpdateAnimationPlayback(&runtimeState);
                 UpdateCameraShotPlayback(&runtimeState);
                 UpdatePerformanceInteractionState(&runtimeState, viewport.value());
@@ -102277,7 +103956,8 @@ int Application::Run(ApplicationRunOptions options) const {
             PrunePreviewLodSampleCaches(&runtimeState);
             if (!pauseLiveViewport) {
                 DrawPivotOverlay(runtimeState, viewport.value());
-                if (!reciprocalPanWizardActive) {
+                if (!reciprocalPanWizardActive &&
+                    !runtimeState.animationPanel.liveCameraEdit.active) {
                     DrawWaterPathDebugOverlay(
                         &runtimeState,
                         viewport.value());
@@ -102359,7 +104039,8 @@ int Application::Run(ApplicationRunOptions options) const {
                             0.5F,
                             0.5F,
                             &viewProjections,
-                            true,
+                            renderer::core::
+                                TemporalCameraCompositionMode::Split,
                             splitCentre,
                             ReciprocalPanAOnLeftForSeam(
                                 wizard,
@@ -102395,26 +104076,66 @@ int Application::Run(ApplicationRunOptions options) const {
                                     .viewProjection,
                             };
                         const float splitCenter =
-                            linkedSeamedComparison->trackedAnchorsValid
-                            ? AnimationFeatureSplitCentreNormalized(
-                                  linkedSeamedComparison->trackedAnchors,
-                                  comparisonMatrices.value(),
-                                  uiViewportWidth,
-                                  linkedView.splitOffsetPixels[
-                                      linkedSeamedComparison
-                                          ->orderedSeamIndex])
+                            linkedView.overlapEnabled
+                            ? 0.5F
+                            : (linkedSeamedComparison
+                                       ->trackedAnchorsValid
+                                   ? AnimationFeatureSplitCentreNormalized(
+                                         linkedSeamedComparison
+                                             ->trackedAnchors,
+                                         comparisonMatrices.value(),
+                                         uiViewportWidth,
+                                         linkedView.splitOffsetPixels[
+                                             linkedSeamedComparison
+                                                 ->orderedSeamIndex])
+                                   : linkedSeamedComparison
+                                         ->splitCenterNormalized);
+                        const bool currentIsOrderedFirst =
+                            PathsLexicallyEqual(
+                                std::filesystem::path{
+                                    runtimeState.animationPanel
+                                        .currentFilePath},
+                                linkedView.orderedFilePaths[0U]);
+                        const bool currentSourcePrimary =
+                            linkedView.overlapEnabled
+                            ? renderer::core::
+                                  CurrentSourceIsSelectedTop(
+                                      currentIsOrderedFirst,
+                                      linkedView
+                                          .orderedFirstSourceOnTop)
                             : linkedSeamedComparison
-                                  ->splitCenterNormalized;
+                                  ->currentSourceOnLeft;
+                        const float topOpacity = std::clamp(
+                            linkedView.overlapTopOpacity,
+                            0.0F,
+                            1.0F);
+                        const float currentSourceOpacity =
+                            linkedView.overlapEnabled
+                            ? (currentSourcePrimary
+                                   ? topOpacity
+                                   : 1.0F)
+                            : 0.5F;
+                        const float partnerSourceOpacity =
+                            linkedView.overlapEnabled
+                            ? (currentSourcePrimary
+                                   ? 1.0F
+                                   : topOpacity)
+                            : 0.5F;
                         viewport->SetTemporalCameraOverlay(
                             true,
                             renderedSource,
-                            0.5F,
-                            0.5F,
+                            currentSourceOpacity,
+                            partnerSourceOpacity,
                             &viewProjections,
-                            true,
+                            linkedView.overlapEnabled
+                                ? renderer::core::
+                                      TemporalCameraCompositionMode::
+                                          AlphaOver
+                                : renderer::core::
+                                      TemporalCameraCompositionMode::
+                                          Split,
                             splitCenter,
-                            linkedSeamedComparison
-                                ->currentSourceOnLeft);
+                            currentSourcePrimary);
                     }
                 }
                 if (!comparison.has_value() &&

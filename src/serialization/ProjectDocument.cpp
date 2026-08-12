@@ -2750,6 +2750,10 @@ json SerializeAnimationPath(const AnimationPath& path) {
         {"water_scenario_tracks", json::array()},
         {"keys", json::array()},
     };
+    if (!path.preferredBlendPartnerFileName.empty()) {
+        pathJson["preferred_blend_partner_file_name"] =
+            path.preferredBlendPartnerFileName;
+    }
     if (path.defaultLiveViewWindowWidth > 0U &&
         path.defaultLiveViewWindowHeight > 0U) {
         pathJson["default_live_view_window_size"] = {
@@ -2818,6 +2822,9 @@ AnimationPath ParseAnimationPath(const json& pathJson) {
     path.apertureFStops = pathJson.value("aperture_f_stops", path.apertureFStops);
     path.depthOfFieldMaxBlurPixels =
         pathJson.value("depth_of_field_max_blur_px", path.depthOfFieldMaxBlurPixels);
+    path.preferredBlendPartnerFileName = pathJson.value(
+        "preferred_blend_partner_file_name",
+        std::string{});
     path.selectedWaterScenarioId =
         pathJson.value("selected_water_scenario_id", std::string{});
     path.selectedTimingTakeId =

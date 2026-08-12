@@ -116,6 +116,22 @@ pose. Focus shall use the first stable point-cloud hit along the live view ray,
 falling back to the selected key's previous camera-to-focus distance when the
 ray misses.
 
+Selecting a viewport focus key shall expose a world-Z quarter-arc rotation
+handle from +Y to +X on its XY plane. Dragging it shall orbit the key camera
+around that focus while preserving Z offset and focus distance. It shall also
+expose compact secondary XY, ZX, and ZY plane handles for translating the key's
+camera and focus together. XY shall be drawn in the negative-X/negative-Y
+region, ZX offset along negative Y, and ZY offset along negative X. Hover shall
+expand only that handle to the ordinary plane-control size. Dragging shall
+apply one equal world-plane delta to camera and focus, preserving their relative
+geometry, authored orientation, and lens values; the ordinary gizmo shall keep
+moving only the selected focus control. Double-clicking a focus key shall enter
+a transactional Live Edit Mode at the complete evaluated
+key camera and lens state. Live camera navigation shall update the key preview;
+Enter or a tick commits, while Escape or a cross restores the prior animation
+and view. The live view shall show a faded red border and top-right mode card
+for the duration of the edit.
+
 #### FR-CAM-11
 Matching-Frame Key Alignment shall provide an **Extend Both Seams** assistant
 for two target-driven, fixed-lens animations and one unambiguous working
@@ -129,6 +145,21 @@ least restrictive combined clip range, and remove lens-only spline tangents
 without changing camera/focus positions or timing. If that repair alone makes
 the pair eligible, Extend shall apply it to private wizard baselines; Cancel
 shall discard it and Apply Both shall commit it with the extension.
+
+The Animation tab shall persist each animation's preferred Blend Partner even
+without reciprocal velocity-link metadata and restore it when that animation
+is loaded. A live reciprocal link shall override the preference while linked,
+and unlinking shall retain the former link partner as the preference. Flipping
+the displayed A/B roles shall resolve each path by stable file identity rather
+than silently substituting another registered animation.
+
+On the ordinary paired matching-frame timelines, right-clicking a key shall
+select it by stable animation-file and key identity and show a red outline.
+**Copy Camera Alignment** shall capture world-Z orbit azimuth, elevation,
+geometric camera-to-focus distance, and the evaluated camera orientation.
+**Paste Camera Alignment** shall apply those values around another selected
+key's unchanged focus. It shall preserve target-driven orientation policy and
+copy horizon/roll only when the destination path already authors orientation.
 
 #### FR-CAM-12
 The assistant shall collect ordered anchor/front/side source triangles at
@@ -245,6 +276,15 @@ the left and the starting animation on the right at both seams. The boundary
 shall pass through the aligned midpoint at 50% overlap progress, retain one
 artistic pixel offset per physical seam when the loaded A/B role reverses, and
 fall back to the ordinary single-animation view outside the overlap.
+
+While **Seamed View** is enabled, an adjacent **Overlap** control shall replace
+the hard split with complete-frame straight-alpha source-over composition. The
+user shall be able to select which animation is on top by stable filename and
+adjust a top-opacity multiplier without discarding either frame's per-pixel
+alpha. Switching the loaded A/B member shall not reverse the selected layer
+order. Disabling Overlap shall restore the feature-following hard split and its
+saved in-session seam offsets; outside the linked overlap bands the viewport
+shall remain a normal single-animation view.
 
 ### 5.4 Side Panel Behaviour
 #### FR-UI-1

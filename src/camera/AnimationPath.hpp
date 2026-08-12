@@ -63,6 +63,17 @@ struct AnimationPathKey {
     std::string linkedCameraName;
 };
 
+// Portable focus-relative camera alignment copied between animation keys.
+// Angles are expressed in the world-Z spherical frame used by the focus-key
+// orbit handle. The evaluated orientation carries the source horizon/roll
+// when the destination path already uses the free-orientation channel.
+struct AnimationCameraAlignment {
+    float azimuthRadians = 0.0F;
+    float elevationRadians = 0.0F;
+    float cameraToFocusDistance = 1.0F;
+    std::array<float, 4> orientation{0.0F, 0.0F, 0.0F, 1.0F};
+};
+
 struct AnimationExportSettings {
     std::string outputDirectory;
     std::uint32_t width = 1920;
@@ -118,7 +129,7 @@ struct AnimationLinkedSeamSample {
 struct AnimationPath {
     // Original file schema retained only for application-level migration
     // bookkeeping. Serialization always writes the current schema.
-    std::uint32_t sourceSchemaVersion = 22U;
+    std::uint32_t sourceSchemaVersion = 23U;
     std::string name = "Animation";
     std::uint32_t durationFrames = 180;
     // Deprecated schema-22 migration marker. A nonzero value identifies the
@@ -136,6 +147,10 @@ struct AnimationPath {
     float apertureFStops = 8.0F;
     float depthOfFieldMaxBlurPixels = 24.0F;
     AnimationExportSettings exportSettings{};
+    // Advisory A/B editing preference, independent of reciprocal velocity
+    // linkage. Filename-only storage keeps animation files portable when the
+    // containing directory moves between systems.
+    std::string preferredBlendPartnerFileName;
     // Pair ownership and localized path evaluation are intentionally
     // independent. A confirmed pose remains localized after the animation is
     // unlinked or paired with another animation.
@@ -1054,6 +1069,38 @@ void CollectRayHitDistancesAlongRay(
     std::optional<float> surfaceHitDistance,
     float fallbackFocusDistance);
 
+// Rotates only the camera position around the focus point on the world XY
+// plane. The camera's world Z offset and complete focus distance remain
+// unchanged. This is the geometry used by the focus-key Z rotation handle.
+[[nodiscard]] std::array<float, 3> RotateAnimationCameraPositionAboutFocusZ(
+    const std::array<float, 3>& cameraPosition,
+    const std::array<float, 3>& focusPoint,
+    float radians);
+
+// Captures and reapplies the focus-relative spherical camera alignment used
+// by the matching-frame timeline clipboard. Paste keeps the destination focus
+// fixed while copying orbit azimuth, elevation, distance, and—when that path
+// already authors orientation—the source's evaluated horizon/roll.
+[[nodiscard]] std::optional<AnimationCameraAlignment>
+CaptureAnimationCameraAlignment(
+    const AnimationPath& path,
+    std::size_t keyIndex);
+bool ApplyAnimationCameraAlignment(
+    AnimationPath* path,
+    std::size_t keyIndex,
+    const AnimationCameraAlignment& alignment);
+
+// Replaces one key with a live camera snapshot while retaining the path's
+// existing authored-channel policy. Orientation, focus distance, and aperture
+// become per-key values only when that channel is already authored somewhere
+// on the path; camera/focus positions and lens/clip values always update.
+void UpdateAnimationPathKeyFromCameraState(
+    AnimationPath* path,
+    std::size_t keyIndex,
+    const CameraState& camera,
+    const std::array<float, 3>& focusPoint,
+    float focusDistance);
+
 void MoveAnimationCameraKey(
     AnimationPath* path,
     std::size_t keyIndex,
@@ -1063,5 +1110,13 @@ void MoveAnimationFocusKey(
     AnimationPath* path,
     std::size_t keyIndex,
     const std::array<float, 3>& focusPoint);
+
+// Translates both spatial controls of one key by the same world-space delta.
+// Camera-to-focus geometry, authored orientation, and lens channels remain
+// unchanged. This backs the secondary focus-gizmo plane handles.
+void TranslateAnimationCameraAndFocusKey(
+    AnimationPath* path,
+    std::size_t keyIndex,
+    const std::array<float, 3>& translation);
 
 }  // namespace invisible_places::camera

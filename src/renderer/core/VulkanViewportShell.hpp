@@ -4,6 +4,7 @@
 #include "io/PointCloudData.hpp"
 #include "output/ExrWriter.hpp"
 #include "renderer/core/FrameTiming.hpp"
+#include "renderer/core/TemporalCameraComposition.hpp"
 #include "renderer/gsplat/GsplatLayer.hpp"
 #include "renderer/gsplat/HighQualityGaussianScene.hpp"
 #include "renderer/pointcloud/PointCloudPreviewState.hpp"
@@ -654,9 +655,10 @@ class VulkanViewportShell {
         float secondWeight = 0.0F,
         const std::array<glm::mat4, 2U>* currentSourceViewProjections =
             nullptr,
-        bool splitView = false,
+        TemporalCameraCompositionMode compositionMode =
+            TemporalCameraCompositionMode::ReprojectedBlend,
         float splitCenterNormalized = 0.5F,
-        bool firstSourceOnLeft = true);
+        bool firstSourcePrimary = true);
 
   private:
     static constexpr std::size_t kFramesInFlight = 2U;
@@ -1502,9 +1504,10 @@ class VulkanViewportShell {
     bool temporalCameraOverlayResourcesInitialized_ = false;
     std::uint32_t temporalCameraOverlayRenderedSourceIndex_ = 0U;
     std::array<float, 2U> temporalCameraOverlayWeights_{1.0F, 0.0F};
-    bool temporalCameraOverlaySplitView_ = false;
+    TemporalCameraCompositionMode temporalCameraOverlayCompositionMode_ =
+        TemporalCameraCompositionMode::ReprojectedBlend;
     float temporalCameraOverlaySplitCenterNormalized_ = 0.5F;
-    bool temporalCameraOverlayFirstSourceOnLeft_ = true;
+    bool temporalCameraOverlayFirstSourcePrimary_ = true;
     std::array<bool, 2U> temporalCameraOverlayHistoryValid_{false, false};
     std::array<glm::mat4, 2U> temporalCameraOverlayHistoryViews_{
         glm::mat4{1.0F},

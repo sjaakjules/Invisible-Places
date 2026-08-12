@@ -20,7 +20,7 @@ The central idea is that data already present in the point cloud can become visu
 - **Data-driven art direction:** render parameters can be constant values or field-mapped controls with input/output ranges, layer statistics, clamp, invert, and gamma shaping.
 - **Hybrid capture scenes:** point-cloud layers and Gaussian splat layers share the same camera, scene, and project workflow, so survey geometry and photogrammetric/3DGS material can be composed together.
 - **Postproduction-friendly output:** preview-density EXR stacks currently write `beauty.RGB`, `alpha.A`, and `depth.Z`, while Quick MP4 export gives fast review movies through `ffmpeg`.
-- **Portable project state:** schema-73 project JSON, schema-22 animation JSON, and schema-27 standalone water-source JSON store authored scenes, explicit active water-scene ownership, animation, styles, water controls, live-view window preferences, and compact cache manifests; derived shared-surface and settled Flow-path payloads live in validated sidecars rather than bloating the project file.
+- **Portable project state:** schema-73 project JSON, schema-23 animation JSON, and schema-27 standalone water-source JSON store authored scenes, explicit active water-scene ownership, animation, styles, water controls, live-view window preferences, and compact cache manifests; derived shared-surface and settled Flow-path payloads live in validated sidecars rather than bloating the project file.
 
 ## Current capabilities
 
@@ -86,7 +86,7 @@ The central idea is that data already present in the point cloud can become visu
 
 ### Export and persistence
 
-- Saves and reloads schema-73 project JSON containing authoritative scene density groups, explicit active water-scene ownership, point-cloud styles, camera shots, animation paths, saved visuals, the live-view window preference and lock, water state/cache manifests, and export selections. Animation documents use schema 22 and standalone water-source documents use schema 27.
+- Saves and reloads schema-73 project JSON containing authoritative scene density groups, explicit active water-scene ownership, point-cloud styles, camera shots, animation paths, saved visuals, the live-view window preference and lock, water state/cache manifests, and export selections. Animation documents use schema 23 and standalone water-source documents use schema 27.
 - Persists the shared schema-4 water surface cache as a scene-local `.surfacecache` and settled generated Flow branches as `.flowpathcache`, with project-local fallback paths when scene storage is unavailable.
 - Builds the shared 10 mm Rain/Flow/Seepage surface from one complete 2 mm ROCK/SAND/VEG bundle (or the nearest complete fallback bundle), and folds the explicitly active scene's unambiguous 5 mm `MESHSampled` point cloud into a separate Ground-v3 tier for Mesh Flow. Density changes and effect tuning therefore do not rescan or mix role sources.
 - Keeps Rain near-surface squish, ROCK/VEG response tuning, Flow trail visibility, and Seepage reach/width/prominence as live parameter updates over settled cache-derived support.

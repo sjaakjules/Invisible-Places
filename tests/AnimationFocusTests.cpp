@@ -243,6 +243,189 @@ TEST_CASE("Surface focus preserves the previous distance when the ray misses",
           Approx(7.25F));
 }
 
+TEST_CASE("Focus Z rotation orbits the camera on XY without changing height or distance",
+          "[camera][animation][key-editing][focus-orbit]") {
+    const std::array<float, 3> focus{1.0F, 2.0F, 3.0F};
+    const std::array<float, 3> camera{1.0F, 4.0F, 8.0F};
+    const auto rotated = invisible_places::camera::
+        RotateAnimationCameraPositionAboutFocusZ(
+            camera,
+            focus,
+            0.5F * 3.14159265358979323846F);
+
+    CHECK(rotated[0U] == Approx(-1.0F));
+    CHECK(rotated[1U] == Approx(2.0F));
+    CHECK(rotated[2U] == Approx(camera[2U]));
+    const auto distance = [](const auto& left, const auto& right) {
+        return std::hypot(
+            left[0U] - right[0U],
+            std::hypot(
+                left[1U] - right[1U],
+                left[2U] - right[2U]));
+    };
+    CHECK(distance(rotated, focus) == Approx(distance(camera, focus)));
+}
+
+TEST_CASE("Live camera snapshots update a key's authored pose and lens channels",
+          "[camera][animation][key-editing][live-camera]") {
+    invisible_places::camera::AnimationPath path;
+    path.keys = {
+        {.cameraPosition = {0.0F, 0.0F, 4.0F},
+         .focusPoint = {0.0F, 0.0F, 0.0F}},
+        {.cameraPosition = {2.0F, 0.0F, 4.0F},
+         .focusPoint = {1.0F, 0.0F, 0.0F},
+         .hasOrientation = true,
+         .hasFocusDistance = true,
+         .focusDistance = 4.0F,
+         .hasApertureFStops = true,
+         .apertureFStops = 5.6F},
+    };
+    invisible_places::camera::CameraState cameraState;
+    cameraState.position = {5.0F, 6.0F, 7.0F};
+    cameraState.orientation = {
+        0.0F,
+        0.0F,
+        0.70710677F,
+        0.70710677F,
+    };
+    cameraState.fovDegrees = 38.0F;
+    cameraState.nearPlane = 0.025F;
+    cameraState.farPlane = 420.0F;
+    cameraState.focusDistance = 9.5F;
+    cameraState.apertureFStops = 2.8F;
+    const std::array<float, 3> focus{8.0F, 9.0F, 10.0F};
+
+    invisible_places::camera::UpdateAnimationPathKeyFromCameraState(
+        &path,
+        0U,
+        cameraState,
+        focus,
+        cameraState.focusDistance);
+
+    const auto& updated = path.keys[0U];
+    CHECK(updated.cameraPosition == cameraState.position);
+    CHECK(updated.focusPoint == focus);
+    CHECK(updated.hasOrientation);
+    CHECK(updated.orientation == cameraState.orientation);
+    CHECK(updated.hasFocusDistance);
+    CHECK(updated.focusDistance == Approx(9.5F));
+    CHECK(updated.hasApertureFStops);
+    CHECK(updated.apertureFStops == Approx(2.8F));
+    CHECK(updated.fovDegrees == Approx(38.0F));
+    CHECK(updated.nearPlane == Approx(0.025F));
+    CHECK(updated.farPlane == Approx(420.0F));
+}
+
+TEST_CASE("Camera alignment paste keeps the destination focus and copies spherical framing",
+          "[camera][animation][key-editing][alignment-clipboard]") {
+    invisible_places::camera::AnimationPath source;
+    source.keys = {
+        {.id = "source",
+         .cameraPosition = {3.0F, 4.0F, 12.0F},
+         .focusPoint = {0.0F, 0.0F, 0.0F},
+         .hasOrientation = true,
+         .orientation = {0.0F, 0.0F, 0.38268343F, 0.92387950F}},
+    };
+    const auto alignment = invisible_places::camera::
+        CaptureAnimationCameraAlignment(source, 0U);
+    REQUIRE(alignment.has_value());
+    CHECK(alignment->cameraToFocusDistance == Approx(13.0F));
+    CHECK(alignment->azimuthRadians ==
+          Approx(std::atan2(4.0F, 3.0F)));
+
+    invisible_places::camera::AnimationPath destination;
+    destination.keys = {
+        {.id = "destination",
+         .cameraPosition = {9.0F, 8.0F, 7.0F},
+         .focusPoint = {10.0F, 20.0F, 30.0F},
+         .hasOrientation = true,
+         .orientation = {0.0F, 0.0F, 0.0F, 1.0F}},
+        {.id = "orientation-channel",
+         .cameraPosition = {1.0F, 0.0F, 0.0F},
+         .focusPoint = {0.0F, 0.0F, 0.0F},
+         .hasOrientation = true},
+    };
+    const auto focusBefore = destination.keys[0U].focusPoint;
+    REQUIRE(invisible_places::camera::ApplyAnimationCameraAlignment(
+        &destination,
+        0U,
+        alignment.value()));
+
+    const auto& pasted = destination.keys[0U];
+    CHECK(pasted.focusPoint == focusBefore);
+    CHECK(pasted.cameraPosition[0U] == Approx(13.0F));
+    CHECK(pasted.cameraPosition[1U] == Approx(24.0F));
+    CHECK(pasted.cameraPosition[2U] == Approx(42.0F));
+    CHECK(pasted.orientation[2U] == Approx(0.38268343F));
+    CHECK(pasted.orientation[3U] == Approx(0.92387950F));
+}
+
+TEST_CASE("Camera alignment paste keeps target-driven paths target-driven",
+          "[camera][animation][key-editing][alignment-clipboard]") {
+    invisible_places::camera::AnimationPath path;
+    path.keys = {
+        {.cameraPosition = {0.0F, 2.0F, 1.0F},
+         .focusPoint = {1.0F, 1.0F, 1.0F}},
+    };
+    const invisible_places::camera::AnimationCameraAlignment alignment{
+        .azimuthRadians = 0.0F,
+        .elevationRadians = 0.0F,
+        .cameraToFocusDistance = 5.0F,
+        .orientation = {0.0F, 0.0F, 0.70710677F, 0.70710677F},
+    };
+    REQUIRE(invisible_places::camera::ApplyAnimationCameraAlignment(
+        &path,
+        0U,
+        alignment));
+    const std::array<float, 3> expectedCamera{6.0F, 1.0F, 1.0F};
+    CHECK(path.keys[0U].cameraPosition == expectedCamera);
+    CHECK_FALSE(path.keys[0U].hasOrientation);
+}
+
+TEST_CASE("Focus rig translation moves camera and focus together without changing framing",
+          "[camera][animation][key-editing][focus-rig-plane]") {
+    invisible_places::camera::AnimationPath path;
+    path.keys = {
+        {.id = "rig-key",
+         .cameraPosition = {1.0F, 2.0F, 3.0F},
+         .focusPoint = {4.0F, 5.0F, 6.0F},
+         .hasOrientation = true,
+         .orientation = {0.0F, 0.0F, 0.38268343F, 0.92387950F},
+         .hasFocusDistance = true,
+         .focusDistance = 7.0F},
+    };
+    path.localizedKeyCorrections = {{
+        .keyId = "rig-key",
+        .splineCameraPosition = {0.5F, 1.5F, 2.5F},
+        .splineFocusPoint = {3.5F, 4.5F, 5.5F},
+    }};
+    const auto offsetBefore = std::array<float, 3>{
+        path.keys[0U].cameraPosition[0U] - path.keys[0U].focusPoint[0U],
+        path.keys[0U].cameraPosition[1U] - path.keys[0U].focusPoint[1U],
+        path.keys[0U].cameraPosition[2U] - path.keys[0U].focusPoint[2U],
+    };
+
+    invisible_places::camera::TranslateAnimationCameraAndFocusKey(
+        &path,
+        0U,
+        {-2.0F, 3.0F, 1.5F});
+
+    const std::array<float, 3> expectedCamera{-1.0F, 5.0F, 4.5F};
+    const std::array<float, 3> expectedFocus{2.0F, 8.0F, 7.5F};
+    CHECK(path.keys[0U].cameraPosition == expectedCamera);
+    CHECK(path.keys[0U].focusPoint == expectedFocus);
+    CHECK(path.keys[0U].orientation[2U] == Approx(0.38268343F));
+    CHECK(path.keys[0U].orientation[3U] == Approx(0.92387950F));
+    CHECK(path.keys[0U].focusDistance == Approx(7.0F));
+    CHECK(path.localizedKeyCorrections.empty());
+    const std::array<float, 3> offsetAfter{
+        path.keys[0U].cameraPosition[0U] - path.keys[0U].focusPoint[0U],
+        path.keys[0U].cameraPosition[1U] - path.keys[0U].focusPoint[1U],
+        path.keys[0U].cameraPosition[2U] - path.keys[0U].focusPoint[2U],
+    };
+    CHECK(offsetAfter == offsetBefore);
+}
+
 TEST_CASE("Matching-frame ghost keeps the linked view's front surface and freezes it at the destination pose",
           "[camera][animation][matching-frame-ghost]") {
     invisible_places::camera::AnimationPathEvaluation reference;
