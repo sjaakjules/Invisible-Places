@@ -136,7 +136,7 @@ TEST_CASE("Canonical analysis sources require one exact role spacing", "[scene][
     std::vector<PointCloudAsset> assets{
         MakeVariant(folder, "FallbackScene", "ROCK", 1'500U, 15U, "z"),
         MakeVariant(folder, "FallbackScene", "ROCK", 500U, 5U, "z"),
-        MakeVariant(folder, "FallbackScene", "SAND", 2'000U, 20U, "z"),
+        MakeVariant(folder, "FallbackScene", "SAND", 1'000U, 20U, "z"),
         MakeVariant(folder, "FallbackScene", "VEG", 1'000U, 11U, "z"),
         MakeVariant(folder, "FallbackScene", "VEG", 1'000U, 12U, "a"),
     };
@@ -153,7 +153,7 @@ TEST_CASE("Canonical analysis sources require one exact role spacing", "[scene][
     CHECK(rock == nullptr);
     REQUIRE(sand != nullptr);
     CHECK(vegetation == nullptr);
-    CHECK(sand->spacingMicrometres == 2'000U);
+    CHECK(sand->spacingMicrometres == 1'000U);
 
     CHECK(group.defaultDisplay.kind == invisible_places::scene::SceneDisplaySelectionKind::Mixed);
     CHECK_FALSE(group.defaultDisplay.spacingMicrometres.has_value());
@@ -167,7 +167,7 @@ TEST_CASE("Canonical analysis sources require one exact role spacing", "[scene][
     CHECK(reversedGroups.front().AnalysisSource(ScenePointCloudRole::Rock) == nullptr);
     CHECK(reversedGroups.front().AnalysisSource(ScenePointCloudRole::Vegetation) == nullptr);
     REQUIRE(reversedGroups.front().AnalysisSource(ScenePointCloudRole::Sand) != nullptr);
-    CHECK(reversedGroups.front().AnalysisSource(ScenePointCloudRole::Sand)->spacingMicrometres == 2'000U);
+    CHECK(reversedGroups.front().AnalysisSource(ScenePointCloudRole::Sand)->spacingMicrometres == 1'000U);
 }
 
 TEST_CASE("The finest complete density is the default display bundle", "[scene][density]") {
@@ -328,7 +328,7 @@ TEST_CASE("Scene3 exposes 1, 2, 3, and 5 millimetre display bundles", "[scene][d
     REQUIRE(scene3->AnalysisSource(ScenePointCloudRole::Sand) != nullptr);
     REQUIRE(scene3->AnalysisSource(ScenePointCloudRole::Vegetation) != nullptr);
     CHECK(scene3->AnalysisSource(ScenePointCloudRole::Rock)->spacingMicrometres == 1'000U);
-    CHECK(scene3->AnalysisSource(ScenePointCloudRole::Sand)->spacingMicrometres == 2'000U);
+    CHECK(scene3->AnalysisSource(ScenePointCloudRole::Sand)->spacingMicrometres == 1'000U);
     CHECK(scene3->AnalysisSource(ScenePointCloudRole::Vegetation)->spacingMicrometres == 1'000U);
     REQUIRE(scene3->defaultDisplay.spacingMicrometres.has_value());
     CHECK(scene3->defaultDisplay.spacingMicrometres.value() == 1'000U);

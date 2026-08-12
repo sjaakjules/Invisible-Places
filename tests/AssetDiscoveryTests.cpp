@@ -884,7 +884,7 @@ TEST_CASE("SampleScene validates local multi-cloud shoreline fixture", "[discove
     CHECK(sampleScene->AnalysisSource(ScenePointCloudRole::Rock)->sourcePath.filename() ==
           "Site1-ROCK-1mm. SampleScene.ply");
     CHECK(sampleScene->AnalysisSource(ScenePointCloudRole::Sand)->sourcePath.filename() ==
-          "Site1-SAND-2mm. SampleScene.ply");
+          "Site1-SAND-1mm. SampleScene.ply");
     CHECK(sampleScene->AnalysisSource(ScenePointCloudRole::Vegetation)->sourcePath.filename() ==
           "Site1-VEG-1mm. SampleScene.ply");
 }

@@ -153,6 +153,7 @@ add_library(
     src/app/Application.cpp
     src/app/PointVisualSelection.cpp
     src/app/ProcessMemoryTelemetry.cpp
+    src/app/ProjectWorkspace.cpp
     src/app/UsedScalarFields.cpp
     src/app/WaterPathDiagnostics.cpp
     src/camera/AnimationPath.cpp
@@ -316,6 +317,7 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
             tests/PointCloudFieldResidencyTests.cpp
             tests/PointCloudVariantsTests.cpp
             tests/ProcessMemoryTelemetryTests.cpp
+            tests/ProjectWorkspaceTests.cpp
             tests/ProjectDocumentSerializationTests.cpp
             tests/RenderSetupDocumentTests.cpp
             tests/RainImpactGpuEquivalenceTests.cpp

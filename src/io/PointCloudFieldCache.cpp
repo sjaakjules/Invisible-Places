@@ -17,6 +17,7 @@ using nlohmann::json;
 
 constexpr std::string_view kManifestFileName = "manifest.json";
 constexpr std::string_view kGeometryFileName = "geometry.bin";
+std::filesystem::path gPointCloudFieldCacheRoot;
 
 std::uint64_t Fnv1aHash(std::string_view text) {
     std::uint64_t hash = 1469598103934665603ULL;
@@ -447,8 +448,18 @@ std::filesystem::path PointCloudFieldCacheDirectory(
     char hashText[17];
     std::snprintf(hashText, sizeof(hashText), "%016llx",
                   static_cast<unsigned long long>(hash));
-    return normalized.parent_path() / ".invisible_places" / "cache" /
-           "fields" / (normalized.stem().string() + "-" + hashText);
+    const auto root = gPointCloudFieldCacheRoot.empty()
+                          ? normalized.parent_path() / ".invisible_places" /
+                                "cache" / "fields"
+                          : gPointCloudFieldCacheRoot / "fields";
+    return root / (normalized.stem().string() + "-" + hashText);
+}
+
+void SetPointCloudFieldCacheRoot(
+    const std::filesystem::path& cacheRoot) {
+    gPointCloudFieldCacheRoot = cacheRoot.empty()
+                                   ? std::filesystem::path{}
+                                   : cacheRoot.lexically_normal();
 }
 
 std::optional<PointCloudFieldCacheManifest>

@@ -3,6 +3,7 @@
 #include "app/ManualFlowPathEditMath.hpp"
 #include "app/PointVisualSelection.hpp"
 #include "app/ProcessMemoryTelemetry.hpp"
+#include "app/ProjectWorkspace.hpp"
 #include "app/WaterSurfaceCacheReadiness.hpp"
 #include "app/WaterPathDiagnostics.hpp"
 #include "camera/AnimationPath.hpp"
@@ -360,7 +361,14 @@ struct ProjectSettings {
 
 struct PersistenceState {
     std::string projectName = "Invisible Places";
+    std::string sharedDataPath;
+    std::string sharedDataEditBuffer;
+    std::string authoredWorkspacePath;
+    std::string authoredWorkspaceEditBuffer;
     std::string projectFilePath;
+    std::filesystem::path trackedProjectFilePath;
+    std::optional<invisible_places::app::workspace::FileRevision>
+        trackedProjectRevision;
     std::string pointStylePresetPath;
     std::string animationDirectoryPath;
     std::vector<QueuedLayerLoad> queuedLoads;
@@ -1185,6 +1193,12 @@ struct AnimationPanelState {
     // Ordinary authoring never mutates it; edits live in the parallel shadow.
     std::vector<std::optional<AnimationPath>> availableFileLoadedPaths;
     std::vector<std::optional<AnimationPath>> availableFileEditedPaths;
+    // Fingerprints the exact disk bytes that each saved path was loaded
+    // from. A OneDrive update arriving while the app is open makes a later
+    // overwrite fail safely instead of silently choosing the last writer.
+    std::vector<std::optional<
+        invisible_places::app::workspace::FileRevision>>
+        availableFileDiskRevisions;
     // Keeps paired save/discard atomic even after Unapply clears the
     // serialized smoothing metadata from both edited paths.
     std::vector<std::string> availableFileLoopEditPairIds;
@@ -1949,10 +1963,12 @@ void EnsureAnimationAssociationStorage(AnimationPanelState* panelState);
 bool AddAnimationFileToRegistry(
     AnimationPanelState* panelState,
     const std::filesystem::path& filePath,
-    std::vector<std::filesystem::path> associatedLayerPaths);
+    std::vector<std::filesystem::path> associatedLayerPaths,
+    const invisible_places::app::workspace::Roots* roots = nullptr);
 void RefreshAnimationFileList(
     AnimationPanelState* panelState,
-    const std::filesystem::path& animationDirectory);
+    const std::filesystem::path& animationDirectory,
+    const invisible_places::app::workspace::Roots* roots = nullptr);
 std::optional<std::size_t> FindAnimationRegistryIndex(
     const AnimationPanelState& panelState,
     const std::filesystem::path& path);
@@ -3175,6 +3191,7 @@ struct PreviewRuntimeState {
     // means the preview follows the animation camera.
     std::optional<invisible_places::camera::CameraState>
         pendingFramePreviewCamera;
+    std::filesystem::path localSavedRoot;
     std::filesystem::path waterSurfaceCacheRoot;
     invisible_places::platform::ScopedPowerAssertion exportPowerAssertion{};
     bool showDiagnosticsPanel = false;
@@ -4524,15 +4541,58 @@ std::string ActiveWaterScenarioDisplayName(const PreviewRuntimeState& runtimeSta
 }
 
 std::filesystem::path ResolveDataDirectory(const std::filesystem::path& requested) {
-    if (!requested.empty()) {
-        return requested;
+    auto localOrRequested = requested;
+    if (localOrRequested.empty()) {
+        if (const char* envValue = std::getenv("INVISIBLE_PLACES_DATA_DIR");
+            envValue != nullptr) {
+            localOrRequested = std::filesystem::path{envValue};
+        }
+    }
+    return invisible_places::app::workspace::ResolveSharedDataDirectory(
+        Application::DefaultDataDirectory(),
+        localOrRequested);
+}
+
+bool SupplementalLocalPointCloudAllowed(
+    const invisible_places::io::PointCloudAsset& asset) {
+    // OneDrive owns the production Scene3 set. Avoid rediscovering its local
+    // compatibility symlinks and deliberately leave the retired 2 mm/3 mm
+    // role variants out of the active catalog. Other local fixtures remain.
+    if (asset.sceneGroupName == "Scene3") {
+        return false;
+    }
+    const auto filename = asset.filePath.filename().string();
+    return filename != "Site3-MESH.ply" &&
+           filename != "Site3-MESHSampled-5mm.ply";
+}
+
+invisible_places::io::AssetCatalog DiscoverApplicationAssets(
+    const std::filesystem::path& primaryDataRoot) {
+    auto catalog = invisible_places::io::DiscoverAssets(primaryDataRoot);
+    const auto localDataRoot = Application::DefaultDataDirectory();
+    if (primaryDataRoot.lexically_normal() == localDataRoot.lexically_normal()) {
+        return catalog;
     }
 
-    if (const char* envValue = std::getenv("INVISIBLE_PLACES_DATA_DIR"); envValue != nullptr) {
-        return std::filesystem::path{envValue};
-    }
-
-    return Application::DefaultDataDirectory();
+    auto supplemental = invisible_places::io::DiscoverAssets(localDataRoot);
+    std::erase_if(
+        supplemental.pointClouds,
+        [](const auto& asset) {
+            return !SupplementalLocalPointCloudAllowed(asset);
+        });
+    catalog.pointClouds.insert(
+        catalog.pointClouds.end(),
+        std::make_move_iterator(supplemental.pointClouds.begin()),
+        std::make_move_iterator(supplemental.pointClouds.end()));
+    catalog.gaussianSplats.insert(
+        catalog.gaussianSplats.end(),
+        std::make_move_iterator(supplemental.gaussianSplats.begin()),
+        std::make_move_iterator(supplemental.gaussianSplats.end()));
+    catalog.issues.insert(
+        catalog.issues.end(),
+        std::make_move_iterator(supplemental.issues.begin()),
+        std::make_move_iterator(supplemental.issues.end()));
+    return catalog;
 }
 
 void AcquireExportPowerAssertion(PreviewRuntimeState* runtimeState) {
@@ -4982,9 +5042,9 @@ std::size_t RefreshWaterRegionPointPreviews(
 }
 
 std::filesystem::path DefaultProjectFilePath(const std::filesystem::path& dataRoot) {
-    const auto savedDirectory = dataRoot.filename() == "ExhibitionScene"
-                                    ? dataRoot.parent_path().parent_path() / "Saved"
-                                    : dataRoot.parent_path() / "Saved";
+    const auto savedDirectory =
+        invisible_places::app::workspace::ResolveAuthoredWorkspaceDirectory(
+            dataRoot);
     std::error_code error;
     const auto exhibitionFinalProjectPath = savedDirectory / "ExhibitionFinal_project.json";
     if (std::filesystem::is_regular_file(exhibitionFinalProjectPath, error)) {
@@ -4998,15 +5058,30 @@ std::filesystem::path DefaultProjectFilePath(const std::filesystem::path& dataRo
 }
 
 std::filesystem::path DefaultPointStylePresetPath(const std::filesystem::path& dataRoot) {
-    return dataRoot.parent_path() / "Saved" / "pointcloud_style_preset.json";
+    return invisible_places::app::workspace::ResolveAuthoredWorkspaceDirectory(
+               dataRoot) /
+           "pointcloud_style_preset.json";
 }
 
 std::filesystem::path DefaultRenderOutputDirectory(const std::filesystem::path& dataRoot) {
-    return dataRoot.parent_path() / "Saved" / "renders" / "Invisible Places";
+    return invisible_places::app::workspace::LocalSavedDirectory(dataRoot) /
+           "renders" / "Invisible Places";
 }
 
 std::filesystem::path DefaultAnimationDirectory(const std::filesystem::path& dataRoot) {
-    return dataRoot.parent_path() / "Saved" / "animations";
+    return invisible_places::app::workspace::ResolveAuthoredWorkspaceDirectory(
+               dataRoot) /
+           "animations";
+}
+
+invisible_places::app::workspace::Roots WorkspaceRoots(
+    const PreviewRuntimeState& runtimeState) {
+    return invisible_places::app::workspace::MakeRoots(
+        runtimeState.dataRoot,
+        std::filesystem::path{
+            runtimeState.persistence.authoredWorkspacePath},
+        runtimeState.localSavedRoot,
+        Application::DefaultDataDirectory());
 }
 
 std::string DescribeBudget(const PointBudgetState& budget) {
@@ -12292,7 +12367,7 @@ bool QueueSceneAnalysisSourceLoads(
     for (const auto sessionIndex : scene->analysisSessionIndices) {
         if (!sessionIndex.has_value() || sessionIndex.value() >= runtimeState->sessions.size()) {
             scene->switchError =
-                "Canonical ROCK/VEG 1 mm and SAND 2 mm analysis sources are required for this scene.";
+                "A complete canonical ROCK/SAND/VEG 1 mm analysis bundle is required for this scene.";
             return false;
         }
     }
@@ -16606,10 +16681,7 @@ std::filesystem::path BuildWaterTrailOverlayPath(
     const PreviewLayerSession& sourceSession,
     std::uint32_t sourceId,
     std::string_view trailProfileName) {
-    const std::filesystem::path projectPath{runtimeState.persistence.projectFilePath};
-    const auto waterDirectory = projectPath.empty()
-                                    ? std::filesystem::path{"Saved"} / "water"
-                                    : projectPath.parent_path() / "water";
+    const auto waterDirectory = runtimeState.waterSurfaceCacheRoot / "water";
     return waterDirectory /
            (sourceSession.sourcePath.stem().string() + "-WaterFlowTrails-" +
             std::to_string(sourceId) + "-" + WaterProfileFileToken(trailProfileName) + ".generated");
@@ -18301,35 +18373,22 @@ std::size_t AddOrRefreshWaterEffectOverlaySession(
 std::filesystem::path BuildWaterOverlayPath(
     const PreviewRuntimeState& runtimeState,
     const PreviewLayerSession& sourceSession) {
-    const std::filesystem::path projectPath{runtimeState.persistence.projectFilePath};
-    const auto waterDirectory = projectPath.empty()
-                                    ? std::filesystem::path{"Saved"} / "water"
-                                    : projectPath.parent_path() / "water";
+    const auto waterDirectory = runtimeState.waterSurfaceCacheRoot / "water";
     const auto suffix = "-WaterFlowTrails.generated";
     return waterDirectory / (sourceSession.sourcePath.stem().string() + suffix);
 }
 
 std::filesystem::path BuildWaterPathCacheDirectory(
     const PreviewRuntimeState& runtimeState,
-    const PreviewLayerSession& sourceSession) {
-    const std::filesystem::path projectPath{runtimeState.persistence.projectFilePath};
-    const auto cacheDirectory = !sourceSession.sourcePath.parent_path().empty()
-                                    ? sourceSession.sourcePath.parent_path() /
-                                          ".invisible_places" / "cache" / "flow"
-                                    : (projectPath.empty()
-                                           ? std::filesystem::path{"Saved"} / "water"
-                                           : projectPath.parent_path() /
-                                                 ".invisible_places" / "cache" / "flow");
-    return cacheDirectory;
+    const PreviewLayerSession& /*sourceSession*/) {
+    return runtimeState.waterSurfaceCacheRoot /
+           ".invisible_places" / "cache" / "flow";
 }
 
 std::filesystem::path BuildWaterFieldCachePath(
     const PreviewRuntimeState& runtimeState,
     const PreviewLayerSession& sourceSession) {
-    const std::filesystem::path projectPath{runtimeState.persistence.projectFilePath};
-    const auto waterDirectory = projectPath.empty()
-                                    ? std::filesystem::path{"Saved"} / "water"
-                                    : projectPath.parent_path() / "water";
+    const auto waterDirectory = runtimeState.waterSurfaceCacheRoot / "water";
     return waterDirectory / (sourceSession.sourcePath.stem().string() + "-WaterFieldCache.bin");
 }
 
@@ -19317,11 +19376,7 @@ bool PersistSettledWaterPathCache(
         return true;
     }
 
-    const std::filesystem::path projectPath{runtimeState->persistence.projectFilePath};
-    if (projectPath.empty()) {
-        return false;
-    }
-    const auto fallbackDirectory = projectPath.parent_path() /
+    const auto fallbackDirectory = runtimeState->waterSurfaceCacheRoot /
                                    ".invisible_places" / "cache" / "flow";
     if (NormalizePathKey(fallbackDirectory) == NormalizePathKey(outputDirectory)) {
         return false;
@@ -20268,10 +20323,7 @@ std::filesystem::path BuildWaterFeatureOverlayPath(
     const PreviewRuntimeState& runtimeState,
     const PreviewLayerSession& sourceSession,
     const char* suffix) {
-    const std::filesystem::path projectPath{runtimeState.persistence.projectFilePath};
-    const auto waterDirectory = projectPath.empty()
-                                    ? std::filesystem::path{"Saved"} / "water"
-                                    : projectPath.parent_path() / "water";
+    const auto waterDirectory = runtimeState.waterSurfaceCacheRoot / "water";
     return waterDirectory / (sourceSession.sourcePath.stem().string() + suffix);
 }
 
@@ -20345,6 +20397,9 @@ void SaveWaterSources(PreviewRuntimeState* runtimeState) {
     }
     document.pathCache = CurrentWaterPathCacheForDocument(*runtimeState);
     document.rippleRuntimeCaches = CurrentWaterRippleRuntimeCachesForDocument(*runtimeState);
+    invisible_places::app::workspace::MakeWaterSourcesDocumentPortable(
+        &document,
+        WorkspaceRoots(*runtimeState));
     std::string errorMessage;
     const auto outputPath = WaterSourcesPath(*runtimeState);
     if (invisible_places::serialization::SaveWaterSourcesDocument(document, outputPath, &errorMessage)) {
@@ -20364,12 +20419,15 @@ void LoadWaterSources(
     }
     std::string errorMessage;
     const auto inputPath = WaterSourcesPath(*runtimeState);
-    const auto document = invisible_places::serialization::LoadWaterSourcesDocument(inputPath, &errorMessage);
+    auto document = invisible_places::serialization::LoadWaterSourcesDocument(inputPath, &errorMessage);
     if (!document.has_value()) {
         runtimeState->errorMessage = errorMessage;
         runtimeState->statusMessage.clear();
         return;
     }
+    invisible_places::app::workspace::ResolveWaterSourcesDocument(
+        &document.value(),
+        WorkspaceRoots(*runtimeState));
 
     CancelWaterFlowTrailBuildJob(&runtimeState->water);
     runtimeState->water.flowTrailSourceRequests.clear();
@@ -21824,18 +21882,13 @@ void CancelWaterSurfaceCacheWarmup(WaterWorkflowState* water) {
 
 std::filesystem::path WaterSurfaceCacheRootForScene(
     const PreviewRuntimeState& runtimeState,
-    const ScenePointCloudRuntime& scene) {
-    if (!scene.sourceFolder.empty()) {
-        return scene.sourceFolder;
-    }
-    const std::filesystem::path projectPath{runtimeState.persistence.projectFilePath};
-    return projectPath.empty() ? runtimeState.waterSurfaceCacheRoot : projectPath.parent_path();
+    const ScenePointCloudRuntime& /*scene*/) {
+    return runtimeState.waterSurfaceCacheRoot;
 }
 
 std::filesystem::path WaterSurfaceProjectFallbackRoot(
     const PreviewRuntimeState& runtimeState) {
-    const std::filesystem::path projectPath{runtimeState.persistence.projectFilePath};
-    return projectPath.empty() ? runtimeState.waterSurfaceCacheRoot : projectPath.parent_path();
+    return runtimeState.waterSurfaceCacheRoot;
 }
 
 std::filesystem::path WaterSurfaceManifestPath(
@@ -21844,10 +21897,22 @@ std::filesystem::path WaterSurfaceManifestPath(
     if (manifest.relativePath.is_absolute()) {
         return manifest.relativePath;
     }
-    const std::filesystem::path projectPath{runtimeState.persistence.projectFilePath};
-    return projectPath.empty()
-               ? manifest.relativePath
-               : (projectPath.parent_path() / manifest.relativePath).lexically_normal();
+    const std::filesystem::path projectPath{
+        runtimeState.persistence.projectFilePath};
+    const auto authoredRelative = projectPath.empty()
+                                      ? std::filesystem::path{}
+                                      : (projectPath.parent_path() /
+                                         manifest.relativePath)
+                                            .lexically_normal();
+    std::error_code authoredError;
+    if (!authoredRelative.empty() &&
+        std::filesystem::is_regular_file(
+            authoredRelative,
+            authoredError)) {
+        return authoredRelative;
+    }
+    return (runtimeState.waterSurfaceCacheRoot / manifest.relativePath)
+        .lexically_normal();
 }
 
 WaterSurfaceCacheRuntimeStatus InitialWaterSurfaceCacheStatus(
@@ -26125,7 +26190,7 @@ bool ApplyScenePointCloudGroupDocuments(
 }
 
 bool ApplyProjectDocumentToRuntime(
-    const ProjectDocument& document,
+    const ProjectDocument& sourceDocument,
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
     if (runtimeState == nullptr || viewport == nullptr) {
@@ -26136,6 +26201,11 @@ bool ApplyProjectDocumentToRuntime(
         runtimeState->statusMessage = "Please wait for the current layer to finish loading before loading a project.";
         return false;
     }
+
+    auto document = sourceDocument;
+    invisible_places::app::workspace::ResolveProjectDocument(
+        &document,
+        WorkspaceRoots(*runtimeState));
 
     // Project application is a full context switch. Clear the previous
     // animation before water/profile state is synchronized, then restore the
@@ -26619,6 +26689,7 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->animationPanel.availableFileAssociatedLayerPaths.clear();
     runtimeState->animationPanel.availableFileLoadedPaths.clear();
     runtimeState->animationPanel.availableFileEditedPaths.clear();
+    runtimeState->animationPanel.availableFileDiskRevisions.clear();
     runtimeState->animationPanel.availableFileLoopEditPairIds.clear();
     runtimeState->animationPanel.reciprocalPanTimingTakeCloneIds.clear();
     runtimeState->animationPanel.availableFileDirtyFlags.clear();
@@ -26627,16 +26698,19 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->animationPanel.projectVelocityLinksDirty = false;
     runtimeState->animationPanel.selectedExportFiles.clear();
     if (document.hasSavedAnimationRegistry) {
+        const auto roots = WorkspaceRoots(*runtimeState);
         for (const auto& animation : document.savedAnimations) {
             AddAnimationFileToRegistry(
                 &runtimeState->animationPanel,
                 animation.filePath,
-                animation.associatedLayerPaths);
+                animation.associatedLayerPaths,
+                &roots);
         }
         runtimeState->animationPanel.animationRegistryInitialized = true;
     } else {
         runtimeState->animationPanel.animationRegistryInitialized = false;
-        RefreshAnimationFileList(&runtimeState->animationPanel, AnimationDirectory(*runtimeState));
+        const auto roots = WorkspaceRoots(*runtimeState);
+        RefreshAnimationFileList(&runtimeState->animationPanel, AnimationDirectory(*runtimeState), &roots);
     }
     ValidateProjectAnimationVelocityLinks(document, runtimeState);
     runtimeState->animationPanel.renamingFileIndex.reset();
@@ -26880,9 +26954,15 @@ std::filesystem::path ProjectRenderSetupDirectory(
     return projectDirectory / "render_setups";
 }
 
+std::filesystem::path LocalRenderSetupHistoryIndexPath(
+    const PreviewRuntimeState& runtimeState) {
+    return runtimeState.waterSurfaceCacheRoot / "render_setups" /
+           "history.json";
+}
+
 std::filesystem::path ProjectRenderSetupHistoryIndexPath(
     const PreviewRuntimeState& runtimeState) {
-    return ProjectRenderSetupDirectory(runtimeState) / "history.json";
+    return LocalRenderSetupHistoryIndexPath(runtimeState);
 }
 
 std::string RenderSetupProjectIdentity(
@@ -26993,10 +27073,12 @@ void RestoreAnimationRuntimeState(
             panel,
             edit.filePath);
         if (!registryIndex.has_value()) {
+            const auto roots = WorkspaceRoots(*runtimeState);
             AddAnimationFileToRegistry(
                 &panel,
                 edit.filePath,
-                edit.path.associatedLayerPaths);
+                edit.path.associatedLayerPaths,
+                &roots);
             registryIndex = FindAnimationRegistryIndex(
                 panel,
                 edit.filePath);
@@ -27547,6 +27629,8 @@ void EnsureAnimationAssociationStorage(AnimationPanelState* panelState) {
     panelState->availableFileAssociatedLayerPaths.resize(panelState->availableFiles.size());
     panelState->availableFileLoadedPaths.resize(panelState->availableFiles.size());
     panelState->availableFileEditedPaths.resize(panelState->availableFiles.size());
+    panelState->availableFileDiskRevisions.resize(
+        panelState->availableFiles.size());
     panelState->availableFileLoopEditPairIds.resize(panelState->availableFiles.size());
     panelState->availableFileDirtyFlags.resize(panelState->availableFiles.size(), false);
 }
@@ -27641,12 +27725,16 @@ void SortAnimationRegistry(AnimationPanelState* panelState) {
     std::vector<std::vector<std::filesystem::path>> sortedAssociations;
     std::vector<std::optional<AnimationPath>> sortedLoadedPaths;
     std::vector<std::optional<AnimationPath>> sortedEditedPaths;
+    std::vector<std::optional<
+        invisible_places::app::workspace::FileRevision>>
+        sortedDiskRevisions;
     std::vector<std::string> sortedLoopEditPairIds;
     std::vector<bool> sortedDirtyFlags;
     sortedFiles.reserve(panelState->availableFiles.size());
     sortedAssociations.reserve(panelState->availableFiles.size());
     sortedLoadedPaths.reserve(panelState->availableFiles.size());
     sortedEditedPaths.reserve(panelState->availableFiles.size());
+    sortedDiskRevisions.reserve(panelState->availableFiles.size());
     sortedLoopEditPairIds.reserve(panelState->availableFiles.size());
     sortedDirtyFlags.reserve(panelState->availableFiles.size());
     for (const auto index : indices) {
@@ -27660,6 +27748,8 @@ void SortAnimationRegistry(AnimationPanelState* panelState) {
         sortedAssociations.push_back(std::move(associations));
         sortedLoadedPaths.push_back(panelState->availableFileLoadedPaths[index]);
         sortedEditedPaths.push_back(panelState->availableFileEditedPaths[index]);
+        sortedDiskRevisions.push_back(
+            panelState->availableFileDiskRevisions[index]);
         sortedLoopEditPairIds.push_back(panelState->availableFileLoopEditPairIds[index]);
         sortedDirtyFlags.push_back(panelState->availableFileDirtyFlags[index]);
     }
@@ -27667,6 +27757,8 @@ void SortAnimationRegistry(AnimationPanelState* panelState) {
     panelState->availableFileAssociatedLayerPaths = std::move(sortedAssociations);
     panelState->availableFileLoadedPaths = std::move(sortedLoadedPaths);
     panelState->availableFileEditedPaths = std::move(sortedEditedPaths);
+    panelState->availableFileDiskRevisions =
+        std::move(sortedDiskRevisions);
     panelState->availableFileLoopEditPairIds = std::move(sortedLoopEditPairIds);
     panelState->availableFileDirtyFlags = std::move(sortedDirtyFlags);
 }
@@ -27674,7 +27766,8 @@ void SortAnimationRegistry(AnimationPanelState* panelState) {
 bool AddAnimationFileToRegistry(
     AnimationPanelState* panelState,
     const std::filesystem::path& filePath,
-    std::vector<std::filesystem::path> associatedLayerPaths) {
+    std::vector<std::filesystem::path> associatedLayerPaths,
+    const invisible_places::app::workspace::Roots* roots) {
     if (panelState == nullptr || filePath.empty()) {
         return false;
     }
@@ -27687,12 +27780,20 @@ bool AddAnimationFileToRegistry(
     auto maybeLoadedPath = invisible_places::serialization::LoadAnimationPath(filePath, &loadError);
     if (maybeLoadedPath.has_value()) {
         loadedPath = std::move(maybeLoadedPath.value());
+        if (roots != nullptr) {
+            invisible_places::app::workspace::ResolveAnimationPath(
+                &loadedPath.value(),
+                *roots);
+        }
         loadedPath->associatedLayerPaths = associatedLayerPaths;
     }
     panelState->availableFiles.push_back(filePath.lexically_normal());
     panelState->availableFileAssociatedLayerPaths.push_back(std::move(associatedLayerPaths));
     panelState->availableFileLoadedPaths.push_back(std::move(loadedPath));
     panelState->availableFileEditedPaths.push_back(std::nullopt);
+    panelState->availableFileDiskRevisions.push_back(
+        invisible_places::app::workspace::ReadFileRevision(
+            filePath));
     panelState->availableFileLoopEditPairIds.emplace_back();
     panelState->availableFileDirtyFlags.push_back(false);
     SortAnimationRegistry(panelState);
@@ -27700,11 +27801,17 @@ bool AddAnimationFileToRegistry(
 }
 
 std::vector<std::filesystem::path> LoadAnimationFileAssociations(
-    const std::filesystem::path& filePath) {
+    const std::filesystem::path& filePath,
+    const invisible_places::app::workspace::Roots* roots) {
     std::string errorMessage;
     auto animationPath = invisible_places::serialization::LoadAnimationPath(filePath, &errorMessage);
     if (!animationPath.has_value()) {
         return {};
+    }
+    if (roots != nullptr) {
+        invisible_places::app::workspace::ResolveAnimationPath(
+            &animationPath.value(),
+            *roots);
     }
     auto associations = animationPath->associatedLayerPaths;
     NormalizeAssociatedLayerPaths(&associations);
@@ -27713,7 +27820,8 @@ std::vector<std::filesystem::path> LoadAnimationFileAssociations(
 
 std::size_t ImportAnimationFilesFromDirectory(
     AnimationPanelState* panelState,
-    const std::filesystem::path& animationDirectory) {
+    const std::filesystem::path& animationDirectory,
+    const invisible_places::app::workspace::Roots* roots) {
     if (panelState == nullptr) {
         return 0U;
     }
@@ -27745,7 +27853,8 @@ std::size_t ImportAnimationFilesFromDirectory(
         if (AddAnimationFileToRegistry(
                 panelState,
                 filePath,
-                LoadAnimationFileAssociations(filePath))) {
+                LoadAnimationFileAssociations(filePath, roots),
+                roots)) {
             ++importedCount;
         }
     }
@@ -27770,6 +27879,11 @@ void RemoveAnimationFileFromRegistry(AnimationPanelState* panelState, std::size_
     if (fileIndex < panelState->availableFileEditedPaths.size()) {
         panelState->availableFileEditedPaths.erase(
             panelState->availableFileEditedPaths.begin() + static_cast<std::ptrdiff_t>(fileIndex));
+    }
+    if (fileIndex < panelState->availableFileDiskRevisions.size()) {
+        panelState->availableFileDiskRevisions.erase(
+            panelState->availableFileDiskRevisions.begin() +
+            static_cast<std::ptrdiff_t>(fileIndex));
     }
     if (fileIndex < panelState->availableFileLoopEditPairIds.size()) {
         panelState->availableFileLoopEditPairIds.erase(
@@ -27835,7 +27949,10 @@ void SetAnimationFileSelectedForExport(
     }
 }
 
-void RefreshAnimationFileList(AnimationPanelState* panelState, const std::filesystem::path& animationDirectory) {
+void RefreshAnimationFileList(
+    AnimationPanelState* panelState,
+    const std::filesystem::path& animationDirectory,
+    const invisible_places::app::workspace::Roots* roots) {
     if (panelState == nullptr) {
         return;
     }
@@ -27852,9 +27969,10 @@ void RefreshAnimationFileList(AnimationPanelState* panelState, const std::filesy
         panelState->availableFileAssociatedLayerPaths.clear();
         panelState->availableFileLoadedPaths.clear();
         panelState->availableFileEditedPaths.clear();
+        panelState->availableFileDiskRevisions.clear();
         panelState->availableFileLoopEditPairIds.clear();
         panelState->availableFileDirtyFlags.clear();
-        ImportAnimationFilesFromDirectory(panelState, animationDirectory);
+        ImportAnimationFilesFromDirectory(panelState, animationDirectory, roots);
         panelState->animationRegistryInitialized = true;
     }
     SortAnimationRegistry(panelState);
@@ -28885,6 +29003,62 @@ bool SaveAnimationPathToFile(
         &path == &runtimeState->animationPanel.currentPath.value();
     const std::filesystem::path previousCurrentPath{
         runtimeState->animationPanel.currentFilePath};
+    auto& panel = runtimeState->animationPanel;
+    EnsureAnimationAssociationStorage(&panel);
+    if (const auto existingIndex = FindAnimationRegistryIndex(
+            panel,
+            outputPath);
+        existingIndex.has_value()) {
+        const auto& revision =
+            panel.availableFileDiskRevisions[existingIndex.value()];
+        if (!revision.has_value() ||
+            !invisible_places::app::workspace::FileRevisionMatches(
+                outputPath,
+                revision.value())) {
+            runtimeState->errorMessage =
+                outputPath.filename().string() +
+                " changed on the other computer. Reload it before overwriting, or save under a new name.";
+            runtimeState->statusMessage.clear();
+            return false;
+        }
+    } else {
+        const auto revision =
+            invisible_places::app::workspace::ReadFileRevision(outputPath);
+        if (!revision.has_value()) {
+            runtimeState->errorMessage =
+                "The animation target could not be verified. Choose a different name.";
+            runtimeState->statusMessage.clear();
+            return false;
+        }
+        if (revision->exists) {
+            std::string loadError;
+            auto existing = invisible_places::serialization::LoadAnimationPath(
+                outputPath,
+                &loadError);
+            if (!existing.has_value()) {
+                runtimeState->errorMessage =
+                    "The animation target already exists and could not be loaded safely. Choose a different name.";
+                runtimeState->statusMessage.clear();
+                return false;
+            }
+            invisible_places::app::workspace::ResolveAnimationPath(
+                &existing.value(),
+                WorkspaceRoots(*runtimeState));
+            AddAnimationFileToRegistry(
+                &panel,
+                outputPath,
+                existing->associatedLayerPaths,
+                nullptr);
+            EnsureAnimationAssociationStorage(&panel);
+            if (const auto existingIndex = FindAnimationRegistryIndex(
+                    panel,
+                    outputPath);
+                existingIndex.has_value()) {
+                panel.availableFileDiskRevisions[existingIndex.value()] =
+                    revision;
+            }
+        }
+    }
     auto pathToSave = path;
     EnsureAnimationDefaultLiveViewWindowSize(
         &pathToSave,
@@ -28914,19 +29088,24 @@ bool SaveAnimationPathToFile(
         runtimeState->animationPanel.currentPath = pathToSave;
     }
 
+    auto serializedPath = pathToSave;
+    invisible_places::app::workspace::MakeAnimationPathPortable(
+        &serializedPath,
+        WorkspaceRoots(*runtimeState));
     std::string errorMessage;
-    if (!invisible_places::serialization::SaveAnimationPath(pathToSave, outputPath, &errorMessage)) {
+    if (!invisible_places::serialization::SaveAnimationPath(serializedPath, outputPath, &errorMessage)) {
         runtimeState->errorMessage = errorMessage.empty() ? "Failed to save animation path." : errorMessage;
         runtimeState->statusMessage.clear();
         return false;
     }
 
     AddAnimationFileToRegistry(
-        &runtimeState->animationPanel,
+        &panel,
         outputPath,
-        pathToSave.associatedLayerPaths);
+        pathToSave.associatedLayerPaths,
+        nullptr);
     SetAnimationRegistryAssociations(
-        &runtimeState->animationPanel,
+        &panel,
         outputPath,
         pathToSave.associatedLayerPaths);
     runtimeState->animationPanel.animationRegistryInitialized = true;
@@ -28972,8 +29151,13 @@ bool SaveAnimationPathToFile(
         runtimeState->animationPanel.availableFileEditedPaths[registryIndex.value()].reset();
         runtimeState->animationPanel.availableFileLoopEditPairIds[registryIndex.value()].clear();
         runtimeState->animationPanel.availableFileDirtyFlags[registryIndex.value()] = false;
+        runtimeState->animationPanel.availableFileDiskRevisions[
+            registryIndex.value()] =
+            invisible_places::app::workspace::ReadFileRevision(
+                outputPath);
     }
-    RefreshAnimationFileList(&runtimeState->animationPanel, AnimationDirectory(*runtimeState));
+    const auto roots = WorkspaceRoots(*runtimeState);
+    RefreshAnimationFileList(&runtimeState->animationPanel, AnimationDirectory(*runtimeState), &roots);
     runtimeState->statusMessage = "Saved animation path: " + outputPath.filename().string() + ".";
     runtimeState->errorMessage.clear();
     return true;
@@ -29110,10 +29294,12 @@ bool LoadAnimationPathVariant(
     auto& panel = runtimeState->animationPanel;
     auto registryIndex = FindAnimationRegistryIndex(panel, inputPath);
     if (!registryIndex.has_value()) {
+        const auto roots = WorkspaceRoots(*runtimeState);
         AddAnimationFileToRegistry(
             &panel,
             inputPath,
-            LoadAnimationFileAssociations(inputPath));
+            LoadAnimationFileAssociations(inputPath, &roots),
+            &roots);
         registryIndex = FindAnimationRegistryIndex(panel, inputPath);
     }
     if (!registryIndex.has_value()) {
@@ -29136,6 +29322,9 @@ bool LoadAnimationPathVariant(
             runtimeState->statusMessage.clear();
             return false;
         }
+        invisible_places::app::workspace::ResolveAnimationPath(
+            &savedPath.value(),
+            WorkspaceRoots(*runtimeState));
         CanonicalizeAssociatedLayerPathsForSceneGroups(
             *runtimeState,
             &savedPath->associatedLayerPaths);
@@ -29149,6 +29338,9 @@ bool LoadAnimationPathVariant(
     auto loadedPath = loadingEdited
                           ? panel.availableFileEditedPaths[index].value()
                           : panel.availableFileLoadedPaths[index].value();
+    invisible_places::app::workspace::ResolveAnimationPath(
+        &loadedPath,
+        WorkspaceRoots(*runtimeState));
     const auto requestedTakeId =
         invisible_places::timing::NormalizeTimingTakeId(
             loadedPath.selectedTimingTakeId);
@@ -29168,6 +29360,8 @@ bool LoadAnimationPathVariant(
 
     const bool currentUsesEdited = loadingEdited || repairedMissingTimingTake;
     panel.currentPath = std::move(loadedPath);
+    panel.availableFileDiskRevisions[index] =
+        invisible_places::app::workspace::ReadFileRevision(inputPath);
     panel.currentPathUsesEdited = currentUsesEdited;
     panel.selectedFileUsesEdited = currentUsesEdited;
     panel.selectedFileIndex = index;
@@ -29498,6 +29692,18 @@ bool CommitAnimationFileRename(PreviewRuntimeState* runtimeState, std::size_t fi
         return false;
     }
 
+    EnsureAnimationAssociationStorage(&panel);
+    if (!panel.availableFileDiskRevisions[fileIndex].has_value() ||
+        !invisible_places::app::workspace::FileRevisionMatches(
+            oldPath,
+            panel.availableFileDiskRevisions[fileIndex].value())) {
+        runtimeState->errorMessage =
+            oldPath.filename().string() +
+            " changed on the other computer. Reload it before renaming.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
     std::error_code existsError;
     if (std::filesystem::exists(newPath, existsError)) {
         runtimeState->errorMessage = "An animation named " + newPath.filename().string() + " already exists.";
@@ -29529,7 +29735,11 @@ bool CommitAnimationFileRename(PreviewRuntimeState* runtimeState, std::size_t fi
         panel.currentPath->associatedLayerPaths = AnimationRegistryAssociationPaths(panel, fileIndex);
         panel.currentFilePath = newPath.string();
         panel.draftAnimationName = cleanName;
-        if (invisible_places::serialization::SaveAnimationPath(panel.currentPath.value(), newPath, &saveError)) {
+        auto serializedPath = panel.currentPath.value();
+        invisible_places::app::workspace::MakeAnimationPathPortable(
+            &serializedPath,
+            WorkspaceRoots(*runtimeState));
+        if (invisible_places::serialization::SaveAnimationPath(serializedPath, newPath, &saveError)) {
             panel.dirty = false;
         } else {
             savedInternalName = false;
@@ -29537,8 +29747,14 @@ bool CommitAnimationFileRename(PreviewRuntimeState* runtimeState, std::size_t fi
     } else {
         auto renamedPath = invisible_places::serialization::LoadAnimationPath(newPath, &saveError);
         if (renamedPath.has_value()) {
+            invisible_places::app::workspace::ResolveAnimationPath(
+                &renamedPath.value(),
+                WorkspaceRoots(*runtimeState));
             renamedPath->name = cleanName;
             renamedPath->associatedLayerPaths = AnimationRegistryAssociationPaths(panel, fileIndex);
+            invisible_places::app::workspace::MakeAnimationPathPortable(
+                &renamedPath.value(),
+                WorkspaceRoots(*runtimeState));
             savedInternalName =
                 invisible_places::serialization::SaveAnimationPath(renamedPath.value(), newPath, &saveError);
         } else {
@@ -29552,12 +29768,17 @@ bool CommitAnimationFileRename(PreviewRuntimeState* runtimeState, std::size_t fi
             newPath,
             &reloadError);
         if (savedPath.has_value()) {
+            invisible_places::app::workspace::ResolveAnimationPath(
+                &savedPath.value(),
+                WorkspaceRoots(*runtimeState));
             EnsureAnimationAssociationStorage(&panel);
             panel.availableFileLoadedPaths[fileIndex] =
                 std::move(savedPath.value());
             panel.availableFileEditedPaths[fileIndex].reset();
             panel.availableFileLoopEditPairIds[fileIndex].clear();
             panel.availableFileDirtyFlags[fileIndex] = false;
+            panel.availableFileDiskRevisions[fileIndex] =
+                invisible_places::app::workspace::ReadFileRevision(newPath);
         }
         if (renamedCurrent) {
             panel.currentPathUsesEdited = false;
@@ -29565,7 +29786,8 @@ bool CommitAnimationFileRename(PreviewRuntimeState* runtimeState, std::size_t fi
         }
     }
 
-    RefreshAnimationFileList(&panel, AnimationDirectory(*runtimeState));
+    const auto roots = WorkspaceRoots(*runtimeState);
+    RefreshAnimationFileList(&panel, AnimationDirectory(*runtimeState), &roots);
     panel.selectedFileIndex = FindAnimationFileIndex(panel.availableFiles, newPath);
     panel.selectedFileUsesEdited = false;
     runtimeState->statusMessage = "Renamed animation to " + newPath.filename().string() + ".";
@@ -34364,6 +34586,9 @@ bool QueueCurrentAnimationBackgroundRender(
     const auto setupPath = jobDirectory / "render.iprender.json";
     const auto statusPath = BackgroundRenderStatusPath(setupPath);
     std::string saveError;
+    invisible_places::app::workspace::MakeRenderSetupDocumentPortable(
+        &setup,
+        WorkspaceRoots(*runtimeState));
     if (!invisible_places::serialization::SaveRenderSetupDocument(
             setup,
             setupPath,
@@ -34857,8 +35082,12 @@ bool CreateOfflineRenderSetupSidecar(
             document.outputPath,
             document.createdUtc);
     std::string saveError;
+    auto serializedDocument = document;
+    invisible_places::app::workspace::MakeRenderSetupDocumentPortable(
+        &serializedDocument,
+        WorkspaceRoots(*runtimeState));
     if (!invisible_places::serialization::SaveRenderSetupDocument(
-            document,
+            serializedDocument,
             setupPath,
             &saveError)) {
         if (errorMessage != nullptr) {
@@ -37662,6 +37891,11 @@ void StartSelectedQuickMp4Batch(
         } else {
             loadedAnimation =
                 invisible_places::serialization::LoadAnimationPath(animationFilePath, &loadErrorMessage);
+            if (loadedAnimation.has_value()) {
+                invisible_places::app::workspace::ResolveAnimationPath(
+                    &loadedAnimation.value(),
+                    WorkspaceRoots(*runtimeState));
+            }
         }
 
         if (!loadedAnimation.has_value()) {
@@ -39213,7 +39447,7 @@ int RunBackgroundRenderWorker(
         options.setupPath);
 
     std::string errorMessage;
-    const auto setup = invisible_places::serialization::
+    auto setup = invisible_places::serialization::
         LoadRenderSetupDocument(options.setupPath, &errorMessage);
     if (!setup.has_value()) {
         WriteBackgroundWorkerStatus(
@@ -39225,6 +39459,9 @@ int RunBackgroundRenderWorker(
             options.setupPath);
         return 2;
     }
+    invisible_places::app::workspace::ResolveRenderSetupDocument(
+        &setup.value(),
+        WorkspaceRoots(*runtimeState));
     if (!InstallBackgroundWorkerRenderSetup(
             runtimeState,
             viewport,
@@ -49620,6 +49857,9 @@ bool ValidateLoopSmoothingMovableLinks(
                 }
                 return false;
             }
+            invisible_places::app::workspace::ResolveAnimationPath(
+                &diskPath.value(),
+                WorkspaceRoots(runtimeState));
             path = &diskPath.value();
         }
         for (std::size_t keyIndex = 0U; keyIndex < path->keys.size(); ++keyIndex) {
@@ -59776,13 +60016,15 @@ void DrawAnimationSection(
     }
     ImGui::EndDisabled();
     if (ImGui::Button("Refresh")) {
-        RefreshAnimationFileList(&panel, AnimationDirectory(*runtimeState));
+        const auto roots = WorkspaceRoots(*runtimeState);
+        RefreshAnimationFileList(&panel, AnimationDirectory(*runtimeState), &roots);
     }
     ImGui::SameLine();
     if (ImGui::Button("Import Files")) {
-        const auto importedCount = ImportAnimationFilesFromDirectory(&panel, AnimationDirectory(*runtimeState));
+        const auto roots = WorkspaceRoots(*runtimeState);
+        const auto importedCount = ImportAnimationFilesFromDirectory(&panel, AnimationDirectory(*runtimeState), &roots);
         panel.animationRegistryInitialized = true;
-        RefreshAnimationFileList(&panel, AnimationDirectory(*runtimeState));
+        RefreshAnimationFileList(&panel, AnimationDirectory(*runtimeState), &roots);
         runtimeState->statusMessage =
             importedCount == 0U
                 ? "No new animation files were found to import."
@@ -59967,7 +60209,8 @@ void DrawAnimationSection(
                 panel.selectedKeyIndex.reset();
             }
             RemoveAnimationFileFromRegistry(&panel, selectedAnimationIndex);
-            RefreshAnimationFileList(&panel, AnimationDirectory(*runtimeState));
+            const auto roots = WorkspaceRoots(*runtimeState);
+            RefreshAnimationFileList(&panel, AnimationDirectory(*runtimeState), &roots);
             runtimeState->statusMessage =
                 "Removed animation from project: " + removedPath.filename().string() + ".";
             runtimeState->errorMessage.clear();
@@ -64858,6 +65101,123 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
         return false;
     }
 
+    struct ExpectedSaveRevision {
+        std::filesystem::path targetPath;
+        invisible_places::app::workspace::FileRevision revision;
+    };
+    std::vector<ExpectedSaveRevision> expectedRevisions;
+    expectedRevisions.reserve(
+        animations.size() + (projectItem != nullptr ? 1U : 0U));
+    const auto rememberExpected = [&](
+                                      const std::filesystem::path& target,
+                                      const std::optional<
+                                          invisible_places::app::workspace::
+                                              FileRevision>& tracked,
+                                      std::string_view description) {
+        std::string revisionError;
+        auto expected = tracked;
+        if (!expected.has_value()) {
+            expected = invisible_places::app::workspace::ReadFileRevision(
+                target,
+                &revisionError);
+        }
+        if (!expected.has_value()) {
+            saveError = revisionError.empty()
+                            ? "Could not verify " +
+                                  std::string{description} + "."
+                            : revisionError;
+            return false;
+        }
+        expectedRevisions.push_back({
+            .targetPath = target,
+            .revision = expected.value(),
+        });
+        return true;
+    };
+    for (const auto& animation : animations) {
+        std::optional<invisible_places::app::workspace::FileRevision>
+            tracked;
+        if (animation.sourceRegistryIndex.has_value() &&
+            PathsLexicallyEqual(
+                animation.sourcePath,
+                animation.targetPath)) {
+            EnsureAnimationAssociationStorage(
+                &runtimeState->animationPanel);
+            tracked = runtimeState->animationPanel
+                          .availableFileDiskRevisions[
+                              animation.sourceRegistryIndex.value()];
+        } else {
+            // Save As is valid only while the chosen filename remains
+            // absent. Capturing the missing revision now also catches a
+            // competing machine creating that file before commit.
+            tracked = invisible_places::app::workspace::FileRevision{};
+        }
+        if (animation.sourceRegistryIndex.has_value() &&
+            PathsLexicallyEqual(
+                animation.sourcePath,
+                animation.targetPath) &&
+            !tracked.has_value()) {
+            dialog.errorMessage =
+                "The saved revision for " +
+                animation.targetPath.filename().string() +
+                " is unknown. Reload it before overwriting, or use Save As.";
+            return false;
+        }
+        if (!rememberExpected(
+                animation.targetPath,
+                tracked,
+                "animation " + animation.targetPath.filename().string())) {
+            dialog.errorMessage = saveError;
+            return false;
+        }
+    }
+    if (projectItem != nullptr) {
+        std::optional<invisible_places::app::workspace::FileRevision>
+            tracked;
+        if (PathsLexicallyEqual(
+                runtimeState->persistence.trackedProjectFilePath,
+                projectItem->targetPath)) {
+            tracked = runtimeState->persistence.trackedProjectRevision;
+        } else {
+            const auto current = invisible_places::app::workspace::
+                ReadFileRevision(projectItem->targetPath, &saveError);
+            if (!current.has_value()) {
+                dialog.errorMessage = saveError;
+                return false;
+            }
+            if (current->exists) {
+                dialog.errorMessage =
+                    "Load " + projectItem->targetPath.filename().string() +
+                    " before overwriting it; it may have changed on the other computer.";
+                return false;
+            }
+            tracked = current;
+        }
+        if (!rememberExpected(
+                projectItem->targetPath,
+                tracked,
+                "project " + projectItem->targetPath.filename().string())) {
+            dialog.errorMessage = saveError;
+            return false;
+        }
+    }
+    for (const auto& expected : expectedRevisions) {
+        std::string revisionError;
+        if (!invisible_places::app::workspace::FileRevisionMatches(
+                expected.targetPath,
+                expected.revision,
+                &revisionError)) {
+            dialog.errorMessage =
+                revisionError.empty()
+                    ? expected.targetPath.filename().string() +
+                          " changed in OneDrive after it was loaded. "
+                          "Your edits are still open; reload the changed file "
+                          "or use Save As instead of overwriting it."
+                    : revisionError;
+            return false;
+        }
+    }
+
     if (dialog.animationPairSaveAs) {
         if (projectItem == nullptr) {
             dialog.errorMessage =
@@ -65119,8 +65479,12 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
             .stagedPath = animation.targetPath.string() +
                           transactionSuffix + ".pending",
         });
+        auto serializedAnimation = animation.path;
+        invisible_places::app::workspace::MakeAnimationPathPortable(
+            &serializedAnimation,
+            WorkspaceRoots(*runtimeState));
         if (!invisible_places::serialization::SaveAnimationPath(
-                animation.path,
+                serializedAnimation,
                 replacements.back().stagedPath,
                 &saveError)) {
             CleanupStagedDocumentFiles(
@@ -65138,8 +65502,12 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
             .stagedPath = projectItem->targetPath.string() +
                           transactionSuffix + ".pending",
         });
+        auto serializedProject = project.value();
+        invisible_places::app::workspace::MakeProjectDocumentPortable(
+            &serializedProject,
+            WorkspaceRoots(*runtimeState));
         if (!invisible_places::serialization::SaveProjectDocument(
-                project.value(),
+                serializedProject,
                 replacements.back().stagedPath,
                 &saveError)) {
             CleanupStagedDocumentFiles(
@@ -65150,6 +65518,46 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
                     : std::move(saveError);
             return false;
         }
+    }
+    // Recheck after serialization, immediately before the atomic local
+    // replacements. If OneDrive delivered a peer's update while staging,
+    // keep every outgoing document in machine-local conflict recovery and
+    // leave the shared canonical files untouched.
+    for (const auto& expected : expectedRevisions) {
+        std::string revisionError;
+        if (invisible_places::app::workspace::FileRevisionMatches(
+                expected.targetPath,
+                expected.revision,
+                &revisionError)) {
+            continue;
+        }
+        std::vector<std::filesystem::path> recoveries;
+        std::string recoveryError;
+        for (const auto& replacement : replacements) {
+            std::filesystem::path recovery;
+            if (invisible_places::app::workspace::
+                    PreserveConflictRecoveryCopy(
+                        replacement.stagedPath,
+                        replacement.targetPath,
+                        runtimeState->localSavedRoot,
+                        &recovery,
+                        &recoveryError)) {
+                recoveries.push_back(std::move(recovery));
+            }
+        }
+        CleanupStagedDocumentFiles(std::span{replacements});
+        dialog.errorMessage =
+            expected.targetPath.filename().string() +
+            " changed on the other computer while this save was being "
+            "prepared. The shared files were not overwritten.";
+        if (!recoveries.empty()) {
+            dialog.errorMessage +=
+                " Local recovery: " +
+                recoveries.front().parent_path().string() + ".";
+        } else if (!recoveryError.empty()) {
+            dialog.errorMessage += " " + recoveryError;
+        }
+        return false;
     }
     if (!invisible_places::serialization::
             CommitStagedDocumentReplacements(
@@ -65194,7 +65602,8 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
         AddAnimationFileToRegistry(
             &panel,
             animation.targetPath,
-            animation.path.associatedLayerPaths);
+            animation.path.associatedLayerPaths,
+            nullptr);
         SetAnimationRegistryAssociations(
             &panel,
             animation.targetPath,
@@ -65211,6 +65620,9 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
             panel.availableFileAssociatedLayerPaths[targetIndex.value()] =
                 animation.path.associatedLayerPaths;
             panel.availableFileDirtyFlags[targetIndex.value()] = false;
+            panel.availableFileDiskRevisions[targetIndex.value()] =
+                invisible_places::app::workspace::ReadFileRevision(
+                    animation.targetPath);
             panel.brokenVelocityLinkPathKeys.erase(
                 NormalizePathKey(animation.targetPath));
         }
@@ -65283,6 +65695,11 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
         panel.reciprocalPanTimingTakeCloneIds.erase(pairId);
     }
     if (project.has_value()) {
+        runtimeState->persistence.trackedProjectFilePath =
+            projectItem->targetPath.lexically_normal();
+        runtimeState->persistence.trackedProjectRevision =
+            invisible_places::app::workspace::ReadFileRevision(
+                projectItem->targetPath);
         panel.projectVelocityLinksBaselineDirty = false;
         panel.projectVelocityLinksDirty = std::any_of(
             panel.availableFileLoopEditPairIds.begin(),
@@ -65606,6 +66023,69 @@ void DrawProjectSection(
         return;
     }
 
+    ImGui::Text("Shared Source Data");
+    ImGui::TextWrapped(
+        "%s",
+        runtimeState->persistence.sharedDataPath.c_str());
+    ImGui::TextDisabled(
+        "Only source PLY/mesh files live here. Caches, builds, validation, renders, and render history stay local.");
+    if (invisible_places::app::workspace::
+            SharedDataEnvironmentOverrideActive()) {
+        ImGui::TextDisabled(
+            "Configured by INVISIBLE_PLACES_SHARED_DATA_DIR.");
+    } else {
+        InputTextString(
+            "Source Data Folder",
+            &runtimeState->persistence.sharedDataEditBuffer);
+        if (ImGui::Button("Use Source Data On Next Launch")) {
+            std::string markerError;
+            if (invisible_places::app::workspace::WriteSharedDataMarker(
+                    Application::DefaultDataDirectory(),
+                    runtimeState->persistence.sharedDataEditBuffer,
+                    &markerError)) {
+                runtimeState->statusMessage =
+                    "Saved the source-data choice. Restart Invisible Places after the OneDrive files are fully downloaded.";
+                runtimeState->errorMessage.clear();
+            } else {
+                runtimeState->errorMessage = std::move(markerError);
+                runtimeState->statusMessage.clear();
+            }
+        }
+    }
+    ImGui::Spacing();
+
+    ImGui::Text("Authored Workspace");
+    ImGui::TextWrapped(
+        "%s",
+        runtimeState->persistence.authoredWorkspacePath.c_str());
+    ImGui::TextDisabled(
+        "Project, animations, named render setups, presets, and water sources live here. Renders and caches stay local.");
+    if (invisible_places::app::workspace::WorkspaceEnvironmentOverrideActive()) {
+        ImGui::TextDisabled(
+            "Configured by INVISIBLE_PLACES_WORKSPACE_DIR.");
+    } else {
+        InputTextString(
+            "Workspace Folder",
+            &runtimeState->persistence.authoredWorkspaceEditBuffer);
+        if (ImGui::Button("Use On Next Launch")) {
+            std::string markerError;
+            if (invisible_places::app::workspace::WriteWorkspaceMarker(
+                    Application::DefaultDataDirectory(),
+                    runtimeState->persistence.authoredWorkspaceEditBuffer,
+                    &markerError)) {
+                runtimeState->statusMessage =
+                    "Saved the local workspace choice. Restart Invisible Places after saving or discarding the current session.";
+                runtimeState->errorMessage.clear();
+            } else {
+                runtimeState->errorMessage = std::move(markerError);
+                runtimeState->statusMessage.clear();
+            }
+        }
+    }
+    ImGui::TextWrapped(
+        "Saves verify the exact project/animation bytes loaded by this session. If OneDrive delivers a newer copy, overwrite is refused and your local edit remains open. OneDrive cannot provide a true distributed lock while either machine is offline, so do not intentionally edit the same project or animation file simultaneously; use separate Save As names for parallel work.");
+    ImGui::Spacing();
+
     InputTextString("Project File", &runtimeState->persistence.projectFilePath);
     if (ImGui::Button("Save Project")) {
         RequestSaveChangesDialog(
@@ -65626,6 +66106,14 @@ void DrawProjectSection(
             if (runtimeState->errorMessage.empty() && runtimeState->statusMessage.empty()) {
                 runtimeState->statusMessage = "Project load was cancelled.";
             }
+        } else {
+            const auto loadedPath = std::filesystem::path{
+                runtimeState->persistence.projectFilePath};
+            runtimeState->persistence.trackedProjectFilePath =
+                loadedPath.lexically_normal();
+            runtimeState->persistence.trackedProjectRevision =
+                invisible_places::app::workspace::ReadFileRevision(
+                    loadedPath);
         }
     }
 
@@ -76888,7 +77376,8 @@ void DrawExportBatchSection(
     }
     auto& panel = runtimeState->animationPanel;
     if (!panel.animationRegistryInitialized) {
-        RefreshAnimationFileList(&panel, AnimationDirectory(*runtimeState));
+        const auto roots = WorkspaceRoots(*runtimeState);
+        RefreshAnimationFileList(&panel, AnimationDirectory(*runtimeState), &roots);
     }
     if (panel.availableFiles.empty()) {
         ImGui::TextDisabled("No saved animations are registered.");
@@ -76987,7 +77476,7 @@ bool SaveNamedRenderSetupCopy(
     }
 
     std::string errorMessage;
-    const auto document =
+    auto document =
         invisible_places::serialization::LoadRenderSetupDocument(
             sourcePath,
             &errorMessage);
@@ -76999,8 +77488,15 @@ bool SaveNamedRenderSetupCopy(
         runtimeState->statusMessage.clear();
         return false;
     }
+    invisible_places::app::workspace::ResolveRenderSetupDocument(
+        &document.value(),
+        WorkspaceRoots(*runtimeState));
+    auto portableDocument = document.value();
+    invisible_places::app::workspace::MakeRenderSetupDocumentPortable(
+        &portableDocument,
+        WorkspaceRoots(*runtimeState));
     if (!invisible_places::serialization::SaveRenderSetupDocument(
-            document.value(),
+            portableDocument,
             destination,
             &errorMessage)) {
         runtimeState->errorMessage =
@@ -77179,7 +77675,7 @@ void DrawRenderSetupHistorySection(
     ImGui::BeginDisabled(!canLoad);
     if (ImGui::Button("Load onto Active Animation")) {
         std::string errorMessage;
-        const auto setup =
+        auto setup =
             invisible_places::serialization::LoadRenderSetupDocument(
                 selectedEntry->setupPath,
                 &errorMessage);
@@ -77190,6 +77686,9 @@ void DrawRenderSetupHistorySection(
                     : errorMessage;
             runtimeState->statusMessage.clear();
         } else {
+            invisible_places::app::workspace::ResolveRenderSetupDocument(
+                &setup.value(),
+                WorkspaceRoots(*runtimeState));
             ActivateRenderSetupOverride(
                 runtimeState,
                 viewport,
@@ -84077,13 +84576,9 @@ TimingColouriseHistogramIdentityForScene(
         invisible_places::timing::
             BuildTimingColouriseHistogramFingerprint(
                 input);
-    const auto root =
-        !scene->sourceFolder.empty()
-            ? scene->sourceFolder
-            : std::filesystem::path{
-                  runtimeState->persistence
-                      .projectFilePath}
-                  .parent_path();
+    const auto root = runtimeState->waterSurfaceCacheRoot /
+                      ".invisible_places" / "cache" /
+                      "colourise" / scene->sceneGroupName;
     return std::pair{
         fingerprint,
         invisible_places::timing::
@@ -93911,7 +94406,8 @@ int RunRendererFrameTimingScene3Smoke(
     }
 
     const auto exhibitionPath =
-        DefaultAnimationDirectory(assetCatalog.dataRoot) / "Exhibition.ipanim.json";
+        DefaultAnimationDirectory(Application::DefaultDataDirectory()) /
+        "Exhibition.ipanim.json";
     if (!LoadAnimationPathFromFile(runtimeState, exhibitionPath)) {
         failures.emplace_back(
             "Could not load Exhibition moving-camera path: " +
@@ -94154,7 +94650,8 @@ int RunRendererFrameTimingProjectSmoke(
     }
 
     const auto projectPath = options.projectPath.empty()
-        ? assetCatalog.dataRoot.parent_path() / "Saved" /
+        ? std::filesystem::path{
+              runtimeState->persistence.authoredWorkspacePath} /
               "ExhibitionFinal_project.json"
         : options.projectPath;
     std::string loadError;
@@ -95468,9 +95965,10 @@ int RunDynamicMeshFlowGroundSmoke(
     }
 
     const auto projectPath = scene3Visual
-        ? assetCatalog.dataRoot.parent_path() / "Saved" /
+        ? std::filesystem::path{
+              runtimeState->persistence.authoredWorkspacePath} /
               "ExhibitionFinal_project.json"
-        : assetCatalog.dataRoot.parent_path() / "Saved" / "validation" /
+        : runtimeState->localSavedRoot / "validation" /
               "SampleSceneValidation_project.json";
     std::string loadError;
     const auto project =
@@ -95595,7 +96093,7 @@ int RunDynamicMeshFlowGroundSmoke(
         runtimeState->errorMessage.clear();
 
         const auto exhibitionPath =
-            DefaultAnimationDirectory(assetCatalog.dataRoot) /
+            DefaultAnimationDirectory(Application::DefaultDataDirectory()) /
             "Exhibition.ipanim.json";
         if (!LoadAnimationPathFromFile(runtimeState, exhibitionPath)) {
             report.Fail(
@@ -98167,7 +98665,8 @@ int RunScene3PatchBoundarySmoke(
         return finish();
     }
     const auto projectPath = options.projectPath.empty()
-        ? assetCatalog.dataRoot.parent_path() / "Saved" /
+        ? std::filesystem::path{
+              runtimeState->persistence.authoredWorkspacePath} /
               "ExhibitionFinal_project.json"
         : options.projectPath;
     std::string loadError;
@@ -98706,7 +99205,7 @@ int RunAnimationExportFrameSmoke(
     }
 
     const auto projectPath =
-        assetCatalog.dataRoot.parent_path() / "Saved" / "validation" /
+        runtimeState->localSavedRoot / "validation" /
         "SampleSceneValidation_project.json";
     std::string loadError;
     const auto project =
@@ -98723,7 +99222,7 @@ int RunAnimationExportFrameSmoke(
         return finish();
     }
     const auto sampleAnimationPath =
-        assetCatalog.dataRoot.parent_path() / "tests" / "fixtures" /
+        Application::DefaultDataDirectory().parent_path() / "tests" / "fixtures" /
         "sample_scene_validation.ipanim.json";
     if (!LoadAnimationPathFromFile(runtimeState, sampleAnimationPath)) {
         report.Fail("SampleScene validation animation could not be loaded: " +
@@ -103562,11 +104061,15 @@ std::filesystem::path Application::DefaultDataDirectory() {
 
 int Application::Run(ApplicationRunOptions options) const {
     const auto runtimeConfig = platform::PrepareVulkanRuntime();
-    const auto assetCatalog = io::DiscoverAssets(dataRoot_);
+    const auto assetCatalog = DiscoverApplicationAssets(dataRoot_);
     const auto sceneCatalog = scene::SceneCatalog::FromDiscoveredAssets(assetCatalog);
 
     std::cout << "Invisible Places preview/export app" << std::endl;
     std::cout << "Data root: " << dataRoot_.string() << std::endl << std::endl;
+    std::cout << "Authored workspace: "
+              << invisible_places::app::workspace::ResolveAuthoredWorkspaceDirectory(
+                     Application::DefaultDataDirectory()).string()
+              << std::endl << std::endl;
     std::cout << platform::DescribeVulkanRuntime(runtimeConfig) << std::endl << std::endl;
     std::cout << assetCatalog.Summary();
     std::cout << std::endl;
@@ -103622,6 +104125,11 @@ int Application::Run(ApplicationRunOptions options) const {
 
     PreviewRuntimeState runtimeState;
     runtimeState.dataRoot = dataRoot_;
+    runtimeState.localSavedRoot =
+        invisible_places::app::workspace::LocalSavedDirectory(
+            Application::DefaultDataDirectory());
+    invisible_places::io::SetPointCloudFieldCacheRoot(
+        runtimeState.localSavedRoot / ".invisible_places" / "cache");
     runtimeState.liveViewWindowSize = window.Size();
     runtimeState.water.defaultPointVisualStyle = MakeDefaultWaterPointVisualStyle();
     runtimeState.sessions = BuildSessions(assetCatalog);
@@ -103630,12 +104138,25 @@ int Application::Run(ApplicationRunOptions options) const {
         &runtimeState.sessions);
     runtimeState.sidePanel.pinned = false;
     runtimeState.sidePanel.panelWidth = 410.0F;
-    runtimeState.persistence.projectFilePath = DefaultProjectFilePath(dataRoot_).string();
-    runtimeState.waterSurfaceCacheRoot = DefaultProjectFilePath(dataRoot_).parent_path();
-    runtimeState.persistence.pointStylePresetPath = DefaultPointStylePresetPath(dataRoot_).string();
-    runtimeState.persistence.animationDirectoryPath = DefaultAnimationDirectory(dataRoot_).string();
-    runtimeState.renderSettings.outputDirectory = DefaultRenderOutputDirectory(dataRoot_).string();
-    RefreshAnimationFileList(&runtimeState.animationPanel, AnimationDirectory(runtimeState));
+    runtimeState.persistence.authoredWorkspacePath =
+        invisible_places::app::workspace::ResolveAuthoredWorkspaceDirectory(
+            Application::DefaultDataDirectory()).string();
+    runtimeState.persistence.authoredWorkspaceEditBuffer =
+        runtimeState.persistence.authoredWorkspacePath;
+    runtimeState.persistence.sharedDataPath = dataRoot_.string();
+    runtimeState.persistence.sharedDataEditBuffer =
+        runtimeState.persistence.sharedDataPath;
+    runtimeState.persistence.projectFilePath =
+        DefaultProjectFilePath(Application::DefaultDataDirectory()).string();
+    runtimeState.waterSurfaceCacheRoot = runtimeState.localSavedRoot;
+    runtimeState.persistence.pointStylePresetPath =
+        DefaultPointStylePresetPath(Application::DefaultDataDirectory()).string();
+    runtimeState.persistence.animationDirectoryPath =
+        DefaultAnimationDirectory(Application::DefaultDataDirectory()).string();
+    runtimeState.renderSettings.outputDirectory =
+        DefaultRenderOutputDirectory(Application::DefaultDataDirectory()).string();
+    const auto roots = WorkspaceRoots(runtimeState);
+    RefreshAnimationFileList(&runtimeState.animationPanel, AnimationDirectory(runtimeState), &roots);
     if (!backgroundWorker) {
         runtimeState.backgroundRender.latestStatusPath =
             LatestBackgroundRenderStatusPath(runtimeState);
@@ -103905,6 +104426,11 @@ int Application::Run(ApplicationRunOptions options) const {
             if (startupProject.has_value() &&
                 ApplyProjectDocumentToRuntime(startupProject.value(), &runtimeState, &viewport.value())) {
                 loadedStartupProject = true;
+                runtimeState.persistence.trackedProjectFilePath =
+                    startupProjectPath.lexically_normal();
+                runtimeState.persistence.trackedProjectRevision =
+                    invisible_places::app::workspace::ReadFileRevision(
+                        startupProjectPath);
                 runtimeState.statusMessage =
                     "Loaded default project from " + startupProjectPath.string() + ".";
             } else {

@@ -24,7 +24,7 @@ enum class ScenePointCloudRole : std::uint8_t {
 
 inline constexpr std::size_t kScenePointCloudRoleCount = 3U;
 inline constexpr PointSpacingMicrometres kRockAnalysisSpacingMicrometres = 1'000U;
-inline constexpr PointSpacingMicrometres kSandAnalysisSpacingMicrometres = 2'000U;
+inline constexpr PointSpacingMicrometres kSandAnalysisSpacingMicrometres = 1'000U;
 inline constexpr PointSpacingMicrometres kVegetationAnalysisSpacingMicrometres = 1'000U;
 
 [[nodiscard]] std::optional<ScenePointCloudRole> ParseScenePointCloudRole(std::string_view role);

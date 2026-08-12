@@ -51,6 +51,11 @@ struct PointCloudFieldCacheManifest {
 [[nodiscard]] std::filesystem::path PointCloudFieldCacheDirectory(
     const std::filesystem::path& sourcePath);
 
+// The desktop app points this at its machine-local Saved tree when source
+// PLY files live in a synchronized folder. Empty restores the historical
+// beside-source location used by standalone tools and tests.
+void SetPointCloudFieldCacheRoot(const std::filesystem::path& cacheRoot);
+
 // Manifest loaded from cacheDirectory when present, parseable, schema-
 // compatible, and matching the current source file identity.
 [[nodiscard]] std::optional<PointCloudFieldCacheManifest>

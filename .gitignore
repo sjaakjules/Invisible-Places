@@ -48,6 +48,8 @@ install_manifest.txt
 
 # Local project runtime state
 imgui.ini
+.invisible_places-workspace
+.invisible_places-data-workspace
 
 # Local-only CMake presets
 CMakeUserPresets.json
