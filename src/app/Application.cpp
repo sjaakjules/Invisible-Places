@@ -61,6 +61,7 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -96,9 +97,21 @@
 #include <vector>
 
 #if defined(__APPLE__)
+#include <fcntl.h>
+#include <mach-o/dyld.h>
 #include <pthread/qos.h>
+#include <spawn.h>
+#include <sys/resource.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <sys/sysctl.h>
 #elif defined(__linux__)
+#include <fcntl.h>
+#include <spawn.h>
+#include <sys/resource.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -108,6 +121,10 @@
 #include <glm/vec2.hpp>
 #include <glm/vec3.hpp>
 #include <glm/vec4.hpp>
+
+#if defined(__APPLE__) || defined(__linux__)
+extern char** environ;
+#endif
 
 namespace invisible_places::app {
 
@@ -387,6 +404,15 @@ struct RenderSetupHistoryRuntimeState {
     bool saveAsEditing = false;
     bool focusSaveAsName = false;
     std::string saveAsName;
+};
+
+struct BackgroundRenderRuntimeState {
+    std::filesystem::path latestStatusPath;
+    std::optional<
+        invisible_places::serialization::BackgroundRenderStatusDocument>
+        latestStatus;
+    std::chrono::steady_clock::time_point nextRefreshAt{};
+    std::string readError;
 };
 
 enum class SaveChangesRequest {
@@ -3010,6 +3036,7 @@ struct AnimationReciprocalPanSmoothingJobRuntime {
 };
 
 struct PreviewRuntimeState {
+    std::filesystem::path dataRoot;
     std::vector<PreviewLayerSession> sessions;
     std::uint64_t nextPointCloudContentGeneration = 1U;
     std::vector<ScenePointCloudRuntime> pointCloudScenes;
@@ -3058,6 +3085,7 @@ struct PreviewRuntimeState {
     PersistenceState persistence{};
     SaveChangesDialogState saveChanges{};
     RenderSetupHistoryRuntimeState renderSetupHistory{};
+    BackgroundRenderRuntimeState backgroundRender{};
     std::optional<ActiveRenderSetupOverride> activeRenderSetupOverride;
     // Set by the first Export Current click when finest-density sources still
     // need loading. The same immutable payload resumes automatically once
@@ -30222,6 +30250,248 @@ struct ResolvedRenderSetupSnapshot {
     RenderSetupDocument document{};
 };
 
+std::filesystem::path CurrentExecutablePath() {
+#if defined(__APPLE__)
+    std::uint32_t size = 0U;
+    if (_NSGetExecutablePath(nullptr, &size) != -1 || size == 0U) {
+        return {};
+    }
+    std::string buffer(size, '\0');
+    if (_NSGetExecutablePath(buffer.data(), &size) != 0) {
+        return {};
+    }
+    buffer.resize(std::char_traits<char>::length(buffer.c_str()));
+    std::error_code canonicalError;
+    const auto canonical = std::filesystem::weakly_canonical(
+        std::filesystem::path{buffer},
+        canonicalError);
+    return canonicalError ? std::filesystem::path{buffer} : canonical;
+#elif defined(__linux__)
+    std::array<char, 4096U> buffer{};
+    const auto count = ::readlink(
+        "/proc/self/exe",
+        buffer.data(),
+        buffer.size() - 1U);
+    if (count <= 0) {
+        return {};
+    }
+    return std::filesystem::path{
+        std::string{buffer.data(), static_cast<std::size_t>(count)}};
+#else
+    return {};
+#endif
+}
+
+std::filesystem::path BackgroundRenderJobDirectory(
+    const PreviewRuntimeState& runtimeState,
+    std::string_view createdUtc) {
+    auto timestamp = std::string{createdUtc};
+    timestamp.erase(
+        std::remove_if(
+            timestamp.begin(),
+            timestamp.end(),
+            [](char character) {
+                return std::isalnum(
+                           static_cast<unsigned char>(character)) == 0;
+            }),
+        timestamp.end());
+    if (timestamp.empty()) {
+        timestamp = "render";
+    }
+    const auto root = ProjectRenderSetupDirectory(runtimeState) /
+                      "background_jobs";
+    for (std::uint32_t suffix = 1U; suffix < 10000U; ++suffix) {
+        const auto leaf = suffix == 1U
+                              ? timestamp
+                              : timestamp + "_" +
+                                    (suffix < 10U ? "0" : "") +
+                                    std::to_string(suffix);
+        const auto candidate = root / leaf;
+        std::error_code existenceError;
+        if (!std::filesystem::exists(candidate, existenceError)) {
+            return candidate;
+        }
+    }
+    return root /
+           (timestamp + "_" + std::to_string(
+                std::chrono::steady_clock::now()
+                    .time_since_epoch()
+                    .count()));
+}
+
+std::filesystem::path BackgroundRenderStatusPath(
+    const std::filesystem::path& setupPath) {
+    return setupPath.parent_path() / "status.json";
+}
+
+std::filesystem::path LatestBackgroundRenderStatusPath(
+    const PreviewRuntimeState& runtimeState) {
+    const auto root = ProjectRenderSetupDirectory(runtimeState) /
+                      "background_jobs";
+    std::error_code directoryError;
+    if (!std::filesystem::is_directory(root, directoryError)) {
+        return {};
+    }
+    std::filesystem::path latest;
+    std::filesystem::file_time_type latestTime{};
+    for (std::filesystem::directory_iterator it{root, directoryError}, end;
+         !directoryError && it != end;
+         it.increment(directoryError)) {
+        if (!it->is_directory()) {
+            continue;
+        }
+        const auto candidate = it->path() / "status.json";
+        std::error_code metadataError;
+        if (!std::filesystem::is_regular_file(candidate, metadataError)) {
+            continue;
+        }
+        const auto modified = std::filesystem::last_write_time(
+            candidate,
+            metadataError);
+        if (metadataError) {
+            continue;
+        }
+        if (latest.empty() || modified > latestTime) {
+            latest = candidate;
+            latestTime = modified;
+        }
+    }
+    return latest;
+}
+
+bool BackgroundRenderStatusTerminal(std::string_view state) {
+    return state == "completed" || state == "failed" ||
+           state == "cancelled";
+}
+
+void RefreshBackgroundRenderStatus(
+    PreviewRuntimeState* runtimeState,
+    bool force = false) {
+    if (runtimeState == nullptr ||
+        runtimeState->backgroundRender.latestStatusPath.empty()) {
+        return;
+    }
+    auto& background = runtimeState->backgroundRender;
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && now < background.nextRefreshAt) {
+        return;
+    }
+    background.nextRefreshAt = now + std::chrono::milliseconds{500};
+    std::string errorMessage;
+    const auto status = invisible_places::serialization::
+        LoadBackgroundRenderStatusDocument(
+            background.latestStatusPath,
+            &errorMessage);
+    if (status.has_value()) {
+        background.latestStatus = status.value();
+        background.readError.clear();
+    } else {
+        background.readError = std::move(errorMessage);
+    }
+}
+
+bool SpawnDetachedBackgroundRenderWorker(
+    const std::filesystem::path& executablePath,
+    const std::filesystem::path& dataRoot,
+    const std::filesystem::path& setupPath,
+    const std::filesystem::path& statusPath,
+    std::uint32_t throttleMilliseconds,
+    std::int64_t* processId,
+    std::string* errorMessage) {
+#if defined(__APPLE__) || defined(__linux__)
+    if (executablePath.empty()) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "The current executable path could not be resolved.";
+        }
+        return false;
+    }
+    std::vector<std::string> arguments{
+        executablePath.string(),
+        dataRoot.string(),
+        "--background-render-worker",
+        setupPath.string(),
+        "--background-render-status",
+        statusPath.string(),
+        "--background-render-throttle-ms",
+        std::to_string(throttleMilliseconds),
+    };
+    std::vector<char*> argv;
+    argv.reserve(arguments.size() + 1U);
+    for (auto& argument : arguments) {
+        argv.push_back(argument.data());
+    }
+    argv.push_back(nullptr);
+
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Could not initialize the detached worker launch.";
+        }
+        return false;
+    }
+    const auto logPath = setupPath.parent_path() / "worker.log";
+    const int addStdout = posix_spawn_file_actions_addopen(
+        &actions,
+        STDOUT_FILENO,
+        logPath.c_str(),
+        O_WRONLY | O_CREAT | O_APPEND,
+        0644);
+    const int addStderr = posix_spawn_file_actions_adddup2(
+        &actions,
+        STDOUT_FILENO,
+        STDERR_FILENO);
+    if (addStdout != 0 || addStderr != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        if (errorMessage != nullptr) {
+            *errorMessage = "Could not attach the detached worker log.";
+        }
+        return false;
+    }
+
+    pid_t pid = 0;
+    const int result = posix_spawn(
+        &pid,
+        executablePath.c_str(),
+        &actions,
+        nullptr,
+        argv.data(),
+        ::environ);
+    posix_spawn_file_actions_destroy(&actions);
+    if (result != 0) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "Could not launch the detached render worker (error " +
+                std::to_string(result) + ").";
+        }
+        return false;
+    }
+    if (processId != nullptr) {
+        *processId = static_cast<std::int64_t>(pid);
+    }
+    std::thread{[pid]() {
+        int status = 0;
+        while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+        }
+    }}.detach();
+    if (errorMessage != nullptr) {
+        errorMessage->clear();
+    }
+    return true;
+#else
+    (void)executablePath;
+    (void)dataRoot;
+    (void)setupPath;
+    (void)statusPath;
+    (void)throttleMilliseconds;
+    (void)processId;
+    if (errorMessage != nullptr) {
+        *errorMessage =
+            "Detached background rendering is not implemented on this platform.";
+    }
+    return false;
+#endif
+}
+
 std::optional<ResolvedRenderSetupSnapshot>
 ResolveCurrentRenderSetupSnapshot(
     PreviewRuntimeState* runtimeState,
@@ -32278,6 +32548,32 @@ void ConfigureAnimationExportWriterQueue(
     (void)combinedColorAlphaMattePipe;
 }
 
+void ConfigureBackgroundAnimationExportWriterQueue(
+    const std::shared_ptr<AnimationExportWriterState>& writerState,
+    invisible_places::output::AnimationExportMode mode,
+    const RenderJobSettings& settings,
+    bool externalAlphaMatte) {
+    if (writerState == nullptr) {
+        return;
+    }
+    const auto physicalBytes = SystemPhysicalMemoryBytes();
+    const auto processMemory = ReadCurrentProcessMemorySnapshot();
+    std::scoped_lock lock(writerState->mutex);
+    writerState->maxQueuedFrames = 1U;
+    writerState->queueMemoryBudgetBytes =
+        EstimateVideoExportWorkingSetBytes(
+            mode,
+            settings,
+            externalAlphaMatte,
+            1U);
+    writerState->memoryStopThresholdBytes =
+        physicalBytes > 0U
+            ? (physicalBytes * kHardExportMemoryStopPercent) / 100ULL
+            : 0U;
+    writerState->peakProcessMemoryBytes =
+        ProcessMemoryPressureBytes(processMemory);
+}
+
 bool CheckVideoExportMemoryBudget(
     PreviewRuntimeState* runtimeState,
     invisible_places::output::AnimationExportMode mode,
@@ -33807,6 +34103,333 @@ ResolveCurrentRenderSetupSnapshot(
         errorMessage->clear();
     }
     return snapshot;
+}
+
+bool QueueCurrentAnimationBackgroundRender(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+    if (runtimeState->offlineRenderJob.active ||
+        runtimeState->pendingCurrentRenderSnapshot != nullptr ||
+        runtimeState->pendingFramePreviewSnapshot != nullptr) {
+        runtimeState->errorMessage =
+            "Wait for the current preview or foreground export to finish.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    std::string snapshotError;
+    auto snapshot = ResolveCurrentRenderSetupSnapshot(
+        runtimeState,
+        &snapshotError);
+    if (!snapshot.has_value()) {
+        runtimeState->errorMessage = std::move(snapshotError);
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    auto setup = std::move(snapshot->document);
+    setup.status = RenderSetupStatus::Rendering;
+    setup.createdUtc =
+        invisible_places::serialization::CurrentUtcTimestamp();
+    setup.completedUtc.clear();
+    setup.failureMessage.clear();
+    setup.outputPath.clear();
+    setup.logPath.clear();
+
+    const auto jobDirectory = BackgroundRenderJobDirectory(
+        *runtimeState,
+        setup.createdUtc);
+    std::error_code createError;
+    std::filesystem::create_directories(jobDirectory, createError);
+    if (createError) {
+        runtimeState->errorMessage =
+            "Could not create the background render package: " +
+            createError.message() + ".";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    const auto setupPath = jobDirectory / "render.iprender.json";
+    const auto statusPath = BackgroundRenderStatusPath(setupPath);
+    std::string saveError;
+    if (!invisible_places::serialization::SaveRenderSetupDocument(
+            setup,
+            setupPath,
+            &saveError)) {
+        runtimeState->errorMessage =
+            "Could not freeze the background render package: " +
+            saveError;
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    invisible_places::serialization::BackgroundRenderStatusDocument status;
+    status.state = "queued";
+    status.message = "Waiting for the detached render worker to start.";
+    status.setupPath = setupPath;
+    status.totalFrames = static_cast<std::uint32_t>(
+        invisible_places::output::AnimationRenderSequenceFrameCount(
+            setup.animation,
+            RenderSettingsFromExportPreset(
+                setup.exportPreset,
+                runtimeState->renderSettings.outputDirectory)));
+    status.updatedUtc =
+        invisible_places::serialization::CurrentUtcTimestamp();
+    if (!invisible_places::serialization::
+            SaveBackgroundRenderStatusDocument(
+                status,
+                statusPath,
+                &saveError)) {
+        runtimeState->errorMessage =
+            "Could not create the background render status: " +
+            saveError;
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    std::int64_t processId = 0;
+    if (!SpawnDetachedBackgroundRenderWorker(
+            CurrentExecutablePath(),
+            runtimeState->dataRoot,
+            setupPath,
+            statusPath,
+            24U,
+            &processId,
+            &saveError)) {
+        status.state = "failed";
+        status.message = saveError;
+        status.updatedUtc =
+            invisible_places::serialization::CurrentUtcTimestamp();
+        invisible_places::serialization::
+            SaveBackgroundRenderStatusDocument(
+                status,
+                statusPath,
+                nullptr);
+        runtimeState->errorMessage = std::move(saveError);
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    status.state = "starting";
+    status.message =
+        "Detached low-priority render worker is starting.";
+    status.processId = processId;
+    status.updatedUtc =
+        invisible_places::serialization::CurrentUtcTimestamp();
+    invisible_places::serialization::SaveBackgroundRenderStatusDocument(
+        status,
+        statusPath,
+        nullptr);
+    runtimeState->backgroundRender.latestStatusPath = statusPath;
+    runtimeState->backgroundRender.latestStatus = status;
+    runtimeState->backgroundRender.readError.clear();
+    runtimeState->statusMessage =
+        "Queued background render in " + jobDirectory.string() +
+        ". You can close or rebuild the editor; the worker will continue.";
+    runtimeState->errorMessage.clear();
+    return true;
+}
+
+ResolvedRenderSetupSnapshot BuildBackgroundWorkerSnapshot(
+    const RenderSetupDocument& setup) {
+    ResolvedRenderSetupSnapshot snapshot;
+    snapshot.animationPath = setup.animation;
+    snapshot.normalizedPosition = 0.0F;
+    snapshot.framePreviewUsesPlaybackDensity = false;
+    snapshot.exportPreset = setup.exportPreset;
+    snapshot.visual.visualName = setup.visualName;
+    snapshot.timing.takeId =
+        invisible_places::timing::NormalizeTimingTakeId(
+            setup.timingTakeId);
+    snapshot.timing.sceneGroupName = setup.sceneGroupName;
+    snapshot.timing.state = setup.timingState;
+    snapshot.timing.state.takeId = snapshot.timing.takeId;
+    snapshot.timing.state.sceneGroupName = setup.sceneGroupName;
+    snapshot.animationPath.selectedTimingTakeId =
+        snapshot.timing.takeId;
+    snapshot.document = setup;
+    return snapshot;
+}
+
+std::optional<std::size_t> BackgroundWorkerVisualSessionIndex(
+    const PreviewRuntimeState& runtimeState,
+    std::string_view sceneGroupName) {
+    const auto scene = std::find_if(
+        runtimeState.pointCloudScenes.begin(),
+        runtimeState.pointCloudScenes.end(),
+        [&](const ScenePointCloudRuntime& candidate) {
+            return candidate.sceneGroupName == sceneGroupName;
+        });
+    if (scene == runtimeState.pointCloudScenes.end()) {
+        return std::nullopt;
+    }
+    for (const auto index : SceneFullDensityExportSessionIndices(*scene)) {
+        if (index.has_value() &&
+            index.value() < runtimeState.sessions.size()) {
+            return index;
+        }
+    }
+    return std::nullopt;
+}
+
+bool InstallBackgroundWorkerRenderSetup(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    const RenderSetupDocument& setup,
+    std::string* errorMessage) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Background worker runtime is unavailable.";
+        }
+        return false;
+    }
+    const auto validationLayers = BuildRenderSetupValidationLayers(
+        *runtimeState,
+        setup.sceneGroupName);
+    if (validationLayers.empty()) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "Recorded scene '" + setup.sceneGroupName +
+                "' has no full-density point-cloud sources in this data root.";
+        }
+        return false;
+    }
+    for (const auto& fingerprint : setup.sourceFingerprints) {
+        const auto session = std::find_if(
+            runtimeState->sessions.begin(),
+            runtimeState->sessions.end(),
+            [&](const PreviewLayerSession& candidate) {
+                return candidate.sceneGroupName == setup.sceneGroupName &&
+                       NormalizeSceneRoleName(candidate.sceneRole) ==
+                           NormalizeSceneRoleName(fingerprint.sceneRole) &&
+                       PathsReferToSameLocation(
+                           candidate.sourcePath,
+                           fingerprint.sourcePath);
+            });
+        if (session == runtimeState->sessions.end()) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "Recorded " + fingerprint.sceneRole + " source is missing: " +
+                    fingerprint.sourcePath.filename().string() + ".";
+            }
+            return false;
+        }
+        std::error_code metadataError;
+        const auto size = std::filesystem::file_size(
+            fingerprint.sourcePath,
+            metadataError);
+        if (metadataError || size != fingerprint.fileSize) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "Recorded source size changed before background rendering: " +
+                    fingerprint.sourcePath.filename().string() + ".";
+            }
+            return false;
+        }
+        metadataError.clear();
+        const auto modified = std::filesystem::last_write_time(
+            fingerprint.sourcePath,
+            metadataError);
+        if (metadataError ||
+            static_cast<std::int64_t>(
+                modified.time_since_epoch().count()) !=
+                fingerprint.modificationTimeTicks) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "Recorded source changed before background rendering: " +
+                    fingerprint.sourcePath.filename().string() + ".";
+            }
+            return false;
+        }
+    }
+
+    auto project = BuildProjectForRenderSetupOverride(
+        *runtimeState,
+        setup);
+    project.activeAnimationPath.clear();
+    project.lastAnimationPath.clear();
+    if (!ApplyProjectDocumentToRuntime(project, runtimeState, viewport)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = runtimeState->errorMessage.empty()
+                                ? "The recorded project scene could not be loaded."
+                                : runtimeState->errorMessage;
+        }
+        return false;
+    }
+    auto& panel = runtimeState->animationPanel;
+    panel.currentPath = setup.animation;
+    panel.currentPath->selectedTimingTakeId =
+        invisible_places::timing::NormalizeTimingTakeId(
+            setup.timingTakeId);
+    panel.currentFilePath = setup.originalAnimationPath.string();
+    panel.currentPathUsesEdited = setup.animationModified;
+    panel.selectedFileUsesEdited = setup.animationModified;
+    panel.selectedKeyIndex = panel.currentPath->keys.empty()
+                                 ? std::nullopt
+                                 : std::optional<std::size_t>{0U};
+    panel.scrubAmount = 0.0F;
+    panel.dirty = setup.animationModified;
+    panel.exportMode = setup.exportPreset.mode;
+    panel.selectedExportPresetName = setup.exportPreset.name;
+    panel.editedExportPreset = setup.exportPreset;
+    runtimeState->renderSettings = RenderSettingsFromExportPreset(
+        setup.exportPreset,
+        runtimeState->renderSettings.outputDirectory);
+    runtimeState->projectSettings.gaussianSplatFootprintBoost =
+        setup.renderer.gaussianSplatFootprintBoost;
+    runtimeState->projectSettings.pointCloudRendererMode =
+        setup.renderer.pointCloudRendererMode;
+    runtimeState->projectSettings.backgroundColor =
+        setup.renderer.backgroundColor;
+    runtimeState->projectSettings.eyeDomeLightingEnabled =
+        setup.renderer.eyeDomeLightingEnabled;
+    runtimeState->projectSettings.eyeDomeLightingThickness =
+        setup.renderer.eyeDomeLightingThickness;
+    runtimeState->projectSettings.proResAlphaPreviewEnabled =
+        setup.renderer.proResAlphaPreviewEnabled;
+    runtimeState->water.selectedAnimationTrailProfileName =
+        setup.selectedWaterAnimationTrailProfileName;
+    EnsureWaterAnimationTrailProfiles(&runtimeState->water);
+    ApplyAnimationEvaluation(
+        runtimeState,
+        panel.currentPath.value(),
+        0.0F,
+        false);
+    StartQueuedLayerLoadIfIdle(runtimeState);
+
+    auto snapshot = BuildBackgroundWorkerSnapshot(setup);
+    const auto visualSession = BackgroundWorkerVisualSessionIndex(
+        *runtimeState,
+        setup.sceneGroupName);
+    if (!visualSession.has_value()) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The recorded scene has no full-density point-cloud source.";
+        }
+        return false;
+    }
+    snapshot.visual.visualOverride.sessionIndex =
+        visualSession.value();
+    snapshot.visual.visualOverride.style = setup.livePointVisual;
+    snapshot.provenance = CollectRenderSetupProvenance(
+        *runtimeState,
+        &snapshot.animationPath,
+        setup.sceneGroupName,
+        setup.timingTakeId,
+        setup.timingState.waterFeatureTimingRuns,
+        setup.timingState.colouriseEffects,
+        setup.visualName,
+        setup.animationModified);
+    snapshot.provenance.timingTakeName = setup.timingTakeName;
+    snapshot.provenance.exportPresetName = setup.exportPreset.name;
+    snapshot.provenance.editedSettingLabels = setup.editedSettingLabels;
+    runtimeState->pendingCurrentRenderSnapshot =
+        std::make_shared<ResolvedRenderSetupSnapshot>(
+            std::move(snapshot));
+    runtimeState->errorMessage.clear();
+    if (errorMessage != nullptr) {
+        errorMessage->clear();
+    }
+    return true;
 }
 
 RenderSetupDocument BuildQueuedQuickMp4RenderSetupDocument(
@@ -37426,7 +38049,8 @@ void StartStillCameraExportJob(
 
 void StartAnimationExportJob(
     PreviewRuntimeState* runtimeState,
-    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    bool lowResourceBackgroundWorker = false) {
     if (runtimeState == nullptr || runtimeState->offlineRenderJob.active) {
         return;
     }
@@ -37680,6 +38304,13 @@ void StartAnimationExportJob(
         settings,
         outputOptions.externalAlphaMatte,
         outputOptions.combinedColorAlphaMattePipe);
+    if (lowResourceBackgroundWorker) {
+        ConfigureBackgroundAnimationExportWriterQueue(
+            writerState,
+            activeMode,
+            settings,
+            outputOptions.externalAlphaMatte);
+    }
     const auto logDirectory = !pngStackDirectory.empty()
                                   ? pngStackDirectory.parent_path()
                                   : videoOutputPath.empty()
@@ -38296,6 +38927,232 @@ void ProcessOfflineRenderJobStep(
         SignalAnimationExportWriterFinish(&job);
         return;
     }
+}
+
+std::int64_t CurrentProcessId() {
+#if defined(__APPLE__) || defined(__linux__)
+    return static_cast<std::int64_t>(::getpid());
+#else
+    return 0;
+#endif
+}
+
+void ApplyBackgroundWorkerProcessPriority() {
+#if defined(__APPLE__) || defined(__linux__)
+    (void)::setpriority(PRIO_PROCESS, 0, 10);
+#endif
+#if defined(__APPLE__)
+    (void)pthread_set_qos_class_self_np(
+        QOS_CLASS_UTILITY,
+        0);
+#endif
+}
+
+void WriteBackgroundWorkerStatus(
+    const std::filesystem::path& statusPath,
+    std::string state,
+    std::string message,
+    const std::filesystem::path& setupPath,
+    const OfflineRenderJobState* job = nullptr) {
+    if (statusPath.empty()) {
+        return;
+    }
+    invisible_places::serialization::BackgroundRenderStatusDocument status;
+    status.state = std::move(state);
+    status.message = std::move(message);
+    status.setupPath = setupPath;
+    status.processId = CurrentProcessId();
+    status.updatedUtc =
+        invisible_places::serialization::CurrentUtcTimestamp();
+    if (job != nullptr) {
+        status.outputPath = OfflineRenderSetupOutputPath(*job);
+        status.logPath = job->exportLog.path;
+        status.renderedFrames = std::min<std::uint32_t>(
+            job->currentFrame,
+            static_cast<std::uint32_t>(job->frames.size()));
+        status.totalFrames =
+            static_cast<std::uint32_t>(job->frames.size());
+        status.progress = ExportRenderProgressFraction(*job);
+    }
+    std::string ignoredError;
+    invisible_places::serialization::SaveBackgroundRenderStatusDocument(
+        status,
+        statusPath,
+        &ignoredError);
+}
+
+int RunBackgroundRenderWorker(
+    const BackgroundRenderWorkerOptions& options,
+    platform::Window* window,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    PreviewRuntimeState* runtimeState) {
+    if (window == nullptr || viewport == nullptr || runtimeState == nullptr ||
+        options.setupPath.empty()) {
+        return 2;
+    }
+    const auto statusPath = options.statusPath.empty()
+                                ? BackgroundRenderStatusPath(options.setupPath)
+                                : options.statusPath;
+    ApplyBackgroundWorkerProcessPriority();
+    WriteBackgroundWorkerStatus(
+        statusPath,
+        "preparing",
+        "Loading the immutable render package and full-density scene.",
+        options.setupPath);
+
+    std::string errorMessage;
+    const auto setup = invisible_places::serialization::
+        LoadRenderSetupDocument(options.setupPath, &errorMessage);
+    if (!setup.has_value()) {
+        WriteBackgroundWorkerStatus(
+            statusPath,
+            "failed",
+            errorMessage.empty()
+                ? "The immutable render package could not be loaded."
+                : errorMessage,
+            options.setupPath);
+        return 2;
+    }
+    if (!InstallBackgroundWorkerRenderSetup(
+            runtimeState,
+            viewport,
+            setup.value(),
+            &errorMessage)) {
+        WriteBackgroundWorkerStatus(
+            statusPath,
+            "failed",
+            errorMessage,
+            options.setupPath);
+        return 2;
+    }
+
+    const auto startedAt = std::chrono::steady_clock::now();
+    const auto preparationDeadline = startedAt + std::chrono::hours{2};
+    auto nextStatusAt = startedAt;
+    bool exportStarted = false;
+    bool observedActiveExport = false;
+    std::filesystem::path lastOutputPath;
+    std::filesystem::path lastLogPath;
+    std::uint32_t lastRenderedFrames = 0U;
+    std::uint32_t lastTotalFrames = 0U;
+    while (std::chrono::steady_clock::now() < preparationDeadline) {
+        window->PollEvents();
+        PollPendingLayerLoad(runtimeState, viewport);
+        PollTimingColouriseHistogram(runtimeState);
+        EnsureWaterSurfaceCacheReady(runtimeState, viewport);
+        PollWaterRegionPointPreviewJob(runtimeState);
+        PollWaterFlowTrailBuildJob(runtimeState, viewport);
+        PollWaterRippleLiveEffectRefresh(runtimeState, viewport);
+        CommitReadySceneDisplaySwitches(runtimeState, viewport);
+        StartQueuedLayerLoadIfIdle(runtimeState);
+
+        if (!runtimeState->offlineRenderJob.active && !exportStarted &&
+            !runtimeState->pendingLoad.has_value() &&
+            !runtimeState->pendingScalarFieldLoad.has_value() &&
+            runtimeState->persistence.queuedLoads.empty()) {
+            StartAnimationExportJob(runtimeState, viewport, true);
+            if (runtimeState->offlineRenderJob.active) {
+                exportStarted = true;
+                observedActiveExport = true;
+            } else if (!runtimeState->errorMessage.empty()) {
+                WriteBackgroundWorkerStatus(
+                    statusPath,
+                    "failed",
+                    runtimeState->errorMessage,
+                    options.setupPath);
+                return 2;
+            }
+        }
+
+        if (runtimeState->offlineRenderJob.active) {
+            observedActiveExport = true;
+            lastOutputPath = OfflineRenderSetupOutputPath(
+                runtimeState->offlineRenderJob);
+            lastLogPath = runtimeState->offlineRenderJob.exportLog.path;
+            lastRenderedFrames = std::min<std::uint32_t>(
+                runtimeState->offlineRenderJob.currentFrame,
+                static_cast<std::uint32_t>(
+                    runtimeState->offlineRenderJob.frames.size()));
+            lastTotalFrames = static_cast<std::uint32_t>(
+                runtimeState->offlineRenderJob.frames.size());
+            viewport->BeginUiFrame();
+            viewport->SetDiagnosticsEnabled(false);
+            viewport->SetSceneCachingEnabled(false);
+            viewport->SetLiveSceneRenderingEnabled(false);
+            viewport->SetLiveRainSimulationEnabled(false);
+            viewport->DrawFrame();
+            ProcessOfflineRenderJobStep(runtimeState, viewport);
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= nextStatusAt) {
+            nextStatusAt = now + std::chrono::milliseconds{500};
+            WriteBackgroundWorkerStatus(
+                statusPath,
+                runtimeState->offlineRenderJob.active
+                    ? "rendering"
+                    : exportStarted ? "finishing" : "preparing",
+                runtimeState->statusMessage.empty()
+                    ? "Preparing full-density render resources."
+                    : runtimeState->statusMessage,
+                options.setupPath,
+                runtimeState->offlineRenderJob.active
+                    ? &runtimeState->offlineRenderJob
+                    : nullptr);
+        }
+
+        if (exportStarted && observedActiveExport &&
+            !runtimeState->offlineRenderJob.active) {
+            const bool failed = !runtimeState->errorMessage.empty();
+            invisible_places::serialization::
+                BackgroundRenderStatusDocument status;
+            status.state = failed ? "failed" : "completed";
+            status.message = failed
+                                 ? runtimeState->errorMessage
+                                 : runtimeState->statusMessage.empty()
+                                       ? "Background render completed."
+                                       : runtimeState->statusMessage;
+            status.setupPath = options.setupPath;
+            status.outputPath = lastOutputPath;
+            status.logPath = lastLogPath;
+            status.processId = CurrentProcessId();
+            status.renderedFrames = failed
+                                        ? lastRenderedFrames
+                                        : lastTotalFrames;
+            status.totalFrames = lastTotalFrames;
+            status.progress = failed ? (lastTotalFrames > 0U
+                                            ? static_cast<float>(lastRenderedFrames) /
+                                                  static_cast<float>(lastTotalFrames)
+                                            : 0.0F)
+                                     : 1.0F;
+            status.updatedUtc =
+                invisible_places::serialization::CurrentUtcTimestamp();
+            invisible_places::serialization::
+                SaveBackgroundRenderStatusDocument(
+                    status,
+                    statusPath,
+                    nullptr);
+            viewport->WaitIdle();
+            return failed ? 2 : 0;
+        }
+
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds{
+                std::clamp<std::uint32_t>(
+                    options.throttleMilliseconds,
+                    1U,
+                    250U)});
+    }
+
+    WriteBackgroundWorkerStatus(
+        statusPath,
+        "failed",
+        "Background render preparation timed out.",
+        options.setupPath,
+        runtimeState->offlineRenderJob.active
+            ? &runtimeState->offlineRenderJob
+            : nullptr);
+    return 2;
 }
 
 void DrawExportTimingSummary(const OfflineRenderJobState& job, bool stableLayout = false) {
@@ -39174,6 +40031,66 @@ void DrawAnimationExportSection(
                           ? "Writes an HEVC MP4 from the exact current animation, Timing Take, water, Colourise, and live visual settings."
                           : "Writes beauty.RGB, alpha.A, and depth.Z EXRs from the exact current animation and live render state using the selected point-density mode.");
         }
+        ImGui::SameLine();
+        if (!exportAvailable) {
+            ImGui::BeginDisabled();
+        }
+        if (ImGui::Button("Render in Background")) {
+            QueueCurrentAnimationBackgroundRender(runtimeState);
+        }
+        if (!exportAvailable) {
+            ImGui::EndDisabled();
+        }
+        if (ImGui::IsItemHovered(
+                ImGuiHoveredFlags_DelayNormal |
+                ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip(
+                "Freezes this exact render setup and launches a detached, "
+                "low-priority worker. The worker survives closing or "
+                "rebuilding this app. It shares the GPU, so the reopened "
+                "editor may still run more slowly while it renders.");
+        }
+    }
+
+    RefreshBackgroundRenderStatus(runtimeState);
+    const auto& background = runtimeState->backgroundRender;
+    if (background.latestStatus.has_value()) {
+        const auto& status = background.latestStatus.value();
+        ImGui::SeparatorText("Latest Background Render");
+        ImGui::ProgressBar(
+            std::clamp(status.progress, 0.0F, 1.0F),
+            ImVec2{-FLT_MIN, 0.0F});
+        ImGui::TextWrapped(
+            "%s: %s",
+            status.state.c_str(),
+            status.message.c_str());
+        if (status.totalFrames > 0U) {
+            ImGui::TextDisabled(
+                "%u / %u frames  |  worker %lld",
+                status.renderedFrames,
+                status.totalFrames,
+                static_cast<long long>(status.processId));
+        }
+        if (!status.outputPath.empty()) {
+            ImGui::TextWrapped(
+                "Output: %s",
+                status.outputPath.string().c_str());
+        } else {
+            ImGui::TextDisabled(
+                "Output path is reserved when the worker finishes setup.");
+        }
+        if (BackgroundRenderStatusTerminal(status.state)) {
+            ImGui::TextDisabled(
+                "This render no longer uses GPU or memory resources.");
+        } else {
+            ImGui::TextDisabled(
+                "Detached worker: editor close/rebuild is safe; GPU and "
+                "memory remain shared until completion.");
+        }
+    } else if (!background.readError.empty()) {
+        ImGui::TextDisabled(
+            "Background status unavailable: %s",
+            background.readError.c_str());
     }
     EndPanelSection();
 }
@@ -100839,12 +101756,24 @@ int Application::Run(ApplicationRunOptions options) const {
         return 2;
     }
 
+    const bool backgroundWorker =
+        options.backgroundRenderWorker.has_value();
     std::cout << std::endl
-              << "Opening preview window. Press Escape or close the window to exit." << std::endl;
+              << (backgroundWorker
+                      ? "Starting hidden low-priority background render worker."
+                      : "Opening preview window. Press Escape or close the window to exit.")
+              << std::endl;
 
     const auto windowTitle = platform::MakeBootstrapWindowTitle(assetCatalog);
     platform::Window window{
-        {.width = 1440, .height = 900, .title = windowTitle},
+        {.width = backgroundWorker ? 64 : 1440,
+         .height = backgroundWorker ? 64 : 900,
+         .title = backgroundWorker
+                      ? "Invisible Places Background Render"
+                      : windowTitle,
+         .visible = !backgroundWorker,
+         .focusOnOpen = !backgroundWorker,
+         .fitToPrimaryScreen = !backgroundWorker},
     };
 
     std::optional<renderer::core::VulkanViewportShell> viewport;
@@ -100868,6 +101797,7 @@ int Application::Run(ApplicationRunOptions options) const {
     }
 
     PreviewRuntimeState runtimeState;
+    runtimeState.dataRoot = dataRoot_;
     runtimeState.liveViewWindowSize = window.Size();
     runtimeState.water.defaultPointVisualStyle = MakeDefaultWaterPointVisualStyle();
     runtimeState.sessions = BuildSessions(assetCatalog);
@@ -100882,6 +101812,11 @@ int Application::Run(ApplicationRunOptions options) const {
     runtimeState.persistence.animationDirectoryPath = DefaultAnimationDirectory(dataRoot_).string();
     runtimeState.renderSettings.outputDirectory = DefaultRenderOutputDirectory(dataRoot_).string();
     RefreshAnimationFileList(&runtimeState.animationPanel, AnimationDirectory(runtimeState));
+    if (!backgroundWorker) {
+        runtimeState.backgroundRender.latestStatusPath =
+            LatestBackgroundRenderStatusPath(runtimeState);
+        RefreshBackgroundRenderStatus(&runtimeState, true);
+    }
 
     if (options.guiSmoke.has_value()) {
         if (!viewport.has_value()) {
@@ -101090,6 +102025,23 @@ int Application::Run(ApplicationRunOptions options) const {
         }
         std::cerr << "Unknown GUI smoke scenario: " << options.guiSmoke->scenario << "\n";
         return 2;
+    }
+
+    if (options.backgroundRenderWorker.has_value()) {
+        if (!viewport.has_value()) {
+            std::cerr <<
+                "Background render worker requires a Vulkan viewport.\n";
+            StopBackgroundWorkForShutdown(&runtimeState);
+            return 2;
+        }
+        const auto workerExitCode = RunBackgroundRenderWorker(
+            options.backgroundRenderWorker.value(),
+            &window,
+            &viewport.value(),
+            &runtimeState);
+        StopBackgroundWorkForShutdown(&runtimeState);
+        viewport->WaitIdle();
+        return workerExitCode;
     }
 
     if (viewport.has_value()) {

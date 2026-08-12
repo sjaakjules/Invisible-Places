@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <cstdint>
 #include <optional>
 #include <string>
 
@@ -17,10 +18,17 @@ struct ExportBenchmarkOptions {
     std::filesystem::path outputDirectory;
 };
 
+struct BackgroundRenderWorkerOptions {
+    std::filesystem::path setupPath;
+    std::filesystem::path statusPath;
+    std::uint32_t throttleMilliseconds = 24U;
+};
+
 struct ApplicationRunOptions {
     std::optional<GuiSmokeOptions> guiSmoke;
     std::optional<ExportBenchmarkOptions> exportBenchmark;
     std::optional<std::string> refocusAnimation;
+    std::optional<BackgroundRenderWorkerOptions> backgroundRenderWorker;
 };
 
 class Application {

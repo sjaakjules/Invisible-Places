@@ -1,6 +1,8 @@
 #include "app/Application.hpp"
 
 #include <filesystem>
+#include <charconv>
+#include <cstdint>
 #include <iostream>
 #include <string>
 #include <utility>
@@ -61,6 +63,41 @@ int main(int argc, char** argv) {
                 return 2;
             }
             options.refocusAnimation = argv[++index];
+        } else if (argument == "--background-render-worker") {
+            if (index + 1 >= argc || argv[index + 1] == nullptr) {
+                std::cerr << "--background-render-worker requires a render setup path.\n";
+                return 2;
+            }
+            if (!options.backgroundRenderWorker.has_value()) {
+                options.backgroundRenderWorker.emplace();
+            }
+            options.backgroundRenderWorker->setupPath = argv[++index];
+        } else if (argument == "--background-render-status") {
+            if (index + 1 >= argc || argv[index + 1] == nullptr) {
+                std::cerr << "--background-render-status requires a status path.\n";
+                return 2;
+            }
+            if (!options.backgroundRenderWorker.has_value()) {
+                options.backgroundRenderWorker.emplace();
+            }
+            options.backgroundRenderWorker->statusPath = argv[++index];
+        } else if (argument == "--background-render-throttle-ms") {
+            if (index + 1 >= argc || argv[index + 1] == nullptr) {
+                std::cerr << "--background-render-throttle-ms requires a non-negative integer.\n";
+                return 2;
+            }
+            std::uint32_t throttle = 0U;
+            const std::string value = argv[++index];
+            const auto parsed = std::from_chars(
+                value.data(), value.data() + value.size(), throttle);
+            if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size()) {
+                std::cerr << "--background-render-throttle-ms requires a non-negative integer.\n";
+                return 2;
+            }
+            if (!options.backgroundRenderWorker.has_value()) {
+                options.backgroundRenderWorker.emplace();
+            }
+            options.backgroundRenderWorker->throttleMilliseconds = throttle;
         } else if (!argument.starts_with("--") && dataRoot.empty()) {
             dataRoot = argument;
         } else {

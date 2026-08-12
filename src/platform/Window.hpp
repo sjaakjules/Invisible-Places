@@ -13,6 +13,9 @@ struct WindowConfig {
     int width = 1440;
     int height = 900;
     std::string title;
+    bool visible = true;
+    bool focusOnOpen = true;
+    bool fitToPrimaryScreen = true;
 };
 
 struct WindowSize {

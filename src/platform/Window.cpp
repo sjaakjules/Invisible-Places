@@ -52,14 +52,16 @@ Window::Window(const WindowConfig& config) {
     }
 
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE);
-    glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
+    glfwWindowHint(GLFW_VISIBLE, config.visible ? GLFW_TRUE : GLFW_FALSE);
+    glfwWindowHint(GLFW_RESIZABLE, config.visible ? GLFW_TRUE : GLFW_FALSE);
 
     WindowSize initialSize{
         .width = std::max(1, config.width),
         .height = std::max(1, config.height),
     };
-    if (GLFWmonitor* primaryMonitor = glfwGetPrimaryMonitor(); primaryMonitor != nullptr) {
+    if (GLFWmonitor* primaryMonitor =
+            config.fitToPrimaryScreen ? glfwGetPrimaryMonitor() : nullptr;
+        primaryMonitor != nullptr) {
         if (const GLFWvidmode* videoMode = glfwGetVideoMode(primaryMonitor); videoMode != nullptr) {
             initialSize = ResolveInitialWindowSizeForScreen(
                 videoMode->width,
@@ -74,8 +76,12 @@ Window::Window(const WindowConfig& config) {
         throw std::runtime_error{"Window creation failed."};
     }
 
-    glfwShowWindow(window_);
-    glfwFocusWindow(window_);
+    if (config.visible) {
+        glfwShowWindow(window_);
+        if (config.focusOnOpen) {
+            glfwFocusWindow(window_);
+        }
+    }
 }
 
 Window::~Window() {

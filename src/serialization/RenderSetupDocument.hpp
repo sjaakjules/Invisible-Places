@@ -118,6 +118,22 @@ struct RenderSetupHistoryIndex {
     std::vector<RenderSetupHistoryEntry> entries;
 };
 
+inline constexpr std::uint32_t kBackgroundRenderStatusSchemaVersion = 1U;
+
+struct BackgroundRenderStatusDocument {
+    std::uint32_t schemaVersion = kBackgroundRenderStatusSchemaVersion;
+    std::string state = "queued";
+    std::string message;
+    std::filesystem::path setupPath;
+    std::filesystem::path outputPath;
+    std::filesystem::path logPath;
+    std::int64_t processId = 0;
+    std::uint32_t renderedFrames = 0U;
+    std::uint32_t totalFrames = 0U;
+    float progress = 0.0F;
+    std::string updatedUtc;
+};
+
 [[nodiscard]] std::string_view RenderSetupStatusName(RenderSetupStatus status);
 [[nodiscard]] std::optional<RenderSetupStatus> ParseRenderSetupStatus(
     std::string_view name);
@@ -166,6 +182,15 @@ bool UpsertRenderSetupHistoryEntry(
     const std::filesystem::path& indexPath,
     const RenderSetupHistoryEntry& entry,
     std::size_t maximumEntries = kMaximumRenderSetupHistoryEntries,
+    std::string* errorMessage = nullptr);
+
+bool SaveBackgroundRenderStatusDocument(
+    const BackgroundRenderStatusDocument& document,
+    const std::filesystem::path& outputPath,
+    std::string* errorMessage = nullptr);
+[[nodiscard]] std::optional<BackgroundRenderStatusDocument>
+LoadBackgroundRenderStatusDocument(
+    const std::filesystem::path& inputPath,
     std::string* errorMessage = nullptr);
 
 }  // namespace invisible_places::serialization

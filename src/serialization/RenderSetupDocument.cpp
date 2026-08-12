@@ -578,6 +578,86 @@ bool SaveRenderSetupDocument(
     }
 }
 
+bool SaveBackgroundRenderStatusDocument(
+    const BackgroundRenderStatusDocument& document,
+    const std::filesystem::path& outputPath,
+    std::string* errorMessage) {
+    try {
+        const json value{
+            {"schema_version", kBackgroundRenderStatusSchemaVersion},
+            {"state", document.state},
+            {"message", document.message},
+            {"setup_path", document.setupPath.generic_string()},
+            {"output_path", document.outputPath.generic_string()},
+            {"log_path", document.logPath.generic_string()},
+            {"process_id", document.processId},
+            {"rendered_frames", document.renderedFrames},
+            {"total_frames", document.totalFrames},
+            {"progress", std::clamp(document.progress, 0.0F, 1.0F)},
+            {"updated_utc",
+             document.updatedUtc.empty() ? CurrentUtcTimestamp()
+                                         : document.updatedUtc},
+        };
+        return WriteJsonAtomically(value, outputPath, errorMessage);
+    } catch (const std::exception& error) {
+        SetError(
+            errorMessage,
+            "Failed to serialize background-render status: " +
+                std::string{error.what()});
+        return false;
+    }
+}
+
+std::optional<BackgroundRenderStatusDocument>
+LoadBackgroundRenderStatusDocument(
+    const std::filesystem::path& inputPath,
+    std::string* errorMessage) {
+    const auto root = ReadJson(inputPath, errorMessage);
+    if (!root.has_value() || !root->is_object()) {
+        if (root.has_value()) {
+            SetError(
+                errorMessage,
+                "Background-render status root is not an object.");
+        }
+        return std::nullopt;
+    }
+    if (root->value("schema_version", 0U) !=
+        kBackgroundRenderStatusSchemaVersion) {
+        SetError(
+            errorMessage,
+            "Background-render status schema is unsupported.");
+        return std::nullopt;
+    }
+    try {
+        BackgroundRenderStatusDocument document;
+        document.state = root->value("state", std::string{"queued"});
+        document.message = root->value("message", std::string{});
+        document.setupPath = root->value("setup_path", std::string{});
+        document.outputPath = root->value("output_path", std::string{});
+        document.logPath = root->value("log_path", std::string{});
+        document.processId = root->value("process_id", std::int64_t{0});
+        document.renderedFrames = root->value("rendered_frames", 0U);
+        document.totalFrames = root->value("total_frames", 0U);
+        document.progress = std::clamp(
+            root->value("progress", 0.0F), 0.0F, 1.0F);
+        document.updatedUtc = root->value("updated_utc", std::string{});
+        if (document.state.empty()) {
+            SetError(errorMessage, "Background-render status state is empty.");
+            return std::nullopt;
+        }
+        if (errorMessage != nullptr) {
+            errorMessage->clear();
+        }
+        return document;
+    } catch (const std::exception& error) {
+        SetError(
+            errorMessage,
+            "Failed to parse background-render status: " +
+                std::string{error.what()});
+        return std::nullopt;
+    }
+}
+
 std::optional<RenderSetupDocument> LoadRenderSetupDocument(
     const std::filesystem::path& inputPath,
     std::string* errorMessage) {

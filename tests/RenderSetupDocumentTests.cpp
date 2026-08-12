@@ -741,3 +741,60 @@ TEST_CASE(
                     .has_value());
     CHECK(error.find("newer unsupported") != std::string::npos);
 }
+
+TEST_CASE(
+    "Background render status is atomic and round-trips progress",
+    "[render-setup][background-render][serialization]") {
+    TemporaryDirectory directory;
+    const auto statusPath = directory.path / "surface.background.json";
+    invisible_places::serialization::BackgroundRenderStatusDocument status;
+    status.state = "rendering";
+    status.message = "Capturing frame 18 of 120";
+    status.setupPath = directory.path / "surface.iprender.json";
+    status.outputPath = directory.path / "surface.mov";
+    status.logPath = directory.path / "surface.log.txt";
+    status.processId = 4321;
+    status.renderedFrames = 18U;
+    status.totalFrames = 120U;
+    status.progress = 0.15F;
+    status.updatedUtc = "2026-08-12T01:02:03Z";
+
+    std::string error;
+    REQUIRE(
+        invisible_places::serialization::
+            SaveBackgroundRenderStatusDocument(
+                status,
+                statusPath,
+                &error));
+    const auto loaded =
+        invisible_places::serialization::
+            LoadBackgroundRenderStatusDocument(
+                statusPath,
+                &error);
+    REQUIRE(loaded.has_value());
+    CHECK(loaded->state == status.state);
+    CHECK(loaded->message == status.message);
+    CHECK(loaded->setupPath == status.setupPath);
+    CHECK(loaded->outputPath == status.outputPath);
+    CHECK(loaded->logPath == status.logPath);
+    CHECK(loaded->processId == status.processId);
+    CHECK(loaded->renderedFrames == status.renderedFrames);
+    CHECK(loaded->totalFrames == status.totalFrames);
+    CHECK(loaded->progress == Approx(status.progress));
+    CHECK(loaded->updatedUtc == status.updatedUtc);
+
+    status.progress = 2.0F;
+    REQUIRE(
+        invisible_places::serialization::
+            SaveBackgroundRenderStatusDocument(
+                status,
+                statusPath,
+                &error));
+    const auto clamped =
+        invisible_places::serialization::
+            LoadBackgroundRenderStatusDocument(
+                statusPath,
+                &error);
+    REQUIRE(clamped.has_value());
+    CHECK(clamped->progress == Approx(1.0F));
+}

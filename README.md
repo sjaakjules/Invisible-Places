@@ -93,6 +93,7 @@ The central idea is that data already present in the point cloud can become visu
 - Runs Mesh Flow automatically over the active scene's resident Ground table with a fixed 4,096-particle, 24-history GPU allocation. Dry particles emerge from vegetation-supported, convergent cells along each connected component's highest-+X edge; VEG Rain impacts feed a bounded GPU seed ring for distributed downhill emergence and recession. Ordinary Flow sources never seed Mesh Flow, and live activity, moisture, and appearance edits neither rebuild the cache nor resize GPU storage.
 - Exports selected saved animations and saved visuals as batched Quick MP4 files.
 - Exports preview-density EXR animation stacks.
+- Can freeze the current animation, Timing Take, water, visual, and export preset into an immutable background-render package, then launch a hidden low-priority worker process. The worker survives closing or rebuilding the editor, limits its writer queue to one frame, and deliberately pauses between GPU steps; it still shares GPU memory and bandwidth with any reopened editor. A persistent status file reports preparation, frame progress, output/log paths, completion, or failure.
 - Writes EXR `beauty.RGB`, `alpha.A`, and `depth.Z` channels.
 - Includes tiled offline point-rendering support for LiDAR-first output experiments.
 
