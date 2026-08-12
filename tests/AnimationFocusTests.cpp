@@ -3305,3 +3305,413 @@ TEST_CASE("Linked seam sampling follows both reciprocal overlap bands",
                     0.1F)
                     .has_value());
 }
+
+namespace {
+
+// A pan with several authored keys close to its end so a pre-roll alignment
+// ramp has interior controls to ease across.
+invisible_places::camera::AnimationPath MakeDenseReciprocalPanTestPath(
+    std::string name,
+    float direction) {
+    invisible_places::camera::AnimationPath path;
+    path.name = std::move(name);
+    path.durationFrames = 120U;
+    path.keys = {
+        {.id = "k0",
+         .cameraPosition = {-1.6F * direction, -8.0F, 2.0F},
+         .focusPoint = {-0.4F * direction, 0.0F, 1.0F}},
+        {.id = "k1",
+         .cameraPosition = {-1.0F * direction, -8.0F, 2.0F},
+         .focusPoint = {-0.2F * direction, 0.0F, 1.0F},
+         .durationFrames = 24U},
+        {.id = "k2",
+         .cameraPosition = {-0.4F * direction, -8.0F, 2.0F},
+         .focusPoint = {0.0F, 0.0F, 1.0F},
+         .durationFrames = 24U},
+        {.id = "k3",
+         .cameraPosition = {0.2F * direction, -8.0F, 2.0F},
+         .focusPoint = {0.1F * direction, 0.0F, 1.0F},
+         .durationFrames = 24U},
+        {.id = "k4",
+         .cameraPosition = {0.8F * direction, -8.0F, 2.0F},
+         .focusPoint = {0.2F * direction, 0.0F, 1.0F},
+         .durationFrames = 24U},
+        {.id = "k5",
+         .cameraPosition = {1.4F * direction, -8.0F, 2.0F},
+         .focusPoint = {0.3F * direction, 0.0F, 1.0F},
+         .durationFrames = 24U},
+    };
+    for (auto& key : path.keys) {
+        key.id = path.name + "_" + key.id;
+    }
+    return path;
+}
+
+}  // namespace
+
+TEST_CASE(
+    "Pre-roll alignment ramp spreads the terminal seam move across authored keys",
+    "[camera][animation][pan-extension]") {
+    const auto source = MakeDenseReciprocalPanTestPath("ramp-src", 1.0F);
+    const auto destination = MakeDenseReciprocalPanTestPath(
+        "ramp-dst",
+        -1.0F);
+    invisible_places::camera::AnimationTerminalExtensionSpec spec;
+    spec.sourceTailFrame = 24U;
+    spec.sourcePatch = MakeReciprocalPanTestPatch();
+    auto destinationPatch = MakeReciprocalPanTestPatch();
+    destinationPatch.worldPoints[0U][0U] = 2.0F;
+    destinationPatch.worldPoints[1U][0U] = 3.0F;
+    destinationPatch.worldPoints[2U][0U] = 2.0F;
+    spec.destinationEndPatch = destinationPatch;
+
+    const auto legacy = invisible_places::camera::
+        BuildAnimationPanTerminalExtensionPreview(
+            destination,
+            source,
+            spec,
+            16.0F / 9.0F,
+            9U,
+            12U);
+    INFO(legacy.errorMessage);
+    REQUIRE(legacy.succeeded);
+    CHECK(legacy.alignmentSpreadKeyCount == 0U);
+    CHECK(legacy.formerTerminalCameraMove > 1.0e-3F);
+
+    auto rampedSpec = spec;
+    rampedSpec.alignmentRampFrames = 60U;
+    const auto ramped = invisible_places::camera::
+        BuildAnimationPanTerminalExtensionPreview(
+            destination,
+            source,
+            rampedSpec,
+            16.0F / 9.0F,
+            9U,
+            12U);
+    INFO(ramped.errorMessage);
+    REQUIRE(ramped.succeeded);
+    // Keys 24 and 48 frames before the terminal sit strictly inside the
+    // 60-frame window.
+    CHECK(ramped.alignmentSpreadKeyCount == 2U);
+
+    // Both fits land the terminal on the identical aligned pose.
+    const auto& legacyTerminal =
+        legacy.candidate.keys[destination.keys.size() - 1U];
+    const auto& rampedTerminal =
+        ramped.candidate.keys[destination.keys.size() - 1U];
+    for (std::size_t component = 0U; component < 3U; ++component) {
+        CHECK(rampedTerminal.cameraPosition[component] ==
+              Approx(legacyTerminal.cameraPosition[component])
+                  .margin(1.0e-4F));
+    }
+
+    // The ramp trades the one-segment lurch for a gentler approach: the peak
+    // extra camera speed over the incoming window must drop.
+    CHECK(ramped.incomingTransientPeakSpeed <
+          legacy.incomingTransientPeakSpeed);
+
+    // Before the window (its first eased key is 48 frames before the end,
+    // so exactness holds through the preceding key at 48/30 s) the ramped
+    // candidate still evaluates exactly like the original animation.
+    const auto originalContext = invisible_places::camera::
+        PrepareAnimationPathEvaluation(destination);
+    const auto rampedContext = invisible_places::camera::
+        PrepareAnimationPathEvaluation(ramped.candidate);
+    REQUIRE(originalContext.valid);
+    REQUIRE(rampedContext.valid);
+    const float exactPrefixEnd = 48.0F / 30.0F;
+    for (std::uint32_t sample = 0U; sample <= 48U; ++sample) {
+        const float time = exactPrefixEnd *
+            static_cast<float>(sample) / 48.0F;
+        CheckPanEvaluationNear(
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                originalContext,
+                time),
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                rampedContext,
+                time),
+            2.0e-4F);
+    }
+
+    // The eased keys hold fractional shares of the terminal move, pinned as
+    // localized corrections over untouched base spline poses.
+    for (const auto keyOffset : {std::size_t{3U}, std::size_t{4U}}) {
+        const auto& key = ramped.candidate.keys[keyOffset];
+        const auto correction = std::find_if(
+            ramped.candidate.localizedKeyCorrections.begin(),
+            ramped.candidate.localizedKeyCorrections.end(),
+            [&](const auto& value) { return value.keyId == key.id; });
+        REQUIRE(correction !=
+                ramped.candidate.localizedKeyCorrections.end());
+        CHECK(correction->hasCameraCorrectionTangent);
+        for (std::size_t component = 0U; component < 3U; ++component) {
+            CHECK(correction->splineCameraPosition[component] ==
+                  Approx(destination.keys[keyOffset]
+                             .cameraPosition[component])
+                      .margin(1.0e-6F));
+        }
+        const float movedDistance = std::hypot(
+            key.cameraPosition[0U] -
+                destination.keys[keyOffset].cameraPosition[0U],
+            key.cameraPosition[1U] -
+                destination.keys[keyOffset].cameraPosition[1U],
+            key.cameraPosition[2U] -
+                destination.keys[keyOffset].cameraPosition[2U]);
+        CHECK(movedDistance > 0.0F);
+        CHECK(movedDistance < legacy.formerTerminalCameraMove + 1.0e-4F);
+    }
+
+    // The appended tail still tracks the source patch as well as before.
+    CHECK(ramped.anchorOverlayRmsScreenHeights <
+          legacy.anchorOverlayRmsScreenHeights + 5.0e-3F);
+}
+
+TEST_CASE(
+    "Balanced seam alignment moves the source start toward the destination terminal",
+    "[camera][animation][pan-extension]") {
+    const auto source = MakeDenseReciprocalPanTestPath("bias-src", 1.0F);
+    const auto destination = MakeDenseReciprocalPanTestPath(
+        "bias-dst",
+        -1.0F);
+    invisible_places::camera::AnimationTerminalExtensionSpec spec;
+    spec.sourceTailFrame = 24U;
+    spec.sourcePatch = MakeReciprocalPanTestPatch();
+    auto destinationPatch = MakeReciprocalPanTestPatch();
+    destinationPatch.worldPoints[0U][0U] = 2.0F;
+    destinationPatch.worldPoints[1U][0U] = 3.0F;
+    destinationPatch.worldPoints[2U][0U] = 2.0F;
+    spec.destinationEndPatch = destinationPatch;
+    spec.alignmentRampFrames = 48U;
+
+    const auto unbiased = invisible_places::camera::
+        BuildAnimationPanBidirectionalSeamPreview(
+            source,
+            destination,
+            spec,
+            16.0F / 9.0F,
+            9U,
+            12U);
+    INFO(unbiased.errorMessage);
+    REQUIRE(unbiased.succeeded);
+
+    auto balancedSpec = spec;
+    balancedSpec.sourceAlignmentFraction = 0.5F;
+    const auto balanced = invisible_places::camera::
+        BuildAnimationPanBidirectionalSeamPreview(
+            source,
+            destination,
+            balancedSpec,
+            16.0F / 9.0F,
+            9U,
+            12U);
+    INFO(balanced.errorMessage);
+    REQUIRE(balanced.succeeded);
+
+    // The destination terminal carries a smaller share of the alignment.
+    CHECK(balanced.destinationTail.formerTerminalCameraMove <
+          unbiased.destinationTail.formerTerminalCameraMove);
+
+    // The source's former frame-zero key moved as a localized correction
+    // while its base spline pose stayed authored.
+    const std::size_t headKeys = balanced.sourceHead.appendedKeyCount;
+    const auto& movedStart =
+        balanced.sourceHead.candidate.keys[headKeys];
+    CHECK(movedStart.id == source.keys.front().id);
+    const float startMove = std::hypot(
+        movedStart.cameraPosition[0U] -
+            source.keys.front().cameraPosition[0U],
+        movedStart.cameraPosition[1U] -
+            source.keys.front().cameraPosition[1U],
+        movedStart.cameraPosition[2U] -
+            source.keys.front().cameraPosition[2U]);
+    CHECK(startMove > 1.0e-4F);
+    const auto startCorrection = std::find_if(
+        balanced.sourceHead.candidate.localizedKeyCorrections.begin(),
+        balanced.sourceHead.candidate.localizedKeyCorrections.end(),
+        [&](const auto& value) {
+            return value.keyId == source.keys.front().id;
+        });
+    REQUIRE(startCorrection !=
+            balanced.sourceHead.candidate.localizedKeyCorrections.end());
+
+    // A zero fraction reproduces the unbiased candidates exactly.
+    auto zeroSpec = spec;
+    zeroSpec.sourceAlignmentFraction = 0.0F;
+    const auto zero = invisible_places::camera::
+        BuildAnimationPanBidirectionalSeamPreview(
+            source,
+            destination,
+            zeroSpec,
+            16.0F / 9.0F,
+            9U,
+            12U);
+    REQUIRE(zero.succeeded);
+    const auto zeroContext = invisible_places::camera::
+        PrepareAnimationPathEvaluation(zero.destinationTail.candidate);
+    const auto unbiasedContext = invisible_places::camera::
+        PrepareAnimationPathEvaluation(unbiased.destinationTail.candidate);
+    REQUIRE(zeroContext.valid);
+    REQUIRE(unbiasedContext.valid);
+    for (std::uint32_t sample = 0U; sample <= 24U; ++sample) {
+        const float time = zeroContext.durationSeconds *
+            static_cast<float>(sample) / 24.0F;
+        CheckPanEvaluationNear(
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                zeroContext,
+                time),
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                unbiasedContext,
+                time),
+            1.0e-6F);
+    }
+}
+
+TEST_CASE(
+    "Bidirectional reciprocal extension composes both seams' pre-roll ramps",
+    "[camera][animation][pan-extension]") {
+    const auto first = MakeDenseReciprocalPanTestPath("compose-A", 1.0F);
+    const auto second = MakeDenseReciprocalPanTestPath("compose-B", -1.0F);
+    invisible_places::camera::AnimationReciprocalPanExtensionOptions options;
+    const auto patch = MakeReciprocalPanTestPatch();
+    options.firstDrivesSecond.sourceTailFrame = 24U;
+    options.firstDrivesSecond.sourcePatch = patch;
+    auto bPatch = patch;
+    bPatch.worldPoints[0U][0U] = 2.0F;
+    bPatch.worldPoints[1U][0U] = 3.0F;
+    bPatch.worldPoints[2U][0U] = 2.0F;
+    options.firstDrivesSecond.destinationEndPatch = bPatch;
+    options.firstDrivesSecond.alignmentRampFrames = 48U;
+    options.secondDrivesFirst.sourceTailFrame = 24U;
+    options.secondDrivesFirst.sourcePatch = patch;
+    auto aPatch = patch;
+    aPatch.worldPoints[0U][0U] = 1.5F;
+    aPatch.worldPoints[1U][0U] = 2.5F;
+    aPatch.worldPoints[2U][0U] = 1.5F;
+    options.secondDrivesFirst.destinationEndPatch = aPatch;
+    options.secondDrivesFirst.alignmentRampFrames = 48U;
+    options.sampleCount = 9U;
+    options.optimizationSweeps = 12U;
+
+    const auto result = invisible_places::camera::
+        BuildAnimationBidirectionalReciprocalPanExtension(
+            first,
+            second,
+            options);
+    INFO(result.errorMessage);
+    REQUIRE(result.succeeded);
+    CHECK(result.metrics.outgoing.alignmentSpreadKeyCount[0U] > 0U);
+    CHECK(result.metrics.outgoing.alignmentSpreadKeyCount[1U] > 0U);
+
+    // Both merged candidates still evaluate and keep every original key id
+    // exactly once between the generated head and tail.
+    for (const auto* candidate :
+         {&result.firstCandidate, &result.secondCandidate}) {
+        const auto context = invisible_places::camera::
+            PrepareAnimationPathEvaluation(*candidate);
+        REQUIRE(context.valid);
+        std::unordered_set<std::string> ids;
+        for (const auto& key : candidate->keys) {
+            CHECK(ids.insert(key.id).second);
+        }
+    }
+    for (const auto& key : first.keys) {
+        CHECK(std::count_if(
+                  result.firstCandidate.keys.begin(),
+                  result.firstCandidate.keys.end(),
+                  [&](const auto& candidateKey) {
+                      return candidateKey.id == key.id;
+                  }) == 1);
+    }
+
+    // The bulk centre, outside both 48-frame windows, is preserved: the
+    // authored middle key pose survives the merge untouched.
+    const auto& middle = first.keys[2U];
+    const auto merged = std::find_if(
+        result.firstCandidate.keys.begin(),
+        result.firstCandidate.keys.end(),
+        [&](const auto& key) { return key.id == middle.id; });
+    REQUIRE(merged != result.firstCandidate.keys.end());
+    for (std::size_t component = 0U; component < 3U; ++component) {
+        CHECK(merged->cameraPosition[component] ==
+              Approx(middle.cameraPosition[component]).margin(1.0e-5F));
+    }
+}
+
+TEST_CASE(
+    "Bidirectional merge preserves a pre-existing correction's effective tangent",
+    "[camera][animation][pan-extension]") {
+    auto first = MakeDenseReciprocalPanTestPath("carry-A", 1.0F);
+    const auto second = MakeDenseReciprocalPanTestPath("carry-B", -1.0F);
+    // Pre-existing localized corrections without materialized tangents
+    // evaluate with derived central-difference tangents. Two adjacent
+    // corrections give the middle one a NONZERO derived tangent; both end
+    // fits materialize that same value, so the merge must not double it.
+    for (const auto [keyIndex, offset] :
+         {std::pair<std::size_t, float>{2U, 0.02F},
+          std::pair<std::size_t, float>{3U, 0.045F}}) {
+        auto& key = first.keys[keyIndex];
+        invisible_places::camera::AnimationLocalizedKeyCorrection correction;
+        correction.keyId = key.id;
+        correction.splineCameraPosition = key.cameraPosition;
+        correction.splineFocusPoint = key.focusPoint;
+        key.cameraPosition[2U] += offset;
+        first.localizedKeyCorrections.push_back(correction);
+    }
+    const auto& correctedKey = first.keys[2U];
+
+    const auto originalContext = invisible_places::camera::
+        PrepareAnimationPathEvaluation(first);
+    REQUIRE(originalContext.valid);
+    REQUIRE(originalContext.hasLoopKeyCorrections);
+    const auto expectedTangent =
+        originalContext.loopCameraCorrectionTangents[2U];
+    REQUIRE(std::abs(expectedTangent[2U]) > 1.0e-4F);
+
+    invisible_places::camera::AnimationReciprocalPanExtensionOptions options;
+    const auto patch = MakeReciprocalPanTestPatch();
+    options.firstDrivesSecond.sourceTailFrame = 24U;
+    options.firstDrivesSecond.sourcePatch = patch;
+    auto bPatch = patch;
+    bPatch.worldPoints[0U][0U] = 0.4F;
+    bPatch.worldPoints[1U][0U] = 0.65F;
+    bPatch.worldPoints[2U][0U] = 0.4F;
+    options.firstDrivesSecond.destinationEndPatch = bPatch;
+    options.firstDrivesSecond.alignmentRampFrames = 30U;
+    options.secondDrivesFirst.sourceTailFrame = 24U;
+    options.secondDrivesFirst.sourcePatch = patch;
+    auto aPatch = patch;
+    aPatch.worldPoints[0U][0U] = 0.3F;
+    aPatch.worldPoints[1U][0U] = 0.55F;
+    aPatch.worldPoints[2U][0U] = 0.3F;
+    options.secondDrivesFirst.destinationEndPatch = aPatch;
+    options.secondDrivesFirst.alignmentRampFrames = 30U;
+    options.sampleCount = 9U;
+    options.optimizationSweeps = 12U;
+
+    const auto result = invisible_places::camera::
+        BuildAnimationBidirectionalReciprocalPanExtension(
+            first,
+            second,
+            options);
+    INFO(result.errorMessage);
+    REQUIRE(result.succeeded);
+    const auto merged = std::find_if(
+        result.firstCandidate.localizedKeyCorrections.begin(),
+        result.firstCandidate.localizedKeyCorrections.end(),
+        [&](const auto& value) { return value.keyId == correctedKey.id; });
+    REQUIRE(merged != result.firstCandidate.localizedKeyCorrections.end());
+    REQUIRE(merged->hasCameraCorrectionTangent);
+    // The 30-frame ramps do not reach the middle key (48 frames from either
+    // end), so its effective tangent must survive the merge unchanged.
+    for (std::size_t component = 0U; component < 3U; ++component) {
+        CHECK(merged->cameraCorrectionTangent[component] ==
+              Approx(expectedTangent[component]).margin(1.0e-5F));
+    }
+    const auto mergedKey = std::find_if(
+        result.firstCandidate.keys.begin(),
+        result.firstCandidate.keys.end(),
+        [&](const auto& key) { return key.id == correctedKey.id; });
+    REQUIRE(mergedKey != result.firstCandidate.keys.end());
+    CHECK(mergedKey->cameraPosition[2U] ==
+          Approx(correctedKey.cameraPosition[2U]).margin(1.0e-5F));
+}

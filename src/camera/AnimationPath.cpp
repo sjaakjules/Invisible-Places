@@ -1766,6 +1766,8 @@ struct PanTerminalBuildMetrics {
     float maxPrefixPositionError = 0.0F;
     float formerTerminalCameraMove = 0.0F;
     float formerTerminalFocusMove = 0.0F;
+    std::uint32_t alignmentSpreadKeyCount = 0U;
+    float incomingTransientPeakSpeed = 0.0F;
 };
 
 bool FinitePanVector(const std::array<float, 3>& value) {
@@ -3090,6 +3092,270 @@ std::size_t CountPanScreenInflections(
 }
 
 
+float PanQuinticEase(float amount) {
+    const float clamped = std::clamp(amount, 0.0F, 1.0F);
+    return clamped * clamped * clamped *
+        (10.0F - 15.0F * clamped + 6.0F * clamped * clamped);
+}
+
+float PanQuinticEaseDerivative(float amount) {
+    const float clamped = std::clamp(amount, 0.0F, 1.0F);
+    const float inverse = 1.0F - clamped;
+    return 30.0F * clamped * clamped * inverse * inverse;
+}
+
+struct PanAlignmentSpreadOutcome {
+    std::uint32_t spreadKeyCount = 0U;
+    // Earliest authored-key time whose outgoing segment may deviate from the
+    // original path. Prefix-exactness checks must stop here.
+    float deviationStartTime = 0.0F;
+};
+
+// Eases a large endpoint alignment move across the authored keys inside a
+// ramp window so it becomes a slow drift instead of a one-segment lurch. Each
+// interior key keeps its base spline pose (a fresh localized correction pins
+// it) while its visible pose shifts by a C2 quintic-ease fraction of the
+// endpoint move, with the matching materialized correction tangent. The base
+// spline is untouched, so segments outside the window stay exact. When
+// `terminalSide` is true the ramp eases toward the last key; otherwise it
+// eases away from the first key.
+PanAlignmentSpreadOutcome SpreadPanAlignmentCorrection(
+    AnimationPath* path,
+    const std::vector<float>& originalKnots,
+    const std::array<float, 3>& cameraDelta,
+    const std::array<float, 3>& focusDelta,
+    float rampSeconds,
+    bool terminalSide) {
+    PanAlignmentSpreadOutcome outcome;
+    const std::size_t keyCount = originalKnots.size();
+    outcome.deviationStartTime = terminalSide && keyCount >= 2U
+        ? originalKnots[keyCount - 2U]
+        : 0.0F;
+    if (path == nullptr || keyCount < 3U ||
+        path->keys.size() < keyCount || rampSeconds <= 1.0e-6F) {
+        return outcome;
+    }
+    const float duration = originalKnots.back();
+    const float clampedRamp = std::min(rampSeconds, 0.5F * duration);
+    std::size_t firstSpreadIndex = keyCount;
+    for (std::size_t keyIndex = 1U; keyIndex + 1U < keyCount; ++keyIndex) {
+        const float keyTime = originalKnots[keyIndex];
+        const float amount = terminalSide
+            ? (keyTime - (duration - clampedRamp)) / clampedRamp
+            : 1.0F - keyTime / clampedRamp;
+        if (amount <= 1.0e-6F || amount >= 1.0F - 1.0e-6F) {
+            continue;
+        }
+        const float weight = PanQuinticEase(amount);
+        const float weightRate = PanQuinticEaseDerivative(amount) *
+            (terminalSide ? 1.0F : -1.0F) / clampedRamp;
+        auto& key = path->keys[keyIndex];
+        auto* correction = UpsertPanCorrection(
+            path,
+            key.id,
+            key.cameraPosition,
+            key.focusPoint);
+        if (correction == nullptr) {
+            continue;
+        }
+        if (!correction->hasCameraCorrectionTangent) {
+            correction->hasCameraCorrectionTangent = true;
+            correction->cameraCorrectionTangent = {};
+        }
+        if (!correction->hasFocusCorrectionTangent) {
+            correction->hasFocusCorrectionTangent = true;
+            correction->focusCorrectionTangent = {};
+        }
+        for (std::size_t component = 0U; component < 3U; ++component) {
+            key.cameraPosition[component] +=
+                weight * cameraDelta[component];
+            key.focusPoint[component] += weight * focusDelta[component];
+            correction->cameraCorrectionTangent[component] +=
+                weightRate * cameraDelta[component];
+            correction->focusCorrectionTangent[component] +=
+                weightRate * focusDelta[component];
+        }
+        ++outcome.spreadKeyCount;
+        firstSpreadIndex = std::min(firstSpreadIndex, keyIndex);
+    }
+    if (terminalSide && firstSpreadIndex < keyCount &&
+        firstSpreadIndex > 0U) {
+        // The segment entering the first fractional key also deviates, so
+        // exactness holds only up to the key before it.
+        outcome.deviationStartTime =
+            originalKnots[firstSpreadIndex - 1U];
+    }
+    return outcome;
+}
+
+// Screen-space target between two seam-endpoint projections. Zero returns
+// the source projection exactly (the legacy destination-only alignment);
+// one half is the balanced midpoint where each 50% endpoint moves half way.
+PanPatchDescriptor BlendPanPatchDescriptors(
+    const PanPatchDescriptor& source,
+    const PanPatchDescriptor& destination,
+    float amount) {
+    PanPatchDescriptor blended;
+    if (!source.valid || !destination.valid) {
+        return blended;
+    }
+    const float clamped = std::clamp(amount, 0.0F, 1.0F);
+    blended.valid = true;
+    for (std::size_t point = 0U;
+         point < blended.projectedPoints.size();
+         ++point) {
+        for (std::size_t axis = 0U; axis < 2U; ++axis) {
+            blended.projectedPoints[point][axis] = std::lerp(
+                source.projectedPoints[point][axis],
+                destination.projectedPoints[point][axis],
+                clamped);
+        }
+    }
+    blended.anchor = blended.projectedPoints[0U];
+    blended.rotationValid = source.rotationValid &&
+        destination.rotationValid;
+    if (blended.rotationValid) {
+        blended.angleRadians = source.angleRadians +
+            clamped *
+                WrappedAngleDelta(
+                    destination.angleRadians,
+                    source.angleRadians);
+    }
+    blended.scale = source.scale > 1.0e-7F && destination.scale > 1.0e-7F
+        ? std::exp(std::lerp(
+              std::log(source.scale),
+              std::log(destination.scale),
+              clamped))
+        : 0.0F;
+    blended.conditioning = std::min(
+        source.conditioning,
+        destination.conditioning);
+    return blended;
+}
+
+// Carries `sourceAlignmentFraction` of one seam's 50%-pose alignment on the
+// source's frame-zero key so the destination terminal needs a smaller move.
+// The move eases forwards over the pre-roll window as fractional localized
+// corrections; the source's base spline and interior motion stay intact.
+bool AdjustPanSourceStartForSeamAlignment(
+    const AnimationPath& source,
+    const AnimationPath& destination,
+    const AnimationTerminalExtensionSpec& specification,
+    const AnimationReciprocalPanExtensionOptions& options,
+    AnimationPath* adjusted,
+    std::string* errorMessage) {
+    if (adjusted == nullptr || source.keys.size() < 2U ||
+        destination.keys.empty()) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "Balanced seam alignment needs prepared multi-key animations.";
+        }
+        return false;
+    }
+    const float fraction = std::clamp(
+        specification.sourceAlignmentFraction,
+        0.0F,
+        1.0F);
+    const auto sourceContext = PrepareAnimationPathEvaluation(source);
+    const auto destinationContext =
+        PrepareAnimationPathEvaluation(destination);
+    if (!sourceContext.valid || sourceContext.singleKey ||
+        !destinationContext.valid || destinationContext.singleKey) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "Balanced seam alignment could not prepare both animations.";
+        }
+        return false;
+    }
+    const auto sourceStart = EvaluatePreparedAnimationPath(
+        sourceContext,
+        0.0F);
+    const auto sourceDescriptor = DescribePanPatch(
+        sourceStart,
+        specification.sourcePatch);
+    const auto destinationEnd = EvaluatePreparedAnimationPath(
+        destinationContext,
+        destinationContext.durationSeconds);
+    const auto destinationDescriptor = DescribePanPatch(
+        destinationEnd,
+        specification.destinationEndPatch);
+    if (!sourceDescriptor.valid || !sourceDescriptor.rotationValid ||
+        !destinationDescriptor.valid ||
+        !destinationDescriptor.rotationValid) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "A seam triangle is degenerate or falls behind a camera, so the balanced alignment target is undefined.";
+        }
+        return false;
+    }
+    const auto target = BlendPanPatchDescriptors(
+        sourceDescriptor,
+        destinationDescriptor,
+        fraction);
+    if (!target.valid) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The balanced seam alignment target could not be blended.";
+        }
+        return false;
+    }
+
+    AnimationPath candidate = source;
+    MaterializePanCorrectionTangents(&candidate, sourceContext);
+    auto alignedCamera = candidate.keys.front().cameraPosition;
+    auto alignedFocus = candidate.keys.front().focusPoint;
+    OptimizePanEndpointPose(
+        &alignedCamera,
+        &alignedFocus,
+        candidate.keys.front(),
+        specification.sourcePatch,
+        target,
+        std::max(options.optimizationSweeps, 48U));
+    const auto cameraDelta = Difference(
+        alignedCamera,
+        candidate.keys.front().cameraPosition);
+    const auto focusDelta = Difference(
+        alignedFocus,
+        candidate.keys.front().focusPoint);
+    auto* correction = UpsertPanCorrection(
+        &candidate,
+        candidate.keys.front().id,
+        candidate.keys.front().cameraPosition,
+        candidate.keys.front().focusPoint);
+    if (correction == nullptr) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "Could not create the balanced seam start correction.";
+        }
+        return false;
+    }
+    // The ease has zero slope at the moved endpoint, so the source keeps its
+    // authored velocity through the 50% pose; only the pose itself shifts.
+    correction->hasCameraCorrectionTangent = true;
+    correction->hasFocusCorrectionTangent = true;
+    candidate.keys.front().cameraPosition = alignedCamera;
+    candidate.keys.front().focusPoint = alignedFocus;
+    const std::uint32_t rampFrames = specification.alignmentRampFrames > 0U
+        ? specification.alignmentRampFrames
+        : specification.sourceTailFrame;
+    SpreadPanAlignmentCorrection(
+        &candidate,
+        sourceContext.knots,
+        cameraDelta,
+        focusDelta,
+        static_cast<float>(rampFrames) / kAnimationFramesPerSecond,
+        false);
+    if (!PrepareAnimationPathEvaluation(candidate).valid) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The balanced-alignment source could not be evaluated.";
+        }
+        return false;
+    }
+    *adjusted = std::move(candidate);
+    return true;
+}
+
 float PanCubicContinuationValue(
     float startValue,
     float startDerivative,
@@ -3401,6 +3667,19 @@ bool AppendPanTerminal(
     candidate->keys.back().cameraPosition = alignedEndCamera;
     candidate->keys.back().focusPoint = alignedEndFocus;
     candidate->keys.back().hasOrientation = false;
+    // Ease the terminal alignment move backwards across the authored keys
+    // inside the requested pre-roll window. Without this the complete move
+    // ramps in over only the final authored segment, which reads as a sudden
+    // movement when the 50% poses start far apart and that segment is short.
+    const auto terminalSpread = SpreadPanAlignmentCorrection(
+        candidate,
+        destinationContext.knots,
+        Difference(alignedEndCamera, destination.keys.back().cameraPosition),
+        Difference(alignedEndFocus, destination.keys.back().focusPoint),
+        static_cast<float>(specification.alignmentRampFrames) /
+            kAnimationFramesPerSecond,
+        true);
+    metrics->alignmentSpreadKeyCount = terminalSpread.spreadKeyCount;
 
     auto& firstKey = candidate->keys.front();
     firstKey.hasSplineEndpointTangent = true;
@@ -3899,10 +4178,9 @@ bool AppendPanTerminal(
             std::to_string(inflectionCount) + " screen-space inflection(s).";
     }
 
-    const float prefixEnd = destinationContext.knots.size() >= 2U
-                                ? destinationContext.knots[
-                                      destinationContext.knots.size() - 2U]
-                                : 0.0F;
+    // The pre-roll alignment ramp deviates on purpose inside its window, so
+    // exactness is asserted only before the first eased key.
+    const float prefixEnd = terminalSpread.deviationStartTime;
     for (std::uint32_t sample = 0U; sample <= 128U; ++sample) {
         const float time = prefixEnd * static_cast<float>(sample) / 128.0F;
         const auto before = EvaluatePreparedAnimationPath(
@@ -3916,6 +4194,50 @@ bool AppendPanTerminal(
             std::max(
                 Distance(before.camera.position, after.camera.position),
                 Distance(before.focusPoint, after.focusPoint)));
+    }
+    // Peak extra camera speed the alignment introduces while approaching the
+    // seam. This is the quantity a viewer perceives as the seam bump.
+    const float transientBegin = std::min(prefixEnd, destinationEndTime);
+    if (destinationEndTime - transientBegin > 1.0e-4F) {
+        constexpr float kTransientProbeDelta = 1.0F / 120.0F;
+        for (std::uint32_t sample = 0U; sample <= 64U; ++sample) {
+            const float time = std::lerp(
+                transientBegin,
+                destinationEndTime,
+                static_cast<float>(sample) / 64.0F);
+            const float probeBegin = std::max(0.0F, time - kTransientProbeDelta);
+            const float probeEnd = std::min(
+                destinationEndTime,
+                time + kTransientProbeDelta);
+            const float span = probeEnd - probeBegin;
+            if (span <= 1.0e-6F) {
+                continue;
+            }
+            const auto beforeVelocity = [&](const auto& context) {
+                const auto early = EvaluatePreparedAnimationPath(
+                    context,
+                    probeBegin);
+                const auto late = EvaluatePreparedAnimationPath(
+                    context,
+                    probeEnd);
+                return std::array<float, 3>{
+                    (late.camera.position[0U] - early.camera.position[0U]) /
+                        span,
+                    (late.camera.position[1U] - early.camera.position[1U]) /
+                        span,
+                    (late.camera.position[2U] - early.camera.position[2U]) /
+                        span,
+                };
+            };
+            const auto original = beforeVelocity(destinationContext);
+            const auto adjusted = beforeVelocity(candidateContext);
+            metrics->incomingTransientPeakSpeed = std::max(
+                metrics->incomingTransientPeakSpeed,
+                std::hypot(
+                    adjusted[0U] - original[0U],
+                    adjusted[1U] - original[1U],
+                    adjusted[2U] - original[2U]));
+        }
     }
     const std::size_t oldTerminalIndex = destination.keys.size() - 1U;
     metrics->formerTerminalCameraMove = Distance(
@@ -3945,9 +4267,26 @@ bool BuildPanBidirectionalSeam(
         return false;
     }
     PanBidirectionalSeamBuild candidate;
+    // Optional balanced alignment: move the source's 50% start key toward
+    // the destination terminal first, so each side absorbs its share of the
+    // seam alignment instead of the destination lurching the whole way.
+    AnimationPath biasAdjustedSource;
+    const AnimationPath* effectiveSource = &source;
+    if (specification.sourceAlignmentFraction > 1.0e-4F) {
+        if (!AdjustPanSourceStartForSeamAlignment(
+                source,
+                destination,
+                specification,
+                options,
+                &biasAdjustedSource,
+                errorMessage)) {
+            return false;
+        }
+        effectiveSource = &biasAdjustedSource;
+    }
     if (!AppendPanTerminal(
             destination,
-            source,
+            *effectiveSource,
             specification,
             options,
             &candidate.destinationTailCandidate,
@@ -3968,7 +4307,7 @@ bool BuildPanBidirectionalSeam(
     AnimationPath reversedSource;
     AnimationPath reversedAdjustedDestination;
     if (!ReversePanPathForExtension(
-            source,
+            *effectiveSource,
             &reversedSource,
             errorMessage) ||
         !ReversePanPathForExtension(
@@ -3981,6 +4320,8 @@ bool BuildPanBidirectionalSeam(
     reverseSpecification.sourceTailFrame = specification.sourceTailFrame;
     reverseSpecification.sourcePatch = specification.destinationEndPatch;
     reverseSpecification.destinationEndPatch = specification.sourcePatch;
+    reverseSpecification.alignmentRampFrames =
+        specification.alignmentRampFrames;
     AnimationPath reversedHeadCandidate;
     if (!AppendPanTerminal(
             reversedSource,
@@ -4070,20 +4411,119 @@ bool MergePanBidirectionalEnds(
         headKeyCount + original.keys.size() - 1U;
     candidate.keys[candidateOriginalLast] =
         tailCandidate.keys[original.keys.size() - 1U];
-    if (const auto* correction = FindPanCorrection(
+    // Both independent end fits may ease part of their seam alignment onto
+    // the original keys inside their pre-roll windows. Their visible-pose
+    // moves and materialized correction tangents are deltas against the same
+    // original path, so the merged key composes them additively over one
+    // shared base pose. The tangent baseline is the original's EFFECTIVE
+    // value: a pre-existing correction without materialized tangents still
+    // evaluates with a derived central-difference tangent, and both fits
+    // materialized exactly that value, so subtracting the stored (zero)
+    // record would double it.
+    const auto originalMergeContext = PrepareAnimationPathEvaluation(original);
+    const auto originalEffectiveTangent = [&](std::size_t keyIndex,
+                                              bool cameraTrack)
+        -> std::array<float, 3> {
+        if (!originalMergeContext.hasLoopKeyCorrections ||
+            keyIndex >= originalMergeContext.loopCameraCorrectionTangents
+                             .size()) {
+            return {};
+        }
+        return cameraTrack
+            ? originalMergeContext.loopCameraCorrectionTangents[keyIndex]
+            : originalMergeContext.loopFocusCorrectionTangents[keyIndex];
+    };
+    for (std::size_t index = 0U; index < original.keys.size(); ++index) {
+        const auto& originalKey = original.keys[index];
+        const auto* tailCorrection = FindPanCorrection(
             tailCandidate,
-            original.keys.back().id);
-        correction != nullptr) {
+            originalKey.id);
+        if (tailCorrection == nullptr) {
+            continue;
+        }
+        const auto* headCorrection = FindPanCorrection(
+            headCandidate,
+            originalKey.id);
+        const auto* originalCorrection = FindPanCorrection(
+            original,
+            originalKey.id);
         auto existing = std::find_if(
             candidate.localizedKeyCorrections.begin(),
             candidate.localizedKeyCorrections.end(),
             [&](const auto& value) {
-                return value.keyId == original.keys.back().id;
+                return value.keyId == originalKey.id;
             });
-        if (existing != candidate.localizedKeyCorrections.end()) {
-            *existing = *correction;
-        } else {
-            candidate.localizedKeyCorrections.push_back(*correction);
+        if (headCorrection == nullptr) {
+            if (index + 1U < original.keys.size()) {
+                // The tail fit moved this interior key; carry the move onto
+                // the merged key while keeping the head fit's timing fields.
+                auto& mergedKey = candidate.keys[headKeyCount + index];
+                const auto& tailKey = tailCandidate.keys[index];
+                for (std::size_t component = 0U; component < 3U;
+                     ++component) {
+                    mergedKey.cameraPosition[component] +=
+                        tailKey.cameraPosition[component] -
+                        originalKey.cameraPosition[component];
+                    mergedKey.focusPoint[component] +=
+                        tailKey.focusPoint[component] -
+                        originalKey.focusPoint[component];
+                }
+            }
+            if (existing != candidate.localizedKeyCorrections.end()) {
+                *existing = *tailCorrection;
+            } else {
+                candidate.localizedKeyCorrections.push_back(*tailCorrection);
+            }
+            continue;
+        }
+        if (existing == candidate.localizedKeyCorrections.end()) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "A merged seam key lost its localized correction record.";
+            }
+            return false;
+        }
+        auto& mergedKey = candidate.keys[headKeyCount + index];
+        const auto& tailKey = tailCandidate.keys[index];
+        const auto originalTangent = [&](bool cameraTrack)
+            -> std::array<float, 3> {
+            if (originalCorrection == nullptr) {
+                return {};
+            }
+            return originalEffectiveTangent(index, cameraTrack);
+        };
+        const auto composeTangent = [&](std::array<float, 3>* merged,
+                                        const std::array<float, 3>& tail,
+                                        bool cameraTrack) {
+            const auto baseTangent = originalTangent(cameraTrack);
+            for (std::size_t component = 0U; component < 3U; ++component) {
+                (*merged)[component] +=
+                    tail[component] - baseTangent[component];
+            }
+        };
+        existing->hasCameraCorrectionTangent = true;
+        existing->hasFocusCorrectionTangent = true;
+        composeTangent(
+            &existing->cameraCorrectionTangent,
+            tailCorrection->hasCameraCorrectionTangent
+                ? tailCorrection->cameraCorrectionTangent
+                : std::array<float, 3>{},
+            true);
+        composeTangent(
+            &existing->focusCorrectionTangent,
+            tailCorrection->hasFocusCorrectionTangent
+                ? tailCorrection->focusCorrectionTangent
+                : std::array<float, 3>{},
+            false);
+        if (index + 1U < original.keys.size()) {
+            for (std::size_t component = 0U; component < 3U; ++component) {
+                mergedKey.cameraPosition[component] +=
+                    tailKey.cameraPosition[component] -
+                    originalKey.cameraPosition[component];
+                mergedKey.focusPoint[component] +=
+                    tailKey.focusPoint[component] -
+                    originalKey.focusPoint[component];
+            }
         }
     }
 
@@ -4173,6 +4613,10 @@ void StorePanBuildMetrics(
         source.formerTerminalCameraMove;
     destination->formerTerminalFocusMove[index] =
         source.formerTerminalFocusMove;
+    destination->alignmentSpreadKeyCount[index] =
+        source.alignmentSpreadKeyCount;
+    destination->incomingTransientPeakSpeed[index] =
+        source.incomingTransientPeakSpeed;
 }
 
 }  // namespace
@@ -4271,6 +4715,11 @@ BuildAnimationPanTerminalExtensionPreview(
         metrics.afterVelocityRms;
     result.rotationRateResidualDegreesPerSecond =
         metrics.rotationRateResidual;
+    result.formerTerminalCameraMove = metrics.formerTerminalCameraMove;
+    result.formerTerminalFocusMove = metrics.formerTerminalFocusMove;
+    result.alignmentSpreadKeyCount = metrics.alignmentSpreadKeyCount;
+    result.incomingTransientPeakSpeed =
+        metrics.incomingTransientPeakSpeed;
     return result;
 }
 
@@ -4318,6 +4767,14 @@ BuildAnimationPanBidirectionalSeamPreview(
         build.headMetrics.afterVelocityRms;
     result.sourceHead.rotationRateResidualDegreesPerSecond =
         build.headMetrics.rotationRateResidual;
+    result.sourceHead.formerTerminalCameraMove =
+        build.headMetrics.formerTerminalCameraMove;
+    result.sourceHead.formerTerminalFocusMove =
+        build.headMetrics.formerTerminalFocusMove;
+    result.sourceHead.alignmentSpreadKeyCount =
+        build.headMetrics.alignmentSpreadKeyCount;
+    result.sourceHead.incomingTransientPeakSpeed =
+        build.headMetrics.incomingTransientPeakSpeed;
     result.destinationTail.succeeded = true;
     result.destinationTail.changed = true;
     result.destinationTail.candidate =
@@ -4334,6 +4791,14 @@ BuildAnimationPanBidirectionalSeamPreview(
         build.tailMetrics.afterVelocityRms;
     result.destinationTail.rotationRateResidualDegreesPerSecond =
         build.tailMetrics.rotationRateResidual;
+    result.destinationTail.formerTerminalCameraMove =
+        build.tailMetrics.formerTerminalCameraMove;
+    result.destinationTail.formerTerminalFocusMove =
+        build.tailMetrics.formerTerminalFocusMove;
+    result.destinationTail.alignmentSpreadKeyCount =
+        build.tailMetrics.alignmentSpreadKeyCount;
+    result.destinationTail.incomingTransientPeakSpeed =
+        build.tailMetrics.incomingTransientPeakSpeed;
     result.succeeded = true;
     result.changed = true;
     return result;

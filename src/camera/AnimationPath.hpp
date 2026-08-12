@@ -351,6 +351,19 @@ struct AnimationTerminalExtensionSpec {
     std::uint32_t sourceTailFrame = 0U;
     AnimationSurfacePatchObservation sourcePatch{};
     AnimationSurfacePatchObservation destinationEndPatch{};
+    // Frames before the destination's terminal over which the 50%-pose
+    // alignment move eases in as fractional corrections on the authored keys
+    // inside that window. Zero preserves the legacy behavior of ramping the
+    // complete move across only the final authored segment, which reads as a
+    // sudden movement when the alignment move is large and that segment is
+    // short. The assistant defaults this to the seam's pre-roll extent.
+    std::uint32_t alignmentRampFrames = 0U;
+    // Fraction of the seam's 50%-pose alignment carried by the source's
+    // frame-zero key instead of the destination's terminal key. Zero keeps
+    // the legacy destination-only move; one half meets in the middle so each
+    // path absorbs half the alignment transient. Honored by the
+    // bidirectional seam builders, which adjust the source before fitting.
+    float sourceAlignmentFraction = 0.0F;
 };
 
 struct AnimationReciprocalPanExtensionOptions {
@@ -387,6 +400,11 @@ struct AnimationReciprocalPanExtensionMetrics {
     std::array<float, 2> maxPrefixPositionError{};
     std::array<float, 2> formerTerminalCameraMove{};
     std::array<float, 2> formerTerminalFocusMove{};
+    // Authored keys that received fractional alignment corrections inside
+    // the pre-roll ramp window, and the peak extra camera speed the seam
+    // alignment adds over the incoming window (world units per second).
+    std::array<std::uint32_t, 2> alignmentSpreadKeyCount{};
+    std::array<float, 2> incomingTransientPeakSpeed{};
 };
 
 struct AnimationReciprocalPanExtensionResult {
@@ -412,6 +430,13 @@ struct AnimationPanTerminalExtensionResult {
     float patchNodeOverlayRmsScreenHeights = 0.0F;
     float velocityResidualScreenHeightsPerSecond = 0.0F;
     float rotationRateResidualDegreesPerSecond = 0.0F;
+    // Seam alignment transient diagnostics: how far the former terminal key
+    // moved, how many authored keys carry fractional ramp corrections, and
+    // the peak extra camera speed over the incoming window (units/second).
+    float formerTerminalCameraMove = 0.0F;
+    float formerTerminalFocusMove = 0.0F;
+    std::uint32_t alignmentSpreadKeyCount = 0U;
+    float incomingTransientPeakSpeed = 0.0F;
     std::string errorMessage;
 };
 
