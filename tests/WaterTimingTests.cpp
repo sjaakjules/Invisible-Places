@@ -704,6 +704,33 @@ TEST_CASE("Keyed setting tracks hold endpoints and step at exact Hold keys",
           Approx(0.2F));
 }
 
+TEST_CASE("Keyed setting interpolation retains precision beyond UI display",
+          "[water][timing][keyed][precision]") {
+    using invisible_places::water::AddOrUpdateWaterSettingKey;
+    using invisible_places::water::EvaluateWaterKeyedSettingTrack;
+    using invisible_places::water::WaterKeyedSettingTrack;
+    using invisible_places::water::WaterScenarioInterpolation;
+
+    WaterKeyedSettingTrack track;
+    track.settingId = "normalised_amount";
+    AddOrUpdateWaterSettingKey(
+        &track,
+        0.20F,
+        0.123456F,
+        WaterScenarioInterpolation::Linear);
+    AddOrUpdateWaterSettingKey(
+        &track,
+        0.80F,
+        0.987654F,
+        WaterScenarioInterpolation::Linear);
+
+    REQUIRE(track.keys.size() == 2U);
+    CHECK(track.keys[0].value == Approx(0.123456F).margin(1.0e-7F));
+    CHECK(track.keys[1].value == Approx(0.987654F).margin(1.0e-7F));
+    CHECK(EvaluateWaterKeyedSettingTrack(track, 0.35F).value() ==
+          Approx(0.3395055F).margin(1.0e-6F));
+}
+
 TEST_CASE("Track-default keys follow the track's default interpolation",
           "[water][timing][keyed][interpolation]") {
     using Catch::Approx;
@@ -2010,6 +2037,76 @@ TEST_CASE("Keyed setting Centripetal Catmull-Rom stays finite through uneven key
     }
 }
 
+TEST_CASE("Keyed setting Spline Handles shape Bezier segments without losing handles",
+          "[water][timing][keyed][spline-handles]") {
+    using invisible_places::water::AddOrUpdateWaterSettingKey;
+    using invisible_places::water::EvaluateWaterKeyedSettingTrack;
+    using invisible_places::water::MoveWaterSettingKey;
+    using invisible_places::water::MoveWaterSettingSplineHandlePoint;
+    using invisible_places::water::ResolveWaterSettingSplineHandlePoint;
+    using invisible_places::water::WaterKeyedSettingTrack;
+    using invisible_places::water::WaterSettingSplineHandleSide;
+
+    WaterKeyedSettingTrack track;
+    track.settingId = "strength";
+    track.defaultInterpolation = WaterScenarioInterpolation::SplineHandles;
+    track.keys = {
+        {.position = 0.0F,
+         .value = 0.0F,
+         .interpolation = WaterScenarioInterpolation::TrackDefault},
+        {.position = 1.0F,
+         .value = 1.0F,
+         .interpolation = WaterScenarioInterpolation::Linear},
+    };
+
+    // Default one-third handles reproduce Smooth Step exactly while still
+    // exposing an editable outgoing and incoming control point.
+    REQUIRE(EvaluateWaterKeyedSettingTrack(track, 0.25F).has_value());
+    CHECK(
+        EvaluateWaterKeyedSettingTrack(track, 0.25F).value() ==
+        Approx(0.15625F).margin(1.0e-5F));
+    const auto outgoing = ResolveWaterSettingSplineHandlePoint(
+        track,
+        0.0F,
+        WaterSettingSplineHandleSide::Outgoing);
+    const auto incoming = ResolveWaterSettingSplineHandlePoint(
+        track,
+        1.0F,
+        WaterSettingSplineHandleSide::Incoming);
+    REQUIRE(outgoing.has_value());
+    REQUIRE(incoming.has_value());
+    CHECK(outgoing->controlPosition == Approx(1.0F / 3.0F));
+    CHECK(outgoing->controlValue == Approx(0.0F));
+    CHECK(incoming->controlPosition == Approx(2.0F / 3.0F));
+    CHECK(incoming->controlValue == Approx(1.0F));
+
+    REQUIRE(MoveWaterSettingSplineHandlePoint(
+        &track,
+        0.0F,
+        WaterSettingSplineHandleSide::Outgoing,
+        1.0F / 3.0F,
+        1.0F));
+    CHECK(
+        EvaluateWaterKeyedSettingTrack(track, 0.5F).value() ==
+        Approx(0.875F).margin(1.0e-5F));
+
+    // Ordinary value/interpolation edits preserve the authored handle, and
+    // retiming the neighbour carries its segment-relative time coordinate.
+    AddOrUpdateWaterSettingKey(
+        &track,
+        0.0F,
+        0.2F,
+        WaterScenarioInterpolation::TrackDefault);
+    CHECK(track.keys.front().outgoingHandleValue == Approx(1.0F));
+    REQUIRE(MoveWaterSettingKey(&track, 1.0F, 0.8F));
+    const auto retimedIncoming = ResolveWaterSettingSplineHandlePoint(
+        track,
+        0.8F,
+        WaterSettingSplineHandleSide::Incoming);
+    REQUIRE(retimedIncoming.has_value());
+    CHECK(retimedIncoming->controlPosition == Approx(0.8F * 2.0F / 3.0F));
+}
+
 TEST_CASE("Mixed Hold and Catmull-Rom segments step exactly at the shared key",
           "[water][timing][keyed][catmull-rom]") {
     using invisible_places::water::EvaluateWaterKeyedSettingTrack;
@@ -2226,13 +2323,13 @@ TEST_CASE("Settings-clip span transforms offset and stretch grouped keys",
         0.10F,
         0.50F));
 
-    // The limits query reports how far the span may move before touching
-    // outside keys on any track that has keys inside the span.
+    // Other keys and clip windows do not clamp the drag range; only an exact
+    // same-track landing collision rejects a particular transform.
     const auto limits = WaterFeatureTimelineSpanLimits(
         timeline,
         0.50F,
         0.90F);
-    CHECK(limits.minimumStart == Approx(0.10F + 2.0e-4F));
+    CHECK(limits.minimumStart == Approx(0.0F));
     CHECK(limits.maximumEnd == Approx(1.0F));
 }
 
@@ -2383,8 +2480,8 @@ TEST_CASE("Settings clips transfer between features of one kind only",
     CHECK(source.settings.front().keys.size() == 4U);
     REQUIRE(source.clips.size() == 1U);
 
-    // A move removes the clip and its keys from the source; keys outside
-    // the clip stay.
+    // A move removes the clip and its keys from the source; the earlier copy
+    // remains as an independent overlapping clip on the destination.
     const auto moved = TransferWaterFeatureClip(
         &source,
         3U,
@@ -2394,14 +2491,21 @@ TEST_CASE("Settings clips transfer between features of one kind only",
     CHECK(source.clips.empty());
     REQUIRE(source.settings.front().keys.size() == 1U);
     CHECK(source.settings.front().keys.front().position == Approx(0.70F));
+    REQUIRE(sibling.clips.size() == 2U);
+    REQUIRE(sibling.settings.front().keys.size() == 6U);
 
-    // Removing a clip without deleting keys keeps them loose.
+    // Removing one overlapping clip without deleting keys keeps only its
+    // three members loose; the first copied clip remains intact.
     REQUIRE(RemoveWaterFeatureClip(&sibling, moved.value(), false));
-    CHECK(sibling.clips.empty());
-    CHECK(sibling.settings.front().keys.size() == 3U);
+    REQUIRE(sibling.clips.size() == 1U);
+    CHECK(sibling.clips.front().id == copied.value());
+    CHECK(sibling.settings.front().keys.size() == 6U);
+    CHECK(std::count_if(
+              sibling.settings.front().keys.begin(),
+              sibling.settings.front().keys.end(),
+              [](const auto& key) { return key.clipId == 0U; }) == 3);
 
-    // Loose keys regroup into a clip, and removing it with its keys clears
-    // the span.
+    // Loose keys regroup into a clip even across an existing clip's window.
     const auto regrouped =
         invisible_places::water::CreateWaterFeatureClipFromSpan(
             &sibling,
@@ -2410,6 +2514,12 @@ TEST_CASE("Settings clips transfer between features of one kind only",
             "Regrouped");
     REQUIRE(regrouped.has_value());
     REQUIRE(RemoveWaterFeatureClip(&sibling, regrouped.value(), true));
+    REQUIRE(sibling.clips.size() == 1U);
+    REQUIRE(sibling.settings.front().keys.size() == 3U);
+    REQUIRE(RemoveWaterFeatureClip(
+        &sibling,
+        copied.value(),
+        /*removeKeys=*/true));
     CHECK(sibling.clips.empty());
     CHECK(sibling.settings.front().keys.empty());
 }
@@ -2476,8 +2586,9 @@ TEST_CASE("Settings clips and package lengths round-trip through the project doc
         .settings = {{
             .settingId = "strength",
             .keys = {
-                {.position = 0.20F, .value = 0.0F},
-                {.position = 0.40F, .value = 1.0F},
+                {.position = 0.20F, .value = 0.0F, .clipId = 5U},
+                {.position = 0.40F, .value = 1.0F, .clipId = 5U},
+                {.position = 0.70F, .value = 0.25F},
             },
         }},
         .clips = {
@@ -2487,6 +2598,7 @@ TEST_CASE("Settings clips and package lengths round-trip through the project doc
              .end = 0.40F,
              .sourceProfileName = "Seep On Off"},
         },
+        .clipMembershipExplicit = true,
     });
     entry.runs.push_back(run);
     document.waterFeatureTimingRuns.push_back(entry);
@@ -2507,6 +2619,14 @@ TEST_CASE("Settings clips and package lengths round-trip through the project doc
     TemporaryTimingFile file{"invisible_places_settings_clips.json"};
     std::string errorMessage;
     REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+    {
+        std::ifstream input{file.path};
+        const std::string saved{
+            std::istreambuf_iterator<char>{input},
+            std::istreambuf_iterator<char>{}};
+        CHECK(saved.find("\"clip_id\": 5") != std::string::npos);
+        CHECK(saved.find("\"clip_id\": 0") != std::string::npos);
+    }
     const auto loaded = LoadProjectDocument(file.path, &errorMessage);
     REQUIRE(loaded.has_value());
     REQUIRE(loaded->waterFeatureTimingRuns.size() == 1U);
@@ -2520,6 +2640,11 @@ TEST_CASE("Settings clips and package lengths round-trip through the project doc
     CHECK(clips.front().start == Approx(0.20F));
     CHECK(clips.front().end == Approx(0.40F));
     CHECK(clips.front().sourceProfileName == "Seep On Off");
+    REQUIRE(loadedRun.features.front().settings.front().keys.size() == 3U);
+    CHECK(loadedRun.features.front().settings.front().keys[0].clipId == 5U);
+    CHECK(loadedRun.features.front().settings.front().keys[1].clipId == 5U);
+    CHECK(loadedRun.features.front().settings.front().keys[2].clipId == 0U);
+    CHECK(loadedRun.features.front().clipMembershipExplicit);
     REQUIRE(loaded->waterKeyedSettingsProfiles.size() == 1U);
     CHECK(loaded->waterKeyedSettingsProfiles.front().nativeLengthFraction ==
           Approx(0.20F));
@@ -2569,7 +2694,7 @@ TEST_CASE("Adjacent clips keep their boundary keys through span operations",
           "[water][timing][keyed][clips]") {
     using Catch::Approx;
     using invisible_places::water::RemoveWaterFeatureClip;
-    using invisible_places::water::TransformWaterFeatureTimelineSpan;
+    using invisible_places::water::TransformWaterFeatureClip;
     using invisible_places::water::WaterFeatureTimeline;
     using invisible_places::water::WaterKeyedFeatureKind;
 
@@ -2580,29 +2705,29 @@ TEST_CASE("Adjacent clips keep their boundary keys through span operations",
     timeline.settings = {
         {.settingId = "strength",
          .keys = {
-             {.position = 0.20F, .value = 0.0F},
-             {.position = 0.35F, .value = 1.0F},
-             {.position = 0.50F, .value = 0.4F},
-             {.position = 0.65F, .value = 1.0F},
-             {.position = 0.80F, .value = 0.0F},
+             {.position = 0.20F, .value = 0.0F, .clipId = 1U},
+             {.position = 0.35F, .value = 1.0F, .clipId = 1U},
+             {.position = 0.50F, .value = 0.4F, .clipId = 2U},
+             {.position = 0.65F, .value = 1.0F, .clipId = 2U},
+             {.position = 0.80F, .value = 0.0F, .clipId = 2U},
          }},
     };
     timeline.clips = {
-        {.id = 1U, .name = "First", .start = 0.20F, .end = 0.50F},
+        {.id = 1U, .name = "First", .start = 0.20F, .end = 0.35F},
         {.id = 2U, .name = "Second", .start = 0.50F, .end = 0.80F},
     };
+    timeline.clipMembershipExplicit = true;
 
-    // Moving the first clip leaves the shared boundary key with its
-    // neighbour instead of dragging the second clip's opening key away.
-    REQUIRE(TransformWaterFeatureTimelineSpan(
+    // Moving the first clip leaves the second clip's explicitly owned
+    // opening key behind instead of capturing it by destination span.
+    REQUIRE(TransformWaterFeatureClip(
         &timeline,
-        0.20F,
-        0.50F,
+        1U,
         0.10F,
         0.40F));
     REQUIRE(timeline.settings.front().keys.size() == 5U);
     CHECK(timeline.settings.front().keys[0].position == Approx(0.10F));
-    CHECK(timeline.settings.front().keys[1].position == Approx(0.25F));
+    CHECK(timeline.settings.front().keys[1].position == Approx(0.40F));
     CHECK(timeline.settings.front().keys[2].position == Approx(0.50F));
     CHECK(timeline.settings.front().keys[2].value == Approx(0.4F));
     CHECK(timeline.settings.front().keys[3].position == Approx(0.65F));
@@ -2610,15 +2735,8 @@ TEST_CASE("Adjacent clips keep their boundary keys through span operations",
     CHECK(timeline.clips[0].end == Approx(0.40F));
     CHECK(timeline.clips[1].start == Approx(0.50F));
 
-    // Moving the clip back against the neighbour is allowed — touching is
-    // not overlapping — and deleting its keys then spares the key the
-    // second clip still claims on the shared boundary.
-    REQUIRE(TransformWaterFeatureTimelineSpan(
-        &timeline,
-        0.10F,
-        0.40F,
-        0.20F,
-        0.50F));
+    // Deleting it affects only its explicit members; the second clip's
+    // opening key survives.
     REQUIRE(RemoveWaterFeatureClip(&timeline, 1U, /*removeKeys=*/true));
     REQUIRE(timeline.settings.front().keys.size() == 3U);
     CHECK(timeline.settings.front().keys[0].position == Approx(0.50F));
@@ -2678,7 +2796,7 @@ TEST_CASE("Applying a package beside a clip preserves the neighbour boundary key
     CHECK(keys[3].value == Approx(1.0F));
 }
 
-TEST_CASE("Duplicating a clip never pastes over its own source",
+TEST_CASE("Duplicating a clip supports overlapping destinations",
           "[water][timing][keyed][clips]") {
     using Catch::Approx;
     using invisible_places::water::DuplicateWaterFeatureClip;
@@ -2700,26 +2818,33 @@ TEST_CASE("Duplicating a clip never pastes over its own source",
     timeline.clips = {
         {.id = 1U, .name = "Burst", .start = 0.70F, .end = 0.95F}};
 
-    // There is no room after this clip: the clamped window would overlap
-    // the source, so the duplicate is refused and nothing is lost.
-    CHECK_FALSE(DuplicateWaterFeatureClip(&timeline, 1U, 0.951F)
-                    .has_value());
-    CHECK(timeline.clips.size() == 1U);
-    CHECK(timeline.settings.front().keys.size() == 3U);
+    // The clamped destination overlaps the source, but remains an
+    // independent clip whose same-track keys are minimally separated.
+    const auto overlapping =
+        DuplicateWaterFeatureClip(&timeline, 1U, 0.951F);
+    REQUIRE(overlapping.has_value());
+    CHECK(timeline.clips.size() == 2U);
+    CHECK(timeline.settings.front().keys.size() == 6U);
+    CHECK(std::count_if(
+              timeline.settings.front().keys.begin(),
+              timeline.settings.front().keys.end(),
+              [&](const auto& key) {
+                  return key.clipId == overlapping.value();
+              }) == 3);
 
-    // A clear window in front still works.
+    // A clear window in front still works independently.
     const auto duplicated =
         DuplicateWaterFeatureClip(&timeline, 1U, 0.10F);
     REQUIRE(duplicated.has_value());
-    CHECK(timeline.clips.size() == 2U);
-    CHECK(timeline.settings.front().keys.size() == 6U);
+    CHECK(timeline.clips.size() == 3U);
+    CHECK(timeline.settings.front().keys.size() == 9U);
 }
 
-TEST_CASE("Clip moves cannot stack entries and sanitize separates overlaps",
+TEST_CASE("Clip moves and sanitize preserve overlapping entries",
           "[water][timing][keyed][clips]") {
     using Catch::Approx;
     using invisible_places::water::SanitizeWaterFeatureTimingRun;
-    using invisible_places::water::TransformWaterFeatureTimelineSpan;
+    using invisible_places::water::TransformWaterFeatureClip;
     using invisible_places::water::WaterFeatureTimeline;
     using invisible_places::water::WaterFeatureTimelineSpanLimits;
     using invisible_places::water::WaterFeatureTimingRun;
@@ -2732,38 +2857,40 @@ TEST_CASE("Clip moves cannot stack entries and sanitize separates overlaps",
     timeline.settings = {
         {.settingId = "strength",
          .keys = {
-             {.position = 0.10F, .value = 0.0F},
-             {.position = 0.20F, .value = 1.0F},
+             {.position = 0.10F, .value = 0.0F, .clipId = 1U},
+             {.position = 0.20F, .value = 1.0F, .clipId = 1U},
+             {.position = 0.50F, .value = 0.3F, .clipId = 2U},
+             {.position = 0.60F, .value = 0.7F, .clipId = 2U},
          }},
     };
-    // The second clip holds no keys, so only its span can block the move.
     timeline.clips = {
         {.id = 1U, .name = "Keyed", .start = 0.10F, .end = 0.20F},
         {.id = 2U, .name = "Marker", .start = 0.50F, .end = 0.60F},
     };
+    timeline.clipMembershipExplicit = true;
 
     const auto limits = WaterFeatureTimelineSpanLimits(
         timeline,
         0.10F,
         0.20F);
-    CHECK(limits.maximumEnd == Approx(0.50F));
-    CHECK_FALSE(TransformWaterFeatureTimelineSpan(
+    CHECK(limits.minimumStart == Approx(0.0F));
+    CHECK(limits.maximumEnd == Approx(1.0F));
+    REQUIRE(TransformWaterFeatureClip(
         &timeline,
-        0.10F,
-        0.20F,
+        1U,
         0.45F,
         0.55F));
-    REQUIRE(TransformWaterFeatureTimelineSpan(
+    const auto* moved = invisible_places::water::FindWaterFeatureClip(
         &timeline,
-        0.10F,
-        0.20F,
-        0.30F,
-        0.40F));
-    CHECK(timeline.clips[0].start == Approx(0.30F));
+        1U);
+    REQUIRE(moved != nullptr);
+    CHECK(moved->start == Approx(0.45F));
+    CHECK(moved->end == Approx(0.55F));
+    CHECK(timeline.settings.front().keys[1].clipId == 2U);
+    CHECK(timeline.settings.front().keys[2].clipId == 1U);
 
-    // Overlapping clips from hand-edited or retimed documents come apart
-    // on sanitize: later clips clamp behind their predecessor and a clip
-    // swallowed whole is dropped.
+    // Overlapping and fully nested clips from hand-edited documents survive
+    // sanitization; only bounds and ids are repaired.
     WaterFeatureTimingRun run;
     run.features.push_back({
         .feature = {.kind = WaterKeyedFeatureKind::SeepageNode,
@@ -2777,10 +2904,78 @@ TEST_CASE("Clip moves cannot stack entries and sanitize separates overlaps",
     });
     const auto sanitized = SanitizeWaterFeatureTimingRun(run);
     const auto& clips = sanitized.features.front().clips;
-    REQUIRE(clips.size() == 2U);
+    REQUIRE(clips.size() == 3U);
     CHECK(clips[0].name == "A");
     CHECK(clips[0].end == Approx(0.50F));
     CHECK(clips[1].name == "B");
-    CHECK(clips[1].start == Approx(0.50F));
+    CHECK(clips[1].start == Approx(0.30F));
     CHECK(clips[1].end == Approx(0.70F));
+    CHECK(clips[2].name == "C");
+    CHECK(clips[2].start == Approx(0.32F));
+    CHECK(clips[2].end == Approx(0.40F));
+}
+
+TEST_CASE("Explicit clip membership routes new keys and derives clip bounds",
+          "[water][timing][keyed][clips]") {
+    using Catch::Approx;
+    using invisible_places::water::AddOrUpdateWaterSettingKey;
+    using invisible_places::water::CaptureWaterKeyedSettingsClipById;
+    using invisible_places::water::SynchronizeWaterFeatureClipBounds;
+    using invisible_places::water::WaterFeatureLooseKeySpan;
+    using invisible_places::water::WaterFeatureTimeline;
+    using invisible_places::water::WaterKeyedFeatureKind;
+    using invisible_places::water::WaterScenarioInterpolation;
+
+    WaterFeatureTimeline timeline;
+    timeline.feature = {
+        .kind = WaterKeyedFeatureKind::SeepageNode,
+        .objectId = 7U};
+    timeline.settings = {
+        {.settingId = "strength",
+         .keys = {
+             {.position = 0.20F, .value = 0.0F, .clipId = 7U},
+             {.position = 0.40F, .value = 1.0F, .clipId = 7U},
+             {.position = 0.70F, .value = 0.4F},
+         }},
+    };
+    timeline.clips = {
+        {.id = 7U, .name = "Selected", .start = 0.20F, .end = 0.40F},
+    };
+    timeline.clipMembershipExplicit = true;
+
+    // This is the model call used when the UI has one stored clip selected.
+    AddOrUpdateWaterSettingKey(
+        &timeline.settings.front(),
+        0.60F,
+        0.5F,
+        WaterScenarioInterpolation::Linear,
+        7U);
+    REQUIRE(SynchronizeWaterFeatureClipBounds(&timeline, 7U));
+    const auto* clip = invisible_places::water::FindWaterFeatureClip(
+        &timeline,
+        7U);
+    REQUIRE(clip != nullptr);
+    CHECK(clip->start == Approx(0.20F));
+    CHECK(clip->end == Approx(0.60F));
+
+    // With no selected clip id, a genuinely new key stays loose even though
+    // its time can overlap the selected clip's window.
+    AddOrUpdateWaterSettingKey(
+        &timeline.settings.front(),
+        0.30F,
+        0.25F);
+    const auto looseSpan = WaterFeatureLooseKeySpan(timeline);
+    REQUIRE(looseSpan.has_value());
+    CHECK(looseSpan->first == Approx(0.30F));
+    CHECK(looseSpan->second == Approx(0.70F));
+
+    const auto package = CaptureWaterKeyedSettingsClipById(timeline, 7U);
+    REQUIRE(package.settings.size() == 1U);
+    REQUIRE(package.settings.front().keys.size() == 3U);
+    CHECK(package.settings.front().keys.front().position == Approx(0.0F));
+    CHECK(package.settings.front().keys.back().position == Approx(1.0F));
+    CHECK(std::all_of(
+        package.settings.front().keys.begin(),
+        package.settings.front().keys.end(),
+        [](const auto& key) { return key.clipId == 0U; }));
 }

@@ -35,6 +35,8 @@ float InterpolationAmount(
     if (interpolation ==
             invisible_places::water::WaterScenarioInterpolation::Smooth ||
         interpolation == invisible_places::water::
+                             WaterScenarioInterpolation::SplineHandles ||
+        interpolation == invisible_places::water::
                              WaterScenarioInterpolation::SmoothVelocity ||
         interpolation == invisible_places::water::
                              WaterScenarioInterpolation::
@@ -54,6 +56,7 @@ bool IsValidInterpolation(
             return true;
         case WaterScenarioInterpolation::Linear:
         case WaterScenarioInterpolation::Hold:
+        case WaterScenarioInterpolation::SplineHandles:
         // Setting-track-only sentinel; colourise keys never carry it.
         case WaterScenarioInterpolation::TrackDefault:
             return false;

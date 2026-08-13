@@ -149,6 +149,10 @@ constexpr std::uint32_t kTrackDefaultInterpolationProjectSchemaVersion = 71U;
 constexpr std::uint32_t kTrackDefaultInterpolationSourcesSchemaVersion = 26U;
 constexpr std::uint32_t kSeepageNodeSettingsProjectSchemaVersion = 72U;
 constexpr std::uint32_t kSeepageNodeSettingsSourcesSchemaVersion = 27U;
+constexpr std::uint32_t kWaterSplineHandlesProjectSchemaVersion = 75U;
+constexpr std::uint32_t kWaterSplineHandlesSourcesSchemaVersion = 29U;
+constexpr std::uint32_t kWaterClipMembershipProjectSchemaVersion = 76U;
+constexpr std::uint32_t kWaterClipMembershipSourcesSchemaVersion = 30U;
 constexpr std::uint32_t kRelativePalettePhaseProjectSchemaVersion = 62U;
 constexpr std::uint32_t kFieldMapBoundsMemoryProjectSchemaVersion = 63U;
 constexpr std::uint32_t kShorelineInstancesProjectSchemaVersion = 64U;
@@ -176,6 +180,18 @@ static_assert(
 static_assert(
     kWaterSourcesDocumentSchemaVersion >=
     kSeepageNodeSettingsSourcesSchemaVersion);
+static_assert(
+    kProjectDocumentSchemaVersion >=
+    kWaterSplineHandlesProjectSchemaVersion);
+static_assert(
+    kWaterSourcesDocumentSchemaVersion >=
+    kWaterSplineHandlesSourcesSchemaVersion);
+static_assert(
+    kProjectDocumentSchemaVersion >=
+    kWaterClipMembershipProjectSchemaVersion);
+static_assert(
+    kWaterSourcesDocumentSchemaVersion >=
+    kWaterClipMembershipSourcesSchemaVersion);
 
 constexpr std::string_view kProjectVisualEditedSuffix = "_edited";
 constexpr std::string_view kProjectVisualLegacyEditedSuffix = "_Edited";
@@ -4086,6 +4102,8 @@ const char* WaterScenarioInterpolationName(WaterScenarioInterpolation interpolat
             return "smooth_velocity";
         case WaterScenarioInterpolation::CentripetalCatmullRom:
             return "centripetal_catmull_rom";
+        case WaterScenarioInterpolation::SplineHandles:
+            return "spline_handles";
         case WaterScenarioInterpolation::TrackDefault:
             return "track_default";
     }
@@ -4108,6 +4126,9 @@ WaterScenarioInterpolation ParseWaterScenarioInterpolation(const json& interpola
     }
     if (name == "centripetal_catmull_rom") {
         return WaterScenarioInterpolation::CentripetalCatmullRom;
+    }
+    if (name == "spline_handles") {
+        return WaterScenarioInterpolation::SplineHandles;
     }
     if (name == "track_default") {
         return WaterScenarioInterpolation::TrackDefault;
@@ -4375,15 +4396,26 @@ invisible_places::water::WaterTimingKey ParseWaterTimingKey(const json& keyJson)
 
 
 json SerializeWaterKeyedSettingTrack(
-    const invisible_places::water::WaterKeyedSettingTrack& setting) {
+    const invisible_places::water::WaterKeyedSettingTrack& setting,
+    bool includeClipMembership = false) {
     json keysJson = json::array();
     for (const auto& key : setting.keys) {
-        keysJson.push_back({
+        json keyJson{
             {"position", key.position},
             {"value", key.value},
             {"interpolation",
              WaterScenarioInterpolationName(key.interpolation)},
-        });
+            {"incoming_handle_time", key.incomingHandleTime},
+            {"incoming_handle_value", key.incomingHandleValue},
+            {"outgoing_handle_time", key.outgoingHandleTime},
+            {"outgoing_handle_value", key.outgoingHandleValue},
+        };
+        if (includeClipMembership) {
+            // Zero is significant: it distinguishes a deliberately loose
+            // key from a pre-schema-76 key whose clip was inferred by span.
+            keyJson["clip_id"] = key.clipId;
+        }
+        keysJson.push_back(std::move(keyJson));
     }
     return {
         {"id", setting.settingId},
@@ -4443,6 +4475,19 @@ ParseWaterKeyedSettingTrack(const json& settingJson) {
                 key.interpolation = ParseWaterScenarioInterpolation(
                     keyJson.at("interpolation"));
             }
+            key.clipId = keyJson.value("clip_id", 0U);
+            key.incomingHandleTime = keyJson.value(
+                "incoming_handle_time",
+                key.incomingHandleTime);
+            key.incomingHandleValue = keyJson.value(
+                "incoming_handle_value",
+                key.incomingHandleValue);
+            key.outgoingHandleTime = keyJson.value(
+                "outgoing_handle_time",
+                key.outgoingHandleTime);
+            key.outgoingHandleValue = keyJson.value(
+                "outgoing_handle_value",
+                key.outgoingHandleValue);
             track.keys.push_back(key);
         }
     }
@@ -4541,13 +4586,17 @@ ParseWaterFeatureSettingsClip(const json& clipJson) {
 }
 
 json SerializeWaterFeatureTimingRun(
-    const invisible_places::water::WaterFeatureTimingRun& run) {
+    const invisible_places::water::WaterFeatureTimingRun& input) {
+    const auto run = invisible_places::water::SanitizeWaterFeatureTimingRun(
+        input);
     json featuresJson = json::array();
     for (const auto& timeline : run.features) {
         json settingsJson = json::array();
         for (const auto& setting : timeline.settings) {
             settingsJson.push_back(
-                SerializeWaterKeyedSettingTrack(setting));
+                SerializeWaterKeyedSettingTrack(
+                    setting,
+                    /*includeClipMembership=*/true));
         }
         json timelineJson{
             {"kind",
@@ -4601,6 +4650,16 @@ invisible_places::water::WaterFeatureTimingRun ParseWaterFeatureTimingRun(
             if (featureJson.contains("settings") &&
                 featureJson.at("settings").is_array()) {
                 for (const auto& settingJson : featureJson.at("settings")) {
+                    if (settingJson.contains("keys") &&
+                        settingJson.at("keys").is_array() &&
+                        std::any_of(
+                            settingJson.at("keys").begin(),
+                            settingJson.at("keys").end(),
+                            [](const json& keyJson) {
+                                return keyJson.contains("clip_id");
+                            })) {
+                        timeline.clipMembershipExplicit = true;
+                    }
                     timeline.settings.push_back(
                         ParseWaterKeyedSettingTrack(settingJson));
                 }

@@ -156,6 +156,9 @@ enum class WaterScenarioInterpolation {
     // follows a fluid C1 curve through every key without the uniform
     // Catmull-Rom loops and cusps caused by unevenly spaced control points.
     CentripetalCatmullRom,
+    // Keyed-setting tracks only: a cubic Bezier segment whose outgoing and
+    // incoming control points are authored directly on the value graph.
+    SplineHandles,
     // Keyed-setting tracks only: the key follows its track's
     // defaultInterpolation, so restyling the whole setting is one edit while
     // explicitly overridden keys keep their own mode. Never valid on
@@ -512,6 +515,30 @@ struct WaterSettingKey {
     float value = 0.0F;
     WaterScenarioInterpolation interpolation =
         WaterScenarioInterpolation::Smooth;
+    // Explicit settings-clip ownership. Zero means the key is loose on the
+    // feature timeline. Keeping ownership on the key (rather than inferring
+    // it from a time window) lets clips overlap without stealing each
+    // other's keys.
+    std::uint32_t clipId = 0U;
+    // Handle times are fractions of the adjacent segment measured away from
+    // this key. Handle values are offsets in the setting's authored units.
+    // The one-third/zero defaults reproduce Smooth Step exactly.
+    float incomingHandleTime = 1.0F / 3.0F;
+    float incomingHandleValue = 0.0F;
+    float outgoingHandleTime = 1.0F / 3.0F;
+    float outgoingHandleValue = 0.0F;
+};
+
+enum class WaterSettingSplineHandleSide : std::uint8_t {
+    Incoming = 0,
+    Outgoing,
+};
+
+struct WaterSettingSplineHandlePoint {
+    float anchorPosition = 0.0F;
+    float anchorValue = 0.0F;
+    float controlPosition = 0.0F;
+    float controlValue = 0.0F;
 };
 
 struct WaterKeyedSettingTrack {
@@ -557,13 +584,12 @@ struct WaterKeyedSettingsProfile {
 // shrunk clip still keeps its keys distinct.
 inline constexpr float kWaterFeatureClipMinimumLength = 1.0e-3F;
 
-// A named span of one feature's keyed-setting timeline. Clips are authoring
-// metadata only: the keys stay the single evaluated source of truth, and a
-// clip groups the keys inside its window so they can be offset, stretched,
-// duplicated, packaged, or retargeted together. Positions are normalized
-// 0..1 along the linked animation, exactly like the keys they contain.
-// Clips on one timeline never overlap; applying a package or creating a
-// clip over a window removes the clip entries it intersects first.
+// A named group on one feature's keyed-setting timeline. Clips are authoring
+// metadata only: the keys stay the single evaluated source of truth, and
+// carry this clip's id explicitly so overlapping clip windows remain
+// unambiguous. A keyed clip's first and last key define its displayed bounds;
+// an empty clip retains its authored window. Positions are normalized 0..1
+// along the linked animation, exactly like the keys they contain.
 struct WaterFeatureSettingsClip {
     // Unique within its timeline; zero is never a valid stored id (the UI
     // uses it for the derived loose-keys block).
@@ -579,6 +605,10 @@ struct WaterFeatureTimeline {
     WaterKeyedFeatureId feature{};
     std::vector<WaterKeyedSettingTrack> settings;
     std::vector<WaterFeatureSettingsClip> clips;
+    // Load/runtime migration marker. Older documents inferred membership
+    // from non-overlapping clip spans; current documents serialize clip_id
+    // on every timeline key, including zero for deliberately loose keys.
+    bool clipMembershipExplicit = false;
 };
 
 struct WaterFeatureTimingRun {
@@ -642,20 +672,23 @@ ParseWaterKeyedFeatureKindName(std::string_view name);
     WaterScenarioFeatureRuns* entry,
     const WaterKeyedFeatureId& feature,
     std::uint32_t targetRunId);
-// Endpoint-hold sampling with Hold/Linear/Smooth segments. An exact interior
-// key belongs to the segment it starts, so a Hold step reads its new value
-// at the key position itself. Empty tracks return nullopt.
+// Endpoint-hold sampling across the concrete per-segment modes, including
+// automatic and manually handled splines. An exact interior key belongs to
+// the segment it starts, so a Hold step reads its new value at the key
+// position itself. Empty tracks return nullopt.
 [[nodiscard]] std::optional<float> EvaluateWaterKeyedSettingTrack(
     const WaterKeyedSettingTrack& track,
     float normalizedPosition);
-// Inserts, or replaces any key within 1e-4 of the position (id-free tracks
-// renumber implicitly via time order).
+// Inserts, or replaces any key within 1e-4 of the position. Passing clipId
+// explicitly attaches (or reattaches) the key; omitting it preserves an
+// existing key's membership and creates a new loose key.
 void AddOrUpdateWaterSettingKey(
     WaterKeyedSettingTrack* track,
     float position,
     float value,
     WaterScenarioInterpolation interpolation =
-        WaterScenarioInterpolation::TrackDefault);
+        WaterScenarioInterpolation::TrackDefault,
+    std::optional<std::uint32_t> clipId = std::nullopt);
 // Moves one key without overwriting another key in the same setting track.
 // Source matching and destination occupancy use the same 1e-4 tolerance as
 // insertion and navigation.
@@ -663,6 +696,22 @@ void AddOrUpdateWaterSettingKey(
     WaterKeyedSettingTrack* track,
     float sourcePosition,
     float destinationPosition);
+// Resolves or moves one manual Bezier control point. Incoming handles are
+// active when the preceding segment uses Spline Handles; outgoing handles are
+// active when the selected key's segment does. Absolute graph coordinates are
+// converted to segment-relative storage so ordinary key/clip retiming carries
+// the curve shape with it.
+[[nodiscard]] std::optional<WaterSettingSplineHandlePoint>
+ResolveWaterSettingSplineHandlePoint(
+    const WaterKeyedSettingTrack& track,
+    float keyPosition,
+    WaterSettingSplineHandleSide side);
+[[nodiscard]] bool MoveWaterSettingSplineHandlePoint(
+    WaterKeyedSettingTrack* track,
+    float keyPosition,
+    WaterSettingSplineHandleSide side,
+    float controlPosition,
+    float controlValue);
 [[nodiscard]] std::size_t WaterSettingKeyCountAtPosition(
     const WaterKeyedSettingTrack& track,
     float position);
@@ -709,16 +758,21 @@ void AddOrUpdateWaterSettingKey(
 [[nodiscard]] const WaterFeatureSettingsClip* FindWaterFeatureClip(
     const WaterFeatureTimeline* timeline,
     std::uint32_t clipId);
-// Span of every key on the timeline (active and dormant tracks) that lies
-// outside all stored clips, or nullopt when there are none. Backs the
-// derived loose-keys block shown when a feature has keys but no clips.
+// Span of every explicitly loose key on the timeline (active and dormant
+// tracks), or nullopt when there are none. Backs the derived loose-keys block
+// shown alongside stored clips.
 [[nodiscard]] std::optional<std::pair<float, float>>
 WaterFeatureLooseKeySpan(const WaterFeatureTimeline& timeline);
 
-// Interval the span [rangeStart, rangeEnd] may occupy after a move or
-// stretch without any contained key landing on a key outside the range (per
-// track), and without leaving 0..1. minimumStart <= rangeStart and
-// maximumEnd >= rangeEnd always hold for valid inputs.
+// Recomputes one stored clip's bounds from its owned keys. Two or more key
+// times map exactly to the first/last key; a single time keeps the minimum
+// manipulable width around that key. Empty clips retain their authored span.
+[[nodiscard]] bool SynchronizeWaterFeatureClipBounds(
+    WaterFeatureTimeline* timeline,
+    std::uint32_t clipId);
+
+// Interval the span [rangeStart, rangeEnd] may occupy without leaving 0..1.
+// Other clips do not constrain it: overlapping clip windows are supported.
 struct WaterFeatureSpanLimits {
     float minimumStart = 0.0F;
     float maximumEnd = 1.0F;
@@ -741,6 +795,24 @@ struct WaterFeatureSpanLimits {
     float newStart,
     float newEnd);
 
+// Affinely transforms only the explicitly selected clip ids. Zero selects
+// loose keys inside the source range. This is the overlap-safe primitive
+// used by single and grouped UI drags.
+[[nodiscard]] bool TransformWaterFeatureClipSelection(
+    WaterFeatureTimeline* timeline,
+    std::span<const std::uint32_t> clipIds,
+    float rangeStart,
+    float rangeEnd,
+    float newStart,
+    float newEnd);
+
+// Convenience form for one stored clip.
+[[nodiscard]] bool TransformWaterFeatureClip(
+    WaterFeatureTimeline* timeline,
+    std::uint32_t clipId,
+    float newStart,
+    float newEnd);
+
 // Captures the keys inside [rangeStart, rangeEnd] as a reusable package
 // whose key positions are renormalized to 0..1 across the span. Tracks with
 // no keys in range are omitted; dormant tracks keep active = false. The
@@ -751,15 +823,19 @@ struct WaterFeatureSpanLimits {
     float rangeStart,
     float rangeEnd);
 
-// Applies a package into [windowStart, windowEnd]: for every track the
-// package carries, existing keys inside the window are replaced by the
-// package keys mapped across it; keys outside the window and tracks the
-// package does not carry are untouched. Missing tracks are created with the
-// package's display metadata. When the package kind differs from the
-// timeline's feature kind only registry settings of the target kind apply.
-// Clip entries intersecting the window are removed, then a clip spanning
-// the window is added (named clipName, or the package's base name). Returns
-// the new clip id, or nullopt without mutation for invalid arguments.
+// Captures only keys explicitly owned by clipId, irrespective of overlapping
+// windows. The package is normalized across the clip's current bounds.
+[[nodiscard]] WaterKeyedSettingsProfile CaptureWaterKeyedSettingsClipById(
+    const WaterFeatureTimeline& timeline,
+    std::uint32_t clipId);
+
+// Applies a package into [windowStart, windowEnd] as a new explicitly owned
+// clip. Existing clips and loose keys survive, including inside the target
+// window. Same-track/time collisions are nudged minimally within the window.
+// Missing tracks are created with the package's display metadata. When the
+// package kind differs from the timeline's feature kind only registry
+// settings of the target kind apply. Returns the new clip id, or nullopt
+// without mutation for invalid arguments.
 [[nodiscard]] std::optional<std::uint32_t> ApplyWaterKeyedSettingsClip(
     WaterFeatureTimeline* timeline,
     const WaterKeyedSettingsProfile& profile,
@@ -767,32 +843,33 @@ struct WaterFeatureSpanLimits {
     float windowEnd,
     std::string clipName = {});
 
-// Creates a clip over an existing span of keys (removing intersecting clip
-// entries first). Returns the new clip id.
+// Creates a clip over a span and attaches the loose keys inside it. Existing
+// clips, including overlapping ones, are untouched. Returns the new clip id.
 [[nodiscard]] std::optional<std::uint32_t> CreateWaterFeatureClipFromSpan(
     WaterFeatureTimeline* timeline,
     float start,
     float end,
-    std::string name);
+    std::string name,
+    bool attachLooseKeys = true);
 
-// Copies one clip (bounds and contained keys) onto the same timeline with
-// its start at targetStart, replacing whatever the target window held.
-// Returns the new clip id.
+// Copies one clip (bounds and explicitly owned keys) onto the same timeline
+// with its start at targetStart. Overlapping destinations are supported.
 [[nodiscard]] std::optional<std::uint32_t> DuplicateWaterFeatureClip(
     WaterFeatureTimeline* timeline,
     std::uint32_t clipId,
     float targetStart);
 
-// Copies or moves one clip onto another feature's timeline over the same
-// window. Both features must share one feature kind; the destination keys
-// inside the window are replaced. Returns the destination clip id.
+// Copies or moves one explicitly owned clip onto another feature's timeline
+// over the same window. Both features must share one feature kind; existing
+// destination clips and loose keys survive. Returns the destination clip id.
 [[nodiscard]] std::optional<std::uint32_t> TransferWaterFeatureClip(
     WaterFeatureTimeline* source,
     std::uint32_t clipId,
     WaterFeatureTimeline* destination,
     bool removeFromSource);
 
-// Removes the clip entry, and optionally every key inside its span.
+// Removes the clip entry, and either deletes its explicitly owned keys or
+// leaves them behind as loose keys.
 [[nodiscard]] bool RemoveWaterFeatureClip(
     WaterFeatureTimeline* timeline,
     std::uint32_t clipId,

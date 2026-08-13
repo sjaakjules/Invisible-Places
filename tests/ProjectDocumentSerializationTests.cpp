@@ -3791,14 +3791,18 @@ TEST_CASE("Keyed setting tracks round-trip their default interpolation and migra
   WaterKeyedSettingTrack track;
   track.settingId = "level";
   track.defaultInterpolation =
-      WaterScenarioInterpolation::CentripetalCatmullRom;
+      WaterScenarioInterpolation::SplineHandles;
   track.keys = {
       {.position = 0.20F,
        .value = 0.10F,
-       .interpolation = WaterScenarioInterpolation::TrackDefault},
+       .interpolation = WaterScenarioInterpolation::TrackDefault,
+       .outgoingHandleTime = 0.22F,
+       .outgoingHandleValue = 0.31F},
       {.position = 0.70F,
        .value = 0.90F,
-       .interpolation = WaterScenarioInterpolation::Linear},
+       .interpolation = WaterScenarioInterpolation::Linear,
+       .incomingHandleTime = 0.18F,
+       .incomingHandleValue = -0.24F},
   };
   WaterFeatureTimeline timeline;
   timeline.feature = {.kind = WaterKeyedFeatureKind::Rain};
@@ -3828,12 +3832,16 @@ TEST_CASE("Keyed setting tracks round-trip their default interpolation and migra
   const auto& loadedTrack =
       loaded->waterFeatureTimingRuns[0].runs[0].features[0].settings.at(0);
   CHECK(loadedTrack.defaultInterpolation ==
-        WaterScenarioInterpolation::CentripetalCatmullRom);
+        WaterScenarioInterpolation::SplineHandles);
   REQUIRE(loadedTrack.keys.size() == 2U);
   CHECK(loadedTrack.keys[0].interpolation ==
         WaterScenarioInterpolation::TrackDefault);
   CHECK(loadedTrack.keys[1].interpolation ==
         WaterScenarioInterpolation::Linear);
+  CHECK(loadedTrack.keys[0].outgoingHandleTime == Catch::Approx(0.22F));
+  CHECK(loadedTrack.keys[0].outgoingHandleValue == Catch::Approx(0.31F));
+  CHECK(loadedTrack.keys[1].incomingHandleTime == Catch::Approx(0.18F));
+  CHECK(loadedTrack.keys[1].incomingHandleValue == Catch::Approx(-0.24F));
 
   // A pre-71 document carries concrete "smooth" keys and no track default:
   // migration turns those keys into TrackDefault on a Smooth default, so

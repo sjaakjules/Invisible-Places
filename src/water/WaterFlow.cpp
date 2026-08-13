@@ -6424,6 +6424,7 @@ WaterScenarioState EvaluateWaterScenarioTrack(
         // approximate as the eased blend; a per-channel spline is not
         // applicable here.
         if (left.interpolation == WaterScenarioInterpolation::Smooth ||
+            left.interpolation == WaterScenarioInterpolation::SplineHandles ||
             left.interpolation == WaterScenarioInterpolation::SmoothVelocity ||
             left.interpolation ==
                 WaterScenarioInterpolation::CentripetalCatmullRom) {
@@ -6531,6 +6532,7 @@ WaterSeepageNodeAnimationState EvaluateWaterSeepageNodeAnimationTrack(
         // approximate as the eased blend; a per-channel spline is not
         // applicable here.
         if (left.interpolation == WaterScenarioInterpolation::Smooth ||
+            left.interpolation == WaterScenarioInterpolation::SplineHandles ||
             left.interpolation == WaterScenarioInterpolation::SmoothVelocity ||
             left.interpolation ==
                 WaterScenarioInterpolation::CentripetalCatmullRom) {
@@ -7099,6 +7101,117 @@ namespace {
 // WaterSettingKey::value). The math mirrors the TimingColourise scalar key
 // track evaluator so both editors animate identically.
 constexpr float kWaterKeySplineTolerance = 1.0e-4F;
+constexpr float kWaterSettingSplineHandleDefaultFraction = 1.0F / 3.0F;
+constexpr float kWaterSettingSplineHandleMinimumFraction = 0.01F;
+constexpr float kWaterSettingSplineHandleMaximumPair = 0.98F;
+
+struct WaterSettingSplineHandleFractions {
+    float outgoing = kWaterSettingSplineHandleDefaultFraction;
+    float incoming = kWaterSettingSplineHandleDefaultFraction;
+};
+
+WaterScenarioInterpolation ResolveWaterSettingInterpolation(
+    const WaterKeyedSettingTrack& track,
+    const WaterSettingKey& key) {
+    if (key.interpolation != WaterScenarioInterpolation::TrackDefault) {
+        return key.interpolation;
+    }
+    return track.defaultInterpolation == WaterScenarioInterpolation::TrackDefault
+               ? WaterScenarioInterpolation::CentripetalCatmullRom
+               : track.defaultInterpolation;
+}
+
+WaterSettingSplineHandleFractions ResolveWaterSettingSplineHandleFractions(
+    const WaterSettingKey& left,
+    const WaterSettingKey& right) {
+    WaterSettingSplineHandleFractions result{
+        .outgoing = std::clamp(
+            SeepageFiniteOr(
+                left.outgoingHandleTime,
+                kWaterSettingSplineHandleDefaultFraction),
+            kWaterSettingSplineHandleMinimumFraction,
+            kWaterSettingSplineHandleMaximumPair -
+                kWaterSettingSplineHandleMinimumFraction),
+        .incoming = std::clamp(
+            SeepageFiniteOr(
+                right.incomingHandleTime,
+                kWaterSettingSplineHandleDefaultFraction),
+            kWaterSettingSplineHandleMinimumFraction,
+            kWaterSettingSplineHandleMaximumPair -
+                kWaterSettingSplineHandleMinimumFraction),
+    };
+    const float movableOutgoing =
+        result.outgoing - kWaterSettingSplineHandleMinimumFraction;
+    const float movableIncoming =
+        result.incoming - kWaterSettingSplineHandleMinimumFraction;
+    const float movableTotal = movableOutgoing + movableIncoming;
+    const float movableCapacity =
+        kWaterSettingSplineHandleMaximumPair -
+        2.0F * kWaterSettingSplineHandleMinimumFraction;
+    if (movableTotal > movableCapacity && movableTotal > 0.0F) {
+        const float scale = movableCapacity / movableTotal;
+        result.outgoing =
+            kWaterSettingSplineHandleMinimumFraction +
+            movableOutgoing * scale;
+        result.incoming =
+            kWaterSettingSplineHandleMinimumFraction +
+            movableIncoming * scale;
+    }
+    return result;
+}
+
+float EvaluateCubicBezierCoordinate(
+    float point0,
+    float point1,
+    float point2,
+    float point3,
+    float amount) {
+    const float inverse = 1.0F - amount;
+    return inverse * inverse * inverse * point0 +
+           3.0F * inverse * inverse * amount * point1 +
+           3.0F * inverse * amount * amount * point2 +
+           amount * amount * amount * point3;
+}
+
+float EvaluateWaterSettingSplineHandleSegment(
+    const WaterSettingKey& left,
+    const WaterSettingKey& right,
+    float normalizedAmount) {
+    const auto fractions =
+        ResolveWaterSettingSplineHandleFractions(left, right);
+    const float target = Clamp01(normalizedAmount);
+    // With ordered x control points the Bezier x coordinate is monotone, so
+    // bisection gives a stable timeline parameter even for nearly vertical
+    // authored handles.
+    float low = 0.0F;
+    float high = 1.0F;
+    for (int iteration = 0; iteration < 28; ++iteration) {
+        const float middle = std::midpoint(low, high);
+        const float x = EvaluateCubicBezierCoordinate(
+            0.0F,
+            fractions.outgoing,
+            1.0F - fractions.incoming,
+            1.0F,
+            middle);
+        if (x < target) {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    const float parameter = std::midpoint(low, high);
+    const float leftValue = SeepageFiniteOr(left.value, 0.0F);
+    const float rightValue = SeepageFiniteOr(right.value, 0.0F);
+    const float result = EvaluateCubicBezierCoordinate(
+        leftValue,
+        leftValue + SeepageFiniteOr(left.outgoingHandleValue, 0.0F),
+        rightValue + SeepageFiniteOr(right.incomingHandleValue, 0.0F),
+        rightValue,
+        parameter);
+    return std::isfinite(result)
+               ? result
+               : std::lerp(leftValue, rightValue, target);
+}
 
 template <typename Key, typename ValueAt>
 float EvaluateCentripetalCatmullRomKeySegment(
@@ -7456,7 +7569,8 @@ float EvaluateWaterTimingRun(
                 amount,
                 keyLevel));
         }
-        if (left.interpolation == WaterScenarioInterpolation::Smooth) {
+        if (left.interpolation == WaterScenarioInterpolation::Smooth ||
+            left.interpolation == WaterScenarioInterpolation::SplineHandles) {
             amount = amount * amount * (3.0F - 2.0F * amount);
         }
         return std::lerp(keyLevel(left), keyLevel(right), amount);
@@ -8437,6 +8551,24 @@ WaterKeyedSettingTrack SanitizeWaterKeyedSettingTrack(
     for (auto& key : track.keys) {
         key.position = Clamp01(SeepageFiniteOr(key.position, 0.0F));
         key.value = SeepageFiniteOr(key.value, 0.0F);
+        key.incomingHandleTime = std::clamp(
+            SeepageFiniteOr(
+                key.incomingHandleTime,
+                kWaterSettingSplineHandleDefaultFraction),
+            kWaterSettingSplineHandleMinimumFraction,
+            kWaterSettingSplineHandleMaximumPair -
+                kWaterSettingSplineHandleMinimumFraction);
+        key.incomingHandleValue =
+            SeepageFiniteOr(key.incomingHandleValue, 0.0F);
+        key.outgoingHandleTime = std::clamp(
+            SeepageFiniteOr(
+                key.outgoingHandleTime,
+                kWaterSettingSplineHandleDefaultFraction),
+            kWaterSettingSplineHandleMinimumFraction,
+            kWaterSettingSplineHandleMaximumPair -
+                kWaterSettingSplineHandleMinimumFraction);
+        key.outgoingHandleValue =
+            SeepageFiniteOr(key.outgoingHandleValue, 0.0F);
     }
     std::stable_sort(
         track.keys.begin(),
@@ -8444,6 +8576,13 @@ WaterKeyedSettingTrack SanitizeWaterKeyedSettingTrack(
         [](const WaterSettingKey& left, const WaterSettingKey& right) {
             return left.position < right.position;
         });
+    for (std::size_t index = 0U; index + 1U < track.keys.size(); ++index) {
+        const auto fractions = ResolveWaterSettingSplineHandleFractions(
+            track.keys[index],
+            track.keys[index + 1U]);
+        track.keys[index].outgoingHandleTime = fractions.outgoing;
+        track.keys[index + 1U].incomingHandleTime = fractions.incoming;
+    }
     return track;
 }
 
@@ -8510,8 +8649,14 @@ WaterKeyedSettingsProfile SanitizeWaterKeyedSettingsProfile(
                 })) {
             continue;
         }
-        kept.push_back(
-            SanitizeWaterKeyedSettingTrack(std::move(setting)));
+        auto sanitized =
+            SanitizeWaterKeyedSettingTrack(std::move(setting));
+        // Reusable packages are ownership-neutral. Applying one assigns a
+        // fresh destination clip id to every copied key.
+        for (auto& key : sanitized.keys) {
+            key.clipId = 0U;
+        }
+        kept.push_back(std::move(sanitized));
     }
     profile.settings = std::move(kept);
     return profile;
@@ -8577,24 +8722,71 @@ WaterFeatureTimingRun SanitizeWaterFeatureTimingRun(
                 clip.id = nextId++;
             }
         }
-        // Clips on one timeline never overlap. Hand-edited or retimed
-        // documents may violate that; later clips are clamped behind their
-        // predecessor, and a clip swallowed entirely is dropped.
-        std::vector<WaterFeatureSettingsClip> separated;
-        separated.reserve(clips.size());
-        float previousEnd = -1.0F;
-        for (auto& clip : clips) {
-            if (clip.start < previousEnd) {
-                clip.start = previousEnd;
+        timeline.clips = std::move(clips);
+
+        if (!timeline.clipMembershipExplicit) {
+            // Pre-membership documents grouped keys implicitly by a
+            // non-overlapping time window. Migrate once. At a shared
+            // boundary the later-starting clip owns the key, matching the
+            // evaluator rule that an interior key starts the next segment.
+            constexpr float kLegacyMembershipTolerance = 1.0e-4F;
+            for (auto& setting : timeline.settings) {
+                for (auto& key : setting.keys) {
+                    const WaterFeatureSettingsClip* owner = nullptr;
+                    for (const auto& clip : timeline.clips) {
+                        if (key.position <
+                                clip.start - kLegacyMembershipTolerance ||
+                            key.position >
+                                clip.end + kLegacyMembershipTolerance) {
+                            continue;
+                        }
+                        if (owner == nullptr ||
+                            clip.start > owner->start +
+                                             kLegacyMembershipTolerance ||
+                            (std::abs(clip.start - owner->start) <=
+                                 kLegacyMembershipTolerance &&
+                             clip.id < owner->id)) {
+                            owner = &clip;
+                        }
+                    }
+                    key.clipId = owner != nullptr ? owner->id : 0U;
+                }
             }
-            if (clip.end - clip.start <
-                kWaterFeatureClipMinimumLength - 1.0e-6F) {
-                continue;
+        } else {
+            // Corrupt or hand-edited references become deliberately loose;
+            // they must never be captured by an unrelated clip merely
+            // because its window happens to overlap their time.
+            for (auto& setting : timeline.settings) {
+                for (auto& key : setting.keys) {
+                    if (key.clipId == 0U) {
+                        continue;
+                    }
+                    const bool ownerExists = std::any_of(
+                        timeline.clips.begin(),
+                        timeline.clips.end(),
+                        [&](const WaterFeatureSettingsClip& clip) {
+                            return clip.id == key.clipId;
+                        });
+                    if (!ownerExists) {
+                        key.clipId = 0U;
+                    }
+                }
             }
-            previousEnd = clip.end;
-            separated.push_back(std::move(clip));
         }
-        timeline.clips = std::move(separated);
+        timeline.clipMembershipExplicit = true;
+
+        // Keyed clip bounds are derived from their actual members, which
+        // keeps additions, key drags, and overlapping windows consistent.
+        std::vector<std::uint32_t> clipIds;
+        clipIds.reserve(timeline.clips.size());
+        for (const auto& clip : timeline.clips) {
+            clipIds.push_back(clip.id);
+        }
+        for (const auto clipId : clipIds) {
+            (void)SynchronizeWaterFeatureClipBounds(
+                &timeline,
+                clipId);
+        }
     }
     return run;
 }
@@ -8724,6 +8916,13 @@ std::optional<float> EvaluateWaterKeyedSettingTrack(
                 amount,
                 keyValue);
         }
+        if (left.interpolation ==
+            WaterScenarioInterpolation::SplineHandles) {
+            return EvaluateWaterSettingSplineHandleSegment(
+                left,
+                right,
+                amount);
+        }
         if (left.interpolation == WaterScenarioInterpolation::Smooth) {
             amount = amount * amount * (3.0F - 2.0F * amount);
         }
@@ -8736,7 +8935,8 @@ void AddOrUpdateWaterSettingKey(
     WaterKeyedSettingTrack* track,
     float position,
     float value,
-    WaterScenarioInterpolation interpolation) {
+    WaterScenarioInterpolation interpolation,
+    std::optional<std::uint32_t> clipId) {
     if (track == nullptr) {
         return;
     }
@@ -8745,6 +8945,7 @@ void AddOrUpdateWaterSettingKey(
         .position = Clamp01(SeepageFiniteOr(position, 0.0F)),
         .value = SeepageFiniteOr(value, 0.0F),
         .interpolation = interpolation,
+        .clipId = clipId.value_or(0U),
     };
     const auto existing = std::find_if(
         track->keys.begin(),
@@ -8754,7 +8955,14 @@ void AddOrUpdateWaterSettingKey(
                    kReplacementTolerance;
         });
     if (existing != track->keys.end()) {
-        *existing = key;
+        // Value and interpolation edits must not silently reset authored
+        // Bezier handles on the same key.
+        existing->position = key.position;
+        existing->value = key.value;
+        existing->interpolation = key.interpolation;
+        if (clipId.has_value()) {
+            existing->clipId = clipId.value();
+        }
     } else {
         track->keys.push_back(key);
     }
@@ -8804,6 +9012,161 @@ bool MoveWaterSettingKey(
         [](const WaterSettingKey& left, const WaterSettingKey& right) {
             return left.position < right.position;
         });
+    return true;
+}
+
+std::optional<WaterSettingSplineHandlePoint>
+ResolveWaterSettingSplineHandlePoint(
+    const WaterKeyedSettingTrack& track,
+    float keyPosition,
+    WaterSettingSplineHandleSide side) {
+    if (!std::isfinite(keyPosition) || track.keys.size() < 2U) {
+        return std::nullopt;
+    }
+    std::vector<const WaterSettingKey*> ordered;
+    ordered.reserve(track.keys.size());
+    for (const auto& key : track.keys) {
+        ordered.push_back(&key);
+    }
+    std::stable_sort(
+        ordered.begin(),
+        ordered.end(),
+        [](const WaterSettingKey* left, const WaterSettingKey* right) {
+            return left->position < right->position;
+        });
+    const auto selected = std::find_if(
+        ordered.begin(),
+        ordered.end(),
+        [&](const WaterSettingKey* key) {
+            return std::abs(key->position - keyPosition) <=
+                   kWaterKeySplineTolerance;
+        });
+    if (selected == ordered.end()) {
+        return std::nullopt;
+    }
+    const std::size_t index = static_cast<std::size_t>(
+        std::distance(ordered.begin(), selected));
+    const WaterSettingKey* left = nullptr;
+    const WaterSettingKey* right = nullptr;
+    const WaterSettingKey* anchor = *selected;
+    if (side == WaterSettingSplineHandleSide::Outgoing) {
+        if (index + 1U >= ordered.size() ||
+            ResolveWaterSettingInterpolation(track, **selected) !=
+                WaterScenarioInterpolation::SplineHandles) {
+            return std::nullopt;
+        }
+        left = *selected;
+        right = ordered[index + 1U];
+    } else {
+        if (index == 0U ||
+            ResolveWaterSettingInterpolation(track, *ordered[index - 1U]) !=
+                WaterScenarioInterpolation::SplineHandles) {
+            return std::nullopt;
+        }
+        left = ordered[index - 1U];
+        right = *selected;
+    }
+    const float span = right->position - left->position;
+    if (span <= kWaterKeySplineTolerance) {
+        return std::nullopt;
+    }
+    const auto fractions =
+        ResolveWaterSettingSplineHandleFractions(*left, *right);
+    return WaterSettingSplineHandlePoint{
+        .anchorPosition = anchor->position,
+        .anchorValue = anchor->value,
+        .controlPosition =
+            side == WaterSettingSplineHandleSide::Outgoing
+                ? left->position + span * fractions.outgoing
+                : right->position - span * fractions.incoming,
+        .controlValue =
+            side == WaterSettingSplineHandleSide::Outgoing
+                ? left->value + left->outgoingHandleValue
+                : right->value + right->incomingHandleValue,
+    };
+}
+
+bool MoveWaterSettingSplineHandlePoint(
+    WaterKeyedSettingTrack* track,
+    float keyPosition,
+    WaterSettingSplineHandleSide side,
+    float controlPosition,
+    float controlValue) {
+    if (track == nullptr || !std::isfinite(keyPosition) ||
+        !std::isfinite(controlPosition) || !std::isfinite(controlValue) ||
+        track->keys.size() < 2U) {
+        return false;
+    }
+    std::vector<WaterSettingKey*> ordered;
+    ordered.reserve(track->keys.size());
+    for (auto& key : track->keys) {
+        ordered.push_back(&key);
+    }
+    std::stable_sort(
+        ordered.begin(),
+        ordered.end(),
+        [](const WaterSettingKey* left, const WaterSettingKey* right) {
+            return left->position < right->position;
+        });
+    const auto selected = std::find_if(
+        ordered.begin(),
+        ordered.end(),
+        [&](const WaterSettingKey* key) {
+            return std::abs(key->position - keyPosition) <=
+                   kWaterKeySplineTolerance;
+        });
+    if (selected == ordered.end()) {
+        return false;
+    }
+    const std::size_t index = static_cast<std::size_t>(
+        std::distance(ordered.begin(), selected));
+    WaterSettingKey* left = nullptr;
+    WaterSettingKey* right = nullptr;
+    WaterSettingKey* anchor = *selected;
+    if (side == WaterSettingSplineHandleSide::Outgoing) {
+        if (index + 1U >= ordered.size() ||
+            ResolveWaterSettingInterpolation(*track, **selected) !=
+                WaterScenarioInterpolation::SplineHandles) {
+            return false;
+        }
+        left = *selected;
+        right = ordered[index + 1U];
+    } else {
+        if (index == 0U ||
+            ResolveWaterSettingInterpolation(*track, *ordered[index - 1U]) !=
+                WaterScenarioInterpolation::SplineHandles) {
+            return false;
+        }
+        left = ordered[index - 1U];
+        right = *selected;
+    }
+    const float span = right->position - left->position;
+    if (span <= kWaterKeySplineTolerance) {
+        return false;
+    }
+    const auto fractions =
+        ResolveWaterSettingSplineHandleFractions(*left, *right);
+    // Materialize any paired normalization before changing one side so the
+    // user's new control coordinate remains stable on the following frame.
+    left->outgoingHandleTime = fractions.outgoing;
+    right->incomingHandleTime = fractions.incoming;
+    if (side == WaterSettingSplineHandleSide::Outgoing) {
+        const float maximumFraction =
+            kWaterSettingSplineHandleMaximumPair - fractions.incoming;
+        left->outgoingHandleTime = std::clamp(
+            (controlPosition - left->position) / span,
+            kWaterSettingSplineHandleMinimumFraction,
+            maximumFraction);
+        left->outgoingHandleValue = controlValue - anchor->value;
+    } else {
+        const float maximumFraction =
+            kWaterSettingSplineHandleMaximumPair - fractions.outgoing;
+        right->incomingHandleTime = std::clamp(
+            (right->position - controlPosition) / span,
+            kWaterSettingSplineHandleMinimumFraction,
+            maximumFraction);
+        right->incomingHandleValue = controlValue - anchor->value;
+    }
     return true;
 }
 
@@ -8860,6 +9223,22 @@ std::size_t RemoveWaterFeatureKeysAtPosition(
     if (timeline == nullptr) {
         return 0U;
     }
+    std::vector<std::uint32_t> affectedClipIds;
+    for (const auto& setting : timeline->settings) {
+        if (!setting.active) {
+            continue;
+        }
+        for (const auto& key : setting.keys) {
+            if (key.clipId != 0U && std::isfinite(position) &&
+                std::abs(key.position - position) <= 1.0e-4F &&
+                std::find(
+                    affectedClipIds.begin(),
+                    affectedClipIds.end(),
+                    key.clipId) == affectedClipIds.end()) {
+                affectedClipIds.push_back(key.clipId);
+            }
+        }
+    }
     std::size_t removed = 0U;
     for (auto& setting : timeline->settings) {
         if (!setting.active) {
@@ -8868,6 +9247,9 @@ std::size_t RemoveWaterFeatureKeysAtPosition(
         removed += RemoveWaterSettingKeysAtPosition(
             &setting,
             position);
+    }
+    for (const auto clipId : affectedClipIds) {
+        (void)SynchronizeWaterFeatureClipBounds(timeline, clipId);
     }
     return removed;
 }
@@ -8992,50 +9374,6 @@ bool WaterClipRangeIsValid(float start, float end) {
            end - start >= kWaterClipKeyTolerance;
 }
 
-bool WaterClipStrictlyOverlaps(
-    const WaterFeatureSettingsClip& clip,
-    float windowStart,
-    float windowEnd) {
-    return clip.start < windowEnd - kWaterClipKeyTolerance &&
-           clip.end > windowStart + kWaterClipKeyTolerance;
-}
-
-// Strict overlap: clips that merely touch the window boundary survive, so
-// placing a clip immediately after another never deletes the neighbour.
-void RemoveWaterClipsIntersecting(
-    WaterFeatureTimeline* timeline,
-    float windowStart,
-    float windowEnd) {
-    std::erase_if(
-        timeline->clips,
-        [&](const WaterFeatureSettingsClip& clip) {
-            return WaterClipStrictlyOverlaps(clip, windowStart, windowEnd);
-        });
-}
-
-// A key sitting exactly on a shared boundary lies inside both neighbouring
-// clips' spans. Span operations must never steal or delete a key that a
-// clip OUTSIDE the operated range still claims, or the neighbour's
-// envelope silently changes shape.
-bool WaterClipKeyClaimedOutsideRange(
-    const WaterFeatureTimeline& timeline,
-    float rangeStart,
-    float rangeEnd,
-    float position) {
-    for (const auto& clip : timeline.clips) {
-        const bool clipInsideRange =
-            WaterClipSpanContains(rangeStart, rangeEnd, clip.start) &&
-            WaterClipSpanContains(rangeStart, rangeEnd, clip.end);
-        if (clipInsideRange) {
-            continue;
-        }
-        if (WaterClipSpanContains(clip.start, clip.end, position)) {
-            return true;
-        }
-    }
-    return false;
-}
-
 void SortWaterFeatureClips(std::vector<WaterFeatureSettingsClip>* clips) {
     std::stable_sort(
         clips->begin(),
@@ -9044,6 +9382,96 @@ void SortWaterFeatureClips(std::vector<WaterFeatureSettingsClip>* clips) {
            const WaterFeatureSettingsClip& right) {
             return left.start < right.start;
         });
+}
+
+bool WaterClipIdIsSelected(
+    std::span<const std::uint32_t> clipIds,
+    std::uint32_t clipId) {
+    return std::find(clipIds.begin(), clipIds.end(), clipId) !=
+           clipIds.end();
+}
+
+// Runtime-created test/support timelines and pre-membership documents may
+// still carry implicit spans. Convert once before any ownership-sensitive
+// operation. Current UI-created loose keys are protected by the explicit
+// marker and therefore never get captured merely by entering a clip window.
+void EnsureWaterFeatureExplicitClipMembership(
+    WaterFeatureTimeline* timeline) {
+    if (timeline == nullptr || timeline->clipMembershipExplicit) {
+        return;
+    }
+    for (auto& setting : timeline->settings) {
+        for (auto& key : setting.keys) {
+            const WaterFeatureSettingsClip* owner = nullptr;
+            for (const auto& clip : timeline->clips) {
+                if (!WaterClipSpanContains(
+                        clip.start,
+                        clip.end,
+                        key.position)) {
+                    continue;
+                }
+                if (owner == nullptr ||
+                    clip.start > owner->start + kWaterClipKeyTolerance ||
+                    (std::abs(clip.start - owner->start) <=
+                         kWaterClipKeyTolerance &&
+                     clip.id < owner->id)) {
+                    owner = &clip;
+                }
+            }
+            key.clipId = owner != nullptr ? owner->id : 0U;
+        }
+    }
+    timeline->clipMembershipExplicit = true;
+    std::vector<std::uint32_t> clipIds;
+    clipIds.reserve(timeline->clips.size());
+    for (const auto& clip : timeline->clips) {
+        clipIds.push_back(clip.id);
+    }
+    for (const auto clipId : clipIds) {
+        (void)SynchronizeWaterFeatureClipBounds(timeline, clipId);
+    }
+}
+
+std::optional<float> AvailableWaterClipKeyPosition(
+    const WaterKeyedSettingTrack& track,
+    float desired,
+    float windowStart,
+    float windowEnd) {
+    const auto available = [&](float candidate) {
+        return candidate >= windowStart && candidate <= windowEnd &&
+               std::none_of(
+                   track.keys.begin(),
+                   track.keys.end(),
+                   [&](const WaterSettingKey& existing) {
+                       return std::abs(existing.position - candidate) <=
+                              kWaterClipKeyTolerance;
+                   });
+    };
+    desired = std::clamp(desired, windowStart, windowEnd);
+    if (available(desired)) {
+        return desired;
+    }
+    constexpr float kStep = 2.1F * kWaterClipKeyTolerance;
+    const std::size_t maximumAttempts = static_cast<std::size_t>(
+        std::ceil((windowEnd - windowStart) / kStep)) + 1U;
+    for (std::size_t attempt = 1U; attempt <= maximumAttempts; ++attempt) {
+        const float offset = static_cast<float>(attempt) * kStep;
+        const float inwardFirst =
+            desired <= std::midpoint(windowStart, windowEnd)
+                ? desired + offset
+                : desired - offset;
+        const float other =
+            desired <= std::midpoint(windowStart, windowEnd)
+                ? desired - offset
+                : desired + offset;
+        if (available(inwardFirst)) {
+            return inwardFirst;
+        }
+        if (available(other)) {
+            return other;
+        }
+    }
+    return std::nullopt;
 }
 
 }  // namespace
@@ -9100,24 +9528,56 @@ const WaterFeatureSettingsClip* FindWaterFeatureClip(
         clipId);
 }
 
+bool SynchronizeWaterFeatureClipBounds(
+    WaterFeatureTimeline* timeline,
+    std::uint32_t clipId) {
+    if (timeline == nullptr || clipId == 0U) {
+        return false;
+    }
+    auto* clip = FindWaterFeatureClip(timeline, clipId);
+    if (clip == nullptr) {
+        return false;
+    }
+    float first = std::numeric_limits<float>::infinity();
+    float last = -std::numeric_limits<float>::infinity();
+    for (const auto& setting : timeline->settings) {
+        for (const auto& key : setting.keys) {
+            if (key.clipId != clipId || !std::isfinite(key.position)) {
+                continue;
+            }
+            first = std::min(first, Clamp01(key.position));
+            last = std::max(last, Clamp01(key.position));
+        }
+    }
+    if (!std::isfinite(first) || !std::isfinite(last)) {
+        return false;
+    }
+    if (last - first >= kWaterFeatureClipMinimumLength) {
+        clip->start = first;
+        clip->end = last;
+    } else {
+        // One authored time still needs a small hit target. Keep that key
+        // inside the marker while respecting the normalized domain.
+        clip->start = std::max(
+            0.0F,
+            first - 0.5F * kWaterFeatureClipMinimumLength);
+        clip->end = std::min(
+            1.0F,
+            clip->start + kWaterFeatureClipMinimumLength);
+        clip->start = std::max(
+            0.0F,
+            clip->end - kWaterFeatureClipMinimumLength);
+    }
+    SortWaterFeatureClips(&timeline->clips);
+    return true;
+}
+
 std::optional<std::pair<float, float>> WaterFeatureLooseKeySpan(
     const WaterFeatureTimeline& timeline) {
     std::optional<std::pair<float, float>> span;
     for (const auto& setting : timeline.settings) {
         for (const auto& key : setting.keys) {
-            if (!std::isfinite(key.position)) {
-                continue;
-            }
-            const bool covered = std::any_of(
-                timeline.clips.begin(),
-                timeline.clips.end(),
-                [&](const WaterFeatureSettingsClip& clip) {
-                    return WaterClipSpanContains(
-                        clip.start,
-                        clip.end,
-                        key.position);
-                });
-            if (covered) {
+            if (!std::isfinite(key.position) || key.clipId != 0U) {
                 continue;
             }
             const float position = Clamp01(key.position);
@@ -9133,84 +9593,24 @@ std::optional<std::pair<float, float>> WaterFeatureLooseKeySpan(
 }
 
 WaterFeatureSpanLimits WaterFeatureTimelineSpanLimits(
-    const WaterFeatureTimeline& timeline,
+    const WaterFeatureTimeline&,
     float rangeStart,
     float rangeEnd) {
     WaterFeatureSpanLimits limits{};
     if (!WaterClipRangeIsValid(rangeStart, rangeEnd)) {
         return limits;
     }
-    // A track's outside keys only constrain the window when the track also
-    // has keys that will move with it. The window itself may never cross
-    // the nearest outside key, which keeps every moved key clear of it.
-    // Keys claimed by a clip outside the range count as outside keys: they
-    // stay behind, so the window must not cross them either.
-    for (const auto& setting : timeline.settings) {
-        bool holdsMovingKeys = false;
-        float nearestBefore = -std::numeric_limits<float>::infinity();
-        float nearestAfter = std::numeric_limits<float>::infinity();
-        for (const auto& key : setting.keys) {
-            if (!std::isfinite(key.position)) {
-                continue;
-            }
-            if (WaterClipSpanContains(
-                    rangeStart,
-                    rangeEnd,
-                    key.position) &&
-                !WaterClipKeyClaimedOutsideRange(
-                    timeline,
-                    rangeStart,
-                    rangeEnd,
-                    key.position)) {
-                holdsMovingKeys = true;
-            } else if (key.position < rangeStart) {
-                nearestBefore = std::max(nearestBefore, key.position);
-            } else if (key.position > rangeEnd) {
-                nearestAfter = std::min(nearestAfter, key.position);
-            }
-        }
-        if (!holdsMovingKeys) {
-            continue;
-        }
-        if (std::isfinite(nearestBefore)) {
-            limits.minimumStart = std::max(
-                limits.minimumStart,
-                nearestBefore + 2.0F * kWaterClipKeyTolerance);
-        }
-        if (std::isfinite(nearestAfter)) {
-            limits.maximumEnd = std::min(
-                limits.maximumEnd,
-                nearestAfter - 2.0F * kWaterClipKeyTolerance);
-        }
-    }
-    // Clips outside the range block the window with their whole span, not
-    // just their keys, so a move can never stack two clip entries — even
-    // when the neighbouring clip currently holds no keys.
-    for (const auto& clip : timeline.clips) {
-        const bool clipInsideRange =
-            WaterClipSpanContains(rangeStart, rangeEnd, clip.start) &&
-            WaterClipSpanContains(rangeStart, rangeEnd, clip.end);
-        if (clipInsideRange) {
-            continue;
-        }
-        if (clip.end <= rangeStart + kWaterClipKeyTolerance) {
-            limits.minimumStart = std::max(limits.minimumStart, clip.end);
-        } else if (clip.start >= rangeEnd - kWaterClipKeyTolerance) {
-            limits.maximumEnd = std::min(limits.maximumEnd, clip.start);
-        }
-    }
-    limits.minimumStart = std::min(limits.minimumStart, rangeStart);
-    limits.maximumEnd = std::max(limits.maximumEnd, rangeEnd);
     return limits;
 }
 
-bool TransformWaterFeatureTimelineSpan(
+bool TransformWaterFeatureClipSelection(
     WaterFeatureTimeline* timeline,
+    std::span<const std::uint32_t> clipIds,
     float rangeStart,
     float rangeEnd,
     float newStart,
     float newEnd) {
-    if (timeline == nullptr ||
+    if (timeline == nullptr || clipIds.empty() ||
         !WaterClipRangeIsValid(rangeStart, rangeEnd) ||
         !std::isfinite(newStart) || !std::isfinite(newEnd) ||
         newStart < -kWaterClipKeyTolerance ||
@@ -9218,40 +9618,24 @@ bool TransformWaterFeatureTimelineSpan(
         newEnd - newStart < kWaterClipKeyTolerance) {
         return false;
     }
+    EnsureWaterFeatureExplicitClipMembership(timeline);
     newStart = Clamp01(newStart);
     newEnd = Clamp01(newEnd);
-    // A key moves with the range only while no clip outside the range
-    // claims it; a shared-boundary key stays with its neighbouring clip.
-    const auto keyMovesWithRange = [&](float position) {
-        return WaterClipSpanContains(rangeStart, rangeEnd, position) &&
-               !WaterClipKeyClaimedOutsideRange(
-                   *timeline,
+    const auto keyMovesWithSelection = [&](const WaterSettingKey& key) {
+        if (key.clipId != 0U) {
+            return WaterClipIdIsSelected(clipIds, key.clipId);
+        }
+        return WaterClipIdIsSelected(clipIds, 0U) &&
+               WaterClipSpanContains(
                    rangeStart,
                    rangeEnd,
-                   position);
+                   key.position);
     };
-    // The destination window must not stack onto a clip that is not moving
-    // with the range: clips on one timeline never overlap.
-    for (const auto& clip : timeline->clips) {
-        const bool clipInsideRange =
-            WaterClipSpanContains(rangeStart, rangeEnd, clip.start) &&
-            WaterClipSpanContains(rangeStart, rangeEnd, clip.end);
-        if (clipInsideRange) {
-            continue;
-        }
-        if (WaterClipStrictlyOverlaps(clip, newStart, newEnd)) {
-            return false;
-        }
-    }
     bool holdsContent = std::any_of(
         timeline->clips.begin(),
         timeline->clips.end(),
         [&](const WaterFeatureSettingsClip& clip) {
-            return WaterClipSpanContains(
-                       rangeStart,
-                       rangeEnd,
-                       clip.start) &&
-                   WaterClipSpanContains(rangeStart, rangeEnd, clip.end);
+            return WaterClipIdIsSelected(clipIds, clip.id);
         });
     for (const auto& setting : timeline->settings) {
         if (holdsContent) {
@@ -9261,7 +9645,7 @@ bool TransformWaterFeatureTimelineSpan(
             setting.keys.begin(),
             setting.keys.end(),
             [&](const WaterSettingKey& key) {
-                return keyMovesWithRange(key.position);
+                return keyMovesWithSelection(key);
             });
     }
     if (holdsContent &&
@@ -9270,10 +9654,12 @@ bool TransformWaterFeatureTimelineSpan(
         return false;
     }
     // Collision check before any mutation: a remapped key must not land on
-    // a key that stays outside the range on the same track.
+    // a key that stays outside the selection on the same track, nor collapse
+    // two selected keys to an ambiguous time.
     for (const auto& setting : timeline->settings) {
+        std::vector<float> remappedPositions;
         for (const auto& key : setting.keys) {
-            if (!keyMovesWithRange(key.position)) {
+            if (!keyMovesWithSelection(key)) {
                 continue;
             }
             const float remapped = RemapWaterClipPosition(
@@ -9283,7 +9669,7 @@ bool TransformWaterFeatureTimelineSpan(
                 newStart,
                 newEnd);
             for (const auto& other : setting.keys) {
-                if (keyMovesWithRange(other.position)) {
+                if (keyMovesWithSelection(other)) {
                     continue;
                 }
                 if (std::abs(other.position - remapped) <=
@@ -9291,12 +9677,22 @@ bool TransformWaterFeatureTimelineSpan(
                     return false;
                 }
             }
+            if (std::any_of(
+                    remappedPositions.begin(),
+                    remappedPositions.end(),
+                    [&](float other) {
+                        return std::abs(other - remapped) <=
+                               kWaterClipKeyTolerance;
+                    })) {
+                return false;
+            }
+            remappedPositions.push_back(remapped);
         }
     }
     for (auto& setting : timeline->settings) {
         bool moved = false;
         for (auto& key : setting.keys) {
-            if (!keyMovesWithRange(key.position)) {
+            if (!keyMovesWithSelection(key)) {
                 continue;
             }
             key.position = RemapWaterClipPosition(
@@ -9318,8 +9714,7 @@ bool TransformWaterFeatureTimelineSpan(
         }
     }
     for (auto& clip : timeline->clips) {
-        if (!WaterClipSpanContains(rangeStart, rangeEnd, clip.start) ||
-            !WaterClipSpanContains(rangeStart, rangeEnd, clip.end)) {
+        if (!WaterClipIdIsSelected(clipIds, clip.id)) {
             continue;
         }
         clip.start = RemapWaterClipPosition(
@@ -9335,8 +9730,83 @@ bool TransformWaterFeatureTimelineSpan(
             newStart,
             newEnd);
     }
+    for (const auto clipId : clipIds) {
+        if (clipId != 0U) {
+            (void)SynchronizeWaterFeatureClipBounds(timeline, clipId);
+        }
+    }
     SortWaterFeatureClips(&timeline->clips);
     return true;
+}
+
+bool TransformWaterFeatureTimelineSpan(
+    WaterFeatureTimeline* timeline,
+    float rangeStart,
+    float rangeEnd,
+    float newStart,
+    float newEnd) {
+    if (timeline == nullptr ||
+        !WaterClipRangeIsValid(rangeStart, rangeEnd)) {
+        return false;
+    }
+    EnsureWaterFeatureExplicitClipMembership(timeline);
+    std::vector<std::uint32_t> selected;
+    for (const auto& clip : timeline->clips) {
+        if (WaterClipSpanContains(rangeStart, rangeEnd, clip.start) &&
+            WaterClipSpanContains(rangeStart, rangeEnd, clip.end)) {
+            selected.push_back(clip.id);
+        }
+    }
+    const bool holdsLooseKeys = std::any_of(
+        timeline->settings.begin(),
+        timeline->settings.end(),
+        [&](const WaterKeyedSettingTrack& setting) {
+            return std::any_of(
+                setting.keys.begin(),
+                setting.keys.end(),
+                [&](const WaterSettingKey& key) {
+                    return key.clipId == 0U &&
+                           WaterClipSpanContains(
+                               rangeStart,
+                               rangeEnd,
+                               key.position);
+                });
+        });
+    if (holdsLooseKeys) {
+        selected.push_back(0U);
+    }
+    return TransformWaterFeatureClipSelection(
+        timeline,
+        selected,
+        rangeStart,
+        rangeEnd,
+        newStart,
+        newEnd);
+}
+
+bool TransformWaterFeatureClip(
+    WaterFeatureTimeline* timeline,
+    std::uint32_t clipId,
+    float newStart,
+    float newEnd) {
+    if (timeline == nullptr || clipId == 0U) {
+        return false;
+    }
+    EnsureWaterFeatureExplicitClipMembership(timeline);
+    const auto* clip = FindWaterFeatureClip(timeline, clipId);
+    if (clip == nullptr) {
+        return false;
+    }
+    const float rangeStart = clip->start;
+    const float rangeEnd = clip->end;
+    const std::array ids{clipId};
+    return TransformWaterFeatureClipSelection(
+        timeline,
+        ids,
+        rangeStart,
+        rangeEnd,
+        newStart,
+        newEnd);
 }
 
 WaterKeyedSettingsProfile CaptureWaterKeyedSettingsClip(
@@ -9365,19 +9835,62 @@ WaterKeyedSettingsProfile CaptureWaterKeyedSettingsClip(
             if (!WaterClipSpanContains(
                     rangeStart,
                     rangeEnd,
-                    key.position)) {
+                    key.position) ||
+                (timeline.clipMembershipExplicit && key.clipId != 0U)) {
                 continue;
             }
-            captured.keys.push_back(WaterSettingKey{
-                .position = RemapWaterClipPosition(
-                    key.position,
-                    rangeStart,
-                    rangeEnd,
-                    0.0F,
-                    1.0F),
-                .value = key.value,
-                .interpolation = key.interpolation,
-            });
+            auto capturedKey = key;
+            capturedKey.position = RemapWaterClipPosition(
+                key.position,
+                rangeStart,
+                rangeEnd,
+                0.0F,
+                1.0F);
+            capturedKey.clipId = 0U;
+            captured.keys.push_back(capturedKey);
+        }
+        if (!captured.keys.empty()) {
+            profile.settings.push_back(std::move(captured));
+        }
+    }
+    return profile;
+}
+
+WaterKeyedSettingsProfile CaptureWaterKeyedSettingsClipById(
+    const WaterFeatureTimeline& timeline,
+    std::uint32_t clipId) {
+    WaterKeyedSettingsProfile profile;
+    profile.featureKind = timeline.feature.kind;
+    profile.ownerObjectId = timeline.feature.objectId;
+    const auto* clip = FindWaterFeatureClip(&timeline, clipId);
+    if (clip == nullptr || !WaterClipRangeIsValid(clip->start, clip->end)) {
+        return profile;
+    }
+    profile.nativeLengthFraction = std::clamp(
+        clip->end - clip->start,
+        kWaterFeatureClipMinimumLength,
+        1.0F);
+    for (const auto& setting : timeline.settings) {
+        WaterKeyedSettingTrack captured;
+        captured.settingId = setting.settingId;
+        captured.active = setting.active;
+        captured.label = setting.label;
+        captured.profileGroup = setting.profileGroup;
+        captured.profileName = setting.profileName;
+        captured.defaultInterpolation = setting.defaultInterpolation;
+        for (const auto& key : setting.keys) {
+            if (key.clipId != clipId) {
+                continue;
+            }
+            auto capturedKey = key;
+            capturedKey.position = RemapWaterClipPosition(
+                key.position,
+                clip->start,
+                clip->end,
+                0.0F,
+                1.0F);
+            capturedKey.clipId = 0U;
+            captured.keys.push_back(capturedKey);
         }
         if (!captured.keys.empty()) {
             profile.settings.push_back(std::move(captured));
@@ -9403,7 +9916,38 @@ std::optional<std::uint32_t> ApplyWaterKeyedSettingsClip(
         kWaterFeatureClipMinimumLength - kWaterClipKeyTolerance) {
         return std::nullopt;
     }
+    EnsureWaterFeatureExplicitClipMembership(timeline);
     const bool crossKind = profile.featureKind != timeline->feature.kind;
+    const bool hasApplicableKeys = std::any_of(
+        profile.settings.begin(),
+        profile.settings.end(),
+        [&](const WaterKeyedSettingTrack& packaged) {
+            return !packaged.settingId.empty() &&
+                   !packaged.keys.empty() &&
+                   (!crossKind ||
+                    FindWaterKeyableSetting(
+                        timeline->feature.kind,
+                        packaged.settingId) != nullptr);
+        });
+    if (!hasApplicableKeys) {
+        return std::nullopt;
+    }
+
+    WaterFeatureSettingsClip clip{
+        .id = AllocateWaterFeatureClipId(*timeline),
+        .name = !clipName.empty()
+                    ? std::move(clipName)
+                    : (!profile.baseProfileName.empty()
+                           ? profile.baseProfileName
+                           : profile.name),
+        .start = windowStart,
+        .end = windowEnd,
+        .sourceProfileName = profile.name,
+    };
+    const std::uint32_t clipId = clip.id;
+    timeline->clips.push_back(
+        SanitizeWaterFeatureSettingsClip(std::move(clip)));
+
     for (const auto& packaged : profile.settings) {
         if (packaged.settingId.empty() || packaged.keys.empty()) {
             continue;
@@ -9434,73 +9978,25 @@ std::optional<std::uint32_t> ApplyWaterKeyedSettingsClip(
             });
             return &timeline->settings.back();
         }();
-        // Keys claimed by a clip that survives this window (touching
-        // neighbours are kept by the strict-overlap clip removal below)
-        // must survive the key replacement too.
-        const auto keyIsProtected = [&](float position) {
-            return std::any_of(
-                timeline->clips.begin(),
-                timeline->clips.end(),
-                [&](const WaterFeatureSettingsClip& clip) {
-                    return !WaterClipStrictlyOverlaps(
-                               clip,
-                               windowStart,
-                               windowEnd) &&
-                           WaterClipSpanContains(
-                               clip.start,
-                               clip.end,
-                               position);
-                });
-        };
-        std::erase_if(
-            track->keys,
-            [&](const WaterSettingKey& key) {
-                return WaterClipSpanContains(
-                           windowStart,
-                           windowEnd,
-                           key.position) &&
-                       !keyIsProtected(key.position);
-            });
         for (const auto& key : packaged.keys) {
-            float position = RemapWaterClipPosition(
+            const float desiredPosition = RemapWaterClipPosition(
                 Clamp01(key.position),
                 0.0F,
                 1.0F,
                 windowStart,
                 windowEnd);
-            // A landing key may not stack onto a protected boundary key;
-            // nudge it just inside the window instead of overwriting the
-            // neighbouring clip's envelope.
-            const auto collides = [&](float candidate) {
-                return std::any_of(
-                    track->keys.begin(),
-                    track->keys.end(),
-                    [&](const WaterSettingKey& existing) {
-                        return std::abs(
-                                   existing.position - candidate) <=
-                               kWaterClipKeyTolerance;
-                    });
-            };
-            const float inwardStep =
-                position <= 0.5F * (windowStart + windowEnd)
-                    ? 2.0F * kWaterClipKeyTolerance
-                    : -2.0F * kWaterClipKeyTolerance;
-            for (std::size_t attempt = 0U;
-                 attempt < 3U && collides(position);
-                 ++attempt) {
-                position = std::clamp(
-                    position + inwardStep,
-                    windowStart,
-                    windowEnd);
-            }
-            if (collides(position)) {
+            const auto position = AvailableWaterClipKeyPosition(
+                *track,
+                desiredPosition,
+                windowStart,
+                windowEnd);
+            if (!position.has_value()) {
                 continue;
             }
-            track->keys.push_back(WaterSettingKey{
-                .position = position,
-                .value = key.value,
-                .interpolation = key.interpolation,
-            });
+            auto appliedKey = key;
+            appliedKey.position = position.value();
+            appliedKey.clipId = clipId;
+            track->keys.push_back(appliedKey);
         }
         std::stable_sort(
             track->keys.begin(),
@@ -9509,21 +10005,7 @@ std::optional<std::uint32_t> ApplyWaterKeyedSettingsClip(
                 return left.position < right.position;
             });
     }
-    RemoveWaterClipsIntersecting(timeline, windowStart, windowEnd);
-    WaterFeatureSettingsClip clip{
-        .id = AllocateWaterFeatureClipId(*timeline),
-        .name = !clipName.empty()
-                    ? std::move(clipName)
-                    : (!profile.baseProfileName.empty()
-                           ? profile.baseProfileName
-                           : profile.name),
-        .start = windowStart,
-        .end = windowEnd,
-        .sourceProfileName = profile.name,
-    };
-    const std::uint32_t clipId = clip.id;
-    timeline->clips.push_back(
-        SanitizeWaterFeatureSettingsClip(std::move(clip)));
+    (void)SynchronizeWaterFeatureClipBounds(timeline, clipId);
     SortWaterFeatureClips(&timeline->clips);
     return clipId;
 }
@@ -9532,11 +10014,12 @@ std::optional<std::uint32_t> CreateWaterFeatureClipFromSpan(
     WaterFeatureTimeline* timeline,
     float start,
     float end,
-    std::string name) {
+    std::string name,
+    bool attachLooseKeys) {
     if (timeline == nullptr || !WaterClipRangeIsValid(start, end)) {
         return std::nullopt;
     }
-    RemoveWaterClipsIntersecting(timeline, start, end);
+    EnsureWaterFeatureExplicitClipMembership(timeline);
     WaterFeatureSettingsClip clip = SanitizeWaterFeatureSettingsClip({
         .id = AllocateWaterFeatureClipId(*timeline),
         .name = std::move(name),
@@ -9546,6 +10029,17 @@ std::optional<std::uint32_t> CreateWaterFeatureClipFromSpan(
     });
     const std::uint32_t clipId = clip.id;
     timeline->clips.push_back(std::move(clip));
+    if (attachLooseKeys) {
+        for (auto& setting : timeline->settings) {
+            for (auto& key : setting.keys) {
+                if (key.clipId == 0U &&
+                    WaterClipSpanContains(start, end, key.position)) {
+                    key.clipId = clipId;
+                }
+            }
+        }
+    }
+    (void)SynchronizeWaterFeatureClipBounds(timeline, clipId);
     SortWaterFeatureClips(&timeline->clips);
     return clipId;
 }
@@ -9554,28 +10048,16 @@ std::optional<std::uint32_t> DuplicateWaterFeatureClip(
     WaterFeatureTimeline* timeline,
     std::uint32_t clipId,
     float targetStart) {
+    EnsureWaterFeatureExplicitClipMembership(timeline);
     const auto* clip = FindWaterFeatureClip(timeline, clipId);
     if (clip == nullptr || !std::isfinite(targetStart)) {
         return std::nullopt;
     }
-    // Copies taken before any clip-vector mutation: the intersecting-clip
-    // removal below may erase or shift the source entry.
     const float length = clip->end - clip->start;
-    const float sourceStart = clip->start;
-    const float sourceEnd = clip->end;
     const std::string name = clip->name;
     const std::string provenance = clip->sourceProfileName;
     const float start = std::clamp(targetStart, 0.0F, 1.0F - length);
-    // A copy landing on its own source would paste over it and destroy the
-    // original; refuse rather than silently lose authored keys.
-    if (start < sourceEnd - kWaterClipKeyTolerance &&
-        start + length > sourceStart + kWaterClipKeyTolerance) {
-        return std::nullopt;
-    }
-    auto package = CaptureWaterKeyedSettingsClip(
-        *timeline,
-        sourceStart,
-        sourceEnd);
+    auto package = CaptureWaterKeyedSettingsClipById(*timeline, clipId);
     package.name = provenance;
     package.baseProfileName = name;
     if (package.settings.empty()) {
@@ -9584,7 +10066,8 @@ std::optional<std::uint32_t> DuplicateWaterFeatureClip(
             timeline,
             start,
             start + length,
-            name);
+            name,
+            /*attachLooseKeys=*/false);
     }
     return ApplyWaterKeyedSettingsClip(
         timeline,
@@ -9599,6 +10082,8 @@ std::optional<std::uint32_t> TransferWaterFeatureClip(
     std::uint32_t clipId,
     WaterFeatureTimeline* destination,
     bool removeFromSource) {
+    EnsureWaterFeatureExplicitClipMembership(source);
+    EnsureWaterFeatureExplicitClipMembership(destination);
     const auto* clip = FindWaterFeatureClip(source, clipId);
     if (clip == nullptr || destination == nullptr ||
         source == destination ||
@@ -9609,7 +10094,7 @@ std::optional<std::uint32_t> TransferWaterFeatureClip(
     const float end = clip->end;
     const std::string name = clip->name;
     const std::string provenance = clip->sourceProfileName;
-    auto package = CaptureWaterKeyedSettingsClip(*source, start, end);
+    auto package = CaptureWaterKeyedSettingsClipById(*source, clipId);
     package.name = provenance;
     package.baseProfileName = name;
     std::optional<std::uint32_t> destinationClipId;
@@ -9618,7 +10103,8 @@ std::optional<std::uint32_t> TransferWaterFeatureClip(
             destination,
             start,
             end,
-            name);
+            name,
+            /*attachLooseKeys=*/false);
     } else {
         destinationClipId = ApplyWaterKeyedSettingsClip(
             destination,
@@ -9637,29 +10123,24 @@ bool RemoveWaterFeatureClip(
     WaterFeatureTimeline* timeline,
     std::uint32_t clipId,
     bool removeKeys) {
+    EnsureWaterFeatureExplicitClipMembership(timeline);
     auto* clip = FindWaterFeatureClip(timeline, clipId);
     if (clip == nullptr) {
         return false;
     }
-    if (removeKeys) {
-        const float start = clip->start;
-        const float end = clip->end;
-        for (auto& setting : timeline->settings) {
+    for (auto& setting : timeline->settings) {
+        if (removeKeys) {
             std::erase_if(
                 setting.keys,
                 [&](const WaterSettingKey& key) {
-                    // A shared-boundary key claimed by a neighbouring clip
-                    // survives; only this clip's own keys are deleted.
-                    return WaterClipSpanContains(
-                               start,
-                               end,
-                               key.position) &&
-                           !WaterClipKeyClaimedOutsideRange(
-                               *timeline,
-                               start,
-                               end,
-                               key.position);
+                    return key.clipId == clipId;
                 });
+        } else {
+            for (auto& key : setting.keys) {
+                if (key.clipId == clipId) {
+                    key.clipId = 0U;
+                }
+            }
         }
     }
     std::erase_if(
