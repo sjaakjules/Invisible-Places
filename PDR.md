@@ -479,6 +479,22 @@ and camera-key editing shall always move the camera. A shared **Always Follow
 Camera** override shall appear beside **Subtle Selected Cues** in Water and
 beside **Split Graphs** in Timings.
 
+#### FR-STYLE-12
+Timings feature runs shall support settings clips: named normalized spans that
+group one feature's keyed-setting keys for whole-clip manipulation. A Clips
+lane in the Timings tab and the embedded per-feature timelines shall offset,
+stretch, duplicate, and retarget clips by direct drag, including marquee and
+modifier-click multi-selection, group offset and anchored group scaling with
+collision-safe clamping against keys outside each clip, Alt-drag duplication,
+and drag-between-rows transfer restricted to features of one kind. Blocks
+shall indicate the primary keyed value by fill brightness, not curves. A clip
+shall save as a reusable package that records its native length; packages
+shall apply to any same-kind feature at any position and stretch to any
+length. Clip operations shall rewrite only the grouped keys — evaluation,
+per-key editing, and compiled export snapshots are unchanged — and Timing
+Take retiming shall carry clip bounds with their keys. Project schema 74 and
+water-sources schema 28 store clips and package lengths.
+
 ### 5.8 Procedural Motion
 #### FR-MOTION-1
 Dynamic point motion shall be procedural and non-destructive.

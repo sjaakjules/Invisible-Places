@@ -496,6 +496,14 @@ Keep v1 simple and predictable.
   the pre-scrub animation frame, preserve an orbited inspection view otherwise,
   and expose one shared **Always Follow Camera** override in both tabs. Global
   Animation Position and camera-key timelines remain unconditional.
+- Project schema 74 / water-sources schema 28 add per-feature-timeline
+  `clips[]` (id, name, start, end, source_profile) and a keyed-settings
+  profile `native_length`. Settings clips are authoring metadata over the
+  same normalized key domain: every clip operation (offset, stretch,
+  duplicate, cross-feature transfer, package capture/apply into a window)
+  rewrites the grouped keys through shared water-model helpers, clip-less
+  documents parse unchanged, and Timing Take retiming moves clip bounds with
+  their keys.
 
 ## 10. Procedural Motion System
 ### 10.1 Motion objective

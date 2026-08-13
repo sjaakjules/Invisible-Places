@@ -4459,7 +4459,7 @@ json SerializeWaterKeyedSettingsProfile(
         settingsJson.push_back(
             SerializeWaterKeyedSettingTrack(setting));
     }
-    return {
+    json profileJson{
         {"name", profile.name},
         {"base_profile_name", profile.baseProfileName},
         {"owner_object_name", profile.ownerObjectName},
@@ -4471,6 +4471,13 @@ json SerializeWaterKeyedSettingsProfile(
         {"edited", profile.edited},
         {"settings", std::move(settingsJson)},
     };
+    // Full length is the norm; emitting only clip-captured lengths keeps
+    // documents with whole-animation profiles byte-identical to earlier
+    // schema output.
+    if (profile.nativeLengthFraction < 1.0F) {
+        profileJson["native_length"] = profile.nativeLengthFraction;
+    }
+    return profileJson;
 }
 
 invisible_places::water::WaterKeyedSettingsProfile
@@ -4488,6 +4495,7 @@ ParseWaterKeyedSettingsProfile(const json& profileJson) {
         "source_profile_name",
         std::string{});
     profile.edited = profileJson.value("edited", false);
+    profile.nativeLengthFraction = profileJson.value("native_length", 1.0F);
     if (const auto kind = invisible_places::water::
             ParseWaterKeyedFeatureKindName(
                 profileJson.value("feature_kind", std::string{"flow_path"}));
@@ -4505,6 +4513,33 @@ ParseWaterKeyedSettingsProfile(const json& profileJson) {
         std::move(profile));
 }
 
+json SerializeWaterFeatureSettingsClip(
+    const invisible_places::water::WaterFeatureSettingsClip& clip) {
+    json clipJson{
+        {"id", clip.id},
+        {"name", clip.name},
+        {"start", clip.start},
+        {"end", clip.end},
+    };
+    if (!clip.sourceProfileName.empty()) {
+        clipJson["source_profile"] = clip.sourceProfileName;
+    }
+    return clipJson;
+}
+
+invisible_places::water::WaterFeatureSettingsClip
+ParseWaterFeatureSettingsClip(const json& clipJson) {
+    return invisible_places::water::WaterFeatureSettingsClip{
+        .id = clipJson.value("id", 0U),
+        .name = clipJson.value("name", std::string{"Clip"}),
+        .start = clipJson.value("start", 0.0F),
+        .end = clipJson.value("end", 1.0F),
+        .sourceProfileName = clipJson.value(
+            "source_profile",
+            std::string{}),
+    };
+}
+
 json SerializeWaterFeatureTimingRun(
     const invisible_places::water::WaterFeatureTimingRun& run) {
     json featuresJson = json::array();
@@ -4514,13 +4549,24 @@ json SerializeWaterFeatureTimingRun(
             settingsJson.push_back(
                 SerializeWaterKeyedSettingTrack(setting));
         }
-        featuresJson.push_back({
+        json timelineJson{
             {"kind",
              std::string{invisible_places::water::WaterKeyedFeatureKindName(
                  timeline.feature.kind)}},
             {"object_id", timeline.feature.objectId},
             {"settings", std::move(settingsJson)},
-        });
+        };
+        // Clip-less timelines are the norm; omitting the array keeps them
+        // byte-identical to earlier schema output.
+        if (!timeline.clips.empty()) {
+            json clipsJson = json::array();
+            for (const auto& clip : timeline.clips) {
+                clipsJson.push_back(
+                    SerializeWaterFeatureSettingsClip(clip));
+            }
+            timelineJson["clips"] = std::move(clipsJson);
+        }
+        featuresJson.push_back(std::move(timelineJson));
     }
     json runJson{
         {"id", run.id},
@@ -4557,6 +4603,13 @@ invisible_places::water::WaterFeatureTimingRun ParseWaterFeatureTimingRun(
                 for (const auto& settingJson : featureJson.at("settings")) {
                     timeline.settings.push_back(
                         ParseWaterKeyedSettingTrack(settingJson));
+                }
+            }
+            if (featureJson.contains("clips") &&
+                featureJson.at("clips").is_array()) {
+                for (const auto& clipJson : featureJson.at("clips")) {
+                    timeline.clips.push_back(
+                        ParseWaterFeatureSettingsClip(clipJson));
                 }
             }
             run.features.push_back(std::move(timeline));

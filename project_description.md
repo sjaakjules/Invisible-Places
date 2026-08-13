@@ -557,6 +557,25 @@ The Global Animation Position bar and camera-key timeline always restore and
 follow the animation camera. A shared **Always Follow Camera** override appears
 beside **Subtle Selected Cues** in Water and beside **Split Graphs** in Timings.
 
+The Timings tab adds a Clips lane above the run graphs, with the same lane
+embedded on each water sub-tab timeline. Every feature row shows its keyed
+spans as blocks whose fill brightness follows the feature's primary keyed
+setting, so a rain burst or seepage response reads at a glance without curve
+clutter; a feature that has keys but no clips yet appears as a dashed
+loose-keys block that one double-click turns into a named clip. Blocks drag to
+offset their grouped keys in time, stretch from either edge (a multi-selection
+scales about its far edge), duplicate with Alt-drag, and move or copy onto
+another feature of the same kind by dragging between rows. Marquee drags and
+Cmd-clicks build multi-selections that offset and scale together, clamped so
+no clip ever lands on keys outside it; Escape cancels a live drag losslessly.
+Right-click saves a clip as a named package that records its natural length,
+and the same menu applies any saved package to a same-kind feature at the
+clicked position, after which each applied clip slides, shrinks, or stretches
+independently — one authored seepage on/off envelope can drive many seepage
+features, each with its own timing against the rain. Clips persist with the
+run (project schema 74, water-sources schema 28), retime with camera-tail
+extensions, and never change how the keys themselves evaluate.
+
 ## Side Panel UI
 The main artist-facing control surface is a side panel.
 

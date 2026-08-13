@@ -2231,6 +2231,12 @@ bool RetimeTimingTakeSceneStateNormalizedPositions(
             for (auto& setting : feature.settings) {
                 retimeKeys(&setting.keys);
             }
+            // Settings clips are spans over the same normalized domain, so
+            // they retime exactly with the keys they group.
+            for (auto& clip : feature.clips) {
+                clip.start = retimePosition(clip.start);
+                clip.end = retimePosition(clip.end);
+            }
         }
     }
 
