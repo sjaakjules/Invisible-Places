@@ -314,8 +314,12 @@ TEST_CASE("World camera segments clip to the visible view-frustum interval",
     }
 }
 
-TEST_CASE("Feature timeline camera following preserves an orbited inspection view",
-          "[camera][animation][feature-timeline][scrub]") {
+TEST_CASE("Timeline camera following preserves an orbited inspection view",
+          "[camera][animation][feature-timeline][playback][scrub]") {
+    CHECK_FALSE(invisible_places::camera::AnimationCameraMatchesFrame(
+        {},
+        {},
+        0.5F));
     CHECK_FALSE(invisible_places::camera::
                     FeatureTimelineScrubShouldMoveCamera(
                         {},
@@ -344,6 +348,15 @@ TEST_CASE("Feature timeline camera following preserves an orbited inspection vie
     liveCamera.ApplyState(evaluation.camera);
     const auto attached = liveCamera.CaptureState();
 
+    CHECK(invisible_places::camera::AnimationCameraMatchesFrame(
+        attached,
+        path,
+        kPosition));
+    CHECK(invisible_places::camera::AnimationPlaybackShouldFollowCamera(
+        attached,
+        path,
+        kPosition,
+        true));
     CHECK(invisible_places::camera::
               FeatureTimelineScrubShouldMoveCamera(
                   attached,
@@ -353,6 +366,20 @@ TEST_CASE("Feature timeline camera following preserves an orbited inspection vie
 
     liveCamera.Orbit(24.0F, -8.0F);
     const auto orbited = liveCamera.CaptureState();
+    CHECK_FALSE(invisible_places::camera::AnimationCameraMatchesFrame(
+        orbited,
+        path,
+        kPosition));
+    CHECK_FALSE(invisible_places::camera::AnimationPlaybackShouldFollowCamera(
+        orbited,
+        path,
+        kPosition,
+        true));
+    CHECK_FALSE(invisible_places::camera::AnimationPlaybackShouldFollowCamera(
+        attached,
+        path,
+        kPosition,
+        false));
     CHECK_FALSE(invisible_places::camera::
                     FeatureTimelineScrubShouldMoveCamera(
                         orbited,

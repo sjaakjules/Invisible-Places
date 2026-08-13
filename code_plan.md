@@ -403,6 +403,12 @@ Widget features:
 
 This widget is the main scaling mechanism for the style system.
 
+Water feature sliders use a scoped wrapper around Dear ImGui's native slider:
+double-clicking the bar requests its numeric input mode, exact `0..1` ranges
+render with three decimals and `NoRoundToFormat`, and the underlying float is
+passed unchanged to Water key storage and interpolation. Existing Water drag
+and ranged controls retain their native/custom double-click numeric entry.
+
 ### 7.5 Layer override model
 Each layer should expose:
 - base style preset,
@@ -504,6 +510,26 @@ Keep v1 simple and predictable.
   rewrites the grouped keys through shared water-model helpers, clip-less
   documents parse unchanged, and Timing Take retiming moves clip bounds with
   their keys.
+- Project schema 75 / water-sources schema 29 add segment-relative incoming
+  and outgoing cubic-Bezier handle coordinates to every keyed Water setting.
+  Add **Spline Handles** to the per-key and per-setting interpolation menus,
+  invert its monotone time curve during evaluation, expose only the controls
+  belonging to the selected key's adjacent manual segments, and preserve the
+  handles through value edits, key retiming, clip retiming, save/load, preview,
+  and export. Reserve a distinct lower graph rail for time-only key handles so
+  minimum-valued curve dots cannot capture retime gestures.
+- Project schema 76 / water-sources schema 30 add `clip_id` to every keyed
+  Water timeline key (including zero for a deliberately loose key). Derive
+  keyed clip bounds from their first/last explicit members, allow clip windows
+  to overlap and pass one another, keep same-track/time collision checks local
+  to the keys, route new authoring to a single selected stored clip, and retain
+  a simultaneous dashed loose-key block for unowned keys. Clip-owned graph
+  keys use square/diamond markers while loose keys remain round/linear.
+- Keep a one-edit session snapshot around water key authoring. Start the
+  transaction before a slider, key, spline-handle, or settings-clip gesture,
+  commit its final state once on release/Apply, and let Ctrl+Z (Cmd+Z on macOS)
+  toggle between the two snapshots. Do not intercept the shortcut while an
+  ImGui text or numeric input owns keyboard editing.
 
 ## 10. Procedural Motion System
 ### 10.1 Motion objective
@@ -572,7 +598,7 @@ Allow the user to tag specific scalar fields for output to avoid exploding pass 
 - Slide-out/pinnable side panel split into Lidar, Visuals, gSplat, Camera, Animation, and Project tabs, with LiDAR lookdev isolated in Visuals.
 - Camera shot save/load, ordered camera paths, quaternion interpolation, 30 fps timing, CPU-assisted surface pivot picking, view-frustum-clipped selected-key camera/focus relationship lines that remain visible with off-screen endpoints, one-third-position shared-rig cube gizmos with standard axis/plane translation, retained focus-key world-Z orbit handles, and transactional focus-node Live Edit Mode with full camera/lens capture.
 - Preview-only live-view composition guides with a top-toolbar Grid toggle, distinct thirds and emphasized halfway marks, plus independent line-group, colour, opacity, and weight controls.
-- Animation paths derived from camera paths, editable camera/focus keys, playback/scrubbing, save/load, focus distance, aperture metadata, LiDAR associations, a default live-view window size, per-animation Quick MP4 export settings/visual selections, and an unlinked preferred Blend Partner in `.ipanim.json` schema v23. Local Water and Timings feature scrubs preserve a manually orbited inspection camera while continuing to evaluate the shared playhead; attached cameras follow normally, the global/camera-key timelines always follow, and both feature tabs expose the same always-follow override.
+- Animation paths derived from camera paths, editable camera/focus keys, playback/scrubbing, save/load, focus distance, aperture metadata, LiDAR associations, a default live-view window size, per-animation Quick MP4 export settings/visual selections, and an unlinked preferred Blend Partner in `.ipanim.json` schema v23. Local Water and Timings feature scrubs preserve a manually orbited inspection camera while continuing to evaluate the shared playhead; attached cameras follow normally, the global/camera-key timelines always follow, and both feature tabs expose the same always-follow override. Ordinary Play/Space transport acquires camera follow only from an animation-aligned live view, permanently detaches for that run after manual navigation, and continues advancing the shared playhead and keyed features while detached.
 - Matching-Frame Key Alignment keeps **Fix A+B Lens** beside **Extend Both Seams…**. Its ordinary paired timelines support stable right-click key selection plus an immutable camera-alignment snapshot. A live/selected/copied comparison exposes focus distance, world-Z polar angle, local path-tangent-relative horizontal angle, and camera/focus clearances above a shared ground reference beginning one-third of the way from focus to camera and falling forward when that cell is missing. The 10 mm cached authored-SAND channel is authoritative; MESH is permitted only for vegetation-supported retained Ground cells. Selected-node notices expose the chosen source, fallback, or cache/coverage failure. Paste masks select those five geometry values independently plus authored horizon/roll; missing tangent/Ground measurements gate only the dependent paste choices. The standalone repair creates paired edited paths with one median fixed-lens profile per animation and a conservative pair-wide clip union; the extension wizard can instead hold that repair privately until Apply or Cancel.
 - Reciprocal pan extension for target-driven, fixed-lens paths: editable working-scene triangles define the existing A-start/B-end and B-start/A-end 50%-blend midpoints. Each inward seam span generates both a source pre-roll and partner tail, using two keys at each simple end or three for a crossed key/inflection, plus localized first/last endpoint alignment. Signed fitted-seam review includes A/B switching, a real two-camera hard split whose adjustable boundary follows the projected anchors, and two selectable key timelines for one-seam spatial smoothing around the paired midpoint before the opposite seam is captured; water work is suppressed while the assistant is active. Final Preview replays those authored-key selections and exposes iterative green-key spatial editing with a viewport gizmo, exact-knot/per-segment spline redraw, coordinated triangle-pair movement, a selected-reference force-align action, selected-only X/Y/rotation/X+rotation/perceived-speed passes, and no timing-weight writes. Four A/B motion graphs mark the 50% keys. A signed -1..1 full-cycle transport selects the appropriate hard-split seam, keeps a separate feature-relative offset for each blend, wraps repeated drags, and loops with Space. Its default 4:00 fit retimes the two unique bulk spans plus every generated seam half with one shared scale, apportions exact integer segment frames to a 7,200-frame cycle, and scales reciprocal overlaps/export bounds without moving camera geometry or triangle constraints. Apply creates a reciprocal blend link for an unlinked pair or updates its existing pair and stores the generated spans as reciprocal start/end blend durations. Pair-aware Save As retargets the two new filenames and commits A, B, and project together without detaching the link. Schema v22 stores explicit correction tangents and a deprecated migration marker. Current extensions affinely shift/rescale normalized timing/water/effect keys so they remain attached to the same old camera poses. Camera position selects those keyed values but never drives procedural motion: live effects use steady elapsed time even with a stationary camera, and export uses deterministic full output time.
 - Valid reciprocal links retain a live **Seamed View** after the assistant closes. A pure linked-seam sampler maps either member's current playhead into the partner at both reciprocal overlap bands. The alternating two-camera compositor renders either the existing moving hard split or a complete-frame straight-alpha Overlap, with a stable filename-based top layer and adjustable top-opacity multiplier. The split follows transient wizard anchors when available and otherwise uses overlap progress, with endpoint-role side assignment, one session-stable offset per physical seam, and ordinary single-camera rendering outside the bands.

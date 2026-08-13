@@ -10095,16 +10095,12 @@ AnimationPathEvaluation EvaluateAnimationPath(
         timeSeconds);
 }
 
-bool FeatureTimelineScrubShouldMoveCamera(
+bool AnimationCameraMatchesFrame(
     const CameraState& liveCamera,
     const AnimationPath& path,
-    float normalizedPosition,
-    bool alwaysFollowCamera) {
+    float normalizedPosition) {
     if (path.keys.size() < 2U) {
         return false;
-    }
-    if (alwaysFollowCamera) {
-        return true;
     }
 
     const auto expected = EvaluateAnimationPath(
@@ -10156,6 +10152,31 @@ bool FeatureTimelineScrubShouldMoveCamera(
                liveCamera.fovDegrees -
                expected.camera.fovDegrees) <=
                1.0e-3F;
+}
+
+bool FeatureTimelineScrubShouldMoveCamera(
+    const CameraState& liveCamera,
+    const AnimationPath& path,
+    float normalizedPosition,
+    bool alwaysFollowCamera) {
+    if (path.keys.size() < 2U) {
+        return false;
+    }
+    return alwaysFollowCamera || AnimationCameraMatchesFrame(
+        liveCamera,
+        path,
+        normalizedPosition);
+}
+
+bool AnimationPlaybackShouldFollowCamera(
+    const CameraState& liveCamera,
+    const AnimationPath& path,
+    float normalizedPosition,
+    bool cameraFollowWasActive) {
+    return cameraFollowWasActive && AnimationCameraMatchesFrame(
+        liveCamera,
+        path,
+        normalizedPosition);
 }
 
 AnimationCameraFrameTransform BuildAnimationCameraFrameTransform(

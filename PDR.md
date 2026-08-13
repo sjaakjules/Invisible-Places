@@ -386,6 +386,13 @@ allow halfway and thirds to be shown independently and shall expose colour,
 opacity, and line-weight controls. The guide shall be preview-only and shall
 not appear in frame previews or exported output.
 
+#### FR-UI-14
+Every numeric slider in the Water features UI shall enter native numeric text
+editing when its slider bar is double-clicked. Controls with an exact normalized
+`0..1` range shall display three decimal places without rounding the stored
+single-precision value; Water keys and their interpolation shall use that
+underlying value rather than the display text.
+
 ### 5.6 Parameter Source Modes
 #### FR-PARAM-1
 Every eligible numeric or vector render parameter shall support `Constant` mode.
@@ -477,23 +484,53 @@ animation frame active before the scrub. After orbit, pan, or dolly navigation,
 feature scrubbing shall preserve the inspection view. Global Animation Position
 and camera-key editing shall always move the camera. A shared **Always Follow
 Camera** override shall appear beside **Subtle Selected Cues** in Water and
-beside **Split Graphs** in Timings.
+beside **Split Graphs** in Timings. Ordinary Play/Space transport shall follow
+the live camera only when it matches the active animation frame at playback
+start, shall detach without snapping back if the user navigates away during
+playback, and shall continue advancing the shared playhead and keyed features
+while detached.
 
 #### FR-STYLE-12
 Timings feature runs shall support settings clips: named normalized spans that
-group one feature's keyed-setting keys for whole-clip manipulation. A Clips
+group one feature's keyed-setting keys by explicit clip id for whole-clip
+manipulation. Clip windows may overlap and pass across one another without
+capturing or deleting each other's keys. A Clips
 lane in the Timings tab and the embedded per-feature timelines shall offset,
 stretch, duplicate, and retarget clips by direct drag, including marquee and
 modifier-click multi-selection, group offset and anchored group scaling with
-collision-safe clamping against keys outside each clip, Alt-drag duplication,
-and drag-between-rows transfer restricted to features of one kind. Blocks
+normalized-domain clamping and exact same-track key collision protection,
+Alt-drag duplication, and drag-between-rows transfer restricted to features
+of one kind. Selecting one stored clip shall attach newly authored keys for
+that feature to it; otherwise new keys shall remain loose and visible in a
+dashed loose-key block alongside clips. Clip keys shall use distinct square
+and diamond graph markers, and their first and last key shall derive the clip
+bounds. Blocks
 shall indicate the primary keyed value by fill brightness, not curves. A clip
 shall save as a reusable package that records its native length; packages
 shall apply to any same-kind feature at any position and stretch to any
 length. Clip operations shall rewrite only the grouped keys — evaluation,
 per-key editing, and compiled export snapshots are unchanged — and Timing
 Take retiming shall carry clip bounds with their keys. Project schema 74 and
-water-sources schema 28 store clips and package lengths.
+water-sources schema 28 introduced clips and package lengths; project schema
+76 and water-sources schema 30 store explicit per-key `clip_id` ownership.
+
+#### FR-STYLE-13
+Each keyed Water setting shall offer **Spline Handles** alongside Smooth Step,
+Linear, Hold, Monotone Spline, and Centripetal Catmull-Rom. The mode shall use
+persisted incoming and outgoing cubic-Bezier controls; selecting a participating
+key shall expose its circular controls on the value graph, and dragging a
+control shall change curve time/value shape without moving the key. The graph's
+time-only key markers shall occupy a separate lower rail with non-overlapping
+hit targets even when the keyed value is at its minimum. Project schema 75 and
+water-sources schema 29 store the handle time fractions and value offsets.
+
+#### FR-STYLE-14
+Water key authoring shall retain one atomic edit of session history. Ctrl+Z on
+Windows/Linux and Cmd+Z on macOS shall restore the state before the latest key,
+keyed-setting, or settings-clip edit, and pressing the same shortcut again shall
+reapply it. Continuous slider, key, spline-handle, and clip drags shall each form
+one edit. Focused text and numeric inputs shall keep their native field-level
+undo instead of triggering the timeline history.
 
 ### 5.8 Procedural Motion
 #### FR-MOTION-1

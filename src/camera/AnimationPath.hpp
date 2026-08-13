@@ -1043,10 +1043,23 @@ AlignAnimationKeyCameraToReferenceRig(
 AnimationPathEvaluation EvaluateAnimationPath(
     const AnimationPath& path,
     float timeSeconds);
+// Recognizes an animation-attached live pose at the current playhead. Feature
+// timeline scrubbing and animation playback use the same geometric check so
+// manual camera navigation is never unexpectedly undone.
+[[nodiscard]] bool AnimationCameraMatchesFrame(
+    const CameraState& liveCamera,
+    const AnimationPath& path,
+    float normalizedPosition);
+// Playback may acquire follow at start, but a run that has detached must not
+// unexpectedly reattach when the playhead later crosses a similar pose.
+[[nodiscard]] bool AnimationPlaybackShouldFollowCamera(
+    const CameraState& liveCamera,
+    const AnimationPath& path,
+    float normalizedPosition,
+    bool cameraFollowWasActive);
 // Feature timelines share the animation playhead but normally preserve an
-// inspection camera after the user orbits away. This predicate recognizes an
-// animation-attached live pose at the pre-scrub frame; the explicit override
-// always follows the animation camera.
+// inspection camera after the user orbits away. The explicit override always
+// follows the animation camera.
 [[nodiscard]] bool FeatureTimelineScrubShouldMoveCamera(
     const CameraState& liveCamera,
     const AnimationPath& path,

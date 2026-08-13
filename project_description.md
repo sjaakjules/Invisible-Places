@@ -556,25 +556,54 @@ panning, or dollying away turns the viewport into a retained inspection view.
 The Global Animation Position bar and camera-key timeline always restore and
 follow the animation camera. A shared **Always Follow Camera** override appears
 beside **Subtle Selected Cues** in Water and beside **Split Graphs** in Timings.
+Starting ordinary animation playback with **Play** or Space follows the camera
+only when the live view matches the current animation frame. If the user has
+already orbited, panned, or dollied away—or navigates away during playback—the
+global playhead and keyed effects continue while that inspection camera stays
+put for the rest of the run. Scrubbing the global or camera-key timeline still
+restores the animation camera before a later playback run.
+
+Water setting keys offer six outgoing interpolation modes. In addition to the
+automatic Smooth Step, Linear, Hold, Monotone Spline, and Centripetal
+Catmull-Rom choices, **Spline Handles** exposes persisted cubic-Bezier controls
+for manual time/value shaping. Selecting a key shows only the incoming and
+outgoing controls used by its adjacent manual segments; dragging them reshapes
+the curve without moving the key. Time-only key markers sit on a separate lower
+rail beneath the value graph, so a minimum or zero value cannot overlap the
+retime target. Project schema 75 and water-sources schema 29 store the handles.
 
 The Timings tab adds a Clips lane above the run graphs, with the same lane
 embedded on each water sub-tab timeline. Every feature row shows its keyed
 spans as blocks whose fill brightness follows the feature's primary keyed
 setting, so a rain burst or seepage response reads at a glance without curve
 clutter; a feature that has keys but no clips yet appears as a dashed
-loose-keys block that one double-click turns into a named clip. Blocks drag to
+loose-keys block that one double-click turns into a named clip. Loose keys can
+also remain beside stored clips. Selecting exactly one stored clip makes new
+keys for that feature join it; with no such selection, new keys remain loose.
+Clip members use square curve dots and diamond time markers, while loose keys
+remain round and linear. The first and last explicitly owned keys set each
+keyed clip's bounds. Blocks drag to
 offset their grouped keys in time, stretch from either edge (a multi-selection
 scales about its far edge), duplicate with Alt-drag, and move or copy onto
 another feature of the same kind by dragging between rows. Marquee drags and
-Cmd-clicks build multi-selections that offset and scale together, clamped so
-no clip ever lands on keys outside it; Escape cancels a live drag losslessly.
+Cmd-clicks build multi-selections that offset and scale together. Explicit key
+ownership lets clips overlap and pass across one another; the normalized
+domain and exact same-track key-time collisions remain guarded. Escape cancels
+a live drag losslessly.
 Right-click saves a clip as a named package that records its natural length,
 and the same menu applies any saved package to a same-kind feature at the
 clicked position, after which each applied clip slides, shrinks, or stretches
 independently — one authored seepage on/off envelope can drive many seepage
 features, each with its own timing against the rain. Clips persist with the
-run (project schema 74, water-sources schema 28), retime with camera-tail
+run (introduced in project schema 74/water-sources schema 28; explicit key
+ownership in project schema 76/water-sources schema 30), retime with camera-tail
 extensions, and never change how the keys themselves evaluate.
+
+Water key authoring retains one atomic edit in session history. Ctrl+Z on
+Windows/Linux and Cmd+Z on macOS restores the state before the latest key,
+keyed-setting, or settings-clip edit; the same shortcut then reapplies it. Each
+continuous slider, key, spline-handle, or clip drag is one edit, while focused
+text and numeric fields retain their own native text undo.
 
 ## Side Panel UI
 The main artist-facing control surface is a side panel.
@@ -587,6 +616,12 @@ The main artist-facing control surface is a side panel.
 - double-click again unpins it,
 - optional hotkey toggles visibility,
 - pinned state is saved per project.
+
+Water feature sliders retain their visual slider interaction but switch to an
+exact numeric field when the slider bar is double-clicked. An exact `0..1`
+range displays three decimals; that presentation does not quantize the stored
+float or the values used by Water key interpolation. For keyable controls,
+double-clicking the setting name remains the separate keying toggle.
 
 ### Panel purpose
 The side panel controls:
