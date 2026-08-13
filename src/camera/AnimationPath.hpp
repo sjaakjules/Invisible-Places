@@ -1043,6 +1043,15 @@ AlignAnimationKeyCameraToReferenceRig(
 AnimationPathEvaluation EvaluateAnimationPath(
     const AnimationPath& path,
     float timeSeconds);
+// Feature timelines share the animation playhead but normally preserve an
+// inspection camera after the user orbits away. This predicate recognizes an
+// animation-attached live pose at the pre-scrub frame; the explicit override
+// always follows the animation camera.
+[[nodiscard]] bool FeatureTimelineScrubShouldMoveCamera(
+    const CameraState& liveCamera,
+    const AnimationPath& path,
+    float normalizedPosition,
+    bool alwaysFollowCamera);
 [[nodiscard]] AnimationCameraFrameTransform
 BuildAnimationCameraFrameTransform(
     const AnimationPathEvaluation& destination,

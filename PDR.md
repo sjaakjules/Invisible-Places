@@ -469,6 +469,16 @@ Colourise and Emissive effects shall share a recommended maximum of five
 simultaneous effects. The UI shall identify ranges above that recommendation,
 and preview and export shall evaluate both kinds on GPU where feasible.
 
+#### FR-STYLE-11
+Scrubbing a keyed Water feature or Timings visual-feature timeline shall always
+advance the one shared animation position and evaluate every active keyed
+feature. It shall move the live camera only while that camera still matches the
+animation frame active before the scrub. After orbit, pan, or dolly navigation,
+feature scrubbing shall preserve the inspection view. Global Animation Position
+and camera-key editing shall always move the camera. A shared **Always Follow
+Camera** override shall appear beside **Subtle Selected Cues** in Water and
+beside **Split Graphs** in Timings.
+
 ### 5.8 Procedural Motion
 #### FR-MOTION-1
 Dynamic point motion shall be procedural and non-destructive.

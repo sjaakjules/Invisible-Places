@@ -4,6 +4,9 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <glm/gtc/quaternion.hpp>
+#include <glm/trigonometric.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -309,6 +312,113 @@ TEST_CASE("World camera segments clip to the visible view-frustum interval",
             {1.5F, -0.5F, 0.0F},
             {2.0F, 0.5F, 0.0F}));
     }
+}
+
+TEST_CASE("Feature timeline camera following preserves an orbited inspection view",
+          "[camera][animation][feature-timeline][scrub]") {
+    CHECK_FALSE(invisible_places::camera::
+                    FeatureTimelineScrubShouldMoveCamera(
+                        {},
+                        {},
+                        0.5F,
+                        true));
+
+    invisible_places::camera::AnimationPath path;
+    path.durationFrames = 90U;
+    path.keys = {
+        {.cameraPosition = {-2.0F, -6.0F, 2.0F},
+         .focusPoint = {0.0F, 0.0F, 1.0F},
+         .fovDegrees = 52.0F,
+         .durationFrames = 90U},
+        {.cameraPosition = {2.0F, -5.0F, 2.5F},
+         .focusPoint = {0.5F, 0.0F, 1.2F},
+         .fovDegrees = 58.0F,
+         .durationFrames = 90U},
+    };
+    constexpr float kPosition = 0.4F;
+    const auto evaluation = invisible_places::camera::EvaluateAnimationPath(
+        path,
+        invisible_places::camera::AnimationPathDurationSeconds(path) *
+            kPosition);
+    invisible_places::camera::OrbitCamera liveCamera;
+    liveCamera.ApplyState(evaluation.camera);
+    const auto attached = liveCamera.CaptureState();
+
+    CHECK(invisible_places::camera::
+              FeatureTimelineScrubShouldMoveCamera(
+                  attached,
+                  path,
+                  kPosition,
+                  false));
+
+    liveCamera.Orbit(24.0F, -8.0F);
+    const auto orbited = liveCamera.CaptureState();
+    CHECK_FALSE(invisible_places::camera::
+                    FeatureTimelineScrubShouldMoveCamera(
+                        orbited,
+                        path,
+                        kPosition,
+                        false));
+    CHECK(invisible_places::camera::
+              FeatureTimelineScrubShouldMoveCamera(
+                  orbited,
+                  path,
+                  kPosition,
+                  true));
+
+    auto changedLens = attached;
+    changedLens.fovDegrees += 0.1F;
+    CHECK_FALSE(invisible_places::camera::
+                    FeatureTimelineScrubShouldMoveCamera(
+                        changedLens,
+                        path,
+                        kPosition,
+                        false));
+
+    auto rolled = attached;
+    const glm::quat originalOrientation{
+        rolled.orientation[3U],
+        rolled.orientation[0U],
+        rolled.orientation[1U],
+        rolled.orientation[2U],
+    };
+    const glm::quat rolledOrientation = glm::normalize(
+        glm::angleAxis(
+            glm::radians(2.0F),
+            glm::vec3{0.0F, 0.0F, 1.0F}) *
+        originalOrientation);
+    rolled.orientation = {
+        rolledOrientation.x,
+        rolledOrientation.y,
+        rolledOrientation.z,
+        rolledOrientation.w,
+    };
+    CHECK_FALSE(invisible_places::camera::
+                    FeatureTimelineScrubShouldMoveCamera(
+                        rolled,
+                        path,
+                        kPosition,
+                        false));
+
+    auto freeOrientationPath = path;
+    for (auto& key : freeOrientationPath.keys) {
+        key.hasOrientation = true;
+        key.orientation = {0.0F, 0.0F, 0.0F, 1.0F};
+    }
+    const auto freeEvaluation = invisible_places::camera::
+        EvaluateAnimationPath(
+            freeOrientationPath,
+            invisible_places::camera::AnimationPathDurationSeconds(
+                freeOrientationPath) *
+                kPosition);
+    invisible_places::camera::OrbitCamera freeCamera;
+    freeCamera.ApplyState(freeEvaluation.camera);
+    CHECK(invisible_places::camera::
+              FeatureTimelineScrubShouldMoveCamera(
+                  freeCamera.CaptureState(),
+                  freeOrientationPath,
+                  kPosition,
+                  false));
 }
 
 TEST_CASE("Focus Z rotation orbits the camera on XY without changing height or distance",

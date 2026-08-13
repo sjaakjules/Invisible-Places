@@ -548,6 +548,15 @@ the animation overview.
   the project and in render-setup snapshots. Emissive effects require a scalar
   field and cannot select synthetic normal components.
 
+Water setting graphs and Timings visual-feature lanes advance the same global
+animation position, so scrubbing either one continues to replay every active
+keyed water and visual effect. Their camera follow is conditional: it continues
+when the live view still matches the previous animation frame, but orbiting,
+panning, or dollying away turns the viewport into a retained inspection view.
+The Global Animation Position bar and camera-key timeline always restore and
+follow the animation camera. A shared **Always Follow Camera** override appears
+beside **Subtle Selected Cues** in Water and beside **Split Graphs** in Timings.
+
 ## Side Panel UI
 The main artist-facing control surface is a side panel.
 

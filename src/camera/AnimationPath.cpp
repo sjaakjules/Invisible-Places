@@ -10095,6 +10095,69 @@ AnimationPathEvaluation EvaluateAnimationPath(
         timeSeconds);
 }
 
+bool FeatureTimelineScrubShouldMoveCamera(
+    const CameraState& liveCamera,
+    const AnimationPath& path,
+    float normalizedPosition,
+    bool alwaysFollowCamera) {
+    if (path.keys.size() < 2U) {
+        return false;
+    }
+    if (alwaysFollowCamera) {
+        return true;
+    }
+
+    const auto expected = EvaluateAnimationPath(
+        path,
+        AnimationPathDurationSeconds(path) *
+            std::clamp(normalizedPosition, 0.0F, 1.0F));
+    const auto distance = [](const auto& left, const auto& right) {
+        const float x = left[0U] - right[0U];
+        const float y = left[1U] - right[1U];
+        const float z = left[2U] - right[2U];
+        return std::hypot(x, std::hypot(y, z));
+    };
+    const float scale = std::max(
+        1.0F,
+        distance(
+            expected.camera.position,
+            expected.focusPoint));
+    const auto orientationMatches = [&]() {
+        float dot = 0.0F;
+        float liveLengthSquared = 0.0F;
+        float expectedLengthSquared = 0.0F;
+        for (std::size_t component = 0U; component < 4U; ++component) {
+            dot += liveCamera.orientation[component] *
+                expected.camera.orientation[component];
+            liveLengthSquared +=
+                liveCamera.orientation[component] *
+                liveCamera.orientation[component];
+            expectedLengthSquared +=
+                expected.camera.orientation[component] *
+                expected.camera.orientation[component];
+        }
+        if (liveLengthSquared <= 1.0e-8F ||
+            expectedLengthSquared <= 1.0e-8F) {
+            return false;
+        }
+        const float normalizedDot = std::abs(dot) /
+            std::sqrt(liveLengthSquared * expectedLengthSquared);
+        // q and -q encode the same rotation. This tolerance admits ordinary
+        // float round-off but detaches even a small manual camera rotation.
+        return 1.0F - std::clamp(normalizedDot, 0.0F, 1.0F) <=
+            1.0e-6F;
+    };
+    return distance(
+               liveCamera.position,
+               expected.camera.position) <=
+               2.0e-4F * scale &&
+           orientationMatches() &&
+           std::abs(
+               liveCamera.fovDegrees -
+               expected.camera.fovDegrees) <=
+               1.0e-3F;
+}
+
 AnimationCameraFrameTransform BuildAnimationCameraFrameTransform(
     const AnimationPathEvaluation& destination,
     const AnimationPathEvaluation& source) {

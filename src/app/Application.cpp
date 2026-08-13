@@ -1302,6 +1302,11 @@ struct AnimationPanelState {
     // keys use the same normalized 0..1 domain as the complete animation.
     invisible_places::timing::TimelineViewRange timelineViewRange{};
     std::optional<AnimationTimelineViewDragState> timelineViewDrag;
+    // Session-only override shared by the Water and Timings feature
+    // timelines. Ordinarily those timelines follow the animation camera only
+    // while the live view still matches the current animation frame, allowing
+    // an orbited inspection view to survive feature-key scrubbing.
+    bool featureTimelinesAlwaysFollowCamera = false;
     bool liveApply = true;
     bool previewDepthOfField = false;
     bool dirty = false;
@@ -53961,28 +53966,60 @@ bool LiveCameraMatchesAnimationFrame(
     const PreviewRuntimeState& runtimeState,
     const AnimationPath& path,
     float normalizedPosition) {
-    const auto expected = invisible_places::camera::EvaluateAnimationPath(
-        path,
-        invisible_places::camera::AnimationPathDurationSeconds(path) *
-            std::clamp(normalizedPosition, 0.0F, 1.0F));
-    const auto live = runtimeState.camera.CaptureState();
-    const auto distance = [](const auto& left, const auto& right) {
-        const float x = left[0U] - right[0U];
-        const float y = left[1U] - right[1U];
-        const float z = left[2U] - right[2U];
-        return std::hypot(x, std::hypot(y, z));
-    };
-    const float scale = std::max(
-        1.0F,
-        std::max(
-            distance(expected.camera.position, expected.focusPoint),
-            distance(live.position, live.target)));
-    return distance(live.position, expected.camera.position) <=
-               2.0e-4F * scale &&
-           distance(live.target, expected.focusPoint) <=
-               2.0e-4F * scale &&
-           std::abs(live.fovDegrees - expected.camera.fovDegrees) <=
-               1.0e-3F;
+    return invisible_places::camera::
+        FeatureTimelineScrubShouldMoveCamera(
+            runtimeState.camera.CaptureState(),
+            path,
+            normalizedPosition,
+            false);
+}
+
+// Water and visual-feature timelines share the global animation position so
+// all keyed effects continue to resolve together. They move the live camera
+// only if it was still on the animation path before the scrub began, unless
+// the user enables the explicit always-follow override.
+void ApplyFeatureTimelineScrub(
+    PreviewRuntimeState* runtimeState,
+    std::optional<float> cameraMatchPosition = std::nullopt) {
+    if (runtimeState == nullptr ||
+        !runtimeState->animationPanel.currentPath.has_value()) {
+        return;
+    }
+    auto& panel = runtimeState->animationPanel;
+    const float referencePosition = cameraMatchPosition.value_or(
+        panel.scrubAmount);
+    const bool moveCamera = invisible_places::camera::
+        FeatureTimelineScrubShouldMoveCamera(
+            runtimeState->camera.CaptureState(),
+            panel.currentPath.value(),
+            referencePosition,
+            panel.featureTimelinesAlwaysFollowCamera);
+    runtimeState->previewRenderStateSignatureValid = false;
+    if (moveCamera) {
+        ApplyAnimationScrub(runtimeState);
+        return;
+    }
+
+    // The playhead itself is the source of truth for water and visual timing
+    // evaluation, so preserving the camera must not pause those animations.
+    runtimeState->animationPlayback.active = false;
+    runtimeState->cameraPlayback.active = false;
+}
+
+void ScrubFeatureTimelineToAuthoredPosition(
+    PreviewRuntimeState* runtimeState,
+    float trackPosition) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    const float cameraPositionBeforeScrub =
+        runtimeState->animationPanel.scrubAmount;
+    SetCurrentAnimationPositionFromAuthoredTrack(
+        runtimeState,
+        trackPosition);
+    ApplyFeatureTimelineScrub(
+        runtimeState,
+        cameraPositionBeforeScrub);
 }
 
 std::uint32_t EffectiveAnimationKeyDurationFrames(
@@ -64660,11 +64697,15 @@ void DrawAnimationSection(
                                           panel.selectedWaterKeyIndex.value() == index;
                     if (ImGui::Selectable(label.c_str(), selected)) {
                         panel.selectedWaterKeyIndex = index;
+                        const float cameraPositionBeforeScrub =
+                            panel.scrubAmount;
                         SetCurrentAnimationPositionFromAuthoredTrack(
                             runtimeState,
                             key.position);
                         if (panel.liveApply) {
-                            ApplyAnimationScrub(runtimeState);
+                            ApplyFeatureTimelineScrub(
+                                runtimeState,
+                                cameraPositionBeforeScrub);
                         }
                     }
                 }
@@ -65049,11 +65090,15 @@ void DrawAnimationSection(
                                               panel.selectedSeepageNodeKeyIndex.value() == index;
                         if (ImGui::Selectable(label.c_str(), selected)) {
                             panel.selectedSeepageNodeKeyIndex = index;
+                            const float cameraPositionBeforeScrub =
+                                panel.scrubAmount;
                             SetCurrentAnimationPositionFromAuthoredTrack(
                                 runtimeState,
                                 nodeKey.position);
                             if (panel.liveApply) {
-                                ApplyAnimationScrub(runtimeState);
+                                ApplyFeatureTimelineScrub(
+                                    runtimeState,
+                                    cameraPositionBeforeScrub);
                             }
                         }
                     }
@@ -68875,19 +68920,17 @@ void DrawWaterSourceList(
             ImGui::SameLine();
             ImGui::BeginDisabled(!previous.has_value());
             if (ImGui::SmallButton("<")) {
-                SetCurrentAnimationPositionFromAuthoredTrack(
+                ScrubFeatureTimelineToAuthoredPosition(
                     runtimeState,
                     previous.value());
-                ApplyAnimationScrub(runtimeState);
             }
             ImGui::EndDisabled();
             ImGui::SameLine(0.0F, 2.0F);
             ImGui::BeginDisabled(!next.has_value());
             if (ImGui::SmallButton(">")) {
-                SetCurrentAnimationPositionFromAuthoredTrack(
+                ScrubFeatureTimelineToAuthoredPosition(
                     runtimeState,
                     next.value());
-                ApplyAnimationScrub(runtimeState);
             }
             ImGui::EndDisabled();
         };
@@ -71238,7 +71281,7 @@ KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
                 break;
             }
         }
-        ApplyAnimationScrub(runtimeState);
+        ApplyFeatureTimelineScrub(runtimeState);
         InvalidateWaterSeepageParams(&water);
         runtimeState->previewRenderStateSignatureValid = false;
         runtimeState->statusMessage =
@@ -71318,10 +71361,9 @@ KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
     ImGui::PushID(label);
     ImGui::BeginDisabled(!previous.has_value());
     if (ImGui::SmallButton("<")) {
-        SetCurrentAnimationPositionFromAuthoredTrack(
+        ScrubFeatureTimelineToAuthoredPosition(
             runtimeState,
             previous.value());
-        ApplyAnimationScrub(runtimeState);
     }
     ImGui::EndDisabled();
     buttonTooltip(
@@ -71331,10 +71373,9 @@ KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
     ImGui::SameLine(0.0F, 2.0F);
     ImGui::BeginDisabled(!next.has_value());
     if (ImGui::SmallButton(">")) {
-        SetCurrentAnimationPositionFromAuthoredTrack(
+        ScrubFeatureTimelineToAuthoredPosition(
             runtimeState,
             next.value());
-        ApplyAnimationScrub(runtimeState);
     }
     ImGui::EndDisabled();
     buttonTooltip(
@@ -71356,7 +71397,7 @@ KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
                     position);
         }
         if (removed > 0U) {
-            ApplyAnimationScrub(runtimeState);
+            ApplyFeatureTimelineScrub(runtimeState);
             InvalidateWaterSeepageParams(&water);
             runtimeState->previewRenderStateSignatureValid =
                 false;
@@ -71597,7 +71638,7 @@ KeyedWaterSliderResult DrawKeyedWaterColourSetting(
                 break;
             }
         }
-        ApplyAnimationScrub(runtimeState);
+        ApplyFeatureTimelineScrub(runtimeState);
         InvalidateWaterSeepageParams(&water);
         runtimeState->previewRenderStateSignatureValid = false;
         runtimeState->statusMessage =
@@ -71685,10 +71726,9 @@ KeyedWaterSliderResult DrawKeyedWaterColourSetting(
     ImGui::PushID(label);
     ImGui::BeginDisabled(!previous.has_value());
     if (ImGui::SmallButton("<")) {
-        SetCurrentAnimationPositionFromAuthoredTrack(
+        ScrubFeatureTimelineToAuthoredPosition(
             runtimeState,
             previous.value());
-        ApplyAnimationScrub(runtimeState);
     }
     ImGui::EndDisabled();
     buttonTooltip(
@@ -71698,10 +71738,9 @@ KeyedWaterSliderResult DrawKeyedWaterColourSetting(
     ImGui::SameLine(0.0F, 2.0F);
     ImGui::BeginDisabled(!next.has_value());
     if (ImGui::SmallButton(">")) {
-        SetCurrentAnimationPositionFromAuthoredTrack(
+        ScrubFeatureTimelineToAuthoredPosition(
             runtimeState,
             next.value());
-        ApplyAnimationScrub(runtimeState);
     }
     ImGui::EndDisabled();
     buttonTooltip(
@@ -71725,7 +71764,7 @@ KeyedWaterSliderResult DrawKeyedWaterColourSetting(
             }
         }
         if (removed > 0U) {
-            ApplyAnimationScrub(runtimeState);
+            ApplyFeatureTimelineScrub(runtimeState);
             InvalidateWaterSeepageParams(&water);
             runtimeState->previewRenderStateSignatureValid = false;
             runtimeState->statusMessage =
@@ -73788,10 +73827,9 @@ void DrawWaterKeyedProfilesCombo(
             if (ImGui::Selectable(
                     option.c_str(),
                     currentIndex == index)) {
-                SetCurrentAnimationPositionFromAuthoredTrack(
+                ScrubFeatureTimelineToAuthoredPosition(
                     runtimeState,
                     positions[index]);
-                ApplyAnimationScrub(runtimeState);
             }
             if (currentIndex == index) {
                 ImGui::SetItemDefaultFocus();
@@ -73928,7 +73966,7 @@ void ApplyFlowPathKeyedSettingsProfile(
             "Applied keyed settings " + profile->name + " to " +
             source->name + ".";
     }
-    ApplyAnimationScrub(runtimeState);
+    ApplyFeatureTimelineScrub(runtimeState);
     runtimeState->previewRenderStateSignatureValid = false;
     runtimeState->errorMessage.clear();
 }
@@ -75774,6 +75812,19 @@ void DrawWaterPanel(
             "Paths, boundaries, structure guides, and movement gizmos are "
             "hidden; switch this off to edit their geometry. Water effects "
             "and timing previews are unchanged.");
+    }
+    ImGui::SameLine();
+    ImGui::Checkbox(
+        "Always Follow Camera##WaterFeatureTimelines",
+        &runtimeState->animationPanel
+             .featureTimelinesAlwaysFollowCamera);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Always move the live camera along the loaded animation when "
+            "scrubbing Water or Timings feature keys. Off preserves an "
+            "orbited inspection view; feature playback still follows the "
+            "shared animation position. Global Animation Position and "
+            "camera-key editing always move the camera.");
     }
     ImGui::Separator();
     if (!ImGui::BeginTabBar("WaterFeatureTabs")) {
@@ -79548,10 +79599,9 @@ void DrawWaterRunTimingGraph(
     };
 
     const auto scrubTo = [&](float position) {
-        SetCurrentAnimationPositionFromAuthoredTrack(
+        ScrubFeatureTimelineToAuthoredPosition(
             runtimeState,
             position);
-        ApplyAnimationScrub(runtimeState);
     };
     const auto selectKey = [&](std::size_t index, float position) {
         timings.waterRunKeySelection = WaterRunKeySelectionState{
@@ -80775,6 +80825,20 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                 "features. Double-click a graph to add a key, drag curve "
                 "points to move them, double-click a point to edit or "
                 "delete it.");
+            ImGui::SameLine();
+            ImGui::Checkbox(
+                "Always Follow Camera##TimingFeatureTimelines",
+                &runtimeState->animationPanel
+                     .featureTimelinesAlwaysFollowCamera);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Always move the live camera along the loaded animation "
+                    "when scrubbing Water or visual-feature keys. Off "
+                    "preserves an orbited inspection view while every active "
+                    "keyed feature continues to evaluate at the shared "
+                    "animation position. Global Animation Position and "
+                    "camera-key editing always move the camera.");
+            }
             const auto timelineViewRange =
                 invisible_places::timing::SanitizeTimelineViewRange(
                     runtimeState->animationPanel.timelineViewRange);
@@ -82498,18 +82562,16 @@ void DrawTimingKeyLaneGroup(
                 ImGui::OpenPopup(
                     "Edit Local Effect Key Position");
             } else {
-                SetCurrentAnimationPositionFromAuthoredTrack(
+                ScrubFeatureTimelineToAuthoredPosition(
                     runtimeState,
                     nearestPosition);
-                ApplyAnimationScrub(runtimeState);
             }
         } else if (ImGui::IsMouseClicked(
                        ImGuiMouseButton_Left)) {
             handledMarkerInteraction = true;
-            SetCurrentAnimationPositionFromAuthoredTrack(
+            ScrubFeatureTimelineToAuthoredPosition(
                 runtimeState,
                 nearestPosition);
-            ApplyAnimationScrub(runtimeState);
             timings.colouriseLocalKeyDrag =
                 TimingColouriseLocalKeyDragState{
                     .effectId = effect->id,
@@ -82571,10 +82633,9 @@ void DrawTimingKeyLaneGroup(
                 CurrentAuthoredTrackPosition(*runtimeState) -
                 scrubPosition) >
             std::numeric_limits<float>::epsilon()) {
-            SetCurrentAnimationPositionFromAuthoredTrack(
+            ScrubFeatureTimelineToAuthoredPosition(
                 runtimeState,
                 scrubPosition);
-            ApplyAnimationScrub(runtimeState);
         }
     }
     if (draggedSeries != nullptr &&
@@ -82598,10 +82659,9 @@ void DrawTimingKeyLaneGroup(
             movedSourcePosition = drag.currentPosition;
             movedDestinationPosition = destination;
             drag.currentPosition = destination;
-            SetCurrentAnimationPositionFromAuthoredTrack(
+            ScrubFeatureTimelineToAuthoredPosition(
                 runtimeState,
                 destination);
-            ApplyAnimationScrub(runtimeState);
             runtimeState
                 ->previewRenderStateSignatureValid =
                 false;
@@ -83257,10 +83317,9 @@ void DrawTimingKeyLaneGroup(
                         *editorSeries,
                         editor->sourcePosition,
                         editor->draftPosition)) {
-                    SetCurrentAnimationPositionFromAuthoredTrack(
+                    ScrubFeatureTimelineToAuthoredPosition(
                         runtimeState,
                         editor->draftPosition);
-                    ApplyAnimationScrub(runtimeState);
                     runtimeState
                         ->previewRenderStateSignatureValid =
                         false;
@@ -83545,10 +83604,9 @@ void DrawTimingColouriseTrackButtons(
                       position);
     ImGui::BeginDisabled(!previous.has_value());
     if (ImGui::SmallButton("<")) {
-        SetCurrentAnimationPositionFromAuthoredTrack(
+        ScrubFeatureTimelineToAuthoredPosition(
             runtimeState,
             previous.value());
-        ApplyAnimationScrub(runtimeState);
     }
     ImGui::EndDisabled();
     DrawTimingControlTooltip(
@@ -83558,10 +83616,9 @@ void DrawTimingColouriseTrackButtons(
     ImGui::SameLine(0.0F, 2.0F);
     ImGui::BeginDisabled(!next.has_value());
     if (ImGui::SmallButton(">")) {
-        SetCurrentAnimationPositionFromAuthoredTrack(
+        ScrubFeatureTimelineToAuthoredPosition(
             runtimeState,
             next.value());
-        ApplyAnimationScrub(runtimeState);
     }
     ImGui::EndDisabled();
     DrawTimingControlTooltip(
@@ -83754,10 +83811,9 @@ bool DrawTimingColouriseEffectParameterTrackButtons(
             position);
     ImGui::BeginDisabled(!previous.has_value());
     if (ImGui::SmallButton("<")) {
-        SetCurrentAnimationPositionFromAuthoredTrack(
+        ScrubFeatureTimelineToAuthoredPosition(
             runtimeState,
             previous.value());
-        ApplyAnimationScrub(runtimeState);
     }
     ImGui::EndDisabled();
     DrawTimingControlTooltip(
@@ -83767,10 +83823,9 @@ bool DrawTimingColouriseEffectParameterTrackButtons(
     ImGui::SameLine(0.0F, 2.0F);
     ImGui::BeginDisabled(!next.has_value());
     if (ImGui::SmallButton(">")) {
-        SetCurrentAnimationPositionFromAuthoredTrack(
+        ScrubFeatureTimelineToAuthoredPosition(
             runtimeState,
             next.value());
-        ApplyAnimationScrub(runtimeState);
     }
     ImGui::EndDisabled();
     DrawTimingControlTooltip(
@@ -84702,10 +84757,9 @@ void DrawTimingColourisePaletteEditor(
                 if (DrawTimingPaletteComboEntry(
                         keyed,
                         selected)) {
-                    SetCurrentAnimationPositionFromAuthoredTrack(
+                    ScrubFeatureTimelineToAuthoredPosition(
                         runtimeState,
                         keyPosition);
-                    ApplyAnimationScrub(runtimeState);
                 }
             }
             ImGui::EndCombo();
@@ -87231,10 +87285,9 @@ void DrawTimingColouriseBoundsParameterTrackButtons(
     ImGui::SameLine(0.0F, 2.0F);
     ImGui::BeginDisabled(!previous.has_value());
     if (ImGui::SmallButton("<")) {
-        SetCurrentAnimationPositionFromAuthoredTrack(
+        ScrubFeatureTimelineToAuthoredPosition(
             runtimeState,
             previous.value());
-        ApplyAnimationScrub(runtimeState);
     }
     ImGui::EndDisabled();
     DrawTimingControlTooltip(
@@ -87244,10 +87297,9 @@ void DrawTimingColouriseBoundsParameterTrackButtons(
     ImGui::SameLine(0.0F, 2.0F);
     ImGui::BeginDisabled(!next.has_value());
     if (ImGui::SmallButton(">")) {
-        SetCurrentAnimationPositionFromAuthoredTrack(
+        ScrubFeatureTimelineToAuthoredPosition(
             runtimeState,
             next.value());
-        ApplyAnimationScrub(runtimeState);
     }
     ImGui::EndDisabled();
     DrawTimingControlTooltip(
@@ -89548,13 +89600,9 @@ void DrawWaterKeyMarkerStrip(
                         mutableTrack,
                         edit->sourcePosition,
                         edit->draftPosition)) {
-                    runtimeState->animationPanel.scrubAmount =
-                        runtimeState->animationPanel.currentPath.has_value()
-                            ? AuthoredTrackNormalizedToCameraNormalized(
-                                  runtimeState->animationPanel.currentPath.value(),
-                                  edit->draftPosition)
-                            : edit->draftPosition;
-                    ApplyAnimationScrub(runtimeState);
+                    ScrubFeatureTimelineToAuthoredPosition(
+                        runtimeState,
+                        edit->draftPosition);
                     InvalidateWaterSeepageParams(&water);
                     runtimeState->previewRenderStateSignatureValid =
                         false;
@@ -89951,13 +89999,9 @@ void DrawTimingColouriseGlobalMarkerLanes(
                                   edit->sourcePosition,
                                   edit->draftPosition);
                 if (moved) {
-                    runtimeState->animationPanel.scrubAmount =
-                        runtimeState->animationPanel.currentPath.has_value()
-                            ? AuthoredTrackNormalizedToCameraNormalized(
-                                  runtimeState->animationPanel.currentPath.value(),
-                                  edit->draftPosition)
-                            : edit->draftPosition;
-                    ApplyAnimationScrub(runtimeState);
+                    ScrubFeatureTimelineToAuthoredPosition(
+                        runtimeState,
+                        edit->draftPosition);
                     runtimeState
                         ->previewRenderStateSignatureValid =
                         false;
@@ -90853,7 +90897,7 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
                                 scrubPosition)
                       : 0U;
         if (removed > 0U) {
-            ApplyAnimationScrub(runtimeState);
+            ApplyFeatureTimelineScrub(runtimeState);
             InvalidateWaterSeepageParams(&water);
             runtimeState->previewRenderStateSignatureValid = false;
             runtimeState->statusMessage =
@@ -90982,7 +91026,7 @@ void DrawFocusedWaterRunCombo(
                         featureLabel + " now belongs to " +
                         run.name + ".";
                     runtimeState->errorMessage.clear();
-                    ApplyAnimationScrub(runtimeState);
+                    ApplyFeatureTimelineScrub(runtimeState);
                     InvalidateWaterSeepageParams(&water);
                     runtimeState
                         ->previewRenderStateSignatureValid =
