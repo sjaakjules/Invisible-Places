@@ -8,8 +8,10 @@
 #include <fstream>
 #include <iomanip>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string_view>
+#include <unordered_map>
 
 namespace invisible_places::app::workspace {
 namespace {
@@ -378,7 +380,293 @@ void TransformProject(
     }
 }
 
+bool OptionalJsonEqual(
+    const std::optional<nlohmann::json>& first,
+    const std::optional<nlohmann::json>& second) {
+    return first.has_value() == second.has_value() &&
+           (!first.has_value() || first.value() == second.value());
+}
+
+bool IsIdentityScalar(const nlohmann::json& value) {
+    return value.is_string() || value.is_number() || value.is_boolean();
+}
+
+std::string IdentityValue(const nlohmann::json& value) {
+    return value.is_string() ? value.get<std::string>() : value.dump();
+}
+
+std::optional<std::string> ObjectIdentity(const nlohmann::json& value) {
+    if (!value.is_object()) {
+        return std::nullopt;
+    }
+    const auto composite = [&](std::string_view first,
+                               std::string_view second)
+        -> std::optional<std::string> {
+        const auto firstIt = value.find(std::string{first});
+        const auto secondIt = value.find(std::string{second});
+        if (firstIt == value.end() || secondIt == value.end() ||
+            !IsIdentityScalar(*firstIt) || !IsIdentityScalar(*secondIt)) {
+            return std::nullopt;
+        }
+        return std::string{first} + "=" + IdentityValue(*firstIt) + ";" +
+               std::string{second} + "=" + IdentityValue(*secondIt);
+    };
+    // Composite identities precede individual fields so repeated ids in
+    // different scene groups, feature kinds, or parameter lanes stay distinct.
+    for (const auto& fields : std::array{
+             std::pair<std::string_view, std::string_view>{
+                 "take_id", "scene_group"},
+             std::pair<std::string_view, std::string_view>{
+                 "kind", "object_id"},
+             std::pair<std::string_view, std::string_view>{
+                 "parameter", "position"},
+             std::pair<std::string_view, std::string_view>{
+                 "setting_id", "position"},
+             std::pair<std::string_view, std::string_view>{
+                 "stop_id", "position"},
+             std::pair<std::string_view, std::string_view>{
+                 "field", "position"},
+         }) {
+        if (const auto identity = composite(fields.first, fields.second);
+            identity.has_value()) {
+            return identity;
+        }
+    }
+    for (const std::string_view field : {
+             "id", "file_path", "source_path", "name", "scene_group",
+             "take_id", "profile_name", "position"}) {
+        const auto it = value.find(std::string{field});
+        if (it == value.end() || !IsIdentityScalar(*it)) {
+            continue;
+        }
+        if (it->is_string() && it->get_ref<const std::string&>().empty()) {
+            continue;
+        }
+        return std::string{field} + "=" + IdentityValue(*it);
+    }
+    return std::nullopt;
+}
+
+struct IndexedJsonArray {
+    std::vector<std::string> order;
+    std::unordered_map<std::string, nlohmann::json> values;
+};
+
+std::optional<IndexedJsonArray> IndexJsonArray(
+    const nlohmann::json& value) {
+    if (!value.is_array()) {
+        return std::nullopt;
+    }
+    IndexedJsonArray indexed;
+    indexed.order.reserve(value.size());
+    indexed.values.reserve(value.size());
+    for (const auto& item : value) {
+        const auto identity = ObjectIdentity(item);
+        if (!identity.has_value() || indexed.values.contains(*identity)) {
+            return std::nullopt;
+        }
+        indexed.order.push_back(*identity);
+        indexed.values.emplace(*identity, item);
+    }
+    return indexed;
+}
+
+std::optional<nlohmann::json> MergeJsonValue(
+    const std::optional<nlohmann::json>& baseline,
+    const std::optional<nlohmann::json>& local,
+    const std::optional<nlohmann::json>& remote,
+    const std::string& path,
+    const std::unordered_map<std::string, JsonMergeSide>& resolutions,
+    std::vector<JsonMergeConflict>* conflicts) {
+    if (OptionalJsonEqual(local, remote)) {
+        return local;
+    }
+    if (OptionalJsonEqual(local, baseline)) {
+        return remote;
+    }
+    if (OptionalJsonEqual(remote, baseline)) {
+        return local;
+    }
+
+    const bool mergeObjects = local.has_value() && remote.has_value() &&
+                              local->is_object() && remote->is_object() &&
+                              (!baseline.has_value() || baseline->is_object());
+    if (mergeObjects) {
+        std::set<std::string> keys;
+        if (baseline.has_value()) {
+            for (const auto& [key, ignored] : baseline->items()) {
+                (void)ignored;
+                keys.insert(key);
+            }
+        }
+        for (const auto& [key, ignored] : local->items()) {
+            (void)ignored;
+            keys.insert(key);
+        }
+        for (const auto& [key, ignored] : remote->items()) {
+            (void)ignored;
+            keys.insert(key);
+        }
+        nlohmann::json merged = nlohmann::json::object();
+        for (const auto& key : keys) {
+            const auto read = [&](const std::optional<nlohmann::json>& object)
+                -> std::optional<nlohmann::json> {
+                if (!object.has_value()) {
+                    return std::nullopt;
+                }
+                const auto it = object->find(key);
+                return it == object->end()
+                           ? std::nullopt
+                           : std::optional<nlohmann::json>{*it};
+            };
+            if (auto child = MergeJsonValue(
+                    read(baseline),
+                    read(local),
+                    read(remote),
+                    path + "." + key,
+                    resolutions,
+                    conflicts);
+                child.has_value()) {
+                merged[key] = std::move(child.value());
+            }
+        }
+        return merged;
+    }
+
+    const bool mergeArrays = local.has_value() && remote.has_value() &&
+                             local->is_array() && remote->is_array() &&
+                             (!baseline.has_value() || baseline->is_array());
+    if (mergeArrays) {
+        const auto indexedBase = baseline.has_value()
+                                     ? IndexJsonArray(*baseline)
+                                     : std::optional<IndexedJsonArray>{
+                                           IndexedJsonArray{}};
+        const auto indexedLocal = IndexJsonArray(*local);
+        const auto indexedRemote = IndexJsonArray(*remote);
+        if (indexedBase.has_value() && indexedLocal.has_value() &&
+            indexedRemote.has_value()) {
+            std::vector<std::string> order = indexedBase->order;
+            const auto appendNew = [&](const IndexedJsonArray& indexed) {
+                for (const auto& identity : indexed.order) {
+                    if (std::find(order.begin(), order.end(), identity) ==
+                        order.end()) {
+                        order.push_back(identity);
+                    }
+                }
+            };
+            appendNew(*indexedLocal);
+            appendNew(*indexedRemote);
+
+            nlohmann::json merged = nlohmann::json::array();
+            for (const auto& identity : order) {
+                const auto read = [&](const IndexedJsonArray& indexed)
+                    -> std::optional<nlohmann::json> {
+                    const auto it = indexed.values.find(identity);
+                    return it == indexed.values.end()
+                               ? std::nullopt
+                               : std::optional<nlohmann::json>{it->second};
+                };
+                if (auto child = MergeJsonValue(
+                        read(*indexedBase),
+                        read(*indexedLocal),
+                        read(*indexedRemote),
+                        path + "[" + identity + "]",
+                        resolutions,
+                        conflicts);
+                    child.has_value()) {
+                    merged.push_back(std::move(child.value()));
+                }
+            }
+            return merged;
+        }
+    }
+
+    if (const auto choice = resolutions.find(path);
+        choice != resolutions.end()) {
+        return choice->second == JsonMergeSide::Local ? local : remote;
+    }
+    if (conflicts != nullptr) {
+        conflicts->push_back({
+            .path = path,
+            .baseValue = baseline,
+            .localValue = local,
+            .remoteValue = remote,
+        });
+    }
+    // This provisional value is never committed while conflicts remain.
+    return local;
+}
+
 }  // namespace
+
+JsonMergeResult MergeJsonDocuments(
+    const nlohmann::json& baseline,
+    const nlohmann::json& local,
+    const nlohmann::json& remote,
+    const std::unordered_map<std::string, JsonMergeSide>& resolutions) {
+    JsonMergeResult result;
+    auto merged = MergeJsonValue(
+        std::optional<nlohmann::json>{baseline},
+        std::optional<nlohmann::json>{local},
+        std::optional<nlohmann::json>{remote},
+        "$",
+        resolutions,
+        &result.conflicts);
+    result.merged = merged.has_value() ? std::move(merged.value())
+                                       : nlohmann::json{};
+    return result;
+}
+
+std::optional<nlohmann::json> ReadJsonDocument(
+    const std::filesystem::path& path,
+    std::string* errorMessage) {
+    std::ifstream input{path};
+    if (!input.is_open()) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Could not open " + path.string() + ".";
+        }
+        return std::nullopt;
+    }
+    try {
+        auto document = nlohmann::json::parse(input);
+        if (errorMessage != nullptr) {
+            errorMessage->clear();
+        }
+        return document;
+    } catch (const std::exception& error) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Could not parse " + path.string() + ": " +
+                            error.what();
+        }
+        return std::nullopt;
+    }
+}
+
+bool WriteJsonDocument(
+    const nlohmann::json& document,
+    const std::filesystem::path& path,
+    std::string* errorMessage) {
+    std::ofstream output{path, std::ios::trunc};
+    if (!output.is_open()) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Could not write " + path.string() + ".";
+        }
+        return false;
+    }
+    output << document.dump(2) << '\n';
+    output.flush();
+    if (!output.good()) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Could not finish writing " + path.string() +
+                            ".";
+        }
+        return false;
+    }
+    if (errorMessage != nullptr) {
+        errorMessage->clear();
+    }
+    return true;
+}
 
 std::filesystem::path LocalSavedDirectory(
     const std::filesystem::path& dataRoot) {

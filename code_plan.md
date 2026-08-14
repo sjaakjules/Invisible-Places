@@ -259,11 +259,13 @@ Flow, and histogram caches are redirected to local `Saved/`, alongside renders,
 render history, validation, and build products. Water cache source selection is
 explicitly 2 mm first and complete 1 mm second, so a new machine with only the
 shared subset cold-builds the same 10 mm representation locally instead of
-requiring unsynchronized 2 mm files. Project/animation saves keep a
-content fingerprint from load, verify it before and after staging, refuse stale
-OneDrive overwrites, and copy mid-save conflicts to local recovery. The Project
-panel writes both local markers for the next launch, avoiding a destructive
-live context switch.
+requiring unsynchronized 2 mm files. Project saves keep their loaded JSON as a
+three-way merge ancestor: identifiable packages, profiles, Timing Takes,
+features, settings and key positions merge recursively, with UI choices only
+for fields changed on both computers. Animation camera files retain their
+strict content fingerprint. Every target is verified again after staging and
+mid-save conflicts are copied to local recovery. The Project panel writes both
+local markers for the next launch, avoiding a destructive live context switch.
 
 ## 5. Point Attribute Strategy
 ### 5.1 CPU-side canonical layout

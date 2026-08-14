@@ -4,10 +4,14 @@
 #include "serialization/ProjectDocument.hpp"
 #include "serialization/RenderSetupDocument.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace invisible_places::app::workspace {
 
@@ -27,6 +31,41 @@ struct FileRevision {
 
     friend bool operator==(const FileRevision&, const FileRevision&) = default;
 };
+
+// Project files are shared through OneDrive, where two machines can save
+// independent authoring changes before either sees the other's write.  These
+// types describe a semantic three-way merge: object fields and identifiable
+// array entries merge independently, while only overlapping scalar edits are
+// returned for an explicit user choice.
+enum class JsonMergeSide {
+    Local,
+    Remote,
+};
+
+struct JsonMergeConflict {
+    std::string path;
+    std::optional<nlohmann::json> baseValue;
+    std::optional<nlohmann::json> localValue;
+    std::optional<nlohmann::json> remoteValue;
+};
+
+struct JsonMergeResult {
+    nlohmann::json merged;
+    std::vector<JsonMergeConflict> conflicts;
+};
+
+[[nodiscard]] JsonMergeResult MergeJsonDocuments(
+    const nlohmann::json& baseline,
+    const nlohmann::json& local,
+    const nlohmann::json& remote,
+    const std::unordered_map<std::string, JsonMergeSide>& resolutions = {});
+[[nodiscard]] std::optional<nlohmann::json> ReadJsonDocument(
+    const std::filesystem::path& path,
+    std::string* errorMessage = nullptr);
+bool WriteJsonDocument(
+    const nlohmann::json& document,
+    const std::filesystem::path& path,
+    std::string* errorMessage = nullptr);
 
 struct Roots {
     std::filesystem::path dataRoot;

@@ -104,11 +104,15 @@ builds remain local. Water-surface preprocessing prefers a complete 2 mm
 ROCK/SAND/VEG bundle when available, explicitly falls back to the synchronized
 complete 1 mm bundle when 2 mm is absent, and reduces either source into the
 same 10 mm cache. Consequently, a new computer can cold-build its own cache in
-its local `Saved/` root from OneDrive's 1 mm/5 mm subset. Existing project and
-animation files use optimistic content revisions: a save refuses to overwrite bytes that changed since load,
-and preserves a local recovery copy when a peer update arrives during staging.
-Parallel offline work on the same file uses separate names because OneDrive is
-not a distributed locking service.
+its local `Saved/` root from OneDrive's 1 mm/5 mm subset. The configured cloud
+authored workspace is authoritative rather than the repository's fallback
+`Saved/` copy. Existing project files use their loaded JSON as a semantic
+three-way merge ancestor, automatically combining independent edits to named
+libraries, Timing Takes, features, settings, keys and fields and asking for a
+choice only where both computers changed the same value. Animation camera files
+retain strict optimistic content revisions. All saves preserve a local recovery
+copy when a peer update arrives during staging. Parallel offline work still
+requires care because OneDrive is not a distributed locking service.
 
 ## Scene Layer Model
 The scene supports multiple layers.

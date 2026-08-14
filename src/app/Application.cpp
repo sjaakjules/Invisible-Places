@@ -370,6 +370,11 @@ struct PersistenceState {
     std::filesystem::path trackedProjectFilePath;
     std::optional<invisible_places::app::workspace::FileRevision>
         trackedProjectRevision;
+    // Raw portable JSON corresponding to the in-memory project state when it
+    // was loaded or last saved.  It is the local side's merge ancestor; after
+    // a cloud merge it intentionally remains the serialized local snapshot so
+    // remote-only edits are not mistaken for deletions on a later save.
+    std::optional<nlohmann::json> trackedProjectMergeBaseJson;
     std::string pointStylePresetPath;
     std::string animationDirectoryPath;
     std::vector<QueuedLayerLoad> queuedLoads;
@@ -447,6 +452,18 @@ struct SaveChangesItem {
     std::string displayName;
 };
 
+struct ProjectMergeDialogState {
+    std::filesystem::path targetPath;
+    std::optional<invisible_places::app::workspace::FileRevision>
+        remoteRevision;
+    std::vector<invisible_places::app::workspace::JsonMergeConflict>
+        conflicts;
+    std::unordered_map<
+        std::string,
+        invisible_places::app::workspace::JsonMergeSide>
+        resolutions;
+};
+
 struct SaveChangesDialogState {
     bool requested = false;
     bool closeAfterSave = false;
@@ -462,6 +479,7 @@ struct SaveChangesDialogState {
     std::string animationPairSaveAsPartnerBaseName;
     bool animationPairSaveAsPartnerNameEdited = false;
     std::vector<SaveChangesItem> items;
+    std::optional<ProjectMergeDialogState> projectMerge;
     std::string errorMessage;
 };
 
@@ -67583,13 +67601,77 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
             return false;
         }
     }
+    bool projectNeedsMerge = false;
+    std::optional<nlohmann::json> projectMergeBaseline;
+    std::optional<nlohmann::json> projectMergeRemote;
+    std::optional<invisible_places::app::workspace::FileRevision>
+        projectRemoteRevision;
     if (projectItem != nullptr) {
-        std::optional<invisible_places::app::workspace::FileRevision>
-            tracked;
         if (PathsLexicallyEqual(
                 runtimeState->persistence.trackedProjectFilePath,
                 projectItem->targetPath)) {
-            tracked = runtimeState->persistence.trackedProjectRevision;
+            const auto tracked =
+                runtimeState->persistence.trackedProjectRevision;
+            if (!tracked.has_value()) {
+                dialog.errorMessage =
+                    "The loaded project revision is unknown. Reload the OneDrive project before saving.";
+                return false;
+            }
+            const auto current = invisible_places::app::workspace::
+                ReadFileRevision(projectItem->targetPath, &saveError);
+            if (!current.has_value()) {
+                dialog.errorMessage = saveError;
+                return false;
+            }
+            projectRemoteRevision = current;
+            if (!current->exists) {
+                dialog.errorMessage =
+                    projectItem->targetPath.filename().string() +
+                    " was removed from OneDrive after it was loaded. Your edits remain open; restore/reload it or save under a new project name.";
+                return false;
+            }
+            if (!runtimeState->persistence
+                     .trackedProjectMergeBaseJson.has_value()) {
+                dialog.errorMessage =
+                    "The common project baseline is unavailable. Reload the OneDrive project before attempting a merge.";
+                return false;
+            }
+            projectMergeBaseline = runtimeState->persistence
+                                       .trackedProjectMergeBaseJson;
+            projectMergeRemote = invisible_places::app::workspace::
+                ReadJsonDocument(projectItem->targetPath, &saveError);
+            if (!projectMergeRemote.has_value()) {
+                dialog.errorMessage = saveError;
+                return false;
+            }
+            const auto verified = invisible_places::app::workspace::
+                ReadFileRevision(projectItem->targetPath, &saveError);
+            if (!verified.has_value() ||
+                verified.value() != current.value()) {
+                dialog.errorMessage =
+                    "OneDrive changed the project while it was being read. Nothing was overwritten; wait for sync to finish and press Save again.";
+                return false;
+            }
+            // Merge every tracked project save, even when the disk revision is
+            // unchanged.  After an earlier merge the in-memory runtime can
+            // intentionally remain based on its local ancestor, while the
+            // canonical file also contains remote-only fields.
+            projectNeedsMerge = true;
+            if (dialog.projectMerge.has_value() &&
+                (!PathsLexicallyEqual(
+                     dialog.projectMerge->targetPath,
+                     projectItem->targetPath) ||
+                 dialog.projectMerge->remoteRevision != current)) {
+                dialog.projectMerge.reset();
+            }
+            if (!rememberExpected(
+                    projectItem->targetPath,
+                    current,
+                    "project " +
+                        projectItem->targetPath.filename().string())) {
+                dialog.errorMessage = saveError;
+                return false;
+            }
         } else {
             const auto current = invisible_places::app::workspace::
                 ReadFileRevision(projectItem->targetPath, &saveError);
@@ -67603,14 +67685,15 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
                     " before overwriting it; it may have changed on the other computer.";
                 return false;
             }
-            tracked = current;
-        }
-        if (!rememberExpected(
-                projectItem->targetPath,
-                tracked,
-                "project " + projectItem->targetPath.filename().string())) {
-            dialog.errorMessage = saveError;
-            return false;
+            projectRemoteRevision = current;
+            if (!rememberExpected(
+                    projectItem->targetPath,
+                    current,
+                    "project " +
+                        projectItem->targetPath.filename().string())) {
+                dialog.errorMessage = saveError;
+                return false;
+            }
         }
     }
     for (const auto& expected : expectedRevisions) {
@@ -67623,8 +67706,9 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
                 revisionError.empty()
                     ? expected.targetPath.filename().string() +
                           " changed in OneDrive after it was loaded. "
-                          "Your edits are still open; reload the changed file "
-                          "or use Save As instead of overwriting it."
+                          "Your edits are still open; press Save again after "
+                          "OneDrive finishes syncing. Projects merge on retry; "
+                          "animation camera files require reload or Save As."
                     : revisionError;
             return false;
         }
@@ -67874,6 +67958,8 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
         }
     }
 
+    std::optional<nlohmann::json> localProjectMergeBaseAfterSave;
+    bool mergedOneDriveProject = false;
     const auto transactionSuffix =
         ".save-changes." +
         std::to_string(
@@ -67929,6 +68015,72 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
                     ? "Could not stage the selected project."
                     : std::move(saveError);
             return false;
+        }
+        localProjectMergeBaseAfterSave =
+            invisible_places::app::workspace::ReadJsonDocument(
+                replacements.back().stagedPath,
+                &saveError);
+        if (!localProjectMergeBaseAfterSave.has_value()) {
+            CleanupStagedDocumentFiles(std::span{replacements});
+            dialog.errorMessage = saveError.empty()
+                                      ? "Could not verify the staged project."
+                                      : std::move(saveError);
+            return false;
+        }
+        if (projectNeedsMerge) {
+            const bool remoteDiffersFromLocalAncestor =
+                projectMergeRemote.value() !=
+                projectMergeBaseline.value();
+            const auto& resolutions = dialog.projectMerge.has_value()
+                ? dialog.projectMerge->resolutions
+                : std::unordered_map<
+                      std::string,
+                      invisible_places::app::workspace::JsonMergeSide>{};
+            auto merge = invisible_places::app::workspace::
+                MergeJsonDocuments(
+                    projectMergeBaseline.value(),
+                    localProjectMergeBaseAfterSave.value(),
+                    projectMergeRemote.value(),
+                    resolutions);
+            if (!merge.conflicts.empty()) {
+                ProjectMergeDialogState mergeState;
+                mergeState.targetPath = projectItem->targetPath;
+                mergeState.remoteRevision = projectRemoteRevision;
+                mergeState.conflicts = std::move(merge.conflicts);
+                if (dialog.projectMerge.has_value()) {
+                    mergeState.resolutions =
+                        std::move(dialog.projectMerge->resolutions);
+                }
+                dialog.projectMerge = std::move(mergeState);
+                CleanupStagedDocumentFiles(std::span{replacements});
+                dialog.errorMessage =
+                    "OneDrive contains overlapping project edits. Independent changes were merged automatically; choose this computer or OneDrive for each highlighted field, then save again.";
+                return false;
+            }
+            if (!invisible_places::app::workspace::WriteJsonDocument(
+                    merge.merged,
+                    replacements.back().stagedPath,
+                    &saveError)) {
+                CleanupStagedDocumentFiles(std::span{replacements});
+                dialog.errorMessage = saveError;
+                return false;
+            }
+            auto mergedProject = invisible_places::serialization::
+                LoadProjectDocument(
+                    replacements.back().stagedPath,
+                    &saveError);
+            if (!mergedProject.has_value()) {
+                CleanupStagedDocumentFiles(std::span{replacements});
+                dialog.errorMessage = saveError.empty()
+                                          ? "The merged project did not validate."
+                                          : std::move(saveError);
+                return false;
+            }
+            invisible_places::app::workspace::ResolveProjectDocument(
+                &mergedProject.value(),
+                WorkspaceRoots(*runtimeState));
+            project = std::move(mergedProject.value());
+            mergedOneDriveProject = remoteDiffersFromLocalAncestor;
         }
     }
     // Recheck after serialization, immediately before the atomic local
@@ -68112,6 +68264,9 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
         runtimeState->persistence.trackedProjectRevision =
             invisible_places::app::workspace::ReadFileRevision(
                 projectItem->targetPath);
+        runtimeState->persistence.trackedProjectMergeBaseJson =
+            localProjectMergeBaseAfterSave;
+        dialog.projectMerge.reset();
         panel.projectVelocityLinksBaselineDirty = false;
         panel.projectVelocityLinksDirty = std::any_of(
             panel.availableFileLoopEditPairIds.begin(),
@@ -68119,6 +68274,36 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
             [](const std::string& dependencyId) {
                 return !dependencyId.empty();
             });
+    }
+    if (project.has_value() && mergedOneDriveProject &&
+        !runtimeState->activeRenderSetupOverride.has_value()) {
+        // Adopt the shared libraries most likely to be edited concurrently so
+        // remote packages and Timing Take changes are visible immediately.
+        // Other merged project state remains protected by the stored local
+        // merge ancestor and becomes visible on the next ordinary reload.
+        auto& water = runtimeState->water;
+        water.timingRuns = project->waterTimingRuns;
+        water.nextTimingRunSequence = project->waterTimingRunSequence;
+        water.featureTimingRunsByScenario =
+            project->waterFeatureTimingRuns;
+        water.keyedSettingsProfiles =
+            project->waterKeyedSettingsProfiles;
+        water.nextFeatureTimingRunSequence =
+            project->waterFeatureTimingRunSequence;
+        water.timingTakes = project->timingTakes;
+        water.selectedTimingTakeId =
+            invisible_places::timing::NormalizeTimingTakeId(
+                project->selectedTimingTakeId);
+        water.timingTakeSceneStates = project->timingTakeStates;
+        water.savedTimingColourisePalettes =
+            project->timingColourisePalettes;
+        water.timingScalarBoundsStores =
+            project->timingScalarBoundsStores;
+        water.nextTimingTakeSequence = project->timingTakeSequence;
+        water.nextTimingColourisePaletteSequence =
+            project->timingColourisePaletteSequence;
+        runtimeState->timingsPanel = TimingsPanelState{};
+        RecompileWaterTimingTracksForAnimation(runtimeState);
     }
     if (project.has_value() &&
         runtimeState->activeRenderSetupOverride.has_value()) {
@@ -68166,12 +68351,29 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
              ? " The new animation is independent of the source's velocity pair and linked camera controls."
              : "") +
         linkedPairStatus +
+        (mergedOneDriveProject
+             ? " Independent OneDrive project edits were merged; shared packages and Timing Takes are now refreshed."
+             : "") +
         (savedAsCopy
              ? " The source animation and any _Edited state were left unchanged."
              : "");
     runtimeState->errorMessage.clear();
     dialog.errorMessage.clear();
     return true;
+}
+
+std::string ProjectMergeValuePreview(
+    const std::optional<nlohmann::json>& value) {
+    if (!value.has_value()) {
+        return "<deleted>";
+    }
+    std::string preview = value->dump();
+    constexpr std::size_t kMaximumPreviewCharacters = 180U;
+    if (preview.size() > kMaximumPreviewCharacters) {
+        preview.resize(kMaximumPreviewCharacters - 3U);
+        preview += "...";
+    }
+    return preview;
 }
 
 void DrawSaveChangesDialog(PreviewRuntimeState* runtimeState) {
@@ -68360,6 +68562,79 @@ void DrawSaveChangesDialog(PreviewRuntimeState* runtimeState) {
             "The loaded Render Setup is a temporary preview. The underlying "
             "project will be saved without writing the preview into it.");
     }
+    const bool projectSelected = std::any_of(
+        dialog.items.begin(),
+        dialog.items.end(),
+        [](const SaveChangesItem& item) {
+            return item.kind == SaveChangesItemKind::Project &&
+                   item.selected;
+        });
+    if (projectSelected && dialog.projectMerge.has_value() &&
+        !dialog.projectMerge->conflicts.empty()) {
+        auto& merge = dialog.projectMerge.value();
+        ImGui::Spacing();
+        ImGui::SeparatorText("OneDrive Project Conflicts");
+        ImGui::TextWrapped(
+            "Non-overlapping edits have already been combined. Choose only "
+            "the value to keep for each field changed on both computers.");
+        if (ImGui::Button("Use This Computer for All")) {
+            for (const auto& conflict : merge.conflicts) {
+                merge.resolutions[conflict.path] =
+                    invisible_places::app::workspace::JsonMergeSide::Local;
+            }
+            dialog.errorMessage.clear();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Use OneDrive for All")) {
+            for (const auto& conflict : merge.conflicts) {
+                merge.resolutions[conflict.path] =
+                    invisible_places::app::workspace::JsonMergeSide::Remote;
+            }
+            dialog.errorMessage.clear();
+        }
+        ImGui::BeginChild(
+            "##project_merge_conflicts",
+            ImVec2{0.0F, 300.0F},
+            true);
+        for (std::size_t index = 0U;
+             index < merge.conflicts.size();
+             ++index) {
+            const auto& conflict = merge.conflicts[index];
+            ImGui::PushID(static_cast<int>(index));
+            if (index > 0U) {
+                ImGui::Separator();
+            }
+            ImGui::TextWrapped("%s", conflict.path.c_str());
+            const auto selected = merge.resolutions.find(conflict.path);
+            const bool localSelected =
+                selected != merge.resolutions.end() &&
+                selected->second == invisible_places::app::workspace::
+                                        JsonMergeSide::Local;
+            const bool remoteSelected =
+                selected != merge.resolutions.end() &&
+                selected->second == invisible_places::app::workspace::
+                                        JsonMergeSide::Remote;
+            if (ImGui::RadioButton("This computer", localSelected)) {
+                merge.resolutions[conflict.path] =
+                    invisible_places::app::workspace::JsonMergeSide::Local;
+                dialog.errorMessage.clear();
+            }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("OneDrive", remoteSelected)) {
+                merge.resolutions[conflict.path] =
+                    invisible_places::app::workspace::JsonMergeSide::Remote;
+                dialog.errorMessage.clear();
+            }
+            const auto localPreview =
+                ProjectMergeValuePreview(conflict.localValue);
+            const auto remotePreview =
+                ProjectMergeValuePreview(conflict.remoteValue);
+            ImGui::TextWrapped("This computer: %s", localPreview.c_str());
+            ImGui::TextWrapped("OneDrive: %s", remotePreview.c_str());
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+    }
     if (dialog.waitingForRenderCancellation) {
         ImGui::Spacing();
         ImGui::TextWrapped(
@@ -68391,10 +68666,22 @@ void DrawSaveChangesDialog(PreviewRuntimeState* runtimeState) {
         (TrimText(dialog.animationSaveAsName).empty() ||
          (dialog.animationPairSaveAs &&
           TrimText(dialog.animationPairSaveAsPartnerName).empty()));
-    ImGui::BeginDisabled(!anySelected || saveAsNameMissing);
+    const bool unresolvedProjectMerge =
+        projectSelected && dialog.projectMerge.has_value() &&
+        std::any_of(
+            dialog.projectMerge->conflicts.begin(),
+            dialog.projectMerge->conflicts.end(),
+            [&](const auto& conflict) {
+                return !dialog.projectMerge->resolutions.contains(
+                    conflict.path);
+            });
+    ImGui::BeginDisabled(
+        !anySelected || saveAsNameMissing || unresolvedProjectMerge);
     const char* saveButtonLabel =
         dialog.closeAfterSave
             ? "Save All and Close"
+        : dialog.projectMerge.has_value() && projectSelected
+            ? "Merge and Save"
         : dialog.animationPairSaveAs
             ? "Save Linked Pair As"
             : "Save Selected";
@@ -68495,7 +68782,7 @@ void DrawProjectSection(
         }
     }
     ImGui::TextWrapped(
-        "Saves verify the exact project/animation bytes loaded by this session. If OneDrive delivers a newer copy, overwrite is refused and your local edit remains open. OneDrive cannot provide a true distributed lock while either machine is offline, so do not intentionally edit the same project or animation file simultaneously; use separate Save As names for parallel work.");
+        "This configured OneDrive folder is authoritative; the repository's local Saved copy is not consulted while it is active. Project saves compare against the loaded baseline and merge independent fields, packages, profiles, Timing Takes, features, settings, and keyed positions. Only overlapping edits require a per-field choice. Animation camera files retain a strict whole-file guard. OneDrive cannot coordinate two offline machines, so allow sync to finish before opening and after saving on each computer.");
     ImGui::Spacing();
 
     InputTextString("Project File", &runtimeState->persistence.projectFilePath);
@@ -68525,6 +68812,9 @@ void DrawProjectSection(
                 loadedPath.lexically_normal();
             runtimeState->persistence.trackedProjectRevision =
                 invisible_places::app::workspace::ReadFileRevision(
+                    loadedPath);
+            runtimeState->persistence.trackedProjectMergeBaseJson =
+                invisible_places::app::workspace::ReadJsonDocument(
                     loadedPath);
         }
     }
@@ -83109,8 +83399,8 @@ void DrawWaterClipPackagePopup(
                         std::move(package));
                 }
                 runtimeState->statusMessage =
-                    "Saved package " + std::string{trimmed} +
-                    ". Right-click any " +
+                    "Added package " + std::string{trimmed} +
+                    " to the current project. Use Save Project (or Save Changes when closing) to write it to OneDrive. Right-click any " +
                     std::string{
                         invisible_places::water::WaterKeyedFeatureKindLabel(
                             save.feature.kind)} +
@@ -110179,6 +110469,9 @@ int Application::Run(ApplicationRunOptions options) const {
                     startupProjectPath.lexically_normal();
                 runtimeState.persistence.trackedProjectRevision =
                     invisible_places::app::workspace::ReadFileRevision(
+                        startupProjectPath);
+                runtimeState.persistence.trackedProjectMergeBaseJson =
+                    invisible_places::app::workspace::ReadJsonDocument(
                         startupProjectPath);
                 runtimeState.statusMessage =
                     "Loaded default project from " + startupProjectPath.string() + ".";

@@ -628,13 +628,16 @@ complete 2 mm ROCK/SAND/VEG bundle shall be used for a water-surface cache when
 available; if it is absent, the complete 1 mm bundle shall be the explicit
 fallback. A new computer with only the shared 1 mm/5 mm source subset shall
 build and persist its 10 mm water-surface cache below its machine-local Saved
-root. Before an
-existing project or animation is replaced, Save shall verify that its bytes
-still match the version loaded by this session, recheck after staging, and
-refuse a stale overwrite while retaining in-memory edits. A mid-save conflict
-shall also preserve local recovery JSON. Because OneDrive cannot enforce an
-offline distributed lock, deliberate parallel edits to the same file shall use
-different Save As names.
+root. The configured authored workspace shall be authoritative while active.
+Before replacing a project, Save shall compare its loaded ancestor, current
+runtime serialization and current OneDrive JSON. Identifiable array entries and
+object fields shall merge recursively; independent package/profile/Timing Take,
+feature, setting and key edits shall combine automatically, while overlapping
+field edits shall require an explicit local-or-OneDrive choice. Animation files
+shall retain strict whole-file revision validation. Every target shall be
+rechecked after staging, and a mid-save conflict shall preserve local recovery
+JSON. Because OneDrive cannot enforce an offline distributed lock, both
+machines shall allow cloud sync to settle before opening and after saving.
 
 ### 6.3 Reliability
 #### NFR-REL-1

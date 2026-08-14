@@ -135,6 +135,8 @@ Current settings-clip ownership supersedes the earlier collision-clamped descrip
 
 New Water setting tracks now default to **Monotone Spline**, while saved and legacy-migrated tracks retain their authored default. Timeline selection follows desktop conventions and is scoped to the focused settings graph or Clips lane: plain-click replaces the node selection, Cmd/Ctrl-click toggles nodes, Shift-click selects a same-setting range, Cmd/Ctrl+A selects the visible active nodes, Delete/Backspace removes them, and Escape clears. Clicking a clip selects all of its active owned keys and exposes the same bulk interpolation control; modifier-clicking graph nodes can then remove or re-add individual members. These shortcuts never target Global Animation Position, and packages preserve the resulting per-key interpolation modes.
 
+**Save Package** adds the captured keys to the project-owned `water_keyed_settings_profiles` library; **Save Project** (or Save Changes on close) serializes that library into the authoritative OneDrive project JSON. Concurrent project saves three-way merge named packages, their setting tracks, and individual key positions/fields, so an unrelated Timing Take edit on one computer and package/profile edit on the other combine automatically.
+
 Water key authoring keeps one atomic edit of session history. **Ctrl+Z** on Windows/Linux or **Cmd+Z** on macOS restores the state before the latest key, keyed-setting, or settings-clip edit; pressing the same shortcut again reapplies it. A complete slider, key, spline-handle, or clip drag is one edit. When a text or numeric input is focused, the shortcut remains the input field's native text undo instead.
 
 ## Serialization Contract

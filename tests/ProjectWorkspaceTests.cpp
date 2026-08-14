@@ -2,6 +2,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <nlohmann/json.hpp>
+
 #include <filesystem>
 #include <fstream>
 
@@ -13,6 +15,7 @@ using invisible_places::app::workspace::MakeProjectDocumentPortable;
 using invisible_places::app::workspace::MakeRenderPathPortable;
 using invisible_places::app::workspace::MakeRoots;
 using invisible_places::app::workspace::MakeWorkspacePathPortable;
+using invisible_places::app::workspace::MergeJsonDocuments;
 using invisible_places::app::workspace::ResolveAnimationPath;
 using invisible_places::app::workspace::ResolveDataPath;
 using invisible_places::app::workspace::ResolveProjectDocument;
@@ -243,6 +246,149 @@ TEST_CASE("conflicting staged documents are copied to local recovery",
     std::getline(input, contents);
     CHECK(contents == "local edit");
     std::filesystem::remove_all(root, cleanupError);
+}
+
+TEST_CASE("project merge combines independent timing and package edits",
+          "[workspace][conflict][merge]") {
+    const nlohmann::json baseline = {
+        {"water_keyed_settings_profiles",
+         nlohmann::json::array({
+             {{"name", "Rain package"},
+              {"settings",
+               nlohmann::json::array({
+                   {{"id", "level"},
+                    {"keys",
+                     nlohmann::json::array({
+                         {{"position", 0.25}, {"value", 0.2}},
+                     })}},
+               })}},
+         })},
+        {"timing_take_states",
+         nlohmann::json::array({
+             {{"take_id", "wet"},
+              {"scene_group", "Scene3"},
+              {"water_feature_timing_runs",
+               nlohmann::json::array({
+                   {{"id", 1},
+                    {"features",
+                     nlohmann::json::array({
+                         {{"kind", "rain"},
+                          {"object_id", 0},
+                          {"settings",
+                           nlohmann::json::array({
+                               {{"id", "level"},
+                                {"keys",
+                                 nlohmann::json::array({
+                                     {{"position", 0.5}, {"value", 0.4}},
+                                 })}},
+                           })}},
+                     })}},
+               })}},
+         })},
+    };
+    auto local = baseline;
+    local["timing_take_states"][0]["water_feature_timing_runs"][0]
+         ["features"][0]["settings"][0]["keys"][0]["value"] = 0.8;
+    auto remote = baseline;
+    remote["water_keyed_settings_profiles"][0]["settings"][0]["keys"]
+          [0]["value"] = 0.6;
+
+    const auto result = MergeJsonDocuments(baseline, local, remote);
+    CHECK(result.conflicts.empty());
+    CHECK(result.merged["timing_take_states"][0]
+                       ["water_feature_timing_runs"][0]["features"][0]
+                       ["settings"][0]["keys"][0]["value"] == 0.8);
+    CHECK(result.merged["water_keyed_settings_profiles"][0]["settings"]
+                       [0]["keys"][0]["value"] == 0.6);
+}
+
+TEST_CASE("project merge reports and resolves one overlapping scalar edit",
+          "[workspace][conflict][merge]") {
+    const nlohmann::json baseline = {
+        {"profiles",
+         nlohmann::json::array({
+             {{"name", "Pool"}, {"settings", {{"strength", 1.0}}}},
+         })},
+    };
+    auto local = baseline;
+    local["profiles"][0]["settings"]["strength"] = 2.0;
+    auto remote = baseline;
+    remote["profiles"][0]["settings"]["strength"] = 3.0;
+
+    const auto unresolved = MergeJsonDocuments(baseline, local, remote);
+    REQUIRE(unresolved.conflicts.size() == 1U);
+    CHECK(unresolved.conflicts.front().path ==
+          "$.profiles[name=Pool].settings.strength");
+
+    const std::unordered_map<
+        std::string,
+        invisible_places::app::workspace::JsonMergeSide>
+        remoteChoice{{
+            unresolved.conflicts.front().path,
+            invisible_places::app::workspace::JsonMergeSide::Remote,
+        }};
+    const auto resolved =
+        MergeJsonDocuments(baseline, local, remote, remoteChoice);
+    CHECK(resolved.conflicts.empty());
+    CHECK(resolved.merged["profiles"][0]["settings"]["strength"] == 3.0);
+}
+
+TEST_CASE("project merge distinguishes deletion from independent edits",
+          "[workspace][conflict][merge]") {
+    const nlohmann::json baseline = {
+        {"packages",
+         nlohmann::json::array({
+             {{"name", "A"}, {"value", 1}},
+             {{"name", "B"}, {"value", 2}},
+         })},
+    };
+    auto local = baseline;
+    local["packages"].erase(local["packages"].begin());
+    auto remote = baseline;
+    remote["packages"][1]["value"] = 4;
+    const auto independent = MergeJsonDocuments(baseline, local, remote);
+    CHECK(independent.conflicts.empty());
+    REQUIRE(independent.merged["packages"].size() == 1U);
+    CHECK(independent.merged["packages"][0]["name"] == "B");
+    CHECK(independent.merged["packages"][0]["value"] == 4);
+
+    remote = baseline;
+    remote["packages"][0]["value"] = 3;
+    const auto overlap = MergeJsonDocuments(baseline, local, remote);
+    REQUIRE(overlap.conflicts.size() == 1U);
+    CHECK(overlap.conflicts.front().path == "$.packages[name=A]");
+    CHECK_FALSE(overlap.conflicts.front().localValue.has_value());
+    REQUIRE(overlap.conflicts.front().remoteValue.has_value());
+}
+
+TEST_CASE("project merge keeps remote-only fields across later local saves",
+          "[workspace][conflict][merge]") {
+    const nlohmann::json baseline = {
+        {"camera", {{"position", 0}, {"fov", 55}}},
+        {"packages", nlohmann::json::array()},
+    };
+    auto firstLocal = baseline;
+    firstLocal["camera"]["position"] = 1;
+    auto firstRemote = baseline;
+    firstRemote["packages"].push_back({{"name", "Other machine"},
+                                        {"settings", nlohmann::json::array()}});
+    const auto first =
+        MergeJsonDocuments(baseline, firstLocal, firstRemote);
+    REQUIRE(first.conflicts.empty());
+
+    // The live runtime may still be based on firstLocal after the merged file
+    // is committed.  Use that local snapshot as the next ancestor and the
+    // merged canonical document as the remote side, even when its file
+    // revision has not changed since the prior save.
+    auto secondLocal = firstLocal;
+    secondLocal["camera"]["fov"] = 60;
+    const auto second =
+        MergeJsonDocuments(firstLocal, secondLocal, first.merged);
+    CHECK(second.conflicts.empty());
+    CHECK(second.merged["camera"]["position"] == 1);
+    CHECK(second.merged["camera"]["fov"] == 60);
+    REQUIRE(second.merged["packages"].size() == 1U);
+    CHECK(second.merged["packages"][0]["name"] == "Other machine");
 }
 
 }  // namespace
