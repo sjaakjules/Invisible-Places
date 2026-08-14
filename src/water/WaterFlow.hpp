@@ -514,7 +514,7 @@ struct WaterSettingKey {
     float position = 0.0F;
     float value = 0.0F;
     WaterScenarioInterpolation interpolation =
-        WaterScenarioInterpolation::Smooth;
+        WaterScenarioInterpolation::TrackDefault;
     // Explicit settings-clip ownership. Zero means the key is loose on the
     // feature timeline. Keeping ownership on the key (rather than inferring
     // it from a time window) lets clips overlap without stealing each
@@ -551,11 +551,13 @@ struct WaterKeyedSettingTrack {
     std::string label;
     std::string profileGroup;
     std::string profileName;
-    // Curve style applied to every key set to TrackDefault. New tracks flow
-    // through keys on a centripetal Catmull-Rom spline; pre-existing tracks
-    // migrate to Smooth so saved motion is unchanged until restyled.
+    // Curve style applied to every key set to TrackDefault. New tracks use a
+    // monotone spline: speed carries through monotonic runs without scalar
+    // overshoot and comes to rest at reversals. Pre-existing tracks retain
+    // their serialized style, and legacy tracks migrate to Smooth so their
+    // saved motion remains unchanged until deliberately restyled.
     WaterScenarioInterpolation defaultInterpolation =
-        WaterScenarioInterpolation::CentripetalCatmullRom;
+        WaterScenarioInterpolation::SmoothVelocity;
     std::vector<WaterSettingKey> keys;
 };
 

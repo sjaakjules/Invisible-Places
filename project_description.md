@@ -570,7 +570,9 @@ for manual time/value shaping. Selecting a key shows only the incoming and
 outgoing controls used by its adjacent manual segments; dragging them reshapes
 the curve without moving the key. Time-only key markers sit on a separate lower
 rail beneath the value graph, so a minimum or zero value cannot overlap the
-retime target. Project schema 75 and water-sources schema 29 store the handles.
+retime target. New setting tracks default their inherited keys to Monotone
+Spline; existing serialized and legacy-migrated tracks preserve their previous
+style. Project schema 75 and water-sources schema 29 store the handles.
 
 The Timings tab adds a Clips lane above the run graphs, with the same lane
 embedded on each water sub-tab timeline. Every feature row shows its keyed
@@ -589,7 +591,13 @@ another feature of the same kind by dragging between rows. Marquee drags and
 Cmd-clicks build multi-selections that offset and scale together. Explicit key
 ownership lets clips overlap and pass across one another; the normalized
 domain and exact same-track key-time collisions remain guarded. Escape cancels
-a live drag losslessly.
+a live drag losslessly. Clicking a clip also selects all of its active owned
+key nodes. Plain key clicks replace that node selection, Cmd/Ctrl-click toggles
+individual nodes, Shift-click selects a same-setting range, and the focused
+settings graph or Clips lane owns Cmd/Ctrl+A, Delete/Backspace, and Escape.
+The Global Animation Position bar never receives those editing commands. One
+bulk interpolation control writes the same outgoing mode to every selected key
+and is preserved when the clip is captured or applied as a package.
 Right-click saves a clip as a named package that records its natural length,
 and the same menu applies any saved package to a same-kind feature at the
 clicked position, after which each applied clip slides, shrinks, or stretches

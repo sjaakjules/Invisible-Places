@@ -787,20 +787,33 @@ struct WaterRunKeyEditState {
     float draftPosition = 0.0F;
     float draftValue = 0.0F;
     invisible_places::water::WaterScenarioInterpolation draftInterpolation =
-        invisible_places::water::WaterScenarioInterpolation::Smooth;
+        invisible_places::water::WaterScenarioInterpolation::TrackDefault;
     bool requestKeyboardFocus = false;
     std::string errorMessage;
 };
 
-// The last grabbed or edited run-graph key. It backs the read-only-selection
-// interpolation row drawn beneath every run graph (Timings tab and the
-// embedded Water-tab timelines share the editor).
+// Stable, session-only identity for one settings key. Setting tracks already
+// enforce unique positions within 1e-4, so (feature, setting, position) is
+// sufficient without adding persistence-only ids to the project schema.
+struct WaterRunKeyHandle {
+    invisible_places::water::WaterKeyedFeatureId feature{};
+    std::string settingId;
+    float position = 0.0F;
+};
+
+// Selected run-graph keys. The first three identity fields retain the
+// primary key used by the exact editor and spline handles, while keys holds
+// the complete standard multi-selection. A clip selection fills this same
+// set, so bulk interpolation and keyboard deletion use one code path.
 struct WaterRunKeySelectionState {
     std::string scenarioId;
     std::uint32_t runId = 0U;
     invisible_places::water::WaterKeyedFeatureId feature{};
     std::string settingId;
     float position = 0.0F;
+    std::vector<WaterRunKeyHandle> keys;
+    std::optional<WaterRunKeyHandle> rangeAnchor;
+    bool clipDriven = false;
 };
 
 // One-level, toggle-style history for water timing edits. Snapshots retain
@@ -79890,8 +79903,9 @@ const char* TimingInterpolationLabel(
 bool DrawTimingInterpolationCombo(
     const char* label,
     invisible_places::water::WaterScenarioInterpolation* interpolation,
-    bool includeSplineModes,
-    bool includeTrackDefault);
+    bool includeSplineModes = false,
+    bool includeTrackDefault = false,
+    bool mixed = false);
 
 // ---- Water run timeline graph ----
 // The Timings-tab editor for a selected run's keyed setting tracks, visually
@@ -80028,6 +80042,308 @@ void BuildWaterFeatureGraphSeries(
     }
 }
 
+constexpr float kWaterRunKeyIdentityTolerance = 1.0e-4F;
+
+bool WaterRunKeyHandleMatches(
+    const WaterRunKeyHandle& left,
+    const WaterRunKeyHandle& right) {
+    return left.feature == right.feature &&
+           left.settingId == right.settingId &&
+           std::abs(left.position - right.position) <=
+               kWaterRunKeyIdentityTolerance;
+}
+
+bool WaterRunKeySelectionMatches(
+    const WaterRunKeySelectionState& selection,
+    const std::string& scenarioId,
+    std::uint32_t runId) {
+    return selection.scenarioId == scenarioId &&
+           selection.runId == runId;
+}
+
+struct ResolvedWaterRunKey {
+    invisible_places::water::WaterFeatureTimeline* timeline = nullptr;
+    invisible_places::water::WaterKeyedSettingTrack* track = nullptr;
+    invisible_places::water::WaterSettingKey* key = nullptr;
+};
+
+ResolvedWaterRunKey ResolveWaterRunKey(
+    invisible_places::water::WaterFeatureTimingRun* run,
+    const WaterRunKeyHandle& handle) {
+    if (run == nullptr) {
+        return {};
+    }
+    auto* timeline = invisible_places::water::FindWaterFeatureTimeline(
+        run,
+        handle.feature);
+    if (timeline == nullptr) {
+        return {};
+    }
+    for (auto& track : timeline->settings) {
+        if (track.settingId != handle.settingId) {
+            continue;
+        }
+        for (auto& key : track.keys) {
+            if (std::abs(key.position - handle.position) <=
+                kWaterRunKeyIdentityTolerance) {
+                return {
+                    .timeline = timeline,
+                    .track = &track,
+                    .key = &key,
+                };
+            }
+        }
+        break;
+    }
+    return {};
+}
+
+void SetWaterRunKeySelectionPrimary(
+    WaterRunKeySelectionState* selection,
+    const WaterRunKeyHandle& handle) {
+    if (selection == nullptr) {
+        return;
+    }
+    selection->feature = handle.feature;
+    selection->settingId = handle.settingId;
+    selection->position = handle.position;
+}
+
+void PruneWaterRunKeySelection(
+    TimingsPanelState* timings,
+    const std::string& scenarioId,
+    invisible_places::water::WaterFeatureTimingRun* run) {
+    if (timings == nullptr || run == nullptr ||
+        !timings->waterRunKeySelection.has_value() ||
+        !WaterRunKeySelectionMatches(
+            timings->waterRunKeySelection.value(),
+            scenarioId,
+            run->id)) {
+        return;
+    }
+    auto& selection = timings->waterRunKeySelection.value();
+    std::erase_if(
+        selection.keys,
+        [&](const WaterRunKeyHandle& handle) {
+            return ResolveWaterRunKey(run, handle).key == nullptr;
+        });
+    if (selection.keys.empty()) {
+        timings->waterRunKeySelection.reset();
+        return;
+    }
+    const WaterRunKeyHandle primary{
+        .feature = selection.feature,
+        .settingId = selection.settingId,
+        .position = selection.position,
+    };
+    if (std::none_of(
+            selection.keys.begin(),
+            selection.keys.end(),
+            [&](const WaterRunKeyHandle& handle) {
+                return WaterRunKeyHandleMatches(handle, primary);
+            })) {
+        SetWaterRunKeySelectionPrimary(&selection, selection.keys.front());
+    }
+    if (selection.rangeAnchor.has_value() &&
+        ResolveWaterRunKey(run, selection.rangeAnchor.value()).key == nullptr) {
+        selection.rangeAnchor.reset();
+    }
+}
+
+void ReplaceWaterRunKeySelection(
+    TimingsPanelState* timings,
+    const std::string& scenarioId,
+    std::uint32_t runId,
+    std::vector<WaterRunKeyHandle> handles,
+    bool clipDriven,
+    std::optional<WaterRunKeyHandle> primary = std::nullopt) {
+    if (timings == nullptr) {
+        return;
+    }
+    std::vector<WaterRunKeyHandle> unique;
+    unique.reserve(handles.size());
+    for (auto& handle : handles) {
+        if (std::none_of(
+                unique.begin(),
+                unique.end(),
+                [&](const WaterRunKeyHandle& existing) {
+                    return WaterRunKeyHandleMatches(existing, handle);
+                })) {
+            unique.push_back(std::move(handle));
+        }
+    }
+    if (unique.empty()) {
+        timings->waterRunKeySelection.reset();
+        return;
+    }
+    WaterRunKeySelectionState selection{
+        .scenarioId = scenarioId,
+        .runId = runId,
+        .keys = std::move(unique),
+        .clipDriven = clipDriven,
+    };
+    const auto chosen = primary.value_or(selection.keys.front());
+    SetWaterRunKeySelectionPrimary(&selection, chosen);
+    selection.rangeAnchor = chosen;
+    timings->waterRunKeySelection = std::move(selection);
+}
+
+std::vector<WaterRunKeyHandle> WaterRunKeysOwnedByClips(
+    invisible_places::water::WaterFeatureTimingRun* run,
+    std::span<const WaterClipHandle> clips) {
+    std::vector<WaterRunKeyHandle> handles;
+    if (run == nullptr) {
+        return handles;
+    }
+    for (const auto& clip : clips) {
+        auto* timeline = invisible_places::water::FindWaterFeatureTimeline(
+            run,
+            clip.feature);
+        if (timeline == nullptr) {
+            continue;
+        }
+        for (const auto& track : timeline->settings) {
+            if (!track.active) {
+                continue;
+            }
+            for (const auto& key : track.keys) {
+                if (key.clipId == clip.clipId) {
+                    handles.push_back({
+                        .feature = timeline->feature,
+                        .settingId = track.settingId,
+                        .position = key.position,
+                    });
+                }
+            }
+        }
+    }
+    return handles;
+}
+
+void SelectWaterRunKeysOwnedByClips(
+    PreviewRuntimeState* runtimeState,
+    const std::string& scenarioId,
+    invisible_places::water::WaterFeatureTimingRun* run,
+    std::span<const WaterClipHandle> clips) {
+    if (runtimeState == nullptr || run == nullptr) {
+        return;
+    }
+    ReplaceWaterRunKeySelection(
+        &runtimeState->timingsPanel,
+        scenarioId,
+        run->id,
+        WaterRunKeysOwnedByClips(run, clips),
+        /*clipDriven=*/true);
+}
+
+bool DeleteSelectedWaterRunKeys(
+    PreviewRuntimeState* runtimeState,
+    const std::string& scenarioId,
+    invisible_places::water::WaterFeatureTimingRun* run) {
+    if (runtimeState == nullptr || run == nullptr) {
+        return false;
+    }
+    auto& timings = runtimeState->timingsPanel;
+    PruneWaterRunKeySelection(&timings, scenarioId, run);
+    if (!timings.waterRunKeySelection.has_value() ||
+        !WaterRunKeySelectionMatches(
+            timings.waterRunKeySelection.value(),
+            scenarioId,
+            run->id)) {
+        return false;
+    }
+    const auto selected = timings.waterRunKeySelection->keys;
+    if (selected.empty()) {
+        return false;
+    }
+    BeginWaterKeyEditTransaction(runtimeState, scenarioId);
+    std::vector<std::pair<
+        invisible_places::water::WaterFeatureTimeline*,
+        std::uint32_t>> affectedClips;
+    std::size_t removed = 0U;
+    for (const auto& handle : selected) {
+        const auto resolved = ResolveWaterRunKey(run, handle);
+        if (resolved.track == nullptr || resolved.key == nullptr) {
+            continue;
+        }
+        const auto clipId = resolved.key->clipId;
+        removed += invisible_places::water::RemoveWaterSettingKeysAtPosition(
+            resolved.track,
+            handle.position);
+        if (clipId != 0U &&
+            std::find(
+                affectedClips.begin(),
+                affectedClips.end(),
+                std::make_pair(resolved.timeline, clipId)) ==
+                affectedClips.end()) {
+            affectedClips.emplace_back(resolved.timeline, clipId);
+        }
+    }
+    for (const auto& [timeline, clipId] : affectedClips) {
+        (void)invisible_places::water::SynchronizeWaterFeatureClipBounds(
+            timeline,
+            clipId);
+    }
+    if (removed == 0U) {
+        CancelWaterKeyEditTransaction(runtimeState);
+        return false;
+    }
+    MarkWaterKeyEditTransactionChanged(runtimeState);
+    FinishWaterKeyEditTransaction(runtimeState);
+    timings.waterRunKeySelection.reset();
+    timings.waterRunSplineHandleDrag.reset();
+    timings.waterRunKeyEdit.reset();
+    // A clip remains valid authoring metadata after some or all of its keys
+    // are deleted, but it is no longer an exact proxy for the key selection.
+    timings.waterClipSelection.reset();
+    ApplyFeatureTimelineScrub(runtimeState);
+    runtimeState->previewRenderStateSignatureValid = false;
+    runtimeState->statusMessage =
+        "Deleted " + std::to_string(removed) +
+        (removed == 1U ? " selected timing key." :
+                         " selected timing keys.");
+    return true;
+}
+
+bool ApplyInterpolationToSelectedWaterRunKeys(
+    PreviewRuntimeState* runtimeState,
+    const std::string& scenarioId,
+    invisible_places::water::WaterFeatureTimingRun* run,
+    invisible_places::water::WaterScenarioInterpolation interpolation) {
+    if (runtimeState == nullptr || run == nullptr) {
+        return false;
+    }
+    auto& timings = runtimeState->timingsPanel;
+    PruneWaterRunKeySelection(&timings, scenarioId, run);
+    if (!timings.waterRunKeySelection.has_value() ||
+        !WaterRunKeySelectionMatches(
+            timings.waterRunKeySelection.value(),
+            scenarioId,
+            run->id)) {
+        return false;
+    }
+    BeginWaterKeyEditTransaction(runtimeState, scenarioId);
+    bool changed = false;
+    for (const auto& handle : timings.waterRunKeySelection->keys) {
+        if (auto resolved = ResolveWaterRunKey(run, handle);
+            resolved.key != nullptr &&
+            resolved.key->interpolation != interpolation) {
+            resolved.key->interpolation = interpolation;
+            changed = true;
+        }
+    }
+    if (!changed) {
+        CancelWaterKeyEditTransaction(runtimeState);
+        return false;
+    }
+    MarkWaterKeyEditTransactionChanged(runtimeState);
+    FinishWaterKeyEditTransaction(runtimeState);
+    timings.waterRunSplineHandleDrag.reset();
+    ApplyFeatureTimelineScrub(runtimeState);
+    runtimeState->previewRenderStateSignatureValid = false;
+    return true;
+}
+
 void DrawWaterRunTimingGraph(
     const char* id,
     PreviewRuntimeState* runtimeState,
@@ -80055,6 +80371,7 @@ void DrawWaterRunTimingGraph(
         "##WaterRunGraphSurface",
         size,
         ImGuiButtonFlags_MouseButtonLeft);
+    const bool itemFocused = ImGui::IsItemFocused();
     const auto minimum = ImGui::GetItemRectMin();
     const auto maximum = ImGui::GetItemRectMax();
     const float width = std::max(1.0F, maximum.x - minimum.x);
@@ -80182,7 +80499,7 @@ void DrawWaterRunTimingGraph(
                     return key.interpolation;
                 }
             }
-            return WaterScenarioInterpolation::Smooth;
+            return WaterScenarioInterpolation::TrackDefault;
         };
     const auto keyClipIdAt =
         [&](std::size_t index, float position) -> std::uint32_t {
@@ -80220,6 +80537,34 @@ void DrawWaterRunTimingGraph(
         return std::nullopt;
     };
 
+    PruneWaterRunKeySelection(&timings, scenarioId, run);
+    const auto selectionMatchesRun = [&] {
+        return timings.waterRunKeySelection.has_value() &&
+               WaterRunKeySelectionMatches(
+                   timings.waterRunKeySelection.value(),
+                   scenarioId,
+                   run->id);
+    };
+    const auto keyHandle = [&](std::size_t index, float position) {
+        return WaterRunKeyHandle{
+            .feature = series[index].feature,
+            .settingId = series[index].settingId,
+            .position = position,
+        };
+    };
+    const auto isKeySelected = [&](std::size_t index, float position) {
+        if (!selectionMatchesRun()) {
+            return false;
+        }
+        const auto handle = keyHandle(index, position);
+        return std::any_of(
+            timings.waterRunKeySelection->keys.begin(),
+            timings.waterRunKeySelection->keys.end(),
+            [&](const WaterRunKeyHandle& selected) {
+                return WaterRunKeyHandleMatches(selected, handle);
+            });
+    };
+
     struct DisplayedSplineHandle {
         std::size_t seriesIndex = 0U;
         invisible_places::water::WaterSettingSplineHandleSide side =
@@ -80227,7 +80572,8 @@ void DrawWaterRunTimingGraph(
         invisible_places::water::WaterSettingSplineHandlePoint point{};
     };
     std::vector<DisplayedSplineHandle> displayedSplineHandles;
-    if (timings.waterRunKeySelection.has_value()) {
+    if (selectionMatchesRun() &&
+        timings.waterRunKeySelection->keys.size() == 1U) {
         const auto selectedSeries =
             findMatchingSeries(timings.waterRunKeySelection.value());
         if (selectedSeries.has_value() &&
@@ -80373,21 +80719,105 @@ void DrawWaterRunTimingGraph(
             runtimeState,
             position);
     };
-    const auto selectKey = [&](std::size_t index, float position) {
-        timings.waterRunKeySelection = WaterRunKeySelectionState{
-            .scenarioId = scenarioId,
-            .runId = run->id,
-            .feature = series[index].feature,
-            .settingId = series[index].settingId,
-            .position = position,
-        };
+    const auto selectKey = [&](std::size_t index,
+                               float position,
+                               bool useKeyboardModifiers) {
+        const auto clicked = keyHandle(index, position);
+        const auto& io = ImGui::GetIO();
+        const bool command =
+            useKeyboardModifiers && (io.KeyCtrl || io.KeySuper);
+        const bool range = useKeyboardModifiers && io.KeyShift;
+        if (range && selectionMatchesRun() &&
+            timings.waterRunKeySelection->rangeAnchor.has_value()) {
+            const auto anchor =
+                timings.waterRunKeySelection->rangeAnchor.value();
+            if (anchor.feature == clicked.feature &&
+                anchor.settingId == clicked.settingId) {
+                std::vector<WaterRunKeyHandle> handles =
+                    command ? timings.waterRunKeySelection->keys
+                            : std::vector<WaterRunKeyHandle>{};
+                const float low = std::min(anchor.position, position);
+                const float high = std::max(anchor.position, position);
+                for (const auto& key : sortedKeys[index]) {
+                    if (key.position + kKeyTolerance < low ||
+                        key.position - kKeyTolerance > high) {
+                        continue;
+                    }
+                    const auto candidate = keyHandle(index, key.position);
+                    if (std::none_of(
+                            handles.begin(),
+                            handles.end(),
+                            [&](const WaterRunKeyHandle& selected) {
+                                return WaterRunKeyHandleMatches(
+                                    selected,
+                                    candidate);
+                            })) {
+                        handles.push_back(candidate);
+                    }
+                }
+                ReplaceWaterRunKeySelection(
+                    &timings,
+                    scenarioId,
+                    run->id,
+                    std::move(handles),
+                    /*clipDriven=*/false,
+                    clicked);
+                if (timings.waterRunKeySelection.has_value()) {
+                    timings.waterRunKeySelection->rangeAnchor = anchor;
+                }
+                timings.waterClipSelection.reset();
+                return;
+            }
+        }
+        if (command) {
+            if (!selectionMatchesRun()) {
+                ReplaceWaterRunKeySelection(
+                    &timings,
+                    scenarioId,
+                    run->id,
+                    {clicked},
+                    /*clipDriven=*/false,
+                    clicked);
+                return;
+            }
+            auto& selection = timings.waterRunKeySelection.value();
+            const auto found = std::find_if(
+                selection.keys.begin(),
+                selection.keys.end(),
+                [&](const WaterRunKeyHandle& selected) {
+                    return WaterRunKeyHandleMatches(selected, clicked);
+                });
+            if (found != selection.keys.end()) {
+                selection.keys.erase(found);
+                if (selection.keys.empty()) {
+                    timings.waterRunKeySelection.reset();
+                    return;
+                }
+                SetWaterRunKeySelectionPrimary(
+                    &selection,
+                    selection.keys.front());
+            } else {
+                selection.keys.push_back(clicked);
+                SetWaterRunKeySelectionPrimary(&selection, clicked);
+                selection.rangeAnchor = clicked;
+            }
+            return;
+        }
+        ReplaceWaterRunKeySelection(
+            &timings,
+            scenarioId,
+            run->id,
+            {clicked},
+            /*clipDriven=*/false,
+            clicked);
+        timings.waterClipSelection.reset();
     };
     const auto armDrag = [&](std::size_t index,
                              float position,
                              float keyValue,
                              bool value) {
         BeginWaterKeyEditTransaction(runtimeState, scenarioId);
-        selectKey(index, position);
+        selectKey(index, position, /*useKeyboardModifiers=*/false);
         timings.waterRunSplineHandleDrag.reset();
         timings.waterRunKeyDrag = WaterRunKeyDragState{
             .scenarioId = scenarioId,
@@ -80407,7 +80837,10 @@ void DrawWaterRunTimingGraph(
     const auto armSplineHandleDrag =
         [&](const DisplayedSplineHandle& handle) {
         BeginWaterKeyEditTransaction(runtimeState, scenarioId);
-        selectKey(handle.seriesIndex, handle.point.anchorPosition);
+        selectKey(
+            handle.seriesIndex,
+            handle.point.anchorPosition,
+            /*useKeyboardModifiers=*/false);
         timings.waterRunKeyDrag.reset();
         timings.waterRunSplineHandleDrag = WaterRunSplineHandleDragState{
             .scenarioId = scenarioId,
@@ -80434,7 +80867,7 @@ void DrawWaterRunTimingGraph(
                 break;
             }
         }
-        selectKey(index, position);
+        selectKey(index, position, /*useKeyboardModifiers=*/false);
         timings.waterRunKeyDrag.reset();
         timings.waterRunSplineHandleDrag.reset();
         timings.waterRunKeyEdit = WaterRunKeyEditState{
@@ -80521,6 +80954,46 @@ void DrawWaterRunTimingGraph(
         scrubTo(position);
     };
 
+    // Keyboard commands belong to the focused settings graph only. The
+    // Global Animation Position bar is a different ImGui item, so clicking
+    // it naturally removes this focus and Cmd/Ctrl+A or Delete cannot leak
+    // into camera scrubbing.
+    if (itemFocused && !ImGui::GetIO().WantTextInput &&
+        !timings.waterRunKeyEdit.has_value() &&
+        !timings.waterRunKeyDrag.has_value() &&
+        !timings.waterRunSplineHandleDrag.has_value()) {
+        const bool command =
+            ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeySuper;
+        if (command && ImGui::IsKeyPressed(ImGuiKey_A, false)) {
+            std::vector<WaterRunKeyHandle> handles;
+            for (std::size_t index = 0U; index < series.size(); ++index) {
+                if (series[index].track == nullptr ||
+                    !series[index].track->active) {
+                    continue;
+                }
+                for (const auto& key : sortedKeys[index]) {
+                    handles.push_back(keyHandle(index, key.position));
+                }
+            }
+            ReplaceWaterRunKeySelection(
+                &timings,
+                scenarioId,
+                run->id,
+                std::move(handles),
+                /*clipDriven=*/false);
+            timings.waterClipSelection.reset();
+        } else if (
+            ImGui::IsKeyPressed(ImGuiKey_Delete, false) ||
+            ImGui::IsKeyPressed(ImGuiKey_Backspace, false)) {
+            if (DeleteSelectedWaterRunKeys(runtimeState, scenarioId, run)) {
+                rebuildSortedKeys();
+            }
+        } else if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+            timings.waterRunKeySelection.reset();
+            timings.waterClipSelection.reset();
+        }
+    }
+
     const bool scrubOnKey =
         [&](float position) {
             return std::abs(
@@ -80547,7 +81020,7 @@ void DrawWaterRunTimingGraph(
     } else if (hoveredDotSeries.has_value()) {
         const auto index = hoveredDotSeries.value();
         ImGui::SetTooltip(
-            "%s = %.3g at %.2f s (position %.4f)\n%s\nDrag to move the key in time and value; double-click to edit or delete it.",
+            "%s = %.3g at %.2f s (position %.4f)\n%s\nDrag to move; Cmd/Ctrl-click toggles selection; Shift-click selects a range; double-click edits.",
             seriesKeyLabel(index, hoveredDotPosition).c_str(),
             hoveredDotValue,
             hoveredDotPosition * durationSeconds,
@@ -80559,7 +81032,15 @@ void DrawWaterRunTimingGraph(
         } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             handledInteraction = true;
             scrubTo(hoveredDotPosition);
-            armDrag(index, hoveredDotPosition, hoveredDotValue, true);
+            const auto& io = ImGui::GetIO();
+            if (io.KeyCtrl || io.KeySuper || io.KeyShift) {
+                selectKey(
+                    index,
+                    hoveredDotPosition,
+                    /*useKeyboardModifiers=*/true);
+            } else {
+                armDrag(index, hoveredDotPosition, hoveredDotValue, true);
+            }
         }
     } else if (markerHovered) {
         const auto index = nearestMarkerSeries.value();
@@ -80573,8 +81054,8 @@ void DrawWaterRunTimingGraph(
         }
         ImGui::SetTooltip(
             scrubOnKey
-                ? "%s = %.3g at %.2f s\n%s\nDrag this axis marker to retime it; double-click to edit or delete it."
-                : "%s = %.3g at %.2f s\n%s\nClick to select; drag to retime; double-click to jump the animation here.",
+                ? "%s = %.3g at %.2f s\n%s\nDrag to retime; Cmd/Ctrl-click toggles selection; Shift-click selects a range; double-click edits."
+                : "%s = %.3g at %.2f s\n%s\nClick to select; Cmd/Ctrl-click adds or removes; Shift-click selects a range; double-click jumps here.",
             seriesKeyLabel(index, nearestMarkerPosition).c_str(),
             markerValue,
             nearestMarkerPosition * durationSeconds,
@@ -80589,7 +81070,15 @@ void DrawWaterRunTimingGraph(
         } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             handledInteraction = true;
             scrubTo(nearestMarkerPosition);
-            armDrag(index, nearestMarkerPosition, markerValue, false);
+            const auto& io = ImGui::GetIO();
+            if (io.KeyCtrl || io.KeySuper || io.KeyShift) {
+                selectKey(
+                    index,
+                    nearestMarkerPosition,
+                    /*useKeyboardModifiers=*/true);
+            } else {
+                armDrag(index, nearestMarkerPosition, markerValue, false);
+            }
         }
     } else if (
         inGraphArea &&
@@ -80647,6 +81136,13 @@ void DrawWaterRunTimingGraph(
             std::numeric_limits<float>::epsilon()) {
             scrubTo(scrubPosition);
         }
+    }
+    if (!handledInteraction && itemHovered &&
+        ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+        !ImGui::GetIO().KeyCtrl && !ImGui::GetIO().KeySuper &&
+        !ImGui::GetIO().KeyShift) {
+        timings.waterRunKeySelection.reset();
+        timings.waterClipSelection.reset();
     }
     if (draggedSplineHandleSeries.has_value() &&
         ImGui::IsItemActive() &&
@@ -80714,6 +81210,26 @@ void DrawWaterRunTimingGraph(
                             timings.waterRunKeySelection->position -
                             drag.currentPosition) <= kKeyTolerance) {
                         timings.waterRunKeySelection->position = destination;
+                    }
+                    if (selectionMatchesRun()) {
+                        const auto moved = keyHandle(
+                            draggedSeries.value(),
+                            drag.currentPosition);
+                        for (auto& selected :
+                             timings.waterRunKeySelection->keys) {
+                            if (WaterRunKeyHandleMatches(selected, moved)) {
+                                selected.position = destination;
+                            }
+                        }
+                        if (timings.waterRunKeySelection->rangeAnchor
+                                .has_value() &&
+                            WaterRunKeyHandleMatches(
+                                timings.waterRunKeySelection->rangeAnchor
+                                    .value(),
+                                moved)) {
+                            timings.waterRunKeySelection->rangeAnchor
+                                ->position = destination;
+                        }
                     }
                     drag.currentPosition = destination;
                     scrubTo(destination);
@@ -80870,8 +81386,10 @@ void DrawWaterRunTimingGraph(
                 hoveredDotSeries == index &&
                 std::abs(key.position - hoveredDotPosition) <=
                     kKeyTolerance;
+            const bool selected = isKeySelected(index, key.position);
             if (key.clipId != 0U) {
-                const float radius = isHovered ? 4.5F : 3.6F;
+                const float radius =
+                    isHovered || selected ? 4.5F : 3.6F;
                 drawList->AddRectFilled(
                     ImVec2{point.x - radius, point.y - radius},
                     ImVec2{point.x + radius, point.y + radius},
@@ -80882,21 +81400,25 @@ void DrawWaterRunTimingGraph(
                            point.y - radius - 0.75F},
                     ImVec2{point.x + radius + 0.75F,
                            point.y + radius + 0.75F},
-                    IM_COL32(255, 255, 255, 205),
+                    selected
+                        ? ImGui::GetColorU32(ImGuiCol_SliderGrabActive)
+                        : IM_COL32(255, 255, 255, 205),
                     1.0F,
                     0,
-                    1.25F);
+                    selected ? 2.25F : 1.25F);
             } else {
                 drawList->AddCircleFilled(
                     point,
-                    isHovered ? 4.5F : 3.5F,
+                    isHovered || selected ? 4.5F : 3.5F,
                     lane.colour);
                 drawList->AddCircle(
                     point,
-                    isHovered ? 5.25F : 4.25F,
-                    ImGui::GetColorU32(ImGuiCol_Border),
+                    isHovered || selected ? 5.5F : 4.25F,
+                    selected
+                        ? ImGui::GetColorU32(ImGuiCol_SliderGrabActive)
+                        : ImGui::GetColorU32(ImGuiCol_Border),
                     0,
-                    1.0F);
+                    selected ? 2.25F : 1.0F);
             }
         }
     }
@@ -80951,8 +81473,10 @@ void DrawWaterRunTimingGraph(
                 markerHovered && nearestMarkerSeries == index &&
                 std::abs(key.position - nearestMarkerPosition) <=
                     kKeyTolerance;
+            const bool selected = isKeySelected(index, key.position);
             if (key.clipId != 0U) {
-                const float radius = isHoveredMarker ? 4.75F : 3.75F;
+                const float radius =
+                    isHoveredMarker || selected ? 4.75F : 3.75F;
                 drawList->AddQuadFilled(
                     ImVec2{x, axisY - radius},
                     ImVec2{x + radius, axisY},
@@ -80964,13 +81488,23 @@ void DrawWaterRunTimingGraph(
                     ImVec2{x + radius + 0.75F, axisY},
                     ImVec2{x, axisY + radius + 0.75F},
                     ImVec2{x - radius - 0.75F, axisY},
-                    IM_COL32(255, 255, 255, 190),
-                    1.0F);
-            } else if (isHoveredMarker) {
+                    selected
+                        ? ImGui::GetColorU32(ImGuiCol_SliderGrabActive)
+                        : IM_COL32(255, 255, 255, 190),
+                    selected ? 2.0F : 1.0F);
+            } else if (isHoveredMarker || selected) {
                 drawList->AddCircleFilled(
                     ImVec2{x, axisY},
-                    4.25F,
+                    selected ? 4.75F : 4.25F,
                     series[index].colour);
+                if (selected) {
+                    drawList->AddCircle(
+                        ImVec2{x, axisY},
+                        5.5F,
+                        ImGui::GetColorU32(ImGuiCol_SliderGrabActive),
+                        0,
+                        2.0F);
+                }
             } else {
                 drawList->AddLine(
                     ImVec2{x, axisY - 4.5F},
@@ -81149,15 +81683,7 @@ void DrawWaterRunTimingGraph(
                             series[index].timeline,
                             deletedClipId);
                 }
-                if (timings.waterRunKeySelection.has_value() &&
-                    matchesSeries(
-                        timings.waterRunKeySelection.value(),
-                        index) &&
-                    std::abs(
-                        timings.waterRunKeySelection->position -
-                        editor->sourcePosition) <= kKeyTolerance) {
-                    timings.waterRunKeySelection.reset();
-                }
+                PruneWaterRunKeySelection(&timings, scenarioId, run);
                 mutated = true;
                 MarkWaterKeyEditTransactionChanged(runtimeState);
                 FinishWaterKeyEditTransaction(runtimeState);
@@ -81222,6 +81748,26 @@ void DrawWaterRunTimingGraph(
                         timings.waterRunKeySelection->position =
                             editor->draftPosition;
                     }
+                    if (selectionMatchesRun() && positionChanged) {
+                        const auto moved = keyHandle(
+                            index,
+                            editor->sourcePosition);
+                        for (auto& selected :
+                             timings.waterRunKeySelection->keys) {
+                            if (WaterRunKeyHandleMatches(selected, moved)) {
+                                selected.position = editor->draftPosition;
+                            }
+                        }
+                        if (timings.waterRunKeySelection->rangeAnchor
+                                .has_value() &&
+                            WaterRunKeyHandleMatches(
+                                timings.waterRunKeySelection->rangeAnchor
+                                    .value(),
+                                moved)) {
+                            timings.waterRunKeySelection->rangeAnchor
+                                ->position = editor->draftPosition;
+                        }
+                    }
                     mutated = true;
                     MarkWaterKeyEditTransactionChanged(runtimeState);
                     FinishWaterKeyEditTransaction(runtimeState);
@@ -81278,64 +81824,83 @@ void DrawWaterRunTimingGraph(
         }
     }
 
-    // Selected-key interpolation row: the last grabbed or edited key stays
-    // adjustable beneath the graph without reopening the popup. Timings-tab
-    // graphs and the embedded Water-tab timelines share this editor, so the
-    // row appears under both.
-    if (timings.waterRunKeySelection.has_value()) {
+    // Selection editor: a plain key click produces one item, modifier clicks
+    // and Cmd/Ctrl+A produce many. Clip-driven selections render their copy
+    // beside the clip lane instead, preventing duplicate controls in Split
+    // Graphs while still using the same underlying key set and undo path.
+    if (selectionMatchesRun() &&
+        !timings.waterRunKeySelection->clipDriven) {
         const auto selectionSeries =
             findMatchingSeries(timings.waterRunKeySelection.value());
-        if (selectionSeries.has_value() &&
-            series[selectionSeries.value()].track != nullptr) {
-            auto* track = series[selectionSeries.value()].track;
-            auto* selectedKey = [&]() -> WaterSettingKey* {
-                for (auto& key : track->keys) {
-                    if (std::abs(
-                            key.position -
-                            timings.waterRunKeySelection->position) <=
-                        kKeyTolerance) {
-                        return &key;
-                    }
+        if (selectionSeries.has_value()) {
+            std::vector<ResolvedWaterRunKey> selected;
+            selected.reserve(timings.waterRunKeySelection->keys.size());
+            for (const auto& handle :
+                 timings.waterRunKeySelection->keys) {
+                if (auto resolved = ResolveWaterRunKey(run, handle);
+                    resolved.key != nullptr) {
+                    selected.push_back(resolved);
                 }
-                return nullptr;
-            }();
-            if (selectedKey != nullptr) {
+            }
+            if (!selected.empty()) {
+                const auto selectedCount = selected.size();
                 ImGui::AlignTextToFramePadding();
-                ImGui::TextDisabled(
-                    "Key: %s at %.2f s",
-                    seriesKeyLabel(
-                        selectionSeries.value(),
-                        selectedKey->position)
-                        .c_str(),
-                    selectedKey->position * durationSeconds);
+                if (selectedCount == 1U) {
+                    ImGui::TextDisabled(
+                        "Key: %s at %.2f s",
+                        seriesKeyLabel(
+                            selectionSeries.value(),
+                            selected.front().key->position)
+                            .c_str(),
+                        selected.front().key->position * durationSeconds);
+                } else {
+                    ImGui::TextDisabled(
+                        "%zu keys selected",
+                        selectedCount);
+                }
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(200.0F);
-                const auto interpolationBeforeEdit =
-                    selectedKey->interpolation;
+                auto interpolation = selected.front().key->interpolation;
+                const bool mixed = std::any_of(
+                    std::next(selected.begin()),
+                    selected.end(),
+                    [&](const ResolvedWaterRunKey& resolved) {
+                        return resolved.key->interpolation != interpolation;
+                    });
                 if (DrawTimingInterpolationCombo(
                         "##SelectedRunKeyInterpolation",
-                        &selectedKey->interpolation,
+                        &interpolation,
                         /*includeSplineModes=*/true,
-                        /*includeTrackDefault=*/true)) {
-                    const auto interpolationAfterEdit =
-                        selectedKey->interpolation;
-                    selectedKey->interpolation = interpolationBeforeEdit;
-                    BeginWaterKeyEditTransaction(runtimeState, scenarioId);
-                    selectedKey->interpolation = interpolationAfterEdit;
-                    MarkWaterKeyEditTransactionChanged(runtimeState);
-                    FinishWaterKeyEditTransaction(runtimeState);
-                    timings.waterRunSplineHandleDrag.reset();
-                    ApplyFeatureTimelineScrub(runtimeState);
-                    runtimeState->previewRenderStateSignatureValid = false;
+                        /*includeTrackDefault=*/true,
+                        mixed)) {
+                    (void)ApplyInterpolationToSelectedWaterRunKeys(
+                        runtimeState,
+                        scenarioId,
+                        run,
+                        interpolation);
                 }
-                if (selectedKey->interpolation ==
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Delete##SelectedRunKeys")) {
+                    (void)DeleteSelectedWaterRunKeys(
+                        runtimeState,
+                        scenarioId,
+                        run);
+                }
+                if (!mixed && interpolation ==
                     WaterScenarioInterpolation::TrackDefault) {
                     ImGui::SameLine();
-                    ImGui::TextDisabled(
-                        "= %s",
-                        TimingInterpolationLabel(
-                            track->defaultInterpolation));
+                    if (selectedCount == 1U) {
+                        ImGui::TextDisabled(
+                            "= %s",
+                            TimingInterpolationLabel(
+                                selected.front().track
+                                    ->defaultInterpolation));
+                    } else {
+                        ImGui::TextDisabled("= each setting default");
+                    }
                 }
+                ImGui::TextDisabled(
+                    "Cmd/Ctrl-click toggles keys; Shift-click selects a range; Cmd/Ctrl+A selects this graph; Delete removes selected keys; Esc clears.");
             }
         }
     }
@@ -81377,14 +81942,22 @@ void MarkWaterClipMutation(PreviewRuntimeState* runtimeState) {
 void SelectSingleWaterClip(
     PreviewRuntimeState* runtimeState,
     const std::string& scenarioId,
-    std::uint32_t runId,
+    invisible_places::water::WaterFeatureTimingRun* run,
     const invisible_places::water::WaterKeyedFeatureId& feature,
     std::uint32_t clipId) {
+    if (runtimeState == nullptr || run == nullptr) {
+        return;
+    }
     runtimeState->timingsPanel.waterClipSelection = WaterClipSelectionState{
         .scenarioId = scenarioId,
-        .runId = runId,
+        .runId = run->id,
         .clips = {{.feature = feature, .clipId = clipId}},
     };
+    SelectWaterRunKeysOwnedByClips(
+        runtimeState,
+        scenarioId,
+        run,
+        runtimeState->timingsPanel.waterClipSelection->clips);
 }
 
 // Right-click menu for a clip block, the loose-keys block, or empty lane
@@ -81483,7 +82056,7 @@ void DrawWaterClipContextMenu(
                 SelectSingleWaterClip(
                     runtimeState,
                     scenarioId,
-                    run->id,
+                    run,
                     context.feature,
                     duplicated.value());
                 MarkWaterClipMutation(runtimeState);
@@ -81529,7 +82102,7 @@ void DrawWaterClipContextMenu(
                         SelectSingleWaterClip(
                             runtimeState,
                             scenarioId,
-                            run->id,
+                            run,
                             candidate.feature,
                             transferred.value());
                         runtimeState->statusMessage =
@@ -81563,6 +82136,7 @@ void DrawWaterClipContextMenu(
                 context.clipId,
                 /*removeKeys=*/false);
             timings.waterClipSelection.reset();
+            timings.waterRunKeySelection.reset();
             if (removed) {
                 MarkWaterClipMutation(runtimeState);
                 MarkWaterKeyEditTransactionChanged(runtimeState);
@@ -81578,6 +82152,7 @@ void DrawWaterClipContextMenu(
                 context.clipId,
                 /*removeKeys=*/true);
             timings.waterClipSelection.reset();
+            timings.waterRunKeySelection.reset();
             if (removed) {
                 MarkWaterClipMutation(runtimeState);
                 MarkWaterKeyEditTransactionChanged(runtimeState);
@@ -81603,7 +82178,7 @@ void DrawWaterClipContextMenu(
                 SelectSingleWaterClip(
                     runtimeState,
                     scenarioId,
-                    run->id,
+                    run,
                     context.feature,
                     created.value());
                 MarkWaterClipMutation(runtimeState);
@@ -81661,7 +82236,7 @@ void DrawWaterClipContextMenu(
                         SelectSingleWaterClip(
                             runtimeState,
                             scenarioId,
-                            run->id,
+                            run,
                             context.feature,
                             applied.value());
                         runtimeState->statusMessage =
@@ -81696,7 +82271,7 @@ void DrawWaterClipContextMenu(
                 SelectSingleWaterClip(
                     runtimeState,
                     scenarioId,
-                    run->id,
+                    run,
                     context.feature,
                     created.value());
                 MarkWaterClipMutation(runtimeState);
@@ -81987,6 +82562,7 @@ void DrawWaterRunClipsTimeline(
         size,
         ImGuiButtonFlags_MouseButtonLeft |
             ImGuiButtonFlags_MouseButtonRight);
+    const bool itemFocused = ImGui::IsItemFocused();
     const auto minimum = ImGui::GetItemRectMin();
     const auto maximum = ImGui::GetItemRectMax();
     const float width = std::max(1.0F, maximum.x - minimum.x);
@@ -82123,14 +82699,24 @@ void DrawWaterRunClipsTimeline(
         return std::find(clips.begin(), clips.end(), handle) != clips.end();
     };
     const auto replaceSelection = [&](std::vector<WaterClipHandle> clips) {
+        if (clips.empty()) {
+            timings.waterClipSelection.reset();
+            timings.waterRunKeySelection.reset();
+            return;
+        }
         timings.waterClipSelection = WaterClipSelectionState{
             .scenarioId = scenarioId,
             .runId = run->id,
             .clips = std::move(clips),
         };
+        SelectWaterRunKeysOwnedByClips(
+            runtimeState,
+            scenarioId,
+            run,
+            timings.waterClipSelection->clips);
     };
     const auto toggleSelection = [&](const WaterClipHandle& handle) {
-        if (!selectionMatches) {
+        if (!selectionMatchesNow()) {
             replaceSelection({handle});
             return;
         }
@@ -82227,8 +82813,51 @@ void DrawWaterRunClipsTimeline(
         timings.waterClipDrag->scenarioId == scenarioId &&
         timings.waterClipDrag->runId == run->id;
 
-    // ---- Drag lifecycle ----
+    // ---- Drag lifecycle and focused keyboard commands ----
     bool mutated = false;
+    if (itemFocused && !ImGui::GetIO().WantTextInput &&
+        !timings.waterClipDrag.has_value() &&
+        !timings.waterClipEdit.has_value() &&
+        !timings.waterClipPackageSave.has_value()) {
+        const bool command =
+            ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeySuper;
+        if (command && ImGui::IsKeyPressed(ImGuiKey_A, false)) {
+            std::vector<WaterRunKeyHandle> handles;
+            for (std::size_t row = 0U; row < rowCount; ++row) {
+                const auto& timeline = timelineForRow(row);
+                for (const auto& track : timeline.settings) {
+                    if (!track.active) {
+                        continue;
+                    }
+                    for (const auto& key : track.keys) {
+                        handles.push_back({
+                            .feature = timeline.feature,
+                            .settingId = track.settingId,
+                            .position = key.position,
+                        });
+                    }
+                }
+            }
+            ReplaceWaterRunKeySelection(
+                &timings,
+                scenarioId,
+                run->id,
+                std::move(handles),
+                /*clipDriven=*/true);
+            timings.waterClipSelection.reset();
+        } else if (
+            ImGui::IsKeyPressed(ImGuiKey_Delete, false) ||
+            ImGui::IsKeyPressed(ImGuiKey_Backspace, false)) {
+            mutated = DeleteSelectedWaterRunKeys(
+                          runtimeState,
+                          scenarioId,
+                          run) ||
+                      mutated;
+        } else if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+            timings.waterClipSelection.reset();
+            timings.waterRunKeySelection.reset();
+        }
+    }
     if (dragMatches) {
         auto& drag = timings.waterClipDrag.value();
         const auto restoreSnapshots = [&] {
@@ -82870,6 +83499,13 @@ void DrawWaterRunClipsTimeline(
         // into the block list) must be re-derived before drawing reads it.
         rebuildBlocks();
         hovered = hitTest();
+        if (selectionMatchesNow()) {
+            SelectWaterRunKeysOwnedByClips(
+                runtimeState,
+                scenarioId,
+                run,
+                timings.waterClipSelection->clips);
+        }
     }
 
     // ---- Drawing ----
@@ -83227,7 +83863,8 @@ void DrawWaterRunClipsTimeline(
     }
 
     // Selection summary and quick clear.
-    if (selectionMatches && !timings.waterClipSelection->clips.empty()) {
+    if (selectionMatchesNow() &&
+        !timings.waterClipSelection->clips.empty()) {
         const auto count = timings.waterClipSelection->clips.size();
         ImGui::TextDisabled(
             "%zu clip%s selected — drag together to offset, drag an edge "
@@ -83241,6 +83878,60 @@ void DrawWaterRunClipsTimeline(
         ImGui::SameLine();
         if (ImGui::SmallButton("Deselect##WaterClips")) {
             timings.waterClipSelection.reset();
+            timings.waterRunKeySelection.reset();
+        }
+    }
+    PruneWaterRunKeySelection(&timings, scenarioId, run);
+    if (timings.waterRunKeySelection.has_value() &&
+        WaterRunKeySelectionMatches(
+            timings.waterRunKeySelection.value(),
+            scenarioId,
+            run->id) &&
+        timings.waterRunKeySelection->clipDriven) {
+        std::vector<ResolvedWaterRunKey> selected;
+        selected.reserve(timings.waterRunKeySelection->keys.size());
+        for (const auto& handle : timings.waterRunKeySelection->keys) {
+            if (auto resolved = ResolveWaterRunKey(run, handle);
+                resolved.key != nullptr) {
+                selected.push_back(resolved);
+            }
+        }
+        if (!selected.empty()) {
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextDisabled(
+                "%zu active key%s selected",
+                selected.size(),
+                selected.size() == 1U ? "" : "s");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(200.0F);
+            auto interpolation = selected.front().key->interpolation;
+            const bool mixed = std::any_of(
+                std::next(selected.begin()),
+                selected.end(),
+                [&](const ResolvedWaterRunKey& resolved) {
+                    return resolved.key->interpolation != interpolation;
+                });
+            if (DrawTimingInterpolationCombo(
+                    "##SelectedClipKeyInterpolation",
+                    &interpolation,
+                    /*includeSplineModes=*/true,
+                    /*includeTrackDefault=*/true,
+                    mixed)) {
+                (void)ApplyInterpolationToSelectedWaterRunKeys(
+                    runtimeState,
+                    scenarioId,
+                    run,
+                    interpolation);
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Delete Keys##SelectedClipKeys")) {
+                (void)DeleteSelectedWaterRunKeys(
+                    runtimeState,
+                    scenarioId,
+                    run);
+            }
+            ImGui::TextDisabled(
+                "Clip click selects its keys; Cmd/Ctrl-click toggles clips, then Cmd/Ctrl-click graph nodes to refine. Cmd/Ctrl+A selects all active keys in these rows.");
         }
     }
 
@@ -84440,8 +85131,9 @@ const char* TimingInterpolationLabel(
 bool DrawTimingInterpolationCombo(
     const char* label,
     invisible_places::water::WaterScenarioInterpolation* interpolation,
-    bool includeSplineModes = false,
-    bool includeTrackDefault = false) {
+    bool includeSplineModes,
+    bool includeTrackDefault,
+    bool mixed) {
     if (interpolation == nullptr) {
         return false;
     }
@@ -84449,7 +85141,7 @@ bool DrawTimingInterpolationCombo(
     bool changed = false;
     if (ImGui::BeginCombo(
             label,
-            TimingInterpolationLabel(*interpolation))) {
+            mixed ? "Mixed" : TimingInterpolationLabel(*interpolation))) {
         constexpr std::array baseOptions{
             WaterScenarioInterpolation::Smooth,
             WaterScenarioInterpolation::Linear,
@@ -84461,7 +85153,7 @@ bool DrawTimingInterpolationCombo(
             WaterScenarioInterpolation::SplineHandles,
         };
         const auto drawOption = [&](WaterScenarioInterpolation option) {
-            const bool selected = *interpolation == option;
+            const bool selected = !mixed && *interpolation == option;
             if (ImGui::Selectable(
                     TimingInterpolationLabel(option),
                     selected)) {

@@ -7117,7 +7117,7 @@ WaterScenarioInterpolation ResolveWaterSettingInterpolation(
         return key.interpolation;
     }
     return track.defaultInterpolation == WaterScenarioInterpolation::TrackDefault
-               ? WaterScenarioInterpolation::CentripetalCatmullRom
+               ? WaterScenarioInterpolation::SmoothVelocity
                : track.defaultInterpolation;
 }
 
@@ -8546,7 +8546,7 @@ WaterKeyedSettingTrack SanitizeWaterKeyedSettingTrack(
     if (track.defaultInterpolation ==
         WaterScenarioInterpolation::TrackDefault) {
         track.defaultInterpolation =
-            WaterScenarioInterpolation::CentripetalCatmullRom;
+            WaterScenarioInterpolation::SmoothVelocity;
     }
     for (auto& key : track.keys) {
         key.position = Clamp01(SeepageFiniteOr(key.position, 0.0F));
@@ -8855,7 +8855,7 @@ std::optional<float> EvaluateWaterKeyedSettingTrack(
     // interpolation to find mode boundaries.
     const auto trackDefault =
         track.defaultInterpolation == WaterScenarioInterpolation::TrackDefault
-            ? WaterScenarioInterpolation::CentripetalCatmullRom
+            ? WaterScenarioInterpolation::SmoothVelocity
             : track.defaultInterpolation;
     std::vector<WaterSettingKey> resolved = track.keys;
     for (auto& key : resolved) {

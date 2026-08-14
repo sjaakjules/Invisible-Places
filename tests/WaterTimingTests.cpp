@@ -794,6 +794,48 @@ TEST_CASE("Track-default keys follow the track's default interpolation",
     CHECK(splineStep > smoothStep * 2.0F);
 }
 
+TEST_CASE("New setting tracks default to monotone spline interpolation",
+          "[water][timing][keyed][interpolation][defaults]") {
+    using Catch::Approx;
+    using invisible_places::water::EvaluateWaterKeyedSettingTrack;
+    using invisible_places::water::SanitizeWaterKeyedSettingTrack;
+    using invisible_places::water::WaterKeyedSettingTrack;
+    using invisible_places::water::WaterScenarioInterpolation;
+    using invisible_places::water::WaterSettingKey;
+
+    WaterKeyedSettingTrack track;
+    CHECK(track.defaultInterpolation ==
+          WaterScenarioInterpolation::SmoothVelocity);
+    CHECK(WaterSettingKey{}.interpolation ==
+          WaterScenarioInterpolation::TrackDefault);
+
+    track.settingId = "strength";
+    track.keys = {
+        {.position = 0.0F, .value = 0.0F},
+        {.position = 0.4F, .value = 1.0F},
+        {.position = 0.7F, .value = 1.5F},
+        {.position = 1.0F, .value = 0.2F},
+    };
+    auto concrete = track;
+    for (auto& key : concrete.keys) {
+        key.interpolation = WaterScenarioInterpolation::SmoothVelocity;
+    }
+    for (const float position : {0.1F, 0.35F, 0.55F, 0.85F}) {
+        REQUIRE(EvaluateWaterKeyedSettingTrack(track, position).has_value());
+        CHECK(EvaluateWaterKeyedSettingTrack(track, position).value() ==
+              Approx(EvaluateWaterKeyedSettingTrack(concrete, position)
+                         .value()));
+    }
+
+    // TrackDefault is not a valid track-level mode. Sanitizing a malformed
+    // new record resolves it to the same monotone default rather than the
+    // older Catmull-Rom fallback.
+    track.defaultInterpolation = WaterScenarioInterpolation::TrackDefault;
+    const auto sanitized = SanitizeWaterKeyedSettingTrack(std::move(track));
+    CHECK(sanitized.defaultInterpolation ==
+          WaterScenarioInterpolation::SmoothVelocity);
+}
+
 TEST_CASE("Adding a key between keys preserves surrounding blends and order",
           "[water][timing][keyed]") {
     using Catch::Approx;

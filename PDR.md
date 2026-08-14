@@ -500,11 +500,16 @@ stretch, duplicate, and retarget clips by direct drag, including marquee and
 modifier-click multi-selection, group offset and anchored group scaling with
 normalized-domain clamping and exact same-track key collision protection,
 Alt-drag duplication, and drag-between-rows transfer restricted to features
-of one kind. Selecting one stored clip shall attach newly authored keys for
-that feature to it; otherwise new keys shall remain loose and visible in a
-dashed loose-key block alongside clips. Clip keys shall use distinct square
-and diamond graph markers, and their first and last key shall derive the clip
-bounds. Blocks
+of one kind. Selecting a clip shall also select all of its active owned key
+nodes for bulk interpolation or keyboard deletion; modifier-clicking graph
+nodes shall toggle them individually. A focused settings graph or Clips lane
+shall support platform Select All, Delete/Backspace, Escape, plain-click
+replacement, modifier-click toggling, and Shift-click range selection without
+capturing shortcuts from Global Animation Position. Selecting exactly one
+stored clip shall attach newly authored keys for that feature to it; otherwise
+new keys shall remain loose and visible in a dashed loose-key block alongside
+clips. Clip keys shall use distinct square and diamond graph markers, and their
+first and last key shall derive the clip bounds. Blocks
 shall indicate the primary keyed value by fill brightness, not curves. A clip
 shall save as a reusable package that records its native length; packages
 shall apply to any same-kind feature at any position and stretch to any
@@ -522,7 +527,9 @@ key shall expose its circular controls on the value graph, and dragging a
 control shall change curve time/value shape without moving the key. The graph's
 time-only key markers shall occupy a separate lower rail with non-overlapping
 hit targets even when the keyed value is at its minimum. Project schema 75 and
-water-sources schema 29 store the handle time fractions and value offsets.
+water-sources schema 29 store the handle time fractions and value offsets. New
+setting tracks and their inherited keys shall default to Monotone Spline;
+serialized and migrated older tracks shall retain their authored curve style.
 
 #### FR-STYLE-14
 Water key authoring shall retain one atomic edit of session history. Ctrl+Z on
