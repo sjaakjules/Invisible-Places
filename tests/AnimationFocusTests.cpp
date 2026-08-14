@@ -3640,6 +3640,74 @@ TEST_CASE("Linked seam sampling follows both reciprocal overlap bands",
                     .has_value());
 }
 
+TEST_CASE("Reciprocal timing windows map both camera paths onto one exact loop",
+          "[camera][animation][linked-seam][timing-loop]") {
+    const auto makePath = [](std::string name,
+                             float startOverlap,
+                             float endOverlap) {
+        invisible_places::camera::AnimationPath path;
+        path.name = std::move(name);
+        path.durationFrames = 300U;
+        path.keys = {
+            {.id = path.name + "-start"},
+            {.id = path.name + "-end", .durationFrames = 300U},
+        };
+        path.velocityBlendLink = invisible_places::camera::
+            AnimationVelocityBlendLinkMetadata{
+                .pairId = "shared-clock",
+                .partnerFileName = "partner.ipanim.json",
+                .startOverlapSeconds = startOverlap,
+                .endOverlapSeconds = endOverlap,
+            };
+        return path;
+    };
+    auto first = makePath("A", 2.0F, 3.0F);
+    auto second = makePath("B", 3.0F, 2.0F);
+    REQUIRE(invisible_places::camera::
+                ConfigureAnimationReciprocalTimingLoopWindows(
+                    &first,
+                    &second));
+    REQUIRE(first.velocityBlendLink.has_value());
+    REQUIRE(second.velocityBlendLink.has_value());
+    CHECK(first.velocityBlendLink->timingCycleFrames == 450U);
+    CHECK(second.velocityBlendLink->timingCycleFrames == 450U);
+    CHECK(first.velocityBlendLink->timingWindowStartFrame == 0);
+    CHECK(second.velocityBlendLink->timingWindowStartFrame == 210);
+
+    const auto phase = [](const auto& path, float local) {
+        return invisible_places::camera::AnimationLocalToTimingLoopPosition(
+            path,
+            local);
+    };
+    CHECK(phase(first, 0.0F) ==
+          Approx(phase(second, 0.8F)).margin(1.0e-6F));
+    CHECK(phase(first, 0.2F) ==
+          Approx(phase(second, 1.0F)).margin(1.0e-6F));
+    CHECK(phase(first, 0.7F) ==
+          Approx(phase(second, 0.0F)).margin(1.0e-6F));
+    CHECK(phase(first, 1.0F) ==
+          Approx(phase(second, 0.3F)).margin(1.0e-6F));
+
+    const auto atLoopZero = invisible_places::camera::
+        AnimationTimingLoopPositionToLocalPositions(first, 0.0F);
+    const auto partnerAtLoopZero = invisible_places::camera::
+        AnimationTimingLoopPositionToLocalPositions(second, 0.0F);
+    REQUIRE(atLoopZero.size() == 1U);
+    REQUIRE(partnerAtLoopZero.size() == 1U);
+    CHECK(atLoopZero.front() == Approx(0.0F));
+    CHECK(partnerAtLoopZero.front() == Approx(0.8F));
+
+    auto invalid = second;
+    invalid.velocityBlendLink->endOverlapSeconds = 1.0F;
+    const auto originalFirst = first.velocityBlendLink.value();
+    CHECK_FALSE(invisible_places::camera::
+                    ConfigureAnimationReciprocalTimingLoopWindows(
+                        &first,
+                        &invalid));
+    CHECK(first.velocityBlendLink->timingCycleFrames ==
+          originalFirst.timingCycleFrames);
+}
+
 namespace {
 
 // A pan with several authored keys close to its end so a pre-roll alignment

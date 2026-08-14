@@ -1363,6 +1363,177 @@ ResolveAnimationLinkedSeamSample(
     };
 }
 
+std::optional<AnimationTimingLoopWindow>
+ResolveAnimationTimingLoopWindow(const AnimationPath& path) {
+    if (!path.velocityBlendLink.has_value() ||
+        path.velocityBlendLink->timingCycleFrames == 0U) {
+        return std::nullopt;
+    }
+    const std::uint32_t durationFrames = std::max<std::uint32_t>(
+        path.durationFrames,
+        path.keys.size() > 1U
+            ? static_cast<std::uint32_t>(path.keys.size() - 1U)
+            : 1U);
+    return AnimationTimingLoopWindow{
+        .cycleFrames = path.velocityBlendLink->timingCycleFrames,
+        .startFrame = path.velocityBlendLink->timingWindowStartFrame,
+        .durationFrames = durationFrames,
+    };
+}
+
+namespace {
+
+double WrapTimingLoopFrame(double frame, double cycle) {
+    if (!std::isfinite(frame) || !std::isfinite(cycle) || cycle <= 0.0) {
+        return 0.0;
+    }
+    frame = std::fmod(frame, cycle);
+    return frame < 0.0 ? frame + cycle : frame;
+}
+
+}  // namespace
+
+float AnimationLocalToTimingLoopPosition(
+    const AnimationPath& path,
+    float localNormalizedPosition) {
+    const auto window = ResolveAnimationTimingLoopWindow(path);
+    if (!window.has_value()) {
+        return std::clamp(
+            std::isfinite(localNormalizedPosition)
+                ? localNormalizedPosition
+                : 0.0F,
+            0.0F,
+            1.0F);
+    }
+    const double local = std::clamp(
+        std::isfinite(localNormalizedPosition)
+            ? static_cast<double>(localNormalizedPosition)
+            : 0.0,
+        0.0,
+        1.0);
+    const double cycle = static_cast<double>(window->cycleFrames);
+    const double frame = static_cast<double>(window->startFrame) +
+        local * static_cast<double>(window->durationFrames);
+    return static_cast<float>(WrapTimingLoopFrame(frame, cycle) / cycle);
+}
+
+std::vector<float> AnimationTimingLoopPositionToLocalPositions(
+    const AnimationPath& path,
+    float loopNormalizedPosition) {
+    const auto window = ResolveAnimationTimingLoopWindow(path);
+    if (!window.has_value()) {
+        return {std::clamp(
+            std::isfinite(loopNormalizedPosition)
+                ? loopNormalizedPosition
+                : 0.0F,
+            0.0F,
+            1.0F)};
+    }
+    const double cycle = static_cast<double>(window->cycleFrames);
+    const double phase = WrapTimingLoopFrame(
+        (std::isfinite(loopNormalizedPosition)
+             ? static_cast<double>(loopNormalizedPosition)
+             : 0.0) * cycle,
+        cycle);
+    const double start = static_cast<double>(window->startFrame);
+    const double duration = static_cast<double>(window->durationFrames);
+    constexpr double kFrameTolerance = 1.0e-6;
+    const auto minimumCopy = static_cast<std::int64_t>(std::ceil(
+        (start - phase - kFrameTolerance) / cycle));
+    const auto maximumCopy = static_cast<std::int64_t>(std::floor(
+        (start + duration - phase + kFrameTolerance) / cycle));
+    std::vector<float> positions;
+    if (maximumCopy < minimumCopy) {
+        return positions;
+    }
+    positions.reserve(static_cast<std::size_t>(
+        std::min<std::int64_t>(maximumCopy - minimumCopy + 1, 8)));
+    for (std::int64_t copy = minimumCopy;
+         copy <= maximumCopy;
+         ++copy) {
+        const double localFrame = phase +
+            static_cast<double>(copy) * cycle - start;
+        const float local = static_cast<float>(std::clamp(
+            localFrame / std::max(1.0, duration),
+            0.0,
+            1.0));
+        if (positions.empty() ||
+            std::abs(positions.back() - local) > 1.0e-6F) {
+            positions.push_back(local);
+        }
+        if (positions.size() == 8U) {
+            break;
+        }
+    }
+    return positions;
+}
+
+bool ConfigureAnimationReciprocalTimingLoopWindows(
+    AnimationPath* first,
+    AnimationPath* second) {
+    if (first == nullptr || second == nullptr || first == second ||
+        !first->velocityBlendLink.has_value() ||
+        !second->velocityBlendLink.has_value()) {
+        return false;
+    }
+    auto& firstLink = first->velocityBlendLink.value();
+    auto& secondLink = second->velocityBlendLink.value();
+    if (firstLink.pairId.empty() ||
+        firstLink.pairId != secondLink.pairId) {
+        return false;
+    }
+    const std::uint32_t firstDuration = std::max<std::uint32_t>(
+        first->durationFrames,
+        first->keys.size() > 1U
+            ? static_cast<std::uint32_t>(first->keys.size() - 1U)
+            : 1U);
+    const std::uint32_t secondDuration = std::max<std::uint32_t>(
+        second->durationFrames,
+        second->keys.size() > 1U
+            ? static_cast<std::uint32_t>(second->keys.size() - 1U)
+            : 1U);
+    const auto overlapFrames = [](float seconds)
+        -> std::optional<std::uint32_t> {
+        if (!std::isfinite(seconds) || seconds < 0.0F) {
+            return std::nullopt;
+        }
+        const long double frames =
+            static_cast<long double>(seconds) *
+            static_cast<long double>(kAnimationFramesPerSecond);
+        if (frames > std::numeric_limits<std::uint32_t>::max()) {
+            return std::nullopt;
+        }
+        return static_cast<std::uint32_t>(std::llround(frames));
+    };
+    const auto firstStart = overlapFrames(firstLink.startOverlapSeconds);
+    const auto firstEnd = overlapFrames(firstLink.endOverlapSeconds);
+    const auto secondStart = overlapFrames(secondLink.startOverlapSeconds);
+    const auto secondEnd = overlapFrames(secondLink.endOverlapSeconds);
+    if (!firstStart.has_value() || !firstEnd.has_value() ||
+        !secondStart.has_value() || !secondEnd.has_value() ||
+        *firstStart != *secondEnd || *firstEnd != *secondStart ||
+        static_cast<std::uint64_t>(*firstStart) + *firstEnd >
+            firstDuration ||
+        static_cast<std::uint64_t>(*secondStart) + *secondEnd >
+            secondDuration) {
+        return false;
+    }
+    const std::uint64_t cycle64 =
+        static_cast<std::uint64_t>(firstDuration) + secondDuration -
+        *firstStart - *firstEnd;
+    if (cycle64 == 0U ||
+        cycle64 > std::numeric_limits<std::uint32_t>::max()) {
+        return false;
+    }
+    const auto cycle = static_cast<std::uint32_t>(cycle64);
+    firstLink.timingCycleFrames = cycle;
+    firstLink.timingWindowStartFrame = 0;
+    secondLink.timingCycleFrames = cycle;
+    secondLink.timingWindowStartFrame =
+        static_cast<std::int64_t>(firstDuration) - *firstEnd;
+    return true;
+}
+
 PreparedAnimationPathEvaluationContext PrepareAnimationPathEvaluation(const AnimationPath& path) {
     PreparedAnimationPathEvaluationContext context;
     if (path.keys.empty()) {

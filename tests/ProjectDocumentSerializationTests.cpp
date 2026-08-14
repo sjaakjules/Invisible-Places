@@ -3142,6 +3142,8 @@ TEST_CASE("Animation velocity blend metadata and localized corrections round-tri
       .endOverlapSeconds = 1.75F,
       .horizontalBlend = true,
       .panRight = false,
+      .timingCycleFrames = 7200U,
+      .timingWindowStartFrame = -375,
       .movableKeyIds = {"first", "last"},
   };
   path.localizedKeyCorrections = {
@@ -3163,6 +3165,9 @@ TEST_CASE("Animation velocity blend metadata and localized corrections round-tri
   REQUIRE(json.contains("localized_key_corrections"));
   CHECK_FALSE(json.contains("linked_loop"));
   CHECK(json.at("velocity_blend_link").at("pair_id") == "pair-123");
+  CHECK(json.at("velocity_blend_link").at("timing_cycle_frames") == 7200U);
+  CHECK(json.at("velocity_blend_link").at("timing_window_start_frame") ==
+        -375);
   CHECK_FALSE(json.at("velocity_blend_link")
                   .contains("pending_strong_alignment"));
   // Schema-19 files written by the removed guide workflow are accepted, but
@@ -3190,6 +3195,8 @@ TEST_CASE("Animation velocity blend metadata and localized corrections round-tri
         Catch::Approx(1.75F));
   CHECK(loaded->velocityBlendLink->horizontalBlend);
   CHECK_FALSE(loaded->velocityBlendLink->panRight);
+  CHECK(loaded->velocityBlendLink->timingCycleFrames == 7200U);
+  CHECK(loaded->velocityBlendLink->timingWindowStartFrame == -375);
   CHECK_FALSE(AnimationPathToJson(*loaded)
                   .at("velocity_blend_link")
                   .contains("pending_strong_alignment"));

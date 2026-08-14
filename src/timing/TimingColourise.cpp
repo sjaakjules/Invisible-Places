@@ -6,6 +6,7 @@
 #include <limits>
 #include <numeric>
 #include <sstream>
+#include <tuple>
 #include <unordered_set>
 #include <utility>
 
@@ -667,7 +668,8 @@ std::optional<float> EvaluateEffectParameterTrack(
     const std::vector<TimingColouriseEffectParameterKey>& keys,
     TimingColouriseEffectParameter parameter,
     float normalizedPosition,
-    float palettePhaseBaseValue) {
+    float palettePhaseBaseValue,
+    bool palettePhaseKeysAreAbsolute = false) {
     // Sanitization groups each parameter's keys and orders them by time.
     const auto trackBegin = std::find_if(
         keys.begin(),
@@ -677,7 +679,8 @@ std::optional<float> EvaluateEffectParameterTrack(
         trackBegin,
         keys.end(),
         [&](const auto& key) { return key.parameter != parameter; });
-    if (parameter == TimingColouriseEffectParameter::PalettePhase) {
+    if (parameter == TimingColouriseEffectParameter::PalettePhase &&
+        !palettePhaseKeysAreAbsolute) {
         std::vector<TimingColouriseEffectParameterKey> accumulated;
         accumulated.reserve(static_cast<std::size_t>(
             std::distance(trackBegin, trackEnd)));
@@ -1722,7 +1725,11 @@ bool TimingColouriseActivationRangeContains(
 
 bool TimingColouriseEffectIsActiveAt(
     const TimingColouriseEffect& effect,
-    float normalizedPosition) {
+    float normalizedPosition,
+    bool cyclic) {
+    if (cyclic && std::isfinite(normalizedPosition)) {
+        normalizedPosition -= std::floor(normalizedPosition);
+    }
     return effect.enabled &&
            (effect.colouriseEnabled || effect.emissiveEnabled) &&
            TimingColouriseActivationRangeContains(
@@ -2658,22 +2665,184 @@ TimingColouriseLut ApplyTimingColourisePalettePhase(
     return shifted;
 }
 
+namespace {
+
+float WrapTimingLoopPosition(float position) {
+    position = FiniteOr(position, 0.0F);
+    position -= std::floor(position);
+    return position >= 1.0F ? 0.0F : position;
+}
+
+template <typename Key, typename SameTrack, typename TrackLess>
+void ExpandTimingKeysForCyclicEvaluation(
+    std::vector<Key>* keys,
+    SameTrack sameTrack,
+    TrackLess trackLess) {
+    if (keys == nullptr || keys->empty()) {
+        return;
+    }
+    for (auto& key : *keys) {
+        key.position = WrapTimingLoopPosition(key.position);
+    }
+    std::stable_sort(
+        keys->begin(),
+        keys->end(),
+        [&](const Key& left, const Key& right) {
+            if (trackLess(left, right)) {
+                return true;
+            }
+            if (trackLess(right, left)) {
+                return false;
+            }
+            return left.position < right.position;
+        });
+    std::vector<Key> canonical;
+    canonical.reserve(keys->size());
+    for (auto& key : *keys) {
+        if (!canonical.empty() &&
+            sameTrack(canonical.back(), key) &&
+            std::abs(canonical.back().position - key.position) <=
+                kTimingColouriseKeyTolerance) {
+            canonical.back() = std::move(key);
+        } else {
+            canonical.push_back(std::move(key));
+        }
+    }
+    keys->clear();
+    keys->reserve(canonical.size() * 3U);
+    for (const float shift : {-1.0F, 0.0F, 1.0F}) {
+        for (const auto& key : canonical) {
+            auto copy = key;
+            copy.position += shift;
+            keys->push_back(std::move(copy));
+        }
+    }
+    std::stable_sort(
+        keys->begin(),
+        keys->end(),
+        [&](const Key& left, const Key& right) {
+            if (trackLess(left, right)) {
+                return true;
+            }
+            if (trackLess(right, left)) {
+                return false;
+            }
+            return left.position < right.position;
+        });
+}
+
+TimingColouriseEffect PrepareTimingColouriseEffectForEvaluation(
+    const TimingColouriseEffect& effect,
+    bool cyclic) {
+    auto prepared = SanitizeTimingColouriseEffect(effect);
+    if (!cyclic) {
+        return prepared;
+    }
+
+    // Palette Phase storage is delta-based. Convert one canonical cycle to
+    // absolute targets before making virtual neighbours, otherwise tripling
+    // the keys would incorrectly accumulate another phase turn per copy.
+    float accumulatedPhase = prepared.palettePhaseOffset;
+    for (auto& key : prepared.effectParameterKeys) {
+        if (key.parameter == TimingColouriseEffectParameter::PalettePhase) {
+            accumulatedPhase += ClampPalettePhaseDelta(key.value);
+            key.value = accumulatedPhase;
+        }
+    }
+    ExpandTimingKeysForCyclicEvaluation(
+        &prepared.effectParameterKeys,
+        [](const auto& left, const auto& right) {
+            return left.parameter == right.parameter;
+        },
+        [](const auto& left, const auto& right) {
+            return static_cast<std::uint8_t>(left.parameter) <
+                   static_cast<std::uint8_t>(right.parameter);
+        });
+    ExpandTimingKeysForCyclicEvaluation(
+        &prepared.paletteKeys,
+        [](const auto&, const auto&) { return true; },
+        [](const auto&, const auto&) { return false; });
+    ExpandTimingKeysForCyclicEvaluation(
+        &prepared.paletteStopParameterKeys,
+        [](const auto& left, const auto& right) {
+            return left.stopId == right.stopId &&
+                   left.parameter == right.parameter;
+        },
+        [](const auto& left, const auto& right) {
+            return std::tie(left.stopId, left.parameter) <
+                   std::tie(right.stopId, right.parameter);
+        });
+    ExpandTimingKeysForCyclicEvaluation(
+        &prepared.boundsParameterKeys,
+        [](const auto& left, const auto& right) {
+            return left.parameter == right.parameter;
+        },
+        [](const auto& left, const auto& right) {
+            return static_cast<std::uint8_t>(left.parameter) <
+                   static_cast<std::uint8_t>(right.parameter);
+        });
+    ExpandTimingKeysForCyclicEvaluation(
+        &prepared.boundsKeys,
+        [](const auto&, const auto&) { return true; },
+        [](const auto&, const auto&) { return false; });
+    return prepared;
+}
+
+TimingColourisePalette EvaluatePreparedTimingColourisePalette(
+    const TimingColouriseEffect& prepared,
+    float normalizedPosition) {
+    if (prepared.paletteKeyModel ==
+        TimingColourisePaletteKeyModel::LegacySnapshots) {
+        return prepared.basePalette;
+    }
+    auto palette = prepared.basePalette;
+    for (auto& stop : palette.stops) {
+        stop.position = EvaluatePaletteStopScalarTrack(
+                            prepared.paletteStopParameterKeys,
+                            stop.id,
+                            TimingColourisePaletteStopParameter::Position,
+                            normalizedPosition)
+                            .value_or(stop.position);
+        stop.colour = EvaluatePaletteStopColourTrack(
+                          prepared.paletteStopParameterKeys,
+                          stop.id,
+                          normalizedPosition)
+                          .value_or(stop.colour);
+        stop.colouriseAmount = EvaluatePaletteStopScalarTrack(
+                                  prepared.paletteStopParameterKeys,
+                                  stop.id,
+                                  TimingColourisePaletteStopParameter::
+                                      ColouriseAmount,
+                                  normalizedPosition)
+                                  .value_or(stop.colouriseAmount);
+    }
+    return SanitizeTimingColourisePalette(std::move(palette));
+}
+
+}  // namespace
+
 float EvaluateTimingColouriseEffectParameter(
     const TimingColouriseEffect& effect,
     TimingColouriseEffectParameter parameter,
-    float normalizedPosition) {
-    const auto sanitized = SanitizeTimingColouriseEffect(effect);
+    float normalizedPosition,
+    bool cyclic) {
+    const auto sanitized = PrepareTimingColouriseEffectForEvaluation(
+        effect,
+        cyclic);
     if (!TimingEffectParameterIsSupported(
             sanitized,
             parameter)) {
         return 0.0F;
     }
-    normalizedPosition = Clamp01(normalizedPosition);
+    normalizedPosition = cyclic
+        ? WrapTimingLoopPosition(normalizedPosition)
+        : Clamp01(normalizedPosition);
     return EvaluateEffectParameterTrack(
                sanitized.effectParameterKeys,
                parameter,
                normalizedPosition,
-               sanitized.palettePhaseOffset)
+               sanitized.palettePhaseOffset,
+               cyclic)
         .value_or(EffectParameterBaseValue(sanitized, parameter));
 }
 
@@ -2712,62 +2881,48 @@ float TimingColourisePalettePhaseDeltaFromPrevious(
 
 float EvaluateTimingEmissiveLevel(
     const TimingColouriseEffect& effect,
-    float normalizedPosition) {
+    float normalizedPosition,
+    bool cyclic) {
     return EvaluateTimingColouriseEffectParameter(
         effect,
         TimingColouriseEffectParameter::EmissiveLevel,
-        normalizedPosition);
+        normalizedPosition,
+        cyclic);
 }
 
 TimingColourisePalette EvaluateTimingColourisePalette(
     const TimingColouriseEffect& effect,
-    float normalizedPosition) {
-    const auto sanitized = SanitizeTimingColouriseEffect(effect);
-    // A legacy snapshot track is evaluated directly as LUTs by
-    // EvaluateTimingColourisePaletteLut. There is no single stop topology
-    // capable of representing its sample-wise interpolation, so this helper
-    // intentionally exposes its authored base palette only.
-    if (sanitized.paletteKeyModel ==
-        TimingColourisePaletteKeyModel::LegacySnapshots) {
-        return sanitized.basePalette;
-    }
-    normalizedPosition = Clamp01(normalizedPosition);
-    auto palette = sanitized.basePalette;
-    for (auto& stop : palette.stops) {
-        stop.position = EvaluatePaletteStopScalarTrack(
-                            sanitized.paletteStopParameterKeys,
-                            stop.id,
-                            TimingColourisePaletteStopParameter::Position,
-                            normalizedPosition)
-                            .value_or(stop.position);
-        stop.colour = EvaluatePaletteStopColourTrack(
-                          sanitized.paletteStopParameterKeys,
-                          stop.id,
-                          normalizedPosition)
-                          .value_or(stop.colour);
-        stop.colouriseAmount =
-            EvaluatePaletteStopScalarTrack(
-                sanitized.paletteStopParameterKeys,
-                stop.id,
-                TimingColourisePaletteStopParameter::ColouriseAmount,
-                normalizedPosition)
-                .value_or(stop.colouriseAmount);
-    }
-    return SanitizeTimingColourisePalette(std::move(palette));
+    float normalizedPosition,
+    bool cyclic) {
+    const auto prepared = PrepareTimingColouriseEffectForEvaluation(
+        effect,
+        cyclic);
+    normalizedPosition = cyclic
+        ? WrapTimingLoopPosition(normalizedPosition)
+        : Clamp01(normalizedPosition);
+    return EvaluatePreparedTimingColourisePalette(
+        prepared,
+        normalizedPosition);
 }
 
 TimingColouriseLut EvaluateTimingColourisePaletteLut(
     const TimingColouriseEffect& effect,
-    float normalizedPosition) {
-    const auto sanitized = SanitizeTimingColouriseEffect(effect);
-    normalizedPosition = Clamp01(normalizedPosition);
+    float normalizedPosition,
+    bool cyclic) {
+    const auto sanitized = PrepareTimingColouriseEffectForEvaluation(
+        effect,
+        cyclic);
+    normalizedPosition = cyclic
+        ? WrapTimingLoopPosition(normalizedPosition)
+        : Clamp01(normalizedPosition);
     const auto evaluatedParameter =
         [&](TimingColouriseEffectParameter parameter) {
             return EvaluateEffectParameterTrack(
                        sanitized.effectParameterKeys,
                        parameter,
                        normalizedPosition,
-                       sanitized.palettePhaseOffset)
+                       sanitized.palettePhaseOffset,
+                       cyclic)
                 .value_or(
                     EffectParameterBaseValue(
                         sanitized,
@@ -2786,7 +2941,7 @@ TimingColouriseLut EvaluateTimingColourisePaletteLut(
     if (sanitized.paletteKeyModel ==
         TimingColourisePaletteKeyModel::StopParameters) {
         return finalize(CompileTimingColourisePaletteLut(
-            EvaluateTimingColourisePalette(
+            EvaluatePreparedTimingColourisePalette(
                 sanitized,
                 normalizedPosition)));
     }
@@ -2822,9 +2977,14 @@ TimingColouriseLut EvaluateTimingColourisePaletteLut(
 
 TimingColouriseBounds EvaluateTimingColouriseBounds(
     const TimingColouriseEffect& effect,
-    float normalizedPosition) {
-    const auto sanitized = SanitizeTimingColouriseEffect(effect);
-    normalizedPosition = Clamp01(normalizedPosition);
+    float normalizedPosition,
+    bool cyclic) {
+    const auto sanitized = PrepareTimingColouriseEffectForEvaluation(
+        effect,
+        cyclic);
+    normalizedPosition = cyclic
+        ? WrapTimingLoopPosition(normalizedPosition)
+        : Clamp01(normalizedPosition);
     const auto fallback = EvaluateLegacyTimingColouriseBounds(
         sanitized,
         normalizedPosition);

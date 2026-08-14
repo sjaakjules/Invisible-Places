@@ -1126,12 +1126,6 @@ struct AnimationLinkedSeamedViewState {
     // is active only inside either saved reciprocal overlap, so ordinary
     // single-animation inspection remains unchanged through the bulk.
     bool enabled = true;
-    // The ordinary seam is a hard split. Overlap instead layers both complete
-    // frames with straight-alpha source-over composition. Filename order,
-    // rather than the currently loaded A/B role, keeps the top layer stable.
-    bool overlapEnabled = false;
-    bool orderedFirstSourceOnTop = true;
-    float overlapTopOpacity = 0.5F;
     std::string pairId;
     // Stable lexical file order gives both loaded members the same two seam
     // slots. Seam 0 is first-start/second-end; seam 1 is
@@ -1367,6 +1361,17 @@ struct ReciprocalPanTimingTakeCloneJournal {
     std::uint32_t preAllocationNextSequence = 1U;
 };
 
+// Immutable project payload prepared before either linked animation shadow
+// is committed. It is shared by reciprocal extension and ordinary linking so
+// every new A/B pair receives one cyclic Timing Take transactionally.
+struct ReciprocalPanTimingTakeClonePlan {
+    std::array<std::string, 2> assignedTakeIds;
+    std::vector<invisible_places::timing::TimingTakeDefinition> definitions;
+    std::vector<invisible_places::timing::TimingTakeSceneState> sceneStates;
+    std::vector<std::string> createdTakeIds;
+    std::uint32_t nextSequence = 1U;
+};
+
 struct AnimationPanelState {
     std::optional<AnimationPath> currentPath;
     std::string currentFilePath;
@@ -1437,6 +1442,8 @@ struct AnimationPanelState {
     AnimationReciprocalPanWizardState reciprocalPanWizard;
     std::optional<std::array<std::filesystem::path, 2>>
         requestedFixedLensNormalization;
+    std::optional<std::array<std::filesystem::path, 2>>
+        requestedSharedTimingLoop;
     std::optional<std::array<std::filesystem::path, 2>>
         requestedVelocityUnlink;
     std::optional<std::size_t> renamingFileIndex;
@@ -2196,6 +2203,15 @@ ProjectDocument BuildProjectDocumentForSave(
 void ValidateProjectAnimationVelocityLinks(
     const ProjectDocument& document,
     PreviewRuntimeState* runtimeState);
+bool BuildReciprocalPanTimingTakeClonePlan(
+    const PreviewRuntimeState& runtimeState,
+    const std::array<AnimationPath, 2U>& baselines,
+    const std::array<std::uint32_t, 2U>& prependedFrames,
+    const std::array<std::uint32_t, 2U>& contentFrames,
+    std::array<AnimationPath*, 2U> candidates,
+    ReciprocalPanTimingTakeClonePlan* plan,
+    std::string* errorMessage);
+
 bool ApplyAnimationLoopSmoothing(
     PreviewRuntimeState* runtimeState,
     std::size_t partnerFileIndex,
@@ -3910,7 +3926,8 @@ ResolveTimingColouriseStack(
         effects,
     std::span<const invisible_places::io::ScalarFieldStats> scalarFields,
     bool hasNormals,
-    float normalizedPosition) {
+    float normalizedPosition,
+    bool cyclic) {
     using invisible_places::renderer::pointcloud::
         ResolvedTimingColouriseEffect;
     using invisible_places::renderer::pointcloud::
@@ -3948,7 +3965,8 @@ ResolveTimingColouriseStack(
         if (!invisible_places::timing::
                 TimingColouriseEffectIsActiveAt(
                     effect,
-                    normalizedPosition)) {
+                    normalizedPosition,
+                    cyclic)) {
             continue;
         }
 
@@ -4024,7 +4042,8 @@ ResolveTimingColouriseStack(
         const auto bounds =
             invisible_places::timing::EvaluateTimingColouriseBounds(
                 effect,
-                normalizedPosition);
+                normalizedPosition,
+                cyclic);
         resolved.lowerBound = bounds.lower;
         resolved.upperBound = bounds.upper;
         resolved.edgeFadeFraction = bounds.edgeFade;
@@ -4038,7 +4057,8 @@ ResolveTimingColouriseStack(
                 invisible_places::timing::
                     EvaluateTimingColourisePaletteLut(
                         effect,
-                        normalizedPosition);
+                        normalizedPosition,
+                        cyclic);
             result.effects[result.effectCount++] = colouriseResolved;
         }
         if (selected.emitEmissive) {
@@ -4047,7 +4067,8 @@ ResolveTimingColouriseStack(
             emissiveResolved.emissiveLevel =
                 invisible_places::timing::EvaluateTimingEmissiveLevel(
                     effect,
-                    normalizedPosition);
+                    normalizedPosition,
+                    cyclic);
             result.effects[result.effectCount++] = emissiveResolved;
         }
     }
@@ -4065,6 +4086,11 @@ std::uint32_t EffectiveAnimationDurationFramesForTracks(
 
 std::uint32_t AuthoredAnimationTrackDurationFrames(
     const AnimationPath& path) {
+    if (const auto loop = invisible_places::camera::
+            ResolveAnimationTimingLoopWindow(path);
+        loop.has_value()) {
+        return loop->cycleFrames;
+    }
     const std::uint32_t cameraFrames =
         EffectiveAnimationDurationFramesForTracks(path);
     // Compatibility for files written by the initial schema-22 extension.
@@ -4085,17 +4111,37 @@ float AuthoredAnimationTrackDurationSeconds(
            30.0F;
 }
 
-float AuthoredTrackNormalizedToCameraNormalized(
+std::vector<float> AuthoredTrackNormalizedToCameraNormalizedPositions(
     const AnimationPath& path,
     float trackNormalizedPosition) {
+    if (invisible_places::camera::ResolveAnimationTimingLoopWindow(path)
+            .has_value()) {
+        return invisible_places::camera::
+            AnimationTimingLoopPositionToLocalPositions(
+                path,
+                trackNormalizedPosition);
+    }
     const float cameraFrames = static_cast<float>(
         EffectiveAnimationDurationFramesForTracks(path));
     const float trackFrames = static_cast<float>(
         AuthoredAnimationTrackDurationFrames(path));
-    return std::clamp(
-        trackNormalizedPosition,
-        0.0F,
-        1.0F) * trackFrames / cameraFrames;
+    return {std::clamp(
+                trackNormalizedPosition,
+                0.0F,
+                1.0F) *
+            trackFrames / cameraFrames};
+}
+
+float AuthoredTrackNormalizedToCameraNormalized(
+    const AnimationPath& path,
+    float trackNormalizedPosition) {
+    const auto positions =
+        AuthoredTrackNormalizedToCameraNormalizedPositions(
+            path,
+            trackNormalizedPosition);
+    return positions.empty()
+               ? std::numeric_limits<float>::quiet_NaN()
+               : positions.front();
 }
 
 float CurrentAuthoredTrackPosition(
@@ -4108,6 +4154,11 @@ float CurrentAuthoredTrackPosition(
         return cameraPosition;
     }
     const auto& path = runtimeState.animationPanel.currentPath.value();
+    if (invisible_places::camera::ResolveAnimationTimingLoopWindow(path)
+            .has_value()) {
+        return invisible_places::camera::
+            AnimationLocalToTimingLoopPosition(path, cameraPosition);
+    }
     const float cameraFrames = static_cast<float>(
         EffectiveAnimationDurationFramesForTracks(path));
     const float trackFrames = static_cast<float>(
@@ -4118,6 +4169,14 @@ float CurrentAuthoredTrackPosition(
         1.0F);
 }
 
+bool CurrentAnimationTimingIsCyclic(
+    const PreviewRuntimeState& runtimeState) {
+    return runtimeState.animationPanel.currentPath.has_value() &&
+        invisible_places::camera::ResolveAnimationTimingLoopWindow(
+            runtimeState.animationPanel.currentPath.value())
+            .has_value();
+}
+
 void SetCurrentAnimationPositionFromAuthoredTrack(
     PreviewRuntimeState* runtimeState,
     float trackPosition) {
@@ -4126,9 +4185,30 @@ void SetCurrentAnimationPositionFromAuthoredTrack(
     }
     float cameraPosition = std::clamp(trackPosition, 0.0F, 1.0F);
     if (runtimeState->animationPanel.currentPath.has_value()) {
-        cameraPosition = AuthoredTrackNormalizedToCameraNormalized(
-            runtimeState->animationPanel.currentPath.value(),
-            cameraPosition);
+        const auto& path = runtimeState->animationPanel.currentPath.value();
+        if (invisible_places::camera::ResolveAnimationTimingLoopWindow(path)
+                .has_value()) {
+            const auto positions = invisible_places::camera::
+                AnimationTimingLoopPositionToLocalPositions(
+                    path,
+                    cameraPosition);
+            if (positions.empty()) {
+                return;
+            }
+            cameraPosition = *std::min_element(
+                positions.begin(),
+                positions.end(),
+                [&](float left, float right) {
+                    return std::abs(
+                               left - runtimeState->animationPanel.scrubAmount) <
+                           std::abs(
+                               right - runtimeState->animationPanel.scrubAmount);
+                });
+        } else {
+            cameraPosition = AuthoredTrackNormalizedToCameraNormalized(
+                path,
+                cameraPosition);
+        }
     }
     runtimeState->animationPanel.scrubAmount = cameraPosition;
 }
@@ -4136,6 +4216,7 @@ void SetCurrentAnimationPositionFromAuthoredTrack(
 struct WaterFrameState {
     float normalizedTime = 0.0F;
     float sampleTimeSeconds = 0.0F;
+    bool timingIsCyclic = false;
     float meshFlowMoisture = 0.0F;
     std::optional<invisible_places::water::WaterScenarioState> rawScenarioState;
     std::optional<invisible_places::water::WaterScenarioState> seepageScenarioState;
@@ -4170,7 +4251,8 @@ void ApplyWaterFeatureTimingRunsToFrame(
     frame->featureOverlay =
         invisible_places::water::BuildWaterFeatureTimingOverlay(
             runs,
-            frame->normalizedTime);
+            frame->normalizedTime,
+            frame->timingIsCyclic);
     const auto& overlay = frame->featureOverlay;
     if (overlay.samples.empty()) {
         return;
@@ -4257,6 +4339,8 @@ WaterFrameState ResolveWaterFrameStateBase(
     }
 
     const auto& animation = runtimeState->animationPanel.currentPath.value();
+    result.timingIsCyclic = invisible_places::camera::
+        ResolveAnimationTimingLoopWindow(animation).has_value();
     const float durationSeconds = std::max(
         1.0e-6F,
         AuthoredAnimationTrackDurationSeconds(animation));
@@ -28637,6 +28721,8 @@ bool AnimationVelocityLinksEquivalent(
         !close(left.endOverlapSeconds, right.endOverlapSeconds) ||
         left.horizontalBlend != right.horizontalBlend ||
         left.panRight != right.panRight ||
+        left.timingCycleFrames != right.timingCycleFrames ||
+        left.timingWindowStartFrame != right.timingWindowStartFrame ||
         leftMovable != rightMovable) {
         return false;
     }
@@ -31186,7 +31272,8 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
                            *activeColouriseEffects,
                            session.scalarFields,
                            session.hasNormals,
-                           activeWater.normalizedTime)
+                           activeWater.normalizedTime,
+                           activeWater.timingIsCyclic)
                      : invisible_places::renderer::pointcloud::
                            ResolvedTimingColouriseStack{},
              .generatedWaterOverlay = IsGeneratedWaterOverlaySession(session),
@@ -32800,7 +32887,8 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
                       job.frozenTimingColouriseEffects,
                       layer.scalarFields,
                       layer.hasNormals,
-                      waterFrame.normalizedTime)
+                      waterFrame.normalizedTime,
+                      waterFrame.timingIsCyclic)
                 : invisible_places::renderer::pointcloud::
                       ResolvedTimingColouriseStack{};
     }
@@ -37858,14 +37946,21 @@ WaterFrameState ResolveFrozenWaterFrameState(
             cameraSampleTimeSeconds / cameraDurationSeconds,
             0.0F,
             1.0F);
-        const float cameraFrames = static_cast<float>(
-            EffectiveAnimationDurationFramesForTracks(path));
+        result.timingIsCyclic = invisible_places::camera::
+            ResolveAnimationTimingLoopWindow(path).has_value();
         const float trackFrames = static_cast<float>(
             AuthoredAnimationTrackDurationFrames(path));
-        result.normalizedTime = std::clamp(
-            cameraPosition * cameraFrames / trackFrames,
-            0.0F,
-            1.0F);
+        if (result.timingIsCyclic) {
+            result.normalizedTime = invisible_places::camera::
+                AnimationLocalToTimingLoopPosition(path, cameraPosition);
+        } else {
+            const float cameraFrames = static_cast<float>(
+                EffectiveAnimationDurationFramesForTracks(path));
+            result.normalizedTime = std::clamp(
+                cameraPosition * cameraFrames / trackFrames,
+                0.0F,
+                1.0F);
+        }
         // This field drives keyed envelopes. Procedural export motion receives
         // the original full output sample time separately.
         result.sampleTimeSeconds =
@@ -51463,6 +51558,57 @@ bool ApplyAnimationLoopSmoothing(
         requestedOptions.secondStartOverlapSeconds,
         requestedOptions.secondEndOverlapSeconds,
         requestedOptions.secondMovableKeyIds);
+    const bool timingLoopConfigured = currentIsCanonicalFirst
+        ? invisible_places::camera::
+              ConfigureAnimationReciprocalTimingLoopWindows(
+                  &candidateCurrent,
+                  &candidatePartner)
+        : invisible_places::camera::
+              ConfigureAnimationReciprocalTimingLoopWindows(
+                  &candidatePartner,
+                  &candidateCurrent);
+    if (!timingLoopConfigured) {
+        runtimeState->errorMessage =
+            "The linked effect timeline could not be mapped from the reciprocal overlap bounds.";
+        runtimeState->statusMessage.clear();
+        rollbackDraftReplacement();
+        return false;
+    }
+    const std::array<AnimationPath, 2U> timingBaselines{
+        beforeCurrent,
+        beforePartner,
+    };
+    const auto sourceTimingFrames = [](const AnimationPath& path) {
+        const auto cameraFrames =
+            EffectiveAnimationDurationFramesForTracks(path);
+        return path.authoredTrackDurationFrames == 0U
+            ? cameraFrames
+            : std::clamp(
+                  path.authoredTrackDurationFrames,
+                  1U,
+                  cameraFrames);
+    };
+    const std::array<std::uint32_t, 2U> timingContentFrames{
+        sourceTimingFrames(beforeCurrent),
+        sourceTimingFrames(beforePartner),
+    };
+    ReciprocalPanTimingTakeClonePlan timingTakePlan;
+    std::string timingTakeError;
+    if (!BuildReciprocalPanTimingTakeClonePlan(
+            *runtimeState,
+            timingBaselines,
+            {0U, 0U},
+            timingContentFrames,
+            {&candidateCurrent, &candidatePartner},
+            &timingTakePlan,
+            &timingTakeError)) {
+        runtimeState->errorMessage = timingTakeError.empty()
+            ? "The two animations could not be assigned one linked effect timeline."
+            : std::move(timingTakeError);
+        runtimeState->statusMessage.clear();
+        rollbackDraftReplacement();
+        return false;
+    }
     candidateCurrent.preferredBlendPartnerFileName =
         panel.availableFiles[partnerFileIndex].filename().string();
     candidatePartner.preferredBlendPartnerFileName =
@@ -51549,6 +51695,24 @@ bool ApplyAnimationLoopSmoothing(
         },
         .strongKeyDeltas = std::move(retainedStrongDeltas),
     };
+    const std::uint32_t preAllocationNextSequence =
+        runtimeState->water.nextTimingTakeSequence;
+    runtimeState->water.nextTimingTakeSequence =
+        timingTakePlan.nextSequence;
+    runtimeState->water.timingTakes.insert(
+        runtimeState->water.timingTakes.end(),
+        std::make_move_iterator(timingTakePlan.definitions.begin()),
+        std::make_move_iterator(timingTakePlan.definitions.end()));
+    runtimeState->water.timingTakeSceneStates.insert(
+        runtimeState->water.timingTakeSceneStates.end(),
+        std::make_move_iterator(timingTakePlan.sceneStates.begin()),
+        std::make_move_iterator(timingTakePlan.sceneStates.end()));
+    if (!timingTakePlan.createdTakeIds.empty()) {
+        panel.reciprocalPanTimingTakeCloneIds[pairId] = {
+            .createdTakeIds = std::move(timingTakePlan.createdTakeIds),
+            .preAllocationNextSequence = preAllocationNextSequence,
+        };
+    }
     panel.availableFileEditedPaths[currentFileIndex.value()] =
         candidateCurrent;
     panel.availableFileEditedPaths[partnerFileIndex] =
@@ -55841,13 +56005,106 @@ void EnsureLinkedSeamedViewPair(
     }
     state->pairId = std::string{pairId};
     state->orderedFilePaths = std::move(ordered);
-    state->overlapEnabled = false;
-    state->orderedFirstSourceOnTop = true;
-    state->overlapTopOpacity = 0.5F;
     state->splitOffsetPixels = {0.0F, 0.0F};
     state->trackedAnchors = {};
     state->trackedAnchorsValid = {};
     state->renderedSourceIndex = 0U;
+}
+
+void DrawLinkedSeamedViewHeaderControls(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    auto& panel = runtimeState->animationPanel;
+    if (panel.currentFilePath.empty()) {
+        return;
+    }
+    const auto currentIndex = FindAnimationRegistryIndex(
+        panel,
+        std::filesystem::path{panel.currentFilePath});
+    const auto* current = currentIndex.has_value()
+        ? RegistryAnimationPath(*runtimeState, currentIndex.value())
+        : nullptr;
+    if (current == nullptr || !current->velocityBlendLink.has_value()) {
+        return;
+    }
+    const auto partnerIndex = FindAnimationRegistryIndexByFileName(
+        panel,
+        current->velocityBlendLink->partnerFileName);
+    const auto* partner = partnerIndex.has_value()
+        ? RegistryAnimationPath(*runtimeState, partnerIndex.value())
+        : nullptr;
+    std::optional<std::string> failure;
+    if (partner == nullptr) {
+        failure = "The linked partner animation is not loaded.";
+    } else {
+        failure = AppliedReciprocalPairFailure(
+            *current,
+            panel.availableFiles[currentIndex.value()],
+            *partner,
+            panel.availableFiles[partnerIndex.value()]);
+    }
+    const bool available = !failure.has_value();
+    if (available) {
+        EnsureLinkedSeamedViewPair(
+            &panel.linkedSeamedView,
+            current->velocityBlendLink->pairId,
+            panel.availableFiles[currentIndex.value()],
+            panel.availableFiles[partnerIndex.value()]);
+    }
+
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Linked A/B View");
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!available);
+    if (ImGui::Checkbox(
+            "Seamed View",
+            &panel.linkedSeamedView.enabled)) {
+        panel.linkedSeamedView.renderedSourceIndex = 0U;
+        runtimeState->previewRenderStateSignatureValid = false;
+    }
+    if (ImGui::IsItemHovered(
+            ImGuiHoveredFlags_DelayNormal |
+            ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip(
+            "%s",
+            available
+                ? "Shows the reciprocal partner in either saved overlap. The keyed feature timeline is shared across the complete linked loop."
+                : failure->c_str());
+    }
+    const auto currentTimingWindow = current != nullptr
+        ? invisible_places::camera::ResolveAnimationTimingLoopWindow(*current)
+        : std::nullopt;
+    const auto partnerTimingWindow = partner != nullptr
+        ? invisible_places::camera::ResolveAnimationTimingLoopWindow(*partner)
+        : std::nullopt;
+    const bool timingShared = current != nullptr && partner != nullptr &&
+        current->selectedTimingTakeId == partner->selectedTimingTakeId &&
+        currentTimingWindow.has_value() &&
+        partnerTimingWindow.has_value() &&
+        currentTimingWindow->cycleFrames ==
+            partnerTimingWindow->cycleFrames;
+    ImGui::TextDisabled(
+        timingShared ? "Effects: shared loop" : "Effects: path-local");
+    if (!timingShared) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Share Effect Timeline")) {
+            panel.requestedSharedTimingLoop =
+                std::array<std::filesystem::path, 2U>{
+                    panel.availableFiles[currentIndex.value()],
+                    panel.availableFiles[partnerIndex.value()],
+                };
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Creates one cyclic Timing Take for the linked pair. Existing keys from both paths are mapped into the full loop; the two animation files and project remain one Save/Discard transaction.");
+        }
+    } else if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+        ImGui::SetTooltip(
+            "Both animation windows evaluate the same cyclic Timing Take. Keys outside the loaded camera window remain virtual interpolation neighbours.");
+    }
+    ImGui::EndDisabled();
 }
 
 std::size_t LinkedSeamedViewOrderedSeamIndex(
@@ -58370,13 +58627,254 @@ void AddUniqueAnimationKeyId(
     ids->emplace_back(id);
 }
 
-struct ReciprocalPanTimingTakeClonePlan {
-    std::array<std::string, 2> assignedTakeIds;
-    std::vector<invisible_places::timing::TimingTakeDefinition> definitions;
-    std::vector<invisible_places::timing::TimingTakeSceneState> sceneStates;
-    std::vector<std::string> createdTakeIds;
-    std::uint32_t nextSequence = 1U;
-};
+float MapReciprocalTimingPositionToLoop(
+    const AnimationPath& candidate,
+    std::uint32_t contentStartFrame,
+    std::uint32_t contentFrames,
+    float position) {
+    const auto window = invisible_places::camera::
+        ResolveAnimationTimingLoopWindow(candidate);
+    if (!window.has_value() || window->cycleFrames == 0U) {
+        return std::clamp(position, 0.0F, 1.0F);
+    }
+    const long double sourcePosition = std::clamp(
+        std::isfinite(position) ? static_cast<long double>(position) : 0.0L,
+        0.0L,
+        1.0L);
+    const long double cycle = window->cycleFrames;
+    long double frame =
+        static_cast<long double>(window->startFrame) +
+        contentStartFrame + sourcePosition * contentFrames;
+    frame = std::fmod(frame, cycle);
+    if (frame < 0.0L) {
+        frame += cycle;
+    }
+    return static_cast<float>(frame / cycle);
+}
+
+void MapTimingTakeSceneStateToReciprocalLoop(
+    invisible_places::timing::TimingTakeSceneState* state,
+    const AnimationPath& candidate,
+    std::uint32_t contentStartFrame,
+    std::uint32_t contentFrames) {
+    if (state == nullptr) {
+        return;
+    }
+    const auto mapPosition = [&](float position) {
+        return MapReciprocalTimingPositionToLoop(
+            candidate,
+            contentStartFrame,
+            contentFrames,
+            position);
+    };
+    const auto mapKeys = [&](auto* keys) {
+        for (auto& key : *keys) {
+            key.position = mapPosition(key.position);
+        }
+    };
+    for (auto& run : state->waterFeatureTimingRuns) {
+        for (auto& feature : run.features) {
+            for (auto& setting : feature.settings) {
+                mapKeys(&setting.keys);
+            }
+            for (auto& clip : feature.clips) {
+                const float start = mapPosition(clip.start);
+                const float end = mapPosition(clip.end);
+                if (start <= end) {
+                    clip.start = start;
+                    clip.end = end;
+                } else {
+                    // A clip is authoring metadata; its member keys remain
+                    // exact. A wrapped clip uses the complete rail instead of
+                    // inventing a discontinuous endpoint key.
+                    clip.start = 0.0F;
+                    clip.end = 1.0F;
+                }
+            }
+        }
+    }
+    for (auto& effect : state->colouriseEffects) {
+        const auto range = invisible_places::timing::
+            SanitizeTimingColouriseActivationRange(
+                effect.activationRange);
+        if (range.start == 0.0F && range.end == 1.0F) {
+            effect.activationRange = range;
+        } else {
+            const float start = mapPosition(range.start);
+            const float end = mapPosition(range.end);
+            effect.activationRange = start <= end
+                ? invisible_places::timing::TimingColouriseActivationRange{
+                      .start = start,
+                      .end = end}
+                : invisible_places::timing::TimingColouriseActivationRange{};
+        }
+        mapKeys(&effect.effectParameterKeys);
+        mapKeys(&effect.paletteKeys);
+        mapKeys(&effect.paletteStopParameterKeys);
+        mapKeys(&effect.boundsParameterKeys);
+        mapKeys(&effect.boundsKeys);
+        for (auto& memory : effect.fieldBoundsMemory) {
+            mapKeys(&memory.boundsParameterKeys);
+            mapKeys(&memory.boundsKeys);
+        }
+    }
+    *state = invisible_places::timing::SanitizeTimingTakeSceneState(
+        std::move(*state));
+}
+
+template <typename Key, typename SameLane>
+void MergeTimingKeysKeepingFirst(
+    std::vector<Key>* destination,
+    const std::vector<Key>& source,
+    SameLane sameLane) {
+    if (destination == nullptr) {
+        return;
+    }
+    for (auto key : source) {
+        const bool occupied = std::any_of(
+            destination->begin(),
+            destination->end(),
+            [&](const Key& existing) {
+                return sameLane(existing, key) &&
+                       std::abs(existing.position - key.position) <= 1.0e-4F;
+            });
+        if (!occupied) {
+            if constexpr (requires { key.clipId; }) {
+                key.clipId = 0U;
+            }
+            destination->push_back(std::move(key));
+        }
+    }
+}
+
+void MergeTimingTakeSceneStateKeepingFirst(
+    invisible_places::timing::TimingTakeSceneState* destination,
+    const invisible_places::timing::TimingTakeSceneState& source) {
+    if (destination == nullptr) {
+        return;
+    }
+    for (const auto& sourceRun : source.waterFeatureTimingRuns) {
+        auto destinationRun = std::find_if(
+            destination->waterFeatureTimingRuns.begin(),
+            destination->waterFeatureTimingRuns.end(),
+            [&](const auto& run) {
+                return run.id == sourceRun.id || run.name == sourceRun.name;
+            });
+        if (destinationRun == destination->waterFeatureTimingRuns.end()) {
+            destination->waterFeatureTimingRuns.push_back(sourceRun);
+            continue;
+        }
+        destinationRun->enabled = destinationRun->enabled || sourceRun.enabled;
+        for (const auto& sourceFeature : sourceRun.features) {
+            auto destinationFeature = std::find_if(
+                destinationRun->features.begin(),
+                destinationRun->features.end(),
+                [&](const auto& feature) {
+                    return feature.feature == sourceFeature.feature;
+                });
+            if (destinationFeature == destinationRun->features.end()) {
+                destinationRun->features.push_back(sourceFeature);
+                continue;
+            }
+            for (const auto& sourceSetting : sourceFeature.settings) {
+                auto destinationSetting = std::find_if(
+                    destinationFeature->settings.begin(),
+                    destinationFeature->settings.end(),
+                    [&](const auto& setting) {
+                        return setting.settingId == sourceSetting.settingId;
+                    });
+                if (destinationSetting == destinationFeature->settings.end()) {
+                    destinationFeature->settings.push_back(sourceSetting);
+                    continue;
+                }
+                destinationSetting->active =
+                    destinationSetting->active || sourceSetting.active;
+                MergeTimingKeysKeepingFirst(
+                    &destinationSetting->keys,
+                    sourceSetting.keys,
+                    [](const auto&, const auto&) { return true; });
+            }
+        }
+    }
+
+    for (const auto& sourceEffect : source.colouriseEffects) {
+        auto destinationEffect = std::find_if(
+            destination->colouriseEffects.begin(),
+            destination->colouriseEffects.end(),
+            [&](const auto& effect) {
+                return !sourceEffect.id.empty() &&
+                       effect.id == sourceEffect.id;
+            });
+        if (destinationEffect == destination->colouriseEffects.end()) {
+            destination->colouriseEffects.push_back(sourceEffect);
+            continue;
+        }
+        destinationEffect->activationRange.start = std::min(
+            destinationEffect->activationRange.start,
+            sourceEffect.activationRange.start);
+        destinationEffect->activationRange.end = std::max(
+            destinationEffect->activationRange.end,
+            sourceEffect.activationRange.end);
+        MergeTimingKeysKeepingFirst(
+            &destinationEffect->effectParameterKeys,
+            sourceEffect.effectParameterKeys,
+            [](const auto& left, const auto& right) {
+                return left.parameter == right.parameter;
+            });
+        MergeTimingKeysKeepingFirst(
+            &destinationEffect->paletteKeys,
+            sourceEffect.paletteKeys,
+            [](const auto&, const auto&) { return true; });
+        MergeTimingKeysKeepingFirst(
+            &destinationEffect->paletteStopParameterKeys,
+            sourceEffect.paletteStopParameterKeys,
+            [](const auto& left, const auto& right) {
+                return left.stopId == right.stopId &&
+                       left.parameter == right.parameter;
+            });
+        MergeTimingKeysKeepingFirst(
+            &destinationEffect->boundsParameterKeys,
+            sourceEffect.boundsParameterKeys,
+            [](const auto& left, const auto& right) {
+                return left.parameter == right.parameter;
+            });
+        MergeTimingKeysKeepingFirst(
+            &destinationEffect->boundsKeys,
+            sourceEffect.boundsKeys,
+            [](const auto&, const auto&) { return true; });
+        for (const auto& sourceMemory : sourceEffect.fieldBoundsMemory) {
+            auto destinationMemory = std::find_if(
+                destinationEffect->fieldBoundsMemory.begin(),
+                destinationEffect->fieldBoundsMemory.end(),
+                [&](const auto& memory) {
+                    return memory.selector == sourceMemory.selector;
+                });
+            if (destinationMemory ==
+                destinationEffect->fieldBoundsMemory.end()) {
+                destinationEffect->fieldBoundsMemory.push_back(sourceMemory);
+                continue;
+            }
+            MergeTimingKeysKeepingFirst(
+                &destinationMemory->boundsParameterKeys,
+                sourceMemory.boundsParameterKeys,
+                [](const auto& left, const auto& right) {
+                    return left.parameter == right.parameter;
+                });
+            MergeTimingKeysKeepingFirst(
+                &destinationMemory->boundsKeys,
+                sourceMemory.boundsKeys,
+                [](const auto&, const auto&) { return true; });
+        }
+    }
+    destination->waterFeatureTimingRunSequence = std::max(
+        destination->waterFeatureTimingRunSequence,
+        source.waterFeatureTimingRunSequence);
+    destination->colouriseEffectSequence = std::max(
+        destination->colouriseEffectSequence,
+        source.colouriseEffectSequence);
+    *destination = invisible_places::timing::SanitizeTimingTakeSceneState(
+        std::move(*destination));
+}
 
 bool TimingTakeSceneStateHasAnimationCoordinates(
     const invisible_places::timing::TimingTakeSceneState& state) {
@@ -58425,106 +58923,261 @@ bool BuildReciprocalPanTimingTakeClonePlan(
     *plan = {};
     plan->nextSequence = runtimeState.water.nextTimingTakeSequence;
     auto definitionsForAllocation = runtimeState.water.timingTakes;
-    struct SharedClone {
-        std::string sourceTakeId;
-        std::string clonedTakeId;
-        std::uint32_t contentFrames = 0U;
-        std::uint32_t destinationFrames = 0U;
-        std::uint32_t destinationStartFrame = 0U;
-    };
-    std::vector<SharedClone> sharedClones;
-
+    std::array<std::string, 2U> sourceTakeIds{};
+    std::array<const invisible_places::timing::TimingTakeDefinition*, 2U>
+        sourceDefinitions{};
+    bool needsPrivateLoopTake = false;
     for (std::size_t role = 0U; role < candidates.size(); ++role) {
         candidates[role]->authoredTrackDurationFrames = 0U;
-        const std::string sourceTakeId =
-            invisible_places::timing::NormalizeTimingTakeId(
-                baselines[role].selectedTimingTakeId);
-        const auto* sourceDefinition =
+        sourceTakeIds[role] = invisible_places::timing::NormalizeTimingTakeId(
+            baselines[role].selectedTimingTakeId);
+        sourceDefinitions[role] =
             invisible_places::timing::FindTimingTakeDefinition(
                 runtimeState.water.timingTakes,
-                sourceTakeId);
-        if (sourceDefinition == nullptr) {
+                sourceTakeIds[role]);
+        if (sourceDefinitions[role] == nullptr) {
             if (errorMessage != nullptr) {
                 *errorMessage =
                     "The selected Timing Take is missing; choose an available take before applying the pan extension.";
             }
             return false;
         }
-        const bool hasAnimationCoordinates = std::any_of(
+        needsPrivateLoopTake = needsPrivateLoopTake || std::any_of(
             runtimeState.water.timingTakeSceneStates.begin(),
             runtimeState.water.timingTakeSceneStates.end(),
             [&](const auto& state) {
-                return state.takeId == sourceTakeId &&
+                return state.takeId == sourceTakeIds[role] &&
                        TimingTakeSceneStateHasAnimationCoordinates(state);
             });
-        if (!hasAnimationCoordinates) {
-            plan->assignedTakeIds[role] = sourceTakeId;
-            candidates[role]->selectedTimingTakeId = sourceTakeId;
-            continue;
+    }
+    const auto baselineFirstWindow = invisible_places::camera::
+        ResolveAnimationTimingLoopWindow(baselines[0U]);
+    const auto baselineSecondWindow = invisible_places::camera::
+        ResolveAnimationTimingLoopWindow(baselines[1U]);
+    const bool alreadyOneSharedLoop =
+        sourceTakeIds[0U] == sourceTakeIds[1U] &&
+        baselineFirstWindow.has_value() &&
+        baselineSecondWindow.has_value() &&
+        baselineFirstWindow->cycleFrames ==
+            baselineSecondWindow->cycleFrames;
+    if (alreadyOneSharedLoop) {
+        for (auto* candidate : candidates) {
+            candidate->selectedTimingTakeId = sourceTakeIds[0U];
         }
-
-        const std::uint32_t contentSpanFrames = std::max<std::uint32_t>(
-            1U,
-            contentFrames[role]);
-        const std::uint32_t destinationFrames = std::max<std::uint32_t>(
-            1U,
-            ReciprocalPanPathFrameCount(*candidates[role]));
-        const std::uint32_t destinationStartFrame = prependedFrames[role];
-        const auto shared = std::find_if(
-            sharedClones.begin(),
-            sharedClones.end(),
-            [&](const SharedClone& candidate) {
-                return candidate.sourceTakeId == sourceTakeId &&
-                       candidate.contentFrames == contentSpanFrames &&
-                       candidate.destinationFrames == destinationFrames &&
-                       candidate.destinationStartFrame ==
-                           destinationStartFrame;
-            });
-        if (shared != sharedClones.end()) {
-            plan->assignedTakeIds[role] = shared->clonedTakeId;
-            candidates[role]->selectedTimingTakeId = shared->clonedTakeId;
-            continue;
+        plan->assignedTakeIds = {sourceTakeIds[0U], sourceTakeIds[0U]};
+        return true;
+    }
+    needsPrivateLoopTake = needsPrivateLoopTake ||
+        sourceTakeIds[0U] != sourceTakeIds[1U];
+    if (!needsPrivateLoopTake) {
+        for (auto* candidate : candidates) {
+            candidate->selectedTimingTakeId = sourceTakeIds[0U];
         }
+        plan->assignedTakeIds = {sourceTakeIds[0U], sourceTakeIds[0U]};
+        return true;
+    }
 
-        auto cloneDefinition = *sourceDefinition;
-        cloneDefinition.id =
-            invisible_places::timing::AllocateTimingTakeId(
-                definitionsForAllocation,
-                &plan->nextSequence);
-        cloneDefinition.name += " - Pan Extension";
-        definitionsForAllocation.push_back(cloneDefinition);
-        plan->definitions.push_back(cloneDefinition);
-        plan->createdTakeIds.push_back(cloneDefinition.id);
-        for (const auto& state : runtimeState.water.timingTakeSceneStates) {
-            if (state.takeId != sourceTakeId) {
+    auto cloneDefinition = *sourceDefinitions[0U];
+    cloneDefinition.id = invisible_places::timing::AllocateTimingTakeId(
+        definitionsForAllocation,
+        &plan->nextSequence);
+    cloneDefinition.name += " - Linked Loop";
+    plan->definitions.push_back(cloneDefinition);
+    plan->createdTakeIds.push_back(cloneDefinition.id);
+
+    std::vector<std::string> sceneGroups;
+    for (const auto& state : runtimeState.water.timingTakeSceneStates) {
+        if ((state.takeId == sourceTakeIds[0U] ||
+             state.takeId == sourceTakeIds[1U]) &&
+            std::find(
+                sceneGroups.begin(),
+                sceneGroups.end(),
+                state.sceneGroupName) == sceneGroups.end()) {
+            sceneGroups.push_back(state.sceneGroupName);
+        }
+    }
+    for (const auto& sceneGroup : sceneGroups) {
+        std::optional<invisible_places::timing::TimingTakeSceneState> merged;
+        for (std::size_t role = 0U; role < candidates.size(); ++role) {
+            // The same source take is one body of authoring, not two
+            // contradictory path-local copies. Map it once through the
+            // canonical first animation. Distinct takes are merged with the
+            // first member winning only exact same-lane/same-frame conflicts.
+            if (role == 1U && sourceTakeIds[1U] == sourceTakeIds[0U]) {
                 continue;
             }
-            auto cloneState = state;
-            cloneState.takeId = cloneDefinition.id;
-            if (!invisible_places::timing::
-                    RetimeTimingTakeSceneStateNormalizedPositions(
-                        &cloneState,
-                        contentSpanFrames,
-                        destinationFrames,
-                        destinationStartFrame)) {
-                if (errorMessage != nullptr) {
-                    *errorMessage =
-                        "The selected Timing Take could not be retimed for the extended camera path.";
-                }
-                return false;
+            const auto* sourceState = invisible_places::timing::
+                FindTimingTakeSceneState(
+                    runtimeState.water.timingTakeSceneStates,
+                    sourceTakeIds[role],
+                    sceneGroup);
+            if (sourceState == nullptr) {
+                continue;
             }
-            plan->sceneStates.push_back(std::move(cloneState));
+            auto mapped = *sourceState;
+            mapped.takeId = cloneDefinition.id;
+            MapTimingTakeSceneStateToReciprocalLoop(
+                &mapped,
+                *candidates[role],
+                prependedFrames[role],
+                std::max<std::uint32_t>(1U, contentFrames[role]));
+            if (!merged.has_value()) {
+                merged = std::move(mapped);
+            } else {
+                MergeTimingTakeSceneStateKeepingFirst(
+                    &merged.value(),
+                    mapped);
+            }
         }
-        sharedClones.push_back({
-            .sourceTakeId = sourceTakeId,
-            .clonedTakeId = cloneDefinition.id,
-            .contentFrames = contentSpanFrames,
-            .destinationFrames = destinationFrames,
-            .destinationStartFrame = destinationStartFrame,
-        });
-        plan->assignedTakeIds[role] = cloneDefinition.id;
-        candidates[role]->selectedTimingTakeId = cloneDefinition.id;
+        if (!merged.has_value()) {
+            continue;
+        }
+        merged->takeId = cloneDefinition.id;
+        plan->sceneStates.push_back(std::move(merged.value()));
     }
+    for (auto* candidate : candidates) {
+        candidate->selectedTimingTakeId = cloneDefinition.id;
+    }
+    plan->assignedTakeIds = {cloneDefinition.id, cloneDefinition.id};
+    return true;
+}
+
+bool ApplySharedTimingLoopToLinkedPair(
+    PreviewRuntimeState* runtimeState,
+    const std::array<std::filesystem::path, 2U>& filePaths) {
+    if (runtimeState == nullptr ||
+        runtimeState->activeRenderSetupOverride.has_value()) {
+        return false;
+    }
+    SyncCurrentAnimationToRegistry(runtimeState);
+    auto& panel = runtimeState->animationPanel;
+    const auto firstIndex = FindAnimationRegistryIndex(panel, filePaths[0U]);
+    const auto secondIndex = FindAnimationRegistryIndex(panel, filePaths[1U]);
+    if (!firstIndex.has_value() || !secondIndex.has_value() ||
+        firstIndex == secondIndex) {
+        runtimeState->errorMessage =
+            "A linked animation was removed before its shared effect timeline could be prepared.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    const auto* firstLive = RegistryAnimationPath(
+        *runtimeState,
+        firstIndex.value());
+    const auto* secondLive = RegistryAnimationPath(
+        *runtimeState,
+        secondIndex.value());
+    if (firstLive == nullptr || secondLive == nullptr) {
+        runtimeState->errorMessage =
+            "Both linked animations must be loaded before sharing their effect timeline.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    if (const auto failure = AppliedReciprocalPairFailure(
+            *firstLive,
+            panel.availableFiles[firstIndex.value()],
+            *secondLive,
+            panel.availableFiles[secondIndex.value()]);
+        failure.has_value()) {
+        runtimeState->errorMessage = failure.value();
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    const std::array<AnimationPath, 2U> baselines{
+        *firstLive,
+        *secondLive,
+    };
+    auto first = baselines[0U];
+    auto second = baselines[1U];
+    const bool firstIsCanonical =
+        NormalizePathKey(panel.availableFiles[firstIndex.value()]) <
+        NormalizePathKey(panel.availableFiles[secondIndex.value()]);
+    const bool configured = firstIsCanonical
+        ? invisible_places::camera::
+              ConfigureAnimationReciprocalTimingLoopWindows(&first, &second)
+        : invisible_places::camera::
+              ConfigureAnimationReciprocalTimingLoopWindows(&second, &first);
+    if (!configured) {
+        runtimeState->errorMessage =
+            "The reciprocal overlap bounds cannot form one linked effect loop.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    const auto sourceFrames = [](const AnimationPath& path) {
+        const auto cameraFrames =
+            EffectiveAnimationDurationFramesForTracks(path);
+        return path.authoredTrackDurationFrames == 0U
+            ? cameraFrames
+            : std::clamp(
+                  path.authoredTrackDurationFrames,
+                  1U,
+                  cameraFrames);
+    };
+    ReciprocalPanTimingTakeClonePlan plan;
+    std::string error;
+    if (!BuildReciprocalPanTimingTakeClonePlan(
+            *runtimeState,
+            baselines,
+            {0U, 0U},
+            {sourceFrames(baselines[0U]), sourceFrames(baselines[1U])},
+            {&first, &second},
+            &plan,
+            &error)) {
+        runtimeState->errorMessage = error.empty()
+            ? "The two Timing Takes could not be combined into one linked loop."
+            : std::move(error);
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    const std::string pairId = first.velocityBlendLink->pairId;
+    const std::uint32_t preAllocationNextSequence =
+        runtimeState->water.nextTimingTakeSequence;
+    runtimeState->water.nextTimingTakeSequence = plan.nextSequence;
+    runtimeState->water.timingTakes.insert(
+        runtimeState->water.timingTakes.end(),
+        std::make_move_iterator(plan.definitions.begin()),
+        std::make_move_iterator(plan.definitions.end()));
+    runtimeState->water.timingTakeSceneStates.insert(
+        runtimeState->water.timingTakeSceneStates.end(),
+        std::make_move_iterator(plan.sceneStates.begin()),
+        std::make_move_iterator(plan.sceneStates.end()));
+    if (!plan.createdTakeIds.empty()) {
+        panel.reciprocalPanTimingTakeCloneIds[pairId] = {
+            .createdTakeIds = std::move(plan.createdTakeIds),
+            .preAllocationNextSequence = preAllocationNextSequence,
+        };
+    }
+    panel.availableFileEditedPaths[firstIndex.value()] = first;
+    panel.availableFileEditedPaths[secondIndex.value()] = second;
+    panel.availableFileDirtyFlags[firstIndex.value()] = true;
+    panel.availableFileDirtyFlags[secondIndex.value()] = true;
+    panel.availableFileLoopEditPairIds[firstIndex.value()] = pairId;
+    panel.availableFileLoopEditPairIds[secondIndex.value()] = pairId;
+    panel.projectVelocityLinksDirty = true;
+    const auto activeIndex = panel.currentFilePath.empty()
+        ? std::nullopt
+        : FindAnimationRegistryIndex(
+              panel,
+              std::filesystem::path{panel.currentFilePath});
+    if (activeIndex == firstIndex) {
+        panel.currentPath = first;
+    } else if (activeIndex == secondIndex) {
+        panel.currentPath = second;
+    }
+    if (activeIndex == firstIndex || activeIndex == secondIndex) {
+        panel.currentPathUsesEdited = true;
+        panel.selectedFileUsesEdited = true;
+        panel.dirty = true;
+    }
+    panel.preparedPathCache = {};
+    panel.motionStatsCache = {};
+    panel.perceivedFlowCache = {};
+    panel.loopTimeline.previewDirty = true;
+    runtimeState->previewRenderStateSignatureValid = false;
+    ApplyAnimationScrub(runtimeState);
+    runtimeState->statusMessage =
+        "The linked animations now share one cyclic Timing Take. Save A, B, and the project together, or Discard to undo.";
+    runtimeState->errorMessage.clear();
     return true;
 }
 
@@ -58790,6 +59443,26 @@ bool ApplyReciprocalPanCandidate(
             "The two generated overlap bands would cross inside A or B. Shorten one or both seam spans, then rebuild the preview.";
         return false;
     }
+    first.velocityBlendLink = makeLink(
+        0U,
+        wizard.filePaths[1U].filename().string(),
+        newFirstStart,
+        newSecondStart,
+        first);
+    second.velocityBlendLink = makeLink(
+        1U,
+        wizard.filePaths[0U].filename().string(),
+        newSecondStart,
+        newFirstStart,
+        second);
+    if (!invisible_places::camera::
+            ConfigureAnimationReciprocalTimingLoopWindows(
+                &first,
+                &second)) {
+        wizard.errorMessage =
+            "The reciprocal keyed-effect loop could not be mapped from the saved overlap frames.";
+        return false;
+    }
     ReciprocalPanTimingTakeClonePlan timingTakePlan;
     std::array<std::uint32_t, 2U> timingContentFrames{};
     for (std::size_t role = 0U; role < timingContentFrames.size(); ++role) {
@@ -58820,18 +59493,6 @@ bool ApplyReciprocalPanCandidate(
             &wizard.errorMessage)) {
         return false;
     }
-    first.velocityBlendLink = makeLink(
-        0U,
-        wizard.filePaths[1U].filename().string(),
-        newFirstStart,
-        newSecondStart,
-        first);
-    second.velocityBlendLink = makeLink(
-        1U,
-        wizard.filePaths[0U].filename().string(),
-        newSecondStart,
-        newFirstStart,
-        second);
     first.preferredBlendPartnerFileName =
         wizard.filePaths[1U].filename().string();
     second.preferredBlendPartnerFileName =
@@ -64237,7 +64898,6 @@ void DrawAnimationSection(
                         : "Applies only the checked values from the immutable copied snapshot. Angle from path tangent is transported into the destination's local direction of travel.";
                 ImGui::SetTooltip("%s", tooltip);
             }
-            ImGui::BeginDisabled(!matchingAppliedPair);
             if (matchingAppliedPair) {
                 EnsureLinkedSeamedViewPair(
                     &panel.linkedSeamedView,
@@ -64245,132 +64905,47 @@ void DrawAnimationSection(
                     panel.availableFiles[currentLoopFileIndex.value()],
                     panel.availableFiles[loopPartnerIndex.value()]);
             }
-            if (ImGui::Checkbox(
-                    "Seamed View",
-                    &panel.linkedSeamedView.enabled)) {
-                panel.linkedSeamedView.renderedSourceIndex = 0U;
-                runtimeState->previewRenderStateSignatureValid = false;
-            }
-            if (ImGui::IsItemHovered(
-                    ImGuiHoveredFlags_DelayNormal |
-                    ImGuiHoveredFlags_AllowWhenDisabled)) {
-                ImGui::SetTooltip(
-                    "%s",
-                    matchingAppliedPair
-                        ? "Shows the reciprocal partner whenever the current playhead enters either saved overlap. Disable Overlap for the moving hard split."
-                        : reciprocalPairFailure->c_str());
-            }
-            ImGui::SameLine();
-            ImGui::BeginDisabled(!panel.linkedSeamedView.enabled);
-            if (ImGui::Checkbox(
-                    "Overlap",
-                    &panel.linkedSeamedView.overlapEnabled)) {
-                panel.linkedSeamedView.renderedSourceIndex = 0U;
-                runtimeState->previewRenderStateSignatureValid = false;
-            }
-            if (ImGui::IsItemHovered(
-                    ImGuiHoveredFlags_DelayNormal |
-                    ImGuiHoveredFlags_AllowWhenDisabled)) {
-                ImGui::SetTooltip(
-                    "Layer both complete camera frames inside the linked overlap. The selected top frame uses its own per-pixel alpha, multiplied by the Top opacity control.");
-            }
-            ImGui::EndDisabled();
-            ImGui::EndDisabled();
             if (matchingAppliedPair && panel.linkedSeamedView.enabled) {
                 const bool currentIsOrderedFirst = PathsLexicallyEqual(
                     panel.availableFiles[currentLoopFileIndex.value()],
                     panel.linkedSeamedView.orderedFilePaths[0U]);
-                if (panel.linkedSeamedView.overlapEnabled) {
-                    const std::array<std::string, 2U> layerLabels{
-                        panel.linkedSeamedView.orderedFilePaths[0U]
-                            .filename()
-                            .string(),
-                        panel.linkedSeamedView.orderedFilePaths[1U]
-                            .filename()
-                            .string(),
-                    };
-                    const std::size_t topLayerIndex =
-                        panel.linkedSeamedView
-                                .orderedFirstSourceOnTop
-                            ? 0U
-                            : 1U;
-                    ImGui::SetNextItemWidth(-FLT_MIN);
-                    if (ImGui::BeginCombo(
-                            "Top animation",
-                            layerLabels[topLayerIndex].c_str())) {
-                        for (std::size_t layerIndex = 0U;
-                             layerIndex < layerLabels.size();
-                             ++layerIndex) {
-                            const bool selected =
-                                layerIndex == topLayerIndex;
-                            if (ImGui::Selectable(
-                                    layerLabels[layerIndex].c_str(),
-                                    selected)) {
-                                panel.linkedSeamedView
-                                    .orderedFirstSourceOnTop =
-                                    layerIndex == 0U;
-                                runtimeState
-                                    ->previewRenderStateSignatureValid =
-                                    false;
-                            }
-                            if (selected) {
-                                ImGui::SetItemDefaultFocus();
-                            }
-                        }
-                        ImGui::EndCombo();
-                    }
-                    ImGui::SetNextItemWidth(-FLT_MIN);
-                    if (ImGui::SliderFloat(
-                            "Top opacity",
-                            &panel.linkedSeamedView
-                                 .overlapTopOpacity,
-                            0.0F,
-                            1.0F,
-                            "%.2f")) {
-                        runtimeState
-                            ->previewRenderStateSignatureValid = false;
-                    }
-                    ImGui::TextWrapped(
-                        "Both complete frames occupy the live view. The bottom frame retains its alpha; Top opacity multiplies, rather than replaces, the selected frame's own transparency. Layer order remains tied to these filenames when A/B is switched.");
-                } else {
-                    const std::size_t currentStartSlot =
-                        currentIsOrderedFirst ? 0U : 1U;
-                    const std::size_t currentEndSlot =
-                        currentIsOrderedFirst ? 1U : 0U;
-                    const float viewportWidth = std::max(
-                        1.0F,
-                        CurrentUiViewportSize(viewport).x);
-                    ImGui::SetNextItemWidth(-FLT_MIN);
-                    const bool startOffsetChanged = ImGui::SliderFloat(
-                        "Current start seam offset",
-                        &panel.linkedSeamedView
-                             .splitOffsetPixels[currentStartSlot],
-                        -viewportWidth,
-                        viewportWidth,
-                        "%+.0f px");
-                    ImGui::SetNextItemWidth(-FLT_MIN);
-                    const bool endOffsetChanged = ImGui::SliderFloat(
-                        "Current end seam offset",
-                        &panel.linkedSeamedView
-                             .splitOffsetPixels[currentEndSlot],
-                        -viewportWidth,
-                        viewportWidth,
-                        "%+.0f px");
-                    if (startOffsetChanged || endOffsetChanged) {
-                        runtimeState->previewRenderStateSignatureValid =
-                            false;
-                    }
-                    if (ImGui::Button("Reset seam offsets")) {
-                        panel.linkedSeamedView.splitOffsetPixels = {
-                            0.0F,
-                            0.0F,
-                        };
-                        runtimeState->previewRenderStateSignatureValid =
-                            false;
-                    }
-                    ImGui::TextWrapped(
-                        "The split is visible only inside a linked overlap. After Apply it follows the captured feature anchors; a reloaded link falls back to an overlap-progress sweep. Both cross the aligned 50%% pose halfway through and retain these artistic offsets for this session.");
+                const std::size_t currentStartSlot =
+                    currentIsOrderedFirst ? 0U : 1U;
+                const std::size_t currentEndSlot =
+                    currentIsOrderedFirst ? 1U : 0U;
+                const float viewportWidth = std::max(
+                    1.0F,
+                    CurrentUiViewportSize(viewport).x);
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                const bool startOffsetChanged = ImGui::SliderFloat(
+                    "Current start seam offset",
+                    &panel.linkedSeamedView
+                         .splitOffsetPixels[currentStartSlot],
+                    -viewportWidth,
+                    viewportWidth,
+                    "%+.0f px");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                const bool endOffsetChanged = ImGui::SliderFloat(
+                    "Current end seam offset",
+                    &panel.linkedSeamedView
+                         .splitOffsetPixels[currentEndSlot],
+                    -viewportWidth,
+                    viewportWidth,
+                    "%+.0f px");
+                if (startOffsetChanged || endOffsetChanged) {
+                    runtimeState->previewRenderStateSignatureValid =
+                        false;
                 }
+                if (ImGui::Button("Reset seam offsets")) {
+                    panel.linkedSeamedView.splitOffsetPixels = {
+                        0.0F,
+                        0.0F,
+                    };
+                    runtimeState->previewRenderStateSignatureValid =
+                        false;
+                }
+                ImGui::TextWrapped(
+                    "The split is visible only inside a linked overlap. After Apply it follows the captured feature anchors; a reloaded link falls back to an overlap-progress sweep. Both cross the aligned 50%% pose halfway through and retain these artistic offsets for this session.");
             }
             const std::optional<std::string> extensionLinkFailure =
                 ReciprocalPanExistingLinkConflict(
@@ -71840,14 +72415,20 @@ KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
         }
     }
     const float position = CurrentAuthoredTrackPosition(*runtimeState);
+    const bool cyclicTiming =
+        CurrentAnimationTimingIsCyclic(*runtimeState);
     const bool keyingActive = track != nullptr && track->active;
     const bool keyed =
         keyingActive && track != nullptr && !track->keys.empty();
     float value = keyed
-                      ? invisible_places::water::
-                            EvaluateWaterKeyedSettingTrack(*track, position)
-                                .value_or(authoredValue)
-                      : authoredValue;
+        ? (cyclicTiming
+               ? invisible_places::water::
+                     EvaluateWaterKeyedSettingTrackCyclic(*track, position)
+               : invisible_places::water::EvaluateWaterKeyedSettingTrack(
+                     *track,
+                     position))
+              .value_or(authoredValue)
+        : authoredValue;
     const std::string renderedLabel = [&]() {
         const std::string text{label};
         const auto hiddenId = text.find("##");
@@ -72201,6 +72782,8 @@ KeyedWaterSliderResult DrawKeyedWaterColourSetting(
     }
 
     const float position = CurrentAuthoredTrackPosition(*runtimeState);
+    const bool cyclicTiming =
+        CurrentAnimationTimingIsCyclic(*runtimeState);
     const bool keyingActive = std::any_of(
         tracks.begin(),
         tracks.end(),
@@ -72211,11 +72794,15 @@ KeyedWaterSliderResult DrawKeyedWaterColourSetting(
     for (std::size_t channel = 0; channel < tracks.size(); ++channel) {
         const auto* track = tracks[channel];
         if (track != nullptr && track->active && !track->keys.empty()) {
-            colour[channel] =
-                invisible_places::water::EvaluateWaterKeyedSettingTrack(
-                    *track,
-                    position)
-                    .value_or(authoredColour[channel]);
+            const auto sampled = cyclicTiming
+                ? invisible_places::water::
+                      EvaluateWaterKeyedSettingTrackCyclic(
+                          *track,
+                          position)
+                : invisible_places::water::EvaluateWaterKeyedSettingTrack(
+                      *track,
+                      position);
+            colour[channel] = sampled.value_or(authoredColour[channel]);
         }
     }
 
@@ -80358,6 +80945,11 @@ void DrawWaterRunTimingGraph(
     }
     constexpr float kKeyTolerance = 1.0e-4F;
     auto& timings = runtimeState->timingsPanel;
+    const bool cyclicTiming =
+        runtimeState->animationPanel.currentPath.has_value() &&
+        invisible_places::camera::ResolveAnimationTimingLoopWindow(
+            runtimeState->animationPanel.currentPath.value())
+            .has_value();
     ImGui::PushID(id);
     constexpr float kCompactLaneHeight = 14.0F;
     constexpr float kTimeRailSeparation = 17.0F;
@@ -80466,9 +81058,14 @@ void DrawWaterRunTimingGraph(
         [&](std::size_t index, float position) -> std::optional<float> {
         const auto& lane = series[index];
         if (!sortedKeys[index].empty() && lane.track != nullptr) {
-            return invisible_places::water::EvaluateWaterKeyedSettingTrack(
-                *lane.track,
-                position);
+            return cyclicTiming
+                ? invisible_places::water::
+                      EvaluateWaterKeyedSettingTrackCyclic(
+                          *lane.track,
+                          position)
+                : invisible_places::water::EvaluateWaterKeyedSettingTrack(
+                      *lane.track,
+                      position);
         }
         return std::nullopt;
     };
@@ -80587,7 +81184,8 @@ void DrawWaterRunTimingGraph(
                     ResolveWaterSettingSplineHandlePoint(
                         *series[selectedSeries.value()].track,
                         timings.waterRunKeySelection->position,
-                        side);
+                        side,
+                        cyclicTiming);
                 if (point.has_value() &&
                     positionInView(point->anchorPosition) &&
                     positionInView(point->controlPosition)) {
@@ -81162,7 +81760,8 @@ void DrawWaterRunTimingGraph(
                                                            .value()],
                                                 mouse.y - drag.grabOffsetY),
                                             drag.rangeMinimum,
-                                        drag.rangeMaximum))) {
+                                        drag.rangeMaximum),
+                                        cyclicTiming)) {
             mutated = true;
             MarkWaterKeyEditTransactionChanged(runtimeState);
             ApplyFeatureTimelineScrub(runtimeState);
@@ -83686,8 +84285,16 @@ void DrawWaterRunClipsTimeline(
                     positionForX((x + sampleEnd) * 0.5F),
                     0.0F,
                     1.0F);
-                const auto value = invisible_places::water::
-                    EvaluateWaterKeyedSettingTrack(*primary, position);
+                const auto value = CurrentAnimationTimingIsCyclic(
+                                       *runtimeState)
+                    ? invisible_places::water::
+                          EvaluateWaterKeyedSettingTrackCyclic(
+                              *primary,
+                              position)
+                    : invisible_places::water::
+                          EvaluateWaterKeyedSettingTrack(
+                              *primary,
+                              position);
                 const float normalized = std::clamp(
                     (value.value_or(valueMinimum) - valueMinimum) /
                         std::max(1.0e-6F, valueMaximum - valueMinimum),
@@ -85904,6 +86511,8 @@ void DrawTimingKeyLaneGroup(
         series.empty()) {
         return;
     }
+    const bool cyclicTiming =
+        CurrentAnimationTimingIsCyclic(*runtimeState);
     ImGui::PushID(id);
     const auto laneDrawsValueGraph =
         [&](const TimingColouriseKeyLaneSeries& lane) {
@@ -86153,7 +86762,8 @@ void DrawTimingKeyLaneGroup(
                         invisible_places::timing::
                             EvaluateTimingColouriseBounds(
                                 *effect,
-                                position),
+                                position,
+                                cyclicTiming),
                         lane.boundsParameter.value());
             } else if (
                 lane.track ==
@@ -86163,7 +86773,8 @@ void DrawTimingKeyLaneGroup(
                     EvaluateTimingColouriseEffectParameter(
                         *effect,
                         lane.effectParameter.value(),
-                        position);
+                        position,
+                        cyclicTiming);
             } else {
                 return std::nullopt;
             }
@@ -86401,7 +87012,8 @@ void DrawTimingKeyLaneGroup(
                     invisible_places::timing::
                         EvaluateTimingColouriseBounds(
                             *effect,
-                            position));
+                            position,
+                            cyclicTiming));
             }
         }
 
@@ -87575,7 +88187,8 @@ bool DrawTimingColouriseEffectParameterEditor(
         EvaluateTimingColouriseEffectParameter(
             *effect,
             parameter,
-            position);
+            position,
+            CurrentAnimationTimingIsCyclic(*runtimeState));
     float authoredValue =
         parameter == TimingColouriseEffectParameter::PalettePhase &&
                 hasKeys
@@ -87840,6 +88453,8 @@ void DrawTimingColourisePaletteEditor(
     auto& timings = runtimeState->timingsPanel;
     auto& water = runtimeState->water;
     const float position = CurrentAuthoredTrackPosition(*runtimeState);
+    const bool cyclicTiming =
+        CurrentAnimationTimingIsCyclic(*runtimeState);
     const auto stopIndexById =
         [](const TimingColourisePalette& palette,
            std::string_view stopId)
@@ -88330,14 +88945,16 @@ void DrawTimingColourisePaletteEditor(
         return invisible_places::timing::
             EvaluateTimingColourisePaletteLut(
                 rawEffect,
-                position);
+                position,
+                cyclicTiming);
     };
     auto rawEvaluatedLut = evaluateRawPaletteLut();
     auto evaluatedLut =
         invisible_places::timing::
             EvaluateTimingColourisePaletteLut(
                 *effect,
-                position);
+                position,
+                cyclicTiming);
     TimingColourisePalette workingPalette;
     if (legacyModel) {
         if (effect->paletteKeys.empty()) {
@@ -88358,7 +88975,8 @@ void DrawTimingColourisePaletteEditor(
             invisible_places::timing::
                 EvaluateTimingColourisePalette(
                     *effect,
-                    position);
+                    position,
+                    cyclicTiming);
     }
 
     if (!timings.selectedColourisePaletteStopIndex
@@ -88417,11 +89035,13 @@ void DrawTimingColourisePaletteEditor(
                               invisible_places::timing::
                                   EvaluateTimingColourisePaletteLut(
                                       *effect,
-                                      keyPosition))
+                                      keyPosition,
+                                      cyclicTiming))
                         : invisible_places::timing::
                               EvaluateTimingColourisePalette(
                                   *effect,
-                                  keyPosition);
+                                  keyPosition,
+                                  cyclicTiming);
                 const bool selected =
                     std::abs(keyPosition - position) <=
                     invisible_places::timing::
@@ -88476,7 +89096,8 @@ void DrawTimingColourisePaletteEditor(
                 invisible_places::timing::
                     EvaluateTimingColourisePaletteLut(
                         *effect,
-                        position);
+                        position,
+                        cyclicTiming);
             if (legacyModel) {
                 legacyExactKey = std::find_if(
                     effect->paletteKeys.begin(),
@@ -88509,7 +89130,8 @@ void DrawTimingColourisePaletteEditor(
                     invisible_places::timing::
                         EvaluateTimingColourisePalette(
                             *effect,
-                            position);
+                            position,
+                            cyclicTiming);
             }
             paletteKeyPositions =
                 invisible_places::timing::
@@ -88577,12 +89199,14 @@ void DrawTimingColourisePaletteEditor(
         EvaluateTimingColouriseEffectParameter(
             *effect,
             TimingColouriseEffectParameter::PalettePhase,
-            position);
+            position,
+            cyclicTiming);
     const float evaluatedAmountOverride = invisible_places::timing::
         EvaluateTimingColouriseEffectParameter(
             *effect,
             TimingColouriseEffectParameter::AmountOverride,
-            position);
+            position,
+            cyclicTiming);
 
     const bool canEditStops =
         !legacyModel || legacyEditable != nullptr;
@@ -88716,7 +89340,10 @@ void DrawTimingColourisePaletteEditor(
         effectParameterLanes);
     if (effectControlsChanged) {
         evaluatedLut = invisible_places::timing::
-            EvaluateTimingColourisePaletteLut(*effect, position);
+            EvaluateTimingColourisePaletteLut(
+                *effect,
+                position,
+                cyclicTiming);
         runtimeState->previewRenderStateSignatureValid = false;
     }
     drawKeyedPaletteVersionsCombo();
@@ -90174,7 +90801,8 @@ bool SetTimingColouriseBoundsParameterAt(
     invisible_places::timing::TimingColouriseEffect* effect,
     invisible_places::timing::TimingColouriseBoundsParameter parameter,
     float position,
-    float value) {
+    float value,
+    bool cyclicTiming) {
     using invisible_places::timing::TimingColouriseBoundsParameter;
     if (!TimingColouriseBoundsParameterEditableAt(
             effect,
@@ -90186,7 +90814,8 @@ bool SetTimingColouriseBoundsParameterAt(
     const auto evaluated =
         invisible_places::timing::EvaluateTimingColouriseBounds(
             *effect,
-            position);
+            position,
+            cyclicTiming);
     switch (parameter) {
         case TimingColouriseBoundsParameter::Lower:
             if (effect->boundsKeyMode ==
@@ -90317,7 +90946,8 @@ bool ApplyTimingColouriseHistogramBounds(
     float position,
     float targetValue,
     float rangeMinimum,
-    float rangeMaximum) {
+    float rangeMaximum,
+    bool cyclicTiming) {
     if (!TimingColouriseHistogramHandleEditableAt(
             effect,
             handle,
@@ -90330,7 +90960,8 @@ bool ApplyTimingColouriseHistogramBounds(
     const auto bounds =
         invisible_places::timing::EvaluateTimingColouriseBounds(
             *effect,
-            position);
+            position,
+            cyclicTiming);
     const float span = bounds.upper - bounds.lower;
     if (handle == TimingColouriseHistogramHandle::LowerFade ||
         handle == TimingColouriseHistogramHandle::UpperFade) {
@@ -90347,7 +90978,8 @@ bool ApplyTimingColouriseHistogramBounds(
             invisible_places::timing::
                 TimingColouriseBoundsParameter::EdgeFade,
             position,
-            std::clamp(fade, -0.5F, 0.5F));
+            std::clamp(fade, -0.5F, 0.5F),
+            cyclicTiming);
     }
 
     auto desired = bounds;
@@ -90423,7 +91055,8 @@ bool ApplyTimingColouriseHistogramBounds(
                 effect,
                 parameter,
                 position,
-                desiredValue);
+                desiredValue,
+                cyclicTiming);
         }
     }
     return changed;
@@ -90452,6 +91085,8 @@ void DrawTimingColouriseHistogram(
         return;
     }
     const float position = CurrentAuthoredTrackPosition(*runtimeState);
+    const bool cyclicTiming =
+        CurrentAnimationTimingIsCyclic(*runtimeState);
     const ImVec2 size{
         std::max(160.0F, ImGui::GetContentRegionAvail().x),
         92.0F};
@@ -90597,7 +91232,8 @@ void DrawTimingColouriseHistogram(
         invisible_places::timing::
             EvaluateTimingColouriseBounds(
                 *effect,
-                position);
+                position,
+                cyclicTiming);
     const auto xForRaw = [&](float value) {
         return minimum.x + width * axis.RawToUnit(value);
     };
@@ -90818,7 +91454,8 @@ void DrawTimingColouriseHistogram(
                 mouseValue - runtimeState->timingsPanel
                                  .histogramHandleGrabOffset,
                 histogramData.minimum,
-                histogramData.maximum)) {
+                histogramData.maximum,
+                cyclicTiming)) {
             runtimeState->previewRenderStateSignatureValid =
                 false;
         }
@@ -90920,7 +91557,8 @@ void DrawTimingColouriseBoundsParameterTrackButtons(
             invisible_places::timing::
                 EvaluateTimingColouriseBounds(
                     *effect,
-                    position),
+                    position,
+                    CurrentAnimationTimingIsCyclic(*runtimeState)),
             parameter);
     auto interpolation = TimingScalarTrackInterpolationAt(
         effect->boundsParameterKeys,
@@ -91022,7 +91660,8 @@ void DrawTimingColouriseBoundsParameterEditor(
     const auto evaluatedBounds =
         invisible_places::timing::EvaluateTimingColouriseBounds(
             *effect,
-            position);
+            position,
+            CurrentAnimationTimingIsCyclic(*runtimeState));
     const float evaluatedValue =
         invisible_places::timing::TimingColouriseBoundsParameterValue(
             evaluatedBounds,
@@ -91085,7 +91724,8 @@ void DrawTimingColouriseBoundsParameterEditor(
             effect,
             parameter,
             position,
-            percentage ? draft * 0.01F : draft)) {
+            percentage ? draft * 0.01F : draft,
+            CurrentAnimationTimingIsCyclic(*runtimeState))) {
         runtimeState->previewRenderStateSignatureValid = false;
     }
     if (percentage) {
@@ -92803,6 +93443,10 @@ void DrawAuthoredTimingsPanel(
         RegistryAnimationHasEditedVersion(
             panel,
             animationRegistryIndex.value());
+    const auto linkedTimingWindow = animationPath != nullptr
+        ? invisible_places::camera::ResolveAnimationTimingLoopWindow(
+              *animationPath)
+        : std::nullopt;
     std::string selectedTakeId =
         animationPath != nullptr
             ? invisible_places::timing::NormalizeTimingTakeId(
@@ -92848,7 +93492,17 @@ void DrawAuthoredTimingsPanel(
                 "The saved animation is a read-only comparison. Load "
                 "_Edited before changing its Timing Take link.");
         }
-        ImGui::BeginDisabled(readOnlySavedComparison);
+        if (linkedTimingWindow.has_value()) {
+            ImGui::TextWrapped(
+                "Shared linked-loop Timing Take: %.1f s cycle. This camera shows frames %lld to %lld of that cyclic track; keys outside the window remain as virtual interpolation neighbours.",
+                static_cast<double>(linkedTimingWindow->cycleFrames) / 30.0,
+                static_cast<long long>(linkedTimingWindow->startFrame),
+                static_cast<long long>(
+                    linkedTimingWindow->startFrame +
+                    linkedTimingWindow->durationFrames));
+        }
+        ImGui::BeginDisabled(
+            readOnlySavedComparison || linkedTimingWindow.has_value());
         const char* takePreview =
             selectedTake != nullptr
                 ? selectedTake->name.c_str()
@@ -92887,7 +93541,9 @@ void DrawAuthoredTimingsPanel(
             ImGui::EndCombo();
         }
         DrawTimingControlTooltip(
-            "Choose the reusable Timing Take linked to this animation. A take starts from authored water and changes only explicit keys.");
+            linkedTimingWindow.has_value()
+                ? "The reciprocal pair owns one Timing Take. Unlink the pair before assigning either animation a different take; the keys below remain editable."
+                : "Choose the reusable Timing Take linked to this animation. A take starts from authored water and changes only explicit keys.");
 
         if (ImGui::Button("New")) {
             invisible_places::timing::TimingTakeDefinition take;
@@ -93090,28 +93746,34 @@ void DrawWaterKeyMarkerStrip(
         for (std::size_t keyIndex = 0U; keyIndex < ordered.size();
              ++keyIndex) {
             const auto& key = ordered[keyIndex];
-            const float cameraPosition =
+            const auto cameraPositions =
                 runtimeState->animationPanel.currentPath.has_value()
-                    ? AuthoredTrackNormalizedToCameraNormalized(
+                    ? AuthoredTrackNormalizedToCameraNormalizedPositions(
                           runtimeState->animationPanel.currentPath.value(),
                           key.position)
-                    : key.position;
-            const float x = barMin.x + barWidth * cameraPosition;
-            drawList->AddRectFilled(
-                ImVec2{x - 1.5F, stripTop},
-                ImVec2{x + 1.5F, stripTop + kStripHeight},
-                colour);
-            if (hovered) {
-                const float distance = std::abs(mouseX - x);
-                if (distance < nearest.distance) {
-                    nearest = {
-                        .distance = distance,
-                        .position = key.position,
-                        .cameraPosition = cameraPosition,
-                        .settingIndex = settingIndex,
-                        .keyNumber = keyIndex + 1U,
-                        .value = key.value,
-                    };
+                    : std::vector<float>{key.position};
+            // A shared loop key may be outside this camera path, or may occur
+            // more than once in an unusually long overlap window. Draw only
+            // the virtual occurrences belonging to the loaded path; the
+            // stored Timing Take still owns one key at one loop phase.
+            for (const float cameraPosition : cameraPositions) {
+                const float x = barMin.x + barWidth * cameraPosition;
+                drawList->AddRectFilled(
+                    ImVec2{x - 1.5F, stripTop},
+                    ImVec2{x + 1.5F, stripTop + kStripHeight},
+                    colour);
+                if (hovered) {
+                    const float distance = std::abs(mouseX - x);
+                    if (distance < nearest.distance) {
+                        nearest = {
+                            .distance = distance,
+                            .position = key.position,
+                            .cameraPosition = cameraPosition,
+                            .settingIndex = settingIndex,
+                            .keyNumber = keyIndex + 1U,
+                            .value = key.value,
+                        };
+                    }
                 }
             }
         }
@@ -93412,26 +94074,57 @@ void DrawTimingColouriseGlobalMarkerLanes(
             ImVec2{width, kLaneHeight});
         const bool hovered = ImGui::IsItemHovered();
         auto* drawList = ImGui::GetWindowDrawList();
-        const auto cameraPosition = [&](float trackPosition) {
+        const auto cameraPositions = [&](float trackPosition) {
             return runtimeState->animationPanel.currentPath.has_value()
-                       ? AuthoredTrackNormalizedToCameraNormalized(
+                       ? AuthoredTrackNormalizedToCameraNormalizedPositions(
                              runtimeState->animationPanel.currentPath.value(),
                              trackPosition)
-                       : trackPosition;
+                       : std::vector<float>{trackPosition};
         };
-        const float activationStartX =
-            barMin.x + width * cameraPosition(activation.start);
-        const float activationEndX =
-            barMin.x + width * cameraPosition(activation.end);
-        drawList->AddRectFilled(
-            ImVec2{activationStartX, top + 2.0F},
-            ImVec2{activationEndX, top + kLaneHeight - 1.0F},
-            effect->enabled
-                ? IM_COL32(88, 158, 208, 42)
-                : IM_COL32(128, 128, 128, 24),
-            1.0F);
-        for (const float boundaryX :
-             {activationStartX, activationEndX}) {
+        // Activation is stored in the shared loop domain. Shade it by
+        // sampling the loaded camera window, which correctly handles a path
+        // crossing loop zero without inventing a local boundary key.
+        constexpr int kActivationSamples = 128;
+        bool intervalActive = false;
+        float intervalStartX = barMin.x;
+        for (int sample = 0; sample <= kActivationSamples; ++sample) {
+            const float local = static_cast<float>(sample) /
+                static_cast<float>(kActivationSamples);
+            const float track =
+                runtimeState->animationPanel.currentPath.has_value()
+                    ? invisible_places::camera::
+                          AnimationLocalToTimingLoopPosition(
+                              runtimeState->animationPanel.currentPath.value(),
+                              local)
+                    : local;
+            const bool active = sample < kActivationSamples &&
+                invisible_places::timing::
+                    TimingColouriseActivationRangeContains(
+                        activation,
+                        track);
+            const float x = barMin.x + width * local;
+            if (active && !intervalActive) {
+                intervalActive = true;
+                intervalStartX = x;
+            } else if (!active && intervalActive) {
+                drawList->AddRectFilled(
+                    ImVec2{intervalStartX, top + 2.0F},
+                    ImVec2{x, top + kLaneHeight - 1.0F},
+                    effect->enabled
+                        ? IM_COL32(88, 158, 208, 42)
+                        : IM_COL32(128, 128, 128, 24),
+                    1.0F);
+                intervalActive = false;
+            }
+        }
+        std::vector<float> activationBoundaryXs;
+        for (const float boundary : {activation.start, activation.end}) {
+            for (const float cameraPosition : cameraPositions(boundary)) {
+                activationBoundaryXs.push_back(
+                    barMin.x + width * cameraPosition);
+            }
+        }
+        for (const float boundaryX : activationBoundaryXs) {
             drawList->AddLine(
                 ImVec2{boundaryX, top + 1.0F},
                 ImVec2{boundaryX, top + kLaneHeight - 1.0F},
@@ -93449,35 +94142,35 @@ void DrawTimingColouriseGlobalMarkerLanes(
         float nearestPosition = 0.0F;
         float nearestCameraPosition = 0.0F;
         for (const float keyPosition : lane.positions) {
-            const float keyCameraPosition =
-                cameraPosition(keyPosition);
-            const float x =
-                barMin.x +
-                width *
-                    std::clamp(keyCameraPosition, 0.0F, 1.0F);
-            auto markerColour = lane.colour;
-            if (!invisible_places::timing::
-                    TimingColouriseActivationRangeContains(
-                        activation,
-                        keyPosition)) {
-                auto dimmed =
-                    ImGui::ColorConvertU32ToFloat4(
-                        markerColour);
-                dimmed.w *= 0.32F;
-                markerColour =
-                    ImGui::ColorConvertFloat4ToU32(
-                        dimmed);
-            }
-            drawList->AddRectFilled(
-                ImVec2{x - 1.75F, top},
-                ImVec2{x + 1.75F, top + kLaneHeight},
-                markerColour);
-            const float distance =
-                std::abs(mouseX - x);
-            if (distance < nearestDistance) {
-                nearestDistance = distance;
-                nearestPosition = keyPosition;
-                nearestCameraPosition = keyCameraPosition;
+            for (const float keyCameraPosition :
+                 cameraPositions(keyPosition)) {
+                const float x = barMin.x + width * std::clamp(
+                    keyCameraPosition,
+                    0.0F,
+                    1.0F);
+                auto markerColour = lane.colour;
+                if (!invisible_places::timing::
+                        TimingColouriseActivationRangeContains(
+                            activation,
+                            keyPosition)) {
+                    auto dimmed =
+                        ImGui::ColorConvertU32ToFloat4(
+                            markerColour);
+                    dimmed.w *= 0.32F;
+                    markerColour =
+                        ImGui::ColorConvertFloat4ToU32(
+                            dimmed);
+                }
+                drawList->AddRectFilled(
+                    ImVec2{x - 1.75F, top},
+                    ImVec2{x + 1.75F, top + kLaneHeight},
+                    markerColour);
+                const float distance = std::abs(mouseX - x);
+                if (distance < nearestDistance) {
+                    nearestDistance = distance;
+                    nearestPosition = keyPosition;
+                    nearestCameraPosition = keyCameraPosition;
+                }
             }
         }
         if (hovered && nearestDistance <= 6.0F) {
@@ -93517,20 +94210,16 @@ void DrawTimingColouriseGlobalMarkerLanes(
                 }
             }
         } else if (hovered) {
-            const float startDistance =
-                std::abs(mouseX - activationStartX);
-            const float endDistance =
-                std::abs(mouseX - activationEndX);
-            if (std::min(startDistance, endDistance) <=
-                5.0F) {
+            float nearestBoundaryDistance =
+                std::numeric_limits<float>::max();
+            for (const float x : activationBoundaryXs) {
+                nearestBoundaryDistance = std::min(
+                    nearestBoundaryDistance,
+                    std::abs(mouseX - x));
+            }
+            if (nearestBoundaryDistance <= 5.0F) {
                 ImGui::SetTooltip(
-                    "%s activation boundary at %.4f (derived, not a key). Edit it in the Activation overview.",
-                    startDistance <= endDistance
-                        ? "Start"
-                        : "End",
-                    startDistance <= endDistance
-                        ? activation.start
-                        : activation.end);
+                    "Activation boundary (derived, not a key). Edit it in the Activation overview.");
             }
         }
     }
@@ -93836,41 +94525,43 @@ void DrawAnimationTimelineViewBoundsOverlay(
     ImVec2 barMin,
     ImVec2 barMax) {
     range = invisible_places::timing::SanitizeTimelineViewRange(range);
-    const auto cameraPosition = [&](float trackPosition) {
-        return runtimeState.animationPanel.currentPath.has_value()
-                   ? AuthoredTrackNormalizedToCameraNormalized(
-                         runtimeState.animationPanel.currentPath.value(),
-                         trackPosition)
-                   : std::clamp(trackPosition, 0.0F, 1.0F);
-    };
-    const float cameraStart = cameraPosition(range.start);
-    const float cameraEnd = cameraPosition(range.end);
-    if (cameraStart <= 1.0e-6F && cameraEnd >= 1.0F - 1.0e-6F) {
+    if (invisible_places::timing::TimelineViewRangeIsFull(range)) {
         return;
     }
     const float width = std::max(1.0F, barMax.x - barMin.x);
-    const float startX = barMin.x + width * cameraStart;
-    const float endX = barMin.x + width * cameraEnd;
     auto* drawList = ImGui::GetWindowDrawList();
-    drawList->AddRectFilled(
-        barMin,
-        ImVec2{startX, barMax.y},
-        IM_COL32(0, 0, 0, 76));
-    drawList->AddRectFilled(
-        ImVec2{endX, barMin.y},
-        barMax,
-        IM_COL32(0, 0, 0, 76));
+    constexpr int kSamples = 256;
     const ImU32 boundaryColour = IM_COL32(245, 185, 82, 225);
-    drawList->AddLine(
-        ImVec2{startX, barMin.y},
-        ImVec2{startX, barMax.y},
-        boundaryColour,
-        1.5F);
-    drawList->AddLine(
-        ImVec2{endX, barMin.y},
-        ImVec2{endX, barMax.y},
-        boundaryColour,
-        1.5F);
+    bool previousInside = false;
+    for (int sample = 0; sample < kSamples; ++sample) {
+        const float local0 = static_cast<float>(sample) /
+            static_cast<float>(kSamples);
+        const float local1 = static_cast<float>(sample + 1) /
+            static_cast<float>(kSamples);
+        const float localMid = (local0 + local1) * 0.5F;
+        const float track = runtimeState.animationPanel.currentPath.has_value()
+            ? invisible_places::camera::AnimationLocalToTimingLoopPosition(
+                  runtimeState.animationPanel.currentPath.value(),
+                  localMid)
+            : localMid;
+        const bool inside = track >= range.start && track <= range.end;
+        const float x0 = barMin.x + width * local0;
+        const float x1 = barMin.x + width * local1;
+        if (!inside) {
+            drawList->AddRectFilled(
+                ImVec2{x0, barMin.y},
+                ImVec2{x1 + 1.0F, barMax.y},
+                IM_COL32(0, 0, 0, 76));
+        }
+        if (sample > 0 && inside != previousInside) {
+            drawList->AddLine(
+                ImVec2{x0, barMin.y},
+                ImVec2{x0, barMax.y},
+                boundaryColour,
+                1.5F);
+        }
+        previousInside = inside;
+    }
 }
 
 bool DrawAnimationTimelineViewRangeSelector(
@@ -94230,23 +94921,34 @@ void DrawPinnedWaterSettingOverlays(
         }
         const float range =
             std::max(1.0e-6F, series->maximum - series->minimum);
-        const auto pointAt = [&](float position01) {
-            const float value =
-                invisible_places::water::EvaluateWaterKeyedSettingTrack(
-                    *series->track,
-                    position01)
-                    .value_or(series->minimum);
+        const bool cyclic =
+            runtimeState->animationPanel.currentPath.has_value() &&
+            invisible_places::camera::ResolveAnimationTimingLoopWindow(
+                runtimeState->animationPanel.currentPath.value())
+                .has_value();
+        const auto pointAtLocal = [&](float localPosition) {
+            const float trackPosition =
+                runtimeState->animationPanel.currentPath.has_value()
+                    ? invisible_places::camera::
+                          AnimationLocalToTimingLoopPosition(
+                              runtimeState->animationPanel.currentPath.value(),
+                              localPosition)
+                    : localPosition;
+            const auto sampled = cyclic
+                ? invisible_places::water::
+                      EvaluateWaterKeyedSettingTrackCyclic(
+                          *series->track,
+                          trackPosition)
+                : invisible_places::water::EvaluateWaterKeyedSettingTrack(
+                      *series->track,
+                      trackPosition);
+            const float value = sampled.value_or(series->minimum);
             const float normalized = std::clamp(
                 (value - series->minimum) / range,
                 0.0F,
                 1.0F);
             return ImVec2{
-                barMin.x + barWidth *
-                    (runtimeState->animationPanel.currentPath.has_value()
-                         ? AuthoredTrackNormalizedToCameraNormalized(
-                               runtimeState->animationPanel.currentPath.value(),
-                               position01)
-                         : position01),
+                barMin.x + barWidth * localPosition,
                 barMax.y - kOverlayPad -
                     normalized * (barHeight - kOverlayPad * 2.0F)};
         };
@@ -94256,22 +94958,77 @@ void DrawPinnedWaterSettingOverlays(
             256);
         const ImU32 colour =
             (series->colour & 0x00FFFFFFU) | 0xD2000000U;
-        ImVec2 previous = pointAt(0.0F);
+        ImVec2 previous = pointAtLocal(0.0F);
         for (int sample = 1; sample <= sampleCount; ++sample) {
-            const ImVec2 current = pointAt(
+            const ImVec2 current = pointAtLocal(
                 static_cast<float>(sample) /
                 static_cast<float>(sampleCount));
             drawList->AddLine(previous, current, colour, 1.5F);
             previous = current;
         }
         for (const auto& key : series->track->keys) {
-            drawList->AddCircleFilled(
-                pointAt(std::clamp(key.position, 0.0F, 1.0F)),
-                2.0F,
-                colour);
+            const auto localPositions =
+                runtimeState->animationPanel.currentPath.has_value()
+                    ? AuthoredTrackNormalizedToCameraNormalizedPositions(
+                          runtimeState->animationPanel.currentPath.value(),
+                          key.position)
+                    : std::vector<float>{key.position};
+            for (const float localPosition : localPositions) {
+                drawList->AddCircleFilled(
+                    pointAtLocal(localPosition),
+                    2.0F,
+                    colour);
+            }
         }
     }
     drawList->PopClipRect();
+}
+
+struct TimingTrackCameraOccurrence {
+    float authoredPosition = 0.0F;
+    float cameraPosition = 0.0F;
+};
+
+std::vector<TimingTrackCameraOccurrence>
+TimingTrackCameraOccurrences(
+    const PreviewRuntimeState& runtimeState,
+    std::span<const float> authoredPositions) {
+    std::vector<TimingTrackCameraOccurrence> occurrences;
+    for (const float authored : authoredPositions) {
+        const auto cameraPositions =
+            runtimeState.animationPanel.currentPath.has_value()
+                ? AuthoredTrackNormalizedToCameraNormalizedPositions(
+                      runtimeState.animationPanel.currentPath.value(),
+                      authored)
+                : std::vector<float>{authored};
+        for (const float camera : cameraPositions) {
+            occurrences.push_back({
+                .authoredPosition = authored,
+                .cameraPosition = camera,
+            });
+        }
+    }
+    std::stable_sort(
+        occurrences.begin(),
+        occurrences.end(),
+        [](const auto& left, const auto& right) {
+            if (std::abs(left.cameraPosition - right.cameraPosition) >
+                1.0e-6F) {
+                return left.cameraPosition < right.cameraPosition;
+            }
+            return left.authoredPosition < right.authoredPosition;
+        });
+    occurrences.erase(
+        std::unique(
+            occurrences.begin(),
+            occurrences.end(),
+            [](const auto& left, const auto& right) {
+                return std::abs(
+                           left.cameraPosition - right.cameraPosition) <=
+                       1.0e-6F;
+            }),
+        occurrences.end());
+    return occurrences;
 }
 
 void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
@@ -94381,46 +95138,43 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
         colouriseEffect != nullptr
             ? TimingEffectRelevantKeyPositions(*colouriseEffect)
             : std::vector<float>{};
-    const auto previousEffectKey = [&]() -> std::optional<float> {
-        for (auto position = relevantEffectKeyPositions.rbegin();
-             position != relevantEffectKeyPositions.rend();
-             ++position) {
-            if (*position <
-                scrubPosition -
-                    invisible_places::timing::
-                        kTimingColouriseKeyTolerance) {
-                return *position;
+    std::vector<float> relevantWaterKeyPositions;
+    if (timeline != nullptr) {
+        for (const auto& setting : timeline->settings) {
+            if (!setting.active) {
+                continue;
+            }
+            for (const auto& key : setting.keys) {
+                relevantWaterKeyPositions.push_back(key.position);
+            }
+        }
+    }
+    const auto occurrences = TimingTrackCameraOccurrences(
+        *runtimeState,
+        colouriseEffect != nullptr
+            ? std::span<const float>{relevantEffectKeyPositions}
+            : std::span<const float>{relevantWaterKeyPositions});
+    const float cameraScrub = std::clamp(panel.scrubAmount, 0.0F, 1.0F);
+    const auto previous = [&]()
+        -> std::optional<TimingTrackCameraOccurrence> {
+        for (auto occurrence = occurrences.rbegin();
+             occurrence != occurrences.rend();
+             ++occurrence) {
+            if (occurrence->cameraPosition < cameraScrub - 1.0e-4F) {
+                return *occurrence;
             }
         }
         return std::nullopt;
     }();
-    const auto nextEffectKey = [&]() -> std::optional<float> {
-        for (const float position : relevantEffectKeyPositions) {
-            if (position >
-                scrubPosition +
-                    invisible_places::timing::
-                        kTimingColouriseKeyTolerance) {
-                return position;
+    const auto next = [&]()
+        -> std::optional<TimingTrackCameraOccurrence> {
+        for (const auto& occurrence : occurrences) {
+            if (occurrence.cameraPosition > cameraScrub + 1.0e-4F) {
+                return occurrence;
             }
         }
         return std::nullopt;
     }();
-    const auto previous =
-        colouriseEffect != nullptr
-            ? previousEffectKey
-        : timeline != nullptr
-            ? invisible_places::water::PreviousWaterFeatureKeyPosition(
-                  *timeline,
-                  scrubPosition)
-            : std::nullopt;
-    const auto next =
-        colouriseEffect != nullptr
-            ? nextEffectKey
-        : timeline != nullptr
-            ? invisible_places::water::NextWaterFeatureKeyPosition(
-                  *timeline,
-                  scrubPosition)
-            : std::nullopt;
     const std::size_t currentFeatureKeyCount =
         colouriseEffect != nullptr
             ? TimingEffectRelevantKeyCountAtPosition(
@@ -94490,9 +95244,7 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
     ImGui::SameLine(0.0F, navigationGap);
     ImGui::BeginDisabled(!previous.has_value());
     if (ImGui::SmallButton("<")) {
-        SetCurrentAnimationPositionFromAuthoredTrack(
-            runtimeState,
-            previous.value());
+        panel.scrubAmount = previous->cameraPosition;
         ApplyAnimationScrub(runtimeState);
     }
     ImGui::EndDisabled();
@@ -94523,9 +95275,7 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
     ImGui::SameLine(0.0F, 2.0F);
     ImGui::BeginDisabled(!next.has_value());
     if (ImGui::SmallButton(">")) {
-        SetCurrentAnimationPositionFromAuthoredTrack(
-            runtimeState,
-            next.value());
+        panel.scrubAmount = next->cameraPosition;
         ApplyAnimationScrub(runtimeState);
     }
     ImGui::EndDisabled();
@@ -95075,6 +95825,16 @@ void DrawControlsWindow(
     const std::string fpsLabel =
         "FPS (" + FormatFixed(diagnostics.frameAverageWindowSeconds, 1) + "s): " +
         FormatFixed(renderFps, 1) + "  " + previewStatus;
+    ImGui::BeginDisabled(
+        reciprocalPanWizardActive || liveCameraEditActive);
+    DrawLinkedSeamedViewHeaderControls(runtimeState);
+    ImGui::EndDisabled();
+    if (runtimeState->animationPanel.requestedSharedTimingLoop.has_value()) {
+        const auto requested =
+            runtimeState->animationPanel.requestedSharedTimingLoop.value();
+        runtimeState->animationPanel.requestedSharedTimingLoop.reset();
+        (void)ApplySharedTimingLoopToLinkedPair(runtimeState, requested);
+    }
     if (runtimeState->animationPanel.currentPath.has_value()) {
         ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted("Global Animation Position");
@@ -96844,7 +97604,8 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                                *activeColouriseEffects,
                                session.scalarFields,
                                session.hasNormals,
-                               waterFrame.normalizedTime)
+                               waterFrame.normalizedTime,
+                               waterFrame.timingIsCyclic)
                          : invisible_places::renderer::pointcloud::
                            ResolvedTimingColouriseStack{},
                  .scalarFields = session.scalarFields,
@@ -104047,7 +104808,8 @@ std::optional<WaterIntegrationCapturedFrame> RenderWaterIntegrationOfflineCompar
                           *timingColouriseEffects,
                           session.scalarFields,
                           session.hasNormals,
-                          frameState.normalizedTime)
+                          frameState.normalizedTime,
+                          frameState.timingIsCyclic)
                     : invisible_places::renderer::
                           pointcloud::
                               ResolvedTimingColouriseStack{},
@@ -109767,64 +110529,27 @@ int Application::Run(ApplicationRunOptions options) const {
                                     .viewProjection,
                             };
                         const float splitCenter =
-                            linkedView.overlapEnabled
-                            ? 0.5F
-                            : (linkedSeamedComparison
-                                       ->trackedAnchorsValid
-                                   ? AnimationFeatureSplitCentreNormalized(
-                                         linkedSeamedComparison
-                                             ->trackedAnchors,
-                                         comparisonMatrices.value(),
-                                         uiViewportWidth,
-                                         linkedView.splitOffsetPixels[
-                                             linkedSeamedComparison
-                                                 ->orderedSeamIndex])
-                                   : linkedSeamedComparison
-                                         ->splitCenterNormalized);
-                        const bool currentIsOrderedFirst =
-                            PathsLexicallyEqual(
-                                std::filesystem::path{
-                                    runtimeState.animationPanel
-                                        .currentFilePath},
-                                linkedView.orderedFilePaths[0U]);
+                            linkedSeamedComparison->trackedAnchorsValid
+                                ? AnimationFeatureSplitCentreNormalized(
+                                      linkedSeamedComparison
+                                          ->trackedAnchors,
+                                      comparisonMatrices.value(),
+                                      uiViewportWidth,
+                                      linkedView.splitOffsetPixels[
+                                          linkedSeamedComparison
+                                              ->orderedSeamIndex])
+                                : linkedSeamedComparison
+                                      ->splitCenterNormalized;
                         const bool currentSourcePrimary =
-                            linkedView.overlapEnabled
-                            ? renderer::core::
-                                  CurrentSourceIsSelectedTop(
-                                      currentIsOrderedFirst,
-                                      linkedView
-                                          .orderedFirstSourceOnTop)
-                            : linkedSeamedComparison
-                                  ->currentSourceOnLeft;
-                        const float topOpacity = std::clamp(
-                            linkedView.overlapTopOpacity,
-                            0.0F,
-                            1.0F);
-                        const float currentSourceOpacity =
-                            linkedView.overlapEnabled
-                            ? (currentSourcePrimary
-                                   ? topOpacity
-                                   : 1.0F)
-                            : 0.5F;
-                        const float partnerSourceOpacity =
-                            linkedView.overlapEnabled
-                            ? (currentSourcePrimary
-                                   ? 1.0F
-                                   : topOpacity)
-                            : 0.5F;
+                            linkedSeamedComparison->currentSourceOnLeft;
                         viewport->SetTemporalCameraOverlay(
                             true,
                             renderedSource,
-                            currentSourceOpacity,
-                            partnerSourceOpacity,
+                            0.5F,
+                            0.5F,
                             &viewProjections,
-                            linkedView.overlapEnabled
-                                ? renderer::core::
-                                      TemporalCameraCompositionMode::
-                                          AlphaOver
-                                : renderer::core::
-                                      TemporalCameraCompositionMode::
-                                          Split,
+                            renderer::core::
+                                TemporalCameraCompositionMode::Split,
                             splitCenter,
                             currentSourcePrimary);
                     }

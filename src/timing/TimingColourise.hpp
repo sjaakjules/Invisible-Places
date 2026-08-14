@@ -427,7 +427,8 @@ SanitizeTimingColouriseActivationRange(
 // Combines the persistent enabled toggle with the activation window.
 [[nodiscard]] bool TimingColouriseEffectIsActiveAt(
     const TimingColouriseEffect& effect,
-    float normalizedPosition);
+    float normalizedPosition,
+    bool cyclic = false);
 [[nodiscard]] TimingColouriseEffect SanitizeTimingColouriseEffect(
     TimingColouriseEffect effect);
 [[nodiscard]] TimingColourisePaletteDefinition
@@ -514,7 +515,8 @@ std::size_t MergeLegacyTimingEffectAspects(
 [[nodiscard]] float EvaluateTimingColouriseEffectParameter(
     const TimingColouriseEffect& effect,
     TimingColouriseEffectParameter parameter,
-    float normalizedPosition);
+    float normalizedPosition,
+    bool cyclic = false);
 // Returns the authored Palette Phase delta at an exact key. Between keys it
 // returns the currently evaluated phase relative to the preceding accumulated
 // key target, which makes inserting a key preserve the visible phase.
@@ -523,16 +525,20 @@ std::size_t MergeLegacyTimingEffectAspects(
     float normalizedPosition);
 [[nodiscard]] float EvaluateTimingEmissiveLevel(
     const TimingColouriseEffect& effect,
-    float normalizedPosition);
+    float normalizedPosition,
+    bool cyclic = false);
 [[nodiscard]] TimingColourisePalette EvaluateTimingColourisePalette(
     const TimingColouriseEffect& effect,
-    float normalizedPosition);
+    float normalizedPosition,
+    bool cyclic = false);
 [[nodiscard]] TimingColouriseLut EvaluateTimingColourisePaletteLut(
     const TimingColouriseEffect& effect,
-    float normalizedPosition);
+    float normalizedPosition,
+    bool cyclic = false);
 [[nodiscard]] TimingColouriseBounds EvaluateTimingColouriseBounds(
     const TimingColouriseEffect& effect,
-    float normalizedPosition);
+    float normalizedPosition,
+    bool cyclic = false);
 [[nodiscard]] TimingColouriseLayerSample SampleTimingColouriseLut(
     const TimingColouriseLut& lut,
     float normalizedFieldValue);

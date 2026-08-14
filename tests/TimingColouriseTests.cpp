@@ -183,6 +183,45 @@ TEST_CASE(
         0.5F));
 }
 
+TEST_CASE("Timing Colourise cyclic evaluation interpolates through loop zero",
+          "[timing][colourise][cyclic]") {
+    using invisible_places::timing::TimingColouriseEffectParameter;
+    using invisible_places::water::WaterScenarioInterpolation;
+
+    TimingColouriseEffect effect;
+    effect.emissiveEnabled = true;
+    effect.emissiveLevel = 0.0F;
+    effect.effectParameterKeys = {
+        {.parameter = TimingColouriseEffectParameter::EmissiveLevel,
+         .position = 0.25F,
+         .value = 0.0F,
+         .interpolation = WaterScenarioInterpolation::Smooth},
+        {.parameter = TimingColouriseEffectParameter::EmissiveLevel,
+         .position = 0.75F,
+         .value = 1.0F,
+         .interpolation = WaterScenarioInterpolation::Smooth},
+    };
+    CHECK(invisible_places::timing::EvaluateTimingEmissiveLevel(
+              effect,
+              0.0F) == Approx(0.0F));
+    CHECK(invisible_places::timing::EvaluateTimingEmissiveLevel(
+              effect,
+              0.0F,
+              true) == Approx(0.5F));
+    CHECK(invisible_places::timing::EvaluateTimingEmissiveLevel(
+              effect,
+              1.0F,
+              true) == Approx(0.5F));
+    CHECK(invisible_places::timing::EvaluateTimingEmissiveLevel(
+              effect,
+              -0.1F,
+              true) ==
+          Approx(invisible_places::timing::EvaluateTimingEmissiveLevel(
+              effect,
+              0.9F,
+              true)));
+}
+
 TEST_CASE(
     "Timing Colourise activation boundaries derive from every authored key",
     "[timing][colourise][activation][keys]") {

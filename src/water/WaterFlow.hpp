@@ -434,9 +434,10 @@ struct WaterSeepageNodeAnimationStateEntry {
 };
 
 // Water timing runs are reusable per-feature key sequences authored in the
-// Timings panel. Positions are stored normalized 0..1 along an animation.
-// Camera-tail extension workflows rescale these positions so existing keys
-// retain their absolute frames. Applied runs compile into the owning track's
+// Timings panel. Positions use the active normalized timing domain: one path
+// for an ordinary animation, or the unique cyclic duration for a reciprocal
+// pair. Extension workflows remap existing positions so they retain their
+// intended camera frames. Applied legacy runs compile into the owning track's
 // complete-snapshot keys; runs are never evaluated per frame.
 enum class WaterTimingFeature {
     Shoreline,
@@ -479,11 +480,11 @@ struct WaterScenarioTrack {
 };
 
 // ---- Timings v2: per-feature, per-setting keyframing ----
-// A run groups scene water features whose individual settings are keyed
-// along the linked animation. Positions are stored normalized 0..1; camera-
-// tail extensions rescale them to retain existing absolute frames. Runs are
-// scenario-scoped and evaluated directly per frame; within one scenario a
-// feature belongs to at most one run. Key
+// A run groups scene water features whose individual settings are keyed in
+// the active Timing Take. Positions are normalized 0..1 in its path-local or
+// shared cyclic domain; camera-tail extensions remap them to retain existing
+// camera frames. Runs are scenario-scoped and evaluated directly per frame;
+// within one scenario a feature belongs to at most one run. Key
 // display names are derived ("<run name> <n>" in time order), never stored,
 // so inserting a key between two others renumbers the later ones for free.
 enum class WaterKeyedFeatureKind : std::uint8_t {
@@ -564,8 +565,8 @@ struct WaterKeyedSettingTrack {
 // Project-owned reusable key tracks. Saved profiles are immutable templates;
 // editing an applied profile creates an object-owned `_edited` shadow whose
 // sourceProfileName points back to the saved template for discard/restore.
-// Keys stay normalized to the linked animation (0..1), so a profile can be
-// applied to another Flow Path Source without depending on frame count.
+// Keys stay normalized to their reusable timing domain (0..1), so a profile
+// can be applied to another Flow Path Source without depending on frame count.
 // Captured clip packages additionally record the normalized length of the
 // span they came from, so applying one reproduces its authored duration by
 // default while remaining freely stretchable afterwards.
@@ -581,7 +582,7 @@ struct WaterKeyedSettingsProfile {
     std::vector<WaterKeyedSettingTrack> settings;
 };
 
-// The shortest span a settings clip may occupy, in normalized animation
+// The shortest span a settings clip may occupy, in normalized timing
 // positions. It stays well above the 1e-4 key identity tolerance so a fully
 // shrunk clip still keeps its keys distinct.
 inline constexpr float kWaterFeatureClipMinimumLength = 1.0e-3F;
@@ -591,7 +592,8 @@ inline constexpr float kWaterFeatureClipMinimumLength = 1.0e-3F;
 // carry this clip's id explicitly so overlapping clip windows remain
 // unambiguous. A keyed clip's first and last key define its displayed bounds;
 // an empty clip retains its authored window. Positions are normalized 0..1
-// along the linked animation, exactly like the keys they contain.
+// in the active path-local or shared-loop timing domain, exactly like the keys
+// they contain.
 struct WaterFeatureSettingsClip {
     // Unique within its timeline; zero is never a valid stored id (the UI
     // uses it for the derived loose-keys block).
@@ -681,6 +683,12 @@ ParseWaterKeyedFeatureKindName(std::string_view name);
 [[nodiscard]] std::optional<float> EvaluateWaterKeyedSettingTrack(
     const WaterKeyedSettingTrack& track,
     float normalizedPosition);
+// Whole-loop sampling. The last authored key connects directly to the first;
+// virtual neighbouring copies participate in spline tangents, so no endpoint
+// key is inserted and Smooth/SmoothVelocity behaviour is preserved.
+[[nodiscard]] std::optional<float> EvaluateWaterKeyedSettingTrackCyclic(
+    const WaterKeyedSettingTrack& track,
+    float normalizedLoopPosition);
 // Inserts, or replaces any key within 1e-4 of the position. Passing clipId
 // explicitly attaches (or reattaches) the key; omitting it preserves an
 // existing key's membership and creates a new loose key.
@@ -707,13 +715,15 @@ void AddOrUpdateWaterSettingKey(
 ResolveWaterSettingSplineHandlePoint(
     const WaterKeyedSettingTrack& track,
     float keyPosition,
-    WaterSettingSplineHandleSide side);
+    WaterSettingSplineHandleSide side,
+    bool cyclic = false);
 [[nodiscard]] bool MoveWaterSettingSplineHandlePoint(
     WaterKeyedSettingTrack* track,
     float keyPosition,
     WaterSettingSplineHandleSide side,
     float controlPosition,
-    float controlValue);
+    float controlValue,
+    bool cyclic = false);
 [[nodiscard]] std::size_t WaterSettingKeyCountAtPosition(
     const WaterKeyedSettingTrack& track,
     float position);
@@ -894,7 +904,8 @@ struct WaterFeatureTimingOverlay {
 
 [[nodiscard]] WaterFeatureTimingOverlay BuildWaterFeatureTimingOverlay(
     std::span<const WaterFeatureTimingRun> runs,
-    float normalizedPosition);
+    float normalizedPosition,
+    bool cyclic = false);
 // Applies active singleton "level" samples onto the legacy frame-control
 // carrier (Rain, Mesh Flow, Shoreline). Parsed Seepage/Flow global samples
 // are deliberately ignored.

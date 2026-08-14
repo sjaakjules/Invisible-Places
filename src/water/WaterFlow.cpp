@@ -8843,13 +8843,24 @@ bool AssignWaterFeatureToTimingRun(
     return true;
 }
 
-std::optional<float> EvaluateWaterKeyedSettingTrack(
+namespace {
+
+float WrapNormalizedLoopPosition(float position) {
+    position = SeepageFiniteOr(position, 0.0F);
+    position -= std::floor(position);
+    return position >= 1.0F ? 0.0F : position;
+}
+
+std::optional<float> EvaluateWaterKeyedSettingTrackImpl(
     const WaterKeyedSettingTrack& track,
-    float normalizedPosition) {
+    float normalizedPosition,
+    bool cyclic) {
     if (!track.active || track.keys.empty()) {
         return std::nullopt;
     }
-    normalizedPosition = Clamp01(SeepageFiniteOr(normalizedPosition, 0.0F));
+    normalizedPosition = cyclic
+        ? WrapNormalizedLoopPosition(normalizedPosition)
+        : Clamp01(SeepageFiniteOr(normalizedPosition, 0.0F));
     // TrackDefault keys resolve to the track's default style before any
     // segment math, because the spline segments read neighbouring keys'
     // interpolation to find mode boundaries.
@@ -8859,8 +8870,39 @@ std::optional<float> EvaluateWaterKeyedSettingTrack(
             : track.defaultInterpolation;
     std::vector<WaterSettingKey> resolved = track.keys;
     for (auto& key : resolved) {
+        if (cyclic) {
+            key.position = WrapNormalizedLoopPosition(key.position);
+        }
         if (key.interpolation == WaterScenarioInterpolation::TrackDefault) {
             key.interpolation = trackDefault;
+        }
+    }
+    if (cyclic) {
+        std::stable_sort(
+            resolved.begin(),
+            resolved.end(),
+            [](const WaterSettingKey& left, const WaterSettingKey& right) {
+                return left.position < right.position;
+            });
+        std::vector<WaterSettingKey> canonical;
+        canonical.reserve(resolved.size());
+        for (auto& key : resolved) {
+            if (!canonical.empty() &&
+                std::abs(canonical.back().position - key.position) <=
+                    kWaterKeySplineTolerance) {
+                canonical.back() = std::move(key);
+            } else {
+                canonical.push_back(std::move(key));
+            }
+        }
+        resolved.clear();
+        resolved.reserve(canonical.size() * 3U);
+        for (const float shift : {-1.0F, 0.0F, 1.0F}) {
+            for (const auto& key : canonical) {
+                auto copy = key;
+                copy.position += shift;
+                resolved.push_back(std::move(copy));
+            }
         }
     }
     std::vector<const WaterSettingKey*> ordered;
@@ -8929,6 +8971,26 @@ std::optional<float> EvaluateWaterKeyedSettingTrack(
         return std::lerp(keyValue(left), keyValue(right), amount);
     }
     return keyValue(*ordered.back());
+}
+
+}  // namespace
+
+std::optional<float> EvaluateWaterKeyedSettingTrack(
+    const WaterKeyedSettingTrack& track,
+    float normalizedPosition) {
+    return EvaluateWaterKeyedSettingTrackImpl(
+        track,
+        normalizedPosition,
+        false);
+}
+
+std::optional<float> EvaluateWaterKeyedSettingTrackCyclic(
+    const WaterKeyedSettingTrack& track,
+    float normalizedLoopPosition) {
+    return EvaluateWaterKeyedSettingTrackImpl(
+        track,
+        normalizedLoopPosition,
+        true);
 }
 
 void AddOrUpdateWaterSettingKey(
@@ -9019,7 +9081,8 @@ std::optional<WaterSettingSplineHandlePoint>
 ResolveWaterSettingSplineHandlePoint(
     const WaterKeyedSettingTrack& track,
     float keyPosition,
-    WaterSettingSplineHandleSide side) {
+    WaterSettingSplineHandleSide side,
+    bool cyclic) {
     if (!std::isfinite(keyPosition) || track.keys.size() < 2U) {
         return std::nullopt;
     }
@@ -9049,24 +9112,42 @@ ResolveWaterSettingSplineHandlePoint(
     const WaterSettingKey* left = nullptr;
     const WaterSettingKey* right = nullptr;
     const WaterSettingKey* anchor = *selected;
+    float leftPosition = 0.0F;
+    float rightPosition = 0.0F;
     if (side == WaterSettingSplineHandleSide::Outgoing) {
-        if (index + 1U >= ordered.size() ||
-            ResolveWaterSettingInterpolation(track, **selected) !=
+        if (ResolveWaterSettingInterpolation(track, **selected) !=
                 WaterScenarioInterpolation::SplineHandles) {
             return std::nullopt;
         }
         left = *selected;
-        right = ordered[index + 1U];
+        leftPosition = left->position;
+        if (index + 1U < ordered.size()) {
+            right = ordered[index + 1U];
+            rightPosition = right->position;
+        } else if (cyclic) {
+            right = ordered.front();
+            rightPosition = right->position + 1.0F;
+        } else {
+            return std::nullopt;
+        }
     } else {
-        if (index == 0U ||
-            ResolveWaterSettingInterpolation(track, *ordered[index - 1U]) !=
+        if (index > 0U) {
+            left = ordered[index - 1U];
+            leftPosition = left->position;
+        } else if (cyclic) {
+            left = ordered.back();
+            leftPosition = left->position - 1.0F;
+        } else {
+            return std::nullopt;
+        }
+        if (ResolveWaterSettingInterpolation(track, *left) !=
                 WaterScenarioInterpolation::SplineHandles) {
             return std::nullopt;
         }
-        left = ordered[index - 1U];
         right = *selected;
+        rightPosition = right->position;
     }
-    const float span = right->position - left->position;
+    const float span = rightPosition - leftPosition;
     if (span <= kWaterKeySplineTolerance) {
         return std::nullopt;
     }
@@ -9077,8 +9158,8 @@ ResolveWaterSettingSplineHandlePoint(
         .anchorValue = anchor->value,
         .controlPosition =
             side == WaterSettingSplineHandleSide::Outgoing
-                ? left->position + span * fractions.outgoing
-                : right->position - span * fractions.incoming,
+                ? leftPosition + span * fractions.outgoing
+                : rightPosition - span * fractions.incoming,
         .controlValue =
             side == WaterSettingSplineHandleSide::Outgoing
                 ? left->value + left->outgoingHandleValue
@@ -9091,7 +9172,8 @@ bool MoveWaterSettingSplineHandlePoint(
     float keyPosition,
     WaterSettingSplineHandleSide side,
     float controlPosition,
-    float controlValue) {
+    float controlValue,
+    bool cyclic) {
     if (track == nullptr || !std::isfinite(keyPosition) ||
         !std::isfinite(controlPosition) || !std::isfinite(controlValue) ||
         track->keys.size() < 2U) {
@@ -9123,24 +9205,42 @@ bool MoveWaterSettingSplineHandlePoint(
     WaterSettingKey* left = nullptr;
     WaterSettingKey* right = nullptr;
     WaterSettingKey* anchor = *selected;
+    float leftPosition = 0.0F;
+    float rightPosition = 0.0F;
     if (side == WaterSettingSplineHandleSide::Outgoing) {
-        if (index + 1U >= ordered.size() ||
-            ResolveWaterSettingInterpolation(*track, **selected) !=
+        if (ResolveWaterSettingInterpolation(*track, **selected) !=
                 WaterScenarioInterpolation::SplineHandles) {
             return false;
         }
         left = *selected;
-        right = ordered[index + 1U];
+        leftPosition = left->position;
+        if (index + 1U < ordered.size()) {
+            right = ordered[index + 1U];
+            rightPosition = right->position;
+        } else if (cyclic) {
+            right = ordered.front();
+            rightPosition = right->position + 1.0F;
+        } else {
+            return false;
+        }
     } else {
-        if (index == 0U ||
-            ResolveWaterSettingInterpolation(*track, *ordered[index - 1U]) !=
+        if (index > 0U) {
+            left = ordered[index - 1U];
+            leftPosition = left->position;
+        } else if (cyclic) {
+            left = ordered.back();
+            leftPosition = left->position - 1.0F;
+        } else {
+            return false;
+        }
+        if (ResolveWaterSettingInterpolation(*track, *left) !=
                 WaterScenarioInterpolation::SplineHandles) {
             return false;
         }
-        left = ordered[index - 1U];
         right = *selected;
+        rightPosition = right->position;
     }
-    const float span = right->position - left->position;
+    const float span = rightPosition - leftPosition;
     if (span <= kWaterKeySplineTolerance) {
         return false;
     }
@@ -9154,7 +9254,7 @@ bool MoveWaterSettingSplineHandlePoint(
         const float maximumFraction =
             kWaterSettingSplineHandleMaximumPair - fractions.incoming;
         left->outgoingHandleTime = std::clamp(
-            (controlPosition - left->position) / span,
+            (controlPosition - leftPosition) / span,
             kWaterSettingSplineHandleMinimumFraction,
             maximumFraction);
         left->outgoingHandleValue = controlValue - anchor->value;
@@ -9162,7 +9262,7 @@ bool MoveWaterSettingSplineHandlePoint(
         const float maximumFraction =
             kWaterSettingSplineHandleMaximumPair - fractions.outgoing;
         right->incomingHandleTime = std::clamp(
-            (right->position - controlPosition) / span,
+            (rightPosition - controlPosition) / span,
             kWaterSettingSplineHandleMinimumFraction,
             maximumFraction);
         right->incomingHandleValue = controlValue - anchor->value;
@@ -10164,7 +10264,8 @@ const float* WaterFeatureTimingOverlay::Find(
 
 WaterFeatureTimingOverlay BuildWaterFeatureTimingOverlay(
     std::span<const WaterFeatureTimingRun> runs,
-    float normalizedPosition) {
+    float normalizedPosition,
+    bool cyclic) {
     WaterFeatureTimingOverlay overlay;
     for (const auto& run : runs) {
         if (!run.enabled) {
@@ -10172,9 +10273,13 @@ WaterFeatureTimingOverlay BuildWaterFeatureTimingOverlay(
         }
         for (const auto& timeline : run.features) {
             for (const auto& setting : timeline.settings) {
-                const auto value = EvaluateWaterKeyedSettingTrack(
-                    setting,
-                    normalizedPosition);
+                const auto value = cyclic
+                    ? EvaluateWaterKeyedSettingTrackCyclic(
+                          setting,
+                          normalizedPosition)
+                    : EvaluateWaterKeyedSettingTrack(
+                          setting,
+                          normalizedPosition);
                 if (!value.has_value()) {
                     continue;
                 }

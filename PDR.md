@@ -316,14 +316,15 @@ shall pass through the aligned midpoint at 50% overlap progress, retain one
 artistic pixel offset per physical seam when the loaded A/B role reverses, and
 fall back to the ordinary single-animation view outside the overlap.
 
-While **Seamed View** is enabled, an adjacent **Overlap** control shall replace
-the hard split with complete-frame straight-alpha source-over composition. The
-user shall be able to select which animation is on top by stable filename and
-adjust a top-opacity multiplier without discarding either frame's per-pixel
-alpha. Switching the loaded A/B member shall not reverse the selected layer
-order. Disabling Overlap shall restore the feature-following hard split and its
-saved in-session seam offsets; outside the linked overlap bands the viewport
-shall remain a normal single-animation view.
+The linked-view controls shall appear above Global Animation Position. A
+reciprocal pair shall use one shared Timing Take over its unique cyclic
+duration while each member retains its own local camera timeline. Local live
+and export evaluation shall map through the member's signed loop window and
+shall use virtual adjacent-cycle keys so boundary values and derivatives retain
+the authored Hold, Linear, Smooth Step, Smooth Velocity, Catmull-Rom, or manual
+spline behavior. Camera position selects keyed settings only; procedural
+Water, Rain, and trail motion shall continue on their independent live or
+deterministic export clocks.
 
 ### 5.4 Side Panel Behaviour
 #### FR-UI-1

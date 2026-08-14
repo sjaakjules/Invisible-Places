@@ -704,6 +704,86 @@ TEST_CASE("Keyed setting tracks hold endpoints and step at exact Hold keys",
           Approx(0.2F));
 }
 
+TEST_CASE("Cyclic keyed settings use virtual neighbours across the loop seam",
+          "[water][timing][keyed][cyclic]") {
+    using Catch::Approx;
+    using invisible_places::water::EvaluateWaterKeyedSettingTrack;
+    using invisible_places::water::EvaluateWaterKeyedSettingTrackCyclic;
+    using invisible_places::water::WaterKeyedSettingTrack;
+    using invisible_places::water::WaterScenarioInterpolation;
+
+    WaterKeyedSettingTrack smooth;
+    smooth.settingId = "rain.level";
+    smooth.keys = {
+        {.position = 0.25F,
+         .value = 0.0F,
+         .interpolation = WaterScenarioInterpolation::Smooth},
+        {.position = 0.75F,
+         .value = 1.0F,
+         .interpolation = WaterScenarioInterpolation::Smooth},
+    };
+    CHECK(EvaluateWaterKeyedSettingTrack(smooth, 0.0F).value() ==
+          Approx(0.0F));
+    CHECK(EvaluateWaterKeyedSettingTrackCyclic(smooth, 0.0F).value() ==
+          Approx(0.5F));
+    CHECK(EvaluateWaterKeyedSettingTrackCyclic(smooth, 1.0F).value() ==
+          Approx(0.5F));
+    CHECK(EvaluateWaterKeyedSettingTrackCyclic(smooth, -0.1F).value() ==
+          Approx(EvaluateWaterKeyedSettingTrackCyclic(smooth, 0.9F).value()));
+    // Loop zero is only a camera-window boundary, not an authored key. The
+    // virtual 0.75 -> 1.25 Smooth Step segment therefore crosses it with the
+    // same non-zero derivative on both sides instead of slowing to rest.
+    constexpr float epsilon = 1.0e-3F;
+    const float beforeZero =
+        EvaluateWaterKeyedSettingTrackCyclic(smooth, -epsilon).value();
+    const float atZero =
+        EvaluateWaterKeyedSettingTrackCyclic(smooth, 0.0F).value();
+    const float afterZero =
+        EvaluateWaterKeyedSettingTrackCyclic(smooth, epsilon).value();
+    const float incomingRate = (atZero - beforeZero) / epsilon;
+    const float outgoingRate = (afterZero - atZero) / epsilon;
+    CHECK(incomingRate == Approx(outgoingRate).margin(0.02F));
+    CHECK(std::abs(incomingRate) > 1.0F);
+
+    WaterKeyedSettingTrack hold = smooth;
+    hold.keys[0U].interpolation = WaterScenarioInterpolation::Hold;
+    hold.keys[1U].interpolation = WaterScenarioInterpolation::Hold;
+    CHECK(EvaluateWaterKeyedSettingTrackCyclic(hold, 0.0F).value() ==
+          Approx(1.0F));
+    CHECK(EvaluateWaterKeyedSettingTrackCyclic(hold, 0.25F).value() ==
+          Approx(0.0F));
+
+    WaterKeyedSettingTrack handles = smooth;
+    for (auto& key : handles.keys) {
+        key.interpolation = WaterScenarioInterpolation::SplineHandles;
+    }
+    CHECK_FALSE(invisible_places::water::
+                    ResolveWaterSettingSplineHandlePoint(
+                        handles,
+                        0.25F,
+                        invisible_places::water::
+                            WaterSettingSplineHandleSide::Incoming)
+                    .has_value());
+    const auto cyclicIncoming = invisible_places::water::
+        ResolveWaterSettingSplineHandlePoint(
+            handles,
+            0.25F,
+            invisible_places::water::
+                WaterSettingSplineHandleSide::Incoming,
+            true);
+    const auto cyclicOutgoing = invisible_places::water::
+        ResolveWaterSettingSplineHandlePoint(
+            handles,
+            0.75F,
+            invisible_places::water::
+                WaterSettingSplineHandleSide::Outgoing,
+            true);
+    REQUIRE(cyclicIncoming.has_value());
+    REQUIRE(cyclicOutgoing.has_value());
+    CHECK(cyclicIncoming->controlPosition == Approx(1.0F / 12.0F));
+    CHECK(cyclicOutgoing->controlPosition == Approx(11.0F / 12.0F));
+}
+
 TEST_CASE("Keyed setting interpolation retains precision beyond UI display",
           "[water][timing][keyed][precision]") {
     using invisible_places::water::AddOrUpdateWaterSettingKey;

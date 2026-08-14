@@ -2573,6 +2573,8 @@ json SerializeAnimationVelocityBlendLink(
         {"end_overlap_seconds", link.endOverlapSeconds},
         {"horizontal_blend", link.horizontalBlend},
         {"pan_right", link.panRight},
+        {"timing_cycle_frames", link.timingCycleFrames},
+        {"timing_window_start_frame", link.timingWindowStartFrame},
         {"movable_key_ids", link.movableKeyIds},
     };
     return linkJson;
@@ -2604,6 +2606,10 @@ ParseAnimationVelocityBlendLink(const json& linkJson) {
     link.horizontalBlend =
         linkJson.value("horizontal_blend", false);
     link.panRight = linkJson.value("pan_right", true);
+    link.timingCycleFrames =
+        linkJson.value("timing_cycle_frames", 0U);
+    link.timingWindowStartFrame =
+        linkJson.value("timing_window_start_frame", std::int64_t{0});
     if (linkJson.contains("movable_key_ids") &&
         linkJson.at("movable_key_ids").is_array()) {
         std::unordered_set<std::string> uniqueIds;

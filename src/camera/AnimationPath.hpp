@@ -137,7 +137,19 @@ struct AnimationVelocityBlendLinkMetadata {
     // leftward pan mirrors those regions.
     bool horizontalBlend = false;
     bool panRight = true;
+    // Optional shared keyed-effect clock for a reciprocal pair. Both members
+    // store the same cycle length and Timing Take id; windowStartFrame places
+    // this path's local frame zero on an unwrapped copy of that cycle. A zero
+    // cycle retains the legacy path-local 0..1 timing domain.
+    std::uint32_t timingCycleFrames = 0U;
+    std::int64_t timingWindowStartFrame = 0;
     std::vector<std::string> movableKeyIds;
+};
+
+struct AnimationTimingLoopWindow {
+    std::uint32_t cycleFrames = 0U;
+    std::int64_t startFrame = 0;
+    std::uint32_t durationFrames = 0U;
 };
 
 struct AnimationLinkedSeamSample {
@@ -153,7 +165,7 @@ struct AnimationLinkedSeamSample {
 struct AnimationPath {
     // Original file schema retained only for application-level migration
     // bookkeeping. Serialization always writes the current schema.
-    std::uint32_t sourceSchemaVersion = 23U;
+    std::uint32_t sourceSchemaVersion = 24U;
     std::string name = "Animation";
     std::uint32_t durationFrames = 180;
     // Deprecated schema-22 migration marker. A nonzero value identifies the
@@ -833,6 +845,24 @@ ResolveAnimationLinkedSeamSample(
     const AnimationPath& current,
     const AnimationPath& partner,
     float currentNormalizedPosition);
+// Resolves the persisted whole-loop keyed-effect window. Mapping stays in
+// integer 30 fps frames so reciprocal paths agree exactly at both overlaps.
+[[nodiscard]] std::optional<AnimationTimingLoopWindow>
+ResolveAnimationTimingLoopWindow(const AnimationPath& path);
+[[nodiscard]] float AnimationLocalToTimingLoopPosition(
+    const AnimationPath& path,
+    float localNormalizedPosition);
+// A loop phase can occur zero, one, or (for unusually long overlap windows)
+// several times inside a local animation. Results are local 0..1 positions.
+[[nodiscard]] std::vector<float> AnimationTimingLoopPositionToLocalPositions(
+    const AnimationPath& path,
+    float loopNormalizedPosition);
+// Assigns one canonical shared clock to a validated reciprocal pair. `first`
+// begins at loop frame zero; `second` begins where first's end overlap starts.
+// Existing camera, timing keys, and selected Timing Take ids are untouched.
+[[nodiscard]] bool ConfigureAnimationReciprocalTimingLoopWindows(
+    AnimationPath* first,
+    AnimationPath* second);
 [[nodiscard]] PreparedAnimationPathEvaluationContext PrepareAnimationPathEvaluation(
     const AnimationPath& path);
 [[nodiscard]] AnimationPathEvaluation EvaluatePreparedAnimationPath(

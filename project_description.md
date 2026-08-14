@@ -412,13 +412,15 @@ ending path is always left and the starting path right; switching which file
 is loaded preserves the physical seam and its artistic pixel offset. Outside
 an overlap, live view returns to the ordinary current animation.
 
-An adjacent **Overlap** option replaces the hard boundary with complete-frame
-source-over composition while the playhead remains inside either saved overlap
-band. The bottom animation retains its full per-pixel alpha, and **Top opacity**
-multiplies rather than replaces the chosen top animation's authored alpha. A
-filename-based **Top animation** selector keeps the layer order stable when the
-loaded A/B role is switched. Turning Overlap off restores the feature-following
-split and its independent seam offsets.
+The linked-view controls live above Global Animation Position. Both reciprocal
+members can share one Timing Take over the complete unique loop while retaining
+their own local camera timelines. Each animation stores a signed window into
+that loop; ordinary A-only or B-only rendering maps its local frame into the
+shared cycle. Evaluators expose virtual previous/next-cycle neighbours, rather
+than adding artificial endpoint keys, so Smooth Step and manual spline motion
+do not decelerate at a path boundary and Rain can be authored continuously over
+the whole loop. Global Animation Position remains a camera control only;
+procedural waves, Rain, and trails keep advancing independently.
 
 Camera duration grows on the same 30 fps timebase. Every normalized timing,
 water, and visual-effect key or finite activation boundary is shifted by the
