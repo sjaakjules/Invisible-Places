@@ -2522,6 +2522,255 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Timing Take merge preserves water clips curves and state-local run identity",
+    "[timing][water][linked-loop][merge]") {
+    using invisible_places::timing::MergeTimingTakeSceneStateKeepingFirst;
+    using invisible_places::timing::TimingTakeSceneState;
+    using invisible_places::water::WaterFeatureTimeline;
+    using invisible_places::water::WaterFeatureTimingRun;
+    using invisible_places::water::WaterKeyedFeatureKind;
+
+    const invisible_places::water::WaterKeyedFeatureId seepageId{
+        .kind = WaterKeyedFeatureKind::SeepageNode,
+        .objectId = 20U};
+    const invisible_places::water::WaterKeyedFeatureId flowPathId{
+        .kind = WaterKeyedFeatureKind::FlowPath,
+        .objectId = 44U};
+
+    WaterFeatureTimeline firstSeepage{
+        .feature = seepageId,
+        .settings = {{
+            .settingId = "strength",
+            .defaultInterpolation =
+                WaterScenarioInterpolation::Smooth,
+            .keys = {
+                {.position = 0.10F, .value = 0.0F, .clipId = 7U},
+                {.position = 0.30F, .value = 1.0F, .clipId = 7U},
+            },
+        }},
+        .clips = {{
+            .id = 7U,
+            .name = "First clip",
+            .start = 0.10F,
+            .end = 0.30F,
+        }},
+        .clipMembershipExplicit = true,
+    };
+    WaterFeatureTimeline legacyDuplicate{
+        .feature = seepageId,
+        .settings = {{
+            .settingId = "source_width",
+            .keys = {
+                {.position = 0.35F, .value = 0.01F, .clipId = 7U},
+                {.position = 0.45F, .value = 0.20F, .clipId = 7U},
+            },
+        }},
+        .clips = {{
+            .id = 7U,
+            .name = "Legacy duplicate clip",
+            .start = 0.35F,
+            .end = 0.45F,
+        }},
+        .clipMembershipExplicit = true,
+    };
+    TimingTakeSceneState destination;
+    destination.waterFeatureTimingRunSequence = 2U;
+    destination.waterFeatureTimingRuns = {
+        WaterFeatureTimingRun{
+            .id = 1U,
+            .name = "First loop",
+            .enabled = false,
+            .features = {std::move(firstSeepage)},
+        },
+        // Historical output could contain both a duplicate id and duplicate
+        // feature assignment. The merge repairs both while keeping this run.
+        WaterFeatureTimingRun{
+            .id = 1U,
+            .name = "Legacy run",
+            .enabled = true,
+            .features = {std::move(legacyDuplicate)},
+        },
+    };
+
+    WaterFeatureTimeline secondSeepage{
+        .feature = seepageId,
+        .settings = {{
+            .settingId = "strength",
+            .defaultInterpolation =
+                WaterScenarioInterpolation::SmoothVelocity,
+            .keys = {
+                // This collision must retain the first loop's value.
+                {.position = 0.30F, .value = 9.0F, .clipId = 7U},
+                {.position = 0.60F, .value = 0.2F, .clipId = 7U},
+                {.position = 0.80F, .value = 0.9F, .clipId = 7U},
+            },
+        }},
+        .clips = {{
+            .id = 7U,
+            .name = "Second clip",
+            .start = 0.30F,
+            .end = 0.80F,
+        }},
+        .clipMembershipExplicit = true,
+    };
+    WaterFeatureTimeline secondFlowPath{
+        .feature = flowPathId,
+        .settings = {{
+            .settingId = "strength",
+            .keys = {
+                {.position = 0.55F, .value = 0.0F, .clipId = 7U},
+                {.position = 0.75F, .value = 0.8F, .clipId = 7U},
+            },
+        }},
+        .clips = {{
+            .id = 7U,
+            .name = "Flow clip",
+            .start = 0.55F,
+            .end = 0.75F,
+        }},
+        .clipMembershipExplicit = true,
+    };
+    TimingTakeSceneState source;
+    source.waterFeatureTimingRunSequence = 2U;
+    source.waterFeatureTimingRuns = {
+        {
+            .id = 1U,
+            .name = "Second loop",
+            .enabled = false,
+            .features = {
+                std::move(secondSeepage),
+                std::move(secondFlowPath),
+            },
+        },
+        {
+            .id = 5U,
+            .name = "Shared feature only",
+            .enabled = false,
+            .features = {{
+                .feature = seepageId,
+                .settings = {{
+                    .settingId = "prominence",
+                    .keys = {{.position = 0.90F, .value = 0.4F}},
+                }},
+            }},
+        },
+    };
+
+    MergeTimingTakeSceneStateKeepingFirst(&destination, source);
+
+    REQUIRE(destination.waterFeatureTimingRuns.size() == 4U);
+    std::vector<std::uint32_t> runIds;
+    for (const auto& run : destination.waterFeatureTimingRuns) {
+        CHECK(run.id != 0U);
+        runIds.push_back(run.id);
+    }
+    std::ranges::sort(runIds);
+    CHECK(std::adjacent_find(runIds.begin(), runIds.end()) == runIds.end());
+    CHECK(destination.waterFeatureTimingRunSequence > runIds.back());
+
+    const auto secondRun = std::find_if(
+        destination.waterFeatureTimingRuns.begin(),
+        destination.waterFeatureTimingRuns.end(),
+        [](const auto& run) { return run.name == "Second loop"; });
+    REQUIRE(secondRun != destination.waterFeatureTimingRuns.end());
+    CHECK(secondRun->id != 1U);
+    REQUIRE(secondRun->features.size() == 1U);
+    CHECK(secondRun->features.front().feature == flowPathId);
+    REQUIRE(secondRun->features.front().clips.size() == 1U);
+    // A non-colliding state-local clip id can be retained.
+    CHECK(secondRun->features.front().clips.front().id == 7U);
+    for (const auto& key :
+         secondRun->features.front().settings.front().keys) {
+        CHECK(key.clipId == 7U);
+    }
+
+    const auto sharedOnlyRun = std::find_if(
+        destination.waterFeatureTimingRuns.begin(),
+        destination.waterFeatureTimingRuns.end(),
+        [](const auto& run) {
+            return run.name == "Shared feature only";
+        });
+    REQUIRE(sharedOnlyRun != destination.waterFeatureTimingRuns.end());
+    CHECK(sharedOnlyRun->features.empty());
+
+    const WaterFeatureTimeline* mergedSeepage = nullptr;
+    std::size_t seepageAssignments = 0U;
+    for (const auto& run : destination.waterFeatureTimingRuns) {
+        for (const auto& feature : run.features) {
+            if (feature.feature == seepageId) {
+                ++seepageAssignments;
+                mergedSeepage = &feature;
+                CHECK(run.enabled);
+            }
+        }
+    }
+    REQUIRE(seepageAssignments == 1U);
+    REQUIRE(mergedSeepage != nullptr);
+    REQUIRE(mergedSeepage->clips.size() == 3U);
+    std::vector<std::uint32_t> clipIds;
+    for (const auto& clip : mergedSeepage->clips) {
+        clipIds.push_back(clip.id);
+    }
+    std::ranges::sort(clipIds);
+    CHECK(std::adjacent_find(clipIds.begin(), clipIds.end()) ==
+          clipIds.end());
+
+    const auto secondClip = std::find_if(
+        mergedSeepage->clips.begin(),
+        mergedSeepage->clips.end(),
+        [](const auto& clip) { return clip.name == "Second clip"; });
+    REQUIRE(secondClip != mergedSeepage->clips.end());
+    CHECK(secondClip->id != 7U);
+    CHECK(secondClip->start == Approx(0.60F));
+    CHECK(secondClip->end == Approx(0.80F));
+
+    const auto strength = std::find_if(
+        mergedSeepage->settings.begin(),
+        mergedSeepage->settings.end(),
+        [](const auto& track) { return track.settingId == "strength"; });
+    REQUIRE(strength != mergedSeepage->settings.end());
+    CHECK(strength->defaultInterpolation ==
+          WaterScenarioInterpolation::Smooth);
+    REQUIRE(strength->keys.size() == 4U);
+    const auto collision = std::find_if(
+        strength->keys.begin(),
+        strength->keys.end(),
+        [](const auto& key) {
+            return std::abs(key.position - 0.30F) <= 1.0e-5F;
+        });
+    REQUIRE(collision != strength->keys.end());
+    CHECK(collision->value == Approx(1.0F));
+    for (const auto& key : strength->keys) {
+        if (key.position < 0.60F) {
+            continue;
+        }
+        CHECK(key.clipId == secondClip->id);
+        // TrackDefault must not inherit the first loop's Smooth mode.
+        CHECK(key.interpolation ==
+              WaterScenarioInterpolation::SmoothVelocity);
+    }
+
+    const auto sourceWidth = std::find_if(
+        mergedSeepage->settings.begin(),
+        mergedSeepage->settings.end(),
+        [](const auto& track) {
+            return track.settingId == "source_width";
+        });
+    REQUIRE(sourceWidth != mergedSeepage->settings.end());
+    REQUIRE(sourceWidth->keys.size() == 2U);
+    CHECK(sourceWidth->keys.front().clipId != 7U);
+    CHECK(sourceWidth->keys.front().clipId ==
+          sourceWidth->keys.back().clipId);
+    CHECK(std::any_of(
+        mergedSeepage->settings.begin(),
+        mergedSeepage->settings.end(),
+        [](const auto& track) {
+            return track.settingId == "prominence" &&
+                   track.keys.size() == 1U;
+        }));
+}
+
+TEST_CASE(
     "Timing Colourise phase keys are relative one-turn deltas and split cleanly on insertion",
     "[timing][colourise][palette][phase][relative]") {
     TimingColouriseEffect effect;

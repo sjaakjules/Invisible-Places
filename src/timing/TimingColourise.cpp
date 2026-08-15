@@ -2278,6 +2278,409 @@ bool RetimeTimingTakeSceneStateNormalizedPositions(
     return true;
 }
 
+namespace {
+
+template <typename Key, typename SameLane>
+void MergeTimingKeysKeepingFirst(
+    std::vector<Key>* destination,
+    const std::vector<Key>& source,
+    SameLane sameLane) {
+    if (destination == nullptr) {
+        return;
+    }
+    for (const auto& key : source) {
+        const bool occupied = std::any_of(
+            destination->begin(),
+            destination->end(),
+            [&](const Key& existing) {
+                return sameLane(existing, key) &&
+                       std::abs(existing.position - key.position) <=
+                           kTimingColouriseKeyTolerance;
+            });
+        if (!occupied) {
+            destination->push_back(key);
+        }
+    }
+}
+
+invisible_places::water::WaterScenarioInterpolation
+ConcreteWaterTrackDefault(
+    const invisible_places::water::WaterKeyedSettingTrack& track) {
+    return track.defaultInterpolation ==
+                   invisible_places::water::
+                       WaterScenarioInterpolation::TrackDefault
+               ? invisible_places::water::
+                     WaterScenarioInterpolation::SmoothVelocity
+               : track.defaultInterpolation;
+}
+
+void MergeWaterFeatureTimelineKeepingFirst(
+    invisible_places::water::WaterFeatureTimeline* destination,
+    const invisible_places::water::WaterFeatureTimeline& source) {
+    using invisible_places::water::WaterKeyedSettingTrack;
+    using invisible_places::water::WaterScenarioInterpolation;
+    if (destination == nullptr ||
+        destination->feature != source.feature) {
+        return;
+    }
+
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> clipIdMap;
+    clipIdMap.reserve(source.clips.size());
+    std::vector<std::uint32_t> appendedClipIds;
+    appendedClipIds.reserve(source.clips.size());
+    for (const auto& sourceClip : source.clips) {
+        auto copied = sourceClip;
+        const bool idUnavailable =
+            copied.id == 0U ||
+            std::any_of(
+                destination->clips.begin(),
+                destination->clips.end(),
+                [&](const auto& existing) {
+                    return existing.id == copied.id;
+                });
+        if (idUnavailable) {
+            copied.id =
+                invisible_places::water::AllocateWaterFeatureClipId(
+                    *destination);
+        }
+        clipIdMap.emplace_back(sourceClip.id, copied.id);
+        appendedClipIds.push_back(copied.id);
+        destination->clips.push_back(std::move(copied));
+    }
+    const auto remapClipId = [&](std::uint32_t sourceId) {
+        if (sourceId == 0U) {
+            return 0U;
+        }
+        const auto mapped = std::find_if(
+            clipIdMap.begin(),
+            clipIdMap.end(),
+            [&](const auto& entry) {
+                return entry.first == sourceId;
+            });
+        return mapped != clipIdMap.end() ? mapped->second : 0U;
+    };
+
+    for (const auto& sourceSetting : source.settings) {
+        auto destinationSetting = std::find_if(
+            destination->settings.begin(),
+            destination->settings.end(),
+            [&](const WaterKeyedSettingTrack& setting) {
+                return setting.settingId == sourceSetting.settingId;
+            });
+        if (destinationSetting == destination->settings.end()) {
+            auto copied = sourceSetting;
+            for (auto& key : copied.keys) {
+                key.clipId = remapClipId(key.clipId);
+            }
+            destination->settings.push_back(std::move(copied));
+            continue;
+        }
+
+        destinationSetting->active =
+            destinationSetting->active || sourceSetting.active;
+        const bool differingDefaults =
+            ConcreteWaterTrackDefault(*destinationSetting) !=
+            ConcreteWaterTrackDefault(sourceSetting);
+        for (auto key : sourceSetting.keys) {
+            const bool occupied = std::any_of(
+                destinationSetting->keys.begin(),
+                destinationSetting->keys.end(),
+                [&](const auto& existing) {
+                    return std::abs(existing.position - key.position) <=
+                           kTimingColouriseKeyTolerance;
+                });
+            if (occupied) {
+                continue;
+            }
+            key.clipId = remapClipId(key.clipId);
+            if (differingDefaults &&
+                key.interpolation ==
+                    WaterScenarioInterpolation::TrackDefault) {
+                key.interpolation =
+                    ConcreteWaterTrackDefault(sourceSetting);
+            }
+            destinationSetting->keys.push_back(std::move(key));
+        }
+        std::stable_sort(
+            destinationSetting->keys.begin(),
+            destinationSetting->keys.end(),
+            [](const auto& left, const auto& right) {
+                return left.position < right.position;
+            });
+    }
+    destination->clipMembershipExplicit =
+        destination->clipMembershipExplicit ||
+        source.clipMembershipExplicit || !source.clips.empty();
+    for (const auto clipId : appendedClipIds) {
+        (void)invisible_places::water::SynchronizeWaterFeatureClipBounds(
+            destination,
+            clipId);
+    }
+}
+
+std::uint32_t AllocateMergedWaterRunId(
+    TimingTakeSceneState* destination,
+    std::uint32_t preferred) {
+    const auto used = [&](std::uint32_t id) {
+        return id == 0U || std::any_of(
+            destination->waterFeatureTimingRuns.begin(),
+            destination->waterFeatureTimingRuns.end(),
+            [&](const auto& run) { return run.id == id; });
+    };
+    if (!used(preferred)) {
+        return preferred;
+    }
+    std::uint32_t candidate = std::max(
+        1U,
+        destination->waterFeatureTimingRunSequence);
+    while (used(candidate)) {
+        ++candidate;
+    }
+    destination->waterFeatureTimingRunSequence = candidate + 1U;
+    return candidate;
+}
+
+}  // namespace
+
+void MergeTimingTakeSceneStateKeepingFirst(
+    TimingTakeSceneState* destination,
+    const TimingTakeSceneState& inputSource) {
+    if (destination == nullptr) {
+        return;
+    }
+    *destination = SanitizeTimingTakeSceneState(
+        std::move(*destination));
+    const auto source = SanitizeTimingTakeSceneState(inputSource);
+
+    // Older linked-loop merges could leave duplicate/zero run ids and the
+    // same feature assigned to multiple runs. Repair that historical state
+    // before adding the next loop so subsequent run and clip remapping has a
+    // deterministic first owner.
+    for (std::size_t runIndex = 0U;
+         runIndex < destination->waterFeatureTimingRuns.size();
+         ++runIndex) {
+        auto& run = destination->waterFeatureTimingRuns[runIndex];
+        const bool idUnavailable =
+            run.id == 0U ||
+            std::any_of(
+                destination->waterFeatureTimingRuns.begin(),
+                destination->waterFeatureTimingRuns.begin() +
+                    static_cast<std::ptrdiff_t>(runIndex),
+                [&](const auto& earlier) {
+                    return earlier.id == run.id;
+                });
+        if (idUnavailable) {
+            run.id = AllocateMergedWaterRunId(destination, 0U);
+        }
+    }
+    for (std::size_t runIndex = 0U;
+         runIndex < destination->waterFeatureTimingRuns.size();
+         ++runIndex) {
+        auto& run = destination->waterFeatureTimingRuns[runIndex];
+        for (std::size_t featureIndex = 0U;
+             featureIndex < run.features.size();) {
+            auto* firstOwner =
+                static_cast<invisible_places::water::
+                                WaterFeatureTimeline*>(nullptr);
+            auto* firstOwnerRun =
+                static_cast<invisible_places::water::
+                                WaterFeatureTimingRun*>(nullptr);
+            for (std::size_t earlierRunIndex = 0U;
+                 earlierRunIndex <= runIndex && firstOwner == nullptr;
+                 ++earlierRunIndex) {
+                auto& earlierRun =
+                    destination->waterFeatureTimingRuns[earlierRunIndex];
+                const std::size_t limit =
+                    earlierRunIndex == runIndex
+                        ? featureIndex
+                        : earlierRun.features.size();
+                const auto earlier = std::find_if(
+                    earlierRun.features.begin(),
+                    earlierRun.features.begin() +
+                        static_cast<std::ptrdiff_t>(limit),
+                    [&](const auto& candidate) {
+                        return candidate.feature ==
+                               run.features[featureIndex].feature;
+                    });
+                if (earlier !=
+                    earlierRun.features.begin() +
+                        static_cast<std::ptrdiff_t>(limit)) {
+                    firstOwner = &*earlier;
+                    firstOwnerRun = &earlierRun;
+                }
+            }
+            if (firstOwner == nullptr) {
+                ++featureIndex;
+                continue;
+            }
+            MergeWaterFeatureTimelineKeepingFirst(
+                firstOwner,
+                run.features[featureIndex]);
+            firstOwnerRun->enabled =
+                firstOwnerRun->enabled || run.enabled;
+            run.features.erase(
+                run.features.begin() +
+                static_cast<std::ptrdiff_t>(featureIndex));
+        }
+    }
+
+    const auto findFeature = [&](const auto& featureId) {
+        using Result = std::pair<
+            invisible_places::water::WaterFeatureTimingRun*,
+            invisible_places::water::WaterFeatureTimeline*>;
+        for (auto& run : destination->waterFeatureTimingRuns) {
+            const auto feature = std::find_if(
+                run.features.begin(),
+                run.features.end(),
+                [&](const auto& timeline) {
+                    return timeline.feature == featureId;
+                });
+            if (feature != run.features.end()) {
+                return Result{&run, &*feature};
+            }
+        }
+        return Result{nullptr, nullptr};
+    };
+    const auto findRunByName = [&](std::string_view name) {
+        const auto run = std::find_if(
+            destination->waterFeatureTimingRuns.begin(),
+            destination->waterFeatureTimingRuns.end(),
+            [&](const auto& candidate) {
+                return candidate.name == name;
+            });
+        return run != destination->waterFeatureTimingRuns.end()
+                   ? &*run
+                   : nullptr;
+    };
+
+    for (const auto& sourceRun : source.waterFeatureTimingRuns) {
+        auto* namedDestinationRun = findRunByName(sourceRun.name);
+        const auto ensureDestinationRun = [&]() {
+            if (namedDestinationRun != nullptr) {
+                return namedDestinationRun;
+            }
+            destination->waterFeatureTimingRuns.push_back({
+                .id = AllocateMergedWaterRunId(
+                    destination,
+                    sourceRun.id),
+                .name = sourceRun.name,
+                .enabled = sourceRun.enabled,
+                .features = {},
+            });
+            namedDestinationRun =
+                &destination->waterFeatureTimingRuns.back();
+            return namedDestinationRun;
+        };
+        // Preserve the source run even when all of its features already have
+        // a first owner in another run. In that case the named run remains an
+        // empty organizational group instead of duplicating the feature.
+        auto* targetRun = ensureDestinationRun();
+        targetRun->enabled = targetRun->enabled || sourceRun.enabled;
+        for (const auto& sourceFeature : sourceRun.features) {
+            auto [owningRun, destinationFeature] =
+                findFeature(sourceFeature.feature);
+            if (destinationFeature != nullptr) {
+                owningRun->enabled = owningRun->enabled || sourceRun.enabled;
+                MergeWaterFeatureTimelineKeepingFirst(
+                    destinationFeature,
+                    sourceFeature);
+                continue;
+            }
+            invisible_places::water::WaterFeatureTimeline merged{
+                .feature = sourceFeature.feature};
+            MergeWaterFeatureTimelineKeepingFirst(
+                &merged,
+                sourceFeature);
+            targetRun->features.push_back(std::move(merged));
+        }
+    }
+
+    for (const auto& sourceEffect : source.colouriseEffects) {
+        auto destinationEffect = std::find_if(
+            destination->colouriseEffects.begin(),
+            destination->colouriseEffects.end(),
+            [&](const auto& effect) {
+                return !sourceEffect.id.empty() &&
+                       effect.id == sourceEffect.id;
+            });
+        if (destinationEffect == destination->colouriseEffects.end()) {
+            destination->colouriseEffects.push_back(sourceEffect);
+            continue;
+        }
+        destinationEffect->activationRange.start = std::min(
+            destinationEffect->activationRange.start,
+            sourceEffect.activationRange.start);
+        destinationEffect->activationRange.end = std::max(
+            destinationEffect->activationRange.end,
+            sourceEffect.activationRange.end);
+        MergeTimingKeysKeepingFirst(
+            &destinationEffect->effectParameterKeys,
+            sourceEffect.effectParameterKeys,
+            [](const auto& left, const auto& right) {
+                return left.parameter == right.parameter;
+            });
+        MergeTimingKeysKeepingFirst(
+            &destinationEffect->paletteKeys,
+            sourceEffect.paletteKeys,
+            [](const auto&, const auto&) { return true; });
+        MergeTimingKeysKeepingFirst(
+            &destinationEffect->paletteStopParameterKeys,
+            sourceEffect.paletteStopParameterKeys,
+            [](const auto& left, const auto& right) {
+                return left.stopId == right.stopId &&
+                       left.parameter == right.parameter;
+            });
+        MergeTimingKeysKeepingFirst(
+            &destinationEffect->boundsParameterKeys,
+            sourceEffect.boundsParameterKeys,
+            [](const auto& left, const auto& right) {
+                return left.parameter == right.parameter;
+            });
+        MergeTimingKeysKeepingFirst(
+            &destinationEffect->boundsKeys,
+            sourceEffect.boundsKeys,
+            [](const auto&, const auto&) { return true; });
+        for (const auto& sourceMemory : sourceEffect.fieldBoundsMemory) {
+            auto destinationMemory = std::find_if(
+                destinationEffect->fieldBoundsMemory.begin(),
+                destinationEffect->fieldBoundsMemory.end(),
+                [&](const auto& memory) {
+                    return memory.selector == sourceMemory.selector;
+                });
+            if (destinationMemory ==
+                destinationEffect->fieldBoundsMemory.end()) {
+                destinationEffect->fieldBoundsMemory.push_back(sourceMemory);
+                continue;
+            }
+            MergeTimingKeysKeepingFirst(
+                &destinationMemory->boundsParameterKeys,
+                sourceMemory.boundsParameterKeys,
+                [](const auto& left, const auto& right) {
+                    return left.parameter == right.parameter;
+                });
+            MergeTimingKeysKeepingFirst(
+                &destinationMemory->boundsKeys,
+                sourceMemory.boundsKeys,
+                [](const auto&, const auto&) { return true; });
+        }
+    }
+    destination->waterFeatureTimingRunSequence = std::max(
+        destination->waterFeatureTimingRunSequence,
+        source.waterFeatureTimingRunSequence);
+    destination->colouriseEffectSequence = std::max(
+        destination->colouriseEffectSequence,
+        source.colouriseEffectSequence);
+    std::uint32_t maximumRunId = 0U;
+    for (const auto& run : destination->waterFeatureTimingRuns) {
+        maximumRunId = std::max(maximumRunId, run.id);
+    }
+    destination->waterFeatureTimingRunSequence = std::max(
+        destination->waterFeatureTimingRunSequence,
+        maximumRunId + 1U);
+    *destination = SanitizeTimingTakeSceneState(
+        std::move(*destination));
+}
+
 void StashTimingColouriseFieldBounds(TimingColouriseEffect* effect) {
     if (effect == nullptr) {
         return;

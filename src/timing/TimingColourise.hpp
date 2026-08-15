@@ -449,6 +449,14 @@ SanitizeTimingColourisePaletteDefinition(
     std::uint32_t sourceDurationFrames,
     std::uint32_t destinationDurationFrames,
     std::uint32_t destinationStartFrame = 0U);
+// Merges a second mapped Timing Take scene into the first. Exact
+// same-lane/time collisions keep the destination value, while unrelated
+// state from the source retains its run, clip ownership, and curve mode.
+// Run and clip ids are remapped where their state-local identities collide,
+// and a feature remains assigned to exactly one run.
+void MergeTimingTakeSceneStateKeepingFirst(
+    TimingTakeSceneState* destination,
+    const TimingTakeSceneState& source);
 // Upserts the live bounds authoring (base bounds, key mode, both key
 // vectors, edited flag) into the effect's per-selector memory under its
 // current field selector.
