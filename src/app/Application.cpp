@@ -4,6 +4,7 @@
 #include "app/PointVisualSelection.hpp"
 #include "app/ProcessMemoryTelemetry.hpp"
 #include "app/ProjectWorkspace.hpp"
+#include "app/RenderSetupProjectSave.hpp"
 #include "app/WaterSurfaceCacheReadiness.hpp"
 #include "app/WaterPathDiagnostics.hpp"
 #include "camera/AnimationPath.hpp"
@@ -406,6 +407,10 @@ struct ActiveRenderSetupOverride {
     std::filesystem::path sourcePath;
     RenderSetupDocument document{};
     ProjectDocument underlyingProject{};
+    // Exact runtime document immediately after the setup was applied.  Save
+    // uses it as the merge ancestor so later project-owned authoring survives
+    // without treating the setup snapshot itself as project authoring.
+    ProjectDocument previewBaseline{};
     PreservedAnimationRuntimeState underlyingAnimation{};
     float underlyingGaussianSplatFootprintBoost = 1.5F;
     bool preparing = false;
@@ -32644,6 +32649,7 @@ bool ActivateRenderSetupOverride(
     active.preparationMessage = active.preparing
                                     ? "Preparing recorded scene and water resources..."
                                     : "Ready";
+    active.previewBaseline = BuildProjectDocument(*runtimeState);
     runtimeState->activeRenderSetupOverride =
         std::move(active);
     runtimeState->statusMessage =
@@ -66827,35 +66833,12 @@ ProjectDocument BuildProjectDocumentForSave(
         return runtimeDocument;
     }
 
-    // A loaded Render Setup is a read-only preview over a retained copy of
-    // the user's project. Saving the live runtime here would bake the
-    // temporary scene, visual, timing, and export overrides into that
-    // project. Keep the retained authoring document and merge only the
-    // camera/animation resume state that remains editable while previewing.
-    auto document =
-        runtimeState.activeRenderSetupOverride->underlyingProject;
-    document.cameraState = runtimeDocument.cameraState;
-    document.orbitControlMode = runtimeDocument.orbitControlMode;
-    document.cameraShots = std::move(runtimeDocument.cameraShots);
-    document.cameraPathShotIndices =
-        std::move(runtimeDocument.cameraPathShotIndices);
-    document.cameraPathDurationFrames =
-        runtimeDocument.cameraPathDurationFrames;
-    document.liveViewWindowWidth =
-        runtimeDocument.liveViewWindowWidth;
-    document.liveViewWindowHeight =
-        runtimeDocument.liveViewWindowHeight;
-    document.lockLiveViewWindowSize =
-        runtimeDocument.lockLiveViewWindowSize;
-    document.lastAnimationPath = runtimeDocument.lastAnimationPath;
-    document.activeAnimationPath = runtimeDocument.activeAnimationPath;
-    document.activeAnimationPosition =
-        runtimeDocument.activeAnimationPosition;
-    document.savedAnimations =
-        std::move(runtimeDocument.savedAnimations);
-    document.hasSavedAnimationRegistry =
-        runtimeDocument.hasSavedAnimationRegistry;
-    return document;
+    const auto& active =
+        runtimeState.activeRenderSetupOverride.value();
+    return invisible_places::app::MergeRenderSetupProjectForSave(
+        active.underlyingProject,
+        active.previewBaseline,
+        std::move(runtimeDocument));
 }
 
 std::filesystem::path CurrentAnimationSavePath(
@@ -68144,8 +68127,15 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
     }
     if (project.has_value() &&
         runtimeState->activeRenderSetupOverride.has_value()) {
-        runtimeState->activeRenderSetupOverride->underlyingProject =
-            project.value();
+        auto& active =
+            runtimeState->activeRenderSetupOverride.value();
+        active.underlyingProject = project.value();
+        // Accept the successfully saved project-owned deltas as the next
+        // merge baseline.  A later save can then retain cloud-only library
+        // additions in underlyingProject instead of reapplying stale local
+        // changes from this preview session.
+        active.previewBaseline =
+            BuildProjectDocument(*runtimeState);
     }
     if (project.has_value() && !loopPairSaves.empty()) {
         runtimeState->cameraShots = project->cameraShots;
@@ -77503,6 +77493,7 @@ void DrawWaterPanel(
             if (water.activeKeyingFeature->kind ==
                     invisible_places::water::WaterKeyedFeatureKind::
                         FlowPath &&
+                !RenderSetupAuthoringLocked(runtimeState) &&
                 water.selectedManualFlowPathIndex.has_value() &&
                 water.selectedManualFlowPathIndex.value() <
                     water.manualFlowPaths.size()) {
@@ -84756,7 +84747,23 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
             EndPanelSection();
             return;
         }
-        auto& entry = EnsureScenarioFeatureRuns(&water, scenarioId);
+        auto* existingEntry =
+            invisible_places::timing::FindTimingTakeSceneState(
+                &water.timingTakeSceneStates,
+                scenarioId,
+                ActiveWaterTimingSceneGroupName(water));
+        if (existingEntry == nullptr &&
+            RenderSetupAuthoringLocked(runtimeState)) {
+            ImGui::TextDisabled(
+                "This recorded setup has no feature runs for the active scene.");
+            EndPanelSection();
+            return;
+        }
+        auto& entry = existingEntry != nullptr
+                          ? *existingEntry
+                          : EnsureScenarioFeatureRuns(
+                                &water,
+                                scenarioId);
         if (timings.selectedFeatureRunIndex.has_value() &&
             timings.selectedFeatureRunIndex.value() >=
                 entry.waterFeatureTimingRuns.size()) {
@@ -85318,7 +85325,23 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
         // The destination entry must exist BEFORE pointers into the
         // per-take vector are taken: creating it later reallocates the
         // vector and dangles every pointer collected below.
-        auto& entry = EnsureScenarioFeatureRuns(&water, scenarioId);
+        auto* existingEntry =
+            invisible_places::timing::FindTimingTakeSceneState(
+                &water.timingTakeSceneStates,
+                scenarioId,
+                ActiveWaterTimingSceneGroupName(water));
+        if (existingEntry == nullptr &&
+            RenderSetupAuthoringLocked(runtimeState)) {
+            ImGui::TextDisabled(
+                "This recorded setup has no runs to import for the active scene.");
+            EndPanelSection();
+            return;
+        }
+        auto& entry = existingEntry != nullptr
+                          ? *existingEntry
+                          : EnsureScenarioFeatureRuns(
+                                &water,
+                                scenarioId);
         std::vector<const invisible_places::timing::TimingTakeSceneState*>
             otherScenarios;
         const auto sceneGroup = ActiveWaterTimingSceneGroupName(water);
@@ -92853,19 +92876,35 @@ void DrawTimingColouriseSection(
     auto& timings = runtimeState->timingsPanel;
     const auto takeId =
         ActiveWaterTimingScenarioId(*runtimeState);
-    auto& state = EnsureScenarioFeatureRuns(
-        &water,
-        takeId);
+    auto* existingState =
+        invisible_places::timing::FindTimingTakeSceneState(
+            &water.timingTakeSceneStates,
+            takeId,
+            ActiveWaterTimingSceneGroupName(water));
+    if (existingState == nullptr &&
+        RenderSetupAuthoringLocked(runtimeState)) {
+        ImGui::TextDisabled(
+            "This recorded setup has no visual features for the active scene.");
+        EndPanelSection();
+        return;
+    }
+    auto& state = existingState != nullptr
+                      ? *existingState
+                      : EnsureScenarioFeatureRuns(
+                            &water,
+                            takeId);
     auto& effects = state.colouriseEffects;
     // Features without a local bounds edit follow the newest shared Global
     // bounds for their scalar field once per frame.
-    for (auto& candidate : effects) {
-        if (invisible_places::timing::
-                RefreshTimingColouriseBoundsFromGlobal(
-                    &candidate,
-                    water.timingScalarBoundsStores)) {
-            runtimeState->previewRenderStateSignatureValid =
-                false;
+    if (!RenderSetupAuthoringLocked(runtimeState)) {
+        for (auto& candidate : effects) {
+            if (invisible_places::timing::
+                    RefreshTimingColouriseBoundsFromGlobal(
+                        &candidate,
+                        water.timingScalarBoundsStores)) {
+                runtimeState->previewRenderStateSignatureValid =
+                    false;
+            }
         }
     }
     const auto selectEffect = [&](std::size_t index) {
@@ -93132,7 +93171,8 @@ void DrawTimingColouriseSection(
             effect.field.source !=
                 invisible_places::timing::
                     TimingColouriseFieldSource::Scalar;
-        if (!foundSelector &&
+        if (!RenderSetupAuthoringLocked(runtimeState) &&
+            !foundSelector &&
             (unsetScalarSelector ||
              emissiveNonScalarSelector) &&
             !catalog.front().variants.empty()) {
@@ -93509,26 +93549,30 @@ void DrawAuthoredTimingsPanel(
     auto& water = runtimeState->water;
     auto& panel = runtimeState->animationPanel;
     auto& timings = runtimeState->timingsPanel;
-    if (water.timingTakes.empty() ||
-        invisible_places::timing::FindTimingTakeDefinition(
-            water.timingTakes,
-            invisible_places::timing::kAuthoredTimingTakeId) ==
-            nullptr) {
-        water.timingTakes.insert(
-            water.timingTakes.begin(),
-            invisible_places::timing::
-                AuthoredTimingTakeDefinition());
-    }
-    water.selectedTimingTakeId =
-        invisible_places::timing::NormalizeTimingTakeId(
-            water.selectedTimingTakeId);
-    if (invisible_places::timing::FindTimingTakeDefinition(
-            water.timingTakes,
-            water.selectedTimingTakeId) == nullptr) {
-        water.selectedTimingTakeId =
-            std::string{
+    const bool renderSetupReadOnly =
+        RenderSetupAuthoringLocked(runtimeState);
+    if (!renderSetupReadOnly) {
+        if (water.timingTakes.empty() ||
+            invisible_places::timing::FindTimingTakeDefinition(
+                water.timingTakes,
+                invisible_places::timing::kAuthoredTimingTakeId) ==
+                nullptr) {
+            water.timingTakes.insert(
+                water.timingTakes.begin(),
                 invisible_places::timing::
-                    kAuthoredTimingTakeId};
+                    AuthoredTimingTakeDefinition());
+        }
+        water.selectedTimingTakeId =
+            invisible_places::timing::NormalizeTimingTakeId(
+                water.selectedTimingTakeId);
+        if (invisible_places::timing::FindTimingTakeDefinition(
+                water.timingTakes,
+                water.selectedTimingTakeId) == nullptr) {
+            water.selectedTimingTakeId =
+                std::string{
+                    invisible_places::timing::
+                        kAuthoredTimingTakeId};
+        }
     }
     auto* animationPath =
         panel.currentPath.has_value()
@@ -93564,11 +93608,14 @@ void DrawAuthoredTimingsPanel(
             std::string{
                 invisible_places::timing::
                     kAuthoredTimingTakeId};
-        water.selectedTimingTakeId = selectedTakeId;
-        if (animationPath != nullptr && !readOnlySavedComparison) {
-            animationPath->selectedTimingTakeId =
-                selectedTakeId;
-            panel.dirty = true;
+        if (!renderSetupReadOnly) {
+            water.selectedTimingTakeId = selectedTakeId;
+            if (animationPath != nullptr &&
+                !readOnlySavedComparison) {
+                animationPath->selectedTimingTakeId =
+                    selectedTakeId;
+                panel.dirty = true;
+            }
         }
         selectedTake =
             invisible_places::timing::FindTimingTakeDefinition(
