@@ -8662,6 +8662,28 @@ WaterKeyedSettingsProfile SanitizeWaterKeyedSettingsProfile(
     return profile;
 }
 
+std::vector<WaterKeyedSettingsProfile>
+SanitizeWaterKeyedSettingsProfileLibrary(
+    std::vector<WaterKeyedSettingsProfile> profiles) {
+    std::vector<WaterKeyedSettingsProfile> kept;
+    kept.reserve(profiles.size());
+    for (auto& profile : profiles) {
+        auto sanitized = SanitizeWaterKeyedSettingsProfile(
+            std::move(profile));
+        if (sanitized.name.empty() ||
+            std::any_of(
+                kept.begin(),
+                kept.end(),
+                [&](const WaterKeyedSettingsProfile& existing) {
+                    return existing.name == sanitized.name;
+                })) {
+            continue;
+        }
+        kept.push_back(std::move(sanitized));
+    }
+    return kept;
+}
+
 WaterFeatureTimingRun SanitizeWaterFeatureTimingRun(
     WaterFeatureTimingRun run) {
     if (run.name.empty()) {

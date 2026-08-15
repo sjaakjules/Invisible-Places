@@ -1875,6 +1875,53 @@ TEST_CASE("Flow Path keyed profiles round-trip with standalone Water sources",
     CHECK(profile.settings.front().settingId == "trail_width");
 }
 
+TEST_CASE("Project keyed-settings cleanup preserves packages for every water feature",
+          "[water][timing][keyed][profiles][packages]") {
+    using invisible_places::water::SanitizeWaterKeyedSettingsProfileLibrary;
+    using invisible_places::water::WaterKeyedFeatureKind;
+    using invisible_places::water::WaterKeyedSettingsProfile;
+
+    const std::array kinds{
+        WaterKeyedFeatureKind::Rain,
+        WaterKeyedFeatureKind::MeshFlow,
+        WaterKeyedFeatureKind::Shoreline,
+        WaterKeyedFeatureKind::SeepageGlobal,
+        WaterKeyedFeatureKind::FlowGlobal,
+        WaterKeyedFeatureKind::SeepageNode,
+        WaterKeyedFeatureKind::FlowSource,
+        WaterKeyedFeatureKind::FlowPath,
+        WaterKeyedFeatureKind::ShorelineInstance,
+    };
+    std::vector<WaterKeyedSettingsProfile> profiles;
+    profiles.reserve(kinds.size() + 1U);
+    for (std::size_t index = 0U; index < kinds.size(); ++index) {
+        profiles.push_back({
+            .name = " Package " + std::to_string(index) + " ",
+            .featureKind = kinds[index],
+            .nativeLengthFraction = 0.25F,
+            .settings = {{
+                .settingId = " level ",
+                .keys = {
+                    {.position = 0.0F, .value = 0.0F},
+                    {.position = 1.0F, .value = 1.0F},
+                },
+            }},
+        });
+    }
+    profiles.push_back(profiles.front());
+
+    const auto sanitized =
+        SanitizeWaterKeyedSettingsProfileLibrary(std::move(profiles));
+    REQUIRE(sanitized.size() == kinds.size());
+    for (std::size_t index = 0U; index < kinds.size(); ++index) {
+        CHECK(sanitized[index].name ==
+              "Package " + std::to_string(index));
+        CHECK(sanitized[index].featureKind == kinds[index]);
+        REQUIRE(sanitized[index].settings.size() == 1U);
+        CHECK(sanitized[index].settings.front().settingId == "level");
+    }
+}
+
 TEST_CASE("Schema 46 timing tracks migrate with active legacy defaults",
           "[water][timing][keyed][serialization][migration]") {
     using invisible_places::serialization::kProjectDocumentSchemaVersion;

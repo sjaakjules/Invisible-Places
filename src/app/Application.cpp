@@ -16620,26 +16620,9 @@ void EnsureWaterProfiles(PreviewRuntimeState* runtimeState) {
         emitter.laneProfileName = NormalizeWaterProfileName(emitter.laneProfileName, kWaterProfileGlobalName);
         emitter.trailProfileName = NormalizeWaterProfileName(emitter.trailProfileName, kWaterProfileGlobalName);
     }
-    std::vector<invisible_places::water::WaterKeyedSettingsProfile>
-        keyedProfiles;
-    keyedProfiles.reserve(water.keyedSettingsProfiles.size());
-    for (auto profile : water.keyedSettingsProfiles) {
-        profile = invisible_places::water::
-            SanitizeWaterKeyedSettingsProfile(std::move(profile));
-        if (profile.featureKind !=
-                invisible_places::water::WaterKeyedFeatureKind::FlowPath ||
-            profile.name.empty() ||
-            std::any_of(
-                keyedProfiles.begin(),
-                keyedProfiles.end(),
-                [&](const auto& existing) {
-                    return existing.name == profile.name;
-                })) {
-            continue;
-        }
-        keyedProfiles.push_back(std::move(profile));
-    }
-    water.keyedSettingsProfiles = std::move(keyedProfiles);
+    water.keyedSettingsProfiles = invisible_places::water::
+        SanitizeWaterKeyedSettingsProfileLibrary(
+            std::move(water.keyedSettingsProfiles));
     for (auto& source : water.manualFlowPaths) {
         source.laneProfileName = NormalizeWaterProfileName(
             source.laneProfileName,
@@ -16654,8 +16637,10 @@ void EnsureWaterProfiles(PreviewRuntimeState* runtimeState) {
                 water.keyedSettingsProfiles.begin(),
                 water.keyedSettingsProfiles.end(),
                 [&](const auto& profile) {
-                    return profile.name ==
-                           source.keyedSettingsProfileName;
+                    return profile.featureKind ==
+                               invisible_places::water::
+                                   WaterKeyedFeatureKind::FlowPath &&
+                           profile.name == source.keyedSettingsProfileName;
                 })) {
             source.keyedSettingsProfileName.clear();
         }

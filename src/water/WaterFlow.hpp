@@ -662,6 +662,12 @@ ParseWaterKeyedFeatureKindName(std::string_view name);
     WaterKeyedSettingTrack track);
 [[nodiscard]] WaterKeyedSettingsProfile SanitizeWaterKeyedSettingsProfile(
     WaterKeyedSettingsProfile profile);
+// Sanitizes the project-owned keyed-settings library without narrowing it to
+// one feature kind. Clip packages are shared by Rain, Flow, Shoreline, and
+// Seepage authoring, while full-length Flow Path profiles use the same store.
+[[nodiscard]] std::vector<WaterKeyedSettingsProfile>
+SanitizeWaterKeyedSettingsProfileLibrary(
+    std::vector<WaterKeyedSettingsProfile> profiles);
 [[nodiscard]] std::string WaterKeyedSettingsProfileSavedName(
     std::string_view baseProfileName,
     std::string_view objectName);
