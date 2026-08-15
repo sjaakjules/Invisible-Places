@@ -16257,6 +16257,29 @@ void ReplaceWaterSeepageProfileReferences(
     }
 }
 
+std::size_t RemoveWaterFeatureTimingReferences(
+    WaterWorkflowState* water,
+    const invisible_places::water::WaterKeyedFeatureId& feature) {
+    if (water == nullptr) {
+        return 0U;
+    }
+    std::size_t removed = 0U;
+    for (auto& entry : water->featureTimingRunsByScenario) {
+        removed += invisible_places::water::RemoveWaterFeatureFromTimingRuns(
+            entry.runs,
+            feature);
+    }
+    for (auto& state : water->timingTakeSceneStates) {
+        removed += invisible_places::water::RemoveWaterFeatureFromTimingRuns(
+            state.waterFeatureTimingRuns,
+            feature);
+    }
+    if (water->activeKeyingFeature == feature) {
+        water->activeKeyingFeature.reset();
+    }
+    return removed;
+}
+
 void ReplaceWaterSeepageNodeSettingsProfileReferences(
     WaterWorkflowState* water,
     std::string_view previousName,
@@ -76673,6 +76696,11 @@ void DrawWaterSeepagePanel(
         }
         for (const auto nodeId : deletedNodeIds) {
             RemoveWaterSeepageNodeObjectProfiles(&water, nodeId);
+            (void)RemoveWaterFeatureTimingReferences(
+                &water,
+                {.kind = invisible_places::water::WaterKeyedFeatureKind::
+                     SeepageNode,
+                 .objectId = nodeId});
         }
         const auto deletedCount = selectedSeepageIndices.size();
         ClearWaterSeepageSelection(&water);
@@ -78153,6 +78181,11 @@ void DrawWaterPanel(
             water.emitters.erase(
                 water.emitters.begin() +
                 static_cast<std::ptrdiff_t>(deleteEmitterIndex.value()));
+            (void)RemoveWaterFeatureTimingReferences(
+                &water,
+                {.kind = invisible_places::water::WaterKeyedFeatureKind::
+                     FlowSource,
+                 .objectId = deletedEmitterId});
             if (water.selectedEmitterIndex.has_value()) {
                 if (water.emitters.empty()) {
                     water.selectedEmitterIndex.reset();
@@ -78220,9 +78253,17 @@ void DrawWaterPanel(
                     water.keyedSettingsProfiles.end(),
                     [&](const auto& profile) {
                         return profile.edited &&
+                               profile.featureKind ==
+                                   invisible_places::water::
+                                       WaterKeyedFeatureKind::FlowPath &&
                                profile.ownerObjectId == deletedSourceId;
                     }),
                 water.keyedSettingsProfiles.end());
+            (void)RemoveWaterFeatureTimingReferences(
+                &water,
+                {.kind = invisible_places::water::WaterKeyedFeatureKind::
+                     FlowPath,
+                 .objectId = deletedSourceId});
             const auto removedProfiles = RemoveWaterFlowSourceObjectProfiles(
                 &water,
                 deletedSourceId);

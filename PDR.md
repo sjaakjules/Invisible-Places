@@ -521,6 +521,11 @@ per-key editing, and compiled export snapshots are unchanged — and Timing
 Take retiming shall carry clip bounds with their keys. Project schema 74 and
 water-sources schema 28 introduced clips and package lengths; project schema
 76 and water-sources schema 30 store explicit per-key `clip_id` ownership.
+Deleting a scene Water feature shall remove that exact kind-and-object
+timeline from every legacy scenario and Timing Take scene state while
+retaining authored run shells and reusable saved packages. Owner-shadow
+cleanup shall never remove a same-id package belonging to another feature
+kind.
 
 #### FR-STYLE-13
 Each keyed Water setting shall offer **Spline Handles** alongside Smooth Step,

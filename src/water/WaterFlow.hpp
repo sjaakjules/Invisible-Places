@@ -704,6 +704,12 @@ SanitizeWaterKeyedSettingsProfileLibrary(
     WaterScenarioFeatureRuns* entry,
     const WaterKeyedFeatureId& feature,
     std::uint32_t targetRunId);
+// Removes every timeline for one deleted scene feature while retaining the
+// authored runs themselves (including runs that become empty). Returns the
+// number of timelines removed, which also exposes malformed duplicates.
+[[nodiscard]] std::size_t RemoveWaterFeatureFromTimingRuns(
+    std::span<WaterFeatureTimingRun> runs,
+    const WaterKeyedFeatureId& feature);
 // Endpoint-hold sampling across the concrete per-segment modes, including
 // automatic and manually handled splines. An exact interior key belongs to
 // the segment it starts, so a Hold step reads its new value at the key

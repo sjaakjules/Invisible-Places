@@ -8931,6 +8931,20 @@ bool AssignWaterFeatureToTimingRun(
     return true;
 }
 
+std::size_t RemoveWaterFeatureFromTimingRuns(
+    std::span<WaterFeatureTimingRun> runs,
+    const WaterKeyedFeatureId& feature) {
+    std::size_t removed = 0U;
+    for (auto& run : runs) {
+        removed += std::erase_if(
+            run.features,
+            [&](const WaterFeatureTimeline& timeline) {
+                return timeline.feature == feature;
+            });
+    }
+    return removed;
+}
+
 namespace {
 
 float WrapNormalizedLoopPosition(float position) {

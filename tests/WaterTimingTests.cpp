@@ -1103,6 +1103,111 @@ TEST_CASE("Focused feature run assignment preserves its complete timeline",
             99U));
 }
 
+TEST_CASE("Deleting a water feature removes only its timelines and keeps runs",
+          "[water][timing][keyed][runs][delete]") {
+    using invisible_places::water::RemoveWaterFeatureFromTimingRuns;
+    using invisible_places::water::WaterFeatureSettingsClip;
+    using invisible_places::water::WaterFeatureTimeline;
+    using invisible_places::water::WaterFeatureTimingRun;
+    using invisible_places::water::WaterKeyedFeatureId;
+    using invisible_places::water::WaterKeyedFeatureKind;
+    using invisible_places::water::WaterKeyedSettingTrack;
+    using invisible_places::water::WaterSettingKey;
+
+    const WaterKeyedFeatureId deleted{
+        .kind = WaterKeyedFeatureKind::FlowPath,
+        .objectId = 34U};
+    const WaterKeyedFeatureId retained{
+        .kind = WaterKeyedFeatureKind::FlowPath,
+        .objectId = 35U};
+    const WaterKeyedFeatureId sameObjectOtherKind{
+        .kind = WaterKeyedFeatureKind::FlowSource,
+        .objectId = 34U};
+    const WaterKeyedSettingTrack retainedTrack{
+        .settingId = "strength",
+        .active = false,
+        .label = "Maximum Flow Strength",
+        .profileGroup = "flow_path",
+        .profileName = "Trail",
+        .keys = {
+            WaterSettingKey{
+                .position = 0.2F,
+                .value = 0.4F,
+                .clipId = 7U},
+            WaterSettingKey{
+                .position = 0.8F,
+                .value = 0.9F,
+                .clipId = 7U},
+        },
+    };
+    const WaterFeatureSettingsClip retainedClip{
+        .id = 7U,
+        .name = "Retained Clip",
+        .start = 0.2F,
+        .end = 0.8F,
+        .sourceProfileName = "Retained Package",
+    };
+    std::vector<WaterFeatureTimingRun> runs{
+        WaterFeatureTimingRun{
+            .id = 10U,
+            .name = "Mixed",
+            .enabled = false,
+            .features = {
+                WaterFeatureTimeline{.feature = deleted},
+                WaterFeatureTimeline{
+                    .feature = retained,
+                    .settings = {retainedTrack},
+                    .clips = {retainedClip},
+                    .clipMembershipExplicit = true},
+                WaterFeatureTimeline{
+                    .feature = sameObjectOtherKind,
+                    .settings = {retainedTrack},
+                    .clips = {retainedClip},
+                    .clipMembershipExplicit = true},
+            }},
+        WaterFeatureTimingRun{
+            .id = 11U,
+            .name = "Becomes Empty",
+            .features = {WaterFeatureTimeline{.feature = deleted}}},
+    };
+
+    CHECK(RemoveWaterFeatureFromTimingRuns(runs, deleted) == 2U);
+    REQUIRE(runs.size() == 2U);
+    CHECK(runs[0].id == 10U);
+    CHECK(runs[0].name == "Mixed");
+    CHECK_FALSE(runs[0].enabled);
+    REQUIRE(runs[0].features.size() == 2U);
+    CHECK(runs[0].features[0].feature == retained);
+    CHECK(runs[0].features[1].feature == sameObjectOtherKind);
+
+    for (const auto& timeline : runs[0].features) {
+        REQUIRE(timeline.settings.size() == 1U);
+        const auto& track = timeline.settings.front();
+        CHECK(track.settingId == "strength");
+        CHECK_FALSE(track.active);
+        CHECK(track.label == "Maximum Flow Strength");
+        CHECK(track.profileGroup == "flow_path");
+        CHECK(track.profileName == "Trail");
+        REQUIRE(track.keys.size() == 2U);
+        CHECK(track.keys[0].position == Approx(0.2F));
+        CHECK(track.keys[0].value == Approx(0.4F));
+        CHECK(track.keys[0].clipId == 7U);
+        CHECK(track.keys[1].position == Approx(0.8F));
+        CHECK(track.keys[1].value == Approx(0.9F));
+        CHECK(track.keys[1].clipId == 7U);
+        REQUIRE(timeline.clips.size() == 1U);
+        CHECK(timeline.clips.front().id == 7U);
+        CHECK(timeline.clips.front().name == "Retained Clip");
+        CHECK(timeline.clips.front().sourceProfileName == "Retained Package");
+        CHECK(timeline.clipMembershipExplicit);
+    }
+
+    CHECK(runs[1].id == 11U);
+    CHECK(runs[1].name == "Becomes Empty");
+    CHECK(runs[1].features.empty());
+    CHECK(RemoveWaterFeatureFromTimingRuns(runs, deleted) == 0U);
+}
+
 TEST_CASE("Feature key navigation finds the nearest key across every setting",
           "[water][timing][keyed][navigation]") {
     using Catch::Approx;
