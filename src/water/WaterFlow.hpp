@@ -666,6 +666,14 @@ ParseWaterKeyedFeatureKindName(std::string_view name);
 [[nodiscard]] bool WaterKeyedSettingTrackProfileEqual(
     const WaterKeyedSettingTrack& left,
     const WaterKeyedSettingTrack& right);
+// Rebinds dynamic keyed-setting tracks when a named Seepage Look or Response
+// profile is renamed/reconciled. Callers may apply this to live Timing Take
+// timelines, legacy timelines, and reusable package tracks alike.
+[[nodiscard]] std::size_t ReplaceWaterKeyedSettingProfileReferences(
+    std::span<WaterKeyedSettingTrack> settings,
+    std::string_view profileGroup,
+    std::string_view previousProfileName,
+    std::string_view nextProfileName);
 [[nodiscard]] WaterKeyedSettingsProfile SanitizeWaterKeyedSettingsProfile(
     WaterKeyedSettingsProfile profile);
 // Package/profile names are scoped to their feature kind. This lets a Seepage

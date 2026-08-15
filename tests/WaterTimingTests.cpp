@@ -2027,6 +2027,45 @@ TEST_CASE("Keyed profile equality includes interpolation defaults and spline han
     CHECK(WaterKeyedSettingTrackProfileEqual(baseline, edited));
 }
 
+TEST_CASE("Dynamic keyed tracks follow renamed Seepage profiles",
+          "[water][timing][keyed][profiles][references]") {
+    using invisible_places::water::
+        ReplaceWaterKeyedSettingProfileReferences;
+    using invisible_places::water::WaterKeyedSettingTrack;
+
+    std::vector<WaterKeyedSettingTrack> tracks{
+        {.settingId = "look.trickle_width",
+         .profileGroup = "seepage_look",
+         .profileName = " Old Look "},
+        {.settingId = "look.breakup",
+         .profileGroup = "seepage_look",
+         .profileName = "Another Look"},
+        {.settingId = "response.intensity",
+         .profileGroup = "seepage_response",
+         .profileName = "Old Look"},
+        {.settingId = "strength",
+         .profileName = "Old Look"},
+    };
+
+    CHECK(ReplaceWaterKeyedSettingProfileReferences(
+              tracks,
+              "seepage_look",
+              "Old Look",
+              "Renamed Look") == 1U);
+    CHECK(tracks[0].profileName == "Renamed Look");
+    CHECK(tracks[1].profileName == "Another Look");
+    CHECK(tracks[2].profileName == "Old Look");
+    CHECK(tracks[3].profileName == "Old Look");
+
+    CHECK(ReplaceWaterKeyedSettingProfileReferences(
+              tracks,
+              "seepage_look",
+              "",
+              "Ignored") == 0U);
+    CHECK(tracks[0].profileName == "Renamed Look");
+    CHECK(tracks[1].profileName == "Another Look");
+}
+
 TEST_CASE("Schema 46 timing tracks migrate with active legacy defaults",
           "[water][timing][keyed][serialization][migration]") {
     using invisible_places::serialization::kProjectDocumentSchemaVersion;

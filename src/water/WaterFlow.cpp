@@ -8614,6 +8614,28 @@ bool WaterKeyedSettingTrackProfileEqual(
     return true;
 }
 
+std::size_t ReplaceWaterKeyedSettingProfileReferences(
+    std::span<WaterKeyedSettingTrack> settings,
+    std::string_view profileGroup,
+    std::string_view previousProfileName,
+    std::string_view nextProfileName) {
+    const auto previous = TrimSeepageName(previousProfileName);
+    const auto next = TrimSeepageName(nextProfileName);
+    if (profileGroup.empty() || previous.empty() || next.empty()) {
+        return 0U;
+    }
+    std::size_t replacementCount = 0U;
+    for (auto& setting : settings) {
+        if (setting.profileGroup != profileGroup ||
+            TrimSeepageName(setting.profileName) != previous) {
+            continue;
+        }
+        setting.profileName = std::string{next};
+        ++replacementCount;
+    }
+    return replacementCount;
+}
+
 std::string WaterKeyedSettingsProfileSavedName(
     std::string_view baseProfileName,
     std::string_view objectName) {

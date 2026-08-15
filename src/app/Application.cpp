@@ -16229,18 +16229,31 @@ void ReplaceWaterSeepageProfileReferences(
     }
     const std::string_view group =
         responseHalf ? "seepage_response" : "seepage_look";
-    for (auto& entry : water->featureTimingRunsByScenario) {
-        for (auto& run : entry.runs) {
+    const auto replaceInRuns = [&](auto& runs) {
+        for (auto& run : runs) {
             for (auto& feature : run.features) {
-                for (auto& track : feature.settings) {
-                    if (track.profileGroup == group &&
-                        NormalizedWaterSeepageProfileName(track.profileName) ==
-                            previous) {
-                        track.profileName = std::string{nextName};
-                    }
-                }
+                (void)invisible_places::water::
+                    ReplaceWaterKeyedSettingProfileReferences(
+                        feature.settings,
+                        group,
+                        previous,
+                        nextName);
             }
         }
+    };
+    for (auto& entry : water->featureTimingRunsByScenario) {
+        replaceInRuns(entry.runs);
+    }
+    for (auto& state : water->timingTakeSceneStates) {
+        replaceInRuns(state.waterFeatureTimingRuns);
+    }
+    for (auto& profile : water->keyedSettingsProfiles) {
+        (void)invisible_places::water::
+            ReplaceWaterKeyedSettingProfileReferences(
+                profile.settings,
+                group,
+                previous,
+                nextName);
     }
 }
 
