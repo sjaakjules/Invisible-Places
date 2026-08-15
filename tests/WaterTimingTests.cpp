@@ -2703,6 +2703,118 @@ TEST_CASE("Settings clips capture, apply, and duplicate as packages",
     CHECK(strengthKeys[6].value == Approx(1.0F));
 }
 
+TEST_CASE("Package application rolls back when a dense window cannot fit every key",
+          "[water][timing][keyed][clips][packages][collision]") {
+    using invisible_places::water::ApplyWaterKeyedSettingsClip;
+    using invisible_places::water::WaterFeatureTimeline;
+    using invisible_places::water::WaterKeyedFeatureKind;
+    using invisible_places::water::WaterKeyedSettingsProfile;
+    using invisible_places::water::WaterScenarioInterpolation;
+
+    WaterFeatureTimeline timeline;
+    timeline.feature = {
+        .kind = WaterKeyedFeatureKind::SeepageNode,
+        .objectId = 7U};
+    timeline.settings = {{
+        .settingId = "strength",
+        .active = false,
+        .label = "Node Strength",
+        .defaultInterpolation = WaterScenarioInterpolation::Smooth,
+    }};
+    for (int index = 0; index <= 20; ++index) {
+        timeline.settings.front().keys.push_back({
+            .position = 0.5F + static_cast<float>(index) * 0.00005F,
+            .value = static_cast<float>(index) * 0.1F,
+            .interpolation = WaterScenarioInterpolation::Hold,
+            .clipId = 0U,
+            .incomingHandleTime = 0.2F,
+            .incomingHandleValue = -0.1F,
+            .outgoingHandleTime = 0.4F,
+            .outgoingHandleValue = 0.3F,
+        });
+    }
+    timeline.clips = {{
+        .id = 4U,
+        .name = "Existing marker",
+        .start = 0.1F,
+        .end = 0.2F,
+        .sourceProfileName = "Earlier",
+    }};
+    timeline.clipMembershipExplicit = false;
+    const auto before = timeline;
+
+    WaterKeyedSettingsProfile package{
+        .name = "Dense Start",
+        .baseProfileName = "Dense Start",
+        .featureKind = WaterKeyedFeatureKind::SeepageNode,
+        .nativeLengthFraction = 0.001F,
+        .settings = {
+            {
+                .settingId = "prominence",
+                .keys = {{.position = 0.0F, .value = 1.25F}},
+            },
+            {
+                .settingId = "strength",
+                .keys = {{.position = 0.5F, .value = 2.0F}},
+            },
+        },
+    };
+
+    CHECK_FALSE(ApplyWaterKeyedSettingsClip(
+                    &timeline,
+                    package,
+                    0.5F,
+                    0.501F,
+                    "Should Not Appear")
+                    .has_value());
+
+    CHECK(timeline.feature.kind == before.feature.kind);
+    CHECK(timeline.feature.objectId == before.feature.objectId);
+    CHECK(timeline.clipMembershipExplicit == before.clipMembershipExplicit);
+    REQUIRE(timeline.clips.size() == before.clips.size());
+    for (std::size_t index = 0U; index < timeline.clips.size(); ++index) {
+        const auto& actual = timeline.clips[index];
+        const auto& expected = before.clips[index];
+        CHECK(actual.id == expected.id);
+        CHECK(actual.name == expected.name);
+        CHECK(actual.start == expected.start);
+        CHECK(actual.end == expected.end);
+        CHECK(actual.sourceProfileName == expected.sourceProfileName);
+    }
+    REQUIRE(timeline.settings.size() == before.settings.size());
+    for (std::size_t settingIndex = 0U;
+         settingIndex < timeline.settings.size();
+         ++settingIndex) {
+        const auto& actual = timeline.settings[settingIndex];
+        const auto& expected = before.settings[settingIndex];
+        CHECK(actual.settingId == expected.settingId);
+        CHECK(actual.active == expected.active);
+        CHECK(actual.label == expected.label);
+        CHECK(actual.profileGroup == expected.profileGroup);
+        CHECK(actual.profileName == expected.profileName);
+        CHECK(actual.defaultInterpolation == expected.defaultInterpolation);
+        REQUIRE(actual.keys.size() == expected.keys.size());
+        for (std::size_t keyIndex = 0U;
+             keyIndex < actual.keys.size();
+             ++keyIndex) {
+            const auto& actualKey = actual.keys[keyIndex];
+            const auto& expectedKey = expected.keys[keyIndex];
+            CHECK(actualKey.position == expectedKey.position);
+            CHECK(actualKey.value == expectedKey.value);
+            CHECK(actualKey.interpolation == expectedKey.interpolation);
+            CHECK(actualKey.clipId == expectedKey.clipId);
+            CHECK(actualKey.incomingHandleTime ==
+                  expectedKey.incomingHandleTime);
+            CHECK(actualKey.incomingHandleValue ==
+                  expectedKey.incomingHandleValue);
+            CHECK(actualKey.outgoingHandleTime ==
+                  expectedKey.outgoingHandleTime);
+            CHECK(actualKey.outgoingHandleValue ==
+                  expectedKey.outgoingHandleValue);
+        }
+    }
+}
+
 TEST_CASE("Applied packages preserve their track-default interpolation when stretched",
           "[water][timing][keyed][clips][packages][interpolation]") {
     using Catch::Approx;

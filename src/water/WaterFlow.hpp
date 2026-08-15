@@ -877,7 +877,9 @@ struct WaterFeatureSpanLimits {
 // Missing tracks are created with the package's display metadata. When the
 // package kind differs from the timeline's feature kind only registry
 // settings of the target kind apply. Returns the new clip id, or nullopt
-// without mutation for invalid arguments.
+// without mutation for invalid arguments or when any applicable package key
+// cannot be placed collision-free. Package application is transactional: it
+// never leaves a partial or empty clip behind.
 [[nodiscard]] std::optional<std::uint32_t> ApplyWaterKeyedSettingsClip(
     WaterFeatureTimeline* timeline,
     const WaterKeyedSettingsProfile& profile,

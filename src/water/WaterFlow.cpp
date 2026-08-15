@@ -10135,7 +10135,12 @@ std::optional<std::uint32_t> ApplyWaterKeyedSettingsClip(
         kWaterFeatureClipMinimumLength - kWaterClipKeyTolerance) {
         return std::nullopt;
     }
-    EnsureWaterFeatureExplicitClipMembership(timeline);
+    // Stage the complete operation away from the live timeline. Applying a
+    // package may need to nudge several keys around existing same-track keys;
+    // if even one applicable key has no collision-free position, none of the
+    // membership migration, new tracks, keys, or clip metadata may leak out.
+    WaterFeatureTimeline candidate = *timeline;
+    EnsureWaterFeatureExplicitClipMembership(&candidate);
     const bool crossKind = profile.featureKind != timeline->feature.kind;
     const bool hasApplicableKeys = std::any_of(
         profile.settings.begin(),
@@ -10153,7 +10158,7 @@ std::optional<std::uint32_t> ApplyWaterKeyedSettingsClip(
     }
 
     WaterFeatureSettingsClip clip{
-        .id = AllocateWaterFeatureClipId(*timeline),
+        .id = AllocateWaterFeatureClipId(candidate),
         .name = !clipName.empty()
                     ? std::move(clipName)
                     : (!profile.baseProfileName.empty()
@@ -10164,7 +10169,7 @@ std::optional<std::uint32_t> ApplyWaterKeyedSettingsClip(
         .sourceProfileName = profile.name,
     };
     const std::uint32_t clipId = clip.id;
-    timeline->clips.push_back(
+    candidate.clips.push_back(
         SanitizeWaterFeatureSettingsClip(std::move(clip)));
 
     for (const auto& packaged : profile.settings) {
@@ -10181,12 +10186,12 @@ std::optional<std::uint32_t> ApplyWaterKeyedSettingsClip(
             continue;
         }
         auto* track = [&]() -> WaterKeyedSettingTrack* {
-            for (auto& setting : timeline->settings) {
+            for (auto& setting : candidate.settings) {
                 if (setting.settingId == packaged.settingId) {
                     return &setting;
                 }
             }
-            timeline->settings.push_back(WaterKeyedSettingTrack{
+            candidate.settings.push_back(WaterKeyedSettingTrack{
                 .settingId = packaged.settingId,
                 .active = packaged.active,
                 .label = packaged.label,
@@ -10195,7 +10200,7 @@ std::optional<std::uint32_t> ApplyWaterKeyedSettingsClip(
                 .defaultInterpolation = packaged.defaultInterpolation,
                 .keys = {},
             });
-            return &timeline->settings.back();
+            return &candidate.settings.back();
         }();
         for (const auto& key : packaged.keys) {
             const float desiredPosition = RemapWaterClipPosition(
@@ -10210,7 +10215,7 @@ std::optional<std::uint32_t> ApplyWaterKeyedSettingsClip(
                 windowStart,
                 windowEnd);
             if (!position.has_value()) {
-                continue;
+                return std::nullopt;
             }
             auto appliedKey = key;
             appliedKey.position = position.value();
@@ -10237,8 +10242,9 @@ std::optional<std::uint32_t> ApplyWaterKeyedSettingsClip(
                 return left.position < right.position;
             });
     }
-    (void)SynchronizeWaterFeatureClipBounds(timeline, clipId);
-    SortWaterFeatureClips(&timeline->clips);
+    (void)SynchronizeWaterFeatureClipBounds(&candidate, clipId);
+    SortWaterFeatureClips(&candidate.clips);
+    *timeline = std::move(candidate);
     return clipId;
 }
 
