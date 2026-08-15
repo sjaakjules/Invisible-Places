@@ -137,6 +137,12 @@ New Water setting tracks now default to **Monotone Spline**, while saved and leg
 
 **Save Package** adds the captured keys to the project-owned `water_keyed_settings_profiles` library; **Save Project** (or Save Changes on close) serializes that library into the authoritative OneDrive project JSON. Concurrent project saves three-way merge named packages, their setting tracks, and individual key positions/fields, so an unrelated Timing Take edit on one computer and package/profile edit on the other combine automatically.
 
+**Save Project** and orderly close are save-all transactions: they write this
+project-owned Water state and every changed `.ipanim.json` camera animation
+together. The dialog labels both ownership domains explicitly and does not
+allow the project or a changed animation to be deselected from those two
+workflows.
+
 Water key authoring keeps one atomic edit of session history. **Ctrl+Z** on Windows/Linux or **Cmd+Z** on macOS restores the state before the latest key, keyed-setting, or settings-clip edit; pressing the same shortcut again reapplies it. A complete slider, key, spline-handle, or clip drag is one edit. When a text or numeric input is focused, the shortcut remains the input field's native text undo instead.
 
 ## Serialization Contract

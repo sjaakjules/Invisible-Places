@@ -636,7 +636,11 @@ feature, setting and key edits shall combine automatically, while overlapping
 field edits shall require an explicit local-or-OneDrive choice. Animation files
 shall retain strict whole-file revision validation. Every target shall be
 rechecked after staging, and a mid-save conflict shall preserve local recovery
-JSON. Because OneDrive cannot enforce an offline distributed lock, both
+JSON. **Save Project** and orderly close shall write the project together with
+every changed animation as one non-deselectable save-all transaction. The save
+dialog shall explain that Water packages, Feature Run clips/keys, and Timing
+Takes are project-owned while camera paths and animation metadata live in the
+listed animation files. Because OneDrive cannot enforce an offline distributed lock, both
 machines shall allow cloud sync to settle before opening and after saving.
 
 ### 6.3 Reliability

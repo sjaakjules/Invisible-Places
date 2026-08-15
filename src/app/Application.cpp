@@ -467,6 +467,9 @@ struct ProjectMergeDialogState {
 struct SaveChangesDialogState {
     bool requested = false;
     bool closeAfterSave = false;
+    // Save Project is a save-all transaction just like orderly close: the
+    // project and every changed animation are selected and cannot be split.
+    bool projectSaveAll = false;
     bool allowItemSelection = true;
     bool waitingForRenderCancellation = false;
     bool exitConfirmed = false;
@@ -67087,7 +67090,9 @@ void RequestSaveChangesDialog(
     dialog = {};
     dialog.requested = true;
     dialog.closeAfterSave = request == SaveChangesRequest::Closing;
-    dialog.allowItemSelection = !dialog.closeAfterSave;
+    dialog.projectSaveAll = request == SaveChangesRequest::Project;
+    dialog.allowItemSelection =
+        !dialog.closeAfterSave && !dialog.projectSaveAll;
     dialog.animationSaveAs =
         request == SaveChangesRequest::AnimationAs;
     const auto currentRegistryIndex =
@@ -68406,7 +68411,9 @@ void DrawSaveChangesDialog(PreviewRuntimeState* runtimeState) {
 
     ImGui::TextWrapped(
         dialog.closeAfterSave
-            ? "These files contain the session state that can be saved before Invisible Places closes."
+            ? "All changed project and animation files are saved together before Invisible Places closes. The project contains Water packages, Feature Run clips and keys, Timing Takes, visuals, and other project authoring; animation files contain camera paths and animation-owned settings."
+        : dialog.projectSaveAll
+            ? "Save the complete project together with every changed animation. Water packages, Feature Run clips and keys, and Timing Takes live in the project; camera-path edits live in the listed animation files."
         : dialog.animationPairSaveAs
             ? "Save the processed A/B animations as a new linked pair. Both animations and the project are written atomically."
             : "Select the changed files to save together.");
@@ -68529,6 +68536,11 @@ void DrawSaveChangesDialog(PreviewRuntimeState* runtimeState) {
                                    ? std::string{"No file selected"}
                                    : item.targetPath.string();
         ImGui::TextDisabled("%s", pathLabel.c_str());
+        ImGui::TextDisabled(
+            "%s",
+            item.kind == SaveChangesItemKind::Project
+                ? "Includes Water packages, Feature Run clips/keys, Timing Takes, visuals, and project state."
+                : "Includes the camera path, animation metadata, and selected Timing Take association.");
         ImGui::Unindent();
         ImGui::PopID();
         ImGui::PopID();
@@ -68665,6 +68677,8 @@ void DrawSaveChangesDialog(PreviewRuntimeState* runtimeState) {
     const char* saveButtonLabel =
         dialog.closeAfterSave
             ? "Save All and Close"
+        : dialog.projectSaveAll
+            ? "Save Project and Changed Animations"
         : dialog.projectMerge.has_value() && projectSelected
             ? "Merge and Save"
         : dialog.animationPairSaveAs
@@ -68771,10 +68785,14 @@ void DrawProjectSection(
     ImGui::Spacing();
 
     InputTextString("Project File", &runtimeState->persistence.projectFilePath);
-    if (ImGui::Button("Save Project")) {
+    if (ImGui::Button("Save Project + Animations")) {
         RequestSaveChangesDialog(
             runtimeState,
             SaveChangesRequest::Project);
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+        ImGui::SetTooltip(
+            "Saves project-owned Water packages, Feature Run clips/keys, Timing Takes, visuals, and project state together with every changed animation file.");
     }
 
     ImGui::SameLine();
