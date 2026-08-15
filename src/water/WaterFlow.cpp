@@ -8690,6 +8690,23 @@ WaterKeyedSettingsProfile SanitizeWaterKeyedSettingsProfile(
     return profile;
 }
 
+std::optional<std::size_t> FindWaterKeyedSettingsProfileIndex(
+    std::span<const WaterKeyedSettingsProfile> profiles,
+    WaterKeyedFeatureKind featureKind,
+    std::string_view name) {
+    const auto normalizedName = TrimSeepageName(name);
+    if (normalizedName.empty()) {
+        return std::nullopt;
+    }
+    for (std::size_t index = 0U; index < profiles.size(); ++index) {
+        if (profiles[index].featureKind == featureKind &&
+            TrimSeepageName(profiles[index].name) == normalizedName) {
+            return index;
+        }
+    }
+    return std::nullopt;
+}
+
 std::vector<WaterKeyedSettingsProfile>
 SanitizeWaterKeyedSettingsProfileLibrary(
     std::vector<WaterKeyedSettingsProfile> profiles) {
@@ -8699,12 +8716,11 @@ SanitizeWaterKeyedSettingsProfileLibrary(
         auto sanitized = SanitizeWaterKeyedSettingsProfile(
             std::move(profile));
         if (sanitized.name.empty() ||
-            std::any_of(
-                kept.begin(),
-                kept.end(),
-                [&](const WaterKeyedSettingsProfile& existing) {
-                    return existing.name == sanitized.name;
-                })) {
+            FindWaterKeyedSettingsProfileIndex(
+                kept,
+                sanitized.featureKind,
+                sanitized.name)
+                .has_value()) {
             continue;
         }
         kept.push_back(std::move(sanitized));

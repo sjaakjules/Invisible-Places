@@ -302,6 +302,48 @@ TEST_CASE("project merge combines independent timing and package edits",
                        [0]["keys"][0]["value"] == 0.6);
 }
 
+TEST_CASE("project merge scopes package names to water feature kind",
+          "[workspace][conflict][merge][water][packages]") {
+    const nlohmann::json baseline = {
+        {"water_keyed_settings_profiles", nlohmann::json::array()},
+    };
+    auto local = baseline;
+    local["water_keyed_settings_profiles"].push_back({
+        {"name", "Start"},
+        {"feature_kind", "seepage_node"},
+        {"settings",
+         nlohmann::json::array({
+             {{"id", "strength"},
+              {"keys",
+               nlohmann::json::array({
+                   {{"position", 0.0}, {"value", 0.0}},
+               })}},
+         })},
+    });
+    auto remote = baseline;
+    remote["water_keyed_settings_profiles"].push_back({
+        {"name", "Start"},
+        {"feature_kind", "flow_path"},
+        {"settings",
+         nlohmann::json::array({
+             {{"id", "trail_width"},
+              {"keys",
+               nlohmann::json::array({
+                   {{"position", 0.0}, {"value", 0.25}},
+               })}},
+         })},
+    });
+
+    const auto result = MergeJsonDocuments(baseline, local, remote);
+    CHECK(result.conflicts.empty());
+    const auto& profiles = result.merged["water_keyed_settings_profiles"];
+    REQUIRE(profiles.size() == 2U);
+    CHECK(profiles[0]["name"] == "Start");
+    CHECK(profiles[0]["feature_kind"] == "seepage_node");
+    CHECK(profiles[1]["name"] == "Start");
+    CHECK(profiles[1]["feature_kind"] == "flow_path");
+}
+
 TEST_CASE("project merge reports and resolves one overlapping scalar edit",
           "[workspace][conflict][merge]") {
     const nlohmann::json baseline = {

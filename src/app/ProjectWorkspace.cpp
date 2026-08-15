@@ -417,6 +417,8 @@ std::optional<std::string> ObjectIdentity(const nlohmann::json& value) {
              std::pair<std::string_view, std::string_view>{
                  "take_id", "scene_group"},
              std::pair<std::string_view, std::string_view>{
+                 "feature_kind", "name"},
+             std::pair<std::string_view, std::string_view>{
                  "kind", "object_id"},
              std::pair<std::string_view, std::string_view>{
                  "parameter", "position"},

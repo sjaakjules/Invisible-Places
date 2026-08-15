@@ -668,6 +668,14 @@ ParseWaterKeyedFeatureKindName(std::string_view name);
     const WaterKeyedSettingTrack& right);
 [[nodiscard]] WaterKeyedSettingsProfile SanitizeWaterKeyedSettingsProfile(
     WaterKeyedSettingsProfile profile);
+// Package/profile names are scoped to their feature kind. This lets a Seepage
+// package and a Flow Path package share a user-facing name without replacing
+// one another in the project-owned library.
+[[nodiscard]] std::optional<std::size_t>
+FindWaterKeyedSettingsProfileIndex(
+    std::span<const WaterKeyedSettingsProfile> profiles,
+    WaterKeyedFeatureKind featureKind,
+    std::string_view name);
 // Sanitizes the project-owned keyed-settings library without narrowing it to
 // one feature kind. Clip packages are shared by Rain, Flow, Shoreline, and
 // Seepage authoring, while full-length Flow Path profiles use the same store.

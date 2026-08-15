@@ -512,9 +512,11 @@ new keys shall remain loose and visible in a dashed loose-key block alongside
 clips. Clip keys shall use distinct square and diamond graph markers, and their
 first and last key shall derive the clip bounds. Blocks
 shall indicate the primary keyed value by fill brightness, not curves. A clip
-shall save as a reusable package that records its native length; packages
-shall apply to any same-kind feature at any position and stretch to any
-length. Clip operations shall rewrite only the grouped keys — evaluation,
+shall save as a reusable package that records its native length; package
+identity shall be feature kind plus name, so same-named packages for different
+feature kinds coexist. Packages shall apply to any same-kind feature at any
+position and stretch to any length. Clip operations shall rewrite only the
+grouped keys — evaluation,
 per-key editing, and compiled export snapshots are unchanged — and Timing
 Take retiming shall carry clip bounds with their keys. Project schema 74 and
 water-sources schema 28 introduced clips and package lengths; project schema

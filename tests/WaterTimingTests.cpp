@@ -1922,6 +1922,67 @@ TEST_CASE("Project keyed-settings cleanup preserves packages for every water fea
     }
 }
 
+TEST_CASE("Keyed-settings package identity includes feature kind",
+          "[water][timing][keyed][profiles][packages]") {
+    using invisible_places::water::FindWaterKeyedSettingsProfileIndex;
+    using invisible_places::water::SanitizeWaterKeyedSettingsProfileLibrary;
+    using invisible_places::water::WaterKeyedFeatureKind;
+    using invisible_places::water::WaterKeyedSettingsProfile;
+
+    std::vector<WaterKeyedSettingsProfile> profiles{
+        {
+            .name = " Start ",
+            .featureKind = WaterKeyedFeatureKind::SeepageNode,
+            .settings = {{
+                .settingId = "strength",
+                .keys = {{.position = 0.0F, .value = 0.0F}},
+            }},
+        },
+        {
+            .name = "Start",
+            .featureKind = WaterKeyedFeatureKind::FlowPath,
+            .settings = {{
+                .settingId = "trail_width",
+                .keys = {{.position = 0.0F, .value = 0.25F}},
+            }},
+        },
+        {
+            .name = "Start",
+            .featureKind = WaterKeyedFeatureKind::SeepageNode,
+            .settings = {{
+                .settingId = "prominence",
+                .keys = {{.position = 0.0F, .value = 1.0F}},
+            }},
+        },
+    };
+
+    const auto sanitized =
+        SanitizeWaterKeyedSettingsProfileLibrary(std::move(profiles));
+    REQUIRE(sanitized.size() == 2U);
+
+    const auto seepage = FindWaterKeyedSettingsProfileIndex(
+        sanitized,
+        WaterKeyedFeatureKind::SeepageNode,
+        " Start ");
+    const auto flowPath = FindWaterKeyedSettingsProfileIndex(
+        sanitized,
+        WaterKeyedFeatureKind::FlowPath,
+        "Start");
+    REQUIRE(seepage.has_value());
+    REQUIRE(flowPath.has_value());
+    CHECK(seepage.value() != flowPath.value());
+    CHECK(sanitized[seepage.value()].settings.front().settingId ==
+          "strength");
+    CHECK(sanitized[flowPath.value()].settings.front().settingId ==
+          "trail_width");
+    CHECK_FALSE(
+        FindWaterKeyedSettingsProfileIndex(
+            sanitized,
+            WaterKeyedFeatureKind::FlowSource,
+            "Start")
+            .has_value());
+}
+
 TEST_CASE("Keyed profile equality includes interpolation defaults and spline handles",
           "[water][timing][keyed][profiles][interpolation]") {
     using invisible_places::water::WaterKeyedSettingTrack;
