@@ -72559,7 +72559,7 @@ std::optional<std::uint32_t> SelectedWaterClipIdForFeature(
     return selection->clips.front().clipId;
 }
 
-void AddOrUpdateWaterTimelineSettingKey(
+void AddOrUpdateWaterTimelineSettingKeyFromUi(
     invisible_places::water::WaterFeatureTimeline* timeline,
     invisible_places::water::WaterKeyedSettingTrack* track,
     float position,
@@ -72567,42 +72567,13 @@ void AddOrUpdateWaterTimelineSettingKey(
     invisible_places::water::WaterScenarioInterpolation interpolation =
         invisible_places::water::WaterScenarioInterpolation::TrackDefault,
     std::optional<std::uint32_t> selectedClipId = std::nullopt) {
-    if (timeline == nullptr || track == nullptr) {
-        return;
-    }
-    std::uint32_t previousClipId = 0U;
-    for (const auto& key : track->keys) {
-        if (std::abs(key.position - position) <= 1.0e-4F) {
-            previousClipId = key.clipId;
-            break;
-        }
-    }
-    if (selectedClipId.has_value() &&
-        invisible_places::water::FindWaterFeatureClip(
-            timeline,
-            selectedClipId.value()) == nullptr) {
-        selectedClipId.reset();
-    }
-    if (selectedClipId.has_value()) {
-        timeline->clipMembershipExplicit = true;
-    }
-    invisible_places::water::AddOrUpdateWaterSettingKey(
+    invisible_places::water::AddOrUpdateWaterTimelineSettingKey(
+        timeline,
         track,
         position,
         value,
         interpolation,
         selectedClipId);
-    if (previousClipId != 0U) {
-        (void)invisible_places::water::SynchronizeWaterFeatureClipBounds(
-            timeline,
-            previousClipId);
-    }
-    if (selectedClipId.value_or(0U) != 0U &&
-        selectedClipId.value_or(0U) != previousClipId) {
-        (void)invisible_places::water::SynchronizeWaterFeatureClipBounds(
-            timeline,
-            selectedClipId.value());
-    }
 }
 
 std::size_t RemoveWaterTimelineSettingKeysAtPosition(
@@ -72981,7 +72952,7 @@ KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
                             std::string{profileName};
                     }
                 }
-                AddOrUpdateWaterTimelineSettingKey(
+                AddOrUpdateWaterTimelineSettingKeyFromUi(
                     mutableTimeline,
                     mutableTrack,
                     position,
@@ -73383,7 +73354,7 @@ KeyedWaterSliderResult DrawKeyedWaterColourSetting(
                                 std::string{profileName};
                         }
                     }
-                    AddOrUpdateWaterTimelineSettingKey(
+                    AddOrUpdateWaterTimelineSettingKeyFromUi(
                             mutableTimeline,
                             &*mutableTrack,
                             position,
@@ -75484,22 +75455,9 @@ bool FlowPathProfileTracksEqual(
          ++settingIndex) {
         const auto& a = left[settingIndex];
         const auto& b = right[settingIndex];
-        if (a.settingId != b.settingId || a.active != b.active ||
-            a.label != b.label || a.profileGroup != b.profileGroup ||
-            a.profileName != b.profileName ||
-            a.keys.size() != b.keys.size()) {
+        if (!invisible_places::water::
+                WaterKeyedSettingTrackProfileEqual(a, b)) {
             return false;
-        }
-        for (std::size_t keyIndex = 0U;
-             keyIndex < a.keys.size();
-             ++keyIndex) {
-            const auto& aKey = a.keys[keyIndex];
-            const auto& bKey = b.keys[keyIndex];
-            if (aKey.position != bKey.position ||
-                aKey.value != bKey.value ||
-                aKey.interpolation != bKey.interpolation) {
-                return false;
-            }
         }
     }
     return true;
@@ -81823,7 +81781,7 @@ void DrawWaterRunTimingGraph(
             lane.feature);
         if (lane.track != nullptr && lane.track->active &&
             !lane.track->keys.empty()) {
-            AddOrUpdateWaterTimelineSettingKey(
+            AddOrUpdateWaterTimelineSettingKeyFromUi(
                 lane.timeline,
                 lane.track,
                 position,
@@ -82136,7 +82094,7 @@ void DrawWaterRunTimingGraph(
                         mouse.y - drag.grabOffsetY),
                     drag.rangeMinimum,
                     drag.rangeMaximum);
-                AddOrUpdateWaterTimelineSettingKey(
+                AddOrUpdateWaterTimelineSettingKeyFromUi(
                     series[draggedSeries.value()].timeline,
                     track,
                     drag.currentPosition,
@@ -82624,7 +82582,7 @@ void DrawWaterRunTimingGraph(
                             info->minimum,
                             info->maximum);
                     }
-                    AddOrUpdateWaterTimelineSettingKey(
+                    AddOrUpdateWaterTimelineSettingKeyFromUi(
                         series[index].timeline,
                         track,
                         editor->draftPosition,
@@ -82702,7 +82660,7 @@ void DrawWaterRunTimingGraph(
                 track = &timeline->settings.back();
             }
             track->active = true;
-            AddOrUpdateWaterTimelineSettingKey(
+            AddOrUpdateWaterTimelineSettingKeyFromUi(
                 timeline,
                 track,
                 add.position,

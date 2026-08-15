@@ -8586,6 +8586,34 @@ WaterKeyedSettingTrack SanitizeWaterKeyedSettingTrack(
     return track;
 }
 
+bool WaterKeyedSettingTrackProfileEqual(
+    const WaterKeyedSettingTrack& left,
+    const WaterKeyedSettingTrack& right) {
+    if (left.settingId != right.settingId ||
+        left.active != right.active ||
+        left.label != right.label ||
+        left.profileGroup != right.profileGroup ||
+        left.profileName != right.profileName ||
+        left.defaultInterpolation != right.defaultInterpolation ||
+        left.keys.size() != right.keys.size()) {
+        return false;
+    }
+    for (std::size_t index = 0U; index < left.keys.size(); ++index) {
+        const auto& a = left.keys[index];
+        const auto& b = right.keys[index];
+        if (a.position != b.position ||
+            a.value != b.value ||
+            a.interpolation != b.interpolation ||
+            a.incomingHandleTime != b.incomingHandleTime ||
+            a.incomingHandleValue != b.incomingHandleValue ||
+            a.outgoingHandleTime != b.outgoingHandleTime ||
+            a.outgoingHandleValue != b.outgoingHandleValue) {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::string WaterKeyedSettingsProfileSavedName(
     std::string_view baseProfileName,
     std::string_view objectName) {
@@ -9056,6 +9084,59 @@ void AddOrUpdateWaterSettingKey(
         [](const WaterSettingKey& left, const WaterSettingKey& right) {
             return left.position < right.position;
         });
+}
+
+void AddOrUpdateWaterTimelineSettingKey(
+    WaterFeatureTimeline* timeline,
+    WaterKeyedSettingTrack* track,
+    float position,
+    float value,
+    WaterScenarioInterpolation interpolation,
+    std::optional<std::uint32_t> selectedClipId) {
+    if (timeline == nullptr || track == nullptr) {
+        return;
+    }
+    constexpr float kReplacementTolerance = 1.0e-4F;
+    const auto existing = std::find_if(
+        track->keys.begin(),
+        track->keys.end(),
+        [&](const WaterSettingKey& key) {
+            return std::abs(key.position - position) <=
+                   kReplacementTolerance;
+        });
+    const bool replacingExisting = existing != track->keys.end();
+    const std::uint32_t previousClipId =
+        replacingExisting ? existing->clipId : 0U;
+    if (selectedClipId.has_value() &&
+        FindWaterFeatureClip(timeline, selectedClipId.value()) == nullptr) {
+        selectedClipId.reset();
+    }
+    // FR-STYLE-12 assigns only newly authored keys to the single selected
+    // stored clip. Supplying no id to the lower-level replacement API keeps
+    // an existing key's explicit owner intact.
+    const auto newKeyClipId = replacingExisting
+                                  ? std::nullopt
+                                  : selectedClipId;
+    if (newKeyClipId.has_value()) {
+        timeline->clipMembershipExplicit = true;
+    }
+    AddOrUpdateWaterSettingKey(
+        track,
+        position,
+        value,
+        interpolation,
+        newKeyClipId);
+    if (previousClipId != 0U) {
+        (void)SynchronizeWaterFeatureClipBounds(
+            timeline,
+            previousClipId);
+    }
+    if (newKeyClipId.value_or(0U) != 0U &&
+        newKeyClipId.value_or(0U) != previousClipId) {
+        (void)SynchronizeWaterFeatureClipBounds(
+            timeline,
+            newKeyClipId.value());
+    }
 }
 
 bool MoveWaterSettingKey(
@@ -10118,6 +10199,19 @@ std::optional<std::uint32_t> ApplyWaterKeyedSettingsClip(
             auto appliedKey = key;
             appliedKey.position = position.value();
             appliedKey.clipId = clipId;
+            if (appliedKey.interpolation ==
+                WaterScenarioInterpolation::TrackDefault &&
+                track->defaultInterpolation !=
+                    packaged.defaultInterpolation) {
+                // A package carries its own track default. Materialize it on
+                // copied keys rather than restyling unrelated keys already
+                // present on the destination track.
+                appliedKey.interpolation =
+                    packaged.defaultInterpolation ==
+                            WaterScenarioInterpolation::TrackDefault
+                        ? WaterScenarioInterpolation::SmoothVelocity
+                        : packaged.defaultInterpolation;
+            }
             track->keys.push_back(appliedKey);
         }
         std::stable_sort(

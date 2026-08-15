@@ -1922,6 +1922,50 @@ TEST_CASE("Project keyed-settings cleanup preserves packages for every water fea
     }
 }
 
+TEST_CASE("Keyed profile equality includes interpolation defaults and spline handles",
+          "[water][timing][keyed][profiles][interpolation]") {
+    using invisible_places::water::WaterKeyedSettingTrack;
+    using invisible_places::water::WaterKeyedSettingTrackProfileEqual;
+    using invisible_places::water::WaterScenarioInterpolation;
+
+    WaterKeyedSettingTrack baseline{
+        .settingId = "strength",
+        .defaultInterpolation = WaterScenarioInterpolation::SmoothVelocity,
+        .keys = {{
+            .position = 0.25F,
+            .value = 0.4F,
+            .interpolation = WaterScenarioInterpolation::SplineHandles,
+            .incomingHandleTime = 0.2F,
+            .incomingHandleValue = -0.1F,
+            .outgoingHandleTime = 0.4F,
+            .outgoingHandleValue = 0.3F,
+        }},
+    };
+    auto edited = baseline;
+    CHECK(WaterKeyedSettingTrackProfileEqual(baseline, edited));
+
+    edited.defaultInterpolation = WaterScenarioInterpolation::Smooth;
+    CHECK_FALSE(WaterKeyedSettingTrackProfileEqual(baseline, edited));
+    edited = baseline;
+    edited.keys.front().incomingHandleTime += 0.01F;
+    CHECK_FALSE(WaterKeyedSettingTrackProfileEqual(baseline, edited));
+    edited = baseline;
+    edited.keys.front().incomingHandleValue += 0.01F;
+    CHECK_FALSE(WaterKeyedSettingTrackProfileEqual(baseline, edited));
+    edited = baseline;
+    edited.keys.front().outgoingHandleTime += 0.01F;
+    CHECK_FALSE(WaterKeyedSettingTrackProfileEqual(baseline, edited));
+    edited = baseline;
+    edited.keys.front().outgoingHandleValue += 0.01F;
+    CHECK_FALSE(WaterKeyedSettingTrackProfileEqual(baseline, edited));
+
+    // Clip membership is independent authoring metadata and does not make a
+    // whole-timeline keyed profile dirty by itself.
+    edited = baseline;
+    edited.keys.front().clipId = 42U;
+    CHECK(WaterKeyedSettingTrackProfileEqual(baseline, edited));
+}
+
 TEST_CASE("Schema 46 timing tracks migrate with active legacy defaults",
           "[water][timing][keyed][serialization][migration]") {
     using invisible_places::serialization::kProjectDocumentSchemaVersion;
@@ -2598,6 +2642,86 @@ TEST_CASE("Settings clips capture, apply, and duplicate as packages",
     CHECK(strengthKeys[6].value == Approx(1.0F));
 }
 
+TEST_CASE("Applied packages preserve their track-default interpolation when stretched",
+          "[water][timing][keyed][clips][packages][interpolation]") {
+    using Catch::Approx;
+    using invisible_places::water::ApplyWaterKeyedSettingsClip;
+    using invisible_places::water::EvaluateWaterKeyedSettingTrack;
+    using invisible_places::water::TransformWaterFeatureClip;
+    using invisible_places::water::WaterFeatureTimeline;
+    using invisible_places::water::WaterKeyedFeatureKind;
+    using invisible_places::water::WaterKeyedSettingsProfile;
+    using invisible_places::water::WaterScenarioInterpolation;
+
+    WaterKeyedSettingsProfile package{
+        .name = "Monotone Start",
+        .featureKind = WaterKeyedFeatureKind::SeepageNode,
+        .nativeLengthFraction = 0.4F,
+        .settings = {{
+            .settingId = "strength",
+            .defaultInterpolation =
+                WaterScenarioInterpolation::SmoothVelocity,
+            .keys = {
+                {.position = 0.0F, .value = 0.0F},
+                {.position = 0.2F, .value = 0.05F},
+                {.position = 0.6F, .value = 0.35F},
+                {.position = 1.0F, .value = 1.0F},
+            },
+        }},
+    };
+    WaterFeatureTimeline target;
+    target.feature = {
+        .kind = WaterKeyedFeatureKind::SeepageNode,
+        .objectId = 9U};
+    target.settings = {{
+        .settingId = "strength",
+        .defaultInterpolation = WaterScenarioInterpolation::Smooth,
+    }};
+
+    const auto applied = ApplyWaterKeyedSettingsClip(
+        &target,
+        package,
+        0.2F,
+        0.6F,
+        "Start");
+    REQUIRE(applied.has_value());
+    REQUIRE(target.settings.front().keys.size() == 4U);
+    for (const auto& key : target.settings.front().keys) {
+        CHECK(key.interpolation ==
+              WaterScenarioInterpolation::SmoothVelocity);
+    }
+    for (int sample = 0; sample <= 100; ++sample) {
+        const float amount = static_cast<float>(sample) / 100.0F;
+        const auto expected = EvaluateWaterKeyedSettingTrack(
+            package.settings.front(),
+            amount);
+        const auto actual = EvaluateWaterKeyedSettingTrack(
+            target.settings.front(),
+            0.2F + amount * 0.4F);
+        REQUIRE(expected.has_value());
+        REQUIRE(actual.has_value());
+        CHECK(actual.value() == Approx(expected.value()).margin(1.0e-5F));
+    }
+
+    REQUIRE(TransformWaterFeatureClip(
+        &target,
+        applied.value(),
+        0.1F,
+        0.9F));
+    for (int sample = 0; sample <= 100; ++sample) {
+        const float amount = static_cast<float>(sample) / 100.0F;
+        const auto expected = EvaluateWaterKeyedSettingTrack(
+            package.settings.front(),
+            amount);
+        const auto actual = EvaluateWaterKeyedSettingTrack(
+            target.settings.front(),
+            0.1F + amount * 0.8F);
+        REQUIRE(expected.has_value());
+        REQUIRE(actual.has_value());
+        CHECK(actual.value() == Approx(expected.value()).margin(1.0e-5F));
+    }
+}
+
 TEST_CASE("Settings clips transfer between features of one kind only",
           "[water][timing][keyed][clips]") {
     using Catch::Approx;
@@ -3088,6 +3212,7 @@ TEST_CASE("Explicit clip membership routes new keys and derives clip bounds",
           "[water][timing][keyed][clips]") {
     using Catch::Approx;
     using invisible_places::water::AddOrUpdateWaterSettingKey;
+    using invisible_places::water::AddOrUpdateWaterTimelineSettingKey;
     using invisible_places::water::CaptureWaterKeyedSettingsClipById;
     using invisible_places::water::SynchronizeWaterFeatureClipBounds;
     using invisible_places::water::WaterFeatureLooseKeySpan;
@@ -3147,4 +3272,23 @@ TEST_CASE("Explicit clip membership routes new keys and derives clip bounds",
         package.settings.front().keys.begin(),
         package.settings.front().keys.end(),
         [](const auto& key) { return key.clipId == 0U; }));
+
+    timeline.clips.push_back(
+        {.id = 8U, .name = "Other", .start = 0.80F, .end = 0.90F});
+    AddOrUpdateWaterTimelineSettingKey(
+        &timeline,
+        &timeline.settings.front(),
+        0.20F,
+        0.9F,
+        WaterScenarioInterpolation::SmoothVelocity,
+        8U);
+    const auto edited = std::find_if(
+        timeline.settings.front().keys.begin(),
+        timeline.settings.front().keys.end(),
+        [](const auto& key) {
+            return std::abs(key.position - 0.20F) <= 1.0e-4F;
+        });
+    REQUIRE(edited != timeline.settings.front().keys.end());
+    CHECK(edited->value == Approx(0.9F));
+    CHECK(edited->clipId == 7U);
 }

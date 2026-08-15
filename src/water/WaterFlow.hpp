@@ -660,6 +660,12 @@ ParseWaterKeyedFeatureKindName(std::string_view name);
 
 [[nodiscard]] WaterKeyedSettingTrack SanitizeWaterKeyedSettingTrack(
     WaterKeyedSettingTrack track);
+// Profile equality includes curve defaults and manual handle geometry, but
+// deliberately ignores clip ownership because whole-timeline profiles do not
+// carry settings-clip grouping.
+[[nodiscard]] bool WaterKeyedSettingTrackProfileEqual(
+    const WaterKeyedSettingTrack& left,
+    const WaterKeyedSettingTrack& right);
 [[nodiscard]] WaterKeyedSettingsProfile SanitizeWaterKeyedSettingsProfile(
     WaterKeyedSettingsProfile profile);
 // Sanitizes the project-owned keyed-settings library without narrowing it to
@@ -705,6 +711,16 @@ void AddOrUpdateWaterSettingKey(
     WaterScenarioInterpolation interpolation =
         WaterScenarioInterpolation::TrackDefault,
     std::optional<std::uint32_t> clipId = std::nullopt);
+// Timeline-aware UI authoring: one selected clip owns genuinely new keys,
+// while editing a key already at this time preserves its current clip.
+void AddOrUpdateWaterTimelineSettingKey(
+    WaterFeatureTimeline* timeline,
+    WaterKeyedSettingTrack* track,
+    float position,
+    float value,
+    WaterScenarioInterpolation interpolation =
+        WaterScenarioInterpolation::TrackDefault,
+    std::optional<std::uint32_t> selectedClipId = std::nullopt);
 // Moves one key without overwriting another key in the same setting track.
 // Source matching and destination occupancy use the same 1e-4 tolerance as
 // insertion and navigation.
