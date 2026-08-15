@@ -75395,17 +75395,13 @@ void DrawWaterKeyedProfilesCombo(
 
 std::optional<std::size_t> FindWaterKeyedSettingsProfileIndex(
     const WaterWorkflowState& water,
+    invisible_places::water::WaterKeyedFeatureKind featureKind,
     std::string_view name) {
-    const auto normalized = TrimText(name);
-    for (std::size_t index = 0U;
-         index < water.keyedSettingsProfiles.size();
-         ++index) {
-        if (TrimText(water.keyedSettingsProfiles[index].name) ==
-            normalized) {
-            return index;
-        }
-    }
-    return std::nullopt;
+    return invisible_places::water::
+        FindWaterKeyedSettingsProfileIndex(
+            water.keyedSettingsProfiles,
+            featureKind,
+            name);
 }
 
 std::string FlowPathKeyedSettingsBaseName(
@@ -75413,6 +75409,7 @@ std::string FlowPathKeyedSettingsBaseName(
     const WaterManualFlowPathSource& source) {
     if (const auto profileIndex = FindWaterKeyedSettingsProfileIndex(
             water,
+            invisible_places::water::WaterKeyedFeatureKind::FlowPath,
             source.keyedSettingsProfileName);
         profileIndex.has_value()) {
         return BaseWaterProfileName(
@@ -75524,6 +75521,7 @@ void MarkFlowPathKeyedSettingsEdited(
         source->keyedSettingsProfileName;
     const auto priorIndex = FindWaterKeyedSettingsProfileIndex(
         water,
+        invisible_places::water::WaterKeyedFeatureKind::FlowPath,
         priorAssignment);
     const auto* priorProfile =
         priorIndex.has_value()
@@ -75590,6 +75588,7 @@ void SyncFlowPathKeyedSettingsProfileFromTimeline(
     }
     const auto profileIndex = FindWaterKeyedSettingsProfileIndex(
         runtimeState->water,
+        invisible_places::water::WaterKeyedFeatureKind::FlowPath,
         source->keyedSettingsProfileName);
     const auto* timeline = FindMutableWaterFeatureTimeline(
         &runtimeState->water,
@@ -75660,6 +75659,7 @@ void SaveFlowPathKeyedSettingsProfile(
         water.keyedSettingsProfiles.end());
     const auto savedIndex = FindWaterKeyedSettingsProfileIndex(
         water,
+        invisible_places::water::WaterKeyedFeatureKind::FlowPath,
         savedName);
     if (savedIndex.has_value()) {
         water.keyedSettingsProfiles[savedIndex.value()] =
@@ -75683,6 +75683,7 @@ void DiscardFlowPathKeyedSettingsEdits(
     auto& water = runtimeState->water;
     const auto editedIndex = FindWaterKeyedSettingsProfileIndex(
         water,
+        invisible_places::water::WaterKeyedFeatureKind::FlowPath,
         source->keyedSettingsProfileName);
     if (!editedIndex.has_value() ||
         !water.keyedSettingsProfiles[editedIndex.value()].edited) {
@@ -75691,6 +75692,7 @@ void DiscardFlowPathKeyedSettingsEdits(
     const auto edited = water.keyedSettingsProfiles[editedIndex.value()];
     const auto sourceIndex = FindWaterKeyedSettingsProfileIndex(
         water,
+        invisible_places::water::WaterKeyedFeatureKind::FlowPath,
         edited.sourceProfileName);
     const auto restored =
         sourceIndex.has_value()
@@ -75725,6 +75727,7 @@ void DrawFlowPathKeyedSettingsProfileControls(
         feature);
     const auto selectedIndex = FindWaterKeyedSettingsProfileIndex(
         water,
+        invisible_places::water::WaterKeyedFeatureKind::FlowPath,
         source->keyedSettingsProfileName);
     const std::string preview =
         selectedIndex.has_value()
@@ -75798,6 +75801,7 @@ void DrawFlowPathKeyedSettingsProfileControls(
     ImGui::EndDisabled();
     const auto currentIndex = FindWaterKeyedSettingsProfileIndex(
         water,
+        invisible_places::water::WaterKeyedFeatureKind::FlowPath,
         source->keyedSettingsProfileName);
     const bool hasEdited =
         currentIndex.has_value() &&
@@ -83351,6 +83355,7 @@ void DrawWaterClipPackagePopup(
                     SanitizeWaterKeyedSettingsProfile(std::move(package));
                 const auto existing = FindWaterKeyedSettingsProfileIndex(
                     water,
+                    package.featureKind,
                     package.name);
                 if (existing.has_value()) {
                     water.keyedSettingsProfiles[existing.value()] =
