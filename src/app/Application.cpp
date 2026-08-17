@@ -7254,7 +7254,8 @@ bool QueueWaterFlowTrailRefresh(
 std::size_t ApplyWaterTrailLiveVisualProfile(
     PreviewRuntimeState* runtimeState,
     const SavedWaterTrailProfileState& profile,
-    bool dynamicMesh);
+    bool dynamicMesh,
+    bool matchAllDynamicMeshSessions = false);
 WaterOverlay WaterPathAnchorsFromCacheWithProfileSettings(
     const PreviewRuntimeState& runtimeState);
 void DrawWaterSeepageParameterTooltip(const char* text);
@@ -16254,11 +16255,8 @@ std::optional<std::size_t> FindWaterTrailProfileIndex(
     return std::nullopt;
 }
 
-enum class WaterProfileKind {
-    Path,
-    Lane,
-    Trail
-};
+using WaterProfileKind =
+    invisible_places::water::WaterFlowProfileKind;
 
 // ---------------------------------------------------------------------------
 // Object-specific Flow profile copies. Editing Path/Lanes/Trail settings with
@@ -16413,52 +16411,148 @@ std::string CommitWaterFlowObjectProfileEdit(
     return profile->name;
 }
 
-// Rewrites every by-name reference to a profile and returns the ids of the
-// Flow sources whose assignment changed.
-std::vector<std::uint32_t> ReplaceWaterFlowProfileAssignment(
+struct WaterFlowProfileReferenceRewrite {
+    invisible_places::water::WaterFlowProfileAssignmentRewrite path;
+    invisible_places::water::WaterFlowProfileAssignmentRewrite lane;
+    invisible_places::water::WaterFlowProfileAssignmentRewrite trail;
+    invisible_places::timing::TimingWaterProfileReferenceRewriteCounts timing;
+    std::size_t keyedProfileBaseMirrors = 0U;
+    bool dynamicMeshEditedShadowCleared = false;
+
+    [[nodiscard]] bool flowSourceRuntimeChanged() const {
+        return !lane.pointSourceIds.empty() ||
+               !lane.manualPathSourceIds.empty() ||
+               !trail.pointSourceIds.empty() ||
+               !trail.manualPathSourceIds.empty();
+    }
+
+    [[nodiscard]] bool dynamicMeshRuntimeChanged() const {
+        return trail.dynamicMeshTrailChanged ||
+               dynamicMeshEditedShadowCleared;
+    }
+};
+
+void MergeWaterFlowProfileAssignmentRewrite(
+    invisible_places::water::WaterFlowProfileAssignmentRewrite* target,
+    invisible_places::water::WaterFlowProfileAssignmentRewrite source) {
+    if (target == nullptr) {
+        return;
+    }
+    const auto appendUnique = [](std::vector<std::uint32_t>* destination,
+                                 std::span<const std::uint32_t> values) {
+        for (const auto value : values) {
+            if (std::find(destination->begin(), destination->end(), value) ==
+                destination->end()) {
+                destination->push_back(value);
+            }
+        }
+    };
+    appendUnique(&target->pointSourceIds, source.pointSourceIds);
+    appendUnique(&target->manualPathSourceIds, source.manualPathSourceIds);
+    target->dynamicMeshTrailChanged |= source.dynamicMeshTrailChanged;
+    target->dynamicMeshEditedTrailProfileMatched |=
+        source.dynamicMeshEditedTrailProfileMatched;
+}
+
+void MergeWaterFlowProfileReferenceRewrite(
+    WaterFlowProfileReferenceRewrite* target,
+    WaterFlowProfileReferenceRewrite source) {
+    if (target == nullptr) {
+        return;
+    }
+    MergeWaterFlowProfileAssignmentRewrite(
+        &target->path,
+        std::move(source.path));
+    MergeWaterFlowProfileAssignmentRewrite(
+        &target->lane,
+        std::move(source.lane));
+    MergeWaterFlowProfileAssignmentRewrite(
+        &target->trail,
+        std::move(source.trail));
+    target->timing.legacyScenarioTracks +=
+        source.timing.legacyScenarioTracks;
+    target->timing.timingTakeTracks +=
+        source.timing.timingTakeTracks;
+    target->timing.keyedPackageTracks +=
+        source.timing.keyedPackageTracks;
+    target->keyedProfileBaseMirrors +=
+        source.keyedProfileBaseMirrors;
+    target->dynamicMeshEditedShadowCleared |=
+        source.dynamicMeshEditedShadowCleared;
+}
+
+// Rewrites every exact by-name reference for one Flow profile kind. Lane is
+// the only kind whose name is also persisted on manual Flow Path tracks and
+// keyed-package base mirrors.
+WaterFlowProfileReferenceRewrite ReplaceWaterFlowProfileReferences(
     WaterWorkflowState* water,
     WaterProfileKind kind,
     std::string_view previousName,
     std::string_view nextName) {
+    WaterFlowProfileReferenceRewrite rewrite;
+    if (water == nullptr || TrimText(previousName).empty() ||
+        TrimText(nextName).empty()) {
+        return rewrite;
+    }
     const auto previous = NormalizeWaterProfileName(previousName);
-    std::vector<std::uint32_t> changedSourceIds;
-    const auto replace = [&](std::string* assignment, std::uint32_t sourceId) {
-        if (NormalizeWaterProfileName(*assignment, kWaterProfileGlobalName) == previous) {
-            *assignment = std::string{nextName};
-            changedSourceIds.push_back(sourceId);
-        }
-    };
-    for (auto& emitter : water->emitters) {
-        if (kind == WaterProfileKind::Path) {
-            replace(&emitter.pathProfileName, emitter.id);
-        } else if (kind == WaterProfileKind::Lane) {
-            replace(&emitter.laneProfileName, emitter.id);
-        } else {
-            replace(&emitter.trailProfileName, emitter.id);
+    const auto next = NormalizeWaterProfileName(nextName);
+    const std::string_view dynamicMeshEditedTrailName =
+        water->editedDynamicMeshTrailProfile.has_value()
+            ? std::string_view{
+                  water->editedDynamicMeshTrailProfile->name}
+            : std::string_view{};
+    auto assignments = invisible_places::water::
+        ReplaceWaterFlowProfileAssignments(
+            water->emitters,
+            water->manualFlowPaths,
+            &water->dynamicMeshFlowSettings,
+            kind,
+            previous,
+            next,
+            dynamicMeshEditedTrailName);
+    auto* assignmentResult =
+        kind == WaterProfileKind::Path
+            ? &rewrite.path
+        : kind == WaterProfileKind::Lane
+            ? &rewrite.lane
+            : &rewrite.trail;
+    *assignmentResult = std::move(assignments);
+
+    if (kind == WaterProfileKind::Lane) {
+        rewrite.timing = invisible_places::timing::
+            ReplaceTimingWaterProfileReferences(
+                water->featureTimingRunsByScenario,
+                water->timingTakeSceneStates,
+                water->keyedSettingsProfiles,
+                "flow_path",
+                previous,
+                next);
+        rewrite.keyedProfileBaseMirrors = invisible_places::water::
+            ReplaceWaterKeyedSettingsProfileBaseReferences(
+                water->keyedSettingsProfiles,
+                invisible_places::water::WaterKeyedFeatureKind::FlowPath,
+                previous,
+                next);
+    }
+
+    if (rewrite.trail.dynamicMeshTrailChanged) {
+        water->dynamicMeshTrailProfileNameBuffer =
+            BaseWaterProfileName(next);
+        if (rewrite.trail.dynamicMeshEditedTrailProfileMatched) {
+            water->editedDynamicMeshTrailProfile.reset();
+            rewrite.dynamicMeshEditedShadowCleared = true;
         }
     }
-    for (auto& source : water->manualFlowPaths) {
-        if (kind == WaterProfileKind::Lane) {
-            replace(&source.laneProfileName, source.id);
-        } else if (kind == WaterProfileKind::Trail) {
-            replace(&source.trailProfileName, source.id);
-        }
-    }
-    if (kind == WaterProfileKind::Trail &&
-        NormalizeWaterProfileName(
-            water->dynamicMeshFlowSettings.trailProfileName,
-            kWaterProfileGlobalName) == previous) {
-        water->dynamicMeshFlowSettings.trailProfileName = std::string{nextName};
-    }
-    return changedSourceIds;
+    return rewrite;
 }
 
 // Renaming a source renames its copies so the "<base>_<source name>"
 // convention keeps holding; every by-name reference follows the rename.
-void RenameWaterFlowSourceObjectProfiles(
+WaterFlowProfileReferenceRewrite RenameWaterFlowSourceObjectProfiles(
     WaterWorkflowState* water,
     std::uint32_t ownerObjectId,
     std::string_view ownerName) {
+    WaterFlowProfileReferenceRewrite rewrite;
     const auto renameIn = [&](auto* profiles, WaterProfileKind kind) {
         for (auto& profile : *profiles) {
             if (!profile.objectOverride || profile.ownerObjectId != ownerObjectId) {
@@ -16473,28 +16567,28 @@ void RenameWaterFlowSourceObjectProfiles(
             }
             const auto previous = profile.name;
             profile.name = renamed;
-            ReplaceWaterFlowProfileAssignment(water, kind, previous, renamed);
+            MergeWaterFlowProfileReferenceRewrite(
+                &rewrite,
+                ReplaceWaterFlowProfileReferences(
+                    water,
+                    kind,
+                    previous,
+                    renamed));
         }
     };
     renameIn(&water->pathProfiles, WaterProfileKind::Path);
     renameIn(&water->laneProfiles, WaterProfileKind::Lane);
     renameIn(&water->trailProfiles, WaterProfileKind::Trail);
+    return rewrite;
 }
 
 // Deleting a source removes its copies; sources referencing a removed copy
 // fall back to the copy's base so their look changes predictably instead of
 // dangling on a missing name.
-struct WaterFlowObjectProfileRemoval {
-    // Sources whose Path assignment fell back to a base (path bake inputs
-    // changed) and sources whose Lane/Trail assignment fell back.
-    std::vector<std::uint32_t> pathRemappedSourceIds;
-    std::vector<std::uint32_t> laneOrTrailRemappedSourceIds;
-};
-
-WaterFlowObjectProfileRemoval RemoveWaterFlowSourceObjectProfiles(
+WaterFlowProfileReferenceRewrite RemoveWaterFlowSourceObjectProfiles(
     WaterWorkflowState* water,
     std::uint32_t ownerObjectId) {
-    WaterFlowObjectProfileRemoval removal;
+    WaterFlowProfileReferenceRewrite rewrite;
     const auto removeIn = [&](auto* profiles, WaterProfileKind kind) {
         for (std::size_t index = profiles->size(); index > 0U; --index) {
             auto& profile = (*profiles)[index - 1U];
@@ -16503,18 +16597,20 @@ WaterFlowObjectProfileRemoval RemoveWaterFlowSourceObjectProfiles(
             }
             const auto removedName = profile.name;
             const auto baseName = NormalizeWaterProfileName(profile.baseProfileName);
+            MergeWaterFlowProfileReferenceRewrite(
+                &rewrite,
+                ReplaceWaterFlowProfileReferences(
+                    water,
+                    kind,
+                    removedName,
+                    baseName));
             profiles->erase(profiles->begin() + static_cast<std::ptrdiff_t>(index - 1U));
-            auto remapped = ReplaceWaterFlowProfileAssignment(water, kind, removedName, baseName);
-            auto& target = kind == WaterProfileKind::Path
-                ? removal.pathRemappedSourceIds
-                : removal.laneOrTrailRemappedSourceIds;
-            target.insert(target.end(), remapped.begin(), remapped.end());
         }
     };
     removeIn(&water->pathProfiles, WaterProfileKind::Path);
     removeIn(&water->laneProfiles, WaterProfileKind::Lane);
     removeIn(&water->trailProfiles, WaterProfileKind::Trail);
-    return removal;
+    return rewrite;
 }
 
 // ---------------------------------------------------------------------------
@@ -16966,9 +17062,12 @@ void EnsureWaterProfiles(PreviewRuntimeState* runtimeState) {
                 kept.end(),
                 [&](const Profile& existing) {
                     return NormalizeWaterProfileName(existing.name) == profile.name;
-                });
+            });
             if (profile.name == kWaterProfileDefaultName ||
-                IsEditedWaterProfileName(profile.name) ||
+                invisible_places::water::
+                    WaterObjectProfileNameIsLegacyEditedShadow(
+                        profile.name,
+                        profile.objectOverride) ||
                 protectedPredicate(profile.name) ||
                 duplicate) {
                 continue;
@@ -17032,6 +17131,7 @@ void EnsureWaterProfiles(PreviewRuntimeState* runtimeState) {
     for (const auto& source : water.manualFlowPaths) {
         flowSourceIds.insert(source.id);
     }
+    WaterFlowProfileReferenceRewrite reconciliation;
     const auto dropOrphanCopies = [&](auto* profiles, WaterProfileKind kind) {
         for (std::size_t index = profiles->size(); index > 0U; --index) {
             auto& profile = (*profiles)[index - 1U];
@@ -17047,27 +17147,36 @@ void EnsureWaterProfiles(PreviewRuntimeState* runtimeState) {
             const auto baseName = profile.baseProfileName;
             profiles->erase(
                 profiles->begin() + static_cast<std::ptrdiff_t>(index - 1U));
-            (void)ReplaceWaterFlowProfileAssignment(
-                &water,
-                kind,
-                removedName,
-                baseName);
+            MergeWaterFlowProfileReferenceRewrite(
+                &reconciliation,
+                ReplaceWaterFlowProfileReferences(
+                    &water,
+                    kind,
+                    removedName,
+                    baseName));
         }
     };
     dropOrphanCopies(&water.pathProfiles, WaterProfileKind::Path);
     dropOrphanCopies(&water.laneProfiles, WaterProfileKind::Lane);
     dropOrphanCopies(&water.trailProfiles, WaterProfileKind::Trail);
     for (const auto& emitter : water.emitters) {
-        RenameWaterFlowSourceObjectProfiles(
-            &water,
-            emitter.id,
-            WaterFlowSourceDisplayName(emitter.name, emitter.id));
+        MergeWaterFlowProfileReferenceRewrite(
+            &reconciliation,
+            RenameWaterFlowSourceObjectProfiles(
+                &water,
+                emitter.id,
+                WaterFlowSourceDisplayName(emitter.name, emitter.id)));
     }
     for (const auto& source : water.manualFlowPaths) {
-        RenameWaterFlowSourceObjectProfiles(
-            &water,
-            source.id,
-            WaterFlowSourceDisplayName(source.name, source.id));
+        MergeWaterFlowProfileReferenceRewrite(
+            &reconciliation,
+            RenameWaterFlowSourceObjectProfiles(
+                &water,
+                source.id,
+                WaterFlowSourceDisplayName(source.name, source.id)));
+    }
+    for (const auto sourceId : reconciliation.path.pointSourceIds) {
+        MarkWaterPathDirty(runtimeState, sourceId);
     }
     // The global selectors only ever hold shared names; a selection left on
     // an object copy falls back to the copy's base.
@@ -24148,6 +24257,42 @@ bool RefreshWaterDynamicMeshFlowOverlayFromUiEdit(
         "the shared Ground cache remains settled.";
     runtimeState->errorMessage.clear();
     return true;
+}
+
+void ApplyWaterFlowProfileReferenceRuntimeEffects(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    const WaterFlowProfileReferenceRewrite& rewrite) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    // The Path bake fingerprint includes the exact assignment name. A copy
+    // rename or fallback therefore invalidates these emitters even when the
+    // resolved numeric settings are identical.
+    for (const auto sourceId : rewrite.path.pointSourceIds) {
+        MarkWaterPathDirty(runtimeState, sourceId);
+    }
+    if (rewrite.flowSourceRuntimeChanged()) {
+        RefreshResolvedWaterFlowSourceSettings(runtimeState);
+    }
+    if (!rewrite.dynamicMeshRuntimeChanged()) {
+        return;
+    }
+
+    const auto resolved =
+        ViewedDynamicMeshWaterTrailProfile(*runtimeState);
+    (void)ApplyWaterTrailLiveVisualProfile(
+        runtimeState,
+        resolved,
+        true,
+        true);
+    if (viewport != nullptr) {
+        (void)RefreshWaterDynamicMeshFlowOverlayFromUiEdit(
+            runtimeState,
+            viewport);
+    } else {
+        runtimeState->previewRenderStateSignatureValid = false;
+    }
 }
 
 std::optional<invisible_places::io::Float3> ProjectScreenRayToDynamicMeshSurface(
@@ -71792,7 +71937,8 @@ bool WaterGeneratedTrailSessionMatchesLiveVisualTarget(
 std::size_t ApplyWaterTrailLiveVisualProfile(
     PreviewRuntimeState* runtimeState,
     const SavedWaterTrailProfileState& profile,
-    bool dynamicMesh) {
+    bool dynamicMesh,
+    bool matchAllDynamicMeshSessions) {
     if (runtimeState == nullptr) {
         return 0U;
     }
@@ -71831,11 +71977,16 @@ std::size_t ApplyWaterTrailLiveVisualProfile(
         }
     }
     for (auto& session : runtimeState->sessions) {
+        const bool matchesAnyDynamicMeshSession =
+            dynamicMesh && matchAllDynamicMeshSessions &&
+            session.kind == LayerKind::PointCloud &&
+            IsGeneratedWaterDynamicMeshTrailOverlayStem(
+                session.sourcePath.stem().string());
         const bool matchesFlowSource =
             !dynamicMesh && session.waterFlowSourceId.has_value() &&
             affectedFlowSourceIds.contains(session.waterFlowSourceId.value()) &&
             IsGeneratedWaterFlowOverlaySession(session);
-        if (!matchesFlowSource &&
+        if (!matchesAnyDynamicMeshSession && !matchesFlowSource &&
             !WaterGeneratedTrailSessionMatchesLiveVisualTarget(session, profile, dynamicMesh)) {
             continue;
         }
@@ -79035,12 +79186,16 @@ void DrawWaterPanel(
 
             if (selectedEmitter != nullptr && !water.manualFlowPathEditor.active) {
                 if (InputTextString("Name", &selectedEmitter->name)) {
-                    RenameWaterFlowSourceObjectProfiles(
+                    const auto rewrite = RenameWaterFlowSourceObjectProfiles(
                         &water,
                         selectedEmitter->id,
                         WaterFlowSourceDisplayName(
                             selectedEmitter->name,
                             selectedEmitter->id));
+                    ApplyWaterFlowProfileReferenceRuntimeEffects(
+                        runtimeState,
+                        viewport,
+                        rewrite);
                 }
                 float position[3] = {
                     selectedEmitter->position.x,
@@ -79244,10 +79399,14 @@ void DrawWaterPanel(
                         previousTrailProfile.geometry);
                 const bool previousUseSurfaceGuide = source.useSurfaceGuide;
                 if (InputTextString("Name", &source.name)) {
-                    RenameWaterFlowSourceObjectProfiles(
+                    const auto rewrite = RenameWaterFlowSourceObjectProfiles(
                         &water,
                         source.id,
                         WaterFlowSourceDisplayName(source.name, source.id));
+                    ApplyWaterFlowProfileReferenceRuntimeEffects(
+                        runtimeState,
+                        viewport,
+                        rewrite);
                 }
                 const invisible_places::water::WaterKeyedFeatureId feature{
                     .kind = invisible_places::water::WaterKeyedFeatureKind::
@@ -79633,12 +79792,10 @@ void DrawWaterPanel(
             const auto removedProfiles = RemoveWaterFlowSourceObjectProfiles(
                 &water,
                 deletedEmitterId);
-            for (const auto sourceId : removedProfiles.pathRemappedSourceIds) {
-                MarkWaterPathDirty(runtimeState, sourceId);
-            }
-            if (!removedProfiles.laneOrTrailRemappedSourceIds.empty()) {
-                RefreshResolvedWaterFlowSourceSettings(runtimeState);
-            }
+            ApplyWaterFlowProfileReferenceRuntimeEffects(
+                runtimeState,
+                viewport,
+                removedProfiles);
             MarkWaterPathDirty(runtimeState, deletedEmitterId);
             ValidateWaterSourceSettingLinks(runtimeState);
         }
@@ -79675,12 +79832,10 @@ void DrawWaterPanel(
             const auto removedProfiles = RemoveWaterFlowSourceObjectProfiles(
                 &water,
                 deletedSourceId);
-            for (const auto sourceId : removedProfiles.pathRemappedSourceIds) {
-                MarkWaterPathDirty(runtimeState, sourceId);
-            }
-            if (!removedProfiles.laneOrTrailRemappedSourceIds.empty()) {
-                RefreshResolvedWaterFlowSourceSettings(runtimeState);
-            }
+            ApplyWaterFlowProfileReferenceRuntimeEffects(
+                runtimeState,
+                viewport,
+                removedProfiles);
             water.selectedManualFlowPathIndex.reset();
             water.manualFlowPathEditor = {};
             QueueWaterFlowTrailRefresh(

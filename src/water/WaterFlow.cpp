@@ -8783,6 +8783,17 @@ bool WaterKeyedSettingTrackProfileEqual(
     return true;
 }
 
+bool WaterObjectProfileNameIsLegacyEditedShadow(
+    std::string_view profileName,
+    bool objectOverride) {
+    constexpr std::string_view kEditedSuffix = "_edited";
+    constexpr std::string_view kLegacyEditedSuffix = "_Edited";
+    const auto name = TrimSeepageName(profileName);
+    return !objectOverride &&
+           (name.ends_with(kEditedSuffix) ||
+            name.ends_with(kLegacyEditedSuffix));
+}
+
 WaterObjectProfileEditDescriptor DescribeWaterObjectProfileEdit(
     std::string_view assignedProfileName,
     std::uint32_t selectedOwnerObjectId,
@@ -8825,12 +8836,11 @@ WaterObjectProfileEditDescriptor DescribeWaterObjectProfileEdit(
             descriptor.removableWorkingProfileName =
                 descriptor.assignedProfileName;
         }
-    } else if ((descriptor.assignedProfileName.ends_with(
-                    kEditedSuffix) ||
-                descriptor.assignedProfileName.ends_with(
-                    kLegacyEditedSuffix)) &&
-               descriptor.assignedProfileName.size() >
-                   kEditedSuffix.size()) {
+    } else if (descriptor.assignedProfileName.size() >
+                   kEditedSuffix.size() &&
+               WaterObjectProfileNameIsLegacyEditedShadow(
+                   descriptor.assignedProfileName,
+                   false)) {
         descriptor.legacyEditedShadow = true;
         descriptor.exactBaseProfileName =
             descriptor.assignedProfileName.substr(
@@ -8882,6 +8892,104 @@ std::size_t ReplaceWaterSeepageNodeProfileReferences(
     return changed;
 }
 
+WaterFlowProfileAssignmentRewrite ReplaceWaterFlowProfileAssignments(
+    std::span<WaterEmitter> emitters,
+    std::span<WaterManualFlowPathSource> manualPaths,
+    WaterDynamicMeshFlowSettings* dynamicMesh,
+    WaterFlowProfileKind kind,
+    std::string_view previousProfileName,
+    std::string_view nextProfileName,
+    std::string_view dynamicMeshEditedTrailProfileName) {
+    const auto normalize = [](std::string_view name,
+                              std::string_view fallback) {
+        const auto trimmed = TrimSeepageName(name);
+        return trimmed.empty() ? std::string{fallback}
+                               : std::string{trimmed};
+    };
+    const auto previousTrimmed = TrimSeepageName(previousProfileName);
+    const auto nextTrimmed = TrimSeepageName(nextProfileName);
+    WaterFlowProfileAssignmentRewrite rewrite;
+    if (previousTrimmed.empty() || nextTrimmed.empty() ||
+        previousTrimmed == nextTrimmed) {
+        return rewrite;
+    }
+    const std::string previous{previousTrimmed};
+    const std::string next{nextTrimmed};
+    const auto replace = [&](std::string* assignment,
+                             std::uint32_t sourceId,
+                             std::vector<std::uint32_t>* changedIds) {
+        if (assignment == nullptr || changedIds == nullptr ||
+            normalize(*assignment, "Global") != previous) {
+            return;
+        }
+        *assignment = next;
+        changedIds->push_back(sourceId);
+    };
+    for (auto& emitter : emitters) {
+        switch (kind) {
+            case WaterFlowProfileKind::Path:
+                replace(
+                    &emitter.pathProfileName,
+                    emitter.id,
+                    &rewrite.pointSourceIds);
+                break;
+            case WaterFlowProfileKind::Lane:
+                replace(
+                    &emitter.laneProfileName,
+                    emitter.id,
+                    &rewrite.pointSourceIds);
+                break;
+            case WaterFlowProfileKind::Trail:
+                replace(
+                    &emitter.trailProfileName,
+                    emitter.id,
+                    &rewrite.pointSourceIds);
+                break;
+        }
+    }
+    if (kind != WaterFlowProfileKind::Path) {
+        for (auto& source : manualPaths) {
+            replace(
+                kind == WaterFlowProfileKind::Lane
+                    ? &source.laneProfileName
+                    : &source.trailProfileName,
+                source.id,
+                &rewrite.manualPathSourceIds);
+        }
+    }
+    if (kind == WaterFlowProfileKind::Trail && dynamicMesh != nullptr) {
+        const auto unedited = [&](std::string_view name) {
+            auto normalized = normalize(name, "Global");
+            constexpr std::string_view kEditedSuffix = "_edited";
+            constexpr std::string_view kLegacyEditedSuffix = "_Edited";
+            if ((normalized.ends_with(kEditedSuffix) ||
+                 normalized.ends_with(kLegacyEditedSuffix)) &&
+                normalized.size() > kEditedSuffix.size()) {
+                normalized.erase(
+                    normalized.size() - kEditedSuffix.size());
+            }
+            return normalized;
+        };
+        const bool exactAssignment =
+            normalize(dynamicMesh->trailProfileName, "Global") == previous;
+        const auto editedName =
+            TrimSeepageName(dynamicMeshEditedTrailProfileName);
+        const bool matchingEditedProfile =
+            !editedName.empty() &&
+            normalize(dynamicMesh->trailProfileName, "Global") ==
+                normalize(editedName, "Global") &&
+            unedited(dynamicMesh->trailProfileName) == previous &&
+            unedited(editedName) == previous;
+        if (exactAssignment || matchingEditedProfile) {
+            dynamicMesh->trailProfileName = next;
+            rewrite.dynamicMeshTrailChanged = true;
+            rewrite.dynamicMeshEditedTrailProfileMatched =
+                matchingEditedProfile;
+        }
+    }
+    return rewrite;
+}
+
 namespace {
 
 bool WaterKeyedSettingBelongsToProfileGroup(
@@ -8893,8 +9001,16 @@ bool WaterKeyedSettingBelongsToProfileGroup(
     if (!existingGroup.empty()) {
         return existingGroup == group;
     }
-    if (!featureKind.has_value() ||
-        *featureKind != WaterKeyedFeatureKind::SeepageNode) {
+    if (!featureKind.has_value()) {
+        return false;
+    }
+    if (*featureKind == WaterKeyedFeatureKind::FlowPath) {
+        return group == "flow_path" &&
+               FindWaterKeyableSetting(
+                   WaterKeyedFeatureKind::FlowPath,
+                   track.settingId) != nullptr;
+    }
+    if (*featureKind != WaterKeyedFeatureKind::SeepageNode) {
         return false;
     }
     // Schema-46 tracks predate profile metadata. Dynamic Look/Response
@@ -8973,6 +9089,28 @@ std::size_t ReplaceWaterKeyedSettingProfileReferences(
         profileGroup,
         previousProfileName,
         nextProfileName);
+}
+
+std::size_t ReplaceWaterKeyedSettingsProfileBaseReferences(
+    std::span<WaterKeyedSettingsProfile> profiles,
+    WaterKeyedFeatureKind featureKind,
+    std::string_view previousProfileName,
+    std::string_view nextProfileName) {
+    const auto previous = TrimSeepageName(previousProfileName);
+    const auto next = TrimSeepageName(nextProfileName);
+    if (previous.empty() || next.empty() || previous == next) {
+        return 0U;
+    }
+    std::size_t changed = 0U;
+    for (auto& profile : profiles) {
+        if (profile.featureKind != featureKind ||
+            TrimSeepageName(profile.baseProfileName) != previous) {
+            continue;
+        }
+        profile.baseProfileName = std::string{next};
+        ++changed;
+    }
+    return changed;
 }
 
 std::size_t CanonicalizeWaterFeatureProfileMetadata(

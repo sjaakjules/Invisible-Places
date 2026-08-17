@@ -373,6 +373,13 @@ struct WaterObjectProfileEditDescriptor {
     bool legacyEditedShadow = false;
 };
 
+// Modern owner/base metadata wins over the legacy `<base>_edited` spelling:
+// an object can legitimately end in "edited", so its owned copy must survive
+// project-library sanitization.
+[[nodiscard]] bool WaterObjectProfileNameIsLegacyEditedShadow(
+    std::string_view profileName,
+    bool objectOverride);
+
 [[nodiscard]] WaterObjectProfileEditDescriptor
 DescribeWaterObjectProfileEdit(
     std::string_view assignedProfileName,
@@ -721,25 +728,32 @@ ParseWaterKeyedFeatureKindName(std::string_view name);
     const WaterKeyedSettingTrack& right);
 // Rebinds keyed tracks carrying explicit profile-group metadata. Use the
 // feature-aware overload below for persisted stores that may still contain
-// schema-46 blank-group Seepage tracks.
+// blank-group Seepage or manual Flow Path tracks.
 [[nodiscard]] std::size_t ReplaceWaterKeyedSettingProfileReferences(
     std::span<WaterKeyedSettingTrack> settings,
     std::string_view profileGroup,
     std::string_view previousProfileName,
     std::string_view nextProfileName);
 // Feature-aware overload used for whole-project transactions. Explicit
-// profile metadata remains authoritative; legacy blank-group Seepage tracks
-// are classified only inside Seepage Node timelines/packages so overlapping
-// ids such as `strength` cannot capture Flow tracks.
+// profile metadata remains authoritative; legacy blank-group tracks are
+// classified only inside their matching feature kind so overlapping ids such
+// as `strength` cannot capture an unrelated Water feature.
 [[nodiscard]] std::size_t ReplaceWaterKeyedSettingProfileReferences(
     std::span<WaterKeyedSettingTrack> settings,
     WaterKeyedFeatureKind featureKind,
     std::string_view profileGroup,
     std::string_view previousProfileName,
     std::string_view nextProfileName);
+// Rebinds the saved-base mirror carried by reusable keyed settings profiles.
+// Package identity and provenance fields are deliberately left untouched.
+[[nodiscard]] std::size_t ReplaceWaterKeyedSettingsProfileBaseReferences(
+    std::span<WaterKeyedSettingsProfile> profiles,
+    WaterKeyedFeatureKind featureKind,
+    std::string_view previousProfileName,
+    std::string_view nextProfileName);
 // Rebinds every matching profile-backed track on the requested feature
 // timelines. Dormant tracks are intentionally included; legacy blank-group
-// Seepage tracks are classified by their stable setting ids.
+// Seepage and manual Flow Path tracks are classified by stable setting ids.
 [[nodiscard]] std::size_t CanonicalizeWaterFeatureProfileMetadata(
     std::span<WaterFeatureTimingRun> runs,
     std::span<const WaterKeyedFeatureId> features,
@@ -2650,6 +2664,46 @@ struct WaterManualFlowPathSource {
     float rainResponse = 0.0F;
     bool showTrail = true;
 };
+
+enum class WaterFlowProfileKind : std::uint8_t {
+    Path = 0,
+    Lane,
+    Trail,
+};
+
+// Exact by-name assignment replacements are reported separately for point
+// and manual-path sources because their ids share one allocator but their
+// runtime invalidation paths differ. Lock state is deliberately untouched.
+struct WaterFlowProfileAssignmentRewrite {
+    std::vector<std::uint32_t> pointSourceIds;
+    std::vector<std::uint32_t> manualPathSourceIds;
+    bool dynamicMeshTrailChanged = false;
+    // True only when the supplied mesh edit shadow (or its `_edited`
+    // assignment) derives from the replaced Trail profile. The Application
+    // may then safely discard that shadow without touching an unrelated edit.
+    bool dynamicMeshEditedTrailProfileMatched = false;
+
+    [[nodiscard]] bool changed() const {
+        return !pointSourceIds.empty() ||
+               !manualPathSourceIds.empty() ||
+               dynamicMeshTrailChanged;
+    }
+};
+
+// Rebinds one Flow profile name through every persisted source assignment.
+// Matching trims surrounding whitespace and treats a blank source assignment
+// as Global, mirroring runtime profile resolution. Empty previous/replacement
+// names are rejected so a cleanup transaction cannot become ambiguous or
+// create a dangling assignment.
+[[nodiscard]] WaterFlowProfileAssignmentRewrite
+ReplaceWaterFlowProfileAssignments(
+    std::span<WaterEmitter> emitters,
+    std::span<WaterManualFlowPathSource> manualPaths,
+    WaterDynamicMeshFlowSettings* dynamicMesh,
+    WaterFlowProfileKind kind,
+    std::string_view previousProfileName,
+    std::string_view nextProfileName,
+    std::string_view dynamicMeshEditedTrailProfileName = {});
 
 struct WaterSceneSupportLayer {
     const invisible_places::io::LoadedPointCloud* cloud = nullptr;

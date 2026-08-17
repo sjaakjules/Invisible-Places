@@ -2136,6 +2136,277 @@ TEST_CASE("Keyed profile equality includes interpolation defaults and spline han
     CHECK(WaterKeyedSettingTrackProfileEqual(baseline, edited));
 }
 
+TEST_CASE("Flow profile assignment rewrites are exact and kind scoped",
+          "[water][flow][profiles][references]") {
+    using invisible_places::water::ReplaceWaterFlowProfileAssignments;
+    using invisible_places::water::WaterDynamicMeshFlowSettings;
+    using invisible_places::water::WaterEmitter;
+    using invisible_places::water::WaterFlowProfileKind;
+    using invisible_places::water::WaterManualFlowPathSource;
+
+    std::vector<WaterEmitter> emitters(3U);
+    emitters[0].id = 11U;
+    emitters[0].pathProfileName = " Path Copy ";
+    emitters[0].laneProfileName = "Shared Copy";
+    emitters[0].trailProfileName = "Shared Copy";
+    emitters[0].pathProfileLocked = true;
+    emitters[0].laneProfileLocked = true;
+    emitters[0].trailProfileLocked = true;
+    emitters[1].id = 12U;
+    emitters[1].pathProfileName = "Path Copy";
+    emitters[1].laneProfileName = "Other";
+    emitters[1].trailProfileName = "Shared Copy";
+    emitters[2].id = 13U;
+    emitters[2].pathProfileName.clear();
+
+    std::vector<WaterManualFlowPathSource> manualPaths(2U);
+    manualPaths[0].id = 21U;
+    manualPaths[0].laneProfileName = " Shared Copy ";
+    manualPaths[0].trailProfileName = "Shared Copy";
+    manualPaths[0].laneProfileLocked = true;
+    manualPaths[0].trailProfileLocked = true;
+    manualPaths[1].id = 22U;
+    manualPaths[1].laneProfileName = "Other";
+    manualPaths[1].trailProfileName = "Other";
+    WaterDynamicMeshFlowSettings mesh;
+    mesh.trailProfileName = "Shared Copy";
+
+    const auto path = ReplaceWaterFlowProfileAssignments(
+        emitters,
+        manualPaths,
+        &mesh,
+        WaterFlowProfileKind::Path,
+        "Path Copy",
+        "Saved Path");
+    CHECK(path.pointSourceIds == std::vector<std::uint32_t>{11U, 12U});
+    CHECK(path.manualPathSourceIds.empty());
+    CHECK_FALSE(path.dynamicMeshTrailChanged);
+    CHECK(emitters[0].pathProfileName == "Saved Path");
+    CHECK(emitters[1].pathProfileName == "Saved Path");
+    CHECK(emitters[2].pathProfileName.empty());
+    CHECK(manualPaths[0].laneProfileName == " Shared Copy ");
+
+    const auto lane = ReplaceWaterFlowProfileAssignments(
+        emitters,
+        manualPaths,
+        &mesh,
+        WaterFlowProfileKind::Lane,
+        "Shared Copy",
+        "Saved Lane");
+    CHECK(lane.pointSourceIds == std::vector<std::uint32_t>{11U});
+    CHECK(lane.manualPathSourceIds == std::vector<std::uint32_t>{21U});
+    CHECK_FALSE(lane.dynamicMeshTrailChanged);
+    CHECK(emitters[0].laneProfileName == "Saved Lane");
+    CHECK(emitters[0].trailProfileName == "Shared Copy");
+    CHECK(manualPaths[0].laneProfileName == "Saved Lane");
+    CHECK(manualPaths[0].trailProfileName == "Shared Copy");
+    CHECK(mesh.trailProfileName == "Shared Copy");
+
+    const auto trail = ReplaceWaterFlowProfileAssignments(
+        emitters,
+        manualPaths,
+        &mesh,
+        WaterFlowProfileKind::Trail,
+        "Shared Copy",
+        "Saved Trail");
+    CHECK(trail.pointSourceIds ==
+          std::vector<std::uint32_t>{11U, 12U});
+    CHECK(trail.manualPathSourceIds ==
+          std::vector<std::uint32_t>{21U});
+    CHECK(trail.dynamicMeshTrailChanged);
+    CHECK(emitters[0].trailProfileName == "Saved Trail");
+    CHECK(emitters[0].laneProfileName == "Saved Lane");
+    CHECK(manualPaths[0].trailProfileName == "Saved Trail");
+    CHECK(manualPaths[0].laneProfileName == "Saved Lane");
+    CHECK(mesh.trailProfileName == "Saved Trail");
+
+    mesh.trailProfileName = "Owner Trail_edited";
+    const auto editedMesh = ReplaceWaterFlowProfileAssignments(
+        emitters,
+        manualPaths,
+        &mesh,
+        WaterFlowProfileKind::Trail,
+        "Owner Trail",
+        "Saved Owner Trail",
+        "Owner Trail_edited");
+    CHECK(editedMesh.dynamicMeshTrailChanged);
+    CHECK(editedMesh.dynamicMeshEditedTrailProfileMatched);
+    CHECK(mesh.trailProfileName == "Saved Owner Trail");
+
+    mesh.trailProfileName = "Unrelated_edited";
+    const auto unrelatedMeshEdit = ReplaceWaterFlowProfileAssignments(
+        emitters,
+        manualPaths,
+        &mesh,
+        WaterFlowProfileKind::Trail,
+        "Owner Trail",
+        "Ignored",
+        "Unrelated_edited");
+    CHECK_FALSE(unrelatedMeshEdit.dynamicMeshTrailChanged);
+    CHECK_FALSE(
+        unrelatedMeshEdit.dynamicMeshEditedTrailProfileMatched);
+    CHECK(mesh.trailProfileName == "Unrelated_edited");
+
+    const auto staleOwnerShadow = ReplaceWaterFlowProfileAssignments(
+        emitters,
+        manualPaths,
+        &mesh,
+        WaterFlowProfileKind::Trail,
+        "Owner Trail",
+        "Ignored",
+        "Owner Trail_edited");
+    CHECK_FALSE(staleOwnerShadow.dynamicMeshTrailChanged);
+    CHECK_FALSE(
+        staleOwnerShadow.dynamicMeshEditedTrailProfileMatched);
+    CHECK(mesh.trailProfileName == "Unrelated_edited");
+
+    mesh.trailProfileName = "Other";
+    const auto staleEditedProfile = ReplaceWaterFlowProfileAssignments(
+        emitters,
+        manualPaths,
+        &mesh,
+        WaterFlowProfileKind::Trail,
+        "Owner Trail",
+        "Ignored",
+        "Owner Trail_edited");
+    CHECK_FALSE(staleEditedProfile.dynamicMeshTrailChanged);
+    CHECK_FALSE(
+        staleEditedProfile.dynamicMeshEditedTrailProfileMatched);
+    CHECK(mesh.trailProfileName == "Other");
+
+    mesh.trailProfileName = "Owner Trail";
+    const auto exactMeshWithUnrelatedEdit =
+        ReplaceWaterFlowProfileAssignments(
+            emitters,
+            manualPaths,
+            &mesh,
+            WaterFlowProfileKind::Trail,
+            "Owner Trail",
+            "Saved Owner Trail",
+            "Unrelated_edited");
+    CHECK(exactMeshWithUnrelatedEdit.dynamicMeshTrailChanged);
+    CHECK_FALSE(
+        exactMeshWithUnrelatedEdit
+            .dynamicMeshEditedTrailProfileMatched);
+    CHECK(mesh.trailProfileName == "Saved Owner Trail");
+
+    const auto global = ReplaceWaterFlowProfileAssignments(
+        emitters,
+        manualPaths,
+        &mesh,
+        WaterFlowProfileKind::Path,
+        "Global",
+        "Default");
+    CHECK(global.pointSourceIds == std::vector<std::uint32_t>{13U});
+    CHECK(emitters[2].pathProfileName == "Default");
+    CHECK_FALSE(ReplaceWaterFlowProfileAssignments(
+                    emitters,
+                    manualPaths,
+                    &mesh,
+                    WaterFlowProfileKind::Path,
+                    "",
+                    "Ignored")
+                    .changed());
+
+    CHECK(emitters[0].pathProfileLocked);
+    CHECK(emitters[0].laneProfileLocked);
+    CHECK(emitters[0].trailProfileLocked);
+    CHECK(manualPaths[0].laneProfileLocked);
+    CHECK(manualPaths[0].trailProfileLocked);
+}
+
+TEST_CASE("Modern Flow object-copy metadata outranks legacy edited suffixes",
+          "[water][flow][profiles][persistence][migration]") {
+    using invisible_places::water::
+        WaterObjectProfileNameIsLegacyEditedShadow;
+
+    constexpr std::array<std::string_view, 3U> ownedCopies{
+        "Aerial_Creek_edited",
+        "Calm Lanes_Creek_edited",
+        "Water Flow_Creek_edited",
+    };
+    for (const auto name : ownedCopies) {
+        CAPTURE(name);
+        CHECK(WaterObjectProfileNameIsLegacyEditedShadow(name, false));
+        CHECK_FALSE(WaterObjectProfileNameIsLegacyEditedShadow(name, true));
+    }
+    CHECK(WaterObjectProfileNameIsLegacyEditedShadow(
+        "Legacy Working_Edited",
+        false));
+    CHECK_FALSE(WaterObjectProfileNameIsLegacyEditedShadow(
+        "Legacy Working_Edited",
+        true));
+    CHECK_FALSE(WaterObjectProfileNameIsLegacyEditedShadow(
+        "Creek edited",
+        false));
+    CHECK(WaterObjectProfileNameIsLegacyEditedShadow("_edited", false));
+    CHECK(WaterObjectProfileNameIsLegacyEditedShadow("_Edited", false));
+    CHECK_FALSE(WaterObjectProfileNameIsLegacyEditedShadow("_edited", true));
+    CHECK_FALSE(WaterObjectProfileNameIsLegacyEditedShadow("_Edited", true));
+}
+
+TEST_CASE("Flow keyed profile base rewrites preserve package identity and provenance",
+          "[water][flow][timing][keyed][profiles][references]") {
+    using invisible_places::water::
+        ReplaceWaterKeyedSettingsProfileBaseReferences;
+    using invisible_places::water::WaterKeyedFeatureKind;
+    using invisible_places::water::WaterKeyedSettingsProfile;
+
+    std::vector<WaterKeyedSettingsProfile> profiles{
+        {
+            .name = "Working_Path A",
+            .baseProfileName = " Working ",
+            .ownerObjectName = "Path A",
+            .sourceProfileName = "Template A",
+            .ownerObjectId = 10U,
+            .featureKind = WaterKeyedFeatureKind::FlowPath,
+            .edited = false,
+            .nativeLengthFraction = 0.4F,
+            .settings = {{
+                .settingId = "speed",
+                .profileGroup = "flow_path",
+                .profileName = "Working",
+                .keys = {{.position = 0.25F, .value = 0.5F}},
+            }},
+        },
+        {
+            .name = "Working_Path A_edited",
+            .baseProfileName = "Working",
+            .ownerObjectName = "Path A",
+            .sourceProfileName = "Working_Path A",
+            .ownerObjectId = 10U,
+            .featureKind = WaterKeyedFeatureKind::FlowPath,
+            .edited = true,
+        },
+        {
+            .name = "Seepage Working",
+            .baseProfileName = "Working",
+            .featureKind = WaterKeyedFeatureKind::SeepageNode,
+        },
+    };
+
+    const auto originalName = profiles[0].name;
+    const auto originalSource = profiles[0].sourceProfileName;
+    const auto originalKey = profiles[0].settings[0].keys[0];
+    CHECK(ReplaceWaterKeyedSettingsProfileBaseReferences(
+              profiles,
+              WaterKeyedFeatureKind::FlowPath,
+              "Working",
+              "Saved Lane") == 2U);
+    CHECK(profiles[0].baseProfileName == "Saved Lane");
+    CHECK(profiles[1].baseProfileName == "Saved Lane");
+    CHECK(profiles[2].baseProfileName == "Working");
+    CHECK(profiles[0].name == originalName);
+    CHECK(profiles[0].sourceProfileName == originalSource);
+    CHECK(profiles[0].ownerObjectId == 10U);
+    CHECK(profiles[0].nativeLengthFraction == Catch::Approx(0.4F));
+    CHECK(profiles[0].settings[0].profileName == "Working");
+    CHECK(profiles[0].settings[0].keys[0].position ==
+          Catch::Approx(originalKey.position));
+    CHECK(profiles[0].settings[0].keys[0].value ==
+          Catch::Approx(originalKey.value));
+}
+
 TEST_CASE("Dynamic keyed tracks follow renamed Seepage profiles",
           "[water][timing][keyed][profiles][references]") {
     using invisible_places::water::
@@ -2453,6 +2724,138 @@ TEST_CASE("Seepage transactions classify blank legacy metadata in every persiste
         CHECK(packages[1].settings[0].profileGroup.empty());
         CHECK(packages[1].settings[0].profileName == "Working");
     }
+}
+
+TEST_CASE("Flow Path transactions classify blank legacy metadata in every persisted store",
+          "[water][flow][timing][keyed][profiles][references][migration]") {
+    using invisible_places::timing::ReplaceTimingWaterProfileReferences;
+    using invisible_places::timing::TimingTakeSceneState;
+    using invisible_places::water::WaterKeyedFeatureKind;
+    using invisible_places::water::WaterKeyedSettingsProfile;
+    using invisible_places::water::WaterScenarioFeatureRuns;
+
+    const auto flowPath = invisible_places::water::WaterKeyedFeatureId{
+        .kind = WaterKeyedFeatureKind::FlowPath,
+        .objectId = 30U,
+    };
+    const auto flowSource = invisible_places::water::WaterKeyedFeatureId{
+        .kind = WaterKeyedFeatureKind::FlowSource,
+        .objectId = 31U,
+    };
+    std::vector<WaterScenarioFeatureRuns> legacyScenarios{{
+        .scenarioId = "legacy",
+        .runs = {{
+            .id = 1U,
+            .features = {
+                {
+                    .feature = flowPath,
+                    .settings = {
+                        {.settingId = "speed",
+                         .active = false,
+                         .profileName = "Working Lane",
+                         .keys = {{.position = 0.2F, .value = 0.4F}}},
+                        {.settingId = "not_a_flow_path_setting",
+                         .active = false,
+                         .profileName = "Working Lane"},
+                        {.settingId = "trail_width",
+                         .active = false,
+                         .profileGroup = "trail",
+                         .profileName = "Working Lane"},
+                    },
+                },
+                {
+                    .feature = flowSource,
+                    .settings = {{
+                        .settingId = "strength",
+                        .active = false,
+                        .profileName = "Working Lane",
+                    }},
+                },
+            },
+        }},
+    }};
+    std::vector<TimingTakeSceneState> takeStates{{
+        .takeId = "take-1",
+        .waterFeatureTimingRuns = {{
+            .id = 2U,
+            .features = {{
+                .feature = flowPath,
+                .settings = {{
+                    .settingId = "trail_streak_length",
+                    .active = false,
+                    .profileName = "Working Lane",
+                    .keys = {{.position = 0.7F, .value = 0.8F}},
+                }},
+            }},
+        }},
+    }};
+    std::vector<WaterKeyedSettingsProfile> packages{
+        {
+            .name = "Flow Finish",
+            .baseProfileName = "Working Lane",
+            .sourceProfileName = "Flow Start",
+            .ownerObjectId = 30U,
+            .featureKind = WaterKeyedFeatureKind::FlowPath,
+            .nativeLengthFraction = 0.3F,
+            .settings = {{
+                .settingId = "trail_width",
+                .active = false,
+                .profileName = "Working Lane",
+                .keys = {{.position = 1.0F, .value = 0.0F}},
+            }},
+        },
+        {
+            .name = "Seepage Finish",
+            .baseProfileName = "Working Lane",
+            .featureKind = WaterKeyedFeatureKind::SeepageNode,
+            .settings = {{
+                .settingId = "strength",
+                .active = false,
+                .profileName = "Working Lane",
+            }},
+        },
+    };
+
+    const auto counts = ReplaceTimingWaterProfileReferences(
+        legacyScenarios,
+        takeStates,
+        packages,
+        "flow_path",
+        "Working Lane",
+        "Saved Lane");
+    CHECK(counts.legacyScenarioTracks == 1U);
+    CHECK(counts.timingTakeTracks == 1U);
+    CHECK(counts.keyedPackageTracks == 1U);
+    const auto& legacyTracks =
+        legacyScenarios[0].runs[0].features[0].settings;
+    CHECK(legacyTracks[0].profileGroup == "flow_path");
+    CHECK(legacyTracks[0].profileName == "Saved Lane");
+    CHECK_FALSE(legacyTracks[0].active);
+    CHECK(legacyTracks[0].keys[0].position == Catch::Approx(0.2F));
+    CHECK(legacyTracks[1].profileGroup.empty());
+    CHECK(legacyTracks[1].profileName == "Working Lane");
+    CHECK(legacyTracks[2].profileGroup == "trail");
+    CHECK(legacyTracks[2].profileName == "Working Lane");
+    CHECK(legacyScenarios[0]
+              .runs[0]
+              .features[1]
+              .settings[0]
+              .profileName == "Working Lane");
+    const auto& takeTrack = takeStates[0]
+                                .waterFeatureTimingRuns[0]
+                                .features[0]
+                                .settings[0];
+    CHECK(takeTrack.profileGroup == "flow_path");
+    CHECK(takeTrack.profileName == "Saved Lane");
+    CHECK(takeTrack.keys[0].value == Catch::Approx(0.8F));
+    CHECK(packages[0].settings[0].profileGroup == "flow_path");
+    CHECK(packages[0].settings[0].profileName == "Saved Lane");
+    CHECK(packages[0].name == "Flow Finish");
+    CHECK(packages[0].sourceProfileName == "Flow Start");
+    CHECK(packages[0].nativeLengthFraction == Catch::Approx(0.3F));
+    CHECK(packages[0].baseProfileName == "Working Lane");
+    CHECK(packages[1].settings[0].profileGroup.empty());
+    CHECK(packages[1].settings[0].profileName == "Working Lane");
 }
 
 TEST_CASE("Legacy uppercase Seepage edits promote every exact reference before removal",
