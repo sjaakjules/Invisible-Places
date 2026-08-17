@@ -340,6 +340,12 @@ PromoteTimingColouriseLocalPaletteEdit(
 struct TimingTakeDefinition {
     std::string id;
     std::string name = "Timing Take";
+    // Stable profile ids are authoritative. Names are persisted mirrors for
+    // readable JSON, recovery from a missing id, and explicit base provenance.
+    std::string assignedRainProfileId;
+    std::string assignedRainProfileName;
+    std::string baseRainProfileId;
+    std::string baseRainProfileName;
 };
 
 struct TimingTakeSceneState {
@@ -361,6 +367,92 @@ struct TimingColouriseLayerSample {
 
 [[nodiscard]] std::string NormalizeTimingTakeId(std::string_view takeId);
 [[nodiscard]] TimingTakeDefinition AuthoredTimingTakeDefinition();
+
+inline constexpr std::string_view kLegacyWaterRainProfileId =
+    "rain-profile-project";
+inline constexpr std::string_view kLegacyWaterRainProfileName =
+    "Project Rain";
+
+// Resolves one take's effective/base Rain profiles by stable id first and its
+// persisted name mirror second. A missing assignment falls back to the first
+// shared base profile; object-owned copies are never chosen as that fallback.
+[[nodiscard]] const invisible_places::water::WaterRainProfile*
+ResolveTimingTakeRainProfile(
+    std::span<const invisible_places::water::WaterRainProfile> profiles,
+    const TimingTakeDefinition& take);
+[[nodiscard]] const invisible_places::water::WaterRainProfile*
+ResolveTimingTakeRainBaseProfile(
+    std::span<const invisible_places::water::WaterRainProfile> profiles,
+    const TimingTakeDefinition& take);
+
+// Normalizes ids/names in file order and rewrites profile/take references.
+// The first duplicate keeps its identity; later entries receive deterministic
+// suffixes, with stable-id plus name mirrors disambiguating legacy collisions.
+void SanitizeWaterRainProfileLibrary(
+    std::vector<invisible_places::water::WaterRainProfile>* profiles,
+    std::vector<TimingTakeDefinition>* takes = nullptr);
+
+// Upgrades a singleton legacy Rain snapshot into exactly one shared base and
+// assigns it only to takes that do not already resolve. Returns the base id.
+// The full runtime and visual snapshots are copied verbatim.
+[[nodiscard]] std::string EnsureLegacyWaterRainProfile(
+    std::vector<invisible_places::water::WaterRainProfile>* profiles,
+    std::vector<TimingTakeDefinition>* takes,
+    const invisible_places::water::RainRuntimeSettings& legacySettings,
+    const invisible_places::water::WaterRainVisualSettings& legacyVisual,
+    std::string_view preferredName = kLegacyWaterRainProfileName);
+
+// Selects a shared base profile and clears any prior owner-copy assignment.
+bool AssignTimingTakeRainBaseProfile(
+    TimingTakeDefinition* take,
+    std::span<const invisible_places::water::WaterRainProfile> profiles,
+    std::string_view baseProfileId);
+
+// Commits edited Rain into the take-owned `(owner, base)` copy, creating a
+// collision-safe `<base>_<take>` profile on first edit. The take is reassigned
+// to that copy and its base mirrors remain stable.
+[[nodiscard]] invisible_places::water::WaterRainProfile*
+UpsertTimingTakeRainOwnerProfile(
+    std::vector<invisible_places::water::WaterRainProfile>* profiles,
+    TimingTakeDefinition* take,
+    const invisible_places::water::RainRuntimeSettings& settings,
+    const invisible_places::water::WaterRainVisualSettings& visual);
+
+// Promotes the take's effective snapshot into a nameable shared base. An
+// existing shared profile is overwritten only when explicitly requested;
+// otherwise a collision-safe new name/id is allocated. Any references to the
+// promoted temporary owner copy follow the saved base before it is removed.
+[[nodiscard]] invisible_places::water::WaterRainProfile*
+SaveTimingTakeRainOwnerProfileAsShared(
+    std::vector<invisible_places::water::WaterRainProfile>* profiles,
+    std::vector<TimingTakeDefinition>* takes,
+    std::string_view takeId,
+    std::string_view requestedName,
+    bool overwriteExisting = false);
+
+// Returns a take to the base behind its current owner copy and removes that
+// temporary copy. Any other take referencing the copy follows the same base.
+bool DiscardTimingTakeRainOwnerProfile(
+    std::vector<invisible_places::water::WaterRainProfile>* profiles,
+    std::vector<TimingTakeDefinition>* takes,
+    std::string_view takeId);
+
+// Lifecycle helpers used by Timing Take Rename/Duplicate/Delete transactions.
+// Rename updates every assignment-name mirror for the stable owner profile id.
+bool RenameTimingTakeRainOwnerProfile(
+    std::vector<invisible_places::water::WaterRainProfile>* profiles,
+    std::vector<TimingTakeDefinition>* takes,
+    std::string_view takeId);
+bool DuplicateTimingTakeRainProfileAssignment(
+    std::vector<invisible_places::water::WaterRainProfile>* profiles,
+    const TimingTakeDefinition& source,
+    TimingTakeDefinition* duplicate);
+// Surviving takes that referenced a removed owner copy are returned to its
+// shared base before the copy is erased.
+[[nodiscard]] std::size_t RemoveTimingTakeRainOwnerProfiles(
+    std::vector<invisible_places::water::WaterRainProfile>* profiles,
+    std::vector<TimingTakeDefinition>* takes,
+    std::string_view deletedTakeId);
 
 [[nodiscard]] TimingColourisePalette SanitizeTimingColourisePalette(
     TimingColourisePalette palette);

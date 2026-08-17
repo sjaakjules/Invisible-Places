@@ -344,6 +344,48 @@ TEST_CASE("project merge scopes package names to water feature kind",
     CHECK(profiles[1]["feature_kind"] == "flow_path");
 }
 
+TEST_CASE(
+    "project merge identifies shared and owner Rain profiles by stable id",
+    "[workspace][conflict][merge][water][rain-profile]") {
+    const nlohmann::json baseline = {
+        {"water_rain_profiles",
+         nlohmann::json::array({
+             {{"id", "rain-base-a"},
+              {"name", "Fine"},
+              {"rain_settings", {{"density", 0.2}}}},
+             {{"id", "rain-base-b"},
+              {"name", "Heavy"},
+              {"rain_settings", {{"density", 0.7}}}},
+             {{"id", "rain-base-a-take-1"},
+              {"name", "Fine_Take 1"},
+              {"object_override", true},
+              {"owner_timing_take_id", "take-1"},
+              {"base_profile_id", "rain-base-a"},
+              {"base_profile_name", "Fine"},
+              {"rain_settings", {{"density", 0.3}}}},
+         })},
+    };
+    auto local = baseline;
+    local["water_rain_profiles"][0]["rain_settings"]["density"] = 0.4;
+    local["water_rain_profiles"][2]["rain_settings"]["density"] = 0.5;
+    auto remote = baseline;
+    remote["water_rain_profiles"][1]["rain_settings"]["density"] = 0.9;
+    remote["water_rain_profiles"][2]["rain_settings"]["opacity_scale"] =
+        1.6;
+
+    const auto result = MergeJsonDocuments(baseline, local, remote);
+    CHECK(result.conflicts.empty());
+    const auto& profiles = result.merged["water_rain_profiles"];
+    REQUIRE(profiles.size() == 3U);
+    CHECK(profiles[0]["id"] == "rain-base-a");
+    CHECK(profiles[0]["rain_settings"]["density"] == 0.4);
+    CHECK(profiles[1]["id"] == "rain-base-b");
+    CHECK(profiles[1]["rain_settings"]["density"] == 0.9);
+    CHECK(profiles[2]["id"] == "rain-base-a-take-1");
+    CHECK(profiles[2]["rain_settings"]["density"] == 0.5);
+    CHECK(profiles[2]["rain_settings"]["opacity_scale"] == 1.6);
+}
+
 TEST_CASE("project merge reports and resolves one overlapping scalar edit",
           "[workspace][conflict][merge]") {
     const nlohmann::json baseline = {

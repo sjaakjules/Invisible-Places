@@ -3625,3 +3625,401 @@ TEST_CASE("Explicit clip membership routes new keys and derives clip bounds",
     CHECK(edited->value == Approx(0.9F));
     CHECK(edited->clipId == 7U);
 }
+
+TEST_CASE(
+    "legacy Rain snapshot becomes one shared Timing Take profile without losing edited visual values",
+    "[water][rain][profiles][timing]") {
+    using invisible_places::timing::EnsureLegacyWaterRainProfile;
+    using invisible_places::timing::ResolveTimingTakeRainProfile;
+    using invisible_places::timing::TimingTakeDefinition;
+    using invisible_places::water::RainRuntimeSettings;
+    using invisible_places::water::WaterRainProfile;
+    using invisible_places::water::WaterRainVisualSettings;
+
+    RainRuntimeSettings legacy;
+    legacy.enabled = false;
+    legacy.activeParticleCount = 32'768U;
+    legacy.visualProfileName = "Rain Fine Lines";
+    legacy.density = 0.40F;
+    legacy.opacityScale = 1.58F;
+    WaterRainVisualSettings editedVisual;
+    editedVisual.widthMeters = 0.0017F;
+    editedVisual.softness = 0.92F;
+    editedVisual.opacity = 0.08F;
+    editedVisual.emission = 0.01F;
+    editedVisual.minimumScreenPixels = 0.0F;
+    editedVisual.maximumScreenPixels = 10.09F;
+
+    std::vector<WaterRainProfile> profiles;
+    std::vector<TimingTakeDefinition> takes{
+        invisible_places::timing::AuthoredTimingTakeDefinition(),
+        {.id = "timing-take-8", .name = "First-01"},
+        {.id = "timing-take-9", .name = "First-02"},
+    };
+    const auto baseId = EnsureLegacyWaterRainProfile(
+        &profiles,
+        &takes,
+        legacy,
+        editedVisual);
+
+    REQUIRE(baseId == invisible_places::timing::kLegacyWaterRainProfileId);
+    REQUIRE(profiles.size() == 1U);
+    CHECK(profiles.front().name == "Project Rain");
+    CHECK_FALSE(profiles.front().objectOverride);
+    CHECK(profiles.front().settings == legacy);
+    CHECK(profiles.front().visual == editedVisual);
+    for (const auto& take : takes) {
+        CHECK(take.assignedRainProfileId == baseId);
+        CHECK(take.assignedRainProfileName == "Project Rain");
+        CHECK(take.baseRainProfileId == baseId);
+        REQUIRE(ResolveTimingTakeRainProfile(profiles, take) != nullptr);
+        CHECK(ResolveTimingTakeRainProfile(profiles, take)->visual ==
+              editedVisual);
+    }
+
+    // Re-running migration does not manufacture one profile per take and does
+    // not overwrite a base that has subsequently been authored.
+    profiles.front().settings.density = 0.73F;
+    CHECK(EnsureLegacyWaterRainProfile(
+              &profiles,
+              &takes,
+              legacy,
+              editedVisual) == baseId);
+    REQUIRE(profiles.size() == 1U);
+    CHECK(profiles.front().settings.density == Approx(0.73F));
+}
+
+TEST_CASE(
+    "Timing Take Rain owner profiles follow assign edit rename duplicate and delete lifecycle",
+    "[water][rain][profiles][timing]") {
+    using invisible_places::timing::AssignTimingTakeRainBaseProfile;
+    using invisible_places::timing::DuplicateTimingTakeRainProfileAssignment;
+    using invisible_places::timing::RemoveTimingTakeRainOwnerProfiles;
+    using invisible_places::timing::RenameTimingTakeRainOwnerProfile;
+    using invisible_places::timing::ResolveTimingTakeRainProfile;
+    using invisible_places::timing::TimingTakeDefinition;
+    using invisible_places::timing::UpsertTimingTakeRainOwnerProfile;
+    using invisible_places::water::WaterRainProfile;
+
+    WaterRainProfile base;
+    base.id = "rain-profile-fine";
+    base.name = "Fine Lines";
+    base.settings.density = 0.40F;
+    base.visual.opacity = 0.08F;
+    WaterRainProfile nameCollision;
+    nameCollision.id = "rain-profile-collision";
+    nameCollision.name = "Fine Lines_First-01";
+    std::vector<WaterRainProfile> profiles{base, nameCollision};
+    std::vector<TimingTakeDefinition> takes{
+        {.id = "timing-take-8", .name = "First-01"},
+        {.id = "timing-take-9", .name = "First-02"},
+    };
+    REQUIRE(AssignTimingTakeRainBaseProfile(
+        &takes[0], profiles, base.id));
+    REQUIRE(AssignTimingTakeRainBaseProfile(
+        &takes[1], profiles, base.id));
+
+    auto editedSettings = base.settings;
+    auto editedVisual = base.visual;
+    editedSettings.density = 0.91F;
+    editedVisual.opacity = 0.42F;
+    auto* firstCopy = UpsertTimingTakeRainOwnerProfile(
+        &profiles,
+        &takes[0],
+        editedSettings,
+        editedVisual);
+    REQUIRE(firstCopy != nullptr);
+    const auto firstCopyId = firstCopy->id;
+    CHECK(firstCopy->name == "Fine Lines_First-01 2");
+    CHECK(firstCopy->objectOverride);
+    CHECK(firstCopy->ownerTimingTakeId == "timing-take-8");
+    CHECK(firstCopy->baseProfileId == base.id);
+    CHECK(ResolveTimingTakeRainProfile(profiles, takes[0])->settings.density ==
+          Approx(0.91F));
+    CHECK(ResolveTimingTakeRainProfile(profiles, takes[1])->settings.density ==
+          Approx(0.40F));
+
+    // A second take may inspect the copy by stable id; rename updates its
+    // human-readable mirror without changing the assignment identity.
+    TimingTakeDefinition observer{
+        .id = "observer",
+        .name = "Observer",
+        .assignedRainProfileId = firstCopyId,
+        .assignedRainProfileName = firstCopy->name,
+        .baseRainProfileId = base.id,
+        .baseRainProfileName = base.name,
+    };
+    takes.push_back(observer);
+    takes[0].name = "First Rain";
+    REQUIRE(RenameTimingTakeRainOwnerProfile(
+        &profiles,
+        &takes,
+        takes[0].id));
+    firstCopy = invisible_places::water::FindWaterRainProfileById(
+        &profiles,
+        firstCopyId);
+    REQUIRE(firstCopy != nullptr);
+    CHECK(firstCopy->name == "Fine Lines_First Rain");
+    CHECK(takes[2].assignedRainProfileName == firstCopy->name);
+
+    TimingTakeDefinition duplicate{
+        .id = "timing-take-10",
+        .name = "First Rain Copy",
+    };
+    REQUIRE(DuplicateTimingTakeRainProfileAssignment(
+        &profiles,
+        takes[0],
+        &duplicate));
+    REQUIRE(duplicate.assignedRainProfileId != firstCopyId);
+    const auto* duplicateProfile = ResolveTimingTakeRainProfile(
+        profiles,
+        duplicate);
+    REQUIRE(duplicateProfile != nullptr);
+    const auto duplicateProfileId = duplicateProfile->id;
+    CHECK(duplicateProfile->objectOverride);
+    CHECK(duplicateProfile->ownerTimingTakeId == duplicate.id);
+    CHECK(duplicateProfile->settings == editedSettings);
+    CHECK(duplicateProfile->visual == editedVisual);
+    takes.push_back(duplicate);
+
+    CHECK(RemoveTimingTakeRainOwnerProfiles(
+              &profiles,
+              &takes,
+              takes[0].id) == 1U);
+    CHECK(invisible_places::water::FindWaterRainProfileById(
+              profiles,
+              firstCopyId) == nullptr);
+    CHECK(takes[2].assignedRainProfileId == base.id);
+    CHECK(ResolveTimingTakeRainProfile(profiles, takes.back())->id ==
+          duplicateProfileId);
+}
+
+TEST_CASE(
+    "Rain profile sanitation deterministically repairs duplicate ids names and references",
+    "[water][rain][profiles][timing]") {
+    using invisible_places::timing::SanitizeWaterRainProfileLibrary;
+    using invisible_places::timing::TimingTakeDefinition;
+    using invisible_places::water::WaterRainProfile;
+
+    WaterRainProfile first;
+    first.id = "shared-duplicate";
+    first.name = "Rain";
+    WaterRainProfile second;
+    second.id = "shared-duplicate";
+    second.name = "Storm";
+    WaterRainProfile owner;
+    owner.id = "owner-copy";
+    owner.name = "Rain";
+    owner.objectOverride = true;
+    owner.ownerTimingTakeId = "timing-take-8";
+    owner.baseProfileId = "shared-duplicate";
+    owner.baseProfileName = "Storm";
+    WaterRainProfile reservedSuffix;
+    reservedSuffix.id = "shared-duplicate-2";
+    reservedSuffix.name = "Rain 2";
+    std::vector<WaterRainProfile> profiles{
+        first,
+        second,
+        owner,
+        reservedSuffix,
+    };
+    std::vector<TimingTakeDefinition> takes{
+        {.id = "timing-take-8",
+         .name = "First-01",
+         .assignedRainProfileId = "owner-copy",
+         .assignedRainProfileName = "Rain",
+         .baseRainProfileId = "shared-duplicate",
+         .baseRainProfileName = "Storm"},
+        {.id = "timing-take-9",
+         .name = "First-02",
+         .assignedRainProfileId = "shared-duplicate",
+         .assignedRainProfileName = "Storm",
+         .baseRainProfileId = "shared-duplicate",
+         .baseRainProfileName = "Storm"},
+    };
+
+    SanitizeWaterRainProfileLibrary(&profiles, &takes);
+    REQUIRE(profiles.size() == 4U);
+    CHECK(profiles[0].id == "shared-duplicate");
+    CHECK(profiles[1].id == "shared-duplicate-3");
+    CHECK(profiles[2].id == "owner-copy");
+    CHECK(profiles[3].id == "shared-duplicate-2");
+    CHECK(profiles[0].name == "Rain");
+    CHECK(profiles[1].name == "Storm");
+    CHECK(profiles[2].name == "Rain 3");
+    CHECK(profiles[3].name == "Rain 2");
+    CHECK(profiles[2].baseProfileId == profiles[1].id);
+    CHECK(profiles[2].baseProfileName == profiles[1].name);
+    CHECK(takes[0].assignedRainProfileId == profiles[2].id);
+    CHECK(takes[0].assignedRainProfileName == profiles[2].name);
+    CHECK(takes[0].baseRainProfileId == profiles[1].id);
+    CHECK(takes[1].assignedRainProfileId == profiles[1].id);
+
+    const auto once = profiles;
+    const auto onceTakes = takes;
+    SanitizeWaterRainProfileLibrary(&profiles, &takes);
+    CHECK(profiles == once);
+    REQUIRE(takes.size() == onceTakes.size());
+    for (std::size_t index = 0U; index < takes.size(); ++index) {
+        CHECK(takes[index].id == onceTakes[index].id);
+        CHECK(takes[index].name == onceTakes[index].name);
+        CHECK(takes[index].assignedRainProfileId ==
+              onceTakes[index].assignedRainProfileId);
+        CHECK(takes[index].assignedRainProfileName ==
+              onceTakes[index].assignedRainProfileName);
+        CHECK(takes[index].baseRainProfileId ==
+              onceTakes[index].baseRainProfileId);
+        CHECK(takes[index].baseRainProfileName ==
+              onceTakes[index].baseRainProfileName);
+    }
+}
+
+TEST_CASE(
+    "Timing Take Rain rename updates every base-specific owner copy",
+    "[water][rain][profiles][timing]") {
+    using invisible_places::timing::AssignTimingTakeRainBaseProfile;
+    using invisible_places::timing::RenameTimingTakeRainOwnerProfile;
+    using invisible_places::timing::TimingTakeDefinition;
+    using invisible_places::timing::UpsertTimingTakeRainOwnerProfile;
+    using invisible_places::water::WaterRainProfile;
+
+    WaterRainProfile fine;
+    fine.id = "fine";
+    fine.name = "Fine";
+    WaterRainProfile heavy;
+    heavy.id = "heavy";
+    heavy.name = "Heavy";
+    std::vector<WaterRainProfile> profiles{fine, heavy};
+    std::vector<TimingTakeDefinition> takes{
+        {.id = "take-a", .name = "Before"},
+        {.id = "observer-a", .name = "Observer A"},
+        {.id = "observer-b", .name = "Observer B"},
+    };
+
+    REQUIRE(AssignTimingTakeRainBaseProfile(&takes[0], profiles, fine.id));
+    REQUIRE(UpsertTimingTakeRainOwnerProfile(
+                &profiles,
+                &takes[0],
+                fine.settings,
+                fine.visual) != nullptr);
+    const auto fineCopyId = takes[0].assignedRainProfileId;
+    takes[1] = takes[0];
+    takes[1].id = "observer-a";
+    takes[1].name = "Observer A";
+
+    REQUIRE(AssignTimingTakeRainBaseProfile(&takes[0], profiles, heavy.id));
+    REQUIRE(UpsertTimingTakeRainOwnerProfile(
+                &profiles,
+                &takes[0],
+                heavy.settings,
+                heavy.visual) != nullptr);
+    const auto heavyCopyId = takes[0].assignedRainProfileId;
+    takes[2] = takes[0];
+    takes[2].id = "observer-b";
+    takes[2].name = "Observer B";
+
+    takes[0].name = "After";
+    REQUIRE(RenameTimingTakeRainOwnerProfile(
+        &profiles,
+        &takes,
+        takes[0].id));
+    const auto* fineCopy = invisible_places::water::FindWaterRainProfileById(
+        profiles,
+        fineCopyId);
+    const auto* heavyCopy = invisible_places::water::FindWaterRainProfileById(
+        profiles,
+        heavyCopyId);
+    REQUIRE(fineCopy != nullptr);
+    REQUIRE(heavyCopy != nullptr);
+    CHECK(fineCopy->name == "Fine_After");
+    CHECK(heavyCopy->name == "Heavy_After");
+    CHECK(takes[1].assignedRainProfileName == fineCopy->name);
+    CHECK(takes[2].assignedRainProfileName == heavyCopy->name);
+}
+
+TEST_CASE(
+    "Timing Take Rain Save and Discard return owner edits to shared profiles",
+    "[water][rain][profiles][timing]") {
+    using invisible_places::timing::AssignTimingTakeRainBaseProfile;
+    using invisible_places::timing::DiscardTimingTakeRainOwnerProfile;
+    using invisible_places::timing::ResolveTimingTakeRainProfile;
+    using invisible_places::timing::SaveTimingTakeRainOwnerProfileAsShared;
+    using invisible_places::timing::TimingTakeDefinition;
+    using invisible_places::timing::UpsertTimingTakeRainOwnerProfile;
+    using invisible_places::water::WaterRainProfile;
+
+    WaterRainProfile base;
+    base.id = "base";
+    base.name = "Base";
+    base.settings.density = 0.2F;
+    std::vector<WaterRainProfile> profiles{base};
+    std::vector<TimingTakeDefinition> takes{
+        {.id = "take", .name = "Take"},
+        {.id = "observer", .name = "Observer"},
+    };
+    REQUIRE(AssignTimingTakeRainBaseProfile(&takes[0], profiles, base.id));
+    REQUIRE(AssignTimingTakeRainBaseProfile(&takes[1], profiles, base.id));
+
+    auto edited = base.settings;
+    edited.density = 0.7F;
+    REQUIRE(UpsertTimingTakeRainOwnerProfile(
+                &profiles,
+                &takes[0],
+                edited,
+                base.visual) != nullptr);
+    const auto discardedOwnerId = takes[0].assignedRainProfileId;
+    takes[1].assignedRainProfileId = discardedOwnerId;
+    takes[1].assignedRainProfileName = takes[0].assignedRainProfileName;
+    REQUIRE(DiscardTimingTakeRainOwnerProfile(
+        &profiles,
+        &takes,
+        takes[0].id));
+    CHECK(invisible_places::water::FindWaterRainProfileById(
+              profiles,
+              discardedOwnerId) == nullptr);
+    CHECK(takes[0].assignedRainProfileId == base.id);
+    CHECK(takes[1].assignedRainProfileId == base.id);
+    CHECK(ResolveTimingTakeRainProfile(profiles, takes[0])->settings.density ==
+          Catch::Approx(0.2F));
+
+    REQUIRE(UpsertTimingTakeRainOwnerProfile(
+                &profiles,
+                &takes[0],
+                edited,
+                base.visual) != nullptr);
+    const auto savedOwnerId = takes[0].assignedRainProfileId;
+    takes[1].assignedRainProfileId = savedOwnerId;
+    takes[1].assignedRainProfileName = takes[0].assignedRainProfileName;
+    auto* saved = SaveTimingTakeRainOwnerProfileAsShared(
+        &profiles,
+        &takes,
+        takes[0].id,
+        "Saved Rain");
+    REQUIRE(saved != nullptr);
+    const auto savedId = saved->id;
+    CHECK(saved->name == "Saved Rain");
+    CHECK_FALSE(saved->objectOverride);
+    CHECK(saved->settings.density == Catch::Approx(0.7F));
+    CHECK(invisible_places::water::FindWaterRainProfileById(
+              profiles,
+              savedOwnerId) == nullptr);
+    CHECK(takes[0].assignedRainProfileId == savedId);
+    CHECK(takes[1].assignedRainProfileId == savedId);
+
+    auto overwritten = saved->settings;
+    overwritten.density = 0.9F;
+    REQUIRE(UpsertTimingTakeRainOwnerProfile(
+                &profiles,
+                &takes[0],
+                overwritten,
+                saved->visual) != nullptr);
+    auto* promoted = SaveTimingTakeRainOwnerProfileAsShared(
+        &profiles,
+        &takes,
+        takes[0].id,
+        "Saved Rain",
+        true);
+    REQUIRE(promoted != nullptr);
+    CHECK(promoted->id == savedId);
+    CHECK(promoted->settings.density == Catch::Approx(0.9F));
+}

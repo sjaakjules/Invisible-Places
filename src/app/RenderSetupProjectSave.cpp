@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <optional>
 #include <span>
 #include <utility>
 
@@ -16,6 +17,7 @@ using invisible_places::serialization::ProjectDocument;
 using invisible_places::timing::TimingTakeDefinition;
 using invisible_places::timing::TimingTakeSceneState;
 using invisible_places::water::WaterKeyedSettingsProfile;
+using invisible_places::water::WaterRainProfile;
 
 bool WaterKeyedSettingsProfilesEqual(
     const WaterKeyedSettingsProfile& leftInput,
@@ -111,6 +113,72 @@ void ApplyWaterKeyedSettingsProfileDelta(
     }
 }
 
+std::optional<std::size_t> FindWaterRainProfileIndex(
+    std::span<const WaterRainProfile> profiles,
+    const WaterRainProfile& profile) {
+    if (!profile.id.empty()) {
+        if (const auto* found =
+                invisible_places::water::FindWaterRainProfileById(
+                    profiles,
+                    profile.id);
+            found != nullptr) {
+            return static_cast<std::size_t>(found - profiles.data());
+        }
+        // Stable ids are authoritative. A reused display name must not merge
+        // two different profiles; name fallback is legacy empty-id only.
+        return std::nullopt;
+    }
+    if (const auto* found =
+            invisible_places::water::FindWaterRainProfileByName(
+                profiles,
+                profile.name);
+        found != nullptr) {
+        return static_cast<std::size_t>(found - profiles.data());
+    }
+    return std::nullopt;
+}
+
+void ApplyWaterRainProfileDelta(
+    std::span<const WaterRainProfile> baseline,
+    std::span<const WaterRainProfile> live,
+    std::vector<WaterRainProfile>* destination) {
+    if (destination == nullptr) {
+        return;
+    }
+    for (const auto& profile : baseline) {
+        if (FindWaterRainProfileIndex(live, profile).has_value()) {
+            continue;
+        }
+        if (const auto index =
+                FindWaterRainProfileIndex(*destination, profile);
+            index.has_value()) {
+            destination->erase(
+                destination->begin() +
+                static_cast<std::ptrdiff_t>(index.value()));
+        }
+    }
+    for (const auto& profile : live) {
+        const auto sanitized =
+            invisible_places::water::SanitizeWaterRainProfile(profile);
+        const auto baselineIndex = FindWaterRainProfileIndex(
+            baseline,
+            sanitized);
+        if (baselineIndex.has_value() &&
+            invisible_places::water::SanitizeWaterRainProfile(
+                baseline[baselineIndex.value()]) == sanitized) {
+            continue;
+        }
+        if (const auto destinationIndex = FindWaterRainProfileIndex(
+                *destination,
+                sanitized);
+            destinationIndex.has_value()) {
+            (*destination)[destinationIndex.value()] = sanitized;
+        } else {
+            destination->push_back(sanitized);
+        }
+    }
+}
+
 bool TimingTakeDefinitionsEqual(
     const TimingTakeDefinition& left,
     const TimingTakeDefinition& right) {
@@ -119,7 +187,15 @@ bool TimingTakeDefinitionsEqual(
     const auto sanitizedRight =
         invisible_places::timing::SanitizeTimingTakeDefinition(right);
     return sanitizedLeft.id == sanitizedRight.id &&
-           sanitizedLeft.name == sanitizedRight.name;
+           sanitizedLeft.name == sanitizedRight.name &&
+           sanitizedLeft.assignedRainProfileId ==
+               sanitizedRight.assignedRainProfileId &&
+           sanitizedLeft.assignedRainProfileName ==
+               sanitizedRight.assignedRainProfileName &&
+           sanitizedLeft.baseRainProfileId ==
+               sanitizedRight.baseRainProfileId &&
+           sanitizedLeft.baseRainProfileName ==
+               sanitizedRight.baseRainProfileName;
 }
 
 void ApplyTimingTakeDefinitionDelta(
@@ -236,6 +312,10 @@ ProjectDocument MergeRenderSetupProjectForSave(
         previewBaseline.waterKeyedSettingsProfiles,
         liveProject.waterKeyedSettingsProfiles,
         &document.waterKeyedSettingsProfiles);
+    ApplyWaterRainProfileDelta(
+        previewBaseline.waterRainProfiles,
+        liveProject.waterRainProfiles,
+        &document.waterRainProfiles);
     ApplyTimingTakeDefinitionDelta(
         previewBaseline.timingTakes,
         liveProject.timingTakes,

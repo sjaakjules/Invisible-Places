@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -31,6 +32,61 @@ constexpr std::string_view kPreviousWaterSurfaceCacheAlgorithmId =
 constexpr std::uint64_t kWaterSurfacePayloadIoChunkBytes = 64ULL * 1024ULL * 1024ULL;
 constexpr std::uint32_t kMaximumHashProbeCount = 32U;
 constexpr float kPi = 3.14159265358979323846F;
+
+std::string TrimRainProfileText(std::string_view value) {
+    const auto isSpace = [](unsigned char character) {
+        return std::isspace(character) != 0;
+    };
+    auto first = value.begin();
+    while (first != value.end() &&
+           isSpace(static_cast<unsigned char>(*first))) {
+        ++first;
+    }
+    auto last = value.end();
+    while (last != first &&
+           isSpace(static_cast<unsigned char>(*(last - 1)))) {
+        --last;
+    }
+    return std::string{first, last};
+}
+
+std::string RainProfileNameKey(std::string_view value) {
+    auto normalized = TrimRainProfileText(value);
+    std::transform(
+        normalized.begin(),
+        normalized.end(),
+        normalized.begin(),
+        [](unsigned char character) {
+            return static_cast<char>(std::tolower(character));
+        });
+    return normalized;
+}
+
+std::string RainProfileIdStem(std::string_view value) {
+    const auto trimmed = TrimRainProfileText(value);
+    std::string stem;
+    stem.reserve(trimmed.size());
+    bool separator = false;
+    for (const unsigned char character : trimmed) {
+        if (std::isalnum(character) != 0) {
+            stem.push_back(static_cast<char>(std::tolower(character)));
+            separator = false;
+        } else if (character == '_' || character == '-') {
+            if (!stem.empty() && !separator) {
+                stem.push_back(static_cast<char>(character));
+                separator = true;
+            }
+        } else if (!stem.empty() && !separator) {
+            stem.push_back('-');
+            separator = true;
+        }
+    }
+    while (!stem.empty() &&
+           (stem.back() == '-' || stem.back() == '_')) {
+        stem.pop_back();
+    }
+    return stem.empty() ? std::string{"rain-profile"} : stem;
+}
 
 struct Cell2 {
     std::int32_t x = 0;
@@ -1457,6 +1513,95 @@ std::uint64_t WaterSurfaceCachePersistenceBytes(
 }
 
 }  // namespace
+
+WaterRainProfile SanitizeWaterRainProfile(WaterRainProfile profile) {
+    profile.id = TrimRainProfileText(profile.id);
+    profile.name = TrimRainProfileText(profile.name);
+    if (profile.name.empty()) {
+        profile.name = "Project Rain";
+    }
+    profile.ownerTimingTakeId = TrimRainProfileText(
+        profile.ownerTimingTakeId);
+    profile.baseProfileId = TrimRainProfileText(profile.baseProfileId);
+    profile.baseProfileName = TrimRainProfileText(profile.baseProfileName);
+    if (!profile.objectOverride || profile.ownerTimingTakeId.empty()) {
+        profile.objectOverride = false;
+        profile.ownerTimingTakeId.clear();
+        profile.baseProfileId.clear();
+        profile.baseProfileName.clear();
+    }
+    return profile;
+}
+
+const WaterRainProfile* FindWaterRainProfileById(
+    std::span<const WaterRainProfile> profiles,
+    std::string_view id) {
+    const auto wanted = TrimRainProfileText(id);
+    if (wanted.empty()) {
+        return nullptr;
+    }
+    const auto found = std::find_if(
+        profiles.begin(),
+        profiles.end(),
+        [&](const WaterRainProfile& profile) {
+            return TrimRainProfileText(profile.id) == wanted;
+        });
+    return found != profiles.end() ? &*found : nullptr;
+}
+
+WaterRainProfile* FindWaterRainProfileById(
+    std::vector<WaterRainProfile>* profiles,
+    std::string_view id) {
+    if (profiles == nullptr) {
+        return nullptr;
+    }
+    return const_cast<WaterRainProfile*>(FindWaterRainProfileById(
+        std::span<const WaterRainProfile>{*profiles},
+        id));
+}
+
+const WaterRainProfile* FindWaterRainProfileByName(
+    std::span<const WaterRainProfile> profiles,
+    std::string_view name) {
+    const auto wanted = RainProfileNameKey(name);
+    if (wanted.empty()) {
+        return nullptr;
+    }
+    const auto found = std::find_if(
+        profiles.begin(),
+        profiles.end(),
+        [&](const WaterRainProfile& profile) {
+            return RainProfileNameKey(profile.name) == wanted;
+        });
+    return found != profiles.end() ? &*found : nullptr;
+}
+
+WaterRainProfile* FindWaterRainProfileByName(
+    std::vector<WaterRainProfile>* profiles,
+    std::string_view name) {
+    if (profiles == nullptr) {
+        return nullptr;
+    }
+    return const_cast<WaterRainProfile*>(FindWaterRainProfileByName(
+        std::span<const WaterRainProfile>{*profiles},
+        name));
+}
+
+std::string AllocateWaterRainProfileId(
+    std::span<const WaterRainProfile> profiles,
+    std::string_view preferredId) {
+    const auto stem = RainProfileIdStem(preferredId);
+    if (FindWaterRainProfileById(profiles, stem) == nullptr) {
+        return stem;
+    }
+    for (std::uint32_t suffix = 2U; suffix < 100'000U; ++suffix) {
+        const auto candidate = stem + "-" + std::to_string(suffix);
+        if (FindWaterRainProfileById(profiles, candidate) == nullptr) {
+            return candidate;
+        }
+    }
+    return stem + "-copy";
+}
 
 RainRuntimeSettings DefaultRainRuntimeSettings() {
     return {};

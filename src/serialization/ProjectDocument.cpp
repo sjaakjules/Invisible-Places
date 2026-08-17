@@ -113,6 +113,7 @@ using invisible_places::water::WaterPathGenerationSettings;
 using invisible_places::water::WaterPathTerminationReason;
 using invisible_places::water::WaterRenderSettings;
 using invisible_places::water::RainRuntimeSettings;
+using invisible_places::water::WaterRainProfile;
 using invisible_places::water::WaterRainVisualSettings;
 using invisible_places::water::WaterRippleOverlayType;
 using invisible_places::water::WaterRipplePatternSettings;
@@ -153,6 +154,7 @@ constexpr std::uint32_t kWaterSplineHandlesProjectSchemaVersion = 75U;
 constexpr std::uint32_t kWaterSplineHandlesSourcesSchemaVersion = 29U;
 constexpr std::uint32_t kWaterClipMembershipProjectSchemaVersion = 76U;
 constexpr std::uint32_t kWaterClipMembershipSourcesSchemaVersion = 30U;
+constexpr std::uint32_t kWaterRainProfilesProjectSchemaVersion = 78U;
 constexpr std::uint32_t kRelativePalettePhaseProjectSchemaVersion = 62U;
 constexpr std::uint32_t kFieldMapBoundsMemoryProjectSchemaVersion = 63U;
 constexpr std::uint32_t kShorelineInstancesProjectSchemaVersion = 64U;
@@ -192,6 +194,9 @@ static_assert(
 static_assert(
     kWaterSourcesDocumentSchemaVersion >=
     kWaterClipMembershipSourcesSchemaVersion);
+static_assert(
+    kProjectDocumentSchemaVersion >=
+    kWaterRainProfilesProjectSchemaVersion);
 
 constexpr std::string_view kProjectVisualEditedSuffix = "_edited";
 constexpr std::string_view kProjectVisualLegacyEditedSuffix = "_Edited";
@@ -5641,6 +5646,10 @@ json SerializeTimingTakeDefinition(
     return {
         {"id", sanitized.id},
         {"name", sanitized.name},
+        {"assigned_rain_profile_id", sanitized.assignedRainProfileId},
+        {"assigned_rain_profile_name", sanitized.assignedRainProfileName},
+        {"base_rain_profile_id", sanitized.baseRainProfileId},
+        {"base_rain_profile_name", sanitized.baseRainProfileName},
     };
 }
 
@@ -5650,6 +5659,18 @@ ParseTimingTakeDefinition(const json& definitionJson) {
         .id = definitionJson.value("id", std::string{}),
         .name =
             definitionJson.value("name", std::string{"Timing Take"}),
+        .assignedRainProfileId = definitionJson.value(
+            "assigned_rain_profile_id",
+            std::string{}),
+        .assignedRainProfileName = definitionJson.value(
+            "assigned_rain_profile_name",
+            std::string{}),
+        .baseRainProfileId = definitionJson.value(
+            "base_rain_profile_id",
+            std::string{}),
+        .baseRainProfileName = definitionJson.value(
+            "base_rain_profile_name",
+            std::string{}),
     });
 }
 
@@ -7411,6 +7432,54 @@ WaterRainVisualSettings ParseWaterRainVisualSettings(const json& settingsJson) {
     return visual;
 }
 
+json SerializeWaterRainProfile(const WaterRainProfile& input) {
+    const auto profile =
+        invisible_places::water::SanitizeWaterRainProfile(input);
+    json profileJson{
+        {"id", profile.id},
+        {"name", profile.name},
+        {"rain_settings",
+         SerializeWaterRainSettings(profile.settings, profile.visual)},
+    };
+    if (profile.objectOverride) {
+        profileJson["object_override"] = true;
+        profileJson["owner_timing_take_id"] = profile.ownerTimingTakeId;
+        profileJson["base_profile_id"] = profile.baseProfileId;
+        profileJson["base_profile_name"] = profile.baseProfileName;
+    }
+    return profileJson;
+}
+
+WaterRainProfile ParseWaterRainProfile(const json& profileJson) {
+    WaterRainProfile profile;
+    if (!profileJson.is_object()) {
+        return invisible_places::water::SanitizeWaterRainProfile(
+            std::move(profile));
+    }
+    profile.id = profileJson.value("id", std::string{});
+    profile.name = profileJson.value("name", std::string{"Project Rain"});
+    profile.objectOverride =
+        profileJson.value("object_override", false);
+    profile.ownerTimingTakeId = profileJson.value(
+        "owner_timing_take_id",
+        std::string{});
+    profile.baseProfileId = profileJson.value(
+        "base_profile_id",
+        std::string{});
+    profile.baseProfileName = profileJson.value(
+        "base_profile_name",
+        std::string{});
+    if (profileJson.contains("rain_settings") &&
+        profileJson.at("rain_settings").is_object()) {
+        profile.settings = ParseWaterRainSettings(
+            profileJson.at("rain_settings"));
+        profile.visual = ParseWaterRainVisualSettings(
+            profileJson.at("rain_settings"));
+    }
+    return invisible_places::water::SanitizeWaterRainProfile(
+        std::move(profile));
+}
+
 json SerializeWaterPathGenerationSettings(const WaterPathGenerationSettings& settings) {
     return json{
         {"auto_tune", settings.autoTune},
@@ -8781,15 +8850,30 @@ void MigrateAndSanitizeTimingTakeData(
         [&](invisible_places::timing::TimingTakeDefinition take) {
             take = invisible_places::timing::SanitizeTimingTakeDefinition(
                 std::move(take));
-            const bool duplicate = std::any_of(
+            const auto duplicate = std::find_if(
                 takes.begin(),
                 takes.end(),
                 [&](const auto& existing) {
                     return existing.id == take.id;
                 });
-            if (!duplicate) {
-                takes.push_back(std::move(take));
+            if (duplicate != takes.end()) {
+                if (take.id ==
+                    invisible_places::timing::kAuthoredTimingTakeId) {
+                    // The reserved definition is seeded above to guarantee its
+                    // id/name, but its persisted Rain assignment still belongs
+                    // to the project and must survive that normalization.
+                    duplicate->assignedRainProfileId =
+                        std::move(take.assignedRainProfileId);
+                    duplicate->assignedRainProfileName =
+                        std::move(take.assignedRainProfileName);
+                    duplicate->baseRainProfileId =
+                        std::move(take.baseRainProfileId);
+                    duplicate->baseRainProfileName =
+                        std::move(take.baseRainProfileName);
+                }
+                return;
             }
+            takes.push_back(std::move(take));
         };
     for (const auto& take : document->timingTakes) {
         appendTake(take);
@@ -9448,6 +9532,13 @@ bool SaveProjectDocument(
     const ProjectDocument& document,
     const std::filesystem::path& outputPath,
     std::string* errorMessage) {
+    auto savedRainProfiles = document.waterRainProfiles;
+    auto savedTimingTakes = document.timingTakes;
+    (void)invisible_places::timing::EnsureLegacyWaterRainProfile(
+        &savedRainProfiles,
+        &savedTimingTakes,
+        document.waterRainSettings,
+        document.waterRainVisualSettings);
     const auto activeWaterSceneGroupName =
         ResolveActiveWaterSceneGroupName(document);
     const auto activeSceneGroupName =
@@ -9520,6 +9611,7 @@ bool SaveProjectDocument(
         {"water_timing_run_sequence", document.waterTimingRunSequence},
         {"water_feature_timing_runs", json::array()},
         {"water_keyed_settings_profiles", json::array()},
+        {"water_rain_profiles", json::array()},
         {"water_feature_timing_run_sequence",
          document.waterFeatureTimingRunSequence},
         {"timing_takes", json::array()},
@@ -9644,7 +9736,11 @@ bool SaveProjectDocument(
         projectJson["water_keyed_settings_profiles"].push_back(
             SerializeWaterKeyedSettingsProfile(profile));
     }
-    for (const auto& take : document.timingTakes) {
+    for (const auto& profile : savedRainProfiles) {
+        projectJson["water_rain_profiles"].push_back(
+            SerializeWaterRainProfile(profile));
+    }
+    for (const auto& take : savedTimingTakes) {
         projectJson["timing_takes"].push_back(
             SerializeTimingTakeDefinition(take));
     }
@@ -10135,6 +10231,14 @@ std::optional<ProjectDocument> LoadProjectDocument(
         document.waterRainVisualSettings =
             ParseWaterRainVisualSettings(projectJson->at("water_rain_settings"));
     }
+    if (projectJson->contains("water_rain_profiles") &&
+        projectJson->at("water_rain_profiles").is_array()) {
+        for (const auto& profileJson :
+             projectJson->at("water_rain_profiles")) {
+            document.waterRainProfiles.push_back(
+                ParseWaterRainProfile(profileJson));
+        }
+    }
     if (projectJson->contains("temp_water_animation_trail_settings")) {
         document.tempWaterAnimationTrailSettings =
             ParseWaterAnimationTrailSettings(projectJson->at("temp_water_animation_trail_settings"));
@@ -10455,6 +10559,11 @@ std::optional<ProjectDocument> LoadProjectDocument(
         hasNativeTimingTakes,
         hasNativeTimingTakeStates,
         hasLegacyWaterScenarios);
+    (void)invisible_places::timing::EnsureLegacyWaterRainProfile(
+        &document.waterRainProfiles,
+        &document.timingTakes,
+        document.waterRainSettings,
+        document.waterRainVisualSettings);
     if (document.schemaVersion <
         kSmoothVelocityProjectSchemaVersion) {
         MigrateLegacySmoothPalettePhaseKeys(

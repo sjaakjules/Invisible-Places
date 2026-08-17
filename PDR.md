@@ -547,6 +547,26 @@ reapply it. Continuous slider, key, spline-handle, and clip drags shall each for
 one edit. Focused text and numeric inputs shall keep their native field-level
 undo instead of triggering the timeline history.
 
+#### FR-STYLE-15
+Rain shall remain one active simulation rather than a collection of concurrent
+objects. A project-owned Rain profile shall store the complete authored runtime
+and visual snapshot, with a stable identity independent of its display name.
+Each Timing Take shall reference one shared base profile; its first Rain edit
+shall create or update one owner copy named `<base>_<Timing Take>`, leaving other
+takes on the shared base. Renaming, duplicating, and deleting a Timing Take shall
+rename, duplicate, or remove only its owner copy and preserve surviving
+assignments. Saving an edited copy under a shared name shall promote its exact
+snapshot and return the take to that shared profile; Discard shall return the
+take to its base and remove the temporary copy. Timing Take scene states shall
+continue to own Rain scalar keys,
+which overlay the take's resolved profile at evaluation time. Loading a project
+without the profile library shall migrate the legacy singleton Rain settings and
+its embedded visual values into one shared base without manufacturing one copy
+per take. Project schema 78 introduces the Rain profile library and Timing Take
+profile assignments; the legacy singleton shall remain a compatibility
+projection. Live preview and every frozen export shall resolve exactly one
+profile into the existing Rain simulation.
+
 ### 5.8 Procedural Motion
 #### FR-MOTION-1
 Dynamic point motion shall be procedural and non-destructive.

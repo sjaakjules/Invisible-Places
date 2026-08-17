@@ -22,7 +22,7 @@
 namespace invisible_places::serialization {
 
 inline constexpr std::size_t kMaxSerializedWaterRippleRuntimeCacheMemberships = 250'000U;
-inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 77U;
+inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 78U;
 inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 30U;
 inline constexpr std::uint32_t kWaterOwnedShorelineProjectSchemaVersion = 66U;
 inline constexpr std::uint32_t kWaterOwnedShorelineSourcesSchemaVersion = 22U;
@@ -256,6 +256,9 @@ struct ProjectDocument {
     // run and edits fork to an object-owned shadow.
     std::vector<invisible_places::water::WaterKeyedSettingsProfile>
         waterKeyedSettingsProfiles;
+    // Reusable full Rain baselines. Timing Take definitions reference these by
+    // stable id; the legacy singleton below remains a compatibility projection.
+    std::vector<invisible_places::water::WaterRainProfile> waterRainProfiles;
     std::uint32_t waterFeatureTimingRunSequence = 1U;
     // Authored Timing and named takes are runtime timing containers. Legacy
     // waterScenarios and waterFeatureTimingRuns remain above for round-trip

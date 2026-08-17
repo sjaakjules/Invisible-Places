@@ -1,5 +1,6 @@
 #include "app/RenderSetupProjectSave.hpp"
 
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <string_view>
@@ -13,6 +14,7 @@ using invisible_places::water::WaterFeatureTimeline;
 using invisible_places::water::WaterKeyedFeatureKind;
 using invisible_places::water::WaterKeyedSettingTrack;
 using invisible_places::water::WaterKeyedSettingsProfile;
+using invisible_places::water::WaterRainProfile;
 using invisible_places::water::WaterScenarioInterpolation;
 using invisible_places::water::WaterSettingKey;
 
@@ -98,6 +100,25 @@ float TimingStateEndValue(const TimingTakeSceneState& state) {
     REQUIRE(settings.size() == 1U);
     REQUIRE(settings.front().keys.size() == 2U);
     return settings.front().keys.back().value;
+}
+
+WaterRainProfile MakeRainProfile(
+    std::string id,
+    std::string name,
+    float density) {
+    WaterRainProfile profile;
+    profile.id = std::move(id);
+    profile.name = std::move(name);
+    profile.settings.density = density;
+    return profile;
+}
+
+const WaterRainProfile* FindRainProfile(
+    const ProjectDocument& project,
+    std::string_view id) {
+    return invisible_places::water::FindWaterRainProfileById(
+        project.waterRainProfiles,
+        id);
 }
 
 TEST_CASE(
@@ -207,6 +228,72 @@ TEST_CASE(
         saved.activeAnimationPath ==
         std::filesystem::path{"animations/live-edit.ipanim.json"});
     CHECK(saved.activeAnimationPosition == 0.75F);
+}
+
+TEST_CASE(
+    "active render setup Rain profile deltas use stable ids and keep setup-only same-name profiles isolated",
+    "[render-setup][project-save][rain-profile]") {
+    ProjectDocument underlying;
+    underlying.waterRainProfiles = {
+        MakeRainProfile("underlying-rain", "Shared Rain", 0.20F),
+    };
+    underlying.timingTakes = {
+        invisible_places::timing::AuthoredTimingTakeDefinition(),
+        {.id = "shared-take",
+         .name = "Shared take",
+         .assignedRainProfileId = "underlying-rain",
+         .assignedRainProfileName = "Shared Rain",
+         .baseRainProfileId = "underlying-rain",
+         .baseRainProfileName = "Shared Rain"},
+    };
+
+    auto previewBaseline = underlying;
+    previewBaseline.waterRainProfiles = {
+        MakeRainProfile("setup-rain", "Shared Rain", 0.80F),
+    };
+    auto* previewTake = invisible_places::timing::FindTimingTakeDefinition(
+        &previewBaseline.timingTakes,
+        "shared-take");
+    REQUIRE(previewTake != nullptr);
+    previewTake->assignedRainProfileId = "setup-rain";
+    previewTake->assignedRainProfileName = "Shared Rain";
+    previewTake->baseRainProfileId = "setup-rain";
+    previewTake->baseRainProfileName = "Shared Rain";
+
+    auto live = previewBaseline;
+    live.waterRainProfiles = {
+        MakeRainProfile("authored-rain", "Shared Rain", 0.65F),
+    };
+    auto* liveTake = invisible_places::timing::FindTimingTakeDefinition(
+        &live.timingTakes,
+        "shared-take");
+    REQUIRE(liveTake != nullptr);
+    liveTake->assignedRainProfileId = "authored-rain";
+    liveTake->assignedRainProfileName = "Shared Rain";
+    liveTake->baseRainProfileId = "authored-rain";
+    liveTake->baseRainProfileName = "Shared Rain";
+
+    const auto saved =
+        invisible_places::app::MergeRenderSetupProjectForSave(
+            underlying,
+            previewBaseline,
+            std::move(live));
+
+    REQUIRE(FindRainProfile(saved, "underlying-rain") != nullptr);
+    CHECK(FindRainProfile(saved, "underlying-rain")->settings.density ==
+          Catch::Approx(0.20F));
+    REQUIRE(FindRainProfile(saved, "authored-rain") != nullptr);
+    CHECK(FindRainProfile(saved, "authored-rain")->settings.density ==
+          Catch::Approx(0.65F));
+    CHECK(FindRainProfile(saved, "setup-rain") == nullptr);
+    REQUIRE(saved.waterRainProfiles.size() == 2U);
+
+    const auto* savedTake = invisible_places::timing::FindTimingTakeDefinition(
+        saved.timingTakes,
+        "shared-take");
+    REQUIRE(savedTake != nullptr);
+    CHECK(savedTake->assignedRainProfileId == "authored-rain");
+    CHECK(savedTake->baseRainProfileId == "authored-rain");
 }
 
 TEST_CASE(

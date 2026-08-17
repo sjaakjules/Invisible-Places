@@ -3783,6 +3783,196 @@ TEST_CASE("Flow profile object copies round-trip owner metadata",
         "Standard_preset");
 }
 
+TEST_CASE("Rain profile library and Timing Take assignments round-trip by stable id",
+          "[project][serialization][water][rain-profile]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::timing::AuthoredTimingTakeDefinition;
+  using invisible_places::timing::TimingTakeDefinition;
+  using invisible_places::water::WaterRainProfile;
+
+  WaterRainProfile fine;
+  fine.id = "rain-fine";
+  fine.name = "Fine";
+  fine.settings.density = 0.31F;
+  fine.visual.widthMeters = 0.0017F;
+  WaterRainProfile heavy;
+  heavy.id = "rain-heavy";
+  heavy.name = "Heavy";
+  heavy.settings.density = 0.81F;
+  heavy.visual.widthMeters = 0.0042F;
+  WaterRainProfile owner = fine;
+  owner.id = "rain-fine-first-01";
+  owner.name = "Fine_First-01";
+  owner.objectOverride = true;
+  owner.ownerTimingTakeId = "timing-take-8";
+  owner.baseProfileId = fine.id;
+  owner.baseProfileName = fine.name;
+  owner.settings.density = 0.63F;
+  owner.visual.opacity = 0.19F;
+
+  auto authored = AuthoredTimingTakeDefinition();
+  authored.assignedRainProfileId = heavy.id;
+  authored.assignedRainProfileName = heavy.name;
+  authored.baseRainProfileId = heavy.id;
+  authored.baseRainProfileName = heavy.name;
+  TimingTakeDefinition first{
+      .id = "timing-take-8",
+      .name = "First-01",
+      .assignedRainProfileId = owner.id,
+      .assignedRainProfileName = owner.name,
+      .baseRainProfileId = fine.id,
+      .baseRainProfileName = fine.name,
+  };
+
+  ProjectDocument project;
+  project.projectName = "rain-profiles";
+  project.waterRainProfiles = {fine, heavy, owner};
+  project.timingTakes = {authored, first};
+  TemporaryProjectFile file{"invisible_places_rain_profiles.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(project, file.path, &errorMessage));
+
+  std::ifstream savedInput{file.path};
+  REQUIRE(savedInput.is_open());
+  auto savedJson = nlohmann::json::parse(savedInput);
+  savedInput.close();
+  REQUIRE(savedJson.at("water_rain_profiles").size() == 3U);
+  CHECK_FALSE(savedJson.at("water_rain_profiles")[0].contains(
+      "object_override"));
+  CHECK(savedJson.at("water_rain_profiles")[2].at("object_override") ==
+        true);
+  CHECK(savedJson.at("water_rain_profiles")[2].at(
+            "owner_timing_take_id") == "timing-take-8");
+  CHECK(savedJson.at("water_rain_profiles")[2].at("base_profile_id") ==
+        fine.id);
+  REQUIRE(savedJson.at("timing_takes").size() == 2U);
+  CHECK(savedJson.at("timing_takes")[0].at("assigned_rain_profile_id") ==
+        heavy.id);
+
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->waterRainProfiles.size() == 3U);
+  REQUIRE(loaded->timingTakes.size() == 2U);
+  CHECK(loaded->waterRainProfiles[0] == fine);
+  CHECK(loaded->waterRainProfiles[1] == heavy);
+  CHECK(loaded->waterRainProfiles[2] == owner);
+  // Authored Timing is a reserved definition, but its persisted Rain fields
+  // must be merged into that reserved id/name instead of being discarded.
+  CHECK(loaded->timingTakes[0].id ==
+        invisible_places::timing::kAuthoredTimingTakeId);
+  CHECK(loaded->timingTakes[0].assignedRainProfileId == heavy.id);
+  CHECK(loaded->timingTakes[0].assignedRainProfileName == heavy.name);
+  CHECK(loaded->timingTakes[1].assignedRainProfileId == owner.id);
+  CHECK(loaded->timingTakes[1].baseRainProfileId == fine.id);
+
+  // Load sanitation repairs duplicate non-empty ids and names in file order,
+  // and the stable-id/name pairs keep ambiguous legacy references attached to
+  // their intended profiles.
+  auto& profilesJson = savedJson.at("water_rain_profiles");
+  profilesJson[0]["id"] = "duplicate";
+  profilesJson[0]["name"] = "Rain";
+  profilesJson[1]["id"] = "duplicate";
+  profilesJson[1]["name"] = "Storm";
+  profilesJson[2]["name"] = "Rain";
+  profilesJson[2]["base_profile_id"] = "duplicate";
+  profilesJson[2]["base_profile_name"] = "Storm";
+  auto& takesJson = savedJson.at("timing_takes");
+  takesJson[0]["assigned_rain_profile_id"] = "duplicate";
+  takesJson[0]["assigned_rain_profile_name"] = "Storm";
+  takesJson[0]["base_rain_profile_id"] = "duplicate";
+  takesJson[0]["base_rain_profile_name"] = "Storm";
+  takesJson[1]["base_rain_profile_id"] = "duplicate";
+  takesJson[1]["base_rain_profile_name"] = "Storm";
+  {
+    std::ofstream output{file.path, std::ios::trunc};
+    REQUIRE(output.is_open());
+    output << savedJson.dump(2);
+  }
+  const auto repaired = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(repaired.has_value());
+  REQUIRE(repaired->waterRainProfiles.size() == 3U);
+  CHECK(repaired->waterRainProfiles[0].id == "duplicate");
+  CHECK(repaired->waterRainProfiles[1].id == "duplicate-2");
+  CHECK(repaired->waterRainProfiles[2].name == "Rain 2");
+  CHECK(repaired->waterRainProfiles[2].baseProfileId == "duplicate-2");
+  CHECK(repaired->timingTakes[0].assignedRainProfileId == "duplicate-2");
+  CHECK(repaired->timingTakes[1].baseRainProfileId == "duplicate-2");
+}
+
+TEST_CASE("Legacy singleton Rain migrates once without replacing edited visuals with its named preset",
+          "[project][serialization][water][rain-profile][migration]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::timing::AuthoredTimingTakeDefinition;
+  using invisible_places::timing::TimingTakeDefinition;
+
+  ProjectDocument legacy;
+  legacy.projectName = "legacy-edited-rain";
+  legacy.waterRainSettings.enabled = false;
+  legacy.waterRainSettings.activeParticleCount = 32'768U;
+  legacy.waterRainSettings.visualProfileName = "Rain Fine Lines";
+  legacy.waterRainSettings.rainLevel = 1.0F;
+  legacy.waterRainSettings.density = 0.40F;
+  legacy.waterRainSettings.fallSpeedMetersPerSecond = 7.10F;
+  legacy.waterRainSettings.dropletSizeScale = 2.97F;
+  legacy.waterRainSettings.opacityScale = 1.58F;
+  legacy.waterRainSettings.emissionScale = 4.0F;
+  legacy.waterRainVisualSettings.widthMeters = 0.0017F;
+  legacy.waterRainVisualSettings.softness = 0.92F;
+  legacy.waterRainVisualSettings.opacity = 0.08F;
+  legacy.waterRainVisualSettings.emission = 0.01F;
+  legacy.waterRainVisualSettings.minimumScreenPixels = 0.0F;
+  legacy.waterRainVisualSettings.maximumScreenPixels = 10.09F;
+  legacy.timingTakes = {
+      AuthoredTimingTakeDefinition(),
+      TimingTakeDefinition{.id = "timing-take-8", .name = "First-01"},
+      TimingTakeDefinition{.id = "timing-take-9", .name = "First-02"},
+  };
+
+  TemporaryProjectFile file{"invisible_places_legacy_rain_profile.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(legacy, file.path, &errorMessage));
+  std::ifstream savedInput{file.path};
+  REQUIRE(savedInput.is_open());
+  auto legacyJson = nlohmann::json::parse(savedInput);
+  savedInput.close();
+  legacyJson["schema_version"] = 77U;
+  legacyJson.erase("water_rain_profiles");
+  for (auto& takeJson : legacyJson.at("timing_takes")) {
+    takeJson.erase("assigned_rain_profile_id");
+    takeJson.erase("assigned_rain_profile_name");
+    takeJson.erase("base_rain_profile_id");
+    takeJson.erase("base_rain_profile_name");
+  }
+  {
+    std::ofstream output{file.path, std::ios::trunc};
+    REQUIRE(output.is_open());
+    output << legacyJson.dump(2);
+  }
+
+  const auto migrated = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(migrated.has_value());
+  REQUIRE(migrated->waterRainProfiles.size() == 1U);
+  const auto& profile = migrated->waterRainProfiles.front();
+  CHECK(profile.id == invisible_places::timing::kLegacyWaterRainProfileId);
+  CHECK(profile.name == invisible_places::timing::kLegacyWaterRainProfileName);
+  CHECK(profile.settings == legacy.waterRainSettings);
+  CHECK(profile.visual == legacy.waterRainVisualSettings);
+  REQUIRE(migrated->timingTakes.size() == legacy.timingTakes.size());
+  for (const auto& take : migrated->timingTakes) {
+    CHECK(take.assignedRainProfileId == profile.id);
+    CHECK(take.assignedRainProfileName == profile.name);
+    CHECK(take.baseRainProfileId == profile.id);
+    CHECK(take.baseRainProfileName == profile.name);
+  }
+}
+
 TEST_CASE("Keyed setting tracks round-trip their default interpolation and migrate legacy smooth keys",
           "[project][serialization][water][timings][interpolation]") {
   using invisible_places::serialization::LoadProjectDocument;

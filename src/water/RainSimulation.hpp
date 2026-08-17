@@ -39,6 +39,10 @@ struct WaterRainVisualSettings {
     float emission = 0.16F;
     float minimumScreenPixels = 0.65F;
     float maximumScreenPixels = 4.0F;
+
+    friend bool operator==(
+        const WaterRainVisualSettings&,
+        const WaterRainVisualSettings&) = default;
 };
 
 // These controls are evaluated from the already-resident Rain collision
@@ -49,6 +53,10 @@ struct RainNearSurfaceSettings {
     float minimumSpeedFactor = 0.30F;
     float squish = 0.65F;
     float normalAlignment = 0.75F;
+
+    friend bool operator==(
+        const RainNearSurfaceSettings&,
+        const RainNearSurfaceSettings&) = default;
 };
 
 // World-space dimensions shared by the CPU/offline path and mirrored in the
@@ -78,12 +86,20 @@ struct RainRockImpactSettings {
     // only, tightening lateral/uphill extents as stretch rises. Zero restores
     // the isotropic footprint. Flat surfaces are unaffected at any value.
     float downhillStretch = 1.0F;
+
+    friend bool operator==(
+        const RainRockImpactSettings&,
+        const RainRockImpactSettings&) = default;
 };
 
 struct RainRingImpactSettings {
     // Multiplies the existing expanding-ring width. One preserves legacy
     // projects; 0.5 produces a ring half as thick without changing its radius.
     float thicknessScale = 1.0F;
+
+    friend bool operator==(
+        const RainRingImpactSettings&,
+        const RainRingImpactSettings&) = default;
 };
 
 // Finite sentinel for an open band edge. JSON cannot round-trip IEEE
@@ -97,6 +113,10 @@ struct RainImpactHeightBand {
     float minZ = -kRainImpactBandUnbounded;
     float maxZ = kRainImpactBandUnbounded;
     float fadeMeters = 0.30F;
+
+    friend bool operator==(
+        const RainImpactHeightBand&,
+        const RainImpactHeightBand&) = default;
 };
 
 [[nodiscard]] RainImpactHeightBand SanitizeRainImpactHeightBand(
@@ -127,6 +147,10 @@ struct RainVegetationImpactSettings {
     float hopSpacingMeters = 0.070F;
     float streamWidthMeters = 0.010F;
     float streamSpread = 0.65F;
+
+    friend bool operator==(
+        const RainVegetationImpactSettings&,
+        const RainVegetationImpactSettings&) = default;
 };
 
 struct RainRuntimeSettings {
@@ -171,6 +195,10 @@ struct RainRuntimeSettings {
     RainImpactHeightBand sandImpactBand{-kRainImpactBandUnbounded, 2.0F, 0.30F};
     RainImpactHeightBand rockImpactBand{1.5F, 2.4F, 0.30F};
     RainImpactHeightBand vegetationImpactBand{2.5F, kRainImpactBandUnbounded, 0.30F};
+
+    friend bool operator==(
+        const RainRuntimeSettings&,
+        const RainRuntimeSettings&) = default;
 };
 
 struct RainIntensityMultipliers {
@@ -223,6 +251,44 @@ struct RainIntensityMultipliers {
 [[nodiscard]] WaterRainVisualSettings RainVisualPreset(std::string_view name);
 [[nodiscard]] std::array<std::string_view, 3> RainVisualPresetNames();
 [[nodiscard]] float RainImpactGridWorldSpan(const RainRuntimeSettings& settings);
+
+// A project-owned authored Rain baseline. Timing Takes reference one profile
+// by stable id; editing a shared base creates an owner copy for that take while
+// the renderer continues to resolve exactly one Rain simulation at a time.
+struct WaterRainProfile {
+    std::string id;
+    std::string name = "Project Rain";
+    RainRuntimeSettings settings{};
+    WaterRainVisualSettings visual{};
+    bool objectOverride = false;
+    std::string ownerTimingTakeId;
+    std::string baseProfileId;
+    std::string baseProfileName;
+
+    friend bool operator==(
+        const WaterRainProfile&,
+        const WaterRainProfile&) = default;
+};
+
+[[nodiscard]] WaterRainProfile SanitizeWaterRainProfile(
+    WaterRainProfile profile);
+[[nodiscard]] const WaterRainProfile* FindWaterRainProfileById(
+    std::span<const WaterRainProfile> profiles,
+    std::string_view id);
+[[nodiscard]] WaterRainProfile* FindWaterRainProfileById(
+    std::vector<WaterRainProfile>* profiles,
+    std::string_view id);
+[[nodiscard]] const WaterRainProfile* FindWaterRainProfileByName(
+    std::span<const WaterRainProfile> profiles,
+    std::string_view name);
+[[nodiscard]] WaterRainProfile* FindWaterRainProfileByName(
+    std::vector<WaterRainProfile>* profiles,
+    std::string_view name);
+// Allocates a stable, JSON-safe id derived from preferredId. Existing ids are
+// never reused within the supplied library; numeric suffixes resolve clashes.
+[[nodiscard]] std::string AllocateWaterRainProfileId(
+    std::span<const WaterRainProfile> profiles,
+    std::string_view preferredId);
 
 struct RainCollisionHit {
     io::Float3 position{};
