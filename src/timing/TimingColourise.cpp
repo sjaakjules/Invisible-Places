@@ -1381,6 +1381,24 @@ CaptureTimingTakeRainProfileSnapshot(
                : std::nullopt;
 }
 
+float TimingTakeRainAuthoredLevel(
+    const invisible_places::water::RainRuntimeSettings& settings) {
+    return settings.enabled
+               ? std::clamp(settings.rainLevel, 0.0F, 1.0F)
+               : 0.0F;
+}
+
+std::optional<invisible_places::water::WaterScenarioState>
+ProjectTimingTakeRainToScenarioSnapshot(
+    const std::optional<invisible_places::water::WaterScenarioState>& scenario,
+    const invisible_places::water::RainRuntimeSettings& settings) {
+    auto result = scenario;
+    if (result.has_value()) {
+        result->rainLevel = TimingTakeRainAuthoredLevel(settings);
+    }
+    return result;
+}
+
 TimingTakeRainLiveSyncDecision ResolveTimingTakeRainLiveSyncDecision(
     std::string_view boundTakeId,
     std::string_view boundProfileId,

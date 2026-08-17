@@ -640,6 +640,10 @@ struct QueuedQuickMp4Export {
     AnimationPath animationPath{};
     std::vector<invisible_places::water::WaterScenarioDefinition> waterScenarios;
     std::shared_ptr<const QueuedQuickMp4WaterSnapshot> waterSnapshot;
+    // Each saved animation may select a different Timing Take. Keep its exact
+    // effective profile on the item instead of sharing the live Rain singleton
+    // across the batch.
+    std::optional<WaterRainProfile> effectiveRainProfile;
     invisible_places::output::AnimationExportMode mode =
         invisible_places::output::AnimationExportMode::FastPreviewMp4;
     invisible_places::output::AnimationExportQuality quality =
@@ -2036,10 +2040,10 @@ struct OfflineRenderJobState {
     std::chrono::steady_clock::time_point writerWaitStartedAt{};
 };
 
-// One immutable authored-water snapshot is shared by every job in a Quick
-// MP4 batch. Large Seepage grids are copied only into the currently running
-// job, while later queued animations continue to reference the queue-time
-// state even if the user edits the live project during an export.
+// One immutable authored-water snapshot is shared by every job in a Quick MP4
+// batch. Large Seepage topology is copied and reparameterized with each item's
+// frozen Rain only when that item starts. Rain itself deliberately cannot live
+// here: saved animations in one batch may select different Timing Takes.
 struct QueuedQuickMp4WaterSnapshot {
     std::string sceneGroupName = "Default";
     std::vector<invisible_places::timing::TimingTakeSceneState>
@@ -2048,8 +2052,6 @@ struct QueuedQuickMp4WaterSnapshot {
     std::vector<PointCloudShorelineInstance> shorelineInstances;
     std::optional<invisible_places::water::WaterScenarioState>
         authoredFrameControlState;
-    WaterRainSettings rainSettings{};
-    WaterRainVisualSettings rainVisual{};
     WaterDynamicMeshFlowSettings dynamicMeshFlowSettings{};
     std::uint64_t effectiveSeepageInvocations = 0U;
     PointCloudRendererMode pointCloudRendererMode =
@@ -2059,7 +2061,7 @@ struct QueuedQuickMp4WaterSnapshot {
             PointCloudLayerState>
         basePointCloudLayers;
     std::vector<OfflineRenderJobState::FrozenSeepageLayer>
-        frozenSeepageLayers;
+        baseSeepageLayers;
     std::vector<OfflineRenderJobState::FrozenFlowSourceLayer>
         frozenFlowSourceLayers;
 };
@@ -38087,16 +38089,12 @@ void FreezeAuthoredTimingState(
         job->frozenTimingColouriseEffects =
             timingState->colouriseEffects;
     }
-    job->frozenAuthoredRainLevel =
-        job->waterRainSettings.enabled
-            ? std::clamp(job->waterRainSettings.rainLevel, 0.0F, 1.0F)
-            : 0.0F;
-    job->frozenPreviewWaterScenario =
-        ResolveActiveWaterScenarioState(runtimeState, false);
-    if (job->frozenPreviewWaterScenario.has_value()) {
-        job->frozenPreviewWaterScenario->rainLevel =
-            job->frozenAuthoredRainLevel;
-    }
+    job->frozenAuthoredRainLevel = invisible_places::timing::
+        TimingTakeRainAuthoredLevel(job->waterRainSettings);
+    job->frozenPreviewWaterScenario = invisible_places::timing::
+        ProjectTimingTakeRainToScenarioSnapshot(
+            ResolveActiveWaterScenarioState(runtimeState, false),
+            job->waterRainSettings);
 
     job->frozenSeepageRainEnvelopes.clear();
     if (!job->animationPath.has_value()) {
@@ -38122,43 +38120,96 @@ void FreezeAuthoredTimingState(
     }
 }
 
+ResolvedTimingTakeExportSnapshot BuildQueuedQuickMp4TimingSnapshot(
+    const AnimationPath& animationPath,
+    const QueuedQuickMp4WaterSnapshot& snapshot,
+    const WaterRainProfile& effectiveRainProfile) {
+    ResolvedTimingTakeExportSnapshot result;
+    result.takeId = invisible_places::timing::NormalizeTimingTakeId(
+        animationPath.selectedTimingTakeId);
+    result.sceneGroupName = snapshot.sceneGroupName;
+    if (const auto* state =
+            invisible_places::timing::FindTimingTakeSceneState(
+                snapshot.timingTakeSceneStates,
+                result.takeId,
+                result.sceneGroupName);
+        state != nullptr) {
+        result.state = *state;
+    }
+    result.state.takeId = result.takeId;
+    result.state.sceneGroupName = result.sceneGroupName;
+    result.effectiveRainProfile = effectiveRainProfile;
+    return result;
+}
+
+std::vector<OfflineRenderJobState::FrozenSeepageLayer>
+BuildQueuedQuickMp4SeepageLayers(
+    const QueuedQuickMp4WaterSnapshot& snapshot,
+    const WaterRainSettings& rainSettings) {
+    auto layers = snapshot.baseSeepageLayers;
+    const auto itemScenario = invisible_places::timing::
+        ProjectTimingTakeRainToScenarioSnapshot(
+            snapshot.authoredFrameControlState,
+            rainSettings);
+    for (auto& layer : layers) {
+        invisible_places::water::ApplyWaterSeepageScenarioParameters(
+            &layer.grid,
+            itemScenario,
+            rainSettings,
+            snapshot.effectiveSeepageInvocations,
+            {});
+        invisible_places::water::PrepareWaterSeepagePulseFields(
+            &layer.grid,
+            0.0F);
+    }
+    return layers;
+}
+
 void FreezeQueuedQuickMp4AuthoredTimingState(
     OfflineRenderJobState* job,
     const QueuedQuickMp4WaterSnapshot& snapshot) {
     if (job == nullptr) {
         return;
     }
-    job->frozenTimingTakeId =
-        job->animationPath.has_value()
-            ? invisible_places::timing::NormalizeTimingTakeId(
-                  job->animationPath->selectedTimingTakeId)
-            : std::string{
-                  invisible_places::timing::kAuthoredTimingTakeId};
-    job->frozenTimingSceneGroupName = snapshot.sceneGroupName;
+    const auto* timingSnapshot =
+        job->frozenTimingSnapshot.has_value()
+            ? &job->frozenTimingSnapshot.value()
+            : nullptr;
+    job->frozenTimingTakeId = timingSnapshot != nullptr
+        ? timingSnapshot->takeId
+        : job->animationPath.has_value()
+              ? invisible_places::timing::NormalizeTimingTakeId(
+                    job->animationPath->selectedTimingTakeId)
+              : std::string{
+                    invisible_places::timing::kAuthoredTimingTakeId};
+    job->frozenTimingSceneGroupName = timingSnapshot != nullptr
+        ? timingSnapshot->sceneGroupName
+        : snapshot.sceneGroupName;
     job->frozenFeatureTimingRuns.clear();
     job->frozenShorelineInstances = snapshot.shorelineInstances;
     job->frozenTimingColouriseEffects.clear();
-    if (const auto* timingState =
-            invisible_places::timing::FindTimingTakeSceneState(
-                snapshot.timingTakeSceneStates,
-                job->frozenTimingTakeId,
-                job->frozenTimingSceneGroupName);
-        timingState != nullptr) {
+    if (timingSnapshot != nullptr) {
+        job->frozenFeatureTimingRuns =
+            timingSnapshot->state.waterFeatureTimingRuns;
+        job->frozenTimingColouriseEffects =
+            timingSnapshot->state.colouriseEffects;
+    } else if (const auto* timingState =
+                   invisible_places::timing::FindTimingTakeSceneState(
+                       snapshot.timingTakeSceneStates,
+                       job->frozenTimingTakeId,
+                       job->frozenTimingSceneGroupName);
+               timingState != nullptr) {
         job->frozenFeatureTimingRuns =
             timingState->waterFeatureTimingRuns;
         job->frozenTimingColouriseEffects =
             timingState->colouriseEffects;
     }
-    job->frozenAuthoredRainLevel =
-        snapshot.rainSettings.enabled
-            ? std::clamp(snapshot.rainSettings.rainLevel, 0.0F, 1.0F)
-            : 0.0F;
-    job->frozenPreviewWaterScenario =
-        snapshot.authoredFrameControlState;
-    if (job->frozenPreviewWaterScenario.has_value()) {
-        job->frozenPreviewWaterScenario->rainLevel =
-            job->frozenAuthoredRainLevel;
-    }
+    job->frozenAuthoredRainLevel = invisible_places::timing::
+        TimingTakeRainAuthoredLevel(job->waterRainSettings);
+    job->frozenPreviewWaterScenario = invisible_places::timing::
+        ProjectTimingTakeRainToScenarioSnapshot(
+            snapshot.authoredFrameControlState,
+            job->waterRainSettings);
 
     job->frozenSeepageRainEnvelopes.clear();
     if (!job->animationPath.has_value()) {
@@ -38621,7 +38672,16 @@ QuickMp4ExportStartResult StartQuickMp4ExportJob(
         runtimeState->statusMessage.clear();
         return QuickMp4ExportStartResult::Failed;
     }
+    if (!request.effectiveRainProfile.has_value()) {
+        runtimeState->errorMessage =
+            "The queued animation export is missing its effective Timing "
+            "Take Rain profile.";
+        runtimeState->statusMessage.clear();
+        return QuickMp4ExportStartResult::Failed;
+    }
     const auto& waterSnapshot = *request.waterSnapshot;
+    const auto& effectiveRainProfile =
+        request.effectiveRainProfile.value();
     if (!request.renderSetupDocument.has_value()) {
         runtimeState->errorMessage =
             "The queued animation export is missing its frozen render "
@@ -38762,7 +38822,9 @@ QuickMp4ExportStartResult StartQuickMp4ExportJob(
     const auto effectiveSeepageInvocations =
         waterSnapshot.effectiveSeepageInvocations;
     auto frozenSeepageLayers =
-        waterSnapshot.frozenSeepageLayers;
+        BuildQueuedQuickMp4SeepageLayers(
+            waterSnapshot,
+            effectiveRainProfile.settings);
     auto frozenFlowSourceLayers =
         waterSnapshot.frozenFlowSourceLayers;
     if (viewport != nullptr) {
@@ -38817,6 +38879,10 @@ QuickMp4ExportStartResult StartQuickMp4ExportJob(
         outputOptions.combinedColorAlphaMattePipe);
     const auto frozenRenderer =
         request.renderSetupDocument->renderer;
+    const auto timingSnapshot = BuildQueuedQuickMp4TimingSnapshot(
+        request.animationPath,
+        waterSnapshot,
+        effectiveRainProfile);
     runtimeState->offlineRenderJob = {
         .active = true,
         .cancelRequested = false,
@@ -38861,10 +38927,13 @@ QuickMp4ExportStartResult StartQuickMp4ExportJob(
         .animationName = outputAnimationName,
         .animationPath = request.animationPath,
         .waterScenarios = request.waterScenarios,
-        .waterRainSettings = waterSnapshot.rainSettings,
-        .waterRainVisual = waterSnapshot.rainVisual,
-        .frozenPreviewWaterScenario =
-            waterSnapshot.authoredFrameControlState,
+        .frozenTimingSnapshot = timingSnapshot,
+        .waterRainSettings = effectiveRainProfile.settings,
+        .waterRainVisual = effectiveRainProfile.visual,
+        .frozenPreviewWaterScenario = invisible_places::timing::
+            ProjectTimingTakeRainToScenarioSnapshot(
+                waterSnapshot.authoredFrameControlState,
+                effectiveRainProfile.settings),
         .frozenNormalizedTime =
             CurrentAuthoredTrackPosition(*runtimeState),
         .effectiveSeepageInvocations = effectiveSeepageInvocations,
@@ -39148,10 +39217,6 @@ void StartSelectedQuickMp4Batch(
         runtimeState->water.shorelineInstances;
     waterSnapshot->authoredFrameControlState =
         ResolveActiveWaterScenarioState(*runtimeState, false);
-    waterSnapshot->rainSettings =
-        runtimeState->water.collisionRainSettings;
-    waterSnapshot->rainVisual =
-        runtimeState->water.rainVisual;
     waterSnapshot->dynamicMeshFlowSettings =
         runtimeState->water.dynamicMeshFlowSettings;
     waterSnapshot->effectiveSeepageInvocations =
@@ -39171,12 +39236,16 @@ void StartSelectedQuickMp4Batch(
         runtimeState->statusMessage.clear();
         return;
     }
-    waterSnapshot->frozenSeepageLayers =
+    // Capture large immutable topology once. Its compact runtime parameters
+    // are overwritten with each queued item's frozen Rain before upload.
+    const auto baseSeepageRain =
+        invisible_places::water::DefaultRainRuntimeSettings();
+    waterSnapshot->baseSeepageLayers =
         BuildFrozenAnimationSeepageLayers(
             runtimeState,
             waterSnapshot->basePointCloudLayers,
             waterSnapshot->effectiveSeepageInvocations,
-            &waterSnapshot->rainSettings);
+            &baseSeepageRain);
     waterSnapshot->frozenFlowSourceLayers =
         BuildFrozenAnimationFlowSourceLayers(
             *runtimeState,
@@ -39305,6 +39374,8 @@ void StartSelectedQuickMp4Batch(
                 {.animationPath = animationPath,
                  .waterScenarios = ExportWaterScenarioDefinitions(*runtimeState),
                  .waterSnapshot = waterSnapshot,
+                 .effectiveRainProfile =
+                     timingSnapshot->effectiveRainProfile.value(),
                  .mode = activeMode,
                  .quality = activeQuality,
                  .useVideoToolbox = activeUseVideoToolbox,

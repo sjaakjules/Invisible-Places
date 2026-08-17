@@ -4144,6 +4144,160 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Quick MP4 mixed Timing Takes keep per-item Rain and reparameterize a shared Seepage topology",
+    "[water][rain][profiles][timing][snapshot][quick-mp4][seepage]") {
+    using invisible_places::timing::CaptureTimingTakeRainProfileSnapshot;
+    using invisible_places::timing::ProjectTimingTakeRainToScenarioSnapshot;
+    using invisible_places::timing::TimingTakeDefinition;
+    using invisible_places::water::WaterRainProfile;
+
+    WaterRainProfile shared;
+    shared.id = "quick-shared";
+    shared.name = "Shared Shower";
+    shared.settings.enabled = true;
+    shared.settings.rainLevel = 0.18F;
+    shared.settings.density = 0.24F;
+    shared.settings.activeParticleCount = 2'345U;
+    shared.visual.colour = {0.16F, 0.42F, 0.76F};
+    shared.visual.opacity = 0.31F;
+    shared.visual.widthMeters = 0.0037F;
+
+    auto owner = shared;
+    owner.id = "quick-owner";
+    owner.name = "Shared Shower_Owner Take";
+    owner.objectOverride = true;
+    owner.ownerTimingTakeId = "owner-take";
+    owner.baseProfileId = shared.id;
+    owner.baseProfileName = shared.name;
+    owner.settings.rainLevel = 0.84F;
+    owner.settings.density = 0.79F;
+    owner.settings.activeParticleCount = 9'876U;
+    owner.visual.colour = {0.83F, 0.36F, 0.19F};
+    owner.visual.opacity = 0.72F;
+    owner.visual.widthMeters = 0.0061F;
+    owner.visual.streakLengthMeters = 0.287F;
+
+    const auto expectedShared = shared;
+    const auto expectedOwner = owner;
+    auto liveSettings = shared.settings;
+    auto liveVisual = shared.visual;
+    std::vector<WaterRainProfile> profiles{shared, owner};
+    std::vector<TimingTakeDefinition> takes{
+        {.id = "shared-take",
+         .name = "Shared Take",
+         .assignedRainProfileId = shared.id,
+         .assignedRainProfileName = shared.name,
+         .baseRainProfileId = shared.id,
+         .baseRainProfileName = shared.name},
+        {.id = "owner-take",
+         .name = "Owner Take",
+         .assignedRainProfileId = owner.id,
+         .assignedRainProfileName = owner.name,
+         .baseRainProfileId = shared.id,
+         .baseRainProfileName = shared.name},
+    };
+
+    std::vector<WaterRainProfile> queuedItems;
+    for (const auto takeId : {"shared-take", "owner-take"}) {
+        const auto captured = CaptureTimingTakeRainProfileSnapshot(
+            profiles,
+            takes,
+            takeId);
+        REQUIRE(captured.has_value());
+        queuedItems.push_back(captured.value());
+    }
+
+    // A non-null shared scenario used to mask every later queue item's Rain.
+    // Keep its Seepage lane, but project each frozen profile's Rain mirror.
+    invisible_places::water::WaterScenarioState queueScenario;
+    queueScenario.seepageLevel = 0.62F;
+    queueScenario.rainLevel = 0.97F;
+    invisible_places::water::WaterSeepageNode node;
+    node.id = 42U;
+    node.strength = 1.25F;
+    const std::vector<invisible_places::water::WaterSeepageNode> nodes{node};
+    const auto baseGrid = invisible_places::water::BuildWaterSeepageSpatialGrid(
+        nodes,
+        {},
+        invisible_places::water::DefaultWaterSeepageLookSettings(),
+        "ROCK",
+        true,
+        invisible_places::water::DefaultRainRuntimeSettings(),
+        100'000'000ULL,
+        {},
+        queueScenario);
+    REQUIRE(baseGrid.nodes.size() == 1U);
+
+    // Mutate both the reusable library and assignment mirrors after queueing.
+    // Starting either item must consume only its by-value queued snapshot.
+    profiles[0].settings.rainLevel = 1.0F;
+    profiles[0].visual.colour = {0.0F, 1.0F, 0.0F};
+    profiles[1].id = "mutated-owner";
+    profiles[1].settings.rainLevel = 0.01F;
+    profiles[1].visual.opacity = 0.02F;
+    takes[0].assignedRainProfileId = profiles[1].id;
+    takes[1].assignedRainProfileId = profiles[0].id;
+    liveSettings.rainLevel = 0.99F;
+    liveSettings.density = 0.01F;
+    liveVisual.colour = {1.0F, 0.0F, 1.0F};
+    liveVisual.opacity = 0.01F;
+
+    struct FrozenQuickJobRain {
+        WaterRainProfile profile;
+        invisible_places::water::WaterSeepageSpatialGrid seepage;
+        std::optional<invisible_places::water::WaterScenarioState> scenario;
+    };
+    const auto startQueuedItem = [&](const WaterRainProfile& profile) {
+        auto scenario = ProjectTimingTakeRainToScenarioSnapshot(
+            queueScenario,
+            profile.settings);
+        auto seepage = baseGrid;
+        invisible_places::water::ApplyWaterSeepageScenarioParameters(
+            &seepage,
+            scenario,
+            profile.settings,
+            100'000'000ULL);
+        return FrozenQuickJobRain{
+            .profile = profile,
+            .seepage = std::move(seepage),
+            .scenario = std::move(scenario),
+        };
+    };
+    const auto sharedJob = startQueuedItem(queuedItems[0]);
+    const auto ownerJob = startQueuedItem(queuedItems[1]);
+
+    CHECK(sharedJob.profile == expectedShared);
+    CHECK(ownerJob.profile == expectedOwner);
+    CHECK(sharedJob.profile.settings != liveSettings);
+    CHECK(sharedJob.profile.visual != liveVisual);
+    REQUIRE(sharedJob.scenario.has_value());
+    REQUIRE(ownerJob.scenario.has_value());
+    CHECK(sharedJob.scenario->seepageLevel == Catch::Approx(0.62F));
+    CHECK(ownerJob.scenario->seepageLevel == Catch::Approx(0.62F));
+    CHECK(sharedJob.scenario->rainLevel == Catch::Approx(0.18F));
+    CHECK(ownerJob.scenario->rainLevel == Catch::Approx(0.84F));
+    REQUIRE(sharedJob.seepage.nodes.size() == 1U);
+    REQUIRE(ownerJob.seepage.nodes.size() == 1U);
+    CHECK(sharedJob.seepage.nodes.front().rainVisualStrength ==
+          Catch::Approx(0.18F));
+    CHECK(ownerJob.seepage.nodes.front().rainVisualStrength ==
+          Catch::Approx(0.84F));
+    CHECK(sharedJob.seepage.nodes.front().strength ==
+          Catch::Approx(ownerJob.seepage.nodes.front().strength));
+    CHECK(ownerJob.seepage.nodes.front().reachMeters >
+          sharedJob.seepage.nodes.front().reachMeters);
+
+    auto disabled = expectedOwner.settings;
+    disabled.enabled = false;
+    disabled.rainLevel = 0.99F;
+    const auto disabledScenario = ProjectTimingTakeRainToScenarioSnapshot(
+        queueScenario,
+        disabled);
+    REQUIRE(disabledScenario.has_value());
+    CHECK(disabledScenario->rainLevel == Catch::Approx(0.0F));
+}
+
+TEST_CASE(
     "live Rain synchronization resets only for identity changes or forced refresh",
     "[water][rain][profiles][timing]") {
     using invisible_places::timing::ResolveTimingTakeRainLiveSyncDecision;

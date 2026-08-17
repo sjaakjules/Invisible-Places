@@ -396,6 +396,18 @@ CaptureTimingTakeRainProfileSnapshot(
     std::span<const TimingTakeDefinition> takes,
     std::string_view takeId);
 
+// Converts one frozen effective profile into the authored Rain level consumed
+// by Timing/Seepage exports. Disabled Rain is always exactly dry.
+[[nodiscard]] float TimingTakeRainAuthoredLevel(
+    const invisible_places::water::RainRuntimeSettings& settings);
+
+// Retains the queue-time scenario's other authored lanes while replacing its
+// Rain mirror with the selected Timing Take's immutable profile value.
+[[nodiscard]] std::optional<invisible_places::water::WaterScenarioState>
+ProjectTimingTakeRainToScenarioSnapshot(
+    const std::optional<invisible_places::water::WaterScenarioState>& scenario,
+    const invisible_places::water::RainRuntimeSettings& settings);
+
 struct TimingTakeRainLiveSyncDecision {
     bool copyProfile = false;
     bool resetRuntime = false;
