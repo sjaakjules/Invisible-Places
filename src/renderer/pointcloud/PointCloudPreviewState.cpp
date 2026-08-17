@@ -18,6 +18,20 @@ namespace {
 constexpr std::uint32_t kSurfelVerticesPerPoint = 6U;
 constexpr float kMaterialEpsilon = 1.0e-5F;
 
+std::string TrimShorelineProfileName(std::string_view value) {
+    std::size_t begin = 0U;
+    while (begin < value.size() &&
+           std::isspace(static_cast<unsigned char>(value[begin])) != 0) {
+        ++begin;
+    }
+    std::size_t end = value.size();
+    while (end > begin &&
+           std::isspace(static_cast<unsigned char>(value[end - 1U])) != 0) {
+        --end;
+    }
+    return std::string{value.substr(begin, end - begin)};
+}
+
 void SortForCoherentDraw(std::vector<std::uint32_t>* indices) {
     if (indices == nullptr) {
         return;
@@ -496,6 +510,50 @@ PointCloudShorelineWaveSettings CalmPointCloudShorelineWaveSettings() {
         1.0F,
     };
     return settings;
+}
+
+std::string UniquePointCloudShorelineObjectProfileName(
+    std::span<const PointCloudShorelineWaveProfile> profiles,
+    std::string_view baseProfileName,
+    std::string_view objectName,
+    std::uint32_t shorelineInstanceId) {
+    const std::string base = TrimShorelineProfileName(baseProfileName);
+    if (base.empty()) {
+        return {};
+    }
+    const std::string object = TrimShorelineProfileName(objectName);
+    const std::string preferred =
+        base + "_" + (object.empty() ? std::string{"Shoreline"} : object);
+
+    const auto nameInUse = [&](std::string_view candidate) {
+        bool ignoredExistingCopy = false;
+        for (const auto& profile : profiles) {
+            const bool sameOwnedCopy =
+                profile.objectOverride &&
+                profile.shorelineInstanceId == shorelineInstanceId &&
+                TrimShorelineProfileName(profile.baseProfileName) == base;
+            if (sameOwnedCopy && !ignoredExistingCopy) {
+                ignoredExistingCopy = true;
+                continue;
+            }
+            if (TrimShorelineProfileName(profile.name) == candidate) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    if (!nameInUse(preferred)) {
+        return preferred;
+    }
+    for (std::uint32_t suffix = 2U; suffix < 10000U; ++suffix) {
+        const std::string candidate =
+            preferred + " " + std::to_string(suffix);
+        if (!nameInUse(candidate)) {
+            return candidate;
+        }
+    }
+    return preferred + " Copy";
 }
 
 bool PointCloudAlphaContributesDepth(float alpha) {

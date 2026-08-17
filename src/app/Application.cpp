@@ -223,6 +223,10 @@ using PointCloudShorelineWaveProfile =
     invisible_places::renderer::pointcloud::PointCloudShorelineWaveProfile;
 using PointCloudShorelineWaveSettings =
     invisible_places::renderer::pointcloud::PointCloudShorelineWaveSettings;
+using PointCloudFoamFrontsShorelineSettings =
+    invisible_places::renderer::pointcloud::PointCloudFoamFrontsShorelineSettings;
+using PointCloudHeightFoamShorelineSettings =
+    invisible_places::renderer::pointcloud::PointCloudHeightFoamShorelineSettings;
 using PointCloudShorelineInstance =
     invisible_places::renderer::pointcloud::PointCloudShorelineInstance;
 using WaterSeepageLookProfile = invisible_places::water::WaterSeepageLookProfile;
@@ -13694,17 +13698,6 @@ void ApplyWaterSeepageSelectionClick(
 
 std::string NormalizeWaterShorelineProfileName(std::string_view name) {
     return TrimText(name);
-}
-
-std::string WaterShorelineObjectProfileName(
-    std::string_view baseName,
-    std::string_view objectName) {
-    const std::string base = NormalizeWaterShorelineProfileName(baseName);
-    const std::string object = TrimText(objectName);
-    if (base.empty()) {
-        return {};
-    }
-    return base + "_" + (object.empty() ? std::string{"Shoreline"} : object);
 }
 
 std::uint32_t NextAvailableShorelineInstanceId(
@@ -49971,7 +49964,38 @@ bool DrawPointCloudSurfaceMotionSection(PreviewLayerSession* session) {
     return changed;
 }
 
-bool DrawPointCloudShorelineWavesSection(PreviewLayerSession* session) {
+std::string WaterProfileValueFormat(
+    const char* format,
+    float currentValue,
+    const std::optional<float>& baseValue);
+void DrawWaterProfileBaseBoolHint(
+    bool currentValue,
+    const std::optional<bool>& baseValue);
+
+void DrawWaterProfileBaseColourHint(
+    const std::array<float, 3>& currentValue,
+    const std::optional<std::array<float, 3>>& baseValue) {
+    if (!baseValue.has_value()) {
+        return;
+    }
+    const bool differs =
+        std::abs(currentValue[0] - baseValue->at(0)) > 1.0e-4F ||
+        std::abs(currentValue[1] - baseValue->at(1)) > 1.0e-4F ||
+        std::abs(currentValue[2] - baseValue->at(2)) > 1.0e-4F;
+    if (!differs) {
+        return;
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled(
+        "(%.2f, %.2f, %.2f)",
+        baseValue->at(0),
+        baseValue->at(1),
+        baseValue->at(2));
+}
+
+bool DrawPointCloudShorelineWavesSection(
+    PreviewLayerSession* session,
+    const PointCloudShorelineWaveSettings* savedBaseSettings) {
     if (session == nullptr || !BeginPanelSection("Shoreline Waves")) {
         return false;
     }
@@ -49979,6 +50003,11 @@ bool DrawPointCloudShorelineWavesSection(PreviewLayerSession* session) {
     auto& style = session->pointStyle;
     bool changed = false;
     changed |= ImGui::Checkbox("Enable Shoreline Waves", &style.shorelineWaveEnabled);
+    DrawWaterProfileBaseBoolHint(
+        style.shorelineWaveEnabled,
+        savedBaseSettings != nullptr
+            ? std::optional<bool>{savedBaseSettings->enabled}
+            : std::nullopt);
 
     if (style.shorelineWaveEnabled) {
         constexpr std::array kAlgorithms{
@@ -50002,32 +50031,63 @@ bool DrawPointCloudShorelineWavesSection(PreviewLayerSession* session) {
             style.shorelineWaveAlgorithm = kAlgorithms[static_cast<std::size_t>(algorithmIndex)];
             changed = true;
         }
+        if (savedBaseSettings != nullptr &&
+            savedBaseSettings->algorithm != style.shorelineWaveAlgorithm) {
+            const auto savedAlgorithm = std::find(
+                kAlgorithms.begin(),
+                kAlgorithms.end(),
+                savedBaseSettings->algorithm);
+            const auto savedAlgorithmIndex =
+                savedAlgorithm != kAlgorithms.end()
+                    ? static_cast<std::size_t>(
+                          std::distance(kAlgorithms.begin(), savedAlgorithm))
+                    : 0U;
+            ImGui::TextDisabled(
+                "(Saved: %s)",
+                algorithms[savedAlgorithmIndex]);
+        }
 
         constexpr float kPi = 3.14159265358979323846F;
         if (style.shorelineWaveAlgorithm == PointCloudShorelineWaveAlgorithm::HeightFoam) {
             auto& foam = style.shorelineHeightFoam;
+            const auto foamFormat = [&](const char* format, float current, auto member) {
+                return WaterProfileValueFormat(
+                    format,
+                    current,
+                    savedBaseSettings != nullptr
+                        ? std::optional<float>{savedBaseSettings->heightFoam.*member}
+                        : std::nullopt);
+            };
             changed |= DrawRangedFloatControl(
                 "Run-up Height",
                 &foam.runupZ,
-                {.visualMin = 0.0F, .visualMax = 3.0F, .format = "%.3f m", .hardMin = -1000.0F, .hardMax = 1000.0F});
+                {.visualMin = 0.0F, .visualMax = 3.0F, .format = foamFormat("%.3f m", foam.runupZ, &PointCloudHeightFoamShorelineSettings::runupZ).c_str(), .hardMin = -1000.0F, .hardMax = 1000.0F});
             changed |= DrawRangedFloatControl(
                 "Break Height",
                 &foam.breakZ,
-                {.visualMin = 0.0F, .visualMax = 3.0F, .format = "%.3f m", .hardMin = -1000.0F, .hardMax = 1000.0F});
+                {.visualMin = 0.0F, .visualMax = 3.0F, .format = foamFormat("%.3f m", foam.breakZ, &PointCloudHeightFoamShorelineSettings::breakZ).c_str(), .hardMin = -1000.0F, .hardMax = 1000.0F});
             changed |= DrawRangedFloatControl(
                 "Offshore Reach",
                 &foam.offshoreReachMeters,
-                {.visualMin = 0.001F, .visualMax = 2.0F, .format = "%.3f m", .hardMin = 0.001F, .hardMax = 50.0F});
+                {.visualMin = 0.001F, .visualMax = 2.0F, .format = foamFormat("%.3f m", foam.offshoreReachMeters, &PointCloudHeightFoamShorelineSettings::offshoreReachMeters).c_str(), .hardMin = 0.001F, .hardMax = 50.0F});
             changed |= DrawRangedFloatControl(
                 "Edge Fade",
                 &foam.edgeFadeMeters,
-                {.visualMin = 0.0F, .visualMax = 0.50F, .format = "%.3f m", .hardMin = 0.0F, .hardMax = 10.0F});
+                {.visualMin = 0.0F, .visualMax = 0.50F, .format = foamFormat("%.3f m", foam.edgeFadeMeters, &PointCloudHeightFoamShorelineSettings::edgeFadeMeters).c_str(), .hardMin = 0.0F, .hardMax = 10.0F});
 
             float directionDegrees = std::atan2(foam.directionY, foam.directionX) * 180.0F / kPi;
+            const std::optional<float> savedDirectionDegrees =
+                savedBaseSettings != nullptr
+                    ? std::optional<float>{
+                          std::atan2(
+                              savedBaseSettings->heightFoam.directionY,
+                              savedBaseSettings->heightFoam.directionX) *
+                          180.0F / kPi}
+                    : std::nullopt;
             if (DrawRangedFloatControl(
                     "Wave Direction",
                     &directionDegrees,
-                    {.visualMin = -180.0F, .visualMax = 180.0F, .format = "%.1f deg"})) {
+                    {.visualMin = -180.0F, .visualMax = 180.0F, .format = WaterProfileValueFormat("%.1f deg", directionDegrees, savedDirectionDegrees).c_str()})) {
                 const float radians = directionDegrees * kPi / 180.0F;
                 foam.directionX = std::cos(radians);
                 foam.directionY = std::sin(radians);
@@ -50037,70 +50097,76 @@ bool DrawPointCloudShorelineWavesSection(PreviewLayerSession* session) {
             changed |= DrawRangedFloatControl(
                 "Wavelength",
                 &foam.wavelengthMeters,
-                {.visualMin = 0.002F, .visualMax = 2.0F, .format = "%.3f m", .hardMin = 0.002F, .hardMax = 10.0F});
+                {.visualMin = 0.002F, .visualMax = 2.0F, .format = foamFormat("%.3f m", foam.wavelengthMeters, &PointCloudHeightFoamShorelineSettings::wavelengthMeters).c_str(), .hardMin = 0.002F, .hardMax = 10.0F});
             changed |= DrawRangedFloatControl(
                 "Pattern Scale",
                 &foam.patternScale,
-                {.visualMin = 0.01F, .visualMax = 8.0F, .format = "%.2f", .hardMin = 0.01F, .hardMax = 50.0F});
+                {.visualMin = 0.01F, .visualMax = 8.0F, .format = foamFormat("%.2f", foam.patternScale, &PointCloudHeightFoamShorelineSettings::patternScale).c_str(), .hardMin = 0.01F, .hardMax = 50.0F});
             changed |= DrawRangedFloatControl(
                 "Speed",
                 &foam.speed,
-                {.visualMin = 0.0F, .visualMax = 4.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 10.0F});
+                {.visualMin = 0.0F, .visualMax = 4.0F, .format = foamFormat("%.2f", foam.speed, &PointCloudHeightFoamShorelineSettings::speed).c_str(), .hardMin = 0.0F, .hardMax = 10.0F});
             changed |= DrawRangedFloatControl(
                 "Warp",
                 &foam.warp,
-                {.visualMin = 0.0F, .visualMax = 2.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 3.0F});
+                {.visualMin = 0.0F, .visualMax = 2.0F, .format = foamFormat("%.2f", foam.warp, &PointCloudHeightFoamShorelineSettings::warp).c_str(), .hardMin = 0.0F, .hardMax = 3.0F});
             changed |= DrawRangedFloatControl(
                 "Turbulence",
                 &foam.turbulence,
-                {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.3f", .hardMin = 0.0F, .hardMax = 1.0F});
+                {.visualMin = 0.0F, .visualMax = 1.0F, .format = foamFormat("%.3f", foam.turbulence, &PointCloudHeightFoamShorelineSettings::turbulence).c_str(), .hardMin = 0.0F, .hardMax = 1.0F});
             changed |= DrawRangedFloatControl(
                 "Band Density",
                 &foam.density,
-                {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.3f", .hardMin = 0.0F, .hardMax = 1.0F});
+                {.visualMin = 0.0F, .visualMax = 1.0F, .format = foamFormat("%.3f", foam.density, &PointCloudHeightFoamShorelineSettings::density).c_str(), .hardMin = 0.0F, .hardMax = 1.0F});
 
             ImGui::Spacing();
             changed |= DrawRangedFloatControl(
                 "Offshore Foam",
                 &foam.offshoreFoamStrength,
-                {.visualMin = 0.0F, .visualMax = 1.5F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 3.0F});
+                {.visualMin = 0.0F, .visualMax = 1.5F, .format = foamFormat("%.2f", foam.offshoreFoamStrength, &PointCloudHeightFoamShorelineSettings::offshoreFoamStrength).c_str(), .hardMin = 0.0F, .hardMax = 3.0F});
             changed |= DrawRangedFloatControl(
                 "Incoming Strength",
                 &foam.incomingStrength,
-                {.visualMin = 0.0F, .visualMax = 2.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 5.0F});
+                {.visualMin = 0.0F, .visualMax = 2.0F, .format = foamFormat("%.2f", foam.incomingStrength, &PointCloudHeightFoamShorelineSettings::incomingStrength).c_str(), .hardMin = 0.0F, .hardMax = 5.0F});
             changed |= DrawRangedFloatControl(
                 "Return Strength",
                 &foam.returnStrength,
-                {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.3f", .hardMin = 0.0F, .hardMax = 1.0F});
+                {.visualMin = 0.0F, .visualMax = 1.0F, .format = foamFormat("%.3f", foam.returnStrength, &PointCloudHeightFoamShorelineSettings::returnStrength).c_str(), .hardMin = 0.0F, .hardMax = 1.0F});
             changed |= DrawRangedFloatControl(
                 "Intensity",
                 &foam.intensity,
-                {.visualMin = 0.0F, .visualMax = 2.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 5.0F});
+                {.visualMin = 0.0F, .visualMax = 2.0F, .format = foamFormat("%.2f", foam.intensity, &PointCloudHeightFoamShorelineSettings::intensity).c_str(), .hardMin = 0.0F, .hardMax = 5.0F});
             changed |= DrawRangedFloatControl(
                 "Emission Add",
                 &foam.emissionAdd,
-                {.visualMin = 0.0F, .visualMax = 2.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 8.0F});
+                {.visualMin = 0.0F, .visualMax = 2.0F, .format = foamFormat("%.2f", foam.emissionAdd, &PointCloudHeightFoamShorelineSettings::emissionAdd).c_str(), .hardMin = 0.0F, .hardMax = 8.0F});
             changed |= DrawRangedFloatControl(
                 "Opacity Add",
                 &foam.opacityAdd,
-                {.visualMin = -1.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = -1.0F, .hardMax = 2.0F});
+                {.visualMin = -1.0F, .visualMax = 1.0F, .format = foamFormat("%.2f", foam.opacityAdd, &PointCloudHeightFoamShorelineSettings::opacityAdd).c_str(), .hardMin = -1.0F, .hardMax = 2.0F});
             changed |= DrawRangedFloatControl(
                 "Opacity Multiply",
                 &foam.opacityMultiply,
-                {.visualMin = 0.0F, .visualMax = 4.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 8.0F});
+                {.visualMin = 0.0F, .visualMax = 4.0F, .format = foamFormat("%.2f", foam.opacityMultiply, &PointCloudHeightFoamShorelineSettings::opacityMultiply).c_str(), .hardMin = 0.0F, .hardMax = 8.0F});
             changed |= DrawRangedFloatControl(
                 "Point Size Add",
                 &foam.pointSizeAdd,
-                {.visualMin = -32.0F, .visualMax = 64.0F, .format = "%.1f", .hardMin = -256.0F, .hardMax = 512.0F});
+                {.visualMin = -32.0F, .visualMax = 64.0F, .format = foamFormat("%.1f", foam.pointSizeAdd, &PointCloudHeightFoamShorelineSettings::pointSizeAdd).c_str(), .hardMin = -256.0F, .hardMax = 512.0F});
             changed |= DrawRangedFloatControl(
                 "Point Size Multiply",
                 &foam.pointSizeMultiply,
-                {.visualMin = 0.0F, .visualMax = 4.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 8.0F});
+                {.visualMin = 0.0F, .visualMax = 4.0F, .format = foamFormat("%.2f", foam.pointSizeMultiply, &PointCloudHeightFoamShorelineSettings::pointSizeMultiply).c_str(), .hardMin = 0.0F, .hardMax = 8.0F});
             changed |= DrawRangedFloatControl(
                 "Colour Mix",
                 &foam.colourMix,
-                {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.3f", .hardMin = 0.0F, .hardMax = 1.0F});
+                {.visualMin = 0.0F, .visualMax = 1.0F, .format = foamFormat("%.3f", foam.colourMix, &PointCloudHeightFoamShorelineSettings::colourMix).c_str(), .hardMin = 0.0F, .hardMax = 1.0F});
             changed |= ImGui::ColorEdit3("Wave Colour", foam.colour.data());
+            DrawWaterProfileBaseColourHint(
+                foam.colour,
+                savedBaseSettings != nullptr
+                    ? std::optional<std::array<float, 3>>{
+                          savedBaseSettings->heightFoam.colour}
+                    : std::nullopt);
 
             const float normalizedBreakZ =
                 invisible_places::renderer::pointcloud::NormalizeHeightFoamBreakZ(
@@ -50113,25 +50179,41 @@ bool DrawPointCloudShorelineWavesSection(PreviewLayerSession* session) {
                 changed = true;
             }
         } else {
+            const auto foamFormat = [&](const char* format, float current, auto member) {
+                return WaterProfileValueFormat(
+                    format,
+                    current,
+                    savedBaseSettings != nullptr
+                        ? std::optional<float>{savedBaseSettings->foamFronts.*member}
+                        : std::nullopt);
+            };
             changed |= DrawRangedFloatControl(
                 "Boundary Height",
                 &style.shorelineBoundaryZ,
-                {.visualMin = 0.0F, .visualMax = 3.0F, .format = "%.3f m", .hardMin = -1000.0F, .hardMax = 1000.0F});
+                {.visualMin = 0.0F, .visualMax = 3.0F, .format = foamFormat("%.3f m", style.shorelineBoundaryZ, &PointCloudFoamFrontsShorelineSettings::boundaryZ).c_str(), .hardMin = -1000.0F, .hardMax = 1000.0F});
             changed |= DrawRangedFloatControl(
                 "Height Reach",
                 &style.shorelineHeightReachMeters,
-                {.visualMin = 0.001F, .visualMax = 2.0F, .format = "%.3f m", .hardMin = 0.001F, .hardMax = 50.0F});
+                {.visualMin = 0.001F, .visualMax = 2.0F, .format = foamFormat("%.3f m", style.shorelineHeightReachMeters, &PointCloudFoamFrontsShorelineSettings::heightReachMeters).c_str(), .hardMin = 0.001F, .hardMax = 50.0F});
             changed |= DrawRangedFloatControl(
                 "Edge Fade",
                 &style.shorelineEdgeFadeMeters,
-                {.visualMin = 0.0F, .visualMax = 0.50F, .format = "%.3f m", .hardMin = 0.0F, .hardMax = 10.0F});
+                {.visualMin = 0.0F, .visualMax = 0.50F, .format = foamFormat("%.3f m", style.shorelineEdgeFadeMeters, &PointCloudFoamFrontsShorelineSettings::edgeFadeMeters).c_str(), .hardMin = 0.0F, .hardMax = 10.0F});
 
             float directionDegrees =
                 std::atan2(style.shorelineDirectionY, style.shorelineDirectionX) * 180.0F / kPi;
+            const std::optional<float> savedDirectionDegrees =
+                savedBaseSettings != nullptr
+                    ? std::optional<float>{
+                          std::atan2(
+                              savedBaseSettings->foamFronts.directionY,
+                              savedBaseSettings->foamFronts.directionX) *
+                          180.0F / kPi}
+                    : std::nullopt;
             if (DrawRangedFloatControl(
                     "Wave Direction",
                     &directionDegrees,
-                    {.visualMin = -180.0F, .visualMax = 180.0F, .format = "%.1f deg"})) {
+                    {.visualMin = -180.0F, .visualMax = 180.0F, .format = WaterProfileValueFormat("%.1f deg", directionDegrees, savedDirectionDegrees).c_str()})) {
                 const float radians = directionDegrees * kPi / 180.0F;
                 style.shorelineDirectionX = std::cos(radians);
                 style.shorelineDirectionY = std::sin(radians);
@@ -50141,33 +50223,33 @@ bool DrawPointCloudShorelineWavesSection(PreviewLayerSession* session) {
             changed |= DrawRangedFloatControl(
                 "Wavelength",
                 &style.shorelineWavelengthMeters,
-                {.visualMin = 0.002F, .visualMax = 2.0F, .format = "%.3f m", .hardMin = 0.002F, .hardMax = 10.0F});
+                {.visualMin = 0.002F, .visualMax = 2.0F, .format = foamFormat("%.3f m", style.shorelineWavelengthMeters, &PointCloudFoamFrontsShorelineSettings::wavelengthMeters).c_str(), .hardMin = 0.002F, .hardMax = 10.0F});
             changed |= DrawRangedFloatControl(
                 "Pattern Scale",
                 &style.shorelinePatternScale,
-                {.visualMin = 0.01F, .visualMax = 8.0F, .format = "%.2f", .hardMin = 0.01F, .hardMax = 50.0F});
+                {.visualMin = 0.01F, .visualMax = 8.0F, .format = foamFormat("%.2f", style.shorelinePatternScale, &PointCloudFoamFrontsShorelineSettings::patternScale).c_str(), .hardMin = 0.01F, .hardMax = 50.0F});
             changed |= DrawRangedFloatControl(
                 "Speed",
                 &style.shorelineSpeed,
-                {.visualMin = 0.0F, .visualMax = 4.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 10.0F});
+                {.visualMin = 0.0F, .visualMax = 4.0F, .format = foamFormat("%.2f", style.shorelineSpeed, &PointCloudFoamFrontsShorelineSettings::speed).c_str(), .hardMin = 0.0F, .hardMax = 10.0F});
             changed |= DrawRangedFloatControl(
                 "Warp",
                 &style.shorelineWarp,
-                {.visualMin = 0.0F, .visualMax = 2.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 3.0F});
+                {.visualMin = 0.0F, .visualMax = 2.0F, .format = foamFormat("%.2f", style.shorelineWarp, &PointCloudFoamFrontsShorelineSettings::warp).c_str(), .hardMin = 0.0F, .hardMax = 3.0F});
             changed |= DrawRangedFloatControl(
                 "Turbulence",
                 &style.shorelineTurbulence,
-                {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.3f", .hardMin = 0.0F, .hardMax = 1.0F});
+                {.visualMin = 0.0F, .visualMax = 1.0F, .format = foamFormat("%.3f", style.shorelineTurbulence, &PointCloudFoamFrontsShorelineSettings::turbulence).c_str(), .hardMin = 0.0F, .hardMax = 1.0F});
             changed |= DrawRangedFloatControl(
                 "Band Density",
                 &style.shorelineDensity,
-                {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.3f", .hardMin = 0.0F, .hardMax = 1.0F});
+                {.visualMin = 0.0F, .visualMax = 1.0F, .format = foamFormat("%.3f", style.shorelineDensity, &PointCloudFoamFrontsShorelineSettings::density).c_str(), .hardMin = 0.0F, .hardMax = 1.0F});
             if (style.shorelineWaveAlgorithm ==
                 PointCloudShorelineWaveAlgorithm::FoamFronts) {
                 changed |= DrawRangedFloatControl(
                     "Background Wash",
                     &style.shorelineBackgroundWash,
-                    {.visualMin = 0.05F, .visualMax = 2.0F, .format = "%.2f", .hardMin = 0.05F, .hardMax = 2.0F});
+                    {.visualMin = 0.05F, .visualMax = 2.0F, .format = foamFormat("%.2f", style.shorelineBackgroundWash, &PointCloudFoamFrontsShorelineSettings::backgroundWash).c_str(), .hardMin = 0.05F, .hardMax = 2.0F});
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
                     ImGui::SetTooltip(
                         "Response curve for the faded wash between foam crests. 1 keeps the "
@@ -50180,32 +50262,38 @@ bool DrawPointCloudShorelineWavesSection(PreviewLayerSession* session) {
             changed |= DrawRangedFloatControl(
                 "Intensity",
                 &style.shorelineIntensity,
-                {.visualMin = 0.0F, .visualMax = 2.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 5.0F});
+                {.visualMin = 0.0F, .visualMax = 2.0F, .format = foamFormat("%.2f", style.shorelineIntensity, &PointCloudFoamFrontsShorelineSettings::intensity).c_str(), .hardMin = 0.0F, .hardMax = 5.0F});
             changed |= DrawRangedFloatControl(
                 "Emission Add",
                 &style.shorelineEmissionAdd,
-                {.visualMin = 0.0F, .visualMax = 2.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 8.0F});
+                {.visualMin = 0.0F, .visualMax = 2.0F, .format = foamFormat("%.2f", style.shorelineEmissionAdd, &PointCloudFoamFrontsShorelineSettings::emissionAdd).c_str(), .hardMin = 0.0F, .hardMax = 8.0F});
             changed |= DrawRangedFloatControl(
                 "Opacity Add",
                 &style.shorelineOpacityAdd,
-                {.visualMin = -1.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = -1.0F, .hardMax = 2.0F});
+                {.visualMin = -1.0F, .visualMax = 1.0F, .format = foamFormat("%.2f", style.shorelineOpacityAdd, &PointCloudFoamFrontsShorelineSettings::opacityAdd).c_str(), .hardMin = -1.0F, .hardMax = 2.0F});
             changed |= DrawRangedFloatControl(
                 "Opacity Multiply",
                 &style.shorelineOpacityMultiply,
-                {.visualMin = 0.0F, .visualMax = 4.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 8.0F});
+                {.visualMin = 0.0F, .visualMax = 4.0F, .format = foamFormat("%.2f", style.shorelineOpacityMultiply, &PointCloudFoamFrontsShorelineSettings::opacityMultiply).c_str(), .hardMin = 0.0F, .hardMax = 8.0F});
             changed |= DrawRangedFloatControl(
                 "Point Size Add",
                 &style.shorelinePointSizeAdd,
-                {.visualMin = -32.0F, .visualMax = 64.0F, .format = "%.1f", .hardMin = -256.0F, .hardMax = 512.0F});
+                {.visualMin = -32.0F, .visualMax = 64.0F, .format = foamFormat("%.1f", style.shorelinePointSizeAdd, &PointCloudFoamFrontsShorelineSettings::pointSizeAdd).c_str(), .hardMin = -256.0F, .hardMax = 512.0F});
             changed |= DrawRangedFloatControl(
                 "Point Size Multiply",
                 &style.shorelinePointSizeMultiply,
-                {.visualMin = 0.0F, .visualMax = 4.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 8.0F});
+                {.visualMin = 0.0F, .visualMax = 4.0F, .format = foamFormat("%.2f", style.shorelinePointSizeMultiply, &PointCloudFoamFrontsShorelineSettings::pointSizeMultiply).c_str(), .hardMin = 0.0F, .hardMax = 8.0F});
             changed |= DrawRangedFloatControl(
                 "Colour Mix",
                 &style.shorelineColourMix,
-                {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.3f", .hardMin = 0.0F, .hardMax = 1.0F});
+                {.visualMin = 0.0F, .visualMax = 1.0F, .format = foamFormat("%.3f", style.shorelineColourMix, &PointCloudFoamFrontsShorelineSettings::colourMix).c_str(), .hardMin = 0.0F, .hardMax = 1.0F});
             changed |= ImGui::ColorEdit3("Wave Colour", style.shorelineColour.data());
+            DrawWaterProfileBaseColourHint(
+                style.shorelineColour,
+                savedBaseSettings != nullptr
+                    ? std::optional<std::array<float, 3>>{
+                          savedBaseSettings->foamFronts.colour}
+                    : std::nullopt);
         }
     }
 
@@ -73417,9 +73505,13 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
                     profile.shorelineInstanceId != instance.id) {
                     continue;
                 }
-                const auto renamed = WaterShorelineObjectProfileName(
-                    profile.baseProfileName,
-                    instance.name);
+                const auto renamed = invisible_places::renderer::pointcloud::
+                    UniquePointCloudShorelineObjectProfileName(
+                        std::span<const PointCloudShorelineWaveProfile>{
+                            water.shorelineProfiles},
+                        profile.baseProfileName,
+                        instance.name,
+                        instance.id);
                 if (!renamed.empty()) {
                     const bool wasApplied =
                         instance.profileName == profile.name;
@@ -73513,6 +73605,21 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
                 "from the base plus the new change.");
         }
 
+        std::optional<PointCloudShorelineWaveSettings> savedBaseSettings;
+        const std::string normalizedBaseName =
+            NormalizeWaterShorelineProfileName(instance.baseProfileName);
+        const auto savedBaseProfile = std::find_if(
+            water.shorelineProfiles.begin(),
+            water.shorelineProfiles.end(),
+            [&](const PointCloudShorelineWaveProfile& profile) {
+                return !profile.objectOverride &&
+                       NormalizeWaterShorelineProfileName(profile.name) ==
+                           normalizedBaseName;
+            });
+        if (savedBaseProfile != water.shorelineProfiles.end()) {
+            savedBaseSettings = savedBaseProfile->settings;
+        }
+
         bool instanceSettingsChanged = false;
 
         const invisible_places::water::WaterKeyedFeatureId feature{
@@ -73530,19 +73637,31 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
                                         const char* label,
                                         float ffValue,
                                         float hfValue,
+                                        float savedFfValue,
+                                        float savedHfValue,
                                         float minimum,
                                         float maximum,
                                         auto&& assign) {
+            const float currentValue =
+                heightFoamActive ? hfValue : ffValue;
             float edited = 0.0F;
             const auto result = DrawKeyedWaterSettingSlider(
                 runtimeState,
                 keyedFeatures,
                 settingId,
                 label,
-                heightFoamActive ? hfValue : ffValue,
+                currentValue,
                 minimum,
                 maximum,
-                "%.2f",
+                WaterProfileValueFormat(
+                    "%.2f",
+                    currentValue,
+                    savedBaseSettings.has_value()
+                        ? std::optional<float>{
+                              heightFoamActive ? savedHfValue
+                                               : savedFfValue}
+                        : std::nullopt)
+                    .c_str(),
                 ImGuiSliderFlags_None,
                 false,
                 &edited,
@@ -73562,6 +73681,12 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
             "Intensity",
             instance.settings.foamFronts.intensity,
             instance.settings.heightFoam.intensity,
+            savedBaseSettings.has_value()
+                ? savedBaseSettings->foamFronts.intensity
+                : 0.0F,
+            savedBaseSettings.has_value()
+                ? savedBaseSettings->heightFoam.intensity
+                : 0.0F,
             0.0F,
             2.0F,
             [&](float value) {
@@ -73574,6 +73699,12 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
             "Emission Add",
             instance.settings.foamFronts.emissionAdd,
             instance.settings.heightFoam.emissionAdd,
+            savedBaseSettings.has_value()
+                ? savedBaseSettings->foamFronts.emissionAdd
+                : 0.0F,
+            savedBaseSettings.has_value()
+                ? savedBaseSettings->heightFoam.emissionAdd
+                : 0.0F,
             0.0F,
             2.0F,
             [&](float value) {
@@ -73586,6 +73717,12 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
             "Opacity Add",
             instance.settings.foamFronts.opacityAdd,
             instance.settings.heightFoam.opacityAdd,
+            savedBaseSettings.has_value()
+                ? savedBaseSettings->foamFronts.opacityAdd
+                : 0.0F,
+            savedBaseSettings.has_value()
+                ? savedBaseSettings->heightFoam.opacityAdd
+                : 0.0F,
             -1.0F,
             1.0F,
             [&](float value) {
@@ -73598,6 +73735,12 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
             "Point Size Multiply",
             instance.settings.foamFronts.pointSizeMultiply,
             instance.settings.heightFoam.pointSizeMultiply,
+            savedBaseSettings.has_value()
+                ? savedBaseSettings->foamFronts.pointSizeMultiply
+                : 0.0F,
+            savedBaseSettings.has_value()
+                ? savedBaseSettings->heightFoam.pointSizeMultiply
+                : 0.0F,
             0.0F,
             3.0F,
             [&](float value) {
@@ -73611,6 +73754,12 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
             "Colour Mix",
             instance.settings.foamFronts.colourMix,
             instance.settings.heightFoam.colourMix,
+            savedBaseSettings.has_value()
+                ? savedBaseSettings->foamFronts.colourMix
+                : 0.0F,
+            savedBaseSettings.has_value()
+                ? savedBaseSettings->heightFoam.colourMix
+                : 0.0F,
             0.0F,
             1.0F,
             [&](float value) {
@@ -73661,7 +73810,11 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
             ApplyPointCloudShorelineWaveSettings(
                 &editSession.pointStyle,
                 instance.settings);
-        if (DrawPointCloudShorelineWavesSection(&editSession)) {
+        if (DrawPointCloudShorelineWavesSection(
+                &editSession,
+                savedBaseSettings.has_value()
+                    ? &savedBaseSettings.value()
+                    : nullptr)) {
             instance.settings = invisible_places::renderer::pointcloud::
                 ExtractPointCloudShorelineWaveSettings(
                     editSession.pointStyle);
@@ -73686,9 +73839,13 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
                 }
             }
             const std::string objectProfileName =
-                WaterShorelineObjectProfileName(
-                    baseName,
-                    instance.name);
+                invisible_places::renderer::pointcloud::
+                    UniquePointCloudShorelineObjectProfileName(
+                        std::span<const PointCloudShorelineWaveProfile>{
+                            water.shorelineProfiles},
+                        baseName,
+                        instance.name,
+                        instance.id);
             if (!objectProfileName.empty()) {
                 PointCloudShorelineWaveProfile objectProfile{
                     .name = objectProfileName,
@@ -77985,6 +78142,20 @@ void DrawWaterPanel(
                     feature);
                 const std::string keyedProfileBaseName =
                     FlowPathKeyedSettingsBaseName(water, source);
+                const auto responsiveLaneSavedBase =
+                    WaterLaneProfileSettingsByName(
+                        water,
+                        WaterFlowObjectEditBaseName(
+                            water.laneProfiles,
+                            source.laneProfileName,
+                            water.selectedLaneProfileName));
+                const auto responsiveTrailSavedBase =
+                    WaterTrailProfileByName(
+                        *runtimeState,
+                        WaterFlowObjectEditBaseName(
+                            water.trailProfiles,
+                            source.trailProfileName,
+                            water.selectedTrailProfileName));
                 bool activityChanged = false;
                 bool keyedSettingsChanged = false;
                 bool responsiveBaseChanged = false;
@@ -78057,7 +78228,11 @@ void DrawWaterPanel(
                         speed,
                         0.001F,
                         10.0F,
-                        "%.2f m/s",
+                        WaterProfileValueFormat(
+                            "%.2f m/s",
+                            speed,
+                            responsiveLaneSavedBase.speedMetersPerSecond)
+                            .c_str(),
                         ImGuiSliderFlags_Logarithmic,
                         false,
                         &speed,
@@ -78090,7 +78265,11 @@ void DrawWaterPanel(
                         trailWidth,
                         0.0005F,
                         1.0F,
-                        "%.4f m",
+                        WaterProfileValueFormat(
+                            "%.4f m",
+                            trailWidth,
+                            responsiveTrailSavedBase.geometry.widthMeters)
+                            .c_str(),
                         ImGuiSliderFlags_Logarithmic,
                         false,
                         &trailWidth,
@@ -78126,7 +78305,12 @@ void DrawWaterPanel(
                         streakLength,
                         0.001F,
                         5.0F,
-                        "%.3f m",
+                        WaterProfileValueFormat(
+                            "%.3f m",
+                            streakLength,
+                            responsiveTrailSavedBase.geometry
+                                .streakLengthMeters)
+                            .c_str(),
                         ImGuiSliderFlags_Logarithmic,
                         false,
                         &streakLength,

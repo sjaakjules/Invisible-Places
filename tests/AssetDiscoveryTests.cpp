@@ -1660,6 +1660,79 @@ TEST_CASE("Shoreline profiles copy only water settings and Calm matches the auth
     CHECK(extracted.heightFoam.offshoreFoamStrength == Catch::Approx(0.43F));
 }
 
+TEST_CASE("Shoreline object profile names avoid bases and other object copies",
+          "[water][shoreline][profiles][naming]") {
+    using invisible_places::renderer::pointcloud::
+        PointCloudShorelineWaveProfile;
+    using invisible_places::renderer::pointcloud::
+        UniquePointCloudShorelineObjectProfileName;
+
+    SECTION("saved base names retain ownership of the preferred name") {
+        const std::vector<PointCloudShorelineWaveProfile> profiles{
+            {.name = "Calm_North"},
+        };
+        CHECK(
+            UniquePointCloudShorelineObjectProfileName(
+                profiles,
+                " Calm ",
+                " North ",
+                7U) ==
+            "Calm_North 2");
+    }
+
+    SECTION("copies owned by other objects receive deterministic suffixes") {
+        const std::vector<PointCloudShorelineWaveProfile> profiles{
+            {.name = "Calm_North"},
+            {.name = "Calm_North 2",
+             .objectOverride = true,
+             .shorelineInstanceId = 8U,
+             .baseProfileName = "Calm"},
+        };
+        CHECK(
+            UniquePointCloudShorelineObjectProfileName(
+                profiles,
+                "Calm",
+                "North",
+                7U) ==
+            "Calm_North 3");
+    }
+
+    SECTION("updating the same owner and base keeps its stable name") {
+        const std::vector<PointCloudShorelineWaveProfile> profiles{
+            {.name = "Calm"},
+            {.name = "Calm_North",
+             .objectOverride = true,
+             .shorelineInstanceId = 7U,
+             .baseProfileName = " Calm "},
+        };
+        CHECK(
+            UniquePointCloudShorelineObjectProfileName(
+                profiles,
+                "Calm",
+                "North",
+                7U) ==
+            "Calm_North");
+    }
+
+    SECTION("blank object labels use the deterministic Shoreline fallback") {
+        const std::vector<PointCloudShorelineWaveProfile> profiles;
+        CHECK(
+            UniquePointCloudShorelineObjectProfileName(
+                profiles,
+                " Calm ",
+                "   ",
+                7U) ==
+            "Calm_Shoreline");
+        CHECK(
+            UniquePointCloudShorelineObjectProfileName(
+                profiles,
+                "   ",
+                "North",
+                7U)
+                .empty());
+    }
+}
+
 TEST_CASE("Sand-cloud shoreline waves use dedicated foam helpers", "[water][shoreline][shader]") {
     const auto shaderPath = DataRoot().parent_path() / "shaders" / "pointcloud_sparse_ripple.glsl";
     std::ifstream input{shaderPath};

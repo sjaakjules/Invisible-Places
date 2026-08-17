@@ -407,6 +407,15 @@ void ApplyPointCloudShorelineWaveSettings(
     PointCloudStyleState* style,
     const PointCloudShorelineWaveSettings& settings);
 [[nodiscard]] PointCloudShorelineWaveSettings CalmPointCloudShorelineWaveSettings();
+// Returns the stable human-facing name for one Shoreline object's derived
+// profile without colliding with a saved base or another object's copy. An
+// existing copy owned by the same object and base is ignored so ordinary
+// rename/update operations keep their current unsuffixed name when possible.
+[[nodiscard]] std::string UniquePointCloudShorelineObjectProfileName(
+    std::span<const PointCloudShorelineWaveProfile> profiles,
+    std::string_view baseProfileName,
+    std::string_view objectName,
+    std::uint32_t shorelineInstanceId);
 // True when an authored shoreline still defines a flooded/dry spatial region,
 // even if its animation speed is paused. Rain uses this predicate so viewport
 // and offline SAND impacts agree at a held shoreline frame.
