@@ -351,6 +351,52 @@ struct WaterSeepageNodeSettingsProfile {
     std::string baseProfileName;
 };
 
+// Pure description of the editable layer behind a Seepage Node Settings,
+// Look, or Response assignment. Modern object-copy metadata is authoritative;
+// the legacy `<base>_edited` convention remains readable for migration.
+struct WaterObjectProfileIdentity {
+    std::string name;
+    std::uint32_t ownerObjectId = 0U;
+    std::string baseProfileName;
+};
+
+struct WaterObjectProfileEditDescriptor {
+    std::string assignedProfileName = "Default";
+    // Exact resolvable base: `_preset` is deliberately retained for discard.
+    std::string exactBaseProfileName = "Default";
+    // Human-facing reusable save target: `_preset`/`_edited` are stripped.
+    std::string suggestedSaveProfileName = "Default";
+    // Empty for ordinary assignments and another object's copy.
+    std::string removableWorkingProfileName;
+    bool assignedObjectCopy = false;
+    bool ownedObjectCopy = false;
+    bool legacyEditedShadow = false;
+};
+
+[[nodiscard]] WaterObjectProfileEditDescriptor
+DescribeWaterObjectProfileEdit(
+    std::string_view assignedProfileName,
+    std::uint32_t selectedOwnerObjectId,
+    const std::optional<WaterObjectProfileIdentity>& assignedObjectCopy =
+        std::nullopt);
+
+struct WaterSeepageNode;
+
+enum class WaterSeepageProfileHalf : std::uint8_t {
+    NodeSettings = 0,
+    Look,
+    Response,
+};
+
+// Rebinds the persisted assignment on every matching node. Matching is
+// trimmed but case-preserving so legacy `_Edited` names remain addressable
+// until their promotion transaction completes.
+[[nodiscard]] std::size_t ReplaceWaterSeepageNodeProfileReferences(
+    std::span<WaterSeepageNode> nodes,
+    WaterSeepageProfileHalf half,
+    std::string_view previousProfileName,
+    std::string_view nextProfileName);
+
 struct WaterScenarioState {
     WaterSeepageLookSettings seepageLook{};
     float seepageLevel = 1.0F;
@@ -673,14 +719,32 @@ ParseWaterKeyedFeatureKindName(std::string_view name);
 [[nodiscard]] bool WaterKeyedSettingTrackProfileEqual(
     const WaterKeyedSettingTrack& left,
     const WaterKeyedSettingTrack& right);
-// Rebinds dynamic keyed-setting tracks when a named Seepage Look or Response
-// profile is renamed/reconciled. Callers may apply this to live Timing Take
-// timelines, legacy timelines, and reusable package tracks alike.
+// Rebinds keyed tracks carrying explicit profile-group metadata. Use the
+// feature-aware overload below for persisted stores that may still contain
+// schema-46 blank-group Seepage tracks.
 [[nodiscard]] std::size_t ReplaceWaterKeyedSettingProfileReferences(
     std::span<WaterKeyedSettingTrack> settings,
     std::string_view profileGroup,
     std::string_view previousProfileName,
     std::string_view nextProfileName);
+// Feature-aware overload used for whole-project transactions. Explicit
+// profile metadata remains authoritative; legacy blank-group Seepage tracks
+// are classified only inside Seepage Node timelines/packages so overlapping
+// ids such as `strength` cannot capture Flow tracks.
+[[nodiscard]] std::size_t ReplaceWaterKeyedSettingProfileReferences(
+    std::span<WaterKeyedSettingTrack> settings,
+    WaterKeyedFeatureKind featureKind,
+    std::string_view profileGroup,
+    std::string_view previousProfileName,
+    std::string_view nextProfileName);
+// Rebinds every matching profile-backed track on the requested feature
+// timelines. Dormant tracks are intentionally included; legacy blank-group
+// Seepage tracks are classified by their stable setting ids.
+[[nodiscard]] std::size_t CanonicalizeWaterFeatureProfileMetadata(
+    std::span<WaterFeatureTimingRun> runs,
+    std::span<const WaterKeyedFeatureId> features,
+    std::string_view profileGroup,
+    std::string_view profileName);
 [[nodiscard]] WaterKeyedSettingsProfile SanitizeWaterKeyedSettingsProfile(
     WaterKeyedSettingsProfile profile);
 // Package/profile names are scoped to their feature kind. This lets a Seepage

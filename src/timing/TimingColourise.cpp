@@ -1415,6 +1415,79 @@ TimingTakeRainLiveSyncDecision ResolveTimingTakeRainLiveSyncDecision(
     };
 }
 
+TimingWaterProfileReferenceRewriteCounts
+ReplaceTimingWaterProfileReferences(
+    std::span<invisible_places::water::WaterScenarioFeatureRuns>
+        legacyScenarios,
+    std::span<TimingTakeSceneState> timingTakeStates,
+    std::span<invisible_places::water::WaterKeyedSettingsProfile>
+        keyedPackages,
+    std::string_view profileGroup,
+    std::string_view previousProfileName,
+    std::string_view nextProfileName) {
+    TimingWaterProfileReferenceRewriteCounts counts;
+    const auto replaceInRuns = [&](auto& runs, std::size_t* count) {
+        for (auto& run : runs) {
+            for (auto& feature : run.features) {
+                *count += invisible_places::water::
+                    ReplaceWaterKeyedSettingProfileReferences(
+                        feature.settings,
+                        feature.feature.kind,
+                        profileGroup,
+                        previousProfileName,
+                        nextProfileName);
+            }
+        }
+    };
+    for (auto& scenario : legacyScenarios) {
+        replaceInRuns(
+            scenario.runs,
+            &counts.legacyScenarioTracks);
+    }
+    for (auto& state : timingTakeStates) {
+        replaceInRuns(
+            state.waterFeatureTimingRuns,
+            &counts.timingTakeTracks);
+    }
+    for (auto& package : keyedPackages) {
+        counts.keyedPackageTracks += invisible_places::water::
+            ReplaceWaterKeyedSettingProfileReferences(
+                package.settings,
+                package.featureKind,
+                profileGroup,
+                previousProfileName,
+                nextProfileName);
+    }
+    return counts;
+}
+
+std::size_t CanonicalizeTimingWaterFeatureProfileMetadata(
+    std::span<invisible_places::water::WaterScenarioFeatureRuns>
+        legacyScenarios,
+    std::span<TimingTakeSceneState> timingTakeStates,
+    std::span<const invisible_places::water::WaterKeyedFeatureId> features,
+    std::string_view profileGroup,
+    std::string_view profileName) {
+    std::size_t changed = 0U;
+    for (auto& scenario : legacyScenarios) {
+        changed += invisible_places::water::
+            CanonicalizeWaterFeatureProfileMetadata(
+                scenario.runs,
+                features,
+                profileGroup,
+                profileName);
+    }
+    for (auto& state : timingTakeStates) {
+        changed += invisible_places::water::
+            CanonicalizeWaterFeatureProfileMetadata(
+                state.waterFeatureTimingRuns,
+                features,
+                profileGroup,
+                profileName);
+    }
+    return changed;
+}
+
 std::size_t RewriteTimingTakeRainTrackProfileMetadata(
     std::vector<TimingTakeSceneState>* states,
     std::string_view takeId,

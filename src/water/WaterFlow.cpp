@@ -8783,26 +8783,231 @@ bool WaterKeyedSettingTrackProfileEqual(
     return true;
 }
 
+WaterObjectProfileEditDescriptor DescribeWaterObjectProfileEdit(
+    std::string_view assignedProfileName,
+    std::uint32_t selectedOwnerObjectId,
+    const std::optional<WaterObjectProfileIdentity>& assignedObjectCopy) {
+    constexpr std::string_view kPresetSuffix = "_preset";
+    constexpr std::string_view kEditedSuffix = "_edited";
+    constexpr std::string_view kLegacyEditedSuffix = "_Edited";
+    const auto normalize = [](std::string_view name) {
+        const auto trimmed = TrimSeepageName(name);
+        return trimmed.empty() ? std::string{"Default"}
+                               : std::string{trimmed};
+    };
+    const auto savedName = [&](std::string_view name) {
+        auto saved = normalize(name);
+        if ((saved.ends_with(kEditedSuffix) ||
+             saved.ends_with(kLegacyEditedSuffix)) &&
+            saved.size() > kEditedSuffix.size()) {
+            saved.erase(saved.size() - kEditedSuffix.size());
+        }
+        if (saved.ends_with(kPresetSuffix) &&
+            saved.size() > kPresetSuffix.size()) {
+            saved.erase(saved.size() - kPresetSuffix.size());
+        }
+        return normalize(saved);
+    };
+
+    WaterObjectProfileEditDescriptor descriptor;
+    descriptor.assignedProfileName = normalize(assignedProfileName);
+    const bool copyMatches =
+        assignedObjectCopy.has_value() &&
+        normalize(assignedObjectCopy->name) ==
+            descriptor.assignedProfileName;
+    if (copyMatches) {
+        descriptor.assignedObjectCopy = true;
+        descriptor.exactBaseProfileName =
+            normalize(assignedObjectCopy->baseProfileName);
+        descriptor.ownedObjectCopy =
+            assignedObjectCopy->ownerObjectId == selectedOwnerObjectId;
+        if (descriptor.ownedObjectCopy) {
+            descriptor.removableWorkingProfileName =
+                descriptor.assignedProfileName;
+        }
+    } else if ((descriptor.assignedProfileName.ends_with(
+                    kEditedSuffix) ||
+                descriptor.assignedProfileName.ends_with(
+                    kLegacyEditedSuffix)) &&
+               descriptor.assignedProfileName.size() >
+                   kEditedSuffix.size()) {
+        descriptor.legacyEditedShadow = true;
+        descriptor.exactBaseProfileName =
+            descriptor.assignedProfileName.substr(
+                0U,
+                descriptor.assignedProfileName.size() -
+                    kEditedSuffix.size());
+        descriptor.removableWorkingProfileName =
+            descriptor.assignedProfileName;
+    } else {
+        descriptor.exactBaseProfileName =
+            descriptor.assignedProfileName;
+    }
+    descriptor.suggestedSaveProfileName =
+        savedName(descriptor.exactBaseProfileName);
+    return descriptor;
+}
+
+std::size_t ReplaceWaterSeepageNodeProfileReferences(
+    std::span<WaterSeepageNode> nodes,
+    WaterSeepageProfileHalf half,
+    std::string_view previousProfileName,
+    std::string_view nextProfileName) {
+    const auto previous = TrimSeepageName(previousProfileName);
+    const auto next = TrimSeepageName(nextProfileName);
+    if (previous.empty() || next.empty()) {
+        return 0U;
+    }
+    std::size_t changed = 0U;
+    for (auto& node : nodes) {
+        std::string* reference = nullptr;
+        switch (half) {
+            case WaterSeepageProfileHalf::NodeSettings:
+                reference = &node.settingsProfileName;
+                break;
+            case WaterSeepageProfileHalf::Look:
+                reference = &node.lookProfileName;
+                break;
+            case WaterSeepageProfileHalf::Response:
+                reference = &node.responseProfileName;
+                break;
+        }
+        if (reference == nullptr ||
+            TrimSeepageName(*reference) != previous) {
+            continue;
+        }
+        *reference = std::string{next};
+        ++changed;
+    }
+    return changed;
+}
+
+namespace {
+
+bool WaterKeyedSettingBelongsToProfileGroup(
+    const WaterKeyedSettingTrack& track,
+    std::optional<WaterKeyedFeatureKind> featureKind,
+    std::string_view profileGroup) {
+    const auto group = TrimSeepageName(profileGroup);
+    const auto existingGroup = TrimSeepageName(track.profileGroup);
+    if (!existingGroup.empty()) {
+        return existingGroup == group;
+    }
+    if (!featureKind.has_value() ||
+        *featureKind != WaterKeyedFeatureKind::SeepageNode) {
+        return false;
+    }
+    // Schema-46 tracks predate profile metadata. Dynamic Look/Response
+    // members have stable prefixes; physical node settings come from the
+    // fixed Seepage Node registry.
+    if (group == "seepage_look") {
+        return track.settingId.starts_with("look.");
+    }
+    if (group == "seepage_response") {
+        return track.settingId.starts_with("response.");
+    }
+    if (group == "seepage_node_settings") {
+        if (track.settingId.starts_with("look.") ||
+            track.settingId.starts_with("response.")) {
+            return false;
+        }
+        return FindWaterKeyableSetting(
+                   WaterKeyedFeatureKind::SeepageNode,
+                   track.settingId) != nullptr;
+    }
+    return false;
+}
+
+std::size_t ReplaceWaterKeyedSettingProfileReferencesImpl(
+    std::span<WaterKeyedSettingTrack> settings,
+    std::optional<WaterKeyedFeatureKind> featureKind,
+    std::string_view profileGroup,
+    std::string_view previousProfileName,
+    std::string_view nextProfileName) {
+    const auto group = TrimSeepageName(profileGroup);
+    const auto previous = TrimSeepageName(previousProfileName);
+    const auto next = TrimSeepageName(nextProfileName);
+    if (group.empty() || previous.empty() || next.empty()) {
+        return 0U;
+    }
+    std::size_t replacementCount = 0U;
+    for (auto& setting : settings) {
+        if (!WaterKeyedSettingBelongsToProfileGroup(
+                setting,
+                featureKind,
+                group) ||
+            TrimSeepageName(setting.profileName) != previous) {
+            continue;
+        }
+        setting.profileGroup = std::string{group};
+        setting.profileName = std::string{next};
+        ++replacementCount;
+    }
+    return replacementCount;
+}
+
+}  // namespace
+
 std::size_t ReplaceWaterKeyedSettingProfileReferences(
     std::span<WaterKeyedSettingTrack> settings,
     std::string_view profileGroup,
     std::string_view previousProfileName,
     std::string_view nextProfileName) {
-    const auto previous = TrimSeepageName(previousProfileName);
-    const auto next = TrimSeepageName(nextProfileName);
-    if (profileGroup.empty() || previous.empty() || next.empty()) {
+    return ReplaceWaterKeyedSettingProfileReferencesImpl(
+        settings,
+        std::nullopt,
+        profileGroup,
+        previousProfileName,
+        nextProfileName);
+}
+
+std::size_t ReplaceWaterKeyedSettingProfileReferences(
+    std::span<WaterKeyedSettingTrack> settings,
+    WaterKeyedFeatureKind featureKind,
+    std::string_view profileGroup,
+    std::string_view previousProfileName,
+    std::string_view nextProfileName) {
+    return ReplaceWaterKeyedSettingProfileReferencesImpl(
+        settings,
+        featureKind,
+        profileGroup,
+        previousProfileName,
+        nextProfileName);
+}
+
+std::size_t CanonicalizeWaterFeatureProfileMetadata(
+    std::span<WaterFeatureTimingRun> runs,
+    std::span<const WaterKeyedFeatureId> features,
+    std::string_view profileGroup,
+    std::string_view profileName) {
+    const auto group = TrimSeepageName(profileGroup);
+    const auto name = TrimSeepageName(profileName);
+    if (features.empty() || group.empty() || name.empty()) {
         return 0U;
     }
-    std::size_t replacementCount = 0U;
-    for (auto& setting : settings) {
-        if (setting.profileGroup != profileGroup ||
-            TrimSeepageName(setting.profileName) != previous) {
-            continue;
+    std::size_t changed = 0U;
+    for (auto& run : runs) {
+        for (auto& timeline : run.features) {
+            if (std::find(features.begin(), features.end(), timeline.feature) ==
+                features.end()) {
+                continue;
+            }
+            for (auto& track : timeline.settings) {
+                if (!WaterKeyedSettingBelongsToProfileGroup(
+                        track,
+                        timeline.feature.kind,
+                        group) ||
+                    (track.profileGroup == group &&
+                     track.profileName == name)) {
+                    continue;
+                }
+                track.profileGroup = std::string{group};
+                track.profileName = std::string{name};
+                ++changed;
+            }
         }
-        setting.profileName = std::string{next};
-        ++replacementCount;
     }
-    return replacementCount;
+    return changed;
 }
 
 std::string WaterKeyedSettingsProfileSavedName(
@@ -11412,13 +11617,19 @@ ResolveWaterSeepageNodeSettingsProfileBaseline(
         baseName = TrimSeepageName(assignedCopy->baseProfileName);
     } else {
         constexpr std::string_view kEditedSuffix = "_edited";
-        if (!assigned.ends_with(kEditedSuffix) ||
-            assigned.size() == kEditedSuffix.size()) {
+        constexpr std::string_view kLegacyEditedSuffix = "_Edited";
+        const auto suffix = assigned.ends_with(kEditedSuffix)
+                                ? kEditedSuffix
+                                : (assigned.ends_with(
+                                       kLegacyEditedSuffix)
+                                       ? kLegacyEditedSuffix
+                                       : std::string_view{});
+        if (suffix.empty() || assigned.size() == suffix.size()) {
             return std::nullopt;
         }
         baseName = assigned.substr(
             0U,
-            assigned.size() - kEditedSuffix.size());
+            assigned.size() - suffix.size());
     }
 
     if (baseName.empty() || baseName == "Default") {

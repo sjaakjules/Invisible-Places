@@ -532,6 +532,94 @@ TEST_CASE("Seepage local look names are stable and padded", "[water][seepage][na
     CHECK(WaterSeepageLocalLookName("  ", 4U) == "Default_04");
 }
 
+TEST_CASE("Seepage object profile descriptors preserve exact bases and owner safety",
+          "[water][seepage][profiles][promotion]") {
+    using invisible_places::water::DescribeWaterObjectProfileEdit;
+    using invisible_places::water::WaterObjectProfileIdentity;
+
+    const WaterObjectProfileIdentity ownedCopy{
+        .name = "Wet Rock_Front Edge",
+        .ownerObjectId = 20U,
+        .baseProfileName = " Wet Rock_preset ",
+    };
+    const auto owned = DescribeWaterObjectProfileEdit(
+        " Wet Rock_Front Edge ",
+        20U,
+        ownedCopy);
+    CHECK(owned.assignedProfileName == "Wet Rock_Front Edge");
+    CHECK(owned.exactBaseProfileName == "Wet Rock_preset");
+    CHECK(owned.suggestedSaveProfileName == "Wet Rock");
+    CHECK(owned.removableWorkingProfileName == "Wet Rock_Front Edge");
+    CHECK(owned.assignedObjectCopy);
+    CHECK(owned.ownedObjectCopy);
+    CHECK_FALSE(owned.legacyEditedShadow);
+
+    const auto foreign = DescribeWaterObjectProfileEdit(
+        "Wet Rock_Front Edge",
+        21U,
+        ownedCopy);
+    CHECK(foreign.assignedObjectCopy);
+    CHECK_FALSE(foreign.ownedObjectCopy);
+    CHECK(foreign.exactBaseProfileName == "Wet Rock_preset");
+    CHECK(foreign.suggestedSaveProfileName == "Wet Rock");
+    CHECK(foreign.removableWorkingProfileName.empty());
+
+    const auto legacy = DescribeWaterObjectProfileEdit(
+        " Still-Subtle-02_Edited ",
+        20U);
+    CHECK(legacy.assignedProfileName == "Still-Subtle-02_Edited");
+    CHECK(legacy.exactBaseProfileName == "Still-Subtle-02");
+    CHECK(legacy.suggestedSaveProfileName == "Still-Subtle-02");
+    CHECK(legacy.removableWorkingProfileName ==
+          "Still-Subtle-02_Edited");
+    CHECK(legacy.legacyEditedShadow);
+    CHECK_FALSE(legacy.assignedObjectCopy);
+
+    // Editing the legacy shadow must fork a modern owner copy from the saved
+    // base, never from the temporary `_Edited` profile. The resulting copy's
+    // Save and Discard destinations remain the same reusable base.
+    const WaterObjectProfileIdentity modernizedLegacyCopy{
+        .name = "Still-Subtle-02_Front Edge",
+        .ownerObjectId = 20U,
+        .baseProfileName = legacy.exactBaseProfileName,
+    };
+    const auto modernized = DescribeWaterObjectProfileEdit(
+        modernizedLegacyCopy.name,
+        20U,
+        modernizedLegacyCopy);
+    CHECK(modernized.assignedObjectCopy);
+    CHECK(modernized.ownedObjectCopy);
+    CHECK(modernized.exactBaseProfileName == "Still-Subtle-02");
+    CHECK(modernized.suggestedSaveProfileName == "Still-Subtle-02");
+    CHECK(modernized.removableWorkingProfileName ==
+          "Still-Subtle-02_Front Edge");
+
+    const auto preset = DescribeWaterObjectProfileEdit(
+        " Wet Rock_preset ",
+        20U);
+    CHECK(preset.exactBaseProfileName == "Wet Rock_preset");
+    CHECK(preset.suggestedSaveProfileName == "Wet Rock");
+    CHECK(preset.removableWorkingProfileName.empty());
+
+    const auto empty = DescribeWaterObjectProfileEdit("  ", 20U);
+    CHECK(empty.assignedProfileName == "Default");
+    CHECK(empty.exactBaseProfileName == "Default");
+    CHECK(empty.suggestedSaveProfileName == "Default");
+
+    const WaterObjectProfileIdentity mismatchedCopy{
+        .name = "Another Copy",
+        .ownerObjectId = 20U,
+        .baseProfileName = "Wrong Base",
+    };
+    const auto mismatched = DescribeWaterObjectProfileEdit(
+        "Saved Base",
+        20U,
+        mismatchedCopy);
+    CHECK_FALSE(mismatched.assignedObjectCopy);
+    CHECK(mismatched.exactBaseProfileName == "Saved Base");
+    CHECK(mismatched.removableWorkingProfileName.empty());
+}
+
 TEST_CASE("Seepage edited shadow profiles leave the saved profile untouched", "[water][seepage][profiles]") {
     using Catch::Approx;
     using invisible_places::water::ResolveWaterSeepageLook;
@@ -612,6 +700,14 @@ TEST_CASE("Seepage Node Settings object edits resolve their saved baseline",
             "Still-Subtle-02_edited");
     REQUIRE(legacyBaseline.has_value());
     CHECK(legacyBaseline->strength == Catch::Approx(1.05F));
+
+    const auto uppercaseLegacyBaseline =
+        ResolveWaterSeepageNodeSettingsProfileBaseline(
+            defaults,
+            profiles,
+            "Still-Subtle-02_Edited");
+    REQUIRE(uppercaseLegacyBaseline.has_value());
+    CHECK(uppercaseLegacyBaseline->strength == Catch::Approx(1.05F));
 
     const auto defaultBaseline =
         ResolveWaterSeepageNodeSettingsProfileBaseline(

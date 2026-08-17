@@ -8,12 +8,14 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -2185,6 +2187,444 @@ TEST_CASE("Dynamic keyed tracks follow renamed Seepage profiles",
               "Ignored") == 0U);
     CHECK(tracks[0].profileName == "Renamed Look");
     CHECK(tracks[1].profileName == "Another Look");
+}
+
+TEST_CASE("Seepage profile reference transactions include dormant tracks and packages",
+          "[water][timing][keyed][profiles][references]") {
+    using invisible_places::timing::ReplaceTimingWaterProfileReferences;
+    using invisible_places::timing::TimingTakeSceneState;
+    using invisible_places::water::WaterFeatureTimeline;
+    using invisible_places::water::WaterFeatureTimingRun;
+    using invisible_places::water::WaterKeyedFeatureKind;
+    using invisible_places::water::WaterKeyedSettingTrack;
+    using invisible_places::water::WaterKeyedSettingsProfile;
+    using invisible_places::water::WaterScenarioFeatureRuns;
+
+    const auto feature = invisible_places::water::WaterKeyedFeatureId{
+        .kind = WaterKeyedFeatureKind::SeepageNode,
+        .objectId = 20U,
+    };
+    WaterFeatureTimingRun legacyRun{
+        .id = 1U,
+        .features = {{
+            .feature = feature,
+            .settings = {
+                {.settingId = "look.wetness",
+                 .active = true,
+                 .profileGroup = "seepage_look",
+                 .profileName = "Old Look",
+                 .keys = {{.position = 0.2F, .value = 0.4F}}},
+                {.settingId = "look.glisten",
+                 .active = false,
+                 .profileGroup = "seepage_look",
+                 .profileName = "Old Look",
+                 .keys = {{.position = 0.7F, .value = 0.8F}}},
+                {.settingId = "response.intensity",
+                 .active = false,
+                 .profileGroup = "seepage_response",
+                 .profileName = "Old Look"},
+            },
+        }},
+    };
+    std::vector<WaterScenarioFeatureRuns> legacyScenarios{{
+        .scenarioId = "legacy",
+        .runs = {legacyRun},
+    }};
+    std::vector<TimingTakeSceneState> takeStates{{
+        .takeId = "take-1",
+        .waterFeatureTimingRuns = {{
+            .id = 2U,
+            .features = {{
+                .feature = feature,
+                .settings = {{
+                    .settingId = "look.breakup",
+                    .active = false,
+                    .profileGroup = "seepage_look",
+                    .profileName = "Old Look",
+                    .keys = {{.position = 0.5F, .value = 0.6F}},
+                }},
+            }},
+        }},
+    }};
+    std::vector<WaterKeyedSettingsProfile> packages{{
+        .name = "Finish",
+        .featureKind = WaterKeyedFeatureKind::SeepageNode,
+        .settings = {{
+            .settingId = "look.density",
+            .active = false,
+            .profileGroup = "seepage_look",
+            .profileName = "Old Look",
+            .keys = {{.position = 1.0F, .value = 0.0F}},
+        }},
+    }};
+
+    const auto counts = ReplaceTimingWaterProfileReferences(
+        legacyScenarios,
+        takeStates,
+        packages,
+        "seepage_look",
+        "Old Look",
+        "Saved Look");
+    CHECK(counts.legacyScenarioTracks == 2U);
+    CHECK(counts.timingTakeTracks == 1U);
+    CHECK(counts.keyedPackageTracks == 1U);
+    CHECK(counts.total() == 4U);
+    CHECK(legacyScenarios[0].runs[0].features[0].settings[0].profileName ==
+          "Saved Look");
+    CHECK(legacyScenarios[0].runs[0].features[0].settings[1].profileName ==
+          "Saved Look");
+    CHECK_FALSE(
+        legacyScenarios[0].runs[0].features[0].settings[1].active);
+    CHECK(legacyScenarios[0].runs[0].features[0].settings[1].keys[0].position ==
+          Catch::Approx(0.7F));
+    CHECK(legacyScenarios[0].runs[0].features[0].settings[2].profileName ==
+          "Old Look");
+    CHECK(takeStates[0].waterFeatureTimingRuns[0]
+              .features[0]
+              .settings[0]
+              .profileName == "Saved Look");
+    CHECK_FALSE(takeStates[0]
+                    .waterFeatureTimingRuns[0]
+                    .features[0]
+                    .settings[0]
+                    .active);
+    CHECK(packages[0].settings[0].profileName == "Saved Look");
+    CHECK_FALSE(packages[0].settings[0].active);
+    CHECK(packages[0].settings[0].keys[0].value == Catch::Approx(0.0F));
+}
+
+TEST_CASE("Seepage transactions classify blank legacy metadata in every persisted store",
+          "[water][timing][keyed][profiles][references][migration]") {
+    using invisible_places::timing::ReplaceTimingWaterProfileReferences;
+    using invisible_places::timing::TimingTakeSceneState;
+    using invisible_places::water::WaterKeyedFeatureId;
+    using invisible_places::water::WaterKeyedFeatureKind;
+    using invisible_places::water::WaterKeyedSettingsProfile;
+    using invisible_places::water::WaterScenarioFeatureRuns;
+
+    struct ProfileHalfCase {
+        std::string_view group;
+        std::string_view settingId;
+        std::string_view unrelatedSettingId;
+    };
+    constexpr std::array profileHalves{
+        ProfileHalfCase{
+            .group = "seepage_node_settings",
+            .settingId = "strength",
+            .unrelatedSettingId = "look.wetness",
+        },
+        ProfileHalfCase{
+            .group = "seepage_look",
+            .settingId = "look.wetness",
+            .unrelatedSettingId = "response.intensity",
+        },
+        ProfileHalfCase{
+            .group = "seepage_response",
+            .settingId = "response.intensity",
+            .unrelatedSettingId = "look.wetness",
+        },
+    };
+
+    const WaterKeyedFeatureId seepageFeature{
+        .kind = WaterKeyedFeatureKind::SeepageNode,
+        .objectId = 20U,
+    };
+    const WaterKeyedFeatureId flowFeature{
+        .kind = WaterKeyedFeatureKind::FlowPath,
+        .objectId = 30U,
+    };
+    for (const auto& profileHalf : profileHalves) {
+        CAPTURE(profileHalf.group, profileHalf.settingId);
+        std::vector<WaterScenarioFeatureRuns> legacyScenarios{{
+            .scenarioId = "legacy",
+            .runs = {{
+                .id = 1U,
+                .features = {
+                    {
+                        .feature = seepageFeature,
+                        .settings = {
+                            {.settingId = std::string{profileHalf.settingId},
+                             .active = false,
+                             .profileName = "Working"},
+                            {.settingId = std::string{
+                                 profileHalf.unrelatedSettingId},
+                             .active = false,
+                             .profileName = "Working"},
+                        },
+                    },
+                    {
+                        .feature = flowFeature,
+                        .settings = {{
+                            .settingId = std::string{profileHalf.settingId},
+                            .active = false,
+                            .profileName = "Working",
+                        }},
+                    },
+                },
+            }},
+        }};
+        std::vector<TimingTakeSceneState> takeStates{{
+            .takeId = "take-1",
+            .waterFeatureTimingRuns = {{
+                .id = 2U,
+                .features = {{
+                    .feature = seepageFeature,
+                    .settings = {
+                        {.settingId = std::string{profileHalf.settingId},
+                         .active = false,
+                         .profileName = "Working"},
+                        {.settingId = std::string{
+                             profileHalf.unrelatedSettingId},
+                         .active = false,
+                         .profileName = "Working"},
+                    },
+                }},
+            }},
+        }};
+        std::vector<WaterKeyedSettingsProfile> packages{
+            {
+                .name = "Seepage Finish",
+                .featureKind = WaterKeyedFeatureKind::SeepageNode,
+                .settings = {
+                    {.settingId = std::string{profileHalf.settingId},
+                     .active = false,
+                     .profileName = "Working"},
+                    {.settingId = std::string{
+                         profileHalf.unrelatedSettingId},
+                     .active = false,
+                     .profileName = "Working"},
+                },
+            },
+            {
+                .name = "Flow Finish",
+                .featureKind = WaterKeyedFeatureKind::FlowPath,
+                .settings = {{
+                    .settingId = std::string{profileHalf.settingId},
+                    .active = false,
+                    .profileName = "Working",
+                }},
+            },
+        };
+
+        const auto counts = ReplaceTimingWaterProfileReferences(
+            legacyScenarios,
+            takeStates,
+            packages,
+            profileHalf.group,
+            "Working",
+            "Saved");
+        CHECK(counts.legacyScenarioTracks == 1U);
+        CHECK(counts.timingTakeTracks == 1U);
+        CHECK(counts.keyedPackageTracks == 1U);
+
+        const auto& legacySettings =
+            legacyScenarios[0].runs[0].features[0].settings;
+        CHECK(legacySettings[0].profileGroup == profileHalf.group);
+        CHECK(legacySettings[0].profileName == "Saved");
+        CHECK_FALSE(legacySettings[0].active);
+        CHECK(legacySettings[1].profileGroup.empty());
+        CHECK(legacySettings[1].profileName == "Working");
+        CHECK(legacyScenarios[0]
+                  .runs[0]
+                  .features[1]
+                  .settings[0]
+                  .profileGroup.empty());
+        CHECK(legacyScenarios[0]
+                  .runs[0]
+                  .features[1]
+                  .settings[0]
+                  .profileName == "Working");
+
+        const auto& takeSettings = takeStates[0]
+                                       .waterFeatureTimingRuns[0]
+                                       .features[0]
+                                       .settings;
+        CHECK(takeSettings[0].profileGroup == profileHalf.group);
+        CHECK(takeSettings[0].profileName == "Saved");
+        CHECK_FALSE(takeSettings[0].active);
+        CHECK(takeSettings[1].profileGroup.empty());
+        CHECK(takeSettings[1].profileName == "Working");
+
+        CHECK(packages[0].settings[0].profileGroup == profileHalf.group);
+        CHECK(packages[0].settings[0].profileName == "Saved");
+        CHECK_FALSE(packages[0].settings[0].active);
+        CHECK(packages[0].settings[1].profileGroup.empty());
+        CHECK(packages[0].settings[1].profileName == "Working");
+        CHECK(packages[1].settings[0].profileGroup.empty());
+        CHECK(packages[1].settings[0].profileName == "Working");
+    }
+}
+
+TEST_CASE("Legacy uppercase Seepage edits promote every exact reference before removal",
+          "[water][timing][keyed][profiles][references][migration]") {
+    using invisible_places::timing::ReplaceTimingWaterProfileReferences;
+    using invisible_places::timing::TimingTakeSceneState;
+    using invisible_places::water::DescribeWaterObjectProfileEdit;
+    using invisible_places::water::ReplaceWaterSeepageNodeProfileReferences;
+    using invisible_places::water::WaterKeyedFeatureKind;
+    using invisible_places::water::WaterKeyedSettingsProfile;
+    using invisible_places::water::WaterScenarioFeatureRuns;
+    using invisible_places::water::WaterSeepageNode;
+    using invisible_places::water::WaterSeepageProfileHalf;
+
+    const auto descriptor = DescribeWaterObjectProfileEdit(
+        " Wet Rock_Edited ",
+        20U);
+    REQUIRE(descriptor.legacyEditedShadow);
+    CHECK(descriptor.removableWorkingProfileName == "Wet Rock_Edited");
+    CHECK(descriptor.exactBaseProfileName == "Wet Rock");
+
+    const auto feature = invisible_places::water::WaterKeyedFeatureId{
+        .kind = WaterKeyedFeatureKind::SeepageNode,
+        .objectId = 20U,
+    };
+    std::vector<WaterSeepageNode> nodes(2U);
+    nodes[0].id = 20U;
+    nodes[0].lookProfileName = " Wet Rock_Edited ";
+    nodes[1].id = 21U;
+    nodes[1].lookProfileName = "Wet Rock_edited";
+    std::vector<WaterScenarioFeatureRuns> legacyScenarios{{
+        .scenarioId = "legacy",
+        .runs = {{
+            .id = 1U,
+            .features = {{
+                .feature = feature,
+                .settings = {{
+                    .settingId = "look.wetness",
+                    .active = false,
+                    .profileGroup = "seepage_look",
+                    .profileName = "Wet Rock_Edited",
+                }, {
+                    .settingId = "look.density",
+                    .active = false,
+                    .profileGroup = "seepage_look",
+                    .profileName = "Wet Rock_edited",
+                }},
+            }},
+        }},
+    }};
+    std::vector<TimingTakeSceneState> takeStates{{
+        .takeId = "take-1",
+        .waterFeatureTimingRuns = {{
+            .id = 2U,
+            .features = {{
+                .feature = feature,
+                .settings = {{
+                    .settingId = "look.glisten",
+                    .active = true,
+                    .profileGroup = "seepage_look",
+                    .profileName = "Wet Rock_Edited",
+                }},
+            }},
+        }},
+    }};
+    std::vector<WaterKeyedSettingsProfile> packages{{
+        .name = "Finish",
+        .featureKind = WaterKeyedFeatureKind::SeepageNode,
+        .settings = {{
+            .settingId = "look.density",
+            .active = false,
+            .profileGroup = "seepage_look",
+            .profileName = "Wet Rock_Edited",
+        }, {
+            .settingId = "look.breakup",
+            .active = false,
+            .profileGroup = "seepage_look",
+            .profileName = "Wet Rock_edited",
+        }},
+    }};
+
+    CHECK(ReplaceWaterSeepageNodeProfileReferences(
+              nodes,
+              WaterSeepageProfileHalf::Look,
+              descriptor.removableWorkingProfileName,
+              descriptor.exactBaseProfileName) == 1U);
+    const auto counts = ReplaceTimingWaterProfileReferences(
+        legacyScenarios,
+        takeStates,
+        packages,
+        "seepage_look",
+        descriptor.removableWorkingProfileName,
+        descriptor.exactBaseProfileName);
+    CHECK(counts.legacyScenarioTracks == 1U);
+    CHECK(counts.timingTakeTracks == 1U);
+    CHECK(counts.keyedPackageTracks == 1U);
+    CHECK(nodes[0].lookProfileName == "Wet Rock");
+    CHECK(nodes[1].lookProfileName == "Wet Rock_edited");
+    CHECK(legacyScenarios[0].runs[0].features[0].settings[0].profileName ==
+          "Wet Rock");
+    CHECK(legacyScenarios[0].runs[0].features[0].settings[1].profileName ==
+          "Wet Rock_edited");
+    CHECK(takeStates[0].waterFeatureTimingRuns[0]
+              .features[0]
+              .settings[0]
+              .profileName == "Wet Rock");
+    CHECK(packages[0].settings[0].profileName == "Wet Rock");
+    CHECK(packages[0].settings[1].profileName == "Wet Rock_edited");
+}
+
+TEST_CASE("Blank legacy Seepage track metadata is classified per profile half",
+          "[water][timing][keyed][profiles][references][migration]") {
+    using invisible_places::water::CanonicalizeWaterFeatureProfileMetadata;
+    using invisible_places::water::WaterFeatureTimingRun;
+    using invisible_places::water::WaterKeyedFeatureId;
+    using invisible_places::water::WaterKeyedFeatureKind;
+
+    const WaterKeyedFeatureId selected{
+        .kind = WaterKeyedFeatureKind::SeepageNode,
+        .objectId = 20U,
+    };
+    std::vector<WaterFeatureTimingRun> runs{{
+        .id = 1U,
+        .features = {{
+            .feature = selected,
+            .settings = {
+                {.settingId = "strength",
+                 .active = false,
+                 .profileName = "Stale Settings"},
+                {.settingId = "look.trickle_width",
+                 .active = false,
+                 .profileName = "Stale Look"},
+                {.settingId = "response.intensity",
+                 .active = false,
+                 .profileName = "Stale Response"},
+            },
+        }},
+    }};
+    const std::array features{selected};
+
+    CHECK(CanonicalizeWaterFeatureProfileMetadata(
+              runs,
+              features,
+              "seepage_node_settings",
+              "Saved Settings") == 1U);
+    CHECK(runs[0].features[0].settings[0].profileGroup ==
+          "seepage_node_settings");
+    CHECK(runs[0].features[0].settings[0].profileName == "Saved Settings");
+    CHECK(runs[0].features[0].settings[1].profileGroup.empty());
+    CHECK(runs[0].features[0].settings[2].profileGroup.empty());
+
+    CHECK(CanonicalizeWaterFeatureProfileMetadata(
+              runs,
+              features,
+              "seepage_look",
+              "Saved Look") == 1U);
+    CHECK(runs[0].features[0].settings[1].profileGroup == "seepage_look");
+    CHECK(runs[0].features[0].settings[1].profileName == "Saved Look");
+    CHECK(runs[0].features[0].settings[2].profileGroup.empty());
+
+    CHECK(CanonicalizeWaterFeatureProfileMetadata(
+              runs,
+              features,
+              "seepage_response",
+              "Saved Response") == 1U);
+    CHECK(runs[0].features[0].settings[2].profileGroup ==
+          "seepage_response");
+    CHECK(runs[0].features[0].settings[2].profileName ==
+          "Saved Response");
+    CHECK_FALSE(runs[0].features[0].settings[0].active);
+    CHECK_FALSE(runs[0].features[0].settings[1].active);
+    CHECK_FALSE(runs[0].features[0].settings[2].active);
 }
 
 TEST_CASE("Schema 46 timing tracks migrate with active legacy defaults",

@@ -365,6 +365,41 @@ struct TimingColouriseLayerSample {
     float colouriseAmount = 0.0F;
 };
 
+struct TimingWaterProfileReferenceRewriteCounts {
+    std::size_t legacyScenarioTracks = 0U;
+    std::size_t timingTakeTracks = 0U;
+    std::size_t keyedPackageTracks = 0U;
+
+    [[nodiscard]] std::size_t total() const {
+        return legacyScenarioTracks + timingTakeTracks +
+               keyedPackageTracks;
+    }
+};
+
+// Rebinds one dynamic Water profile through every persisted timing store.
+// Dormant tracks and reusable keyed packages are deliberately retained and
+// rewritten with the active tracks.
+[[nodiscard]] TimingWaterProfileReferenceRewriteCounts
+ReplaceTimingWaterProfileReferences(
+    std::span<invisible_places::water::WaterScenarioFeatureRuns>
+        legacyScenarios,
+    std::span<TimingTakeSceneState> timingTakeStates,
+    std::span<invisible_places::water::WaterKeyedSettingsProfile>
+        keyedPackages,
+    std::string_view profileGroup,
+    std::string_view previousProfileName,
+    std::string_view nextProfileName);
+
+// Canonicalizes the selected features' matching profile tracks across both
+// live stores without changing reusable packages or unrelated features.
+[[nodiscard]] std::size_t CanonicalizeTimingWaterFeatureProfileMetadata(
+    std::span<invisible_places::water::WaterScenarioFeatureRuns>
+        legacyScenarios,
+    std::span<TimingTakeSceneState> timingTakeStates,
+    std::span<const invisible_places::water::WaterKeyedFeatureId> features,
+    std::string_view profileGroup,
+    std::string_view profileName);
+
 [[nodiscard]] std::string NormalizeTimingTakeId(std::string_view takeId);
 [[nodiscard]] TimingTakeDefinition AuthoredTimingTakeDefinition();
 
