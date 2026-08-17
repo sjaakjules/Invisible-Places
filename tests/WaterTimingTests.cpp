@@ -1785,8 +1785,8 @@ TEST_CASE("Per-scenario feature timing runs round-trip through the project docum
             .settingId = "strength",
             .active = false,
             .label = "Node Strength",
-            .profileGroup = "seepage_look",
-            .profileName = "Wet Rock",
+            .profileGroup = "seepage_node_settings",
+            .profileName = "Wide Footprint",
             .keys = {
                 {.position = 0.20F,
                  .value = 0.0F,
@@ -1852,8 +1852,10 @@ TEST_CASE("Per-scenario feature timing runs round-trip through the project docum
     REQUIRE(timeline.settings.size() == 1U);
     CHECK_FALSE(timeline.settings.front().active);
     CHECK(timeline.settings.front().label == "Node Strength");
-    CHECK(timeline.settings.front().profileGroup == "seepage_look");
-    CHECK(timeline.settings.front().profileName == "Wet Rock");
+    CHECK(
+        timeline.settings.front().profileGroup ==
+        "seepage_node_settings");
+    CHECK(timeline.settings.front().profileName == "Wide Footprint");
     REQUIRE(timeline.settings.front().keys.size() == 2U);
     CHECK(timeline.settings.front().keys[0].position == Approx(0.20F));
     CHECK(timeline.settings.front().keys[0].interpolation ==
@@ -2150,6 +2152,9 @@ TEST_CASE("Dynamic keyed tracks follow renamed Seepage profiles",
          .profileName = "Old Look"},
         {.settingId = "strength",
          .profileName = "Old Look"},
+        {.settingId = "strength",
+         .profileGroup = "seepage_node_settings",
+         .profileName = " Old Settings "},
     };
 
     CHECK(ReplaceWaterKeyedSettingProfileReferences(
@@ -2161,6 +2166,17 @@ TEST_CASE("Dynamic keyed tracks follow renamed Seepage profiles",
     CHECK(tracks[1].profileName == "Another Look");
     CHECK(tracks[2].profileName == "Old Look");
     CHECK(tracks[3].profileName == "Old Look");
+    CHECK(tracks[4].profileName == " Old Settings ");
+
+    CHECK(ReplaceWaterKeyedSettingProfileReferences(
+              tracks,
+              "seepage_node_settings",
+              "Old Settings",
+              "Renamed Settings") == 1U);
+    CHECK(tracks[0].profileName == "Renamed Look");
+    CHECK(tracks[2].profileName == "Old Look");
+    CHECK(tracks[3].profileName == "Old Look");
+    CHECK(tracks[4].profileName == "Renamed Settings");
 
     CHECK(ReplaceWaterKeyedSettingProfileReferences(
               tracks,

@@ -16210,8 +16210,8 @@ WaterFlowObjectProfileRemoval RemoveWaterFlowSourceObjectProfiles(
 
 // ---------------------------------------------------------------------------
 // Seepage object-copy helpers: the same per-object fork model over the
-// node-referenced look/response libraries. Renames and removals also follow
-// keyed profile tracks, which reference these profiles by (group, name).
+// node-referenced settings/look/response libraries. Renames and removals also
+// follow keyed profile tracks, which reference these profiles by (group, name).
 // ---------------------------------------------------------------------------
 
 void ReplaceWaterSeepageProfileReferences(
@@ -16297,6 +16297,34 @@ void ReplaceWaterSeepageNodeSettingsProfileReferences(
         invisible_places::water::ApplyWaterSeepageNodeSettings(
             settings,
             &node);
+    }
+    constexpr std::string_view kProfileGroup =
+        "seepage_node_settings";
+    const auto replaceInRuns = [&](auto& runs) {
+        for (auto& run : runs) {
+            for (auto& feature : run.features) {
+                (void)invisible_places::water::
+                    ReplaceWaterKeyedSettingProfileReferences(
+                        feature.settings,
+                        kProfileGroup,
+                        previous,
+                        nextName);
+            }
+        }
+    };
+    for (auto& entry : water->featureTimingRunsByScenario) {
+        replaceInRuns(entry.runs);
+    }
+    for (auto& state : water->timingTakeSceneStates) {
+        replaceInRuns(state.waterFeatureTimingRuns);
+    }
+    for (auto& profile : water->keyedSettingsProfiles) {
+        (void)invisible_places::water::
+            ReplaceWaterKeyedSettingProfileReferences(
+                profile.settings,
+                kProfileGroup,
+                previous,
+                nextName);
     }
 }
 
@@ -26909,15 +26937,16 @@ bool ApplyProjectDocumentToRuntime(
         document.waterKeyedSettingsProfiles;
     runtimeState->water.nextFeatureTimingRunSequence =
         document.waterFeatureTimingRunSequence;
-    // After nodes, profiles, and keyed tracks are all loaded so orphan drops
-    // and owner-rename syncs can rewrite every reference kind.
+    runtimeState->water.timingTakeSceneStates =
+        document.timingTakeStates;
+    // After nodes, profiles, legacy tracks, canonical Timing Take states, and
+    // keyed packages are all loaded so reconciliation can rewrite every
+    // reference kind.
     ReconcileWaterSeepageObjectProfiles(&runtimeState->water);
     runtimeState->water.timingTakes = document.timingTakes;
     runtimeState->water.selectedTimingTakeId =
         invisible_places::timing::NormalizeTimingTakeId(
             document.selectedTimingTakeId);
-    runtimeState->water.timingTakeSceneStates =
-        document.timingTakeStates;
     runtimeState->water.savedTimingColourisePalettes =
         document.timingColourisePalettes;
     runtimeState->water.timingScalarBoundsStores =
@@ -75854,6 +75883,7 @@ void DrawWaterSeepagePanel(
                                               float minimumValue,
                                               float maximumValue,
                                               const char* format,
+                                              const std::optional<float>& baseValue,
                                               ImGuiSliderFlags flags,
                                               auto&& clampForNode) {
             float value = node->*field;
@@ -75870,7 +75900,13 @@ void DrawWaterSeepagePanel(
                     &value,
                     minimumValue,
                     maximumValue,
-                    mixed ? "different" : format,
+                    mixed
+                        ? "different"
+                        : WaterProfileValueFormat(
+                              format,
+                              value,
+                              baseValue)
+                              .c_str(),
                     flags)) {
                 return false;
             }
@@ -75896,6 +75932,7 @@ void DrawWaterSeepagePanel(
                                           float minimumValue,
                                           float maximumValue,
                                           const char* format,
+                                          const std::optional<float>& baseValue,
                                           ImGuiSliderFlags flags,
                                           const char* semanticHelp,
                                           auto&& clampForNode) {
@@ -75931,13 +75968,48 @@ void DrawWaterSeepagePanel(
                 value,
                 minimumValue,
                 maximumValue,
-                format,
+                WaterProfileValueFormat(
+                    format,
+                    value,
+                    baseValue)
+                    .c_str(),
                 flags,
                 mixed,
                 &edited,
-                {},
-                {},
+                "seepage_node_settings",
+                node->settingsProfileName,
                 semanticHelp);
+            if (result.keyedChanged || result.keyingStateChanged) {
+                // The shared slider call initially uses the primary profile;
+                // preserve each selected node's own metadata when a mixed
+                // selection writes or toggles tracks together.
+                const auto scenarioId =
+                    ActiveWaterTimingScenarioId(*runtimeState);
+                for (const auto index : selectedSeepageIndices) {
+                    const auto& target = water.seepageNodes[index];
+                    auto* timeline = FindMutableWaterFeatureTimeline(
+                        &water,
+                        scenarioId,
+                        {.kind = invisible_places::water::
+                             WaterKeyedFeatureKind::SeepageNode,
+                         .objectId = target.id});
+                    if (timeline == nullptr) {
+                        continue;
+                    }
+                    const auto track = std::find_if(
+                        timeline->settings.begin(),
+                        timeline->settings.end(),
+                        [&](const auto& candidate) {
+                            return candidate.settingId == settingId;
+                        });
+                    if (track != timeline->settings.end()) {
+                        track->profileGroup = "seepage_node_settings";
+                        track->profileName =
+                            NormalizedWaterSeepageProfileName(
+                                target.settingsProfileName);
+                    }
+                }
+            }
             if (!result.authoredChanged) {
                 return false;
             }
@@ -76183,6 +76255,12 @@ void DrawWaterSeepagePanel(
             "Applies the selected footprint, strength, delayed Rain response, and target roles "
             "to every selected node. Name, visibility, export, position, and seed remain "
             "node-specific.");
+        DrawWaterKeyedProfilesCombo(
+            runtimeState,
+            selectedSeepageFeatures.front(),
+            "seepage_node_settings",
+            assignedNodeSettings,
+            "SeepageNodeSettings");
 
         const std::string assignedLook =
             NormalizedWaterSeepageProfileName(node->lookProfileName);
@@ -76290,6 +76368,21 @@ void DrawWaterSeepagePanel(
                 node->settingsProfileName);
         const bool settingsNamesIdentical =
             nodeSettingsProfileNamesIdentical(assignedSettingsName);
+        std::optional<WaterSeepageNodeSettings> settingsBaseline;
+        if (settingsNamesIdentical) {
+            settingsBaseline = invisible_places::water::
+                ResolveWaterSeepageNodeSettingsProfileBaseline(
+                    water.defaultSeepageNodeSettings,
+                    water.seepageNodeSettingsProfiles,
+                    assignedSettingsName);
+        }
+        const auto settingsBaseValue =
+            [&](float WaterSeepageNodeSettings::*field)
+            -> std::optional<float> {
+            return settingsBaseline.has_value()
+                       ? std::optional<float>{settingsBaseline.value().*field}
+                       : std::nullopt;
+        };
         std::vector<WaterSeepageNodeSettings> settingsBeforeEdit;
         settingsBeforeEdit.reserve(selectedSeepageIndices.size());
         for (const auto index : selectedSeepageIndices) {
@@ -76326,6 +76419,7 @@ void DrawWaterSeepagePanel(
             0.01F,
             std::max(0.02F, node->selectionWidthLimitMeters),
             "%.2f m",
+            settingsBaseValue(&WaterSeepageNodeSettings::widthMeters),
             ImGuiSliderFlags_Logarithmic,
             "Width of the always-wet patch around the node. Everywhere beyond it the affected "
             "area comes from Node Strength: wetness follows paths of least resistance across "
@@ -76343,6 +76437,7 @@ void DrawWaterSeepagePanel(
             0.0F,
             3.0F,
             "%.2f",
+            settingsBaseValue(&WaterSeepageNodeSettings::prominence),
             ImGuiSliderFlags_None,
             "How strongly the effect changes the underlying cloud. Prominence never changes "
             "where seepage applies — key it to draw attention to a node or let it fade.",
@@ -76361,6 +76456,8 @@ void DrawWaterSeepagePanel(
                 0.05F,
                 50.0F,
                 "%.2f m",
+                settingsBaseValue(
+                    &WaterSeepageNodeSettings::selectionReachLimitMeters),
                 ImGuiSliderFlags_Logarithmic,
                 noPerNodeClamp);
             EndWaterRegenerativeSettingLabels(nodeInRun);
@@ -76375,6 +76472,8 @@ void DrawWaterSeepagePanel(
                 std::max(0.02F, node->widthMeters),
                 25.0F,
                 "%.2f m",
+                settingsBaseValue(
+                    &WaterSeepageNodeSettings::selectionWidthLimitMeters),
                 ImGuiSliderFlags_Logarithmic,
                 [](const WaterSeepageNode& target, float value) {
                     return std::clamp(
@@ -76397,6 +76496,7 @@ void DrawWaterSeepagePanel(
             0.0F,
             5.0F,
             "%.2f m",
+            settingsBaseValue(&WaterSeepageNodeSettings::edgeFeatherMeters),
             ImGuiSliderFlags_None,
             noPerNodeClamp);
         EndWaterRegenerativeSettingLabels(nodeInRun);
@@ -76410,6 +76510,8 @@ void DrawWaterSeepagePanel(
             0.005F,
             2.0F,
             "%.3f m",
+            settingsBaseValue(
+                &WaterSeepageNodeSettings::depthToleranceMeters),
             ImGuiSliderFlags_Logarithmic,
             noPerNodeClamp);
         EndWaterRegenerativeSettingLabels(nodeInRun);
@@ -76422,6 +76524,7 @@ void DrawWaterSeepagePanel(
             0.0F,
             1.0F,
             "%.2f",
+            settingsBaseValue(&WaterSeepageNodeSettings::normalAlignment),
             ImGuiSliderFlags_None,
             noPerNodeClamp);
         DrawWaterSeepageParameterTooltip(
@@ -76434,6 +76537,7 @@ void DrawWaterSeepagePanel(
             0.0F,
             3.0F,
             "%.2f",
+            settingsBaseValue(&WaterSeepageNodeSettings::strength),
             ImGuiSliderFlags_None,
             "How much water this node carries — strength is the travel budget, and wetness "
             "follows paths of least resistance: it splits into every available downhill route "
@@ -76450,6 +76554,7 @@ void DrawWaterSeepagePanel(
             0.0F,
             120.0F,
             "%.1f s",
+            settingsBaseValue(&WaterSeepageNodeSettings::rainDelaySeconds),
             ImGuiSliderFlags_None,
             "Seconds before this node begins responding to the effective Rain amount.",
             noPerNodeClamp);
@@ -76460,6 +76565,7 @@ void DrawWaterSeepagePanel(
             0.0F,
             120.0F,
             "%.1f s",
+            settingsBaseValue(&WaterSeepageNodeSettings::rainRiseSeconds),
             ImGuiSliderFlags_None,
             "Seconds for this node's Rain envelope to rise toward the effective Rain amount.",
             noPerNodeClamp);
@@ -76470,6 +76576,8 @@ void DrawWaterSeepagePanel(
             0.0F,
             300.0F,
             "%.1f s",
+            settingsBaseValue(
+                &WaterSeepageNodeSettings::rainRecessionSeconds),
             ImGuiSliderFlags_None,
             "Seconds for this node's Rain envelope to decay after Rain falls, allowing wetness effects to finish naturally.",
             noPerNodeClamp);

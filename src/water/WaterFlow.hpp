@@ -1994,6 +1994,15 @@ BuildWaterDynamicMeshFlowGroundEntries(const WaterSurfaceCache& cache);
 void ApplyWaterSeepageNodeSettings(
     const WaterSeepageNodeSettings& settings,
     WaterSeepageNode* node);
+// Returns the saved settings beneath an object-owned copy or a legacy
+// `<base>_edited` shadow. Ordinary saved profiles have no comparison base.
+// A missing/Default base resolves to `defaultSettings`, matching runtime
+// profile fallback behaviour.
+[[nodiscard]] std::optional<WaterSeepageNodeSettings>
+ResolveWaterSeepageNodeSettingsProfileBaseline(
+    const WaterSeepageNodeSettings& defaultSettings,
+    std::span<const WaterSeepageNodeSettingsProfile> profiles,
+    std::string_view assignedProfileName);
 // Applies one scalar Timings-v2 profile sample. IDs beginning with "look."
 // address the look half; "response." addresses the visual-response half.
 // Returns false for an unknown/non-scalar setting.

@@ -11225,6 +11225,47 @@ void ApplyWaterSeepageNodeSettings(
     node->targetSceneRoles = settings.targetSceneRoles;
 }
 
+std::optional<WaterSeepageNodeSettings>
+ResolveWaterSeepageNodeSettingsProfileBaseline(
+    const WaterSeepageNodeSettings& defaultSettings,
+    std::span<const WaterSeepageNodeSettingsProfile> profiles,
+    std::string_view assignedProfileName) {
+    const auto assigned = TrimSeepageName(assignedProfileName);
+    std::string_view baseName;
+    const auto assignedCopy = std::find_if(
+        profiles.begin(),
+        profiles.end(),
+        [&](const WaterSeepageNodeSettingsProfile& profile) {
+            return profile.objectOverride &&
+                   TrimSeepageName(profile.name) == assigned;
+        });
+    if (assignedCopy != profiles.end()) {
+        baseName = TrimSeepageName(assignedCopy->baseProfileName);
+    } else {
+        constexpr std::string_view kEditedSuffix = "_edited";
+        if (!assigned.ends_with(kEditedSuffix) ||
+            assigned.size() == kEditedSuffix.size()) {
+            return std::nullopt;
+        }
+        baseName = assigned.substr(
+            0U,
+            assigned.size() - kEditedSuffix.size());
+    }
+
+    if (baseName.empty() || baseName == "Default") {
+        return defaultSettings;
+    }
+    const auto base = std::find_if(
+        profiles.begin(),
+        profiles.end(),
+        [&](const WaterSeepageNodeSettingsProfile& profile) {
+            return TrimSeepageName(profile.name) == baseName;
+        });
+    return base != profiles.end()
+               ? std::optional<WaterSeepageNodeSettings>{base->settings}
+               : std::optional<WaterSeepageNodeSettings>{defaultSettings};
+}
+
 WaterSeepageLookSettings ResolveWaterSeepageTimingLookBase(
     const WaterSeepageLookSettings& resolvedAuthoredLook,
     const std::optional<WaterScenarioState>& /*scenarioState*/) {

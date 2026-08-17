@@ -562,6 +562,87 @@ TEST_CASE("Seepage edited shadow profiles leave the saved profile untouched", "[
     CHECK(ResolveWaterSeepageLook(node, profiles, {}, {}).baseWetness == Approx(0.78F));
 }
 
+TEST_CASE("Seepage Node Settings object edits resolve their saved baseline",
+          "[water][seepage][profiles][node-settings][baseline]") {
+    using invisible_places::water::
+        ResolveWaterSeepageNodeSettingsProfileBaseline;
+    using invisible_places::water::WaterSeepageNodeSettings;
+    using invisible_places::water::WaterSeepageNodeSettingsProfile;
+
+    WaterSeepageNodeSettings defaults;
+    defaults.strength = 0.25F;
+    defaults.widthMeters = 0.08F;
+    WaterSeepageNodeSettings saved = defaults;
+    saved.strength = 1.05F;
+    saved.widthMeters = 0.12F;
+    WaterSeepageNodeSettings edited = saved;
+    edited.strength = 1.52F;
+    const std::vector<WaterSeepageNodeSettingsProfile> profiles{
+        {.name = "Still-Subtle-02", .settings = saved},
+        {.name = "Still-Subtle-02_Front Edge",
+         .settings = edited,
+         .objectOverride = true,
+         .ownerObjectId = 20U,
+         .baseProfileName = "Still-Subtle-02"},
+        {.name = "Default_Node",
+         .settings = edited,
+         .objectOverride = true,
+         .ownerObjectId = 21U,
+         .baseProfileName = "Default"},
+        {.name = "Missing_Node",
+         .settings = edited,
+         .objectOverride = true,
+         .ownerObjectId = 22U,
+         .baseProfileName = "Missing"},
+    };
+
+    const auto objectBaseline =
+        ResolveWaterSeepageNodeSettingsProfileBaseline(
+            defaults,
+            profiles,
+            " Still-Subtle-02_Front Edge ");
+    REQUIRE(objectBaseline.has_value());
+    CHECK(objectBaseline->strength == Catch::Approx(1.05F));
+    CHECK(objectBaseline->widthMeters == Catch::Approx(0.12F));
+
+    const auto legacyBaseline =
+        ResolveWaterSeepageNodeSettingsProfileBaseline(
+            defaults,
+            profiles,
+            "Still-Subtle-02_edited");
+    REQUIRE(legacyBaseline.has_value());
+    CHECK(legacyBaseline->strength == Catch::Approx(1.05F));
+
+    const auto defaultBaseline =
+        ResolveWaterSeepageNodeSettingsProfileBaseline(
+            defaults,
+            profiles,
+            "Default_Node");
+    REQUIRE(defaultBaseline.has_value());
+    CHECK(defaultBaseline->strength == Catch::Approx(0.25F));
+
+    const auto missingBaseline =
+        ResolveWaterSeepageNodeSettingsProfileBaseline(
+            defaults,
+            profiles,
+            "Missing_Node");
+    REQUIRE(missingBaseline.has_value());
+    CHECK(missingBaseline->strength == Catch::Approx(0.25F));
+
+    CHECK_FALSE(
+        ResolveWaterSeepageNodeSettingsProfileBaseline(
+            defaults,
+            profiles,
+            "Still-Subtle-02")
+            .has_value());
+    CHECK_FALSE(
+        ResolveWaterSeepageNodeSettingsProfileBaseline(
+            defaults,
+            profiles,
+            "Unknown")
+            .has_value());
+}
+
 TEST_CASE("Seepage derives surface-tangent gravity direction", "[water][seepage][direction]") {
     using Catch::Approx;
     using invisible_places::water::DeriveWaterSeepageDownAxis;
