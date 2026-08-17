@@ -8574,6 +8574,46 @@ std::string BindingFieldLabel(
     return "Select Field";
 }
 
+std::string WaterProfileValueFormat(
+    const char* format,
+    float currentValue,
+    const std::optional<float>& baseValue);
+void DrawWaterProfileBaseColourHint(
+    const std::array<float, 3>& currentValue,
+    const std::optional<std::array<float, 3>>& baseValue);
+
+template <std::size_t Size>
+bool WaterProfileColourDiffers(
+    const std::array<float, Size>& current,
+    const std::array<float, Size>& saved) {
+    for (std::size_t index = 0U; index < Size; ++index) {
+        if (std::abs(current[index] - saved[index]) > 1.0e-4F) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void DrawSavedScalarBindingBaseline(
+    const RenderParameterBinding& current,
+    const RenderParameterBinding* savedBase) {
+    if (savedBase == nullptr ||
+        invisible_places::style::
+            ScalarRenderParameterBindingsAuthoringEqual(
+                current,
+                *savedBase)) {
+        return;
+    }
+    const std::string savedDescription = invisible_places::style::
+        DescribeScalarRenderParameterBindingAuthoringState(*savedBase);
+    ImGui::Spacing();
+    ImGui::PushTextWrapPos(0.0F);
+    ImGui::TextDisabled(
+        "Saved base: %s",
+        savedDescription.c_str());
+    ImGui::PopTextWrapPos();
+}
+
 // ---- Visuals field histogram with interactive input bounds ----
 
 // Returns the cached (or lazily computed) histogram entry for one of this
@@ -49548,7 +49588,8 @@ bool DrawColormapSwatch(
 
 bool DrawPointCloudColourSection(
     PreviewRuntimeState* runtimeState,
-    PreviewLayerSession* session) {
+    PreviewLayerSession* session,
+    const PointCloudStyleState* savedBaseStyle = nullptr) {
     if (session == nullptr || !BeginPanelSection("Colour")) {
         return false;
     }
@@ -49563,6 +49604,16 @@ bool DrawPointCloudColourSection(
         if (style.colorMode == PointCloudColorMode::ScalarColormap) {
             EnsureFieldMappedBindingDefaults(&style.colormapPosition, session->scalarFields, 0.0F, 1.0F);
         }
+    }
+    if (savedBaseStyle != nullptr &&
+        savedBaseStyle->colorMode != style.colorMode) {
+        const int savedModeIndex = std::clamp(
+            static_cast<int>(savedBaseStyle->colorMode),
+            0,
+            static_cast<int>(IM_ARRAYSIZE(colorModes)) - 1);
+        ImGui::TextDisabled(
+            "(Saved: %s)",
+            colorModes[savedModeIndex]);
     }
     if (!session->hasSourceRgb && style.colorMode == PointCloudColorMode::SourceRgb) {
         ImGui::TextDisabled("Source RGB is not available on this file.");
@@ -49646,12 +49697,77 @@ bool DrawPointCloudColourSection(
         ImGui::TextDisabled("No scalar fields were discovered for this cloud.");
     }
 
+    if (savedBaseStyle != nullptr &&
+        savedBaseStyle->colorMode == PointCloudColorMode::SolidColor &&
+        (style.colorMode != PointCloudColorMode::SolidColor ||
+         WaterProfileColourDiffers(
+             style.solidColor,
+             savedBaseStyle->solidColor))) {
+        ImGui::TextDisabled(
+            "Saved base solid colour: (%.2f, %.2f, %.2f, %.2f)",
+            savedBaseStyle->solidColor[0],
+            savedBaseStyle->solidColor[1],
+            savedBaseStyle->solidColor[2],
+            savedBaseStyle->solidColor[3]);
+    }
+    if (savedBaseStyle != nullptr &&
+        savedBaseStyle->colorMode ==
+            PointCloudColorMode::ScalarColormap) {
+        if (style.colorMode != PointCloudColorMode::ScalarColormap ||
+            style.colormap != savedBaseStyle->colormap) {
+            ImGui::TextDisabled(
+                "Saved base colormap: %s",
+                PointCloudColormapLabel(savedBaseStyle->colormap));
+        }
+        if (savedBaseStyle->colormap ==
+                PointCloudColormapId::CustomGradient &&
+            (style.colorMode != PointCloudColorMode::ScalarColormap ||
+             style.colormap != PointCloudColormapId::CustomGradient ||
+             WaterProfileColourDiffers(
+                 style.gradientStartColor,
+                 savedBaseStyle->gradientStartColor) ||
+             WaterProfileColourDiffers(
+                 style.gradientEndColor,
+                 savedBaseStyle->gradientEndColor))) {
+            ImGui::TextDisabled(
+                "Saved base gradient: (%.2f, %.2f, %.2f) to "
+                "(%.2f, %.2f, %.2f)",
+                savedBaseStyle->gradientStartColor[0],
+                savedBaseStyle->gradientStartColor[1],
+                savedBaseStyle->gradientStartColor[2],
+                savedBaseStyle->gradientEndColor[0],
+                savedBaseStyle->gradientEndColor[1],
+                savedBaseStyle->gradientEndColor[2]);
+        }
+    }
+
     ImGui::Spacing();
     changed |= ImGui::ColorEdit3("Colourise Colour", style.colorizeColor.data());
+    DrawWaterProfileBaseColourHint(
+        style.colorizeColor,
+        savedBaseStyle != nullptr
+            ? std::optional<std::array<float, 3>>{
+                  savedBaseStyle->colorizeColor}
+            : std::nullopt);
     changed |= DrawRangedFloatControl(
         "Colourise Amount",
         &style.colorizeAmount,
-        {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.3f", .hardMin = 0.0F, .hardMax = 1.0F});
+        {.visualMin = 0.0F,
+         .visualMax = 1.0F,
+         .format = WaterProfileValueFormat(
+             "%.3f",
+             style.colorizeAmount,
+             savedBaseStyle != nullptr
+                 ? std::optional<float>{savedBaseStyle->colorizeAmount}
+                 : std::nullopt)
+                       .c_str(),
+         .hardMin = 0.0F,
+         .hardMax = 1.0F});
+    DrawSavedScalarBindingBaseline(
+        style.colormapPosition,
+        savedBaseStyle != nullptr
+            ? &savedBaseStyle->colormapPosition
+            : nullptr);
 
     EndPanelSection();
     return changed;
@@ -49964,10 +50080,6 @@ bool DrawPointCloudSurfaceMotionSection(PreviewLayerSession* session) {
     return changed;
 }
 
-std::string WaterProfileValueFormat(
-    const char* format,
-    float currentValue,
-    const std::optional<float>& baseValue);
 void DrawWaterProfileBaseBoolHint(
     bool currentValue,
     const std::optional<bool>& baseValue);
@@ -50345,7 +50457,8 @@ bool DrawVisualBindingSection(
     PreviewLayerSession* session,
     RenderParameterBinding* binding,
     const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields,
-    const ScalarBindingWidgetConfig& config) {
+    const ScalarBindingWidgetConfig& config,
+    const RenderParameterBinding* savedBaseBinding = nullptr) {
     bool activeChanged = false;
     if (!BeginPanelSection(sectionLabel, true, binding != nullptr ? &binding->active : nullptr, &activeChanged)) {
         return activeChanged;
@@ -50360,13 +50473,19 @@ bool DrawVisualBindingSection(
             false,
             runtimeState,
             session);
+    if (binding != nullptr) {
+        DrawSavedScalarBindingBaseline(
+            *binding,
+            savedBaseBinding);
+    }
     EndPanelSection();
     return changed;
 }
 
 bool DrawPointCloudEmissionSection(
     PreviewRuntimeState* runtimeState,
-    PreviewLayerSession* session) {
+    PreviewLayerSession* session,
+    const PointCloudStyleState* savedBaseStyle = nullptr) {
     if (session == nullptr) {
         return false;
     }
@@ -50395,7 +50514,21 @@ bool DrawPointCloudEmissionSection(
     changed |= DrawRangedFloatControl(
         "Exposure",
         &style.exposure,
-        {.visualMin = 0.0F, .visualMax = 8.0F, .format = "%.2f", .hardMin = 0.0F});
+        {.visualMin = 0.0F,
+         .visualMax = 8.0F,
+         .format = WaterProfileValueFormat(
+             "%.2f",
+             style.exposure,
+             savedBaseStyle != nullptr
+                 ? std::optional<float>{savedBaseStyle->exposure}
+                 : std::nullopt)
+                       .c_str(),
+         .hardMin = 0.0F});
+    DrawSavedScalarBindingBaseline(
+        style.emissiveStrength,
+        savedBaseStyle != nullptr
+            ? &savedBaseStyle->emissiveStrength
+            : nullptr);
 
     EndPanelSection();
     return changed;
@@ -70612,24 +70745,22 @@ std::optional<WaterFlowTrailSettings> WaterLaneEditorBaseline(
     return std::nullopt;
 }
 
-std::optional<WaterTrailGeometrySettings> WaterTrailEditorBaselineGeometry(
+std::optional<SavedWaterTrailProfileState> WaterTrailEditorBaselineProfile(
     const PreviewRuntimeState& runtimeState,
     const std::string* assignedProfileName) {
     const auto& water = runtimeState.water;
     if (assignedProfileName != nullptr) {
-        if (const auto* copy = FindWaterFlowObjectProfileByName(
+        return WaterTrailProfileByName(
+            runtimeState,
+            WaterFlowObjectEditBaseName(
                 water.trailProfiles,
-                *assignedProfileName);
-            copy != nullptr) {
-            return WaterTrailProfileByName(runtimeState, copy->baseProfileName).geometry;
-        }
-        return std::nullopt;
+                *assignedProfileName,
+                water.selectedTrailProfileName));
     }
     if (water.editedTrailProfile.has_value()) {
         return WaterTrailProfileByName(
-                   runtimeState,
-                   UneditedWaterProfileName(water.selectedTrailProfileName))
-            .geometry;
+            runtimeState,
+            UneditedWaterProfileName(water.selectedTrailProfileName));
     }
     return std::nullopt;
 }
@@ -71213,11 +71344,13 @@ struct WaterTrailStyleEditResult {
 
 // Draws the Trail geometry and style controls without committing; callers
 // decide whether the edit lands in the global edited shadow or a source's
-// object copy. Differing geometry values show the base in brackets.
+// object copy. Differing geometry and adjacent scalar style values show the
+// base in brackets; structural bindings show the complete saved authoring
+// state because a single scalar cannot represent a field mapping.
 WaterTrailStyleEditResult DrawWaterTrailStyleEditorCore(
     PreviewRuntimeState* runtimeState,
     SavedWaterTrailProfileState profile,
-    const std::optional<WaterTrailGeometrySettings>& baselineGeometry) {
+    const std::optional<SavedWaterTrailProfileState>& baselineProfile) {
     WaterTrailStyleEditResult result;
     const auto previousGeometry = profile.geometry;
     bool generationChanged = false;
@@ -71232,15 +71365,15 @@ WaterTrailStyleEditResult DrawWaterTrailStyleEditorCore(
         return WaterProfileValueFormat(
             format,
             current,
-            baselineGeometry.has_value()
-                ? std::optional<float>{baselineGeometry.value().*member}
+            baselineProfile.has_value()
+                ? std::optional<float>{baselineProfile->geometry.*member}
                 : std::nullopt);
     };
     const auto trailBoolHint = [&](bool current, auto member) {
         DrawWaterProfileBaseBoolHint(
             current,
-            baselineGeometry.has_value()
-                ? std::optional<bool>{baselineGeometry.value().*member}
+            baselineProfile.has_value()
+                ? std::optional<bool>{baselineProfile->geometry.*member}
                 : std::nullopt);
     };
     if (DrawWaterSliderFloat(
@@ -71431,11 +71564,22 @@ WaterTrailStyleEditResult DrawWaterTrailStyleEditorCore(
     editSession.hasSourceRgb = true;
     editSession.scalarFields = WaterTrailScalarFieldsForUi(*runtimeState);
     editSession.pointStyle = MakeWaterTrailSessionStyle(profile.style, profile.geometry);
+    std::optional<PointCloudStyleState> savedBaseStyle;
+    if (baselineProfile.has_value()) {
+        savedBaseStyle = MakeWaterTrailSessionStyle(
+            baselineProfile->style,
+            baselineProfile->geometry);
+    }
     bool styleChanged = false;
     // Trail fields are synthetic per-particle values with no resident cloud
     // behind them, so the null runtime/session pair suppresses the field
     // histogram while bounds memory still rides on the binding itself.
-    styleChanged |= DrawPointCloudColourSection(nullptr, &editSession);
+    styleChanged |= DrawPointCloudColourSection(
+        nullptr,
+        &editSession,
+        savedBaseStyle.has_value()
+            ? &savedBaseStyle.value()
+            : nullptr);
     styleChanged |= DrawVisualBindingSection(
         "Opacity",
         "Opacity",
@@ -71450,8 +71594,16 @@ WaterTrailStyleEditResult DrawWaterTrailStyleEditorCore(
          .defaultConstant = 1.0F,
          .format = "%.3f",
          .hardMin = 0.0F,
-         .hardMax = 1.0F});
-    styleChanged |= DrawPointCloudEmissionSection(nullptr, &editSession);
+         .hardMax = 1.0F},
+        savedBaseStyle.has_value()
+            ? &savedBaseStyle->opacity
+            : nullptr);
+    styleChanged |= DrawPointCloudEmissionSection(
+        nullptr,
+        &editSession,
+        savedBaseStyle.has_value()
+            ? &savedBaseStyle.value()
+            : nullptr);
 
     result.generationChanged = generationChanged;
     result.generationRefreshRequested = generationRefreshRequested;
@@ -71471,7 +71623,7 @@ void DrawWaterTrailStyleEditor(
     const auto result = DrawWaterTrailStyleEditorCore(
         runtimeState,
         std::move(profile),
-        WaterTrailEditorBaselineGeometry(*runtimeState, nullptr));
+        WaterTrailEditorBaselineProfile(*runtimeState, nullptr));
     if (!result.changed()) {
         return;
     }
@@ -71512,7 +71664,9 @@ void DrawWaterTrailStyleEditorForSource(
     const auto result = DrawWaterTrailStyleEditorCore(
         runtimeState,
         resolvedProfile,
-        WaterTrailEditorBaselineGeometry(*runtimeState, assignedProfileName));
+        WaterTrailEditorBaselineProfile(
+            *runtimeState,
+            assignedProfileName));
     if (!result.changed()) {
         return;
     }

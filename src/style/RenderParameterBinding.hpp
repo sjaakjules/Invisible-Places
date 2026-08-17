@@ -88,5 +88,18 @@ void SyncBindingFieldReference(
     const RenderParameterBinding& binding,
     float fieldValue,
     const invisible_places::io::ScalarFieldStats* fieldStats);
+// Authoring comparison for the scalar binding editor. Durable field names
+// take precedence over density-variant runtime slots, layer-stat input bounds
+// ignore their transient resolved values, and remembered manual bounds are
+// compared canonically rather than by insertion order.
+[[nodiscard]] bool ScalarRenderParameterBindingsAuthoringEqual(
+    const RenderParameterBinding& left,
+    const RenderParameterBinding& right,
+    float epsilon = 1.0e-4F);
+// Complete saved-state text for the same editor. It includes the active/mode
+// state, constant fallback, durable field, applicable input range, output
+// range, gamma, flags, and every remembered manual field range.
+[[nodiscard]] std::string DescribeScalarRenderParameterBindingAuthoringState(
+    const RenderParameterBinding& binding);
 
 }  // namespace invisible_places::style

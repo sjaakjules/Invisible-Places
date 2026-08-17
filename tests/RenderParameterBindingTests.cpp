@@ -208,3 +208,166 @@ TEST_CASE("Bounds memory sanitize drops unusable and duplicate entries", "[style
     CHECK(config.boundsMemory[1].inputMin == Catch::Approx(0.25F));
     CHECK(config.boundsMemory[1].inputMax == Catch::Approx(0.75F));
 }
+
+TEST_CASE("Scalar binding authoring comparison ignores runtime-only field resolution",
+          "[style][field-binding][baseline]") {
+    using invisible_places::style::FieldMapFlagClamp;
+    using invisible_places::style::FieldMapFlagUseLayerStats;
+    using invisible_places::style::ScalarRenderParameterBindingsAuthoringEqual;
+
+    auto saved = MappedBinding(3, "Wetness");
+    saved.fieldMap.flags = FieldMapFlagClamp | FieldMapFlagUseLayerStats;
+    saved.fieldMap.boundsMemory = {
+        {.fieldName = "Heat", .inputMin = -2.0F, .inputMax = 6.0F},
+        {.fieldName = "Roughness", .inputMin = 0.25F, .inputMax = 0.75F},
+    };
+    auto live = saved;
+    live.fieldMap.fieldName = "wetness";
+    live.fieldMap.fieldSlot = 17;
+    live.fieldMap.inputMin = -500.0F;
+    live.fieldMap.inputMax = 900.0F;
+    live.fieldMap.boundsMemory = {
+        {.fieldName = "roughness", .inputMin = 0.25F, .inputMax = 0.75F},
+        {.fieldName = "HEAT", .inputMin = -2.0F, .inputMax = 6.0F},
+    };
+    live.constantValue[1] = 99.0F;
+
+    CHECK(ScalarRenderParameterBindingsAuthoringEqual(live, saved));
+}
+
+TEST_CASE("Scalar binding authoring comparison covers every retained editor setting",
+          "[style][field-binding][baseline]") {
+    using invisible_places::style::FieldMapFlagClamp;
+    using invisible_places::style::FieldMapFlagInvert;
+    using invisible_places::style::ParameterSourceMode;
+    using invisible_places::style::ScalarRenderParameterBindingsAuthoringEqual;
+
+    auto saved = MappedBinding(3, "Wetness");
+    saved.fieldMap.flags = FieldMapFlagClamp;
+    saved.fieldMap.boundsMemory = {
+        {.fieldName = "Heat", .inputMin = -2.0F, .inputMax = 6.0F},
+    };
+
+    SECTION("active") {
+        auto live = saved;
+        live.active = !saved.active;
+        CHECK_FALSE(ScalarRenderParameterBindingsAuthoringEqual(live, saved));
+    }
+    SECTION("mode") {
+        auto live = saved;
+        live.mode = ParameterSourceMode::Constant;
+        CHECK_FALSE(ScalarRenderParameterBindingsAuthoringEqual(live, saved));
+    }
+    SECTION("constant fallback") {
+        auto live = saved;
+        invisible_places::style::SetScalarConstant(&live, 0.73F);
+        CHECK_FALSE(ScalarRenderParameterBindingsAuthoringEqual(live, saved));
+    }
+    SECTION("durable field") {
+        auto live = saved;
+        live.fieldMap.fieldName = "Heat";
+        CHECK_FALSE(ScalarRenderParameterBindingsAuthoringEqual(live, saved));
+    }
+    SECTION("manual input range") {
+        auto live = saved;
+        live.fieldMap.inputMin = -2.0F;
+        CHECK_FALSE(ScalarRenderParameterBindingsAuthoringEqual(live, saved));
+    }
+    SECTION("output range") {
+        auto live = saved;
+        live.fieldMap.outputMax = 3.0F;
+        CHECK_FALSE(ScalarRenderParameterBindingsAuthoringEqual(live, saved));
+    }
+    SECTION("gamma") {
+        auto live = saved;
+        live.fieldMap.gamma = 2.1F;
+        CHECK_FALSE(ScalarRenderParameterBindingsAuthoringEqual(live, saved));
+    }
+    SECTION("clamp and invert flags") {
+        auto live = saved;
+        live.fieldMap.flags = FieldMapFlagClamp | FieldMapFlagInvert;
+        CHECK_FALSE(ScalarRenderParameterBindingsAuthoringEqual(live, saved));
+    }
+    SECTION("layer stats mode") {
+        auto live = saved;
+        live.fieldMap.flags |=
+            invisible_places::style::FieldMapFlagUseLayerStats;
+        CHECK_FALSE(ScalarRenderParameterBindingsAuthoringEqual(live, saved));
+    }
+    SECTION("remembered field ranges") {
+        auto live = saved;
+        live.fieldMap.boundsMemory.front().inputMax = 7.0F;
+        CHECK_FALSE(ScalarRenderParameterBindingsAuthoringEqual(live, saved));
+    }
+    SECTION("remembered field membership") {
+        auto live = saved;
+        live.fieldMap.boundsMemory.push_back(
+            {.fieldName = "Roughness",
+             .inputMin = 0.25F,
+             .inputMax = 0.75F});
+        CHECK_FALSE(ScalarRenderParameterBindingsAuthoringEqual(live, saved));
+    }
+    SECTION("remembered field identity") {
+        auto live = saved;
+        live.fieldMap.boundsMemory.front().fieldName = "Roughness";
+        CHECK_FALSE(ScalarRenderParameterBindingsAuthoringEqual(live, saved));
+    }
+    SECTION("legacy slot identity") {
+        auto left = saved;
+        auto right = saved;
+        left.fieldMap.fieldName.clear();
+        right.fieldMap.fieldName.clear();
+        left.fieldMap.fieldSlot = 1;
+        right.fieldMap.fieldSlot = 2;
+        CHECK_FALSE(ScalarRenderParameterBindingsAuthoringEqual(left, right));
+    }
+}
+
+TEST_CASE("Scalar binding authoring comparison uses a display-scale epsilon",
+          "[style][field-binding][baseline]") {
+    using invisible_places::style::ScalarRenderParameterBindingsAuthoringEqual;
+
+    const auto saved = MappedBinding(3, "Wetness");
+    auto live = saved;
+    live.fieldMap.outputMax += 5.0e-5F;
+    CHECK(ScalarRenderParameterBindingsAuthoringEqual(live, saved));
+    live.fieldMap.outputMax += 2.0e-4F;
+    CHECK_FALSE(ScalarRenderParameterBindingsAuthoringEqual(live, saved));
+}
+
+TEST_CASE("Scalar binding saved-state text is complete and deterministic",
+          "[style][field-binding][baseline]") {
+    using invisible_places::style::DescribeScalarRenderParameterBindingAuthoringState;
+    using invisible_places::style::FieldMapFlagInvert;
+
+    auto mapped = MappedBinding(3, "Wetness");
+    mapped.active = false;
+    mapped.fieldMap.flags = FieldMapFlagInvert | (1U << 3U);
+    mapped.fieldMap.boundsMemory = {
+        {.fieldName = "Roughness", .inputMin = 0.25F, .inputMax = 0.75F},
+        {.fieldName = "Heat", .inputMin = -2.0F, .inputMax = 6.0F},
+    };
+    CHECK(
+        DescribeScalarRenderParameterBindingAuthoringState(mapped) ==
+        "inactive; Field-Mapped field \"Wetness\"; input -3..9; output "
+        "1.5..2.2; gamma 1.7; clamp off; invert on; retained constant 0.42; "
+        "unknown flags 0x8; remembered bounds \"Heat\" -2..6, "
+        "\"Roughness\" 0.25..0.75");
+
+    invisible_places::style::RenderParameterBinding constant;
+    invisible_places::style::SetScalarConstant(&constant, 0.25F);
+    CHECK(
+        DescribeScalarRenderParameterBindingAuthoringState(constant) ==
+        "active; Constant 0.25; retained no field; input layer stats; "
+        "output 0..1; gamma 1; clamp on; invert off; remembered bounds none");
+
+    auto mappedStats = MappedBinding(4, "");
+    mappedStats.fieldMap.flags =
+        invisible_places::style::FieldMapFlagClamp |
+        invisible_places::style::FieldMapFlagUseLayerStats;
+    CHECK(
+        DescribeScalarRenderParameterBindingAuthoringState(mappedStats) ==
+        "active; Field-Mapped field slot 4; input layer stats; output "
+        "1.5..2.2; gamma 1.7; clamp on; invert off; retained constant "
+        "0.42; remembered bounds none");
+}

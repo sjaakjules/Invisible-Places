@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <iomanip>
 #include <optional>
+#include <sstream>
 
 namespace invisible_places::style {
 
@@ -21,6 +23,48 @@ std::string NormalizedFieldName(std::string_view value) {
         normalized.push_back(static_cast<char>(std::tolower(byte)));
     }
     return normalized;
+}
+
+bool AuthoringFloatEqual(float left, float right, float epsilon) {
+    if (left == right) {
+        return true;
+    }
+    if (std::isnan(left) && std::isnan(right)) {
+        return true;
+    }
+    return std::isfinite(left) && std::isfinite(right) &&
+           std::abs(left - right) <= std::max(0.0F, epsilon);
+}
+
+std::vector<FieldMapBoundsMemoryEntry> CanonicalBoundsMemory(
+    const FieldMapConfig& source) {
+    auto sanitized = source;
+    SanitizeFieldMapBoundsMemory(&sanitized);
+    std::sort(
+        sanitized.boundsMemory.begin(),
+        sanitized.boundsMemory.end(),
+        [](const FieldMapBoundsMemoryEntry& left,
+           const FieldMapBoundsMemoryEntry& right) {
+            return NormalizedFieldName(left.fieldName) <
+                   NormalizedFieldName(right.fieldName);
+        });
+    return sanitized.boundsMemory;
+}
+
+std::string FormatAuthoringFloat(float value) {
+    std::ostringstream output;
+    output << std::setprecision(6) << std::defaultfloat << value;
+    return output.str();
+}
+
+void AppendFieldIdentity(std::ostringstream* output, const FieldMapConfig& map) {
+    if (!map.fieldName.empty()) {
+        *output << "field " << std::quoted(map.fieldName);
+    } else if (map.fieldSlot >= 0) {
+        *output << "field slot " << map.fieldSlot;
+    } else {
+        *output << "no field";
+    }
 }
 
 }  // namespace
@@ -294,6 +338,142 @@ float EvaluateScalarBinding(
 
     return binding.fieldMap.outputMin +
            ((binding.fieldMap.outputMax - binding.fieldMap.outputMin) * normalized);
+}
+
+bool ScalarRenderParameterBindingsAuthoringEqual(
+    const RenderParameterBinding& left,
+    const RenderParameterBinding& right,
+    float epsilon) {
+    if (left.active != right.active || left.mode != right.mode ||
+        !AuthoringFloatEqual(
+            ScalarConstant(left), ScalarConstant(right), epsilon) ||
+        left.fieldMap.flags != right.fieldMap.flags) {
+        return false;
+    }
+
+    const auto leftField = NormalizedFieldName(left.fieldMap.fieldName);
+    const auto rightField = NormalizedFieldName(right.fieldMap.fieldName);
+    if (leftField != rightField ||
+        (leftField.empty() &&
+         left.fieldMap.fieldSlot != right.fieldMap.fieldSlot)) {
+        return false;
+    }
+
+    const bool useLayerStats =
+        HasFieldMapFlag(left.fieldMap, FieldMapFlagUseLayerStats);
+    if ((!useLayerStats &&
+         (!AuthoringFloatEqual(
+              left.fieldMap.inputMin,
+              right.fieldMap.inputMin,
+              epsilon) ||
+          !AuthoringFloatEqual(
+              left.fieldMap.inputMax,
+              right.fieldMap.inputMax,
+              epsilon))) ||
+        !AuthoringFloatEqual(
+            left.fieldMap.outputMin,
+            right.fieldMap.outputMin,
+            epsilon) ||
+        !AuthoringFloatEqual(
+            left.fieldMap.outputMax,
+            right.fieldMap.outputMax,
+            epsilon) ||
+        !AuthoringFloatEqual(
+            left.fieldMap.gamma,
+            right.fieldMap.gamma,
+            epsilon)) {
+        return false;
+    }
+
+    const auto leftMemory = CanonicalBoundsMemory(left.fieldMap);
+    const auto rightMemory = CanonicalBoundsMemory(right.fieldMap);
+    if (leftMemory.size() != rightMemory.size()) {
+        return false;
+    }
+    for (std::size_t index = 0U; index < leftMemory.size(); ++index) {
+        if (NormalizedFieldName(leftMemory[index].fieldName) !=
+                NormalizedFieldName(rightMemory[index].fieldName) ||
+            !AuthoringFloatEqual(
+                leftMemory[index].inputMin,
+                rightMemory[index].inputMin,
+                epsilon) ||
+            !AuthoringFloatEqual(
+                leftMemory[index].inputMax,
+                rightMemory[index].inputMax,
+                epsilon)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string DescribeScalarRenderParameterBindingAuthoringState(
+    const RenderParameterBinding& binding) {
+    std::ostringstream output;
+    output << (binding.active ? "active" : "inactive") << "; ";
+    if (binding.mode == ParameterSourceMode::Constant) {
+        output << "Constant "
+               << FormatAuthoringFloat(ScalarConstant(binding))
+               << "; retained ";
+        AppendFieldIdentity(&output, binding.fieldMap);
+    } else {
+        output << "Field-Mapped ";
+        AppendFieldIdentity(&output, binding.fieldMap);
+    }
+
+    if (HasFieldMapFlag(binding.fieldMap, FieldMapFlagUseLayerStats)) {
+        output << "; input layer stats";
+    } else {
+        output << "; input "
+               << FormatAuthoringFloat(binding.fieldMap.inputMin)
+               << ".."
+               << FormatAuthoringFloat(binding.fieldMap.inputMax);
+    }
+    output << "; output "
+           << FormatAuthoringFloat(binding.fieldMap.outputMin)
+           << ".."
+           << FormatAuthoringFloat(binding.fieldMap.outputMax)
+           << "; gamma "
+           << FormatAuthoringFloat(binding.fieldMap.gamma)
+           << "; clamp "
+           << (HasFieldMapFlag(binding.fieldMap, FieldMapFlagClamp)
+                   ? "on"
+                   : "off")
+           << "; invert "
+           << (HasFieldMapFlag(binding.fieldMap, FieldMapFlagInvert)
+                   ? "on"
+                   : "off");
+    if (binding.mode == ParameterSourceMode::FieldMapped) {
+        output << "; retained constant "
+               << FormatAuthoringFloat(ScalarConstant(binding));
+    }
+
+    constexpr std::uint32_t kKnownFlags =
+        FieldMapFlagClamp | FieldMapFlagInvert |
+        FieldMapFlagUseLayerStats;
+    const std::uint32_t unknownFlags =
+        binding.fieldMap.flags & ~kKnownFlags;
+    if (unknownFlags != 0U) {
+        output << "; unknown flags 0x" << std::hex << unknownFlags
+               << std::dec;
+    }
+
+    const auto memory = CanonicalBoundsMemory(binding.fieldMap);
+    output << "; remembered bounds ";
+    if (memory.empty()) {
+        output << "none";
+    } else {
+        for (std::size_t index = 0U; index < memory.size(); ++index) {
+            if (index > 0U) {
+                output << ", ";
+            }
+            output << std::quoted(memory[index].fieldName) << " "
+                   << FormatAuthoringFloat(memory[index].inputMin)
+                   << ".."
+                   << FormatAuthoringFloat(memory[index].inputMax);
+        }
+    }
+    return output.str();
 }
 
 }  // namespace invisible_places::style
