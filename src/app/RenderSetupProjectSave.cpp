@@ -308,6 +308,30 @@ void RebuildRenderSetupRainProject(
         return;
     }
 
+    const auto normalizedTakeId =
+        invisible_places::timing::NormalizeTimingTakeId(
+            selectedTimingTakeId);
+    const auto* capturedSelectedAssignment =
+        invisible_places::timing::FindTimingTakeDefinition(
+            authoredWater.rainTimingTakeAssignments,
+            normalizedTakeId);
+    const invisible_places::water::WaterRainProfile*
+        capturedSelectedProfile = nullptr;
+    if (capturedSelectedAssignment != nullptr) {
+        if (!capturedSelectedAssignment->assignedRainProfileId.empty()) {
+            capturedSelectedProfile =
+                invisible_places::water::FindWaterRainProfileById(
+                    authoredWater.rainProfiles,
+                    capturedSelectedAssignment->assignedRainProfileId);
+        } else if (!capturedSelectedAssignment
+                        ->assignedRainProfileName.empty()) {
+            capturedSelectedProfile =
+                invisible_places::water::FindWaterRainProfileByName(
+                    authoredWater.rainProfiles,
+                    capturedSelectedAssignment->assignedRainProfileName);
+        }
+    }
+
     auto importedProfiles = authoredWater.rainProfiles;
     auto importedAssignments =
         authoredWater.rainTimingTakeAssignments;
@@ -322,15 +346,12 @@ void RebuildRenderSetupRainProject(
     // applies only assignment mirrors whose take ids already exist in the
     // synthetic setup project.
     project->waterRainProfiles.clear();
-    const auto normalizedTakeId =
-        invisible_places::timing::NormalizeTimingTakeId(
-            selectedTimingTakeId);
-    const std::string legacyCompatibilityTakeId =
+    const bool legacyCompatibility =
         authoredWater.schemaVersion <
-                invisible_places::serialization::
-                    kWaterRainProfilesSourcesSchemaVersion
-            ? normalizedTakeId
-            : std::string{};
+        invisible_places::serialization::
+            kWaterRainProfilesSourcesSchemaVersion;
+    const std::string legacyCompatibilityTakeId =
+        legacyCompatibility ? normalizedTakeId : std::string{};
     (void)invisible_places::timing::
         MergeImportedTimingTakeRainProfiles(
             &project->waterRainProfiles,
@@ -338,6 +359,48 @@ void RebuildRenderSetupRainProject(
             importedProfiles,
             importedAssignments,
             legacyCompatibilityTakeId);
+
+    auto* selectedTake =
+        invisible_places::timing::FindTimingTakeDefinition(
+            &project->timingTakes,
+            normalizedTakeId);
+    const auto* appliedSelectedProfile =
+        selectedTake == nullptr
+            ? nullptr
+            : invisible_places::water::FindWaterRainProfileById(
+                  project->waterRainProfiles,
+                  selectedTake->assignedRainProfileId);
+    bool selectedAssignmentApplied = false;
+    if (legacyCompatibility) {
+        selectedAssignmentApplied =
+            appliedSelectedProfile != nullptr &&
+            appliedSelectedProfile->settings ==
+                authoredWater.rainSettings &&
+            appliedSelectedProfile->visual ==
+                authoredWater.rainVisualSettings;
+    } else if (capturedSelectedProfile != nullptr) {
+        const auto* normalizedSelectedAssignment =
+            invisible_places::timing::FindTimingTakeDefinition(
+                importedAssignments,
+                normalizedTakeId);
+        selectedAssignmentApplied =
+            normalizedSelectedAssignment != nullptr &&
+            appliedSelectedProfile != nullptr &&
+            appliedSelectedProfile->id ==
+                normalizedSelectedAssignment->assignedRainProfileId;
+    }
+    if (!selectedAssignmentApplied && selectedTake != nullptr) {
+        // The compatibility pair is the exact effective selected-take
+        // snapshot captured by current writers. Preserve it as an isolated
+        // owner when a schema31 assignment is absent or cannot be resolved;
+        // never silently substitute an arbitrary first shared profile.
+        (void)invisible_places::timing::
+            UpsertTimingTakeRainOwnerProfile(
+                &project->waterRainProfiles,
+                selectedTake,
+                authoredWater.rainSettings,
+                authoredWater.rainVisualSettings);
+    }
     (void)invisible_places::timing::EnsureLegacyWaterRainProfile(
         &project->waterRainProfiles,
         &project->timingTakes,

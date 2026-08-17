@@ -469,6 +469,73 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "modern render setup Rain reconstruction isolates compatibility when the selected assignment is unusable",
+    "[render-setup][project-reconstruction][rain-profile]") {
+    WaterSourcesDocument authoredWater;
+    auto firstShared =
+        MakeRainProfile("first-shared", "First shared", 0.16F);
+    firstShared.visual.opacity = 0.22F;
+    auto secondShared =
+        MakeRainProfile("second-shared", "Second shared", 0.41F);
+    secondShared.visual.opacity = 0.48F;
+    authoredWater.rainProfiles = {firstShared, secondShared};
+    authoredWater.rainSettings.enabled = true;
+    authoredWater.rainSettings.density = 0.79F;
+    authoredWater.rainSettings.activeParticleCount = 8'765U;
+    authoredWater.rainVisualSettings.colour = {0.81F, 0.27F, 0.43F};
+    authoredWater.rainVisualSettings.widthMeters = 0.0061F;
+    authoredWater.rainVisualSettings.opacity = 0.68F;
+
+    SECTION("empty selected assignment") {
+        authoredWater.rainTimingTakeAssignments.clear();
+    }
+    SECTION("invalid stable id does not fall through to its name mirror") {
+        authoredWater.rainTimingTakeAssignments = {
+            {.id = "selected-take",
+             .name = "Selected",
+             .assignedRainProfileId = "missing-stable-id",
+             .assignedRainProfileName = firstShared.name,
+             .baseRainProfileId = firstShared.id,
+             .baseRainProfileName = firstShared.name},
+        };
+    }
+
+    ProjectDocument project;
+    project.timingTakes = {
+        invisible_places::timing::AuthoredTimingTakeDefinition(),
+        {.id = "selected-take", .name = "Selected"},
+    };
+    invisible_places::app::RebuildRenderSetupRainProject(
+        authoredWater,
+        "selected-take",
+        &project);
+
+    REQUIRE(project.timingTakes.size() == 2U);
+    const auto* selectedTake =
+        invisible_places::timing::FindTimingTakeDefinition(
+            project.timingTakes,
+            "selected-take");
+    REQUIRE(selectedTake != nullptr);
+    const auto* effective = invisible_places::timing::
+        ResolveTimingTakeRainProfile(
+            project.waterRainProfiles,
+            *selectedTake);
+    REQUIRE(effective != nullptr);
+    CHECK(effective->objectOverride);
+    CHECK(effective->ownerTimingTakeId == "selected-take");
+    CHECK(effective->settings == authoredWater.rainSettings);
+    CHECK(effective->visual == authoredWater.rainVisualSettings);
+    CHECK(project.waterRainSettings == authoredWater.rainSettings);
+    CHECK(project.waterRainVisualSettings ==
+          authoredWater.rainVisualSettings);
+    REQUIRE(FindRainProfile(project, firstShared.id) != nullptr);
+    CHECK(FindRainProfile(project, firstShared.id)->settings ==
+          firstShared.settings);
+    CHECK(FindRainProfile(project, firstShared.id)->visual ==
+          firstShared.visual);
+}
+
+TEST_CASE(
     "active render setup save applies modified and removed package and timing deltas",
     "[render-setup][project-save]") {
     ProjectDocument underlying;
