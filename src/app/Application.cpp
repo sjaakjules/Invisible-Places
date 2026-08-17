@@ -27960,7 +27960,8 @@ void RestoreAnimationRuntimeState(
 
 invisible_places::serialization::WaterSourcesDocument
 CaptureRenderSetupAuthoredWater(
-    const ProjectDocument& project) {
+    const ProjectDocument& project,
+    std::string_view selectedTimingTakeId) {
     invisible_places::serialization::WaterSourcesDocument water;
     water.emitters = project.waterEmitters;
     water.manualFlowPaths = project.waterManualFlowPaths;
@@ -28014,8 +28015,17 @@ CaptureRenderSetupAuthoredWater(
     water.fieldTrailSettings = project.waterFieldTrailSettings;
     water.dynamicMeshFlowSettings =
         project.waterDynamicMeshFlowSettings;
-    water.rainSettings = project.waterRainSettings;
-    water.rainVisualSettings = project.waterRainVisualSettings;
+    const auto rainExport = invisible_places::timing::
+        BuildTimingTakeRainStandaloneExportState(
+            project.waterRainProfiles,
+            project.timingTakes,
+            selectedTimingTakeId,
+            project.waterRainSettings,
+            project.waterRainVisualSettings);
+    water.rainProfiles = rainExport.profiles;
+    water.rainTimingTakeAssignments = rainExport.assignments;
+    water.rainSettings = rainExport.compatibilitySettings;
+    water.rainVisualSettings = rainExport.compatibilityVisual;
     // Render setups deliberately reference immutable terrain inputs and never
     // carry generated path/ripple cache payloads.
     water.pathCache.reset();
@@ -28082,6 +28092,7 @@ void ApplyRenderSetupAuthoredWaterToProject(
         water.dynamicMeshFlowSettings;
     project->waterRainSettings = water.rainSettings;
     project->waterRainVisualSettings = water.rainVisualSettings;
+    project->waterRainProfiles = water.rainProfiles;
     project->waterPathCache.reset();
     project->waterRippleRuntimeCaches.clear();
     project->waterAnimationTrailSettings =
@@ -32882,6 +32893,10 @@ ProjectDocument BuildProjectForRenderSetupOverride(
                         : setup.timingTakeName,
         });
     }
+    RebuildRenderSetupRainProject(
+        setup.authoredWater,
+        takeId,
+        &project);
     project.selectedTimingTakeId = takeId;
     auto timingState = setup.timingState;
     timingState.takeId = takeId;
@@ -35708,7 +35723,9 @@ ResolveCurrentRenderSetupSnapshot(
     document.timingState = snapshot.timing.state;
     if (loadedOverride == nullptr) {
         document.authoredWater =
-            CaptureRenderSetupAuthoredWater(project);
+            CaptureRenderSetupAuthoredWater(
+                project,
+                snapshot.timing.takeId);
         document.waterAnimationTrailSettings =
             project.waterAnimationTrailSettings;
         document.tempWaterAnimationTrailSettings =
@@ -36131,7 +36148,9 @@ RenderSetupDocument BuildQueuedQuickMp4RenderSetupDocument(
     document.livePointVisual = savedVisual.visualOverride.style;
     document.timingState = timingSnapshot.state;
     document.authoredWater =
-        CaptureRenderSetupAuthoredWater(projectSnapshot);
+        CaptureRenderSetupAuthoredWater(
+            projectSnapshot,
+            timingSnapshot.takeId);
     document.waterAnimationTrailSettings =
         projectSnapshot.waterAnimationTrailSettings;
     document.tempWaterAnimationTrailSettings =

@@ -2,7 +2,20 @@
 
 #include "serialization/ProjectDocument.hpp"
 
+#include <string_view>
+
 namespace invisible_places::app {
+
+// Rebuilds the isolated Render Setup Rain library after its Authored Timing
+// and selected synthetic Timing Take definitions exist. Assignment records
+// can only bind those existing definitions; they never manufacture takes.
+// Legacy setup water snapshots bind their exact compatibility pair to the
+// selected take.
+void RebuildRenderSetupRainProject(
+    const invisible_places::serialization::WaterSourcesDocument&
+        authoredWater,
+    std::string_view selectedTimingTakeId,
+    invisible_places::serialization::ProjectDocument* project);
 
 // A loaded Render Setup is an isolated preview layered over the project.  The
 // preview baseline identifies setup-owned values, while changes made after

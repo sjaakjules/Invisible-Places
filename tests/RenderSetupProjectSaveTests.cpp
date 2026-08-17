@@ -8,6 +8,7 @@
 namespace {
 
 using invisible_places::serialization::ProjectDocument;
+using invisible_places::serialization::WaterSourcesDocument;
 using invisible_places::timing::TimingTakeSceneState;
 using invisible_places::water::WaterFeatureTimingRun;
 using invisible_places::water::WaterFeatureTimeline;
@@ -294,6 +295,177 @@ TEST_CASE(
     REQUIRE(savedTake != nullptr);
     CHECK(savedTake->assignedRainProfileId == "authored-rain");
     CHECK(savedTake->baseRainProfileId == "authored-rain");
+}
+
+TEST_CASE(
+    "render setup Rain reconstruction selects the stable-id owner over same-name shared profiles",
+    "[render-setup][project-reconstruction][rain-profile]") {
+    WaterSourcesDocument authoredWater;
+    auto firstShared =
+        MakeRainProfile("rain-shared-first", "Shared Rain", 0.14F);
+    firstShared.visual.opacity = 0.21F;
+    auto selectedBase =
+        MakeRainProfile("rain-shared-selected", "Shared Rain", 0.38F);
+    selectedBase.visual.opacity = 0.42F;
+    auto selectedOwner = selectedBase;
+    selectedOwner.id = "rain-owner-selected";
+    selectedOwner.name = "Shared Rain_Selected";
+    selectedOwner.objectOverride = true;
+    selectedOwner.ownerTimingTakeId = "selected-take";
+    selectedOwner.baseProfileId = selectedBase.id;
+    selectedOwner.baseProfileName = selectedBase.name;
+    selectedOwner.settings.density = 0.86F;
+    selectedOwner.settings.activeParticleCount = 12'345U;
+    selectedOwner.visual.colour = {0.17F, 0.63F, 0.91F};
+    selectedOwner.visual.widthMeters = 0.0047F;
+    selectedOwner.visual.opacity = 0.73F;
+
+    auto unreachableOwner = firstShared;
+    unreachableOwner.id = "rain-owner-missing";
+    unreachableOwner.name = "Shared Rain_Missing";
+    unreachableOwner.objectOverride = true;
+    unreachableOwner.ownerTimingTakeId = "missing-take";
+    unreachableOwner.baseProfileId = firstShared.id;
+    unreachableOwner.baseProfileName = firstShared.name;
+    authoredWater.rainProfiles = {
+        firstShared,
+        selectedBase,
+        selectedOwner,
+        unreachableOwner,
+    };
+    authoredWater.rainTimingTakeAssignments = {
+        {.id = std::string{
+             invisible_places::timing::kAuthoredTimingTakeId},
+         .name = std::string{
+             invisible_places::timing::kAuthoredTimingTakeName},
+         .assignedRainProfileId = firstShared.id,
+         .assignedRainProfileName = firstShared.name,
+         .baseRainProfileId = firstShared.id,
+         .baseRainProfileName = firstShared.name},
+        {.id = "selected-take",
+         .name = "Selected",
+         .assignedRainProfileId = selectedOwner.id,
+         .assignedRainProfileName = selectedOwner.name,
+         .baseRainProfileId = selectedBase.id,
+         .baseRainProfileName = selectedBase.name},
+        {.id = "missing-take",
+         .name = "Missing",
+         .assignedRainProfileId = unreachableOwner.id,
+         .assignedRainProfileName = unreachableOwner.name,
+         .baseRainProfileId = firstShared.id,
+         .baseRainProfileName = firstShared.name},
+    };
+    // This arbitrary compatibility projection must not beat the selected
+    // take's owner assignment.
+    authoredWater.rainSettings.density = 0.03F;
+    authoredWater.rainVisualSettings.opacity = 0.04F;
+
+    ProjectDocument project;
+    project.timingTakes = {
+        invisible_places::timing::AuthoredTimingTakeDefinition(),
+        {.id = "selected-take", .name = "Selected"},
+    };
+    project.waterRainProfiles = {
+        MakeRainProfile("live-only", "Live Rain", 0.99F),
+    };
+
+    invisible_places::app::RebuildRenderSetupRainProject(
+        authoredWater,
+        "selected-take",
+        &project);
+
+    REQUIRE(project.timingTakes.size() == 2U);
+    CHECK(
+        invisible_places::timing::FindTimingTakeDefinition(
+            project.timingTakes,
+            "missing-take") == nullptr);
+    CHECK(FindRainProfile(project, "live-only") == nullptr);
+    CHECK(FindRainProfile(project, unreachableOwner.id) == nullptr);
+    REQUIRE(FindRainProfile(project, firstShared.id) != nullptr);
+    REQUIRE(FindRainProfile(project, selectedBase.id) != nullptr);
+    CHECK(FindRainProfile(project, firstShared.id)->name == "Shared Rain");
+    CHECK(FindRainProfile(project, selectedBase.id)->name ==
+          "Shared Rain 2");
+    const auto* selectedTake =
+        invisible_places::timing::FindTimingTakeDefinition(
+            project.timingTakes,
+            "selected-take");
+    REQUIRE(selectedTake != nullptr);
+    CHECK(selectedTake->assignedRainProfileId == selectedOwner.id);
+    CHECK(selectedTake->baseRainProfileId == selectedBase.id);
+    CHECK(selectedTake->baseRainProfileName == "Shared Rain 2");
+    const auto* effective = invisible_places::timing::
+        ResolveTimingTakeRainProfile(
+            project.waterRainProfiles,
+            *selectedTake);
+    REQUIRE(effective != nullptr);
+    CHECK(effective->id == selectedOwner.id);
+    CHECK(effective->settings == selectedOwner.settings);
+    CHECK(effective->visual == selectedOwner.visual);
+    CHECK(project.waterRainSettings == selectedOwner.settings);
+    CHECK(project.waterRainVisualSettings == selectedOwner.visual);
+}
+
+TEST_CASE(
+    "legacy render setup Rain reconstruction preserves its exact compatibility snapshot",
+    "[render-setup][project-reconstruction][rain-profile][legacy]") {
+    WaterSourcesDocument authoredWater;
+    authoredWater.schemaVersion =
+        invisible_places::serialization::
+            kWaterRainProfilesSourcesSchemaVersion - 1U;
+    authoredWater.rainProfiles.clear();
+    authoredWater.rainTimingTakeAssignments.clear();
+    authoredWater.rainSettings.enabled = true;
+    authoredWater.rainSettings.visualProfileName =
+        "Unlisted captured look";
+    authoredWater.rainSettings.activeParticleCount = 4'321U;
+    authoredWater.rainSettings.seed = 876U;
+    authoredWater.rainSettings.density = 0.731F;
+    authoredWater.rainSettings.windDirectionX = -0.37F;
+    authoredWater.rainSettings.rockImpact.downhillStretch = 2.17F;
+    authoredWater.rainVisualSettings.colour = {0.12F, 0.34F, 0.87F};
+    authoredWater.rainVisualSettings.widthMeters = 0.0073F;
+    authoredWater.rainVisualSettings.streakLengthMeters = 0.287F;
+    authoredWater.rainVisualSettings.softness = 0.19F;
+    authoredWater.rainVisualSettings.opacity = 0.843F;
+    authoredWater.rainVisualSettings.emission = 0.617F;
+    authoredWater.rainVisualSettings.minimumScreenPixels = 1.13F;
+    authoredWater.rainVisualSettings.maximumScreenPixels = 7.71F;
+
+    ProjectDocument project;
+    project.timingTakes = {
+        invisible_places::timing::AuthoredTimingTakeDefinition(),
+        {.id = "legacy-selected", .name = "Legacy selected"},
+    };
+    project.waterRainProfiles = {
+        MakeRainProfile(
+            std::string{
+                invisible_places::timing::kLegacyWaterRainProfileId},
+            "Project Rain",
+            0.02F),
+    };
+
+    invisible_places::app::RebuildRenderSetupRainProject(
+        authoredWater,
+        "legacy-selected",
+        &project);
+
+    REQUIRE(project.timingTakes.size() == 2U);
+    const auto* selectedTake =
+        invisible_places::timing::FindTimingTakeDefinition(
+            project.timingTakes,
+            "legacy-selected");
+    REQUIRE(selectedTake != nullptr);
+    const auto* effective = invisible_places::timing::
+        ResolveTimingTakeRainProfile(
+            project.waterRainProfiles,
+            *selectedTake);
+    REQUIRE(effective != nullptr);
+    CHECK(effective->settings == authoredWater.rainSettings);
+    CHECK(effective->visual == authoredWater.rainVisualSettings);
+    CHECK(project.waterRainSettings == authoredWater.rainSettings);
+    CHECK(project.waterRainVisualSettings ==
+          authoredWater.rainVisualSettings);
 }
 
 TEST_CASE(

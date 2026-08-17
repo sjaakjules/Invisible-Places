@@ -299,6 +299,70 @@ void ApplyTimingTakeSceneStateDelta(
 
 }  // namespace
 
+void RebuildRenderSetupRainProject(
+    const invisible_places::serialization::WaterSourcesDocument&
+        authoredWater,
+    std::string_view selectedTimingTakeId,
+    ProjectDocument* project) {
+    if (project == nullptr) {
+        return;
+    }
+
+    auto importedProfiles = authoredWater.rainProfiles;
+    auto importedAssignments =
+        authoredWater.rainTimingTakeAssignments;
+    (void)invisible_places::timing::EnsureLegacyWaterRainProfile(
+        &importedProfiles,
+        &importedAssignments,
+        authoredWater.rainSettings,
+        authoredWater.rainVisualSettings);
+
+    // A setup is an isolated authored-water snapshot, so the captured library
+    // replaces the arbitrary live project's library. The merge helper then
+    // applies only assignment mirrors whose take ids already exist in the
+    // synthetic setup project.
+    project->waterRainProfiles.clear();
+    const auto normalizedTakeId =
+        invisible_places::timing::NormalizeTimingTakeId(
+            selectedTimingTakeId);
+    const std::string legacyCompatibilityTakeId =
+        authoredWater.schemaVersion <
+                invisible_places::serialization::
+                    kWaterRainProfilesSourcesSchemaVersion
+            ? normalizedTakeId
+            : std::string{};
+    (void)invisible_places::timing::
+        MergeImportedTimingTakeRainProfiles(
+            &project->waterRainProfiles,
+            &project->timingTakes,
+            importedProfiles,
+            importedAssignments,
+            legacyCompatibilityTakeId);
+    (void)invisible_places::timing::EnsureLegacyWaterRainProfile(
+        &project->waterRainProfiles,
+        &project->timingTakes,
+        authoredWater.rainSettings,
+        authoredWater.rainVisualSettings);
+
+    project->waterRainSettings = authoredWater.rainSettings;
+    project->waterRainVisualSettings =
+        authoredWater.rainVisualSettings;
+    if (const auto* take =
+            invisible_places::timing::FindTimingTakeDefinition(
+                project->timingTakes,
+                normalizedTakeId);
+        take != nullptr) {
+        if (const auto* effective = invisible_places::timing::
+                ResolveTimingTakeRainProfile(
+                    project->waterRainProfiles,
+                    *take);
+            effective != nullptr) {
+            project->waterRainSettings = effective->settings;
+            project->waterRainVisualSettings = effective->visual;
+        }
+    }
+}
+
 ProjectDocument MergeRenderSetupProjectForSave(
     const ProjectDocument& underlyingProject,
     const ProjectDocument& previewBaseline,
