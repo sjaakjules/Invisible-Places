@@ -1416,6 +1416,66 @@ std::size_t RewriteTimingTakeRainTrackProfileMetadata(
     return changed;
 }
 
+std::size_t RewriteLegacyScenarioRainTrackProfileMetadata(
+    std::vector<invisible_places::water::WaterScenarioFeatureRuns>* scenarios,
+    std::span<const invisible_places::water::WaterRainProfile> profiles,
+    std::span<const TimingTakeDefinition> takes,
+    std::string_view legacyProfileName) {
+    if (scenarios == nullptr || legacyProfileName.empty()) {
+        return 0U;
+    }
+    std::string legacyResolvedProfileName{legacyProfileName};
+    const invisible_places::water::WaterRainProfile* legacyProfile = nullptr;
+    if (const auto* authored = FindTimingTakeDefinition(
+            takes,
+            kAuthoredTimingTakeId);
+        authored != nullptr) {
+        legacyProfile = ResolveTimingTakeRainProfile(
+            profiles,
+            *authored);
+    }
+    if (legacyProfile == nullptr) {
+        legacyProfile = FirstSharedRainProfile(profiles);
+    }
+    if (legacyProfile != nullptr) {
+        legacyResolvedProfileName = legacyProfile->name;
+    }
+    std::size_t changed = 0U;
+    for (auto& scenario : *scenarios) {
+        std::string profileName{legacyResolvedProfileName};
+        if (const auto* take = FindTimingTakeDefinition(
+                takes,
+                scenario.scenarioId);
+            take != nullptr) {
+            if (const auto* profile = ResolveTimingTakeRainProfile(
+                    profiles,
+                    *take);
+                profile != nullptr) {
+                profileName = profile->name;
+            }
+        }
+        for (auto& run : scenario.runs) {
+            for (auto& timeline : run.features) {
+                if (timeline.feature.kind !=
+                    invisible_places::water::WaterKeyedFeatureKind::Rain) {
+                    continue;
+                }
+                for (auto& track : timeline.settings) {
+                    if (track.profileGroup !=
+                            kTimingTakeRainTrackProfileGroup ||
+                        track.profileName != profileName) {
+                        track.profileGroup = std::string{
+                            kTimingTakeRainTrackProfileGroup};
+                        track.profileName = profileName;
+                        ++changed;
+                    }
+                }
+            }
+        }
+    }
+    return changed;
+}
+
 bool AssignTimingTakeRainBaseProfile(
     TimingTakeDefinition* take,
     std::span<const invisible_places::water::WaterRainProfile> profiles,
@@ -1631,6 +1691,334 @@ std::string EnsureLegacyWaterRainProfile(
         }
     }
     return sharedId;
+}
+
+TimingTakeRainStandaloneExportState
+BuildTimingTakeRainStandaloneExportState(
+    std::span<const invisible_places::water::WaterRainProfile> profiles,
+    std::span<const TimingTakeDefinition> takes,
+    std::string_view activeTakeId,
+    const invisible_places::water::RainRuntimeSettings& fallbackSettings,
+    const invisible_places::water::WaterRainVisualSettings& fallbackVisual) {
+    TimingTakeRainStandaloneExportState result{
+        .profiles = {profiles.begin(), profiles.end()},
+        .assignments = {takes.begin(), takes.end()},
+        .compatibilitySettings = fallbackSettings,
+        .compatibilityVisual = fallbackVisual,
+    };
+    (void)EnsureLegacyWaterRainProfile(
+        &result.profiles,
+        &result.assignments,
+        fallbackSettings,
+        fallbackVisual);
+    const auto* active = FindTimingTakeDefinition(
+        result.assignments,
+        activeTakeId);
+    if (active == nullptr) {
+        active = FindTimingTakeDefinition(
+            result.assignments,
+            kAuthoredTimingTakeId);
+    }
+    if (active == nullptr && !result.assignments.empty()) {
+        active = &result.assignments.front();
+    }
+    if (active != nullptr) {
+        if (const auto* effective = ResolveTimingTakeRainProfile(
+                result.profiles,
+                *active);
+            effective != nullptr) {
+            result.compatibilitySettings = effective->settings;
+            result.compatibilityVisual = effective->visual;
+        }
+    }
+    return result;
+}
+
+TimingTakeRainImportResult MergeImportedTimingTakeRainProfiles(
+    std::vector<invisible_places::water::WaterRainProfile>* profiles,
+    std::vector<TimingTakeDefinition>* takes,
+    std::span<const invisible_places::water::WaterRainProfile>
+        importedProfiles,
+    std::span<const TimingTakeDefinition> importedAssignments,
+    std::string_view legacyCompatibilityTakeId) {
+    TimingTakeRainImportResult result;
+    if (profiles == nullptr || takes == nullptr) {
+        return result;
+    }
+
+    auto normalizedProfiles =
+        std::vector<invisible_places::water::WaterRainProfile>{
+            importedProfiles.begin(),
+            importedProfiles.end()};
+    // Normalize only the incoming payload. Existing project entries are
+    // deliberately left byte-for-byte alone unless their stable id is
+    // explicitly imported below.
+    SanitizeWaterRainProfileLibrary(&normalizedProfiles, nullptr);
+
+    // Schema <= 30 carried only one compatibility Rain snapshot and no take
+    // assignments. Its synthesized legacy id is not an authoritative stable
+    // identity: replacing an existing profile with that id would also change
+    // every other take that shares the destination profile. Isolate a
+    // collision before synthesizing the active-take assignment below.
+    if (importedAssignments.empty() &&
+        !legacyCompatibilityTakeId.empty()) {
+        const auto legacyShared = std::find_if(
+            normalizedProfiles.begin(),
+            normalizedProfiles.end(),
+            [](const invisible_places::water::WaterRainProfile& profile) {
+                return !profile.objectOverride;
+            });
+        if (legacyShared != normalizedProfiles.end() &&
+            invisible_places::water::FindWaterRainProfileById(
+                *profiles,
+                legacyShared->id) != nullptr) {
+            const auto previousId = legacyShared->id;
+            legacyShared->id =
+                invisible_places::water::AllocateWaterRainProfileId(
+                    *profiles,
+                    previousId + "-" +
+                        std::string{legacyCompatibilityTakeId});
+            for (auto& profile : normalizedProfiles) {
+                if (profile.objectOverride &&
+                    profile.baseProfileId == previousId) {
+                    profile.baseProfileId = legacyShared->id;
+                    profile.baseProfileName = legacyShared->name;
+                }
+            }
+        }
+    }
+
+    std::vector<TimingTakeDefinition> matchedAssignments;
+    std::unordered_set<std::string> matchedTakeIds;
+    const auto appendMatchedAssignment = [&](TimingTakeDefinition imported) {
+        auto assignment = SanitizeTimingTakeDefinition(imported);
+        if (FindTimingTakeDefinition(takes, assignment.id) == nullptr ||
+            !matchedTakeIds.insert(assignment.id).second) {
+            return;
+        }
+        matchedAssignments.push_back(std::move(assignment));
+    };
+    for (const auto& imported : importedAssignments) {
+        appendMatchedAssignment(imported);
+    }
+    if (importedAssignments.empty() &&
+        !legacyCompatibilityTakeId.empty()) {
+        if (const auto* legacyShared =
+                FirstSharedRainProfile(normalizedProfiles);
+            legacyShared != nullptr) {
+            appendMatchedAssignment({
+                .id = std::string{legacyCompatibilityTakeId},
+                .assignedRainProfileId = legacyShared->id,
+                .assignedRainProfileName = legacyShared->name,
+                .baseRainProfileId = legacyShared->id,
+                .baseRainProfileName = legacyShared->name,
+            });
+        }
+    }
+
+    const auto assignmentReferences =
+        [&](const invisible_places::water::WaterRainProfile& profile) {
+            return std::any_of(
+                matchedAssignments.begin(),
+                matchedAssignments.end(),
+                [&](const TimingTakeDefinition& assignment) {
+                    if (!assignment.assignedRainProfileId.empty()) {
+                        return assignment.assignedRainProfileId ==
+                               profile.id;
+                    }
+                    return RainProfileNameKey(
+                               assignment.assignedRainProfileName) ==
+                           RainProfileNameKey(profile.name);
+                });
+        };
+
+    std::vector<std::string> mergedProfileIds;
+    mergedProfileIds.reserve(normalizedProfiles.size());
+    std::unordered_set<std::string> insertedProfileIds;
+    std::unordered_set<std::string> updatedProfileIds;
+    for (auto candidate : normalizedProfiles) {
+        if (candidate.objectOverride &&
+            FindTimingTakeDefinition(
+                *takes,
+                candidate.ownerTimingTakeId) == nullptr &&
+            !assignmentReferences(candidate)) {
+            ++result.orphanOwnerProfilesSkipped;
+            continue;
+        }
+        candidate.name = UniqueRainProfileName(
+            *profiles,
+            candidate.name,
+            candidate.id);
+        const auto candidateId = candidate.id;
+        if (auto* existing =
+                invisible_places::water::FindWaterRainProfileById(
+                    profiles,
+                    candidate.id);
+            existing != nullptr) {
+            if (*existing != candidate) {
+                *existing = candidate;
+                updatedProfileIds.insert(candidateId);
+                ++result.profilesUpdated;
+            }
+        } else {
+            profiles->push_back(std::move(candidate));
+            insertedProfileIds.insert(candidateId);
+            ++result.profilesInserted;
+        }
+        mergedProfileIds.push_back(candidateId);
+    }
+
+    const auto findStrictProfile =
+        [&](std::string_view id,
+            std::string_view name)
+        -> const invisible_places::water::WaterRainProfile* {
+            if (!TrimRainProfileText(id).empty()) {
+                return invisible_places::water::FindWaterRainProfileById(
+                    *profiles,
+                    id);
+            }
+            return invisible_places::water::FindWaterRainProfileByName(
+                *profiles,
+                name);
+        };
+
+    const std::unordered_set<std::string> mergedProfileIdSet{
+        mergedProfileIds.begin(),
+        mergedProfileIds.end()};
+    const auto recordProfileUpdate = [&](std::string_view profileId) {
+        if (!insertedProfileIds.contains(std::string{profileId}) &&
+            updatedProfileIds.insert(std::string{profileId}).second) {
+            ++result.profilesUpdated;
+        }
+    };
+
+    // Imported base-name mirrors follow the final stable-id destination,
+    // including any collision-safe display-name suffix assigned above.
+    for (const auto& profileId : mergedProfileIds) {
+        auto* profile = invisible_places::water::FindWaterRainProfileById(
+            profiles,
+            profileId);
+        if (profile == nullptr || !profile->objectOverride) {
+            continue;
+        }
+        const auto* base = findStrictProfile(
+            profile->baseProfileId,
+            profile->baseProfileName);
+        if (base == nullptr || base->objectOverride) {
+            continue;
+        }
+        const bool changed =
+            profile->baseProfileId != base->id ||
+            profile->baseProfileName != base->name;
+        profile->baseProfileId = base->id;
+        profile->baseProfileName = base->name;
+        if (changed) {
+            recordProfileUpdate(profile->id);
+        }
+    }
+
+    // A stable-id update may rename a shared base that already had local
+    // owner copies. Repair only those dependent mirrors; unrelated profiles
+    // remain untouched.
+    for (auto& profile : *profiles) {
+        if (!profile.objectOverride || profile.baseProfileId.empty() ||
+            !mergedProfileIdSet.contains(profile.baseProfileId)) {
+            continue;
+        }
+        const auto* base =
+            invisible_places::water::FindWaterRainProfileById(
+                *profiles,
+                profile.baseProfileId);
+        if (base == nullptr || base->objectOverride ||
+            profile.baseProfileName == base->name) {
+            continue;
+        }
+        profile.baseProfileName = base->name;
+        recordProfileUpdate(profile.id);
+    }
+
+    std::unordered_set<std::string> changedAssignmentTakeIds;
+    const auto recordAssignmentUpdate = [&](std::string_view takeId) {
+        if (changedAssignmentTakeIds.insert(std::string{takeId}).second) {
+            ++result.assignmentsApplied;
+        }
+    };
+    // The same stable-id rename also repairs readable mirrors on local takes,
+    // including observers not present in the standalone assignment list.
+    for (auto& take : *takes) {
+        bool changed = false;
+        if (!take.assignedRainProfileId.empty() &&
+            mergedProfileIdSet.contains(take.assignedRainProfileId)) {
+            if (const auto* assigned =
+                    invisible_places::water::FindWaterRainProfileById(
+                        *profiles,
+                        take.assignedRainProfileId);
+                assigned != nullptr &&
+                take.assignedRainProfileName != assigned->name) {
+                take.assignedRainProfileName = assigned->name;
+                changed = true;
+            }
+        }
+        if (!take.baseRainProfileId.empty() &&
+            mergedProfileIdSet.contains(take.baseRainProfileId)) {
+            if (const auto* base =
+                    invisible_places::water::FindWaterRainProfileById(
+                        *profiles,
+                        take.baseRainProfileId);
+                base != nullptr && !base->objectOverride &&
+                take.baseRainProfileName != base->name) {
+                take.baseRainProfileName = base->name;
+                changed = true;
+            }
+        }
+        if (changed) {
+            recordAssignmentUpdate(take.id);
+        }
+    }
+
+    for (const auto& assignment : matchedAssignments) {
+        auto* destination = FindTimingTakeDefinition(
+            takes,
+            assignment.id);
+        if (destination == nullptr) {
+            continue;
+        }
+        const auto* assigned = findStrictProfile(
+            assignment.assignedRainProfileId,
+            assignment.assignedRainProfileName);
+        const auto* base = findStrictProfile(
+            assignment.baseRainProfileId,
+            assignment.baseRainProfileName);
+        if (assigned != nullptr && !assigned->objectOverride) {
+            base = assigned;
+        } else if (assigned != nullptr && assigned->objectOverride &&
+                   (base == nullptr || base->objectOverride)) {
+            base = findStrictProfile(
+                assigned->baseProfileId,
+                assigned->baseProfileName);
+        } else if (assigned == nullptr && base != nullptr &&
+                   !base->objectOverride) {
+            assigned = base;
+        }
+        if (assigned == nullptr || base == nullptr ||
+            base->objectOverride) {
+            continue;
+        }
+
+        const bool changed =
+            destination->assignedRainProfileId != assigned->id ||
+            destination->assignedRainProfileName != assigned->name ||
+            destination->baseRainProfileId != base->id ||
+            destination->baseRainProfileName != base->name;
+        destination->assignedRainProfileId = assigned->id;
+        destination->assignedRainProfileName = assigned->name;
+        destination->baseRainProfileId = base->id;
+        destination->baseRainProfileName = base->name;
+        if (changed) {
+            recordAssignmentUpdate(destination->id);
+        }
+    }
+    return result;
 }
 
 invisible_places::water::WaterRainProfile*

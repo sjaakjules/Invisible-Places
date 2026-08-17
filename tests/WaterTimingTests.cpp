@@ -3735,6 +3735,347 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "standalone Rain import merges stable ids without creating takes or conflating names",
+    "[water][rain][profiles][timing][import]") {
+    using invisible_places::timing::MergeImportedTimingTakeRainProfiles;
+    using invisible_places::timing::TimingTakeDefinition;
+    using invisible_places::water::WaterRainProfile;
+
+    WaterRainProfile localSameName;
+    localSameName.id = "local-shared";
+    localSameName.name = "Shared Rain";
+    localSameName.settings.density = 0.10F;
+    WaterRainProfile updated;
+    updated.id = "updated-by-id";
+    updated.name = "Updated Rain";
+    updated.settings.density = 0.20F;
+    WaterRainProfile unrelated;
+    unrelated.id = "unrelated";
+    unrelated.name = "Unrelated Rain";
+    unrelated.settings.density = 0.30F;
+    WaterRainProfile dependentOwner = updated;
+    dependentOwner.id = "dependent-owner";
+    dependentOwner.name = "Updated Rain_Mirror";
+    dependentOwner.objectOverride = true;
+    dependentOwner.ownerTimingTakeId = "mirror";
+    dependentOwner.baseProfileId = updated.id;
+    dependentOwner.baseProfileName = updated.name;
+    std::vector<WaterRainProfile> profiles{
+        localSameName,
+        updated,
+        unrelated,
+        dependentOwner,
+    };
+    std::vector<TimingTakeDefinition> takes{
+        {.id = "take-a",
+         .name = "Take A",
+         .assignedRainProfileId = localSameName.id,
+         .assignedRainProfileName = localSameName.name,
+         .baseRainProfileId = localSameName.id,
+         .baseRainProfileName = localSameName.name},
+        {.id = "observer", .name = "Observer"},
+        {.id = "mirror",
+         .name = "Mirror",
+         .assignedRainProfileId = updated.id,
+         .assignedRainProfileName = updated.name,
+         .baseRainProfileId = updated.id,
+         .baseRainProfileName = updated.name},
+        {.id = "untouched",
+         .name = "Untouched",
+         .assignedRainProfileId = unrelated.id,
+         .assignedRainProfileName = unrelated.name,
+         .baseRainProfileId = unrelated.id,
+         .baseRainProfileName = unrelated.name},
+    };
+    const auto untouchedTake = takes.back();
+
+    WaterRainProfile importedBase;
+    importedBase.id = " imported-shared ";
+    importedBase.name = " Shared Rain ";
+    importedBase.settings.density = 0.80F;
+    WaterRainProfile importedOwner = importedBase;
+    importedOwner.id = "imported-owner";
+    importedOwner.name = "Shared Rain_Take A";
+    importedOwner.objectOverride = true;
+    importedOwner.ownerTimingTakeId = "take-a";
+    importedOwner.baseProfileId = "imported-shared";
+    importedOwner.baseProfileName = "Shared Rain";
+    importedOwner.settings.density = 0.91F;
+    WaterRainProfile observedOwner = importedOwner;
+    observedOwner.id = "observed-owner";
+    observedOwner.name = "Shared Rain_Remote";
+    observedOwner.ownerTimingTakeId = "remote-owner";
+    observedOwner.settings.density = 0.67F;
+    WaterRainProfile orphanOwner = observedOwner;
+    orphanOwner.id = "orphan-owner";
+    orphanOwner.name = "Shared Rain_Orphan";
+    orphanOwner.ownerTimingTakeId = "missing-owner";
+    WaterRainProfile importedUpdate = updated;
+    importedUpdate.name = "Updated Rain Renamed";
+    importedUpdate.settings.density = 0.74F;
+
+    const std::vector<WaterRainProfile> importedProfiles{
+        importedBase,
+        importedOwner,
+        observedOwner,
+        orphanOwner,
+        importedUpdate,
+    };
+    const std::vector<TimingTakeDefinition> assignments{
+        {.id = "take-a",
+         .assignedRainProfileId = " imported-owner ",
+         .assignedRainProfileName = importedOwner.name,
+         .baseRainProfileId = " imported-shared ",
+         .baseRainProfileName = importedBase.name},
+        {.id = "observer",
+         .assignedRainProfileId = observedOwner.id,
+         .assignedRainProfileName = observedOwner.name,
+         .baseRainProfileId = "imported-shared",
+         .baseRainProfileName = importedBase.name},
+        {.id = "missing-take",
+         .assignedRainProfileId = importedBase.id,
+         .assignedRainProfileName = importedBase.name,
+         .baseRainProfileId = importedBase.id,
+         .baseRainProfileName = importedBase.name},
+    };
+
+    const auto result = MergeImportedTimingTakeRainProfiles(
+        &profiles,
+        &takes,
+        importedProfiles,
+        assignments);
+    CHECK(result.profilesInserted == 3U);
+    CHECK(result.profilesUpdated == 2U);
+    CHECK(result.orphanOwnerProfilesSkipped == 1U);
+    CHECK(result.assignmentsApplied == 3U);
+    CHECK(result.changed());
+    REQUIRE(takes.size() == 4U);
+    CHECK(invisible_places::timing::FindTimingTakeDefinition(
+              takes,
+              "missing-take") == nullptr);
+
+    const auto* preservedLocal =
+        invisible_places::water::FindWaterRainProfileById(
+            profiles,
+            localSameName.id);
+    REQUIRE(preservedLocal != nullptr);
+    CHECK(*preservedLocal == localSameName);
+    const auto* mergedBase =
+        invisible_places::water::FindWaterRainProfileById(
+            profiles,
+            "imported-shared");
+    REQUIRE(mergedBase != nullptr);
+    CHECK(mergedBase->name == "Shared Rain 2");
+    CHECK(mergedBase->settings.density == Catch::Approx(0.80F));
+    const auto* mergedOwner =
+        invisible_places::water::FindWaterRainProfileById(
+            profiles,
+            importedOwner.id);
+    REQUIRE(mergedOwner != nullptr);
+    CHECK(mergedOwner->baseProfileId == mergedBase->id);
+    CHECK(mergedOwner->baseProfileName == mergedBase->name);
+    CHECK(invisible_places::water::FindWaterRainProfileById(
+              profiles,
+              orphanOwner.id) == nullptr);
+    REQUIRE(invisible_places::water::FindWaterRainProfileById(
+                profiles,
+                observedOwner.id) != nullptr);
+    REQUIRE(invisible_places::water::FindWaterRainProfileById(
+                profiles,
+                updated.id) != nullptr);
+    CHECK(invisible_places::water::FindWaterRainProfileById(
+              profiles,
+              updated.id)
+              ->settings.density == Catch::Approx(0.74F));
+    CHECK(invisible_places::water::FindWaterRainProfileById(
+              profiles,
+              updated.id)
+              ->name == importedUpdate.name);
+    const auto* repairedDependent =
+        invisible_places::water::FindWaterRainProfileById(
+            profiles,
+            dependentOwner.id);
+    REQUIRE(repairedDependent != nullptr);
+    CHECK(repairedDependent->baseProfileName == importedUpdate.name);
+
+    const auto* assignedTake =
+        invisible_places::timing::FindTimingTakeDefinition(
+            takes,
+            "take-a");
+    REQUIRE(assignedTake != nullptr);
+    CHECK(assignedTake->name == "Take A");
+    CHECK(assignedTake->assignedRainProfileId == mergedOwner->id);
+    CHECK(assignedTake->assignedRainProfileName == mergedOwner->name);
+    CHECK(assignedTake->baseRainProfileId == mergedBase->id);
+    CHECK(assignedTake->baseRainProfileName == mergedBase->name);
+    const auto* repairedMirror =
+        invisible_places::timing::FindTimingTakeDefinition(
+            takes,
+            "mirror");
+    REQUIRE(repairedMirror != nullptr);
+    CHECK(repairedMirror->assignedRainProfileName == importedUpdate.name);
+    CHECK(repairedMirror->baseRainProfileName == importedUpdate.name);
+    CHECK(takes.back().id == untouchedTake.id);
+    CHECK(takes.back().name == untouchedTake.name);
+    CHECK(takes.back().assignedRainProfileId ==
+          untouchedTake.assignedRainProfileId);
+    CHECK(takes.back().assignedRainProfileName ==
+          untouchedTake.assignedRainProfileName);
+    CHECK(takes.back().baseRainProfileId ==
+          untouchedTake.baseRainProfileId);
+    CHECK(takes.back().baseRainProfileName ==
+          untouchedTake.baseRainProfileName);
+}
+
+TEST_CASE(
+    "standalone Rain export captures all assignments and the active effective compatibility pair",
+    "[water][rain][profiles][timing][export]") {
+    using invisible_places::timing::BuildTimingTakeRainStandaloneExportState;
+    using invisible_places::timing::TimingTakeDefinition;
+    using invisible_places::water::WaterRainProfile;
+
+    WaterRainProfile base;
+    base.id = "base";
+    base.name = "Saved Rain";
+    base.settings.density = 0.22F;
+    base.visual.opacity = 0.15F;
+    WaterRainProfile owner = base;
+    owner.id = "owner";
+    owner.name = "Saved Rain_First-01";
+    owner.objectOverride = true;
+    owner.ownerTimingTakeId = "take-a";
+    owner.baseProfileId = base.id;
+    owner.baseProfileName = base.name;
+    owner.settings.density = 0.81F;
+    owner.visual.opacity = 0.63F;
+    const std::vector<WaterRainProfile> profiles{base, owner};
+    const std::vector<TimingTakeDefinition> takes{
+        {.id = std::string{
+             invisible_places::timing::kAuthoredTimingTakeId},
+         .name = std::string{
+             invisible_places::timing::kAuthoredTimingTakeName},
+         .assignedRainProfileId = base.id,
+         .assignedRainProfileName = base.name,
+         .baseRainProfileId = base.id,
+         .baseRainProfileName = base.name},
+        {.id = "take-a",
+         .name = "First-01",
+         .assignedRainProfileId = owner.id,
+         .assignedRainProfileName = owner.name,
+         .baseRainProfileId = base.id,
+         .baseRainProfileName = base.name},
+    };
+    auto fallbackSettings = base.settings;
+    auto fallbackVisual = base.visual;
+    fallbackSettings.density = 0.01F;
+    fallbackVisual.opacity = 0.02F;
+
+    const auto exported = BuildTimingTakeRainStandaloneExportState(
+        profiles,
+        takes,
+        "take-a",
+        fallbackSettings,
+        fallbackVisual);
+    CHECK(exported.profiles == profiles);
+    REQUIRE(exported.assignments.size() == takes.size());
+    CHECK(exported.assignments[0].id == takes[0].id);
+    CHECK(exported.assignments[1].id == takes[1].id);
+    CHECK(exported.assignments[1].assignedRainProfileId == owner.id);
+    CHECK(exported.assignments[1].baseRainProfileId == base.id);
+    CHECK(exported.compatibilitySettings == owner.settings);
+    CHECK(exported.compatibilityVisual == owner.visual);
+
+    const auto authoredFallback = BuildTimingTakeRainStandaloneExportState(
+        profiles,
+        takes,
+        "missing-take",
+        fallbackSettings,
+        fallbackVisual);
+    CHECK(authoredFallback.compatibilitySettings == base.settings);
+    CHECK(authoredFallback.compatibilityVisual == base.visual);
+}
+
+TEST_CASE(
+    "legacy standalone Rain import rebinds only the requested existing active take",
+    "[water][rain][profiles][timing][import]") {
+    using invisible_places::timing::MergeImportedTimingTakeRainProfiles;
+    using invisible_places::timing::TimingTakeDefinition;
+    using invisible_places::water::WaterRainProfile;
+
+    WaterRainProfile local;
+    local.id = std::string{
+        invisible_places::timing::kLegacyWaterRainProfileId};
+    local.name = "Project Rain";
+    local.settings.density = 0.12F;
+    WaterRainProfile legacy;
+    legacy.id = std::string{
+        invisible_places::timing::kLegacyWaterRainProfileId};
+    legacy.name = "Project Rain";
+    legacy.settings.density = 0.88F;
+    std::vector<WaterRainProfile> profiles{local};
+    std::vector<TimingTakeDefinition> takes{
+        {.id = "active",
+         .name = "Active",
+         .assignedRainProfileId = local.id,
+         .assignedRainProfileName = local.name,
+         .baseRainProfileId = local.id,
+         .baseRainProfileName = local.name},
+        {.id = "other",
+         .name = "Other",
+         .assignedRainProfileId = local.id,
+         .assignedRainProfileName = local.name,
+         .baseRainProfileId = local.id,
+         .baseRainProfileName = local.name},
+    };
+
+    const auto result = MergeImportedTimingTakeRainProfiles(
+        &profiles,
+        &takes,
+        std::span<const WaterRainProfile>{&legacy, 1U},
+        {},
+        "active");
+    CHECK(result.profilesInserted == 1U);
+    CHECK(result.assignmentsApplied == 1U);
+    const auto* imported =
+        invisible_places::water::FindWaterRainProfileById(
+            profiles,
+            takes[0].assignedRainProfileId);
+    REQUIRE(imported != nullptr);
+    CHECK(imported->id != local.id);
+    CHECK(imported->name == "Project Rain 2");
+    CHECK(imported->settings.density == Catch::Approx(0.88F));
+    CHECK(takes[0].assignedRainProfileId == imported->id);
+    CHECK(takes[0].assignedRainProfileName == imported->name);
+    CHECK(takes[1].assignedRainProfileId == local.id);
+    const auto* preservedLocal =
+        invisible_places::water::FindWaterRainProfileById(
+            profiles,
+            local.id);
+    REQUIRE(preservedLocal != nullptr);
+    CHECK(preservedLocal->settings.density == Catch::Approx(0.12F));
+
+    // Schema 31 passes no compatibility take id. An empty assignment array
+    // then merges the reusable profile only and does not change a take.
+    std::vector<WaterRainProfile> modernProfiles{local};
+    auto modernTakes = takes;
+    modernTakes[0].assignedRainProfileId = local.id;
+    modernTakes[0].assignedRainProfileName = local.name;
+    modernTakes[0].baseRainProfileId = local.id;
+    modernTakes[0].baseRainProfileName = local.name;
+    const auto modernResult = MergeImportedTimingTakeRainProfiles(
+        &modernProfiles,
+        &modernTakes,
+        std::span<const WaterRainProfile>{&legacy, 1U},
+        {});
+    CHECK(modernResult.profilesInserted == 0U);
+    CHECK(modernResult.profilesUpdated == 1U);
+    CHECK(modernResult.assignmentsApplied == 0U);
+    CHECK(modernTakes[0].assignedRainProfileId == local.id);
+    CHECK(modernProfiles.front().settings.density ==
+          Catch::Approx(0.88F));
+}
+
+TEST_CASE(
     "live Rain synchronization resets only for identity changes or forced refresh",
     "[water][rain][profiles][timing]") {
     using invisible_places::timing::ResolveTimingTakeRainLiveSyncDecision;
@@ -3824,6 +4165,107 @@ TEST_CASE(
               &states,
               "take-a",
               "Project Rain_Take A") == 0U);
+}
+
+TEST_CASE(
+    "legacy scenario Rain metadata follows mapped takes without changing keys",
+    "[water][rain][profiles][timing][migration]") {
+    using invisible_places::timing::RewriteLegacyScenarioRainTrackProfileMetadata;
+    using invisible_places::timing::TimingTakeDefinition;
+    using invisible_places::water::WaterFeatureTimeline;
+    using invisible_places::water::WaterFeatureTimingRun;
+    using invisible_places::water::WaterKeyedFeatureKind;
+    using invisible_places::water::WaterRainProfile;
+    using invisible_places::water::WaterScenarioFeatureRuns;
+    using invisible_places::water::WaterScenarioInterpolation;
+
+    WaterRainProfile base;
+    base.id = "base";
+    base.name = "Base Rain";
+    WaterRainProfile owner = base;
+    owner.id = "owner";
+    owner.name = "Base Rain_Take A";
+    owner.objectOverride = true;
+    owner.ownerTimingTakeId = "take-a";
+    owner.baseProfileId = base.id;
+    owner.baseProfileName = base.name;
+    const std::vector<WaterRainProfile> profiles{base, owner};
+    const std::vector<TimingTakeDefinition> takes{
+        {.id = std::string{
+             invisible_places::timing::kAuthoredTimingTakeId},
+         .name = std::string{
+             invisible_places::timing::kAuthoredTimingTakeName},
+         .assignedRainProfileId = base.id,
+         .assignedRainProfileName = base.name,
+         .baseRainProfileId = base.id,
+         .baseRainProfileName = base.name},
+        {.id = "take-a",
+         .name = "Take A",
+         .assignedRainProfileId = owner.id,
+         .assignedRainProfileName = owner.name,
+         .baseRainProfileId = base.id,
+         .baseRainProfileName = base.name},
+    };
+
+    WaterFeatureTimeline mappedRain;
+    mappedRain.feature.kind = WaterKeyedFeatureKind::Rain;
+    mappedRain.settings = {
+        {.settingId = "density",
+         .keys = {
+             {.position = 0.20F,
+              .value = 0.30F,
+              .interpolation = WaterScenarioInterpolation::SmoothVelocity,
+              .clipId = 7U},
+             {.position = 0.80F,
+              .value = 0.90F,
+              .interpolation = WaterScenarioInterpolation::SmoothVelocity,
+              .clipId = 7U},
+         }},
+    };
+    WaterFeatureTimeline legacyRain = mappedRain;
+    legacyRain.settings.front().profileGroup = "rain_visual";
+    legacyRain.settings.front().profileName = "Rain Fine Lines";
+    std::vector<WaterScenarioFeatureRuns> scenarios{
+        {.scenarioId = "take-a",
+         .runs = {WaterFeatureTimingRun{
+             .id = 1U,
+             .features = {mappedRain},
+         }}},
+        {.scenarioId = "legacy-scenario",
+         .runs = {WaterFeatureTimingRun{
+             .id = 2U,
+             .features = {legacyRain},
+         }}},
+    };
+    const auto beforeKeys =
+        scenarios.front().runs.front().features.front().settings.front().keys;
+
+    CHECK(RewriteLegacyScenarioRainTrackProfileMetadata(
+              &scenarios,
+              profiles,
+              takes) == 2U);
+    const auto& mappedTrack = scenarios.front()
+                                  .runs.front()
+                                  .features.front()
+                                  .settings.front();
+    CHECK(mappedTrack.profileGroup == "rain");
+    CHECK(mappedTrack.profileName == owner.name);
+    const auto& fallbackTrack = scenarios.back()
+                                    .runs.front()
+                                    .features.front()
+                                    .settings.front();
+    CHECK(fallbackTrack.profileGroup == "rain");
+    CHECK(fallbackTrack.profileName == base.name);
+    REQUIRE(mappedTrack.keys.size() == beforeKeys.size());
+    for (std::size_t index = 0U; index < beforeKeys.size(); ++index) {
+        CHECK(mappedTrack.keys[index].position ==
+              Catch::Approx(beforeKeys[index].position));
+        CHECK(mappedTrack.keys[index].value ==
+              Catch::Approx(beforeKeys[index].value));
+        CHECK(mappedTrack.keys[index].interpolation ==
+              beforeKeys[index].interpolation);
+        CHECK(mappedTrack.keys[index].clipId == beforeKeys[index].clipId);
+    }
 }
 
 TEST_CASE(

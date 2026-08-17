@@ -416,6 +416,16 @@ ResolveTimingTakeRainLiveSyncDecision(
     std::string_view takeId,
     std::string_view profileName);
 
+// Canonicalizes pre-Timing-Take scenario storage without touching tracks or
+// keys. Scenario ids that are stable take ids use that take's effective Rain
+// profile; older scenario ids use Authored Timing's effective profile, then
+// the first shared profile, and finally the readable literal fallback.
+[[nodiscard]] std::size_t RewriteLegacyScenarioRainTrackProfileMetadata(
+    std::vector<invisible_places::water::WaterScenarioFeatureRuns>* scenarios,
+    std::span<const invisible_places::water::WaterRainProfile> profiles,
+    std::span<const TimingTakeDefinition> takes,
+    std::string_view legacyProfileName = kLegacyWaterRainProfileName);
+
 // Normalizes ids/names in file order and rewrites profile/take references.
 // The first duplicate keeps its identity; later entries receive deterministic
 // suffixes, with stable-id plus name mirrors disambiguating legacy collisions.
@@ -432,6 +442,54 @@ void SanitizeWaterRainProfileLibrary(
     const invisible_places::water::RainRuntimeSettings& legacySettings,
     const invisible_places::water::WaterRainVisualSettings& legacyVisual,
     std::string_view preferredName = kLegacyWaterRainProfileName);
+
+struct TimingTakeRainStandaloneExportState {
+    std::vector<invisible_places::water::WaterRainProfile> profiles;
+    std::vector<TimingTakeDefinition> assignments;
+    invisible_places::water::RainRuntimeSettings compatibilitySettings{};
+    invisible_places::water::WaterRainVisualSettings compatibilityVisual{};
+};
+
+// Captures the complete reusable library and definition-only assignment
+// records for Water Sources. The legacy singleton pair mirrors the requested
+// take's effective authored profile so older readers see the same Rain.
+[[nodiscard]] TimingTakeRainStandaloneExportState
+BuildTimingTakeRainStandaloneExportState(
+    std::span<const invisible_places::water::WaterRainProfile> profiles,
+    std::span<const TimingTakeDefinition> takes,
+    std::string_view activeTakeId,
+    const invisible_places::water::RainRuntimeSettings& fallbackSettings,
+    const invisible_places::water::WaterRainVisualSettings& fallbackVisual);
+
+struct TimingTakeRainImportResult {
+    std::size_t profilesInserted = 0U;
+    std::size_t profilesUpdated = 0U;
+    std::size_t orphanOwnerProfilesSkipped = 0U;
+    std::size_t assignmentsApplied = 0U;
+
+    [[nodiscard]] bool changed() const {
+        return profilesInserted > 0U || profilesUpdated > 0U ||
+               assignmentsApplied > 0U;
+    }
+};
+
+// Merges a standalone Water Sources Rain library into a project without
+// importing Timing Takes. Stable profile ids are authoritative: reused names
+// never overwrite another id, and imported collisions receive a unique
+// display name. Assignment mirrors are applied only to already-existing take
+// ids. Owner copies that neither belong to an existing take nor serve a
+// matched observer assignment are skipped as unreachable temporary state.
+[[nodiscard]] TimingTakeRainImportResult
+MergeImportedTimingTakeRainProfiles(
+    std::vector<invisible_places::water::WaterRainProfile>* profiles,
+    std::vector<TimingTakeDefinition>* takes,
+    std::span<const invisible_places::water::WaterRainProfile>
+        importedProfiles,
+    std::span<const TimingTakeDefinition> importedAssignments,
+    // Schema <=30 carried only one compatibility snapshot. Supplying the
+    // current take id preserves its historical replace-Rain behavior without
+    // letting a standalone file manufacture a take.
+    std::string_view legacyCompatibilityTakeId = {});
 
 // Selects a shared base profile and clears any prior owner-copy assignment.
 bool AssignTimingTakeRainBaseProfile(

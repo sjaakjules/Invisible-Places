@@ -155,7 +155,6 @@ constexpr std::uint32_t kWaterSplineHandlesSourcesSchemaVersion = 29U;
 constexpr std::uint32_t kWaterClipMembershipProjectSchemaVersion = 76U;
 constexpr std::uint32_t kWaterClipMembershipSourcesSchemaVersion = 30U;
 constexpr std::uint32_t kWaterRainProfilesProjectSchemaVersion = 78U;
-constexpr std::uint32_t kWaterRainProfilesSourcesSchemaVersion = 31U;
 constexpr std::uint32_t kRelativePalettePhaseProjectSchemaVersion = 62U;
 constexpr std::uint32_t kFieldMapBoundsMemoryProjectSchemaVersion = 63U;
 constexpr std::uint32_t kShorelineInstancesProjectSchemaVersion = 64U;

@@ -3908,6 +3908,11 @@ void BackfillRainTrackProfileMetadata(WaterWorkflowState* water) {
             state.takeId,
             resolved.effective->name);
     }
+    (void)invisible_places::timing::
+        RewriteLegacyScenarioRainTrackProfileMetadata(
+            &water->featureTimingRunsByScenario,
+            water->rainProfiles,
+            water->timingTakes);
 }
 
 void EnsureWaterRainProfiles(WaterWorkflowState* water) {
@@ -21114,6 +21119,7 @@ void SaveWaterSources(PreviewRuntimeState* runtimeState) {
     if (runtimeState == nullptr) {
         return;
     }
+    EnsureWaterRainProfiles(&runtimeState->water);
     invisible_places::serialization::WaterSourcesDocument document;
     document.emitters = runtimeState->water.emitters;
     document.manualFlowPaths = runtimeState->water.manualFlowPaths;
@@ -21144,8 +21150,20 @@ void SaveWaterSources(PreviewRuntimeState* runtimeState) {
     document.fieldSettings = runtimeState->water.fieldSettings;
     document.fieldTrailSettings = runtimeState->water.fieldTrailSettings;
     document.dynamicMeshFlowSettings = runtimeState->water.dynamicMeshFlowSettings;
-    document.rainSettings = runtimeState->water.collisionRainSettings;
-    document.rainVisualSettings = runtimeState->water.rainVisual;
+    const auto rainExport = invisible_places::timing::
+        BuildTimingTakeRainStandaloneExportState(
+            runtimeState->water.rainProfiles,
+            runtimeState->water.timingTakes,
+            ActiveWaterTimingScenarioId(*runtimeState),
+            runtimeState->water.collisionRainSettings,
+            runtimeState->water.rainVisual);
+    document.rainProfiles = rainExport.profiles;
+    document.rainTimingTakeAssignments = rainExport.assignments;
+    // The singleton pair remains for schema <=30 readers. It mirrors the
+    // active take's effective authored profile, while schema 31 readers retain
+    // the complete library and assignment records above.
+    document.rainSettings = rainExport.compatibilitySettings;
+    document.rainVisualSettings = rainExport.compatibilityVisual;
     document.sourceSettings = runtimeState->water.defaultSourceSettings;
     document.tempSourceSettings = runtimeState->water.tempDefaultSourceSettings;
     document.causticLookSettings = runtimeState->water.defaultCausticLookSettings;
@@ -21309,8 +21327,24 @@ void LoadWaterSources(
     runtimeState->water.dynamicMeshFlowSharedGroundUploadRevision = 0U;
     runtimeState->water.dynamicMeshFlowContactEventCount = 0U;
     runtimeState->water.dynamicMeshFlowLastActiveSeconds = -1.0F;
+    const std::string legacyRainCompatibilityTakeId =
+        document->schemaVersion <
+                invisible_places::serialization::
+                    kWaterRainProfilesSourcesSchemaVersion
+            ? ActiveWaterTimingScenarioId(*runtimeState)
+            : std::string{};
+    const auto rainImport = invisible_places::timing::
+        MergeImportedTimingTakeRainProfiles(
+            &runtimeState->water.rainProfiles,
+            &runtimeState->water.timingTakes,
+            document->rainProfiles,
+            document->rainTimingTakeAssignments,
+            legacyRainCompatibilityTakeId);
     runtimeState->water.collisionRainSettings = document->rainSettings;
     runtimeState->water.rainVisual = document->rainVisualSettings;
+    runtimeState->water.liveRainTimingTakeId.clear();
+    runtimeState->water.liveRainProfileId.clear();
+    runtimeState->water.rainProfileNameBufferBaseId.clear();
     runtimeState->water.defaultSourceSettings = document->sourceSettings;
     runtimeState->water.tempDefaultSourceSettings = document->tempSourceSettings;
     runtimeState->water.defaultCausticLookSettings = document->causticLookSettings;
@@ -21441,6 +21475,26 @@ void LoadWaterSources(
         &restoredRippleMemberships,
         &restoredRippleRegions);
     runtimeState->statusMessage = "Loaded water sources from " + inputPath.string() + ".";
+    if (rainImport.profilesInserted > 0U ||
+        rainImport.profilesUpdated > 0U ||
+        rainImport.assignmentsApplied > 0U) {
+        runtimeState->statusMessage +=
+            " Merged " +
+            std::to_string(
+                rainImport.profilesInserted +
+                rainImport.profilesUpdated) +
+            " Rain profile" +
+            (rainImport.profilesInserted + rainImport.profilesUpdated == 1U
+                 ? std::string{}
+                 : std::string{"s"}) +
+            " and applied " +
+            std::to_string(rainImport.assignmentsApplied) +
+            " existing Timing Take assignment" +
+            (rainImport.assignmentsApplied == 1U
+                 ? std::string{}
+                 : std::string{"s"}) +
+            ".";
+    }
     if (restoredRippleSessions > 0U) {
         runtimeState->statusMessage +=
             " Restored cached Ripple membership: " + FormatPointCount(restoredRippleMemberships) +
@@ -21448,6 +21502,10 @@ void LoadWaterSources(
     }
     runtimeState->errorMessage.clear();
     ValidateWaterSourceSettingLinks(runtimeState);
+    (void)SynchronizeLiveTimingTakeRain(
+        runtimeState,
+        viewport,
+        true);
 }
 
 void SelectWaterEmitterInViewport(
