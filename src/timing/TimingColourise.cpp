@@ -1365,6 +1365,22 @@ ResolveTimingTakeRainBaseProfile(
     return FirstSharedRainProfile(profiles);
 }
 
+std::optional<invisible_places::water::WaterRainProfile>
+CaptureTimingTakeRainProfileSnapshot(
+    std::span<const invisible_places::water::WaterRainProfile> profiles,
+    std::span<const TimingTakeDefinition> takes,
+    std::string_view takeId) {
+    const auto* take = FindTimingTakeDefinition(takes, takeId);
+    if (take == nullptr) {
+        return std::nullopt;
+    }
+    const auto* effective = ResolveTimingTakeRainProfile(profiles, *take);
+    return effective != nullptr
+               ? std::optional<invisible_places::water::WaterRainProfile>{
+                     *effective}
+               : std::nullopt;
+}
+
 TimingTakeRainLiveSyncDecision ResolveTimingTakeRainLiveSyncDecision(
     std::string_view boundTakeId,
     std::string_view boundProfileId,

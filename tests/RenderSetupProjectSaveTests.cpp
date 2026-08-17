@@ -404,6 +404,25 @@ TEST_CASE(
     CHECK(effective->visual == selectedOwner.visual);
     CHECK(project.waterRainSettings == selectedOwner.settings);
     CHECK(project.waterRainVisualSettings == selectedOwner.visual);
+
+    const auto backgroundSnapshot = invisible_places::app::
+        CaptureRenderSetupRainProfileSnapshot(
+            authoredWater,
+            "selected-take");
+    REQUIRE(backgroundSnapshot.has_value());
+    CHECK(backgroundSnapshot->id == selectedOwner.id);
+    CHECK(backgroundSnapshot->settings == selectedOwner.settings);
+    CHECK(backgroundSnapshot->visual == selectedOwner.visual);
+    auto* mutableOwner =
+        invisible_places::water::FindWaterRainProfileById(
+            &authoredWater.rainProfiles,
+            selectedOwner.id);
+    REQUIRE(mutableOwner != nullptr);
+    mutableOwner->settings.density = 0.01F;
+    mutableOwner->visual.colour = {1.0F, 0.0F, 0.0F};
+    mutableOwner->visual.opacity = 0.02F;
+    CHECK(backgroundSnapshot->settings == selectedOwner.settings);
+    CHECK(backgroundSnapshot->visual == selectedOwner.visual);
 }
 
 TEST_CASE(

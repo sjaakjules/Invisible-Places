@@ -387,6 +387,15 @@ ResolveTimingTakeRainBaseProfile(
     std::span<const invisible_places::water::WaterRainProfile> profiles,
     const TimingTakeDefinition& take);
 
+// Captures one take's exact effective Rain profile by value. Stable identity,
+// the full runtime settings, and edited/non-preset visual values remain
+// immutable if the source library is changed after an export request.
+[[nodiscard]] std::optional<invisible_places::water::WaterRainProfile>
+CaptureTimingTakeRainProfileSnapshot(
+    std::span<const invisible_places::water::WaterRainProfile> profiles,
+    std::span<const TimingTakeDefinition> takes,
+    std::string_view takeId);
+
 struct TimingTakeRainLiveSyncDecision {
     bool copyProfile = false;
     bool resetRuntime = false;

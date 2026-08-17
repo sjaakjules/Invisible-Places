@@ -1887,15 +1887,16 @@ struct OfflineRenderFrameSampleState {
     std::chrono::steady_clock::time_point startedAt{};
 };
 
-// Immutable Timing Take payload captured when a current-animation render is
-// requested. Full-density source preparation may continue after that click;
-// keeping the compound (take, scene) state here prevents later UI edits from
-// changing the queued frame preview/export.
+// Immutable Timing Take payload captured when a render is requested.
+// Full-density source preparation may continue after that click; keeping the
+// compound (take, scene, effective Rain) state here prevents later UI edits
+// from changing a frame preview, still, foreground, or background export.
 struct ResolvedTimingTakeExportSnapshot {
     std::string takeId{
         invisible_places::timing::kAuthoredTimingTakeId};
     std::string sceneGroupName = "Default";
     invisible_places::timing::TimingTakeSceneState state{};
+    std::optional<WaterRainProfile> effectiveRainProfile;
 };
 
 struct OfflineRenderJobState {
@@ -1976,6 +1977,8 @@ struct OfflineRenderJobState {
         invisible_places::water::WaterSeepageRainEnvelope envelope{};
     };
     std::vector<invisible_places::water::WaterScenarioDefinition> waterScenarios;
+    std::optional<ResolvedTimingTakeExportSnapshot>
+        frozenTimingSnapshot;
     WaterRainSettings waterRainSettings{};
     WaterRainVisualSettings waterRainVisual{};
     std::optional<invisible_places::water::WaterScenarioState> frozenPreviewWaterScenario;
@@ -2093,7 +2096,8 @@ bool MoveReciprocalPanSeamReviewKey(
 std::vector<OfflineRenderJobState::FrozenSeepageLayer> BuildFrozenAnimationSeepageLayers(
     PreviewRuntimeState* runtimeState,
     std::span<const invisible_places::renderer::core::SceneRenderState::PointCloudLayerState> exportLayers,
-    std::uint64_t effectiveInvocations);
+    std::uint64_t effectiveInvocations,
+    const RainRuntimeSettings* rainSettingsOverride = nullptr);
 std::vector<OfflineRenderJobState::FrozenFlowSourceLayer> BuildFrozenAnimationFlowSourceLayers(
     const PreviewRuntimeState& runtimeState,
     std::span<const invisible_places::renderer::core::SceneRenderState::PointCloudLayerState> exportLayers);
@@ -4058,13 +4062,13 @@ ActiveTimingColouriseEffects(
 }
 
 std::optional<ResolvedTimingTakeExportSnapshot>
-ResolveCurrentTimingTakeExportSnapshot(
+ResolveTimingTakeExportSnapshot(
     const PreviewRuntimeState& runtimeState,
-    const AnimationPath& animationPath,
+    std::string_view selectedTimingTakeId,
     std::string* errorMessage) {
     const auto takeId =
         invisible_places::timing::NormalizeTimingTakeId(
-            animationPath.selectedTimingTakeId);
+            selectedTimingTakeId);
     const bool authoredTake =
         takeId == invisible_places::timing::kAuthoredTimingTakeId;
     if (!authoredTake &&
@@ -4129,10 +4133,34 @@ ResolveCurrentTimingTakeExportSnapshot(
         state != nullptr) {
         snapshot.state = *state;
     }
+    snapshot.effectiveRainProfile = invisible_places::timing::
+        CaptureTimingTakeRainProfileSnapshot(
+            runtimeState.water.rainProfiles,
+            runtimeState.water.timingTakes,
+            takeId);
+    if (!snapshot.effectiveRainProfile.has_value()) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "Timing Take '" + takeId +
+                "' has no effective Rain profile to freeze for rendering.";
+        }
+        return std::nullopt;
+    }
     if (errorMessage != nullptr) {
         errorMessage->clear();
     }
     return snapshot;
+}
+
+std::optional<ResolvedTimingTakeExportSnapshot>
+ResolveCurrentTimingTakeExportSnapshot(
+    const PreviewRuntimeState& runtimeState,
+    const AnimationPath& animationPath,
+    std::string* errorMessage) {
+    return ResolveTimingTakeExportSnapshot(
+        runtimeState,
+        animationPath.selectedTimingTakeId,
+        errorMessage);
 }
 
 bool IsAuthoredTimingColouriseLayer(
@@ -33670,8 +33698,10 @@ bool RenderCurrentAnimationFramePreview(
         &job.animationPath.value(),
         runtimeState->water.seepageScenarios);
     job.waterScenarios = ExportWaterScenarioDefinitions(*runtimeState);
-    job.waterRainSettings = runtimeState->water.collisionRainSettings;
-    job.waterRainVisual = runtimeState->water.rainVisual;
+    job.waterRainSettings =
+        timingSnapshot.effectiveRainProfile->settings;
+    job.waterRainVisual =
+        timingSnapshot.effectiveRainProfile->visual;
     job.frozenNormalizedTime = renderSnapshot.normalizedPosition;
     FreezeAuthoredTimingState(
         &job,
@@ -33681,7 +33711,8 @@ bool RenderCurrentAnimationFramePreview(
     job.frozenSeepageLayers = BuildFrozenAnimationSeepageLayers(
         runtimeState,
         exportPointCloudLayers,
-        job.effectiveSeepageInvocations);
+        job.effectiveSeepageInvocations,
+        &job.waterRainSettings);
     job.frozenFlowSourceLayers = BuildFrozenAnimationFlowSourceLayers(
         *runtimeState,
         exportPointCloudLayers);
@@ -35921,6 +35952,10 @@ ResolvedRenderSetupSnapshot BuildBackgroundWorkerSnapshot(
     snapshot.timing.state = setup.timingState;
     snapshot.timing.state.takeId = snapshot.timing.takeId;
     snapshot.timing.state.sceneGroupName = setup.sceneGroupName;
+    snapshot.timing.effectiveRainProfile =
+        CaptureRenderSetupRainProfileSnapshot(
+            setup.authoredWater,
+            snapshot.timing.takeId);
     snapshot.animationPath.selectedTimingTakeId =
         snapshot.timing.takeId;
     snapshot.document = setup;
@@ -36074,6 +36109,13 @@ bool InstallBackgroundWorkerRenderSetup(
     StartQueuedLayerLoadIfIdle(runtimeState);
 
     auto snapshot = BuildBackgroundWorkerSnapshot(setup);
+    if (!snapshot.timing.effectiveRainProfile.has_value()) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The recorded Timing Take has no effective Rain profile.";
+        }
+        return false;
+    }
     const auto visualSession = BackgroundWorkerVisualSessionIndex(
         *runtimeState,
         setup.sceneGroupName);
@@ -37912,11 +37954,16 @@ void NormalizeAnimationRenderSettings(RenderJobSettings* settings) {
 std::vector<OfflineRenderJobState::FrozenSeepageLayer> BuildFrozenAnimationSeepageLayers(
     PreviewRuntimeState* runtimeState,
     std::span<const invisible_places::renderer::core::SceneRenderState::PointCloudLayerState> exportLayers,
-    std::uint64_t effectiveInvocations) {
+    std::uint64_t effectiveInvocations,
+    const RainRuntimeSettings* rainSettingsOverride) {
     std::vector<OfflineRenderJobState::FrozenSeepageLayer> frozen;
     if (runtimeState == nullptr) {
         return frozen;
     }
+    const auto& rainSettings =
+        rainSettingsOverride != nullptr
+            ? *rainSettingsOverride
+            : runtimeState->water.collisionRainSettings;
     frozen.reserve(exportLayers.size());
     for (const auto& exportLayer : exportLayers) {
         if (exportLayer.layerId >= runtimeState->sessions.size()) {
@@ -37956,7 +38003,7 @@ std::vector<OfflineRenderJobState::FrozenSeepageLayer> BuildFrozenAnimationSeepa
                 runtimeState->water.defaultSeepageLook,
                 session.sceneRole,
                 true,
-                runtimeState->water.collisionRainSettings,
+                rainSettings,
                 effectiveInvocations,
                 guideSpan,
                 std::nullopt,
@@ -38002,6 +38049,15 @@ void FreezeAuthoredTimingState(
     const ResolvedTimingTakeExportSnapshot* timingSnapshot) {
     if (job == nullptr) {
         return;
+    }
+    if (timingSnapshot != nullptr) {
+        job->frozenTimingSnapshot = *timingSnapshot;
+        if (timingSnapshot->effectiveRainProfile.has_value()) {
+            job->waterRainSettings =
+                timingSnapshot->effectiveRainProfile->settings;
+            job->waterRainVisual =
+                timingSnapshot->effectiveRainProfile->visual;
+        }
     }
     job->frozenTimingTakeId = timingSnapshot != nullptr
         ? timingSnapshot->takeId
@@ -39119,7 +39175,8 @@ void StartSelectedQuickMp4Batch(
         BuildFrozenAnimationSeepageLayers(
             runtimeState,
             waterSnapshot->basePointCloudLayers,
-            waterSnapshot->effectiveSeepageInvocations);
+            waterSnapshot->effectiveSeepageInvocations,
+            &waterSnapshot->rainSettings);
     waterSnapshot->frozenFlowSourceLayers =
         BuildFrozenAnimationFlowSourceLayers(
             *runtimeState,
@@ -39326,11 +39383,17 @@ void StartStillCameraExportCapture(
     job.frozenSeepageLayers = BuildFrozenAnimationSeepageLayers(
         runtimeState,
         job.exportPointCloudLayers,
-        job.effectiveSeepageInvocations);
+        job.effectiveSeepageInvocations,
+        &job.waterRainSettings);
     job.frozenFlowSourceLayers = BuildFrozenAnimationFlowSourceLayers(
         *runtimeState,
         job.exportPointCloudLayers);
-    FreezeAuthoredTimingState(&job, *runtimeState);
+    FreezeAuthoredTimingState(
+        &job,
+        *runtimeState,
+        job.frozenTimingSnapshot.has_value()
+            ? &job.frozenTimingSnapshot.value()
+            : nullptr);
     PopulateOfflineRenderJobProvenance(
         &job,
         *runtimeState,
@@ -39497,6 +39560,17 @@ void StartStillCameraExportJob(
         runtimeState->errorMessage =
             "Cancel or finish the pending animation render request before "
             "starting a still-camera export.";
+        runtimeState->statusMessage.clear();
+        return;
+    }
+
+    std::string timingSnapshotError;
+    const auto timingSnapshot = ResolveTimingTakeExportSnapshot(
+        *runtimeState,
+        ActiveWaterTimingScenarioId(*runtimeState),
+        &timingSnapshotError);
+    if (!timingSnapshot.has_value()) {
+        runtimeState->errorMessage = std::move(timingSnapshotError);
         runtimeState->statusMessage.clear();
         return;
     }
@@ -39695,8 +39769,11 @@ void StartStillCameraExportJob(
         .stillCameraJob = true,
         .animationName = stillName,
         .waterScenarios = ExportWaterScenarioDefinitions(*runtimeState),
-        .waterRainSettings = runtimeState->water.collisionRainSettings,
-        .waterRainVisual = runtimeState->water.rainVisual,
+        .frozenTimingSnapshot = timingSnapshot.value(),
+        .waterRainSettings =
+            timingSnapshot->effectiveRainProfile->settings,
+        .waterRainVisual =
+            timingSnapshot->effectiveRainProfile->visual,
         .frozenPreviewWaterScenario = ResolveActiveWaterScenarioState(
             *runtimeState,
             runtimeState->exportUsesEditedScenario),
@@ -39966,7 +40043,8 @@ void StartAnimationExportJob(
     auto frozenSeepageLayers = BuildFrozenAnimationSeepageLayers(
         runtimeState,
         exportPointCloudLayers,
-        effectiveSeepageInvocations);
+        effectiveSeepageInvocations,
+        &timingSnapshot.effectiveRainProfile->settings);
     auto frozenFlowSourceLayers = BuildFrozenAnimationFlowSourceLayers(
         *runtimeState,
         exportPointCloudLayers);
@@ -40049,8 +40127,11 @@ void StartAnimationExportJob(
         .animationName = animationName,
         .animationPath = animationPathSnapshot,
         .waterScenarios = ExportWaterScenarioDefinitions(*runtimeState),
-        .waterRainSettings = runtimeState->water.collisionRainSettings,
-        .waterRainVisual = runtimeState->water.rainVisual,
+        .frozenTimingSnapshot = timingSnapshot,
+        .waterRainSettings =
+            timingSnapshot.effectiveRainProfile->settings,
+        .waterRainVisual =
+            timingSnapshot.effectiveRainProfile->visual,
         .frozenPreviewWaterScenario = ResolveActiveWaterScenarioState(
             *runtimeState,
             runtimeState->exportUsesEditedScenario),

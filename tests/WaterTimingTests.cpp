@@ -4076,6 +4076,74 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Timing Take Rain export snapshots retain stable identity and non-preset visuals after mutation",
+    "[water][rain][profiles][timing][snapshot]") {
+    using invisible_places::timing::CaptureTimingTakeRainProfileSnapshot;
+    using invisible_places::timing::TimingTakeDefinition;
+    using invisible_places::water::WaterRainProfile;
+
+    WaterRainProfile base;
+    base.id = "snapshot-base";
+    base.name = "Snapshot Rain";
+    base.settings.density = 0.19F;
+    WaterRainProfile owner = base;
+    owner.id = "snapshot-owner";
+    owner.name = "Snapshot Rain_Take";
+    owner.objectOverride = true;
+    owner.ownerTimingTakeId = "snapshot-take";
+    owner.baseProfileId = base.id;
+    owner.baseProfileName = base.name;
+    owner.settings.enabled = true;
+    owner.settings.visualProfileName = "Fine Lines, edited by hand";
+    owner.settings.activeParticleCount = 7'321U;
+    owner.settings.seed = 456U;
+    owner.settings.density = 0.713F;
+    owner.settings.rockImpact.downhillStretch = 2.31F;
+    owner.visual.colour = {0.13F, 0.57F, 0.89F};
+    owner.visual.widthMeters = 0.0063F;
+    owner.visual.streakLengthMeters = 0.271F;
+    owner.visual.softness = 0.23F;
+    owner.visual.opacity = 0.79F;
+    owner.visual.emission = 0.44F;
+    owner.visual.minimumScreenPixels = 1.17F;
+    owner.visual.maximumScreenPixels = 7.43F;
+    const auto expected = owner;
+    std::vector<WaterRainProfile> profiles{base, owner};
+    std::vector<TimingTakeDefinition> takes{
+        {.id = "snapshot-take",
+         .name = "Snapshot Take",
+         .assignedRainProfileId = owner.id,
+         .assignedRainProfileName = owner.name,
+         .baseRainProfileId = base.id,
+         .baseRainProfileName = base.name},
+    };
+
+    const auto captured = CaptureTimingTakeRainProfileSnapshot(
+        profiles,
+        takes,
+        "snapshot-take");
+    REQUIRE(captured.has_value());
+    CHECK(captured.value() == expected);
+
+    profiles[1].id = "mutated-owner";
+    profiles[1].name = "Mutated Rain";
+    profiles[1].settings.density = 0.02F;
+    profiles[1].visual.colour = {1.0F, 0.0F, 0.0F};
+    profiles[1].visual.opacity = 0.01F;
+    takes[0].assignedRainProfileId = base.id;
+    takes[0].assignedRainProfileName = base.name;
+    CHECK(captured->id == expected.id);
+    CHECK(captured->name == expected.name);
+    CHECK(captured->settings == expected.settings);
+    CHECK(captured->visual == expected.visual);
+    CHECK_FALSE(CaptureTimingTakeRainProfileSnapshot(
+                    profiles,
+                    takes,
+                    "missing-take")
+                    .has_value());
+}
+
+TEST_CASE(
     "live Rain synchronization resets only for identity changes or forced refresh",
     "[water][rain][profiles][timing]") {
     using invisible_places::timing::ResolveTimingTakeRainLiveSyncDecision;

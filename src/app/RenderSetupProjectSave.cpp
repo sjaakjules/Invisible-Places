@@ -426,6 +426,35 @@ void RebuildRenderSetupRainProject(
     }
 }
 
+std::optional<invisible_places::water::WaterRainProfile>
+CaptureRenderSetupRainProfileSnapshot(
+    const invisible_places::serialization::WaterSourcesDocument&
+        authoredWater,
+    std::string_view selectedTimingTakeId) {
+    ProjectDocument project;
+    project.timingTakes = {
+        invisible_places::timing::AuthoredTimingTakeDefinition()};
+    const auto normalizedTakeId =
+        invisible_places::timing::NormalizeTimingTakeId(
+            selectedTimingTakeId);
+    if (normalizedTakeId !=
+        invisible_places::timing::kAuthoredTimingTakeId) {
+        project.timingTakes.push_back({
+            .id = normalizedTakeId,
+            .name = normalizedTakeId,
+        });
+    }
+    RebuildRenderSetupRainProject(
+        authoredWater,
+        normalizedTakeId,
+        &project);
+    return invisible_places::timing::
+        CaptureTimingTakeRainProfileSnapshot(
+            project.waterRainProfiles,
+            project.timingTakes,
+            normalizedTakeId);
+}
+
 ProjectDocument MergeRenderSetupProjectForSave(
     const ProjectDocument& underlyingProject,
     const ProjectDocument& previewBaseline,

@@ -2,6 +2,7 @@
 
 #include "serialization/ProjectDocument.hpp"
 
+#include <optional>
 #include <string_view>
 
 namespace invisible_places::app {
@@ -16,6 +17,15 @@ void RebuildRenderSetupRainProject(
         authoredWater,
     std::string_view selectedTimingTakeId,
     invisible_places::serialization::ProjectDocument* project);
+
+// Resolves the setup's selected effective Rain after applying the same
+// synthetic-take reconstruction used by background workers. The returned
+// value is independent of both authoredWater and the live project.
+[[nodiscard]] std::optional<invisible_places::water::WaterRainProfile>
+CaptureRenderSetupRainProfileSnapshot(
+    const invisible_places::serialization::WaterSourcesDocument&
+        authoredWater,
+    std::string_view selectedTimingTakeId);
 
 // A loaded Render Setup is an isolated preview layered over the project.  The
 // preview baseline identifies setup-owned values, while changes made after
