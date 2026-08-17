@@ -2373,6 +2373,15 @@ struct SavedWaterTrailProfileState {
     std::string baseProfileName;
 };
 
+// Runtime-only Save As text is scoped to one exact owner copy. Changing the
+// selected source or editing a copy derived from another base cannot leak a
+// proposed reusable name between Path, Lane, and Trail panels.
+struct WaterFlowProfilePromotionUiState {
+    std::uint32_t ownerObjectId = 0U;
+    std::string workingProfileName;
+    std::string nameBuffer;
+};
+
 struct WaterTrailOverlayGroup {
     std::uint32_t sourceId = 0U;
     SavedWaterTrailProfileState trailProfile;
@@ -2999,6 +3008,7 @@ struct WaterWorkflowState {
     std::vector<SavedWaterPathProfileState> pathProfiles;
     std::string selectedPathProfileName = "Default";
     std::string pathProfileNameBuffer = "Default";
+    WaterFlowProfilePromotionUiState pathProfilePromotion;
     std::optional<WaterPathGenerationSettings> editedPathProfileSettings;
     WaterAnimationTrailSettings defaultAnimationTrailSettings =
         invisible_places::water::DefaultWaterAnimationTrailSettings();
@@ -3018,6 +3028,7 @@ struct WaterWorkflowState {
     std::vector<SavedWaterLaneProfileState> laneProfiles;
     std::string selectedLaneProfileName = "Default";
     std::string laneProfileNameBuffer = "Default";
+    WaterFlowProfilePromotionUiState laneProfilePromotion;
     std::optional<WaterFlowTrailSettings> editedLaneProfileSettings;
     WaterTrailGeometrySettings defaultTrailGeometry =
         invisible_places::water::DefaultWaterTrailGeometrySettings();
@@ -3025,6 +3036,7 @@ struct WaterWorkflowState {
     std::vector<SavedWaterTrailProfileState> trailProfiles;
     std::string selectedTrailProfileName = "Default";
     std::string trailProfileNameBuffer = "Default";
+    WaterFlowProfilePromotionUiState trailProfilePromotion;
     std::optional<SavedWaterTrailProfileState> editedTrailProfile;
     std::string dynamicMeshTrailProfileNameBuffer = "Default";
     std::optional<SavedWaterTrailProfileState> editedDynamicMeshTrailProfile;
@@ -14191,7 +14203,7 @@ void ClearWaterShorelineFromSavedVisuals(
 
 template <typename ProfileState>
 invisible_places::water::WaterObjectProfileEditDescriptor
-DescribeWaterSeepageProfileEdit(
+DescribeWaterObjectProfileEditIn(
     const std::vector<ProfileState>& profiles,
     std::string_view assignedProfileName,
     std::uint32_t selectedOwnerObjectId) {
@@ -14219,6 +14231,18 @@ DescribeWaterSeepageProfileEdit(
         normalizedAssigned,
         selectedOwnerObjectId,
         identity);
+}
+
+template <typename ProfileState>
+invisible_places::water::WaterObjectProfileEditDescriptor
+DescribeWaterSeepageProfileEdit(
+    const std::vector<ProfileState>& profiles,
+    std::string_view assignedProfileName,
+    std::uint32_t selectedOwnerObjectId) {
+    return DescribeWaterObjectProfileEditIn(
+        profiles,
+        assignedProfileName,
+        selectedOwnerObjectId);
 }
 
 // Keeps all three profile name fields following the primary selection's
@@ -16312,24 +16336,6 @@ const ProfileState* FindWaterFlowObjectProfileByName(
     return nullptr;
 }
 
-template <typename ProfileState>
-bool WaterFlowObjectProfileNameInUse(
-    const std::vector<ProfileState>& profiles,
-    std::string_view name,
-    const ProfileState* exclude) {
-    const auto normalized = NormalizeWaterProfileName(name);
-    if (normalized == kWaterProfileGlobalName || normalized == kWaterProfileDefaultName) {
-        return true;
-    }
-    for (const auto& profile : profiles) {
-        if (&profile != exclude &&
-            NormalizeWaterProfileName(profile.name) == normalized) {
-            return true;
-        }
-    }
-    return false;
-}
-
 // Copy names are human-readable and can collide with a base profile or a
 // same-named source's copy; the (owner, base) metadata stays authoritative,
 // so a numeric suffix only keeps by-name references unambiguous.
@@ -16338,17 +16344,19 @@ std::string UniqueWaterFlowObjectProfileName(
     const std::vector<ProfileState>& profiles,
     std::string_view preferredName,
     const ProfileState* exclude) {
-    const auto preferred = NormalizeWaterProfileName(preferredName);
-    if (!WaterFlowObjectProfileNameInUse(profiles, preferred, exclude)) {
-        return preferred;
-    }
-    for (std::uint32_t suffix = 2U; suffix < 10000U; ++suffix) {
-        const auto candidate = preferred + " " + std::to_string(suffix);
-        if (!WaterFlowObjectProfileNameInUse(profiles, candidate, exclude)) {
-            return candidate;
+    std::vector<std::string> reserved{
+        std::string{kWaterProfileDefaultName},
+        std::string{kWaterProfileGlobalName},
+    };
+    reserved.reserve(profiles.size() + reserved.size());
+    for (const auto& profile : profiles) {
+        if (&profile != exclude) {
+            reserved.push_back(NormalizeWaterProfileName(profile.name));
         }
     }
-    return preferred + " Copy";
+    return invisible_places::water::AllocateUniqueWaterObjectProfileName(
+        NormalizeWaterProfileName(preferredName),
+        reserved);
 }
 
 // The base a selected source's edit derives from: a Global assignment follows
@@ -17051,6 +17059,12 @@ void EnsureWaterProfiles(PreviewRuntimeState* runtimeState) {
         return;
     }
     auto& water = runtimeState->water;
+    // These name-entry buffers are session UI state, not project data. A
+    // newly loaded/imported project must never inherit a prior project's
+    // Save As text just because object ids and generated copy names match.
+    water.pathProfilePromotion = {};
+    water.laneProfilePromotion = {};
+    water.trailProfilePromotion = {};
     auto sanitizeNameList = [](auto* profiles, auto protectedPredicate) {
         using Profile = typename std::remove_reference_t<decltype(*profiles)>::value_type;
         std::vector<Profile> kept;
@@ -24259,6 +24273,28 @@ bool RefreshWaterDynamicMeshFlowOverlayFromUiEdit(
     return true;
 }
 
+void RefreshResolvedWaterDynamicMeshTrailProfile(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    const auto resolved =
+        ViewedDynamicMeshWaterTrailProfile(*runtimeState);
+    (void)ApplyWaterTrailLiveVisualProfile(
+        runtimeState,
+        resolved,
+        true,
+        true);
+    if (viewport != nullptr) {
+        (void)RefreshWaterDynamicMeshFlowOverlayFromUiEdit(
+            runtimeState,
+            viewport);
+    } else {
+        runtimeState->previewRenderStateSignatureValid = false;
+    }
+}
+
 void ApplyWaterFlowProfileReferenceRuntimeEffects(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport,
@@ -24275,23 +24311,10 @@ void ApplyWaterFlowProfileReferenceRuntimeEffects(
     if (rewrite.flowSourceRuntimeChanged()) {
         RefreshResolvedWaterFlowSourceSettings(runtimeState);
     }
-    if (!rewrite.dynamicMeshRuntimeChanged()) {
-        return;
-    }
-
-    const auto resolved =
-        ViewedDynamicMeshWaterTrailProfile(*runtimeState);
-    (void)ApplyWaterTrailLiveVisualProfile(
-        runtimeState,
-        resolved,
-        true,
-        true);
-    if (viewport != nullptr) {
-        (void)RefreshWaterDynamicMeshFlowOverlayFromUiEdit(
+    if (rewrite.dynamicMeshRuntimeChanged()) {
+        RefreshResolvedWaterDynamicMeshTrailProfile(
             runtimeState,
             viewport);
-    } else {
-        runtimeState->previewRenderStateSignatureValid = false;
     }
 }
 
@@ -71455,7 +71478,16 @@ void DrawWaterFlowObjectEditCaption(
         profiles,
         assignedProfileName,
         selectedProfileName);
-    const auto targetName = WaterFlowObjectProfileName(baseName, ownerName);
+    const auto ownedCopy = FindWaterFlowObjectProfileIndexIn(
+        profiles,
+        ownerObjectId,
+        baseName);
+    const auto targetName = ownedCopy.has_value()
+        ? NormalizeWaterProfileName(profiles[ownedCopy.value()].name)
+        : UniqueWaterFlowObjectProfileName(
+              profiles,
+              WaterFlowObjectProfileName(baseName, ownerName),
+              static_cast<const ProfileState*>(nullptr));
     if (assignedCopy != nullptr) {
         ImGui::TextDisabled(
             "Using \"%s\" (another source's copy, read-only) — editing saves your own \"%s\".",
@@ -72001,6 +72033,694 @@ std::size_t ApplyWaterTrailLiveVisualProfile(
         ++updatedCount;
     }
     return updatedCount;
+}
+
+const char* WaterFlowProfileKindLabel(WaterProfileKind kind) {
+    switch (kind) {
+        case WaterProfileKind::Path:
+            return "Path";
+        case WaterProfileKind::Lane:
+            return "Lane";
+        case WaterProfileKind::Trail:
+            return "Trail";
+    }
+    return "Flow";
+}
+
+WaterFlowProfilePromotionUiState* WaterFlowProfilePromotionState(
+    WaterWorkflowState* water,
+    WaterProfileKind kind) {
+    if (water == nullptr) {
+        return nullptr;
+    }
+    switch (kind) {
+        case WaterProfileKind::Path:
+            return &water->pathProfilePromotion;
+        case WaterProfileKind::Lane:
+            return &water->laneProfilePromotion;
+        case WaterProfileKind::Trail:
+            return &water->trailProfilePromotion;
+    }
+    return nullptr;
+}
+
+invisible_places::water::WaterObjectProfileEditDescriptor
+DescribeWaterFlowProfileEdit(
+    const WaterWorkflowState& water,
+    WaterProfileKind kind,
+    std::string_view assignedProfileName,
+    std::uint32_t ownerObjectId) {
+    switch (kind) {
+        case WaterProfileKind::Path:
+            return DescribeWaterObjectProfileEditIn(
+                water.pathProfiles,
+                assignedProfileName,
+                ownerObjectId);
+        case WaterProfileKind::Lane:
+            return DescribeWaterObjectProfileEditIn(
+                water.laneProfiles,
+                assignedProfileName,
+                ownerObjectId);
+        case WaterProfileKind::Trail:
+            return DescribeWaterObjectProfileEditIn(
+                water.trailProfiles,
+                assignedProfileName,
+                ownerObjectId);
+    }
+    return {};
+}
+
+invisible_places::water::WaterObjectProfileBaseKind
+WaterFlowProfileBaseKind(
+    const PreviewRuntimeState& runtimeState,
+    WaterProfileKind kind,
+    std::string_view baseProfileName) {
+    using BaseKind =
+        invisible_places::water::WaterObjectProfileBaseKind;
+    const auto base = NormalizeWaterProfileName(baseProfileName);
+    if (base == kWaterProfileDefaultName) {
+        return BaseKind::Default;
+    }
+    const bool protectedBase =
+        kind == WaterProfileKind::Path
+            ? IsProtectedWaterPathProfileName(base)
+        : kind == WaterProfileKind::Lane
+            ? IsProtectedWaterLaneProfileName(base)
+            : IsProtectedWaterTrailProfileName(runtimeState, base);
+    if (protectedBase) {
+        return BaseKind::Protected;
+    }
+    const auto classify = [&](const auto& profiles) {
+        const auto found = std::find_if(
+            profiles.begin(),
+            profiles.end(),
+            [&](const auto& profile) {
+                return NormalizeWaterProfileName(profile.name) == base;
+            });
+        if (found == profiles.end()) {
+            return BaseKind::Missing;
+        }
+        return found->objectOverride ? BaseKind::ObjectCopy
+                                     : BaseKind::Shared;
+    };
+    switch (kind) {
+        case WaterProfileKind::Path:
+            return classify(runtimeState.water.pathProfiles);
+        case WaterProfileKind::Lane:
+            return classify(runtimeState.water.laneProfiles);
+        case WaterProfileKind::Trail:
+            return classify(runtimeState.water.trailProfiles);
+    }
+    return BaseKind::Missing;
+}
+
+std::vector<std::string> ReservedWaterFlowProfileNames(
+    const WaterWorkflowState& water,
+    WaterProfileKind kind) {
+    std::vector<std::string> reserved{
+        std::string{kWaterProfileDefaultName},
+        std::string{kWaterProfileGlobalName},
+    };
+    const auto appendNames = [&](const auto& names) {
+        for (const auto name : names) {
+            reserved.emplace_back(name);
+        }
+    };
+    const auto appendProfiles = [&](const auto& profiles) {
+        for (const auto& profile : profiles) {
+            reserved.push_back(profile.name);
+        }
+    };
+    switch (kind) {
+        case WaterProfileKind::Path:
+            appendNames(kBuiltInWaterPathProfileNames);
+            appendProfiles(water.pathProfiles);
+            break;
+        case WaterProfileKind::Lane:
+            appendNames(kBuiltInWaterLaneProfileNames);
+            appendProfiles(water.laneProfiles);
+            break;
+        case WaterProfileKind::Trail:
+            appendNames(kBuiltInWaterTrailProfileNames);
+            appendProfiles(water.trailProfiles);
+            break;
+    }
+    return reserved;
+}
+
+template <typename ProfileState>
+std::optional<std::size_t> FindOwnedWaterFlowWorkingProfileIndex(
+    const std::vector<ProfileState>& profiles,
+    std::string_view profileName,
+    std::uint32_t ownerObjectId) {
+    const auto name = NormalizeWaterProfileName(profileName);
+    for (std::size_t index = 0U; index < profiles.size(); ++index) {
+        const auto& profile = profiles[index];
+        if (profile.objectOverride &&
+            profile.ownerObjectId == ownerObjectId &&
+            NormalizeWaterProfileName(profile.name) == name) {
+            return index;
+        }
+    }
+    return std::nullopt;
+}
+
+template <typename ProfileState>
+std::optional<std::size_t> FindSharedWaterFlowProfileIndex(
+    const std::vector<ProfileState>& profiles,
+    std::string_view profileName) {
+    const auto name = NormalizeWaterProfileName(profileName);
+    for (std::size_t index = 0U; index < profiles.size(); ++index) {
+        const auto& profile = profiles[index];
+        if (!profile.objectOverride &&
+            NormalizeWaterProfileName(profile.name) == name) {
+            return index;
+        }
+    }
+    return std::nullopt;
+}
+
+template <typename ProfileState>
+bool EraseOwnedWaterFlowWorkingProfile(
+    std::vector<ProfileState>* profiles,
+    std::string_view profileName,
+    std::uint32_t ownerObjectId) {
+    if (profiles == nullptr) {
+        return false;
+    }
+    const auto index = FindOwnedWaterFlowWorkingProfileIndex(
+        *profiles,
+        profileName,
+        ownerObjectId);
+    if (!index.has_value()) {
+        return false;
+    }
+    profiles->erase(
+        profiles->begin() +
+        static_cast<std::ptrdiff_t>(index.value()));
+    return true;
+}
+
+struct WaterPathProfilePromotionRuntimeSnapshot {
+    std::unordered_map<std::uint32_t, std::string> fingerprints;
+    std::unordered_map<std::uint32_t, float> smoothing;
+};
+
+WaterPathProfilePromotionRuntimeSnapshot
+CaptureWaterPathProfilePromotionRuntimeSnapshot(
+    const WaterWorkflowState& water) {
+    WaterPathProfilePromotionRuntimeSnapshot snapshot;
+    snapshot.fingerprints.reserve(water.emitters.size());
+    snapshot.smoothing.reserve(water.emitters.size());
+    for (const auto& emitter : water.emitters) {
+        snapshot.fingerprints.emplace(
+            emitter.id,
+            WaterEmitterBakeFingerprint(water, emitter));
+        snapshot.smoothing.emplace(
+            emitter.id,
+            ResolveEmitterWaterPathSettings(water, emitter).smoothing);
+    }
+    return snapshot;
+}
+
+void ApplyWaterPathProfilePromotionRuntimeChanges(
+    PreviewRuntimeState* runtimeState,
+    const WaterPathProfilePromotionRuntimeSnapshot& before) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    std::vector<std::uint32_t> smoothingOnlySourceIds;
+    for (const auto& emitter : runtimeState->water.emitters) {
+        const auto fingerprint = WaterEmitterBakeFingerprint(
+            runtimeState->water,
+            emitter);
+        const auto previousFingerprint =
+            before.fingerprints.find(emitter.id);
+        if (previousFingerprint == before.fingerprints.end() ||
+            previousFingerprint->second != fingerprint) {
+            MarkWaterPathDirty(runtimeState, emitter.id);
+            continue;
+        }
+        const auto previousSmoothing = before.smoothing.find(emitter.id);
+        const auto smoothing = ResolveEmitterWaterPathSettings(
+            runtimeState->water,
+            emitter).smoothing;
+        if (previousSmoothing != before.smoothing.end() &&
+            std::abs(previousSmoothing->second - smoothing) > 1.0e-6F) {
+            smoothingOnlySourceIds.push_back(emitter.id);
+        }
+    }
+    if (smoothingOnlySourceIds.empty()) {
+        return;
+    }
+    if (runtimeState->water.pathCacheLoaded &&
+        !runtimeState->water.pathCache.branches.empty()) {
+        runtimeState->water.pathAnchors =
+            WaterPathAnchorsFromCacheWithProfileSettings(*runtimeState);
+    }
+    for (const auto sourceId : smoothingOnlySourceIds) {
+        QueueWaterFlowTrailRefresh(
+            runtimeState,
+            WaterOverlayRefreshPersistence::InMemoryOnly,
+            std::chrono::milliseconds{0},
+            sourceId);
+    }
+}
+
+std::string WaterFlowProfilePromotionFailureMessage(
+    invisible_places::water::WaterObjectProfilePromotionFailure failure,
+    WaterProfileKind kind) {
+    using Failure =
+        invisible_places::water::WaterObjectProfilePromotionFailure;
+    const std::string label = WaterFlowProfileKindLabel(kind);
+    switch (failure) {
+        case Failure::None:
+            return {};
+        case Failure::NotOwnedWorkingCopy:
+            return "Select the source that owns this " + label +
+                   " copy before changing it.";
+        case Failure::ProtectedBaseRequiresSaveAs:
+            return "The saved base is a protected " + label +
+                   " preset; use Save As.";
+        case Failure::MissingBaseRequiresSaveAs:
+            return "The saved base is missing; use Save As to preserve this " +
+                   label + " copy.";
+        case Failure::ObjectCopyBaseRequiresSaveAs:
+            return "The recorded base is another source's copy; use Save As.";
+        case Failure::MissingDiscardBase:
+            return "Cannot discard because the exact saved base is missing.";
+        case Failure::ObjectCopyDiscardBase:
+            return "Cannot discard into another source's object copy.";
+    }
+    return "This profile transaction is unavailable.";
+}
+
+struct WaterFlowObjectProfilePromotionOutcome {
+    bool applied = false;
+    std::string targetProfileName;
+    std::string error;
+};
+
+WaterFlowObjectProfilePromotionOutcome ExecuteWaterFlowObjectProfilePromotion(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    WaterProfileKind kind,
+    std::string_view assignedProfileName,
+    std::uint32_t ownerObjectId,
+    invisible_places::water::WaterObjectProfilePromotionOperation operation,
+    std::string_view requestedProfileName) {
+    using Operation =
+        invisible_places::water::WaterObjectProfilePromotionOperation;
+    WaterFlowObjectProfilePromotionOutcome outcome;
+    if (runtimeState == nullptr) {
+        outcome.error = "Water preview is unavailable.";
+        return outcome;
+    }
+    auto& water = runtimeState->water;
+    const auto descriptor = DescribeWaterFlowProfileEdit(
+        water,
+        kind,
+        assignedProfileName,
+        ownerObjectId);
+    const auto baseKind = WaterFlowProfileBaseKind(
+        *runtimeState,
+        kind,
+        descriptor.exactBaseProfileName);
+    const auto reserved = ReservedWaterFlowProfileNames(water, kind);
+    const auto plan = invisible_places::water::
+        PlanWaterObjectProfilePromotion(
+            descriptor,
+            operation,
+            baseKind,
+            requestedProfileName,
+            reserved);
+    if (!plan.allowed()) {
+        outcome.error = WaterFlowProfilePromotionFailureMessage(
+            plan.failure,
+            kind);
+        return outcome;
+    }
+
+    std::optional<WaterPathGenerationSettings> pathSnapshot;
+    std::optional<WaterFlowTrailSettings> laneSnapshot;
+    std::optional<SavedWaterTrailProfileState> trailSnapshot;
+    std::optional<std::size_t> sharedTargetIndex;
+    switch (kind) {
+        case WaterProfileKind::Path: {
+            const auto working = FindOwnedWaterFlowWorkingProfileIndex(
+                water.pathProfiles,
+                plan.workingProfileName,
+                ownerObjectId);
+            if (!working.has_value()) {
+                outcome.error = "The selected Path working copy no longer exists.";
+                return outcome;
+            }
+            pathSnapshot = water.pathProfiles[working.value()].settings;
+            if (operation == Operation::Save &&
+                plan.targetProfileName != kWaterProfileDefaultName) {
+                sharedTargetIndex = FindSharedWaterFlowProfileIndex(
+                    water.pathProfiles,
+                    plan.targetProfileName);
+            }
+            break;
+        }
+        case WaterProfileKind::Lane: {
+            const auto working = FindOwnedWaterFlowWorkingProfileIndex(
+                water.laneProfiles,
+                plan.workingProfileName,
+                ownerObjectId);
+            if (!working.has_value()) {
+                outcome.error = "The selected Lane working copy no longer exists.";
+                return outcome;
+            }
+            laneSnapshot = water.laneProfiles[working.value()].settings;
+            if (operation == Operation::Save &&
+                plan.targetProfileName != kWaterProfileDefaultName) {
+                sharedTargetIndex = FindSharedWaterFlowProfileIndex(
+                    water.laneProfiles,
+                    plan.targetProfileName);
+            }
+            break;
+        }
+        case WaterProfileKind::Trail: {
+            const auto working = FindOwnedWaterFlowWorkingProfileIndex(
+                water.trailProfiles,
+                plan.workingProfileName,
+                ownerObjectId);
+            if (!working.has_value()) {
+                outcome.error = "The selected Trail working copy no longer exists.";
+                return outcome;
+            }
+            trailSnapshot = water.trailProfiles[working.value()];
+            if (operation == Operation::Save &&
+                plan.targetProfileName != kWaterProfileDefaultName) {
+                sharedTargetIndex = FindSharedWaterFlowProfileIndex(
+                    water.trailProfiles,
+                    plan.targetProfileName);
+            }
+            break;
+        }
+    }
+    if (operation == Operation::Save &&
+        plan.targetProfileName != kWaterProfileDefaultName &&
+        !sharedTargetIndex.has_value()) {
+        outcome.error = "The exact saved base disappeared; use Save As.";
+        return outcome;
+    }
+
+    std::optional<WaterPathProfilePromotionRuntimeSnapshot>
+        pathRuntimeBefore;
+    if (kind == WaterProfileKind::Path) {
+        pathRuntimeBefore =
+            CaptureWaterPathProfilePromotionRuntimeSnapshot(water);
+    }
+    bool dynamicMeshTargetConsumer = false;
+    if (kind == WaterProfileKind::Trail &&
+        operation != Operation::Discard &&
+        !water.editedDynamicMeshTrailProfile.has_value()) {
+        const auto meshProfile =
+            ViewedDynamicMeshWaterTrailProfile(*runtimeState);
+        dynamicMeshTargetConsumer =
+            NormalizeWaterProfileName(
+                water.dynamicMeshFlowSettings.trailProfileName) ==
+                NormalizeWaterProfileName(plan.targetProfileName) ||
+            NormalizeWaterProfileName(meshProfile.name) ==
+                NormalizeWaterProfileName(plan.targetProfileName);
+    }
+
+    WaterFlowProfileReferenceRewrite rewrite;
+    const bool applied = invisible_places::water::
+        RunWaterObjectProfilePromotionTransaction(
+            plan,
+            {
+                .writeTarget = [&](std::string_view) {
+                    switch (kind) {
+                        case WaterProfileKind::Path:
+                            if (plan.createShared) {
+                                water.pathProfiles.push_back({
+                                    .name = plan.targetProfileName,
+                                    .settings = pathSnapshot.value(),
+                                });
+                            } else if (plan.targetProfileName ==
+                                       kWaterProfileDefaultName) {
+                                water.defaultSourceSettings.path =
+                                    pathSnapshot.value();
+                            } else {
+                                water.pathProfiles[
+                                    sharedTargetIndex.value()].settings =
+                                    pathSnapshot.value();
+                            }
+                            break;
+                        case WaterProfileKind::Lane:
+                            if (plan.createShared) {
+                                water.laneProfiles.push_back({
+                                    .name = plan.targetProfileName,
+                                    .settings = laneSnapshot.value(),
+                                });
+                            } else if (plan.targetProfileName ==
+                                       kWaterProfileDefaultName) {
+                                water.flowTrailSettings =
+                                    laneSnapshot.value();
+                            } else {
+                                water.laneProfiles[
+                                    sharedTargetIndex.value()].settings =
+                                    laneSnapshot.value();
+                            }
+                            break;
+                        case WaterProfileKind::Trail:
+                            if (plan.createShared) {
+                                water.trailProfiles.push_back(
+                                    MakeWaterTrailProfile(
+                                        plan.targetProfileName,
+                                        trailSnapshot->geometry,
+                                        trailSnapshot->style));
+                            } else if (plan.targetProfileName ==
+                                       kWaterProfileDefaultName) {
+                                water.defaultTrailGeometry =
+                                    trailSnapshot->geometry;
+                                water.defaultPointVisualStyle =
+                                    trailSnapshot->style;
+                            } else {
+                                auto& target = water.trailProfiles[
+                                    sharedTargetIndex.value()];
+                                target.geometry = trailSnapshot->geometry;
+                                target.style = trailSnapshot->style;
+                            }
+                            break;
+                    }
+                    return true;
+                },
+                .rewriteReferences = [&] (
+                    std::string_view previous,
+                    std::string_view next) {
+                    rewrite = ReplaceWaterFlowProfileReferences(
+                        &water,
+                        kind,
+                        previous,
+                        next);
+                    return true;
+                },
+                .eraseWorkingCopy = [&](std::string_view workingName) {
+                    switch (kind) {
+                        case WaterProfileKind::Path:
+                            return EraseOwnedWaterFlowWorkingProfile(
+                                &water.pathProfiles,
+                                workingName,
+                                ownerObjectId);
+                        case WaterProfileKind::Lane:
+                            return EraseOwnedWaterFlowWorkingProfile(
+                                &water.laneProfiles,
+                                workingName,
+                                ownerObjectId);
+                        case WaterProfileKind::Trail:
+                            return EraseOwnedWaterFlowWorkingProfile(
+                                &water.trailProfiles,
+                                workingName,
+                                ownerObjectId);
+                    }
+                    return false;
+                },
+            });
+    if (!applied) {
+        outcome.error =
+            "The owner copy changed during the profile transaction.";
+        return outcome;
+    }
+
+    ApplyWaterFlowProfileReferenceRuntimeEffects(
+        runtimeState,
+        viewport,
+        rewrite);
+    if (kind == WaterProfileKind::Path &&
+        pathRuntimeBefore.has_value()) {
+        ApplyWaterPathProfilePromotionRuntimeChanges(
+            runtimeState,
+            pathRuntimeBefore.value());
+    } else if ((kind == WaterProfileKind::Lane ||
+                kind == WaterProfileKind::Trail) &&
+               !rewrite.flowSourceRuntimeChanged()) {
+        RefreshResolvedWaterFlowSourceSettings(runtimeState);
+    }
+    if (kind == WaterProfileKind::Trail &&
+        dynamicMeshTargetConsumer &&
+        !rewrite.dynamicMeshRuntimeChanged()) {
+        RefreshResolvedWaterDynamicMeshTrailProfile(
+            runtimeState,
+            viewport);
+    }
+
+    if (auto* state = WaterFlowProfilePromotionState(&water, kind);
+        state != nullptr) {
+        *state = {};
+    }
+    outcome.applied = true;
+    outcome.targetProfileName = plan.targetProfileName;
+    const std::string label = WaterFlowProfileKindLabel(kind);
+    if (operation == Operation::Discard) {
+        runtimeState->statusMessage =
+            "Discarded " + label + " edits; restored " +
+            plan.targetProfileName + ".";
+    } else if (operation == Operation::SaveAs) {
+        runtimeState->statusMessage =
+            "Saved reusable " + label + " profile " +
+            plan.targetProfileName + ".";
+    } else {
+        runtimeState->statusMessage =
+            "Saved " + label + " edits into " +
+            plan.targetProfileName + ".";
+    }
+    runtimeState->errorMessage.clear();
+    return outcome;
+}
+
+void DrawWaterFlowObjectProfilePromotionControls(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    WaterProfileKind kind,
+    std::string_view assignedProfileName,
+    std::uint32_t ownerObjectId) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    auto& water = runtimeState->water;
+    const auto descriptor = DescribeWaterFlowProfileEdit(
+        water,
+        kind,
+        assignedProfileName,
+        ownerObjectId);
+    if (!descriptor.ownedObjectCopy ||
+        descriptor.removableWorkingProfileName.empty()) {
+        return;
+    }
+    auto* state = WaterFlowProfilePromotionState(&water, kind);
+    if (state == nullptr) {
+        return;
+    }
+    if (state->ownerObjectId != ownerObjectId ||
+        NormalizeWaterProfileName(state->workingProfileName) !=
+            NormalizeWaterProfileName(
+                descriptor.removableWorkingProfileName)) {
+        state->ownerObjectId = ownerObjectId;
+        state->workingProfileName =
+            descriptor.removableWorkingProfileName;
+        state->nameBuffer = descriptor.suggestedSaveProfileName;
+    }
+
+    using Operation =
+        invisible_places::water::WaterObjectProfilePromotionOperation;
+    const auto baseKind = WaterFlowProfileBaseKind(
+        *runtimeState,
+        kind,
+        descriptor.exactBaseProfileName);
+    const auto reserved = ReservedWaterFlowProfileNames(water, kind);
+    const auto savePlan = invisible_places::water::
+        PlanWaterObjectProfilePromotion(
+            descriptor,
+            Operation::Save,
+            baseKind,
+            state->nameBuffer,
+            reserved);
+    const auto discardPlan = invisible_places::water::
+        PlanWaterObjectProfilePromotion(
+            descriptor,
+            Operation::Discard,
+            baseKind,
+            state->nameBuffer,
+            reserved);
+
+    const std::string label = WaterFlowProfileKindLabel(kind);
+    ImGui::PushID("FlowObjectProfilePromotion");
+    ImGui::PushID(static_cast<int>(kind));
+    ImGui::PushID(static_cast<int>(ownerObjectId));
+    ImGui::Separator();
+    ImGui::TextDisabled(
+        "Working copy: %s  |  saved base: %s",
+        descriptor.removableWorkingProfileName.c_str(),
+        descriptor.exactBaseProfileName.c_str());
+    InputTextString(
+        ("Save As " + label + " Name").c_str(),
+        &state->nameBuffer);
+
+    std::optional<Operation> requestedOperation;
+    ImGui::BeginDisabled(!savePlan.allowed());
+    if (ImGui::Button("Save")) {
+        requestedOperation = Operation::Save;
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(
+            ImGuiHoveredFlags_AllowWhenDisabled |
+            ImGuiHoveredFlags_DelayNormal)) {
+        const auto message = savePlan.allowed()
+            ? "Overwrites the exact saved base with this source's current copy, then removes the working copy."
+            : WaterFlowProfilePromotionFailureMessage(
+                  savePlan.failure,
+                  kind);
+        ImGui::SetTooltip("%s", message.c_str());
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Save As")) {
+        requestedOperation = Operation::SaveAs;
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+        ImGui::SetTooltip(
+            "Creates a new reusable %s profile without overwriting any existing name; collisions receive a numeric suffix.",
+            label.c_str());
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!discardPlan.allowed());
+    if (ImGui::Button("Discard")) {
+        requestedOperation = Operation::Discard;
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(
+            ImGuiHoveredFlags_AllowWhenDisabled |
+            ImGuiHoveredFlags_DelayNormal)) {
+        const auto message = discardPlan.allowed()
+            ? "Deletes this owner copy and restores every exact source, timing track, package, and compatible mesh reference to its saved base."
+            : WaterFlowProfilePromotionFailureMessage(
+                  discardPlan.failure,
+                  kind);
+        ImGui::SetTooltip("%s", message.c_str());
+    }
+    ImGui::PopID();
+    ImGui::PopID();
+    ImGui::PopID();
+
+    if (!requestedOperation.has_value()) {
+        return;
+    }
+    const auto outcome = ExecuteWaterFlowObjectProfilePromotion(
+        runtimeState,
+        viewport,
+        kind,
+        descriptor.removableWorkingProfileName,
+        ownerObjectId,
+        requestedOperation.value(),
+        state->nameBuffer);
+    if (!outcome.applied) {
+        runtimeState->errorMessage = outcome.error;
+        runtimeState->statusMessage.clear();
+    }
 }
 
 struct WaterTrailStyleEditResult {
@@ -80135,6 +80855,14 @@ void DrawWaterPanel(
                 }
                 runtimeState->errorMessage.clear();
             }
+            if (pathEditEmitter != nullptr) {
+                DrawWaterFlowObjectProfilePromotionControls(
+                    runtimeState,
+                    viewport,
+                    WaterProfileKind::Path,
+                    pathEditEmitter->pathProfileName,
+                    pathEditEmitter->id);
+            }
             if (water.pathCacheLoaded && !water.pathCache.diagnostics.summary.empty()) {
                 ImGui::TextDisabled("%s", water.pathCache.diagnostics.summary.c_str());
                 ImGui::TextDisabled(
@@ -80537,6 +81265,14 @@ void DrawWaterPanel(
                     }
                 }
             }
+            if (laneAssignment != nullptr) {
+                DrawWaterFlowObjectProfilePromotionControls(
+                    runtimeState,
+                    viewport,
+                    WaterProfileKind::Lane,
+                    *laneAssignment,
+                    laneOwnerId);
+            }
             if (ImGui::Button("Regenerate Lanes")) {
                 QueueWaterFlowTrailRefresh(
                     runtimeState,
@@ -80577,6 +81313,12 @@ void DrawWaterPanel(
                     trailEditEmitter->id,
                     WaterFlowSourceDisplayName(trailEditEmitter->name, trailEditEmitter->id),
                     ResolveEmitterWaterTrailProfile(*runtimeState, *trailEditEmitter));
+                DrawWaterFlowObjectProfilePromotionControls(
+                    runtimeState,
+                    viewport,
+                    WaterProfileKind::Trail,
+                    trailEditEmitter->trailProfileName,
+                    trailEditEmitter->id);
             } else if (trailEditManualPath != nullptr) {
                 DrawWaterFlowObjectEditCaption(
                     water.trailProfiles,
@@ -80590,6 +81332,12 @@ void DrawWaterPanel(
                     trailEditManualPath->id,
                     WaterFlowSourceDisplayName(trailEditManualPath->name, trailEditManualPath->id),
                     ResolveManualFlowPathTrailProfile(*runtimeState, *trailEditManualPath));
+                DrawWaterFlowObjectProfilePromotionControls(
+                    runtimeState,
+                    viewport,
+                    WaterProfileKind::Trail,
+                    trailEditManualPath->trailProfileName,
+                    trailEditManualPath->id);
             } else {
                 DrawWaterTrailProfileSelector(runtimeState, viewport);
                 DrawWaterTrailStyleEditor(runtimeState, viewport, ViewedGlobalWaterTrailProfile(*runtimeState));

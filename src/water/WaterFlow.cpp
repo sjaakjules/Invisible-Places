@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <fstream>
 #include <iomanip>
 #include <iterator>
@@ -8856,6 +8857,176 @@ WaterObjectProfileEditDescriptor DescribeWaterObjectProfileEdit(
     descriptor.suggestedSaveProfileName =
         savedName(descriptor.exactBaseProfileName);
     return descriptor;
+}
+
+WaterObjectProfilePromotionPlan PlanWaterObjectProfilePromotion(
+    const WaterObjectProfileEditDescriptor& descriptor,
+    WaterObjectProfilePromotionOperation operation,
+    WaterObjectProfileBaseKind baseKind,
+    std::string_view requestedProfileName,
+    std::span<const std::string> reservedProfileNames) {
+    WaterObjectProfilePromotionPlan plan;
+    plan.operation = operation;
+    plan.workingProfileName =
+        std::string{TrimSeepageName(
+            descriptor.removableWorkingProfileName)};
+    if (!descriptor.ownedObjectCopy ||
+        plan.workingProfileName.empty()) {
+        plan.failure = WaterObjectProfilePromotionFailure::
+            NotOwnedWorkingCopy;
+        return plan;
+    }
+
+    const auto exactBase = [&]() {
+        const auto trimmed =
+            TrimSeepageName(descriptor.exactBaseProfileName);
+        return trimmed.empty() ? std::string{"Default"}
+                               : std::string{trimmed};
+    }();
+    if (operation == WaterObjectProfilePromotionOperation::Save) {
+        switch (baseKind) {
+            case WaterObjectProfileBaseKind::Default:
+            case WaterObjectProfileBaseKind::Shared:
+                plan.targetProfileName = exactBase;
+                plan.overwriteExisting = true;
+                plan.eraseWorkingCopy = true;
+                return plan;
+            case WaterObjectProfileBaseKind::Protected:
+                plan.failure = WaterObjectProfilePromotionFailure::
+                    ProtectedBaseRequiresSaveAs;
+                return plan;
+            case WaterObjectProfileBaseKind::Missing:
+                plan.failure = WaterObjectProfilePromotionFailure::
+                    MissingBaseRequiresSaveAs;
+                return plan;
+            case WaterObjectProfileBaseKind::ObjectCopy:
+                plan.failure = WaterObjectProfilePromotionFailure::
+                    ObjectCopyBaseRequiresSaveAs;
+                return plan;
+        }
+    }
+
+    if (operation == WaterObjectProfilePromotionOperation::Discard) {
+        switch (baseKind) {
+            case WaterObjectProfileBaseKind::Default:
+            case WaterObjectProfileBaseKind::Shared:
+            case WaterObjectProfileBaseKind::Protected:
+                plan.targetProfileName = exactBase;
+                plan.eraseWorkingCopy = true;
+                return plan;
+            case WaterObjectProfileBaseKind::Missing:
+                plan.failure = WaterObjectProfilePromotionFailure::
+                    MissingDiscardBase;
+                return plan;
+            case WaterObjectProfileBaseKind::ObjectCopy:
+                plan.failure = WaterObjectProfilePromotionFailure::
+                    ObjectCopyDiscardBase;
+                return plan;
+        }
+    }
+
+    const auto reusableName = [](std::string_view name) {
+        auto reusable = std::string{TrimSeepageName(name)};
+        constexpr std::array suffixes{
+            std::string_view{"_edited"},
+            std::string_view{"_Edited"},
+            std::string_view{"_preset"},
+        };
+        bool stripped = true;
+        while (stripped && !reusable.empty()) {
+            stripped = false;
+            for (const auto suffix : suffixes) {
+                if (reusable.size() >= suffix.size() &&
+                    reusable.ends_with(suffix)) {
+                    reusable.erase(reusable.size() - suffix.size());
+                    stripped = true;
+                    break;
+                }
+            }
+        }
+        return std::string{TrimSeepageName(reusable)};
+    };
+    auto preferred = reusableName(requestedProfileName);
+    if (preferred.empty()) {
+        preferred = reusableName(
+            descriptor.suggestedSaveProfileName);
+    }
+    if (preferred.empty()) {
+        preferred = "Profile";
+    }
+    plan.targetProfileName = AllocateUniqueWaterObjectProfileName(
+        preferred,
+        reservedProfileNames);
+    plan.createShared = true;
+    plan.eraseWorkingCopy = true;
+    return plan;
+}
+
+std::string AllocateUniqueWaterObjectProfileName(
+    std::string_view preferredProfileName,
+    std::span<const std::string> reservedProfileNames) {
+    auto preferred = std::string{TrimSeepageName(preferredProfileName)};
+    if (preferred.empty()) {
+        preferred = "Profile";
+    }
+    const auto inUse = [&](std::string_view name) {
+        const auto normalized = TrimSeepageName(name);
+        if (normalized.ends_with("_preset")) {
+            return true;
+        }
+        return std::any_of(
+            reservedProfileNames.begin(),
+            reservedProfileNames.end(),
+            [&](const std::string& reserved) {
+                return TrimSeepageName(reserved) == normalized;
+            });
+    };
+    if (!inUse(preferred)) {
+        return preferred;
+    }
+
+    // N reservations cannot occupy all N+1 distinct numeric candidates.
+    // This bound is deliberately derived from the input rather than capped.
+    const auto candidateCount = reservedProfileNames.size() + 1U;
+    for (std::size_t offset = 0U; offset < candidateCount; ++offset) {
+        const auto candidate =
+            preferred + " " + std::to_string(offset + 2U);
+        if (!inUse(candidate)) {
+            return candidate;
+        }
+    }
+
+    // The pigeonhole bound above makes this unreachable for a finite span.
+    std::terminate();
+}
+
+bool RunWaterObjectProfilePromotionTransaction(
+    const WaterObjectProfilePromotionPlan& plan,
+    const WaterObjectProfilePromotionTransactionCallbacks& callbacks) {
+    if (!plan.allowed() || plan.workingProfileName.empty() ||
+        plan.targetProfileName.empty() || !plan.eraseWorkingCopy) {
+        return false;
+    }
+    const bool writesTarget =
+        plan.operation != WaterObjectProfilePromotionOperation::Discard;
+    if ((writesTarget && !callbacks.writeTarget) ||
+        !callbacks.rewriteReferences || !callbacks.eraseWorkingCopy) {
+        return false;
+    }
+    if (writesTarget) {
+        if (!callbacks.writeTarget(plan.targetProfileName)) {
+            return false;
+        }
+    }
+    if (!callbacks.rewriteReferences(
+            plan.workingProfileName,
+            plan.targetProfileName)) {
+        return false;
+    }
+    if (!callbacks.eraseWorkingCopy(plan.workingProfileName)) {
+        return false;
+    }
+    return true;
 }
 
 std::size_t ReplaceWaterSeepageNodeProfileReferences(

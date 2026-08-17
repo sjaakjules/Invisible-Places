@@ -2345,6 +2345,431 @@ TEST_CASE("Modern Flow object-copy metadata outranks legacy edited suffixes",
     CHECK_FALSE(WaterObjectProfileNameIsLegacyEditedShadow("_Edited", true));
 }
 
+TEST_CASE("Flow owner-copy promotion planning is safe and collision free",
+          "[water][flow][profiles][promotion]") {
+    using invisible_places::water::AllocateUniqueWaterObjectProfileName;
+    using invisible_places::water::PlanWaterObjectProfilePromotion;
+    using invisible_places::water::WaterObjectProfileBaseKind;
+    using invisible_places::water::WaterObjectProfileEditDescriptor;
+    using invisible_places::water::WaterObjectProfilePromotionFailure;
+    using invisible_places::water::WaterObjectProfilePromotionOperation;
+
+    WaterObjectProfileEditDescriptor owned{
+        .assignedProfileName = "Calm Lanes_Creek",
+        .exactBaseProfileName = "Calm Lanes",
+        .suggestedSaveProfileName = "Calm Lanes",
+        .removableWorkingProfileName = "Calm Lanes_Creek",
+        .assignedObjectCopy = true,
+        .ownedObjectCopy = true,
+    };
+    const std::vector<std::string> reserved{
+        "Default",
+        "Global",
+        "Calm Lanes_preset",
+        "Calm Lanes_Creek",
+        "Storm",
+        "Storm 2",
+    };
+
+    const auto saveShared = PlanWaterObjectProfilePromotion(
+        owned,
+        WaterObjectProfilePromotionOperation::Save,
+        WaterObjectProfileBaseKind::Shared,
+        "Ignored",
+        reserved);
+    REQUIRE(saveShared.allowed());
+    CHECK(saveShared.targetProfileName == "Calm Lanes");
+    CHECK(saveShared.overwriteExisting);
+    CHECK_FALSE(saveShared.createShared);
+    CHECK(saveShared.eraseWorkingCopy);
+
+    auto defaultOwned = owned;
+    defaultOwned.exactBaseProfileName = "Default";
+    defaultOwned.suggestedSaveProfileName = "Default";
+    const auto saveDefault = PlanWaterObjectProfilePromotion(
+        defaultOwned,
+        WaterObjectProfilePromotionOperation::Save,
+        WaterObjectProfileBaseKind::Default,
+        "Ignored",
+        reserved);
+    REQUIRE(saveDefault.allowed());
+    CHECK(saveDefault.targetProfileName == "Default");
+    CHECK(saveDefault.overwriteExisting);
+
+    struct RejectedSave {
+        WaterObjectProfileBaseKind baseKind;
+        WaterObjectProfilePromotionFailure failure;
+    };
+    constexpr std::array rejectedSaves{
+        RejectedSave{
+            WaterObjectProfileBaseKind::Protected,
+            WaterObjectProfilePromotionFailure::
+                ProtectedBaseRequiresSaveAs},
+        RejectedSave{
+            WaterObjectProfileBaseKind::Missing,
+            WaterObjectProfilePromotionFailure::
+                MissingBaseRequiresSaveAs},
+        RejectedSave{
+            WaterObjectProfileBaseKind::ObjectCopy,
+            WaterObjectProfilePromotionFailure::
+                ObjectCopyBaseRequiresSaveAs},
+    };
+    for (const auto& rejected : rejectedSaves) {
+        const auto plan = PlanWaterObjectProfilePromotion(
+            owned,
+            WaterObjectProfilePromotionOperation::Save,
+            rejected.baseKind,
+            "Ignored",
+            reserved);
+        CHECK_FALSE(plan.allowed());
+        CHECK(plan.failure == rejected.failure);
+        CHECK_FALSE(plan.eraseWorkingCopy);
+    }
+
+    const auto saveAs = PlanWaterObjectProfilePromotion(
+        owned,
+        WaterObjectProfilePromotionOperation::SaveAs,
+        WaterObjectProfileBaseKind::Protected,
+        " Storm_preset_edited ",
+        reserved);
+    REQUIRE(saveAs.allowed());
+    CHECK(saveAs.targetProfileName == "Storm 3");
+    CHECK_FALSE(saveAs.overwriteExisting);
+    CHECK(saveAs.createShared);
+    CHECK(saveAs.eraseWorkingCopy);
+
+    const std::vector<std::string> denseReserved{
+        "Storm",
+        "Storm 2",
+        "Storm 3",
+        "Storm 4",
+        "Storm Copy",
+    };
+    const auto denseSaveAs = PlanWaterObjectProfilePromotion(
+        owned,
+        WaterObjectProfilePromotionOperation::SaveAs,
+        WaterObjectProfileBaseKind::Shared,
+        "Storm",
+        denseReserved);
+    REQUIRE(denseSaveAs.allowed());
+    CHECK(denseSaveAs.targetProfileName == "Storm 5");
+    CHECK(std::find(
+              denseReserved.begin(),
+              denseReserved.end(),
+              denseSaveAs.targetProfileName) == denseReserved.end());
+    CHECK(AllocateUniqueWaterObjectProfileName("Storm", denseReserved) ==
+          "Storm 5");
+    for (const std::string_view protectedName : {
+             "Aerial_preset",
+             "Calm Lanes_preset",
+             "Water Flow_preset",
+             "Wet Rock_preset",
+         }) {
+        INFO(protectedName);
+        CHECK(AllocateUniqueWaterObjectProfileName(protectedName, {}) ==
+              std::string{protectedName} + " 2");
+    }
+
+    const auto blankSaveAs = PlanWaterObjectProfilePromotion(
+        owned,
+        WaterObjectProfilePromotionOperation::SaveAs,
+        WaterObjectProfileBaseKind::Missing,
+        "_edited",
+        reserved);
+    REQUIRE(blankSaveAs.allowed());
+    CHECK(blankSaveAs.targetProfileName == "Calm Lanes");
+
+    const auto discardPreset = PlanWaterObjectProfilePromotion(
+        WaterObjectProfileEditDescriptor{
+            .assignedProfileName = "Calm_Creek",
+            .exactBaseProfileName = "Calm Lanes_preset",
+            .suggestedSaveProfileName = "Calm Lanes",
+            .removableWorkingProfileName = "Calm_Creek",
+            .assignedObjectCopy = true,
+            .ownedObjectCopy = true,
+        },
+        WaterObjectProfilePromotionOperation::Discard,
+        WaterObjectProfileBaseKind::Protected,
+        "Ignored",
+        reserved);
+    REQUIRE(discardPreset.allowed());
+    CHECK(discardPreset.targetProfileName == "Calm Lanes_preset");
+    CHECK(discardPreset.eraseWorkingCopy);
+
+    const auto missingDiscard = PlanWaterObjectProfilePromotion(
+        owned,
+        WaterObjectProfilePromotionOperation::Discard,
+        WaterObjectProfileBaseKind::Missing,
+        "Ignored",
+        reserved);
+    CHECK_FALSE(missingDiscard.allowed());
+    CHECK(missingDiscard.failure ==
+          WaterObjectProfilePromotionFailure::MissingDiscardBase);
+
+    auto foreign = owned;
+    foreign.ownedObjectCopy = false;
+    foreign.removableWorkingProfileName.clear();
+    const auto foreignSaveAs = PlanWaterObjectProfilePromotion(
+        foreign,
+        WaterObjectProfilePromotionOperation::SaveAs,
+        WaterObjectProfileBaseKind::Shared,
+        "Foreign",
+        reserved);
+    CHECK_FALSE(foreignSaveAs.allowed());
+    CHECK(foreignSaveAs.failure ==
+          WaterObjectProfilePromotionFailure::NotOwnedWorkingCopy);
+}
+
+TEST_CASE("Flow owner-copy promotion transaction writes rewrites then erases exact owner",
+          "[water][flow][profiles][promotion]") {
+    using invisible_places::water::PlanWaterObjectProfilePromotion;
+    using invisible_places::water::RunWaterObjectProfilePromotionTransaction;
+    using invisible_places::water::WaterObjectProfileBaseKind;
+    using invisible_places::water::WaterObjectProfileEditDescriptor;
+    using invisible_places::water::WaterObjectProfilePromotionOperation;
+
+    struct TestProfile {
+        std::string name;
+        int value = 0;
+        bool objectOverride = false;
+        std::uint32_t ownerObjectId = 0U;
+    };
+    std::vector<TestProfile> profiles{
+        {.name = "Calm", .value = 1},
+        {
+            .name = "Calm_Creek",
+            .value = 17,
+            .objectOverride = true,
+            .ownerObjectId = 41U,
+        },
+        {
+            .name = "Calm_Creek",
+            .value = 23,
+            .objectOverride = true,
+            .ownerObjectId = 99U,
+        },
+    };
+    std::vector<std::string> references{
+        "Calm_Creek",
+        "Other",
+        "Calm_Creek",
+    };
+    const std::vector<std::string> reserved{
+        "Default",
+        "Global",
+        "Calm",
+        "Calm_Creek",
+    };
+    const auto plan = PlanWaterObjectProfilePromotion(
+        WaterObjectProfileEditDescriptor{
+            .assignedProfileName = "Calm_Creek",
+            .exactBaseProfileName = "Calm",
+            .suggestedSaveProfileName = "Calm",
+            .removableWorkingProfileName = "Calm_Creek",
+            .assignedObjectCopy = true,
+            .ownedObjectCopy = true,
+        },
+        WaterObjectProfilePromotionOperation::Save,
+        WaterObjectProfileBaseKind::Shared,
+        "Ignored",
+        reserved);
+    REQUIRE(plan.allowed());
+    REQUIRE(plan.targetProfileName == "Calm");
+
+    const int snapshottedValue = profiles[1].value;
+    std::vector<std::string> phases;
+    const bool applied = RunWaterObjectProfilePromotionTransaction(
+        plan,
+        {
+            .writeTarget = [&](std::string_view target) {
+                phases.emplace_back("write");
+                const auto found = std::find_if(
+                    profiles.begin(),
+                    profiles.end(),
+                    [&](const TestProfile& profile) {
+                        return !profile.objectOverride &&
+                               profile.name == target;
+                    });
+                if (found == profiles.end()) {
+                    return false;
+                }
+                found->value = snapshottedValue;
+                return true;
+            },
+            .rewriteReferences = [&] (
+                std::string_view previous,
+                std::string_view next) {
+                phases.emplace_back("rewrite");
+                REQUIRE(std::any_of(
+                    profiles.begin(),
+                    profiles.end(),
+                    [&](const TestProfile& profile) {
+                        return profile.name == next &&
+                               profile.value == snapshottedValue;
+                    }));
+                for (auto& reference : references) {
+                    if (reference == previous) {
+                        reference = next;
+                    }
+                }
+                return true;
+            },
+            .eraseWorkingCopy = [&](std::string_view working) {
+                phases.emplace_back("erase");
+                const auto found = std::find_if(
+                    profiles.begin(),
+                    profiles.end(),
+                    [&](const TestProfile& profile) {
+                        return profile.objectOverride &&
+                               profile.ownerObjectId == 41U &&
+                               profile.name == working;
+                    });
+                if (found == profiles.end()) {
+                    return false;
+                }
+                profiles.erase(found);
+                return true;
+            },
+        });
+
+    REQUIRE(applied);
+    CHECK(phases == std::vector<std::string>{"write", "rewrite", "erase"});
+    CHECK(references ==
+          std::vector<std::string>{"Calm", "Other", "Calm"});
+    CHECK(profiles.front().value == snapshottedValue);
+    CHECK(std::none_of(
+        profiles.begin(),
+        profiles.end(),
+        [](const TestProfile& profile) {
+            return profile.objectOverride &&
+                   profile.ownerObjectId == 41U;
+        }));
+    CHECK(std::any_of(
+        profiles.begin(),
+        profiles.end(),
+        [](const TestProfile& profile) {
+            return profile.objectOverride &&
+                   profile.ownerObjectId == 99U &&
+                   profile.name == "Calm_Creek";
+        }));
+
+    SECTION("Discard skips target write") {
+        auto discard = plan;
+        discard.operation = WaterObjectProfilePromotionOperation::Discard;
+        std::vector<std::string> discardPhases;
+        const bool discarded = RunWaterObjectProfilePromotionTransaction(
+            discard,
+            {
+                .writeTarget = [&](std::string_view) {
+                    discardPhases.emplace_back("write");
+                    return true;
+                },
+                .rewriteReferences = [&] (
+                    std::string_view,
+                    std::string_view) {
+                    discardPhases.emplace_back("rewrite");
+                    return true;
+                },
+                .eraseWorkingCopy = [&](std::string_view) {
+                    discardPhases.emplace_back("erase");
+                    return true;
+                },
+            });
+        CHECK(discarded);
+        CHECK(discardPhases ==
+              std::vector<std::string>{"rewrite", "erase"});
+    }
+
+    SECTION("A failed callback suppresses only later phases") {
+        struct FailedRun {
+            bool result = false;
+            std::vector<std::string> attempted;
+            int targetValue = 0;
+            std::string reference = "Calm_Creek";
+            bool erased = false;
+        };
+        const auto runWithFailure = [&](std::string_view failedPhase) {
+            FailedRun run;
+            run.result = RunWaterObjectProfilePromotionTransaction(
+                plan,
+                {
+                    .writeTarget = [&](std::string_view) {
+                        run.attempted.emplace_back("write");
+                        if (failedPhase == "write") {
+                            return false;
+                        }
+                        run.targetValue = snapshottedValue;
+                        return true;
+                    },
+                    .rewriteReferences = [&] (
+                        std::string_view,
+                        std::string_view next) {
+                        run.attempted.emplace_back("rewrite");
+                        if (failedPhase == "rewrite") {
+                            return false;
+                        }
+                        run.reference = next;
+                        return true;
+                    },
+                    .eraseWorkingCopy = [&](std::string_view) {
+                        run.attempted.emplace_back("erase");
+                        if (failedPhase == "erase") {
+                            return false;
+                        }
+                        run.erased = true;
+                        return true;
+                    },
+                });
+            return run;
+        };
+
+        const auto writeFailure = runWithFailure("write");
+        CHECK_FALSE(writeFailure.result);
+        CHECK(writeFailure.attempted ==
+              std::vector<std::string>{"write"});
+        CHECK(writeFailure.targetValue == 0);
+        CHECK(writeFailure.reference == "Calm_Creek");
+        CHECK_FALSE(writeFailure.erased);
+
+        const auto rewriteFailure = runWithFailure("rewrite");
+        CHECK_FALSE(rewriteFailure.result);
+        CHECK(rewriteFailure.attempted ==
+              std::vector<std::string>{"write", "rewrite"});
+        CHECK(rewriteFailure.targetValue == snapshottedValue);
+        CHECK(rewriteFailure.reference == "Calm_Creek");
+        CHECK_FALSE(rewriteFailure.erased);
+
+        const auto eraseFailure = runWithFailure("erase");
+        CHECK_FALSE(eraseFailure.result);
+        CHECK(eraseFailure.attempted ==
+              std::vector<std::string>{"write", "rewrite", "erase"});
+        CHECK(eraseFailure.targetValue == snapshottedValue);
+        CHECK(eraseFailure.reference == "Calm");
+        CHECK_FALSE(eraseFailure.erased);
+    }
+
+    SECTION("Missing callbacks fail preflight before any mutation") {
+        std::vector<std::string> attempted;
+        const bool result = RunWaterObjectProfilePromotionTransaction(
+            plan,
+            {
+                .writeTarget = [&](std::string_view) {
+                    attempted.emplace_back("write");
+                    return true;
+                },
+                .rewriteReferences = [&] (
+                    std::string_view,
+                    std::string_view) {
+                    attempted.emplace_back("rewrite");
+                    return true;
+                },
+                .eraseWorkingCopy = {},
+            });
+        CHECK_FALSE(result);
+        CHECK(attempted.empty());
+    }
+}
+
 TEST_CASE("Flow keyed profile base rewrites preserve package identity and provenance",
           "[water][flow][timing][keyed][profiles][references]") {
     using invisible_places::water::

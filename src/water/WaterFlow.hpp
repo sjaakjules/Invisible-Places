@@ -387,6 +387,88 @@ DescribeWaterObjectProfileEdit(
     const std::optional<WaterObjectProfileIdentity>& assignedObjectCopy =
         std::nullopt);
 
+enum class WaterObjectProfilePromotionOperation : std::uint8_t {
+    Save = 0,
+    SaveAs,
+    Discard,
+};
+
+enum class WaterObjectProfileBaseKind : std::uint8_t {
+    Default = 0,
+    Shared,
+    Protected,
+    Missing,
+    ObjectCopy,
+};
+
+enum class WaterObjectProfilePromotionFailure : std::uint8_t {
+    None = 0,
+    NotOwnedWorkingCopy,
+    ProtectedBaseRequiresSaveAs,
+    MissingBaseRequiresSaveAs,
+    ObjectCopyBaseRequiresSaveAs,
+    MissingDiscardBase,
+    ObjectCopyDiscardBase,
+};
+
+struct WaterObjectProfilePromotionPlan {
+    WaterObjectProfilePromotionOperation operation =
+        WaterObjectProfilePromotionOperation::Save;
+    WaterObjectProfilePromotionFailure failure =
+        WaterObjectProfilePromotionFailure::None;
+    std::string workingProfileName;
+    std::string targetProfileName;
+    bool overwriteExisting = false;
+    bool createShared = false;
+    bool eraseWorkingCopy = false;
+
+    [[nodiscard]] bool allowed() const {
+        return failure == WaterObjectProfilePromotionFailure::None;
+    }
+};
+
+// Plans one owner-copy transaction without mutating the profile library.
+// Save As never overwrites: requested/reserved collisions receive a stable
+// numeric suffix. Save retains its allowed exact reusable base; Discard may
+// retain a protected `_preset` base because it does not overwrite its values.
+[[nodiscard]] WaterObjectProfilePromotionPlan
+PlanWaterObjectProfilePromotion(
+    const WaterObjectProfileEditDescriptor& descriptor,
+    WaterObjectProfilePromotionOperation operation,
+    WaterObjectProfileBaseKind baseKind,
+    std::string_view requestedProfileName,
+    std::span<const std::string> reservedProfileNames);
+
+// Returns the preferred name when it is free, otherwise the first free
+// numeric suffix. The code-owned `_preset` namespace is reserved even when
+// the caller's stored library does not contain those regenerated profiles.
+// The finite reservation set guarantees one of the next N+1 candidates is
+// available, so callers never receive an unchecked fallback.
+[[nodiscard]] std::string AllocateUniqueWaterObjectProfileName(
+    std::string_view preferredProfileName,
+    std::span<const std::string> reservedProfileNames);
+
+struct WaterObjectProfilePromotionTransactionCallbacks {
+    // Save and Save As write the snapshotted working values first. Discard
+    // intentionally skips this callback.
+    std::function<bool(std::string_view targetProfileName)> writeTarget;
+    std::function<bool(
+        std::string_view previousProfileName,
+        std::string_view nextProfileName)> rewriteReferences;
+    // The caller must erase only the exact owner-tagged working copy.
+    std::function<bool(std::string_view workingProfileName)> eraseWorkingCopy;
+};
+
+// Executes the mutation ordering shared by Path/Lane/Trail promotion:
+// target write, exact reference rewrite, then owner-copy erase. A rejected
+// plan or missing required callback fails before mutation; a callback that
+// returns false stops before the next phase. Completed callbacks are not
+// rolled back, so callers preflight owner/target identity and keep these
+// small in-memory callbacks effectively infallible.
+[[nodiscard]] bool RunWaterObjectProfilePromotionTransaction(
+    const WaterObjectProfilePromotionPlan& plan,
+    const WaterObjectProfilePromotionTransactionCallbacks& callbacks);
+
 struct WaterSeepageNode;
 
 enum class WaterSeepageProfileHalf : std::uint8_t {
