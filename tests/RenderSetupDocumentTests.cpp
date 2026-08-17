@@ -245,6 +245,32 @@ RenderSetupDocument MakeRenderSetup() {
         .settings = {.widthMeters = 0.72F},
     });
     document.authoredWater.rainSettings.rainLevel = 0.63F;
+    invisible_places::water::WaterRainProfile rainBase;
+    rainBase.id = "render-rain-base";
+    rainBase.name = "Render Rain";
+    rainBase.settings = document.authoredWater.rainSettings;
+    rainBase.settings.density = 0.38F;
+    rainBase.visual.widthMeters = 0.0018F;
+    invisible_places::water::WaterRainProfile rainOwner = rainBase;
+    rainOwner.id = "render-rain-base-timing-take-1";
+    rainOwner.name = "Render Rain_Wet reveal";
+    rainOwner.objectOverride = true;
+    rainOwner.ownerTimingTakeId = document.timingTakeId;
+    rainOwner.baseProfileId = rainBase.id;
+    rainOwner.baseProfileName = rainBase.name;
+    rainOwner.settings.density = 0.74F;
+    rainOwner.visual.opacity = 0.23F;
+    document.authoredWater.rainSettings = rainOwner.settings;
+    document.authoredWater.rainVisualSettings = rainOwner.visual;
+    document.authoredWater.rainProfiles = {rainBase, rainOwner};
+    document.authoredWater.rainTimingTakeAssignments = {
+        {.id = document.timingTakeId,
+         .name = document.timingTakeName,
+         .assignedRainProfileId = rainOwner.id,
+         .assignedRainProfileName = rainOwner.name,
+         .baseRainProfileId = rainBase.id,
+         .baseRainProfileName = rainBase.name},
+    };
     document.authoredWater.pathCache = invisible_places::water::WaterPathCache{};
     invisible_places::serialization::WaterRippleRuntimeCacheDocument cache;
     cache.memberships.push_back({.pointIndex = 3U});
@@ -313,9 +339,18 @@ TEST_CASE(
     CHECK(saved.at("schema_version") ==
           invisible_places::serialization::kRenderSetupDocumentSchemaVersion);
     const auto& water = saved.at("snapshot").at("authored_water");
+    CHECK(water.at("schema_version") ==
+          invisible_places::serialization::kWaterSourcesDocumentSchemaVersion);
     CHECK_FALSE(water.contains("water_path_cache"));
     REQUIRE(water.at("water_ripple_runtime_caches").is_array());
     CHECK(water.at("water_ripple_runtime_caches").empty());
+    REQUIRE(water.at("water_rain_profiles").size() == 2U);
+    CHECK(water.at("water_rain_profiles")[1].at("id") ==
+          "render-rain-base-timing-take-1");
+    REQUIRE(water.at("timing_take_rain_assignments").size() == 1U);
+    CHECK(water.at("timing_take_rain_assignments")[0].at(
+              "assigned_rain_profile_id") ==
+          "render-rain-base-timing-take-1");
     const auto& savedTiming =
         saved.at("snapshot").at("timing_take_scene_state");
     REQUIRE(savedTiming.at("timing_effects").size() == 4U);
@@ -384,6 +419,22 @@ TEST_CASE(
           "Cliff footprint");
     CHECK(loaded->authoredWater.seepageNodeSettingsProfiles.front()
               .settings.widthMeters == Approx(0.72F));
+    REQUIRE(loaded->authoredWater.rainProfiles.size() == 2U);
+    CHECK(loaded->authoredWater.rainProfiles[0].id == "render-rain-base");
+    CHECK(loaded->authoredWater.rainProfiles[0].settings.density ==
+          Approx(0.38F));
+    CHECK(loaded->authoredWater.rainProfiles[1].id ==
+          "render-rain-base-timing-take-1");
+    CHECK(loaded->authoredWater.rainProfiles[1].settings.density ==
+          Approx(0.74F));
+    CHECK(loaded->authoredWater.rainProfiles[1].visual.opacity ==
+          Approx(0.23F));
+    REQUIRE(loaded->authoredWater.rainTimingTakeAssignments.size() == 1U);
+    CHECK(loaded->authoredWater.rainTimingTakeAssignments[0].id ==
+          loaded->timingTakeId);
+    CHECK(loaded->authoredWater.rainTimingTakeAssignments[0]
+              .assignedRainProfileId ==
+          "render-rain-base-timing-take-1");
     CHECK_FALSE(loaded->authoredWater.pathCache.has_value());
     CHECK(loaded->authoredWater.rippleRuntimeCaches.empty());
     CHECK(loaded->waterAnimationTrailSettings.particleDensity == Approx(2.5F));

@@ -2165,6 +2165,10 @@ TEST_CASE("SampleScene authored water fixture is current, canonical, and cache f
   CHECK_FALSE(fixtureJson.contains("water_path_cache"));
   CHECK_FALSE(fixtureJson.contains("water_path_cache_manifest"));
   REQUIRE(fixtureJson.at("water_ripple_runtime_caches").empty());
+  REQUIRE(fixtureJson.at("water_rain_profiles").size() == 1U);
+  CHECK(fixtureJson.at("water_rain_profiles").front().at("id") ==
+        invisible_places::timing::kLegacyWaterRainProfileId);
+  CHECK(fixtureJson.at("timing_take_rain_assignments").empty());
   REQUIRE(fixtureJson.at("water_emitters").size() == 1U);
   CHECK_FALSE(fixtureJson.at("water_emitters").front().contains("cached_path"));
   CHECK_FALSE(fixtureJson.at("water_emitters").front().contains("generated_path"));
@@ -2195,6 +2199,12 @@ TEST_CASE("SampleScene authored water fixture is current, canonical, and cache f
   CHECK(
       fixture->dynamicMeshFlowSettings.vegetationResponse.twinkle ==
       Catch::Approx(1.4F));
+  REQUIRE(fixture->rainProfiles.size() == 1U);
+  CHECK(fixture->rainProfiles.front().id ==
+        invisible_places::timing::kLegacyWaterRainProfileId);
+  CHECK(fixture->rainProfiles.front().settings == fixture->rainSettings);
+  CHECK(fixture->rainProfiles.front().visual == fixture->rainVisualSettings);
+  CHECK(fixture->rainTimingTakeAssignments.empty());
 
   REQUIRE(fixture->emitters.size() == 1U);
   const auto &emitter = fixture->emitters.front();
@@ -3971,6 +3981,101 @@ TEST_CASE("Legacy singleton Rain migrates once without replacing edited visuals 
     CHECK(take.baseRainProfileId == profile.id);
     CHECK(take.baseRainProfileName == profile.name);
   }
+}
+
+TEST_CASE("Standalone Water Sources preserve Rain profiles and migrate schema 30 without inventing takes",
+          "[water][serialization][sources][rain-profile]") {
+  using invisible_places::serialization::LoadWaterSourcesDocument;
+  using invisible_places::serialization::SaveWaterSourcesDocument;
+  using invisible_places::serialization::WaterSourcesDocument;
+  using invisible_places::timing::TimingTakeDefinition;
+  using invisible_places::water::WaterRainProfile;
+
+  WaterRainProfile base;
+  base.id = "rain-source-base";
+  base.name = "Source Rain";
+  base.settings.enabled = true;
+  base.settings.activeParticleCount = 12'345U;
+  base.settings.density = 0.37F;
+  base.settings.rockImpact.persistence = 2.2F;
+  base.visual.widthMeters = 0.0019F;
+  base.visual.opacity = 0.18F;
+  WaterRainProfile owner = base;
+  owner.id = "rain-source-base-first";
+  owner.name = "Source Rain_First-01";
+  owner.objectOverride = true;
+  owner.ownerTimingTakeId = "timing-take-8";
+  owner.baseProfileId = base.id;
+  owner.baseProfileName = base.name;
+  owner.settings.density = 0.73F;
+  owner.settings.vegetationImpact.streamSpread = 1.1F;
+  owner.visual.widthMeters = 0.0037F;
+  owner.visual.maximumScreenPixels = 9.2F;
+
+  TimingTakeDefinition assignment{
+      .id = "timing-take-8",
+      .name = "First-01",
+      .assignedRainProfileId = owner.id,
+      .assignedRainProfileName = owner.name,
+      .baseRainProfileId = base.id,
+      .baseRainProfileName = base.name,
+  };
+  WaterSourcesDocument sources;
+  sources.rainSettings = owner.settings;
+  sources.rainVisualSettings = owner.visual;
+  sources.rainProfiles = {base, owner};
+  sources.rainTimingTakeAssignments = {assignment};
+
+  TemporaryProjectFile file{"invisible_places_rain_profile_sources.json"};
+  std::string errorMessage;
+  REQUIRE(SaveWaterSourcesDocument(sources, file.path, &errorMessage));
+  std::ifstream savedInput{file.path};
+  REQUIRE(savedInput.is_open());
+  auto savedJson = nlohmann::json::parse(savedInput);
+  savedInput.close();
+  CHECK(savedJson.at("schema_version") ==
+        kWaterSourcesDocumentSchemaVersion);
+  REQUIRE(savedJson.at("water_rain_profiles").size() == 2U);
+  CHECK(savedJson.at("water_rain_profiles")[0].at("id") == base.id);
+  CHECK(savedJson.at("water_rain_profiles")[1].at("id") == owner.id);
+  REQUIRE(savedJson.at("timing_take_rain_assignments").size() == 1U);
+  CHECK(savedJson.at("timing_take_rain_assignments")[0].at(
+            "assigned_rain_profile_id") == owner.id);
+
+  const auto loaded = LoadWaterSourcesDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  CHECK(loaded->schemaVersion == kWaterSourcesDocumentSchemaVersion);
+  REQUIRE(loaded->rainProfiles.size() == 2U);
+  CHECK(loaded->rainProfiles[0] == base);
+  CHECK(loaded->rainProfiles[1] == owner);
+  REQUIRE(loaded->rainTimingTakeAssignments.size() == 1U);
+  CHECK(loaded->rainTimingTakeAssignments[0].id == assignment.id);
+  CHECK(loaded->rainTimingTakeAssignments[0].assignedRainProfileId ==
+        owner.id);
+  CHECK(loaded->rainTimingTakeAssignments[0].baseRainProfileId == base.id);
+
+  // Schema 30 knew only the compatibility singleton. It upgrades that exact
+  // authored runtime/visual snapshot into one shared base, but an absent list
+  // of assignment records remains absent so imports cannot create takes.
+  savedJson["schema_version"] = 30U;
+  savedJson.erase("water_rain_profiles");
+  savedJson.erase("timing_take_rain_assignments");
+  {
+    std::ofstream output{file.path, std::ios::trunc};
+    REQUIRE(output.is_open());
+    output << savedJson.dump(2);
+  }
+  const auto migrated = LoadWaterSourcesDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(migrated.has_value());
+  CHECK(migrated->schemaVersion == 30U);
+  REQUIRE(migrated->rainProfiles.size() == 1U);
+  CHECK(migrated->rainProfiles.front().id ==
+        invisible_places::timing::kLegacyWaterRainProfileId);
+  CHECK(migrated->rainProfiles.front().settings == sources.rainSettings);
+  CHECK(migrated->rainProfiles.front().visual == sources.rainVisualSettings);
+  CHECK(migrated->rainTimingTakeAssignments.empty());
 }
 
 TEST_CASE("Keyed setting tracks round-trip their default interpolation and migrate legacy smooth keys",

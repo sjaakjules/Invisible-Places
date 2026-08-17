@@ -1,5 +1,5 @@
 {
-  "schema_version": 30,
+  "schema_version": 31,
   "fixture_metadata": {
     "scene_group": "SampleScene",
     "display_spacing_micrometres": 3000,
@@ -1727,6 +1727,20 @@
       "stream_spread": 0.65
     }
   },
+  "water_rain_profiles": [
+    {
+      "id": "rain-profile-project",
+      "name": "Project Rain",
+      "rain_settings": {
+        "version": 3,
+        "enabled": true,
+        "rock_effects_enabled": false,
+        "sand_effects_enabled": false,
+        "vegetation_effect_scale": 3.0
+      }
+    }
+  ],
+  "timing_take_rain_assignments": [],
   "water_emitters": [
     {
       "confidence": 1.0,

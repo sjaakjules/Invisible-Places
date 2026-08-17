@@ -564,8 +564,11 @@ without the profile library shall migrate the legacy singleton Rain settings and
 its embedded visual values into one shared base without manufacturing one copy
 per take. Project schema 78 introduces the Rain profile library and Timing Take
 profile assignments; the legacy singleton shall remain a compatibility
-projection. Live preview and every frozen export shall resolve exactly one
-profile into the existing Rain simulation.
+projection. Standalone Water Sources schema 31 shall carry the same profile
+library plus assignment-only Timing Take records; loading a schema-30 singleton
+shall create one shared profile without creating any Timing Take record. Live
+preview and every frozen export shall resolve exactly one profile into the
+existing Rain simulation.
 
 ### 5.8 Procedural Motion
 #### FR-MOTION-1

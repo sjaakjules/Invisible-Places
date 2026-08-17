@@ -155,6 +155,7 @@ constexpr std::uint32_t kWaterSplineHandlesSourcesSchemaVersion = 29U;
 constexpr std::uint32_t kWaterClipMembershipProjectSchemaVersion = 76U;
 constexpr std::uint32_t kWaterClipMembershipSourcesSchemaVersion = 30U;
 constexpr std::uint32_t kWaterRainProfilesProjectSchemaVersion = 78U;
+constexpr std::uint32_t kWaterRainProfilesSourcesSchemaVersion = 31U;
 constexpr std::uint32_t kRelativePalettePhaseProjectSchemaVersion = 62U;
 constexpr std::uint32_t kFieldMapBoundsMemoryProjectSchemaVersion = 63U;
 constexpr std::uint32_t kShorelineInstancesProjectSchemaVersion = 64U;
@@ -197,6 +198,9 @@ static_assert(
 static_assert(
     kProjectDocumentSchemaVersion >=
     kWaterRainProfilesProjectSchemaVersion);
+static_assert(
+    kWaterSourcesDocumentSchemaVersion >=
+    kWaterRainProfilesSourcesSchemaVersion);
 
 constexpr std::string_view kProjectVisualEditedSuffix = "_edited";
 constexpr std::string_view kProjectVisualLegacyEditedSuffix = "_Edited";
@@ -7480,6 +7484,34 @@ WaterRainProfile ParseWaterRainProfile(const json& profileJson) {
         std::move(profile));
 }
 
+void PrepareStandaloneWaterRainProfiles(
+    std::vector<WaterRainProfile>* profiles,
+    std::vector<invisible_places::timing::TimingTakeDefinition>*
+        assignments,
+    const RainRuntimeSettings& legacySettings,
+    const WaterRainVisualSettings& legacyVisual) {
+    if (profiles == nullptr || assignments == nullptr) {
+        return;
+    }
+    std::vector<invisible_places::timing::TimingTakeDefinition> unique;
+    unique.reserve(assignments->size());
+    for (auto& assignment : *assignments) {
+        assignment = invisible_places::timing::SanitizeTimingTakeDefinition(
+            std::move(assignment));
+        if (invisible_places::timing::FindTimingTakeDefinition(
+                unique,
+                assignment.id) == nullptr) {
+            unique.push_back(std::move(assignment));
+        }
+    }
+    *assignments = std::move(unique);
+    (void)invisible_places::timing::EnsureLegacyWaterRainProfile(
+        profiles,
+        assignments,
+        legacySettings,
+        legacyVisual);
+}
+
 json SerializeWaterPathGenerationSettings(const WaterPathGenerationSettings& settings) {
     return json{
         {"auto_tune", settings.autoTune},
@@ -10604,6 +10636,13 @@ std::optional<ProjectDocument> LoadProjectDocument(
 
 nlohmann::json WaterSourcesDocumentToJson(
     const WaterSourcesDocument& document) {
+    auto savedRainProfiles = document.rainProfiles;
+    auto savedRainAssignments = document.rainTimingTakeAssignments;
+    PrepareStandaloneWaterRainProfiles(
+        &savedRainProfiles,
+        &savedRainAssignments,
+        document.rainSettings,
+        document.rainVisualSettings);
     json sourcesJson{
         {"schema_version", kWaterSourcesDocumentSchemaVersion},
         {"water_source_settings", SerializeWaterSourceSettings(document.sourceSettings)},
@@ -10615,6 +10654,8 @@ nlohmann::json WaterSourcesDocumentToJson(
         {"water_lane_profiles", json::array()},
         {"water_trail_profiles", json::array()},
         {"water_keyed_settings_profiles", json::array()},
+        {"water_rain_profiles", json::array()},
+        {"timing_take_rain_assignments", json::array()},
         {"selected_water_path_profile", document.selectedPathProfileName},
         {"selected_water_lane_profile", document.selectedLaneProfileName},
         {"selected_water_trail_profile", document.selectedTrailProfileName},
@@ -10671,6 +10712,14 @@ nlohmann::json WaterSourcesDocumentToJson(
     for (const auto& profile : document.keyedSettingsProfiles) {
         sourcesJson["water_keyed_settings_profiles"].push_back(
             SerializeWaterKeyedSettingsProfile(profile));
+    }
+    for (const auto& profile : savedRainProfiles) {
+        sourcesJson["water_rain_profiles"].push_back(
+            SerializeWaterRainProfile(profile));
+    }
+    for (const auto& assignment : savedRainAssignments) {
+        sourcesJson["timing_take_rain_assignments"].push_back(
+            SerializeTimingTakeDefinition(assignment));
     }
     for (const auto& emitter : document.emitters) {
         sourcesJson["water_emitters"].push_back(SerializeWaterEmitter(emitter));
@@ -10913,6 +10962,24 @@ static WaterSourcesDocument ParseWaterSourcesDocumentJsonValue(
         document.rainSettings = ParseWaterRainSettings(sourcesJson->at("water_rain_settings"));
         document.rainVisualSettings = ParseWaterRainVisualSettings(sourcesJson->at("water_rain_settings"));
     }
+    if (sourcesJson->contains("water_rain_profiles") &&
+        sourcesJson->at("water_rain_profiles").is_array()) {
+        for (const auto& profileJson :
+             sourcesJson->at("water_rain_profiles")) {
+            document.rainProfiles.push_back(
+                ParseWaterRainProfile(profileJson));
+        }
+    }
+    if (sourcesJson->contains("timing_take_rain_assignments") &&
+        sourcesJson->at("timing_take_rain_assignments").is_array()) {
+        for (const auto& assignmentJson :
+             sourcesJson->at("timing_take_rain_assignments")) {
+            if (assignmentJson.is_object()) {
+                document.rainTimingTakeAssignments.push_back(
+                    ParseTimingTakeDefinition(assignmentJson));
+            }
+        }
+    }
     if (sourcesJson->contains("water_dynamic_mesh_flow_settings")) {
         document.dynamicMeshFlowSettings =
             ParseWaterDynamicMeshFlowSettings(sourcesJson->at("water_dynamic_mesh_flow_settings"));
@@ -11056,6 +11123,11 @@ static WaterSourcesDocument ParseWaterSourcesDocumentJsonValue(
             }
         }
     }
+    PrepareStandaloneWaterRainProfiles(
+        &document.rainProfiles,
+        &document.rainTimingTakeAssignments,
+        document.rainSettings,
+        document.rainVisualSettings);
     return document;
 }
 

@@ -23,7 +23,7 @@ namespace invisible_places::serialization {
 
 inline constexpr std::size_t kMaxSerializedWaterRippleRuntimeCacheMemberships = 250'000U;
 inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 78U;
-inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 30U;
+inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 31U;
 inline constexpr std::uint32_t kWaterOwnedShorelineProjectSchemaVersion = 66U;
 inline constexpr std::uint32_t kWaterOwnedShorelineSourcesSchemaVersion = 22U;
 inline constexpr std::uint32_t kAnimationDocumentSchemaVersion = 24U;
@@ -367,6 +367,12 @@ struct WaterSourcesDocument {
     std::vector<WaterTrailProfileDocument> trailProfiles;
     std::vector<invisible_places::water::WaterKeyedSettingsProfile>
         keyedSettingsProfiles;
+    // Standalone/render-setup Rain state. Assignment records intentionally
+    // carry no Timing Take scene data; importers merge them only into existing
+    // project takes whose stable ids match.
+    std::vector<invisible_places::water::WaterRainProfile> rainProfiles;
+    std::vector<invisible_places::timing::TimingTakeDefinition>
+        rainTimingTakeAssignments;
     std::string selectedPathProfileName = "Default";
     std::string selectedLaneProfileName = "Default";
     std::string selectedTrailProfileName = "Default";
