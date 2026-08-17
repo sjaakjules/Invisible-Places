@@ -8344,6 +8344,175 @@ const WaterKeyableSettingInfo* FindWaterKeyableSetting(
     return nullptr;
 }
 
+std::optional<float> ResolveWaterRainSettingValue(
+    const RainRuntimeSettings& settings,
+    const WaterRainVisualSettings& visual,
+    std::string_view settingId) {
+    if (settingId == "level") {
+        return settings.rainLevel;
+    }
+    if (settingId == "density") {
+        return settings.density;
+    }
+    if (settingId == "fall_speed") {
+        return settings.fallSpeedMetersPerSecond;
+    }
+    if (settingId == "drop_scale") {
+        return settings.dropletSizeScale;
+    }
+    if (settingId == "visibility") {
+        return settings.opacityScale;
+    }
+    if (settingId == "glow") {
+        return settings.emissionScale;
+    }
+    if (settingId == "visual.colour_red") {
+        return visual.colour[0];
+    }
+    if (settingId == "visual.colour_green") {
+        return visual.colour[1];
+    }
+    if (settingId == "visual.colour_blue") {
+        return visual.colour[2];
+    }
+    if (settingId == "visual.width") {
+        return visual.widthMeters;
+    }
+    if (settingId == "visual.streak_length") {
+        return visual.streakLengthMeters;
+    }
+    if (settingId == "visual.softness") {
+        return visual.softness;
+    }
+    if (settingId == "visual.opacity") {
+        return visual.opacity;
+    }
+    if (settingId == "visual.emission") {
+        return visual.emission;
+    }
+    if (settingId == "visual.minimum_pixels") {
+        return visual.minimumScreenPixels;
+    }
+    if (settingId == "visual.maximum_pixels") {
+        return visual.maximumScreenPixels;
+    }
+    if (settingId == "weather.wind_direction_x") {
+        return settings.windDirectionX;
+    }
+    if (settingId == "weather.wind_direction_y") {
+        return settings.windDirectionY;
+    }
+    if (settingId == "weather.wind_speed") {
+        return settings.windSpeedMetersPerSecond;
+    }
+    if (settingId == "weather.turbulence") {
+        return settings.turbulence;
+    }
+    if (settingId == "weather.gust_strength") {
+        return settings.gustStrength;
+    }
+    if (settingId == "weather.gust_scale") {
+        return settings.gustScaleMeters;
+    }
+    if (settingId == "weather.gust_speed") {
+        return settings.gustSpeedMetersPerSecond;
+    }
+    if (settingId == "weather.front_strength") {
+        return settings.weatherFrontStrength;
+    }
+    if (settingId == "weather.front_scale") {
+        return settings.weatherFrontScaleMeters;
+    }
+    if (settingId == "weather.front_speed") {
+        return settings.weatherFrontSpeedMetersPerSecond;
+    }
+    if (settingId == "effects.rings_response") {
+        return settings.sandEffectScale;
+    }
+    if (settingId == "effects.ring_thickness") {
+        return settings.ringImpact.thicknessScale;
+    }
+    if (settingId == "effects.wetness_response") {
+        return settings.rockEffectScale;
+    }
+    if (settingId == "effects.droplets_response") {
+        return settings.vegetationEffectScale;
+    }
+    if (settingId == "near_surface.approach_distance") {
+        return settings.nearSurface.approachDistanceMeters;
+    }
+    if (settingId == "near_surface.minimum_speed") {
+        return settings.nearSurface.minimumSpeedFactor;
+    }
+    if (settingId == "near_surface.squish") {
+        return settings.nearSurface.squish;
+    }
+    if (settingId == "near_surface.normal_alignment") {
+        return settings.nearSurface.normalAlignment;
+    }
+    if (settingId == "rings.band_min_z") {
+        return settings.sandImpactBand.minZ;
+    }
+    if (settingId == "rings.band_max_z") {
+        return settings.sandImpactBand.maxZ;
+    }
+    if (settingId == "rings.band_fade") {
+        return settings.sandImpactBand.fadeMeters;
+    }
+    if (settingId == "wetness.edge_breakup") {
+        return settings.rockImpact.edgeBreakup;
+    }
+    if (settingId == "wetness.spread_speed") {
+        return settings.rockImpact.spreadSpeed;
+    }
+    if (settingId == "wetness.centre_falloff") {
+        return settings.rockImpact.centreFalloff;
+    }
+    if (settingId == "wetness.height_bias") {
+        return settings.rockImpact.heightBias;
+    }
+    if (settingId == "wetness.persistence") {
+        return settings.rockImpact.persistence;
+    }
+    if (settingId == "wetness.downhill_stretch") {
+        return settings.rockImpact.downhillStretch;
+    }
+    if (settingId == "wetness.band_min_z") {
+        return settings.rockImpactBand.minZ;
+    }
+    if (settingId == "wetness.band_max_z") {
+        return settings.rockImpactBand.maxZ;
+    }
+    if (settingId == "wetness.band_fade") {
+        return settings.rockImpactBand.fadeMeters;
+    }
+    if (settingId == "droplets.twinkle") {
+        return settings.vegetationImpact.twinkle;
+    }
+    if (settingId == "droplets.propagation") {
+        return settings.vegetationImpact.propagationMetersPerSecond;
+    }
+    if (settingId == "droplets.hop_spacing") {
+        return settings.vegetationImpact.hopSpacingMeters;
+    }
+    if (settingId == "droplets.stream_width") {
+        return settings.vegetationImpact.streamWidthMeters;
+    }
+    if (settingId == "droplets.stream_spread") {
+        return settings.vegetationImpact.streamSpread;
+    }
+    if (settingId == "droplets.band_min_z") {
+        return settings.vegetationImpactBand.minZ;
+    }
+    if (settingId == "droplets.band_max_z") {
+        return settings.vegetationImpactBand.maxZ;
+    }
+    if (settingId == "droplets.band_fade") {
+        return settings.vegetationImpactBand.fadeMeters;
+    }
+    return std::nullopt;
+}
+
 void ApplyWaterFeatureTimingOverlayToRainSettings(
     const WaterFeatureTimingOverlay& overlay,
     WaterRainSettings* settings,

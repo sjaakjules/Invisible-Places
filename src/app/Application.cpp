@@ -218,6 +218,7 @@ using WaterSurfaceCacheRuntimeStatus =
 using WaterSurfaceRole = invisible_places::water::WaterSurfaceRole;
 using WaterSurfaceSource = invisible_places::water::WaterSurfaceSource;
 using RainRuntimeSettings = invisible_places::water::RainRuntimeSettings;
+using WaterRainProfile = invisible_places::water::WaterRainProfile;
 using WaterRainVisualSettings = invisible_places::water::WaterRainVisualSettings;
 using PointCloudShorelineWaveProfile =
     invisible_places::renderer::pointcloud::PointCloudShorelineWaveProfile;
@@ -1398,6 +1399,7 @@ struct ReciprocalPanTimingTakeClonePlan {
     std::array<std::string, 2> assignedTakeIds;
     std::vector<invisible_places::timing::TimingTakeDefinition> definitions;
     std::vector<invisible_places::timing::TimingTakeSceneState> sceneStates;
+    std::optional<std::vector<WaterRainProfile>> rainProfiles;
     std::vector<std::string> createdTakeIds;
     std::uint32_t nextSequence = 1U;
 };
@@ -3044,6 +3046,16 @@ struct WaterWorkflowState {
     // the quiescence gate that stops per-frame dispatches and scene redraws
     // once trails, terminal fades, and contact shading have drained.
     float dynamicMeshFlowLastActiveSeconds = -1.0F;
+    // Project-owned Rain baselines and take-owned temporary COW snapshots.
+    // The two settings fields below remain the sole active renderer
+    // projection; selecting a Timing Take resolves exactly one profile into
+    // them rather than creating another simulation.
+    std::vector<WaterRainProfile> rainProfiles;
+    std::string rainProfileNameBuffer =
+        std::string{invisible_places::timing::kLegacyWaterRainProfileName};
+    std::string rainProfileNameBufferBaseId;
+    std::string liveRainTimingTakeId;
+    std::string liveRainProfileId;
     RainRuntimeSettings collisionRainSettings = invisible_places::water::DefaultRainRuntimeSettings();
     WaterRainVisualSettings rainVisual = invisible_places::water::RainVisualPreset("Rain Fine Lines");
     // Currently resolved owner of the water-surface lifecycle. Generated Flow
@@ -3816,6 +3828,187 @@ std::string ActiveWaterTimingScenarioId(
                : std::string{
                      invisible_places::timing::
                          kAuthoredTimingTakeId};
+}
+
+struct ResolvedLiveRainProfile {
+    std::string takeId;
+    invisible_places::timing::TimingTakeDefinition* take = nullptr;
+    WaterRainProfile* effective = nullptr;
+    WaterRainProfile* base = nullptr;
+};
+
+ResolvedLiveRainProfile ResolveLiveRainProfile(
+    WaterWorkflowState* water,
+    std::string_view requestedTakeId) {
+    ResolvedLiveRainProfile result;
+    if (water == nullptr) {
+        return result;
+    }
+    result.takeId = invisible_places::timing::NormalizeTimingTakeId(
+        requestedTakeId);
+    result.take = invisible_places::timing::FindTimingTakeDefinition(
+        &water->timingTakes,
+        result.takeId);
+    if (result.take == nullptr) {
+        result.takeId = std::string{
+            invisible_places::timing::kAuthoredTimingTakeId};
+        result.take = invisible_places::timing::FindTimingTakeDefinition(
+            &water->timingTakes,
+            result.takeId);
+    }
+    if (result.take == nullptr) {
+        return result;
+    }
+    result.effective = const_cast<WaterRainProfile*>(
+        invisible_places::timing::ResolveTimingTakeRainProfile(
+            water->rainProfiles,
+            *result.take));
+    result.base = const_cast<WaterRainProfile*>(
+        invisible_places::timing::ResolveTimingTakeRainBaseProfile(
+            water->rainProfiles,
+            *result.take));
+    return result;
+}
+
+ResolvedLiveRainProfile ResolveActiveLiveRainProfile(
+    PreviewRuntimeState* runtimeState) {
+    return runtimeState == nullptr
+               ? ResolvedLiveRainProfile{}
+               : ResolveLiveRainProfile(
+                     &runtimeState->water,
+                     ActiveWaterTimingScenarioId(*runtimeState));
+}
+
+std::size_t RewriteTimingTakeRainTrackProfileName(
+    WaterWorkflowState* water,
+    std::string_view takeId,
+    std::string_view profileName) {
+    return water == nullptr
+               ? 0U
+               : invisible_places::timing::
+                     RewriteTimingTakeRainTrackProfileMetadata(
+                         &water->timingTakeSceneStates,
+                         takeId,
+                         profileName);
+}
+
+void BackfillRainTrackProfileMetadata(WaterWorkflowState* water) {
+    if (water == nullptr) {
+        return;
+    }
+    for (auto& state : water->timingTakeSceneStates) {
+        const auto resolved = ResolveLiveRainProfile(
+            water,
+            state.takeId);
+        if (resolved.effective == nullptr) {
+            continue;
+        }
+        (void)RewriteTimingTakeRainTrackProfileName(
+            water,
+            state.takeId,
+            resolved.effective->name);
+    }
+}
+
+void EnsureWaterRainProfiles(WaterWorkflowState* water) {
+    if (water == nullptr) {
+        return;
+    }
+    if (water->timingTakes.empty() ||
+        invisible_places::timing::FindTimingTakeDefinition(
+            water->timingTakes,
+            invisible_places::timing::kAuthoredTimingTakeId) == nullptr) {
+        water->timingTakes.insert(
+            water->timingTakes.begin(),
+            invisible_places::timing::AuthoredTimingTakeDefinition());
+    }
+    (void)invisible_places::timing::EnsureLegacyWaterRainProfile(
+        &water->rainProfiles,
+        &water->timingTakes,
+        water->collisionRainSettings,
+        water->rainVisual);
+    BackfillRainTrackProfileMetadata(water);
+    const auto resolved = ResolveLiveRainProfile(
+        water,
+        water->selectedTimingTakeId);
+    if (resolved.base != nullptr &&
+        water->rainProfileNameBufferBaseId != resolved.base->id) {
+        water->rainProfileNameBuffer = resolved.base->name;
+        water->rainProfileNameBufferBaseId = resolved.base->id;
+    }
+}
+
+bool SynchronizeLiveTimingTakeRain(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    bool forceRefresh = false) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return false;
+    }
+    auto& water = runtimeState->water;
+    auto resolved = ResolveActiveLiveRainProfile(runtimeState);
+    if (resolved.effective == nullptr || resolved.base == nullptr) {
+        EnsureWaterRainProfiles(&water);
+        resolved = ResolveActiveLiveRainProfile(runtimeState);
+    }
+    if (resolved.effective == nullptr || resolved.base == nullptr) {
+        return false;
+    }
+    const auto decision = invisible_places::timing::
+        ResolveTimingTakeRainLiveSyncDecision(
+            water.liveRainTimingTakeId,
+            water.liveRainProfileId,
+            resolved.takeId,
+            resolved.effective->id,
+            forceRefresh);
+    if (!decision.copyProfile) {
+        return false;
+    }
+    water.collisionRainSettings = resolved.effective->settings;
+    water.rainVisual = resolved.effective->visual;
+    water.liveRainTimingTakeId = resolved.takeId;
+    water.liveRainProfileId = resolved.effective->id;
+    if (water.rainProfileNameBufferBaseId != resolved.base->id) {
+        water.rainProfileNameBuffer = resolved.base->name;
+        water.rainProfileNameBufferBaseId = resolved.base->id;
+    }
+    water.seepageParamsFingerprints.clear();
+    runtimeState->previewRenderStateSignatureValid = false;
+    if (decision.resetRuntime) {
+        viewport->ResetRainRuntime();
+    }
+    return true;
+}
+
+WaterRainProfile* CommitActiveTimingTakeRainEdit(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return nullptr;
+    }
+    auto& water = runtimeState->water;
+    auto resolved = ResolveActiveLiveRainProfile(runtimeState);
+    if (resolved.take == nullptr || resolved.base == nullptr) {
+        return nullptr;
+    }
+    auto* owner = invisible_places::timing::
+        UpsertTimingTakeRainOwnerProfile(
+            &water.rainProfiles,
+            resolved.take,
+            water.collisionRainSettings,
+            water.rainVisual);
+    if (owner == nullptr) {
+        return nullptr;
+    }
+    // The renderer is already displaying these values. Rebinding the same
+    // live state from base to its first COW owner must not restart Rain.
+    water.liveRainTimingTakeId = resolved.takeId;
+    water.liveRainProfileId = owner->id;
+    (void)RewriteTimingTakeRainTrackProfileName(
+        &water,
+        resolved.takeId,
+        owner->name);
+    runtimeState->previewRenderStateSignatureValid = false;
+    return owner;
 }
 
 std::vector<invisible_places::water::WaterFeatureTimingRun>
@@ -16811,6 +17004,7 @@ void EnsureWaterProfiles(PreviewRuntimeState* runtimeState) {
     water.pathProfileNameBuffer = BaseWaterProfileName(water.selectedPathProfileName);
     water.laneProfileNameBuffer = BaseWaterProfileName(water.selectedLaneProfileName);
     water.trailProfileNameBuffer = BaseWaterProfileName(water.selectedTrailProfileName);
+    EnsureWaterRainProfiles(&water);
 }
 
 WaterPathProfileDocument MakeWaterPathProfileDocument(const SavedWaterPathProfileState& profile) {
@@ -25785,6 +25979,7 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
         runtimeState.water.featureTimingRunsByScenario;
     document.waterKeyedSettingsProfiles =
         runtimeState.water.keyedSettingsProfiles;
+    document.waterRainProfiles = runtimeState.water.rainProfiles;
     document.waterFeatureTimingRunSequence =
         runtimeState.water.nextFeatureTimingRunSequence;
     document.timingTakes = runtimeState.water.timingTakes;
@@ -26977,6 +27172,7 @@ bool ApplyProjectDocumentToRuntime(
     // reference kind.
     ReconcileWaterSeepageObjectProfiles(&runtimeState->water);
     runtimeState->water.timingTakes = document.timingTakes;
+    runtimeState->water.rainProfiles = document.waterRainProfiles;
     runtimeState->water.selectedTimingTakeId =
         invisible_places::timing::NormalizeTimingTakeId(
             document.selectedTimingTakeId);
@@ -27039,6 +27235,10 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->water.dynamicMeshSurfaceCacheSignature.clear();
     runtimeState->water.collisionRainSettings = document.waterRainSettings;
     runtimeState->water.rainVisual = document.waterRainVisualSettings;
+    runtimeState->water.liveRainTimingTakeId.clear();
+    runtimeState->water.liveRainProfileId.clear();
+    runtimeState->water.rainProfileNameBufferBaseId.clear();
+    EnsureWaterRainProfiles(&runtimeState->water);
     runtimeState->water.flowOverlay = {};
     runtimeState->water.flowTrailOverlay = {};
     runtimeState->water.fieldTrailOverlay = {};
@@ -27526,6 +27726,10 @@ bool ApplyProjectDocumentToRuntime(
             "The project loaded, but its active animation did not: " +
             activeAnimationRestoreError;
     }
+    (void)SynchronizeLiveTimingTakeRain(
+        runtimeState,
+        viewport,
+        true);
     return true;
 }
 
@@ -30417,6 +30621,11 @@ bool DiscardReciprocalPanTimingTakeClones(
             retainedReferencedClone = true;
             continue;
         }
+        (void)invisible_places::timing::
+            RemoveTimingTakeRainOwnerProfiles(
+                &runtimeState->water.rainProfiles,
+                &runtimeState->water.timingTakes,
+                takeId);
         std::erase_if(
             runtimeState->water.timingTakes,
             [&](const auto& take) { return take.id == takeId; });
@@ -51997,6 +52206,10 @@ bool ApplyAnimationLoopSmoothing(
         runtimeState->water.nextTimingTakeSequence;
     runtimeState->water.nextTimingTakeSequence =
         timingTakePlan.nextSequence;
+    if (timingTakePlan.rainProfiles.has_value()) {
+        runtimeState->water.rainProfiles =
+            std::move(timingTakePlan.rainProfiles.value());
+    }
     runtimeState->water.timingTakes.insert(
         runtimeState->water.timingTakes.end(),
         std::make_move_iterator(timingTakePlan.definitions.begin()),
@@ -59126,6 +59339,19 @@ bool BuildReciprocalPanTimingTakeClonePlan(
         definitionsForAllocation,
         &plan->nextSequence);
     cloneDefinition.name += " - Linked Loop";
+    auto clonedRainProfiles = runtimeState.water.rainProfiles;
+    if (!invisible_places::timing::
+            DuplicateTimingTakeRainProfileAssignment(
+                &clonedRainProfiles,
+                *sourceDefinitions[0U],
+                &cloneDefinition)) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The linked loop's Rain profile could not be duplicated.";
+        }
+        return false;
+    }
+    plan->rainProfiles = std::move(clonedRainProfiles);
     plan->definitions.push_back(cloneDefinition);
     plan->createdTakeIds.push_back(cloneDefinition.id);
 
@@ -59179,6 +59405,17 @@ bool BuildReciprocalPanTimingTakeClonePlan(
         }
         merged->takeId = cloneDefinition.id;
         plan->sceneStates.push_back(std::move(merged.value()));
+    }
+    if (const auto* clonedRainProfile = invisible_places::timing::
+            ResolveTimingTakeRainProfile(
+                plan->rainProfiles.value(),
+                cloneDefinition);
+        clonedRainProfile != nullptr) {
+        (void)invisible_places::timing::
+            RewriteTimingTakeRainTrackProfileMetadata(
+                &plan->sceneStates,
+                cloneDefinition.id,
+                clonedRainProfile->name);
     }
     for (auto* candidate : candidates) {
         candidate->selectedTimingTakeId = cloneDefinition.id;
@@ -59278,6 +59515,10 @@ bool ApplySharedTimingLoopToLinkedPair(
     const std::uint32_t preAllocationNextSequence =
         runtimeState->water.nextTimingTakeSequence;
     runtimeState->water.nextTimingTakeSequence = plan.nextSequence;
+    if (plan.rainProfiles.has_value()) {
+        runtimeState->water.rainProfiles =
+            std::move(plan.rainProfiles.value());
+    }
     runtimeState->water.timingTakes.insert(
         runtimeState->water.timingTakes.end(),
         std::make_move_iterator(plan.definitions.begin()),
@@ -59652,6 +59893,10 @@ bool ApplyReciprocalPanCandidate(
         runtimeState->water.nextTimingTakeSequence;
     runtimeState->water.nextTimingTakeSequence =
         timingTakePlan.nextSequence;
+    if (timingTakePlan.rainProfiles.has_value()) {
+        runtimeState->water.rainProfiles =
+            std::move(timingTakePlan.rainProfiles.value());
+    }
     runtimeState->water.timingTakes.insert(
         runtimeState->water.timingTakes.end(),
         std::make_move_iterator(timingTakePlan.definitions.begin()),
@@ -68401,6 +68646,11 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
             invisible_places::timing::NormalizeTimingTakeId(
                 project->selectedTimingTakeId);
         water.timingTakeSceneStates = project->timingTakeStates;
+        water.rainProfiles = project->waterRainProfiles;
+        water.liveRainTimingTakeId.clear();
+        water.liveRainProfileId.clear();
+        water.rainProfileNameBufferBaseId.clear();
+        EnsureWaterRainProfiles(&water);
         water.savedTimingColourisePalettes =
             project->timingColourisePalettes;
         water.timingScalarBoundsStores =
@@ -74033,6 +74283,13 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
     EndPanelSection();
 }
 
+void DrawWaterKeyedProfilesCombo(
+    PreviewRuntimeState* runtimeState,
+    const invisible_places::water::WaterKeyedFeatureId& feature,
+    std::string_view profileGroup,
+    std::string_view baseName,
+    const char* widgetId);
+
 void DrawWaterGpuRainPanel(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
@@ -74041,11 +74298,245 @@ void DrawWaterGpuRainPanel(
     }
     auto& water = runtimeState->water;
     auto& settings = water.collisionRainSettings;
+    EnsureWaterRainProfiles(&water);
+
+    if (BeginPanelSection("Rain Profile")) {
+        auto resolved = ResolveActiveLiveRainProfile(runtimeState);
+        if (resolved.take != nullptr && resolved.effective != nullptr &&
+            resolved.base != nullptr) {
+            ImGui::TextDisabled(
+                "Timing Take: %s",
+                resolved.take->name.c_str());
+            if (resolved.effective->objectOverride) {
+                ImGui::TextDisabled(
+                    "Temporary take copy: %s",
+                    resolved.effective->name.c_str());
+                ImGui::TextDisabled(
+                    "Saved base: %s",
+                    resolved.base->name.c_str());
+            } else {
+                ImGui::TextDisabled(
+                    "Saved profile: %s",
+                    resolved.base->name.c_str());
+            }
+
+            std::optional<std::string> requestedBaseId;
+            if (ImGui::BeginCombo(
+                    "Saved Profile",
+                    resolved.base->name.c_str())) {
+                for (const auto& profile : water.rainProfiles) {
+                    if (profile.objectOverride) {
+                        continue;
+                    }
+                    const bool selected = profile.id == resolved.base->id;
+                    if (ImGui::Selectable(profile.name.c_str(), selected) &&
+                        !selected) {
+                        requestedBaseId = profile.id;
+                    }
+                    if (selected) {
+                        ImGui::SetItemDefaultFocus();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            if (requestedBaseId.has_value()) {
+                const auto requestedId = requestedBaseId.value();
+                const auto* requestedProfile =
+                    invisible_places::water::FindWaterRainProfileById(
+                        water.rainProfiles,
+                        requestedId);
+                const auto requestedName = requestedProfile != nullptr
+                                               ? requestedProfile->name
+                                               : std::string{};
+                if (resolved.effective->objectOverride) {
+                    (void)invisible_places::timing::
+                        DiscardTimingTakeRainOwnerProfile(
+                            &water.rainProfiles,
+                            &water.timingTakes,
+                            resolved.takeId);
+                }
+                auto* take = invisible_places::timing::
+                    FindTimingTakeDefinition(
+                        &water.timingTakes,
+                        resolved.takeId);
+                if (take != nullptr &&
+                    invisible_places::timing::
+                        AssignTimingTakeRainBaseProfile(
+                            take,
+                            water.rainProfiles,
+                            requestedId)) {
+                    (void)RewriteTimingTakeRainTrackProfileName(
+                        &water,
+                        resolved.takeId,
+                        requestedName);
+                    water.rainProfileNameBuffer = requestedName;
+                    water.rainProfileNameBufferBaseId = requestedId;
+                    (void)SynchronizeLiveTimingTakeRain(
+                        runtimeState,
+                        viewport);
+                    runtimeState->statusMessage =
+                        "Rain now uses saved profile " + requestedName + ".";
+                    runtimeState->errorMessage.clear();
+                }
+                resolved = ResolveActiveLiveRainProfile(runtimeState);
+            }
+
+            InputTextString(
+                "Profile Name",
+                &water.rainProfileNameBuffer);
+            const bool canSave =
+                resolved.take != nullptr &&
+                resolved.effective != nullptr &&
+                !TrimText(water.rainProfileNameBuffer).empty();
+            if (!canSave) {
+                ImGui::BeginDisabled();
+            }
+            const auto saveProfile = [&](bool overwriteExisting) {
+                const auto active = ResolveActiveLiveRainProfile(runtimeState);
+                if (active.take == nullptr || active.effective == nullptr) {
+                    return;
+                }
+                auto* saved = invisible_places::timing::
+                    SaveTimingTakeRainOwnerProfileAsShared(
+                        &water.rainProfiles,
+                        &water.timingTakes,
+                        active.takeId,
+                        water.rainProfileNameBuffer,
+                        overwriteExisting);
+                if (saved == nullptr) {
+                    runtimeState->errorMessage =
+                        "Rain profile could not be saved.";
+                    runtimeState->statusMessage.clear();
+                    return;
+                }
+                const auto savedId = saved->id;
+                const auto savedName = saved->name;
+                water.rainProfileNameBuffer = savedName;
+                water.rainProfileNameBufferBaseId = savedId;
+                (void)RewriteTimingTakeRainTrackProfileName(
+                    &water,
+                    active.takeId,
+                    savedName);
+                // Promotion changes only project/profile identity. The live
+                // renderer already contains this exact snapshot, so rebind
+                // without beginning another Rain simulation epoch.
+                water.liveRainTimingTakeId = active.takeId;
+                water.liveRainProfileId = savedId;
+                runtimeState->previewRenderStateSignatureValid = false;
+                (void)SynchronizeLiveTimingTakeRain(
+                    runtimeState,
+                    viewport);
+                runtimeState->statusMessage =
+                    "Saved Rain profile " + savedName + ".";
+                runtimeState->errorMessage.clear();
+            };
+            if (ImGui::Button("Save")) {
+                saveProfile(true);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Save As")) {
+                saveProfile(false);
+            }
+            if (!canSave) {
+                ImGui::EndDisabled();
+            }
+
+            resolved = ResolveActiveLiveRainProfile(runtimeState);
+            const bool canDiscard =
+                resolved.take != nullptr &&
+                resolved.effective != nullptr &&
+                resolved.effective->objectOverride;
+            if (!canDiscard) {
+                ImGui::BeginDisabled();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Discard")) {
+                const auto discardedTakeId = resolved.takeId;
+                if (invisible_places::timing::
+                        DiscardTimingTakeRainOwnerProfile(
+                            &water.rainProfiles,
+                            &water.timingTakes,
+                            discardedTakeId)) {
+                    const auto restored =
+                        ResolveActiveLiveRainProfile(runtimeState);
+                    if (restored.effective != nullptr &&
+                        restored.base != nullptr) {
+                        water.rainProfileNameBuffer =
+                            restored.base->name;
+                        water.rainProfileNameBufferBaseId =
+                            restored.base->id;
+                        (void)RewriteTimingTakeRainTrackProfileName(
+                            &water,
+                            discardedTakeId,
+                            restored.effective->name);
+                    }
+                    (void)SynchronizeLiveTimingTakeRain(
+                        runtimeState,
+                        viewport);
+                    runtimeState->statusMessage =
+                        "Discarded the Timing Take's temporary Rain edits.";
+                    runtimeState->errorMessage.clear();
+                }
+            }
+            if (!canDiscard) {
+                ImGui::EndDisabled();
+            }
+        } else {
+            ImGui::TextDisabled("No Timing Take Rain profile is available.");
+        }
+        EndPanelSection();
+    }
+
+    const auto activeRainProfile = ResolveActiveLiveRainProfile(runtimeState);
+    const std::optional<RainRuntimeSettings> savedBaseSettings =
+        activeRainProfile.base != nullptr
+            ? std::optional<RainRuntimeSettings>{
+                  activeRainProfile.base->settings}
+            : std::nullopt;
+    const std::optional<WaterRainVisualSettings> savedBaseVisual =
+        activeRainProfile.base != nullptr
+            ? std::optional<WaterRainVisualSettings>{
+                  activeRainProfile.base->visual}
+            : std::nullopt;
+    const std::string rainTrackProfileName =
+        activeRainProfile.effective != nullptr
+            ? activeRainProfile.effective->name
+            : std::string{};
     const invisible_places::water::WaterKeyedFeatureId rainFeature{
         .kind = invisible_places::water::WaterKeyedFeatureKind::Rain};
     const std::array<invisible_places::water::WaterKeyedFeatureId, 1>
         rainFeatures{rainFeature};
     bool liveChanged = false;
+    const auto baseRainSettingValue =
+        [&](std::string_view settingId) -> std::optional<float> {
+            if (!savedBaseSettings.has_value() ||
+                !savedBaseVisual.has_value()) {
+                return std::nullopt;
+            }
+            return invisible_places::water::ResolveWaterRainSettingValue(
+                savedBaseSettings.value(),
+                savedBaseVisual.value(),
+                settingId);
+        };
+    const auto drawRainBaseTextHint =
+        [](std::string_view currentValue,
+           const std::optional<std::string>& baseValue) {
+            if (!baseValue.has_value() ||
+                baseValue.value() == currentValue) {
+                return;
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("(%s)", baseValue->c_str());
+        };
+    const auto drawRainBaseIntHint =
+        [](int currentValue, const std::optional<int>& baseValue) {
+            if (!baseValue.has_value() ||
+                baseValue.value() == currentValue) {
+                return;
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("(%d)", baseValue.value());
+        };
     const auto drawRainSlider =
         [&](const char* settingId,
             const char* label,
@@ -74064,12 +74555,16 @@ void DrawWaterGpuRainPanel(
                 *value,
                 minimum,
                 maximum,
-                format,
+                WaterProfileValueFormat(
+                    format,
+                    *value,
+                    baseRainSettingValue(settingId))
+                    .c_str(),
                 flags,
                 false,
                 &edited,
-                {},
-                {},
+                invisible_places::timing::kTimingTakeRainTrackProfileGroup,
+                rainTrackProfileName,
                 help);
             if (result.authoredChanged) {
                 *value = edited;
@@ -74081,7 +74576,18 @@ void DrawWaterGpuRainPanel(
         DrawEmbeddedWaterFeatureTimeline(
             runtimeState,
             rainFeature);
+        DrawWaterKeyedProfilesCombo(
+            runtimeState,
+            rainFeature,
+            invisible_places::timing::kTimingTakeRainTrackProfileGroup,
+            rainTrackProfileName,
+            "Rain");
         liveChanged |= ImGui::Checkbox("Enabled##GpuRain", &settings.enabled);
+        DrawWaterProfileBaseBoolHint(
+            settings.enabled,
+            savedBaseSettings.has_value()
+                ? std::optional<bool>{savedBaseSettings->enabled}
+                : std::nullopt);
         const auto intensityLabel = invisible_places::water::WaterRainIntensityPresetLabel(
             static_cast<WaterRainIntensityPreset>(settings.intensityPreset));
         if (ImGui::BeginCombo("Intensity", intensityLabel.data())) {
@@ -74089,7 +74595,7 @@ void DrawWaterGpuRainPanel(
                 const auto runtimePreset = static_cast<invisible_places::water::RainIntensityPreset>(preset);
                 const bool selected = settings.intensityPreset == runtimePreset;
                 const auto label = invisible_places::water::WaterRainIntensityPresetLabel(preset);
-                if (ImGui::Selectable(label.data(), selected)) {
+                if (ImGui::Selectable(label.data(), selected) && !selected) {
                     settings.intensityPreset = runtimePreset;
                     liveChanged = true;
                 }
@@ -74099,6 +74605,14 @@ void DrawWaterGpuRainPanel(
             }
             ImGui::EndCombo();
         }
+        drawRainBaseTextHint(
+            intensityLabel,
+            savedBaseSettings.has_value()
+                ? std::optional<std::string>{std::string{
+                      invisible_places::water::WaterRainIntensityPresetLabel(
+                          static_cast<WaterRainIntensityPreset>(
+                              savedBaseSettings->intensityPreset))}}
+                : std::nullopt);
         drawRainSlider(
             "level",
             "Rain Amount",
@@ -74110,7 +74624,19 @@ void DrawWaterGpuRainPanel(
             "Animates rain births continuously. A keyed zero stops new rain "
             "while existing impact effects finish fading.");
         int activeParticles = static_cast<int>(settings.activeParticleCount);
-        if (DrawWaterSliderInt("Particle Limit", &activeParticles, 1, 32768)) {
+        if (DrawWaterSliderInt(
+                "Particle Limit",
+                &activeParticles,
+                1,
+                32768,
+                WaterProfileValueFormat(
+                    "%d",
+                    activeParticles,
+                    savedBaseSettings.has_value()
+                        ? std::optional<int>{static_cast<int>(
+                              savedBaseSettings->activeParticleCount)}
+                        : std::nullopt)
+                    .c_str())) {
             settings.activeParticleCount = static_cast<std::uint32_t>(std::clamp(activeParticles, 1, 32768));
             liveChanged = true;
         }
@@ -74164,8 +74690,16 @@ void DrawWaterGpuRainPanel(
             settings.seed = static_cast<std::uint32_t>(std::max(0, seed));
             liveChanged = true;
         }
+        const bool seedHovered =
+            ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal);
         EndWaterRegenerativeSettingLabels(rainInRun);
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+        drawRainBaseIntHint(
+            seed,
+            savedBaseSettings.has_value()
+                ? std::optional<int>{
+                      static_cast<int>(savedBaseSettings->seed)}
+                : std::nullopt);
+        if (seedHovered) {
             ImGui::SetTooltip(
                 "Changing the seed reseeds the whole rain simulation — not "
                 "keyable.");
@@ -74177,7 +74711,7 @@ void DrawWaterGpuRainPanel(
         if (ImGui::BeginCombo("Visual Preset", settings.visualProfileName.c_str())) {
             for (const auto name : invisible_places::water::RainVisualPresetNames()) {
                 const bool selected = settings.visualProfileName == name;
-                if (ImGui::Selectable(name.data(), selected)) {
+                if (ImGui::Selectable(name.data(), selected) && !selected) {
                     settings.visualProfileName = std::string{name};
                     water.rainVisual = invisible_places::water::RainVisualPreset(name);
                     liveChanged = true;
@@ -74188,6 +74722,12 @@ void DrawWaterGpuRainPanel(
             }
             ImGui::EndCombo();
         }
+        drawRainBaseTextHint(
+            settings.visualProfileName,
+            savedBaseSettings.has_value()
+                ? std::optional<std::string>{
+                      savedBaseSettings->visualProfileName}
+                : std::nullopt);
         auto editedColour = water.rainVisual.colour;
         const auto colourResult = DrawKeyedWaterColourSetting(
             runtimeState,
@@ -74198,12 +74738,18 @@ void DrawWaterGpuRainPanel(
             "Colour",
             water.rainVisual.colour,
             &editedColour,
-            "rain_visual",
-            settings.visualProfileName);
+            invisible_places::timing::kTimingTakeRainTrackProfileGroup,
+            rainTrackProfileName);
         if (colourResult.authoredChanged) {
             water.rainVisual.colour = editedColour;
             liveChanged = true;
         }
+        DrawWaterProfileBaseColourHint(
+            water.rainVisual.colour,
+            savedBaseVisual.has_value()
+                ? std::optional<std::array<float, 3>>{
+                      savedBaseVisual->colour}
+                : std::nullopt);
         drawRainSlider(
             "visual.width",
             "Width",
@@ -74337,7 +74883,14 @@ void DrawWaterGpuRainPanel(
             &settings.spawnHeightMeters,
             0.1F,
             80.0F,
-            "%.1f m");
+            WaterProfileValueFormat(
+                "%.1f m",
+                settings.spawnHeightMeters,
+                savedBaseSettings.has_value()
+                    ? std::optional<float>{
+                          savedBaseSettings->spawnHeightMeters}
+                    : std::nullopt)
+                .c_str());
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
             ImGui::SetTooltip(
                 "Applies to newly born drops only, so it remains authored "
@@ -74348,7 +74901,14 @@ void DrawWaterGpuRainPanel(
             &settings.spawnRadiusMeters,
             0.5F,
             80.0F,
-            "%.1f m");
+            WaterProfileValueFormat(
+                "%.1f m",
+                settings.spawnRadiusMeters,
+                savedBaseSettings.has_value()
+                    ? std::optional<float>{
+                          savedBaseSettings->spawnRadiusMeters}
+                    : std::nullopt)
+                .c_str());
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
             ImGui::SetTooltip(
                 "Applies to newly born drops only and is not keyable.");
@@ -74358,7 +74918,14 @@ void DrawWaterGpuRainPanel(
             &settings.cameraDeathDistanceMeters,
             1.0F,
             250.0F,
-            "%.1f m",
+            WaterProfileValueFormat(
+                "%.1f m",
+                settings.cameraDeathDistanceMeters,
+                savedBaseSettings.has_value()
+                    ? std::optional<float>{
+                          savedBaseSettings->cameraDeathDistanceMeters}
+                    : std::nullopt)
+                .c_str(),
             ImGuiSliderFlags_Logarithmic);
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
             ImGui::SetTooltip(
@@ -74372,6 +74939,12 @@ void DrawWaterGpuRainPanel(
         liveChanged |= ImGui::Checkbox(
             "Enabled##RainImpacts",
             &settings.impactEffectsEnabled);
+        DrawWaterProfileBaseBoolHint(
+            settings.impactEffectsEnabled,
+            savedBaseSettings.has_value()
+                ? std::optional<bool>{
+                      savedBaseSettings->impactEffectsEnabled}
+                : std::nullopt);
         if (!settings.impactEffectsEnabled) {
             ImGui::BeginDisabled();
         }
@@ -74381,12 +74954,28 @@ void DrawWaterGpuRainPanel(
         // consume vegetation impacts. Each response is applied by effect
         // after collision, so none of these sliders selects a cloud role.
         liveChanged |= ImGui::Checkbox("Rings", &settings.sandEffectsEnabled);
-        ImGui::SameLine();
+        DrawWaterProfileBaseBoolHint(
+            settings.sandEffectsEnabled,
+            savedBaseSettings.has_value()
+                ? std::optional<bool>{
+                      savedBaseSettings->sandEffectsEnabled}
+                : std::nullopt);
         liveChanged |= ImGui::Checkbox("Wetness", &settings.rockEffectsEnabled);
-        ImGui::SameLine();
+        DrawWaterProfileBaseBoolHint(
+            settings.rockEffectsEnabled,
+            savedBaseSettings.has_value()
+                ? std::optional<bool>{
+                      savedBaseSettings->rockEffectsEnabled}
+                : std::nullopt);
         liveChanged |= ImGui::Checkbox(
             "Droplets",
             &settings.vegetationEffectsEnabled);
+        DrawWaterProfileBaseBoolHint(
+            settings.vegetationEffectsEnabled,
+            savedBaseSettings.has_value()
+                ? std::optional<bool>{
+                      savedBaseSettings->vegetationEffectsEnabled}
+                : std::nullopt);
         drawRainSlider(
             "effects.rings_response",
             "Rings Response",
@@ -74486,6 +75075,14 @@ void DrawWaterGpuRainPanel(
                                  : -kUnbounded;
                 liveChanged = true;
             }
+            const auto savedMinimum =
+                baseRainSettingValue(minimumSettingId);
+            DrawWaterProfileBaseBoolHint(
+                lowerBounded,
+                savedMinimum.has_value()
+                    ? std::optional<bool>{
+                          savedMinimum.value() > -kUnbounded * 0.5F}
+                    : std::nullopt);
             if (lowerBounded) {
                 drawRainSlider(
                     minimumSettingId,
@@ -74504,6 +75101,14 @@ void DrawWaterGpuRainPanel(
                                  : kUnbounded;
                 liveChanged = true;
             }
+            const auto savedMaximum =
+                baseRainSettingValue(maximumSettingId);
+            DrawWaterProfileBaseBoolHint(
+                upperBounded,
+                savedMaximum.has_value()
+                    ? std::optional<bool>{
+                          savedMaximum.value() < kUnbounded * 0.5F}
+                    : std::nullopt);
             if (upperBounded) {
                 drawRainSlider(
                     maximumSettingId,
@@ -74741,7 +75346,12 @@ void DrawWaterGpuRainPanel(
         EndPanelSection();
     }
     if (liveChanged) {
-        runtimeState->previewRenderStateSignatureValid = false;
+        if (CommitActiveTimingTakeRainEdit(runtimeState) == nullptr) {
+            runtimeState->previewRenderStateSignatureValid = false;
+            runtimeState->errorMessage =
+                "Rain edits could not be attached to the active Timing Take.";
+            runtimeState->statusMessage.clear();
+        }
     }
 }
 
@@ -94196,6 +94806,17 @@ void DrawAuthoredTimingsPanel(
                 : "Choose the reusable Timing Take linked to this animation. A take starts from authored water and changes only explicit keys.");
 
         if (ImGui::Button("New")) {
+            const auto* inheritedRainBase =
+                selectedTake != nullptr
+                    ? invisible_places::timing::
+                          ResolveTimingTakeRainBaseProfile(
+                              water.rainProfiles,
+                              *selectedTake)
+                    : nullptr;
+            const std::string inheritedRainBaseId =
+                inheritedRainBase != nullptr
+                    ? inheritedRainBase->id
+                    : std::string{};
             invisible_places::timing::TimingTakeDefinition take;
             take.id =
                 invisible_places::timing::
@@ -94206,6 +94827,13 @@ void DrawAuthoredTimingsPanel(
                 "Timing Take " +
                 std::to_string(
                     water.timingTakes.size());
+            if (!inheritedRainBaseId.empty()) {
+                (void)invisible_places::timing::
+                    AssignTimingTakeRainBaseProfile(
+                        &take,
+                        water.rainProfiles,
+                        inheritedRainBaseId);
+            }
             water.timingTakes.push_back(take);
             water.selectedTimingTakeId = take.id;
             if (animationPath != nullptr) {
@@ -94222,7 +94850,8 @@ void DrawAuthoredTimingsPanel(
         ImGui::SameLine();
         if (ImGui::Button("Duplicate") &&
             selectedTake != nullptr) {
-            auto copy = *selectedTake;
+            const auto sourceTake = *selectedTake;
+            auto copy = sourceTake;
             copy.id =
                 invisible_places::timing::
                     AllocateTimingTakeId(
@@ -94230,6 +94859,11 @@ void DrawAuthoredTimingsPanel(
                         &water.nextTimingTakeSequence);
             copy.name += " Copy";
             const std::string sourceId = selectedTakeId;
+            (void)invisible_places::timing::
+                DuplicateTimingTakeRainProfileAssignment(
+                    &water.rainProfiles,
+                    sourceTake,
+                    &copy);
             water.timingTakes.push_back(copy);
             std::vector<
                 invisible_places::timing::
@@ -94259,6 +94893,16 @@ void DrawAuthoredTimingsPanel(
             selectedTakeId = copy.id;
             selectedTake =
                 &water.timingTakes.back();
+            if (const auto* rainProfile = invisible_places::timing::
+                    ResolveTimingTakeRainProfile(
+                        water.rainProfiles,
+                        *selectedTake);
+                rainProfile != nullptr) {
+                (void)RewriteTimingTakeRainTrackProfileName(
+                    &water,
+                    selectedTakeId,
+                    rainProfile->name);
+            }
         }
         DrawTimingControlTooltip(
             "Duplicate the selected take across all of its scene-specific runs and Colourise / Emissive effects.");
@@ -94272,6 +94916,11 @@ void DrawAuthoredTimingsPanel(
             selectedTake == nullptr);
         if (ImGui::Button("Delete") &&
             selectedTake != nullptr) {
+            (void)invisible_places::timing::
+                RemoveTimingTakeRainOwnerProfiles(
+                    &water.rainProfiles,
+                    &water.timingTakes,
+                    selectedTakeId);
             std::erase_if(
                 water.timingTakes,
                 [&](const auto& candidate) {
@@ -94310,9 +94959,25 @@ void DrawAuthoredTimingsPanel(
                 : "Delete this Timing Take and every scene-specific run and scalar effect it owns.");
         if (selectedTake != nullptr) {
             ImGui::BeginDisabled(authoredTake);
-            InputTextString(
-                "Take Name",
-                &selectedTake->name);
+            if (InputTextString(
+                    "Take Name",
+                    &selectedTake->name)) {
+                (void)invisible_places::timing::
+                    RenameTimingTakeRainOwnerProfile(
+                        &water.rainProfiles,
+                        &water.timingTakes,
+                        selectedTakeId);
+                if (const auto* rainProfile = invisible_places::timing::
+                        ResolveTimingTakeRainProfile(
+                            water.rainProfiles,
+                            *selectedTake);
+                    rainProfile != nullptr) {
+                    (void)RewriteTimingTakeRainTrackProfileName(
+                        &water,
+                        selectedTakeId,
+                        rainProfile->name);
+                }
+            }
             ImGui::EndDisabled();
             DrawTimingControlTooltip(
                 authoredTake
@@ -110556,6 +111221,7 @@ int Application::Run(ApplicationRunOptions options) const {
         DefaultRenderOutputDirectory(Application::DefaultDataDirectory()).string();
     const auto roots = WorkspaceRoots(runtimeState);
     RefreshAnimationFileList(&runtimeState.animationPanel, AnimationDirectory(runtimeState), &roots);
+    EnsureWaterRainProfiles(&runtimeState.water);
     if (!backgroundWorker) {
         runtimeState.backgroundRender.latestStatusPath =
             LatestBackgroundRenderStatusPath(runtimeState);
@@ -111001,11 +111667,17 @@ int Application::Run(ApplicationRunOptions options) const {
                 runtimeState.offlineRenderJob.active && runtimeState.pauseLiveViewportDuringExport;
 
             DrawControlsWindow(&runtimeState, &viewport.value());
+            (void)SynchronizeLiveTimingTakeRain(
+                &runtimeState,
+                &viewport.value());
             DrawAnimationFramePreviewWindow(&runtimeState, &viewport.value());
             DrawDiagnosticsWindow(&runtimeState, viewport.value());
             DrawLoadingOverlay(runtimeState);
             DrawOfflineRenderOverlay(&runtimeState);
             DrawSaveChangesDialog(&runtimeState);
+            (void)SynchronizeLiveTimingTakeRain(
+                &runtimeState,
+                &viewport.value());
             const bool reciprocalPanWizardActive =
                 runtimeState.animationPanel.reciprocalPanWizard.Active();
             if (!pauseLiveViewport) {

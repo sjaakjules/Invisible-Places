@@ -3690,6 +3690,143 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Rain authored value resolver covers the complete keyable registry",
+    "[water][rain][profiles][timing]") {
+    using invisible_places::water::ResolveWaterRainSettingValue;
+    using invisible_places::water::WaterKeyableSettings;
+    using invisible_places::water::WaterKeyedFeatureKind;
+
+    auto settings = invisible_places::water::DefaultWaterRainSettings();
+    auto visual = invisible_places::water::RainVisualPreset(
+        "Rain Fine Lines");
+    settings.rainLevel = 0.37F;
+    settings.rockImpact.downhillStretch = 1.41F;
+    visual.colour[1] = 0.63F;
+
+    const auto registry = WaterKeyableSettings(
+        WaterKeyedFeatureKind::Rain);
+    REQUIRE_FALSE(registry.empty());
+    for (const auto& info : registry) {
+        CAPTURE(info.id);
+        CHECK(ResolveWaterRainSettingValue(
+                  settings,
+                  visual,
+                  info.id)
+                  .has_value());
+    }
+    CHECK(ResolveWaterRainSettingValue(
+              settings,
+              visual,
+              "level") == Catch::Approx(0.37F));
+    CHECK(ResolveWaterRainSettingValue(
+              settings,
+              visual,
+              "wetness.downhill_stretch") ==
+          Catch::Approx(1.41F));
+    CHECK(ResolveWaterRainSettingValue(
+              settings,
+              visual,
+              "visual.colour_green") == Catch::Approx(0.63F));
+    CHECK_FALSE(ResolveWaterRainSettingValue(
+                    settings,
+                    visual,
+                    "unknown")
+                    .has_value());
+}
+
+TEST_CASE(
+    "live Rain synchronization resets only for identity changes or forced refresh",
+    "[water][rain][profiles][timing]") {
+    using invisible_places::timing::ResolveTimingTakeRainLiveSyncDecision;
+
+    CHECK(ResolveTimingTakeRainLiveSyncDecision(
+              "take-a",
+              "profile-a",
+              "take-a",
+              "profile-a") ==
+          invisible_places::timing::TimingTakeRainLiveSyncDecision{});
+
+    const auto takeChanged = ResolveTimingTakeRainLiveSyncDecision(
+        "take-a",
+        "profile-a",
+        "take-b",
+        "profile-a");
+    CHECK(takeChanged.copyProfile);
+    CHECK(takeChanged.resetRuntime);
+
+    const auto profileChanged = ResolveTimingTakeRainLiveSyncDecision(
+        "take-a",
+        "profile-a",
+        "take-a",
+        "profile-b");
+    CHECK(profileChanged.copyProfile);
+    CHECK(profileChanged.resetRuntime);
+
+    const auto forced = ResolveTimingTakeRainLiveSyncDecision(
+        "take-a",
+        "profile-a",
+        "take-a",
+        "profile-a",
+        true);
+    CHECK(forced.copyProfile);
+    CHECK(forced.resetRuntime);
+}
+
+TEST_CASE(
+    "Rain Timing Take metadata canonicalizes empty scalar and legacy colour tracks",
+    "[water][rain][profiles][timing]") {
+    using invisible_places::timing::RewriteTimingTakeRainTrackProfileMetadata;
+    using invisible_places::timing::TimingTakeSceneState;
+    using invisible_places::water::WaterFeatureTimeline;
+    using invisible_places::water::WaterFeatureTimingRun;
+    using invisible_places::water::WaterKeyedFeatureKind;
+
+    WaterFeatureTimeline rainTimeline;
+    rainTimeline.feature.kind = WaterKeyedFeatureKind::Rain;
+    rainTimeline.settings = {
+        {.settingId = "density"},
+        {.settingId = "visual.colour_red",
+         .profileGroup = "rain_visual",
+         .profileName = "Rain Fine Lines"},
+    };
+    WaterFeatureTimeline meshTimeline;
+    meshTimeline.feature.kind = WaterKeyedFeatureKind::MeshFlow;
+    meshTimeline.settings = {
+        {.settingId = "level",
+         .profileGroup = "mesh",
+         .profileName = "Mesh Base"},
+    };
+    TimingTakeSceneState state;
+    state.takeId = "take-a";
+    state.waterFeatureTimingRuns = {
+        WaterFeatureTimingRun{
+            .id = 1U,
+            .name = "Rain Run",
+            .features = {rainTimeline, meshTimeline},
+        },
+    };
+    std::vector<TimingTakeSceneState> states{state};
+
+    CHECK(RewriteTimingTakeRainTrackProfileMetadata(
+              &states,
+              "take-a",
+              "Project Rain_Take A") == 2U);
+    const auto& rewritten =
+        states.front().waterFeatureTimingRuns.front().features;
+    REQUIRE(rewritten.front().settings.size() == 2U);
+    for (const auto& track : rewritten.front().settings) {
+        CHECK(track.profileGroup == "rain");
+        CHECK(track.profileName == "Project Rain_Take A");
+    }
+    CHECK(rewritten.back().settings.front().profileGroup == "mesh");
+    CHECK(rewritten.back().settings.front().profileName == "Mesh Base");
+    CHECK(RewriteTimingTakeRainTrackProfileMetadata(
+              &states,
+              "take-a",
+              "Project Rain_Take A") == 0U);
+}
+
+TEST_CASE(
     "Timing Take Rain owner profiles follow assign edit rename duplicate and delete lifecycle",
     "[water][rain][profiles][timing]") {
     using invisible_places::timing::AssignTimingTakeRainBaseProfile;

@@ -650,6 +650,13 @@ struct WaterKeyableSettingInfo {
 [[nodiscard]] const WaterKeyableSettingInfo* FindWaterKeyableSetting(
     WaterKeyedFeatureKind kind,
     std::string_view settingId);
+// Resolves the authored scalar behind every entry in Rain's fixed keyable
+// setting registry. UI/profile comparisons use this rather than maintaining a
+// second member map that can silently drift when a Rain setting is added.
+[[nodiscard]] std::optional<float> ResolveWaterRainSettingValue(
+    const RainRuntimeSettings& settings,
+    const WaterRainVisualSettings& visual,
+    std::string_view settingId);
 [[nodiscard]] std::string_view WaterKeyedFeatureKindLabel(
     WaterKeyedFeatureKind kind);
 [[nodiscard]] std::string_view WaterKeyedFeatureKindName(

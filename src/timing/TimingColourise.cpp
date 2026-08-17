@@ -1365,6 +1365,57 @@ ResolveTimingTakeRainBaseProfile(
     return FirstSharedRainProfile(profiles);
 }
 
+TimingTakeRainLiveSyncDecision ResolveTimingTakeRainLiveSyncDecision(
+    std::string_view boundTakeId,
+    std::string_view boundProfileId,
+    std::string_view resolvedTakeId,
+    std::string_view resolvedProfileId,
+    bool forceRefresh) {
+    const bool identityChanged =
+        boundTakeId != resolvedTakeId ||
+        boundProfileId != resolvedProfileId;
+    const bool synchronize = forceRefresh || identityChanged;
+    return {
+        .copyProfile = synchronize,
+        .resetRuntime = synchronize,
+    };
+}
+
+std::size_t RewriteTimingTakeRainTrackProfileMetadata(
+    std::vector<TimingTakeSceneState>* states,
+    std::string_view takeId,
+    std::string_view profileName) {
+    if (states == nullptr || profileName.empty()) {
+        return 0U;
+    }
+    const auto normalizedTakeId = NormalizeTimingTakeId(takeId);
+    std::size_t changed = 0U;
+    for (auto& state : *states) {
+        if (NormalizeTimingTakeId(state.takeId) != normalizedTakeId) {
+            continue;
+        }
+        for (auto& run : state.waterFeatureTimingRuns) {
+            for (auto& timeline : run.features) {
+                if (timeline.feature.kind !=
+                    invisible_places::water::WaterKeyedFeatureKind::Rain) {
+                    continue;
+                }
+                for (auto& track : timeline.settings) {
+                    if (track.profileGroup !=
+                            kTimingTakeRainTrackProfileGroup ||
+                        track.profileName != profileName) {
+                        track.profileGroup = std::string{
+                            kTimingTakeRainTrackProfileGroup};
+                        track.profileName = std::string{profileName};
+                        ++changed;
+                    }
+                }
+            }
+        }
+    }
+    return changed;
+}
+
 bool AssignTimingTakeRainBaseProfile(
     TimingTakeDefinition* take,
     std::span<const invisible_places::water::WaterRainProfile> profiles,

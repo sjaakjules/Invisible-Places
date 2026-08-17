@@ -372,6 +372,8 @@ inline constexpr std::string_view kLegacyWaterRainProfileId =
     "rain-profile-project";
 inline constexpr std::string_view kLegacyWaterRainProfileName =
     "Project Rain";
+inline constexpr std::string_view kTimingTakeRainTrackProfileGroup =
+    "rain";
 
 // Resolves one take's effective/base Rain profiles by stable id first and its
 // persisted name mirror second. A missing assignment falls back to the first
@@ -384,6 +386,35 @@ ResolveTimingTakeRainProfile(
 ResolveTimingTakeRainBaseProfile(
     std::span<const invisible_places::water::WaterRainProfile> profiles,
     const TimingTakeDefinition& take);
+
+struct TimingTakeRainLiveSyncDecision {
+    bool copyProfile = false;
+    bool resetRuntime = false;
+
+    friend bool operator==(
+        const TimingTakeRainLiveSyncDecision&,
+        const TimingTakeRainLiveSyncDecision&) = default;
+};
+
+// Decides whether the single live Rain renderer projection must change. A
+// value edit within an already-bound owner profile deliberately returns a
+// no-op; take/profile identity changes and explicit project-load refreshes
+// copy the resolved snapshot and begin one new simulation epoch.
+[[nodiscard]] TimingTakeRainLiveSyncDecision
+ResolveTimingTakeRainLiveSyncDecision(
+    std::string_view boundTakeId,
+    std::string_view boundProfileId,
+    std::string_view resolvedTakeId,
+    std::string_view resolvedProfileId,
+    bool forceRefresh = false);
+
+// Canonicalizes every Rain setting track owned by a Timing Take to one
+// metadata group and the take's currently resolved profile name. Legacy RGB
+// tracks used `rain_visual`, while scalar tracks often had empty metadata.
+[[nodiscard]] std::size_t RewriteTimingTakeRainTrackProfileMetadata(
+    std::vector<TimingTakeSceneState>* states,
+    std::string_view takeId,
+    std::string_view profileName);
 
 // Normalizes ids/names in file order and rewrites profile/take references.
 // The first duplicate keeps its identity; later entries receive deterministic
