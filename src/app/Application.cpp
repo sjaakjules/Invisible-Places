@@ -952,9 +952,9 @@ struct WaterClipDragState {
     // Duplicate drags re-create their copies every frame; these are the ids
     // most recently applied, promoted to the selection on release.
     std::vector<WaterClipHandle> duplicateHandles;
-    // Marquee anchor (normalized position and lane row).
+    // Marquee anchor; release intersects the real variable-height block
+    // rectangles rather than treating a whole feature band as selected.
     float marqueeStartPosition = 0.0F;
-    int marqueeStartRow = 0;
     bool additive = false;
 };
 
@@ -991,6 +991,17 @@ struct WaterClipContextState {
     std::uint32_t clipId = 0U;
     bool onBlock = false;
     float position = 0.0F;
+};
+
+// Short hover grace lets the pointer travel from a clip body into the
+// adjacent non-interactive help gutter without leaving a permanent help mark
+// on every timeline. Identity keeps global and embedded clip surfaces apart.
+struct WaterClipHelpHoverState {
+    std::string surfaceId;
+    std::string scenarioId;
+    std::uint32_t runId = 0U;
+    WaterClipHandle handle{};
+    double visibleUntil = 0.0;
 };
 
 enum class AnimationTimelineViewDragPart : std::uint8_t {
@@ -1647,6 +1658,7 @@ struct TimingsPanelState {
     std::optional<WaterClipEditState> waterClipEdit;
     std::optional<WaterClipPackageSaveState> waterClipPackageSave;
     std::optional<WaterClipContextState> waterClipContext;
+    std::optional<WaterClipHelpHoverState> waterClipHelpHover;
     // Timing-take and Colourise authoring state. The selected effect is
     // intentionally UI-only; effects themselves are project-owned by the
     // active (take, scene-group) pair.
@@ -85013,19 +85025,6 @@ void DrawWaterRunTimingGraph(
 // graphs, keyed sliders, and evaluation stay in lockstep, and Escape
 // cancels a live drag by restoring the pre-drag snapshots.
 
-float WaterClipGhostSpanMinimum(float start, float* end) {
-    if (*end - start <
-        invisible_places::water::kWaterFeatureClipMinimumLength) {
-        *end = std::min(
-            1.0F,
-            start + invisible_places::water::kWaterFeatureClipMinimumLength);
-        return std::max(
-            0.0F,
-            *end - invisible_places::water::kWaterFeatureClipMinimumLength);
-    }
-    return start;
-}
-
 void MarkWaterClipMutation(PreviewRuntimeState* runtimeState) {
     ApplyFeatureTimelineScrub(runtimeState);
     runtimeState->previewRenderStateSignatureValid = false;
@@ -85092,11 +85091,9 @@ void DrawWaterClipContextMenu(
         if (!looseSpan.has_value()) {
             return std::nullopt;
         }
-        float end = looseSpan->second;
-        const float start = WaterClipGhostSpanMinimum(
+        return invisible_places::water::WaterFeatureClipDisplaySpan(
             looseSpan->first,
-            &end);
-        return std::make_pair(start, end);
+            looseSpan->second);
     }();
     const auto openPackageSave = [&](std::uint32_t clipId,
                                      std::string defaultName) {
@@ -85557,11 +85554,9 @@ void DrawWaterClipPackagePopup(
                 invisible_places::water::WaterFeatureLooseKeySpan(
                     *timeline);
             loose.has_value()) {
-            float end = loose->second;
-            const float start = WaterClipGhostSpanMinimum(
+            span = invisible_places::water::WaterFeatureClipDisplaySpan(
                 loose->first,
-                &end);
-            span = std::make_pair(start, end);
+                loose->second);
         }
         if (trimmed.empty()) {
             save.errorMessage = "Name the package first.";
@@ -85640,16 +85635,70 @@ void DrawWaterRunClipsTimeline(
     constexpr float kClipMinimumLength =
         invisible_places::water::kWaterFeatureClipMinimumLength;
     auto& timings = runtimeState->timingsPanel;
-    auto& water = runtimeState->water;
     ImGui::PushID(id);
-    constexpr float kRowHeight = 24.0F;
-    constexpr float kRowGap = 3.0F;
+    constexpr float kLaneHeight = 24.0F;
+    constexpr float kLaneGap = 3.0F;
+    constexpr float kFeatureLabelHeight = 18.0F;
+    constexpr float kFeatureRowGap = 5.0F;
+    constexpr float kHelpGutterWidth = 22.0F;
     constexpr float kEdgeGrabWidth = 6.0F;
     const std::size_t rowCount = featureIndices.size();
+    const auto timelineForRow = [&](std::size_t row) -> WaterFeatureTimeline& {
+        return run->features[featureIndices[row]];
+    };
+    const auto timelineForFeature =
+        [&](const WaterKeyedFeatureId& feature) -> WaterFeatureTimeline* {
+        return invisible_places::water::FindWaterFeatureTimeline(
+            run,
+            feature);
+    };
+    const auto rowForFeature =
+        [&](const WaterKeyedFeatureId& feature)
+        -> std::optional<std::size_t> {
+        for (std::size_t row = 0U; row < rowCount; ++row) {
+            if (timelineForRow(row).feature == feature) {
+                return row;
+            }
+        }
+        return std::nullopt;
+    };
+
+    struct FeatureRowLayout {
+        invisible_places::water::WaterFeatureClipLaneLayout lanes;
+        std::size_t visibleLaneCount = 1U;
+        float topOffset = 0.0F;
+        float height = kFeatureLabelHeight + kLaneHeight;
+    };
+    std::vector<FeatureRowLayout> rowLayouts(rowCount);
+    float surfaceHeight = 0.0F;
+    const auto rebuildRowLayouts = [&] {
+        float offset = 2.0F;
+        for (std::size_t row = 0U; row < rowCount; ++row) {
+            auto& layout = rowLayouts[row];
+            layout.lanes = invisible_places::water::
+                BuildWaterFeatureClipLaneLayout(timelineForRow(row));
+            layout.visibleLaneCount =
+                std::max<std::size_t>(1U, layout.lanes.laneCount);
+            layout.topOffset = offset;
+            layout.height = kFeatureLabelHeight +
+                            static_cast<float>(layout.visibleLaneCount) *
+                                kLaneHeight +
+                            static_cast<float>(layout.visibleLaneCount - 1U) *
+                                kLaneGap;
+            offset += layout.height;
+            if (row + 1U < rowCount) {
+                offset += kFeatureRowGap;
+            }
+        }
+        surfaceHeight = offset + 2.0F;
+    };
+    rebuildRowLayouts();
+
+    const float availableWidth =
+        std::max(24.0F + kHelpGutterWidth, ImGui::GetContentRegionAvail().x);
     const ImVec2 size{
-        std::max(24.0F, ImGui::GetContentRegionAvail().x),
-        static_cast<float>(rowCount) * (kRowHeight + kRowGap) - kRowGap +
-            4.0F};
+        std::max(24.0F, availableWidth - kHelpGutterWidth),
+        surfaceHeight};
     ImGui::InvisibleButton(
         "##WaterClipLaneSurface",
         size,
@@ -85661,6 +85710,11 @@ void DrawWaterRunClipsTimeline(
     const float width = std::max(1.0F, maximum.x - minimum.x);
     const bool itemHovered = ImGui::IsItemHovered();
     const auto mouse = ImGui::GetIO().MousePos;
+    // The help gutter is layout space but never an interactive button, so it
+    // cannot arm a marquee or steal a clip edge/body gesture.
+    ImGui::SameLine(0.0F, 0.0F);
+    ImGui::Dummy(ImVec2{kHelpGutterWidth, surfaceHeight});
+    const float helpMaximumX = maximum.x + kHelpGutterWidth;
     const auto viewRange =
         invisible_places::timing::SanitizeTimelineViewRange(
             runtimeState->animationPanel.timelineViewRange);
@@ -85677,32 +85731,19 @@ void DrawWaterRunClipsTimeline(
             (x - minimum.x) / width);
     };
     const auto rowTop = [&](std::size_t row) {
-        return minimum.y + 2.0F +
-               static_cast<float>(row) * (kRowHeight + kRowGap);
+        return minimum.y + rowLayouts[row].topOffset;
+    };
+    const auto rowBottom = [&](std::size_t row) {
+        return rowTop(row) + rowLayouts[row].height;
+    };
+    const auto blockTop = [&](std::size_t row, std::size_t lane) {
+        return rowTop(row) + kFeatureLabelHeight +
+               static_cast<float>(lane) * (kLaneHeight + kLaneGap);
     };
     const auto rowAtY = [&](float y) -> std::optional<std::size_t> {
         for (std::size_t row = 0U; row < rowCount; ++row) {
             const float top = rowTop(row);
-            if (y >= top && y <= top + kRowHeight) {
-                return row;
-            }
-        }
-        return std::nullopt;
-    };
-    const auto timelineForRow = [&](std::size_t row) -> WaterFeatureTimeline& {
-        return run->features[featureIndices[row]];
-    };
-    const auto timelineForFeature =
-        [&](const WaterKeyedFeatureId& feature) -> WaterFeatureTimeline* {
-        return invisible_places::water::FindWaterFeatureTimeline(
-            run,
-            feature);
-    };
-    const auto rowForFeature =
-        [&](const WaterKeyedFeatureId& feature)
-        -> std::optional<std::size_t> {
-        for (std::size_t row = 0U; row < rowCount; ++row) {
-            if (timelineForRow(row).feature == feature) {
+            if (y >= top && y <= rowBottom(row)) {
                 return row;
             }
         }
@@ -85732,9 +85773,9 @@ void DrawWaterRunClipsTimeline(
         if (!span.has_value()) {
             return std::nullopt;
         }
-        float end = span->second;
-        const float start = WaterClipGhostSpanMinimum(span->first, &end);
-        return std::make_pair(start, end);
+        return invisible_places::water::WaterFeatureClipDisplaySpan(
+            span->first,
+            span->second);
     };
 
     struct ClipBlock {
@@ -85743,6 +85784,7 @@ void DrawWaterRunClipsTimeline(
         float start = 0.0F;
         float end = 1.0F;
         std::string name;
+        std::size_t lane = 0U;
         bool ghost = false;
     };
     std::vector<ClipBlock> blocks;
@@ -85750,6 +85792,17 @@ void DrawWaterRunClipsTimeline(
         blocks.clear();
         for (std::size_t row = 0U; row < rowCount; ++row) {
             auto& timeline = timelineForRow(row);
+            const auto laneForId = [&](std::uint32_t clipId) {
+                const auto found = std::find_if(
+                    rowLayouts[row].lanes.assignments.begin(),
+                    rowLayouts[row].lanes.assignments.end(),
+                    [&](const auto& assignment) {
+                        return assignment.clipId == clipId;
+                    });
+                return found != rowLayouts[row].lanes.assignments.end()
+                           ? found->laneIndex
+                           : 0U;
+            };
             for (const auto& clip : timeline.clips) {
                 blocks.push_back(ClipBlock{
                     .row = row,
@@ -85758,6 +85811,7 @@ void DrawWaterRunClipsTimeline(
                     .start = clip.start,
                     .end = clip.end,
                     .name = clip.name,
+                    .lane = laneForId(clip.id),
                     .ghost = false,
                 });
             }
@@ -85771,12 +85825,23 @@ void DrawWaterRunClipsTimeline(
                     .start = span->first,
                     .end = span->second,
                     .name = "Loose Keys",
+                    .lane = laneForId(0U),
                     .ghost = true,
                 });
             }
         }
     };
     rebuildBlocks();
+    const auto conciseBlockName = [&](const ClipBlock& block) {
+        if (block.ghost) {
+            return std::string{"Loose Keys"};
+        }
+        return invisible_places::water::WaterFeatureClipConciseDisplayName(
+            block.name,
+            WaterKeyedFeatureDisplayLabel(
+                *runtimeState,
+                block.handle.feature));
+    };
 
     const auto selectionMatchesNow = [&] {
         return timings.waterClipSelection.has_value() &&
@@ -85828,8 +85893,8 @@ void DrawWaterRunClipsTimeline(
         MarkWaterKeyEditTransactionChanged(runtimeState);
     };
 
-    // Block hit-testing: topmost block of the hovered row whose pixel span
-    // contains the cursor, with edge zones for stretch grabs.
+    // Block hit-testing uses the assigned physical sublane as well as the
+    // authored horizontal span, so every overlap spill remains reachable.
     struct BlockHit {
         std::size_t blockIndex = 0U;
         WaterClipDragMode zone = WaterClipDragMode::Move;
@@ -85846,6 +85911,10 @@ void DrawWaterRunClipsTimeline(
         for (std::size_t index = 0U; index < blocks.size(); ++index) {
             const auto& block = blocks[index];
             if (block.row != row.value()) {
+                continue;
+            }
+            const float top = blockTop(block.row, block.lane);
+            if (mouse.y < top || mouse.y > top + kLaneHeight) {
                 continue;
             }
             const float x0 = xForPosition(
@@ -86070,28 +86139,17 @@ void DrawWaterRunClipsTimeline(
                     std::min(startPosition, endPosition);
                 const float highPosition =
                     std::max(startPosition, endPosition);
-                const auto endRow = rowAtY(std::clamp(
-                    mouse.y,
-                    minimum.y + 1.0F,
-                    maximum.y - 1.0F));
-                const std::size_t rowA = static_cast<std::size_t>(
-                    std::min<int>(
-                        drag.marqueeStartRow,
-                        static_cast<int>(endRow.value_or(
-                            static_cast<std::size_t>(
-                                drag.marqueeStartRow)))));
-                const std::size_t rowB = static_cast<std::size_t>(
-                    std::max<int>(
-                        drag.marqueeStartRow,
-                        static_cast<int>(endRow.value_or(
-                            static_cast<std::size_t>(
-                                drag.marqueeStartRow)))));
+                const float lowY =
+                    std::min(drag.mouseStartY, mouse.y);
+                const float highY =
+                    std::max(drag.mouseStartY, mouse.y);
                 std::vector<WaterClipHandle> picked;
                 if (drag.additive && selectionMatches) {
                     picked = timings.waterClipSelection->clips;
                 }
                 for (const auto& block : blocks) {
-                    if (block.row < rowA || block.row > rowB) {
+                    const float top = blockTop(block.row, block.lane);
+                    if (top + kLaneHeight < lowY || top > highY) {
                         continue;
                     }
                     if (block.end < lowPosition ||
@@ -86578,7 +86636,6 @@ void DrawWaterRunClipsTimeline(
                     positionForX(mouse.x),
                     0.0F,
                     1.0F);
-                drag.marqueeStartRow = static_cast<int>(row.value());
                 drag.additive = additive;
                 timings.waterClipDrag = std::move(drag);
                 if (!additive) {
@@ -86590,6 +86647,7 @@ void DrawWaterRunClipsTimeline(
     if (mutated) {
         // Mutations can add or remove blocks, so the hover hit (an index
         // into the block list) must be re-derived before drawing reads it.
+        rebuildRowLayouts();
         rebuildBlocks();
         hovered = hitTest();
         if (selectionMatchesNow()) {
@@ -86616,7 +86674,7 @@ void DrawWaterRunClipsTimeline(
     for (std::size_t row = 0U; row < rowCount; ++row) {
         const float top = rowTop(row);
         const ImVec2 rowMinimum{minimum.x, top};
-        const ImVec2 rowMaximum{maximum.x, top + kRowHeight};
+        const ImVec2 rowMaximum{maximum.x, rowBottom(row)};
         drawList->AddRectFilled(
             rowMinimum,
             rowMaximum,
@@ -86635,9 +86693,19 @@ void DrawWaterRunClipsTimeline(
             *runtimeState,
             timelineForRow(row).feature);
         drawList->AddText(
-            ImVec2{minimum.x + 6.0F, top + 5.0F},
+            ImVec2{minimum.x + 6.0F, top + 1.0F},
             dimTextColour,
             label.c_str());
+        for (std::size_t lane = 1U;
+             lane < rowLayouts[row].visibleLaneCount;
+             ++lane) {
+            const float separatorY =
+                blockTop(row, lane) - 0.5F * kLaneGap;
+            drawList->AddLine(
+                ImVec2{minimum.x, separatorY},
+                ImVec2{maximum.x, separatorY},
+                IM_COL32(255, 255, 255, 14));
+        }
     }
     const float playheadPosition =
         CurrentAuthoredTrackPosition(*runtimeState);
@@ -86682,7 +86750,7 @@ void DrawWaterRunClipsTimeline(
             clipSettingIndex
                     .value_or(featureIndices[block.row]) %
                 kWaterKeyedSettingColours.size()];
-        const float top = rowTop(block.row);
+        const float top = blockTop(block.row, block.lane);
         const float x0 = xForPosition(
             std::max(block.start, viewRange.start));
         const float x1 = std::max(
@@ -86809,7 +86877,7 @@ void DrawWaterRunClipsTimeline(
                     (block.ghost ? 0.45F : 0.66F) * normalized;
                 drawList->AddRectFilled(
                     ImVec2{x, top + 1.0F},
-                    ImVec2{sampleEnd, top + kRowHeight - 1.0F},
+                    ImVec2{sampleEnd, top + kLaneHeight - 1.0F},
                     ImGui::ColorConvertFloat4ToU32(ImVec4{
                         converted.x,
                         converted.y,
@@ -86819,7 +86887,7 @@ void DrawWaterRunClipsTimeline(
         } else {
             drawList->AddRectFilled(
                 ImVec2{x0, top + 1.0F},
-                ImVec2{x1, top + kRowHeight - 1.0F},
+                ImVec2{x1, top + kLaneHeight - 1.0F},
                 ImGui::ColorConvertFloat4ToU32(ImVec4{
                     converted.x,
                     converted.y,
@@ -86839,8 +86907,8 @@ void DrawWaterRunClipsTimeline(
                 }
                 const float x = xForPosition(key.position);
                 drawList->AddLine(
-                    ImVec2{x, top + kRowHeight - 5.0F},
-                    ImVec2{x, top + kRowHeight - 1.0F},
+                    ImVec2{x, top + kLaneHeight - 5.0F},
+                    ImVec2{x, top + kLaneHeight - 1.0F},
                     IM_COL32(255, 255, 255, 130),
                     1.0F);
             }
@@ -86865,43 +86933,44 @@ void DrawWaterRunClipsTimeline(
                     borderColour,
                     1.0F);
                 drawList->AddLine(
-                    ImVec2{x, top + kRowHeight - 1.0F},
-                    ImVec2{xEnd, top + kRowHeight - 1.0F},
+                    ImVec2{x, top + kLaneHeight - 1.0F},
+                    ImVec2{xEnd, top + kLaneHeight - 1.0F},
                     borderColour,
                     1.0F);
             }
             drawList->AddLine(
                 ImVec2{x0, top + 1.0F},
-                ImVec2{x0, top + kRowHeight - 1.0F},
+                ImVec2{x0, top + kLaneHeight - 1.0F},
                 borderColour,
                 1.0F);
             drawList->AddLine(
                 ImVec2{x1, top + 1.0F},
-                ImVec2{x1, top + kRowHeight - 1.0F},
+                ImVec2{x1, top + kLaneHeight - 1.0F},
                 borderColour,
                 1.0F);
         } else {
             drawList->AddRect(
                 ImVec2{x0, top + 1.0F},
-                ImVec2{x1, top + kRowHeight - 1.0F},
+                ImVec2{x1, top + kLaneHeight - 1.0F},
                 borderColour,
                 3.0F,
                 0,
                 selected ? 2.0F : 1.0F);
         }
         if (x1 - x0 > 34.0F) {
+            const auto displayName = conciseBlockName(block);
             drawList->PushClipRect(
                 ImVec2{x0 + 3.0F, top},
-                ImVec2{x1 - 3.0F, top + kRowHeight},
+                ImVec2{x1 - 3.0F, top + kLaneHeight},
                 true);
             drawList->AddText(
                 ImVec2{x0 + 5.0F, top + 5.0F},
                 IM_COL32(0, 0, 0, 200),
-                block.name.c_str());
+                displayName.c_str());
             drawList->AddText(
                 ImVec2{x0 + 4.0F, top + 4.0F},
                 textColour,
-                block.name.c_str());
+                displayName.c_str());
             drawList->PopClipRect();
         }
     }
@@ -86922,6 +86991,77 @@ void DrawWaterRunClipsTimeline(
             IM_COL32(255, 255, 255, 140));
     }
     drawList->PopClipRect();
+
+    // A clip hover reveals one contextual help mark in the non-interactive
+    // gutter. A short grace period makes the mark reachable across empty
+    // timeline pixels; hovering the mark keeps it alive. No ImGui item is
+    // registered here, so clip body/edge/context gestures remain exclusive.
+    constexpr double kHelpHoverGraceSeconds = 2.5;
+    const double now = ImGui::GetTime();
+    if (hovered.has_value() && !timings.waterClipDrag.has_value()) {
+        timings.waterClipHelpHover = WaterClipHelpHoverState{
+            .surfaceId = id,
+            .scenarioId = scenarioId,
+            .runId = run->id,
+            .handle = blocks[hovered->blockIndex].handle,
+            .visibleUntil = now + kHelpHoverGraceSeconds,
+        };
+    }
+    bool helpHovered = false;
+    std::optional<std::size_t> helpBlockIndex;
+    const bool helpStateMatches =
+        timings.waterClipHelpHover.has_value() &&
+        timings.waterClipHelpHover->surfaceId == id &&
+        timings.waterClipHelpHover->scenarioId == scenarioId &&
+        timings.waterClipHelpHover->runId == run->id;
+    if (helpStateMatches && !timings.waterClipDrag.has_value()) {
+        auto& help = timings.waterClipHelpHover.value();
+        const auto found = std::find_if(
+            blocks.begin(),
+            blocks.end(),
+            [&](const ClipBlock& block) {
+                return block.handle == help.handle;
+            });
+        if (found != blocks.end()) {
+            const auto index = static_cast<std::size_t>(found - blocks.begin());
+            const float top = blockTop(found->row, found->lane);
+            const ImVec2 helpMinimum{maximum.x, top};
+            const ImVec2 helpMaximum{helpMaximumX, top + kLaneHeight};
+            helpHovered = ImGui::IsMouseHoveringRect(
+                helpMinimum,
+                helpMaximum,
+                /*clip=*/true);
+            if (helpHovered) {
+                help.visibleUntil = now + kHelpHoverGraceSeconds;
+            }
+            if (now <= help.visibleUntil) {
+                helpBlockIndex = index;
+                const ImVec2 centre{
+                    0.5F * (helpMinimum.x + helpMaximum.x),
+                    0.5F * (helpMinimum.y + helpMaximum.y)};
+                drawList->AddCircleFilled(
+                    centre,
+                    7.0F,
+                    helpHovered ? IM_COL32(255, 255, 255, 48)
+                                : IM_COL32(255, 255, 255, 22));
+                drawList->AddCircle(
+                    centre,
+                    7.0F,
+                    helpHovered ? IM_COL32(255, 255, 255, 180)
+                                : IM_COL32(255, 255, 255, 100));
+                const auto questionSize = ImGui::CalcTextSize("?");
+                drawList->AddText(
+                    ImVec2{centre.x - 0.5F * questionSize.x,
+                           centre.y - 0.5F * questionSize.y},
+                    helpHovered ? textColour : dimTextColour,
+                    "?");
+            }
+        }
+        if (!helpBlockIndex.has_value() && now > help.visibleUntil) {
+            timings.waterClipHelpHover.reset();
+            helpHovered = false;
+        }
+    }
 
     // Hover affordances and drag readouts.
     if (dragMatches && timings.waterClipDrag.has_value() &&
@@ -86954,23 +87094,27 @@ void DrawWaterRunClipsTimeline(
                                      "cancels.");
             }
         }
-    } else if (hovered.has_value() && !timings.waterClipDrag.has_value()) {
-        if (hovered->zone != WaterClipDragMode::Move) {
-            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
-        }
-        const auto& block = blocks[hovered->blockIndex];
+    } else if (helpHovered && helpBlockIndex.has_value()) {
+        const auto& block = blocks[helpBlockIndex.value()];
         ImGui::SetTooltip(
-            "%s — %.2f s to %.2f s\nDrag to move, edges to stretch, "
-            "Alt-drag to duplicate, drag to another %s row to retarget.\n"
-            "Double-click %s. Right-click for actions.",
-            block.ghost ? "Loose keys" : block.name.c_str(),
-            block.start * durationSeconds,
-            block.end * durationSeconds,
+            "Drag to move, edges to stretch, Alt-drag to duplicate, drag "
+            "to another %s row to retarget.\nCmd/Ctrl-click toggles a "
+            "multi-selection; drag empty lane space for a marquee.\nEdges "
+            "snap to the playhead and neighbouring clips; Shift bypasses "
+            "snapping and Esc cancels a live drag.\nDouble-click %s. "
+            "Right-click for actions.",
             invisible_places::water::WaterKeyedFeatureKindLabel(
                 block.handle.feature.kind)
                 .data(),
             block.ghost ? "to group these keys into a clip"
                         : "to rename or retime exactly");
+    } else if (hovered.has_value() && !timings.waterClipDrag.has_value()) {
+        if (hovered->zone != WaterClipDragMode::Move) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        }
+        const auto& block = blocks[hovered->blockIndex];
+        const auto conciseName = conciseBlockName(block);
+        ImGui::SetTooltip("%s", conciseName.c_str());
     }
 
     // Selection summary and quick clear.

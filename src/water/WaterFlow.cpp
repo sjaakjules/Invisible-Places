@@ -8386,10 +8386,10 @@ std::optional<std::size_t> WaterKeyedSettingDisplayIndex(
            static_cast<std::size_t>(found - dynamicIds.begin());
 }
 
-std::optional<std::size_t> WaterFeatureClipPrimarySettingDisplayIndex(
+WaterFeatureClipSettingSignature WaterFeatureClipSettingSignatureForId(
     const WaterFeatureTimeline& timeline,
     std::uint32_t clipId) {
-    std::optional<std::size_t> primary;
+    WaterFeatureClipSettingSignature signature;
     for (const auto& setting : timeline.settings) {
         const bool ownsKey = std::any_of(
             setting.keys.begin(),
@@ -8400,16 +8400,260 @@ std::optional<std::size_t> WaterFeatureClipPrimarySettingDisplayIndex(
         if (!ownsKey) {
             continue;
         }
+        signature.settingIds.push_back(setting.settingId);
         const auto index = WaterKeyedSettingDisplayIndex(
             timeline.feature.kind,
             setting.settingId,
             timeline.settings);
         if (index.has_value() &&
-            (!primary.has_value() || *index < *primary)) {
-            primary = *index;
+            (!signature.minimumDisplayIndex.has_value() ||
+             *index < *signature.minimumDisplayIndex)) {
+            signature.minimumDisplayIndex = *index;
         }
     }
-    return primary;
+    std::ranges::sort(signature.settingIds);
+    signature.settingIds.erase(
+        std::unique(
+            signature.settingIds.begin(),
+            signature.settingIds.end()),
+        signature.settingIds.end());
+    return signature;
+}
+
+std::optional<std::size_t> WaterFeatureClipPrimarySettingDisplayIndex(
+    const WaterFeatureTimeline& timeline,
+    std::uint32_t clipId) {
+    return WaterFeatureClipSettingSignatureForId(timeline, clipId)
+        .minimumDisplayIndex;
+}
+
+std::pair<float, float> WaterFeatureClipDisplaySpan(
+    float start,
+    float end) {
+    start = std::clamp(std::isfinite(start) ? start : 0.0F, 0.0F, 1.0F);
+    end = std::clamp(std::isfinite(end) ? end : start, 0.0F, 1.0F);
+    if (end < start) {
+        std::swap(start, end);
+    }
+    if (end - start < kWaterFeatureClipMinimumLength) {
+        end = std::min(1.0F, start + kWaterFeatureClipMinimumLength);
+        start = std::max(0.0F, end - kWaterFeatureClipMinimumLength);
+    }
+    return {start, end};
+}
+
+WaterFeatureClipLaneLayout BuildWaterFeatureClipLaneLayout(
+    const WaterFeatureTimeline& timeline) {
+    struct Candidate {
+        std::uint32_t clipId = 0U;
+        float start = 0.0F;
+        float end = 0.0F;
+        WaterFeatureClipSettingSignature signature;
+    };
+    std::vector<Candidate> candidates;
+    candidates.reserve(timeline.clips.size() + 1U);
+    for (const auto& clip : timeline.clips) {
+        if (clip.id == 0U) {
+            continue;
+        }
+        float start = std::isfinite(clip.start) ? clip.start : 0.0F;
+        float end = std::isfinite(clip.end) ? clip.end : start;
+        if (end < start) {
+            std::swap(start, end);
+        }
+        candidates.push_back({
+            .clipId = clip.id,
+            .start = start,
+            .end = end,
+            .signature =
+                WaterFeatureClipSettingSignatureForId(timeline, clip.id),
+        });
+    }
+    if (const auto looseSpan = WaterFeatureLooseKeySpan(timeline);
+        looseSpan.has_value()) {
+        const auto displaySpan = WaterFeatureClipDisplaySpan(
+            looseSpan->first,
+            looseSpan->second);
+        candidates.push_back({
+            .clipId = 0U,
+            .start = displaySpan.first,
+            .end = displaySpan.second,
+            .signature = WaterFeatureClipSettingSignatureForId(timeline, 0U),
+        });
+    }
+
+    std::vector<WaterFeatureClipSettingSignature> signatures;
+    signatures.reserve(candidates.size());
+    for (const auto& candidate : candidates) {
+        if (std::find(
+                signatures.begin(),
+                signatures.end(),
+                candidate.signature) == signatures.end()) {
+            signatures.push_back(candidate.signature);
+        }
+    }
+    const auto signatureLess =
+        [](const WaterFeatureClipSettingSignature& left,
+           const WaterFeatureClipSettingSignature& right) {
+        const auto noIndex = std::numeric_limits<std::size_t>::max();
+        const auto leftIndex = left.minimumDisplayIndex.value_or(noIndex);
+        const auto rightIndex = right.minimumDisplayIndex.value_or(noIndex);
+        if (leftIndex != rightIndex) {
+            return leftIndex < rightIndex;
+        }
+        if (left.settingIds.size() != right.settingIds.size()) {
+            return left.settingIds.size() < right.settingIds.size();
+        }
+        return std::lexicographical_compare(
+            left.settingIds.begin(),
+            left.settingIds.end(),
+            right.settingIds.begin(),
+            right.settingIds.end());
+    };
+    std::ranges::sort(signatures, signatureLess);
+
+    WaterFeatureClipLaneLayout result;
+    result.signatureBandCount = signatures.size();
+    constexpr float kTouchTolerance = 1.0e-4F;
+    std::size_t laneOffset = 0U;
+    for (std::size_t band = 0U; band < signatures.size(); ++band) {
+        std::vector<const Candidate*> bandCandidates;
+        for (const auto& candidate : candidates) {
+            if (candidate.signature == signatures[band]) {
+                bandCandidates.push_back(&candidate);
+            }
+        }
+        std::ranges::sort(
+            bandCandidates,
+            [](const Candidate* left, const Candidate* right) {
+                if (left->start != right->start) {
+                    return left->start < right->start;
+                }
+                if (left->end != right->end) {
+                    return left->end < right->end;
+                }
+                return left->clipId < right->clipId;
+            });
+
+        std::vector<float> spillEnds;
+        for (const auto* candidate : bandCandidates) {
+            std::size_t spill = 0U;
+            for (; spill < spillEnds.size(); ++spill) {
+                // Exact-touch spans spill as well, keeping coincident edge
+                // handles independently reachable in the UI.
+                if (candidate->start >
+                    spillEnds[spill] + kTouchTolerance) {
+                    break;
+                }
+            }
+            if (spill == spillEnds.size()) {
+                spillEnds.push_back(candidate->end);
+            } else {
+                spillEnds[spill] = candidate->end;
+            }
+            result.assignments.push_back({
+                .clipId = candidate->clipId,
+                .signatureBandIndex = band,
+                .spillLaneIndex = spill,
+                .laneIndex = laneOffset + spill,
+            });
+        }
+        laneOffset += spillEnds.size();
+    }
+    result.laneCount = laneOffset;
+    std::ranges::sort(
+        result.assignments,
+        [](const WaterFeatureClipLaneAssignment& left,
+           const WaterFeatureClipLaneAssignment& right) {
+            return left.clipId < right.clipId;
+        });
+    return result;
+}
+
+std::string WaterFeatureClipConciseDisplayName(
+    std::string_view clipName,
+    std::string_view focusedObjectName) {
+    const auto trim = [](std::string_view value) {
+        while (!value.empty() &&
+               std::isspace(
+                   static_cast<unsigned char>(value.front())) != 0) {
+            value.remove_prefix(1U);
+        }
+        while (!value.empty() &&
+               std::isspace(
+                   static_cast<unsigned char>(value.back())) != 0) {
+            value.remove_suffix(1U);
+        }
+        return value;
+    };
+    clipName = trim(clipName);
+    focusedObjectName = trim(focusedObjectName);
+    if (clipName.empty()) {
+        return "Clip";
+    }
+
+    struct PhaseMarker {
+        std::string_view marker;
+        std::string_view phase;
+    };
+    constexpr std::array kPhaseMarkers{
+        PhaseMarker{" - Start - ", "Start"},
+        PhaseMarker{" - Finish - ", "Finish"},
+        PhaseMarker{" — Start — ", "Start"},
+        PhaseMarker{" — Finish — ", "Finish"},
+        PhaseMarker{" – Start – ", "Start"},
+        PhaseMarker{" – Finish – ", "Finish"},
+    };
+    for (const auto& phase : kPhaseMarkers) {
+        if (const auto found = clipName.find(phase.marker);
+            found != std::string_view::npos) {
+            const auto tail = trim(
+                clipName.substr(found + phase.marker.size()));
+            std::string concise{phase.phase};
+            if (!tail.empty()) {
+                concise += " - ";
+                concise += tail;
+            }
+            return concise;
+        }
+    }
+
+    if (focusedObjectName.empty() ||
+        !clipName.starts_with(focusedObjectName) ||
+        clipName.size() == focusedObjectName.size()) {
+        return std::string{clipName};
+    }
+    auto remainder = clipName.substr(focusedObjectName.size());
+    const auto startsSeparator = [](std::string_view value) {
+        if (value.empty()) {
+            return false;
+        }
+        const auto byte = static_cast<unsigned char>(value.front());
+        return std::isspace(byte) != 0 || value.front() == '-' ||
+               value.front() == '_' || value.front() == ':' ||
+               value.front() == '/' || value.starts_with("—") ||
+               value.starts_with("–");
+    };
+    if (!startsSeparator(remainder)) {
+        return std::string{clipName};
+    }
+    while (!remainder.empty()) {
+        if (remainder.starts_with("—") || remainder.starts_with("–")) {
+            remainder.remove_prefix(3U);
+            continue;
+        }
+        const auto byte = static_cast<unsigned char>(remainder.front());
+        if (std::isspace(byte) != 0 || remainder.front() == '-' ||
+            remainder.front() == '_' || remainder.front() == ':' ||
+            remainder.front() == '/') {
+            remainder.remove_prefix(1U);
+            continue;
+        }
+        break;
+    }
+    remainder = trim(remainder);
+    return remainder.empty() ? std::string{clipName}
+                             : std::string{remainder};
 }
 
 std::optional<float> ResolveWaterRainSettingValue(

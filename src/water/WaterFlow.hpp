@@ -722,6 +722,14 @@ struct WaterKeyedSettingsProfile {
 // shrunk clip still keeps its keys distinct.
 inline constexpr float kWaterFeatureClipMinimumLength = 1.0e-3F;
 
+// Normalizes a derived display span to the same minimum width as a stored
+// clip, shifting backwards at the end of the normalized domain. The clip
+// lane allocator and UI share this so a loose-key ghost can never overlap a
+// bar in pixels while being considered disjoint by lane assignment.
+[[nodiscard]] std::pair<float, float> WaterFeatureClipDisplaySpan(
+    float start,
+    float end);
+
 // A named group on one feature's keyed-setting timeline. Clips are authoring
 // metadata only: the keys stay the single evaluated source of truth, and
 // carry this clip's id explicitly so overlapping clip windows remain
@@ -803,6 +811,59 @@ struct WaterKeyableSettingInfo {
 WaterFeatureClipPrimarySettingDisplayIndex(
     const WaterFeatureTimeline& timeline,
     std::uint32_t clipId);
+// Exact, presentation-stable setting ownership for one stored clip, or for
+// the derived loose-keys block when clipId is zero. Every authored key
+// participates, including keys on dormant tracks. Empty stored clips retain
+// an empty signature so they receive their own semantic lane band.
+struct WaterFeatureClipSettingSignature {
+    std::vector<std::string> settingIds;
+    std::optional<std::size_t> minimumDisplayIndex;
+
+    friend bool operator==(
+        const WaterFeatureClipSettingSignature&,
+        const WaterFeatureClipSettingSignature&) = default;
+};
+
+[[nodiscard]] WaterFeatureClipSettingSignature
+WaterFeatureClipSettingSignatureForId(
+    const WaterFeatureTimeline& timeline,
+    std::uint32_t clipId);
+
+// Deterministic semantic lane allocation for a feature timeline. Signatures
+// form stable base bands ordered by canonical setting identity; overlapping
+// or exactly touching spans of the same signature greedily spill into the
+// lowest available sublane. The result depends on authored spans and ids,
+// never clip-vector order or the current timeline zoom.
+struct WaterFeatureClipLaneAssignment {
+    std::uint32_t clipId = 0U;
+    std::size_t signatureBandIndex = 0U;
+    std::size_t spillLaneIndex = 0U;
+    std::size_t laneIndex = 0U;
+
+    friend bool operator==(
+        const WaterFeatureClipLaneAssignment&,
+        const WaterFeatureClipLaneAssignment&) = default;
+};
+
+struct WaterFeatureClipLaneLayout {
+    std::vector<WaterFeatureClipLaneAssignment> assignments;
+    std::size_t signatureBandCount = 0U;
+    std::size_t laneCount = 0U;
+
+    friend bool operator==(
+        const WaterFeatureClipLaneLayout&,
+        const WaterFeatureClipLaneLayout&) = default;
+};
+
+[[nodiscard]] WaterFeatureClipLaneLayout
+BuildWaterFeatureClipLaneLayout(const WaterFeatureTimeline& timeline);
+
+// Concise body-hover label for a clip. Conventional package names such as
+// "Object - Start - Strength" become "Start - Strength"; otherwise only an
+// exact focused-object prefix followed by a separator is removed.
+[[nodiscard]] std::string WaterFeatureClipConciseDisplayName(
+    std::string_view clipName,
+    std::string_view focusedObjectName);
 // Resolves the authored scalar behind every entry in Rain's fixed keyable
 // setting registry. UI/profile comparisons use this rather than maintaining a
 // second member map that can silently drift when a Rain setting is added.

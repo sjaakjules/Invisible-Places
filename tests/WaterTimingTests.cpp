@@ -8,6 +8,7 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <filesystem>
@@ -1854,6 +1855,140 @@ TEST_CASE(
     CHECK_FALSE(
         WaterFeatureClipPrimarySettingDisplayIndex(timeline, 11U)
             .has_value());
+}
+
+TEST_CASE(
+    "Water clip semantic lanes are stable and preserve every owned span",
+    "[water][timing][keyed][clips][lanes]") {
+    using invisible_places::water::BuildWaterFeatureClipLaneLayout;
+    using invisible_places::water::WaterFeatureClipConciseDisplayName;
+    using invisible_places::water::WaterFeatureClipSettingSignatureForId;
+    using invisible_places::water::WaterFeatureTimeline;
+    using invisible_places::water::WaterKeyedFeatureKind;
+
+    WaterFeatureTimeline timeline;
+    timeline.feature = {.kind = WaterKeyedFeatureKind::Rain};
+    // Deliberately not time/id ordered: lane identity must not inherit clip
+    // vector order. Start and Finish share Density and are separated in time.
+    timeline.clips = {
+        {.id = 6U, .name = "Empty", .start = 0.60F, .end = 0.70F},
+        {.id = 3U, .name = "Touching", .start = 0.20F, .end = 0.30F},
+        {.id = 5U, .name = "Mixed", .start = 0.31F, .end = 0.38F},
+        {.id = 2U, .name = "Finish", .start = 0.40F, .end = 0.50F},
+        {.id = 4U, .name = "Level", .start = 0.75F, .end = 0.82F},
+        {.id = 1U, .name = "Start", .start = 0.10F, .end = 0.20F},
+        {.id = 7U, .name = "Empty Later", .start = 0.80F, .end = 0.90F},
+    };
+    timeline.settings = {
+        {.settingId = "fall_speed",
+         .keys = {
+             {.position = 0.34F, .clipId = 5U},
+             {.position = 0.92F, .clipId = 0U},
+         }},
+        // Dormancy changes evaluation/visibility, never semantic ownership.
+        {.settingId = "density",
+         .active = false,
+         .keys = {
+             {.position = 0.10F, .clipId = 1U},
+             {.position = 0.20F, .clipId = 1U},
+             {.position = 0.40F, .clipId = 2U},
+             {.position = 0.50F, .clipId = 2U},
+             {.position = 0.20F, .clipId = 3U},
+             {.position = 0.30F, .clipId = 3U},
+             {.position = 0.35F, .clipId = 5U},
+         }},
+        {.settingId = "level",
+         .keys = {{.position = 0.78F, .clipId = 4U}}},
+    };
+
+    CHECK(
+        WaterFeatureClipSettingSignatureForId(timeline, 1U).settingIds ==
+        std::vector<std::string>{"density"});
+    CHECK(
+        WaterFeatureClipSettingSignatureForId(timeline, 5U).settingIds ==
+        std::vector<std::string>{"density", "fall_speed"});
+    CHECK(
+        WaterFeatureClipSettingSignatureForId(timeline, 0U).settingIds ==
+        std::vector<std::string>{"fall_speed"});
+    CHECK(
+        WaterFeatureClipSettingSignatureForId(timeline, 6U)
+            .settingIds.empty());
+    CHECK_FALSE(
+        WaterFeatureClipSettingSignatureForId(timeline, 6U)
+            .minimumDisplayIndex.has_value());
+
+    const auto layout = BuildWaterFeatureClipLaneLayout(timeline);
+    const auto assignment = [&](std::uint32_t clipId) -> const auto& {
+        const auto found = std::find_if(
+            layout.assignments.begin(),
+            layout.assignments.end(),
+            [&](const auto& candidate) {
+                return candidate.clipId == clipId;
+            });
+        REQUIRE(found != layout.assignments.end());
+        return *found;
+    };
+    CHECK(layout.signatureBandCount == 5U);
+    CHECK(layout.laneCount == 6U);
+    CHECK(assignment(4U).signatureBandIndex == 0U);  // Level.
+    CHECK(assignment(1U).signatureBandIndex == 1U);  // Density.
+    CHECK(assignment(5U).signatureBandIndex == 2U);  // Density + Fall.
+    CHECK(assignment(0U).signatureBandIndex == 3U);  // Loose Fall.
+    CHECK(assignment(6U).signatureBandIndex == 4U);  // Dedicated empty.
+    CHECK(assignment(1U).laneIndex == assignment(2U).laneIndex);
+    CHECK(assignment(1U).spillLaneIndex == 0U);
+    // Exact-touch is an overlap for grabbing purposes.
+    CHECK(assignment(3U).signatureBandIndex ==
+          assignment(1U).signatureBandIndex);
+    CHECK(assignment(3U).spillLaneIndex == 1U);
+    CHECK(assignment(3U).laneIndex != assignment(1U).laneIndex);
+    // Empty markers share their dedicated band and reuse when disjoint.
+    CHECK(assignment(6U).laneIndex == assignment(7U).laneIndex);
+
+    auto permuted = timeline;
+    std::ranges::reverse(permuted.clips);
+    CHECK(BuildWaterFeatureClipLaneLayout(permuted) == layout);
+    std::ranges::reverse(permuted.settings);
+    CHECK(BuildWaterFeatureClipLaneLayout(permuted) == layout);
+
+    // The loose ghost's minimum display width participates in allocation.
+    // At the end of the domain it expands backwards and overlaps this clip.
+    WaterFeatureTimeline endTouch;
+    endTouch.feature = {.kind = WaterKeyedFeatureKind::Rain};
+    endTouch.clips = {
+        {.id = 20U, .name = "At End", .start = 0.998F, .end = 0.9995F},
+    };
+    endTouch.settings = {
+        {.settingId = "density",
+         .keys = {
+             {.position = 0.998F, .clipId = 20U},
+             {.position = 1.0F, .clipId = 0U},
+         }},
+    };
+    const auto endLayout = BuildWaterFeatureClipLaneLayout(endTouch);
+    REQUIRE(endLayout.assignments.size() == 2U);
+    CHECK(endLayout.signatureBandCount == 1U);
+    CHECK(endLayout.laneCount == 2U);
+    CHECK(endLayout.assignments[0].clipId == 0U);
+    CHECK(endLayout.assignments[1].clipId == 20U);
+    CHECK(endLayout.assignments[0].laneIndex !=
+          endLayout.assignments[1].laneIndex);
+
+    CHECK(WaterFeatureClipConciseDisplayName(
+              "1-1-Seepage Front Edge - Start - Node Strength",
+              "1-2-Seepage Gooves") == "Start - Node Strength");
+    CHECK(WaterFeatureClipConciseDisplayName(
+              "1-1-Seepage Front Edge — Finish — Seepage Width",
+              "1-1-Seepage Front Edge") == "Finish - Seepage Width");
+    CHECK(WaterFeatureClipConciseDisplayName(
+              "First-01: Slow Spread",
+              "First-01") == "Slow Spread");
+    CHECK(WaterFeatureClipConciseDisplayName(
+              "First-010 Slow Spread",
+              "First-01") == "First-010 Slow Spread");
+    CHECK(WaterFeatureClipConciseDisplayName(
+              "A Beautiful Start - Node Strength",
+              "First-01") == "A Beautiful Start - Node Strength");
 }
 
 TEST_CASE("Per-scenario feature timing runs round-trip through the project document",
