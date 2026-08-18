@@ -785,6 +785,24 @@ struct WaterKeyableSettingInfo {
 [[nodiscard]] const WaterKeyableSettingInfo* FindWaterKeyableSetting(
     WaterKeyedFeatureKind kind,
     std::string_view settingId);
+// Canonical presentation order for one keyable setting. Registry settings
+// keep their fixed registry ordinal even when an unauthored setting is hidden
+// from a timeline. Dynamic profile tracks follow every registry setting in
+// lexicographic id order, independent of their storage/merge order. Returning
+// one shared index lets Water controls, graphs, markers, pins, and clips use a
+// stable colour identity without depending on an ImGui palette here.
+[[nodiscard]] std::optional<std::size_t> WaterKeyedSettingDisplayIndex(
+    WaterKeyedFeatureKind kind,
+    std::string_view settingId,
+    std::span<const WaterKeyedSettingTrack> timelineSettings = {});
+// Lowest canonical setting index among every key explicitly owned by clipId.
+// Inactive/dormant tracks still participate so toggling a track cannot recolour
+// its clip. clipId zero resolves the derived loose-keys block; an empty clip or
+// loose timeline has no setting identity.
+[[nodiscard]] std::optional<std::size_t>
+WaterFeatureClipPrimarySettingDisplayIndex(
+    const WaterFeatureTimeline& timeline,
+    std::uint32_t clipId);
 // Resolves the authored scalar behind every entry in Rain's fixed keyable
 // setting registry. UI/profile comparisons use this rather than maintaining a
 // second member map that can silently drift when a Rain setting is added.

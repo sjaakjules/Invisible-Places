@@ -1764,6 +1764,98 @@ TEST_CASE("Rain runtime uniforms key smoothly without changing authored lifecycl
     CHECK(authoredVisual.colour == originalVisual.colour);
 }
 
+TEST_CASE(
+    "Water keyed setting display identity is canonical across storage and clips",
+    "[water][timing][keyed][colour]") {
+    using invisible_places::water::WaterFeatureClipPrimarySettingDisplayIndex;
+    using invisible_places::water::WaterFeatureTimeline;
+    using invisible_places::water::WaterKeyableSettings;
+    using invisible_places::water::WaterKeyedFeatureKind;
+    using invisible_places::water::WaterKeyedSettingDisplayIndex;
+    using invisible_places::water::WaterKeyedSettingTrack;
+
+    const auto rainRegistry =
+        WaterKeyableSettings(WaterKeyedFeatureKind::Rain);
+    REQUIRE(rainRegistry.size() > 3U);
+
+    // Registry ordinals never compress around hidden unauthored settings.
+    // This is the common identity consumed by embedded/global graphs, keyed
+    // controls, markers, and pins even when only one Rain track is stored.
+    CHECK(WaterKeyedSettingDisplayIndex(
+              WaterKeyedFeatureKind::Rain,
+              "level") == 0U);
+    CHECK(WaterKeyedSettingDisplayIndex(
+              WaterKeyedFeatureKind::Rain,
+              "density") == 1U);
+    CHECK(WaterKeyedSettingDisplayIndex(
+              WaterKeyedFeatureKind::Rain,
+              "fall_speed") == 2U);
+
+    const std::vector<WaterKeyedSettingTrack> firstOrder{
+        {.settingId = "zeta.profile"},
+        {.settingId = "density"},
+        {.settingId = "alpha.profile"},
+    };
+    const std::vector<WaterKeyedSettingTrack> secondOrder{
+        {.settingId = "alpha.profile"},
+        {.settingId = "density"},
+        {.settingId = "zeta.profile"},
+    };
+    for (const auto& tracks : {firstOrder, secondOrder}) {
+        CHECK(WaterKeyedSettingDisplayIndex(
+                  WaterKeyedFeatureKind::Rain,
+                  "density",
+                  tracks) == 1U);
+        CHECK(WaterKeyedSettingDisplayIndex(
+                  WaterKeyedFeatureKind::Rain,
+                  "alpha.profile",
+                  tracks) == rainRegistry.size());
+        CHECK(WaterKeyedSettingDisplayIndex(
+                  WaterKeyedFeatureKind::Rain,
+                  "zeta.profile",
+                  tracks) == rainRegistry.size() + 1U);
+    }
+
+    WaterFeatureTimeline timeline;
+    timeline.feature = {.kind = WaterKeyedFeatureKind::Rain};
+    timeline.settings = {
+        // Storage order and active state deliberately disagree with display
+        // order. Explicit ownership, not visibility, determines clip colour.
+        {.settingId = "zeta.profile",
+         .keys = {{.position = 0.4F, .clipId = 8U}}},
+        {.settingId = "density",
+         .active = false,
+         .keys = {{.position = 0.2F, .clipId = 8U}}},
+        {.settingId = "alpha.profile",
+         .keys = {
+             {.position = 0.1F, .clipId = 0U},
+             {.position = 0.6F, .clipId = 9U},
+         }},
+        {.settingId = "level",
+         .keys = {{.position = 0.8F, .clipId = 10U}}},
+    };
+    timeline.clips = {
+        {.id = 8U, .name = "Mixed"},
+        {.id = 9U, .name = "Dynamic"},
+        {.id = 10U, .name = "Level"},
+        {.id = 11U, .name = "Empty"},
+    };
+
+    CHECK(WaterFeatureClipPrimarySettingDisplayIndex(timeline, 8U) ==
+          WaterKeyedSettingDisplayIndex(
+              WaterKeyedFeatureKind::Rain,
+              "density",
+              timeline.settings));
+    CHECK(WaterFeatureClipPrimarySettingDisplayIndex(timeline, 9U) ==
+          rainRegistry.size());
+    CHECK(WaterFeatureClipPrimarySettingDisplayIndex(timeline, 10U) == 0U);
+    CHECK(WaterFeatureClipPrimarySettingDisplayIndex(timeline, 0U) ==
+          rainRegistry.size());
+    CHECK_FALSE(
+        WaterFeatureClipPrimarySettingDisplayIndex(timeline, 11U)
+            .has_value());
+}
+
 TEST_CASE("Per-scenario feature timing runs round-trip through the project document",
           "[water][timing][keyed][serialization]") {
     using Catch::Approx;

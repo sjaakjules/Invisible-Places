@@ -8345,6 +8345,73 @@ const WaterKeyableSettingInfo* FindWaterKeyableSetting(
     return nullptr;
 }
 
+std::optional<std::size_t> WaterKeyedSettingDisplayIndex(
+    WaterKeyedFeatureKind kind,
+    std::string_view settingId,
+    std::span<const WaterKeyedSettingTrack> timelineSettings) {
+    if (settingId.empty()) {
+        return std::nullopt;
+    }
+    const auto registry = WaterKeyableSettings(kind);
+    for (std::size_t index = 0U; index < registry.size(); ++index) {
+        if (settingId == registry[index].id) {
+            return index;
+        }
+    }
+
+    std::vector<std::string_view> dynamicIds;
+    dynamicIds.reserve(timelineSettings.size() + 1U);
+    for (const auto& setting : timelineSettings) {
+        if (!setting.settingId.empty() &&
+            FindWaterKeyableSetting(kind, setting.settingId) == nullptr) {
+            dynamicIds.push_back(setting.settingId);
+        }
+    }
+    // The queried id may describe a track immediately before it is inserted.
+    // Including it keeps that first keyed frame on the same deterministic
+    // ordering rule as every stored dynamic track.
+    dynamicIds.push_back(settingId);
+    std::ranges::sort(dynamicIds);
+    dynamicIds.erase(
+        std::unique(dynamicIds.begin(), dynamicIds.end()),
+        dynamicIds.end());
+    const auto found = std::lower_bound(
+        dynamicIds.begin(),
+        dynamicIds.end(),
+        settingId);
+    if (found == dynamicIds.end() || *found != settingId) {
+        return std::nullopt;
+    }
+    return registry.size() +
+           static_cast<std::size_t>(found - dynamicIds.begin());
+}
+
+std::optional<std::size_t> WaterFeatureClipPrimarySettingDisplayIndex(
+    const WaterFeatureTimeline& timeline,
+    std::uint32_t clipId) {
+    std::optional<std::size_t> primary;
+    for (const auto& setting : timeline.settings) {
+        const bool ownsKey = std::any_of(
+            setting.keys.begin(),
+            setting.keys.end(),
+            [&](const WaterSettingKey& key) {
+                return key.clipId == clipId;
+            });
+        if (!ownsKey) {
+            continue;
+        }
+        const auto index = WaterKeyedSettingDisplayIndex(
+            timeline.feature.kind,
+            setting.settingId,
+            timeline.settings);
+        if (index.has_value() &&
+            (!primary.has_value() || *index < *primary)) {
+            primary = *index;
+        }
+    }
+    return primary;
+}
+
 std::optional<float> ResolveWaterRainSettingValue(
     const RainRuntimeSettings& settings,
     const WaterRainVisualSettings& visual,

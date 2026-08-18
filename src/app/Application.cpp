@@ -71092,6 +71092,52 @@ bool DrawWaterSourceProfileAssignmentCombo(
 
 constexpr ImVec4 kWaterKeyableSettingColour{0.08F, 0.07F, 0.05F, 1.0F};
 constexpr ImVec4 kWaterKeyedSettingColour{0.96F, 0.70F, 0.04F, 1.0F};
+// One canonical palette for actual Water setting identities. The amber value
+// above remains the feature-level "belongs to a run" cue; keyed controls,
+// graphs, markers, pins, and clips resolve an index into this palette instead.
+constexpr std::array<ImU32, 5> kWaterKeyedSettingColours{
+    IM_COL32(240, 173, 78, 255),
+    IM_COL32(102, 187, 227, 255),
+    IM_COL32(148, 214, 132, 255),
+    IM_COL32(222, 134, 190, 255),
+    IM_COL32(196, 196, 120, 255),
+};
+
+ImU32 WaterKeyedSettingDisplayColour(
+    invisible_places::water::WaterKeyedFeatureKind kind,
+    std::string_view settingId,
+    const invisible_places::water::WaterFeatureTimeline* timeline = nullptr) {
+    const auto settings = timeline != nullptr
+        ? std::span<const invisible_places::water::WaterKeyedSettingTrack>{
+              timeline->settings}
+        : std::span<const invisible_places::water::WaterKeyedSettingTrack>{};
+    const std::size_t index = invisible_places::water::
+        WaterKeyedSettingDisplayIndex(kind, settingId, settings)
+            .value_or(0U);
+    return kWaterKeyedSettingColours[
+        index % kWaterKeyedSettingColours.size()];
+}
+
+ImU32 WaterKeyedSettingsDisplayColour(
+    invisible_places::water::WaterKeyedFeatureKind kind,
+    std::span<const std::string_view> settingIds,
+    const invisible_places::water::WaterFeatureTimeline* timeline = nullptr) {
+    const auto settings = timeline != nullptr
+        ? std::span<const invisible_places::water::WaterKeyedSettingTrack>{
+              timeline->settings}
+        : std::span<const invisible_places::water::WaterKeyedSettingTrack>{};
+    std::optional<std::size_t> primary;
+    for (const auto settingId : settingIds) {
+        const auto index = invisible_places::water::
+            WaterKeyedSettingDisplayIndex(kind, settingId, settings);
+        if (index.has_value() &&
+            (!primary.has_value() || *index < *primary)) {
+            primary = *index;
+        }
+    }
+    return kWaterKeyedSettingColours[
+        primary.value_or(0U) % kWaterKeyedSettingColours.size()];
+}
 constexpr char kWaterPointSourceDragPayload[] = "WATER_FLOW_POINT";
 constexpr char kWaterPathSourceDragPayload[] = "WATER_FLOW_PATH";
 constexpr std::size_t kImGuiDragPayloadTypeMaxCharacters =
@@ -74057,19 +74103,19 @@ void EndWaterRegenerativeSettingLabels(bool featureInRun) {
 // Draws the visible setting name exactly once, to the right of the keyed
 // widget it follows on the same line. In-run settings are keyable, so the
 // name is always bold (a one-pixel second text pass — ImGui has no bold face
-// in this theme); the amber tint marks keying as enabled. Returns whether
+// in this theme); its canonical timeline tint marks keying as enabled. Returns whether
 // the name is hovered so callers can handle the double-click toggle.
 bool DrawKeyedWaterSettingLabel(
     const std::string& renderedLabel,
-    bool keyingActive) {
+    bool keyingActive,
+    ImVec4 keyedColour) {
     if (renderedLabel.empty()) {
         return false;
     }
     ImGui::SameLine(0.0F, ImGui::GetStyle().ItemInnerSpacing.x);
     ImGui::PushStyleColor(
         ImGuiCol_Text,
-        keyingActive ? kWaterKeyedSettingColour
-                     : kWaterKeyableSettingColour);
+        keyingActive ? keyedColour : kWaterKeyableSettingColour);
     ImGui::TextUnformatted(renderedLabel.c_str());
     const bool hovered = ImGui::IsItemHovered();
     const ImVec2 textMin = ImGui::GetItemRectMin();
@@ -74150,7 +74196,7 @@ std::size_t RemoveWaterTimelineSettingKeysAtPosition(
 // The keyed-editing core: when the primary feature belongs to a run of the
 // active Timing Take the slider displays the value evaluated at the current
 // animation position, edits write keys (for every passed feature that is in
-// a run) instead of touching authored state, the bold name tints amber while
+// a run) instead of touching authored state, the bold name uses its canonical colour while
 // keying is enabled, and trailing < > arrows scrub to this setting's
 // neighbouring keys. Outside a run it is a plain slider on the authored
 // value.
@@ -74241,10 +74287,14 @@ KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
     // The slider carries a hidden label so the visible name is rendered by
     // exactly one code path (the shared bold label helper) — never twice.
     const std::string hiddenSliderLabel = "##" + std::string{label};
+    const ImVec4 keyedColour = ImGui::ColorConvertU32ToFloat4(
+        WaterKeyedSettingDisplayColour(
+            primary.kind,
+            settingId,
+            timeline));
     ImGui::PushStyleColor(
         ImGuiCol_Text,
-        keyingActive ? kWaterKeyedSettingColour
-                     : kWaterKeyableSettingColour);
+        keyingActive ? keyedColour : kWaterKeyableSettingColour);
     const bool sliderChanged = DrawWaterSliderFloat(
         hiddenSliderLabel.c_str(),
         &value,
@@ -74261,7 +74311,10 @@ KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
         BeginWaterKeyEditTransaction(runtimeState, scenarioId);
     }
     const bool labelHovered =
-        DrawKeyedWaterSettingLabel(renderedLabel, keyingActive);
+        DrawKeyedWaterSettingLabel(
+            renderedLabel,
+            keyingActive,
+            keyedColour);
 
     bool toggledKeying = false;
     if (labelHovered &&
@@ -74618,8 +74671,13 @@ KeyedWaterSliderResult DrawKeyedWaterColourSetting(
     // Hidden editor label — the visible name is rendered exactly once by the
     // shared bold label helper.
     const std::string hiddenEditorLabel = "##" + std::string{label};
+    const ImVec4 keyedColour = ImGui::ColorConvertU32ToFloat4(
+        WaterKeyedSettingsDisplayColour(
+            features.front().kind,
+            settingIds,
+            timeline));
     if (keyingActive) {
-        ImGui::PushStyleColor(ImGuiCol_Text, kWaterKeyedSettingColour);
+        ImGui::PushStyleColor(ImGuiCol_Text, keyedColour);
     }
     const bool colourChanged =
         ImGui::ColorEdit3(hiddenEditorLabel.c_str(), colour.data());
@@ -74634,7 +74692,10 @@ KeyedWaterSliderResult DrawKeyedWaterColourSetting(
         BeginWaterKeyEditTransaction(runtimeState, scenarioId);
     }
     const bool labelHovered =
-        DrawKeyedWaterSettingLabel(renderedLabel, keyingActive);
+        DrawKeyedWaterSettingLabel(
+            renderedLabel,
+            keyingActive,
+            keyedColour);
 
     const auto channelLabel =
         [&](std::size_t channel) {
@@ -82961,31 +83022,6 @@ bool DrawTimingInterpolationCombo(
 // and the key popup edits position, value, and interpolation or deletes the
 // key. Matches the water model tolerances (1e-4 insertion/move/navigation).
 
-// Shared with the top-bar water key marker strip so a setting keeps one
-// colour everywhere it appears.
-constexpr std::array<ImU32, 5> kWaterKeyedSettingColours{
-    IM_COL32(240, 173, 78, 255),
-    IM_COL32(102, 187, 227, 255),
-    IM_COL32(148, 214, 132, 255),
-    IM_COL32(222, 134, 190, 255),
-    IM_COL32(196, 196, 120, 255),
-};
-
-// Darkens a feature's base colour per setting index so a multi-setting
-// feature stays one recognisable family on the combined graph.
-ImU32 WaterRunSeriesShade(ImU32 colour, std::size_t step) {
-    if (step == 0U) {
-        return colour;
-    }
-    auto converted = ImGui::ColorConvertU32ToFloat4(colour);
-    const float scale =
-        1.0F / (1.0F + 0.4F * static_cast<float>(step));
-    converted.x *= scale;
-    converted.y *= scale;
-    converted.z *= scale;
-    return ImGui::ColorConvertFloat4ToU32(converted);
-}
-
 struct WaterRunGraphSeries {
     invisible_places::water::WaterKeyedFeatureId feature{};
     std::string settingId;
@@ -83011,9 +83047,11 @@ struct WaterRunGraphSeries {
 void BuildWaterFeatureGraphSeries(
     invisible_places::water::WaterFeatureTimeline& timeline,
     std::vector<WaterRunGraphSeries>* out) {
-    const auto seriesColour = [](std::size_t settingIndex) {
-        return kWaterKeyedSettingColours[
-            settingIndex % kWaterKeyedSettingColours.size()];
+    const auto seriesColour = [&](std::string_view settingId) {
+        return WaterKeyedSettingDisplayColour(
+            timeline.feature.kind,
+            settingId,
+            &timeline);
     };
     const auto trackFor =
         [&](std::string_view settingId)
@@ -83025,7 +83063,6 @@ void BuildWaterFeatureGraphSeries(
         }
         return nullptr;
     };
-    std::size_t settingIndex = 0U;
     for (const auto& info :
          invisible_places::water::WaterKeyableSettings(
              timeline.feature.kind)) {
@@ -83037,14 +83074,13 @@ void BuildWaterFeatureGraphSeries(
             .feature = timeline.feature,
             .settingId = std::string{info.id},
             .label = std::string{info.label},
-            .colour = seriesColour(settingIndex),
+            .colour = seriesColour(info.id),
             .track = track,
             .timeline = &timeline,
             .minimum = info.minimum,
             .maximum = info.maximum,
             .defaultValue = info.defaultValue,
         });
-        ++settingIndex;
     }
     // Dynamic profile tracks carry their own labels and no registry range;
     // they join once keyed, framed by their padded key extents.
@@ -83076,14 +83112,13 @@ void BuildWaterFeatureGraphSeries(
             .settingId = setting.settingId,
             .label = !setting.label.empty() ? setting.label
                                             : setting.settingId,
-            .colour = seriesColour(settingIndex),
+            .colour = seriesColour(setting.settingId),
             .track = &setting,
             .timeline = &timeline,
             .minimum = minimum,
             .maximum = maximum,
             .defaultValue = std::midpoint(minimum, maximum),
         });
-        ++settingIndex;
     }
 }
 
@@ -86633,9 +86668,20 @@ void DrawWaterRunClipsTimeline(
         if (block.end < viewRange.start || block.start > viewRange.end) {
             continue;
         }
-        const std::size_t featureIndex = featureIndices[block.row];
+        const auto* timeline = timelineForFeature(block.handle.feature);
+        // Colour follows the earliest canonical setting represented by the
+        // clip's explicit key owners, including dormant tracks. Empty markers
+        // retain the row colour because they have no setting identity yet.
+        const auto clipSettingIndex = timeline != nullptr
+            ? invisible_places::water::
+                  WaterFeatureClipPrimarySettingDisplayIndex(
+                      *timeline,
+                      block.handle.clipId)
+            : std::nullopt;
         const ImU32 baseColour = kWaterKeyedSettingColours[
-            featureIndex % kWaterKeyedSettingColours.size()];
+            clipSettingIndex
+                    .value_or(featureIndices[block.row]) %
+                kWaterKeyedSettingColours.size()];
         const float top = rowTop(block.row);
         const float x0 = xForPosition(
             std::max(block.start, viewRange.start));
@@ -86664,7 +86710,6 @@ void DrawWaterRunClipsTimeline(
         // The value ribbon: brightness of the fill follows the primary
         // keyed setting across the clip, so "comes on, peaks, fades out"
         // reads directly off the bar.
-        const auto* timeline = timelineForFeature(block.handle.feature);
         const WaterKeyedSettingTrack* primary = nullptr;
         const invisible_places::water::WaterKeyableSettingInfo*
             primaryInfo = nullptr;
@@ -87276,7 +87321,7 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
             // exact colours of the graphs below.
             const auto buildFeatureSeries =
                 [&](invisible_places::water::WaterFeatureTimeline& timeline,
-                    std::size_t featureIndex,
+                    std::size_t /*featureIndex*/,
                     bool combined,
                     std::vector<WaterRunGraphSeries>* out) {
                     if (!combined) {
@@ -87287,10 +87332,11 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                         *runtimeState,
                         timeline.feature);
                     const auto seriesColour =
-                        [&](std::size_t settingIndex) {
-                            return WaterRunSeriesShade(
-                                featureBaseColour(featureIndex),
-                                settingIndex);
+                        [&](std::string_view settingId) {
+                            return WaterKeyedSettingDisplayColour(
+                                timeline.feature.kind,
+                                settingId,
+                                &timeline);
                         };
                     const auto trackFor =
                         [&](std::string_view settingId)
@@ -87302,7 +87348,6 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                         }
                         return nullptr;
                     };
-                    std::size_t settingIndex = 0U;
                     for (const auto& info :
                          invisible_places::water::WaterKeyableSettings(
                              timeline.feature.kind)) {
@@ -87311,7 +87356,6 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                                            track->active &&
                                            !track->keys.empty();
                         if (combined && !keyed) {
-                            ++settingIndex;
                             continue;
                         }
                         out->push_back(WaterRunGraphSeries{
@@ -87320,14 +87364,13 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                             .label = combined
                                          ? featureLabel + " · " + info.label
                                          : std::string{info.label},
-                            .colour = seriesColour(settingIndex),
+                            .colour = seriesColour(info.id),
                             .track = track,
                             .timeline = &timeline,
                             .minimum = info.minimum,
                             .maximum = info.maximum,
                             .defaultValue = info.defaultValue,
                         });
-                        ++settingIndex;
                     }
                     // Dynamic profile tracks carry their own labels and no
                     // registry range; they join once keyed, framed by their
@@ -87367,7 +87410,7 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                                          ? featureLabel + " · " +
                                                settingLabel
                                          : settingLabel,
-                            .colour = seriesColour(settingIndex),
+                            .colour = seriesColour(setting.settingId),
                             .track = &setting,
                             .timeline = &timeline,
                             .minimum = minimum,
@@ -87375,7 +87418,6 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                             .defaultValue =
                                 std::midpoint(minimum, maximum),
                         });
-                        ++settingIndex;
                     }
                 };
 
@@ -96274,9 +96316,6 @@ void DrawWaterKeyMarkerStrip(
     const invisible_places::water::WaterFeatureTimeline& timeline,
     ImVec2 barMin,
     ImVec2 barMax) {
-    // One palette with the Timings-tab run graphs so a setting keeps its
-    // colour between the top bar and the run timeline.
-    const auto& kSettingColours = kWaterKeyedSettingColours;
     const float barWidth = std::max(1.0F, barMax.x - barMin.x);
     constexpr float kStripHeight = 9.0F;
     ImGui::SetCursorScreenPos(ImVec2{barMin.x, barMax.y + 2.0F});
@@ -96311,8 +96350,10 @@ void DrawWaterKeyMarkerStrip(
             [](const auto& left, const auto& right) {
                 return left.position < right.position;
             });
-        const auto colour =
-            kSettingColours[settingIndex % kSettingColours.size()];
+        const auto colour = WaterKeyedSettingDisplayColour(
+            timeline.feature.kind,
+            setting.settingId,
+            &timeline);
         for (std::size_t keyIndex = 0U; keyIndex < ordered.size();
              ++keyIndex) {
             const auto& key = ordered[keyIndex];
@@ -97387,7 +97428,6 @@ std::optional<PinnedWaterSettingSeries> ResolvePinnedWaterSettingSeries(
         }
         return nullptr;
     };
-    std::size_t settingIndex = 0U;
     for (const auto& info :
          invisible_places::water::WaterKeyableSettings(
              timeline.feature.kind)) {
@@ -97397,14 +97437,15 @@ std::optional<PinnedWaterSettingSeries> ResolvePinnedWaterSettingSeries(
         }
         if (settingId == info.id) {
             return PinnedWaterSettingSeries{
-                .colour = kWaterKeyedSettingColours[
-                    settingIndex % kWaterKeyedSettingColours.size()],
+                .colour = WaterKeyedSettingDisplayColour(
+                    timeline.feature.kind,
+                    settingId,
+                    &timeline),
                 .minimum = info.minimum,
                 .maximum = info.maximum,
                 .track = track,
             };
         }
-        ++settingIndex;
     }
     for (const auto& setting : timeline.settings) {
         if (invisible_places::water::FindWaterKeyableSetting(
@@ -97431,14 +97472,15 @@ std::optional<PinnedWaterSettingSeries> ResolvePinnedWaterSettingSeries(
                 maximum += padding;
             }
             return PinnedWaterSettingSeries{
-                .colour = kWaterKeyedSettingColours[
-                    settingIndex % kWaterKeyedSettingColours.size()],
+                .colour = WaterKeyedSettingDisplayColour(
+                    timeline.feature.kind,
+                    settingId,
+                    &timeline),
                 .minimum = minimum,
                 .maximum = maximum,
                 .track = &setting,
             };
         }
-        ++settingIndex;
     }
     return std::nullopt;
 }
