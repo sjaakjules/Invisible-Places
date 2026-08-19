@@ -92,6 +92,8 @@ json RendererStateToJson(const RenderSetupRendererState& state) {
         {"pro_res_alpha_preview_enabled", state.proResAlphaPreviewEnabled},
         {"gaussian_splat_footprint_boost",
          state.gaussianSplatFootprintBoost},
+        {"setup_viewport_width", state.setupViewportWidth},
+        {"setup_viewport_height", state.setupViewportHeight},
         {"density_policy", state.densityPolicy},
     };
 }
@@ -118,6 +120,12 @@ RenderSetupRendererState ParseRendererState(const json& value) {
     state.gaussianSplatFootprintBoost = value.value(
         "gaussian_splat_footprint_boost",
         state.gaussianSplatFootprintBoost);
+    state.setupViewportWidth = value.value(
+        "setup_viewport_width",
+        state.setupViewportWidth);
+    state.setupViewportHeight = value.value(
+        "setup_viewport_height",
+        state.setupViewportHeight);
     state.densityPolicy = value.value(
         "density_policy",
         state.densityPolicy);
@@ -591,6 +599,7 @@ bool SaveBackgroundRenderStatusDocument(
             {"output_path", document.outputPath.generic_string()},
             {"log_path", document.logPath.generic_string()},
             {"process_id", document.processId},
+            {"cancellation_supported", document.cancellationSupported},
             {"rendered_frames", document.renderedFrames},
             {"total_frames", document.totalFrames},
             {"progress", std::clamp(document.progress, 0.0F, 1.0F)},
@@ -636,6 +645,9 @@ LoadBackgroundRenderStatusDocument(
         document.outputPath = root->value("output_path", std::string{});
         document.logPath = root->value("log_path", std::string{});
         document.processId = root->value("process_id", std::int64_t{0});
+        document.cancellationSupported = root->value(
+            "cancellation_supported",
+            false);
         document.renderedFrames = root->value("rendered_frames", 0U);
         document.totalFrames = root->value("total_frames", 0U);
         document.progress = std::clamp(

@@ -301,6 +301,8 @@ RenderSetupDocument MakeRenderSetup() {
     document.renderer.eyeDomeLightingEnabled = true;
     document.renderer.eyeDomeLightingThickness = 2.25F;
     document.renderer.gaussianSplatFootprintBoost = 2.75F;
+    document.renderer.setupViewportWidth = 1680U;
+    document.renderer.setupViewportHeight = 1050U;
     document.summary =
         invisible_places::serialization::SummarizeRenderSetupTiming(
             document.timingState);
@@ -452,6 +454,8 @@ TEST_CASE(
     CHECK(loaded->tempWaterPointVisualStyle->solidColor[1] == Approx(0.7F));
     CHECK(loaded->renderer.eyeDomeLightingThickness == Approx(2.25F));
     CHECK(loaded->renderer.gaussianSplatFootprintBoost == Approx(2.75F));
+    CHECK(loaded->renderer.setupViewportWidth == 1680U);
+    CHECK(loaded->renderer.setupViewportHeight == 1050U);
     CHECK(loaded->editedSettingLabels == authored.editedSettingLabels);
     REQUIRE(loaded->sourceFingerprints.size() == 1U);
     CHECK(loaded->sourceFingerprints.front().fileSize == 1234567U);
@@ -559,6 +563,9 @@ TEST_CASE(
         legacy = nlohmann::json::parse(input);
     }
     legacy["schema_version"] = 2U;
+    auto& legacyRenderer = legacy.at("snapshot").at("renderer");
+    legacyRenderer.erase("setup_viewport_width");
+    legacyRenderer.erase("setup_viewport_height");
     auto& legacyTiming = legacy.at("snapshot")
                              .at("timing_take_scene_state");
     legacyTiming.erase("timing_effects");
@@ -584,6 +591,8 @@ TEST_CASE(
             legacyPath,
             &error);
     REQUIRE(loaded.has_value());
+    CHECK(loaded->renderer.setupViewportWidth == 0U);
+    CHECK(loaded->renderer.setupViewportHeight == 0U);
     REQUIRE(loaded->timingState.colouriseEffects.size() == 4U);
     CHECK(loaded->timingState.colouriseEffects.front()
               .activationRange.start == Approx(0.0F));
@@ -858,6 +867,7 @@ TEST_CASE(
     status.outputPath = directory.path / "surface.mov";
     status.logPath = directory.path / "surface.log.txt";
     status.processId = 4321;
+    status.cancellationSupported = true;
     status.renderedFrames = 18U;
     status.totalFrames = 120U;
     status.progress = 0.15F;
@@ -882,6 +892,7 @@ TEST_CASE(
     CHECK(loaded->outputPath == status.outputPath);
     CHECK(loaded->logPath == status.logPath);
     CHECK(loaded->processId == status.processId);
+    CHECK(loaded->cancellationSupported);
     CHECK(loaded->renderedFrames == status.renderedFrames);
     CHECK(loaded->totalFrames == status.totalFrames);
     CHECK(loaded->progress == Approx(status.progress));
@@ -901,4 +912,46 @@ TEST_CASE(
                 &error);
     REQUIRE(clamped.has_value());
     CHECK(clamped->progress == Approx(1.0F));
+
+    status.state = "cancelled";
+    status.message = "Background render cancelled.";
+    status.renderedFrames = 37U;
+    status.totalFrames = 120U;
+    status.progress = 37.0F / 120.0F;
+    REQUIRE(
+        invisible_places::serialization::
+            SaveBackgroundRenderStatusDocument(
+                status,
+                statusPath,
+                &error));
+    const auto cancelled =
+        invisible_places::serialization::
+            LoadBackgroundRenderStatusDocument(
+                statusPath,
+                &error);
+    REQUIRE(cancelled.has_value());
+    CHECK(cancelled->state == "cancelled");
+    CHECK(cancelled->renderedFrames == 37U);
+    CHECK(cancelled->totalFrames == 120U);
+    CHECK(cancelled->progress == Approx(37.0F / 120.0F));
+
+    nlohmann::json legacyStatus;
+    {
+        std::ifstream input{statusPath};
+        REQUIRE(input.is_open());
+        legacyStatus = nlohmann::json::parse(input);
+    }
+    legacyStatus.erase("cancellation_supported");
+    {
+        std::ofstream output{statusPath};
+        REQUIRE(output.is_open());
+        output << legacyStatus.dump(2);
+    }
+    const auto legacy =
+        invisible_places::serialization::
+            LoadBackgroundRenderStatusDocument(
+                statusPath,
+                &error);
+    REQUIRE(legacy.has_value());
+    CHECK_FALSE(legacy->cancellationSupported);
 }

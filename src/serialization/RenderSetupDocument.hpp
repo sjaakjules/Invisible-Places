@@ -13,7 +13,7 @@
 
 namespace invisible_places::serialization {
 
-inline constexpr std::uint32_t kRenderSetupDocumentSchemaVersion = 5U;
+inline constexpr std::uint32_t kRenderSetupDocumentSchemaVersion = 6U;
 inline constexpr std::uint32_t kMinimumRenderSetupDocumentSchemaVersion = 1U;
 inline constexpr std::uint32_t kRenderSetupHistorySchemaVersion = 1U;
 inline constexpr std::size_t kMaximumRenderSetupHistoryEntries = 100U;
@@ -34,6 +34,12 @@ struct RenderSetupRendererState {
     float eyeDomeLightingThickness = 1.0F;
     bool proResAlphaPreviewEnabled = false;
     float gaussianSplatFootprintBoost = 1.5F;
+    // Click-time live viewport used to scale screen-space point, EDL, and
+    // depth-of-field values for deterministic foreground/background export.
+    // Zero is the legacy sentinel. Queueing fills it from the live framebuffer;
+    // direct legacy workers use a stable authored/canonical viewport fallback.
+    std::uint32_t setupViewportWidth = 0U;
+    std::uint32_t setupViewportHeight = 0U;
     // Stable policy identifier rather than a transient loaded source path.
     std::string densityPolicy = "finest_available";
 };
@@ -128,6 +134,7 @@ struct BackgroundRenderStatusDocument {
     std::filesystem::path outputPath;
     std::filesystem::path logPath;
     std::int64_t processId = 0;
+    bool cancellationSupported = false;
     std::uint32_t renderedFrames = 0U;
     std::uint32_t totalFrames = 0U;
     float progress = 0.0F;
