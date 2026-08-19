@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Refresh the local SampleScene validation project from durable fixtures.
 
-The tracked schema-28 water fixture and the current validation project are the
+The tracked schema-31 water fixture and the current validation project are the
 default inputs, so regeneration never depends on or rewrites an authored
 exhibition project. An explicit main-project option can still refresh the water
 fixture while those authored objects exist. The helper builds a lightweight
@@ -24,8 +24,8 @@ from typing import Any
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
-PROJECT_SCHEMA_VERSION = 74
-WATER_SOURCES_SCHEMA_VERSION = 28
+PROJECT_SCHEMA_VERSION = 80
+WATER_SOURCES_SCHEMA_VERSION = 31
 DEFAULT_MAIN_PROJECT = REPOSITORY_ROOT / "Saved" / "exhibitionScene_project.json"
 DEFAULT_FIXTURE = REPOSITORY_ROOT / "tests" / "fixtures" / "sample_scene_water_sources.json"
 DEFAULT_VALIDATION_PROJECT = (
@@ -84,15 +84,48 @@ STATE_WATER_KEYS = (
     "water_emitters",
     "water_manual_flow_paths",
     "water_seepage_nodes",
+)
+
+# Legacy Ripple / Field / Caustics keys. The features were removed; current
+# documents neither write nor read these keys.
+REMOVED_WATER_KEYS = (
     "water_ripple_layers",
     "water_field_layers",
     "water_ripple_runtime_caches",
+    "water_caustic_look_settings",
+    "temp_water_caustic_look_settings",
+    "water_field_settings",
+    "water_field_trail_settings",
+    "water_field_stream_settings",
+    "water_caustic_regions",
+    "water_basin_regions",
+    "water_runoff_regions",
 )
+
+
+def strip_removed_style_keys(value: Any) -> None:
+    """Drop legacy point_style caustic_* keys from every nested style dict."""
+
+    if isinstance(value, dict):
+        for key in [key for key in value if key.startswith("caustic_")]:
+            value.pop(key, None)
+        for nested in value.values():
+            strip_removed_style_keys(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            strip_removed_style_keys(nested)
 
 
 def upgrade_water_contract(value: dict[str, Any], *, project: bool) -> None:
     """Apply the current project/water-source authored-data contract."""
 
+    for removed_key in REMOVED_WATER_KEYS:
+        value.pop(removed_key, None)
+    for state in value.get("water_scene_states", []):
+        if isinstance(state, dict):
+            for removed_key in REMOVED_WATER_KEYS:
+                state.pop(removed_key, None)
+    strip_removed_style_keys(value)
     value.pop("water_shoreline_default_settings", None)
     value.pop("selected_water_shoreline_profile", None)
     for profile in value.get("water_shoreline_profiles", []):
@@ -447,7 +480,6 @@ def build_water_fixture(project: dict[str, Any], state: dict[str, Any]) -> dict[
             ],
         },
         "water_source_settings": copy.deepcopy(project["water_source_settings"]),
-        "water_caustic_look_settings": copy.deepcopy(project["water_caustic_look_settings"]),
         "water_flow_trail_settings": copy.deepcopy(project["water_flow_trail_settings"]),
         "show_flow_trails": project.get("water_show_flow_trails", True),
         "water_trail_geometry": copy.deepcopy(project["water_trail_geometry"]),
@@ -457,8 +489,6 @@ def build_water_fixture(project: dict[str, Any], state: dict[str, Any]) -> dict[
         "selected_water_path_profile": project.get("selected_water_path_profile", "Default"),
         "selected_water_lane_profile": project.get("selected_water_lane_profile", "Default"),
         "selected_water_trail_profile": project.get("selected_water_trail_profile", "Default"),
-        "water_field_settings": copy.deepcopy(project["water_field_settings"]),
-        "water_field_trail_settings": copy.deepcopy(project["water_field_trail_settings"]),
         "water_dynamic_mesh_flow_settings": copy.deepcopy(
             project["water_dynamic_mesh_flow_settings"]
         ),
@@ -470,13 +500,9 @@ def build_water_fixture(project: dict[str, Any], state: dict[str, Any]) -> dict[
         "water_seepage_look_profiles": copy.deepcopy(
             project.get("water_seepage_look_profiles", [])
         ),
-        "water_ripple_layers": copy.deepcopy(state.get("water_ripple_layers", [])),
-        "water_field_layers": copy.deepcopy(state.get("water_field_layers", [])),
-        "water_ripple_runtime_caches": [],
     }
     for optional_key in (
         "temp_water_source_settings",
-        "temp_water_caustic_look_settings",
         "temp_water_path_profile_settings",
         "temp_water_lane_profile_settings",
         "temp_water_trail_profile",
@@ -501,8 +527,11 @@ def validate_water_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
     named_object(fixture.get("water_seepage_nodes", []), "SampleSeepage")
     if "water_path_cache" in fixture or "water_path_cache_manifest" in fixture:
         raise ValueError("SampleScene water fixture must not contain a derived Flow cache")
-    if fixture.get("water_ripple_runtime_caches"):
-        raise ValueError("SampleScene water fixture must not contain ripple runtime caches")
+    for removed_key in REMOVED_WATER_KEYS:
+        if removed_key in fixture:
+            raise ValueError(
+                f"SampleScene water fixture must not contain removed key {removed_key}"
+            )
     return fixture
 
 
@@ -638,11 +667,6 @@ def build_validation_project(
             fixture["water_manual_flow_paths"]
         ),
         "water_seepage_nodes": copy.deepcopy(fixture["water_seepage_nodes"]),
-        "water_ripple_layers": copy.deepcopy(
-            fixture.get("water_ripple_layers", [])
-        ),
-        "water_field_layers": copy.deepcopy(fixture.get("water_field_layers", [])),
-        "water_ripple_runtime_caches": [],
         "dynamic_mesh_path": "",
     }
     validation["water_scene_states"] = [validation_state]
@@ -653,13 +677,6 @@ def build_validation_project(
     validation.pop("water_path_cache_manifest", None)
     validation.pop("water_emitters", None)
     validation.pop("water_manual_flow_paths", None)
-    validation["water_ripple_layers"] = copy.deepcopy(
-        validation_state["water_ripple_layers"]
-    )
-    validation["water_field_layers"] = copy.deepcopy(
-        validation_state["water_field_layers"]
-    )
-    validation["water_ripple_runtime_caches"] = []
 
     for entry in validation.get("camera_shots", []):
         entry["associated_layer_paths"] = ["__scene_group__/SampleScene"]

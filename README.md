@@ -32,7 +32,7 @@ The central idea is that data already present in the point cloud can become visu
 - Reads scalar-field statistics for field-driven styling.
 - Groups sibling role-named PLY files into one folder-level scene, such as ROCK/SAND/VEG layers under `Data/ExhibitionScene`.
 - Infers point spacing from filenames such as `1mm` and `2mm`, builds complete scene-wide density bundles, and exposes one **Visible Point Cloud** selector in the Visuals tab.
-- Loads and commits the selected ROCK/SAND/VEG display bundle first. The complete 1 mm bundle loads CPU-only on demand for explicit Bake Path and analysis-based Ripple/Field operations; only the committed display bundle is renderable/GPU-resident.
+- Loads and commits the selected ROCK/SAND/VEG display bundle first. The complete 1 mm bundle loads CPU-only on demand for explicit Bake Path operations; only the committed display bundle is renderable/GPU-resident.
 - Treats the ROCK role as the primary visual/style reference in grouped scenes while keeping role-specific backend behavior available.
 - Loads Gaussian splat PLY files named with the `gSplat-` prefix.
 - Applies same-stem `.txt` 4x4 transform matrices for Gaussian splat alignment.

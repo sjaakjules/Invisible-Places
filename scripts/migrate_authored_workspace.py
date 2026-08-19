@@ -105,11 +105,7 @@ def rewrite_json(value: Any, repo: Path, destination: Path) -> Any:
 def remove_derived_cache_state(document: Any) -> None:
     if not isinstance(document, dict):
         return
-    for key in (
-        "water_path_cache",
-        "water_path_cache_manifest",
-        "water_ripple_runtime_caches",
-    ):
+    for key in ("water_path_cache", "water_path_cache_manifest"):
         document.pop(key, None)
     for group in document.get("scene_point_cloud_groups", []):
         if isinstance(group, dict):
@@ -119,7 +115,6 @@ def remove_derived_cache_state(document: Any) -> None:
             continue
         state.pop("water_path_cache", None)
         state.pop("water_path_cache_manifest", None)
-        state.pop("water_ripple_runtime_caches", None)
 
 
 def rewrite_json_file(path: Path, repo: Path, destination: Path) -> None:

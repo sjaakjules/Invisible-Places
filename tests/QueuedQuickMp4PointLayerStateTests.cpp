@@ -40,8 +40,8 @@ PointCloudStyleState MakeQueuedVisualStyle(float marker, bool alternate) {
     style.flowAnimation = alternate;
     style.waterPathView = !alternate;
     style.waterTrailOverlay = alternate;
-    style.causticAnimation = !alternate;
-    style.causticIntensity = marker * 2.0F;
+    style.roughnessMotionFullLayer = !alternate;
+    style.roughnessMotionStrength = marker * 2.0F;
     style.pointSize.constantValue[0] = 1.0F + marker;
     style.opacity.constantValue[0] = 0.50F + marker;
     style.emissiveStrength.constantValue[0] = 0.25F + marker;

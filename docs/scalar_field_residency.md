@@ -22,9 +22,8 @@ Constant bindings retain their field names in authored state without retaining
 their point-count-sized columns. Switching one back to `FieldMapped` invokes
 the existing on-demand streamer before rendering. All takes and visuals remain
 covered so a queued batch can select a different authored snapshot safely.
-There are currently no unconditional name patterns: retired Field/Mesh Flow
-rendering no longer pins `roughness` or `groundid`, and inactive Ripple
-caustic slots do not contribute to the filter. Active Roughness Motion still
+There are currently no unconditional name patterns: inactive Mesh Flow
+rendering no longer pins `roughness` or `groundid`. Active Roughness Motion still
 loads matching `roughness`/`groundid` fields for an ungrouped layer that uses
 them; grouped VEG motion is the existing full-layer mode and needs neither
 column.
@@ -123,17 +122,6 @@ export density and quality, using the current animation position's water
 state and a single sample (a still camera has no motion blur). It shares
 Render Frame Preview's readiness gate, so required clouds and scalar
 fields load first and the render then fires automatically.
-
-## Inactive caustic slots
-
-`caustic_*_field_slot` values persist as file-order indices (the resident
-slot of the load-everything era) and keep that meaning on disk.
-`MakeSceneRenderStyle` can still translate them to the field's current
-resident row via `TranslateCausticFieldSlotsToResident`, preserving project
-compatibility if Ripple is reintroduced. Ripple rendering is currently
-inactive, so these slots do not request or consume source columns. Sessions without an
-`availableScalarFields` catalog (runtime-generated overlays) skip the
-translation because file order and resident order are identical there.
 
 ## Exports
 

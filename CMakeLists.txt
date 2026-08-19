@@ -413,54 +413,6 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
                 TIMEOUT 1800
         )
         add_test(
-            NAME water-region-sample-terrestrial-gui-smoke
-            COMMAND
-                $<TARGET_FILE:invisible_places>
-                "${CMAKE_CURRENT_SOURCE_DIR}/Data"
-                --gui-smoke water-region-sample-terrestrial
-                --smoke-output "${CMAKE_CURRENT_BINARY_DIR}/water-region-smoke"
-        )
-        set_tests_properties(
-            water-region-sample-terrestrial-gui-smoke
-            PROPERTIES
-                DISABLED TRUE
-                LABELS "gui_smoke;legacy_water_inactive"
-                RUN_SERIAL TRUE
-                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        )
-        add_test(
-            NAME water-region-test-points-gui-smoke
-            COMMAND
-                $<TARGET_FILE:invisible_places>
-                "${CMAKE_CURRENT_SOURCE_DIR}/Data"
-                --gui-smoke water-region-test-points
-                --smoke-output "${CMAKE_CURRENT_BINARY_DIR}/water-region-smoke"
-        )
-        set_tests_properties(
-            water-region-test-points-gui-smoke
-            PROPERTIES
-                DISABLED TRUE
-                LABELS "gui_smoke;legacy_water_inactive"
-                RUN_SERIAL TRUE
-                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        )
-        add_test(
-            NAME water-ripple-patterns-test-points-gui-smoke
-            COMMAND
-                $<TARGET_FILE:invisible_places>
-                "${CMAKE_CURRENT_SOURCE_DIR}/Data"
-                --gui-smoke water-ripple-patterns-test-points
-                --smoke-output "${CMAKE_CURRENT_BINARY_DIR}/water-region-smoke"
-        )
-        set_tests_properties(
-            water-ripple-patterns-test-points-gui-smoke
-            PROPERTIES
-                DISABLED TRUE
-                LABELS "gui_smoke;legacy_water_inactive"
-                RUN_SERIAL TRUE
-                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        )
-        add_test(
             NAME seepage-sample-terrestrial-gui-smoke
             COMMAND
                 $<TARGET_FILE:invisible_places>
@@ -487,7 +439,7 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
             dynamic-mesh-flow-ground-gui-smoke
             PROPERTIES
                 DISABLED TRUE
-                LABELS "gui_smoke;legacy_water_inactive"
+                LABELS "gui_smoke;mesh_flow_inactive"
                 RUN_SERIAL TRUE
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         )
@@ -503,7 +455,7 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
             dynamic-mesh-flow-scene3-5mm-visual-gui-smoke
             PROPERTIES
                 DISABLED TRUE
-                LABELS "gui_smoke;legacy_water_inactive"
+                LABELS "gui_smoke;mesh_flow_inactive"
                 RUN_SERIAL TRUE
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
                 TIMEOUT 600

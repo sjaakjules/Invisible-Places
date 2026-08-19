@@ -117,7 +117,6 @@ TEST_CASE("project and animation authored paths remain portable", "[workspace][p
             invisible_places::serialization::WaterSurfaceCacheManifestDocument{},
     });
     project.waterPathCache = invisible_places::water::WaterPathCache{};
-    project.waterRippleRuntimeCaches.push_back({});
     MakeProjectDocumentPortable(&project, first);
     CHECK(project.selectedLayerPath.generic_string() ==
           "@data/Scene3/ROCK.ply");
@@ -126,7 +125,6 @@ TEST_CASE("project and animation authored paths remain portable", "[workspace][p
     CHECK(project.renderJobSettings.outputDirectory == "@local-renders/");
     CHECK_FALSE(project.scenePointCloudGroups.front().waterSurfaceCache.has_value());
     CHECK_FALSE(project.waterPathCache.has_value());
-    CHECK(project.waterRippleRuntimeCaches.empty());
 
     ResolveProjectDocument(&project, second);
     CHECK(project.selectedLayerPath ==

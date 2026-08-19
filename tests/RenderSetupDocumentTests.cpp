@@ -273,10 +273,6 @@ RenderSetupDocument MakeRenderSetup() {
          .baseRainProfileName = rainBase.name},
     };
     document.authoredWater.pathCache = invisible_places::water::WaterPathCache{};
-    invisible_places::serialization::WaterRippleRuntimeCacheDocument cache;
-    cache.memberships.push_back({.pointIndex = 3U});
-    cache.params.push_back({.layerId = 9U});
-    document.authoredWater.rippleRuntimeCaches.push_back(cache);
 
     document.waterAnimationTrailSettings.particleDensity = 2.5F;
     document.tempWaterAnimationTrailSettings =
@@ -345,8 +341,6 @@ TEST_CASE(
     CHECK(water.at("schema_version") ==
           invisible_places::serialization::kWaterSourcesDocumentSchemaVersion);
     CHECK_FALSE(water.contains("water_path_cache"));
-    REQUIRE(water.at("water_ripple_runtime_caches").is_array());
-    CHECK(water.at("water_ripple_runtime_caches").empty());
     REQUIRE(water.at("water_rain_profiles").size() == 2U);
     CHECK(water.at("water_rain_profiles")[1].at("id") ==
           "render-rain-base-timing-take-1");
@@ -440,7 +434,6 @@ TEST_CASE(
               .assignedRainProfileId ==
           "render-rain-base-timing-take-1");
     CHECK_FALSE(loaded->authoredWater.pathCache.has_value());
-    CHECK(loaded->authoredWater.rippleRuntimeCaches.empty());
     CHECK(loaded->waterAnimationTrailSettings.particleDensity == Approx(2.5F));
     REQUIRE(loaded->tempWaterAnimationTrailSettings.has_value());
     CHECK(loaded->tempWaterAnimationTrailSettings->particleSpeed == Approx(1.75F));

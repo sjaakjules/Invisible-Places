@@ -2164,7 +2164,6 @@ TEST_CASE("SampleScene authored water fixture is current, canonical, and cache f
   CHECK_FALSE(fixtureJson.at("fixture_metadata").at("derived_caches_included").get<bool>());
   CHECK_FALSE(fixtureJson.contains("water_path_cache"));
   CHECK_FALSE(fixtureJson.contains("water_path_cache_manifest"));
-  REQUIRE(fixtureJson.at("water_ripple_runtime_caches").empty());
   REQUIRE(fixtureJson.at("water_rain_profiles").size() == 1U);
   CHECK(fixtureJson.at("water_rain_profiles").front().at("id") ==
         invisible_places::timing::kLegacyWaterRainProfileId);
@@ -2188,7 +2187,6 @@ TEST_CASE("SampleScene authored water fixture is current, canonical, and cache f
   REQUIRE(fixture.has_value());
   CHECK(fixture->schemaVersion == kWaterSourcesDocumentSchemaVersion);
   CHECK_FALSE(fixture->pathCache.has_value());
-  CHECK(fixture->rippleRuntimeCaches.empty());
   CHECK(fixture->dynamicMeshFlowSettings.showTrails);
   CHECK(fixture->dynamicMeshFlowSettings.automaticSources);
   CHECK(fixture->dynamicMeshFlowSettings.particleCapacity == 4096U);
@@ -2343,7 +2341,6 @@ TEST_CASE("Generated SampleScene validation project migrates and round-trips wit
   CHECK(validationJson.at("active_water_scene_group") == "SampleScene");
   CHECK_FALSE(validationJson.contains("water_path_cache"));
   CHECK_FALSE(validationJson.contains("water_path_cache_manifest"));
-  REQUIRE(validationJson.at("water_ripple_runtime_caches").empty());
   REQUIRE(validationJson.at("water_scene_states").size() == 1U);
   CHECK_FALSE(validationJson.at("water_scene_states").front().contains("water_path_cache"));
   CHECK_FALSE(validationJson.at("water_scene_states").front().contains(
@@ -2352,9 +2349,6 @@ TEST_CASE("Generated SampleScene validation project migrates and round-trips wit
       "dynamic_mesh_attractors"));
   CHECK_FALSE(validationJson.at("water_scene_states").front().contains(
       "dynamic_mesh_emitter_motions"));
-  REQUIRE(validationJson.at("water_scene_states").front()
-              .at("water_ripple_runtime_caches")
-              .empty());
   REQUIRE(validationJson.at("scene_point_cloud_groups").size() == 1U);
   CHECK_FALSE(validationJson.at("scene_point_cloud_groups").front().contains(
       "water_surface_cache"));
