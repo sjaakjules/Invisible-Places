@@ -3117,6 +3117,36 @@ TEST_CASE("Animation preferred blend partner round-trips without a velocity link
   CHECK_FALSE(schema22Loaded->velocityBlendLink.has_value());
 }
 
+TEST_CASE("Animation selected point visual round-trips and legacy files preserve the live selection",
+          "[animation][serialization][point-visual]") {
+  using invisible_places::camera::AnimationPath;
+  using invisible_places::serialization::AnimationPathFromJson;
+  using invisible_places::serialization::AnimationPathToJson;
+  using invisible_places::serialization::kAnimationDocumentSchemaVersion;
+
+  AnimationPath path;
+  path.selectedPointVisualName = "Projector-01";
+
+  const auto saved = AnimationPathToJson(path);
+  CHECK(saved.at("schema_version") == kAnimationDocumentSchemaVersion);
+  CHECK(saved.at("selected_point_visual") == "Projector-01");
+
+  std::string error;
+  const auto loaded = AnimationPathFromJson(saved, &error);
+  INFO(error);
+  REQUIRE(loaded.has_value());
+  CHECK(loaded->selectedPointVisualName == "Projector-01");
+
+  auto legacy = saved;
+  legacy["schema_version"] = 24U;
+  legacy.erase("selected_point_visual");
+  const auto loadedLegacy = AnimationPathFromJson(legacy, &error);
+  INFO(error);
+  REQUIRE(loadedLegacy.has_value());
+  CHECK(loadedLegacy->sourceSchemaVersion == 24U);
+  CHECK(loadedLegacy->selectedPointVisualName.empty());
+}
+
 TEST_CASE("Animation velocity blend metadata and localized corrections round-trip",
           "[animation][serialization][velocity-blend]") {
   using invisible_places::camera::AnimationLocalizedKeyCorrection;

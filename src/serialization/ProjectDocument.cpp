@@ -2781,6 +2781,7 @@ json SerializeAnimationPath(const AnimationPath& path) {
         {"aperture_f_stops", path.apertureFStops},
         {"depth_of_field_max_blur_px", path.depthOfFieldMaxBlurPixels},
         {"export_settings", SerializeAnimationExportSettings(path.exportSettings)},
+        {"selected_point_visual", path.selectedPointVisualName},
         {"selected_timing_take_id",
          invisible_places::timing::NormalizeTimingTakeId(
              path.selectedTimingTakeId)},
@@ -2862,6 +2863,9 @@ AnimationPath ParseAnimationPath(const json& pathJson) {
         pathJson.value("depth_of_field_max_blur_px", path.depthOfFieldMaxBlurPixels);
     path.preferredBlendPartnerFileName = pathJson.value(
         "preferred_blend_partner_file_name",
+        std::string{});
+    path.selectedPointVisualName = pathJson.value(
+        "selected_point_visual",
         std::string{});
     path.selectedWaterScenarioId =
         pathJson.value("selected_water_scenario_id", std::string{});
