@@ -1004,6 +1004,41 @@ struct WaterClipHelpHoverState {
     double visibleUntil = 0.0;
 };
 
+struct WaterRunMarkSelectionState {
+    std::string scenarioId;
+    std::string sceneGroupName;
+    std::uint32_t runId = 0U;
+    std::uint32_t markId = 0U;
+};
+
+struct WaterRunMarkDragState {
+    std::string surfaceId;
+    std::string scenarioId;
+    std::string sceneGroupName;
+    std::uint32_t runId = 0U;
+    std::uint32_t markId = 0U;
+    bool moved = false;
+};
+
+struct WaterRunMarkEditState {
+    std::string surfaceId;
+    std::string scenarioId;
+    std::string sceneGroupName;
+    std::uint32_t runId = 0U;
+    std::uint32_t markId = 0U;
+    std::string draftText;
+    bool requestKeyboardFocus = false;
+};
+
+struct WaterRunMarkHelpHoverState {
+    std::string surfaceId;
+    std::string scenarioId;
+    std::string sceneGroupName;
+    std::uint32_t runId = 0U;
+    std::uint32_t markId = 0U;
+    double visibleUntil = 0.0;
+};
+
 enum class AnimationTimelineViewDragPart : std::uint8_t {
     Start = 0,
     Body,
@@ -1659,6 +1694,12 @@ struct TimingsPanelState {
     std::optional<WaterClipPackageSaveState> waterClipPackageSave;
     std::optional<WaterClipContextState> waterClipContext;
     std::optional<WaterClipHelpHoverState> waterClipHelpHover;
+    // Run-owned event marks share one stable selection across the Timings,
+    // embedded Water, and Global Animation surfaces.
+    std::optional<WaterRunMarkSelectionState> waterRunMarkSelection;
+    std::optional<WaterRunMarkDragState> waterRunMarkDrag;
+    std::optional<WaterRunMarkEditState> waterRunMarkEdit;
+    std::optional<WaterRunMarkHelpHoverState> waterRunMarkHelpHover;
     // Timing-take and Colourise authoring state. The selected effect is
     // intentionally UI-only; effects themselves are project-owned by the
     // active (take, scene-group) pair.
@@ -8494,6 +8535,7 @@ struct RangedFloatControlConfig {
     bool scaleDragToWidth = false;
     std::optional<float> hardMin = std::nullopt;
     std::optional<float> hardMax = std::nullopt;
+    std::optional<float> width = std::nullopt;
 };
 
 bool IsValidRangedFloatValue(float value, const RangedFloatControlConfig& config) {
@@ -8567,7 +8609,9 @@ bool DrawRangedFloatControl(const char* label, float* value, const RangedFloatCo
     }
 
     const ImGuiStyle& style = ImGui::GetStyle();
-    const float barWidth = std::max(110.0F, ImGui::GetContentRegionAvail().x);
+    const float barWidth = std::max(
+        110.0F,
+        config.width.value_or(ImGui::GetContentRegionAvail().x));
     const float frameHeight = ImGui::GetFrameHeight();
     const float dragSpeed =
         config.speed > 0.0F
@@ -55670,6 +55714,9 @@ bool ToggleLastWaterKeyEdit(PreviewRuntimeState* runtimeState) {
     timings.waterClipEdit.reset();
     timings.waterClipContext.reset();
     timings.waterClipSelection.reset();
+    timings.waterRunMarkDrag.reset();
+    timings.waterRunMarkEdit.reset();
+    timings.waterRunMarkHelpHover.reset();
     ApplyFeatureTimelineScrub(runtimeState);
     InvalidateWaterSeepageParams(&runtimeState->water);
     runtimeState->previewRenderStateSignatureValid = false;
@@ -55696,6 +55743,155 @@ bool HandleWaterKeyEditUndoShortcut(PreviewRuntimeState* runtimeState) {
         return false;
     }
     return ToggleLastWaterKeyEdit(runtimeState);
+}
+
+invisible_places::water::WaterFeatureTimingRun*
+FindVisibleWaterFeatureRunForMarks(
+    PreviewRuntimeState* runtimeState,
+    std::string_view scenarioId) {
+    if (runtimeState == nullptr || scenarioId.empty()) {
+        return nullptr;
+    }
+    auto* scene = invisible_places::timing::FindTimingTakeSceneState(
+        &runtimeState->water.timingTakeSceneStates,
+        scenarioId,
+        ActiveWaterTimingSceneGroupName(runtimeState->water));
+    if (scene == nullptr) {
+        return nullptr;
+    }
+    if (runtimeState->activeControlsTab == ControlsTab::Timings) {
+        const auto selected =
+            runtimeState->timingsPanel.selectedFeatureRunIndex;
+        return selected.has_value() &&
+                       selected.value() <
+                           scene->waterFeatureTimingRuns.size()
+                   ? &scene->waterFeatureTimingRuns[selected.value()]
+                   : nullptr;
+    }
+    if (runtimeState->activeControlsTab == ControlsTab::Water &&
+        runtimeState->water.activeKeyingFeature.has_value()) {
+        const auto feature = runtimeState->water.activeKeyingFeature.value();
+        for (auto& run : scene->waterFeatureTimingRuns) {
+            if (invisible_places::water::FindWaterFeatureTimeline(
+                    &run,
+                    feature) != nullptr) {
+                return &run;
+            }
+        }
+    }
+    return nullptr;
+}
+
+bool HandleWaterFeatureRunMarkShortcuts(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+    const auto& io = ImGui::GetIO();
+    if (RenderSetupAuthoringLocked(runtimeState) ||
+        runtimeState->animationPanel.liveCameraEdit.active ||
+        runtimeState->animationPanel.reciprocalPanWizard.Active() ||
+        !ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) ||
+        io.WantTextInput || ImGui::IsAnyItemActive() ||
+        runtimeState->timingsPanel.waterKeyEditTransaction.has_value()) {
+        return false;
+    }
+    const auto scenarioId = ActiveWaterTimingScenarioId(*runtimeState);
+    const auto sceneGroupName =
+        ActiveWaterTimingSceneGroupName(runtimeState->water);
+    auto* run = FindVisibleWaterFeatureRunForMarks(
+        runtimeState,
+        scenarioId);
+    if (run == nullptr) {
+        return false;
+    }
+    auto& timings = runtimeState->timingsPanel;
+    const bool addPressed =
+        runtimeState->activeControlsTab == ControlsTab::Timings &&
+        !io.KeyCtrl && !io.KeySuper && !io.KeyAlt &&
+        ImGui::IsKeyPressed(ImGuiKey_M, false);
+    if (addPressed) {
+        const auto* scene = invisible_places::timing::
+            FindTimingTakeSceneState(
+                runtimeState->water.timingTakeSceneStates,
+                scenarioId,
+                ActiveWaterTimingSceneGroupName(runtimeState->water));
+        if (scene == nullptr) {
+            return false;
+        }
+        const auto id = invisible_places::water::
+            AllocateWaterFeatureRunMarkId(*run);
+        if (id == 0U) {
+            runtimeState->errorMessage =
+                "No Feature Run mark id is available.";
+            runtimeState->statusMessage.clear();
+            return true;
+        }
+        const auto name = invisible_places::water::
+            AllocateWaterFeatureRunMarkName(
+                scene->waterFeatureTimingRuns);
+        BeginWaterKeyEditTransaction(runtimeState, scenarioId);
+        run->marks.push_back({
+            .id = id,
+            .text = name,
+            .position = CurrentAuthoredTrackPosition(*runtimeState),
+        });
+        MarkWaterKeyEditTransactionChanged(runtimeState);
+        FinishWaterKeyEditTransaction(runtimeState);
+        timings.waterRunMarkSelection = WaterRunMarkSelectionState{
+            .scenarioId = scenarioId,
+            .sceneGroupName = sceneGroupName,
+            .runId = run->id,
+            .markId = id,
+        };
+        timings.waterRunKeySelection.reset();
+        timings.waterClipSelection.reset();
+        runtimeState->previewRenderStateSignatureValid = false;
+        runtimeState->statusMessage =
+            "Added " + name + " to " + run->name + ".";
+        runtimeState->errorMessage.clear();
+        return true;
+    }
+
+    const bool deletePressed =
+        ImGui::IsKeyPressed(ImGuiKey_Delete, false) ||
+        ImGui::IsKeyPressed(ImGuiKey_Backspace, false);
+    if (!deletePressed || !timings.waterRunMarkSelection.has_value() ||
+        timings.waterRunMarkSelection->scenarioId != scenarioId ||
+        timings.waterRunMarkSelection->sceneGroupName != sceneGroupName ||
+        timings.waterRunMarkSelection->runId != run->id ||
+        (timings.waterRunKeySelection.has_value() &&
+         !timings.waterRunKeySelection->keys.empty()) ||
+        (timings.waterClipSelection.has_value() &&
+         !timings.waterClipSelection->clips.empty())) {
+        return false;
+    }
+    const auto markId = timings.waterRunMarkSelection->markId;
+    const auto* mark = invisible_places::water::FindWaterFeatureRunMark(
+        run,
+        markId);
+    if (mark == nullptr) {
+        timings.waterRunMarkSelection.reset();
+        return false;
+    }
+    const std::string name = mark->text;
+    BeginWaterKeyEditTransaction(runtimeState, scenarioId);
+    if (!invisible_places::water::RemoveWaterFeatureRunMark(
+            run,
+            markId)) {
+        CancelWaterKeyEditTransaction(runtimeState);
+        return false;
+    }
+    MarkWaterKeyEditTransactionChanged(runtimeState);
+    FinishWaterKeyEditTransaction(runtimeState);
+    timings.waterRunMarkSelection.reset();
+    timings.waterRunMarkDrag.reset();
+    timings.waterRunMarkEdit.reset();
+    timings.waterRunMarkHelpHover.reset();
+    runtimeState->previewRenderStateSignatureValid = false;
+    runtimeState->statusMessage = "Deleted " + name + ".";
+    runtimeState->errorMessage.clear();
+    return true;
 }
 
 std::uint32_t EffectiveAnimationKeyDurationFrames(
@@ -60069,10 +60265,61 @@ void ResetTimingTakeEditorSelections(PreviewRuntimeState* runtimeState) {
     timings.waterClipPackageSave.reset();
     timings.waterClipContext.reset();
     timings.waterClipHelpHover.reset();
+    timings.waterRunMarkSelection.reset();
+    timings.waterRunMarkDrag.reset();
+    timings.waterRunMarkEdit.reset();
+    timings.waterRunMarkHelpHover.reset();
     timings.colouriseLocalKeyDrag.reset();
     timings.colouriseLocalKeyPositionEdit.reset();
     timings.colouriseActivationDrag.reset();
     timings.activeHistogramHandle = TimingColouriseHistogramHandle::None;
+}
+
+// The Global Animation header presents one Timings focus at a time. Keeping
+// these resets symmetrical prevents a Visual Feature's marker lanes from
+// occupying the same global row as a selected Water Feature Run's marks.
+void ClearTimingColouriseEditorFocus(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    auto& timings = runtimeState->timingsPanel;
+    timings.selectedColouriseEffectIndex.reset();
+    timings.selectedColourisePaletteStopIndex.reset();
+    timings.draggingColourisePaletteStop = false;
+    timings.draggingColourisePaletteStopAmount = false;
+    timings.renamingColouriseEffectIndex.reset();
+    timings.focusColouriseEffectRename = false;
+    timings.requestedColourisePalettePickerStopIndex.reset();
+    timings.colourisePalettePicker.reset();
+    timings.colourisePaletteDrag.reset();
+    timings.colouriseLocalKeyDrag.reset();
+    timings.colouriseLocalKeyPositionEdit.reset();
+    timings.colouriseActivationDrag.reset();
+    timings.activeHistogramHandle = TimingColouriseHistogramHandle::None;
+    runtimeState->animationPanel.timingColouriseKeyPositionEdit.reset();
+}
+
+void ClearWaterFeatureRunEditorFocus(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    auto& timings = runtimeState->timingsPanel;
+    timings.selectedFeatureRunIndex.reset();
+    timings.pendingRunDeleteIndex.reset();
+    timings.waterRunKeyDrag.reset();
+    timings.waterRunSplineHandleDrag.reset();
+    timings.waterRunKeyEdit.reset();
+    timings.waterRunKeySelection.reset();
+    timings.waterClipSelection.reset();
+    timings.waterClipDrag.reset();
+    timings.waterClipEdit.reset();
+    timings.waterClipPackageSave.reset();
+    timings.waterClipContext.reset();
+    timings.waterClipHelpHover.reset();
+    timings.waterRunMarkSelection.reset();
+    timings.waterRunMarkDrag.reset();
+    timings.waterRunMarkEdit.reset();
+    timings.waterRunMarkHelpHover.reset();
 }
 
 bool ApplyTimingTakeToLinkedLoopPair(
@@ -87393,6 +87640,430 @@ void DrawWaterRunClipsTimeline(
     ImGui::PopID();
 }
 
+// One run-owned event rail shared by the Timings editor, the focused Water
+// feature, and the Global Animation header. Marks remain visible even when a
+// run has no keys. Their body hover is deliberately informational; the
+// adjacent non-interactive '?' owns every manipulation instruction.
+void DrawWaterFeatureRunMarkStrip(
+    const char* id,
+    PreviewRuntimeState* runtimeState,
+    const std::string& scenarioId,
+    invisible_places::water::WaterFeatureTimingRun* run,
+    float durationSeconds,
+    bool cameraDomain = false,
+    std::optional<std::pair<ImVec2, float>> fixedPlacement = std::nullopt) {
+    if (runtimeState == nullptr || run == nullptr || scenarioId.empty()) {
+        return;
+    }
+    constexpr float kRailHeight = 28.0F;
+    constexpr float kHelpGutterWidth = 22.0F;
+    constexpr float kHitRadius = 7.0F;
+    constexpr double kHelpHoverGraceSeconds = 2.5;
+    auto& timings = runtimeState->timingsPanel;
+    const bool readOnly = RenderSetupAuthoringLocked(runtimeState);
+    const std::string sceneGroupName =
+        ActiveWaterTimingSceneGroupName(runtimeState->water);
+
+    ImGui::PushID(id);
+    if (fixedPlacement.has_value()) {
+        ImGui::SetCursorScreenPos(fixedPlacement->first);
+    }
+    const float railWidth = fixedPlacement.has_value()
+        ? std::max(24.0F, fixedPlacement->second)
+        : std::max(
+              24.0F,
+              ImGui::GetContentRegionAvail().x - kHelpGutterWidth);
+    ImGui::InvisibleButton(
+        "##FeatureRunMarks",
+        ImVec2{railWidth, kRailHeight},
+        ImGuiButtonFlags_MouseButtonLeft);
+    const bool railHovered = ImGui::IsItemHovered();
+    const ImVec2 railMin = ImGui::GetItemRectMin();
+    const ImVec2 railMax = ImGui::GetItemRectMax();
+    ImGui::SameLine(0.0F, 0.0F);
+    ImGui::Dummy(ImVec2{kHelpGutterWidth, kRailHeight});
+    const ImVec2 helpMin{railMax.x, railMin.y};
+    const ImVec2 helpMax{railMax.x + kHelpGutterWidth, railMax.y};
+    const auto viewRange = cameraDomain
+        ? invisible_places::timing::TimelineViewRange{}
+        : invisible_places::timing::SanitizeTimelineViewRange(
+              runtimeState->animationPanel.timelineViewRange);
+    const float width = std::max(1.0F, railMax.x - railMin.x);
+    const auto xForPosition = [&](float position) {
+        return railMin.x +
+               width * invisible_places::timing::
+                           TimelinePositionToViewFraction(
+                               viewRange,
+                               position);
+    };
+    const auto authoredPositionForX = [&](float x) {
+        const float local = std::clamp(
+            (x - railMin.x) / width,
+            0.0F,
+            1.0F);
+        if (cameraDomain &&
+            runtimeState->animationPanel.currentPath.has_value()) {
+            const auto& path =
+                runtimeState->animationPanel.currentPath.value();
+            if (invisible_places::camera::ResolveAnimationTimingLoopWindow(
+                    path)
+                    .has_value()) {
+                return invisible_places::camera::
+                    AnimationLocalToTimingLoopPosition(path, local);
+            }
+            const float cameraFrames = static_cast<float>(
+                EffectiveAnimationDurationFramesForTracks(path));
+            const float trackFrames = static_cast<float>(
+                AuthoredAnimationTrackDurationFrames(path));
+            return std::clamp(
+                local * cameraFrames / trackFrames,
+                0.0F,
+                1.0F);
+        }
+        return invisible_places::timing::
+            TimelineViewFractionToPosition(viewRange, local);
+    };
+    const auto displayPositions = [&](float authoredPosition) {
+        if (cameraDomain &&
+            runtimeState->animationPanel.currentPath.has_value()) {
+            return AuthoredTrackNormalizedToCameraNormalizedPositions(
+                runtimeState->animationPanel.currentPath.value(),
+                authoredPosition);
+        }
+        return std::vector<float>{authoredPosition};
+    };
+
+    struct HoveredMark {
+        std::uint32_t id = 0U;
+        float displayPosition = 0.0F;
+        float distance = std::numeric_limits<float>::max();
+    };
+    std::optional<HoveredMark> hoveredMark;
+    if (railHovered) {
+        const float mouseX = ImGui::GetIO().MousePos.x;
+        for (const auto& mark : run->marks) {
+            for (const float displayPosition :
+                 displayPositions(mark.position)) {
+                if (!invisible_places::timing::
+                        TimelinePositionIsInView(
+                            viewRange,
+                            displayPosition,
+                            1.0e-4F)) {
+                    continue;
+                }
+                const float distance =
+                    std::abs(mouseX - xForPosition(displayPosition));
+                if (distance <= kHitRadius &&
+                    (!hoveredMark.has_value() ||
+                     distance < hoveredMark->distance)) {
+                    hoveredMark = HoveredMark{
+                        .id = mark.id,
+                        .displayPosition = displayPosition,
+                        .distance = distance,
+                    };
+                }
+            }
+        }
+    }
+    const auto selectionMatches = [&](std::uint32_t markId) {
+        return timings.waterRunMarkSelection.has_value() &&
+               timings.waterRunMarkSelection->scenarioId == scenarioId &&
+               timings.waterRunMarkSelection->sceneGroupName ==
+                   sceneGroupName &&
+               timings.waterRunMarkSelection->runId == run->id &&
+               timings.waterRunMarkSelection->markId == markId;
+    };
+    const auto dragMatches = [&] {
+        return timings.waterRunMarkDrag.has_value() &&
+               timings.waterRunMarkDrag->surfaceId == id &&
+               timings.waterRunMarkDrag->scenarioId == scenarioId &&
+               timings.waterRunMarkDrag->sceneGroupName ==
+                   sceneGroupName &&
+               timings.waterRunMarkDrag->runId == run->id;
+    };
+
+    if (!readOnly && hoveredMark.has_value() &&
+        ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        const auto* mark = invisible_places::water::FindWaterFeatureRunMark(
+            run,
+            hoveredMark->id);
+        if (mark != nullptr) {
+            timings.waterRunMarkSelection = WaterRunMarkSelectionState{
+                .scenarioId = scenarioId,
+                .sceneGroupName = sceneGroupName,
+                .runId = run->id,
+                .markId = mark->id,
+            };
+            timings.waterRunMarkDrag.reset();
+            CancelWaterKeyEditTransaction(runtimeState);
+            timings.waterRunMarkEdit = WaterRunMarkEditState{
+                .surfaceId = id,
+                .scenarioId = scenarioId,
+                .sceneGroupName = sceneGroupName,
+                .runId = run->id,
+                .markId = mark->id,
+                .draftText = mark->text,
+                .requestKeyboardFocus = true,
+            };
+            ImGui::OpenPopup("Edit Feature Run Mark");
+        }
+    } else if (!readOnly && hoveredMark.has_value() &&
+               ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        timings.waterRunMarkSelection = WaterRunMarkSelectionState{
+            .scenarioId = scenarioId,
+            .sceneGroupName = sceneGroupName,
+            .runId = run->id,
+            .markId = hoveredMark->id,
+        };
+        timings.waterRunKeySelection.reset();
+        timings.waterClipSelection.reset();
+        timings.waterRunMarkDrag = WaterRunMarkDragState{
+            .surfaceId = id,
+            .scenarioId = scenarioId,
+            .sceneGroupName = sceneGroupName,
+            .runId = run->id,
+            .markId = hoveredMark->id,
+        };
+        BeginWaterKeyEditTransaction(runtimeState, scenarioId);
+    } else if (railHovered &&
+               ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+               !hoveredMark.has_value()) {
+        timings.waterRunMarkSelection.reset();
+    }
+
+    if (!readOnly && dragMatches() &&
+        ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
+        ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0F)) {
+        float next = authoredPositionForX(ImGui::GetIO().MousePos.x);
+        if (!ImGui::GetIO().KeyShift) {
+            const float playhead =
+                CurrentAuthoredTrackPosition(*runtimeState);
+            const auto playheadDisplays = displayPositions(playhead);
+            const bool nearPlayhead = std::any_of(
+                playheadDisplays.begin(),
+                playheadDisplays.end(),
+                [&](float displayPosition) {
+                    return std::abs(
+                               ImGui::GetIO().MousePos.x -
+                               xForPosition(displayPosition)) <= 6.0F;
+                });
+            if (nearPlayhead) {
+                next = playhead;
+            }
+        }
+        if (invisible_places::water::MoveWaterFeatureRunMark(
+                run,
+                timings.waterRunMarkDrag->markId,
+                next)) {
+            timings.waterRunMarkDrag->moved = true;
+            MarkWaterKeyEditTransactionChanged(runtimeState);
+            runtimeState->previewRenderStateSignatureValid = false;
+        }
+    }
+    if (dragMatches() &&
+        ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+        if (timings.waterRunMarkDrag->moved) {
+            FinishWaterKeyEditTransaction(runtimeState);
+            runtimeState->statusMessage = "Moved Feature Run mark.";
+            runtimeState->errorMessage.clear();
+        } else {
+            CancelWaterKeyEditTransaction(runtimeState);
+        }
+        timings.waterRunMarkDrag.reset();
+    }
+
+    auto* drawList = ImGui::GetWindowDrawList();
+    drawList->AddRectFilled(
+        railMin,
+        railMax,
+        IM_COL32(255, 255, 255, 10),
+        3.0F);
+    drawList->AddText(
+        ImVec2{railMin.x + 5.0F, railMin.y + 5.0F},
+        ImGui::GetColorU32(ImGuiCol_TextDisabled),
+        "Marks");
+    drawList->PushClipRect(railMin, railMax, true);
+    for (const auto& mark : run->marks) {
+        for (const float displayPosition : displayPositions(mark.position)) {
+            if (!invisible_places::timing::TimelinePositionIsInView(
+                    viewRange,
+                    displayPosition,
+                    1.0e-4F)) {
+                continue;
+            }
+            const float x = xForPosition(displayPosition);
+            const bool selected = selectionMatches(mark.id);
+            const ImU32 colour = selected
+                ? IM_COL32(255, 222, 116, 255)
+                : IM_COL32(230, 195, 105, 205);
+            drawList->AddLine(
+                ImVec2{x, railMin.y + 2.0F},
+                ImVec2{x, railMax.y - 2.0F},
+                colour,
+                selected ? 2.0F : 1.0F);
+            drawList->AddTriangleFilled(
+                ImVec2{x, railMin.y + 2.0F},
+                ImVec2{x - 4.0F, railMin.y + 8.0F},
+                ImVec2{x + 4.0F, railMin.y + 8.0F},
+                colour);
+            drawList->AddText(
+                ImVec2{x + 5.0F, railMin.y + 9.0F},
+                selected ? ImGui::GetColorU32(ImGuiCol_Text)
+                         : ImGui::GetColorU32(ImGuiCol_TextDisabled),
+                mark.text.c_str());
+        }
+    }
+    drawList->PopClipRect();
+
+    const double now = ImGui::GetTime();
+    if (hoveredMark.has_value() && !dragMatches()) {
+        timings.waterRunMarkHelpHover = WaterRunMarkHelpHoverState{
+            .surfaceId = id,
+            .scenarioId = scenarioId,
+            .sceneGroupName = sceneGroupName,
+            .runId = run->id,
+            .markId = hoveredMark->id,
+            .visibleUntil = now + kHelpHoverGraceSeconds,
+        };
+    }
+    bool helpHovered = false;
+    const bool helpMatches = timings.waterRunMarkHelpHover.has_value() &&
+        timings.waterRunMarkHelpHover->surfaceId == id &&
+        timings.waterRunMarkHelpHover->scenarioId == scenarioId &&
+        timings.waterRunMarkHelpHover->sceneGroupName == sceneGroupName &&
+        timings.waterRunMarkHelpHover->runId == run->id &&
+        invisible_places::water::FindWaterFeatureRunMark(
+            run,
+            timings.waterRunMarkHelpHover->markId) != nullptr;
+    if (helpMatches && !dragMatches()) {
+        auto& help = timings.waterRunMarkHelpHover.value();
+        helpHovered = ImGui::IsMouseHoveringRect(
+            helpMin,
+            helpMax,
+            /*clip=*/true);
+        if (helpHovered) {
+            help.visibleUntil = now + kHelpHoverGraceSeconds;
+        }
+        if (now <= help.visibleUntil) {
+            const ImVec2 centre{
+                0.5F * (helpMin.x + helpMax.x),
+                0.5F * (helpMin.y + helpMax.y)};
+            drawList->AddCircleFilled(
+                centre,
+                7.0F,
+                helpHovered ? IM_COL32(255, 255, 255, 48)
+                            : IM_COL32(255, 255, 255, 22));
+            drawList->AddCircle(
+                centre,
+                7.0F,
+                helpHovered ? IM_COL32(255, 255, 255, 180)
+                            : IM_COL32(255, 255, 255, 100));
+            const auto size = ImGui::CalcTextSize("?");
+            drawList->AddText(
+                ImVec2{centre.x - size.x * 0.5F,
+                       centre.y - size.y * 0.5F},
+                helpHovered ? ImGui::GetColorU32(ImGuiCol_Text)
+                            : ImGui::GetColorU32(ImGuiCol_TextDisabled),
+                "?");
+        } else {
+            timings.waterRunMarkHelpHover.reset();
+        }
+    }
+
+    if (helpHovered) {
+        ImGui::SetTooltip(
+            "Press M in Timings to add a mark at the current frame.\n"
+            "Click a mark to select it; drag to move it (Shift bypasses "
+            "playhead snapping).\nDouble-click to rename. Delete or "
+            "Backspace removes the selected mark. Cmd/Ctrl+Z toggles the "
+            "last mark edit.");
+    } else if (hoveredMark.has_value() && !dragMatches()) {
+        const auto* mark = invisible_places::water::FindWaterFeatureRunMark(
+            run,
+            hoveredMark->id);
+        if (mark != nullptr) {
+            if (cameraDomain) {
+                ImGui::SetTooltip(
+                    "%s\nLoop position %.3f (%.2f s in this animation)",
+                    mark->text.c_str(),
+                    mark->position,
+                    hoveredMark->displayPosition * durationSeconds);
+            } else {
+                ImGui::SetTooltip(
+                    "%s\nPosition %.3f (%.2f s)",
+                    mark->text.c_str(),
+                    mark->position,
+                    mark->position * durationSeconds);
+            }
+        }
+    }
+
+    const bool editMatches = timings.waterRunMarkEdit.has_value() &&
+        timings.waterRunMarkEdit->surfaceId == id &&
+        timings.waterRunMarkEdit->scenarioId == scenarioId &&
+        timings.waterRunMarkEdit->sceneGroupName == sceneGroupName &&
+        timings.waterRunMarkEdit->runId == run->id;
+    if (editMatches) {
+        bool clearEditState = false;
+        if (ImGui::BeginPopup("Edit Feature Run Mark")) {
+            auto& edit = timings.waterRunMarkEdit.value();
+            auto* mark = invisible_places::water::FindWaterFeatureRunMark(
+                run,
+                edit.markId);
+            if (mark == nullptr) {
+                ImGui::CloseCurrentPopup();
+                clearEditState = true;
+            } else {
+                ImGui::TextDisabled("Feature Run mark");
+                if (edit.requestKeyboardFocus) {
+                    ImGui::SetKeyboardFocusHere();
+                    edit.requestKeyboardFocus = false;
+                }
+                InputTextString("Text", &edit.draftText);
+                const bool valid = std::any_of(
+                    edit.draftText.begin(),
+                    edit.draftText.end(),
+                    [](unsigned char c) {
+                        return !std::isspace(c);
+                    });
+                ImGui::BeginDisabled(!valid);
+                if (ImGui::Button("Apply")) {
+                    BeginWaterKeyEditTransaction(runtimeState, scenarioId);
+                    if (invisible_places::water::RenameWaterFeatureRunMark(
+                            run,
+                            edit.markId,
+                            edit.draftText)) {
+                        MarkWaterKeyEditTransactionChanged(runtimeState);
+                        FinishWaterKeyEditTransaction(runtimeState);
+                        runtimeState->statusMessage =
+                            "Renamed Feature Run mark.";
+                        runtimeState->errorMessage.clear();
+                    } else {
+                        CancelWaterKeyEditTransaction(runtimeState);
+                    }
+                    ImGui::CloseCurrentPopup();
+                    clearEditState = true;
+                }
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                if (ImGui::Button("Cancel")) {
+                    ImGui::CloseCurrentPopup();
+                    clearEditState = true;
+                }
+            }
+            ImGui::EndPopup();
+        } else if (!ImGui::IsPopupOpen("Edit Feature Run Mark")) {
+            // Escape, a click outside the popup, or a context switch must not
+            // leave an edit armed for another scene that reuses the IDs.
+            clearEditState = true;
+        }
+        if (clearEditState) {
+            timings.waterRunMarkEdit.reset();
+        }
+    }
+    ImGui::PopID();
+}
+
 // The per-feature timeline embedded at the top of a water sub-tab: the same
 // editor as the Timings-tab Split Graphs view, drawn for the one feature the
 // panel is focused on. Draws nothing when no animation is loaded or the
@@ -87439,6 +88110,12 @@ void DrawEmbeddedWaterFeatureTimeline(
     ImGui::PushID(static_cast<int>(feature.kind));
     ImGui::PushID(static_cast<int>(feature.objectId));
     ImGui::TextDisabled("Timeline — run \"%s\"", run->name.c_str());
+    DrawWaterFeatureRunMarkStrip(
+        "##WaterFeatureEmbeddedMarks",
+        runtimeState,
+        scenarioId,
+        run,
+        durationSeconds);
     if (runtimeState->timingsPanel.waterRunClipsLane) {
         // The same clips lane as the Timings tab, reduced to this feature's
         // row, so a clip can be offset or stretched right where its
@@ -87548,15 +88225,19 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                 run.name + " (" + std::to_string(run.features.size()) +
                 (run.features.size() == 1U ? " feature, " : " features, ") +
                 std::to_string(keyCount) +
-                (keyCount == 1U ? " key)" : " keys)");
+                (keyCount == 1U ? " key, " : " keys, ") +
+                std::to_string(run.marks.size()) +
+                (run.marks.size() == 1U ? " mark)" : " marks)");
             if (!run.enabled) {
                 ImGui::PushStyleColor(
                     ImGuiCol_Text,
                     ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
             }
             if (ImGui::Selectable(label.c_str(), selected)) {
+                ClearTimingColouriseEditorFocus(runtimeState);
                 timings.selectedFeatureRunIndex = index;
                 timings.pendingRunDeleteIndex.reset();
+                timings.waterRunMarkSelection.reset();
             }
             if (!run.enabled) {
                 ImGui::PopStyleColor();
@@ -87566,6 +88247,7 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
         InputTextString("New Run Name", &timings.newFeatureRunNameBuffer);
         ImGui::SameLine();
         if (ImGui::Button("New Run")) {
+            ClearTimingColouriseEditorFocus(runtimeState);
             WaterFeatureTimingRun run;
             run.id = entry.waterFeatureTimingRunSequence++;
             run.name = timings.newFeatureRunNameBuffer.empty()
@@ -87574,6 +88256,7 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
             entry.waterFeatureTimingRuns.push_back(std::move(run));
             timings.selectedFeatureRunIndex =
                 entry.waterFeatureTimingRuns.size() - 1U;
+            timings.waterRunMarkSelection.reset();
             timings.newFeatureRunNameBuffer.clear();
         }
 
@@ -87599,6 +88282,10 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                             timings.selectedFeatureRunIndex.value()));
                     timings.selectedFeatureRunIndex.reset();
                     timings.pendingRunDeleteIndex.reset();
+                    timings.waterRunMarkSelection.reset();
+                    timings.waterRunMarkDrag.reset();
+                    timings.waterRunMarkEdit.reset();
+                    timings.waterRunMarkHelpHover.reset();
                 } else {
                     timings.pendingRunDeleteIndex =
                         timings.selectedFeatureRunIndex;
@@ -87980,6 +88667,12 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                     timelineViewRange.start,
                     timelineViewRange.end);
             }
+            DrawWaterFeatureRunMarkStrip(
+                "##WaterRunMarks",
+                runtimeState,
+                scenarioId,
+                &run,
+                durationSeconds);
             std::vector<std::size_t> visibleFeatures;
             for (std::size_t featureIndex = 0U;
                  featureIndex < run.features.size();
@@ -94988,6 +95681,7 @@ void DrawTimingColouriseActivationOverview(
         invisible_places::renderer::pointcloud::
             kTimingColouriseMaxEffects;
     const auto selectEffect = [&](std::size_t index) {
+        ClearWaterFeatureRunEditorFocus(runtimeState);
         timings.selectedColouriseEffectIndex = index;
         timings.selectedColourisePaletteStopIndex =
             TimingEffectIsEmissive((*effects)[index])
@@ -95659,6 +96353,7 @@ void DrawTimingColouriseSection(
         if (index >= effects.size()) {
             return;
         }
+        ClearWaterFeatureRunEditorFocus(runtimeState);
         timings.selectedColouriseEffectIndex = index;
         timings.selectedColourisePaletteStopIndex =
             TimingEffectIsEmissive(effects[index])
@@ -98087,6 +98782,14 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
         std::max(0.0F, AnimationDurationSeconds(panel.currentPath.value()));
     const std::string timeLabel =
         FormatFixed(panel.scrubAmount * durationSeconds, 1) + "s";
+    // Leave one in-bounds, non-interactive gutter beside the global time
+    // surface. A hovered Feature Run mark can expose its contextual '?' here
+    // without changing the bar/marker/curve X mapping.
+    constexpr float kGlobalTimingHelpGutterWidth = 22.0F;
+    const float globalBarWidth = std::max(
+        110.0F,
+        ImGui::GetContentRegionAvail().x -
+            kGlobalTimingHelpGutterWidth);
     const bool scrubChanged = DrawRangedFloatControl(
         "GlobalAnimationPosition",
         &panel.scrubAmount,
@@ -98096,7 +98799,8 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
          .showLabel = false,
          .scaleDragToWidth = true,
          .hardMin = 0.0F,
-         .hardMax = 1.0F});
+         .hardMax = 1.0F,
+         .width = globalBarWidth});
     const ImVec2 barMin = ImGui::GetItemRectMin();
     const ImVec2 barMax = ImGui::GetItemRectMax();
     if (scrubChanged) {
@@ -98105,27 +98809,25 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
 
     invisible_places::timing::TimingColouriseEffect*
         colouriseEffect = nullptr;
+    const auto activeScenarioId =
+        ActiveWaterTimingScenarioId(*runtimeState);
+    auto* activeTimingState =
+        invisible_places::timing::FindTimingTakeSceneState(
+            &runtimeState->water.timingTakeSceneStates,
+            activeScenarioId,
+            ActiveWaterTimingSceneGroupName(runtimeState->water));
     if (runtimeState->activeControlsTab ==
             ControlsTab::Timings &&
         runtimeState->timingsPanel
             .selectedColouriseEffectIndex.has_value()) {
-        auto* timingState =
-            invisible_places::timing::
-                FindTimingTakeSceneState(
-                    &runtimeState->water
-                         .timingTakeSceneStates,
-                    ActiveWaterTimingScenarioId(
-                        *runtimeState),
-                    ActiveWaterTimingSceneGroupName(
-                        runtimeState->water));
         const auto selected =
             runtimeState->timingsPanel
                 .selectedColouriseEffectIndex.value();
-        if (timingState != nullptr &&
+        if (activeTimingState != nullptr &&
             selected <
-                timingState->colouriseEffects.size()) {
+                activeTimingState->colouriseEffects.size()) {
             colouriseEffect =
-                &timingState->colouriseEffects[selected];
+                &activeTimingState->colouriseEffects[selected];
             ImGui::BeginDisabled(renderSetupReadOnly);
             DrawTimingColouriseGlobalMarkerLanes(
                 runtimeState,
@@ -98139,6 +98841,15 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
         runtimeState->water.activeKeyingFeature;
     const invisible_places::water::WaterFeatureTimingRun* run = nullptr;
     const invisible_places::water::WaterFeatureTimeline* timeline = nullptr;
+    invisible_places::water::WaterFeatureTimingRun* marksRun = nullptr;
+    if (activeTimingState != nullptr &&
+        runtimeState->activeControlsTab == ControlsTab::Timings &&
+        runtimeState->timingsPanel.selectedFeatureRunIndex.has_value() &&
+        runtimeState->timingsPanel.selectedFeatureRunIndex.value() <
+            activeTimingState->waterFeatureTimingRuns.size()) {
+        marksRun = &activeTimingState->waterFeatureTimingRuns[
+            runtimeState->timingsPanel.selectedFeatureRunIndex.value()];
+    }
     if (colouriseEffect == nullptr &&
         runtimeState->activeControlsTab !=
             ControlsTab::Timings &&
@@ -98156,6 +98867,18 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
                     run,
                     feature.value());
             if (run != nullptr && timeline != nullptr) {
+                if (activeTimingState != nullptr) {
+                    const auto mutableRun = std::find_if(
+                        activeTimingState->waterFeatureTimingRuns.begin(),
+                        activeTimingState->waterFeatureTimingRuns.end(),
+                        [&](const auto& candidate) {
+                            return candidate.id == run->id;
+                        });
+                    if (mutableRun !=
+                        activeTimingState->waterFeatureTimingRuns.end()) {
+                        marksRun = &*mutableRun;
+                    }
+                }
                 ImGui::BeginDisabled(renderSetupReadOnly);
                 DrawWaterKeyMarkerStrip(
                     runtimeState,
@@ -98166,6 +98889,21 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
                 ImGui::EndDisabled();
             }
         }
+    }
+    if (marksRun != nullptr && !marksRun->marks.empty()) {
+        const float markerOffset = timeline != nullptr ? 13.0F : 2.0F;
+        ImGui::BeginDisabled(renderSetupReadOnly);
+        DrawWaterFeatureRunMarkStrip(
+            "##GlobalFeatureRunMarks",
+            runtimeState,
+            activeScenarioId,
+            marksRun,
+            durationSeconds,
+            /*cameraDomain=*/true,
+            std::pair{
+                ImVec2{barMin.x, barMax.y + markerOffset},
+                std::max(1.0F, barMax.x - barMin.x)});
+        ImGui::EndDisabled();
     }
 
     DrawAnimationTimelineViewRangeSelector(
@@ -99057,8 +99795,10 @@ void DrawControlsWindow(
         !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
         FinishWaterKeyEditTransaction(runtimeState);
     }
-    if (!renderSetupReadOnly) {
+    if (!renderSetupReadOnly && !liveCameraEditActive &&
+        !reciprocalPanWizardActive) {
         (void)HandleWaterKeyEditUndoShortcut(runtimeState);
+        (void)HandleWaterFeatureRunMarkShortcuts(runtimeState);
     }
 
     sidePanel.interacting =

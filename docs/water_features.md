@@ -32,7 +32,7 @@ Implemented in the current repository:
 - Active Water tabs are Shoreline, Seepage, Rain, and Flow. Ripples, Mesh Flow,
   and Field are hidden by default behind `+`; when opened they are labelled
   inactive and every setting is disabled/greyed.
-- Project schema `78`, standalone water-source schema `31`, animation schema `24`, nested Rain settings version `3`, and shared-surface binary schema `4`, with authoritative scene density groups, explicit active water-scene ownership, compact cache manifests, manual Flow spline sources, global/per-source Flow-trail visibility, connected Seepage support and live dimensions, reusable per-node Settings/Look/Response profiles, per-node reach/width/prominence/wetting keys, reusable Rain profiles and Timing Take assignments, Rain near-surface/ROCK/VEG tuning, independent delayed Seepage and Mesh Flow Rain response, keyed Rain/Flow/Shoreline/Mesh Flow levels, reusable water timing runs, per-key manual spline handles, overlapping per-feature settings clips with explicit key ownership, length-recording keyed-settings packages, a shared cyclic Timing Take for reciprocal animations, a Water-owned list of up to five profile-backed Shoreline effects, per-node manual-path lane covers, v2 Ripple/Flow/Field settings, reversible paired loop-end smoothing, phase-keyed linked loops, and legacy migration.
+- Project schema `79`, standalone water-source schema `31`, animation schema `24`, nested Rain settings version `3`, and shared-surface binary schema `4`, with authoritative scene density groups, explicit active water-scene ownership, compact cache manifests, manual Flow spline sources, global/per-source Flow-trail visibility, connected Seepage support and live dimensions, reusable per-node Settings/Look/Response profiles, per-node reach/width/prominence/wetting keys, reusable Rain profiles and Timing Take assignments, Rain near-surface/ROCK/VEG tuning, independent delayed Seepage and Mesh Flow Rain response, keyed Rain/Flow/Shoreline/Mesh Flow levels, reusable water timing runs and run-owned event marks, per-key manual spline handles, overlapping per-feature settings clips with explicit key ownership, length-recording keyed-settings packages, a shared cyclic Timing Take for reciprocal animations, a Water-owned list of up to five profile-backed Shoreline effects, per-node manual-path lane covers, v2 Ripple/Flow/Field settings, reversible paired loop-end smoothing, phase-keyed linked loops, and legacy migration.
 - Ripple `WaterEffectLayer` records and distinct shader/offline procedural patterns for all `WaterRippleOverlayType` values.
 - SAND-role shader Shoreline waves with `Foam Fronts (Current)`, `Bay Waves` (stored internally as Continuous Bands), and `Height Foam` algorithms. Bay Waves shares the Foam Fronts controls and foam character but plays a bay beach that never goes quiet: two to four overlapping fronts on smooth staggered cycles jostle through the deeper water while a slow per-front vigour swell sends some crashing beside the waterline — washing into the upper run-in share of the reach — and lets others dissolve mid-band. Height Foam has an independent tuning bank and adds absolute run-up and break elevations, persistent offshore foam, incoming gather strength, and fading return strength while retaining the shared wave and response controls.
 - Visible-depth/cache Seepage placement and editing with connected downhill support selected from the shared 10 mm authored-role cache, ROCK/VEG/SAND role targeting, shared and node-owned Settings/Look/Response profiles, Wetting Trickle, rain-responsive dampness, compact sparse hashes, and topology-versus-frame-safe-parameter GPU upload separation.
@@ -144,6 +144,15 @@ allow the project or a changed animation to be deselected from those two
 workflows.
 
 Water key authoring keeps one atomic edit of session history. **Ctrl+Z** on Windows/Linux or **Cmd+Z** on macOS restores the state before the latest key, keyed-setting, or settings-clip edit; pressing the same shortcut again reapplies it. A complete slider, key, spline-handle, or clip drag is one edit. When a text or numeric input is focused, the shortcut remains the input field's native text undo instead.
+
+Feature Runs also own short event marks shared by every feature in the run.
+With a run selected in Timings, **M** inserts `Mark 00`, `Mark 01`, and so on
+at the current frame. One mark rail appears in Timings and on each focused
+Water feature in that run; the same marks project onto Global Animation
+Position, including each visible occurrence of a linked-loop phase. Click to
+select, drag to move, double-click to rename, and Delete/Backspace to remove.
+The contextual `?` beside the rail contains the interaction guide so the mark
+body hover shows only its text and timing.
 
 ## Serialization Contract
 
