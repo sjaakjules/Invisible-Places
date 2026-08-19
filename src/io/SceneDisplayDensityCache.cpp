@@ -46,6 +46,24 @@ constexpr std::array<std::string_view, 3U> kRequiredRoles{
     "VEG",
 };
 
+[[nodiscard]] bool IsSupportedLivePositionPolicy(
+    std::string_view algorithmId,
+    std::uint64_t algorithmVersion,
+    std::string_view positionPolicy) {
+    if (algorithmId != kSceneDisplayDensityCacheAlgorithmId) {
+        return false;
+    }
+    const bool legacyStableHash =
+        algorithmVersion == kSceneDisplayDensityCacheLegacyAlgorithmVersion &&
+        positionPolicy == kSceneDisplayDensityCacheLegacyPositionPolicy;
+    const bool q1CentroidMedoid =
+        algorithmVersion ==
+            kSceneDisplayDensityCacheQ1CentroidMedoidAlgorithmVersion &&
+        positionPolicy ==
+            kSceneDisplayDensityCacheQ1CentroidMedoidPositionPolicy;
+    return legacyStableHash || q1CentroidMedoid;
+}
+
 std::mutex gPayloadOverridesMutex;
 std::map<std::string, std::filesystem::path> gPayloadOverrides;
 std::string gActiveBundleFingerprint;
@@ -666,9 +684,7 @@ SceneDisplayDensityCacheActivation ActivateScene3DisplayDensityCacheImpl(
     std::string continuousFilter;
     if (algorithmIt == manifest->end() || !algorithmIt->is_object() ||
         !ReadString(*algorithmIt, "id", &result.algorithmId) ||
-        result.algorithmId != kSceneDisplayDensityCacheAlgorithmId ||
         !ReadUnsigned(*algorithmIt, "version", &algorithmVersion) ||
-        algorithmVersion != 1U ||
         !ReadString(*algorithmIt, "seed_hex", &seedHex) ||
         !IsHexString(seedHex, 16U) ||
         !ReadDouble(*algorithmIt, "voxel_size_m", &voxelSizeMeters) ||
@@ -678,7 +694,6 @@ SceneDisplayDensityCacheActivation ActivateScene3DisplayDensityCacheImpl(
         !ReadString(*algorithmIt, "apportionment", &apportionment) ||
         apportionment != "seeded-systematic-parent-population" ||
         !ReadString(*algorithmIt, "position_policy", &positionPolicy) ||
-        positionPolicy != "real-parent-stable-hash" ||
         !ReadString(*algorithmIt, "cell_grid_offset", &cellGridOffset) ||
         cellGridOffset != "half-voxel-xyz" ||
         !ReadString(*algorithmIt, "normal_filter", &normalFilter) ||
@@ -690,7 +705,11 @@ SceneDisplayDensityCacheActivation ActivateScene3DisplayDensityCacheImpl(
             &categoricalFilter) ||
         categoricalFilter != "scanid-mode-low-value-tie" ||
         !ReadString(*algorithmIt, "continuous_filter", &continuousFilter) ||
-        continuousFilter != "finite-arithmetic-mean") {
+        continuousFilter != "finite-arithmetic-mean" ||
+        !IsSupportedLivePositionPolicy(
+            result.algorithmId,
+            algorithmVersion,
+            positionPolicy)) {
         return Reject(
             std::move(result),
             "Bundle algorithm or prefilter policy is unsupported for live 1 mm render parity.");

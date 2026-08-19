@@ -25,6 +25,10 @@
 
 namespace {
 
+constexpr std::uint64_t kGeneratorQ1CentroidAlgorithmVersion = 2U;
+constexpr std::string_view kGeneratorQ1CentroidPositionPolicy =
+    "real-parent-q1-centroid-medoid-qN-stable-hash";
+
 class TemporaryDirectory {
   public:
     TemporaryDirectory() {
@@ -127,7 +131,14 @@ struct SyntheticBundle {
 
 SyntheticBundle WriteSyntheticBundle(
     const std::filesystem::path& root,
-    std::string_view rgbFilter = "renderer-byte-mean") {
+    std::string_view rgbFilter = "renderer-byte-mean",
+    std::uint64_t algorithmVersion =
+        invisible_places::io::
+            kSceneDisplayDensityCacheLegacyAlgorithmVersion,
+    std::string_view positionPolicy =
+        invisible_places::io::
+            kSceneDisplayDensityCacheLegacyPositionPolicy,
+    double voxelSizeMeters = 0.005) {
     constexpr std::array<std::string_view, 3U> roles{
         "ROCK",
         "SAND",
@@ -142,12 +153,12 @@ SyntheticBundle WriteSyntheticBundle(
     const nlohmann::json algorithm{
         {"id",
          invisible_places::io::kSceneDisplayDensityCacheAlgorithmId},
-        {"version", 1U},
+        {"version", algorithmVersion},
         {"seed_hex", "0000000000001234"},
-        {"voxel_size_m", 0.005},
+        {"voxel_size_m", voxelSizeMeters},
         {"rgb_filter", rgbFilter},
         {"apportionment", "seeded-systematic-parent-population"},
-        {"position_policy", "real-parent-stable-hash"},
+        {"position_policy", positionPolicy},
         {"cell_grid_offset", "half-voxel-xyz"},
         {"normal_filter",
          "hemisphere-aligned-normalized-mean-cosine-gate-0.5"},
@@ -369,6 +380,79 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Scene3 display-density cache accepts the exact q1 centroid-medoid policy",
+    "[pointcloud][density][cache]") {
+    TemporaryDirectory temporary;
+    const auto bundle = WriteSyntheticBundle(
+        temporary.path,
+        "renderer-byte-mean",
+        kGeneratorQ1CentroidAlgorithmVersion,
+        kGeneratorQ1CentroidPositionPolicy);
+    auto catalog = invisible_places::io::DiscoverAssets(bundle.dataRoot);
+
+    const auto activation =
+        invisible_places::io::ActivateScene3DisplayDensityCache(
+            bundle.cacheRoot,
+            &catalog);
+    INFO(activation.message);
+    REQUIRE(activation.Activated());
+    CHECK(activation.bundleFingerprint == bundle.fingerprint);
+    CHECK(
+        invisible_places::io::ActiveSceneDisplayDensityBundleFingerprint() ==
+        bundle.fingerprint);
+}
+
+TEST_CASE(
+    "Scene3 display-density cache rejects crossed or unknown position policies",
+    "[pointcloud][density][cache]") {
+    struct UnsupportedPolicy {
+        std::uint64_t version;
+        std::string_view positionPolicy;
+    };
+    constexpr std::array<UnsupportedPolicy, 4U> unsupportedPolicies{
+        UnsupportedPolicy{
+            invisible_places::io::
+                kSceneDisplayDensityCacheLegacyAlgorithmVersion,
+            kGeneratorQ1CentroidPositionPolicy},
+        UnsupportedPolicy{
+            kGeneratorQ1CentroidAlgorithmVersion,
+            invisible_places::io::
+                kSceneDisplayDensityCacheLegacyPositionPolicy},
+        UnsupportedPolicy{
+            kGeneratorQ1CentroidAlgorithmVersion,
+            "real-parent-q1-centroid-medoid-qN-stable-hash-unknown"},
+        UnsupportedPolicy{
+            3U,
+            kGeneratorQ1CentroidPositionPolicy},
+    };
+
+    TemporaryDirectory temporary;
+    for (std::size_t index = 0U; index < unsupportedPolicies.size(); ++index) {
+        const auto& policy = unsupportedPolicies[index];
+        const auto bundle = WriteSyntheticBundle(
+            temporary.path / std::to_string(index),
+            "renderer-byte-mean",
+            policy.version,
+            policy.positionPolicy);
+        auto catalog = invisible_places::io::DiscoverAssets(bundle.dataRoot);
+
+        const auto activation =
+            invisible_places::io::ActivateScene3DisplayDensityCache(
+                bundle.cacheRoot,
+                &catalog);
+        INFO("version " << policy.version << ", policy "
+                        << policy.positionPolicy);
+        CHECK_FALSE(activation.Activated());
+        CHECK(
+            activation.state ==
+            invisible_places::io::SceneDisplayDensityCacheState::Rejected);
+        CHECK(
+            activation.message.find("prefilter policy") !=
+            std::string::npos);
+    }
+}
+
+TEST_CASE(
     "Scene3 display-density cache rejects one stale role without partial overlay",
     "[pointcloud][density][cache]") {
     TemporaryDirectory temporary;
@@ -517,8 +601,11 @@ TEST_CASE(
     "Scene3 live cache rejects the experimental linear-light child",
     "[pointcloud][density][cache]") {
     TemporaryDirectory temporary;
-    const auto bundle =
-        WriteSyntheticBundle(temporary.path, "srgb-linear-light");
+    const auto bundle = WriteSyntheticBundle(
+        temporary.path,
+        "srgb-linear-light",
+        kGeneratorQ1CentroidAlgorithmVersion,
+        kGeneratorQ1CentroidPositionPolicy);
     auto catalog = invisible_places::io::DiscoverAssets(bundle.dataRoot);
 
     const auto activation =
@@ -531,6 +618,31 @@ TEST_CASE(
         invisible_places::io::SceneDisplayDensityCacheState::Rejected);
     CHECK(
         activation.message.find("prefilter policy") != std::string::npos);
+}
+
+TEST_CASE(
+    "Scene3 live cache rejects a refined child built on a non-5mm grid",
+    "[pointcloud][density][cache]") {
+    TemporaryDirectory temporary;
+    const auto bundle = WriteSyntheticBundle(
+        temporary.path,
+        "renderer-byte-mean",
+        kGeneratorQ1CentroidAlgorithmVersion,
+        kGeneratorQ1CentroidPositionPolicy,
+        0.004);
+    auto catalog = invisible_places::io::DiscoverAssets(bundle.dataRoot);
+
+    const auto activation =
+        invisible_places::io::ActivateScene3DisplayDensityCache(
+            bundle.cacheRoot,
+            &catalog);
+    CHECK_FALSE(activation.Activated());
+    CHECK(
+        activation.state ==
+        invisible_places::io::SceneDisplayDensityCacheState::Rejected);
+    CHECK(
+        activation.message.find("prefilter policy") !=
+        std::string::npos);
 }
 
 TEST_CASE(

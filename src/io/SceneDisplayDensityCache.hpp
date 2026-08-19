@@ -14,6 +14,15 @@ namespace invisible_places::io {
 inline constexpr std::uint32_t kSceneDisplayDensityCacheSchemaVersion = 1U;
 inline constexpr std::string_view kSceneDisplayDensityCacheAlgorithmId =
     "scene-display-density-stratified-prefilter-v1";
+inline constexpr std::uint64_t
+    kSceneDisplayDensityCacheLegacyAlgorithmVersion = 1U;
+inline constexpr std::string_view kSceneDisplayDensityCacheLegacyPositionPolicy =
+    "real-parent-stable-hash";
+inline constexpr std::uint64_t
+    kSceneDisplayDensityCacheQ1CentroidMedoidAlgorithmVersion = 2U;
+inline constexpr std::string_view
+    kSceneDisplayDensityCacheQ1CentroidMedoidPositionPolicy =
+        "real-parent-q1-centroid-medoid-qN-stable-hash";
 
 enum class SceneDisplayDensityCacheState : std::uint8_t {
     Unavailable = 0,
