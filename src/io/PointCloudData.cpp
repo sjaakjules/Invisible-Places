@@ -1,6 +1,7 @@
 #include "io/PointCloudData.hpp"
 
 #include "io/PlyHeader.hpp"
+#include "io/SceneDisplayDensityCache.hpp"
 
 #include <algorithm>
 #include <array>
@@ -453,7 +454,9 @@ PointCloudLoadResult LoadPointCloud(
     const std::filesystem::path& filePath,
     const PointCloudScalarFieldFilter& fieldFilter,
     unsigned threadCount) {
-    const auto headerResult = ParsePlyHeader(filePath);
+    const auto payloadPath =
+        ResolveSceneDisplayDensityPayloadPath(filePath);
+    const auto headerResult = ParsePlyHeader(payloadPath);
     if (!headerResult.success) {
         return {.errorMessage = headerResult.errorMessage, .success = false};
     }
@@ -469,7 +472,7 @@ PointCloudLoadResult LoadPointCloud(
         return {.errorMessage = layoutError, .success = false};
     }
 
-    std::ifstream input{filePath, std::ios::binary};
+    std::ifstream input{payloadPath, std::ios::binary};
     if (!input.is_open()) {
         return {.errorMessage = "Unable to open point cloud file.", .success = false};
     }
@@ -580,7 +583,7 @@ PointCloudLoadResult LoadPointCloud(
                                 std::uint64_t rangeEnd,
                                 RangeParseOutput* out) {
         out->fieldStats.resize(cloud.scalarFields.size());
-        std::ifstream rangeInput{filePath, std::ios::binary};
+        std::ifstream rangeInput{payloadPath, std::ios::binary};
         if (!rangeInput.is_open()) {
             out->errorMessage = "Unable to open point cloud file.";
             return;
@@ -761,7 +764,9 @@ PointCloudLoadResult LoadPointCloud(
 PointCloudStreamResult StreamPointCloudPositionsNormals(
     const std::filesystem::path& filePath,
     const PointCloudPositionNormalVisitor& visitor) {
-    const auto headerResult = ParsePlyHeader(filePath);
+    const auto payloadPath =
+        ResolveSceneDisplayDensityPayloadPath(filePath);
+    const auto headerResult = ParsePlyHeader(payloadPath);
     if (!headerResult.success) {
         return {.errorMessage = headerResult.errorMessage};
     }
@@ -777,7 +782,7 @@ PointCloudStreamResult StreamPointCloudPositionsNormals(
         return {.errorMessage = layoutError};
     }
 
-    std::ifstream input{filePath, std::ios::binary};
+    std::ifstream input{payloadPath, std::ios::binary};
     if (!input.is_open()) {
         return {.errorMessage = "Unable to open point cloud file."};
     }
@@ -872,7 +877,9 @@ PointCloudSelectedValueStreamResult StreamPointCloudSelectedValues(
         };
     }
 
-    const auto headerResult = ParsePlyHeader(filePath);
+    const auto payloadPath =
+        ResolveSceneDisplayDensityPayloadPath(filePath);
+    const auto headerResult = ParsePlyHeader(payloadPath);
     if (!headerResult.success) {
         return {.errorMessage = headerResult.errorMessage};
     }
@@ -944,7 +951,7 @@ PointCloudSelectedValueStreamResult StreamPointCloudSelectedValues(
         };
     }
 
-    std::ifstream input{filePath, std::ios::binary};
+    std::ifstream input{payloadPath, std::ios::binary};
     if (!input.is_open()) {
         return {.errorMessage = "Unable to open point cloud file."};
     }

@@ -37,6 +37,7 @@
 #include "app/ScalarFieldResidencyPolicy.hpp"
 #include "app/UsedScalarFields.hpp"
 #include "io/PointCloudFieldCache.hpp"
+#include "io/SceneDisplayDensityCache.hpp"
 
 #ifdef __APPLE__
 #include <pthread/qos.h>
@@ -5328,6 +5329,42 @@ invisible_places::io::AssetCatalog DiscoverApplicationAssets(
     const std::filesystem::path& primaryDataRoot) {
     auto catalog = invisible_places::io::DiscoverAssets(primaryDataRoot);
     const auto localDataRoot = Application::DefaultDataDirectory();
+    const auto displayDensityCacheRoot =
+        invisible_places::app::workspace::LocalSavedDirectory(localDataRoot) /
+        ".invisible_places" / "cache" / "display_density" / "Scene3";
+    invisible_places::io::SceneDisplayDensityCacheActivation
+        displayDensityCache;
+    if (const char* disabled =
+            std::getenv("INVISIBLE_PLACES_DISABLE_DISPLAY_DENSITY_CACHE");
+        disabled != nullptr && std::string_view{disabled} == "1") {
+        invisible_places::io::ClearSceneDisplayDensityCacheActivation();
+        displayDensityCache.state =
+            invisible_places::io::SceneDisplayDensityCacheState::Unavailable;
+        displayDensityCache.message =
+            "Disabled by INVISIBLE_PLACES_DISABLE_DISPLAY_DENSITY_CACHE=1; using shared 5 mm files.";
+    } else {
+        displayDensityCache =
+            invisible_places::io::ActivateScene3DisplayDensityCache(
+                displayDensityCacheRoot,
+                &catalog);
+    }
+    if (displayDensityCache.state ==
+        invisible_places::io::SceneDisplayDensityCacheState::Rejected) {
+        std::cerr << "Scene3 display-density cache rejected: "
+                  << displayDensityCache.message << '\n';
+    } else {
+        std::cout << "Scene3 display-density cache: "
+                  << displayDensityCache.message << '\n';
+    }
+    if (displayDensityCache.Activated()) {
+        for (const auto& role : displayDensityCache.roles) {
+            std::cout << "  " << role.role << ": "
+                      << role.logicalDisplayPath.filename().string()
+                      << " -> " << role.cachedDisplayPath.generic_string()
+                      << " (" << role.outputPointCount << " points, sha256 "
+                      << role.outputSha256.substr(0U, 12U) << "...)\n";
+        }
+    }
     if (primaryDataRoot.lexically_normal() == localDataRoot.lexically_normal()) {
         return catalog;
     }
@@ -110157,12 +110194,14 @@ nlohmann::json BundleJson(const BundleObservation& bundle) {
     for (const auto& role : bundle.roles) {
         std::error_code metadataError;
         const auto sizeBytes =
-            std::filesystem::file_size(role.sourcePath, metadataError);
+            std::filesystem::file_size(
+                role.resolvedSourcePath,
+                metadataError);
         const auto modificationTime = metadataError
             ? std::int64_t{0}
             : static_cast<std::int64_t>(
                   std::filesystem::last_write_time(
-                      role.sourcePath,
+                      role.resolvedSourcePath,
                       metadataError)
                       .time_since_epoch()
                       .count());
@@ -110185,6 +110224,9 @@ nlohmann::json BundleJson(const BundleObservation& bundle) {
     return {
         {"spacing_micrometres", bundle.spacingMicrometres},
         {"total_point_count", bundle.totalPointCount},
+        {"display_density_bundle_fingerprint",
+         invisible_places::io::
+             ActiveSceneDisplayDensityBundleFingerprint()},
         {"roles", std::move(roles)},
     };
 }
@@ -110907,12 +110949,16 @@ int RunScene3DensityParitySmoke(
             const auto& session =
                 runtimeState->sessions[sessionIndex.value()];
             roleObservation.sourcePath = session.sourcePath;
+            const auto payloadPath =
+                invisible_places::io::
+                    ResolveSceneDisplayDensityPayloadPath(
+                        session.sourcePath);
             std::error_code pathError;
             roleObservation.resolvedSourcePath =
-                std::filesystem::canonical(session.sourcePath, pathError);
+                std::filesystem::canonical(payloadPath, pathError);
             if (pathError) {
                 roleObservation.resolvedSourcePath =
-                    session.sourcePath.lexically_normal();
+                    payloadPath.lexically_normal();
             }
             roleObservation.pointCount = session.totalPrimitives;
             observation.totalPointCount += session.totalPrimitives;

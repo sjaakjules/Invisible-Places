@@ -168,6 +168,7 @@ add_library(
     src/io/PointCloudData.cpp
     src/io/PointCloudFieldCache.cpp
     src/io/PlyHeader.cpp
+    src/io/SceneDisplayDensityCache.cpp
     src/io/TransformMatrix.cpp
     src/output/ExrWriter.cpp
     src/output/EyeDomeLighting.cpp
@@ -331,6 +332,7 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
             tests/PointDensityParityTests.cpp
             tests/PointCloudFieldCacheTests.cpp
             tests/PointCloudFieldResidencyTests.cpp
+            tests/SceneDisplayDensityCacheTests.cpp
             tests/PointCloudVariantsTests.cpp
             tests/PointVisualSelectionTests.cpp
             tests/ProcessMemoryTelemetryTests.cpp

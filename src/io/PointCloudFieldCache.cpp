@@ -1,5 +1,7 @@
 #include "io/PointCloudFieldCache.hpp"
 
+#include "io/SceneDisplayDensityCache.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <cctype>
@@ -443,7 +445,8 @@ void WriteCacheFromLoadedCloud(
 
 std::filesystem::path PointCloudFieldCacheDirectory(
     const std::filesystem::path& sourcePath) {
-    const auto normalized = sourcePath.lexically_normal();
+    const auto normalized =
+        ResolveSceneDisplayDensityPayloadPath(sourcePath).lexically_normal();
     const auto hash = Fnv1aHash(normalized.generic_string());
     char hashText[17];
     std::snprintf(hashText, sizeof(hashText), "%016llx",
@@ -465,7 +468,9 @@ void SetPointCloudFieldCacheRoot(
 std::optional<PointCloudFieldCacheManifest>
 LoadValidPointCloudFieldCacheManifest(
     const std::filesystem::path& sourcePath) {
-    const auto identity = StatSourceIdentity(sourcePath);
+    const auto payloadPath =
+        ResolveSceneDisplayDensityPayloadPath(sourcePath);
+    const auto identity = StatSourceIdentity(payloadPath);
     if (!identity.has_value()) {
         return std::nullopt;
     }
@@ -481,16 +486,20 @@ LoadValidPointCloudFieldCacheManifest(
 PointCloudLoadResult LoadPointCloudWithFieldCache(
     const std::filesystem::path& sourcePath,
     const PointCloudScalarFieldFilter& fieldFilter) {
-    const auto manifest = LoadValidPointCloudFieldCacheManifest(sourcePath);
+    const auto payloadPath =
+        ResolveSceneDisplayDensityPayloadPath(sourcePath);
+    const auto manifest = LoadValidPointCloudFieldCacheManifest(payloadPath);
     if (!manifest.has_value()) {
-        auto result = LoadPointCloud(sourcePath, fieldFilter);
+        auto result = LoadPointCloud(payloadPath, fieldFilter);
         if (result.success) {
-            WriteCacheFromLoadedCloud(sourcePath, result.cloud);
+            WriteCacheFromLoadedCloud(payloadPath, result.cloud);
+            result.cloud.sourcePath = sourcePath;
+            result.cloud.layerName = sourcePath.stem().string();
         }
         return result;
     }
 
-    const auto cacheDirectory = PointCloudFieldCacheDirectory(sourcePath);
+    const auto cacheDirectory = PointCloudFieldCacheDirectory(payloadPath);
     LoadedPointCloud cloud;
     cloud.sourcePath = sourcePath;
     cloud.layerName = sourcePath.stem().string();
@@ -503,9 +512,11 @@ PointCloudLoadResult LoadPointCloudWithFieldCache(
         // Geometry never cached (e.g. the cache was seeded by a lone
         // on-demand field write) or unreadable: take the PLY path, which
         // also repairs the cache.
-        auto result = LoadPointCloud(sourcePath, fieldFilter);
+        auto result = LoadPointCloud(payloadPath, fieldFilter);
         if (result.success) {
-            WriteCacheFromLoadedCloud(sourcePath, result.cloud);
+            WriteCacheFromLoadedCloud(payloadPath, result.cloud);
+            result.cloud.sourcePath = sourcePath;
+            result.cloud.layerName = sourcePath.stem().string();
         }
         return result;
     }
@@ -565,7 +576,7 @@ PointCloudLoadResult LoadPointCloudWithFieldCache(
         streamedStats.sourceIndex =
             static_cast<std::int32_t>(entry.sourceIndex);
         const auto streamResult = StreamPointCloudSelectedValues(
-            sourcePath,
+            payloadPath,
             {.source = PointCloudSelectedValueSource::ScalarField,
              .scalarFieldName = entry.name},
             [&](float value, std::uint64_t pointIndex) {
@@ -617,7 +628,9 @@ bool ReadPointCloudCachedField(
     std::string_view fieldName,
     std::span<float> values,
     ScalarFieldStats* stats) {
-    const auto manifest = LoadValidPointCloudFieldCacheManifest(sourcePath);
+    const auto payloadPath =
+        ResolveSceneDisplayDensityPayloadPath(sourcePath);
+    const auto manifest = LoadValidPointCloudFieldCacheManifest(payloadPath);
     if (!manifest.has_value() ||
         manifest->pointCount != values.size()) {
         return false;
@@ -628,7 +641,7 @@ bool ReadPointCloudCachedField(
         }
         if (!ReadExactFile(
                 FieldFilePath(
-                    PointCloudFieldCacheDirectory(sourcePath),
+                    PointCloudFieldCacheDirectory(payloadPath),
                     entry.sourceIndex,
                     entry.name),
                 values.data(),
@@ -653,11 +666,13 @@ bool WritePointCloudCachedField(
     if (stats.sourceIndex < 0 || stats.name.empty() || values.empty()) {
         return false;
     }
-    const auto identity = StatSourceIdentity(sourcePath);
+    const auto payloadPath =
+        ResolveSceneDisplayDensityPayloadPath(sourcePath);
+    const auto identity = StatSourceIdentity(payloadPath);
     if (!identity.has_value()) {
         return false;
     }
-    const auto cacheDirectory = PointCloudFieldCacheDirectory(sourcePath);
+    const auto cacheDirectory = PointCloudFieldCacheDirectory(payloadPath);
     std::error_code error;
     std::filesystem::create_directories(cacheDirectory, error);
     if (error) {
