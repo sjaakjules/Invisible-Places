@@ -13,7 +13,9 @@ count.  Seeded systematic rounding makes the total exactly ``K`` and avoids an
 occupancy-class cutoff.  Its per-cell rounding error is less than one output
 point; stable hashes define traversal without relying on dictionary iteration.
 Each non-empty stratum keeps one real parent position and prefilters the
-remaining attributes.
+remaining attributes.  A cell with one output uses the parent nearest its XYZ
+centroid (stable point hash breaks exact distance ties); cells with multiple
+outputs retain the original stable-hash stratum representatives.
 
 Peak RAM is bounded by one hash shard rather than the complete cloud.  The
 tradeoff is temporary disk approximately equal to the largest source role:
@@ -55,7 +57,8 @@ except ImportError as exc:  # pragma: no cover - exercised by the CLI host.
 
 SCHEMA_VERSION = 1
 ALGORITHM_ID = "scene-display-density-stratified-prefilter-v1"
-ALGORITHM_VERSION = 1
+ALGORITHM_VERSION = 2
+POSITION_POLICY = "real-parent-q1-centroid-medoid-qN-stable-hash"
 MANIFEST_NAME = "display-density-manifest.json"
 ACTIVE_POINTER_NAME = "active-bundle.json"
 DEFAULT_SEED = 0x4950565F53433331  # "IPV_SC31"
@@ -628,14 +631,26 @@ def _aggregate_sorted_groups(
     records: np.ndarray,
     starts: np.ndarray,
     rgb_filter: str,
+    position_indices: np.ndarray | None = None,
 ) -> np.ndarray:
     output = np.empty(starts.size, dtype=records.dtype)
     names = records.dtype.names or ()
     handled: set[str] = set()
 
     # A sampled child position is always a real canonical parent position.
+    if position_indices is None:
+        position_indices = starts
+    else:
+        position_indices = np.asarray(position_indices, dtype=np.int64)
+        if position_indices.shape != starts.shape:
+            raise RuntimeError("position representative count does not match groups")
+        ends = np.concatenate(
+            (starts[1:], np.asarray([records.size], dtype=np.int64))
+        )
+        if np.any(position_indices < starts) or np.any(position_indices >= ends):
+            raise RuntimeError("position representative escaped its source group")
     for name in ("x", "y", "z"):
-        output[name] = records[name][starts]
+        output[name] = records[name][position_indices]
         handled.add(name)
 
     rgb_names = ("red", "green", "blue")
@@ -711,6 +726,53 @@ def _aggregate_sorted_groups(
     return output
 
 
+def _quota_one_centroid_medoid_position_indices(
+    records: np.ndarray,
+    starts: np.ndarray,
+    quota_one_groups: np.ndarray,
+) -> np.ndarray:
+    """Choose real-parent centroid medoids only for quota-one groups.
+
+    ``records`` retain the shard's cell-then-stable-point-hash ordering.  The
+    first parent at the minimum squared XYZ distance is therefore the required
+    stable-hash tie break.  Non-quota-one groups deliberately keep their
+    existing first-in-stratum representative.
+    """
+
+    quota_one_groups = np.asarray(quota_one_groups, dtype=bool)
+    if quota_one_groups.shape != starts.shape:
+        raise RuntimeError("quota-one mask does not match output groups")
+    representatives = np.asarray(starts, dtype=np.int64).copy()
+    if starts.size == 0 or not np.any(quota_one_groups):
+        return representatives
+
+    group_counts = _counts_from_starts(starts, records.size).astype(np.int64)
+    group_for_record = np.repeat(
+        np.arange(starts.size, dtype=np.int64), group_counts
+    )
+    squared_distance = np.zeros(records.size, dtype=np.float64)
+    for name in ("x", "y", "z"):
+        values = records[name].astype(np.float64, copy=False)
+        centroids = np.add.reduceat(values, starts) / group_counts
+        delta = values - centroids[group_for_record]
+        squared_distance += delta * delta
+
+    minimum_distance = np.minimum.reduceat(squared_distance, starts)
+    candidate = quota_one_groups[group_for_record] & (
+        squared_distance == minimum_distance[group_for_record]
+    )
+    candidate_indices = np.flatnonzero(candidate).astype(np.int64, copy=False)
+    candidate_groups = group_for_record[candidate_indices]
+    first_for_group = np.empty(candidate_groups.size, dtype=bool)
+    first_for_group[0] = True
+    first_for_group[1:] = candidate_groups[1:] != candidate_groups[:-1]
+    selected_groups = candidate_groups[first_for_group]
+    if selected_groups.size != int(np.count_nonzero(quota_one_groups)):
+        raise RuntimeError("a quota-one group has no centroid-medoid parent")
+    representatives[selected_groups] = candidate_indices[first_for_group]
+    return representatives
+
+
 def _aggregate_shard(
     path: Path,
     description: PlyDescription,
@@ -756,10 +818,17 @@ def _aggregate_shard(
     )
     output_starts = np.flatnonzero(new_group).astype(np.int64, copy=False)
     kept_records = np.asarray(records[keep])
+    output_cells = kept_cells[output_starts]
+    position_indices = _quota_one_centroid_medoid_position_indices(
+        kept_records,
+        output_starts,
+        quotas[output_cells] == 1,
+    )
     output = _aggregate_sorted_groups(
         kept_records,
         output_starts,
         config.rgb_filter,
+        position_indices,
     )
     expected = int(np.sum(quotas, dtype=np.int64))
     if output.size != expected:
@@ -1171,7 +1240,7 @@ def build_cache(config: BuildConfig) -> Path:
                 "voxel_size_m": config.voxel_size_m,
                 "rgb_filter": config.rgb_filter,
                 "apportionment": "seeded-systematic-parent-population",
-                "position_policy": "real-parent-stable-hash",
+                "position_policy": POSITION_POLICY,
                 "cell_grid_offset": "half-voxel-xyz",
                 "normal_filter": (
                     "hemisphere-aligned-normalized-mean-cosine-gate-0.5"

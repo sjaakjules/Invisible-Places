@@ -156,9 +156,21 @@ class DisplayDensityCacheBuilderTests(unittest.TestCase):
                 (bundle_a / cache_builder.MANIFEST_NAME).read_text(encoding="utf-8")
             )
             self.assertTrue(manifest["complete"])
+            self.assertEqual(
+                manifest["schema_version"],
+                cache_builder.SCHEMA_VERSION,
+            )
             self.assertEqual(manifest["bundle_fingerprint"], bundle_a.name)
             self.assertEqual(
                 manifest["algorithm"]["id"], cache_builder.ALGORITHM_ID
+            )
+            self.assertEqual(
+                manifest["algorithm"]["version"],
+                cache_builder.ALGORITHM_VERSION,
+            )
+            self.assertEqual(
+                manifest["algorithm"]["position_policy"],
+                cache_builder.POSITION_POLICY,
             )
             self.assertEqual(
                 manifest["algorithm"]["rgb_filter"],
@@ -182,11 +194,19 @@ class DisplayDensityCacheBuilderTests(unittest.TestCase):
                 self.assertEqual(
                     role_record["output"]["sha256"], _sha256(output_a)
                 )
-                # Every sampled location is one of the actual parent positions.
-                child_x = set(_read_records(output_a)["x"].tolist())
-                parent_x = set(_fixture_records()["x"].tolist())
-                self.assertTrue(child_x.issubset(parent_x))
-                output_x = _read_records(output_a)["x"]
+                # Every sampled XYZ tuple is one actual parent, never a
+                # synthetic centroid assembled from independent axes.
+                output_records = _read_records(output_a)
+                child_xyz = {
+                    (float(point["x"]), float(point["y"]), float(point["z"]))
+                    for point in output_records
+                }
+                parent_xyz = {
+                    (float(point["x"]), float(point["y"]), float(point["z"]))
+                    for point in _fixture_records()
+                }
+                self.assertTrue(child_xyz.issubset(parent_xyz))
+                output_x = output_records["x"]
                 self.assertEqual(
                     [
                         int(np.count_nonzero(output_x < 0.005)),
@@ -278,6 +298,147 @@ class DisplayDensityCacheBuilderTests(unittest.TestCase):
                 [entry.name for entry in cache_root.iterdir()],
                 [cache_builder.ACTIVE_POINTER_NAME],
             )
+
+    def test_quota_one_uses_nearest_xyz_centroid_parent_without_refiltering(
+        self,
+    ) -> None:
+        records = np.zeros(3, dtype=TEST_DTYPE)
+        records["x"] = [0.003, 0.004, 0.007]
+        records["y"] = [0.003, 0.006, 0.004]
+        records["z"] = [0.003, 0.004, 0.006]
+        records["red"] = [10, 50, 90]
+        records["green"] = [20, 60, 100]
+        records["blue"] = [30, 70, 110]
+        records["nz"] = 1.0
+        records["scalar_Intensity"] = [1.0, 3.0, 8.0]
+        records["scalar_ScanID"] = [7.0, 3.0, 3.0]
+        records["scalar_Roughness"] = [2.0, np.nan, 4.0]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_root = root / "sources"
+            self._write_roles(source_root, records)
+            bundle = self._build(source_root, root / "cache", target=1)
+            output = _read_records(
+                bundle / "Scene3" / "Site3-ROCK-5mm.ply"
+            )[0]
+
+            expected_xyz = tuple(
+                float(records[name][1]) for name in ("x", "y", "z")
+            )
+            actual_xyz = tuple(float(output[name]) for name in ("x", "y", "z"))
+            self.assertEqual(actual_xyz, expected_xyz)
+            self.assertIn(
+                actual_xyz,
+                {
+                    tuple(float(point[name]) for name in ("x", "y", "z"))
+                    for point in records
+                },
+            )
+
+            role_seed = int.from_bytes(b"ROCK", "little")
+            order = np.argsort(
+                cache_builder._point_priority(records, role_seed),
+                kind="stable",
+            )
+            stable_records = records[order]
+            legacy_filtered = cache_builder._aggregate_sorted_groups(
+                stable_records,
+                np.asarray([0], dtype=np.int64),
+                cache_builder.RGB_FILTER_RENDERER_BYTE,
+            )[0]
+            self.assertNotEqual(
+                tuple(float(legacy_filtered[name]) for name in ("x", "y", "z")),
+                expected_xyz,
+            )
+            for name in TEST_DTYPE.names or ():
+                if name not in ("x", "y", "z"):
+                    self.assertEqual(
+                        output[name].tobytes(),
+                        legacy_filtered[name].tobytes(),
+                    )
+
+    def test_centroid_distance_tie_uses_stable_hash_independent_of_source_order(
+        self,
+    ) -> None:
+        records = np.zeros(2, dtype=TEST_DTYPE)
+        records["x"] = [0.003, 0.007]
+        records["y"] = [0.003, 0.007]
+        records["z"] = [0.003, 0.007]
+        records["red"] = [20, 80]
+        records["green"] = [30, 90]
+        records["blue"] = [40, 100]
+        records["nz"] = 1.0
+        records["scalar_Intensity"] = [2.0, 6.0]
+        records["scalar_ScanID"] = 3.0
+        records["scalar_Roughness"] = [1.0, 5.0]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_a = root / "sources-a"
+            source_b = root / "sources-b"
+            self._write_roles(source_a, records)
+            self._write_roles(source_b, records[::-1])
+            bundle_a = self._build(source_a, root / "cache-a", target=1)
+            bundle_b = self._build(source_b, root / "cache-b", target=1)
+            output_a = bundle_a / "Scene3" / "Site3-ROCK-5mm.ply"
+            output_b = bundle_b / "Scene3" / "Site3-ROCK-5mm.ply"
+            self.assertEqual(_sha256(output_a), _sha256(output_b))
+
+            role_seed = int.from_bytes(b"ROCK", "little")
+            priorities = cache_builder._point_priority(records, role_seed)
+            expected = records[int(np.argmin(priorities))]
+            actual = _read_records(output_a)[0]
+            self.assertEqual(
+                tuple(float(actual[name]) for name in ("x", "y", "z")),
+                tuple(float(expected[name]) for name in ("x", "y", "z")),
+            )
+
+    def test_quota_greater_than_one_keeps_strata_attributes_count_and_hash(
+        self,
+    ) -> None:
+        records = _fixture_records()[:4]
+        role_seed = int.from_bytes(b"ROCK", "little")
+        order = np.argsort(
+            cache_builder._point_priority(records, role_seed),
+            kind="stable",
+        )
+        stable_records = records[order]
+        expected = cache_builder._aggregate_sorted_groups(
+            stable_records,
+            np.asarray([0, 2], dtype=np.int64),
+            cache_builder.RGB_FILTER_RENDERER_BYTE,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "Site3-ROCK-1mm.ply"
+            _write_ply(source, records)
+            description = cache_builder.read_ply_description(source)
+            shard = root / "shard.bin"
+            shard.write_bytes(stable_records.tobytes())
+            output = cache_builder._aggregate_shard(
+                shard,
+                description,
+                cache_builder.BuildConfig(
+                    source_root=root,
+                    cache_root=root / "cache",
+                    targets={role: 2 for role in cache_builder.ROLE_ORDER},
+                    voxel_size_m=0.005,
+                    shard_count=1,
+                    seed=0,
+                    chunk_records=4,
+                ),
+                target_count=2,
+                systematic_extras=np.asarray([False]),
+            )
+
+        self.assertEqual(output.size, 2)
+        self.assertEqual(output.tobytes(), expected.tobytes())
+        self.assertEqual(
+            hashlib.sha256(output.tobytes()).hexdigest(),
+            hashlib.sha256(expected.tobytes()).hexdigest(),
+        )
 
     def test_cache_source_alias_and_insufficient_space_fail_before_staging(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
