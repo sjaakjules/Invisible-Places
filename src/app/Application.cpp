@@ -1004,6 +1004,26 @@ struct WaterClipHelpHoverState {
     double visibleUntil = 0.0;
 };
 
+// Key manipulation help is revealed only after the corresponding graph or
+// global marker is hovered. The complete ImGui surface id includes the split
+// graph's feature PushID, so identical labels in neighbouring graphs never
+// share a lingering question mark.
+struct WaterRunKeyHelpHoverState {
+    ImGuiID surfaceId = 0U;
+    std::string scenarioId;
+    std::uint32_t runId = 0U;
+    float centreY = 0.0F;
+    double visibleUntil = 0.0;
+};
+
+struct GlobalWaterKeyHelpHoverState {
+    ImGuiID surfaceId = 0U;
+    std::string scenarioId;
+    std::uint32_t runId = 0U;
+    invisible_places::water::WaterKeyedFeatureId feature{};
+    double visibleUntil = 0.0;
+};
+
 struct WaterRunMarkSelectionState {
     std::string scenarioId;
     std::string sceneGroupName;
@@ -1694,6 +1714,9 @@ struct TimingsPanelState {
     std::optional<WaterClipPackageSaveState> waterClipPackageSave;
     std::optional<WaterClipContextState> waterClipContext;
     std::optional<WaterClipHelpHoverState> waterClipHelpHover;
+    std::optional<WaterRunKeyHelpHoverState> waterRunKeyHelpHover;
+    std::optional<GlobalWaterKeyHelpHoverState>
+        globalWaterKeyHelpHover;
     // Run-owned event marks share one stable selection across the Timings,
     // embedded Water, and Global Animation surfaces.
     std::optional<WaterRunMarkSelectionState> waterRunMarkSelection;
@@ -55714,6 +55737,8 @@ bool ToggleLastWaterKeyEdit(PreviewRuntimeState* runtimeState) {
     timings.waterClipEdit.reset();
     timings.waterClipContext.reset();
     timings.waterClipSelection.reset();
+    timings.waterRunKeyHelpHover.reset();
+    timings.globalWaterKeyHelpHover.reset();
     timings.waterRunMarkDrag.reset();
     timings.waterRunMarkEdit.reset();
     timings.waterRunMarkHelpHover.reset();
@@ -60265,6 +60290,8 @@ void ResetTimingTakeEditorSelections(PreviewRuntimeState* runtimeState) {
     timings.waterClipPackageSave.reset();
     timings.waterClipContext.reset();
     timings.waterClipHelpHover.reset();
+    timings.waterRunKeyHelpHover.reset();
+    timings.globalWaterKeyHelpHover.reset();
     timings.waterRunMarkSelection.reset();
     timings.waterRunMarkDrag.reset();
     timings.waterRunMarkEdit.reset();
@@ -60316,6 +60343,8 @@ void ClearWaterFeatureRunEditorFocus(PreviewRuntimeState* runtimeState) {
     timings.waterClipPackageSave.reset();
     timings.waterClipContext.reset();
     timings.waterClipHelpHover.reset();
+    timings.waterRunKeyHelpHover.reset();
+    timings.globalWaterKeyHelpHover.reset();
     timings.waterRunMarkSelection.reset();
     timings.waterRunMarkDrag.reset();
     timings.waterRunMarkEdit.reset();
@@ -83902,19 +83931,35 @@ void DrawWaterRunTimingGraph(
     ImGui::PushID(id);
     constexpr float kCompactLaneHeight = 14.0F;
     constexpr float kTimeRailSeparation = 17.0F;
+    constexpr float kHelpGutterWidth = 22.0F;
     // Preserve the curve's original drawing height and add a separate lower
     // rail for time-only handles, so a zero-value dot cannot overlap them.
     constexpr float kValueGraphHeight = 109.0F;
+    const float availableWidth = std::max(
+        24.0F + kHelpGutterWidth,
+        ImGui::GetContentRegionAvail().x);
     const ImVec2 size{
-        std::max(24.0F, ImGui::GetContentRegionAvail().x),
+        std::max(24.0F, availableWidth - kHelpGutterWidth),
         kValueGraphHeight};
     ImGui::InvisibleButton(
         "##WaterRunGraphSurface",
         size,
         ImGuiButtonFlags_MouseButtonLeft);
+    const ImGuiID surfaceId = ImGui::GetItemID();
     const bool itemFocused = ImGui::IsItemFocused();
+    const bool itemActive = ImGui::IsItemActive();
+    const bool itemHovered = ImGui::IsItemHovered();
     const auto minimum = ImGui::GetItemRectMin();
     const auto maximum = ImGui::GetItemRectMax();
+    // Reserve real layout space without registering another interactive
+    // item. Caching the surface state above keeps all graph keyboard and drag
+    // handling bound to the original InvisibleButton.
+    ImGui::SameLine(0.0F, 0.0F);
+    ImGui::Dummy(ImVec2{kHelpGutterWidth, kValueGraphHeight});
+    const ImVec2 helpMinimum{maximum.x, minimum.y};
+    const ImVec2 helpMaximum{
+        maximum.x + kHelpGutterWidth,
+        maximum.y};
     const float width = std::max(1.0F, maximum.x - minimum.x);
     const float axisY = maximum.y - kCompactLaneHeight * 0.5F;
     const float valueAxisY = axisY - kTimeRailSeparation;
@@ -84152,7 +84197,6 @@ void DrawWaterRunTimingGraph(
     constexpr float kMarkerHitRadius = 7.0F;
     constexpr float kDotHitRadius = 6.0F;
     constexpr float kSplineHandleHitRadius = 7.0F;
-    const bool itemHovered = ImGui::IsItemHovered();
     const bool inAxisBand =
         std::abs(mouse.y - axisY) <= kMarkerHitRadius;
     const bool inGraphArea =
@@ -84260,6 +84304,92 @@ void DrawWaterRunTimingGraph(
         !hoveredDotSeries.has_value() &&
         nearestMarkerSeries.has_value() &&
         nearestMarkerDistance <= kMarkerHitRadius && inAxisBand;
+
+    const bool graphDragActive =
+        (timings.waterRunKeyDrag.has_value() &&
+         findMatchingSeries(timings.waterRunKeyDrag.value()).has_value()) ||
+        (timings.waterRunSplineHandleDrag.has_value() &&
+         findMatchingSeries(
+             timings.waterRunSplineHandleDrag.value()).has_value());
+    constexpr double kHelpHoverGraceSeconds = 2.5;
+    const double helpNow = ImGui::GetTime();
+    if (itemHovered && !graphDragActive) {
+        float contextualY = std::clamp(
+            mouse.y,
+            minimum.y + 8.0F,
+            maximum.y - 8.0F);
+        if (hoveredSplineHandle.has_value()) {
+            const auto& handle =
+                displayedSplineHandles[hoveredSplineHandle.value()];
+            contextualY = yForValue(
+                series[handle.seriesIndex],
+                handle.point.controlValue);
+        } else if (hoveredDotSeries.has_value()) {
+            contextualY = yForValue(
+                series[hoveredDotSeries.value()],
+                hoveredDotValue);
+        } else if (markerHovered) {
+            contextualY = axisY;
+        }
+        timings.waterRunKeyHelpHover = WaterRunKeyHelpHoverState{
+            .surfaceId = surfaceId,
+            .scenarioId = scenarioId,
+            .runId = run->id,
+            .centreY = contextualY,
+            .visibleUntil = helpNow + kHelpHoverGraceSeconds,
+        };
+    }
+    bool keyHelpHovered = false;
+    const bool keyHelpMatches =
+        timings.waterRunKeyHelpHover.has_value() &&
+        timings.waterRunKeyHelpHover->surfaceId == surfaceId &&
+        timings.waterRunKeyHelpHover->scenarioId == scenarioId &&
+        timings.waterRunKeyHelpHover->runId == run->id;
+    if (keyHelpMatches && !graphDragActive) {
+        auto& help = timings.waterRunKeyHelpHover.value();
+        const ImVec2 helpHitMinimum{
+            helpMinimum.x,
+            std::clamp(
+                help.centreY - 11.0F,
+                helpMinimum.y,
+                helpMaximum.y - 22.0F)};
+        const ImVec2 helpHitMaximum{
+            helpMaximum.x,
+            helpHitMinimum.y + 22.0F};
+        keyHelpHovered = ImGui::IsMouseHoveringRect(
+            helpHitMinimum,
+            helpHitMaximum,
+            /*clip=*/true);
+        if (keyHelpHovered) {
+            help.visibleUntil = helpNow + kHelpHoverGraceSeconds;
+        }
+        if (helpNow <= help.visibleUntil) {
+            const ImVec2 centre{
+                0.5F * (helpHitMinimum.x + helpHitMaximum.x),
+                0.5F * (helpHitMinimum.y + helpHitMaximum.y)};
+            auto* drawList = ImGui::GetWindowDrawList();
+            drawList->AddCircleFilled(
+                centre,
+                7.0F,
+                keyHelpHovered ? IM_COL32(255, 255, 255, 48)
+                               : IM_COL32(255, 255, 255, 22));
+            drawList->AddCircle(
+                centre,
+                7.0F,
+                keyHelpHovered ? IM_COL32(255, 255, 255, 180)
+                               : IM_COL32(255, 255, 255, 100));
+            const auto questionSize = ImGui::CalcTextSize("?");
+            drawList->AddText(
+                ImVec2{centre.x - 0.5F * questionSize.x,
+                       centre.y - 0.5F * questionSize.y},
+                keyHelpHovered ? ImGui::GetColorU32(ImGuiCol_Text)
+                               : ImGui::GetColorU32(ImGuiCol_TextDisabled),
+                "?");
+        } else {
+            timings.waterRunKeyHelpHover.reset();
+            keyHelpHovered = false;
+        }
+    }
 
     const auto scrubTo = [&](float position) {
         ScrubFeatureTimelineToAuthoredPosition(
@@ -84444,12 +84574,12 @@ void DrawWaterRunTimingGraph(
         [&](std::size_t index, float position) {
         const std::uint32_t clipId = keyClipIdAt(index, position);
         if (clipId == 0U) {
-            return std::string{"Loose key (round marker)"};
+            return std::string{"Loose key"};
         }
         const auto* clip = invisible_places::water::FindWaterFeatureClip(
             series[index].timeline,
             clipId);
-        return std::string{"Clip key (square marker): "} +
+        return std::string{"Clip: "} +
                (clip != nullptr ? clip->name : "Clip");
     };
 
@@ -84549,7 +84679,14 @@ void DrawWaterRunTimingGraph(
         }(hoveredDotSeries.has_value() ? hoveredDotPosition
                                        : nearestMarkerPosition);
 
-    if (hoveredSplineHandle.has_value()) {
+    if (keyHelpHovered) {
+        ImGui::SetTooltip(
+            "Click or drag empty graph space to scrub; double-click it to add a key on the nearest curve.\n"
+            "Click a key to select it. Drag a curve dot to change time and value; drag its lower marker to retime only.\n"
+            "Double-click a curve dot for exact editing. On the lower rail, double-click once to jump to a key and again to edit it.\n"
+            "Cmd/Ctrl-click toggles selection, Shift-click selects a range, and Cmd/Ctrl+A selects this graph. Delete or Backspace removes selected keys; Esc clears.\n"
+            "A selected Spline Handles key exposes circular controls that drag in time and value.");
+    } else if (hoveredSplineHandle.has_value()) {
         const auto& handle =
             displayedSplineHandles[hoveredSplineHandle.value()];
         const char* sideLabel =
@@ -84558,8 +84695,13 @@ void DrawWaterRunTimingGraph(
                 ? "Incoming"
                 : "Outgoing";
         ImGui::SetTooltip(
-            "%s spline handle — drag to shape time and value without moving the key.",
-            sideLabel);
+            "%s spline handle — %s\nControl position %.4f (%.2f s)\nControl value %.3g\nKey position %.4f",
+            sideLabel,
+            series[handle.seriesIndex].label.c_str(),
+            handle.point.controlPosition,
+            handle.point.controlPosition * durationSeconds,
+            handle.point.controlValue,
+            handle.point.anchorPosition);
         if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             handledInteraction = true;
             armSplineHandleDrag(handle);
@@ -84567,11 +84709,11 @@ void DrawWaterRunTimingGraph(
     } else if (hoveredDotSeries.has_value()) {
         const auto index = hoveredDotSeries.value();
         ImGui::SetTooltip(
-            "%s = %.3g at %.2f s (position %.4f)\n%s\nDrag to move; Cmd/Ctrl-click toggles selection; Shift-click selects a range; double-click edits.",
-            seriesKeyLabel(index, hoveredDotPosition).c_str(),
+            "%s = %.3g\nPosition %.4f (%.2f s)\n%s",
+            series[index].label.c_str(),
             hoveredDotValue,
-            hoveredDotPosition * durationSeconds,
             hoveredDotPosition,
+            hoveredDotPosition * durationSeconds,
             keyMembershipLabel(index, hoveredDotPosition).c_str());
         if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
             handledInteraction = true;
@@ -84600,11 +84742,10 @@ void DrawWaterRunTimingGraph(
             }
         }
         ImGui::SetTooltip(
-            scrubOnKey
-                ? "%s = %.3g at %.2f s\n%s\nDrag to retime; Cmd/Ctrl-click toggles selection; Shift-click selects a range; double-click edits."
-                : "%s = %.3g at %.2f s\n%s\nClick to select; Cmd/Ctrl-click adds or removes; Shift-click selects a range; double-click jumps here.",
-            seriesKeyLabel(index, nearestMarkerPosition).c_str(),
+            "%s = %.3g\nPosition %.4f (%.2f s)\n%s",
+            series[index].label.c_str(),
             markerValue,
+            nearestMarkerPosition,
             nearestMarkerPosition * durationSeconds,
             keyMembershipLabel(index, nearestMarkerPosition).c_str());
         if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
@@ -84672,7 +84813,7 @@ void DrawWaterRunTimingGraph(
             : std::nullopt;
     if (!handledInteraction && !draggedSeries.has_value() &&
         !draggedSplineHandleSeries.has_value() &&
-        ImGui::IsItemActive() &&
+        itemActive &&
         ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
         // Empty surface doubles as a local scrubber, exactly like the
         // Visual Features lanes.
@@ -84692,7 +84833,7 @@ void DrawWaterRunTimingGraph(
         timings.waterClipSelection.reset();
     }
     if (draggedSplineHandleSeries.has_value() &&
-        ImGui::IsItemActive() &&
+        itemActive &&
         ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0F)) {
         auto& drag = timings.waterRunSplineHandleDrag.value();
         auto* track = series[draggedSplineHandleSeries.value()].track;
@@ -84717,7 +84858,7 @@ void DrawWaterRunTimingGraph(
             runtimeState->previewRenderStateSignatureValid = false;
         }
     }
-    if (draggedSeries.has_value() && ImGui::IsItemActive() &&
+    if (draggedSeries.has_value() && itemActive &&
         ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0F)) {
         auto& drag = timings.waterRunKeyDrag.value();
         auto* track = series[draggedSeries.value()].track;
@@ -85071,23 +85212,19 @@ void DrawWaterRunTimingGraph(
             }
         }
     }
-    if (itemHovered && !hoveredSplineHandle.has_value() &&
+    if (!keyHelpHovered && itemHovered &&
+        !hoveredSplineHandle.has_value() &&
         !hoveredDotSeries.has_value() && !markerHovered) {
         if (hoveredCurveSeries.has_value()) {
             ImGui::SetTooltip(
-                "%s %.3g at %.2f s (position %.4f)\nEach setting is scaled from its own minimum at the lower curve line to its maximum at the top.\nDouble-click to add a key here.",
+                "%s = %.3g\nPosition %.4f (%.2f s)",
                 series[hoveredCurveSeries.value()].label.c_str(),
                 hoveredCurveValue,
-                hoveredCurvePosition * durationSeconds,
-                hoveredCurvePosition);
-        } else if (inGraphArea) {
-            ImGui::SetTooltip(
-                "Animation position %.4f (%.2f s) — click or drag to scrub; double-click to add a key on the nearest setting curve.",
-                positionForX(mouse.x),
-                positionForX(mouse.x) * durationSeconds);
+                hoveredCurvePosition,
+                hoveredCurvePosition * durationSeconds);
         } else {
             ImGui::SetTooltip(
-                "Animation position %.4f (%.2f s) — click or drag to scrub. Drag coloured key markers to retime them.",
+                "Animation position %.4f (%.2f s)",
                 positionForX(mouse.x),
                 positionForX(mouse.x) * durationSeconds);
         }
@@ -85182,8 +85319,7 @@ void DrawWaterRunTimingGraph(
             }
             if (editor->draftInterpolation ==
                 WaterScenarioInterpolation::SplineHandles) {
-                ImGui::TextDisabled(
-                    "After Apply, select the key and drag its circular Bezier handles on the graph.");
+                ImGui::TextDisabled("Uses editable Bezier control points.");
             }
             const bool validPosition =
                 std::isfinite(editor->draftPosition) &&
@@ -85447,8 +85583,6 @@ void DrawWaterRunTimingGraph(
                         ImGui::TextDisabled("= each setting default");
                     }
                 }
-                ImGui::TextDisabled(
-                    "Cmd/Ctrl-click toggles keys; Shift-click selects a range; Cmd/Ctrl+A selects this graph; Delete removes selected keys; Esc clears.");
             }
         }
     }
@@ -88237,6 +88371,8 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                 ClearTimingColouriseEditorFocus(runtimeState);
                 timings.selectedFeatureRunIndex = index;
                 timings.pendingRunDeleteIndex.reset();
+                timings.waterRunKeyHelpHover.reset();
+                timings.globalWaterKeyHelpHover.reset();
                 timings.waterRunMarkSelection.reset();
             }
             if (!run.enabled) {
@@ -88256,6 +88392,8 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
             entry.waterFeatureTimingRuns.push_back(std::move(run));
             timings.selectedFeatureRunIndex =
                 entry.waterFeatureTimingRuns.size() - 1U;
+            timings.waterRunKeyHelpHover.reset();
+            timings.globalWaterKeyHelpHover.reset();
             timings.waterRunMarkSelection.reset();
             timings.newFeatureRunNameBuffer.clear();
         }
@@ -88282,6 +88420,8 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                             timings.selectedFeatureRunIndex.value()));
                     timings.selectedFeatureRunIndex.reset();
                     timings.pendingRunDeleteIndex.reset();
+                    timings.waterRunKeyHelpHover.reset();
+                    timings.globalWaterKeyHelpHover.reset();
                     timings.waterRunMarkSelection.reset();
                     timings.waterRunMarkDrag.reset();
                     timings.waterRunMarkEdit.reset();
@@ -88618,9 +88758,7 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                 "keyable setting (dashed line = no keys yet). Off: every "
                 "visible feature's keyed settings overlaid on one shared "
                 "graph. Use the checkboxes above to choose the visible "
-                "features. Double-click a graph to add a key, drag curve "
-                "points to move them, double-click a point to edit or "
-                "delete it.");
+                "features.");
             ImGui::SameLine();
             ImGui::Checkbox(
                 "Always Follow Camera##TimingFeatureTimelines",
@@ -97446,11 +97584,22 @@ void DrawWaterKeyMarkerStrip(
     ImVec2 barMax) {
     const float barWidth = std::max(1.0F, barMax.x - barMin.x);
     constexpr float kStripHeight = 9.0F;
+    constexpr float kHelpGutterWidth = 22.0F;
     ImGui::SetCursorScreenPos(ImVec2{barMin.x, barMax.y + 2.0F});
     ImGui::InvisibleButton(
         "##WaterKeyMarkerStrip",
         ImVec2{barWidth, kStripHeight});
+    const ImGuiID surfaceId = ImGui::GetItemID();
     const bool hovered = ImGui::IsItemHovered();
+    const ImVec2 helpMinimum{barMax.x, barMax.y + 2.0F};
+    const ImVec2 helpMaximum{
+        barMax.x + kHelpGutterWidth,
+        barMax.y + 2.0F + kStripHeight};
+    // Draw into the 22 px already reserved beside the global bar. This Dummy
+    // is non-interactive, so the marker strip retains its exact bar-aligned
+    // X mapping and original ImGui id.
+    ImGui::SameLine(0.0F, 0.0F);
+    ImGui::Dummy(ImVec2{kHelpGutterWidth, kStripHeight});
     const float mouseX = ImGui::GetIO().MousePos.x;
     auto* drawList = ImGui::GetWindowDrawList();
     const float stripTop = barMax.y + 2.0F;
@@ -97460,7 +97609,6 @@ void DrawWaterKeyMarkerStrip(
         float position = 0.0F;
         float cameraPosition = 0.0F;
         std::size_t settingIndex = 0U;
-        std::size_t keyNumber = 0U;
         float value = 0.0F;
     };
     NearestKey nearest;
@@ -97509,7 +97657,6 @@ void DrawWaterKeyMarkerStrip(
                             .position = key.position,
                             .cameraPosition = cameraPosition,
                             .settingIndex = settingIndex,
-                            .keyNumber = keyIndex + 1U,
                             .value = key.value,
                         };
                     }
@@ -97517,7 +97664,70 @@ void DrawWaterKeyMarkerStrip(
             }
         }
     }
-    if (hovered && nearest.distance <= 6.0F) {
+    const bool keyHovered = hovered && nearest.distance <= 6.0F;
+    auto& timings = runtimeState->timingsPanel;
+    const std::string scenarioId =
+        ActiveWaterTimingScenarioId(*runtimeState);
+    constexpr double kHelpHoverGraceSeconds = 2.5;
+    const double now = ImGui::GetTime();
+    if (keyHovered) {
+        timings.globalWaterKeyHelpHover = GlobalWaterKeyHelpHoverState{
+            .surfaceId = surfaceId,
+            .scenarioId = scenarioId,
+            .runId = run.id,
+            .feature = timeline.feature,
+            .visibleUntil = now + kHelpHoverGraceSeconds,
+        };
+    }
+    bool globalKeyHelpHovered = false;
+    const bool helpMatches =
+        timings.globalWaterKeyHelpHover.has_value() &&
+        timings.globalWaterKeyHelpHover->surfaceId == surfaceId &&
+        timings.globalWaterKeyHelpHover->scenarioId == scenarioId &&
+        timings.globalWaterKeyHelpHover->runId == run.id &&
+        timings.globalWaterKeyHelpHover->feature == timeline.feature;
+    if (helpMatches) {
+        auto& help = timings.globalWaterKeyHelpHover.value();
+        globalKeyHelpHovered = ImGui::IsMouseHoveringRect(
+            helpMinimum,
+            helpMaximum,
+            /*clip=*/true);
+        if (globalKeyHelpHovered) {
+            help.visibleUntil = now + kHelpHoverGraceSeconds;
+        }
+        if (now <= help.visibleUntil) {
+            const ImVec2 centre{
+                0.5F * (helpMinimum.x + helpMaximum.x),
+                0.5F * (helpMinimum.y + helpMaximum.y)};
+            drawList->AddCircleFilled(
+                centre,
+                6.5F,
+                globalKeyHelpHovered ? IM_COL32(255, 255, 255, 48)
+                                     : IM_COL32(255, 255, 255, 22));
+            drawList->AddCircle(
+                centre,
+                6.5F,
+                globalKeyHelpHovered ? IM_COL32(255, 255, 255, 180)
+                                     : IM_COL32(255, 255, 255, 100));
+            const auto questionSize = ImGui::CalcTextSize("?");
+            drawList->AddText(
+                ImVec2{centre.x - 0.5F * questionSize.x,
+                       centre.y - 0.5F * questionSize.y},
+                globalKeyHelpHovered
+                    ? ImGui::GetColorU32(ImGuiCol_Text)
+                    : ImGui::GetColorU32(ImGuiCol_TextDisabled),
+                "?");
+        } else {
+            timings.globalWaterKeyHelpHover.reset();
+            globalKeyHelpHovered = false;
+        }
+    }
+
+    if (globalKeyHelpHovered) {
+        ImGui::SetTooltip(
+            "Double-click a Water key marker to move Global Animation Position to that occurrence.\n"
+            "Double-click it again while the playhead is on the key to edit its normalized position exactly.");
+    } else if (keyHovered) {
         const auto& setting = timeline.settings[nearest.settingIndex];
         const auto* info = invisible_places::water::FindWaterKeyableSetting(
             timeline.feature.kind,
@@ -97539,14 +97749,17 @@ void DrawWaterKeyMarkerStrip(
             std::abs(
                 runtimeState->animationPanel.scrubAmount -
                 nearest.cameraPosition) <= 1.0e-4F;
+        const bool loopPosition =
+            runtimeState->animationPanel.currentPath.has_value() &&
+            invisible_places::camera::ResolveAnimationTimingLoopWindow(
+                runtimeState->animationPanel.currentPath.value())
+                .has_value();
         ImGui::SetTooltip(
-            positionIsOnKey
-                ? "%s %zu — %s = %.3f at %.2f s (double-click to edit position)"
-                : "%s %zu — %s = %.3f at %.2f s (double-click to jump)",
-            run.name.c_str(),
-            nearest.keyNumber,
+            "%s = %.3f\n%s %.4f (%.2f s)",
             settingLabel,
             nearest.value,
+            loopPosition ? "Loop position" : "Position",
+            nearest.position,
             nearest.cameraPosition * durationSeconds);
         if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
             if (positionIsOnKey) {
@@ -98783,8 +98996,8 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
     const std::string timeLabel =
         FormatFixed(panel.scrubAmount * durationSeconds, 1) + "s";
     // Leave one in-bounds, non-interactive gutter beside the global time
-    // surface. A hovered Feature Run mark can expose its contextual '?' here
-    // without changing the bar/marker/curve X mapping.
+    // surface. Hovered Feature Run marks and Water keys expose their
+    // row-specific '?' here without changing the bar/marker/curve X mapping.
     constexpr float kGlobalTimingHelpGutterWidth = 22.0F;
     const float globalBarWidth = std::max(
         110.0F,
