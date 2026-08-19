@@ -634,6 +634,56 @@ TEST_CASE(
         CHECK(effect.effectParameterKeys[1U].position == Approx(0.8F));
     }
 
+    SECTION("every duplicate current-field cache follows the live tracks") {
+        using invisible_places::timing::TimingColouriseFieldSelector;
+        using invisible_places::timing::TimingColouriseFieldSource;
+
+        TimingColouriseEffect effect;
+        effect.field = TimingColouriseFieldSelector{
+            .source = TimingColouriseFieldSource::Scalar,
+            .scalarFieldName = "current",
+        };
+        effect.boundsParameterKeys = {
+            {.parameter = TimingColouriseBoundsParameter::Lower,
+             .position = 0.2F,
+             .value = -1.0F},
+        };
+        effect.boundsKeys = {
+            {.position = 0.8F,
+             .bounds = {.lower = -2.0F, .upper = 2.0F}},
+        };
+        TimingColouriseFieldBoundsMemory first;
+        first.selector = effect.field;
+        first.boundsParameterKeys = {
+            {.parameter = TimingColouriseBoundsParameter::Lower,
+             .position = 0.01F,
+             .value = -10.0F},
+        };
+        TimingColouriseFieldBoundsMemory second = first;
+        second.boundsParameterKeys.front().position = 0.99F;
+        effect.fieldBoundsMemory = {first, second};
+
+        REQUIRE(invisible_places::timing::
+                    TransformTimingColouriseEffectSettingsKeys(
+                        &effect,
+                        {.start = 0.2F, .end = 0.8F},
+                        {.start = 0.3F, .end = 0.7F}));
+        REQUIRE(effect.fieldBoundsMemory.size() == 2U);
+        for (const auto& memory : effect.fieldBoundsMemory) {
+            CHECK(memory.selector == effect.field);
+            REQUIRE(memory.boundsParameterKeys.size() == 1U);
+            REQUIRE(memory.boundsKeys.size() == 1U);
+            CHECK(memory.boundsParameterKeys.front().position ==
+                  Approx(effect.boundsParameterKeys.front().position));
+            CHECK(memory.boundsParameterKeys.front().value ==
+                  Approx(effect.boundsParameterKeys.front().value));
+            CHECK(memory.boundsKeys.front().position ==
+                  Approx(effect.boundsKeys.front().position));
+            CHECK(memory.boundsKeys.front().bounds.lower ==
+                  Approx(effect.boundsKeys.front().bounds.lower));
+        }
+    }
+
     SECTION("invalid and incomplete ranges leave state untouched") {
         TimingColouriseEffect empty;
         CHECK(invisible_places::timing::

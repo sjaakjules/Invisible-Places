@@ -3669,22 +3669,18 @@ bool TimingColouriseEffectSettingsKeysHaveNoLaneCollisions(
 
 void SynchronizeCurrentTimingColouriseFieldMemory(
     TimingColouriseEffect* effect) {
-    const auto current = std::find_if(
-        effect->fieldBoundsMemory.begin(),
-        effect->fieldBoundsMemory.end(),
-        [&](const TimingColouriseFieldBoundsMemory& memory) {
-            return IsCurrentTimingColouriseFieldMemory(*effect, memory);
-        });
-    if (current == effect->fieldBoundsMemory.end()) {
-        return;
+    for (auto& memory : effect->fieldBoundsMemory) {
+        if (!IsCurrentTimingColouriseFieldMemory(*effect, memory)) {
+            continue;
+        }
+        memory.bounds = effect->baseBounds;
+        memory.boundsKeyMode = effect->boundsKeyMode;
+        memory.boundsParameterKeys = effect->boundsParameterKeys;
+        memory.boundsKeys = effect->boundsKeys;
+        memory.edited = effect->boundsEdited;
+        memory.adoptedGlobalRevision =
+            effect->boundsAdoptedGlobalRevision;
     }
-    current->bounds = effect->baseBounds;
-    current->boundsKeyMode = effect->boundsKeyMode;
-    current->boundsParameterKeys = effect->boundsParameterKeys;
-    current->boundsKeys = effect->boundsKeys;
-    current->edited = effect->boundsEdited;
-    current->adoptedGlobalRevision =
-        effect->boundsAdoptedGlobalRevision;
 }
 
 void SortTimingColouriseEffectSettingsKeys(
