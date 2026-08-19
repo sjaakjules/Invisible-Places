@@ -1,6 +1,7 @@
 #include "app/Application.hpp"
 
 #include "app/ManualFlowPathEditMath.hpp"
+#include "app/PointDensityParity.hpp"
 #include "app/PointVisualSelection.hpp"
 #include "app/ProcessMemoryTelemetry.hpp"
 #include "app/ProjectWorkspace.hpp"
@@ -60,6 +61,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cfloat>
@@ -67,6 +69,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cerrno>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -41536,6 +41539,120 @@ std::int64_t CurrentProcessId() {
 #else
     return 0;
 #endif
+}
+
+struct InvisiblePlacesPeerProcessQuery {
+    bool success = false;
+    std::vector<std::int64_t> processIds;
+    std::string errorMessage;
+};
+
+InvisiblePlacesPeerProcessQuery QueryInvisiblePlacesPeerProcesses() {
+    InvisiblePlacesPeerProcessQuery query;
+    const auto currentProcessId = CurrentProcessId();
+#if defined(__APPLE__)
+    const int mib[] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    std::vector<kinfo_proc> processes;
+    for (std::uint32_t attempt = 0U; attempt < 3U; ++attempt) {
+        std::size_t byteCount = 0U;
+        if (::sysctl(
+                const_cast<int*>(mib),
+                static_cast<u_int>(std::size(mib)),
+                nullptr,
+                &byteCount,
+                nullptr,
+                0U) != 0) {
+            query.errorMessage =
+                "Could not enumerate running processes for the exclusive "
+                "Scene3 density smoke: " +
+                std::string{std::strerror(errno)} + ".";
+            return query;
+        }
+        processes.resize(byteCount / sizeof(kinfo_proc) + 16U);
+        byteCount = processes.size() * sizeof(kinfo_proc);
+        if (::sysctl(
+                const_cast<int*>(mib),
+                static_cast<u_int>(std::size(mib)),
+                processes.data(),
+                &byteCount,
+                nullptr,
+                0U) == 0) {
+            processes.resize(byteCount / sizeof(kinfo_proc));
+            break;
+        }
+        if (errno != ENOMEM || attempt == 2U) {
+            query.errorMessage =
+                "Could not read the running-process list for the exclusive "
+                "Scene3 density smoke: " +
+                std::string{std::strerror(errno)} + ".";
+            return query;
+        }
+    }
+    for (const auto& process : processes) {
+        const auto processId =
+            static_cast<std::int64_t>(process.kp_proc.p_pid);
+        if (processId <= 0 || processId == currentProcessId) {
+            continue;
+        }
+        const std::string command{process.kp_proc.p_comm};
+        // Darwin retains all 16 characters on current SDKs; the truncated
+        // spelling covers older MAXCOMLEN layouts without matching a broad
+        // application prefix.
+        if (command == "invisible_places" ||
+            command == "invisible_place") {
+            query.processIds.push_back(processId);
+        }
+    }
+#elif defined(__linux__)
+    std::error_code directoryError;
+    for (std::filesystem::directory_iterator it{
+             "/proc",
+             std::filesystem::directory_options::skip_permission_denied,
+             directoryError},
+         end;
+         !directoryError && it != end;
+         it.increment(directoryError)) {
+        const auto name = it->path().filename().string();
+        if (name.empty() || !std::all_of(name.begin(), name.end(), [](char value) {
+                return std::isdigit(static_cast<unsigned char>(value)) != 0;
+            })) {
+            continue;
+        }
+        std::int64_t processId = 0;
+        const auto parsed = std::from_chars(
+            name.data(),
+            name.data() + name.size(),
+            processId);
+        if (parsed.ec != std::errc{} || processId <= 0 ||
+            processId == currentProcessId) {
+            continue;
+        }
+        std::ifstream commandInput{it->path() / "comm"};
+        std::string command;
+        std::getline(commandInput, command);
+        if (command == "invisible_places" ||
+            command == "invisible_place") {
+            query.processIds.push_back(processId);
+        }
+    }
+    if (directoryError) {
+        query.errorMessage =
+            "Could not enumerate /proc for the exclusive Scene3 density "
+            "smoke: " + directoryError.message() + ".";
+        return query;
+    }
+#else
+    query.errorMessage =
+        "Exclusive Scene3 density-smoke process checks are unsupported on "
+        "this platform.";
+    return query;
+#endif
+    std::sort(query.processIds.begin(), query.processIds.end());
+    query.processIds.erase(
+        std::unique(query.processIds.begin(), query.processIds.end()),
+        query.processIds.end());
+    query.success = true;
+    return query;
 }
 
 void ApplyBackgroundWorkerProcessPriority() {
@@ -106797,6 +106914,11 @@ struct WaterIntegrationCapturedFrame {
     std::uint32_t width = 0U;
     std::uint32_t height = 0U;
     std::vector<std::uint8_t> rgb;
+    std::vector<float> linearRed;
+    std::vector<float> linearGreen;
+    std::vector<float> linearBlue;
+    std::vector<float> alpha;
+    std::vector<float> depth;
 };
 
 std::optional<WaterIntegrationCapturedFrame> CaptureWaterIntegrationFrame(
@@ -109240,6 +109362,11 @@ std::optional<WaterIntegrationCapturedFrame> CaptureWaterIntegrationFrame(
         .height = readback.height,
     };
     captured.rgb.reserve(pixelCount * 3U);
+    captured.linearRed.resize(pixelCount);
+    captured.linearGreen.resize(pixelCount);
+    captured.linearBlue.resize(pixelCount);
+    captured.alpha.resize(pixelCount);
+    captured.depth = readback.linearDepth;
     for (std::size_t pixel = 0U; pixel < readback.colorRgba8.size(); pixel += 4U) {
         captured.rgb.insert(
             captured.rgb.end(),
@@ -109274,14 +109401,29 @@ std::optional<WaterIntegrationCapturedFrame> CaptureWaterIntegrationFrame(
         image.beautyR[pixel] = srgb8ToLinear(captured.rgb[rgbOffset]);
         image.beautyG[pixel] = srgb8ToLinear(captured.rgb[rgbOffset + 1U]);
         image.beautyB[pixel] = srgb8ToLinear(captured.rgb[rgbOffset + 2U]);
+        const auto depth = readback.linearDepth[pixel];
         image.alpha[pixel] =
-            static_cast<float>(readback.colorRgba8[rgbaOffset + 3U]) / 255.0F;
-        image.depth[pixel] = readback.linearDepth[pixel];
+            std::isfinite(depth) && depth > 0.0F
+                ? static_cast<float>(
+                      readback.colorRgba8[rgbaOffset + 3U]) /
+                      255.0F
+                : 0.0F;
+        image.depth[pixel] = depth;
+        captured.linearRed[pixel] = image.beautyR[pixel];
+        captured.linearGreen[pixel] = image.beautyG[pixel];
+        captured.linearBlue[pixel] = image.beautyB[pixel];
+        captured.alpha[pixel] = image.alpha[pixel];
     }
     if (!invisible_places::output::WriteExrImage(image, exrPath, errorMessage)) {
         return std::nullopt;
     }
-    if (!WritePpmImage(ppmPath, captured.width, captured.height, captured.rgb, errorMessage)) {
+    if (!ppmPath.empty() &&
+        !WritePpmImage(
+            ppmPath,
+            captured.width,
+            captured.height,
+            captured.rgb,
+            errorMessage)) {
         return std::nullopt;
     }
     return captured;
@@ -109903,6 +110045,1223 @@ int RunScene3PatchBoundarySmoke(
     report.Pass(
         "Captured all four unannotated Projector-01 views and contact sheet: " +
         sheetPath.string());
+    viewport->WaitIdle();
+    return finish();
+}
+
+namespace scene3_density_parity_smoke {
+
+using PointCloudMaterialVariant =
+    invisible_places::renderer::pointcloud::PointCloudMaterialVariant;
+
+constexpr std::uint32_t kFiveMillimetreSpacing = 5'000U;
+constexpr std::uint32_t kOneMillimetreSpacing = 1'000U;
+constexpr float kSimulatedSeconds = 0.0F;
+constexpr std::array<std::uint64_t, 3U> kExpectedFiveMillimetreCounts{
+    2'317'741U,
+    8'586'125U,
+    3'732'504U,
+};
+constexpr std::array<std::uint64_t, 3U> kExpectedOneMillimetreCounts{
+    39'451'487U,
+    136'377'975U,
+    22'919'917U,
+};
+
+struct RoleObservation {
+    std::string role;
+    std::filesystem::path sourcePath;
+    std::filesystem::path resolvedSourcePath;
+    std::uint64_t pointCount = 0U;
+    std::uint64_t expectedPointCount = 0U;
+    float footprintScale = 1.0F;
+    float expectedFootprintScale = 1.0F;
+    float coverageCorrection = 1.0F;
+    std::uint64_t effectiveStyleHash = 0U;
+    PointCloudMaterialVariant materialVariant =
+        PointCloudMaterialVariant::Unified;
+};
+
+struct BundleObservation {
+    std::uint32_t spacingMicrometres = 0U;
+    std::uint64_t totalPointCount = 0U;
+    std::array<RoleObservation, 3U> roles;
+};
+
+std::uint64_t PointStyleHash(const PointCloudStyleState& style) {
+    std::uint64_t seed = 1469598103934665603ULL;
+    HashPointStyle(&seed, style);
+    return seed;
+}
+
+bool MatricesApproximatelyEqual(
+    const glm::mat4& left,
+    const glm::mat4& right,
+    float tolerance = 1.0e-6F) {
+    for (std::size_t column = 0U; column < 4U; ++column) {
+        for (std::size_t row = 0U; row < 4U; ++row) {
+            if (std::abs(left[column][row] - right[column][row]) >
+                tolerance) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+nlohmann::json MatrixJson(const glm::mat4& matrix) {
+    auto values = nlohmann::json::array();
+    for (std::size_t row = 0U; row < 4U; ++row) {
+        auto rowValues = nlohmann::json::array();
+        for (std::size_t column = 0U; column < 4U; ++column) {
+            rowValues.push_back(matrix[column][row]);
+        }
+        values.push_back(std::move(rowValues));
+    }
+    return values;
+}
+
+nlohmann::json CameraJson(
+    const invisible_places::camera::CameraState& camera) {
+    return {
+        {"position", camera.position},
+        {"orientation", camera.orientation},
+        {"target", camera.target},
+        {"orbit_center", camera.orbitCenter},
+        {"has_orbit_center", camera.hasOrbitCenter},
+        {"has_depth_of_field", camera.hasDepthOfField},
+        {"fov_degrees", camera.fovDegrees},
+        {"near_plane", camera.nearPlane},
+        {"far_plane", camera.farPlane},
+        {"focus_distance", camera.focusDistance},
+        {"aperture_f_stops", camera.apertureFStops},
+        {"depth_of_field_max_blur_pixels",
+         camera.depthOfFieldMaxBlurPixels},
+    };
+}
+
+std::string_view MaterialVariantName(PointCloudMaterialVariant variant) {
+    switch (variant) {
+        case PointCloudMaterialVariant::OpaqueHardDisc:
+            return "opaque_hard_disc";
+        case PointCloudMaterialVariant::ConstantSimple:
+            return "constant_simple";
+        case PointCloudMaterialVariant::Unified:
+            return "unified";
+    }
+    return "unknown";
+}
+
+nlohmann::json BundleJson(const BundleObservation& bundle) {
+    auto roles = nlohmann::json::array();
+    for (const auto& role : bundle.roles) {
+        std::error_code metadataError;
+        const auto sizeBytes =
+            std::filesystem::file_size(role.sourcePath, metadataError);
+        const auto modificationTime = metadataError
+            ? std::int64_t{0}
+            : static_cast<std::int64_t>(
+                  std::filesystem::last_write_time(
+                      role.sourcePath,
+                      metadataError)
+                      .time_since_epoch()
+                      .count());
+        roles.push_back({
+            {"role", role.role},
+            {"source_path", role.sourcePath.string()},
+            {"resolved_source_path", role.resolvedSourcePath.string()},
+            {"file_size_bytes", metadataError ? 0U : sizeBytes},
+            {"modification_time_ticks",
+             metadataError ? 0 : modificationTime},
+            {"point_count", role.pointCount},
+            {"expected_point_count", role.expectedPointCount},
+            {"footprint_scale", role.footprintScale},
+            {"expected_footprint_scale", role.expectedFootprintScale},
+            {"coverage_correction", role.coverageCorrection},
+            {"effective_style_hash", role.effectiveStyleHash},
+            {"material_variant", MaterialVariantName(role.materialVariant)},
+        });
+    }
+    return {
+        {"spacing_micrometres", bundle.spacingMicrometres},
+        {"total_point_count", bundle.totalPointCount},
+        {"roles", std::move(roles)},
+    };
+}
+
+bool WriteAbsoluteDifferencePng(
+    const std::filesystem::path& outputPath,
+    const point_density_parity::DiagnosticImages& diagnostics,
+    std::string* errorMessage) {
+    const auto pixelCount =
+        static_cast<std::size_t>(diagnostics.width) * diagnostics.height;
+    if (diagnostics.width == 0U || diagnostics.height == 0U ||
+        diagnostics.absoluteDifferenceRgba.size() != pixelCount * 4U) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "Point-density absolute-difference image has invalid dimensions.";
+        }
+        return false;
+    }
+    const auto linearToSrgb8 = [](float linear) {
+        const auto clamped = std::clamp(linear, 0.0F, 1.0F);
+        const auto encoded = clamped <= 0.0031308F
+            ? clamped * 12.92F
+            : 1.055F * std::pow(clamped, 1.0F / 2.4F) - 0.055F;
+        return static_cast<std::uint8_t>(std::clamp(
+            std::lround(encoded * 255.0F),
+            0L,
+            255L));
+    };
+    std::vector<std::uint8_t> rgba(pixelCount * 4U, 255U);
+    for (std::size_t pixel = 0U; pixel < pixelCount; ++pixel) {
+        const auto offset = pixel * 4U;
+        rgba[offset] =
+            linearToSrgb8(diagnostics.absoluteDifferenceRgba[offset]);
+        rgba[offset + 1U] =
+            linearToSrgb8(diagnostics.absoluteDifferenceRgba[offset + 1U]);
+        rgba[offset + 2U] =
+            linearToSrgb8(diagnostics.absoluteDifferenceRgba[offset + 2U]);
+    }
+    return invisible_places::output::WritePngRgba8(
+        outputPath,
+        diagnostics.width,
+        diagnostics.height,
+        rgba,
+        errorMessage);
+}
+
+bool WriteSupportPng(
+    const std::filesystem::path& outputPath,
+    const point_density_parity::DiagnosticImages& diagnostics,
+    std::string* errorMessage) {
+    const auto pixelCount =
+        static_cast<std::size_t>(diagnostics.width) * diagnostics.height;
+    if (diagnostics.width == 0U || diagnostics.height == 0U ||
+        diagnostics.supportRgba.size() != pixelCount * 4U) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "Point-density support image has invalid dimensions.";
+        }
+        return false;
+    }
+    return invisible_places::output::WritePngRgba8(
+        outputPath,
+        diagnostics.width,
+        diagnostics.height,
+        diagnostics.supportRgba,
+        errorMessage);
+}
+
+nlohmann::json ComparisonMetricsJson(
+    const point_density_parity::Report& metrics) {
+    return {
+        {"width", metrics.width},
+        {"height", metrics.height},
+        {"options",
+         {{"foreground_alpha_threshold",
+           metrics.options.foregroundAlphaThreshold},
+          {"support_tolerance_pixels",
+           metrics.options.supportTolerancePixels},
+          {"tile_columns", metrics.options.tileColumns},
+          {"tile_rows", metrics.options.tileRows},
+          {"rgb_blur_sigma_pixels",
+           metrics.options.rgbBlurSigmaPixels},
+          {"optical_depth_epsilon",
+           metrics.options.opticalDepthEpsilon},
+          {"minimum_valid_depth",
+           metrics.options.minimumValidDepth}}},
+        {"reference_1mm",
+         {{"foreground_pixel_count",
+           metrics.reference.foregroundPixelCount},
+          {"foreground_coverage", metrics.reference.foregroundCoverage},
+          {"optical_depth_sum", metrics.reference.opticalDepthSum}}},
+        {"candidate_5mm",
+         {{"foreground_pixel_count",
+           metrics.candidate.foregroundPixelCount},
+          {"foreground_coverage", metrics.candidate.foregroundCoverage},
+          {"optical_depth_sum", metrics.candidate.opticalDepthSum}}},
+        {"candidate_to_reference_coverage_ratio",
+         metrics.candidateToReferenceCoverageRatio},
+        {"candidate_to_reference_optical_depth_ratio",
+         metrics.candidateToReferenceOpticalDepthRatio},
+        {"support",
+         {{"missing_reference_pixel_count",
+           metrics.support.missingReferencePixelCount},
+          {"excess_candidate_pixel_count",
+           metrics.support.excessCandidatePixelCount},
+          {"missing_fraction_of_reference",
+           metrics.support.missingFractionOfReference},
+          {"excess_fraction_of_candidate",
+           metrics.support.excessFractionOfCandidate}}},
+        {"tile_coverage",
+         {{"columns", metrics.tileCoverage.columns},
+          {"rows", metrics.tileCoverage.rows},
+          {"sample_count", metrics.tileCoverage.sampleCount},
+          {"p50_absolute_delta",
+           metrics.tileCoverage.p50AbsoluteDelta},
+          {"p95_absolute_delta",
+           metrics.tileCoverage.p95AbsoluteDelta},
+          {"maximum_absolute_delta",
+           metrics.tileCoverage.maximumAbsoluteDelta}}},
+        {"blurred_linear_rgb",
+         {{"sample_count", metrics.blurredLinearRgb.sampleCount},
+          {"mean_absolute_error",
+           metrics.blurredLinearRgb.meanAbsoluteError},
+          {"root_mean_square_error",
+           metrics.blurredLinearRgb.rootMeanSquareError}}},
+        {"mutual_support_depth",
+         {{"sample_count", metrics.mutualSupportDepth.sampleCount},
+          {"median_absolute_error",
+           metrics.mutualSupportDepth.medianAbsoluteError},
+          {"p95_absolute_error",
+           metrics.mutualSupportDepth.p95AbsoluteError}}},
+    };
+}
+
+}  // namespace scene3_density_parity_smoke
+
+int RunScene3DensityParitySmoke(
+    const GuiSmokeOptions& options,
+    platform::Window* window,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    PreviewRuntimeState* runtimeState) {
+    using namespace scene3_density_parity_smoke;
+    const auto outputDirectory = options.outputDirectory.empty()
+        ? std::filesystem::path{"build/macos-debug/scene3-density-parity"}
+        : options.outputDirectory;
+    const auto reportPath =
+        outputDirectory / "scene3-density-parity.json";
+    std::error_code outputError;
+    std::filesystem::create_directories(outputDirectory, outputError);
+    if (outputError) {
+        std::cerr << "Could not create Scene3 density-parity output directory: "
+                  << outputError.message() << '\n';
+        return 1;
+    }
+
+    std::vector<std::string> passes;
+    std::vector<std::string> failures;
+    nlohmann::json report{
+        {"scenario", options.scenario},
+        {"project_path", options.projectPath.string()},
+        {"simulated_seconds", kSimulatedSeconds},
+        {"gates",
+         {{"candidate_to_reference_coverage_ratio", {0.95, 1.05}},
+          {"candidate_to_reference_optical_depth_ratio", {0.90, 1.10}},
+          {"maximum_missing_fraction_of_reference", 0.05},
+          {"maximum_p95_tile_coverage_delta", 0.10},
+          {"maximum_blurred_linear_rgb_mae", 0.04}}},
+    };
+    const auto pass = [&](std::string message) {
+        passes.push_back(std::move(message));
+    };
+    const auto fail = [&](std::string message) {
+        failures.push_back(std::move(message));
+    };
+    const auto finish = [&]() {
+        report["passed"] = failures.empty();
+        report["passes"] = passes;
+        report["failures"] = failures;
+        std::string writeError;
+        if (!invisible_places::app::workspace::WriteJsonDocument(
+                report,
+                reportPath,
+                &writeError)) {
+            std::cerr << writeError << '\n';
+            return 1;
+        }
+        std::cout << "Scene3 density-parity report: "
+                  << reportPath.string() << std::endl;
+        return failures.empty() ? 0 : 1;
+    };
+
+    if (window == nullptr || viewport == nullptr || runtimeState == nullptr) {
+        fail("Scene3 density parity did not receive a live window, viewport, and runtime state.");
+        return finish();
+    }
+    report["renderer"] = {
+        {"device", viewport->Diagnostics().rendererName},
+        {"driver", viewport->Diagnostics().driverName},
+    };
+    const auto peerProcesses = QueryInvisiblePlacesPeerProcesses();
+    if (!peerProcesses.success) {
+        fail(peerProcesses.errorMessage);
+        return finish();
+    }
+    if (!peerProcesses.processIds.empty()) {
+        std::ostringstream message;
+        message << "Another Invisible Places process appeared before project load (PID";
+        message << (peerProcesses.processIds.size() == 1U ? " " : "s ");
+        for (std::size_t index = 0U;
+             index < peerProcesses.processIds.size();
+             ++index) {
+            if (index > 0U) {
+                message << ", ";
+            }
+            message << peerProcesses.processIds[index];
+        }
+        message << "). Close it before running this exclusive smoke.";
+        fail(message.str());
+        return finish();
+    }
+    std::string peerExclusionFailure;
+    auto lastPeerProcessCheck = std::chrono::steady_clock::now();
+    const auto maintainPeerProcessExclusion = [&](bool force) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!force &&
+            now - lastPeerProcessCheck < std::chrono::seconds{1}) {
+            return peerExclusionFailure.empty();
+        }
+        lastPeerProcessCheck = now;
+        const auto peers = QueryInvisiblePlacesPeerProcesses();
+        if (!peers.success) {
+            peerExclusionFailure = peers.errorMessage;
+            return false;
+        }
+        if (peers.processIds.empty()) {
+            return true;
+        }
+        std::ostringstream message;
+        message << "Another Invisible Places process appeared during the "
+                   "exclusive Scene3 density smoke (PID";
+        message << (peers.processIds.size() == 1U ? " " : "s ");
+        for (std::size_t index = 0U;
+             index < peers.processIds.size();
+             ++index) {
+            if (index > 0U) {
+                message << ", ";
+            }
+            message << peers.processIds[index];
+        }
+        message << "). The comparison was aborted before using mixed live state.";
+        peerExclusionFailure = message.str();
+        return false;
+    };
+    if (options.projectPath.empty()) {
+        fail("Scene3 density parity requires an explicit local --smoke-project path.");
+        return finish();
+    }
+
+    std::string projectError;
+    auto project = invisible_places::serialization::LoadProjectDocument(
+        options.projectPath,
+        &projectError);
+    if (!project.has_value()) {
+        fail("The explicit density-parity project did not load: " + projectError);
+        return finish();
+    }
+    std::error_code canonicalError;
+    const auto resolvedProjectPath = std::filesystem::canonical(
+        options.projectPath,
+        canonicalError);
+    report["resolved_project_path"] = canonicalError
+        ? options.projectPath.lexically_normal().string()
+        : resolvedProjectPath.string();
+
+    const auto initialScene = std::find_if(
+        runtimeState->pointCloudScenes.begin(),
+        runtimeState->pointCloudScenes.end(),
+        [](const auto& candidate) {
+            return candidate.sceneGroupName == "Scene3";
+        });
+    if (initialScene == runtimeState->pointCloudScenes.end()) {
+        fail("Asset discovery contains no Scene3 point-cloud group.");
+        return finish();
+    }
+    const auto fiveMillimetreBundle = std::find_if(
+        initialScene->displayBundles.begin(),
+        initialScene->displayBundles.end(),
+        [](const auto& bundle) {
+            return bundle.spacingMicrometres == kFiveMillimetreSpacing;
+        });
+    const auto oneMillimetreBundle = std::find_if(
+        initialScene->displayBundles.begin(),
+        initialScene->displayBundles.end(),
+        [](const auto& bundle) {
+            return bundle.spacingMicrometres == kOneMillimetreSpacing;
+        });
+    if (fiveMillimetreBundle == initialScene->displayBundles.end() ||
+        oneMillimetreBundle == initialScene->displayBundles.end()) {
+        fail("Scene3 does not contain complete, switchable 5 mm and 1 mm ROCK/SAND/VEG bundles.");
+        return finish();
+    }
+
+    bool foundSceneDocument = false;
+    for (auto& group : project->scenePointCloudGroups) {
+        const bool active = group.sceneGroupName == "Scene3";
+        group.displayLoaded = active;
+        group.displayVisible = active;
+        if (!active) {
+            continue;
+        }
+        foundSceneDocument = true;
+        group.displaySpacingMeters = 0.005F;
+        for (auto& roleSource : group.roleSources) {
+            const auto role = invisible_places::scene::ParseScenePointCloudRole(
+                roleSource.sceneRole);
+            if (!role.has_value()) {
+                continue;
+            }
+            const auto roleIndex =
+                invisible_places::scene::ScenePointCloudRoleIndex(
+                    role.value());
+            roleSource.displaySourcePath = runtimeState->sessions[
+                fiveMillimetreBundle->sessionIndices[roleIndex]]
+                                               .sourcePath;
+        }
+    }
+    if (!foundSceneDocument) {
+        fail("The explicit project contains no Scene3 scene-group document.");
+        return finish();
+    }
+    project->activeSceneGroupName = "Scene3";
+    project->activeWaterSceneGroupName.clear();
+    project->selectedLayerPath = runtimeState->sessions[
+        fiveMillimetreBundle->sessionIndices.front()]
+                                     .sourcePath;
+    project->liveVisualEffects = false;
+    project->previewPerformanceMode = false;
+    project->eyeDomeLightingEnabled = false;
+    project->proResAlphaPreviewEnabled = false;
+    project->pointCloudRendererMode = PointCloudRendererMode::Beauty;
+    // Keep the authored background RGB for an exact visible comparison, but
+    // clear alpha to zero so the live composite's alpha is actual point
+    // coverage rather than the project's normally opaque canvas. ProRes alpha
+    // preview stays off, so this does not premultiply or darken the RGB image.
+    project->backgroundColor[3U] = 0.0F;
+
+    const auto loadStarted = std::chrono::steady_clock::now();
+    if (!ApplyProjectDocumentToRuntime(
+            project.value(),
+            runtimeState,
+            viewport)) {
+        fail(
+            "The explicit Scene3 density-parity project could not be applied: " +
+            (runtimeState->errorMessage.empty()
+                 ? runtimeState->statusMessage
+                 : runtimeState->errorMessage));
+        return finish();
+    }
+
+    const auto disableEffects = [&]() {
+        runtimeState->projectSettings.liveVisualEffects = false;
+        runtimeState->projectSettings.previewPerformanceMode = false;
+        runtimeState->projectSettings.eyeDomeLightingEnabled = false;
+        runtimeState->projectSettings.proResAlphaPreviewEnabled = false;
+        runtimeState->projectSettings.pointCloudRendererMode =
+            PointCloudRendererMode::Beauty;
+        runtimeState->projectSettings.backgroundColor[3U] = 0.0F;
+        runtimeState->animationPanel.previewDepthOfField = false;
+        runtimeState->water.collisionRainSettings.enabled = false;
+        runtimeState->water.collisionRainSettings.rainLevel = 0.0F;
+        runtimeState->water.dynamicMeshFlowSettings.enabled = false;
+        runtimeState->water.dynamicMeshFlowSettings.showTrails = false;
+        runtimeState->water.showFlowTrails = false;
+        runtimeState->water.emitters.clear();
+        runtimeState->water.manualFlowPaths.clear();
+        runtimeState->water.rippleLayers.clear();
+        runtimeState->water.fieldLayers.clear();
+        runtimeState->water.shorelineInstances.clear();
+        runtimeState->water.selectedShorelineInstanceIndex.reset();
+        runtimeState->water.flowOverlay = {};
+        runtimeState->water.flowTrailOverlay = {};
+        runtimeState->water.fieldTrailOverlay = {};
+        for (auto& node : runtimeState->water.seepageNodes) {
+            node.enabledInViewport = false;
+        }
+        for (auto& timingState :
+             runtimeState->water.timingTakeSceneStates) {
+            timingState.waterFeatureTimingRuns.clear();
+            timingState.colouriseEffects.clear();
+            timingState.onlyShowWaterFeaturesInRuns = false;
+        }
+        runtimeState->water.featureTimingRunsByScenario.clear();
+        for (auto& session : runtimeState->sessions) {
+            if (session.kind == LayerKind::GaussianSplat ||
+                IsGeneratedWaterOverlaySession(session) ||
+                (!session.sceneGroupName.empty() &&
+                 session.sceneGroupName != "Scene3")) {
+                session.visible = false;
+            }
+        }
+        viewport->SetTemporalCameraOverlay(false);
+        viewport->SetLiveRainSimulationEnabled(false);
+    };
+    disableEffects();
+
+    const auto surfaceIndex = FindProjectPointVisualIndex(
+        runtimeState->pointVisualLibrary,
+        "Surface");
+    if (!surfaceIndex.has_value()) {
+        fail("The explicit project contains no saved 'Surface' Visual.");
+        return finish();
+    }
+    const auto savedSurface = runtimeState->pointVisualLibrary
+                                  .pointVisuals[surfaceIndex.value()]
+                                  .style;
+    const bool expectedSurfaceShape =
+        savedSurface.geometryMode == PointCloudGeometryMode::ScreenSprites &&
+        savedSurface.screenSpriteSizeMode ==
+            PointCloudScreenSpriteSizeMode::WorldMillimeters &&
+        savedSurface.falloffProfile == PointCloudFalloffProfile::Gaussian &&
+        savedSurface.surfelDiameter.active &&
+        savedSurface.surfelDiameter.mode ==
+            invisible_places::style::ParameterSourceMode::Constant &&
+        std::abs(
+            savedSurface.surfelDiameter.constantValue[0] - 0.004F) <=
+            1.0e-6F &&
+        std::abs(savedSurface.gaussianSharpness - 4.0F) <= 1.0e-6F;
+    if (!expectedSurfaceShape) {
+        fail(
+            "Saved Visual 'Surface' is not the expected 4 mm Gaussian "
+            "world-sprite baseline (sharpness 4).");
+        return finish();
+    }
+    report["surface_visual"] = {
+        {"name", "Surface"},
+        {"style_hash", PointStyleHash(savedSurface)},
+        {"geometry_mode", "screen_sprites"},
+        {"size_mode", "world_millimeters"},
+        {"surfel_diameter_metres",
+         savedSurface.surfelDiameter.constantValue[0]},
+        {"falloff", "gaussian"},
+        {"gaussian_sharpness", savedSurface.gaussianSharpness},
+    };
+    report["capture"] = {
+        {"background_alpha", 0.0F},
+        {"background_rgb_preserved", true},
+        {"prores_alpha_preview_enabled", false},
+        {"alpha_semantics", "point coverage over transparent authored RGB"},
+    };
+    report["frozen_render_state"] = {
+        {"renderer_mode", "beauty"},
+        {"live_visual_effects", false},
+        {"preview_performance_mode", false},
+        {"eye_dome_lighting", false},
+        {"depth_of_field", false},
+        {"temporal_camera_overlay", false},
+        {"rain", false},
+        {"seepage", false},
+        {"flow", false},
+        {"shoreline", false},
+        {"gaussian_splats", false},
+        {"timing_colourise", false},
+    };
+
+    const auto selectSurface = [&]() {
+        const auto sibling = std::find_if(
+            runtimeState->sessions.begin(),
+            runtimeState->sessions.end(),
+            [](const auto& candidate) {
+                return candidate.sceneGroupName == "Scene3" &&
+                       invisible_places::scene::ParseScenePointCloudRole(
+                           candidate.sceneRole)
+                           .has_value();
+            });
+        if (sibling == runtimeState->sessions.end()) {
+            fail("Scene3 has no role session on which to select Surface.");
+            return false;
+        }
+        const auto warning = SelectProjectPointVisualForScene(
+            runtimeState,
+            *sibling,
+            "Surface",
+            false);
+        if (!warning.empty()) {
+            fail("Surface Visual field binding failed: " + warning);
+            return false;
+        }
+        for (const auto& candidate : runtimeState->sessions) {
+            if (candidate.sceneGroupName != "Scene3" ||
+                !invisible_places::scene::ParseScenePointCloudRole(
+                     candidate.sceneRole)
+                     .has_value()) {
+                continue;
+            }
+            if (candidate.selectedPointVisualName != "Surface" ||
+                !PointStylesEqualForSelection(
+                    candidate.pointStyle,
+                    savedSurface)) {
+                fail(
+                    "Surface Visual was not reproduced exactly on Scene3 " +
+                    candidate.sceneRole + " sibling " +
+                    candidate.sourcePath.filename().string() + ".");
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!selectSurface()) {
+        return finish();
+    }
+
+    const auto patchCamera = std::find_if(
+        runtimeState->cameraShots.begin(),
+        runtimeState->cameraShots.end(),
+        [](const auto& shot) { return shot.name == "Patch 04"; });
+    if (patchCamera == runtimeState->cameraShots.end()) {
+        fail("The explicit project contains no saved 'Patch 04' camera.");
+        return finish();
+    }
+    auto requestedCamera = patchCamera->state;
+    requestedCamera.hasDepthOfField = false;
+    requestedCamera.depthOfFieldMaxBlurPixels = 0.0F;
+    runtimeState->camera.ApplyState(requestedCamera);
+    const auto frozenCamera = runtimeState->camera.CaptureState();
+    const auto frozenWidth = viewport->Width();
+    const auto frozenHeight = viewport->Height();
+    const auto frozenAspect = CurrentAspectRatio(*viewport);
+    const auto frozenMatrices = runtimeState->camera.Matrices(frozenAspect);
+    report["camera"] = CameraJson(frozenCamera);
+    report["view_matrix"] = MatrixJson(frozenMatrices.view);
+    report["projection_matrix"] = MatrixJson(frozenMatrices.projection);
+    report["framebuffer"] = {
+        {"width", frozenWidth},
+        {"height", frozenHeight},
+    };
+
+    auto sceneIt = std::find_if(
+        runtimeState->pointCloudScenes.begin(),
+        runtimeState->pointCloudScenes.end(),
+        [](const auto& candidate) {
+            return candidate.sceneGroupName == "Scene3";
+        });
+    if (sceneIt == runtimeState->pointCloudScenes.end()) {
+        fail("Applied project contains no Scene3 runtime.");
+        return finish();
+    }
+    auto& scene = *sceneIt;
+    scene.displayVisible = true;
+    const auto neutralWaterFrame = ResolveWaterFrameState(runtimeState);
+    const auto deadline = loadStarted + std::chrono::hours{2};
+    const auto pumpFrame = [&]() {
+        if (!maintainPeerProcessExclusion(false)) {
+            return false;
+        }
+        window->PollEvents();
+        PollPendingLayerLoad(runtimeState, viewport);
+        CommitReadySceneDisplaySwitches(runtimeState, viewport);
+        StartQueuedLayerLoadIfIdle(runtimeState);
+        disableEffects();
+        scene.displayVisible = true;
+        runtimeState->camera.ApplyState(frozenCamera);
+        runtimeState->previewRenderStateSignatureValid = false;
+        viewport->BeginUiFrame();
+        viewport->SetDiagnosticsEnabled(true);
+        viewport->SetSceneCachingEnabled(false);
+        viewport->SetLiveSceneRenderingEnabled(true);
+        viewport->SetLiveRainSimulationEnabled(false);
+        viewport->UpdateRenderState(BuildRenderState(
+            *runtimeState,
+            *viewport,
+            kSimulatedSeconds,
+            &neutralWaterFrame,
+            &frozenCamera));
+        viewport->DrawFrame();
+        return true;
+    };
+    const auto bundleReady = [&](std::uint32_t spacingMicrometres) {
+        return scene.displayLoaded && scene.displayVisible &&
+               !scene.pendingDisplaySpacingMicrometres.has_value() &&
+               !scene.pendingMixedDisplay &&
+               scene.committedDisplaySpacingMicrometres ==
+                   spacingMicrometres &&
+               std::all_of(
+                   scene.committedDisplaySessionIndices.begin(),
+                   scene.committedDisplaySessionIndices.end(),
+                   [&](const auto& index) {
+                       return index.has_value() &&
+                              index.value() <
+                                  runtimeState->sessions.size() &&
+                              runtimeState->sessions[index.value()]
+                                  .loaded &&
+                              runtimeState->sessions[index.value()]
+                                  .gpuResident;
+                   });
+    };
+    const auto settleBundle = [&](std::uint32_t spacingMicrometres) {
+        bool requested = false;
+        StartQueuedLayerLoadIfIdle(runtimeState);
+        while (std::chrono::steady_clock::now() < deadline &&
+               !window->ShouldClose()) {
+            if (!pumpFrame()) {
+                return false;
+            }
+            if (bundleReady(spacingMicrometres)) {
+                return true;
+            }
+            if (!requested &&
+                !scene.pendingDisplaySpacingMicrometres.has_value() &&
+                !scene.pendingMixedDisplay &&
+                scene.committedDisplaySpacingMicrometres !=
+                    spacingMicrometres) {
+                if (!RequestSceneDisplaySwitch(
+                        runtimeState,
+                        viewport,
+                        &scene,
+                        spacingMicrometres)) {
+                    return false;
+                }
+                requested = true;
+                StartQueuedLayerLoadIfIdle(runtimeState);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        }
+        return false;
+    };
+
+    const auto validateFrozenState = [&]() {
+        disableEffects();
+        if (!selectSurface()) {
+            return false;
+        }
+        runtimeState->camera.ApplyState(frozenCamera);
+        const auto matrices =
+            runtimeState->camera.Matrices(CurrentAspectRatio(*viewport));
+        if (viewport->Width() != frozenWidth ||
+            viewport->Height() != frozenHeight ||
+            !MatricesApproximatelyEqual(
+                matrices.view,
+                frozenMatrices.view) ||
+            !MatricesApproximatelyEqual(
+                matrices.projection,
+                frozenMatrices.projection)) {
+            fail(
+                "Framebuffer or Patch 04 camera changed between density "
+                "captures.");
+            return false;
+        }
+        const auto renderState = BuildRenderState(
+            *runtimeState,
+            *viewport,
+            kSimulatedSeconds,
+            &neutralWaterFrame,
+            &frozenCamera);
+        const bool neutral =
+            renderState.pointCloudRendererMode ==
+                PointCloudRendererMode::Beauty &&
+            renderState.backgroundColor.a <= 1.0e-6F &&
+            !renderState.proResAlphaPreviewEnabled &&
+            !renderState.previewPerformanceMode &&
+            !renderState.eyeDomeLightingEnabled &&
+            !renderState.hasDepthOfField &&
+            !renderState.rainSettings.enabled &&
+            renderState.rainSettings.rainLevel <= 1.0e-6F &&
+            renderState.gaussianSplatLayers.empty() &&
+            renderState.additionalShorelines.empty() &&
+            renderState.pointCloudLayers.size() ==
+                invisible_places::scene::kScenePointCloudRoleCount &&
+            std::all_of(
+                renderState.pointCloudLayers.begin(),
+                renderState.pointCloudLayers.end(),
+                [](const auto& layer) {
+                    return !layer.generatedWaterOverlay &&
+                           !layer.regionWaterEffectsEnabled &&
+                           layer.timingColourise.effectCount == 0U &&
+                           !layer.style.shorelineWaveEnabled &&
+                           !layer.style.flowAnimation &&
+                           !layer.style.waterTrailOverlay &&
+                           !layer.style.rainImpactEffects &&
+                           !invisible_places::renderer::pointcloud::
+                                PointCloudStyleHasActiveRoughnessMotion(
+                                    layer.style) &&
+                           !invisible_places::renderer::pointcloud::
+                                PointCloudStyleHasActiveCaustics(
+                                    layer.style);
+                });
+        if (!neutral) {
+            fail(
+                "A Water, Rain, Seepage, Flow, Shoreline, gSplat, timing, "
+                "EDL, DOF, temporal, or performance path remained active.");
+            return false;
+        }
+        return true;
+    };
+
+    const auto observeBundle = [&](std::uint32_t spacingMicrometres) {
+        BundleObservation observation;
+        observation.spacingMicrometres = spacingMicrometres;
+        const auto& expectedCounts =
+            spacingMicrometres == kFiveMillimetreSpacing
+                ? kExpectedFiveMillimetreCounts
+                : kExpectedOneMillimetreCounts;
+        for (std::size_t roleIndex = 0U;
+             roleIndex < observation.roles.size();
+             ++roleIndex) {
+            const auto sessionIndex =
+                scene.committedDisplaySessionIndices[roleIndex];
+            auto& roleObservation = observation.roles[roleIndex];
+            const auto role = static_cast<
+                invisible_places::scene::ScenePointCloudRole>(roleIndex);
+            roleObservation.role = std::string{
+                invisible_places::scene::ScenePointCloudRoleName(role)};
+            roleObservation.expectedPointCount = expectedCounts[roleIndex];
+            if (!sessionIndex.has_value() ||
+                sessionIndex.value() >= runtimeState->sessions.size()) {
+                fail(
+                    "Committed " + std::to_string(spacingMicrometres) +
+                    " um bundle is missing " + roleObservation.role + ".");
+                continue;
+            }
+            const auto& session =
+                runtimeState->sessions[sessionIndex.value()];
+            roleObservation.sourcePath = session.sourcePath;
+            std::error_code pathError;
+            roleObservation.resolvedSourcePath =
+                std::filesystem::canonical(session.sourcePath, pathError);
+            if (pathError) {
+                roleObservation.resolvedSourcePath =
+                    session.sourcePath.lexically_normal();
+            }
+            roleObservation.pointCount = session.totalPrimitives;
+            observation.totalPointCount += session.totalPrimitives;
+            const auto density = ResolveSessionDensityCompensation(
+                *runtimeState,
+                session);
+            roleObservation.footprintScale = density.footprintScale;
+            roleObservation.coverageCorrection =
+                density.coverageCorrection;
+            roleObservation.expectedFootprintScale =
+                spacingMicrometres == kFiveMillimetreSpacing
+                    ? static_cast<float>(std::sqrt(
+                          static_cast<double>(
+                              kExpectedOneMillimetreCounts[roleIndex]) /
+                          static_cast<double>(
+                              kExpectedFiveMillimetreCounts[roleIndex])))
+                    : 1.0F;
+            const auto effectiveStyle = MakeSceneRenderStyle(
+                *runtimeState,
+                session,
+                session.pointStyle);
+            roleObservation.effectiveStyleHash =
+                PointStyleHash(effectiveStyle);
+            roleObservation.materialVariant =
+                invisible_places::renderer::pointcloud::
+                    ResolvePointCloudMaterialVariant(
+                        effectiveStyle,
+                        density);
+
+            if (roleObservation.pointCount !=
+                roleObservation.expectedPointCount) {
+                fail(
+                    roleObservation.role + " " +
+                    std::to_string(spacingMicrometres / 1000U) +
+                    " mm count is " +
+                    std::to_string(roleObservation.pointCount) +
+                    ", expected current source count " +
+                    std::to_string(roleObservation.expectedPointCount) +
+                    ".");
+            }
+            if (std::abs(roleObservation.coverageCorrection - 1.0F) >
+                    1.0e-6F ||
+                std::abs(
+                    roleObservation.footprintScale -
+                    roleObservation.expectedFootprintScale) >
+                    std::max(
+                        1.0e-5F,
+                        roleObservation.expectedFootprintScale * 1.0e-5F)) {
+                fail(
+                    roleObservation.role + " " +
+                    std::to_string(spacingMicrometres / 1000U) +
+                    " mm density compensation does not match the "
+                    "count-derived footprint with unit coverage correction.");
+            }
+            if (spacingMicrometres == kFiveMillimetreSpacing &&
+                roleObservation.materialVariant !=
+                    PointCloudMaterialVariant::Unified) {
+                fail(
+                    roleObservation.role +
+                    " compensated 5 mm Beauty render did not select the "
+                    "Unified material.");
+            }
+        }
+        return observation;
+    };
+    const auto validateCoverageCapture = [&](
+        const WaterIntegrationCapturedFrame& frame,
+        std::string_view label) {
+        const auto pixelCount =
+            static_cast<std::size_t>(frame.width) * frame.height;
+        if (frame.alpha.size() != pixelCount ||
+            frame.depth.size() != pixelCount) {
+            fail(
+                std::string{label} +
+                " capture has inconsistent alpha/depth dimensions.");
+            return false;
+        }
+        std::size_t foregroundCount = 0U;
+        std::size_t transparentCount = 0U;
+        std::size_t depthBackedForegroundCount = 0U;
+        float minimumAlpha = 1.0F;
+        float maximumAlpha = 0.0F;
+        for (std::size_t pixel = 0U; pixel < pixelCount; ++pixel) {
+            const auto alpha = std::clamp(
+                std::isfinite(frame.alpha[pixel])
+                    ? frame.alpha[pixel]
+                    : 0.0F,
+                0.0F,
+                1.0F);
+            minimumAlpha = std::min(minimumAlpha, alpha);
+            maximumAlpha = std::max(maximumAlpha, alpha);
+            if (alpha >= 0.01F) {
+                ++foregroundCount;
+                if (std::isfinite(frame.depth[pixel]) &&
+                    frame.depth[pixel] > 0.0F) {
+                    ++depthBackedForegroundCount;
+                }
+            } else {
+                ++transparentCount;
+            }
+        }
+        report["capture"][std::string{label}] = {
+            {"pixel_count", pixelCount},
+            {"foreground_pixel_count", foregroundCount},
+            {"transparent_pixel_count", transparentCount},
+            {"depth_backed_foreground_pixel_count",
+             depthBackedForegroundCount},
+            {"minimum_alpha", minimumAlpha},
+            {"maximum_alpha", maximumAlpha},
+        };
+        if (foregroundCount == 0U || transparentCount == 0U ||
+            depthBackedForegroundCount == 0U ||
+            maximumAlpha - minimumAlpha <= 1.0e-4F) {
+            fail(
+                std::string{label} +
+                " capture did not preserve a non-vacuous point-coverage alpha matte.");
+            return false;
+        }
+        return true;
+    };
+
+    if (!settleBundle(kFiveMillimetreSpacing)) {
+        if (!peerExclusionFailure.empty()) {
+            fail(peerExclusionFailure);
+            return finish();
+        }
+        fail(
+            "The complete 5 mm Scene3 bundle did not settle before the "
+            "two-hour deadline: " +
+            (scene.switchError.empty()
+                 ? runtimeState->errorMessage
+                 : scene.switchError));
+        return finish();
+    }
+    if (!validateFrozenState()) {
+        return finish();
+    }
+    const auto fiveObservation =
+        observeBundle(kFiveMillimetreSpacing);
+    report["timing_ms"]["project_apply_and_5mm_ready"] =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - loadStarted)
+            .count();
+    if (!maintainPeerProcessExclusion(true)) {
+        fail(peerExclusionFailure);
+        return finish();
+    }
+    std::string artifactError;
+    auto fiveFrame = CaptureWaterIntegrationFrame(
+        runtimeState,
+        viewport,
+        neutralWaterFrame,
+        kSimulatedSeconds,
+        outputDirectory / "scene3-5mm.exr",
+        {},
+        &artifactError);
+    if (!fiveFrame.has_value() ||
+        !WritePatchBoundaryPng(
+            outputDirectory / "scene3-5mm.png",
+            fiveFrame.value(),
+            &artifactError)) {
+        fail("Could not capture actual Scene3 5 mm frame: " + artifactError);
+        return finish();
+    }
+    if (!validateCoverageCapture(fiveFrame.value(), "candidate_5mm")) {
+        return finish();
+    }
+    pass("Captured the actual complete 5 mm Scene3 Surface frame first.");
+
+    const auto oneMillimetreSwitchStarted =
+        std::chrono::steady_clock::now();
+    if (!RequestSceneDisplaySwitch(
+            runtimeState,
+            viewport,
+            &scene,
+            kOneMillimetreSpacing)) {
+        fail(
+            "Could not request the atomic Scene3 1 mm switch: " +
+            (scene.switchError.empty()
+                 ? runtimeState->errorMessage
+                 : scene.switchError));
+        return finish();
+    }
+    StartQueuedLayerLoadIfIdle(runtimeState);
+    if (!settleBundle(kOneMillimetreSpacing)) {
+        if (!peerExclusionFailure.empty()) {
+            fail(peerExclusionFailure);
+            return finish();
+        }
+        fail(
+            "The complete 1 mm Scene3 bundle did not settle before the "
+            "two-hour deadline: " +
+            (scene.switchError.empty()
+                 ? runtimeState->errorMessage
+                 : scene.switchError));
+        return finish();
+    }
+    if (!validateFrozenState()) {
+        return finish();
+    }
+    const auto oneObservation =
+        observeBundle(kOneMillimetreSpacing);
+    report["timing_ms"]["5mm_to_1mm_switch"] =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() -
+            oneMillimetreSwitchStarted)
+            .count();
+    for (std::size_t roleIndex = 0U;
+         roleIndex < fiveObservation.roles.size();
+         ++roleIndex) {
+        if (fiveObservation.roles[roleIndex].effectiveStyleHash !=
+            oneObservation.roles[roleIndex].effectiveStyleHash) {
+            fail(
+                fiveObservation.roles[roleIndex].role +
+                " effective Surface style changed between 5 mm and 1 mm.");
+        }
+    }
+    if (!failures.empty()) {
+        report["sources"] = {
+            {"candidate_5mm", BundleJson(fiveObservation)},
+            {"reference_1mm", BundleJson(oneObservation)},
+        };
+        return finish();
+    }
+
+    if (!maintainPeerProcessExclusion(true)) {
+        fail(peerExclusionFailure);
+        return finish();
+    }
+    auto oneFrame = CaptureWaterIntegrationFrame(
+        runtimeState,
+        viewport,
+        neutralWaterFrame,
+        kSimulatedSeconds,
+        outputDirectory / "scene3-1mm.exr",
+        {},
+        &artifactError);
+    if (!oneFrame.has_value() ||
+        !WritePatchBoundaryPng(
+            outputDirectory / "scene3-1mm.png",
+            oneFrame.value(),
+            &artifactError)) {
+        fail("Could not capture actual Scene3 1 mm frame: " + artifactError);
+        return finish();
+    }
+    if (!validateCoverageCapture(oneFrame.value(), "reference_1mm")) {
+        return finish();
+    }
+    pass(
+        "Atomically switched to and captured the actual complete 1 mm "
+        "Scene3 Surface reference.");
+
+    std::array contactFrames{
+        std::move(fiveFrame.value()),
+        std::move(oneFrame.value()),
+    };
+    if (!WritePatchBoundaryContactSheetPng(
+            outputDirectory / "density-contact-sheet.png",
+            contactFrames,
+            &artifactError)) {
+        fail("Could not write density contact sheet: " + artifactError);
+        return finish();
+    }
+
+    const point_density_parity::LinearFrameView referenceView{
+        .width = contactFrames[1U].width,
+        .height = contactFrames[1U].height,
+        .red = contactFrames[1U].linearRed,
+        .green = contactFrames[1U].linearGreen,
+        .blue = contactFrames[1U].linearBlue,
+        .alpha = contactFrames[1U].alpha,
+        .depth = contactFrames[1U].depth,
+    };
+    const point_density_parity::LinearFrameView candidateView{
+        .width = contactFrames[0U].width,
+        .height = contactFrames[0U].height,
+        .red = contactFrames[0U].linearRed,
+        .green = contactFrames[0U].linearGreen,
+        .blue = contactFrames[0U].linearBlue,
+        .alpha = contactFrames[0U].alpha,
+        .depth = contactFrames[0U].depth,
+    };
+    const auto comparison = point_density_parity::Compare(
+        referenceView,
+        candidateView);
+    if (!comparison.success) {
+        fail(
+            "Point-density parity comparison failed: " +
+            comparison.errorMessage);
+        return finish();
+    }
+    if (!WriteAbsoluteDifferencePng(
+            outputDirectory / "linear-rgb-abs-diff.png",
+            comparison.diagnostics,
+            &artifactError) ||
+        !WriteSupportPng(
+            outputDirectory / "support-missing-excess.png",
+            comparison.diagnostics,
+            &artifactError)) {
+        fail("Could not write parity diagnostic PNGs: " + artifactError);
+        return finish();
+    }
+
+    report["sources"] = {
+        {"candidate_5mm", BundleJson(fiveObservation)},
+        {"reference_1mm", BundleJson(oneObservation)},
+    };
+    report["metrics"] = ComparisonMetricsJson(comparison.report);
+    report["artifacts"] = {
+        {"candidate_exr", "scene3-5mm.exr"},
+        {"candidate_png", "scene3-5mm.png"},
+        {"reference_exr", "scene3-1mm.exr"},
+        {"reference_png", "scene3-1mm.png"},
+        {"contact_sheet_png", "density-contact-sheet.png"},
+        {"absolute_difference_png", "linear-rgb-abs-diff.png"},
+        {"support_png", "support-missing-excess.png"},
+    };
+    report["timing_ms"]["total"] =
+        std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - loadStarted)
+            .count();
+
+    const auto& metrics = comparison.report;
+    if (!std::isfinite(metrics.candidateToReferenceCoverageRatio) ||
+        metrics.candidateToReferenceCoverageRatio < 0.95 ||
+        metrics.candidateToReferenceCoverageRatio > 1.05) {
+        fail("5 mm foreground coverage is outside 95-105% of the 1 mm reference.");
+    }
+    if (metrics.reference.opticalDepthSum > 1.0e-6 &&
+        (!std::isfinite(
+             metrics.candidateToReferenceOpticalDepthRatio) ||
+         metrics.candidateToReferenceOpticalDepthRatio < 0.90 ||
+         metrics.candidateToReferenceOpticalDepthRatio > 1.10)) {
+        fail("5 mm optical depth is outside 90-110% of the 1 mm reference.");
+    }
+    if (metrics.support.missingFractionOfReference > 0.05) {
+        fail("5 mm is missing more than 5% of 1 mm foreground support.");
+    }
+    if (metrics.tileCoverage.p95AbsoluteDelta > 0.10) {
+        fail("The p95 local tile coverage delta exceeds 10 percentage points.");
+    }
+    if (metrics.blurredLinearRgb.meanAbsoluteError > 0.04) {
+        fail("Blurred linear-RGB MAE exceeds 0.04.");
+    }
+    if (failures.empty()) {
+        pass(
+            "Actual compensated 5 mm coverage, optical depth, local "
+            "support, and blurred colour match the frozen 1 mm reference.");
+    }
     viewport->WaitIdle();
     return finish();
 }
@@ -114949,6 +116308,30 @@ std::filesystem::path Application::DefaultDataDirectory() {
 }
 
 int Application::Run(ApplicationRunOptions options) const {
+    if (options.guiSmoke.has_value() &&
+        options.guiSmoke->scenario == "scene3-density-parity") {
+        const auto peers = QueryInvisiblePlacesPeerProcesses();
+        if (!peers.success) {
+            std::cerr << peers.errorMessage << '\n';
+            return 2;
+        }
+        if (!peers.processIds.empty()) {
+            std::cerr
+                << "Scene3 density parity requires every other Invisible "
+                   "Places process to be closed. Running peer PID";
+            std::cerr << (peers.processIds.size() == 1U ? ": " : "s: ");
+            for (std::size_t index = 0U;
+                 index < peers.processIds.size();
+                 ++index) {
+                if (index > 0U) {
+                    std::cerr << ", ";
+                }
+                std::cerr << peers.processIds[index];
+            }
+            std::cerr << ".\n";
+            return 2;
+        }
+    }
     const auto runtimeConfig = platform::PrepareVulkanRuntime();
     const auto assetCatalog = DiscoverApplicationAssets(dataRoot_);
     const auto sceneCatalog = scene::SceneCatalog::FromDiscoveredAssets(assetCatalog);
@@ -115277,6 +116660,16 @@ int Application::Run(ApplicationRunOptions options) const {
             const auto smokeExitCode = RunScene3PatchBoundarySmoke(
                 options.guiSmoke.value(),
                 assetCatalog,
+                &window,
+                &viewport.value(),
+                &runtimeState);
+            StopBackgroundWorkForShutdown(&runtimeState);
+            viewport->WaitIdle();
+            return smokeExitCode;
+        }
+        if (options.guiSmoke->scenario == "scene3-density-parity") {
+            const auto smokeExitCode = RunScene3DensityParitySmoke(
+                options.guiSmoke.value(),
                 &window,
                 &viewport.value(),
                 &runtimeState);
