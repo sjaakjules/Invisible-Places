@@ -95972,12 +95972,18 @@ TimingColouriseHistogramIdentityForScene(
             .value_or(0U);
     for (std::size_t layer = 0U; layer < 3U;
          ++layer) {
+        // Key the cached histogram by the payload actually loaded: an active
+        // Scene3 display-density overlay swaps the 5 mm bytes behind the
+        // logical path, and its prefiltered field values have a different
+        // distribution from the shared file's.
         input.sources[layer] =
             invisible_places::timing::
                 InspectTimingColouriseHistogramSource(
-                    runtimeState
-                        ->sessions[indices[layer]]
-                        .sourcePath);
+                    invisible_places::io::
+                        ResolveSceneDisplayDensityPayloadPath(
+                            runtimeState
+                                ->sessions[indices[layer]]
+                                .sourcePath));
     }
     const auto fingerprint =
         invisible_places::timing::
@@ -96094,7 +96100,9 @@ BuildTimingColouriseHistogramBatch(
         bundleInput.sources[layer] =
             invisible_places::timing::
                 InspectTimingColouriseHistogramSource(
-                    batch.paths[layer]);
+                    invisible_places::io::
+                        ResolveSceneDisplayDensityPayloadPath(
+                            batch.paths[layer]));
     }
     batch.id =
         invisible_places::timing::
