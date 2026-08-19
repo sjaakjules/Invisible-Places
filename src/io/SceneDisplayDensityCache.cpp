@@ -25,6 +25,12 @@
 #if defined(__APPLE__) || defined(__linux__)
 #include <sys/stat.h>
 #endif
+#if defined(__APPLE__)
+// Hardware-accelerated SHA-256 (libSystem; no extra framework). The portable
+// software implementation below stays the reference for other platforms and
+// is far too slow for the ~2 GiB verified at every launch in a Debug build.
+#include <CommonCrypto/CommonDigest.h>
+#endif
 
 namespace invisible_places::io {
 
@@ -68,7 +74,7 @@ std::mutex gPayloadOverridesMutex;
 std::map<std::string, std::filesystem::path> gPayloadOverrides;
 std::string gActiveBundleFingerprint;
 
-class Sha256 {
+class SoftwareSha256 {
   public:
     void Update(const void* data, std::size_t size) {
         const auto* bytes = static_cast<const std::uint8_t*>(data);
@@ -205,6 +211,41 @@ class Sha256 {
     std::size_t blockSize_ = 0U;
     std::size_t totalBytes_ = 0U;
 };
+
+#if defined(__APPLE__)
+class Sha256 {
+  public:
+    Sha256() { CC_SHA256_Init(&context_); }
+
+    void Update(const void* data, std::size_t size) {
+        const auto* bytes = static_cast<const std::uint8_t*>(data);
+        while (size > 0U) {
+            const auto chunk = static_cast<CC_LONG>(std::min<std::size_t>(
+                size,
+                static_cast<std::size_t>(std::numeric_limits<CC_LONG>::max())));
+            CC_SHA256_Update(&context_, bytes, chunk);
+            bytes += chunk;
+            size -= chunk;
+        }
+    }
+
+    [[nodiscard]] std::string Finish() {
+        std::array<unsigned char, CC_SHA256_DIGEST_LENGTH> raw{};
+        CC_SHA256_Final(raw.data(), &context_);
+        std::ostringstream digest;
+        digest << std::hex << std::setfill('0');
+        for (const auto byte : raw) {
+            digest << std::setw(2) << static_cast<unsigned int>(byte);
+        }
+        return digest.str();
+    }
+
+  private:
+    CC_SHA256_CTX context_{};
+};
+#else
+using Sha256 = SoftwareSha256;
+#endif
 
 std::optional<std::string> Sha256File(
     const std::filesystem::path& path,
