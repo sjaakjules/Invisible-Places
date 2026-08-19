@@ -758,6 +758,15 @@ struct WaterFeatureTimeline {
     bool clipMembershipExplicit = false;
 };
 
+// A short authored event note shared by every feature assigned to one run.
+// The id is stable within that run; position uses the same normalized timing
+// domain as the run's keys and clips.
+struct WaterFeatureRunMark {
+    std::uint32_t id = 0U;
+    std::string text = "Mark";
+    float position = 0.0F;
+};
+
 struct WaterFeatureTimingRun {
     std::uint32_t id = 0U;
     std::string name = "Run";
@@ -766,6 +775,7 @@ struct WaterFeatureTimingRun {
     // treat their features as unkeyed until the run is enabled again.
     bool enabled = true;
     std::vector<WaterFeatureTimeline> features;
+    std::vector<WaterFeatureRunMark> marks;
 };
 
 struct WaterScenarioFeatureRuns {
@@ -944,6 +954,29 @@ SanitizeWaterKeyedSettingsProfileLibrary(
     std::string_view objectName);
 [[nodiscard]] WaterFeatureTimingRun SanitizeWaterFeatureTimingRun(
     WaterFeatureTimingRun run);
+// Mark ids are unique within a run. Default names are unique across the
+// supplied scene's runs and use the user-facing Mark 00, Mark 01 sequence.
+[[nodiscard]] std::uint32_t AllocateWaterFeatureRunMarkId(
+    const WaterFeatureTimingRun& run);
+[[nodiscard]] std::string AllocateWaterFeatureRunMarkName(
+    std::span<const WaterFeatureTimingRun> runs);
+[[nodiscard]] WaterFeatureRunMark* FindWaterFeatureRunMark(
+    WaterFeatureTimingRun* run,
+    std::uint32_t markId);
+[[nodiscard]] const WaterFeatureRunMark* FindWaterFeatureRunMark(
+    const WaterFeatureTimingRun* run,
+    std::uint32_t markId);
+[[nodiscard]] bool MoveWaterFeatureRunMark(
+    WaterFeatureTimingRun* run,
+    std::uint32_t markId,
+    float position);
+[[nodiscard]] bool RenameWaterFeatureRunMark(
+    WaterFeatureTimingRun* run,
+    std::uint32_t markId,
+    std::string_view text);
+[[nodiscard]] bool RemoveWaterFeatureRunMark(
+    WaterFeatureTimingRun* run,
+    std::uint32_t markId);
 // Moves an existing feature timeline (including dormant tracks and keys) to
 // the target run, or adds a new empty timeline when it is not assigned.
 [[nodiscard]] bool AssignWaterFeatureToTimingRun(

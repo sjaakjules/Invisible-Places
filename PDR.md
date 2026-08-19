@@ -579,6 +579,14 @@ shall create one shared profile without creating any Timing Take record. Live
 preview and every frozen export shall resolve exactly one profile into the
 existing Rain simulation.
 
+#### FR-STYLE-16
+Each Water Feature Run may own short text marks in its normalized animation
+domain. A mark applies to every feature assigned to that run, persists with the
+Timing Take scene state, follows reciprocal-loop mapping and retiming, and
+survives linked-state merging with stable run-local identity. Project schema 79
+adds the optional Feature Run `marks` array; projects without it load with no
+marks.
+
 ### 5.8 Procedural Motion
 #### FR-MOTION-1
 Dynamic point motion shall be procedural and non-destructive.

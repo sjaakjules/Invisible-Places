@@ -55542,6 +55542,15 @@ void RestoreWaterKeyEditSceneSnapshot(
         return;
     }
     for (const auto& savedRun : snapshot.runs) {
+        const auto currentRun = std::find_if(
+            scene->waterFeatureTimingRuns.begin(),
+            scene->waterFeatureTimingRuns.end(),
+            [&](const auto& candidate) {
+                return candidate.id == savedRun.id;
+            });
+        if (currentRun != scene->waterFeatureTimingRuns.end()) {
+            currentRun->marks = savedRun.marks;
+        }
         for (const auto& savedTimeline : savedRun.features) {
             for (auto& currentRun : scene->waterFeatureTimingRuns) {
                 const auto currentTimeline = std::find_if(
@@ -59637,6 +59646,9 @@ void MapTimingTakeSceneStateToReciprocalLoop(
         }
     };
     for (auto& run : state->waterFeatureTimingRuns) {
+        for (auto& mark : run.marks) {
+            mark.position = mapPosition(mark.position);
+        }
         for (auto& feature : run.features) {
             for (auto& setting : feature.settings) {
                 mapKeys(&setting.keys);
@@ -59689,6 +59701,9 @@ void MapTimingTakeSceneStateToReciprocalLoop(
 bool TimingTakeSceneStateHasAnimationCoordinates(
     const invisible_places::timing::TimingTakeSceneState& state) {
     for (const auto& run : state.waterFeatureTimingRuns) {
+        if (!run.marks.empty()) {
+            return true;
+        }
         for (const auto& feature : run.features) {
             for (const auto& setting : feature.settings) {
                 if (!setting.keys.empty()) {

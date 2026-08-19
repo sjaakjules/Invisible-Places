@@ -3499,6 +3499,9 @@ bool RetimeTimingTakeSceneStateNormalizedPositions(
     };
 
     for (auto& run : state->waterFeatureTimingRuns) {
+        for (auto& mark : run.marks) {
+            mark.position = retimePosition(mark.position);
+        }
         for (auto& feature : run.features) {
             for (auto& setting : feature.settings) {
                 retimeKeys(&setting.keys);
@@ -3702,6 +3705,38 @@ std::uint32_t AllocateMergedWaterRunId(
     return candidate;
 }
 
+void MergeWaterFeatureRunMarksKeepingFirst(
+    invisible_places::water::WaterFeatureTimingRun* destination,
+    std::span<const invisible_places::water::WaterFeatureRunMark> source) {
+    if (destination == nullptr) {
+        return;
+    }
+    for (const auto& sourceMark : source) {
+        const bool duplicate = std::any_of(
+            destination->marks.begin(),
+            destination->marks.end(),
+            [&](const auto& existing) {
+                return existing.text == sourceMark.text &&
+                       std::abs(existing.position - sourceMark.position) <=
+                           kTimingColouriseKeyTolerance;
+            });
+        if (duplicate) {
+            continue;
+        }
+        auto copied = sourceMark;
+        if (copied.id == 0U ||
+            invisible_places::water::FindWaterFeatureRunMark(
+                destination,
+                copied.id) != nullptr) {
+            copied.id = invisible_places::water::
+                AllocateWaterFeatureRunMarkId(*destination);
+        }
+        if (copied.id != 0U) {
+            destination->marks.push_back(std::move(copied));
+        }
+    }
+}
+
 }  // namespace
 
 void MergeTimingTakeSceneStateKeepingFirst(
@@ -3739,6 +3774,7 @@ void MergeTimingTakeSceneStateKeepingFirst(
          runIndex < destination->waterFeatureTimingRuns.size();
          ++runIndex) {
         auto& run = destination->waterFeatureTimingRuns[runIndex];
+        const bool originallyHadFeatures = !run.features.empty();
         for (std::size_t featureIndex = 0U;
              featureIndex < run.features.size();) {
             auto* firstOwner =
@@ -3778,11 +3814,21 @@ void MergeTimingTakeSceneStateKeepingFirst(
             MergeWaterFeatureTimelineKeepingFirst(
                 firstOwner,
                 run.features[featureIndex]);
+            MergeWaterFeatureRunMarksKeepingFirst(
+                firstOwnerRun,
+                run.marks);
             firstOwnerRun->enabled =
                 firstOwnerRun->enabled || run.enabled;
             run.features.erase(
                 run.features.begin() +
                 static_cast<std::ptrdiff_t>(featureIndex));
+        }
+        if (originallyHadFeatures && run.features.empty()) {
+            // Every feature that gave these marks meaning was repaired into
+            // its first owning run above. Do not leave the same annotations
+            // on an empty organizational shell where a future feature could
+            // inherit them accidentally.
+            run.marks.clear();
         }
     }
 
@@ -3814,7 +3860,6 @@ void MergeTimingTakeSceneStateKeepingFirst(
                    ? &*run
                    : nullptr;
     };
-
     for (const auto& sourceRun : source.waterFeatureTimingRuns) {
         auto* namedDestinationRun = findRunByName(sourceRun.name);
         const auto ensureDestinationRun = [&]() {
@@ -3838,11 +3883,15 @@ void MergeTimingTakeSceneStateKeepingFirst(
         // empty organizational group instead of duplicating the feature.
         auto* targetRun = ensureDestinationRun();
         targetRun->enabled = targetRun->enabled || sourceRun.enabled;
+        bool targetReceivedFeature = sourceRun.features.empty();
         for (const auto& sourceFeature : sourceRun.features) {
             auto [owningRun, destinationFeature] =
                 findFeature(sourceFeature.feature);
             if (destinationFeature != nullptr) {
                 owningRun->enabled = owningRun->enabled || sourceRun.enabled;
+                MergeWaterFeatureRunMarksKeepingFirst(
+                    owningRun,
+                    sourceRun.marks);
                 MergeWaterFeatureTimelineKeepingFirst(
                     destinationFeature,
                     sourceFeature);
@@ -3854,6 +3903,12 @@ void MergeTimingTakeSceneStateKeepingFirst(
                 &merged,
                 sourceFeature);
             targetRun->features.push_back(std::move(merged));
+            targetReceivedFeature = true;
+        }
+        if (targetReceivedFeature) {
+            MergeWaterFeatureRunMarksKeepingFirst(
+                targetRun,
+                sourceRun.marks);
         }
     }
 

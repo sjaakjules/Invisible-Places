@@ -155,6 +155,7 @@ constexpr std::uint32_t kWaterSplineHandlesSourcesSchemaVersion = 29U;
 constexpr std::uint32_t kWaterClipMembershipProjectSchemaVersion = 76U;
 constexpr std::uint32_t kWaterClipMembershipSourcesSchemaVersion = 30U;
 constexpr std::uint32_t kWaterRainProfilesProjectSchemaVersion = 78U;
+constexpr std::uint32_t kWaterFeatureRunMarksProjectSchemaVersion = 79U;
 constexpr std::uint32_t kRelativePalettePhaseProjectSchemaVersion = 62U;
 constexpr std::uint32_t kFieldMapBoundsMemoryProjectSchemaVersion = 63U;
 constexpr std::uint32_t kShorelineInstancesProjectSchemaVersion = 64U;
@@ -197,6 +198,9 @@ static_assert(
 static_assert(
     kProjectDocumentSchemaVersion >=
     kWaterRainProfilesProjectSchemaVersion);
+static_assert(
+    kProjectDocumentSchemaVersion >=
+    kWaterFeatureRunMarksProjectSchemaVersion);
 static_assert(
     kWaterSourcesDocumentSchemaVersion >=
     kWaterRainProfilesSourcesSchemaVersion);
@@ -4636,6 +4640,17 @@ json SerializeWaterFeatureTimingRun(
         {"name", run.name},
         {"features", std::move(featuresJson)},
     };
+    if (!run.marks.empty()) {
+        auto marksJson = json::array();
+        for (const auto& mark : run.marks) {
+            marksJson.push_back({
+                {"id", mark.id},
+                {"text", mark.text},
+                {"position", mark.position},
+            });
+        }
+        runJson["marks"] = std::move(marksJson);
+    }
     // Enabled is the norm; emitting only the muted state keeps documents
     // with all-enabled runs byte-identical to earlier schema output.
     if (!run.enabled) {
@@ -4650,6 +4665,18 @@ invisible_places::water::WaterFeatureTimingRun ParseWaterFeatureTimingRun(
     run.id = runJson.value("id", 0U);
     run.name = runJson.value("name", std::string{"Run"});
     run.enabled = runJson.value("enabled", true);
+    if (runJson.contains("marks") && runJson.at("marks").is_array()) {
+        for (const auto& markJson : runJson.at("marks")) {
+            if (!markJson.is_object()) {
+                continue;
+            }
+            run.marks.push_back({
+                .id = markJson.value("id", 0U),
+                .text = markJson.value("text", std::string{"Mark"}),
+                .position = markJson.value("position", 0.0F),
+            });
+        }
+    }
     if (runJson.contains("features") && runJson.at("features").is_array()) {
         for (const auto& featureJson : runJson.at("features")) {
             invisible_places::water::WaterFeatureTimeline timeline;
