@@ -23,6 +23,31 @@ Ordinary framing, placement, and editing can use the committed runtime display s
 
 Point-cloud loading and shared-surface build/load plus GPU preprocessing use one exclusive high-memory slot. The active display commits first; the shared surface cache then takes the slot before inactive queued loads, and the remaining work resumes only after preprocessing completes. Mesh Flow consumes the Ground table in that cache and has no separate dynamic-mesh warmup.
 
+## Deterministic Local Display-Density Cache
+
+Scene3 can transparently replace the payload bytes behind its discovered 5 mm ROCK/SAND/VEG display paths with one validated local bundle. The default cache root is `Saved/.invisible_places/cache/display_density/Scene3` and has this layout:
+
+```text
+Scene3/
+  active-bundle.json
+  <bundle-fingerprint>/
+    display-density-manifest.json
+    Scene3/
+      Site3-ROCK-5mm.ply
+      Site3-SAND-5mm.ply
+      Site3-VEG-5mm.ply
+```
+
+`active-bundle.json` schema 1 records the bundle fingerprint and the SHA-256 of the exact manifest bytes. The schema-1 manifest identifies the deterministic algorithm and complete scene, then records each role's canonical source path, size, nanosecond modification time, point count, property-schema digest, and full SHA-256 together with the equivalent identity for its cached output. The bundle fingerprint hashes the complete algorithm object plus the ordered ROCK/SAND/VEG source and output identities. The active pointer is replaced only after all three outputs and the finalized manifest are durable; a partial or rejected build never changes the settled pointer.
+
+At activation the application verifies the small pointer/manifest binding, supported algorithm, complete role set, safe local paths, current file sizes and modification times, canonical/output PLY headers and property-schema digests, and the full SHA-256 of all three local outputs. Canonical 1 mm sources take the fast immutable-reference path at startup: path identity, size, modification time, vertex count, and schema are checked without rehashing roughly 30 GB. A changed source or cached output rejects the whole overlay. No role is redirected until every role passes.
+
+The catalog and project retain the logical shared `Site3-ROLE-5mm.ply` paths. Point-cloud readers resolve those three paths to the active local payload only at the I/O boundary, so scene grouping, saved paths, density switching, and the canonical full-density export choice remain unchanged. Set `INVISIBLE_PLACES_DISABLE_DISPLAY_DENSITY_CACHE=1` before launch to bypass the overlay and read the shared 5 mm files directly.
+
+Build the local bundle explicitly with `scripts/build_scene3_display_density_cache.py`. The builder opens the exact canonical 1 mm sources read-only, rejects a cache root that overlaps or aliases them, preflights temporary disk space, derives exact role budgets with deterministic density-proportional strata and local attribute prefiltering, independently verifies every output, then atomically activates the local bundle. Its default RGB mean deliberately matches the renderer's current byte-domain interpretation of the untouched 1 mm reference; linear-light filtering is an opt-in diagnostic recorded in the manifest.
+
+Local activation does not modify or promote any shared file. Replacing shared 5 mm assets is a separate, explicit operation after matched 5 mm/1 mm still and motion validation, with verified rollback copies and atomic role replacement. The canonical 1 mm sources are never promotion targets; changing them requires separate advance approval because they drive final output.
+
 ## Density-Compensated Rendering
 
 Visuals values remain authored against a 1 mm point-spacing baseline, regardless of the selected display density. The renderer derives a transient compensation for each displayed role; this state is not written back into the authored point style.
