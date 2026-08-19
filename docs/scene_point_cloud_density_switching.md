@@ -30,24 +30,25 @@ Visuals values remain authored against a 1 mm point-spacing baseline, regardless
 For a displayed role:
 
 ```text
-g = displaySpacing / 0.001
+gNominal = displaySpacing / 0.001
 C = (displayPointCount / referencePointCount)
     x (displaySpacing / referenceSpacing)^2
-k = clamp(1 / C, 1/16, 16)
+areaCorrection = clamp(1 / C, 1/16, 16)
+g = gNominal x sqrt(areaCorrection)
 ```
 
-The appearance reference is the role's 1 mm variant when it exists; otherwise it is that role's canonical analysis source or densest known variant. Invalid or zero point-count data uses `k = 1`.
+The appearance reference is the role's 1 mm variant when it exists; otherwise it is that role's canonical analysis source or densest known variant. Invalid or zero point-count data uses `areaCorrection = 1`.
 
-`g` scales the complete authored footprint, including field-mapped sizes and water, Ripple, and Shoreline size additions. Depth-of-field and antialias additions are applied afterward. For example, an authored 2 mm point size renders as 10 mm on a 5 mm bundle; a mapped 1.5–2.2 mm range renders as 7.5–11 mm. The values displayed in the Visuals tab do not change.
+`g` scales the complete authored footprint, including field-mapped sizes and water, Ripple, and Shoreline size additions. The nominal spacing ratio first restores the 1 mm-authored footprint; the square root correction then grows an under-covered source or shrinks an over-covered source while preserving its covered area. Depth-of-field and antialias additions are applied afterward. For an ideal 5 mm decimation, an authored 2 mm point size renders as 10 mm and a mapped 1.5–2.2 mm range renders as 7.5–11 mm. Measured point-count deviations adjust those diameters without changing the values displayed in the Visuals tab.
 
-Beauty rendering applies `k` after falloff, stylisation, depth fade, water effects, and coverage:
+Beauty rendering keeps the authored per-fragment opacity and emission after falloff, stylisation, depth fade, water effects, and coverage:
 
 ```text
-alphaFinal = clamp(alphaRaw x k)
-emission   = alphaRaw x k x emissive x exposure
+alphaFinal = clamp(alphaRaw)
+emission   = alphaRaw x emissive x exposure
 ```
 
-This avoids applying density correction twice when authored opacity changes. A non-identity coverage correction uses the unified transparent material path. Viewport, still, animation, EXR, and CPU offline rendering use the same compensation. Fast Basic remains an opaque approximation: it applies footprint scale `g`, but ignores authored opacity, emission, and `k`.
+Moving measured-count correction into area rather than per-fragment alpha preserves the reference cloud's revealage, nonlinear weighted-blend depth weights, emission profile, and point texture. It also avoids oversized low-alpha splats for over-covered sources and alpha clamping for under-covered sources. Density-compensated Beauty layers stay on the shared accumulation material so the live viewport, still, animation, EXR, and CPU offline paths cannot diverge through an opaque depth-only shortcut. Fast Basic uses the same compensated footprint but remains an explicitly opaque approximation that ignores authored opacity and emission.
 
 Scalar-field bindings follow field names across variants because numeric field slots may be reordered. Resolution uses an exact name first, then one unique case-insensitive match. A slot is used only for a legacy binding with no field name. If a named field is absent, the authored binding is retained, its constant fallback is rendered, and a warning is shown so a field such as `Interest` cannot silently bind to `Roughness`.
 

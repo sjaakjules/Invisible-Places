@@ -252,15 +252,51 @@ TEST_CASE("Density compensation resolves spacing and count-aware coverage", "[po
 
     const auto underCoveredFiveMillimeter =
         ResolvePointCloudDensityCompensation(0.005F, 20U, 0.001F, 1000U);
-    CHECK(underCoveredFiveMillimeter.footprintScale == Catch::Approx(5.0F));
-    CHECK(underCoveredFiveMillimeter.coverageCorrection == Catch::Approx(2.0F));
+    CHECK(underCoveredFiveMillimeter.footprintScale == Catch::Approx(5.0F * std::sqrt(2.0F)));
+    CHECK(underCoveredFiveMillimeter.coverageCorrection == Catch::Approx(1.0F));
+
+    const auto overCoveredFiveMillimeter =
+        ResolvePointCloudDensityCompensation(0.005F, 80U, 0.001F, 1000U);
+    CHECK(overCoveredFiveMillimeter.footprintScale == Catch::Approx(5.0F / std::sqrt(2.0F)));
+    CHECK(overCoveredFiveMillimeter.coverageCorrection == Catch::Approx(1.0F));
 
     const auto clamped = ResolvePointCloudDensityCompensation(0.005F, 1U, 0.001F, 1'000'000U);
-    CHECK(clamped.coverageCorrection == Catch::Approx(16.0F));
+    CHECK(clamped.footprintScale == Catch::Approx(20.0F));
+    CHECK(clamped.coverageCorrection == Catch::Approx(1.0F));
 
     const auto missingCounts = ResolvePointCloudDensityCompensation(0.005F, 0U, 0.001F, 1000U);
     CHECK(missingCounts.footprintScale == Catch::Approx(5.0F));
     CHECK(missingCounts.coverageCorrection == Catch::Approx(1.0F));
+}
+
+TEST_CASE("Density compensation preserves reference area in its footprint", "[pointcloud][density]") {
+    using invisible_places::renderer::pointcloud::ResolvePointCloudDensityCompensation;
+
+    const auto checkArea = [](float displaySpacing,
+                              std::uint64_t displayCount,
+                              float referenceSpacing,
+                              std::uint64_t referenceCount) {
+        const auto compensation = ResolvePointCloudDensityCompensation(
+            displaySpacing,
+            displayCount,
+            referenceSpacing,
+            referenceCount);
+        const double displayArea =
+            static_cast<double>(displayCount) * compensation.footprintScale *
+            compensation.footprintScale;
+        const double referenceFootprint =
+            static_cast<double>(referenceSpacing) / 0.001;
+        const double referenceArea =
+            static_cast<double>(referenceCount) * referenceFootprint * referenceFootprint;
+        CHECK(displayArea == Catch::Approx(referenceArea).epsilon(1.0e-5));
+        CHECK(compensation.coverageCorrection == Catch::Approx(1.0F));
+    };
+
+    checkArea(0.001F, 1000U, 0.001F, 1000U);
+    checkArea(0.005F, 40U, 0.001F, 1000U);
+    checkArea(0.005F, 20U, 0.001F, 1000U);
+    checkArea(0.005F, 80U, 0.001F, 1000U);
+    checkArea(0.005F, 160U, 0.002F, 1000U);
 }
 
 TEST_CASE("Water Flow activity scales are deterministic and monotonic", "[pointcloud][water][activity]") {
@@ -361,19 +397,25 @@ TEST_CASE("Offline Water Flow activity hides and reveals stable trails", "[outpu
     CHECK(Maximum(fastFull.alpha) > 0.0F);
 }
 
-TEST_CASE("Coverage correction forces the unified transparent material", "[pointcloud][density][material]") {
+TEST_CASE("Density compensation forces the unified Beauty material", "[pointcloud][density][material]") {
     using invisible_places::renderer::pointcloud::PointCloudDensityCompensation;
     using invisible_places::renderer::pointcloud::PointCloudMaterialVariant;
     using invisible_places::renderer::pointcloud::PointCloudStyleState;
+    using invisible_places::renderer::pointcloud::ResolvePointCloudDensityCompensation;
     using invisible_places::renderer::pointcloud::ResolvePointCloudMaterialVariant;
 
     const PointCloudStyleState style;
     CHECK(ResolvePointCloudMaterialVariant(style) == PointCloudMaterialVariant::OpaqueHardDisc);
     CHECK(
         ResolvePointCloudMaterialVariant(style, PointCloudDensityCompensation{5.0F, 1.0F}) ==
-        PointCloudMaterialVariant::OpaqueHardDisc);
+        PointCloudMaterialVariant::Unified);
     CHECK(
         ResolvePointCloudMaterialVariant(style, PointCloudDensityCompensation{5.0F, 1.01F}) ==
+        PointCloudMaterialVariant::Unified);
+    CHECK(
+        ResolvePointCloudMaterialVariant(
+            style,
+            ResolvePointCloudDensityCompensation(0.005F, 80U, 0.001F, 1000U)) ==
         PointCloudMaterialVariant::Unified);
 }
 
@@ -393,12 +435,22 @@ TEST_CASE("Offline density compensation scales footprint before alpha and emissi
 }
 
 TEST_CASE("Fast Basic applies footprint scale while remaining opaque", "[output][offline][density][fast-basic]") {
-    using invisible_places::renderer::pointcloud::PointCloudDensityCompensation;
+    using invisible_places::renderer::pointcloud::ResolvePointCloudDensityCompensation;
 
     const auto fine =
-        RenderSinglePoint(0.0F, 0.0F, PointCloudDensityCompensation{1.0F, 16.0F}, nullptr, true);
+        RenderSinglePoint(
+            0.0F,
+            0.0F,
+            ResolvePointCloudDensityCompensation(0.001F, 1000U, 0.001F, 1000U),
+            nullptr,
+            true);
     const auto sparse =
-        RenderSinglePoint(0.0F, 8.0F, PointCloudDensityCompensation{5.0F, 1.0F / 16.0F}, nullptr, true);
+        RenderSinglePoint(
+            0.0F,
+            8.0F,
+            ResolvePointCloudDensityCompensation(0.005F, 20U, 0.001F, 1000U),
+            nullptr,
+            true);
     CHECK(CoveredPixelCount(sparse) > CoveredPixelCount(fine));
     CHECK(Maximum(fine.alpha) == Catch::Approx(1.0F));
     CHECK(Maximum(sparse.alpha) == Catch::Approx(1.0F));

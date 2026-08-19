@@ -868,10 +868,15 @@ PointCloudDensityCompensation ResolvePointCloudDensityCompensation(
         (static_cast<double>(displayPointCount) / static_cast<double>(referencePointCount)) *
         spacingRatio * spacingRatio;
     if (std::isfinite(relativeCoverage) && relativeCoverage > 0.0) {
-        compensation.coverageCorrection = static_cast<float>(std::clamp(
+        const auto areaCorrection = static_cast<float>(std::clamp(
             1.0 / relativeCoverage,
             1.0 / 16.0,
             16.0));
+        // Fold measured count differences into the linear footprint. This
+        // preserves the same covered area as the former per-fragment alpha
+        // correction while retaining the authored alpha, emission, weighted
+        // blend depth weights, and revealage of the 1 mm reference.
+        compensation.footprintScale *= std::sqrt(areaCorrection);
     }
     return SanitizePointCloudDensityCompensation(compensation);
 }
@@ -910,7 +915,13 @@ PointCloudMaterialVariant ResolvePointCloudMaterialVariant(
         return PointCloudMaterialVariant::Unified;
     }
     densityCompensation = SanitizePointCloudDensityCompensation(densityCompensation);
-    if (densityCompensation.coverageCorrection != 1.0F) {
+    // A density-adjusted footprint represents multiple reference points. Keep
+    // Beauty on the same accumulation path used by EXR and CPU output so a
+    // coarse display cannot silently switch to nearest-fragment opaque depth
+    // while the final 1 mm source is composited. Fast Basic selects its own
+    // explicitly opaque renderer before material resolution.
+    if (densityCompensation.footprintScale != 1.0F ||
+        densityCompensation.coverageCorrection != 1.0F) {
         return PointCloudMaterialVariant::Unified;
     }
 
