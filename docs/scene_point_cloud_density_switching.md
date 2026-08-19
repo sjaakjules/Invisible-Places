@@ -59,21 +59,22 @@ gNominal = displaySpacing / 0.001
 C = (displayPointCount / referencePointCount)
     x (displaySpacing / referenceSpacing)^2
 areaCorrection = clamp(1 / C, 1/16, 16)
-g = gNominal x sqrt(areaCorrection)
+if areaCorrection > 1:   g = gNominal x sqrt(areaCorrection),  k = 1
+else:                    g = gNominal,                         k = areaCorrection
 ```
 
 The appearance reference is the role's 1 mm variant when it exists; otherwise it is that role's canonical analysis source or densest known variant. Invalid or zero point-count data uses `areaCorrection = 1`.
 
-`g` scales the complete authored raster footprint, including field-mapped sizes, water/Ripple/Shoreline size additions, and the antialias support around the point kernel. The nominal spacing ratio first restores the 1 mm-authored footprint; the square root correction then grows an under-covered source or shrinks an over-covered source while preserving its covered area. Camera depth-of-field is a later image-space effect and is therefore added after density scaling. For an ideal 5 mm decimation, an authored 2 mm point size renders as 10 mm and a mapped 1.5–2.2 mm range renders as 7.5–11 mm. Measured point-count deviations adjust those diameters without changing the values displayed in the Visuals tab.
+`g` scales the complete authored raster footprint, including field-mapped sizes, water/Ripple/Shoreline size additions, and the antialias support around the point kernel. The nominal spacing ratio first restores the 1 mm-authored footprint. An under-covered source (fewer points than its spacing implies) then grows its footprint by `sqrt(areaCorrection)` so its covered area matches the reference. An over-covered source never shrinks below `gNominal`: a grid-decimated bundle keeps its nominal pitch regardless of how many cells the irregular reference filled, and a kernel narrower than that pitch renders as discrete dots with dark gaps (the Scene3 5 mm "speckle" regression of 2026-08-19, whose footprint fell to 4.13x for ROCK and 2.48x for VEG). The residual over-coverage is instead applied per fragment as `k`. Camera depth-of-field is a later image-space effect and is therefore added after density scaling. For an ideal 5 mm decimation, an authored 2 mm point size renders as 10 mm and a mapped 1.5–2.2 mm range renders as 7.5–11 mm. Measured point-count deviations adjust those diameters or alpha without changing the values displayed in the Visuals tab.
 
-Beauty rendering keeps the authored per-fragment opacity and emission after falloff, stylisation, depth fade, water effects, and coverage:
+Beauty rendering applies `k` after falloff, stylisation, depth fade, water effects, and coverage:
 
 ```text
-alphaFinal = clamp(alphaRaw)
-emission   = alphaRaw x emissive x exposure
+alphaFinal = clamp(alphaRaw x k)
+emission   = alphaRaw x k x emissive x exposure
 ```
 
-Moving measured-count correction into area rather than per-fragment alpha preserves the reference cloud's revealage, nonlinear weighted-blend depth weights, emission profile, and point texture. It also avoids oversized low-alpha splats for over-covered sources and alpha clamping for under-covered sources. Density-compensated Beauty layers stay on the shared accumulation material so the live viewport, still, animation, EXR, and CPU offline paths cannot diverge through an opaque depth-only shortcut. Fast Basic uses the same compensated footprint but remains an explicitly opaque approximation that ignores authored opacity and emission.
+Growing an under-covered source in area rather than per-fragment alpha avoids alpha clamping and keeps the reference cloud's revealage and weighted-blend depth weights. Keeping an over-covered source at its nominal footprint preserves surface continuity at close range; its accumulated coverage is matched through `k`. Density-compensated Beauty layers stay on the shared accumulation material so the live viewport, still, animation, EXR, and CPU offline paths cannot diverge through an opaque depth-only shortcut. Fast Basic uses the same compensated footprint but remains an explicitly opaque approximation that ignores authored opacity, emission, and `k`.
 
 Scalar-field bindings follow field names across variants because numeric field slots may be reordered. Resolution uses an exact name first, then one unique case-insensitive match. A slot is used only for a legacy binding with no field name. If a named field is absent, the authored binding is retained, its constant fallback is rendered, and a warning is shown so a field such as `Interest` cannot silently bind to `Roughness`.
 

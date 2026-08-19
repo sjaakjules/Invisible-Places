@@ -283,10 +283,18 @@ TEST_CASE("Density compensation resolves spacing and count-aware coverage", "[po
     CHECK(underCoveredFiveMillimeter.footprintScale == Catch::Approx(5.0F * std::sqrt(2.0F)));
     CHECK(underCoveredFiveMillimeter.coverageCorrection == Catch::Approx(1.0F));
 
+    // An over-covered bundle keeps its nominal pitch, so the footprint never
+    // shrinks below the spacing ratio; the residual becomes per-fragment alpha.
     const auto overCoveredFiveMillimeter =
         ResolvePointCloudDensityCompensation(0.005F, 80U, 0.001F, 1000U);
-    CHECK(overCoveredFiveMillimeter.footprintScale == Catch::Approx(5.0F / std::sqrt(2.0F)));
-    CHECK(overCoveredFiveMillimeter.coverageCorrection == Catch::Approx(1.0F));
+    CHECK(overCoveredFiveMillimeter.footprintScale == Catch::Approx(5.0F));
+    CHECK(overCoveredFiveMillimeter.coverageCorrection == Catch::Approx(0.5F));
+
+    // Scene3 ROCK measured counts: 2,317,741 of 39,451,487 at 5 mm.
+    const auto scene3Rock =
+        ResolvePointCloudDensityCompensation(0.005F, 2'317'741U, 0.001F, 39'451'487U);
+    CHECK(scene3Rock.footprintScale == Catch::Approx(5.0F));
+    CHECK(scene3Rock.coverageCorrection == Catch::Approx(0.6809F).epsilon(1.0e-3));
 
     const auto clamped = ResolvePointCloudDensityCompensation(0.005F, 1U, 0.001F, 1'000'000U);
     CHECK(clamped.footprintScale == Catch::Approx(20.0F));
@@ -297,7 +305,7 @@ TEST_CASE("Density compensation resolves spacing and count-aware coverage", "[po
     CHECK(missingCounts.coverageCorrection == Catch::Approx(1.0F));
 }
 
-TEST_CASE("Density compensation preserves reference area in its footprint", "[pointcloud][density]") {
+TEST_CASE("Density compensation preserves reference coverage without shrinking the footprint", "[pointcloud][density]") {
     using invisible_places::renderer::pointcloud::ResolvePointCloudDensityCompensation;
 
     const auto checkArea = [](float displaySpacing,
@@ -309,15 +317,22 @@ TEST_CASE("Density compensation preserves reference area in its footprint", "[po
             displayCount,
             referenceSpacing,
             referenceCount);
+        // Effective covered area = count x footprint^2 x per-fragment alpha
+        // correction. Under-covered sources grow the footprint; over-covered
+        // sources keep the nominal footprint and attenuate alpha instead.
         const double displayArea =
             static_cast<double>(displayCount) * compensation.footprintScale *
-            compensation.footprintScale;
+            compensation.footprintScale * compensation.coverageCorrection;
         const double referenceFootprint =
             static_cast<double>(referenceSpacing) / 0.001;
         const double referenceArea =
             static_cast<double>(referenceCount) * referenceFootprint * referenceFootprint;
         CHECK(displayArea == Catch::Approx(referenceArea).epsilon(1.0e-5));
-        CHECK(compensation.coverageCorrection == Catch::Approx(1.0F));
+        const float nominalFootprint = displaySpacing / 0.001F;
+        CHECK(compensation.footprintScale >= Catch::Approx(nominalFootprint));
+        CHECK(compensation.coverageCorrection <= Catch::Approx(1.0F));
+        CHECK((compensation.footprintScale == Catch::Approx(nominalFootprint) ||
+               compensation.coverageCorrection == Catch::Approx(1.0F)));
     };
 
     checkArea(0.001F, 1000U, 0.001F, 1000U);

@@ -112185,14 +112185,27 @@ int RunScene3DensityParitySmoke(
             roleObservation.footprintScale = density.footprintScale;
             roleObservation.coverageCorrection =
                 density.coverageCorrection;
-            roleObservation.expectedFootprintScale =
+            // Expected compensation: nominal 5x footprint, grown only for an
+            // under-covered bundle; an over-covered bundle keeps the nominal
+            // footprint and carries the residual as per-fragment alpha.
+            const double expectedAreaCorrection =
                 spacingMicrometres == kFiveMillimetreSpacing
-                    ? static_cast<float>(std::sqrt(
+                    ? std::clamp(
                           static_cast<double>(
                               kExpectedOneMillimetreCounts[roleIndex]) /
-                          static_cast<double>(
-                              kExpectedFiveMillimetreCounts[roleIndex])))
+                              (static_cast<double>(
+                                   kExpectedFiveMillimetreCounts[roleIndex]) *
+                               25.0),
+                          1.0 / 16.0,
+                          16.0)
+                    : 1.0;
+            roleObservation.expectedFootprintScale =
+                spacingMicrometres == kFiveMillimetreSpacing
+                    ? static_cast<float>(
+                          5.0 * std::sqrt(std::max(1.0, expectedAreaCorrection)))
                     : 1.0F;
+            const float expectedCoverageCorrection =
+                static_cast<float>(std::min(1.0, expectedAreaCorrection));
             const auto effectiveStyle = MakeSceneRenderStyle(
                 *runtimeState,
                 session,
@@ -112216,8 +112229,9 @@ int RunScene3DensityParitySmoke(
                     std::to_string(roleObservation.expectedPointCount) +
                     ".");
             }
-            if (std::abs(roleObservation.coverageCorrection - 1.0F) >
-                    1.0e-6F ||
+            if (std::abs(
+                    roleObservation.coverageCorrection -
+                    expectedCoverageCorrection) > 1.0e-5F ||
                 std::abs(
                     roleObservation.footprintScale -
                     roleObservation.expectedFootprintScale) >
@@ -112228,7 +112242,7 @@ int RunScene3DensityParitySmoke(
                     roleObservation.role + " " +
                     std::to_string(spacingMicrometres / 1000U) +
                     " mm density compensation does not match the "
-                    "count-derived footprint with unit coverage correction.");
+                    "count-derived footprint/coverage split.");
             }
             if (spacingMicrometres == kFiveMillimetreSpacing &&
                 roleObservation.materialVariant !=

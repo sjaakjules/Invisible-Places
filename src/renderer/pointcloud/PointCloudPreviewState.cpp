@@ -872,11 +872,22 @@ PointCloudDensityCompensation ResolvePointCloudDensityCompensation(
             1.0 / relativeCoverage,
             1.0 / 16.0,
             16.0));
-        // Fold measured count differences into the linear footprint. This
-        // preserves the same covered area as the former per-fragment alpha
-        // correction while retaining the authored alpha, emission, weighted
-        // blend depth weights, and revealage of the 1 mm reference.
-        compensation.footprintScale *= std::sqrt(areaCorrection);
+        // An under-covered source (fewer points than its spacing implies)
+        // grows its linear footprint so the covered area matches the
+        // reference while keeping the authored per-fragment alpha.
+        //
+        // An over-covered source must never shrink below the nominal spacing
+        // ratio: a grid-decimated bundle keeps its nominal pitch regardless of
+        // how many cells the irregular reference filled, and a kernel that is
+        // narrower than that pitch renders as discrete dots with gaps (the
+        // 2026-08-19 Scene3 5 mm "speckle" regression). The residual
+        // over-coverage is therefore applied per fragment as alpha so the
+        // accumulated coverage still matches the reference.
+        if (areaCorrection > 1.0F) {
+            compensation.footprintScale *= std::sqrt(areaCorrection);
+        } else {
+            compensation.coverageCorrection = areaCorrection;
+        }
     }
     return SanitizePointCloudDensityCompensation(compensation);
 }
