@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <utility>
 
 namespace invisible_places::app::point_visual {
 
@@ -171,6 +172,116 @@ bool Select(
     *activeStyle = (*visuals)[index.value()].style;
     SyncNameBuffer(nameBuffer, *selectedName);
     return true;
+}
+
+AnimationSelectionEditResult ApplyAnimationSelectionEdit(
+    invisible_places::camera::AnimationPath* currentPath,
+    std::optional<invisible_places::camera::AnimationPath>* editedShadow,
+    bool currentPathUsesEdited,
+    std::string_view visualName) {
+    AnimationSelectionEditResult result;
+    if (currentPath == nullptr || visualName.empty()) {
+        return result;
+    }
+
+    if (!currentPathUsesEdited && editedShadow != nullptr &&
+        editedShadow->has_value()) {
+        *currentPath = editedShadow->value();
+        result.promotedEditedShadow = true;
+    }
+
+    const auto normalized = NormalizeName(visualName);
+    if (currentPath->selectedPointVisualName == normalized) {
+        return result;
+    }
+
+    currentPath->selectedPointVisualName = normalized;
+    result.selectionChanged = true;
+    if (editedShadow != nullptr) {
+        *editedShadow = *currentPath;
+    }
+    return result;
+}
+
+AnimationLoadAuthorityResult ResolveAnimationLoadAuthority(
+    const invisible_places::camera::AnimationPath& requestedPath,
+    const std::optional<invisible_places::camera::AnimationPath>& editedShadow,
+    bool requestedEditedPath,
+    bool requestedPathNeedsRepair) {
+    AnimationLoadAuthorityResult result{
+        .path = requestedPath,
+        .usesEditedPath = requestedEditedPath,
+    };
+    if (!requestedEditedPath && requestedPathNeedsRepair &&
+        editedShadow.has_value()) {
+        result.path = editedShadow.value();
+        result.usesEditedPath = true;
+        result.promotedEditedShadow = true;
+    }
+    return result;
+}
+
+bool ApplyAnimationSelectionForSave(
+    invisible_places::camera::AnimationPath* preparedPath,
+    std::string_view liveVisualName,
+    bool sourceHasEditedVersion,
+    bool currentPathUsesEdited,
+    const invisible_places::camera::AnimationPath*
+        renderSetupUnderlyingAuthority) {
+    if (preparedPath == nullptr) {
+        return false;
+    }
+
+    std::optional<std::string> selectedVisual;
+    if (renderSetupUnderlyingAuthority != nullptr) {
+        selectedVisual =
+            renderSetupUnderlyingAuthority->selectedPointVisualName;
+    } else if ((!sourceHasEditedVersion || currentPathUsesEdited) &&
+               !liveVisualName.empty()) {
+        selectedVisual = NormalizeName(liveVisualName);
+    }
+    if (!selectedVisual.has_value() ||
+        preparedPath->selectedPointVisualName == selectedVisual.value()) {
+        return false;
+    }
+    preparedPath->selectedPointVisualName =
+        std::move(selectedVisual.value());
+    return true;
+}
+
+bool AnimationVisualRequiresProjectSave(
+    std::string_view animationVisualName,
+    std::span<const std::string> durableProjectVisualNames) {
+    if (animationVisualName.empty()) {
+        return false;
+    }
+    const auto normalized = NormalizeName(animationVisualName);
+    return std::none_of(
+        durableProjectVisualNames.begin(),
+        durableProjectVisualNames.end(),
+        [&](const auto& candidate) {
+            return NormalizeName(candidate) == normalized;
+        });
+}
+
+std::vector<std::string> ProjectVisualNames(
+    const invisible_places::serialization::ProjectDocument& project) {
+    std::vector<std::string> names;
+    names.reserve(
+        project.pointVisuals.size() +
+        project.sceneVisualStates.size() + 1U);
+    names.push_back(std::string{kDefaultName});
+    for (const auto& visual : project.pointVisuals) {
+        if (!visual.name.empty()) {
+            names.push_back(visual.name);
+        }
+    }
+    for (const auto& state : project.sceneVisualStates) {
+        if (!state.visual.name.empty()) {
+            names.push_back(state.visual.name);
+        }
+    }
+    return names;
 }
 
 }  // namespace invisible_places::app::point_visual

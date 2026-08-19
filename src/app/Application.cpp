@@ -4,6 +4,7 @@
 #include "app/PointVisualSelection.hpp"
 #include "app/ProcessMemoryTelemetry.hpp"
 #include "app/ProjectWorkspace.hpp"
+#include "app/QueuedQuickMp4PointLayerState.hpp"
 #include "app/RenderSetupProjectSave.hpp"
 #include "app/WaterSurfaceCacheReadiness.hpp"
 #include "app/WaterPathDiagnostics.hpp"
@@ -8241,10 +8242,15 @@ void ApplyProjectPointVisualsToAllSessions(PreviewRuntimeState* runtimeState) {
     }
 }
 
+void RecordCurrentAnimationPointVisualSelection(
+    PreviewRuntimeState* runtimeState,
+    std::string_view visualName);
+
 std::string SelectProjectPointVisualForScene(
     PreviewRuntimeState* runtimeState,
     const PreviewLayerSession& sceneSession,
-    std::string_view name) {
+    std::string_view name,
+    bool recordAnimationSelection = true) {
     if (runtimeState == nullptr) {
         return {};
     }
@@ -8275,6 +8281,11 @@ std::string SelectProjectPointVisualForScene(
         candidate.selectedPointVisualName = normalized;
         candidate.pointVisualNameBuffer = runtimeState->pointVisualLibrary.pointVisualNameBuffer;
         ApplyProjectPointVisualToSession(runtimeState, &candidate);
+    }
+    if (recordAnimationSelection) {
+        RecordCurrentAnimationPointVisualSelection(
+            runtimeState,
+            normalized);
     }
     return BuildProjectVisualFieldBindingWarning(*runtimeState, sceneKey, normalized, selectedStyle);
 }
@@ -8464,6 +8475,9 @@ void SaveCurrentPointVisual(PreviewRuntimeState* runtimeState, PreviewLayerSessi
         session->selectedPointVisualName = targetName;
         session->pointVisualNameBuffer = BasePointVisualName(targetName);
         ApplyProjectPointVisualsToAllSessions(runtimeState);
+        RecordCurrentAnimationPointVisualSelection(
+            runtimeState,
+            targetName);
         runtimeState->statusMessage = "Saved project visual " + targetName + ".";
         runtimeState->errorMessage.clear();
         return;
@@ -14073,6 +14087,11 @@ bool SaveAnimationPathToFile(
     PreviewRuntimeState* runtimeState,
     const AnimationPath& path,
     const std::filesystem::path& outputPath);
+bool PathsLexicallyEqual(
+    const std::filesystem::path& left,
+    const std::filesystem::path& right);
+std::vector<std::string> TrackedProjectPointVisualNames(
+    const PersistenceState& persistence);
 
 const AnimationPath* RegistryAnimationPath(
     const PreviewRuntimeState& runtimeState,
@@ -28331,6 +28350,34 @@ PreservedAnimationRuntimeState CaptureAnimationRuntimeState(
     return state;
 }
 
+const AnimationPath* PreservedAuthoritativeAnimationPath(
+    const PreservedAnimationRuntimeState& state,
+    const std::filesystem::path& filePath) {
+    if (!filePath.empty()) {
+        const auto edited = std::find_if(
+            state.edits.begin(),
+            state.edits.end(),
+            [&](const PreservedAnimationEdit& candidate) {
+                return PathsLexicallyEqual(
+                    candidate.filePath,
+                    filePath);
+            });
+        if (edited != state.edits.end()) {
+            return &edited->path;
+        }
+    }
+    if (!state.path.has_value()) {
+        return nullptr;
+    }
+    if (filePath.empty() || state.filePath.empty() ||
+        PathsLexicallyEqual(
+            std::filesystem::path{state.filePath},
+            filePath)) {
+        return &state.path.value();
+    }
+    return nullptr;
+}
+
 void RestoreAnimationRuntimeState(
     PreviewRuntimeState* runtimeState,
     PreservedAnimationRuntimeState state) {
@@ -30608,6 +30655,171 @@ void ApplyAnimationEvaluation(
         allowDepthOfField);
 }
 
+std::string CurrentAnimationPointVisualSelection(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return {};
+    }
+    EnsureProjectPointVisuals(runtimeState);
+    if (const auto sessionIndex =
+            ResolveVisiblePointCloudLookdevIndex(*runtimeState);
+        sessionIndex.has_value() &&
+        sessionIndex.value() < runtimeState->sessions.size()) {
+        const auto& session = runtimeState->sessions[sessionIndex.value()];
+        if (IsProjectPointVisualSession(session)) {
+            const auto selected = NormalizePointVisualName(
+                session.selectedPointVisualName);
+            if (FindProjectPointVisualIndex(
+                    runtimeState->pointVisualLibrary,
+                    selected)
+                    .has_value() ||
+                FindScenePointVisualStateByNameIndex(
+                    runtimeState->pointVisualLibrary,
+                    selected)
+                    .has_value()) {
+                return selected;
+            }
+        }
+    }
+    return NormalizePointVisualName(
+        runtimeState->pointVisualLibrary.selectedPointVisualName);
+}
+
+void RecordCurrentAnimationPointVisualSelection(
+    PreviewRuntimeState* runtimeState,
+    std::string_view visualName) {
+    if (runtimeState == nullptr ||
+        runtimeState->activeRenderSetupOverride.has_value() ||
+        !runtimeState->animationPanel.currentPath.has_value() ||
+        TrimText(visualName).empty()) {
+        return;
+    }
+    const auto normalized = NormalizePointVisualName(visualName);
+    auto& panel = runtimeState->animationPanel;
+    if (panel.currentFilePath.empty()) {
+        if (panel.currentPath->selectedPointVisualName == normalized) {
+            return;
+        }
+        panel.currentPath->selectedPointVisualName = normalized;
+        panel.currentPathUsesEdited = true;
+        panel.selectedFileUsesEdited = true;
+        panel.dirty = true;
+        return;
+    }
+    if (const auto registryIndex = FindAnimationRegistryIndex(
+            panel,
+            std::filesystem::path{panel.currentFilePath});
+        registryIndex.has_value()) {
+        EnsureAnimationAssociationStorage(&panel);
+        const auto result = point_visual::ApplyAnimationSelectionEdit(
+            &panel.currentPath.value(),
+            &panel.availableFileEditedPaths[registryIndex.value()],
+            panel.currentPathUsesEdited,
+            normalized);
+        if (!result.selectionChanged &&
+            !result.promotedEditedShadow) {
+            return;
+        }
+        panel.currentPathUsesEdited = true;
+        panel.selectedFileUsesEdited = true;
+        panel.availableFileDirtyFlags[registryIndex.value()] = true;
+        panel.dirty = true;
+    } else {
+        if (panel.currentPath->selectedPointVisualName == normalized) {
+            return;
+        }
+        panel.currentPath->selectedPointVisualName = normalized;
+        panel.currentPathUsesEdited = true;
+        panel.selectedFileUsesEdited = true;
+        panel.dirty = true;
+    }
+}
+
+bool ApplyAnimationPointVisualSelection(
+    PreviewRuntimeState* runtimeState,
+    const AnimationPath& path) {
+    if (runtimeState == nullptr ||
+        TrimText(path.selectedPointVisualName).empty()) {
+        return false;
+    }
+
+    EnsureProjectPointVisuals(runtimeState);
+    const auto selected = NormalizePointVisualName(
+        path.selectedPointVisualName);
+    const auto projectVisualIndex = FindProjectPointVisualIndex(
+        runtimeState->pointVisualLibrary,
+        selected);
+    const auto sceneVisualIndex = FindScenePointVisualStateByNameIndex(
+        runtimeState->pointVisualLibrary,
+        selected);
+    if (!projectVisualIndex.has_value() &&
+        !sceneVisualIndex.has_value()) {
+        return false;
+    }
+
+    std::vector<std::size_t> targetSessions;
+    std::vector<std::string> targetSceneKeys;
+    const auto addTarget = [&](std::size_t sessionIndex) {
+        if (sessionIndex >= runtimeState->sessions.size()) {
+            return;
+        }
+        const auto& session = runtimeState->sessions[sessionIndex];
+        if (!IsProjectPointVisualSession(session)) {
+            return;
+        }
+        const auto sceneKey = ProjectVisualSceneKey(session);
+        if (sceneVisualIndex.has_value() &&
+            runtimeState->pointVisualLibrary
+                    .sceneVisualStates[sceneVisualIndex.value()]
+                    .sceneGroupName != sceneKey) {
+            return;
+        }
+        if (std::find(
+                targetSceneKeys.begin(),
+                targetSceneKeys.end(),
+                sceneKey) != targetSceneKeys.end()) {
+            return;
+        }
+        targetSceneKeys.push_back(sceneKey);
+        targetSessions.push_back(sessionIndex);
+    };
+    for (const auto& associatedPath : path.associatedLayerPaths) {
+        if (const auto sessionIndex = FindSessionIndexBySourcePath(
+                *runtimeState,
+                associatedPath);
+            sessionIndex.has_value()) {
+            addTarget(sessionIndex.value());
+        }
+    }
+    if (targetSessions.empty()) {
+        if (const auto sessionIndex =
+                ResolveVisiblePointCloudLookdevIndex(*runtimeState);
+            sessionIndex.has_value()) {
+            addTarget(sessionIndex.value());
+        }
+    }
+    if (targetSessions.empty()) {
+        return false;
+    }
+
+    std::string warning;
+    for (const auto sessionIndex : targetSessions) {
+        const auto nextWarning = SelectProjectPointVisualForScene(
+            runtimeState,
+            runtimeState->sessions[sessionIndex],
+            selected,
+            false);
+        if (warning.empty()) {
+            warning = nextWarning;
+        }
+    }
+    UpdateProjectVisualFieldBindingWarning(
+        runtimeState,
+        warning);
+    runtimeState->previewRenderStateSignatureValid = false;
+    return true;
+}
+
 void EmbedAnimationWaterScenarioFallbacks(
     AnimationPath* /*path*/,
     std::span<const invisible_places::water::WaterScenarioDefinition> /*definitions*/) {
@@ -30691,15 +30903,39 @@ bool SaveAnimationPathToFile(
     const bool savingDuringRenderSetupOverride =
         runtimeState->activeRenderSetupOverride.has_value();
     if (savingDuringRenderSetupOverride) {
-        const auto& underlyingAnimation =
+        const auto& underlyingState =
             runtimeState->activeRenderSetupOverride->underlyingAnimation;
-        if (underlyingAnimation.path.has_value()) {
+        const auto* underlyingAnimation =
+            PreservedAuthoritativeAnimationPath(
+                underlyingState,
+                previousCurrentPath.empty()
+                    ? outputPath
+                    : previousCurrentPath);
+        if (underlyingAnimation != nullptr) {
             // Camera edits remain writable while a historical setup is
             // loaded, but its temporary Timing Take selection must never be
             // written into the user's animation file.
             pathToSave.selectedTimingTakeId =
-                underlyingAnimation.path->selectedTimingTakeId;
+                underlyingAnimation->selectedTimingTakeId;
+            pathToSave.selectedPointVisualName =
+                underlyingAnimation->selectedPointVisualName;
         }
+    } else if (savingCurrentPath ||
+               TrimText(pathToSave.selectedPointVisualName).empty()) {
+        pathToSave.selectedPointVisualName =
+            CurrentAnimationPointVisualSelection(runtimeState);
+    }
+    const auto durableVisualNames =
+        TrackedProjectPointVisualNames(runtimeState->persistence);
+    if (point_visual::AnimationVisualRequiresProjectSave(
+            pathToSave.selectedPointVisualName,
+            durableVisualNames)) {
+        runtimeState->errorMessage =
+            "Visual '" + pathToSave.selectedPointVisualName +
+            "' has not been saved in the project. Save the project before "
+            "writing this animation so its Visual reference remains valid.";
+        runtimeState->statusMessage.clear();
+        return false;
     }
     if (savingCurrentPath && !savingDuringRenderSetupOverride) {
         pathToSave.waterAnimationTrailSettings = ViewedWaterAnimationTrailSettings(*runtimeState);
@@ -30958,7 +31194,7 @@ bool LoadAnimationPathVariant(
 
     const bool editedVersionAvailable =
         RegistryAnimationHasEditedVersion(panel, index);
-    const bool loadingEdited =
+    bool loadingEdited =
         useEditedVersion && editedVersionAvailable;
     auto loadedPath = loadingEdited
                           ? panel.availableFileEditedPaths[index].value()
@@ -30966,6 +31202,23 @@ bool LoadAnimationPathVariant(
     invisible_places::app::workspace::ResolveAnimationPath(
         &loadedPath,
         WorkspaceRoots(*runtimeState));
+    const auto initiallyRequestedTakeId =
+        invisible_places::timing::NormalizeTimingTakeId(
+            loadedPath.selectedTimingTakeId);
+    const bool requestedPathMissingTimingTake =
+        invisible_places::timing::FindTimingTakeDefinition(
+            runtimeState->water.timingTakes,
+            initiallyRequestedTakeId) == nullptr;
+    auto loadAuthority =
+        point_visual::ResolveAnimationLoadAuthority(
+            loadedPath,
+            panel.availableFileEditedPaths[index],
+            loadingEdited,
+            requestedPathMissingTimingTake);
+    loadedPath = std::move(loadAuthority.path);
+    loadingEdited = loadAuthority.usesEditedPath;
+    const bool promotedEditedShadowForMissingTimingTake =
+        loadAuthority.promotedEditedShadow;
     const auto requestedTakeId =
         invisible_places::timing::NormalizeTimingTakeId(
             loadedPath.selectedTimingTakeId);
@@ -30976,15 +31229,22 @@ bool LoadAnimationPathVariant(
     if (repairedMissingTimingTake) {
         loadedPath.selectedTimingTakeId = std::string{
             invisible_places::timing::kAuthoredTimingTakeId};
-        if (!loadingEdited) {
-            panel.availableFileEditedPaths[index] = loadedPath;
-        }
     } else {
         loadedPath.selectedTimingTakeId = requestedTakeId;
+    }
+    if (!TrimText(loadedPath.selectedPointVisualName).empty()) {
+        loadedPath.selectedPointVisualName = NormalizePointVisualName(
+            loadedPath.selectedPointVisualName);
     }
 
     const bool currentUsesEdited = loadingEdited || repairedMissingTimingTake;
     panel.currentPath = std::move(loadedPath);
+    const bool requestedSavedPointVisual =
+        !TrimText(panel.currentPath->selectedPointVisualName).empty();
+    const bool restoredSavedPointVisual =
+        ApplyAnimationPointVisualSelection(
+            runtimeState,
+            panel.currentPath.value());
     panel.availableFileDiskRevisions[index] =
         invisible_places::app::workspace::ReadFileRevision(inputPath);
     panel.currentPathUsesEdited = currentUsesEdited;
@@ -31046,7 +31306,14 @@ bool LoadAnimationPathVariant(
         " animation: " + inputPath.filename().string() +
         (repairedMissingTimingTake
              ? ". Its missing Timing Take was replaced with Authored Timing."
-             : ".");
+             : promotedEditedShadowForMissingTimingTake
+                   ? ". Its saved Timing Take is unavailable, so the existing edited version was kept."
+                   : ".") +
+        (requestedSavedPointVisual && !restoredSavedPointVisual
+             ? " Its saved Visual '" +
+                   panel.currentPath->selectedPointVisualName +
+                   "' is not available in the active scene, so the current Visual was kept."
+             : std::string{});
     runtimeState->errorMessage.clear();
     return true;
 }
@@ -31241,6 +31508,9 @@ bool DiscardAnimationEdits(
             panel.perceivedFlowCache = {};
             runtimeState->animationPlayback.active = false;
             SyncWaterAnimationTrailProfileFromCurrentAnimation(runtimeState);
+            ApplyAnimationPointVisualSelection(
+                runtimeState,
+                panel.currentPath.value());
             ApplyAnimationScrub(runtimeState);
         }
     } else if (panel.selectedFileIndex.has_value() &&
@@ -32629,13 +32899,13 @@ ResolveCurrentPointVisualExportSelection(
     return selection;
 }
 
-// Every export renders the SAVED named visual selected for the live display.
-// Live sessions may carry unsaved lookdev edits (scene-temporary shadows or
-// raw pointStyle tweaks made to keep preview fps up), so this resolves the
-// base entry from the project visual library and never reads session
-// pointStyle or scene shadow states.
+// A requested animation visual resolves exactly, including a persisted scene
+// visual. Legacy animations without a selection keep the previous batch
+// behaviour and resolve the saved base Visual selected in the live display.
+// Raw unsaved pointStyle tweaks are never used by batch exports.
 std::optional<SavedPointVisualExportSelection> ResolveSavedPointVisualExportSelection(
-    PreviewRuntimeState* runtimeState) {
+    PreviewRuntimeState* runtimeState,
+    std::string_view requestedVisualName = {}) {
     if (runtimeState == nullptr) {
         return std::nullopt;
     }
@@ -32649,29 +32919,75 @@ std::optional<SavedPointVisualExportSelection> ResolveSavedPointVisualExportSele
     if (IsProjectPointVisualSession(session)) {
         EnsureProjectPointVisuals(runtimeState);
         auto& library = runtimeState->pointVisualLibrary;
+        const bool hasRequestedVisual =
+            !TrimText(requestedVisualName).empty();
         const auto selectedName = NormalizePointVisualName(
-            session.selectedPointVisualName.empty()
-                ? library.selectedPointVisualName
-                : session.selectedPointVisualName);
-        // An exact saved-visual match wins before scene-suffix stripping so a
-        // saved name that happens to end in a scene-group name is never
-        // re-mapped onto a different base visual.
-        const auto baseName = FindProjectPointVisualIndex(library, selectedName).has_value()
-                                  ? selectedName
-                                  : BaseNameFromProjectPointVisualName(library, selectedName);
-        const auto visualIndex = FindProjectPointVisualIndex(library, baseName);
-        if (!visualIndex.has_value()) {
-            return std::nullopt;
+            hasRequestedVisual
+                ? requestedVisualName
+                : session.selectedPointVisualName.empty()
+                      ? library.selectedPointVisualName
+                      : session.selectedPointVisualName);
+        if (hasRequestedVisual) {
+            if (const auto visualIndex =
+                    FindProjectPointVisualIndex(
+                        library,
+                        selectedName);
+                visualIndex.has_value()) {
+                selection.visualName =
+                    library.pointVisuals[visualIndex.value()].name;
+                selection.visualOverride.style =
+                    library.pointVisuals[visualIndex.value()].style;
+            } else if (const auto stateIndex =
+                           FindScenePointVisualStateByNameIndex(
+                               library,
+                               selectedName);
+                       stateIndex.has_value() &&
+                       library.sceneVisualStates[stateIndex.value()]
+                               .sceneGroupName ==
+                           ProjectVisualSceneKey(session)) {
+                selection.visualName =
+                    library.sceneVisualStates[stateIndex.value()]
+                        .visual.name;
+                selection.visualOverride.style =
+                    library.sceneVisualStates[stateIndex.value()]
+                        .visual.style;
+            } else {
+                return std::nullopt;
+            }
+        } else {
+            // An exact saved-visual match wins before scene-suffix stripping
+            // so a saved name ending in a scene-group name is not remapped.
+            const auto baseName =
+                FindProjectPointVisualIndex(library, selectedName)
+                        .has_value()
+                    ? selectedName
+                    : BaseNameFromProjectPointVisualName(
+                          library,
+                          selectedName);
+            const auto visualIndex =
+                FindProjectPointVisualIndex(library, baseName);
+            if (!visualIndex.has_value()) {
+                return std::nullopt;
+            }
+            selection.visualName =
+                library.pointVisuals[visualIndex.value()].name;
+            selection.visualOverride.style =
+                library.pointVisuals[visualIndex.value()].style;
         }
-        selection.visualName = library.pointVisuals[visualIndex.value()].name;
-        selection.visualOverride.style = library.pointVisuals[visualIndex.value()].style;
     } else {
-        const auto baseName = BasePointVisualName(session.selectedPointVisualName);
+        const bool hasRequestedVisual =
+            !TrimText(requestedVisualName).empty();
+        const auto targetName = hasRequestedVisual
+                                    ? NormalizePointVisualName(
+                                          requestedVisualName)
+                                    : BasePointVisualName(
+                                          session.selectedPointVisualName);
         const auto visualIt = std::find_if(
             session.pointVisuals.begin(),
             session.pointVisuals.end(),
             [&](const SavedPointVisualState& visual) {
-                return NormalizePointVisualName(visual.name) == baseName;
+                return NormalizePointVisualName(visual.name) ==
+                       targetName;
             });
         if (visualIt == session.pointVisuals.end()) {
             return std::nullopt;
@@ -33521,6 +33837,11 @@ bool ClearActiveRenderSetupOverride(
     RestoreAnimationRuntimeState(
         runtimeState,
         std::move(latestAnimation));
+    if (runtimeState->animationPanel.currentPath.has_value()) {
+        ApplyAnimationPointVisualSelection(
+            runtimeState,
+            runtimeState->animationPanel.currentPath.value());
+    }
     runtimeState->projectSettings.gaussianSplatFootprintBoost =
         active.underlyingGaussianSplatFootprintBoost;
     runtimeState->statusMessage =
@@ -36100,6 +36421,8 @@ ResolveCurrentRenderSetupSnapshot(
         snapshot.visual.visualOverride.style =
             loadedOverride->document.livePointVisual;
     }
+    snapshot.animationPath.selectedPointVisualName =
+        snapshot.visual.visualName;
     EnsureExportPresets(runtimeState);
     snapshot.exportPreset =
         loadedOverride != nullptr
@@ -36595,6 +36918,8 @@ RenderSetupDocument BuildQueuedQuickMp4RenderSetupDocument(
     document.visualName = savedVisual.visualName;
     document.animationModified = provenance.animationModified;
     document.animation = animationPath;
+    document.animation.selectedPointVisualName =
+        savedVisual.visualName;
     document.exportPreset = effectivePreset;
     document.livePointVisual = savedVisual.visualOverride.style;
     document.timingState = timingSnapshot.state;
@@ -38653,45 +38978,6 @@ void FreezeQueuedQuickMp4AuthoredTimingState(
     }
 }
 
-void RestoreQueuedQuickMp4PointLayerState(
-    std::vector<
-        invisible_places::renderer::core::SceneRenderState::
-            PointCloudLayerState>* layers,
-    const QueuedQuickMp4WaterSnapshot& snapshot) {
-    if (layers == nullptr) {
-        return;
-    }
-    layers->erase(
-        std::remove_if(
-            layers->begin(),
-            layers->end(),
-            [&](const auto& layer) {
-                return std::none_of(
-                    snapshot.basePointCloudLayers.begin(),
-                    snapshot.basePointCloudLayers.end(),
-                    [&](const auto& frozenLayer) {
-                        return frozenLayer.layerId == layer.layerId;
-                    });
-            }),
-        layers->end());
-    for (auto& layer : *layers) {
-        const auto frozen = std::find_if(
-            snapshot.basePointCloudLayers.begin(),
-            snapshot.basePointCloudLayers.end(),
-            [&](const auto& candidate) {
-                return candidate.layerId == layer.layerId;
-            });
-        if (frozen == snapshot.basePointCloudLayers.end()) {
-            continue;
-        }
-        const auto drawPointCount = layer.drawPointCount;
-        layer = *frozen;
-        // Frustum selection is specific to each animation, so retain only
-        // the draw count derived when this job was started.
-        layer.drawPointCount = drawPointCount;
-    }
-}
-
 invisible_places::water::WaterSeepageRainEnvelope BuildFrozenAnimationSeepageRainEnvelope(
     const std::optional<AnimationPath>& animationPath,
     std::span<const invisible_places::water::WaterScenarioDefinition> definitions) {
@@ -39247,9 +39533,26 @@ QuickMp4ExportStartResult StartQuickMp4ExportJob(
         frustumMaskSummary.enabled,
         visualOverride,
         exportRendererMode);
-    RestoreQueuedQuickMp4PointLayerState(
-        &exportPointCloudLayers,
-        waterSnapshot);
+    std::vector<std::size_t> requestVisualLayerIds;
+    requestVisualLayerIds.reserve(exportPointCloudLayers.size());
+    for (const auto& layer : exportPointCloudLayers) {
+        if (PointVisualExportOverrideTargetsSession(
+                *runtimeState,
+                layer.layerId,
+                visualOverride)) {
+            requestVisualLayerIds.push_back(layer.layerId);
+        }
+    }
+    if (!RestoreQueuedQuickMp4PointLayerState(
+            &exportPointCloudLayers,
+            waterSnapshot.basePointCloudLayers,
+            requestVisualLayerIds)) {
+        runtimeState->errorMessage =
+            "A queue-time LiDAR layer is no longer available. Requeue the "
+            "animation so it can render with a complete layer inventory.";
+        runtimeState->statusMessage.clear();
+        return QuickMp4ExportStartResult::Failed;
+    }
     if (exportPointCloudLayers.empty()) {
         runtimeState->errorMessage =
             "No queue-time LiDAR layers remain available for animation "
@@ -39732,9 +40035,21 @@ void StartSelectedQuickMp4Batch(
             continue;
         }
 
-        // One job per animation, always rendering the saved named visual
-        // selected for the live display.
+        // Schema-25 animations carry their own saved Visual. Older files
+        // retain the legacy batch behaviour and use the live saved Visual.
         {
+            const auto animationVisual =
+                ResolveSavedPointVisualExportSelection(
+                    runtimeState,
+                    animationPath.selectedPointVisualName);
+            if (!animationVisual.has_value()) {
+                loadErrorMessage =
+                    "Animation " + animationPath.name +
+                    " references unavailable Visual '" +
+                    animationPath.selectedPointVisualName + "'.";
+                ++panel.quickMp4QueueSkipped;
+                continue;
+            }
             std::string timingError;
             const auto timingSnapshot =
                 ResolveCurrentTimingTakeExportSnapshot(
@@ -39753,7 +40068,7 @@ void StartSelectedQuickMp4Batch(
                 timingSnapshot->takeId,
                 timingSnapshot->state.waterFeatureTimingRuns,
                 timingSnapshot->state.colouriseEffects,
-                savedVisual->visualName,
+                animationVisual->visualName,
                 usesCurrentInMemoryAnimation && panel.dirty);
             auto renderSetupDocument =
                 BuildQueuedQuickMp4RenderSetupDocument(
@@ -39762,7 +40077,7 @@ void StartSelectedQuickMp4Batch(
                     animationPath,
                     animationFilePath,
                     effectiveBatchPreset,
-                    savedVisual.value(),
+                    animationVisual.value(),
                     timingSnapshot.value(),
                     frozenRenderSetup,
                     batchRendererMode);
@@ -39777,7 +40092,7 @@ void StartSelectedQuickMp4Batch(
                     settings.outputDirectory,
                     outputAnimationName,
                     settings,
-                    savedVisual->visualName,
+                    animationVisual->visualName,
                     reservedOutputPaths,
                     activeMode);
             } else if (AnimationExportWritesAlphaMatteVideoPair(activeMode, activeExternalAlphaMatte)) {
@@ -39788,7 +40103,7 @@ void StartSelectedQuickMp4Batch(
                     settings.outputDirectory,
                     outputAnimationName,
                     settings,
-                    savedVisual->visualName,
+                    animationVisual->visualName,
                     reservedOutputPaths);
                 outputPath = outputPaths.colorPath;
                 alphaMatteVideoPath = outputPaths.alphaMattePath;
@@ -39801,7 +40116,7 @@ void StartSelectedQuickMp4Batch(
                     settings.outputDirectory,
                     outputAnimationName,
                     settings,
-                    savedVisual->visualName,
+                    animationVisual->visualName,
                     reservedOutputPaths);
             }
             reservedOutputPaths.push_back(outputPath);
@@ -39820,13 +40135,14 @@ void StartSelectedQuickMp4Batch(
                  .externalAlphaMatte = activeExternalAlphaMatte,
                  .settings = settings,
                  .animationFilePath = animationFilePath,
-                 .visualName = savedVisual->visualName,
+                 .visualName = animationVisual->visualName,
                  .frozenRenderSetup = std::move(frozenRenderSetup),
                  .renderSetupDocument =
                      std::move(renderSetupDocument),
                  .batchIndex = panel.quickMp4Queue.size() + 1U,
-                 .visualSessionIndex = savedVisual->visualOverride.sessionIndex,
-                 .visualStyle = savedVisual->visualOverride.style,
+                 .visualSessionIndex =
+                     animationVisual->visualOverride.sessionIndex,
+                 .visualStyle = animationVisual->visualOverride.style,
                  .videoOutputPath = AnimationExportWritesPngStack(activeMode) ? std::filesystem::path{} : outputPath,
                  .alphaMatteVideoPath = alphaMatteVideoPath,
                  .pngStackDirectory = AnimationExportWritesPngStack(activeMode) ? outputPath : std::filesystem::path{}});
@@ -68449,6 +68765,63 @@ ProjectDocument BuildProjectDocumentForSave(
         std::move(runtimeDocument));
 }
 
+std::vector<std::string> TrackedProjectPointVisualNames(
+    const PersistenceState& persistence) {
+    std::vector<std::string> names{
+        std::string{point_visual::kDefaultName}};
+    if (!persistence.trackedProjectMergeBaseJson.has_value() ||
+        !persistence.trackedProjectMergeBaseJson->is_object()) {
+        return names;
+    }
+    const auto& project =
+        persistence.trackedProjectMergeBaseJson.value();
+    const auto addVisual = [&](const nlohmann::json& visual) {
+        if (!visual.is_object()) {
+            return;
+        }
+        const auto name = visual.value("name", std::string{});
+        if (!name.empty()) {
+            names.push_back(name);
+        }
+    };
+    if (project.contains("point_visuals") &&
+        project.at("point_visuals").is_array()) {
+        for (const auto& visual : project.at("point_visuals")) {
+            addVisual(visual);
+        }
+    }
+    if (project.contains("scene_visual_states") &&
+        project.at("scene_visual_states").is_array()) {
+        for (const auto& state : project.at("scene_visual_states")) {
+            if (state.is_object() && state.contains("visual")) {
+                addVisual(state.at("visual"));
+            }
+        }
+    }
+    // Only legacy projects source their Visual library from per-layer data.
+    // Current documents may retain stale compatibility fields that are not
+    // authoritative and must not make a deleted Visual appear durable.
+    const auto schemaVersion =
+        project.value("schema_version", 1U);
+    const bool hasAuthoritativeProjectVisuals =
+        schemaVersion >= 30U && project.contains("point_visuals") &&
+        project.at("point_visuals").is_array() &&
+        !project.at("point_visuals").empty();
+    if (!hasAuthoritativeProjectVisuals && project.contains("layers") &&
+        project.at("layers").is_array()) {
+        for (const auto& layer : project.at("layers")) {
+            if (!layer.is_object() || !layer.contains("point_visuals") ||
+                !layer.at("point_visuals").is_array()) {
+                continue;
+            }
+            for (const auto& visual : layer.at("point_visuals")) {
+                addVisual(visual);
+            }
+        }
+    }
+    return names;
+}
+
 std::filesystem::path CurrentAnimationSavePath(
     const PreviewRuntimeState& runtimeState,
     bool saveAs,
@@ -68773,13 +69146,23 @@ std::optional<PreparedAnimationSave> PrepareAnimationSave(
         }
         const bool savingDuringRenderSetupOverride =
             runtimeState->activeRenderSetupOverride.has_value();
+        const AnimationPath* renderSetupUnderlyingAuthority = nullptr;
         if (savingDuringRenderSetupOverride) {
-            const auto& underlying =
+            const auto& underlyingState =
                 runtimeState->activeRenderSetupOverride
                     ->underlyingAnimation;
-            if (underlying.path.has_value()) {
+            renderSetupUnderlyingAuthority =
+                PreservedAuthoritativeAnimationPath(
+                    underlyingState,
+                    currentSourcePath);
+            if (renderSetupUnderlyingAuthority == nullptr) {
+                // Never let the temporary setup selection leak into a save.
+                // Preserving the already-authoritative prepared value is the
+                // safe fallback when the underlying file cannot be matched.
+                renderSetupUnderlyingAuthority = &prepared.path;
+            } else {
                 prepared.path.selectedTimingTakeId =
-                    underlying.path->selectedTimingTakeId;
+                    renderSetupUnderlyingAuthority->selectedTimingTakeId;
             }
         } else if (!sourceHasEditedVersion ||
                    panel.currentPathUsesEdited) {
@@ -68787,6 +69170,12 @@ std::optional<PreparedAnimationSave> PrepareAnimationSave(
                 ViewedWaterAnimationTrailSettings(*runtimeState);
             prepared.path.tempWaterAnimationTrailSettings.reset();
         }
+        (void)point_visual::ApplyAnimationSelectionForSave(
+            &prepared.path,
+            CurrentAnimationPointVisualSelection(runtimeState),
+            sourceHasEditedVersion,
+            panel.currentPathUsesEdited,
+            renderSetupUnderlyingAuthority);
     } else {
         const auto sourcePath = item.sourcePath.empty()
             ? item.targetPath
@@ -68950,6 +69339,25 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
         animations.push_back(std::move(prepared.value()));
     }
 
+    const auto currentPrepared = std::find_if(
+        animations.begin(),
+        animations.end(),
+        [](const PreparedAnimationSave& animation) {
+            return animation.currentAnimation;
+        });
+    if (currentPrepared != animations.end() &&
+        !currentPrepared->loopEditPairId.empty() &&
+        !TrimText(currentPrepared->path.selectedPointVisualName).empty()) {
+        for (auto& animation : animations) {
+            if (animation.loopEditPairId ==
+                    currentPrepared->loopEditPairId &&
+                TrimText(animation.path.selectedPointVisualName).empty()) {
+                animation.path.selectedPointVisualName =
+                    currentPrepared->path.selectedPointVisualName;
+            }
+        }
+    }
+
     if (projectItem != nullptr && projectItem->targetPath.empty()) {
         dialog.errorMessage = "Choose a project file before saving.";
         return false;
@@ -68957,6 +69365,28 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
     if (projectItem == nullptr && animations.empty()) {
         dialog.errorMessage = "Select at least one file to save.";
         return false;
+    }
+    if (projectItem == nullptr) {
+        const auto durableVisualNames =
+            TrackedProjectPointVisualNames(runtimeState->persistence);
+        const auto unsavedVisualAnimation = std::find_if(
+            animations.begin(),
+            animations.end(),
+            [&](const PreparedAnimationSave& animation) {
+                return point_visual::AnimationVisualRequiresProjectSave(
+                    animation.path.selectedPointVisualName,
+                    durableVisualNames);
+            });
+        if (unsavedVisualAnimation != animations.end()) {
+            dialog.errorMessage =
+                "Animation " +
+                unsavedVisualAnimation->targetPath.filename().string() +
+                " uses Visual '" +
+                unsavedVisualAnimation->path.selectedPointVisualName +
+                "', which exists only in unsaved project state. Select and "
+                "save the project in the same transaction first.";
+            return false;
+        }
     }
 
     struct ExpectedSaveRevision {
@@ -69509,6 +69939,28 @@ bool SaveSelectedChanges(PreviewRuntimeState* runtimeState) {
                 WorkspaceRoots(*runtimeState));
             project = std::move(mergedProject.value());
             mergedOneDriveProject = remoteDiffersFromLocalAncestor;
+        }
+    }
+    if (project.has_value()) {
+        const auto committedVisualNames =
+            point_visual::ProjectVisualNames(project.value());
+        const auto danglingAnimation = std::find_if(
+            animations.begin(),
+            animations.end(),
+            [&](const PreparedAnimationSave& animation) {
+                return point_visual::AnimationVisualRequiresProjectSave(
+                    animation.path.selectedPointVisualName,
+                    committedVisualNames);
+            });
+        if (danglingAnimation != animations.end()) {
+            CleanupStagedDocumentFiles(std::span{replacements});
+            dialog.errorMessage =
+                "The project being committed no longer defines Visual '" +
+                danglingAnimation->path.selectedPointVisualName +
+                "', required by animation " +
+                danglingAnimation->targetPath.filename().string() +
+                ". Nothing was saved; restore that Visual or choose another.";
+            return false;
         }
     }
     // Recheck after serialization, immediately before the atomic local

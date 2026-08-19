@@ -65,6 +65,7 @@ RenderSetupDocument MakeRenderSetup() {
     document.animation.name = "Surface 01 edited";
     document.animation.durationFrames = 420U;
     document.animation.selectedTimingTakeId = document.timingTakeId;
+    document.animation.selectedPointVisualName = document.visualName;
     document.animation.keys.push_back({
         .id = "camera-key-1",
         .cameraPosition = {1.0F, 2.0F, 3.0F},
@@ -376,6 +377,7 @@ TEST_CASE(
     CAPTURE(error);
     CHECK(loaded->createdUtc == authored.createdUtc);
     CHECK(loaded->animation.name == "Surface 01 edited");
+    CHECK(loaded->animation.selectedPointVisualName == "Mineral_edited");
     REQUIRE(loaded->animation.keys.size() == 1U);
     CHECK(loaded->animation.keys.front().cameraPosition[2] == Approx(3.0F));
     CHECK(loaded->exportPreset.settings.width == 2560U);
