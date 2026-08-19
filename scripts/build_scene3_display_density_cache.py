@@ -1230,6 +1230,9 @@ def build_cache(config: BuildConfig) -> Path:
             assert isinstance(output, dict)
             output["file"] = relative_output.as_posix()
             role_records.append(record)
+        # Shard scratch lives under .work only while a role is being built;
+        # never publish the (empty) scratch tree inside the immutable bundle.
+        shutil.rmtree(staging_root / ".work", ignore_errors=True)
 
         manifest: dict[str, object] = {
             "schema_version": SCHEMA_VERSION,
@@ -1288,9 +1291,11 @@ def build_cache(config: BuildConfig) -> Path:
                 },
             )
         return final_root
-    except Exception:
+    except BaseException:
+        # BaseException: a Ctrl-C / SIGTERM during the ~30 GB shard phase must
+        # not leave tens of GB of scratch under the cache root.
         if staging_root.exists() and not config.keep_staging_on_error:
-            shutil.rmtree(staging_root)
+            shutil.rmtree(staging_root, ignore_errors=True)
         raise
 
 
