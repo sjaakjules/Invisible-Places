@@ -194,6 +194,14 @@ float WaterFeatureType(uint pointIndex) {
     if (WaterTrailOverlayEnabled()) {
         return LoadScalarFieldValueForPoint(kWaterTrailFeatureTypeFieldSlot, pointIndex);
     }
+    // Fixed water-particle slots only exist on generated water clouds
+    // (pointMeta.w != 0). A scene cloud with 16+ resident scalar fields must
+    // never interpret an ordinary field (e.g. A_R_Recession_Medium at slot
+    // 15) as a particle feature type: points whose value lands in the steam
+    // band would receive time-animated sizes and sparkle.
+    if (styleData.pointMeta.w == 0u) {
+        return 0.0;
+    }
     return styleData.globalControl.z > kWaterFeatureTypeFieldSlot
         ? LoadScalarFieldValueForPoint(kWaterFeatureTypeFieldSlot, pointIndex)
         : 0.0;
@@ -201,6 +209,10 @@ float WaterFeatureType(uint pointIndex) {
 
 float WaterTrailFade(uint pointIndex) {
     if (WaterTrailOverlayEnabled()) {
+        return 1.0;
+    }
+    // Same identity gate: scene clouds have no particle age at slot 13.
+    if (styleData.pointMeta.w == 0u) {
         return 1.0;
     }
     if (styleData.globalControl.z <= kWaterAgeFieldSlot) {
