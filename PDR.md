@@ -326,6 +326,15 @@ spline behavior. Camera position selects keyed settings only; procedural
 Water, Rain, and trail motion shall continue on their independent live or
 deterministic export clocks.
 
+Selecting a Timing Take from either member of a reciprocal pair shall assign
+that same reusable take to both members as one atomic animation edit. A take
+already authored for a linked loop shall be reused unchanged; any other take's
+normalized `0..1` domain shall become one complete target loop and repeat
+cyclically. Assignment shall not clone, rotate, retime, or otherwise rewrite
+the take's keys, handles, setting clips, scene states, or Rain profile. The
+full-loop editor shall remain available immediately after assignment, and Save
+or Discard shall keep the two animation selections together.
+
 ### 5.4 Side Panel Behaviour
 #### FR-UI-1
 The application shall include a side panel for render and style controls.

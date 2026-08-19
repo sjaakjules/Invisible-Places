@@ -13,6 +13,7 @@
 #include <span>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace invisible_places::camera {
@@ -863,6 +864,14 @@ ResolveAnimationTimingLoopWindow(const AnimationPath& path);
 [[nodiscard]] bool ConfigureAnimationReciprocalTimingLoopWindows(
     AnimationPath* first,
     AnimationPath* second);
+// Assigns one existing Timing Take to both members of a reciprocal pair.
+// When neither member has a timing window, `first` is the canonical member
+// and begins at loop frame zero. Existing shared windows are preserved. The
+// operation stages both paths internally and never mutates only one member.
+[[nodiscard]] bool AssignAnimationTimingTakeToReciprocalLoopPair(
+    AnimationPath* first,
+    AnimationPath* second,
+    std::string_view timingTakeId);
 [[nodiscard]] PreparedAnimationPathEvaluationContext PrepareAnimationPathEvaluation(
     const AnimationPath& path);
 [[nodiscard]] AnimationPathEvaluation EvaluatePreparedAnimationPath(

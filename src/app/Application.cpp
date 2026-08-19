@@ -60020,6 +60020,188 @@ bool ApplySharedTimingLoopToLinkedPair(
     return true;
 }
 
+void ResetTimingTakeEditorSelections(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    auto& timings = runtimeState->timingsPanel;
+    timings.selectedRunIndex.reset();
+    timings.selectedKeyIndex.reset();
+    timings.renamingRunIndex.reset();
+    timings.focusRunRename = false;
+    timings.pendingRunDeleteIndex.reset();
+    timings.pendingClearCompiledKeys = false;
+    timings.pendingClearScenarioId.clear();
+    timings.selectedFeatureRunIndex.reset();
+    timings.pendingImport.reset();
+    timings.selectedColouriseEffectIndex.reset();
+    timings.selectedColourisePaletteStopIndex.reset();
+    timings.draggingColourisePaletteStop = false;
+    timings.draggingColourisePaletteStopAmount = false;
+    timings.renamingColouriseEffectIndex.reset();
+    timings.focusColouriseEffectRename = false;
+    timings.colourisePalettePicker.reset();
+    timings.colourisePaletteDrag.reset();
+    timings.waterRunKeyDrag.reset();
+    timings.waterRunSplineHandleDrag.reset();
+    timings.waterRunKeyEdit.reset();
+    timings.waterRunKeySelection.reset();
+    timings.waterKeyEditHistory.reset();
+    timings.waterKeyEditTransaction.reset();
+    timings.waterClipSelection.reset();
+    timings.waterClipDrag.reset();
+    timings.waterClipEdit.reset();
+    timings.waterClipPackageSave.reset();
+    timings.waterClipContext.reset();
+    timings.waterClipHelpHover.reset();
+    timings.colouriseLocalKeyDrag.reset();
+    timings.colouriseLocalKeyPositionEdit.reset();
+    timings.colouriseActivationDrag.reset();
+    timings.activeHistogramHandle = TimingColouriseHistogramHandle::None;
+}
+
+bool ApplyTimingTakeToLinkedLoopPair(
+    PreviewRuntimeState* runtimeState,
+    std::size_t currentIndex,
+    std::string_view timingTakeId) {
+    if (runtimeState == nullptr ||
+        runtimeState->activeRenderSetupOverride.has_value()) {
+        return false;
+    }
+    const std::string normalizedTakeId = invisible_places::timing::
+        NormalizeTimingTakeId(timingTakeId);
+    const auto* take = invisible_places::timing::FindTimingTakeDefinition(
+        runtimeState->water.timingTakes,
+        normalizedTakeId);
+    if (take == nullptr) {
+        runtimeState->errorMessage =
+            "The selected Timing Take no longer exists.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    SyncCurrentAnimationToRegistry(runtimeState);
+    auto& panel = runtimeState->animationPanel;
+    if (currentIndex >= panel.availableFiles.size()) {
+        runtimeState->errorMessage =
+            "The linked animation is no longer loaded.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    const auto* currentLive = RegistryAnimationPath(
+        *runtimeState,
+        currentIndex);
+    if (currentLive == nullptr ||
+        !currentLive->velocityBlendLink.has_value()) {
+        runtimeState->errorMessage =
+            "The current animation is not part of a linked pair.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    const auto partnerIndex = FindAnimationRegistryIndexByFileName(
+        panel,
+        currentLive->velocityBlendLink->partnerFileName);
+    const auto* partnerLive = partnerIndex.has_value()
+        ? RegistryAnimationPath(*runtimeState, partnerIndex.value())
+        : nullptr;
+    if (!partnerIndex.has_value() || partnerLive == nullptr ||
+        partnerIndex.value() == currentIndex) {
+        runtimeState->errorMessage =
+            "The linked partner animation must be loaded before changing the shared Timing Take.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    if (const auto failure = AppliedReciprocalPairFailure(
+            *currentLive,
+            panel.availableFiles[currentIndex],
+            *partnerLive,
+            panel.availableFiles[partnerIndex.value()]);
+        failure.has_value()) {
+        runtimeState->errorMessage = failure.value();
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    const bool currentIsCanonical =
+        NormalizePathKey(panel.availableFiles[currentIndex]) <
+        NormalizePathKey(panel.availableFiles[partnerIndex.value()]);
+    auto canonicalFirst = currentIsCanonical ? *currentLive : *partnerLive;
+    auto canonicalSecond = currentIsCanonical ? *partnerLive : *currentLive;
+    const bool configuredBefore =
+        invisible_places::camera::ResolveAnimationTimingLoopWindow(
+            canonicalFirst).has_value() &&
+        invisible_places::camera::ResolveAnimationTimingLoopWindow(
+            canonicalSecond).has_value();
+    const bool assignmentChanged =
+        invisible_places::timing::NormalizeTimingTakeId(
+            canonicalFirst.selectedTimingTakeId) != normalizedTakeId ||
+        invisible_places::timing::NormalizeTimingTakeId(
+            canonicalSecond.selectedTimingTakeId) != normalizedTakeId;
+    if (!invisible_places::camera::
+            AssignAnimationTimingTakeToReciprocalLoopPair(
+                &canonicalFirst,
+                &canonicalSecond,
+                normalizedTakeId)) {
+        runtimeState->errorMessage =
+            "The linked animations have inconsistent effect-loop windows. Repair or reapply the reciprocal link before selecting a Timing Take.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    const bool configuredLoop = !configuredBefore;
+    if (assignmentChanged || configuredLoop) {
+        auto currentCandidate = currentIsCanonical
+            ? canonicalFirst
+            : canonicalSecond;
+        auto partnerCandidate = currentIsCanonical
+            ? canonicalSecond
+            : canonicalFirst;
+        EnsureAnimationAssociationStorage(&panel);
+        panel.availableFileEditedPaths[currentIndex] = currentCandidate;
+        panel.availableFileEditedPaths[partnerIndex.value()] =
+            partnerCandidate;
+        panel.availableFileDirtyFlags[currentIndex] = true;
+        panel.availableFileDirtyFlags[partnerIndex.value()] = true;
+        const std::string pairId =
+            currentCandidate.velocityBlendLink->pairId;
+        panel.availableFileLoopEditPairIds[currentIndex] = pairId;
+        panel.availableFileLoopEditPairIds[partnerIndex.value()] = pairId;
+        if (configuredLoop) {
+            panel.projectVelocityLinksDirty = true;
+        }
+
+        const auto activeIndex = panel.currentFilePath.empty()
+            ? std::nullopt
+            : FindAnimationRegistryIndex(
+                  panel,
+                  std::filesystem::path{panel.currentFilePath});
+        if (activeIndex == currentIndex) {
+            panel.currentPath = std::move(currentCandidate);
+        } else if (activeIndex == partnerIndex) {
+            panel.currentPath = std::move(partnerCandidate);
+        }
+        if (activeIndex == currentIndex || activeIndex == partnerIndex) {
+            panel.currentPathUsesEdited = true;
+            panel.selectedFileUsesEdited = true;
+            panel.dirty = true;
+        }
+        panel.loopTimeline.previewDirty = true;
+    }
+
+    runtimeState->water.selectedTimingTakeId = normalizedTakeId;
+    ResetTimingTakeEditorSelections(runtimeState);
+    runtimeState->previewRenderStateSignatureValid = false;
+    ApplyAnimationScrub(runtimeState);
+    runtimeState->statusMessage =
+        assignmentChanged || configuredLoop
+            ? "Applied Timing Take \"" + take->name +
+                  "\" to both linked animations. Its complete 0-1 track now repeats across the shared loop; keys and clip ranges were not rewritten. Save or Discard the pair together."
+            : "Both linked animations already use Timing Take \"" +
+                  take->name + "\".";
+    runtimeState->errorMessage.clear();
+    return true;
+}
+
 bool ApplyReciprocalPanCandidate(
     PreviewRuntimeState* runtimeState,
     float currentAspectRatio) {
@@ -96145,6 +96327,35 @@ void DrawAuthoredTimingsPanel(
         ? invisible_places::camera::ResolveAnimationTimingLoopWindow(
               *animationPath)
         : std::nullopt;
+    const bool linkedAnimation = animationPath != nullptr &&
+        animationPath->velocityBlendLink.has_value();
+    std::optional<std::size_t> linkedPartnerIndex;
+    std::optional<std::string> linkedTakeAssignmentFailure;
+    if (linkedAnimation) {
+        if (!animationRegistryIndex.has_value()) {
+            linkedTakeAssignmentFailure =
+                "The linked animation is not registered.";
+        } else {
+            linkedPartnerIndex = FindAnimationRegistryIndexByFileName(
+                panel,
+                animationPath->velocityBlendLink->partnerFileName);
+            const auto* partner = linkedPartnerIndex.has_value()
+                ? RegistryAnimationPath(
+                      *runtimeState,
+                      linkedPartnerIndex.value())
+                : nullptr;
+            if (partner == nullptr) {
+                linkedTakeAssignmentFailure =
+                    "Load the linked partner animation before changing the shared Timing Take.";
+            } else {
+                linkedTakeAssignmentFailure = AppliedReciprocalPairFailure(
+                    *animationPath,
+                    panel.availableFiles[animationRegistryIndex.value()],
+                    *partner,
+                    panel.availableFiles[linkedPartnerIndex.value()]);
+            }
+        }
+    }
     std::string selectedTakeId =
         animationPath != nullptr
             ? invisible_places::timing::NormalizeTimingTakeId(
@@ -96163,9 +96374,18 @@ void DrawAuthoredTimingsPanel(
             water.selectedTimingTakeId = selectedTakeId;
             if (animationPath != nullptr &&
                 !readOnlySavedComparison) {
-                animationPath->selectedTimingTakeId =
-                    selectedTakeId;
-                panel.dirty = true;
+                if (linkedAnimation &&
+                    animationRegistryIndex.has_value() &&
+                    !linkedTakeAssignmentFailure.has_value()) {
+                    (void)ApplyTimingTakeToLinkedLoopPair(
+                        runtimeState,
+                        animationRegistryIndex.value(),
+                        selectedTakeId);
+                } else if (!linkedAnimation) {
+                    animationPath->selectedTimingTakeId =
+                        selectedTakeId;
+                    panel.dirty = true;
+                }
             }
         }
         selectedTake =
@@ -96201,9 +96421,14 @@ void DrawAuthoredTimingsPanel(
                 static_cast<long long>(
                     linkedTimingWindow->startFrame +
                     linkedTimingWindow->durationFrames));
+        } else if (linkedAnimation &&
+                   !linkedTakeAssignmentFailure.has_value()) {
+            ImGui::TextWrapped(
+                "This reciprocal pair is ready for one shared effect loop. Choosing a Timing Take below will map its complete 0-1 track onto that loop for both animations.");
         }
         ImGui::BeginDisabled(
-            readOnlySavedComparison || linkedTimingWindow.has_value());
+            readOnlySavedComparison ||
+            linkedTakeAssignmentFailure.has_value());
         const char* takePreview =
             selectedTake != nullptr
                 ? selectedTake->name.c_str()
@@ -96217,23 +96442,32 @@ void DrawAuthoredTimingsPanel(
                 if (ImGui::Selectable(
                         take.name.c_str(),
                         selected)) {
-                    water.selectedTimingTakeId = take.id;
-                    if (animationPath != nullptr) {
-                        animationPath->selectedTimingTakeId =
-                            take.id;
-                        panel.dirty = true;
-                    }
-                    timings.selectedFeatureRunIndex.reset();
-                    timings.selectedColouriseEffectIndex.reset();
-                    timings.selectedColourisePaletteStopIndex.reset();
-                    runtimeState->previewRenderStateSignatureValid =
-                        false;
-                    selectedTakeId = take.id;
-                    selectedTake =
-                        invisible_places::timing::
-                            FindTimingTakeDefinition(
-                                &water.timingTakes,
+                    bool applied = true;
+                    if (linkedAnimation) {
+                        applied = animationRegistryIndex.has_value() &&
+                            ApplyTimingTakeToLinkedLoopPair(
+                                runtimeState,
+                                animationRegistryIndex.value(),
                                 take.id);
+                    } else if (!selected) {
+                        water.selectedTimingTakeId = take.id;
+                        if (animationPath != nullptr) {
+                            animationPath->selectedTimingTakeId =
+                                take.id;
+                            panel.dirty = true;
+                        }
+                        ResetTimingTakeEditorSelections(runtimeState);
+                        runtimeState->previewRenderStateSignatureValid =
+                            false;
+                    }
+                    if (applied) {
+                        selectedTakeId = take.id;
+                        selectedTake =
+                            invisible_places::timing::
+                                FindTimingTakeDefinition(
+                                    &water.timingTakes,
+                                    take.id);
+                    }
                 }
                 if (selected) {
                     ImGui::SetItemDefaultFocus();
@@ -96241,10 +96475,28 @@ void DrawAuthoredTimingsPanel(
             }
             ImGui::EndCombo();
         }
-        DrawTimingControlTooltip(
-            linkedTimingWindow.has_value()
-                ? "The reciprocal pair owns one Timing Take. Unlink the pair before assigning either animation a different take; the keys below remain editable."
-                : "Choose the reusable Timing Take linked to this animation. A take starts from authored water and changes only explicit keys.");
+        ImGui::EndDisabled();
+        std::string takeTooltip;
+        if (readOnlySavedComparison) {
+            takeTooltip =
+                "Load the _Edited animation before changing its Timing Take.";
+        } else if (linkedTakeAssignmentFailure.has_value()) {
+            takeTooltip = linkedTakeAssignmentFailure.value();
+        } else if (linkedAnimation) {
+            takeTooltip =
+                "Choose any reusable Timing Take for both linked animations. Its normalized 0-1 domain becomes one complete loop without cloning, rotating, or retiming its keys and clip ranges; edit that full loop below. A take with different keys at both 0 and 1 uses its end key at the shared cyclic phase.";
+        } else {
+            takeTooltip =
+                "Choose the reusable Timing Take linked to this animation. A take starts from authored water and changes only explicit keys.";
+        }
+        DrawTimingControlTooltip(takeTooltip.c_str());
+
+        if (linkedAnimation) {
+            ImGui::TextDisabled(
+                "Take-library controls stay locked for linked pairs; choose any existing take above, then edit its full-loop keys and clips below.");
+        }
+        ImGui::BeginDisabled(
+            readOnlySavedComparison || linkedAnimation);
 
         if (ImGui::Button("New")) {
             const auto* inheritedRainBase =
@@ -96352,9 +96604,29 @@ void DrawAuthoredTimingsPanel(
             selectedTakeId ==
             invisible_places::timing::
                 kAuthoredTimingTakeId;
+        const bool takeReferencedByAnotherAnimation = [&] {
+            for (std::size_t index = 0U;
+                 index < panel.availableFiles.size();
+                 ++index) {
+                if (animationRegistryIndex.has_value() &&
+                    index == animationRegistryIndex.value()) {
+                    continue;
+                }
+                const auto* path = RegistryAnimationPath(
+                    *runtimeState,
+                    index);
+                if (path != nullptr &&
+                    invisible_places::timing::NormalizeTimingTakeId(
+                        path->selectedTimingTakeId) == selectedTakeId) {
+                    return true;
+                }
+            }
+            return false;
+        }();
         ImGui::BeginDisabled(
             authoredTake ||
-            selectedTake == nullptr);
+            selectedTake == nullptr ||
+            takeReferencedByAnotherAnimation);
         if (ImGui::Button("Delete") &&
             selectedTake != nullptr) {
             (void)invisible_places::timing::
@@ -96397,6 +96669,8 @@ void DrawAuthoredTimingsPanel(
         DrawTimingControlTooltip(
             authoredTake
                 ? "Authored Timing is reserved and cannot be deleted."
+            : takeReferencedByAnotherAnimation
+                ? "This Timing Take is assigned to another loaded animation and cannot be deleted until those animations use a different take."
                 : "Delete this Timing Take and every scene-specific run and scalar effect it owns.");
         if (selectedTake != nullptr) {
             ImGui::BeginDisabled(authoredTake);

@@ -1534,6 +1534,45 @@ bool ConfigureAnimationReciprocalTimingLoopWindows(
     return true;
 }
 
+bool AssignAnimationTimingTakeToReciprocalLoopPair(
+    AnimationPath* first,
+    AnimationPath* second,
+    std::string_view timingTakeId) {
+    if (first == nullptr || second == nullptr || first == second ||
+        !first->velocityBlendLink.has_value() ||
+        !second->velocityBlendLink.has_value() ||
+        first->velocityBlendLink->pairId.empty() ||
+        first->velocityBlendLink->pairId !=
+            second->velocityBlendLink->pairId) {
+        return false;
+    }
+
+    const auto firstWindow = ResolveAnimationTimingLoopWindow(*first);
+    const auto secondWindow = ResolveAnimationTimingLoopWindow(*second);
+    if (firstWindow.has_value() != secondWindow.has_value() ||
+        (firstWindow.has_value() &&
+         firstWindow->cycleFrames != secondWindow->cycleFrames)) {
+        return false;
+    }
+
+    auto firstCandidate = *first;
+    auto secondCandidate = *second;
+    if (!firstWindow.has_value() &&
+        !ConfigureAnimationReciprocalTimingLoopWindows(
+            &firstCandidate,
+            &secondCandidate)) {
+        return false;
+    }
+
+    const auto normalizedTakeId = invisible_places::timing::
+        NormalizeTimingTakeId(timingTakeId);
+    firstCandidate.selectedTimingTakeId = normalizedTakeId;
+    secondCandidate.selectedTimingTakeId = normalizedTakeId;
+    *first = std::move(firstCandidate);
+    *second = std::move(secondCandidate);
+    return true;
+}
+
 PreparedAnimationPathEvaluationContext PrepareAnimationPathEvaluation(const AnimationPath& path) {
     PreparedAnimationPathEvaluationContext context;
     if (path.keys.empty()) {

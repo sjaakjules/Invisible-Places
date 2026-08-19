@@ -3708,6 +3708,105 @@ TEST_CASE("Reciprocal timing windows map both camera paths onto one exact loop",
           originalFirst.timingCycleFrames);
 }
 
+TEST_CASE("Reciprocal linked animations accept any existing Timing Take atomically",
+          "[camera][animation][linked-seam][timing-loop][timing-take]") {
+    const auto makePath = [](std::string name,
+                             float startOverlap,
+                             float endOverlap) {
+        invisible_places::camera::AnimationPath path;
+        path.name = std::move(name);
+        path.durationFrames = 300U;
+        path.keys = {
+            {.id = path.name + "-start",
+             .cameraPosition = {1.0F, 2.0F, 3.0F}},
+            {.id = path.name + "-end",
+             .cameraPosition = {4.0F, 5.0F, 6.0F},
+             .durationFrames = 300U},
+        };
+        path.velocityBlendLink = invisible_places::camera::
+            AnimationVelocityBlendLinkMetadata{
+                .pairId = "shared-clock",
+                .partnerFileName = "partner.ipanim.json",
+                .startOverlapSeconds = startOverlap,
+                .endOverlapSeconds = endOverlap,
+            };
+        path.selectedTimingTakeId = "previous-" + path.name;
+        return path;
+    };
+
+    SECTION("an ordinary take creates the loop without rewriting camera data") {
+        auto first = makePath("A", 2.0F, 3.0F);
+        auto second = makePath("B", 3.0F, 2.0F);
+        const auto firstCamera = first.keys.front().cameraPosition;
+        const auto secondCamera = second.keys.back().cameraPosition;
+
+        REQUIRE(invisible_places::camera::
+                    AssignAnimationTimingTakeToReciprocalLoopPair(
+                        &first,
+                        &second,
+                        "ordinary-take"));
+        CHECK(first.selectedTimingTakeId == "ordinary-take");
+        CHECK(second.selectedTimingTakeId == "ordinary-take");
+        REQUIRE(first.velocityBlendLink.has_value());
+        REQUIRE(second.velocityBlendLink.has_value());
+        CHECK(first.velocityBlendLink->timingCycleFrames == 450U);
+        CHECK(second.velocityBlendLink->timingCycleFrames == 450U);
+        CHECK(first.velocityBlendLink->timingWindowStartFrame == 0);
+        CHECK(second.velocityBlendLink->timingWindowStartFrame == 210);
+        CHECK(first.keys.front().cameraPosition == firstCamera);
+        CHECK(second.keys.back().cameraPosition == secondCamera);
+    }
+
+    SECTION("an existing linked-loop take preserves established windows") {
+        auto first = makePath("A", 2.0F, 3.0F);
+        auto second = makePath("B", 3.0F, 2.0F);
+        REQUIRE(invisible_places::camera::
+                    ConfigureAnimationReciprocalTimingLoopWindows(
+                        &first,
+                        &second));
+        const auto firstStart =
+            first.velocityBlendLink->timingWindowStartFrame;
+        const auto secondStart =
+            second.velocityBlendLink->timingWindowStartFrame;
+
+        REQUIRE(invisible_places::camera::
+                    AssignAnimationTimingTakeToReciprocalLoopPair(
+                        &first,
+                        &second,
+                        "linked-loop-take"));
+        CHECK(first.selectedTimingTakeId == "linked-loop-take");
+        CHECK(second.selectedTimingTakeId == "linked-loop-take");
+        CHECK(first.velocityBlendLink->timingWindowStartFrame == firstStart);
+        CHECK(second.velocityBlendLink->timingWindowStartFrame == secondStart);
+    }
+
+    SECTION("inconsistent saved windows reject without partial assignment") {
+        auto first = makePath("A", 2.0F, 3.0F);
+        auto second = makePath("B", 3.0F, 2.0F);
+        REQUIRE(invisible_places::camera::
+                    ConfigureAnimationReciprocalTimingLoopWindows(
+                        &first,
+                        &second));
+        second.velocityBlendLink->timingCycleFrames += 1U;
+        const auto firstTake = first.selectedTimingTakeId;
+        const auto secondTake = second.selectedTimingTakeId;
+        const auto firstCycle =
+            first.velocityBlendLink->timingCycleFrames;
+        const auto secondCycle =
+            second.velocityBlendLink->timingCycleFrames;
+
+        CHECK_FALSE(invisible_places::camera::
+                        AssignAnimationTimingTakeToReciprocalLoopPair(
+                            &first,
+                            &second,
+                            "replacement"));
+        CHECK(first.selectedTimingTakeId == firstTake);
+        CHECK(second.selectedTimingTakeId == secondTake);
+        CHECK(first.velocityBlendLink->timingCycleFrames == firstCycle);
+        CHECK(second.velocityBlendLink->timingCycleFrames == secondCycle);
+    }
+}
+
 namespace {
 
 // A pan with several authored keys close to its end so a pre-roll alignment
