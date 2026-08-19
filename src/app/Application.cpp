@@ -1642,6 +1642,42 @@ struct TimingColouriseActivationDragState {
     float originalEnd = 1.0F;
 };
 
+enum class TimingColouriseSettingsClipDragPart : std::uint8_t {
+    Start = 0,
+    Body,
+    End,
+};
+
+// The overview's lower-half settings clip is derived from every animation
+// key owned by one Visual Feature. Keep a complete immutable effect snapshot
+// so each drag frame can reapply one affine transform from the original
+// positions; stable ids avoid dangling references after list reordering.
+struct TimingColouriseSettingsClipDragState {
+    std::string effectId;
+    TimingColouriseSettingsClipDragPart part =
+        TimingColouriseSettingsClipDragPart::Body;
+    float mouseStartX = 0.0F;
+    float grabOffsetPixels = 0.0F;
+    invisible_places::timing::TimingColouriseSettingsKeySpan sourceSpan{};
+    invisible_places::timing::TimingColouriseEffect originalEffect{};
+    bool moved = false;
+};
+
+enum class TimingColouriseOverviewHelpLayer : std::uint8_t {
+    Activation = 0,
+    SettingsClip,
+};
+
+// Hovering either half of an overview row reveals one non-interactive help
+// mark in the adjacent gutter. A short grace period lets the pointer cross
+// from the timeline into the gutter without registering a second widget.
+struct TimingColouriseOverviewHelpHoverState {
+    std::string effectId;
+    TimingColouriseOverviewHelpLayer layer =
+        TimingColouriseOverviewHelpLayer::Activation;
+    double visibleUntil = 0.0;
+};
+
 enum class TimingColouriseTimelineView : std::uint8_t {
     FullAnimation = 0,
     ActiveRange,
@@ -1756,6 +1792,10 @@ struct TimingsPanelState {
         colouriseLocalKeyPositionEdit;
     std::optional<TimingColouriseActivationDragState>
         colouriseActivationDrag;
+    std::optional<TimingColouriseSettingsClipDragState>
+        colouriseSettingsClipDrag;
+    std::optional<TimingColouriseOverviewHelpHoverState>
+        colouriseOverviewHelpHover;
     TimingColouriseTimelineView colouriseTimelineView =
         TimingColouriseTimelineView::FullAnimation;
     // Remembered variant choice per scalar family so switching families
@@ -33616,6 +33656,8 @@ void CancelRenderSetupAuthoringInteractions(
     timings.colouriseLocalKeyDrag.reset();
     timings.colouriseLocalKeyPositionEdit.reset();
     timings.colouriseActivationDrag.reset();
+    timings.colouriseSettingsClipDrag.reset();
+    timings.colouriseOverviewHelpHover.reset();
 }
 
 invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState(
@@ -60404,6 +60446,8 @@ void ResetTimingTakeEditorSelections(PreviewRuntimeState* runtimeState) {
     timings.colouriseLocalKeyDrag.reset();
     timings.colouriseLocalKeyPositionEdit.reset();
     timings.colouriseActivationDrag.reset();
+    timings.colouriseSettingsClipDrag.reset();
+    timings.colouriseOverviewHelpHover.reset();
     timings.activeHistogramHandle = TimingColouriseHistogramHandle::None;
 }
 
@@ -60427,6 +60471,8 @@ void ClearTimingColouriseEditorFocus(PreviewRuntimeState* runtimeState) {
     timings.colouriseLocalKeyDrag.reset();
     timings.colouriseLocalKeyPositionEdit.reset();
     timings.colouriseActivationDrag.reset();
+    timings.colouriseSettingsClipDrag.reset();
+    timings.colouriseOverviewHelpHover.reset();
     timings.activeHistogramHandle = TimingColouriseHistogramHandle::None;
     runtimeState->animationPanel.timingColouriseKeyPositionEdit.reset();
 }
@@ -96039,6 +96085,8 @@ void DrawTimingColouriseActivationOverview(
     auto& timings = runtimeState->timingsPanel;
     if (effects->empty()) {
         timings.colouriseActivationDrag.reset();
+        timings.colouriseSettingsClipDrag.reset();
+        timings.colouriseOverviewHelpHover.reset();
         ImGui::TextDisabled(
             "Add a Visual Feature to author an active range.");
         return;
@@ -96065,6 +96113,9 @@ void DrawTimingColouriseActivationOverview(
             TimingColouriseHistogramHandle::None;
         timings.colouriseLocalKeyDrag.reset();
         timings.colouriseLocalKeyPositionEdit.reset();
+        timings.colouriseActivationDrag.reset();
+        timings.colouriseSettingsClipDrag.reset();
+        timings.colouriseOverviewHelpHover.reset();
         runtimeState->animationPanel
             .timingColouriseKeyPositionEdit.reset();
         timings.colouriseEffectRenameBuffer =
@@ -96112,14 +96163,14 @@ void DrawTimingColouriseActivationOverview(
             ImGuiTableColumnFlags_WidthFixed,
             180.0F);
         ImGui::TableSetupColumn(
-            "Active range  0 ............................. 1",
+            "Active range / settings clip  0 .............. 1",
             ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
         ImGui::TableSetColumnIndex(0);
         ImGui::TableHeader("Visual Feature");
         ImGui::TableSetColumnIndex(1);
         ImGui::TableHeader(
-            "Active range  0 ............................. 1");
+            "Active range / settings clip  0 .............. 1");
         DrawTimingCornerHelpMark(
             ImGui::GetWindowDrawList(),
             ImGui::GetItemRectMin(),
@@ -96127,9 +96178,11 @@ void DrawTimingColouriseActivationOverview(
             "Visual Features timeline\n"
             "Click a feature name to select it, double-click to turn it on "
             "or off, or drag it to change its layer priority.\n"
-            "Drag either endpoint of a row's filled interval, or drag the "
-            "filled body to translate it. Keys keep their global animation "
-            "positions.\n"
+            "The upper half is the active range: drag an endpoint to resize "
+            "it or the body to move it; setting keys stay fixed.\n"
+            "The lower half bundles every setting key: drag an edge to "
+            "stretch all keys or the body to offset them; the active range "
+            "stays fixed. Individual keys remain editable below.\n"
             "Red overlays mark ranges where the active features need more "
             "renderer slots than recommended. A feature with colourise and "
             "emissive output uses two of the eight slots.");
@@ -96137,6 +96190,10 @@ void DrawTimingColouriseActivationOverview(
         // This timeline is the single Visual Feature list: its names own
         // selection, enable toggles, and renderer-priority reordering.
         bool dragEffectStillPresent = false;
+        bool settingsClipDragEffectStillPresent = false;
+        bool overviewHelpEffectStillPresent = false;
+        constexpr float kOverviewHelpGutterWidth = 22.0F;
+        constexpr double kOverviewHelpHoverGraceSeconds = 2.5;
         std::optional<std::pair<std::size_t, std::size_t>>
             requestedReorder;
         for (std::size_t index = 0U;
@@ -96213,19 +96270,31 @@ void DrawTimingColouriseActivationOverview(
                     : "Click to select, double-click to turn on, or drag to change layer priority. The top feature has highest priority.");
 
             ImGui::TableSetColumnIndex(1);
+            const float availableLaneWidth = std::max(
+                80.0F,
+                ImGui::GetContentRegionAvail().x);
             const ImVec2 laneSize{
                 std::max(
-                    80.0F,
-                    ImGui::GetContentRegionAvail().x),
+                    58.0F,
+                    availableLaneWidth - kOverviewHelpGutterWidth),
                 20.0F};
             ImGui::InvisibleButton(
-                "##ActivationRange",
+                "##ActivationAndSettingsClip",
                 laneSize,
                 ImGuiButtonFlags_MouseButtonLeft);
+            const bool timelineItemHovered = ImGui::IsItemHovered();
+            const bool timelineItemActive = ImGui::IsItemActive();
             const ImVec2 itemMinimum =
                 ImGui::GetItemRectMin();
             const ImVec2 itemMaximum =
                 ImGui::GetItemRectMax();
+            ImGui::SameLine(0.0F, 0.0F);
+            ImGui::Dummy(
+                ImVec2{kOverviewHelpGutterWidth, laneSize.y});
+            const ImVec2 helpMinimum{itemMaximum.x, itemMinimum.y};
+            const ImVec2 helpMaximum{
+                itemMaximum.x + kOverviewHelpGutterWidth,
+                itemMaximum.y};
             constexpr float kHandleInset = 5.0F;
             const float trackMinimumX =
                 itemMinimum.x + kHandleInset;
@@ -96234,10 +96303,18 @@ void DrawTimingColouriseActivationOverview(
             const float trackWidth = std::max(
                 1.0F,
                 trackMaximumX - trackMinimumX);
-            const float centreY =
-                std::midpoint(
-                    itemMinimum.y,
-                    itemMaximum.y);
+            const float splitY = std::floor(
+                std::midpoint(itemMinimum.y, itemMaximum.y));
+            const ImVec2 activationMinimum = itemMinimum;
+            const ImVec2 activationMaximum{itemMaximum.x, splitY};
+            const ImVec2 settingsMinimum{itemMinimum.x, splitY};
+            const ImVec2 settingsMaximum = itemMaximum;
+            const float activationCentreY = std::midpoint(
+                activationMinimum.y,
+                activationMaximum.y);
+            const float settingsCentreY = std::midpoint(
+                settingsMinimum.y,
+                settingsMaximum.y);
             const auto xForPosition = [&](float position) {
                 return trackMinimumX +
                        trackWidth * std::clamp(
@@ -96252,6 +96329,10 @@ void DrawTimingColouriseActivationOverview(
                     1.0F);
             };
             const auto mouse = ImGui::GetIO().MousePos;
+            const bool activationHovered =
+                timelineItemHovered && mouse.y < splitY;
+            const bool settingsHovered =
+                timelineItemHovered && mouse.y >= splitY;
             const float startX =
                 xForPosition(range.start);
             const float endX =
@@ -96263,11 +96344,11 @@ void DrawTimingColouriseActivationOverview(
                 std::abs(mouse.x - endX);
             std::optional<TimingColouriseActivationDragPart>
                 hoveredPart;
-            if (ImGui::IsItemHovered()) {
+            if (activationHovered) {
                 if (startDistance <= kHandleHitRadius &&
                     endDistance <= kHandleHitRadius) {
                     hoveredPart =
-                        mouse.y < centreY
+                        mouse.y < activationCentreY
                             ? TimingColouriseActivationDragPart::Start
                             : TimingColouriseActivationDragPart::End;
                 } else if (
@@ -96284,7 +96365,53 @@ void DrawTimingColouriseActivationOverview(
                         TimingColouriseActivationDragPart::Body;
                 }
             }
-            if (ImGui::IsItemHovered() &&
+
+            auto settingsKeyPositions = invisible_places::timing::
+                TimingColouriseEffectSettingsKeyPositions(effect);
+            auto settingsSpan = invisible_places::timing::
+                TimingColouriseEffectSettingsKeySpan(effect);
+            std::optional<TimingColouriseSettingsClipDragPart>
+                hoveredSettingsPart;
+            if (settingsHovered && settingsSpan.has_value()) {
+                const float clipStartX =
+                    xForPosition(settingsSpan->start);
+                const float clipEndX =
+                    xForPosition(settingsSpan->end);
+                const bool pointClip =
+                    settingsSpan->start == settingsSpan->end;
+                if (pointClip) {
+                    if (std::abs(mouse.x - clipStartX) <= 5.0F) {
+                        hoveredSettingsPart =
+                            TimingColouriseSettingsClipDragPart::Body;
+                    }
+                } else if (
+                    mouse.x >= clipStartX - 2.0F &&
+                    mouse.x <= clipEndX + 2.0F) {
+                    const float edgeWidth = std::min(
+                        6.0F,
+                        std::max(
+                            2.0F,
+                            (clipEndX - clipStartX) * 0.25F));
+                    const float clipStartDistance =
+                        std::abs(mouse.x - clipStartX);
+                    const float clipEndDistance =
+                        std::abs(mouse.x - clipEndX);
+                    if (clipStartDistance <= edgeWidth ||
+                        clipEndDistance <= edgeWidth) {
+                        hoveredSettingsPart =
+                            clipStartDistance <= clipEndDistance
+                                ? TimingColouriseSettingsClipDragPart::Start
+                                : TimingColouriseSettingsClipDragPart::End;
+                    } else if (
+                        mouse.x >= clipStartX &&
+                        mouse.x <= clipEndX) {
+                        hoveredSettingsPart =
+                            TimingColouriseSettingsClipDragPart::Body;
+                    }
+                }
+            }
+
+            if (activationHovered &&
                 ImGui::IsMouseClicked(
                     ImGuiMouseButton_Left)) {
                 selectEffect(index);
@@ -96299,13 +96426,36 @@ void DrawTimingColouriseActivationOverview(
                             .originalEnd = range.end,
                         };
                 }
+            } else if (
+                settingsHovered &&
+                ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                selectEffect(index);
+                timings.colouriseActivationDrag.reset();
+                if (hoveredSettingsPart.has_value() &&
+                    settingsSpan.has_value()) {
+                    StopAnimationPlayback(runtimeState);
+                    const float grabbedX =
+                        hoveredSettingsPart.value() ==
+                                TimingColouriseSettingsClipDragPart::End
+                            ? xForPosition(settingsSpan->end)
+                            : xForPosition(settingsSpan->start);
+                    timings.colouriseSettingsClipDrag =
+                        TimingColouriseSettingsClipDragState{
+                            .effectId = effect.id,
+                            .part = hoveredSettingsPart.value(),
+                            .mouseStartX = mouse.x,
+                            .grabOffsetPixels = mouse.x - grabbedX,
+                            .sourceSpan = settingsSpan.value(),
+                            .originalEffect = effect,
+                        };
+                }
             }
 
             if (timings.colouriseActivationDrag.has_value() &&
                 timings.colouriseActivationDrag->effectId ==
                     effect.id) {
                 dragEffectStillPresent = true;
-                if (ImGui::IsItemActive() &&
+                if (timelineItemActive &&
                     ImGui::IsMouseDown(
                         ImGuiMouseButton_Left)) {
                     const auto& drag =
@@ -96358,6 +96508,105 @@ void DrawTimingColouriseActivationOverview(
                 }
             }
 
+            if (timings.colouriseSettingsClipDrag.has_value() &&
+                timings.colouriseSettingsClipDrag->effectId ==
+                    effect.id) {
+                settingsClipDragEffectStillPresent = true;
+                auto& drag =
+                    timings.colouriseSettingsClipDrag.value();
+                if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+                    const auto activationRange = effect.activationRange;
+                    effect = drag.originalEffect;
+                    effect.activationRange = activationRange;
+                    settingsKeyPositions = invisible_places::timing::
+                        TimingColouriseEffectSettingsKeyPositions(effect);
+                    settingsSpan = invisible_places::timing::
+                        TimingColouriseEffectSettingsKeySpan(effect);
+                    runtimeState->previewRenderStateSignatureValid = false;
+                    timings.colouriseSettingsClipDrag.reset();
+                } else if (
+                    timelineItemActive &&
+                    ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
+                    (drag.moved || ImGui::IsMouseDragging(
+                                       ImGuiMouseButton_Left,
+                                       2.0F))) {
+                    const auto source = drag.sourceSpan;
+                    auto destination = source;
+                    const float sourceLength = source.end - source.start;
+                    const float pointerPosition = positionForX(
+                        mouse.x - drag.grabOffsetPixels);
+                    switch (drag.part) {
+                        case TimingColouriseSettingsClipDragPart::Start: {
+                            const float minimumSpan = std::min(
+                                sourceLength,
+                                invisible_places::timing::
+                                    kTimingColouriseKeyTolerance);
+                            destination.start = std::clamp(
+                                pointerPosition,
+                                0.0F,
+                                std::max(0.0F, source.end - minimumSpan));
+                            destination.end = source.end;
+                            break;
+                        }
+                        case TimingColouriseSettingsClipDragPart::End: {
+                            const float minimumSpan = std::min(
+                                sourceLength,
+                                invisible_places::timing::
+                                    kTimingColouriseKeyTolerance);
+                            destination.start = source.start;
+                            destination.end = std::clamp(
+                                pointerPosition,
+                                std::min(1.0F, source.start + minimumSpan),
+                                1.0F);
+                            break;
+                        }
+                        case TimingColouriseSettingsClipDragPart::Body: {
+                            const float destinationStart = std::clamp(
+                                pointerPosition,
+                                0.0F,
+                                std::max(0.0F, 1.0F - sourceLength));
+                            destination.start = destinationStart;
+                            destination.end = destinationStart + sourceLength;
+                            break;
+                        }
+                    }
+
+                    const bool destinationChanged =
+                        std::abs(destination.start - source.start) >
+                            std::numeric_limits<float>::epsilon() ||
+                        std::abs(destination.end - source.end) >
+                            std::numeric_limits<float>::epsilon();
+                    if (destinationChanged || drag.moved) {
+                        auto transformed = drag.originalEffect;
+                        const bool transformedSuccessfully =
+                            !destinationChanged ||
+                            invisible_places::timing::
+                                TransformTimingColouriseEffectSettingsKeys(
+                                    &transformed,
+                                    source,
+                                    destination);
+                        if (transformedSuccessfully) {
+                            // The upper interval is an independent render
+                            // gate and never participates in a settings-clip
+                            // edit, even if another authoring path refreshed
+                            // it since this drag began.
+                            const auto activationRange =
+                                effect.activationRange;
+                            effect = std::move(transformed);
+                            effect.activationRange = activationRange;
+                            settingsKeyPositions = invisible_places::timing::
+                                TimingColouriseEffectSettingsKeyPositions(
+                                    effect);
+                            settingsSpan = invisible_places::timing::
+                                TimingColouriseEffectSettingsKeySpan(effect);
+                            drag.moved = true;
+                            runtimeState
+                                ->previewRenderStateSignatureValid = false;
+                        }
+                    }
+                }
+            }
+
             auto* drawList =
                 ImGui::GetWindowDrawList();
             const ImU32 frameColour =
@@ -96377,6 +96626,11 @@ void DrawTimingColouriseActivationOverview(
                 itemMaximum,
                 borderColour,
                 3.0F);
+            drawList->AddLine(
+                ImVec2{itemMinimum.x, splitY},
+                ImVec2{itemMaximum.x, splitY},
+                ImGui::GetColorU32(ImGuiCol_Border),
+                1.0F);
             // Low-alpha scalar-field watermark behind the activation fill
             // so every row identifies its bound field at a glance.
             if (const std::string fieldLabel =
@@ -96406,10 +96660,10 @@ void DrawTimingColouriseActivationOverview(
             drawList->AddRectFilled(
                 ImVec2{
                     xForPosition(range.start),
-                    itemMinimum.y + 3.0F},
+                    activationMinimum.y + 1.0F},
                 ImVec2{
                     xForPosition(range.end),
-                    itemMaximum.y - 3.0F},
+                    activationMaximum.y - 1.0F},
                 rangeColour,
                 2.0F);
 
@@ -96445,24 +96699,24 @@ void DrawTimingColouriseActivationOverview(
                         drawList->AddLine(
                             ImVec2{
                                 boundaryX,
-                                itemMinimum.y + 2.0F},
+                                activationMinimum.y + 1.0F},
                             ImVec2{
                                 boundaryX,
-                                itemMaximum.y - 2.0F},
+                                activationMaximum.y - 1.0F},
                             concurrencyColour,
                             beyondCapacity ? 4.0F : 3.0F);
                     } else {
                         drawList->AddRectFilled(
                             ImVec2{
                                 xForPosition(span.start),
-                                itemMinimum.y + 3.0F},
+                                activationMinimum.y + 1.0F},
                             ImVec2{
                                 xForPosition(span.end),
-                                itemMaximum.y - 3.0F},
+                                activationMaximum.y - 1.0F},
                             concurrencyColour,
                             1.5F);
                     }
-                    if (ImGui::IsItemHovered() &&
+                    if (activationHovered &&
                         (boundaryOnly
                              ? std::abs(
                                    mouse.x -
@@ -96486,23 +96740,87 @@ void DrawTimingColouriseActivationOverview(
             const float drawnEndX =
                 xForPosition(range.end);
             drawList->AddLine(
-                ImVec2{drawnStartX, itemMinimum.y + 2.0F},
-                ImVec2{drawnStartX, itemMaximum.y - 2.0F},
+                ImVec2{drawnStartX, activationMinimum.y + 1.0F},
+                ImVec2{drawnStartX, activationMaximum.y - 1.0F},
                 handleColour,
                 2.0F);
             drawList->AddLine(
-                ImVec2{drawnEndX, itemMinimum.y + 2.0F},
-                ImVec2{drawnEndX, itemMaximum.y - 2.0F},
+                ImVec2{drawnEndX, activationMinimum.y + 1.0F},
+                ImVec2{drawnEndX, activationMaximum.y - 1.0F},
                 handleColour,
                 2.0F);
             drawList->AddCircleFilled(
-                ImVec2{drawnStartX, centreY - 3.0F},
-                3.0F,
+                ImVec2{drawnStartX, activationCentreY - 1.5F},
+                2.0F,
                 handleColour);
             drawList->AddCircleFilled(
-                ImVec2{drawnEndX, centreY + 3.0F},
-                3.0F,
+                ImVec2{drawnEndX, activationCentreY + 1.5F},
+                2.0F,
                 handleColour);
+
+            const ImU32 settingsRailColour =
+                ImGui::GetColorU32(ImGuiCol_Border);
+            drawList->AddLine(
+                ImVec2{trackMinimumX, settingsCentreY},
+                ImVec2{trackMaximumX, settingsCentreY},
+                settingsRailColour,
+                1.0F);
+            if (settingsSpan.has_value()) {
+                const float clipStartX =
+                    xForPosition(settingsSpan->start);
+                const float clipEndX =
+                    xForPosition(settingsSpan->end);
+                const bool pointClip =
+                    settingsSpan->start == settingsSpan->end;
+                const ImU32 clipColour = effect.enabled
+                    ? IM_COL32(226, 166, 72, 142)
+                    : IM_COL32(128, 128, 128, 76);
+                const ImU32 clipHandleColour = effect.enabled
+                    ? IM_COL32(238, 174, 72, 235)
+                    : ImGui::GetColorU32(ImGuiCol_TextDisabled);
+                if (pointClip) {
+                    drawList->AddCircleFilled(
+                        ImVec2{clipStartX, settingsCentreY},
+                        3.25F,
+                        clipHandleColour);
+                } else {
+                    drawList->AddRectFilled(
+                        ImVec2{
+                            clipStartX,
+                            settingsMinimum.y + 1.0F},
+                        ImVec2{
+                            clipEndX,
+                            settingsMaximum.y - 1.0F},
+                        clipColour,
+                        1.5F);
+                    drawList->AddLine(
+                        ImVec2{
+                            clipStartX,
+                            settingsMinimum.y + 1.0F},
+                        ImVec2{
+                            clipStartX,
+                            settingsMaximum.y - 1.0F},
+                        clipHandleColour,
+                        1.5F);
+                    drawList->AddLine(
+                        ImVec2{
+                            clipEndX,
+                            settingsMinimum.y + 1.0F},
+                        ImVec2{
+                            clipEndX,
+                            settingsMaximum.y - 1.0F},
+                        clipHandleColour,
+                        1.5F);
+                }
+                for (const float keyPosition : settingsKeyPositions) {
+                    const float keyX = xForPosition(keyPosition);
+                    drawList->AddLine(
+                        ImVec2{keyX, settingsMinimum.y + 2.0F},
+                        ImVec2{keyX, settingsMaximum.y - 2.0F},
+                        IM_COL32(255, 236, 196, 225),
+                        1.0F);
+                }
+            }
             const float trackScrubPosition =
                 CurrentAuthoredTrackPosition(*runtimeState);
             const float scrubX = xForPosition(trackScrubPosition);
@@ -96514,6 +96832,92 @@ void DrawTimingColouriseActivationOverview(
                         ? ImGuiCol_Text
                         : ImGuiCol_TextDisabled),
                 1.0F);
+
+            const double now = ImGui::GetTime();
+            const bool overviewDragActive =
+                timings.colouriseActivationDrag.has_value() ||
+                timings.colouriseSettingsClipDrag.has_value();
+            if (!overviewDragActive) {
+                if (hoveredSettingsPart.has_value()) {
+                    timings.colouriseOverviewHelpHover =
+                        TimingColouriseOverviewHelpHoverState{
+                            .effectId = effect.id,
+                            .layer = TimingColouriseOverviewHelpLayer::
+                                SettingsClip,
+                            .visibleUntil =
+                                now + kOverviewHelpHoverGraceSeconds,
+                        };
+                } else if (hoveredPart.has_value()) {
+                    timings.colouriseOverviewHelpHover =
+                        TimingColouriseOverviewHelpHoverState{
+                            .effectId = effect.id,
+                            .layer = TimingColouriseOverviewHelpLayer::
+                                Activation,
+                            .visibleUntil =
+                                now + kOverviewHelpHoverGraceSeconds,
+                        };
+                }
+            }
+
+            bool overviewHelpHovered = false;
+            if (timings.colouriseOverviewHelpHover.has_value() &&
+                timings.colouriseOverviewHelpHover->effectId == effect.id) {
+                overviewHelpEffectStillPresent = true;
+                auto& help =
+                    timings.colouriseOverviewHelpHover.value();
+                overviewHelpHovered =
+                    !overviewDragActive &&
+                    ImGui::IsWindowHovered(
+                        ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) &&
+                    ImGui::IsMouseHoveringRect(
+                        helpMinimum,
+                        helpMaximum,
+                        /*clip=*/true);
+                if (overviewHelpHovered) {
+                    help.visibleUntil =
+                        now + kOverviewHelpHoverGraceSeconds;
+                }
+                if (!overviewDragActive && now <= help.visibleUntil) {
+                    const ImVec2 helpCentre{
+                        std::midpoint(helpMinimum.x, helpMaximum.x),
+                        std::midpoint(helpMinimum.y, helpMaximum.y)};
+                    drawList->AddCircleFilled(
+                        helpCentre,
+                        7.0F,
+                        overviewHelpHovered
+                            ? IM_COL32(255, 255, 255, 48)
+                            : IM_COL32(255, 255, 255, 22));
+                    drawList->AddCircle(
+                        helpCentre,
+                        7.0F,
+                        overviewHelpHovered
+                            ? IM_COL32(90, 90, 90, 190)
+                            : IM_COL32(90, 90, 90, 110));
+                    const auto questionSize =
+                        ImGui::CalcTextSize("?");
+                    drawList->AddText(
+                        ImVec2{
+                            helpCentre.x - questionSize.x * 0.5F,
+                            helpCentre.y - questionSize.y * 0.5F},
+                        overviewHelpHovered
+                            ? ImGui::GetColorU32(ImGuiCol_Text)
+                            : ImGui::GetColorU32(
+                                  ImGuiCol_TextDisabled),
+                        "?");
+                    if (overviewHelpHovered) {
+                        ImGui::SetTooltip(
+                            "%s",
+                            help.layer ==
+                                    TimingColouriseOverviewHelpLayer::
+                                        Activation
+                                ? "Active range (upper half)\nDrag either edge to resize the render interval, or drag its body to move it. Setting keys remain at their authored positions."
+                                : "Settings clip (lower half)\nDrag either edge to stretch every setting key, or drag its body to offset all setting keys together. The active range remains unchanged; individual keys stay editable below.");
+                    }
+                } else if (now > help.visibleUntil) {
+                    timings.colouriseOverviewHelpHover.reset();
+                    overviewHelpEffectStillPresent = false;
+                }
+            }
 
             if (hoveredConcurrency != nullptr) {
                 std::string activeNames;
@@ -96582,7 +96986,7 @@ void DrawTimingColouriseActivationOverview(
                             activeNames.c_str());
                     }
                 }
-            } else if (ImGui::IsItemHovered()) {
+            } else if (activationHovered) {
                 const float durationSeconds =
                     runtimeState->animationPanel.currentPath.has_value()
                         ? std::max(
@@ -96598,16 +97002,53 @@ void DrawTimingColouriseActivationOverview(
                     range.end,
                     range.start * durationSeconds,
                     range.end * durationSeconds);
+            } else if (
+                hoveredSettingsPart.has_value() &&
+                settingsSpan.has_value()) {
+                const float durationSeconds =
+                    runtimeState->animationPanel.currentPath.has_value()
+                        ? std::max(
+                              0.0F,
+                              AuthoredAnimationTrackDurationSeconds(
+                                  runtimeState->animationPanel
+                                      .currentPath.value()))
+                        : 0.0F;
+                ImGui::SetTooltip(
+                    "%s settings clip %.4f–%.4f (%.2f–%.2f s), %zu key position%s",
+                    effect.name.c_str(),
+                    settingsSpan->start,
+                    settingsSpan->end,
+                    settingsSpan->start * durationSeconds,
+                    settingsSpan->end * durationSeconds,
+                    settingsKeyPositions.size(),
+                    settingsKeyPositions.size() == 1U ? "" : "s");
             }
             if (hoveredPart.has_value()) {
                 ImGui::SetMouseCursor(
-                    ImGuiMouseCursor_ResizeEW);
+                    hoveredPart.value() ==
+                            TimingColouriseActivationDragPart::Body
+                        ? ImGuiMouseCursor_Hand
+                        : ImGuiMouseCursor_ResizeEW);
+            } else if (hoveredSettingsPart.has_value()) {
+                ImGui::SetMouseCursor(
+                    hoveredSettingsPart.value() ==
+                            TimingColouriseSettingsClipDragPart::Body
+                        ? ImGuiMouseCursor_Hand
+                        : ImGuiMouseCursor_ResizeEW);
             }
             ImGui::PopID();
         }
         if (timings.colouriseActivationDrag.has_value() &&
             !dragEffectStillPresent) {
             timings.colouriseActivationDrag.reset();
+        }
+        if (timings.colouriseSettingsClipDrag.has_value() &&
+            !settingsClipDragEffectStillPresent) {
+            timings.colouriseSettingsClipDrag.reset();
+        }
+        if (timings.colouriseOverviewHelpHover.has_value() &&
+            !overviewHelpEffectStillPresent) {
+            timings.colouriseOverviewHelpHover.reset();
         }
         ImGui::EndTable();
 
@@ -96652,6 +97093,7 @@ void DrawTimingColouriseActivationOverview(
     }
     if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
         timings.colouriseActivationDrag.reset();
+        timings.colouriseSettingsClipDrag.reset();
     }
 
     std::size_t maximumConcurrency = 0U;
@@ -96737,6 +97179,9 @@ void DrawTimingColouriseSection(
             TimingColouriseHistogramHandle::None;
         timings.colouriseLocalKeyDrag.reset();
         timings.colouriseLocalKeyPositionEdit.reset();
+        timings.colouriseActivationDrag.reset();
+        timings.colouriseSettingsClipDrag.reset();
+        timings.colouriseOverviewHelpHover.reset();
         runtimeState->animationPanel
             .timingColouriseKeyPositionEdit.reset();
         timings.colouriseEffectRenameBuffer = effects[index].name;
@@ -96748,6 +97193,9 @@ void DrawTimingColouriseSection(
         timings.selectedColourisePaletteStopIndex.reset();
         timings.draggingColourisePaletteStop = false;
         timings.draggingColourisePaletteStopAmount = false;
+        timings.colouriseActivationDrag.reset();
+        timings.colouriseSettingsClipDrag.reset();
+        timings.colouriseOverviewHelpHover.reset();
         runtimeState->previewRenderStateSignatureValid =
             false;
     }
@@ -96828,6 +97276,9 @@ void DrawTimingColouriseSection(
             timings.colourisePaletteDrag.reset();
             timings.colouriseLocalKeyDrag.reset();
             timings.colouriseLocalKeyPositionEdit.reset();
+            timings.colouriseActivationDrag.reset();
+            timings.colouriseSettingsClipDrag.reset();
+            timings.colouriseOverviewHelpHover.reset();
         } else {
             selectEffect(std::min(
                 timings.selectedColouriseEffectIndex.value(),
@@ -100042,6 +100493,8 @@ void DrawControlsWindow(
         timings.colouriseLocalKeyDrag.reset();
         timings.colouriseLocalKeyPositionEdit.reset();
         timings.colouriseActivationDrag.reset();
+        timings.colouriseSettingsClipDrag.reset();
+        timings.colouriseOverviewHelpHover.reset();
     }
 
     const auto& diagnostics = viewport->Diagnostics();
