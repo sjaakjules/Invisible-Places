@@ -8,7 +8,9 @@ SystemThermalState CurrentSystemThermalState() {
     return SystemThermalState::Unavailable;
 }
 
-void PrepareMacWindowingRuntime() {}
+void PrepareMacWindowingRuntime(bool accessoryApplication) {
+    (void)accessoryApplication;
+}
 
 ScopedPowerAssertion::ScopedPowerAssertion(std::string reason) {
     (void)reason;

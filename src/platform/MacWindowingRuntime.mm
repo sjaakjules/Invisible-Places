@@ -26,10 +26,13 @@ SystemThermalState CurrentSystemThermalState() {
     return SystemThermalState::Unavailable;
 }
 
-void PrepareMacWindowingRuntime() {
+void PrepareMacWindowingRuntime(bool accessoryApplication) {
     @autoreleasepool {
         [NSApplication sharedApplication];
-        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        [NSApp setActivationPolicy:
+            accessoryApplication
+                ? NSApplicationActivationPolicyAccessory
+                : NSApplicationActivationPolicyRegular];
 
         if ([NSWindow respondsToSelector:@selector(setAllowsAutomaticWindowTabbing:)]) {
             [NSWindow setAllowsAutomaticWindowTabbing:NO];

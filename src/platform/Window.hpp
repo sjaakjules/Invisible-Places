@@ -16,6 +16,7 @@ struct WindowConfig {
     bool visible = true;
     bool focusOnOpen = true;
     bool fitToPrimaryScreen = true;
+    bool accessoryApplication = false;
 };
 
 struct WindowSize {
@@ -49,6 +50,7 @@ class Window {
 
     [[nodiscard]] bool ShouldClose() const;
     void CancelCloseRequest();
+    void Hide();
     void PollEvents();
     // While suppressed, Escape does not request a window close — the UI
     // layer sets this each frame so Escape can keep its ImGui meaning
@@ -56,6 +58,7 @@ class Window {
     void SetEscapeCloseSuppressed(bool suppressed);
     void SetTitle(const std::string& title);
     [[nodiscard]] WindowSize Size() const;
+    [[nodiscard]] WindowSize FramebufferSize() const;
     void SetSize(WindowSize size);
     void ShowBootstrapContent(const BootstrapWindowContent& content);
     [[nodiscard]] GLFWwindow* NativeHandle() const { return window_; }

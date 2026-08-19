@@ -45,7 +45,7 @@ WindowSize ResolvePreferredWindowSize(
 }
 
 Window::Window(const WindowConfig& config) {
-    PrepareMacWindowingRuntime();
+    PrepareMacWindowingRuntime(config.accessoryApplication);
 
     if (glfwInit() == GLFW_FALSE) {
         throw std::runtime_error{"GLFW initialization failed."};
@@ -54,6 +54,10 @@ Window::Window(const WindowConfig& config) {
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindowHint(GLFW_VISIBLE, config.visible ? GLFW_TRUE : GLFW_FALSE);
     glfwWindowHint(GLFW_RESIZABLE, config.visible ? GLFW_TRUE : GLFW_FALSE);
+    glfwWindowHint(GLFW_FOCUSED, config.focusOnOpen ? GLFW_TRUE : GLFW_FALSE);
+    glfwWindowHint(
+        GLFW_FOCUS_ON_SHOW,
+        config.focusOnOpen ? GLFW_TRUE : GLFW_FALSE);
 
     WindowSize initialSize{
         .width = std::max(1, config.width),
@@ -101,6 +105,12 @@ void Window::CancelCloseRequest() {
     }
 }
 
+void Window::Hide() {
+    if (window_ != nullptr) {
+        glfwHideWindow(window_);
+    }
+}
+
 void Window::PollEvents() {
     if (window_ == nullptr) {
         return;
@@ -134,6 +144,17 @@ WindowSize Window::Size() const {
         return size;
     }
     glfwGetWindowSize(window_, &size.width, &size.height);
+    size.width = std::max(1, size.width);
+    size.height = std::max(1, size.height);
+    return size;
+}
+
+WindowSize Window::FramebufferSize() const {
+    WindowSize size{};
+    if (window_ == nullptr) {
+        return size;
+    }
+    glfwGetFramebufferSize(window_, &size.width, &size.height);
     size.width = std::max(1, size.width);
     size.height = std::max(1, size.height);
     return size;

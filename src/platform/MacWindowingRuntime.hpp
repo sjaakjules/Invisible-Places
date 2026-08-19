@@ -33,7 +33,10 @@ enum class SystemThermalState : std::uint8_t {
     return "unavailable";
 }
 
-void PrepareMacWindowingRuntime();
+// Accessory processes can own visible utility windows without adding another
+// Dock or Command-Tab entry. The regular editor keeps the normal application
+// activation policy.
+void PrepareMacWindowingRuntime(bool accessoryApplication = false);
 
 class ScopedPowerAssertion {
   public:
