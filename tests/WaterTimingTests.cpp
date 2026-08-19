@@ -6487,12 +6487,13 @@ TEST_CASE(
     CHECK(takes[1].assignedRainProfileId == savedId);
 
     auto overwritten = saved->settings;
+    const auto overwrittenVisual = saved->visual;
     overwritten.density = 0.9F;
     REQUIRE(UpsertTimingTakeRainOwnerProfile(
                 &profiles,
                 &takes[0],
                 overwritten,
-                saved->visual) != nullptr);
+                overwrittenVisual) != nullptr);
     auto* promoted = SaveTimingTakeRainOwnerProfileAsShared(
         &profiles,
         &takes,
@@ -6502,4 +6503,243 @@ TEST_CASE(
     REQUIRE(promoted != nullptr);
     CHECK(promoted->id == savedId);
     CHECK(promoted->settings.density == Catch::Approx(0.9F));
+}
+
+TEST_CASE(
+    "Timing Take Rain Save targets the resolved base while Save As stays collision safe",
+    "[water][rain][profiles][timing]") {
+    using invisible_places::timing::AssignTimingTakeRainBaseProfile;
+    using invisible_places::timing::SaveTimingTakeRainOwnerProfileAsShared;
+    using invisible_places::timing::SaveTimingTakeRainOwnerProfileToBase;
+    using invisible_places::timing::TimingTakeDefinition;
+    using invisible_places::timing::UpsertTimingTakeRainOwnerProfile;
+    using invisible_places::water::WaterRainProfile;
+
+    WaterRainProfile baseA;
+    baseA.id = "base-a";
+    baseA.name = "Base A";
+    baseA.settings.density = 0.2F;
+    WaterRainProfile baseB;
+    baseB.id = "base-b";
+    baseB.name = "Base B";
+    baseB.settings.density = 0.4F;
+    baseB.settings.fallSpeedMetersPerSecond = 13.0F;
+    const auto baseBBefore = baseB;
+    std::vector<WaterRainProfile> profiles{baseA, baseB};
+    std::vector<TimingTakeDefinition> takes{
+        {.id = "take", .name = "Take"},
+    };
+    REQUIRE(AssignTimingTakeRainBaseProfile(
+        &takes[0],
+        profiles,
+        baseA.id));
+
+    auto edited = baseA.settings;
+    edited.density = 0.7F;
+    const auto* owner = UpsertTimingTakeRainOwnerProfile(
+        &profiles,
+        &takes[0],
+        edited,
+        baseA.visual);
+    REQUIRE(owner != nullptr);
+    const auto ownerId = owner->id;
+    takes[0].baseRainProfileId = "missing-base";
+    takes[0].baseRainProfileName = baseB.name;
+
+    // Both the editable Save As name and the take's stale base mirrors point
+    // away from Base A. The owned copy's stable base id remains authoritative.
+    auto* saved = SaveTimingTakeRainOwnerProfileAsShared(
+        &profiles,
+        &takes,
+        takes[0].id,
+        baseB.name,
+        true);
+    REQUIRE(saved != nullptr);
+    CHECK(saved->id == baseA.id);
+    CHECK(saved->name == baseA.name);
+    CHECK(saved->settings.density == Catch::Approx(0.7F));
+    CHECK(invisible_places::water::FindWaterRainProfileById(
+              profiles,
+              ownerId) == nullptr);
+    CHECK(takes[0].assignedRainProfileId == baseA.id);
+    CHECK(takes[0].baseRainProfileId == baseA.id);
+    const auto* unchangedB =
+        invisible_places::water::FindWaterRainProfileById(
+            profiles,
+            baseB.id);
+    REQUIRE(unchangedB != nullptr);
+    CHECK(*unchangedB == baseBBefore);
+
+    auto saveAsEdit = saved->settings;
+    const auto saveAsVisual = saved->visual;
+    saveAsEdit.density = 0.85F;
+    REQUIRE(UpsertTimingTakeRainOwnerProfile(
+                &profiles,
+                &takes[0],
+                saveAsEdit,
+                saveAsVisual) != nullptr);
+    auto* savedAs = SaveTimingTakeRainOwnerProfileAsShared(
+        &profiles,
+        &takes,
+        takes[0].id,
+        baseB.name);
+    REQUIRE(savedAs != nullptr);
+    const auto savedAsId = savedAs->id;
+    const auto savedAsName = savedAs->name;
+    CHECK(savedAsId != baseA.id);
+    CHECK(savedAsId != baseB.id);
+    CHECK(savedAsName == "Base B 2");
+    unchangedB = invisible_places::water::FindWaterRainProfileById(
+        profiles,
+        baseB.id);
+    REQUIRE(unchangedB != nullptr);
+    CHECK(*unchangedB == baseBBefore);
+
+    auto postSaveAsEdit = savedAs->settings;
+    const auto postSaveAsVisual = savedAs->visual;
+    postSaveAsEdit.density = 0.95F;
+    owner = UpsertTimingTakeRainOwnerProfile(
+        &profiles,
+        &takes[0],
+        postSaveAsEdit,
+        postSaveAsVisual);
+    REQUIRE(owner != nullptr);
+    const auto postSaveAsOwnerId = owner->id;
+    CHECK(owner->name == savedAsName + "_" + takes[0].name);
+    CHECK(owner->baseProfileId == savedAsId);
+    CHECK(takes[0].assignedRainProfileId == owner->id);
+    CHECK(takes[0].baseRainProfileId == savedAsId);
+
+    auto* savedBackToBase = SaveTimingTakeRainOwnerProfileToBase(
+        &profiles,
+        &takes,
+        takes[0].id);
+    REQUIRE(savedBackToBase != nullptr);
+    CHECK(savedBackToBase->id == savedAsId);
+    CHECK(savedBackToBase->settings.density == Catch::Approx(0.95F));
+    CHECK(invisible_places::water::FindWaterRainProfileById(
+              profiles,
+              postSaveAsOwnerId) == nullptr);
+    CHECK(takes[0].assignedRainProfileId == savedAsId);
+}
+
+TEST_CASE(
+    "Timing Take Rain Save fails closed on unresolved owner base identity",
+    "[water][rain][profiles][timing]") {
+    using invisible_places::timing::AssignTimingTakeRainBaseProfile;
+    using invisible_places::timing::SaveTimingTakeRainOwnerProfileToBase;
+    using invisible_places::timing::TimingTakeDefinition;
+    using invisible_places::timing::UpsertTimingTakeRainOwnerProfile;
+    using invisible_places::water::WaterRainProfile;
+
+    WaterRainProfile baseA;
+    baseA.id = "base-a";
+    baseA.name = "Base A";
+    baseA.settings.density = 0.2F;
+    WaterRainProfile baseB;
+    baseB.id = "base-b";
+    baseB.name = "Base B";
+    baseB.settings.density = 0.4F;
+    std::vector<WaterRainProfile> profiles{baseA, baseB};
+    std::vector<TimingTakeDefinition> takes{
+        {.id = "take", .name = "Take"},
+    };
+    REQUIRE(AssignTimingTakeRainBaseProfile(
+        &takes[0],
+        profiles,
+        baseA.id));
+
+    auto edited = baseA.settings;
+    edited.density = 0.8F;
+    auto* owner = UpsertTimingTakeRainOwnerProfile(
+        &profiles,
+        &takes[0],
+        edited,
+        baseA.visual);
+    REQUIRE(owner != nullptr);
+    const auto ownerId = owner->id;
+    owner->baseProfileId = "missing-base";
+    owner->baseProfileName = baseB.name;
+    takes[0].baseRainProfileId = baseB.id;
+    takes[0].baseRainProfileName = baseB.name;
+    const auto baseABefore = baseA;
+    const auto baseBBefore = baseB;
+
+    CHECK(SaveTimingTakeRainOwnerProfileToBase(
+              &profiles,
+              &takes,
+              takes[0].id) == nullptr);
+    const auto* unchangedA =
+        invisible_places::water::FindWaterRainProfileById(
+            profiles,
+            baseA.id);
+    const auto* unchangedB =
+        invisible_places::water::FindWaterRainProfileById(
+            profiles,
+            baseB.id);
+    REQUIRE(unchangedA != nullptr);
+    REQUIRE(unchangedB != nullptr);
+    CHECK(*unchangedA == baseABefore);
+    CHECK(*unchangedB == baseBBefore);
+    CHECK(invisible_places::water::FindWaterRainProfileById(
+              profiles,
+              ownerId) != nullptr);
+    CHECK(takes[0].assignedRainProfileId == ownerId);
+}
+
+TEST_CASE(
+    "Timing Take Rain Save rejects a foreign take owner copy",
+    "[water][rain][profiles][timing]") {
+    using invisible_places::timing::AssignTimingTakeRainBaseProfile;
+    using invisible_places::timing::SaveTimingTakeRainOwnerProfileToBase;
+    using invisible_places::timing::TimingTakeDefinition;
+    using invisible_places::timing::UpsertTimingTakeRainOwnerProfile;
+    using invisible_places::water::WaterRainProfile;
+
+    WaterRainProfile base;
+    base.id = "base";
+    base.name = "Base";
+    base.settings.density = 0.2F;
+    std::vector<WaterRainProfile> profiles{base};
+    std::vector<TimingTakeDefinition> takes{
+        {.id = "owner-take", .name = "Owner"},
+        {.id = "observer-take", .name = "Observer"},
+    };
+    REQUIRE(AssignTimingTakeRainBaseProfile(
+        &takes[0],
+        profiles,
+        base.id));
+    REQUIRE(AssignTimingTakeRainBaseProfile(
+        &takes[1],
+        profiles,
+        base.id));
+
+    auto edited = base.settings;
+    edited.density = 0.8F;
+    const auto* owner = UpsertTimingTakeRainOwnerProfile(
+        &profiles,
+        &takes[0],
+        edited,
+        base.visual);
+    REQUIRE(owner != nullptr);
+    const auto ownerId = owner->id;
+    takes[1].assignedRainProfileId = owner->id;
+    takes[1].assignedRainProfileName = owner->name;
+    const auto baseBefore = base;
+
+    CHECK(SaveTimingTakeRainOwnerProfileToBase(
+              &profiles,
+              &takes,
+              takes[1].id) == nullptr);
+    const auto* unchangedBase =
+        invisible_places::water::FindWaterRainProfileById(
+            profiles,
+            base.id);
+    REQUIRE(unchangedBase != nullptr);
+    CHECK(*unchangedBase == baseBefore);
+    CHECK(invisible_places::water::FindWaterRainProfileById(
+              profiles,
+              ownerId) != nullptr);
+    CHECK(takes[0].assignedRainProfileId == ownerId);
+    CHECK(takes[1].assignedRainProfileId == ownerId);
 }

@@ -563,17 +563,29 @@ UpsertTimingTakeRainOwnerProfile(
     const invisible_places::water::RainRuntimeSettings& settings,
     const invisible_places::water::WaterRainVisualSettings& visual);
 
-// Promotes the take's effective snapshot into a nameable shared base. An
-// existing shared profile is overwritten only when explicitly requested;
-// otherwise a collision-safe new name/id is allocated. Any references to the
-// promoted temporary owner copy follow the saved base before it is removed.
+// Saves the active take's own temporary edit over its exact shared base. The
+// owner-copy base id is authoritative; an unresolved supplied id fails closed
+// instead of falling back by name. The base keeps its identity/name, the
+// temporary owner copy is removed, and references to it follow the base.
+[[nodiscard]] invisible_places::water::WaterRainProfile*
+SaveTimingTakeRainOwnerProfileToBase(
+    std::vector<invisible_places::water::WaterRainProfile>* profiles,
+    std::vector<TimingTakeDefinition>* takes,
+    std::string_view takeId);
+
+// Promotes the take's effective snapshot into a nameable shared base. Save As
+// always allocates a collision-safe new name/id. The explicit overwrite mode
+// is retained for callers transitioning to SaveTimingTakeRainOwnerProfileToBase:
+// it ignores requestedName and overwrites only the take's resolved base by id.
+// Any references to the promoted temporary owner copy follow the saved base
+// before it is removed.
 [[nodiscard]] invisible_places::water::WaterRainProfile*
 SaveTimingTakeRainOwnerProfileAsShared(
     std::vector<invisible_places::water::WaterRainProfile>* profiles,
     std::vector<TimingTakeDefinition>* takes,
     std::string_view takeId,
     std::string_view requestedName,
-    bool overwriteExisting = false);
+    bool overwriteResolvedBase = false);
 
 // Returns a take to the base behind its current owner copy and removes that
 // temporary copy. Any other take referencing the copy follows the same base.

@@ -2186,12 +2186,25 @@ UpsertTimingTakeRainOwnerProfile(
 }
 
 invisible_places::water::WaterRainProfile*
+SaveTimingTakeRainOwnerProfileToBase(
+    std::vector<invisible_places::water::WaterRainProfile>* profiles,
+    std::vector<TimingTakeDefinition>* takes,
+    std::string_view takeId) {
+    return SaveTimingTakeRainOwnerProfileAsShared(
+        profiles,
+        takes,
+        takeId,
+        {},
+        true);
+}
+
+invisible_places::water::WaterRainProfile*
 SaveTimingTakeRainOwnerProfileAsShared(
     std::vector<invisible_places::water::WaterRainProfile>* profiles,
     std::vector<TimingTakeDefinition>* takes,
     std::string_view takeId,
     std::string_view requestedName,
-    bool overwriteExisting) {
+    bool overwriteResolvedBase) {
     if (profiles == nullptr || takes == nullptr) {
         return nullptr;
     }
@@ -2203,6 +2216,53 @@ SaveTimingTakeRainOwnerProfileAsShared(
     if (effective == nullptr) {
         return nullptr;
     }
+    const invisible_places::water::WaterRainProfile* resolvedBase = nullptr;
+    if (overwriteResolvedBase) {
+        if (!effective->objectOverride ||
+            effective->ownerTimingTakeId != take->id) {
+            return nullptr;
+        }
+        const auto findSharedById = [&](std::string_view profileId) {
+            const auto* profile =
+                invisible_places::water::FindWaterRainProfileById(
+                    *profiles,
+                    profileId);
+            return profile != nullptr && !profile->objectOverride
+                       ? profile
+                       : nullptr;
+        };
+        if (!effective->baseProfileId.empty()) {
+            resolvedBase = findSharedById(effective->baseProfileId);
+            if (resolvedBase == nullptr) {
+                return nullptr;
+            }
+        } else if (!take->baseRainProfileId.empty()) {
+            resolvedBase = findSharedById(take->baseRainProfileId);
+            if (resolvedBase == nullptr) {
+                return nullptr;
+            }
+        } else {
+            const auto baseName =
+                !TrimRainProfileText(effective->baseProfileName).empty()
+                    ? effective->baseProfileName
+                    : take->baseRainProfileName;
+            resolvedBase =
+                invisible_places::water::FindWaterRainProfileByName(
+                    profiles,
+                    baseName);
+            if (resolvedBase == nullptr || resolvedBase->objectOverride) {
+                return nullptr;
+            }
+        }
+    } else {
+        resolvedBase = ResolveTimingTakeRainBaseProfile(
+            *profiles,
+            *take);
+    }
+    const auto resolvedBaseId =
+        resolvedBase != nullptr ? resolvedBase->id : std::string{};
+    const auto resolvedBaseName =
+        resolvedBase != nullptr ? resolvedBase->name : std::string{};
     const auto savedSettings = effective->settings;
     const auto savedVisual = effective->visual;
     const auto promotedOwnerId =
@@ -2213,21 +2273,25 @@ SaveTimingTakeRainOwnerProfileAsShared(
     const auto promotedOwnerName =
         promotedOwnerId.empty() ? std::string{} : effective->name;
 
-    auto preferredName = TrimRainProfileText(requestedName);
-    if (preferredName.empty()) {
-        preferredName = effective->objectOverride
-                            ? effective->baseProfileName
-                            : effective->name;
-    }
-    auto* existingByName =
-        invisible_places::water::FindWaterRainProfileByName(
-            profiles,
-            preferredName);
     invisible_places::water::WaterRainProfile* saved = nullptr;
-    if (overwriteExisting && existingByName != nullptr &&
-        !existingByName->objectOverride) {
-        saved = existingByName;
+    if (overwriteResolvedBase) {
+        // Save is identity-based: an editable name field must never redirect
+        // an overwrite to an unrelated shared profile with the same text.
+        saved = invisible_places::water::FindWaterRainProfileById(
+            profiles,
+            resolvedBaseId);
+        if (saved == nullptr || saved->objectOverride) {
+            return nullptr;
+        }
     } else {
+        auto preferredName = TrimRainProfileText(requestedName);
+        if (preferredName.empty()) {
+            preferredName = !resolvedBaseName.empty()
+                                ? resolvedBaseName
+                                : effective->objectOverride
+                                      ? effective->baseProfileName
+                                      : effective->name;
+        }
         invisible_places::water::WaterRainProfile shared;
         shared.name = UniqueRainProfileName(*profiles, preferredName);
         shared.id = invisible_places::water::AllocateWaterRainProfileId(
