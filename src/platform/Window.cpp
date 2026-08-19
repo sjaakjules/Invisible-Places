@@ -47,6 +47,14 @@ WindowSize ResolvePreferredWindowSize(
 Window::Window(const WindowConfig& config) {
     PrepareMacWindowingRuntime(config.accessoryApplication);
 
+#if defined(GLFW_COCOA_MENUBAR)
+    // GLFW's Cocoa init re-applies NSApplicationActivationPolicyRegular when
+    // it creates its menu bar, which would undo the accessory policy set
+    // above and give worker/monitor processes Dock and Cmd-Tab entries.
+    glfwInitHint(
+        GLFW_COCOA_MENUBAR,
+        config.accessoryApplication ? GLFW_FALSE : GLFW_TRUE);
+#endif
     if (glfwInit() == GLFW_FALSE) {
         throw std::runtime_error{"GLFW initialization failed."};
     }
