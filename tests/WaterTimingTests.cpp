@@ -6174,6 +6174,7 @@ TEST_CASE(
     "[water][rain][profiles][timing]") {
     using invisible_places::timing::AssignTimingTakeRainBaseProfile;
     using invisible_places::timing::DuplicateTimingTakeRainProfileAssignment;
+    using invisible_places::timing::PredictTimingTakeRainOwnerProfileName;
     using invisible_places::timing::RemoveTimingTakeRainOwnerProfiles;
     using invisible_places::timing::RenameTimingTakeRainOwnerProfile;
     using invisible_places::timing::ResolveTimingTakeRainProfile;
@@ -6198,6 +6199,8 @@ TEST_CASE(
         &takes[0], profiles, base.id));
     REQUIRE(AssignTimingTakeRainBaseProfile(
         &takes[1], profiles, base.id));
+    CHECK(PredictTimingTakeRainOwnerProfileName(profiles, takes[0]) ==
+          "Fine Lines_First-01 2");
 
     auto editedSettings = base.settings;
     auto editedVisual = base.visual;
@@ -6214,6 +6217,10 @@ TEST_CASE(
     CHECK(firstCopy->objectOverride);
     CHECK(firstCopy->ownerTimingTakeId == "timing-take-8");
     CHECK(firstCopy->baseProfileId == base.id);
+    // Once created, prediction reuses the owner's exact identity instead of
+    // treating its own name as a fresh collision and adding another suffix.
+    CHECK(PredictTimingTakeRainOwnerProfileName(profiles, takes[0]) ==
+          firstCopy->name);
     CHECK(ResolveTimingTakeRainProfile(profiles, takes[0])->settings.density ==
           Approx(0.91F));
     CHECK(ResolveTimingTakeRainProfile(profiles, takes[1])->settings.density ==
@@ -6688,9 +6695,10 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "Timing Take Rain Save rejects a foreign take owner copy",
+    "Timing Take Rain rejects foreign-owner Save but permits independent Save As",
     "[water][rain][profiles][timing]") {
     using invisible_places::timing::AssignTimingTakeRainBaseProfile;
+    using invisible_places::timing::SaveTimingTakeRainOwnerProfileAsShared;
     using invisible_places::timing::SaveTimingTakeRainOwnerProfileToBase;
     using invisible_places::timing::TimingTakeDefinition;
     using invisible_places::timing::UpsertTimingTakeRainOwnerProfile;
@@ -6704,6 +6712,7 @@ TEST_CASE(
     std::vector<TimingTakeDefinition> takes{
         {.id = "owner-take", .name = "Owner"},
         {.id = "observer-take", .name = "Observer"},
+        {.id = "other-observer", .name = "Other Observer"},
     };
     REQUIRE(AssignTimingTakeRainBaseProfile(
         &takes[0],
@@ -6711,6 +6720,10 @@ TEST_CASE(
         base.id));
     REQUIRE(AssignTimingTakeRainBaseProfile(
         &takes[1],
+        profiles,
+        base.id));
+    REQUIRE(AssignTimingTakeRainBaseProfile(
+        &takes[2],
         profiles,
         base.id));
 
@@ -6725,6 +6738,8 @@ TEST_CASE(
     const auto ownerId = owner->id;
     takes[1].assignedRainProfileId = owner->id;
     takes[1].assignedRainProfileName = owner->name;
+    takes[2].assignedRainProfileId = owner->id;
+    takes[2].assignedRainProfileName = owner->name;
     const auto baseBefore = base;
 
     CHECK(SaveTimingTakeRainOwnerProfileToBase(
@@ -6742,4 +6757,24 @@ TEST_CASE(
               ownerId) != nullptr);
     CHECK(takes[0].assignedRainProfileId == ownerId);
     CHECK(takes[1].assignedRainProfileId == ownerId);
+    CHECK(takes[2].assignedRainProfileId == ownerId);
+
+    // The observing take may fork the effective snapshot without gaining
+    // permission to promote or delete the other take's temporary owner.
+    auto* observerCopy = SaveTimingTakeRainOwnerProfileAsShared(
+        &profiles,
+        &takes,
+        takes[1].id,
+        "Observer Rain");
+    REQUIRE(observerCopy != nullptr);
+    const auto observerCopyId = observerCopy->id;
+    CHECK(observerCopy->name == "Observer Rain");
+    CHECK_FALSE(observerCopy->objectOverride);
+    CHECK(observerCopy->settings.density == Catch::Approx(0.8F));
+    CHECK(invisible_places::water::FindWaterRainProfileById(
+              profiles,
+              ownerId) != nullptr);
+    CHECK(takes[0].assignedRainProfileId == ownerId);
+    CHECK(takes[1].assignedRainProfileId == observerCopyId);
+    CHECK(takes[2].assignedRainProfileId == ownerId);
 }

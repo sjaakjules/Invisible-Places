@@ -134,6 +134,31 @@ std::string TimingTakeRainOwnerProfileName(
            (takeName.empty() ? std::string{"Timing Take"} : takeName);
 }
 
+std::optional<std::size_t> TimingTakeRainOwnerProfileIndex(
+    std::span<const invisible_places::water::WaterRainProfile> profiles,
+    const TimingTakeDefinition& take,
+    const invisible_places::water::WaterRainProfile& base) {
+    const auto baseNameKey = RainProfileNameKey(base.name);
+    const auto existing = std::find_if(
+        profiles.begin(),
+        profiles.end(),
+        [&](const invisible_places::water::WaterRainProfile& profile) {
+            if (!profile.objectOverride ||
+                profile.ownerTimingTakeId != take.id) {
+                return false;
+            }
+            return (!base.id.empty() &&
+                    profile.baseProfileId == base.id) ||
+                   (profile.baseProfileId.empty() &&
+                    RainProfileNameKey(profile.baseProfileName) ==
+                        baseNameKey);
+        });
+    if (existing == profiles.end()) {
+        return std::nullopt;
+    }
+    return static_cast<std::size_t>(existing - profiles.begin());
+}
+
 float FiniteOr(float value, float fallback) {
     return std::isfinite(value) ? value : fallback;
 }
@@ -2128,6 +2153,26 @@ TimingTakeRainImportResult MergeImportedTimingTakeRainProfiles(
     return result;
 }
 
+std::string PredictTimingTakeRainOwnerProfileName(
+    std::span<const invisible_places::water::WaterRainProfile> profiles,
+    const TimingTakeDefinition& take) {
+    const auto sanitizedTake = SanitizeTimingTakeDefinition(take);
+    const auto* base = ResolveTimingTakeRainBaseProfile(
+        profiles,
+        sanitizedTake);
+    if (base == nullptr) {
+        return {};
+    }
+    if (const auto existing =
+            TimingTakeRainOwnerProfileIndex(profiles, sanitizedTake, *base);
+        existing.has_value()) {
+        return profiles[existing.value()].name;
+    }
+    return UniqueRainProfileName(
+        profiles,
+        TimingTakeRainOwnerProfileName(*base, sanitizedTake));
+}
+
 invisible_places::water::WaterRainProfile*
 UpsertTimingTakeRainOwnerProfile(
     std::vector<invisible_places::water::WaterRainProfile>* profiles,
@@ -2145,44 +2190,33 @@ UpsertTimingTakeRainOwnerProfile(
         return nullptr;
     }
     const auto base = *resolvedBase;
-    const auto baseNameKey = RainProfileNameKey(base.name);
-    auto existing = std::find_if(
-        profiles->begin(),
-        profiles->end(),
-        [&](const invisible_places::water::WaterRainProfile& profile) {
-            if (!profile.objectOverride ||
-                profile.ownerTimingTakeId != take->id) {
-                return false;
-            }
-            return (!base.id.empty() &&
-                    profile.baseProfileId == base.id) ||
-                   (profile.baseProfileId.empty() &&
-                    RainProfileNameKey(profile.baseProfileName) ==
-                        baseNameKey);
-        });
-    if (existing == profiles->end()) {
+    const auto existingIndex =
+        TimingTakeRainOwnerProfileIndex(*profiles, *take, base);
+    if (!existingIndex.has_value()) {
         invisible_places::water::WaterRainProfile copy;
         copy.id = invisible_places::water::AllocateWaterRainProfileId(
             *profiles,
             base.id + "-" + take->id);
-        copy.name = UniqueRainProfileName(
+        copy.name = PredictTimingTakeRainOwnerProfileName(
             *profiles,
-            TimingTakeRainOwnerProfileName(base, *take));
+            *take);
         copy.objectOverride = true;
         copy.ownerTimingTakeId = take->id;
         copy.baseProfileId = base.id;
         copy.baseProfileName = base.name;
         profiles->push_back(std::move(copy));
-        existing = profiles->end() - 1;
     }
-    existing->settings = settings;
-    existing->visual = visual;
-    existing->objectOverride = true;
-    existing->ownerTimingTakeId = take->id;
-    existing->baseProfileId = base.id;
-    existing->baseProfileName = base.name;
-    SetTimingTakeRainAssignment(take, *existing, base);
-    return &*existing;
+    auto& owner = existingIndex.has_value()
+                      ? (*profiles)[existingIndex.value()]
+                      : profiles->back();
+    owner.settings = settings;
+    owner.visual = visual;
+    owner.objectOverride = true;
+    owner.ownerTimingTakeId = take->id;
+    owner.baseProfileId = base.id;
+    owner.baseProfileName = base.name;
+    SetTimingTakeRainAssignment(take, owner, base);
+    return &owner;
 }
 
 invisible_places::water::WaterRainProfile*

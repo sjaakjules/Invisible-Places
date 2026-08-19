@@ -553,6 +553,13 @@ bool AssignTimingTakeRainBaseProfile(
     std::span<const invisible_places::water::WaterRainProfile> profiles,
     std::string_view baseProfileId);
 
+// Returns the exact collision-safe name that the next authored Rain edit will
+// use. An existing owner copy for this take/base pair keeps its current name,
+// so UI previews cannot drift from UpsertTimingTakeRainOwnerProfile.
+[[nodiscard]] std::string PredictTimingTakeRainOwnerProfileName(
+    std::span<const invisible_places::water::WaterRainProfile> profiles,
+    const TimingTakeDefinition& take);
+
 // Commits edited Rain into the take-owned `(owner, base)` copy, creating a
 // collision-safe `<base>_<take>` profile on first edit. The take is reassigned
 // to that copy and its base mirrors remain stable.

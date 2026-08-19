@@ -3959,10 +3959,30 @@ ResolvedLiveRainProfile ResolveLiveRainProfile(
         invisible_places::timing::ResolveTimingTakeRainProfile(
             water->rainProfiles,
             *result.take));
-    result.base = const_cast<WaterRainProfile*>(
-        invisible_places::timing::ResolveTimingTakeRainBaseProfile(
-            water->rainProfiles,
-            *result.take));
+    if (result.effective != nullptr &&
+        result.effective->objectOverride) {
+        // An owner copy's own stable base identity is authoritative. Falling
+        // through to a stale take mirror would make the panel label and
+        // bracket one base while exact Save correctly overwrites another.
+        const WaterRainProfile* ownerBase = nullptr;
+        if (!result.effective->baseProfileId.empty()) {
+            ownerBase = invisible_places::water::FindWaterRainProfileById(
+                water->rainProfiles,
+                result.effective->baseProfileId);
+        } else if (!result.effective->baseProfileName.empty()) {
+            ownerBase = invisible_places::water::FindWaterRainProfileByName(
+                water->rainProfiles,
+                result.effective->baseProfileName);
+        }
+        if (ownerBase != nullptr && !ownerBase->objectOverride) {
+            result.base = const_cast<WaterRainProfile*>(ownerBase);
+        }
+    } else {
+        result.base = const_cast<WaterRainProfile*>(
+            invisible_places::timing::ResolveTimingTakeRainBaseProfile(
+                water->rainProfiles,
+                *result.take));
+    }
     return result;
 }
 
@@ -73994,7 +74014,8 @@ KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
     float* editedValue,
     std::string_view profileGroup,
     std::string_view profileName,
-    const char* semanticHelp);
+    const char* semanticHelp,
+    std::optional<float> savedBaseValue = std::nullopt);
 
 void DrawWaterDynamicMeshFlowPanel(
     PreviewRuntimeState* runtimeState,
@@ -74699,7 +74720,8 @@ KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
     float* editedValue,
     std::string_view profileGroup = {},
     std::string_view profileName = {},
-    const char* semanticHelp = nullptr) {
+    const char* semanticHelp = nullptr,
+    std::optional<float> savedBaseValue) {
     KeyedWaterSliderResult result;
     auto& water = runtimeState->water;
     const auto scenarioId = ActiveWaterTimingScenarioId(*runtimeState);
@@ -74712,12 +74734,19 @@ KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
     }
     if (run == nullptr) {
         float value = authoredValue;
+        // Compute bracket annotations from the value this exact row renders.
+        // Rain may supply a saved base while every other caller keeps its
+        // existing raw format through the default empty baseline.
+        const auto displayedFormat = WaterProfileValueFormat(
+            format,
+            value,
+            savedBaseValue);
         const bool sliderChanged = DrawWaterSliderFloat(
                 label,
                 &value,
                 minimumValue,
                 maximumValue,
-                mixed ? "different" : format,
+                mixed ? "different" : displayedFormat.c_str(),
                 flags);
         if (semanticHelp != nullptr &&
             semanticHelp[0] != '\0' &&
@@ -74780,12 +74809,19 @@ KeyedWaterSliderResult DrawKeyedWaterSettingSlider(
     ImGui::PushStyleColor(
         ImGuiCol_Text,
         keyingActive ? keyedColour : kWaterKeyableSettingColour);
+    // Key evaluation must precede formatting: otherwise a Rain slider can
+    // compare the saved base with stale authored state while drawing the
+    // current Timing Take key.
+    const auto displayedFormat = WaterProfileValueFormat(
+        format,
+        value,
+        savedBaseValue);
     const bool sliderChanged = DrawWaterSliderFloat(
         hiddenSliderLabel.c_str(),
         &value,
         minimumValue,
         maximumValue,
-        mixed ? "different" : format,
+        mixed ? "different" : displayedFormat.c_str(),
         flags);
     const bool sliderActivated = ImGui::IsItemActivated();
     const bool sliderDeactivated = ImGui::IsItemDeactivated();
@@ -75991,29 +76027,62 @@ void DrawWaterGpuRainPanel(
     EnsureWaterRainProfiles(&water);
 
     if (BeginPanelSection("Rain Profile")) {
+        const auto drawSideHelp = [](const char* text) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("?");
+            DrawWaterSeepageParameterTooltip(text);
+        };
         auto resolved = ResolveActiveLiveRainProfile(runtimeState);
         if (resolved.take != nullptr && resolved.effective != nullptr &&
             resolved.base != nullptr) {
             ImGui::TextDisabled(
                 "Timing Take: %s",
                 resolved.take->name.c_str());
-            if (resolved.effective->objectOverride) {
+            const bool ownsEffective =
+                resolved.effective->objectOverride &&
+                resolved.effective->ownerTimingTakeId == resolved.takeId;
+            const bool viewsForeignOwner =
+                resolved.effective->objectOverride && !ownsEffective;
+            if (ownsEffective) {
                 ImGui::TextDisabled(
-                    "Temporary take copy: %s",
+                    "Edited profile: %s",
                     resolved.effective->name.c_str());
                 ImGui::TextDisabled(
                     "Saved base: %s",
                     resolved.base->name.c_str());
-            } else {
+            } else if (viewsForeignOwner) {
+                const auto* ownerTake = invisible_places::timing::
+                    FindTimingTakeDefinition(
+                        water.timingTakes,
+                        resolved.effective->ownerTimingTakeId);
                 ImGui::TextDisabled(
-                    "Saved profile: %s",
+                    "Viewing profile: %s",
+                    resolved.effective->name.c_str());
+                ImGui::TextDisabled(
+                    "Owned by: %s  |  Saved base: %s",
+                    ownerTake != nullptr
+                        ? ownerTake->name.c_str()
+                        : resolved.effective->ownerTimingTakeId.c_str(),
                     resolved.base->name.c_str());
+            } else {
+                const auto predictedName = invisible_places::timing::
+                    PredictTimingTakeRainOwnerProfileName(
+                        water.rainProfiles,
+                        *resolved.take);
+                ImGui::TextDisabled(
+                    "Saved base: %s",
+                    resolved.base->name.c_str());
+                if (!predictedName.empty()) {
+                    ImGui::TextDisabled(
+                        "First authored edit: %s",
+                        predictedName.c_str());
+                }
             }
 
             std::optional<std::string> requestedBaseId;
             if (ImGui::BeginCombo(
                     "Saved Profile",
-                    resolved.base->name.c_str())) {
+                    resolved.effective->name.c_str())) {
                 for (const auto& profile : water.rainProfiles) {
                     if (profile.objectOverride) {
                         continue;
@@ -76029,6 +76098,10 @@ void DrawWaterGpuRainPanel(
                 }
                 ImGui::EndCombo();
             }
+            drawSideHelp(
+                "Select a reusable saved Rain base. The closed selector "
+                "shows the effective profile, including this Timing Take's "
+                "edited-name suffix when one exists.");
             if (requestedBaseId.has_value()) {
                 const auto requestedId = requestedBaseId.value();
                 const auto* requestedProfile =
@@ -76038,27 +76111,29 @@ void DrawWaterGpuRainPanel(
                 const auto requestedName = requestedProfile != nullptr
                                                ? requestedProfile->name
                                                : std::string{};
-                if (resolved.effective->objectOverride) {
-                    (void)invisible_places::timing::
+                const auto requestedTakeId = resolved.takeId;
+                bool canAssign = true;
+                if (ownsEffective) {
+                    canAssign = invisible_places::timing::
                         DiscardTimingTakeRainOwnerProfile(
                             &water.rainProfiles,
                             &water.timingTakes,
-                            resolved.takeId);
+                            requestedTakeId);
                 }
                 auto* take = invisible_places::timing::
                     FindTimingTakeDefinition(
                         &water.timingTakes,
-                        resolved.takeId);
-                if (take != nullptr &&
+                        requestedTakeId);
+                if (canAssign && take != nullptr &&
                     invisible_places::timing::
                         AssignTimingTakeRainBaseProfile(
                             take,
                             water.rainProfiles,
                             requestedId)) {
-                    (void)RewriteTimingTakeRainTrackProfileName(
-                        &water,
-                        resolved.takeId,
-                        requestedName);
+                    // Discarding an owner can repoint observing takes too;
+                    // refresh every Rain track before a const project save
+                    // can capture a now-erased profile name.
+                    BackfillRainTrackProfileMetadata(&water);
                     water.rainProfileNameBuffer = requestedName;
                     water.rainProfileNameBufferBaseId = requestedId;
                     (void)SynchronizeLiveTimingTakeRain(
@@ -76072,62 +76147,99 @@ void DrawWaterGpuRainPanel(
             }
 
             InputTextString(
-                "Profile Name",
+                "Save As Name",
                 &water.rainProfileNameBuffer);
-            const bool canSave =
+            drawSideHelp(
+                "Names only a new reusable profile created by Save As. "
+                "Changing this text never redirects Save away from the "
+                "edited profile's exact saved base.");
+
+            resolved = ResolveActiveLiveRainProfile(runtimeState);
+            const bool canSaveToBase =
+                resolved.take != nullptr &&
+                resolved.effective != nullptr &&
+                resolved.effective->objectOverride &&
+                resolved.effective->ownerTimingTakeId == resolved.takeId;
+            const bool canSaveAs =
                 resolved.take != nullptr &&
                 resolved.effective != nullptr &&
                 !TrimText(water.rainProfileNameBuffer).empty();
-            if (!canSave) {
+
+            const auto finishSavedProfile =
+                [&](std::string_view takeId,
+                    const WaterRainProfile& saved,
+                    bool savedAs) {
+                    const auto savedId = saved.id;
+                    const auto savedName = saved.name;
+                    water.rainProfileNameBuffer = savedName;
+                    water.rainProfileNameBufferBaseId = savedId;
+                    (void)RewriteTimingTakeRainTrackProfileName(
+                        &water,
+                        takeId,
+                        savedName);
+                    BackfillRainTrackProfileMetadata(&water);
+                    // Promotion changes profile identity, not the live Rain
+                    // snapshot. Rebind before synchronization so saving does
+                    // not begin another simulation epoch.
+                    water.liveRainTimingTakeId = std::string{takeId};
+                    water.liveRainProfileId = savedId;
+                    runtimeState->previewRenderStateSignatureValid = false;
+                    (void)SynchronizeLiveTimingTakeRain(
+                        runtimeState,
+                        viewport);
+                    runtimeState->statusMessage =
+                        std::string{savedAs ? "Saved new Rain profile "
+                                            : "Saved Rain edits over "} +
+                        savedName + ".";
+                    runtimeState->errorMessage.clear();
+                };
+
+            if (!canSaveToBase) {
                 ImGui::BeginDisabled();
             }
-            const auto saveProfile = [&](bool overwriteExisting) {
+            if (ImGui::Button("Save")) {
                 const auto active = ResolveActiveLiveRainProfile(runtimeState);
-                if (active.take == nullptr || active.effective == nullptr) {
-                    return;
+                const auto activeTakeId = active.takeId;
+                auto* saved = invisible_places::timing::
+                    SaveTimingTakeRainOwnerProfileToBase(
+                        &water.rainProfiles,
+                        &water.timingTakes,
+                        activeTakeId);
+                if (saved == nullptr) {
+                    runtimeState->errorMessage =
+                        "Rain edits could not be saved over their exact base.";
+                    runtimeState->statusMessage.clear();
+                } else {
+                    finishSavedProfile(activeTakeId, *saved, false);
                 }
+            }
+            if (!canSaveToBase) {
+                ImGui::EndDisabled();
+            }
+
+            ImGui::SameLine();
+            if (!canSaveAs) {
+                ImGui::BeginDisabled();
+            }
+            if (ImGui::Button("Save As")) {
+                const auto active = ResolveActiveLiveRainProfile(runtimeState);
+                const auto activeTakeId = active.takeId;
                 auto* saved = invisible_places::timing::
                     SaveTimingTakeRainOwnerProfileAsShared(
                         &water.rainProfiles,
                         &water.timingTakes,
-                        active.takeId,
+                        activeTakeId,
                         water.rainProfileNameBuffer,
-                        overwriteExisting);
+                        false);
                 if (saved == nullptr) {
                     runtimeState->errorMessage =
-                        "Rain profile could not be saved.";
+                        "A new Rain profile could not be saved.";
                     runtimeState->statusMessage.clear();
-                    return;
+                } else {
+                    finishSavedProfile(activeTakeId, *saved, true);
                 }
-                const auto savedId = saved->id;
-                const auto savedName = saved->name;
-                water.rainProfileNameBuffer = savedName;
-                water.rainProfileNameBufferBaseId = savedId;
-                (void)RewriteTimingTakeRainTrackProfileName(
-                    &water,
-                    active.takeId,
-                    savedName);
-                // Promotion changes only project/profile identity. The live
-                // renderer already contains this exact snapshot, so rebind
-                // without beginning another Rain simulation epoch.
-                water.liveRainTimingTakeId = active.takeId;
-                water.liveRainProfileId = savedId;
-                runtimeState->previewRenderStateSignatureValid = false;
-                (void)SynchronizeLiveTimingTakeRain(
-                    runtimeState,
-                    viewport);
-                runtimeState->statusMessage =
-                    "Saved Rain profile " + savedName + ".";
-                runtimeState->errorMessage.clear();
-            };
-            if (ImGui::Button("Save")) {
-                saveProfile(true);
             }
-            ImGui::SameLine();
-            if (ImGui::Button("Save As")) {
-                saveProfile(false);
-            }
-            if (!canSave) {
+            if (!canSaveAs) {
                 ImGui::EndDisabled();
             }
 
@@ -76135,7 +76247,8 @@ void DrawWaterGpuRainPanel(
             const bool canDiscard =
                 resolved.take != nullptr &&
                 resolved.effective != nullptr &&
-                resolved.effective->objectOverride;
+                resolved.effective->objectOverride &&
+                resolved.effective->ownerTimingTakeId == resolved.takeId;
             if (!canDiscard) {
                 ImGui::BeginDisabled();
             }
@@ -76160,6 +76273,7 @@ void DrawWaterGpuRainPanel(
                             discardedTakeId,
                             restored.effective->name);
                     }
+                    BackfillRainTrackProfileMetadata(&water);
                     (void)SynchronizeLiveTimingTakeRain(
                         runtimeState,
                         viewport);
@@ -76171,6 +76285,15 @@ void DrawWaterGpuRainPanel(
             if (!canDiscard) {
                 ImGui::EndDisabled();
             }
+            drawSideHelp(
+                "Save overwrites only this Timing Take's exact saved base. "
+                "Save As creates a new shared profile. Discard returns this "
+                "take to its saved base. None of these actions changes "
+                "Timing Take keys.");
+            ImGui::TextWrapped(
+                "Coloured keyed controls show the current frame; bracketed "
+                "values show the saved base. Save actions store authored "
+                "Rain settings, not Timing Take keys.");
         } else {
             ImGui::TextDisabled("No Timing Take Rain profile is available.");
         }
@@ -76245,17 +76368,14 @@ void DrawWaterGpuRainPanel(
                 *value,
                 minimum,
                 maximum,
-                WaterProfileValueFormat(
-                    format,
-                    *value,
-                    baseRainSettingValue(settingId))
-                    .c_str(),
+                format,
                 flags,
                 false,
                 &edited,
                 invisible_places::timing::kTimingTakeRainTrackProfileGroup,
                 rainTrackProfileName,
-                help);
+                help,
+                baseRainSettingValue(settingId));
             if (result.authoredChanged) {
                 *value = edited;
                 liveChanged = true;
