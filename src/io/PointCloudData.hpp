@@ -31,9 +31,9 @@ struct ScalarFieldStats {
     std::uint64_t count = 0;
     bool valid = false;
     // File-order position among the source's scalar_* properties, or -1 for
-    // runtime-generated fields (water_effect_*, ripple_*). This is the slot
-    // the field occupied when every on-disk field loaded, which legacy
-    // documents may still reference by raw index.
+    // runtime-generated fields. This is the slot the field occupied when
+    // every on-disk field loaded, which legacy documents may still reference
+    // by raw index.
     std::int32_t sourceIndex = -1;
 
     void Include(float value);
@@ -99,8 +99,8 @@ struct LoadedPointCloud {
         std::size_t fieldIndex,
         std::size_t pointIndex) const;
     // Resident slot of the field whose file-order position is sourceIndex,
-    // or nullopt when that field is not resident. Legacy documents address
-    // caustic fields by file-order slot; this is the runtime translation.
+    // or nullopt when that field is not resident. Legacy documents may
+    // address fields by file-order slot; this is the runtime translation.
     [[nodiscard]] std::optional<std::size_t> ResidentSlotForSourceIndex(
         std::int32_t sourceIndex) const;
 };

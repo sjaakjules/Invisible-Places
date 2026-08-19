@@ -256,30 +256,6 @@ void TransformAssociations(
 }
 
 template <typename Transform>
-void TransformWaterEffectLayers(
-    std::vector<invisible_places::water::WaterEffectLayer>* layers,
-    Transform transform) {
-    if (layers == nullptr) {
-        return;
-    }
-    for (auto& layer : *layers) {
-        layer.targetLayerSourcePath = transform(layer.targetLayerSourcePath);
-    }
-}
-
-template <typename Transform>
-void TransformWaterRuntimeCaches(
-    std::vector<invisible_places::serialization::WaterRippleRuntimeCacheDocument>* caches,
-    Transform transform) {
-    if (caches == nullptr) {
-        return;
-    }
-    for (auto& cache : *caches) {
-        cache.supportLayerPath = transform(cache.supportLayerPath);
-    }
-}
-
-template <typename Transform>
 void TransformWaterPathCache(
     std::optional<invisible_places::water::WaterPathCache>* cache,
     Transform transform) {
@@ -296,10 +272,7 @@ void TransformWaterSceneState(
     if (state == nullptr) {
         return;
     }
-    TransformWaterEffectLayers(&state->rippleLayers, transform);
-    TransformWaterEffectLayers(&state->fieldLayers, transform);
     TransformWaterPathCache(&state->pathCache, transform);
-    TransformWaterRuntimeCaches(&state->rippleRuntimeCaches, transform);
     state->dynamicMeshPath = transform(state->dynamicMeshPath);
 }
 
@@ -310,10 +283,7 @@ void TransformWaterSources(
     if (document == nullptr) {
         return;
     }
-    TransformWaterEffectLayers(&document->rippleLayers, transform);
-    TransformWaterEffectLayers(&document->fieldLayers, transform);
     TransformWaterPathCache(&document->pathCache, transform);
-    TransformWaterRuntimeCaches(&document->rippleRuntimeCaches, transform);
     document->dynamicMeshFlowSettings.meshPath =
         transform(document->dynamicMeshFlowSettings.meshPath);
 }
@@ -367,12 +337,7 @@ void TransformProject(
                 document->tempExportPreset->settings.outputDirectory).string();
     }
 
-    TransformWaterEffectLayers(&document->waterRippleLayers, dataTransform);
-    TransformWaterEffectLayers(&document->waterFieldLayers, dataTransform);
     TransformWaterPathCache(&document->waterPathCache, dataTransform);
-    TransformWaterRuntimeCaches(
-        &document->waterRippleRuntimeCaches,
-        dataTransform);
     document->waterDynamicMeshFlowSettings.meshPath =
         dataTransform(document->waterDynamicMeshFlowSettings.meshPath);
     for (auto& state : document->waterSceneStates) {
@@ -1117,11 +1082,9 @@ void MakeProjectDocumentPortable(
     }
     document->waterPathCache.reset();
     document->waterPathCacheManifest.reset();
-    document->waterRippleRuntimeCaches.clear();
     for (auto& state : document->waterSceneStates) {
         state.pathCache.reset();
         state.pathCacheManifest.reset();
-        state.rippleRuntimeCaches.clear();
     }
 }
 
@@ -1143,7 +1106,6 @@ void MakeWaterSourcesDocumentPortable(
         [&](const auto& value) { return MakeDataPathPortable(value, roots); });
     if (document != nullptr) {
         document->pathCache.reset();
-        document->rippleRuntimeCaches.clear();
     }
 }
 

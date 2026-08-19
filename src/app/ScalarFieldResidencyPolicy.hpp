@@ -15,8 +15,8 @@ namespace invisible_places::app {
 // required-field set contained this field; fields the authored state still
 // references keep a fresh tick and are additionally marked required.
 // Disk-backed fields (a non-negative sourceIndex) are evictable because the
-// on-demand loader can stream them back; runtime-generated fields
-// (water_effect_*, ripple_*) are not.
+// on-demand loader can stream them back; runtime-generated fields (those
+// without a source index) are not.
 struct ScalarFieldResidencyCandidate {
     std::size_t sessionIndex = 0;
     std::string fieldName;
