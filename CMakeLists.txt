@@ -305,6 +305,18 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
                     LABELS "pointcloud;python"
                     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
             )
+            add_test(
+                NAME scene3-display-density-cache-builder-tests
+                COMMAND
+                    "${INVISIBLE_PLACES_PATCH_PYTHON_EXECUTABLE}" -m unittest
+                    tests/test_build_scene3_display_density_cache.py -v
+            )
+            set_tests_properties(
+                scene3-display-density-cache-builder-tests
+                PROPERTIES
+                    LABELS "pointcloud;python;display_density_cache"
+                    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+            )
         endif()
     endif()
 
