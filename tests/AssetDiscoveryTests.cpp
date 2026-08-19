@@ -1889,6 +1889,45 @@ TEST_CASE("Shoreline shader layouts reserve Height Foam parameters consistently"
     }
 }
 
+TEST_CASE(
+    "Mesh Flow contact composition has a frame-local timing visibility gate",
+    "[water][mesh-flow][shader][timing][visibility]") {
+    using invisible_places::water::WaterFeatureTimingOverlay;
+    using invisible_places::water::WaterKeyedFeatureId;
+    using invisible_places::water::WaterKeyedFeatureKind;
+
+    invisible_places::renderer::core::SceneRenderState renderState;
+    CHECK(renderState.meshFlowContactEffectsEnabled);
+
+    WaterFeatureTimingOverlay overlay;
+    overlay.onlyShowRunFeatures = true;
+    renderState.meshFlowContactEffectsEnabled = overlay.Allows(
+        WaterKeyedFeatureId{.kind = WaterKeyedFeatureKind::MeshFlow});
+    CHECK_FALSE(renderState.meshFlowContactEffectsEnabled);
+
+    overlay.assignedRunFeatures.push_back(
+        WaterKeyedFeatureId{.kind = WaterKeyedFeatureKind::MeshFlow});
+    renderState.meshFlowContactEffectsEnabled = overlay.Allows(
+        WaterKeyedFeatureId{.kind = WaterKeyedFeatureKind::MeshFlow});
+    CHECK(renderState.meshFlowContactEffectsEnabled);
+
+    const auto shaderPath =
+        DataRoot().parent_path() /
+        "shaders/pointcloud_mesh_flow_contact.glsl";
+    std::ifstream input{shaderPath};
+    REQUIRE(input.good());
+    const std::string shader{
+        std::istreambuf_iterator<char>{input},
+        std::istreambuf_iterator<char>{}};
+    const auto gate = shader.find(
+        "styleData.additionalShorelineCount.y == 0u");
+    const auto bufferLengthRead = shader.find(
+        "meshFlowContactEvents.length()");
+    REQUIRE(gate != std::string::npos);
+    REQUIRE(bufferLengthRead != std::string::npos);
+    CHECK(gate < bufferLengthRead);
+}
+
 TEST_CASE("Seepage cannot publish non-finite point material outputs", "[water][seepage][shader]") {
     const auto shaderRoot = DataRoot().parent_path() / "shaders";
     const auto readShader = [](const std::filesystem::path& path) {

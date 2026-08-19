@@ -2049,6 +2049,8 @@ struct OfflineRenderJobState {
     struct FrozenFlowSourceLayer {
         std::size_t layerId = 0U;
         std::uint32_t sourceId = 0U;
+        invisible_places::water::WaterKeyedFeatureKind featureKind =
+            invisible_places::water::WaterKeyedFeatureKind::FlowSource;
         float maximumFlowStrength = 1.0F;
         float rainResponse = 0.0F;
         bool sourceShowTrail = true;
@@ -2068,6 +2070,7 @@ struct OfflineRenderJobState {
     // per-frame keyed-setting overlay is deterministic for the whole export.
     std::vector<invisible_places::water::WaterFeatureTimingRun>
         frozenFeatureTimingRuns;
+    bool frozenOnlyShowWaterFeaturesInRuns = false;
     // Additional shoreline instances frozen with the job; their keyed
     // visual settings evaluate per exported frame from the frozen runs.
     std::vector<PointCloudShorelineInstance> frozenShorelineInstances;
@@ -4611,16 +4614,18 @@ std::optional<float> WaterFrameExplicitRainLevel(
 template <typename ResolveAuthoredLook>
 void ApplyWaterFeatureTimingRunsToFrame(
     std::span<const invisible_places::water::WaterFeatureTimingRun> runs,
+    bool onlyShowRunFeatures,
     WaterFrameState* frame,
     ResolveAuthoredLook&& resolveAuthoredLook) {
-    if (frame == nullptr || runs.empty()) {
+    if (frame == nullptr) {
         return;
     }
     frame->featureOverlay =
         invisible_places::water::BuildWaterFeatureTimingOverlay(
             runs,
             frame->normalizedTime,
-            frame->timingIsCyclic);
+            frame->timingIsCyclic,
+            onlyShowRunFeatures);
     const auto& overlay = frame->featureOverlay;
     if (overlay.samples.empty()) {
         return;
@@ -4685,6 +4690,34 @@ void ApplyWaterFeatureTimingRunsToFrame(
     }
 }
 
+void SuppressUnassignedWaterSeepageNode(
+    const invisible_places::water::WaterFeatureTimingOverlay& overlay,
+    std::uint32_t nodeId,
+    std::vector<invisible_places::water::
+                    WaterSeepageNodeAnimationStateEntry>* states) {
+    if (states == nullptr ||
+        overlay.Allows({
+            .kind = invisible_places::water::WaterKeyedFeatureKind::
+                SeepageNode,
+            .objectId = nodeId})) {
+        return;
+    }
+    auto state = std::find_if(
+        states->begin(),
+        states->end(),
+        [nodeId](const auto& candidate) {
+            return candidate.nodeId == nodeId;
+        });
+    if (state == states->end()) {
+        states->push_back({
+            .nodeId = nodeId,
+            .state = {},
+        });
+        state = std::prev(states->end());
+    }
+    state->state.activity = 0.0F;
+}
+
 WaterFrameState ResolveWaterFrameStateBase(
     PreviewRuntimeState* runtimeState) {
     WaterFrameState result;
@@ -4736,6 +4769,7 @@ WaterFrameState ResolveWaterFrameState(
         if (entry != nullptr) {
             ApplyWaterFeatureTimingRunsToFrame(
                 runs,
+                entry->onlyShowWaterFeaturesInRuns,
                 &result,
                 [&](std::uint32_t nodeId)
                     -> std::optional<WaterSeepageLookSettings> {
@@ -4871,6 +4905,12 @@ WaterFrameState ResolveWaterFrameState(
                 });
             }
         }
+        for (const auto& node : runtimeState->water.seepageNodes) {
+            SuppressUnassignedWaterSeepageNode(
+                result.featureOverlay,
+                node.id,
+                &result.nodeStates);
+        }
     }
     return result;
 }
@@ -4897,6 +4937,12 @@ std::optional<WaterFlowSourceActivityParameters> ResolveWaterFlowSourceActivityP
                 .kind = kind,
                 .objectId = sourceId.value(),
             };
+            if (!overlay->Allows(feature)) {
+                parameters.maximumFlowStrength = 0.0F;
+                parameters.rainResponse = 0.0F;
+                parameters.showTrail = false;
+                return parameters;
+            }
             if (const auto* strength = overlay->Find(feature, "strength");
                 strength != nullptr) {
                 parameters.maximumFlowStrength = std::max(0.0F, *strength);
@@ -5124,12 +5170,15 @@ ResolveShorelinesForFrame(
         if (!instance.enabled || !instance.settings.enabled) {
             continue;
         }
+        const invisible_places::water::WaterKeyedFeatureId feature{
+            .kind = invisible_places::water::WaterKeyedFeatureKind::
+                ShorelineInstance,
+            .objectId = instance.id};
+        if (overlay != nullptr && !overlay->Allows(feature)) {
+            continue;
+        }
         auto settings = instance.settings;
         if (overlay != nullptr) {
-            const invisible_places::water::WaterKeyedFeatureId feature{
-                .kind = invisible_places::water::WaterKeyedFeatureKind::
-                    ShorelineInstance,
-                .objectId = instance.id};
             const auto keyed = [&](const char* settingId) {
                 return overlay->Find(feature, settingId);
             };
@@ -6688,6 +6737,7 @@ std::uint64_t RenderStateSignature(
     HashFloat(&seed, renderState.gaussianSplatFootprintBoost);
     HashFloat(&seed, renderState.pointSizeScale);
     HashFloat(&seed, renderState.flowTimeSeconds);
+    HashBool(&seed, renderState.meshFlowContactEffectsEnabled);
     HashRainRuntime(&seed, renderState.rainSettings, renderState.rainVisual);
     HashVec3(&seed, renderState.rainSpawnCentre);
     // Resolved shoreline instances must invalidate the cached scene image:
@@ -33627,6 +33677,10 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
     }
     const auto scenarioState = waterFrame.rawScenarioState.value_or(
         invisible_places::water::WaterScenarioState{});
+    renderState.meshFlowContactEffectsEnabled =
+        waterFrame.featureOverlay.Allows({
+            .kind = invisible_places::water::WaterKeyedFeatureKind::
+                MeshFlow});
     invisible_places::water::ApplyWaterFeatureTimingOverlayToRainSettings(
         waterFrame.featureOverlay,
         &renderState.rainSettings,
@@ -33643,22 +33697,22 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
         // per frame so exports match the preview.
         float frozenStrength = frozenSource.maximumFlowStrength;
         float frozenResponse = frozenSource.rainResponse;
-        for (const auto kind :
-             {invisible_places::water::WaterKeyedFeatureKind::FlowSource,
-              invisible_places::water::WaterKeyedFeatureKind::FlowPath}) {
-            const invisible_places::water::WaterKeyedFeatureId feature{
-                .kind = kind,
-                .objectId = frozenSource.sourceId};
-            if (const auto* keyed =
-                    waterFrame.featureOverlay.Find(feature, "strength");
-                keyed != nullptr) {
-                frozenStrength = std::max(0.0F, *keyed);
-            }
-            if (const auto* keyed =
-                    waterFrame.featureOverlay.Find(feature, "rain_response");
-                keyed != nullptr) {
-                frozenResponse = std::max(0.0F, *keyed);
-            }
+        const invisible_places::water::WaterKeyedFeatureId feature{
+            .kind = frozenSource.featureKind,
+            .objectId = frozenSource.sourceId};
+        if (!waterFrame.featureOverlay.Allows(feature)) {
+            layerIt->style.waterFlowActivity = 0.0F;
+            continue;
+        }
+        if (const auto* keyed =
+                waterFrame.featureOverlay.Find(feature, "strength");
+            keyed != nullptr) {
+            frozenStrength = std::max(0.0F, *keyed);
+        }
+        if (const auto* keyed =
+                waterFrame.featureOverlay.Find(feature, "rain_response");
+            keyed != nullptr) {
+            frozenResponse = std::max(0.0F, *keyed);
         }
         layerIt->style.waterFlowActivity =
             invisible_places::water::
@@ -38347,6 +38401,7 @@ std::vector<OfflineRenderJobState::FrozenFlowSourceLayer> BuildFrozenAnimationFl
         frozen.push_back({
             .layerId = exportLayer.layerId,
             .sourceId = session.waterFlowSourceId.value_or(0U),
+            .featureKind = parameters->featureKind,
             .maximumFlowStrength = parameters->maximumFlowStrength,
             .rainResponse = parameters->rainResponse,
             .sourceShowTrail = parameters->showTrail,
@@ -38382,11 +38437,14 @@ void FreezeAuthoredTimingState(
         ? timingSnapshot->sceneGroupName
         : ActiveWaterTimingSceneGroupName(runtimeState.water);
     job->frozenFeatureTimingRuns.clear();
+    job->frozenOnlyShowWaterFeaturesInRuns = false;
     job->frozenShorelineInstances = runtimeState.water.shorelineInstances;
     job->frozenTimingColouriseEffects.clear();
     if (timingSnapshot != nullptr) {
         job->frozenFeatureTimingRuns =
             timingSnapshot->state.waterFeatureTimingRuns;
+        job->frozenOnlyShowWaterFeaturesInRuns =
+            timingSnapshot->state.onlyShowWaterFeaturesInRuns;
         job->frozenTimingColouriseEffects =
             timingSnapshot->state.colouriseEffects;
     } else if (const auto* timingState =
@@ -38397,6 +38455,8 @@ void FreezeAuthoredTimingState(
                timingState != nullptr) {
         job->frozenFeatureTimingRuns =
             timingState->waterFeatureTimingRuns;
+        job->frozenOnlyShowWaterFeaturesInRuns =
+            timingState->onlyShowWaterFeaturesInRuns;
         job->frozenTimingColouriseEffects =
             timingState->colouriseEffects;
     }
@@ -38497,11 +38557,14 @@ void FreezeQueuedQuickMp4AuthoredTimingState(
         ? timingSnapshot->sceneGroupName
         : snapshot.sceneGroupName;
     job->frozenFeatureTimingRuns.clear();
+    job->frozenOnlyShowWaterFeaturesInRuns = false;
     job->frozenShorelineInstances = snapshot.shorelineInstances;
     job->frozenTimingColouriseEffects.clear();
     if (timingSnapshot != nullptr) {
         job->frozenFeatureTimingRuns =
             timingSnapshot->state.waterFeatureTimingRuns;
+        job->frozenOnlyShowWaterFeaturesInRuns =
+            timingSnapshot->state.onlyShowWaterFeaturesInRuns;
         job->frozenTimingColouriseEffects =
             timingSnapshot->state.colouriseEffects;
     } else if (const auto* timingState =
@@ -38512,6 +38575,8 @@ void FreezeQueuedQuickMp4AuthoredTimingState(
                timingState != nullptr) {
         job->frozenFeatureTimingRuns =
             timingState->waterFeatureTimingRuns;
+        job->frozenOnlyShowWaterFeaturesInRuns =
+            timingState->onlyShowWaterFeaturesInRuns;
         job->frozenTimingColouriseEffects =
             timingState->colouriseEffects;
     }
@@ -38795,6 +38860,7 @@ WaterFrameState ResolveFrozenWaterFrameState(
     }
     ApplyWaterFeatureTimingRunsToFrame(
         job.frozenFeatureTimingRuns,
+        job.frozenOnlyShowWaterFeaturesInRuns,
         &result,
         [&](std::uint32_t nodeId)
             -> std::optional<WaterSeepageLookSettings> {
@@ -38862,6 +38928,25 @@ WaterFrameState ResolveFrozenWaterFrameState(
                 if (visitedNodes.insert(node.id).second) {
                     setNodeRain(node.id, immediateRain);
                 }
+            }
+        }
+    }
+    std::unordered_set<std::uint32_t> visibilityVisitedNodes;
+    for (const auto& frozen : job.frozenSeepageRainEnvelopes) {
+        if (visibilityVisitedNodes.insert(frozen.nodeId).second) {
+            SuppressUnassignedWaterSeepageNode(
+                result.featureOverlay,
+                frozen.nodeId,
+                &result.nodeStates);
+        }
+    }
+    for (const auto& layer : job.frozenSeepageLayers) {
+        for (const auto& node : layer.grid.nodes) {
+            if (visibilityVisitedNodes.insert(node.id).second) {
+                SuppressUnassignedWaterSeepageNode(
+                    result.featureOverlay,
+                    node.id,
+                    &result.nodeStates);
             }
         }
     }
@@ -88414,6 +88499,11 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
     auto& water = runtimeState->water;
     auto& timings = runtimeState->timingsPanel;
     const auto scenarioId = ActiveWaterTimingScenarioId(*runtimeState);
+    const auto invalidateFeatureRunEvaluation = [&]() {
+        InvalidateWaterSeepageParams(&water);
+        ApplyFeatureTimelineScrub(runtimeState);
+        runtimeState->previewRenderStateSignatureValid = false;
+    };
     const float durationSeconds =
         runtimeState->animationPanel.currentPath.has_value()
             ? std::max(
@@ -88446,6 +88536,20 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                           : EnsureScenarioFeatureRuns(
                                 &water,
                                 scenarioId);
+        if (ImGui::Checkbox(
+                "Only show Water features in runs",
+                &entry.onlyShowWaterFeaturesInRuns)) {
+            invalidateFeatureRunEvaluation();
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("?");
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "When on, only Water features assigned to a Feature Run in "
+                "this Timing Take and scene are visible. A feature in a "
+                "muted run remains included and uses its base settings. "
+                "Visual Features are not affected.");
+        }
         if (timings.selectedFeatureRunIndex.has_value() &&
             timings.selectedFeatureRunIndex.value() >=
                 entry.waterFeatureTimingRuns.size()) {
@@ -88464,7 +88568,9 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                     keyCount += setting.keys.size();
                 }
             }
-            (void)ImGui::Checkbox("##RunEnabled", &run.enabled);
+            if (ImGui::Checkbox("##RunEnabled", &run.enabled)) {
+                invalidateFeatureRunEvaluation();
+            }
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
                 ImGui::SetTooltip(
                     run.enabled
@@ -88546,6 +88652,7 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                     timings.waterRunMarkDrag.reset();
                     timings.waterRunMarkEdit.reset();
                     timings.waterRunMarkHelpHover.reset();
+                    invalidateFeatureRunEvaluation();
                 } else {
                     timings.pendingRunDeleteIndex =
                         timings.selectedFeatureRunIndex;
@@ -88569,6 +88676,7 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                         WaterKeyedFeatureDisplayLabel(*runtimeState, feature);
                     if (ImGui::Selectable(label.c_str(), false)) {
                         run.features.push_back({.feature = feature});
+                        invalidateFeatureRunEvaluation();
                     }
                 }
                 if (available.empty()) {
@@ -88863,6 +88971,7 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                 run.features.erase(
                     run.features.begin() +
                     static_cast<std::ptrdiff_t>(removeFeatureIndex.value()));
+                invalidateFeatureRunEvaluation();
             }
 
             // ---- Timeline graphs ----
@@ -89116,6 +89225,7 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                         entry.waterFeatureTimingRuns.push_back(
                             std::move(imported));
                         timings.pendingImport.reset();
+                        invalidateFeatureRunEvaluation();
                     } else {
                         timings.pendingImport = {
                             .sourceScenarioId = source->takeId,
@@ -89186,6 +89296,7 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                     entry.waterFeatureTimingRuns.push_back(
                         std::move(imported));
                     timings.pendingImport.reset();
+                    invalidateFeatureRunEvaluation();
                 }
                 ImGui::SameLine();
                 if (ImGui::Button("Cancel Import")) {
@@ -101508,7 +101619,9 @@ bool PreviewLiveVisualEffectsRequireSceneRedraw(
         entry != nullptr) {
         overlay = invisible_places::water::BuildWaterFeatureTimingOverlay(
             entry->waterFeatureTimingRuns,
-            CurrentAuthoredTrackPosition(runtimeState));
+            CurrentAuthoredTrackPosition(runtimeState),
+            /*cyclic=*/false,
+            entry->onlyShowWaterFeaturesInRuns);
         overlayPtr = &overlay;
         invisible_places::water::ApplyWaterFeatureTimingOverlayToRainSettings(
             overlay,
@@ -101662,6 +101775,10 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                                          : WaterFrameState{};
     const auto& waterFrame = frameState != nullptr ? *frameState : evaluatedWaterFrame;
     const auto& activeWaterScenario = waterFrame.rawScenarioState;
+    renderState.meshFlowContactEffectsEnabled =
+        waterFrame.featureOverlay.Allows({
+            .kind = invisible_places::water::WaterKeyedFeatureKind::
+                MeshFlow});
     const auto* activeColouriseEffects =
         ActiveTimingColouriseEffects(runtimeState);
     renderState.rainVisual = runtimeState.water.rainVisual;

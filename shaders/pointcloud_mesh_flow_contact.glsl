@@ -279,6 +279,12 @@ MeshFlowContactComposite ResolveMeshFlowContactComposite(
     vec3 pointNormal,
     float timeSeconds) {
     MeshFlowContactComposite composite = EmptyMeshFlowContactComposite();
+    // additionalShorelineCount.y is reserved by the CPU style packer as the
+    // per-frame Mesh Flow contact gate. The descriptor can keep referencing
+    // persistent contact buffers while Timing Takes suppress their output.
+    if (styleData.additionalShorelineCount.y == 0u) {
+        return composite;
+    }
     const uint eventCapacity = uint(meshFlowContactEvents.length());
     const uint gridCapacity = uint(meshFlowContactIndicesPlusOne.length());
     // A single-bucket grid is the inactive placeholder binding (Vulkan

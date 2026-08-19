@@ -204,6 +204,10 @@ struct SceneRenderState {
     float gaussianSplatFootprintBoost = 1.5F;
     float pointSizeScale = 1.0F;
     float flowTimeSeconds = 0.0F;
+    // Per-frame visibility gate for persistent Mesh Flow contact buffers.
+    // False hides existing wetness/twinkle without clearing or rebuilding
+    // the simulation, so a Timing Take can reveal the same state again.
+    bool meshFlowContactEffectsEnabled = true;
     invisible_places::water::RainRuntimeSettings rainSettings{};
     invisible_places::water::WaterRainVisualSettings rainVisual{};
     glm::vec3 rainSpawnCentre{0.0F, 0.0F, 0.0F};

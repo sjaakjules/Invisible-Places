@@ -15080,7 +15080,13 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
             1.0F,
         };
     }
-    styleGpu.additionalShorelineCount = glm::uvec4{0U, 0U, 0U, 0U};
+    // The spare Y lane is a frame-local Mesh Flow contact visibility gate.
+    // Contact buffers remain resident and continue aging while hidden.
+    styleGpu.additionalShorelineCount = glm::uvec4{
+        0U,
+        renderState_.meshFlowContactEffectsEnabled ? 1U : 0U,
+        0U,
+        0U};
     if (layer.shorelineInstancesEligible) {
         std::uint32_t packedShorelineCount = 0U;
         for (const auto& instanceSettings : renderState_.additionalShorelines) {

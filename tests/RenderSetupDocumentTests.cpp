@@ -483,6 +483,57 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Render setup preserves Timing Take Water run visibility and defaults legacy packages off",
+    "[render-setup][serialization][timing][water][visibility]") {
+    TemporaryDirectory directory;
+    const auto currentPath = directory.path / "water-visibility.iprender.json";
+    const auto legacyPath =
+        directory.path / "water-visibility-legacy.iprender.json";
+    auto authored = MakeRenderSetup();
+    authored.timingState.onlyShowWaterFeaturesInRuns = true;
+
+    std::string error;
+    REQUIRE(invisible_places::serialization::SaveRenderSetupDocument(
+        authored,
+        currentPath,
+        &error));
+
+    nlohmann::json saved;
+    {
+        std::ifstream input{currentPath};
+        REQUIRE(input.is_open());
+        saved = nlohmann::json::parse(input);
+    }
+    const auto& timing =
+        saved.at("snapshot").at("timing_take_scene_state");
+    CHECK(timing.at("only_show_water_features_in_runs") == true);
+
+    const auto loaded =
+        invisible_places::serialization::LoadRenderSetupDocument(
+            currentPath,
+            &error);
+    REQUIRE(loaded.has_value());
+    CHECK(loaded->timingState.onlyShowWaterFeaturesInRuns);
+
+    auto legacy = saved;
+    legacy.at("snapshot")
+        .at("timing_take_scene_state")
+        .erase("only_show_water_features_in_runs");
+    {
+        std::ofstream output{legacyPath};
+        REQUIRE(output.is_open());
+        output << legacy.dump(2);
+    }
+
+    const auto legacyLoaded =
+        invisible_places::serialization::LoadRenderSetupDocument(
+            legacyPath,
+            &error);
+    REQUIRE(legacyLoaded.has_value());
+    CHECK_FALSE(legacyLoaded->timingState.onlyShowWaterFeaturesInRuns);
+}
+
+TEST_CASE(
     "Render setup schema two migrates missing activation ranges to full time",
     "[render-setup][serialization][migration]") {
     TemporaryDirectory directory;
