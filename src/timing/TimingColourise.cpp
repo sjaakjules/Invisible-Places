@@ -3846,6 +3846,9 @@ void MergeTimingTakeSceneStateKeepingFirst(
     *destination = SanitizeTimingTakeSceneState(
         std::move(*destination));
     const auto source = SanitizeTimingTakeSceneState(inputSource);
+    destination->onlyShowWaterFeaturesInRuns =
+        destination->onlyShowWaterFeaturesInRuns ||
+        source.onlyShowWaterFeaturesInRuns;
 
     // Older linked-loop merges could leave duplicate/zero run ids and the
     // same feature assigned to multiple runs. Repair that historical state

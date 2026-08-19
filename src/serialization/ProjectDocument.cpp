@@ -156,6 +156,7 @@ constexpr std::uint32_t kWaterClipMembershipProjectSchemaVersion = 76U;
 constexpr std::uint32_t kWaterClipMembershipSourcesSchemaVersion = 30U;
 constexpr std::uint32_t kWaterRainProfilesProjectSchemaVersion = 78U;
 constexpr std::uint32_t kWaterFeatureRunMarksProjectSchemaVersion = 79U;
+constexpr std::uint32_t kWaterFeatureRunVisibilityProjectSchemaVersion = 80U;
 constexpr std::uint32_t kRelativePalettePhaseProjectSchemaVersion = 62U;
 constexpr std::uint32_t kFieldMapBoundsMemoryProjectSchemaVersion = 63U;
 constexpr std::uint32_t kShorelineInstancesProjectSchemaVersion = 64U;
@@ -201,6 +202,9 @@ static_assert(
 static_assert(
     kProjectDocumentSchemaVersion >=
     kWaterFeatureRunMarksProjectSchemaVersion);
+static_assert(
+    kProjectDocumentSchemaVersion >=
+    kWaterFeatureRunVisibilityProjectSchemaVersion);
 static_assert(
     kWaterSourcesDocumentSchemaVersion >=
     kWaterRainProfilesSourcesSchemaVersion);
@@ -5721,7 +5725,7 @@ json SerializeTimingTakeSceneState(
             legacyColouriseEffectsJson.push_back(std::move(effectJson));
         }
     }
-    return {
+    json stateJson = {
         {"take_id", sanitized.takeId},
         {"scene_group", sanitized.sceneGroupName},
         {"water_feature_timing_runs", std::move(runsJson)},
@@ -5732,6 +5736,10 @@ json SerializeTimingTakeSceneState(
         {"colourise_effects", std::move(legacyColouriseEffectsJson)},
         {"colourise_effect_sequence", sanitized.colouriseEffectSequence},
     };
+    if (sanitized.onlyShowWaterFeaturesInRuns) {
+        stateJson["only_show_water_features_in_runs"] = true;
+    }
+    return stateJson;
 }
 
 invisible_places::timing::TimingTakeSceneState
@@ -5740,6 +5748,9 @@ ParseTimingTakeSceneState(const json& stateJson) {
     state.takeId = stateJson.value("take_id", state.takeId);
     state.sceneGroupName =
         stateJson.value("scene_group", state.sceneGroupName);
+    state.onlyShowWaterFeaturesInRuns = stateJson.value(
+        "only_show_water_features_in_runs",
+        false);
     state.waterFeatureTimingRunSequence = stateJson.value(
         "water_feature_timing_run_sequence",
         state.waterFeatureTimingRunSequence);
@@ -8998,6 +9009,9 @@ void MigrateAndSanitizeTimingTakeData(
                     state.waterFeatureTimingRuns.begin()),
                 std::make_move_iterator(
                     state.waterFeatureTimingRuns.end()));
+            existing->onlyShowWaterFeaturesInRuns =
+                existing->onlyShowWaterFeaturesInRuns ||
+                state.onlyShowWaterFeaturesInRuns;
             existing->colouriseEffects.insert(
                 existing->colouriseEffects.end(),
                 std::make_move_iterator(

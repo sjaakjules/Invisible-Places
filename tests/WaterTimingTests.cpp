@@ -1430,6 +1430,100 @@ TEST_CASE("Feature timing overlay samples every keyed setting and drives scenari
           nullptr);
 }
 
+TEST_CASE(
+    "Feature timing overlay visibility keeps muted membership and category umbrellas",
+    "[water][timing][keyed][overlay][visibility]") {
+    using invisible_places::water::ApplyWaterFeatureTimingOverlayToScenario;
+    using invisible_places::water::BuildWaterFeatureTimingOverlay;
+    using invisible_places::water::WaterFeatureTimingRun;
+    using invisible_places::water::WaterKeyedFeatureId;
+    using invisible_places::water::WaterKeyedFeatureKind;
+    using invisible_places::water::WaterScenarioState;
+
+    const auto restrictedEmpty = BuildWaterFeatureTimingOverlay(
+        {},
+        0.5F,
+        false,
+        true);
+    CHECK_FALSE(restrictedEmpty.Allows(
+        {.kind = WaterKeyedFeatureKind::Rain}));
+    const auto unrestrictedEmpty = BuildWaterFeatureTimingOverlay(
+        {},
+        0.5F);
+    CHECK(unrestrictedEmpty.Allows(
+        {.kind = WaterKeyedFeatureKind::Rain}));
+
+    WaterFeatureTimingRun exactRun;
+    exactRun.enabled = false;
+    exactRun.features = {
+        {.feature = {.kind = WaterKeyedFeatureKind::Rain}},
+        {.feature = {.kind = WaterKeyedFeatureKind::SeepageNode,
+                     .objectId = 4U}},
+        {.feature = {.kind = WaterKeyedFeatureKind::FlowSource,
+                     .objectId = 12U}},
+        {.feature = {.kind = WaterKeyedFeatureKind::ShorelineInstance,
+                     .objectId = 7U}},
+    };
+    const std::array exactRuns{exactRun};
+    const auto exact = BuildWaterFeatureTimingOverlay(
+        exactRuns,
+        0.5F,
+        false,
+        true);
+    CHECK(exact.samples.empty());
+    CHECK(exact.assignedRunFeatures.size() == 4U);
+    CHECK(exact.Allows({.kind = WaterKeyedFeatureKind::Rain}));
+    CHECK_FALSE(exact.Allows({.kind = WaterKeyedFeatureKind::MeshFlow}));
+    CHECK(exact.Allows({.kind = WaterKeyedFeatureKind::SeepageNode,
+                        .objectId = 4U}));
+    CHECK_FALSE(exact.Allows({.kind = WaterKeyedFeatureKind::SeepageNode,
+                              .objectId = 9U}));
+    CHECK(exact.Allows({.kind = WaterKeyedFeatureKind::SeepageGlobal}));
+    CHECK(exact.Allows({.kind = WaterKeyedFeatureKind::FlowSource,
+                        .objectId = 12U}));
+    // Object identity includes kind: a point source cannot expose a manual
+    // path that happens to use the same numeric id.
+    CHECK_FALSE(exact.Allows({.kind = WaterKeyedFeatureKind::FlowPath,
+                              .objectId = 12U}));
+    CHECK(exact.Allows({.kind = WaterKeyedFeatureKind::FlowGlobal}));
+    CHECK(exact.Allows({.kind = WaterKeyedFeatureKind::ShorelineInstance,
+                        .objectId = 7U}));
+    CHECK_FALSE(exact.Allows(
+        {.kind = WaterKeyedFeatureKind::ShorelineInstance,
+         .objectId = 8U}));
+    CHECK(exact.Allows({.kind = WaterKeyedFeatureKind::Shoreline}));
+
+    WaterFeatureTimingRun umbrellaRun;
+    umbrellaRun.enabled = false;
+    umbrellaRun.features = {
+        {.feature = {.kind = WaterKeyedFeatureKind::Shoreline}},
+        {.feature = {.kind = WaterKeyedFeatureKind::SeepageGlobal}},
+        {.feature = {.kind = WaterKeyedFeatureKind::FlowGlobal}},
+    };
+    const std::array umbrellaRuns{umbrellaRun};
+    const auto umbrella = BuildWaterFeatureTimingOverlay(
+        umbrellaRuns,
+        0.5F,
+        false,
+        true);
+    CHECK(umbrella.Allows(
+        {.kind = WaterKeyedFeatureKind::ShorelineInstance,
+         .objectId = 99U}));
+    CHECK(umbrella.Allows({.kind = WaterKeyedFeatureKind::SeepageNode,
+                           .objectId = 99U}));
+    CHECK(umbrella.Allows({.kind = WaterKeyedFeatureKind::FlowSource,
+                           .objectId = 99U}));
+    CHECK(umbrella.Allows({.kind = WaterKeyedFeatureKind::FlowPath,
+                           .objectId = 99U}));
+
+    // Visibility is enforced by feature consumers rather than by changing
+    // the environmental Rain channel shared with Seepage and Flow.
+    WaterScenarioState scenario;
+    scenario.rainLevel = 0.73F;
+    ApplyWaterFeatureTimingOverlayToScenario(restrictedEmpty, &scenario);
+    CHECK(scenario.rainLevel == Approx(0.73F));
+}
+
 TEST_CASE("Muted timing runs keep their keys but stop driving water features",
           "[water][timing][keyed][overlay][mute]") {
     using Catch::Approx;
@@ -1524,6 +1618,7 @@ TEST_CASE("Authored water response settings are keyable and overlays stay transi
         ApplyWaterFeatureTimingOverlayToDynamicMeshFlowSettings;
     using invisible_places::water::
         ApplyWaterFeatureTimingOverlayToSeepageNode;
+    using invisible_places::water::EffectiveWaterDynamicMeshFlowLevel;
     using invisible_places::water::FindWaterKeyableSetting;
     using invisible_places::water::WaterDynamicMeshFlowSettings;
     using invisible_places::water::WaterFeatureTimingOverlay;
@@ -1622,6 +1717,21 @@ TEST_CASE("Authored water response settings are keyable and overlays stay transi
     CHECK(mesh.activity == Approx(0.25F));
     CHECK(mesh.rainGain == Approx(1.5F));
     CHECK(mesh.moisturePersistenceMultiplier == Approx(2.0F));
+
+    WaterFeatureTimingOverlay hiddenMesh;
+    hiddenMesh.onlyShowRunFeatures = true;
+    mesh.activity = 0.8F;
+    mesh.rainGain = 1.0F;
+    CHECK(EffectiveWaterDynamicMeshFlowLevel(
+              mesh,
+              1.0F,
+              &hiddenMesh) == Approx(0.0F));
+    hiddenMesh.assignedRunFeatures.push_back(
+        {.kind = WaterKeyedFeatureKind::MeshFlow});
+    CHECK(EffectiveWaterDynamicMeshFlowLevel(
+              mesh,
+              0.0F,
+              &hiddenMesh) == Approx(0.8F));
 }
 
 TEST_CASE("Rain runtime uniforms key smoothly without changing authored lifecycle state",
@@ -1630,6 +1740,7 @@ TEST_CASE("Rain runtime uniforms key smoothly without changing authored lifecycl
     using invisible_places::water::ApplyWaterFeatureTimingOverlayToRainSettings;
     using invisible_places::water::BuildWaterFeatureTimingOverlay;
     using invisible_places::water::FindWaterKeyableSetting;
+    using invisible_places::water::WaterFeatureTimingOverlay;
     using invisible_places::water::RainIntensityPreset;
     using invisible_places::water::WaterFeatureTimingRun;
     using invisible_places::water::WaterKeyedFeatureKind;
@@ -1763,6 +1874,21 @@ TEST_CASE("Rain runtime uniforms key smoothly without changing authored lifecycl
     CHECK(authored.density == Approx(originalAuthored.density));
     CHECK(authoredVisual.widthMeters == Approx(originalVisual.widthMeters));
     CHECK(authoredVisual.colour == originalVisual.colour);
+
+    WaterFeatureTimingOverlay hiddenRain;
+    hiddenRain.onlyShowRunFeatures = true;
+    auto hiddenResolved = authored;
+    hiddenResolved.enabled = true;
+    hiddenResolved.rainLevel = 0.65F;
+    auto hiddenVisual = authoredVisual;
+    ApplyWaterFeatureTimingOverlayToRainSettings(
+        hiddenRain,
+        &hiddenResolved,
+        &hiddenVisual);
+    CHECK_FALSE(hiddenResolved.enabled);
+    CHECK(hiddenResolved.rainLevel == Approx(0.0F));
+    CHECK(hiddenVisual.widthMeters == Approx(authoredVisual.widthMeters));
+    CHECK(hiddenVisual.colour == authoredVisual.colour);
 }
 
 TEST_CASE(

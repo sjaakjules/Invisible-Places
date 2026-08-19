@@ -353,6 +353,10 @@ struct TimingTakeSceneState {
     std::string sceneGroupName = "Default";
     std::vector<invisible_places::water::WaterFeatureTimingRun>
         waterFeatureTimingRuns;
+    // When enabled, run membership is also an explicit Water visibility
+    // allow-list for this Timing Take and scene. Disabled runs retain their
+    // membership while contributing no keyed samples.
+    bool onlyShowWaterFeaturesInRuns = false;
     // List order is visual priority: index zero is the top layer and is
     // applied last.
     std::vector<TimingColouriseEffect> colouriseEffects;

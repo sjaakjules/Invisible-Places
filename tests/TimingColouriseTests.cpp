@@ -1,4 +1,5 @@
 #include "serialization/ProjectDocument.hpp"
+#include "serialization/ProjectDocumentJson.hpp"
 #include "timing/TimingColourise.hpp"
 
 #include <catch2/catch_approx.hpp>
@@ -2631,6 +2632,7 @@ TEST_CASE(
         .clipMembershipExplicit = true,
     };
     TimingTakeSceneState source;
+    source.onlyShowWaterFeaturesInRuns = true;
     source.waterFeatureTimingRunSequence = 2U;
     source.waterFeatureTimingRuns = {
         {
@@ -2658,6 +2660,7 @@ TEST_CASE(
 
     MergeTimingTakeSceneStateKeepingFirst(&destination, source);
 
+    CHECK(destination.onlyShowWaterFeaturesInRuns);
     REQUIRE(destination.waterFeatureTimingRuns.size() == 4U);
     std::vector<std::uint32_t> runIds;
     for (const auto& run : destination.waterFeatureTimingRuns) {
@@ -4141,6 +4144,44 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Timing Take Water run visibility is optional and round-trips by scene",
+    "[timing][water][project][serialization]") {
+    using invisible_places::serialization::TimingTakeSceneStateFromJson;
+    using invisible_places::serialization::TimingTakeSceneStateToJson;
+    using invisible_places::timing::TimingTakeSceneState;
+
+    TimingTakeSceneState state{
+        .takeId = "isolated-take",
+        .sceneGroupName = "Site A",
+    };
+    const auto defaultJson = TimingTakeSceneStateToJson(state);
+    CHECK_FALSE(defaultJson.contains(
+        "only_show_water_features_in_runs"));
+    auto defaultRoundTrip = TimingTakeSceneStateFromJson(defaultJson);
+    REQUIRE(defaultRoundTrip.has_value());
+    CHECK_FALSE(defaultRoundTrip->onlyShowWaterFeaturesInRuns);
+
+    state.onlyShowWaterFeaturesInRuns = true;
+    const auto restrictedJson = TimingTakeSceneStateToJson(state);
+    REQUIRE(restrictedJson.contains(
+        "only_show_water_features_in_runs"));
+    CHECK(restrictedJson.at(
+              "only_show_water_features_in_runs") == true);
+    const auto restrictedRoundTrip =
+        TimingTakeSceneStateFromJson(restrictedJson);
+    REQUIRE(restrictedRoundTrip.has_value());
+    CHECK(restrictedRoundTrip->onlyShowWaterFeaturesInRuns);
+
+    // Documents predating project schema 80 have no key and retain the
+    // historical behaviour of showing authored Water outside runs.
+    auto legacyJson = restrictedJson;
+    legacyJson.erase("only_show_water_features_in_runs");
+    const auto legacy = TimingTakeSceneStateFromJson(legacyJson);
+    REQUIRE(legacy.has_value());
+    CHECK_FALSE(legacy->onlyShowWaterFeaturesInRuns);
+}
+
+TEST_CASE(
     "Timing takes and saved palettes persist compound scene state",
     "[timing][colourise][project][serialization]") {
     invisible_places::serialization::ProjectDocument document;
@@ -4158,6 +4199,7 @@ TEST_CASE(
         .takeId = "timing-take-7",
         .sceneGroupName = "Site A",
     };
+    state.onlyShowWaterFeaturesInRuns = true;
     invisible_places::water::WaterFeatureTimingRun run;
     run.id = 3U;
     run.name = "Rain run";
@@ -4218,7 +4260,11 @@ TEST_CASE(
         std::ifstream input{file.path};
         REQUIRE(input.is_open());
         const auto saved = nlohmann::json::parse(input);
+        CHECK(
+            saved.at("schema_version") ==
+            invisible_places::serialization::kProjectDocumentSchemaVersion);
         const auto& stateJson = saved.at("timing_take_states")[0];
+        CHECK(stateJson.at("only_show_water_features_in_runs") == true);
         REQUIRE(stateJson.at("timing_effects").size() == 1U);
         REQUIRE(stateJson.at("colourise_effects").size() == 1U);
         CHECK(stateJson.at("timing_effect_sequence") ==
@@ -4250,6 +4296,7 @@ TEST_CASE(
     const auto& loadedState = loaded->timingTakeStates.front();
     CHECK(loadedState.takeId == "timing-take-7");
     CHECK(loadedState.sceneGroupName == "Site A");
+    CHECK(loadedState.onlyShowWaterFeaturesInRuns);
     REQUIRE(loadedState.waterFeatureTimingRuns.size() == 1U);
     REQUIRE(loadedState.colouriseEffects.size() == 1U);
     CHECK(loadedState.colouriseEffects.front().activationRange.start ==

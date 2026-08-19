@@ -587,6 +587,16 @@ survives linked-state merging with stable run-local identity. Project schema 79
 adds the optional Feature Run `marks` array; projects without it load with no
 marks.
 
+#### FR-STYLE-17
+A Timing Take scene may restrict Water visibility to features assigned to its
+Feature Runs. Disabled runs retain their visibility membership while producing
+no keyed samples. Global Shoreline, Seepage, and Flow assignments act as
+category umbrellas; an individual assignment exposes only that object while
+retaining its category-level master. Rain and Mesh Flow require their own
+assignments. Project schema 80 adds the optional
+`only_show_water_features_in_runs` scene-state flag; older projects default to
+the unrestricted behaviour.
+
 ### 5.8 Procedural Motion
 #### FR-MOTION-1
 Dynamic point motion shall be procedural and non-destructive.

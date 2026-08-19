@@ -8832,6 +8832,13 @@ void ApplyWaterFeatureTimingOverlayToRainSettings(
     const WaterKeyedFeatureId feature{
         .kind = WaterKeyedFeatureKind::Rain,
     };
+    if (!overlay.Allows(feature)) {
+        if (settings != nullptr) {
+            settings->enabled = false;
+            settings->rainLevel = 0.0F;
+        }
+        return;
+    }
     const auto apply = [&](std::string_view settingId, float* target) {
         if (target == nullptr) {
             return false;
@@ -11603,12 +11610,64 @@ const float* WaterFeatureTimingOverlay::Find(
     return nullptr;
 }
 
+bool WaterFeatureTimingOverlay::Allows(
+    const WaterKeyedFeatureId& feature) const {
+    if (!onlyShowRunFeatures) {
+        return true;
+    }
+    const auto hasKind = [&](WaterKeyedFeatureKind kind) {
+        return std::any_of(
+            assignedRunFeatures.begin(),
+            assignedRunFeatures.end(),
+            [&](const WaterKeyedFeatureId& assigned) {
+                return assigned.kind == kind;
+            });
+    };
+    if (std::find(
+            assignedRunFeatures.begin(),
+            assignedRunFeatures.end(),
+            feature) != assignedRunFeatures.end()) {
+        return true;
+    }
+    switch (feature.kind) {
+        case WaterKeyedFeatureKind::Shoreline:
+            return hasKind(WaterKeyedFeatureKind::ShorelineInstance);
+        case WaterKeyedFeatureKind::ShorelineInstance:
+            return hasKind(WaterKeyedFeatureKind::Shoreline);
+        case WaterKeyedFeatureKind::SeepageGlobal:
+            return hasKind(WaterKeyedFeatureKind::SeepageNode);
+        case WaterKeyedFeatureKind::SeepageNode:
+            return hasKind(WaterKeyedFeatureKind::SeepageGlobal);
+        case WaterKeyedFeatureKind::FlowGlobal:
+            return hasKind(WaterKeyedFeatureKind::FlowSource) ||
+                   hasKind(WaterKeyedFeatureKind::FlowPath);
+        case WaterKeyedFeatureKind::FlowSource:
+        case WaterKeyedFeatureKind::FlowPath:
+            return hasKind(WaterKeyedFeatureKind::FlowGlobal);
+        case WaterKeyedFeatureKind::Rain:
+        case WaterKeyedFeatureKind::MeshFlow:
+            return false;
+    }
+    return false;
+}
+
 WaterFeatureTimingOverlay BuildWaterFeatureTimingOverlay(
     std::span<const WaterFeatureTimingRun> runs,
     float normalizedPosition,
-    bool cyclic) {
+    bool cyclic,
+    bool onlyShowRunFeatures) {
     WaterFeatureTimingOverlay overlay;
+    overlay.onlyShowRunFeatures = onlyShowRunFeatures;
     for (const auto& run : runs) {
+        for (const auto& timeline : run.features) {
+            if (std::find(
+                    overlay.assignedRunFeatures.begin(),
+                    overlay.assignedRunFeatures.end(),
+                    timeline.feature) ==
+                overlay.assignedRunFeatures.end()) {
+                overlay.assignedRunFeatures.push_back(timeline.feature);
+            }
+        }
         if (!run.enabled) {
             continue;
         }
@@ -11803,6 +11862,10 @@ float EffectiveWaterDynamicMeshFlowLevel(
     const WaterDynamicMeshFlowSettings& settings,
     float effectiveRainLevel,
     const WaterFeatureTimingOverlay* overlay) {
+    if (overlay != nullptr &&
+        !overlay->Allows({.kind = WaterKeyedFeatureKind::MeshFlow})) {
+        return 0.0F;
+    }
     auto resolved = settings;
     if (overlay != nullptr) {
         ApplyWaterFeatureTimingOverlayToDynamicMeshFlowSettings(

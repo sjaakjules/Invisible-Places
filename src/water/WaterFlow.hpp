@@ -1221,16 +1221,26 @@ struct WaterFeatureTimingSampleEntry {
 // Every keyed (feature, setting) evaluated at one normalized position.
 struct WaterFeatureTimingOverlay {
     std::vector<WaterFeatureTimingSampleEntry> samples;
+    // Membership includes enabled and disabled runs. The toggle decides
+    // whether that membership is merely informational or a visibility
+    // allow-list for runtime consumers.
+    std::vector<WaterKeyedFeatureId> assignedRunFeatures;
+    bool onlyShowRunFeatures = false;
 
     [[nodiscard]] const float* Find(
         const WaterKeyedFeatureId& feature,
         std::string_view settingId) const;
+    // Global Shoreline/Seepage/Flow ids are category umbrellas: assigning a
+    // global permits every matching object, while assigning any object keeps
+    // its category-level master available without permitting its siblings.
+    [[nodiscard]] bool Allows(const WaterKeyedFeatureId& feature) const;
 };
 
 [[nodiscard]] WaterFeatureTimingOverlay BuildWaterFeatureTimingOverlay(
     std::span<const WaterFeatureTimingRun> runs,
     float normalizedPosition,
-    bool cyclic = false);
+    bool cyclic = false,
+    bool onlyShowRunFeatures = false);
 // Applies active singleton "level" samples onto the legacy frame-control
 // carrier (Rain, Mesh Flow, Shoreline). Parsed Seepage/Flow global samples
 // are deliberately ignored.
