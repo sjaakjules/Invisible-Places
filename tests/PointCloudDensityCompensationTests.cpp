@@ -67,13 +67,19 @@ invisible_places::output::ExrImage RenderSinglePoint(
 invisible_places::output::ExrImage RenderSingleWaterTrail(
     float activity,
     float trailSeed,
-    bool fastBasic = false) {
+    bool fastBasic = false,
+    float waterEffectPointSizeAdd = std::numeric_limits<float>::quiet_NaN()) {
     invisible_places::io::LoadedPointCloud cloud;
     cloud.positions = {{0.0F, 0.0F, 0.0F}};
     cloud.packedColors = {0xFFFFFFFFU};
     cloud.hasSourceRgb = true;
     cloud.bounds.Expand(cloud.positions.front());
-    for (std::size_t fieldIndex = 0; fieldIndex < 31U; ++fieldIndex) {
+    constexpr std::size_t kWaterTrailFieldCount = 31U;
+    constexpr std::size_t kWaterEffectFieldCount = 9U;
+    const bool waterEffect = std::isfinite(waterEffectPointSizeAdd);
+    const std::size_t fieldCount =
+        kWaterTrailFieldCount + (waterEffect ? kWaterEffectFieldCount : 0U);
+    for (std::size_t fieldIndex = 0; fieldIndex < fieldCount; ++fieldIndex) {
         cloud.scalarFields.push_back({
             .name = "stream_" + std::to_string(fieldIndex),
             .minimum = 0.0F,
@@ -92,6 +98,17 @@ invisible_places::output::ExrImage RenderSingleWaterTrail(
     setField(17U, 0.30F); // trail_width
     setField(18U, 0.40F); // trail_streak_length
     setField(22U, 1.0F);  // tangent_x
+    if (waterEffect) {
+        setField(31U, 0.0F);                    // emission_add
+        setField(32U, 0.0F);                    // opacity_add
+        setField(33U, 1.0F);                    // opacity_multiply
+        setField(34U, waterEffectPointSizeAdd); // point_size_add
+        setField(35U, 1.0F);                    // point_size_multiply
+        setField(36U, 1.0F);                    // colour_red
+        setField(37U, 1.0F);                    // colour_green
+        setField(38U, 1.0F);                    // colour_blue
+        setField(39U, 0.0F);                    // colour_mix
+    }
 
     invisible_places::renderer::pointcloud::PointCloudStyleState style;
     style.geometryMode =
@@ -107,7 +124,7 @@ invisible_places::output::ExrImage RenderSingleWaterTrail(
     invisible_places::style::SetScalarConstant(&style.emissiveStrength, 0.0F);
     invisible_places::style::SetScalarConstant(&style.depthFade, 0.0F);
 
-    const invisible_places::output::OfflinePointLayer layer{
+    invisible_places::output::OfflinePointLayer layer{
         .cloud = &cloud,
         .style = style,
         .generatedWaterOverlay = true,
@@ -115,6 +132,17 @@ invisible_places::output::ExrImage RenderSingleWaterTrail(
         .fastBasic = fastBasic,
         .localToWorld = glm::mat4{1.0F},
     };
+    if (waterEffect) {
+        layer.waterEffectEmissionAddFieldSlot = 31U;
+        layer.waterEffectOpacityAddFieldSlot = 32U;
+        layer.waterEffectOpacityMultiplyFieldSlot = 33U;
+        layer.waterEffectPointSizeAddFieldSlot = 34U;
+        layer.waterEffectPointSizeMultiplyFieldSlot = 35U;
+        layer.waterEffectColourRedFieldSlot = 36U;
+        layer.waterEffectColourGreenFieldSlot = 37U;
+        layer.waterEffectColourBlueFieldSlot = 38U;
+        layer.waterEffectColourMixFieldSlot = 39U;
+    }
     invisible_places::camera::CameraState cameraState;
     cameraState.position = {0.0F, 0.0F, 5.0F};
     cameraState.target = {0.0F, 0.0F, 0.0F};
@@ -297,6 +325,67 @@ TEST_CASE("Density compensation preserves reference area in its footprint", "[po
     checkArea(0.005F, 20U, 0.001F, 1000U);
     checkArea(0.005F, 80U, 0.001F, 1000U);
     checkArea(0.005F, 160U, 0.002F, 1000U);
+}
+
+TEST_CASE(
+    "Density compensation scales antialias support before depth of field",
+    "[pointcloud][density][footprint]") {
+    using invisible_places::renderer::pointcloud::PointCloudDensityCompensation;
+    using invisible_places::renderer::pointcloud::ClampPointCloudResolvedSurfelDiameter;
+    using invisible_places::renderer::pointcloud::ResolvePointCloudDensityAdjustedFootprint;
+
+    CHECK(
+        ResolvePointCloudDensityAdjustedFootprint(
+            3.0F,
+            1.0F,
+            2.0F,
+            PointCloudDensityCompensation{1.0F, 1.0F}) ==
+        Catch::Approx(6.0F));
+    CHECK(
+        ResolvePointCloudDensityAdjustedFootprint(
+            3.0F,
+            1.0F,
+            2.0F,
+            PointCloudDensityCompensation{4.0F, 1.0F}) ==
+        Catch::Approx(18.0F));
+    // Coverage correction changes fragment opacity, not geometry.
+    CHECK(
+        ResolvePointCloudDensityAdjustedFootprint(
+            3.0F,
+            1.0F,
+            2.0F,
+            PointCloudDensityCompensation{4.0F, 8.0F}) ==
+        Catch::Approx(18.0F));
+    // Signed water/Ripple size additions stay composed until the same final
+    // geometry clamp used by the GPU. Clamping the authored term first would
+    // incorrectly leave a five-pixel AA footprint here.
+    CHECK(
+        ResolvePointCloudDensityAdjustedFootprint(
+            -1.0F,
+            1.0F,
+            0.0F,
+            PointCloudDensityCompensation{5.0F, 1.0F}) ==
+        Catch::Approx(0.0F));
+    CHECK(
+        ClampPointCloudResolvedSurfelDiameter(
+            ResolvePointCloudDensityAdjustedFootprint(
+                20.0F,
+                1.0F,
+                2.0F,
+                PointCloudDensityCompensation{5.0F, 1.0F}),
+            64.0F) ==
+        Catch::Approx(64.0F));
+    CHECK(
+        ClampPointCloudResolvedSurfelDiameter(-3.0F, 64.0F) ==
+        Catch::Approx(0.0F));
+}
+
+TEST_CASE(
+    "Offline water trail width retains composed water size effects",
+    "[output][offline][water][density][footprint]") {
+    const auto base = RenderSingleWaterTrail(1.0F, 0.8F, false, 0.0F);
+    const auto expanded = RenderSingleWaterTrail(1.0F, 0.8F, false, 0.30F);
+    CHECK(CoveredPixelCount(expanded) > CoveredPixelCount(base));
 }
 
 TEST_CASE("Water Flow activity scales are deterministic and monotonic", "[pointcloud][water][activity]") {

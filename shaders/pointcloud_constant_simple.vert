@@ -92,13 +92,18 @@ void main() {
     const float basePointSize =
         worldSizedScreenSprites
             ? WorldDiameterToScreenPointSizePixels(
-                  max(0.0, styleData.surfelDiameterBinding.constantValue.x) * footprintScale,
+                  max(0.0, styleData.surfelDiameterBinding.constantValue.x),
                   viewDepth)
-            : max(0.0, styleData.pointSizeBinding.constantValue.x) * footprintScale;
+            : max(0.0, styleData.pointSizeBinding.constantValue.x);
     const float minPointSize = max(1.0, styleData.renderParams3.y);
     const float maxPointSize = max(minPointSize, styleData.renderParams3.z);
+    // The antialias support is part of the point kernel represented by this
+    // sparse sample, so it scales with density. Camera blur remains a
+    // post-density image effect.
+    const float densityAdjustedPointSize =
+        (basePointSize + max(0.0, styleData.renderParams2.x)) * footprintScale;
     gl_PointSize = clamp(
-        basePointSize + ResolveDepthOfFieldBlurPixels(viewDepth) + max(0.0, styleData.renderParams2.x),
+        densityAdjustedPointSize + ResolveDepthOfFieldBlurPixels(viewDepth),
         minPointSize,
         maxPointSize);
 

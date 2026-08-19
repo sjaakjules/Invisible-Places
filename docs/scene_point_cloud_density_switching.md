@@ -39,7 +39,7 @@ g = gNominal x sqrt(areaCorrection)
 
 The appearance reference is the role's 1 mm variant when it exists; otherwise it is that role's canonical analysis source or densest known variant. Invalid or zero point-count data uses `areaCorrection = 1`.
 
-`g` scales the complete authored footprint, including field-mapped sizes and water, Ripple, and Shoreline size additions. The nominal spacing ratio first restores the 1 mm-authored footprint; the square root correction then grows an under-covered source or shrinks an over-covered source while preserving its covered area. Depth-of-field and antialias additions are applied afterward. For an ideal 5 mm decimation, an authored 2 mm point size renders as 10 mm and a mapped 1.5–2.2 mm range renders as 7.5–11 mm. Measured point-count deviations adjust those diameters without changing the values displayed in the Visuals tab.
+`g` scales the complete authored raster footprint, including field-mapped sizes, water/Ripple/Shoreline size additions, and the antialias support around the point kernel. The nominal spacing ratio first restores the 1 mm-authored footprint; the square root correction then grows an under-covered source or shrinks an over-covered source while preserving its covered area. Camera depth-of-field is a later image-space effect and is therefore added after density scaling. For an ideal 5 mm decimation, an authored 2 mm point size renders as 10 mm and a mapped 1.5–2.2 mm range renders as 7.5–11 mm. Measured point-count deviations adjust those diameters without changing the values displayed in the Visuals tab.
 
 Beauty rendering keeps the authored per-fragment opacity and emission after falloff, stylisation, depth fade, water effects, and coverage:
 

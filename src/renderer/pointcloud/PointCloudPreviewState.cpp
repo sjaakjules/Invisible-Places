@@ -894,6 +894,39 @@ PointCloudDensityCompensation SanitizePointCloudDensityCompensation(
     return compensation;
 }
 
+float ResolvePointCloudDensityAdjustedFootprint(
+    float authoredFootprint,
+    float antialiasFootprint,
+    float postDensityExpansion,
+    PointCloudDensityCompensation compensation) {
+    const auto finiteOrZero = [](float value) {
+        return std::isfinite(value) ? value : 0.0F;
+    };
+    const auto finiteNonNegative = [](float value) {
+        return std::isfinite(value) ? std::max(0.0F, value) : 0.0F;
+    };
+    compensation = SanitizePointCloudDensityCompensation(compensation);
+    // Size additions are intentionally signed. Preserve their composed value
+    // through density scaling and leave the geometry-specific lower bound to
+    // the caller, matching the unified GPU paths' final clamp.
+    return (finiteOrZero(authoredFootprint) +
+            finiteNonNegative(antialiasFootprint)) *
+               compensation.footprintScale +
+           finiteNonNegative(postDensityExpansion);
+}
+
+float ClampPointCloudResolvedSurfelDiameter(
+    float resolvedDiameter,
+    float maximumDiameter) {
+    if (!std::isfinite(resolvedDiameter)) {
+        return 0.0F;
+    }
+    const float safeMaximum = std::isfinite(maximumDiameter)
+                                  ? std::max(1.0e-6F, maximumDiameter)
+                                  : 1.0e-6F;
+    return std::clamp(resolvedDiameter, 0.0F, safeMaximum);
+}
+
 PointCloudMaterialVariant ResolvePointCloudMaterialVariant(const PointCloudStyleState& style) {
     return ResolvePointCloudMaterialVariant(style, {});
 }

@@ -1323,7 +1323,12 @@ void main() {
     const float unboundedDiameter =
         authoredDiameter * max(1.0e-6, styleData.renderParams1.y) +
         (ResolveDepthOfFieldWorldRadius(centerDepth) * 2.0) +
-        ScreenPixelWorldSpan(centerDepth, styleData.renderParams2.x);
+        // Match screen sprites by scaling antialias support with the sparse
+        // point kernel while leaving depth-of-field above unscaled.
+        ScreenPixelWorldSpan(
+            centerDepth,
+            styleData.renderParams2.x *
+                max(1.0e-6, styleData.renderParams1.y));
     const float maximumDiameter = max(
         1.0e-6,
         ScreenPixelWorldSpan(

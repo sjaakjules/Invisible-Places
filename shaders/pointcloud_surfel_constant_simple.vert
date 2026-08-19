@@ -157,11 +157,25 @@ void main() {
 
     const vec4 centerViewPosition = uniforms.view * vec4(center, 1.0);
     const float centerDepth = -centerViewPosition.z;
-    const float diameter =
+    // Antialias support is part of the density-scaled kernel; camera blur is
+    // deliberately independent of point density.
+    const float unboundedDiameter =
         max(0.0, styleData.surfelDiameterBinding.constantValue.x) *
             max(1.0e-6, styleData.renderParams1.y) +
         (ResolveDepthOfFieldWorldRadius(centerDepth) * 2.0) +
-        ScreenPixelWorldSpan(centerDepth, styleData.renderParams2.x);
+        ScreenPixelWorldSpan(
+            centerDepth,
+            styleData.renderParams2.x *
+                max(1.0e-6, styleData.renderParams1.y));
+    const float maximumDiameter = max(
+        1.0e-6,
+        ScreenPixelWorldSpan(
+            centerDepth,
+            max(1.0, styleData.renderParams3.z)));
+    const float diameter =
+        (isnan(unboundedDiameter) || isinf(unboundedDiameter))
+            ? 0.0
+            : clamp(unboundedDiameter, 0.0, maximumDiameter);
     const vec3 offset = (tangent * corner.x + bitangent * corner.y) * (diameter * 0.5);
     const vec4 worldPosition = vec4(center + offset, 1.0);
     const vec4 viewPosition = uniforms.view * worldPosition;

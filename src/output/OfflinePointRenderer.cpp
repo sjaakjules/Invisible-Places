@@ -2220,12 +2220,21 @@ bool BuildOfflinePointSample(
             : invisible_places::water::RainImpactEffect{};
     const float waterParticleSizeScale =
         waterParticles ? WaterParticleSizeScale(cloud, pointIndex, stylisationTimeSeconds) : 1.0F;
+    const float baseSurfelDiameter = waterTrails
+                                         ? WaterTrailWidth(
+                                               cloud,
+                                               pointIndex,
+                                               layer.style)
+                                         : std::max(
+                                               0.0F,
+                                               EvaluateBindingOrDefault(
+                                                   cloud,
+                                                   layer.style.surfelDiameter,
+                                                   pointIndex,
+                                                   invisible_places::renderer::pointcloud::
+                                                       kInactiveSurfelDiameterDefault));
     const float authoredSurfelDiameter =
-        (EvaluateBindingOrDefault(
-             cloud,
-             layer.style.surfelDiameter,
-             pointIndex,
-             invisible_places::renderer::pointcloud::kInactiveSurfelDiameterDefault) *
+        (baseSurfelDiameter *
              waterParticleSizeScale *
              (1.0F + caustic * std::max(0.0F, layer.style.causticPointSizeBoost)) *
              waterEffectPointSizeMultiply *
@@ -2234,11 +2243,13 @@ bool BuildOfflinePointSample(
         waterEffectPointSizeAdd +
         sparseRipple.pointSizeAdd;
     const float authoredPointSize =
-        (EvaluateBindingOrDefault(
-             cloud,
-             layer.style.pointSize,
-             pointIndex,
-             invisible_places::renderer::pointcloud::kInactivePointSizeDefault) *
+        (std::max(
+             0.0F,
+             EvaluateBindingOrDefault(
+                 cloud,
+                 layer.style.pointSize,
+                 pointIndex,
+                 invisible_places::renderer::pointcloud::kInactivePointSizeDefault)) *
              waterParticleSizeScale *
              (1.0F + caustic * std::max(0.0F, layer.style.causticPointSizeBoost)) *
              waterEffectPointSizeMultiply *
@@ -2251,54 +2262,52 @@ bool BuildOfflinePointSample(
         invisible_places::renderer::pointcloud::PointCloudStyleUsesWorldSizedScreenSprites(layer.style);
     if (worldSizedScreenSprites) {
         sample->pointSize = std::clamp(
-            invisible_places::renderer::pointcloud::WorldDiameterToScreenPointSizePixels(
-                authoredSurfelDiameter * densityCompensation.footprintScale,
-                viewDepth,
-                matrices.projection[1][1],
-                static_cast<float>(image.height)) +
-                depthOfFieldBlurPixels +
+            invisible_places::renderer::pointcloud::ResolvePointCloudDensityAdjustedFootprint(
+                invisible_places::renderer::pointcloud::WorldDiameterToScreenPointSizePixels(
+                    authoredSurfelDiameter,
+                    viewDepth,
+                    matrices.projection[1][1],
+                    static_cast<float>(image.height)),
                 kPointCloudAntialiasFeatherPixels,
+                depthOfFieldBlurPixels,
+                densityCompensation),
             1.0F,
             64.0F);
     } else {
         sample->pointSize = std::clamp(
-            authoredPointSize * densityCompensation.footprintScale +
-                depthOfFieldBlurPixels +
+            invisible_places::renderer::pointcloud::ResolvePointCloudDensityAdjustedFootprint(
+                authoredPointSize,
                 kPointCloudAntialiasFeatherPixels,
+                depthOfFieldBlurPixels,
+                densityCompensation),
             1.0F,
             64.0F);
     }
     sample->worldSurfels = worldSurfels;
-    sample->surfelDiameter = std::max(
-        0.0F,
-        authoredSurfelDiameter * densityCompensation.footprintScale +
-            2.0F * ScreenPixelWorldSpan(
-                       viewDepth,
-                       depthOfFieldBlurPixels,
-                       matrices.projection[1][1],
-                       static_cast<float>(image.height)) +
+    sample->surfelDiameter =
+        invisible_places::renderer::pointcloud::ClampPointCloudResolvedSurfelDiameter(
+            invisible_places::renderer::pointcloud::ResolvePointCloudDensityAdjustedFootprint(
+                authoredSurfelDiameter,
+                ScreenPixelWorldSpan(
+                    viewDepth,
+                    kPointCloudAntialiasFeatherPixels,
+                    matrices.projection[1][1],
+                    static_cast<float>(image.height)),
+                2.0F * ScreenPixelWorldSpan(
+                           viewDepth,
+                           depthOfFieldBlurPixels,
+                           matrices.projection[1][1],
+                           static_cast<float>(image.height)),
+                densityCompensation),
             ScreenPixelWorldSpan(
                 viewDepth,
-                kPointCloudAntialiasFeatherPixels,
+                64.0F,
                 matrices.projection[1][1],
                 static_cast<float>(image.height)));
     sample->surfelAspect = layer.style.flowAnimation
                                 ? std::clamp(layer.style.waterStreakAspect, 1.0F, 32.0F)
                                 : 1.0F;
     if (waterTrails) {
-        const float trailWidth = WaterTrailWidth(cloud, pointIndex, layer.style);
-        sample->surfelDiameter =
-            trailWidth * densityCompensation.footprintScale +
-            2.0F * ScreenPixelWorldSpan(
-                       viewDepth,
-                       depthOfFieldBlurPixels,
-                       matrices.projection[1][1],
-                       static_cast<float>(image.height)) +
-            ScreenPixelWorldSpan(
-                viewDepth,
-                kPointCloudAntialiasFeatherPixels,
-                matrices.projection[1][1],
-                static_cast<float>(image.height));
         const float trailStreakLength = std::max(
             sample->surfelDiameter,
             WaterTrailStreakLength(cloud, pointIndex, layer.style));

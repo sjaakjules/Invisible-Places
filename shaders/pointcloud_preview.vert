@@ -1273,9 +1273,12 @@ void main() {
                   footprintScale);
     const float minPointSize = max(1.0, styleData.renderParams3.y);
     const float maxPointSize = max(minPointSize, styleData.renderParams3.z);
+    // Scale the authored kernel and its antialias support together. Depth of
+    // field belongs to the camera and remains outside density compensation.
     const float resolvedPointSize =
-        pointSizeBeforeDepthOfField + ResolveDepthOfFieldBlurPixels(viewDepth) +
-        max(0.0, styleData.renderParams2.x);
+        pointSizeBeforeDepthOfField +
+        max(0.0, styleData.renderParams2.x) * footprintScale +
+        ResolveDepthOfFieldBlurPixels(viewDepth);
     gl_PointSize = RippleFiniteFloat(resolvedPointSize)
         ? clamp(resolvedPointSize, minPointSize, maxPointSize)
         : minPointSize;
