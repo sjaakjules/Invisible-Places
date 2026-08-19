@@ -1120,7 +1120,7 @@ def _validate_existing_bundle(
 
 
 def build_cache(config: BuildConfig) -> Path:
-    """Build and atomically activate a complete local three-role bundle."""
+    """Build a complete bundle; activate only the renderer-parity RGB mode."""
 
     if config.shard_count <= 0:
         raise ValueError("shard_count must be positive")
@@ -1202,18 +1202,22 @@ def build_cache(config: BuildConfig) -> Path:
             _fsync_directory(cache_root)
             active_manifest_path = final_root / MANIFEST_NAME
 
-        # This small pointer is the only activation mutation.  It occurs after
-        # the finalized three-role directory and manifest are durable.
+        # Comparison colour filters remain durable, versioned bundles but can
+        # never become the application's implicit display source. This keeps
+        # an exploratory colour transform from replacing the 1 mm-parity mode.
         _assert_sources_unchanged(role_records)
-        manifest_sha256 = _sha256_file(active_manifest_path)
-        _write_json_atomic(
-            cache_root / ACTIVE_POINTER_NAME,
-            {
-                "schema_version": SCHEMA_VERSION,
-                "bundle_fingerprint": fingerprint,
-                "manifest_sha256": manifest_sha256,
-            },
-        )
+        if config.rgb_filter == RGB_FILTER_RENDERER_BYTE:
+            # This small pointer is the only activation mutation. It occurs
+            # after the finalized three-role directory and manifest are durable.
+            manifest_sha256 = _sha256_file(active_manifest_path)
+            _write_json_atomic(
+                cache_root / ACTIVE_POINTER_NAME,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "bundle_fingerprint": fingerprint,
+                    "manifest_sha256": manifest_sha256,
+                },
+            )
         return final_root
     except Exception:
         if staging_root.exists() and not config.keep_staging_on_error:
@@ -1292,7 +1296,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         keep_staging_on_error=arguments.keep_staging_on_error,
     )
     bundle = build_cache(config)
-    print(f"Activated local display-density bundle: {bundle}")
+    if config.rgb_filter == RGB_FILTER_RENDERER_BYTE:
+        print(f"Activated local display-density bundle: {bundle}")
+    else:
+        print(
+            "Finalized comparison display-density bundle without activating "
+            f"it: {bundle}"
+        )
     return 0
 
 

@@ -221,10 +221,13 @@ class DisplayDensityCacheBuilderTests(unittest.TestCase):
             root = Path(temporary)
             source_root = root / "sources"
             self._write_roles(source_root, _filter_fixture_records())
-            byte_bundle = self._build(source_root, root / "byte-cache", target=1)
+            cache_root = root / "cache"
+            byte_bundle = self._build(source_root, cache_root, target=1)
+            pointer_path = cache_root / cache_builder.ACTIVE_POINTER_NAME
+            settled_pointer = pointer_path.read_bytes()
             linear_bundle = self._build(
                 source_root,
-                root / "linear-cache",
+                cache_root,
                 target=1,
                 rgb_filter=cache_builder.RGB_FILTER_SRGB_LINEAR,
             )
@@ -244,6 +247,9 @@ class DisplayDensityCacheBuilderTests(unittest.TestCase):
                 float(byte_point["x"]),
                 _filter_fixture_records()["x"].tolist(),
             )
+            self.assertNotEqual(byte_bundle, linear_bundle)
+            self.assertTrue((linear_bundle / cache_builder.MANIFEST_NAME).is_file())
+            self.assertEqual(pointer_path.read_bytes(), settled_pointer)
 
     def test_failed_role_never_replaces_active_pointer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
