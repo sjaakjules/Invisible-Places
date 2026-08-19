@@ -344,6 +344,339 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Visual Feature settings clips derive from every owned key family",
+    "[timing][colourise][settings-clip]") {
+    using invisible_places::timing::TimingColouriseFieldSelector;
+    using invisible_places::timing::TimingColouriseFieldSource;
+
+    TimingColouriseEffect effect;
+    effect.activationRange = {.start = 0.25F, .end = 0.75F};
+    effect.field = TimingColouriseFieldSelector{
+        .source = TimingColouriseFieldSource::Scalar,
+        .scalarFieldName = "current",
+    };
+    // Palette and Palette Phase are dormant while the feature is
+    // emissive-only, but feature-wide timing still owns them.
+    effect.colouriseEnabled = false;
+    effect.emissiveEnabled = true;
+    effect.basePalette.stops = {{.id = "tracked", .position = 0.5F}};
+    effect.effectParameterKeys = {
+        {.parameter = TimingColouriseEffectParameter::PalettePhase,
+         .position = 0.2F,
+         .value = 0.3F,
+         .interpolation = WaterScenarioInterpolation::Hold},
+        {.parameter = TimingColouriseEffectParameter::EmissiveLevel,
+         .position = 0.4F,
+         .value = 2.0F},
+    };
+    effect.paletteKeys = {
+        {.position = 0.1F,
+         .palette = Solid({0.1F, 0.2F, 0.3F})},
+    };
+    effect.paletteStopParameterKeys = {
+        {.stopId = "tracked",
+         .parameter =
+             TimingColourisePaletteStopParameter::ColouriseAmount,
+         .position = 0.9F,
+         .scalarValue = 0.6F},
+    };
+    effect.boundsParameterKeys = {
+        {.parameter = TimingColouriseBoundsParameter::Lower,
+         .position = 0.7F,
+         .value = -1.0F},
+    };
+    effect.boundsKeys = {
+        {.position = 0.3F,
+         .bounds = {.lower = -2.0F, .upper = 2.0F}},
+    };
+
+    TimingColouriseFieldBoundsMemory currentCache;
+    currentCache.selector = effect.field;
+    currentCache.boundsParameterKeys = {
+        {.parameter = TimingColouriseBoundsParameter::Lower,
+         .position = 0.01F,
+         .value = -99.0F},
+    };
+    currentCache.boundsKeys = {
+        {.position = 0.99F,
+         .bounds = {.lower = -99.0F, .upper = 99.0F}},
+    };
+    TimingColouriseFieldBoundsMemory remembered;
+    remembered.selector = TimingColouriseFieldSelector{
+        .source = TimingColouriseFieldSource::Scalar,
+        .scalarFieldName = "remembered",
+    };
+    remembered.boundsParameterKeys = {
+        {.parameter = TimingColouriseBoundsParameter::Upper,
+         .position = 0.05F,
+         .value = 4.0F},
+    };
+    remembered.boundsKeys = {
+        {.position = 0.95F,
+         .bounds = {.lower = -4.0F, .upper = 4.0F}},
+    };
+    effect.fieldBoundsMemory = {currentCache, remembered};
+
+    const auto positions = invisible_places::timing::
+        TimingColouriseEffectSettingsKeyPositions(effect);
+    REQUIRE(positions.size() == 8U);
+    CHECK(positions.front() == Approx(0.05F));
+    CHECK(positions.back() == Approx(0.95F));
+    CHECK(std::find(positions.begin(), positions.end(), 0.01F) ==
+          positions.end());
+    CHECK(std::find(positions.begin(), positions.end(), 0.99F) ==
+          positions.end());
+
+    const auto span = invisible_places::timing::
+        TimingColouriseEffectSettingsKeySpan(effect);
+    REQUIRE(span.has_value());
+    CHECK(span->start == Approx(0.05F));
+    CHECK(span->end == Approx(0.95F));
+
+    const auto activationBefore = effect.activationRange;
+    REQUIRE(invisible_places::timing::
+                TransformTimingColouriseEffectSettingsKeys(
+                    &effect,
+                    *span,
+                    {.start = 0.2F, .end = 0.8F}));
+    const auto mapped = [](float position) {
+        return 0.2F + (position - 0.05F) * (0.6F / 0.9F);
+    };
+    CHECK(effect.activationRange.start == Approx(activationBefore.start));
+    CHECK(effect.activationRange.end == Approx(activationBefore.end));
+    REQUIRE(effect.paletteKeys.size() == 1U);
+    CHECK(effect.paletteKeys.front().position == Approx(mapped(0.1F)));
+    CHECK(effect.paletteKeys.front().palette.stops.front().colour[1] ==
+          Approx(0.2F));
+    REQUIRE(effect.paletteStopParameterKeys.size() == 1U);
+    CHECK(effect.paletteStopParameterKeys.front().position ==
+          Approx(mapped(0.9F)));
+    REQUIRE(effect.boundsParameterKeys.size() == 1U);
+    CHECK(effect.boundsParameterKeys.front().position ==
+          Approx(mapped(0.7F)));
+    REQUIRE(effect.boundsKeys.size() == 1U);
+    CHECK(effect.boundsKeys.front().position == Approx(mapped(0.3F)));
+    const auto dormantPhase = std::find_if(
+        effect.effectParameterKeys.begin(),
+        effect.effectParameterKeys.end(),
+        [](const auto& key) {
+            return key.parameter ==
+                   TimingColouriseEffectParameter::PalettePhase;
+        });
+    REQUIRE(dormantPhase != effect.effectParameterKeys.end());
+    CHECK(dormantPhase->position == Approx(mapped(0.2F)));
+    CHECK(dormantPhase->value == Approx(0.3F));
+    CHECK(dormantPhase->interpolation ==
+          WaterScenarioInterpolation::Hold);
+
+    const auto transformedRemembered = std::find_if(
+        effect.fieldBoundsMemory.begin(),
+        effect.fieldBoundsMemory.end(),
+        [&](const auto& memory) {
+            return memory.selector == remembered.selector;
+        });
+    REQUIRE(transformedRemembered != effect.fieldBoundsMemory.end());
+    CHECK(transformedRemembered->boundsParameterKeys.front().position ==
+          Approx(mapped(0.05F)));
+    CHECK(transformedRemembered->boundsKeys.front().position ==
+          Approx(mapped(0.95F)));
+
+    // A selected-field memory entry is a cache, not another authored lane;
+    // replace its stale snapshot from the transformed live bounds tracks.
+    const auto synchronizedCurrent = std::find_if(
+        effect.fieldBoundsMemory.begin(),
+        effect.fieldBoundsMemory.end(),
+        [&](const auto& memory) {
+            return memory.selector == effect.field;
+        });
+    REQUIRE(synchronizedCurrent != effect.fieldBoundsMemory.end());
+    REQUIRE(synchronizedCurrent->boundsParameterKeys.size() == 1U);
+    REQUIRE(synchronizedCurrent->boundsKeys.size() == 1U);
+    CHECK(synchronizedCurrent->boundsParameterKeys.front().position ==
+          Approx(effect.boundsParameterKeys.front().position));
+    CHECK(synchronizedCurrent->boundsKeys.front().position ==
+          Approx(effect.boundsKeys.front().position));
+
+    const auto transformedSpan = invisible_places::timing::
+        TimingColouriseEffectSettingsKeySpan(effect);
+    REQUIRE(transformedSpan.has_value());
+    CHECK(transformedSpan->start == Approx(0.2F));
+    CHECK(transformedSpan->end == Approx(0.8F));
+}
+
+TEST_CASE(
+    "Visual Feature settings clip transforms are atomic and lane aware",
+    "[timing][colourise][settings-clip]") {
+    using invisible_places::timing::TimingColouriseSettingsKeySpan;
+
+    SECTION("a coincident point bundle translates without stretching") {
+        TimingColouriseEffect effect;
+        effect.colouriseEnabled = true;
+        effect.emissiveEnabled = true;
+        effect.effectParameterKeys = {
+            {.parameter = TimingColouriseEffectParameter::PalettePhase,
+             .position = 0.4F,
+             .value = 0.2F},
+            {.parameter = TimingColouriseEffectParameter::EmissiveLevel,
+             .position = 0.4F,
+             .value = 2.0F},
+        };
+        const auto span = invisible_places::timing::
+            TimingColouriseEffectSettingsKeySpan(effect);
+        REQUIRE(span.has_value());
+        CHECK(span->start == Approx(0.4F));
+        CHECK(span->end == Approx(0.4F));
+        REQUIRE(invisible_places::timing::
+                    TransformTimingColouriseEffectSettingsKeys(
+                        &effect,
+                        *span,
+                        {.start = 0.7F, .end = 0.7F}));
+        REQUIRE(effect.effectParameterKeys.size() == 2U);
+        CHECK(effect.effectParameterKeys[0U].position == Approx(0.7F));
+        CHECK(effect.effectParameterKeys[1U].position == Approx(0.7F));
+        CHECK_FALSE(invisible_places::timing::
+                        TransformTimingColouriseEffectSettingsKeys(
+                            &effect,
+                            {.start = 0.7F, .end = 0.7F},
+                            {.start = 0.7F, .end = 0.70005F}));
+        CHECK_FALSE(invisible_places::timing::
+                        TransformTimingColouriseEffectSettingsKeys(
+                            &effect,
+                            {.start = 0.7F, .end = 0.7F},
+                            {.start = 0.6F, .end = 0.8F}));
+    }
+
+    SECTION("same-lane collapse rejects the whole candidate") {
+        TimingColouriseEffect effect;
+        effect.activationRange = {.start = 0.15F, .end = 0.85F};
+        effect.effectParameterKeys = {
+            {.parameter = TimingColouriseEffectParameter::PalettePhase,
+             .position = 0.2F,
+             .value = 0.1F},
+            {.parameter = TimingColouriseEffectParameter::PalettePhase,
+             .position = 0.5F,
+             .value = 0.2F},
+            {.parameter = TimingColouriseEffectParameter::PalettePhase,
+             .position = 0.8F,
+             .value = 0.3F},
+        };
+        const auto before = effect;
+        CHECK_FALSE(invisible_places::timing::
+                        TransformTimingColouriseEffectSettingsKeys(
+                            &effect,
+                            {.start = 0.2F, .end = 0.8F},
+                            {.start = 0.5F, .end = 0.50015F}));
+        REQUIRE(effect.effectParameterKeys.size() ==
+                before.effectParameterKeys.size());
+        for (std::size_t index = 0U;
+             index < effect.effectParameterKeys.size();
+             ++index) {
+            CHECK(effect.effectParameterKeys[index].position ==
+                  Approx(before.effectParameterKeys[index].position));
+            CHECK(effect.effectParameterKeys[index].value ==
+                  Approx(before.effectParameterKeys[index].value));
+        }
+        CHECK(effect.activationRange.start ==
+              Approx(before.activationRange.start));
+        CHECK(effect.activationRange.end ==
+              Approx(before.activationRange.end));
+    }
+
+    SECTION("different lanes may share a tightly compressed time") {
+        TimingColouriseEffect effect;
+        effect.colouriseEnabled = true;
+        effect.emissiveEnabled = true;
+        effect.effectParameterKeys = {
+            {.parameter = TimingColouriseEffectParameter::PalettePhase,
+             .position = 0.2F,
+             .value = 0.1F},
+            {.parameter = TimingColouriseEffectParameter::EmissiveLevel,
+             .position = 0.8F,
+             .value = 2.0F},
+        };
+        REQUIRE(invisible_places::timing::
+                    TransformTimingColouriseEffectSettingsKeys(
+                        &effect,
+                        {.start = 0.2F, .end = 0.8F},
+                        {.start = 0.5F, .end = 0.50005F}));
+        REQUIRE(effect.effectParameterKeys.size() == 2U);
+        CHECK(effect.effectParameterKeys[0U].position == Approx(0.5F));
+        CHECK(effect.effectParameterKeys[1U].position ==
+              Approx(0.50005F));
+    }
+
+    SECTION("a one-ULP cross-lane span remains stretchable") {
+        const float adjacent = std::nextafter(0.4F, 1.0F);
+        REQUIRE(adjacent > 0.4F);
+        TimingColouriseEffect effect;
+        effect.colouriseEnabled = true;
+        effect.emissiveEnabled = true;
+        effect.effectParameterKeys = {
+            {.parameter = TimingColouriseEffectParameter::PalettePhase,
+             .position = 0.4F,
+             .value = 0.1F},
+            {.parameter = TimingColouriseEffectParameter::EmissiveLevel,
+             .position = adjacent,
+             .value = 2.0F},
+        };
+        const auto span = invisible_places::timing::
+            TimingColouriseEffectSettingsKeySpan(effect);
+        REQUIRE(span.has_value());
+        CHECK(span->start == Approx(0.4F));
+        CHECK(span->end == adjacent);
+        REQUIRE(invisible_places::timing::
+                    TransformTimingColouriseEffectSettingsKeys(
+                        &effect,
+                        *span,
+                        {.start = 0.2F, .end = 0.8F}));
+        REQUIRE(effect.effectParameterKeys.size() == 2U);
+        CHECK(effect.effectParameterKeys[0U].position == Approx(0.2F));
+        CHECK(effect.effectParameterKeys[1U].position == Approx(0.8F));
+    }
+
+    SECTION("invalid and incomplete ranges leave state untouched") {
+        TimingColouriseEffect empty;
+        CHECK(invisible_places::timing::
+                  TimingColouriseEffectSettingsKeyPositions(empty)
+                      .empty());
+        CHECK_FALSE(invisible_places::timing::
+                        TimingColouriseEffectSettingsKeySpan(empty)
+                            .has_value());
+        CHECK_FALSE(invisible_places::timing::
+                        TransformTimingColouriseEffectSettingsKeys(
+                            &empty,
+                            TimingColouriseSettingsKeySpan{
+                                .start = 0.0F,
+                                .end = 1.0F},
+                            TimingColouriseSettingsKeySpan{
+                                .start = 0.2F,
+                                .end = 0.8F}));
+
+        TimingColouriseEffect effect;
+        effect.paletteKeys = {
+            {.position = 0.1F, .palette = Solid({0.0F, 0.0F, 0.0F})},
+            {.position = 0.9F, .palette = Solid({1.0F, 1.0F, 1.0F})},
+        };
+        const auto before = effect.paletteKeys;
+        CHECK_FALSE(invisible_places::timing::
+                        TransformTimingColouriseEffectSettingsKeys(
+                            &effect,
+                            {.start = 0.2F, .end = 0.9F},
+                            {.start = 0.0F, .end = 0.7F}));
+        CHECK_FALSE(invisible_places::timing::
+                        TransformTimingColouriseEffectSettingsKeys(
+                            &effect,
+                            {.start = 0.1F, .end = 0.9F},
+                            {.start = -0.2F, .end = 0.7F}));
+        REQUIRE(effect.paletteKeys.size() == before.size());
+        CHECK(effect.paletteKeys.front().position ==
+              Approx(before.front().position));
+        CHECK(effect.paletteKeys.back().position ==
+              Approx(before.back().position));
+    }
+}
+
+TEST_CASE(
     "Visual Feature aspects gate parameters and keep emissive scalar-only",
     "[timing][colourise][emissive][effect-parameters]") {
     using invisible_places::timing::TimingColouriseFieldSource;

@@ -3560,6 +3560,337 @@ TimingTakeSceneState SanitizeTimingTakeSceneState(
     return state;
 }
 
+namespace {
+
+bool IsCurrentTimingColouriseFieldMemory(
+    const TimingColouriseEffect& effect,
+    const TimingColouriseFieldBoundsMemory& memory) {
+    return memory.selector == effect.field;
+}
+
+template <typename Key>
+void AppendTimingColouriseSettingsKeyPositions(
+    std::vector<float>* positions,
+    const std::vector<Key>& keys) {
+    for (const auto& key : keys) {
+        if (!std::isfinite(key.position)) {
+            continue;
+        }
+        positions->push_back(Clamp01(key.position));
+    }
+}
+
+template <typename Key>
+void ExtendTimingColouriseSettingsKeySpan(
+    std::optional<TimingColouriseSettingsKeySpan>* span,
+    const std::vector<Key>& keys) {
+    for (const auto& key : keys) {
+        if (!std::isfinite(key.position)) {
+            continue;
+        }
+        const float position = Clamp01(key.position);
+        if (!span->has_value()) {
+            *span = TimingColouriseSettingsKeySpan{
+                .start = position,
+                .end = position,
+            };
+        } else {
+            (*span)->start = std::min((*span)->start, position);
+            (*span)->end = std::max((*span)->end, position);
+        }
+    }
+}
+
+template <typename Key, typename SameLane>
+bool TimingColouriseKeysHaveNoLaneCollisions(
+    const std::vector<Key>& keys,
+    SameLane sameLane) {
+    for (std::size_t left = 0U; left < keys.size(); ++left) {
+        for (std::size_t right = left + 1U;
+             right < keys.size();
+             ++right) {
+            if (sameLane(keys[left], keys[right]) &&
+                std::abs(
+                    keys[left].position - keys[right].position) <=
+                    kTimingColouriseKeyTolerance) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool TimingColouriseEffectSettingsKeysHaveNoLaneCollisions(
+    const TimingColouriseEffect& effect) {
+    const auto sameSingleLane = [](const auto&, const auto&) {
+        return true;
+    };
+    if (!TimingColouriseKeysHaveNoLaneCollisions(
+            effect.paletteKeys,
+            sameSingleLane) ||
+        !TimingColouriseKeysHaveNoLaneCollisions(
+            effect.paletteStopParameterKeys,
+            [](const auto& left, const auto& right) {
+                return left.stopId == right.stopId &&
+                       left.parameter == right.parameter;
+            }) ||
+        !TimingColouriseKeysHaveNoLaneCollisions(
+            effect.effectParameterKeys,
+            [](const auto& left, const auto& right) {
+                return left.parameter == right.parameter;
+            }) ||
+        !TimingColouriseKeysHaveNoLaneCollisions(
+            effect.boundsKeys,
+            sameSingleLane) ||
+        !TimingColouriseKeysHaveNoLaneCollisions(
+            effect.boundsParameterKeys,
+            [](const auto& left, const auto& right) {
+                return left.parameter == right.parameter;
+            })) {
+        return false;
+    }
+    for (const auto& memory : effect.fieldBoundsMemory) {
+        if (IsCurrentTimingColouriseFieldMemory(effect, memory)) {
+            continue;
+        }
+        if (!TimingColouriseKeysHaveNoLaneCollisions(
+                memory.boundsKeys,
+                sameSingleLane) ||
+            !TimingColouriseKeysHaveNoLaneCollisions(
+                memory.boundsParameterKeys,
+                [](const auto& left, const auto& right) {
+                    return left.parameter == right.parameter;
+                })) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void SynchronizeCurrentTimingColouriseFieldMemory(
+    TimingColouriseEffect* effect) {
+    const auto current = std::find_if(
+        effect->fieldBoundsMemory.begin(),
+        effect->fieldBoundsMemory.end(),
+        [&](const TimingColouriseFieldBoundsMemory& memory) {
+            return IsCurrentTimingColouriseFieldMemory(*effect, memory);
+        });
+    if (current == effect->fieldBoundsMemory.end()) {
+        return;
+    }
+    current->bounds = effect->baseBounds;
+    current->boundsKeyMode = effect->boundsKeyMode;
+    current->boundsParameterKeys = effect->boundsParameterKeys;
+    current->boundsKeys = effect->boundsKeys;
+    current->edited = effect->boundsEdited;
+    current->adoptedGlobalRevision =
+        effect->boundsAdoptedGlobalRevision;
+}
+
+void SortTimingColouriseEffectSettingsKeys(
+    TimingColouriseEffect* effect) {
+    SortAndCoalesceKeys(&effect->paletteKeys);
+    SortAndCoalescePaletteStopParameterKeys(
+        &effect->paletteStopParameterKeys);
+    SortAndCoalesceEffectParameterKeys(
+        &effect->effectParameterKeys);
+    SortAndCoalesceKeys(&effect->boundsKeys);
+    SortAndCoalesceBoundsParameterKeys(
+        &effect->boundsParameterKeys);
+    for (auto& memory : effect->fieldBoundsMemory) {
+        SortAndCoalesceKeys(&memory.boundsKeys);
+        SortAndCoalesceBoundsParameterKeys(
+            &memory.boundsParameterKeys);
+    }
+}
+
+}  // namespace
+
+std::vector<float> TimingColouriseEffectSettingsKeyPositions(
+    const TimingColouriseEffect& effect) {
+    std::vector<float> positions;
+    positions.reserve(
+        effect.effectParameterKeys.size() +
+        effect.paletteKeys.size() +
+        effect.paletteStopParameterKeys.size() +
+        effect.boundsParameterKeys.size() +
+        effect.boundsKeys.size());
+    AppendTimingColouriseSettingsKeyPositions(
+        &positions,
+        effect.effectParameterKeys);
+    AppendTimingColouriseSettingsKeyPositions(
+        &positions,
+        effect.paletteKeys);
+    AppendTimingColouriseSettingsKeyPositions(
+        &positions,
+        effect.paletteStopParameterKeys);
+    AppendTimingColouriseSettingsKeyPositions(
+        &positions,
+        effect.boundsParameterKeys);
+    AppendTimingColouriseSettingsKeyPositions(
+        &positions,
+        effect.boundsKeys);
+    for (const auto& memory : effect.fieldBoundsMemory) {
+        // The live vectors above are authoritative for the selected field.
+        // Its remembered entry is only the snapshot from the last switch and
+        // may legitimately lag until the next Stash call.
+        if (IsCurrentTimingColouriseFieldMemory(effect, memory)) {
+            continue;
+        }
+        AppendTimingColouriseSettingsKeyPositions(
+            &positions,
+            memory.boundsParameterKeys);
+        AppendTimingColouriseSettingsKeyPositions(
+            &positions,
+            memory.boundsKeys);
+    }
+    std::stable_sort(positions.begin(), positions.end());
+    positions.erase(
+        std::unique(
+            positions.begin(),
+            positions.end(),
+            [](float left, float right) {
+                return std::abs(left - right) <=
+                       kTimingColouriseKeyTolerance;
+            }),
+        positions.end());
+    return positions;
+}
+
+std::optional<TimingColouriseSettingsKeySpan>
+TimingColouriseEffectSettingsKeySpan(
+    const TimingColouriseEffect& effect) {
+    std::optional<TimingColouriseSettingsKeySpan> span;
+    ExtendTimingColouriseSettingsKeySpan(
+        &span,
+        effect.effectParameterKeys);
+    ExtendTimingColouriseSettingsKeySpan(&span, effect.paletteKeys);
+    ExtendTimingColouriseSettingsKeySpan(
+        &span,
+        effect.paletteStopParameterKeys);
+    ExtendTimingColouriseSettingsKeySpan(
+        &span,
+        effect.boundsParameterKeys);
+    ExtendTimingColouriseSettingsKeySpan(&span, effect.boundsKeys);
+    for (const auto& memory : effect.fieldBoundsMemory) {
+        if (IsCurrentTimingColouriseFieldMemory(effect, memory)) {
+            continue;
+        }
+        ExtendTimingColouriseSettingsKeySpan(
+            &span,
+            memory.boundsParameterKeys);
+        ExtendTimingColouriseSettingsKeySpan(
+            &span,
+            memory.boundsKeys);
+    }
+    return span;
+}
+
+bool TransformTimingColouriseEffectSettingsKeys(
+    TimingColouriseEffect* effect,
+    TimingColouriseSettingsKeySpan source,
+    TimingColouriseSettingsKeySpan destination) {
+    if (effect == nullptr || !std::isfinite(source.start) ||
+        !std::isfinite(source.end) ||
+        !std::isfinite(destination.start) ||
+        !std::isfinite(destination.end) ||
+        source.start < -kTimingColouriseKeyTolerance ||
+        source.end > 1.0F + kTimingColouriseKeyTolerance ||
+        source.end < source.start ||
+        destination.start < -kTimingColouriseKeyTolerance ||
+        destination.end > 1.0F + kTimingColouriseKeyTolerance ||
+        destination.end < destination.start) {
+        return false;
+    }
+    source.start = Clamp01(source.start);
+    source.end = Clamp01(source.end);
+    destination.start = Clamp01(destination.start);
+    destination.end = Clamp01(destination.end);
+
+    const float sourceLength = source.end - source.start;
+    const float destinationLength = destination.end - destination.start;
+    const bool pointSource = source.start == source.end;
+    if (pointSource && destination.start != destination.end) {
+        // One key time has no internal timing that can be stretched.
+        return false;
+    }
+    if (!pointSource && destination.start == destination.end) {
+        return false;
+    }
+
+    TimingColouriseEffect candidate = *effect;
+    bool foundKey = false;
+    const auto mapKeys = [&](auto* keys) {
+        for (auto& key : *keys) {
+            foundKey = true;
+            if (!std::isfinite(key.position) ||
+                key.position <
+                    source.start - kTimingColouriseKeyTolerance ||
+                key.position >
+                    source.end + kTimingColouriseKeyTolerance) {
+                return false;
+            }
+            const double remapped = pointSource
+                ? static_cast<double>(key.position) +
+                      static_cast<double>(destination.start - source.start)
+                : static_cast<double>(destination.start) +
+                      (static_cast<double>(key.position) -
+                       static_cast<double>(source.start)) /
+                          static_cast<double>(sourceLength) *
+                          static_cast<double>(destinationLength);
+            if (!std::isfinite(remapped) ||
+                remapped <
+                    -static_cast<double>(kTimingColouriseKeyTolerance) ||
+                remapped >
+                    1.0 +
+                        static_cast<double>(
+                            kTimingColouriseKeyTolerance) ||
+                remapped <
+                    static_cast<double>(destination.start) -
+                        static_cast<double>(
+                            kTimingColouriseKeyTolerance) ||
+                remapped >
+                    static_cast<double>(destination.end) +
+                        static_cast<double>(
+                            kTimingColouriseKeyTolerance)) {
+                return false;
+            }
+            key.position = Clamp01(static_cast<float>(remapped));
+        }
+        return true;
+    };
+
+    if (!mapKeys(&candidate.effectParameterKeys) ||
+        !mapKeys(&candidate.paletteKeys) ||
+        !mapKeys(&candidate.paletteStopParameterKeys) ||
+        !mapKeys(&candidate.boundsParameterKeys) ||
+        !mapKeys(&candidate.boundsKeys)) {
+        return false;
+    }
+    for (auto& memory : candidate.fieldBoundsMemory) {
+        if (IsCurrentTimingColouriseFieldMemory(candidate, memory)) {
+            continue;
+        }
+        if (!mapKeys(&memory.boundsParameterKeys) ||
+            !mapKeys(&memory.boundsKeys)) {
+            return false;
+        }
+    }
+    if (!foundKey ||
+        !TimingColouriseEffectSettingsKeysHaveNoLaneCollisions(
+            candidate)) {
+        return false;
+    }
+
+    // Bring an existing selected-field cache forward from the transformed
+    // live tracks. Do not manufacture a cache for effects that never needed
+    // one merely because their clip moved.
+    SynchronizeCurrentTimingColouriseFieldMemory(&candidate);
+    SortTimingColouriseEffectSettingsKeys(&candidate);
+    *effect = std::move(candidate);
+    return true;
+}
+
 bool RetimeTimingTakeSceneStateNormalizedPositions(
     TimingTakeSceneState* state,
     std::uint32_t sourceDurationFrames,

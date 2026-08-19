@@ -201,6 +201,14 @@ struct TimingColouriseActivationRange {
     float end = 1.0F;
 };
 
+// Exact first/last animation-time coordinates owned by one Visual Feature's
+// setting keys. This is derived authoring state, independent of the feature's
+// activation window, and is therefore never serialized.
+struct TimingColouriseSettingsKeySpan {
+    float start = 0.0F;
+    float end = 0.0F;
+};
+
 // Remembered bounds authoring for one scalar field selector, so switching a
 // Visual Feature between families/variants and back never loses edits. An
 // unedited entry keeps following the latest globally edited bounds for its
@@ -689,6 +697,28 @@ SanitizeTimingColouriseActivationRange(
     const TimingColouriseEffect& effect,
     float normalizedPosition,
     bool cyclic = false);
+// Derives one feature-wide settings clip from every authoritative animation
+// key, including keys for disabled aspects and remembered non-current field
+// bounds. A remembered entry matching effect.field is a cache of the live
+// bounds tracks and is deliberately not counted twice. The positions helper
+// returns a sorted, tolerance-deduplicated union for clip ticks; the span is
+// nullopt when the feature owns no setting keys.
+[[nodiscard]] std::vector<float>
+TimingColouriseEffectSettingsKeyPositions(
+    const TimingColouriseEffect& effect);
+[[nodiscard]] std::optional<TimingColouriseSettingsKeySpan>
+TimingColouriseEffectSettingsKeySpan(
+    const TimingColouriseEffect& effect);
+// Affinely maps every key represented by source onto destination without
+// changing the activation window, values, interpolation, or other settings.
+// Dormant aspect and non-current field-memory tracks move with the live keys.
+// A zero-width source may only translate to another zero-width destination.
+// Invalid bounds, a source that does not contain every owned key, or a
+// same-lane collision rejects the complete operation without mutation.
+[[nodiscard]] bool TransformTimingColouriseEffectSettingsKeys(
+    TimingColouriseEffect* effect,
+    TimingColouriseSettingsKeySpan source,
+    TimingColouriseSettingsKeySpan destination);
 [[nodiscard]] TimingColouriseEffect SanitizeTimingColouriseEffect(
     TimingColouriseEffect effect);
 [[nodiscard]] TimingColourisePaletteDefinition
