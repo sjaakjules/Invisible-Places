@@ -21,7 +21,6 @@
 
 namespace invisible_places::serialization {
 
-inline constexpr std::size_t kMaxSerializedWaterRippleRuntimeCacheMemberships = 250'000U;
 inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 80U;
 inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 31U;
 inline constexpr std::uint32_t kWaterRainProfilesSourcesSchemaVersion = 31U;
@@ -91,16 +90,6 @@ struct WaterTrailProfileDocument {
     std::string baseProfileName;
 };
 
-struct WaterRippleRuntimeCacheDocument {
-    std::uint32_t schemaVersion = 1;
-    std::filesystem::path supportLayerPath;
-    std::string supportSignature;
-    std::string regionFingerprint;
-    std::vector<invisible_places::water::WaterRippleRuntimeMembership> memberships;
-    std::vector<invisible_places::water::WaterRippleRuntimeParams> params;
-    bool stale = false;
-};
-
 struct WaterPathCacheManifestDocument {
     std::filesystem::path relativePath;
     std::uint32_t cacheSchema = kWaterPathCacheSidecarSchemaVersion;
@@ -126,11 +115,8 @@ struct WaterSceneStateDocument {
     std::vector<invisible_places::water::WaterEmitter> emitters;
     std::vector<invisible_places::water::WaterManualFlowPathSource> manualFlowPaths;
     std::vector<invisible_places::water::WaterSeepageNode> seepageNodes;
-    std::vector<invisible_places::water::WaterEffectLayer> rippleLayers;
-    std::vector<invisible_places::water::WaterEffectLayer> fieldLayers;
     std::optional<invisible_places::water::WaterPathCache> pathCache;
     std::optional<WaterPathCacheManifestDocument> pathCacheManifest;
-    std::vector<WaterRippleRuntimeCacheDocument> rippleRuntimeCaches;
     std::filesystem::path dynamicMeshPath;
     std::vector<invisible_places::water::WaterDynamicMeshAttractor> dynamicMeshAttractors;
     std::vector<invisible_places::water::WaterDynamicMeshEmitterMotion> dynamicMeshEmitterMotions;
@@ -280,7 +266,6 @@ struct ProjectDocument {
     std::uint32_t timingColourisePaletteSequence = 1U;
     std::uint32_t waterTimingRunSequence = 1U;
     std::optional<invisible_places::water::WaterScenarioDefinition> tempWaterScenario;
-    std::vector<invisible_places::water::WaterEffectLayer> waterRippleLayers;
     invisible_places::water::WaterSourceSettings waterSourceSettings{};
     std::optional<invisible_places::water::WaterSourceSettings> tempWaterSourceSettings;
     invisible_places::water::WaterAnimationTrailSettings waterAnimationTrailSettings{};
@@ -297,8 +282,6 @@ struct ProjectDocument {
     std::optional<invisible_places::water::WaterFlowTrailSettings> tempWaterLaneProfileSettings;
     std::optional<WaterTrailProfileDocument> tempWaterTrailProfile;
     std::optional<WaterTrailProfileDocument> tempWaterDynamicMeshTrailProfile;
-    invisible_places::water::WaterCausticLookSettings waterCausticLookSettings{};
-    std::optional<invisible_places::water::WaterCausticLookSettings> tempWaterCausticLookSettings;
     std::vector<ProjectLayerDocument::PointVisual> waterPointVisuals;
     std::string selectedWaterPointVisualName = "Water Flow_preset";
     invisible_places::renderer::pointcloud::PointCloudStyleState waterPointVisualStyle{};
@@ -311,8 +294,6 @@ struct ProjectDocument {
     invisible_places::water::WaterRenderSettings waterRenderSettings{};
     invisible_places::water::WaterFlowTrailSettings waterFlowTrailSettings{};
     bool waterShowFlowTrails = true;
-    invisible_places::water::WaterFieldSettings waterFieldSettings{};
-    invisible_places::water::WaterFieldTrailSettings waterFieldTrailSettings{};
     invisible_places::water::WaterDynamicMeshFlowSettings waterDynamicMeshFlowSettings{};
     invisible_places::water::RainRuntimeSettings waterRainSettings =
         invisible_places::water::DefaultRainRuntimeSettings();
@@ -320,10 +301,8 @@ struct ProjectDocument {
         invisible_places::water::RainVisualPreset("Rain Fine Lines");
     std::string activeWaterSceneGroupName;
     std::vector<WaterSceneStateDocument> waterSceneStates;
-    std::vector<invisible_places::water::WaterEffectLayer> waterFieldLayers;
     std::optional<invisible_places::water::WaterPathCache> waterPathCache;
     std::optional<WaterPathCacheManifestDocument> waterPathCacheManifest;
-    std::vector<WaterRippleRuntimeCacheDocument> waterRippleRuntimeCaches;
 };
 
 struct PointCloudStylePresetDocument {
@@ -355,12 +334,8 @@ struct WaterSourcesDocument {
     std::vector<invisible_places::water::WaterSeepageLookProfile> seepageLookProfiles;
     std::vector<invisible_places::water::WaterSeepageResponseProfile>
         seepageResponseProfiles;
-    std::vector<invisible_places::water::WaterEffectLayer> rippleLayers;
-    std::vector<invisible_places::water::WaterEffectLayer> fieldLayers;
     invisible_places::water::WaterSourceSettings sourceSettings{};
     std::optional<invisible_places::water::WaterSourceSettings> tempSourceSettings;
-    invisible_places::water::WaterCausticLookSettings causticLookSettings{};
-    std::optional<invisible_places::water::WaterCausticLookSettings> tempCausticLookSettings;
     invisible_places::water::WaterSettingsBundle settings{};
     std::optional<invisible_places::water::WaterSettingsBundle> tempSettings;
     std::vector<WaterPathProfileDocument> pathProfiles;
@@ -385,15 +360,12 @@ struct WaterSourcesDocument {
     invisible_places::water::WaterFlowTrailSettings flowTrailSettings{};
     bool showFlowTrails = true;
     invisible_places::water::WaterTrailGeometrySettings trailGeometry{};
-    invisible_places::water::WaterFieldSettings fieldSettings{};
-    invisible_places::water::WaterFieldTrailSettings fieldTrailSettings{};
     invisible_places::water::WaterDynamicMeshFlowSettings dynamicMeshFlowSettings{};
     invisible_places::water::RainRuntimeSettings rainSettings =
         invisible_places::water::DefaultRainRuntimeSettings();
     invisible_places::water::WaterRainVisualSettings rainVisualSettings =
         invisible_places::water::RainVisualPreset("Rain Fine Lines");
     std::optional<invisible_places::water::WaterPathCache> pathCache;
-    std::vector<WaterRippleRuntimeCacheDocument> rippleRuntimeCaches;
 };
 
 struct StagedDocumentReplacement {

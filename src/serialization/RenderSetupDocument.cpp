@@ -310,13 +310,11 @@ json RenderSetupToJson(const RenderSetupDocument& document) {
                                 ? CurrentUtcTimestamp()
                                 : document.createdUtc;
     json authoredWaterJson;
-    if (!document.authoredWater.pathCache.has_value() &&
-        document.authoredWater.rippleRuntimeCaches.empty()) {
+    if (!document.authoredWater.pathCache.has_value()) {
         authoredWaterJson = WaterSourcesDocumentToJson(document.authoredWater);
     } else {
         auto cacheFreeWater = document.authoredWater;
         cacheFreeWater.pathCache.reset();
-        cacheFreeWater.rippleRuntimeCaches.clear();
         authoredWaterJson = WaterSourcesDocumentToJson(cacheFreeWater);
     }
 
@@ -768,7 +766,6 @@ std::optional<RenderSetupDocument> LoadRenderSetupDocument(
             return std::nullopt;
         }
         authoredWater->pathCache.reset();
-        authoredWater->rippleRuntimeCaches.clear();
         auto animationTrailSettings = WaterAnimationTrailSettingsFromJson(
             snapshot.at("water_animation_trail_settings"),
             &nestedError);
