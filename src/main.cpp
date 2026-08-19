@@ -98,6 +98,16 @@ int main(int argc, char** argv) {
                 options.backgroundRenderWorker.emplace();
             }
             options.backgroundRenderWorker->throttleMilliseconds = throttle;
+        } else if (argument == "--background-render-monitor") {
+            if (index + 1 >= argc || argv[index + 1] == nullptr) {
+                std::cerr << "--background-render-monitor requires a status path.\n";
+                return 2;
+            }
+            options.backgroundRenderStatusMonitor =
+                invisible_places::app::
+                    BackgroundRenderStatusMonitorOptions{
+                        .statusPath = argv[++index],
+                    };
         } else if (!argument.starts_with("--") && dataRoot.empty()) {
             dataRoot = argument;
         } else {

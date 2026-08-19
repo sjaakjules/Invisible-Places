@@ -109,7 +109,9 @@
 #include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <pthread/qos.h>
+#include <signal.h>
 #include <spawn.h>
+#include <sys/file.h>
 #include <sys/resource.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -117,7 +119,9 @@
 #include <sys/sysctl.h>
 #elif defined(__linux__)
 #include <fcntl.h>
+#include <signal.h>
 #include <spawn.h>
+#include <sys/file.h>
 #include <sys/resource.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -2710,6 +2714,15 @@ struct PreviewLayerSession {
 struct BackgroundLayerLoadState {
     std::mutex mutex;
     std::optional<LayerLoadResult> result;
+    std::atomic_bool finished{false};
+};
+
+struct BackgroundLoadCompletionSignal {
+    std::atomic_bool& finished;
+
+    ~BackgroundLoadCompletionSignal() {
+        finished.store(true, std::memory_order_release);
+    }
 };
 
 struct DynamicMeshSurfaceCacheWarmupResult {
@@ -2783,6 +2796,7 @@ struct ScalarFieldLoadResult {
 struct BackgroundScalarFieldLoadState {
     std::mutex mutex;
     std::optional<ScalarFieldLoadResult> result;
+    std::atomic_bool finished{false};
 };
 
 struct PendingScalarFieldLoad {
@@ -3584,6 +3598,8 @@ struct PreviewRuntimeState {
     invisible_places::ui::SidePanelState sidePanel{};
     ProjectSettings projectSettings{};
     invisible_places::platform::WindowSize liveViewWindowSize{};
+    invisible_places::platform::WindowSize
+        liveFramebufferViewportSize{};
     std::optional<invisible_places::platform::WindowSize>
         pendingLiveViewWindowSize;
     ProjectPointVisualLibraryState pointVisualLibrary{};
@@ -3708,6 +3724,8 @@ void SynchronizeLiveViewWindow(
     runtimeState->pendingLiveViewWindowSize.reset();
     window->SetSize(preferredSize);
     runtimeState->liveViewWindowSize = window->Size();
+    runtimeState->liveFramebufferViewportSize =
+        window->FramebufferSize();
 }
 
 bool IsSceneGroupedPointCloud(const PreviewLayerSession& session);
@@ -12437,6 +12455,8 @@ void StartScalarFieldLoad(
                                    fieldName,
                                    sourceIndex,
                                    expectedPointCount](std::stop_token stopToken) {
+        const BackgroundLoadCompletionSignal completion{
+            backgroundState->finished};
 #ifdef __APPLE__
         // Field streams are opportunistic prefetch/backfill: run them at
         // utility QoS so they never compete with the render loop for
@@ -12781,6 +12801,8 @@ void BeginLayerLoad(
     auto backgroundState = std::make_shared<BackgroundLayerLoadState>();
     std::jthread backgroundThread{
         [backgroundState, layerKind, filePath, transformPath, scalarFieldFilter](std::stop_token stopToken) {
+            const BackgroundLoadCompletionSignal completion{
+                backgroundState->finished};
             if (stopToken.stop_requested()) {
                 return;
             }
@@ -27254,13 +27276,21 @@ void StopBackgroundWorkForShutdown(PreviewRuntimeState* runtimeState) {
     runtimeState->animationMatchingFrameGhostJob.shared.reset();
     runtimeState->animationMatchingFrameGhostJob.sourceCache.reset();
 
-    if (!runtimeState->pendingLoad.has_value()) {
-        return;
+    if (runtimeState->pendingScalarFieldLoad.has_value()) {
+        std::cout
+            << "Waiting for background scalar-field load to finish before shutdown..."
+            << std::endl;
+        runtimeState->pendingScalarFieldLoad->backgroundThread.request_stop();
+        runtimeState->pendingScalarFieldLoad.reset();
     }
 
-    std::cout << "Waiting for background layer load to finish before shutdown..." << std::endl;
-    runtimeState->pendingLoad->backgroundThread.request_stop();
-    runtimeState->pendingLoad.reset();
+    if (runtimeState->pendingLoad.has_value()) {
+        std::cout
+            << "Waiting for background layer load to finish before shutdown..."
+            << std::endl;
+        runtimeState->pendingLoad->backgroundThread.request_stop();
+        runtimeState->pendingLoad.reset();
+    }
 }
 
 const invisible_places::serialization::ScenePointCloudRoleSourceDocument*
@@ -32731,6 +32761,11 @@ std::filesystem::path BackgroundRenderStatusPath(
     return setupPath.parent_path() / "status.json";
 }
 
+std::filesystem::path BackgroundRenderCancellationRequestPath(
+    const std::filesystem::path& statusPath) {
+    return statusPath.parent_path() / "cancel.request.json";
+}
+
 std::filesystem::path LatestBackgroundRenderStatusPath(
     const PreviewRuntimeState& runtimeState) {
     const auto root = ProjectRenderSetupDirectory(runtimeState) /
@@ -32769,6 +32804,72 @@ std::filesystem::path LatestBackgroundRenderStatusPath(
 bool BackgroundRenderStatusTerminal(std::string_view state) {
     return state == "completed" || state == "failed" ||
            state == "cancelled";
+}
+
+void UpdateBackgroundRenderPackageStatus(
+    const std::filesystem::path& setupPath,
+    RenderSetupStatus status,
+    std::string_view failureMessage = {});
+
+bool BackgroundRenderProcessAlive(std::int64_t processId) {
+    if (processId <= 0) {
+        return false;
+    }
+#if defined(__APPLE__) || defined(__linux__)
+    if (::kill(static_cast<pid_t>(processId), 0) == 0) {
+        return true;
+    }
+    return errno == EPERM;
+#else
+    return true;
+#endif
+}
+
+bool BackgroundRenderStatusIsFresh(
+    const std::filesystem::path& statusPath,
+    std::chrono::seconds maximumAge = std::chrono::minutes{2}) {
+    std::error_code metadataError;
+    const auto modified =
+        std::filesystem::last_write_time(statusPath, metadataError);
+    if (metadataError) {
+        return false;
+    }
+    return std::filesystem::file_time_type::clock::now() - modified <=
+           maximumAge;
+}
+
+std::vector<std::filesystem::path>
+ActiveBackgroundRenderStatusPaths(
+    const PreviewRuntimeState& runtimeState) {
+    const auto root = ProjectRenderSetupDirectory(runtimeState) /
+                      "background_jobs";
+    std::vector<std::filesystem::path> paths;
+    std::error_code directoryError;
+    if (!std::filesystem::is_directory(root, directoryError)) {
+        return paths;
+    }
+    for (std::filesystem::directory_iterator it{root, directoryError}, end;
+         !directoryError && it != end;
+         it.increment(directoryError)) {
+        if (!it->is_directory()) {
+            continue;
+        }
+        const auto statusPath = it->path() / "status.json";
+        std::string readError;
+        const auto status = invisible_places::serialization::
+            LoadBackgroundRenderStatusDocument(
+                statusPath,
+                &readError);
+        if (status.has_value() &&
+            !BackgroundRenderStatusTerminal(status->state) &&
+            BackgroundRenderStatusIsFresh(statusPath) &&
+            (BackgroundRenderProcessAlive(status->processId) ||
+             status->processId <= 0)) {
+            paths.push_back(statusPath);
+        }
+    }
+    std::sort(paths.begin(), paths.end());
+    return paths;
 }
 
 void RefreshBackgroundRenderStatus(
@@ -32894,6 +32995,165 @@ bool SpawnDetachedBackgroundRenderWorker(
     if (errorMessage != nullptr) {
         *errorMessage =
             "Detached background rendering is not implemented on this platform.";
+    }
+    return false;
+#endif
+}
+
+bool SpawnDetachedBackgroundRenderStatusMonitor(
+    const std::filesystem::path& executablePath,
+    const std::filesystem::path& statusPath,
+    bool* launched,
+    std::string* errorMessage) {
+#if defined(__APPLE__) || defined(__linux__)
+    if (launched != nullptr) {
+        *launched = false;
+    }
+    if (executablePath.empty() || statusPath.empty()) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The executable or background status path is missing.";
+        }
+        return false;
+    }
+    const auto markerPath = statusPath.parent_path() / "monitor.json";
+    std::string markerError;
+    const auto marker = invisible_places::app::workspace::ReadJsonDocument(
+        markerPath,
+        &markerError);
+    if (marker.has_value() && marker->is_object()) {
+        const auto monitorProcessId = marker->value(
+            "process_id",
+            std::int64_t{0});
+        if (BackgroundRenderProcessAlive(monitorProcessId) &&
+            BackgroundRenderStatusIsFresh(
+                markerPath,
+                std::chrono::seconds{30})) {
+            if (errorMessage != nullptr) {
+                errorMessage->clear();
+            }
+            return true;
+        }
+    }
+    std::vector<std::string> arguments{
+        executablePath.string(),
+        "--background-render-monitor",
+        statusPath.string(),
+    };
+    std::vector<char*> argv;
+    argv.reserve(arguments.size() + 1U);
+    for (auto& argument : arguments) {
+        argv.push_back(argument.data());
+    }
+    argv.push_back(nullptr);
+
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "Could not initialize the attached monitor launch.";
+        }
+        return false;
+    }
+    const auto logPath = statusPath.parent_path() / "monitor.log";
+    const int addStdout = posix_spawn_file_actions_addopen(
+        &actions,
+        STDOUT_FILENO,
+        logPath.c_str(),
+        O_WRONLY | O_CREAT | O_APPEND,
+        0644);
+    const int addStderr = posix_spawn_file_actions_adddup2(
+        &actions,
+        STDOUT_FILENO,
+        STDERR_FILENO);
+    if (addStdout != 0 || addStderr != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "Could not attach the background monitor log.";
+        }
+        return false;
+    }
+
+    const auto lockPath = statusPath.parent_path() / "monitor.lock";
+    const int lockFile = ::open(
+        lockPath.c_str(),
+        O_RDWR | O_CREAT,
+        0644);
+    if (lockFile < 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "Could not claim the background monitor launch lock.";
+        }
+        return false;
+    }
+    if (::flock(lockFile, LOCK_EX | LOCK_NB) != 0) {
+        const int lockError = errno;
+        (void)::close(lockFile);
+        posix_spawn_file_actions_destroy(&actions);
+        if (lockError == EWOULDBLOCK || lockError == EAGAIN) {
+            if (errorMessage != nullptr) {
+                errorMessage->clear();
+            }
+            return true;
+        }
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "Could not claim the background monitor launch lock.";
+        }
+        return false;
+    }
+
+    pid_t pid = 0;
+    const int result = posix_spawn(
+        &pid,
+        executablePath.c_str(),
+        &actions,
+        nullptr,
+        argv.data(),
+        ::environ);
+    posix_spawn_file_actions_destroy(&actions);
+    // The child inherits this non-CLOEXEC descriptor and therefore owns the
+    // advisory lock for its entire lifetime. Closing the parent's copy after
+    // spawn makes duplicate prevention crash-safe without stale-lock cleanup.
+    (void)::close(lockFile);
+    if (result != 0) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "Could not launch the attached render monitor (error " +
+                std::to_string(result) + ").";
+        }
+        return false;
+    }
+    invisible_places::app::workspace::WriteJsonDocument(
+        nlohmann::json{
+            {"process_id", static_cast<std::int64_t>(pid)},
+            {"status_path", statusPath.string()},
+            {"started_utc",
+             invisible_places::serialization::CurrentUtcTimestamp()},
+        },
+        markerPath,
+        nullptr);
+    if (launched != nullptr) {
+        *launched = true;
+    }
+    std::thread{[pid]() {
+        int status = 0;
+        while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+        }
+    }}.detach();
+    if (errorMessage != nullptr) {
+        errorMessage->clear();
+    }
+    return true;
+#else
+    (void)executablePath;
+    (void)statusPath;
+    (void)launched;
+    if (errorMessage != nullptr) {
+        *errorMessage =
+            "Attached background monitors are not implemented on this platform.";
     }
     return false;
 #endif
@@ -36558,6 +36818,29 @@ ResolveCurrentRenderSetupSnapshot(
             runtimeState->projectSettings.proResAlphaPreviewEnabled;
         document.renderer.gaussianSplatFootprintBoost =
             runtimeState->projectSettings.gaussianSplatFootprintBoost;
+        document.renderer.setupViewportWidth =
+            static_cast<std::uint32_t>(
+                std::max(
+                    1,
+                    runtimeState->liveFramebufferViewportSize.width));
+        document.renderer.setupViewportHeight =
+            static_cast<std::uint32_t>(
+                std::max(
+                    1,
+                    runtimeState->liveFramebufferViewportSize.height));
+    }
+    if (document.renderer.setupViewportWidth == 0U ||
+        document.renderer.setupViewportHeight == 0U) {
+        document.renderer.setupViewportWidth =
+            static_cast<std::uint32_t>(
+                std::max(
+                    1,
+                    runtimeState->liveFramebufferViewportSize.width));
+        document.renderer.setupViewportHeight =
+            static_cast<std::uint32_t>(
+                std::max(
+                    1,
+                    runtimeState->liveFramebufferViewportSize.height));
     }
     document.renderer.densityPolicy = "finest_available";
     document.summary = {
@@ -36647,6 +36930,7 @@ bool QueueCurrentAnimationBackgroundRender(
     status.state = "queued";
     status.message = "Waiting for the detached render worker to start.";
     status.setupPath = setupPath;
+    status.cancellationSupported = true;
     status.totalFrames = static_cast<std::uint32_t>(
         invisible_places::output::AnimationRenderSequenceFrameCount(
             setup.animation,
@@ -36660,6 +36944,10 @@ bool QueueCurrentAnimationBackgroundRender(
                 status,
                 statusPath,
                 &saveError)) {
+        UpdateBackgroundRenderPackageStatus(
+            setupPath,
+            RenderSetupStatus::Failed,
+            saveError);
         runtimeState->errorMessage =
             "Could not create the background render status: " +
             saveError;
@@ -36685,6 +36973,10 @@ bool QueueCurrentAnimationBackgroundRender(
                 status,
                 statusPath,
                 nullptr);
+        UpdateBackgroundRenderPackageStatus(
+            setupPath,
+            RenderSetupStatus::Failed,
+            saveError);
         runtimeState->errorMessage = std::move(saveError);
         runtimeState->statusMessage.clear();
         return false;
@@ -40921,7 +41213,19 @@ void StartAnimationExportJob(
         }
     }
 
-    const auto setupSize = viewport != nullptr ? CurrentFramebufferViewportSize(*viewport) : ImVec2{1.0F, 1.0F};
+    const auto currentSetupSize = viewport != nullptr
+                                      ? CurrentFramebufferViewportSize(*viewport)
+                                      : ImVec2{1.0F, 1.0F};
+    const auto setupViewportWidth =
+        renderSnapshot.document.renderer.setupViewportWidth > 0U
+            ? renderSnapshot.document.renderer.setupViewportWidth
+            : static_cast<std::uint32_t>(
+                  std::max(1.0F, currentSetupSize.x));
+    const auto setupViewportHeight =
+        renderSnapshot.document.renderer.setupViewportHeight > 0U
+            ? renderSnapshot.document.renderer.setupViewportHeight
+            : static_cast<std::uint32_t>(
+                  std::max(1.0F, currentSetupSize.y));
     auto writerState = std::make_shared<AnimationExportWriterState>();
     const auto outputOptions =
         MakeAnimationExportOutputOptions(
@@ -40980,8 +41284,8 @@ void StartAnimationExportJob(
         .mp4SupersampleScale = outputOptions.mp4SupersampleScale,
         .spatialAntialiasing = outputOptions.spatialAntialiasing,
         .previewVideoWarning = outputOptions.previewVideoWarning,
-        .setupViewportWidth = static_cast<std::uint32_t>(std::max(1.0F, setupSize.x)),
-        .setupViewportHeight = static_cast<std::uint32_t>(std::max(1.0F, setupSize.y)),
+        .setupViewportWidth = setupViewportWidth,
+        .setupViewportHeight = setupViewportHeight,
         .previewDensity = exportUsesPreviewDensity,
         .exportFrustumMask = frustumMaskSummary.enabled,
         .exportFrustumMaskDrawPoints = frustumMaskSummary.effectiveDrawPoints,
@@ -41703,12 +42007,66 @@ void ApplyBackgroundWorkerProcessPriority() {
 #endif
 }
 
+bool SettleCancelledBackgroundRenderPreparation(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return true;
+    }
+    runtimeState->pendingCurrentRenderSnapshot.reset();
+    runtimeState->persistence.queuedLoads.clear();
+
+    bool settled = true;
+    if (runtimeState->pendingScalarFieldLoad.has_value()) {
+        auto& pending = runtimeState->pendingScalarFieldLoad.value();
+        pending.backgroundThread.request_stop();
+        const bool finished =
+            !pending.backgroundThread.joinable() ||
+            pending.backgroundState == nullptr ||
+            pending.backgroundState->finished.load(
+                std::memory_order_acquire);
+        if (finished) {
+            runtimeState->pendingScalarFieldLoad.reset();
+        } else {
+            settled = false;
+        }
+    }
+    if (runtimeState->pendingLoad.has_value()) {
+        auto& pending = runtimeState->pendingLoad.value();
+        pending.backgroundThread.request_stop();
+        const bool finished =
+            !pending.backgroundThread.joinable() ||
+            pending.backgroundState == nullptr ||
+            pending.backgroundState->finished.load(
+                std::memory_order_acquire);
+        if (finished) {
+            runtimeState->pendingLoad.reset();
+        } else {
+            settled = false;
+        }
+    }
+    return settled;
+}
+
+void UpdateBackgroundRenderPackageStatus(
+    const std::filesystem::path& setupPath,
+    RenderSetupStatus status,
+    std::string_view failureMessage) {
+    std::string ignoredError;
+    invisible_places::serialization::UpdateRenderSetupDocumentStatus(
+        setupPath,
+        status,
+        {},
+        failureMessage,
+        &ignoredError);
+}
+
 void WriteBackgroundWorkerStatus(
     const std::filesystem::path& statusPath,
     std::string state,
     std::string message,
     const std::filesystem::path& setupPath,
-    const OfflineRenderJobState* job = nullptr) {
+    const OfflineRenderJobState* job = nullptr,
+    std::uint32_t expectedTotalFrames = 0U) {
     if (statusPath.empty()) {
         return;
     }
@@ -41717,6 +42075,7 @@ void WriteBackgroundWorkerStatus(
     status.message = std::move(message);
     status.setupPath = setupPath;
     status.processId = CurrentProcessId();
+    status.cancellationSupported = true;
     status.updatedUtc =
         invisible_places::serialization::CurrentUtcTimestamp();
     if (job != nullptr) {
@@ -41728,12 +42087,610 @@ void WriteBackgroundWorkerStatus(
         status.totalFrames =
             static_cast<std::uint32_t>(job->frames.size());
         status.progress = ExportRenderProgressFraction(*job);
+    } else {
+        status.totalFrames = expectedTotalFrames;
     }
     std::string ignoredError;
     invisible_places::serialization::SaveBackgroundRenderStatusDocument(
         status,
         statusPath,
         &ignoredError);
+}
+
+std::string BackgroundRenderWorkerPhase(
+    const PreviewRuntimeState& runtimeState,
+    bool exportStarted,
+    bool cancellationRequested) {
+    if (cancellationRequested) {
+        return "Cancelling";
+    }
+    const auto& job = runtimeState.offlineRenderJob;
+    if (!job.active) {
+        return exportStarted ? "Finishing output" : "Preparing full-density scene";
+    }
+    if (job.preparingExport) {
+        return "Preparing export samples";
+    }
+    if (job.currentFrame >= job.frames.size() ||
+        job.writerFinishRequested) {
+        return "Finishing output";
+    }
+    return "Rendering";
+}
+
+bool DrawBackgroundRenderWorkerMonitor(
+    const invisible_places::serialization::RenderSetupDocument* setup,
+    PreviewRuntimeState* runtimeState,
+    std::string_view phase,
+    std::string_view fallbackMessage,
+    std::chrono::steady_clock::time_point startedAt,
+    bool cancellationRequested,
+    std::uint32_t expectedTotalFrames) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+
+    auto& job = runtimeState->offlineRenderJob;
+    if (job.active) {
+        RefreshAnimationExportWriterProgress(&job);
+    }
+
+    const auto& io = ImGui::GetIO();
+    const auto* mainViewport = ImGui::GetMainViewport();
+    const ImVec2 viewportPosition = mainViewport != nullptr
+                                        ? mainViewport->Pos
+                                        : ImVec2{0.0F, 0.0F};
+    const ImVec2 viewportSize = mainViewport != nullptr
+                                    ? mainViewport->Size
+                                    : io.DisplaySize;
+    if (mainViewport != nullptr) {
+        ImGui::SetNextWindowViewport(mainViewport->ID);
+    }
+    ImGui::SetNextWindowPos(viewportPosition, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(viewportSize, ImGuiCond_Always);
+    constexpr ImGuiWindowFlags flags =
+        ImGuiWindowFlags_NoDecoration |
+        ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoNav |
+        ImGuiWindowFlags_NoFocusOnAppearing;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2{18.0F, 16.0F});
+    ImGui::Begin("BackgroundRenderWorkerMonitor", nullptr, flags);
+
+    const std::string animationName =
+        job.active && !job.animationName.empty()
+            ? job.animationName
+            : setup != nullptr && !setup->animation.name.empty()
+                  ? setup->animation.name
+                  : std::string{"Background render"};
+    ImGui::TextUnformatted(animationName.c_str());
+    if (setup != nullptr && !setup->exportPreset.name.empty()) {
+        ImGui::TextDisabled("%s", setup->exportPreset.name.c_str());
+    }
+    ImGui::Separator();
+    ImGui::TextUnformatted(phase.data(), phase.data() + phase.size());
+
+    std::string detailMessage;
+    if (cancellationRequested) {
+        detailMessage = job.active
+                            ? "Stopping GPU capture and closing the output writer safely."
+                            : "Cancelling before the render starts. A source load may need to settle first.";
+    } else if (!runtimeState->errorMessage.empty()) {
+        detailMessage = runtimeState->errorMessage;
+    } else if (!runtimeState->statusMessage.empty()) {
+        detailMessage = runtimeState->statusMessage;
+    } else {
+        detailMessage.assign(fallbackMessage);
+    }
+    if (!detailMessage.empty()) {
+        ImGui::TextWrapped("%s", detailMessage.c_str());
+    }
+
+    float progress = 0.0F;
+    std::uint32_t capturedFrames = 0U;
+    std::uint32_t totalFrames = expectedTotalFrames;
+    std::string progressOverlay = "Preparing";
+    bool preparingSamples = false;
+    if (job.active) {
+        totalFrames = static_cast<std::uint32_t>(job.frames.size());
+        capturedFrames = std::min<std::uint32_t>(
+            job.currentFrame,
+            totalFrames);
+        preparingSamples =
+            job.preparingExport && job.preparationState != nullptr;
+        if (preparingSamples) {
+            std::size_t completedRequests = 0U;
+            std::size_t totalRequests = 0U;
+            {
+                std::scoped_lock lock(job.preparationState->mutex);
+                completedRequests =
+                    job.preparationState->completedRequests;
+                totalRequests = job.preparationState->totalRequests;
+            }
+            progress = totalRequests == 0U
+                           ? 0.0F
+                           : static_cast<float>(completedRequests) /
+                                 static_cast<float>(totalRequests);
+            progressOverlay =
+                "Preparing " + std::to_string(completedRequests) +
+                " / " + std::to_string(totalRequests);
+        } else {
+            progress = ExportRenderProgressFraction(job);
+            std::ostringstream overlay;
+            overlay << capturedFrames << " / " << totalFrames
+                    << " frames  " << std::fixed << std::setprecision(1)
+                    << (progress * 100.0F) << '%';
+            progressOverlay = overlay.str();
+        }
+    } else if (totalFrames > 0U) {
+        progressOverlay = "Preparing 0 / " +
+                          std::to_string(totalFrames) + " frames";
+    }
+    ImGui::ProgressBar(
+        std::clamp(progress, 0.0F, 1.0F),
+        ImVec2{-FLT_MIN, 22.0F},
+        progressOverlay.c_str());
+
+    if (job.active && !preparingSamples) {
+        ImGui::Text(
+            "Captured %u / %u    Saved %u    Queued %zu",
+            capturedFrames,
+            totalFrames,
+            std::min<std::uint32_t>(job.writtenFrameCount, totalFrames),
+            job.pendingFrameCount);
+    }
+
+    const auto elapsed = std::chrono::steady_clock::now() - startedAt;
+    ImGui::Text("Elapsed: %s", FormatAdaptiveDuration(elapsed).c_str());
+    ImGui::SameLine(190.0F);
+    const bool capturingFrames =
+        job.active && !preparingSamples && !cancellationRequested &&
+        job.currentFrame < job.frames.size() &&
+        !job.writerFinishRequested;
+    if (capturingFrames) {
+        const auto remaining = RemainingExportRenderDuration(job);
+        if (remaining.has_value()) {
+            ImGui::Text(
+                "ETA: %s  (~%s)",
+                FormatAdaptiveDuration(remaining.value()).c_str(),
+                FormatEtaClock(remaining.value()).c_str());
+        } else {
+            ImGui::TextDisabled("ETA: calculating...");
+        }
+    } else if (job.active && !preparingSamples &&
+               !cancellationRequested) {
+        ImGui::TextDisabled("Finalizing output...");
+    } else {
+        ImGui::TextDisabled("ETA: waiting for rendered frames...");
+    }
+
+    std::filesystem::path outputPath;
+    if (job.active) {
+        outputPath = OfflineRenderSetupOutputPath(job);
+    } else if (setup != nullptr) {
+        outputPath = setup->exportPreset.settings.outputDirectory;
+    }
+    if (!outputPath.empty()) {
+        const auto outputLabel = outputPath.filename().empty()
+                                     ? outputPath.string()
+                                     : outputPath.filename().string();
+        ImGui::Text("Output: %s", outputLabel.c_str());
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip("%s", outputPath.string().c_str());
+        }
+    }
+
+    ImGui::Separator();
+    ImGui::BeginDisabled(cancellationRequested);
+    const bool cancelClicked = ImGui::Button(
+        cancellationRequested ? "Cancelling..." : "Cancel Render",
+        ImVec2{128.0F, 0.0F});
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::TextDisabled(
+        "Worker PID %lld",
+        static_cast<long long>(CurrentProcessId()));
+    ImGui::TextDisabled(
+        "Close this monitor to hide it; rendering continues.");
+
+    ImGui::End();
+    ImGui::PopStyleVar();
+    return cancelClicked;
+}
+
+bool DrawAttachedBackgroundRenderStatusMonitor(
+    const invisible_places::serialization::
+        BackgroundRenderStatusDocument* status,
+    const invisible_places::serialization::RenderSetupDocument* setup,
+    std::string_view readError,
+    bool cancellationRequestSent,
+    bool rendererConnected,
+    std::chrono::steady_clock::duration observedElapsed,
+    std::optional<std::chrono::steady_clock::duration>
+        observedRemaining) {
+    const auto& io = ImGui::GetIO();
+    const auto* mainViewport = ImGui::GetMainViewport();
+    const ImVec2 viewportPosition = mainViewport != nullptr
+                                        ? mainViewport->Pos
+                                        : ImVec2{0.0F, 0.0F};
+    const ImVec2 viewportSize = mainViewport != nullptr
+                                    ? mainViewport->Size
+                                    : io.DisplaySize;
+    if (mainViewport != nullptr) {
+        ImGui::SetNextWindowViewport(mainViewport->ID);
+    }
+    ImGui::SetNextWindowPos(viewportPosition, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(viewportSize, ImGuiCond_Always);
+    constexpr ImGuiWindowFlags flags =
+        ImGuiWindowFlags_NoDecoration |
+        ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoNav |
+        ImGuiWindowFlags_NoFocusOnAppearing;
+    ImGui::PushStyleVar(
+        ImGuiStyleVar_WindowPadding,
+        ImVec2{18.0F, 16.0F});
+    ImGui::Begin("AttachedBackgroundRenderStatusMonitor", nullptr, flags);
+
+    const std::string animationName =
+        setup != nullptr && !setup->animation.name.empty()
+            ? setup->animation.name
+            : std::string{"Background render"};
+    ImGui::TextUnformatted(animationName.c_str());
+    if (setup != nullptr && !setup->exportPreset.name.empty()) {
+        ImGui::TextDisabled("%s", setup->exportPreset.name.c_str());
+    }
+    ImGui::Separator();
+
+    if (status == nullptr) {
+        ImGui::TextUnformatted("Connecting to renderer");
+        ImGui::ProgressBar(
+            0.0F,
+            ImVec2{-FLT_MIN, 22.0F},
+            "Waiting for status");
+        if (!readError.empty()) {
+            ImGui::TextWrapped(
+                "Status unavailable: %.*s",
+                static_cast<int>(readError.size()),
+                readError.data());
+        }
+    } else {
+        ImGui::Text("%s", status->state.c_str());
+        std::ostringstream overlay;
+        if (status->totalFrames > 0U) {
+            overlay << status->renderedFrames << " / "
+                    << status->totalFrames << " frames  ";
+        }
+        overlay << std::fixed << std::setprecision(1)
+                << (std::clamp(status->progress, 0.0F, 1.0F) *
+                    100.0F)
+                << '%';
+        ImGui::ProgressBar(
+            std::clamp(status->progress, 0.0F, 1.0F),
+            ImVec2{-FLT_MIN, 22.0F},
+            overlay.str().c_str());
+        ImGui::Text(
+            "Monitoring: %s",
+            FormatAdaptiveDuration(observedElapsed).c_str());
+        ImGui::SameLine(210.0F);
+        const bool estimatingRender =
+            status->state == "rendering" && status->progress < 1.0F;
+        if (estimatingRender && observedRemaining.has_value()) {
+            ImGui::Text(
+                "Observed ETA: %s  (~%s)",
+                FormatAdaptiveDuration(observedRemaining.value()).c_str(),
+                FormatEtaClock(observedRemaining.value()).c_str());
+        } else if (estimatingRender) {
+            ImGui::TextDisabled("ETA: calculating...");
+        } else if (status->state == "finishing" ||
+                   (status->progress >= 1.0F &&
+                    !BackgroundRenderStatusTerminal(status->state))) {
+            ImGui::TextDisabled("Finalizing output...");
+        } else if (status->state == "cancelling") {
+            ImGui::TextDisabled("Cancelling safely...");
+        } else if (!BackgroundRenderStatusTerminal(status->state)) {
+            ImGui::TextDisabled("ETA: waiting for rendered frames...");
+        }
+        if (!status->message.empty()) {
+            ImGui::TextWrapped("%s", status->message.c_str());
+        }
+        if (!status->outputPath.empty()) {
+            const auto outputLabel = status->outputPath.filename().empty()
+                                         ? status->outputPath.string()
+                                         : status->outputPath.filename().string();
+            ImGui::Text("Output: %s", outputLabel.c_str());
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+                ImGui::SetTooltip(
+                    "%s",
+                    status->outputPath.string().c_str());
+            }
+        }
+        ImGui::TextDisabled(
+            "Updated %s",
+            status->updatedUtc.c_str());
+    }
+    if (status != nullptr && !readError.empty()) {
+        ImGui::TextWrapped(
+            "Status refresh warning: %.*s",
+            static_cast<int>(readError.size()),
+            readError.data());
+    }
+    if (status != nullptr && !rendererConnected &&
+        !BackgroundRenderStatusTerminal(status->state)) {
+        ImGui::TextWrapped(
+            "Renderer disconnected: the recorded worker process is no longer running.");
+    }
+
+    ImGui::Separator();
+    const bool cancellationAvailable =
+        rendererConnected && status != nullptr &&
+        status->cancellationSupported &&
+        !BackgroundRenderStatusTerminal(status->state);
+    ImGui::BeginDisabled(
+        !cancellationAvailable || cancellationRequestSent);
+    const bool cancelClicked = ImGui::Button(
+        cancellationRequestSent
+            ? "Cancelling..."
+            : cancellationAvailable ? "Cancel Render"
+                                    : "Cancel unavailable",
+        ImVec2{148.0F, 0.0F});
+    ImGui::EndDisabled();
+    if (status != nullptr) {
+        ImGui::SameLine();
+        ImGui::TextDisabled(
+            "Worker PID %lld",
+            static_cast<long long>(status->processId));
+    }
+    if (!rendererConnected && status != nullptr &&
+        !BackgroundRenderStatusTerminal(status->state)) {
+        ImGui::TextDisabled(
+            "Close this stale monitor; no live renderer can receive cancellation.");
+    } else {
+        ImGui::TextDisabled(
+            cancellationAvailable || cancellationRequestSent
+                ? "Close this attached monitor without stopping the render."
+                : "This renderer predates cooperative monitor cancellation; this attached window is read-only.");
+    }
+
+    ImGui::End();
+    ImGui::PopStyleVar();
+    return cancelClicked;
+}
+
+int RunBackgroundRenderStatusMonitor(
+    const BackgroundRenderStatusMonitorOptions& options) {
+    if (options.statusPath.empty()) {
+        std::cerr << "Background render monitor requires a status path.\n";
+        return 2;
+    }
+
+    invisible_places::app::workspace::WriteJsonDocument(
+        nlohmann::json{
+            {"process_id", CurrentProcessId()},
+            {"status_path", options.statusPath.string()},
+            {"started_utc",
+             invisible_places::serialization::CurrentUtcTimestamp()},
+        },
+        options.statusPath.parent_path() / "monitor.json",
+        nullptr);
+    struct MonitorRegistrationCleanup {
+        std::filesystem::path statusPath;
+        std::int64_t processId = 0;
+
+        ~MonitorRegistrationCleanup() {
+            const auto markerPath =
+                statusPath.parent_path() / "monitor.json";
+            const auto marker = invisible_places::app::workspace::
+                ReadJsonDocument(markerPath);
+            if (!marker.has_value() || !marker->is_object() ||
+                marker->value("process_id", std::int64_t{0}) !=
+                    processId) {
+                return;
+            }
+            std::error_code removeError;
+            std::filesystem::remove(markerPath, removeError);
+        }
+    } registrationCleanup{
+        .statusPath = options.statusPath,
+        .processId = CurrentProcessId(),
+    };
+
+    (void)platform::PrepareVulkanRuntime();
+    platform::Window window{
+        {.width = 640,
+         .height = 340,
+         .title = "Invisible Places - Attached Background Render",
+         .visible = true,
+         .focusOnOpen = true,
+         .fitToPrimaryScreen = false,
+         .accessoryApplication = true},
+    };
+    std::optional<invisible_places::renderer::core::VulkanViewportShell>
+        viewport;
+    try {
+        viewport.emplace(window.NativeHandle());
+    } catch (const std::exception& error) {
+        std::cerr << "Background monitor Vulkan initialization failed: "
+                  << error.what() << '\n';
+        return 2;
+    }
+    viewport->SetDiagnosticsEnabled(false);
+    viewport->SetSceneCachingEnabled(false);
+    viewport->SetLiveSceneRenderingEnabled(false);
+    viewport->SetLiveRainSimulationEnabled(false);
+
+    std::optional<invisible_places::serialization::
+        BackgroundRenderStatusDocument>
+        status;
+    std::optional<invisible_places::serialization::RenderSetupDocument>
+        setup;
+    std::string readError;
+    bool cancellationRequestSent = false;
+    bool rendererConnected = true;
+    const auto monitorStartedAt = std::chrono::steady_clock::now();
+    std::optional<std::chrono::steady_clock::time_point>
+        progressBaselineAt;
+    float progressBaseline = 0.0F;
+    std::string observedState;
+    std::optional<std::chrono::steady_clock::duration>
+        observedRemaining;
+    auto nextRefreshAt = std::chrono::steady_clock::time_point{};
+    auto nextRegistrationAt = std::chrono::steady_clock::time_point{};
+    std::optional<std::chrono::steady_clock::time_point> terminalAt;
+    while (true) {
+        window.PollEvents();
+        if (window.ShouldClose()) {
+            viewport->WaitIdle();
+            return 0;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= nextRegistrationAt) {
+            nextRegistrationAt = now + std::chrono::seconds{10};
+            invisible_places::app::workspace::WriteJsonDocument(
+                nlohmann::json{
+                    {"process_id", CurrentProcessId()},
+                    {"status_path", options.statusPath.string()},
+                    {"started_utc",
+                     invisible_places::serialization::
+                         CurrentUtcTimestamp()},
+                },
+                options.statusPath.parent_path() / "monitor.json",
+                nullptr);
+        }
+        if (now >= nextRefreshAt) {
+            nextRefreshAt = now + std::chrono::milliseconds{500};
+            auto refreshed = invisible_places::serialization::
+                LoadBackgroundRenderStatusDocument(
+                    options.statusPath,
+                    &readError);
+            if (refreshed.has_value()) {
+                status = std::move(refreshed.value());
+                readError.clear();
+                rendererConnected =
+                    BackgroundRenderStatusTerminal(status->state) ||
+                    BackgroundRenderProcessAlive(status->processId) ||
+                    (status->processId <= 0 &&
+                     BackgroundRenderStatusIsFresh(
+                         options.statusPath,
+                         std::chrono::seconds{15}));
+                const bool estimatingRender =
+                    status->state == "rendering" &&
+                    status->progress < 1.0F;
+                if (status->state != observedState) {
+                    observedState = status->state;
+                    if (estimatingRender) {
+                        progressBaselineAt = now;
+                    } else {
+                        progressBaselineAt.reset();
+                    }
+                    progressBaseline = status->progress;
+                    observedRemaining.reset();
+                } else if (estimatingRender &&
+                           (!progressBaselineAt.has_value() ||
+                            status->progress < progressBaseline)) {
+                    progressBaselineAt = now;
+                    progressBaseline = status->progress;
+                    observedRemaining.reset();
+                } else if (estimatingRender) {
+                    const auto observedDuration =
+                        now - progressBaselineAt.value();
+                    const auto progressDelta =
+                        status->progress - progressBaseline;
+                    if (observedDuration >= std::chrono::seconds{3} &&
+                        progressDelta >= 0.001F) {
+                        const auto observedSeconds =
+                            std::chrono::duration<double>(
+                                observedDuration)
+                                .count();
+                        const auto remainingSeconds =
+                            observedSeconds *
+                            static_cast<double>(
+                                1.0F - std::clamp(
+                                           status->progress,
+                                           0.0F,
+                                           1.0F)) /
+                            static_cast<double>(progressDelta);
+                        observedRemaining =
+                            std::chrono::duration_cast<
+                                std::chrono::steady_clock::duration>(
+                                std::chrono::duration<double>{
+                                    std::max(0.0, remainingSeconds)});
+                    }
+                } else {
+                    progressBaselineAt.reset();
+                    observedRemaining.reset();
+                }
+                if (!setup.has_value() && !status->setupPath.empty()) {
+                    std::string setupError;
+                    setup = invisible_places::serialization::
+                        LoadRenderSetupDocument(
+                            status->setupPath,
+                            &setupError);
+                }
+                if (setup.has_value()) {
+                    window.SetTitle(
+                        setup->animation.name +
+                        " - Attached Background Render");
+                }
+                if (BackgroundRenderStatusTerminal(status->state)) {
+                    if (!terminalAt.has_value()) {
+                        terminalAt = now;
+                    }
+                } else {
+                    terminalAt.reset();
+                }
+                if (status->state == "cancelling" ||
+                    status->state == "cancelled") {
+                    cancellationRequestSent = true;
+                }
+            }
+        }
+        if (status.has_value() &&
+            !BackgroundRenderStatusTerminal(status->state) &&
+            status->processId > 0 &&
+            !BackgroundRenderProcessAlive(status->processId)) {
+            rendererConnected = false;
+            observedRemaining.reset();
+        }
+
+        viewport->BeginUiFrame();
+        const bool cancelClicked =
+            DrawAttachedBackgroundRenderStatusMonitor(
+            status.has_value() ? &status.value() : nullptr,
+            setup.has_value() ? &setup.value() : nullptr,
+            readError,
+            cancellationRequestSent,
+            rendererConnected,
+            now - monitorStartedAt,
+            observedRemaining);
+        viewport->DrawFrame();
+        if (cancelClicked) {
+            std::string requestError;
+            const bool wroteRequest = invisible_places::app::workspace::
+                WriteJsonDocument(
+                    nlohmann::json{
+                        {"requested_utc",
+                         invisible_places::serialization::
+                             CurrentUtcTimestamp()},
+                    },
+                    BackgroundRenderCancellationRequestPath(
+                        options.statusPath),
+                    &requestError);
+            if (wroteRequest) {
+                cancellationRequestSent = true;
+            } else {
+                readError = std::move(requestError);
+            }
+        }
+
+        if (terminalAt.has_value() &&
+            now - terminalAt.value() >= std::chrono::seconds{10}) {
+            viewport->WaitIdle();
+            return status->state == "failed" ? 2 : 0;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    }
 }
 
 int RunBackgroundRenderWorker(
@@ -41748,26 +42705,85 @@ int RunBackgroundRenderWorker(
     const auto statusPath = options.statusPath.empty()
                                 ? BackgroundRenderStatusPath(options.setupPath)
                                 : options.statusPath;
+    const auto startedAt = std::chrono::steady_clock::now();
+    std::uint32_t expectedTotalFrames = 0U;
+    if (const auto queuedStatus = invisible_places::serialization::
+            LoadBackgroundRenderStatusDocument(statusPath);
+        queuedStatus.has_value()) {
+        expectedTotalFrames = queuedStatus->totalFrames;
+    }
+
     ApplyBackgroundWorkerProcessPriority();
+    viewport->SetDiagnosticsEnabled(false);
+    viewport->SetSceneCachingEnabled(false);
+    viewport->SetLiveSceneRenderingEnabled(false);
+    viewport->SetLiveRainSimulationEnabled(false);
+    viewport->BeginUiFrame();
+    DrawBackgroundRenderWorkerMonitor(
+        nullptr,
+        runtimeState,
+        "Preparing",
+        "Loading the immutable render package.",
+        startedAt,
+        false,
+        expectedTotalFrames);
+    viewport->DrawFrame();
     WriteBackgroundWorkerStatus(
         statusPath,
         "preparing",
         "Loading the immutable render package and full-density scene.",
-        options.setupPath);
+        options.setupPath,
+        nullptr,
+        expectedTotalFrames);
 
     std::string errorMessage;
     auto setup = invisible_places::serialization::
         LoadRenderSetupDocument(options.setupPath, &errorMessage);
     if (!setup.has_value()) {
+        const auto failure =
+            errorMessage.empty()
+                ? std::string{"The immutable render package could not be loaded."}
+                : errorMessage;
         WriteBackgroundWorkerStatus(
             statusPath,
             "failed",
-            errorMessage.empty()
-                ? "The immutable render package could not be loaded."
-                : errorMessage,
-            options.setupPath);
+            failure,
+            options.setupPath,
+            nullptr,
+            expectedTotalFrames);
+        UpdateBackgroundRenderPackageStatus(
+            options.setupPath,
+            RenderSetupStatus::Failed,
+            failure);
         return 2;
     }
+    if (setup->renderer.setupViewportWidth == 0U ||
+        setup->renderer.setupViewportHeight == 0U) {
+        // Legacy packages did not record the click-time framebuffer. Use
+        // their authored animation viewport rather than the resizable monitor
+        // window, so monitor layout can never change export appearance. Very
+        // old animations also omitted that preference; 1440x900 is the
+        // historical editor viewport and a stable compatibility fallback.
+        setup->renderer.setupViewportWidth =
+            setup->animation.defaultLiveViewWindowWidth > 0U
+                ? setup->animation.defaultLiveViewWindowWidth
+                : 1440U;
+        setup->renderer.setupViewportHeight =
+            setup->animation.defaultLiveViewWindowHeight > 0U
+                ? setup->animation.defaultLiveViewWindowHeight
+                : 900U;
+    }
+    expectedTotalFrames = static_cast<std::uint32_t>(
+        invisible_places::output::AnimationRenderSequenceFrameCount(
+            setup->animation,
+            RenderSettingsFromExportPreset(
+                setup->exportPreset,
+                runtimeState->renderSettings.outputDirectory)));
+    window->SetTitle(
+        (setup->animation.name.empty()
+             ? std::string{"Background Render"}
+             : setup->animation.name) +
+        " - Invisible Places Background Render");
     invisible_places::app::workspace::ResolveRenderSetupDocument(
         &setup.value(),
         WorkspaceRoots(*runtimeState));
@@ -41780,31 +42796,57 @@ int RunBackgroundRenderWorker(
             statusPath,
             "failed",
             errorMessage,
-            options.setupPath);
+            options.setupPath,
+            nullptr,
+            expectedTotalFrames);
+        UpdateBackgroundRenderPackageStatus(
+            options.setupPath,
+            RenderSetupStatus::Failed,
+            errorMessage);
         return 2;
     }
 
-    const auto startedAt = std::chrono::steady_clock::now();
     const auto preparationDeadline = startedAt + std::chrono::hours{2};
     auto nextStatusAt = startedAt;
     bool exportStarted = false;
     bool observedActiveExport = false;
+    bool workerCancellationRequested = false;
+    bool preparationTimedOut = false;
     std::filesystem::path lastOutputPath;
     std::filesystem::path lastLogPath;
     std::uint32_t lastRenderedFrames = 0U;
-    std::uint32_t lastTotalFrames = 0U;
-    while (std::chrono::steady_clock::now() < preparationDeadline) {
+    std::uint32_t lastTotalFrames = expectedTotalFrames;
+    while (true) {
         window->PollEvents();
-        PollPendingLayerLoad(runtimeState, viewport);
-        PollTimingColouriseHistogram(runtimeState);
-        EnsureWaterSurfaceCacheReady(runtimeState, viewport);
-        PollWaterRegionPointPreviewJob(runtimeState);
-        PollWaterFlowTrailBuildJob(runtimeState, viewport);
-        PollWaterRippleLiveEffectRefresh(runtimeState, viewport);
-        CommitReadySceneDisplaySwitches(runtimeState, viewport);
-        StartQueuedLayerLoadIfIdle(runtimeState);
+        if (window->ShouldClose()) {
+            window->CancelCloseRequest();
+            window->Hide();
+        }
+        if (!workerCancellationRequested) {
+            std::error_code requestError;
+            workerCancellationRequested =
+                std::filesystem::is_regular_file(
+                    BackgroundRenderCancellationRequestPath(statusPath),
+                    requestError);
+        }
+        if (!exportStarted && !workerCancellationRequested &&
+            std::chrono::steady_clock::now() >= preparationDeadline) {
+            preparationTimedOut = true;
+            workerCancellationRequested = true;
+        }
+        if (!workerCancellationRequested) {
+            PollPendingLayerLoad(runtimeState, viewport);
+            PollTimingColouriseHistogram(runtimeState);
+            EnsureWaterSurfaceCacheReady(runtimeState, viewport);
+            PollWaterRegionPointPreviewJob(runtimeState);
+            PollWaterFlowTrailBuildJob(runtimeState, viewport);
+            PollWaterRippleLiveEffectRefresh(runtimeState, viewport);
+            CommitReadySceneDisplaySwitches(runtimeState, viewport);
+            StartQueuedLayerLoadIfIdle(runtimeState);
+        }
 
-        if (!runtimeState->offlineRenderJob.active && !exportStarted &&
+        if (!workerCancellationRequested &&
+            !runtimeState->offlineRenderJob.active && !exportStarted &&
             !runtimeState->pendingLoad.has_value() &&
             !runtimeState->pendingScalarFieldLoad.has_value() &&
             runtimeState->persistence.queuedLoads.empty()) {
@@ -41817,7 +42859,13 @@ int RunBackgroundRenderWorker(
                     statusPath,
                     "failed",
                     runtimeState->errorMessage,
-                    options.setupPath);
+                    options.setupPath,
+                    nullptr,
+                    expectedTotalFrames);
+                UpdateBackgroundRenderPackageStatus(
+                    options.setupPath,
+                    RenderSetupStatus::Failed,
+                    runtimeState->errorMessage);
                 return 2;
             }
         }
@@ -41833,56 +42881,156 @@ int RunBackgroundRenderWorker(
                     runtimeState->offlineRenderJob.frames.size()));
             lastTotalFrames = static_cast<std::uint32_t>(
                 runtimeState->offlineRenderJob.frames.size());
-            viewport->BeginUiFrame();
-            viewport->SetDiagnosticsEnabled(false);
-            viewport->SetSceneCachingEnabled(false);
-            viewport->SetLiveSceneRenderingEnabled(false);
-            viewport->SetLiveRainSimulationEnabled(false);
-            viewport->DrawFrame();
+        }
+
+        const auto phase = BackgroundRenderWorkerPhase(
+            *runtimeState,
+            exportStarted,
+            workerCancellationRequested);
+        viewport->BeginUiFrame();
+        const bool cancelClicked = DrawBackgroundRenderWorkerMonitor(
+            &setup.value(),
+            runtimeState,
+            phase,
+            "Preparing full-density render resources.",
+            startedAt,
+            workerCancellationRequested,
+            expectedTotalFrames);
+        viewport->DrawFrame();
+        if (cancelClicked) {
+            workerCancellationRequested = true;
+        }
+
+        if (workerCancellationRequested &&
+            runtimeState->offlineRenderJob.active) {
+            RequestOfflineRenderCancellation(
+                &runtimeState->offlineRenderJob);
+        }
+        if (runtimeState->offlineRenderJob.active) {
             ProcessOfflineRenderJobStep(runtimeState, viewport);
+        }
+
+        if (workerCancellationRequested && !exportStarted &&
+            !runtimeState->offlineRenderJob.active) {
+            const bool preparationSettled =
+                SettleCancelledBackgroundRenderPreparation(runtimeState);
+            runtimeState->statusMessage =
+                preparationSettled
+                    ? "Finishing background preparation cleanup."
+                    : preparationTimedOut
+                          ? "Preparation timed out; waiting for the current source load to settle."
+                          : "Cancellation requested; waiting for the current source load to settle.";
+            runtimeState->errorMessage.clear();
+            // Keep pumping the monitor and publishing `cancelling` until the
+            // non-interruptible portion of a source read returns.
+            if (preparationSettled) {
+                WriteBackgroundWorkerStatus(
+                    statusPath,
+                    "cancelling",
+                    runtimeState->statusMessage,
+                    options.setupPath,
+                    nullptr,
+                    expectedTotalFrames);
+                StopBackgroundWorkForShutdown(runtimeState);
+                runtimeState->statusMessage =
+                    preparationTimedOut
+                        ? "Background render preparation timed out."
+                        : "Background render cancelled before export startup.";
+                WriteBackgroundWorkerStatus(
+                    statusPath,
+                    preparationTimedOut ? "failed" : "cancelled",
+                    runtimeState->statusMessage,
+                    options.setupPath,
+                    nullptr,
+                    expectedTotalFrames);
+                UpdateBackgroundRenderPackageStatus(
+                    options.setupPath,
+                    preparationTimedOut ? RenderSetupStatus::Failed
+                                        : RenderSetupStatus::Cancelled,
+                    preparationTimedOut
+                        ? std::string_view{runtimeState->statusMessage}
+                        : std::string_view{});
+                viewport->BeginUiFrame();
+                DrawBackgroundRenderWorkerMonitor(
+                    &setup.value(),
+                    runtimeState,
+                    preparationTimedOut ? "Failed" : "Cancelled",
+                    runtimeState->statusMessage,
+                    startedAt,
+                    true,
+                    expectedTotalFrames);
+                viewport->DrawFrame();
+                viewport->WaitIdle();
+                return preparationTimedOut ? 2 : 0;
+            }
         }
 
         const auto now = std::chrono::steady_clock::now();
         if (now >= nextStatusAt) {
             nextStatusAt = now + std::chrono::milliseconds{500};
+            const bool finishingOutput =
+                runtimeState->offlineRenderJob.active &&
+                (runtimeState->offlineRenderJob.currentFrame >=
+                     runtimeState->offlineRenderJob.frames.size() ||
+                 runtimeState->offlineRenderJob.writerFinishRequested);
             WriteBackgroundWorkerStatus(
                 statusPath,
-                runtimeState->offlineRenderJob.active
+                workerCancellationRequested
+                    ? "cancelling"
+                : finishingOutput
+                    ? "finishing"
+                : runtimeState->offlineRenderJob.active
                     ? "rendering"
                     : exportStarted ? "finishing" : "preparing",
-                runtimeState->statusMessage.empty()
+                workerCancellationRequested
+                    ? "Stopping the render and closing output safely."
+                : runtimeState->statusMessage.empty()
                     ? "Preparing full-density render resources."
                     : runtimeState->statusMessage,
                 options.setupPath,
                 runtimeState->offlineRenderJob.active
                     ? &runtimeState->offlineRenderJob
-                    : nullptr);
+                    : nullptr,
+                expectedTotalFrames);
         }
 
         if (exportStarted && observedActiveExport &&
             !runtimeState->offlineRenderJob.active) {
-            const bool failed = !runtimeState->errorMessage.empty();
+            const bool cancelled = workerCancellationRequested;
+            const bool failed =
+                !cancelled && !runtimeState->errorMessage.empty();
             invisible_places::serialization::
                 BackgroundRenderStatusDocument status;
-            status.state = failed ? "failed" : "completed";
-            status.message = failed
-                                 ? runtimeState->errorMessage
-                                 : runtimeState->statusMessage.empty()
-                                       ? "Background render completed."
-                                       : runtimeState->statusMessage;
+            status.state = cancelled
+                               ? "cancelled"
+                               : failed ? "failed" : "completed";
+            if (cancelled) {
+                status.message = runtimeState->errorMessage.empty()
+                                     ? "Background render cancelled."
+                                     : "Background render cancelled. Cleanup warning: " +
+                                           runtimeState->errorMessage;
+            } else {
+                status.message = failed
+                                     ? runtimeState->errorMessage
+                                     : runtimeState->statusMessage.empty()
+                                           ? "Background render completed."
+                                           : runtimeState->statusMessage;
+            }
             status.setupPath = options.setupPath;
             status.outputPath = lastOutputPath;
             status.logPath = lastLogPath;
             status.processId = CurrentProcessId();
-            status.renderedFrames = failed
+            status.cancellationSupported = true;
+            status.renderedFrames = failed || cancelled
                                         ? lastRenderedFrames
                                         : lastTotalFrames;
             status.totalFrames = lastTotalFrames;
-            status.progress = failed ? (lastTotalFrames > 0U
-                                            ? static_cast<float>(lastRenderedFrames) /
-                                                  static_cast<float>(lastTotalFrames)
-                                            : 0.0F)
-                                     : 1.0F;
+            status.progress = failed || cancelled
+                                  ? (lastTotalFrames > 0U
+                                         ? static_cast<float>(lastRenderedFrames) /
+                                               static_cast<float>(lastTotalFrames)
+                                         : 0.0F)
+                                  : 1.0F;
             status.updatedUtc =
                 invisible_places::serialization::CurrentUtcTimestamp();
             invisible_places::serialization::
@@ -41890,6 +43038,15 @@ int RunBackgroundRenderWorker(
                     status,
                     statusPath,
                     nullptr);
+            UpdateBackgroundRenderPackageStatus(
+                options.setupPath,
+                cancelled
+                    ? RenderSetupStatus::Cancelled
+                    : failed ? RenderSetupStatus::Failed
+                             : RenderSetupStatus::Completed,
+                failed
+                    ? std::string_view{runtimeState->errorMessage}
+                    : std::string_view{});
             viewport->WaitIdle();
             return failed ? 2 : 0;
         }
@@ -41902,15 +43059,6 @@ int RunBackgroundRenderWorker(
                     250U)});
     }
 
-    WriteBackgroundWorkerStatus(
-        statusPath,
-        "failed",
-        "Background render preparation timed out.",
-        options.setupPath,
-        runtimeState->offlineRenderJob.active
-            ? &runtimeState->offlineRenderJob
-            : nullptr);
-    return 2;
 }
 
 void DrawExportTimingSummary(const OfflineRenderJobState& job, bool stableLayout = false) {
@@ -42814,13 +43962,20 @@ void DrawAnimationExportSection(
     const auto& background = runtimeState->backgroundRender;
     if (background.latestStatus.has_value()) {
         const auto& status = background.latestStatus.value();
+        const bool terminal = BackgroundRenderStatusTerminal(status.state);
+        const bool disconnected =
+            !terminal &&
+            (!BackgroundRenderStatusIsFresh(
+                 background.latestStatusPath) ||
+             (status.processId > 0 &&
+              !BackgroundRenderProcessAlive(status.processId)));
         ImGui::SeparatorText("Latest Background Render");
         ImGui::ProgressBar(
             std::clamp(status.progress, 0.0F, 1.0F),
             ImVec2{-FLT_MIN, 0.0F});
         ImGui::TextWrapped(
             "%s: %s",
-            status.state.c_str(),
+            disconnected ? "disconnected" : status.state.c_str(),
             status.message.c_str());
         if (status.totalFrames > 0U) {
             ImGui::TextDisabled(
@@ -42837,18 +43992,80 @@ void DrawAnimationExportSection(
             ImGui::TextDisabled(
                 "Output path is reserved when the worker finishes setup.");
         }
-        if (BackgroundRenderStatusTerminal(status.state)) {
+        if (terminal) {
             ImGui::TextDisabled(
                 "This render no longer uses GPU or memory resources.");
+        } else if (disconnected) {
+            ImGui::TextDisabled(
+                "The recorded worker is no longer running; this stale job "
+                "is excluded from active monitors.");
         } else {
             ImGui::TextDisabled(
                 "Detached worker: editor close/rebuild is safe; GPU and "
                 "memory remain shared until completion.");
         }
+        if (!background.readError.empty()) {
+            ImGui::TextDisabled(
+                "Status refresh warning: %s",
+                background.readError.c_str());
+        }
     } else if (!background.readError.empty()) {
         ImGui::TextDisabled(
             "Background status unavailable: %s",
             background.readError.c_str());
+    }
+    if (ImGui::Button("Show Active Render Monitors")) {
+        const auto activeStatusPaths =
+            ActiveBackgroundRenderStatusPaths(*runtimeState);
+        std::size_t openedCount = 0U;
+        std::size_t alreadyOpenCount = 0U;
+        std::string monitorError;
+        for (const auto& statusPath : activeStatusPaths) {
+            bool launched = false;
+            if (SpawnDetachedBackgroundRenderStatusMonitor(
+                    CurrentExecutablePath(),
+                    statusPath,
+                    &launched,
+                    &monitorError)) {
+                if (launched) {
+                    ++openedCount;
+                } else {
+                    ++alreadyOpenCount;
+                }
+            }
+        }
+        if (openedCount == 0U && alreadyOpenCount == 0U) {
+            runtimeState->statusMessage = activeStatusPaths.empty()
+                                              ? "No active background renders were found."
+                                              : "Could not open background render monitors.";
+            runtimeState->errorMessage = monitorError;
+        } else {
+            std::ostringstream summary;
+            if (openedCount > 0U) {
+                summary << "Opened " << openedCount
+                        << " detached background render monitor"
+                        << (openedCount == 1U ? "" : "s");
+            }
+            if (alreadyOpenCount > 0U) {
+                if (openedCount > 0U) {
+                    summary << "; ";
+                }
+                summary << alreadyOpenCount << " already open";
+            }
+            summary << '.';
+            runtimeState->statusMessage = summary.str();
+            runtimeState->errorMessage =
+                openedCount + alreadyOpenCount ==
+                        activeStatusPaths.size()
+                    ? std::string{}
+                    : monitorError;
+        }
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+        ImGui::SetTooltip(
+            "Finds every non-terminal background job in this project's "
+            "render history and opens a detached progress window for each. "
+            "This also attaches to renders launched by an older build.");
     }
     EndPanelSection();
 }
@@ -116354,6 +117571,10 @@ std::filesystem::path Application::DefaultDataDirectory() {
 }
 
 int Application::Run(ApplicationRunOptions options) const {
+    if (options.backgroundRenderStatusMonitor.has_value()) {
+        return RunBackgroundRenderStatusMonitor(
+            options.backgroundRenderStatusMonitor.value());
+    }
     if (options.guiSmoke.has_value() &&
         options.guiSmoke->scenario == "scene3-density-parity") {
         const auto peers = QueryInvisiblePlacesPeerProcesses();
@@ -116398,6 +117619,24 @@ int Application::Run(ApplicationRunOptions options) const {
         for (const auto& issue : assetCatalog.issues) {
             std::cerr << "- " << issue.filePath.string() << ": " << issue.message << "\n";
         }
+        if (options.backgroundRenderWorker.has_value()) {
+            const auto& worker = options.backgroundRenderWorker.value();
+            const auto statusPath = worker.statusPath.empty()
+                                        ? BackgroundRenderStatusPath(
+                                              worker.setupPath)
+                                        : worker.statusPath;
+            const std::string failure =
+                "Background render asset discovery failed; see worker.log.";
+            WriteBackgroundWorkerStatus(
+                statusPath,
+                "failed",
+                failure,
+                worker.setupPath);
+            UpdateBackgroundRenderPackageStatus(
+                worker.setupPath,
+                RenderSetupStatus::Failed,
+                failure);
+        }
         return 2;
     }
 
@@ -116405,21 +117644,49 @@ int Application::Run(ApplicationRunOptions options) const {
         options.backgroundRenderWorker.has_value();
     std::cout << std::endl
               << (backgroundWorker
-                      ? "Starting hidden low-priority background render worker."
+                      ? "Starting low-priority background render worker with progress monitor."
                       : "Opening preview window. Press Escape or close the window to exit.")
               << std::endl;
 
     const auto windowTitle = platform::MakeBootstrapWindowTitle(assetCatalog);
-    platform::Window window{
-        {.width = backgroundWorker ? 64 : 1440,
-         .height = backgroundWorker ? 64 : 900,
-         .title = backgroundWorker
-                      ? "Invisible Places Background Render"
-                      : windowTitle,
-         .visible = !backgroundWorker,
-         .focusOnOpen = !backgroundWorker,
-         .fitToPrimaryScreen = !backgroundWorker},
-    };
+    std::unique_ptr<platform::Window> windowOwner;
+    try {
+        windowOwner = std::make_unique<platform::Window>(
+            platform::WindowConfig{
+                .width = backgroundWorker ? 620 : 1440,
+                .height = backgroundWorker ? 320 : 900,
+                .title = backgroundWorker
+                             ? "Invisible Places Background Render"
+                             : windowTitle,
+                .visible = true,
+                .focusOnOpen = !backgroundWorker,
+                .fitToPrimaryScreen = !backgroundWorker,
+                .accessoryApplication = backgroundWorker,
+            });
+    } catch (const std::exception& error) {
+        if (!backgroundWorker) {
+            throw;
+        }
+        const auto& worker = options.backgroundRenderWorker.value();
+        const auto statusPath = worker.statusPath.empty()
+                                    ? BackgroundRenderStatusPath(
+                                          worker.setupPath)
+                                    : worker.statusPath;
+        const std::string failure =
+            "Background render monitor window failed to start: " +
+            std::string{error.what()};
+        WriteBackgroundWorkerStatus(
+            statusPath,
+            "failed",
+            failure,
+            worker.setupPath);
+        UpdateBackgroundRenderPackageStatus(
+            worker.setupPath,
+            RenderSetupStatus::Failed,
+            failure);
+        return 2;
+    }
+    auto& window = *windowOwner;
 
     std::optional<renderer::core::VulkanViewportShell> viewport;
     try {
@@ -116439,6 +117706,26 @@ int Application::Run(ApplicationRunOptions options) const {
                      "Gaussian splat layers discovered: " + std::to_string(assetCatalog.gaussianSplats.size()),
                  },
              .footer = "Close the window or press Escape to exit."});
+        if (options.backgroundRenderWorker.has_value()) {
+            const auto& worker = options.backgroundRenderWorker.value();
+            const auto statusPath = worker.statusPath.empty()
+                                        ? BackgroundRenderStatusPath(
+                                              worker.setupPath)
+                                        : worker.statusPath;
+            const std::string failure =
+                "Background render Vulkan initialization failed: " +
+                std::string{error.what()};
+            WriteBackgroundWorkerStatus(
+                statusPath,
+                "failed",
+                failure,
+                worker.setupPath);
+            UpdateBackgroundRenderPackageStatus(
+                worker.setupPath,
+                RenderSetupStatus::Failed,
+                failure);
+            return 2;
+        }
     }
 
     PreviewRuntimeState runtimeState;
@@ -116449,6 +117736,8 @@ int Application::Run(ApplicationRunOptions options) const {
     invisible_places::io::SetPointCloudFieldCacheRoot(
         runtimeState.localSavedRoot / ".invisible_places" / "cache");
     runtimeState.liveViewWindowSize = window.Size();
+    runtimeState.liveFramebufferViewportSize =
+        window.FramebufferSize();
     runtimeState.water.defaultPointVisualStyle = MakeDefaultWaterPointVisualStyle();
     runtimeState.sessions = BuildSessions(assetCatalog);
     runtimeState.pointCloudScenes = BuildScenePointCloudRuntimeStates(
@@ -116734,11 +118023,56 @@ int Application::Run(ApplicationRunOptions options) const {
             StopBackgroundWorkForShutdown(&runtimeState);
             return 2;
         }
-        const auto workerExitCode = RunBackgroundRenderWorker(
-            options.backgroundRenderWorker.value(),
-            &window,
-            &viewport.value(),
-            &runtimeState);
+        const auto& worker = options.backgroundRenderWorker.value();
+        int workerExitCode = 2;
+        try {
+            workerExitCode = RunBackgroundRenderWorker(
+                worker,
+                &window,
+                &viewport.value(),
+                &runtimeState);
+        } catch (const std::exception& error) {
+            const auto statusPath = worker.statusPath.empty()
+                                        ? BackgroundRenderStatusPath(
+                                              worker.setupPath)
+                                        : worker.statusPath;
+            const std::string failure =
+                "Background render worker stopped unexpectedly: " +
+                std::string{error.what()};
+            WriteBackgroundWorkerStatus(
+                statusPath,
+                "failed",
+                failure,
+                worker.setupPath,
+                runtimeState.offlineRenderJob.active
+                    ? &runtimeState.offlineRenderJob
+                    : nullptr);
+            UpdateBackgroundRenderPackageStatus(
+                worker.setupPath,
+                RenderSetupStatus::Failed,
+                failure);
+            std::cerr << failure << '\n';
+        } catch (...) {
+            const auto statusPath = worker.statusPath.empty()
+                                        ? BackgroundRenderStatusPath(
+                                              worker.setupPath)
+                                        : worker.statusPath;
+            const std::string failure =
+                "Background render worker stopped because of an unknown error.";
+            WriteBackgroundWorkerStatus(
+                statusPath,
+                "failed",
+                failure,
+                worker.setupPath,
+                runtimeState.offlineRenderJob.active
+                    ? &runtimeState.offlineRenderJob
+                    : nullptr);
+            UpdateBackgroundRenderPackageStatus(
+                worker.setupPath,
+                RenderSetupStatus::Failed,
+                failure);
+            std::cerr << failure << '\n';
+        }
         StopBackgroundWorkForShutdown(&runtimeState);
         viewport->WaitIdle();
         return workerExitCode;

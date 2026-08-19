@@ -24,11 +24,17 @@ struct BackgroundRenderWorkerOptions {
     std::uint32_t throttleMilliseconds = 24U;
 };
 
+struct BackgroundRenderStatusMonitorOptions {
+    std::filesystem::path statusPath;
+};
+
 struct ApplicationRunOptions {
     std::optional<GuiSmokeOptions> guiSmoke;
     std::optional<ExportBenchmarkOptions> exportBenchmark;
     std::optional<std::string> refocusAnimation;
     std::optional<BackgroundRenderWorkerOptions> backgroundRenderWorker;
+    std::optional<BackgroundRenderStatusMonitorOptions>
+        backgroundRenderStatusMonitor;
 };
 
 class Application {
