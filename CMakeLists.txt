@@ -151,6 +151,7 @@ configure_file(
 add_library(
     invisible_places_core
     src/app/Application.cpp
+    src/app/PointDensityParity.cpp
     src/app/PointVisualSelection.cpp
     src/app/ProcessMemoryTelemetry.cpp
     src/app/ProjectWorkspace.cpp
@@ -315,6 +316,7 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
             tests/AssetDiscoveryTests.cpp
             tests/CompositionGuideTests.cpp
             tests/PointCloudDensityCompensationTests.cpp
+            tests/PointDensityParityTests.cpp
             tests/PointCloudFieldCacheTests.cpp
             tests/PointCloudFieldResidencyTests.cpp
             tests/PointCloudVariantsTests.cpp
