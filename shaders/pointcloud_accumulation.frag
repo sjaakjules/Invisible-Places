@@ -11,7 +11,6 @@ layout(location = 5) in float inDepthFade;
 layout(location = 6) in float inViewDepth;
 layout(location = 7) flat in uint inPointIndex;
 layout(location = 8) in float inSurfaceAngleMask;
-layout(location = 10) in float inCaustic;
 layout(location = 11) in vec4 inWaterColourTransform;
 layout(location = 12) flat in vec4 inTimingColouriseTransform;
 layout(location = 13) flat in float inTimingColouriseEmissionAdd;
@@ -59,18 +58,6 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 stylisationParams2;
     vec4 surfaceMotionParams;
     vec4 surfaceMotionStats;
-    uvec4 causticControl;
-    vec4 causticParams0;
-    vec4 causticParams1;
-    vec4 causticParams2;
-    vec4 causticTint;
-    uvec4 waterEffectControl;
-    uvec4 waterEffectSlots0;
-    uvec4 waterEffectSlots1;
-    uvec4 rippleEffectSlots0;
-    uvec4 rippleEffectSlots1;
-    uvec4 rippleEffectSlots2;
-    uvec4 rippleEffectSlots3;
     uvec4 shorelineWaveControl;
     vec4 shorelineWaveParams0;
     vec4 shorelineWaveParams1;
@@ -265,7 +252,6 @@ void main() {
         radius,
         inPointIndex,
         inSurfaceAngleMask);
-    baseColor = mix(baseColor, styleData.causticTint.rgb, clamp(inCaustic * 0.55, 0.0, 1.0));
     outAccumulation = vec4(0.0);
     outRevealage = 0.0;
     outEmission = vec4(0.0);

@@ -64,18 +64,6 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 stylisationParams2;
     vec4 surfaceMotionParams;
     vec4 surfaceMotionStats;
-    uvec4 causticControl;
-    vec4 causticParams0;
-    vec4 causticParams1;
-    vec4 causticParams2;
-    vec4 causticTint;
-    uvec4 waterEffectControl;
-    uvec4 waterEffectSlots0;
-    uvec4 waterEffectSlots1;
-    uvec4 rippleEffectSlots0;
-    uvec4 rippleEffectSlots1;
-    uvec4 rippleEffectSlots2;
-    uvec4 rippleEffectSlots3;
     uvec4 shorelineWaveControl;
     vec4 shorelineWaveParams0;
     vec4 shorelineWaveParams1;

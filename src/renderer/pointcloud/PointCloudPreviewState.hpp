@@ -308,26 +308,6 @@ struct PointCloudStyleState {
     bool waterTrailOverlay = false;
     // Runtime-only: role-scoped rain reactions require the unified material path.
     bool rainImpactEffects = false;
-    bool causticAnimation = false;
-    float causticIntensity = 0.0F;
-    float causticScale = 4.0F;
-    float causticSpeed = 0.55F;
-    float causticLineSharpness = 0.72F;
-    float causticWarp = 0.35F;
-    float causticCellSizeMeters = 0.20F;
-    float causticLineWidthMeters = 0.015F;
-    float causticFeatherMeters = 0.006F;
-    float causticSurfacePointSpacingMeters = 0.005F;
-    float causticWarpAmplitudeMeters = 0.045F;
-    std::array<float, 3> causticTint{0.62F, 0.88F, 1.0F};
-    float causticEmissionBoost = 1.15F;
-    float causticOpacityBoost = 0.08F;
-    float causticPointSizeBoost = 0.0F;
-    float causticPreviewTintAmount = 0.0F;
-    float causticPreviewTintRegionId = 0.0F;
-    std::int32_t causticMaskFieldSlot = -1;
-    std::int32_t causticEdgeFieldSlot = -1;
-    std::int32_t causticSeedFieldSlot = -1;
     bool shorelineWaveEnabled = false;
     PointCloudShorelineWaveAlgorithm shorelineWaveAlgorithm =
         PointCloudShorelineWaveAlgorithm::FoamFronts;
@@ -421,7 +401,6 @@ void ApplyPointCloudShorelineWaveSettings(
 // and offline SAND impacts agree at a held shoreline frame.
 [[nodiscard]] bool PointCloudStyleHasShorelineWaveRegion(
     const PointCloudStyleState& style);
-[[nodiscard]] bool PointCloudStyleHasActiveCaustics(const PointCloudStyleState& style);
 [[nodiscard]] bool PointCloudStyleUsesWorldSizedScreenSprites(const PointCloudStyleState& style);
 [[nodiscard]] WaterFlowActivityScales ResolveWaterFlowActivityScales(
     float effectiveActivity,

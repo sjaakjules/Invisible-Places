@@ -137,53 +137,6 @@ float ScalarFieldValueBySlot(
     return cloud.scalarFieldValues[valueIndex];
 }
 
-float WaterEffectFieldValue(
-    const OfflinePointLayer& layer,
-    std::size_t fieldSlot,
-    std::size_t pointIndex,
-    float fallback) {
-    if (layer.cloud == nullptr || fieldSlot >= layer.cloud->scalarFields.size()) {
-        return fallback;
-    }
-    return ScalarFieldValueBySlot(*layer.cloud, fieldSlot, pointIndex);
-}
-
-bool HasWaterEffectComposition(const OfflinePointLayer& layer) {
-    return layer.cloud != nullptr &&
-           layer.waterEffectEmissionAddFieldSlot < layer.cloud->scalarFields.size() &&
-           layer.waterEffectOpacityAddFieldSlot < layer.cloud->scalarFields.size() &&
-           layer.waterEffectOpacityMultiplyFieldSlot < layer.cloud->scalarFields.size() &&
-           layer.waterEffectPointSizeAddFieldSlot < layer.cloud->scalarFields.size() &&
-           layer.waterEffectPointSizeMultiplyFieldSlot < layer.cloud->scalarFields.size() &&
-           layer.waterEffectColourRedFieldSlot < layer.cloud->scalarFields.size() &&
-           layer.waterEffectColourGreenFieldSlot < layer.cloud->scalarFields.size() &&
-           layer.waterEffectColourBlueFieldSlot < layer.cloud->scalarFields.size() &&
-           layer.waterEffectColourMixFieldSlot < layer.cloud->scalarFields.size();
-}
-
-glm::vec3 ApplyWaterEffectColour(
-    const OfflinePointLayer& layer,
-    std::size_t pointIndex,
-    glm::vec3 baseColor) {
-    if (!HasWaterEffectComposition(layer)) {
-        return baseColor;
-    }
-    const float mixAmount = Clamp01(WaterEffectFieldValue(
-        layer,
-        layer.waterEffectColourMixFieldSlot,
-        pointIndex,
-        0.0F));
-    if (mixAmount <= 1.0e-5F) {
-        return baseColor;
-    }
-    const glm::vec3 effectColor{
-        Clamp01(WaterEffectFieldValue(layer, layer.waterEffectColourRedFieldSlot, pointIndex, 0.62F)),
-        Clamp01(WaterEffectFieldValue(layer, layer.waterEffectColourGreenFieldSlot, pointIndex, 0.88F)),
-        Clamp01(WaterEffectFieldValue(layer, layer.waterEffectColourBlueFieldSlot, pointIndex, 1.0F)),
-    };
-    return glm::mix(baseColor, effectColor, mixAmount);
-}
-
 bool HasWaterParticleFields(const OfflinePointLayer& layer) {
     return layer.generatedWaterOverlay &&
            layer.cloud != nullptr &&
@@ -271,179 +224,6 @@ float HashWater01(std::uint32_t value) {
 
 float PositiveFract(float value) {
     return value - std::floor(value);
-}
-
-float HashCaustic01(const glm::vec2& p) {
-    const glm::vec3 p3 = glm::fract(glm::vec3{p.x, p.y, p.x} * 0.1031F);
-    const float mixed = glm::dot(p3, glm::vec3{p3.y, p3.z, p3.x} + glm::vec3{33.33F});
-    const glm::vec3 folded = p3 + glm::vec3{mixed};
-    return PositiveFract((folded.x + folded.y) * folded.z);
-}
-
-glm::vec2 HashCaustic2(const glm::vec2& p) {
-    return {HashCaustic01(p), HashCaustic01(p + glm::vec2{19.19F})};
-}
-
-float StableCausticSeed(float regionOrSeed) {
-    if (regionOrSeed >= 1.0F) {
-        return HashCaustic01(glm::vec2{std::floor(regionOrSeed + 0.5F), 401.0F});
-    }
-    return 0.38196601125F;
-}
-
-glm::vec2 CausticSurfaceUv(const glm::vec3& worldPosition, const glm::vec3& normal) {
-    if (glm::dot(normal, normal) <= 1.0e-8F) {
-        return {worldPosition.x, worldPosition.y};
-    }
-
-    glm::vec3 n = glm::normalize(normal);
-    if (n.z < 0.0F) {
-        n = -n;
-    }
-
-    const float steepness = SmoothStep(0.18F, 0.82F, 1.0F - std::clamp(n.z, 0.0F, 1.0F));
-    const glm::vec2 slope = glm::clamp(
-        glm::vec2{-n.x, -n.y} / std::max(0.35F, n.z),
-        glm::vec2{-1.75F},
-        glm::vec2{1.75F});
-    return glm::vec2{worldPosition.x, worldPosition.y} + slope * worldPosition.z * steepness * 0.32F;
-}
-
-float CausticVoronoiRidge(
-    const invisible_places::renderer::pointcloud::PointCloudStyleState& style,
-    const glm::vec2& metersUv,
-    float seed,
-    float timeSeconds,
-    float edge) {
-    const float stableSeed = StableCausticSeed(seed);
-    const float cellSize = std::max(0.005F, style.causticCellSizeMeters);
-    const float lineWidth = std::max(0.0005F, style.causticLineWidthMeters);
-    const float warpAmplitude = std::clamp(style.causticWarpAmplitudeMeters, 0.0F, 2.0F);
-    const float feather = std::max(0.0005F, style.causticFeatherMeters);
-    const float pointSpacing = std::max(0.0005F, style.causticSurfacePointSpacingMeters);
-    const float edgeCore = SmoothStep(0.08F, 0.82F, Clamp01(edge));
-    const glm::vec2 warpUv = metersUv / std::max(0.001F, cellSize * 1.7F);
-    const glm::vec2 warpedMeters =
-        metersUv +
-        warpAmplitude *
-            glm::vec2{
-                std::sin(warpUv.y * 1.73F + timeSeconds * 0.71F + stableSeed * 6.28318530718F) +
-                    0.35F * std::sin(warpUv.x * 3.19F - timeSeconds * 0.23F + stableSeed * 5.31F),
-                std::cos(warpUv.x * 1.31F - timeSeconds * 0.63F + stableSeed * 4.398229715F) +
-                    0.35F * std::cos(warpUv.y * 2.17F + timeSeconds * 0.29F + stableSeed * 7.13F),
-            };
-    const glm::vec2 uv = warpedMeters / cellSize;
-    const glm::vec2 base{std::floor(uv.x), std::floor(uv.y)};
-    const glm::vec2 f{PositiveFract(uv.x), PositiveFract(uv.y)};
-    float first = 16.0F;
-    float second = 16.0F;
-    for (int y = -1; y <= 1; ++y) {
-        for (int x = -1; x <= 1; ++x) {
-            const glm::vec2 cell{static_cast<float>(x), static_cast<float>(y)};
-            auto feature = HashCaustic2(base + cell + glm::vec2{stableSeed * 37.0F});
-            feature = glm::vec2{0.5F} + glm::vec2{0.5F} *
-                                      glm::vec2{
-                                          std::sin((feature.x + timeSeconds * 0.17F + stableSeed) * 6.28318530718F),
-                                          std::sin((feature.y - timeSeconds * 0.13F + stableSeed) * 6.28318530718F),
-                                      };
-            const float distance = glm::length(cell + feature - f);
-            if (distance < first) {
-                second = first;
-                first = distance;
-            } else if (distance < second) {
-                second = distance;
-            }
-        }
-    }
-    const float ridgeDistanceMeters = std::max(0.0F, second - first) * cellSize;
-    const float edgeWidthScale = 0.55F + (1.0F - 0.55F) * edgeCore;
-    const float resolvedWidth = std::max(lineWidth, pointSpacing * 1.15F) * edgeWidthScale;
-    const float resolvedFeather = std::max(feather, pointSpacing * 0.5F) * (0.75F + (1.0F - 0.75F) * edgeCore);
-    const float core = 1.0F - SmoothStep(resolvedWidth, resolvedWidth + resolvedFeather, ridgeDistanceMeters);
-    const float halo = 1.0F - SmoothStep(
-        resolvedWidth + resolvedFeather * 2.0F,
-        resolvedWidth + resolvedFeather * 7.0F,
-        ridgeDistanceMeters);
-    const float dissolveNoise = HashCaustic01(
-        glm::floor((metersUv / std::max(0.001F, cellSize * 2.0F)) + glm::vec2{stableSeed * 23.0F}));
-    const float dissolve = SmoothStep(0.04F, 0.74F, edgeCore + (dissolveNoise - 0.5F) * 0.18F);
-    const float shimmer = 0.82F + 0.18F * std::sin(timeSeconds * 1.7F + stableSeed * 17.0F + first * 11.0F);
-    return std::clamp((core * 1.12F + halo * 0.32F) * shimmer * dissolve, 0.0F, 1.0F);
-}
-
-float CausticEdgeGate(const invisible_places::renderer::pointcloud::PointCloudStyleState& style, const glm::vec2& metersUv, float edge, float seed) {
-    const float stableSeed = StableCausticSeed(seed);
-    const float cellSize = std::max(0.005F, style.causticCellSizeMeters);
-    const float broadBreakup =
-        HashCaustic01(glm::floor((metersUv / std::max(0.001F, cellSize * 2.5F)) + glm::vec2{stableSeed * 11.0F}));
-    return SmoothStep(0.04F, 0.92F, edge + broadBreakup * 0.14F - 0.06F);
-}
-
-float CausticPreviewTint(
-    const invisible_places::renderer::pointcloud::PointCloudStyleState& style,
-    float mask,
-    float edge,
-    float regionOrSeed) {
-    const float amount = std::clamp(style.causticPreviewTintAmount, 0.0F, 1.0F);
-    if (amount <= 1.0e-5F) {
-        return 0.0F;
-    }
-    const float targetRegion = style.causticPreviewTintRegionId;
-    if (targetRegion >= 0.5F &&
-        std::abs(std::floor(regionOrSeed + 0.5F) - std::floor(targetRegion + 0.5F)) > 0.5F) {
-        return 0.0F;
-    }
-    return std::clamp(mask * edge * amount, 0.0F, 1.0F);
-}
-
-float CausticColorMixAmount(float causticStrength, float previewTint) {
-    return std::clamp(causticStrength * 0.55F + previewTint * 0.24F, 0.0F, 1.0F);
-}
-
-float ResolveCausticStrength(
-    const invisible_places::io::LoadedPointCloud& cloud,
-    const invisible_places::renderer::pointcloud::PointCloudStyleState& style,
-    std::size_t pointIndex,
-    const glm::vec3& worldPosition,
-    float timeSeconds,
-    float* previewTint) {
-    if (previewTint != nullptr) {
-        *previewTint = 0.0F;
-    }
-    if (!invisible_places::renderer::pointcloud::PointCloudStyleHasActiveCaustics(style)) {
-        return 0.0F;
-    }
-    const float mask = Clamp01(ScalarFieldValueBySlot(
-        cloud,
-        static_cast<std::size_t>(style.causticMaskFieldSlot),
-        pointIndex));
-    if (mask <= 1.0e-5F) {
-        return 0.0F;
-    }
-    const float edge = Clamp01(ScalarFieldValueBySlot(
-        cloud,
-        static_cast<std::size_t>(style.causticEdgeFieldSlot),
-        pointIndex));
-    const float seed = ScalarFieldValueBySlot(
-        cloud,
-        static_cast<std::size_t>(style.causticSeedFieldSlot),
-        pointIndex);
-    if (previewTint != nullptr) {
-        *previewTint = CausticPreviewTint(style, mask, edge, seed);
-    }
-    const float temporal = std::max(0.0F, timeSeconds) * std::max(0.0F, style.causticSpeed);
-    glm::vec3 normal{0.0F};
-    if (cloud.hasNormals && pointIndex < cloud.normals.size()) {
-        normal = {
-            cloud.normals[pointIndex].x,
-            cloud.normals[pointIndex].y,
-            cloud.normals[pointIndex].z,
-        };
-    }
-    const glm::vec2 metersUv = CausticSurfaceUv(worldPosition, normal);
-    const float ridge = CausticVoronoiRidge(style, metersUv, seed, temporal, edge);
-    const float edgeGate = CausticEdgeGate(style, metersUv, edge, seed);
-    return std::clamp(ridge * mask * edgeGate * std::max(0.0F, style.causticIntensity), 0.0F, 6.0F);
 }
 
 glm::vec3 SafeWaterLateral(const glm::vec3& tangent, const glm::vec3& fallback) {
@@ -1302,13 +1082,10 @@ glm::vec3 ResolvePointColor(
         baseColor = {customColor[0], customColor[1], customColor[2]};
     }
 
-    return ApplyWaterEffectColour(
+    return ApplyTimingColourise(
+        ApplyColorize(baseColor, layer.style),
         layer,
-        pointIndex,
-        ApplyTimingColourise(
-            ApplyColorize(baseColor, layer.style),
-            layer,
-            pointIndex));
+        pointIndex);
 }
 
 struct OfflinePointSample {
@@ -1882,76 +1659,13 @@ float PointSurfaceAngleMask(
         1.0F);
 }
 
-float ScreenBlend01(float baseValue, float contribution) {
-    const float a = Clamp01(baseValue);
-    const float b = Clamp01(contribution);
-    return 1.0F - ((1.0F - a) * (1.0F - b));
-}
-
-void BlendRippleContribution(
-    invisible_places::water::WaterRippleRuntimeContribution* target,
-    const invisible_places::water::WaterRippleRuntimeContribution& contribution,
-    invisible_places::water::WaterEffectBlendMode blendMode) {
-    if (target == nullptr || contribution.scale <= 1.0e-5F) {
-        return;
-    }
-
-    if (blendMode == invisible_places::water::WaterEffectBlendMode::Max) {
-        target->scale = std::max(target->scale, contribution.scale);
-        target->emissionAdd = std::max(target->emissionAdd, contribution.emissionAdd);
-        target->opacityAdd = std::max(target->opacityAdd, contribution.opacityAdd);
-        target->opacityMultiply = std::max(target->opacityMultiply, contribution.opacityMultiply);
-        target->pointSizeAdd = std::max(target->pointSizeAdd, contribution.pointSizeAdd);
-        target->pointSizeMultiply = std::max(target->pointSizeMultiply, contribution.pointSizeMultiply);
-        if (contribution.colourMix >= target->colourMix) {
-            target->colourMix = contribution.colourMix;
-            target->colour = contribution.colour;
-        }
-        return;
-    }
-    if (blendMode == invisible_places::water::WaterEffectBlendMode::Override) {
-        *target = contribution;
-        return;
-    }
-
-    if (blendMode == invisible_places::water::WaterEffectBlendMode::Multiply) {
-        target->scale = std::max(target->scale, contribution.scale);
-        target->opacityMultiply *= contribution.opacityMultiply;
-        target->pointSizeMultiply *= contribution.pointSizeMultiply;
-        target->emissionAdd += contribution.emissionAdd;
-        target->opacityAdd += contribution.opacityAdd;
-        target->pointSizeAdd += contribution.pointSizeAdd;
-    } else if (blendMode == invisible_places::water::WaterEffectBlendMode::Screen) {
-        target->scale = ScreenBlend01(target->scale, contribution.scale);
-        target->emissionAdd = ScreenBlend01(target->emissionAdd, contribution.emissionAdd);
-        target->opacityAdd = ScreenBlend01(target->opacityAdd, contribution.opacityAdd);
-        target->opacityMultiply *= contribution.opacityMultiply;
-        target->pointSizeAdd = ScreenBlend01(target->pointSizeAdd, contribution.pointSizeAdd);
-        target->pointSizeMultiply *= contribution.pointSizeMultiply;
-    } else {
-        target->scale = Clamp01(target->scale + contribution.scale);
-        target->emissionAdd += contribution.emissionAdd;
-        target->opacityAdd += contribution.opacityAdd;
-        target->opacityMultiply *= contribution.opacityMultiply;
-        target->pointSizeAdd += contribution.pointSizeAdd;
-        target->pointSizeMultiply *= contribution.pointSizeMultiply;
-    }
-
-    const float nextMix = Clamp01(target->colourMix + contribution.colourMix);
-    if (nextMix > 1.0e-5F) {
-        target->colour = glm::mix(target->colour, contribution.colour, contribution.colourMix / nextMix);
-    }
-    target->colourMix = nextMix;
-}
-
-invisible_places::water::WaterRippleRuntimeContribution ResolveOfflineRippleContribution(
+invisible_places::water::WaterSeepageRuntimeContribution ResolveOfflineSeepageContribution(
     const OfflinePointLayer& layer,
     const invisible_places::io::LoadedPointCloud& cloud,
     std::size_t pointIndex,
     const glm::vec3& worldPosition,
     float timeSeconds,
     const glm::vec3& cameraPosition) {
-    invisible_places::water::WaterRippleRuntimeContribution result;
     glm::vec3 worldNormal{0.0F, 0.0F, 1.0F};
     bool hasWorldNormal = false;
     if (cloud.hasNormals && pointIndex < cloud.normals.size()) {
@@ -1977,7 +1691,7 @@ invisible_places::water::WaterRippleRuntimeContribution ResolveOfflineRippleCont
     const invisible_places::io::Float3 seepageNormal =
         hasWorldNormal ? normal : invisible_places::io::Float3{};
 
-    const auto seepage = invisible_places::water::EvaluateWaterSeepageGridContribution(
+    auto result = invisible_places::water::EvaluateWaterSeepageGridContribution(
         layer.seepageGrid,
         position,
         seepageNormal,
@@ -1990,43 +1704,6 @@ invisible_places::water::WaterRippleRuntimeContribution ResolveOfflineRippleCont
             },
             .hasCameraPosition = true,
         });
-    result.scale = seepage.scale;
-    result.colourMix = seepage.colourMix;
-    result.emissionAdd = seepage.emissionAdd;
-    result.opacityAdd = seepage.opacityAdd;
-    result.opacityMultiply = seepage.opacityMultiply;
-    result.pointSizeAdd = seepage.pointSizeAdd;
-    result.pointSizeMultiply = seepage.pointSizeMultiply;
-    result.colour = seepage.colour;
-
-    if (pointIndex >= layer.rippleMembershipRanges.size() ||
-        layer.rippleMemberships.empty() ||
-        layer.rippleParams.empty()) {
-        return result;
-    }
-
-    const glm::uvec2 range = layer.rippleMembershipRanges[pointIndex];
-    const std::size_t start = range.x;
-    const std::size_t count = range.y;
-    if (count == 0U || start >= layer.rippleMemberships.size()) {
-        return result;
-    }
-
-    const std::size_t end = std::min(start + count, layer.rippleMemberships.size());
-    for (std::size_t entryIndex = start; entryIndex < end; ++entryIndex) {
-        const auto& membership = layer.rippleMemberships[entryIndex];
-        if (membership.paramIndex >= layer.rippleParams.size()) {
-            continue;
-        }
-        const auto& params = layer.rippleParams[membership.paramIndex];
-        const auto contribution = invisible_places::water::EvaluateWaterRippleRuntimeContribution(
-            params,
-            membership,
-            position,
-            normal,
-            timeSeconds);
-        BlendRippleContribution(&result, contribution, params.blendMode);
-    }
     result.opacityMultiply = std::max(0.0F, result.opacityMultiply);
     result.pointSizeMultiply = std::max(0.0F, result.pointSizeMultiply);
     result.colourMix = Clamp01(result.colourMix);
@@ -2138,57 +1815,7 @@ bool BuildOfflinePointSample(
         pointIndex,
         static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
     sample->viewDepth = viewDepth;
-    float causticPreviewTint = 0.0F;
-    const float caustic = ResolveCausticStrength(
-        cloud,
-        layer.style,
-        pointIndex,
-        sample->worldCenter,
-        stylisationTimeSeconds,
-        &causticPreviewTint);
-    const bool waterEffects = HasWaterEffectComposition(layer);
-    const float waterEffectPointSizeAdd = waterEffects
-                                              ? WaterEffectFieldValue(
-                                                    layer,
-                                                    layer.waterEffectPointSizeAddFieldSlot,
-                                                    pointIndex,
-                                                    0.0F)
-                                              : 0.0F;
-    const float waterEffectPointSizeMultiply = waterEffects
-                                                   ? std::max(
-                                                         0.0F,
-                                                         WaterEffectFieldValue(
-                                                             layer,
-                                                             layer.waterEffectPointSizeMultiplyFieldSlot,
-                                                             pointIndex,
-                                                             1.0F))
-                                                   : 1.0F;
-    const float waterEffectOpacityAdd = waterEffects
-                                            ? WaterEffectFieldValue(
-                                                  layer,
-                                                  layer.waterEffectOpacityAddFieldSlot,
-                                                  pointIndex,
-                                                  0.0F)
-                                            : 0.0F;
-    const float waterEffectOpacityMultiply = waterEffects
-                                                 ? std::max(
-                                                       0.0F,
-                                                       WaterEffectFieldValue(
-                                                           layer,
-                                                           layer.waterEffectOpacityMultiplyFieldSlot,
-                                                           pointIndex,
-                                                           1.0F))
-                                                 : 1.0F;
-    const float waterEffectEmissionAdd = waterEffects
-                                             ? std::max(
-                                                   0.0F,
-                                                   WaterEffectFieldValue(
-                                                       layer,
-                                                       layer.waterEffectEmissionAddFieldSlot,
-                                                       pointIndex,
-                                                       0.0F))
-                                             : 0.0F;
-    const auto sparseRipple = ResolveOfflineRippleContribution(
+    const auto seepage = ResolveOfflineSeepageContribution(
         layer,
         cloud,
         pointIndex,
@@ -2236,12 +1863,9 @@ bool BuildOfflinePointSample(
     const float authoredSurfelDiameter =
         (baseSurfelDiameter *
              waterParticleSizeScale *
-             (1.0F + caustic * std::max(0.0F, layer.style.causticPointSizeBoost)) *
-             waterEffectPointSizeMultiply *
-             sparseRipple.pointSizeMultiply *
+             seepage.pointSizeMultiply *
              rainImpact.sizeScale) +
-        waterEffectPointSizeAdd +
-        sparseRipple.pointSizeAdd;
+        seepage.pointSizeAdd;
     const float authoredPointSize =
         (std::max(
              0.0F,
@@ -2251,12 +1875,9 @@ bool BuildOfflinePointSample(
                  pointIndex,
                  invisible_places::renderer::pointcloud::kInactivePointSizeDefault)) *
              waterParticleSizeScale *
-             (1.0F + caustic * std::max(0.0F, layer.style.causticPointSizeBoost)) *
-             waterEffectPointSizeMultiply *
-             sparseRipple.pointSizeMultiply *
+             seepage.pointSizeMultiply *
              rainImpact.sizeScale) +
-        waterEffectPointSizeAdd +
-        sparseRipple.pointSizeAdd;
+        seepage.pointSizeAdd;
     const float depthOfFieldBlurPixels = ResolveDepthOfFieldBlurPixels(cameraState, viewDepth);
     const bool worldSizedScreenSprites =
         invisible_places::renderer::pointcloud::PointCloudStyleUsesWorldSizedScreenSprites(layer.style);
@@ -2322,11 +1943,8 @@ bool BuildOfflinePointSample(
              layer.style.opacity,
              pointIndex,
              invisible_places::renderer::pointcloud::kInactiveOpacityDefault) *
-             (1.0F + caustic * std::max(0.0F, layer.style.causticOpacityBoost)) *
-             waterEffectOpacityMultiply *
-             sparseRipple.opacityMultiply) +
-        waterEffectOpacityAdd +
-        sparseRipple.opacityAdd +
+             seepage.opacityMultiply) +
+        seepage.opacityAdd +
         rainImpact.opacity);
     if (waterTrails) {
         sample->opacity *= waterTrailVisibility * waterFlowActivity.appearance;
@@ -2351,9 +1969,7 @@ bool BuildOfflinePointSample(
         if (waterParticles) {
             sample->emissive *= WaterParticleFade(cloud, pointIndex, stylisationTimeSeconds);
         }
-        sample->emissive += caustic * std::max(0.0F, layer.style.causticEmissionBoost);
-        sample->emissive += waterEffectEmissionAdd;
-        sample->emissive += sparseRipple.emissionAdd;
+        sample->emissive += seepage.emissionAdd;
         sample->emissive += rainImpact.emission;
         if (waterTrails) {
             sample->emissive *= waterTrailVisibility * waterFlowActivity.appearance;
@@ -2364,16 +1980,8 @@ bool BuildOfflinePointSample(
         sample->color = ResolvePointColor(layer, pointIndex);
         sample->color = glm::mix(
             sample->color,
-            glm::vec3{
-                layer.style.causticTint[0],
-                layer.style.causticTint[1],
-                layer.style.causticTint[2],
-            },
-            CausticColorMixAmount(caustic, causticPreviewTint));
-        sample->color = glm::mix(
-            sample->color,
-            sparseRipple.colour,
-            Clamp01(sparseRipple.colourMix));
+            seepage.colour,
+            Clamp01(seepage.colourMix));
         // Mirrors ApplyRainImpactColour: the shared wet tint first, then the
         // brighter Droplets tint on top.
         sample->color = glm::mix(
@@ -2985,7 +2593,7 @@ void RenderFastBasicPointCloudTile(
                 continue;
             }
 
-            const auto sparseRipple = ResolveOfflineRippleContribution(
+            const auto seepage = ResolveOfflineSeepageContribution(
                 layer,
                 cloud,
                 pointIndex,
@@ -3019,9 +2627,9 @@ void RenderFastBasicPointCloudTile(
             glm::vec3 color =
                 glm::mix(
                     ResolvePointColor(layer, pointIndex),
-                    sparseRipple.colour,
-                    Clamp01(sparseRipple.colourMix)) *
-                (1.0F + std::max(0.0F, sparseRipple.emissionAdd));
+                    seepage.colour,
+                    Clamp01(seepage.colourMix)) *
+                (1.0F + std::max(0.0F, seepage.emissionAdd));
             // Mirrors ApplyRainImpactColour: the shared wet tint first, then
             // the brighter Droplets tint on top.
             color = glm::mix(
@@ -3045,7 +2653,7 @@ void RenderFastBasicPointCloudTile(
                                            ? waterTrailVisibility * waterFlowActivity.appearance
                                            : 1.0F;
             const float opacity = Clamp01(
-                (sparseRipple.opacityMultiply + sparseRipple.opacityAdd + rainImpact.opacity) *
+                (seepage.opacityMultiply + seepage.opacityAdd + rainImpact.opacity) *
                 flowCoverage);
             if (opacity <= 1.0e-5F) {
                 continue;
@@ -3061,8 +2669,8 @@ void RenderFastBasicPointCloudTile(
             const float flowWidthScale = waterTrails ? waterFlowActivity.width : 1.0F;
             const float pointSize =
                 std::clamp(
-                    ((basePointSize * flowWidthScale * sparseRipple.pointSizeMultiply * rainImpact.sizeScale) +
-                     sparseRipple.pointSizeAdd) *
+                    ((basePointSize * flowWidthScale * seepage.pointSizeMultiply * rainImpact.sizeScale) +
+                     seepage.pointSizeAdd) *
                         footprintScale,
                     1.0F,
                     64.0F);

@@ -659,15 +659,6 @@ PointCloudStyleState MakePointCloudStyleForSceneRole(
     return style;
 }
 
-bool PointCloudStyleHasActiveCaustics(const PointCloudStyleState& style) {
-    return style.causticAnimation &&
-           (style.causticIntensity > kMaterialEpsilon ||
-            style.causticPreviewTintAmount > kMaterialEpsilon) &&
-           style.causticMaskFieldSlot >= 0 &&
-           style.causticEdgeFieldSlot >= 0 &&
-           style.causticSeedFieldSlot >= 0;
-}
-
 bool PointCloudStyleUsesWorldSizedScreenSprites(const PointCloudStyleState& style) {
     return style.geometryMode == PointCloudGeometryMode::ScreenSprites &&
            style.screenSpriteSizeMode == PointCloudScreenSpriteSizeMode::WorldMillimeters;
@@ -782,26 +773,6 @@ PointCloudStyleState MakeFastBasicPointCloudStyle(
     style.flowAnimation = false;
     style.waterPathView = false;
     style.waterTrailOverlay = false;
-    style.causticAnimation = sourceStyle.causticAnimation;
-    style.causticIntensity = sourceStyle.causticIntensity;
-    style.causticScale = sourceStyle.causticScale;
-    style.causticSpeed = sourceStyle.causticSpeed;
-    style.causticLineSharpness = sourceStyle.causticLineSharpness;
-    style.causticWarp = sourceStyle.causticWarp;
-    style.causticCellSizeMeters = sourceStyle.causticCellSizeMeters;
-    style.causticLineWidthMeters = sourceStyle.causticLineWidthMeters;
-    style.causticFeatherMeters = sourceStyle.causticFeatherMeters;
-    style.causticSurfacePointSpacingMeters = sourceStyle.causticSurfacePointSpacingMeters;
-    style.causticWarpAmplitudeMeters = sourceStyle.causticWarpAmplitudeMeters;
-    style.causticTint = sourceStyle.causticTint;
-    style.causticEmissionBoost = sourceStyle.causticEmissionBoost;
-    style.causticOpacityBoost = sourceStyle.causticOpacityBoost;
-    style.causticPointSizeBoost = 0.0F;
-    style.causticPreviewTintAmount = sourceStyle.causticPreviewTintAmount;
-    style.causticPreviewTintRegionId = sourceStyle.causticPreviewTintRegionId;
-    style.causticMaskFieldSlot = sourceStyle.causticMaskFieldSlot;
-    style.causticEdgeFieldSlot = sourceStyle.causticEdgeFieldSlot;
-    style.causticSeedFieldSlot = sourceStyle.causticSeedFieldSlot;
     style.shorelineWaveEnabled = sourceStyle.shorelineWaveEnabled;
     style.shorelineWaveAlgorithm = sourceStyle.shorelineWaveAlgorithm;
     style.shorelineHeightFoam = sourceStyle.shorelineHeightFoam;
@@ -1009,10 +980,6 @@ PointCloudMaterialVariant ResolvePointCloudMaterialVariant(
     }
 
     if (PointCloudStyleHasActiveRoughnessMotion(style)) {
-        return PointCloudMaterialVariant::Unified;
-    }
-
-    if (PointCloudStyleHasActiveCaustics(style)) {
         return PointCloudMaterialVariant::Unified;
     }
 

@@ -85,7 +85,6 @@ set(INVISIBLE_PLACES_SHADER_SOURCES
 )
 set(INVISIBLE_PLACES_SHADER_INCLUDES
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_coverage.glsl"
-    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_caustics.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_colormaps.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_timing_colourise.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_sparse_ripple.glsl"

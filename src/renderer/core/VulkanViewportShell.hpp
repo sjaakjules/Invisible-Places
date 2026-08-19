@@ -223,10 +223,6 @@ struct SceneRenderState {
         // heuristic. Only generated Water overlays may interpret the fixed
         // water scalar slots; survey clouds never do.
         bool generatedWaterOverlay = false;
-        // Ripple/Field authored state may remain serialized while its legacy
-        // runtime is inactive. This gate prevents scalar-slot discovery and
-        // sparse-region shading without mutating that authored state.
-        bool regionWaterEffectsEnabled = true;
         bool hasSourceRgb = true;
         bool hasNormals = false;
         bool timingColouriseEligible = false;
@@ -530,10 +526,6 @@ class VulkanViewportShell {
         std::size_t layerId,
         std::size_t scalarFieldIndex,
         std::span<const float> values);
-    void UploadSparseWaterRippleMembership(
-        std::size_t layerId,
-        const std::vector<invisible_places::water::WaterRippleRuntimeMembership>& memberships,
-        const std::vector<invisible_places::water::WaterRippleRuntimeParams>& params);
     [[nodiscard]] DynamicMeshFlowGpuUploadResult UploadDynamicMeshFlowPreviewPointCloud(
         std::size_t layerId,
         const invisible_places::water::MeshSurfaceCache& cache,
@@ -552,21 +544,12 @@ class VulkanViewportShell {
     [[nodiscard]] WaterFlowGpuSourceDiagnostics WaterFlowGpuSourceState(
         std::size_t layerId) const;
     void RemoveWaterFlowGpuSource(std::size_t layerId);
-    void UpdateSparseWaterRippleParams(
-        std::size_t layerId,
-        const std::vector<invisible_places::water::WaterRippleRuntimeParams>& params);
     void UploadWaterSeepageTopology(
         std::size_t layerId,
         const invisible_places::water::WaterSeepageSpatialGrid& grid);
     void UpdateWaterSeepageParams(
         std::size_t layerId,
         const invisible_places::water::WaterSeepageSpatialGrid& grid);
-    [[nodiscard]] std::size_t SparseWaterRippleEffectCount(std::size_t layerId) const;
-    [[nodiscard]] std::size_t SparseWaterRippleRegionCount(std::size_t layerId) const;
-    [[nodiscard]] std::uint64_t SparseWaterRippleMembershipUploadRevision(std::size_t layerId) const;
-    [[nodiscard]] std::uint64_t SparseWaterRippleParamsUploadRevision(std::size_t layerId) const;
-    [[nodiscard]] WaterEffectFramePublicationDiagnostics SparseWaterRippleParamsPublicationState(
-        std::size_t layerId) const;
     [[nodiscard]] std::size_t WaterSeepageNodeCount(std::size_t layerId) const;
     [[nodiscard]] std::size_t WaterSeepageOccupiedCellCount(std::size_t layerId) const;
     [[nodiscard]] std::size_t WaterSeepageNodeReferenceCount(std::size_t layerId) const;
@@ -718,13 +701,9 @@ class VulkanViewportShell {
         BufferAllocation colorBuffer{};
         BufferAllocation normalBuffer{};
         BufferAllocation scalarFieldBuffer{};
-        BufferAllocation sparseRippleRangeBuffer{};
-        BufferAllocation sparseRippleMembershipBuffer{};
-        // Animated Ripple and Seepage state is published only after the target
+        // Animated Seepage state is published only after the target
         // frame fence signals. Dedicated EXR snapshots keep asynchronous export
         // reads isolated from live viewport updates.
-        std::array<BufferAllocation, kFramesInFlight> sparseRippleParamsBuffers{};
-        BufferAllocation sparseRippleExrParamsBuffer{};
         BufferAllocation seepageNodeBuffer{};
         std::array<BufferAllocation, kFramesInFlight> seepageParamsBuffers{};
         BufferAllocation seepageExrParamsBuffer{};
@@ -783,14 +762,6 @@ class VulkanViewportShell {
         std::uint32_t activePointCount = 0;
         std::uint32_t interactiveSampledIndexCount = 0;
         std::uint32_t scalarFieldCount = 0;
-        std::uint32_t sparseRippleMembershipCount = 0;
-        std::uint32_t sparseRippleParamCount = 0;
-        std::uint64_t sparseRippleMembershipUploadRevision = 0;
-        std::uint64_t sparseRippleParamsUploadRevision = 0;
-        std::uint64_t sparseRippleParamsGeneration = 0;
-        std::array<std::uint64_t, kFramesInFlight> sparseRippleParamsFrameGenerations{};
-        std::uint64_t sparseRippleParamsExrGeneration = 0;
-        std::vector<std::byte> pendingSparseRippleParams;
         std::uint32_t seepageNodeCount = 0;
         std::uint32_t seepageHashCellCapacity = 0;
         std::uint32_t seepageOccupiedCellCount = 0;
@@ -875,7 +846,6 @@ class VulkanViewportShell {
         bool usingSampledIndices = false;
         bool hasSourceRgb = false;
         bool hasNormals = false;
-        std::vector<std::uint32_t> activeSparseRipplePointIndices;
         std::vector<PointHighlightResources> highlights;
         std::vector<WaterFlowRetiredOutputResources> waterFlowRetiredOutputs;
         std::uint32_t waterFlowDeleteOutstandingFrameMask = 0U;
@@ -1212,8 +1182,6 @@ class VulkanViewportShell {
     void RecordRainDrawWithDescriptor(VkCommandBuffer commandBuffer, VkDescriptorSet descriptorSet,
                                       VkPipeline pipeline);
     void CleanupRainResources();
-    void FlushSparseWaterRippleParamsForFrame(std::size_t frameIndex);
-    void FlushSparseWaterRippleParamsForExr();
     void FlushWaterSeepageParamsForFrame(std::size_t frameIndex);
     void FlushWaterSeepageParamsForExr();
     void UpdatePointCloudDescriptorSets(ActivePointCloudResources* resources,

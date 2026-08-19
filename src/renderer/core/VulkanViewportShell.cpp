@@ -125,18 +125,6 @@ struct alignas(16) PointCloudStyleGpu {
     glm::vec4 stylisationParams2{0.25F, 0.0F, 0.0F, 0.0F};
     glm::vec4 surfaceMotionParams{0.0F, 1.5F, 0.35F, 0.58F};
     glm::vec4 surfaceMotionStats{0.0F, 1.0F, 1.0F, 0.25F};
-    glm::uvec4 causticControl{0U, 0U, 0U, 0U};
-    glm::vec4 causticParams0{0.0F, 0.20F, 0.55F, 0.015F};
-    glm::vec4 causticParams1{0.045F, 1.15F, 0.08F, 0.0F};
-    glm::vec4 causticParams2{0.006F, 0.005F, 0.0F, 0.0F};
-    glm::vec4 causticTint{0.62F, 0.88F, 1.0F, 1.0F};
-    glm::uvec4 waterEffectControl{0U, 0U, 0U, 0U};
-    glm::uvec4 waterEffectSlots0{0U, 0U, 0U, 0U};
-    glm::uvec4 waterEffectSlots1{0U, 0U, 0U, 0U};
-    glm::uvec4 rippleEffectSlots0{0U, 0U, 0U, 0U};
-    glm::uvec4 rippleEffectSlots1{0U, 0U, 0U, 0U};
-    glm::uvec4 rippleEffectSlots2{0U, 0U, 0U, 0U};
-    glm::uvec4 rippleEffectSlots3{0U, 0U, 0U, 0U};
     glm::uvec4 shorelineWaveControl{0U, 1U, 0U, 0U};
     glm::vec4 shorelineWaveParams0{1.55F, 0.45F, 0.05F, 1.15F};
     glm::vec4 shorelineWaveParams1{1.0F, 0.0F, 1.0F, 0.25F};
@@ -211,18 +199,18 @@ struct alignas(16) PointCloudStyleGpu {
 // PointStyleData is mirrored verbatim by the point-cloud GLSL uniform blocks.
 // Keep these checks beside the CPU definition so a capacity or field-layout
 // change cannot silently shift the fixed std140 ABI.
-static_assert(offsetof(PointCloudStyleGpu, timingColouriseControl) == 1168U);
-static_assert(offsetof(PointCloudStyleGpu, timingColouriseSources) == 1184U);
-static_assert(offsetof(PointCloudStyleGpu, timingColouriseRanges) == 1312U);
-static_assert(offsetof(PointCloudStyleGpu, timingColouriseLut) == 1440U);
+static_assert(offsetof(PointCloudStyleGpu, timingColouriseControl) == 976U);
+static_assert(offsetof(PointCloudStyleGpu, timingColouriseSources) == 992U);
+static_assert(offsetof(PointCloudStyleGpu, timingColouriseRanges) == 1120U);
+static_assert(offsetof(PointCloudStyleGpu, timingColouriseLut) == 1248U);
 static_assert(
-    offsetof(PointCloudStyleGpu, additionalShorelineCount) == 9632U);
-static_assert(sizeof(PointCloudStyleGpu) == 10160U);
+    offsetof(PointCloudStyleGpu, additionalShorelineCount) == 9440U);
+static_assert(sizeof(PointCloudStyleGpu) == 9968U);
 
-// The surfel/EXR pair has the largest point-cloud stage interface: 21 scalar
+// The surfel/EXR pair has the largest point-cloud stage interface: 20 scalar
 // components plus one flat vec4 per Timing Colourise effect.
 constexpr std::uint32_t kPointCloudMaximumInterstageComponents =
-    21U +
+    20U +
     (4U * static_cast<std::uint32_t>(
               renderer::pointcloud::kTimingColouriseMaxEffects));
 
@@ -296,26 +284,6 @@ std::uint32_t ActiveRainParticleCount(const SceneRenderState& state) {
             std::clamp(state.rainSettings.rainLevel, 0.0F, 1.0F) *
             std::clamp(state.rainSettings.density * intensity.density, 0.0F, 1.0F))));
 }
-
-struct alignas(8) SparseWaterRippleRangeGpu {
-    glm::uvec2 range{0U, 0U};
-};
-
-struct alignas(16) SparseWaterRippleMembershipGpu {
-    glm::uvec4 control{0U, 0U, 0U, 0U};
-    glm::vec4 data{0.0F, 0.0F, 0.0F, 0.0F};
-};
-
-struct alignas(16) SparseWaterRippleParamsGpu {
-    glm::uvec4 control{0U, 0U, 0U, 0U};
-    glm::vec4 region0{0.0F, 0.0F, 0.0F, 1.0F};
-    glm::vec4 region1{1.0F, 0.0F, 0.0F, 0.60F};
-    glm::vec4 pattern0{1.0F, 0.25F, 0.55F, 0.35F};
-    glm::vec4 pattern1{0.06F, 0.0F, 0.75F, 0.0F};
-    glm::vec4 response0{0.85F, 0.0F, 1.0F, 0.0F};
-    glm::vec4 response1{1.0F, 0.62F, 0.88F, 1.0F};
-    glm::vec4 response2{0.35F, 0.0F, 0.0F, 0.0F};
-};
 
 struct alignas(16) WaterSeepageLookGpu {
     // x: pattern, y: blend mode.
@@ -707,75 +675,6 @@ struct alignas(16) DynamicMeshFlowAttractorGpu {
     glm::vec4 positionRadius{0.0F, 0.0F, 0.0F, 0.0F};
     glm::vec4 strengthEnabled{0.0F, 0.0F, 0.0F, 0.0F};
 };
-
-SparseWaterRippleParamsGpu MakeSparseWaterRippleParamsGpu(
-    const invisible_places::water::WaterRippleRuntimeParams& params) {
-    const auto finiteOr = [](float value, float fallback) {
-        return std::isfinite(value) ? value : fallback;
-    };
-    const auto finiteClamp = [&finiteOr](float value, float minimum, float maximum, float fallback) {
-        return std::clamp(finiteOr(value, fallback), minimum, maximum);
-    };
-    SparseWaterRippleParamsGpu gpu;
-    gpu.control = glm::uvec4{
-        static_cast<std::uint32_t>(params.overlayType),
-        static_cast<std::uint32_t>(params.blendMode),
-        params.seed,
-        params.layerId,
-    };
-    gpu.region0 = glm::vec4{
-        finiteOr(params.regionCenter.x, 0.0F),
-        finiteOr(params.regionCenter.y, 0.0F),
-        finiteOr(params.regionCenter.z, 0.0F),
-        finiteClamp(params.regionStrength, 0.0F, 1.0F, 0.0F),
-    };
-    glm::vec3 direction = params.direction;
-    if (!std::isfinite(direction.x) ||
-        !std::isfinite(direction.y) ||
-        !std::isfinite(direction.z) ||
-        glm::dot(direction, direction) <= 1.0e-8F) {
-        direction = {1.0F, 0.0F, 0.0F};
-    } else {
-        direction = glm::normalize(direction);
-    }
-    gpu.region1 = glm::vec4{
-        direction.x,
-        direction.y,
-        direction.z,
-        std::max(1.0e-5F, finiteOr(params.edgeBlendWidth, 1.0e-5F)),
-    };
-    gpu.pattern0 = glm::vec4{
-        finiteClamp(params.patternScale, 0.05F, 100.0F, 1.0F),
-        std::max(0.005F, finiteOr(params.wavelengthMeters, 0.25F)),
-        std::max(0.0F, finiteOr(params.speed, 0.0F)),
-        std::max(0.0F, finiteOr(params.warp, 0.0F)),
-    };
-    gpu.pattern1 = glm::vec4{
-        std::max(0.0F, finiteOr(params.turbulence, 0.0F)),
-        finiteOr(params.phase, 0.0F),
-        std::max(0.0F, finiteOr(params.response.intensity, 0.0F)),
-        finiteClamp(params.density, 0.0F, 1.0F, 0.0F),
-    };
-    gpu.response0 = glm::vec4{
-        std::max(0.0F, finiteOr(params.response.emissionAdd, 0.0F)),
-        finiteOr(params.response.opacityAdd, 0.0F),
-        std::max(0.0F, finiteOr(params.response.opacityMultiply, 1.0F)),
-        finiteOr(params.response.pointSizeAdd, 0.0F),
-    };
-    gpu.response1 = glm::vec4{
-        std::max(0.0F, finiteOr(params.response.pointSizeMultiply, 1.0F)),
-        finiteClamp(params.response.colouriseRed, 0.0F, 1.0F, 0.62F),
-        finiteClamp(params.response.colouriseGreen, 0.0F, 1.0F, 0.88F),
-        finiteClamp(params.response.colouriseBlue, 0.0F, 1.0F, 1.0F),
-    };
-    gpu.response2 = glm::vec4{
-        finiteClamp(params.response.colouriseAmount, 0.0F, 1.0F, 0.0F),
-        0.0F,
-        0.0F,
-        0.0F,
-    };
-    return gpu;
-}
 
 std::uint32_t WaterSeepageQualityGpu(invisible_places::water::WaterSeepageQuality quality) {
     using Quality = invisible_places::water::WaterSeepageQuality;
@@ -1242,18 +1141,6 @@ std::optional<std::uint32_t> FindGroundIdScalarFieldSlot(
         scalarFields,
         {"groundid", "scalargroundid"},
         "groundid");
-}
-
-std::optional<std::uint32_t> FindExactScalarFieldSlot(
-    const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields,
-    std::string_view name) {
-    const auto normalizedName = NormalizeScalarFieldName(name);
-    for (std::size_t index = 0; index < scalarFields.size(); ++index) {
-        if (NormalizeScalarFieldName(scalarFields[index].name) == normalizedName) {
-            return static_cast<std::uint32_t>(index);
-        }
-    }
-    return std::nullopt;
 }
 
 constexpr std::uint32_t kSurfelVerticesPerPoint = 6U;
@@ -2011,7 +1898,6 @@ void VulkanViewportShell::DrawFrame() {
     // This frame slot is no longer referenced by the GPU, so it is safe to
     // publish the newest compact water-effect snapshots without waiting for
     // any other in-flight frame.
-    FlushSparseWaterRippleParamsForFrame(currentFrameIndex_);
     FlushWaterSeepageParamsForFrame(currentFrameIndex_);
     const auto maintenanceEnd = collectDiagnostics
                                     ? std::chrono::steady_clock::now()
@@ -2982,24 +2868,6 @@ void VulkanViewportShell::UploadPointCloud(std::size_t layerId, const invisible_
             UploadBufferData(resources.scalarFieldBuffer, &fallbackScalar, sizeof(float));
         }
         TrackPointCloudResidentPeak(PointCloudResourceResidentBytes(resources));
-        const SparseWaterRippleRangeGpu emptySparseRippleRange{};
-        resources.sparseRippleRangeBuffer =
-            CreateHostVisibleBuffer(sizeof(emptySparseRippleRange), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        UploadBufferData(resources.sparseRippleRangeBuffer, &emptySparseRippleRange, sizeof(emptySparseRippleRange));
-        const SparseWaterRippleMembershipGpu emptySparseRippleMembership{};
-        resources.sparseRippleMembershipBuffer =
-            CreateHostVisibleBuffer(sizeof(emptySparseRippleMembership), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        UploadBufferData(resources.sparseRippleMembershipBuffer, &emptySparseRippleMembership,
-                         sizeof(emptySparseRippleMembership));
-        const SparseWaterRippleParamsGpu emptySparseRippleParams{};
-        for (auto& paramsBuffer : resources.sparseRippleParamsBuffers) {
-            paramsBuffer = CreateHostVisibleBuffer(sizeof(emptySparseRippleParams), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            UploadBufferData(paramsBuffer, &emptySparseRippleParams, sizeof(emptySparseRippleParams));
-        }
-        resources.sparseRippleExrParamsBuffer =
-            CreateHostVisibleBuffer(sizeof(emptySparseRippleParams), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        UploadBufferData(resources.sparseRippleExrParamsBuffer, &emptySparseRippleParams,
-                         sizeof(emptySparseRippleParams));
         const WaterSeepageNodeTopologyGpu emptySeepageNode{};
         resources.seepageNodeBuffer =
             CreateHostVisibleBuffer(sizeof(emptySeepageNode), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -3447,33 +3315,6 @@ DynamicMeshFlowGpuUploadResult VulkanViewportShell::UploadDynamicMeshFlowPreview
             VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         UploadBufferData(resources->colorBuffer, packedColors.data(), resources->colorBuffer.size);
 
-        const SparseWaterRippleRangeGpu emptySparseRippleRange{};
-        resources->sparseRippleRangeBuffer = CreateHostVisibleBuffer(
-            sizeof(emptySparseRippleRange),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        UploadBufferData(resources->sparseRippleRangeBuffer, &emptySparseRippleRange, sizeof(emptySparseRippleRange));
-        const SparseWaterRippleMembershipGpu emptySparseRippleMembership{};
-        resources->sparseRippleMembershipBuffer = CreateHostVisibleBuffer(
-            sizeof(emptySparseRippleMembership),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        UploadBufferData(
-            resources->sparseRippleMembershipBuffer,
-            &emptySparseRippleMembership,
-            sizeof(emptySparseRippleMembership));
-        const SparseWaterRippleParamsGpu emptySparseRippleParams{};
-        for (auto& paramsBuffer : resources->sparseRippleParamsBuffers) {
-            paramsBuffer = CreateHostVisibleBuffer(
-                sizeof(emptySparseRippleParams),
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            UploadBufferData(paramsBuffer, &emptySparseRippleParams, sizeof(emptySparseRippleParams));
-        }
-        resources->sparseRippleExrParamsBuffer = CreateHostVisibleBuffer(
-            sizeof(emptySparseRippleParams),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        UploadBufferData(
-            resources->sparseRippleExrParamsBuffer,
-            &emptySparseRippleParams,
-            sizeof(emptySparseRippleParams));
         const WaterSeepageNodeTopologyGpu emptySeepageNode{};
         resources->seepageNodeBuffer = CreateHostVisibleBuffer(
             sizeof(emptySeepageNode),
@@ -3828,40 +3669,6 @@ DynamicMeshFlowGpuUpdateResult VulkanViewportShell::UpdateDynamicMeshFlowGpuSimu
                 staged.colorBuffer,
                 packedColors.data(),
                 staged.colorBuffer.size);
-
-            const SparseWaterRippleRangeGpu emptySparseRippleRange{};
-            staged.sparseRippleRangeBuffer = CreateHostVisibleBuffer(
-                sizeof(emptySparseRippleRange),
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            UploadBufferData(
-                staged.sparseRippleRangeBuffer,
-                &emptySparseRippleRange,
-                sizeof(emptySparseRippleRange));
-            const SparseWaterRippleMembershipGpu emptySparseRippleMembership{};
-            staged.sparseRippleMembershipBuffer = CreateHostVisibleBuffer(
-                sizeof(emptySparseRippleMembership),
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            UploadBufferData(
-                staged.sparseRippleMembershipBuffer,
-                &emptySparseRippleMembership,
-                sizeof(emptySparseRippleMembership));
-            const SparseWaterRippleParamsGpu emptySparseRippleParams{};
-            for (auto& paramsBuffer : staged.sparseRippleParamsBuffers) {
-                paramsBuffer = CreateHostVisibleBuffer(
-                    sizeof(emptySparseRippleParams),
-                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-                UploadBufferData(
-                    paramsBuffer,
-                    &emptySparseRippleParams,
-                    sizeof(emptySparseRippleParams));
-            }
-            staged.sparseRippleExrParamsBuffer = CreateHostVisibleBuffer(
-                sizeof(emptySparseRippleParams),
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            UploadBufferData(
-                staged.sparseRippleExrParamsBuffer,
-                &emptySparseRippleParams,
-                sizeof(emptySparseRippleParams));
 
             const WaterSeepageNodeTopologyGpu emptySeepageNode{};
             staged.seepageNodeBuffer = CreateHostVisibleBuffer(
@@ -4930,15 +4737,8 @@ WaterFlowGpuSourceUploadResult VulkanViewportShell::UploadWaterFlowGpuSource(
     // A newly-created Flow layer adopts the completely staged dummy point
     // effect/style bundle. An existing settled Flow keeps its already-bound
     // immutable bundle; the unused staged copy is released below.
-    if (resources->sparseRippleRangeBuffer.buffer == VK_NULL_HANDLE) {
-        moveBuffer(&resources->sparseRippleRangeBuffer, &staging.sparseRippleRangeBuffer);
-        moveBuffer(
-            &resources->sparseRippleMembershipBuffer,
-            &staging.sparseRippleMembershipBuffer);
+    if (resources->seepageNodeBuffer.buffer == VK_NULL_HANDLE) {
         for (std::size_t frameIndex = 0U; frameIndex < kFramesInFlight; ++frameIndex) {
-            moveBuffer(
-                &resources->sparseRippleParamsBuffers[frameIndex],
-                &staging.sparseRippleParamsBuffers[frameIndex]);
             moveBuffer(
                 &resources->seepageParamsBuffers[frameIndex],
                 &staging.seepageParamsBuffers[frameIndex]);
@@ -4946,9 +4746,6 @@ WaterFlowGpuSourceUploadResult VulkanViewportShell::UploadWaterFlowGpuSource(
                 &resources->styleBuffers[frameIndex],
                 &staging.styleBuffers[frameIndex]);
         }
-        moveBuffer(
-            &resources->sparseRippleExrParamsBuffer,
-            &staging.sparseRippleExrParamsBuffer);
         moveBuffer(&resources->seepageNodeBuffer, &staging.seepageNodeBuffer);
         moveBuffer(&resources->seepageExrParamsBuffer, &staging.seepageExrParamsBuffer);
         moveBuffer(&resources->seepageHashCellBuffer, &staging.seepageHashCellBuffer);
@@ -5028,270 +4825,6 @@ void VulkanViewportShell::RemoveWaterFlowGpuSource(std::size_t layerId) {
     resources->waterFlowSettledPointCount = 0U;
     resources->activePointCount = 0U;
     ++sceneRevision_;
-}
-
-void VulkanViewportShell::UploadSparseWaterRippleMembership(
-    std::size_t layerId,
-    const std::vector<invisible_places::water::WaterRippleRuntimeMembership>& memberships,
-    const std::vector<invisible_places::water::WaterRippleRuntimeParams>& params) {
-    auto* resources = FindPointCloudResources(layerId);
-    if (resources == nullptr || resources->pointCount == 0U) {
-        throw std::runtime_error{"Cannot update sparse Ripple membership for an unloaded point cloud."};
-    }
-
-    std::vector<invisible_places::water::WaterRippleRuntimeMembership> sanitized;
-    sanitized.reserve(memberships.size());
-    for (const auto& membership : memberships) {
-        if (membership.pointIndex < resources->pointCount && membership.paramIndex < params.size()) {
-            sanitized.push_back(membership);
-        }
-    }
-    std::sort(
-        sanitized.begin(),
-        sanitized.end(),
-        [](const auto& left, const auto& right) {
-            if (left.pointIndex != right.pointIndex) {
-                return left.pointIndex < right.pointIndex;
-            }
-            return left.paramIndex < right.paramIndex;
-        });
-    if (sanitized.size() > std::numeric_limits<std::uint32_t>::max() ||
-        params.size() > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::runtime_error{"Sparse Ripple membership count exceeds the current 32-bit limit."};
-    }
-
-    std::vector<SparseWaterRippleMembershipGpu> gpuMemberships;
-    gpuMemberships.reserve(std::max<std::size_t>(sanitized.size(), 1U));
-    for (const auto& membership : sanitized) {
-        SparseWaterRippleMembershipGpu gpuMembership;
-        gpuMembership.control = glm::uvec4{membership.paramIndex, 0U, 0U, 0U};
-        gpuMembership.data = glm::vec4{
-            std::max(0.0F, membership.edgeDistance),
-            std::isfinite(membership.seed) ? membership.seed : 0.0F,
-            std::isfinite(membership.shoreDistance) ? std::max(0.0F, membership.shoreDistance) : 0.0F,
-            0.0F,
-        };
-        gpuMemberships.push_back(gpuMembership);
-    }
-    if (gpuMemberships.empty()) {
-        gpuMemberships.push_back(SparseWaterRippleMembershipGpu{});
-    }
-
-    const auto membershipBufferSize =
-        static_cast<VkDeviceSize>(gpuMemberships.size() * sizeof(SparseWaterRippleMembershipGpu));
-
-    std::vector<SparseWaterRippleParamsGpu> gpuParams;
-    gpuParams.reserve(std::max<std::size_t>(params.size(), 1U));
-    for (const auto& param : params) {
-        gpuParams.push_back(MakeSparseWaterRippleParamsGpu(param));
-    }
-    if (gpuParams.empty()) {
-        gpuParams.push_back(SparseWaterRippleParamsGpu{});
-    }
-    const auto paramsBufferSize =
-        static_cast<VkDeviceSize>(gpuParams.size() * sizeof(SparseWaterRippleParamsGpu));
-    std::vector<std::byte> pendingParams(
-        static_cast<std::size_t>(paramsBufferSize));
-    std::memcpy(
-        pendingParams.data(),
-        gpuParams.data(),
-        static_cast<std::size_t>(paramsBufferSize));
-
-    struct SparseRippleBufferSet {
-        BufferAllocation ranges{};
-        BufferAllocation memberships{};
-        std::array<BufferAllocation, kFramesInFlight> params{};
-        BufferAllocation exrParams{};
-    } pending;
-    const auto destroyBufferSet = [this](SparseRippleBufferSet* buffers) {
-        if (buffers == nullptr) {
-            return;
-        }
-        DestroyBuffer(&buffers->ranges);
-        DestroyBuffer(&buffers->memberships);
-        for (auto& paramsBuffer : buffers->params) {
-            DestroyBuffer(&paramsBuffer);
-        }
-        DestroyBuffer(&buffers->exrParams);
-    };
-
-    const auto pointCount = static_cast<std::size_t>(resources->pointCount);
-    const auto rangeBufferSize = static_cast<VkDeviceSize>(
-        sanitized.empty()
-            ? sizeof(SparseWaterRippleRangeGpu)
-            : pointCount * sizeof(SparseWaterRippleRangeGpu));
-    std::vector<std::uint32_t> activePointIndices;
-    activePointIndices.reserve(sanitized.size());
-    try {
-        pending.ranges = CreateHostVisibleBuffer(
-            rangeBufferSize,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        if (pending.ranges.mapped == nullptr) {
-            throw std::runtime_error{
-                "Sparse Ripple range buffer is not host visible."};
-        }
-        std::memset(
-            pending.ranges.mapped,
-            0,
-            static_cast<std::size_t>(pending.ranges.size));
-        auto* mappedRanges =
-            static_cast<SparseWaterRippleRangeGpu*>(pending.ranges.mapped);
-        std::size_t groupStart = 0;
-        while (groupStart < sanitized.size()) {
-            const auto pointIndex = sanitized[groupStart].pointIndex;
-            std::size_t groupEnd = groupStart + 1U;
-            while (groupEnd < sanitized.size() && sanitized[groupEnd].pointIndex == pointIndex) {
-                ++groupEnd;
-            }
-            mappedRanges[pointIndex].range = glm::uvec2{
-                static_cast<std::uint32_t>(groupStart),
-                static_cast<std::uint32_t>(groupEnd - groupStart),
-            };
-            activePointIndices.push_back(pointIndex);
-            groupStart = groupEnd;
-        }
-
-        pending.memberships = CreateHostVisibleBuffer(
-            membershipBufferSize,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        UploadBufferData(
-            pending.memberships,
-            gpuMemberships.data(),
-            pending.memberships.size);
-        for (auto& paramsBuffer : pending.params) {
-            paramsBuffer = CreateHostVisibleBuffer(
-                paramsBufferSize,
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            UploadBufferData(paramsBuffer, gpuParams.data(), paramsBufferSize);
-        }
-        pending.exrParams = CreateHostVisibleBuffer(
-            paramsBufferSize,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        UploadBufferData(
-            pending.exrParams,
-            gpuParams.data(),
-            paramsBufferSize);
-    } catch (...) {
-        destroyBufferSet(&pending);
-        throw;
-    }
-
-    std::swap(resources->sparseRippleRangeBuffer, pending.ranges);
-    std::swap(resources->sparseRippleMembershipBuffer, pending.memberships);
-    std::swap(resources->sparseRippleParamsBuffers, pending.params);
-    std::swap(resources->sparseRippleExrParamsBuffer, pending.exrParams);
-    try {
-        ReplacePointCloudDescriptorSets(resources);
-    } catch (...) {
-        std::swap(resources->sparseRippleRangeBuffer, pending.ranges);
-        std::swap(resources->sparseRippleMembershipBuffer, pending.memberships);
-        std::swap(resources->sparseRippleParamsBuffers, pending.params);
-        std::swap(resources->sparseRippleExrParamsBuffer, pending.exrParams);
-        destroyBufferSet(&pending);
-        throw;
-    }
-    destroyBufferSet(&pending);
-
-    resources->pendingSparseRippleParams = std::move(pendingParams);
-    ++resources->sparseRippleParamsGeneration;
-    resources->sparseRippleParamsFrameGenerations.fill(
-        resources->sparseRippleParamsGeneration);
-    resources->sparseRippleParamsExrGeneration =
-        resources->sparseRippleParamsGeneration;
-    resources->activeSparseRipplePointIndices = std::move(activePointIndices);
-    resources->sparseRippleMembershipCount = static_cast<std::uint32_t>(sanitized.size());
-    resources->sparseRippleParamCount = static_cast<std::uint32_t>(params.size());
-    ++resources->sparseRippleMembershipUploadRevision;
-    ++resources->sparseRippleParamsUploadRevision;
-
-    ++sceneRevision_;
-}
-
-void VulkanViewportShell::UpdateSparseWaterRippleParams(
-    std::size_t layerId,
-    const std::vector<invisible_places::water::WaterRippleRuntimeParams>& params) {
-    auto* resources = FindPointCloudResources(layerId);
-    if (resources == nullptr || resources->pointCount == 0U) {
-        throw std::runtime_error{"Cannot update sparse Ripple params for an unloaded point cloud."};
-    }
-    if (params.size() != resources->sparseRippleParamCount) {
-        throw std::runtime_error{"Sparse Ripple params count changed without rebuilding membership."};
-    }
-    if (params.size() > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::runtime_error{"Sparse Ripple params count exceeds the current 32-bit limit."};
-    }
-
-    std::vector<SparseWaterRippleParamsGpu> gpuParams;
-    gpuParams.reserve(std::max<std::size_t>(params.size(), 1U));
-    for (const auto& param : params) {
-        gpuParams.push_back(MakeSparseWaterRippleParamsGpu(param));
-    }
-    if (gpuParams.empty()) {
-        gpuParams.push_back(SparseWaterRippleParamsGpu{});
-    }
-    const auto paramsBufferSize =
-        static_cast<VkDeviceSize>(gpuParams.size() * sizeof(SparseWaterRippleParamsGpu));
-    const bool hasExpectedBuffers = std::all_of(
-        resources->sparseRippleParamsBuffers.begin(),
-        resources->sparseRippleParamsBuffers.end(),
-        [paramsBufferSize](const BufferAllocation& buffer) {
-            return buffer.size == paramsBufferSize;
-        });
-    if (!hasExpectedBuffers ||
-        resources->sparseRippleExrParamsBuffer.size != paramsBufferSize) {
-        throw std::runtime_error{"Sparse Ripple params buffer has an unexpected size."};
-    }
-    resources->pendingSparseRippleParams.resize(static_cast<std::size_t>(paramsBufferSize));
-    std::memcpy(
-        resources->pendingSparseRippleParams.data(),
-        gpuParams.data(),
-        static_cast<std::size_t>(paramsBufferSize));
-    ++resources->sparseRippleParamsGeneration;
-    ++resources->sparseRippleParamsUploadRevision;
-    ++sceneRevision_;
-}
-
-void VulkanViewportShell::FlushSparseWaterRippleParamsForFrame(std::size_t frameIndex) {
-    if (frameIndex >= kFramesInFlight) {
-        return;
-    }
-    for (auto& resources : pointCloudResources_) {
-        if (resources.sparseRippleParamsFrameGenerations[frameIndex] ==
-                resources.sparseRippleParamsGeneration ||
-            resources.pendingSparseRippleParams.empty()) {
-            continue;
-        }
-        auto& target = resources.sparseRippleParamsBuffers[frameIndex];
-        if (target.size != resources.pendingSparseRippleParams.size()) {
-            throw std::runtime_error{"Sparse Ripple frame params buffer has an unexpected size."};
-        }
-        UploadBufferData(
-            target,
-            resources.pendingSparseRippleParams.data(),
-            target.size);
-        resources.sparseRippleParamsFrameGenerations[frameIndex] =
-            resources.sparseRippleParamsGeneration;
-    }
-}
-
-void VulkanViewportShell::FlushSparseWaterRippleParamsForExr() {
-    for (auto& resources : pointCloudResources_) {
-        if (resources.sparseRippleParamsExrGeneration ==
-                resources.sparseRippleParamsGeneration ||
-            resources.pendingSparseRippleParams.empty()) {
-            continue;
-        }
-        if (resources.sparseRippleExrParamsBuffer.size !=
-            resources.pendingSparseRippleParams.size()) {
-            throw std::runtime_error{"Sparse Ripple EXR params buffer has an unexpected size."};
-        }
-        UploadBufferData(
-            resources.sparseRippleExrParamsBuffer,
-            resources.pendingSparseRippleParams.data(),
-            resources.sparseRippleExrParamsBuffer.size);
-        resources.sparseRippleParamsExrGeneration =
-            resources.sparseRippleParamsGeneration;
-    }
 }
 
 void VulkanViewportShell::UploadWaterSeepageTopology(
@@ -5549,50 +5082,6 @@ void VulkanViewportShell::FlushWaterSeepageParamsForExr() {
             resources.seepageExrParamsBuffer.size);
         resources.seepageParamsExrGeneration = resources.seepageParamsGeneration;
     }
-}
-
-std::size_t VulkanViewportShell::SparseWaterRippleEffectCount(std::size_t layerId) const {
-    const auto* resources = FindPointCloudResources(layerId);
-    return resources != nullptr ? static_cast<std::size_t>(resources->sparseRippleMembershipCount) : 0U;
-}
-
-std::size_t VulkanViewportShell::SparseWaterRippleRegionCount(std::size_t layerId) const {
-    const auto* resources = FindPointCloudResources(layerId);
-    return resources != nullptr ? static_cast<std::size_t>(resources->sparseRippleParamCount) : 0U;
-}
-
-std::uint64_t VulkanViewportShell::SparseWaterRippleMembershipUploadRevision(std::size_t layerId) const {
-    const auto* resources = FindPointCloudResources(layerId);
-    return resources != nullptr ? resources->sparseRippleMembershipUploadRevision : 0U;
-}
-
-std::uint64_t VulkanViewportShell::SparseWaterRippleParamsUploadRevision(std::size_t layerId) const {
-    const auto* resources = FindPointCloudResources(layerId);
-    return resources != nullptr ? resources->sparseRippleParamsUploadRevision : 0U;
-}
-
-WaterEffectFramePublicationDiagnostics
-VulkanViewportShell::SparseWaterRippleParamsPublicationState(std::size_t layerId) const {
-    WaterEffectFramePublicationDiagnostics diagnostics;
-    const auto* resources = FindPointCloudResources(layerId);
-    if (resources == nullptr) {
-        return diagnostics;
-    }
-    diagnostics.requestedGeneration = resources->sparseRippleParamsGeneration;
-    diagnostics.liveFrameGenerations = resources->sparseRippleParamsFrameGenerations;
-    diagnostics.exrGeneration = resources->sparseRippleParamsExrGeneration;
-    const auto firstLiveBuffer = resources->sparseRippleParamsBuffers[0].buffer;
-    const auto secondLiveBuffer = resources->sparseRippleParamsBuffers[1].buffer;
-    diagnostics.liveBuffersDistinct =
-        firstLiveBuffer != VK_NULL_HANDLE &&
-        secondLiveBuffer != VK_NULL_HANDLE &&
-        firstLiveBuffer != secondLiveBuffer;
-    const auto exrBuffer = resources->sparseRippleExrParamsBuffer.buffer;
-    diagnostics.exrBufferDistinct =
-        exrBuffer != VK_NULL_HANDLE &&
-        exrBuffer != firstLiveBuffer &&
-        exrBuffer != secondLiveBuffer;
-    return diagnostics;
 }
 
 std::size_t VulkanViewportShell::WaterSeepageNodeCount(std::size_t layerId) const {
@@ -7234,7 +6723,6 @@ bool VulkanViewportShell::BeginPointCloudExrFrame(const PointCloudExrFrameReques
     }
     // EXR owns a separate parameter snapshot. The fence above guarantees a
     // previous asynchronous export is no longer reading it.
-    FlushSparseWaterRippleParamsForExr();
     FlushWaterSeepageParamsForExr();
     // The EXR descriptor is separate from both live frame descriptors. It is
     // rebound only after its own fence so surface-cache promotion cannot
@@ -8099,7 +7587,13 @@ void VulkanViewportShell::CreatePresentRenderPass() {
 }
 
 void VulkanViewportShell::CreatePointDescriptorSetLayout() {
-    std::array<VkDescriptorSetLayoutBinding, 19> bindings{};
+    // Storage-buffer bindings: 4-6 point data, 10-12/16 Seepage, 13-15 rain
+    // impact, 17-18 Mesh Flow contact. Bindings 7-9 were the removed sparse
+    // Ripple buffers and are intentionally left unbound so the Seepage, rain
+    // and Mesh Flow GLSL binding numbers stay unchanged.
+    constexpr std::array<std::uint32_t, 12> kPointStorageBindings{
+        4U, 5U, 6U, 10U, 11U, 12U, 13U, 14U, 15U, 16U, 17U, 18U};
+    std::array<VkDescriptorSetLayoutBinding, 4U + kPointStorageBindings.size()> bindings{};
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     bindings[0].descriptorCount = 1;
@@ -8116,11 +7610,12 @@ void VulkanViewportShell::CreatePointDescriptorSetLayout() {
     bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
     bindings[3].descriptorCount = 1;
     bindings[3].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    for (std::uint32_t bindingIndex = 4; bindingIndex < bindings.size(); ++bindingIndex) {
-        bindings[bindingIndex].binding = bindingIndex;
-        bindings[bindingIndex].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        bindings[bindingIndex].descriptorCount = 1;
-        bindings[bindingIndex].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    for (std::size_t storageIndex = 0; storageIndex < kPointStorageBindings.size(); ++storageIndex) {
+        auto& binding = bindings[4U + storageIndex];
+        binding.binding = kPointStorageBindings[storageIndex];
+        binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        binding.descriptorCount = 1;
+        binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     }
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
@@ -11422,13 +10917,13 @@ VkDescriptorPool VulkanViewportShell::CreatePointDescriptorPool(std::size_t high
         layerCount * static_cast<std::uint64_t>(kFramesInFlight) * static_cast<std::uint64_t>(depthImages_.size());
     const std::uint64_t exrSetCount = includeExrDescriptor ? 1U : 0U;
     const std::uint64_t setCount64 = std::max<std::uint64_t>(1U, liveSetCount + exrSetCount);
-    if (setCount64 > std::numeric_limits<std::uint32_t>::max() / 16U) {
+    if (setCount64 > std::numeric_limits<std::uint32_t>::max() / 13U) {
         throw std::runtime_error{"Point descriptor generation exceeds Vulkan pool limits."};
     }
     const auto setCount = static_cast<std::uint32_t>(setCount64);
     const std::array<VkDescriptorPoolSize, 3> poolSizes = {
         MakePoolSize(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, setCount * 2U),
-        MakePoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, setCount * 16U),
+        MakePoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, setCount * 13U),
         MakePoolSize(VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, setCount),
     };
     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -11776,21 +11271,6 @@ void VulkanViewportShell::UpdatePointCloudDescriptorSet(ActivePointCloudResource
     normalInfo.offset = 0;
     normalInfo.range = resources->normalBuffer.size;
 
-    VkDescriptorBufferInfo sparseRippleRangeInfo{};
-    sparseRippleRangeInfo.buffer = resources->sparseRippleRangeBuffer.buffer;
-    sparseRippleRangeInfo.offset = 0;
-    sparseRippleRangeInfo.range = resources->sparseRippleRangeBuffer.size;
-
-    VkDescriptorBufferInfo sparseRippleMembershipInfo{};
-    sparseRippleMembershipInfo.buffer = resources->sparseRippleMembershipBuffer.buffer;
-    sparseRippleMembershipInfo.offset = 0;
-    sparseRippleMembershipInfo.range = resources->sparseRippleMembershipBuffer.size;
-
-    VkDescriptorBufferInfo sparseRippleParamsInfo{};
-    sparseRippleParamsInfo.buffer = resources->sparseRippleParamsBuffers[frameIndex].buffer;
-    sparseRippleParamsInfo.offset = 0;
-    sparseRippleParamsInfo.range = resources->sparseRippleParamsBuffers[frameIndex].size;
-
     VkDescriptorBufferInfo seepageNodeInfo{
         resources->seepageNodeBuffer.buffer,
         0,
@@ -11834,7 +11314,7 @@ void VulkanViewportShell::UpdatePointCloudDescriptorSet(ActivePointCloudResource
     sceneDepthInfo.imageView = sceneDepthView;
     sceneDepthInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
-    std::array<VkWriteDescriptorSet, 19> writes{};
+    std::array<VkWriteDescriptorSet, 16> writes{};
     writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[0].dstSet = descriptorSet;
     writes[0].dstBinding = 0;
@@ -11886,81 +11366,60 @@ void VulkanViewportShell::UpdatePointCloudDescriptorSet(ActivePointCloudResource
 
     writes[7] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[7].dstSet = descriptorSet;
-    writes[7].dstBinding = 7;
+    writes[7].dstBinding = 10;
     writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[7].descriptorCount = 1;
-    writes[7].pBufferInfo = &sparseRippleRangeInfo;
+    writes[7].pBufferInfo = &seepageNodeInfo;
 
     writes[8] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[8].dstSet = descriptorSet;
-    writes[8].dstBinding = 8;
+    writes[8].dstBinding = 11;
     writes[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[8].descriptorCount = 1;
-    writes[8].pBufferInfo = &sparseRippleMembershipInfo;
+    writes[8].pBufferInfo = &seepageHashCellInfo;
 
     writes[9] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[9].dstSet = descriptorSet;
-    writes[9].dstBinding = 9;
+    writes[9].dstBinding = 12;
     writes[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[9].descriptorCount = 1;
-    writes[9].pBufferInfo = &sparseRippleParamsInfo;
-
+    writes[9].pBufferInfo = &seepageNodeReferenceInfo;
     writes[10] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[10].dstSet = descriptorSet;
-    writes[10].dstBinding = 10;
+    writes[10].dstBinding = 13;
     writes[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[10].descriptorCount = 1;
-    writes[10].pBufferInfo = &seepageNodeInfo;
-
+    writes[10].pBufferInfo = &rainImpactCountInfo;
     writes[11] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[11].dstSet = descriptorSet;
-    writes[11].dstBinding = 11;
+    writes[11].dstBinding = 14;
     writes[11].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[11].descriptorCount = 1;
-    writes[11].pBufferInfo = &seepageHashCellInfo;
-
+    writes[11].pBufferInfo = &rainImpactReferenceInfo;
     writes[12] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[12].dstSet = descriptorSet;
-    writes[12].dstBinding = 12;
+    writes[12].dstBinding = 15;
     writes[12].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[12].descriptorCount = 1;
-    writes[12].pBufferInfo = &seepageNodeReferenceInfo;
+    writes[12].pBufferInfo = &rainImpactEventInfo;
     writes[13] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[13].dstSet = descriptorSet;
-    writes[13].dstBinding = 13;
+    writes[13].dstBinding = 16;
     writes[13].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[13].descriptorCount = 1;
-    writes[13].pBufferInfo = &rainImpactCountInfo;
+    writes[13].pBufferInfo = &seepageParamsInfo;
     writes[14] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[14].dstSet = descriptorSet;
-    writes[14].dstBinding = 14;
+    writes[14].dstBinding = 17;
     writes[14].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[14].descriptorCount = 1;
-    writes[14].pBufferInfo = &rainImpactReferenceInfo;
+    writes[14].pBufferInfo = &meshFlowContactEventInfo;
     writes[15] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[15].dstSet = descriptorSet;
-    writes[15].dstBinding = 15;
+    writes[15].dstBinding = 18;
     writes[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[15].descriptorCount = 1;
-    writes[15].pBufferInfo = &rainImpactEventInfo;
-    writes[16] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[16].dstSet = descriptorSet;
-    writes[16].dstBinding = 16;
-    writes[16].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[16].descriptorCount = 1;
-    writes[16].pBufferInfo = &seepageParamsInfo;
-    writes[17] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[17].dstSet = descriptorSet;
-    writes[17].dstBinding = 17;
-    writes[17].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[17].descriptorCount = 1;
-    writes[17].pBufferInfo = &meshFlowContactEventInfo;
-    writes[18] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[18].dstSet = descriptorSet;
-    writes[18].dstBinding = 18;
-    writes[18].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[18].descriptorCount = 1;
-    writes[18].pBufferInfo = &meshFlowContactGridInfo;
+    writes[15].pBufferInfo = &meshFlowContactGridInfo;
 
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
@@ -12344,33 +11803,6 @@ void VulkanViewportShell::CreateWaterFlowDummyPointResources(
     if (resources == nullptr) {
         return;
     }
-
-    const SparseWaterRippleRangeGpu emptySparseRippleRange{};
-    resources->sparseRippleRangeBuffer = CreateHostVisibleBuffer(
-        sizeof(emptySparseRippleRange), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    UploadBufferData(
-        resources->sparseRippleRangeBuffer,
-        &emptySparseRippleRange,
-        sizeof(emptySparseRippleRange));
-    const SparseWaterRippleMembershipGpu emptySparseRippleMembership{};
-    resources->sparseRippleMembershipBuffer = CreateHostVisibleBuffer(
-        sizeof(emptySparseRippleMembership), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    UploadBufferData(
-        resources->sparseRippleMembershipBuffer,
-        &emptySparseRippleMembership,
-        sizeof(emptySparseRippleMembership));
-    const SparseWaterRippleParamsGpu emptySparseRippleParams{};
-    for (auto& paramsBuffer : resources->sparseRippleParamsBuffers) {
-        paramsBuffer = CreateHostVisibleBuffer(
-            sizeof(emptySparseRippleParams), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        UploadBufferData(paramsBuffer, &emptySparseRippleParams, sizeof(emptySparseRippleParams));
-    }
-    resources->sparseRippleExrParamsBuffer = CreateHostVisibleBuffer(
-        sizeof(emptySparseRippleParams), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    UploadBufferData(
-        resources->sparseRippleExrParamsBuffer,
-        &emptySparseRippleParams,
-        sizeof(emptySparseRippleParams));
 
     const WaterSeepageNodeTopologyGpu emptySeepageNode{};
     resources->seepageNodeBuffer = CreateHostVisibleBuffer(
@@ -12965,21 +12397,6 @@ void VulkanViewportShell::UpdatePointHighlightDescriptorSet(
     normalInfo.offset = 0;
     normalInfo.range = resources->normalBuffer.size;
 
-    VkDescriptorBufferInfo sparseRippleRangeInfo{};
-    sparseRippleRangeInfo.buffer = resources->sparseRippleRangeBuffer.buffer;
-    sparseRippleRangeInfo.offset = 0;
-    sparseRippleRangeInfo.range = resources->sparseRippleRangeBuffer.size;
-
-    VkDescriptorBufferInfo sparseRippleMembershipInfo{};
-    sparseRippleMembershipInfo.buffer = resources->sparseRippleMembershipBuffer.buffer;
-    sparseRippleMembershipInfo.offset = 0;
-    sparseRippleMembershipInfo.range = resources->sparseRippleMembershipBuffer.size;
-
-    VkDescriptorBufferInfo sparseRippleParamsInfo{};
-    sparseRippleParamsInfo.buffer = resources->sparseRippleParamsBuffers[frameIndex].buffer;
-    sparseRippleParamsInfo.offset = 0;
-    sparseRippleParamsInfo.range = resources->sparseRippleParamsBuffers[frameIndex].size;
-
     VkDescriptorBufferInfo seepageNodeInfo{
         resources->seepageNodeBuffer.buffer,
         0,
@@ -13023,7 +12440,7 @@ void VulkanViewportShell::UpdatePointHighlightDescriptorSet(
     sceneDepthInfo.imageView = sceneDepthView;
     sceneDepthInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
-    std::array<VkWriteDescriptorSet, 19> writes{};
+    std::array<VkWriteDescriptorSet, 16> writes{};
     writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[0].dstSet = descriptorSet;
     writes[0].dstBinding = 0;
@@ -13075,81 +12492,60 @@ void VulkanViewportShell::UpdatePointHighlightDescriptorSet(
 
     writes[7] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[7].dstSet = descriptorSet;
-    writes[7].dstBinding = 7;
+    writes[7].dstBinding = 10;
     writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[7].descriptorCount = 1;
-    writes[7].pBufferInfo = &sparseRippleRangeInfo;
+    writes[7].pBufferInfo = &seepageNodeInfo;
 
     writes[8] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[8].dstSet = descriptorSet;
-    writes[8].dstBinding = 8;
+    writes[8].dstBinding = 11;
     writes[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[8].descriptorCount = 1;
-    writes[8].pBufferInfo = &sparseRippleMembershipInfo;
+    writes[8].pBufferInfo = &seepageHashCellInfo;
 
     writes[9] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[9].dstSet = descriptorSet;
-    writes[9].dstBinding = 9;
+    writes[9].dstBinding = 12;
     writes[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[9].descriptorCount = 1;
-    writes[9].pBufferInfo = &sparseRippleParamsInfo;
-
+    writes[9].pBufferInfo = &seepageNodeReferenceInfo;
     writes[10] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[10].dstSet = descriptorSet;
-    writes[10].dstBinding = 10;
+    writes[10].dstBinding = 13;
     writes[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[10].descriptorCount = 1;
-    writes[10].pBufferInfo = &seepageNodeInfo;
-
+    writes[10].pBufferInfo = &rainImpactCountInfo;
     writes[11] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[11].dstSet = descriptorSet;
-    writes[11].dstBinding = 11;
+    writes[11].dstBinding = 14;
     writes[11].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[11].descriptorCount = 1;
-    writes[11].pBufferInfo = &seepageHashCellInfo;
-
+    writes[11].pBufferInfo = &rainImpactReferenceInfo;
     writes[12] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[12].dstSet = descriptorSet;
-    writes[12].dstBinding = 12;
+    writes[12].dstBinding = 15;
     writes[12].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[12].descriptorCount = 1;
-    writes[12].pBufferInfo = &seepageNodeReferenceInfo;
+    writes[12].pBufferInfo = &rainImpactEventInfo;
     writes[13] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[13].dstSet = descriptorSet;
-    writes[13].dstBinding = 13;
+    writes[13].dstBinding = 16;
     writes[13].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[13].descriptorCount = 1;
-    writes[13].pBufferInfo = &rainImpactCountInfo;
+    writes[13].pBufferInfo = &seepageParamsInfo;
     writes[14] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[14].dstSet = descriptorSet;
-    writes[14].dstBinding = 14;
+    writes[14].dstBinding = 17;
     writes[14].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[14].descriptorCount = 1;
-    writes[14].pBufferInfo = &rainImpactReferenceInfo;
+    writes[14].pBufferInfo = &meshFlowContactEventInfo;
     writes[15] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[15].dstSet = descriptorSet;
-    writes[15].dstBinding = 15;
+    writes[15].dstBinding = 18;
     writes[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[15].descriptorCount = 1;
-    writes[15].pBufferInfo = &rainImpactEventInfo;
-    writes[16] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[16].dstSet = descriptorSet;
-    writes[16].dstBinding = 16;
-    writes[16].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[16].descriptorCount = 1;
-    writes[16].pBufferInfo = &seepageParamsInfo;
-    writes[17] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[17].dstSet = descriptorSet;
-    writes[17].dstBinding = 17;
-    writes[17].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[17].descriptorCount = 1;
-    writes[17].pBufferInfo = &meshFlowContactEventInfo;
-    writes[18] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[18].dstSet = descriptorSet;
-    writes[18].dstBinding = 18;
-    writes[18].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[18].descriptorCount = 1;
-    writes[18].pBufferInfo = &meshFlowContactGridInfo;
+    writes[15].pBufferInfo = &meshFlowContactGridInfo;
 
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
@@ -13199,18 +12595,6 @@ void VulkanViewportShell::UpdatePointCloudExrDescriptorSet(
         resources->positionStorageBuffer.size};
     VkDescriptorBufferInfo colorStorageInfo{resources->colorBuffer.buffer, 0, resources->colorBuffer.size};
     VkDescriptorBufferInfo normalInfo{resources->normalBuffer.buffer, 0, resources->normalBuffer.size};
-    VkDescriptorBufferInfo sparseRippleRangeInfo{
-        resources->sparseRippleRangeBuffer.buffer,
-        0,
-        resources->sparseRippleRangeBuffer.size};
-    VkDescriptorBufferInfo sparseRippleMembershipInfo{
-        resources->sparseRippleMembershipBuffer.buffer,
-        0,
-        resources->sparseRippleMembershipBuffer.size};
-    VkDescriptorBufferInfo sparseRippleParamsInfo{
-        resources->sparseRippleExrParamsBuffer.buffer,
-        0,
-        resources->sparseRippleExrParamsBuffer.size};
     VkDescriptorBufferInfo seepageNodeInfo{
         resources->seepageNodeBuffer.buffer,
         0,
@@ -13253,7 +12637,7 @@ void VulkanViewportShell::UpdatePointCloudExrDescriptorSet(
     sceneDepthInfo.imageView = sceneDepthView;
     sceneDepthInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
-    std::array<VkWriteDescriptorSet, 19> writes{};
+    std::array<VkWriteDescriptorSet, 16> writes{};
     writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[0].dstSet = resources->exrDescriptorSet;
     writes[0].dstBinding = 0;
@@ -13305,81 +12689,60 @@ void VulkanViewportShell::UpdatePointCloudExrDescriptorSet(
 
     writes[7] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[7].dstSet = resources->exrDescriptorSet;
-    writes[7].dstBinding = 7;
+    writes[7].dstBinding = 10;
     writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[7].descriptorCount = 1;
-    writes[7].pBufferInfo = &sparseRippleRangeInfo;
+    writes[7].pBufferInfo = &seepageNodeInfo;
 
     writes[8] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[8].dstSet = resources->exrDescriptorSet;
-    writes[8].dstBinding = 8;
+    writes[8].dstBinding = 11;
     writes[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[8].descriptorCount = 1;
-    writes[8].pBufferInfo = &sparseRippleMembershipInfo;
+    writes[8].pBufferInfo = &seepageHashCellInfo;
 
     writes[9] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[9].dstSet = resources->exrDescriptorSet;
-    writes[9].dstBinding = 9;
+    writes[9].dstBinding = 12;
     writes[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[9].descriptorCount = 1;
-    writes[9].pBufferInfo = &sparseRippleParamsInfo;
-
+    writes[9].pBufferInfo = &seepageNodeReferenceInfo;
     writes[10] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[10].dstSet = resources->exrDescriptorSet;
-    writes[10].dstBinding = 10;
+    writes[10].dstBinding = 13;
     writes[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[10].descriptorCount = 1;
-    writes[10].pBufferInfo = &seepageNodeInfo;
-
+    writes[10].pBufferInfo = &rainImpactCountInfo;
     writes[11] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[11].dstSet = resources->exrDescriptorSet;
-    writes[11].dstBinding = 11;
+    writes[11].dstBinding = 14;
     writes[11].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[11].descriptorCount = 1;
-    writes[11].pBufferInfo = &seepageHashCellInfo;
-
+    writes[11].pBufferInfo = &rainImpactReferenceInfo;
     writes[12] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[12].dstSet = resources->exrDescriptorSet;
-    writes[12].dstBinding = 12;
+    writes[12].dstBinding = 15;
     writes[12].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[12].descriptorCount = 1;
-    writes[12].pBufferInfo = &seepageNodeReferenceInfo;
+    writes[12].pBufferInfo = &rainImpactEventInfo;
     writes[13] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[13].dstSet = resources->exrDescriptorSet;
-    writes[13].dstBinding = 13;
+    writes[13].dstBinding = 16;
     writes[13].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[13].descriptorCount = 1;
-    writes[13].pBufferInfo = &rainImpactCountInfo;
+    writes[13].pBufferInfo = &seepageParamsInfo;
     writes[14] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[14].dstSet = resources->exrDescriptorSet;
-    writes[14].dstBinding = 14;
+    writes[14].dstBinding = 17;
     writes[14].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[14].descriptorCount = 1;
-    writes[14].pBufferInfo = &rainImpactReferenceInfo;
+    writes[14].pBufferInfo = &meshFlowContactEventInfo;
     writes[15] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[15].dstSet = resources->exrDescriptorSet;
-    writes[15].dstBinding = 15;
+    writes[15].dstBinding = 18;
     writes[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[15].descriptorCount = 1;
-    writes[15].pBufferInfo = &rainImpactEventInfo;
-    writes[16] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[16].dstSet = resources->exrDescriptorSet;
-    writes[16].dstBinding = 16;
-    writes[16].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[16].descriptorCount = 1;
-    writes[16].pBufferInfo = &seepageParamsInfo;
-    writes[17] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[17].dstSet = resources->exrDescriptorSet;
-    writes[17].dstBinding = 17;
-    writes[17].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[17].descriptorCount = 1;
-    writes[17].pBufferInfo = &meshFlowContactEventInfo;
-    writes[18] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[18].dstSet = resources->exrDescriptorSet;
-    writes[18].dstBinding = 18;
-    writes[18].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[18].descriptorCount = 1;
-    writes[18].pBufferInfo = &meshFlowContactGridInfo;
+    writes[15].pBufferInfo = &meshFlowContactGridInfo;
 
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     resources->seepageExrDescriptorGeneration =
@@ -14252,12 +13615,6 @@ void VulkanViewportShell::DestroyPointCloudResources(ActivePointCloudResources* 
     DestroyBuffer(&resources->colorBuffer);
     DestroyBuffer(&resources->normalBuffer);
     DestroyBuffer(&resources->scalarFieldBuffer);
-    DestroyBuffer(&resources->sparseRippleRangeBuffer);
-    DestroyBuffer(&resources->sparseRippleMembershipBuffer);
-    for (auto& paramsBuffer : resources->sparseRippleParamsBuffers) {
-        DestroyBuffer(&paramsBuffer);
-    }
-    DestroyBuffer(&resources->sparseRippleExrParamsBuffer);
     DestroyBuffer(&resources->seepageNodeBuffer);
     for (auto& paramsBuffer : resources->seepageParamsBuffers) {
         DestroyBuffer(&paramsBuffer);
@@ -14944,38 +14301,6 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
             }
         }
     }
-    if (renderer::pointcloud::PointCloudStyleHasActiveCaustics(layer.style)) {
-        styleGpu.causticControl = glm::uvec4{
-            1U,
-            static_cast<std::uint32_t>(layer.style.causticMaskFieldSlot + 1),
-            static_cast<std::uint32_t>(layer.style.causticEdgeFieldSlot + 1),
-            static_cast<std::uint32_t>(layer.style.causticSeedFieldSlot + 1),
-        };
-        styleGpu.causticParams0 = glm::vec4{
-            std::clamp(layer.style.causticIntensity, 0.0F, 5.0F),
-            std::clamp(layer.style.causticCellSizeMeters, 0.005F, 5.0F),
-            std::clamp(layer.style.causticSpeed, 0.0F, 10.0F),
-            std::clamp(layer.style.causticLineWidthMeters, 0.0005F, 0.50F),
-        };
-        styleGpu.causticParams1 = glm::vec4{
-            std::clamp(layer.style.causticWarpAmplitudeMeters, 0.0F, 2.0F),
-            std::clamp(layer.style.causticEmissionBoost, 0.0F, 8.0F),
-            std::clamp(layer.style.causticOpacityBoost, 0.0F, 2.0F),
-            std::clamp(layer.style.causticPointSizeBoost, 0.0F, 4.0F),
-        };
-        styleGpu.causticParams2 = glm::vec4{
-            std::clamp(layer.style.causticFeatherMeters, 0.0005F, 0.50F),
-            std::clamp(layer.style.causticSurfacePointSpacingMeters, 0.0005F, 0.10F),
-            std::clamp(layer.style.causticPreviewTintAmount, 0.0F, 1.0F),
-            std::clamp(layer.style.causticPreviewTintRegionId, 0.0F, 16777216.0F),
-        };
-        styleGpu.causticTint = glm::vec4{
-            std::clamp(layer.style.causticTint[0], 0.0F, 4.0F),
-            std::clamp(layer.style.causticTint[1], 0.0F, 4.0F),
-            std::clamp(layer.style.causticTint[2], 0.0F, 4.0F),
-            1.0F,
-        };
-    }
     if (layer.style.shorelineWaveEnabled) {
         const bool heightFoam =
             layer.style.shorelineWaveAlgorithm ==
@@ -15218,99 +14543,6 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
             ++packedShorelineCount;
         }
         styleGpu.additionalShorelineCount.x = packedShorelineCount;
-    }
-    if (layer.regionWaterEffectsEnabled) {
-    const auto waterEffectEmissionAddSlot = FindExactScalarFieldSlot(layer.scalarFields, "water_effect_emission_add");
-    const auto waterEffectOpacityAddSlot = FindExactScalarFieldSlot(layer.scalarFields, "water_effect_opacity_add");
-    const auto waterEffectOpacityMultiplySlot =
-        FindExactScalarFieldSlot(layer.scalarFields, "water_effect_opacity_multiply");
-    const auto waterEffectPointSizeAddSlot =
-        FindExactScalarFieldSlot(layer.scalarFields, "water_effect_point_size_add");
-    const auto waterEffectPointSizeMultiplySlot =
-        FindExactScalarFieldSlot(layer.scalarFields, "water_effect_point_size_multiply");
-    const auto waterEffectColourRedSlot = FindExactScalarFieldSlot(layer.scalarFields, "water_effect_colour_red");
-    const auto waterEffectColourGreenSlot = FindExactScalarFieldSlot(layer.scalarFields, "water_effect_colour_green");
-    const auto waterEffectColourBlueSlot = FindExactScalarFieldSlot(layer.scalarFields, "water_effect_colour_blue");
-    const auto waterEffectColourMixSlot = FindExactScalarFieldSlot(layer.scalarFields, "water_effect_colour_mix");
-    if (waterEffectEmissionAddSlot.has_value() &&
-        waterEffectOpacityAddSlot.has_value() &&
-        waterEffectOpacityMultiplySlot.has_value() &&
-        waterEffectPointSizeAddSlot.has_value() &&
-        waterEffectPointSizeMultiplySlot.has_value() &&
-        waterEffectColourRedSlot.has_value() &&
-        waterEffectColourGreenSlot.has_value() &&
-        waterEffectColourBlueSlot.has_value() &&
-        waterEffectColourMixSlot.has_value()) {
-        styleGpu.waterEffectControl = glm::uvec4{
-            1U,
-            waterEffectEmissionAddSlot.value() + 1U,
-            waterEffectOpacityAddSlot.value() + 1U,
-            waterEffectOpacityMultiplySlot.value() + 1U,
-        };
-        styleGpu.waterEffectSlots0 = glm::uvec4{
-            waterEffectPointSizeAddSlot.value() + 1U,
-            waterEffectPointSizeMultiplySlot.value() + 1U,
-            waterEffectColourMixSlot.value() + 1U,
-            waterEffectColourRedSlot.value() + 1U,
-        };
-        styleGpu.waterEffectSlots1 = glm::uvec4{
-            waterEffectColourGreenSlot.value() + 1U,
-            waterEffectColourBlueSlot.value() + 1U,
-            0U,
-            0U,
-        };
-    }
-    const auto rippleMaskSlot = FindExactScalarFieldSlot(layer.scalarFields, "ripple_mask");
-    const auto rippleEdgeSlot = FindExactScalarFieldSlot(layer.scalarFields, "ripple_edge");
-    const auto rippleValueSlot = FindExactScalarFieldSlot(layer.scalarFields, "ripple_value");
-    const auto rippleSeedSlot = FindExactScalarFieldSlot(layer.scalarFields, "ripple_seed");
-    const auto rippleDistanceSlot = FindExactScalarFieldSlot(layer.scalarFields, "ripple_distance");
-    const auto rippleLinearCoordSlot = FindExactScalarFieldSlot(layer.scalarFields, "ripple_linear_coord");
-    const auto rippleAngleSlot = FindExactScalarFieldSlot(layer.scalarFields, "ripple_angle");
-    const auto rippleSpeedSlot = FindExactScalarFieldSlot(layer.scalarFields, "ripple_speed");
-    const auto rippleConfidenceSlot = FindExactScalarFieldSlot(layer.scalarFields, "ripple_confidence");
-    const auto rippleWavelengthSlot = FindExactScalarFieldSlot(layer.scalarFields, "ripple_wavelength");
-    const auto rippleWarpSlot = FindExactScalarFieldSlot(layer.scalarFields, "ripple_warp");
-    const auto ripplePhaseSlot = FindExactScalarFieldSlot(layer.scalarFields, "ripple_phase");
-    if (rippleMaskSlot.has_value() &&
-        rippleEdgeSlot.has_value() &&
-        rippleValueSlot.has_value() &&
-        rippleSeedSlot.has_value() &&
-        rippleDistanceSlot.has_value() &&
-        rippleLinearCoordSlot.has_value() &&
-        rippleAngleSlot.has_value() &&
-        rippleSpeedSlot.has_value() &&
-        rippleConfidenceSlot.has_value() &&
-        rippleWavelengthSlot.has_value() &&
-        rippleWarpSlot.has_value() &&
-        ripplePhaseSlot.has_value()) {
-        styleGpu.rippleEffectSlots0 = glm::uvec4{
-            rippleMaskSlot.value() + 1U,
-            rippleEdgeSlot.value() + 1U,
-            rippleValueSlot.value() + 1U,
-            rippleSeedSlot.value() + 1U,
-        };
-        styleGpu.rippleEffectSlots1 = glm::uvec4{
-            rippleDistanceSlot.value() + 1U,
-            rippleLinearCoordSlot.value() + 1U,
-            rippleAngleSlot.value() + 1U,
-            rippleSpeedSlot.value() + 1U,
-        };
-        styleGpu.rippleEffectSlots2 = glm::uvec4{
-            rippleConfidenceSlot.value() + 1U,
-            rippleWavelengthSlot.value() + 1U,
-            rippleWarpSlot.value() + 1U,
-            ripplePhaseSlot.value() + 1U,
-        };
-    }
-    if (resources->sparseRippleMembershipCount > 0U && resources->sparseRippleParamCount > 0U) {
-        styleGpu.rippleEffectSlots3 = glm::uvec4{
-            1U,
-            resources->sparseRippleMembershipCount,
-            resources->sparseRippleParamCount,
-            0U,
-        };
-    }
     }
     const bool seepageDescriptorReady =
         exrStyle
@@ -15633,8 +14865,6 @@ bool VulkanViewportShell::RecordPointCloudHighlightDraw(
     highlightLayer.style.flowAnimation = false;
     highlightLayer.style.waterPathView = false;
     highlightLayer.style.waterTrailOverlay = false;
-    highlightLayer.style.causticAnimation = false;
-    highlightLayer.style.causticIntensity = 0.0F;
     highlightLayer.style.roughnessMotionStrength = 0.0F;
     highlightLayer.style.stylisationMode = renderer::pointcloud::PointCloudStylisationMode::Off;
     invisible_places::style::SetScalarConstant(

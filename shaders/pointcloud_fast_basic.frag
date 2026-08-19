@@ -55,18 +55,6 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 stylisationParams2;
     vec4 surfaceMotionParams;
     vec4 surfaceMotionStats;
-    uvec4 causticControl;
-    vec4 causticParams0;
-    vec4 causticParams1;
-    vec4 causticParams2;
-    vec4 causticTint;
-    uvec4 waterEffectControl;
-    uvec4 waterEffectSlots0;
-    uvec4 waterEffectSlots1;
-    uvec4 rippleEffectSlots0;
-    uvec4 rippleEffectSlots1;
-    uvec4 rippleEffectSlots2;
-    uvec4 rippleEffectSlots3;
     uvec4 shorelineWaveControl;
     vec4 shorelineWaveParams0;
     vec4 shorelineWaveParams1;
@@ -126,109 +114,6 @@ float LoadScalarFieldValue(uint fieldSlot) {
         return 0.0;
     }
     return scalarFieldValues.values[(fieldSlot * styleData.pointMeta.x) + inPointIndex];
-}
-
-#include "pointcloud_caustics.glsl"
-
-float ResolveCausticStrength(out float previewTint) {
-    previewTint = 0.0;
-    if (styleData.causticControl.x == 0u ||
-        styleData.causticControl.y == 0u ||
-        styleData.causticControl.z == 0u ||
-        styleData.causticControl.w == 0u) {
-        return 0.0;
-    }
-    const float mask = clamp(LoadScalarFieldValue(styleData.causticControl.y - 1u), 0.0, 1.0);
-    if (mask <= 1e-5) {
-        return 0.0;
-    }
-    const float edge = clamp(LoadScalarFieldValue(styleData.causticControl.z - 1u), 0.0, 1.0);
-    const float seed = LoadScalarFieldValue(styleData.causticControl.w - 1u);
-    previewTint = CausticPreviewTint(mask, edge, seed);
-    const float time = styleData.renderParams3.w * max(0.0, styleData.causticParams0.z);
-    const vec2 metersUv = CausticSurfaceUv(inWorldPosition, inPointNormal);
-    const float ridge = CausticVoronoiRidge(metersUv, seed, time, edge);
-    const float edgeGate = CausticEdgeGate(metersUv, edge, seed);
-    return clamp(ridge * mask * edgeGate * max(0.0, styleData.causticParams0.x), 0.0, 6.0);
-}
-
-bool HasWaterEffectComposition() {
-    return styleData.waterEffectControl.x != 0u &&
-           styleData.waterEffectSlots0.z != 0u &&
-           styleData.waterEffectSlots0.w != 0u &&
-           styleData.waterEffectSlots1.x != 0u &&
-           styleData.waterEffectSlots1.y != 0u;
-}
-
-float WaterEffectField(uint slotPlusOne, float fallback) {
-    if (!HasWaterEffectComposition() || slotPlusOne == 0u) {
-        return fallback;
-    }
-    return LoadScalarFieldValue(slotPlusOne - 1u);
-}
-
-bool HasRippleEffectFields() {
-    return styleData.rippleEffectSlots0.x != 0u &&
-           styleData.rippleEffectSlots0.y != 0u &&
-           styleData.rippleEffectSlots0.z != 0u &&
-           styleData.rippleEffectSlots0.w != 0u &&
-           styleData.rippleEffectSlots1.x != 0u &&
-           styleData.rippleEffectSlots1.y != 0u &&
-           styleData.rippleEffectSlots1.w != 0u &&
-           styleData.rippleEffectSlots2.x != 0u &&
-           styleData.rippleEffectSlots2.y != 0u &&
-           styleData.rippleEffectSlots2.z != 0u &&
-           styleData.rippleEffectSlots2.w != 0u;
-}
-
-float RippleEffectField(uint slotPlusOne, float fallback) {
-    if (!HasRippleEffectFields() || slotPlusOne == 0u) {
-        return fallback;
-    }
-    return LoadScalarFieldValue(slotPlusOne - 1u);
-}
-
-float ResolveRippleEffectScale() {
-    if (!HasRippleEffectFields()) {
-        return 1.0;
-    }
-    const float mask = clamp(RippleEffectField(styleData.rippleEffectSlots0.x, 0.0), 0.0, 1.0);
-    if (mask <= 1e-5) {
-        return 1.0;
-    }
-    const float edge = clamp(RippleEffectField(styleData.rippleEffectSlots0.y, 0.0), 0.0, 1.0);
-    const float value = clamp(RippleEffectField(styleData.rippleEffectSlots0.z, 0.0), 0.0, 1.0);
-    const float seed = RippleEffectField(styleData.rippleEffectSlots0.w, 0.0);
-    const float distance = RippleEffectField(styleData.rippleEffectSlots1.x, 0.0);
-    const float linearCoord = RippleEffectField(styleData.rippleEffectSlots1.y, 0.0);
-    const float speed = max(0.0, RippleEffectField(styleData.rippleEffectSlots1.w, 0.0));
-    const float confidence = clamp(RippleEffectField(styleData.rippleEffectSlots2.x, 0.0), 0.0, 1.0);
-    const float wavelength = max(0.005, RippleEffectField(styleData.rippleEffectSlots2.y, 0.25));
-    const float warp = max(0.0, RippleEffectField(styleData.rippleEffectSlots2.z, 0.0));
-    const float phaseOffset = RippleEffectField(styleData.rippleEffectSlots2.w, 0.0);
-    const float time = max(0.0, styleData.renderParams3.w);
-    const float ripplePhase =
-        (linearCoord / wavelength) -
-        (time * speed) +
-        phaseOffset +
-        (seed * 0.173);
-    const float warpPhase =
-        sin(((distance / wavelength) + time * 0.37 + seed) * 6.28318530718) * warp;
-    const float wave = 0.5 + 0.5 * cos((ripplePhase + warpPhase) * 6.28318530718);
-    const float crest = smoothstep(0.42, 1.0, wave);
-    return clamp(value * mask * edge * confidence * (0.18 + 0.82 * crest), 0.0, 1.0);
-}
-
-vec3 ApplyWaterEffectColor(vec3 baseColor, float waterEffectScale) {
-    const float mixAmount = clamp(WaterEffectField(styleData.waterEffectSlots0.z, 0.0) * waterEffectScale, 0.0, 1.0);
-    if (mixAmount <= 1e-5) {
-        return baseColor;
-    }
-    const vec3 effectColor = vec3(
-        clamp(WaterEffectField(styleData.waterEffectSlots0.w, 0.62), 0.0, 1.0),
-        clamp(WaterEffectField(styleData.waterEffectSlots1.x, 0.88), 0.0, 1.0),
-        clamp(WaterEffectField(styleData.waterEffectSlots1.y, 1.0), 0.0, 1.0));
-    return mix(baseColor, effectColor, mixAmount);
 }
 
 float EvaluateBinding(RenderParameterBindingGpu binding) {
@@ -334,9 +219,6 @@ vec3 ResolveBaseColor() {
     }
     baseColor = ApplyColorize(baseColor);
     baseColor = ApplyTimingColouriseStack(baseColor);
-    float previewTint = 0.0;
-    const float caustic = ResolveCausticStrength(previewTint);
-    const float waterEffectScale = ResolveRippleEffectScale();
     const SparseRippleComposite sparseRipple =
         ResolveSparseRippleComposite(inWorldPosition, inPointNormal, inPointIndex, styleData.renderParams3.w);
     const RainImpactComposite rainImpact = ResolveRainImpactComposite(inWorldPosition, inPointNormal);
@@ -348,11 +230,7 @@ vec3 ResolveBaseColor() {
     const vec3 composedColour =
         ApplyMeshFlowContactColour(
             ApplyRainImpactColour(
-                ApplySparseRippleColor(
-                    ApplyWaterEffectColor(
-                        mix(baseColor, styleData.causticTint.rgb, CausticColorMixAmount(caustic, previewTint)),
-                        waterEffectScale),
-                    sparseRipple),
+                ApplySparseRippleColor(baseColor, sparseRipple),
                 rainImpact),
             meshFlowContact);
     // Fast Basic is intentionally opaque and has no separate emission target;

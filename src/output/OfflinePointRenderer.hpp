@@ -33,18 +33,6 @@ struct OfflinePointLayer {
     bool roughnessMotionFullLayer = false;
     std::size_t roughnessMotionFieldSlot = std::numeric_limits<std::size_t>::max();
     std::size_t groundIdMotionFieldSlot = std::numeric_limits<std::size_t>::max();
-    std::size_t waterEffectEmissionAddFieldSlot = std::numeric_limits<std::size_t>::max();
-    std::size_t waterEffectOpacityAddFieldSlot = std::numeric_limits<std::size_t>::max();
-    std::size_t waterEffectOpacityMultiplyFieldSlot = std::numeric_limits<std::size_t>::max();
-    std::size_t waterEffectPointSizeAddFieldSlot = std::numeric_limits<std::size_t>::max();
-    std::size_t waterEffectPointSizeMultiplyFieldSlot = std::numeric_limits<std::size_t>::max();
-    std::size_t waterEffectColourRedFieldSlot = std::numeric_limits<std::size_t>::max();
-    std::size_t waterEffectColourGreenFieldSlot = std::numeric_limits<std::size_t>::max();
-    std::size_t waterEffectColourBlueFieldSlot = std::numeric_limits<std::size_t>::max();
-    std::size_t waterEffectColourMixFieldSlot = std::numeric_limits<std::size_t>::max();
-    std::vector<invisible_places::water::WaterRippleRuntimeMembership> rippleMemberships;
-    std::vector<invisible_places::water::WaterRippleRuntimeParams> rippleParams;
-    std::vector<glm::uvec2> rippleMembershipRanges;
     invisible_places::water::WaterSeepageSpatialGrid seepageGrid;
     invisible_places::water::WaterSurfaceRole rainCollisionRole =
         invisible_places::water::WaterSurfaceRole::None;
