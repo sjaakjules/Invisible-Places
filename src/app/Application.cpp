@@ -104866,7 +104866,8 @@ std::optional<WaterIntegrationCapturedFrame> CaptureWaterIntegrationFrame(
         captured.linearBlue[pixel] = image.beautyB[pixel];
         captured.alpha[pixel] = image.alpha[pixel];
     }
-    if (!invisible_places::output::WriteExrImage(image, exrPath, errorMessage)) {
+    if (!exrPath.empty() &&
+        !invisible_places::output::WriteExrImage(image, exrPath, errorMessage)) {
         return std::nullopt;
     }
     if (!ppmPath.empty() &&
@@ -105495,6 +105496,332 @@ int RunScene3PatchBoundarySmoke(
     report.Pass(
         "Captured all four unannotated Projector-01 views and contact sheet: " +
         sheetPath.string());
+    viewport->WaitIdle();
+    return finish();
+}
+
+// Measures live-view/export size and brightness parity for world-millimetre
+// point visuals. For each visual x style-variant x authored size, the same
+// three cameras (taken from the authored Visuals_Test animation: a ~1 m
+// close-up, a mid dolly, and a ~4 m wide) are captured on the committed 5 mm
+// display bundle and again on the full 1 mm export bundle, with every water
+// feature disabled and a black background. Each capture records mean beauty
+// luminance, alpha coverage, and the After Effects style luma-matte
+// composite (beauty-over-black multiplied by alpha), so a coarse live view
+// that renders points fatter, thinner, brighter, or dimmer than the export
+// at any camera distance shows up as a ratio away from 1 in the report.
+int RunScene3VisualParitySmoke(
+    const GuiSmokeOptions& options,
+    platform::Window* window,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    PreviewRuntimeState* runtimeState) {
+    const auto outputDirectory = options.outputDirectory.empty()
+        ? std::filesystem::path{"build/macos-debug/scene3-visual-parity"}
+        : options.outputDirectory;
+    const auto reportPath = outputDirectory / "scene3-visual-parity.json";
+    std::error_code outputError;
+    std::filesystem::create_directories(outputDirectory, outputError);
+
+    std::vector<std::string> failures;
+    nlohmann::json rows = nlohmann::json::array();
+    const auto finish = [&]() {
+        nlohmann::json report{
+            {"scenario", "scene3-visual-parity"},
+            {"passed", failures.empty()},
+            {"failures", failures},
+            {"rows", rows},
+        };
+        std::ofstream output{reportPath, std::ios::trunc};
+        if (!output.is_open()) {
+            std::cerr << "Could not write " << reportPath.string() << "\n";
+            return 1;
+        }
+        output << report.dump(2) << '\n';
+        std::cout << "Scene3 visual parity report: " << reportPath.string()
+                  << std::endl;
+        return failures.empty() ? 0 : 1;
+    };
+    if (window == nullptr || viewport == nullptr || runtimeState == nullptr) {
+        failures.emplace_back("Visual parity smoke has no window/viewport/runtime.");
+        return finish();
+    }
+
+    const auto projectPath = options.projectPath.empty()
+        ? std::filesystem::path{
+              runtimeState->persistence.authoredWorkspacePath} /
+              "ExhibitionFinal_project.json"
+        : options.projectPath;
+    std::string loadError;
+    const auto project = invisible_places::serialization::LoadProjectDocument(
+        projectPath,
+        &loadError);
+    if (!project.has_value()) {
+        failures.emplace_back("Project did not load: " + loadError);
+        return finish();
+    }
+    if (!ApplyProjectDocumentToRuntime(project.value(), runtimeState, viewport)) {
+        failures.emplace_back(
+            "Project could not be applied: " +
+            (runtimeState->errorMessage.empty() ? runtimeState->statusMessage
+                                                : runtimeState->errorMessage));
+        return finish();
+    }
+
+    // Isolate point styling: no water, no live effects, black background so
+    // beauty-over-background equals the luma-matte source footage.
+    runtimeState->projectSettings.liveVisualEffects = false;
+    runtimeState->projectSettings.previewPerformanceMode = false;
+    runtimeState->projectSettings.pointCloudPreviewLodMode =
+        PointCloudPreviewLodMode::FullResolution;
+    runtimeState->projectSettings.backgroundColor = {0.0F, 0.0F, 0.0F, 1.0F};
+    runtimeState->water.collisionRainSettings.enabled = false;
+    runtimeState->water.dynamicMeshFlowSettings.enabled = false;
+    runtimeState->water.shorelineInstances.clear();
+    runtimeState->water.selectedShorelineInstanceIndex.reset();
+    for (auto& node : runtimeState->water.seepageNodes) {
+        node.enabledInViewport = false;
+    }
+
+    const auto pumpFrame = [&]() {
+        window->PollEvents();
+        PollPendingLayerLoad(runtimeState, viewport);
+        CommitReadySceneDisplaySwitches(runtimeState, viewport);
+        StartQueuedLayerLoadIfIdle(runtimeState);
+        for (auto& session : runtimeState->sessions) {
+            if (session.kind == LayerKind::GaussianSplat ||
+                IsGeneratedWaterOverlaySession(session)) {
+                session.visible = false;
+            }
+        }
+        viewport->BeginUiFrame();
+        viewport->SetDiagnosticsEnabled(true);
+        viewport->SetSceneCachingEnabled(false);
+        viewport->SetLiveSceneRenderingEnabled(true);
+        viewport->SetLiveRainSimulationEnabled(false);
+        viewport->UpdateRenderState(
+            BuildRenderState(*runtimeState, *viewport, 0.0F));
+        viewport->DrawFrame();
+    };
+
+    const auto sceneIt = std::find_if(
+        runtimeState->pointCloudScenes.begin(),
+        runtimeState->pointCloudScenes.end(),
+        [](const auto& candidate) {
+            return candidate.sceneGroupName == "Scene3";
+        });
+    if (sceneIt == runtimeState->pointCloudScenes.end()) {
+        failures.emplace_back("Project has no Scene3 runtime.");
+        return finish();
+    }
+    auto& scene = *sceneIt;
+
+    const auto waitForDisplay = [&](std::uint32_t spacingMicrometres) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::minutes{15};
+        while (std::chrono::steady_clock::now() < deadline &&
+               !window->ShouldClose()) {
+            pumpFrame();
+            const bool ready =
+                scene.displayLoaded && scene.displayVisible &&
+                scene.committedDisplaySpacingMicrometres == spacingMicrometres &&
+                !scene.pendingDisplaySpacingMicrometres.has_value() &&
+                std::all_of(
+                    scene.committedDisplaySessionIndices.begin(),
+                    scene.committedDisplaySessionIndices.end(),
+                    [&](const auto& index) {
+                        return index.has_value() &&
+                               index.value() < runtimeState->sessions.size() &&
+                               runtimeState->sessions[index.value()].gpuResident;
+                    });
+            if (ready) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        }
+        return false;
+    };
+    if (!waitForDisplay(5'000U)) {
+        failures.emplace_back("The saved 5 mm Scene3 display never settled.");
+        return finish();
+    }
+
+    // Camera poses from the authored Visuals_Test animation (2026-08-20):
+    // a ~4.1 m wide, its midpoint, and a ~1.1 m close-up over ROCK.
+    struct ParityCamera {
+        std::string_view name;
+        std::array<float, 3> position;
+        std::array<float, 3> target;
+    };
+    const std::array<ParityCamera, 3> cameras{{
+        {"far", {309.94012F, 80.31008F, 5.63699F}, {309.96829F, 80.42173F, 4.53782F}},
+        {"mid", {309.99725F, 80.16314F, 4.00613F}, {310.04296F, 80.37487F, 2.92708F}},
+        {"near", {310.05438F, 80.01620F, 2.37527F}, {310.11762F, 80.32802F, 1.31633F}},
+    }};
+    const auto applyCamera = [&](const ParityCamera& parityCamera) {
+        invisible_places::camera::CameraState state;
+        state.position = parityCamera.position;
+        state.target = parityCamera.target;
+        state.fovDegrees = 55.0F;
+        state.nearPlane = 0.0005F;
+        state.farPlane = 80.0F;
+        runtimeState->camera.ApplyState(state);
+        runtimeState->previewRenderStateSignatureValid = false;
+    };
+
+    const std::array<std::string_view, 2> visuals{"Surface_03", "Projector-01"};
+    const std::array<std::string_view, 3> variants{
+        "authored",
+        "opacity_055",
+        "emissive_150",
+    };
+    const std::array<float, 4> sizesMeters{0.001F, 0.002F, 0.004F, 0.008F};
+
+    const auto forEachCommittedRoleSession = [&](const auto& mutate) {
+        for (const auto& sessionIndex : scene.committedDisplaySessionIndices) {
+            if (sessionIndex.has_value() &&
+                sessionIndex.value() < runtimeState->sessions.size()) {
+                mutate(runtimeState->sessions[sessionIndex.value()]);
+            }
+        }
+    };
+
+    const auto captureBundle = [&](std::string_view bundleName) {
+        for (const auto visualName : visuals) {
+            for (const auto variantName : variants) {
+                // Re-apply the saved visual so each variant starts from the
+                // authored style rather than the previous overrides.
+                const auto rockIndex = scene.committedDisplaySessionIndices
+                    [static_cast<std::size_t>(
+                        invisible_places::scene::ScenePointCloudRole::Rock)];
+                if (!rockIndex.has_value() ||
+                    rockIndex.value() >= runtimeState->sessions.size()) {
+                    failures.emplace_back("No committed ROCK session.");
+                    return;
+                }
+                const auto visualWarning = SelectProjectPointVisualForScene(
+                    runtimeState,
+                    runtimeState->sessions[rockIndex.value()],
+                    visualName,
+                    false);
+                if (!visualWarning.empty()) {
+                    failures.emplace_back(
+                        std::string{visualName} + ": " + visualWarning);
+                    return;
+                }
+                forEachCommittedRoleSession([&](PreviewLayerSession& session) {
+                    auto& style = session.pointStyle;
+                    if (variantName == "opacity_055") {
+                        style.opacity.active = true;
+                        style.opacity.mode =
+                            invisible_places::style::ParameterSourceMode::Constant;
+                        invisible_places::style::SetScalarConstant(
+                            &style.opacity, 0.55F);
+                    } else if (variantName == "emissive_150") {
+                        style.emissiveStrength.active = true;
+                        style.emissiveStrength.mode =
+                            invisible_places::style::ParameterSourceMode::Constant;
+                        invisible_places::style::SetScalarConstant(
+                            &style.emissiveStrength, 1.5F);
+                    }
+                });
+                for (const auto sizeMeters : sizesMeters) {
+                    forEachCommittedRoleSession(
+                        [&](PreviewLayerSession& session) {
+                            auto& style = session.pointStyle;
+                            style.surfelDiameter.active = true;
+                            style.surfelDiameter.mode = invisible_places::
+                                style::ParameterSourceMode::Constant;
+                            invisible_places::style::SetScalarConstant(
+                                &style.surfelDiameter, sizeMeters);
+                        });
+                    for (const auto& parityCamera : cameras) {
+                        applyCamera(parityCamera);
+                        for (std::uint32_t frame = 0U; frame < 6U; ++frame) {
+                            pumpFrame();
+                        }
+                        const auto sizeTag = std::to_string(
+                            static_cast<int>(std::lround(sizeMeters * 1000.0F)));
+                        const bool showcase =
+                            variantName == "authored" &&
+                            (sizeMeters == 0.002F || sizeMeters == 0.004F) &&
+                            parityCamera.name != "mid";
+                        const auto stem = std::string{visualName} + "_" +
+                                          sizeTag + "mm_" +
+                                          std::string{variantName} + "_" +
+                                          std::string{parityCamera.name} + "_" +
+                                          std::string{bundleName};
+                        std::string captureError;
+                        const auto captured = CaptureWaterIntegrationFrame(
+                            runtimeState,
+                            viewport,
+                            ResolveWaterFrameState(runtimeState),
+                            0.0F,
+                            std::filesystem::path{},
+                            showcase ? outputDirectory / (stem + ".ppm")
+                                     : std::filesystem::path{},
+                            &captureError);
+                        if (!captured.has_value()) {
+                            failures.emplace_back(
+                                stem + " capture failed: " + captureError);
+                            return;
+                        }
+                        double lumaSum = 0.0;
+                        double matteSum = 0.0;
+                        double alphaSum = 0.0;
+                        std::size_t covered = 0U;
+                        const auto pixelCount = captured->alpha.size();
+                        for (std::size_t pixel = 0U; pixel < pixelCount; ++pixel) {
+                            const double luma =
+                                0.2126 * captured->linearRed[pixel] +
+                                0.7152 * captured->linearGreen[pixel] +
+                                0.0722 * captured->linearBlue[pixel];
+                            const double alpha = captured->alpha[pixel];
+                            lumaSum += luma;
+                            matteSum += luma * alpha;
+                            alphaSum += alpha;
+                            covered += alpha > 0.01 ? 1U : 0U;
+                        }
+                        const double pixels =
+                            std::max<std::size_t>(1U, pixelCount);
+                        rows.push_back({
+                            {"visual", std::string{visualName}},
+                            {"variant", std::string{variantName}},
+                            {"size_mm", sizeTag},
+                            {"camera", std::string{parityCamera.name}},
+                            {"bundle", std::string{bundleName}},
+                            {"mean_luma", lumaSum / pixels},
+                            {"mean_luma_matte", matteSum / pixels},
+                            {"mean_alpha", alphaSum / pixels},
+                            {"coverage", static_cast<double>(covered) / pixels},
+                        });
+                        std::cout << "parity " << stem
+                                  << " matte " << (matteSum / pixels)
+                                  << " coverage "
+                                  << (static_cast<double>(covered) / pixels)
+                                  << std::endl;
+                    }
+                }
+            }
+        }
+    };
+
+    captureBundle("live5mm");
+    if (!failures.empty()) {
+        return finish();
+    }
+    if (!RequestSceneDisplaySwitch(runtimeState, viewport, &scene, 1'000U)) {
+        failures.emplace_back(
+            "Could not request the 1 mm bundle: " +
+            (scene.switchError.empty() ? runtimeState->errorMessage
+                                       : scene.switchError));
+        return finish();
+    }
+    StartQueuedLayerLoadIfIdle(runtimeState);
+    if (!waitForDisplay(1'000U)) {
+        failures.emplace_back("The 1 mm Scene3 bundle never settled.");
+        return finish();
+    }
+    captureBundle("render1mm");
     viewport->WaitIdle();
     return finish();
 }
@@ -112183,6 +112510,16 @@ int Application::Run(ApplicationRunOptions options) const {
             const auto smokeExitCode = RunScene3PatchBoundarySmoke(
                 options.guiSmoke.value(),
                 assetCatalog,
+                &window,
+                &viewport.value(),
+                &runtimeState);
+            StopBackgroundWorkForShutdown(&runtimeState);
+            viewport->WaitIdle();
+            return smokeExitCode;
+        }
+        if (options.guiSmoke->scenario == "scene3-visual-parity") {
+            const auto smokeExitCode = RunScene3VisualParitySmoke(
+                options.guiSmoke.value(),
                 &window,
                 &viewport.value(),
                 &runtimeState);

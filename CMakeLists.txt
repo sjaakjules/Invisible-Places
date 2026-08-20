@@ -380,6 +380,23 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
                 TIMEOUT 1200
         )
         add_test(
+            NAME scene3-visual-parity-gui-smoke
+            COMMAND
+                $<TARGET_FILE:invisible_places>
+                "${CMAKE_CURRENT_SOURCE_DIR}/Data"
+                --gui-smoke scene3-visual-parity
+                --smoke-project "${CMAKE_CURRENT_SOURCE_DIR}/Saved/ExhibitionFinal_project.json"
+                --smoke-output "${CMAKE_CURRENT_BINARY_DIR}/scene3-visual-parity"
+        )
+        set_tests_properties(
+            scene3-visual-parity-gui-smoke
+            PROPERTIES
+                LABELS "gui_smoke;pointcloud;full_site"
+                RUN_SERIAL TRUE
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                TIMEOUT 2400
+        )
+        add_test(
             NAME renderer-frame-timing-scene3-5mm
             COMMAND
                 $<TARGET_FILE:invisible_places>
