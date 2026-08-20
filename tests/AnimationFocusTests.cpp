@@ -3708,6 +3708,332 @@ TEST_CASE("Reciprocal timing windows map both camera paths onto one exact loop",
           originalFirst.timingCycleFrames);
 }
 
+TEST_CASE("Reciprocal loop transport preserves asymmetric S01 seam timing",
+          "[camera][animation][linked-seam][timing-loop]"
+          "[reciprocal-loop-transport]") {
+    const auto makePath = [](std::string name,
+                             std::uint32_t durationFrames,
+                             std::uint32_t startOverlapFrames,
+                             std::uint32_t endOverlapFrames) {
+        invisible_places::camera::AnimationPath path;
+        path.name = std::move(name);
+        path.durationFrames = durationFrames;
+        path.keys = {
+            {.id = path.name + "-start"},
+            {.id = path.name + "-end",
+             .durationFrames = durationFrames},
+        };
+        path.velocityBlendLink = invisible_places::camera::
+            AnimationVelocityBlendLinkMetadata{
+                .pairId = "Proj_09S01",
+                .partnerFileName = "partner.ipanim.json",
+                .startOverlapSeconds =
+                    static_cast<float>(startOverlapFrames) / 30.0F,
+                .endOverlapSeconds =
+                    static_cast<float>(endOverlapFrames) / 30.0F,
+            };
+        return path;
+    };
+
+    auto animationA = makePath("Proj_A_09S01", 6868U, 3080U, 2818U);
+    auto animationB = makePath("Proj_B_09S01", 6230U, 2818U, 3080U);
+    animationA.velocityBlendLink->partnerFileName =
+        "Proj_B_09S01.ipanim.json";
+    animationB.velocityBlendLink->partnerFileName =
+        "Proj_A_09S01.ipanim.json";
+    REQUIRE(invisible_places::camera::
+                ConfigureAnimationReciprocalTimingLoopWindows(
+                    &animationA,
+                    &animationB));
+    REQUIRE(animationA.velocityBlendLink.has_value());
+    REQUIRE(animationB.velocityBlendLink.has_value());
+    CHECK(animationA.velocityBlendLink->timingCycleFrames == 7200U);
+    CHECK(animationB.velocityBlendLink->timingCycleFrames == 7200U);
+    CHECK(animationA.velocityBlendLink->timingWindowStartFrame == 0);
+    CHECK(animationB.velocityBlendLink->timingWindowStartFrame == 4050);
+
+    const auto resolved = invisible_places::camera::
+        ResolveAnimationReciprocalLoopTransport(animationA, animationB);
+    REQUIRE(resolved.has_value());
+    const auto& transport = resolved.value();
+    CHECK(transport.cycleFrames == 7200U);
+    CHECK(transport.canonicalFirstMemberIndex == 0U);
+    CHECK(transport.memberInputIndices ==
+          std::array<std::size_t, 2U>{0U, 1U});
+    CHECK(transport.memberWindows[0U].durationFrames == 6868U);
+    CHECK(transport.memberWindows[1U].durationFrames == 6230U);
+    CHECK(transport.firstStartOverlapFrames == 3080U);
+    CHECK(transport.firstEndOverlapFrames == 2818U);
+    CHECK(transport.firstStartSeamMidpointFrame == Approx(1540.0));
+    CHECK(transport.firstEndSeamMidpointFrame == Approx(5459.0));
+
+    const auto signedToFrame = [&](double position) {
+        return invisible_places::camera::
+            AnimationReciprocalLoopSignedPositionToCycleFrame(
+                transport,
+                position);
+    };
+    const auto frameToSigned = [&](double frame) {
+        return invisible_places::camera::
+            AnimationReciprocalLoopCycleFrameToSignedPosition(
+                transport,
+                frame);
+    };
+    CHECK(signedToFrame(0.0) == Approx(1540.0));
+    CHECK(signedToFrame(-1.0) == Approx(5459.0));
+    CHECK(signedToFrame(1.0) == Approx(5459.0));
+    CHECK(signedToFrame(2.0) == Approx(1540.0));
+    CHECK(signedToFrame(-2.0) == Approx(1540.0));
+    CHECK(signedToFrame(0.5) == Approx(3499.5));
+    CHECK(signedToFrame(-0.5) == Approx(7099.5));
+    CHECK(invisible_places::camera::
+              WrapAnimationReciprocalLoopSignedPosition(1.0) ==
+          Approx(-1.0));
+    CHECK(invisible_places::camera::
+              WrapAnimationReciprocalLoopCycleFrame(transport, 7200.0) ==
+          Approx(0.0));
+    CHECK(invisible_places::camera::
+              WrapAnimationReciprocalLoopCycleFrame(transport, -1.0) ==
+          Approx(7199.0));
+
+    for (const double position :
+         std::array{-1.0, -0.75, -0.25, 0.0, 0.25, 0.75}) {
+        const double expected = invisible_places::camera::
+            WrapAnimationReciprocalLoopSignedPosition(position);
+        CHECK(frameToSigned(signedToFrame(position)) ==
+              Approx(expected).margin(1.0e-12));
+        const double phase = invisible_places::camera::
+            AnimationReciprocalLoopSignedPositionToCyclePhase(
+                transport,
+                position);
+        CHECK(invisible_places::camera::
+                  AnimationReciprocalLoopCyclePhaseToSignedPosition(
+                      transport,
+                      phase) == Approx(expected).margin(1.0e-12));
+    }
+    for (const double frame :
+         std::array{0.0, 1540.0, 3000.0, 5459.0, 6500.0, 7199.0,
+                    7200.0}) {
+        const double expected = invisible_places::camera::
+            WrapAnimationReciprocalLoopCycleFrame(transport, frame);
+        CHECK(signedToFrame(frameToSigned(frame)) ==
+              Approx(expected).margin(1.0e-9));
+    }
+
+    const auto localAt = [&](std::size_t memberIndex, double frame) {
+        return invisible_places::camera::
+            AnimationReciprocalLoopCycleFrameToLocalPositions(
+                transport,
+                memberIndex,
+                frame);
+    };
+    const auto aAtFirstSeam = localAt(0U, 1540.0);
+    const auto bAtFirstSeam = localAt(1U, 1540.0);
+    REQUIRE(aAtFirstSeam.size() == 1U);
+    REQUIRE(bAtFirstSeam.size() == 1U);
+    CHECK(aAtFirstSeam.front() == Approx(1540.0F / 6868.0F));
+    CHECK(bAtFirstSeam.front() == Approx(4690.0F / 6230.0F));
+    const auto aAtSecondSeam = localAt(0U, 5459.0);
+    const auto bAtSecondSeam = localAt(1U, 5459.0);
+    REQUIRE(aAtSecondSeam.size() == 1U);
+    REQUIRE(bAtSecondSeam.size() == 1U);
+    CHECK(aAtSecondSeam.front() == Approx(5459.0F / 6868.0F));
+    CHECK(bAtSecondSeam.front() == Approx(1409.0F / 6230.0F));
+    CHECK(localAt(0U, 3499.5).size() == 1U);
+    CHECK(localAt(1U, 3499.5).empty());
+    CHECK(localAt(0U, 7099.5).empty());
+    CHECK(localAt(1U, 7099.5).size() == 1U);
+    const auto nearestA = invisible_places::camera::
+        ResolveAnimationReciprocalLoopNearestLocalPosition(
+            transport,
+            0U,
+            3499.5,
+            0.4F);
+    REQUIRE(nearestA.has_value());
+    CHECK(nearestA.value() == Approx(3499.5F / 6868.0F));
+    CHECK_FALSE(invisible_places::camera::
+                    ResolveAnimationReciprocalLoopNearestLocalPosition(
+                        transport,
+                        1U,
+                        3499.5,
+                        0.4F)
+                        .has_value());
+    const auto aAtCycle = localAt(0U, 7200.0);
+    const auto aAtZero = localAt(0U, 0.0);
+    REQUIRE(aAtCycle.size() == aAtZero.size());
+    REQUIRE(aAtCycle.size() == 1U);
+    CHECK(aAtCycle.front() == Approx(aAtZero.front()));
+
+    SECTION("path-only input order remains explicit") {
+        const auto swapped = invisible_places::camera::
+            ResolveAnimationReciprocalLoopTransport(
+                animationB,
+                animationA);
+        REQUIRE(swapped.has_value());
+        CHECK(swapped->canonicalFirstMemberIndex == 1U);
+        CHECK(swapped->memberInputIndices ==
+              std::array<std::size_t, 2U>{0U, 1U});
+        CHECK(swapped->memberWindows[0U].durationFrames == 6230U);
+        CHECK(swapped->memberWindows[1U].durationFrames == 6868U);
+        CHECK(swapped->firstStartSeamMidpointFrame == Approx(5459.0));
+        CHECK(swapped->firstEndSeamMidpointFrame == Approx(1540.0));
+        CHECK(invisible_places::camera::
+                  AnimationReciprocalLoopSignedPositionToCycleFrame(
+                      swapped.value(),
+                      0.0) == Approx(5459.0));
+        CHECK(invisible_places::camera::
+                  AnimationReciprocalLoopSignedPositionToCycleFrame(
+                      swapped.value(),
+                      1.0) == Approx(1540.0));
+    }
+
+    SECTION("full file paths keep lexical A and B identity stable") {
+        const std::filesystem::path aPath =
+            "/show/animations/Proj_A_09S01.ipanim.json";
+        const std::filesystem::path bPath =
+            "/show/animations/Proj_B_09S01.ipanim.json";
+        const auto swappedInputs = invisible_places::camera::
+            ResolveAnimationReciprocalLoopTransport(
+                animationB,
+                bPath,
+                animationA,
+                aPath);
+        REQUIRE(swappedInputs.has_value());
+        CHECK(swappedInputs->memberInputIndices ==
+              std::array<std::size_t, 2U>{1U, 0U});
+        CHECK(swappedInputs->canonicalFirstMemberIndex == 0U);
+        CHECK(swappedInputs->memberWindows[0U].durationFrames == 6868U);
+        CHECK(swappedInputs->memberWindows[1U].durationFrames == 6230U);
+        CHECK(swappedInputs->firstStartSeamMidpointFrame == Approx(1540.0));
+        CHECK(swappedInputs->firstEndSeamMidpointFrame == Approx(5459.0));
+
+        const auto orderedInputs = invisible_places::camera::
+            ResolveAnimationReciprocalLoopTransport(
+                animationA,
+                aPath,
+                animationB,
+                bPath);
+        REQUIRE(orderedInputs.has_value());
+        CHECK(orderedInputs->memberInputIndices ==
+              std::array<std::size_t, 2U>{0U, 1U});
+        CHECK(orderedInputs->firstStartSeamMidpointFrame ==
+              Approx(swappedInputs->firstStartSeamMidpointFrame));
+        CHECK(orderedInputs->firstEndSeamMidpointFrame ==
+              Approx(swappedInputs->firstEndSeamMidpointFrame));
+
+        auto wrongPartner = animationB;
+        wrongPartner.velocityBlendLink->partnerFileName =
+            "Proj_C_09S01.ipanim.json";
+        CHECK_FALSE(invisible_places::camera::
+                        ResolveAnimationReciprocalLoopTransport(
+                            wrongPartner,
+                            bPath,
+                            animationA,
+                            aPath)
+                            .has_value());
+    }
+
+    SECTION("lexical member zero owns signed seams even when its timing starts later") {
+        auto laterLexicalMember = animationB;
+        auto zeroLexicalMember = animationA;
+        laterLexicalMember.velocityBlendLink->partnerFileName =
+            "Z_zero.ipanim.json";
+        zeroLexicalMember.velocityBlendLink->partnerFileName =
+            "A_later.ipanim.json";
+        const std::filesystem::path laterPath =
+            "/show/animations/A_later.ipanim.json";
+        const std::filesystem::path zeroPath =
+            "/show/animations/Z_zero.ipanim.json";
+        const auto lexicalTransport = invisible_places::camera::
+            ResolveAnimationReciprocalLoopTransport(
+                zeroLexicalMember,
+                zeroPath,
+                laterLexicalMember,
+                laterPath);
+        REQUIRE(lexicalTransport.has_value());
+        CHECK(lexicalTransport->memberInputIndices ==
+              std::array<std::size_t, 2U>{1U, 0U});
+        CHECK(lexicalTransport->canonicalFirstMemberIndex == 1U);
+        CHECK(lexicalTransport->memberWindows[0U].durationFrames == 6230U);
+        CHECK(lexicalTransport->firstStartSeamMidpointFrame ==
+              Approx(5459.0));
+        CHECK(lexicalTransport->firstEndSeamMidpointFrame ==
+              Approx(1540.0));
+    }
+
+    SECTION("nearest occurrence follows the previous playhead at a boundary") {
+        auto cycleLengthMember = makePath("A", 100U, 20U, 40U);
+        auto shorterMember = makePath("B", 60U, 40U, 20U);
+        REQUIRE(invisible_places::camera::
+                    ConfigureAnimationReciprocalTimingLoopWindows(
+                        &cycleLengthMember,
+                        &shorterMember));
+        const auto boundaryTransport = invisible_places::camera::
+            ResolveAnimationReciprocalLoopTransport(
+                cycleLengthMember,
+                shorterMember);
+        REQUIRE(boundaryTransport.has_value());
+        REQUIRE(boundaryTransport->cycleFrames == 100U);
+        const auto boundaryOccurrences = invisible_places::camera::
+            AnimationReciprocalLoopCycleFrameToLocalPositions(
+                boundaryTransport.value(),
+                0U,
+                0.0);
+        REQUIRE(boundaryOccurrences.size() == 2U);
+        CHECK(boundaryOccurrences[0U] == Approx(0.0F));
+        CHECK(boundaryOccurrences[1U] == Approx(1.0F));
+        const auto nearerStart = invisible_places::camera::
+            ResolveAnimationReciprocalLoopNearestLocalPosition(
+                boundaryTransport.value(),
+                0U,
+                0.0,
+                0.2F);
+        const auto nearerEnd = invisible_places::camera::
+            ResolveAnimationReciprocalLoopNearestLocalPositionAtCyclePhase(
+                boundaryTransport.value(),
+                0U,
+                0.0,
+                0.8F);
+        REQUIRE(nearerStart.has_value());
+        REQUIRE(nearerEnd.has_value());
+        CHECK(nearerStart.value() == Approx(0.0F));
+        CHECK(nearerEnd.value() == Approx(1.0F));
+        CHECK_FALSE(invisible_places::camera::
+                        ResolveAnimationReciprocalLoopNearestLocalPosition(
+                            boundaryTransport.value(),
+                            1U,
+                            40.0,
+                            0.5F)
+                            .has_value());
+    }
+
+    SECTION("inconsistent persisted windows are rejected") {
+        auto wrongCycle = animationB;
+        wrongCycle.velocityBlendLink->timingCycleFrames = 7199U;
+        CHECK_FALSE(invisible_places::camera::
+                        ResolveAnimationReciprocalLoopTransport(
+                            animationA,
+                            wrongCycle)
+                            .has_value());
+
+        auto wrongStart = animationB;
+        wrongStart.velocityBlendLink->timingWindowStartFrame += 1;
+        CHECK_FALSE(invisible_places::camera::
+                        ResolveAnimationReciprocalLoopTransport(
+                            animationA,
+                            wrongStart)
+                            .has_value());
+
+        auto wrongOverlap = animationB;
+        wrongOverlap.velocityBlendLink->endOverlapSeconds = 100.0F;
+        CHECK_FALSE(invisible_places::camera::
+                        ResolveAnimationReciprocalLoopTransport(
+                            animationA,
+                            wrongOverlap)
+                            .has_value());
+    }
+}
+
 TEST_CASE("Reciprocal linked animations accept any existing Timing Take atomically",
           "[camera][animation][linked-seam][timing-loop][timing-take]") {
     const auto makePath = [](std::string name,

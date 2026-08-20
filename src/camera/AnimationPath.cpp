@@ -1388,7 +1388,80 @@ double WrapTimingLoopFrame(double frame, double cycle) {
         return 0.0;
     }
     frame = std::fmod(frame, cycle);
-    return frame < 0.0 ? frame + cycle : frame;
+    if (frame < 0.0) {
+        frame += cycle;
+    }
+    const double wrapTolerance =
+        std::max(1.0, cycle) * std::numeric_limits<double>::epsilon() * 32.0;
+    return frame <= wrapTolerance || frame >= cycle - wrapTolerance
+        ? 0.0
+        : frame;
+}
+
+std::optional<std::uint32_t> AnimationOverlapFrameCount(float seconds) {
+    if (!std::isfinite(seconds) || seconds < 0.0F) {
+        return std::nullopt;
+    }
+    const long double frames =
+        static_cast<long double>(seconds) *
+        static_cast<long double>(kAnimationFramesPerSecond);
+    if (frames > std::numeric_limits<std::uint32_t>::max()) {
+        return std::nullopt;
+    }
+    return static_cast<std::uint32_t>(std::llround(frames));
+}
+
+std::uint32_t WrapTimingLoopIntegerFrame(
+    std::int64_t frame,
+    std::uint32_t cycleFrames) {
+    if (cycleFrames == 0U) {
+        return 0U;
+    }
+    const std::int64_t cycle = static_cast<std::int64_t>(cycleFrames);
+    const std::int64_t remainder = frame % cycle;
+    return static_cast<std::uint32_t>(
+        remainder < 0 ? remainder + cycle : remainder);
+}
+
+std::vector<float> TimingLoopFrameToLocalPositions(
+    const AnimationTimingLoopWindow& window,
+    double cycleFrame) {
+    if (window.cycleFrames == 0U || window.durationFrames == 0U) {
+        return {};
+    }
+    const double cycle = static_cast<double>(window.cycleFrames);
+    const double phase = WrapTimingLoopFrame(cycleFrame, cycle);
+    const double start = static_cast<double>(window.startFrame);
+    const double duration = static_cast<double>(window.durationFrames);
+    constexpr double kFrameTolerance = 1.0e-6;
+    const auto minimumCopy = static_cast<std::int64_t>(std::ceil(
+        (start - phase - kFrameTolerance) / cycle));
+    const auto maximumCopy = static_cast<std::int64_t>(std::floor(
+        (start + duration - phase + kFrameTolerance) / cycle));
+    std::vector<float> positions;
+    if (maximumCopy < minimumCopy) {
+        return positions;
+    }
+    positions.reserve(static_cast<std::size_t>(
+        std::min<std::int64_t>(maximumCopy - minimumCopy + 1, 8)));
+    for (std::int64_t copy = minimumCopy;
+         copy <= maximumCopy;
+         ++copy) {
+        const double localFrame = phase +
+            static_cast<double>(copy) * cycle - start;
+        const float local = static_cast<float>(std::clamp(
+            localFrame / duration,
+            0.0,
+            1.0));
+        if (positions.empty() ||
+            std::abs(positions.back() - local) > 1.0e-6F) {
+            positions.push_back(local);
+        }
+        if (positions.size() == 8U) {
+            break;
+        }
+    }
+    return positions;
 }
 
 }  // namespace
@@ -1435,37 +1508,311 @@ std::vector<float> AnimationTimingLoopPositionToLocalPositions(
              ? static_cast<double>(loopNormalizedPosition)
              : 0.0) * cycle,
         cycle);
-    const double start = static_cast<double>(window->startFrame);
-    const double duration = static_cast<double>(window->durationFrames);
-    constexpr double kFrameTolerance = 1.0e-6;
-    const auto minimumCopy = static_cast<std::int64_t>(std::ceil(
-        (start - phase - kFrameTolerance) / cycle));
-    const auto maximumCopy = static_cast<std::int64_t>(std::floor(
-        (start + duration - phase + kFrameTolerance) / cycle));
-    std::vector<float> positions;
-    if (maximumCopy < minimumCopy) {
-        return positions;
+    return TimingLoopFrameToLocalPositions(*window, phase);
+}
+
+std::optional<AnimationReciprocalLoopTransport>
+ResolveAnimationReciprocalLoopTransport(
+    const AnimationPath& firstMember,
+    const AnimationPath& secondMember) {
+    const std::array<const AnimationPath*, 2U> members{
+        &firstMember,
+        &secondMember,
+    };
+    const auto firstWindow = ResolveAnimationTimingLoopWindow(firstMember);
+    const auto secondWindow = ResolveAnimationTimingLoopWindow(secondMember);
+    if (!firstWindow.has_value() || !secondWindow.has_value() ||
+        firstWindow->cycleFrames == 0U ||
+        firstWindow->cycleFrames != secondWindow->cycleFrames ||
+        !firstMember.velocityBlendLink.has_value() ||
+        !secondMember.velocityBlendLink.has_value() ||
+        firstMember.velocityBlendLink->pairId.empty() ||
+        firstMember.velocityBlendLink->pairId !=
+            secondMember.velocityBlendLink->pairId) {
+        return std::nullopt;
     }
-    positions.reserve(static_cast<std::size_t>(
-        std::min<std::int64_t>(maximumCopy - minimumCopy + 1, 8)));
-    for (std::int64_t copy = minimumCopy;
-         copy <= maximumCopy;
-         ++copy) {
-        const double localFrame = phase +
-            static_cast<double>(copy) * cycle - start;
-        const float local = static_cast<float>(std::clamp(
-            localFrame / std::max(1.0, duration),
-            0.0,
-            1.0));
-        if (positions.empty() ||
-            std::abs(positions.back() - local) > 1.0e-6F) {
-            positions.push_back(local);
-        }
-        if (positions.size() == 8U) {
-            break;
-        }
+    const std::array<AnimationTimingLoopWindow, 2U> windows{
+        *firstWindow,
+        *secondWindow,
+    };
+    const std::uint32_t cycleFrames = firstWindow->cycleFrames;
+    const bool firstStartsAtZero =
+        WrapTimingLoopIntegerFrame(firstWindow->startFrame, cycleFrames) == 0U;
+    const bool secondStartsAtZero =
+        WrapTimingLoopIntegerFrame(secondWindow->startFrame, cycleFrames) == 0U;
+    if (firstStartsAtZero == secondStartsAtZero) {
+        return std::nullopt;
     }
-    return positions;
+    const std::size_t canonicalFirst = firstStartsAtZero ? 0U : 1U;
+    const auto& firstLink = members[0U]->velocityBlendLink.value();
+    const auto& secondLink = members[1U]->velocityBlendLink.value();
+    const auto firstStart = AnimationOverlapFrameCount(
+        firstLink.startOverlapSeconds);
+    const auto firstEnd = AnimationOverlapFrameCount(
+        firstLink.endOverlapSeconds);
+    const auto secondStart = AnimationOverlapFrameCount(
+        secondLink.startOverlapSeconds);
+    const auto secondEnd = AnimationOverlapFrameCount(
+        secondLink.endOverlapSeconds);
+    const std::uint32_t firstDuration = windows[0U].durationFrames;
+    const std::uint32_t secondDuration = windows[1U].durationFrames;
+    if (!firstStart.has_value() || !firstEnd.has_value() ||
+        !secondStart.has_value() || !secondEnd.has_value() ||
+        *firstStart != *secondEnd || *firstEnd != *secondStart ||
+        static_cast<std::uint64_t>(*firstStart) + *firstEnd >
+            firstDuration ||
+        static_cast<std::uint64_t>(*secondStart) + *secondEnd >
+            secondDuration) {
+        return std::nullopt;
+    }
+    const std::uint64_t derivedCycle =
+        static_cast<std::uint64_t>(firstDuration) + secondDuration -
+        *firstStart - *firstEnd;
+    if (derivedCycle == 0U || derivedCycle != cycleFrames) {
+        return std::nullopt;
+    }
+    const std::uint64_t expectedSecondStart =
+        static_cast<std::uint64_t>(WrapTimingLoopIntegerFrame(
+            windows[0U].startFrame,
+            cycleFrames)) +
+        firstDuration - *firstEnd;
+    if (WrapTimingLoopIntegerFrame(
+            windows[1U].startFrame,
+            cycleFrames) != expectedSecondStart % cycleFrames) {
+        return std::nullopt;
+    }
+    const double cycle = static_cast<double>(cycleFrames);
+    const double firstStartMidpoint = WrapTimingLoopFrame(
+        static_cast<double>(windows[0U].startFrame) +
+            static_cast<double>(*firstStart) * 0.5,
+        cycle);
+    const double firstEndMidpoint = WrapTimingLoopFrame(
+        static_cast<double>(windows[0U].startFrame) +
+            static_cast<double>(firstDuration) -
+            static_cast<double>(*firstEnd) * 0.5,
+        cycle);
+    const double positiveSpan = WrapTimingLoopFrame(
+        firstEndMidpoint - firstStartMidpoint,
+        cycle);
+    if (positiveSpan <= 0.0 || positiveSpan >= cycle) {
+        return std::nullopt;
+    }
+    return AnimationReciprocalLoopTransport{
+        .cycleFrames = cycleFrames,
+        .memberWindows = windows,
+        .memberInputIndices = {0U, 1U},
+        .canonicalFirstMemberIndex = canonicalFirst,
+        .firstStartOverlapFrames = *firstStart,
+        .firstEndOverlapFrames = *firstEnd,
+        .firstStartSeamMidpointFrame = firstStartMidpoint,
+        .firstEndSeamMidpointFrame = firstEndMidpoint,
+    };
+}
+
+std::optional<AnimationReciprocalLoopTransport>
+ResolveAnimationReciprocalLoopTransport(
+    const AnimationPath& firstMember,
+    const std::filesystem::path& firstMemberFilePath,
+    const AnimationPath& secondMember,
+    const std::filesystem::path& secondMemberFilePath) {
+    if (!firstMember.velocityBlendLink.has_value() ||
+        !secondMember.velocityBlendLink.has_value()) {
+        return std::nullopt;
+    }
+    const std::string firstFileName =
+        firstMemberFilePath.filename().generic_string();
+    const std::string secondFileName =
+        secondMemberFilePath.filename().generic_string();
+    const std::string firstPartnerFileName = std::filesystem::path{
+        firstMember.velocityBlendLink->partnerFileName}
+        .filename()
+        .generic_string();
+    const std::string secondPartnerFileName = std::filesystem::path{
+        secondMember.velocityBlendLink->partnerFileName}
+        .filename()
+        .generic_string();
+    if (firstFileName.empty() || secondFileName.empty() ||
+        firstPartnerFileName != secondFileName ||
+        secondPartnerFileName != firstFileName) {
+        return std::nullopt;
+    }
+    const std::string firstKey =
+        firstMemberFilePath.lexically_normal().generic_string();
+    const std::string secondKey =
+        secondMemberFilePath.lexically_normal().generic_string();
+    if (firstKey == secondKey) {
+        return std::nullopt;
+    }
+    if (secondKey < firstKey) {
+        auto transport = ResolveAnimationReciprocalLoopTransport(
+            secondMember,
+            firstMember);
+        if (transport.has_value()) {
+            transport->memberInputIndices = {1U, 0U};
+        }
+        return transport;
+    }
+    return ResolveAnimationReciprocalLoopTransport(
+        firstMember,
+        secondMember);
+}
+
+double WrapAnimationReciprocalLoopSignedPosition(double signedPosition) {
+    if (!std::isfinite(signedPosition)) {
+        return 0.0;
+    }
+    double wrapped = std::remainder(signedPosition, 2.0);
+    if (wrapped >= 1.0) {
+        wrapped -= 2.0;
+    } else if (wrapped < -1.0) {
+        wrapped += 2.0;
+    }
+    return wrapped;
+}
+
+double WrapAnimationReciprocalLoopCycleFrame(
+    const AnimationReciprocalLoopTransport& transport,
+    double cycleFrame) {
+    return WrapTimingLoopFrame(
+        cycleFrame,
+        static_cast<double>(transport.cycleFrames));
+}
+
+double AnimationReciprocalLoopSignedPositionToCycleFrame(
+    const AnimationReciprocalLoopTransport& transport,
+    double signedPosition) {
+    const double cycle = static_cast<double>(transport.cycleFrames);
+    if (cycle <= 0.0) {
+        return 0.0;
+    }
+    const double start = WrapTimingLoopFrame(
+        transport.firstStartSeamMidpointFrame,
+        cycle);
+    const double end = WrapTimingLoopFrame(
+        transport.firstEndSeamMidpointFrame,
+        cycle);
+    const double positiveSpan = WrapTimingLoopFrame(end - start, cycle);
+    const double negativeSpan = cycle - positiveSpan;
+    if (positiveSpan <= 0.0 || negativeSpan <= 0.0) {
+        return start;
+    }
+    const double position =
+        WrapAnimationReciprocalLoopSignedPosition(signedPosition);
+    const double frame = position >= 0.0
+        ? start + position * positiveSpan
+        : start + position * negativeSpan;
+    return WrapTimingLoopFrame(frame, cycle);
+}
+
+double AnimationReciprocalLoopCycleFrameToSignedPosition(
+    const AnimationReciprocalLoopTransport& transport,
+    double cycleFrame) {
+    const double cycle = static_cast<double>(transport.cycleFrames);
+    if (cycle <= 0.0) {
+        return 0.0;
+    }
+    const double start = WrapTimingLoopFrame(
+        transport.firstStartSeamMidpointFrame,
+        cycle);
+    const double end = WrapTimingLoopFrame(
+        transport.firstEndSeamMidpointFrame,
+        cycle);
+    const double positiveSpan = WrapTimingLoopFrame(end - start, cycle);
+    const double negativeSpan = cycle - positiveSpan;
+    if (positiveSpan <= 0.0 || negativeSpan <= 0.0) {
+        return 0.0;
+    }
+    const double forward = WrapTimingLoopFrame(cycleFrame - start, cycle);
+    if (forward < positiveSpan) {
+        return forward / positiveSpan;
+    }
+    return -(cycle - forward) / negativeSpan;
+}
+
+double AnimationReciprocalLoopSignedPositionToCyclePhase(
+    const AnimationReciprocalLoopTransport& transport,
+    double signedPosition) {
+    if (transport.cycleFrames == 0U) {
+        return 0.0;
+    }
+    return AnimationReciprocalLoopSignedPositionToCycleFrame(
+               transport,
+               signedPosition) /
+        static_cast<double>(transport.cycleFrames);
+}
+
+double AnimationReciprocalLoopCyclePhaseToSignedPosition(
+    const AnimationReciprocalLoopTransport& transport,
+    double cyclePhase) {
+    const double finitePhase = std::isfinite(cyclePhase) ? cyclePhase : 0.0;
+    return AnimationReciprocalLoopCycleFrameToSignedPosition(
+        transport,
+        finitePhase * static_cast<double>(transport.cycleFrames));
+}
+
+std::vector<float> AnimationReciprocalLoopCycleFrameToLocalPositions(
+    const AnimationReciprocalLoopTransport& transport,
+    std::size_t memberIndex,
+    double cycleFrame) {
+    if (memberIndex >= transport.memberWindows.size() ||
+        transport.cycleFrames == 0U ||
+        transport.memberWindows[memberIndex].cycleFrames !=
+            transport.cycleFrames) {
+        return {};
+    }
+    return TimingLoopFrameToLocalPositions(
+        transport.memberWindows[memberIndex],
+        cycleFrame);
+}
+
+std::vector<float> AnimationReciprocalLoopCyclePhaseToLocalPositions(
+    const AnimationReciprocalLoopTransport& transport,
+    std::size_t memberIndex,
+    double cyclePhase) {
+    const double finitePhase = std::isfinite(cyclePhase) ? cyclePhase : 0.0;
+    return AnimationReciprocalLoopCycleFrameToLocalPositions(
+        transport,
+        memberIndex,
+        finitePhase * static_cast<double>(transport.cycleFrames));
+}
+
+std::optional<float> ResolveAnimationReciprocalLoopNearestLocalPosition(
+    const AnimationReciprocalLoopTransport& transport,
+    std::size_t memberIndex,
+    double cycleFrame,
+    float previousLocalPosition) {
+    const auto positions =
+        AnimationReciprocalLoopCycleFrameToLocalPositions(
+            transport,
+            memberIndex,
+            cycleFrame);
+    if (positions.empty()) {
+        return std::nullopt;
+    }
+    if (!std::isfinite(previousLocalPosition)) {
+        return positions.front();
+    }
+    return *std::min_element(
+        positions.begin(),
+        positions.end(),
+        [previousLocalPosition](float left, float right) {
+            return std::abs(left - previousLocalPosition) <
+                std::abs(right - previousLocalPosition);
+        });
+}
+
+std::optional<float>
+ResolveAnimationReciprocalLoopNearestLocalPositionAtCyclePhase(
+    const AnimationReciprocalLoopTransport& transport,
+    std::size_t memberIndex,
+    double cyclePhase,
+    float previousLocalPosition) {
+    const double finitePhase = std::isfinite(cyclePhase) ? cyclePhase : 0.0;
+    return ResolveAnimationReciprocalLoopNearestLocalPosition(
+        transport,
+        memberIndex,
+        finitePhase * static_cast<double>(transport.cycleFrames),
+        previousLocalPosition);
 }
 
 bool ConfigureAnimationReciprocalTimingLoopWindows(
@@ -1492,23 +1839,14 @@ bool ConfigureAnimationReciprocalTimingLoopWindows(
         second->keys.size() > 1U
             ? static_cast<std::uint32_t>(second->keys.size() - 1U)
             : 1U);
-    const auto overlapFrames = [](float seconds)
-        -> std::optional<std::uint32_t> {
-        if (!std::isfinite(seconds) || seconds < 0.0F) {
-            return std::nullopt;
-        }
-        const long double frames =
-            static_cast<long double>(seconds) *
-            static_cast<long double>(kAnimationFramesPerSecond);
-        if (frames > std::numeric_limits<std::uint32_t>::max()) {
-            return std::nullopt;
-        }
-        return static_cast<std::uint32_t>(std::llround(frames));
-    };
-    const auto firstStart = overlapFrames(firstLink.startOverlapSeconds);
-    const auto firstEnd = overlapFrames(firstLink.endOverlapSeconds);
-    const auto secondStart = overlapFrames(secondLink.startOverlapSeconds);
-    const auto secondEnd = overlapFrames(secondLink.endOverlapSeconds);
+    const auto firstStart = AnimationOverlapFrameCount(
+        firstLink.startOverlapSeconds);
+    const auto firstEnd = AnimationOverlapFrameCount(
+        firstLink.endOverlapSeconds);
+    const auto secondStart = AnimationOverlapFrameCount(
+        secondLink.startOverlapSeconds);
+    const auto secondEnd = AnimationOverlapFrameCount(
+        secondLink.endOverlapSeconds);
     if (!firstStart.has_value() || !firstEnd.has_value() ||
         !secondStart.has_value() || !secondEnd.has_value() ||
         *firstStart != *secondEnd || *firstEnd != *secondStart ||

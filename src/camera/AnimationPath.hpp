@@ -153,6 +153,24 @@ struct AnimationTimingLoopWindow {
     std::uint32_t durationFrames = 0U;
 };
 
+// Immutable description of the shared clock for one validated reciprocal
+// pair. memberInputIndices maps each stored member window back to the input
+// slot supplied by the caller. canonicalFirstMemberIndex identifies the
+// stored member whose local frame zero defines cycle frame zero; it is timing
+// identity and is deliberately independent of lexical A/B file identity.
+// The first/second seam fields always describe stored member 0, while their
+// frame values are expressed on the canonical 0..cycle clock.
+struct AnimationReciprocalLoopTransport {
+    std::uint32_t cycleFrames = 0U;
+    std::array<AnimationTimingLoopWindow, 2U> memberWindows{};
+    std::array<std::size_t, 2U> memberInputIndices{0U, 1U};
+    std::size_t canonicalFirstMemberIndex = 0U;
+    std::uint32_t firstStartOverlapFrames = 0U;
+    std::uint32_t firstEndOverlapFrames = 0U;
+    double firstStartSeamMidpointFrame = 0.0;
+    double firstEndSeamMidpointFrame = 0.0;
+};
+
 struct AnimationLinkedSeamSample {
     // 0 = current-start/partner-end, 1 = current-end/partner-start.
     std::uint32_t currentSeamIndex = 0U;
@@ -860,6 +878,70 @@ ResolveAnimationTimingLoopWindow(const AnimationPath& path);
 [[nodiscard]] std::vector<float> AnimationTimingLoopPositionToLocalPositions(
     const AnimationPath& path,
     float loopNormalizedPosition);
+// Validates two persisted reciprocal timing windows and resolves one stable
+// whole-loop transport. Input order defines signed seam identity: position 0
+// is first-member start/second-member end. The independently recorded
+// canonicalFirstMemberIndex says which timing window begins at loop frame 0.
+[[nodiscard]] std::optional<AnimationReciprocalLoopTransport>
+ResolveAnimationReciprocalLoopTransport(
+    const AnimationPath& firstMember,
+    const AnimationPath& secondMember);
+// The path-aware overload stores members in normalized full-file-path lexical
+// order, giving A/B controls stable identity when either member was loaded
+// first. memberInputIndices preserves the mapping back to the call arguments.
+[[nodiscard]] std::optional<AnimationReciprocalLoopTransport>
+ResolveAnimationReciprocalLoopTransport(
+    const AnimationPath& firstMember,
+    const std::filesystem::path& firstMemberFilePath,
+    const AnimationPath& secondMember,
+    const std::filesystem::path& secondMemberFilePath);
+// Signed wizard positions repeat every 2: 0 is the first-start/second-end
+// seam midpoint and -1/+1 is the first-end/second-start seam midpoint.
+[[nodiscard]] double WrapAnimationReciprocalLoopSignedPosition(
+    double signedPosition);
+[[nodiscard]] double WrapAnimationReciprocalLoopCycleFrame(
+    const AnimationReciprocalLoopTransport& transport,
+    double cycleFrame);
+[[nodiscard]] double AnimationReciprocalLoopSignedPositionToCycleFrame(
+    const AnimationReciprocalLoopTransport& transport,
+    double signedPosition);
+[[nodiscard]] double AnimationReciprocalLoopCycleFrameToSignedPosition(
+    const AnimationReciprocalLoopTransport& transport,
+    double cycleFrame);
+[[nodiscard]] double AnimationReciprocalLoopSignedPositionToCyclePhase(
+    const AnimationReciprocalLoopTransport& transport,
+    double signedPosition);
+[[nodiscard]] double AnimationReciprocalLoopCyclePhaseToSignedPosition(
+    const AnimationReciprocalLoopTransport& transport,
+    double cyclePhase);
+// Returns every exact occurrence of a shared frame/phase within one member's
+// persisted local window. Empty means that only the other member is visible.
+[[nodiscard]] std::vector<float>
+AnimationReciprocalLoopCycleFrameToLocalPositions(
+    const AnimationReciprocalLoopTransport& transport,
+    std::size_t memberIndex,
+    double cycleFrame);
+[[nodiscard]] std::vector<float>
+AnimationReciprocalLoopCyclePhaseToLocalPositions(
+    const AnimationReciprocalLoopTransport& transport,
+    std::size_t memberIndex,
+    double cyclePhase);
+// Selects the exact available occurrence nearest the member's previous local
+// playhead. It never clamps an unavailable shared frame to a window endpoint;
+// unavailable members return nullopt. The previous value is used only for
+// ranking and is not itself clamped.
+[[nodiscard]] std::optional<float>
+ResolveAnimationReciprocalLoopNearestLocalPosition(
+    const AnimationReciprocalLoopTransport& transport,
+    std::size_t memberIndex,
+    double cycleFrame,
+    float previousLocalPosition);
+[[nodiscard]] std::optional<float>
+ResolveAnimationReciprocalLoopNearestLocalPositionAtCyclePhase(
+    const AnimationReciprocalLoopTransport& transport,
+    std::size_t memberIndex,
+    double cyclePhase,
+    float previousLocalPosition);
 // Assigns one canonical shared clock to a validated reciprocal pair. `first`
 // begins at loop frame zero; `second` begins where first's end overlap starts.
 // Existing camera, timing keys, and selected Timing Take ids are untouched.
