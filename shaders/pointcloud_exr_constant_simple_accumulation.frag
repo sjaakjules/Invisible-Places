@@ -4,6 +4,8 @@
 
 layout(location = 0) in vec4 inSourceColor;
 layout(location = 1) in float inViewDepth;
+layout(location = 3) in float inKernelEnergy;
+layout(location = 4) in float inKernelSpriteRatio;
 layout(location = 2) in vec3 inAovNormal;
 
 layout(location = 0) out vec4 outAccumulation;
@@ -182,10 +184,14 @@ void main() {
         discard;
     }
 
-    float radiusSquared = dot(centered, centered);
+    // Kernel-true falloff: see pointcloud_accumulation.frag.
+    const vec2 kernelCentered = centered / max(1.0e-3, inKernelSpriteRatio);
+    float radiusSquared = dot(kernelCentered, kernelCentered);
     const float radius = sqrt(radiusSquared);
     const float falloff = ResolveFalloff(radius, radiusSquared);
-    const float opacity = clamp(styleData.opacityBinding.constantValue.x, 0.0, 1.0);
+    const float opacity =
+        clamp(styleData.opacityBinding.constantValue.x, 0.0, 1.0) *
+        clamp(inKernelEnergy, 0.0, 1.0);
     const float alpha = clamp(opacity * falloff * coverage, 0.0, AlphaClampMax());
     if (alpha <= 1e-5) {
         discard;

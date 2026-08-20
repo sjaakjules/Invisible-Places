@@ -888,12 +888,14 @@ float ResolvePointCloudDensityAdjustedFootprint(
         return std::isfinite(value) ? std::max(0.0F, value) : 0.0F;
     };
     compensation = SanitizePointCloudDensityCompensation(compensation);
-    // Size additions are intentionally signed. Preserve their composed value
-    // through density scaling and leave the geometry-specific lower bound to
-    // the caller, matching the unified GPU paths' final clamp.
-    return (finiteOrZero(authoredFootprint) +
-            finiteNonNegative(antialiasFootprint)) *
-               compensation.footprintScale +
+    // Size additions are intentionally signed. Only the authored kernel is
+    // density-scaled; the antialias support is a fixed screen-space margin
+    // shared by every display density, so the live coarse bundle and the
+    // fine-bundle export pad sprites identically at every camera distance.
+    // The geometry-specific lower bound stays with the caller, matching the
+    // unified GPU paths' final clamp.
+    return finiteOrZero(authoredFootprint) * compensation.footprintScale +
+           finiteNonNegative(antialiasFootprint) +
            finiteNonNegative(postDensityExpansion);
 }
 

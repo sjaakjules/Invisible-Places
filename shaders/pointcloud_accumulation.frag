@@ -11,6 +11,7 @@ layout(location = 5) in float inDepthFade;
 layout(location = 6) in float inViewDepth;
 layout(location = 7) flat in uint inPointIndex;
 layout(location = 8) in float inSurfaceAngleMask;
+layout(location = 10) in float inKernelSpriteRatio;
 layout(location = 11) in vec4 inWaterColourTransform;
 layout(location = 12) flat in vec4 inTimingColouriseTransform;
 layout(location = 13) flat in float inTimingColouriseEmissionAdd;
@@ -230,7 +231,12 @@ void main() {
         discard;
     }
 
-    float radiusSquared = dot(centered, centered);
+    // The falloff kernel occupies only the authored (plus depth-of-field)
+    // part of the sprite; the remaining antialias margin renders the kernel
+    // tail instead of stretching the kernel, so world-sized points read the
+    // same at every camera distance and display density.
+    const vec2 kernelCentered = centered / max(1.0e-3, inKernelSpriteRatio);
+    float radiusSquared = dot(kernelCentered, kernelCentered);
     const float radius = sqrt(radiusSquared);
     const float falloff = ResolveFalloff(radius, radiusSquared);
     const float opacity = clamp(inOpacity, 0.0, 1.0);

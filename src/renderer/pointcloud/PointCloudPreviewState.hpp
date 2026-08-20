@@ -431,10 +431,11 @@ void ApplyPointCloudShorelineWaveSettings(
     std::uint64_t referencePointCount);
 [[nodiscard]] PointCloudDensityCompensation SanitizePointCloudDensityCompensation(
     PointCloudDensityCompensation compensation);
-// Density scaling applies to the complete raster footprint: the signed,
-// composed authored geometry plus its antialias support. Camera depth-of-field
-// is a post-density image effect and is deliberately added after that scale.
-// The caller applies its geometry-specific final clamp.
+// Density scaling applies to the signed, composed authored geometry only.
+// The antialias support is a fixed screen-space margin added after the scale
+// (identical across display densities), and camera depth-of-field is a
+// post-density image effect added after that. The caller applies its
+// geometry-specific final clamp.
 [[nodiscard]] float ResolvePointCloudDensityAdjustedFootprint(
     float authoredFootprint,
     float antialiasFootprint,

@@ -6,6 +6,8 @@ layout(location = 1) in vec4 inColor;
 layout(location = 0) out vec4 outSourceColor;
 layout(location = 1) out float outViewDepth;
 layout(location = 2) out vec3 outAovNormal;
+layout(location = 3) out float outKernelEnergy;
+layout(location = 4) out float outKernelSpriteRatio;
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 viewProjection;
@@ -97,15 +99,31 @@ void main() {
             : max(0.0, styleData.pointSizeBinding.constantValue.x);
     const float minPointSize = max(1.0, styleData.renderParams3.y);
     const float maxPointSize = max(minPointSize, styleData.renderParams3.z);
-    // The antialias support is part of the point kernel represented by this
-    // sparse sample, so it scales with density. Camera blur remains a
-    // post-density image effect.
+    // The antialias support is a fixed screen-space margin (see
+    // pointcloud_preview.vert): only the authored kernel scales with the
+    // density footprint. Camera blur remains a post-density image effect.
     const float densityAdjustedPointSize =
-        (basePointSize + max(0.0, styleData.renderParams2.x)) * footprintScale;
+        basePointSize * footprintScale + max(0.0, styleData.renderParams2.x);
     gl_PointSize = clamp(
         densityAdjustedPointSize + ResolveDepthOfFieldBlurPixels(viewDepth),
         minPointSize,
         maxPointSize);
+    // Floor-only energy conservation and kernel-true falloff normalisation;
+    // see pointcloud_preview.vert for the rules.
+    const float floorEnergyRatio =
+        clamp(densityAdjustedPointSize / minPointSize, 0.0, 1.0);
+    outKernelEnergy = floorEnergyRatio * floorEnergyRatio;
+    const float dofKernelSize = basePointSize * footprintScale +
+                                ResolveDepthOfFieldBlurPixels(viewDepth);
+    const float spriteSize = clamp(
+        densityAdjustedPointSize + ResolveDepthOfFieldBlurPixels(viewDepth),
+        minPointSize,
+        maxPointSize);
+    outKernelSpriteRatio =
+        densityAdjustedPointSize + ResolveDepthOfFieldBlurPixels(viewDepth) <=
+                minPointSize
+            ? 1.0
+            : clamp(dofKernelSize / spriteSize, 1.0e-3, 1.0);
 
     outSourceColor = inColor;
     outViewDepth = viewDepth;

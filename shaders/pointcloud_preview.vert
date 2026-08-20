@@ -18,6 +18,7 @@ layout(location = 7) flat out uint outPointIndex;
 #ifndef DEPTH_PREPASS
 layout(location = 8) out float outSurfaceAngleMask;
 layout(location = 9) out vec3 outAovNormal;
+layout(location = 10) out float outKernelSpriteRatio;
 layout(location = 11) out vec4 outWaterColourTransform;
 layout(location = 12) flat out vec4 outTimingColouriseTransform;
 layout(location = 13) flat out float outTimingColouriseEmissionAdd;
@@ -1035,6 +1036,9 @@ void main() {
         gl_Position.z < -0.05 * gl_Position.w ||
         gl_Position.z > effectCullLimit) {
         gl_PointSize = max(1.0, styleData.renderParams3.y);
+#ifndef DEPTH_PREPASS
+        outKernelSpriteRatio = 1.0;
+#endif
         outOpacity = 0.0;
         outDepthFade = 0.0;
         outViewDepth = viewDepth;
@@ -1092,15 +1096,50 @@ void main() {
                   footprintScale);
     const float minPointSize = max(1.0, styleData.renderParams3.y);
     const float maxPointSize = max(minPointSize, styleData.renderParams3.z);
-    // Scale the authored kernel and its antialias support together. Depth of
-    // field belongs to the camera and remains outside density compensation.
+    // The antialias support is a fixed screen-space margin, identical for
+    // every display density. Scaling it with the density footprint padded a
+    // constant extra pixel band onto every sprite of a coarse bundle; the
+    // falloff kernel normalises to the whole sprite, so distant points
+    // rendered visibly fatter than their authored world size while close-up
+    // points were barely affected, and the live coarse view disagreed with
+    // the fine-bundle export. Depth of field stays a camera-space effect.
     const float resolvedPointSize =
         pointSizeBeforeDepthOfField +
-        max(0.0, styleData.renderParams2.x) * footprintScale +
+        max(0.0, styleData.renderParams2.x) +
         ResolveDepthOfFieldBlurPixels(viewDepth);
     gl_PointSize = RippleFiniteFloat(resolvedPointSize)
         ? clamp(resolvedPointSize, minPointSize, maxPointSize)
         : minPointSize;
+    // Two consistency rules for screen-space growth that is not authored
+    // world footprint:
+    // 1. The minimum-size clamp must not add energy. A sub-pixel point
+    //    clamped up to the floor previously rendered its full kernel alpha,
+    //    so distant fine-bundle points read brighter than the same cloud
+    //    nearby and brighter than a coarse display bundle whose larger
+    //    footprints never hit the floor. Scale alpha by the squared ratio of
+    //    the un-clamped padded size to the floor; above the floor this is
+    //    exactly 1 so authored opacity (including opaque solid centres) is
+    //    untouched.
+    // 2. The fixed antialias margin must not inflate the visible kernel.
+    //    The falloff kernel normalises to the whole sprite, so the fragment
+    //    stage receives kernel/sprite and evaluates falloff on the authored
+    //    kernel only; the margin remains as antialias support. Depth of
+    //    field deliberately stays part of the visible kernel.
+    const float paddedKernelSize =
+        pointSizeBeforeDepthOfField + max(0.0, styleData.renderParams2.x);
+    const float floorEnergyRatio =
+        RippleFiniteFloat(paddedKernelSize)
+            ? clamp(paddedKernelSize / minPointSize, 0.0, 1.0)
+            : 1.0;
+    const float kernelEnergyScale = floorEnergyRatio * floorEnergyRatio;
+    const float dofKernelSize =
+        pointSizeBeforeDepthOfField + ResolveDepthOfFieldBlurPixels(viewDepth);
+#ifndef DEPTH_PREPASS
+    outKernelSpriteRatio =
+        !RippleFiniteFloat(resolvedPointSize) || resolvedPointSize <= minPointSize
+            ? 1.0
+            : clamp(dofKernelSize / gl_PointSize, 1.0e-3, 1.0);
+#endif
 
 #ifndef DEPTH_PREPASS
     ResolveTimingColouriseTransform(
@@ -1160,9 +1199,9 @@ void main() {
             (sparseRippleOpacityAdd +
              rainImpact.opacityAdd +
              meshFlowContact.opacityAdd) * flowEffectVisibility;
-    outOpacity = RippleFiniteFloat(resolvedOpacity)
+    outOpacity = (RippleFiniteFloat(resolvedOpacity)
         ? clamp(resolvedOpacity, 0.0, 4.0)
-        : safeBaseOpacity;
+        : safeBaseOpacity) * kernelEnergyScale;
 #ifndef DEPTH_PREPASS
     const float resolvedEmissive =
         animatedFlow.y +

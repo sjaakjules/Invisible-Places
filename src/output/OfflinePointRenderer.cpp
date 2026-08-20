@@ -1881,29 +1881,45 @@ bool BuildOfflinePointSample(
     const float depthOfFieldBlurPixels = ResolveDepthOfFieldBlurPixels(cameraState, viewDepth);
     const bool worldSizedScreenSprites =
         invisible_places::renderer::pointcloud::PointCloudStyleUsesWorldSizedScreenSprites(layer.style);
-    if (worldSizedScreenSprites) {
-        sample->pointSize = std::clamp(
-            invisible_places::renderer::pointcloud::ResolvePointCloudDensityAdjustedFootprint(
-                invisible_places::renderer::pointcloud::WorldDiameterToScreenPointSizePixels(
-                    authoredSurfelDiameter,
-                    viewDepth,
-                    matrices.projection[1][1],
-                    static_cast<float>(image.height)),
-                kPointCloudAntialiasFeatherPixels,
-                depthOfFieldBlurPixels,
-                densityCompensation),
-            1.0F,
-            64.0F);
-    } else {
-        sample->pointSize = std::clamp(
-            invisible_places::renderer::pointcloud::ResolvePointCloudDensityAdjustedFootprint(
-                authoredPointSize,
-                kPointCloudAntialiasFeatherPixels,
-                depthOfFieldBlurPixels,
-                densityCompensation),
-            1.0F,
-            64.0F);
-    }
+    const float kernelPixels =
+        invisible_places::renderer::pointcloud::ResolvePointCloudDensityAdjustedFootprint(
+            worldSizedScreenSprites
+                ? invisible_places::renderer::pointcloud::WorldDiameterToScreenPointSizePixels(
+                      authoredSurfelDiameter,
+                      viewDepth,
+                      matrices.projection[1][1],
+                      static_cast<float>(image.height))
+                : authoredPointSize,
+            0.0F,
+            0.0F,
+            densityCompensation);
+    sample->pointSize = std::clamp(
+        invisible_places::renderer::pointcloud::ResolvePointCloudDensityAdjustedFootprint(
+            worldSizedScreenSprites
+                ? invisible_places::renderer::pointcloud::WorldDiameterToScreenPointSizePixels(
+                      authoredSurfelDiameter,
+                      viewDepth,
+                      matrices.projection[1][1],
+                      static_cast<float>(image.height))
+                : authoredPointSize,
+            kPointCloudAntialiasFeatherPixels,
+            depthOfFieldBlurPixels,
+            densityCompensation),
+        1.0F,
+        64.0F);
+    // Floor-only energy conservation, mirroring the GPU vertex shaders: a
+    // point clamped up to the 1 px minimum must not gain integrated
+    // brightness, while everything above the floor keeps its authored
+    // opacity. (The GPU additionally normalises the falloff kernel to the
+    // authored footprint inside the padded sprite; the CPU rasteriser is
+    // analytic, so its padded disc introduces no sampling inflation.)
+    const float paddedKernelPixels =
+        kernelPixels + kPointCloudAntialiasFeatherPixels;
+    const float kernelEnergyRatio =
+        !worldSurfels
+            ? std::clamp(paddedKernelPixels / 1.0F, 0.0F, 1.0F)
+            : 1.0F;
+    const float kernelEnergyScale = kernelEnergyRatio * kernelEnergyRatio;
     sample->worldSurfels = worldSurfels;
     sample->surfelDiameter =
         invisible_places::renderer::pointcloud::ClampPointCloudResolvedSurfelDiameter(
@@ -1946,6 +1962,7 @@ bool BuildOfflinePointSample(
              seepage.opacityMultiply) +
         seepage.opacityAdd +
         rainImpact.opacity);
+    sample->opacity *= kernelEnergyScale;
     if (waterTrails) {
         sample->opacity *= waterTrailVisibility * waterFlowActivity.appearance;
     }

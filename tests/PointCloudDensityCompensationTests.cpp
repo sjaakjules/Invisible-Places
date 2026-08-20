@@ -316,7 +316,7 @@ TEST_CASE("Density compensation preserves reference coverage without shrinking t
 }
 
 TEST_CASE(
-    "Density compensation scales antialias support before depth of field",
+    "Density compensation keeps antialias support unscaled before depth of field",
     "[pointcloud][density][footprint]") {
     using invisible_places::renderer::pointcloud::PointCloudDensityCompensation;
     using invisible_places::renderer::pointcloud::ClampPointCloudResolvedSurfelDiameter;
@@ -329,13 +329,17 @@ TEST_CASE(
             2.0F,
             PointCloudDensityCompensation{1.0F, 1.0F}) ==
         Catch::Approx(6.0F));
+    // Only the authored kernel scales with density; the antialias margin is
+    // the same fixed screen-space pad for every display bundle so the live
+    // coarse view and the fine-bundle export stay size-consistent at every
+    // camera distance.
     CHECK(
         ResolvePointCloudDensityAdjustedFootprint(
             3.0F,
             1.0F,
             2.0F,
             PointCloudDensityCompensation{4.0F, 1.0F}) ==
-        Catch::Approx(18.0F));
+        Catch::Approx(15.0F));
     // Coverage correction changes fragment opacity, not geometry.
     CHECK(
         ResolvePointCloudDensityAdjustedFootprint(
@@ -343,17 +347,16 @@ TEST_CASE(
             1.0F,
             2.0F,
             PointCloudDensityCompensation{4.0F, 8.0F}) ==
-        Catch::Approx(18.0F));
+        Catch::Approx(15.0F));
     // Signed water size additions stay composed until the same final
-    // geometry clamp used by the GPU. Clamping the authored term first would
-    // incorrectly leave a five-pixel AA footprint here.
+    // geometry clamp used by the GPU.
     CHECK(
         ResolvePointCloudDensityAdjustedFootprint(
             -1.0F,
             1.0F,
             0.0F,
             PointCloudDensityCompensation{5.0F, 1.0F}) ==
-        Catch::Approx(0.0F));
+        Catch::Approx(-4.0F));
     CHECK(
         ClampPointCloudResolvedSurfelDiameter(
             ResolvePointCloudDensityAdjustedFootprint(

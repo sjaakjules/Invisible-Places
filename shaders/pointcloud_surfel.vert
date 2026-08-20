@@ -1156,12 +1156,9 @@ void main() {
     const float unboundedDiameter =
         authoredDiameter * max(1.0e-6, styleData.renderParams1.y) +
         (ResolveDepthOfFieldWorldRadius(centerDepth) * 2.0) +
-        // Match screen sprites by scaling antialias support with the sparse
-        // point kernel while leaving depth-of-field above unscaled.
-        ScreenPixelWorldSpan(
-            centerDepth,
-            styleData.renderParams2.x *
-                max(1.0e-6, styleData.renderParams1.y));
+        // Match screen sprites: the antialias support is a fixed
+        // screen-space margin, independent of the density footprint.
+        ScreenPixelWorldSpan(centerDepth, styleData.renderParams2.x);
     const float maximumDiameter = max(
         1.0e-6,
         ScreenPixelWorldSpan(
