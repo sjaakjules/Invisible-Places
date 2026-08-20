@@ -405,26 +405,60 @@ triangle fit, and a rejected pass does not replace the current working edit.
 Back, Cancel, and Escape discard all private candidates and restore the launch
 camera, playhead, pivot, and matching ghost.
 
-Once the reciprocal metadata is applied, **Seamed View** keeps the same
+Once the reciprocal metadata is applied, **Seam** keeps the same
 two-camera hard-split compositor available during ordinary linked-animation
 scrubbing and playback. It resolves the partner from the link rather than the
 current Blend Partner menu, maps both saved overlap bands at exact elapsed
 seconds, and follows captured feature anchors when the pair has just been
 applied in this session; reloaded links fall back to a deterministic sweep
-from saved overlap progress. The
-ending path is always left and the starting path right; switching which file
-is loaded preserves the physical seam and its artistic pixel offset. Outside
-an overlap, live view returns to the ordinary current animation.
+from saved overlap progress. The ending path is always left and the starting
+path right; switching which file is loaded preserves the physical seam and its
+artistic pixel offset. Outside an overlap, live view returns to the available
+ordinary member.
 
-The linked-view controls live above Global Animation Position. Both reciprocal
-members can share one Timing Take over the complete unique loop while retaining
-their own local camera timelines. Each animation stores a signed window into
-that loop; ordinary A-only or B-only rendering maps its local frame into the
-shared cycle. Evaluators expose virtual previous/next-cycle neighbours, rather
-than adding artificial endpoint keys, so Smooth Step and manual spline motion
-do not decelerate at a path boundary and Rain can be authored continuously over
-the whole loop. Global Animation Position remains a camera control only;
-procedural waves, Rain, and trails keep advancing independently.
+The linked-view header above Global Animation Position has session-only
+**Seam / A / B** modes. A and B are canonical pair slots established by lexical
+order of the normalized full animation file paths, so loading the other member
+does not reverse their identity; the member that happens to own shared frame
+zero is tracked separately. Switching modes preserves the canonical cycle
+frame and matched camera pose. Seam shows the hard split where exact A and B
+occurrences overlap and one available member elsewhere, whereas A or B isolates
+that finite member. The signed number shown in Seam can therefore become a
+different local number in A or B without a visual jump. The UI never clamps an
+unavailable member to an unrelated endpoint. These modes do not replace the
+separate compiled-linked-animation **Live Camera** Overlay/A/B control described
+above, and none of this header state is serialized.
+
+Seam uses the same signed `-1..1` transport as the wizard's final preview, but
+without invoking the wizard or retiming either path. Zero is the midpoint of
+lexical A-start / B-end; `-1` and `+1` are the two displayed copies of the same
+A-end / B-start midpoint. A narrow Feature Run View beneath Global Animation
+Position is a cyclic focus lens on that canonical domain. It may cross zero or
+wrap through `-1` / `+1`, and the Water, Timing, and visual-setting key
+timelines all follow it. The lens is keyed to the canonical pair for the active
+session, initializes to the full range when the pair changes, is never rebased
+to a member's local duration, and is not written to either document.
+
+Both reciprocal members share one Timing Take over the complete unique loop
+while retaining their own finite camera timelines and export bounds. Each local
+frame maps into the same canonical cycle phase for live preview and frozen
+export. Evaluators expose virtual previous/next-cycle neighbours, rather than
+adding artificial endpoint keys, so values and derivatives remain continuous
+through phase zero and both path boundaries under the authored interpolation.
+An ordinary normalized Timing Take stretches or shrinks over the pair's unique
+cycle without rewriting its keys, handles, clips, scene states, or Rain profile.
+Seam playback wraps the complete cycle; A-only and B-only playback stop at the
+selected member's local end. Global Animation Position remains a camera control
+and selects keyed state, while procedural waves, Rain, and trails keep advancing
+on their independent live or deterministic export clocks.
+
+The production `Proj_A_09S01` / `Proj_B_09S01` timing already satisfies the
+four-minute target: its 6,868- and 6,230-frame local windows overlap by 3,080 and
+2,818 frames, so `6,868 + 6,230 - 3,080 - 2,818 = 7,200` unique frames, exactly
+240 seconds at 30 fps. Those shorter member-local windows are intentional and
+remain the export bounds used for After Effects placement and wrap. No
+`Proj_A_09S02` / `Proj_B_09S02` retime is needed; the optional wizard fit remains
+available for a future pair whose unique cycle is not already 7,200 frames.
 
 Camera duration grows on the same 30 fps timebase. Every normalized timing,
 water, and visual-effect key or finite activation boundary is shifted by the

@@ -4034,6 +4034,177 @@ TEST_CASE("Reciprocal loop transport preserves asymmetric S01 seam timing",
     }
 }
 
+TEST_CASE(
+    "Asymmetric reciprocal boundaries drive identical cyclic Timing Take samples",
+    "[camera][animation][linked-seam][timing-loop][phase-integration]") {
+    const auto makePath = [](std::string name,
+                             std::uint32_t durationFrames,
+                             std::uint32_t startOverlapFrames,
+                             std::uint32_t endOverlapFrames) {
+        invisible_places::camera::AnimationPath path;
+        path.name = std::move(name);
+        path.durationFrames = durationFrames;
+        path.keys = {
+            {.id = path.name + "-start"},
+            {.id = path.name + "-end",
+             .durationFrames = durationFrames},
+        };
+        path.velocityBlendLink = invisible_places::camera::
+            AnimationVelocityBlendLinkMetadata{
+                .pairId = "Proj_09S01_phase_integration",
+                .partnerFileName = "partner.ipanim.json",
+                .startOverlapSeconds =
+                    static_cast<float>(startOverlapFrames) / 30.0F,
+                .endOverlapSeconds =
+                    static_cast<float>(endOverlapFrames) / 30.0F,
+            };
+        return path;
+    };
+
+    auto animationA = makePath("Proj_A_09S01", 6868U, 3080U, 2818U);
+    auto animationB = makePath("Proj_B_09S01", 6230U, 2818U, 3080U);
+    REQUIRE(invisible_places::camera::
+                ConfigureAnimationReciprocalTimingLoopWindows(
+                    &animationA,
+                    &animationB));
+    const auto resolved = invisible_places::camera::
+        ResolveAnimationReciprocalLoopTransport(animationA, animationB);
+    REQUIRE(resolved.has_value());
+    const auto& transport = resolved.value();
+    REQUIRE(transport.cycleFrames == 7200U);
+
+    invisible_places::water::WaterKeyedSettingTrack waterTrack;
+    waterTrack.settingId = "rain.level";
+    waterTrack.keys = {
+        {.position = 0.25F,
+         .value = 0.0F,
+         .interpolation =
+             invisible_places::water::WaterScenarioInterpolation::Smooth},
+        {.position = 0.75F,
+         .value = 1.0F,
+         .interpolation =
+             invisible_places::water::WaterScenarioInterpolation::Smooth},
+    };
+    invisible_places::timing::TimingColouriseEffect colouriseEffect;
+    colouriseEffect.emissiveEnabled = true;
+    colouriseEffect.effectParameterKeys = {
+        {.parameter = invisible_places::timing::
+             TimingColouriseEffectParameter::EmissiveLevel,
+         .position = 0.25F,
+         .value = 0.0F,
+         .interpolation =
+             invisible_places::water::WaterScenarioInterpolation::Smooth},
+        {.parameter = invisible_places::timing::
+             TimingColouriseEffectParameter::EmissiveLevel,
+         .position = 0.75F,
+         .value = 1.0F,
+         .interpolation =
+             invisible_places::water::WaterScenarioInterpolation::Smooth},
+    };
+
+    struct TimingSample {
+        float phase = 0.0F;
+        float water = 0.0F;
+        float emissive = 0.0F;
+    };
+    const auto sampleAtPhase = [&](float phase) {
+        return TimingSample{
+            .phase = phase,
+            .water = invisible_places::water::
+                         EvaluateWaterKeyedSettingTrackCyclic(
+                             waterTrack,
+                             phase)
+                         .value(),
+            .emissive = invisible_places::timing::
+                EvaluateTimingEmissiveLevel(
+                    colouriseEffect,
+                    phase,
+                    true),
+        };
+    };
+    const auto sampleAtLocal = [&](const auto& path, float local) {
+        return sampleAtPhase(invisible_places::camera::
+                                 AnimationLocalToTimingLoopPosition(
+                                     path,
+                                     local));
+    };
+    const auto checkSameSample = [](const TimingSample& left,
+                                    const TimingSample& right) {
+        CHECK(std::abs(std::remainder(
+                  left.phase - right.phase,
+                  1.0F)) <= 2.0e-6F);
+        CHECK(left.water == Approx(right.water).margin(2.0e-5F));
+        CHECK(left.emissive ==
+              Approx(right.emissive).margin(2.0e-5F));
+    };
+
+    // These are the four exact boundaries of the two reciprocal overlap
+    // bands. Each shared frame must resolve to one local occurrence on both
+    // members and therefore to one identical cyclic Timing Take sample.
+    for (const double boundaryFrame :
+         std::array{0.0, 3080.0, 4050.0, 6868.0}) {
+        INFO("Shared boundary frame " << boundaryFrame);
+        const auto aLocals = invisible_places::camera::
+            AnimationReciprocalLoopCycleFrameToLocalPositions(
+                transport,
+                0U,
+                boundaryFrame);
+        const auto bLocals = invisible_places::camera::
+            AnimationReciprocalLoopCycleFrameToLocalPositions(
+                transport,
+                1U,
+                boundaryFrame);
+        REQUIRE(aLocals.size() == 1U);
+        REQUIRE(bLocals.size() == 1U);
+        const auto direct = sampleAtPhase(static_cast<float>(
+            invisible_places::camera::
+                WrapAnimationReciprocalLoopCycleFrame(
+                    transport,
+                    boundaryFrame) /
+            static_cast<double>(transport.cycleFrames)));
+        const auto fromA = sampleAtLocal(animationA, aLocals.front());
+        const auto fromB = sampleAtLocal(animationB, bLocals.front());
+        checkSameSample(fromA, direct);
+        checkSameSample(fromB, direct);
+        checkSameSample(fromA, fromB);
+    }
+
+    // Immediately before zero only B has a local occurrence; at zero and
+    // immediately after it both members do. All available local samples must
+    // reproduce the canonical cyclic value without an endpoint hold.
+    std::array<TimingSample, 3U> aroundZero{};
+    const std::array<double, 3U> aroundZeroFrames{7199.0, 0.0, 1.0};
+    for (std::size_t index = 0U; index < aroundZeroFrames.size(); ++index) {
+        const double frame = aroundZeroFrames[index];
+        INFO("Shared loop-zero frame " << frame);
+        const float phase = static_cast<float>(
+            invisible_places::camera::
+                WrapAnimationReciprocalLoopCycleFrame(transport, frame) /
+            static_cast<double>(transport.cycleFrames));
+        aroundZero[index] = sampleAtPhase(phase);
+        for (std::size_t member = 0U; member < 2U; ++member) {
+            const auto locals = invisible_places::camera::
+                AnimationReciprocalLoopCycleFrameToLocalPositions(
+                    transport,
+                    member,
+                    frame);
+            if (member == 0U && frame == 7199.0) {
+                CHECK(locals.empty());
+                continue;
+            }
+            REQUIRE(locals.size() == 1U);
+            const auto& path = member == 0U ? animationA : animationB;
+            checkSameSample(
+                sampleAtLocal(path, locals.front()),
+                aroundZero[index]);
+        }
+    }
+    CHECK(aroundZero[0U].water > aroundZero[1U].water);
+    CHECK(aroundZero[1U].water > aroundZero[2U].water);
+    CHECK(aroundZero[0U].emissive > aroundZero[1U].emissive);
+    CHECK(aroundZero[1U].emissive > aroundZero[2U].emissive);
+}
+
 TEST_CASE("Reciprocal linked animations accept any existing Timing Take atomically",
           "[camera][animation][linked-seam][timing-loop][timing-take]") {
     const auto makePath = [](std::string name,

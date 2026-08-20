@@ -221,6 +221,30 @@ TEST_CASE("Timing Colourise cyclic evaluation interpolates through loop zero",
               effect,
               0.9F,
               true)));
+
+    // Loop zero is an interior point of the virtual 0.75 -> 1.25 segment,
+    // so cyclic evaluation carries the same non-zero derivative through both
+    // normalized endpoints instead of easing to rest at either one.
+    constexpr float epsilon = 1.0e-3F;
+    const auto cyclicLevel = [&](float position) {
+        return invisible_places::timing::EvaluateTimingEmissiveLevel(
+            effect,
+            position,
+            true);
+    };
+    const float incomingAtZero =
+        (cyclicLevel(0.0F) - cyclicLevel(-epsilon)) / epsilon;
+    const float outgoingAtZero =
+        (cyclicLevel(epsilon) - cyclicLevel(0.0F)) / epsilon;
+    CHECK(incomingAtZero == Approx(outgoingAtZero).margin(0.02F));
+    CHECK(std::abs(incomingAtZero) > 1.0F);
+
+    const float incomingAtOne =
+        (cyclicLevel(1.0F) - cyclicLevel(1.0F - epsilon)) / epsilon;
+    const float outgoingAtOne =
+        (cyclicLevel(1.0F + epsilon) - cyclicLevel(1.0F)) / epsilon;
+    CHECK(incomingAtOne == Approx(outgoingAtOne).margin(0.02F));
+    CHECK(incomingAtOne == Approx(incomingAtZero).margin(0.02F));
 }
 
 TEST_CASE(

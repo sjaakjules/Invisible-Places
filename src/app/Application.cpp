@@ -388,6 +388,15 @@ struct PreservedAnimationEdit {
     std::string loopPairId;
 };
 
+// Session-only presentation of one validated reciprocal animation pair.
+// A/B identity follows full-path lexical order and never depends on which
+// member happens to be the loaded authoring document.
+enum class AnimationLinkedViewMode : std::uint8_t {
+    Seam = 0,
+    A,
+    B,
+};
+
 struct PreservedAnimationRuntimeState {
     std::optional<AnimationPath> path;
     std::string filePath;
@@ -400,6 +409,14 @@ struct PreservedAnimationRuntimeState {
     invisible_places::timing::CyclicTimelineViewRange
         linkedTimelineViewRange{};
     std::string linkedTimelineViewPairId;
+    AnimationLinkedViewMode linkedViewMode =
+        AnimationLinkedViewMode::Seam;
+    double linkedCanonicalCycleFrame = 0.0;
+    bool linkedCanonicalCycleFrameValid = false;
+    std::string linkedCanonicalPairId;
+    bool linkedViewCameraAttached = true;
+    std::array<float, 2U> linkedMemberLocalPlayheads{};
+    std::array<bool, 2U> linkedMemberLocalPlayheadsValid{};
     bool dirty = false;
 };
 
@@ -1230,8 +1247,8 @@ struct AnimationMatchingFrameGhostState {
 
 struct AnimationLinkedSeamedViewState {
     // Linked pairs default to their authored hard-split view. The compositor
-    // is active only inside either saved reciprocal overlap, so ordinary
-    // single-animation inspection remains unchanged through the bulk.
+    // is active only inside either saved reciprocal overlap; the sole exact
+    // owner fills the viewport through each unique bulk span.
     bool enabled = true;
     std::string pairId;
     // Stable lexical file order gives both loaded members the same two seam
@@ -1245,6 +1262,10 @@ struct AnimationLinkedSeamedViewState {
     std::array<std::array<glm::vec3, 2U>, 2U> trackedAnchors{};
     std::array<bool, 2U> trackedAnchorsValid{};
     std::uint32_t renderedSourceIndex = 0U;
+    // A canonical-time jump invalidates both cached compositor sources. The
+    // next split frame clears renderer history before rebuilding the matched
+    // A/B pair, so an in-place scrub cannot combine two different phases.
+    bool temporalHistoryResetRequested = false;
 };
 
 enum class AnimationReciprocalPanWizardStage : std::uint8_t {
@@ -1594,6 +1615,20 @@ struct AnimationPanelState {
     std::string linkedTimelineViewPairId;
     std::optional<AnimationCyclicTimelineViewDragState>
         linkedTimelineViewDrag;
+    AnimationLinkedViewMode linkedViewMode =
+        AnimationLinkedViewMode::Seam;
+    // Fractional cycle frames are retained between scrubs and view changes;
+    // linked playback samples integral frames without throwing away a
+    // sub-frame authoring position while stopped.
+    double linkedCanonicalCycleFrame = 0.0;
+    bool linkedCanonicalCycleFrameValid = false;
+    std::string linkedCanonicalPairId;
+    // Manual viewport navigation detaches the presentation camera while the
+    // canonical effects/playback clock keeps advancing. A linked view choice
+    // or scrub reattaches it; playback preserves the inspection choice.
+    bool linkedViewCameraAttached = true;
+    std::array<float, 2U> linkedMemberLocalPlayheads{};
+    std::array<bool, 2U> linkedMemberLocalPlayheadsValid{};
     // Session-only override shared by the Water and Timings feature
     // timelines. Ordinarily those timelines follow the animation camera only
     // while the live view still matches the current animation frame, allowing
@@ -1625,6 +1660,12 @@ struct AnimationPanelState {
     AnimationFramePreviewState framePreview{};
 };
 
+enum class AnimationPlaybackDomain : std::uint8_t {
+    LoadedLocal = 0,
+    LinkedSeam,
+    LinkedMember,
+};
+
 struct AnimationPlaybackState {
     bool active = false;
     // Camera following is acquired only when playback starts from an
@@ -1637,6 +1678,13 @@ struct AnimationPlaybackState {
     AnimationPath path{};
     float durationSeconds = 3.0F;
     float startPosition = 0.0F;
+    AnimationPlaybackDomain domain =
+        AnimationPlaybackDomain::LoadedLocal;
+    std::string linkedPairId;
+    invisible_places::camera::AnimationReciprocalLoopTransport
+        linkedTransport{};
+    std::size_t linkedMemberIndex = 0U;
+    double linkedStartCycleFrame = 0.0;
     std::chrono::steady_clock::time_point startedAt{};
 };
 
@@ -3491,6 +3539,45 @@ struct PreviewRuntimeState {
     std::string errorMessage;
 };
 
+struct ResolvedAnimationLinkedPair {
+    std::string pairId;
+    // Pair id plus normalized lexical full paths. This prevents an old
+    // session clock/focus from leaking into a different pair that happens to
+    // reuse a persisted id.
+    std::string sessionPairId;
+    invisible_places::camera::AnimationReciprocalLoopTransport transport{};
+    std::array<const AnimationPath*, 2U> members{};
+    std::array<std::filesystem::path, 2U> memberFilePaths{};
+    std::array<std::size_t, 2U> memberRegistryIndices{};
+    std::size_t currentMemberIndex = 0U;
+};
+
+std::optional<ResolvedAnimationLinkedPair>
+ResolveActiveAnimationLinkedPair(
+    const PreviewRuntimeState& runtimeState);
+
+std::optional<ResolvedAnimationLinkedPair>
+EnsureAnimationLinkedCanonicalClock(
+    PreviewRuntimeState* runtimeState);
+
+bool SyncLoadedAnimationPositionToLinkedCanonical(
+    PreviewRuntimeState* runtimeState,
+    const ResolvedAnimationLinkedPair& pair);
+
+void SetAnimationLinkedCanonicalCycleFrame(
+    PreviewRuntimeState* runtimeState,
+    const ResolvedAnimationLinkedPair& pair,
+    double cycleFrame,
+    bool requestTemporalHistoryReset = true);
+
+bool ApplyAnimationLinkedCanonicalCamera(
+    PreviewRuntimeState* runtimeState,
+    const ResolvedAnimationLinkedPair& pair,
+    bool allowDepthOfField);
+
+void SynchronizeAnimationLinkedCanonicalFromLoadedLocal(
+    PreviewRuntimeState* runtimeState);
+
 invisible_places::platform::WindowSize SanitizeLiveViewWindowSize(
     invisible_places::platform::WindowSize size) {
     return {
@@ -4427,6 +4514,21 @@ float AuthoredTrackNormalizedToCameraNormalized(
 
 float CurrentAuthoredTrackPosition(
     const PreviewRuntimeState& runtimeState) {
+    if (const auto pair =
+            ResolveActiveAnimationLinkedPair(runtimeState);
+        pair.has_value() &&
+        runtimeState.animationPanel.linkedCanonicalCycleFrameValid &&
+        runtimeState.animationPanel.linkedCanonicalPairId ==
+            pair->sessionPairId &&
+        pair->transport.cycleFrames > 0U) {
+        return static_cast<float>(
+            invisible_places::camera::
+                WrapAnimationReciprocalLoopCycleFrame(
+                    pair->transport,
+                    runtimeState.animationPanel
+                        .linkedCanonicalCycleFrame) /
+            static_cast<double>(pair->transport.cycleFrames));
+    }
     const float cameraPosition = std::clamp(
         runtimeState.animationPanel.scrubAmount,
         0.0F,
@@ -4464,7 +4566,20 @@ void SetCurrentAnimationPositionFromAuthoredTrack(
     if (runtimeState == nullptr) {
         return;
     }
-    float cameraPosition = std::clamp(trackPosition, 0.0F, 1.0F);
+    const float authoredPosition =
+        std::clamp(trackPosition, 0.0F, 1.0F);
+    if (const auto pair =
+            ResolveActiveAnimationLinkedPair(*runtimeState);
+        pair.has_value() && pair->transport.cycleFrames > 0U) {
+        SetAnimationLinkedCanonicalCycleFrame(
+            runtimeState,
+            pair.value(),
+            static_cast<double>(authoredPosition) *
+                static_cast<double>(pair->transport.cycleFrames),
+            true);
+        return;
+    }
+    float cameraPosition = authoredPosition;
     if (runtimeState->animationPanel.currentPath.has_value()) {
         const auto& path = runtimeState->animationPanel.currentPath.value();
         if (invisible_places::camera::ResolveAnimationTimingLoopWindow(path)
@@ -4652,6 +4767,22 @@ WaterFrameState ResolveWaterFrameStateBase(
     const auto& animation = runtimeState->animationPanel.currentPath.value();
     result.timingIsCyclic = invisible_places::camera::
         ResolveAnimationTimingLoopWindow(animation).has_value();
+    if (const auto pair =
+            ResolveActiveAnimationLinkedPair(*runtimeState);
+        pair.has_value() &&
+        runtimeState->animationPanel.linkedCanonicalCycleFrameValid &&
+        runtimeState->animationPanel.linkedCanonicalPairId ==
+            pair->sessionPairId) {
+        result.timingIsCyclic = true;
+        result.sampleTimeSeconds = static_cast<float>(
+            invisible_places::camera::
+                WrapAnimationReciprocalLoopCycleFrame(
+                    pair->transport,
+                    runtimeState->animationPanel
+                        .linkedCanonicalCycleFrame) /
+            30.0);
+        return result;
+    }
     const float durationSeconds = std::max(
         1.0e-6F,
         AuthoredAnimationTrackDurationSeconds(animation));
@@ -14873,6 +15004,14 @@ void UnloadCurrentAnimationForWaterEditing(PreviewRuntimeState* runtimeState) {
     runtimeState->animationPanel.linkedTimelineViewRange = {};
     runtimeState->animationPanel.linkedTimelineViewPairId.clear();
     runtimeState->animationPanel.linkedTimelineViewDrag.reset();
+    runtimeState->animationPanel.linkedViewMode =
+        AnimationLinkedViewMode::Seam;
+    runtimeState->animationPanel.linkedCanonicalCycleFrame = 0.0;
+    runtimeState->animationPanel.linkedCanonicalCycleFrameValid = false;
+    runtimeState->animationPanel.linkedCanonicalPairId.clear();
+    runtimeState->animationPanel.linkedViewCameraAttached = true;
+    runtimeState->animationPanel.linkedMemberLocalPlayheads = {};
+    runtimeState->animationPanel.linkedMemberLocalPlayheadsValid = {};
     runtimeState->animationPanel.dirty = false;
     runtimeState->animationPanel.requestedMatchingFrameGhostCapture.reset();
     runtimeState->animationPanel.requestedMatchingFrameGhostClear =
@@ -24567,6 +24706,14 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->animationPanel.linkedTimelineViewRange = {};
     runtimeState->animationPanel.linkedTimelineViewPairId.clear();
     runtimeState->animationPanel.linkedTimelineViewDrag.reset();
+    runtimeState->animationPanel.linkedViewMode =
+        AnimationLinkedViewMode::Seam;
+    runtimeState->animationPanel.linkedCanonicalCycleFrame = 0.0;
+    runtimeState->animationPanel.linkedCanonicalCycleFrameValid = false;
+    runtimeState->animationPanel.linkedCanonicalPairId.clear();
+    runtimeState->animationPanel.linkedViewCameraAttached = true;
+    runtimeState->animationPanel.linkedMemberLocalPlayheads = {};
+    runtimeState->animationPanel.linkedMemberLocalPlayheadsValid = {};
     runtimeState->animationPanel.dirty = false;
     if (runtimeState->animationMatchingFrameGhostJob.worker.joinable()) {
         runtimeState->animationMatchingFrameGhostJob.worker.request_stop();
@@ -25202,6 +25349,8 @@ bool ApplyProjectDocumentToRuntime(
                     document.activeAnimationPosition,
                     0.0F,
                     1.0F);
+            SynchronizeAnimationLinkedCanonicalFromLoadedLocal(
+                runtimeState);
             ApplyAnimationScrub(runtimeState);
             runtimeState->animationPanel.selectedFileIndex =
                 FindAnimationRegistryIndex(
@@ -25308,6 +25457,22 @@ PreservedAnimationRuntimeState CaptureAnimationRuntimeState(
                 runtimeState.animationPanel.linkedTimelineViewRange),
         .linkedTimelineViewPairId =
             runtimeState.animationPanel.linkedTimelineViewPairId,
+        .linkedViewMode =
+            runtimeState.animationPanel.linkedViewMode,
+        .linkedCanonicalCycleFrame =
+            runtimeState.animationPanel.linkedCanonicalCycleFrame,
+        .linkedCanonicalCycleFrameValid =
+            runtimeState.animationPanel
+                .linkedCanonicalCycleFrameValid,
+        .linkedCanonicalPairId =
+            runtimeState.animationPanel.linkedCanonicalPairId,
+        .linkedViewCameraAttached =
+            runtimeState.animationPanel.linkedViewCameraAttached,
+        .linkedMemberLocalPlayheads =
+            runtimeState.animationPanel.linkedMemberLocalPlayheads,
+        .linkedMemberLocalPlayheadsValid =
+            runtimeState.animationPanel
+                .linkedMemberLocalPlayheadsValid,
         .dirty = runtimeState.animationPanel.dirty,
     };
     const auto& panel = runtimeState.animationPanel;
@@ -25443,13 +25608,40 @@ void RestoreAnimationRuntimeState(
     panel.linkedTimelineViewPairId =
         std::move(state.linkedTimelineViewPairId);
     panel.linkedTimelineViewDrag.reset();
+    panel.linkedViewMode = state.linkedViewMode;
+    panel.linkedCanonicalCycleFrame =
+        state.linkedCanonicalCycleFrame;
+    panel.linkedCanonicalCycleFrameValid =
+        state.linkedCanonicalCycleFrameValid;
+    panel.linkedCanonicalPairId =
+        std::move(state.linkedCanonicalPairId);
+    panel.linkedViewCameraAttached =
+        state.linkedViewCameraAttached;
+    panel.linkedMemberLocalPlayheads =
+        state.linkedMemberLocalPlayheads;
+    panel.linkedMemberLocalPlayheadsValid =
+        state.linkedMemberLocalPlayheadsValid;
     panel.dirty = state.dirty;
     panel.preparedPathCache = {};
     panel.motionStatsCache = {};
     panel.perceivedFlowCache = {};
     runtimeState->animationPlayback.active = false;
     if (panel.currentPath.has_value()) {
-        ApplyAnimationScrub(runtimeState);
+        const auto linkedPair =
+            EnsureAnimationLinkedCanonicalClock(runtimeState);
+        if (linkedPair.has_value()) {
+            (void)SyncLoadedAnimationPositionToLinkedCanonical(
+                runtimeState,
+                linkedPair.value());
+            if (panel.linkedViewCameraAttached) {
+                (void)ApplyAnimationLinkedCanonicalCamera(
+                    runtimeState,
+                    linkedPair.value(),
+                    panel.previewDepthOfField);
+            }
+        } else {
+            ApplyAnimationScrub(runtimeState);
+        }
     }
 }
 
@@ -26497,6 +26689,314 @@ const AnimationPath* RegistryAnimationPath(const PreviewRuntimeState& runtimeSta
         return &panel.currentPath.value();
     }
     return SavedRegistryAnimationPath(runtimeState, fileIndex);
+}
+
+std::optional<ResolvedAnimationLinkedPair>
+ResolveActiveAnimationLinkedPair(
+    const PreviewRuntimeState& runtimeState) {
+    const auto& panel = runtimeState.animationPanel;
+    if (!panel.currentPath.has_value() || panel.currentFilePath.empty() ||
+        panel.currentPath->selectedTimingTakeId.empty() ||
+        !panel.currentPath->velocityBlendLink.has_value()) {
+        return std::nullopt;
+    }
+    const auto currentIndex = FindAnimationRegistryIndex(
+        panel,
+        std::filesystem::path{panel.currentFilePath});
+    const auto partnerIndex = FindAnimationRegistryIndexByFileName(
+        panel,
+        panel.currentPath->velocityBlendLink->partnerFileName);
+    if (!currentIndex.has_value() || !partnerIndex.has_value() ||
+        currentIndex == partnerIndex) {
+        return std::nullopt;
+    }
+    const auto* current = RegistryAnimationPath(
+        runtimeState,
+        currentIndex.value());
+    const auto* partner = RegistryAnimationPath(
+        runtimeState,
+        partnerIndex.value());
+    if (current == nullptr || partner == nullptr ||
+        current->selectedTimingTakeId.empty() ||
+        current->selectedTimingTakeId != partner->selectedTimingTakeId) {
+        return std::nullopt;
+    }
+    const auto transport = invisible_places::camera::
+        ResolveAnimationReciprocalLoopTransport(
+            *current,
+            panel.availableFiles[currentIndex.value()],
+            *partner,
+            panel.availableFiles[partnerIndex.value()]);
+    if (!transport.has_value() || transport->cycleFrames == 0U) {
+        return std::nullopt;
+    }
+
+    ResolvedAnimationLinkedPair result;
+    result.pairId = current->velocityBlendLink->pairId;
+    result.transport = transport.value();
+    for (std::size_t member = 0U;
+         member < result.transport.memberInputIndices.size();
+         ++member) {
+        const bool fromCurrent =
+            result.transport.memberInputIndices[member] == 0U;
+        result.members[member] = fromCurrent ? current : partner;
+        result.memberFilePaths[member] = panel.availableFiles[
+            fromCurrent ? currentIndex.value() : partnerIndex.value()];
+        result.memberRegistryIndices[member] =
+            fromCurrent ? currentIndex.value() : partnerIndex.value();
+        if (fromCurrent) {
+            result.currentMemberIndex = member;
+        }
+    }
+    if (result.members[0U] == nullptr || result.members[1U] == nullptr) {
+        return std::nullopt;
+    }
+    result.sessionPairId = result.pairId + "\n" +
+        NormalizePathKey(result.memberFilePaths[0U]) + "\n" +
+        NormalizePathKey(result.memberFilePaths[1U]) + "\n" +
+        std::to_string(result.transport.cycleFrames);
+    return result;
+}
+
+bool SyncLoadedAnimationPositionToLinkedCanonical(
+    PreviewRuntimeState* runtimeState,
+    const ResolvedAnimationLinkedPair& pair) {
+    if (runtimeState == nullptr ||
+        !runtimeState->animationPanel.linkedCanonicalCycleFrameValid ||
+        runtimeState->animationPanel.linkedCanonicalPairId !=
+            pair.sessionPairId) {
+        return false;
+    }
+    auto& panel = runtimeState->animationPanel;
+    const std::size_t member = pair.currentMemberIndex;
+    const float previous =
+        panel.linkedMemberLocalPlayheadsValid[member]
+            ? panel.linkedMemberLocalPlayheads[member]
+            : panel.scrubAmount;
+    const auto local = invisible_places::camera::
+        ResolveAnimationReciprocalLoopNearestLocalPosition(
+            pair.transport,
+            member,
+            panel.linkedCanonicalCycleFrame,
+            previous);
+    if (!local.has_value()) {
+        return false;
+    }
+    panel.scrubAmount = local.value();
+    panel.linkedMemberLocalPlayheads[member] = local.value();
+    panel.linkedMemberLocalPlayheadsValid[member] = true;
+    return true;
+}
+
+std::optional<float> ResolveAnimationLinkedMemberLocalPosition(
+    PreviewRuntimeState* runtimeState,
+    const ResolvedAnimationLinkedPair& pair,
+    std::size_t memberIndex) {
+    if (runtimeState == nullptr || memberIndex >= pair.members.size() ||
+        pair.members[memberIndex] == nullptr ||
+        !runtimeState->animationPanel.linkedCanonicalCycleFrameValid ||
+        runtimeState->animationPanel.linkedCanonicalPairId !=
+            pair.sessionPairId) {
+        return std::nullopt;
+    }
+    auto& panel = runtimeState->animationPanel;
+    const float previous =
+        panel.linkedMemberLocalPlayheadsValid[memberIndex]
+            ? panel.linkedMemberLocalPlayheads[memberIndex]
+        : memberIndex == pair.currentMemberIndex
+            ? panel.scrubAmount
+            : 0.5F;
+    const auto local = invisible_places::camera::
+        ResolveAnimationReciprocalLoopNearestLocalPosition(
+            pair.transport,
+            memberIndex,
+            panel.linkedCanonicalCycleFrame,
+            previous);
+    if (local.has_value()) {
+        panel.linkedMemberLocalPlayheads[memberIndex] = local.value();
+        panel.linkedMemberLocalPlayheadsValid[memberIndex] = true;
+    }
+    return local;
+}
+
+std::optional<ResolvedAnimationLinkedPair>
+EnsureAnimationLinkedCanonicalClock(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return std::nullopt;
+    }
+    const auto pair = ResolveActiveAnimationLinkedPair(*runtimeState);
+    if (!pair.has_value()) {
+        return std::nullopt;
+    }
+    auto& panel = runtimeState->animationPanel;
+    if (!panel.linkedCanonicalCycleFrameValid ||
+        panel.linkedCanonicalPairId != pair->sessionPairId) {
+        const float phase = invisible_places::camera::
+            AnimationLocalToTimingLoopPosition(
+                *pair->members[pair->currentMemberIndex],
+                std::clamp(panel.scrubAmount, 0.0F, 1.0F));
+        panel.linkedCanonicalCycleFrame =
+            invisible_places::camera::
+                WrapAnimationReciprocalLoopCycleFrame(
+                    pair->transport,
+                    static_cast<double>(phase) *
+                        static_cast<double>(
+                            pair->transport.cycleFrames));
+        panel.linkedCanonicalCycleFrameValid = true;
+        panel.linkedCanonicalPairId = pair->sessionPairId;
+        panel.linkedViewMode = AnimationLinkedViewMode::Seam;
+        panel.linkedViewCameraAttached = true;
+        panel.linkedMemberLocalPlayheads = {};
+        panel.linkedMemberLocalPlayheadsValid = {};
+        panel.linkedMemberLocalPlayheads[pair->currentMemberIndex] =
+            std::clamp(panel.scrubAmount, 0.0F, 1.0F);
+        panel.linkedMemberLocalPlayheadsValid[pair->currentMemberIndex] =
+            true;
+        panel.linkedSeamedView.renderedSourceIndex = 0U;
+        panel.linkedSeamedView.temporalHistoryResetRequested = true;
+    }
+    return pair;
+}
+
+void SetAnimationLinkedCanonicalCycleFrame(
+    PreviewRuntimeState* runtimeState,
+    const ResolvedAnimationLinkedPair& pair,
+    double cycleFrame,
+    bool requestTemporalHistoryReset) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    auto& panel = runtimeState->animationPanel;
+    const double wrappedCycleFrame = invisible_places::camera::
+        WrapAnimationReciprocalLoopCycleFrame(
+            pair.transport,
+            cycleFrame);
+    const bool canonicalChanged =
+        !panel.linkedCanonicalCycleFrameValid ||
+        panel.linkedCanonicalPairId != pair.sessionPairId ||
+        std::abs(std::remainder(
+            wrappedCycleFrame - panel.linkedCanonicalCycleFrame,
+            static_cast<double>(pair.transport.cycleFrames))) > 1.0e-6;
+    panel.linkedCanonicalPairId = pair.sessionPairId;
+    panel.linkedCanonicalCycleFrame = wrappedCycleFrame;
+    panel.linkedCanonicalCycleFrameValid = true;
+    // Scrubs and jumps must discard both cached halves. Continuous playback
+    // instead retains the completed pair while its existing two-frame cadence
+    // advances source 0 and then source 1 at the held canonical phase.
+    if (canonicalChanged && requestTemporalHistoryReset) {
+        panel.linkedSeamedView.renderedSourceIndex = 0U;
+        panel.linkedSeamedView.temporalHistoryResetRequested = true;
+    }
+    (void)SyncLoadedAnimationPositionToLinkedCanonical(
+        runtimeState,
+        pair);
+    const std::size_t selectedMember =
+        panel.linkedViewMode == AnimationLinkedViewMode::A
+            ? 0U
+        : panel.linkedViewMode == AnimationLinkedViewMode::B
+            ? 1U
+            : 2U;
+    if (selectedMember < 2U && invisible_places::camera::
+            AnimationReciprocalLoopCycleFrameToLocalPositions(
+                pair.transport,
+                selectedMember,
+                panel.linkedCanonicalCycleFrame)
+            .empty()) {
+        const char unavailable = selectedMember == 0U ? 'A' : 'B';
+        panel.linkedViewMode = AnimationLinkedViewMode::Seam;
+        panel.linkedSeamedView.enabled = true;
+        runtimeState->statusMessage =
+            std::string{unavailable} +
+            " has no exact frame at that shared time; switched to Seam.";
+        runtimeState->errorMessage.clear();
+    }
+    runtimeState->previewRenderStateSignatureValid = false;
+}
+
+void SetAnimationLinkedCanonicalFromMemberLocal(
+    PreviewRuntimeState* runtimeState,
+    const ResolvedAnimationLinkedPair& pair,
+    std::size_t memberIndex,
+    float localPosition,
+    bool requestTemporalHistoryReset = true) {
+    if (runtimeState == nullptr || memberIndex >= pair.members.size() ||
+        pair.members[memberIndex] == nullptr) {
+        return;
+    }
+    const float clampedLocal =
+        std::clamp(localPosition, 0.0F, 1.0F);
+    auto& panel = runtimeState->animationPanel;
+    panel.linkedMemberLocalPlayheads[memberIndex] = clampedLocal;
+    panel.linkedMemberLocalPlayheadsValid[memberIndex] = true;
+    const float phase = invisible_places::camera::
+        AnimationLocalToTimingLoopPosition(
+            *pair.members[memberIndex],
+            clampedLocal);
+    SetAnimationLinkedCanonicalCycleFrame(
+        runtimeState,
+        pair,
+        static_cast<double>(phase) *
+            static_cast<double>(pair.transport.cycleFrames),
+        requestTemporalHistoryReset);
+}
+
+void SynchronizeAnimationLinkedCanonicalFromLoadedLocal(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    if (const auto pair =
+            ResolveActiveAnimationLinkedPair(*runtimeState);
+        pair.has_value()) {
+        runtimeState->animationPanel.linkedViewCameraAttached = true;
+        SetAnimationLinkedCanonicalFromMemberLocal(
+            runtimeState,
+            pair.value(),
+            pair->currentMemberIndex,
+            runtimeState->animationPanel.scrubAmount);
+    }
+}
+
+void ApplyAnimationEvaluation(
+    PreviewRuntimeState* runtimeState,
+    const AnimationPath& path,
+    float amount,
+    bool allowDepthOfField);
+
+bool ApplyAnimationLinkedCanonicalCamera(
+    PreviewRuntimeState* runtimeState,
+    const ResolvedAnimationLinkedPair& pair,
+    bool allowDepthOfField) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+    auto& panel = runtimeState->animationPanel;
+    std::array<std::size_t, 2U> candidates{
+        pair.currentMemberIndex,
+        1U - pair.currentMemberIndex,
+    };
+    if (panel.linkedViewMode == AnimationLinkedViewMode::A) {
+        candidates = {0U, 0U};
+    } else if (panel.linkedViewMode == AnimationLinkedViewMode::B) {
+        candidates = {1U, 1U};
+    }
+    for (const std::size_t member : candidates) {
+        const auto local = ResolveAnimationLinkedMemberLocalPosition(
+            runtimeState,
+            pair,
+            member);
+        if (!local.has_value()) {
+            continue;
+        }
+        ApplyAnimationEvaluation(
+            runtimeState,
+            *pair.members[member],
+            local.value(),
+            allowDepthOfField);
+        return true;
+    }
+    return false;
 }
 
 enum class AnimationVelocityLinkDisplayState : std::uint8_t {
@@ -27606,6 +28106,23 @@ float AnimationDurationSeconds(const AnimationPath& path) {
     return invisible_places::camera::AnimationPathDurationSeconds(path);
 }
 
+std::string FormatAnimationCycleClock(std::uint32_t cycleFrames) {
+    const std::uint32_t wholeSeconds = cycleFrames / 30U;
+    const std::uint32_t minutes = wholeSeconds / 60U;
+    const std::uint32_t seconds = wholeSeconds % 60U;
+    const std::uint32_t remainderFrames = cycleFrames % 30U;
+    std::ostringstream output;
+    output << minutes << ':' << std::setfill('0') << std::setw(2)
+           << seconds;
+    if (remainderFrames != 0U) {
+        output << '.' << std::setw(2)
+               << static_cast<std::uint32_t>(std::lround(
+                      static_cast<double>(remainderFrames) /
+                      30.0 * 100.0));
+    }
+    return output.str();
+}
+
 void SetCameraDepthOfFieldEnabled(PreviewRuntimeState* runtimeState, bool enabled) {
     if (runtimeState == nullptr) {
         return;
@@ -28153,6 +28670,11 @@ bool LoadAnimationPathVariant(
     }
 
     SyncCurrentAnimationToRegistry(runtimeState);
+    // Materializing the canonical clock before replacing the loaded member
+    // lets A<->B file selection retain the exact shared frame. The path load
+    // below remains an authoring-document change; view-mode buttons never
+    // call this function.
+    (void)EnsureAnimationLinkedCanonicalClock(runtimeState);
     auto& panel = runtimeState->animationPanel;
     auto registryIndex = FindAnimationRegistryIndex(panel, inputPath);
     if (!registryIndex.has_value()) {
@@ -28303,7 +28825,36 @@ bool LoadAnimationPathVariant(
     MarkWaterPathDirty(runtimeState);
     runtimeState->animationPlayback.active = false;
     runtimeState->cameraPlayback.active = false;
-    ApplyAnimationEvaluation(runtimeState, panel.currentPath.value(), 0.0F, false);
+    const auto linkedPair =
+        EnsureAnimationLinkedCanonicalClock(runtimeState);
+    bool appliedLinkedCamera = false;
+    if (linkedPair.has_value()) {
+        (void)SyncLoadedAnimationPositionToLinkedCanonical(
+            runtimeState,
+            linkedPair.value());
+        if (panel.linkedViewCameraAttached) {
+            appliedLinkedCamera = ApplyAnimationLinkedCanonicalCamera(
+                runtimeState,
+                linkedPair.value(),
+                false);
+        }
+    } else {
+        panel.linkedViewMode = AnimationLinkedViewMode::Seam;
+        panel.linkedCanonicalCycleFrame = 0.0;
+        panel.linkedCanonicalCycleFrameValid = false;
+        panel.linkedCanonicalPairId.clear();
+        panel.linkedViewCameraAttached = true;
+        panel.linkedMemberLocalPlayheads = {};
+        panel.linkedMemberLocalPlayheadsValid = {};
+    }
+    if (!linkedPair.has_value() ||
+        (panel.linkedViewCameraAttached && !appliedLinkedCamera)) {
+        ApplyAnimationEvaluation(
+            runtimeState,
+            panel.currentPath.value(),
+            panel.scrubAmount,
+            false);
+    }
     runtimeState->statusMessage =
         "Loaded " +
         std::string{currentUsesEdited ? "edited" : "saved"} +
@@ -28751,11 +29302,27 @@ void ApplyAnimationScrub(PreviewRuntimeState* runtimeState) {
         return;
     }
 
-    ApplyAnimationEvaluation(
-        runtimeState,
-        runtimeState->animationPanel.currentPath.value(),
-        runtimeState->animationPanel.scrubAmount,
-        runtimeState->animationPanel.previewDepthOfField);
+    bool appliedLinkedCamera = false;
+    if (runtimeState->animationPanel.linkedViewCameraAttached) {
+        const auto linkedPair =
+            ResolveActiveAnimationLinkedPair(*runtimeState);
+        if (linkedPair.has_value() &&
+            runtimeState->animationPanel.linkedCanonicalCycleFrameValid &&
+            runtimeState->animationPanel.linkedCanonicalPairId ==
+                linkedPair->sessionPairId) {
+            appliedLinkedCamera = ApplyAnimationLinkedCanonicalCamera(
+                runtimeState,
+                linkedPair.value(),
+                runtimeState->animationPanel.previewDepthOfField);
+        }
+    }
+    if (!appliedLinkedCamera) {
+        ApplyAnimationEvaluation(
+            runtimeState,
+            runtimeState->animationPanel.currentPath.value(),
+            runtimeState->animationPanel.scrubAmount,
+            runtimeState->animationPanel.previewDepthOfField);
+    }
     runtimeState->animationPlayback.active = false;
     runtimeState->cameraPlayback.active = false;
 }
@@ -28788,7 +29355,17 @@ void StartAnimationPlayback(PreviewRuntimeState* runtimeState) {
         currentPosition >= 1.0F - kAnimationEndTolerance
             ? 0.0F
             : currentPosition;
+    runtimeState->animationPanel.linkedViewCameraAttached = followCamera;
     runtimeState->animationPanel.scrubAmount = startPosition;
+    if (const auto pair =
+            ResolveActiveAnimationLinkedPair(*runtimeState);
+        pair.has_value()) {
+        SetAnimationLinkedCanonicalFromMemberLocal(
+            runtimeState,
+            pair.value(),
+            pair->currentMemberIndex,
+            startPosition);
+    }
     runtimeState->animationPlayback = {
         .active = true,
         .followCamera = followCamera,
@@ -28796,6 +29373,7 @@ void StartAnimationPlayback(PreviewRuntimeState* runtimeState) {
         .path = path,
         .durationSeconds = AnimationDurationSeconds(path),
         .startPosition = startPosition,
+        .domain = AnimationPlaybackDomain::LoadedLocal,
         .startedAt = std::chrono::steady_clock::now(),
     };
     if (followCamera && startPosition != currentPosition) {
@@ -28805,6 +29383,151 @@ void StartAnimationPlayback(PreviewRuntimeState* runtimeState) {
     runtimeState->statusMessage = followCamera
         ? "Playing animation path."
         : "Playing animation timing with the inspection camera preserved.";
+    runtimeState->errorMessage.clear();
+}
+
+void StartGlobalAnimationPlayback(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr ||
+        runtimeState->animationPanel.reciprocalPanWizard.Active() ||
+        runtimeState->animationPanel.liveCameraEdit.active) {
+        return;
+    }
+    const auto linkedPair =
+        EnsureAnimationLinkedCanonicalClock(runtimeState);
+    if (!linkedPair.has_value()) {
+        StartAnimationPlayback(runtimeState);
+        return;
+    }
+    auto& panel = runtimeState->animationPanel;
+    const bool followLinkedCamera = panel.linkedViewCameraAttached;
+    const auto& pair = linkedPair.value();
+    const auto localForMember = [&](std::size_t member) {
+        return ResolveAnimationLinkedMemberLocalPosition(
+            runtimeState,
+            pair,
+            member);
+    };
+
+    if (panel.linkedViewMode == AnimationLinkedViewMode::Seam) {
+        const double startCycleFrame = std::round(
+            invisible_places::camera::
+                WrapAnimationReciprocalLoopCycleFrame(
+                    pair.transport,
+                    panel.linkedCanonicalCycleFrame));
+        SetAnimationLinkedCanonicalCycleFrame(
+            runtimeState,
+            pair,
+            startCycleFrame);
+        std::size_t cameraMember = pair.currentMemberIndex;
+        auto cameraLocal = localForMember(cameraMember);
+        if (!cameraLocal.has_value()) {
+            cameraMember = 1U - cameraMember;
+            cameraLocal = localForMember(cameraMember);
+        }
+        if (!cameraLocal.has_value() ||
+            pair.members[cameraMember]->keys.size() < 2U) {
+            runtimeState->errorMessage =
+                "The shared frame has no exact A or B camera occurrence.";
+            runtimeState->statusMessage.clear();
+            return;
+        }
+        const bool followCamera = followLinkedCamera;
+        panel.linkedViewCameraAttached = followCamera;
+        if (followCamera) {
+            ApplyAnimationEvaluation(
+                runtimeState,
+                *pair.members[cameraMember],
+                cameraLocal.value(),
+                true);
+        }
+        runtimeState->animationPlayback = {
+            .active = true,
+            .followCamera = followCamera,
+            .cameraWasFollowed = followCamera,
+            .path = *pair.members[cameraMember],
+            .durationSeconds =
+                static_cast<float>(pair.transport.cycleFrames) /
+                30.0F,
+            .startPosition = cameraLocal.value(),
+            .domain = AnimationPlaybackDomain::LinkedSeam,
+            .linkedPairId = pair.sessionPairId,
+            .linkedTransport = pair.transport,
+            .linkedMemberIndex = cameraMember,
+            .linkedStartCycleFrame = startCycleFrame,
+            .startedAt = std::chrono::steady_clock::now(),
+        };
+        panel.linkedSeamedView.renderedSourceIndex = 0U;
+        runtimeState->cameraPlayback.active = false;
+        runtimeState->statusMessage =
+            followCamera
+                ? "Playing the shared " +
+                      FormatAnimationCycleClock(
+                          pair.transport.cycleFrames) +
+                      " loop (" +
+                      std::to_string(pair.transport.cycleFrames) +
+                      " frames)."
+                : "Playing the shared loop with the inspection camera preserved.";
+        runtimeState->errorMessage.clear();
+        return;
+    }
+
+    const std::size_t member =
+        panel.linkedViewMode == AnimationLinkedViewMode::A
+            ? 0U
+            : 1U;
+    auto local = localForMember(member);
+    if (!local.has_value()) {
+        runtimeState->errorMessage =
+            std::string{member == 0U ? 'A' : 'B'} +
+            " has no exact frame at the current shared time. Select Seam "
+            "or move into that member before playback.";
+        runtimeState->statusMessage.clear();
+        return;
+    }
+    constexpr float kAnimationEndTolerance = 1.0e-4F;
+    if (local.value() >= 1.0F - kAnimationEndTolerance) {
+        local = 0.0F;
+        SetAnimationLinkedCanonicalFromMemberLocal(
+            runtimeState,
+            pair,
+            member,
+            local.value());
+    }
+    const auto& path = *pair.members[member];
+    if (path.keys.size() < 2U) {
+        runtimeState->errorMessage =
+            "The selected linked member needs at least two camera keys for playback.";
+        runtimeState->statusMessage.clear();
+        return;
+    }
+    const bool followCamera = followLinkedCamera;
+    panel.linkedViewCameraAttached = followCamera;
+    if (followCamera) {
+        ApplyAnimationEvaluation(
+            runtimeState,
+            path,
+            local.value(),
+            true);
+    }
+    runtimeState->animationPlayback = {
+        .active = true,
+        .followCamera = followCamera,
+        .cameraWasFollowed = followCamera,
+        .path = path,
+        .durationSeconds = AnimationDurationSeconds(path),
+        .startPosition = local.value(),
+        .domain = AnimationPlaybackDomain::LinkedMember,
+        .linkedPairId = pair.sessionPairId,
+        .linkedTransport = pair.transport,
+        .linkedMemberIndex = member,
+        .linkedStartCycleFrame = panel.linkedCanonicalCycleFrame,
+        .startedAt = std::chrono::steady_clock::now(),
+    };
+    runtimeState->cameraPlayback.active = false;
+    runtimeState->statusMessage = followCamera
+        ? std::string{"Playing linked member "} +
+              (member == 0U ? "A." : "B.")
+        : "Playing linked member timing with the inspection camera preserved.";
     runtimeState->errorMessage.clear();
 }
 
@@ -28833,6 +29556,18 @@ void ToggleAnimationPlayback(PreviewRuntimeState* runtimeState) {
     }
 }
 
+void ToggleGlobalAnimationPlayback(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    if (runtimeState->animationPlayback.active) {
+        StopAnimationPlayback(runtimeState);
+    } else {
+        StartGlobalAnimationPlayback(runtimeState);
+    }
+}
+
 // The one shared scrub over the loaded animation. Every tab that shows it
 // reads and writes the same animationPanel.scrubAmount, so dragging it in
 // Camera, Animation, Timings, or Export moves the same normalized position
@@ -28856,11 +29591,16 @@ bool DrawAnimationScrubControl(PreviewRuntimeState* runtimeState) {
     ImGui::SameLine();
     ImGui::TextDisabled("%.2f s", panel.scrubAmount * durationSeconds);
     ImGui::Checkbox("Live Apply", &panel.liveApply);
+    if (scrubChanged) {
+        SynchronizeAnimationLinkedCanonicalFromLoadedLocal(
+            runtimeState);
+    }
     if (panel.liveApply && scrubChanged) {
         ApplyAnimationScrub(runtimeState);
     }
     ImGui::SameLine();
     if (ImGui::Button("Apply Position")) {
+        panel.linkedViewCameraAttached = true;
         ApplyAnimationScrub(runtimeState);
     }
     ImGui::SameLine();
@@ -28876,36 +29616,162 @@ void UpdateAnimationPlayback(PreviewRuntimeState* runtimeState) {
     }
 
     auto& playback = runtimeState->animationPlayback;
-    const bool followedCameraBeforeUpdate = playback.followCamera;
-    if (playback.followCamera) {
-        playback.followCamera = invisible_places::camera::
-            AnimationPlaybackShouldFollowCamera(
-                runtimeState->camera.CaptureState(),
-                playback.path,
-                runtimeState->animationPanel.scrubAmount,
-                playback.followCamera);
-    }
-    if (followedCameraBeforeUpdate && !playback.followCamera) {
-        runtimeState->statusMessage =
-            "Playing animation timing with the inspection camera preserved.";
-    }
     const float elapsedSeconds =
         std::chrono::duration<float>(std::chrono::steady_clock::now() - playback.startedAt).count();
+    if (playback.domain == AnimationPlaybackDomain::LinkedSeam) {
+        const auto linkedPair =
+            ResolveActiveAnimationLinkedPair(*runtimeState);
+        if (!linkedPair.has_value() ||
+            linkedPair->sessionPairId != playback.linkedPairId) {
+            StopAnimationPlayback(runtimeState);
+            runtimeState->errorMessage =
+                "Shared playback stopped because the active linked pair changed.";
+            runtimeState->statusMessage.clear();
+            return;
+        }
+        const auto& pair = linkedPair.value();
+        const bool matchedSplitPresentation =
+            runtimeState->animationPanel.linkedViewMode ==
+                AnimationLinkedViewMode::Seam &&
+            runtimeState->animationPanel.linkedViewCameraAttached &&
+            !runtimeState->animationPanel.savedEditedComparisonHoldActive &&
+            !runtimeState->animationPanel
+                 .velocityPartnerComparisonHoldActive &&
+            !invisible_places::camera::
+                 AnimationReciprocalLoopCycleFrameToLocalPositions(
+                     pair.transport,
+                     0U,
+                     runtimeState->animationPanel
+                         .linkedCanonicalCycleFrame)
+                 .empty() &&
+            !invisible_places::camera::
+                 AnimationReciprocalLoopCycleFrameToLocalPositions(
+                     pair.transport,
+                     1U,
+                     runtimeState->animationPanel
+                         .linkedCanonicalCycleFrame)
+                 .empty();
+        if (!matchedSplitPresentation) {
+            runtimeState->animationPanel.linkedSeamedView
+                .renderedSourceIndex = 0U;
+        }
+        const bool completingMatchedSplitPair =
+            matchedSplitPresentation &&
+            runtimeState->animationPanel.linkedSeamedView
+                    .renderedSourceIndex %
+                    2U ==
+                1U;
+        if (!completingMatchedSplitPair) {
+            const auto elapsedFrames = static_cast<double>(std::floor(
+                std::max(0.0F, elapsedSeconds) * 30.0F +
+                1.0e-6F));
+            SetAnimationLinkedCanonicalCycleFrame(
+                runtimeState,
+                pair,
+                playback.linkedStartCycleFrame + elapsedFrames,
+                false);
+        }
+
+        std::size_t cameraMember = pair.currentMemberIndex;
+        auto cameraLocal = ResolveAnimationLinkedMemberLocalPosition(
+            runtimeState,
+            pair,
+            cameraMember);
+        if (!cameraLocal.has_value()) {
+            cameraMember = 1U - cameraMember;
+            cameraLocal = ResolveAnimationLinkedMemberLocalPosition(
+                runtimeState,
+                pair,
+                cameraMember);
+        }
+        if (!cameraLocal.has_value()) {
+            StopAnimationPlayback(runtimeState);
+            runtimeState->errorMessage =
+                "Shared playback reached a frame with no exact A or B owner.";
+            runtimeState->statusMessage.clear();
+            return;
+        }
+        playback.path = *pair.members[cameraMember];
+        playback.linkedMemberIndex = cameraMember;
+        // Linked transport owns the camera until explicit viewport input
+        // detaches it. Comparing the live camera at frame N against the
+        // evaluation for frame N+1 would falsely interpret ordinary motion
+        // as manual navigation and stop following on the first moving frame.
+        if (playback.followCamera) {
+            ApplyAnimationEvaluation(
+                runtimeState,
+                playback.path,
+                cameraLocal.value(),
+                true);
+        }
+        runtimeState->previewRenderStateSignatureValid = false;
+        return;
+    }
+
+    if (playback.domain == AnimationPlaybackDomain::LoadedLocal) {
+        const bool followedCameraBeforeUpdate = playback.followCamera;
+        if (playback.followCamera) {
+            playback.followCamera = invisible_places::camera::
+                AnimationPlaybackShouldFollowCamera(
+                    runtimeState->camera.CaptureState(),
+                    playback.path,
+                    runtimeState->animationPanel.scrubAmount,
+                    playback.followCamera);
+        }
+        if (followedCameraBeforeUpdate && !playback.followCamera) {
+            runtimeState->statusMessage =
+                "Playing animation timing with the inspection camera preserved.";
+        }
+    }
     const float t = std::clamp(
         playback.startPosition +
             elapsedSeconds /
                 std::max(0.001F, playback.durationSeconds),
         0.0F,
         1.0F);
-    runtimeState->animationPanel.scrubAmount = t;
+    if (playback.domain == AnimationPlaybackDomain::LinkedMember) {
+        const auto linkedPair =
+            ResolveActiveAnimationLinkedPair(*runtimeState);
+        if (!linkedPair.has_value() ||
+            linkedPair->sessionPairId != playback.linkedPairId ||
+            playback.linkedMemberIndex >= 2U) {
+            StopAnimationPlayback(runtimeState);
+            runtimeState->errorMessage =
+                "Member playback stopped because the active linked pair changed.";
+            runtimeState->statusMessage.clear();
+            return;
+        }
+        SetAnimationLinkedCanonicalFromMemberLocal(
+            runtimeState,
+            linkedPair.value(),
+            playback.linkedMemberIndex,
+            t,
+            false);
+    } else {
+        runtimeState->animationPanel.scrubAmount = t;
+        if (const auto linkedPair =
+                ResolveActiveAnimationLinkedPair(*runtimeState);
+            linkedPair.has_value()) {
+            SetAnimationLinkedCanonicalFromMemberLocal(
+                runtimeState,
+                linkedPair.value(),
+                linkedPair->currentMemberIndex,
+                t,
+                false);
+        }
+    }
     runtimeState->previewRenderStateSignatureValid = false;
     if (playback.followCamera) {
         ApplyAnimationEvaluation(runtimeState, playback.path, t, true);
     }
 
     if (t >= 1.0F) {
+        const bool linkedMember =
+            playback.domain == AnimationPlaybackDomain::LinkedMember;
         StopAnimationPlayback(runtimeState);
-        runtimeState->statusMessage = "Animation playback complete.";
+        runtimeState->statusMessage = linkedMember
+            ? "Linked member playback complete."
+            : "Animation playback complete.";
     }
 }
 
@@ -28925,8 +29791,22 @@ void HandleAnimationPlaybackShortcut(PreviewRuntimeState* runtimeState) {
         return;
     }
     if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
-        ToggleAnimationPlayback(runtimeState);
+        ToggleGlobalAnimationPlayback(runtimeState);
     }
+}
+
+bool DetachAnimationLinkedPresentationCamera(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr ||
+        !ResolveActiveAnimationLinkedPair(*runtimeState).has_value()) {
+        return false;
+    }
+    runtimeState->animationPanel.linkedViewCameraAttached = false;
+    runtimeState->previewRenderStateSignatureValid = false;
+    if (runtimeState->animationPlayback.active) {
+        runtimeState->animationPlayback.followCamera = false;
+    }
+    return true;
 }
 
 std::string NextCameraShotName(const PreviewRuntimeState& runtimeState) {
@@ -28972,6 +29852,7 @@ void ApplyCameraShot(PreviewRuntimeState* runtimeState, std::size_t shotIndex) {
     }
 
     runtimeState->camera.ApplyState(runtimeState->cameraShots[shotIndex].state);
+    (void)DetachAnimationLinkedPresentationCamera(runtimeState);
     runtimeState->cameraPlayback.active = false;
     runtimeState->cameraPanel.selectedShotIndex = shotIndex;
     runtimeState->statusMessage = "Loaded camera shot " + runtimeState->cameraShots[shotIndex].name + ".";
@@ -29081,6 +29962,7 @@ void ApplyCameraBlend(PreviewRuntimeState* runtimeState) {
         pathShots,
         timing,
         timeSeconds));
+    (void)DetachAnimationLinkedPresentationCamera(runtimeState);
     runtimeState->cameraPlayback.active = false;
     runtimeState->animationPlayback.active = false;
 }
@@ -29103,6 +29985,7 @@ void StartCameraPlayback(PreviewRuntimeState* runtimeState) {
         return;
     }
 
+    (void)DetachAnimationLinkedPresentationCamera(runtimeState);
     runtimeState->cameraPlayback = {
         .active = true,
         .pathShotIndices = runtimeState->cameraPanel.pathShotIndices,
@@ -29121,6 +30004,7 @@ void UpdateCameraShotPlayback(PreviewRuntimeState* runtimeState) {
         return;
     }
 
+    (void)DetachAnimationLinkedPresentationCamera(runtimeState);
     const auto& playback = runtimeState->cameraPlayback;
     const auto pathShots = BuildOrderedCameraPathShots(
         runtimeState->cameraShots,
@@ -53471,6 +54355,20 @@ void ApplyFeatureTimelineScrub(
             panel.featureTimelinesAlwaysFollowCamera);
     runtimeState->previewRenderStateSignatureValid = false;
     if (moveCamera) {
+        if (const auto pair =
+                ResolveActiveAnimationLinkedPair(*runtimeState);
+            pair.has_value() &&
+            panel.linkedCanonicalCycleFrameValid &&
+            panel.linkedCanonicalPairId == pair->sessionPairId) {
+            panel.linkedViewCameraAttached = true;
+            (void)ApplyAnimationLinkedCanonicalCamera(
+                runtimeState,
+                pair.value(),
+                panel.previewDepthOfField);
+            runtimeState->animationPlayback.active = false;
+            runtimeState->cameraPlayback.active = false;
+            return;
+        }
         ApplyAnimationScrub(runtimeState);
         return;
     }
@@ -54197,6 +55095,7 @@ bool BeginAnimationLiveCameraEdit(
     panel.viewportPartnerSelectionActive = false;
     panel.viewportPartnerKeyIndex.reset();
     panel.scrubAmount = normalizedPosition;
+    SynchronizeAnimationLinkedCanonicalFromLoadedLocal(runtimeState);
     panel.drag = {};
     runtimeState->animationPlayback.active = false;
     runtimeState->cameraPlayback.active = false;
@@ -54366,6 +55265,7 @@ void FinishAnimationLiveCameraEdit(
         panel.selectedFileUsesEdited = edit.selectedFileUsesEditedBefore;
         panel.dirty = edit.panelDirtyBefore;
         panel.scrubAmount = edit.scrubAmountBefore;
+        SynchronizeAnimationLinkedCanonicalFromLoadedLocal(runtimeState);
         panel.selectedKeyIndex = panel.currentPath->keys.empty()
             ? std::nullopt
             : std::optional<std::size_t>{std::min(
@@ -54586,6 +55486,7 @@ void SwitchSavedEditedAnimationVariant(
                 1.0e-6F),
         0.0F,
         1.0F);
+    SynchronizeAnimationLinkedCanonicalFromLoadedLocal(runtimeState);
     if (!selectedKeyId.empty()) {
         const auto selected = std::find_if(
             panel.currentPath->keys.begin(),
@@ -55163,8 +56064,8 @@ void DrawLinkedSeamedViewHeaderControls(
             *partner,
             panel.availableFiles[partnerIndex.value()]);
     }
-    const bool available = !failure.has_value();
-    if (available) {
+    const bool reciprocalPairAvailable = !failure.has_value();
+    if (reciprocalPairAvailable) {
         EnsureLinkedSeamedViewPair(
             &panel.linkedSeamedView,
             current->velocityBlendLink->pairId,
@@ -55172,40 +56073,112 @@ void DrawLinkedSeamedViewHeaderControls(
             panel.availableFiles[partnerIndex.value()]);
     }
 
+    const auto linkedPair = reciprocalPairAvailable
+        ? EnsureAnimationLinkedCanonicalClock(runtimeState)
+        : std::nullopt;
+    const bool timingShared = linkedPair.has_value();
+    std::array<bool, 2U> memberAvailable{};
+    if (linkedPair.has_value()) {
+        EnsureLinkedSeamedViewPair(
+            &panel.linkedSeamedView,
+            linkedPair->pairId,
+            linkedPair->memberFilePaths[0U],
+            linkedPair->memberFilePaths[1U]);
+        for (std::size_t member = 0U; member < 2U; ++member) {
+            memberAvailable[member] = !invisible_places::camera::
+                AnimationReciprocalLoopCycleFrameToLocalPositions(
+                    linkedPair->transport,
+                    member,
+                    panel.linkedCanonicalCycleFrame)
+                .empty();
+        }
+    }
+
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted("Linked A/B View");
-    ImGui::SameLine();
-    ImGui::BeginDisabled(!available);
-    if (ImGui::Checkbox(
-            "Seamed View",
-            &panel.linkedSeamedView.enabled)) {
-        panel.linkedSeamedView.renderedSourceIndex = 0U;
-        runtimeState->previewRenderStateSignatureValid = false;
+    if (timingShared) {
+        const auto drawModeButton = [&](const char* label,
+                                        AnimationLinkedViewMode mode,
+                                        bool enabled,
+                                        std::string_view tooltip) {
+            ImGui::SameLine();
+            const bool selected = panel.linkedViewMode == mode;
+            if (selected) {
+                ImGui::PushStyleColor(
+                    ImGuiCol_Button,
+                    ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+            }
+            ImGui::BeginDisabled(!enabled);
+            const bool pressed = ImGui::SmallButton(label);
+            ImGui::EndDisabled();
+            if (selected) {
+                ImGui::PopStyleColor();
+            }
+            if (pressed) {
+                StopAnimationPlayback(runtimeState);
+                runtimeState->cameraPlayback.active = false;
+                panel.linkedViewMode = mode;
+                panel.linkedViewCameraAttached = true;
+                panel.linkedSeamedView.enabled =
+                    mode == AnimationLinkedViewMode::Seam;
+                panel.linkedSeamedView.renderedSourceIndex = 0U;
+                (void)ApplyAnimationLinkedCanonicalCamera(
+                    runtimeState,
+                    linkedPair.value(),
+                    panel.previewDepthOfField);
+                runtimeState->previewRenderStateSignatureValid = false;
+                runtimeState->statusMessage =
+                    std::string{"Linked view: "} + label + ".";
+                runtimeState->errorMessage.clear();
+            }
+            if (ImGui::IsItemHovered(
+                    ImGuiHoveredFlags_DelayNormal |
+                    ImGuiHoveredFlags_AllowWhenDisabled)) {
+                ImGui::SetTooltip("%s", std::string{tooltip}.c_str());
+            }
+        };
+        const std::string seamTooltip =
+            "Seam: show every exact owner of the shared frame. Two owners "
+            "use the authored hard split; one owner fills the view.\nA: " +
+            linkedPair->memberFilePaths[0U].string() + "\nB: " +
+            linkedPair->memberFilePaths[1U].string();
+        const std::string aTooltip = memberAvailable[0U]
+            ? "A: show this exact shared frame from\n" +
+                  linkedPair->memberFilePaths[0U].string()
+            : "A has no exact camera frame at the current shared time. "
+              "Choose Seam or move to an A-owned part of the loop.\n" +
+                  linkedPair->memberFilePaths[0U].string();
+        const std::string bTooltip = memberAvailable[1U]
+            ? "B: show this exact shared frame from\n" +
+                  linkedPair->memberFilePaths[1U].string()
+            : "B has no exact camera frame at the current shared time. "
+              "Choose Seam or move to a B-owned part of the loop.\n" +
+                  linkedPair->memberFilePaths[1U].string();
+        drawModeButton(
+            "Seam",
+            AnimationLinkedViewMode::Seam,
+            true,
+            seamTooltip);
+        drawModeButton(
+            "A",
+            AnimationLinkedViewMode::A,
+            memberAvailable[0U],
+            aTooltip);
+        drawModeButton(
+            "B",
+            AnimationLinkedViewMode::B,
+            memberAvailable[1U],
+            bTooltip);
+    } else if (failure.has_value()) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("Local view");
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip("%s", failure->c_str());
+        }
     }
-    if (ImGui::IsItemHovered(
-            ImGuiHoveredFlags_DelayNormal |
-            ImGuiHoveredFlags_AllowWhenDisabled)) {
-        ImGui::SetTooltip(
-            "%s",
-            available
-                ? "Shows the reciprocal partner in either saved overlap. The keyed feature timeline is shared across the complete linked loop."
-                : failure->c_str());
-    }
-    const auto currentTimingWindow = current != nullptr
-        ? invisible_places::camera::ResolveAnimationTimingLoopWindow(*current)
-        : std::nullopt;
-    const auto partnerTimingWindow = partner != nullptr
-        ? invisible_places::camera::ResolveAnimationTimingLoopWindow(*partner)
-        : std::nullopt;
-    const bool timingShared = current != nullptr && partner != nullptr &&
-        current->selectedTimingTakeId == partner->selectedTimingTakeId &&
-        currentTimingWindow.has_value() &&
-        partnerTimingWindow.has_value() &&
-        currentTimingWindow->cycleFrames ==
-            partnerTimingWindow->cycleFrames;
     ImGui::TextDisabled(
         timingShared ? "Effects: shared loop" : "Effects: path-local");
-    if (!timingShared) {
+    if (!timingShared && reciprocalPairAvailable) {
         ImGui::SameLine();
         if (ImGui::SmallButton("Share Effect Timeline")) {
             panel.requestedSharedTimingLoop =
@@ -55222,7 +56195,20 @@ void DrawLinkedSeamedViewHeaderControls(
         ImGui::SetTooltip(
             "Both animation windows evaluate the same cyclic Timing Take. Keys outside the loaded camera window remain virtual interpolation neighbours.");
     }
-    ImGui::EndDisabled();
+    if (timingShared) {
+        const std::size_t selectedMember =
+            panel.linkedViewMode == AnimationLinkedViewMode::A
+                ? 0U
+            : panel.linkedViewMode == AnimationLinkedViewMode::B
+                ? 1U
+                : 2U;
+        if (selectedMember < 2U && !memberAvailable[selectedMember]) {
+            ImGui::TextColored(
+                ImVec4{1.0F, 0.72F, 0.28F, 1.0F},
+                "%c has no exact frame here. Select Seam or the available member.",
+                selectedMember == 0U ? 'A' : 'B');
+        }
+    }
 }
 
 std::size_t LinkedSeamedViewOrderedSeamIndex(
@@ -55237,10 +56223,11 @@ std::size_t LinkedSeamedViewOrderedSeamIndex(
 }
 
 struct LinkedAnimationSeamedComparison {
-    // Camera source 0 is always the currently loaded animation; source 1 is
-    // its reciprocal partner. `currentSourceOnLeft` follows endpoint roles,
-    // rather than assigning one permanent side to either filename.
+    // One source is a full-screen camera override. Two sources retain the
+    // existing alternating hard-split compositor; zero is never returned.
     std::array<invisible_places::camera::CameraState, 2U> cameraStates{};
+    std::array<std::size_t, 2U> sourceMemberIndices{};
+    std::size_t sourceCount = 0U;
     std::size_t currentLocalSeamIndex = 0U;
     std::size_t orderedSeamIndex = 0U;
     float currentNormalizedPosition = 0.0F;
@@ -55261,65 +56248,120 @@ ResolveLinkedAnimationSeamedComparison(
     }
     auto& panel = runtimeState->animationPanel;
     auto& view = panel.linkedSeamedView;
-    if (!view.enabled || panel.currentFilePath.empty() ||
+    if (panel.currentFilePath.empty() ||
+        !panel.linkedViewCameraAttached ||
         panel.savedEditedComparisonHoldActive ||
         panel.velocityPartnerComparisonHoldActive) {
+        view.renderedSourceIndex = 0U;
         return std::nullopt;
     }
-    const auto currentIndex = FindAnimationRegistryIndex(
-        panel,
-        std::filesystem::path{panel.currentFilePath});
-    const auto* current = currentIndex.has_value()
-        ? RegistryAnimationPath(*runtimeState, currentIndex.value())
-        : nullptr;
-    if (current == nullptr || !current->velocityBlendLink.has_value()) {
+    const auto linkedPair =
+        EnsureAnimationLinkedCanonicalClock(runtimeState);
+    if (!linkedPair.has_value()) {
         return std::nullopt;
     }
-    const auto partnerIndex = FindAnimationRegistryIndexByFileName(
-        panel,
-        current->velocityBlendLink->partnerFileName);
-    const auto* partner = partnerIndex.has_value()
-        ? RegistryAnimationPath(*runtimeState, partnerIndex.value())
-        : nullptr;
-    if (partner == nullptr ||
-        AppliedReciprocalPairFailure(
-            *current,
-            panel.availableFiles[currentIndex.value()],
-            *partner,
-            panel.availableFiles[partnerIndex.value()])
-            .has_value()) {
-        return std::nullopt;
-    }
+    const auto& pair = linkedPair.value();
     EnsureLinkedSeamedViewPair(
         &view,
-        current->velocityBlendLink->pairId,
-        panel.availableFiles[currentIndex.value()],
-        panel.availableFiles[partnerIndex.value()]);
+        pair.pairId,
+        pair.memberFilePaths[0U],
+        pair.memberFilePaths[1U]);
 
-    const float currentDuration = invisible_places::camera::
-        AnimationPathDurationSeconds(*current);
-    const float partnerDuration = invisible_places::camera::
-        AnimationPathDurationSeconds(*partner);
-    if (currentDuration <= 1.0e-6F || partnerDuration <= 1.0e-6F) {
+    const auto localForMember = [&](std::size_t memberIndex) {
+        return ResolveAnimationLinkedMemberLocalPosition(
+            runtimeState,
+            pair,
+            memberIndex);
+    };
+    std::array<std::optional<float>, 2U> memberLocals{
+        localForMember(0U),
+        localForMember(1U),
+    };
+    std::vector<std::size_t> visibleMembers;
+    switch (panel.linkedViewMode) {
+        case AnimationLinkedViewMode::Seam:
+            for (std::size_t member = 0U; member < 2U; ++member) {
+                if (memberLocals[member].has_value()) {
+                    visibleMembers.push_back(member);
+                }
+            }
+            break;
+        case AnimationLinkedViewMode::A:
+            if (memberLocals[0U].has_value()) {
+                visibleMembers.push_back(0U);
+            }
+            break;
+        case AnimationLinkedViewMode::B:
+            if (memberLocals[1U].has_value()) {
+                visibleMembers.push_back(1U);
+            }
+            break;
+    }
+    if (visibleMembers.empty()) {
         return std::nullopt;
     }
+
+    LinkedAnimationSeamedComparison comparison;
+    comparison.sourceCount = visibleMembers.size();
+    for (std::size_t source = 0U;
+         source < visibleMembers.size();
+         ++source) {
+        const std::size_t member = visibleMembers[source];
+        comparison.sourceMemberIndices[source] = member;
+        const float duration = invisible_places::camera::
+            AnimationPathDurationSeconds(*pair.members[member]);
+        comparison.cameraStates[source] = invisible_places::camera::
+            EvaluateAnimationPath(
+                *pair.members[member],
+                memberLocals[member].value() * duration)
+                .camera;
+        comparison.cameraStates[source].hasDepthOfField = false;
+    }
+    if (comparison.sourceCount == 1U) {
+        view.renderedSourceIndex = 0U;
+        return comparison;
+    }
+
+    // The two-source split retains the established loaded/current endpoint
+    // roles and anchor mapping. Both locals came from the same canonical
+    // cycle frame, so this call only resolves orientation and seam identity.
+    const std::size_t currentMember = pair.currentMemberIndex;
+    const std::size_t partnerMember = 1U - currentMember;
+    const auto* current = pair.members[currentMember];
+    const auto* partner = pair.members[partnerMember];
     const auto seamSample = invisible_places::camera::
         ResolveAnimationLinkedSeamSample(
             *current,
             *partner,
-            panel.scrubAmount);
+            memberLocals[currentMember].value());
     if (!seamSample.has_value()) {
         return std::nullopt;
     }
-    const std::size_t localSeamIndex =
-        seamSample->currentSeamIndex;
+    // Reorder the camera slots to current/partner for the existing temporal
+    // compositor and its current-source-left flag.
+    comparison.cameraStates[0U] = invisible_places::camera::
+        EvaluateAnimationPath(
+            *current,
+            memberLocals[currentMember].value() *
+                invisible_places::camera::
+                    AnimationPathDurationSeconds(*current))
+            .camera;
+    comparison.cameraStates[1U] = invisible_places::camera::
+        EvaluateAnimationPath(
+            *partner,
+            memberLocals[partnerMember].value() *
+                invisible_places::camera::
+                    AnimationPathDurationSeconds(*partner))
+            .camera;
+    comparison.cameraStates[0U].hasDepthOfField = false;
+    comparison.cameraStates[1U].hasDepthOfField = false;
+    comparison.sourceMemberIndices = {currentMember, partnerMember};
+    const std::size_t localSeamIndex = seamSample->currentSeamIndex;
     const std::size_t orderedSeamIndex =
         LinkedSeamedViewOrderedSeamIndex(
             view,
-            panel.availableFiles[currentIndex.value()],
+            pair.memberFilePaths[currentMember],
             localSeamIndex);
-
-    LinkedAnimationSeamedComparison comparison;
     comparison.currentLocalSeamIndex = localSeamIndex;
     comparison.orderedSeamIndex = orderedSeamIndex;
     comparison.currentNormalizedPosition =
@@ -55336,7 +56378,7 @@ ResolveLinkedAnimationSeamedComparison(
         3.0F);
     if (view.trackedAnchorsValid[orderedSeamIndex]) {
         const bool currentIsOrderedFirst = PathsLexicallyEqual(
-            panel.availableFiles[currentIndex.value()],
+            pair.memberFilePaths[currentMember],
             view.orderedFilePaths[0U]);
         comparison.trackedAnchors[0U] =
             view.trackedAnchors[orderedSeamIndex]
@@ -55346,16 +56388,6 @@ ResolveLinkedAnimationSeamedComparison(
                 [currentIsOrderedFirst ? 1U : 0U];
         comparison.trackedAnchorsValid = true;
     }
-    comparison.cameraStates[0U] = invisible_places::camera::
-        EvaluateAnimationPath(
-            *current,
-            seamSample->currentNormalizedPosition * currentDuration).camera;
-    comparison.cameraStates[1U] = invisible_places::camera::
-        EvaluateAnimationPath(
-            *partner,
-            seamSample->partnerNormalizedPosition * partnerDuration).camera;
-    comparison.cameraStates[0U].hasDepthOfField = false;
-    comparison.cameraStates[1U].hasDepthOfField = false;
     return comparison;
 }
 
@@ -55926,6 +56958,15 @@ void CancelReciprocalPanWizard(
     runtimeState->animationPlayback.active = false;
     runtimeState->cameraPlayback.active = false;
     panel.scrubAmount = launch.launchScrubAmount;
+    if (const auto linkedPair =
+            ResolveActiveAnimationLinkedPair(*runtimeState);
+        linkedPair.has_value()) {
+        SetAnimationLinkedCanonicalFromMemberLocal(
+            runtimeState,
+            linkedPair.value(),
+            linkedPair->currentMemberIndex,
+            panel.scrubAmount);
+    }
     panel.matchingFrameGhost.visible = launch.launchGhostVisible;
     panel.matchingFrameGhost.automaticUpdate =
         launch.launchGhostAutomaticUpdate;
@@ -58837,6 +59878,8 @@ bool ApplyReciprocalPanCandidate(
           };
     panel.linkedSeamedView.trackedAnchorsValid = {true, true};
     panel.linkedSeamedView.enabled = true;
+    panel.linkedViewMode = AnimationLinkedViewMode::Seam;
+    panel.linkedViewCameraAttached = true;
     panel.linkedSeamedView.renderedSourceIndex = 0U;
     if (runtimeState->animationVelocityPreviewJob.worker.joinable()) {
         runtimeState->animationVelocityPreviewJob.worker.request_stop();
@@ -58871,6 +59914,7 @@ bool ApplyReciprocalPanCandidate(
             std::max<std::uint32_t>(1U, ReciprocalPanPathFrameCount(first))),
         0.0F,
         1.0F);
+    SynchronizeAnimationLinkedCanonicalFromLoadedLocal(runtimeState);
     if (!launch.launchSelectedKeyId.empty()) {
         const auto selected = std::find_if(
             first.keys.begin(),
@@ -61449,6 +62493,8 @@ void DrawAnimationSection(
                 requestedPosition,
                 0.0F,
                 1.0F);
+            SynchronizeAnimationLinkedCanonicalFromLoadedLocal(
+                runtimeState);
             ApplyAnimationScrub(runtimeState);
         }
     }
@@ -61672,6 +62718,14 @@ void DrawAnimationSection(
                 panel.selectedFileUsesEdited = false;
                 panel.dirty = false;
                 panel.selectedKeyIndex.reset();
+                panel.linkedViewMode =
+                    AnimationLinkedViewMode::Seam;
+                panel.linkedCanonicalCycleFrame = 0.0;
+                panel.linkedCanonicalCycleFrameValid = false;
+                panel.linkedCanonicalPairId.clear();
+                panel.linkedViewCameraAttached = true;
+                panel.linkedMemberLocalPlayheads = {};
+                panel.linkedMemberLocalPlayheadsValid = {};
             }
             RemoveAnimationFileFromRegistry(&panel, selectedAnimationIndex);
             const auto roots = WorkspaceRoots(*runtimeState);
@@ -62406,6 +63460,8 @@ void DrawAnimationSection(
                         plotWidth,
                     0.0F,
                     1.0F);
+                SynchronizeAnimationLinkedCanonicalFromLoadedLocal(
+                    runtimeState);
                 ApplyAnimationScrub(runtimeState);
             }
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
@@ -64149,7 +65205,8 @@ void DrawAnimationSection(
                     panel.availableFiles[currentLoopFileIndex.value()],
                     panel.availableFiles[loopPartnerIndex.value()]);
             }
-            if (matchingAppliedPair && panel.linkedSeamedView.enabled) {
+            if (matchingAppliedPair &&
+                panel.linkedViewMode == AnimationLinkedViewMode::Seam) {
                 const bool currentIsOrderedFirst = PathsLexicallyEqual(
                     panel.availableFiles[currentLoopFileIndex.value()],
                     panel.linkedSeamedView.orderedFilePaths[0U]);
@@ -65807,6 +66864,7 @@ void DrawAnimationSection(
         panel.scrubAmount =
             static_cast<float>(playheadFrame) /
             static_cast<float>(totalFrames);
+        SynchronizeAnimationLinkedCanonicalFromLoadedLocal(runtimeState);
         const bool confirmedDraft = FinalizeAnimationKeyStructureEdit(
             runtimeState,
             registryIndex);
@@ -80285,59 +81343,269 @@ AnimationTimelineCoordinateContext ResolveAnimationTimelineCoordinateContext(
             CyclicTimelineSanitizeViewRange(
                 panel.linkedTimelineViewRange),
     };
-    if (!panel.currentPath.has_value() || panel.currentFilePath.empty() ||
-        panel.currentPath->selectedTimingTakeId.empty() ||
-        !panel.currentPath->velocityBlendLink.has_value()) {
-        return result;
-    }
-    const auto currentIndex = FindAnimationRegistryIndex(
-        panel,
-        std::filesystem::path{panel.currentFilePath});
-    const auto partnerIndex = FindAnimationRegistryIndexByFileName(
-        panel,
-        panel.currentPath->velocityBlendLink->partnerFileName);
-    if (!currentIndex.has_value() || !partnerIndex.has_value() ||
-        currentIndex == partnerIndex) {
-        return result;
-    }
-    const auto* current = RegistryAnimationPath(
-        runtimeState,
-        currentIndex.value());
-    const auto* partner = RegistryAnimationPath(
-        runtimeState,
-        partnerIndex.value());
-    if (current == nullptr || partner == nullptr ||
-        current->selectedTimingTakeId.empty() ||
-        current->selectedTimingTakeId != partner->selectedTimingTakeId) {
-        return result;
-    }
-    const auto transport = invisible_places::camera::
-        ResolveAnimationReciprocalLoopTransport(
-            *current,
-            panel.availableFiles[currentIndex.value()],
-            *partner,
-            panel.availableFiles[partnerIndex.value()]);
-    if (!transport.has_value()) {
-        return result;
-    }
-    const auto currentStoredMember = std::find(
-        transport->memberInputIndices.begin(),
-        transport->memberInputIndices.end(),
-        0U);
-    if (currentStoredMember == transport->memberInputIndices.end()) {
+    const auto pair = ResolveActiveAnimationLinkedPair(runtimeState);
+    if (!pair.has_value()) {
         return result;
     }
     result.linkedCyclic = true;
-    result.pairId = current->velocityBlendLink->pairId;
-    result.transport = transport.value();
-    result.currentMemberIndex = static_cast<std::size_t>(std::distance(
-        transport->memberInputIndices.begin(),
-        currentStoredMember));
+    result.pairId = pair->sessionPairId;
+    result.transport = pair->transport;
+    result.currentMemberIndex = pair->currentMemberIndex;
     if (panel.linkedTimelineViewPairId != result.pairId) {
         result.linkedRange = invisible_places::timing::
             CyclicTimelineFullViewRange();
     }
     return result;
+}
+
+enum class GlobalAnimationTimelineSurfaceKind : std::uint8_t {
+    LoadedLocal = 0,
+    LinkedSeam,
+    LinkedMember,
+};
+
+struct GlobalAnimationTimelineSurface {
+    GlobalAnimationTimelineSurfaceKind kind =
+        GlobalAnimationTimelineSurfaceKind::LoadedLocal;
+    std::optional<ResolvedAnimationLinkedPair> linkedPair;
+    std::size_t memberIndex = 0U;
+    float displayMinimum = 0.0F;
+    float displayMaximum = 1.0F;
+    float displayPosition = 0.0F;
+    float durationSeconds = 0.0F;
+};
+
+GlobalAnimationTimelineSurface ResolveGlobalAnimationTimelineSurface(
+    PreviewRuntimeState* runtimeState) {
+    GlobalAnimationTimelineSurface surface;
+    if (runtimeState == nullptr ||
+        !runtimeState->animationPanel.currentPath.has_value()) {
+        return surface;
+    }
+    auto& panel = runtimeState->animationPanel;
+    surface.displayPosition =
+        std::clamp(panel.scrubAmount, 0.0F, 1.0F);
+    surface.durationSeconds = std::max(
+        0.0F,
+        AnimationDurationSeconds(panel.currentPath.value()));
+    auto linkedPair =
+        EnsureAnimationLinkedCanonicalClock(runtimeState);
+    if (!linkedPair.has_value()) {
+        return surface;
+    }
+
+    const auto selectedMember = [&]() -> std::optional<std::size_t> {
+        if (panel.linkedViewMode == AnimationLinkedViewMode::A) {
+            return 0U;
+        }
+        if (panel.linkedViewMode == AnimationLinkedViewMode::B) {
+            return 1U;
+        }
+        return std::nullopt;
+    }();
+    if (selectedMember.has_value()) {
+        const auto local = ResolveAnimationLinkedMemberLocalPosition(
+            runtimeState,
+            linkedPair.value(),
+            selectedMember.value());
+        if (local.has_value()) {
+            surface.kind =
+                GlobalAnimationTimelineSurfaceKind::LinkedMember;
+            surface.linkedPair = linkedPair;
+            surface.memberIndex = selectedMember.value();
+            surface.displayPosition = local.value();
+            surface.durationSeconds = std::max(
+                0.0F,
+                AnimationDurationSeconds(
+                    *linkedPair->members[selectedMember.value()]));
+            return surface;
+        }
+        // A member view never clamps into a gap. Falling back to Seam keeps
+        // the requested canonical frame visible and explains the transition.
+        const char unavailable =
+            selectedMember.value() == 0U ? 'A' : 'B';
+        panel.linkedViewMode = AnimationLinkedViewMode::Seam;
+        panel.linkedSeamedView.enabled = true;
+        runtimeState->statusMessage =
+            std::string{unavailable} +
+            " has no exact frame here; showing Seam instead.";
+        runtimeState->errorMessage.clear();
+    }
+    surface.kind = GlobalAnimationTimelineSurfaceKind::LinkedSeam;
+    surface.linkedPair = std::move(linkedPair);
+    surface.displayMinimum = -1.0F;
+    surface.displayMaximum = 1.0F;
+    surface.displayPosition = static_cast<float>(
+        invisible_places::camera::
+            AnimationReciprocalLoopCycleFrameToSignedPosition(
+                surface.linkedPair->transport,
+                panel.linkedCanonicalCycleFrame));
+    surface.durationSeconds = static_cast<float>(
+        surface.linkedPair->transport.cycleFrames) /
+        30.0F;
+    return surface;
+}
+
+float GlobalAnimationSurfaceFraction(
+    const GlobalAnimationTimelineSurface& surface,
+    float displayPosition) {
+    return std::clamp(
+        (displayPosition - surface.displayMinimum) /
+            std::max(
+                1.0e-6F,
+                surface.displayMaximum - surface.displayMinimum),
+        0.0F,
+        1.0F);
+}
+
+float GlobalAnimationSurfaceDisplayAtFraction(
+    const GlobalAnimationTimelineSurface& surface,
+    float fraction) {
+    return std::lerp(
+        surface.displayMinimum,
+        surface.displayMaximum,
+        std::clamp(fraction, 0.0F, 1.0F));
+}
+
+float GlobalAnimationSurfaceAuthoredPosition(
+    const PreviewRuntimeState& runtimeState,
+    const GlobalAnimationTimelineSurface& surface,
+    float displayPosition) {
+    if (surface.kind ==
+            GlobalAnimationTimelineSurfaceKind::LinkedSeam &&
+        surface.linkedPair.has_value()) {
+        return static_cast<float>(invisible_places::camera::
+            AnimationReciprocalLoopSignedPositionToCyclePhase(
+                surface.linkedPair->transport,
+                displayPosition));
+    }
+    if (surface.kind ==
+            GlobalAnimationTimelineSurfaceKind::LinkedMember &&
+        surface.linkedPair.has_value()) {
+        return invisible_places::camera::
+            AnimationLocalToTimingLoopPosition(
+                *surface.linkedPair->members[surface.memberIndex],
+                std::clamp(displayPosition, 0.0F, 1.0F));
+    }
+    if (runtimeState.animationPanel.currentPath.has_value()) {
+        const auto& path =
+            runtimeState.animationPanel.currentPath.value();
+        if (invisible_places::camera::ResolveAnimationTimingLoopWindow(path)
+                .has_value()) {
+            return invisible_places::camera::
+                AnimationLocalToTimingLoopPosition(
+                    path,
+                    std::clamp(displayPosition, 0.0F, 1.0F));
+        }
+        const float cameraFrames = static_cast<float>(
+            EffectiveAnimationDurationFramesForTracks(path));
+        const float trackFrames = static_cast<float>(
+            AuthoredAnimationTrackDurationFrames(path));
+        return std::clamp(
+            displayPosition * cameraFrames / trackFrames,
+            0.0F,
+            1.0F);
+    }
+    return std::clamp(displayPosition, 0.0F, 1.0F);
+}
+
+std::vector<float> GlobalAnimationSurfaceDisplayPositions(
+    const PreviewRuntimeState& runtimeState,
+    const GlobalAnimationTimelineSurface& surface,
+    float authoredPosition) {
+    if (surface.kind ==
+            GlobalAnimationTimelineSurfaceKind::LinkedSeam &&
+        surface.linkedPair.has_value()) {
+        return {static_cast<float>(invisible_places::camera::
+            AnimationReciprocalLoopCyclePhaseToSignedPosition(
+                surface.linkedPair->transport,
+                authoredPosition))};
+    }
+    if (surface.kind ==
+            GlobalAnimationTimelineSurfaceKind::LinkedMember &&
+        surface.linkedPair.has_value()) {
+        return invisible_places::camera::
+            AnimationReciprocalLoopCyclePhaseToLocalPositions(
+                surface.linkedPair->transport,
+                surface.memberIndex,
+                authoredPosition);
+    }
+    return runtimeState.animationPanel.currentPath.has_value()
+        ? AuthoredTrackNormalizedToCameraNormalizedPositions(
+              runtimeState.animationPanel.currentPath.value(),
+              authoredPosition)
+        : std::vector<float>{authoredPosition};
+}
+
+void SetGlobalAnimationSurfacePosition(
+    PreviewRuntimeState* runtimeState,
+    const GlobalAnimationTimelineSurface& surface,
+    float displayPosition) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    runtimeState->animationPanel.linkedViewCameraAttached = true;
+    if (surface.kind ==
+            GlobalAnimationTimelineSurfaceKind::LinkedSeam &&
+        surface.linkedPair.has_value()) {
+        SetAnimationLinkedCanonicalCycleFrame(
+            runtimeState,
+            surface.linkedPair.value(),
+            invisible_places::camera::
+                AnimationReciprocalLoopSignedPositionToCycleFrame(
+                    surface.linkedPair->transport,
+                    displayPosition));
+        (void)ApplyAnimationLinkedCanonicalCamera(
+            runtimeState,
+            surface.linkedPair.value(),
+            runtimeState->animationPanel.previewDepthOfField);
+        runtimeState->animationPlayback.active = false;
+        runtimeState->cameraPlayback.active = false;
+        return;
+    }
+    if (surface.kind ==
+            GlobalAnimationTimelineSurfaceKind::LinkedMember &&
+        surface.linkedPair.has_value()) {
+        SetAnimationLinkedCanonicalFromMemberLocal(
+            runtimeState,
+            surface.linkedPair.value(),
+            surface.memberIndex,
+            displayPosition);
+        (void)ApplyAnimationLinkedCanonicalCamera(
+            runtimeState,
+            surface.linkedPair.value(),
+            runtimeState->animationPanel.previewDepthOfField);
+        runtimeState->animationPlayback.active = false;
+        runtimeState->cameraPlayback.active = false;
+        return;
+    }
+    runtimeState->animationPanel.scrubAmount =
+        std::clamp(displayPosition, 0.0F, 1.0F);
+    ApplyAnimationScrub(runtimeState);
+}
+
+void SetGlobalAnimationSurfaceToAuthoredPosition(
+    PreviewRuntimeState* runtimeState,
+    float authoredPosition) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    runtimeState->animationPanel.linkedViewCameraAttached = true;
+    SetCurrentAnimationPositionFromAuthoredTrack(
+        runtimeState,
+        authoredPosition);
+    if (const auto pair =
+            ResolveActiveAnimationLinkedPair(*runtimeState);
+        pair.has_value()) {
+        (void)ApplyAnimationLinkedCanonicalCamera(
+            runtimeState,
+            pair.value(),
+            runtimeState->animationPanel.previewDepthOfField);
+        runtimeState->animationPlayback.active = false;
+        runtimeState->cameraPlayback.active = false;
+    } else {
+        ApplyAnimationScrub(runtimeState);
+    }
 }
 
 void DrawExportBatchSection(
@@ -85267,14 +86535,16 @@ void DrawWaterFeatureRunMarkStrip(
     ImGui::Dummy(ImVec2{kHelpGutterWidth, kRailHeight});
     const ImVec2 helpMin{railMax.x, railMin.y};
     const ImVec2 helpMax{railMax.x + kHelpGutterWidth, railMax.y};
-    const invisible_places::timing::TimelineViewRange cameraViewRange{};
+    const auto globalSurface = cameraDomain
+        ? ResolveGlobalAnimationTimelineSurface(runtimeState)
+        : GlobalAnimationTimelineSurface{};
     const auto timelineCoordinates =
         ResolveAnimationTimelineCoordinateContext(*runtimeState);
     const float width = std::max(1.0F, railMax.x - railMin.x);
     const auto xForPosition = [&](float position) {
         const float fraction = cameraDomain
-            ? invisible_places::timing::TimelinePositionToViewFraction(
-                  cameraViewRange,
+            ? GlobalAnimationSurfaceFraction(
+                  globalSurface,
                   position)
             : timelineCoordinates.AuthoredToViewFraction(position);
         return railMin.x + width * fraction;
@@ -85284,42 +86554,29 @@ void DrawWaterFeatureRunMarkStrip(
             (x - railMin.x) / width,
             0.0F,
             1.0F);
-        if (cameraDomain &&
-            runtimeState->animationPanel.currentPath.has_value()) {
-            const auto& path =
-                runtimeState->animationPanel.currentPath.value();
-            if (invisible_places::camera::ResolveAnimationTimingLoopWindow(
-                    path)
-                    .has_value()) {
-                return invisible_places::camera::
-                    AnimationLocalToTimingLoopPosition(path, local);
-            }
-            const float cameraFrames = static_cast<float>(
-                EffectiveAnimationDurationFramesForTracks(path));
-            const float trackFrames = static_cast<float>(
-                AuthoredAnimationTrackDurationFrames(path));
-            return std::clamp(
-                local * cameraFrames / trackFrames,
-                0.0F,
-                1.0F);
+        if (cameraDomain) {
+            return GlobalAnimationSurfaceAuthoredPosition(
+                *runtimeState,
+                globalSurface,
+                GlobalAnimationSurfaceDisplayAtFraction(
+                    globalSurface,
+                    local));
         }
         return timelineCoordinates.ViewFractionToAuthored(local);
     };
     const auto displayPositions = [&](float authoredPosition) {
-        if (cameraDomain &&
-            runtimeState->animationPanel.currentPath.has_value()) {
-            return AuthoredTrackNormalizedToCameraNormalizedPositions(
-                runtimeState->animationPanel.currentPath.value(),
+        if (cameraDomain) {
+            return GlobalAnimationSurfaceDisplayPositions(
+                *runtimeState,
+                globalSurface,
                 authoredPosition);
         }
         return std::vector<float>{authoredPosition};
     };
     const auto positionInView = [&](float position) {
         return cameraDomain
-            ? invisible_places::timing::TimelinePositionIsInView(
-                  cameraViewRange,
-                  position,
-                  1.0e-4F)
+            ? position >= globalSurface.displayMinimum - 1.0e-4F &&
+                  position <= globalSurface.displayMaximum + 1.0e-4F
             : timelineCoordinates.AuthoredIsInView(position, 1.0e-4F);
     };
 
@@ -85566,11 +86823,19 @@ void DrawWaterFeatureRunMarkStrip(
             hoveredMark->id);
         if (mark != nullptr) {
             if (cameraDomain) {
+                const float authoredAtOccurrence =
+                    GlobalAnimationSurfaceAuthoredPosition(
+                        *runtimeState,
+                        globalSurface,
+                        hoveredMark->displayPosition);
                 ImGui::SetTooltip(
-                    "%s\nLoop position %.3f (%.2f s in this animation)",
+                    "%s\nLoop position %.3f (%.2f s on this view)",
                     mark->text.c_str(),
                     mark->position,
-                    hoveredMark->displayPosition * durationSeconds);
+                    globalSurface.kind ==
+                            GlobalAnimationTimelineSurfaceKind::LinkedSeam
+                        ? authoredAtOccurrence * durationSeconds
+                        : hoveredMark->displayPosition * durationSeconds);
             } else {
                 ImGui::SetTooltip(
                     "%s\nPosition %.3f (%.2f s)",
@@ -95579,6 +96844,8 @@ void DrawWaterKeyMarkerStrip(
     ImVec2 barMin,
     ImVec2 barMax) {
     const float barWidth = std::max(1.0F, barMax.x - barMin.x);
+    const auto globalSurface =
+        ResolveGlobalAnimationTimelineSurface(runtimeState);
     constexpr float kStripHeight = 9.0F;
     constexpr float kHelpGutterWidth = 22.0F;
     ImGui::SetCursorScreenPos(ImVec2{barMin.x, barMax.y + 2.0F});
@@ -95630,17 +96897,19 @@ void DrawWaterKeyMarkerStrip(
              ++keyIndex) {
             const auto& key = ordered[keyIndex];
             const auto cameraPositions =
-                runtimeState->animationPanel.currentPath.has_value()
-                    ? AuthoredTrackNormalizedToCameraNormalizedPositions(
-                          runtimeState->animationPanel.currentPath.value(),
-                          key.position)
-                    : std::vector<float>{key.position};
+                GlobalAnimationSurfaceDisplayPositions(
+                    *runtimeState,
+                    globalSurface,
+                    key.position);
             // A shared loop key may be outside this camera path, or may occur
             // more than once in an unusually long overlap window. Draw only
             // the virtual occurrences belonging to the loaded path; the
             // stored Timing Take still owns one key at one loop phase.
             for (const float cameraPosition : cameraPositions) {
-                const float x = barMin.x + barWidth * cameraPosition;
+                const float x = barMin.x + barWidth *
+                    GlobalAnimationSurfaceFraction(
+                        globalSurface,
+                        cameraPosition);
                 drawList->AddRectFilled(
                     ImVec2{x - 1.5F, stripTop},
                     ImVec2{x + 1.5F, stripTop + kStripHeight},
@@ -95734,29 +97003,29 @@ void DrawWaterKeyMarkerStrip(
                 : info != nullptr
                       ? info->label
                       : setting.settingId.c_str();
-        const float durationSeconds =
-            runtimeState->animationPanel.currentPath.has_value()
-                ? std::max(
-                      0.0F,
-                      AnimationDurationSeconds(
-                          runtimeState->animationPanel.currentPath.value()))
-                : 0.0F;
         const bool positionIsOnKey =
             std::abs(
-                runtimeState->animationPanel.scrubAmount -
-                nearest.cameraPosition) <= 1.0e-4F;
-        const bool loopPosition =
-            runtimeState->animationPanel.currentPath.has_value() &&
-            invisible_places::camera::ResolveAnimationTimingLoopWindow(
-                runtimeState->animationPanel.currentPath.value())
-                .has_value();
+                CurrentAuthoredTrackPosition(*runtimeState) -
+                nearest.position) <= 1.0e-4F;
+        const bool loopPosition = globalSurface.kind !=
+            GlobalAnimationTimelineSurfaceKind::LoadedLocal ||
+            (runtimeState->animationPanel.currentPath.has_value() &&
+             invisible_places::camera::ResolveAnimationTimingLoopWindow(
+                 runtimeState->animationPanel.currentPath.value())
+                 .has_value());
+        const float occurrenceSeconds =
+            globalSurface.kind ==
+                    GlobalAnimationTimelineSurfaceKind::LinkedSeam
+                ? nearest.position * globalSurface.durationSeconds
+                : nearest.cameraPosition *
+                      globalSurface.durationSeconds;
         ImGui::SetTooltip(
             "%s = %.3f\n%s %.4f (%.2f s)",
             settingLabel,
             nearest.value,
             loopPosition ? "Loop position" : "Position",
             nearest.position,
-            nearest.cameraPosition * durationSeconds);
+            occurrenceSeconds);
         if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
             if (positionIsOnKey) {
                 runtimeState->animationPanel.waterKeyPositionEdit =
@@ -95770,9 +97039,9 @@ void DrawWaterKeyMarkerStrip(
                     };
                 ImGui::OpenPopup("Edit Water Key Position");
             } else {
-                runtimeState->animationPanel.scrubAmount =
-                    nearest.cameraPosition;
-                ApplyAnimationScrub(runtimeState);
+                SetGlobalAnimationSurfaceToAuthoredPosition(
+                    runtimeState,
+                    nearest.position);
             }
         }
     }
@@ -95920,6 +97189,8 @@ void DrawTimingColouriseGlobalMarkerLanes(
     if (runtimeState == nullptr || effect == nullptr) {
         return;
     }
+    const auto globalSurface =
+        ResolveGlobalAnimationTimelineSurface(runtimeState);
     struct Lane {
         const char* id;
         const char* label;
@@ -96023,11 +97294,10 @@ void DrawTimingColouriseGlobalMarkerLanes(
         const bool hovered = ImGui::IsItemHovered();
         auto* drawList = ImGui::GetWindowDrawList();
         const auto cameraPositions = [&](float trackPosition) {
-            return runtimeState->animationPanel.currentPath.has_value()
-                       ? AuthoredTrackNormalizedToCameraNormalizedPositions(
-                             runtimeState->animationPanel.currentPath.value(),
-                             trackPosition)
-                       : std::vector<float>{trackPosition};
+            return GlobalAnimationSurfaceDisplayPositions(
+                *runtimeState,
+                globalSurface,
+                trackPosition);
         };
         // Activation is stored in the shared loop domain. Shade it by
         // sampling the loaded camera window, which correctly handles a path
@@ -96039,12 +97309,12 @@ void DrawTimingColouriseGlobalMarkerLanes(
             const float local = static_cast<float>(sample) /
                 static_cast<float>(kActivationSamples);
             const float track =
-                runtimeState->animationPanel.currentPath.has_value()
-                    ? invisible_places::camera::
-                          AnimationLocalToTimingLoopPosition(
-                              runtimeState->animationPanel.currentPath.value(),
-                              local)
-                    : local;
+                GlobalAnimationSurfaceAuthoredPosition(
+                    *runtimeState,
+                    globalSurface,
+                    GlobalAnimationSurfaceDisplayAtFraction(
+                        globalSurface,
+                        local));
             const bool active = sample < kActivationSamples &&
                 invisible_places::timing::
                     TimingColouriseActivationRangeContains(
@@ -96069,7 +97339,10 @@ void DrawTimingColouriseGlobalMarkerLanes(
         for (const float boundary : {activation.start, activation.end}) {
             for (const float cameraPosition : cameraPositions(boundary)) {
                 activationBoundaryXs.push_back(
-                    barMin.x + width * cameraPosition);
+                    barMin.x + width *
+                        GlobalAnimationSurfaceFraction(
+                            globalSurface,
+                            cameraPosition));
             }
         }
         for (const float boundaryX : activationBoundaryXs) {
@@ -96088,14 +97361,13 @@ void DrawTimingColouriseGlobalMarkerLanes(
         float nearestDistance =
             std::numeric_limits<float>::max();
         float nearestPosition = 0.0F;
-        float nearestCameraPosition = 0.0F;
         for (const float keyPosition : lane.positions) {
             for (const float keyCameraPosition :
                  cameraPositions(keyPosition)) {
-                const float x = barMin.x + width * std::clamp(
-                    keyCameraPosition,
-                    0.0F,
-                    1.0F);
+                const float x = barMin.x + width *
+                    GlobalAnimationSurfaceFraction(
+                        globalSurface,
+                        keyCameraPosition);
                 auto markerColour = lane.colour;
                 if (!invisible_places::timing::
                         TimingColouriseActivationRangeContains(
@@ -96117,15 +97389,14 @@ void DrawTimingColouriseGlobalMarkerLanes(
                 if (distance < nearestDistance) {
                     nearestDistance = distance;
                     nearestPosition = keyPosition;
-                    nearestCameraPosition = keyCameraPosition;
                 }
             }
         }
         if (hovered && nearestDistance <= 6.0F) {
             const bool onKey =
                 std::abs(
-                    runtimeState->animationPanel.scrubAmount -
-                    nearestCameraPosition) <=
+                    CurrentAuthoredTrackPosition(*runtimeState) -
+                    nearestPosition) <=
                 invisible_places::timing::
                     kTimingColouriseKeyTolerance;
             ImGui::SetTooltip(
@@ -96152,9 +97423,9 @@ void DrawTimingColouriseGlobalMarkerLanes(
                     ImGui::OpenPopup(
                         "Edit Effect Key Position");
                 } else {
-                    runtimeState->animationPanel.scrubAmount =
-                        nearestCameraPosition;
-                    ApplyAnimationScrub(runtimeState);
+                    SetGlobalAnimationSurfaceToAuthoredPosition(
+                        runtimeState,
+                        nearestPosition);
                 }
             }
         } else if (hovered) {
@@ -96468,11 +97739,14 @@ std::size_t RemoveTimingEffectRelevantKeysAtPosition(
 }
 
 void DrawAnimationTimelineViewBoundsOverlay(
-    const PreviewRuntimeState& runtimeState,
+    PreviewRuntimeState* runtimeState,
     ImVec2 barMin,
     ImVec2 barMax) {
+    if (runtimeState == nullptr) {
+        return;
+    }
     const auto coordinates =
-        ResolveAnimationTimelineCoordinateContext(runtimeState);
+        ResolveAnimationTimelineCoordinateContext(*runtimeState);
     if (coordinates.IsFull()) {
         return;
     }
@@ -96480,6 +97754,8 @@ void DrawAnimationTimelineViewBoundsOverlay(
     auto* drawList = ImGui::GetWindowDrawList();
     constexpr int kSamples = 256;
     const ImU32 boundaryColour = IM_COL32(245, 185, 82, 225);
+    const auto surface =
+        ResolveGlobalAnimationTimelineSurface(runtimeState);
     bool previousInside = false;
     for (int sample = 0; sample < kSamples; ++sample) {
         const float local0 = static_cast<float>(sample) /
@@ -96487,11 +97763,12 @@ void DrawAnimationTimelineViewBoundsOverlay(
         const float local1 = static_cast<float>(sample + 1) /
             static_cast<float>(kSamples);
         const float localMid = (local0 + local1) * 0.5F;
-        const float track = runtimeState.animationPanel.currentPath.has_value()
-            ? invisible_places::camera::AnimationLocalToTimingLoopPosition(
-                  runtimeState.animationPanel.currentPath.value(),
-                  localMid)
-            : localMid;
+        const float track = GlobalAnimationSurfaceAuthoredPosition(
+            *runtimeState,
+            surface,
+            GlobalAnimationSurfaceDisplayAtFraction(
+                surface,
+                localMid));
         const bool inside = coordinates.AuthoredIsInView(track);
         const float x0 = barMin.x + width * local0;
         const float x1 = barMin.x + width * local1;
@@ -97129,6 +98406,8 @@ void DrawPinnedWaterSettingOverlays(
     if (entry == nullptr) {
         return;
     }
+    const auto globalSurface =
+        ResolveGlobalAnimationTimelineSurface(runtimeState);
     const float barWidth = std::max(1.0F, barMax.x - barMin.x);
     const float barHeight = std::max(1.0F, barMax.y - barMin.y);
     auto* drawList = ImGui::GetWindowDrawList();
@@ -97158,18 +98437,22 @@ void DrawPinnedWaterSettingOverlays(
         const float range =
             std::max(1.0e-6F, series->maximum - series->minimum);
         const bool cyclic =
-            runtimeState->animationPanel.currentPath.has_value() &&
-            invisible_places::camera::ResolveAnimationTimingLoopWindow(
-                runtimeState->animationPanel.currentPath.value())
-                .has_value();
-        const auto pointAtLocal = [&](float localPosition) {
+            globalSurface.kind !=
+                GlobalAnimationTimelineSurfaceKind::LoadedLocal ||
+            (runtimeState->animationPanel.currentPath.has_value() &&
+             invisible_places::camera::ResolveAnimationTimingLoopWindow(
+                 runtimeState->animationPanel.currentPath.value())
+                 .has_value());
+        const auto pointAtFraction = [&](float fraction) {
+            const float displayPosition =
+                GlobalAnimationSurfaceDisplayAtFraction(
+                    globalSurface,
+                    fraction);
             const float trackPosition =
-                runtimeState->animationPanel.currentPath.has_value()
-                    ? invisible_places::camera::
-                          AnimationLocalToTimingLoopPosition(
-                              runtimeState->animationPanel.currentPath.value(),
-                              localPosition)
-                    : localPosition;
+                GlobalAnimationSurfaceAuthoredPosition(
+                    *runtimeState,
+                    globalSurface,
+                    displayPosition);
             const auto sampled = cyclic
                 ? invisible_places::water::
                       EvaluateWaterKeyedSettingTrackCyclic(
@@ -97184,9 +98467,15 @@ void DrawPinnedWaterSettingOverlays(
                 0.0F,
                 1.0F);
             return ImVec2{
-                barMin.x + barWidth * localPosition,
+                barMin.x + barWidth * fraction,
                 barMax.y - kOverlayPad -
                     normalized * (barHeight - kOverlayPad * 2.0F)};
+        };
+        const auto pointAtDisplay = [&](float displayPosition) {
+            return pointAtFraction(
+                GlobalAnimationSurfaceFraction(
+                    globalSurface,
+                    displayPosition));
         };
         const int sampleCount = std::clamp(
             static_cast<int>(barWidth / 2.0F),
@@ -97194,9 +98483,9 @@ void DrawPinnedWaterSettingOverlays(
             256);
         const ImU32 colour =
             (series->colour & 0x00FFFFFFU) | 0xD2000000U;
-        ImVec2 previous = pointAtLocal(0.0F);
+        ImVec2 previous = pointAtFraction(0.0F);
         for (int sample = 1; sample <= sampleCount; ++sample) {
-            const ImVec2 current = pointAtLocal(
+            const ImVec2 current = pointAtFraction(
                 static_cast<float>(sample) /
                 static_cast<float>(sampleCount));
             drawList->AddLine(previous, current, colour, 1.5F);
@@ -97204,14 +98493,13 @@ void DrawPinnedWaterSettingOverlays(
         }
         for (const auto& key : series->track->keys) {
             const auto localPositions =
-                runtimeState->animationPanel.currentPath.has_value()
-                    ? AuthoredTrackNormalizedToCameraNormalizedPositions(
-                          runtimeState->animationPanel.currentPath.value(),
-                          key.position)
-                    : std::vector<float>{key.position};
+                GlobalAnimationSurfaceDisplayPositions(
+                    *runtimeState,
+                    globalSurface,
+                    key.position);
             for (const float localPosition : localPositions) {
                 drawList->AddCircleFilled(
-                    pointAtLocal(localPosition),
+                    pointAtDisplay(localPosition),
                     2.0F,
                     colour);
             }
@@ -97228,15 +98516,15 @@ struct TimingTrackCameraOccurrence {
 std::vector<TimingTrackCameraOccurrence>
 TimingTrackCameraOccurrences(
     const PreviewRuntimeState& runtimeState,
+    const GlobalAnimationTimelineSurface& surface,
     std::span<const float> authoredPositions) {
     std::vector<TimingTrackCameraOccurrence> occurrences;
     for (const float authored : authoredPositions) {
         const auto cameraPositions =
-            runtimeState.animationPanel.currentPath.has_value()
-                ? AuthoredTrackNormalizedToCameraNormalizedPositions(
-                      runtimeState.animationPanel.currentPath.value(),
-                      authored)
-                : std::vector<float>{authored};
+            GlobalAnimationSurfaceDisplayPositions(
+                runtimeState,
+                surface,
+                authored);
         for (const float camera : cameraPositions) {
             occurrences.push_back({
                 .authoredPosition = authored,
@@ -97274,10 +98562,9 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
     }
     const bool renderSetupReadOnly =
         RenderSetupAuthoringLocked(runtimeState);
-    const float durationSeconds =
-        std::max(0.0F, AnimationDurationSeconds(panel.currentPath.value()));
-    const std::string timeLabel =
-        FormatFixed(panel.scrubAmount * durationSeconds, 1) + "s";
+    auto globalSurface =
+        ResolveGlobalAnimationTimelineSurface(runtimeState);
+    const float durationSeconds = globalSurface.durationSeconds;
     // Leave one in-bounds, non-interactive gutter beside the global time
     // surface. Hovered Feature Run marks and Water keys expose their
     // row-specific '?' here without changing the bar/marker/curve X mapping.
@@ -97286,22 +98573,64 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
         110.0F,
         ImGui::GetContentRegionAvail().x -
             kGlobalTimingHelpGutterWidth);
+    float displayedPosition = globalSurface.displayPosition;
     const bool scrubChanged = DrawRangedFloatControl(
         "GlobalAnimationPosition",
-        &panel.scrubAmount,
-        {.visualMin = 0.0F,
-         .visualMax = 1.0F,
+        &displayedPosition,
+        {.visualMin = globalSurface.displayMinimum,
+         .visualMax = globalSurface.displayMaximum,
          .format = "%.3f",
          .showLabel = false,
          .scaleDragToWidth = true,
-         .hardMin = 0.0F,
-         .hardMax = 1.0F,
+         .hardMin = globalSurface.displayMinimum,
+         .hardMax = globalSurface.displayMaximum,
          .width = globalBarWidth});
     const ImVec2 barMin = ImGui::GetItemRectMin();
     const ImVec2 barMax = ImGui::GetItemRectMax();
     if (scrubChanged) {
-        ApplyAnimationScrub(runtimeState);
+        SetGlobalAnimationSurfacePosition(
+            runtimeState,
+            globalSurface,
+            displayedPosition);
+        globalSurface.displayPosition = displayedPosition;
     }
+    const float authoredDisplayPosition =
+        GlobalAnimationSurfaceAuthoredPosition(
+            *runtimeState,
+            globalSurface,
+            globalSurface.displayPosition);
+    const std::string timeLabel = [&] {
+        if (globalSurface.kind ==
+                GlobalAnimationTimelineSurfaceKind::LinkedSeam &&
+            globalSurface.linkedPair.has_value()) {
+            const auto cycleFrames =
+                globalSurface.linkedPair->transport.cycleFrames;
+            const auto cycleFrame = static_cast<std::uint32_t>(
+                std::llround(
+                    authoredDisplayPosition *
+                    static_cast<float>(cycleFrames))) %
+                std::max<std::uint32_t>(1U, cycleFrames);
+            return FormatFixed(globalSurface.displayPosition, 3) +
+                "  " +
+                FormatFixed(
+                    authoredDisplayPosition * durationSeconds,
+                    1) +
+                "s / " + FormatAnimationCycleClock(cycleFrames) +
+                "  f" + std::to_string(cycleFrame) + " / " +
+                std::to_string(cycleFrames);
+        }
+        const char* prefix =
+            globalSurface.kind ==
+                    GlobalAnimationTimelineSurfaceKind::LinkedMember
+                ? globalSurface.memberIndex == 0U ? "A " : "B "
+                : "";
+        return std::string{prefix} +
+            FormatFixed(globalSurface.displayPosition, 3) + "  " +
+            FormatFixed(
+                globalSurface.displayPosition * durationSeconds,
+                1) +
+            "s / " + FormatFixed(durationSeconds, 1) + "s";
+    }();
 
     invisible_places::timing::TimingColouriseEffect*
         colouriseEffect = nullptr;
@@ -97406,7 +98735,7 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
         runtimeState,
         durationSeconds);
     DrawAnimationTimelineViewBoundsOverlay(
-        *runtimeState,
+        runtimeState,
         barMin,
         barMax);
     DrawPinnedWaterSettingOverlays(runtimeState, barMin, barMax);
@@ -97429,10 +98758,11 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
     }
     const auto occurrences = TimingTrackCameraOccurrences(
         *runtimeState,
+        globalSurface,
         colouriseEffect != nullptr
             ? std::span<const float>{relevantEffectKeyPositions}
             : std::span<const float>{relevantWaterKeyPositions});
-    const float cameraScrub = std::clamp(panel.scrubAmount, 0.0F, 1.0F);
+    const float cameraScrub = globalSurface.displayPosition;
     const auto previous = [&]()
         -> std::optional<TimingTrackCameraOccurrence> {
         for (auto occurrence = occurrences.rbegin();
@@ -97488,42 +98818,79 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
             : "Palette, Controls, or Bounds";
     const std::string effectTypeLabel =
         colouriseEffect != nullptr ? "Visual Feature" : "effect";
-    const auto buttonTooltip = [](const char* text) {
+    const auto buttonTooltip = [](std::string_view text) {
         if (ImGui::IsItemHovered(
                 ImGuiHoveredFlags_DelayNormal |
                 ImGuiHoveredFlags_AllowWhenDisabled)) {
-            ImGui::SetTooltip("%s", text);
+            ImGui::SetTooltip(
+                "%.*s",
+                static_cast<int>(text.size()),
+                text.data());
         }
     };
 
     ImGui::PushID("GlobalAnimationTransport");
     if (ImGui::SmallButton("|<")) {
-        panel.scrubAmount = 0.0F;
-        ApplyAnimationScrub(runtimeState);
+        SetGlobalAnimationSurfacePosition(
+            runtimeState,
+            globalSurface,
+            globalSurface.displayMinimum);
     }
-    buttonTooltip("Go back to the start of the loaded animation.");
+    buttonTooltip(
+        globalSurface.kind ==
+                GlobalAnimationTimelineSurfaceKind::LinkedSeam
+            ? "Go to -1, the left edge of the shared signed loop. -1 and +1 are the same canonical frame."
+            : "Go back to the start of the displayed animation member.");
 
     ImGui::SameLine();
-    const bool playbackAvailable = panel.currentPath->keys.size() >= 2U;
+    const bool playbackAvailable = [&] {
+        if (!globalSurface.linkedPair.has_value()) {
+            return panel.currentPath->keys.size() >= 2U;
+        }
+        if (globalSurface.kind ==
+            GlobalAnimationTimelineSurfaceKind::LinkedMember) {
+            return globalSurface.linkedPair
+                       ->members[globalSurface.memberIndex]
+                       ->keys.size() >= 2U;
+        }
+        return std::any_of(
+            globalSurface.linkedPair->members.begin(),
+            globalSurface.linkedPair->members.end(),
+            [](const AnimationPath* path) {
+                return path != nullptr && path->keys.size() >= 2U;
+            });
+    }();
     ImGui::BeginDisabled(!playbackAvailable);
     if (ImGui::SmallButton(
             runtimeState->animationPlayback.active ? "Stop" : "Play")) {
-        ToggleAnimationPlayback(runtimeState);
+        ToggleGlobalAnimationPlayback(runtimeState);
     }
     ImGui::EndDisabled();
     buttonTooltip(
         playbackAvailable
             ? (runtimeState->animationPlayback.active
                    ? "Stop animation playback. Shortcut: Space."
-                   : "Play the loaded animation from the current position. Shortcut: Space.")
+                   : globalSurface.kind ==
+                             GlobalAnimationTimelineSurfaceKind::LinkedSeam
+                         ? ("Play the shared " +
+                            FormatAnimationCycleClock(
+                                globalSurface.linkedPair->transport
+                                    .cycleFrames) +
+                            " loop (" +
+                            std::to_string(
+                                globalSurface.linkedPair->transport
+                                    .cycleFrames) +
+                            " frames) continuously from this canonical frame. Shortcut: Space.")
+                         : "Play the displayed animation member from the current local position. Shortcut: Space.")
             : "Playback requires a loaded animation with at least two camera keys.");
 
     const float navigationGap = ImGui::GetStyle().ItemSpacing.x * 3.0F;
     ImGui::SameLine(0.0F, navigationGap);
     ImGui::BeginDisabled(!previous.has_value());
     if (ImGui::SmallButton("<")) {
-        panel.scrubAmount = previous->cameraPosition;
-        ApplyAnimationScrub(runtimeState);
+        SetGlobalAnimationSurfaceToAuthoredPosition(
+            runtimeState,
+            previous->authoredPosition);
     }
     ImGui::EndDisabled();
     const std::string previousTooltip =
@@ -97553,8 +98920,9 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
     ImGui::SameLine(0.0F, 2.0F);
     ImGui::BeginDisabled(!next.has_value());
     if (ImGui::SmallButton(">")) {
-        panel.scrubAmount = next->cameraPosition;
-        ApplyAnimationScrub(runtimeState);
+        SetGlobalAnimationSurfaceToAuthoredPosition(
+            runtimeState,
+            next->authoredPosition);
     }
     ImGui::EndDisabled();
     const std::string nextTooltip =
@@ -97837,6 +99205,7 @@ void DrawControlsWindow(
                 screenUpDirection);
             runtimeState->cameraPlayback.active = false;
             runtimeState->animationPlayback.active = false;
+            (void)DetachAnimationLinkedPresentationCamera(runtimeState);
             runtimeState->cameraInteraction.trackballOrbitActive = false;
             runtimeState->cameraInteraction.lastNavigationInputAt =
                 std::chrono::steady_clock::now();
@@ -97936,6 +99305,7 @@ void DrawControlsWindow(
         if (toggleParallel) {
             runtimeState->camera.SetParallelProjection(
                 !parallelProjection);
+            (void)DetachAnimationLinkedPresentationCamera(runtimeState);
             runtimeState->statusMessage =
                 parallelProjection
                     ? "Perspective projection enabled."
@@ -98968,6 +100338,13 @@ void UpdateCameraFromInput(
             runtimeState->statusMessage =
                 "Playing animation timing with the inspection camera preserved.";
         }
+        if (DetachAnimationLinkedPresentationCamera(runtimeState)) {
+            if (!runtimeState->animationPlayback.active) {
+                runtimeState->statusMessage =
+                    "Linked camera detached for inspection. Scrub or choose Seam/A/B to reattach.";
+                runtimeState->errorMessage.clear();
+            }
+        }
     }
     runtimeState->cameraInteraction.navigationActive =
         navigatedThisFrame ||
@@ -99648,7 +101025,7 @@ bool PreviewLiveVisualEffectsRequireSceneRedraw(
         overlay = invisible_places::water::BuildWaterFeatureTimingOverlay(
             entry->waterFeatureTimingRuns,
             CurrentAuthoredTrackPosition(runtimeState),
-            /*cyclic=*/false,
+            CurrentAnimationTimingIsCyclic(runtimeState),
             entry->onlyShowWaterFeaturesInRuns);
         overlayPtr = &overlay;
         invisible_places::water::ApplyWaterFeatureTimingOverlayToRainSettings(
@@ -113722,8 +115099,17 @@ int Application::Run(ApplicationRunOptions options) const {
                             &runtimeState,
                             uiViewportWidth);
                     if (linkedSeamedComparison.has_value()) {
+                        comparisonCamera =
+                            &linkedSeamedComparison->cameraStates[0U];
+                    }
+                    if (linkedSeamedComparison.has_value() &&
+                        linkedSeamedComparison->sourceCount == 2U) {
                         auto& linkedView = runtimeState.animationPanel
                             .linkedSeamedView;
+                        if (linkedView.temporalHistoryResetRequested) {
+                            viewport->SetTemporalCameraOverlay(false);
+                            linkedView.temporalHistoryResetRequested = false;
+                        }
                         comparisonMatrices =
                             AnimationCameraComparisonMatrices(
                                 linkedSeamedComparison->cameraStates,
@@ -113766,11 +115152,21 @@ int Application::Run(ApplicationRunOptions options) const {
                                 TemporalCameraCompositionMode::Split,
                             splitCenter,
                             currentSourcePrimary);
+                    } else if (linkedSeamedComparison.has_value()) {
+                        // A selected member, or a Seam frame with a sole
+                        // owner, is a normal full-screen camera override.
+                        // Temporal alternation is reserved for two exact
+                        // sources only.
+                        viewport->SetTemporalCameraOverlay(false);
+                        runtimeState.animationPanel.linkedSeamedView
+                            .temporalHistoryResetRequested = false;
                     }
                 }
                 if (!comparison.has_value() &&
                     !linkedSeamedComparison.has_value()) {
                     viewport->SetTemporalCameraOverlay(false);
+                    runtimeState.animationPanel.linkedSeamedView
+                        .temporalHistoryResetRequested = false;
                 }
                 auto renderState = BuildRenderState(
                     runtimeState,

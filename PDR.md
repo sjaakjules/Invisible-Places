@@ -335,6 +335,57 @@ the take's keys, handles, setting clips, scene states, or Rain profile. The
 full-loop editor shall remain available immediately after assignment, and Save
 or Discard shall keep the two animation selections together.
 
+#### FR-CAM-21
+Every valid reciprocal pair shall expose a session-only **Seam / A / B** view
+selector above Global Animation Position. A and B identity shall be established
+by lexical order of the normalized full animation file paths and shall remain
+stable whichever member is loaded; this display identity is independent of
+which member owns shared cycle frame zero. Seam mode shall display the existing
+hard-split compositor wherever both exact reciprocal occurrences are available
+and the available single member elsewhere. A and B mode shall isolate only that
+finite member. Switching mode shall preserve the canonical cycle frame and
+matched visual pose while changing the displayed position to the selected
+member's local coordinate. An unavailable member occurrence shall not be
+manufactured by clamping to an endpoint. This selector shall remain independent
+of the compiled linked-animation **Live Camera** Overlay/A/B facility and shall
+not change that facility's saved behavior.
+
+The canonical Seam position shall use the signed `-1..1` cycle. Signed zero
+shall be the midpoint of lexical member A's start / member B's end overlap.
+Signed `-1` and `+1` shall be equivalent copies of the midpoint of A's end /
+B's start overlap. Conversion to either local member shall use its exact saved
+timing window; where a synthetic timing window admits repeated local
+occurrences, resolution shall choose the occurrence nearest the previous local
+playhead. The selected view and local-display projection shall not be written
+to project or animation documents.
+
+#### FR-CAM-22
+The linked Global Animation Position shall provide one pair-keyed cyclic focus
+lens over the canonical signed `-1..1` domain. A narrowed lens shall be able to
+span zero or wrap through the equivalent `-1` / `+1` boundary, and all Water,
+Timing, and visual-setting key timelines shall use that same focused
+canonical interval. Selecting A or B shall not rebase the lens to that member's
+local `0..1` duration. The lens shall initialize to the full range for a
+different canonical pair, remain session-only, and never be serialized.
+
+#### FR-CAM-23
+Seam-mode playback shall wrap and loop over the complete unique reciprocal
+cycle. A-only and B-only playback shall remain finite, preserve that member's
+saved local timing window, and stop at its local end instead of wrapping into
+the partner. Live preview and immutable/frozen export evaluation shall map the
+same canonical cycle phase into the shared Timing Take and visual state.
+Virtual previous- and next-cycle keys shall preserve values and derivatives at
+phase zero and at both local path boundaries. A member export shall continue to
+use its saved local start/end frames; the view mode and canonical transport
+shall not extend or replace its output bounds.
+
+The production acceptance pair `Proj_A_09S01` / `Proj_B_09S01` shall be treated
+as an existing exact four-minute loop at 30 fps: member durations 6,868 and
+6,230 frames, less reciprocal overlaps 3,080 and 2,818 frames, yield
+`6,868 + 6,230 - 3,080 - 2,818 = 7,200` unique frames. No `09S02` retimed copies
+are required for that pair. The optional wizard 4:00 fit in FR-CAM-20 remains
+available for other pairs whose unique duration is not already 7,200 frames.
+
 ### 5.4 Side Panel Behaviour
 #### FR-UI-1
 The application shall include a side panel for render and style controls.
