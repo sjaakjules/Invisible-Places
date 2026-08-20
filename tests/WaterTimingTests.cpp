@@ -126,6 +126,163 @@ TEST_CASE(
     CHECK(TimelineViewRangeIsFull(nonFinite));
 }
 
+TEST_CASE(
+    "Signed cyclic timeline views cross the seam as a short interval",
+    "[water][timing][timeline-view]") {
+    using invisible_places::timing::CyclicTimelineEquivalentPositionNear;
+    using invisible_places::timing::CyclicTimelineFullViewRange;
+    using invisible_places::timing::CyclicTimelinePanViewRange;
+    using invisible_places::timing::CyclicTimelinePositionIsInView;
+    using invisible_places::timing::CyclicTimelinePositionToViewFraction;
+    using invisible_places::timing::
+        CyclicTimelineViewFractionToUnwrappedPosition;
+    using invisible_places::timing::CyclicTimelineViewRangeEnd;
+    using invisible_places::timing::CyclicTimelineViewRangeFromEndpoints;
+    using invisible_places::timing::CyclicTimelineViewRangeIsFull;
+    using invisible_places::timing::CyclicTimelineViewRangeSegments;
+    using invisible_places::timing::CyclicTimelineWrapPosition;
+    using invisible_places::timing::
+        kLinkedSignedCyclicTimelineViewDomain;
+
+    constexpr auto domain = kLinkedSignedCyclicTimelineViewDomain;
+    const auto full = CyclicTimelineFullViewRange(domain);
+    CHECK(full.start == Approx(-1.0F));
+    CHECK(full.span == Approx(2.0F));
+    CHECK(CyclicTimelineViewRangeIsFull(full, domain));
+    CHECK(CyclicTimelineWrapPosition(1.0F, domain) == Approx(-1.0F));
+    CHECK(CyclicTimelineWrapPosition(1.1F, domain) == Approx(-0.9F));
+    CHECK(CyclicTimelinePositionToViewFraction(full, -1.0F, domain) ==
+          Approx(0.0F));
+    CHECK(CyclicTimelinePositionToViewFraction(full, 1.0F, domain) ==
+          Approx(1.0F));
+
+    // Endpoint lifting follows the nearest unwrapped handle. Exact
+    // half-period ties preserve the caller's -1 or +1 endpoint copy.
+    CHECK(CyclicTimelineEquivalentPositionNear(-0.9F, 1.0F, domain) ==
+          Approx(1.1F));
+    CHECK(CyclicTimelineEquivalentPositionNear(0.9F, -1.0F, domain) ==
+          Approx(-1.1F));
+    CHECK(CyclicTimelineEquivalentPositionNear(-1.0F, 0.0F, domain) ==
+          Approx(-1.0F));
+    CHECK(CyclicTimelineEquivalentPositionNear(1.0F, 0.0F, domain) ==
+          Approx(1.0F));
+
+    const auto wrapped = CyclicTimelineViewRangeFromEndpoints(
+        0.9F,
+        -0.9F,
+        domain);
+    CHECK(wrapped.start == Approx(0.9F));
+    CHECK(wrapped.span == Approx(0.2F));
+    CHECK(CyclicTimelineViewRangeEnd(wrapped) == Approx(1.1F));
+    CHECK_FALSE(CyclicTimelineViewRangeIsFull(wrapped, domain));
+
+    const auto segments = CyclicTimelineViewRangeSegments(wrapped, domain);
+    REQUIRE(segments.count == 2U);
+    CHECK(segments[0U].start == Approx(0.9F));
+    CHECK(segments[0U].end == Approx(1.0F));
+    CHECK(segments[1U].start == Approx(-1.0F));
+    CHECK(segments[1U].end == Approx(-0.9F));
+
+    CHECK(CyclicTimelinePositionIsInView(wrapped, 0.9F, domain));
+    CHECK(CyclicTimelinePositionIsInView(wrapped, 1.0F, domain));
+    CHECK(CyclicTimelinePositionIsInView(wrapped, -1.0F, domain));
+    CHECK(CyclicTimelinePositionIsInView(wrapped, -0.9F, domain));
+    CHECK_FALSE(CyclicTimelinePositionIsInView(wrapped, -0.7F, domain));
+    CHECK_FALSE(CyclicTimelinePositionIsInView(wrapped, 0.0F, domain));
+
+    CHECK(CyclicTimelinePositionToViewFraction(wrapped, 0.9F, domain) ==
+          Approx(0.0F));
+    CHECK(CyclicTimelinePositionToViewFraction(wrapped, 1.0F, domain) ==
+          Approx(0.5F));
+    CHECK(CyclicTimelinePositionToViewFraction(wrapped, -1.0F, domain) ==
+          Approx(0.5F));
+    CHECK(CyclicTimelinePositionToViewFraction(wrapped, -0.9F, domain) ==
+          Approx(1.0F));
+
+    // Display samples stay unwrapped for continuous drawing, then wrap back
+    // to canonical signed coordinates without changing their view fraction.
+    for (const float fraction : {0.0F, 0.25F, 0.5F, 0.75F, 1.0F}) {
+        const float unwrapped =
+            CyclicTimelineViewFractionToUnwrappedPosition(
+                wrapped,
+                fraction,
+                domain);
+        const float canonical =
+            CyclicTimelineWrapPosition(unwrapped, domain);
+        CHECK(CyclicTimelinePositionToViewFraction(
+                  wrapped,
+                  canonical,
+                  domain) == Approx(fraction).margin(1.0e-5F));
+    }
+    CHECK(CyclicTimelineViewFractionToUnwrappedPosition(
+              wrapped,
+              1.0F,
+              domain) == Approx(1.1F));
+
+    // A +0.2 body pan wraps +0.9 to -0.9 without changing the lens width.
+    const auto panned = CyclicTimelinePanViewRange(wrapped, 0.2F, domain);
+    CHECK(panned.start == Approx(-0.9F));
+    CHECK(panned.span == Approx(0.2F));
+    CHECK(CyclicTimelineViewRangeEnd(panned) == Approx(-0.7F));
+    const auto pannedSegments =
+        CyclicTimelineViewRangeSegments(panned, domain);
+    REQUIRE(pannedSegments.count == 1U);
+    CHECK(pannedSegments[0U].start == Approx(-0.9F));
+    CHECK(pannedSegments[0U].end == Approx(-0.7F));
+
+    const auto explicitFull = CyclicTimelineViewRangeFromEndpoints(
+        -1.0F,
+        1.0F,
+        domain);
+    CHECK(CyclicTimelineViewRangeIsFull(explicitFull, domain));
+    CHECK(explicitFull.start == Approx(-1.0F));
+    CHECK(explicitFull.span == Approx(2.0F));
+    const auto pannedFull =
+        CyclicTimelinePanViewRange(full, 0.6F, domain);
+    CHECK(pannedFull.start == Approx(-1.0F));
+    CHECK(pannedFull.span == Approx(2.0F));
+}
+
+TEST_CASE(
+    "Timeline view sanitization is stable for cyclic invalid and tiny spans",
+    "[water][timing][timeline-view]") {
+    using invisible_places::timing::CyclicTimelineSanitizeViewRange;
+    using invisible_places::timing::CyclicTimelineViewRangeFromEndpoints;
+    using invisible_places::timing::CyclicTimelineViewRangeIsFull;
+    using invisible_places::timing::
+        kLinkedSignedCyclicTimelineViewDomain;
+
+    constexpr auto domain = kLinkedSignedCyclicTimelineViewDomain;
+    const auto nonFinite = CyclicTimelineSanitizeViewRange(
+        {std::numeric_limits<float>::quiet_NaN(),
+         std::numeric_limits<float>::infinity()},
+        domain);
+    CHECK(CyclicTimelineViewRangeIsFull(nonFinite, domain));
+    CHECK(nonFinite.start == Approx(-1.0F));
+    CHECK(nonFinite.span == Approx(2.0F));
+
+    const auto tiny = CyclicTimelineSanitizeViewRange(
+        {.start = 1.4F, .span = 0.0F},
+        domain,
+        0.05F);
+    CHECK(tiny.start == Approx(-0.6F));
+    CHECK(tiny.span == Approx(0.05F));
+
+    const auto coincident = CyclicTimelineViewRangeFromEndpoints(
+        0.25F,
+        0.25F,
+        domain,
+        0.05F);
+    CHECK(coincident.start == Approx(0.25F));
+    CHECK(coincident.span == Approx(0.05F));
+
+    const auto oversized = CyclicTimelineSanitizeViewRange(
+        {.start = 0.4F, .span = 4.0F},
+        domain);
+    CHECK(oversized.start == Approx(-1.0F));
+    CHECK(oversized.span == Approx(2.0F));
+}
+
 TEST_CASE("Timing run evaluation holds endpoints and interpolates", "[water][timing]") {
     const auto run = Run(
         WaterTimingFeature::Rain,

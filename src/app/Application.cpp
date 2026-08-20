@@ -397,6 +397,9 @@ struct PreservedAnimationRuntimeState {
     std::vector<PreservedAnimationEdit> edits;
     float scrubAmount = 0.0F;
     invisible_places::timing::TimelineViewRange timelineViewRange{};
+    invisible_places::timing::CyclicTimelineViewRange
+        linkedTimelineViewRange{};
+    std::string linkedTimelineViewPairId;
     bool dirty = false;
 };
 
@@ -1066,6 +1069,13 @@ struct AnimationTimelineViewDragState {
     invisible_places::timing::TimelineViewRange originalRange{};
 };
 
+struct AnimationCyclicTimelineViewDragState {
+    AnimationTimelineViewDragPart part =
+        AnimationTimelineViewDragPart::Body;
+    float mouseStartX = 0.0F;
+    invisible_places::timing::CyclicTimelineViewRange originalRange{};
+};
+
 enum class AnimationLoopDiagnosticsStatus : std::uint8_t {
     Baseline = 0,
     Applied,
@@ -1575,6 +1585,15 @@ struct AnimationPanelState {
     // keys use the same normalized 0..1 domain as the complete animation.
     invisible_places::timing::TimelineViewRange timelineViewRange{};
     std::optional<AnimationTimelineViewDragState> timelineViewDrag;
+    // Reciprocal pairs with one shared Timing Take use the stable signed
+    // whole-loop domain from the extension wizard. It remains independent of
+    // the ordinary 0..1 lens so switching unrelated animations cannot inherit
+    // a cyclic range.
+    invisible_places::timing::CyclicTimelineViewRange
+        linkedTimelineViewRange{};
+    std::string linkedTimelineViewPairId;
+    std::optional<AnimationCyclicTimelineViewDragState>
+        linkedTimelineViewDrag;
     // Session-only override shared by the Water and Timings feature
     // timelines. Ordinarily those timelines follow the animation camera only
     // while the live view still matches the current animation frame, allowing
@@ -1632,6 +1651,7 @@ struct TimingColouriseActivationDragState {
     TimingColouriseActivationDragPart part =
         TimingColouriseActivationDragPart::Body;
     float mouseStartX = 0.0F;
+    float grabOffsetPixels = 0.0F;
     float originalStart = 0.0F;
     float originalEnd = 1.0F;
 };
@@ -14850,6 +14870,9 @@ void UnloadCurrentAnimationForWaterEditing(PreviewRuntimeState* runtimeState) {
     runtimeState->animationPanel.scrubAmount = 0.0F;
     runtimeState->animationPanel.timelineViewRange = {};
     runtimeState->animationPanel.timelineViewDrag.reset();
+    runtimeState->animationPanel.linkedTimelineViewRange = {};
+    runtimeState->animationPanel.linkedTimelineViewPairId.clear();
+    runtimeState->animationPanel.linkedTimelineViewDrag.reset();
     runtimeState->animationPanel.dirty = false;
     runtimeState->animationPanel.requestedMatchingFrameGhostCapture.reset();
     runtimeState->animationPanel.requestedMatchingFrameGhostClear =
@@ -24541,6 +24564,9 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->animationPanel.scrubAmount = 0.0F;
     runtimeState->animationPanel.timelineViewRange = {};
     runtimeState->animationPanel.timelineViewDrag.reset();
+    runtimeState->animationPanel.linkedTimelineViewRange = {};
+    runtimeState->animationPanel.linkedTimelineViewPairId.clear();
+    runtimeState->animationPanel.linkedTimelineViewDrag.reset();
     runtimeState->animationPanel.dirty = false;
     if (runtimeState->animationMatchingFrameGhostJob.worker.joinable()) {
         runtimeState->animationMatchingFrameGhostJob.worker.request_stop();
@@ -25277,6 +25303,11 @@ PreservedAnimationRuntimeState CaptureAnimationRuntimeState(
         .timelineViewRange =
             invisible_places::timing::SanitizeTimelineViewRange(
                 runtimeState.animationPanel.timelineViewRange),
+        .linkedTimelineViewRange = invisible_places::timing::
+            CyclicTimelineSanitizeViewRange(
+                runtimeState.animationPanel.linkedTimelineViewRange),
+        .linkedTimelineViewPairId =
+            runtimeState.animationPanel.linkedTimelineViewPairId,
         .dirty = runtimeState.animationPanel.dirty,
     };
     const auto& panel = runtimeState.animationPanel;
@@ -25406,6 +25437,12 @@ void RestoreAnimationRuntimeState(
         invisible_places::timing::SanitizeTimelineViewRange(
             state.timelineViewRange);
     panel.timelineViewDrag.reset();
+    panel.linkedTimelineViewRange = invisible_places::timing::
+        CyclicTimelineSanitizeViewRange(
+            state.linkedTimelineViewRange);
+    panel.linkedTimelineViewPairId =
+        std::move(state.linkedTimelineViewPairId);
+    panel.linkedTimelineViewDrag.reset();
     panel.dirty = state.dirty;
     panel.preparedPathCache = {};
     panel.motionStatsCache = {};
@@ -28252,6 +28289,9 @@ bool LoadAnimationPathVariant(
     panel.scrubAmount = 0.0F;
     panel.timelineViewRange = {};
     panel.timelineViewDrag.reset();
+    // The signed lens belongs to the reciprocal loop, so choosing its other
+    // member must not lose the focused canonical interval.
+    panel.linkedTimelineViewDrag.reset();
     panel.previewDepthOfField = false;
     RequestAnimationLiveViewWindowSize(
         runtimeState,
@@ -80025,6 +80065,281 @@ bool WaterTimingRunAppliedToCurrentAnimation(
     return false;
 }
 
+// Timing Takes continue to store authored positions on their canonical 0..1
+// cycle. This UI-only context maps those positions onto the stable lexical
+// signed loop used by reciprocal A/B pairs. Resolution is deliberately
+// fail-closed: a missing partner, invalid transport, or differing/empty take
+// id leaves the existing unlinked 0..1 editor behavior untouched.
+struct AnimationTimelineCoordinateContext {
+    bool linkedCyclic = false;
+    std::string pairId;
+    invisible_places::camera::AnimationReciprocalLoopTransport transport{};
+    std::size_t currentMemberIndex = 0U;
+    invisible_places::timing::TimelineViewRange unlinkedRange{};
+    invisible_places::timing::CyclicTimelineViewRange linkedRange{};
+
+    [[nodiscard]] float AuthoredToDisplay(float authoredPosition) const {
+        if (!linkedCyclic) {
+            return authoredPosition;
+        }
+        return static_cast<float>(invisible_places::camera::
+            AnimationReciprocalLoopCyclePhaseToSignedPosition(
+                transport,
+                static_cast<double>(authoredPosition)));
+    }
+
+    [[nodiscard]] float DisplayToAuthored(float displayPosition) const {
+        if (!linkedCyclic) {
+            return std::clamp(displayPosition, 0.0F, 1.0F);
+        }
+        const double phase = invisible_places::camera::
+            AnimationReciprocalLoopSignedPositionToCyclePhase(
+                transport,
+                static_cast<double>(displayPosition));
+        return static_cast<float>(std::clamp(phase, 0.0, 1.0));
+    }
+
+    [[nodiscard]] bool AuthoredIsInView(
+        float authoredPosition,
+        float tolerance =
+            invisible_places::timing::kMinimumTimelineViewSpan) const {
+        if (!linkedCyclic) {
+            return invisible_places::timing::TimelinePositionIsInView(
+                unlinkedRange,
+                authoredPosition,
+                tolerance);
+        }
+        return invisible_places::timing::CyclicTimelinePositionIsInView(
+            linkedRange,
+            AuthoredToDisplay(authoredPosition),
+            invisible_places::timing::
+                kLinkedSignedCyclicTimelineViewDomain,
+            tolerance);
+    }
+
+    [[nodiscard]] float AuthoredToViewFraction(
+        float authoredPosition) const {
+        if (!linkedCyclic) {
+            return invisible_places::timing::
+                TimelinePositionToViewFraction(
+                    unlinkedRange,
+                    authoredPosition);
+        }
+        return invisible_places::timing::
+            CyclicTimelinePositionToViewFraction(
+                linkedRange,
+                AuthoredToDisplay(authoredPosition));
+    }
+
+    [[nodiscard]] float ViewFractionToUnwrappedDisplay(
+        float fraction) const {
+        if (!linkedCyclic) {
+            return invisible_places::timing::TimelineViewFractionToPosition(
+                unlinkedRange,
+                fraction);
+        }
+        return invisible_places::timing::
+            CyclicTimelineViewFractionToUnwrappedPosition(
+                linkedRange,
+                fraction);
+    }
+
+    [[nodiscard]] float ViewFractionToAuthored(float fraction) const {
+        return DisplayToAuthored(ViewFractionToUnwrappedDisplay(fraction));
+    }
+
+    [[nodiscard]] float AuthoredDeltaBetweenDisplayPositions(
+        float fromDisplay,
+        float toDisplay) const {
+        if (!linkedCyclic) {
+            return toDisplay - fromDisplay;
+        }
+        const double cycle = static_cast<double>(transport.cycleFrames);
+        if (cycle <= 0.0) {
+            return 0.0F;
+        }
+        const double first = invisible_places::camera::
+            AnimationReciprocalLoopSignedPositionToCycleFrame(
+                transport,
+                static_cast<double>(fromDisplay));
+        const double second = invisible_places::camera::
+            AnimationReciprocalLoopSignedPositionToCycleFrame(
+                transport,
+                static_cast<double>(toDisplay));
+        double delta = second - first;
+        const double displayDelta =
+            static_cast<double>(toDisplay) -
+            static_cast<double>(fromDisplay);
+        if (displayDelta > 0.0 && delta < 0.0) {
+            delta += cycle;
+        } else if (displayDelta < 0.0 && delta > 0.0) {
+            delta -= cycle;
+        } else if (std::abs(delta) <= 1.0e-8 &&
+                   std::abs(displayDelta) >= 2.0 - 1.0e-6) {
+            delta = displayDelta > 0.0 ? cycle : -cycle;
+        }
+        return static_cast<float>(delta / cycle);
+    }
+
+    [[nodiscard]] std::vector<std::pair<float, float>>
+    AuthoredIntervalToViewFractions(
+        float authoredStart,
+        float authoredEnd) const {
+        authoredStart = std::clamp(authoredStart, 0.0F, 1.0F);
+        authoredEnd = std::clamp(authoredEnd, 0.0F, 1.0F);
+        if (authoredStart > authoredEnd) {
+            std::swap(authoredStart, authoredEnd);
+        }
+        if (!linkedCyclic) {
+            const float start = std::max(
+                authoredStart,
+                unlinkedRange.start);
+            const float end = std::min(
+                authoredEnd,
+                unlinkedRange.end);
+            if (end < start) {
+                return {};
+            }
+            return {{
+                invisible_places::timing::
+                    TimelinePositionToViewFraction(unlinkedRange, start),
+                invisible_places::timing::
+                    TimelinePositionToViewFraction(unlinkedRange, end),
+            }};
+        }
+        constexpr float kIntervalTolerance = 1.0e-6F;
+        if (authoredEnd - authoredStart >= 1.0F - kIntervalTolerance) {
+            return {{0.0F, 1.0F}};
+        }
+        const auto domain = invisible_places::timing::
+            kLinkedSignedCyclicTimelineViewDomain;
+        const float displayStart = AuthoredToDisplay(authoredStart);
+        const float displayEnd = AuthoredToDisplay(authoredEnd);
+        const float intervalSpan = invisible_places::timing::
+            CyclicTimelineForwardDistance(
+                displayStart,
+                displayEnd,
+                domain);
+        const float viewStart = linkedRange.start;
+        const float viewEnd = invisible_places::timing::
+            CyclicTimelineViewRangeEnd(linkedRange);
+        const float viewMidpoint = (viewStart + viewEnd) * 0.5F;
+        const float nearestStart = invisible_places::timing::
+            CyclicTimelineEquivalentPositionNear(
+                displayStart,
+                viewMidpoint,
+                domain);
+        std::vector<std::pair<float, float>> segments;
+        for (const float offset :
+             {-domain.period, 0.0F, domain.period}) {
+            const float intervalStart = nearestStart + offset;
+            const float intervalEnd = intervalStart + intervalSpan;
+            const float overlapStart = std::max(viewStart, intervalStart);
+            const float overlapEnd = std::min(viewEnd, intervalEnd);
+            if (overlapEnd + kIntervalTolerance < overlapStart) {
+                continue;
+            }
+            segments.emplace_back(
+                std::clamp(
+                    (overlapStart - viewStart) / linkedRange.span,
+                    0.0F,
+                    1.0F),
+                std::clamp(
+                    (overlapEnd - viewStart) / linkedRange.span,
+                    0.0F,
+                    1.0F));
+        }
+        std::sort(segments.begin(), segments.end());
+        std::vector<std::pair<float, float>> merged;
+        for (const auto& segment : segments) {
+            if (!merged.empty() &&
+                segment.first <= merged.back().second +
+                    kIntervalTolerance) {
+                merged.back().second = std::max(
+                    merged.back().second,
+                    segment.second);
+            } else {
+                merged.push_back(segment);
+            }
+        }
+        return merged;
+    }
+
+    [[nodiscard]] bool IsFull() const {
+        return linkedCyclic
+            ? invisible_places::timing::CyclicTimelineViewRangeIsFull(
+                  linkedRange)
+            : invisible_places::timing::TimelineViewRangeIsFull(
+                  unlinkedRange);
+    }
+};
+
+AnimationTimelineCoordinateContext ResolveAnimationTimelineCoordinateContext(
+    const PreviewRuntimeState& runtimeState) {
+    const auto& panel = runtimeState.animationPanel;
+    AnimationTimelineCoordinateContext result{
+        .unlinkedRange =
+            invisible_places::timing::SanitizeTimelineViewRange(
+                panel.timelineViewRange),
+        .linkedRange = invisible_places::timing::
+            CyclicTimelineSanitizeViewRange(
+                panel.linkedTimelineViewRange),
+    };
+    if (!panel.currentPath.has_value() || panel.currentFilePath.empty() ||
+        panel.currentPath->selectedTimingTakeId.empty() ||
+        !panel.currentPath->velocityBlendLink.has_value()) {
+        return result;
+    }
+    const auto currentIndex = FindAnimationRegistryIndex(
+        panel,
+        std::filesystem::path{panel.currentFilePath});
+    const auto partnerIndex = FindAnimationRegistryIndexByFileName(
+        panel,
+        panel.currentPath->velocityBlendLink->partnerFileName);
+    if (!currentIndex.has_value() || !partnerIndex.has_value() ||
+        currentIndex == partnerIndex) {
+        return result;
+    }
+    const auto* current = RegistryAnimationPath(
+        runtimeState,
+        currentIndex.value());
+    const auto* partner = RegistryAnimationPath(
+        runtimeState,
+        partnerIndex.value());
+    if (current == nullptr || partner == nullptr ||
+        current->selectedTimingTakeId.empty() ||
+        current->selectedTimingTakeId != partner->selectedTimingTakeId) {
+        return result;
+    }
+    const auto transport = invisible_places::camera::
+        ResolveAnimationReciprocalLoopTransport(
+            *current,
+            panel.availableFiles[currentIndex.value()],
+            *partner,
+            panel.availableFiles[partnerIndex.value()]);
+    if (!transport.has_value()) {
+        return result;
+    }
+    const auto currentStoredMember = std::find(
+        transport->memberInputIndices.begin(),
+        transport->memberInputIndices.end(),
+        0U);
+    if (currentStoredMember == transport->memberInputIndices.end()) {
+        return result;
+    }
+    result.linkedCyclic = true;
+    result.pairId = current->velocityBlendLink->pairId;
+    result.transport = transport.value();
+    result.currentMemberIndex = static_cast<std::size_t>(std::distance(
+        transport->memberInputIndices.begin(),
+        currentStoredMember));
+    if (panel.linkedTimelineViewPairId != result.pairId) {
+        result.linkedRange = invisible_places::timing::
+            CyclicTimelineFullViewRange();
+    }
+    return result;
+}
+
 void DrawExportBatchSection(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
@@ -81031,25 +81346,19 @@ void DrawWaterRunTimingGraph(
     const float valueAxisY = axisY - kTimeRailSeparation;
     const float graphTopY = minimum.y + 5.0F;
     const float graphHeight = std::max(1.0F, valueAxisY - graphTopY);
-    const auto viewRange =
-        invisible_places::timing::SanitizeTimelineViewRange(
-            runtimeState->animationPanel.timelineViewRange);
+    const auto timelineCoordinates =
+        ResolveAnimationTimelineCoordinateContext(*runtimeState);
     const auto positionInView = [&](float position) {
-        return invisible_places::timing::TimelinePositionIsInView(
-            viewRange,
+        return timelineCoordinates.AuthoredIsInView(
             position,
             kKeyTolerance);
     };
     const auto xForPosition = [&](float position) {
-        return minimum.x +
-               width * invisible_places::timing::
-                           TimelinePositionToViewFraction(
-                               viewRange,
-                               position);
+        return minimum.x + width *
+            timelineCoordinates.AuthoredToViewFraction(position);
     };
     const auto positionForX = [&](float x) {
-        return invisible_places::timing::TimelineViewFractionToPosition(
-            viewRange,
+        return timelineCoordinates.ViewFractionToAuthored(
             (x - minimum.x) / width);
     };
     const auto seriesRange =
@@ -81479,11 +81788,34 @@ void DrawWaterRunTimingGraph(
                 std::vector<WaterRunKeyHandle> handles =
                     command ? timings.waterRunKeySelection->keys
                             : std::vector<WaterRunKeyHandle>{};
-                const float low = std::min(anchor.position, position);
-                const float high = std::max(anchor.position, position);
+                const float anchorCoordinate =
+                    timelineCoordinates.linkedCyclic
+                        ? timelineCoordinates.AuthoredToViewFraction(
+                              anchor.position)
+                        : anchor.position;
+                const float positionCoordinate =
+                    timelineCoordinates.linkedCyclic
+                        ? timelineCoordinates.AuthoredToViewFraction(
+                              position)
+                        : position;
+                const float low = std::min(
+                    anchorCoordinate,
+                    positionCoordinate);
+                const float high = std::max(
+                    anchorCoordinate,
+                    positionCoordinate);
                 for (const auto& key : sortedKeys[index]) {
-                    if (key.position + kKeyTolerance < low ||
-                        key.position - kKeyTolerance > high) {
+                    if (timelineCoordinates.linkedCyclic &&
+                        !positionInView(key.position)) {
+                        continue;
+                    }
+                    const float keyCoordinate =
+                        timelineCoordinates.linkedCyclic
+                            ? timelineCoordinates.AuthoredToViewFraction(
+                                  key.position)
+                            : key.position;
+                    if (keyCoordinate + kKeyTolerance < low ||
+                        keyCoordinate - kKeyTolerance > high) {
                         continue;
                     }
                     const auto candidate = keyHandle(index, key.position);
@@ -82062,15 +82394,17 @@ void DrawWaterRunTimingGraph(
         40,
         160);
     std::vector<float> samplePositions;
+    std::vector<float> sampleViewFractions;
     samplePositions.reserve(static_cast<std::size_t>(sampleCount));
+    sampleViewFractions.reserve(static_cast<std::size_t>(sampleCount));
     for (int index = 0; index < sampleCount; ++index) {
+        const float fraction = sampleCount > 1
+            ? static_cast<float>(index) /
+                static_cast<float>(sampleCount - 1)
+            : 0.0F;
+        sampleViewFractions.push_back(fraction);
         samplePositions.push_back(
-            invisible_places::timing::TimelineViewFractionToPosition(
-                viewRange,
-                sampleCount > 1
-                    ? static_cast<float>(index) /
-                          static_cast<float>(sampleCount - 1)
-                    : 0.0F));
+            timelineCoordinates.ViewFractionToAuthored(fraction));
     }
 
     std::optional<std::size_t> hoveredCurveSeries;
@@ -82105,10 +82439,10 @@ void DrawWaterRunTimingGraph(
              ++sample) {
             drawList->AddLine(
                 ImVec2{
-                    xForPosition(samplePositions[sample - 1U]),
+                    minimum.x + width * sampleViewFractions[sample - 1U],
                     yForValue(lane, values[sample - 1U])},
                 ImVec2{
-                    xForPosition(samplePositions[sample]),
+                    minimum.x + width * sampleViewFractions[sample],
                     yForValue(lane, values[sample])},
                 lane.colour,
                 1.5F);
@@ -82118,7 +82452,8 @@ void DrawWaterRunTimingGraph(
                  sample < samplePositions.size();
                  ++sample) {
                 const float dx =
-                    mouse.x - xForPosition(samplePositions[sample]);
+                    mouse.x -
+                    (minimum.x + width * sampleViewFractions[sample]);
                 const float dy =
                     mouse.y - yForValue(lane, values[sample]);
                 const float distance = std::hypot(dx, dy);
@@ -82297,11 +82632,9 @@ void DrawWaterRunTimingGraph(
     }
     // Keep the shared playhead discoverable while it sits outside the zoomed
     // section by pinning it to the corresponding edge of the graph.
-    const float scrubX = xForPosition(
-        std::clamp(
-            CurrentAuthoredTrackPosition(*runtimeState),
-            viewRange.start,
-            viewRange.end));
+    const float scrubX = minimum.x + width *
+        timelineCoordinates.AuthoredToViewFraction(
+            CurrentAuthoredTrackPosition(*runtimeState));
     const float playheadTipY = graphTopY + 7.0F;
     drawList->AddLine(
         ImVec2{scrubX, playheadTipY},
@@ -83359,20 +83692,29 @@ void DrawWaterRunClipsTimeline(
     ImGui::SameLine(0.0F, 0.0F);
     ImGui::Dummy(ImVec2{kHelpGutterWidth, surfaceHeight});
     const float helpMaximumX = maximum.x + kHelpGutterWidth;
-    const auto viewRange =
-        invisible_places::timing::SanitizeTimelineViewRange(
-            runtimeState->animationPanel.timelineViewRange);
+    const auto timelineCoordinates =
+        ResolveAnimationTimelineCoordinateContext(*runtimeState);
     const auto xForPosition = [&](float position) {
-        return minimum.x +
-               width * invisible_places::timing::
-                           TimelinePositionToViewFraction(
-                               viewRange,
-                               position);
+        return minimum.x + width *
+            timelineCoordinates.AuthoredToViewFraction(position);
     };
     const auto positionForX = [&](float x) {
-        return invisible_places::timing::TimelineViewFractionToPosition(
-            viewRange,
+        return timelineCoordinates.ViewFractionToAuthored(
             (x - minimum.x) / width);
+    };
+    const auto fractionSegmentsForInterval = [&](float start, float end) {
+        return timelineCoordinates.AuthoredIntervalToViewFractions(
+            start,
+            end);
+    };
+    const auto displayPositionForX = [&](float x) {
+        return timelineCoordinates.ViewFractionToUnwrappedDisplay(
+            (x - minimum.x) / width);
+    };
+    const auto authoredDragDelta = [&](float fromX, float toX) {
+        return timelineCoordinates.AuthoredDeltaBetweenDisplayPositions(
+            displayPositionForX(fromX),
+            displayPositionForX(toX));
     };
     const auto rowTop = [&](std::size_t row) {
         return minimum.y + rowLayouts[row].topOffset;
@@ -83561,23 +83903,40 @@ void DrawWaterRunClipsTimeline(
             if (mouse.y < top || mouse.y > top + kLaneHeight) {
                 continue;
             }
-            const float x0 = xForPosition(
-                std::max(block.start, viewRange.start));
-            const float x1 = xForPosition(
-                std::min(block.end, viewRange.end));
-            if (mouse.x < x0 - 2.0F || mouse.x > x1 + 2.0F) {
+            const auto visibleSegments = fractionSegmentsForInterval(
+                block.start,
+                block.end);
+            const auto hoveredSegment = std::find_if(
+                visibleSegments.begin(),
+                visibleSegments.end(),
+                [&](const auto& segment) {
+                    const float x0 = minimum.x + width * segment.first;
+                    const float x1 = minimum.x + width * segment.second;
+                    return mouse.x >= x0 - 2.0F &&
+                        mouse.x <= x1 + 2.0F;
+                });
+            if (hoveredSegment == visibleSegments.end()) {
                 continue;
             }
+            const float x0 = minimum.x + width * hoveredSegment->first;
+            const float x1 = minimum.x + width * hoveredSegment->second;
             const float edge = std::min(
                 kEdgeGrabWidth,
                 std::max(2.0F, (x1 - x0) * 0.25F));
             WaterClipDragMode zone = WaterClipDragMode::Move;
-            if (mouse.x <= x0 + edge &&
-                block.start >= viewRange.start - 1.0e-4F) {
+            const bool startVisible =
+                timelineCoordinates.AuthoredIsInView(
+                    block.start,
+                    1.0e-4F);
+            const bool endVisible =
+                timelineCoordinates.AuthoredIsInView(
+                    block.end,
+                    1.0e-4F);
+            if (startVisible &&
+                std::abs(mouse.x - xForPosition(block.start)) <= edge) {
                 zone = WaterClipDragMode::StretchStart;
-            } else if (
-                mouse.x >= x1 - edge &&
-                block.end <= viewRange.end + 1.0e-4F) {
+            } else if (endVisible &&
+                       std::abs(mouse.x - xForPosition(block.end)) <= edge) {
                 zone = WaterClipDragMode::StretchEnd;
             }
             if (!hit.has_value() || isSelected(block.handle) ||
@@ -83691,18 +84050,22 @@ void DrawWaterRunClipsTimeline(
             }
             return std::clamp(requested, std::min(lower, upper), upper);
         };
-        const auto snapTolerance =
-            6.0F * (viewRange.end - viewRange.start) / width;
         const auto snapAdjust = [&](float value) -> std::optional<float> {
             if (ImGui::GetIO().KeyShift) {
                 return std::nullopt;
             }
-            float best = snapTolerance;
+            float bestPixels = 6.0F;
             std::optional<float> snapped;
             const auto consider = [&](float candidate) {
-                const float distance = std::abs(candidate - value);
-                if (distance < best) {
-                    best = distance;
+                if (!timelineCoordinates.AuthoredIsInView(
+                        candidate,
+                        1.0e-4F)) {
+                    return;
+                }
+                const float distancePixels = std::abs(
+                    xForPosition(candidate) - xForPosition(value));
+                if (distancePixels < bestPixels) {
+                    bestPixels = distancePixels;
                     snapped = candidate;
                 }
             };
@@ -83776,13 +84139,8 @@ void DrawWaterRunClipsTimeline(
             // Release commits whatever the last drag frame applied, then
             // resolves duplicates, retargets, and marquee selections.
             if (drag.mode == WaterClipDragMode::Marquee) {
-                const float startPosition = drag.marqueeStartPosition;
-                const float endPosition =
-                    std::clamp(positionForX(mouse.x), 0.0F, 1.0F);
-                const float lowPosition =
-                    std::min(startPosition, endPosition);
-                const float highPosition =
-                    std::max(startPosition, endPosition);
+                const float lowX = std::min(drag.mouseStartX, mouse.x);
+                const float highX = std::max(drag.mouseStartX, mouse.x);
                 const float lowY =
                     std::min(drag.mouseStartY, mouse.y);
                 const float highY =
@@ -83796,8 +84154,22 @@ void DrawWaterRunClipsTimeline(
                     if (top + kLaneHeight < lowY || top > highY) {
                         continue;
                     }
-                    if (block.end < lowPosition ||
-                        block.start > highPosition) {
+                    const auto visibleSegments =
+                        fractionSegmentsForInterval(
+                            block.start,
+                            block.end);
+                    const bool horizontallySelected = std::any_of(
+                        visibleSegments.begin(),
+                        visibleSegments.end(),
+                        [&](const auto& segment) {
+                            const float segmentStart =
+                                minimum.x + width * segment.first;
+                            const float segmentEnd =
+                                minimum.x + width * segment.second;
+                            return segmentEnd >= lowX &&
+                                segmentStart <= highX;
+                        });
+                    if (!horizontallySelected) {
                         continue;
                     }
                     if (std::find(
@@ -83831,8 +84203,7 @@ void DrawWaterRunClipsTimeline(
                     // surroundings allow it; otherwise the clip keeps the
                     // source window.
                     const float requested = clampedMoveDelta(
-                        positionForX(mouse.x - drag.grabOffsetPixels) -
-                        entry.originalStart);
+                        authoredDragDelta(drag.mouseStartX, mouse.x));
                     const auto limits = invisible_places::water::
                         WaterFeatureTimelineSpanLimits(
                             target,
@@ -83888,9 +84259,9 @@ void DrawWaterRunClipsTimeline(
             if (drag.mode != WaterClipDragMode::Marquee && drag.moved) {
                 restoreSnapshots();
                 if (drag.mode == WaterClipDragMode::Move) {
-                    const float requested =
-                        positionForX(mouse.x - drag.grabOffsetPixels) -
-                        drag.entries.front().originalStart;
+                    const float requested = authoredDragDelta(
+                        drag.mouseStartX,
+                        mouse.x);
                     float delta = 0.0F;
                     if (drag.duplicate) {
                         // Duplicates place fresh copies, so their windows
@@ -83993,7 +84364,8 @@ void DrawWaterRunClipsTimeline(
                                          : grabbedEntry->originalEnd)
                             : (fromStart ? drag.groupStart
                                          : drag.groupEnd);
-                    float target = positionForX(
+                    float target = grabbedEdge + authoredDragDelta(
+                        drag.mouseStartX - drag.grabOffsetPixels,
                         mouse.x - drag.grabOffsetPixels);
                     if (const auto snapped = snapAdjust(target);
                         snapped.has_value()) {
@@ -84166,12 +84538,17 @@ void DrawWaterRunClipsTimeline(
                     drag.duplicate =
                         ImGui::GetIO().KeyAlt &&
                         hovered->zone == WaterClipDragMode::Move;
-                    const float grabReference =
-                        hovered->zone == WaterClipDragMode::StretchEnd
-                            ? block.end
-                            : block.start;
-                    drag.grabOffsetPixels =
-                        mouse.x - xForPosition(grabReference);
+                    if (hovered->zone == WaterClipDragMode::Move) {
+                        drag.grabOffsetPixels = 0.0F;
+                    } else {
+                        const float grabReference =
+                            hovered->zone ==
+                                    WaterClipDragMode::StretchEnd
+                                ? block.end
+                                : block.start;
+                        drag.grabOffsetPixels =
+                            mouse.x - xForPosition(grabReference);
+                    }
                     drag.groupStart = 1.0F;
                     drag.groupEnd = 0.0F;
                     std::vector<WaterKeyedFeatureId> affected;
@@ -84353,8 +84730,7 @@ void DrawWaterRunClipsTimeline(
     }
     const float playheadPosition =
         CurrentAuthoredTrackPosition(*runtimeState);
-    if (invisible_places::timing::TimelinePositionIsInView(
-            viewRange,
+    if (timelineCoordinates.AuthoredIsInView(
             playheadPosition,
             1.0e-4F)) {
         const float x = xForPosition(playheadPosition);
@@ -84377,7 +84753,10 @@ void DrawWaterRunClipsTimeline(
         });
     for (const auto* blockPointer : drawBlocks) {
         const auto& block = *blockPointer;
-        if (block.end < viewRange.start || block.start > viewRange.end) {
+        const auto visibleSegments = fractionSegmentsForInterval(
+            block.start,
+            block.end);
+        if (visibleSegments.empty()) {
             continue;
         }
         const auto* timeline = timelineForFeature(block.handle.feature);
@@ -84395,11 +84774,6 @@ void DrawWaterRunClipsTimeline(
                     .value_or(featureIndices[block.row]) %
                 kWaterKeyedSettingColours.size()];
         const float top = blockTop(block.row, block.lane);
-        const float x0 = xForPosition(
-            std::max(block.start, viewRange.start));
-        const float x1 = std::max(
-            xForPosition(std::min(block.end, viewRange.end)),
-            x0 + 3.0F);
         const bool selected = isSelected(block.handle) ||
                               [&] {
                                   if (!dragMatches ||
@@ -84493,70 +84867,6 @@ void DrawWaterRunClipsTimeline(
             }
         }
         const auto converted = ImGui::ColorConvertU32ToFloat4(baseColour);
-        if (primary != nullptr) {
-            const float step = 4.0F;
-            for (float x = x0; x < x1; x += step) {
-                const float sampleEnd = std::min(x + step, x1);
-                const float position = std::clamp(
-                    positionForX((x + sampleEnd) * 0.5F),
-                    0.0F,
-                    1.0F);
-                const auto value = CurrentAnimationTimingIsCyclic(
-                                       *runtimeState)
-                    ? invisible_places::water::
-                          EvaluateWaterKeyedSettingTrackCyclic(
-                              *primary,
-                              position)
-                    : invisible_places::water::
-                          EvaluateWaterKeyedSettingTrack(
-                              *primary,
-                              position);
-                const float normalized = std::clamp(
-                    (value.value_or(valueMinimum) - valueMinimum) /
-                        std::max(1.0e-6F, valueMaximum - valueMinimum),
-                    0.0F,
-                    1.0F);
-                const float alpha =
-                    (block.ghost ? 0.10F : 0.16F) +
-                    (block.ghost ? 0.45F : 0.66F) * normalized;
-                drawList->AddRectFilled(
-                    ImVec2{x, top + 1.0F},
-                    ImVec2{sampleEnd, top + kLaneHeight - 1.0F},
-                    ImGui::ColorConvertFloat4ToU32(ImVec4{
-                        converted.x,
-                        converted.y,
-                        converted.z,
-                        alpha}));
-            }
-        } else {
-            drawList->AddRectFilled(
-                ImVec2{x0, top + 1.0F},
-                ImVec2{x1, top + kLaneHeight - 1.0F},
-                ImGui::ColorConvertFloat4ToU32(ImVec4{
-                    converted.x,
-                    converted.y,
-                    converted.z,
-                    block.ghost ? 0.14F : 0.25F}));
-        }
-        // Subtle key ticks along the bottom edge keep exact timings
-        // findable without turning the bar into a curve.
-        if (primary != nullptr) {
-            for (const auto& key : primary->keys) {
-                if (key.clipId != block.handle.clipId ||
-                    !invisible_places::timing::TimelinePositionIsInView(
-                        viewRange,
-                        key.position,
-                        1.0e-4F)) {
-                    continue;
-                }
-                const float x = xForPosition(key.position);
-                drawList->AddLine(
-                    ImVec2{x, top + kLaneHeight - 5.0F},
-                    ImVec2{x, top + kLaneHeight - 1.0F},
-                    IM_COL32(255, 255, 255, 130),
-                    1.0F);
-            }
-        }
         const ImU32 borderColour =
             selected ? IM_COL32(255, 255, 255, 235)
                      : (blockHovered
@@ -84566,56 +84876,129 @@ void DrawWaterRunClipsTimeline(
                                   converted.y,
                                   converted.z,
                                   0.9F}));
-        if (block.ghost) {
-            // Dashed outline marks the derived loose-keys block.
-            const float dash = 5.0F;
-            for (float x = x0; x < x1; x += dash * 2.0F) {
-                const float xEnd = std::min(x + dash, x1);
-                drawList->AddLine(
-                    ImVec2{x, top + 1.0F},
-                    ImVec2{xEnd, top + 1.0F},
-                    borderColour,
-                    1.0F);
-                drawList->AddLine(
-                    ImVec2{x, top + kLaneHeight - 1.0F},
-                    ImVec2{xEnd, top + kLaneHeight - 1.0F},
-                    borderColour,
-                    1.0F);
+        // A cyclic focus may split one ordered authored clip across the two
+        // visible edges. Draw each projected piece without changing storage.
+        for (const auto& visibleSegment : visibleSegments) {
+            const float x0 = minimum.x + width * visibleSegment.first;
+            const float x1 = std::max(
+                minimum.x + width * visibleSegment.second,
+                x0 + 3.0F);
+            if (primary != nullptr) {
+                const float step = 4.0F;
+                for (float x = x0; x < x1; x += step) {
+                    const float sampleEnd = std::min(x + step, x1);
+                    const float position = std::clamp(
+                        positionForX((x + sampleEnd) * 0.5F),
+                        0.0F,
+                        1.0F);
+                    const auto value = CurrentAnimationTimingIsCyclic(
+                                           *runtimeState)
+                        ? invisible_places::water::
+                              EvaluateWaterKeyedSettingTrackCyclic(
+                                  *primary,
+                                  position)
+                        : invisible_places::water::
+                              EvaluateWaterKeyedSettingTrack(
+                                  *primary,
+                                  position);
+                    const float normalized = std::clamp(
+                        (value.value_or(valueMinimum) - valueMinimum) /
+                            std::max(
+                                1.0e-6F,
+                                valueMaximum - valueMinimum),
+                        0.0F,
+                        1.0F);
+                    const float alpha =
+                        (block.ghost ? 0.10F : 0.16F) +
+                        (block.ghost ? 0.45F : 0.66F) * normalized;
+                    drawList->AddRectFilled(
+                        ImVec2{x, top + 1.0F},
+                        ImVec2{sampleEnd, top + kLaneHeight - 1.0F},
+                        ImGui::ColorConvertFloat4ToU32(ImVec4{
+                            converted.x,
+                            converted.y,
+                            converted.z,
+                            alpha}));
+                }
+            } else {
+                drawList->AddRectFilled(
+                    ImVec2{x0, top + 1.0F},
+                    ImVec2{x1, top + kLaneHeight - 1.0F},
+                    ImGui::ColorConvertFloat4ToU32(ImVec4{
+                        converted.x,
+                        converted.y,
+                        converted.z,
+                        block.ghost ? 0.14F : 0.25F}));
             }
-            drawList->AddLine(
-                ImVec2{x0, top + 1.0F},
-                ImVec2{x0, top + kLaneHeight - 1.0F},
-                borderColour,
-                1.0F);
-            drawList->AddLine(
-                ImVec2{x1, top + 1.0F},
-                ImVec2{x1, top + kLaneHeight - 1.0F},
-                borderColour,
-                1.0F);
-        } else {
-            drawList->AddRect(
-                ImVec2{x0, top + 1.0F},
-                ImVec2{x1, top + kLaneHeight - 1.0F},
-                borderColour,
-                3.0F,
-                0,
-                selected ? 2.0F : 1.0F);
-        }
-        if (x1 - x0 > 34.0F) {
-            const auto displayName = conciseBlockName(block);
-            drawList->PushClipRect(
-                ImVec2{x0 + 3.0F, top},
-                ImVec2{x1 - 3.0F, top + kLaneHeight},
-                true);
-            drawList->AddText(
-                ImVec2{x0 + 5.0F, top + 5.0F},
-                IM_COL32(0, 0, 0, 200),
-                displayName.c_str());
-            drawList->AddText(
-                ImVec2{x0 + 4.0F, top + 4.0F},
-                textColour,
-                displayName.c_str());
-            drawList->PopClipRect();
+            // Subtle key ticks along the bottom edge keep exact timings
+            // findable without turning the bar into a curve.
+            if (primary != nullptr) {
+                for (const auto& key : primary->keys) {
+                    if (key.clipId != block.handle.clipId ||
+                        !timelineCoordinates.AuthoredIsInView(
+                            key.position,
+                            1.0e-4F)) {
+                        continue;
+                    }
+                    const float x = xForPosition(key.position);
+                    drawList->AddLine(
+                        ImVec2{x, top + kLaneHeight - 5.0F},
+                        ImVec2{x, top + kLaneHeight - 1.0F},
+                        IM_COL32(255, 255, 255, 130),
+                        1.0F);
+                }
+            }
+            if (block.ghost) {
+                // Dashed outline marks the derived loose-keys block.
+                const float dash = 5.0F;
+                for (float x = x0; x < x1; x += dash * 2.0F) {
+                    const float xEnd = std::min(x + dash, x1);
+                    drawList->AddLine(
+                        ImVec2{x, top + 1.0F},
+                        ImVec2{xEnd, top + 1.0F},
+                        borderColour,
+                        1.0F);
+                    drawList->AddLine(
+                        ImVec2{x, top + kLaneHeight - 1.0F},
+                        ImVec2{xEnd, top + kLaneHeight - 1.0F},
+                        borderColour,
+                        1.0F);
+                }
+                drawList->AddLine(
+                    ImVec2{x0, top + 1.0F},
+                    ImVec2{x0, top + kLaneHeight - 1.0F},
+                    borderColour,
+                    1.0F);
+                drawList->AddLine(
+                    ImVec2{x1, top + 1.0F},
+                    ImVec2{x1, top + kLaneHeight - 1.0F},
+                    borderColour,
+                    1.0F);
+            } else {
+                drawList->AddRect(
+                    ImVec2{x0, top + 1.0F},
+                    ImVec2{x1, top + kLaneHeight - 1.0F},
+                    borderColour,
+                    3.0F,
+                    0,
+                    selected ? 2.0F : 1.0F);
+            }
+            if (x1 - x0 > 34.0F) {
+                const auto displayName = conciseBlockName(block);
+                drawList->PushClipRect(
+                    ImVec2{x0 + 3.0F, top},
+                    ImVec2{x1 - 3.0F, top + kLaneHeight},
+                    true);
+                drawList->AddText(
+                    ImVec2{x0 + 5.0F, top + 5.0F},
+                    IM_COL32(0, 0, 0, 200),
+                    displayName.c_str());
+                drawList->AddText(
+                    ImVec2{x0 + 4.0F, top + 4.0F},
+                    textColour,
+                    displayName.c_str());
+                drawList->PopClipRect();
+            }
         }
     }
     if (dragMatches && timings.waterClipDrag.has_value() &&
@@ -84884,17 +85267,17 @@ void DrawWaterFeatureRunMarkStrip(
     ImGui::Dummy(ImVec2{kHelpGutterWidth, kRailHeight});
     const ImVec2 helpMin{railMax.x, railMin.y};
     const ImVec2 helpMax{railMax.x + kHelpGutterWidth, railMax.y};
-    const auto viewRange = cameraDomain
-        ? invisible_places::timing::TimelineViewRange{}
-        : invisible_places::timing::SanitizeTimelineViewRange(
-              runtimeState->animationPanel.timelineViewRange);
+    const invisible_places::timing::TimelineViewRange cameraViewRange{};
+    const auto timelineCoordinates =
+        ResolveAnimationTimelineCoordinateContext(*runtimeState);
     const float width = std::max(1.0F, railMax.x - railMin.x);
     const auto xForPosition = [&](float position) {
-        return railMin.x +
-               width * invisible_places::timing::
-                           TimelinePositionToViewFraction(
-                               viewRange,
-                               position);
+        const float fraction = cameraDomain
+            ? invisible_places::timing::TimelinePositionToViewFraction(
+                  cameraViewRange,
+                  position)
+            : timelineCoordinates.AuthoredToViewFraction(position);
+        return railMin.x + width * fraction;
     };
     const auto authoredPositionForX = [&](float x) {
         const float local = std::clamp(
@@ -84920,8 +85303,7 @@ void DrawWaterFeatureRunMarkStrip(
                 0.0F,
                 1.0F);
         }
-        return invisible_places::timing::
-            TimelineViewFractionToPosition(viewRange, local);
+        return timelineCoordinates.ViewFractionToAuthored(local);
     };
     const auto displayPositions = [&](float authoredPosition) {
         if (cameraDomain &&
@@ -84931,6 +85313,14 @@ void DrawWaterFeatureRunMarkStrip(
                 authoredPosition);
         }
         return std::vector<float>{authoredPosition};
+    };
+    const auto positionInView = [&](float position) {
+        return cameraDomain
+            ? invisible_places::timing::TimelinePositionIsInView(
+                  cameraViewRange,
+                  position,
+                  1.0e-4F)
+            : timelineCoordinates.AuthoredIsInView(position, 1.0e-4F);
     };
 
     struct HoveredMark {
@@ -84944,11 +85334,7 @@ void DrawWaterFeatureRunMarkStrip(
         for (const auto& mark : run->marks) {
             for (const float displayPosition :
                  displayPositions(mark.position)) {
-                if (!invisible_places::timing::
-                        TimelinePositionIsInView(
-                            viewRange,
-                            displayPosition,
-                            1.0e-4F)) {
+                if (!positionInView(displayPosition)) {
                     continue;
                 }
                 const float distance =
@@ -85085,10 +85471,7 @@ void DrawWaterFeatureRunMarkStrip(
     drawList->PushClipRect(railMin, railMax, true);
     for (const auto& mark : run->marks) {
         for (const float displayPosition : displayPositions(mark.position)) {
-            if (!invisible_places::timing::TimelinePositionIsInView(
-                    viewRange,
-                    displayPosition,
-                    1.0e-4F)) {
+            if (!positionInView(displayPosition)) {
                 continue;
             }
             const float x = xForPosition(displayPosition);
@@ -85877,23 +86260,35 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                 "select several blocks at once. Right-click for "
                 "packages: save a clip once, then apply it to other "
                 "features and retime each copy independently.");
-            const auto timelineViewRange =
-                invisible_places::timing::SanitizeTimelineViewRange(
-                    runtimeState->animationPanel.timelineViewRange);
-            if (invisible_places::timing::TimelineViewRangeIsFull(
-                    timelineViewRange)) {
+            const auto timelineCoordinates =
+                ResolveAnimationTimelineCoordinateContext(*runtimeState);
+            if (timelineCoordinates.IsFull()) {
                 ImGui::TextDisabled(
-                    "View: full animation (set bounds under Global Animation Position to zoom)");
+                    timelineCoordinates.linkedCyclic
+                        ? "View: full linked loop (-1 to +1; set bounds under Global Animation Position to zoom)"
+                        : "View: full animation (set bounds under Global Animation Position to zoom)");
+            } else if (timelineCoordinates.linkedCyclic) {
+                const float end = invisible_places::timing::
+                    CyclicTimelineWrapPosition(
+                        invisible_places::timing::
+                            CyclicTimelineViewRangeEnd(
+                                timelineCoordinates.linkedRange));
+                ImGui::TextDisabled(
+                    "View: %+.4f to %+.4f on linked loop",
+                    timelineCoordinates.linkedRange.start,
+                    end);
             } else if (durationSeconds > 0.0F) {
                 ImGui::TextDisabled(
                     "View: %.2f s to %.2f s",
-                    timelineViewRange.start * durationSeconds,
-                    timelineViewRange.end * durationSeconds);
+                    timelineCoordinates.unlinkedRange.start *
+                        durationSeconds,
+                    timelineCoordinates.unlinkedRange.end *
+                        durationSeconds);
             } else {
                 ImGui::TextDisabled(
                     "View: %.4f to %.4f",
-                    timelineViewRange.start,
-                    timelineViewRange.end);
+                    timelineCoordinates.unlinkedRange.start,
+                    timelineCoordinates.unlinkedRange.end);
             }
             DrawWaterFeatureRunMarkStrip(
                 "##WaterRunMarks",
@@ -87357,43 +87752,37 @@ void DrawTimingKeyLaneGroup(
     const auto activation = invisible_places::timing::
         SanitizeTimingColouriseActivationRange(
             effect->activationRange);
+    auto timelineCoordinates =
+        ResolveAnimationTimelineCoordinateContext(*runtimeState);
     const bool activeRangeView =
+        !timelineCoordinates.linkedCyclic &&
         runtimeState->timingsPanel.colouriseTimelineView ==
             TimingColouriseTimelineView::ActiveRange &&
         activation.end - activation.start >
             invisible_places::timing::
                 kTimingColouriseKeyTolerance;
-    const float viewMinimum =
-        activeRangeView ? activation.start : 0.0F;
-    const float viewMaximum =
-        activeRangeView ? activation.end : 1.0F;
-    const float viewSpan =
-        std::max(
-            viewMaximum - viewMinimum,
+    if (!timelineCoordinates.linkedCyclic) {
+        // Preserve the established unlinked Full/Active Range switch. Linked
+        // takes instead share the animation panel's signed cyclic lens.
+        timelineCoordinates.unlinkedRange = activeRangeView
+            ? invisible_places::timing::TimelineViewRange{
+                  .start = activation.start,
+                  .end = activation.end,
+              }
+            : invisible_places::timing::TimelineViewRange{};
+    }
+    const auto positionInView = [&](float position) {
+        return timelineCoordinates.AuthoredIsInView(
+            position,
             invisible_places::timing::
                 kTimingColouriseKeyTolerance);
-    const auto positionInView = [&](float position) {
-        return position >=
-                   viewMinimum -
-                       invisible_places::timing::
-                           kTimingColouriseKeyTolerance &&
-               position <=
-                   viewMaximum +
-                       invisible_places::timing::
-                           kTimingColouriseKeyTolerance;
     };
     const auto xForPosition = [&](float position) {
-        return minimum.x +
-               width * std::clamp(
-                           (position - viewMinimum) /
-                               viewSpan,
-                           0.0F,
-                           1.0F);
+        return minimum.x + width *
+            timelineCoordinates.AuthoredToViewFraction(position);
     };
     const auto positionForX = [&](float x) {
-        return std::lerp(
-            viewMinimum,
-            viewMaximum,
+        return timelineCoordinates.ViewFractionToAuthored(
             std::clamp(
                 (x - minimum.x) / width,
                 0.0F,
@@ -87775,6 +88164,7 @@ void DrawTimingKeyLaneGroup(
         bool wrappedPalettePhase = false;
     };
     std::vector<float> graphPositions;
+    std::vector<float> graphViewFractions;
     std::vector<ValueGraph> valueGraphs;
     if (drawsValueGraph) {
         const int sampleCount = std::clamp(
@@ -87783,14 +88173,17 @@ void DrawTimingKeyLaneGroup(
             160);
         graphPositions.reserve(
             static_cast<std::size_t>(sampleCount));
+        graphViewFractions.reserve(
+            static_cast<std::size_t>(sampleCount));
         for (int index = 0; index < sampleCount; ++index) {
-            graphPositions.push_back(std::lerp(
-                viewMinimum,
-                viewMaximum,
+            const float fraction =
                 sampleCount > 1
                     ? static_cast<float>(index) /
                           static_cast<float>(sampleCount - 1)
-                    : 0.0F));
+                    : 0.0F;
+            graphViewFractions.push_back(fraction);
+            graphPositions.push_back(
+                timelineCoordinates.ViewFractionToAuthored(fraction));
         }
 
         const bool hasBoundsSeries = std::any_of(
@@ -87972,10 +88365,12 @@ void DrawTimingKeyLaneGroup(
             if (!graph.wrappedPalettePhase) {
                 drawList->AddLine(
                     ImVec2{
-                        xForPosition(leftPosition),
+                        minimum.x + width *
+                            graphViewFractions[index - 1U],
                         yForValue(graph, graph.values[index - 1U])},
                     ImVec2{
-                        xForPosition(rightPosition),
+                        minimum.x + width *
+                            graphViewFractions[index],
                         yForValue(graph, graph.values[index])},
                     segmentColour,
                     1.5F);
@@ -88035,16 +88430,16 @@ void DrawTimingKeyLaneGroup(
                     visibleEnd);
                 drawList->AddLine(
                     ImVec2{
-                        xForPosition(std::lerp(
-                            leftPosition,
-                            rightPosition,
-                            visibleStart)),
+                        minimum.x + width * std::lerp(
+                            graphViewFractions[index - 1U],
+                            graphViewFractions[index],
+                            visibleStart),
                         yForValue(graph, clippedLeft)},
                     ImVec2{
-                        xForPosition(std::lerp(
-                            leftPosition,
-                            rightPosition,
-                            visibleEnd)),
+                        minimum.x + width * std::lerp(
+                            graphViewFractions[index - 1U],
+                            graphViewFractions[index],
+                            visibleEnd),
                         yForValue(graph, clippedRight)},
                     colourWithOpacity(
                         segmentColour,
@@ -88060,7 +88455,8 @@ void DrawTimingKeyLaneGroup(
                 break;
             }
             const float dx = mouse.x -
-                             xForPosition(graphPositions[index]);
+                             (minimum.x + width *
+                                 graphViewFractions[index]);
             const float value = graph.values[index];
             const int firstOffset = graph.wrappedPalettePhase
                                         ? static_cast<int>(
@@ -88161,17 +88557,16 @@ void DrawTimingKeyLaneGroup(
             effect->enabled
                 ? ImVec4{0.44F, 0.70F, 0.88F, 0.44F}
                 : ImVec4{0.50F, 0.50F, 0.50F, 0.26F});
-    const float visibleActivationStart =
-        std::max(viewMinimum, activation.start);
-    const float visibleActivationEnd =
-        std::min(viewMaximum, activation.end);
-    if (visibleActivationEnd >= visibleActivationStart) {
+    for (const auto& visibleActivation :
+         timelineCoordinates.AuthoredIntervalToViewFractions(
+             activation.start,
+             activation.end)) {
         drawList->AddRectFilled(
             ImVec2{
-                xForPosition(visibleActivationStart),
+                minimum.x + width * visibleActivation.first,
                 axisY - 2.5F},
             ImVec2{
-                xForPosition(visibleActivationEnd),
+                minimum.x + width * visibleActivation.second,
                 axisY + 2.5F},
             activationColour,
             2.0F);
@@ -88263,14 +88658,14 @@ void DrawTimingKeyLaneGroup(
                 nearestSeries->colour,
                 drawnPosition));
     } else if (ImGui::IsItemHovered()) {
-        const float startDistance =
-            std::abs(
-                mouseX -
-                xForPosition(activation.start));
-        const float endDistance =
-            std::abs(
-                mouseX -
-                xForPosition(activation.end));
+        const float startDistance = positionInView(activation.start)
+            ? std::abs(
+                  mouseX - xForPosition(activation.start))
+            : std::numeric_limits<float>::max();
+        const float endDistance = positionInView(activation.end)
+            ? std::abs(
+                  mouseX - xForPosition(activation.end))
+            : std::numeric_limits<float>::max();
         const bool axisHovered =
             std::abs(mouse.y - axisY) <= kMarkerHitRadius;
         if (axisHovered &&
@@ -92879,6 +93274,14 @@ void DrawTimingColouriseTimelineZoomToggle(
     if (runtimeState == nullptr) {
         return;
     }
+    if (ResolveAnimationTimelineCoordinateContext(*runtimeState)
+            .linkedCyclic) {
+        ImGui::TextDisabled(
+            "Setting lanes follow the linked-loop focus above.");
+        DrawTimingControlTooltip(
+            "Linked animations share the signed -1 to +1 focus lens. Setting keys remain stored on their authored 0..1 phase.");
+        return;
+    }
     auto& timings = runtimeState->timingsPanel;
     bool activeRangeView =
         timings.colouriseTimelineView ==
@@ -92917,6 +93320,8 @@ void DrawTimingColouriseActivationOverview(
 
     const auto concurrency =
         BuildTimingColouriseActivationConcurrencySpans(*effects);
+    const auto timelineCoordinates =
+        ResolveAnimationTimelineCoordinateContext(*runtimeState);
     const std::size_t rendererCapacity =
         invisible_places::renderer::pointcloud::
             kTimingColouriseMaxEffects;
@@ -92977,6 +93382,9 @@ void DrawTimingColouriseActivationOverview(
         ImGuiTableFlags_SizingStretchProp |
         ImGuiTableFlags_BordersInnerV |
         ImGuiTableFlags_RowBg;
+    const char* timelineHeader = timelineCoordinates.linkedCyclic
+        ? "Active range / settings clip  -1 ............ +1"
+        : "Active range / settings clip  0 .............. 1";
     if (ImGui::BeginTable(
             "##TimingColouriseActivationOverview",
             2,
@@ -92986,14 +93394,13 @@ void DrawTimingColouriseActivationOverview(
             ImGuiTableColumnFlags_WidthFixed,
             180.0F);
         ImGui::TableSetupColumn(
-            "Active range / settings clip  0 .............. 1",
+            timelineHeader,
             ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
         ImGui::TableSetColumnIndex(0);
         ImGui::TableHeader("Visual Feature");
         ImGui::TableSetColumnIndex(1);
-        ImGui::TableHeader(
-            "Active range / settings clip  0 .............. 1");
+        ImGui::TableHeader(timelineHeader);
         DrawTimingCornerHelpMark(
             ImGui::GetWindowDrawList(),
             ImGui::GetItemRectMin(),
@@ -93139,32 +93546,64 @@ void DrawTimingColouriseActivationOverview(
                 settingsMinimum.y,
                 settingsMaximum.y);
             const auto xForPosition = [&](float position) {
-                return trackMinimumX +
-                       trackWidth * std::clamp(
-                                        position,
-                                        0.0F,
-                                        1.0F);
+                return trackMinimumX + trackWidth *
+                    timelineCoordinates.AuthoredToViewFraction(position);
             };
-            const auto positionForX = [&](float x) {
-                return std::clamp(
-                    (x - trackMinimumX) / trackWidth,
-                    0.0F,
-                    1.0F);
+            const auto pixelSegmentsForInterval =
+                [&](float start, float end) {
+                    std::vector<std::pair<float, float>> result;
+                    const auto fractions =
+                        timelineCoordinates.AuthoredIntervalToViewFractions(
+                            start,
+                            end);
+                    for (const auto& segment : fractions) {
+                        result.emplace_back(
+                            trackMinimumX + trackWidth * segment.first,
+                            trackMinimumX + trackWidth * segment.second);
+                    }
+                    return result;
+                };
+            const auto positionInView = [&](float position) {
+                return timelineCoordinates.AuthoredIsInView(
+                    position,
+                    invisible_places::timing::
+                        kTimingColouriseKeyTolerance);
+            };
+            const auto displayPositionForX = [&](float x) {
+                return timelineCoordinates.ViewFractionToUnwrappedDisplay(
+                    (x - trackMinimumX) / trackWidth);
+            };
+            const auto authoredDragDelta = [&](float fromX, float toX) {
+                return timelineCoordinates.AuthoredDeltaBetweenDisplayPositions(
+                    displayPositionForX(fromX),
+                    displayPositionForX(toX));
             };
             const auto mouse = ImGui::GetIO().MousePos;
             const bool activationHovered =
                 timelineItemHovered && mouse.y < splitY;
             const bool settingsHovered =
                 timelineItemHovered && mouse.y >= splitY;
-            const float startX =
-                xForPosition(range.start);
-            const float endX =
-                xForPosition(range.end);
+            const auto activationSegments = pixelSegmentsForInterval(
+                range.start,
+                range.end);
+            const bool startVisible = positionInView(range.start);
+            const bool endVisible = positionInView(range.end);
+            const float startX = xForPosition(range.start);
+            const float endX = xForPosition(range.end);
             constexpr float kHandleHitRadius = 7.0F;
-            const float startDistance =
-                std::abs(mouse.x - startX);
-            const float endDistance =
-                std::abs(mouse.x - endX);
+            const float startDistance = startVisible
+                ? std::abs(mouse.x - startX)
+                : std::numeric_limits<float>::max();
+            const float endDistance = endVisible
+                ? std::abs(mouse.x - endX)
+                : std::numeric_limits<float>::max();
+            const bool activationBodyHovered = std::any_of(
+                activationSegments.begin(),
+                activationSegments.end(),
+                [&](const auto& segment) {
+                    return mouse.x >= segment.first &&
+                        mouse.x <= segment.second;
+                });
             std::optional<TimingColouriseActivationDragPart>
                 hoveredPart;
             if (activationHovered) {
@@ -93182,8 +93621,7 @@ void DrawTimingColouriseActivationOverview(
                     endDistance <= kHandleHitRadius) {
                     hoveredPart =
                         TimingColouriseActivationDragPart::End;
-                } else if (
-                    mouse.x >= startX && mouse.x <= endX) {
+                } else if (activationBodyHovered) {
                     hoveredPart =
                         TimingColouriseActivationDragPart::Body;
                 }
@@ -93196,38 +93634,46 @@ void DrawTimingColouriseActivationOverview(
             std::optional<TimingColouriseSettingsClipDragPart>
                 hoveredSettingsPart;
             if (settingsHovered && settingsSpan.has_value()) {
+                const auto settingsSegments = pixelSegmentsForInterval(
+                    settingsSpan->start,
+                    settingsSpan->end);
                 const float clipStartX =
                     xForPosition(settingsSpan->start);
                 const float clipEndX =
                     xForPosition(settingsSpan->end);
+                const bool clipStartVisible =
+                    positionInView(settingsSpan->start);
+                const bool clipEndVisible =
+                    positionInView(settingsSpan->end);
                 const bool pointClip =
                     settingsSpan->start == settingsSpan->end;
                 if (pointClip) {
-                    if (std::abs(mouse.x - clipStartX) <= 5.0F) {
+                    if (clipStartVisible &&
+                        std::abs(mouse.x - clipStartX) <= 5.0F) {
                         hoveredSettingsPart =
                             TimingColouriseSettingsClipDragPart::Body;
                     }
-                } else if (
-                    mouse.x >= clipStartX - 2.0F &&
-                    mouse.x <= clipEndX + 2.0F) {
-                    const float edgeWidth = std::min(
-                        6.0F,
-                        std::max(
-                            2.0F,
-                            (clipEndX - clipStartX) * 0.25F));
-                    const float clipStartDistance =
-                        std::abs(mouse.x - clipStartX);
-                    const float clipEndDistance =
-                        std::abs(mouse.x - clipEndX);
+                } else if (std::any_of(
+                               settingsSegments.begin(),
+                               settingsSegments.end(),
+                               [&](const auto& segment) {
+                                   return mouse.x >= segment.first - 2.0F &&
+                                       mouse.x <= segment.second + 2.0F;
+                               })) {
+                    constexpr float edgeWidth = 6.0F;
+                    const float clipStartDistance = clipStartVisible
+                        ? std::abs(mouse.x - clipStartX)
+                        : std::numeric_limits<float>::max();
+                    const float clipEndDistance = clipEndVisible
+                        ? std::abs(mouse.x - clipEndX)
+                        : std::numeric_limits<float>::max();
                     if (clipStartDistance <= edgeWidth ||
                         clipEndDistance <= edgeWidth) {
                         hoveredSettingsPart =
                             clipStartDistance <= clipEndDistance
                                 ? TimingColouriseSettingsClipDragPart::Start
                                 : TimingColouriseSettingsClipDragPart::End;
-                    } else if (
-                        mouse.x >= clipStartX &&
-                        mouse.x <= clipEndX) {
+                    } else {
                         hoveredSettingsPart =
                             TimingColouriseSettingsClipDragPart::Body;
                     }
@@ -93240,11 +93686,17 @@ void DrawTimingColouriseActivationOverview(
                 selectEffect(index);
                 if (hoveredPart.has_value()) {
                     StopAnimationPlayback(runtimeState);
+                    const float grabbedX =
+                        hoveredPart.value() ==
+                                TimingColouriseActivationDragPart::End
+                            ? xForPosition(range.end)
+                            : xForPosition(range.start);
                     timings.colouriseActivationDrag =
                         TimingColouriseActivationDragState{
                             .effectId = effect.id,
                             .part = hoveredPart.value(),
                             .mouseStartX = mouse.x,
+                            .grabOffsetPixels = mouse.x - grabbedX,
                             .originalStart = range.start,
                             .originalEnd = range.end,
                         };
@@ -93283,9 +93735,9 @@ void DrawTimingColouriseActivationOverview(
                         ImGuiMouseButton_Left)) {
                     const auto& drag =
                         timings.colouriseActivationDrag.value();
-                    const float delta =
-                        (mouse.x - drag.mouseStartX) /
-                        trackWidth;
+                    const float delta = authoredDragDelta(
+                        drag.mouseStartX - drag.grabOffsetPixels,
+                        mouse.x - drag.grabOffsetPixels);
                     auto updated = range;
                     switch (drag.part) {
                         case TimingColouriseActivationDragPart::Start:
@@ -93356,7 +93808,8 @@ void DrawTimingColouriseActivationOverview(
                     const auto source = drag.sourceSpan;
                     auto destination = source;
                     const float sourceLength = source.end - source.start;
-                    const float pointerPosition = positionForX(
+                    const float delta = authoredDragDelta(
+                        drag.mouseStartX - drag.grabOffsetPixels,
                         mouse.x - drag.grabOffsetPixels);
                     switch (drag.part) {
                         case TimingColouriseSettingsClipDragPart::Start: {
@@ -93365,7 +93818,7 @@ void DrawTimingColouriseActivationOverview(
                                 invisible_places::timing::
                                     kTimingColouriseKeyTolerance);
                             destination.start = std::clamp(
-                                pointerPosition,
+                                source.start + delta,
                                 0.0F,
                                 std::max(0.0F, source.end - minimumSpan));
                             destination.end = source.end;
@@ -93378,14 +93831,14 @@ void DrawTimingColouriseActivationOverview(
                                     kTimingColouriseKeyTolerance);
                             destination.start = source.start;
                             destination.end = std::clamp(
-                                pointerPosition,
+                                source.end + delta,
                                 std::min(1.0F, source.start + minimumSpan),
                                 1.0F);
                             break;
                         }
                         case TimingColouriseSettingsClipDragPart::Body: {
                             const float destinationStart = std::clamp(
-                                pointerPosition,
+                                source.start + delta,
                                 0.0F,
                                 std::max(0.0F, 1.0F - sourceLength));
                             destination.start = destinationStart;
@@ -93480,15 +93933,19 @@ void DrawTimingColouriseActivationOverview(
                 effect.enabled
                     ? ImVec4{0.26F, 0.55F, 0.78F, 0.58F}
                     : ImVec4{0.42F, 0.42F, 0.42F, 0.24F});
-            drawList->AddRectFilled(
-                ImVec2{
-                    xForPosition(range.start),
-                    activationMinimum.y + 1.0F},
-                ImVec2{
-                    xForPosition(range.end),
-                    activationMaximum.y - 1.0F},
-                rangeColour,
-                2.0F);
+            for (const auto& segment : pixelSegmentsForInterval(
+                     range.start,
+                     range.end)) {
+                drawList->AddRectFilled(
+                    ImVec2{
+                        segment.first,
+                        activationMinimum.y + 1.0F},
+                    ImVec2{
+                        segment.second,
+                        activationMaximum.y - 1.0F},
+                    rangeColour,
+                    2.0F);
+            }
 
             const auto rangeContains =
                 [&](float position) {
@@ -93517,37 +93974,53 @@ void DrawTimingColouriseActivationOverview(
                             ? IM_COL32(230, 58, 52, 196)
                             : IM_COL32(222, 82, 72, 112);
                     if (boundaryOnly) {
-                        const float boundaryX =
-                            xForPosition(span.start);
-                        drawList->AddLine(
-                            ImVec2{
-                                boundaryX,
-                                activationMinimum.y + 1.0F},
-                            ImVec2{
-                                boundaryX,
-                                activationMaximum.y - 1.0F},
-                            concurrencyColour,
-                            beyondCapacity ? 4.0F : 3.0F);
+                        if (positionInView(span.start)) {
+                            const float boundaryX =
+                                xForPosition(span.start);
+                            drawList->AddLine(
+                                ImVec2{
+                                    boundaryX,
+                                    activationMinimum.y + 1.0F},
+                                ImVec2{
+                                    boundaryX,
+                                    activationMaximum.y - 1.0F},
+                                concurrencyColour,
+                                beyondCapacity ? 4.0F : 3.0F);
+                        }
                     } else {
-                        drawList->AddRectFilled(
-                            ImVec2{
-                                xForPosition(span.start),
-                                activationMinimum.y + 1.0F},
-                            ImVec2{
-                                xForPosition(span.end),
-                                activationMaximum.y - 1.0F},
-                            concurrencyColour,
-                            1.5F);
+                        for (const auto& segment :
+                             pixelSegmentsForInterval(
+                                 span.start,
+                                 span.end)) {
+                            drawList->AddRectFilled(
+                                ImVec2{
+                                    segment.first,
+                                    activationMinimum.y + 1.0F},
+                                ImVec2{
+                                    segment.second,
+                                    activationMaximum.y - 1.0F},
+                                concurrencyColour,
+                                1.5F);
+                        }
                     }
-                    if (activationHovered &&
-                        (boundaryOnly
-                             ? std::abs(
-                                   mouse.x -
-                                   xForPosition(span.start)) <= 4.0F
-                             : mouse.x >=
-                                       xForPosition(span.start) &&
-                                   mouse.x <=
-                                       xForPosition(span.end))) {
+                    const auto concurrencySegments = boundaryOnly
+                        ? std::vector<std::pair<float, float>>{}
+                        : pixelSegmentsForInterval(
+                              span.start,
+                              span.end);
+                    const bool concurrencyHovered = boundaryOnly
+                        ? positionInView(span.start) &&
+                              std::abs(
+                                  mouse.x - xForPosition(span.start)) <=
+                                  4.0F
+                        : std::any_of(
+                              concurrencySegments.begin(),
+                              concurrencySegments.end(),
+                              [&](const auto& segment) {
+                                  return mouse.x >= segment.first &&
+                                      mouse.x <= segment.second;
+                              });
+                    if (activationHovered && concurrencyHovered) {
                         hoveredConcurrency = &span;
                     }
                 }
@@ -93562,24 +94035,28 @@ void DrawTimingColouriseActivationOverview(
                 xForPosition(range.start);
             const float drawnEndX =
                 xForPosition(range.end);
-            drawList->AddLine(
-                ImVec2{drawnStartX, activationMinimum.y + 1.0F},
-                ImVec2{drawnStartX, activationMaximum.y - 1.0F},
-                handleColour,
-                2.0F);
-            drawList->AddLine(
-                ImVec2{drawnEndX, activationMinimum.y + 1.0F},
-                ImVec2{drawnEndX, activationMaximum.y - 1.0F},
-                handleColour,
-                2.0F);
-            drawList->AddCircleFilled(
-                ImVec2{drawnStartX, activationCentreY - 1.5F},
-                2.0F,
-                handleColour);
-            drawList->AddCircleFilled(
-                ImVec2{drawnEndX, activationCentreY + 1.5F},
-                2.0F,
-                handleColour);
+            if (positionInView(range.start)) {
+                drawList->AddLine(
+                    ImVec2{drawnStartX, activationMinimum.y + 1.0F},
+                    ImVec2{drawnStartX, activationMaximum.y - 1.0F},
+                    handleColour,
+                    2.0F);
+                drawList->AddCircleFilled(
+                    ImVec2{drawnStartX, activationCentreY - 1.5F},
+                    2.0F,
+                    handleColour);
+            }
+            if (positionInView(range.end)) {
+                drawList->AddLine(
+                    ImVec2{drawnEndX, activationMinimum.y + 1.0F},
+                    ImVec2{drawnEndX, activationMaximum.y - 1.0F},
+                    handleColour,
+                    2.0F);
+                drawList->AddCircleFilled(
+                    ImVec2{drawnEndX, activationCentreY + 1.5F},
+                    2.0F,
+                    handleColour);
+            }
 
             const ImU32 settingsRailColour =
                 ImGui::GetColorU32(ImGuiCol_Border);
@@ -93602,40 +94079,54 @@ void DrawTimingColouriseActivationOverview(
                     ? IM_COL32(238, 174, 72, 235)
                     : ImGui::GetColorU32(ImGuiCol_TextDisabled);
                 if (pointClip) {
-                    drawList->AddCircleFilled(
-                        ImVec2{clipStartX, settingsCentreY},
-                        3.25F,
-                        clipHandleColour);
+                    if (positionInView(settingsSpan->start)) {
+                        drawList->AddCircleFilled(
+                            ImVec2{clipStartX, settingsCentreY},
+                            3.25F,
+                            clipHandleColour);
+                    }
                 } else {
-                    drawList->AddRectFilled(
-                        ImVec2{
-                            clipStartX,
-                            settingsMinimum.y + 1.0F},
-                        ImVec2{
-                            clipEndX,
-                            settingsMaximum.y - 1.0F},
-                        clipColour,
-                        1.5F);
-                    drawList->AddLine(
-                        ImVec2{
-                            clipStartX,
-                            settingsMinimum.y + 1.0F},
-                        ImVec2{
-                            clipStartX,
-                            settingsMaximum.y - 1.0F},
-                        clipHandleColour,
-                        1.5F);
-                    drawList->AddLine(
-                        ImVec2{
-                            clipEndX,
-                            settingsMinimum.y + 1.0F},
-                        ImVec2{
-                            clipEndX,
-                            settingsMaximum.y - 1.0F},
-                        clipHandleColour,
-                        1.5F);
+                    for (const auto& segment :
+                         pixelSegmentsForInterval(
+                             settingsSpan->start,
+                             settingsSpan->end)) {
+                        drawList->AddRectFilled(
+                            ImVec2{
+                                segment.first,
+                                settingsMinimum.y + 1.0F},
+                            ImVec2{
+                                segment.second,
+                                settingsMaximum.y - 1.0F},
+                            clipColour,
+                            1.5F);
+                    }
+                    if (positionInView(settingsSpan->start)) {
+                        drawList->AddLine(
+                            ImVec2{
+                                clipStartX,
+                                settingsMinimum.y + 1.0F},
+                            ImVec2{
+                                clipStartX,
+                                settingsMaximum.y - 1.0F},
+                            clipHandleColour,
+                            1.5F);
+                    }
+                    if (positionInView(settingsSpan->end)) {
+                        drawList->AddLine(
+                            ImVec2{
+                                clipEndX,
+                                settingsMinimum.y + 1.0F},
+                            ImVec2{
+                                clipEndX,
+                                settingsMaximum.y - 1.0F},
+                            clipHandleColour,
+                            1.5F);
+                    }
                 }
                 for (const float keyPosition : settingsKeyPositions) {
+                    if (!positionInView(keyPosition)) {
+                        continue;
+                    }
                     const float keyX = xForPosition(keyPosition);
                     drawList->AddLine(
                         ImVec2{keyX, settingsMinimum.y + 2.0F},
@@ -95978,11 +96469,11 @@ std::size_t RemoveTimingEffectRelevantKeysAtPosition(
 
 void DrawAnimationTimelineViewBoundsOverlay(
     const PreviewRuntimeState& runtimeState,
-    invisible_places::timing::TimelineViewRange range,
     ImVec2 barMin,
     ImVec2 barMax) {
-    range = invisible_places::timing::SanitizeTimelineViewRange(range);
-    if (invisible_places::timing::TimelineViewRangeIsFull(range)) {
+    const auto coordinates =
+        ResolveAnimationTimelineCoordinateContext(runtimeState);
+    if (coordinates.IsFull()) {
         return;
     }
     const float width = std::max(1.0F, barMax.x - barMin.x);
@@ -96001,7 +96492,7 @@ void DrawAnimationTimelineViewBoundsOverlay(
                   runtimeState.animationPanel.currentPath.value(),
                   localMid)
             : localMid;
-        const bool inside = track >= range.start && track <= range.end;
+        const bool inside = coordinates.AuthoredIsInView(track);
         const float x0 = barMin.x + width * local0;
         const float x1 = barMin.x + width * local1;
         if (!inside) {
@@ -96021,13 +96512,300 @@ void DrawAnimationTimelineViewBoundsOverlay(
     }
 }
 
+bool DrawAnimationCyclicTimelineViewRangeSelector(
+    PreviewRuntimeState* runtimeState,
+    float /*durationSeconds*/,
+    const AnimationTimelineCoordinateContext& coordinates) {
+    if (runtimeState == nullptr || !coordinates.linkedCyclic) {
+        return false;
+    }
+    constexpr auto kDomain = invisible_places::timing::
+        kLinkedSignedCyclicTimelineViewDomain;
+    auto& panel = runtimeState->animationPanel;
+    panel.timelineViewDrag.reset();
+    bool changed = false;
+    if (panel.linkedTimelineViewPairId != coordinates.pairId) {
+        panel.linkedTimelineViewPairId = coordinates.pairId;
+        panel.linkedTimelineViewRange = invisible_places::timing::
+            CyclicTimelineFullViewRange(kDomain);
+        panel.linkedTimelineViewDrag.reset();
+        changed = true;
+    }
+    panel.linkedTimelineViewRange = invisible_places::timing::
+        CyclicTimelineSanitizeViewRange(
+            panel.linkedTimelineViewRange,
+            kDomain);
+
+    ImGui::PushID("AnimationCyclicTimelineViewRange");
+    const bool fullRange = invisible_places::timing::
+        CyclicTimelineViewRangeIsFull(
+            panel.linkedTimelineViewRange,
+            kDomain);
+    const float unwrappedEnd = invisible_places::timing::
+        CyclicTimelineViewRangeEnd(panel.linkedTimelineViewRange);
+    const float labelledEnd = fullRange
+        ? kDomain.origin + kDomain.period
+        : invisible_places::timing::CyclicTimelineWrapPosition(
+              unwrappedEnd,
+              kDomain);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled(
+        "Feature Run View: %s%+.4f to %+.4f",
+        fullRange ? "Full linked loop, " : "",
+        panel.linkedTimelineViewRange.start,
+        labelledEnd);
+    const float fullButtonWidth =
+        ImGui::CalcTextSize("Full").x +
+        ImGui::GetStyle().FramePadding.x * 2.0F;
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(std::max(
+        ImGui::GetCursorPosX(),
+        ImGui::GetWindowContentRegionMax().x - fullButtonWidth));
+    ImGui::BeginDisabled(fullRange);
+    if (ImGui::SmallButton("Full")) {
+        panel.linkedTimelineViewRange = invisible_places::timing::
+            CyclicTimelineFullViewRange(kDomain);
+        panel.linkedTimelineViewDrag.reset();
+        changed = true;
+    }
+    ImGui::EndDisabled();
+
+    constexpr float kSelectorHeight = 14.0F;
+    const ImVec2 size{
+        std::max(24.0F, ImGui::GetContentRegionAvail().x),
+        kSelectorHeight};
+    ImGui::InvisibleButton(
+        "##LinkedFeatureRunViewRange",
+        size,
+        ImGuiButtonFlags_MouseButtonLeft);
+    const ImVec2 minimum = ImGui::GetItemRectMin();
+    const ImVec2 maximum = ImGui::GetItemRectMax();
+    const float width = std::max(1.0F, maximum.x - minimum.x);
+    const float mouseX = ImGui::GetIO().MousePos.x;
+    const auto overviewPositionForX = [&](float x) {
+        return std::lerp(
+            kDomain.origin,
+            kDomain.origin + kDomain.period,
+            std::clamp((x - minimum.x) / width, 0.0F, 1.0F));
+    };
+    const auto xForOverviewPosition = [&](float position) {
+        const float domainEnd = kDomain.origin + kDomain.period;
+        const float displayed =
+            std::abs(position - domainEnd) <= 1.0e-6F
+            ? domainEnd
+            : invisible_places::timing::CyclicTimelineWrapPosition(
+                  position,
+                  kDomain);
+        return minimum.x + width *
+            ((displayed - kDomain.origin) / kDomain.period);
+    };
+    const auto rangeEndForHandle = [&] {
+        return fullRange
+            ? kDomain.origin + kDomain.period
+            : invisible_places::timing::CyclicTimelineWrapPosition(
+                  invisible_places::timing::CyclicTimelineViewRangeEnd(
+                      panel.linkedTimelineViewRange),
+                  kDomain);
+    };
+    const auto mouseInRangeBody = [&] {
+        return invisible_places::timing::CyclicTimelinePositionIsInView(
+            panel.linkedTimelineViewRange,
+            overviewPositionForX(mouseX),
+            kDomain,
+            0.0F);
+    };
+
+    constexpr float kHandleHitRadius = 7.0F;
+    if (ImGui::IsItemHovered()) {
+        const float startX = xForOverviewPosition(
+            panel.linkedTimelineViewRange.start);
+        const float endX = xForOverviewPosition(rangeEndForHandle());
+        if (std::min(
+                std::abs(mouseX - startX),
+                std::abs(mouseX - endX)) <= kHandleHitRadius) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        } else if (mouseInRangeBody()) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        }
+    }
+
+    if (ImGui::IsItemHovered() &&
+        ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        if (!fullRange) {
+            panel.linkedTimelineViewRange = invisible_places::timing::
+                CyclicTimelineFullViewRange(kDomain);
+            changed = true;
+        }
+        panel.linkedTimelineViewDrag.reset();
+    } else if (ImGui::IsItemActivated()) {
+        const float startX = xForOverviewPosition(
+            panel.linkedTimelineViewRange.start);
+        const float endX = xForOverviewPosition(rangeEndForHandle());
+        const float startDistance = std::abs(mouseX - startX);
+        const float endDistance = std::abs(mouseX - endX);
+        AnimationTimelineViewDragPart part =
+            AnimationTimelineViewDragPart::Body;
+        if (std::min(startDistance, endDistance) <= kHandleHitRadius ||
+            !mouseInRangeBody()) {
+            part = startDistance <= endDistance
+                ? AnimationTimelineViewDragPart::Start
+                : AnimationTimelineViewDragPart::End;
+        }
+        panel.linkedTimelineViewDrag =
+            AnimationCyclicTimelineViewDragState{
+                .part = part,
+                .mouseStartX = mouseX,
+                .originalRange = panel.linkedTimelineViewRange,
+            };
+    }
+
+    if (panel.linkedTimelineViewDrag.has_value() &&
+        ImGui::IsItemActive() &&
+        ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        const auto& drag = panel.linkedTimelineViewDrag.value();
+        auto candidate = panel.linkedTimelineViewRange;
+        const float pointer = overviewPositionForX(mouseX);
+        switch (drag.part) {
+            case AnimationTimelineViewDragPart::Start: {
+                const float fixedEnd =
+                    drag.originalRange.start + drag.originalRange.span;
+                float start = invisible_places::timing::
+                    CyclicTimelineEquivalentPositionNear(
+                        pointer,
+                        drag.originalRange.start,
+                        kDomain);
+                start = std::clamp(
+                    start,
+                    fixedEnd - kDomain.period,
+                    fixedEnd - invisible_places::timing::
+                        kMinimumTimelineViewSpan);
+                candidate = {
+                    .start = start,
+                    .span = fixedEnd - start,
+                };
+                break;
+            }
+            case AnimationTimelineViewDragPart::End: {
+                float end = invisible_places::timing::
+                    CyclicTimelineEquivalentPositionNear(
+                        pointer,
+                        drag.originalRange.start +
+                            drag.originalRange.span,
+                        kDomain);
+                end = std::clamp(
+                    end,
+                    drag.originalRange.start + invisible_places::timing::
+                        kMinimumTimelineViewSpan,
+                    drag.originalRange.start + kDomain.period);
+                candidate = {
+                    .start = drag.originalRange.start,
+                    .span = end - drag.originalRange.start,
+                };
+                break;
+            }
+            case AnimationTimelineViewDragPart::Body:
+                candidate = invisible_places::timing::
+                    CyclicTimelinePanViewRange(
+                        drag.originalRange,
+                        (mouseX - drag.mouseStartX) / width *
+                            kDomain.period,
+                        kDomain);
+                break;
+        }
+        candidate = invisible_places::timing::
+            CyclicTimelineSanitizeViewRange(candidate, kDomain);
+        if (std::abs(
+                candidate.start -
+                panel.linkedTimelineViewRange.start) >
+                std::numeric_limits<float>::epsilon() ||
+            std::abs(
+                candidate.span -
+                panel.linkedTimelineViewRange.span) >
+                std::numeric_limits<float>::epsilon()) {
+            panel.linkedTimelineViewRange = candidate;
+            changed = true;
+        }
+    }
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        panel.linkedTimelineViewDrag.reset();
+    }
+
+    auto* drawList = ImGui::GetWindowDrawList();
+    drawList->AddRectFilled(
+        minimum,
+        maximum,
+        ImGui::GetColorU32(ImGuiCol_FrameBg),
+        2.0F);
+    ImVec4 fill = ImGui::GetStyleColorVec4(ImGuiCol_SliderGrabActive);
+    fill.w *= 0.42F;
+    const auto segments = invisible_places::timing::
+        CyclicTimelineViewRangeSegments(
+            panel.linkedTimelineViewRange,
+            kDomain);
+    for (const auto& segment : segments) {
+        drawList->AddRectFilled(
+            ImVec2{xForOverviewPosition(segment.start), minimum.y},
+            ImVec2{xForOverviewPosition(segment.end), maximum.y},
+            ImGui::ColorConvertFloat4ToU32(fill),
+            2.0F);
+    }
+    drawList->AddRect(
+        minimum,
+        maximum,
+        ImGui::GetColorU32(ImGuiCol_Border),
+        2.0F);
+    const ImU32 handleColour =
+        ImGui::GetColorU32(ImGuiCol_SliderGrabActive);
+    const float startX = xForOverviewPosition(
+        panel.linkedTimelineViewRange.start);
+    const float endX = xForOverviewPosition(rangeEndForHandle());
+    drawList->AddLine(
+        ImVec2{startX, minimum.y},
+        ImVec2{startX, maximum.y},
+        handleColour,
+        2.0F);
+    drawList->AddLine(
+        ImVec2{endX, minimum.y},
+        ImVec2{endX, maximum.y},
+        handleColour,
+        2.0F);
+    const float playheadX = xForOverviewPosition(
+        coordinates.AuthoredToDisplay(
+            CurrentAuthoredTrackPosition(*runtimeState)));
+    drawList->AddLine(
+        ImVec2{playheadX, minimum.y + 2.0F},
+        ImVec2{playheadX, maximum.y - 2.0F},
+        IM_COL32(18, 18, 18, 230),
+        1.0F);
+
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Drag either end to focus the shared linked loop; drag either highlighted segment to pan through the -1/1 seam.\nDouble-click or press Full to reset. Stored 0-1 key times, playback, and exports remain unchanged.");
+    }
+    ImGui::PopID();
+    if (changed) {
+        runtimeState->timingsPanel.waterRunKeyDrag.reset();
+        runtimeState->timingsPanel.waterRunSplineHandleDrag.reset();
+    }
+    return changed;
+}
+
 bool DrawAnimationTimelineViewRangeSelector(
     PreviewRuntimeState* runtimeState,
     float durationSeconds) {
     if (runtimeState == nullptr) {
         return false;
     }
+    const auto coordinates =
+        ResolveAnimationTimelineCoordinateContext(*runtimeState);
+    if (coordinates.linkedCyclic) {
+        return DrawAnimationCyclicTimelineViewRangeSelector(
+            runtimeState,
+            durationSeconds,
+            coordinates);
+    }
     auto& panel = runtimeState->animationPanel;
+    panel.linkedTimelineViewDrag.reset();
     panel.timelineViewRange =
         invisible_places::timing::SanitizeTimelineViewRange(
             panel.timelineViewRange);
@@ -96629,7 +97407,6 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
         durationSeconds);
     DrawAnimationTimelineViewBoundsOverlay(
         *runtimeState,
-        panel.timelineViewRange,
         barMin,
         barMax);
     DrawPinnedWaterSettingOverlays(runtimeState, barMin, barMax);
