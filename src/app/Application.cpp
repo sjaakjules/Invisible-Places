@@ -1991,8 +1991,6 @@ struct AnimationExportWriterState {
     std::uint32_t writerMattePipeWriteCount = 0;
 };
 
-struct StillCameraPreparationState;
-
 enum class ExportMemorySampleStage : std::uint8_t {
     Start,
     Readback,
@@ -2230,8 +2228,6 @@ struct OfflineRenderJobState {
     float exportEyeDomeLightingThickness = 1.0F;
     float exportGaussianSplatFootprintBoost = 1.5F;
     std::vector<invisible_places::renderer::core::SceneRenderState::PointCloudLayerState> exportPointCloudLayers;
-    bool preparingExport = false;
-    std::shared_ptr<StillCameraPreparationState> preparationState;
     std::shared_ptr<AnimationExportWriterState> writerState;
     std::shared_ptr<struct OfflineRenderProgressState> progressState;
     std::jthread worker;
@@ -2333,32 +2329,6 @@ void UploadFrozenAnimationSeepageParameters(
     OfflineRenderJobState* job,
     invisible_places::renderer::core::VulkanViewportShell* viewport,
     const WaterFrameState& frameState);
-
-struct StillCameraPreviewLodPreparationRequest {
-    std::size_t sessionIndex = 0;
-    std::string displayName;
-    std::uint32_t requestedCount = 0;
-    std::shared_ptr<const invisible_places::io::LoadedPointCloud> cloud;
-};
-
-struct StillCameraPreviewLodPreparationResult {
-    std::size_t sessionIndex = 0;
-    std::uint32_t requestedCount = 0;
-    std::vector<std::uint32_t> sampledIndices;
-};
-
-struct StillCameraPreparationState {
-    std::mutex mutex;
-    bool cancelRequested = false;
-    bool cancelled = false;
-    bool completed = false;
-    std::size_t totalRequests = 0;
-    std::size_t completedRequests = 0;
-    std::size_t currentRequestIndex = 0;
-    std::string currentLayerName;
-    std::vector<StillCameraPreviewLodPreparationResult> results;
-    std::string errorMessage;
-};
 
 struct OfflineRenderProgressState {
     std::mutex mutex;
@@ -5651,77 +5621,6 @@ void PreparePreviewLodSampleCaches(
     for (std::size_t sessionIndex = 0; sessionIndex < runtimeState->sessions.size(); ++sessionIndex) {
         PreparePreviewLodSampleCache(runtimeState, viewport, sessionIndex);
     }
-}
-
-std::vector<StillCameraPreviewLodPreparationRequest> BuildStillCameraPreviewLodPreparationRequests(
-    const PreviewRuntimeState& runtimeState) {
-    (void)runtimeState;
-    std::vector<StillCameraPreviewLodPreparationRequest> requests;
-    return requests;
-}
-
-void RunStillCameraPreviewLodPreparationWorker(
-    std::stop_token stopToken,
-    std::vector<StillCameraPreviewLodPreparationRequest> requests,
-    std::shared_ptr<StillCameraPreparationState> preparationState) {
-    if (preparationState == nullptr) {
-        return;
-    }
-
-    {
-        std::scoped_lock lock(preparationState->mutex);
-        preparationState->totalRequests = requests.size();
-        preparationState->completedRequests = 0;
-        preparationState->currentRequestIndex = 0;
-        preparationState->currentLayerName.clear();
-    }
-
-    try {
-        for (std::size_t requestIndex = 0; requestIndex < requests.size(); ++requestIndex) {
-            const auto& request = requests[requestIndex];
-            {
-                std::scoped_lock lock(preparationState->mutex);
-                if (preparationState->cancelRequested || stopToken.stop_requested()) {
-                    preparationState->cancelled = true;
-                    preparationState->completed = true;
-                    return;
-                }
-                preparationState->currentRequestIndex = requestIndex;
-                preparationState->currentLayerName = request.displayName;
-            }
-
-            std::vector<std::uint32_t> sampledIndices;
-            if (request.cloud != nullptr) {
-                sampledIndices =
-                    invisible_places::renderer::pointcloud::GenerateSpatialSampleIndices(
-                        request.cloud->positions,
-                        request.cloud->bounds,
-                        request.requestedCount);
-            }
-
-            {
-                std::scoped_lock lock(preparationState->mutex);
-                if (preparationState->cancelRequested || stopToken.stop_requested()) {
-                    preparationState->cancelled = true;
-                    preparationState->completed = true;
-                    return;
-                }
-                preparationState->results.push_back(
-                    {.sessionIndex = request.sessionIndex,
-                     .requestedCount = request.requestedCount,
-                     .sampledIndices = std::move(sampledIndices)});
-                preparationState->completedRequests = requestIndex + 1U;
-            }
-        }
-    } catch (const std::exception& error) {
-        std::scoped_lock lock(preparationState->mutex);
-        preparationState->errorMessage = "Still-camera EXR preparation failed: " + std::string{error.what()};
-        preparationState->completed = true;
-        return;
-    }
-
-    std::scoped_lock lock(preparationState->mutex);
-    preparationState->completed = true;
 }
 
 const char* LayerKindLabel(LayerKind kind) {
@@ -38453,10 +38352,6 @@ void StartStillCameraExportCapture(
     }
 
     auto& job = runtimeState->offlineRenderJob;
-    if (job.worker.joinable() && job.preparingExport) {
-        job.worker = std::jthread{};
-    }
-
     const auto savedVisual = ResolveSavedPointVisualExportSelection(runtimeState);
     if (!savedVisual.has_value()) {
         FinishOfflineRenderJob(
@@ -38512,8 +38407,6 @@ void StartStillCameraExportCapture(
                 frozenLayer.grid);
         }
     }
-    job.preparingExport = false;
-    job.preparationState.reset();
     auto writerState = std::make_shared<AnimationExportWriterState>();
     job.writerState = writerState;
     const AnimationExportOutputOptions outputOptions{
@@ -38559,97 +38452,6 @@ void StartStillCameraExportCapture(
         FormatFixed(job.settings.stillCameraDurationSeconds, 2) +
         " seconds...";
     runtimeState->errorMessage.clear();
-}
-
-void ProcessStillCameraPreparationStep(
-    PreviewRuntimeState* runtimeState,
-    invisible_places::renderer::core::VulkanViewportShell* viewport) {
-    if (runtimeState == nullptr || viewport == nullptr || !runtimeState->offlineRenderJob.active) {
-        return;
-    }
-
-    auto& job = runtimeState->offlineRenderJob;
-    auto preparationState = job.preparationState;
-    if (preparationState == nullptr) {
-        StartStillCameraExportCapture(runtimeState, viewport);
-        return;
-    }
-
-    if (job.cancelRequested) {
-        {
-            std::scoped_lock lock(preparationState->mutex);
-            preparationState->cancelRequested = true;
-        }
-        if (job.worker.joinable()) {
-            job.worker.request_stop();
-        }
-        runtimeState->statusMessage = "Cancelling still-camera export preparation...";
-    }
-
-    bool completed = false;
-    bool cancelled = false;
-    std::size_t completedRequests = 0;
-    std::size_t totalRequests = 0;
-    std::string currentLayerName;
-    std::string errorMessage;
-    std::vector<StillCameraPreviewLodPreparationResult> results;
-    {
-        std::scoped_lock lock(preparationState->mutex);
-        completed = preparationState->completed;
-        cancelled = preparationState->cancelled;
-        completedRequests = preparationState->completedRequests;
-        totalRequests = preparationState->totalRequests;
-        currentLayerName = preparationState->currentLayerName;
-        errorMessage = preparationState->errorMessage;
-        if (completed) {
-            results = std::move(preparationState->results);
-        }
-    }
-
-    if (!completed) {
-        runtimeState->statusMessage =
-            "Preparing still-camera EXR samples " +
-            std::to_string(std::min(completedRequests + 1U, totalRequests)) +
-            " / " + std::to_string(std::max<std::size_t>(1U, totalRequests)) +
-            (currentLayerName.empty() ? std::string{} : ": " + currentLayerName) + ".";
-        return;
-    }
-
-    if (!errorMessage.empty()) {
-        FinishOfflineRenderJob(runtimeState, viewport, {}, errorMessage);
-        return;
-    }
-    if (cancelled || job.cancelRequested) {
-        FinishOfflineRenderJob(
-            runtimeState,
-            viewport,
-            "Still-camera export cancelled.");
-        return;
-    }
-
-    for (auto& result : results) {
-        if (result.sessionIndex >= runtimeState->sessions.size()) {
-            continue;
-        }
-        auto& session = runtimeState->sessions[result.sessionIndex];
-        if (!session.loaded || session.kind != LayerKind::PointCloud ||
-            session.waterFlowGpuPreview) {
-            if (session.waterFlowGpuPreview) {
-                ClearPreviewLodSampleCache(&session);
-                viewport->UpdateInteractivePointSampleBuffer(
-                    result.sessionIndex,
-                    session.previewLodSampledIndices,
-                    false);
-            }
-            continue;
-        }
-        session.previewLodRequestedDrawCount = result.requestedCount;
-        session.previewLodSampledDrawCount = static_cast<std::uint32_t>(result.sampledIndices.size());
-        session.previewLodSampledIndices = std::move(result.sampledIndices);
-        viewport->UpdateInteractivePointSampleBuffer(result.sessionIndex, session.previewLodSampledIndices);
-    }
-
-    StartStillCameraExportCapture(runtimeState, viewport);
 }
 
 void StartStillCameraExportJob(
@@ -38828,12 +38630,7 @@ void StartStillCameraExportJob(
         exportRendererMode);
     const bool exportUsesPreviewDensity = frustumMaskSummary.enabled;
 
-    std::vector<StillCameraPreviewLodPreparationRequest> preparationRequests;
-
     const auto setupSize = viewport != nullptr ? CurrentFramebufferViewportSize(*viewport) : ImVec2{1.0F, 1.0F};
-    auto preparationState = !preparationRequests.empty()
-                                ? std::make_shared<StillCameraPreparationState>()
-                                : std::shared_ptr<StillCameraPreparationState>{};
     runtimeState->offlineRenderJob = {
         .active = true,
         .cancelRequested = false,
@@ -38904,22 +38701,12 @@ void StartStillCameraExportJob(
         .exportGaussianSplatFootprintBoost =
             runtimeState->projectSettings.gaussianSplatFootprintBoost,
         .exportPointCloudLayers = {},
-        .preparingExport = !preparationRequests.empty(),
-        .preparationState = preparationState,
     };
     AcquireExportPowerAssertion(runtimeState);
     runtimeState->cameraPlayback.active = false;
     runtimeState->animationPlayback.active = false;
     runtimeState->errorMessage.clear();
-    if (!preparationRequests.empty()) {
-        runtimeState->offlineRenderJob.worker = std::jthread{
-            RunStillCameraPreviewLodPreparationWorker,
-            std::move(preparationRequests),
-            preparationState};
-        runtimeState->statusMessage = "Preparing still-camera EXR samples...";
-    } else {
-        StartStillCameraExportCapture(runtimeState, viewport);
-    }
+    StartStillCameraExportCapture(runtimeState, viewport);
 }
 
 void StartAnimationExportJob(
@@ -39488,8 +39275,6 @@ void FinishOfflineRenderJob(
     job.cancelRequested = false;
     job.writerFinishRequested = false;
     job.frameSampleState = {};
-    job.preparingExport = false;
-    job.preparationState.reset();
     job.writerState.reset();
     if (clearQuickMp4Queue) {
         runtimeState->animationPanel.quickMp4Queue.clear();
@@ -39511,13 +39296,6 @@ void RequestOfflineRenderCancellation(OfflineRenderJobState* job) {
     // cancel branch reads gpuSampleInFlight to know it has to call
     // CancelPointCloudExrFrame. Wiping it here abandoned the submitted EXR
     // frame and latched the viewport's in-flight flag forever.
-    if (job->preparationState != nullptr) {
-        std::scoped_lock lock(job->preparationState->mutex);
-        job->preparationState->cancelRequested = true;
-    }
-    if (job->preparingExport && job->worker.joinable()) {
-        job->worker.request_stop();
-    }
 }
 
 void ProcessOfflineRenderJobStep(
@@ -39539,10 +39317,6 @@ void ProcessOfflineRenderJobStep(
     if (job.rainRuntimeResetPending) {
         viewport->ResetRainRuntime();
         job.rainRuntimeResetPending = false;
-    }
-    if (job.preparingExport) {
-        ProcessStillCameraPreparationStep(runtimeState, viewport);
-        return;
     }
 
     RefreshAnimationExportWriterProgress(&job);
@@ -40112,9 +39886,6 @@ std::string BackgroundRenderWorkerPhase(
     if (!job.active) {
         return exportStarted ? "Finishing output" : "Preparing full-density scene";
     }
-    if (job.preparingExport) {
-        return "Preparing export samples";
-    }
     if (job.currentFrame >= job.frames.size() ||
         job.writerFinishRequested) {
         return "Finishing output";
@@ -40194,38 +39965,17 @@ bool DrawBackgroundRenderWorkerMonitor(
     std::uint32_t capturedFrames = 0U;
     std::uint32_t totalFrames = expectedTotalFrames;
     std::string progressOverlay = "Preparing";
-    bool preparingSamples = false;
     if (job.active) {
         totalFrames = static_cast<std::uint32_t>(job.frames.size());
         capturedFrames = std::min<std::uint32_t>(
             job.currentFrame,
             totalFrames);
-        preparingSamples =
-            job.preparingExport && job.preparationState != nullptr;
-        if (preparingSamples) {
-            std::size_t completedRequests = 0U;
-            std::size_t totalRequests = 0U;
-            {
-                std::scoped_lock lock(job.preparationState->mutex);
-                completedRequests =
-                    job.preparationState->completedRequests;
-                totalRequests = job.preparationState->totalRequests;
-            }
-            progress = totalRequests == 0U
-                           ? 0.0F
-                           : static_cast<float>(completedRequests) /
-                                 static_cast<float>(totalRequests);
-            progressOverlay =
-                "Preparing " + std::to_string(completedRequests) +
-                " / " + std::to_string(totalRequests);
-        } else {
-            progress = ExportRenderProgressFraction(job);
-            std::ostringstream overlay;
-            overlay << capturedFrames << " / " << totalFrames
-                    << " frames  " << std::fixed << std::setprecision(1)
-                    << (progress * 100.0F) << '%';
-            progressOverlay = overlay.str();
-        }
+        progress = ExportRenderProgressFraction(job);
+        std::ostringstream overlay;
+        overlay << capturedFrames << " / " << totalFrames
+                << " frames  " << std::fixed << std::setprecision(1)
+                << (progress * 100.0F) << '%';
+        progressOverlay = overlay.str();
     } else if (totalFrames > 0U) {
         progressOverlay = "Preparing 0 / " +
                           std::to_string(totalFrames) + " frames";
@@ -40235,7 +39985,7 @@ bool DrawBackgroundRenderWorkerMonitor(
         ImVec2{-FLT_MIN, 22.0F},
         progressOverlay.c_str());
 
-    if (job.active && !preparingSamples) {
+    if (job.active) {
         ImGui::Text(
             "Captured %u / %u    Saved %u    Queued %zu",
             capturedFrames,
@@ -40248,7 +39998,7 @@ bool DrawBackgroundRenderWorkerMonitor(
     ImGui::Text("Elapsed: %s", FormatAdaptiveDuration(elapsed).c_str());
     ImGui::SameLine(190.0F);
     const bool capturingFrames =
-        job.active && !preparingSamples && !cancellationRequested &&
+        job.active && !cancellationRequested &&
         job.currentFrame < job.frames.size() &&
         !job.writerFinishRequested;
     if (capturingFrames) {
@@ -40261,8 +40011,7 @@ bool DrawBackgroundRenderWorkerMonitor(
         } else {
             ImGui::TextDisabled("ETA: calculating...");
         }
-    } else if (job.active && !preparingSamples &&
-               !cancellationRequested) {
+    } else if (job.active && !cancellationRequested) {
         ImGui::TextDisabled("Finalizing output...");
     } else {
         ImGui::TextDisabled("ETA: waiting for rendered frames...");
@@ -42600,44 +42349,23 @@ void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
                 "Appended to the output file names of the remaining queued jobs.");
         }
     }
-    if (job.preparingExport && job.preparationState != nullptr) {
-        std::size_t completedRequests = 0;
-        std::size_t totalRequests = 0;
-        std::string currentLayerName;
-        {
-            std::scoped_lock lock(job.preparationState->mutex);
-            completedRequests = job.preparationState->completedRequests;
-            totalRequests = job.preparationState->totalRequests;
-            currentLayerName = job.preparationState->currentLayerName;
-        }
-        const float prepareProgress = totalRequests == 0
-                                          ? 0.0F
-                                          : static_cast<float>(completedRequests) /
-                                                static_cast<float>(totalRequests);
-        ImGui::ProgressBar(prepareProgress, ImVec2{-FLT_MIN, 0.0F});
-        ImGui::Text("Preparing samples: %zu / %zu", completedRequests, totalRequests);
-        if (!currentLayerName.empty()) {
-            ImGui::TextWrapped("Layer: %s", currentLayerName.c_str());
-        }
-    } else {
-        DrawExportFrameDurationProgressBar(job);
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
-            ImGui::SetTooltip(
-                "Each column is one rendered frame; its height is the "
-                "frame's render time within the post-warm-up min/max range. "
-                "Warm-up frames are omitted.");
-        }
-        ImGui::Text(
-            "Captured: %u / %zu",
-            std::min<std::uint32_t>(job.currentFrame, static_cast<std::uint32_t>(job.frames.size())),
-            job.frames.size());
-        ImGui::Text(
-            "Saved: %u / %zu",
-            std::min<std::uint32_t>(job.writtenFrameCount, static_cast<std::uint32_t>(job.frames.size())),
-            job.frames.size());
-        ImGui::Text("Queued: %zu", job.pendingFrameCount);
-        DrawExportTimingSummary(job, true);
+    DrawExportFrameDurationProgressBar(job);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+        ImGui::SetTooltip(
+            "Each column is one rendered frame; its height is the "
+            "frame's render time within the post-warm-up min/max range. "
+            "Warm-up frames are omitted.");
     }
+    ImGui::Text(
+        "Captured: %u / %zu",
+        std::min<std::uint32_t>(job.currentFrame, static_cast<std::uint32_t>(job.frames.size())),
+        job.frames.size());
+    ImGui::Text(
+        "Saved: %u / %zu",
+        std::min<std::uint32_t>(job.writtenFrameCount, static_cast<std::uint32_t>(job.frames.size())),
+        job.frames.size());
+    ImGui::Text("Queued: %zu", job.pendingFrameCount);
+    DrawExportTimingSummary(job, true);
     if (job.exportFrustumMask) {
         ImGui::TextUnformatted("Renderer: GPU frustum mask, full visible density");
         const double retainedPercent =
@@ -50627,41 +50355,17 @@ void DrawStillCameraExportSection(
     if (job.active) {
         RefreshAnimationExportWriterProgress(&job);
         if (job.stillCameraJob) {
-            if (job.preparingExport && job.preparationState != nullptr) {
-                std::size_t completedRequests = 0;
-                std::size_t totalRequests = 0;
-                std::string currentLayerName;
-                {
-                    std::scoped_lock lock(job.preparationState->mutex);
-                    completedRequests = job.preparationState->completedRequests;
-                    totalRequests = job.preparationState->totalRequests;
-                    currentLayerName = job.preparationState->currentLayerName;
-                }
-                const float prepareProgress = totalRequests == 0
-                                                  ? 0.0F
-                                                  : static_cast<float>(completedRequests) /
-                                                        static_cast<float>(totalRequests);
-                ImGui::ProgressBar(prepareProgress, ImVec2{-FLT_MIN, 0.0F});
-                ImGui::Text(
-                    "Preparing samples %zu / %zu",
-                    completedRequests,
-                    totalRequests);
-                if (!currentLayerName.empty()) {
-                    ImGui::TextWrapped("Layer: %s", currentLayerName.c_str());
-                }
-            } else {
-                const float frameProgress = job.frames.empty()
-                                                ? 0.0F
-                                                : static_cast<float>(job.writtenFrameCount) /
-                                                      static_cast<float>(job.frames.size());
-                ImGui::ProgressBar(frameProgress, ImVec2{-FLT_MIN, 0.0F});
-                ImGui::Text(
-                    "Captured %u / %zu, saved %u, queued %zu",
-                    std::min<std::uint32_t>(job.currentFrame, static_cast<std::uint32_t>(job.frames.size())),
-                    job.frames.size(),
-                    std::min<std::uint32_t>(job.writtenFrameCount, static_cast<std::uint32_t>(job.frames.size())),
-                    job.pendingFrameCount);
-            }
+            const float frameProgress = job.frames.empty()
+                                            ? 0.0F
+                                            : static_cast<float>(job.writtenFrameCount) /
+                                                  static_cast<float>(job.frames.size());
+            ImGui::ProgressBar(frameProgress, ImVec2{-FLT_MIN, 0.0F});
+            ImGui::Text(
+                "Captured %u / %zu, saved %u, queued %zu",
+                std::min<std::uint32_t>(job.currentFrame, static_cast<std::uint32_t>(job.frames.size())),
+                job.frames.size(),
+                std::min<std::uint32_t>(job.writtenFrameCount, static_cast<std::uint32_t>(job.frames.size())),
+                job.pendingFrameCount);
             ImGui::Text("Elapsed: %s", FormatElapsedTime(std::chrono::steady_clock::now() - job.startedAt).c_str());
             if (!job.lastOutputPath.empty()) {
                 ImGui::TextWrapped("Last: %s", job.lastOutputPath.string().c_str());
@@ -81208,29 +80912,13 @@ void DrawDebugExportSection(PreviewRuntimeState* runtimeState) {
             static_cast<double>(session.totalPrimitives) / 1.0e6);
     }
     RefreshAnimationExportWriterProgress(&job);
-    if (job.preparingExport && job.preparationState != nullptr) {
-        std::size_t completedRequests = 0;
-        std::size_t totalRequests = 0;
-        std::string currentLayerName;
-        {
-            std::scoped_lock lock(job.preparationState->mutex);
-            completedRequests = job.preparationState->completedRequests;
-            totalRequests = job.preparationState->totalRequests;
-            currentLayerName = job.preparationState->currentLayerName;
-        }
-        ImGui::Text("Preparing samples %zu / %zu", completedRequests, totalRequests);
-        if (!currentLayerName.empty()) {
-            ImGui::TextWrapped("Layer: %s", currentLayerName.c_str());
-        }
-    } else {
-        ImGui::Text(
-            "Captured %u / %zu, saved %u, queued %zu",
-            std::min<std::uint32_t>(job.currentFrame, static_cast<std::uint32_t>(job.frames.size())),
-            job.frames.size(),
-            std::min<std::uint32_t>(job.writtenFrameCount, static_cast<std::uint32_t>(job.frames.size())),
-            job.pendingFrameCount);
-        DrawExportTimingSummary(job);
-    }
+    ImGui::Text(
+        "Captured %u / %zu, saved %u, queued %zu",
+        std::min<std::uint32_t>(job.currentFrame, static_cast<std::uint32_t>(job.frames.size())),
+        job.frames.size(),
+        std::min<std::uint32_t>(job.writtenFrameCount, static_cast<std::uint32_t>(job.frames.size())),
+        job.pendingFrameCount);
+    DrawExportTimingSummary(job);
     ImGui::Text("Elapsed: %s", FormatElapsedTime(std::chrono::steady_clock::now() - job.startedAt).c_str());
     if (!job.lastOutputPath.empty()) {
         ImGui::TextWrapped("Last: %s", job.lastOutputPath.string().c_str());
