@@ -801,6 +801,17 @@ struct TimingColouriseLocalKeyPositionEditState {
     std::string errorMessage;
 };
 
+struct TimingColouriseBoundsValueEditState {
+    std::string effectId;
+    invisible_places::timing::TimingColouriseBoundsParameter parameter =
+        invisible_places::timing::TimingColouriseBoundsParameter::Lower;
+    // Keep the backing text stable until its edit has fully deactivated. The
+    // evaluated curve value can change underneath it when a key drag also
+    // moves the playhead; replacing this draft in that transition makes
+    // ImGui report a stale edit after another item has become active.
+    std::string draft;
+};
+
 struct TimingColouriseKeyHandle {
     TimingColouriseKeyTrack track = TimingColouriseKeyTrack::Palette;
     std::optional<
@@ -1954,6 +1965,8 @@ struct TimingsPanelState {
         colouriseLocalKeyDrag;
     std::optional<TimingColouriseLocalKeyPositionEditState>
         colouriseLocalKeyPositionEdit;
+    std::optional<TimingColouriseBoundsValueEditState>
+        colouriseBoundsValueEdit;
     std::optional<TimingColouriseKeySelectionState>
         colouriseKeySelection;
     std::optional<TimingColouriseGraphKeyDragState>
@@ -95435,8 +95448,54 @@ void DrawTimingColouriseBoundsParameterEditor(
         parameter ==
         invisible_places::timing::
             TimingColouriseBoundsParameter::EdgeFade;
-    float draft =
-        percentage ? evaluatedValue * 100.0F : evaluatedValue;
+    const auto formatDraft = [&](float value) {
+        std::array<char, 64> buffer{};
+        std::snprintf(
+            buffer.data(),
+            buffer.size(),
+            percentage ? "%+.1f%%" : "%.6g",
+            percentage ? value * 100.0F : value);
+        return std::string{buffer.data()};
+    };
+    const auto parseDraft = [&](const std::string& text)
+        -> std::optional<float> {
+        const char* begin = text.c_str();
+        while (*begin != '\0' && std::isspace(
+                   static_cast<unsigned char>(*begin)) != 0) {
+            ++begin;
+        }
+        errno = 0;
+        char* end = nullptr;
+        const float parsed = std::strtof(begin, &end);
+        if (end == begin || errno == ERANGE || !std::isfinite(parsed)) {
+            return std::nullopt;
+        }
+        while (*end != '\0' && std::isspace(
+                   static_cast<unsigned char>(*end)) != 0) {
+            ++end;
+        }
+        if (percentage && *end == '%') {
+            ++end;
+            while (*end != '\0' && std::isspace(
+                       static_cast<unsigned char>(*end)) != 0) {
+                ++end;
+            }
+        }
+        if (*end != '\0') {
+            return std::nullopt;
+        }
+        return percentage ? parsed * 0.01F : parsed;
+    };
+    std::string evaluatedDraft = formatDraft(evaluatedValue);
+    auto& valueEdit =
+        runtimeState->timingsPanel.colouriseBoundsValueEdit;
+    bool valueEditMatches =
+        valueEdit.has_value() &&
+        valueEdit->effectId == effect->id &&
+        valueEdit->parameter == parameter;
+    std::string* draft = valueEditMatches
+        ? &valueEdit->draft
+        : &evaluatedDraft;
     ImGui::PushID(static_cast<int>(parameter));
     ImGui::SetNextItemWidth(
         std::max(24.0F, ImGui::GetContentRegionAvail().x));
@@ -95461,28 +95520,50 @@ void DrawTimingColouriseBoundsParameterEditor(
             kWaterKeyedSettingColour);
     }
     ImGui::BeginDisabled(!editable);
-    const bool changed = ImGui::InputFloat(
+    // InputScalar calls MarkItemEdited after InputText reapplies its
+    // deactivation buffer. If the graph has already taken ActiveId and the
+    // animated value changed, that ImGui path asserts. Use InputText's
+    // numeric presentation directly and suppress only its bookkeeping mark;
+    // this editor applies and validates the value itself below.
+    GImGui->NextItemData.ItemFlags |= ImGuiItemFlags_NoMarkEdited;
+    const bool changed = InputTextStringWithFlags(
         "##Value",
-        &draft,
-        0.0F,
-        0.0F,
-        percentage ? "%+.1f%%" : "%.6g",
-        ImGuiInputTextFlags_None);
+        draft,
+        ImGuiInputTextFlags_AutoSelectAll);
+    const bool activated = ImGui::IsItemActivated();
+    const bool active = ImGui::IsItemActive();
     ImGui::EndDisabled();
+    if (activated && !valueEditMatches) {
+        valueEdit = TimingColouriseBoundsValueEditState{
+            .effectId = effect->id,
+            .parameter = parameter,
+            .draft = *draft,
+        };
+        valueEditMatches = true;
+    }
+    const auto submittedDraft = parseDraft(
+        valueEditMatches && valueEdit.has_value()
+            ? valueEdit->draft
+            : *draft);
     if (keyed) {
         ImGui::PopStyleColor();
     }
     ImGui::PopStyleColor(3);
     ImGui::PopStyleVar(2);
-    if (changed && editable &&
+    if (changed && editable && submittedDraft.has_value() &&
         SetTimingColouriseBoundsParameterAt(
             &runtimeState->water.timingScalarBoundsStores,
             effect,
             parameter,
             position,
-            percentage ? draft * 0.01F : draft,
+            submittedDraft.value(),
             CurrentAnimationTimingIsCyclic(*runtimeState))) {
         runtimeState->previewRenderStateSignatureValid = false;
+    }
+    if (valueEditMatches && !active) {
+        // Preserve the draft through the deactivation frame above, then let
+        // the next frame resume following the evaluated animation curve.
+        valueEdit.reset();
     }
     if (percentage) {
         DrawTimingControlTooltip(
@@ -95598,6 +95679,9 @@ void DrawTimingColouriseBoundsEditor(
         return;
     }
 
+    // Bounds inputs for different Visual Features must not inherit one
+    // another's active text-edit state when the selected feature changes.
+    ImGui::PushID(effect->id.c_str());
     if (!effect->boundsKeys.empty()) {
         ImGui::TextDisabled(
             "Legacy Bounds snapshot keys remain active as a fallback. New keys below override their individual coordinates.");
@@ -95703,6 +95787,7 @@ void DrawTimingColouriseBoundsEditor(
         runtimeState,
         effect,
         boundsLanes);
+    ImGui::PopID();
 }
 
 struct TimingColouriseActivationConcurrencySpan {
