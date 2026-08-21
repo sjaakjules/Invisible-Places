@@ -89310,6 +89310,58 @@ void AddUniqueTimingColouriseKeyHandle(
     handles->push_back(std::move(handle));
 }
 
+void AddCoincidentTimingColouriseKeyHandles(
+    const invisible_places::timing::TimingColouriseEffect& effect,
+    const std::vector<TimingColouriseKeyHandle>& anchors,
+    std::vector<TimingColouriseKeyHandle>* handles) {
+    if (handles == nullptr || anchors.empty()) {
+        return;
+    }
+    const auto matchesAnchorPosition = [&](float position) {
+        return std::any_of(
+            anchors.begin(),
+            anchors.end(),
+            [&](const auto& anchor) {
+                return std::abs(anchor.position - position) <=
+                       invisible_places::timing::
+                           kTimingColouriseKeyTolerance;
+            });
+    };
+    for (const float position : invisible_places::timing::
+             TimingColourisePaletteKeyPositions(effect)) {
+        if (matchesAnchorPosition(position)) {
+            AddUniqueTimingColouriseKeyHandle(
+                handles,
+                TimingColouriseKeyHandle{
+                    .track = TimingColouriseKeyTrack::Palette,
+                    .position = position,
+                });
+        }
+    }
+    for (const auto& key : effect.boundsParameterKeys) {
+        if (matchesAnchorPosition(key.position)) {
+            AddUniqueTimingColouriseKeyHandle(
+                handles,
+                TimingColouriseKeyHandle{
+                    .track = TimingColouriseKeyTrack::Bounds,
+                    .boundsParameter = key.parameter,
+                    .position = key.position,
+                });
+        }
+    }
+    for (const auto& key : effect.effectParameterKeys) {
+        if (matchesAnchorPosition(key.position)) {
+            AddUniqueTimingColouriseKeyHandle(
+                handles,
+                TimingColouriseKeyHandle{
+                    .track = TimingColouriseKeyTrack::EffectParameter,
+                    .effectParameter = key.parameter,
+                    .position = key.position,
+                });
+        }
+    }
+}
+
 std::optional<std::pair<
     float,
     invisible_places::water::WaterScenarioInterpolation>>
@@ -90290,6 +90342,23 @@ void DrawTimingKeyLaneGroup(
             } else {
                 handles = {clicked};
             }
+            const auto rangeAnchor =
+                timings.colouriseKeySelection.has_value() &&
+                        timings.colouriseKeySelection->effectId ==
+                            effect->id
+                    ? timings.colouriseKeySelection->rangeAnchor
+                    : std::nullopt;
+            if (timings.colouriseGraphTimeOnly) {
+                // Gather against the original selection positions rather than
+                // the growing result so tolerance cannot create a transitive
+                // chain into keys at neighbouring times.
+                const auto anchorHandles = handles;
+                AddCoincidentTimingColouriseKeyHandles(
+                    *effect,
+                    anchorHandles,
+                    &handles);
+                replaceSelection(handles, rangeAnchor);
+            }
             TimingColouriseGraphKeyDragState drag{
                 .effectId = effect->id,
                 .laneGroupId = id,
@@ -90299,12 +90368,7 @@ void DrawTimingKeyLaneGroup(
                 .mouseStartY = mouse.y,
                 .originalEffect = *effect,
                 .handles = std::move(handles),
-                .rangeAnchor =
-                    timings.colouriseKeySelection.has_value() &&
-                            timings.colouriseKeySelection->effectId ==
-                                effect->id
-                        ? timings.colouriseKeySelection->rangeAnchor
-                        : std::nullopt,
+                .rangeAnchor = rangeAnchor,
             };
             if (drag.valueDrag) {
                 for (const auto& handle : drag.handles) {
@@ -91183,7 +91247,7 @@ void DrawTimingKeyLaneGroup(
         ImGui::TextUnformatted(
             "Left-click selects a key; drag a curve dot to change time and value.");
         ImGui::TextUnformatted(
-            "Drag a lower marker, or enable Time-only drag, to change time only.");
+            "Drag a lower marker to change time only. With Time-only drag enabled, every key in this Visual Feature at each selected time moves together.");
         ImGui::TextUnformatted(
             "Left-drag empty space for a selection window. Cmd/Ctrl-click toggles; Shift-click selects a range.");
         ImGui::TextUnformatted(
@@ -91434,7 +91498,7 @@ void DrawTimingKeyLaneGroup(
             "Time-only drag",
             &timings.colouriseGraphTimeOnly);
         DrawTimingControlTooltip(
-            "When enabled, dragging a curve key changes only its animation position. Lower rail markers always change time only.");
+            "When enabled, dragging a curve key changes only its animation position and moves every key in this Visual Feature at each selected time together. Lower rail markers always change time only.");
         if (timings.colouriseKeySelection.has_value() &&
             timings.colouriseKeySelection->effectId == effect->id &&
             !timings.colouriseKeySelection->keys.empty()) {
