@@ -165,7 +165,7 @@ struct alignas(16) PointCloudStyleGpu {
     std::array<glm::uvec4, renderer::pointcloud::kTimingColouriseMaxEffects>
         timingColouriseSources{};
     // x/y: lower/upper bounds; z: signed edge-fade fraction (positive inward,
-    // negative outward); w: non-negative emissive level.
+    // negative outward); w: signed emissive/darkening level.
     std::array<glm::vec4, renderer::pointcloud::kTimingColouriseMaxEffects>
         timingColouriseRanges{};
     // Effect-major 64-sample RGBA lookup tables. RGB is tint; A is mix only.
@@ -14124,11 +14124,9 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
                 0.5F),
             effect.output ==
                     renderer::pointcloud::TimingColouriseOutput::Emissive
-                ? std::max(
-                      0.0F,
-                      std::isfinite(effect.emissiveLevel)
-                          ? effect.emissiveLevel
-                          : 0.0F)
+                ? (std::isfinite(effect.emissiveLevel)
+                       ? effect.emissiveLevel
+                       : 0.0F)
                 : 0.0F,
         };
         if (effect.output ==

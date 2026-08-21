@@ -283,8 +283,10 @@ struct TimingColouriseEffect {
     // sampling the LUT. Stops and their authored positions remain fixed.
     float palettePhaseOffset = 0.0F;
     // Independent animated tracks for phase and the amount override value.
-    // EmissiveLevel shares this scalar-key representation. The Max/Scale mode
-    // itself remains an authored, non-animated choice.
+    // EmissiveLevel shares this scalar-key representation. Positive values
+    // add emission; negative values darken masked points without changing
+    // opacity. The Max/Scale mode itself remains an authored, non-animated
+    // choice.
     float emissiveLevel = 1.0F;
     std::vector<TimingColouriseEffectParameterKey> effectParameterKeys;
     // Legacy whole-palette snapshots remain active only in LegacySnapshots

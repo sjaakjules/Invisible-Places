@@ -663,7 +663,7 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "Offline timing emissive matches Beauty masks and Fast Basic bounded lift",
+    "Offline timing emissive supports masked glow and darkening",
     "[output][offline][timing-colourise][emissive]") {
     using invisible_places::renderer::pointcloud::PointCloudColorMode;
     using invisible_places::renderer::pointcloud::PointCloudFalloffProfile;
@@ -769,11 +769,22 @@ TEST_CASE(
     const auto beautyInside = render(1.0F, 0.5F, false);
     const auto beautyStacked = render(1.0F, 0.5F, false, true, false, 0.25F, 0.5F);
     const auto beautyNormal = render(1.0F, 0.5F, false, true, true);
+    const auto beautyDarkened = render(1.0F, -0.5F, false);
+    const auto beautyHalfDarkened = render(0.625F, -0.5F, false);
+    const auto beautyFullyDark = render(1.0F, -1.0F, false);
     CHECK(beautyInside.beautyR[kCenter] > beautyOff.beautyR[kCenter]);
     CHECK(beautyInside.beautyG[kCenter] > beautyOff.beautyG[kCenter]);
     CHECK(beautyInside.beautyB[kCenter] > beautyOff.beautyB[kCenter]);
     CHECK(beautyStacked.beautyR[kCenter] > beautyInside.beautyR[kCenter]);
     CHECK(beautyNormal.beautyR[kCenter] == Catch::Approx(beautyInside.beautyR[kCenter]).margin(1.0e-5F));
+    CHECK(
+        beautyDarkened.beautyR[kCenter] / beautyOff.beautyR[kCenter] ==
+        Catch::Approx(0.5F).margin(1.0e-5F));
+    CHECK(
+        beautyHalfDarkened.beautyR[kCenter] / beautyOff.beautyR[kCenter] ==
+        Catch::Approx(0.75F).margin(1.0e-5F));
+    CHECK(beautyFullyDark.beautyR[kCenter] == Catch::Approx(0.0F).margin(1.0e-6F));
+    CHECK(beautyDarkened.alpha[kCenter] == Catch::Approx(beautyOff.alpha[kCenter]).margin(1.0e-6F));
 
     const auto fastOff = render(1.0F, 0.0F, true);
     const auto fastInside = render(1.0F, 0.5F, true);
@@ -781,6 +792,9 @@ TEST_CASE(
     const auto fastOutwardHalfFade =
         render(0.375F, 0.5F, true, true, false, -0.25F);
     const auto fastCapped = render(1.0F, 2.0F, true);
+    const auto fastDarkened = render(1.0F, -0.5F, true);
+    const auto fastHalfDarkened = render(0.625F, -0.5F, true);
+    const auto fastFullyDark = render(1.0F, -1.0F, true);
     REQUIRE(fastOff.beautyR[kCenter] > 0.0F);
     CHECK(
         fastInside.beautyR[kCenter] / fastOff.beautyR[kCenter] ==
@@ -795,7 +809,15 @@ TEST_CASE(
     CHECK(
         fastCapped.beautyR[kCenter] / fastOff.beautyR[kCenter] ==
         Catch::Approx(1.35F).margin(1.0e-5F));
+    CHECK(
+        fastDarkened.beautyR[kCenter] / fastOff.beautyR[kCenter] ==
+        Catch::Approx(0.5F).margin(1.0e-5F));
+    CHECK(
+        fastHalfDarkened.beautyR[kCenter] / fastOff.beautyR[kCenter] ==
+        Catch::Approx(0.75F).margin(1.0e-5F));
+    CHECK(fastFullyDark.beautyR[kCenter] == Catch::Approx(0.0F).margin(1.0e-6F));
     CHECK(fastInside.alpha[kCenter] == Catch::Approx(fastOff.alpha[kCenter]).margin(1.0e-6F));
+    CHECK(fastDarkened.alpha[kCenter] == Catch::Approx(fastOff.alpha[kCenter]).margin(1.0e-6F));
 }
 
 TEST_CASE(

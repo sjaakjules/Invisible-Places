@@ -86,9 +86,9 @@ vec4 ResolveTimingColouriseEffect(uint effectIndex, uint pointIndex) {
     if (source.w == kTimingColouriseEmissiveOutput) {
         // A single resolved vec4 carries both effect kinds. Negative alpha
         // is an emissive sentinel consumed by
-        // ResolveTimingColouriseTransform; x stores the non-negative add.
+        // ResolveTimingColouriseTransform; x stores the signed masked level.
         return vec4(
-            max(0.0, range.w) * safeEdgeMask,
+            range.w * safeEdgeMask,
             0.0,
             0.0,
             -1.0);
@@ -135,7 +135,16 @@ void ResolveTimingColouriseTransform(
         const vec4 effect =
             ResolveTimingColouriseEffect(effectIndex, pointIndex);
         if (effect.a < 0.0) {
-            emission += max(0.0, effect.x);
+            if (effect.x < 0.0) {
+                // A level of -1 fully darkens the masked colour. Folding the
+                // attenuation into the affine transform preserves stack
+                // order with neighbouring colourise effects.
+                const float retainedLight = clamp(1.0 + effect.x, 0.0, 1.0);
+                blended *= retainedLight;
+                retained *= retainedLight;
+            } else {
+                emission += effect.x;
+            }
             continue;
         }
         const float alpha = clamp(effect.a, 0.0, 1.0);

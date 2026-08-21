@@ -985,16 +985,30 @@ glm::vec3 ApplyTimingColourise(
         layer.timingColourise.effects.size());
     for (std::size_t effectIndex = 0; effectIndex < effectCount; ++effectIndex) {
         const auto& effect = layer.timingColourise.effects[effectIndex];
-        if (effect.output !=
-            invisible_places::renderer::pointcloud::
-                TimingColouriseOutput::Colourise) {
-            continue;
-        }
         const auto mask = ResolveTimingColouriseMask(
             layer,
             effect,
             pointIndex);
         if (!mask.has_value()) {
+            continue;
+        }
+        if (effect.output ==
+            invisible_places::renderer::pointcloud::
+                TimingColouriseOutput::Emissive) {
+            const float level = std::isfinite(effect.emissiveLevel)
+                                    ? effect.emissiveLevel
+                                    : 0.0F;
+            if (level < 0.0F) {
+                baseColor *= std::clamp(
+                    1.0F + level * mask->edgeMask,
+                    0.0F,
+                    1.0F);
+            }
+            continue;
+        }
+        if (effect.output !=
+            invisible_places::renderer::pointcloud::
+                TimingColouriseOutput::Colourise) {
             continue;
         }
         const glm::vec4 lut = SampleTimingColouriseLut(
@@ -1032,14 +1046,14 @@ float ResolveTimingColouriseEmissionAdd(
         if (!mask.has_value()) {
             continue;
         }
-        const float level = std::max(
-            0.0F,
-            std::isfinite(effect.emissiveLevel)
-                ? effect.emissiveLevel
-                : 0.0F);
-        emissionAdd += level * mask->edgeMask;
+        const float level = std::isfinite(effect.emissiveLevel)
+                                ? effect.emissiveLevel
+                                : 0.0F;
+        if (level > 0.0F) {
+            emissionAdd += level * mask->edgeMask;
+        }
     }
-    return std::max(0.0F, emissionAdd);
+    return emissionAdd;
 }
 
 glm::vec3 ResolvePointColor(

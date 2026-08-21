@@ -450,7 +450,7 @@ float SanitizeEffectParameterValue(
         case TimingColouriseEffectParameter::AmountOverride:
             return Clamp01(value);
         case TimingColouriseEffectParameter::EmissiveLevel:
-            return std::max(0.0F, FiniteOr(value, 1.0F));
+            return FiniteOr(value, 1.0F);
     }
     return 0.0F;
 }
@@ -3282,9 +3282,8 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
         1.0F);
     effect.palettePhaseOffset =
         FiniteOr(effect.palettePhaseOffset, 0.0F);
-    effect.emissiveLevel = std::max(
-        0.0F,
-        FiniteOr(effect.emissiveLevel, 1.0F));
+    effect.emissiveLevel =
+        FiniteOr(effect.emissiveLevel, 1.0F);
     std::erase_if(
         effect.effectParameterKeys,
         [](const TimingColouriseEffectParameterKey& key) {

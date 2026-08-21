@@ -4533,8 +4533,8 @@ ResolveTimingColouriseStack(
         resolved.upperBound = bounds.upper;
         resolved.edgeFadeFraction = bounds.edgeFade;
         // A combined Visual Feature occupies one renderer slot per enabled
-        // aspect. Slot order between the pair is irrelevant: colourise
-        // entries compose by slot order while emissive entries sum.
+        // aspect. Colourise and negative emissive entries compose in slot
+        // order; positive emissive entries retain their additive behaviour.
         if (selected.emitColourise) {
             auto colouriseResolved = resolved;
             colouriseResolved.output = TimingColouriseOutput::Colourise;
@@ -92162,7 +92162,7 @@ bool DrawTimingColouriseEffectParameterEditor(
             break;
         case TimingColouriseEffectParameter::EmissiveLevel:
             parameterTooltip =
-                "Add field-masked emission without changing point opacity. Click to edit; drag across 0 to 2.5 or double-click to type any non-negative value.";
+                "Apply a field-masked light level without changing point opacity. Positive values add emission; negative values darken, with -1 fully dark at full mask. Click to edit or double-click to type any finite value.";
             break;
     }
     DrawTimingControlTooltip(parameterTooltip);
@@ -92194,13 +92194,12 @@ bool DrawTimingColouriseEffectParameterEditor(
             valueChanged = DrawRangedFloatControl(
                 "##EmissiveLevel",
                 &authoredValue,
-                {.visualMin = 0.0F,
+                {.visualMin = -2.5F,
                  .visualMax = 2.5F,
                  .format = "%.3f",
-                 .showLabel = false,
-                 .hardMin = 0.0F});
+                 .showLabel = false});
             DrawTimingControlTooltip(
-                "Drag from 0 to 2.5. Double-click the bar to type any non-negative finite value.");
+                "Drag from -2.5 to +2.5. Negative values darken masked points; -1 is fully dark at full mask. Double-click the bar to type any finite value.");
         } else {
             ImGui::SetNextItemWidth(120.0F);
             valueChanged =
@@ -92224,9 +92223,6 @@ bool DrawTimingColouriseEffectParameterEditor(
         } else if (
             parameter == TimingColouriseEffectParameter::AmountOverride) {
             authoredValue = std::clamp(authoredValue, 0.0F, 1.0F);
-        } else if (
-            parameter == TimingColouriseEffectParameter::EmissiveLevel) {
-            authoredValue = std::max(0.0F, authoredValue);
         }
         if (hasKeys) {
             (void)invisible_places::timing::

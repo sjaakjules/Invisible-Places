@@ -822,7 +822,16 @@ TEST_CASE(
     CHECK(sanitized.name == "Visual Feature");
     CHECK(sanitized.field.source == TimingColouriseFieldSource::Scalar);
     CHECK(sanitized.field.scalarFieldName.empty());
-    CHECK(sanitized.emissiveLevel == Approx(0.0F));
+    CHECK(sanitized.emissiveLevel == Approx(-4.0F));
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColouriseEffectParameterKey(
+                    &sanitized,
+                    TimingColouriseEffectParameter::EmissiveLevel,
+                    0.5F,
+                    -1.25F));
+    CHECK(invisible_places::timing::EvaluateTimingEmissiveLevel(
+              sanitized,
+              0.5F) == Approx(-1.25F));
 
     // A dual-aspect feature legitimately follows colourise onto a normal
     // source; only its emissive aspect is dropped rather than the field.
@@ -5301,7 +5310,7 @@ TEST_CASE(
     effect.emissiveEnabled = true;
     effect.field.scalarFieldName = "Mineral";
     effect.basePalette = Solid({0.2F, 0.6F, 0.9F}, 0.7F);
-    effect.emissiveLevel = 3.0F;
+    effect.emissiveLevel = -3.0F;
     effect.boundsEdited = true;
     effect.boundsAdoptedGlobalRevision = 4U;
     effect.fieldBoundsMemory.push_back(TimingColouriseFieldBoundsMemory{
@@ -5337,7 +5346,7 @@ TEST_CASE(
                     &effect,
                     TimingColouriseEffectParameter::EmissiveLevel,
                     0.6F,
-                    2.0F));
+                    -2.0F));
     state.colouriseEffects.push_back(effect);
     document.timingTakeStates.push_back(state);
 
@@ -5364,7 +5373,7 @@ TEST_CASE(
     CHECK(savedEffect.at("kind") == "colourise");
     CHECK(savedEffect.at("colourise_enabled") == true);
     CHECK(savedEffect.at("emissive_enabled") == true);
-    CHECK(savedEffect.at("emissive_level") == Approx(3.0F));
+    CHECK(savedEffect.at("emissive_level") == Approx(-3.0F));
     REQUIRE(savedEffect.at("effect_parameter_keys").size() == 3U);
     CHECK(savedEffect.at("bounds_edited") == true);
     CHECK(savedEffect.at("bounds_adopted_global_revision") == 4U);
@@ -5390,7 +5399,7 @@ TEST_CASE(
         loaded->timingTakeStates.front().colouriseEffects.front();
     CHECK(loadedEffect.colouriseEnabled);
     CHECK(loadedEffect.emissiveEnabled);
-    CHECK(loadedEffect.emissiveLevel == Approx(3.0F));
+    CHECK(loadedEffect.emissiveLevel == Approx(-3.0F));
     // Every effect parameter is live on a dual-aspect feature.
     for (const auto parameter : {
              TimingColouriseEffectParameter::PalettePhase,
@@ -5417,6 +5426,9 @@ TEST_CASE(
                   loadedEffect,
                   TimingColouriseEffectParameter::EmissiveLevel,
                   0.6F) == 1U);
+    CHECK(invisible_places::timing::EvaluateTimingEmissiveLevel(
+              loadedEffect,
+              0.6F) == Approx(-2.0F));
     CHECK(loadedEffect.boundsEdited);
     CHECK(loadedEffect.boundsAdoptedGlobalRevision == 4U);
     REQUIRE(loadedEffect.fieldBoundsMemory.size() == 1U);
