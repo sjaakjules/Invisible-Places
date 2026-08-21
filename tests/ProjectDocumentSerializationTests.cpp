@@ -107,6 +107,35 @@ SettledFlowCacheFixture MakeSettledFlowCacheFixture() {
 
 } // namespace
 
+TEST_CASE("Project animation registry preserves its authored list order",
+          "[project][serialization][animation][order]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+
+  ProjectDocument document;
+  document.projectName = "animation-order";
+  document.hasSavedAnimationRegistry = true;
+  document.savedAnimations = {
+      {.filePath = "Saved/animations/Most Used.ipanim.json"},
+      {.filePath = "Saved/animations/Alpha.ipanim.json"},
+      {.filePath = "Saved/animations/Occasional.ipanim.json"},
+  };
+  TemporaryProjectFile file{"invisible_places_animation_order_project.json"};
+  std::string errorMessage;
+
+  REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->savedAnimations.size() == 3U);
+  CHECK(loaded->savedAnimations[0U].filePath.filename() ==
+        "Most Used.ipanim.json");
+  CHECK(loaded->savedAnimations[1U].filePath.filename() ==
+        "Alpha.ipanim.json");
+  CHECK(loaded->savedAnimations[2U].filePath.filename() ==
+        "Occasional.ipanim.json");
+}
+
 TEST_CASE("Current project schema round-trips authoritative scene density groups",
           "[project][serialization][density]") {
   using invisible_places::serialization::LoadProjectDocument;

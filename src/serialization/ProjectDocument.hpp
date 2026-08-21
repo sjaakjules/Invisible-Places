@@ -172,6 +172,8 @@ struct ProjectDocument {
     std::vector<invisible_places::camera::CameraShot> cameraShots;
     std::vector<std::size_t> cameraPathShotIndices;
     std::uint32_t cameraPathDurationFrames = 180;
+    // Serialized order is the user-authored order shown by the Animation
+    // Versions list; newly imported animations append to the end.
     std::vector<SavedAnimation> savedAnimations;
     bool hasSavedAnimationRegistry = false;
     std::filesystem::path selectedLayerPath;

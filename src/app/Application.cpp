@@ -1,5 +1,6 @@
 #include "app/Application.hpp"
 
+#include "app/AnimationRegistryOrder.hpp"
 #include "app/ManualFlowPathEditMath.hpp"
 #include "app/PointDensityParity.hpp"
 #include "app/PointVisualSelection.hpp"
@@ -26288,61 +26289,64 @@ bool SetAnimationRegistryAssociations(
     return true;
 }
 
-void SortAnimationRegistry(AnimationPanelState* panelState) {
-    if (panelState == nullptr) {
-        return;
+bool MoveAnimationRegistryEntry(
+    AnimationPanelState* panelState,
+    std::size_t sourceIndex,
+    std::size_t destinationIndex) {
+    if (panelState == nullptr ||
+        sourceIndex >= panelState->availableFiles.size() ||
+        destinationIndex >= panelState->availableFiles.size() ||
+        sourceIndex == destinationIndex) {
+        return false;
     }
     EnsureAnimationAssociationStorage(panelState);
-    std::vector<std::size_t> indices(panelState->availableFiles.size());
-    std::iota(indices.begin(), indices.end(), static_cast<std::size_t>(0U));
-    std::sort(
-        indices.begin(),
-        indices.end(),
-        [&](std::size_t left, std::size_t right) {
-            return NormalizePathKey(panelState->availableFiles[left]) <
-                   NormalizePathKey(panelState->availableFiles[right]);
-        });
+    using invisible_places::app::animation_registry::MoveRow;
+    using invisible_places::app::animation_registry::RemapIndexAfterMove;
+    (void)MoveRow(
+        &panelState->availableFileAssociatedLayerPaths,
+        sourceIndex,
+        destinationIndex);
+    (void)MoveRow(
+        &panelState->availableFileLoadedPaths,
+        sourceIndex,
+        destinationIndex);
+    (void)MoveRow(
+        &panelState->availableFileEditedPaths,
+        sourceIndex,
+        destinationIndex);
+    (void)MoveRow(
+        &panelState->availableFileDiskRevisions,
+        sourceIndex,
+        destinationIndex);
+    (void)MoveRow(
+        &panelState->availableFileLoopEditPairIds,
+        sourceIndex,
+        destinationIndex);
+    (void)MoveRow(
+        &panelState->availableFileDirtyFlags,
+        sourceIndex,
+        destinationIndex);
+    (void)MoveRow(
+        &panelState->availableFiles,
+        sourceIndex,
+        destinationIndex);
 
-    std::vector<std::filesystem::path> sortedFiles;
-    std::vector<std::vector<std::filesystem::path>> sortedAssociations;
-    std::vector<std::optional<AnimationPath>> sortedLoadedPaths;
-    std::vector<std::optional<AnimationPath>> sortedEditedPaths;
-    std::vector<std::optional<
-        invisible_places::app::workspace::FileRevision>>
-        sortedDiskRevisions;
-    std::vector<std::string> sortedLoopEditPairIds;
-    std::vector<bool> sortedDirtyFlags;
-    sortedFiles.reserve(panelState->availableFiles.size());
-    sortedAssociations.reserve(panelState->availableFiles.size());
-    sortedLoadedPaths.reserve(panelState->availableFiles.size());
-    sortedEditedPaths.reserve(panelState->availableFiles.size());
-    sortedDiskRevisions.reserve(panelState->availableFiles.size());
-    sortedLoopEditPairIds.reserve(panelState->availableFiles.size());
-    sortedDirtyFlags.reserve(panelState->availableFiles.size());
-    for (const auto index : indices) {
-        if (!sortedFiles.empty() &&
-            NormalizePathKey(sortedFiles.back()) == NormalizePathKey(panelState->availableFiles[index])) {
-            continue;
+    const auto remap = [&](std::optional<std::size_t>* index) {
+        if (index == nullptr || !index->has_value()) {
+            return;
         }
-        auto associations = panelState->availableFileAssociatedLayerPaths[index];
-        NormalizeAssociatedLayerPaths(&associations);
-        sortedFiles.push_back(panelState->availableFiles[index].lexically_normal());
-        sortedAssociations.push_back(std::move(associations));
-        sortedLoadedPaths.push_back(panelState->availableFileLoadedPaths[index]);
-        sortedEditedPaths.push_back(panelState->availableFileEditedPaths[index]);
-        sortedDiskRevisions.push_back(
-            panelState->availableFileDiskRevisions[index]);
-        sortedLoopEditPairIds.push_back(panelState->availableFileLoopEditPairIds[index]);
-        sortedDirtyFlags.push_back(panelState->availableFileDirtyFlags[index]);
-    }
-    panelState->availableFiles = std::move(sortedFiles);
-    panelState->availableFileAssociatedLayerPaths = std::move(sortedAssociations);
-    panelState->availableFileLoadedPaths = std::move(sortedLoadedPaths);
-    panelState->availableFileEditedPaths = std::move(sortedEditedPaths);
-    panelState->availableFileDiskRevisions =
-        std::move(sortedDiskRevisions);
-    panelState->availableFileLoopEditPairIds = std::move(sortedLoopEditPairIds);
-    panelState->availableFileDirtyFlags = std::move(sortedDirtyFlags);
+        if (index->value() >= panelState->availableFiles.size()) {
+            index->reset();
+            return;
+        }
+        *index = RemapIndexAfterMove(
+            index->value(),
+            sourceIndex,
+            destinationIndex);
+    };
+    remap(&panelState->selectedFileIndex);
+    remap(&panelState->renamingFileIndex);
+    return true;
 }
 
 bool AddAnimationFileToRegistry(
@@ -26378,7 +26382,8 @@ bool AddAnimationFileToRegistry(
             filePath));
     panelState->availableFileLoopEditPairIds.emplace_back();
     panelState->availableFileDirtyFlags.push_back(false);
-    SortAnimationRegistry(panelState);
+    // Existing rows are user ordered. Newly registered or imported
+    // animations intentionally append to the bottom of that order.
     return true;
 }
 
@@ -26557,7 +26562,6 @@ void RefreshAnimationFileList(
         ImportAnimationFilesFromDirectory(panelState, animationDirectory, roots);
         panelState->animationRegistryInitialized = true;
     }
-    SortAnimationRegistry(panelState);
     panelState->selectedExportFiles.erase(
         std::remove_if(
             panelState->selectedExportFiles.begin(),
@@ -62775,6 +62779,39 @@ void DrawAnimationSection(
         ImGui::TextDisabled("No project animation paths are registered.");
     } else if (ImGui::BeginListBox("Animation Versions", ImVec2{-FLT_MIN, 160.0F})) {
         bool animationListChanged = false;
+        std::optional<std::pair<std::size_t, std::size_t>>
+            requestedReorder;
+        const auto drawReorderInteraction =
+            [&](std::size_t index, const std::string& displayName) {
+                if (ImGui::BeginDragDropSource()) {
+                    const auto payloadIndex = index;
+                    ImGui::SetDragDropPayload(
+                        "ANIMATION_REGISTRY_ORDER",
+                        &payloadIndex,
+                        sizeof(payloadIndex),
+                        ImGuiCond_Once);
+                    ImGui::Text("Move %s", displayName.c_str());
+                    ImGui::EndDragDropSource();
+                }
+                if (ImGui::BeginDragDropTarget()) {
+                    if (const auto* payload =
+                            ImGui::AcceptDragDropPayload(
+                                "ANIMATION_REGISTRY_ORDER");
+                        payload != nullptr &&
+                        payload->DataSize == sizeof(std::size_t)) {
+                        const auto sourceIndex =
+                            *static_cast<const std::size_t*>(
+                                payload->Data);
+                        if (sourceIndex != index) {
+                            requestedReorder = std::pair{
+                                sourceIndex,
+                                index,
+                            };
+                        }
+                    }
+                    ImGui::EndDragDropTarget();
+                }
+            };
         for (std::size_t index = 0; index < panel.availableFiles.size(); ++index) {
             const bool selectedSaved =
                 panel.selectedFileIndex.has_value() &&
@@ -62823,18 +62860,23 @@ void DrawAnimationSection(
                     panel.selectedFileIndex = index;
                     panel.selectedFileUsesEdited = false;
                 }
+                const bool savedRowHovered = ImGui::IsItemHovered();
+                const bool renameRequested =
+                    savedRowHovered &&
+                    ImGui::IsMouseDoubleClicked(
+                        ImGuiMouseButton_Left);
+                if (selectedSaved) {
+                    ImGui::SetItemDefaultFocus();
+                }
+                drawReorderInteraction(index, displayName);
                 if (linkState != AnimationVelocityLinkDisplayState::None) {
                     ImGui::PopStyleColor();
                 }
                 if (!renderSetupLocksAnimationSwitching &&
                     !RegistryAnimationHasEditedVersion(panel, index) &&
-                    ImGui::IsItemHovered() &&
-                    ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                    renameRequested) {
                     BeginAnimationFileRename(&panel, index);
                 }
-            }
-            if (selectedSaved) {
-                ImGui::SetItemDefaultFocus();
             }
 
             if (RegistryAnimationHasEditedVersion(panel, index)) {
@@ -62870,6 +62912,7 @@ void DrawAnimationSection(
                 if (selectedEdited) {
                     ImGui::SetItemDefaultFocus();
                 }
+                drawReorderInteraction(index, editedDisplayName);
                 ImGui::PopID();
             }
             ImGui::PopID();
@@ -62877,7 +62920,24 @@ void DrawAnimationSection(
                 break;
             }
         }
+        if (requestedReorder.has_value() &&
+            requestedReorder->first < panel.availableFiles.size()) {
+            const auto movedName = AnimationDisplayNameFromPath(
+                panel.availableFiles[requestedReorder->first]);
+            if (MoveAnimationRegistryEntry(
+                    &panel,
+                    requestedReorder->first,
+                    requestedReorder->second)) {
+                runtimeState->statusMessage =
+                    "Moved animation " + movedName + " to position " +
+                    std::to_string(requestedReorder->second + 1U) +
+                    ". Save the project to keep this order.";
+                runtimeState->errorMessage.clear();
+            }
+        }
         ImGui::EndListBox();
+        ImGui::TextDisabled(
+            "Drag an animation to reorder it; the order is saved with the project.");
     }
 
     if (panel.selectedFileIndex.has_value() && panel.selectedFileIndex.value() < panel.availableFiles.size()) {
