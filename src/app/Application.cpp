@@ -801,6 +801,93 @@ struct TimingColouriseLocalKeyPositionEditState {
     std::string errorMessage;
 };
 
+struct TimingColouriseKeyHandle {
+    TimingColouriseKeyTrack track = TimingColouriseKeyTrack::Palette;
+    std::optional<
+        invisible_places::timing::TimingColouriseBoundsParameter>
+        boundsParameter;
+    std::optional<
+        invisible_places::timing::TimingColouriseEffectParameter>
+        effectParameter;
+    float position = 0.0F;
+};
+
+bool TimingColouriseKeyHandlesMatch(
+    const TimingColouriseKeyHandle& left,
+    const TimingColouriseKeyHandle& right) {
+    return left.track == right.track &&
+           left.boundsParameter == right.boundsParameter &&
+           left.effectParameter == right.effectParameter &&
+           std::abs(left.position - right.position) <=
+               invisible_places::timing::kTimingColouriseKeyTolerance;
+}
+
+struct TimingColouriseKeySelectionState {
+    std::string effectId;
+    std::vector<TimingColouriseKeyHandle> keys;
+    std::optional<TimingColouriseKeyHandle> rangeAnchor;
+};
+
+struct TimingColouriseKeyClipboardItem {
+    TimingColouriseKeyTrack track = TimingColouriseKeyTrack::Palette;
+    std::optional<
+        invisible_places::timing::TimingColouriseBoundsParameter>
+        boundsParameter;
+    std::optional<
+        invisible_places::timing::TimingColouriseEffectParameter>
+        effectParameter;
+    float sourcePosition = 0.0F;
+    float value = 0.0F;
+    invisible_places::water::WaterScenarioInterpolation interpolation =
+        invisible_places::water::WaterScenarioInterpolation::Smooth;
+    // Palette clusters may contain one legacy snapshot and/or several
+    // independent stop-property keys. Stop ids are feature-local, so the
+    // clipboard records the ordered stop index for cross-feature paste.
+    std::optional<invisible_places::timing::TimingColourisePalette>
+        palette;
+    std::optional<std::size_t> paletteStopIndex;
+    std::optional<
+        invisible_places::timing::TimingColourisePaletteStopParameter>
+        paletteStopParameter;
+    std::array<float, 3> colourValue{1.0F, 1.0F, 1.0F};
+};
+
+struct TimingColouriseKeyClipboardState {
+    std::string sourceEffectName;
+    invisible_places::timing::TimingColouriseFieldSelector sourceField{};
+    std::optional<std::pair<float, float>> sourceScalarRange;
+    std::vector<TimingColouriseKeyClipboardItem> items;
+};
+
+struct TimingColouriseGraphKeyDragValue {
+    TimingColouriseKeyHandle handle;
+    float originalValue = 0.0F;
+    float unitsPerPixel = 0.0F;
+};
+
+struct TimingColouriseGraphKeyDragState {
+    std::string effectId;
+    std::string laneGroupId;
+    bool valueDrag = false;
+    float mouseStartX = 0.0F;
+    float mouseStartY = 0.0F;
+    invisible_places::timing::TimingColouriseEffect originalEffect{};
+    std::vector<TimingColouriseKeyHandle> handles;
+    std::optional<TimingColouriseKeyHandle> rangeAnchor;
+    std::vector<TimingColouriseGraphKeyDragValue> values;
+};
+
+struct TimingColouriseKeyMarqueeState {
+    std::string effectId;
+    std::string laneGroupId;
+    float startX = 0.0F;
+    float startY = 0.0F;
+    float currentX = 0.0F;
+    float currentY = 0.0F;
+    bool additive = false;
+    std::vector<TimingColouriseKeyHandle> baseSelection;
+};
+
 // Water run graph interaction state is identity-based, never pointer-based:
 // runs, features, and tracks are re-resolved from these ids every frame so a
 // deleted or reimported run simply drops the interaction instead of dangling.
@@ -1867,6 +1954,15 @@ struct TimingsPanelState {
         colouriseLocalKeyDrag;
     std::optional<TimingColouriseLocalKeyPositionEditState>
         colouriseLocalKeyPositionEdit;
+    std::optional<TimingColouriseKeySelectionState>
+        colouriseKeySelection;
+    std::optional<TimingColouriseGraphKeyDragState>
+        colouriseGraphKeyDrag;
+    std::optional<TimingColouriseKeyMarqueeState>
+        colouriseKeyMarquee;
+    std::optional<TimingColouriseKeyClipboardState>
+        colouriseKeyClipboard;
+    bool colouriseGraphTimeOnly = false;
     std::optional<TimingColouriseActivationDragState>
         colouriseActivationDrag;
     std::optional<TimingColouriseSettingsClipDragState>
@@ -1881,6 +1977,19 @@ struct TimingsPanelState {
         lastColouriseVariantByFamily;
     std::string boundsProfileNameBuffer;
 };
+
+void ClearTimingColouriseGraphInteraction(
+    TimingsPanelState* timings,
+    bool clearSelection = true) {
+    if (timings == nullptr) {
+        return;
+    }
+    timings->colouriseGraphKeyDrag.reset();
+    timings->colouriseKeyMarquee.reset();
+    if (clearSelection) {
+        timings->colouriseKeySelection.reset();
+    }
+}
 
 struct TimingColouriseHistogram {
     std::string signature;
@@ -31892,6 +32001,7 @@ void CancelRenderSetupAuthoringInteractions(
         TimingColouriseHistogramHandle::None;
     timings.colouriseLocalKeyDrag.reset();
     timings.colouriseLocalKeyPositionEdit.reset();
+    ClearTimingColouriseGraphInteraction(&timings);
     timings.colouriseActivationDrag.reset();
     timings.colouriseSettingsClipDrag.reset();
     timings.colouriseOverviewHelpHover.reset();
@@ -59348,6 +59458,7 @@ void ResetTimingTakeEditorSelections(PreviewRuntimeState* runtimeState) {
     timings.waterRunMarkHelpHover.reset();
     timings.colouriseLocalKeyDrag.reset();
     timings.colouriseLocalKeyPositionEdit.reset();
+    ClearTimingColouriseGraphInteraction(&timings);
     timings.colouriseActivationDrag.reset();
     timings.colouriseSettingsClipDrag.reset();
     timings.colouriseOverviewHelpHover.reset();
@@ -59373,6 +59484,7 @@ void ClearTimingColouriseEditorFocus(PreviewRuntimeState* runtimeState) {
     timings.colourisePaletteDrag.reset();
     timings.colouriseLocalKeyDrag.reset();
     timings.colouriseLocalKeyPositionEdit.reset();
+    ClearTimingColouriseGraphInteraction(&timings);
     timings.colouriseActivationDrag.reset();
     timings.colouriseSettingsClipDrag.reset();
     timings.colouriseOverviewHelpHover.reset();
@@ -83601,8 +83713,9 @@ void DrawWaterRunTimingGraph(
         !draggedSplineHandleSeries.has_value() &&
         itemActive &&
         ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-        // Empty surface doubles as a local scrubber, exactly like the
-        // Visual Features lanes.
+        // Water setting graphs retain their established left-button local
+        // scrubber. Visual Feature graphs reserve left drag for marquee
+        // selection and use the right button for scrubbing instead.
         const float scrubPosition = positionForX(mouse.x);
         if (std::abs(
                 CurrentAuthoredTrackPosition(*runtimeState) -
@@ -89079,6 +89192,378 @@ struct TimingColouriseKeyLaneSeries {
     ImU32 colour = IM_COL32_WHITE;
 };
 
+std::optional<std::pair<float, float>>
+TimingColouriseSelectorRangeFromStats(
+    PreviewRuntimeState* runtimeState,
+    const invisible_places::timing::TimingColouriseFieldSelector& selector);
+
+TimingColouriseKeyHandle TimingColouriseKeyHandleForLane(
+    const TimingColouriseKeyLaneSeries& lane,
+    float position) {
+    return TimingColouriseKeyHandle{
+        .track = lane.track,
+        .boundsParameter = lane.boundsParameter,
+        .effectParameter = lane.effectParameter,
+        .position = position,
+    };
+}
+
+bool TimingColouriseKeySelectionContains(
+    const TimingColouriseKeySelectionState* selection,
+    std::string_view effectId,
+    const TimingColouriseKeyHandle& handle) {
+    return selection != nullptr && selection->effectId == effectId &&
+           std::any_of(
+               selection->keys.begin(),
+               selection->keys.end(),
+               [&](const auto& selected) {
+                   return TimingColouriseKeyHandlesMatch(
+                       selected,
+                       handle);
+               });
+}
+
+void AddUniqueTimingColouriseKeyHandle(
+    std::vector<TimingColouriseKeyHandle>* handles,
+    TimingColouriseKeyHandle handle) {
+    if (handles == nullptr || std::any_of(
+            handles->begin(),
+            handles->end(),
+            [&](const auto& existing) {
+                return TimingColouriseKeyHandlesMatch(existing, handle);
+            })) {
+        return;
+    }
+    handles->push_back(std::move(handle));
+}
+
+std::optional<std::pair<
+    float,
+    invisible_places::water::WaterScenarioInterpolation>>
+TimingColouriseExactScalarKey(
+    const invisible_places::timing::TimingColouriseEffect& effect,
+    const TimingColouriseKeyHandle& handle) {
+    if (handle.track == TimingColouriseKeyTrack::Bounds &&
+        handle.boundsParameter.has_value()) {
+        const auto found = std::find_if(
+            effect.boundsParameterKeys.begin(),
+            effect.boundsParameterKeys.end(),
+            [&](const auto& key) {
+                return key.parameter == handle.boundsParameter.value() &&
+                       std::abs(key.position - handle.position) <=
+                           invisible_places::timing::
+                               kTimingColouriseKeyTolerance;
+            });
+        if (found != effect.boundsParameterKeys.end()) {
+            return std::pair{found->value, found->interpolation};
+        }
+    } else if (
+        handle.track == TimingColouriseKeyTrack::EffectParameter &&
+        handle.effectParameter.has_value()) {
+        const auto found = std::find_if(
+            effect.effectParameterKeys.begin(),
+            effect.effectParameterKeys.end(),
+            [&](const auto& key) {
+                return key.parameter == handle.effectParameter.value() &&
+                       std::abs(key.position - handle.position) <=
+                           invisible_places::timing::
+                               kTimingColouriseKeyTolerance;
+            });
+        if (found != effect.effectParameterKeys.end()) {
+            return std::pair{found->value, found->interpolation};
+        }
+    }
+    return std::nullopt;
+}
+
+bool CopySelectedTimingColouriseKeys(
+    PreviewRuntimeState* runtimeState,
+    const invisible_places::timing::TimingColouriseEffect& effect) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+    const auto& selection =
+        runtimeState->timingsPanel.colouriseKeySelection;
+    if (!selection.has_value() || selection->effectId != effect.id ||
+        selection->keys.empty()) {
+        runtimeState->statusMessage =
+            "Select one or more Visual Feature keys before copying.";
+        return false;
+    }
+
+    TimingColouriseKeyClipboardState clipboard{
+        .sourceEffectName = effect.name,
+        .sourceField = effect.field,
+        .sourceScalarRange =
+            TimingColouriseSelectorRangeFromStats(
+                runtimeState,
+                effect.field),
+    };
+    constexpr float kPaletteClusterTolerance =
+        invisible_places::timing::kTimingColouriseKeyTolerance * 4.0F;
+    for (const auto& handle : selection->keys) {
+        if (handle.track == TimingColouriseKeyTrack::Bounds ||
+            handle.track == TimingColouriseKeyTrack::EffectParameter) {
+            const auto scalar =
+                TimingColouriseExactScalarKey(effect, handle);
+            if (!scalar.has_value()) {
+                continue;
+            }
+            clipboard.items.push_back({
+                .track = handle.track,
+                .boundsParameter = handle.boundsParameter,
+                .effectParameter = handle.effectParameter,
+                .sourcePosition = handle.position,
+                .value = scalar->first,
+                .interpolation = scalar->second,
+            });
+            continue;
+        }
+
+        for (const auto& key : effect.paletteKeys) {
+            if (std::abs(key.position - handle.position) <=
+                kPaletteClusterTolerance) {
+                clipboard.items.push_back({
+                    .track = TimingColouriseKeyTrack::Palette,
+                    .sourcePosition = handle.position,
+                    .interpolation = key.interpolation,
+                    .palette = key.palette,
+                });
+            }
+        }
+        for (const auto& key : effect.paletteStopParameterKeys) {
+            if (std::abs(key.position - handle.position) >
+                kPaletteClusterTolerance) {
+                continue;
+            }
+            const auto stop = std::find_if(
+                effect.basePalette.stops.begin(),
+                effect.basePalette.stops.end(),
+                [&](const auto& candidate) {
+                    return candidate.id == key.stopId;
+                });
+            if (stop == effect.basePalette.stops.end()) {
+                continue;
+            }
+            clipboard.items.push_back({
+                .track = TimingColouriseKeyTrack::Palette,
+                .sourcePosition = handle.position,
+                .value = key.scalarValue,
+                .interpolation = key.interpolation,
+                .paletteStopIndex = static_cast<std::size_t>(
+                    std::distance(effect.basePalette.stops.begin(), stop)),
+                .paletteStopParameter = key.parameter,
+                .colourValue = key.colourValue,
+            });
+        }
+    }
+    if (clipboard.items.empty()) {
+        runtimeState->statusMessage =
+            "The selected Visual Feature keys no longer exist.";
+        return false;
+    }
+    runtimeState->timingsPanel.colouriseKeyClipboard =
+        std::move(clipboard);
+    runtimeState->statusMessage =
+        "Copied " +
+        std::to_string(selection->keys.size()) +
+        (selection->keys.size() == 1U ? " Visual Feature key."
+                                      : " Visual Feature keys.");
+    return true;
+}
+
+bool DeleteSelectedTimingColouriseKeys(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::timing::TimingColouriseEffect* effect) {
+    if (runtimeState == nullptr || effect == nullptr) {
+        return false;
+    }
+    auto& selection =
+        runtimeState->timingsPanel.colouriseKeySelection;
+    if (!selection.has_value() || selection->effectId != effect->id ||
+        selection->keys.empty()) {
+        return false;
+    }
+    std::size_t removed = 0U;
+    for (const auto& handle : selection->keys) {
+        if (handle.track == TimingColouriseKeyTrack::Palette) {
+            removed += invisible_places::timing::
+                RemoveTimingColourisePaletteKeysAtPosition(
+                    effect,
+                    handle.position);
+        } else if (
+            handle.track == TimingColouriseKeyTrack::Bounds &&
+            handle.boundsParameter.has_value()) {
+            removed += invisible_places::timing::
+                RemoveTimingColouriseBoundsParameterKeysAtPosition(
+                    effect,
+                    handle.boundsParameter.value(),
+                    handle.position);
+        } else if (handle.effectParameter.has_value()) {
+            removed += invisible_places::timing::
+                RemoveTimingColouriseEffectParameterKeysAtPosition(
+                    effect,
+                    handle.effectParameter.value(),
+                    handle.position);
+        }
+    }
+    selection.reset();
+    if (removed == 0U) {
+        return false;
+    }
+    runtimeState->previewRenderStateSignatureValid = false;
+    runtimeState->statusMessage =
+        "Deleted " + std::to_string(removed) +
+        (removed == 1U ? " Visual Feature key."
+                       : " Visual Feature key values.");
+    return true;
+}
+
+bool PasteTimingColouriseKeysAtPlayhead(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::timing::TimingColouriseEffect* effect) {
+    if (runtimeState == nullptr || effect == nullptr) {
+        return false;
+    }
+    const auto& clipboard =
+        runtimeState->timingsPanel.colouriseKeyClipboard;
+    if (!clipboard.has_value() || clipboard->items.empty()) {
+        runtimeState->statusMessage =
+            "The Visual Feature key clipboard is empty.";
+        return false;
+    }
+
+    std::vector<float> sourcePositions;
+    sourcePositions.reserve(clipboard->items.size());
+    for (const auto& item : clipboard->items) {
+        sourcePositions.push_back(item.sourcePosition);
+    }
+    const auto destinationPositions = invisible_places::timing::
+        OffsetTimingColouriseKeyPositionsForPaste(
+            sourcePositions,
+            CurrentAuthoredTrackPosition(*runtimeState));
+    const auto destinationRange =
+        TimingColouriseSelectorRangeFromStats(
+            runtimeState,
+            effect->field);
+    std::vector<TimingColouriseKeyHandle> pastedHandles;
+    std::size_t pastedValues = 0U;
+    std::size_t skippedValues = 0U;
+    for (std::size_t index = 0U;
+         index < clipboard->items.size();
+         ++index) {
+        const auto& item = clipboard->items[index];
+        const float position = destinationPositions[index];
+        bool pasted = false;
+        if (item.track == TimingColouriseKeyTrack::Bounds &&
+            item.boundsParameter.has_value()) {
+            float value = item.value;
+            if (clipboard->sourceScalarRange.has_value() &&
+                destinationRange.has_value()) {
+                value = invisible_places::timing::
+                    RemapTimingColouriseBoundsParameterValueToRange(
+                        item.boundsParameter.value(),
+                        value,
+                        clipboard->sourceScalarRange->first,
+                        clipboard->sourceScalarRange->second,
+                        destinationRange->first,
+                        destinationRange->second);
+            }
+            pasted = invisible_places::timing::
+                AddOrUpdateTimingColouriseBoundsParameterKey(
+                    effect,
+                    item.boundsParameter.value(),
+                    position,
+                    value,
+                    item.interpolation);
+            if (pasted) {
+                effect->boundsEdited = true;
+            }
+        } else if (
+            item.track == TimingColouriseKeyTrack::EffectParameter &&
+            item.effectParameter.has_value()) {
+            pasted = invisible_places::timing::
+                AddOrUpdateTimingColouriseEffectParameterKey(
+                    effect,
+                    item.effectParameter.value(),
+                    position,
+                    item.value,
+                    item.interpolation);
+        } else if (item.palette.has_value() &&
+                   effect->paletteKeyModel == invisible_places::timing::
+                       TimingColourisePaletteKeyModel::LegacySnapshots) {
+            invisible_places::timing::AddOrUpdateTimingColourisePaletteKey(
+                effect,
+                position,
+                item.palette.value(),
+                item.interpolation);
+            pasted = true;
+        } else if (
+            item.paletteStopIndex.has_value() &&
+            item.paletteStopParameter.has_value() &&
+            effect->paletteKeyModel == invisible_places::timing::
+                TimingColourisePaletteKeyModel::StopParameters &&
+            item.paletteStopIndex.value() <
+                effect->basePalette.stops.size()) {
+            const auto& stop = effect->basePalette.stops[
+                item.paletteStopIndex.value()];
+            if (item.paletteStopParameter.value() ==
+                invisible_places::timing::
+                    TimingColourisePaletteStopParameter::Colour) {
+                pasted = invisible_places::timing::
+                    AddOrUpdateTimingColourisePaletteStopColourKey(
+                        effect,
+                        stop.id,
+                        position,
+                        item.colourValue,
+                        item.interpolation);
+            } else {
+                pasted = invisible_places::timing::
+                    AddOrUpdateTimingColourisePaletteStopScalarKey(
+                        effect,
+                        stop.id,
+                        item.paletteStopParameter.value(),
+                        position,
+                        item.value,
+                        item.interpolation);
+            }
+        }
+        if (!pasted) {
+            ++skippedValues;
+            continue;
+        }
+        ++pastedValues;
+        AddUniqueTimingColouriseKeyHandle(
+            &pastedHandles,
+            TimingColouriseKeyHandle{
+                .track = item.track,
+                .boundsParameter = item.boundsParameter,
+                .effectParameter = item.effectParameter,
+                .position = position,
+            });
+    }
+    if (pastedValues == 0U) {
+        runtimeState->statusMessage =
+            "No copied keys are compatible with this Visual Feature.";
+        return false;
+    }
+    runtimeState->timingsPanel.colouriseKeySelection =
+        TimingColouriseKeySelectionState{
+            .effectId = effect->id,
+            .keys = std::move(pastedHandles),
+    };
+    runtimeState->previewRenderStateSignatureValid = false;
+    runtimeState->statusMessage =
+        "Pasted " + std::to_string(pastedValues) +
+        (pastedValues == 1U ? " key value" : " key values") +
+        " from " + clipboard->sourceEffectName +
+        (skippedValues == 0U
+             ? "."
+             : "; skipped " + std::to_string(skippedValues) +
+                   " incompatible value(s).") ;
+    return true;
+}
+
 void DrawTimingKeyLaneGroup(
     const char* id,
     PreviewRuntimeState* runtimeState,
@@ -89124,7 +89609,11 @@ void DrawTimingKeyLaneGroup(
     ImGui::InvisibleButton(
         "##TimingKeyLaneSurface",
         size,
-        ImGuiButtonFlags_MouseButtonLeft);
+        ImGuiButtonFlags_MouseButtonLeft |
+            ImGuiButtonFlags_MouseButtonRight);
+    const bool itemHovered = ImGui::IsItemHovered();
+    const bool itemFocused = ImGui::IsItemFocused();
+    const bool itemActive = ImGui::IsItemActive();
     const auto minimum = ImGui::GetItemRectMin();
     const auto maximum = ImGui::GetItemRectMax();
     const float width = std::max(1.0F, maximum.x - minimum.x);
@@ -89232,8 +89721,13 @@ void DrawTimingKeyLaneGroup(
         }
     }
     constexpr float kMarkerHitRadius = 7.0F;
+    const ImVec2 helpCentre{maximum.x - 10.0F, minimum.y + 10.0F};
+    const bool keyHelpHovered =
+        itemHovered && std::hypot(
+                           mouse.x - helpCentre.x,
+                           mouse.y - helpCentre.y) <= 8.0F;
     const bool markerHovered =
-        ImGui::IsItemHovered() &&
+        itemHovered && !keyHelpHovered &&
         nearestSeries != nullptr &&
         nearestDistance <= kMarkerHitRadius &&
         std::abs(mouse.y - axisY) <= kMarkerHitRadius;
@@ -89271,13 +89765,30 @@ void DrawTimingKeyLaneGroup(
                         destinationPosition);
             }
             if (lane.track == TimingColouriseKeyTrack::Bounds) {
-                return lane.boundsParameter.has_value() &&
-                       invisible_places::timing::
-                           MoveTimingColouriseBoundsParameterKey(
-                               effect,
-                               lane.boundsParameter.value(),
-                               sourcePosition,
-                               destinationPosition);
+                if (!lane.boundsParameter.has_value()) {
+                    return false;
+                }
+                const auto found = std::find_if(
+                    effect->boundsParameterKeys.begin(),
+                    effect->boundsParameterKeys.end(),
+                    [&](const auto& key) {
+                        return key.parameter ==
+                                   lane.boundsParameter.value() &&
+                               std::abs(
+                                   key.position - sourcePosition) <=
+                                   invisible_places::timing::
+                                       kTimingColouriseKeyTolerance;
+                    });
+                if (found == effect->boundsParameterKeys.end()) {
+                    return false;
+                }
+                found->position = std::clamp(
+                    destinationPosition,
+                    0.0F,
+                    1.0F);
+                *effect = invisible_places::timing::
+                    SanitizeTimingColouriseEffect(std::move(*effect));
+                return true;
             }
             return lane.effectParameter.has_value() &&
                    invisible_places::timing::
@@ -89308,12 +89819,11 @@ void DrawTimingKeyLaneGroup(
             }
             if (lane.track == TimingColouriseKeyTrack::Bounds) {
                 return lane.boundsParameter.has_value() &&
-                       !invisible_places::timing::
-                            CanMoveTimingColouriseBoundsParameterKeysAtPosition(
-                                *effect,
-                                lane.boundsParameter.value(),
-                                sourcePosition,
-                                destinationPosition);
+                       invisible_places::timing::
+                               TimingColouriseBoundsParameterKeyCountAtPosition(
+                                   *effect,
+                                   lane.boundsParameter.value(),
+                                   destinationPosition) > 0U;
             }
             return lane.effectParameter.has_value() &&
                    invisible_places::timing::
@@ -89355,176 +89865,37 @@ void DrawTimingKeyLaneGroup(
         };
 
     auto& timings = runtimeState->timingsPanel;
-    bool handledMarkerInteraction = false;
-    if (markerHovered) {
-        const bool onKey =
-            std::abs(
-                CurrentAuthoredTrackPosition(*runtimeState) -
-                nearestPosition) <=
-            invisible_places::timing::
-                kTimingColouriseKeyTolerance;
-        const auto markerValue =
-            scalarValueAt(*nearestSeries, nearestPosition);
-        if (markerValue.has_value()) {
-            if (laneDrawsWrappedPalettePhase(*nearestSeries)) {
-                const float delta = invisible_places::timing::
-                    TimingColourisePalettePhaseDeltaFromPrevious(
-                        *effect,
-                        nearestPosition);
-                ImGui::SetTooltip(
-                    onKey
-                        ? "%s key delta %.6g turns; accumulated %.6g at animation position %.4f — drag this axis marker to move it; double-click to type an exact position."
-                        : "%s key delta %.6g turns; accumulated %.6g at animation position %.4f — click this axis marker to select it; drag to move it.",
-                    nearestSeries->label,
-                    delta,
-                    markerValue.value(),
-                    nearestPosition);
-            } else {
-                ImGui::SetTooltip(
-                    onKey
-                        ? "%s key %.6g at animation position %.4f — drag this axis marker to move it; double-click to type an exact position."
-                        : "%s key %.6g at animation position %.4f — click this axis marker to select it; drag to move it.",
-                    nearestSeries->label,
-                    markerValue.value(),
-                    nearestPosition);
-            }
-        } else {
-            ImGui::SetTooltip(
-                onKey
-                    ? "%s key at %.4f — drag this axis marker to move it; double-click to type an exact position."
-                    : "%s key at %.4f — click this axis marker to select it; drag to move it.",
-                nearestSeries->label,
-                nearestPosition);
-        }
-        if (ImGui::IsMouseDoubleClicked(
-                ImGuiMouseButton_Left)) {
-            handledMarkerInteraction = true;
-            timings.colouriseLocalKeyDrag.reset();
-            if (onKey) {
-                timings.colouriseLocalKeyPositionEdit =
-                    TimingColouriseLocalKeyPositionEditState{
-                        .effectId = effect->id,
-                        .track = nearestSeries->track,
-                        .boundsParameter =
-                            nearestSeries->boundsParameter,
-                        .effectParameter =
-                            nearestSeries->effectParameter,
-                        .sourcePosition = nearestPosition,
-                        .draftPosition = nearestPosition,
-                        .requestKeyboardFocus = true,
-                };
-                ImGui::OpenPopup(
-                    "Edit Local Effect Key Position");
-            } else {
-                ScrubFeatureTimelineToAuthoredPosition(
-                    runtimeState,
-                    nearestPosition);
-            }
-        } else if (ImGui::IsMouseClicked(
-                       ImGuiMouseButton_Left)) {
-            handledMarkerInteraction = true;
-            ScrubFeatureTimelineToAuthoredPosition(
-                runtimeState,
-                nearestPosition);
-            timings.colouriseLocalKeyDrag =
-                TimingColouriseLocalKeyDragState{
-                    .effectId = effect->id,
-                    .track = nearestSeries->track,
-                    .boundsParameter =
-                        nearestSeries->boundsParameter,
-                    .effectParameter =
-                        nearestSeries->effectParameter,
-                    .currentPosition = nearestPosition,
-                };
-        }
+    if (timings.colouriseKeySelection.has_value() &&
+        timings.colouriseKeySelection->effectId != effect->id) {
+        timings.colouriseKeySelection.reset();
+    }
+    if (timings.colouriseGraphKeyDrag.has_value() &&
+        timings.colouriseGraphKeyDrag->effectId != effect->id) {
+        timings.colouriseGraphKeyDrag.reset();
+    }
+    if (timings.colouriseKeyMarquee.has_value() &&
+        timings.colouriseKeyMarquee->effectId != effect->id) {
+        timings.colouriseKeyMarquee.reset();
+    }
+    // Scrubbing is deliberately isolated on the right mouse button. The
+    // left button can therefore own selection, marquees, and key drags
+    // without unexpectedly moving the animation position first.
+    if (itemActive && ImGui::IsMouseDown(ImGuiMouseButton_Right) &&
+        !keyHelpHovered) {
+        ScrubFeatureTimelineToAuthoredPosition(
+            runtimeState,
+            positionForX(mouseX));
     }
 
     bool movedThisFrame = false;
     float movedSourcePosition = 0.0F;
     float movedDestinationPosition = 0.0F;
-    const TimingColouriseKeyLaneSeries* draggedSeries =
-        timings.colouriseLocalKeyDrag.has_value()
-            ? findMatchingSeries(
-                  timings.colouriseLocalKeyDrag.value())
-            : nullptr;
+    const TimingColouriseKeyLaneSeries* draggedSeries = nullptr;
     const auto sameMoveGroup =
         [&](const TimingColouriseKeyLaneSeries& left,
             const TimingColouriseKeyLaneSeries& right) {
-            if (sameTrack(left, right)) {
-                return true;
-            }
-            if (left.track != TimingColouriseKeyTrack::Bounds ||
-                right.track != TimingColouriseKeyTrack::Bounds ||
-                !left.boundsParameter.has_value() ||
-                !right.boundsParameter.has_value()) {
-                return false;
-            }
-            const auto geometricParameters =
-                invisible_places::timing::
-                    TimingColouriseBoundsParametersForMode(
-                        effect->boundsKeyMode);
-            const auto isGeometric =
-                [&](auto parameter) {
-                    return std::find(
-                               geometricParameters.begin(),
-                               geometricParameters.end(),
-                               parameter) !=
-                           geometricParameters.end();
-                };
-            return isGeometric(left.boundsParameter.value()) &&
-                   isGeometric(right.boundsParameter.value());
+            return sameTrack(left, right);
         };
-    // Empty lane space is a compact local scrubber. ImGui keeps the clicked
-    // item active while the button is held, so the same path supports both a
-    // single jump and continuous drag-scrubbing without stealing marker
-    // drags or double-click key editing.
-    if (!handledMarkerInteraction &&
-        draggedSeries == nullptr &&
-        ImGui::IsItemActive() &&
-        ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-        const float scrubPosition = positionForX(mouseX);
-        if (std::abs(
-                CurrentAuthoredTrackPosition(*runtimeState) -
-                scrubPosition) >
-            std::numeric_limits<float>::epsilon()) {
-            ScrubFeatureTimelineToAuthoredPosition(
-                runtimeState,
-                scrubPosition);
-        }
-    }
-    if (draggedSeries != nullptr &&
-        ImGui::IsItemActive() &&
-        ImGui::IsMouseDragging(
-            ImGuiMouseButton_Left,
-            2.0F)) {
-        auto& drag =
-            timings.colouriseLocalKeyDrag.value();
-        const float destination =
-            positionForX(mouseX);
-        if (!destinationOccupied(
-                *draggedSeries,
-                drag.currentPosition,
-                destination) &&
-            moveKey(
-                *draggedSeries,
-                drag.currentPosition,
-                destination)) {
-            movedThisFrame = true;
-            movedSourcePosition = drag.currentPosition;
-            movedDestinationPosition = destination;
-            drag.currentPosition = destination;
-            ScrubFeatureTimelineToAuthoredPosition(
-                runtimeState,
-                destination);
-            runtimeState
-                ->previewRenderStateSignatureValid =
-                false;
-        }
-    }
-    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
-        draggedSeries != nullptr) {
-        timings.colouriseLocalKeyDrag.reset();
-    }
 
     auto* drawList = ImGui::GetWindowDrawList();
     const auto markerColour =
@@ -89703,6 +90074,631 @@ void DrawTimingKeyLaneGroup(
         converted.w *= std::clamp(opacity, 0.0F, 1.0F);
         return ImGui::ColorConvertFloat4ToU32(converted);
     };
+
+    const auto handleSelected = [&](const TimingColouriseKeyHandle& handle) {
+        return TimingColouriseKeySelectionContains(
+            timings.colouriseKeySelection.has_value()
+                ? &timings.colouriseKeySelection.value()
+                : nullptr,
+            effect->id,
+            handle);
+    };
+    const auto replaceSelection =
+        [&](std::vector<TimingColouriseKeyHandle> handles,
+            std::optional<TimingColouriseKeyHandle> anchor = std::nullopt) {
+            timings.colouriseKeySelection =
+                TimingColouriseKeySelectionState{
+                    .effectId = effect->id,
+                    .keys = std::move(handles),
+                    .rangeAnchor = std::move(anchor),
+                };
+        };
+    const auto selectClickedHandle =
+        [&](const TimingColouriseKeyLaneSeries& lane,
+            float position) {
+            const auto handle =
+                TimingColouriseKeyHandleForLane(lane, position);
+            const auto& io = ImGui::GetIO();
+            const bool command = io.KeyCtrl || io.KeySuper;
+            if (io.KeyShift) {
+                std::vector<TimingColouriseKeyHandle> selected;
+                if (command && timings.colouriseKeySelection.has_value() &&
+                    timings.colouriseKeySelection->effectId == effect->id) {
+                    selected = timings.colouriseKeySelection->keys;
+                }
+                auto anchor = handle;
+                if (timings.colouriseKeySelection.has_value() &&
+                    timings.colouriseKeySelection->effectId == effect->id &&
+                    timings.colouriseKeySelection->rangeAnchor.has_value() &&
+                    sameTrack(
+                        timings.colouriseKeySelection->rangeAnchor.value(),
+                        lane)) {
+                    anchor =
+                        timings.colouriseKeySelection->rangeAnchor.value();
+                }
+                const auto [start, end] = std::minmax(
+                    anchor.position,
+                    position);
+                for (const float candidate : lane.positions) {
+                    if (candidate >= start - invisible_places::timing::
+                                               kTimingColouriseKeyTolerance &&
+                        candidate <= end + invisible_places::timing::
+                                               kTimingColouriseKeyTolerance) {
+                        AddUniqueTimingColouriseKeyHandle(
+                            &selected,
+                            TimingColouriseKeyHandleForLane(
+                                lane,
+                                candidate));
+                    }
+                }
+                replaceSelection(std::move(selected), anchor);
+                return;
+            }
+            if (command) {
+                std::vector<TimingColouriseKeyHandle> selected;
+                if (timings.colouriseKeySelection.has_value() &&
+                    timings.colouriseKeySelection->effectId == effect->id) {
+                    selected = timings.colouriseKeySelection->keys;
+                }
+                const auto existing = std::find_if(
+                    selected.begin(),
+                    selected.end(),
+                    [&](const auto& candidate) {
+                        return TimingColouriseKeyHandlesMatch(
+                            candidate,
+                            handle);
+                    });
+                if (existing == selected.end()) {
+                    selected.push_back(handle);
+                } else {
+                    selected.erase(existing);
+                }
+                replaceSelection(std::move(selected), handle);
+                return;
+            }
+            if (handleSelected(handle) &&
+                timings.colouriseKeySelection->keys.size() > 1U) {
+                timings.colouriseKeySelection->rangeAnchor = handle;
+                return;
+            }
+            replaceSelection({handle}, handle);
+        };
+
+    const ValueGraph* hoveredDotGraph = nullptr;
+    TimingColouriseKeyHandle hoveredDotHandle{};
+    float hoveredDotValue = 0.0F;
+    float hoveredDotDistance = 7.0F;
+    if (itemHovered && !keyHelpHovered) {
+        for (const auto& graph : valueGraphs) {
+            for (const float position : graph.lane->positions) {
+                if (!positionInView(position)) {
+                    continue;
+                }
+                const auto value = scalarValueAt(*graph.lane, position);
+                if (!value.has_value()) {
+                    continue;
+                }
+                const int firstOffset = graph.wrappedPalettePhase
+                    ? static_cast<int>(std::ceil(value.value() - 1.0F))
+                    : 0;
+                const int lastOffset = graph.wrappedPalettePhase
+                    ? static_cast<int>(std::floor(value.value() + 1.0F))
+                    : 0;
+                for (int offset = firstOffset;
+                     offset <= lastOffset;
+                     ++offset) {
+                    const float drawnValue = graph.wrappedPalettePhase
+                        ? value.value() - static_cast<float>(offset)
+                        : value.value();
+                    const float distance = std::hypot(
+                        mouse.x - xForPosition(position),
+                        mouse.y - yForValue(graph, drawnValue));
+                    if (distance < hoveredDotDistance) {
+                        hoveredDotDistance = distance;
+                        hoveredDotGraph = &graph;
+                        hoveredDotHandle = TimingColouriseKeyHandleForLane(
+                            *graph.lane,
+                            position);
+                        hoveredDotValue = value.value();
+                    }
+                }
+            }
+        }
+    }
+
+    const auto armKeyDrag =
+        [&](const TimingColouriseKeyHandle& clicked,
+            bool requestValueDrag) {
+            std::vector<TimingColouriseKeyHandle> handles;
+            if (timings.colouriseKeySelection.has_value() &&
+                timings.colouriseKeySelection->effectId == effect->id &&
+                handleSelected(clicked)) {
+                handles = timings.colouriseKeySelection->keys;
+            } else {
+                handles = {clicked};
+            }
+            TimingColouriseGraphKeyDragState drag{
+                .effectId = effect->id,
+                .laneGroupId = id,
+                .valueDrag = requestValueDrag &&
+                             !timings.colouriseGraphTimeOnly,
+                .mouseStartX = mouse.x,
+                .mouseStartY = mouse.y,
+                .originalEffect = *effect,
+                .handles = std::move(handles),
+                .rangeAnchor =
+                    timings.colouriseKeySelection.has_value() &&
+                            timings.colouriseKeySelection->effectId ==
+                                effect->id
+                        ? timings.colouriseKeySelection->rangeAnchor
+                        : std::nullopt,
+            };
+            if (drag.valueDrag) {
+                for (const auto& handle : drag.handles) {
+                    const auto graph = std::find_if(
+                        valueGraphs.begin(),
+                        valueGraphs.end(),
+                        [&](const auto& candidate) {
+                            return sameTrack(handle, *candidate.lane);
+                        });
+                    const auto scalar =
+                        TimingColouriseExactScalarKey(*effect, handle);
+                    if (graph == valueGraphs.end() ||
+                        !scalar.has_value()) {
+                        continue;
+                    }
+                    drag.values.push_back({
+                        .handle = handle,
+                        .originalValue = scalar->first,
+                        .unitsPerPixel =
+                            -(graph->maximum - graph->minimum) /
+                            graphHeight,
+                    });
+                }
+            }
+            timings.colouriseLocalKeyDrag.reset();
+            timings.colouriseKeyMarquee.reset();
+            timings.colouriseGraphKeyDrag = std::move(drag);
+        };
+    const auto openPositionEditor =
+        [&](const TimingColouriseKeyHandle& handle) {
+            timings.colouriseGraphKeyDrag.reset();
+            timings.colouriseLocalKeyDrag.reset();
+            timings.colouriseLocalKeyPositionEdit =
+                TimingColouriseLocalKeyPositionEditState{
+                    .effectId = effect->id,
+                    .track = handle.track,
+                    .boundsParameter = handle.boundsParameter,
+                    .effectParameter = handle.effectParameter,
+                    .sourcePosition = handle.position,
+                    .draftPosition = handle.position,
+                    .requestKeyboardFocus = true,
+                };
+            ImGui::OpenPopup("Edit Local Effect Key Position");
+        };
+
+    if (hoveredDotGraph != nullptr) {
+        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            selectClickedHandle(
+                *hoveredDotGraph->lane,
+                hoveredDotHandle.position);
+            openPositionEditor(hoveredDotHandle);
+        } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            const auto& io = ImGui::GetIO();
+            selectClickedHandle(
+                *hoveredDotGraph->lane,
+                hoveredDotHandle.position);
+            if (!io.KeyCtrl && !io.KeySuper && !io.KeyShift) {
+                armKeyDrag(hoveredDotHandle, true);
+            }
+        }
+    } else if (markerHovered && nearestSeries != nullptr) {
+        const auto handle = TimingColouriseKeyHandleForLane(
+            *nearestSeries,
+            nearestPosition);
+        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            selectClickedHandle(*nearestSeries, nearestPosition);
+            openPositionEditor(handle);
+        } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            const auto& io = ImGui::GetIO();
+            selectClickedHandle(*nearestSeries, nearestPosition);
+            if (!io.KeyCtrl && !io.KeySuper && !io.KeyShift) {
+                armKeyDrag(handle, false);
+            }
+        }
+    } else if (
+        itemHovered && !keyHelpHovered &&
+        ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        const auto& io = ImGui::GetIO();
+        const bool additive = io.KeyCtrl || io.KeySuper || io.KeyShift;
+        std::vector<TimingColouriseKeyHandle> base;
+        if (additive && timings.colouriseKeySelection.has_value() &&
+            timings.colouriseKeySelection->effectId == effect->id) {
+            base = timings.colouriseKeySelection->keys;
+        }
+        replaceSelection(base);
+        timings.colouriseGraphKeyDrag.reset();
+        timings.colouriseKeyMarquee = TimingColouriseKeyMarqueeState{
+            .effectId = effect->id,
+            .laneGroupId = id,
+            .startX = mouse.x,
+            .startY = mouse.y,
+            .currentX = mouse.x,
+            .currentY = mouse.y,
+            .additive = additive,
+            .baseSelection = std::move(base),
+        };
+    }
+
+    auto marqueeMatches = [&]() {
+        return timings.colouriseKeyMarquee.has_value() &&
+               timings.colouriseKeyMarquee->effectId == effect->id &&
+               timings.colouriseKeyMarquee->laneGroupId == id;
+    };
+    if (marqueeMatches() &&
+        ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        auto& marquee = timings.colouriseKeyMarquee.value();
+        marquee.currentX = mouse.x;
+        marquee.currentY = mouse.y;
+        if (ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0F)) {
+            const ImVec2 selectionMinimum{
+                std::min(marquee.startX, marquee.currentX),
+                std::min(marquee.startY, marquee.currentY)};
+            const ImVec2 selectionMaximum{
+                std::max(marquee.startX, marquee.currentX),
+                std::max(marquee.startY, marquee.currentY)};
+            const auto pointInside = [&](ImVec2 point) {
+                return point.x >= selectionMinimum.x &&
+                       point.x <= selectionMaximum.x &&
+                       point.y >= selectionMinimum.y &&
+                       point.y <= selectionMaximum.y;
+            };
+            auto selected = marquee.baseSelection;
+            for (const auto& lane : series) {
+                const auto graph = std::find_if(
+                    valueGraphs.begin(),
+                    valueGraphs.end(),
+                    [&](const auto& candidate) {
+                        return sameTrack(lane, *candidate.lane);
+                    });
+                for (const float position : lane.positions) {
+                    if (!positionInView(position)) {
+                        continue;
+                    }
+                    bool inside = false;
+                    if (graph == valueGraphs.end()) {
+                        inside = pointInside(
+                            ImVec2{xForPosition(position), axisY});
+                    } else if (const auto value =
+                                   scalarValueAt(lane, position);
+                               value.has_value()) {
+                        const int firstOffset = graph->wrappedPalettePhase
+                            ? static_cast<int>(
+                                  std::ceil(value.value() - 1.0F))
+                            : 0;
+                        const int lastOffset = graph->wrappedPalettePhase
+                            ? static_cast<int>(
+                                  std::floor(value.value() + 1.0F))
+                            : 0;
+                        for (int offset = firstOffset;
+                             offset <= lastOffset;
+                             ++offset) {
+                            const float drawnValue =
+                                graph->wrappedPalettePhase
+                                    ? value.value() -
+                                          static_cast<float>(offset)
+                                    : value.value();
+                            inside = inside || pointInside(ImVec2{
+                                xForPosition(position),
+                                yForValue(*graph, drawnValue)});
+                        }
+                    }
+                    if (inside) {
+                        AddUniqueTimingColouriseKeyHandle(
+                            &selected,
+                            TimingColouriseKeyHandleForLane(
+                                lane,
+                                position));
+                    }
+                }
+            }
+            replaceSelection(std::move(selected));
+        }
+    }
+
+    const bool keyboardCommandsAvailable =
+        itemFocused && !ImGui::GetIO().WantTextInput &&
+        !timings.colouriseLocalKeyPositionEdit.has_value() &&
+        !timings.colouriseGraphKeyDrag.has_value() &&
+        !timings.colouriseKeyMarquee.has_value();
+    if (keyboardCommandsAvailable) {
+        const bool command =
+            ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeySuper;
+        if (command && ImGui::IsKeyPressed(ImGuiKey_C, false)) {
+            (void)CopySelectedTimingColouriseKeys(runtimeState, *effect);
+        } else if (command && ImGui::IsKeyPressed(ImGuiKey_X, false)) {
+            if (CopySelectedTimingColouriseKeys(runtimeState, *effect)) {
+                (void)DeleteSelectedTimingColouriseKeys(
+                    runtimeState,
+                    effect);
+            }
+        } else if (command && ImGui::IsKeyPressed(ImGuiKey_V, false)) {
+            (void)PasteTimingColouriseKeysAtPlayhead(
+                runtimeState,
+                effect);
+        } else if (command && ImGui::IsKeyPressed(ImGuiKey_A, false)) {
+            std::vector<TimingColouriseKeyHandle> selected;
+            for (const auto& lane : series) {
+                for (const float position : lane.positions) {
+                    AddUniqueTimingColouriseKeyHandle(
+                        &selected,
+                        TimingColouriseKeyHandleForLane(
+                            lane,
+                            position));
+                }
+            }
+            replaceSelection(std::move(selected));
+        } else if (
+            ImGui::IsKeyPressed(ImGuiKey_Delete, false) ||
+            ImGui::IsKeyPressed(ImGuiKey_Backspace, false)) {
+            (void)DeleteSelectedTimingColouriseKeys(
+                runtimeState,
+                effect);
+        } else if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+            timings.colouriseKeySelection.reset();
+        }
+    }
+
+    const auto dragMatches = [&]() {
+        return timings.colouriseGraphKeyDrag.has_value() &&
+               timings.colouriseGraphKeyDrag->effectId == effect->id &&
+               timings.colouriseGraphKeyDrag->laneGroupId == id;
+    };
+    if (dragMatches() && itemActive &&
+        ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0F)) {
+        const auto& drag = timings.colouriseGraphKeyDrag.value();
+        float offset =
+            positionForX(mouse.x) - positionForX(drag.mouseStartX);
+        float first = 1.0F;
+        float last = 0.0F;
+        for (const auto& handle : drag.handles) {
+            first = std::min(first, handle.position);
+            last = std::max(last, handle.position);
+        }
+        offset = std::clamp(offset, -first, 1.0F - last);
+
+        const auto isDraggedHandle =
+            [&](const TimingColouriseKeyHandle& handle) {
+                return std::any_of(
+                    drag.handles.begin(),
+                    drag.handles.end(),
+                    [&](const auto& selected) {
+                        return TimingColouriseKeyHandlesMatch(
+                            selected,
+                            handle);
+                    });
+            };
+        std::vector<TimingColouriseKeyHandle> existingHandles;
+        for (const float position : invisible_places::timing::
+                 TimingColourisePaletteKeyPositions(
+                     drag.originalEffect)) {
+            existingHandles.push_back({
+                .track = TimingColouriseKeyTrack::Palette,
+                .position = position,
+            });
+        }
+        for (const auto& key :
+             drag.originalEffect.boundsParameterKeys) {
+            existingHandles.push_back({
+                .track = TimingColouriseKeyTrack::Bounds,
+                .boundsParameter = key.parameter,
+                .position = key.position,
+            });
+        }
+        for (const auto& key :
+             drag.originalEffect.effectParameterKeys) {
+            existingHandles.push_back({
+                .track = TimingColouriseKeyTrack::EffectParameter,
+                .effectParameter = key.parameter,
+                .position = key.position,
+            });
+        }
+        bool collision = false;
+        for (const auto& selected : drag.handles) {
+            auto destination = selected;
+            destination.position += offset;
+            collision = collision || std::any_of(
+                existingHandles.begin(),
+                existingHandles.end(),
+                [&](const auto& existing) {
+                    return !isDraggedHandle(existing) &&
+                           existing.track == destination.track &&
+                           existing.boundsParameter ==
+                               destination.boundsParameter &&
+                           existing.effectParameter ==
+                               destination.effectParameter &&
+                           std::abs(
+                               existing.position -
+                               destination.position) <=
+                               invisible_places::timing::
+                                   kTimingColouriseKeyTolerance;
+                });
+        }
+        if (!collision) {
+            auto updated = drag.originalEffect;
+            constexpr float kPaletteClusterTolerance =
+                invisible_places::timing::
+                    kTimingColouriseKeyTolerance * 4.0F;
+            const auto movedPosition =
+                [&](TimingColouriseKeyTrack track,
+                    auto boundsParameter,
+                    auto effectParameter,
+                    float sourcePosition) {
+                    for (const auto& selected : drag.handles) {
+                        if (selected.track == track &&
+                            selected.boundsParameter == boundsParameter &&
+                            selected.effectParameter == effectParameter &&
+                            std::abs(
+                                selected.position - sourcePosition) <=
+                                (track == TimingColouriseKeyTrack::Palette
+                                     ? kPaletteClusterTolerance
+                                     : invisible_places::timing::
+                                           kTimingColouriseKeyTolerance)) {
+                            return std::clamp(
+                                selected.position + offset,
+                                0.0F,
+                                1.0F);
+                        }
+                    }
+                    return sourcePosition;
+                };
+            for (auto& key : updated.paletteKeys) {
+                key.position = movedPosition(
+                    TimingColouriseKeyTrack::Palette,
+                    std::optional<invisible_places::timing::
+                        TimingColouriseBoundsParameter>{},
+                    std::optional<invisible_places::timing::
+                        TimingColouriseEffectParameter>{},
+                    key.position);
+            }
+            for (auto& key : updated.paletteStopParameterKeys) {
+                key.position = movedPosition(
+                    TimingColouriseKeyTrack::Palette,
+                    std::optional<invisible_places::timing::
+                        TimingColouriseBoundsParameter>{},
+                    std::optional<invisible_places::timing::
+                        TimingColouriseEffectParameter>{},
+                    key.position);
+            }
+            for (auto& key : updated.boundsParameterKeys) {
+                key.position = movedPosition(
+                    TimingColouriseKeyTrack::Bounds,
+                    std::optional{key.parameter},
+                    std::optional<invisible_places::timing::
+                        TimingColouriseEffectParameter>{},
+                    key.position);
+            }
+            for (auto& key : updated.effectParameterKeys) {
+                key.position = movedPosition(
+                    TimingColouriseKeyTrack::EffectParameter,
+                    std::optional<invisible_places::timing::
+                        TimingColouriseBoundsParameter>{},
+                    std::optional{key.parameter},
+                    key.position);
+            }
+
+            const auto destinationRange =
+                TimingColouriseSelectorRangeFromStats(
+                    runtimeState,
+                    updated.field);
+            for (const auto& valueDrag : drag.values) {
+                float value = valueDrag.originalValue +
+                              (mouse.y - drag.mouseStartY) *
+                                  valueDrag.unitsPerPixel;
+                if (valueDrag.handle.track ==
+                        TimingColouriseKeyTrack::Bounds &&
+                    valueDrag.handle.boundsParameter.has_value()) {
+                    const auto parameter =
+                        valueDrag.handle.boundsParameter.value();
+                    if (destinationRange.has_value() &&
+                        parameter != invisible_places::timing::
+                                         TimingColouriseBoundsParameter::
+                                             EdgeFade) {
+                        const auto [rangeMinimum, rangeMaximum] =
+                            std::minmax(
+                                destinationRange->first,
+                                destinationRange->second);
+                        if (parameter == invisible_places::timing::
+                                             TimingColouriseBoundsParameter::
+                                                 Spread) {
+                            value = std::clamp(
+                                value,
+                                0.0F,
+                                rangeMaximum - rangeMinimum);
+                        } else {
+                            value = std::clamp(
+                                value,
+                                rangeMinimum,
+                                rangeMaximum);
+                        }
+                    }
+                    const auto found = std::find_if(
+                        updated.boundsParameterKeys.begin(),
+                        updated.boundsParameterKeys.end(),
+                        [&](const auto& key) {
+                            return key.parameter == parameter &&
+                                   std::abs(
+                                       key.position -
+                                       (valueDrag.handle.position +
+                                        offset)) <=
+                                       invisible_places::timing::
+                                           kTimingColouriseKeyTolerance;
+                        });
+                    if (found != updated.boundsParameterKeys.end()) {
+                        found->value = value;
+                        updated.boundsEdited = true;
+                    }
+                } else if (
+                    valueDrag.handle.track ==
+                        TimingColouriseKeyTrack::EffectParameter &&
+                    valueDrag.handle.effectParameter.has_value()) {
+                    const auto parameter =
+                        valueDrag.handle.effectParameter.value();
+                    const auto found = std::find_if(
+                        updated.effectParameterKeys.begin(),
+                        updated.effectParameterKeys.end(),
+                        [&](const auto& key) {
+                            return key.parameter == parameter &&
+                                   std::abs(
+                                       key.position -
+                                       (valueDrag.handle.position +
+                                        offset)) <=
+                                       invisible_places::timing::
+                                           kTimingColouriseKeyTolerance;
+                        });
+                    if (found != updated.effectParameterKeys.end()) {
+                        found->value = value;
+                    }
+                }
+            }
+            *effect = invisible_places::timing::
+                SanitizeTimingColouriseEffect(std::move(updated));
+            std::vector<TimingColouriseKeyHandle> movedHandles =
+                drag.handles;
+            for (auto& handle : movedHandles) {
+                handle.position = std::clamp(
+                    handle.position + offset,
+                    0.0F,
+                    1.0F);
+            }
+            auto anchor = drag.rangeAnchor;
+            if (anchor.has_value() && isDraggedHandle(anchor.value())) {
+                anchor->position = std::clamp(
+                    anchor->position + offset,
+                    0.0F,
+                    1.0F);
+            }
+            replaceSelection(std::move(movedHandles), anchor);
+            if (!drag.handles.empty()) {
+                ScrubFeatureTimelineToAuthoredPosition(
+                    runtimeState,
+                    std::clamp(
+                        drag.handles.front().position + offset,
+                        0.0F,
+                        1.0F));
+            }
+            runtimeState->previewRenderStateSignatureValid = false;
+        }
+    }
+    if (dragMatches() &&
+        !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        timings.colouriseGraphKeyDrag.reset();
+    }
+    if (marqueeMatches() &&
+        !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        timings.colouriseKeyMarquee.reset();
+    }
+
     if (const auto phaseGraph = std::find_if(
             valueGraphs.begin(),
             valueGraphs.end(),
@@ -89911,6 +90907,10 @@ void DrawTimingKeyLaneGroup(
                 const ImVec2 point{
                     xForPosition(drawnPosition),
                     yForValue(graph, drawnValue)};
+                const bool selected = handleSelected(
+                    TimingColouriseKeyHandleForLane(
+                        *graph.lane,
+                        position));
                 const ImU32 pointColour = colourWithOpacity(
                     markerColour(
                         graph.lane->colour,
@@ -89922,12 +90922,16 @@ void DrawTimingKeyLaneGroup(
                     pointColour);
                 drawList->AddCircle(
                     point,
-                    primary ? 4.25F : 3.3F,
-                    colourWithOpacity(
-                        ImGui::GetColorU32(ImGuiCol_Border),
-                        primary ? 1.0F : 0.45F),
+                    selected && primary
+                        ? 5.5F
+                        : primary ? 4.25F : 3.3F,
+                    selected && primary
+                        ? ImGui::GetColorU32(ImGuiCol_SliderGrabActive)
+                        : colourWithOpacity(
+                              ImGui::GetColorU32(ImGuiCol_Border),
+                              primary ? 1.0F : 0.45F),
                     0,
-                    1.0F);
+                    selected && primary ? 2.0F : 1.0F);
             }
         }
     }
@@ -90000,7 +91004,20 @@ void DrawTimingKeyLaneGroup(
                 std::abs(position - nearestPosition) <=
                     invisible_places::timing::
                         kTimingColouriseKeyTolerance;
-            if (isMovedMarker) {
+            const bool selected = handleSelected(
+                TimingColouriseKeyHandleForLane(lane, position));
+            if (selected) {
+                drawList->AddCircleFilled(
+                    ImVec2{x, axisY},
+                    4.25F,
+                    drawnColour);
+                drawList->AddCircle(
+                    ImVec2{x, axisY},
+                    5.75F,
+                    ImGui::GetColorU32(ImGuiCol_SliderGrabActive),
+                    0,
+                    2.0F);
+            } else if (isMovedMarker) {
                 drawList->AddCircleFilled(
                     ImVec2{x, axisY},
                     4.25F,
@@ -90026,7 +91043,8 @@ void DrawTimingKeyLaneGroup(
             }
         }
     }
-    if (markerHovered && nearestSeries != nullptr) {
+    if (markerHovered && nearestSeries != nullptr &&
+        hoveredDotGraph == nullptr) {
         const float drawnPosition =
             movedThisFrame && draggedSeries != nullptr &&
                     sameMoveGroup(*draggedSeries, *nearestSeries) &&
@@ -90042,7 +91060,119 @@ void DrawTimingKeyLaneGroup(
             markerColour(
                 nearestSeries->colour,
                 drawnPosition));
-    } else if (ImGui::IsItemHovered()) {
+    }
+
+    if (marqueeMatches() &&
+        ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0F)) {
+        const auto& marquee = timings.colouriseKeyMarquee.value();
+        const ImVec2 selectionMinimum{
+            std::min(marquee.startX, marquee.currentX),
+            std::min(marquee.startY, marquee.currentY)};
+        const ImVec2 selectionMaximum{
+            std::max(marquee.startX, marquee.currentX),
+            std::max(marquee.startY, marquee.currentY)};
+        drawList->AddRectFilled(
+            selectionMinimum,
+            selectionMaximum,
+            ImGui::GetColorU32(ImVec4{0.30F, 0.62F, 0.90F, 0.16F}));
+        drawList->AddRect(
+            selectionMinimum,
+            selectionMaximum,
+            ImGui::GetColorU32(ImVec4{0.42F, 0.72F, 1.0F, 0.88F}),
+            0.0F,
+            0,
+            1.25F);
+    }
+
+    drawList->AddCircleFilled(
+        helpCentre,
+        7.0F,
+        ImGui::GetColorU32(
+            keyHelpHovered ? ImGuiCol_ButtonHovered : ImGuiCol_Button));
+    drawList->AddCircle(
+        helpCentre,
+        7.0F,
+        ImGui::GetColorU32(ImGuiCol_Border));
+    const ImVec2 helpTextSize = ImGui::CalcTextSize("?");
+    drawList->AddText(
+        ImVec2{
+            helpCentre.x - helpTextSize.x * 0.5F,
+            helpCentre.y - helpTextSize.y * 0.5F},
+        ImGui::GetColorU32(ImGuiCol_Text),
+        "?");
+
+    if (keyHelpHovered) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted("Visual Feature keyframe graph");
+        ImGui::Separator();
+        ImGui::TextUnformatted(
+            "Right-click or right-drag to scrub the animation position.");
+        ImGui::TextUnformatted(
+            "Left-click selects a key; drag a curve dot to change time and value.");
+        ImGui::TextUnformatted(
+            "Drag a lower marker, or enable Time-only drag, to change time only.");
+        ImGui::TextUnformatted(
+            "Left-drag empty space for a selection window. Cmd/Ctrl-click toggles; Shift-click selects a range.");
+        ImGui::TextUnformatted(
+            "Cmd/Ctrl+A selects this graph. C, X, and V copy, cut, and paste at the playhead. Delete removes; Esc clears.");
+        ImGui::TextUnformatted(
+            "Double-click a key to enter its exact normalized animation position.");
+        ImGui::Separator();
+        const float position =
+            CurrentAuthoredTrackPosition(*runtimeState);
+        ImGui::Text("At animation position %.4f:", position);
+        for (const auto& lane : series) {
+            if (const auto value = scalarValueAt(lane, position);
+                value.has_value()) {
+                ImGui::BulletText(
+                    "%s = %.6g",
+                    lane.label,
+                    value.value());
+            } else {
+                ImGui::BulletText("%s keys", lane.label);
+            }
+        }
+        ImGui::EndTooltip();
+    } else if (hoveredDotGraph != nullptr) {
+        if (hoveredDotGraph->wrappedPalettePhase) {
+            const auto exact = TimingColouriseExactScalarKey(
+                *effect,
+                hoveredDotHandle);
+            ImGui::SetTooltip(
+                "%s key\nDelta = %.6g turns; accumulated = %.6g turns\nAnimation position %.4f\nLeft-drag changes time%s; double-click enters an exact position.",
+                hoveredDotGraph->lane->label,
+                exact.has_value() ? exact->first : 0.0F,
+                hoveredDotValue,
+                hoveredDotHandle.position,
+                timings.colouriseGraphTimeOnly
+                    ? " only"
+                    : " and value");
+        } else {
+            ImGui::SetTooltip(
+                "%s key\nValue = %.6g\nAnimation position %.4f\nLeft-drag changes time%s; double-click enters an exact position.",
+                hoveredDotGraph->lane->label,
+                hoveredDotValue,
+                hoveredDotHandle.position,
+                timings.colouriseGraphTimeOnly
+                    ? " only"
+                    : " and value");
+        }
+    } else if (markerHovered && nearestSeries != nullptr) {
+        const auto markerValue =
+            scalarValueAt(*nearestSeries, nearestPosition);
+        if (markerValue.has_value()) {
+            ImGui::SetTooltip(
+                "%s key\nValue = %.6g\nAnimation position %.4f\nLeft-drag this lower marker to change time only.",
+                nearestSeries->label,
+                markerValue.value(),
+                nearestPosition);
+        } else {
+            ImGui::SetTooltip(
+                "%s key\nAnimation position %.4f\nLeft-drag this lower marker to change time only.",
+                nearestSeries->label,
+                nearestPosition);
+        }
+    } else if (itemHovered) {
         const float startDistance = positionInView(activation.start)
             ? std::abs(
                   mouseX - xForPosition(activation.start))
@@ -90079,7 +91209,7 @@ void DrawTimingKeyLaneGroup(
             }
         } else {
             ImGui::SetTooltip(
-                "Animation position %.4f — click or drag to scrub. Drag coloured key markers on the horizontal axis to retime them.",
+                "Animation position %.4f\nRight-click or right-drag to scrub. Left-drag empty space to select keys.",
                 positionForX(mouseX));
         }
     }
@@ -90178,6 +91308,32 @@ void DrawTimingKeyLaneGroup(
                         *editorSeries,
                         editor->sourcePosition,
                         editor->draftPosition)) {
+                    const auto movedHandle =
+                        TimingColouriseKeyHandleForLane(
+                            *editorSeries,
+                            editor->sourcePosition);
+                    if (timings.colouriseKeySelection.has_value() &&
+                        timings.colouriseKeySelection->effectId ==
+                            effect->id) {
+                        for (auto& selected :
+                             timings.colouriseKeySelection->keys) {
+                            if (TimingColouriseKeyHandlesMatch(
+                                    selected,
+                                    movedHandle)) {
+                                selected.position =
+                                    editor->draftPosition;
+                            }
+                        }
+                        if (timings.colouriseKeySelection->rangeAnchor
+                                .has_value() &&
+                            TimingColouriseKeyHandlesMatch(
+                                timings.colouriseKeySelection
+                                    ->rangeAnchor.value(),
+                                movedHandle)) {
+                            timings.colouriseKeySelection->rangeAnchor
+                                ->position = editor->draftPosition;
+                        }
+                    }
                     ScrubFeatureTimelineToAuthoredPosition(
                         runtimeState,
                         editor->draftPosition);
@@ -90199,6 +91355,21 @@ void DrawTimingKeyLaneGroup(
          !ImGui::IsPopupOpen(
              "Edit Local Effect Key Position"))) {
         editor.reset();
+    }
+    if (drawsValueGraph) {
+        ImGui::Checkbox(
+            "Time-only drag",
+            &timings.colouriseGraphTimeOnly);
+        DrawTimingControlTooltip(
+            "When enabled, dragging a curve key changes only its animation position. Lower rail markers always change time only.");
+        if (timings.colouriseKeySelection.has_value() &&
+            timings.colouriseKeySelection->effectId == effect->id &&
+            !timings.colouriseKeySelection->keys.empty()) {
+            ImGui::SameLine();
+            ImGui::TextDisabled(
+                "%zu selected",
+                timings.colouriseKeySelection->keys.size());
+        }
     }
     ImGui::PopID();
 }
@@ -91002,7 +92173,7 @@ void DrawTimingEmissiveLevelEditor(
     };
     ImGui::TextDisabled("Value over animation position");
     DrawTimingControlTooltip(
-        "Curve height shows the evaluated setting value, scaled from that setting's visible minimum at the horizontal axis to its maximum at the top. Key dots show authored values; drag their matching coloured axis markers to retime them.");
+        "Curve height shows the evaluated setting value. Left-drag a key dot to change its time and value, or its lower marker to retime only. Left-drag empty space to window-select; right-drag scrubs.");
     DrawTimingKeyLaneGroup(
         "##TimingEmissiveLevelKeyLane",
         runtimeState,
@@ -91909,7 +93080,7 @@ void DrawTimingColourisePaletteEditor(
     };
     ImGui::TextDisabled("Value over animation position");
     DrawTimingControlTooltip(
-        "Colourise Amount uses its own visible value range. Colour Phase uses a fixed -1 to +1 turn range and draws integer-shifted copies of its accumulated curve so every wrap remains visible. Drag the matching coloured markers on the horizontal axis to retime keys.");
+        "Colourise Amount uses its own visible value range. Colour Phase uses a fixed -1 to +1 turn range with wrapped copies. Left-drag dots to edit time and value; lower markers and Time-only drag retime only. Right-drag scrubs.");
     DrawTimingKeyLaneGroup(
         "##TimingColouriseEffectParameterKeyLane",
         runtimeState,
@@ -94526,7 +95697,7 @@ void DrawTimingColouriseBoundsEditor(
     }
     ImGui::TextDisabled("Value over animation position");
     DrawTimingControlTooltip(
-        "Allowed Bounds settings are drawn as coloured evaluated curves, each scaled over its own visible value range. Key dots are visual; drag matching coloured markers on the horizontal axis to retime keys.");
+        "Allowed Bounds settings are drawn as coloured evaluated curves. Left-drag dots to edit time and value, left-drag empty space to window-select, and use lower markers or Time-only drag to retime only. Right-drag scrubs.");
     DrawTimingKeyLaneGroup(
         "##TimingColouriseBoundsParameterKeyLane",
         runtimeState,
@@ -94679,6 +95850,9 @@ void DrawTimingColouriseTimelineZoomToggle(
                 ? TimingColouriseTimelineView::ActiveRange
                 : TimingColouriseTimelineView::FullAnimation;
         timings.colouriseLocalKeyDrag.reset();
+        ClearTimingColouriseGraphInteraction(
+            &timings,
+            /*clearSelection=*/false);
     }
     DrawTimingControlTooltip(
         activeRangeView
@@ -94726,6 +95900,7 @@ void DrawTimingColouriseActivationOverview(
             TimingColouriseHistogramHandle::None;
         timings.colouriseLocalKeyDrag.reset();
         timings.colouriseLocalKeyPositionEdit.reset();
+        ClearTimingColouriseGraphInteraction(&timings);
         timings.colouriseActivationDrag.reset();
         timings.colouriseSettingsClipDrag.reset();
         timings.colouriseOverviewHelpHover.reset();
@@ -95878,6 +97053,7 @@ void DrawTimingColouriseSection(
             TimingColouriseHistogramHandle::None;
         timings.colouriseLocalKeyDrag.reset();
         timings.colouriseLocalKeyPositionEdit.reset();
+        ClearTimingColouriseGraphInteraction(&timings);
         timings.colouriseActivationDrag.reset();
         timings.colouriseSettingsClipDrag.reset();
         timings.colouriseOverviewHelpHover.reset();
@@ -95975,6 +97151,7 @@ void DrawTimingColouriseSection(
             timings.colourisePaletteDrag.reset();
             timings.colouriseLocalKeyDrag.reset();
             timings.colouriseLocalKeyPositionEdit.reset();
+            ClearTimingColouriseGraphInteraction(&timings);
             timings.colouriseActivationDrag.reset();
             timings.colouriseSettingsClipDrag.reset();
             timings.colouriseOverviewHelpHover.reset();
@@ -99581,6 +100758,7 @@ void DrawControlsWindow(
             TimingColouriseHistogramHandle::None;
         timings.colouriseLocalKeyDrag.reset();
         timings.colouriseLocalKeyPositionEdit.reset();
+        ClearTimingColouriseGraphInteraction(&timings);
         timings.colouriseActivationDrag.reset();
         timings.colouriseSettingsClipDrag.reset();
         timings.colouriseOverviewHelpHover.reset();
