@@ -3550,6 +3550,11 @@ struct PreviewRuntimeState {
     bool exportUsesEditedScenario = false;
     ControlsTab activeControlsTab = ControlsTab::Visuals;
     std::array<ImVec4, 9> controlsTabHitRects{};
+    // Milliseconds each controls tab spent building its UI last frame, with a
+    // decaying per-tab peak; surfaced in the Debug window so a laggy tab is
+    // attributable without a profiler.
+    std::array<float, 9> controlsTabDrawMilliseconds{};
+    std::array<float, 9> controlsTabDrawPeakMilliseconds{};
     bool pauseLiveViewportDuringExport = true;
     bool previewRenderStateSignatureValid = false;
     std::uint64_t previewRenderStateSignature = 0;
@@ -80821,6 +80826,36 @@ void DrawDebugGeneralSection(
             diagnostics.framePlatformWindowsMs,
             diagnostics.averageFramePlatformWindowsMs);
         ImGui::Separator();
+        ImGui::TextDisabled("Controls tab UI build (last / decaying peak)");
+        {
+            constexpr std::array<const char*, 9> kControlsTabNames{{
+                "Visuals",
+                "Water",
+                "Camera",
+                "Animation",
+                "Timings",
+                "Export",
+                "Project",
+                "Lidar",
+                "gSplat"}};
+            for (std::size_t index = 0;
+                 index < runtimeState->controlsTabDrawMilliseconds.size();
+                 ++index) {
+                const float last =
+                    runtimeState->controlsTabDrawMilliseconds[index];
+                const float peak =
+                    runtimeState->controlsTabDrawPeakMilliseconds[index];
+                if (last <= 0.0F && peak <= 0.01F) {
+                    continue;  // Tab has not been opened this session.
+                }
+                ImGui::Text(
+                    "%s: %.2f ms / %.2f ms",
+                    kControlsTabNames[index],
+                    last,
+                    peak);
+            }
+        }
+        ImGui::Separator();
         ImGui::TextDisabled("Synchronization");
         ImGui::Text(
             "Submitted: serial %llu, slot %u, image %u",
@@ -99914,6 +99949,9 @@ void DrawControlsWindow(
     constexpr ImGuiWindowFlags tabScrollFlags = ImGuiWindowFlags_AlwaysVerticalScrollbar;
     runtimeState->controlsTabHitRects.fill(ImVec4{});
     ImGui::BeginDisabled(liveCameraEditActive);
+    // Only the selected tab builds its body each frame, so the whole tab-bar
+    // duration is attributable to the active tab (header row cost is noise).
+    const auto tabBodiesStartedAt = std::chrono::steady_clock::now();
     if (ImGui::BeginTabBar("ScenePanelTabs")) {
         const auto beginControlsTabItem =
             [&](const char* label,
@@ -100048,6 +100086,23 @@ void DrawControlsWindow(
             ImGui::EndPopup();
         }
         ImGui::EndTabBar();
+    }
+    {
+        const float drawMilliseconds =
+            std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - tabBodiesStartedAt)
+                .count();
+        const auto tabIndex =
+            static_cast<std::size_t>(runtimeState->activeControlsTab);
+        if (tabIndex < runtimeState->controlsTabDrawMilliseconds.size()) {
+            runtimeState->controlsTabDrawMilliseconds[tabIndex] =
+                drawMilliseconds;
+            auto& peak =
+                runtimeState->controlsTabDrawPeakMilliseconds[tabIndex];
+            // Peak decays slowly so a one-frame hitch stays readable without
+            // pinning the display forever.
+            peak = std::max(drawMilliseconds, peak * 0.995F);
+        }
     }
     ImGui::EndDisabled();
 
