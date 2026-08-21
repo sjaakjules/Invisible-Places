@@ -652,6 +652,14 @@ struct FrozenRenderSetupProvenance {
     std::filesystem::path setupDocumentPath;
 };
 
+// One timed step of export-start setup. The recorded labels surface in the
+// export log and the progress overlay, so a slow start is attributable to a
+// specific phase instead of reading as one opaque freeze.
+struct ExportStartupPhase {
+    std::string label;
+    std::chrono::steady_clock::duration duration{};
+};
+
 struct QueuedQuickMp4Export {
     AnimationPath animationPath{};
     std::vector<invisible_places::water::WaterScenarioDefinition> waterScenarios;
@@ -1543,6 +1551,9 @@ struct AnimationPanelState {
     // the main loop restarts the batch automatically once loads go idle, so
     // the click does not have to be repeated.
     bool quickMp4BatchStartPending = false;
+    // Setup timings recorded while the batch queue was built; the first
+    // started batch job absorbs them into its export log.
+    std::vector<ExportStartupPhase> quickMp4QueuePhases;
     // User-typed text appended to export output names. Read when each job
     // starts (sanitized), so editing it mid-batch tags every job that has
     // not opened its output yet.
@@ -2004,6 +2015,7 @@ struct ExportMemorySample {
 
 struct ExportLogState {
     std::filesystem::path path;
+    std::vector<ExportStartupPhase> startupPhases;
     std::chrono::system_clock::time_point startedWallTime{};
     std::chrono::steady_clock::time_point startedAt{};
     ProcessMemorySnapshot startMemory{};
@@ -3513,6 +3525,9 @@ struct PreviewRuntimeState {
     // alter the queued render.
     std::shared_ptr<ResolvedRenderSetupSnapshot>
         pendingCurrentRenderSnapshot;
+    // Export Current defers its heavy setup by one frame so the click paints
+    // the "Starting export" card before the app pauses for setup work.
+    bool currentExportStartQueued = false;
     std::shared_ptr<ResolvedRenderSetupSnapshot>
         pendingFramePreviewSnapshot;
     // Render Current View freezes the click-time viewport camera here so a
@@ -33880,6 +33895,58 @@ ExportLogState MakeExportLogState(
     return log;
 }
 
+// Runs one export-start step and appends its duration to the phase list.
+template <typename Fn>
+auto RunExportStartupPhase(
+    std::vector<ExportStartupPhase>* phases,
+    std::string label,
+    Fn&& fn) {
+    const auto startedAt = std::chrono::steady_clock::now();
+    if constexpr (std::is_void_v<std::invoke_result_t<Fn&>>) {
+        fn();
+        phases->push_back(
+            {std::move(label), std::chrono::steady_clock::now() - startedAt});
+    } else {
+        auto result = fn();
+        phases->push_back(
+            {std::move(label), std::chrono::steady_clock::now() - startedAt});
+        return result;
+    }
+}
+
+std::chrono::steady_clock::duration ExportStartupPhaseTotal(
+    const std::vector<ExportStartupPhase>& phases) {
+    auto total = std::chrono::steady_clock::duration{};
+    for (const auto& phase : phases) {
+        total += phase.duration;
+    }
+    return total;
+}
+
+// One compact line for progress UI: total setup time plus the slowest steps.
+std::string ExportStartupPhaseSummaryLine(
+    const std::vector<ExportStartupPhase>& phases,
+    std::size_t maximumDetailCount = 3U) {
+    if (phases.empty()) {
+        return {};
+    }
+    auto ranked = phases;
+    std::stable_sort(
+        ranked.begin(),
+        ranked.end(),
+        [](const ExportStartupPhase& left, const ExportStartupPhase& right) {
+            return left.duration > right.duration;
+        });
+    std::string line =
+        "Setup " + FormatDurationForLog(ExportStartupPhaseTotal(phases)) + ":";
+    const auto detailCount = std::min(maximumDetailCount, ranked.size());
+    for (std::size_t index = 0U; index < detailCount; ++index) {
+        line += (index == 0U ? " " : ", ") + ranked[index].label + " " +
+                FormatDurationForLog(ranked[index].duration);
+    }
+    return line;
+}
+
 void SampleExportLogMemory(
     OfflineRenderJobState* job,
     std::optional<ExportMemorySampleStage> stage = std::nullopt) {
@@ -35457,6 +35524,17 @@ std::string WriteExportLog(
     log << "Started: " << FormatLocalTime(job.exportLog.startedWallTime, "%Y-%m-%d %H:%M:%S") << '\n';
     log << "Finished: " << FormatLocalTime(finishedWallTime, "%Y-%m-%d %H:%M:%S") << '\n';
     log << "Duration: " << FormatDurationForLog(duration) << '\n';
+    if (!job.exportLog.startupPhases.empty()) {
+        log << "Setup total: "
+            << FormatDurationForLog(
+                   ExportStartupPhaseTotal(job.exportLog.startupPhases))
+            << '\n';
+        log << "Setup phases:\n";
+        for (const auto& phase : job.exportLog.startupPhases) {
+            log << "  - " << phase.label << ": "
+                << FormatDurationForLog(phase.duration) << '\n';
+        }
+    }
     const bool cancelled =
         job.cancelRequested ||
         statusMessage.find("cancelled") != std::string::npos ||
@@ -37614,7 +37692,15 @@ QuickMp4ExportStartResult StartQuickMp4ExportJob(
         }
     }
 
-    auto frames = invisible_places::output::BuildAnimationRenderSequence(request.animationPath, settings);
+    std::vector<ExportStartupPhase> startupPhases;
+    auto frames = RunExportStartupPhase(
+        &startupPhases,
+        "Render sequence",
+        [&] {
+            return invisible_places::output::BuildAnimationRenderSequence(
+                request.animationPath,
+                settings);
+        });
     if (frames.empty()) {
         runtimeState->errorMessage = "Animation " + request.animationPath.name +
                                      " did not produce any output frames.";
@@ -37634,18 +37720,30 @@ QuickMp4ExportStartResult StartQuickMp4ExportJob(
     }};
     const auto exportRendererMode =
         waterSnapshot.pointCloudRendererMode;
-    const auto frustumMaskSummary = PrepareAnimationExportFrustumMasks(
-        runtimeState,
-        viewport,
-        std::span<const invisible_places::camera::CameraState>{frames.data(), frames.size()},
-        settings,
-        visualOverride,
-        exportRendererMode);
-    auto exportPointCloudLayers = BuildAnimationExportPointCloudLayerSnapshot(
-        *runtimeState,
-        frustumMaskSummary.enabled,
-        visualOverride,
-        exportRendererMode);
+    const auto frustumMaskSummary = RunExportStartupPhase(
+        &startupPhases,
+        "Camera-path frustum masks",
+        [&] {
+            return PrepareAnimationExportFrustumMasks(
+                runtimeState,
+                viewport,
+                std::span<const invisible_places::camera::CameraState>{
+                    frames.data(),
+                    frames.size()},
+                settings,
+                visualOverride,
+                exportRendererMode);
+        });
+    auto exportPointCloudLayers = RunExportStartupPhase(
+        &startupPhases,
+        "Export layer snapshot",
+        [&] {
+            return BuildAnimationExportPointCloudLayerSnapshot(
+                *runtimeState,
+                frustumMaskSummary.enabled,
+                visualOverride,
+                exportRendererMode);
+        });
     std::vector<std::size_t> requestVisualLayerIds;
     requestVisualLayerIds.reserve(exportPointCloudLayers.size());
     for (const auto& layer : exportPointCloudLayers) {
@@ -37675,18 +37773,27 @@ QuickMp4ExportStartResult StartQuickMp4ExportJob(
     }
     const auto effectiveSeepageInvocations =
         waterSnapshot.effectiveSeepageInvocations;
-    auto frozenSeepageLayers =
-        BuildQueuedQuickMp4SeepageLayers(
-            waterSnapshot,
-            effectiveRainProfile.settings);
+    auto frozenSeepageLayers = RunExportStartupPhase(
+        &startupPhases,
+        "Seepage freeze",
+        [&] {
+            return BuildQueuedQuickMp4SeepageLayers(
+                waterSnapshot,
+                effectiveRainProfile.settings);
+        });
     auto frozenFlowSourceLayers =
         waterSnapshot.frozenFlowSourceLayers;
     if (viewport != nullptr) {
-        for (const auto& frozenLayer : frozenSeepageLayers) {
-            viewport->UploadWaterSeepageTopology(
-                frozenLayer.layerId,
-                frozenLayer.grid);
-        }
+        RunExportStartupPhase(
+            &startupPhases,
+            "Seepage GPU upload",
+            [&] {
+                for (const auto& frozenLayer : frozenSeepageLayers) {
+                    viewport->UploadWaterSeepageTopology(
+                        frozenLayer.layerId,
+                        frozenLayer.grid);
+                }
+            });
     }
 
     const auto setupSize = viewport != nullptr ? CurrentFramebufferViewportSize(*viewport) : ImVec2{1.0F, 1.0F};
@@ -37820,30 +37927,55 @@ QuickMp4ExportStartResult StartQuickMp4ExportJob(
         .exportPointCloudLayers = std::move(exportPointCloudLayers),
         .writerState = writerState,
     };
-    runtimeState->offlineRenderJob.seepageRainEnvelope =
-        BuildFrozenAnimationSeepageRainEnvelope(
-            runtimeState->offlineRenderJob.animationPath,
-            runtimeState->offlineRenderJob.waterScenarios);
-    FreezeQueuedQuickMp4AuthoredTimingState(
-        &runtimeState->offlineRenderJob,
-        waterSnapshot);
-    SynchronizeOfflineRenderJobProvenanceCounts(
-        &runtimeState->offlineRenderJob);
-    FreezeAnimationDynamicMeshFlow(
-        &runtimeState->offlineRenderJob,
-        *runtimeState,
-        runtimeState->offlineRenderJob.exportPointCloudLayers,
-        &waterSnapshot.dynamicMeshFlowSettings);
+    // Batch queue-building timings ride along with the first started job.
+    auto& panelQueuePhases =
+        runtimeState->animationPanel.quickMp4QueuePhases;
+    if (!panelQueuePhases.empty()) {
+        startupPhases.insert(
+            startupPhases.begin(),
+            std::make_move_iterator(panelQueuePhases.begin()),
+            std::make_move_iterator(panelQueuePhases.end()));
+        panelQueuePhases.clear();
+    }
+    runtimeState->offlineRenderJob.exportLog.startupPhases =
+        std::move(startupPhases);
+    auto& jobStartupPhases =
+        runtimeState->offlineRenderJob.exportLog.startupPhases;
+    RunExportStartupPhase(
+        &jobStartupPhases,
+        "Water timing freeze",
+        [&] {
+            runtimeState->offlineRenderJob.seepageRainEnvelope =
+                BuildFrozenAnimationSeepageRainEnvelope(
+                    runtimeState->offlineRenderJob.animationPath,
+                    runtimeState->offlineRenderJob.waterScenarios);
+            FreezeQueuedQuickMp4AuthoredTimingState(
+                &runtimeState->offlineRenderJob,
+                waterSnapshot);
+            SynchronizeOfflineRenderJobProvenanceCounts(
+                &runtimeState->offlineRenderJob);
+            FreezeAnimationDynamicMeshFlow(
+                &runtimeState->offlineRenderJob,
+                *runtimeState,
+                runtimeState->offlineRenderJob.exportPointCloudLayers,
+                &waterSnapshot.dynamicMeshFlowSettings);
+        });
     runtimeState->offlineRenderJob.exportLog.writerQueueFrameLimit = writerState->maxQueuedFrames;
     runtimeState->offlineRenderJob.exportLog.writerQueueMemoryBudgetBytes = writerState->queueMemoryBudgetBytes;
     runtimeState->offlineRenderJob.exportLog.writerMemoryStopThresholdBytes = writerState->memoryStopThresholdBytes;
     runtimeState->offlineRenderJob.exportLog.combinedColorAlphaMattePipe =
         outputOptions.combinedColorAlphaMattePipe;
     std::string setupError;
-    if (!CreateOfflineRenderSetupSidecar(
-            runtimeState,
-            &runtimeState->offlineRenderJob,
-            &setupError)) {
+    const bool sidecarCreated = RunExportStartupPhase(
+        &jobStartupPhases,
+        "Render setup sidecar",
+        [&] {
+            return CreateOfflineRenderSetupSidecar(
+                runtimeState,
+                &runtimeState->offlineRenderJob,
+                &setupError);
+        });
+    if (!sidecarCreated) {
         runtimeState->offlineRenderJob = OfflineRenderJobState{};
         runtimeState->errorMessage = std::move(setupError);
         runtimeState->statusMessage.clear();
@@ -37970,6 +38102,7 @@ void StartSelectedQuickMp4Batch(
     panel.quickMp4QueueTotal = 0;
     panel.quickMp4QueueCompleted = 0;
     panel.quickMp4QueueSkipped = 0;
+    panel.quickMp4QueuePhases.clear();
     EnsureExportPresets(runtimeState);
     const auto activePreset = ViewedExportPreset(*runtimeState);
     const auto activeMode = activePreset.mode;
@@ -38051,8 +38184,10 @@ void StartSelectedQuickMp4Batch(
     // so capturing here sees exactly the sources the batch renders with —
     // including sessions that full-density preparation swapped in before an
     // automatic restart — while failed gates skip this expensive build.
-    const auto batchProjectSnapshot =
-        BuildProjectDocument(*runtimeState);
+    const auto batchProjectSnapshot = RunExportStartupPhase(
+        &panel.quickMp4QueuePhases,
+        "Batch project snapshot",
+        [&] { return BuildProjectDocument(*runtimeState); });
     if (!HasOfflinePointLayers(*runtimeState)) {
         runtimeState->errorMessage = "Load and show at least one LiDAR layer before exporting an animation.";
         runtimeState->statusMessage.clear();
@@ -38075,6 +38210,7 @@ void StartSelectedQuickMp4Batch(
     const auto batchVisualOverride =
         std::optional<PointVisualExportOverride>{
             savedVisual->visualOverride};
+    const auto waterSnapshotPhaseStartedAt = std::chrono::steady_clock::now();
     auto waterSnapshot =
         std::make_shared<QueuedQuickMp4WaterSnapshot>();
     waterSnapshot->sceneGroupName =
@@ -38120,7 +38256,11 @@ void StartSelectedQuickMp4Batch(
         BuildFrozenAnimationFlowSourceLayers(
             *runtimeState,
             waterSnapshot->basePointCloudLayers);
+    panel.quickMp4QueuePhases.push_back(
+        {"Batch water snapshot",
+         std::chrono::steady_clock::now() - waterSnapshotPhaseStartedAt});
 
+    const auto queuePhaseStartedAt = std::chrono::steady_clock::now();
     std::vector<std::filesystem::path> reservedOutputPaths;
     std::string loadErrorMessage;
     for (const auto& animationFilePath : selectedFiles) {
@@ -38278,6 +38418,10 @@ void StartSelectedQuickMp4Batch(
         }
     }
 
+    panel.quickMp4QueuePhases.push_back(
+        {"Queue " + std::to_string(panel.quickMp4Queue.size()) +
+             " animation documents",
+         std::chrono::steady_clock::now() - queuePhaseStartedAt});
     panel.quickMp4QueueTotal = panel.quickMp4Queue.size();
     if (panel.quickMp4Queue.empty()) {
         runtimeState->statusMessage =
@@ -38811,6 +38955,18 @@ void StartAnimationExportJob(
         }
     }
 
+    // While the frozen click-time setup waits for full-density sources, the
+    // retry frames stop here instead of re-copying the multi-megabyte
+    // snapshot every frame; errors release the frozen setup as before.
+    if (runtimeState->pendingCurrentRenderSnapshot != nullptr &&
+        !EnsureFullDensityExportSourcesReady(runtimeState, viewport)) {
+        if (!runtimeState->errorMessage.empty()) {
+            runtimeState->pendingCurrentRenderSnapshot.reset();
+        }
+        return;
+    }
+    std::vector<ExportStartupPhase> startupPhases;
+    const auto snapshotPhaseStartedAt = std::chrono::steady_clock::now();
     ResolvedRenderSetupSnapshot renderSnapshot;
     if (runtimeState->pendingCurrentRenderSnapshot != nullptr) {
         renderSnapshot =
@@ -38827,6 +38983,9 @@ void StartAnimationExportJob(
         }
         renderSnapshot = std::move(resolvedSnapshot.value());
     }
+    startupPhases.push_back(
+        {"Render setup snapshot",
+         std::chrono::steady_clock::now() - snapshotPhaseStartedAt});
 
     const auto activePreset = renderSnapshot.exportPreset;
     const auto activeMode = activePreset.mode;
@@ -38947,9 +39106,14 @@ void StartAnimationExportJob(
             {},
             activeMode);
     }
-    auto frames = invisible_places::output::BuildAnimationRenderSequence(
-        animationPathSnapshot,
-        settings);
+    auto frames = RunExportStartupPhase(
+        &startupPhases,
+        "Render sequence",
+        [&] {
+            return invisible_places::output::BuildAnimationRenderSequence(
+                animationPathSnapshot,
+                settings);
+        });
     if (frames.empty()) {
         runtimeState->errorMessage = "Animation path did not produce any output frames.";
         runtimeState->statusMessage.clear();
@@ -38965,21 +39129,31 @@ void StartAnimationExportJob(
     const auto currentVisualOverride =
         std::optional<PointVisualExportOverride>{
             currentVisual.visualOverride};
-    const auto frustumMaskSummary = PrepareAnimationExportFrustumMasks(
-        runtimeState,
-        viewport,
-        std::span<const invisible_places::camera::CameraState>{
-            frames.data(),
-            frames.size()},
-        settings,
-        currentVisualOverride,
-        exportRendererMode);
+    const auto frustumMaskSummary = RunExportStartupPhase(
+        &startupPhases,
+        "Camera-path frustum masks",
+        [&] {
+            return PrepareAnimationExportFrustumMasks(
+                runtimeState,
+                viewport,
+                std::span<const invisible_places::camera::CameraState>{
+                    frames.data(),
+                    frames.size()},
+                settings,
+                currentVisualOverride,
+                exportRendererMode);
+        });
     const bool exportUsesPreviewDensity = frustumMaskSummary.enabled;
-    auto exportPointCloudLayers = BuildAnimationExportPointCloudLayerSnapshot(
-        *runtimeState,
-        exportUsesPreviewDensity,
-        currentVisualOverride,
-        exportRendererMode);
+    auto exportPointCloudLayers = RunExportStartupPhase(
+        &startupPhases,
+        "Export layer snapshot",
+        [&] {
+            return BuildAnimationExportPointCloudLayerSnapshot(
+                *runtimeState,
+                exportUsesPreviewDensity,
+                currentVisualOverride,
+                exportRendererMode);
+        });
     if (exportPointCloudLayers.empty()) {
         runtimeState->errorMessage = "No visible loaded LiDAR layers are available for animation export.";
         runtimeState->statusMessage.clear();
@@ -38997,20 +39171,30 @@ void StartAnimationExportJob(
     }
     const auto effectiveSeepageInvocations =
         EffectiveExportWaterSeepageShaderInvocations(*runtimeState);
-    auto frozenSeepageLayers = BuildFrozenAnimationSeepageLayers(
-        runtimeState,
-        exportPointCloudLayers,
-        effectiveSeepageInvocations,
-        &timingSnapshot.effectiveRainProfile->settings);
+    auto frozenSeepageLayers = RunExportStartupPhase(
+        &startupPhases,
+        "Seepage freeze",
+        [&] {
+            return BuildFrozenAnimationSeepageLayers(
+                runtimeState,
+                exportPointCloudLayers,
+                effectiveSeepageInvocations,
+                &timingSnapshot.effectiveRainProfile->settings);
+        });
     auto frozenFlowSourceLayers = BuildFrozenAnimationFlowSourceLayers(
         *runtimeState,
         exportPointCloudLayers);
     if (viewport != nullptr) {
-        for (const auto& frozenLayer : frozenSeepageLayers) {
-            viewport->UploadWaterSeepageTopology(
-                frozenLayer.layerId,
-                frozenLayer.grid);
-        }
+        RunExportStartupPhase(
+            &startupPhases,
+            "Seepage GPU upload",
+            [&] {
+                for (const auto& frozenLayer : frozenSeepageLayers) {
+                    viewport->UploadWaterSeepageTopology(
+                        frozenLayer.layerId,
+                        frozenLayer.grid);
+                }
+            });
     }
 
     const auto currentSetupSize = viewport != nullptr
@@ -39136,30 +39320,45 @@ void StartAnimationExportJob(
         .exportPointCloudLayers = std::move(exportPointCloudLayers),
         .writerState = writerState,
     };
-    runtimeState->offlineRenderJob.seepageRainEnvelope =
-        BuildFrozenAnimationSeepageRainEnvelope(
-            runtimeState->offlineRenderJob.animationPath,
-            runtimeState->offlineRenderJob.waterScenarios);
-    FreezeAuthoredTimingState(
-        &runtimeState->offlineRenderJob,
-        *runtimeState,
-        &timingSnapshot);
-    SynchronizeOfflineRenderJobProvenanceCounts(
-        &runtimeState->offlineRenderJob);
-    FreezeAnimationDynamicMeshFlow(
-        &runtimeState->offlineRenderJob,
-        *runtimeState,
-        runtimeState->offlineRenderJob.exportPointCloudLayers);
+    runtimeState->offlineRenderJob.exportLog.startupPhases =
+        std::move(startupPhases);
+    auto& jobStartupPhases =
+        runtimeState->offlineRenderJob.exportLog.startupPhases;
+    RunExportStartupPhase(
+        &jobStartupPhases,
+        "Water timing freeze",
+        [&] {
+            runtimeState->offlineRenderJob.seepageRainEnvelope =
+                BuildFrozenAnimationSeepageRainEnvelope(
+                    runtimeState->offlineRenderJob.animationPath,
+                    runtimeState->offlineRenderJob.waterScenarios);
+            FreezeAuthoredTimingState(
+                &runtimeState->offlineRenderJob,
+                *runtimeState,
+                &timingSnapshot);
+            SynchronizeOfflineRenderJobProvenanceCounts(
+                &runtimeState->offlineRenderJob);
+            FreezeAnimationDynamicMeshFlow(
+                &runtimeState->offlineRenderJob,
+                *runtimeState,
+                runtimeState->offlineRenderJob.exportPointCloudLayers);
+        });
     runtimeState->offlineRenderJob.exportLog.writerQueueFrameLimit = writerState->maxQueuedFrames;
     runtimeState->offlineRenderJob.exportLog.writerQueueMemoryBudgetBytes = writerState->queueMemoryBudgetBytes;
     runtimeState->offlineRenderJob.exportLog.writerMemoryStopThresholdBytes = writerState->memoryStopThresholdBytes;
     runtimeState->offlineRenderJob.exportLog.combinedColorAlphaMattePipe =
         outputOptions.combinedColorAlphaMattePipe;
     std::string setupError;
-    if (!CreateOfflineRenderSetupSidecar(
-            runtimeState,
-            &runtimeState->offlineRenderJob,
-            &setupError)) {
+    const bool sidecarCreated = RunExportStartupPhase(
+        &jobStartupPhases,
+        "Render setup sidecar",
+        [&] {
+            return CreateOfflineRenderSetupSidecar(
+                runtimeState,
+                &runtimeState->offlineRenderJob,
+                &setupError);
+        });
+    if (!sidecarCreated) {
         runtimeState->offlineRenderJob = OfflineRenderJobState{};
         runtimeState->errorMessage = std::move(setupError);
         runtimeState->statusMessage.clear();
@@ -41625,6 +41824,11 @@ void DrawAnimationExportSection(
             std::min<std::uint32_t>(job.currentFrame, static_cast<std::uint32_t>(job.frames.size())),
             job.pendingFrameCount);
         DrawExportTimingSummary(job);
+        if (const auto setupSummary =
+                ExportStartupPhaseSummaryLine(job.exportLog.startupPhases);
+            !setupSummary.empty()) {
+            ImGui::TextDisabled("%s", setupSummary.c_str());
+        }
         ImGui::TextDisabled(
             runtimeState->pauseLiveViewportDuringExport
                 ? "Live 3D view is paused; export rendering continues."
@@ -41710,17 +41914,24 @@ void DrawAnimationExportSection(
         }
     } else {
         const bool exportAvailable =
+            !runtimeState->currentExportStartQueued &&
             runtimeState->pendingFramePreviewSnapshot == nullptr &&
             ResolveCurrentPointVisualExportSelection(runtimeState).has_value();
         if (!exportAvailable) {
             ImGui::BeginDisabled();
         }
         const std::string exportButtonLabel =
-            AnimationExportWritesVideo(panel.exportMode) || AnimationExportWritesPngStack(panel.exportMode)
+            runtimeState->currentExportStartQueued
+                ? std::string{"Starting Export..."}
+            : AnimationExportWritesVideo(panel.exportMode) || AnimationExportWritesPngStack(panel.exportMode)
                 ? "Export Current " + std::string{AnimationExportModeLabel(panel.exportMode)}
                 : "Export HQ EXR Stack";
         if (ImGui::Button(exportButtonLabel.c_str())) {
-            StartAnimationExportJob(runtimeState, viewport);
+            // Deferring the heavy setup one frame paints the Starting Export
+            // card before the app pauses for setup work.
+            runtimeState->currentExportStartQueued = true;
+            runtimeState->statusMessage = "Starting export...";
+            runtimeState->errorMessage.clear();
         }
         if (!exportAvailable) {
             ImGui::EndDisabled();
@@ -42301,7 +42512,44 @@ void DrawExportRenderTimingDetail(const OfflineRenderJobState& job) {
 }
 
 void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
-    if (runtimeState == nullptr || !runtimeState->offlineRenderJob.active) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    if (!runtimeState->offlineRenderJob.active) {
+        // The heavy export setup runs on the frame after the click, so this
+        // card is already on screen if setup briefly pauses the app.
+        if (runtimeState->currentExportStartQueued ||
+            runtimeState->animationPanel.quickMp4BatchStartPending) {
+            const auto& io = ImGui::GetIO();
+            constexpr float kStartingCardWidth = 420.0F;
+            ImGui::SetNextWindowPos(
+                ImVec2{
+                    std::max(20.0F, io.DisplaySize.x - kStartingCardWidth - 24.0F),
+                    24.0F},
+                ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowSizeConstraints(
+                ImVec2{kStartingCardWidth, 0.0F},
+                ImVec2{kStartingCardWidth, FLT_MAX});
+            ImGui::Begin(
+                "Starting Export",
+                nullptr,
+                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse |
+                    ImGuiWindowFlags_NoFocusOnAppearing);
+            ImGui::TextWrapped(
+                runtimeState->currentExportStartQueued
+                    ? "Preparing the render sequence, camera-path frustum "
+                      "masks, and frozen water state. The app may pause "
+                      "briefly."
+                    : "Preparing the batch queue and full-density export "
+                      "sources; the batch starts automatically when they "
+                      "are ready.");
+            if (!runtimeState->statusMessage.empty()) {
+                ImGui::TextDisabled(
+                    "%s",
+                    runtimeState->statusMessage.c_str());
+            }
+            ImGui::End();
+        }
         return;
     }
 
@@ -42421,6 +42669,19 @@ void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
     ImGui::Text(
         "Elapsed: %s",
         FormatElapsedTime(std::chrono::steady_clock::now() - job.startedAt).c_str());
+    if (const auto setupSummary =
+            ExportStartupPhaseSummaryLine(job.exportLog.startupPhases);
+        !setupSummary.empty()) {
+        ImGui::TextDisabled("%s", setupSummary.c_str());
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            std::string detail = "Export setup phases:";
+            for (const auto& phase : job.exportLog.startupPhases) {
+                detail += "\n  " + phase.label + ": " +
+                          FormatDurationForLog(phase.duration);
+            }
+            ImGui::SetTooltip("%s", detail.c_str());
+        }
+    }
     ImGui::SeparatorText("Frame Timing");
     DrawExportRenderTimingDetail(job);
 
@@ -81774,7 +82035,11 @@ void DrawExportBatchSection(
         ImGui::BeginDisabled();
     }
     if (ImGui::Button(batchButtonLabel.c_str())) {
-        StartSelectedQuickMp4Batch(runtimeState, viewport);
+        // Deferring the queue build one frame paints the pending state and
+        // the Starting Export card before the setup work pauses the app.
+        panel.quickMp4BatchStartPending = true;
+        runtimeState->statusMessage = "Starting batch export...";
+        runtimeState->errorMessage.clear();
     }
     if (exportButtonDisabled) {
         ImGui::EndDisabled();
@@ -115049,6 +115314,17 @@ int Application::Run(ApplicationRunOptions options) const {
                         &viewport.value());
                 }
                 StartQueuedLayerLoadIfIdle(&runtimeState);
+            }
+            if (runtimeState.currentExportStartQueued) {
+                // Deferred one frame from the Export Current click so the
+                // Starting Export card is on screen while setup runs; the
+                // click-time setup still freezes on this first invocation.
+                runtimeState.currentExportStartQueued = false;
+                if (!runtimeState.offlineRenderJob.active) {
+                    StartAnimationExportJob(
+                        &runtimeState,
+                        &viewport.value());
+                }
             }
             if (!runtimeState.offlineRenderJob.active &&
                 !runtimeState.pendingLoad.has_value() &&
