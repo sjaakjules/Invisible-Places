@@ -1539,6 +1539,10 @@ struct AnimationPanelState {
     std::size_t quickMp4QueueTotal = 0;
     std::size_t quickMp4QueueCompleted = 0;
     std::size_t quickMp4QueueSkipped = 0;
+    // Set when Export Selected found the full-density sources still loading;
+    // the main loop restarts the batch automatically once loads go idle, so
+    // the click does not have to be repeated.
+    bool quickMp4BatchStartPending = false;
     // User-typed text appended to export output names. Read when each job
     // starts (sanitized), so editing it mid-batch tags every job that has
     // not opened its output yet.
@@ -37936,6 +37940,9 @@ void StartSelectedQuickMp4Batch(
     if (runtimeState == nullptr || runtimeState->offlineRenderJob.active) {
         return;
     }
+    // Every path through this function either starts the batch or reports
+    // why it cannot; only the full-density wait below re-arms the retry.
+    runtimeState->animationPanel.quickMp4BatchStartPending = false;
     if (runtimeState->pendingCurrentRenderSnapshot != nullptr ||
         runtimeState->pendingFramePreviewSnapshot != nullptr) {
         runtimeState->errorMessage =
@@ -38024,15 +38031,28 @@ void StartSelectedQuickMp4Batch(
         runtimeState->statusMessage.clear();
         return;
     }
-    // Batch jobs deliberately retain saved-visual semantics, but every item
-    // still needs a self-contained queue-time snapshot of authored water and
-    // profile dependencies. Capture this before density preparation can
-    // replace any live display sessions.
-    const auto batchProjectSnapshot =
-        BuildProjectDocument(*runtimeState);
     if (!EnsureFullDensityExportSourcesReady(runtimeState, viewport)) {
+        // A wait state (loads queued, status set) rather than a failure:
+        // remember the click so the main loop restarts the batch once the
+        // sources are ready instead of requiring a second click.
+        if (runtimeState->errorMessage.empty()) {
+            panel.quickMp4BatchStartPending = true;
+            if (!runtimeState->statusMessage.empty()) {
+                runtimeState->statusMessage += " ";
+            }
+            runtimeState->statusMessage +=
+                "The batch export will start automatically.";
+        }
         return;
     }
+    // Batch jobs deliberately retain saved-visual semantics, but every item
+    // still needs a self-contained queue-time snapshot of authored water and
+    // profile dependencies. A passing readiness gate makes no state changes,
+    // so capturing here sees exactly the sources the batch renders with —
+    // including sessions that full-density preparation swapped in before an
+    // automatic restart — while failed gates skip this expensive build.
+    const auto batchProjectSnapshot =
+        BuildProjectDocument(*runtimeState);
     if (!HasOfflinePointLayers(*runtimeState)) {
         runtimeState->errorMessage = "Load and show at least one LiDAR layer before exporting an animation.";
         runtimeState->statusMessage.clear();
@@ -38760,6 +38780,9 @@ void StartAnimationExportJob(
     if (runtimeState == nullptr || runtimeState->offlineRenderJob.active) {
         return;
     }
+    // A current-animation export supersedes a batch click that is still
+    // waiting for sources, so the stale batch cannot fire later by surprise.
+    runtimeState->animationPanel.quickMp4BatchStartPending = false;
     if (runtimeState->pendingFramePreviewSnapshot != nullptr) {
         runtimeState->errorMessage =
             "Cancel or finish the pending frame preview before starting an "
@@ -81761,6 +81784,23 @@ void DrawExportBatchSection(
     if (!batchModeCanExport) {
         ImGui::TextDisabled("Batch export needs a video or PNG-stack preset.");
     }
+    if (panel.quickMp4BatchStartPending) {
+        ImGui::TextColored(
+            ImVec4{0.86F, 0.62F, 0.16F, 1.0F},
+            "Preparing full-density export sources; the batch starts "
+            "automatically when they are ready.");
+        if (ImGui::Button("Cancel Pending Batch Export")) {
+            panel.quickMp4BatchStartPending = false;
+            runtimeState->statusMessage =
+                "Cancelled the pending batch export.";
+            runtimeState->errorMessage.clear();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Cancels the automatic batch start without cancelling the "
+                "source loads already in progress.");
+        }
+    }
     EndPanelSection();
 }
 
@@ -115020,6 +115060,13 @@ int Application::Run(ApplicationRunOptions options) const {
                 } else if (
                     runtimeState.pendingFramePreviewSnapshot != nullptr) {
                     RenderCurrentAnimationFramePreview(
+                        &runtimeState,
+                        &viewport.value());
+                } else if (runtimeState.animationPanel
+                               .quickMp4BatchStartPending) {
+                    // Re-runs the batch click once loads go idle; the call
+                    // re-arms itself while any readiness gate still waits.
+                    StartSelectedQuickMp4Batch(
                         &runtimeState,
                         &viewport.value());
                 }
