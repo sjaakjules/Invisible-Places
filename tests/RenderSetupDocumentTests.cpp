@@ -813,6 +813,53 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "In-memory history entries match file-parsed entries and sidecar paths "
+    "list without parsing",
+    "[render-setup][history]") {
+    TemporaryDirectory directory;
+    const auto path = directory.path / "surface.iprender.json";
+    auto document = MakeRenderSetup();
+    document.status =
+        invisible_places::serialization::RenderSetupStatus::Completed;
+    document.createdUtc = "2026-07-31T07:30:00Z";
+    document.completedUtc = "2026-07-31T08:00:00Z";
+    document.outputPath = directory.path / "surface.mp4";
+    std::string error;
+    REQUIRE(invisible_places::serialization::SaveRenderSetupDocument(
+        document,
+        path,
+        &error));
+
+    const auto parsed =
+        invisible_places::serialization::ReadRenderSetupHistoryEntry(
+            path,
+            &error);
+    REQUIRE(parsed.has_value());
+    const auto direct =
+        invisible_places::serialization::MakeRenderSetupHistoryEntry(
+            document,
+            path);
+    CHECK(direct.setupPath == parsed->setupPath);
+    CHECK(direct.outputPath.generic_string() ==
+          parsed->outputPath.generic_string());
+    CHECK(direct.status == parsed->status);
+    CHECK(direct.createdUtc == parsed->createdUtc);
+    CHECK(direct.completedUtc == parsed->completedUtc);
+    CHECK(direct.animationName == parsed->animationName);
+    CHECK(direct.sceneGroupName == parsed->sceneGroupName);
+    CHECK(direct.timingTakeName == parsed->timingTakeName);
+    CHECK(direct.editedSettingCount == parsed->editedSettingCount);
+
+    std::ofstream{directory.path / "notes.txt"} << "not a sidecar";
+    const auto sidecarPaths =
+        invisible_places::serialization::DiscoverRenderSetupSidecarPaths(
+            directory.path,
+            &error);
+    REQUIRE(sidecarPaths.size() == 1U);
+    CHECK(sidecarPaths.front() == path);
+}
+
+TEST_CASE(
     "Render setup rejects malformed and future documents without partial values",
     "[render-setup][serialization][errors]") {
     TemporaryDirectory directory;

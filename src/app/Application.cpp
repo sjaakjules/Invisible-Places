@@ -25822,23 +25822,31 @@ void RefreshRenderSetupHistory(
             return;
         }
         std::string discoveryError;
-        auto discovered =
-            invisible_places::serialization::DiscoverRenderSetupHistory(
-                directory,
-                invisible_places::serialization::
-                    kMaximumRenderSetupHistoryEntries,
-                &discoveryError);
-        for (auto& entry : discovered) {
+        // Sidecar documents embed a full frozen project snapshot and run to
+        // megabytes each, so files the pruned index already covers must be
+        // skipped before parsing — not deduplicated afterwards.
+        for (const auto& sidecarPath :
+             invisible_places::serialization::DiscoverRenderSetupSidecarPaths(
+                 directory,
+                 &discoveryError)) {
             const bool alreadyPresent = std::any_of(
                 history.entries.begin(),
                 history.entries.end(),
                 [&](const RenderSetupHistoryEntry& candidate) {
                     return PathsReferToSameLocation(
                         candidate.setupPath,
-                        entry.setupPath);
+                        sidecarPath);
                 });
-            if (!alreadyPresent) {
-                history.entries.push_back(std::move(entry));
+            if (alreadyPresent) {
+                continue;
+            }
+            std::string ignoredError;
+            auto entry =
+                invisible_places::serialization::ReadRenderSetupHistoryEntry(
+                    sidecarPath,
+                    &ignoredError);
+            if (entry.has_value()) {
+                history.entries.push_back(std::move(entry.value()));
             }
         }
     };
@@ -35063,6 +35071,62 @@ void AppendRenderSetupWarning(
     job->renderSetupWarning += std::move(warning);
 }
 
+// Applies one just-saved sidecar's entry to the in-memory Export-tab history
+// list, preserving the selection by path. Keeping the list current here means
+// starting or finishing an export never schedules a rescan that would parse
+// every multi-megabyte sidecar document while the user is exporting.
+void UpsertRenderSetupHistoryEntryInMemory(
+    PreviewRuntimeState* runtimeState,
+    const invisible_places::serialization::RenderSetupHistoryEntry& entry) {
+    auto& history = runtimeState->renderSetupHistory;
+    if (!history.initialized) {
+        return;  // The first tab draw will load it from the index instead.
+    }
+    const auto selectedPath =
+        history.selectedIndex.has_value() &&
+                history.selectedIndex.value() < history.entries.size()
+            ? history.entries[history.selectedIndex.value()].setupPath
+            : std::filesystem::path{};
+    std::erase_if(
+        history.entries,
+        [&](const invisible_places::serialization::RenderSetupHistoryEntry&
+                candidate) {
+            return PathsReferToSameLocation(
+                candidate.setupPath,
+                entry.setupPath);
+        });
+    history.entries.push_back(entry);
+    std::stable_sort(
+        history.entries.begin(),
+        history.entries.end(),
+        [](const RenderSetupHistoryEntry& left,
+           const RenderSetupHistoryEntry& right) {
+            if (left.createdUtc != right.createdUtc) {
+                return left.createdUtc > right.createdUtc;
+            }
+            return left.setupPath.generic_string() >
+                   right.setupPath.generic_string();
+        });
+    if (history.entries.size() >
+        invisible_places::serialization::
+            kMaximumRenderSetupHistoryEntries) {
+        history.entries.resize(
+            invisible_places::serialization::
+                kMaximumRenderSetupHistoryEntries);
+    }
+    history.selectedIndex.reset();
+    if (!selectedPath.empty()) {
+        for (std::size_t index = 0U; index < history.entries.size(); ++index) {
+            if (PathsReferToSameLocation(
+                    history.entries[index].setupPath,
+                    selectedPath)) {
+                history.selectedIndex = index;
+                break;
+            }
+        }
+    }
+}
+
 void IndexOfflineRenderSetup(
     PreviewRuntimeState* runtimeState,
     OfflineRenderJobState* job) {
@@ -35071,10 +35135,17 @@ void IndexOfflineRenderSetup(
         return;
     }
     std::string errorMessage;
+    // The saved document is still in memory; rebuilding the entry from it
+    // avoids parsing the multi-megabyte sidecar straight back off disk.
     const auto entry =
-        invisible_places::serialization::ReadRenderSetupHistoryEntry(
-            job->frozenRenderSetup.setupDocumentPath,
-            &errorMessage);
+        job->renderSetupDocument.has_value()
+            ? std::optional{
+                  invisible_places::serialization::MakeRenderSetupHistoryEntry(
+                      job->renderSetupDocument.value(),
+                      job->frozenRenderSetup.setupDocumentPath)}
+            : invisible_places::serialization::ReadRenderSetupHistoryEntry(
+                  job->frozenRenderSetup.setupDocumentPath,
+                  &errorMessage);
     if (!entry.has_value() ||
         !invisible_places::serialization::UpsertRenderSetupHistoryEntry(
             ProjectRenderSetupHistoryIndexPath(*runtimeState),
@@ -35086,7 +35157,11 @@ void IndexOfflineRenderSetup(
             job,
             "Render setup history index warning: " + errorMessage + ".");
     }
-    runtimeState->renderSetupHistory.initialized = false;
+    if (entry.has_value()) {
+        UpsertRenderSetupHistoryEntryInMemory(runtimeState, entry.value());
+    } else {
+        runtimeState->renderSetupHistory.initialized = false;
+    }
 }
 
 bool CreateOfflineRenderSetupSidecar(
@@ -35152,7 +35227,29 @@ void CompleteOfflineRenderSetupSidecar(
     std::string updateError;
     const auto completedUtc =
         invisible_places::serialization::CurrentUtcTimestamp();
-    if (!invisible_places::serialization::UpdateRenderSetupDocumentStatus(
+    if (job->renderSetupDocument.has_value()) {
+        // The full document is still in memory from job start; saving it
+        // directly skips re-parsing the multi-megabyte sidecar only to flip
+        // its status fields.
+        job->renderSetupDocument->status = status;
+        job->renderSetupDocument->completedUtc = completedUtc;
+        job->renderSetupDocument->failureMessage = failureMessage;
+        auto portableDocument = job->renderSetupDocument.value();
+        invisible_places::app::workspace::MakeRenderSetupDocumentPortable(
+            &portableDocument,
+            WorkspaceRoots(*runtimeState));
+        if (!invisible_places::serialization::SaveRenderSetupDocument(
+                portableDocument,
+                job->frozenRenderSetup.setupDocumentPath,
+                &updateError)) {
+            AppendRenderSetupWarning(
+                job,
+                "Video output is intact, but render setup status could not "
+                "be updated: " + updateError + ".");
+            return;
+        }
+    } else if (
+        !invisible_places::serialization::UpdateRenderSetupDocumentStatus(
             job->frozenRenderSetup.setupDocumentPath,
             status,
             completedUtc,
@@ -35163,11 +35260,6 @@ void CompleteOfflineRenderSetupSidecar(
             "Video output is intact, but render setup status could not be "
             "updated: " + updateError + ".");
         return;
-    }
-    if (job->renderSetupDocument.has_value()) {
-        job->renderSetupDocument->status = status;
-        job->renderSetupDocument->completedUtc = completedUtc;
-        job->renderSetupDocument->failureMessage = failureMessage;
     }
     IndexOfflineRenderSetup(runtimeState, job);
 }

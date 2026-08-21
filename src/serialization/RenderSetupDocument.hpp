@@ -172,6 +172,17 @@ bool UpdateRenderSetupDocumentStatus(
 ReadRenderSetupHistoryEntry(
     const std::filesystem::path& setupPath,
     std::string* errorMessage = nullptr);
+// Builds the history entry directly from an in-memory document, so callers
+// that just saved a sidecar do not need to parse the whole file back.
+[[nodiscard]] RenderSetupHistoryEntry MakeRenderSetupHistoryEntry(
+    const RenderSetupDocument& document,
+    const std::filesystem::path& setupPath);
+// Lists candidate sidecar files without parsing them, so callers can skip
+// documents whose history entries are already known.
+[[nodiscard]] std::vector<std::filesystem::path>
+DiscoverRenderSetupSidecarPaths(
+    const std::filesystem::path& directory,
+    std::string* errorMessage = nullptr);
 [[nodiscard]] std::vector<RenderSetupHistoryEntry> DiscoverRenderSetupHistory(
     const std::filesystem::path& directory,
     std::size_t maximumEntries = kMaximumRenderSetupHistoryEntries,

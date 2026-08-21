@@ -948,11 +948,26 @@ std::optional<RenderSetupHistoryEntry> ReadRenderSetupHistoryEntry(
     }
 }
 
-std::vector<RenderSetupHistoryEntry> DiscoverRenderSetupHistory(
+RenderSetupHistoryEntry MakeRenderSetupHistoryEntry(
+    const RenderSetupDocument& document,
+    const std::filesystem::path& setupPath) {
+    RenderSetupHistoryEntry entry;
+    entry.setupPath = setupPath;
+    entry.outputPath = document.outputPath;
+    entry.status = document.status;
+    entry.createdUtc = document.createdUtc;
+    entry.completedUtc = document.completedUtc;
+    entry.animationName = document.animation.name;
+    entry.sceneGroupName = document.sceneGroupName;
+    entry.timingTakeName = document.timingTakeName;
+    entry.editedSettingCount = document.editedSettingLabels.size();
+    return entry;
+}
+
+std::vector<std::filesystem::path> DiscoverRenderSetupSidecarPaths(
     const std::filesystem::path& directory,
-    std::size_t maximumEntries,
     std::string* errorMessage) {
-    std::vector<RenderSetupHistoryEntry> entries;
+    std::vector<std::filesystem::path> paths;
     std::error_code iteratorError;
     std::filesystem::directory_iterator iterator{directory, iteratorError};
     if (iteratorError) {
@@ -960,7 +975,7 @@ std::vector<RenderSetupHistoryEntry> DiscoverRenderSetupHistory(
             errorMessage,
             "Failed to inspect render setup directory: " +
                 iteratorError.message());
-        return entries;
+        return paths;
     }
     for (const auto& item : iterator) {
         std::error_code typeError;
@@ -968,8 +983,20 @@ std::vector<RenderSetupHistoryEntry> DiscoverRenderSetupHistory(
             !EndsWith(item.path().filename().string(), kRenderSetupSuffix)) {
             continue;
         }
+        paths.push_back(item.path());
+    }
+    return paths;
+}
+
+std::vector<RenderSetupHistoryEntry> DiscoverRenderSetupHistory(
+    const std::filesystem::path& directory,
+    std::size_t maximumEntries,
+    std::string* errorMessage) {
+    std::vector<RenderSetupHistoryEntry> entries;
+    for (const auto& path :
+         DiscoverRenderSetupSidecarPaths(directory, errorMessage)) {
         std::string ignoredError;
-        auto entry = ReadRenderSetupHistoryEntry(item.path(), &ignoredError);
+        auto entry = ReadRenderSetupHistoryEntry(path, &ignoredError);
         if (entry.has_value()) {
             entries.push_back(std::move(entry.value()));
         }
