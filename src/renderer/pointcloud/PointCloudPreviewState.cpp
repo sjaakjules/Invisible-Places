@@ -5,9 +5,12 @@
 #include <cmath>
 #include <limits>
 #include <numeric>
+#include <thread>
 #include <unordered_map>
 
 #include <glm/geometric.hpp>
+#include <glm/mat4x4.hpp>
+#include <glm/matrix.hpp>
 #include <glm/vec3.hpp>
 #include <glm/vec4.hpp>
 
@@ -1150,67 +1153,240 @@ std::vector<std::uint32_t> GenerateFrustumUnionPointIndices(
     const float yCellExtent = safeYExtent / static_cast<float>(dimension);
     const float zCellExtent = safeZExtent / static_cast<float>(dimension);
 
-    std::vector<std::array<FrustumPlane, 6>> frustums;
+    // Each frustum only marks cells inside its own conservative cell range,
+    // derived from the world-space corner AABB. A cell outside that padded
+    // range cannot intersect the frustum, so skipping it never drops a
+    // visible point; when the corners cannot be recovered the frustum
+    // conservatively covers the whole grid.
+    struct RangedFrustum {
+        std::array<FrustumPlane, 6> planes{};
+        std::array<std::uint32_t, 3> begin{0U, 0U, 0U};
+        std::array<std::uint32_t, 3> end{0U, 0U, 0U};
+    };
+    const auto cellRangeFor = [&](float minimumValue,
+                                  float maximumValue,
+                                  float boundsMinimum,
+                                  float cellExtent) {
+        // Cells are tested with one cell of bloat on each side; padding the
+        // range by two cells keeps the skip conservative under float slop.
+        const float relativeMinimum = (minimumValue - boundsMinimum) / cellExtent;
+        const float relativeMaximum = (maximumValue - boundsMinimum) / cellExtent;
+        const auto lastCell = dimension - 1U;
+        const std::uint32_t begin =
+            !std::isfinite(relativeMinimum) || relativeMinimum < 2.0F
+                ? 0U
+                : (relativeMinimum - 2.0F >= static_cast<float>(lastCell)
+                       ? lastCell
+                       : static_cast<std::uint32_t>(relativeMinimum - 2.0F));
+        const std::uint32_t end =
+            !std::isfinite(relativeMaximum) ||
+                    relativeMaximum + 2.0F >= static_cast<float>(lastCell)
+                ? lastCell
+                : (relativeMaximum + 2.0F <= 0.0F
+                       ? 0U
+                       : static_cast<std::uint32_t>(relativeMaximum + 2.0F));
+        return std::pair{begin, std::max(begin, end)};
+    };
+    std::vector<RangedFrustum> frustums;
     frustums.reserve(viewProjections.size());
     for (const auto& viewProjection : viewProjections) {
-        frustums.push_back(FrustumPlanes(viewProjection));
-    }
-
-    std::vector<std::uint8_t> visibleCells(cellCount, 0U);
-    std::size_t visibleCellCount = 0;
-    for (std::uint32_t z = 0; z < dimension; ++z) {
-        for (std::uint32_t y = 0; y < dimension; ++y) {
-            for (std::uint32_t x = 0; x < dimension; ++x) {
-                const invisible_places::io::Float3 cellMinimum{
-                    bounds.minimum.x + (static_cast<float>(x) * xCellExtent) - xCellExtent,
-                    bounds.minimum.y + (static_cast<float>(y) * yCellExtent) - yCellExtent,
-                    bounds.minimum.z + (static_cast<float>(z) * zCellExtent) - zCellExtent,
-                };
-                const invisible_places::io::Float3 cellMaximum{
-                    bounds.minimum.x + (static_cast<float>(x + 1U) * xCellExtent) + xCellExtent,
-                    bounds.minimum.y + (static_cast<float>(y + 1U) * yCellExtent) + yCellExtent,
-                    bounds.minimum.z + (static_cast<float>(z + 1U) * zCellExtent) + zCellExtent,
-                };
-                bool visible = false;
-                for (const auto& frustum : frustums) {
-                    if (BoundsIntersectsFrustumPlanes(cellMinimum, cellMaximum, frustum)) {
-                        visible = true;
+        RangedFrustum frustum;
+        frustum.planes = FrustumPlanes(viewProjection);
+        frustum.end = {dimension - 1U, dimension - 1U, dimension - 1U};
+        const glm::mat4 inverse = glm::inverse(viewProjection);
+        glm::vec3 cornerMinimum{std::numeric_limits<float>::max()};
+        glm::vec3 cornerMaximum{std::numeric_limits<float>::lowest()};
+        bool cornersValid = true;
+        // Depth spans -1..1 and 0..1 clip conventions; the superset stays
+        // conservative for either projection style.
+        for (const float x : {-1.0F, 1.0F}) {
+            for (const float y : {-1.0F, 1.0F}) {
+                for (const float z : {-1.0F, 0.0F, 1.0F}) {
+                    const glm::vec4 clip = inverse * glm::vec4{x, y, z, 1.0F};
+                    if (!std::isfinite(clip.w) ||
+                        std::abs(clip.w) <= 1.0e-9F) {
+                        cornersValid = false;
                         break;
                     }
+                    const glm::vec3 world = glm::vec3{clip} / clip.w;
+                    if (!std::isfinite(world.x) ||
+                        !std::isfinite(world.y) ||
+                        !std::isfinite(world.z)) {
+                        cornersValid = false;
+                        break;
+                    }
+                    cornerMinimum = glm::min(cornerMinimum, world);
+                    cornerMaximum = glm::max(cornerMaximum, world);
                 }
-                if (visible) {
-                    visibleCells[FrustumCellIndex(x, y, z, dimension)] = 1U;
-                    ++visibleCellCount;
+                if (!cornersValid) {
+                    break;
+                }
+            }
+            if (!cornersValid) {
+                break;
+            }
+        }
+        if (cornersValid) {
+            const auto xRange = cellRangeFor(
+                cornerMinimum.x, cornerMaximum.x, bounds.minimum.x, xCellExtent);
+            const auto yRange = cellRangeFor(
+                cornerMinimum.y, cornerMaximum.y, bounds.minimum.y, yCellExtent);
+            const auto zRange = cellRangeFor(
+                cornerMinimum.z, cornerMaximum.z, bounds.minimum.z, zCellExtent);
+            frustum.begin = {xRange.first, yRange.first, zRange.first};
+            frustum.end = {xRange.second, yRange.second, zRange.second};
+        }
+        frustums.push_back(frustum);
+    }
+
+    // Frusta are marked concurrently into per-worker cell masks that merge
+    // with a commutative OR, so the visible set is deterministic regardless
+    // of scheduling. The calling thread always processes the first chunk.
+    const auto hardwareThreads =
+        std::max(1U, std::thread::hardware_concurrency());
+    const auto maskWorkerCount = static_cast<std::size_t>(std::clamp<std::size_t>(
+        frustums.size() / 32U,
+        1U,
+        std::min(hardwareThreads, 8U)));
+    std::vector<std::vector<std::uint8_t>> workerCells(
+        maskWorkerCount,
+        std::vector<std::uint8_t>(cellCount, 0U));
+    const auto markFrustumRange = [&](std::size_t frustumBegin,
+                                      std::size_t frustumEnd,
+                                      std::vector<std::uint8_t>* cells) {
+        for (std::size_t frustumIndex = frustumBegin;
+             frustumIndex < frustumEnd;
+             ++frustumIndex) {
+            const auto& frustum = frustums[frustumIndex];
+            for (std::uint32_t z = frustum.begin[2]; z <= frustum.end[2]; ++z) {
+                for (std::uint32_t y = frustum.begin[1]; y <= frustum.end[1]; ++y) {
+                    for (std::uint32_t x = frustum.begin[0]; x <= frustum.end[0]; ++x) {
+                        auto& cell = (*cells)[FrustumCellIndex(x, y, z, dimension)];
+                        if (cell != 0U) {
+                            continue;
+                        }
+                        const invisible_places::io::Float3 cellMinimum{
+                            bounds.minimum.x + (static_cast<float>(x) * xCellExtent) - xCellExtent,
+                            bounds.minimum.y + (static_cast<float>(y) * yCellExtent) - yCellExtent,
+                            bounds.minimum.z + (static_cast<float>(z) * zCellExtent) - zCellExtent,
+                        };
+                        const invisible_places::io::Float3 cellMaximum{
+                            bounds.minimum.x + (static_cast<float>(x + 1U) * xCellExtent) + xCellExtent,
+                            bounds.minimum.y + (static_cast<float>(y + 1U) * yCellExtent) + yCellExtent,
+                            bounds.minimum.z + (static_cast<float>(z + 1U) * zCellExtent) + zCellExtent,
+                        };
+                        if (BoundsIntersectsFrustumPlanes(cellMinimum, cellMaximum, frustum.planes)) {
+                            cell = 1U;
+                        }
+                    }
                 }
             }
         }
+    };
+    {
+        std::vector<std::jthread> workers;
+        workers.reserve(maskWorkerCount - 1U);
+        const auto frustaPerWorker =
+            (frustums.size() + maskWorkerCount - 1U) / maskWorkerCount;
+        for (std::size_t workerIndex = 1U; workerIndex < maskWorkerCount; ++workerIndex) {
+            const auto frustumBegin = std::min(
+                frustums.size(),
+                workerIndex * frustaPerWorker);
+            const auto frustumEnd = std::min(
+                frustums.size(),
+                frustumBegin + frustaPerWorker);
+            workers.emplace_back(
+                [&markFrustumRange, frustumBegin, frustumEnd, &workerCells, workerIndex]() {
+                    markFrustumRange(frustumBegin, frustumEnd, &workerCells[workerIndex]);
+                });
+        }
+        markFrustumRange(
+            0U,
+            std::min(frustums.size(), frustaPerWorker),
+            &workerCells[0]);
     }
+    auto visibleCells = std::move(workerCells.front());
+    for (std::size_t workerIndex = 1U; workerIndex < maskWorkerCount; ++workerIndex) {
+        const auto& cells = workerCells[workerIndex];
+        for (std::size_t cellIndex = 0; cellIndex < cellCount; ++cellIndex) {
+            visibleCells[cellIndex] |= cells[cellIndex];
+        }
+    }
+    const auto visibleCellCount = static_cast<std::size_t>(std::count(
+        visibleCells.begin(),
+        visibleCells.end(),
+        std::uint8_t{1U}));
 
     if (visibleCellCount == 0) {
         return {};
     }
 
-    std::vector<std::uint32_t> indices;
+    // Points are classified in ascending index ranges and concatenated in
+    // range order, so the result matches a single-threaded pass exactly.
     const double visibleFraction =
         static_cast<double>(visibleCellCount) / static_cast<double>(visibleCells.size());
-    const auto reserveCount = static_cast<std::size_t>(std::min<double>(
-        static_cast<double>(positions.size()),
-        std::max(1024.0, static_cast<double>(positions.size()) * visibleFraction * 1.5)));
-    indices.reserve(reserveCount);
-
     const auto pointCount = static_cast<std::uint32_t>(positions.size());
-    for (std::uint32_t pointIndex = 0; pointIndex < pointCount; ++pointIndex) {
-        const auto& point = positions[pointIndex];
-        const std::uint32_t x = VoxelCoordinate(point.x, bounds.minimum.x, safeXExtent, dimension);
-        const std::uint32_t y = VoxelCoordinate(point.y, bounds.minimum.y, safeYExtent, dimension);
-        const std::uint32_t z = VoxelCoordinate(point.z, bounds.minimum.z, safeZExtent, dimension);
-        if (visibleCells[FrustumCellIndex(x, y, z, dimension)] != 0U) {
-            indices.push_back(pointIndex);
+    constexpr std::uint32_t kMinimumPointsPerClassifyThread = 1'000'000U;
+    const auto classifyWorkerCount = static_cast<std::size_t>(std::clamp<std::uint32_t>(
+        pointCount / kMinimumPointsPerClassifyThread,
+        1U,
+        std::min(hardwareThreads, 8U)));
+    std::vector<std::vector<std::uint32_t>> workerIndices(classifyWorkerCount);
+    const auto classifyRange = [&](std::uint32_t rangeBegin,
+                                   std::uint32_t rangeEnd,
+                                   std::vector<std::uint32_t>* out) {
+        out->reserve(static_cast<std::size_t>(std::min<double>(
+            static_cast<double>(rangeEnd - rangeBegin),
+            std::max(
+                1024.0,
+                static_cast<double>(rangeEnd - rangeBegin) * visibleFraction * 1.5))));
+        for (std::uint32_t pointIndex = rangeBegin; pointIndex < rangeEnd; ++pointIndex) {
+            const auto& point = positions[pointIndex];
+            const std::uint32_t x = VoxelCoordinate(point.x, bounds.minimum.x, safeXExtent, dimension);
+            const std::uint32_t y = VoxelCoordinate(point.y, bounds.minimum.y, safeYExtent, dimension);
+            const std::uint32_t z = VoxelCoordinate(point.z, bounds.minimum.z, safeZExtent, dimension);
+            if (visibleCells[FrustumCellIndex(x, y, z, dimension)] != 0U) {
+                out->push_back(pointIndex);
+            }
         }
+    };
+    {
+        std::vector<std::jthread> workers;
+        workers.reserve(classifyWorkerCount - 1U);
+        const auto pointsPerWorker = static_cast<std::uint32_t>(
+            (pointCount + classifyWorkerCount - 1U) / classifyWorkerCount);
+        for (std::size_t workerIndex = 1U; workerIndex < classifyWorkerCount; ++workerIndex) {
+            const auto rangeBegin = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                pointCount,
+                static_cast<std::uint64_t>(workerIndex) * pointsPerWorker));
+            const auto rangeEnd = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                pointCount,
+                static_cast<std::uint64_t>(rangeBegin) + pointsPerWorker));
+            workers.emplace_back(
+                [&classifyRange, rangeBegin, rangeEnd, &workerIndices, workerIndex]() {
+                    classifyRange(rangeBegin, rangeEnd, &workerIndices[workerIndex]);
+                });
+        }
+        classifyRange(
+            0U,
+            std::min(pointCount, pointsPerWorker),
+            &workerIndices[0]);
     }
 
-    if (indices.size() >= positions.size()) {
+    std::size_t totalIndexCount = 0;
+    for (const auto& ranges : workerIndices) {
+        totalIndexCount += ranges.size();
+    }
+    if (totalIndexCount >= positions.size()) {
         return {};
+    }
+    auto indices = std::move(workerIndices.front());
+    indices.reserve(totalIndexCount);
+    for (std::size_t workerIndex = 1U; workerIndex < classifyWorkerCount; ++workerIndex) {
+        indices.insert(
+            indices.end(),
+            workerIndices[workerIndex].begin(),
+            workerIndices[workerIndex].end());
     }
     return indices;
 }

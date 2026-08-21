@@ -1976,6 +1976,73 @@ TEST_CASE("Frustum union point mask keeps full-density visible points", "[budget
     CHECK(std::find(pathMask.begin(), pathMask.end(), 2U) == pathMask.end());
 }
 
+TEST_CASE(
+    "Frustum union point mask never drops points inside any frame frustum",
+    "[budget][frustum][export]") {
+    // A dense deterministic grid large enough to exercise the concurrent
+    // cell-marking and point-classification ranges.
+    invisible_places::io::LoadedPointCloud cloud;
+    constexpr int kSide = 40;
+    for (int x = 0; x < kSide; ++x) {
+        for (int y = 0; y < kSide; ++y) {
+            for (int z = 0; z < 4; ++z) {
+                const invisible_places::io::Float3 point{
+                    static_cast<float>(x) * 0.5F - 10.0F,
+                    static_cast<float>(y) * 0.5F - 10.0F,
+                    static_cast<float>(z) * 0.5F - 1.0F,
+                };
+                cloud.positions.push_back(point);
+                cloud.bounds.Expand(point);
+            }
+        }
+    }
+
+    // A small moving window sweeping across one corner of the grid.
+    std::vector<glm::mat4> views;
+    for (int step = 0; step < 24; ++step) {
+        const float center = -9.0F + static_cast<float>(step) * 0.25F;
+        views.push_back(glm::ortho(
+            center - 0.75F,
+            center + 0.75F,
+            -1.0F,
+            1.0F,
+            -2.0F,
+            2.0F));
+    }
+
+    const auto mask =
+        invisible_places::renderer::pointcloud::GenerateFrustumUnionPointIndices(
+            cloud.positions,
+            cloud.bounds,
+            std::span<const glm::mat4>{views.data(), views.size()},
+            48U);
+    REQUIRE_FALSE(mask.empty());
+    CHECK(std::is_sorted(mask.begin(), mask.end()));
+    CHECK(std::adjacent_find(mask.begin(), mask.end()) == mask.end());
+    CHECK(mask.size() < cloud.positions.size());
+
+    // Every point that any frame projects inside clip space must survive.
+    const std::unordered_set<std::uint32_t> masked{mask.begin(), mask.end()};
+    for (std::uint32_t index = 0; index < cloud.positions.size(); ++index) {
+        const auto& point = cloud.positions[index];
+        bool insideAnyView = false;
+        for (const auto& view : views) {
+            const glm::vec4 clip =
+                view * glm::vec4{point.x, point.y, point.z, 1.0F};
+            if (std::abs(clip.x) <= clip.w &&
+                std::abs(clip.y) <= clip.w &&
+                std::abs(clip.z) <= clip.w) {
+                insideAnyView = true;
+                break;
+            }
+        }
+        if (insideAnyView) {
+            INFO("point index " << index << " lies inside a frame frustum");
+            CHECK(masked.contains(index));
+        }
+    }
+}
+
 TEST_CASE("Orbit camera can move its pivot without changing the current view", "[camera][pivot]") {
     invisible_places::io::Bounds3f bounds;
     bounds.Expand({-1.0F, -1.0F, -1.0F});
