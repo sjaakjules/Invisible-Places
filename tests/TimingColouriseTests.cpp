@@ -3840,6 +3840,86 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Timing Colourise copied bounds keys remap across scalar field ranges",
+    "[timing][colourise][bounds][clipboard]") {
+    const auto remap = [](TimingColouriseBoundsParameter parameter,
+                          float value) {
+        return invisible_places::timing::
+            RemapTimingColouriseBoundsParameterValueToRange(
+                parameter,
+                value,
+                0.0F,
+                1.0F,
+                1'000.0F,
+                100'000.0F);
+    };
+
+    CHECK(remap(TimingColouriseBoundsParameter::Lower, 0.0F) ==
+          Approx(1'000.0F));
+    CHECK(remap(TimingColouriseBoundsParameter::Upper, 1.0F) ==
+          Approx(100'000.0F));
+    CHECK(remap(TimingColouriseBoundsParameter::Centre, 0.25F) ==
+          Approx(25'750.0F));
+    CHECK(remap(TimingColouriseBoundsParameter::Spread, 0.1F) ==
+          Approx(9'900.0F));
+    CHECK(remap(TimingColouriseBoundsParameter::EdgeFade, 0.2F) ==
+          Approx(0.2F));
+
+    SECTION("Ranges may be reversed and absolute values stay bounded") {
+        CHECK(
+            invisible_places::timing::
+                RemapTimingColouriseBoundsParameterValueToRange(
+                    TimingColouriseBoundsParameter::Lower,
+                    2.0F,
+                    1.0F,
+                    0.0F,
+                    100'000.0F,
+                    1'000.0F) == Approx(100'000.0F));
+    }
+
+    SECTION("A degenerate destination has deterministic coordinates") {
+        CHECK(
+            invisible_places::timing::
+                RemapTimingColouriseBoundsParameterValueToRange(
+                    TimingColouriseBoundsParameter::Upper,
+                    0.5F,
+                    0.0F,
+                    1.0F,
+                    42.0F,
+                    42.0F) == Approx(42.0F));
+        CHECK(
+            invisible_places::timing::
+                RemapTimingColouriseBoundsParameterValueToRange(
+                    TimingColouriseBoundsParameter::Spread,
+                    0.5F,
+                    0.0F,
+                    1.0F,
+                    42.0F,
+                    42.0F) == Approx(0.0F));
+    }
+}
+
+TEST_CASE(
+    "Timing Colourise pasted key groups preserve spacing at the playhead",
+    "[timing][colourise][clipboard][position]") {
+    const std::array source{0.2F, 0.35F, 0.6F};
+
+    const auto centred = invisible_places::timing::
+        OffsetTimingColouriseKeyPositionsForPaste(source, 0.5F);
+    REQUIRE(centred.size() == source.size());
+    CHECK(centred[0] == Approx(0.5F));
+    CHECK(centred[1] == Approx(0.65F));
+    CHECK(centred[2] == Approx(0.9F));
+
+    const auto fitted = invisible_places::timing::
+        OffsetTimingColouriseKeyPositionsForPaste(source, 0.9F);
+    REQUIRE(fitted.size() == source.size());
+    CHECK(fitted[0] == Approx(0.6F));
+    CHECK(fitted[1] == Approx(0.75F));
+    CHECK(fitted[2] == Approx(1.0F));
+}
+
+TEST_CASE(
     "Timing Colourise histogram handles follow the selected bounds coordinates",
     "[timing][colourise][bounds][handles]") {
     const TimingColouriseBounds current{

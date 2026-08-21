@@ -657,6 +657,23 @@ TimingColouriseBoundsParametersForMode(TimingColouriseBoundsKeyMode mode);
 [[nodiscard]] float TimingColouriseBoundsParameterValue(
     const TimingColouriseBounds& bounds,
     TimingColouriseBoundsParameter parameter);
+// Transfers a scalar-bounds key between fields with different numeric
+// domains. Absolute coordinates preserve their normalized percentile,
+// Spread preserves its fraction of the full field range, and Edge Fade is
+// dimensionless so it is retained verbatim (subject to normal sanitizing).
+[[nodiscard]] float RemapTimingColouriseBoundsParameterValueToRange(
+    TimingColouriseBoundsParameter parameter,
+    float value,
+    float sourceMinimum,
+    float sourceMaximum,
+    float destinationMinimum,
+    float destinationMaximum);
+// Places the earliest copied key at destinationAnchor while preserving all
+// relative spacing. Near either animation edge, the complete group shifts
+// just enough to remain inside the normalized [0, 1] authored domain.
+[[nodiscard]] std::vector<float> OffsetTimingColouriseKeyPositionsForPaste(
+    std::span<const float> sourcePositions,
+    float destinationAnchor);
 // Resolves a direct histogram-handle drag into the coordinate track(s) owned
 // by the selected keying mode. Translation handles preserve spacing; a
 // Centre+Spacing endpoint mirrors its partner around the fixed centre.

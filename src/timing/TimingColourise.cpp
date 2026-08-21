@@ -2803,6 +2803,88 @@ float TimingColouriseBoundsParameterValue(
     return 0.0F;
 }
 
+float RemapTimingColouriseBoundsParameterValueToRange(
+    TimingColouriseBoundsParameter parameter,
+    float value,
+    float sourceMinimum,
+    float sourceMaximum,
+    float destinationMinimum,
+    float destinationMaximum) {
+    value = SanitizeBoundsParameterValue(parameter, value);
+    if (parameter == TimingColouriseBoundsParameter::EdgeFade) {
+        return value;
+    }
+
+    if (!std::isfinite(sourceMinimum) ||
+        !std::isfinite(sourceMaximum) ||
+        !std::isfinite(destinationMinimum) ||
+        !std::isfinite(destinationMaximum)) {
+        return value;
+    }
+    const auto [sourceLow, sourceHigh] = std::minmax(
+        sourceMinimum,
+        sourceMaximum);
+    const auto [destinationLow, destinationHigh] = std::minmax(
+        destinationMinimum,
+        destinationMaximum);
+    const float sourceWidth = sourceHigh - sourceLow;
+    const float destinationWidth = destinationHigh - destinationLow;
+    if (destinationWidth <= std::numeric_limits<float>::epsilon()) {
+        return parameter == TimingColouriseBoundsParameter::Spread
+                   ? 0.0F
+                   : destinationLow;
+    }
+    if (sourceWidth <= std::numeric_limits<float>::epsilon()) {
+        return parameter == TimingColouriseBoundsParameter::Spread
+                   ? value
+                   : destinationLow;
+    }
+    if (parameter == TimingColouriseBoundsParameter::Spread) {
+        return std::max(
+            0.0F,
+            value * destinationWidth / sourceWidth);
+    }
+    const float percentile = std::clamp(
+        (value - sourceLow) / sourceWidth,
+        0.0F,
+        1.0F);
+    return std::lerp(
+        destinationLow,
+        destinationHigh,
+        percentile);
+}
+
+std::vector<float> OffsetTimingColouriseKeyPositionsForPaste(
+    std::span<const float> sourcePositions,
+    float destinationAnchor) {
+    if (sourcePositions.empty()) {
+        return {};
+    }
+    std::vector<float> positions;
+    positions.reserve(sourcePositions.size());
+    float sourceMinimum = 1.0F;
+    float sourceMaximum = 0.0F;
+    for (const float sourcePosition : sourcePositions) {
+        const float position = Clamp01(FiniteOr(sourcePosition, 0.0F));
+        positions.push_back(position);
+        sourceMinimum = std::min(sourceMinimum, position);
+        sourceMaximum = std::max(sourceMaximum, position);
+    }
+
+    float offset =
+        Clamp01(FiniteOr(destinationAnchor, 0.0F)) - sourceMinimum;
+    if (sourceMaximum + offset > 1.0F) {
+        offset -= sourceMaximum + offset - 1.0F;
+    }
+    if (sourceMinimum + offset < 0.0F) {
+        offset -= sourceMinimum + offset;
+    }
+    for (float& position : positions) {
+        position = Clamp01(position + offset);
+    }
+    return positions;
+}
+
 std::optional<TimingColouriseBoundsHandleEdit>
 ResolveTimingColouriseBoundsHandleEdit(
     TimingColouriseBoundsKeyMode mode,
