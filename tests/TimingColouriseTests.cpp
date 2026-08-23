@@ -1234,6 +1234,100 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Timing Colourise graph-dot drag applies its dy to the re-encoded phase "
+    "delta",
+    "[timing][colourise][cyclic][palette-phase]") {
+    using invisible_places::timing::EvaluateTimingColouriseEffectParameter;
+    using invisible_places::timing::
+        PreserveTimingColourisePalettePhaseTargetsAfterMove;
+    using invisible_places::timing::SanitizeTimingColouriseEffect;
+
+    // Contract behind the linked key-lane value drag: once a wrap has
+    // re-encoded the deltas, the vertical movement is added to the delta the
+    // key now carries, never to the pre-move delta (which is relative to a
+    // different predecessor). Keys (0.3,+0.2) (0.9,+0.3) have targets 0.2
+    // and 0.5; dragging the 0.9 key's dot to 0.1 with no vertical movement
+    // must keep both targets.
+    TimingColouriseEffect original;
+    original.colouriseEnabled = true;
+    original.palettePhaseOffset = 0.0F;
+    original.effectParameterKeys = {
+        {.parameter = TimingColouriseEffectParameter::PalettePhase,
+         .position = 0.3F,
+         .value = 0.2F,
+         .interpolation = WaterScenarioInterpolation::Hold},
+        {.parameter = TimingColouriseEffectParameter::PalettePhase,
+         .position = 0.9F,
+         .value = 0.3F,
+         .interpolation = WaterScenarioInterpolation::Hold},
+    };
+    const float originalValue = original.effectParameterKeys[1U].value;
+    auto moved = original;
+    moved.effectParameterKeys[1U].position = 0.1F;
+    PreserveTimingColourisePalettePhaseTargetsAfterMove(original, &moved);
+    CHECK(moved.effectParameterKeys[1U].value == Approx(0.5F));
+    CHECK(moved.effectParameterKeys[0U].value == Approx(-0.3F));
+    const auto phaseAt = [](const TimingColouriseEffect& candidate, float t) {
+        return EvaluateTimingColouriseEffectParameter(
+            candidate,
+            TimingColouriseEffectParameter::PalettePhase,
+            t,
+            true);
+    };
+
+    SECTION("dy of zero keeps every target") {
+        auto dragged = moved;
+        dragged.effectParameterKeys[1U].value += 0.0F;
+        const auto sanitized = SanitizeTimingColouriseEffect(dragged);
+        CHECK(phaseAt(sanitized, 0.1F) == Approx(0.5F));
+        CHECK(phaseAt(sanitized, 0.3F) == Approx(0.2F));
+        // The old write (originalValue + dy) would have shifted both keys.
+        auto overwritten = moved;
+        overwritten.effectParameterKeys[1U].value = originalValue + 0.0F;
+        const auto wrong = SanitizeTimingColouriseEffect(overwritten);
+        CHECK(phaseAt(wrong, 0.1F) == Approx(0.3F));
+        CHECK(phaseAt(wrong, 0.3F) == Approx(0.0F));
+    }
+
+    SECTION("dy moves the dragged key and, as a delta, what follows it") {
+        auto dragged = moved;
+        dragged.effectParameterKeys[1U].value += 0.1F;
+        const auto sanitized = SanitizeTimingColouriseEffect(dragged);
+        CHECK(phaseAt(sanitized, 0.1F) == Approx(0.6F));
+        CHECK(phaseAt(sanitized, 0.3F) == Approx(0.3F));
+    }
+}
+
+TEST_CASE(
+    "Timing Colourise cyclic clip ending on loop one does not wrap",
+    "[timing][colourise][cyclic][settings-clip]") {
+    using invisible_places::timing::kTimingColouriseKeyTolerance;
+    using invisible_places::timing::
+        TimingColouriseEffectCyclicSettingsKeySpan;
+    using invisible_places::timing::WrapTimingColouriseLoopPosition;
+
+    // Keys at 0.0, 0.6 and 1.0: the wrap gap (0.4) is smaller than the
+    // interior gap (0.6), so the clip is 0.6..1.0. Its wrapped end is 0.0,
+    // below its start, which is why the overview's tooltip must derive
+    // "wraps" from start + length rather than from end < start.
+    const auto span = TimingColouriseEffectCyclicSettingsKeySpan(
+        EmissiveKeysAt({0.0F, 0.6F, 1.0F}));
+    REQUIRE(span.has_value());
+    CHECK(span->start == Approx(0.6F));
+    CHECK(span->length == Approx(0.4F));
+    CHECK(WrapTimingColouriseLoopPosition(span->start + span->length) ==
+          0.0F);
+    CHECK_FALSE(
+        span->start + span->length > 1.0F + kTimingColouriseKeyTolerance);
+
+    const auto wrapping = TimingColouriseEffectCyclicSettingsKeySpan(
+        EmissiveKeysAt({0.9F, 0.95F, 0.05F}));
+    REQUIRE(wrapping.has_value());
+    CHECK(wrapping->start + wrapping->length >
+          1.0F + kTimingColouriseKeyTolerance);
+}
+
+TEST_CASE(
     "Timing Colourise cyclic coalescing keeps the dropped key's Palette Phase",
     "[timing][colourise][cyclic][palette-phase][settings-clip]") {
     using invisible_places::timing::

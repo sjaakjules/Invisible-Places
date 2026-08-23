@@ -93342,7 +93342,28 @@ void DrawTimingKeyLaneGroup(
                                            kTimingColouriseKeyTolerance;
                         });
                     if (found != updated.effectParameterKeys.end()) {
-                        found->value = value;
+                        // A linked drag may already have rewritten this
+                        // key's Palette Phase delta: the wrap re-encode
+                        // above, or the twin merge folding the dropped
+                        // 0.0 key's delta into it. `originalValue` is the
+                        // delta against the old predecessor, so writing
+                        // originalValue + dy would undo that and shift
+                        // every later key's phase by the difference.
+                        // Apply the vertical movement to the delta the key
+                        // carries now instead; with no re-encode the two
+                        // are the same bits, and unlinked drags keep the
+                        // original path.
+                        const bool phaseReencoded =
+                            cyclicDrag &&
+                            parameter ==
+                                invisible_places::timing::
+                                    TimingColouriseEffectParameter::
+                                        PalettePhase;
+                        found->value = phaseReencoded
+                            ? found->value +
+                                  (mouse.y - drag.mouseStartY) *
+                                      valueDrag.unitsPerPixel
+                            : value;
                     }
                 }
             }
@@ -99789,17 +99810,31 @@ void DrawTimingColouriseActivationOverview(
                                   runtimeState->animationPanel
                                       .currentPath.value()))
                         : 0.0F;
+                // A cyclic clip wraps only when it actually runs past loop
+                // one. Its stored end is wrapped, so a clip that ends
+                // exactly on loop zero (0.6..1.0) has end 0.0 < start yet
+                // does not cross the seam; report it as 0.6–1.0 at the
+                // loop's duration, not as "0.6–0.0 (wraps)" at 0.00 s.
                 const bool clipWraps =
                     settingsCyclicSpan.has_value() &&
-                    settingsSpan->end < settingsSpan->start;
+                    settingsCyclicSpan->start + settingsCyclicSpan->length >
+                        1.0F + invisible_places::timing::
+                                   kTimingColouriseKeyTolerance;
+                const float tooltipEnd =
+                    settingsCyclicSpan.has_value() && !clipWraps
+                        ? std::min(
+                              settingsCyclicSpan->start +
+                                  settingsCyclicSpan->length,
+                              1.0F)
+                        : settingsSpan->end;
                 ImGui::SetTooltip(
                     "%s settings clip %.4f–%.4f%s (%.2f–%.2f s), %zu key position%s",
                     effect.name.c_str(),
                     settingsSpan->start,
-                    settingsSpan->end,
+                    tooltipEnd,
                     clipWraps ? " (wraps)" : "",
                     settingsSpan->start * durationSeconds,
-                    settingsSpan->end * durationSeconds,
+                    tooltipEnd * durationSeconds,
                     settingsKeyPositions.size(),
                     settingsKeyPositions.size() == 1U ? "" : "s");
             }
