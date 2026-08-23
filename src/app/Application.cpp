@@ -3649,6 +3649,11 @@ struct LinkedHqPreviewRuntime {
     bool ready = false;
     bool enabled = false;
     bool retryRequested = false;
+    // Re-resolving the selection stats five source files (symlinks into
+    // cloud storage) and re-evaluates both midpoint cameras, so it runs on
+    // a short cadence rather than every frame.
+    bool resolveTimestampValid = false;
+    std::chrono::steady_clock::time_point lastResolveAt{};
     std::string failureMessage;
 };
 
@@ -53565,19 +53570,34 @@ void EnsureLinkedHqPreview(
         return;
     }
 
-    std::string resolveError;
-    const auto resolved = ResolveLinkedHqSelectionRequest(
-        *runtimeState,
-        *viewport,
-        &resolveError);
     auto& hq = runtimeState->linkedHqPreview;
+    constexpr auto kLinkedHqResolveInterval = std::chrono::milliseconds{500};
+    const auto now = std::chrono::steady_clock::now();
+    const bool resolveDue = !hq.request.has_value() ||
+        !hq.resolveTimestampValid ||
+        now - hq.lastResolveAt >= kLinkedHqResolveInterval;
+    if (resolveDue) {
+        hq.resolveTimestampValid = true;
+        hq.lastResolveAt = now;
+    }
+    std::string resolveError;
+    bool waitingForScene = false;
+    const auto resolved = resolveDue
+        ? ResolveLinkedHqSelectionRequest(
+              *runtimeState,
+              *viewport,
+              &resolveError,
+              &waitingForScene)
+        : hq.request;
     if (!resolved.has_value()) {
         if (hq.request.has_value()) {
             ResetLinkedHqPreview(runtimeState, viewport);
         }
         if (!resolveError.empty()) {
             hq.failureMessage = resolveError;
-            hq.stage = LinkedHqPreparationStage::Failed;
+            hq.stage = waitingForScene
+                ? LinkedHqPreparationStage::Waiting
+                : LinkedHqPreparationStage::Failed;
         }
         return;
     }
@@ -53641,7 +53661,7 @@ void EnsureLinkedHqPreview(
                 return;
             }
         }
-    } else {
+    } else if (resolveDue) {
         // Refresh field filters without invalidating already retained source
         // indices; newly referenced fields use the indexed gather path.
         hq.request->patchFieldFilters = resolved->patchFieldFilters;
@@ -53733,8 +53753,10 @@ void EnsureLinkedHqPreview(
             hq.baselineReady = false;
             return;
         }
+        // The baseline sessions just became the live source selection;
+        // every later change (publish, toggle, reset) invalidates itself.
+        runtimeState->previewRenderStateSignatureValid = false;
     }
-    runtimeState->previewRenderStateSignatureValid = false;
 
     // A finished scan waits one frame in uploadPending before it publishes;
     // starting another scan there would run the whole 1 mm read twice and
