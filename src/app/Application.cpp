@@ -27511,13 +27511,15 @@ void SynchronizeAnimationLinkedPresentationCamera(
         return;
     }
     auto& panel = runtimeState->animationPanel;
-    // A local-timeline hold ends with the mouse button; the window rule
-    // then decides the member again below and cuts to the partner's
-    // matching frame if the held member is outside its window.
+    // A local-timeline hold ends when no scrubbing button is down any
+    // more; the window rule then decides the member again below and cuts
+    // to the partner's matching frame if the held member is outside its
+    // window.
     if (panel.linkedAlternationHeldMember.has_value() &&
         (panel.linkedViewMode != AnimationLinkedViewMode::Alternating ||
          !panel.linkedViewCameraAttached ||
-         !ImGui::IsMouseDown(ImGuiMouseButton_Left))) {
+         (!ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
+          !ImGui::IsMouseDown(ImGuiMouseButton_Right)))) {
         panel.linkedAlternationHeldMember.reset();
         runtimeState->previewRenderStateSignatureValid = false;
     }
@@ -56323,15 +56325,23 @@ void ApplyFeatureTimelineScrub(
             // that was on screen when it began (see
             // linkedAlternationHeldMember); the per-frame presentation sync
             // releases it on mouse-up.
-            // A plain click-jump is not a hold: it cuts once by the rule.
-            // The hold engages once the press has travelled the drag
-            // threshold, capturing the member the rule chose for the press.
+            // The hold engages on the press itself, capturing the member
+            // that was on screen before this scrub moved the clock
+            // (linkedPresentedMember is last frame's apply). Timelines scrub
+            // with either button (the Visual Feature key lanes use the right
+            // one), so both count. A plain click therefore shows the member
+            // you were on until release, then cuts once by the rule; a drag
+            // keeps that member for its whole gesture, even past its window,
+            // wherever it still has an exact frame. Engaging later (after a
+            // drag threshold) would let the rule cut on the press frame and
+            // then hold the partner instead of the member being looped.
             if (panel.linkedViewMode ==
                     AnimationLinkedViewMode::Alternating &&
                 !panel.linkedAlternationHeldMember.has_value() &&
                 panel.linkedViewCameraAttached &&
                 panel.linkedPresentedMember.has_value() &&
-                ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                (ImGui::IsMouseDown(ImGuiMouseButton_Left) ||
+                 ImGui::IsMouseDown(ImGuiMouseButton_Right))) {
                 panel.linkedAlternationHeldMember =
                     panel.linkedPresentedMember;
             }
