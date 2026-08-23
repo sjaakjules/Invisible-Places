@@ -61111,18 +61111,18 @@ void MapTimingTakeSceneStateToReciprocalLoop(
                 mapKeys(&setting.keys);
             }
             for (auto& clip : feature.clips) {
+                // Map the span's two phases; a span that now crosses loop
+                // phase 0 is stored wrapped (end = mapped end + 1, W1)
+                // rather than flattened to the complete rail. Member keys
+                // stay exact and Synchronize re-derives the bounds from them
+                // with this start as the covering-arc hint.
                 const float start = mapPosition(clip.start);
-                const float end = mapPosition(clip.end);
-                if (start <= end) {
-                    clip.start = start;
-                    clip.end = end;
-                } else {
-                    // A clip is authoring metadata; its member keys remain
-                    // exact. A wrapped clip uses the complete rail instead of
-                    // inventing a discontinuous endpoint key.
-                    clip.start = 0.0F;
-                    clip.end = 1.0F;
-                }
+                const float end = mapPosition(
+                    invisible_places::water::WaterClipCanonicalEnd(
+                        clip.start,
+                        clip.end));
+                clip.start = start;
+                clip.end = end >= start ? end : end + 1.0F;
             }
         }
     }
@@ -83586,36 +83586,58 @@ struct AnimationTimelineCoordinateContext {
     AuthoredIntervalToViewFractions(
         float authoredStart,
         float authoredEnd) const {
-        authoredStart = std::clamp(authoredStart, 0.0F, 1.0F);
-        authoredEnd = std::clamp(authoredEnd, 0.0F, 1.0F);
+        // W1 spans: start in [0,1], end in [start, start+1]; end > 1 wraps
+        // through phase 0.
         if (authoredStart > authoredEnd) {
             std::swap(authoredStart, authoredEnd);
         }
-        if (!linkedCyclic) {
-            const float start = std::max(
-                authoredStart,
-                unlinkedRange.start);
-            const float end = std::min(
-                authoredEnd,
-                unlinkedRange.end);
-            if (end < start) {
-                return {};
-            }
-            return {{
-                invisible_places::timing::
-                    TimelinePositionToViewFraction(unlinkedRange, start),
-                invisible_places::timing::
-                    TimelinePositionToViewFraction(unlinkedRange, end),
-            }};
-        }
+        authoredStart = std::clamp(authoredStart, 0.0F, 1.0F);
+        authoredEnd = std::clamp(
+            authoredEnd,
+            authoredStart,
+            authoredStart + 1.0F);
         constexpr float kIntervalTolerance = 1.0e-6F;
+        if (!linkedCyclic) {
+            // A wrapped interval is two rail pieces in the unlinked view.
+            std::vector<std::pair<float, float>> pieces;
+            if (authoredEnd > 1.0F + kIntervalTolerance) {
+                pieces.emplace_back(authoredStart, 1.0F);
+                pieces.emplace_back(0.0F, authoredEnd - 1.0F);
+            } else {
+                pieces.emplace_back(authoredStart, authoredEnd);
+            }
+            std::vector<std::pair<float, float>> segments;
+            for (const auto& piece : pieces) {
+                const float start = std::max(
+                    piece.first,
+                    unlinkedRange.start);
+                const float end = std::min(
+                    piece.second,
+                    unlinkedRange.end);
+                if (end < start) {
+                    continue;
+                }
+                segments.emplace_back(
+                    invisible_places::timing::
+                        TimelinePositionToViewFraction(unlinkedRange, start),
+                    invisible_places::timing::
+                        TimelinePositionToViewFraction(unlinkedRange, end));
+            }
+            std::sort(segments.begin(), segments.end());
+            return segments;
+        }
         if (authoredEnd - authoredStart >= 1.0F - kIntervalTolerance) {
             return {{0.0F, 1.0F}};
         }
         const auto domain = invisible_places::timing::
             kLinkedSignedCyclicTimelineViewDomain;
         const float displayStart = AuthoredToDisplay(authoredStart);
-        const float displayEnd = AuthoredToDisplay(authoredEnd);
+        // The forward distance from the start phase to the end phase is the
+        // clip length whether or not the end passed through phase 0.
+        const float displayEnd = AuthoredToDisplay(
+            invisible_places::water::WaterClipCanonicalEnd(
+                authoredStart,
+                authoredEnd));
         const float intervalSpan = invisible_places::timing::
             CyclicTimelineForwardDistance(
                 displayStart,
@@ -86689,6 +86711,10 @@ void DrawWaterClipContextMenu(
         ImGui::EndPopup();
         return;
     }
+    // Only linked-cyclic authoring may produce clips that wrap through loop
+    // phase 0; unlinked editing keeps every placement on the 0..1 rail.
+    const bool allowWrap =
+        ResolveAnimationTimelineCoordinateContext(*runtimeState).linkedCyclic;
     const auto* clip = context.clipId != 0U
                            ? invisible_places::water::FindWaterFeatureClip(
                                  timeline,
@@ -86742,7 +86768,7 @@ void DrawWaterClipContextMenu(
                 invisible_places::water::kWaterFeatureClipMinimumLength;
             const float length = clip->end - clip->start;
             float target = clip->end + kGap;
-            if (target + length > 1.0F) {
+            if (!allowWrap && target + length > 1.0F) {
                 target = clip->start - kGap - length;
             }
             BeginWaterKeyEditTransaction(runtimeState, scenarioId);
@@ -86750,7 +86776,8 @@ void DrawWaterClipContextMenu(
                 invisible_places::water::DuplicateWaterFeatureClip(
                     timeline,
                     context.clipId,
-                    target);
+                    target,
+                    allowWrap);
             if (duplicated.has_value()) {
                 SelectSingleWaterClip(
                     runtimeState,
@@ -86917,10 +86944,15 @@ void DrawWaterClipContextMenu(
                         invisible_places::water::
                             kWaterFeatureClipMinimumLength,
                         1.0F);
-                    const float start = std::clamp(
-                        context.position,
-                        0.0F,
-                        1.0F - length);
+                    // On the linked loop the package starts where it was
+                    // clicked and may wrap; unlinked stays on the rail.
+                    const float start = allowWrap
+                        ? invisible_places::water::WrapWaterClipPhase(
+                              context.position)
+                        : std::clamp(
+                              context.position,
+                              0.0F,
+                              1.0F - length);
                     BeginWaterKeyEditTransaction(
                         runtimeState,
                         scenarioId);
@@ -87026,6 +87058,13 @@ void DrawWaterClipEditPopup(
         edit.requestKeyboardFocus = false;
     }
     InputTextString("Name", &edit.draftName);
+    // Wrapped bounds (end past one cycle) are only offered on the linked
+    // loop, or for a clip that already wraps (so renaming it from the
+    // unlinked view cannot silently squash it onto the rail); otherwise an
+    // unlinked take keeps the 0..1 rail semantics.
+    const bool allowWrap =
+        ResolveAnimationTimelineCoordinateContext(*runtimeState).linkedCyclic ||
+        invisible_places::water::WaterClipIsWrapped(clip->start, clip->end);
     const bool useSeconds = durationSeconds > 0.0F;
     if (useSeconds) {
         float startSeconds = edit.draftStart * durationSeconds;
@@ -87042,6 +87081,16 @@ void DrawWaterClipEditPopup(
     }
     ImGui::TextDisabled(
         "Moving these bounds retimes only this clip's keys; clips may overlap.");
+    if (allowWrap) {
+        if (edit.draftEnd > 1.0F) {
+            ImGui::TextDisabled(
+                "This clip wraps through the loop start (end past the cycle).");
+        } else {
+            ImGui::TextDisabled(
+                "An end past the cycle length wraps the clip through the "
+                "loop start.");
+        }
+    }
     if (!edit.errorMessage.empty()) {
         ImGui::TextColored(
             ImVec4{1.0F, 0.45F, 0.35F, 1.0F},
@@ -87049,11 +87098,24 @@ void DrawWaterClipEditPopup(
             edit.errorMessage.c_str());
     }
     if (ImGui::Button("Apply")) {
-        const float draftStart = std::clamp(edit.draftStart, 0.0F, 1.0F);
-        const float draftEnd = std::clamp(edit.draftEnd, 0.0F, 1.0F);
+        float draftStart = 0.0F;
+        float draftEnd = 0.0F;
+        if (allowWrap) {
+            // Keep the typed length; the start phase is what the loop
+            // stores (W1: start in [0,1), end in (start, start+1]).
+            const float length = edit.draftEnd - edit.draftStart;
+            draftStart = invisible_places::water::WrapWaterClipPhase(
+                edit.draftStart);
+            draftEnd = draftStart + length;
+        } else {
+            draftStart = std::clamp(edit.draftStart, 0.0F, 1.0F);
+            draftEnd = std::clamp(edit.draftEnd, 0.0F, 1.0F);
+        }
         if (draftEnd - draftStart <
             invisible_places::water::kWaterFeatureClipMinimumLength) {
             edit.errorMessage = "End must come after start.";
+        } else if (draftEnd - draftStart > 1.0F + 1.0e-6F) {
+            edit.errorMessage = "A clip may not exceed one cycle.";
         } else if (
             std::abs(draftStart - clip->start) <= 1.0e-6F &&
             std::abs(draftEnd - clip->end) <= 1.0e-6F) {
@@ -87072,7 +87134,8 @@ void DrawWaterClipEditPopup(
                     timeline,
                     edit.clipId,
                     draftStart,
-                    draftEnd)) {
+                    draftEnd,
+                    allowWrap)) {
                 // The transform may have re-sorted the clip vector;
                 // re-resolve before renaming.
                 if (auto* moved =
@@ -87557,19 +87620,26 @@ void DrawWaterRunClipsTimeline(
                 kEdgeGrabWidth,
                 std::max(2.0F, (x1 - x0) * 0.25F));
             WaterClipDragMode zone = WaterClipDragMode::Move;
+            // A wrapped block's end (> 1) sits at its canonical phase on
+            // the rail; the display mapping only accepts phases in 0..1.
+            const float blockEndPhase =
+                invisible_places::water::WaterClipCanonicalEnd(
+                    block.start,
+                    block.end);
             const bool startVisible =
                 timelineCoordinates.AuthoredIsInView(
                     block.start,
                     1.0e-4F);
             const bool endVisible =
                 timelineCoordinates.AuthoredIsInView(
-                    block.end,
+                    blockEndPhase,
                     1.0e-4F);
             if (startVisible &&
                 std::abs(mouse.x - xForPosition(block.start)) <= edge) {
                 zone = WaterClipDragMode::StretchStart;
             } else if (endVisible &&
-                       std::abs(mouse.x - xForPosition(block.end)) <= edge) {
+                       std::abs(mouse.x - xForPosition(blockEndPhase)) <=
+                           edge) {
                 zone = WaterClipDragMode::StretchEnd;
             }
             if (!hit.has_value() || isSelected(block.handle) ||
@@ -87670,6 +87740,20 @@ void DrawWaterRunClipsTimeline(
             }
         };
         const auto retargetRow = retargetRowForDrag(drag);
+        // Wrapping is a loop property: the linked cyclic view rolls every
+        // selection around phase 0, and a clip that already wraps (authored
+        // on the loop, now viewed unlinked) keeps rolling rather than being
+        // pinned against rail limits it no longer satisfies.
+        const bool anyEntryWrapped = std::any_of(
+            drag.entries.begin(),
+            drag.entries.end(),
+            [](const WaterClipDragEntry& entry) {
+                return invisible_places::water::WaterClipIsWrapped(
+                    entry.originalStart,
+                    entry.originalEnd);
+            });
+        const bool allowWrap =
+            timelineCoordinates.linkedCyclic || anyEntryWrapped;
         const auto clampedMoveDelta = [&](float requested) {
             float lower = -1.0F;
             float upper = 1.0F;
@@ -87683,23 +87767,44 @@ void DrawWaterRunClipsTimeline(
             }
             return std::clamp(requested, std::min(lower, upper), upper);
         };
+        // Snap candidates and the probed value may sit outside 0..1 during a
+        // cyclic move (a wrapped block end, a start rolled past 0). Compare
+        // them as loop phases and hand back the equivalent of the snapped
+        // phase nearest the probed value, so snapping never jumps a cycle.
+        const auto snapPhase = [&](float position) {
+            if (!allowWrap) {
+                return position;
+            }
+            return invisible_places::water::WrapWaterClipPhase(position);
+        };
         const auto snapAdjust = [&](float value) -> std::optional<float> {
             if (ImGui::GetIO().KeyShift) {
                 return std::nullopt;
             }
             float bestPixels = 6.0F;
             std::optional<float> snapped;
+            const float valuePhase = snapPhase(value);
+            if (!timelineCoordinates.AuthoredIsInView(valuePhase, 1.0e-4F)) {
+                return std::nullopt;
+            }
             const auto consider = [&](float candidate) {
+                const float candidatePhase = snapPhase(candidate);
                 if (!timelineCoordinates.AuthoredIsInView(
-                        candidate,
+                        candidatePhase,
                         1.0e-4F)) {
                     return;
                 }
                 const float distancePixels = std::abs(
-                    xForPosition(candidate) - xForPosition(value));
+                    xForPosition(candidatePhase) - xForPosition(valuePhase));
                 if (distancePixels < bestPixels) {
                     bestPixels = distancePixels;
-                    snapped = candidate;
+                    if (allowWrap) {
+                        float difference = candidatePhase - valuePhase;
+                        difference -= std::round(difference);
+                        snapped = value + difference;
+                    } else {
+                        snapped = candidate;
+                    }
                 }
             };
             consider(0.0F);
@@ -87723,7 +87828,12 @@ void DrawWaterRunClipsTimeline(
                     continue;
                 }
                 consider(block.start);
-                consider(block.end);
+                consider(
+                    allowWrap
+                        ? block.end
+                        : invisible_places::water::WaterClipCanonicalEnd(
+                              block.start,
+                              block.end));
             }
             return snapped;
         };
@@ -87756,7 +87866,8 @@ void DrawWaterRunClipsTimeline(
                         drag.groupStart,
                         drag.groupEnd,
                         newGroupStart,
-                        newGroupEnd);
+                        newGroupEnd,
+                        allowWrap);
             }
         };
 
@@ -87835,24 +87946,30 @@ void DrawWaterRunClipsTimeline(
                     // Re-apply the horizontal offset on the target when its
                     // surroundings allow it; otherwise the clip keeps the
                     // source window.
-                    const float requested = clampedMoveDelta(
-                        authoredDragDelta(drag.mouseStartX, mouse.x));
+                    const float requested = allowWrap
+                        ? authoredDragDelta(drag.mouseStartX, mouse.x)
+                        : clampedMoveDelta(
+                              authoredDragDelta(drag.mouseStartX, mouse.x));
                     const auto limits = invisible_places::water::
                         WaterFeatureTimelineSpanLimits(
                             target,
                             entry.originalStart,
-                            entry.originalEnd);
+                            entry.originalEnd,
+                            allowWrap);
                     const float delta = std::clamp(
                         requested,
                         limits.minimumStart - entry.originalStart,
                         limits.maximumEnd - entry.originalEnd);
                     if (std::abs(delta) > 1.0e-6F) {
+                        // On the loop the transform wraps the start phase
+                        // itself (period 1); on the rail delta is clamped.
                         (void)invisible_places::water::
                             TransformWaterFeatureClip(
                                 &target,
                                 transferred.value(),
                                 entry.originalStart + delta,
-                                entry.originalEnd + delta);
+                                entry.originalEnd + delta,
+                                allowWrap);
                     }
                     replaceSelection({{.feature = target.feature,
                                        .clipId = transferred.value()}});
@@ -87895,14 +88012,13 @@ void DrawWaterRunClipsTimeline(
                     const float requested = authoredDragDelta(
                         drag.mouseStartX,
                         mouse.x);
-                    const bool cyclicMove =
-                        timelineCoordinates.linkedCyclic &&
-                        !drag.duplicate;
-                    float delta = 0.0F;
-                    if (drag.duplicate) {
-                        // Duplicates place fresh copies, so their windows
-                        // are free of the outside-key limits that bind the
-                        // originals — only the 0..1 domain clamps them.
+                    const bool cyclicMove = allowWrap && !drag.duplicate;
+                    // Copies roll around the loop too; on the rail only the
+                    // 0..1 domain clamps them.
+                    const auto clampDuplicateDelta = [&](float candidate) {
+                        if (allowWrap) {
+                            return candidate;
+                        }
                         float lower = -1.0F;
                         float upper = 1.0F;
                         for (const auto& entry : drag.entries) {
@@ -87913,7 +88029,14 @@ void DrawWaterRunClipsTimeline(
                                 upper,
                                 1.0F - entry.originalEnd);
                         }
-                        delta = std::clamp(requested, lower, upper);
+                        return std::clamp(candidate, lower, upper);
+                    };
+                    float delta = 0.0F;
+                    if (drag.duplicate) {
+                        // Duplicates place fresh copies, so their windows
+                        // are free of the outside-key limits that bind the
+                        // originals.
+                        delta = clampDuplicateDelta(requested);
                     } else if (cyclicMove) {
                         const auto moved = invisible_places::water::
                             CyclicWaterFeatureClipMoveSpan(
@@ -87941,12 +88064,7 @@ void DrawWaterRunClipsTimeline(
                         drag.groupStart + delta,
                         drag.groupEnd + delta};
                     if (drag.duplicate) {
-                        for (const auto& entry : drag.entries) {
-                            delta = std::clamp(
-                                delta,
-                                -entry.originalStart,
-                                1.0F - entry.originalEnd);
-                        }
+                        delta = clampDuplicateDelta(delta);
                         movedGroup = {
                             drag.groupStart + delta,
                             drag.groupEnd + delta};
@@ -87970,10 +88088,15 @@ void DrawWaterRunClipsTimeline(
                             if (timeline == nullptr) {
                                 continue;
                             }
-                            const float newStart =
-                                entry.originalStart + delta;
+                            // A copy on the loop is stored with its start
+                            // phase in [0,1) and may wrap (W1).
+                            const float newStart = allowWrap
+                                ? invisible_places::water::WrapWaterClipPhase(
+                                      entry.originalStart + delta)
+                                : entry.originalStart + delta;
                             const float newEnd =
-                                entry.originalEnd + delta;
+                                newStart +
+                                (entry.originalEnd - entry.originalStart);
                             std::optional<std::uint32_t> appliedId;
                             if (!entry.package.settings.empty()) {
                                 appliedId = invisible_places::water::
@@ -88078,6 +88201,13 @@ void DrawWaterRunClipsTimeline(
                                 scaleMinimum = std::max(
                                     scaleMinimum,
                                     kClipMinimumLength / length);
+                                if (allowWrap) {
+                                    // The loop has no rail ends; the only
+                                    // upper bound is one full cycle.
+                                    scaleMaximum = std::min(
+                                        scaleMaximum,
+                                        1.0F / length);
+                                }
                             }
                         }
                         if (scaleMinimum <= scaleMaximum) {
@@ -88203,7 +88333,10 @@ void DrawWaterRunClipsTimeline(
                         const float grabReference =
                             hovered->zone ==
                                     WaterClipDragMode::StretchEnd
-                                ? block.end
+                                ? invisible_places::water::
+                                      WaterClipCanonicalEnd(
+                                          block.start,
+                                          block.end)
                                 : block.start;
                         drag.grabOffsetPixels =
                             mouse.x - xForPosition(grabReference);
@@ -88224,7 +88357,12 @@ void DrawWaterRunClipsTimeline(
                             WaterFeatureTimelineSpanLimits(
                                 *timeline,
                                 span->first,
-                                span->second);
+                                span->second,
+                                /*cyclic=*/timelineCoordinates.linkedCyclic ||
+                                    invisible_places::water::
+                                        WaterClipIsWrapped(
+                                            span->first,
+                                            span->second));
                         WaterClipDragEntry entry{
                             .handle = handle,
                             .originalStart = span->first,
@@ -88283,6 +88421,73 @@ void DrawWaterRunClipsTimeline(
                     if (lead != drag.entries.end() &&
                         lead != drag.entries.begin()) {
                         std::iter_swap(lead, drag.entries.begin());
+                    }
+                    // On the loop the group window is the shortest cyclic
+                    // covering arc of the selected spans (ties broken
+                    // towards the grabbed block), not a rail min/max:
+                    // entries {0.9,1.2} and {0.1,0.3} form the arc
+                    // {0.9,1.3}, not {0.1,1.2}. Any covering arc gives the
+                    // same move; the shortest keeps a stretch anchored at
+                    // the visually outer edges.
+                    const bool groupWraps = std::any_of(
+                        drag.entries.begin(),
+                        drag.entries.end(),
+                        [](const WaterClipDragEntry& entry) {
+                            return invisible_places::water::
+                                WaterClipIsWrapped(
+                                    entry.originalStart,
+                                    entry.originalEnd);
+                        });
+                    if ((timelineCoordinates.linkedCyclic || groupWraps) &&
+                        !drag.entries.empty()) {
+                        const float hint = drag.entries.front().originalStart;
+                        std::optional<std::pair<float, float>> bestArc;
+                        float bestDistance = 0.0F;
+                        for (const auto& candidate : drag.entries) {
+                            const float arcStart = candidate.originalStart;
+                            float arcEnd = arcStart;
+                            for (const auto& entry : drag.entries) {
+                                const float unwrappedStart =
+                                    invisible_places::water::
+                                        UnwrapWaterClipPosition(
+                                            entry.originalStart,
+                                            arcStart);
+                                arcEnd = std::max(
+                                    arcEnd,
+                                    unwrappedStart +
+                                        (entry.originalEnd -
+                                         entry.originalStart));
+                            }
+                            const float difference =
+                                std::abs(arcStart - hint);
+                            const float distance = std::min(
+                                difference,
+                                std::abs(1.0F - difference));
+                            const float length = arcEnd - arcStart;
+                            const bool shorter =
+                                bestArc.has_value() &&
+                                length < bestArc->second - bestArc->first -
+                                             1.0e-4F;
+                            const bool sameLengthNearer =
+                                bestArc.has_value() &&
+                                std::abs(
+                                    length -
+                                    (bestArc->second - bestArc->first)) <=
+                                    1.0e-4F &&
+                                distance < bestDistance;
+                            if (!bestArc.has_value() || shorter ||
+                                sameLengthNearer) {
+                                bestArc = {arcStart, arcEnd};
+                                bestDistance = distance;
+                            }
+                        }
+                        // Spans that cannot share one cycle keep the rail
+                        // min/max window so the transform refuses cleanly.
+                        if (bestArc.has_value() &&
+                            bestArc->second - bestArc->first <= 1.0F + 1.0e-4F) {
+                            drag.groupStart = bestArc->first;
+                            drag.groupEnd = bestArc->second;
+                        }
                     }
                     for (const auto& feature : affected) {
                         if (const auto* timeline =
