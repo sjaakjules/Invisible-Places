@@ -115162,6 +115162,890 @@ int RunScene3SeepageNodeSmoke(
 }
 
 
+std::optional<AnimationPath> LoadLinkedHqSmokeAnimation(
+    const std::filesystem::path& path,
+    std::string* errorMessage) {
+    std::string loadError;
+    auto animation =
+        invisible_places::serialization::LoadAnimationPath(
+            path,
+            &loadError);
+    if (!animation.has_value()) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "Could not load HQ diagnostic animation " +
+                path.string() + ": " + loadError;
+        }
+        return std::nullopt;
+    }
+    return animation;
+}
+
+bool InstallLinkedHqSmokePair(
+    PreviewRuntimeState* runtimeState,
+    const std::filesystem::path& firstSourcePath,
+    const std::optional<std::filesystem::path>& secondSourcePath,
+    std::string_view sceneGroupName,
+    const std::filesystem::path& syntheticDirectory,
+    std::string* errorMessage) {
+    if (runtimeState == nullptr) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "HQ diagnostic runtime is null.";
+        }
+        return false;
+    }
+    auto first = LoadLinkedHqSmokeAnimation(
+        firstSourcePath,
+        errorMessage);
+    if (!first.has_value()) {
+        return false;
+    }
+    auto second = secondSourcePath.has_value()
+        ? LoadLinkedHqSmokeAnimation(
+              secondSourcePath.value(),
+              errorMessage)
+        : first;
+    if (!second.has_value()) {
+        return false;
+    }
+    if (first->keys.size() < 2U || second->keys.size() < 2U) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "HQ diagnostic animations require at least two camera keys.";
+        }
+        return false;
+    }
+
+    const auto firstSyntheticPath =
+        syntheticDirectory / "linked-hq-smoke-A.ipanim.json";
+    const auto secondSyntheticPath =
+        syntheticDirectory / "linked-hq-smoke-B.ipanim.json";
+    const std::string pairId =
+        "linked-hq-smoke-" + std::string{sceneGroupName};
+    const std::uint32_t shortestDuration = std::min(
+        std::max(2U, first->durationFrames),
+        std::max(2U, second->durationFrames));
+    const std::uint32_t overlapFrames = std::max<std::uint32_t>(
+        1U,
+        std::min<std::uint32_t>(30U, shortestDuration / 4U));
+    const float overlapSeconds =
+        static_cast<float>(overlapFrames) / 30.0F;
+    const auto makeLink = [&](const std::filesystem::path& partner) {
+        return invisible_places::camera::
+            AnimationVelocityBlendLinkMetadata{
+                .pairId = pairId,
+                .partnerFileName =
+                    partner.filename().generic_string(),
+                .startOverlapSeconds = overlapSeconds,
+                .endOverlapSeconds = overlapSeconds,
+                .horizontalBlend = true,
+                .panRight = true,
+            };
+    };
+    first->name = "Linked HQ Smoke A";
+    second->name = "Linked HQ Smoke B";
+    first->velocityBlendLink = makeLink(secondSyntheticPath);
+    second->velocityBlendLink = makeLink(firstSyntheticPath);
+    const auto association = SceneGroupAssociationPath(sceneGroupName);
+    first->associatedLayerPaths = {association};
+    second->associatedLayerPaths = {association};
+    std::string timingTakeId =
+        invisible_places::timing::NormalizeTimingTakeId(
+            runtimeState->water.selectedTimingTakeId);
+    if (timingTakeId.empty() &&
+        !runtimeState->water.timingTakes.empty()) {
+        timingTakeId = invisible_places::timing::NormalizeTimingTakeId(
+            runtimeState->water.timingTakes.front().id);
+    }
+    if (timingTakeId.empty()) {
+        timingTakeId = "linked-hq-smoke";
+    }
+    first->selectedTimingTakeId = timingTakeId;
+    second->selectedTimingTakeId = timingTakeId;
+    const auto liveSize = runtimeState->liveViewWindowSize;
+    if (first->defaultLiveViewWindowWidth == 0U ||
+        first->defaultLiveViewWindowHeight == 0U) {
+        first->defaultLiveViewWindowWidth = static_cast<std::uint32_t>(
+            std::max(1, liveSize.width));
+        first->defaultLiveViewWindowHeight = static_cast<std::uint32_t>(
+            std::max(1, liveSize.height));
+    }
+    // Use a distinct authored aspect for B when its file has no authored
+    // viewport. The diagnostic therefore exercises both midpoint-aspect
+    // inputs instead of silently validating the live-aspect fallback twice.
+    if (second->defaultLiveViewWindowWidth == 0U ||
+        second->defaultLiveViewWindowHeight == 0U) {
+        second->defaultLiveViewWindowWidth = 1920U;
+        second->defaultLiveViewWindowHeight = 1080U;
+    }
+    if (!invisible_places::camera::
+            ConfigureAnimationReciprocalTimingLoopWindows(
+                &first.value(),
+                &second.value())) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "Could not configure a reciprocal clock for the HQ diagnostic pair.";
+        }
+        return false;
+    }
+
+    auto& panel = runtimeState->animationPanel;
+    panel.availableFiles = {
+        firstSyntheticPath,
+        secondSyntheticPath,
+    };
+    panel.availableFileAssociatedLayerPaths = {
+        {association},
+        {association},
+    };
+    panel.availableFileLoadedPaths = {
+        first.value(),
+        second.value(),
+    };
+    panel.availableFileEditedPaths = {
+        std::nullopt,
+        std::nullopt,
+    };
+    panel.availableFileDiskRevisions = {
+        std::nullopt,
+        std::nullopt,
+    };
+    panel.availableFileLoopEditPairIds = {
+        {},
+        {},
+    };
+    panel.availableFileDirtyFlags = {false, false};
+    panel.brokenVelocityLinkPathKeys.clear();
+    panel.animationRegistryInitialized = true;
+    panel.currentPath = first.value();
+    panel.currentFilePath = firstSyntheticPath.string();
+    panel.selectedFileIndex = 0U;
+    panel.selectedFileUsesEdited = false;
+    panel.currentPathUsesEdited = false;
+    panel.dirty = false;
+    panel.scrubAmount = 0.5F;
+    panel.linkedViewMode = AnimationLinkedViewMode::Seam;
+    panel.linkedViewCameraAttached = true;
+    panel.linkedCanonicalCycleFrame = 0.0;
+    panel.linkedCanonicalCycleFrameValid = false;
+    panel.linkedCanonicalPairId.clear();
+    panel.linkedMemberLocalPlayheads = {};
+    panel.linkedMemberLocalPlayheadsValid = {};
+    panel.linkedSeamedView = {};
+    const auto midpoint = invisible_places::camera::EvaluateAnimationPath(
+        panel.currentPath.value(),
+        invisible_places::camera::AnimationPathDurationSeconds(
+            panel.currentPath.value()) *
+            0.5F);
+    runtimeState->camera.ApplyState(midpoint.camera);
+    runtimeState->previewRenderStateSignatureValid = false;
+    if (!ResolveActiveAnimationLinkedPair(*runtimeState).has_value()) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The in-memory HQ diagnostic pair did not resolve as reciprocal.";
+        }
+        return false;
+    }
+    if (errorMessage != nullptr) {
+        errorMessage->clear();
+    }
+    return true;
+}
+
+invisible_places::renderer::core::SceneRenderState
+PumpLinkedHqSmokeFrame(
+    platform::Window* window,
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    float simulatedSeconds) {
+    if (window == nullptr || runtimeState == nullptr || viewport == nullptr) {
+        return {};
+    }
+    window->PollEvents();
+    PollPendingLayerLoad(runtimeState, viewport);
+    PollTimingColouriseHistogram(runtimeState);
+    EnsureWaterSurfaceCacheReady(runtimeState, viewport);
+    PollWaterFlowTrailBuildJob(runtimeState, viewport);
+    CommitReadySceneDisplaySwitches(runtimeState, viewport);
+    EnsureWaterSurfaceCacheReady(runtimeState, viewport);
+    StartQueuedLayerLoadIfIdle(runtimeState);
+    EnsureLinkedHqPreview(runtimeState, viewport);
+
+    const auto waterFrameState = ResolveWaterFrameState(runtimeState);
+    EnsureWaterSeepageRuntimeUpToDate(
+        runtimeState,
+        viewport,
+        &waterFrameState);
+    EnsureWaterDynamicMeshFlowGpuUpToDate(
+        runtimeState,
+        viewport,
+        waterFrameState,
+        simulatedSeconds);
+    viewport->BeginUiFrame();
+    viewport->SetDiagnosticsEnabled(true);
+    viewport->SetSceneCachingEnabled(false);
+    viewport->SetLiveSceneRenderingEnabled(true);
+    viewport->SetLiveRainSimulationEnabled(true);
+    auto renderState = BuildRenderState(
+        *runtimeState,
+        *viewport,
+        simulatedSeconds,
+        &waterFrameState,
+        nullptr,
+        true);
+    viewport->UpdateRenderState(renderState);
+    viewport->DrawFrame();
+    return renderState;
+}
+
+std::size_t LinkedHqPatchLayerCount(
+    const invisible_places::renderer::core::SceneRenderState& state) {
+    return static_cast<std::size_t>(std::count_if(
+        state.pointCloudLayers.begin(),
+        state.pointCloudLayers.end(),
+        [](const auto& layer) {
+            return layer.layerId == kLinkedHqRockPatchLayerId ||
+                   layer.layerId ==
+                       kLinkedHqVegetationPatchLayerId;
+        }));
+}
+
+bool LinkedHqCameraStatesEqual(
+    const invisible_places::camera::CameraState& left,
+    const invisible_places::camera::CameraState& right) {
+    return left.position == right.position &&
+           left.orientation == right.orientation &&
+           left.target == right.target &&
+           left.orbitCenter == right.orbitCenter &&
+           left.hasOrbitCenter == right.hasOrbitCenter &&
+           left.hasDepthOfField == right.hasDepthOfField &&
+           left.fovDegrees == right.fovDegrees &&
+           left.nearPlane == right.nearPlane &&
+           left.farPlane == right.farPlane &&
+           left.focusDistance == right.focusDistance &&
+           left.apertureFStops == right.apertureFStops &&
+           left.depthOfFieldMaxBlurPixels ==
+               right.depthOfFieldMaxBlurPixels;
+}
+
+std::uint64_t LinkedHqPointStyleFingerprint(
+    PointCloudStyleState style) {
+    // Compact 1 mm fields can occupy a different GPU slot from the same
+    // named 5 mm field. Slot numbers are transport details; compare the
+    // authored mapping, ranges, and outputs semantically.
+    const auto clearFieldSlot = [](RenderParameterBinding* binding) {
+        if (binding != nullptr) {
+            binding->fieldMap.fieldSlot = -1;
+        }
+    };
+    clearFieldSlot(&style.pointSize);
+    clearFieldSlot(&style.surfelDiameter);
+    clearFieldSlot(&style.opacity);
+    clearFieldSlot(&style.emissiveStrength);
+    clearFieldSlot(&style.depthFade);
+    clearFieldSlot(&style.colormapPosition);
+    std::uint64_t fingerprint = 1469598103934665603ULL;
+    HashPointStyle(&fingerprint, style);
+    return fingerprint;
+}
+
+std::uint64_t LinkedHqTimingColouriseFingerprint(
+    invisible_places::renderer::pointcloud::
+        ResolvedTimingColouriseStack stack) {
+    for (auto& effect : stack.effects) {
+        effect.scalarFieldSlot = -1;
+    }
+    std::uint64_t fingerprint = 1469598103934665603ULL;
+    HashTimingColouriseStack(&fingerprint, stack);
+    return fingerprint;
+}
+
+int RunLinkedHqPreviewSmoke(
+    const GuiSmokeOptions& options,
+    platform::Window* window,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    PreviewRuntimeState* runtimeState,
+    const std::filesystem::path& dataRoot) {
+    const bool sampleScene =
+        options.scenario == "linked-hq-sample-scene";
+    const std::string sceneGroupName =
+        sampleScene ? "SampleScene" : "Scene3";
+    const auto outputDirectory = options.outputDirectory.empty()
+        ? DefaultRenderOutputDirectory(dataRoot) / "linked-hq" /
+              (sampleScene ? "sample-scene" : "scene3")
+        : options.outputDirectory;
+    GuiSmokeReport report{
+        .scenario = options.scenario,
+        .outputPath =
+            outputDirectory / "linked-hq-report.json",
+    };
+    const auto finish = [&]() {
+        if (!WriteGuiSmokeReport(report)) {
+            std::cerr << "Failed to write linked HQ report: "
+                      << report.outputPath.string() << "\n";
+            return 1;
+        }
+        std::cout << "Linked HQ report: "
+                  << report.outputPath.string() << "\n";
+        for (const auto& failure : report.failures) {
+            std::cerr << "Linked HQ failure: " << failure << "\n";
+        }
+        return report.Passed() ? 0 : 1;
+    };
+    if (window == nullptr || viewport == nullptr ||
+        runtimeState == nullptr) {
+        report.Fail(
+            "The linked HQ diagnostic requires a live window, viewport, and runtime.");
+        return finish();
+    }
+    std::error_code createError;
+    std::filesystem::create_directories(
+        outputDirectory,
+        createError);
+    if (createError) {
+        report.Fail(
+            "Could not create linked HQ output directory: " +
+            createError.message());
+        return finish();
+    }
+
+    const auto projectPath = dataRoot.parent_path() / "Saved" /
+        (sampleScene
+             ? std::filesystem::path{"validation"} /
+                   "SampleSceneValidation_project.json"
+             : std::filesystem::path{
+                   "ExhibitionFinal_project.json"});
+    runtimeState->persistence.projectFilePath =
+        projectPath.string();
+    std::string projectError;
+    const auto project =
+        invisible_places::serialization::LoadProjectDocument(
+            projectPath,
+            &projectError);
+    if (!project.has_value()) {
+        report.Fail(
+            "Could not load the linked HQ diagnostic project: " +
+            projectError);
+        return finish();
+    }
+    if (!ApplyProjectDocumentToRuntime(
+            project.value(),
+            runtimeState,
+            viewport)) {
+        report.Fail(
+            "Could not apply the linked HQ diagnostic project: " +
+            (runtimeState->errorMessage.empty()
+                 ? runtimeState->statusMessage
+                 : runtimeState->errorMessage));
+        return finish();
+    }
+    const auto firstAnimationPath = sampleScene
+        ? dataRoot.parent_path() / "tests" / "fixtures" /
+              "sample_scene_validation.ipanim.json"
+        : dataRoot.parent_path() / "Saved" / "animations" /
+              "Projetor_A.ipanim.json";
+    const std::optional<std::filesystem::path> secondAnimationPath =
+        sampleScene
+            ? std::nullopt
+            : std::optional<std::filesystem::path>{
+                  dataRoot.parent_path() / "Saved" / "animations" /
+                  "Projetor_B.ipanim.json"};
+    std::string pairError;
+    if (!InstallLinkedHqSmokePair(
+            runtimeState,
+            firstAnimationPath,
+            secondAnimationPath,
+            sceneGroupName,
+            outputDirectory,
+            &pairError)) {
+        report.Fail(pairError);
+        return finish();
+    }
+
+    auto sceneIt = std::find_if(
+        runtimeState->pointCloudScenes.begin(),
+        runtimeState->pointCloudScenes.end(),
+        [&](const ScenePointCloudRuntime& scene) {
+            return scene.sceneGroupName == sceneGroupName;
+        });
+    if (sceneIt == runtimeState->pointCloudScenes.end()) {
+        report.Fail(
+            "The HQ diagnostic project did not resolve " +
+            sceneGroupName + ".");
+        return finish();
+    }
+    auto* scene = &*sceneIt;
+    const auto* oneMillimeter = FindSceneDisplayBundle(
+        *scene,
+        invisible_places::scene::PointSpacingMicrometres{1'000U});
+    const auto* fiveMillimeter = FindSceneDisplayBundle(
+        *scene,
+        invisible_places::scene::PointSpacingMicrometres{5'000U});
+    if (oneMillimeter == nullptr || fiveMillimeter == nullptr) {
+        report.Fail(
+            "The HQ diagnostic requires complete 1 mm and 5 mm bundles.");
+        return finish();
+    }
+    const auto sandRole =
+        invisible_places::scene::ScenePointCloudRoleIndex(
+            invisible_places::scene::ScenePointCloudRole::Sand);
+    const std::size_t oneMillimeterSandSession =
+        oneMillimeter->sessionIndices[sandRole];
+    if (oneMillimeterSandSession >= runtimeState->sessions.size()) {
+        report.Fail("The 1 mm SAND diagnostic session is invalid.");
+        return finish();
+    }
+    // Compare serialization after HQ against the loaded project authority,
+    // not the transient frame before its ordinary display finishes loading.
+    const auto projectBefore = project.value();
+
+    bool sandWasReadBySessionPath = false;
+    bool sandWasFingerprinted = false;
+    bool partialHybridFrame = false;
+    bool readyBeforeBothPatches = false;
+    bool patchVisibleBeforeReady = false;
+    bool progressMonotonic = true;
+    bool invalidationTriggered = false;
+    bool invalidationObserved = false;
+    float lastProgress = 0.0F;
+    std::uint64_t progressFingerprint = 0U;
+    std::uint64_t invalidatedFingerprint = 0U;
+    const auto startedAt = std::chrono::steady_clock::now();
+    const auto timeout = sampleScene
+        ? std::chrono::minutes{6}
+        : std::chrono::minutes{30};
+    const auto deadline = startedAt + timeout;
+    invisible_places::renderer::core::SceneRenderState latestState;
+    while (std::chrono::steady_clock::now() < deadline &&
+           !window->ShouldClose() &&
+           !runtimeState->linkedHqPreview.ready) {
+        latestState = PumpLinkedHqSmokeFrame(
+            window,
+            runtimeState,
+            viewport,
+            0.5F);
+        auto& hq = runtimeState->linkedHqPreview;
+        const auto patchLayerCount =
+            LinkedHqPatchLayerCount(latestState);
+        partialHybridFrame |= patchLayerCount == 1U;
+        patchVisibleBeforeReady |=
+            patchLayerCount > 0U && !hq.ready;
+        const bool bothPrepared = std::all_of(
+            hq.patches.begin(),
+            hq.patches.end(),
+            [](const LinkedHqPatchRuntime& patch) {
+                return patch.cloud != nullptr &&
+                       (patch.cloud->PointCount() == 0U ||
+                        patch.uploaded);
+            });
+        readyBeforeBothPatches |= hq.ready && !bothPrepared;
+        if (hq.request.has_value()) {
+            if (progressFingerprint != hq.request->fingerprint) {
+                progressFingerprint = hq.request->fingerprint;
+                lastProgress = hq.displayedProgress;
+            } else {
+                if (hq.displayedProgress + 1.0e-6F < lastProgress) {
+                    progressMonotonic = false;
+                }
+                lastProgress = std::max(
+                    lastProgress,
+                    hq.displayedProgress);
+            }
+            const auto& sandPath = runtimeState
+                ->sessions[oneMillimeterSandSession]
+                .sourcePath;
+            sandWasFingerprinted |= std::any_of(
+                hq.request->sourceFingerprints.begin(),
+                hq.request->sourceFingerprints.end(),
+                [&](const LinkedHqSourceFingerprint& source) {
+                    return NormalizePathKey(source.path) ==
+                           NormalizePathKey(sandPath);
+                });
+
+            // Change B's midpoint camera once during its first 1 mm scan.
+            // This exercises cancellation/invalidation without requiring a
+            // second complete scan of the source.
+            if (sampleScene && !invalidationTriggered &&
+                hq.stage == LinkedHqPreparationStage::Scanning &&
+                hq.displayedProgress > 0.08F &&
+                runtimeState->animationPanel
+                        .availableFileLoadedPaths.size() > 1U &&
+                runtimeState->animationPanel
+                    .availableFileLoadedPaths[1U]
+                    .has_value()) {
+                invalidationTriggered = true;
+                invalidatedFingerprint =
+                    hq.request->fingerprint;
+                auto& changed = runtimeState->animationPanel
+                    .availableFileLoadedPaths[1U]
+                    .value();
+                for (auto& key : changed.keys) {
+                    key.cameraPosition[0] += 0.25F;
+                    key.focusPoint[0] += 0.25F;
+                }
+            }
+            if (invalidationTriggered &&
+                hq.request->fingerprint != invalidatedFingerprint) {
+                invalidationObserved = true;
+            }
+        }
+        const auto& sandSession =
+            runtimeState->sessions[oneMillimeterSandSession];
+        sandWasReadBySessionPath |= sandSession.loaded ||
+            sandSession.cpuResident || sandSession.gpuResident;
+        if (runtimeState->pendingLoad.has_value()) {
+            sandWasReadBySessionPath |=
+                runtimeState->pendingLoad->sessionIndex ==
+                oneMillimeterSandSession;
+        }
+        sandWasReadBySessionPath |= std::any_of(
+            runtimeState->persistence.queuedLoads.begin(),
+            runtimeState->persistence.queuedLoads.end(),
+            [&](const QueuedLayerLoad& queued) {
+                return queued.sessionIndex ==
+                       oneMillimeterSandSession;
+            });
+        if (hq.stage == LinkedHqPreparationStage::Failed &&
+            hq.request.has_value()) {
+            report.Fail(
+                "HQ preparation failed: " + hq.failureMessage);
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+    report.loadMs = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - startedAt)
+                        .count();
+    auto& hq = runtimeState->linkedHqPreview;
+    if (!hq.ready) {
+        report.Fail(
+            "HQ did not become ready before the diagnostic deadline (stage " +
+            std::string{LinkedHqPreparationStageName(hq.stage)} +
+            ", " +
+            FormatFixed(hq.displayedProgress * 100.0F, 1) +
+            "%).");
+        return finish();
+    }
+    if (!sandWasReadBySessionPath && !sandWasFingerprinted) {
+        report.Pass(
+            "HQ prepared ROCK/VEG without loading, queueing, or fingerprinting 1 mm SAND.");
+    } else {
+        report.Fail(
+            "HQ touched the 1 mm SAND session or included it in source fingerprints.");
+    }
+    if (!partialHybridFrame && !patchVisibleBeforeReady &&
+        !readyBeforeBothPatches) {
+        report.Pass(
+            "Both HQ patches published atomically; no frame exposed one patch or any patch before Ready.");
+    } else {
+        report.Fail(
+            "A partial HQ hybrid was visible or Ready preceded publication of both patches.");
+    }
+    if (progressMonotonic) {
+        report.Pass(
+            "HQ progress was monotonic within each source/camera fingerprint.");
+    } else {
+        report.Fail("HQ progress moved backwards during one preparation.");
+    }
+    if (!sampleScene ||
+        (invalidationTriggered && invalidationObserved)) {
+        report.Pass(
+            sampleScene
+                ? "A midpoint-camera change cancelled and replaced the active HQ preparation."
+                : "The Scene3 HQ preparation retained one stable source/camera fingerprint.");
+    } else {
+        report.Fail(
+            "The SampleScene midpoint-camera invalidation was not observed.");
+    }
+
+    const auto hqOffState = latestState;
+    report.selectedPointCount = std::accumulate(
+        hq.patches.begin(),
+        hq.patches.end(),
+        std::size_t{0U},
+        [](std::size_t count, const LinkedHqPatchRuntime& patch) {
+            return count +
+                (patch.cloud != nullptr
+                     ? patch.cloud->PointCount()
+                     : 0U);
+        });
+    const auto cameraBeforeToggle =
+        runtimeState->camera.CaptureState();
+    const float scrubBeforeToggle =
+        runtimeState->animationPanel.scrubAmount;
+    const auto modeBeforeToggle =
+        runtimeState->animationPanel.linkedViewMode;
+    runtimeState->animationPlayback.active = true;
+    runtimeState->cameraPlayback.active = true;
+    const bool toggleSucceeded = SetLinkedHqPreviewEnabled(
+        runtimeState,
+        viewport,
+        true);
+    const bool togglePreservedState = toggleSucceeded &&
+        hq.enabled &&
+        LinkedHqCameraStatesEqual(
+            cameraBeforeToggle,
+            runtimeState->camera.CaptureState()) &&
+        scrubBeforeToggle ==
+            runtimeState->animationPanel.scrubAmount &&
+        modeBeforeToggle ==
+            runtimeState->animationPanel.linkedViewMode &&
+        runtimeState->animationPlayback.active &&
+        runtimeState->cameraPlayback.active;
+    if (togglePreservedState) {
+        report.Pass(
+            "HQ toggled without changing the linked mode, camera, playhead, or playback state.");
+    } else {
+        report.Fail(
+            "HQ toggling changed camera/timeline/playback state or failed to enable.");
+    }
+
+    latestState = PumpLinkedHqSmokeFrame(
+        window,
+        runtimeState,
+        viewport,
+        0.5F);
+    if (LinkedHqPatchLayerCount(latestState) == 2U) {
+        report.Pass(
+            "The enabled frame contains both internal 1 mm ROCK/VEG patches.");
+    } else {
+        report.Fail(
+            "The enabled frame did not contain exactly two HQ patch layers.");
+    }
+    bool allModesRetainedHq = true;
+    for (const auto mode : {
+             AnimationLinkedViewMode::Seam,
+             AnimationLinkedViewMode::A,
+             AnimationLinkedViewMode::B}) {
+        runtimeState->animationPanel.linkedViewMode = mode;
+        const auto modeState = PumpLinkedHqSmokeFrame(
+            window,
+            runtimeState,
+            viewport,
+            0.5F);
+        allModesRetainedHq = allModesRetainedHq &&
+            hq.enabled &&
+            LinkedHqPatchLayerCount(modeState) == 2U;
+    }
+    if (allModesRetainedHq) {
+        report.Pass("HQ remained enabled across Seam, A, and B.");
+    } else {
+        report.Fail("Switching Seam/A/B disabled or partially removed HQ.");
+    }
+
+    bool styleParity = true;
+    bool densityParity = true;
+    bool timingParity = true;
+    bool roleParity = true;
+    for (const auto& patch : hq.patches) {
+        const auto patchLayer = std::find_if(
+            latestState.pointCloudLayers.begin(),
+            latestState.pointCloudLayers.end(),
+            [&](const auto& layer) {
+                return layer.layerId == patch.layerId;
+            });
+        const auto baseLayer = std::find_if(
+            hqOffState.pointCloudLayers.begin(),
+            hqOffState.pointCloudLayers.end(),
+            [&](const auto& layer) {
+                return layer.layerId == patch.baseSessionIndex;
+            });
+        if (patchLayer == latestState.pointCloudLayers.end() ||
+            baseLayer == hqOffState.pointCloudLayers.end()) {
+            styleParity = false;
+            densityParity = false;
+            timingParity = false;
+            roleParity = false;
+            continue;
+        }
+        styleParity = styleParity &&
+            LinkedHqPointStyleFingerprint(patchLayer->style) ==
+                LinkedHqPointStyleFingerprint(baseLayer->style);
+        timingParity = timingParity &&
+            LinkedHqTimingColouriseFingerprint(
+                patchLayer->timingColourise) ==
+                LinkedHqTimingColouriseFingerprint(
+                    baseLayer->timingColourise);
+        densityParity = densityParity &&
+            patchLayer->densityCompensation.footprintScale == 1.0F &&
+            patchLayer->densityCompensation.coverageCorrection == 1.0F &&
+            baseLayer->densityCompensation.footprintScale > 0.0F &&
+            baseLayer->densityCompensation.coverageCorrection > 0.0F;
+        roleParity = roleParity &&
+            patchLayer->rainCollisionRole ==
+                baseLayer->rainCollisionRole &&
+            patchLayer->hasNormals == baseLayer->hasNormals &&
+            patchLayer->hasSourceRgb == baseLayer->hasSourceRgb;
+        for (const auto& patchField : patchLayer->scalarFields) {
+            const auto baseField = std::find_if(
+                baseLayer->scalarFields.begin(),
+                baseLayer->scalarFields.end(),
+                [&](const invisible_places::io::ScalarFieldStats& field) {
+                    return field.name == patchField.name;
+                });
+            if (baseField != baseLayer->scalarFields.end() &&
+                baseField->valid) {
+                styleParity = styleParity && patchField.valid &&
+                    patchField.minimum == baseField->minimum &&
+                    patchField.maximum == baseField->maximum;
+            }
+        }
+    }
+    if (styleParity && timingParity && roleParity) {
+        report.Pass(
+            "HQ patches resolved the same Visual bindings, scalar ranges, Timing Colourise, Rain role, Flow/roughness style, EDL, and DOF state as their roles.");
+    } else {
+        report.Fail(
+            "An HQ patch diverged from its base role's resolved Visual/effect state.");
+    }
+    if (densityParity) {
+        report.Pass(
+            "5 mm role layers retained density compensation and 1 mm patches used identity compensation.");
+    } else {
+        report.Fail("HQ density compensation was not role-appropriate.");
+    }
+
+    // Give the Seepage attachment path a frame after enabling HQ. If the
+    // base role has active topology, the corresponding patch must share its
+    // node count without rebuilding semantic support.
+    (void)PumpLinkedHqSmokeFrame(
+        window,
+        runtimeState,
+        viewport,
+        0.5F);
+    bool seepageParity = true;
+    bool seepageWasActive = false;
+    for (const auto& patch : hq.patches) {
+        const auto baseNodeCount =
+            viewport->WaterSeepageNodeCount(
+                patch.baseSessionIndex);
+        if (baseNodeCount == 0U) {
+            continue;
+        }
+        seepageWasActive = true;
+        seepageParity = seepageParity &&
+            viewport->WaterSeepageNodeCount(patch.layerId) ==
+                baseNodeCount;
+    }
+    if (!seepageWasActive || seepageParity) {
+        report.Pass(
+            seepageWasActive
+                ? "HQ patches shared their base roles' settled Seepage topology."
+                : "No active Seepage topology was present; the HQ attachment path remained idle.");
+    } else {
+        report.Fail(
+            "An HQ patch did not receive its base role's Seepage topology.");
+    }
+
+    const auto exportIndices =
+        SceneFullDensityExportSessionIndices(*scene);
+    bool canonicalExports = true;
+    std::array<bool, invisible_places::scene::kScenePointCloudRoleCount>
+        canonicalRoles{};
+    for (const auto& index : exportIndices) {
+        if (!index.has_value() ||
+            index.value() >= runtimeState->sessions.size()) {
+            canonicalExports = false;
+            continue;
+        }
+        const auto& session =
+            runtimeState->sessions[index.value()];
+        const auto spacing = invisible_places::scene::
+            QuantizePointSpacingMicrometres(
+                session.inferredPointSpacingMeters > 0.0F
+                    ? session.inferredPointSpacingMeters
+                    : session.pointSpacingMeters);
+        const auto role = invisible_places::scene::
+            ParseScenePointCloudRole(session.sceneRole);
+        canonicalExports = canonicalExports &&
+            spacing.has_value() && spacing.value() == 1'000U &&
+            role.has_value() &&
+            index.value() != kLinkedHqRockPatchLayerId &&
+            index.value() != kLinkedHqVegetationPatchLayerId;
+        if (role.has_value()) {
+            canonicalRoles[invisible_places::scene::
+                ScenePointCloudRoleIndex(role.value())] = true;
+        }
+    }
+    canonicalExports = canonicalExports &&
+        std::all_of(
+            canonicalRoles.begin(),
+            canonicalRoles.end(),
+            [](bool present) { return present; });
+    if (canonicalExports) {
+        report.Pass(
+            "Still/frame/video/EXR source selection remains the complete canonical 1 mm ROCK/SAND/VEG bundle with no HQ layer IDs.");
+    } else {
+        report.Fail(
+            "The canonical export source selector included a non-1 mm, missing-role, or HQ-internal layer.");
+    }
+
+    const auto projectAfter = BuildProjectDocument(*runtimeState);
+    const auto findSceneDocument = [&](const ProjectDocument& document)
+        -> const invisible_places::serialization::
+            ScenePointCloudGroupDocument* {
+        const auto found = std::find_if(
+            document.scenePointCloudGroups.begin(),
+            document.scenePointCloudGroups.end(),
+            [&](const auto& group) {
+                return group.sceneGroupName == sceneGroupName;
+            });
+        return found == document.scenePointCloudGroups.end()
+            ? nullptr
+            : &*found;
+    };
+    const auto* beforeSceneDocument =
+        findSceneDocument(projectBefore);
+    const auto* afterSceneDocument =
+        findSceneDocument(projectAfter);
+    const auto expectedCommittedSpacing =
+        beforeSceneDocument != nullptr
+            ? invisible_places::scene::
+                  QuantizePointSpacingMicrometres(
+                      beforeSceneDocument->displaySpacingMeters)
+            : std::nullopt;
+    const bool displaySelectionPreserved =
+        beforeSceneDocument != nullptr &&
+        afterSceneDocument != nullptr &&
+        expectedCommittedSpacing.has_value() &&
+        scene->committedDisplaySpacingMicrometres ==
+            expectedCommittedSpacing &&
+        beforeSceneDocument->displaySpacingMeters ==
+            afterSceneDocument->displaySpacingMeters &&
+        beforeSceneDocument->displayLoaded ==
+            afterSceneDocument->displayLoaded &&
+        beforeSceneDocument->displayVisible ==
+            afterSceneDocument->displayVisible;
+    if (displaySelectionPreserved) {
+        report.Pass(
+            "The session-only 5 mm override and internal patches did not change the saved Visible Point Cloud selection.");
+    } else {
+        report.Fail(
+            "HQ changed the committed or serializable scene density selection.");
+    }
+
+    const bool disabled = SetLinkedHqPreviewEnabled(
+        runtimeState,
+        viewport,
+        false);
+    const auto disabledState = PumpLinkedHqSmokeFrame(
+        window,
+        runtimeState,
+        viewport,
+        0.5F);
+    if (disabled && !hq.enabled &&
+        LinkedHqPatchLayerCount(disabledState) == 0U &&
+        hq.ready) {
+        report.Pass(
+            "HQ toggled back to the complete 5 mm view instantly while retaining the prepared cache.");
+    } else {
+        report.Fail(
+            "HQ did not return atomically to the cached complete 5 mm view.");
+    }
+    viewport->WaitIdle();
+    return finish();
+}
+
 int RunWaterIntegrationSmoke(
     const GuiSmokeOptions& options,
     platform::Window* window,
@@ -117938,6 +118822,18 @@ int Application::Run(ApplicationRunOptions options) const {
         if (options.guiSmoke->scenario == "water-integration-sample-scene" ||
             options.guiSmoke->scenario == "water-integration-scene3-exhibition") {
             const auto smokeExitCode = RunWaterIntegrationSmoke(
+                options.guiSmoke.value(),
+                &window,
+                &viewport.value(),
+                &runtimeState,
+                dataRoot_);
+            StopBackgroundWorkForShutdown(&runtimeState);
+            viewport->WaitIdle();
+            return smokeExitCode;
+        }
+        if (options.guiSmoke->scenario == "linked-hq-sample-scene" ||
+            options.guiSmoke->scenario == "linked-hq-scene3") {
+            const auto smokeExitCode = RunLinkedHqPreviewSmoke(
                 options.guiSmoke.value(),
                 &window,
                 &viewport.value(),
