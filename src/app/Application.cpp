@@ -115988,6 +115988,14 @@ bool InstallLinkedHqSmokePair(
         }
         return false;
     }
+    // Seed the shared clock now and pin Seam afterwards: the first pumped
+    // frame would otherwise seed it lazily and reset a fresh pair to the
+    // session default view (A/B), which at this canonical frame presents B
+    // at its local start instead of the loaded member. The diagnostic's
+    // preparation phases are specified against the Seam presentation.
+    (void)EnsureAnimationLinkedCanonicalClock(runtimeState);
+    panel.linkedViewMode = AnimationLinkedViewMode::Seam;
+    panel.linkedSeamedView.renderedSourceIndex = 0U;
     if (errorMessage != nullptr) {
         errorMessage->clear();
     }
