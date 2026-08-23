@@ -1820,10 +1820,11 @@ SanitizeAnimationReciprocalLoopAlternationWindow(
     const AnimationReciprocalLoopTransport& transport,
     AnimationReciprocalLoopAlternationWindow window) {
     const AnimationReciprocalLoopAlternationWindow defaults{};
-    if (!std::isfinite(window.aStart) || !std::isfinite(window.aEnd) ||
-        window.aStart > window.aEnd) {
+    if (!std::isfinite(window.aStart) || !std::isfinite(window.aEnd)) {
         window = defaults;
     }
+    // An inverted pair is not discarded: the start is clamped first and the
+    // end is then lifted to at least that start by the clamps below.
     const double duration = static_cast<double>(
         transport.memberWindows[0U].durationFrames);
     if (transport.cycleFrames == 0U || duration <= 0.0) {

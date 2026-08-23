@@ -963,8 +963,8 @@ struct AnimationReciprocalLoopMemberSelection {
 
 // Keeps the A window inside the frames B can take over: aStart may not pass
 // A's start-overlap fraction and aEnd may not precede the start of A's end
-// overlap. Non-finite or inverted values fall back to the defaults before
-// clamping.
+// overlap. Non-finite values fall back to the defaults; an inverted pair is
+// clamped (end lifted to start) rather than discarded.
 [[nodiscard]] AnimationReciprocalLoopAlternationWindow
 SanitizeAnimationReciprocalLoopAlternationWindow(
     const AnimationReciprocalLoopTransport& transport,

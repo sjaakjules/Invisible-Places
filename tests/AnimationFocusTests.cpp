@@ -4098,12 +4098,14 @@ TEST_CASE("Alternating A/B selection covers the S01 loop with one cut per seam",
                 Window{.aStart = 0.05F, .aEnd = 0.3F});
         CHECK(clampedEnd.aStart == Approx(0.05F));
         CHECK(clampedEnd.aEnd == Approx(1.0F - 2818.0F / 6868.0F));
+        // Inverted input is clamped, not discarded: the start snaps to the
+        // start-overlap edge and the end is lifted to the end-overlap start.
         const auto inverted = invisible_places::camera::
             SanitizeAnimationReciprocalLoopAlternationWindow(
                 transport,
                 Window{.aStart = 0.9F, .aEnd = 0.1F});
-        CHECK(inverted.aStart == Approx(0.2F));
-        CHECK(inverted.aEnd == Approx(0.8F));
+        CHECK(inverted.aStart == Approx(3080.0F / 6868.0F));
+        CHECK(inverted.aEnd == Approx(1.0F - 2818.0F / 6868.0F));
         const auto nan = invisible_places::camera::
             SanitizeAnimationReciprocalLoopAlternationWindow(
                 transport,

@@ -3830,6 +3830,9 @@ ResolveAnimationLinkedAlternationWindow(
 void SynchronizeAnimationLinkedPresentationCamera(
     PreviewRuntimeState* runtimeState);
 
+bool DetachAnimationLinkedPresentationCamera(
+    PreviewRuntimeState* runtimeState);
+
 std::optional<ResolvedAnimationLinkedPair>
 EnsureAnimationLinkedCanonicalClock(
     PreviewRuntimeState* runtimeState);
@@ -11813,6 +11816,10 @@ void FocusSessionLayer(
         return;
     }
 
+    // Framing a layer is manual navigation: release the linked presentation
+    // so the per-frame sync does not snap the camera straight back.
+    (void)DetachAnimationLinkedPresentationCamera(runtimeState);
+    runtimeState->cameraPlayback.active = false;
     runtimeState->camera.FrameBounds(
         effectiveFrame.bounds,
         effectiveFrame.hasFocusPoint ? effectiveFrame.focusPoint : effectiveFrame.bounds.minimum,
@@ -27400,13 +27407,20 @@ ResolveAnimationLinkedPresentation(
                     ? panel.scrubAmount
                     : 0.5F;
         }
+        // Live Edit Mode authors a key of the loaded member with the
+        // viewport showing that member's camera; the window rule must not
+        // swap the scene to the partner underneath the edit overlay.
+        const std::optional<std::size_t> heldMember =
+            panel.liveCameraEdit.active
+                ? std::optional<std::size_t>{pair.currentMemberIndex}
+                : panel.linkedAlternationHeldMember;
         const auto selection = invisible_places::camera::
             ResolveAnimationReciprocalLoopAlternatingMember(
                 pair.transport,
                 panel.linkedCanonicalCycleFrame,
                 ResolveAnimationLinkedAlternationWindow(*runtimeState, pair),
                 previous,
-                panel.linkedAlternationHeldMember);
+                heldMember);
         if (!selection.has_value()) {
             return std::nullopt;
         }
@@ -29957,6 +29971,22 @@ void StartGlobalAnimationPlayback(PreviewRuntimeState* runtimeState) {
             member);
     };
 
+    if (panel.linkedViewMode == AnimationLinkedViewMode::A ||
+        panel.linkedViewMode == AnimationLinkedViewMode::B) {
+        const std::size_t isolated =
+            panel.linkedViewMode == AnimationLinkedViewMode::A ? 0U : 1U;
+        if (!localForMember(isolated).has_value()) {
+            // Same fallback every scrub path applies: an isolated member
+            // with no exact frame here hands over to the A/B presentation
+            // rather than refusing to play.
+            panel.linkedViewMode = AnimationLinkedViewMode::Alternating;
+            panel.linkedSeamedView.enabled = false;
+            runtimeState->statusMessage =
+                std::string{isolated == 0U ? 'A' : 'B'} +
+                " has no exact frame at the current shared time; playing A/B.";
+            runtimeState->errorMessage.clear();
+        }
+    }
     if (panel.linkedViewMode == AnimationLinkedViewMode::Seam ||
         panel.linkedViewMode == AnimationLinkedViewMode::Alternating) {
         const double startCycleFrame = std::round(
@@ -30033,7 +30063,7 @@ void StartGlobalAnimationPlayback(PreviewRuntimeState* runtimeState) {
     if (!local.has_value()) {
         runtimeState->errorMessage =
             std::string{member == 0U ? 'A' : 'B'} +
-            " has no exact frame at the current shared time. Select Seam "
+            " has no exact frame at the current shared time. Select A/B "
             "or move into that member before playback.";
         runtimeState->statusMessage.clear();
         return;
@@ -30106,7 +30136,11 @@ void ToggleAnimationPlayback(PreviewRuntimeState* runtimeState) {
     if (runtimeState->animationPlayback.active) {
         StopAnimationPlayback(runtimeState);
     } else {
-        StartAnimationPlayback(runtimeState);
+        // A linked pair always plays on the shared transport (the same path
+        // Space takes) so the per-tab button cannot start a loaded-local
+        // playback that fights the A/B presentation; without a pair this
+        // is plain StartAnimationPlayback.
+        StartGlobalAnimationPlayback(runtimeState);
     }
 }
 
@@ -34969,6 +35003,28 @@ ResolveCurrentRenderSetupSnapshot(
         runtimeState->animationPanel.scrubAmount,
         0.0F,
         1.0F);
+    // A linked pair renders whichever member the viewport presents at the
+    // shared clock. The loaded member's scrubAmount cannot describe a frame
+    // it has no occurrence of (it freezes at the overlap edge there), and a
+    // presented partner camera would otherwise be previewed from the wrong
+    // path.
+    if (const auto pair = ResolveActiveAnimationLinkedPair(*runtimeState);
+        pair.has_value() &&
+        runtimeState->animationPanel.linkedViewCameraAttached) {
+        if (const auto presentation = ResolveAnimationLinkedPresentation(
+                runtimeState,
+                pair.value());
+            presentation.has_value() &&
+            pair->members[presentation->memberIndex] != nullptr &&
+            pair->members[presentation->memberIndex]->keys.size() >= 2U) {
+            snapshot.animationPath =
+                *pair->members[presentation->memberIndex];
+            snapshot.normalizedPosition = std::clamp(
+                presentation->localPosition,
+                0.0F,
+                1.0F);
+        }
+    }
     snapshot.framePreviewUsesPlaybackDensity =
         runtimeState->animationPanel.exportPreviewDensity;
     const auto* loadedOverride =
@@ -56243,7 +56299,10 @@ void ApplyFeatureTimelineScrub(
         panel.linkedCanonicalCycleFrameValid &&
         panel.linkedCanonicalPairId == pair->sessionPairId) {
         // A linked presentation camera is "on the path" exactly while it is
-        // attached: manual navigation detaches it and scrubs reattach it.
+        // attached: manual navigation detaches it; Global Animation
+        // Position, marker jumps, and the mode buttons reattach it, while a
+        // feature-timeline scrub only moves an attached camera (or any
+        // camera under the always-follow override).
         // The loaded-path geometric test used below cannot decide this
         // case, because the presented camera may legitimately belong to
         // the partner member (A/B alternation, Seam outside the loaded
@@ -56259,12 +56318,15 @@ void ApplyFeatureTimelineScrub(
             // that was on screen when it began (see
             // linkedAlternationHeldMember); the per-frame presentation sync
             // releases it on mouse-up.
+            // A plain click-jump is not a hold: it cuts once by the rule.
+            // The hold engages once the press has travelled the drag
+            // threshold, capturing the member the rule chose for the press.
             if (panel.linkedViewMode ==
                     AnimationLinkedViewMode::Alternating &&
                 !panel.linkedAlternationHeldMember.has_value() &&
                 panel.linkedViewCameraAttached &&
                 panel.linkedPresentedMember.has_value() &&
-                ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
                 panel.linkedAlternationHeldMember =
                     panel.linkedPresentedMember;
             }
@@ -58293,7 +58355,7 @@ void DrawLinkedSeamedViewHeaderControls(
             &window.aStart,
             0.001F,
             0.0F,
-            startOverlapFraction,
+            std::min(startOverlapFraction, window.aEnd),
             "%.3f",
             ImGuiSliderFlags_AlwaysClamp);
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
@@ -58311,7 +58373,7 @@ void DrawLinkedSeamedViewHeaderControls(
             "##LinkedAlternationEnd",
             &window.aEnd,
             0.001F,
-            endOverlapStartFraction,
+            std::max(endOverlapStartFraction, window.aStart),
             1.0F,
             "%.3f",
             ImGuiSliderFlags_AlwaysClamp) || windowChanged;
@@ -58403,7 +58465,7 @@ void DrawLinkedSeamedViewHeaderControls(
         if (selectedMember < 2U && !memberAvailable[selectedMember]) {
             ImGui::TextColored(
                 ImVec4{1.0F, 0.72F, 0.28F, 1.0F},
-                "%c has no exact frame here. Select Seam or the available member.",
+                "%c has no exact frame here. Select A/B or the available member.",
                 selectedMember == 0U ? 'A' : 'B');
         }
     }
@@ -116395,6 +116457,7 @@ int RunLinkedHqPreviewSmoke(
     bool allModesRetainedHq = true;
     for (const auto mode : {
              AnimationLinkedViewMode::Seam,
+             AnimationLinkedViewMode::Alternating,
              AnimationLinkedViewMode::A,
              AnimationLinkedViewMode::B}) {
         runtimeState->animationPanel.linkedViewMode = mode;
