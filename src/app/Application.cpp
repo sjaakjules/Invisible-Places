@@ -52863,6 +52863,12 @@ void ResetLinkedHqPreview(
 
     const auto priorRequest = hq.request;
     const auto ownedBaseline = hq.baselineLoadedForHq;
+    if (priorRequest.has_value()) {
+        std::cout << "Linked HQ: releasing prepared preview for "
+                  << priorRequest->sceneGroupName << " (stage "
+                  << LinkedHqPreparationStageName(hq.stage) << ")."
+                  << std::endl;
+    }
     if (viewport != nullptr) {
         try {
             PointCloudMutationBatchScope mutationBatch{viewport};
@@ -52994,6 +53000,9 @@ void StartLinkedHqPreparation(
             LinkedHqPreparationStage::Scanning,
             0.0F));
     hq.failureMessage.clear();
+    std::cout << "Linked HQ: scanning 1 mm ROCK/VEG for "
+              << request.sceneGroupName << " (" << sourcePaths[0U].filename().string()
+              << ", " << sourcePaths[1U].filename().string() << ")." << std::endl;
     hq.preparationWorker = std::jthread{
         [shared,
          request,
@@ -53124,6 +53133,11 @@ void StartLinkedHqPreparation(
         }};
 }
 
+bool SetLinkedHqPreviewEnabled(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    bool enabled);
+
 bool PollLinkedHqPreparation(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
@@ -53190,6 +53204,10 @@ bool PollLinkedHqPreparation(
         completed->fingerprint != hq.request->fingerprint) {
         return false;
     }
+    // Publishing replaces any patches already on the GPU. Remember whether
+    // the 5 mm masks were live so the new outside sets replace them instead
+    // of leaving the old masks installed with no patch to fill them.
+    const bool wasEnabled = hq.ready && hq.enabled;
     std::array<LinkedHqPatchRuntime, 2U> published{};
     try {
         PointCloudMutationBatchScope mutationBatch{viewport};
@@ -53254,6 +53272,26 @@ bool PollLinkedHqPreparation(
     runtimeState->statusMessage =
         "HQ linked preview is ready (1 mm ROCK/VEG midpoint patches; "
         "5 mm elsewhere).";
+    if (wasEnabled) {
+        (void)SetLinkedHqPreviewEnabled(runtimeState, viewport, true);
+    }
+    std::cout << "Linked HQ: patches ready ("
+              << FormatPointCount(
+                     hq.patches[0U].cloud != nullptr
+                         ? hq.patches[0U].cloud->PointCount()
+                         : 0U)
+              << " 1 mm ROCK, "
+              << FormatPointCount(
+                     hq.patches[1U].cloud != nullptr
+                         ? hq.patches[1U].cloud->PointCount()
+                         : 0U)
+              << " 1 mm VEG; 5 mm remainders "
+              << FormatPointCount(
+                     hq.patches[0U].fiveMillimeterOutsideIndices.size())
+              << " / "
+              << FormatPointCount(
+                     hq.patches[1U].fiveMillimeterOutsideIndices.size())
+              << ")." << std::endl;
     return true;
 }
 
@@ -53399,6 +53437,8 @@ void PollLinkedHqIndexedFieldLoad(
                 patch.cloud->scalarFields,
                 patch.cloud->scalarFieldValues);
         }
+        std::cout << "Linked HQ: field '" << completed->fieldName
+                  << "' is resident on the HQ patch." << std::endl;
         runtimeState->previewRenderStateSignatureValid = false;
     } catch (const std::exception& error) {
         patch.cloud->scalarFieldValues.resize(priorValueCount);
@@ -53460,6 +53500,10 @@ void EnsureLinkedHqIndexedFieldResidency(
                 .sourcePath;
             const auto sourceIndices = patch.sourcePointIndices;
             hq.indexedFieldShared = shared;
+            std::cout << "Linked HQ: gathering field '" << fieldName
+                      << "' for the "
+                      << runtimeState->sessions[patch.baseSessionIndex].sceneRole
+                      << " patch by retained source index." << std::endl;
             hq.indexedFieldWorker = std::jthread{
                 [shared,
                  fingerprint,
@@ -53692,7 +53736,11 @@ void EnsureLinkedHqPreview(
     }
     runtimeState->previewRenderStateSignatureValid = false;
 
+    // A finished scan waits one frame in uploadPending before it publishes;
+    // starting another scan there would run the whole 1 mm read twice and
+    // later re-publish over the live patches.
     if (!hq.ready && hq.preparationShared == nullptr &&
+        !hq.uploadPending.has_value() &&
         !runtimeState->offlineRenderJob.active &&
         !runtimeState->pendingLoad.has_value() &&
         !runtimeState->pendingScalarFieldLoad.has_value() &&
