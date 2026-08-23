@@ -5271,6 +5271,40 @@ TEST_CASE("Timing Take retiming carries settings clips with their keys",
             keyedTimeline.clips.front().end,
             key.position));
     }
+
+    // Placed late in the destination the scaled span {0.95,1.1} would still
+    // pass 1; the bounds must be the linear hull of the retimed keys, not a
+    // clip wrapping the destination's start/end around their complement.
+    TimingTakeSceneState lateState;
+    invisible_places::water::WaterFeatureTimingRun lateRun;
+    lateRun.features.push_back({
+        .feature = {.kind = WaterKeyedFeatureKind::SeepageNode,
+                    .objectId = 4U},
+        .settings = {{
+            .settingId = "strength",
+            .keys = {
+                {.position = 0.20F, .value = 0.0F, .clipId = 1U},
+                {.position = 0.90F, .value = 1.0F, .clipId = 1U},
+            },
+        }},
+        .clips = {{.id = 1U, .name = "Wrap", .start = 0.9F, .end = 1.2F}},
+    });
+    lateRun.features.front().clipMembershipExplicit = true;
+    lateState.waterFeatureTimingRuns.push_back(std::move(lateRun));
+    REQUIRE(RetimeTimingTakeSceneStateNormalizedPositions(
+        &lateState,
+        100U,
+        200U,
+        100U));
+    const auto& lateTimeline =
+        lateState.waterFeatureTimingRuns.front().features.front();
+    CHECK(lateTimeline.settings.front().keys[0].position == Approx(0.60F));
+    CHECK(lateTimeline.settings.front().keys[1].position == Approx(0.95F));
+    CHECK(lateTimeline.clips.front().start == Approx(0.60F));
+    CHECK(lateTimeline.clips.front().end == Approx(0.95F));
+    CHECK_FALSE(invisible_places::water::WaterClipIsWrapped(
+        lateTimeline.clips.front().start,
+        lateTimeline.clips.front().end));
 }
 
 TEST_CASE("Timing Take merge keeps Feature Run marks with feature owners",

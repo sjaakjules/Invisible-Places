@@ -6,6 +6,7 @@
 #include <iomanip>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <sstream>
 #include <tuple>
 #include <unordered_set>
@@ -4034,11 +4035,45 @@ bool RetimeTimingTakeSceneStateNormalizedPositions(
             // The source's phase 0 is no longer a seam once the take is a
             // sub-range of a longer animation, so a wrapped clip's members
             // (retimed individually above) no longer sit inside the scaled
-            // span. Bounds are derived data: re-derive them from the keys
-            // for clips that wrapped, and only those, so documents whose
-            // clips never wrap retime bit-identically. Keyless wrapped
-            // clips keep the scaled span as their only information.
+            // span. Bounds are derived data: take the linear hull of the
+            // retimed keys for clips that wrapped, and only those, so
+            // documents whose clips never wrap retime bit-identically. The
+            // hull is computed here rather than through
+            // SynchronizeWaterFeatureClipBounds because a scaled span that
+            // lands late in the destination can still exceed 1, which
+            // would route that call into its cyclic branch and wrap the
+            // clip through the destination's start/end -- covering the
+            // complement of its keys. Keyless wrapped clips keep the
+            // scaled span as their only information.
             for (const auto clipId : wrappedClipIds) {
+                auto* clip = water::FindWaterFeatureClip(&feature, clipId);
+                if (clip == nullptr) {
+                    continue;
+                }
+                std::optional<std::pair<float, float>> hull;
+                for (const auto& setting : feature.settings) {
+                    for (const auto& key : setting.keys) {
+                        if (key.clipId != clipId ||
+                            !std::isfinite(key.position)) {
+                            continue;
+                        }
+                        if (!hull.has_value()) {
+                            hull = {key.position, key.position};
+                        } else {
+                            hull->first =
+                                std::min(hull->first, key.position);
+                            hull->second =
+                                std::max(hull->second, key.position);
+                        }
+                    }
+                }
+                if (!hull.has_value()) {
+                    continue;
+                }
+                clip->start = hull->first;
+                clip->end = hull->second;
+                // An unwrapped clip is the pre-W1 shape; its single-key
+                // marker and minimum width follow the same rules.
                 (void)water::SynchronizeWaterFeatureClipBounds(
                     &feature,
                     clipId);
