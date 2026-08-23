@@ -1234,6 +1234,81 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Timing Colourise cyclic coincidence follows the evaluator's seam rule",
+    "[timing][colourise][cyclic][settings-clip]") {
+    using invisible_places::timing::
+        CoalesceTimingColouriseEffectCyclicallyCoincidentKeys;
+    using invisible_places::timing::EvaluateTimingEmissiveLevel;
+    using invisible_places::timing::TimingColouriseCyclicSettingsKeySpan;
+    using invisible_places::timing::
+        TimingColouriseEffectCyclicSettingsKeySpan;
+    using invisible_places::timing::
+        TimingColouriseKeyPositionsCoincideCyclically;
+    using invisible_places::timing::
+        TransformTimingColouriseEffectSettingsKeysCyclic;
+
+    SECTION("1.0 meets 0.0 but a pair straddling the seam is two instants") {
+        CHECK(TimingColouriseKeyPositionsCoincideCyclically(0.0F, 1.0F));
+        CHECK(TimingColouriseKeyPositionsCoincideCyclically(1.0F, 0.0F));
+        CHECK(TimingColouriseKeyPositionsCoincideCyclically(0.3F, 1.3F));
+        CHECK(TimingColouriseKeyPositionsCoincideCyclically(0.5F, 0.50005F));
+        CHECK_FALSE(
+            TimingColouriseKeyPositionsCoincideCyclically(0.0F, 0.5F));
+        // Cyclic evaluation wraps and then compares linearly, so these two
+        // keys are distinct there even though they sit 7e-5 apart on the
+        // loop.
+        CHECK_FALSE(
+            TimingColouriseKeyPositionsCoincideCyclically(0.99998F, 0.00005F));
+    }
+
+    SECTION("the coalescer keeps what the evaluator keeps") {
+        TimingColouriseEffect effect;
+        effect.emissiveEnabled = true;
+        for (const auto [position, value] :
+             {std::pair{0.00005F, 0.0F},
+              std::pair{0.50000F, 0.5F},
+              std::pair{0.99998F, 1.0F}}) {
+            effect.effectParameterKeys.push_back(
+                {.parameter = TimingColouriseEffectParameter::EmissiveLevel,
+                 .position = position,
+                 .value = value});
+        }
+        CHECK(EvaluateTimingEmissiveLevel(effect, 0.0F, true) ==
+              Approx(0.0F).margin(1.0e-3F));
+        // Both keys survive evaluation, so the coalescer must not merge
+        // them (it used to drop the 0.00005 key and jump loop zero to 1.0).
+        CHECK(CoalesceTimingColouriseEffectCyclicallyCoincidentKeys(&effect) ==
+              0U);
+        REQUIRE(effect.effectParameterKeys.size() == 3U);
+        CHECK(EvaluateTimingEmissiveLevel(effect, 0.0F, true) ==
+              Approx(0.0F).margin(1.0e-3F));
+        // The derived clip agrees the layout is three instants: the two
+        // interior gaps tie, so the clip starts at 0.5 and wraps through
+        // loop zero to the 0.00005 key instead of collapsing to 0.00005..0.5.
+        const auto span = TimingColouriseEffectCyclicSettingsKeySpan(effect);
+        REQUIRE(span.has_value());
+        CHECK(span->start == Approx(0.5F));
+        CHECK(span->length == Approx(0.50005F).margin(1.0e-5F));
+        // Sliding the clip off the seam would put the pair 7e-5 apart on a
+        // straight run, which evaluation merges, so the transform refuses
+        // rather than silently dropping one of them.
+        const auto before = effect.effectParameterKeys;
+        CHECK_FALSE(TransformTimingColouriseEffectSettingsKeysCyclic(
+            &effect,
+            *span,
+            TimingColouriseCyclicSettingsKeySpan{
+                .start = span->start + 0.1F,
+                .length = span->length}));
+        CHECK(effect.effectParameterKeys.size() == before.size());
+
+        // A genuine 0.0/1.0 twin still coalesces.
+        auto twins = EmissiveKeysAt({0.0F, 0.5F, 1.0F});
+        CHECK(CoalesceTimingColouriseEffectCyclicallyCoincidentKeys(&twins) ==
+              1U);
+    }
+}
+
+TEST_CASE(
     "Timing Colourise cyclic settings transform rejects cross-seam lane "
     "collisions",
     "[timing][colourise][cyclic][settings-clip]") {

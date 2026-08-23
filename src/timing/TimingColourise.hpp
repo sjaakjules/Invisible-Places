@@ -753,6 +753,14 @@ TimingColouriseEffectSettingsKeySpan(
 // Shortest distance around the loop between two wrapped phases, so 0.0 and
 // 1.0 are coincident and 0.05 sits 0.10 from 0.95.
 [[nodiscard]] float TimingColouriseCyclicKeyDistance(float a, float b);
+// Whether two key positions are one instant of the loop under the rule cyclic
+// evaluation applies: both are wrapped into [0, 1) and compared linearly, so
+// 1.0 meets 0.0 but a key a hair below 1.0 stays distinct from one a hair
+// above 0.0. The cyclic collision check, the cyclic coalescer and the key
+// lane drag all use this so they agree with what evaluation shows.
+[[nodiscard]] bool TimingColouriseKeyPositionsCoincideCyclically(
+    float a,
+    float b);
 // Cyclic counterpart of TimingColouriseEffectSettingsKeySpan. The clip is the
 // complement of the largest circular gap between owned keys, so keys that
 // were dragged across loop zero remain one clip. When the wrap gap ties the

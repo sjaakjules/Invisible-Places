@@ -93045,14 +93045,17 @@ void DrawTimingKeyLaneGroup(
                       WrapTimingColouriseLoopPosition(position + offset)
                 : std::clamp(position + offset, 0.0F, 1.0F);
         };
-        // Same-lane proximity: around the loop when cyclic, so a key
-        // wrapping onto 0.0 is caught against an existing key at 1.0.
+        // Same-lane proximity: the evaluator's cyclic rule when cyclic, so
+        // a key wrapping onto 0.0 is caught against an existing key at 1.0
+        // while keys a hair either side of loop zero stay distinct, exactly
+        // as the cyclic lens draws them.
         const auto keysCoincide = [&](float a, float b) {
-            return (cyclicDrag
-                        ? invisible_places::timing::
-                              TimingColouriseCyclicKeyDistance(a, b)
-                        : std::abs(a - b)) <=
-                   invisible_places::timing::kTimingColouriseKeyTolerance;
+            return cyclicDrag
+                ? invisible_places::timing::
+                      TimingColouriseKeyPositionsCoincideCyclically(a, b)
+                : std::abs(a - b) <=
+                      invisible_places::timing::
+                          kTimingColouriseKeyTolerance;
         };
 
         const auto isDraggedHandle =

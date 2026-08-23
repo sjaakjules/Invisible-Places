@@ -3758,10 +3758,9 @@ bool TimingColouriseKeysHaveNoCyclicLaneCollisions(
              right < keys.size();
              ++right) {
             if (sameLane(keys[left], keys[right]) &&
-                TimingColouriseCyclicKeyDistance(
+                TimingColouriseKeyPositionsCoincideCyclically(
                     keys[left].position,
-                    keys[right].position) <=
-                    kTimingColouriseKeyTolerance) {
+                    keys[right].position)) {
                 return false;
             }
         }
@@ -3847,10 +3846,9 @@ std::size_t CoalesceCyclicallyCoincidentKeys(
              right < keys->size();
              ++right) {
             if (!sameLane((*keys)[left], (*keys)[right]) ||
-                TimingColouriseCyclicKeyDistance(
+                !TimingColouriseKeyPositionsCoincideCyclically(
                     (*keys)[left].position,
-                    (*keys)[right].position) >
-                    kTimingColouriseKeyTolerance) {
+                    (*keys)[right].position)) {
                 continue;
             }
             const bool leftEarlier =
@@ -4137,6 +4135,16 @@ float TimingColouriseCyclicKeyDistance(float a, float b) {
     return std::min(forward, 1.0F - forward);
 }
 
+bool TimingColouriseKeyPositionsCoincideCyclically(float a, float b) {
+    // Deliberately not TimingColouriseCyclicKeyDistance: evaluation wraps
+    // and then compares linearly, so a pair straddling loop zero by a hair
+    // (0.99998 and 0.00005) is two instants there and must be two here.
+    return std::abs(
+               WrapTimingColouriseLoopPosition(a) -
+               WrapTimingColouriseLoopPosition(b)) <=
+           kTimingColouriseKeyTolerance;
+}
+
 std::optional<TimingColouriseCyclicSettingsKeySpan>
 TimingColouriseEffectCyclicSettingsKeySpan(
     const TimingColouriseEffect& effect) {
@@ -4145,7 +4153,11 @@ TimingColouriseEffectCyclicSettingsKeySpan(
         return std::nullopt;
     }
     // The linear positions keep 1.0 distinct from 0.0; on the loop they are
-    // the same instant, so wrap and re-coalesce before measuring gaps.
+    // the same instant, so wrap and re-coalesce before measuring gaps. The
+    // coalescing rule is the evaluator's (wrap, then compare linearly), so
+    // keys a hair either side of loop zero stay two instants here exactly as
+    // the cyclic transform and collision check treat them; merging them
+    // would derive a span whose transform then maps both onto one position.
     for (auto& position : positions) {
         position = WrapTimingColouriseLoopPosition(position);
     }
@@ -4154,15 +4166,11 @@ TimingColouriseEffectCyclicSettingsKeySpan(
     unique.reserve(positions.size());
     for (const float position : positions) {
         if (unique.empty() ||
-            TimingColouriseCyclicKeyDistance(unique.back(), position) >
-                kTimingColouriseKeyTolerance) {
+            !TimingColouriseKeyPositionsCoincideCyclically(
+                unique.back(),
+                position)) {
             unique.push_back(position);
         }
-    }
-    if (unique.size() > 1U &&
-        TimingColouriseCyclicKeyDistance(unique.front(), unique.back()) <=
-            kTimingColouriseKeyTolerance) {
-        unique.pop_back();
     }
     if (unique.size() == 1U) {
         return TimingColouriseCyclicSettingsKeySpan{
@@ -5440,8 +5448,9 @@ void ExpandTimingKeysForCyclicEvaluation(
     for (auto& key : *keys) {
         if (!canonical.empty() &&
             sameTrack(canonical.back(), key) &&
-            std::abs(canonical.back().position - key.position) <=
-                kTimingColouriseKeyTolerance) {
+            TimingColouriseKeyPositionsCoincideCyclically(
+                canonical.back().position,
+                key.position)) {
             canonical.back() = std::move(key);
         } else {
             canonical.push_back(std::move(key));
