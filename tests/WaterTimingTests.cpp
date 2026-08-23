@@ -6720,6 +6720,93 @@ TEST_CASE("Full-length clips rotate on the loop, merging keys at both 0 and 1",
     CHECK(unlinked.settings.front().keys.size() == 4U);
 }
 
+TEST_CASE("Twin coalescing never fires on identity drags or across clips",
+          "[water][timing][keyed][clips][cyclic]") {
+    using Catch::Approx;
+    using invisible_places::water::CyclicWaterFeatureClipMoveSpan;
+    using invisible_places::water::FindWaterFeatureClip;
+    using invisible_places::water::SynchronizeWaterFeatureClipBounds;
+    using invisible_places::water::TransformWaterFeatureClip;
+    using invisible_places::water::TransformWaterFeatureClipSelection;
+    using invisible_places::water::WaterFeatureTimeline;
+    using invisible_places::water::WaterKeyedFeatureKind;
+
+    // A latched drag released back at its origin applies the identity
+    // transform: the document must come through bit-identical, twins
+    // included — coalescing here silently deleted the key at 0 and halved
+    // the stored span to the surviving hull.
+    WaterFeatureTimeline identity;
+    identity.feature = {
+        .kind = WaterKeyedFeatureKind::SeepageNode,
+        .objectId = 7U};
+    identity.settings = {
+        {.settingId = "strength",
+         .keys = {
+             {.position = 0.00F, .value = 0.25F, .clipId = 1U},
+             {.position = 0.50F, .value = 1.0F, .clipId = 1U},
+             {.position = 1.00F, .value = 0.75F, .clipId = 1U},
+         }},
+    };
+    identity.clips = {{.id = 1U, .name = "Full", .start = 0.0F, .end = 1.0F}};
+    identity.clipMembershipExplicit = true;
+    const auto zeroDelta = CyclicWaterFeatureClipMoveSpan(0.0F, 1.0F, 0.0F);
+    REQUIRE(TransformWaterFeatureClip(
+        &identity,
+        1U,
+        zeroDelta.first,
+        zeroDelta.second,
+        /*allowWrap=*/true));
+    REQUIRE(identity.settings.front().keys.size() == 3U);
+    CHECK(identity.settings.front().keys[0].position == Approx(0.0F));
+    CHECK(identity.settings.front().keys[2].position == Approx(1.0F));
+    CHECK(identity.clips.front().start == Approx(0.0F));
+    CHECK(identity.clips.front().end == Approx(1.0F));
+    // A whole-loop roll is the same identity.
+    REQUIRE(TransformWaterFeatureClip(
+        &identity,
+        1U,
+        1.0F,
+        2.0F,
+        /*allowWrap=*/true));
+    REQUIRE(identity.settings.front().keys.size() == 3U);
+    CHECK(identity.clips.front().start == Approx(0.0F));
+    CHECK(identity.clips.front().end == Approx(1.0F));
+
+    // Keys of two different clips that share loop phase 0 are separate
+    // authored times, not a stored twin: a group drag must refuse the
+    // ambiguous landing instead of deleting one clip's member and
+    // collapsing it.
+    WaterFeatureTimeline group;
+    group.feature = identity.feature;
+    group.settings = {
+        {.settingId = "strength",
+         .keys = {
+             {.position = 0.00F, .value = 0.25F, .clipId = 1U},
+             {.position = 1.00F, .value = 0.75F, .clipId = 2U},
+         }},
+    };
+    group.clips = {
+        {.id = 1U, .name = "Head", .start = 0.0F, .end = 0.3F},
+        {.id = 2U, .name = "Tail", .start = 0.7F, .end = 1.0F}};
+    group.clipMembershipExplicit = true;
+    const std::array groupIds{1U, 2U};
+    CHECK_FALSE(TransformWaterFeatureClipSelection(
+        &group,
+        groupIds,
+        0.0F,
+        1.0F,
+        0.05F,
+        1.05F,
+        /*allowWrap=*/true));
+    REQUIRE(group.settings.front().keys.size() == 2U);
+    CHECK(group.settings.front().keys[0].position == Approx(0.0F));
+    CHECK(group.settings.front().keys[1].position == Approx(1.0F));
+    CHECK(FindWaterFeatureClip(&group, 1U)->start == Approx(0.0F));
+    CHECK(FindWaterFeatureClip(&group, 1U)->end == Approx(0.3F));
+    CHECK(FindWaterFeatureClip(&group, 2U)->start == Approx(0.7F));
+    CHECK(FindWaterFeatureClip(&group, 2U)->end == Approx(1.0F));
+}
+
 TEST_CASE("Wrapped clips capture, apply, duplicate, and transfer intact",
           "[water][timing][keyed][clips][cyclic][packages]") {
     using Catch::Approx;

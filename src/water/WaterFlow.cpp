@@ -11248,6 +11248,18 @@ bool TransformWaterFeatureClipSelection(
         newStart = Clamp01(newStart);
         newEnd = Clamp01(newEnd);
     }
+    if (allowWrap &&
+        std::abs((newEnd - newStart) - (rangeEnd - rangeStart)) <=
+            kWaterClipKeyTolerance &&
+        CyclicWaterClipDistance(WrapWaterClipPhase(rangeStart), newStart) <=
+            kWaterClipKeyTolerance) {
+        // Identity roll: the destination is the source span on the loop, so
+        // no key can move. Succeed without touching the document — running
+        // the transform anyway would coalesce phase-0 twin keys and delete
+        // a key on a gesture the user perceives as a no-op (a drag latched
+        // past the pixel threshold and released back at its origin).
+        return true;
+    }
     // Key landings are compared on the loop when wrapping is allowed, so a
     // key arriving at phase 1 collides with one sitting at 0.
     const auto landsOn = [&](float left, float right) {
@@ -11310,7 +11322,15 @@ bool TransformWaterFeatureClipSelection(
                 for (std::size_t right = left + 1U;
                      right < keys.size();
                      ++right) {
-                    if (!keyMovesWithSelection(keys[right]) ||
+                    // Only a pair owned by one clip (or two loose keys) is
+                    // a stored twin of a single cyclic instant. Keys of two
+                    // different selected clips that share a loop phase are
+                    // separate authored times; merging them would silently
+                    // delete another clip's member during a group drag, so
+                    // such a landing falls through to the collision check
+                    // below and refuses the move instead.
+                    if (keys[left].clipId != keys[right].clipId ||
+                        !keyMovesWithSelection(keys[right]) ||
                         CyclicWaterClipDistance(
                             keys[left].position,
                             keys[right].position) >
