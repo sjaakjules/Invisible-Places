@@ -5131,6 +5131,44 @@ TEST_CASE("Settings clips and package lengths round-trip through the project doc
     REQUIRE(loaded->waterKeyedSettingsProfiles.size() == 1U);
     CHECK(loaded->waterKeyedSettingsProfiles.front().nativeLengthFraction ==
           Approx(0.20F));
+
+    // A wrapped clip (end > 1, schema 81) round-trips intact: the parse is
+    // a float pass-through and sanitize keeps the wrapped end.
+    ProjectDocument wrappedDocument;
+    wrappedDocument.projectName = "Wrapped clips";
+    invisible_places::water::WaterScenarioFeatureRuns wrappedEntry;
+    wrappedEntry.scenarioId = "authored-timing";
+    invisible_places::water::WaterFeatureTimingRun wrappedRun;
+    wrappedRun.id = 4U;
+    wrappedRun.name = "Seam";
+    wrappedRun.features.push_back({
+        .feature = {.kind = WaterKeyedFeatureKind::SeepageNode,
+                    .objectId = 4U},
+        .settings = {{
+            .settingId = "strength",
+            .keys = {
+                {.position = 0.05F, .value = 1.0F, .clipId = 6U},
+                {.position = 0.20F, .value = 0.0F, .clipId = 6U},
+                {.position = 0.90F, .value = 0.0F, .clipId = 6U},
+            },
+        }},
+        .clips = {{.id = 6U, .name = "Wrap", .start = 0.90F, .end = 1.20F}},
+        .clipMembershipExplicit = true,
+    });
+    wrappedEntry.runs.push_back(wrappedRun);
+    wrappedDocument.waterFeatureTimingRuns.push_back(wrappedEntry);
+    TemporaryTimingFile wrappedFile{"invisible_places_wrapped_clips.json"};
+    REQUIRE(SaveProjectDocument(wrappedDocument, wrappedFile.path, &errorMessage));
+    const auto loadedWrapped = LoadProjectDocument(wrappedFile.path, &errorMessage);
+    REQUIRE(loadedWrapped.has_value());
+    CHECK(loadedWrapped->schemaVersion ==
+          invisible_places::serialization::kProjectDocumentSchemaVersion);
+    CHECK(loadedWrapped->sourceSchemaVersion >= 81U);
+    const auto& wrappedClips =
+        loadedWrapped->waterFeatureTimingRuns.front().runs.front().features.front().clips;
+    REQUIRE(wrappedClips.size() == 1U);
+    CHECK(wrappedClips.front().start == Approx(0.90F));
+    CHECK(wrappedClips.front().end == Approx(1.20F));
 }
 
 TEST_CASE("Timing Take retiming carries settings clips with their keys",

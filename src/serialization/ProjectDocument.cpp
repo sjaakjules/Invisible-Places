@@ -146,6 +146,12 @@ constexpr std::uint32_t kWaterClipMembershipSourcesSchemaVersion = 30U;
 constexpr std::uint32_t kWaterRainProfilesProjectSchemaVersion = 78U;
 constexpr std::uint32_t kWaterFeatureRunMarksProjectSchemaVersion = 79U;
 constexpr std::uint32_t kWaterFeatureRunVisibilityProjectSchemaVersion = 80U;
+// Schema 81/32: settings clips may wrap through loop phase 0 (end in
+// (start, start+1], end > 1 wraps). No parse change; the pin records that
+// such documents are legal, because older builds clamp the end to 1 and
+// then silently re-derive a near-full-rail clip from its members.
+constexpr std::uint32_t kWaterClipWrapProjectSchemaVersion = 81U;
+constexpr std::uint32_t kWaterClipWrapSourcesSchemaVersion = 32U;
 constexpr std::uint32_t kRelativePalettePhaseProjectSchemaVersion = 62U;
 constexpr std::uint32_t kFieldMapBoundsMemoryProjectSchemaVersion = 63U;
 constexpr std::uint32_t kShorelineInstancesProjectSchemaVersion = 64U;
@@ -197,6 +203,12 @@ static_assert(
 static_assert(
     kWaterSourcesDocumentSchemaVersion >=
     kWaterRainProfilesSourcesSchemaVersion);
+static_assert(
+    kProjectDocumentSchemaVersion >=
+    kWaterClipWrapProjectSchemaVersion);
+static_assert(
+    kWaterSourcesDocumentSchemaVersion >=
+    kWaterClipWrapSourcesSchemaVersion);
 
 constexpr std::string_view kProjectVisualEditedSuffix = "_edited";
 constexpr std::string_view kProjectVisualLegacyEditedSuffix = "_Edited";
