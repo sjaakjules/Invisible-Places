@@ -761,6 +761,352 @@ PointCloudLoadResult LoadPointCloud(
     return {.cloud = std::move(cloud), .success = true};
 }
 
+PointCloudSubsetLoadResult LoadPointCloudSubset(
+    const std::filesystem::path& filePath,
+    const PointCloudSubsetLoadOptions& options) {
+    const auto payloadPath =
+        ResolveSceneDisplayDensityPayloadPath(filePath);
+    const auto headerResult = ParsePlyHeader(payloadPath);
+    if (!headerResult.success) {
+        return {.errorMessage = headerResult.errorMessage};
+    }
+
+    const auto& header = headerResult.header;
+    if (header.format != "binary_little_endian") {
+        return {
+            .sourcePointCount = header.vertexCount,
+            .errorMessage =
+                "Only binary_little_endian PLY point clouds are supported.",
+        };
+    }
+    if (header.vertexCount >
+        static_cast<std::uint64_t>(
+            std::numeric_limits<std::uint32_t>::max())) {
+        return {
+            .sourcePointCount = header.vertexCount,
+            .errorMessage =
+                "Filtered point-cloud source indices exceed the 32-bit "
+                "renderer index range.",
+        };
+    }
+
+    std::string layoutError;
+    const auto layout = BuildPointCloudLayout(header, &layoutError);
+    if (!layout.has_value()) {
+        return {
+            .sourcePointCount = header.vertexCount,
+            .errorMessage = layoutError,
+        };
+    }
+
+    std::ifstream input{payloadPath, std::ios::binary};
+    if (!input.is_open()) {
+        return {
+            .sourcePointCount = header.vertexCount,
+            .errorMessage = "Unable to open point cloud file.",
+        };
+    }
+    input.seekg(
+        static_cast<std::streamoff>(header.dataOffsetBytes),
+        std::ios::beg);
+    if (!input.good()) {
+        return {
+            .sourcePointCount = header.vertexCount,
+            .errorMessage = "Failed to seek to PLY payload.",
+        };
+    }
+
+    PointCloudSubsetLoadResult result;
+    result.sourcePointCount = header.vertexCount;
+    auto& cloud = result.cloud;
+    cloud.sourcePath = filePath;
+    cloud.layerName = filePath.stem().string();
+    cloud.hasSourceRgb = header.HasColorRgb();
+    cloud.hasNormals = layout->hasNormals;
+
+    std::vector<std::int32_t> residentSlotBySourceIndex(
+        layout->scalarFieldCount,
+        -1);
+    try {
+        cloud.availableScalarFields.reserve(layout->scalarFieldCount);
+        cloud.scalarFields.reserve(layout->scalarFieldCount);
+        std::uint32_t sourceIndex = 0U;
+        for (const auto& property : header.properties) {
+            if (!StartsWith(property.name, "scalar_")) {
+                continue;
+            }
+            auto displayName = ScalarFieldDisplayName(property.name);
+            cloud.availableScalarFields.push_back({
+                .name = displayName,
+                .sourceIndex = sourceIndex,
+            });
+            if (PointCloudScalarFieldFilterSelects(
+                    options.fieldFilter,
+                    displayName,
+                    sourceIndex)) {
+                residentSlotBySourceIndex[sourceIndex] =
+                    static_cast<std::int32_t>(cloud.scalarFields.size());
+                ScalarFieldStats stats;
+                stats.name = std::move(displayName);
+                stats.sourceIndex = static_cast<std::int32_t>(sourceIndex);
+                cloud.scalarFields.push_back(std::move(stats));
+            }
+            ++sourceIndex;
+        }
+    } catch (const std::exception& error) {
+        result.errorMessage =
+            std::string{"Filtered point-cloud allocation failed: "} +
+            error.what();
+        return result;
+    }
+
+    struct ActiveProperty {
+        PropertySemantic semantic = PropertySemantic::Skip;
+        ScalarType type = ScalarType::Float32;
+        std::uint32_t offset = 0U;
+        std::int32_t residentSlot = -1;
+    };
+    std::vector<ActiveProperty> activeProperties;
+    activeProperties.reserve(layout->properties.size());
+    std::array<ActiveProperty, 3U> positionProperties{};
+    for (const auto& property : layout->properties) {
+        if (property.semantic == PropertySemantic::Skip) {
+            continue;
+        }
+        std::int32_t residentSlot = -1;
+        if (property.semantic == PropertySemantic::ScalarField) {
+            residentSlot =
+                residentSlotBySourceIndex[property.scalarFieldIndex];
+            if (residentSlot < 0) {
+                continue;
+            }
+        }
+        ActiveProperty active{
+            .semantic = property.semantic,
+            .type = property.type,
+            .offset = property.offset,
+            .residentSlot = residentSlot,
+        };
+        if (property.semantic == PropertySemantic::PositionX) {
+            positionProperties[0U] = active;
+            continue;
+        }
+        if (property.semantic == PropertySemantic::PositionY) {
+            positionProperties[1U] = active;
+            continue;
+        }
+        if (property.semantic == PropertySemantic::PositionZ) {
+            positionProperties[2U] = active;
+            continue;
+        }
+        activeProperties.push_back(active);
+    }
+
+    std::vector<std::vector<float>> fieldColumns(
+        cloud.scalarFields.size());
+    std::vector<float> retainedFieldValues(
+        cloud.scalarFields.size(),
+        0.0F);
+    std::vector<Float3> focusSamples;
+    focusSamples.reserve(kMaxFocusSamples);
+    const auto readFloat = [](const std::byte* bytes, ScalarType type) {
+        return type == ScalarType::Float32
+                   ? ReadScalar<float>(bytes)
+                   : static_cast<float>(ReadScalarAsDouble(bytes, type));
+    };
+    const auto finalizeCloud = [&]() {
+        try {
+            cloud.scalarFieldValues.clear();
+            cloud.scalarFieldValues.reserve(
+                cloud.PointCount() * cloud.scalarFields.size());
+            for (auto& column : fieldColumns) {
+                cloud.scalarFieldValues.insert(
+                    cloud.scalarFieldValues.end(),
+                    column.begin(),
+                    column.end());
+            }
+        } catch (const std::exception& error) {
+            result.errorMessage =
+                std::string{"Filtered point-cloud allocation failed: "} +
+                error.what();
+            return false;
+        }
+        cloud.focusPoint =
+            ComputeRepresentativeFocusPoint(cloud.bounds, focusSamples);
+        cloud.hasFocusPoint = cloud.bounds.valid;
+        return true;
+    };
+
+    if (options.progress) {
+        options.progress(0U, header.vertexCount);
+    }
+    const auto pointsPerChunk =
+        RecommendedPointsPerChunk(layout->recordSize);
+    std::vector<std::byte> chunkBuffer(
+        pointsPerChunk * layout->recordSize);
+    try {
+        for (std::uint64_t pointStart = 0U;
+             pointStart < header.vertexCount;
+             pointStart += pointsPerChunk) {
+            if (options.stopToken.stop_requested()) {
+                result.cancelled = true;
+                finalizeCloud();
+                return result;
+            }
+            const auto remaining = header.vertexCount - pointStart;
+            const auto pointsThisChunk = static_cast<std::size_t>(
+                std::min<std::uint64_t>(remaining, pointsPerChunk));
+            const auto bytesToRead =
+                pointsThisChunk * layout->recordSize;
+            input.read(
+                reinterpret_cast<char*>(chunkBuffer.data()),
+                static_cast<std::streamsize>(bytesToRead));
+            if (input.gcount() !=
+                static_cast<std::streamsize>(bytesToRead)) {
+                result.errorMessage =
+                    "Unexpected EOF while reading point cloud payload.";
+                finalizeCloud();
+                return result;
+            }
+
+            for (std::size_t localIndex = 0U;
+                 localIndex < pointsThisChunk;
+                 ++localIndex) {
+                if ((localIndex & 4095U) == 0U &&
+                    options.stopToken.stop_requested()) {
+                    result.cancelled = true;
+                    if (options.progress) {
+                        options.progress(
+                            pointStart + localIndex,
+                            header.vertexCount);
+                    }
+                    finalizeCloud();
+                    return result;
+                }
+                const auto globalIndex =
+                    pointStart + static_cast<std::uint64_t>(localIndex);
+                const auto* recordBytes =
+                    chunkBuffer.data() +
+                    (localIndex * layout->recordSize);
+                Float3 position{};
+                position.x = readFloat(
+                    recordBytes + positionProperties[0U].offset,
+                    positionProperties[0U].type);
+                position.y = readFloat(
+                    recordBytes + positionProperties[1U].offset,
+                    positionProperties[1U].type);
+                position.z = readFloat(
+                    recordBytes + positionProperties[2U].offset,
+                    positionProperties[2U].type);
+                if (options.includePoint &&
+                    !options.includePoint(position)) {
+                    continue;
+                }
+
+                Float3 normal{};
+                std::uint8_t red = 255U;
+                std::uint8_t green = 255U;
+                std::uint8_t blue = 255U;
+                std::fill(
+                    retainedFieldValues.begin(),
+                    retainedFieldValues.end(),
+                    0.0F);
+                for (const auto& property : activeProperties) {
+                    const auto* propertyBytes =
+                        recordBytes + property.offset;
+                    switch (property.semantic) {
+                        case PropertySemantic::ColorR:
+                            red = ReadScalarAsByte(
+                                propertyBytes,
+                                property.type);
+                            break;
+                        case PropertySemantic::ColorG:
+                            green = ReadScalarAsByte(
+                                propertyBytes,
+                                property.type);
+                            break;
+                        case PropertySemantic::ColorB:
+                            blue = ReadScalarAsByte(
+                                propertyBytes,
+                                property.type);
+                            break;
+                        case PropertySemantic::NormalX:
+                            normal.x = readFloat(
+                                propertyBytes,
+                                property.type);
+                            break;
+                        case PropertySemantic::NormalY:
+                            normal.y = readFloat(
+                                propertyBytes,
+                                property.type);
+                            break;
+                        case PropertySemantic::NormalZ:
+                            normal.z = readFloat(
+                                propertyBytes,
+                                property.type);
+                            break;
+                        case PropertySemantic::ScalarField: {
+                            const auto slot = static_cast<std::size_t>(
+                                property.residentSlot);
+                            retainedFieldValues[slot] = readFloat(
+                                propertyBytes,
+                                property.type);
+                            break;
+                        }
+                        default:
+                            break;
+                    }
+                }
+
+                cloud.positions.push_back(position);
+                if (cloud.hasNormals) {
+                    cloud.normals.push_back(NormalizeNormal(normal));
+                }
+                cloud.packedColors.push_back(
+                    PackRgba8(red, green, blue));
+                result.sourcePointIndices.push_back(
+                    static_cast<std::uint32_t>(globalIndex));
+                cloud.bounds.Expand(position);
+                if (focusSamples.size() < kMaxFocusSamples) {
+                    focusSamples.push_back(position);
+                }
+                for (std::size_t slot = 0U;
+                     slot < fieldColumns.size();
+                     ++slot) {
+                    fieldColumns[slot].push_back(
+                        retainedFieldValues[slot]);
+                    cloud.scalarFields[slot].Include(
+                        retainedFieldValues[slot]);
+                }
+            }
+            if (options.progress) {
+                options.progress(
+                    std::min<std::uint64_t>(
+                        header.vertexCount,
+                        pointStart + pointsThisChunk),
+                    header.vertexCount);
+            }
+            if (options.stopToken.stop_requested()) {
+                result.cancelled = true;
+                finalizeCloud();
+                return result;
+            }
+        }
+    } catch (const std::exception& error) {
+        result.errorMessage =
+            std::string{"Filtered point-cloud parsing failed: "} +
+            error.what();
+        finalizeCloud();
+        return result;
+    }
+
+    if (!finalizeCloud()) {
+        return result;
+    }
+    result.success = true;
+    return result;
+}
+
 PointCloudStreamResult StreamPointCloudPositionsNormals(
     const std::filesystem::path& filePath,
     const PointCloudPositionNormalVisitor& visitor) {
@@ -1035,6 +1381,129 @@ PointCloudSelectedValueStreamResult StreamPointCloudSelectedValues(
         }
     }
 
+    result.success = true;
+    return result;
+}
+
+PointCloudIndexedValueLoadResult LoadPointCloudSelectedValuesAtIndices(
+    const std::filesystem::path& filePath,
+    const PointCloudSelectedValueSelector& selector,
+    std::span<const std::uint32_t> orderedSourcePointIndices,
+    const PointCloudLoadProgress& progress,
+    std::stop_token stopToken) {
+    const auto payloadPath =
+        ResolveSceneDisplayDensityPayloadPath(filePath);
+    const auto headerResult = ParsePlyHeader(payloadPath);
+    if (!headerResult.success) {
+        return {.errorMessage = headerResult.errorMessage};
+    }
+
+    PointCloudIndexedValueLoadResult result;
+    result.sourcePointCount = headerResult.header.vertexCount;
+    result.stats.name =
+        selector.source == PointCloudSelectedValueSource::ScalarField
+            ? selector.scalarFieldName
+            : selector.source == PointCloudSelectedValueSource::NormalX
+                  ? "Normal X"
+                  : selector.source == PointCloudSelectedValueSource::NormalY
+                        ? "Normal Y"
+                        : "Normal Z";
+    if (!std::is_sorted(
+            orderedSourcePointIndices.begin(),
+            orderedSourcePointIndices.end()) ||
+        std::adjacent_find(
+            orderedSourcePointIndices.begin(),
+            orderedSourcePointIndices.end()) !=
+            orderedSourcePointIndices.end()) {
+        result.errorMessage =
+            "Indexed point-cloud source indices must be strictly increasing.";
+        return result;
+    }
+    if (!orderedSourcePointIndices.empty() &&
+        orderedSourcePointIndices.back() >=
+            headerResult.header.vertexCount) {
+        result.errorMessage =
+            "Indexed point-cloud source index is outside the PLY vertex range.";
+        return result;
+    }
+
+    if (selector.source == PointCloudSelectedValueSource::ScalarField) {
+        std::uint32_t sourceFieldIndex = 0U;
+        for (const auto& property : headerResult.header.properties) {
+            if (!StartsWith(property.name, "scalar_")) {
+                continue;
+            }
+            if (ScalarFieldDisplayName(property.name) ==
+                selector.scalarFieldName) {
+                result.stats.sourceIndex =
+                    static_cast<std::int32_t>(sourceFieldIndex);
+                break;
+            }
+            ++sourceFieldIndex;
+        }
+    }
+
+    if (progress) {
+        progress(0U, result.sourcePointCount);
+    }
+    if (stopToken.stop_requested()) {
+        result.cancelled = true;
+        return result;
+    }
+    if (orderedSourcePointIndices.empty()) {
+        if (progress) {
+            progress(result.sourcePointCount, result.sourcePointCount);
+        }
+        result.success = true;
+        return result;
+    }
+
+    try {
+        result.values.reserve(orderedSourcePointIndices.size());
+    } catch (const std::exception& error) {
+        result.errorMessage =
+            std::string{"Indexed field allocation failed: "} + error.what();
+        return result;
+    }
+    std::size_t retainedCursor = 0U;
+    const auto streamResult = StreamPointCloudSelectedValues(
+        filePath,
+        selector,
+        [&](float value, std::uint64_t sourceIndex) {
+            if (stopToken.stop_requested()) {
+                return false;
+            }
+            if (retainedCursor < orderedSourcePointIndices.size() &&
+                sourceIndex ==
+                    orderedSourcePointIndices[retainedCursor]) {
+                result.values.push_back(value);
+                result.stats.Include(value);
+                ++retainedCursor;
+            }
+            if (progress && (sourceIndex & 65535ULL) == 0ULL) {
+                progress(sourceIndex, result.sourcePointCount);
+            }
+            return true;
+        });
+    if (progress) {
+        progress(
+            std::min(streamResult.pointCount, result.sourcePointCount),
+            result.sourcePointCount);
+    }
+    if (streamResult.cancelled || stopToken.stop_requested()) {
+        result.cancelled = true;
+        return result;
+    }
+    if (!streamResult.success) {
+        result.errorMessage = streamResult.errorMessage;
+        return result;
+    }
+    if (retainedCursor != orderedSourcePointIndices.size()) {
+        result.errorMessage =
+            "Indexed point-cloud field scan did not visit every requested "
+            "source index.";
+        return result;
+    }
     result.success = true;
     return result;
 }

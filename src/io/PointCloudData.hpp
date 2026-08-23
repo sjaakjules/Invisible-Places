@@ -5,7 +5,10 @@
 #include <filesystem>
 #include <functional>
 #include <optional>
+#include <span>
+#include <stop_token>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace invisible_places::io {
@@ -111,6 +114,31 @@ struct PointCloudLoadResult {
     bool success = false;
 };
 
+using PointCloudSubsetPredicate =
+    std::function<bool(const Float3&)>;
+using PointCloudLoadProgress =
+    std::function<void(std::uint64_t, std::uint64_t)>;
+
+// Streams a fixed-record PLY once and only materialises points accepted by
+// includePoint. Accepted points stay in source order and sourcePointIndices
+// records their original file-order indices, allowing additional fields to
+// be gathered later without retaining the complete source cloud.
+struct PointCloudSubsetLoadOptions {
+    PointCloudScalarFieldFilter fieldFilter{};
+    PointCloudSubsetPredicate includePoint{};
+    PointCloudLoadProgress progress{};
+    std::stop_token stopToken{};
+};
+
+struct PointCloudSubsetLoadResult {
+    LoadedPointCloud cloud;
+    std::vector<std::uint32_t> sourcePointIndices;
+    std::uint64_t sourcePointCount = 0;
+    std::string errorMessage;
+    bool success = false;
+    bool cancelled = false;
+};
+
 struct PointCloudPositionNormalSample {
     Float3 position{};
     Float3 normal{};
@@ -154,6 +182,15 @@ struct PointCloudSelectedValueStreamResult {
     bool cancelled = false;
 };
 
+struct PointCloudIndexedValueLoadResult {
+    std::vector<float> values;
+    ScalarFieldStats stats;
+    std::uint64_t sourcePointCount = 0;
+    std::string errorMessage;
+    bool success = false;
+    bool cancelled = false;
+};
+
 using PointCloudSelectedValueVisitor =
     std::function<bool(float, std::uint64_t)>;
 
@@ -168,6 +205,9 @@ PointCloudLoadResult LoadPointCloud(
     const std::filesystem::path& filePath,
     const PointCloudScalarFieldFilter& fieldFilter = {},
     unsigned threadCount = 0U);
+PointCloudSubsetLoadResult LoadPointCloudSubset(
+    const std::filesystem::path& filePath,
+    const PointCloudSubsetLoadOptions& options);
 PointCloudStreamResult StreamPointCloudPositionsNormals(
     const std::filesystem::path& filePath,
     const PointCloudPositionNormalVisitor& visitor);
@@ -175,5 +215,11 @@ PointCloudSelectedValueStreamResult StreamPointCloudSelectedValues(
     const std::filesystem::path& filePath,
     const PointCloudSelectedValueSelector& selector,
     const PointCloudSelectedValueVisitor& visitor);
+PointCloudIndexedValueLoadResult LoadPointCloudSelectedValuesAtIndices(
+    const std::filesystem::path& filePath,
+    const PointCloudSelectedValueSelector& selector,
+    std::span<const std::uint32_t> orderedSourcePointIndices,
+    const PointCloudLoadProgress& progress = {},
+    std::stop_token stopToken = {});
 
 }  // namespace invisible_places::io
