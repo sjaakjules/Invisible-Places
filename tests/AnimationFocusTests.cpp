@@ -4034,6 +4034,212 @@ TEST_CASE("Reciprocal loop transport preserves asymmetric S01 seam timing",
     }
 }
 
+TEST_CASE("Alternating A/B selection covers the S01 loop with one cut per seam",
+          "[camera][animation][linked-seam][timing-loop]"
+          "[reciprocal-loop-alternation]") {
+    const auto makePath = [](std::string name,
+                             std::uint32_t durationFrames,
+                             std::uint32_t startOverlapFrames,
+                             std::uint32_t endOverlapFrames) {
+        invisible_places::camera::AnimationPath path;
+        path.name = std::move(name);
+        path.durationFrames = durationFrames;
+        path.keys = {
+            {.id = path.name + "-start"},
+            {.id = path.name + "-end",
+             .durationFrames = durationFrames},
+        };
+        path.velocityBlendLink = invisible_places::camera::
+            AnimationVelocityBlendLinkMetadata{
+                .pairId = "Proj_09S01",
+                .partnerFileName = "partner.ipanim.json",
+                .startOverlapSeconds =
+                    static_cast<float>(startOverlapFrames) / 30.0F,
+                .endOverlapSeconds =
+                    static_cast<float>(endOverlapFrames) / 30.0F,
+            };
+        return path;
+    };
+    auto animationA = makePath("Proj_A_09S01", 6868U, 3080U, 2818U);
+    auto animationB = makePath("Proj_B_09S01", 6230U, 2818U, 3080U);
+    animationA.velocityBlendLink->partnerFileName =
+        "Proj_B_09S01.ipanim.json";
+    animationB.velocityBlendLink->partnerFileName =
+        "Proj_A_09S01.ipanim.json";
+    REQUIRE(invisible_places::camera::
+                ConfigureAnimationReciprocalTimingLoopWindows(
+                    &animationA,
+                    &animationB));
+    const auto resolved = invisible_places::camera::
+        ResolveAnimationReciprocalLoopTransport(animationA, animationB);
+    REQUIRE(resolved.has_value());
+    const auto& transport = resolved.value();
+    using Window =
+        invisible_places::camera::AnimationReciprocalLoopAlternationWindow;
+
+    SECTION("sanitization keeps the window inside the overlaps") {
+        const auto defaults = invisible_places::camera::
+            SanitizeAnimationReciprocalLoopAlternationWindow(
+                transport,
+                Window{});
+        CHECK(defaults.aStart == Approx(0.2F));
+        CHECK(defaults.aEnd == Approx(0.8F));
+        // A's start overlap is 3080/6868 of A, its end overlap begins at
+        // 1 - 2818/6868; a window outside those cannot be covered by B.
+        const auto clamped = invisible_places::camera::
+            SanitizeAnimationReciprocalLoopAlternationWindow(
+                transport,
+                Window{.aStart = 0.7F, .aEnd = 0.95F});
+        CHECK(clamped.aStart == Approx(3080.0F / 6868.0F));
+        CHECK(clamped.aEnd == Approx(0.95F));
+        const auto clampedEnd = invisible_places::camera::
+            SanitizeAnimationReciprocalLoopAlternationWindow(
+                transport,
+                Window{.aStart = 0.05F, .aEnd = 0.3F});
+        CHECK(clampedEnd.aStart == Approx(0.05F));
+        CHECK(clampedEnd.aEnd == Approx(1.0F - 2818.0F / 6868.0F));
+        const auto inverted = invisible_places::camera::
+            SanitizeAnimationReciprocalLoopAlternationWindow(
+                transport,
+                Window{.aStart = 0.9F, .aEnd = 0.1F});
+        CHECK(inverted.aStart == Approx(0.2F));
+        CHECK(inverted.aEnd == Approx(0.8F));
+        const auto nan = invisible_places::camera::
+            SanitizeAnimationReciprocalLoopAlternationWindow(
+                transport,
+                Window{
+                    .aStart = std::numeric_limits<float>::quiet_NaN(),
+                    .aEnd = 0.5F});
+        CHECK(nan.aStart == Approx(0.2F));
+        CHECK(nan.aEnd == Approx(0.8F));
+    }
+
+    SECTION("partner window reports the matching B frames") {
+        const auto partner = invisible_places::camera::
+            AnimationReciprocalLoopAlternationPartnerWindow(
+                transport,
+                Window{});
+        REQUIRE(partner.has_value());
+        // A 0.8 = frame 5494.4 = B frame 1444.4 (B starts at cycle frame
+        // 4050); A 0.2 = frame 1373.6 = B frame 3150 + 1373.6 = 4523.6.
+        CHECK(partner->first ==
+              Approx((0.8F * 6868.0F - 4050.0F) / 6230.0F).margin(1.0e-5F));
+        CHECK(partner->second ==
+              Approx((0.2F * 6868.0F + 3150.0F) / 6230.0F).margin(1.0e-5F));
+    }
+
+    SECTION("every cycle frame has exactly one presented member") {
+        const Window window{};
+        std::array<float, 2U> previous{0.5F, 0.5F};
+        std::size_t cuts = 0U;
+        std::optional<std::size_t> lastMember;
+        for (std::uint32_t frame = 0U; frame < transport.cycleFrames;
+             ++frame) {
+            const auto selection = invisible_places::camera::
+                ResolveAnimationReciprocalLoopAlternatingMember(
+                    transport,
+                    static_cast<double>(frame),
+                    window,
+                    previous);
+            REQUIRE(selection.has_value());
+            if (selection->memberIndex == 0U) {
+                CHECK(selection->localPosition >= window.aStart - 1.0e-6F);
+                CHECK(selection->localPosition <= window.aEnd + 1.0e-6F);
+            } else {
+                // B is only used where A is outside its window.
+                const auto firstLocals = invisible_places::camera::
+                    AnimationReciprocalLoopCycleFrameToLocalPositions(
+                        transport,
+                        0U,
+                        static_cast<double>(frame));
+                for (const float local : firstLocals) {
+                    CHECK((local < window.aStart - 1.0e-6F ||
+                           local > window.aEnd + 1.0e-6F));
+                }
+            }
+            if (lastMember.has_value() &&
+                lastMember.value() != selection->memberIndex) {
+                ++cuts;
+            }
+            lastMember = selection->memberIndex;
+            previous[selection->memberIndex] = selection->localPosition;
+        }
+        // Frame 0 is A local 0 (shown from B), so the sweep crosses
+        // B->A at A 0.2 and A->B at A 0.8 exactly once each.
+        CHECK(cuts == 2U);
+        const auto atStart = invisible_places::camera::
+            ResolveAnimationReciprocalLoopAlternatingMember(
+                transport,
+                0.2 * 6868.0,
+                window,
+                previous);
+        REQUIRE(atStart.has_value());
+        CHECK(atStart->memberIndex == 0U);
+        CHECK(atStart->localPosition == Approx(0.2F).margin(1.0e-6F));
+        const auto justBefore = invisible_places::camera::
+            ResolveAnimationReciprocalLoopAlternatingMember(
+                transport,
+                0.2 * 6868.0 - 1.0,
+                window,
+                previous);
+        REQUIRE(justBefore.has_value());
+        CHECK(justBefore->memberIndex == 1U);
+        CHECK(justBefore->localPosition ==
+              Approx((0.2F * 6868.0F - 1.0F + 3150.0F) / 6230.0F)
+                  .margin(1.0e-5F));
+        const auto justAfterEnd = invisible_places::camera::
+            ResolveAnimationReciprocalLoopAlternatingMember(
+                transport,
+                0.8 * 6868.0 + 1.0,
+                window,
+                previous);
+        REQUIRE(justAfterEnd.has_value());
+        CHECK(justAfterEnd->memberIndex == 1U);
+        CHECK(justAfterEnd->localPosition ==
+              Approx((0.8F * 6868.0F + 1.0F - 4050.0F) / 6230.0F)
+                  .margin(1.0e-5F));
+    }
+
+    SECTION("a held member keeps the view until it runs out of frames") {
+        const Window window{};
+        const std::array<float, 2U> previous{0.5F, 0.5F};
+        // A 0.9 is past the window: the rule alone shows B, a hold on A
+        // keeps A at 0.9.
+        const double frame = 0.9 * 6868.0;
+        const auto ruled = invisible_places::camera::
+            ResolveAnimationReciprocalLoopAlternatingMember(
+                transport,
+                frame,
+                window,
+                previous);
+        REQUIRE(ruled.has_value());
+        CHECK(ruled->memberIndex == 1U);
+        const auto held = invisible_places::camera::
+            ResolveAnimationReciprocalLoopAlternatingMember(
+                transport,
+                frame,
+                window,
+                previous,
+                0U);
+        REQUIRE(held.has_value());
+        CHECK(held->memberIndex == 0U);
+        CHECK(held->localPosition == Approx(0.9F).margin(1.0e-6F));
+        // Holding B inside A's exclusive middle cannot be honoured: A owns
+        // frame 0.5 alone.
+        const auto heldB = invisible_places::camera::
+            ResolveAnimationReciprocalLoopAlternatingMember(
+                transport,
+                0.5 * 6868.0,
+                window,
+                previous,
+                1U);
+        REQUIRE(heldB.has_value());
+        CHECK(heldB->memberIndex == 0U);
+        CHECK(heldB->localPosition == Approx(0.5F).margin(1.0e-6F));
+    }
+}
+
+
 TEST_CASE(
     "Asymmetric reciprocal boundaries drive identical cyclic Timing Take samples",
     "[camera][animation][linked-seam][timing-loop][phase-integration]") {

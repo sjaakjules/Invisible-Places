@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <utility>
 #include <span>
 #include <stop_token>
 #include <string>
@@ -942,6 +943,54 @@ ResolveAnimationReciprocalLoopNearestLocalPositionAtCyclePhase(
     std::size_t memberIndex,
     double cyclePhase,
     float previousLocalPosition);
+
+// Alternating A/B presentation of a reciprocal pair. Stored member 0 (A) is
+// shown while its exact local position lies inside [aStart, aEnd]; the rest
+// of the cycle is shown from stored member 1 (B) at the matching shared
+// frame. Because A's window ends inside each overlap, B always owns the
+// remaining frames, so the pair reads as one continuous loop with exactly
+// one hard cut per seam (A 0.8 -> B 0.232 and B 0.726 -> A 0.2 for the
+// S01 pair) instead of a composited split.
+struct AnimationReciprocalLoopAlternationWindow {
+    float aStart = 0.2F;
+    float aEnd = 0.8F;
+};
+
+struct AnimationReciprocalLoopMemberSelection {
+    std::size_t memberIndex = 0U;
+    float localPosition = 0.0F;
+};
+
+// Keeps the A window inside the frames B can take over: aStart may not pass
+// A's start-overlap fraction and aEnd may not precede the start of A's end
+// overlap. Non-finite or inverted values fall back to the defaults before
+// clamping.
+[[nodiscard]] AnimationReciprocalLoopAlternationWindow
+SanitizeAnimationReciprocalLoopAlternationWindow(
+    const AnimationReciprocalLoopTransport& transport,
+    AnimationReciprocalLoopAlternationWindow window);
+
+// B's own local window {start, end}: the exact B frames matching A at aEnd
+// and at aStart. nullopt when either bound has no B occurrence (only
+// possible for an unsanitized window).
+[[nodiscard]] std::optional<std::pair<float, float>>
+AnimationReciprocalLoopAlternationPartnerWindow(
+    const AnimationReciprocalLoopTransport& transport,
+    const AnimationReciprocalLoopAlternationWindow& window);
+
+// Chooses the member to present at cycleFrame. A held member wins whenever
+// it has an exact occurrence (local-timeline scrubs keep the member the
+// user is looping on until release); otherwise A inside its window, then
+// B, then any remaining A occurrence. previousLocalPositions rank multiple
+// occurrences per member exactly like
+// ResolveAnimationReciprocalLoopNearestLocalPosition.
+[[nodiscard]] std::optional<AnimationReciprocalLoopMemberSelection>
+ResolveAnimationReciprocalLoopAlternatingMember(
+    const AnimationReciprocalLoopTransport& transport,
+    double cycleFrame,
+    const AnimationReciprocalLoopAlternationWindow& window,
+    const std::array<float, 2U>& previousLocalPositions,
+    std::optional<std::size_t> heldMemberIndex = std::nullopt);
 // Assigns one canonical shared clock to a validated reciprocal pair. `first`
 // begins at loop frame zero; `second` begins where first's end overlap starts.
 // Existing camera, timing keys, and selected Timing Take ids are untouched.

@@ -1815,6 +1815,131 @@ ResolveAnimationReciprocalLoopNearestLocalPositionAtCyclePhase(
         previousLocalPosition);
 }
 
+AnimationReciprocalLoopAlternationWindow
+SanitizeAnimationReciprocalLoopAlternationWindow(
+    const AnimationReciprocalLoopTransport& transport,
+    AnimationReciprocalLoopAlternationWindow window) {
+    const AnimationReciprocalLoopAlternationWindow defaults{};
+    if (!std::isfinite(window.aStart) || !std::isfinite(window.aEnd) ||
+        window.aStart > window.aEnd) {
+        window = defaults;
+    }
+    const double duration = static_cast<double>(
+        transport.memberWindows[0U].durationFrames);
+    if (transport.cycleFrames == 0U || duration <= 0.0) {
+        window.aStart = std::clamp(window.aStart, 0.0F, 1.0F);
+        window.aEnd = std::clamp(window.aEnd, window.aStart, 1.0F);
+        return window;
+    }
+    // B must own every frame A does not show: A's start overlap (with B's
+    // end) and A's end overlap (with B's start) bound the window.
+    const auto startOverlapFraction = static_cast<float>(std::clamp(
+        static_cast<double>(transport.firstStartOverlapFrames) / duration,
+        0.0,
+        1.0));
+    const auto endOverlapStartFraction = static_cast<float>(std::clamp(
+        1.0 - static_cast<double>(transport.firstEndOverlapFrames) /
+                  duration,
+        0.0,
+        1.0));
+    window.aStart = std::clamp(window.aStart, 0.0F, startOverlapFraction);
+    window.aEnd = std::clamp(
+        window.aEnd,
+        std::max(window.aStart, endOverlapStartFraction),
+        1.0F);
+    return window;
+}
+
+std::optional<std::pair<float, float>>
+AnimationReciprocalLoopAlternationPartnerWindow(
+    const AnimationReciprocalLoopTransport& transport,
+    const AnimationReciprocalLoopAlternationWindow& window) {
+    if (transport.cycleFrames == 0U ||
+        transport.memberWindows[0U].durationFrames == 0U) {
+        return std::nullopt;
+    }
+    const auto& first = transport.memberWindows[0U];
+    const auto partnerLocalAt = [&](float aLocal) -> std::optional<float> {
+        const double cycleFrame = WrapAnimationReciprocalLoopCycleFrame(
+            transport,
+            static_cast<double>(first.startFrame) +
+                static_cast<double>(std::clamp(aLocal, 0.0F, 1.0F)) *
+                    static_cast<double>(first.durationFrames));
+        const auto locals = AnimationReciprocalLoopCycleFrameToLocalPositions(
+            transport,
+            1U,
+            cycleFrame);
+        if (locals.empty()) {
+            return std::nullopt;
+        }
+        return locals.front();
+    };
+    const auto partnerStart = partnerLocalAt(window.aEnd);
+    const auto partnerEnd = partnerLocalAt(window.aStart);
+    if (!partnerStart.has_value() || !partnerEnd.has_value()) {
+        return std::nullopt;
+    }
+    return std::pair{partnerStart.value(), partnerEnd.value()};
+}
+
+std::optional<AnimationReciprocalLoopMemberSelection>
+ResolveAnimationReciprocalLoopAlternatingMember(
+    const AnimationReciprocalLoopTransport& transport,
+    double cycleFrame,
+    const AnimationReciprocalLoopAlternationWindow& window,
+    const std::array<float, 2U>& previousLocalPositions,
+    std::optional<std::size_t> heldMemberIndex) {
+    if (transport.cycleFrames == 0U || !std::isfinite(cycleFrame)) {
+        return std::nullopt;
+    }
+    const auto nearest = [&](std::size_t member) {
+        return ResolveAnimationReciprocalLoopNearestLocalPosition(
+            transport,
+            member,
+            cycleFrame,
+            previousLocalPositions[member]);
+    };
+    const auto select = [](std::size_t member, float local) {
+        return AnimationReciprocalLoopMemberSelection{
+            .memberIndex = member,
+            .localPosition = local,
+        };
+    };
+    if (heldMemberIndex.has_value() && heldMemberIndex.value() < 2U) {
+        if (const auto held = nearest(heldMemberIndex.value());
+            held.has_value()) {
+            return select(heldMemberIndex.value(), held.value());
+        }
+    }
+    constexpr float kWindowTolerance = 1.0e-6F;
+    const auto firstLocals = AnimationReciprocalLoopCycleFrameToLocalPositions(
+        transport,
+        0U,
+        cycleFrame);
+    std::optional<float> firstInWindow;
+    for (const float local : firstLocals) {
+        if (local < window.aStart - kWindowTolerance ||
+            local > window.aEnd + kWindowTolerance) {
+            continue;
+        }
+        if (!firstInWindow.has_value() ||
+            std::abs(local - previousLocalPositions[0U]) <
+                std::abs(firstInWindow.value() - previousLocalPositions[0U])) {
+            firstInWindow = local;
+        }
+    }
+    if (firstInWindow.has_value()) {
+        return select(0U, firstInWindow.value());
+    }
+    if (const auto second = nearest(1U); second.has_value()) {
+        return select(1U, second.value());
+    }
+    if (const auto first = nearest(0U); first.has_value()) {
+        return select(0U, first.value());
+    }
+    return std::nullopt;
+}
+
 bool ConfigureAnimationReciprocalTimingLoopWindows(
     AnimationPath* first,
     AnimationPath* second) {
