@@ -11070,6 +11070,37 @@ bool TransformWaterFeatureClipSelection(
     return true;
 }
 
+std::pair<float, float> CyclicWaterFeatureClipMoveSpan(
+    float rangeStart,
+    float rangeEnd,
+    float delta) {
+    const auto ordered = WaterFeatureClipDisplaySpan(
+        rangeStart,
+        rangeEnd);
+    if (!std::isfinite(delta)) {
+        return ordered;
+    }
+    const float length = ordered.second - ordered.first;
+    const float maximumStart = std::max(0.0F, 1.0F - length);
+    if (maximumStart <= kWaterClipKeyTolerance) {
+        return ordered;
+    }
+
+    float movedStart = ordered.first + delta;
+    // Stored clips remain ordered. Treat the available start-position range
+    // as circular so crossing the left edge rolls the whole span beside 1,
+    // while crossing the right edge rolls it beside 0. Exact boundary
+    // placements remain stable until the pointer actually crosses them.
+    if (movedStart < 0.0F || movedStart > maximumStart) {
+        movedStart = std::fmod(movedStart, maximumStart);
+        if (movedStart < 0.0F) {
+            movedStart += maximumStart;
+        }
+    }
+    movedStart = std::clamp(movedStart, 0.0F, maximumStart);
+    return {movedStart, movedStart + length};
+}
+
 bool TransformWaterFeatureTimelineSpan(
     WaterFeatureTimeline* timeline,
     float rangeStart,

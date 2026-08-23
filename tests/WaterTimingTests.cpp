@@ -5428,6 +5428,64 @@ TEST_CASE("Duplicating a clip supports overlapping destinations",
     CHECK(timeline.settings.front().keys.size() == 9U);
 }
 
+TEST_CASE("Linked cyclic clip moves roll left past animation start",
+          "[water][timing][keyed][clips][cyclic]") {
+    using Catch::Approx;
+    using invisible_places::water::CyclicWaterFeatureClipMoveSpan;
+    using invisible_places::water::TransformWaterFeatureClip;
+    using invisible_places::water::WaterFeatureTimeline;
+    using invisible_places::water::WaterKeyedFeatureKind;
+
+    WaterFeatureTimeline timeline;
+    timeline.feature = {
+        .kind = WaterKeyedFeatureKind::SeepageNode,
+        .objectId = 7U};
+    timeline.settings = {
+        {.settingId = "strength",
+         .keys = {
+             {.position = 0.00F, .value = 0.0F, .clipId = 1U},
+             {.position = 0.20F, .value = 1.0F, .clipId = 1U},
+             {.position = 0.40F, .value = 0.0F, .clipId = 1U},
+         }},
+    };
+    timeline.clips = {
+        {.id = 1U, .name = "Seepage-1", .start = 0.00F, .end = 0.40F}};
+    timeline.clipMembershipExplicit = true;
+
+    // A small leftward move at canonical zero rolls the complete ordered
+    // window beside one. It no longer clamps at the loaded A member's start.
+    const auto left = CyclicWaterFeatureClipMoveSpan(0.00F, 0.40F, -0.05F);
+    CHECK(left.first == Approx(0.55F));
+    CHECK(left.second == Approx(0.95F));
+    REQUIRE(TransformWaterFeatureClip(
+        &timeline,
+        1U,
+        left.first,
+        left.second));
+    REQUIRE(timeline.settings.front().keys.size() == 3U);
+    CHECK(timeline.settings.front().keys[0].position == Approx(0.55F));
+    CHECK(timeline.settings.front().keys[1].position == Approx(0.75F));
+    CHECK(timeline.settings.front().keys[2].position == Approx(0.95F));
+    CHECK(timeline.clips.front().start == Approx(0.55F));
+    CHECK(timeline.clips.front().end == Approx(0.95F));
+
+    // The opposite edge is symmetric, while an exact boundary placement is
+    // stable until the pointer actually crosses it.
+    const auto boundary = CyclicWaterFeatureClipMoveSpan(0.60F, 1.00F, 0.0F);
+    CHECK(boundary.first == Approx(0.60F));
+    CHECK(boundary.second == Approx(1.00F));
+    const auto right = CyclicWaterFeatureClipMoveSpan(0.60F, 1.00F, 0.05F);
+    CHECK(right.first == Approx(0.05F));
+    CHECK(right.second == Approx(0.45F));
+
+    const auto ordinary = CyclicWaterFeatureClipMoveSpan(0.20F, 0.50F, 0.10F);
+    CHECK(ordinary.first == Approx(0.30F));
+    CHECK(ordinary.second == Approx(0.60F));
+    const auto full = CyclicWaterFeatureClipMoveSpan(0.00F, 1.00F, -0.25F);
+    CHECK(full.first == Approx(0.00F));
+    CHECK(full.second == Approx(1.00F));
+}
+
 TEST_CASE("Clip moves and sanitize preserve overlapping entries",
           "[water][timing][keyed][clips]") {
     using Catch::Approx;

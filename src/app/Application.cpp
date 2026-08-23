@@ -85836,6 +85836,9 @@ void DrawWaterRunClipsTimeline(
                     const float requested = authoredDragDelta(
                         drag.mouseStartX,
                         mouse.x);
+                    const bool cyclicMove =
+                        timelineCoordinates.linkedCyclic &&
+                        !drag.duplicate;
                     float delta = 0.0F;
                     if (drag.duplicate) {
                         // Duplicates place fresh copies, so their windows
@@ -85852,6 +85855,13 @@ void DrawWaterRunClipsTimeline(
                                 1.0F - entry.originalEnd);
                         }
                         delta = std::clamp(requested, lower, upper);
+                    } else if (cyclicMove) {
+                        const auto moved = invisible_places::water::
+                            CyclicWaterFeatureClipMoveSpan(
+                                drag.groupStart,
+                                drag.groupEnd,
+                                requested);
+                        delta = moved.first - drag.groupStart;
                     } else {
                         delta = clampedMoveDelta(requested);
                     }
@@ -85865,8 +85875,12 @@ void DrawWaterRunClipsTimeline(
                                snappedEnd.has_value()) {
                         delta = snappedEnd.value() - lead.originalEnd;
                     }
-                    // Re-clamp after snapping so a snap target near the
-                    // domain edge can never push any window out of range.
+                    // Re-resolve after snapping so linked cyclic moves roll
+                    // the complete ordered group across either boundary;
+                    // ordinary and duplicate moves retain their old clamps.
+                    std::pair<float, float> movedGroup{
+                        drag.groupStart + delta,
+                        drag.groupEnd + delta};
                     if (drag.duplicate) {
                         for (const auto& entry : drag.entries) {
                             delta = std::clamp(
@@ -85874,8 +85888,20 @@ void DrawWaterRunClipsTimeline(
                                 -entry.originalStart,
                                 1.0F - entry.originalEnd);
                         }
+                        movedGroup = {
+                            drag.groupStart + delta,
+                            drag.groupEnd + delta};
+                    } else if (cyclicMove) {
+                        movedGroup = invisible_places::water::
+                            CyclicWaterFeatureClipMoveSpan(
+                                drag.groupStart,
+                                drag.groupEnd,
+                                delta);
                     } else {
                         delta = clampedMoveDelta(delta);
+                        movedGroup = {
+                            drag.groupStart + delta,
+                            drag.groupEnd + delta};
                     }
                     drag.duplicateHandles.clear();
                     if (drag.duplicate) {
@@ -85916,8 +85942,8 @@ void DrawWaterRunClipsTimeline(
                         }
                     } else {
                         transformSelectedEntries(
-                            drag.groupStart + delta,
-                            drag.groupEnd + delta);
+                            movedGroup.first,
+                            movedGroup.second);
                     }
                     markTimingMutation();
                 } else {

@@ -1043,6 +1043,15 @@ struct WaterFeatureSpanLimits {
     float newStart,
     float newEnd);
 
+// Translates one ordered clip/group window on the canonical cyclic 0..1
+// timeline. When its leading edge crosses either boundary, the complete
+// ordered span rolls to the opposite side instead of sticking at 0 or 1.
+// Keeping start <= end preserves the existing clip document schema.
+[[nodiscard]] std::pair<float, float> CyclicWaterFeatureClipMoveSpan(
+    float rangeStart,
+    float rangeEnd,
+    float delta);
+
 // Convenience form for one stored clip.
 [[nodiscard]] bool TransformWaterFeatureClip(
     WaterFeatureTimeline* timeline,
