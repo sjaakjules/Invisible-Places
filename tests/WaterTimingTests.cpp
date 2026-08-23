@@ -5234,6 +5234,43 @@ TEST_CASE("Timing Take retiming carries settings clips with their keys",
         wrappedState.waterFeatureTimingRuns.front().features.front().clips.front();
     CHECK(wrappedClip.start == Approx(0.95F));
     CHECK(wrappedClip.end == Approx(1.10F));
+
+    // A wrapped clip with members embedded into a longer animation loses
+    // its seam (the source's phase 0 is no longer the loop origin), so its
+    // bounds are re-derived from the retimed keys and contain every one.
+    TimingTakeSceneState keyedState;
+    invisible_places::water::WaterFeatureTimingRun keyedRun;
+    keyedRun.features.push_back({
+        .feature = {.kind = WaterKeyedFeatureKind::SeepageNode,
+                    .objectId = 4U},
+        .settings = {{
+            .settingId = "strength",
+            .keys = {
+                {.position = 0.20F, .value = 0.0F, .clipId = 1U},
+                {.position = 0.90F, .value = 1.0F, .clipId = 1U},
+            },
+        }},
+        .clips = {{.id = 1U, .name = "Wrap", .start = 0.9F, .end = 1.2F}},
+    });
+    keyedRun.features.front().clipMembershipExplicit = true;
+    keyedState.waterFeatureTimingRuns.push_back(std::move(keyedRun));
+    REQUIRE(RetimeTimingTakeSceneStateNormalizedPositions(
+        &keyedState,
+        100U,
+        200U,
+        0U));
+    const auto& keyedTimeline =
+        keyedState.waterFeatureTimingRuns.front().features.front();
+    CHECK(keyedTimeline.settings.front().keys[0].position == Approx(0.10F));
+    CHECK(keyedTimeline.settings.front().keys[1].position == Approx(0.45F));
+    CHECK(keyedTimeline.clips.front().start == Approx(0.10F));
+    CHECK(keyedTimeline.clips.front().end == Approx(0.45F));
+    for (const auto& key : keyedTimeline.settings.front().keys) {
+        CHECK(invisible_places::water::WaterClipContainsPosition(
+            keyedTimeline.clips.front().start,
+            keyedTimeline.clips.front().end,
+            key.position));
+    }
 }
 
 TEST_CASE("Timing Take merge keeps Feature Run marks with feature owners",

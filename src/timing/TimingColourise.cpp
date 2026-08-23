@@ -4018,14 +4018,30 @@ bool RetimeTimingTakeSceneStateNormalizedPositions(
             // line: mapping the end through the clamping map would pin it to
             // 1 and silently unwrap the clip.
             const double lengthScale = sourceFrames / destinationFrames;
+            std::vector<std::uint32_t> wrappedClipIds;
             for (auto& clip : feature.clips) {
                 const float length = std::isfinite(clip.end) &&
                                              std::isfinite(clip.start)
                     ? std::clamp(clip.end - clip.start, 0.0F, 1.0F)
                     : 0.0F;
+                if (water::WaterClipIsWrapped(clip.start, clip.end)) {
+                    wrappedClipIds.push_back(clip.id);
+                }
                 clip.start = retimePosition(clip.start);
                 clip.end = clip.start +
                            static_cast<float>(length * lengthScale);
+            }
+            // The source's phase 0 is no longer a seam once the take is a
+            // sub-range of a longer animation, so a wrapped clip's members
+            // (retimed individually above) no longer sit inside the scaled
+            // span. Bounds are derived data: re-derive them from the keys
+            // for clips that wrapped, and only those, so documents whose
+            // clips never wrap retime bit-identically. Keyless wrapped
+            // clips keep the scaled span as their only information.
+            for (const auto clipId : wrappedClipIds) {
+                (void)water::SynchronizeWaterFeatureClipBounds(
+                    &feature,
+                    clipId);
             }
         }
     }
