@@ -99050,7 +99050,30 @@ void DrawTimingColouriseActivationOverview(
                                     invisible_places::timing::
                                         TimingColouriseEffectSettingsKeyPositions(
                                             effect);
-                                settingsSpan = deriveSettingsSpan(effect);
+                                // Show the clip the drag is carrying rather
+                                // than re-deriving it from the moved keys:
+                                // for layouts with tied circular gaps the
+                                // heuristic may legitimately pick another
+                                // cluster once keys cross loop zero, which
+                                // would make the clip, its handles and the
+                                // tooltip jump to a different arc mid-drag.
+                                settingsCyclicSpan =
+                                    invisible_places::timing::
+                                        TimingColouriseCyclicSettingsKeySpan{
+                                            .start = invisible_places::timing::
+                                                WrapTimingColouriseLoopPosition(
+                                                    cyclicDestination.start),
+                                            .length =
+                                                cyclicDestination.length,
+                                        };
+                                settingsSpan = invisible_places::timing::
+                                    TimingColouriseSettingsKeySpan{
+                                        .start = settingsCyclicSpan->start,
+                                        .end = invisible_places::timing::
+                                            WrapTimingColouriseLoopPosition(
+                                                settingsCyclicSpan->start +
+                                                settingsCyclicSpan->length),
+                                    };
                                 drag.moved = true;
                                 runtimeState
                                     ->previewRenderStateSignatureValid =

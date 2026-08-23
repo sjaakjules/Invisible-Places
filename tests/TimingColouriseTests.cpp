@@ -1291,6 +1291,44 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Timing Colourise cyclic settings span resolves tied interior gaps "
+    "stably",
+    "[timing][colourise][cyclic][settings-clip]") {
+    using invisible_places::timing::TimingColouriseCyclicSettingsKeySpan;
+    using invisible_places::timing::TimingColouriseEffectCyclicSettingsKeySpan;
+    using invisible_places::timing::
+        TransformTimingColouriseEffectSettingsKeysCyclic;
+
+    // Evenly spaced keys offset from loop zero: three equal interior gaps
+    // and a smaller wrap gap. Float rounding of the differences must not
+    // decide which cluster is the clip frame to frame.
+    const auto original = EmissiveKeysAt({0.05F, 0.35F, 0.65F, 0.95F});
+    const auto initial = TimingColouriseEffectCyclicSettingsKeySpan(original);
+    REQUIRE(initial.has_value());
+    CHECK(initial->start == Approx(0.35F));
+    CHECK(initial->length == Approx(0.70F));
+
+    // Stepping a body drag from the original effect, the way the overview
+    // does, the derived span follows start + delta while no key crosses
+    // loop zero.
+    for (int step = 1; step <= 15; ++step) {
+        const float delta = 0.003F * static_cast<float>(step);
+        auto effect = original;
+        REQUIRE(TransformTimingColouriseEffectSettingsKeysCyclic(
+            &effect,
+            initial.value(),
+            TimingColouriseCyclicSettingsKeySpan{
+                .start = initial->start + delta,
+                .length = initial->length}));
+        const auto span = TimingColouriseEffectCyclicSettingsKeySpan(effect);
+        REQUIRE(span.has_value());
+        INFO("delta " << delta);
+        CHECK(span->start == Approx(initial->start + delta).margin(1.0e-5F));
+        CHECK(span->length == Approx(initial->length).margin(1.0e-5F));
+    }
+}
+
+TEST_CASE(
     "Visual Feature aspects gate parameters and keep emissive scalar-only",
     "[timing][colourise][emissive][effect-parameters]") {
     using invisible_places::timing::TimingColouriseFieldSource;

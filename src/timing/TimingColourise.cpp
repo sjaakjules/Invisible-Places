@@ -4085,13 +4085,23 @@ TimingColouriseEffectCyclicSettingsKeySpan(
         };
     }
 
-    std::size_t largestInteriorGapIndex = 0U;
     float largestInteriorGap = -1.0F;
     for (std::size_t index = 0U; index + 1U < unique.size(); ++index) {
-        const float gap = unique[index + 1U] - unique[index];
-        if (gap > largestInteriorGap) {
-            largestInteriorGap = gap;
+        largestInteriorGap =
+            std::max(largestInteriorGap, unique[index + 1U] - unique[index]);
+    }
+    // Interior gaps that tie within tolerance (evenly spaced keys offset from
+    // loop zero) must resolve the same way every frame, or float rounding of
+    // the differences would pick a different cluster as the keys translate
+    // and the derived clip would flip between arcs mid-drag. Take the first
+    // tied gap in sorted order: the cluster whose start key is nearest after
+    // loop zero.
+    std::size_t largestInteriorGapIndex = 0U;
+    for (std::size_t index = 0U; index + 1U < unique.size(); ++index) {
+        if (unique[index + 1U] - unique[index] >=
+            largestInteriorGap - kTimingColouriseKeyTolerance) {
             largestInteriorGapIndex = index;
+            break;
         }
     }
     const float wrapGap = unique.front() + 1.0F - unique.back();
@@ -4104,9 +4114,11 @@ TimingColouriseEffectCyclicSettingsKeySpan(
             .length = unique.back() - unique.front(),
         };
     }
+    const float chosenGap = unique[largestInteriorGapIndex + 1U] -
+                            unique[largestInteriorGapIndex];
     return TimingColouriseCyclicSettingsKeySpan{
         .start = unique[largestInteriorGapIndex + 1U],
-        .length = 1.0F - largestInteriorGap,
+        .length = 1.0F - chosenGap,
     };
 }
 
