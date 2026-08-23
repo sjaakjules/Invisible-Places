@@ -10726,25 +10726,35 @@ float CyclicWaterClipDistance(float left, float right) {
 // The affine map shared by every span operation. Positions inside the
 // source range land inside the destination window; the caller guarantees a
 // non-degenerate source span. A stored position ahead of a wrapped source
-// range's seam is unwrapped first. With wrap only a result past 1 rolls
-// back by one cycle; a result landing on 1 itself stays stored at 1, exactly
-// like the unlinked path, so a destination span that ends on phase 1 (an
-// unwrapped {start, 1}) still contains its own end key (a stored key at 0 is
-// not a member of an unwrapped clip ending at 1). Without wrap the pre-W1
-// Clamp01 applies, which keeps every unlinked transform bit-identical.
+// range's seam is unwrapped first. With wrap a result past 1 rolls back by
+// one cycle. A result landing on 1 itself depends on the span the key
+// belongs to (seamToZero): inside a destination that itself wraps, phase 1
+// is an interior instant and is stored at 0, since a wrapped clip's
+// cyclic-nearest-member anchoring would otherwise read a stored 1 as the
+// clip's own phase-0 anchor and flip the clip onto its complement once
+// that key became the nearest member. A key of an unwrapped destination
+// (a {start, 1} clip, even inside a wrapped group window) stays stored at
+// 1, exactly like the unlinked path, so the span still contains its own end
+// key (a stored key at 0 is not a member of an unwrapped clip ending at 1).
+// Without wrap the pre-W1 Clamp01 applies, which keeps every unlinked
+// transform bit-identical.
 float RemapWaterClipPosition(
     float position,
     float rangeStart,
     float rangeEnd,
     float newStart,
     float newEnd,
-    bool wrap = false) {
+    bool wrap = false,
+    bool seamToZero = false) {
     const float span = std::max(1.0e-6F, rangeEnd - rangeStart);
     const float unwrapped = UnwrapWaterClipPosition(position, rangeStart);
     const float fraction = (unwrapped - rangeStart) / span;
     const float mapped = newStart + fraction * (newEnd - newStart);
     if (wrap && mapped > 1.0F + kWaterClipKeyTolerance) {
         return WrapWaterClipPhase(mapped - 1.0F);
+    }
+    if (wrap && seamToZero && mapped >= 1.0F - kWaterClipKeyTolerance) {
+        return 0.0F;
     }
     return Clamp01(mapped);
 }
@@ -11054,6 +11064,21 @@ bool SynchronizeWaterFeatureClipBounds(
     std::pair<float, float> arc;
     if (wasWrapped) {
         const float hint = WrapWaterClipPhase(oldStart);
+        // A member stored at phase 1 is phase 0 on the loop: measure it as
+        // 0 for the anchor search and the unwrap so it never becomes an
+        // "anchor at 1" that reads every other member as linear (which
+        // flipped {0.75,1.25} keyed 0.25/1.0 onto the complement
+        // {0.25,1.0} as soon as the key at 1 was the nearest member).
+        bool memberOnPhaseOne = false;
+        float phaseOneStart = 1.0F;
+        for (auto& position : positions) {
+            if (position >= 1.0F - kWaterFeatureClipPositionTolerance) {
+                phaseOneStart = std::min(phaseOneStart, position);
+                position = 0.0F;
+                memberOnPhaseOne = true;
+            }
+        }
+        std::ranges::sort(positions);
         float anchor = positions.front();
         float anchorDistance = std::numeric_limits<float>::infinity();
         for (const float position : positions) {
@@ -11065,12 +11090,6 @@ bool SynchronizeWaterFeatureClipBounds(
                 anchor = position;
                 anchorDistance = distance;
             }
-        }
-        // A member stored exactly at 1 is phase 0 as an anchor; measuring
-        // from 0 keeps every other member linear so the result is the
-        // self-consistent linear hull rather than an arc starting at 1.
-        if (anchor >= 1.0F) {
-            anchor = 0.0F;
         }
         arc = {std::numeric_limits<float>::infinity(),
                -std::numeric_limits<float>::infinity()};
@@ -11086,6 +11105,20 @@ bool SynchronizeWaterFeatureClipBounds(
         if (arc.first >= 1.0F) {
             arc.first -= 1.0F;
             arc.second -= 1.0F;
+        }
+        if (memberOnPhaseOne &&
+            arc.first <= kWaterFeatureClipPositionTolerance) {
+            // The arc starts on phase 0 but (at least) one of its phase-0
+            // members is stored at 1, which an unwrapped {0, end} would not
+            // contain (0 and 1 are distinct times off the loop) and the
+            // next pass would stretch to the full rail. Hold the start on
+            // that member instead (a stored 1 becomes the last phase below
+            // 1): the clip stays wrapped, {~1, 1+end}, contains every
+            // member, and is a fixed point of this call. Only wrapped
+            // transforms ever stored such a key (linked authoring, where 1
+            // is 0), so unlinked bounds are untouched.
+            arc.second = arc.second + 1.0F;
+            arc.first = std::min(phaseOneStart, std::nextafter(1.0F, 0.0F));
         }
     } else {
         // A clip that just unwrapped onto [start, 1] by a member reaching
@@ -11300,6 +11333,39 @@ bool TransformWaterFeatureClipSelection(
         return keyIndex < dropped[settingIndex].size() &&
                dropped[settingIndex][keyIndex];
     };
+    // Whether the destination span a key belongs to wraps through phase 0
+    // (see RemapWaterClipPosition): a selected clip's own remapped window,
+    // or the group window for loose keys.
+    const auto destinationWraps = [&](float spanStart, float spanEnd) {
+        const float mappedStart = RemapWaterClipPositionUnwrapped(
+            spanStart,
+            rangeStart,
+            rangeEnd,
+            newStart,
+            newEnd);
+        const float mappedEnd = RemapWaterClipPositionUnwrapped(
+            spanEnd,
+            rangeStart,
+            rangeEnd,
+            newStart,
+            newEnd);
+        const float wrappedStart = WrapWaterClipPhase(mappedStart);
+        return WaterClipIsWrapped(
+            wrappedStart,
+            wrappedStart + std::min(1.0F, mappedEnd - mappedStart));
+    };
+    const auto seamToZeroFor = [&](const WaterSettingKey& key) {
+        if (!allowWrap) {
+            return false;
+        }
+        if (key.clipId == 0U) {
+            return WaterClipIsWrapped(newStart, newEnd);
+        }
+        const auto* owner = FindWaterFeatureClip(timeline, key.clipId);
+        return owner == nullptr
+            ? WaterClipIsWrapped(newStart, newEnd)
+            : destinationWraps(owner->start, owner->end);
+    };
     // Collision check before any mutation: a remapped key must not land on
     // a key that stays outside the selection on the same track, nor collapse
     // two selected keys to an ambiguous time.
@@ -11322,7 +11388,8 @@ bool TransformWaterFeatureClipSelection(
                 rangeEnd,
                 newStart,
                 newEnd,
-                allowWrap);
+                allowWrap,
+                seamToZeroFor(key));
             for (const auto& other : setting.keys) {
                 if (keyMovesWithSelection(other)) {
                     continue;
@@ -11364,7 +11431,8 @@ bool TransformWaterFeatureClipSelection(
                     rangeEnd,
                     newStart,
                     newEnd,
-                    allowWrap);
+                    allowWrap,
+                    seamToZeroFor(key));
                 moved = true;
             }
             kept.push_back(std::move(key));

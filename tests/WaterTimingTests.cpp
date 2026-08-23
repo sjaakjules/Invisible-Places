@@ -6093,6 +6093,163 @@ TEST_CASE("Wrapped clip bounds follow head-key nudges and are a Synchronize fixe
     checkFixedPoint();
 }
 
+TEST_CASE("Wrapped clips never flip when a member on phase 1 becomes the anchor",
+          "[water][timing][keyed][clips][cyclic]") {
+    using Catch::Approx;
+    using invisible_places::water::CyclicWaterFeatureClipMoveSpan;
+    using invisible_places::water::FindWaterFeatureClip;
+    using invisible_places::water::MoveWaterSettingKey;
+    using invisible_places::water::SynchronizeWaterFeatureClipBounds;
+    using invisible_places::water::TransformWaterFeatureClip;
+    using invisible_places::water::WaterClipContainsPosition;
+    using invisible_places::water::WaterClipIsWrapped;
+    using invisible_places::water::WaterFeatureTimeline;
+    using invisible_places::water::WaterKeyedFeatureKind;
+    using invisible_places::water::kWaterFeatureClipPositionTolerance;
+
+    const auto everyMemberInside = [](const WaterFeatureTimeline& timeline) {
+        const auto* clip = FindWaterFeatureClip(&timeline, 3U);
+        REQUIRE(clip != nullptr);
+        for (const auto& key : timeline.settings.front().keys) {
+            CHECK(WaterClipContainsPosition(
+                clip->start,
+                clip->end,
+                key.position));
+        }
+    };
+    const auto fixedPoint = [](WaterFeatureTimeline timeline) {
+        const auto before = *FindWaterFeatureClip(&timeline, 3U);
+        REQUIRE(SynchronizeWaterFeatureClipBounds(&timeline, 3U));
+        const auto* after = FindWaterFeatureClip(&timeline, 3U);
+        CHECK(after->start == Approx(before.start));
+        CHECK(after->end == Approx(before.end));
+    };
+
+    // Unlinked {0.5,1.0} keyed 0.5/0.75/1.0 dragged +0.25 on the loop: the
+    // interior key maps exactly onto phase 1. Inside a destination that
+    // wraps, phase 1 is an interior instant and is stored at 0, so the
+    // clip's nearest-member anchoring can never mistake it for the end.
+    WaterFeatureTimeline timeline;
+    timeline.feature = {
+        .kind = WaterKeyedFeatureKind::SeepageNode,
+        .objectId = 7U};
+    timeline.settings = {
+        {.settingId = "strength",
+         .keys = {
+             {.position = 0.50F, .value = 0.0F, .clipId = 3U},
+             {.position = 0.75F, .value = 1.0F, .clipId = 3U},
+             {.position = 1.00F, .value = 0.0F, .clipId = 3U},
+         }},
+    };
+    timeline.clips = {{.id = 3U, .name = "Wrap", .start = 0.5F, .end = 1.0F}};
+    timeline.clipMembershipExplicit = true;
+    const auto moved = CyclicWaterFeatureClipMoveSpan(0.5F, 1.0F, 0.25F);
+    REQUIRE(TransformWaterFeatureClip(
+        &timeline,
+        3U,
+        moved.first,
+        moved.second,
+        /*allowWrap=*/true));
+    REQUIRE(timeline.settings.front().keys.size() == 3U);
+    CHECK(timeline.settings.front().keys[0].position == Approx(0.0F));
+    CHECK(timeline.settings.front().keys[0].value == Approx(1.0F));
+    CHECK(timeline.settings.front().keys[1].position == Approx(0.25F));
+    CHECK(timeline.settings.front().keys[2].position == Approx(0.75F));
+    CHECK(FindWaterFeatureClip(&timeline, 3U)->start == Approx(0.75F));
+    CHECK(FindWaterFeatureClip(&timeline, 3U)->end == Approx(1.25F));
+    everyMemberInside(timeline);
+
+    // Deleting the head key leaves the members at 0 and 0.25: the clip
+    // unwraps onto {0, 0.25} rather than the complement {0.25, 1}.
+    {
+        auto deleted = timeline;
+        std::erase_if(
+            deleted.settings.front().keys,
+            [](const auto& key) { return key.position == 0.75F; });
+        REQUIRE(SynchronizeWaterFeatureClipBounds(&deleted, 3U));
+        CHECK(FindWaterFeatureClip(&deleted, 3U)->start == Approx(0.0F));
+        CHECK(FindWaterFeatureClip(&deleted, 3U)->end == Approx(0.25F));
+        everyMemberInside(deleted);
+        fixedPoint(deleted);
+    }
+    // Jumping the head key in one step past the other members (a typed
+    // position) keeps the arc on the keys' side of the loop.
+    {
+        auto jumped = timeline;
+        REQUIRE(MoveWaterSettingKey(&jumped.settings.front(), 0.75F, 0.45F));
+        REQUIRE(SynchronizeWaterFeatureClipBounds(&jumped, 3U));
+        CHECK(FindWaterFeatureClip(&jumped, 3U)->start == Approx(0.0F));
+        CHECK(FindWaterFeatureClip(&jumped, 3U)->end == Approx(0.45F));
+        everyMemberInside(jumped);
+        fixedPoint(jumped);
+    }
+
+    // A document that already stores a wrapped clip's member at 1 (written
+    // before phase 1 was stored at 0) must not flip either: with the key
+    // at 1 as the nearest member the arc starts on that key, held just
+    // below 1 so the unwrapped {0, 0.25} cannot exclude it and the next
+    // pass cannot stretch it to the full rail.
+    WaterFeatureTimeline legacy;
+    legacy.feature = timeline.feature;
+    legacy.settings = {
+        {.settingId = "strength",
+         .keys = {
+             {.position = 0.25F, .value = 1.0F, .clipId = 3U},
+             {.position = 1.00F, .value = 0.0F, .clipId = 3U},
+         }},
+    };
+    legacy.clips = {{.id = 3U, .name = "Wrap", .start = 0.75F, .end = 1.25F}};
+    legacy.clipMembershipExplicit = true;
+    REQUIRE(SynchronizeWaterFeatureClipBounds(&legacy, 3U));
+    {
+        const auto* clip = FindWaterFeatureClip(&legacy, 3U);
+        CHECK(clip->start >= 1.0F - kWaterFeatureClipPositionTolerance);
+        CHECK(clip->start < 1.0F);
+        CHECK(clip->end == Approx(1.25F));
+        CHECK(WaterClipIsWrapped(clip->start, clip->end));
+    }
+    everyMemberInside(legacy);
+    fixedPoint(legacy);
+    // Phase-0 twins stored at both 0 and 1 inside a wrapped clip are held
+    // the same way and both remain members.
+    legacy.settings.front().keys.insert(
+        legacy.settings.front().keys.begin(),
+        {.position = 0.0F, .value = 0.5F, .clipId = 3U});
+    legacy.clips.front().start = 0.75F;
+    legacy.clips.front().end = 1.25F;
+    REQUIRE(SynchronizeWaterFeatureClipBounds(&legacy, 3U));
+    CHECK(FindWaterFeatureClip(&legacy, 3U)->end == Approx(1.25F));
+    CHECK(WaterClipIsWrapped(
+        FindWaterFeatureClip(&legacy, 3U)->start,
+        FindWaterFeatureClip(&legacy, 3U)->end));
+    everyMemberInside(legacy);
+    fixedPoint(legacy);
+
+    // A key of an unwrapped member clip inside a wrapped group window still
+    // lands on 1 (pinned by the group case above); the unwrapped {0.4, 1}
+    // destination of a single clip keeps its end key at 1 as before.
+    WaterFeatureTimeline unwrappedDestination;
+    unwrappedDestination.feature = timeline.feature;
+    unwrappedDestination.settings = {
+        {.settingId = "strength",
+         .keys = {
+             {.position = 0.30F, .value = 0.0F, .clipId = 3U},
+             {.position = 0.70F, .value = 1.0F, .clipId = 3U},
+         }},
+    };
+    unwrappedDestination.clips = {
+        {.id = 3U, .name = "Wrap", .start = 0.7F, .end = 1.3F}};
+    unwrappedDestination.clipMembershipExplicit = true;
+    REQUIRE(TransformWaterFeatureClip(
+        &unwrappedDestination,
+        3U,
+        0.4F,
+        1.0F,
+        /*allowWrap=*/true));
+    CHECK(unwrappedDestination.settings.front().keys[1].position ==
+          Approx(1.0F));
+}
+
 TEST_CASE("Wrapped clip transforms stay on the loop and refuse seam collisions",
           "[water][timing][keyed][clips][cyclic]") {
     using Catch::Approx;
