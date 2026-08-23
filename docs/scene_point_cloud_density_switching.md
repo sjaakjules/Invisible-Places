@@ -76,6 +76,19 @@ invalidation. Both scenarios verify monotonic per-selection progress, zero
 Seam/A/B-safe toggling, Visual/Timing/Rain/Seepage parity, density
 compensation, serialization isolation, and canonical 1 mm export selection.
 
+`--gui-smoke linked-hq-frame-timing` is the performance diagnostic. It loads
+the authored workspace project, waits for the HQ patches, and samples frame
+timings at the A and B normalized-0.5 cameras with HQ off and on, with rain,
+seepage, and all water ablated, and with a backwards-facing camera so every
+patch point is frustum-culled. For `Proj_A_09S01`/`Proj_B_09S01` the union
+holds 28.3 M 1 mm ROCK and 14.2 M 1 mm VEG points (all 2–8 m from the
+cameras, so no distance cap would help); at 2880×1800 on an M1 Max the live
+frame goes from ~100 ms (5 mm) to ~290 ms (HQ) at A-0.5, of which ~130 ms is
+the base sprite material on the extra ~22 M visible points, ~65 ms rain plus
+seepage on them, and ~20 ms the residual of the ~20 M frustum-culled points.
+The cost is therefore proportional to the legitimately visible 1 mm points;
+the frustum-culled residual is the only remaining lossless lever.
+
 ## Deterministic Local Display-Density Cache
 
 Scene3 can transparently replace the payload bytes behind its discovered 5 mm ROCK/SAND/VEG display paths with one validated local bundle. The default cache root is `Saved/.invisible_places/cache/display_density/Scene3` and has this layout:

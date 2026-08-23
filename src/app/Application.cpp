@@ -116125,6 +116125,462 @@ int RunLinkedHqPreviewSmoke(
     return finish();
 }
 
+// Frame-time profile of the linked HQ preview on the production pair. Loads
+// the authored workspace project (or --smoke-project), waits for the HQ
+// patches, then samples the live render path at each member's normalized 0.5
+// camera with HQ off/on and one water feature ablated at a time. The
+// "away" phases look backwards from the A midpoint so every patch point is
+// frustum-culled, isolating the residual cost of culled points.
+int RunLinkedHqFrameTimingSmoke(
+    const GuiSmokeOptions& options,
+    platform::Window* window,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    PreviewRuntimeState* runtimeState) {
+    const auto outputDirectory = options.outputDirectory.empty()
+        ? std::filesystem::path{"build/macos-debug/linked-hq-frame-timing"}
+        : options.outputDirectory;
+    const auto reportPath = outputDirectory / "linked-hq-frame-timing.json";
+    std::vector<std::string> passes;
+    std::vector<std::string> failures;
+
+    enum class TimingCamera : std::uint8_t { AMidpoint, BMidpoint, AAway };
+    struct PhaseSpec {
+        std::string name;
+        bool hqEnabled = false;
+        TimingCamera camera = TimingCamera::AMidpoint;
+        bool disableRain = false;
+        bool disableShoreline = false;
+        bool hideGeneratedWaterOverlays = false;
+        bool disableSeepage = false;
+    };
+    const std::vector<PhaseSpec> phases{
+        {.name = "hq_off_A", .hqEnabled = false},
+        {.name = "hq_on_A", .hqEnabled = true},
+        {.name = "hq_on_A_rain_off", .hqEnabled = true, .disableRain = true},
+        {.name = "hq_on_A_seepage_off",
+         .hqEnabled = true,
+         .disableSeepage = true},
+        {.name = "hq_on_A_all_water_off",
+         .hqEnabled = true,
+         .disableRain = true,
+         .disableShoreline = true,
+         .hideGeneratedWaterOverlays = true,
+         .disableSeepage = true},
+        {.name = "hq_off_A_all_water_off",
+         .hqEnabled = false,
+         .disableRain = true,
+         .disableShoreline = true,
+         .hideGeneratedWaterOverlays = true,
+         .disableSeepage = true},
+        {.name = "hq_off_B", .hqEnabled = false, .camera = TimingCamera::BMidpoint},
+        {.name = "hq_on_B", .hqEnabled = true, .camera = TimingCamera::BMidpoint},
+        {.name = "hq_off_A_away", .hqEnabled = false, .camera = TimingCamera::AAway},
+        {.name = "hq_on_A_away", .hqEnabled = true, .camera = TimingCamera::AAway},
+    };
+    nlohmann::json phaseReport = nlohmann::json::object();
+    nlohmann::json hqReport = nlohmann::json::object();
+
+    auto finish = [&]() {
+        std::error_code createError;
+        std::filesystem::create_directories(outputDirectory, createError);
+        nlohmann::json report{
+            {"scenario", options.scenario},
+            {"passed", failures.empty()},
+            {"passes", passes},
+            {"failures", failures},
+            {"hq", hqReport},
+            {"phases", phaseReport},
+        };
+        if (viewport != nullptr) {
+            const auto& diagnostics = viewport->Diagnostics();
+            report["present_mode"] = diagnostics.presentMode;
+            report["viewport_width"] = diagnostics.width;
+            report["viewport_height"] = diagnostics.height;
+            report["gpu_timestamp_supported"] =
+                diagnostics.gpuTimestampsSupported;
+        }
+        std::ofstream output{reportPath, std::ios::trunc};
+        if (!output.is_open()) {
+            std::cerr << "Failed to write linked HQ timing report: "
+                      << reportPath.string() << "\n";
+            return 1;
+        }
+        output << report.dump(2) << '\n';
+        std::cout << "Linked HQ timing report: " << reportPath.string()
+                  << "\n";
+        for (const auto& failure : failures) {
+            std::cerr << "Linked HQ timing failure: " << failure << "\n";
+        }
+        return failures.empty() ? 0 : 1;
+    };
+
+    if (window == nullptr || viewport == nullptr || runtimeState == nullptr) {
+        failures.emplace_back(
+            "Linked HQ timing requires a live window, viewport, and runtime.");
+        return finish();
+    }
+
+    const auto projectPath = options.projectPath.empty()
+        ? std::filesystem::path{
+              runtimeState->persistence.authoredWorkspacePath} /
+              "ExhibitionFinal_project.json"
+        : options.projectPath;
+    runtimeState->persistence.projectFilePath = projectPath.string();
+    std::string loadError;
+    const auto project = invisible_places::serialization::LoadProjectDocument(
+        projectPath,
+        &loadError);
+    if (!project.has_value()) {
+        failures.emplace_back("Project did not load: " + loadError);
+        return finish();
+    }
+    if (!ApplyProjectDocumentToRuntime(project.value(), runtimeState, viewport)) {
+        failures.emplace_back(
+            "Project could not be applied: " +
+            (runtimeState->errorMessage.empty() ? runtimeState->statusMessage
+                                                : runtimeState->errorMessage));
+        return finish();
+    }
+    passes.emplace_back("Loaded project " + projectPath.filename().string() + ".");
+
+    const auto pair = ResolveActiveAnimationLinkedPair(*runtimeState);
+    if (!pair.has_value()) {
+        failures.emplace_back(
+            "The project's active animation is not a valid reciprocal pair.");
+        return finish();
+    }
+    std::array<invisible_places::camera::CameraState, 2U> midpointCameras{};
+    for (std::size_t member = 0U; member < 2U; ++member) {
+        midpointCameras[member] = invisible_places::camera::EvaluateAnimationPath(
+            *pair->members[member],
+            invisible_places::camera::AnimationPathDurationSeconds(
+                *pair->members[member]) *
+                0.5F).camera;
+    }
+    auto awayCamera = midpointCameras[0U];
+    for (std::size_t axis = 0U; axis < 3U; ++axis) {
+        awayCamera.target[axis] =
+            awayCamera.position[axis] +
+            (awayCamera.position[axis] - midpointCameras[0U].target[axis]);
+    }
+    awayCamera.orientation = {0.0F, 0.0F, 0.0F, 0.0F};
+    awayCamera.hasOrbitCenter = false;
+    hqReport["pair_id"] = pair->pairId;
+    hqReport["member_a"] = pair->memberFilePaths[0U].filename().string();
+    hqReport["member_b"] = pair->memberFilePaths[1U].filename().string();
+    runtimeState->animationPanel.linkedViewMode = AnimationLinkedViewMode::A;
+
+    const auto startedAt = std::chrono::steady_clock::now();
+    const auto liveSeconds = [&]() {
+        return std::chrono::duration<float>(
+                   std::chrono::steady_clock::now() - startedAt)
+            .count();
+    };
+    std::vector<double> ensureHqMilliseconds;
+    std::vector<double> buildRenderStateMilliseconds;
+    std::vector<double> wallClockFrameMilliseconds;
+    std::optional<std::chrono::steady_clock::time_point> lastFrameEnd;
+
+    const auto pumpFrame = [&](const PhaseSpec& spec,
+                               RendererFrameTimingSamples* samples,
+                               invisible_places::renderer::core::
+                                   SceneRenderState* capturedState =
+                                       nullptr) {
+        window->PollEvents();
+        PollPendingLayerLoad(runtimeState, viewport);
+        PollTimingColouriseHistogram(runtimeState);
+        EnsureWaterSurfaceCacheReady(runtimeState, viewport);
+        PollWaterFlowTrailBuildJob(runtimeState, viewport);
+        CommitReadySceneDisplaySwitches(runtimeState, viewport);
+        StartQueuedLayerLoadIfIdle(runtimeState);
+        const auto ensureStart = std::chrono::steady_clock::now();
+        EnsureLinkedHqPreview(runtimeState, viewport);
+        const auto ensureEnd = std::chrono::steady_clock::now();
+        viewport->BeginUiFrame();
+        const auto waterFrameState = ResolveWaterFrameState(runtimeState);
+        EnsureWaterSeepageRuntimeUpToDate(
+            runtimeState,
+            viewport,
+            &waterFrameState);
+        const float liveWaterTimeSeconds = liveSeconds();
+        EnsureWaterDynamicMeshFlowGpuUpToDate(
+            runtimeState,
+            viewport,
+            waterFrameState,
+            liveWaterTimeSeconds);
+        viewport->SetDiagnosticsEnabled(true);
+        viewport->SetSceneCachingEnabled(false);
+        viewport->SetLiveSceneRenderingEnabled(true);
+        viewport->SetLiveRainSimulationEnabled(!spec.disableRain);
+        const bool previewLiveEffectsAffectScene =
+            PreviewLiveVisualEffectsRequireSceneRedraw(
+                *runtimeState,
+                *viewport,
+                liveWaterTimeSeconds);
+        const float previewFlowTimeSeconds =
+            previewLiveEffectsAffectScene ? liveWaterTimeSeconds : 0.0F;
+        const auto buildStart = std::chrono::steady_clock::now();
+        auto renderState = BuildRenderState(
+            *runtimeState,
+            *viewport,
+            previewFlowTimeSeconds,
+            &waterFrameState,
+            nullptr,
+            true);
+        const auto buildEnd = std::chrono::steady_clock::now();
+        if (spec.disableRain) {
+            renderState.rainSettings.enabled = false;
+        }
+        if (spec.disableShoreline) {
+            renderState.additionalShorelines.clear();
+            for (auto& layer : renderState.pointCloudLayers) {
+                ClearPointCloudStyleShoreline(&layer.style);
+            }
+        }
+        if (spec.hideGeneratedWaterOverlays) {
+            std::erase_if(
+                renderState.pointCloudLayers,
+                [](const auto& layer) { return layer.generatedWaterOverlay; });
+        }
+        viewport->UpdateRenderState(renderState);
+        runtimeState->previewRenderStateSignature =
+            RenderStateSignature(renderState);
+        runtimeState->previewRenderStateSignatureValid = true;
+        viewport->DrawFrame();
+        const auto frameEnd = std::chrono::steady_clock::now();
+        const auto& diagnostics = viewport->Diagnostics();
+        if (samples != nullptr) {
+            ensureHqMilliseconds.push_back(
+                std::chrono::duration<double, std::milli>(
+                    ensureEnd - ensureStart).count());
+            buildRenderStateMilliseconds.push_back(
+                std::chrono::duration<double, std::milli>(
+                    buildEnd - buildStart).count());
+            if (lastFrameEnd.has_value()) {
+                wallClockFrameMilliseconds.push_back(
+                    std::chrono::duration<double, std::milli>(
+                        frameEnd - lastFrameEnd.value()).count());
+            }
+            samples->cpuMilliseconds.push_back(diagnostics.frameRenderMs);
+            samples->cpuUiFinalizeMilliseconds.push_back(
+                diagnostics.frameUiRenderMs);
+            samples->cpuFrameSlotFenceWaitMilliseconds.push_back(
+                diagnostics.frameFenceWaitMs);
+            samples->cpuCommandEncodingMilliseconds.push_back(
+                diagnostics.frameCommandBufferMs);
+            samples->cpuPresentMilliseconds.push_back(
+                diagnostics.framePresentMs);
+            if (diagnostics.gpuTimestampResultsAvailable) {
+                samples->gpuMilliseconds.push_back(
+                    diagnostics.gpuTotal.milliseconds);
+                const auto appendActive =
+                    [](std::vector<double>* values,
+                       const invisible_places::renderer::core::
+                           GpuPhaseDiagnostics& phase) {
+                        if (phase.active) {
+                            values->push_back(phase.milliseconds);
+                        }
+                    };
+                appendActive(
+                    &samples->gpuRainComputeMilliseconds,
+                    diagnostics.gpuRainCompute);
+                appendActive(
+                    &samples->gpuDepthMilliseconds,
+                    diagnostics.gpuDepth);
+                appendActive(
+                    &samples->gpuWeightedAccumulationMilliseconds,
+                    diagnostics.gpuWeightedAccumulation);
+                appendActive(
+                    &samples->gpuCompositeMilliseconds,
+                    diagnostics.gpuComposite);
+                appendActive(
+                    &samples->gpuOpaqueAndHighQualityMilliseconds,
+                    diagnostics.gpuOpaqueAndHighQuality);
+                appendActive(
+                    &samples->gpuPostProcessMilliseconds,
+                    diagnostics.gpuPostProcess);
+                appendActive(
+                    &samples->gpuImGuiMilliseconds,
+                    diagnostics.gpuImGui);
+            }
+        }
+        lastFrameEnd = frameEnd;
+        if (capturedState != nullptr) {
+            *capturedState = std::move(renderState);
+        }
+    };
+
+    // Settle loads, shared-water caches, and the HQ preparation itself.
+    runtimeState->camera.ApplyState(midpointCameras[0U]);
+    const PhaseSpec settleSpec = phases.front();
+    const auto loadDeadline =
+        std::chrono::steady_clock::now() + std::chrono::minutes{20};
+    const auto prepareStart = std::chrono::steady_clock::now();
+    auto& hq = runtimeState->linkedHqPreview;
+    while (std::chrono::steady_clock::now() < loadDeadline &&
+           !window->ShouldClose() &&
+           (runtimeState->pendingLoad.has_value() ||
+            !runtimeState->persistence.queuedLoads.empty() ||
+            !hq.ready)) {
+        // The stage reads Failed transiently while the linked scene is still
+        // loading; only a failure of a resolved request is terminal.
+        if (hq.stage == LinkedHqPreparationStage::Failed &&
+            hq.request.has_value() &&
+            !runtimeState->pendingLoad.has_value() &&
+            runtimeState->persistence.queuedLoads.empty()) {
+            break;
+        }
+        pumpFrame(settleSpec, nullptr);
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+    if (runtimeState->pendingLoad.has_value() ||
+        !runtimeState->persistence.queuedLoads.empty()) {
+        failures.emplace_back(
+            "The project's layer loads did not settle before the deadline.");
+        return finish();
+    }
+    if (!hq.ready || !hq.baselineReady) {
+        failures.emplace_back(
+            "HQ preparation did not become ready: " +
+            (hq.failureMessage.empty()
+                 ? std::string{LinkedHqPreparationStageName(hq.stage)}
+                 : hq.failureMessage));
+        return finish();
+    }
+    hqReport["prepare_wall_ms"] = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - prepareStart).count();
+    for (std::size_t patch = 0U; patch < hq.patches.size(); ++patch) {
+        const auto& runtime = hq.patches[patch];
+        nlohmann::json patchJson{
+            {"layer_id", runtime.layerId},
+            {"base_session_index", runtime.baseSessionIndex},
+            {"patch_point_count",
+             runtime.cloud != nullptr ? runtime.cloud->PointCount() : 0U},
+            {"five_mm_outside_count", runtime.fiveMillimeterOutsideIndices.size()},
+            {"scalar_field_count",
+             runtime.cloud != nullptr ? runtime.cloud->scalarFields.size() : 0U},
+        };
+        if (runtime.baseSessionIndex < runtimeState->sessions.size()) {
+            const auto& base = runtimeState->sessions[runtime.baseSessionIndex];
+            patchJson["base_role"] = base.sceneRole;
+            patchJson["five_mm_total_count"] = base.totalPrimitives;
+        }
+        hqReport["patches"].push_back(std::move(patchJson));
+    }
+    passes.emplace_back("Scene loads, water caches, and HQ patches settled.");
+    for (std::uint32_t frame = 0U; frame < 60U; ++frame) {
+        pumpFrame(settleSpec, nullptr);
+    }
+
+    std::vector<bool> stashedSeepageEnablement;
+    for (const auto& node : runtimeState->water.seepageNodes) {
+        stashedSeepageEnablement.push_back(node.enabledInViewport);
+    }
+    const auto setSeepageEnabled = [&](bool enabled) {
+        for (std::size_t nodeIndex = 0U;
+             nodeIndex < runtimeState->water.seepageNodes.size();
+             ++nodeIndex) {
+            runtimeState->water.seepageNodes[nodeIndex].enabledInViewport =
+                enabled ? stashedSeepageEnablement[nodeIndex] : false;
+        }
+    };
+
+    constexpr std::uint32_t kSettleFrames = 24U;
+    constexpr std::uint32_t kSampleFrames = 72U;
+    for (const auto& spec : phases) {
+        switch (spec.camera) {
+            case TimingCamera::AMidpoint:
+                runtimeState->camera.ApplyState(midpointCameras[0U]);
+                break;
+            case TimingCamera::BMidpoint:
+                runtimeState->camera.ApplyState(midpointCameras[1U]);
+                break;
+            case TimingCamera::AAway:
+                runtimeState->camera.ApplyState(awayCamera);
+                break;
+        }
+        if (!SetLinkedHqPreviewEnabled(runtimeState, viewport, spec.hqEnabled) ||
+            hq.enabled != spec.hqEnabled) {
+            failures.emplace_back(
+                "Could not set HQ " + std::string{spec.hqEnabled ? "on" : "off"} +
+                " for phase " + spec.name + ": " + hq.failureMessage);
+            break;
+        }
+        setSeepageEnabled(!spec.disableSeepage);
+        for (std::uint32_t frame = 0U; frame < kSettleFrames; ++frame) {
+            pumpFrame(spec, nullptr);
+        }
+        ensureHqMilliseconds.clear();
+        buildRenderStateMilliseconds.clear();
+        wallClockFrameMilliseconds.clear();
+        lastFrameEnd.reset();
+        RendererFrameTimingSamples samples;
+        invisible_places::renderer::core::SceneRenderState lastRenderState;
+        std::uint32_t patchLayerMismatchFrames = 0U;
+        for (std::uint32_t frame = 0U; frame < kSampleFrames; ++frame) {
+            pumpFrame(spec, &samples, &lastRenderState);
+            const auto patchLayers = LinkedHqPatchLayerCount(lastRenderState);
+            if (patchLayers != (spec.hqEnabled ? 2U : 0U)) {
+                ++patchLayerMismatchFrames;
+            }
+        }
+        auto summary = RendererFrameTimingSampleSummary(samples);
+        summary["patch_layer_mismatch_frames"] = patchLayerMismatchFrames;
+        summary["hq_state"] = {
+            {"enabled", hq.enabled},
+            {"ready", hq.ready},
+            {"baseline_ready", hq.baselineReady},
+            {"stage", LinkedHqPreparationStageName(hq.stage)},
+            {"request_fingerprint",
+             hq.request.has_value() ? hq.request->fingerprint : 0U},
+            {"failure_message", hq.failureMessage},
+            {"indexed_field_job_active", hq.indexedFieldShared != nullptr},
+            {"preparation_active", hq.preparationShared != nullptr},
+        };
+        summary["wall_clock_frame_ms"] = {
+            {"p50", PercentileValue(wallClockFrameMilliseconds, 0.50)},
+            {"p95", PercentileValue(wallClockFrameMilliseconds, 0.95)},
+        };
+        summary["ensure_linked_hq_ms"] = {
+            {"p50", PercentileValue(ensureHqMilliseconds, 0.50)},
+            {"p95", PercentileValue(ensureHqMilliseconds, 0.95)},
+        };
+        summary["build_render_state_ms"] = {
+            {"p50", PercentileValue(buildRenderStateMilliseconds, 0.50)},
+            {"p95", PercentileValue(buildRenderStateMilliseconds, 0.95)},
+        };
+        const auto& diagnostics = viewport->Diagnostics();
+        summary["point_submitted_count"] = diagnostics.pointSubmittedCount;
+        summary["point_unified_draw_calls"] = diagnostics.pointUnifiedDrawCalls;
+        summary["point_opaque_hard_disc_draw_calls"] =
+            diagnostics.pointOpaqueHardDiscDrawCalls;
+        summary["point_constant_simple_draw_calls"] =
+            diagnostics.pointConstantSimpleDrawCalls;
+        nlohmann::json layers = nlohmann::json::array();
+        for (const auto& layer : lastRenderState.pointCloudLayers) {
+            layers.push_back({
+                {"layer_id", layer.layerId},
+                {"draw_point_count", layer.drawPointCount},
+                {"hq_patch",
+                 layer.layerId == kLinkedHqRockPatchLayerId ||
+                     layer.layerId == kLinkedHqVegetationPatchLayerId},
+                {"generated_water_overlay", layer.generatedWaterOverlay},
+                {"footprint_scale", layer.densityCompensation.footprintScale},
+                {"rain_impact_effects", layer.style.rainImpactEffects},
+            });
+        }
+        summary["layers"] = std::move(layers);
+        phaseReport[spec.name] = std::move(summary);
+    }
+    setSeepageEnabled(true);
+    (void)SetLinkedHqPreviewEnabled(runtimeState, viewport, false);
+    if (failures.empty()) {
+        passes.emplace_back("Captured all linked HQ timing phases.");
+    }
+    viewport->WaitIdle();
+    return finish();
+}
+
 int RunWaterIntegrationSmoke(
     const GuiSmokeOptions& options,
     platform::Window* window,
@@ -118918,6 +119374,16 @@ int Application::Run(ApplicationRunOptions options) const {
                 &viewport.value(),
                 &runtimeState,
                 dataRoot_);
+            StopBackgroundWorkForShutdown(&runtimeState);
+            viewport->WaitIdle();
+            return smokeExitCode;
+        }
+        if (options.guiSmoke->scenario == "linked-hq-frame-timing") {
+            const auto smokeExitCode = RunLinkedHqFrameTimingSmoke(
+                options.guiSmoke.value(),
+                &window,
+                &viewport.value(),
+                &runtimeState);
             StopBackgroundWorkForShutdown(&runtimeState);
             viewport->WaitIdle();
             return smokeExitCode;

@@ -560,6 +560,22 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
                 TIMEOUT 2100
         )
+        add_test(
+            NAME linked-hq-frame-timing
+            COMMAND
+                $<TARGET_FILE:invisible_places>
+                "${CMAKE_CURRENT_SOURCE_DIR}/Data"
+                --gui-smoke linked-hq-frame-timing
+                --smoke-output "${CMAKE_CURRENT_BINARY_DIR}/linked-hq-frame-timing"
+        )
+        set_tests_properties(
+            linked-hq-frame-timing
+            PROPERTIES
+                LABELS "gui_smoke;renderer_timing;linked_hq;full_site"
+                RUN_SERIAL TRUE
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                TIMEOUT 1800
+        )
         if(INVISIBLE_PLACES_ENABLE_FULL_SITE_WATER_STRESS_TESTS)
             add_test(
                 NAME water-integration-scene3-exhibition
