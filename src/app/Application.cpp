@@ -352,6 +352,11 @@ struct ProjectSettings {
     // blend in the live viewport (never in exports). Off preserves the
     // original preview appearance exactly.
     bool previewPerformanceMode = false;
+    // Linked A/B HQ patch density (1000, 2000 or 3000 micrometres). Above
+    // 1 mm the 1 mm scan keeps a hash-selected 1/4 or 1/9 of the points
+    // inside the midpoint union and declares that nominal spacing so the
+    // density compensation matches the 1 mm reference coverage.
+    std::uint32_t linkedHqPatchSpacingMicrometres = 1000U;
     // Escape hatch for scalar-field residency: when set, point-cloud loads
     // materialise every on-disk scalar field exactly as before field
     // filtering existed. Takes effect on the next load of each cloud.
@@ -3571,6 +3576,7 @@ struct LinkedHqSelectionRequest {
     std::uint64_t fingerprint = 0U;
     std::string pairSessionId;
     std::string sceneGroupName;
+    std::uint32_t patchSpacingMicrometres = 1000U;
     LinkedHqFrustumUnion midpointFrustums{};
     std::array<std::size_t, invisible_places::scene::kScenePointCloudRoleCount>
         fiveMillimeterSessionIndices{};
@@ -3615,6 +3621,9 @@ struct LinkedHqPatchRuntime {
     std::shared_ptr<invisible_places::io::LoadedPointCloud> cloud;
     std::shared_ptr<const std::vector<std::uint32_t>> sourcePointIndices;
     std::vector<std::uint32_t> fiveMillimeterOutsideIndices;
+    // 1 mm points inside the union before decimation; the reference count
+    // for the patch's density compensation.
+    std::uint64_t includedPointCount = 0U;
     bool uploaded = false;
 };
 
@@ -3649,6 +3658,10 @@ struct LinkedHqPreviewRuntime {
     bool ready = false;
     bool enabled = false;
     bool retryRequested = false;
+    // Set when a selection change (spacing, cameras, sources) replaced a
+    // live HQ view; the next publish re-enables HQ so the user keeps the
+    // density they were looking at.
+    bool reenableAfterPublish = false;
     // Re-resolving the selection stats five source files (symlinks into
     // cloud storage) and re-evaluates both midpoint cameras, so it runs on
     // a short cadence rather than every frame.
@@ -23876,6 +23889,8 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
     document.constantUpdateView = runtimeState.projectSettings.constantUpdateView;
     document.liveVisualEffects = runtimeState.projectSettings.liveVisualEffects;
     document.previewPerformanceMode = runtimeState.projectSettings.previewPerformanceMode;
+    document.linkedHqPatchSpacingMicrometres =
+        runtimeState.projectSettings.linkedHqPatchSpacingMicrometres;
     document.loadAllScalarFields = runtimeState.projectSettings.loadAllScalarFields;
     document.scalarFieldBudgetGigabytes =
         runtimeState.projectSettings.scalarFieldBudgetGigabytes;
@@ -25091,6 +25106,8 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->projectSettings.constantUpdateView = document.constantUpdateView;
     runtimeState->projectSettings.liveVisualEffects = document.liveVisualEffects;
     runtimeState->projectSettings.previewPerformanceMode = document.previewPerformanceMode;
+    runtimeState->projectSettings.linkedHqPatchSpacingMicrometres =
+        SanitizeLinkedHqPatchSpacing(document.linkedHqPatchSpacingMicrometres);
     runtimeState->projectSettings.loadAllScalarFields = document.loadAllScalarFields;
     runtimeState->projectSettings.scalarFieldBudgetGigabytes =
         std::max(0.0F, document.scalarFieldBudgetGigabytes);
@@ -52649,6 +52666,25 @@ SnapshotAnimationMatchingFrameGhostSource(
     return snapshot;
 }
 
+// A 1 mm patch is the reference density itself (identity). A decimated
+// patch declares its nominal spacing and its exact kept/included counts, so
+// ResolvePointCloudDensityCompensation restores the 1 mm coverage the same
+// way it does for the 5 mm display bundles.
+PointCloudDensityCompensation LinkedHqPatchDensityCompensation(
+    std::uint32_t patchSpacingMicrometres,
+    const LinkedHqPatchRuntime& patch) {
+    const auto spacing = SanitizeLinkedHqPatchSpacing(patchSpacingMicrometres);
+    if (spacing <= 1000U || patch.cloud == nullptr) {
+        return {};
+    }
+    return invisible_places::renderer::pointcloud::
+        ResolvePointCloudDensityCompensation(
+            static_cast<float>(spacing) * 1.0e-6F,
+            patch.cloud->PointCount(),
+            0.001F,
+            patch.includedPointCount);
+}
+
 void PublishLinkedHqStageProgress(
     const std::shared_ptr<LinkedHqPreparationJobShared>& shared,
     LinkedHqPreparationStage stage,
@@ -52761,6 +52797,8 @@ std::optional<LinkedHqSelectionRequest> ResolveLinkedHqSelectionRequest(
     LinkedHqSelectionRequest request;
     request.pairSessionId = pair->sessionPairId;
     request.sceneGroupName = selectedScene->sceneGroupName;
+    request.patchSpacingMicrometres = SanitizeLinkedHqPatchSpacing(
+        runtimeState.projectSettings.linkedHqPatchSpacingMicrometres);
     request.fiveMillimeterSessionIndices =
         fiveMillimeterBundle->sessionIndices;
     request.oneMillimeterSessionIndices =
@@ -52841,7 +52879,8 @@ std::optional<LinkedHqSelectionRequest> ResolveLinkedHqSelectionRequest(
     request.sourceFingerprints = sources;
     const std::string projectPairKey = request.pairSessionId + "\n" +
         runtimeState.persistence.projectFilePath + "\n" +
-        request.sceneGroupName;
+        request.sceneGroupName + "\n" +
+        std::to_string(request.patchSpacingMicrometres);
     request.fingerprint = BuildLinkedHqSelectionFingerprint(
         projectPairKey,
         request.midpointFrustums,
@@ -53007,7 +53046,14 @@ void StartLinkedHqPreparation(
     hq.failureMessage.clear();
     std::cout << "Linked HQ: scanning 1 mm ROCK/VEG for "
               << request.sceneGroupName << " (" << sourcePaths[0U].filename().string()
-              << ", " << sourcePaths[1U].filename().string() << ")." << std::endl;
+              << ", " << sourcePaths[1U].filename().string() << ") at "
+              << (request.patchSpacingMicrometres / 1000U) << " mm patch spacing"
+              << (request.patchSpacingMicrometres > 1000U
+                      ? ", keeping one in " +
+                            std::to_string(LinkedHqDecimationKeepOneIn(
+                                request.patchSpacingMicrometres))
+                      : std::string{})
+              << "." << std::endl;
     hq.preparationWorker = std::jthread{
         [shared,
          request,
@@ -53054,6 +53100,9 @@ void StartLinkedHqPreparation(
                             const invisible_places::io::Float3& point) {
                             return frustums.Contains(point);
                         };
+                    options.decimationKeepOneIn =
+                        LinkedHqDecimationKeepOneIn(
+                            request.patchSpacingMicrometres);
                     options.stopToken = stopToken;
                     options.progress =
                         [shared, patch](std::uint64_t completed,
@@ -53229,6 +53278,8 @@ bool PollLinkedHqPreparation(
                     std::move(source.subset.sourcePointIndices));
             destination.fiveMillimeterOutsideIndices =
                 std::move(source.fiveMillimeterOutsideIndices);
+            destination.includedPointCount =
+                source.subset.includedPointCount;
             destination.cloud = std::make_shared<
                 invisible_places::io::LoadedPointCloud>(
                     std::move(source.subset.cloud));
@@ -53277,20 +53328,25 @@ bool PollLinkedHqPreparation(
     runtimeState->statusMessage =
         "HQ linked preview is ready (1 mm ROCK/VEG midpoint patches; "
         "5 mm elsewhere).";
-    if (wasEnabled) {
+    if (wasEnabled || hq.reenableAfterPublish) {
         (void)SetLinkedHqPreviewEnabled(runtimeState, viewport, true);
     }
+    hq.reenableAfterPublish = false;
     std::cout << "Linked HQ: patches ready ("
               << FormatPointCount(
                      hq.patches[0U].cloud != nullptr
                          ? hq.patches[0U].cloud->PointCount()
                          : 0U)
-              << " 1 mm ROCK, "
+              << " ROCK + "
               << FormatPointCount(
                      hq.patches[1U].cloud != nullptr
                          ? hq.patches[1U].cloud->PointCount()
                          : 0U)
-              << " 1 mm VEG; 5 mm remainders "
+              << " VEG patch points at "
+              << (hq.request.has_value()
+                      ? hq.request->patchSpacingMicrometres / 1000U
+                      : 1U)
+              << " mm; 5 mm remainders "
               << FormatPointCount(
                      hq.patches[0U].fiveMillimeterOutsideIndices.size())
               << " / "
@@ -53603,6 +53659,7 @@ void EnsureLinkedHqPreview(
     }
     if (!hq.request.has_value() ||
         hq.request->fingerprint != resolved->fingerprint) {
+        const bool reenableAfterPublish = hq.ready && hq.enabled;
         std::vector<std::pair<std::size_t, bool>> changedFiveMillimeterSources;
         if (hq.request.has_value()) {
             for (std::size_t role = 0U;
@@ -53627,6 +53684,7 @@ void EnsureLinkedHqPreview(
         hq.stage = LinkedHqPreparationStage::Waiting;
         hq.displayedProgress = 0.0F;
         hq.retryRequested = false;
+        hq.reenableAfterPublish = reenableAfterPublish;
         for (const auto& [sessionIndex, wasVisible] :
              changedFiveMillimeterSources) {
             try {
@@ -57880,10 +57938,10 @@ void DrawLinkedSeamedViewHeaderControls(
                     hq.failureMessage.c_str());
             } else if (hq.ready && hq.baselineReady) {
                 ImGui::SetTooltip(
-                    "HQ is independent of Seam/A/B. It uses complete 1 mm "
-                    "ROCK and VEG inside the two padded midpoint views, 5 mm "
-                    "ROCK/VEG elsewhere, and complete 5 mm SAND. Exports "
-                    "remain complete 1 mm.");
+                    "HQ is independent of Seam/A/B. It uses 1 mm ROCK and "
+                    "VEG inside the two padded midpoint views (at the patch "
+                    "spacing chosen beside it), 5 mm ROCK/VEG elsewhere, and "
+                    "complete 5 mm SAND. Exports remain complete 1 mm.");
             } else {
                 ImGui::SetTooltip(
                     "HQ %s (%.0f%%). The complete 5 mm view remains visible "
@@ -57893,6 +57951,46 @@ void DrawLinkedSeamedViewHeaderControls(
                     hq.failureMessage.empty() ? "" : "\n",
                     hq.failureMessage.c_str());
             }
+        }
+        // Patch density. Changing it re-prepares the patches for the pair
+        // (the selection fingerprint includes the spacing); a live HQ view
+        // comes back automatically once the new patches publish.
+        auto& spacingSetting =
+            runtimeState->projectSettings.linkedHqPatchSpacingMicrometres;
+        int spacingChoice = 0;
+        for (std::size_t choice = 0U;
+             choice < kLinkedHqPatchSpacingChoicesMicrometres.size();
+             ++choice) {
+            if (kLinkedHqPatchSpacingChoicesMicrometres[choice] ==
+                SanitizeLinkedHqPatchSpacing(spacingSetting)) {
+                spacingChoice = static_cast<int>(choice);
+            }
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(
+            ImGui::CalcTextSize("3 mm").x +
+            ImGui::GetFrameHeight() +
+            ImGui::GetStyle().FramePadding.x * 2.0F);
+        if (ImGui::Combo(
+                "##LinkedHqPatchSpacing",
+                &spacingChoice,
+                "1 mm\0002 mm\0003 mm\000")) {
+            spacingSetting = kLinkedHqPatchSpacingChoicesMicrometres[
+                static_cast<std::size_t>(std::clamp(
+                    spacingChoice,
+                    0,
+                    static_cast<int>(
+                        kLinkedHqPatchSpacingChoicesMicrometres.size()) -
+                        1))];
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "HQ patch spacing inside the two midpoint views.\n"
+                "1 mm keeps every 1 mm ROCK/VEG point (slowest, export-exact).\n"
+                "2 mm keeps one in four, 3 mm one in nine, chosen by a fixed "
+                "hash so the pattern is stable; the footprint compensation "
+                "restores the 1 mm coverage like a coarser display bundle.\n"
+                "Saved with the project; changing it rescans the 1 mm sources.");
         }
     } else if (failure.has_value()) {
         ImGui::SameLine();
@@ -104589,7 +104687,10 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                      std::min<std::size_t>(
                          patch.cloud->PointCount(),
                          std::numeric_limits<std::uint32_t>::max())),
-                 .densityCompensation = {},
+                 .densityCompensation = LinkedHqPatchDensityCompensation(
+                     runtimeState.linkedHqPreview.request
+                         ->patchSpacingMicrometres,
+                     patch),
                  .rainCollisionRole =
                      RainCollisionRoleForSession(baseSession)});
         }
@@ -116449,13 +116550,20 @@ int RunLinkedHqFrameTimingSmoke(
     }
     hqReport["prepare_wall_ms"] = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - prepareStart).count();
+    hqReport["patch_spacing_um"] = hq.request->patchSpacingMicrometres;
     for (std::size_t patch = 0U; patch < hq.patches.size(); ++patch) {
         const auto& runtime = hq.patches[patch];
+        const auto compensation = LinkedHqPatchDensityCompensation(
+            hq.request->patchSpacingMicrometres,
+            runtime);
         nlohmann::json patchJson{
             {"layer_id", runtime.layerId},
             {"base_session_index", runtime.baseSessionIndex},
             {"patch_point_count",
              runtime.cloud != nullptr ? runtime.cloud->PointCount() : 0U},
+            {"included_point_count", runtime.includedPointCount},
+            {"footprint_scale", compensation.footprintScale},
+            {"coverage_correction", compensation.coverageCorrection},
             {"five_mm_outside_count", runtime.fiveMillimeterOutsideIndices.size()},
             {"scalar_field_count",
              runtime.cloud != nullptr ? runtime.cloud->scalarFields.size() : 0U},

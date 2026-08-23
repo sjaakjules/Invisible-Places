@@ -8816,6 +8816,7 @@ bool SaveProjectDocument(
         {"constant_update_view", document.constantUpdateView},
         {"live_visual_effects", document.liveVisualEffects},
         {"preview_performance_mode", document.previewPerformanceMode},
+        {"linked_hq_patch_spacing_um", document.linkedHqPatchSpacingMicrometres},
         {"load_all_scalar_fields", document.loadAllScalarFields},
         {"scalar_field_budget_gb", document.scalarFieldBudgetGigabytes},
         {"side_panel_pinned", document.sidePanelPinned},
@@ -9130,6 +9131,8 @@ std::optional<ProjectDocument> LoadProjectDocument(
     document.constantUpdateView = projectJson->value("constant_update_view", false);
     document.liveVisualEffects = projectJson->value("live_visual_effects", false);
     document.previewPerformanceMode = projectJson->value("preview_performance_mode", false);
+    document.linkedHqPatchSpacingMicrometres =
+        projectJson->value("linked_hq_patch_spacing_um", 1000U);
     document.loadAllScalarFields = projectJson->value("load_all_scalar_fields", false);
     document.scalarFieldBudgetGigabytes =
         std::max(0.0F, projectJson->value("scalar_field_budget_gb", 0.0F));

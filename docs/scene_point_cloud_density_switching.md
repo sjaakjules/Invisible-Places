@@ -57,7 +57,21 @@ Rain, Seepage, Flow/roughness motion, renderer mode, depth of field, and EDL as
 their 5 mm surroundings. Their values are 1 mm values, while automatic
 field-map ranges come from the complete 5 mm role to avoid a patch-local
 renormalization seam. Existing full-role density compensation remains on the
-5 mm remainder; the 1 mm patch uses identity compensation. All fields already
+5 mm remainder; a 1 mm patch uses identity compensation.
+
+The patch spacing selector beside the HQ button (`linked_hq_patch_spacing_um`
+in the project, 1000 by default) trades patch density for speed without
+touching the 5 mm remainder or exports. At 2 mm or 3 mm the 1 mm scan keeps
+one in four or one in nine of the points inside the union, selected by a fixed
+hash of each point's source index (`PointCloudSubsetDecimationKeeps`) so the
+pattern is uniform, stable between launches and independent of scan threading.
+The patch declares that nominal spacing together with its exact kept/scanned
+counts, so `ResolvePointCloudDensityCompensation` yields footprint 2 or 3 with
+coverage 1 — the same rule that keeps the 5 mm display bundle at 1 mm
+brightness. Changing the spacing rescans the sources and re-enables a live HQ
+view when the new patches publish. On `Proj_A_09S01`/`Proj_B_09S01` the 2 mm
+patch holds 10.6 M points and adds roughly a third to the 5 mm frame time
+instead of tripling it. All fields already
 referenced by saved Visuals and Timing Takes load during extraction. Ordered
 source indices allow a newly referenced scalar field to be gathered later in
 the background without retaining the complete 1 mm source cloud.
