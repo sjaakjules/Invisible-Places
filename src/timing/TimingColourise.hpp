@@ -209,6 +209,15 @@ struct TimingColouriseSettingsKeySpan {
     float end = 0.0F;
 };
 
+// The same derived clip on the whole-loop circle: start is a canonical
+// [0, 1) phase and length a forward cycle fraction, so a clip that straddles
+// loop zero (start 0.90, length 0.15) stays one contiguous interval instead
+// of flipping into its complement. Never serialized.
+struct TimingColouriseCyclicSettingsKeySpan {
+    float start = 0.0F;
+    float length = 0.0F;
+};
+
 // Remembered bounds authoring for one scalar field selector, so switching a
 // Visual Feature between families/variants and back never loses edits. An
 // unedited entry keeps following the latest globally edited bounds for its
@@ -738,6 +747,30 @@ TimingColouriseEffectSettingsKeySpan(
     TimingColouriseEffect* effect,
     TimingColouriseSettingsKeySpan source,
     TimingColouriseSettingsKeySpan destination);
+// Canonicalises a whole-loop phase into [0, 1): 1.0 wraps to 0.0 because loop
+// zero and loop one are the same cyclic instant. Non-finite input maps to 0.
+[[nodiscard]] float WrapTimingColouriseLoopPosition(float position);
+// Shortest distance around the loop between two wrapped phases, so 0.0 and
+// 1.0 are coincident and 0.05 sits 0.10 from 0.95.
+[[nodiscard]] float TimingColouriseCyclicKeyDistance(float a, float b);
+// Cyclic counterpart of TimingColouriseEffectSettingsKeySpan. The clip is the
+// complement of the largest circular gap between owned keys, so keys that
+// were dragged across loop zero remain one clip. When the wrap gap ties the
+// largest interior gap the canonical min..max span wins, which keeps every
+// non-wrapping layout identical to the linear span.
+[[nodiscard]] std::optional<TimingColouriseCyclicSettingsKeySpan>
+TimingColouriseEffectCyclicSettingsKeySpan(
+    const TimingColouriseEffect& effect);
+// Cyclic counterpart of TransformTimingColouriseEffectSettingsKeys: every
+// key is unwrapped relative to source.start, affinely mapped onto destination
+// (whose start may be any finite real), and wrapped back into [0, 1). Keys
+// outside the forward source span, a point/non-point mismatch, a length
+// above one cycle, or a same-lane collision measured around the loop reject
+// the whole operation without mutation.
+[[nodiscard]] bool TransformTimingColouriseEffectSettingsKeysCyclic(
+    TimingColouriseEffect* effect,
+    TimingColouriseCyclicSettingsKeySpan source,
+    TimingColouriseCyclicSettingsKeySpan destination);
 [[nodiscard]] TimingColouriseEffect SanitizeTimingColouriseEffect(
     TimingColouriseEffect effect);
 [[nodiscard]] TimingColourisePaletteDefinition

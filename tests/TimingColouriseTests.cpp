@@ -11,6 +11,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <limits>
 #include <string>
 #include <utility>
@@ -456,6 +457,14 @@ TEST_CASE(
     REQUIRE(span.has_value());
     CHECK(span->start == Approx(0.05F));
     CHECK(span->end == Approx(0.95F));
+    // On the loop the 0.40 -> 0.70 hole (0.30) is wider than the wrap gap
+    // (0.10), so the cyclic clip is the 0.70 -> 0.40 cluster rather than
+    // the linear min..max; the same keys are covered either way.
+    const auto cyclicSpan = invisible_places::timing::
+        TimingColouriseEffectCyclicSettingsKeySpan(effect);
+    REQUIRE(cyclicSpan.has_value());
+    CHECK(cyclicSpan->start == Approx(0.70F));
+    CHECK(cyclicSpan->length == Approx(0.70F));
 
     const auto activationBefore = effect.activationRange;
     REQUIRE(invisible_places::timing::
@@ -550,6 +559,11 @@ TEST_CASE(
         REQUIRE(span.has_value());
         CHECK(span->start == Approx(0.4F));
         CHECK(span->end == Approx(0.4F));
+        const auto cyclicSpan = invisible_places::timing::
+            TimingColouriseEffectCyclicSettingsKeySpan(effect);
+        REQUIRE(cyclicSpan.has_value());
+        CHECK(cyclicSpan->start == Approx(0.4F));
+        CHECK(cyclicSpan->length == Approx(0.0F));
         REQUIRE(invisible_places::timing::
                     TransformTimingColouriseEffectSettingsKeys(
                         &effect,
@@ -747,6 +761,532 @@ TEST_CASE(
               Approx(before.front().position));
         CHECK(effect.paletteKeys.back().position ==
               Approx(before.back().position));
+    }
+}
+
+TEST_CASE(
+    "WrapTimingColouriseLoopPosition canonicalises to [0,1)",
+    "[timing][colourise][cyclic]") {
+    using invisible_places::timing::WrapTimingColouriseLoopPosition;
+    CHECK(WrapTimingColouriseLoopPosition(0.0F) == 0.0F);
+    CHECK(WrapTimingColouriseLoopPosition(1.0F) == 0.0F);
+    CHECK(WrapTimingColouriseLoopPosition(-0.25F) == Approx(0.75F));
+    CHECK(WrapTimingColouriseLoopPosition(1.3F) == Approx(0.3F));
+    CHECK(WrapTimingColouriseLoopPosition(2.0F) == 0.0F);
+    CHECK(WrapTimingColouriseLoopPosition(0.999F) == Approx(0.999F));
+    CHECK(WrapTimingColouriseLoopPosition(
+              std::numeric_limits<float>::quiet_NaN()) == 0.0F);
+    CHECK(WrapTimingColouriseLoopPosition(
+              std::numeric_limits<float>::infinity()) == 0.0F);
+}
+
+TEST_CASE(
+    "TimingColouriseCyclicKeyDistance is symmetric and seam aware",
+    "[timing][colourise][cyclic]") {
+    using invisible_places::timing::TimingColouriseCyclicKeyDistance;
+    CHECK(TimingColouriseCyclicKeyDistance(0.0F, 1.0F) == 0.0F);
+    CHECK(TimingColouriseCyclicKeyDistance(1.0F, 0.0F) == 0.0F);
+    CHECK(TimingColouriseCyclicKeyDistance(0.0F, 0.5F) == Approx(0.5F));
+    CHECK(TimingColouriseCyclicKeyDistance(0.95F, 0.05F) == Approx(0.1F));
+    CHECK(TimingColouriseCyclicKeyDistance(0.05F, 0.95F) == Approx(0.1F));
+    CHECK(TimingColouriseCyclicKeyDistance(0.2F, 0.3F) == Approx(0.1F));
+    CHECK(TimingColouriseCyclicKeyDistance(0.3F, 0.2F) == Approx(0.1F));
+    // Unwrapped arguments are canonicalised first.
+    CHECK(TimingColouriseCyclicKeyDistance(-0.05F, 0.05F) == Approx(0.1F));
+    CHECK(TimingColouriseCyclicKeyDistance(1.25F, 0.25F) == Approx(0.0F));
+}
+
+namespace {
+
+TimingColouriseEffect EmissiveKeysAt(std::initializer_list<float> positions) {
+    TimingColouriseEffect effect;
+    effect.emissiveEnabled = true;
+    for (const float position : positions) {
+        effect.effectParameterKeys.push_back(
+            {.parameter = TimingColouriseEffectParameter::EmissiveLevel,
+             .position = position,
+             .value = position});
+    }
+    return effect;
+}
+
+}  // namespace
+
+TEST_CASE(
+    "Timing Colourise cyclic settings span picks the cluster, not its "
+    "complement",
+    "[timing][colourise][cyclic][settings-clip]") {
+    using invisible_places::timing::TimingColouriseEffectCyclicSettingsKeySpan;
+    using invisible_places::timing::TimingColouriseEffectSettingsKeySpan;
+    using invisible_places::timing::TimingColouriseFieldBoundsMemory;
+    using invisible_places::timing::TimingColouriseFieldSelector;
+    using invisible_places::timing::TimingColouriseFieldSource;
+
+    SECTION("a cluster straddling loop zero is one clip") {
+        const auto span = TimingColouriseEffectCyclicSettingsKeySpan(
+            EmissiveKeysAt({0.90F, 0.95F, 0.05F}));
+        REQUIRE(span.has_value());
+        CHECK(span->start == Approx(0.90F));
+        CHECK(span->length == Approx(0.15F));
+        // The linear span would report the complement.
+        const auto linear = TimingColouriseEffectSettingsKeySpan(
+            EmissiveKeysAt({0.90F, 0.95F, 0.05F}));
+        REQUIRE(linear.has_value());
+        CHECK(linear->start == Approx(0.05F));
+        CHECK(linear->end == Approx(0.95F));
+    }
+
+    SECTION("two keys closer across the seam than inside the loop") {
+        const auto span = TimingColouriseEffectCyclicSettingsKeySpan(
+            EmissiveKeysAt({0.05F, 0.90F}));
+        REQUIRE(span.has_value());
+        CHECK(span->start == Approx(0.90F));
+        CHECK(span->length == Approx(0.15F));
+    }
+
+    SECTION("a tie resolves to the canonical linear span") {
+        const auto effect = EmissiveKeysAt({0.25F, 0.75F});
+        const auto span = TimingColouriseEffectCyclicSettingsKeySpan(effect);
+        const auto linear = TimingColouriseEffectSettingsKeySpan(effect);
+        REQUIRE(span.has_value());
+        REQUIRE(linear.has_value());
+        CHECK(span->start == Approx(0.25F));
+        CHECK(span->length == Approx(0.50F));
+        CHECK(span->start == Approx(linear->start));
+        CHECK(span->length == Approx(linear->end - linear->start));
+    }
+
+    SECTION("a single key is a zero-length clip") {
+        const auto span = TimingColouriseEffectCyclicSettingsKeySpan(
+            EmissiveKeysAt({0.6F}));
+        REQUIRE(span.has_value());
+        CHECK(span->start == Approx(0.6F));
+        CHECK(span->length == 0.0F);
+    }
+
+    SECTION("loop one is loop zero") {
+        // 0.0 and 1.0 coalesce to a single instant, so the clip is the
+        // 0.9 -> 0.0 cluster rather than a full loop.
+        const auto span = TimingColouriseEffectCyclicSettingsKeySpan(
+            EmissiveKeysAt({0.0F, 0.9F, 1.0F}));
+        REQUIRE(span.has_value());
+        CHECK(span->start == Approx(0.9F));
+        CHECK(span->length == Approx(0.1F));
+    }
+
+    SECTION("no keys means no clip") {
+        CHECK_FALSE(TimingColouriseEffectCyclicSettingsKeySpan(
+                        TimingColouriseEffect{})
+                        .has_value());
+    }
+
+    SECTION("remembered field keys participate, the current cache does not") {
+        TimingColouriseEffect effect;
+        effect.field = TimingColouriseFieldSelector{
+            .source = TimingColouriseFieldSource::Scalar,
+            .scalarFieldName = "current",
+        };
+        effect.boundsKeys = {
+            {.position = 0.92F,
+             .bounds = {.lower = -2.0F, .upper = 2.0F}},
+        };
+        TimingColouriseFieldBoundsMemory currentCache;
+        currentCache.selector = effect.field;
+        // A stale cache entry at 0.5 must not widen the clip.
+        currentCache.boundsParameterKeys = {
+            {.parameter = TimingColouriseBoundsParameter::Lower,
+             .position = 0.5F,
+             .value = -99.0F},
+        };
+        TimingColouriseFieldBoundsMemory remembered;
+        remembered.selector = TimingColouriseFieldSelector{
+            .source = TimingColouriseFieldSource::Scalar,
+            .scalarFieldName = "remembered",
+        };
+        remembered.boundsParameterKeys = {
+            {.parameter = TimingColouriseBoundsParameter::Upper,
+             .position = 0.04F,
+             .value = 4.0F},
+        };
+        effect.fieldBoundsMemory = {currentCache, remembered};
+
+        const auto span = TimingColouriseEffectCyclicSettingsKeySpan(effect);
+        REQUIRE(span.has_value());
+        CHECK(span->start == Approx(0.92F));
+        CHECK(span->length == Approx(0.12F));
+    }
+}
+
+TEST_CASE(
+    "Timing Colourise cyclic settings transform translates through loop zero",
+    "[timing][colourise][cyclic][settings-clip]") {
+    using invisible_places::timing::TimingColouriseCyclicSettingsKeySpan;
+    using invisible_places::timing::TimingColouriseFieldBoundsMemory;
+    using invisible_places::timing::TimingColouriseFieldSelector;
+    using invisible_places::timing::TimingColouriseFieldSource;
+    using invisible_places::timing::
+        TransformTimingColouriseEffectSettingsKeysCyclic;
+
+    TimingColouriseEffect effect;
+    effect.activationRange = {.start = 0.25F, .end = 0.75F};
+    effect.colouriseEnabled = true;
+    effect.emissiveEnabled = true;
+    effect.field = TimingColouriseFieldSelector{
+        .source = TimingColouriseFieldSource::Scalar,
+        .scalarFieldName = "current",
+    };
+    effect.basePalette.stops = {{.id = "tracked", .position = 0.5F}};
+    effect.effectParameterKeys = {
+        {.parameter = TimingColouriseEffectParameter::EmissiveLevel,
+         .position = 0.80F,
+         .value = 0.2F,
+         .interpolation = WaterScenarioInterpolation::Hold},
+        {.parameter = TimingColouriseEffectParameter::EmissiveLevel,
+         .position = 0.95F,
+         .value = 2.0F},
+    };
+    effect.paletteStopParameterKeys = {
+        {.stopId = "tracked",
+         .parameter =
+             TimingColourisePaletteStopParameter::ColouriseAmount,
+         .position = 0.95F,
+         .scalarValue = 0.6F},
+    };
+    effect.boundsParameterKeys = {
+        {.parameter = TimingColouriseBoundsParameter::Lower,
+         .position = 0.80F,
+         .value = -1.0F},
+    };
+    TimingColouriseFieldBoundsMemory remembered;
+    remembered.selector = TimingColouriseFieldSelector{
+        .source = TimingColouriseFieldSource::Scalar,
+        .scalarFieldName = "remembered",
+    };
+    remembered.boundsParameterKeys = {
+        {.parameter = TimingColouriseBoundsParameter::Upper,
+         .position = 0.95F,
+         .value = 4.0F},
+    };
+    effect.fieldBoundsMemory = {remembered};
+    const auto original = effect;
+
+    REQUIRE(TransformTimingColouriseEffectSettingsKeysCyclic(
+        &effect,
+        TimingColouriseCyclicSettingsKeySpan{.start = 0.80F, .length = 0.15F},
+        TimingColouriseCyclicSettingsKeySpan{.start = 0.90F, .length = 0.15F}));
+
+    CHECK(effect.activationRange.start == Approx(0.25F));
+    CHECK(effect.activationRange.end == Approx(0.75F));
+    // Tracks are re-sorted, so the wrapped 0.95 key (now 0.05) leads.
+    REQUIRE(effect.effectParameterKeys.size() == 2U);
+    CHECK(effect.effectParameterKeys[0U].position == Approx(0.05F));
+    CHECK(effect.effectParameterKeys[0U].value == Approx(2.0F));
+    CHECK(effect.effectParameterKeys[1U].position == Approx(0.90F));
+    CHECK(effect.effectParameterKeys[1U].value == Approx(0.2F));
+    CHECK(effect.effectParameterKeys[1U].interpolation ==
+          WaterScenarioInterpolation::Hold);
+    REQUIRE(effect.paletteStopParameterKeys.size() == 1U);
+    CHECK(effect.paletteStopParameterKeys.front().position ==
+          Approx(0.05F));
+    CHECK(effect.paletteStopParameterKeys.front().scalarValue ==
+          Approx(0.6F));
+    REQUIRE(effect.boundsParameterKeys.size() == 1U);
+    CHECK(effect.boundsParameterKeys.front().position == Approx(0.90F));
+    REQUIRE(effect.fieldBoundsMemory.size() == 1U);
+    REQUIRE(effect.fieldBoundsMemory.front().boundsParameterKeys.size() ==
+            1U);
+    CHECK(effect.fieldBoundsMemory.front()
+              .boundsParameterKeys.front()
+              .position == Approx(0.05F));
+    for (const auto& key : effect.effectParameterKeys) {
+        CHECK(key.position >= 0.0F);
+        CHECK(key.position < 1.0F);
+    }
+
+    // The derived cyclic clip follows the keys across the seam.
+    const auto span = invisible_places::timing::
+        TimingColouriseEffectCyclicSettingsKeySpan(effect);
+    REQUIRE(span.has_value());
+    CHECK(span->start == Approx(0.90F));
+    CHECK(span->length == Approx(0.15F));
+
+    // Dragging back restores the original layout.
+    REQUIRE(TransformTimingColouriseEffectSettingsKeysCyclic(
+        &effect,
+        *span,
+        TimingColouriseCyclicSettingsKeySpan{.start = 0.80F, .length = 0.15F}));
+    REQUIRE(effect.effectParameterKeys.size() == 2U);
+    CHECK(effect.effectParameterKeys[0U].position == Approx(0.80F));
+    CHECK(effect.effectParameterKeys[0U].value == Approx(0.2F));
+    CHECK(effect.effectParameterKeys[1U].position == Approx(0.95F));
+    CHECK(effect.effectParameterKeys[1U].value == Approx(2.0F));
+    CHECK(effect.paletteStopParameterKeys.front().position ==
+          Approx(0.95F));
+    CHECK(effect.boundsParameterKeys.front().position == Approx(0.80F));
+    CHECK(effect.fieldBoundsMemory.front()
+              .boundsParameterKeys.front()
+              .position == Approx(0.95F));
+
+    // A negative destination start is just a phase before loop zero.
+    REQUIRE(TransformTimingColouriseEffectSettingsKeysCyclic(
+        &effect,
+        TimingColouriseCyclicSettingsKeySpan{.start = 0.80F, .length = 0.15F},
+        TimingColouriseCyclicSettingsKeySpan{.start = -0.05F, .length = 0.15F}));
+    REQUIRE(effect.effectParameterKeys.size() == 2U);
+    CHECK(effect.effectParameterKeys[0U].position == Approx(0.10F));
+    CHECK(effect.effectParameterKeys[1U].position == Approx(0.95F));
+    CHECK(effect.effectParameterKeys[1U].value == Approx(0.2F));
+    (void)original;
+}
+
+TEST_CASE(
+    "Timing Colourise cyclic settings transform stretches a span that "
+    "crosses the seam",
+    "[timing][colourise][cyclic][settings-clip]") {
+    using invisible_places::timing::TimingColouriseCyclicSettingsKeySpan;
+    using invisible_places::timing::
+        TransformTimingColouriseEffectSettingsKeysCyclic;
+
+    SECTION("stretching keeps the relative layout across loop zero") {
+        // 1.0 is the loop origin seen from the end of the cycle.
+        auto effect = EmissiveKeysAt({0.90F, 1.00F, 0.10F});
+        REQUIRE(TransformTimingColouriseEffectSettingsKeysCyclic(
+            &effect,
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.90F, .length = 0.20F},
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.90F, .length = 0.40F}));
+        REQUIRE(effect.effectParameterKeys.size() == 3U);
+        CHECK(effect.effectParameterKeys[0U].position == Approx(0.10F));
+        CHECK(effect.effectParameterKeys[0U].value == Approx(1.00F));
+        CHECK(effect.effectParameterKeys[1U].position == Approx(0.30F));
+        CHECK(effect.effectParameterKeys[1U].value == Approx(0.10F));
+        CHECK(effect.effectParameterKeys[2U].position == Approx(0.90F));
+        CHECK(effect.effectParameterKeys[2U].value == Approx(0.90F));
+    }
+
+    SECTION("a point source cannot stretch") {
+        auto effect = EmissiveKeysAt({0.95F});
+        const auto before = effect.effectParameterKeys;
+        CHECK_FALSE(TransformTimingColouriseEffectSettingsKeysCyclic(
+            &effect,
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.95F, .length = 0.0F},
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.95F, .length = 0.2F}));
+        CHECK_FALSE(TransformTimingColouriseEffectSettingsKeysCyclic(
+            &effect,
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.90F, .length = 0.1F},
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.20F, .length = 0.0F}));
+        REQUIRE(effect.effectParameterKeys.size() == 1U);
+        CHECK(effect.effectParameterKeys.front().position ==
+              Approx(before.front().position));
+        // A point translates freely, including across the seam.
+        REQUIRE(TransformTimingColouriseEffectSettingsKeysCyclic(
+            &effect,
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.95F, .length = 0.0F},
+            TimingColouriseCyclicSettingsKeySpan{.start = 1.05F, .length = 0.0F}));
+        CHECK(effect.effectParameterKeys.front().position == Approx(0.05F));
+    }
+
+    SECTION("more than one loop is rejected") {
+        auto effect = EmissiveKeysAt({0.90F, 0.10F});
+        const auto before = effect.effectParameterKeys;
+        CHECK_FALSE(TransformTimingColouriseEffectSettingsKeysCyclic(
+            &effect,
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.90F, .length = 0.2F},
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.90F, .length = 1.2F}));
+        CHECK_FALSE(TransformTimingColouriseEffectSettingsKeysCyclic(
+            &effect,
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.90F, .length = 1.2F},
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.90F, .length = 0.2F}));
+        CHECK(effect.effectParameterKeys[0U].position ==
+              Approx(before[0U].position));
+        CHECK(effect.effectParameterKeys[1U].position ==
+              Approx(before[1U].position));
+    }
+
+    SECTION("a key outside the forward source span rejects without mutation") {
+        auto effect = EmissiveKeysAt({0.90F, 0.10F, 0.50F});
+        effect.paletteKeys = {
+            {.position = 0.95F, .palette = Solid({0.1F, 0.2F, 0.3F})},
+        };
+        effect.activationRange = {.start = 0.1F, .end = 0.9F};
+        const auto before = effect;
+        CHECK_FALSE(TransformTimingColouriseEffectSettingsKeysCyclic(
+            &effect,
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.90F, .length = 0.2F},
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.80F, .length = 0.2F}));
+        REQUIRE(effect.effectParameterKeys.size() ==
+                before.effectParameterKeys.size());
+        for (std::size_t index = 0U;
+             index < effect.effectParameterKeys.size();
+             ++index) {
+            CHECK(effect.effectParameterKeys[index].position ==
+                  before.effectParameterKeys[index].position);
+            CHECK(effect.effectParameterKeys[index].value ==
+                  before.effectParameterKeys[index].value);
+        }
+        REQUIRE(effect.paletteKeys.size() == 1U);
+        CHECK(effect.paletteKeys.front().position ==
+              before.paletteKeys.front().position);
+        CHECK(effect.activationRange.start == before.activationRange.start);
+        CHECK(effect.activationRange.end == before.activationRange.end);
+    }
+}
+
+TEST_CASE(
+    "Timing Colourise cyclic settings transform rejects cross-seam lane "
+    "collisions",
+    "[timing][colourise][cyclic][settings-clip]") {
+    using invisible_places::timing::TimingColouriseCyclicSettingsKeySpan;
+    using invisible_places::timing::
+        TransformTimingColouriseEffectSettingsKeysCyclic;
+
+    SECTION("a key wrapping onto a same-lane key is a collision") {
+        auto effect = EmissiveKeysAt({0.00F, 0.50F});
+        const auto before = effect.effectParameterKeys;
+        // Stretching the pair to a full loop puts the 0.50 key at 1.0, which
+        // cyclic evaluation coalesces with the key at 0.0.
+        CHECK_FALSE(TransformTimingColouriseEffectSettingsKeysCyclic(
+            &effect,
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.0F, .length = 0.5F},
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.0F, .length = 1.0F}));
+        // Translating by half a loop merely swaps the two instants.
+        REQUIRE(TransformTimingColouriseEffectSettingsKeysCyclic(
+            &effect,
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.0F, .length = 0.5F},
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.5F, .length = 0.5F}));
+        REQUIRE(effect.effectParameterKeys.size() == 2U);
+        CHECK(effect.effectParameterKeys[0U].position == Approx(0.0F));
+        CHECK(effect.effectParameterKeys[0U].value == Approx(0.5F));
+        CHECK(effect.effectParameterKeys[1U].position == Approx(0.5F));
+        CHECK(effect.effectParameterKeys[1U].value == Approx(0.0F));
+        REQUIRE(TransformTimingColouriseEffectSettingsKeysCyclic(
+            &effect,
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.5F, .length = 0.5F},
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.0F, .length = 0.5F}));
+        REQUIRE(effect.effectParameterKeys.size() == 2U);
+        CHECK(effect.effectParameterKeys[0U].position ==
+              before[0U].position);
+        CHECK(effect.effectParameterKeys[1U].position ==
+              before[1U].position);
+    }
+
+    SECTION("different lanes may share a wrapped instant") {
+        TimingColouriseEffect effect;
+        effect.colouriseEnabled = true;
+        effect.emissiveEnabled = true;
+        effect.effectParameterKeys = {
+            {.parameter = TimingColouriseEffectParameter::EmissiveLevel,
+             .position = 0.0F,
+             .value = 1.0F},
+            {.parameter = TimingColouriseEffectParameter::PalettePhase,
+             .position = 0.5F,
+             .value = 0.25F},
+        };
+        REQUIRE(TransformTimingColouriseEffectSettingsKeysCyclic(
+            &effect,
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.0F, .length = 0.5F},
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.0F, .length = 1.0F}));
+        REQUIRE(effect.effectParameterKeys.size() == 2U);
+        for (const auto& key : effect.effectParameterKeys) {
+            CHECK(key.position == Approx(0.0F).margin(1.0e-6F));
+        }
+    }
+
+    SECTION("the distance helper treats loop one as loop zero") {
+        using invisible_places::timing::TimingColouriseCyclicKeyDistance;
+        CHECK(TimingColouriseCyclicKeyDistance(1.0F, 0.0F) == 0.0F);
+        CHECK(TimingColouriseCyclicKeyDistance(0.0F, 0.5F) == Approx(0.5F));
+    }
+}
+
+TEST_CASE(
+    "Timing Colourise cyclic translate preserves cyclic evaluation",
+    "[timing][colourise][cyclic][settings-clip]") {
+    using invisible_places::timing::EvaluateTimingColouriseEffectParameter;
+    using invisible_places::timing::EvaluateTimingEmissiveLevel;
+    using invisible_places::timing::TimingColouriseCyclicSettingsKeySpan;
+    using invisible_places::timing::
+        TransformTimingColouriseEffectSettingsKeysCyclic;
+
+    SECTION("emissive level shifts by exactly the translation") {
+        // Same fixture as the 'interpolates through loop zero' test.
+        TimingColouriseEffect original;
+        original.emissiveEnabled = true;
+        original.emissiveLevel = 0.0F;
+        original.effectParameterKeys = {
+            {.parameter = TimingColouriseEffectParameter::EmissiveLevel,
+             .position = 0.25F,
+             .value = 0.0F,
+             .interpolation = WaterScenarioInterpolation::Smooth},
+            {.parameter = TimingColouriseEffectParameter::EmissiveLevel,
+             .position = 0.75F,
+             .value = 1.0F,
+             .interpolation = WaterScenarioInterpolation::Smooth},
+        };
+        auto effect = original;
+        REQUIRE(TransformTimingColouriseEffectSettingsKeysCyclic(
+            &effect,
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.25F, .length = 0.5F},
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.75F, .length = 0.5F}));
+        REQUIRE(effect.effectParameterKeys.size() == 2U);
+        CHECK(effect.effectParameterKeys[0U].position == Approx(0.25F));
+        CHECK(effect.effectParameterKeys[0U].value == Approx(1.0F));
+        CHECK(effect.effectParameterKeys[1U].position == Approx(0.75F));
+        CHECK(effect.effectParameterKeys[1U].value == Approx(0.0F));
+        for (const float t : {0.0F, 0.1F, 0.5F, 0.9F, 1.0F}) {
+            CHECK(EvaluateTimingEmissiveLevel(effect, t, true) ==
+                  Approx(EvaluateTimingEmissiveLevel(
+                      original,
+                      t - 0.5F,
+                      true)));
+        }
+    }
+
+    SECTION("palette phase deltas travel with their keys and re-accumulate") {
+        // Palette Phase is delta-encoded and accumulated in sorted order, so
+        // a key that wraps past its neighbour changes which delta is applied
+        // first. This is the same behaviour as dragging a key past another
+        // in unlinked mode; the test documents it rather than a shift
+        // identity, which does not hold for accumulated deltas.
+        TimingColouriseEffect original;
+        original.colouriseEnabled = true;
+        original.palettePhaseOffset = 0.0F;
+        original.effectParameterKeys = {
+            {.parameter = TimingColouriseEffectParameter::PalettePhase,
+             .position = 0.25F,
+             .value = 0.1F,
+             .interpolation = WaterScenarioInterpolation::Hold},
+            {.parameter = TimingColouriseEffectParameter::PalettePhase,
+             .position = 0.75F,
+             .value = 0.3F,
+             .interpolation = WaterScenarioInterpolation::Hold},
+        };
+        auto effect = original;
+        REQUIRE(TransformTimingColouriseEffectSettingsKeysCyclic(
+            &effect,
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.25F, .length = 0.5F},
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.75F, .length = 0.5F}));
+        REQUIRE(effect.effectParameterKeys.size() == 2U);
+        CHECK(effect.effectParameterKeys[0U].position == Approx(0.25F));
+        CHECK(effect.effectParameterKeys[0U].value == Approx(0.3F));
+        CHECK(effect.effectParameterKeys[1U].position == Approx(0.75F));
+        CHECK(effect.effectParameterKeys[1U].value == Approx(0.1F));
+        const auto phaseAt = [](const TimingColouriseEffect& candidate,
+                                float t) {
+            return EvaluateTimingColouriseEffectParameter(
+                candidate,
+                TimingColouriseEffectParameter::PalettePhase,
+                t,
+                true);
+        };
+        // Before: 0.25 -> 0.1, 0.75 -> 0.4. After the wrap the 0.3 delta
+        // accumulates first: 0.25 -> 0.3, 0.75 -> 0.4.
+        CHECK(phaseAt(original, 0.25F) == Approx(0.1F));
+        CHECK(phaseAt(original, 0.75F) == Approx(0.4F));
+        CHECK(phaseAt(effect, 0.25F) == Approx(0.3F));
+        CHECK(phaseAt(effect, 0.75F) == Approx(0.4F));
+        // The full-cycle turn is unchanged by the re-ordering.
+        CHECK(phaseAt(effect, 0.75F) - original.palettePhaseOffset ==
+              Approx(0.4F));
     }
 }
 

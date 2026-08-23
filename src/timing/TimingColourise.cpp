@@ -3749,6 +3749,75 @@ bool TimingColouriseEffectSettingsKeysHaveNoLaneCollisions(
     return true;
 }
 
+template <typename Key, typename SameLane>
+bool TimingColouriseKeysHaveNoCyclicLaneCollisions(
+    const std::vector<Key>& keys,
+    SameLane sameLane) {
+    for (std::size_t left = 0U; left < keys.size(); ++left) {
+        for (std::size_t right = left + 1U;
+             right < keys.size();
+             ++right) {
+            if (sameLane(keys[left], keys[right]) &&
+                TimingColouriseCyclicKeyDistance(
+                    keys[left].position,
+                    keys[right].position) <=
+                    kTimingColouriseKeyTolerance) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Same lane rules as the linear check, but 0.0 and 1.0 count as one instant
+// because cyclic evaluation coalesces them before triplicating the keys.
+bool TimingColouriseEffectSettingsKeysHaveNoCyclicLaneCollisions(
+    const TimingColouriseEffect& effect) {
+    const auto sameSingleLane = [](const auto&, const auto&) {
+        return true;
+    };
+    if (!TimingColouriseKeysHaveNoCyclicLaneCollisions(
+            effect.paletteKeys,
+            sameSingleLane) ||
+        !TimingColouriseKeysHaveNoCyclicLaneCollisions(
+            effect.paletteStopParameterKeys,
+            [](const auto& left, const auto& right) {
+                return left.stopId == right.stopId &&
+                       left.parameter == right.parameter;
+            }) ||
+        !TimingColouriseKeysHaveNoCyclicLaneCollisions(
+            effect.effectParameterKeys,
+            [](const auto& left, const auto& right) {
+                return left.parameter == right.parameter;
+            }) ||
+        !TimingColouriseKeysHaveNoCyclicLaneCollisions(
+            effect.boundsKeys,
+            sameSingleLane) ||
+        !TimingColouriseKeysHaveNoCyclicLaneCollisions(
+            effect.boundsParameterKeys,
+            [](const auto& left, const auto& right) {
+                return left.parameter == right.parameter;
+            })) {
+        return false;
+    }
+    for (const auto& memory : effect.fieldBoundsMemory) {
+        if (IsCurrentTimingColouriseFieldMemory(effect, memory)) {
+            continue;
+        }
+        if (!TimingColouriseKeysHaveNoCyclicLaneCollisions(
+                memory.boundsKeys,
+                sameSingleLane) ||
+            !TimingColouriseKeysHaveNoCyclicLaneCollisions(
+                memory.boundsParameterKeys,
+                [](const auto& left, const auto& right) {
+                    return left.parameter == right.parameter;
+                })) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void SynchronizeCurrentTimingColouriseFieldMemory(
     TimingColouriseEffect* effect) {
     for (auto& memory : effect->fieldBoundsMemory) {
@@ -3963,6 +4032,165 @@ bool TransformTimingColouriseEffectSettingsKeys(
     // Bring an existing selected-field cache forward from the transformed
     // live tracks. Do not manufacture a cache for effects that never needed
     // one merely because their clip moved.
+    SynchronizeCurrentTimingColouriseFieldMemory(&candidate);
+    SortTimingColouriseEffectSettingsKeys(&candidate);
+    *effect = std::move(candidate);
+    return true;
+}
+
+float WrapTimingColouriseLoopPosition(float position) {
+    position = FiniteOr(position, 0.0F);
+    position -= std::floor(position);
+    return position >= 1.0F ? 0.0F : position;
+}
+
+float TimingColouriseCyclicKeyDistance(float a, float b) {
+    const float forward = std::abs(
+        WrapTimingColouriseLoopPosition(a) -
+        WrapTimingColouriseLoopPosition(b));
+    return std::min(forward, 1.0F - forward);
+}
+
+std::optional<TimingColouriseCyclicSettingsKeySpan>
+TimingColouriseEffectCyclicSettingsKeySpan(
+    const TimingColouriseEffect& effect) {
+    auto positions = TimingColouriseEffectSettingsKeyPositions(effect);
+    if (positions.empty()) {
+        return std::nullopt;
+    }
+    // The linear positions keep 1.0 distinct from 0.0; on the loop they are
+    // the same instant, so wrap and re-coalesce before measuring gaps.
+    for (auto& position : positions) {
+        position = WrapTimingColouriseLoopPosition(position);
+    }
+    std::sort(positions.begin(), positions.end());
+    std::vector<float> unique;
+    unique.reserve(positions.size());
+    for (const float position : positions) {
+        if (unique.empty() ||
+            TimingColouriseCyclicKeyDistance(unique.back(), position) >
+                kTimingColouriseKeyTolerance) {
+            unique.push_back(position);
+        }
+    }
+    if (unique.size() > 1U &&
+        TimingColouriseCyclicKeyDistance(unique.front(), unique.back()) <=
+            kTimingColouriseKeyTolerance) {
+        unique.pop_back();
+    }
+    if (unique.size() == 1U) {
+        return TimingColouriseCyclicSettingsKeySpan{
+            .start = unique.front(),
+            .length = 0.0F,
+        };
+    }
+
+    std::size_t largestInteriorGapIndex = 0U;
+    float largestInteriorGap = -1.0F;
+    for (std::size_t index = 0U; index + 1U < unique.size(); ++index) {
+        const float gap = unique[index + 1U] - unique[index];
+        if (gap > largestInteriorGap) {
+            largestInteriorGap = gap;
+            largestInteriorGapIndex = index;
+        }
+    }
+    const float wrapGap = unique.front() + 1.0F - unique.back();
+    // Ties (two keys half a loop apart, evenly spaced keys) resolve to the
+    // canonical min..max so the cyclic clip agrees with the linear one for
+    // every layout that does not actually straddle loop zero.
+    if (wrapGap >= largestInteriorGap - kTimingColouriseKeyTolerance) {
+        return TimingColouriseCyclicSettingsKeySpan{
+            .start = unique.front(),
+            .length = unique.back() - unique.front(),
+        };
+    }
+    return TimingColouriseCyclicSettingsKeySpan{
+        .start = unique[largestInteriorGapIndex + 1U],
+        .length = 1.0F - largestInteriorGap,
+    };
+}
+
+bool TransformTimingColouriseEffectSettingsKeysCyclic(
+    TimingColouriseEffect* effect,
+    TimingColouriseCyclicSettingsKeySpan source,
+    TimingColouriseCyclicSettingsKeySpan destination) {
+    if (effect == nullptr || !std::isfinite(source.start) ||
+        !std::isfinite(source.length) ||
+        !std::isfinite(destination.start) ||
+        !std::isfinite(destination.length) ||
+        source.length < -kTimingColouriseKeyTolerance ||
+        source.length > 1.0F + kTimingColouriseKeyTolerance ||
+        destination.length < -kTimingColouriseKeyTolerance ||
+        destination.length > 1.0F + kTimingColouriseKeyTolerance) {
+        return false;
+    }
+    source.length = Clamp01(source.length);
+    destination.length = Clamp01(destination.length);
+    const bool pointSource = source.length == 0.0F;
+    if (pointSource && destination.length != 0.0F) {
+        // One key time has no internal timing that can be stretched.
+        return false;
+    }
+    if (!pointSource && destination.length == 0.0F) {
+        return false;
+    }
+
+    TimingColouriseEffect candidate = *effect;
+    bool foundKey = false;
+    const auto mapKeys = [&](auto* keys) {
+        for (auto& key : *keys) {
+            foundKey = true;
+            if (!std::isfinite(key.position)) {
+                return false;
+            }
+            // Forward distance from the clip start; a key a hair before the
+            // start (u ~ 1) is the start key seen from the other side.
+            float u = WrapTimingColouriseLoopPosition(
+                key.position - source.start);
+            if (u >= 1.0F - kTimingColouriseKeyTolerance) {
+                u = 0.0F;
+            }
+            if (u > source.length + kTimingColouriseKeyTolerance) {
+                return false;
+            }
+            u = std::min(u, source.length);
+            const double remapped = pointSource
+                ? static_cast<double>(destination.start)
+                : static_cast<double>(destination.start) +
+                      static_cast<double>(u) /
+                          static_cast<double>(source.length) *
+                          static_cast<double>(destination.length);
+            if (!std::isfinite(remapped)) {
+                return false;
+            }
+            key.position = WrapTimingColouriseLoopPosition(
+                static_cast<float>(remapped));
+        }
+        return true;
+    };
+
+    if (!mapKeys(&candidate.effectParameterKeys) ||
+        !mapKeys(&candidate.paletteKeys) ||
+        !mapKeys(&candidate.paletteStopParameterKeys) ||
+        !mapKeys(&candidate.boundsParameterKeys) ||
+        !mapKeys(&candidate.boundsKeys)) {
+        return false;
+    }
+    for (auto& memory : candidate.fieldBoundsMemory) {
+        if (IsCurrentTimingColouriseFieldMemory(candidate, memory)) {
+            continue;
+        }
+        if (!mapKeys(&memory.boundsParameterKeys) ||
+            !mapKeys(&memory.boundsKeys)) {
+            return false;
+        }
+    }
+    if (!foundKey ||
+        !TimingColouriseEffectSettingsKeysHaveNoCyclicLaneCollisions(
+            candidate)) {
+        return false;
+    }
+
     SynchronizeCurrentTimingColouriseFieldMemory(&candidate);
     SortTimingColouriseEffectSettingsKeys(&candidate);
     *effect = std::move(candidate);
@@ -4956,12 +5184,6 @@ TimingColouriseLut ApplyTimingColourisePalettePhase(
 
 namespace {
 
-float WrapTimingLoopPosition(float position) {
-    position = FiniteOr(position, 0.0F);
-    position -= std::floor(position);
-    return position >= 1.0F ? 0.0F : position;
-}
-
 template <typename Key, typename SameTrack, typename TrackLess>
 void ExpandTimingKeysForCyclicEvaluation(
     std::vector<Key>* keys,
@@ -4971,7 +5193,7 @@ void ExpandTimingKeysForCyclicEvaluation(
         return;
     }
     for (auto& key : *keys) {
-        key.position = WrapTimingLoopPosition(key.position);
+        key.position = WrapTimingColouriseLoopPosition(key.position);
     }
     std::stable_sort(
         keys->begin(),
@@ -5124,7 +5346,7 @@ float EvaluateTimingColouriseEffectParameter(
         return 0.0F;
     }
     normalizedPosition = cyclic
-        ? WrapTimingLoopPosition(normalizedPosition)
+        ? WrapTimingColouriseLoopPosition(normalizedPosition)
         : Clamp01(normalizedPosition);
     return EvaluateEffectParameterTrack(
                sanitized.effectParameterKeys,
@@ -5187,7 +5409,7 @@ TimingColourisePalette EvaluateTimingColourisePalette(
         effect,
         cyclic);
     normalizedPosition = cyclic
-        ? WrapTimingLoopPosition(normalizedPosition)
+        ? WrapTimingColouriseLoopPosition(normalizedPosition)
         : Clamp01(normalizedPosition);
     return EvaluatePreparedTimingColourisePalette(
         prepared,
@@ -5202,7 +5424,7 @@ TimingColouriseLut EvaluateTimingColourisePaletteLut(
         effect,
         cyclic);
     normalizedPosition = cyclic
-        ? WrapTimingLoopPosition(normalizedPosition)
+        ? WrapTimingColouriseLoopPosition(normalizedPosition)
         : Clamp01(normalizedPosition);
     const auto evaluatedParameter =
         [&](TimingColouriseEffectParameter parameter) {
@@ -5272,7 +5494,7 @@ TimingColouriseBounds EvaluateTimingColouriseBounds(
         effect,
         cyclic);
     normalizedPosition = cyclic
-        ? WrapTimingLoopPosition(normalizedPosition)
+        ? WrapTimingColouriseLoopPosition(normalizedPosition)
         : Clamp01(normalizedPosition);
     const auto fallback = EvaluateLegacyTimingColouriseBounds(
         sanitized,
