@@ -5768,6 +5768,90 @@ TEST_CASE("Clip bounds synchronize as a cyclic covering arc",
     CHECK(clip->end == Approx(0.70F));
 }
 
+TEST_CASE("Unwrapped clip bounds never wrap during plain key edits",
+          "[water][timing][keyed][clips][cyclic]") {
+    using Catch::Approx;
+    using invisible_places::water::FindWaterFeatureClip;
+    using invisible_places::water::RemoveWaterSettingKeysAtPosition;
+    using invisible_places::water::SynchronizeWaterFeatureClipBounds;
+    using invisible_places::water::WaterClipContainsPosition;
+    using invisible_places::water::WaterFeatureTimeline;
+    using invisible_places::water::WaterKeyedFeatureKind;
+
+    WaterFeatureTimeline timeline;
+    timeline.feature = {
+        .kind = WaterKeyedFeatureKind::SeepageNode,
+        .objectId = 7U};
+    timeline.settings = {
+        {.settingId = "strength",
+         .keys = {
+             {.position = 0.20F, .value = 1.0F, .clipId = 3U},
+             {.position = 0.80F, .value = 0.0F, .clipId = 3U},
+         }},
+    };
+    timeline.clips = {{.id = 3U, .name = "On", .start = 0.2F, .end = 0.8F}};
+    timeline.clipMembershipExplicit = true;
+    auto& keys = timeline.settings.front().keys;
+
+    // Dragging the first key right (still left of the other) shrinks the
+    // clip from the left; the member nearest the old start is no longer the
+    // smallest key, which must not turn the clip into a wrapped one.
+    keys[0].position = 0.70F;
+    REQUIRE(SynchronizeWaterFeatureClipBounds(&timeline, 3U));
+    const auto* clip = FindWaterFeatureClip(&timeline, 3U);
+    REQUIRE(clip != nullptr);
+    CHECK(clip->start == Approx(0.70F));
+    CHECK(clip->end == Approx(0.80F));
+
+    // Reordering the keys (last key dragged ahead of the first) keeps the
+    // linear hull exactly as before W1.
+    keys[1].position = 0.10F;
+    REQUIRE(SynchronizeWaterFeatureClipBounds(&timeline, 3U));
+    clip = FindWaterFeatureClip(&timeline, 3U);
+    CHECK(clip->start == Approx(0.10F));
+    CHECK(clip->end == Approx(0.70F));
+
+    // Deleting the first of three members leaves the hull of the rest.
+    keys = {
+        {.position = 0.10F, .value = 1.0F, .clipId = 3U},
+        {.position = 0.50F, .value = 0.5F, .clipId = 3U},
+        {.position = 0.90F, .value = 0.0F, .clipId = 3U}};
+    timeline.clips.front().start = 0.10F;
+    timeline.clips.front().end = 0.90F;
+    REQUIRE(RemoveWaterSettingKeysAtPosition(&timeline.settings.front(), 0.10F) == 1U);
+    REQUIRE(SynchronizeWaterFeatureClipBounds(&timeline, 3U));
+    clip = FindWaterFeatureClip(&timeline, 3U);
+    CHECK(clip->start == Approx(0.50F));
+    CHECK(clip->end == Approx(0.90F));
+
+    // A wrapped clip measures its members relative to its own start: the
+    // tail key dragged back across the seam past the start extends the
+    // wrapped span (mirror of the unwrapped drag-extends rule) rather than
+    // re-anchoring the clip at whichever member is nearest the old start.
+    keys = {
+        {.position = 0.20F, .value = 0.0F, .clipId = 3U},
+        {.position = 0.90F, .value = 1.0F, .clipId = 3U}};
+    timeline.clips.front().start = 0.90F;
+    timeline.clips.front().end = 1.20F;
+    keys[0].position = 0.85F;
+    REQUIRE(SynchronizeWaterFeatureClipBounds(&timeline, 3U));
+    clip = FindWaterFeatureClip(&timeline, 3U);
+    CHECK(clip->start == Approx(0.90F));
+    CHECK(clip->end == Approx(1.85F));
+    CHECK(WaterClipContainsPosition(clip->start, clip->end, 0.85F));
+    CHECK(WaterClipContainsPosition(clip->start, clip->end, 0.90F));
+    // The head key dragged forward through the seam unwraps the clip.
+    keys = {
+        {.position = 0.10F, .value = 1.0F, .clipId = 3U},
+        {.position = 0.20F, .value = 0.0F, .clipId = 3U}};
+    timeline.clips.front().start = 0.90F;
+    timeline.clips.front().end = 1.20F;
+    REQUIRE(SynchronizeWaterFeatureClipBounds(&timeline, 3U));
+    clip = FindWaterFeatureClip(&timeline, 3U);
+    CHECK(clip->start == Approx(0.10F));
+    CHECK(clip->end == Approx(0.20F));
+}
+
 TEST_CASE("Wrapped clip transforms stay on the loop and refuse seam collisions",
           "[water][timing][keyed][clips][cyclic]") {
     using Catch::Approx;
@@ -5856,6 +5940,166 @@ TEST_CASE("Wrapped clip transforms stay on the loop and refuse seam collisions",
         0.9F,
         2.0F,
         /*allowWrap=*/true));
+}
+
+TEST_CASE("Wrapped clip transforms landing on phase 1 keep their end key",
+          "[water][timing][keyed][clips][cyclic]") {
+    using Catch::Approx;
+    using invisible_places::water::TransformWaterFeatureClip;
+    using invisible_places::water::TransformWaterFeatureClipSelection;
+    using invisible_places::water::WaterClipContainsPosition;
+    using invisible_places::water::WaterFeatureTimeline;
+    using invisible_places::water::WaterKeyedFeatureKind;
+
+    const auto everyMemberInsideItsClip =
+        [](const WaterFeatureTimeline& timeline) {
+            for (const auto& clip : timeline.clips) {
+                for (const auto& setting : timeline.settings) {
+                    for (const auto& key : setting.keys) {
+                        if (key.clipId == clip.id &&
+                            !WaterClipContainsPosition(
+                                clip.start,
+                                clip.end,
+                                key.position)) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            return true;
+        };
+
+    // A wrapped clip dragged so its end snaps onto the phase-0 marker
+    // becomes the unwrapped {0.4, 1}; its end key must be stored at 1, not
+    // wrapped to 0 where the unwrapped span would no longer contain it.
+    WaterFeatureTimeline timeline;
+    timeline.feature = {
+        .kind = WaterKeyedFeatureKind::SeepageNode,
+        .objectId = 7U};
+    timeline.settings = {
+        {.settingId = "strength",
+         .keys = {
+             {.position = 0.30F, .value = 0.0F, .clipId = 1U},
+             {.position = 0.70F, .value = 1.0F, .clipId = 1U},
+         }},
+    };
+    timeline.clips = {{.id = 1U, .name = "Wrap", .start = 0.7F, .end = 1.3F}};
+    timeline.clipMembershipExplicit = true;
+    REQUIRE(TransformWaterFeatureClip(
+        &timeline,
+        1U,
+        0.4F,
+        1.0F,
+        /*allowWrap=*/true));
+    CHECK(timeline.clips.front().start == Approx(0.4F));
+    CHECK(timeline.clips.front().end == Approx(1.0F));
+    REQUIRE(timeline.settings.front().keys.size() == 2U);
+    CHECK(timeline.settings.front().keys[0].position == Approx(0.4F));
+    CHECK(timeline.settings.front().keys[1].position == Approx(1.0F));
+    CHECK(everyMemberInsideItsClip(timeline));
+
+    // A group window straddling the seam moved so that one member clip
+    // ends exactly on phase 1 keeps that clip's end key at 1 too.
+    WaterFeatureTimeline group;
+    group.feature = {
+        .kind = WaterKeyedFeatureKind::SeepageNode,
+        .objectId = 8U};
+    group.settings = {
+        {.settingId = "strength",
+         .keys = {
+             {.position = 0.10F, .value = 0.0F, .clipId = 2U},
+             {.position = 0.30F, .value = 1.0F, .clipId = 2U},
+             {.position = 0.90F, .value = 0.0F, .clipId = 1U},
+         }},
+        {.settingId = "radius",
+         .keys = {
+             {.position = 0.10F, .value = 1.0F, .clipId = 1U},
+         }},
+    };
+    group.clips = {
+        {.id = 1U, .name = "A", .start = 0.9F, .end = 1.1F},
+        {.id = 2U, .name = "B", .start = 0.1F, .end = 0.3F}};
+    group.clipMembershipExplicit = true;
+    const std::array ids{1U, 2U};
+    REQUIRE(TransformWaterFeatureClipSelection(
+        &group,
+        ids,
+        0.9F,
+        1.3F,
+        0.8F,
+        1.2F,
+        /*allowWrap=*/true));
+    const auto* clipA = invisible_places::water::FindWaterFeatureClip(
+        &group,
+        1U);
+    REQUIRE(clipA != nullptr);
+    CHECK(clipA->start == Approx(0.8F));
+    CHECK(clipA->end == Approx(1.0F));
+    CHECK(group.settings[1].keys.front().position == Approx(1.0F));
+    CHECK(everyMemberInsideItsClip(group));
+}
+
+TEST_CASE("Full-length clips rotate on the loop unless keyed at both 0 and 1",
+          "[water][timing][keyed][clips][cyclic]") {
+    using Catch::Approx;
+    using invisible_places::water::CyclicWaterFeatureClipMoveSpan;
+    using invisible_places::water::TransformWaterFeatureClip;
+    using invisible_places::water::WaterFeatureTimeline;
+    using invisible_places::water::WaterKeyedFeatureKind;
+
+    WaterFeatureTimeline timeline;
+    timeline.feature = {
+        .kind = WaterKeyedFeatureKind::SeepageNode,
+        .objectId = 7U};
+    timeline.settings = {
+        {.settingId = "strength",
+         .keys = {
+             {.position = 0.00F, .value = 0.0F, .clipId = 1U},
+             {.position = 0.50F, .value = 1.0F, .clipId = 1U},
+         }},
+    };
+    timeline.clips = {{.id = 1U, .name = "Full", .start = 0.0F, .end = 1.0F}};
+    timeline.clipMembershipExplicit = true;
+
+    const auto span = CyclicWaterFeatureClipMoveSpan(0.0F, 1.0F, 0.3F);
+    REQUIRE(TransformWaterFeatureClip(
+        &timeline,
+        1U,
+        span.first,
+        span.second,
+        /*allowWrap=*/true));
+    // Bounds are always the member hull (Synchronize runs after every
+    // transform), so the rotated span settles on its keys at 0.3 and 0.8.
+    CHECK(timeline.clips.front().start == Approx(0.3F));
+    CHECK(timeline.clips.front().end == Approx(0.8F));
+    CHECK(timeline.settings.front().keys[0].position == Approx(0.3F));
+    CHECK(timeline.settings.front().keys[1].position == Approx(0.8F));
+
+    // Two stored keys at 0 and 1 share one loop phase; rotating them would
+    // collapse them onto a single time, so the transform refuses and the
+    // clip holds (documented at CyclicWaterFeatureClipMoveSpan).
+    WaterFeatureTimeline seamPair;
+    seamPair.feature = timeline.feature;
+    seamPair.settings = {
+        {.settingId = "strength",
+         .keys = {
+             {.position = 0.00F, .value = 0.0F, .clipId = 1U},
+             {.position = 0.50F, .value = 1.0F, .clipId = 1U},
+             {.position = 1.00F, .value = 0.0F, .clipId = 1U},
+         }},
+    };
+    seamPair.clips = {{.id = 1U, .name = "Full", .start = 0.0F, .end = 1.0F}};
+    seamPair.clipMembershipExplicit = true;
+    CHECK_FALSE(TransformWaterFeatureClip(
+        &seamPair,
+        1U,
+        span.first,
+        span.second,
+        /*allowWrap=*/true));
+    CHECK(seamPair.clips.front().start == Approx(0.0F));
+    CHECK(seamPair.clips.front().end == Approx(1.0F));
+    CHECK(seamPair.settings.front().keys[0].position == Approx(0.0F));
+    CHECK(seamPair.settings.front().keys[2].position == Approx(1.0F));
 }
 
 TEST_CASE("Wrapped clips capture, apply, duplicate, and transfer intact",

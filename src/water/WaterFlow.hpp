@@ -1084,12 +1084,14 @@ WaterFeatureLooseKeySpan(const WaterFeatureTimeline& timeline);
     std::span<const float> positions,
     float hintStart);
 
-// Recomputes one stored clip's bounds from its owned keys as a cyclic
-// covering arc. Two or more key times map exactly to the first/last key
-// (the arc starting at the member cyclically nearest the clip's current
-// start, so an unwrapped clip stays unwrapped and a wrapped one stays
-// wrapped); a single time keeps the minimum manipulable width around that
-// key, straddling phase 0 if needed. Empty clips retain their authored span.
+// Recomputes one stored clip's bounds from its owned keys. An unwrapped clip
+// takes the exact pre-W1 linear min/max of its members (so unlinked key
+// drags, reorders, and deletes never make it wrap); a wrapped clip takes the
+// hull of its members unwrapped relative to its current start (keys ahead
+// of the seam gain a cycle), so it stays wrapped while its keys move and
+// unwraps once every member sits on one side of phase 0. A single time
+// keeps the minimum manipulable width around that key, straddling phase 0
+// if needed. Empty clips retain their authored span.
 [[nodiscard]] bool SynchronizeWaterFeatureClipBounds(
     WaterFeatureTimeline* timeline,
     std::uint32_t clipId);
@@ -1140,9 +1142,14 @@ struct WaterFeatureSpanLimits {
 // Translates one clip/group window on the canonical cyclic 0..1 timeline
 // with period 1: the start rolls around phase 0 and the returned span is
 // {start in [0,1), start + length}, so a span crossing the loop origin is
-// returned wrapped (end > 1) rather than jumping to the other side. A
-// full-length clip rotates with its keys. Exact boundary placements are
-// stable until the pointer actually crosses them.
+// returned wrapped (end > 1) rather than jumping to the other side. Any
+// length rotates here, including a full-length span; the stored clip then
+// re-derives its bounds from its moved keys. A clip keyed at both 0 and 1
+// cannot rotate: those are two stored keys on a single loop phase, and
+// rotating them would collapse them onto one time, so
+// TransformWaterFeatureClipSelection refuses the move as a seam collision
+// and the drag holds in place. Exact boundary placements are stable until
+// the pointer actually crosses them.
 [[nodiscard]] std::pair<float, float> CyclicWaterFeatureClipMoveSpan(
     float rangeStart,
     float rangeEnd,

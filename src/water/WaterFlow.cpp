@@ -10726,9 +10726,12 @@ float CyclicWaterClipDistance(float left, float right) {
 // The affine map shared by every span operation. Positions inside the
 // source range land inside the destination window; the caller guarantees a
 // non-degenerate source span. A stored position ahead of a wrapped source
-// range's seam is unwrapped first. With wrap the result is stored back in
-// [0,1); without it the pre-W1 Clamp01 applies, which keeps every unlinked
-// transform bit-identical.
+// range's seam is unwrapped first. With wrap only a result past 1 rolls
+// back by one cycle; a result landing on 1 itself stays stored at 1, exactly
+// like the unlinked path, so a destination span that ends on phase 1 (an
+// unwrapped {start, 1}) still contains its own end key (a stored key at 0 is
+// not a member of an unwrapped clip ending at 1). Without wrap the pre-W1
+// Clamp01 applies, which keeps every unlinked transform bit-identical.
 float RemapWaterClipPosition(
     float position,
     float rangeStart,
@@ -10740,7 +10743,10 @@ float RemapWaterClipPosition(
     const float unwrapped = UnwrapWaterClipPosition(position, rangeStart);
     const float fraction = (unwrapped - rangeStart) / span;
     const float mapped = newStart + fraction * (newEnd - newStart);
-    return wrap ? WrapWaterClipPhase(mapped) : Clamp01(mapped);
+    if (wrap && mapped > 1.0F + kWaterClipKeyTolerance) {
+        return WrapWaterClipPhase(mapped - 1.0F);
+    }
+    return Clamp01(mapped);
 }
 
 // Same map in unwrapped coordinates (no wrap, no clamp); used where the
@@ -11009,7 +11015,38 @@ bool SynchronizeWaterFeatureClipBounds(
     if (positions.empty()) {
         return false;
     }
-    const auto arc = WaterFeatureClipCoveringArc(positions, clip->start);
+    // Bounds are the hull of the members on the clip's own coordinate line.
+    // An unwrapped clip keeps the exact pre-W1 linear min/max: plain key
+    // drags, reorders, and deletes in the unlinked view must never make a
+    // clip wrap, which the nearest-start covering arc did whenever the
+    // member nearest the old start was no longer the smallest key (drag
+    // 0.2 -> 0.7 inside {0.2,0.8} gave {0.7,1.7}). Only a clip that already
+    // wraps is measured cyclically: its members unwrap relative to the
+    // current start (keys ahead of the seam gain a cycle), so it stays
+    // wrapped while its keys move and unwraps naturally once every member
+    // sits on one side of phase 0. Transforms write the destination span
+    // before calling this, so a drag across the seam is already wrapped
+    // here and a drag back is already unwrapped.
+    std::pair<float, float> arc;
+    if (WaterClipIsWrapped(clip->start, clip->end)) {
+        const float anchor = WrapWaterClipPhase(clip->start);
+        arc = {std::numeric_limits<float>::infinity(),
+               -std::numeric_limits<float>::infinity()};
+        for (const float position : positions) {
+            const float unwrapped =
+                UnwrapWaterClipPosition(position, anchor);
+            arc.first = std::min(arc.first, unwrapped);
+            arc.second = std::max(arc.second, unwrapped);
+        }
+        if (arc.first >= 1.0F - kWaterFeatureClipPositionTolerance) {
+            arc.first -= 1.0F;
+            arc.second -= 1.0F;
+        }
+    } else {
+        const auto [lowest, highest] =
+            std::ranges::minmax_element(positions);
+        arc = {*lowest, *highest};
+    }
     if (arc.second - arc.first >= kWaterFeatureClipMinimumLength) {
         clip->start = arc.first;
         clip->end = arc.second;
