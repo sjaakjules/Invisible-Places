@@ -11259,13 +11259,61 @@ bool TransformWaterFeatureClipSelection(
             kWaterFeatureClipMinimumLength - kWaterClipKeyTolerance) {
         return false;
     }
+    // Two selected keys on one loop phase (the usual 0 and 1 of a clip
+    // authored on the plain rail, or a legacy full-rail clip) are a single
+    // cyclic instant: every destination maps them onto the same wrapped
+    // time, so the collision check below would refuse every move of such a
+    // clip and the drag would look stuck. Cyclic evaluation already wraps 1
+    // onto 0 and keeps the linear-later key of a coincident pair, so the
+    // same twin is coalesced away here (dropped keys are only erased once
+    // the transform is known to succeed).
+    std::vector<std::vector<bool>> dropped(timeline->settings.size());
+    if (allowWrap) {
+        for (std::size_t settingIndex = 0U;
+             settingIndex < timeline->settings.size();
+             ++settingIndex) {
+            const auto& keys = timeline->settings[settingIndex].keys;
+            auto& drop = dropped[settingIndex];
+            drop.assign(keys.size(), false);
+            for (std::size_t left = 0U; left < keys.size(); ++left) {
+                if (!keyMovesWithSelection(keys[left])) {
+                    continue;
+                }
+                for (std::size_t right = left + 1U;
+                     right < keys.size();
+                     ++right) {
+                    if (!keyMovesWithSelection(keys[right]) ||
+                        CyclicWaterClipDistance(
+                            keys[left].position,
+                            keys[right].position) >
+                            kWaterClipKeyTolerance) {
+                        continue;
+                    }
+                    const bool leftEarlier =
+                        keys[left].position <= keys[right].position;
+                    drop[leftEarlier ? left : right] = true;
+                }
+            }
+        }
+    }
+    const auto isDropped = [&](std::size_t settingIndex, std::size_t keyIndex) {
+        return keyIndex < dropped[settingIndex].size() &&
+               dropped[settingIndex][keyIndex];
+    };
     // Collision check before any mutation: a remapped key must not land on
     // a key that stays outside the selection on the same track, nor collapse
     // two selected keys to an ambiguous time.
-    for (const auto& setting : timeline->settings) {
+    for (std::size_t settingIndex = 0U;
+         settingIndex < timeline->settings.size();
+         ++settingIndex) {
+        const auto& setting = timeline->settings[settingIndex];
         std::vector<float> remappedPositions;
-        for (const auto& key : setting.keys) {
-            if (!keyMovesWithSelection(key)) {
+        for (std::size_t keyIndex = 0U;
+             keyIndex < setting.keys.size();
+             ++keyIndex) {
+            const auto& key = setting.keys[keyIndex];
+            if (!keyMovesWithSelection(key) ||
+                isDropped(settingIndex, keyIndex)) {
                 continue;
             }
             const float remapped = RemapWaterClipPosition(
@@ -11294,21 +11342,34 @@ bool TransformWaterFeatureClipSelection(
             remappedPositions.push_back(remapped);
         }
     }
-    for (auto& setting : timeline->settings) {
+    for (std::size_t settingIndex = 0U;
+         settingIndex < timeline->settings.size();
+         ++settingIndex) {
+        auto& setting = timeline->settings[settingIndex];
         bool moved = false;
-        for (auto& key : setting.keys) {
-            if (!keyMovesWithSelection(key)) {
+        std::vector<WaterSettingKey> kept;
+        kept.reserve(setting.keys.size());
+        for (std::size_t keyIndex = 0U;
+             keyIndex < setting.keys.size();
+             ++keyIndex) {
+            auto& key = setting.keys[keyIndex];
+            if (isDropped(settingIndex, keyIndex)) {
+                moved = true;
                 continue;
             }
-            key.position = RemapWaterClipPosition(
-                key.position,
-                rangeStart,
-                rangeEnd,
-                newStart,
-                newEnd,
-                allowWrap);
-            moved = true;
+            if (keyMovesWithSelection(key)) {
+                key.position = RemapWaterClipPosition(
+                    key.position,
+                    rangeStart,
+                    rangeEnd,
+                    newStart,
+                    newEnd,
+                    allowWrap);
+                moved = true;
+            }
+            kept.push_back(std::move(key));
         }
+        setting.keys = std::move(kept);
         if (moved) {
             std::stable_sort(
                 setting.keys.begin(),

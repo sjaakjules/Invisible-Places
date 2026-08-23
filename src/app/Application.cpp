@@ -87912,15 +87912,22 @@ void DrawWaterRunClipsTimeline(
                         clipIds.push_back(candidate.handle.clipId);
                     }
                 }
-                (void)invisible_places::water::
-                    TransformWaterFeatureClipSelection(
-                        timeline,
-                        clipIds,
-                        drag.groupStart,
-                        drag.groupEnd,
-                        newGroupStart,
-                        newGroupEnd,
-                        allowWrap);
+                if (!invisible_places::water::
+                        TransformWaterFeatureClipSelection(
+                            timeline,
+                            clipIds,
+                            drag.groupStart,
+                            drag.groupEnd,
+                            newGroupStart,
+                            newGroupEnd,
+                            allowWrap)) {
+                    // The drag holds at the last accepted window (the
+                    // snapshot restore above keeps the originals), which
+                    // looks frozen unless the refusal is explained.
+                    runtimeState->errorMessage =
+                        "Clip move refused: a key would land on another key "
+                        "of the same setting.";
+                }
             }
         };
 

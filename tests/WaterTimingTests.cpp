@@ -6280,7 +6280,7 @@ TEST_CASE("Wrapped clip transforms landing on phase 1 keep their end key",
     CHECK(everyMemberInsideItsClip(group));
 }
 
-TEST_CASE("Full-length clips rotate on the loop unless keyed at both 0 and 1",
+TEST_CASE("Full-length clips rotate on the loop, merging keys at both 0 and 1",
           "[water][timing][keyed][clips][cyclic]") {
     using Catch::Approx;
     using invisible_places::water::CyclicWaterFeatureClipMoveSpan;
@@ -6316,31 +6316,67 @@ TEST_CASE("Full-length clips rotate on the loop unless keyed at both 0 and 1",
     CHECK(timeline.settings.front().keys[0].position == Approx(0.3F));
     CHECK(timeline.settings.front().keys[1].position == Approx(0.8F));
 
-    // Two stored keys at 0 and 1 share one loop phase; rotating them would
-    // collapse them onto a single time, so the transform refuses and the
-    // clip holds (documented at CyclicWaterFeatureClipMoveSpan).
+    // Two stored keys at 0 and 1 share one loop phase (the plain-rail "on
+    // at start, off at end" clip). Cyclic evaluation already reads only the
+    // linear-later of the pair, so the cyclic move merges them onto it and
+    // rotates the clip instead of refusing, which left the drag looking
+    // stuck. The survivor keeps the later key's value.
     WaterFeatureTimeline seamPair;
     seamPair.feature = timeline.feature;
     seamPair.settings = {
         {.settingId = "strength",
          .keys = {
-             {.position = 0.00F, .value = 0.0F, .clipId = 1U},
+             {.position = 0.00F, .value = 0.25F, .clipId = 1U},
              {.position = 0.50F, .value = 1.0F, .clipId = 1U},
-             {.position = 1.00F, .value = 0.0F, .clipId = 1U},
+             {.position = 1.00F, .value = 0.75F, .clipId = 1U},
          }},
     };
     seamPair.clips = {{.id = 1U, .name = "Full", .start = 0.0F, .end = 1.0F}};
     seamPair.clipMembershipExplicit = true;
-    CHECK_FALSE(TransformWaterFeatureClip(
+    const auto seamSpan = CyclicWaterFeatureClipMoveSpan(0.0F, 1.0F, -0.1F);
+    REQUIRE(TransformWaterFeatureClip(
         &seamPair,
         1U,
-        span.first,
-        span.second,
+        seamSpan.first,
+        seamSpan.second,
         /*allowWrap=*/true));
-    CHECK(seamPair.clips.front().start == Approx(0.0F));
-    CHECK(seamPair.clips.front().end == Approx(1.0F));
-    CHECK(seamPair.settings.front().keys[0].position == Approx(0.0F));
-    CHECK(seamPair.settings.front().keys[2].position == Approx(1.0F));
+    REQUIRE(seamPair.settings.front().keys.size() == 2U);
+    CHECK(seamPair.settings.front().keys[0].position == Approx(0.4F));
+    CHECK(seamPair.settings.front().keys[0].value == Approx(1.0F));
+    CHECK(seamPair.settings.front().keys[1].position == Approx(0.9F));
+    CHECK(seamPair.settings.front().keys[1].value == Approx(0.75F));
+    CHECK(seamPair.clips.front().start == Approx(0.9F));
+    CHECK(seamPair.clips.front().end == Approx(1.4F));
+
+    // A refusal still leaves the document untouched, including the pair:
+    // here the rotated 0.5 key would land on a loose key.
+    WaterFeatureTimeline blocked = seamPair;
+    blocked.settings = {
+        {.settingId = "strength",
+         .keys = {
+             {.position = 0.00F, .value = 0.25F, .clipId = 1U},
+             {.position = 0.50F, .value = 1.0F, .clipId = 1U},
+             {.position = 0.60F, .value = 0.0F},
+             {.position = 1.00F, .value = 0.75F, .clipId = 1U},
+         }},
+    };
+    blocked.clips = {{.id = 1U, .name = "Full", .start = 0.0F, .end = 1.0F}};
+    const auto blockedSpan = CyclicWaterFeatureClipMoveSpan(0.0F, 1.0F, 0.1F);
+    CHECK_FALSE(TransformWaterFeatureClip(
+        &blocked,
+        1U,
+        blockedSpan.first,
+        blockedSpan.second,
+        /*allowWrap=*/true));
+    REQUIRE(blocked.settings.front().keys.size() == 4U);
+    CHECK(blocked.settings.front().keys[0].position == Approx(0.0F));
+    CHECK(blocked.settings.front().keys[3].position == Approx(1.0F));
+
+    // Unlinked editing never merges: without allowWrap the pair is left
+    // alone and the 0..1 refusal applies as before.
+    WaterFeatureTimeline unlinked = blocked;
+    CHECK_FALSE(TransformWaterFeatureClip(&unlinked, 1U, 0.1F, 1.1F));
+    CHECK(unlinked.settings.front().keys.size() == 4U);
 }
 
 TEST_CASE("Wrapped clips capture, apply, duplicate, and transfer intact",

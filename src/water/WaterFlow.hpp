@@ -1136,8 +1136,11 @@ struct WaterFeatureSpanLimits {
 // used by single and grouped UI drags. The source range may be a wrapped
 // clip span (end > 1). With allowWrap the destination may be any span of
 // length <= 1 expressed in unwrapped coordinates (newStart is normalized
-// into [0,1) and keys wrap around phase 0); without it the destination must
-// lie inside 0..1 exactly as before, so unlinked editing never wraps.
+// into [0,1) and keys wrap around phase 0), and selected same-track keys
+// that share one loop phase (stored 0 and 1) are merged onto the
+// linear-later one before the move, mirroring cyclic evaluation; without
+// it the destination must lie inside 0..1 exactly as before, so unlinked
+// editing never wraps or merges.
 [[nodiscard]] bool TransformWaterFeatureClipSelection(
     WaterFeatureTimeline* timeline,
     std::span<const std::uint32_t> clipIds,
@@ -1153,11 +1156,11 @@ struct WaterFeatureSpanLimits {
 // returned wrapped (end > 1) rather than jumping to the other side. Any
 // length rotates here, including a full-length span; the stored clip then
 // re-derives its bounds from its moved keys. A clip keyed at both 0 and 1
-// cannot rotate: those are two stored keys on a single loop phase, and
-// rotating them would collapse them onto one time, so
-// TransformWaterFeatureClipSelection refuses the move as a seam collision
-// and the drag holds in place. Exact boundary placements are stable until
-// the pointer actually crosses them.
+// holds two stored keys on a single loop phase; TransformWaterFeatureClip-
+// Selection (with allowWrap) coalesces such a pair onto the linear-later
+// key, exactly as cyclic evaluation already reads it, so the clip rotates
+// instead of being refused. Exact boundary placements are stable until the
+// pointer actually crosses them.
 [[nodiscard]] std::pair<float, float> CyclicWaterFeatureClipMoveSpan(
     float rangeStart,
     float rangeEnd,
