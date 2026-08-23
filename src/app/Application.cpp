@@ -409,7 +409,15 @@ enum class AnimationLinkedViewMode : std::uint8_t {
     Seam = 0,
     A,
     B,
+    // Combined A/B: A is presented inside its alternation window and B takes
+    // the matching frames everywhere else, so the whole loop plays as one
+    // continuous camera with a hard cut at each seam instead of a
+    // composited split.
+    Alternating,
 };
+
+constexpr AnimationLinkedViewMode kDefaultAnimationLinkedViewMode =
+    AnimationLinkedViewMode::Alternating;
 
 struct PreservedAnimationRuntimeState {
     std::optional<AnimationPath> path;
@@ -424,7 +432,9 @@ struct PreservedAnimationRuntimeState {
         linkedTimelineViewRange{};
     std::string linkedTimelineViewPairId;
     AnimationLinkedViewMode linkedViewMode =
-        AnimationLinkedViewMode::Seam;
+        kDefaultAnimationLinkedViewMode;
+    invisible_places::camera::AnimationReciprocalLoopAlternationWindow
+        linkedAlternationWindow{};
     double linkedCanonicalCycleFrame = 0.0;
     bool linkedCanonicalCycleFrameValid = false;
     std::string linkedCanonicalPairId;
@@ -1743,7 +1753,20 @@ struct AnimationPanelState {
     std::optional<AnimationCyclicTimelineViewDragState>
         linkedTimelineViewDrag;
     AnimationLinkedViewMode linkedViewMode =
-        AnimationLinkedViewMode::Seam;
+        kDefaultAnimationLinkedViewMode;
+    // Session-only A window for the Alternating view (A local 0..1). B's
+    // matching window is derived from the pair transport and shown beside
+    // it. Sanitized against the overlaps whenever it is read.
+    invisible_places::camera::AnimationReciprocalLoopAlternationWindow
+        linkedAlternationWindow{};
+    // Member whose camera was last pushed into runtimeState->camera by the
+    // linked presentation (any mode).
+    std::optional<std::size_t> linkedPresentedMember;
+    // While a local (feature) timeline is being dragged in Alternating view
+    // the member on screen at the drag start keeps the view, even past its
+    // window, until the mouse is released; release re-applies the window
+    // rule and cuts to the partner's matching frame when required.
+    std::optional<std::size_t> linkedAlternationHeldMember;
     // Fractional cycle frames are retained between scrubs and view changes;
     // linked playback samples integral frames without throwing away a
     // sub-frame authoring position while stopped.
@@ -3797,6 +3820,11 @@ ResolveActiveAnimationLinkedPair(
 std::optional<AnimationLinkedPresentation>
 ResolveAnimationLinkedPresentation(
     PreviewRuntimeState* runtimeState,
+    const ResolvedAnimationLinkedPair& pair);
+
+invisible_places::camera::AnimationReciprocalLoopAlternationWindow
+ResolveAnimationLinkedAlternationWindow(
+    const PreviewRuntimeState& runtimeState,
     const ResolvedAnimationLinkedPair& pair);
 
 void SynchronizeAnimationLinkedPresentationCamera(
@@ -15342,7 +15370,7 @@ void UnloadCurrentAnimationForWaterEditing(PreviewRuntimeState* runtimeState) {
     runtimeState->animationPanel.linkedTimelineViewPairId.clear();
     runtimeState->animationPanel.linkedTimelineViewDrag.reset();
     runtimeState->animationPanel.linkedViewMode =
-        AnimationLinkedViewMode::Seam;
+        kDefaultAnimationLinkedViewMode;
     runtimeState->animationPanel.linkedCanonicalCycleFrame = 0.0;
     runtimeState->animationPanel.linkedCanonicalCycleFrameValid = false;
     runtimeState->animationPanel.linkedCanonicalPairId.clear();
@@ -25066,7 +25094,7 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->animationPanel.linkedTimelineViewPairId.clear();
     runtimeState->animationPanel.linkedTimelineViewDrag.reset();
     runtimeState->animationPanel.linkedViewMode =
-        AnimationLinkedViewMode::Seam;
+        kDefaultAnimationLinkedViewMode;
     runtimeState->animationPanel.linkedCanonicalCycleFrame = 0.0;
     runtimeState->animationPanel.linkedCanonicalCycleFrameValid = false;
     runtimeState->animationPanel.linkedCanonicalPairId.clear();
@@ -25820,6 +25848,8 @@ PreservedAnimationRuntimeState CaptureAnimationRuntimeState(
             runtimeState.animationPanel.linkedTimelineViewPairId,
         .linkedViewMode =
             runtimeState.animationPanel.linkedViewMode,
+        .linkedAlternationWindow =
+            runtimeState.animationPanel.linkedAlternationWindow,
         .linkedCanonicalCycleFrame =
             runtimeState.animationPanel.linkedCanonicalCycleFrame,
         .linkedCanonicalCycleFrameValid =
@@ -25970,6 +26000,9 @@ void RestoreAnimationRuntimeState(
         std::move(state.linkedTimelineViewPairId);
     panel.linkedTimelineViewDrag.reset();
     panel.linkedViewMode = state.linkedViewMode;
+    panel.linkedAlternationWindow = state.linkedAlternationWindow;
+    panel.linkedPresentedMember.reset();
+    panel.linkedAlternationHeldMember.reset();
     panel.linkedCanonicalCycleFrame =
         state.linkedCanonicalCycleFrame;
     panel.linkedCanonicalCycleFrameValid =
@@ -27217,8 +27250,10 @@ EnsureAnimationLinkedCanonicalClock(
                             pair->transport.cycleFrames));
         panel.linkedCanonicalCycleFrameValid = true;
         panel.linkedCanonicalPairId = pair->sessionPairId;
-        panel.linkedViewMode = AnimationLinkedViewMode::Seam;
+        panel.linkedViewMode = kDefaultAnimationLinkedViewMode;
         panel.linkedViewCameraAttached = true;
+        panel.linkedPresentedMember.reset();
+        panel.linkedAlternationHeldMember.reset();
         panel.linkedMemberLocalPlayheads = {};
         panel.linkedMemberLocalPlayheadsValid = {};
         panel.linkedMemberLocalPlayheads[pair->currentMemberIndex] =
@@ -27276,11 +27311,11 @@ void SetAnimationLinkedCanonicalCycleFrame(
                 panel.linkedCanonicalCycleFrame)
             .empty()) {
         const char unavailable = selectedMember == 0U ? 'A' : 'B';
-        panel.linkedViewMode = AnimationLinkedViewMode::Seam;
-        panel.linkedSeamedView.enabled = true;
+        panel.linkedViewMode = AnimationLinkedViewMode::Alternating;
+        panel.linkedSeamedView.enabled = false;
         runtimeState->statusMessage =
             std::string{unavailable} +
-            " has no exact frame at that shared time; switched to Seam.";
+            " has no exact frame at that shared time; switched to A/B.";
         runtimeState->errorMessage.clear();
     }
     runtimeState->previewRenderStateSignatureValid = false;
@@ -27351,6 +27386,39 @@ ResolveAnimationLinkedPresentation(
         return std::nullopt;
     }
     auto& panel = runtimeState->animationPanel;
+    if (!panel.linkedCanonicalCycleFrameValid ||
+        panel.linkedCanonicalPairId != pair.sessionPairId) {
+        return std::nullopt;
+    }
+    if (panel.linkedViewMode == AnimationLinkedViewMode::Alternating) {
+        std::array<float, 2U> previous{};
+        for (std::size_t member = 0U; member < 2U; ++member) {
+            previous[member] =
+                panel.linkedMemberLocalPlayheadsValid[member]
+                    ? panel.linkedMemberLocalPlayheads[member]
+                : member == pair.currentMemberIndex
+                    ? panel.scrubAmount
+                    : 0.5F;
+        }
+        const auto selection = invisible_places::camera::
+            ResolveAnimationReciprocalLoopAlternatingMember(
+                pair.transport,
+                panel.linkedCanonicalCycleFrame,
+                ResolveAnimationLinkedAlternationWindow(*runtimeState, pair),
+                previous,
+                panel.linkedAlternationHeldMember);
+        if (!selection.has_value()) {
+            return std::nullopt;
+        }
+        panel.linkedMemberLocalPlayheads[selection->memberIndex] =
+            selection->localPosition;
+        panel.linkedMemberLocalPlayheadsValid[selection->memberIndex] =
+            true;
+        return AnimationLinkedPresentation{
+            .memberIndex = selection->memberIndex,
+            .localPosition = selection->localPosition,
+        };
+    }
     std::array<std::size_t, 2U> candidates{
         pair.currentMemberIndex,
         1U - pair.currentMemberIndex,
@@ -27376,6 +27444,16 @@ ResolveAnimationLinkedPresentation(
     return std::nullopt;
 }
 
+invisible_places::camera::AnimationReciprocalLoopAlternationWindow
+ResolveAnimationLinkedAlternationWindow(
+    const PreviewRuntimeState& runtimeState,
+    const ResolvedAnimationLinkedPair& pair) {
+    return invisible_places::camera::
+        SanitizeAnimationReciprocalLoopAlternationWindow(
+            pair.transport,
+            runtimeState.animationPanel.linkedAlternationWindow);
+}
+
 bool ApplyAnimationLinkedCanonicalCamera(
     PreviewRuntimeState* runtimeState,
     const ResolvedAnimationLinkedPair& pair,
@@ -27393,6 +27471,8 @@ bool ApplyAnimationLinkedCanonicalCamera(
         *pair.members[presentation->memberIndex],
         presentation->localPosition,
         allowDepthOfField);
+    runtimeState->animationPanel.linkedPresentedMember =
+        presentation->memberIndex;
     return true;
 }
 
@@ -27412,6 +27492,16 @@ void SynchronizeAnimationLinkedPresentationCamera(
         return;
     }
     auto& panel = runtimeState->animationPanel;
+    // A local-timeline hold ends with the mouse button; the window rule
+    // then decides the member again below and cuts to the partner's
+    // matching frame if the held member is outside its window.
+    if (panel.linkedAlternationHeldMember.has_value() &&
+        (panel.linkedViewMode != AnimationLinkedViewMode::Alternating ||
+         !panel.linkedViewCameraAttached ||
+         !ImGui::IsMouseDown(ImGuiMouseButton_Left))) {
+        panel.linkedAlternationHeldMember.reset();
+        runtimeState->previewRenderStateSignatureValid = false;
+    }
     if (!panel.linkedViewCameraAttached ||
         !panel.linkedCanonicalCycleFrameValid ||
         panel.reciprocalPanWizard.Active() ||
@@ -27436,6 +27526,7 @@ void SynchronizeAnimationLinkedPresentationCamera(
             runtimeState->camera.CaptureState(),
             path,
             presentation->localPosition)) {
+        panel.linkedPresentedMember = presentation->memberIndex;
         return;
     }
     ApplyAnimationEvaluation(
@@ -27444,6 +27535,7 @@ void SynchronizeAnimationLinkedPresentationCamera(
         presentation->localPosition,
         panel.previewDepthOfField ||
             runtimeState->animationPlayback.active);
+    panel.linkedPresentedMember = presentation->memberIndex;
     runtimeState->previewRenderStateSignatureValid = false;
 }
 
@@ -29287,11 +29379,13 @@ bool LoadAnimationPathVariant(
                 false);
         }
     } else {
-        panel.linkedViewMode = AnimationLinkedViewMode::Seam;
+        panel.linkedViewMode = kDefaultAnimationLinkedViewMode;
         panel.linkedCanonicalCycleFrame = 0.0;
         panel.linkedCanonicalCycleFrameValid = false;
         panel.linkedCanonicalPairId.clear();
         panel.linkedViewCameraAttached = true;
+        panel.linkedPresentedMember.reset();
+        panel.linkedAlternationHeldMember.reset();
         panel.linkedMemberLocalPlayheads = {};
         panel.linkedMemberLocalPlayheadsValid = {};
     }
@@ -29793,12 +29887,19 @@ void StartAnimationPlayback(PreviewRuntimeState* runtimeState) {
     constexpr float kAnimationEndTolerance = 1.0e-4F;
     const float currentPosition =
         std::clamp(runtimeState->animationPanel.scrubAmount, 0.0F, 1.0F);
-    const bool followCamera = invisible_places::camera::
-        AnimationPlaybackShouldFollowCamera(
-            runtimeState->camera.CaptureState(),
-            path,
-            currentPosition,
-            true);
+    // A linked pair's presented camera may belong to the partner member, so
+    // the loaded-path geometric test would wrongly report an inspection
+    // camera; the attach flag is the linked truth (manual navigation clears
+    // it).
+    const bool linkedPairActive =
+        ResolveActiveAnimationLinkedPair(*runtimeState).has_value();
+    const bool followCamera = linkedPairActive
+        ? runtimeState->animationPanel.linkedViewCameraAttached
+        : invisible_places::camera::AnimationPlaybackShouldFollowCamera(
+              runtimeState->camera.CaptureState(),
+              path,
+              currentPosition,
+              true);
     const float startPosition =
         currentPosition >= 1.0F - kAnimationEndTolerance
             ? 0.0F
@@ -29856,7 +29957,8 @@ void StartGlobalAnimationPlayback(PreviewRuntimeState* runtimeState) {
             member);
     };
 
-    if (panel.linkedViewMode == AnimationLinkedViewMode::Seam) {
+    if (panel.linkedViewMode == AnimationLinkedViewMode::Seam ||
+        panel.linkedViewMode == AnimationLinkedViewMode::Alternating) {
         const double startCycleFrame = std::round(
             invisible_places::camera::
                 WrapAnimationReciprocalLoopCycleFrame(
@@ -29866,11 +29968,14 @@ void StartGlobalAnimationPlayback(PreviewRuntimeState* runtimeState) {
             runtimeState,
             pair,
             startCycleFrame);
+        panel.linkedAlternationHeldMember.reset();
         std::size_t cameraMember = pair.currentMemberIndex;
-        auto cameraLocal = localForMember(cameraMember);
-        if (!cameraLocal.has_value()) {
-            cameraMember = 1U - cameraMember;
-            cameraLocal = localForMember(cameraMember);
+        std::optional<float> cameraLocal;
+        if (const auto presentation =
+                ResolveAnimationLinkedPresentation(runtimeState, pair);
+            presentation.has_value()) {
+            cameraMember = presentation->memberIndex;
+            cameraLocal = presentation->localPosition;
         }
         if (!cameraLocal.has_value() ||
             pair.members[cameraMember]->keys.size() < 2U) {
@@ -29887,6 +29992,7 @@ void StartGlobalAnimationPlayback(PreviewRuntimeState* runtimeState) {
                 *pair.members[cameraMember],
                 cameraLocal.value(),
                 true);
+            panel.linkedPresentedMember = cameraMember;
         }
         runtimeState->animationPlayback = {
             .active = true,
@@ -30121,16 +30227,12 @@ void UpdateAnimationPlayback(PreviewRuntimeState* runtimeState) {
         }
 
         std::size_t cameraMember = pair.currentMemberIndex;
-        auto cameraLocal = ResolveAnimationLinkedMemberLocalPosition(
-            runtimeState,
-            pair,
-            cameraMember);
-        if (!cameraLocal.has_value()) {
-            cameraMember = 1U - cameraMember;
-            cameraLocal = ResolveAnimationLinkedMemberLocalPosition(
-                runtimeState,
-                pair,
-                cameraMember);
+        std::optional<float> cameraLocal;
+        if (const auto presentation =
+                ResolveAnimationLinkedPresentation(runtimeState, pair);
+            presentation.has_value()) {
+            cameraMember = presentation->memberIndex;
+            cameraLocal = presentation->localPosition;
         }
         if (!cameraLocal.has_value()) {
             StopAnimationPlayback(runtimeState);
@@ -30151,6 +30253,8 @@ void UpdateAnimationPlayback(PreviewRuntimeState* runtimeState) {
                 playback.path,
                 cameraLocal.value(),
                 true);
+            runtimeState->animationPanel.linkedPresentedMember =
+                cameraMember;
         }
         runtimeState->previewRenderStateSignatureValid = false;
         return;
@@ -30158,7 +30262,11 @@ void UpdateAnimationPlayback(PreviewRuntimeState* runtimeState) {
 
     if (playback.domain == AnimationPlaybackDomain::LoadedLocal) {
         const bool followedCameraBeforeUpdate = playback.followCamera;
-        if (playback.followCamera) {
+        // Linked pairs detach explicitly (DetachAnimationLinkedPresentationCamera
+        // clears followCamera); their presented camera may be the partner's,
+        // which the loaded-path test cannot recognise.
+        if (playback.followCamera &&
+            !ResolveActiveAnimationLinkedPair(*runtimeState).has_value()) {
             playback.followCamera = invisible_places::camera::
                 AnimationPlaybackShouldFollowCamera(
                     runtimeState->camera.CaptureState(),
@@ -30250,6 +30358,8 @@ bool DetachAnimationLinkedPresentationCamera(
         return false;
     }
     runtimeState->animationPanel.linkedViewCameraAttached = false;
+    runtimeState->animationPanel.linkedAlternationHeldMember.reset();
+    runtimeState->animationPanel.linkedPresentedMember.reset();
     runtimeState->previewRenderStateSignatureValid = false;
     if (runtimeState->animationPlayback.active) {
         runtimeState->animationPlayback.followCamera = false;
@@ -56145,6 +56255,19 @@ void ApplyFeatureTimelineScrub(
         runtimeState->animationPlayback.active = false;
         runtimeState->cameraPlayback.active = false;
         if (moveLinkedCamera) {
+            // A pressed-mouse scrub on a local timeline keeps the member
+            // that was on screen when it began (see
+            // linkedAlternationHeldMember); the per-frame presentation sync
+            // releases it on mouse-up.
+            if (panel.linkedViewMode ==
+                    AnimationLinkedViewMode::Alternating &&
+                !panel.linkedAlternationHeldMember.has_value() &&
+                panel.linkedViewCameraAttached &&
+                panel.linkedPresentedMember.has_value() &&
+                ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                panel.linkedAlternationHeldMember =
+                    panel.linkedPresentedMember;
+            }
             panel.linkedViewCameraAttached = true;
             (void)ApplyAnimationLinkedCanonicalCamera(
                 runtimeState,
@@ -57913,6 +58036,7 @@ void DrawLinkedSeamedViewHeaderControls(
                 runtimeState->cameraPlayback.active = false;
                 panel.linkedViewMode = mode;
                 panel.linkedViewCameraAttached = true;
+                panel.linkedAlternationHeldMember.reset();
                 panel.linkedSeamedView.enabled =
                     mode == AnimationLinkedViewMode::Seam;
                 panel.linkedSeamedView.renderedSourceIndex = 0U;
@@ -57931,11 +58055,33 @@ void DrawLinkedSeamedViewHeaderControls(
                 ImGui::SetTooltip("%s", std::string{tooltip}.c_str());
             }
         };
+        const auto alternationWindow =
+            ResolveAnimationLinkedAlternationWindow(
+                *runtimeState,
+                linkedPair.value());
+        const auto partnerWindow = invisible_places::camera::
+            AnimationReciprocalLoopAlternationPartnerWindow(
+                linkedPair->transport,
+                alternationWindow);
         const std::string seamTooltip =
             "Seam: show every exact owner of the shared frame. Two owners "
             "use the authored hard split; one owner fills the view.\nA: " +
             linkedPair->memberFilePaths[0U].string() + "\nB: " +
             linkedPair->memberFilePaths[1U].string();
+        const std::string alternatingTooltip =
+            "A/B: one continuous camera around the whole loop. A is shown "
+            "between " +
+            FormatFixed(alternationWindow.aStart, 3) + " and " +
+            FormatFixed(alternationWindow.aEnd, 3) +
+            " of its own timeline; everywhere else B shows the matching "
+            "shared frame" +
+            (partnerWindow.has_value()
+                 ? " (B " + FormatFixed(partnerWindow->first, 3) + " to " +
+                       FormatFixed(partnerWindow->second, 3) + ")"
+                 : std::string{}) +
+            ".\nGlobal Animation Position and playback cut between A and "
+            "B at those points. Scrubbing a Water or Timings timeline keeps "
+            "the member on screen until the mouse is released.";
         const std::string aTooltip = memberAvailable[0U]
             ? "A: show this exact shared frame from\n" +
                   linkedPair->memberFilePaths[0U].string()
@@ -57953,6 +58099,11 @@ void DrawLinkedSeamedViewHeaderControls(
             AnimationLinkedViewMode::Seam,
             true,
             seamTooltip);
+        drawModeButton(
+            "A/B",
+            AnimationLinkedViewMode::Alternating,
+            true,
+            alternatingTooltip);
         drawModeButton(
             "A",
             AnimationLinkedViewMode::A,
@@ -58113,6 +58264,116 @@ void DrawLinkedSeamedViewHeaderControls(
             ImGui::SetTooltip("%s", failure->c_str());
         }
     }
+    if (timingShared &&
+        panel.linkedViewMode == AnimationLinkedViewMode::Alternating) {
+        // A window editor. The stored values are sanitized on every read,
+        // so typing an out-of-range bound simply snaps to the overlap edge.
+        auto window = ResolveAnimationLinkedAlternationWindow(
+            *runtimeState,
+            linkedPair.value());
+        const float duration = static_cast<float>(
+            linkedPair->transport.memberWindows[0U].durationFrames);
+        const auto startOverlapFraction = duration > 0.0F
+            ? static_cast<float>(
+                  linkedPair->transport.firstStartOverlapFrames) /
+                  duration
+            : 0.0F;
+        const auto endOverlapStartFraction = duration > 0.0F
+            ? 1.0F -
+                  static_cast<float>(
+                      linkedPair->transport.firstEndOverlapFrames) /
+                      duration
+            : 1.0F;
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("A window");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(72.0F);
+        bool windowChanged = ImGui::DragFloat(
+            "##LinkedAlternationStart",
+            &window.aStart,
+            0.001F,
+            0.0F,
+            startOverlapFraction,
+            "%.3f",
+            ImGuiSliderFlags_AlwaysClamp);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Where A takes over from B (A local position). At most %.3f, "
+                "the end of A's start overlap, so B always owns the frames "
+                "before it.",
+                startOverlapFraction);
+        }
+        ImGui::SameLine();
+        ImGui::TextUnformatted("to");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(72.0F);
+        windowChanged = ImGui::DragFloat(
+            "##LinkedAlternationEnd",
+            &window.aEnd,
+            0.001F,
+            endOverlapStartFraction,
+            1.0F,
+            "%.3f",
+            ImGuiSliderFlags_AlwaysClamp) || windowChanged;
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Where B takes over from A (A local position). At least "
+                "%.3f, the start of A's end overlap, so B always owns the "
+                "frames after it.",
+                endOverlapStartFraction);
+        }
+        if (windowChanged) {
+            panel.linkedAlternationWindow = invisible_places::camera::
+                SanitizeAnimationReciprocalLoopAlternationWindow(
+                    linkedPair->transport,
+                    window);
+            panel.linkedAlternationHeldMember.reset();
+            panel.linkedViewCameraAttached = true;
+            (void)ApplyAnimationLinkedCanonicalCamera(
+                runtimeState,
+                linkedPair.value(),
+                panel.previewDepthOfField);
+            runtimeState->previewRenderStateSignatureValid = false;
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Reset##LinkedAlternationWindow")) {
+            panel.linkedAlternationWindow = {};
+            panel.linkedAlternationHeldMember.reset();
+            panel.linkedViewCameraAttached = true;
+            (void)ApplyAnimationLinkedCanonicalCamera(
+                runtimeState,
+                linkedPair.value(),
+                panel.previewDepthOfField);
+            runtimeState->previewRenderStateSignatureValid = false;
+        }
+        ImGui::SameLine();
+        if (const auto partnerWindow = invisible_places::camera::
+                AnimationReciprocalLoopAlternationPartnerWindow(
+                    linkedPair->transport,
+                    ResolveAnimationLinkedAlternationWindow(
+                        *runtimeState,
+                        linkedPair.value()));
+            partnerWindow.has_value()) {
+            ImGui::TextDisabled(
+                "B %.3f to %.3f",
+                partnerWindow->first,
+                partnerWindow->second);
+        }
+        if (panel.linkedPresentedMember.has_value() &&
+            panel.linkedViewCameraAttached) {
+            const std::size_t presented =
+                std::min<std::size_t>(
+                    panel.linkedPresentedMember.value(),
+                    1U);
+            ImGui::SameLine();
+            ImGui::TextDisabled(
+                "Showing %c%s",
+                presented == 0U ? 'A' : 'B',
+                panel.linkedAlternationHeldMember.has_value()
+                    ? " (held)"
+                    : "");
+        }
+    }
     ImGui::TextDisabled(
         timingShared ? "Effects: shared loop" : "Effects: path-local");
     if (!timingShared && reciprocalPairAvailable) {
@@ -58231,6 +58492,17 @@ ResolveLinkedAnimationSeamedComparison(
         case AnimationLinkedViewMode::B:
             if (memberLocals[1U].has_value()) {
                 visibleMembers.push_back(1U);
+            }
+            break;
+        case AnimationLinkedViewMode::Alternating:
+            // One full-screen member chosen by the window rule (and any
+            // active local-timeline hold); never the two-source split.
+            if (const auto presentation =
+                    ResolveAnimationLinkedPresentation(runtimeState, pair);
+                presentation.has_value()) {
+                memberLocals[presentation->memberIndex] =
+                    presentation->localPosition;
+                visibleMembers.push_back(presentation->memberIndex);
             }
             break;
     }
@@ -64714,7 +64986,7 @@ void DrawAnimationSection(
                 panel.dirty = false;
                 panel.selectedKeyIndex.reset();
                 panel.linkedViewMode =
-                    AnimationLinkedViewMode::Seam;
+                    kDefaultAnimationLinkedViewMode;
                 panel.linkedCanonicalCycleFrame = 0.0;
                 panel.linkedCanonicalCycleFrameValid = false;
                 panel.linkedCanonicalPairId.clear();
@@ -83433,11 +83705,11 @@ GlobalAnimationTimelineSurface ResolveGlobalAnimationTimelineSurface(
         // the requested canonical frame visible and explains the transition.
         const char unavailable =
             selectedMember.value() == 0U ? 'A' : 'B';
-        panel.linkedViewMode = AnimationLinkedViewMode::Seam;
-        panel.linkedSeamedView.enabled = true;
+        panel.linkedViewMode = AnimationLinkedViewMode::Alternating;
+        panel.linkedSeamedView.enabled = false;
         runtimeState->statusMessage =
             std::string{unavailable} +
-            " has no exact frame here; showing Seam instead.";
+            " has no exact frame here; showing A/B instead.";
         runtimeState->errorMessage.clear();
     }
     surface.kind = GlobalAnimationTimelineSurfaceKind::LinkedSeam;
@@ -101863,6 +102135,20 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
                     authoredDisplayPosition *
                     static_cast<float>(cycleFrames))) %
                 std::max<std::uint32_t>(1U, cycleFrames);
+            std::string presented;
+            if (panel.linkedViewCameraAttached &&
+                panel.linkedPresentedMember.has_value() &&
+                panel.linkedPresentedMember.value() < 2U &&
+                panel.linkedMemberLocalPlayheadsValid[
+                    panel.linkedPresentedMember.value()]) {
+                const std::size_t member =
+                    panel.linkedPresentedMember.value();
+                presented = std::string{"  "} +
+                    (member == 0U ? "A " : "B ") +
+                    FormatFixed(
+                        panel.linkedMemberLocalPlayheads[member],
+                        3);
+            }
             return FormatFixed(globalSurface.displayPosition, 3) +
                 "  " +
                 FormatFixed(
@@ -101870,7 +102156,7 @@ void DrawGlobalAnimationTimingBar(PreviewRuntimeState* runtimeState) {
                     1) +
                 "s / " + FormatAnimationCycleClock(cycleFrames) +
                 "  f" + std::to_string(cycleFrame) + " / " +
-                std::to_string(cycleFrames);
+                std::to_string(cycleFrames) + presented;
         }
         const char* prefix =
             globalSurface.kind ==
