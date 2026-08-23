@@ -10837,25 +10837,32 @@ void EnsureWaterFeatureExplicitClipMembership(
     }
 }
 
-// Searches the window in unwrapped coordinates (windowEnd may exceed 1) and
-// compares against existing keys cyclically, so a window spanning phase 0
-// nudges around keys on both sides of the seam. Returns the unwrapped
-// position; the caller stores WrapWaterClipPhase of it.
+// Searches the window in unwrapped coordinates (windowEnd may exceed 1).
+// Only a window that wraps compares against existing keys cyclically, so it
+// nudges around keys on both sides of the seam; an unwrapped window keeps
+// the pre-W1 linear comparison (the rule TransformWaterFeatureClipSelection
+// uses without allowWrap), since 0 and 1 are distinct times off the loop
+// and a package applied into {0.5, 1} must still end on 1 beside a loose
+// key at 0. Returns the unwrapped position; the caller stores
+// WrapWaterClipPhase of it for wrapped windows.
 std::optional<float> AvailableWaterClipKeyPosition(
     const WaterKeyedSettingTrack& track,
     float desired,
     float windowStart,
     float windowEnd) {
+    const bool cyclic = WaterClipIsWrapped(windowStart, windowEnd);
     const auto available = [&](float candidate) {
         return candidate >= windowStart && candidate <= windowEnd &&
                std::none_of(
                    track.keys.begin(),
                    track.keys.end(),
                    [&](const WaterSettingKey& existing) {
-                       return CyclicWaterClipDistance(
-                                  existing.position,
-                                  WrapWaterClipPhase(candidate)) <=
-                              kWaterClipKeyTolerance;
+                       const float distance = cyclic
+                           ? CyclicWaterClipDistance(
+                                 existing.position,
+                                 WrapWaterClipPhase(candidate))
+                           : std::abs(existing.position - candidate);
+                       return distance <= kWaterClipKeyTolerance;
                    });
     };
     desired = std::clamp(desired, windowStart, windowEnd);

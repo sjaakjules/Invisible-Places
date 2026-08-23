@@ -5514,6 +5514,99 @@ TEST_CASE("Applying a package beside a clip preserves the neighbour boundary key
     CHECK(keys[3].value == Approx(1.0F));
 }
 
+TEST_CASE("Packages applied into unwrapped windows keep 0 and 1 distinct",
+          "[water][timing][keyed][clips]") {
+    using Catch::Approx;
+    using invisible_places::water::ApplyWaterKeyedSettingsClip;
+    using invisible_places::water::WaterFeatureTimeline;
+    using invisible_places::water::WaterKeyedFeatureKind;
+    using invisible_places::water::WaterKeyedSettingsProfile;
+
+    // A loose key at time 0 is a very common unlinked shape. Applying a
+    // package whose keys sit at 0 and 1 into {0.5, 1} must still place the
+    // closing key exactly on 1: off the loop 0 and 1 are distinct times, so
+    // no cyclic collision may nudge it to 0.99979 (the pre-W1 behaviour).
+    WaterFeatureTimeline timeline;
+    timeline.feature = {
+        .kind = WaterKeyedFeatureKind::SeepageNode,
+        .objectId = 7U};
+    timeline.settings = {
+        {.settingId = "strength",
+         .keys = {{.position = 0.0F, .value = 1.0F}}},
+    };
+    timeline.clipMembershipExplicit = true;
+
+    WaterKeyedSettingsProfile package;
+    package.featureKind = WaterKeyedFeatureKind::SeepageNode;
+    package.settings = {
+        {.settingId = "strength",
+         .keys = {
+             {.position = 0.0F, .value = 0.0F},
+             {.position = 1.0F, .value = 1.0F},
+         }},
+    };
+    const auto applied = ApplyWaterKeyedSettingsClip(
+        &timeline,
+        package,
+        0.50F,
+        1.00F,
+        "End");
+    REQUIRE(applied.has_value());
+    const auto& keys = timeline.settings.front().keys;
+    REQUIRE(keys.size() == 3U);
+    CHECK(keys[0].position == Approx(0.0F));
+    CHECK(keys[1].position == Approx(0.50F));
+    CHECK(keys[2].position == Approx(1.0F));
+    REQUIRE(timeline.clips.size() == 1U);
+    CHECK(timeline.clips.front().start == Approx(0.50F));
+    CHECK(timeline.clips.front().end == Approx(1.0F));
+
+    // A window that wraps stays cyclic: a package key landing on phase 1
+    // is the same loop instant as the loose key at 0 and is nudged around
+    // it, and the closing key wraps into [0,1).
+    WaterFeatureTimeline wrapped;
+    wrapped.feature = timeline.feature;
+    wrapped.settings = {
+        {.settingId = "strength",
+         .keys = {{.position = 0.0F, .value = 1.0F}}},
+    };
+    wrapped.clipMembershipExplicit = true;
+    WaterKeyedSettingsProfile spanning;
+    spanning.featureKind = WaterKeyedFeatureKind::SeepageNode;
+    spanning.settings = {
+        {.settingId = "strength",
+         .keys = {
+             {.position = 0.0F, .value = 0.0F},
+             {.position = 0.4F, .value = 0.5F},
+             {.position = 1.0F, .value = 1.0F},
+         }},
+    };
+    const auto wrappedApplied = ApplyWaterKeyedSettingsClip(
+        &wrapped,
+        spanning,
+        0.80F,
+        1.30F,
+        "Wrap");
+    REQUIRE(wrappedApplied.has_value());
+    const auto& wrappedKeys = wrapped.settings.front().keys;
+    REQUIRE(wrappedKeys.size() == 4U);
+    // Stored ascending: nudged phase-0 landing, closing key at 0.3, the
+    // loose key untouched at 0, opening key at 0.8.
+    CHECK(wrappedKeys[0].position == Approx(0.0F));
+    CHECK(wrappedKeys[0].value == Approx(1.0F));
+    CHECK(wrappedKeys[0].clipId == 0U);
+    const auto nudged = std::find_if(
+        wrappedKeys.begin(),
+        wrappedKeys.end(),
+        [&](const auto& key) {
+            return key.clipId == wrappedApplied.value() &&
+                   key.value == Approx(0.5F);
+        });
+    REQUIRE(nudged != wrappedKeys.end());
+    CHECK(nudged->position > 0.0F);
+    CHECK(nudged->position < 0.001F);
+}
+
 TEST_CASE("Duplicating a clip supports overlapping destinations",
           "[water][timing][keyed][clips]") {
     using Catch::Approx;
