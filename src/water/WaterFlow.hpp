@@ -1138,11 +1138,15 @@ struct WaterFeatureSpanLimits {
 // used by single and grouped UI drags. The source range may be a wrapped
 // clip span (end > 1). With allowWrap the destination may be any span of
 // length <= 1 expressed in unwrapped coordinates (newStart is normalized
-// into [0,1) and keys wrap around phase 0), and selected same-track keys
-// that share one loop phase (stored 0 and 1) are merged onto the
-// linear-later one before the move, mirroring cyclic evaluation; without
-// it the destination must lie inside 0..1 exactly as before, so unlinked
-// editing never wraps or merges.
+// into [0,1) and keys wrap around phase 0), and same-track keys of one
+// selected clip (or two selected loose keys) that share one loop phase
+// (stored 0 and 1) are merged onto the linear-later one before the move,
+// mirroring cyclic evaluation. Keys of two different selected clips are
+// never merged: a group landing that would collide them is refused. A
+// destination equal to the source span on the loop is the identity and
+// succeeds without touching the document. Without allowWrap the
+// destination must lie inside 0..1 exactly as before, so unlinked editing
+// never wraps or merges.
 [[nodiscard]] bool TransformWaterFeatureClipSelection(
     WaterFeatureTimeline* timeline,
     std::span<const std::uint32_t> clipIds,
@@ -1157,7 +1161,9 @@ struct WaterFeatureSpanLimits {
 // {start in [0,1), start + length}, so a span crossing the loop origin is
 // returned wrapped (end > 1) rather than jumping to the other side. Any
 // length rotates here, including a full-length span; the stored clip then
-// re-derives its bounds from its moved keys. A clip keyed at both 0 and 1
+// re-derives its bounds from its moved keys (except that a full-length
+// wrapped clip with a member on its boundary phase keeps its span, see
+// SynchronizeWaterFeatureClipBounds). A clip keyed at both 0 and 1
 // holds two stored keys on a single loop phase; TransformWaterFeatureClip-
 // Selection (with allowWrap) coalesces such a pair onto the linear-later
 // key, exactly as cyclic evaluation already reads it, so the clip rotates
