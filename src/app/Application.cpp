@@ -116471,7 +116471,7 @@ int RunLinkedHqPreviewSmoke(
             LinkedHqPatchLayerCount(modeState) == 2U;
     }
     if (allModesRetainedHq) {
-        report.Pass("HQ remained enabled across Seam, A, and B.");
+        report.Pass("HQ remained enabled across Seam, A/B, A, and B.");
     } else {
         report.Fail("Switching Seam/A/B disabled or partially removed HQ.");
     }
@@ -116548,27 +116548,38 @@ int RunLinkedHqPreviewSmoke(
         report.Fail("HQ density compensation was not role-appropriate.");
     }
 
-    // Give the Seepage attachment path a frame after enabling HQ. If the
-    // base role has active topology, the corresponding patch must share its
-    // node count without rebuilding semantic support.
-    (void)PumpLinkedHqSmokeFrame(
-        window,
-        runtimeState,
-        viewport,
-        0.5F);
+    // Give the Seepage attachment path a few frames after the mode sweep.
+    // If the base role has active topology, the corresponding patch must
+    // share its node count without rebuilding semantic support. The
+    // attachment settles asynchronously after each presented-camera change,
+    // so the parity is polled over a short frame budget rather than read
+    // after exactly one frame (the sweep above changes the camera once per
+    // mode, and a single settle frame was not always enough).
     bool seepageParity = true;
     bool seepageWasActive = false;
-    for (const auto& patch : hq.patches) {
-        const auto baseNodeCount =
-            viewport->WaterSeepageNodeCount(
-                patch.baseSessionIndex);
-        if (baseNodeCount == 0U) {
-            continue;
+    for (std::uint32_t settleFrame = 0U; settleFrame < 8U; ++settleFrame) {
+        (void)PumpLinkedHqSmokeFrame(
+            window,
+            runtimeState,
+            viewport,
+            0.5F);
+        seepageParity = true;
+        seepageWasActive = false;
+        for (const auto& patch : hq.patches) {
+            const auto baseNodeCount =
+                viewport->WaterSeepageNodeCount(
+                    patch.baseSessionIndex);
+            if (baseNodeCount == 0U) {
+                continue;
+            }
+            seepageWasActive = true;
+            seepageParity = seepageParity &&
+                viewport->WaterSeepageNodeCount(patch.layerId) ==
+                    baseNodeCount;
         }
-        seepageWasActive = true;
-        seepageParity = seepageParity &&
-            viewport->WaterSeepageNodeCount(patch.layerId) ==
-                baseNodeCount;
+        if (!seepageWasActive || seepageParity) {
+            break;
+        }
     }
     if (!seepageWasActive || seepageParity) {
         report.Pass(
