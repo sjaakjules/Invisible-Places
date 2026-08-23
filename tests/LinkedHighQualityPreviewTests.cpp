@@ -8,10 +8,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <set>
 #include <stop_token>
 #include <string>
 #include <utility>
@@ -265,9 +267,10 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "Linked HQ patch spacing choices map to one-in-N decimation",
+    "Linked HQ patch spacing choices map to a kept fraction",
     "[linked-hq]") {
-    using invisible_places::app::LinkedHqDecimationKeepOneIn;
+    using Catch::Approx;
+    using invisible_places::app::LinkedHqPatchKeepFraction;
     using invisible_places::app::SanitizeLinkedHqPatchSpacing;
     CHECK(SanitizeLinkedHqPatchSpacing(0U) == 1'000U);
     CHECK(SanitizeLinkedHqPatchSpacing(1'000U) == 1'000U);
@@ -276,78 +279,130 @@ TEST_CASE(
     CHECK(SanitizeLinkedHqPatchSpacing(2'999U) == 2'000U);
     CHECK(SanitizeLinkedHqPatchSpacing(3'000U) == 3'000U);
     CHECK(SanitizeLinkedHqPatchSpacing(5'000U) == 3'000U);
-    CHECK(LinkedHqDecimationKeepOneIn(1'000U) == 1U);
-    CHECK(LinkedHqDecimationKeepOneIn(2'000U) == 4U);
-    CHECK(LinkedHqDecimationKeepOneIn(3'000U) == 9U);
-    CHECK(LinkedHqDecimationKeepOneIn(999'999U) == 9U);
+    CHECK(LinkedHqPatchKeepFraction(1'000U) == Approx(1.0F));
+    CHECK(LinkedHqPatchKeepFraction(2'000U) == Approx(0.25F));
+    CHECK(LinkedHqPatchKeepFraction(3'000U) == Approx(1.0F / 9.0F));
+    CHECK(LinkedHqPatchKeepFraction(999'999U) == Approx(1.0F / 9.0F));
 }
 
-TEST_CASE(
-    "Subset decimation keeps a uniform deterministic fraction by source index",
-    "[pointcloud][linked-hq][io]") {
-    using invisible_places::io::PointCloudSubsetDecimationKeeps;
-    bool keepsEverything = true;
-    for (std::uint64_t index = 0U; index < 1000U; ++index) {
-        keepsEverything = keepsEverything &&
-            PointCloudSubsetDecimationKeeps(index, 1U) &&
-            PointCloudSubsetDecimationKeeps(index, 0U);
-    }
-    CHECK(keepsEverything);
-    for (const std::uint32_t keepOneIn : {4U, 9U}) {
-        std::uint64_t kept = 0U;
-        std::uint64_t longestRun = 0U;
-        std::uint64_t run = 0U;
-        bool deterministic = true;
-        constexpr std::uint64_t kSamples = 400'000U;
-        for (std::uint64_t index = 0U; index < kSamples; ++index) {
-            const bool keeps = PointCloudSubsetDecimationKeeps(index, keepOneIn);
-            deterministic = deterministic &&
-                keeps == PointCloudSubsetDecimationKeeps(index, keepOneIn);
-            if (keeps) {
-                ++kept;
-                run = 0U;
-            } else {
-                longestRun = std::max(longestRun, ++run);
-            }
-        }
-        CHECK(deterministic);
-        const double fraction =
-            static_cast<double>(kept) / static_cast<double>(kSamples);
-        CHECK(fraction == Catch::Approx(1.0 / keepOneIn).margin(0.01));
-        // A hash, not a stride: gaps vary but never grow pathologically.
-        CHECK(longestRun < 40U * keepOneIn);
-    }
+namespace {
 
-    const auto path = WriteSubsetFixture("decimated-subset");
-    const auto load = [&](std::uint32_t keepOneIn, unsigned threadCount) {
+// A 1 mm lattice on a plane tilted out of every axis, so cells straddle the
+// surface at varying occupancy like a real scan does.
+std::filesystem::path WriteLatticeFixture(
+    std::string_view stem,
+    std::uint32_t side) {
+    const auto path =
+        std::filesystem::temp_directory_path() /
+        "invisible-places-linked-hq" /
+        (std::string{stem} + ".ply");
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream output{path, std::ios::binary | std::ios::trunc};
+    REQUIRE(output.is_open());
+    output << "ply\n"
+           << "format binary_little_endian 1.0\n"
+           << "element vertex " << (side * side) << "\n"
+           << "property float x\n"
+           << "property float y\n"
+           << "property float z\n"
+           << "property uchar red\n"
+           << "property uchar green\n"
+           << "property uchar blue\n"
+           << "property float scalar_Height\n"
+           << "end_header\n";
+    for (std::uint32_t row = 0U; row < side; ++row) {
+        for (std::uint32_t column = 0U; column < side; ++column) {
+            const float x = 0.0003F + static_cast<float>(column) * 0.001F;
+            const float y = 0.0007F + static_cast<float>(row) * 0.001F;
+            const float z = 0.37F * x + 0.21F * y + 0.0001F;
+            const auto shade = static_cast<std::uint8_t>((row * 7U + column * 3U) % 256U);
+            WriteBinary(&output, x);
+            WriteBinary(&output, y);
+            WriteBinary(&output, z);
+            WriteBinary(&output, shade);
+            WriteBinary(&output, shade);
+            WriteBinary(&output, shade);
+            WriteBinary(&output, z);
+        }
+    }
+    return path;
+}
+
+}  // namespace
+
+TEST_CASE(
+    "Grid decimation keeps one centred parent per populated cell",
+    "[pointcloud][linked-hq][io]") {
+    using Catch::Approx;
+    constexpr std::uint32_t kSide = 48U;
+    const auto path = WriteLatticeFixture("grid-decimation", kSide);
+    const auto load = [&](float cellSize, float keepFraction, unsigned threadCount) {
         invisible_places::io::PointCloudSubsetLoadOptions options;
-        options.includePoint = [](const invisible_places::io::Float3& point) {
-            return point.x >= -1.0F;
+        options.fieldFilter.mode =
+            invisible_places::io::PointCloudScalarFieldFilter::Mode::Selected;
+        options.fieldFilter.names = {"Height"};
+        options.gridDecimation = {
+            .cellSizeMeters = cellSize,
+            .keepFraction = keepFraction,
         };
-        options.decimationKeepOneIn = keepOneIn;
         options.threadCount = threadCount;
         return invisible_places::io::LoadPointCloudSubset(path, options);
     };
-    const auto full = load(1U, 1U);
-    REQUIRE(full.success);
-    CHECK(full.includedPointCount == 5U);
-    CHECK(full.cloud.PointCount() == 5U);
 
-    const auto decimated = load(2U, 1U);
-    REQUIRE(decimated.success);
-    CHECK(decimated.includedPointCount == 5U);
-    std::vector<std::uint32_t> expected;
-    for (const std::uint32_t index : full.sourcePointIndices) {
-        if (PointCloudSubsetDecimationKeeps(index, 2U)) {
-            expected.push_back(index);
-        }
+    const auto full = load(0.0F, 1.0F, 1U);
+    REQUIRE(full.success);
+    CHECK(full.includedPointCount == kSide * kSide);
+    CHECK(full.cloud.PointCount() == kSide * kSide);
+
+    // 2 mm cells over a 1 mm lattice hold up to four parents (the tilted
+    // plane also crosses z-cell boundaries, leaving some cells with fewer),
+    // so no cell keeps more than one point and the dithered quotas make the
+    // total a quarter of the lattice within a few points.
+    const auto two = load(0.002F, 0.25F, 1U);
+    REQUIRE(two.success);
+    CHECK(two.includedPointCount == kSide * kSide);
+    const double expectedTwo = static_cast<double>(kSide * kSide) / 4.0;
+    CHECK(static_cast<double>(two.cloud.PointCount()) ==
+          Approx(expectedTwo).margin(expectedTwo * 0.05));
+    CHECK(two.sourcePointIndices.size() == two.cloud.PointCount());
+    CHECK(std::is_sorted(two.sourcePointIndices.begin(), two.sourcePointIndices.end()));
+    // Kept points keep their own attributes (no averaging).
+    for (std::size_t point = 0U; point < two.cloud.PointCount(); ++point) {
+        const auto source = two.sourcePointIndices[point];
+        CHECK(two.cloud.positions[point].x == full.cloud.positions[source].x);
+        CHECK(two.cloud.packedColors[point] == full.cloud.packedColors[source]);
+        CHECK(FieldValues(two.cloud, "Height")[point] ==
+              FieldValues(full.cloud, "Height")[source]);
     }
-    CHECK(decimated.sourcePointIndices == expected);
-    CHECK(decimated.cloud.PointCount() == expected.size());
-    const auto parallel = load(2U, 3U);
-    REQUIRE(parallel.success);
-    CHECK(parallel.includedPointCount == decimated.includedPointCount);
-    CHECK(parallel.sourcePointIndices == decimated.sourcePointIndices);
+    // At most one point per 2 mm cell (half-offset cubic grid).
+    std::set<std::array<int, 3U>> cells;
+    for (const auto& position : two.cloud.positions) {
+        cells.insert({
+            static_cast<int>(std::floor((position.x - 0.001F) / 0.002F)),
+            static_cast<int>(std::floor((position.y - 0.001F) / 0.002F)),
+            static_cast<int>(std::floor((position.z - 0.001F) / 0.002F)),
+        });
+    }
+    CHECK(cells.size() == two.cloud.PointCount());
+    REQUIRE(two.cloud.scalarFields.size() == 1U);
+    CHECK(two.cloud.scalarFields.front().count == two.cloud.PointCount());
+    CHECK(two.cloud.bounds.valid);
+
+    // Thread/bucket count must not change the selection.
+    const auto twoParallel = load(0.002F, 0.25F, 5U);
+    REQUIRE(twoParallel.success);
+    CHECK(twoParallel.sourcePointIndices == two.sourcePointIndices);
+    CHECK(FieldValues(twoParallel.cloud, "Height") == FieldValues(two.cloud, "Height"));
+
+    // 3 mm cells: interior cells hold up to nine parents (one output); edge
+    // and z-split cells hold fewer and round by the dithered quota, so the
+    // total stays near a ninth of the lattice.
+    const auto three = load(0.003F, 1.0F / 9.0F, 3U);
+    REQUIRE(three.success);
+    const double expectedThree = static_cast<double>(kSide * kSide) / 9.0;
+    CHECK(static_cast<double>(three.cloud.PointCount()) ==
+          Approx(expectedThree).margin(expectedThree * 0.08));
+    CHECK(three.cloud.PointCount() < two.cloud.PointCount());
 }
 
 TEST_CASE(

@@ -61,17 +61,29 @@ renormalization seam. Existing full-role density compensation remains on the
 
 The patch spacing selector beside the HQ button (`linked_hq_patch_spacing_um`
 in the project, 1000 by default) trades patch density for speed without
-touching the 5 mm remainder or exports. At 2 mm or 3 mm the 1 mm scan keeps
-one in four or one in nine of the points inside the union, selected by a fixed
-hash of each point's source index (`PointCloudSubsetDecimationKeeps`) so the
-pattern is uniform, stable between launches and independent of scan threading.
-The patch declares that nominal spacing together with its exact kept/scanned
-counts, so `ResolvePointCloudDensityCompensation` yields footprint 2 or 3 with
-coverage 1 — the same rule that keeps the 5 mm display bundle at 1 mm
-brightness. Changing the spacing rescans the sources and re-enables a live HQ
-view when the new patches publish. On `Proj_A_09S01`/`Proj_B_09S01` the 2 mm
-patch holds 10.6 M points and adds roughly a third to the 5 mm frame time
-instead of tripling it. All fields already
+touching the 5 mm remainder or exports. At 2 mm or 3 mm the scanned 1 mm
+points inside the union are thinned by `DecimatePointCloudSubsetByGrid`, the
+density-preserving cell stratification of the display-density cache: points
+group into half-offset cubic cells of the chosen spacing, a cell with `n`
+parents keeps `round(n / 4)` (2 mm) or `round(n / 9)` (3 mm) of them with the
+fraction dithered by a stable cell hash (so totals are unbiased and sparse
+cells are not cut off), a single output is the real parent nearest the cell's
+parent centroid, and further outputs follow a stable position/colour hash.
+This is orientation independent, deterministic, and independent of scan
+threading. A plain per-point random hash was tried first and rejected: it
+matched the mean brightness but its Poisson density fluctuations rendered as
+visible speckle, because the sharp gaussian kernel paints only ~0.2 of the
+sprite diameter. The patch declares the nominal spacing together with its
+exact kept/scanned counts, so `ResolvePointCloudDensityCompensation` yields
+footprint 2 or 3 with coverage 1 — the same rule that keeps the 5 mm display
+bundle at 1 mm brightness. Changing the spacing rescans the sources and
+re-enables a live HQ view when the new patches publish. On
+`Proj_A_09S01`/`Proj_B_09S01` the 2 mm patch holds 10.6 M points and adds
+roughly a third to the 5 mm frame time instead of tripling it; in A-0.5
+captures its mean luminance is within 0.2% of the 1 mm patch and its 9x9
+high-pass texture measure matches (22.7 vs 22.5), while 3 mm visibly thins
+fine vegetation. `--gui-smoke linked-hq-frame-capture` writes the frames used
+for this comparison. All fields already
 referenced by saved Visuals and Timing Takes load during extraction. Ordered
 source indices allow a newly referenced scalar field to be gathered later in
 the background without retaining the complete 1 mm source cloud.

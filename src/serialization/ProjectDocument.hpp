@@ -191,8 +191,8 @@ struct ProjectDocument {
     bool liveVisualEffects = false;
     bool previewPerformanceMode = false;
     // Linked A/B HQ patch density: 1000 keeps every 1 mm point inside the
-    // midpoint union, 2000/3000 keep a deterministic 1/4 or 1/9 of them
-    // with matching density compensation. Session preview only.
+    // midpoint union, 2000/3000 thin them to one centred point per cell of
+    // that spacing with matching density compensation. Preview only.
     std::uint32_t linkedHqPatchSpacingMicrometres = 1000U;
     // Bypasses scalar-field residency so loads keep every on-disk field
     // (the pre-schema-65 behaviour). Off = filtered loads with on-demand

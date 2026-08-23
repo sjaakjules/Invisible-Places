@@ -18,9 +18,11 @@ namespace invisible_places::app {
 constexpr float kLinkedHqViewportBorderFraction = 0.05F;
 
 // Patch densities the HQ control offers. 1 mm keeps every source point
-// inside the midpoint union; coarser choices keep a hash-selected fraction
-// of the 1 mm scan (one in (spacing / 1 mm)^2 points) and declare that
-// nominal spacing so density compensation restores the 1 mm coverage.
+// inside the midpoint union; coarser choices thin the 1 mm scan with the
+// density-preserving cell stratification of the display-density cache
+// (cells of the chosen spacing, keeping (1 mm / spacing)^2 of the parents)
+// and declare that nominal spacing so density compensation restores the
+// 1 mm coverage.
 constexpr std::array<std::uint32_t, 3U> kLinkedHqPatchSpacingChoicesMicrometres{
     1'000U,
     2'000U,
@@ -30,8 +32,9 @@ constexpr std::array<std::uint32_t, 3U> kLinkedHqPatchSpacingChoicesMicrometres{
 [[nodiscard]] std::uint32_t SanitizeLinkedHqPatchSpacing(
     std::uint32_t spacingMicrometres);
 
-// One-in-N keep modulus for the 1 mm scan at the given patch spacing.
-[[nodiscard]] std::uint32_t LinkedHqDecimationKeepOneIn(
+// Expected kept fraction of the 1 mm scan at the given patch spacing
+// ((1 mm / spacing)^2; exactly 1 at 1 mm).
+[[nodiscard]] float LinkedHqPatchKeepFraction(
     std::uint32_t spacingMicrometres);
 
 // The two authored midpoint cameras define a union. BorderFraction is a

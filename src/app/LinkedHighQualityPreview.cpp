@@ -43,10 +43,11 @@ std::uint32_t SanitizeLinkedHqPatchSpacing(std::uint32_t spacingMicrometres) {
     return best;
 }
 
-std::uint32_t LinkedHqDecimationKeepOneIn(std::uint32_t spacingMicrometres) {
+float LinkedHqPatchKeepFraction(std::uint32_t spacingMicrometres) {
     const auto spacing = SanitizeLinkedHqPatchSpacing(spacingMicrometres);
-    const auto ratio = spacing / kLinkedHqPatchSpacingChoicesMicrometres.front();
-    return std::max(1U, ratio * ratio);
+    const float ratio = static_cast<float>(spacing) /
+        static_cast<float>(kLinkedHqPatchSpacingChoicesMicrometres.front());
+    return 1.0F / std::max(1.0F, ratio * ratio);
 }
 
 bool LinkedHqFrustumUnion::Contains(

@@ -123,6 +123,20 @@ using PointCloudLoadProgress =
 // includePoint. Accepted points stay in source order and sourcePointIndices
 // records their original file-order indices, allowing additional fields to
 // be gathered later without retaining the complete source cloud.
+// Density-preserving, cell-stratified thinning of an accepted subset (the
+// scheme of the Scene3 display-density cache): points are grouped into
+// half-offset cubic cells of cellSizeMeters, a cell with n parents keeps
+// round(n * keepFraction) of them (the fraction dithered by a stable cell
+// hash so the total is unbiased and no occupancy class is cut off), a single
+// output is the real parent nearest the cell's parent centroid, and further
+// outputs follow a stable per-point hash order. Thinning is therefore
+// orientation independent, deterministic, and independent of threading.
+// cellSizeMeters <= 0 or keepFraction >= 1 disables it.
+struct PointCloudGridDecimation {
+    float cellSizeMeters = 0.0F;
+    float keepFraction = 1.0F;
+};
+
 struct PointCloudSubsetLoadOptions {
     PointCloudScalarFieldFilter fieldFilter{};
     PointCloudSubsetPredicate includePoint{};
@@ -131,28 +145,29 @@ struct PointCloudSubsetLoadOptions {
     // 0 sizes the range-parallel scan automatically (one range per
     // hardware thread, at most eight, at least one million points each).
     unsigned threadCount = 0U;
-    // Keeps one of every N points accepted by includePoint, chosen by a
-    // hash of the source index (see PointCloudSubsetDecimationKeeps), so the
-    // selection is uniform, deterministic, and independent of threading.
-    // 1 keeps every accepted point.
-    std::uint32_t decimationKeepOneIn = 1U;
+    PointCloudGridDecimation gridDecimation{};
 };
 
 struct PointCloudSubsetLoadResult {
     LoadedPointCloud cloud;
     std::vector<std::uint32_t> sourcePointIndices;
     std::uint64_t sourcePointCount = 0;
-    // Points accepted by includePoint before decimation; with
-    // decimationKeepOneIn == 1 this equals cloud.PointCount().
+    // Points accepted by includePoint before grid decimation; without
+    // decimation this equals cloud.PointCount().
     std::uint64_t includedPointCount = 0;
     std::string errorMessage;
     bool success = false;
     bool cancelled = false;
 };
 
-[[nodiscard]] bool PointCloudSubsetDecimationKeeps(
-    std::uint64_t sourceIndex,
-    std::uint32_t keepOneIn);
+// Applies PointCloudGridDecimation to an already loaded subset in place
+// (LoadPointCloudSubset calls this when its options request it). Returns
+// false only when cancelled; the result is then left unmodified.
+bool DecimatePointCloudSubsetByGrid(
+    PointCloudSubsetLoadResult* result,
+    const PointCloudGridDecimation& decimation,
+    std::stop_token stopToken = {},
+    unsigned threadCount = 0U);
 
 struct PointCloudPositionNormalSample {
     Float3 position{};

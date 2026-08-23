@@ -353,9 +353,10 @@ struct ProjectSettings {
     // original preview appearance exactly.
     bool previewPerformanceMode = false;
     // Linked A/B HQ patch density (1000, 2000 or 3000 micrometres). Above
-    // 1 mm the 1 mm scan keeps a hash-selected 1/4 or 1/9 of the points
-    // inside the midpoint union and declares that nominal spacing so the
-    // density compensation matches the 1 mm reference coverage.
+    // 1 mm the 1 mm scan is thinned to one centred parent per cell of that
+    // spacing (density-preserving quotas, like the 5 mm display cache) and
+    // declares the nominal spacing so the density compensation matches the
+    // 1 mm reference coverage.
     std::uint32_t linkedHqPatchSpacingMicrometres = 1000U;
     // Escape hatch for scalar-field residency: when set, point-cloud loads
     // materialise every on-disk scalar field exactly as before field
@@ -53049,9 +53050,12 @@ void StartLinkedHqPreparation(
               << ", " << sourcePaths[1U].filename().string() << ") at "
               << (request.patchSpacingMicrometres / 1000U) << " mm patch spacing"
               << (request.patchSpacingMicrometres > 1000U
-                      ? ", keeping one in " +
-                            std::to_string(LinkedHqDecimationKeepOneIn(
-                                request.patchSpacingMicrometres))
+                      ? ", cell-stratified to " +
+                            FormatFixed(
+                                100.0F * LinkedHqPatchKeepFraction(
+                                    request.patchSpacingMicrometres),
+                                1) +
+                            "% of the parents"
                       : std::string{})
               << "." << std::endl;
     hq.preparationWorker = std::jthread{
@@ -53100,9 +53104,16 @@ void StartLinkedHqPreparation(
                             const invisible_places::io::Float3& point) {
                             return frustums.Contains(point);
                         };
-                    options.decimationKeepOneIn =
-                        LinkedHqDecimationKeepOneIn(
-                            request.patchSpacingMicrometres);
+                    if (request.patchSpacingMicrometres > 1000U) {
+                        options.gridDecimation = {
+                            .cellSizeMeters =
+                                static_cast<float>(
+                                    request.patchSpacingMicrometres) *
+                                1.0e-6F,
+                            .keepFraction = LinkedHqPatchKeepFraction(
+                                request.patchSpacingMicrometres),
+                        };
+                    }
                     options.stopToken = stopToken;
                     options.progress =
                         [shared, patch](std::uint64_t completed,
@@ -57987,9 +57998,10 @@ void DrawLinkedSeamedViewHeaderControls(
             ImGui::SetTooltip(
                 "HQ patch spacing inside the two midpoint views.\n"
                 "1 mm keeps every 1 mm ROCK/VEG point (slowest, export-exact).\n"
-                "2 mm keeps one in four, 3 mm one in nine, chosen by a fixed "
-                "hash so the pattern is stable; the footprint compensation "
-                "restores the 1 mm coverage like a coarser display bundle.\n"
+                "2 mm / 3 mm keep one centred point per 2 mm / 3 mm cell (a "
+                "quarter / a ninth of the points, density preserving like the "
+                "5 mm display cache); the footprint compensation restores the "
+                "1 mm coverage. 2 mm reads like 1 mm; 3 mm thins fine vegetation.\n"
                 "Saved with the project; changing it rescans the 1 mm sources.");
         }
     } else if (failure.has_value()) {
@@ -116254,7 +116266,17 @@ int RunLinkedHqFrameTimingSmoke(
         bool hideGeneratedWaterOverlays = false;
         bool disableSeepage = false;
     };
-    const std::vector<PhaseSpec> phases{
+    // linked-hq-frame-capture is the short form: only the four camera/HQ
+    // combinations, a handful of frames each, and a PPM of the last frame so
+    // patch density and compensation can be compared by eye and by metric.
+    const bool captureOnly = options.scenario == "linked-hq-frame-capture";
+    const std::vector<PhaseSpec> capturePhases{
+        {.name = "hq_off_A", .hqEnabled = false},
+        {.name = "hq_on_A", .hqEnabled = true},
+        {.name = "hq_off_B", .hqEnabled = false, .camera = TimingCamera::BMidpoint},
+        {.name = "hq_on_B", .hqEnabled = true, .camera = TimingCamera::BMidpoint},
+    };
+    const std::vector<PhaseSpec> timingPhases{
         {.name = "hq_off_A", .hqEnabled = false},
         {.name = "hq_on_A", .hqEnabled = true},
         {.name = "hq_on_A_rain_off", .hqEnabled = true, .disableRain = true},
@@ -116278,6 +116300,7 @@ int RunLinkedHqFrameTimingSmoke(
         {.name = "hq_off_A_away", .hqEnabled = false, .camera = TimingCamera::AAway},
         {.name = "hq_on_A_away", .hqEnabled = true, .camera = TimingCamera::AAway},
     };
+    const auto& phases = captureOnly ? capturePhases : timingPhases;
     nlohmann::json phaseReport = nlohmann::json::object();
     nlohmann::json hqReport = nlohmann::json::object();
 
@@ -116593,8 +116616,10 @@ int RunLinkedHqFrameTimingSmoke(
         }
     };
 
-    constexpr std::uint32_t kSettleFrames = 24U;
-    constexpr std::uint32_t kSampleFrames = 72U;
+    const std::uint32_t kSettleFrames = captureOnly ? 8U : 24U;
+    const std::uint32_t kSampleFrames = captureOnly ? 8U : 72U;
+    const bool captureWasEnabled = viewport->LiveSceneReadbackCaptureEnabled();
+    viewport->SetLiveSceneReadbackCaptureEnabled(true);
     for (const auto& spec : phases) {
         switch (spec.camera) {
             case TimingCamera::AMidpoint:
@@ -116678,7 +116703,40 @@ int RunLinkedHqFrameTimingSmoke(
             });
         }
         summary["layers"] = std::move(layers);
+        // One readback of the presented frame per phase; a failed readback
+        // is reported but does not fail the timing run.
+        try {
+            const auto readback = viewport->ReadLiveSceneFrame();
+            const auto pixelCount =
+                static_cast<std::size_t>(readback.width) * readback.height;
+            if (readback.width > 0U && readback.height > 0U &&
+                readback.colorRgba8.size() == pixelCount * 4U) {
+                std::vector<std::uint8_t> rgb(pixelCount * 3U);
+                for (std::size_t pixel = 0U; pixel < pixelCount; ++pixel) {
+                    rgb[pixel * 3U] = readback.colorRgba8[pixel * 4U];
+                    rgb[pixel * 3U + 1U] = readback.colorRgba8[pixel * 4U + 1U];
+                    rgb[pixel * 3U + 2U] = readback.colorRgba8[pixel * 4U + 2U];
+                }
+                const auto imagePath = outputDirectory / (spec.name + ".ppm");
+                std::string imageError;
+                if (WritePpmImage(
+                        imagePath,
+                        readback.width,
+                        readback.height,
+                        rgb,
+                        &imageError)) {
+                    summary["frame_ppm"] = imagePath.string();
+                } else {
+                    summary["frame_error"] = imageError;
+                }
+            }
+        } catch (const std::exception& error) {
+            summary["frame_error"] = error.what();
+        }
         phaseReport[spec.name] = std::move(summary);
+    }
+    if (!captureWasEnabled) {
+        viewport->SetLiveSceneReadbackCaptureEnabled(false);
     }
     setSeepageEnabled(true);
     (void)SetLinkedHqPreviewEnabled(runtimeState, viewport, false);
@@ -119486,7 +119544,8 @@ int Application::Run(ApplicationRunOptions options) const {
             viewport->WaitIdle();
             return smokeExitCode;
         }
-        if (options.guiSmoke->scenario == "linked-hq-frame-timing") {
+        if (options.guiSmoke->scenario == "linked-hq-frame-timing" ||
+            options.guiSmoke->scenario == "linked-hq-frame-capture") {
             const auto smokeExitCode = RunLinkedHqFrameTimingSmoke(
                 options.guiSmoke.value(),
                 &window,

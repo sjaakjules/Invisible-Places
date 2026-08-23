@@ -434,9 +434,10 @@ density override without moving the canonical frame, camera, or playback. Its
 off state is complete 5 mm ROCK/SAND/VEG. Its on state keeps complete 5 mm SAND
 and combines compact 1 mm ROCK/VEG inside the union of the two authored
 midpoint camera views (with a 5% border on each viewport side) with 5 mm points
-outside. A spacing selector beside the button keeps every 1 mm point or a
-deterministic one in four (2 mm) / one in nine (3 mm) of them with matching
-density compensation when the full 1 mm patch is too slow. Preparation is cancellable and lower priority than normal display and
+outside. A spacing selector beside the button keeps every 1 mm point or thins them
+to one centred point per 2 mm or 3 mm cell (density-preserving, like the 5 mm
+display cache) with matching density compensation when the full 1 mm patch is
+too slow. Preparation is cancellable and lower priority than normal display and
 shared-cache startup, publishes both patches and masks atomically, and retains
 them only for the current session. The 1 mm SAND file is never read for this
 preview. Internal layers share the role Visual and effects but remain excluded

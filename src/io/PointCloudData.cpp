@@ -763,19 +763,281 @@ PointCloudLoadResult LoadPointCloud(
     return {.cloud = std::move(cloud), .success = true};
 }
 
-bool PointCloudSubsetDecimationKeeps(
-    std::uint64_t sourceIndex,
-    std::uint32_t keepOneIn) {
-    if (keepOneIn <= 1U) {
+namespace {
+
+// splitmix64 finaliser (the same mixer as the display-density cache
+// builder) so stable hashes order parents without file-order bias.
+std::uint64_t MixHash64(std::uint64_t value) {
+    value = (value ^ (value >> 30U)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27U)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31U);
+}
+
+std::uint64_t GridDecimationCellHash(std::uint64_t cellKey) {
+    return MixHash64(cellKey ^ 0x9e3779b97f4a7c15ULL);
+}
+
+// Stable parent order inside a cell: the micrometre-quantised position (and
+// the packed colour) hashed like the cache builder's point priority, so the
+// same parent wins regardless of source order or scan threading.
+std::uint64_t GridDecimationPointPriority(
+    const Float3& position,
+    std::uint32_t packedColor) {
+    const auto quantise = [](float value) {
+        return static_cast<std::uint64_t>(static_cast<std::int64_t>(
+            std::llround(static_cast<double>(value) * 1.0e6)));
+    };
+    std::uint64_t hash = MixHash64(quantise(position.x) ^ 0xa0761d6478bd642fULL);
+    hash ^= MixHash64(quantise(position.y) ^ 0x3ed0ac60ee8d8a7aULL);
+    hash ^= MixHash64(quantise(position.z) ^ 0x71a8e2ddc4f0a9e4ULL);
+    hash ^= MixHash64(static_cast<std::uint64_t>(packedColor) ^ 0x6c62272e07bb0142ULL);
+    return MixHash64(hash);
+}
+
+}  // namespace
+
+bool DecimatePointCloudSubsetByGrid(
+    PointCloudSubsetLoadResult* result,
+    const PointCloudGridDecimation& decimation,
+    std::stop_token stopToken,
+    unsigned threadCount) {
+    if (result == nullptr) {
         return true;
     }
-    // splitmix64 finaliser: every source index maps to an independent,
-    // well-mixed value so the kept fraction is 1/N without file-order bias.
-    std::uint64_t mixed = sourceIndex + 0x9e3779b97f4a7c15ULL;
-    mixed = (mixed ^ (mixed >> 30U)) * 0xbf58476d1ce4e5b9ULL;
-    mixed = (mixed ^ (mixed >> 27U)) * 0x94d049bb133111ebULL;
-    mixed ^= mixed >> 31U;
-    return (mixed % keepOneIn) == 0U;
+    auto& cloud = result->cloud;
+    const auto pointCount = cloud.PointCount();
+    const float cellSize = decimation.cellSizeMeters;
+    const double keepFraction = static_cast<double>(decimation.keepFraction);
+    if (pointCount == 0U || !std::isfinite(cellSize) || cellSize <= 0.0F ||
+        !std::isfinite(keepFraction) || keepFraction >= 1.0) {
+        return true;
+    }
+    if (stopToken.stop_requested()) {
+        return false;
+    }
+
+    // Cell keys: half-cell-offset cubic cells packed as three 21-bit
+    // coordinates (the offset keeps boundaries off whole-unit coordinates).
+    const double inverseCell = 1.0 / static_cast<double>(cellSize);
+    const double gridOffset = 0.5 * static_cast<double>(cellSize);
+    constexpr std::int64_t kCellBias = std::int64_t{1} << 20U;
+    constexpr std::int64_t kCellMask = (std::int64_t{1} << 21U) - 1;
+    const auto cellCoordinate = [&](float value) {
+        const double cell = std::floor((static_cast<double>(value) - gridOffset) * inverseCell);
+        const auto clamped = static_cast<std::int64_t>(std::clamp(
+            cell,
+            static_cast<double>(-kCellBias),
+            static_cast<double>(kCellBias - 1)));
+        return static_cast<std::uint64_t>((clamped + kCellBias) & kCellMask);
+    };
+    struct Entry {
+        std::uint64_t key;
+        std::uint32_t index;
+        std::uint32_t bucket;
+    };
+    std::vector<Entry> entries;
+    try {
+        entries.resize(pointCount);
+    } catch (const std::exception&) {
+        return true;
+    }
+    const auto hardwareThreads =
+        std::max(1U, std::thread::hardware_concurrency());
+    const unsigned bucketCount = std::max(
+        1U,
+        threadCount != 0U
+            ? threadCount
+            : static_cast<unsigned>(std::min<std::size_t>(
+                  std::min(hardwareThreads, 8U),
+                  std::max<std::size_t>(1U, pointCount / 250'000U))));
+    for (std::size_t index = 0U; index < pointCount; ++index) {
+        if ((index & 65535U) == 0U && stopToken.stop_requested()) {
+            return false;
+        }
+        const auto& position = cloud.positions[index];
+        const std::uint64_t key =
+            (cellCoordinate(position.x) << 42U) |
+            (cellCoordinate(position.y) << 21U) |
+            cellCoordinate(position.z);
+        entries[index] = {
+            .key = key,
+            .index = static_cast<std::uint32_t>(index),
+            .bucket = static_cast<std::uint32_t>(
+                GridDecimationCellHash(key) % bucketCount),
+        };
+    }
+
+    // Every cell lands in exactly one bucket, so buckets sort and decide
+    // independently; the keep mask is indexed by point, so merge order is
+    // irrelevant and the result is identical for any bucket count.
+    std::vector<std::uint8_t> keep(pointCount, 0U);
+    std::vector<std::vector<Entry>> buckets(bucketCount);
+    {
+        std::vector<std::size_t> counts(bucketCount, 0U);
+        for (const auto& entry : entries) {
+            ++counts[entry.bucket];
+        }
+        for (unsigned bucket = 0U; bucket < bucketCount; ++bucket) {
+            buckets[bucket].reserve(counts[bucket]);
+        }
+        for (const auto& entry : entries) {
+            buckets[entry.bucket].push_back(entry);
+        }
+        entries = {};
+    }
+    std::atomic<bool> cancelled{false};
+    const auto processBucket = [&](std::vector<Entry>* bucket) {
+        std::sort(
+            bucket->begin(),
+            bucket->end(),
+            [&](const Entry& left, const Entry& right) {
+                if (left.key != right.key) {
+                    return left.key < right.key;
+                }
+                const auto leftPriority = GridDecimationPointPriority(
+                    cloud.positions[left.index],
+                    cloud.packedColors[left.index]);
+                const auto rightPriority = GridDecimationPointPriority(
+                    cloud.positions[right.index],
+                    cloud.packedColors[right.index]);
+                if (leftPriority != rightPriority) {
+                    return leftPriority < rightPriority;
+                }
+                return left.index < right.index;
+            });
+        std::size_t groupStart = 0U;
+        while (groupStart < bucket->size()) {
+            if ((groupStart & 4095U) == 0U && stopToken.stop_requested()) {
+                cancelled.store(true, std::memory_order_relaxed);
+                return;
+            }
+            const auto key = (*bucket)[groupStart].key;
+            std::size_t groupEnd = groupStart + 1U;
+            while (groupEnd < bucket->size() && (*bucket)[groupEnd].key == key) {
+                ++groupEnd;
+            }
+            const auto parents = groupEnd - groupStart;
+            // Hash-dithered rounding of the cell quota keeps the expected
+            // total exactly keepFraction * parents without cutting off
+            // sparsely occupied cells.
+            const double quota = static_cast<double>(parents) * keepFraction;
+            const double whole = std::floor(quota);
+            const double dither =
+                static_cast<double>(GridDecimationCellHash(key ^ 0x2545f4914f6cdd1dULL) >> 11U) /
+                static_cast<double>(std::uint64_t{1} << 53U);
+            std::size_t outputs = static_cast<std::size_t>(whole) +
+                ((quota - whole) > dither ? 1U : 0U);
+            outputs = std::min(outputs, parents);
+            if (outputs == 1U) {
+                double centroidX = 0.0;
+                double centroidY = 0.0;
+                double centroidZ = 0.0;
+                for (std::size_t member = groupStart; member < groupEnd; ++member) {
+                    const auto& position = cloud.positions[(*bucket)[member].index];
+                    centroidX += position.x;
+                    centroidY += position.y;
+                    centroidZ += position.z;
+                }
+                centroidX /= static_cast<double>(parents);
+                centroidY /= static_cast<double>(parents);
+                centroidZ /= static_cast<double>(parents);
+                std::size_t best = groupStart;
+                double bestDistance = std::numeric_limits<double>::infinity();
+                for (std::size_t member = groupStart; member < groupEnd; ++member) {
+                    const auto& position = cloud.positions[(*bucket)[member].index];
+                    const double dx = position.x - centroidX;
+                    const double dy = position.y - centroidY;
+                    const double dz = position.z - centroidZ;
+                    const double distance = dx * dx + dy * dy + dz * dz;
+                    // Members are already in stable priority order, so a
+                    // strict comparison breaks exact ties deterministically.
+                    if (distance < bestDistance) {
+                        bestDistance = distance;
+                        best = member;
+                    }
+                }
+                keep[(*bucket)[best].index] = 1U;
+            } else {
+                for (std::size_t member = groupStart;
+                     member < groupStart + outputs;
+                     ++member) {
+                    keep[(*bucket)[member].index] = 1U;
+                }
+            }
+            groupStart = groupEnd;
+        }
+    };
+    {
+        std::vector<std::jthread> workers;
+        workers.reserve(bucketCount > 0U ? bucketCount - 1U : 0U);
+        for (unsigned bucket = 1U; bucket < bucketCount; ++bucket) {
+            workers.emplace_back([&processBucket, &buckets, bucket]() {
+                processBucket(&buckets[bucket]);
+            });
+        }
+        processBucket(&buckets[0]);
+    }
+    if (cancelled.load(std::memory_order_relaxed) || stopToken.stop_requested()) {
+        return false;
+    }
+    buckets = {};
+
+    // Compact every per-point array in place, keeping source order.
+    std::size_t kept = 0U;
+    for (std::size_t index = 0U; index < pointCount; ++index) {
+        if (keep[index] == 0U) {
+            continue;
+        }
+        if (kept != index) {
+            cloud.positions[kept] = cloud.positions[index];
+            if (cloud.hasNormals) {
+                cloud.normals[kept] = cloud.normals[index];
+            }
+            cloud.packedColors[kept] = cloud.packedColors[index];
+            result->sourcePointIndices[kept] = result->sourcePointIndices[index];
+        }
+        ++kept;
+    }
+    const auto fieldCount = cloud.scalarFields.size();
+    if (fieldCount > 0U) {
+        std::vector<float> compactedValues;
+        compactedValues.reserve(kept * fieldCount);
+        for (std::size_t slot = 0U; slot < fieldCount; ++slot) {
+            auto& stats = cloud.scalarFields[slot];
+            stats.minimum = 0.0F;
+            stats.maximum = 0.0F;
+            stats.count = 0U;
+            stats.valid = false;
+            for (std::size_t index = 0U; index < pointCount; ++index) {
+                if (keep[index] == 0U) {
+                    continue;
+                }
+                const float value =
+                    cloud.scalarFieldValues[cloud.ScalarFieldValueIndex(slot, index)];
+                compactedValues.push_back(value);
+                stats.Include(value);
+            }
+        }
+        cloud.scalarFieldValues = std::move(compactedValues);
+    }
+    cloud.positions.resize(kept);
+    if (cloud.hasNormals) {
+        cloud.normals.resize(kept);
+    }
+    cloud.packedColors.resize(kept);
+    result->sourcePointIndices.resize(kept);
+    cloud.bounds = {};
+    std::vector<Float3> focusSamples;
+    focusSamples.reserve(std::min<std::size_t>(kept, kMaxFocusSamples));
+    for (const auto& position : cloud.positions) {
+        cloud.bounds.Expand(position);
+        if (focusSamples.size() < kMaxFocusSamples) {
+            focusSamples.push_back(position);
+        }
+    }
+    cloud.focusPoint = ComputeRepresentativeFocusPoint(cloud.bounds, focusSamples);
+    cloud.hasFocusPoint = cloud.bounds.valid;
+    return true;
 }
 
 PointCloudSubsetLoadResult LoadPointCloudSubset(
@@ -926,7 +1188,6 @@ PointCloudSubsetLoadResult LoadPointCloudSubset(
         std::string errorMessage;
         bool cancelled = false;
     };
-    const std::uint32_t keepOneIn = std::max(1U, options.decimationKeepOneIn);
     std::atomic<std::uint64_t> scannedPoints{0U};
     // Progress is reported from the calling thread only: during its own
     // range after every chunk, then by polling while the workers finish.
@@ -1015,11 +1276,6 @@ PointCloudSubsetLoadResult LoadPointCloudSubset(
                         continue;
                     }
                     ++out->includedCount;
-                    if (!PointCloudSubsetDecimationKeeps(
-                            globalIndex,
-                            keepOneIn)) {
-                        continue;
-                    }
 
                     Float3 normal{};
                     std::uint8_t red = 255U;
@@ -1289,6 +1545,14 @@ PointCloudSubsetLoadResult LoadPointCloudSubset(
         return result;
     }
 
+    if (!DecimatePointCloudSubsetByGrid(
+            &result,
+            options.gridDecimation,
+            options.stopToken,
+            options.threadCount)) {
+        result.cancelled = true;
+        return result;
+    }
     if (options.progress) {
         options.progress(header.vertexCount, header.vertexCount);
     }

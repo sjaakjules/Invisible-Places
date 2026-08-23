@@ -399,11 +399,13 @@ HQ off shall render the complete 5 mm ROCK/SAND/VEG bundle. HQ on shall retain
 complete 5 mm SAND, render 1 mm ROCK and VEG point centres inside the
 union of the two member cameras evaluated at normalized `0.5`, and render 5 mm
 ROCK and VEG outside that union. A project-saved patch spacing of 1, 2 or 3 mm
-selects the inside density: 1 mm keeps every point, while 2 mm and 3 mm keep
-a deterministic one in four or one in nine of the scanned 1 mm points (chosen
-by a fixed hash of the source index) and declare that nominal spacing with the
-exact kept/scanned counts so the existing density compensation restores the
-1 mm reference coverage. Changing the spacing shall re-prepare the patches and
+selects the inside density: 1 mm keeps every point, while 2 mm and 3 mm thin
+the scanned 1 mm points with the density-preserving cell stratification of the
+display-density cache (cells of the chosen spacing keep a hash-dithered quota
+of one in four or one in nine of their parents, a single output being the real
+parent nearest the cell's parent centroid) and declare that nominal spacing
+with the exact kept/scanned counts so the existing density compensation
+restores the 1 mm reference coverage. Changing the spacing shall re-prepare the patches and
 restore an enabled HQ view once they publish. Each camera shall use its authored live-view
 aspect ratio, falling back to the current live aspect only when absent. The
 viewport shall extend by 5% of its full width/height beyond every X/Y side;
