@@ -128,6 +128,9 @@ struct PointCloudSubsetLoadOptions {
     PointCloudSubsetPredicate includePoint{};
     PointCloudLoadProgress progress{};
     std::stop_token stopToken{};
+    // 0 sizes the range-parallel scan automatically (one range per
+    // hardware thread, at most eight, at least one million points each).
+    unsigned threadCount = 0U;
 };
 
 struct PointCloudSubsetLoadResult {

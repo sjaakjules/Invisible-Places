@@ -5,7 +5,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -799,23 +801,6 @@ PointCloudSubsetLoadResult LoadPointCloudSubset(
         };
     }
 
-    std::ifstream input{payloadPath, std::ios::binary};
-    if (!input.is_open()) {
-        return {
-            .sourcePointCount = header.vertexCount,
-            .errorMessage = "Unable to open point cloud file.",
-        };
-    }
-    input.seekg(
-        static_cast<std::streamoff>(header.dataOffsetBytes),
-        std::ios::beg);
-    if (!input.good()) {
-        return {
-            .sourcePointCount = header.vertexCount,
-            .errorMessage = "Failed to seek to PLY payload.",
-        };
-    }
-
     PointCloudSubsetLoadResult result;
     result.sourcePointCount = header.vertexCount;
     auto& cloud = result.cloud;
@@ -902,206 +887,386 @@ PointCloudSubsetLoadResult LoadPointCloudSubset(
         activeProperties.push_back(active);
     }
 
-    std::vector<std::vector<float>> fieldColumns(
-        cloud.scalarFields.size());
-    std::vector<float> retainedFieldValues(
-        cloud.scalarFields.size(),
-        0.0F);
-    std::vector<Float3> focusSamples;
-    focusSamples.reserve(kMaxFocusSamples);
     const auto readFloat = [](const std::byte* bytes, ScalarType type) {
         return type == ScalarType::Float32
                    ? ReadScalar<float>(bytes)
                    : static_cast<float>(ReadScalarAsDouble(bytes, type));
     };
-    const auto finalizeCloud = [&]() {
+    const std::size_t residentFieldCount = cloud.scalarFields.size();
+    const bool hasNormals = cloud.hasNormals;
+
+    // Each worker keeps its accepted points in source order; ranges are
+    // concatenated in index order afterwards, so the merged cloud, source
+    // indices, bounds, stats and focus samples match a sequential scan.
+    struct RangeOutput {
+        std::vector<Float3> positions;
+        std::vector<Float3> normals;
+        std::vector<std::uint32_t> packedColors;
+        std::vector<std::uint32_t> sourceIndices;
+        std::vector<std::vector<float>> fieldColumns;
+        std::vector<ScalarFieldStats> fieldStats;
+        std::vector<Float3> focusSamples;
+        Bounds3f bounds{};
+        std::string errorMessage;
+        bool cancelled = false;
+    };
+    std::atomic<std::uint64_t> scannedPoints{0U};
+    // Progress is reported from the calling thread only: during its own
+    // range after every chunk, then by polling while the workers finish.
+    std::uint64_t reportedPoints = 0U;
+    const auto reportProgress = [&]() {
+        const auto scanned = std::min(
+            header.vertexCount,
+            scannedPoints.load(std::memory_order_relaxed));
+        if (options.progress && scanned > reportedPoints) {
+            reportedPoints = scanned;
+            options.progress(scanned, header.vertexCount);
+        }
+    };
+    const auto parseRange = [&](std::uint64_t rangeBegin,
+                                std::uint64_t rangeEnd,
+                                RangeOutput* out,
+                                bool reportsProgress) {
+        out->fieldColumns.resize(residentFieldCount);
+        out->fieldStats.resize(residentFieldCount);
+        std::vector<float> retainedFieldValues(residentFieldCount, 0.0F);
+        std::ifstream rangeInput{payloadPath, std::ios::binary};
+        if (!rangeInput.is_open()) {
+            out->errorMessage = "Unable to open point cloud file.";
+            return;
+        }
+        rangeInput.seekg(
+            static_cast<std::streamoff>(
+                header.dataOffsetBytes + rangeBegin * layout->recordSize),
+            std::ios::beg);
+        if (!rangeInput.good()) {
+            out->errorMessage = "Failed to seek to PLY payload.";
+            return;
+        }
+        const auto pointsPerChunk =
+            RecommendedPointsPerChunk(layout->recordSize);
+        std::vector<std::byte> chunkBuffer(
+            pointsPerChunk * layout->recordSize);
         try {
-            cloud.scalarFieldValues.clear();
-            cloud.scalarFieldValues.reserve(
-                cloud.PointCount() * cloud.scalarFields.size());
-            for (auto& column : fieldColumns) {
-                cloud.scalarFieldValues.insert(
-                    cloud.scalarFieldValues.end(),
-                    column.begin(),
-                    column.end());
+            for (std::uint64_t pointStart = rangeBegin;
+                 pointStart < rangeEnd;
+                 pointStart += pointsPerChunk) {
+                if (options.stopToken.stop_requested()) {
+                    out->cancelled = true;
+                    return;
+                }
+                const auto remaining = rangeEnd - pointStart;
+                const auto pointsThisChunk = static_cast<std::size_t>(
+                    std::min<std::uint64_t>(remaining, pointsPerChunk));
+                const auto bytesToRead =
+                    pointsThisChunk * layout->recordSize;
+                rangeInput.read(
+                    reinterpret_cast<char*>(chunkBuffer.data()),
+                    static_cast<std::streamsize>(bytesToRead));
+                if (rangeInput.gcount() !=
+                    static_cast<std::streamsize>(bytesToRead)) {
+                    out->errorMessage =
+                        "Unexpected EOF while reading point cloud payload.";
+                    return;
+                }
+
+                for (std::size_t localIndex = 0U;
+                     localIndex < pointsThisChunk;
+                     ++localIndex) {
+                    if ((localIndex & 4095U) == 0U &&
+                        options.stopToken.stop_requested()) {
+                        out->cancelled = true;
+                        return;
+                    }
+                    const auto globalIndex =
+                        pointStart + static_cast<std::uint64_t>(localIndex);
+                    const auto* recordBytes =
+                        chunkBuffer.data() +
+                        (localIndex * layout->recordSize);
+                    Float3 position{};
+                    position.x = readFloat(
+                        recordBytes + positionProperties[0U].offset,
+                        positionProperties[0U].type);
+                    position.y = readFloat(
+                        recordBytes + positionProperties[1U].offset,
+                        positionProperties[1U].type);
+                    position.z = readFloat(
+                        recordBytes + positionProperties[2U].offset,
+                        positionProperties[2U].type);
+                    if (options.includePoint &&
+                        !options.includePoint(position)) {
+                        continue;
+                    }
+
+                    Float3 normal{};
+                    std::uint8_t red = 255U;
+                    std::uint8_t green = 255U;
+                    std::uint8_t blue = 255U;
+                    std::fill(
+                        retainedFieldValues.begin(),
+                        retainedFieldValues.end(),
+                        0.0F);
+                    for (const auto& property : activeProperties) {
+                        const auto* propertyBytes =
+                            recordBytes + property.offset;
+                        switch (property.semantic) {
+                            case PropertySemantic::ColorR:
+                                red = ReadScalarAsByte(
+                                    propertyBytes,
+                                    property.type);
+                                break;
+                            case PropertySemantic::ColorG:
+                                green = ReadScalarAsByte(
+                                    propertyBytes,
+                                    property.type);
+                                break;
+                            case PropertySemantic::ColorB:
+                                blue = ReadScalarAsByte(
+                                    propertyBytes,
+                                    property.type);
+                                break;
+                            case PropertySemantic::NormalX:
+                                normal.x = readFloat(
+                                    propertyBytes,
+                                    property.type);
+                                break;
+                            case PropertySemantic::NormalY:
+                                normal.y = readFloat(
+                                    propertyBytes,
+                                    property.type);
+                                break;
+                            case PropertySemantic::NormalZ:
+                                normal.z = readFloat(
+                                    propertyBytes,
+                                    property.type);
+                                break;
+                            case PropertySemantic::ScalarField: {
+                                const auto slot = static_cast<std::size_t>(
+                                    property.residentSlot);
+                                retainedFieldValues[slot] = readFloat(
+                                    propertyBytes,
+                                    property.type);
+                                break;
+                            }
+                            default:
+                                break;
+                        }
+                    }
+
+                    out->positions.push_back(position);
+                    if (hasNormals) {
+                        out->normals.push_back(NormalizeNormal(normal));
+                    }
+                    out->packedColors.push_back(
+                        PackRgba8(red, green, blue));
+                    out->sourceIndices.push_back(
+                        static_cast<std::uint32_t>(globalIndex));
+                    out->bounds.Expand(position);
+                    if (out->focusSamples.size() < kMaxFocusSamples) {
+                        out->focusSamples.push_back(position);
+                    }
+                    for (std::size_t slot = 0U;
+                         slot < residentFieldCount;
+                         ++slot) {
+                        out->fieldColumns[slot].push_back(
+                            retainedFieldValues[slot]);
+                        out->fieldStats[slot].Include(
+                            retainedFieldValues[slot]);
+                    }
+                }
+                scannedPoints.fetch_add(
+                    pointsThisChunk,
+                    std::memory_order_relaxed);
+                if (reportsProgress) {
+                    reportProgress();
+                }
             }
         } catch (const std::exception& error) {
-            result.errorMessage =
-                std::string{"Filtered point-cloud allocation failed: "} +
+            out->errorMessage =
+                std::string{"Filtered point-cloud parsing failed: "} +
                 error.what();
-            return false;
         }
-        cloud.focusPoint =
-            ComputeRepresentativeFocusPoint(cloud.bounds, focusSamples);
-        cloud.hasFocusPoint = cloud.bounds.valid;
-        return true;
     };
+
+    // One range per worker, sized so small sources stay single-threaded; the
+    // calling thread parses the first range and then reports progress on
+    // behalf of the others.
+    constexpr std::uint64_t kMinimumPointsPerParseThread = 1'000'000ULL;
+    const auto hardwareThreads =
+        std::max(1U, std::thread::hardware_concurrency());
+    auto effectiveThreads = options.threadCount != 0U
+        ? options.threadCount
+        : static_cast<unsigned>(std::min<std::uint64_t>(
+              std::min(hardwareThreads, 8U),
+              std::max<std::uint64_t>(
+                  1ULL,
+                  header.vertexCount / kMinimumPointsPerParseThread)));
+    effectiveThreads = static_cast<unsigned>(std::min<std::uint64_t>(
+        std::max(1U, effectiveThreads),
+        std::max<std::uint64_t>(1ULL, header.vertexCount)));
 
     if (options.progress) {
         options.progress(0U, header.vertexCount);
     }
-    const auto pointsPerChunk =
-        RecommendedPointsPerChunk(layout->recordSize);
-    std::vector<std::byte> chunkBuffer(
-        pointsPerChunk * layout->recordSize);
-    try {
-        for (std::uint64_t pointStart = 0U;
-             pointStart < header.vertexCount;
-             pointStart += pointsPerChunk) {
-            if (options.stopToken.stop_requested()) {
-                result.cancelled = true;
-                finalizeCloud();
-                return result;
-            }
-            const auto remaining = header.vertexCount - pointStart;
-            const auto pointsThisChunk = static_cast<std::size_t>(
-                std::min<std::uint64_t>(remaining, pointsPerChunk));
-            const auto bytesToRead =
-                pointsThisChunk * layout->recordSize;
-            input.read(
-                reinterpret_cast<char*>(chunkBuffer.data()),
-                static_cast<std::streamsize>(bytesToRead));
-            if (input.gcount() !=
-                static_cast<std::streamsize>(bytesToRead)) {
-                result.errorMessage =
-                    "Unexpected EOF while reading point cloud payload.";
-                finalizeCloud();
-                return result;
-            }
-
-            for (std::size_t localIndex = 0U;
-                 localIndex < pointsThisChunk;
-                 ++localIndex) {
-                if ((localIndex & 4095U) == 0U &&
-                    options.stopToken.stop_requested()) {
-                    result.cancelled = true;
-                    if (options.progress) {
-                        options.progress(
-                            pointStart + localIndex,
-                            header.vertexCount);
-                    }
-                    finalizeCloud();
-                    return result;
-                }
-                const auto globalIndex =
-                    pointStart + static_cast<std::uint64_t>(localIndex);
-                const auto* recordBytes =
-                    chunkBuffer.data() +
-                    (localIndex * layout->recordSize);
-                Float3 position{};
-                position.x = readFloat(
-                    recordBytes + positionProperties[0U].offset,
-                    positionProperties[0U].type);
-                position.y = readFloat(
-                    recordBytes + positionProperties[1U].offset,
-                    positionProperties[1U].type);
-                position.z = readFloat(
-                    recordBytes + positionProperties[2U].offset,
-                    positionProperties[2U].type);
-                if (options.includePoint &&
-                    !options.includePoint(position)) {
-                    continue;
-                }
-
-                Float3 normal{};
-                std::uint8_t red = 255U;
-                std::uint8_t green = 255U;
-                std::uint8_t blue = 255U;
-                std::fill(
-                    retainedFieldValues.begin(),
-                    retainedFieldValues.end(),
-                    0.0F);
-                for (const auto& property : activeProperties) {
-                    const auto* propertyBytes =
-                        recordBytes + property.offset;
-                    switch (property.semantic) {
-                        case PropertySemantic::ColorR:
-                            red = ReadScalarAsByte(
-                                propertyBytes,
-                                property.type);
-                            break;
-                        case PropertySemantic::ColorG:
-                            green = ReadScalarAsByte(
-                                propertyBytes,
-                                property.type);
-                            break;
-                        case PropertySemantic::ColorB:
-                            blue = ReadScalarAsByte(
-                                propertyBytes,
-                                property.type);
-                            break;
-                        case PropertySemantic::NormalX:
-                            normal.x = readFloat(
-                                propertyBytes,
-                                property.type);
-                            break;
-                        case PropertySemantic::NormalY:
-                            normal.y = readFloat(
-                                propertyBytes,
-                                property.type);
-                            break;
-                        case PropertySemantic::NormalZ:
-                            normal.z = readFloat(
-                                propertyBytes,
-                                property.type);
-                            break;
-                        case PropertySemantic::ScalarField: {
-                            const auto slot = static_cast<std::size_t>(
-                                property.residentSlot);
-                            retainedFieldValues[slot] = readFloat(
-                                propertyBytes,
-                                property.type);
-                            break;
-                        }
-                        default:
-                            break;
-                    }
-                }
-
-                cloud.positions.push_back(position);
-                if (cloud.hasNormals) {
-                    cloud.normals.push_back(NormalizeNormal(normal));
-                }
-                cloud.packedColors.push_back(
-                    PackRgba8(red, green, blue));
-                result.sourcePointIndices.push_back(
-                    static_cast<std::uint32_t>(globalIndex));
-                cloud.bounds.Expand(position);
-                if (focusSamples.size() < kMaxFocusSamples) {
-                    focusSamples.push_back(position);
-                }
-                for (std::size_t slot = 0U;
-                     slot < fieldColumns.size();
-                     ++slot) {
-                    fieldColumns[slot].push_back(
-                        retainedFieldValues[slot]);
-                    cloud.scalarFields[slot].Include(
-                        retainedFieldValues[slot]);
-                }
-            }
-            if (options.progress) {
-                options.progress(
-                    std::min<std::uint64_t>(
-                        header.vertexCount,
-                        pointStart + pointsThisChunk),
-                    header.vertexCount);
-            }
-            if (options.stopToken.stop_requested()) {
-                result.cancelled = true;
-                finalizeCloud();
-                return result;
-            }
+    std::vector<RangeOutput> outputs(effectiveThreads);
+    {
+        std::vector<std::jthread> workers;
+        workers.reserve(effectiveThreads - 1U);
+        std::atomic<unsigned> finishedWorkers{0U};
+        const auto pointsPerRange =
+            (header.vertexCount + effectiveThreads - 1U) / effectiveThreads;
+        for (unsigned workerIndex = 1U;
+             workerIndex < effectiveThreads;
+             ++workerIndex) {
+            const auto rangeBegin = std::min<std::uint64_t>(
+                header.vertexCount,
+                static_cast<std::uint64_t>(workerIndex) * pointsPerRange);
+            const auto rangeEnd = std::min<std::uint64_t>(
+                header.vertexCount,
+                rangeBegin + pointsPerRange);
+            workers.emplace_back(
+                [&parseRange,
+                 rangeBegin,
+                 rangeEnd,
+                 &outputs,
+                 &finishedWorkers,
+                 workerIndex]() {
+                    parseRange(
+                        rangeBegin,
+                        rangeEnd,
+                        &outputs[workerIndex],
+                        false);
+                    finishedWorkers.fetch_add(1U, std::memory_order_release);
+                });
         }
-    } catch (const std::exception& error) {
-        result.errorMessage =
-            std::string{"Filtered point-cloud parsing failed: "} +
-            error.what();
-        finalizeCloud();
+        parseRange(
+            0U,
+            std::min<std::uint64_t>(header.vertexCount, pointsPerRange),
+            &outputs[0],
+            true);
+        // Workers also leave early on error or cancellation, which the
+        // finished count covers.
+        reportProgress();
+        while (finishedWorkers.load(std::memory_order_acquire) <
+               workers.size()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{50});
+            reportProgress();
+        }
+        for (auto& worker : workers) {
+            worker.join();
+        }
+        reportProgress();
+    }
+
+    bool cancelled = false;
+    for (auto& output : outputs) {
+        if (!output.errorMessage.empty()) {
+            result.errorMessage = output.errorMessage;
+            return result;
+        }
+        cancelled = cancelled || output.cancelled;
+    }
+    if (cancelled || options.stopToken.stop_requested()) {
+        result.cancelled = true;
+        if (options.progress) {
+            options.progress(
+                std::min(
+                    header.vertexCount,
+                    scannedPoints.load(std::memory_order_relaxed)),
+                header.vertexCount);
+        }
         return result;
     }
 
-    if (!finalizeCloud()) {
+    try {
+        std::size_t acceptedCount = 0U;
+        for (const auto& output : outputs) {
+            acceptedCount += output.positions.size();
+        }
+        cloud.positions.reserve(acceptedCount);
+        if (hasNormals) {
+            cloud.normals.reserve(acceptedCount);
+        }
+        cloud.packedColors.reserve(acceptedCount);
+        result.sourcePointIndices.reserve(acceptedCount);
+        std::vector<Float3> focusSamples;
+        focusSamples.reserve(
+            std::min<std::size_t>(acceptedCount, kMaxFocusSamples));
+        for (auto& output : outputs) {
+            cloud.positions.insert(
+                cloud.positions.end(),
+                output.positions.begin(),
+                output.positions.end());
+            if (hasNormals) {
+                cloud.normals.insert(
+                    cloud.normals.end(),
+                    output.normals.begin(),
+                    output.normals.end());
+            }
+            cloud.packedColors.insert(
+                cloud.packedColors.end(),
+                output.packedColors.begin(),
+                output.packedColors.end());
+            result.sourcePointIndices.insert(
+                result.sourcePointIndices.end(),
+                output.sourceIndices.begin(),
+                output.sourceIndices.end());
+            if (output.bounds.valid) {
+                cloud.bounds.Expand(output.bounds.minimum);
+                cloud.bounds.Expand(output.bounds.maximum);
+            }
+            for (const auto& sample : output.focusSamples) {
+                if (focusSamples.size() >= kMaxFocusSamples) {
+                    break;
+                }
+                focusSamples.push_back(sample);
+            }
+            for (std::size_t slot = 0U; slot < residentFieldCount; ++slot) {
+                const auto& local = output.fieldStats[slot];
+                if (!local.valid) {
+                    continue;
+                }
+                auto& merged = cloud.scalarFields[slot];
+                if (!merged.valid) {
+                    merged.minimum = local.minimum;
+                    merged.maximum = local.maximum;
+                    merged.count = local.count;
+                    merged.valid = true;
+                } else {
+                    merged.minimum = std::min(merged.minimum, local.minimum);
+                    merged.maximum = std::max(merged.maximum, local.maximum);
+                    merged.count += local.count;
+                }
+            }
+            // Release per-range geometry as soon as it is merged so the peak
+            // stays near one copy of the accepted points.
+            output.positions = {};
+            output.normals = {};
+            output.packedColors = {};
+            output.sourceIndices = {};
+        }
+        cloud.scalarFieldValues.reserve(acceptedCount * residentFieldCount);
+        for (std::size_t slot = 0U; slot < residentFieldCount; ++slot) {
+            for (auto& output : outputs) {
+                cloud.scalarFieldValues.insert(
+                    cloud.scalarFieldValues.end(),
+                    output.fieldColumns[slot].begin(),
+                    output.fieldColumns[slot].end());
+                output.fieldColumns[slot] = {};
+            }
+        }
+        cloud.focusPoint =
+            ComputeRepresentativeFocusPoint(cloud.bounds, focusSamples);
+        cloud.hasFocusPoint = cloud.bounds.valid;
+    } catch (const std::exception& error) {
+        result.errorMessage =
+            std::string{"Filtered point-cloud allocation failed: "} +
+            error.what();
         return result;
+    }
+
+    if (options.progress) {
+        options.progress(header.vertexCount, header.vertexCount);
     }
     result.success = true;
     return result;

@@ -197,6 +197,74 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Range-parallel filtered PLY loading matches the sequential scan",
+    "[pointcloud][linked-hq][io]") {
+    const auto path = WriteSubsetFixture("parallel-subset");
+    const auto load = [&](unsigned threadCount) {
+        invisible_places::io::PointCloudSubsetLoadOptions options;
+        options.fieldFilter.mode =
+            invisible_places::io::PointCloudScalarFieldFilter::Mode::Selected;
+        options.fieldFilter.names = {"Size", "Opacity"};
+        options.includePoint =
+            [](const invisible_places::io::Float3& point) {
+                return point.x >= -2.0F && point.x <= 2.0F &&
+                       point.x != 0.0F;
+            };
+        options.threadCount = threadCount;
+        return invisible_places::io::LoadPointCloudSubset(path, options);
+    };
+    const auto sequential = load(1U);
+    REQUIRE(sequential.success);
+    CHECK(sequential.sourcePointIndices ==
+          std::vector<std::uint32_t>{0U, 1U, 3U, 4U});
+
+    // Four ranges over six points leaves some ranges with one point and the
+    // rejected point on a range boundary.
+    for (const unsigned threadCount : {2U, 4U, 6U}) {
+        const auto parallel = load(threadCount);
+        REQUIRE(parallel.success);
+        CHECK_FALSE(parallel.cancelled);
+        CHECK(parallel.sourcePointCount == sequential.sourcePointCount);
+        CHECK(parallel.sourcePointIndices == sequential.sourcePointIndices);
+        REQUIRE(parallel.cloud.PointCount() == sequential.cloud.PointCount());
+        for (std::size_t point = 0U;
+             point < sequential.cloud.PointCount();
+             ++point) {
+            CHECK(parallel.cloud.positions[point].x ==
+                  sequential.cloud.positions[point].x);
+            CHECK(parallel.cloud.positions[point].y ==
+                  sequential.cloud.positions[point].y);
+            CHECK(parallel.cloud.normals[point].z ==
+                  sequential.cloud.normals[point].z);
+            CHECK(parallel.cloud.packedColors[point] ==
+                  sequential.cloud.packedColors[point]);
+        }
+        CHECK(FieldValues(parallel.cloud, "Size") ==
+              FieldValues(sequential.cloud, "Size"));
+        CHECK(FieldValues(parallel.cloud, "Opacity") ==
+              FieldValues(sequential.cloud, "Opacity"));
+        REQUIRE(parallel.cloud.scalarFields.size() ==
+                sequential.cloud.scalarFields.size());
+        for (std::size_t slot = 0U;
+             slot < sequential.cloud.scalarFields.size();
+             ++slot) {
+            CHECK(parallel.cloud.scalarFields[slot].minimum ==
+                  sequential.cloud.scalarFields[slot].minimum);
+            CHECK(parallel.cloud.scalarFields[slot].maximum ==
+                  sequential.cloud.scalarFields[slot].maximum);
+            CHECK(parallel.cloud.scalarFields[slot].count ==
+                  sequential.cloud.scalarFields[slot].count);
+        }
+        CHECK(parallel.cloud.bounds.minimum.x ==
+              sequential.cloud.bounds.minimum.x);
+        CHECK(parallel.cloud.bounds.maximum.x ==
+              sequential.cloud.bounds.maximum.x);
+        CHECK(parallel.cloud.focusPoint.x == sequential.cloud.focusPoint.x);
+        CHECK(parallel.cloud.focusPoint.y == sequential.cloud.focusPoint.y);
+    }
+}
+
+TEST_CASE(
     "Filtered PLY loading and indexed field gathering are cancellable",
     "[pointcloud][linked-hq][io]") {
     const auto path = WriteSubsetFixture("cancellable-streams");
