@@ -1234,6 +1234,66 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Timing Colourise removing a phase key folds whole turns into the next key",
+    "[timing][colourise][cyclic][palette-phase]") {
+    using invisible_places::timing::EvaluateTimingColouriseEffectParameter;
+    using invisible_places::timing::
+        RemoveTimingColouriseEffectParameterKeysAtPosition;
+    using invisible_places::timing::WrapTimingColourisePalettePhaseDelta;
+
+    CHECK(WrapTimingColourisePalettePhaseDelta(0.4F) == 0.4F);
+    CHECK(WrapTimingColourisePalettePhaseDelta(-0.9F) == -0.9F);
+    CHECK(WrapTimingColourisePalettePhaseDelta(1.0F) == 1.0F);
+    CHECK(WrapTimingColourisePalettePhaseDelta(1.2F) == Approx(0.2F));
+    CHECK(WrapTimingColourisePalettePhaseDelta(-1.3F) == Approx(0.7F));
+    CHECK(WrapTimingColourisePalettePhaseDelta(2.5F) == Approx(0.5F));
+    CHECK(WrapTimingColourisePalettePhaseDelta(
+              std::numeric_limits<float>::quiet_NaN()) == 0.0F);
+
+    // The key-lane drag merges 0.0/1.0 twins by removing the 0.0 key. Its
+    // delta joins the next key's; a joined delta past one turn used to be
+    // skipped outright, losing the removed key's +0.6 and rotating the
+    // palette by 0.4 turn on the first drag frame.
+    TimingColouriseEffect effect;
+    effect.colouriseEnabled = true;
+    effect.palettePhaseOffset = 0.0F;
+    effect.effectParameterKeys = {
+        {.parameter = TimingColouriseEffectParameter::PalettePhase,
+         .position = 0.0F,
+         .value = 0.6F,
+         .interpolation = WaterScenarioInterpolation::Hold},
+        {.parameter = TimingColouriseEffectParameter::PalettePhase,
+         .position = 0.5F,
+         .value = 0.6F,
+         .interpolation = WaterScenarioInterpolation::Hold},
+        {.parameter = TimingColouriseEffectParameter::PalettePhase,
+         .position = 1.0F,
+         .value = 0.1F,
+         .interpolation = WaterScenarioInterpolation::Hold},
+    };
+    const auto phaseTurn = [](const TimingColouriseEffect& candidate,
+                              float t) {
+        const float phase = EvaluateTimingColouriseEffectParameter(
+            candidate,
+            TimingColouriseEffectParameter::PalettePhase,
+            t,
+            true);
+        return phase - std::floor(phase);
+    };
+    CHECK(phaseTurn(effect, 0.5F) == Approx(0.2F));
+    CHECK(phaseTurn(effect, 0.0F) == Approx(0.3F));
+    CHECK(RemoveTimingColouriseEffectParameterKeysAtPosition(
+              &effect,
+              TimingColouriseEffectParameter::PalettePhase,
+              0.0F) == 1U);
+    REQUIRE(effect.effectParameterKeys.size() == 2U);
+    CHECK(effect.effectParameterKeys[0U].value == Approx(0.2F));
+    CHECK(effect.effectParameterKeys[1U].value == Approx(0.1F));
+    CHECK(phaseTurn(effect, 0.5F) == Approx(0.2F));
+    CHECK(phaseTurn(effect, 0.0F) == Approx(0.3F));
+}
+
+TEST_CASE(
     "Timing Colourise cyclic coincidence follows the evaluator's seam rule",
     "[timing][colourise][cyclic][settings-clip]") {
     using invisible_places::timing::

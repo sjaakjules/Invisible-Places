@@ -761,6 +761,9 @@ TimingColouriseEffectSettingsKeySpan(
 [[nodiscard]] bool TimingColouriseKeyPositionsCoincideCyclically(
     float a,
     float b);
+// Folds a Palette Phase delta into the stored one-turn range by dropping the
+// whole turns the palette cannot see, instead of clamping them away.
+[[nodiscard]] float WrapTimingColourisePalettePhaseDelta(float delta);
 // Cyclic counterpart of TimingColouriseEffectSettingsKeySpan. The clip is the
 // complement of the largest circular gap between owned keys, so keys that
 // were dragged across loop zero remain one clip. When the wrap gap ties the

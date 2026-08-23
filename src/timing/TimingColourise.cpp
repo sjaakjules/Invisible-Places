@@ -4145,6 +4145,16 @@ bool TimingColouriseKeyPositionsCoincideCyclically(float a, float b) {
            kTimingColouriseKeyTolerance;
 }
 
+float WrapTimingColourisePalettePhaseDelta(float delta) {
+    if (!std::isfinite(delta)) {
+        return 0.0F;
+    }
+    if (delta > 1.0F || delta < -1.0F) {
+        delta -= std::floor(delta);
+    }
+    return ClampPalettePhaseDelta(delta);
+}
+
 std::optional<TimingColouriseCyclicSettingsKeySpan>
 TimingColouriseEffectCyclicSettingsKeySpan(
     const TimingColouriseEffect& effect) {
@@ -4363,19 +4373,10 @@ void PreserveTimingColourisePalettePhaseTargetsAfterMove(
     // Re-difference along the new order. A delta outside the stored [-1, 1]
     // range drops whole turns rather than clamping, so the keys still land
     // on the same palette rotation.
-    const auto encodeDelta = [](float delta) {
-        if (!std::isfinite(delta)) {
-            return 0.0F;
-        }
-        if (delta > 1.0F || delta < -1.0F) {
-            delta -= std::floor(delta);
-        }
-        return ClampPalettePhaseDelta(delta);
-    };
     float previous = FiniteOr(original.palettePhaseOffset, 0.0F);
     for (const std::size_t index : movedOrder) {
         moved->effectParameterKeys[index].value =
-            encodeDelta(absolute[index] - previous);
+            WrapTimingColourisePalettePhaseDelta(absolute[index] - previous);
         previous = absolute[index];
     }
 }
@@ -6846,10 +6847,11 @@ std::size_t RemoveTimingColouriseEffectParameterKeysAtPosition(
             }
         }
         if (next != effect->effectParameterKeys.end()) {
-            const float joinedDelta = next->value + removed->value;
-            if (joinedDelta >= -1.0F && joinedDelta <= 1.0F) {
-                next->value = ClampPalettePhaseDelta(joinedDelta);
-            }
+            // Whole turns are invisible to the palette, so a joined delta
+            // outside the stored range folds back into one turn rather than
+            // being skipped (which silently lost the removed key's delta).
+            next->value = WrapTimingColourisePalettePhaseDelta(
+                next->value + removed->value);
         }
     }
     const auto previousSize = effect->effectParameterKeys.size();
