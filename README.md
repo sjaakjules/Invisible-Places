@@ -171,6 +171,13 @@ cmake --build --preset build-macos-debug-home-vcpkg
 ./build/macos-debug/invisible_places.app/Contents/MacOS/invisible_places ./Data
 ```
 
+An optimised build (`RelWithDebInfo`: `-O2` with symbols, tests off) lives beside it and is what to run when using the app rather than debugging it — CPU-side work such as the linked HQ preparation is several times faster, while GPU-bound frame times are unchanged:
+
+```bash
+cmake --preset macos-release-home-vcpkg && cmake --build --preset build-macos-release-home-vcpkg --target invisible_places
+./build/macos-release/invisible_places.app/Contents/MacOS/invisible_places ./Data
+```
+
 ## Debugging
 
 Debugger setup is included for macOS LLDB and VS Code in:
@@ -179,7 +186,7 @@ Debugger setup is included for macOS LLDB and VS Code in:
 - [.vscode/tasks.json](/Users/juju/Documents/Repositories/Invisible%20Places/.vscode/tasks.json)
 - [docs/debugging.md](/Users/juju/Documents/Repositories/Invisible%20Places/docs/debugging.md)
 
-The simplest path is `Debug Invisible Places App`, which builds first and runs against the local `Data/` folder automatically.
+The simplest path is `Debug Invisible Places App`, which builds first and runs against the local `Data/` folder automatically. `Run Invisible Places App (Release)` does the same with the optimised `build/macos-release` binary (task `build-release`; use *Run Without Debugging* for plain use).
 
 ## Data assumptions
 

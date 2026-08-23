@@ -58,6 +58,61 @@
       "problemMatcher": []
     },
     {
+      "label": "configure-release",
+      "type": "shell",
+      "command": "cmake",
+      "args": [
+        "--preset",
+        "macos-release-home-vcpkg"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [
+        "$gcc"
+      ]
+    },
+    {
+      "label": "build-release",
+      "type": "shell",
+      "command": "cmake",
+      "args": [
+        "--build",
+        "--preset",
+        "build-macos-release-home-vcpkg",
+        "--target",
+        "invisible_places"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "dependsOn": [
+        "configure-release"
+      ],
+      "problemMatcher": [
+        "$gcc"
+      ],
+      "group": "build"
+    },
+    {
+      "label": "run-app-release",
+      "type": "shell",
+      "command": "./build/macos-release/invisible_places.app/Contents/MacOS/invisible_places",
+      "args": [
+        "${workspaceFolder}/Data"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "OS_ACTIVITY_MODE": "disable"
+        }
+      },
+      "dependsOn": [
+        "build-release"
+      ],
+      "problemMatcher": []
+    },
+    {
       "label": "run-tests",
       "type": "shell",
       "command": "ctest",

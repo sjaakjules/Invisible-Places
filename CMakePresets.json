@@ -36,6 +36,26 @@
       }
     },
     {
+      "name": "macos-release",
+      "displayName": "macOS Release (optimised, with symbols)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/macos-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "INVISIBLE_PLACES_ENABLE_TESTS": "OFF",
+        "INVISIBLE_PLACES_ENABLE_VULKAN": "ON"
+      }
+    },
+    {
+      "name": "macos-release-home-vcpkg",
+      "displayName": "macOS Release (home vcpkg clone)",
+      "inherits": "macos-release",
+      "toolchainFile": "$penv{HOME}/vcpkg/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "VCPKG_FEATURE_FLAGS": "manifests"
+      }
+    },
+    {
       "name": "windows-release-vcpkg",
       "displayName": "Windows Release (vcpkg)",
       "generator": "Ninja",
@@ -61,6 +81,14 @@
     {
       "name": "build-macos-debug-home-vcpkg",
       "configurePreset": "macos-debug-home-vcpkg"
+    },
+    {
+      "name": "build-macos-release",
+      "configurePreset": "macos-release"
+    },
+    {
+      "name": "build-macos-release-home-vcpkg",
+      "configurePreset": "macos-release-home-vcpkg"
     },
     {
       "name": "build-windows-release-vcpkg",

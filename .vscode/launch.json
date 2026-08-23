@@ -19,6 +19,23 @@
       ]
     },
     {
+      "name": "Run Invisible Places App (Release)",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/macos-release/invisible_places.app/Contents/MacOS/invisible_places",
+      "args": [
+        "${workspaceFolder}/Data"
+      ],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "OS_ACTIVITY_MODE": "disable"
+      },
+      "preLaunchTask": "build-release",
+      "sourceLanguages": [
+        "cpp"
+      ]
+    },
+    {
       "name": "Debug Invisible Places Tests",
       "type": "lldb",
       "request": "launch",
