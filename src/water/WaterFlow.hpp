@@ -1087,11 +1087,19 @@ WaterFeatureLooseKeySpan(const WaterFeatureTimeline& timeline);
 // Recomputes one stored clip's bounds from its owned keys. An unwrapped clip
 // takes the exact pre-W1 linear min/max of its members (so unlinked key
 // drags, reorders, and deletes never make it wrap); a wrapped clip takes the
-// hull of its members unwrapped relative to its current start (keys ahead
-// of the seam gain a cycle), so it stays wrapped while its keys move and
-// unwraps once every member sits on one side of phase 0. A single time
-// keeps the minimum manipulable width around that key, straddling phase 0
-// if needed. Empty clips retain their authored span.
+// hull of its members unwrapped relative to the member cyclically nearest
+// its current start (keys ahead of that anchor gain a cycle), so it stays
+// wrapped while either end key is nudged and unwraps once every member sits
+// on one side of phase 0. A clip that unwrapped onto [start, 1] by a member
+// reaching phase 0 keeps reading that member as 1 so the bounds are a fixed
+// point of this call (and survive save/load). A single time keeps the
+// minimum manipulable width around that key: a clip that was wrapped may
+// straddle phase 0, an unwrapped one keeps the pre-W1 0..1 clamped marker.
+// Empty clips retain their authored span.
+// Known limitation: a key gesture can never make an unwrapped clip wrap.
+// Dragging the head key of {0.02,0.3} backwards across phase 0 to 0.98 in
+// the linked view yields the linear hull {0.3,0.98} (pre-W1 behaviour);
+// only clip drags (TransformWaterFeatureClip with allowWrap) cross the seam.
 [[nodiscard]] bool SynchronizeWaterFeatureClipBounds(
     WaterFeatureTimeline* timeline,
     std::uint32_t clipId);
