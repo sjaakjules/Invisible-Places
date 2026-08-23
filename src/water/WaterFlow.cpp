@@ -8332,15 +8332,27 @@ std::optional<std::size_t> WaterFeatureClipPrimarySettingDisplayIndex(
 std::pair<float, float> WaterFeatureClipDisplaySpan(
     float start,
     float end) {
-    start = std::clamp(std::isfinite(start) ? start : 0.0F, 0.0F, 1.0F);
-    end = std::clamp(std::isfinite(end) ? end : start, 0.0F, 1.0F);
+    start = std::isfinite(start) ? start : 0.0F;
+    end = std::isfinite(end) ? end : start;
     if (end < start) {
         std::swap(start, end);
     }
-    if (end - start < kWaterFeatureClipMinimumLength) {
-        end = std::min(1.0F, start + kWaterFeatureClipMinimumLength);
-        start = std::max(0.0F, end - kWaterFeatureClipMinimumLength);
+    if (end <= 1.0F + kWaterFeatureClipPositionTolerance) {
+        // Unwrapped input (every loose-key span, most clips): the pre-W1
+        // rule, shifting backwards at the end of the normalized domain.
+        start = std::clamp(start, 0.0F, 1.0F);
+        end = std::clamp(end, 0.0F, 1.0F);
+        if (end - start < kWaterFeatureClipMinimumLength) {
+            end = std::min(1.0F, start + kWaterFeatureClipMinimumLength);
+            start = std::max(0.0F, end - kWaterFeatureClipMinimumLength);
+        }
+        return {start, end};
     }
+    // A wrapped clip keeps its start phase and its length (at most one
+    // cycle); only the end exceeds 1.
+    const float length = end - start;
+    start = WrapWaterClipPhase(start);
+    end = start + std::clamp(length, kWaterFeatureClipMinimumLength, 1.0F);
     return {start, end};
 }
 
@@ -9775,10 +9787,10 @@ WaterFeatureTimingRun SanitizeWaterFeatureTimingRun(
                 for (auto& key : setting.keys) {
                     const WaterFeatureSettingsClip* owner = nullptr;
                     for (const auto& clip : timeline.clips) {
-                        if (key.position <
-                                clip.start - kLegacyMembershipTolerance ||
-                            key.position >
-                                clip.end + kLegacyMembershipTolerance) {
+                        if (!WaterClipContainsPosition(
+                                clip.start,
+                                clip.end,
+                                key.position)) {
                             continue;
                         }
                         if (owner == nullptr ||
@@ -10679,30 +10691,57 @@ std::vector<float> WaterFeatureProfileKeyPositions(
 
 namespace {
 
-constexpr float kWaterClipKeyTolerance = 1.0e-4F;
+constexpr float kWaterClipKeyTolerance = kWaterFeatureClipPositionTolerance;
 
+// Membership shared by every span operation; cyclic for wrapped spans (W1).
 bool WaterClipSpanContains(float start, float end, float position) {
-    return position >= start - kWaterClipKeyTolerance &&
-           position <= end + kWaterClipKeyTolerance;
+    return WaterClipContainsPosition(start, end, position);
+}
+
+// Shortest signed distance between two phases on the unit loop.
+float CyclicWaterClipDistance(float left, float right) {
+    const float difference = std::abs(left - right);
+    return std::min(difference, std::abs(1.0F - difference));
 }
 
 // The affine map shared by every span operation. Positions inside the
 // source range land inside the destination window; the caller guarantees a
-// non-degenerate source span.
+// non-degenerate source span. A stored position ahead of a wrapped source
+// range's seam is unwrapped first. With wrap the result is stored back in
+// [0,1); without it the pre-W1 Clamp01 applies, which keeps every unlinked
+// transform bit-identical.
 float RemapWaterClipPosition(
+    float position,
+    float rangeStart,
+    float rangeEnd,
+    float newStart,
+    float newEnd,
+    bool wrap = false) {
+    const float span = std::max(1.0e-6F, rangeEnd - rangeStart);
+    const float unwrapped = UnwrapWaterClipPosition(position, rangeStart);
+    const float fraction = (unwrapped - rangeStart) / span;
+    const float mapped = newStart + fraction * (newEnd - newStart);
+    return wrap ? WrapWaterClipPhase(mapped) : Clamp01(mapped);
+}
+
+// Same map in unwrapped coordinates (no wrap, no clamp); used where the
+// result is compared cyclically or the span itself is remapped.
+float RemapWaterClipPositionUnwrapped(
     float position,
     float rangeStart,
     float rangeEnd,
     float newStart,
     float newEnd) {
     const float span = std::max(1.0e-6F, rangeEnd - rangeStart);
-    const float fraction = (position - rangeStart) / span;
-    return Clamp01(newStart + fraction * (newEnd - newStart));
+    const float unwrapped = UnwrapWaterClipPosition(position, rangeStart);
+    const float fraction = (unwrapped - rangeStart) / span;
+    return newStart + fraction * (newEnd - newStart);
 }
 
 bool WaterClipRangeIsValid(float start, float end) {
     return std::isfinite(start) && std::isfinite(end) &&
-           end - start >= kWaterClipKeyTolerance;
+           end - start >= kWaterClipKeyTolerance &&
+           end - start <= 1.0F + kWaterClipKeyTolerance;
 }
 
 void SortWaterFeatureClips(std::vector<WaterFeatureSettingsClip>* clips) {
@@ -10807,24 +10846,88 @@ std::optional<float> AvailableWaterClipKeyPosition(
 
 }  // namespace
 
+std::pair<float, float> WaterFeatureClipCoveringArc(
+    std::span<const float> positions,
+    float hintStart) {
+    std::vector<float> sorted;
+    sorted.reserve(positions.size());
+    for (const float position : positions) {
+        if (std::isfinite(position)) {
+            sorted.push_back(Clamp01(position));
+        }
+    }
+    if (sorted.empty()) {
+        return {0.0F, 0.0F};
+    }
+    std::ranges::sort(sorted);
+    sorted.erase(
+        std::unique(
+            sorted.begin(),
+            sorted.end(),
+            [](float left, float right) {
+                return std::abs(left - right) <=
+                       kWaterFeatureClipPositionTolerance;
+            }),
+        sorted.end());
+    // Every member is a candidate start; its arc runs forward around the
+    // loop to the member just before it. All candidates cover every member
+    // with length <= 1, so the choice is only about which gap is left open.
+    // Minimal length alone would flip an ordinary clip whose keys straddle
+    // the rail middle (keys at 0.1 and 0.9 -> {0.9,1.1}), so the arc whose
+    // start is cyclically nearest the clip's present start wins: unwrapped
+    // clips stay unwrapped as their keys are dragged, and a clip that
+    // crossed phase 0 stays wrapped. Ties (keys at both 0 and 1, which are
+    // one phase but distinct stored keys) keep the earlier, longer arc so a
+    // legacy full-rail clip keyed at 0 and 1 stays {0,1}.
+    const float hint = std::isfinite(hintStart)
+        ? WrapWaterClipPhase(hintStart)
+        : 0.0F;
+    std::optional<std::pair<float, float>> best;
+    float bestDistance = 0.0F;
+    const std::size_t count = sorted.size();
+    for (std::size_t index = 0U; index < count; ++index) {
+        float start = sorted[index];
+        float end = index == 0U
+            ? sorted[count - 1U]
+            : sorted[index - 1U] + 1.0F;
+        if (start >= 1.0F) {
+            // A key stored exactly at 1 starts its arc at phase 0.
+            start -= 1.0F;
+            end -= 1.0F;
+        }
+        const float difference = std::abs(start - hint);
+        const float distance =
+            std::min(difference, std::abs(1.0F - difference));
+        if (!best.has_value() ||
+            distance < bestDistance - kWaterFeatureClipPositionTolerance) {
+            best = {start, end};
+            bestDistance = distance;
+        }
+    }
+    return best.value();
+}
+
 WaterFeatureSettingsClip SanitizeWaterFeatureSettingsClip(
     WaterFeatureSettingsClip clip) {
     if (clip.name.empty()) {
         clip.name = "Clip";
     }
-    clip.start = Clamp01(SeepageFiniteOr(clip.start, 0.0F));
-    clip.end = Clamp01(SeepageFiniteOr(clip.end, 1.0F));
-    if (clip.end < clip.start) {
-        std::swap(clip.start, clip.end);
+    // W1: start lives in [0,1); end in (start, start+1]. A reversed pair is
+    // still the legacy hand-edit repair (swap), unambiguous because wrapping
+    // is encoded by end > 1, never by start > end. The minimum length grows
+    // the end only: pulling the start back would change a wrapped clip's
+    // phase for no reason and the end is free to exceed 1.
+    float start = SeepageFiniteOr(clip.start, 0.0F);
+    float end = SeepageFiniteOr(clip.end, start + 1.0F);
+    if (end < start) {
+        std::swap(start, end);
     }
-    if (clip.end - clip.start < kWaterFeatureClipMinimumLength) {
-        clip.end = std::min(
-            1.0F,
-            clip.start + kWaterFeatureClipMinimumLength);
-        clip.start = std::max(
-            0.0F,
-            clip.end - kWaterFeatureClipMinimumLength);
+    const float length = std::min(1.0F, end - start);
+    if (start < 0.0F || start >= 1.0F) {
+        start = WrapWaterClipPhase(start);
     }
+    clip.start = start;
+    clip.end = start + std::max(length, kWaterFeatureClipMinimumLength);
     return clip;
 }
 
@@ -10869,35 +10972,28 @@ bool SynchronizeWaterFeatureClipBounds(
     if (clip == nullptr) {
         return false;
     }
-    float first = std::numeric_limits<float>::infinity();
-    float last = -std::numeric_limits<float>::infinity();
+    std::vector<float> positions;
     for (const auto& setting : timeline->settings) {
         for (const auto& key : setting.keys) {
             if (key.clipId != clipId || !std::isfinite(key.position)) {
                 continue;
             }
-            first = std::min(first, Clamp01(key.position));
-            last = std::max(last, Clamp01(key.position));
+            positions.push_back(Clamp01(key.position));
         }
     }
-    if (!std::isfinite(first) || !std::isfinite(last)) {
+    if (positions.empty()) {
         return false;
     }
-    if (last - first >= kWaterFeatureClipMinimumLength) {
-        clip->start = first;
-        clip->end = last;
+    const auto arc = WaterFeatureClipCoveringArc(positions, clip->start);
+    if (arc.second - arc.first >= kWaterFeatureClipMinimumLength) {
+        clip->start = arc.first;
+        clip->end = arc.second;
     } else {
-        // One authored time still needs a small hit target. Keep that key
-        // inside the marker while respecting the normalized domain.
-        clip->start = std::max(
-            0.0F,
-            first - 0.5F * kWaterFeatureClipMinimumLength);
-        clip->end = std::min(
-            1.0F,
-            clip->start + kWaterFeatureClipMinimumLength);
-        clip->start = std::max(
-            0.0F,
-            clip->end - kWaterFeatureClipMinimumLength);
+        // One authored time still needs a small hit target centred on the
+        // key. The marker may straddle phase 0 (W1), so no 0/1 clamps.
+        clip->start = WrapWaterClipPhase(
+            arc.first - 0.5F * kWaterFeatureClipMinimumLength);
+        clip->end = clip->start + kWaterFeatureClipMinimumLength;
     }
     SortWaterFeatureClips(&timeline->clips);
     return true;

@@ -6,6 +6,7 @@
 #include "water/WaterSeepagePulseField.hpp"
 
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -624,10 +625,80 @@ struct WaterKeyedSettingsProfile {
 // shrunk clip still keeps its keys distinct.
 inline constexpr float kWaterFeatureClipMinimumLength = 1.0e-3F;
 
+// Shared key-identity tolerance for clip span maths (membership, collisions,
+// seam comparisons).
+inline constexpr float kWaterFeatureClipPositionTolerance = 1.0e-4F;
+
+// ---- Wrapped clip contract (W1) ----
+// A clip span is `start` in [0,1) and `end` in (start, start+1]. `end > 1`
+// means the clip wraps through loop phase 0: it occupies [start,1] and
+// [0,end-1]. Keys are always stored in [0,1]; a key p belongs to a wrapped
+// span when p or p+1 lies in [start,end]. `end - start` is the clip length
+// everywhere, so an unwrapped clip is exactly the pre-W1 0<=start<=end<=1
+// shape and its maths are unchanged. Wrapping is only ever produced by
+// linked-cyclic authoring gestures (callers pass allowWrap); unlinked
+// editing keeps clamping to 0..1.
+
+// Wraps any phase into [0,1). Values within the shared tolerance below 1
+// wrap to 0 so seam float noise cannot store a key at 0.99999 instead of 0.
+[[nodiscard]] inline float WrapWaterClipPhase(float value) {
+    if (!std::isfinite(value)) {
+        return 0.0F;
+    }
+    float wrapped = value - std::floor(value);
+    if (wrapped >= 1.0F - kWaterFeatureClipPositionTolerance) {
+        wrapped = 0.0F;
+    }
+    return wrapped;
+}
+
+[[nodiscard]] inline bool WaterClipIsWrapped(float start, float end) {
+    (void)start;
+    return end > 1.0F + kWaterFeatureClipPositionTolerance;
+}
+
+[[nodiscard]] inline float WaterClipLength(float start, float end) {
+    return end - start;
+}
+
+// Stored phase of a clip's end: the wrapped end lands back in (0,1].
+[[nodiscard]] inline float WaterClipCanonicalEnd(float start, float end) {
+    return WaterClipIsWrapped(start, end) ? end - 1.0F : end;
+}
+
+// Unwraps a stored key position onto the clip's own [start, start+1]
+// coordinate line: keys ahead of the wrap seam gain one cycle.
+[[nodiscard]] inline float UnwrapWaterClipPosition(
+    float position,
+    float start) {
+    return position < start - kWaterFeatureClipPositionTolerance
+               ? position + 1.0F
+               : position;
+}
+
+// Membership: p inside [start-tol, end+tol], or p+1 inside it when the span
+// wraps. An unwrapped span keeps the pre-W1 linear test on purpose: on the
+// 0..1 rail a stored key at 0 is not a member of a clip ending at 1 (they are
+// distinct times when unlinked), and only a span that actually crosses phase
+// 0 identifies the two phases.
+[[nodiscard]] inline bool WaterClipContainsPosition(
+    float start,
+    float end,
+    float position) {
+    constexpr float kTolerance = kWaterFeatureClipPositionTolerance;
+    const auto inside = [&](float candidate) {
+        return candidate >= start - kTolerance &&
+               candidate <= end + kTolerance;
+    };
+    return inside(position) ||
+           (WaterClipIsWrapped(start, end) && inside(position + 1.0F));
+}
+
 // Normalizes a derived display span to the same minimum width as a stored
-// clip, shifting backwards at the end of the normalized domain. The clip
-// lane allocator and UI share this so a loose-key ghost can never overlap a
-// bar in pixels while being considered disjoint by lane assignment.
+// clip. A wrapped clip span is kept (end up to start+1); a plain loose-key
+// span never wraps. The clip lane allocator and UI share this so a loose-key
+// ghost can never overlap a bar in pixels while being considered disjoint by
+// lane assignment.
 [[nodiscard]] std::pair<float, float> WaterFeatureClipDisplaySpan(
     float start,
     float end);
@@ -644,6 +715,8 @@ struct WaterFeatureSettingsClip {
     // uses it for the derived loose-keys block).
     std::uint32_t id = 0U;
     std::string name = "Clip";
+    // W1 span: start in [0,1), end in (start, start+1]; end > 1 wraps
+    // through phase 0 (see the wrapped clip contract above).
     float start = 0.0F;
     float end = 1.0F;
     // Package provenance (a WaterKeyedSettingsProfile name); metadata only.
@@ -1001,9 +1074,22 @@ ResolveWaterSettingSplineHandlePoint(
 [[nodiscard]] std::optional<std::pair<float, float>>
 WaterFeatureLooseKeySpan(const WaterFeatureTimeline& timeline);
 
-// Recomputes one stored clip's bounds from its owned keys. Two or more key
-// times map exactly to the first/last key; a single time keeps the minimum
-// manipulable width around that key. Empty clips retain their authored span.
+// Shortest-choice cyclic covering arc over stored positions in [0,1]:
+// {start in [0,1), end in [start, start+1]} covering every position, choosing
+// the arc whose start is cyclically nearest hintStart (a clip's present
+// start, or a grabbed block's start for a group window). Empty input yields
+// {0,0}. Shared by SynchronizeWaterFeatureClipBounds and the UI group-move
+// window so both derive identical bounds.
+[[nodiscard]] std::pair<float, float> WaterFeatureClipCoveringArc(
+    std::span<const float> positions,
+    float hintStart);
+
+// Recomputes one stored clip's bounds from its owned keys as a cyclic
+// covering arc. Two or more key times map exactly to the first/last key
+// (the arc starting at the member cyclically nearest the clip's current
+// start, so an unwrapped clip stays unwrapped and a wrapped one stays
+// wrapped); a single time keeps the minimum manipulable width around that
+// key, straddling phase 0 if needed. Empty clips retain their authored span.
 [[nodiscard]] bool SynchronizeWaterFeatureClipBounds(
     WaterFeatureTimeline* timeline,
     std::uint32_t clipId);
