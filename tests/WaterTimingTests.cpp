@@ -6650,10 +6650,12 @@ TEST_CASE("Full-length clips rotate on the loop, merging keys at both 0 and 1",
         span.first,
         span.second,
         /*allowWrap=*/true));
-    // Bounds are always the member hull (Synchronize runs after every
-    // transform), so the rotated span settles on its keys at 0.3 and 0.8.
+    // A full-length clip keeps covering the whole loop while a member rides
+    // its boundary phase: the span rotates to {0.3, 1.3} instead of
+    // settling on the member hull {0.3, 0.8}, so a legacy full-rail block
+    // stays a full-rail block through a rotation.
     CHECK(timeline.clips.front().start == Approx(0.3F));
-    CHECK(timeline.clips.front().end == Approx(0.8F));
+    CHECK(timeline.clips.front().end == Approx(1.3F));
     CHECK(timeline.settings.front().keys[0].position == Approx(0.3F));
     CHECK(timeline.settings.front().keys[1].position == Approx(0.8F));
 
@@ -6686,8 +6688,11 @@ TEST_CASE("Full-length clips rotate on the loop, merging keys at both 0 and 1",
     CHECK(seamPair.settings.front().keys[0].value == Approx(1.0F));
     CHECK(seamPair.settings.front().keys[1].position == Approx(0.9F));
     CHECK(seamPair.settings.front().keys[1].value == Approx(0.75F));
+    // The survivor of the merged pair occupies both boundary phases of the
+    // rotated span, so the clip stays full-length instead of shrinking to
+    // the {0.9, 1.4} member hull.
     CHECK(seamPair.clips.front().start == Approx(0.9F));
-    CHECK(seamPair.clips.front().end == Approx(1.4F));
+    CHECK(seamPair.clips.front().end == Approx(1.9F));
 
     // A refusal still leaves the document untouched, including the pair:
     // here the rotated 0.5 key would land on a loose key.
@@ -6771,6 +6776,50 @@ TEST_CASE("Twin coalescing never fires on identity drags or across clips",
     REQUIRE(identity.settings.front().keys.size() == 3U);
     CHECK(identity.clips.front().start == Approx(0.0F));
     CHECK(identity.clips.front().end == Approx(1.0F));
+
+    // The two-key "on at start, off at end" clip: coalescing leaves a
+    // single stored key, but the clip must stay a full-length grabbable
+    // block through this drag, later synchronizations, and further drags,
+    // not collapse to a minimum-length marker around the survivor.
+    WaterFeatureTimeline twins;
+    twins.feature = identity.feature;
+    twins.settings = {
+        {.settingId = "strength",
+         .keys = {
+             {.position = 0.00F, .value = 0.25F, .clipId = 1U},
+             {.position = 1.00F, .value = 0.75F, .clipId = 1U},
+         }},
+    };
+    twins.clips = {{.id = 1U, .name = "Full", .start = 0.0F, .end = 1.0F}};
+    twins.clipMembershipExplicit = true;
+    const auto back = CyclicWaterFeatureClipMoveSpan(0.0F, 1.0F, -0.1F);
+    REQUIRE(TransformWaterFeatureClip(
+        &twins,
+        1U,
+        back.first,
+        back.second,
+        /*allowWrap=*/true));
+    REQUIRE(twins.settings.front().keys.size() == 1U);
+    CHECK(twins.settings.front().keys[0].position == Approx(0.9F));
+    CHECK(twins.settings.front().keys[0].value == Approx(0.75F));
+    CHECK(twins.clips.front().start == Approx(0.9F));
+    CHECK(twins.clips.front().end == Approx(1.9F));
+    // The coalesced state is a fixed point of the bounds re-derive.
+    REQUIRE(SynchronizeWaterFeatureClipBounds(&twins, 1U));
+    CHECK(twins.clips.front().start == Approx(0.9F));
+    CHECK(twins.clips.front().end == Approx(1.9F));
+    // And it keeps its length through the next drag.
+    const auto onward = CyclicWaterFeatureClipMoveSpan(0.9F, 1.9F, 0.05F);
+    REQUIRE(TransformWaterFeatureClip(
+        &twins,
+        1U,
+        onward.first,
+        onward.second,
+        /*allowWrap=*/true));
+    REQUIRE(twins.settings.front().keys.size() == 1U);
+    CHECK(twins.settings.front().keys[0].position == Approx(0.95F));
+    CHECK(twins.clips.front().start == Approx(0.95F));
+    CHECK(twins.clips.front().end == Approx(1.95F));
 
     // Keys of two different clips that share loop phase 0 are separate
     // authored times, not a stored twin: a group drag must refuse the

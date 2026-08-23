@@ -11018,6 +11018,28 @@ bool SynchronizeWaterFeatureClipBounds(
     const bool wasWrapped = WaterClipIsWrapped(clip->start, clip->end);
     const float oldStart = clip->start;
     const float oldEnd = clip->end;
+    if (wasWrapped &&
+        oldEnd - oldStart >= 1.0F - kWaterFeatureClipPositionTolerance) {
+        // A full-length wrapped clip covers the entire loop, so its span
+        // already contains every member and the two span boundaries are one
+        // loop phase. When a member sits on that phase it occupies both
+        // boundaries at once and the span is the member hull as stored:
+        // re-deriving from linear positions would read that member as a
+        // single point and collapse the clip (the {0,1} clip keyed at 0
+        // and 1 whose twins a linked drag coalesced onto one stored key
+        // must stay a full-length grabbable block, not a marker sliver).
+        const float boundaryPhase = WrapWaterClipPhase(oldStart);
+        const bool memberOnBoundary = std::ranges::any_of(
+            positions,
+            [&](float position) {
+                return CyclicWaterClipDistance(position, boundaryPhase) <=
+                       kWaterFeatureClipPositionTolerance;
+            });
+        if (memberOnBoundary) {
+            SortWaterFeatureClips(&timeline->clips);
+            return true;
+        }
+    }
     std::ranges::sort(positions);
     std::pair<float, float> arc;
     if (wasWrapped) {
