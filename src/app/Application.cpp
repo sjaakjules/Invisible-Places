@@ -3784,9 +3784,23 @@ struct ResolvedAnimationLinkedPair {
     std::size_t currentMemberIndex = 0U;
 };
 
+// One member camera chosen for the viewport at the canonical clock.
+struct AnimationLinkedPresentation {
+    std::size_t memberIndex = 0U;
+    float localPosition = 0.0F;
+};
+
 std::optional<ResolvedAnimationLinkedPair>
 ResolveActiveAnimationLinkedPair(
     const PreviewRuntimeState& runtimeState);
+
+std::optional<AnimationLinkedPresentation>
+ResolveAnimationLinkedPresentation(
+    PreviewRuntimeState* runtimeState,
+    const ResolvedAnimationLinkedPair& pair);
+
+void SynchronizeAnimationLinkedPresentationCamera(
+    PreviewRuntimeState* runtimeState);
 
 std::optional<ResolvedAnimationLinkedPair>
 EnsureAnimationLinkedCanonicalClock(
@@ -27322,12 +27336,19 @@ void ApplyAnimationEvaluation(
     float amount,
     bool allowDepthOfField);
 
-bool ApplyAnimationLinkedCanonicalCamera(
+// The single member camera the linked view presents at the canonical clock
+// for the current view mode. Seam prefers the loaded member inside an
+// overlap and otherwise takes the sole owner; A/B isolate one member and
+// never fall through. Everything that pushes a linked camera into
+// runtimeState->camera (scrubs, playback, the per-frame overlay sync) goes
+// through this one decision so the viewport overlays, the rendered scene,
+// and the status text always agree about which member is on screen.
+std::optional<AnimationLinkedPresentation>
+ResolveAnimationLinkedPresentation(
     PreviewRuntimeState* runtimeState,
-    const ResolvedAnimationLinkedPair& pair,
-    bool allowDepthOfField) {
+    const ResolvedAnimationLinkedPair& pair) {
     if (runtimeState == nullptr) {
-        return false;
+        return std::nullopt;
     }
     auto& panel = runtimeState->animationPanel;
     std::array<std::size_t, 2U> candidates{
@@ -27347,14 +27368,83 @@ bool ApplyAnimationLinkedCanonicalCamera(
         if (!local.has_value()) {
             continue;
         }
-        ApplyAnimationEvaluation(
-            runtimeState,
-            *pair.members[member],
-            local.value(),
-            allowDepthOfField);
-        return true;
+        return AnimationLinkedPresentation{
+            .memberIndex = member,
+            .localPosition = local.value(),
+        };
     }
-    return false;
+    return std::nullopt;
+}
+
+bool ApplyAnimationLinkedCanonicalCamera(
+    PreviewRuntimeState* runtimeState,
+    const ResolvedAnimationLinkedPair& pair,
+    bool allowDepthOfField) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+    const auto presentation =
+        ResolveAnimationLinkedPresentation(runtimeState, pair);
+    if (!presentation.has_value()) {
+        return false;
+    }
+    ApplyAnimationEvaluation(
+        runtimeState,
+        *pair.members[presentation->memberIndex],
+        presentation->localPosition,
+        allowDepthOfField);
+    return true;
+}
+
+// Keeps runtimeState->camera on the presented linked member every frame the
+// presentation camera is attached. The rendered scene already follows the
+// canonical clock independently (ResolveLinkedAnimationSeamedComparison
+// evaluates the member cameras fresh each frame), but the seepage-node,
+// emitter, and flow-path overlays project through runtimeState->camera, so
+// any clock change made without an explicit camera apply (feature-timeline
+// scrubs, key drags, detached playback reattaching) left those gizmos parked
+// at the previous frame. Manual viewport navigation detaches the camera
+// first, so this never fights an orbit; the geometric match means an
+// already-correct camera costs one path evaluation and no state write.
+void SynchronizeAnimationLinkedPresentationCamera(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    auto& panel = runtimeState->animationPanel;
+    if (!panel.linkedViewCameraAttached ||
+        !panel.linkedCanonicalCycleFrameValid ||
+        panel.reciprocalPanWizard.Active() ||
+        panel.liveCameraEdit.active ||
+        panel.savedEditedComparisonHoldActive ||
+        panel.velocityPartnerComparisonHoldActive) {
+        return;
+    }
+    const auto pair = ResolveActiveAnimationLinkedPair(*runtimeState);
+    if (!pair.has_value() ||
+        panel.linkedCanonicalPairId != pair->sessionPairId) {
+        return;
+    }
+    const auto presentation =
+        ResolveAnimationLinkedPresentation(runtimeState, pair.value());
+    if (!presentation.has_value()) {
+        return;
+    }
+    const auto& path = *pair->members[presentation->memberIndex];
+    if (path.keys.size() < 2U ||
+        invisible_places::camera::AnimationCameraMatchesFrame(
+            runtimeState->camera.CaptureState(),
+            path,
+            presentation->localPosition)) {
+        return;
+    }
+    ApplyAnimationEvaluation(
+        runtimeState,
+        path,
+        presentation->localPosition,
+        panel.previewDepthOfField ||
+            runtimeState->animationPlayback.active);
+    runtimeState->previewRenderStateSignatureValid = false;
 }
 
 enum class AnimationVelocityLinkDisplayState : std::uint8_t {
@@ -56036,6 +56126,33 @@ void ApplyFeatureTimelineScrub(
         return;
     }
     auto& panel = runtimeState->animationPanel;
+    runtimeState->previewRenderStateSignatureValid = false;
+    if (const auto pair =
+            ResolveActiveAnimationLinkedPair(*runtimeState);
+        pair.has_value() &&
+        panel.linkedCanonicalCycleFrameValid &&
+        panel.linkedCanonicalPairId == pair->sessionPairId) {
+        // A linked presentation camera is "on the path" exactly while it is
+        // attached: manual navigation detaches it and scrubs reattach it.
+        // The loaded-path geometric test used below cannot decide this
+        // case, because the presented camera may legitimately belong to
+        // the partner member (A/B alternation, Seam outside the loaded
+        // window), which made earlier scrubs leave the camera and its
+        // overlays behind while the rendered scene kept following.
+        const bool moveLinkedCamera =
+            panel.linkedViewCameraAttached ||
+            panel.featureTimelinesAlwaysFollowCamera;
+        runtimeState->animationPlayback.active = false;
+        runtimeState->cameraPlayback.active = false;
+        if (moveLinkedCamera) {
+            panel.linkedViewCameraAttached = true;
+            (void)ApplyAnimationLinkedCanonicalCamera(
+                runtimeState,
+                pair.value(),
+                panel.previewDepthOfField);
+        }
+        return;
+    }
     const float referencePosition = cameraMatchPosition.value_or(
         panel.scrubAmount);
     const bool moveCamera = invisible_places::camera::
@@ -56044,22 +56161,7 @@ void ApplyFeatureTimelineScrub(
             panel.currentPath.value(),
             referencePosition,
             panel.featureTimelinesAlwaysFollowCamera);
-    runtimeState->previewRenderStateSignatureValid = false;
     if (moveCamera) {
-        if (const auto pair =
-                ResolveActiveAnimationLinkedPair(*runtimeState);
-            pair.has_value() &&
-            panel.linkedCanonicalCycleFrameValid &&
-            panel.linkedCanonicalPairId == pair->sessionPairId) {
-            panel.linkedViewCameraAttached = true;
-            (void)ApplyAnimationLinkedCanonicalCamera(
-                runtimeState,
-                pair.value(),
-                panel.previewDepthOfField);
-            runtimeState->animationPlayback.active = false;
-            runtimeState->cameraPlayback.active = false;
-            return;
-        }
         ApplyAnimationScrub(runtimeState);
         return;
     }
@@ -119883,6 +119985,7 @@ int Application::Run(ApplicationRunOptions options) const {
                 UpdateAnimationLiveCameraEdit(&runtimeState);
                 UpdateAnimationPlayback(&runtimeState);
                 UpdateCameraShotPlayback(&runtimeState);
+                SynchronizeAnimationLinkedPresentationCamera(&runtimeState);
                 UpdatePerformanceInteractionState(&runtimeState, viewport.value());
             }
             if (!runtimeState.offlineRenderJob.active) {
