@@ -5305,6 +5305,79 @@ TEST_CASE("Timing Take retiming carries settings clips with their keys",
     CHECK_FALSE(invisible_places::water::WaterClipIsWrapped(
         lateTimeline.clips.front().start,
         lateTimeline.clips.front().end));
+
+    // The unwrapped seam state ({start, 1} owning a member stored at 0,
+    // which Synchronize measures as 1) retimes that member as the clip's
+    // end, not as time 0: mapping the stored 0 through the position map
+    // would leave the key outside the retimed span and the next
+    // Synchronize would silently flip the bounds onto {0, start}.
+    TimingTakeSceneState seamState;
+    invisible_places::water::WaterFeatureTimingRun seamRun;
+    seamRun.features.push_back({
+        .feature = {.kind = WaterKeyedFeatureKind::SeepageNode,
+                    .objectId = 4U},
+        .settings = {{
+            .settingId = "strength",
+            .keys = {
+                {.position = 0.00F, .value = 1.0F, .clipId = 1U},
+                {.position = 0.90F, .value = 0.0F, .clipId = 1U},
+            },
+        }},
+        .clips = {{.id = 1U, .name = "Seam", .start = 0.9F, .end = 1.0F}},
+    });
+    seamRun.features.front().clipMembershipExplicit = true;
+    seamState.waterFeatureTimingRuns.push_back(std::move(seamRun));
+    REQUIRE(RetimeTimingTakeSceneStateNormalizedPositions(
+        &seamState,
+        100U,
+        200U,
+        0U));
+    const auto& seamTimeline =
+        seamState.waterFeatureTimingRuns.front().features.front();
+    REQUIRE(seamTimeline.settings.front().keys.size() == 2U);
+    CHECK(seamTimeline.settings.front().keys[0].position == Approx(0.45F));
+    CHECK(seamTimeline.settings.front().keys[1].position == Approx(0.50F));
+    CHECK(seamTimeline.settings.front().keys[1].value == Approx(1.0F));
+    CHECK(seamTimeline.clips.front().start == Approx(0.45F));
+    CHECK(seamTimeline.clips.front().end == Approx(0.50F));
+    // The retimed state is a Synchronize fixed point, so a later key edit
+    // or save/load cannot move the bounds again.
+    auto resynced = seamTimeline;
+    REQUIRE(invisible_places::water::SynchronizeWaterFeatureClipBounds(
+        &resynced,
+        1U));
+    CHECK(resynced.clips.front().start == Approx(0.45F));
+    CHECK(resynced.clips.front().end == Approx(0.50F));
+
+    // A member at 1 alongside the key at 0 is a real head key (the
+    // unlinked drag to the rail's left edge); both retime linearly.
+    TimingTakeSceneState fullState;
+    invisible_places::water::WaterFeatureTimingRun fullRun;
+    fullRun.features.push_back({
+        .feature = {.kind = WaterKeyedFeatureKind::SeepageNode,
+                    .objectId = 4U},
+        .settings = {{
+            .settingId = "strength",
+            .keys = {
+                {.position = 0.00F, .value = 1.0F, .clipId = 1U},
+                {.position = 1.00F, .value = 0.0F, .clipId = 1U},
+            },
+        }},
+        .clips = {{.id = 1U, .name = "Full", .start = 0.0F, .end = 1.0F}},
+    });
+    fullRun.features.front().clipMembershipExplicit = true;
+    fullState.waterFeatureTimingRuns.push_back(std::move(fullRun));
+    REQUIRE(RetimeTimingTakeSceneStateNormalizedPositions(
+        &fullState,
+        100U,
+        200U,
+        0U));
+    const auto& fullTimeline =
+        fullState.waterFeatureTimingRuns.front().features.front();
+    CHECK(fullTimeline.settings.front().keys[0].position == Approx(0.0F));
+    CHECK(fullTimeline.settings.front().keys[1].position == Approx(0.5F));
+    CHECK(fullTimeline.clips.front().start == Approx(0.0F));
+    CHECK(fullTimeline.clips.front().end == Approx(0.5F));
 }
 
 TEST_CASE("Timing Take merge keeps Feature Run marks with feature owners",

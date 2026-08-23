@@ -4413,6 +4413,59 @@ bool RetimeTimingTakeSceneStateNormalizedPositions(
             mark.position = retimePosition(mark.position);
         }
         for (auto& feature : run.features) {
+            // A clip ending on 1 whose head sits above 0 may own a member
+            // stored at time 0: the seam state SynchronizeWaterFeatureClip-
+            // Bounds documents (a linked tail key dragged onto phase 0,
+            // measured as 1 while the clip ends on 1). Off the loop that
+            // member is the clip's end, not its head, so it must retime as
+            // 1 -- mapping the stored 0 through the position map would land
+            // it at the destination start, outside the retimed span, and
+            // the next Synchronize would flip the clip onto {0, start}.
+            // A member stored at 1 alongside one at 0 means the 0 is a real
+            // head key (the unlinked drag to the rail's left edge); those
+            // retime linearly as before.
+            constexpr float kSeamTolerance =
+                water::kWaterFeatureClipPositionTolerance;
+            for (const auto& clip : feature.clips) {
+                if (water::WaterClipIsWrapped(clip.start, clip.end) ||
+                    std::abs(clip.end - 1.0F) > kSeamTolerance ||
+                    clip.start <= kSeamTolerance) {
+                    continue;
+                }
+                bool memberOnPhaseOne = false;
+                for (const auto& setting : feature.settings) {
+                    for (const auto& key : setting.keys) {
+                        if (key.clipId == clip.id &&
+                            key.position >= 1.0F - kSeamTolerance) {
+                            memberOnPhaseOne = true;
+                        }
+                    }
+                }
+                if (memberOnPhaseOne) {
+                    continue;
+                }
+                for (auto& setting : feature.settings) {
+                    bool rewrote = false;
+                    for (auto& key : setting.keys) {
+                        if (key.clipId == clip.id &&
+                            std::isfinite(key.position) &&
+                            key.position <= kSeamTolerance) {
+                            key.position = 1.0F;
+                            rewrote = true;
+                        }
+                    }
+                    if (rewrote) {
+                        // The seam member moves from the front of the track
+                        // to its end; keys stay stored ascending.
+                        std::stable_sort(
+                            setting.keys.begin(),
+                            setting.keys.end(),
+                            [](const auto& left, const auto& right) {
+                                return left.position < right.position;
+                            });
+                    }
+                }
+            }
             for (auto& setting : feature.settings) {
                 retimeKeys(&setting.keys);
             }
