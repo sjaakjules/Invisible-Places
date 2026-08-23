@@ -1234,6 +1234,103 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Timing Colourise cyclic coalescing keeps the dropped key's Palette Phase",
+    "[timing][colourise][cyclic][palette-phase][settings-clip]") {
+    using invisible_places::timing::
+        CoalesceTimingColouriseEffectCyclicallyCoincidentKeys;
+    using invisible_places::timing::EvaluateTimingColouriseEffectParameter;
+    using invisible_places::timing::TimingColouriseCyclicSettingsKeySpan;
+    using invisible_places::timing::
+        TransformTimingColouriseEffectSettingsKeysCyclic;
+    using invisible_places::timing::WrapTimingColouriseLoopPosition;
+
+    const auto phaseAt = [](const TimingColouriseEffect& candidate, float t) {
+        return EvaluateTimingColouriseEffectParameter(
+            candidate,
+            TimingColouriseEffectParameter::PalettePhase,
+            t,
+            true);
+    };
+    // A linear-authored phase track keyed at both loop ends with a nonzero
+    // first delta. Cyclic evaluation accumulates the 0.0 key's +0.25 into
+    // every later key before it replaces that key with the 1.0 one, so the
+    // merge must carry the delta rather than drop it.
+    TimingColouriseEffect original;
+    original.colouriseEnabled = true;
+    original.palettePhaseOffset = 0.0F;
+    original.effectParameterKeys = {
+        {.parameter = TimingColouriseEffectParameter::PalettePhase,
+         .position = 0.0F,
+         .value = 0.25F,
+         .interpolation = WaterScenarioInterpolation::Hold},
+        {.parameter = TimingColouriseEffectParameter::PalettePhase,
+         .position = 0.5F,
+         .value = 0.10F,
+         .interpolation = WaterScenarioInterpolation::Hold},
+        {.parameter = TimingColouriseEffectParameter::PalettePhase,
+         .position = 1.0F,
+         .value = 0.50F,
+         .interpolation = WaterScenarioInterpolation::Hold},
+    };
+    CHECK(phaseAt(original, 0.0F) == Approx(0.85F));
+    CHECK(phaseAt(original, 0.5F) == Approx(0.35F));
+
+    SECTION("the coalescer alone is invisible to cyclic evaluation") {
+        auto effect = original;
+        CHECK(CoalesceTimingColouriseEffectCyclicallyCoincidentKeys(&effect) ==
+              1U);
+        REQUIRE(effect.effectParameterKeys.size() == 2U);
+        CHECK(effect.effectParameterKeys[0U].position == Approx(0.5F));
+        CHECK(effect.effectParameterKeys[0U].value == Approx(0.35F));
+        CHECK(effect.effectParameterKeys[1U].position == Approx(1.0F));
+        CHECK(effect.effectParameterKeys[1U].value == Approx(0.50F));
+        for (const float t : {0.0F, 0.2F, 0.5F, 0.7F, 0.99F}) {
+            CHECK(phaseAt(effect, t) == Approx(phaseAt(original, t)));
+        }
+    }
+
+    SECTION("a linked clip drag is a pure retime") {
+        auto effect = original;
+        REQUIRE(TransformTimingColouriseEffectSettingsKeysCyclic(
+            &effect,
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.0F, .length = 0.5F},
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.1F, .length = 0.5F}));
+        REQUIRE(effect.effectParameterKeys.size() == 2U);
+        CHECK(effect.effectParameterKeys[0U].position == Approx(0.1F));
+        CHECK(effect.effectParameterKeys[1U].position == Approx(0.6F));
+        for (const float t : {0.0F, 0.1F, 0.3F, 0.6F, 0.8F, 0.95F}) {
+            CHECK(phaseAt(effect, t) ==
+                  Approx(phaseAt(
+                      original,
+                      WrapTimingColouriseLoopPosition(t - 0.1F))));
+        }
+    }
+
+    SECTION("tracks without a merge keep their authored floats") {
+        auto effect = original;
+        effect.effectParameterKeys.erase(effect.effectParameterKeys.begin());
+        effect.effectParameterKeys.push_back(
+            {.parameter = TimingColouriseEffectParameter::EmissiveLevel,
+             .position = 0.0F,
+             .value = 0.3F});
+        effect.effectParameterKeys.push_back(
+            {.parameter = TimingColouriseEffectParameter::EmissiveLevel,
+             .position = 1.0F,
+             .value = 0.9F});
+        const auto phaseKeys = effect.effectParameterKeys;
+        // Only the emissive twins merge; the phase keys are untouched bits.
+        CHECK(CoalesceTimingColouriseEffectCyclicallyCoincidentKeys(&effect) ==
+              1U);
+        REQUIRE(effect.effectParameterKeys.size() == 3U);
+        CHECK(effect.effectParameterKeys[0U].value == phaseKeys[0U].value);
+        CHECK(effect.effectParameterKeys[1U].value == phaseKeys[1U].value);
+        CHECK(effect.effectParameterKeys[2U].parameter ==
+              TimingColouriseEffectParameter::EmissiveLevel);
+        CHECK(effect.effectParameterKeys[2U].value == 0.9F);
+    }
+}
+
+TEST_CASE(
     "Timing Colourise removing a phase key folds whole turns into the next key",
     "[timing][colourise][cyclic][palette-phase]") {
     using invisible_places::timing::EvaluateTimingColouriseEffectParameter;

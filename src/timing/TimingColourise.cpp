@@ -3868,6 +3868,50 @@ std::size_t CoalesceCyclicallyCoincidentKeys(
     return removed;
 }
 
+// Indices of the Palette Phase keys in the order evaluation accumulates
+// their deltas (time order; ties keep the stored order like a stable sort).
+std::vector<std::size_t> PalettePhaseKeyAccumulationOrder(
+    const std::vector<TimingColouriseEffectParameterKey>& keys) {
+    std::vector<std::size_t> order;
+    for (std::size_t index = 0U; index < keys.size(); ++index) {
+        if (keys[index].parameter ==
+            TimingColouriseEffectParameter::PalettePhase) {
+            order.push_back(index);
+        }
+    }
+    std::stable_sort(
+        order.begin(),
+        order.end(),
+        [&](std::size_t left, std::size_t right) {
+            return keys[left].position < keys[right].position;
+        });
+    return order;
+}
+
+// Rewrites every Palette Phase key's value as its accumulated target, the
+// value cyclic evaluation works with once it has merged coincident keys.
+void EncodePalettePhaseKeysAsTargets(TimingColouriseEffect* effect) {
+    float phase = FiniteOr(effect->palettePhaseOffset, 0.0F);
+    for (const std::size_t index :
+         PalettePhaseKeyAccumulationOrder(effect->effectParameterKeys)) {
+        auto& key = effect->effectParameterKeys[index];
+        phase += ClampPalettePhaseDelta(key.value);
+        key.value = phase;
+    }
+}
+
+// Inverse of EncodePalettePhaseKeysAsTargets over whichever keys survived.
+void EncodePalettePhaseKeysAsDeltas(TimingColouriseEffect* effect) {
+    float previous = FiniteOr(effect->palettePhaseOffset, 0.0F);
+    for (const std::size_t index :
+         PalettePhaseKeyAccumulationOrder(effect->effectParameterKeys)) {
+        auto& key = effect->effectParameterKeys[index];
+        const float target = key.value;
+        key.value = WrapTimingColourisePalettePhaseDelta(target - previous);
+        previous = target;
+    }
+}
+
 void SortTimingColouriseEffectSettingsKeys(
     TimingColouriseEffect* effect) {
     SortAndCoalesceKeys(&effect->paletteKeys);
@@ -3905,11 +3949,37 @@ std::size_t CoalesceTimingColouriseEffectCyclicallyCoincidentKeys(
             return left.stopId == right.stopId &&
                    left.parameter == right.parameter;
         });
-    removed += CoalesceCyclicallyCoincidentKeys(
+    // Palette Phase is delta-encoded and every key's delta, including the
+    // one at 0.0 that cyclic evaluation replaces with the 1.0 key, has
+    // already been accumulated into the later keys by the time evaluation
+    // merges the pair. Merge on absolute targets so dropping a key never
+    // drops its delta, then re-difference the survivors. Only a merged phase
+    // lane is re-encoded; untouched tracks keep their authored floats.
+    const auto sameParameter = [](const auto& left, const auto& right) {
+        return left.parameter == right.parameter;
+    };
+    const auto phaseKeyCount = [&]() {
+        return PalettePhaseKeyAccumulationOrder(effect->effectParameterKeys)
+            .size();
+    };
+    auto authoredEffectKeys = effect->effectParameterKeys;
+    const std::size_t authoredPhaseKeys = phaseKeyCount();
+    EncodePalettePhaseKeysAsTargets(effect);
+    const std::size_t removedEffectKeys = CoalesceCyclicallyCoincidentKeys(
         &effect->effectParameterKeys,
-        [](const auto& left, const auto& right) {
-            return left.parameter == right.parameter;
-        });
+        sameParameter);
+    if (phaseKeyCount() == authoredPhaseKeys) {
+        // No phase key merged, so the authored deltas are still right;
+        // coalescing depends only on positions, so replaying it on the
+        // authored copy drops the same (non-phase) keys bit-for-bit.
+        effect->effectParameterKeys = std::move(authoredEffectKeys);
+        (void)CoalesceCyclicallyCoincidentKeys(
+            &effect->effectParameterKeys,
+            sameParameter);
+    } else {
+        EncodePalettePhaseKeysAsDeltas(effect);
+    }
+    removed += removedEffectKeys;
     removed += CoalesceCyclicallyCoincidentKeys(
         &effect->boundsKeys,
         sameSingleLane);
