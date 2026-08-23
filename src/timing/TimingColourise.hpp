@@ -771,6 +771,17 @@ TimingColouriseEffectCyclicSettingsKeySpan(
     TimingColouriseEffect* effect,
     TimingColouriseCyclicSettingsKeySpan source,
     TimingColouriseCyclicSettingsKeySpan destination);
+// Palette Phase keys store deltas accumulated from palettePhaseOffset in
+// time order, so a cyclic move that carries keys across loop zero re-orders
+// the accumulation and changes the phase every key lands on. Given the
+// effect before the move and the same effect with only key positions changed
+// (keys index-aligned, not yet sorted), re-encodes the deltas so every key
+// keeps the accumulated phase it had, making the move a pure retime. Tracks
+// whose time order did not change are left bit-identical. Deltas that would
+// leave the [-1, 1] range wrap by whole turns, which the palette cannot see.
+void PreserveTimingColourisePalettePhaseTargetsAfterMove(
+    const TimingColouriseEffect& original,
+    TimingColouriseEffect* moved);
 [[nodiscard]] TimingColouriseEffect SanitizeTimingColouriseEffect(
     TimingColouriseEffect effect);
 [[nodiscard]] TimingColourisePaletteDefinition

@@ -93087,6 +93087,15 @@ void DrawTimingKeyLaneGroup(
                     std::optional{key.parameter},
                     key.position);
             }
+            if (cyclicDrag) {
+                // Keys that wrapped past loop zero re-order the Palette
+                // Phase accumulation; keep each key on the phase it had so
+                // the drag retimes the animation instead of re-shaping it.
+                invisible_places::timing::
+                    PreserveTimingColourisePalettePhaseTargetsAfterMove(
+                        drag.originalEffect,
+                        &updated);
+            }
 
             const auto destinationRange =
                 TimingColouriseSelectorRangeFromStats(

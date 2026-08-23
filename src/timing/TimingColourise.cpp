@@ -4203,10 +4203,79 @@ bool TransformTimingColouriseEffectSettingsKeysCyclic(
         return false;
     }
 
+    PreserveTimingColourisePalettePhaseTargetsAfterMove(*effect, &candidate);
     SynchronizeCurrentTimingColouriseFieldMemory(&candidate);
     SortTimingColouriseEffectSettingsKeys(&candidate);
     *effect = std::move(candidate);
     return true;
+}
+
+void PreserveTimingColourisePalettePhaseTargetsAfterMove(
+    const TimingColouriseEffect& original,
+    TimingColouriseEffect* moved) {
+    if (moved == nullptr ||
+        moved->effectParameterKeys.size() !=
+            original.effectParameterKeys.size()) {
+        return;
+    }
+    std::vector<std::size_t> phaseKeys;
+    for (std::size_t index = 0U;
+         index < original.effectParameterKeys.size();
+         ++index) {
+        if (original.effectParameterKeys[index].parameter ==
+                TimingColouriseEffectParameter::PalettePhase &&
+            moved->effectParameterKeys[index].parameter ==
+                TimingColouriseEffectParameter::PalettePhase) {
+            phaseKeys.push_back(index);
+        }
+    }
+    if (phaseKeys.size() < 2U) {
+        return;
+    }
+    const auto timeOrder = [&](const std::vector<
+                               TimingColouriseEffectParameterKey>& keys) {
+        auto order = phaseKeys;
+        std::stable_sort(
+            order.begin(),
+            order.end(),
+            [&](std::size_t left, std::size_t right) {
+                return keys[left].position < keys[right].position;
+            });
+        return order;
+    };
+    const auto originalOrder = timeOrder(original.effectParameterKeys);
+    const auto movedOrder = timeOrder(moved->effectParameterKeys);
+    if (originalOrder == movedOrder) {
+        return;
+    }
+
+    // Accumulated targets in the original time order, exactly as evaluation
+    // sees them (EvaluateEffectParameterTrack and the cyclic preparation).
+    std::vector<float> absolute(original.effectParameterKeys.size(), 0.0F);
+    float phase = FiniteOr(original.palettePhaseOffset, 0.0F);
+    for (const std::size_t index : originalOrder) {
+        phase += ClampPalettePhaseDelta(
+            original.effectParameterKeys[index].value);
+        absolute[index] = phase;
+    }
+    // Re-difference along the new order. A delta outside the stored [-1, 1]
+    // range drops whole turns rather than clamping, so the keys still land
+    // on the same palette rotation.
+    const auto encodeDelta = [](float delta) {
+        if (!std::isfinite(delta)) {
+            return 0.0F;
+        }
+        if (delta > 1.0F || delta < -1.0F) {
+            delta -= std::floor(delta);
+        }
+        return ClampPalettePhaseDelta(delta);
+    };
+    float previous = FiniteOr(original.palettePhaseOffset, 0.0F);
+    for (const std::size_t index : movedOrder) {
+        moved->effectParameterKeys[index].value =
+            encodeDelta(absolute[index] - previous);
+        previous = absolute[index];
+    }
 }
 
 bool RetimeTimingTakeSceneStateNormalizedPositions(

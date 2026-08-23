@@ -1206,6 +1206,7 @@ TEST_CASE(
     using invisible_places::timing::TimingColouriseCyclicSettingsKeySpan;
     using invisible_places::timing::
         TransformTimingColouriseEffectSettingsKeysCyclic;
+    using invisible_places::timing::WrapTimingColouriseLoopPosition;
 
     SECTION("emissive level shifts by exactly the translation") {
         // Same fixture as the 'interpolates through loop zero' test.
@@ -1241,12 +1242,11 @@ TEST_CASE(
         }
     }
 
-    SECTION("palette phase deltas travel with their keys and re-accumulate") {
+    SECTION("palette phase keys keep their accumulated phase across a wrap") {
         // Palette Phase is delta-encoded and accumulated in sorted order, so
-        // a key that wraps past its neighbour changes which delta is applied
-        // first. This is the same behaviour as dragging a key past another
-        // in unlinked mode; the test documents it rather than a shift
-        // identity, which does not hold for accumulated deltas.
+        // a key that wraps past loop zero would otherwise change which delta
+        // applies first and re-shape the phase curve. The transform
+        // re-encodes the deltas so the move is a pure retime.
         TimingColouriseEffect original;
         original.colouriseEnabled = true;
         original.palettePhaseOffset = 0.0F;
@@ -1266,10 +1266,12 @@ TEST_CASE(
             TimingColouriseCyclicSettingsKeySpan{.start = 0.25F, .length = 0.5F},
             TimingColouriseCyclicSettingsKeySpan{.start = 0.75F, .length = 0.5F}));
         REQUIRE(effect.effectParameterKeys.size() == 2U);
+        // The key now first in time carries its old accumulated target
+        // (0.1 + 0.3) as its delta; the wrapped key steps back to its own.
         CHECK(effect.effectParameterKeys[0U].position == Approx(0.25F));
-        CHECK(effect.effectParameterKeys[0U].value == Approx(0.3F));
+        CHECK(effect.effectParameterKeys[0U].value == Approx(0.4F));
         CHECK(effect.effectParameterKeys[1U].position == Approx(0.75F));
-        CHECK(effect.effectParameterKeys[1U].value == Approx(0.1F));
+        CHECK(effect.effectParameterKeys[1U].value == Approx(-0.3F));
         const auto phaseAt = [](const TimingColouriseEffect& candidate,
                                 float t) {
             return EvaluateTimingColouriseEffectParameter(
@@ -1278,16 +1280,111 @@ TEST_CASE(
                 t,
                 true);
         };
-        // Before: 0.25 -> 0.1, 0.75 -> 0.4. After the wrap the 0.3 delta
-        // accumulates first: 0.25 -> 0.3, 0.75 -> 0.4.
         CHECK(phaseAt(original, 0.25F) == Approx(0.1F));
         CHECK(phaseAt(original, 0.75F) == Approx(0.4F));
-        CHECK(phaseAt(effect, 0.25F) == Approx(0.3F));
-        CHECK(phaseAt(effect, 0.75F) == Approx(0.4F));
-        // The full-cycle turn is unchanged by the re-ordering.
-        CHECK(phaseAt(effect, 0.75F) - original.palettePhaseOffset ==
-              Approx(0.4F));
+        for (const float t : {0.0F, 0.1F, 0.25F, 0.4F, 0.6F, 0.75F, 0.9F}) {
+            CHECK(phaseAt(effect, t) ==
+                  Approx(phaseAt(
+                      original,
+                      WrapTimingColouriseLoopPosition(t - 0.5F))));
+        }
+
+        // Translating back restores the authored deltas exactly.
+        REQUIRE(TransformTimingColouriseEffectSettingsKeysCyclic(
+            &effect,
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.75F, .length = 0.5F},
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.25F, .length = 0.5F}));
+        CHECK(effect.effectParameterKeys[0U].value == Approx(0.1F));
+        CHECK(effect.effectParameterKeys[1U].value == Approx(0.3F));
     }
+
+    SECTION("a translation that keeps the phase order leaves deltas untouched") {
+        TimingColouriseEffect original;
+        original.colouriseEnabled = true;
+        original.palettePhaseOffset = 0.2F;
+        original.effectParameterKeys = {
+            {.parameter = TimingColouriseEffectParameter::PalettePhase,
+             .position = 0.20F,
+             .value = 0.7F},
+            {.parameter = TimingColouriseEffectParameter::PalettePhase,
+             .position = 0.40F,
+             .value = -0.9F},
+        };
+        auto effect = original;
+        REQUIRE(TransformTimingColouriseEffectSettingsKeysCyclic(
+            &effect,
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.20F, .length = 0.2F},
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.50F, .length = 0.2F}));
+        REQUIRE(effect.effectParameterKeys.size() == 2U);
+        CHECK(effect.effectParameterKeys[0U].value == 0.7F);
+        CHECK(effect.effectParameterKeys[1U].value == -0.9F);
+    }
+}
+
+TEST_CASE(
+    "Timing Colourise palette phase targets survive a single key wrapping",
+    "[timing][colourise][cyclic][palette-phase]") {
+    using invisible_places::timing::EvaluateTimingColouriseEffectParameter;
+    using invisible_places::timing::
+        PreserveTimingColourisePalettePhaseTargetsAfterMove;
+
+    // Mirrors the key-lane drag: one key of a three-key track is dragged
+    // from 0.9 across loop zero to 0.1 while the others stay put.
+    TimingColouriseEffect original;
+    original.colouriseEnabled = true;
+    original.palettePhaseOffset = 0.0F;
+    original.effectParameterKeys = {
+        {.parameter = TimingColouriseEffectParameter::PalettePhase,
+         .position = 0.3F,
+         .value = 0.2F,
+         .interpolation = WaterScenarioInterpolation::Hold},
+        {.parameter = TimingColouriseEffectParameter::EmissiveLevel,
+         .position = 0.3F,
+         .value = 0.5F},
+        {.parameter = TimingColouriseEffectParameter::PalettePhase,
+         .position = 0.6F,
+         .value = 0.3F,
+         .interpolation = WaterScenarioInterpolation::Hold},
+        {.parameter = TimingColouriseEffectParameter::PalettePhase,
+         .position = 0.9F,
+         .value = 0.4F,
+         .interpolation = WaterScenarioInterpolation::Hold},
+    };
+    auto moved = original;
+    moved.effectParameterKeys[3U].position = 0.1F;
+    PreserveTimingColourisePalettePhaseTargetsAfterMove(original, &moved);
+    // Accumulated targets were 0.2, 0.5, 0.9; the wrapped key (0.9) now
+    // leads, then 0.3 steps down to 0.2 and 0.6 up to 0.5.
+    CHECK(moved.effectParameterKeys[3U].value == Approx(0.9F));
+    CHECK(moved.effectParameterKeys[0U].value == Approx(-0.7F));
+    CHECK(moved.effectParameterKeys[2U].value == Approx(0.3F));
+    CHECK(moved.effectParameterKeys[1U].value == 0.5F);
+    const auto sanitized = invisible_places::timing::
+        SanitizeTimingColouriseEffect(moved);
+    const auto phaseAt = [](const TimingColouriseEffect& candidate,
+                            float t) {
+        return EvaluateTimingColouriseEffectParameter(
+            candidate,
+            TimingColouriseEffectParameter::PalettePhase,
+            t,
+            true);
+    };
+    CHECK(phaseAt(sanitized, 0.1F) == Approx(0.9F));
+    CHECK(phaseAt(sanitized, 0.3F) == Approx(0.2F));
+    CHECK(phaseAt(sanitized, 0.6F) == Approx(0.5F));
+
+    // Tracks with fewer than two phase keys, or an unchanged order, are
+    // left alone; a mismatched key count is ignored.
+    auto untouched = original;
+    untouched.effectParameterKeys[3U].position = 0.95F;
+    PreserveTimingColourisePalettePhaseTargetsAfterMove(original, &untouched);
+    CHECK(untouched.effectParameterKeys[3U].value == 0.4F);
+    CHECK(untouched.effectParameterKeys[0U].value == 0.2F);
+    auto resized = moved;
+    resized.effectParameterKeys.pop_back();
+    PreserveTimingColourisePalettePhaseTargetsAfterMove(original, &resized);
+    CHECK(resized.effectParameterKeys[0U].value == Approx(-0.7F));
+    PreserveTimingColourisePalettePhaseTargetsAfterMove(original, nullptr);
 }
 
 TEST_CASE(
