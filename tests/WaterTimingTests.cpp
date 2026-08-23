@@ -5828,7 +5828,9 @@ TEST_CASE("Wrapped clip contract helpers identify seam membership",
     using invisible_places::water::WaterClipCanonicalEnd;
     using invisible_places::water::WaterClipContainsPosition;
     using invisible_places::water::WaterClipIsWrapped;
-    using invisible_places::water::WaterFeatureClipCoveringArc;
+    using invisible_places::water::WaterFeatureLooseKeySpan;
+    using invisible_places::water::WaterFeatureTimeline;
+    using invisible_places::water::WaterKeyedFeatureKind;
     using invisible_places::water::WrapWaterClipPhase;
 
     CHECK(WaterClipIsWrapped(0.9F, 1.2F));
@@ -5854,30 +5856,46 @@ TEST_CASE("Wrapped clip contract helpers identify seam membership",
     CHECK(WrapWaterClipPhase(-0.05F) == Approx(0.95F));
     CHECK(WrapWaterClipPhase(0.99999F) == Approx(0.0F));
 
-    // Covering arcs: the start nearest the hint wins, so an ordinary clip
-    // whose keys straddle the middle is not flipped to the shorter arc.
-    const std::array straddle{0.1F, 0.9F};
-    const auto linear = WaterFeatureClipCoveringArc(straddle, 0.1F);
-    CHECK(linear.first == Approx(0.1F));
-    CHECK(linear.second == Approx(0.9F));
-    const auto wrapped = WaterFeatureClipCoveringArc(straddle, 0.9F);
-    CHECK(wrapped.first == Approx(0.9F));
-    CHECK(wrapped.second == Approx(1.1F));
-    // A member dragged left of an unwrapped clip's start extends it left.
-    const std::array draggedLeft{0.1F, 0.4F, 0.6F};
-    const auto extended = WaterFeatureClipCoveringArc(draggedLeft, 0.2F);
-    CHECK(extended.first == Approx(0.1F));
-    CHECK(extended.second == Approx(0.6F));
-    // A legacy full-rail clip keyed at both 0 and 1 stays the full rail.
-    const std::array fullRail{0.0F, 1.0F};
-    const auto full = WaterFeatureClipCoveringArc(fullRail, 0.0F);
-    CHECK(full.first == Approx(0.0F));
-    CHECK(full.second == Approx(1.0F));
-    // A lone key stored at 1 starts its arc at phase 0.
-    const std::array atOne{1.0F};
-    const auto one = WaterFeatureClipCoveringArc(atOne, 0.999F);
-    CHECK(one.first == Approx(0.0F));
-    CHECK(one.second == Approx(0.0F));
+    // The loose-key ghost span: linear min/max on the rail, and on the loop
+    // the shortest covering arc, so a cluster pushed across phase 0 (stored
+    // 0.9 and 0.1 after a linked drag) stays one 0.2-long block instead of
+    // flipping to the 0.8-long rail hull.
+    WaterFeatureTimeline loose;
+    loose.feature = {
+        .kind = WaterKeyedFeatureKind::SeepageNode,
+        .objectId = 7U};
+    loose.settings = {
+        {.settingId = "strength",
+         .keys = {
+             {.position = 0.10F, .value = 0.0F},
+             {.position = 0.90F, .value = 1.0F},
+         }},
+    };
+    loose.clipMembershipExplicit = true;
+    const auto linear = WaterFeatureLooseKeySpan(loose);
+    REQUIRE(linear.has_value());
+    CHECK(linear->first == Approx(0.1F));
+    CHECK(linear->second == Approx(0.9F));
+    const auto cyclic = WaterFeatureLooseKeySpan(loose, /*cyclic=*/true);
+    REQUIRE(cyclic.has_value());
+    CHECK(cyclic->first == Approx(0.9F));
+    CHECK(cyclic->second == Approx(1.1F));
+    // When the linear hull is already the shortest arc both lenses agree.
+    loose.settings.front().keys = {
+        {.position = 0.30F, .value = 0.0F},
+        {.position = 0.40F, .value = 1.0F},
+        {.position = 0.60F, .value = 0.5F},
+    };
+    const auto agreed = WaterFeatureLooseKeySpan(loose, /*cyclic=*/true);
+    REQUIRE(agreed.has_value());
+    CHECK(agreed->first == Approx(0.3F));
+    CHECK(agreed->second == Approx(0.6F));
+    // A single loose key is a point span in both lenses.
+    loose.settings.front().keys = {{.position = 0.95F, .value = 0.0F}};
+    const auto single = WaterFeatureLooseKeySpan(loose, /*cyclic=*/true);
+    REQUIRE(single.has_value());
+    CHECK(single->first == Approx(0.95F));
+    CHECK(single->second == Approx(0.95F));
 }
 
 TEST_CASE("Sanitize keeps wrapped clips and wraps their start phase",
@@ -7091,6 +7109,81 @@ TEST_CASE("Explicit clip membership routes new keys and derives clip bounds",
     REQUIRE(edited != timeline.settings.front().keys.end());
     CHECK(edited->value == Approx(0.9F));
     CHECK(edited->clipId == 7U);
+}
+
+TEST_CASE("Loose-key ghost drags across phase 0 keep the cluster together",
+          "[water][timing][keyed][clips][cyclic]") {
+    using Catch::Approx;
+    using invisible_places::water::BuildWaterFeatureClipLaneLayout;
+    using invisible_places::water::CyclicWaterFeatureClipMoveSpan;
+    using invisible_places::water::TransformWaterFeatureClipSelection;
+    using invisible_places::water::WaterFeatureClipDisplaySpan;
+    using invisible_places::water::WaterFeatureLooseKeySpan;
+    using invisible_places::water::WaterFeatureTimeline;
+    using invisible_places::water::WaterKeyedFeatureKind;
+
+    // Two loose keys at 0.10/0.30 dragged left by 0.2 in the linked lens:
+    // the keys store mod 1 (0.900 and 0.100), and the cyclically derived
+    // ghost block is the 0.2-long cluster {0.9, 1.1}, not the 0.8-long
+    // complement {0.1, 0.9} that a linear min/max reads from the stored
+    // values (which flipped the block under the cursor mid-drag and fed
+    // the wrong window to a later stretch or group-into-clip).
+    WaterFeatureTimeline timeline;
+    timeline.feature = {
+        .kind = WaterKeyedFeatureKind::SeepageNode,
+        .objectId = 7U};
+    timeline.settings = {
+        {.settingId = "strength",
+         .keys = {
+             {.position = 0.10F, .value = 1.0F},
+             {.position = 0.30F, .value = 0.0F},
+         }},
+    };
+    timeline.clipMembershipExplicit = true;
+    const auto before = WaterFeatureLooseKeySpan(timeline, /*cyclic=*/true);
+    REQUIRE(before.has_value());
+    const auto beforeSpan = WaterFeatureClipDisplaySpan(
+        before->first,
+        before->second);
+    CHECK(beforeSpan.first == Approx(0.10F));
+    CHECK(beforeSpan.second == Approx(0.30F));
+    const auto moved = CyclicWaterFeatureClipMoveSpan(
+        beforeSpan.first,
+        beforeSpan.second,
+        -0.2F);
+    const std::array looseIds{0U};
+    REQUIRE(TransformWaterFeatureClipSelection(
+        &timeline,
+        looseIds,
+        beforeSpan.first,
+        beforeSpan.second,
+        moved.first,
+        moved.second,
+        /*allowWrap=*/true));
+    REQUIRE(timeline.settings.front().keys.size() == 2U);
+    CHECK(timeline.settings.front().keys[0].position == Approx(0.10F));
+    CHECK(timeline.settings.front().keys[1].position == Approx(0.90F));
+    const auto after = WaterFeatureLooseKeySpan(timeline, /*cyclic=*/true);
+    REQUIRE(after.has_value());
+    CHECK(after->first == Approx(0.90F));
+    CHECK(after->second == Approx(1.10F));
+    // The unlinked rail view keeps the pre-W1 linear hull of the same keys.
+    const auto linear = WaterFeatureLooseKeySpan(timeline);
+    REQUIRE(linear.has_value());
+    CHECK(linear->first == Approx(0.10F));
+    CHECK(linear->second == Approx(0.90F));
+
+    // The lane layout mirrors the lens: cyclically the wrapped ghost
+    // overlaps a clip beside phase 0 and takes its own lane; linearly the
+    // stored hull is probed exactly as before W1.
+    timeline.clips = {
+        {.id = 1U, .name = "Early", .start = 0.95F, .end = 1.0F}};
+    const auto cyclicLayout = BuildWaterFeatureClipLaneLayout(
+        timeline,
+        /*cyclicLooseKeys=*/true);
+    CHECK(cyclicLayout.laneCount == 2U);
+    const auto linearLayout = BuildWaterFeatureClipLaneLayout(timeline);
+    CHECK(linearLayout.laneCount == 2U);
 }
 
 TEST_CASE(

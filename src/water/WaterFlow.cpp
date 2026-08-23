@@ -8357,7 +8357,8 @@ std::pair<float, float> WaterFeatureClipDisplaySpan(
 }
 
 WaterFeatureClipLaneLayout BuildWaterFeatureClipLaneLayout(
-    const WaterFeatureTimeline& timeline) {
+    const WaterFeatureTimeline& timeline,
+    bool cyclicLooseKeys) {
     struct Candidate {
         std::uint32_t clipId = 0U;
         float start = 0.0F;
@@ -8383,7 +8384,8 @@ WaterFeatureClipLaneLayout BuildWaterFeatureClipLaneLayout(
                 WaterFeatureClipSettingSignatureForId(timeline, clip.id),
         });
     }
-    if (const auto looseSpan = WaterFeatureLooseKeySpan(timeline);
+    if (const auto looseSpan =
+            WaterFeatureLooseKeySpan(timeline, cyclicLooseKeys);
         looseSpan.has_value()) {
         const auto displaySpan = WaterFeatureClipDisplaySpan(
             looseSpan->first,
@@ -10904,67 +10906,6 @@ std::optional<float> AvailableWaterClipKeyPosition(
 
 }  // namespace
 
-std::pair<float, float> WaterFeatureClipCoveringArc(
-    std::span<const float> positions,
-    float hintStart) {
-    std::vector<float> sorted;
-    sorted.reserve(positions.size());
-    for (const float position : positions) {
-        if (std::isfinite(position)) {
-            sorted.push_back(Clamp01(position));
-        }
-    }
-    if (sorted.empty()) {
-        return {0.0F, 0.0F};
-    }
-    std::ranges::sort(sorted);
-    sorted.erase(
-        std::unique(
-            sorted.begin(),
-            sorted.end(),
-            [](float left, float right) {
-                return std::abs(left - right) <=
-                       kWaterFeatureClipPositionTolerance;
-            }),
-        sorted.end());
-    // Every member is a candidate start; its arc runs forward around the
-    // loop to the member just before it. All candidates cover every member
-    // with length <= 1, so the choice is only about which gap is left open.
-    // Minimal length alone would flip an ordinary clip whose keys straddle
-    // the rail middle (keys at 0.1 and 0.9 -> {0.9,1.1}), so the arc whose
-    // start is cyclically nearest the clip's present start wins: unwrapped
-    // clips stay unwrapped as their keys are dragged, and a clip that
-    // crossed phase 0 stays wrapped. Ties (keys at both 0 and 1, which are
-    // one phase but distinct stored keys) keep the earlier, longer arc so a
-    // legacy full-rail clip keyed at 0 and 1 stays {0,1}.
-    const float hint = std::isfinite(hintStart)
-        ? WrapWaterClipPhase(hintStart)
-        : 0.0F;
-    std::optional<std::pair<float, float>> best;
-    float bestDistance = 0.0F;
-    const std::size_t count = sorted.size();
-    for (std::size_t index = 0U; index < count; ++index) {
-        float start = sorted[index];
-        float end = index == 0U
-            ? sorted[count - 1U]
-            : sorted[index - 1U] + 1.0F;
-        if (start >= 1.0F) {
-            // A key stored exactly at 1 starts its arc at phase 0.
-            start -= 1.0F;
-            end -= 1.0F;
-        }
-        const float difference = std::abs(start - hint);
-        const float distance =
-            std::min(difference, std::abs(1.0F - difference));
-        if (!best.has_value() ||
-            distance < bestDistance - kWaterFeatureClipPositionTolerance) {
-            best = {start, end};
-            bestDistance = distance;
-        }
-    }
-    return best.value();
-}
-
 WaterFeatureSettingsClip SanitizeWaterFeatureSettingsClip(
     WaterFeatureSettingsClip clip) {
     if (clip.name.empty()) {
@@ -11200,14 +11141,19 @@ bool SynchronizeWaterFeatureClipBounds(
 }
 
 std::optional<std::pair<float, float>> WaterFeatureLooseKeySpan(
-    const WaterFeatureTimeline& timeline) {
+    const WaterFeatureTimeline& timeline,
+    bool cyclic) {
     std::optional<std::pair<float, float>> span;
+    std::vector<float> positions;
     for (const auto& setting : timeline.settings) {
         for (const auto& key : setting.keys) {
             if (!std::isfinite(key.position) || key.clipId != 0U) {
                 continue;
             }
             const float position = Clamp01(key.position);
+            if (cyclic) {
+                positions.push_back(position);
+            }
             if (!span.has_value()) {
                 span = {position, position};
             } else {
@@ -11216,7 +11162,39 @@ std::optional<std::pair<float, float>> WaterFeatureLooseKeySpan(
             }
         }
     }
-    return span;
+    if (!cyclic || !span.has_value() || positions.size() < 2U) {
+        return span;
+    }
+    // On the loop the block is the shortest covering arc: the complement of
+    // the largest circular gap between neighbouring loose keys. Keys pushed
+    // across phase 0 by a linked drag (stored 0.9 and 0.1) stay one 0.2-long
+    // cluster {0.9,1.1} instead of flipping to the 0.8-long rail hull. The
+    // hull itself is the complement of the seam gap, so it still wins
+    // whenever it is the shortest choice, and stays the tie-breaker so the
+    // unlinked and linked lenses agree wherever both are valid.
+    std::ranges::sort(positions);
+    positions.erase(
+        std::unique(
+            positions.begin(),
+            positions.end(),
+            [](float left, float right) {
+                return std::abs(left - right) <=
+                       kWaterFeatureClipPositionTolerance;
+            }),
+        positions.end());
+    if (positions.size() < 2U) {
+        return span;
+    }
+    float bestGap = positions.front() + 1.0F - positions.back();
+    std::pair<float, float> arc{positions.front(), positions.back()};
+    for (std::size_t index = 0U; index + 1U < positions.size(); ++index) {
+        const float gap = positions[index + 1U] - positions[index];
+        if (gap > bestGap + kWaterFeatureClipPositionTolerance) {
+            bestGap = gap;
+            arc = {positions[index + 1U], positions[index] + 1.0F};
+        }
+    }
+    return arc;
 }
 
 WaterFeatureSpanLimits WaterFeatureTimelineSpanLimits(

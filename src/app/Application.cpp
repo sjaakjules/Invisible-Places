@@ -1093,6 +1093,12 @@ struct WaterClipDragState {
     bool collapseOnRelease = false;
     std::vector<WaterClipDragEntry> entries;
     std::vector<WaterClipDragSnapshot> snapshots;
+    // Group window applied by the most recent drag frame, recorded only
+    // while the drag holds loose keys (clip id 0). The ghost block has no
+    // stored bounds, so the UI carries the dragged span through the drag
+    // rather than re-deriving it from keys stored mod 1.
+    std::optional<float> appliedGroupStart;
+    float appliedGroupEnd = 1.0F;
     // Duplicate drags re-create their copies every frame; these are the ids
     // most recently applied, promoted to the selection on release.
     std::vector<WaterClipHandle> duplicateHandles;
@@ -86773,8 +86779,12 @@ void DrawWaterClipContextMenu(
                                  timeline,
                                  context.clipId)
                            : nullptr;
+    // The loose-key span matches the drawn ghost block: cyclic (shortest
+    // covering arc) in the linked whole-loop lens, linear on the rail.
     const auto looseSpan =
-        invisible_places::water::WaterFeatureLooseKeySpan(*timeline);
+        invisible_places::water::WaterFeatureLooseKeySpan(
+            *timeline,
+            /*cyclic=*/allowWrap);
     const auto normalizedLooseSpan =
         [&]() -> std::optional<std::pair<float, float>> {
         if (!looseSpan.has_value()) {
@@ -87276,9 +87286,13 @@ void DrawWaterClipPackagePopup(
                 span = std::make_pair(clip->start, clip->end);
             }
         } else if (
+            // Package the same window the ghost block shows: the cyclic
+            // covering arc in the linked lens, the rail hull otherwise.
             const auto loose =
                 invisible_places::water::WaterFeatureLooseKeySpan(
-                    *timeline);
+                    *timeline,
+                    /*cyclic=*/ResolveAnimationTimelineCoordinateContext(
+                        *runtimeState).linkedCyclic);
             loose.has_value()) {
             span = invisible_places::water::WaterFeatureClipDisplaySpan(
                 loose->first,
@@ -87395,6 +87409,8 @@ void DrawWaterRunClipsTimeline(
         float topOffset = 0.0F;
         float height = kFeatureLabelHeight + kLaneHeight;
     };
+    const auto timelineCoordinates =
+        ResolveAnimationTimelineCoordinateContext(*runtimeState);
     std::vector<FeatureRowLayout> rowLayouts(rowCount);
     float surfaceHeight = 0.0F;
     const auto rebuildRowLayouts = [&] {
@@ -87402,7 +87418,9 @@ void DrawWaterRunClipsTimeline(
         for (std::size_t row = 0U; row < rowCount; ++row) {
             auto& layout = rowLayouts[row];
             layout.lanes = invisible_places::water::
-                BuildWaterFeatureClipLaneLayout(timelineForRow(row));
+                BuildWaterFeatureClipLaneLayout(
+                    timelineForRow(row),
+                    /*cyclicLooseKeys=*/timelineCoordinates.linkedCyclic);
             layout.visibleLaneCount =
                 std::max<std::size_t>(1U, layout.lanes.laneCount);
             layout.topOffset = offset;
@@ -87441,8 +87459,6 @@ void DrawWaterRunClipsTimeline(
     ImGui::SameLine(0.0F, 0.0F);
     ImGui::Dummy(ImVec2{kHelpGutterWidth, surfaceHeight});
     const float helpMaximumX = maximum.x + kHelpGutterWidth;
-    const auto timelineCoordinates =
-        ResolveAnimationTimelineCoordinateContext(*runtimeState);
     const auto xForPosition = [&](float position) {
         return minimum.x + width *
             timelineCoordinates.AuthoredToViewFraction(position);
@@ -87503,8 +87519,46 @@ void DrawWaterRunClipsTimeline(
             }
             return std::make_pair(clip->start, clip->end);
         }
-        auto span =
-            invisible_places::water::WaterFeatureLooseKeySpan(*timeline);
+        // While a drag is moving this feature's loose keys the ghost block
+        // carries the dragged {start,length} window instead of re-deriving
+        // it from the moved keys every frame: keys pushed across phase 0
+        // are stored mod 1 (0.9 and 0.1), and a span derived from stored
+        // values alone would flip to the complement arc under the cursor
+        // mid-drag, taking the tooltip, hit test, and any follow-up
+        // stretch or group-into-clip window with it.
+        if (timings.waterClipDrag.has_value() &&
+            timings.waterClipDrag->scenarioId == scenarioId &&
+            timings.waterClipDrag->runId == run->id &&
+            timings.waterClipDrag->appliedGroupStart.has_value()) {
+            const auto& drag = *timings.waterClipDrag;
+            const auto entry = std::find_if(
+                drag.entries.begin(),
+                drag.entries.end(),
+                [&](const WaterClipDragEntry& candidate) {
+                    return candidate.handle == handle;
+                });
+            if (entry != drag.entries.end()) {
+                const float groupLength =
+                    std::max(1.0e-6F, drag.groupEnd - drag.groupStart);
+                const float scale =
+                    (drag.appliedGroupEnd - *drag.appliedGroupStart) /
+                    groupLength;
+                const float mappedStart =
+                    *drag.appliedGroupStart +
+                    (entry->originalStart - drag.groupStart) * scale;
+                const float mappedEnd =
+                    *drag.appliedGroupStart +
+                    (entry->originalEnd - drag.groupStart) * scale;
+                const float start =
+                    invisible_places::water::WrapWaterClipPhase(mappedStart);
+                return invisible_places::water::WaterFeatureClipDisplaySpan(
+                    start,
+                    start + std::min(1.0F, mappedEnd - mappedStart));
+            }
+        }
+        auto span = invisible_places::water::WaterFeatureLooseKeySpan(
+            *timeline,
+            /*cyclic=*/timelineCoordinates.linkedCyclic);
         if (!span.has_value()) {
             return std::nullopt;
         }
@@ -87912,21 +87966,34 @@ void DrawWaterRunClipsTimeline(
                         clipIds.push_back(candidate.handle.clipId);
                     }
                 }
-                if (!invisible_places::water::
-                        TransformWaterFeatureClipSelection(
-                            timeline,
-                            clipIds,
-                            drag.groupStart,
-                            drag.groupEnd,
-                            newGroupStart,
-                            newGroupEnd,
-                            allowWrap)) {
+                const bool applied = invisible_places::water::
+                    TransformWaterFeatureClipSelection(
+                        timeline,
+                        clipIds,
+                        drag.groupStart,
+                        drag.groupEnd,
+                        newGroupStart,
+                        newGroupEnd,
+                        allowWrap);
+                if (!applied) {
                     // The drag holds at the last accepted window (the
                     // snapshot restore above keeps the originals), which
                     // looks frozen unless the refusal is explained.
                     runtimeState->errorMessage =
                         "Clip move refused: a key would land on another key "
                         "of the same setting.";
+                }
+                if (std::find(clipIds.begin(), clipIds.end(), 0U) !=
+                    clipIds.end()) {
+                    // The loose-keys ghost has no stored bounds; remember
+                    // the window this frame actually applied (the original
+                    // one on refusal, matching the snapshot restore) so
+                    // handleSpan can carry the dragged span instead of
+                    // re-deriving it from the moved keys.
+                    drag.appliedGroupStart =
+                        applied ? newGroupStart : drag.groupStart;
+                    drag.appliedGroupEnd =
+                        applied ? newGroupEnd : drag.groupEnd;
                 }
             }
         };

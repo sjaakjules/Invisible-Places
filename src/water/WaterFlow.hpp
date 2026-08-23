@@ -840,8 +840,12 @@ struct WaterFeatureClipLaneLayout {
         const WaterFeatureClipLaneLayout&) = default;
 };
 
+// cyclicLooseKeys derives the loose-key ghost span cyclically (the linked
+// whole-loop lens); stored clip spans always carry their own wrapping.
 [[nodiscard]] WaterFeatureClipLaneLayout
-BuildWaterFeatureClipLaneLayout(const WaterFeatureTimeline& timeline);
+BuildWaterFeatureClipLaneLayout(
+    const WaterFeatureTimeline& timeline,
+    bool cyclicLooseKeys = false);
 
 // Concise body-hover label for a clip. Conventional package names such as
 // "Object - Start - Strength" become "Start - Strength"; otherwise only an
@@ -1070,19 +1074,17 @@ ResolveWaterSettingSplineHandlePoint(
     std::uint32_t clipId);
 // Span of every explicitly loose key on the timeline (active and dormant
 // tracks), or nullopt when there are none. Backs the derived loose-keys block
-// shown alongside stored clips.
+// shown alongside stored clips. The default is the pre-W1 linear min/max on
+// the 0..1 rail; with cyclic (the linked whole-loop lens) it is the shortest
+// covering arc -- the complement of the largest circular gap between the
+// keys, possibly wrapped (end > 1) -- so a cluster pushed across phase 0
+// stays one block instead of flipping to the complement-length rail hull.
+// The linear hull is the complement of the seam gap and remains the
+// tie-breaking choice, so the two lenses agree wherever both are valid.
 [[nodiscard]] std::optional<std::pair<float, float>>
-WaterFeatureLooseKeySpan(const WaterFeatureTimeline& timeline);
-
-// Shortest-choice cyclic covering arc over stored positions in [0,1]:
-// {start in [0,1), end in [start, start+1]} covering every position, choosing
-// the arc whose start is cyclically nearest hintStart (a clip's present
-// start, or a grabbed block's start for a group window). Empty input yields
-// {0,0}. Shared by SynchronizeWaterFeatureClipBounds and the UI group-move
-// window so both derive identical bounds.
-[[nodiscard]] std::pair<float, float> WaterFeatureClipCoveringArc(
-    std::span<const float> positions,
-    float hintStart);
+WaterFeatureLooseKeySpan(
+    const WaterFeatureTimeline& timeline,
+    bool cyclic = false);
 
 // Recomputes one stored clip's bounds from its owned keys. An unwrapped clip
 // takes the exact pre-W1 linear min/max of its members (so unlinked key
