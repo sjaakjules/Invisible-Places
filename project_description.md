@@ -429,6 +429,19 @@ unavailable member to an unrelated endpoint. These modes do not replace the
 separate compiled-linked-animation **Live Camera** Overlay/A/B control described
 above, and none of this header state is serialized.
 
+An independent **HQ** button beside those modes prepares a linked live-view
+density override without moving the canonical frame, camera, or playback. Its
+off state is complete 5 mm ROCK/SAND/VEG. Its on state keeps complete 5 mm SAND
+and combines compact 1 mm ROCK/VEG inside the union of the two authored
+midpoint camera views (with a 5% border on each viewport side) with 5 mm points
+outside. Preparation is cancellable and lower priority than normal display and
+shared-cache startup, publishes both patches and masks atomically, and retains
+them only for the current session. The 1 mm SAND file is never read for this
+preview. Internal layers share the role Visual and effects but remain excluded
+from project/animation documents and all frozen render snapshots; still,
+frame-preview, video, and EXR output continue to use complete canonical 1 mm
+ROCK/SAND/VEG.
+
 Seam uses the same signed `-1..1` transport as the wizard's final preview, but
 without invoking the wizard or retiming either path. Zero is the midpoint of
 lexical A-start / B-end; `-1` and `+1` are the two displayed copies of the same

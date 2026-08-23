@@ -386,6 +386,45 @@ as an existing exact four-minute loop at 30 fps: member durations 6,868 and
 are required for that pair. The optional wizard 4:00 fit in FR-CAM-20 remains
 available for other pairs whose unique duration is not already 7,200 frames.
 
+#### FR-CAM-24
+Every valid reciprocal pair with a common grouped 1 mm/5 mm scene shall expose
+an independent session-only **HQ** control beside Seam/A/B. Preparation shall
+begin automatically after the complete 5 mm baseline and higher-priority
+display/shared-cache work are ready. Until both role patches are ready, the
+disabled control shall show monotonic progress and its Waiting, Scanning,
+Organising, or Uploading stage; a failure shall retain the pure 5 mm view and
+offer retry details.
+
+HQ off shall render the complete 5 mm ROCK/SAND/VEG bundle. HQ on shall retain
+complete 5 mm SAND, render complete 1 mm ROCK and VEG point centres inside the
+union of the two member cameras evaluated at normalized `0.5`, and render 5 mm
+ROCK and VEG outside that union. Each camera shall use its authored live-view
+aspect ratio, falling back to the current live aspect only when absent. The
+viewport shall extend by 5% of its full width/height beyond every X/Y side;
+authored near/far clipping shall not be extended. The same exact centre test
+shall construct the 1 mm selection and complementary 5 mm mask, leaving no
+overlap or gap. The application shall never open or allocate 1 mm SAND for HQ.
+
+Both 1 mm patches and both 5 mm masks shall publish as one live-resource
+transaction. Enabling or disabling HQ shall preserve Seam/A/B mode, canonical
+and local playheads, camera, and playback, while resetting only temporal and
+compositor history. Internal layers shall reuse the corresponding role's
+resolved Visual, field names and full-role mapping ranges, Timing Colourise,
+Rain, Seepage, Flow/roughness motion, renderer mode, depth of field, and EDL.
+The 5 mm remainder shall retain normal density compensation and the 1 mm patch
+shall use identity compensation. Retained source indices shall support later
+indexed field gathering without retaining or rescanning a complete in-memory
+1 mm cloud.
+
+The cache shall remain memory/GPU-only for the current active pair and shall be
+cancelled/rebuilt when the pair, midpoint camera/aspect, project identity, or a
+relevant source fingerprint changes. A hidden 5 mm override may be loaded for
+this purpose without changing the saved Visible Point Cloud selection.
+Internal layer ids, masks, and that override shall never enter serialization or
+export snapshots. Every still, frame preview, video, and EXR export shall keep
+the existing complete canonical 1 mm ROCK/SAND/VEG path. No schema increment is
+required.
+
 ### 5.4 Side Panel Behaviour
 #### FR-UI-1
 The application shall include a side panel for render and style controls.

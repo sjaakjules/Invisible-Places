@@ -23,6 +23,59 @@ Ordinary framing, placement, and editing can use the committed runtime display s
 
 Point-cloud loading and shared-surface build/load plus GPU preprocessing use one exclusive high-memory slot. The active display commits first; the shared surface cache then takes the slot before inactive queued loads, and the remaining work resumes only after preprocessing completes. Mesh Flow consumes the Ground table in that cache and has no separate dynamic-mesh warmup.
 
+## Linked A/B HQ Live Override
+
+The session-only **HQ** control beside **Seam / A / B** is deliberately separate
+from the saved Visible Point Cloud selector. For the active reciprocal pair it
+resolves one common grouped scene and its exact complete 1 mm and 5 mm bundles.
+If 5 mm is not the committed display, those three sessions load hidden and are
+owned only by the linked live override; the saved selection is unchanged. HQ
+off then presents complete 5 mm ROCK/SAND/VEG.
+
+After the baseline and shared-water cache settle, a utility-priority,
+cancellable worker evaluates A and B at normalized `0.5`. Each member uses its
+authored live-view aspect ratio or the current live aspect as a legacy
+fallback. The two frusta keep authored near/far depth and extend X/Y by 5% of
+the full viewport on every side. The filtered PLY reader streams only 1 mm
+ROCK and VEG, preserves source order and original 32-bit point indices, and
+materialises only points whose centres pass either padded frustum. It does not
+stat, open, or allocate 1 mm SAND. The identical predicate partitions the
+resident 5 mm ROCK/VEG indices, so each role is exactly 1 mm inside plus 5 mm
+outside with no boundary overlap or gap.
+
+The two compact patch uploads complete before either complementary mask can be
+selected. A resource-mutation batch publishes masks on toggle and clears them
+on disable/failure, so preparation and cancellation always leave a complete
+5 mm frame. Empty outside sets omit that base draw rather than interpreting an
+empty renderer mask as “draw all.” Prepared CPU/GPU data stays in memory for
+instant Seam/A/B toggling and is released when the pair, midpoint matrices or
+fallback aspect, project path, or any of the five sources actually read (all
+three 5 mm roles plus 1 mm ROCK/VEG) changes.
+
+Patch layers resolve the same role Visual, field names, Timing Colourise,
+Rain, Seepage, Flow/roughness motion, renderer mode, depth of field, and EDL as
+their 5 mm surroundings. Their values are 1 mm values, while automatic
+field-map ranges come from the complete 5 mm role to avoid a patch-local
+renormalization seam. Existing full-role density compensation remains on the
+5 mm remainder; the 1 mm patch uses identity compensation. All fields already
+referenced by saved Visuals and Timing Takes load during extraction. Ordered
+source indices allow a newly referenced scalar field to be gathered later in
+the background without retaining the complete 1 mm source cloud.
+
+Only the main live render-state call opts into these internal ids. The default
+render-state builder, frozen snapshots, full-density export gate, project and
+animation serializers remain unaware of them. Still images, frame previews,
+video and EXR therefore continue to render complete canonical 1 mm
+ROCK/SAND/VEG, and this feature requires no project or animation schema change.
+
+The opt-in native diagnostics are `--gui-smoke linked-hq-sample-scene` and
+`--gui-smoke linked-hq-scene3`. The SampleScene scenario also changes B's
+midpoint camera during the first scan to exercise cancellation and
+invalidation. Both scenarios verify monotonic per-selection progress, zero
+1 mm SAND session reads/fingerprints, atomic two-patch publication, instant
+Seam/A/B-safe toggling, Visual/Timing/Rain/Seepage parity, density
+compensation, serialization isolation, and canonical 1 mm export selection.
+
 ## Deterministic Local Display-Density Cache
 
 Scene3 can transparently replace the payload bytes behind its discovered 5 mm ROCK/SAND/VEG display paths with one validated local bundle. The default cache root is `Saved/.invisible_places/cache/display_density/Scene3` and has this layout:

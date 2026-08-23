@@ -1,6 +1,7 @@
 #include "app/Application.hpp"
 
 #include "app/AnimationRegistryOrder.hpp"
+#include "app/LinkedHighQualityPreview.hpp"
 #include "app/ManualFlowPathEditMath.hpp"
 #include "app/PointDensityParity.hpp"
 #include "app/PointVisualSelection.hpp"
@@ -62,6 +63,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <charconv>
 #include <chrono>
@@ -261,6 +263,10 @@ constexpr float kPi = 3.14159265358979323846F;
 constexpr std::size_t kMaxPivotSamples = 65536;
 constexpr std::size_t kAnimationMatchingFrameGhostLayerId =
     std::numeric_limits<std::size_t>::max() - 64U;
+constexpr std::size_t kLinkedHqRockPatchLayerId =
+    std::numeric_limits<std::size_t>::max() - 62U;
+constexpr std::size_t kLinkedHqVegetationPatchLayerId =
+    std::numeric_limits<std::size_t>::max() - 61U;
 constexpr invisible_places::scene::PointSpacingMicrometres
     kAnimationMatchingFrameGhostSpacingMicrometres = 5'000U;
 constexpr std::size_t kAnimationMatchingFrameGhostSourceSampleLimit =
@@ -310,6 +316,7 @@ enum class PointCloudLoadPurpose : std::uint8_t {
     AnalysisCpuOnly,
     StagedDisplay,
     ExportGpu,
+    LinkedHqBaseline,
 };
 
 struct QueuedLayerLoad {
@@ -3557,6 +3564,94 @@ struct AnimationReciprocalPanSmoothingJobRuntime {
     std::shared_ptr<AnimationReciprocalPanSmoothingJobShared> shared;
 };
 
+// Runtime-only linked-view density assembly. Neither the synthetic layer ids
+// nor the hidden 5 mm baseline sessions are serialized or included by the
+// canonical export-source resolver.
+struct LinkedHqSelectionRequest {
+    std::uint64_t fingerprint = 0U;
+    std::string pairSessionId;
+    std::string sceneGroupName;
+    LinkedHqFrustumUnion midpointFrustums{};
+    std::array<std::size_t, invisible_places::scene::kScenePointCloudRoleCount>
+        fiveMillimeterSessionIndices{};
+    std::array<std::size_t, invisible_places::scene::kScenePointCloudRoleCount>
+        oneMillimeterSessionIndices{};
+    std::array<LinkedHqSourceFingerprint, 5U> sourceFingerprints{};
+    std::array<invisible_places::io::PointCloudScalarFieldFilter, 2U>
+        patchFieldFilters{};
+};
+
+struct LinkedHqPatchJobOutput {
+    std::size_t layerId = 0U;
+    std::size_t baseSessionIndex = 0U;
+    std::size_t sourceSessionIndex = 0U;
+    invisible_places::io::PointCloudSubsetLoadResult subset;
+    std::vector<std::uint32_t> fiveMillimeterOutsideIndices;
+};
+
+struct LinkedHqPreparationJobResult {
+    std::uint64_t fingerprint = 0U;
+    std::array<LinkedHqPatchJobOutput, 2U> patches{};
+    std::string errorMessage;
+    bool success = false;
+    bool cancelled = false;
+};
+
+struct LinkedHqPreparationJobShared {
+    std::mutex mutex;
+    std::optional<LinkedHqPreparationJobResult> result;
+    std::atomic<LinkedHqPreparationStage> stage{
+        LinkedHqPreparationStage::Waiting};
+    std::atomic<float> stageProgress{0.0F};
+    std::atomic_bool finished{false};
+};
+
+struct LinkedHqPatchRuntime {
+    std::size_t layerId = std::numeric_limits<std::size_t>::max();
+    std::size_t baseSessionIndex =
+        std::numeric_limits<std::size_t>::max();
+    std::size_t sourceSessionIndex =
+        std::numeric_limits<std::size_t>::max();
+    std::shared_ptr<invisible_places::io::LoadedPointCloud> cloud;
+    std::shared_ptr<const std::vector<std::uint32_t>> sourcePointIndices;
+    std::vector<std::uint32_t> fiveMillimeterOutsideIndices;
+    bool uploaded = false;
+};
+
+struct LinkedHqIndexedFieldJobResult {
+    std::uint64_t fingerprint = 0U;
+    std::size_t patchSlot = 0U;
+    std::string fieldName;
+    invisible_places::io::PointCloudIndexedValueLoadResult load;
+};
+
+struct LinkedHqIndexedFieldJobShared {
+    std::mutex mutex;
+    std::optional<LinkedHqIndexedFieldJobResult> result;
+    std::atomic_bool finished{false};
+};
+
+struct LinkedHqPreviewRuntime {
+    std::optional<LinkedHqSelectionRequest> request;
+    std::array<LinkedHqPatchRuntime, 2U> patches{};
+    std::jthread preparationWorker;
+    std::shared_ptr<LinkedHqPreparationJobShared> preparationShared;
+    std::optional<LinkedHqPreparationJobResult> uploadPending;
+    std::jthread indexedFieldWorker;
+    std::shared_ptr<LinkedHqIndexedFieldJobShared> indexedFieldShared;
+    std::array<bool, invisible_places::scene::kScenePointCloudRoleCount>
+        baselineLoadedForHq{};
+    std::array<bool, invisible_places::scene::kScenePointCloudRoleCount>
+        baselineVisibilityAfterLoad{};
+    LinkedHqPreparationStage stage = LinkedHqPreparationStage::Waiting;
+    float displayedProgress = 0.0F;
+    bool baselineReady = false;
+    bool ready = false;
+    bool enabled = false;
+    bool retryRequested = false;
+    std::string failureMessage;
+};
+
 struct PreviewRuntimeState {
     std::filesystem::path dataRoot;
     std::vector<PreviewLayerSession> sessions;
@@ -3584,6 +3679,7 @@ struct PreviewRuntimeState {
     AnimationPanSeamPreviewJobRuntime animationPanSeamPreviewJob{};
     AnimationReciprocalPanSmoothingJobRuntime
         animationReciprocalPanSmoothingJob{};
+    LinkedHqPreviewRuntime linkedHqPreview{};
     AnimationPlaybackState animationPlayback{};
     TimingsPanelState timingsPanel{};
     TimingColouriseHistogramRuntime timingColouriseHistogram{};
@@ -9514,11 +9610,39 @@ bool IsCommittedDisplayPointCloudSource(const PreviewLayerSession& session) {
            (!IsSceneGroupedPointCloud(session) || session.committedDisplaySource);
 }
 
+bool IsLinkedHqBaselineSession(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& session) {
+    const auto& hq = runtimeState.linkedHqPreview;
+    if (!hq.baselineReady || !hq.request.has_value()) {
+        return false;
+    }
+    return std::any_of(
+        hq.request->fiveMillimeterSessionIndices.begin(),
+        hq.request->fiveMillimeterSessionIndices.end(),
+        [&](std::size_t sessionIndex) {
+            return sessionIndex < runtimeState.sessions.size() &&
+                   &runtimeState.sessions[sessionIndex] == &session;
+        });
+}
+
+bool IsLinkedHqTargetSceneSession(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& session) {
+    const auto& hq = runtimeState.linkedHqPreview;
+    return hq.baselineReady && hq.request.has_value() &&
+           IsSceneGroupedPointCloud(session) &&
+           session.sceneGroupName == hq.request->sceneGroupName;
+}
+
 bool IsCommittedDisplayPointCloudReady(
     const PreviewRuntimeState& runtimeState,
     const PreviewLayerSession& session) {
     if (session.kind != LayerKind::PointCloud || !session.gpuResident || !session.loaded) {
         return false;
+    }
+    if (IsLinkedHqBaselineSession(runtimeState, session)) {
+        return true;
     }
     if (!IsSceneGroupedPointCloud(session)) {
         return true;
@@ -9527,11 +9651,42 @@ bool IsCommittedDisplayPointCloudReady(
     return session.committedDisplaySource && scene != nullptr && scene->displayLoaded;
 }
 
-bool IsRenderablePointCloudSource(
+bool IsCanonicalRenderablePointCloudSource(
     const PreviewRuntimeState& runtimeState,
     const PreviewLayerSession& session) {
     if (IsInactiveLegacyWaterOverlaySession(session) ||
-        !IsCommittedDisplayPointCloudReady(runtimeState, session) ||
+        session.kind != LayerKind::PointCloud || !session.gpuResident ||
+        !session.loaded || !session.visible) {
+        return false;
+    }
+    if (!IsSceneGroupedPointCloud(session)) {
+        return true;
+    }
+    const auto* scene = FindScenePointCloudRuntime(runtimeState, session);
+    return session.committedDisplaySource && scene != nullptr &&
+           scene->displayLoaded && scene->displayVisible;
+}
+
+bool IsRenderablePointCloudSource(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& session) {
+    if (runtimeState.offlineRenderJob.active) {
+        return IsCanonicalRenderablePointCloudSource(
+            runtimeState,
+            session);
+    }
+    if (IsInactiveLegacyWaterOverlaySession(session)) {
+        return false;
+    }
+    if (IsLinkedHqTargetSceneSession(runtimeState, session)) {
+        if (!IsLinkedHqBaselineSession(runtimeState, session)) {
+            return false;
+        }
+        const auto* scene = FindScenePointCloudRuntime(runtimeState, session);
+        return session.gpuResident && session.loaded && scene != nullptr &&
+               scene->displayVisible;
+    }
+    if (!IsCommittedDisplayPointCloudReady(runtimeState, session) ||
         !session.visible) {
         return false;
     }
@@ -9563,7 +9718,9 @@ std::string NormalizeSceneRoleName(std::string_view role);
 PointCloudDensityCompensation ResolveSessionDensityCompensation(
     const PreviewRuntimeState& runtimeState,
     const PreviewLayerSession& session) {
-    if (!IsSceneGroupedPointCloud(session) || !session.committedDisplaySource) {
+    if (!IsSceneGroupedPointCloud(session) ||
+        (!session.committedDisplaySource &&
+         !IsLinkedHqBaselineSession(runtimeState, session))) {
         return {};
     }
 
@@ -12308,9 +12465,21 @@ void BeginLayerLoad(
 
     auto backgroundState = std::make_shared<BackgroundLayerLoadState>();
     std::jthread backgroundThread{
-        [backgroundState, layerKind, filePath, transformPath, scalarFieldFilter](std::stop_token stopToken) {
+        [backgroundState,
+         layerKind,
+         filePath,
+         transformPath,
+         scalarFieldFilter,
+         purpose](std::stop_token stopToken) {
             const BackgroundLoadCompletionSignal completion{
                 backgroundState->finished};
+#ifdef __APPLE__
+            if (purpose == PointCloudLoadPurpose::LinkedHqBaseline) {
+                (void)pthread_set_qos_class_self_np(
+                    QOS_CLASS_UTILITY,
+                    0);
+            }
+#endif
             if (stopToken.stop_requested()) {
                 return;
             }
@@ -12665,6 +12834,21 @@ void UnloadLayerByIndex(
     }
 
     auto& session = runtimeState->sessions[sessionIndex];
+    if (runtimeState->linkedHqPreview.request.has_value() &&
+        std::find(
+            runtimeState->linkedHqPreview.request
+                ->fiveMillimeterSessionIndices.begin(),
+            runtimeState->linkedHqPreview.request
+                ->fiveMillimeterSessionIndices.end(),
+            sessionIndex) !=
+            runtimeState->linkedHqPreview.request
+                ->fiveMillimeterSessionIndices.end()) {
+        runtimeState->linkedHqPreview.baselineReady = false;
+        runtimeState->animationPanel.linkedSeamedView
+            .temporalHistoryResetRequested = true;
+        viewport->SetTemporalCameraOverlay(false);
+        runtimeState->previewRenderStateSignatureValid = false;
+    }
     if (!session.loaded) {
         session.gpuResident = false;
         session.visible = false;
@@ -13490,6 +13674,48 @@ void HandleScenePurposeLoadCompleted(
     if (scene == nullptr) {
         return;
     }
+    if (purpose == PointCloudLoadPurpose::LinkedHqBaseline) {
+        auto& hq = runtimeState->linkedHqPreview;
+        const bool requestMatches =
+            hq.request.has_value() &&
+            hq.request->fingerprint == sceneSwitchGeneration;
+        if (requestMatches) {
+            const auto role = std::find(
+                hq.request->fiveMillimeterSessionIndices.begin(),
+                hq.request->fiveMillimeterSessionIndices.end(),
+                sessionIndex);
+            if (role !=
+                hq.request->fiveMillimeterSessionIndices.end()) {
+                const auto roleIndex =
+                    static_cast<std::size_t>(std::distance(
+                        hq.request->fiveMillimeterSessionIndices.begin(),
+                        role));
+                hq.baselineLoadedForHq[roleIndex] =
+                    !runtimeState->sessions[sessionIndex]
+                         .committedDisplaySource;
+                runtimeState->sessions[sessionIndex].visible =
+                    hq.baselineVisibilityAfterLoad[roleIndex];
+                return;
+            }
+        }
+
+        // The linked pair/project changed while this whole-role load was in
+        // flight. The legacy whole-cloud loader cannot interrupt a file read,
+        // so discard its now-unowned result as soon as it reaches the main
+        // thread instead of publishing or retaining stale session state.
+        auto& session = runtimeState->sessions[sessionIndex];
+        if (!session.committedDisplaySource &&
+            !session.pendingDisplaySource && !session.analysisSource) {
+            UnloadLayerByIndex(
+                runtimeState,
+                viewport,
+                sessionIndex,
+                true);
+        }
+        runtimeState->statusMessage.clear();
+        runtimeState->previewRenderStateSignatureValid = false;
+        return;
+    }
     if (purpose == PointCloudLoadPurpose::AnalysisCpuOnly) {
         if (SceneAnalysisSourcesReady(*runtimeState, *scene)) {
             scene->switchError.clear();
@@ -13538,6 +13764,29 @@ void HandleScenePurposeLoadFailed(
     PointCloudLoadPurpose purpose,
     std::uint64_t sceneSwitchGeneration,
     std::string_view errorMessage) {
+    if (purpose == PointCloudLoadPurpose::LinkedHqBaseline) {
+        auto& hq = runtimeState->linkedHqPreview;
+        if (!hq.request.has_value() ||
+            hq.request->fingerprint != sceneSwitchGeneration ||
+            std::find(
+                hq.request->fiveMillimeterSessionIndices.begin(),
+                hq.request->fiveMillimeterSessionIndices.end(),
+                sessionIndex) ==
+                hq.request->fiveMillimeterSessionIndices.end()) {
+            runtimeState->errorMessage.clear();
+            runtimeState->statusMessage.clear();
+            return;
+        }
+        const auto role = std::find(
+            hq.request->fiveMillimeterSessionIndices.begin(),
+            hq.request->fiveMillimeterSessionIndices.end(),
+            sessionIndex);
+        const auto roleIndex = static_cast<std::size_t>(std::distance(
+            hq.request->fiveMillimeterSessionIndices.begin(),
+            role));
+        runtimeState->sessions[sessionIndex].visible =
+            hq.baselineVisibilityAfterLoad[roleIndex];
+    }
     auto* scene = FindScenePointCloudRuntimeContainingSession(runtimeState, sessionIndex);
     if (scene == nullptr) {
         return;
@@ -13560,6 +13809,15 @@ void HandleScenePurposeLoadFailed(
             });
         runtimeState->errorMessage = scene->switchError;
         runtimeState->statusMessage.clear();
+    } else if (purpose == PointCloudLoadPurpose::LinkedHqBaseline) {
+        auto& hq = runtimeState->linkedHqPreview;
+        hq.stage = LinkedHqPreparationStage::Failed;
+        hq.failureMessage =
+            "The 5 mm HQ baseline could not load: " +
+            std::string{errorMessage};
+        hq.baselineReady = false;
+        hq.ready = false;
+        hq.enabled = false;
     }
 }
 
@@ -24327,8 +24585,18 @@ ExportSourceReleaseSummary ReleaseExportOnlyPointCloudSources(
             }
             const auto& session =
                 runtimeState->sessions[sessionIndex.value()];
+            const bool retainedByLinkedHq =
+                runtimeState->linkedHqPreview.request.has_value() &&
+                std::find(
+                    runtimeState->linkedHqPreview.request
+                        ->fiveMillimeterSessionIndices.begin(),
+                    runtimeState->linkedHqPreview.request
+                        ->fiveMillimeterSessionIndices.end(),
+                    sessionIndex.value()) !=
+                    runtimeState->linkedHqPreview.request
+                        ->fiveMillimeterSessionIndices.end();
             if (session.committedDisplaySource ||
-                session.pendingDisplaySource) {
+                session.pendingDisplaySource || retainedByLinkedHq) {
                 continue;
             }
             const bool hasExportOnlyGpuCopy =
@@ -24407,6 +24675,16 @@ void StopBackgroundWorkForShutdown(PreviewRuntimeState* runtimeState) {
     }
 
     runtimeState->persistence.queuedLoads.clear();
+    if (runtimeState->linkedHqPreview.preparationWorker.joinable()) {
+        runtimeState->linkedHqPreview.preparationWorker.request_stop();
+        runtimeState->linkedHqPreview.preparationWorker = std::jthread{};
+    }
+    runtimeState->linkedHqPreview.preparationShared.reset();
+    if (runtimeState->linkedHqPreview.indexedFieldWorker.joinable()) {
+        runtimeState->linkedHqPreview.indexedFieldWorker.request_stop();
+        runtimeState->linkedHqPreview.indexedFieldWorker = std::jthread{};
+    }
+    runtimeState->linkedHqPreview.indexedFieldShared.reset();
     if (runtimeState->offlineRenderJob.active) {
         std::cout << "Requesting animation export shutdown..." << std::endl;
         runtimeState->offlineRenderJob.cancelRequested = true;
@@ -52366,6 +52644,1059 @@ SnapshotAnimationMatchingFrameGhostSource(
     return snapshot;
 }
 
+void PublishLinkedHqStageProgress(
+    const std::shared_ptr<LinkedHqPreparationJobShared>& shared,
+    LinkedHqPreparationStage stage,
+    float progress) {
+    if (shared == nullptr) {
+        return;
+    }
+    const float clamped = std::clamp(progress, 0.0F, 1.0F);
+    const auto previousStage =
+        shared->stage.load(std::memory_order_acquire);
+    if (previousStage != stage) {
+        shared->stageProgress.store(clamped, std::memory_order_release);
+        shared->stage.store(stage, std::memory_order_release);
+        return;
+    }
+    auto current = shared->stageProgress.load(std::memory_order_relaxed);
+    while (clamped > current &&
+           !shared->stageProgress.compare_exchange_weak(
+               current,
+               clamped,
+               std::memory_order_release,
+               std::memory_order_relaxed)) {
+    }
+}
+
+std::optional<LinkedHqSelectionRequest> ResolveLinkedHqSelectionRequest(
+    const PreviewRuntimeState& runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    std::string* errorMessage) {
+    const auto pair = ResolveActiveAnimationLinkedPair(runtimeState);
+    if (!pair.has_value()) {
+        if (errorMessage != nullptr) {
+            errorMessage->clear();
+        }
+        return std::nullopt;
+    }
+
+    auto firstAssociations = pair->members[0U]->associatedLayerPaths;
+    auto secondAssociations = pair->members[1U]->associatedLayerPaths;
+    CanonicalizeAssociatedLayerPathsForSceneGroups(
+        runtimeState,
+        &firstAssociations);
+    CanonicalizeAssociatedLayerPathsForSceneGroups(
+        runtimeState,
+        &secondAssociations);
+
+    const ScenePointCloudRuntime* selectedScene = nullptr;
+    const SceneDisplayBundleRuntime* fiveMillimeterBundle = nullptr;
+    const SceneDisplayBundleRuntime* oneMillimeterBundle = nullptr;
+    for (const auto& association : firstAssociations) {
+        if (!AssociatedLayerPathsContain(
+                secondAssociations,
+                association)) {
+            continue;
+        }
+        const auto sceneGroup =
+            SceneGroupNameFromAssociationPath(association);
+        if (!sceneGroup.has_value()) {
+            continue;
+        }
+        const auto sceneIt = std::find_if(
+            runtimeState.pointCloudScenes.begin(),
+            runtimeState.pointCloudScenes.end(),
+            [&](const ScenePointCloudRuntime& scene) {
+                return scene.sceneGroupName == sceneGroup.value();
+            });
+        if (sceneIt == runtimeState.pointCloudScenes.end()) {
+            continue;
+        }
+        const auto* candidateFive = FindSceneDisplayBundle(
+            *sceneIt,
+            invisible_places::scene::PointSpacingMicrometres{5'000U});
+        const auto* candidateOne = FindSceneDisplayBundle(
+            *sceneIt,
+            invisible_places::scene::PointSpacingMicrometres{1'000U});
+        if (candidateFive == nullptr || candidateOne == nullptr) {
+            continue;
+        }
+        selectedScene = &*sceneIt;
+        fiveMillimeterBundle = candidateFive;
+        oneMillimeterBundle = candidateOne;
+        break;
+    }
+    if (selectedScene == nullptr || fiveMillimeterBundle == nullptr ||
+        oneMillimeterBundle == nullptr) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "HQ requires the linked animations to share one grouped "
+                "scene with complete 1 mm and 5 mm ROCK/SAND/VEG bundles.";
+        }
+        return std::nullopt;
+    }
+    if (!selectedScene->displayLoaded || !selectedScene->displayVisible) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "HQ is waiting for the linked scene to become visible.";
+        }
+        return std::nullopt;
+    }
+
+    LinkedHqSelectionRequest request;
+    request.pairSessionId = pair->sessionPairId;
+    request.sceneGroupName = selectedScene->sceneGroupName;
+    request.fiveMillimeterSessionIndices =
+        fiveMillimeterBundle->sessionIndices;
+    request.oneMillimeterSessionIndices =
+        oneMillimeterBundle->sessionIndices;
+
+    const float fallbackAspect = CurrentAspectRatio(viewport);
+    for (std::size_t member = 0U; member < 2U; ++member) {
+        const auto defaultSize =
+            AnimationDefaultLiveViewWindowSize(*pair->members[member]);
+        const float authoredAspect = defaultSize.has_value()
+            ? static_cast<float>(defaultSize->width) /
+                  static_cast<float>(std::max(1, defaultSize->height))
+            : fallbackAspect;
+        const auto evaluation = invisible_places::camera::EvaluateAnimationPath(
+            *pair->members[member],
+            invisible_places::camera::AnimationPathDurationSeconds(
+                *pair->members[member]) *
+                0.5F);
+        invisible_places::camera::OrbitCamera midpointCamera;
+        midpointCamera.ApplyState(evaluation.camera);
+        request.midpointFrustums.midpointViewProjections[member] =
+            midpointCamera.Matrices(authoredAspect).viewProjection;
+    }
+
+    const auto rockRole = invisible_places::scene::ScenePointCloudRoleIndex(
+        invisible_places::scene::ScenePointCloudRole::Rock);
+    const auto vegetationRole =
+        invisible_places::scene::ScenePointCloudRoleIndex(
+            invisible_places::scene::ScenePointCloudRole::Vegetation);
+    const std::array<std::size_t, 2U> patchRoles{
+        rockRole,
+        vegetationRole,
+    };
+    for (std::size_t patch = 0U; patch < patchRoles.size(); ++patch) {
+        const auto baseIndex =
+            request.fiveMillimeterSessionIndices[patchRoles[patch]];
+        if (baseIndex >= runtimeState.sessions.size()) {
+            if (errorMessage != nullptr) {
+                *errorMessage = "HQ 5 mm role source is no longer registered.";
+            }
+            return std::nullopt;
+        }
+        request.patchFieldFilters[patch] = CollectScalarFieldLoadFilter(
+            runtimeState,
+            runtimeState.sessions[baseIndex]);
+    }
+
+    // Fingerprint every source HQ reads except 1 mm SAND. Merely preparing
+    // HQ must never open that large file; export retains sole ownership of it.
+    std::array<LinkedHqSourceFingerprint, 5U> sources{};
+    const std::array<std::size_t, 5U> sourceSessionIndices{
+        request.fiveMillimeterSessionIndices[0U],
+        request.fiveMillimeterSessionIndices[1U],
+        request.fiveMillimeterSessionIndices[2U],
+        request.oneMillimeterSessionIndices[rockRole],
+        request.oneMillimeterSessionIndices[vegetationRole],
+    };
+    for (std::size_t source = 0U;
+         source < sourceSessionIndices.size();
+         ++source) {
+        if (sourceSessionIndices[source] >= runtimeState.sessions.size()) {
+            if (errorMessage != nullptr) {
+                *errorMessage = "HQ role source is no longer registered.";
+            }
+            return std::nullopt;
+        }
+        std::string fingerprintError;
+        if (!TryFingerprintLinkedHqSource(
+                runtimeState.sessions[sourceSessionIndices[source]].sourcePath,
+                &sources[source],
+                &fingerprintError)) {
+            if (errorMessage != nullptr) {
+                *errorMessage = fingerprintError;
+            }
+            return std::nullopt;
+        }
+    }
+    request.sourceFingerprints = sources;
+    const std::string projectPairKey = request.pairSessionId + "\n" +
+        runtimeState.persistence.projectFilePath + "\n" +
+        request.sceneGroupName;
+    request.fingerprint = BuildLinkedHqSelectionFingerprint(
+        projectPairKey,
+        request.midpointFrustums,
+        sources);
+    if (errorMessage != nullptr) {
+        errorMessage->clear();
+    }
+    return request;
+}
+
+void ResetLinkedHqPreview(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    auto& hq = runtimeState->linkedHqPreview;
+    if (hq.preparationWorker.joinable()) {
+        hq.preparationWorker.request_stop();
+    }
+    if (hq.indexedFieldWorker.joinable()) {
+        hq.indexedFieldWorker.request_stop();
+    }
+
+    const auto priorRequest = hq.request;
+    const auto ownedBaseline = hq.baselineLoadedForHq;
+    if (viewport != nullptr) {
+        try {
+            PointCloudMutationBatchScope mutationBatch{viewport};
+            for (const auto& patch : hq.patches) {
+                if (patch.baseSessionIndex < runtimeState->sessions.size() &&
+                    viewport->HasPointCloudResources(patch.baseSessionIndex)) {
+                    viewport->UpdatePointBudget(
+                        patch.baseSessionIndex,
+                        {});
+                }
+                const bool internalPatchLayer =
+                    patch.layerId == kLinkedHqRockPatchLayerId ||
+                    patch.layerId == kLinkedHqVegetationPatchLayerId;
+                if (internalPatchLayer &&
+                    viewport->HasPointCloudResources(patch.layerId)) {
+                    viewport->RemovePointCloud(patch.layerId);
+                }
+                if (internalPatchLayer) {
+                    ForgetWaterSeepageLayerAttachment(
+                        &runtimeState->water,
+                        patch.layerId);
+                }
+            }
+            if (priorRequest.has_value() &&
+                !runtimeState->offlineRenderJob.active) {
+                for (std::size_t role = 0U;
+                     role < priorRequest->fiveMillimeterSessionIndices.size();
+                     ++role) {
+                    const auto sessionIndex =
+                        priorRequest->fiveMillimeterSessionIndices[role];
+                    if (!ownedBaseline[role] ||
+                        sessionIndex >= runtimeState->sessions.size()) {
+                        continue;
+                    }
+                    const auto& session =
+                        runtimeState->sessions[sessionIndex];
+                    if (!session.committedDisplaySource &&
+                        !session.pendingDisplaySource &&
+                        !session.analysisSource) {
+                        UnloadLayerByIndex(
+                            runtimeState,
+                            viewport,
+                            sessionIndex,
+                            true);
+                    }
+                }
+            }
+            mutationBatch.Finish();
+        } catch (const std::exception& error) {
+            runtimeState->errorMessage =
+                "Could not completely release the prior HQ preview: " +
+                std::string{error.what()};
+            if (priorRequest.has_value()) {
+                for (const auto sessionIndex :
+                     priorRequest->fiveMillimeterSessionIndices) {
+                    if (!viewport->HasPointCloudResources(sessionIndex)) {
+                        continue;
+                    }
+                    try {
+                        viewport->UpdatePointBudget(sessionIndex, {});
+                    } catch (...) {
+                    }
+                }
+            }
+            for (const auto layerId : {
+                     kLinkedHqRockPatchLayerId,
+                     kLinkedHqVegetationPatchLayerId}) {
+                if (!viewport->HasPointCloudResources(layerId)) {
+                    continue;
+                }
+                try {
+                    viewport->RemovePointCloud(layerId);
+                } catch (...) {
+                }
+            }
+        }
+        viewport->SetTemporalCameraOverlay(false);
+        runtimeState->animationPanel.linkedSeamedView
+            .temporalHistoryResetRequested = true;
+    }
+    // Moving an empty replacement in joins the cancellable workers after
+    // their current chunk and drops every session-only source index/cache.
+    hq = LinkedHqPreviewRuntime{};
+    runtimeState->previewRenderStateSignatureValid = false;
+}
+
+void StartLinkedHqPreparation(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr ||
+        !runtimeState->linkedHqPreview.request.has_value()) {
+        return;
+    }
+    auto& hq = runtimeState->linkedHqPreview;
+    const auto request = hq.request.value();
+    const auto rockRole = invisible_places::scene::ScenePointCloudRoleIndex(
+        invisible_places::scene::ScenePointCloudRole::Rock);
+    const auto vegetationRole =
+        invisible_places::scene::ScenePointCloudRoleIndex(
+            invisible_places::scene::ScenePointCloudRole::Vegetation);
+    const std::array<std::size_t, 2U> patchRoles{
+        rockRole,
+        vegetationRole,
+    };
+    std::array<std::shared_ptr<const invisible_places::io::LoadedPointCloud>, 2U>
+        baseClouds{};
+    std::array<std::filesystem::path, 2U> sourcePaths{};
+    for (std::size_t patch = 0U; patch < patchRoles.size(); ++patch) {
+        const auto baseIndex =
+            request.fiveMillimeterSessionIndices[patchRoles[patch]];
+        const auto sourceIndex =
+            request.oneMillimeterSessionIndices[patchRoles[patch]];
+        if (baseIndex >= runtimeState->sessions.size() ||
+            sourceIndex >= runtimeState->sessions.size() ||
+            runtimeState->sessions[baseIndex].offlinePointCloud == nullptr) {
+            return;
+        }
+        baseClouds[patch] =
+            runtimeState->sessions[baseIndex].offlinePointCloud;
+        sourcePaths[patch] =
+            runtimeState->sessions[sourceIndex].sourcePath;
+    }
+
+    auto shared = std::make_shared<LinkedHqPreparationJobShared>();
+    hq.preparationShared = shared;
+    hq.stage = LinkedHqPreparationStage::Scanning;
+    hq.displayedProgress = std::max(
+        hq.displayedProgress,
+        LinkedHqOverallProgress(
+            LinkedHqPreparationStage::Scanning,
+            0.0F));
+    hq.failureMessage.clear();
+    hq.preparationWorker = std::jthread{
+        [shared,
+         request,
+         patchRoles,
+         baseClouds,
+         sourcePaths](std::stop_token stopToken) mutable {
+#ifdef __APPLE__
+            (void)pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+#endif
+            LinkedHqPreparationJobResult result;
+            result.fingerprint = request.fingerprint;
+            result.patches[0U].layerId = kLinkedHqRockPatchLayerId;
+            result.patches[1U].layerId =
+                kLinkedHqVegetationPatchLayerId;
+            const auto finish = [&]() {
+                std::scoped_lock lock(shared->mutex);
+                shared->result = std::move(result);
+                shared->finished.store(true, std::memory_order_release);
+            };
+            try {
+                PublishLinkedHqStageProgress(
+                    shared,
+                    LinkedHqPreparationStage::Scanning,
+                    0.0F);
+                for (std::size_t patch = 0U;
+                     patch < patchRoles.size();
+                     ++patch) {
+                    if (stopToken.stop_requested()) {
+                        result.cancelled = true;
+                        finish();
+                        return;
+                    }
+                    auto& output = result.patches[patch];
+                    output.baseSessionIndex =
+                        request.fiveMillimeterSessionIndices[
+                            patchRoles[patch]];
+                    output.sourceSessionIndex =
+                        request.oneMillimeterSessionIndices[
+                            patchRoles[patch]];
+                    invisible_places::io::PointCloudSubsetLoadOptions options;
+                    options.fieldFilter = request.patchFieldFilters[patch];
+                    options.includePoint =
+                        [frustums = request.midpointFrustums](
+                            const invisible_places::io::Float3& point) {
+                            return frustums.Contains(point);
+                        };
+                    options.stopToken = stopToken;
+                    options.progress =
+                        [shared, patch](std::uint64_t completed,
+                                        std::uint64_t total) {
+                            const float local = total > 0U
+                                ? static_cast<float>(
+                                      static_cast<double>(completed) /
+                                      static_cast<double>(total))
+                                : 1.0F;
+                            PublishLinkedHqStageProgress(
+                                shared,
+                                LinkedHqPreparationStage::Scanning,
+                                (static_cast<float>(patch) + local) /
+                                    2.0F);
+                        };
+                    output.subset =
+                        invisible_places::io::LoadPointCloudSubset(
+                            sourcePaths[patch],
+                            options);
+                    if (output.subset.cancelled ||
+                        stopToken.stop_requested()) {
+                        result.cancelled = true;
+                        finish();
+                        return;
+                    }
+                    if (!output.subset.success) {
+                        result.errorMessage =
+                            output.subset.errorMessage.empty()
+                                ? "The 1 mm HQ role scan failed."
+                                : output.subset.errorMessage;
+                        finish();
+                        return;
+                    }
+                }
+
+                PublishLinkedHqStageProgress(
+                    shared,
+                    LinkedHqPreparationStage::Organising,
+                    0.0F);
+                for (std::size_t patch = 0U;
+                     patch < patchRoles.size();
+                     ++patch) {
+                    if (stopToken.stop_requested()) {
+                        result.cancelled = true;
+                        finish();
+                        return;
+                    }
+                    auto partition = PartitionLinkedHqIndices(
+                        baseClouds[patch]->positions,
+                        request.midpointFrustums,
+                        stopToken,
+                        [shared, patch](std::uint64_t completed,
+                                        std::uint64_t total) {
+                            const float local = total > 0U
+                                ? static_cast<float>(
+                                      static_cast<double>(completed) /
+                                      static_cast<double>(total))
+                                : 1.0F;
+                            PublishLinkedHqStageProgress(
+                                shared,
+                                LinkedHqPreparationStage::Organising,
+                                (static_cast<float>(patch) + local) /
+                                    2.0F);
+                        });
+                    if (partition.cancelled ||
+                        stopToken.stop_requested()) {
+                        result.cancelled = true;
+                        finish();
+                        return;
+                    }
+                    result.patches[patch]
+                        .fiveMillimeterOutsideIndices =
+                        std::move(partition.outside);
+                }
+                result.success = true;
+            } catch (const std::exception& error) {
+                result.errorMessage =
+                    "HQ preparation failed unexpectedly: " +
+                    std::string{error.what()};
+            }
+            finish();
+        }};
+}
+
+bool PollLinkedHqPreparation(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return false;
+    }
+    auto& hq = runtimeState->linkedHqPreview;
+    std::optional<LinkedHqPreparationJobResult> completed;
+    if (hq.uploadPending.has_value()) {
+        if (!hq.baselineReady) {
+            return false;
+        }
+        completed = std::move(hq.uploadPending);
+        hq.uploadPending.reset();
+    } else {
+        const auto shared = hq.preparationShared;
+        if (shared == nullptr) {
+            return false;
+        }
+        hq.stage = shared->stage.load(std::memory_order_acquire);
+        hq.displayedProgress = std::max(
+            hq.displayedProgress,
+            LinkedHqOverallProgress(
+                hq.stage,
+                shared->stageProgress.load(std::memory_order_acquire)));
+        if (!shared->finished.load(std::memory_order_acquire)) {
+            return false;
+        }
+
+        {
+            std::scoped_lock lock(shared->mutex);
+            if (shared->result.has_value()) {
+                completed = std::move(shared->result);
+                shared->result.reset();
+            }
+        }
+        hq.preparationWorker = std::jthread{};
+        hq.preparationShared.reset();
+        if (!completed.has_value() || !hq.request.has_value() ||
+            completed->fingerprint != hq.request->fingerprint) {
+            return false;
+        }
+        if (completed->cancelled) {
+            hq.stage = LinkedHqPreparationStage::Waiting;
+            return false;
+        }
+        if (!completed->success) {
+            hq.stage = LinkedHqPreparationStage::Failed;
+            hq.failureMessage = completed->errorMessage.empty()
+                ? "HQ preparation failed."
+                : completed->errorMessage;
+            return false;
+        }
+
+        hq.stage = LinkedHqPreparationStage::Uploading;
+        hq.displayedProgress = std::max(
+            hq.displayedProgress,
+            LinkedHqOverallProgress(hq.stage, 0.0F));
+        hq.uploadPending = std::move(completed);
+        return false;
+    }
+
+    if (!completed.has_value() || !hq.request.has_value() ||
+        completed->fingerprint != hq.request->fingerprint) {
+        return false;
+    }
+    std::array<LinkedHqPatchRuntime, 2U> published{};
+    try {
+        PointCloudMutationBatchScope mutationBatch{viewport};
+        for (std::size_t patch = 0U;
+             patch < completed->patches.size();
+             ++patch) {
+            auto& source = completed->patches[patch];
+            auto& destination = published[patch];
+            destination.layerId = source.layerId;
+            destination.baseSessionIndex = source.baseSessionIndex;
+            destination.sourceSessionIndex = source.sourceSessionIndex;
+            destination.sourcePointIndices =
+                std::make_shared<const std::vector<std::uint32_t>>(
+                    std::move(source.subset.sourcePointIndices));
+            destination.fiveMillimeterOutsideIndices =
+                std::move(source.fiveMillimeterOutsideIndices);
+            destination.cloud = std::make_shared<
+                invisible_places::io::LoadedPointCloud>(
+                    std::move(source.subset.cloud));
+            if (destination.cloud->PointCount() > 0U) {
+                viewport->UploadPointCloud(
+                    destination.layerId,
+                    *destination.cloud,
+                    {});
+                destination.uploaded = true;
+            }
+            hq.displayedProgress = std::max(
+                hq.displayedProgress,
+                LinkedHqOverallProgress(
+                    hq.stage,
+                    static_cast<float>(patch + 1U) / 2.0F));
+        }
+        mutationBatch.Finish();
+    } catch (const std::exception& error) {
+        for (const auto layerId : {
+                 kLinkedHqRockPatchLayerId,
+                 kLinkedHqVegetationPatchLayerId}) {
+            if (viewport->HasPointCloudResources(layerId)) {
+                try {
+                    viewport->RemovePointCloud(layerId);
+                } catch (...) {
+                }
+            }
+        }
+        hq.stage = LinkedHqPreparationStage::Failed;
+        hq.failureMessage =
+            "HQ patch upload failed; the complete 5 mm view was retained: " +
+            std::string{error.what()};
+        hq.ready = false;
+        hq.enabled = false;
+        runtimeState->previewRenderStateSignatureValid = false;
+        return false;
+    }
+
+    hq.patches = std::move(published);
+    hq.ready = true;
+    hq.enabled = false;
+    hq.stage = LinkedHqPreparationStage::Ready;
+    hq.displayedProgress = 1.0F;
+    hq.failureMessage.clear();
+    runtimeState->previewRenderStateSignatureValid = false;
+    runtimeState->statusMessage =
+        "HQ linked preview is ready (1 mm ROCK/VEG midpoint patches; "
+        "5 mm elsewhere).";
+    return true;
+}
+
+bool SetLinkedHqPreviewEnabled(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    bool enabled) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return false;
+    }
+    auto& hq = runtimeState->linkedHqPreview;
+    if (!hq.ready || !hq.baselineReady ||
+        hq.enabled == enabled) {
+        return hq.ready && hq.baselineReady;
+    }
+    try {
+        PointCloudMutationBatchScope mutationBatch{viewport};
+        for (const auto& patch : hq.patches) {
+            if (patch.baseSessionIndex >= runtimeState->sessions.size() ||
+                !viewport->HasPointCloudResources(
+                    patch.baseSessionIndex)) {
+                throw std::runtime_error{
+                    "the 5 mm baseline is no longer resident"};
+            }
+            viewport->UpdatePointBudget(
+                patch.baseSessionIndex,
+                enabled ? patch.fiveMillimeterOutsideIndices
+                        : std::vector<std::uint32_t>{});
+        }
+        mutationBatch.Finish();
+    } catch (const std::exception& error) {
+        try {
+            PointCloudMutationBatchScope rollback{viewport};
+            for (const auto& patch : hq.patches) {
+                if (viewport->HasPointCloudResources(
+                        patch.baseSessionIndex)) {
+                    viewport->UpdatePointBudget(
+                        patch.baseSessionIndex,
+                        {});
+                }
+            }
+            rollback.Finish();
+        } catch (...) {
+        }
+        hq.failureMessage =
+            "HQ could not change density atomically: " +
+            std::string{error.what()};
+        hq.stage = LinkedHqPreparationStage::Failed;
+        hq.ready = false;
+        hq.enabled = false;
+        runtimeState->errorMessage = hq.failureMessage;
+        return false;
+    }
+    hq.enabled = enabled;
+    viewport->SetTemporalCameraOverlay(false);
+    runtimeState->animationPanel.linkedSeamedView
+        .temporalHistoryResetRequested = true;
+    runtimeState->previewRenderStateSignatureValid = false;
+    runtimeState->statusMessage = enabled
+        ? "HQ linked preview enabled."
+        : "HQ linked preview disabled; showing complete 5 mm points.";
+    runtimeState->errorMessage.clear();
+    return true;
+}
+
+void PollLinkedHqIndexedFieldLoad(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return;
+    }
+    auto& hq = runtimeState->linkedHqPreview;
+    const auto failHqField = [&](std::string message) {
+        if (hq.enabled) {
+            (void)SetLinkedHqPreviewEnabled(
+                runtimeState,
+                viewport,
+                false);
+        }
+        hq.stage = LinkedHqPreparationStage::Failed;
+        hq.ready = false;
+        hq.enabled = false;
+        hq.failureMessage = std::move(message);
+        runtimeState->errorMessage = hq.failureMessage;
+        runtimeState->statusMessage.clear();
+        runtimeState->previewRenderStateSignatureValid = false;
+    };
+    const auto shared = hq.indexedFieldShared;
+    if (shared == nullptr ||
+        !shared->finished.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::optional<LinkedHqIndexedFieldJobResult> completed;
+    {
+        std::scoped_lock lock(shared->mutex);
+        if (shared->result.has_value()) {
+            completed = std::move(shared->result);
+            shared->result.reset();
+        }
+    }
+    hq.indexedFieldWorker = std::jthread{};
+    hq.indexedFieldShared.reset();
+    if (!completed.has_value() || !hq.request.has_value() ||
+        completed->fingerprint != hq.request->fingerprint ||
+        completed->patchSlot >= hq.patches.size()) {
+        return;
+    }
+    if (!completed->load.success) {
+        if (!completed->load.cancelled) {
+            failHqField(
+                "HQ field '" + completed->fieldName +
+                "' could not be gathered: " +
+                completed->load.errorMessage);
+        }
+        return;
+    }
+    auto& patch = hq.patches[completed->patchSlot];
+    if (patch.cloud == nullptr ||
+        completed->load.values.size() != patch.cloud->PointCount()) {
+        return;
+    }
+    const bool alreadyResident = std::any_of(
+        patch.cloud->scalarFields.begin(),
+        patch.cloud->scalarFields.end(),
+        [&](const auto& field) {
+            return field.name == completed->fieldName;
+        });
+    if (alreadyResident) {
+        return;
+    }
+    const auto priorValueCount =
+        patch.cloud->scalarFieldValues.size();
+    const auto priorFieldCount = patch.cloud->scalarFields.size();
+    try {
+        patch.cloud->scalarFieldValues.insert(
+            patch.cloud->scalarFieldValues.end(),
+            completed->load.values.begin(),
+            completed->load.values.end());
+        patch.cloud->scalarFields.push_back(completed->load.stats);
+        if (patch.uploaded) {
+            viewport->UploadPointCloudScalarFields(
+                patch.layerId,
+                patch.cloud->scalarFields,
+                patch.cloud->scalarFieldValues);
+        }
+        runtimeState->previewRenderStateSignatureValid = false;
+    } catch (const std::exception& error) {
+        patch.cloud->scalarFieldValues.resize(priorValueCount);
+        patch.cloud->scalarFields.resize(priorFieldCount);
+        failHqField(
+            "HQ field upload failed: " +
+            std::string{error.what()});
+    }
+}
+
+void EnsureLinkedHqIndexedFieldResidency(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr ||
+        !runtimeState->linkedHqPreview.ready ||
+        runtimeState->linkedHqPreview.indexedFieldShared != nullptr ||
+        runtimeState->offlineRenderJob.active ||
+        runtimeState->pendingLoad.has_value() ||
+        runtimeState->pendingScalarFieldLoad.has_value() ||
+        runtimeState->water.waterSurfaceCacheWarmup.worker.joinable() ||
+        runtimeState->water.waterSurfaceCachePreprocessPending) {
+        return;
+    }
+    auto& hq = runtimeState->linkedHqPreview;
+    for (std::size_t patchSlot = 0U;
+         patchSlot < hq.patches.size();
+         ++patchSlot) {
+        const auto& patch = hq.patches[patchSlot];
+        if (patch.cloud == nullptr ||
+            patch.sourcePointIndices == nullptr ||
+            patch.sourcePointIndices->empty() ||
+            patch.baseSessionIndex >= runtimeState->sessions.size() ||
+            patch.sourceSessionIndex >= runtimeState->sessions.size()) {
+            continue;
+        }
+        const auto required = CollectRequiredScalarFieldNames(
+            *runtimeState,
+            runtimeState->sessions[patch.baseSessionIndex]);
+        for (const auto& fieldName : required.Names()) {
+            const bool available = std::any_of(
+                patch.cloud->availableScalarFields.begin(),
+                patch.cloud->availableScalarFields.end(),
+                [&](const auto& field) {
+                    return field.name == fieldName;
+                });
+            const bool resident = std::any_of(
+                patch.cloud->scalarFields.begin(),
+                patch.cloud->scalarFields.end(),
+                [&](const auto& field) {
+                    return field.name == fieldName;
+                });
+            if (!available || resident) {
+                continue;
+            }
+            auto shared =
+                std::make_shared<LinkedHqIndexedFieldJobShared>();
+            const auto fingerprint = hq.request->fingerprint;
+            const auto sourcePath = runtimeState
+                ->sessions[patch.sourceSessionIndex]
+                .sourcePath;
+            const auto sourceIndices = patch.sourcePointIndices;
+            hq.indexedFieldShared = shared;
+            hq.indexedFieldWorker = std::jthread{
+                [shared,
+                 fingerprint,
+                 patchSlot,
+                 fieldName,
+                 sourcePath,
+                 sourceIndices](std::stop_token stopToken) {
+#ifdef __APPLE__
+                    (void)pthread_set_qos_class_self_np(
+                        QOS_CLASS_UTILITY,
+                        0);
+#endif
+                    LinkedHqIndexedFieldJobResult result;
+                    result.fingerprint = fingerprint;
+                    result.patchSlot = patchSlot;
+                    result.fieldName = fieldName;
+                    try {
+                        result.load = invisible_places::io::
+                            LoadPointCloudSelectedValuesAtIndices(
+                                sourcePath,
+                                {
+                                    .source = invisible_places::io::
+                                        PointCloudSelectedValueSource::
+                                            ScalarField,
+                                    .scalarFieldName = fieldName,
+                                },
+                                *sourceIndices,
+                                {},
+                                stopToken);
+                    } catch (const std::exception& error) {
+                        result.load.errorMessage =
+                            "Indexed HQ field scan failed unexpectedly: " +
+                            std::string{error.what()};
+                    }
+                    std::scoped_lock lock(shared->mutex);
+                    shared->result = std::move(result);
+                    shared->finished.store(
+                        true,
+                        std::memory_order_release);
+                }};
+            return;
+        }
+    }
+}
+
+void EnsureLinkedHqPreview(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return;
+    }
+    if (runtimeState->offlineRenderJob.active) {
+        if (runtimeState->linkedHqPreview.preparationWorker.joinable()) {
+            runtimeState->linkedHqPreview.preparationWorker.request_stop();
+        }
+        if (runtimeState->linkedHqPreview.indexedFieldWorker.joinable()) {
+            runtimeState->linkedHqPreview.indexedFieldWorker.request_stop();
+        }
+        return;
+    }
+
+    std::string resolveError;
+    const auto resolved = ResolveLinkedHqSelectionRequest(
+        *runtimeState,
+        *viewport,
+        &resolveError);
+    auto& hq = runtimeState->linkedHqPreview;
+    if (!resolved.has_value()) {
+        if (hq.request.has_value()) {
+            ResetLinkedHqPreview(runtimeState, viewport);
+        }
+        if (!resolveError.empty()) {
+            hq.failureMessage = resolveError;
+            hq.stage = LinkedHqPreparationStage::Failed;
+        }
+        return;
+    }
+    if (!hq.request.has_value() ||
+        hq.request->fingerprint != resolved->fingerprint) {
+        std::vector<std::pair<std::size_t, bool>> changedFiveMillimeterSources;
+        if (hq.request.has_value()) {
+            for (std::size_t role = 0U;
+                 role < hq.request->fiveMillimeterSessionIndices.size();
+                 ++role) {
+                const auto oldSession =
+                    hq.request->fiveMillimeterSessionIndices[role];
+                const auto newSession =
+                    resolved->fiveMillimeterSessionIndices[role];
+                if (oldSession == newSession &&
+                    hq.request->sourceFingerprints[role] !=
+                        resolved->sourceFingerprints[role] &&
+                    newSession < runtimeState->sessions.size()) {
+                    changedFiveMillimeterSources.emplace_back(
+                        newSession,
+                        runtimeState->sessions[newSession].visible);
+                }
+            }
+            ResetLinkedHqPreview(runtimeState, viewport);
+        }
+        hq.request = resolved;
+        hq.stage = LinkedHqPreparationStage::Waiting;
+        hq.displayedProgress = 0.0F;
+        hq.retryRequested = false;
+        for (const auto& [sessionIndex, wasVisible] :
+             changedFiveMillimeterSources) {
+            try {
+                UnloadLayerByIndex(
+                    runtimeState,
+                    viewport,
+                    sessionIndex,
+                    true);
+                runtimeState->sessions[sessionIndex].visible = wasVisible;
+            } catch (const std::exception& error) {
+                // Even if retiring the old GPU object failed, invalidate the
+                // CPU/session payload. Retry will stream the changed file and
+                // UploadPointCloud will atomically replace any surviving
+                // resource with the same session id.
+                auto& failedSession =
+                    runtimeState->sessions[sessionIndex];
+                failedSession.loaded = false;
+                failedSession.gpuResident = false;
+                failedSession.cpuResident = false;
+                failedSession.visible = wasVisible;
+                failedSession.pivotSamples.clear();
+                failedSession.offlinePointCloud.reset();
+                ClearPreviewLodSampleCache(&failedSession);
+                ForgetWaterSeepageLayerAttachment(
+                    &runtimeState->water,
+                    sessionIndex);
+                hq.stage = LinkedHqPreparationStage::Failed;
+                hq.failureMessage =
+                    "HQ could not refresh a changed 5 mm source: " +
+                    std::string{error.what()};
+                runtimeState->errorMessage = hq.failureMessage;
+                return;
+            }
+        }
+    } else {
+        // Refresh field filters without invalidating already retained source
+        // indices; newly referenced fields use the indexed gather path.
+        hq.request->patchFieldFilters = resolved->patchFieldFilters;
+    }
+
+    // Resolve/invalidate before publishing worker results. This prevents a
+    // pair or project changed during an offline render from briefly uploading
+    // the old patch when live rendering resumes.
+    PollLinkedHqPreparation(runtimeState, viewport);
+    PollLinkedHqIndexedFieldLoad(runtimeState, viewport);
+
+    if (hq.stage == LinkedHqPreparationStage::Failed) {
+        if (!hq.retryRequested) {
+            return;
+        }
+        hq.retryRequested = false;
+        hq.failureMessage.clear();
+        hq.stage = LinkedHqPreparationStage::Waiting;
+        hq.displayedProgress = 0.0F;
+    }
+
+    bool baselineReady = true;
+    for (std::size_t role = 0U;
+         role < hq.request->fiveMillimeterSessionIndices.size();
+         ++role) {
+        const auto sessionIndex =
+            hq.request->fiveMillimeterSessionIndices[role];
+        if (sessionIndex >= runtimeState->sessions.size()) {
+            baselineReady = false;
+            continue;
+        }
+        const auto& session = runtimeState->sessions[sessionIndex];
+        if (!session.gpuResident || !session.loaded ||
+            session.offlinePointCloud == nullptr) {
+            baselineReady = false;
+            if (!runtimeState->offlineRenderJob.active &&
+                !runtimeState->pendingLoad.has_value() &&
+                runtimeState->persistence.queuedLoads.empty() &&
+                !runtimeState->water.waterSurfaceCacheWarmup.worker
+                     .joinable() &&
+                !runtimeState->water.waterSurfaceCachePreprocessPending) {
+                hq.baselineLoadedForHq[role] =
+                    !session.committedDisplaySource;
+                hq.baselineVisibilityAfterLoad[role] = session.visible;
+                BeginLayerLoad(
+                    sessionIndex,
+                    runtimeState,
+                    PointCloudLoadPurpose::LinkedHqBaseline,
+                    hq.request->fingerprint);
+            }
+            break;
+        }
+    }
+    const bool baselineBecameReady =
+        baselineReady && !hq.baselineReady;
+    hq.baselineReady = baselineReady;
+    if (!baselineReady) {
+        hq.stage = LinkedHqPreparationStage::Waiting;
+        return;
+    }
+    if (baselineBecameReady) {
+        try {
+            PointCloudMutationBatchScope mutationBatch{viewport};
+            for (const auto sessionIndex :
+                 hq.request->fiveMillimeterSessionIndices) {
+                if (viewport->HasPointCloudResources(sessionIndex)) {
+                    viewport->UpdatePointBudget(sessionIndex, {});
+                }
+            }
+            if (hq.ready && hq.enabled) {
+                for (const auto& patch : hq.patches) {
+                    if (viewport->HasPointCloudResources(
+                            patch.baseSessionIndex)) {
+                        viewport->UpdatePointBudget(
+                            patch.baseSessionIndex,
+                            patch.fiveMillimeterOutsideIndices);
+                    }
+                }
+            }
+            mutationBatch.Finish();
+            viewport->SetTemporalCameraOverlay(false);
+            runtimeState->animationPanel.linkedSeamedView
+                .temporalHistoryResetRequested = true;
+        } catch (const std::exception& error) {
+            hq.stage = LinkedHqPreparationStage::Failed;
+            hq.failureMessage =
+                "The complete 5 mm HQ baseline could not be published: " +
+                std::string{error.what()};
+            hq.baselineReady = false;
+            return;
+        }
+    }
+    runtimeState->previewRenderStateSignatureValid = false;
+
+    if (!hq.ready && hq.preparationShared == nullptr &&
+        !runtimeState->offlineRenderJob.active &&
+        !runtimeState->pendingLoad.has_value() &&
+        !runtimeState->pendingScalarFieldLoad.has_value() &&
+        runtimeState->persistence.queuedLoads.empty() &&
+        !runtimeState->water.waterSurfaceCacheWarmup.worker.joinable() &&
+        !runtimeState->water.waterSurfaceCachePreprocessPending) {
+        StartLinkedHqPreparation(runtimeState);
+    }
+    if (hq.ready) {
+        EnsureLinkedHqIndexedFieldResidency(runtimeState);
+    }
+}
+
 std::optional<float> AnimationLoopCounterpartNormalizedPosition(
     const AnimationPath& path,
     float normalizedPosition,
@@ -56243,8 +57574,9 @@ void EnsureLinkedSeamedViewPair(
 }
 
 void DrawLinkedSeamedViewHeaderControls(
-    PreviewRuntimeState* runtimeState) {
-    if (runtimeState == nullptr) {
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || viewport == nullptr) {
         return;
     }
     auto& panel = runtimeState->animationPanel;
@@ -56381,6 +57713,108 @@ void DrawLinkedSeamedViewHeaderControls(
             AnimationLinkedViewMode::B,
             memberAvailable[1U],
             bTooltip);
+
+        auto& hq = runtimeState->linkedHqPreview;
+        ImGui::SameLine();
+        if (hq.ready && hq.baselineReady) {
+            if (hq.enabled) {
+                ImGui::PushStyleColor(
+                    ImGuiCol_Button,
+                    ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+            }
+            const bool pressed = ImGui::SmallButton("HQ");
+            if (hq.enabled) {
+                ImGui::PopStyleColor();
+            }
+            if (pressed) {
+                (void)SetLinkedHqPreviewEnabled(
+                    runtimeState,
+                    viewport,
+                    !hq.enabled);
+            }
+        } else if (hq.stage == LinkedHqPreparationStage::Failed) {
+            if (ImGui::SmallButton("HQ Retry")) {
+                hq.retryRequested = true;
+                runtimeState->statusMessage =
+                    "Retrying HQ linked-preview preparation.";
+                runtimeState->errorMessage.clear();
+            }
+        } else {
+            const float progress = std::clamp(
+                hq.displayedProgress,
+                0.0F,
+                0.99F);
+            const std::string progressLabel =
+                "HQ " + std::to_string(static_cast<int>(std::floor(
+                              progress * 100.0F))) +
+                "%";
+            const ImVec2 size{
+                ImGui::CalcTextSize("HQ 100%").x +
+                    ImGui::GetStyle().FramePadding.x * 2.0F,
+                ImGui::GetFrameHeight(),
+            };
+            ImGui::BeginDisabled();
+            ImGui::InvisibleButton("##LinkedHqProgress", size);
+            ImGui::EndDisabled();
+            const auto minimum = ImGui::GetItemRectMin();
+            const auto maximum = ImGui::GetItemRectMax();
+            auto* drawList = ImGui::GetWindowDrawList();
+            drawList->AddRectFilled(
+                minimum,
+                maximum,
+                ImGui::GetColorU32(ImGuiCol_Button),
+                ImGui::GetStyle().FrameRounding);
+            if (progress > 0.0F) {
+                drawList->PushClipRect(
+                    minimum,
+                    ImVec2{
+                        minimum.x +
+                            (maximum.x - minimum.x) * progress,
+                        maximum.y,
+                    },
+                    true);
+                drawList->AddRectFilled(
+                    minimum,
+                    maximum,
+                    ImGui::GetColorU32(ImGuiCol_ButtonActive),
+                    ImGui::GetStyle().FrameRounding);
+                drawList->PopClipRect();
+            }
+            const auto labelSize =
+                ImGui::CalcTextSize(progressLabel.c_str());
+            drawList->AddText(
+                ImVec2{
+                    minimum.x +
+                        ((maximum.x - minimum.x) - labelSize.x) * 0.5F,
+                    minimum.y +
+                        ((maximum.y - minimum.y) - labelSize.y) * 0.5F,
+                },
+                ImGui::GetColorU32(ImGuiCol_TextDisabled),
+                progressLabel.c_str());
+        }
+        if (ImGui::IsItemHovered(
+                ImGuiHoveredFlags_DelayNormal |
+                ImGuiHoveredFlags_AllowWhenDisabled)) {
+            if (hq.stage == LinkedHqPreparationStage::Failed) {
+                ImGui::SetTooltip(
+                    "HQ preparation failed. Click to retry.\n%s",
+                    hq.failureMessage.c_str());
+            } else if (hq.ready && hq.baselineReady) {
+                ImGui::SetTooltip(
+                    "HQ is independent of Seam/A/B. It uses complete 1 mm "
+                    "ROCK and VEG inside the two padded midpoint views, 5 mm "
+                    "ROCK/VEG elsewhere, and complete 5 mm SAND. Exports "
+                    "remain complete 1 mm.");
+            } else {
+                ImGui::SetTooltip(
+                    "HQ %s (%.0f%%). The complete 5 mm view remains visible "
+                    "until both 1 mm ROCK/VEG patches are ready.%s%s",
+                    LinkedHqPreparationStageName(hq.stage),
+                    std::min(hq.displayedProgress, 0.99F) * 100.0F,
+                    hq.failureMessage.empty() ? "" : "\n",
+                    hq.failureMessage.c_str());
+            }
+        }
     } else if (failure.has_value()) {
         ImGui::SameLine();
         ImGui::TextDisabled("Local view");
@@ -101005,7 +102439,7 @@ void DrawControlsWindow(
         FormatFixed(renderFps, 1) + "  " + previewStatus;
     ImGui::BeginDisabled(
         reciprocalPanWizardActive || liveCameraEditActive);
-    DrawLinkedSeamedViewHeaderControls(runtimeState);
+    DrawLinkedSeamedViewHeaderControls(runtimeState, viewport);
     ImGui::EndDisabled();
     if (runtimeState->animationPanel.requestedSharedTimingLoop.has_value()) {
         const auto requested =
@@ -101951,7 +103385,27 @@ std::uint64_t EffectiveWaterSeepageShaderInvocations(const PreviewRuntimeState& 
         }
         const auto style = MakeSceneRenderStyle(runtimeState, session, session.pointStyle);
         const std::uint64_t multiplier = style.geometryMode == PointCloudGeometryMode::WorldSurfels ? 6U : 1U;
-        const std::uint64_t points = EffectivePointDrawCount(runtimeState, session);
+        std::uint64_t points = EffectivePointDrawCount(runtimeState, session);
+        if (!runtimeState.offlineRenderJob.active &&
+            runtimeState.linkedHqPreview.baselineReady &&
+            runtimeState.linkedHqPreview.ready &&
+            runtimeState.linkedHqPreview.enabled) {
+            const auto patch = std::find_if(
+                runtimeState.linkedHqPreview.patches.begin(),
+                runtimeState.linkedHqPreview.patches.end(),
+                [&](const LinkedHqPatchRuntime& candidate) {
+                    return candidate.baseSessionIndex <
+                               runtimeState.sessions.size() &&
+                           &runtimeState.sessions[
+                               candidate.baseSessionIndex] == &session;
+                });
+            if (patch != runtimeState.linkedHqPreview.patches.end()) {
+                points = patch->fiveMillimeterOutsideIndices.size() +
+                    (patch->cloud != nullptr
+                         ? patch->cloud->PointCount()
+                         : 0U);
+            }
+        }
         const std::uint64_t contribution =
             points > std::numeric_limits<std::uint64_t>::max() / multiplier
                 ? std::numeric_limits<std::uint64_t>::max()
@@ -102486,6 +103940,110 @@ void EnsureWaterSeepageRuntimeUpToDate(
         }
     }
 
+    // The internal 1 mm patches share their role's already-settled semantic
+    // topology. They need only a second descriptor attachment and compact
+    // parameter publication; no guide trace, support selection, or topology
+    // build is repeated for the preview density split.
+    if (!runtimeState->offlineRenderJob.active &&
+        runtimeState->linkedHqPreview.baselineReady &&
+        runtimeState->linkedHqPreview.ready &&
+        runtimeState->linkedHqPreview.enabled) {
+        for (const auto& patch :
+             runtimeState->linkedHqPreview.patches) {
+            if (!patch.uploaded ||
+                patch.baseSessionIndex >= runtimeState->sessions.size()) {
+                continue;
+            }
+            const auto& baseSession =
+                runtimeState->sessions[patch.baseSessionIndex];
+            if (!IsAuthoredWaterTerrainSession(baseSession)) {
+                continue;
+            }
+            const auto attachmentKey =
+                WaterSeepageLayerAttachmentKey(patch.layerId);
+            const auto semanticKey = WaterSeepageSemanticTopologyKey(
+                *runtimeState,
+                baseSession);
+            activeAttachmentKeys.insert(attachmentKey);
+            activeSemanticKeys.insert(semanticKey);
+            const auto gridIt =
+                runtimeState->water.seepageRuntimeGrids.find(semanticKey);
+            if (gridIt ==
+                runtimeState->water.seepageRuntimeGrids.end()) {
+                continue;
+            }
+            auto& grid = gridIt->second;
+            auto paramsIt =
+                activeSemanticParamsFingerprints.find(semanticKey);
+            if (paramsIt ==
+                activeSemanticParamsFingerprints.end()) {
+                paramsIt = activeSemanticParamsFingerprints.emplace(
+                    semanticKey,
+                    invisible_places::water::
+                        WaterSeepageParamsFingerprint(grid))
+                               .first;
+            }
+            const auto topologyIt = runtimeState->water
+                .seepageTopologyFingerprints.find(attachmentKey);
+            const auto semanticAttachmentIt = runtimeState->water
+                .seepageAttachmentSemanticKeys.find(attachmentKey);
+            const bool topologyCurrent =
+                topologyIt != runtimeState->water
+                                  .seepageTopologyFingerprints.end() &&
+                semanticAttachmentIt != runtimeState->water
+                                            .seepageAttachmentSemanticKeys
+                                            .end() &&
+                semanticAttachmentIt->second == semanticKey &&
+                viewport->WaterSeepageNodeCount(patch.layerId) ==
+                    grid.nodes.size();
+            try {
+                if (!topologyCurrent) {
+                    viewport->UploadWaterSeepageTopology(
+                        patch.layerId,
+                        grid);
+                    runtimeState->water.seepageTopologyFingerprints
+                        [attachmentKey] = invisible_places::water::
+                            WaterSeepageTopologyFingerprint(grid);
+                    runtimeState->water.seepageAttachmentSemanticKeys
+                        [attachmentKey] = semanticKey;
+                    runtimeState->water.seepageParamsFingerprints
+                        [attachmentKey] = paramsIt->second;
+                    ++runtimeState->water
+                          .seepageDescriptorAttachmentRevision;
+                    ++runtimeState->water.seepageTopologyUploadRevision;
+                    ++runtimeState->water.seepageParamsUploadRevision;
+                } else {
+                    const auto uploadedParams = runtimeState->water
+                        .seepageParamsFingerprints.find(attachmentKey);
+                    if (uploadedParams == runtimeState->water
+                                              .seepageParamsFingerprints
+                                              .end() ||
+                        uploadedParams->second != paramsIt->second) {
+                        viewport->UpdateWaterSeepageParams(
+                            patch.layerId,
+                            grid);
+                        runtimeState->water.seepageParamsFingerprints
+                            [attachmentKey] = paramsIt->second;
+                        ++runtimeState->water
+                              .seepageParamsUploadRevision;
+                    }
+                }
+            } catch (const std::exception& error) {
+                runtimeState->errorMessage =
+                    "GPU upload failed for HQ Seepage: " +
+                    std::string{error.what()};
+                continue;
+            }
+            const auto residentBytes =
+                viewport->WaterSeepageResidentBytes(patch.layerId);
+            totalBytes = residentBytes >
+                    std::numeric_limits<std::size_t>::max() - totalBytes
+                ? std::numeric_limits<std::size_t>::max()
+                : totalBytes +
+                      static_cast<std::size_t>(residentBytes);
+        }
+    }
+
     std::erase_if(
         runtimeState->water.seepageTopologyFingerprints,
         [&](const auto& entry) { return !activeAttachmentKeys.contains(entry.first); });
@@ -102676,7 +104234,8 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
     const invisible_places::renderer::core::VulkanViewportShell& viewport,
     float flowTimeSeconds,
     const WaterFrameState* frameState = nullptr,
-    const invisible_places::camera::CameraState* cameraOverride = nullptr) {
+    const invisible_places::camera::CameraState* cameraOverride = nullptr,
+    bool includeLinkedHqPreview = false) {
     invisible_places::renderer::core::SceneRenderState renderState;
     const auto aspectRatio = CurrentAspectRatio(viewport);
     invisible_places::camera::OrbitCamera overrideCamera;
@@ -102748,11 +104307,47 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
             resolvedShorelines.end());
     }
 
+    const bool linkedHqLiveReady =
+        includeLinkedHqPreview &&
+        runtimeState.linkedHqPreview.baselineReady &&
+        runtimeState.linkedHqPreview.request.has_value() &&
+        std::all_of(
+            runtimeState.linkedHqPreview.request
+                ->fiveMillimeterSessionIndices.begin(),
+            runtimeState.linkedHqPreview.request
+                ->fiveMillimeterSessionIndices.end(),
+            [&](std::size_t sessionIndex) {
+                return sessionIndex < runtimeState.sessions.size() &&
+                       runtimeState.sessions[sessionIndex].loaded &&
+                       runtimeState.sessions[sessionIndex].gpuResident &&
+                       viewport.HasPointCloudResources(sessionIndex);
+            });
+
     for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
         const auto& session = runtimeState.sessions[sessionIndex];
         if (session.kind == LayerKind::PointCloud) {
-            if (!IsRenderablePointCloudSource(runtimeState, session)) {
+            const bool renderable = linkedHqLiveReady
+                ? IsRenderablePointCloudSource(runtimeState, session)
+                : IsCanonicalRenderablePointCloudSource(
+                      runtimeState,
+                      session);
+            if (!renderable) {
                 continue;
+            }
+            if (linkedHqLiveReady &&
+                runtimeState.linkedHqPreview.ready &&
+                runtimeState.linkedHqPreview.enabled) {
+                const auto hqPatch = std::find_if(
+                    runtimeState.linkedHqPreview.patches.begin(),
+                    runtimeState.linkedHqPreview.patches.end(),
+                    [&](const LinkedHqPatchRuntime& patch) {
+                        return patch.baseSessionIndex == sessionIndex;
+                    });
+                if (hqPatch !=
+                        runtimeState.linkedHqPreview.patches.end() &&
+                    hqPatch->fiveMillimeterOutsideIndices.empty()) {
+                    continue;
+                }
             }
             auto drawPointCount = std::min<std::uint64_t>(
                 EffectivePointDrawCount(runtimeState, session),
@@ -102825,6 +104420,149 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                 {.layerId = sessionIndex,
                  .style = effectiveStyle,
                  .localToWorld = EffectiveGsplatLocalToWorld(runtimeState.projectSettings, session)});
+        }
+    }
+
+    if (linkedHqLiveReady &&
+        runtimeState.linkedHqPreview.ready &&
+        runtimeState.linkedHqPreview.enabled &&
+        !runtimeState.offlineRenderJob.active) {
+        for (const auto& patch : runtimeState.linkedHqPreview.patches) {
+            if (!patch.uploaded || patch.cloud == nullptr ||
+                patch.cloud->PointCount() == 0U ||
+                patch.baseSessionIndex >= runtimeState.sessions.size()) {
+                continue;
+            }
+            const auto& baseSession =
+                runtimeState.sessions[patch.baseSessionIndex];
+            auto resolvedPatchFields = patch.cloud->scalarFields;
+            for (auto& patchField : resolvedPatchFields) {
+                const auto baseField = std::find_if(
+                    baseSession.scalarFields.begin(),
+                    baseSession.scalarFields.end(),
+                    [&](const invisible_places::io::ScalarFieldStats& field) {
+                        return field.name == patchField.name;
+                    });
+                if (baseField != baseSession.scalarFields.end() &&
+                    baseField->valid) {
+                    // A field-mapped Visual must not renormalize at the
+                    // frustum edge. Keep the compact 1 mm values, but resolve
+                    // automatic input bounds from the same complete-role
+                    // statistics used by the surrounding 5 mm layer.
+                    patchField.minimum = baseField->minimum;
+                    patchField.maximum = baseField->maximum;
+                    patchField.count = baseField->count;
+                    patchField.valid = true;
+                }
+            }
+            PreviewLayerSession patchSession;
+            patchSession.kind = LayerKind::PointCloud;
+            patchSession.sourcePath = patch.cloud->sourcePath;
+            patchSession.sceneGroupName = baseSession.sceneGroupName;
+            patchSession.sceneRole = baseSession.sceneRole;
+            patchSession.hasSourceRgb = patch.cloud->hasSourceRgb;
+            patchSession.hasNormals = patch.cloud->hasNormals;
+            patchSession.scalarFields = resolvedPatchFields;
+            patchSession.availableScalarFields =
+                patch.cloud->availableScalarFields;
+            patchSession.bounds = patch.cloud->bounds;
+            auto renderStyle = MakeSceneRenderStyle(
+                runtimeState,
+                patchSession,
+                baseSession.pointStyle);
+            ApplyWaterFlowSourceActivityToStyle(
+                runtimeState.water,
+                baseSession,
+                activeWaterScenario,
+                &renderStyle,
+                &waterFrame.featureOverlay);
+            ClearPointCloudStyleShoreline(&renderStyle);
+            renderState.pointCloudLayers.push_back(
+                {.layerId = patch.layerId,
+                 .style = fastBasicRenderer
+                              ? MakeEffectiveFastBasicStyle(
+                                    renderStyle,
+                                    patch.cloud->hasSourceRgb,
+                                    false)
+                              : renderStyle,
+                 .timingColourise =
+                     activeColouriseEffects != nullptr &&
+                             IsAuthoredTimingColouriseLayer(baseSession)
+                         ? ResolveTimingColouriseStack(
+                               *activeColouriseEffects,
+                               resolvedPatchFields,
+                               patch.cloud->hasNormals,
+                               waterFrame.normalizedTime,
+                               waterFrame.timingIsCyclic)
+                         : invisible_places::renderer::pointcloud::
+                               ResolvedTimingColouriseStack{},
+                 .scalarFields = resolvedPatchFields,
+                 .generatedWaterOverlay = false,
+                 .hasSourceRgb = patch.cloud->hasSourceRgb,
+                 .hasNormals = patch.cloud->hasNormals,
+                 .timingColouriseEligible =
+                     IsAuthoredTimingColouriseLayer(baseSession),
+                 .shorelineInstancesEligible = false,
+                 .worldZBoundsValid = patch.cloud->bounds.valid,
+                 .worldMinZ = patch.cloud->bounds.minimum.z,
+                 .worldMaxZ = patch.cloud->bounds.maximum.z,
+                 .drawPointCount = static_cast<std::uint32_t>(
+                     std::min<std::size_t>(
+                         patch.cloud->PointCount(),
+                         std::numeric_limits<std::uint32_t>::max())),
+                 .densityCompensation = {},
+                 .rainCollisionRole =
+                     RainCollisionRoleForSession(baseSession)});
+        }
+
+        // Preserve the role/session draw order used by the ordinary full
+        // cloud. Transparent/emissive point materials can be order-sensitive,
+        // so each compact patch occupies its base role's position instead of
+        // being composited after every other scene role.
+        std::array<const LinkedHqPatchRuntime*, 2U> orderedPatches{
+            &runtimeState.linkedHqPreview.patches[0U],
+            &runtimeState.linkedHqPreview.patches[1U],
+        };
+        std::sort(
+            orderedPatches.begin(),
+            orderedPatches.end(),
+            [](const auto* left, const auto* right) {
+                return left->baseSessionIndex < right->baseSessionIndex;
+            });
+        for (const auto* patch : orderedPatches) {
+            auto patchLayer = std::find_if(
+                renderState.pointCloudLayers.begin(),
+                renderState.pointCloudLayers.end(),
+                [&](const auto& layer) {
+                    return layer.layerId == patch->layerId;
+                });
+            if (patchLayer == renderState.pointCloudLayers.end()) {
+                continue;
+            }
+            auto movedLayer = std::move(*patchLayer);
+            renderState.pointCloudLayers.erase(patchLayer);
+            const auto baseLayer = std::find_if(
+                renderState.pointCloudLayers.begin(),
+                renderState.pointCloudLayers.end(),
+                [&](const auto& layer) {
+                    return layer.layerId == patch->baseSessionIndex;
+                });
+            if (baseLayer != renderState.pointCloudLayers.end()) {
+                renderState.pointCloudLayers.insert(
+                    std::next(baseLayer),
+                    std::move(movedLayer));
+                continue;
+            }
+            const auto nextSessionLayer = std::find_if(
+                renderState.pointCloudLayers.begin(),
+                renderState.pointCloudLayers.end(),
+                [&](const auto& layer) {
+                    return layer.layerId < runtimeState.sessions.size() &&
+                           layer.layerId > patch->baseSessionIndex;
+                });
+            renderState.pointCloudLayers.insert(
+                nextSessionLayer,
+                std::move(movedLayer));
         }
     }
 
@@ -116499,6 +118237,9 @@ int Application::Run(ApplicationRunOptions options) const {
                         &viewport.value());
                 }
             }
+            EnsureLinkedHqPreview(
+                &runtimeState,
+                &viewport.value());
             viewport->BeginUiFrame();
             const bool pauseLiveViewport =
                 runtimeState.offlineRenderJob.active && runtimeState.pauseLiveViewportDuringExport;
@@ -116740,7 +118481,8 @@ int Application::Run(ApplicationRunOptions options) const {
                     viewport.value(),
                     previewFlowTimeSeconds,
                     &waterFrameState,
-                    comparisonCamera);
+                    comparisonCamera,
+                    true);
                 if (reciprocalPanWizardActive) {
                     SuppressWaterFeaturesForReciprocalPanWizard(
                         &renderState);
