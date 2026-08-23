@@ -52669,10 +52669,16 @@ void PublishLinkedHqStageProgress(
     }
 }
 
+// waitingForScene distinguishes the common scene still loading (Waiting in
+// the UI, resolved again next frame) from a pair that can never prepare.
 std::optional<LinkedHqSelectionRequest> ResolveLinkedHqSelectionRequest(
     const PreviewRuntimeState& runtimeState,
     const invisible_places::renderer::core::VulkanViewportShell& viewport,
-    std::string* errorMessage) {
+    std::string* errorMessage,
+    bool* waitingForScene = nullptr) {
+    if (waitingForScene != nullptr) {
+        *waitingForScene = false;
+    }
     const auto pair = ResolveActiveAnimationLinkedPair(runtimeState);
     if (!pair.has_value()) {
         if (errorMessage != nullptr) {
@@ -52740,6 +52746,9 @@ std::optional<LinkedHqSelectionRequest> ResolveLinkedHqSelectionRequest(
         if (errorMessage != nullptr) {
             *errorMessage =
                 "HQ is waiting for the linked scene to become visible.";
+        }
+        if (waitingForScene != nullptr) {
+            *waitingForScene = true;
         }
         return std::nullopt;
     }
