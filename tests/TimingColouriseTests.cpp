@@ -1132,6 +1132,108 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Timing Colourise cyclic settings transform moves a clip keyed at both "
+    "loop ends",
+    "[timing][colourise][cyclic][settings-clip]") {
+    using invisible_places::timing::
+        CoalesceTimingColouriseEffectCyclicallyCoincidentKeys;
+    using invisible_places::timing::EvaluateTimingEmissiveLevel;
+    using invisible_places::timing::SanitizeTimingColouriseEffect;
+    using invisible_places::timing::TimingColouriseCyclicSettingsKeySpan;
+    using invisible_places::timing::
+        TimingColouriseEffectCyclicSettingsKeySpan;
+    using invisible_places::timing::
+        TransformTimingColouriseEffectSettingsKeysCyclic;
+
+    SECTION("first/middle/last keys translate as one cluster") {
+        // The linear timeline keeps 0.0 and 1.0 as two keys; the cyclic
+        // lens sees one instant, which used to make every drag collide.
+        auto effect = SanitizeTimingColouriseEffect(
+            EmissiveKeysAt({0.0F, 0.5F, 1.0F}));
+        REQUIRE(effect.effectParameterKeys.size() == 3U);
+        const auto original = effect;
+        const auto span = TimingColouriseEffectCyclicSettingsKeySpan(effect);
+        REQUIRE(span.has_value());
+        CHECK(span->start == Approx(0.0F));
+        CHECK(span->length == Approx(0.5F));
+
+        REQUIRE(TransformTimingColouriseEffectSettingsKeysCyclic(
+            &effect,
+            *span,
+            TimingColouriseCyclicSettingsKeySpan{
+                .start = span->start + 0.1F,
+                .length = span->length}));
+        // The linear-later key (1.0) survives, as cyclic evaluation already
+        // chose it over the 0.0 key.
+        REQUIRE(effect.effectParameterKeys.size() == 2U);
+        CHECK(effect.effectParameterKeys[0U].position == Approx(0.1F));
+        CHECK(effect.effectParameterKeys[0U].value == Approx(1.0F));
+        CHECK(effect.effectParameterKeys[1U].position == Approx(0.6F));
+        CHECK(effect.effectParameterKeys[1U].value == Approx(0.5F));
+        for (const float sample : {0.0F, 0.1F, 0.3F, 0.6F, 0.9F}) {
+            CHECK(EvaluateTimingEmissiveLevel(effect, sample + 0.1F, true) ==
+                  Approx(EvaluateTimingEmissiveLevel(original, sample, true))
+                      .margin(1.0e-4F));
+        }
+
+        // Dragging the other way is just as free.
+        effect = original;
+        REQUIRE(TransformTimingColouriseEffectSettingsKeysCyclic(
+            &effect,
+            *span,
+            TimingColouriseCyclicSettingsKeySpan{
+                .start = span->start - 0.1F,
+                .length = span->length}));
+        REQUIRE(effect.effectParameterKeys.size() == 2U);
+        CHECK(effect.effectParameterKeys[0U].position == Approx(0.4F));
+        CHECK(effect.effectParameterKeys[1U].position == Approx(0.9F));
+    }
+
+    SECTION("a two-key clip at 0.0 and 1.0 is a point on the loop") {
+        auto effect = SanitizeTimingColouriseEffect(
+            EmissiveKeysAt({0.0F, 1.0F}));
+        REQUIRE(effect.effectParameterKeys.size() == 2U);
+        const auto span = TimingColouriseEffectCyclicSettingsKeySpan(effect);
+        REQUIRE(span.has_value());
+        CHECK(span->length == Approx(0.0F));
+        REQUIRE(TransformTimingColouriseEffectSettingsKeysCyclic(
+            &effect,
+            *span,
+            TimingColouriseCyclicSettingsKeySpan{.start = 0.3F, .length = 0.0F}));
+        REQUIRE(effect.effectParameterKeys.size() == 1U);
+        CHECK(effect.effectParameterKeys.front().position == Approx(0.3F));
+        CHECK(effect.effectParameterKeys.front().value == Approx(1.0F));
+    }
+
+    SECTION("coalescing only touches cyclically coincident same-lane keys") {
+        auto effect = EmissiveKeysAt({0.0F, 0.5F, 1.0F});
+        effect.effectParameterKeys.push_back(
+            {.parameter = TimingColouriseEffectParameter::PalettePhase,
+             .position = 1.0F,
+             .value = 0.25F});
+        effect.boundsParameterKeys = {
+            {.parameter = TimingColouriseBoundsParameter::Lower,
+             .position = 0.0F,
+             .value = -1.0F},
+            {.parameter = TimingColouriseBoundsParameter::Upper,
+             .position = 1.0F,
+             .value = 1.0F},
+        };
+        CHECK(CoalesceTimingColouriseEffectCyclicallyCoincidentKeys(&effect) ==
+              1U);
+        REQUIRE(effect.effectParameterKeys.size() == 3U);
+        CHECK(effect.effectParameterKeys[0U].position == Approx(0.5F));
+        CHECK(effect.effectParameterKeys[1U].position == Approx(1.0F));
+        CHECK(effect.effectParameterKeys[1U].value == Approx(1.0F));
+        CHECK(effect.effectParameterKeys[2U].parameter ==
+              TimingColouriseEffectParameter::PalettePhase);
+        CHECK(effect.boundsParameterKeys.size() == 2U);
+        CHECK(CoalesceTimingColouriseEffectCyclicallyCoincidentKeys(
+                  nullptr) == 0U);
+    }
+}
+
+TEST_CASE(
     "Timing Colourise cyclic settings transform rejects cross-seam lane "
     "collisions",
     "[timing][colourise][cyclic][settings-clip]") {

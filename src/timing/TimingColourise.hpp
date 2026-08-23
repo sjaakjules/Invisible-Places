@@ -767,6 +767,13 @@ TimingColouriseEffectCyclicSettingsKeySpan(
 // outside the forward source span, a point/non-point mismatch, a length
 // above one cycle, or a same-lane collision measured around the loop reject
 // the whole operation without mutation.
+// Same-lane keys that sit on one cyclic instant (0.0 and 1.0, the usual
+// first/last layout of a linear-authored feature) are merged the way cyclic
+// evaluation already merges them: the linear-later key survives. Returns the
+// number of keys removed. The cyclic transform applies this itself; the key
+// lane drag applies it to a selection that wraps both keys together.
+std::size_t CoalesceTimingColouriseEffectCyclicallyCoincidentKeys(
+    TimingColouriseEffect* effect);
 [[nodiscard]] bool TransformTimingColouriseEffectSettingsKeysCyclic(
     TimingColouriseEffect* effect,
     TimingColouriseCyclicSettingsKeySpan source,

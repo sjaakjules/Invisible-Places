@@ -3834,6 +3834,42 @@ void SynchronizeCurrentTimingColouriseFieldMemory(
     }
 }
 
+template <typename Key, typename SameLane>
+std::size_t CoalesceCyclicallyCoincidentKeys(
+    std::vector<Key>* keys,
+    SameLane sameLane) {
+    // Mirror ExpandTimingKeysForCyclicEvaluation, which wraps 1.0 onto 0.0
+    // and keeps the later key of a coincident pair: the linear-earlier key
+    // is the one evaluation was already ignoring in the cyclic lens.
+    std::vector<bool> drop(keys->size(), false);
+    for (std::size_t left = 0U; left < keys->size(); ++left) {
+        for (std::size_t right = left + 1U;
+             right < keys->size();
+             ++right) {
+            if (!sameLane((*keys)[left], (*keys)[right]) ||
+                TimingColouriseCyclicKeyDistance(
+                    (*keys)[left].position,
+                    (*keys)[right].position) >
+                    kTimingColouriseKeyTolerance) {
+                continue;
+            }
+            const bool leftEarlier =
+                (*keys)[left].position <= (*keys)[right].position;
+            drop[leftEarlier ? left : right] = true;
+        }
+    }
+    std::vector<Key> kept;
+    kept.reserve(keys->size());
+    for (std::size_t index = 0U; index < keys->size(); ++index) {
+        if (!drop[index]) {
+            kept.push_back(std::move((*keys)[index]));
+        }
+    }
+    const std::size_t removed = keys->size() - kept.size();
+    *keys = std::move(kept);
+    return removed;
+}
+
 void SortTimingColouriseEffectSettingsKeys(
     TimingColouriseEffect* effect) {
     SortAndCoalesceKeys(&effect->paletteKeys);
@@ -3852,6 +3888,56 @@ void SortTimingColouriseEffectSettingsKeys(
 }
 
 }  // namespace
+
+std::size_t CoalesceTimingColouriseEffectCyclicallyCoincidentKeys(
+    TimingColouriseEffect* effect) {
+    if (effect == nullptr) {
+        return 0U;
+    }
+    const auto sameSingleLane = [](const auto&, const auto&) {
+        return true;
+    };
+    std::size_t removed = 0U;
+    removed += CoalesceCyclicallyCoincidentKeys(
+        &effect->paletteKeys,
+        sameSingleLane);
+    removed += CoalesceCyclicallyCoincidentKeys(
+        &effect->paletteStopParameterKeys,
+        [](const auto& left, const auto& right) {
+            return left.stopId == right.stopId &&
+                   left.parameter == right.parameter;
+        });
+    removed += CoalesceCyclicallyCoincidentKeys(
+        &effect->effectParameterKeys,
+        [](const auto& left, const auto& right) {
+            return left.parameter == right.parameter;
+        });
+    removed += CoalesceCyclicallyCoincidentKeys(
+        &effect->boundsKeys,
+        sameSingleLane);
+    removed += CoalesceCyclicallyCoincidentKeys(
+        &effect->boundsParameterKeys,
+        [](const auto& left, const auto& right) {
+            return left.parameter == right.parameter;
+        });
+    for (auto& memory : effect->fieldBoundsMemory) {
+        if (IsCurrentTimingColouriseFieldMemory(*effect, memory)) {
+            continue;
+        }
+        removed += CoalesceCyclicallyCoincidentKeys(
+            &memory.boundsKeys,
+            sameSingleLane);
+        removed += CoalesceCyclicallyCoincidentKeys(
+            &memory.boundsParameterKeys,
+            [](const auto& left, const auto& right) {
+                return left.parameter == right.parameter;
+            });
+    }
+    if (removed != 0U) {
+        SynchronizeCurrentTimingColouriseFieldMemory(effect);
+    }
+    return removed;
+}
 
 std::vector<float> TimingColouriseEffectSettingsKeyPositions(
     const TimingColouriseEffect& effect) {
@@ -4147,7 +4233,15 @@ bool TransformTimingColouriseEffectSettingsKeysCyclic(
         return false;
     }
 
-    TimingColouriseEffect candidate = *effect;
+    // Keys at 0.0 and 1.0 (the usual first/last layout authored in the
+    // linear timeline) are one cyclic instant, so every destination maps
+    // them onto the same wrapped position. Coalesce them first, exactly as
+    // evaluation does, instead of letting the collision check below reject
+    // every move of such a clip. The original is coalesced the same way so
+    // the Palette Phase re-encode still sees index-aligned keys.
+    TimingColouriseEffect original = *effect;
+    (void)CoalesceTimingColouriseEffectCyclicallyCoincidentKeys(&original);
+    TimingColouriseEffect candidate = original;
     bool foundKey = false;
     const auto mapKeys = [&](auto* keys) {
         for (auto& key : *keys) {
@@ -4203,7 +4297,7 @@ bool TransformTimingColouriseEffectSettingsKeysCyclic(
         return false;
     }
 
-    PreserveTimingColourisePalettePhaseTargetsAfterMove(*effect, &candidate);
+    PreserveTimingColourisePalettePhaseTargetsAfterMove(original, &candidate);
     SynchronizeCurrentTimingColouriseFieldMemory(&candidate);
     SortTimingColouriseEffectSettingsKeys(&candidate);
     *effect = std::move(candidate);
