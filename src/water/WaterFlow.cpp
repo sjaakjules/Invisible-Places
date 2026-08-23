@@ -8456,7 +8456,17 @@ WaterFeatureClipLaneLayout BuildWaterFeatureClipLaneLayout(
         const auto spansOverlap =
             [&](std::pair<float, float> left, std::pair<float, float> right) {
                 // Exact-touch spans overlap as well, keeping coincident edge
-                // handles independently reachable in the UI.
+                // handles independently reachable in the UI. Two unwrapped
+                // spans keep the pre-W1 linear test: on the 0..1 rail
+                // {0,0.2} and {0.9,1} are disjoint, and probing the +/-1
+                // shifts would stack them onto separate lanes although they
+                // touch nowhere in pixels. Only a wrapped span occupies
+                // both rail ends and must be tested cyclically.
+                if (!WaterClipIsWrapped(left.first, left.second) &&
+                    !WaterClipIsWrapped(right.first, right.second)) {
+                    return right.first <= left.second + kTouchTolerance &&
+                           right.second >= left.first - kTouchTolerance;
+                }
                 for (const float shift : {-1.0F, 0.0F, 1.0F}) {
                     if (right.first + shift <= left.second + kTouchTolerance &&
                         right.second + shift >= left.first - kTouchTolerance) {

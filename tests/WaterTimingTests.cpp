@@ -6841,6 +6841,23 @@ TEST_CASE("Wrapped spans attach loose keys, migrate membership, and share lanes 
     CHECK(laneOf(1U) != laneOf(2U));
     CHECK(layout.laneCount == 2U);
     CHECK((laneOf(3U) == laneOf(1U) || laneOf(3U) == laneOf(2U)));
+
+    // Two unwrapped clips touching opposite rail ends are disjoint on the
+    // 0..1 rail and keep sharing lane 0 exactly as before W1: the cyclic
+    // +/-1 probes apply only when one of the spans actually wraps.
+    WaterFeatureTimeline railEnds;
+    railEnds.feature = timeline.feature;
+    railEnds.settings = {{.settingId = "strength"}};
+    railEnds.clips = {
+        {.id = 1U, .name = "Head", .start = 0.0F, .end = 0.2F},
+        {.id = 2U, .name = "Tail", .start = 0.9F, .end = 1.0F},
+    };
+    railEnds.clipMembershipExplicit = true;
+    const auto railLayout = BuildWaterFeatureClipLaneLayout(railEnds);
+    REQUIRE(railLayout.assignments.size() == 2U);
+    CHECK(railLayout.laneCount == 1U);
+    CHECK(railLayout.assignments[0].laneIndex ==
+          railLayout.assignments[1].laneIndex);
 }
 
 TEST_CASE("Clip moves and sanitize preserve overlapping entries",
