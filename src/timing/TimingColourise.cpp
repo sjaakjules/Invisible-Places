@@ -4013,10 +4013,19 @@ bool RetimeTimingTakeSceneStateNormalizedPositions(
                 retimeKeys(&setting.keys);
             }
             // Settings clips are spans over the same normalized domain, so
-            // they retime exactly with the keys they group.
+            // they retime exactly with the keys they group. A wrapped clip
+            // (end > 1) retimes as start plus scaled length on its unwrapped
+            // line: mapping the end through the clamping map would pin it to
+            // 1 and silently unwrap the clip.
+            const double lengthScale = sourceFrames / destinationFrames;
             for (auto& clip : feature.clips) {
+                const float length = std::isfinite(clip.end) &&
+                                             std::isfinite(clip.start)
+                    ? std::clamp(clip.end - clip.start, 0.0F, 1.0F)
+                    : 0.0F;
                 clip.start = retimePosition(clip.start);
-                clip.end = retimePosition(clip.end);
+                clip.end = clip.start +
+                           static_cast<float>(length * lengthScale);
             }
         }
     }

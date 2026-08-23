@@ -1096,6 +1096,8 @@ WaterFeatureLooseKeySpan(const WaterFeatureTimeline& timeline);
 
 // Interval the span [rangeStart, rangeEnd] may occupy without leaving 0..1.
 // Other clips do not constrain it: overlapping clip windows are supported.
+// For linked-cyclic editing (cyclic = true) the rail has no ends, so the
+// limits are unbounded and only the end - start <= 1 rule applies.
 struct WaterFeatureSpanLimits {
     float minimumStart = 0.0F;
     float maximumEnd = 1.0F;
@@ -1103,7 +1105,8 @@ struct WaterFeatureSpanLimits {
 [[nodiscard]] WaterFeatureSpanLimits WaterFeatureTimelineSpanLimits(
     const WaterFeatureTimeline& timeline,
     float rangeStart,
-    float rangeEnd);
+    float rangeEnd,
+    bool cyclic = false);
 
 // Affinely remaps every key inside [rangeStart, rangeEnd] (inclusive, with
 // the shared 1e-4 tolerance) onto [newStart, newEnd], on every track. Clips
@@ -1120,19 +1123,26 @@ struct WaterFeatureSpanLimits {
 
 // Affinely transforms only the explicitly selected clip ids. Zero selects
 // loose keys inside the source range. This is the overlap-safe primitive
-// used by single and grouped UI drags.
+// used by single and grouped UI drags. The source range may be a wrapped
+// clip span (end > 1). With allowWrap the destination may be any span of
+// length <= 1 expressed in unwrapped coordinates (newStart is normalized
+// into [0,1) and keys wrap around phase 0); without it the destination must
+// lie inside 0..1 exactly as before, so unlinked editing never wraps.
 [[nodiscard]] bool TransformWaterFeatureClipSelection(
     WaterFeatureTimeline* timeline,
     std::span<const std::uint32_t> clipIds,
     float rangeStart,
     float rangeEnd,
     float newStart,
-    float newEnd);
+    float newEnd,
+    bool allowWrap = false);
 
-// Translates one ordered clip/group window on the canonical cyclic 0..1
-// timeline. When its leading edge crosses either boundary, the complete
-// ordered span rolls to the opposite side instead of sticking at 0 or 1.
-// Keeping start <= end preserves the existing clip document schema.
+// Translates one clip/group window on the canonical cyclic 0..1 timeline
+// with period 1: the start rolls around phase 0 and the returned span is
+// {start in [0,1), start + length}, so a span crossing the loop origin is
+// returned wrapped (end > 1) rather than jumping to the other side. A
+// full-length clip rotates with its keys. Exact boundary placements are
+// stable until the pointer actually crosses them.
 [[nodiscard]] std::pair<float, float> CyclicWaterFeatureClipMoveSpan(
     float rangeStart,
     float rangeEnd,
@@ -1143,7 +1153,8 @@ struct WaterFeatureSpanLimits {
     WaterFeatureTimeline* timeline,
     std::uint32_t clipId,
     float newStart,
-    float newEnd);
+    float newEnd,
+    bool allowWrap = false);
 
 // Captures the keys inside [rangeStart, rangeEnd] as a reusable package
 // whose key positions are renormalized to 0..1 across the span. Tracks with
@@ -1162,8 +1173,9 @@ struct WaterFeatureSpanLimits {
     std::uint32_t clipId);
 
 // Applies a package into [windowStart, windowEnd] as a new explicitly owned
-// clip. Existing clips and loose keys survive, including inside the target
-// window. Same-track/time collisions are nudged minimally within the window.
+// clip; the window may wrap (windowEnd up to windowStart + 1), in which case
+// the stored keys wrap into [0,1). Existing clips and loose keys survive,
+// including inside the target window. Same-track/time collisions are nudged minimally within the window.
 // Missing tracks are created with the package's display metadata. When the
 // package kind differs from the timeline's feature kind only registry
 // settings of the target kind apply. Returns the new clip id, or nullopt
@@ -1188,10 +1200,14 @@ struct WaterFeatureSpanLimits {
 
 // Copies one clip (bounds and explicitly owned keys) onto the same timeline
 // with its start at targetStart. Overlapping destinations are supported.
+// Without allowWrap the start is clamped so the copy stays inside 0..1;
+// with it (linked-cyclic authoring) the start wraps with period 1 and the
+// copy may wrap through phase 0.
 [[nodiscard]] std::optional<std::uint32_t> DuplicateWaterFeatureClip(
     WaterFeatureTimeline* timeline,
     std::uint32_t clipId,
-    float targetStart);
+    float targetStart,
+    bool allowWrap = false);
 
 // Copies or moves one explicitly owned clip onto another feature's timeline
 // over the same window. Both features must share one feature kind; existing

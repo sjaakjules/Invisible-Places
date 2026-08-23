@@ -8449,21 +8449,40 @@ WaterFeatureClipLaneLayout BuildWaterFeatureClipLaneLayout(
                 return left->clipId < right->clipId;
             });
 
-        std::vector<float> spillEnds;
-        for (const auto* candidate : bandCandidates) {
-            std::size_t spill = 0U;
-            for (; spill < spillEnds.size(); ++spill) {
-                // Exact-touch spans spill as well, keeping coincident edge
+        // Each spill lane remembers every span placed on it so a wrapped
+        // candidate (occupying [start,1] and [0,end-1]) is tested cyclically
+        // against the lane's earlier spans rather than only its last end.
+        std::vector<std::vector<std::pair<float, float>>> spillSpans;
+        const auto spansOverlap =
+            [&](std::pair<float, float> left, std::pair<float, float> right) {
+                // Exact-touch spans overlap as well, keeping coincident edge
                 // handles independently reachable in the UI.
-                if (candidate->start >
-                    spillEnds[spill] + kTouchTolerance) {
+                for (const float shift : {-1.0F, 0.0F, 1.0F}) {
+                    if (right.first + shift <= left.second + kTouchTolerance &&
+                        right.second + shift >= left.first - kTouchTolerance) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+        for (const auto* candidate : bandCandidates) {
+            const std::pair<float, float> span{candidate->start, candidate->end};
+            std::size_t spill = 0U;
+            for (; spill < spillSpans.size(); ++spill) {
+                const bool free = std::none_of(
+                    spillSpans[spill].begin(),
+                    spillSpans[spill].end(),
+                    [&](const std::pair<float, float>& placed) {
+                        return spansOverlap(placed, span);
+                    });
+                if (free) {
                     break;
                 }
             }
-            if (spill == spillEnds.size()) {
-                spillEnds.push_back(candidate->end);
+            if (spill == spillSpans.size()) {
+                spillSpans.push_back({span});
             } else {
-                spillEnds[spill] = candidate->end;
+                spillSpans[spill].push_back(span);
             }
             result.assignments.push_back({
                 .clipId = candidate->clipId,
@@ -8472,7 +8491,7 @@ WaterFeatureClipLaneLayout BuildWaterFeatureClipLaneLayout(
                 .laneIndex = laneOffset + spill,
             });
         }
-        laneOffset += spillEnds.size();
+        laneOffset += spillSpans.size();
     }
     result.laneCount = laneOffset;
     std::ranges::sort(
@@ -10802,6 +10821,10 @@ void EnsureWaterFeatureExplicitClipMembership(
     }
 }
 
+// Searches the window in unwrapped coordinates (windowEnd may exceed 1) and
+// compares against existing keys cyclically, so a window spanning phase 0
+// nudges around keys on both sides of the seam. Returns the unwrapped
+// position; the caller stores WrapWaterClipPhase of it.
 std::optional<float> AvailableWaterClipKeyPosition(
     const WaterKeyedSettingTrack& track,
     float desired,
@@ -10813,7 +10836,9 @@ std::optional<float> AvailableWaterClipKeyPosition(
                    track.keys.begin(),
                    track.keys.end(),
                    [&](const WaterSettingKey& existing) {
-                       return std::abs(existing.position - candidate) <=
+                       return CyclicWaterClipDistance(
+                                  existing.position,
+                                  WrapWaterClipPhase(candidate)) <=
                               kWaterClipKeyTolerance;
                    });
     };
@@ -11022,10 +11047,17 @@ std::optional<std::pair<float, float>> WaterFeatureLooseKeySpan(
 WaterFeatureSpanLimits WaterFeatureTimelineSpanLimits(
     const WaterFeatureTimeline&,
     float rangeStart,
-    float rangeEnd) {
+    float rangeEnd,
+    bool cyclic) {
     WaterFeatureSpanLimits limits{};
     if (!WaterClipRangeIsValid(rangeStart, rangeEnd)) {
         return limits;
+    }
+    if (cyclic) {
+        // The linked loop has no rail ends: a span may roll through phase 0
+        // indefinitely. Callers bound stretches by end - start <= 1 instead.
+        limits.minimumStart = -std::numeric_limits<float>::infinity();
+        limits.maximumEnd = std::numeric_limits<float>::infinity();
     }
     return limits;
 }
@@ -11036,18 +11068,40 @@ bool TransformWaterFeatureClipSelection(
     float rangeStart,
     float rangeEnd,
     float newStart,
-    float newEnd) {
+    float newEnd,
+    bool allowWrap) {
     if (timeline == nullptr || clipIds.empty() ||
         !WaterClipRangeIsValid(rangeStart, rangeEnd) ||
         !std::isfinite(newStart) || !std::isfinite(newEnd) ||
-        newStart < -kWaterClipKeyTolerance ||
-        newEnd > 1.0F + kWaterClipKeyTolerance ||
-        newEnd - newStart < kWaterClipKeyTolerance) {
+        newEnd - newStart < kWaterClipKeyTolerance ||
+        newEnd - newStart > 1.0F + kWaterClipKeyTolerance) {
+        return false;
+    }
+    if (!allowWrap &&
+        (newStart < -kWaterClipKeyTolerance ||
+         newEnd > 1.0F + kWaterClipKeyTolerance)) {
+        // Unlinked editing never wraps: the destination must stay on the
+        // 0..1 rail exactly as before W1.
         return false;
     }
     EnsureWaterFeatureExplicitClipMembership(timeline);
-    newStart = Clamp01(newStart);
-    newEnd = Clamp01(newEnd);
+    if (allowWrap) {
+        // Express the destination with its start in [0,1); the end may then
+        // exceed 1, which is the wrapped clip representation.
+        const float length = newEnd - newStart;
+        newStart = WrapWaterClipPhase(newStart);
+        newEnd = newStart + length;
+    } else {
+        newStart = Clamp01(newStart);
+        newEnd = Clamp01(newEnd);
+    }
+    // Key landings are compared on the loop when wrapping is allowed, so a
+    // key arriving at phase 1 collides with one sitting at 0.
+    const auto landsOn = [&](float left, float right) {
+        return allowWrap
+            ? CyclicWaterClipDistance(left, right) <= kWaterClipKeyTolerance
+            : std::abs(left - right) <= kWaterClipKeyTolerance;
+    };
     const auto keyMovesWithSelection = [&](const WaterSettingKey& key) {
         if (key.clipId != 0U) {
             return WaterClipIdIsSelected(clipIds, key.clipId);
@@ -11094,13 +11148,13 @@ bool TransformWaterFeatureClipSelection(
                 rangeStart,
                 rangeEnd,
                 newStart,
-                newEnd);
+                newEnd,
+                allowWrap);
             for (const auto& other : setting.keys) {
                 if (keyMovesWithSelection(other)) {
                     continue;
                 }
-                if (std::abs(other.position - remapped) <=
-                    kWaterClipKeyTolerance) {
+                if (landsOn(other.position, remapped)) {
                     return false;
                 }
             }
@@ -11108,8 +11162,7 @@ bool TransformWaterFeatureClipSelection(
                     remappedPositions.begin(),
                     remappedPositions.end(),
                     [&](float other) {
-                        return std::abs(other - remapped) <=
-                               kWaterClipKeyTolerance;
+                        return landsOn(other, remapped);
                     })) {
                 return false;
             }
@@ -11127,7 +11180,8 @@ bool TransformWaterFeatureClipSelection(
                 rangeStart,
                 rangeEnd,
                 newStart,
-                newEnd);
+                newEnd,
+                allowWrap);
             moved = true;
         }
         if (moved) {
@@ -11144,18 +11198,28 @@ bool TransformWaterFeatureClipSelection(
         if (!WaterClipIdIsSelected(clipIds, clip.id)) {
             continue;
         }
-        clip.start = RemapWaterClipPosition(
+        // Remap the span on the unwrapped line so a wrapped destination
+        // keeps end > 1; Synchronize then re-derives it from the members
+        // with this start as the covering-arc hint.
+        const float mappedStart = RemapWaterClipPositionUnwrapped(
             clip.start,
             rangeStart,
             rangeEnd,
             newStart,
             newEnd);
-        clip.end = RemapWaterClipPosition(
+        const float mappedEnd = RemapWaterClipPositionUnwrapped(
             clip.end,
             rangeStart,
             rangeEnd,
             newStart,
             newEnd);
+        if (allowWrap) {
+            clip.start = WrapWaterClipPhase(mappedStart);
+            clip.end = clip.start + std::min(1.0F, mappedEnd - mappedStart);
+        } else {
+            clip.start = Clamp01(mappedStart);
+            clip.end = Clamp01(mappedEnd);
+        }
     }
     for (const auto clipId : clipIds) {
         if (clipId != 0U) {
@@ -11177,23 +11241,11 @@ std::pair<float, float> CyclicWaterFeatureClipMoveSpan(
         return ordered;
     }
     const float length = ordered.second - ordered.first;
-    const float maximumStart = std::max(0.0F, 1.0F - length);
-    if (maximumStart <= kWaterClipKeyTolerance) {
-        return ordered;
-    }
-
-    float movedStart = ordered.first + delta;
-    // Stored clips remain ordered. Treat the available start-position range
-    // as circular so crossing the left edge rolls the whole span beside 1,
-    // while crossing the right edge rolls it beside 0. Exact boundary
-    // placements remain stable until the pointer actually crosses them.
-    if (movedStart < 0.0F || movedStart > maximumStart) {
-        movedStart = std::fmod(movedStart, maximumStart);
-        if (movedStart < 0.0F) {
-            movedStart += maximumStart;
-        }
-    }
-    movedStart = std::clamp(movedStart, 0.0F, maximumStart);
+    // Period-1 roll (W1): the start simply travels around the loop and the
+    // span keeps its length, so a clip straddling phase 0 is returned as a
+    // wrapped span (end > 1) instead of jumping by its own length. A start
+    // landing exactly on 1 is the same phase as 0 and is stored as 0.
+    const float movedStart = WrapWaterClipPhase(ordered.first + delta);
     return {movedStart, movedStart + length};
 }
 
@@ -11246,7 +11298,8 @@ bool TransformWaterFeatureClip(
     WaterFeatureTimeline* timeline,
     std::uint32_t clipId,
     float newStart,
-    float newEnd) {
+    float newEnd,
+    bool allowWrap) {
     if (timeline == nullptr || clipId == 0U) {
         return false;
     }
@@ -11264,7 +11317,8 @@ bool TransformWaterFeatureClip(
         rangeStart,
         rangeEnd,
         newStart,
-        newEnd);
+        newEnd,
+        allowWrap);
 }
 
 WaterKeyedSettingsProfile CaptureWaterKeyedSettingsClip(
@@ -11308,6 +11362,14 @@ WaterKeyedSettingsProfile CaptureWaterKeyedSettingsClip(
             captured.keys.push_back(capturedKey);
         }
         if (!captured.keys.empty()) {
+            // Members of a wrapped span are stored in loop order, not span
+            // order; packages always carry their keys sorted.
+            std::stable_sort(
+                captured.keys.begin(),
+                captured.keys.end(),
+                [](const WaterSettingKey& left, const WaterSettingKey& right) {
+                    return left.position < right.position;
+                });
             profile.settings.push_back(std::move(captured));
         }
     }
@@ -11351,6 +11413,14 @@ WaterKeyedSettingsProfile CaptureWaterKeyedSettingsClipById(
             captured.keys.push_back(capturedKey);
         }
         if (!captured.keys.empty()) {
+            // Members of a wrapped span are stored in loop order, not span
+            // order; packages always carry their keys sorted.
+            std::stable_sort(
+                captured.keys.begin(),
+                captured.keys.end(),
+                [](const WaterSettingKey& left, const WaterSettingKey& right) {
+                    return left.position < right.position;
+                });
             profile.settings.push_back(std::move(captured));
         }
     }
@@ -11368,8 +11438,12 @@ std::optional<std::uint32_t> ApplyWaterKeyedSettingsClip(
         profile.settings.empty()) {
         return std::nullopt;
     }
-    windowStart = Clamp01(windowStart);
-    windowEnd = Clamp01(windowEnd);
+    {
+        // The window may wrap (W1): keep its length, store the start phase.
+        const float length = std::min(1.0F, windowEnd - windowStart);
+        windowStart = WrapWaterClipPhase(windowStart);
+        windowEnd = windowStart + length;
+    }
     if (windowEnd - windowStart <
         kWaterFeatureClipMinimumLength - kWaterClipKeyTolerance) {
         return std::nullopt;
@@ -11442,7 +11516,7 @@ std::optional<std::uint32_t> ApplyWaterKeyedSettingsClip(
             return &candidate.settings.back();
         }();
         for (const auto& key : packaged.keys) {
-            const float desiredPosition = RemapWaterClipPosition(
+            const float desiredPosition = RemapWaterClipPositionUnwrapped(
                 Clamp01(key.position),
                 0.0F,
                 1.0F,
@@ -11457,7 +11531,14 @@ std::optional<std::uint32_t> ApplyWaterKeyedSettingsClip(
                 return std::nullopt;
             }
             auto appliedKey = key;
-            appliedKey.position = position.value();
+            // Available positions are searched on the unwrapped window;
+            // keys are stored in [0,1). Only a window that wraps can yield
+            // a position >= 1; an unwrapped window's end at exactly 1 stays
+            // a stored key at 1 as before.
+            appliedKey.position =
+                WaterClipIsWrapped(windowStart, windowEnd)
+                    ? WrapWaterClipPhase(position.value())
+                    : position.value();
             appliedKey.clipId = clipId;
             if (appliedKey.interpolation ==
                 WaterScenarioInterpolation::TrackDefault &&
@@ -11505,12 +11586,14 @@ std::optional<std::uint32_t> CreateWaterFeatureClipFromSpan(
         .sourceProfileName = {},
     });
     const std::uint32_t clipId = clip.id;
+    const float clipStart = clip.start;
+    const float clipEnd = clip.end;
     timeline->clips.push_back(std::move(clip));
     if (attachLooseKeys) {
         for (auto& setting : timeline->settings) {
             for (auto& key : setting.keys) {
                 if (key.clipId == 0U &&
-                    WaterClipSpanContains(start, end, key.position)) {
+                    WaterClipSpanContains(clipStart, clipEnd, key.position)) {
                     key.clipId = clipId;
                 }
             }
@@ -11524,7 +11607,8 @@ std::optional<std::uint32_t> CreateWaterFeatureClipFromSpan(
 std::optional<std::uint32_t> DuplicateWaterFeatureClip(
     WaterFeatureTimeline* timeline,
     std::uint32_t clipId,
-    float targetStart) {
+    float targetStart,
+    bool allowWrap) {
     EnsureWaterFeatureExplicitClipMembership(timeline);
     const auto* clip = FindWaterFeatureClip(timeline, clipId);
     if (clip == nullptr || !std::isfinite(targetStart)) {
@@ -11533,7 +11617,10 @@ std::optional<std::uint32_t> DuplicateWaterFeatureClip(
     const float length = clip->end - clip->start;
     const std::string name = clip->name;
     const std::string provenance = clip->sourceProfileName;
-    const float start = std::clamp(targetStart, 0.0F, 1.0F - length);
+    // Unlinked copies stay on the rail; linked-cyclic copies roll around it.
+    const float start = allowWrap
+        ? WrapWaterClipPhase(targetStart)
+        : std::clamp(targetStart, 0.0F, 1.0F - length);
     auto package = CaptureWaterKeyedSettingsClipById(*timeline, clipId);
     package.name = provenance;
     package.baseProfileName = name;
