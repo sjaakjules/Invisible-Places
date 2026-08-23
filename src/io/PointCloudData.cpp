@@ -763,6 +763,21 @@ PointCloudLoadResult LoadPointCloud(
     return {.cloud = std::move(cloud), .success = true};
 }
 
+bool PointCloudSubsetDecimationKeeps(
+    std::uint64_t sourceIndex,
+    std::uint32_t keepOneIn) {
+    if (keepOneIn <= 1U) {
+        return true;
+    }
+    // splitmix64 finaliser: every source index maps to an independent,
+    // well-mixed value so the kept fraction is 1/N without file-order bias.
+    std::uint64_t mixed = sourceIndex + 0x9e3779b97f4a7c15ULL;
+    mixed = (mixed ^ (mixed >> 30U)) * 0xbf58476d1ce4e5b9ULL;
+    mixed = (mixed ^ (mixed >> 27U)) * 0x94d049bb133111ebULL;
+    mixed ^= mixed >> 31U;
+    return (mixed % keepOneIn) == 0U;
+}
+
 PointCloudSubsetLoadResult LoadPointCloudSubset(
     const std::filesystem::path& filePath,
     const PointCloudSubsetLoadOptions& options) {
@@ -907,9 +922,11 @@ PointCloudSubsetLoadResult LoadPointCloudSubset(
         std::vector<ScalarFieldStats> fieldStats;
         std::vector<Float3> focusSamples;
         Bounds3f bounds{};
+        std::uint64_t includedCount = 0U;
         std::string errorMessage;
         bool cancelled = false;
     };
+    const std::uint32_t keepOneIn = std::max(1U, options.decimationKeepOneIn);
     std::atomic<std::uint64_t> scannedPoints{0U};
     // Progress is reported from the calling thread only: during its own
     // range after every chunk, then by polling while the workers finish.
@@ -995,6 +1012,12 @@ PointCloudSubsetLoadResult LoadPointCloudSubset(
                         positionProperties[2U].type);
                     if (options.includePoint &&
                         !options.includePoint(position)) {
+                        continue;
+                    }
+                    ++out->includedCount;
+                    if (!PointCloudSubsetDecimationKeeps(
+                            globalIndex,
+                            keepOneIn)) {
                         continue;
                     }
 
@@ -1193,6 +1216,7 @@ PointCloudSubsetLoadResult LoadPointCloudSubset(
         focusSamples.reserve(
             std::min<std::size_t>(acceptedCount, kMaxFocusSamples));
         for (auto& output : outputs) {
+            result.includedPointCount += output.includedCount;
             cloud.positions.insert(
                 cloud.positions.end(),
                 output.positions.begin(),

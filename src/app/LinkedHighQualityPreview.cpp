@@ -33,6 +33,22 @@ void HashValue(std::uint64_t* hash, const T& value) {
 
 }  // namespace
 
+std::uint32_t SanitizeLinkedHqPatchSpacing(std::uint32_t spacingMicrometres) {
+    std::uint32_t best = kLinkedHqPatchSpacingChoicesMicrometres.front();
+    for (const auto choice : kLinkedHqPatchSpacingChoicesMicrometres) {
+        if (choice <= spacingMicrometres) {
+            best = choice;
+        }
+    }
+    return best;
+}
+
+std::uint32_t LinkedHqDecimationKeepOneIn(std::uint32_t spacingMicrometres) {
+    const auto spacing = SanitizeLinkedHqPatchSpacing(spacingMicrometres);
+    const auto ratio = spacing / kLinkedHqPatchSpacingChoicesMicrometres.front();
+    return std::max(1U, ratio * ratio);
+}
+
 bool LinkedHqFrustumUnion::Contains(
     const invisible_places::io::Float3& point) const {
     const float safeBorder = std::max(0.0F, borderFraction);

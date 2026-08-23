@@ -131,16 +131,28 @@ struct PointCloudSubsetLoadOptions {
     // 0 sizes the range-parallel scan automatically (one range per
     // hardware thread, at most eight, at least one million points each).
     unsigned threadCount = 0U;
+    // Keeps one of every N points accepted by includePoint, chosen by a
+    // hash of the source index (see PointCloudSubsetDecimationKeeps), so the
+    // selection is uniform, deterministic, and independent of threading.
+    // 1 keeps every accepted point.
+    std::uint32_t decimationKeepOneIn = 1U;
 };
 
 struct PointCloudSubsetLoadResult {
     LoadedPointCloud cloud;
     std::vector<std::uint32_t> sourcePointIndices;
     std::uint64_t sourcePointCount = 0;
+    // Points accepted by includePoint before decimation; with
+    // decimationKeepOneIn == 1 this equals cloud.PointCount().
+    std::uint64_t includedPointCount = 0;
     std::string errorMessage;
     bool success = false;
     bool cancelled = false;
 };
+
+[[nodiscard]] bool PointCloudSubsetDecimationKeeps(
+    std::uint64_t sourceIndex,
+    std::uint32_t keepOneIn);
 
 struct PointCloudPositionNormalSample {
     Float3 position{};

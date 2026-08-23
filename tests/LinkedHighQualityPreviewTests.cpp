@@ -265,6 +265,92 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Linked HQ patch spacing choices map to one-in-N decimation",
+    "[linked-hq]") {
+    using invisible_places::app::LinkedHqDecimationKeepOneIn;
+    using invisible_places::app::SanitizeLinkedHqPatchSpacing;
+    CHECK(SanitizeLinkedHqPatchSpacing(0U) == 1'000U);
+    CHECK(SanitizeLinkedHqPatchSpacing(1'000U) == 1'000U);
+    CHECK(SanitizeLinkedHqPatchSpacing(1'500U) == 1'000U);
+    CHECK(SanitizeLinkedHqPatchSpacing(2'000U) == 2'000U);
+    CHECK(SanitizeLinkedHqPatchSpacing(2'999U) == 2'000U);
+    CHECK(SanitizeLinkedHqPatchSpacing(3'000U) == 3'000U);
+    CHECK(SanitizeLinkedHqPatchSpacing(5'000U) == 3'000U);
+    CHECK(LinkedHqDecimationKeepOneIn(1'000U) == 1U);
+    CHECK(LinkedHqDecimationKeepOneIn(2'000U) == 4U);
+    CHECK(LinkedHqDecimationKeepOneIn(3'000U) == 9U);
+    CHECK(LinkedHqDecimationKeepOneIn(999'999U) == 9U);
+}
+
+TEST_CASE(
+    "Subset decimation keeps a uniform deterministic fraction by source index",
+    "[pointcloud][linked-hq][io]") {
+    using invisible_places::io::PointCloudSubsetDecimationKeeps;
+    bool keepsEverything = true;
+    for (std::uint64_t index = 0U; index < 1000U; ++index) {
+        keepsEverything = keepsEverything &&
+            PointCloudSubsetDecimationKeeps(index, 1U) &&
+            PointCloudSubsetDecimationKeeps(index, 0U);
+    }
+    CHECK(keepsEverything);
+    for (const std::uint32_t keepOneIn : {4U, 9U}) {
+        std::uint64_t kept = 0U;
+        std::uint64_t longestRun = 0U;
+        std::uint64_t run = 0U;
+        bool deterministic = true;
+        constexpr std::uint64_t kSamples = 400'000U;
+        for (std::uint64_t index = 0U; index < kSamples; ++index) {
+            const bool keeps = PointCloudSubsetDecimationKeeps(index, keepOneIn);
+            deterministic = deterministic &&
+                keeps == PointCloudSubsetDecimationKeeps(index, keepOneIn);
+            if (keeps) {
+                ++kept;
+                run = 0U;
+            } else {
+                longestRun = std::max(longestRun, ++run);
+            }
+        }
+        CHECK(deterministic);
+        const double fraction =
+            static_cast<double>(kept) / static_cast<double>(kSamples);
+        CHECK(fraction == Catch::Approx(1.0 / keepOneIn).margin(0.01));
+        // A hash, not a stride: gaps vary but never grow pathologically.
+        CHECK(longestRun < 40U * keepOneIn);
+    }
+
+    const auto path = WriteSubsetFixture("decimated-subset");
+    const auto load = [&](std::uint32_t keepOneIn, unsigned threadCount) {
+        invisible_places::io::PointCloudSubsetLoadOptions options;
+        options.includePoint = [](const invisible_places::io::Float3& point) {
+            return point.x >= -1.0F;
+        };
+        options.decimationKeepOneIn = keepOneIn;
+        options.threadCount = threadCount;
+        return invisible_places::io::LoadPointCloudSubset(path, options);
+    };
+    const auto full = load(1U, 1U);
+    REQUIRE(full.success);
+    CHECK(full.includedPointCount == 5U);
+    CHECK(full.cloud.PointCount() == 5U);
+
+    const auto decimated = load(2U, 1U);
+    REQUIRE(decimated.success);
+    CHECK(decimated.includedPointCount == 5U);
+    std::vector<std::uint32_t> expected;
+    for (const std::uint32_t index : full.sourcePointIndices) {
+        if (PointCloudSubsetDecimationKeeps(index, 2U)) {
+            expected.push_back(index);
+        }
+    }
+    CHECK(decimated.sourcePointIndices == expected);
+    CHECK(decimated.cloud.PointCount() == expected.size());
+    const auto parallel = load(2U, 3U);
+    REQUIRE(parallel.success);
+    CHECK(parallel.includedPointCount == decimated.includedPointCount);
+    CHECK(parallel.sourcePointIndices == decimated.sourcePointIndices);
+}
+
+TEST_CASE(
     "Filtered PLY loading and indexed field gathering are cancellable",
     "[pointcloud][linked-hq][io]") {
     const auto path = WriteSubsetFixture("cancellable-streams");
