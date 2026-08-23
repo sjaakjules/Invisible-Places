@@ -1871,6 +1871,11 @@ struct TimingColouriseSettingsClipDragState {
     float mouseStartX = 0.0F;
     float grabOffsetPixels = 0.0F;
     invisible_places::timing::TimingColouriseSettingsKeySpan sourceSpan{};
+    // Set only while the overview is in the linked whole-loop lens. The
+    // drag then moves an unwrapped {start, length} around the loop and
+    // applies the cyclic transform, so the clip can pass loop zero.
+    std::optional<invisible_places::timing::TimingColouriseCyclicSettingsKeySpan>
+        cyclicSourceSpan;
     invisible_places::timing::TimingColouriseEffect originalEffect{};
     bool moved = false;
 };
@@ -83629,6 +83634,44 @@ struct AnimationTimelineCoordinateContext {
         if (authoredEnd - authoredStart >= 1.0F - kIntervalTolerance) {
             return {{0.0F, 1.0F}};
         }
+        return CyclicAuthoredIntervalToViewFractions(
+            authoredStart,
+            authoredEnd);
+    }
+
+    // Like AuthoredIntervalToViewFractions but the interval runs forward
+    // from authoredStart for `forwardLength` cycles, so a settings clip that
+    // straddles loop zero (start 0.90, length 0.15) is drawn as one piece
+    // rather than being swapped into its 0.05..0.90 complement.
+    [[nodiscard]] std::vector<std::pair<float, float>>
+    AuthoredForwardIntervalToViewFractions(
+        float authoredStart,
+        float forwardLength) const {
+        if (!linkedCyclic) {
+            return AuthoredIntervalToViewFractions(
+                authoredStart,
+                authoredStart + forwardLength);
+        }
+        constexpr float kIntervalTolerance = 1.0e-6F;
+        if (forwardLength >= 1.0F - kIntervalTolerance) {
+            return {{0.0F, 1.0F}};
+        }
+        const float start = invisible_places::timing::
+            WrapTimingColouriseLoopPosition(authoredStart);
+        return CyclicAuthoredIntervalToViewFractions(
+            start,
+            invisible_places::timing::WrapTimingColouriseLoopPosition(
+                start + std::max(forwardLength, 0.0F)));
+    }
+
+    // Cyclic branch shared by the two interval helpers: the interval is the
+    // forward arc from authoredStart to authoredEnd, which may cross loop
+    // zero. Callers have already handled the full-loop case.
+    [[nodiscard]] std::vector<std::pair<float, float>>
+    CyclicAuthoredIntervalToViewFractions(
+        float authoredStart,
+        float authoredEnd) const {
+        constexpr float kIntervalTolerance = 1.0e-6F;
         const auto domain = invisible_places::timing::
             kLinkedSignedCyclicTimelineViewDomain;
         const float displayStart = AuthoredToDisplay(authoredStart);
@@ -92077,6 +92120,16 @@ void DrawTimingKeyLaneGroup(
                 0.0F,
                 1.0F));
     };
+    // Unwrapped display position for measuring drag deltas: positionForX
+    // wraps to the canonical phase, so a cursor crossing loop zero in the
+    // linked whole-loop lens would read as a ~one-cycle jump.
+    const auto displayPositionForX = [&](float x) {
+        return timelineCoordinates.ViewFractionToUnwrappedDisplay(
+            std::clamp(
+                (x - minimum.x) / width,
+                0.0F,
+                1.0F));
+    };
     const auto mouse = ImGui::GetIO().MousePos;
     const float mouseX = mouse.x;
     float nearestDistance =
@@ -92884,15 +92937,39 @@ void DrawTimingKeyLaneGroup(
     if (dragMatches() && itemActive &&
         ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0F)) {
         const auto& drag = timings.colouriseGraphKeyDrag.value();
-        float offset =
-            positionForX(mouse.x) - positionForX(drag.mouseStartX);
-        float first = 1.0F;
-        float last = 0.0F;
-        for (const auto& handle : drag.handles) {
-            first = std::min(first, handle.position);
-            last = std::max(last, handle.position);
+        // In the linked whole-loop lens the offset is an unclamped cycle
+        // fraction and moved keys wrap around the loop; unlinked keys keep
+        // the bounded 0..1 timeline and pin at its ends.
+        const bool cyclicDrag = timelineCoordinates.linkedCyclic;
+        float offset = cyclicDrag
+            ? timelineCoordinates.AuthoredDeltaBetweenDisplayPositions(
+                  displayPositionForX(drag.mouseStartX),
+                  displayPositionForX(mouse.x))
+            : positionForX(mouse.x) - positionForX(drag.mouseStartX);
+        if (!cyclicDrag) {
+            float first = 1.0F;
+            float last = 0.0F;
+            for (const auto& handle : drag.handles) {
+                first = std::min(first, handle.position);
+                last = std::max(last, handle.position);
+            }
+            offset = std::clamp(offset, -first, 1.0F - last);
         }
-        offset = std::clamp(offset, -first, 1.0F - last);
+        const auto movedKeyPosition = [&](float position) {
+            return cyclicDrag
+                ? invisible_places::timing::
+                      WrapTimingColouriseLoopPosition(position + offset)
+                : std::clamp(position + offset, 0.0F, 1.0F);
+        };
+        // Same-lane proximity: around the loop when cyclic, so a key
+        // wrapping onto 0.0 is caught against an existing key at 1.0.
+        const auto keysCoincide = [&](float a, float b) {
+            return (cyclicDrag
+                        ? invisible_places::timing::
+                              TimingColouriseCyclicKeyDistance(a, b)
+                        : std::abs(a - b)) <=
+                   invisible_places::timing::kTimingColouriseKeyTolerance;
+        };
 
         const auto isDraggedHandle =
             [&](const TimingColouriseKeyHandle& handle) {
@@ -92933,7 +93010,9 @@ void DrawTimingKeyLaneGroup(
         bool collision = false;
         for (const auto& selected : drag.handles) {
             auto destination = selected;
-            destination.position += offset;
+            destination.position = cyclicDrag
+                ? movedKeyPosition(selected.position)
+                : selected.position + offset;
             collision = collision || std::any_of(
                 existingHandles.begin(),
                 existingHandles.end(),
@@ -92944,11 +93023,9 @@ void DrawTimingKeyLaneGroup(
                                destination.boundsParameter &&
                            existing.effectParameter ==
                                destination.effectParameter &&
-                           std::abs(
-                               existing.position -
-                               destination.position) <=
-                               invisible_places::timing::
-                                   kTimingColouriseKeyTolerance;
+                           keysCoincide(
+                               existing.position,
+                               destination.position);
                 });
         }
         if (!collision) {
@@ -92971,10 +93048,7 @@ void DrawTimingKeyLaneGroup(
                                      ? kPaletteClusterTolerance
                                      : invisible_places::timing::
                                            kTimingColouriseKeyTolerance)) {
-                            return std::clamp(
-                                selected.position + offset,
-                                0.0F,
-                                1.0F);
+                            return movedKeyPosition(selected.position);
                         }
                     }
                     return sourcePosition;
@@ -93056,8 +93130,8 @@ void DrawTimingKeyLaneGroup(
                             return key.parameter == parameter &&
                                    std::abs(
                                        key.position -
-                                       (valueDrag.handle.position +
-                                        offset)) <=
+                                       movedKeyPosition(
+                                           valueDrag.handle.position)) <=
                                        invisible_places::timing::
                                            kTimingColouriseKeyTolerance;
                         });
@@ -93078,8 +93152,8 @@ void DrawTimingKeyLaneGroup(
                             return key.parameter == parameter &&
                                    std::abs(
                                        key.position -
-                                       (valueDrag.handle.position +
-                                        offset)) <=
+                                       movedKeyPosition(
+                                           valueDrag.handle.position)) <=
                                        invisible_places::timing::
                                            kTimingColouriseKeyTolerance;
                         });
@@ -93093,26 +93167,17 @@ void DrawTimingKeyLaneGroup(
             std::vector<TimingColouriseKeyHandle> movedHandles =
                 drag.handles;
             for (auto& handle : movedHandles) {
-                handle.position = std::clamp(
-                    handle.position + offset,
-                    0.0F,
-                    1.0F);
+                handle.position = movedKeyPosition(handle.position);
             }
             auto anchor = drag.rangeAnchor;
             if (anchor.has_value() && isDraggedHandle(anchor.value())) {
-                anchor->position = std::clamp(
-                    anchor->position + offset,
-                    0.0F,
-                    1.0F);
+                anchor->position = movedKeyPosition(anchor->position);
             }
             replaceSelection(std::move(movedHandles), anchor);
             if (!drag.handles.empty()) {
                 ScrubFeatureTimelineToAuthoredPosition(
                     runtimeState,
-                    std::clamp(
-                        drag.handles.front().position + offset,
-                        0.0F,
-                        1.0F));
+                    movedKeyPosition(drag.handles.front().position));
             }
             runtimeState->previewRenderStateSignatureValid = false;
         }
@@ -98684,14 +98749,65 @@ void DrawTimingColouriseActivationOverview(
 
             auto settingsKeyPositions = invisible_places::timing::
                 TimingColouriseEffectSettingsKeyPositions(effect);
-            auto settingsSpan = invisible_places::timing::
-                TimingColouriseEffectSettingsKeySpan(effect);
+            // In the linked whole-loop lens the clip is the key cluster
+            // around the largest circular gap, carried as start plus a
+            // wrapped end (end < start when it straddles loop zero) so the
+            // derived span never flips into its complement.
+            std::optional<
+                invisible_places::timing::TimingColouriseCyclicSettingsKeySpan>
+                settingsCyclicSpan;
+            const auto deriveSettingsSpan =
+                [&](const invisible_places::timing::TimingColouriseEffect&
+                        candidate)
+                -> std::optional<
+                    invisible_places::timing::TimingColouriseSettingsKeySpan> {
+                if (!timelineCoordinates.linkedCyclic) {
+                    settingsCyclicSpan.reset();
+                    return invisible_places::timing::
+                        TimingColouriseEffectSettingsKeySpan(candidate);
+                }
+                settingsCyclicSpan = invisible_places::timing::
+                    TimingColouriseEffectCyclicSettingsKeySpan(candidate);
+                if (!settingsCyclicSpan.has_value()) {
+                    return std::nullopt;
+                }
+                return invisible_places::timing::TimingColouriseSettingsKeySpan{
+                    .start = settingsCyclicSpan->start,
+                    .end = invisible_places::timing::
+                        WrapTimingColouriseLoopPosition(
+                            settingsCyclicSpan->start +
+                            settingsCyclicSpan->length),
+                };
+            };
+            auto settingsSpan = deriveSettingsSpan(effect);
+            const auto settingsSpanIsPoint = [&]() {
+                return settingsCyclicSpan.has_value()
+                    ? settingsCyclicSpan->length <=
+                          invisible_places::timing::
+                              kTimingColouriseKeyTolerance
+                    : settingsSpan->start == settingsSpan->end;
+            };
+            const auto settingsSpanPixelSegments = [&]() {
+                if (!settingsCyclicSpan.has_value()) {
+                    return pixelSegmentsForInterval(
+                        settingsSpan->start,
+                        settingsSpan->end);
+                }
+                std::vector<std::pair<float, float>> result;
+                for (const auto& segment :
+                     timelineCoordinates.AuthoredForwardIntervalToViewFractions(
+                         settingsCyclicSpan->start,
+                         settingsCyclicSpan->length)) {
+                    result.emplace_back(
+                        trackMinimumX + trackWidth * segment.first,
+                        trackMinimumX + trackWidth * segment.second);
+                }
+                return result;
+            };
             std::optional<TimingColouriseSettingsClipDragPart>
                 hoveredSettingsPart;
             if (settingsHovered && settingsSpan.has_value()) {
-                const auto settingsSegments = pixelSegmentsForInterval(
-                    settingsSpan->start,
-                    settingsSpan->end);
+                const auto settingsSegments = settingsSpanPixelSegments();
                 const float clipStartX =
                     xForPosition(settingsSpan->start);
                 const float clipEndX =
@@ -98700,8 +98816,7 @@ void DrawTimingColouriseActivationOverview(
                     positionInView(settingsSpan->start);
                 const bool clipEndVisible =
                     positionInView(settingsSpan->end);
-                const bool pointClip =
-                    settingsSpan->start == settingsSpan->end;
+                const bool pointClip = settingsSpanIsPoint();
                 if (pointClip) {
                     if (clipStartVisible &&
                         std::abs(mouse.x - clipStartX) <= 5.0F) {
@@ -98776,6 +98891,7 @@ void DrawTimingColouriseActivationOverview(
                             .mouseStartX = mouse.x,
                             .grabOffsetPixels = mouse.x - grabbedX,
                             .sourceSpan = settingsSpan.value(),
+                            .cyclicSourceSpan = settingsCyclicSpan,
                             .originalEffect = effect,
                         };
                 }
@@ -98850,8 +98966,7 @@ void DrawTimingColouriseActivationOverview(
                     effect.activationRange = activationRange;
                     settingsKeyPositions = invisible_places::timing::
                         TimingColouriseEffectSettingsKeyPositions(effect);
-                    settingsSpan = invisible_places::timing::
-                        TimingColouriseEffectSettingsKeySpan(effect);
+                    settingsSpan = deriveSettingsSpan(effect);
                     runtimeState->previewRenderStateSignatureValid = false;
                     timings.colouriseSettingsClipDrag.reset();
                 } else if (
@@ -98866,6 +98981,84 @@ void DrawTimingColouriseActivationOverview(
                     const float delta = authoredDragDelta(
                         drag.mouseStartX - drag.grabOffsetPixels,
                         mouse.x - drag.grabOffsetPixels);
+                    if (drag.cyclicSourceSpan.has_value()) {
+                        // Whole-loop lens: the span is {start, length} with
+                        // an unclamped start, so the body slides freely
+                        // around the loop and only the length is bounded
+                        // (never empty unless it started empty, never a
+                        // full loop, which would fold the end onto the
+                        // start key).
+                        const auto cyclicSource =
+                            drag.cyclicSourceSpan.value();
+                        auto cyclicDestination = cyclicSource;
+                        const float minimumSpan = std::min(
+                            cyclicSource.length,
+                            invisible_places::timing::
+                                kTimingColouriseKeyTolerance);
+                        const float maximumSpan = std::max(
+                            minimumSpan,
+                            1.0F -
+                                invisible_places::timing::
+                                    kTimingColouriseKeyTolerance);
+                        switch (drag.part) {
+                            case TimingColouriseSettingsClipDragPart::Start: {
+                                const float end =
+                                    cyclicSource.start + cyclicSource.length;
+                                cyclicDestination.start = std::clamp(
+                                    cyclicSource.start + delta,
+                                    end - maximumSpan,
+                                    end - minimumSpan);
+                                cyclicDestination.length =
+                                    end - cyclicDestination.start;
+                                break;
+                            }
+                            case TimingColouriseSettingsClipDragPart::End:
+                                cyclicDestination.length = std::clamp(
+                                    cyclicSource.length + delta,
+                                    minimumSpan,
+                                    maximumSpan);
+                                break;
+                            case TimingColouriseSettingsClipDragPart::Body:
+                                cyclicDestination.start =
+                                    cyclicSource.start + delta;
+                                break;
+                        }
+                        const bool destinationChanged =
+                            std::abs(
+                                cyclicDestination.start -
+                                cyclicSource.start) >
+                                std::numeric_limits<float>::epsilon() ||
+                            std::abs(
+                                cyclicDestination.length -
+                                cyclicSource.length) >
+                                std::numeric_limits<float>::epsilon();
+                        if (destinationChanged || drag.moved) {
+                            auto transformed = drag.originalEffect;
+                            const bool transformedSuccessfully =
+                                !destinationChanged ||
+                                invisible_places::timing::
+                                    TransformTimingColouriseEffectSettingsKeysCyclic(
+                                        &transformed,
+                                        cyclicSource,
+                                        cyclicDestination);
+                            if (transformedSuccessfully) {
+                                const auto activationRange =
+                                    effect.activationRange;
+                                effect = std::move(transformed);
+                                effect.activationRange = activationRange;
+                                settingsKeyPositions =
+                                    invisible_places::timing::
+                                        TimingColouriseEffectSettingsKeyPositions(
+                                            effect);
+                                settingsSpan = deriveSettingsSpan(effect);
+                                drag.moved = true;
+                                runtimeState
+                                    ->previewRenderStateSignatureValid =
+                                    false;
+                            }
+                        }
+                    } else {
+                    // Unlinked: bounded 0..1 timeline, unchanged.
                     switch (drag.part) {
                         case TimingColouriseSettingsClipDragPart::Start: {
                             const float minimumSpan = std::min(
@@ -98928,12 +99121,12 @@ void DrawTimingColouriseActivationOverview(
                             settingsKeyPositions = invisible_places::timing::
                                 TimingColouriseEffectSettingsKeyPositions(
                                     effect);
-                            settingsSpan = invisible_places::timing::
-                                TimingColouriseEffectSettingsKeySpan(effect);
+                            settingsSpan = deriveSettingsSpan(effect);
                             drag.moved = true;
                             runtimeState
                                 ->previewRenderStateSignatureValid = false;
                         }
+                    }
                     }
                 }
             }
@@ -99125,8 +99318,7 @@ void DrawTimingColouriseActivationOverview(
                     xForPosition(settingsSpan->start);
                 const float clipEndX =
                     xForPosition(settingsSpan->end);
-                const bool pointClip =
-                    settingsSpan->start == settingsSpan->end;
+                const bool pointClip = settingsSpanIsPoint();
                 const ImU32 clipColour = effect.enabled
                     ? IM_COL32(226, 166, 72, 142)
                     : IM_COL32(128, 128, 128, 76);
@@ -99141,10 +99333,7 @@ void DrawTimingColouriseActivationOverview(
                             clipHandleColour);
                     }
                 } else {
-                    for (const auto& segment :
-                         pixelSegmentsForInterval(
-                             settingsSpan->start,
-                             settingsSpan->end)) {
+                    for (const auto& segment : settingsSpanPixelSegments()) {
                         drawList->AddRectFilled(
                             ImVec2{
                                 segment.first,
@@ -99382,11 +99571,15 @@ void DrawTimingColouriseActivationOverview(
                                   runtimeState->animationPanel
                                       .currentPath.value()))
                         : 0.0F;
+                const bool clipWraps =
+                    settingsCyclicSpan.has_value() &&
+                    settingsSpan->end < settingsSpan->start;
                 ImGui::SetTooltip(
-                    "%s settings clip %.4f–%.4f (%.2f–%.2f s), %zu key position%s",
+                    "%s settings clip %.4f–%.4f%s (%.2f–%.2f s), %zu key position%s",
                     effect.name.c_str(),
                     settingsSpan->start,
                     settingsSpan->end,
+                    clipWraps ? " (wraps)" : "",
                     settingsSpan->start * durationSeconds,
                     settingsSpan->end * durationSeconds,
                     settingsKeyPositions.size(),
