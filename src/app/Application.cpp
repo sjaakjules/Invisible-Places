@@ -93030,6 +93030,94 @@ void DrawTimingKeyLaneGroup(
         }
         if (!collision) {
             auto updated = drag.originalEffect;
+            // The pre-move effect the Palette Phase re-encode compares
+            // against; it must stay index-aligned with `updated`.
+            auto original = drag.originalEffect;
+            // Dragged handles merged away by the cyclic coalescing below.
+            std::vector<TimingColouriseKeyHandle> coalescedHandles;
+            // Whether any dragged key crosses loop zero: only then does the
+            // move re-order the Palette Phase accumulation around the loop.
+            // An in-loop overtake keeps the authored deltas, as unlinked
+            // drags do.
+            bool anyKeyWrapped = false;
+            if (cyclicDrag) {
+                const auto removeHandleKeys =
+                    [](invisible_places::timing::TimingColouriseEffect*
+                           target,
+                       const TimingColouriseKeyHandle& handle) {
+                        if (handle.track ==
+                            TimingColouriseKeyTrack::Palette) {
+                            (void)invisible_places::timing::
+                                RemoveTimingColourisePaletteKeysAtPosition(
+                                    target,
+                                    handle.position);
+                        } else if (
+                            handle.track ==
+                                TimingColouriseKeyTrack::Bounds &&
+                            handle.boundsParameter.has_value()) {
+                            (void)invisible_places::timing::
+                                RemoveTimingColouriseBoundsParameterKeysAtPosition(
+                                    target,
+                                    handle.boundsParameter.value(),
+                                    handle.position);
+                        } else if (handle.effectParameter.has_value()) {
+                            (void)invisible_places::timing::
+                                RemoveTimingColouriseEffectParameterKeysAtPosition(
+                                    target,
+                                    handle.effectParameter.value(),
+                                    handle.position);
+                        }
+                    };
+                // Two dragged keys of one lane that already share a cyclic
+                // instant (0.0 and 1.0 authored in the linear timeline)
+                // wrap onto the same position. The collision test above
+                // only guards against keys that are not being dragged, and
+                // Sanitize would merge the pair keeping whichever float
+                // rounding sorted last. Merge them deterministically first,
+                // keeping the linear-later key that cyclic evaluation was
+                // already showing, and drop its twin from the selection.
+                for (std::size_t left = 0U;
+                     left < drag.handles.size();
+                     ++left) {
+                    for (std::size_t right = left + 1U;
+                         right < drag.handles.size();
+                         ++right) {
+                        const auto& a = drag.handles[left];
+                        const auto& b = drag.handles[right];
+                        if (a.track != b.track ||
+                            a.boundsParameter != b.boundsParameter ||
+                            a.effectParameter != b.effectParameter ||
+                            !keysCoincide(a.position, b.position) ||
+                            std::abs(a.position - b.position) <=
+                                invisible_places::timing::
+                                    kTimingColouriseKeyTolerance) {
+                            continue;
+                        }
+                        const auto& dropped =
+                            a.position < b.position ? a : b;
+                        if (std::any_of(
+                                coalescedHandles.begin(),
+                                coalescedHandles.end(),
+                                [&](const auto& existing) {
+                                    return TimingColouriseKeyHandlesMatch(
+                                        existing,
+                                        dropped);
+                                })) {
+                            continue;
+                        }
+                        removeHandleKeys(&updated, dropped);
+                        removeHandleKeys(&original, dropped);
+                        coalescedHandles.push_back(dropped);
+                    }
+                }
+                anyKeyWrapped = std::any_of(
+                    drag.handles.begin(),
+                    drag.handles.end(),
+                    [&](const auto& handle) {
+                        const float unwrapped = handle.position + offset;
+                        return unwrapped < 0.0F || unwrapped >= 1.0F;
+                    });
+            }
             constexpr float kPaletteClusterTolerance =
                 invisible_places::timing::
                     kTimingColouriseKeyTolerance * 4.0F;
@@ -93087,13 +93175,13 @@ void DrawTimingKeyLaneGroup(
                     std::optional{key.parameter},
                     key.position);
             }
-            if (cyclicDrag) {
+            if (anyKeyWrapped) {
                 // Keys that wrapped past loop zero re-order the Palette
                 // Phase accumulation; keep each key on the phase it had so
                 // the drag retimes the animation instead of re-shaping it.
                 invisible_places::timing::
                     PreserveTimingColourisePalettePhaseTargetsAfterMove(
-                        drag.originalEffect,
+                        original,
                         &updated);
             }
 
@@ -93173,10 +93261,21 @@ void DrawTimingKeyLaneGroup(
             }
             *effect = invisible_places::timing::
                 SanitizeTimingColouriseEffect(std::move(updated));
-            std::vector<TimingColouriseKeyHandle> movedHandles =
-                drag.handles;
-            for (auto& handle : movedHandles) {
-                handle.position = movedKeyPosition(handle.position);
+            std::vector<TimingColouriseKeyHandle> movedHandles;
+            for (const auto& handle : drag.handles) {
+                if (std::any_of(
+                        coalescedHandles.begin(),
+                        coalescedHandles.end(),
+                        [&](const auto& dropped) {
+                            return TimingColouriseKeyHandlesMatch(
+                                dropped,
+                                handle);
+                        })) {
+                    continue;
+                }
+                auto moved = handle;
+                moved.position = movedKeyPosition(handle.position);
+                movedHandles.push_back(moved);
             }
             auto anchor = drag.rangeAnchor;
             if (anchor.has_value() && isDraggedHandle(anchor.value())) {
