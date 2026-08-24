@@ -4,7 +4,7 @@
 
 The active Water workflow exposes four rendering tabs:
 
-- **Shoreline**: a separate SAND-role point-cloud shader effect that uses the sand cloud itself to simulate waves washing toward and away from the beach boundary.
+- **Shoreline**: a separate SAND-role point-cloud shader effect that uses the sand cloud itself to simulate waves washing toward and away from the beach boundary. A standing-water gap-fill layer (a role-less `*-WATER-*` standalone cloud such as `Site1-WATER-5mm`) takes the same centrally resolved waves, so they wash from the sand across the reconstructed water sheet in the viewport and in exports.
 - **Seepage**: manually placed surface nodes that select slope-aware downstream routes and a narrow upstream wick over connected ROCK/VEG cache cells, producing persistent dampness, angle-dependent glints, and optional short wetting trickles without generating a stream.
 - **Rain**: camera-aware GPU falling particles that slow and squish against averaged cache normals before collision and can drive three impact effects — Rings and irregular Wetness (both from every ROCK or SAND ground impact, each on its own timing, Wetness running further downhill the steeper the surface) and descending Droplets streams (from VEG impacts) — each shading every cloud's points inside its own height band, with Light Mist, Rain, and Heavy Downpour intensities.
 - **Flow**: downhill emitter paths or manually authored open splines feeding generated world-aligned stream surfels for artist-directed small streams.
