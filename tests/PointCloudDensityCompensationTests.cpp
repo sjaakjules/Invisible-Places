@@ -276,6 +276,13 @@ TEST_CASE("Density compensation resolves spacing and count-aware coverage", "[po
     const auto missingCounts = ResolvePointCloudDensityCompensation(0.005F, 0U, 0.001F, 1000U);
     CHECK(missingCounts.footprintScale == Catch::Approx(5.0F));
     CHECK(missingCounts.coverageCorrection == Catch::Approx(1.0F));
+
+    // Standalone spaced clouds (no scene bundle, e.g. Site1-WATER-5mm) have
+    // no sibling reference at all: spacing-only compensation must still cover
+    // the authored pitch under the ideal-lattice assumption.
+    const auto standaloneFiveMillimeter = ResolvePointCloudDensityCompensation(0.005F, 0U, 0.0F, 0U);
+    CHECK(standaloneFiveMillimeter.footprintScale == Catch::Approx(5.0F));
+    CHECK(standaloneFiveMillimeter.coverageCorrection == Catch::Approx(1.0F));
 }
 
 TEST_CASE("Density compensation preserves reference coverage without shrinking the footprint", "[pointcloud][density]") {

@@ -9800,9 +9800,36 @@ std::string NormalizeSceneRoleName(std::string_view role);
 PointCloudDensityCompensation ResolveSessionDensityCompensation(
     const PreviewRuntimeState& runtimeState,
     const PreviewLayerSession& session) {
-    if (!IsSceneGroupedPointCloud(session) ||
-        (!session.committedDisplaySource &&
-         !IsLinkedHqBaselineSession(runtimeState, session))) {
+    if (!IsSceneGroupedPointCloud(session)) {
+        // Standalone (role-less) spaced clouds -- e.g. the generated
+        // Site1-WATER-5mm gap fill -- belong to no display bundle, so density
+        // switching never swaps them for a finer variant: they render at
+        // their authored pitch beside the coarse live bundles and beside the
+        // fine full-density export sources alike. Whenever such a cloud
+        // declares a spacing token coarser than the canonical 1 mm baseline,
+        // give it the same spacing-only footprint compensation a bundled
+        // coarse layer would receive; there is no sibling cloud to derive a
+        // coverage correction from, so the ideal-lattice assumption applies.
+        // Generated water overlays keep identity compensation: their sprite
+        // sizing carries water-content semantics of its own.
+        if (session.kind != LayerKind::PointCloud ||
+            IsGeneratedWaterOverlaySession(session)) {
+            return {};
+        }
+        const float standaloneSpacing = session.inferredPointSpacingMeters > 0.0F
+                                            ? session.inferredPointSpacingMeters
+                                            : EffectivePointSpacingMeters(session);
+        if (!std::isfinite(standaloneSpacing) || standaloneSpacing <= 0.0015F) {
+            return {};
+        }
+        return invisible_places::renderer::pointcloud::ResolvePointCloudDensityCompensation(
+            standaloneSpacing,
+            0U,
+            0.0F,
+            0U);
+    }
+    if (!session.committedDisplaySource &&
+        !IsLinkedHqBaselineSession(runtimeState, session)) {
         return {};
     }
 
