@@ -120406,6 +120406,9 @@ int Application::Run(ApplicationRunOptions options) const {
             std::cerr << "- " << issue.filePath.string() << ": " << issue.message << "\n";
         }
         if (options.backgroundRenderWorker.has_value()) {
+            // A headless render must not proceed on a partially readable
+            // catalog: it would silently render without the affected
+            // layers. Interactive sessions instead continue below.
             const auto& worker = options.backgroundRenderWorker.value();
             const auto statusPath = worker.statusPath.empty()
                                         ? BackgroundRenderStatusPath(
@@ -120422,8 +120425,20 @@ int Application::Run(ApplicationRunOptions options) const {
                 worker.setupPath,
                 RenderSetupStatus::Failed,
                 failure);
+            return 2;
         }
-        return 2;
+        if (assetCatalog.pointClouds.empty() &&
+            assetCatalog.gaussianSplats.empty()) {
+            // Nothing usable was discovered at all - the session could only
+            // show an empty viewport, so the hard exit stays for this case.
+            return 2;
+        }
+        // One unreadable file (a still-hydrating OneDrive placeholder, a
+        // revoked folder permission, a corrupt local PLY) used to abort the
+        // whole launch. The affected assets are simply absent from the
+        // catalog; everything else keeps working and the issue list is
+        // surfaced in-app below.
+        std::cerr << "Continuing without the affected files.\n";
     }
 
     const bool backgroundWorker =
@@ -120515,6 +120530,26 @@ int Application::Run(ApplicationRunOptions options) const {
     }
 
     PreviewRuntimeState runtimeState;
+    if (!assetCatalog.issues.empty()) {
+        std::string issueSummary =
+            std::to_string(assetCatalog.issues.size()) +
+            " data file(s) could not be read and were skipped:";
+        constexpr std::size_t kMaximumListedIssues = 3U;
+        for (std::size_t index = 0;
+             index < assetCatalog.issues.size() &&
+             index < kMaximumListedIssues;
+             ++index) {
+            issueSummary +=
+                " " +
+                assetCatalog.issues[index].filePath.filename().string() +
+                ";";
+        }
+        if (assetCatalog.issues.size() > kMaximumListedIssues) {
+            issueSummary += " ...;";
+        }
+        issueSummary += " see the launch log for the full list.";
+        runtimeState.errorMessage = std::move(issueSummary);
+    }
     runtimeState.dataRoot = dataRoot_;
     runtimeState.localSavedRoot =
         invisible_places::app::workspace::LocalSavedDirectory(
