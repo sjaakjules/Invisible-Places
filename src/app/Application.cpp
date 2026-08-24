@@ -7239,6 +7239,8 @@ bool PointStylesEqualForSelection(
 }
 
 bool IsGeneratedWaterOverlaySession(const PreviewLayerSession& session);
+bool IsWaterFillPointCloudSession(const PreviewLayerSession& session);
+bool ShorelineWaveEligibleSession(const PreviewLayerSession& session);
 bool IsInactiveLegacyWaterOverlaySession(
     const PreviewLayerSession& session);
 bool IsGeneratedWaterFlowOverlaySession(const PreviewLayerSession& session);
@@ -10251,6 +10253,13 @@ std::vector<PreviewLayerSession> BuildSessions(const invisible_places::io::Asset
         session.pointStyle.colorMode =
             session.hasSourceRgb ? PointCloudColorMode::SourceRgb : PointCloudColorMode::SolidColor;
         EnsurePointVisuals(&session);
+        if (IsWaterFillPointCloudSession(session)) {
+            // A standing-water gap fill follows its scene group: default to
+            // visible so the companion auto-load in CommitSceneDisplaySwitch
+            // shows it with the scene until the user or a project layer
+            // record says otherwise.
+            session.visible = true;
+        }
         sessions.push_back(std::move(session));
     }
 
@@ -10436,6 +10445,51 @@ bool IsGeneratedWaterOverlaySession(const PreviewLayerSession& session) {
            stem.ends_with("-WaterFlow") ||
            IsGeneratedWaterFlowTrailOverlayStem(stem) ||
            IsGeneratedWaterDynamicMeshTrailOverlayStem(stem);
+}
+
+bool IsWaterFillPointCloudSession(const PreviewLayerSession& session) {
+    if (session.kind != LayerKind::PointCloud ||
+        IsSceneGroupedPointCloud(session) ||
+        IsGeneratedWaterOverlaySession(session)) {
+        return false;
+    }
+    // A standing-water gap fill (for example Site1-WATER-5mm.ply) carries a
+    // delimiter-bounded WATER token in its stem, mirroring the discovery
+    // role tokens. Scene-grouped and generated water overlay sessions never
+    // qualify, and camel-case overlay stems such as "-WaterPreview" have no
+    // delimiter after "Water" so they cannot match here.
+    const auto stem = session.sourcePath.stem().string();
+    std::string lowered;
+    lowered.reserve(stem.size());
+    for (const char character : stem) {
+        lowered.push_back(
+            static_cast<char>(std::tolower(static_cast<unsigned char>(character))));
+    }
+    const auto isBoundary = [](char character) {
+        return character == '-' || character == '_' || character == ' ' ||
+               character == '.';
+    };
+    std::size_t searchStart = 0U;
+    while (true) {
+        const auto found = lowered.find("water", searchStart);
+        if (found == std::string::npos) {
+            return false;
+        }
+        const auto end = found + 5U;
+        if ((found == 0U || isBoundary(lowered[found - 1U])) &&
+            (end == lowered.size() || isBoundary(lowered[end]))) {
+            return true;
+        }
+        searchStart = found + 1U;
+    }
+}
+
+// Shoreline waves ride the SAND role and any standing-water gap fill: the
+// authored waves wash from the sand across the reconstructed water sheet, so
+// both take the centrally resolved shoreline instances.
+bool ShorelineWaveEligibleSession(const PreviewLayerSession& session) {
+    return SceneRoleIs(session.sceneRole, "sand") ||
+           IsWaterFillPointCloudSession(session);
 }
 
 bool IsInactiveLegacyWaterOverlaySession(
@@ -13579,6 +13633,23 @@ bool CommitSceneDisplaySwitch(
     scene->mixedDisplay = committedMixedDisplay;
     scene->stagedReadyCount = 0U;
     scene->switchError.clear();
+    // A standing-water gap fill (Site1-WATER-5mm) behaves as part of its
+    // scene: whenever the scene display commits loaded, queue the companion
+    // load for any same-folder water fill that is still unloaded but meant
+    // to be visible. Unloading the water layer clears its visible flag, so
+    // an explicit unload — or a project record hiding it — is respected.
+    for (std::size_t companionIndex = 0;
+         companionIndex < runtimeState->sessions.size();
+         ++companionIndex) {
+        const auto& companion = runtimeState->sessions[companionIndex];
+        if (IsWaterFillPointCloudSession(companion) &&
+            companion.visible &&
+            !companion.loaded &&
+            NormalizePathKey(companion.sourcePath.parent_path()) ==
+                NormalizePathKey(scene->sourceFolder)) {
+            QueueLayerLoad(runtimeState, companionIndex, PointCloudLoadPurpose::Interactive);
+        }
+    }
     if (runtimeState->water.authoritativeWaterSurfaceSceneGroupName.empty() ||
         runtimeState->water.authoritativeWaterSurfaceSceneGroupName ==
             scene->sceneGroupName) {
@@ -25738,6 +25809,12 @@ bool ApplyProjectDocumentToRuntime(
 
         if (layerIt == document.layers.end()) {
             UnloadLayerByIndex(runtimeState, viewport, sessionIndex);
+            if (IsWaterFillPointCloudSession(session)) {
+                // The unload cleared the visible flag, but a water gap fill
+                // with no layer record keeps its follow-the-scene default so
+                // the companion auto-load can show it with its scene group.
+                session.visible = true;
+            }
             continue;
         }
 
@@ -30876,7 +30953,7 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
             &style,
             &activeWater.featureOverlay);
         ClearPointCloudStyleShoreline(&style);
-        if (SceneRoleIs(session.sceneRole, "sand") &&
+        if (ShorelineWaveEligibleSession(session) &&
             !resolvedShorelines.empty()) {
             invisible_places::renderer::pointcloud::
                 ApplyPointCloudShorelineWaveSettings(
@@ -30979,7 +31056,7 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
                  return WaterSurfaceRole::None;
              }(),
              .shorelineInstancesEligible =
-                 SceneRoleIs(session.sceneRole, "sand")});
+                 ShorelineWaveEligibleSession(session)});
     }
     return layers;
 }
@@ -31939,7 +32016,7 @@ BuildAnimationExportPointCloudLayerSnapshot(
              .timingColouriseEligible =
                  IsAuthoredTimingColouriseLayer(session),
              .shorelineInstancesEligible =
-                 SceneRoleIs(session.sceneRole, "sand"),
+                 ShorelineWaveEligibleSession(session),
              .drawPointCount = static_cast<std::uint32_t>(std::min<std::uint64_t>(
                  drawPointCount,
                  std::numeric_limits<std::uint32_t>::max())),
@@ -72018,6 +72095,16 @@ void DrawLidarPanel(
                             runtimeState->sessions[sessionIndex.value()].visible = visible;
                         }
                     }
+                    // The scene checkbox also drives its companion water gap
+                    // fill; the layer's own Visible checkbox can still refine
+                    // it afterwards.
+                    for (auto& companion : runtimeState->sessions) {
+                        if (IsWaterFillPointCloudSession(companion) &&
+                            NormalizePathKey(companion.sourcePath.parent_path()) ==
+                                NormalizePathKey(scene.sourceFolder)) {
+                            companion.visible = visible;
+                        }
+                    }
                 }
                 if (!scene.displayLoaded) {
                     ImGui::EndDisabled();
@@ -105643,7 +105730,7 @@ bool PreviewLiveVisualEffectsRequireSceneRedraw(
         auto renderStyle = MakeSceneRenderStyle(runtimeState, session, session.pointStyle);
         ClearPointCloudStyleShoreline(&renderStyle);
         if (!resolvedShorelines.empty() &&
-            SceneRoleIs(session.sceneRole, "sand")) {
+            ShorelineWaveEligibleSession(session)) {
             return true;
         }
         if (!runtimeState.projectSettings.liveVisualEffects ||
@@ -105817,7 +105904,7 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                 &renderStyle,
                 &waterFrame.featureOverlay);
             ClearPointCloudStyleShoreline(&renderStyle);
-            if (SceneRoleIs(session.sceneRole, "sand") &&
+            if (ShorelineWaveEligibleSession(session) &&
                 !resolvedShorelines.empty()) {
                 invisible_places::renderer::pointcloud::
                     ApplyPointCloudShorelineWaveSettings(
@@ -105851,7 +105938,7 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                  .timingColouriseEligible =
                      IsAuthoredTimingColouriseLayer(session),
                  .shorelineInstancesEligible =
-                     SceneRoleIs(session.sceneRole, "sand"),
+                     ShorelineWaveEligibleSession(session),
                  .worldZBoundsValid = session.bounds.valid,
                  .worldMinZ = session.bounds.minimum.z,
                  .worldMaxZ = session.bounds.maximum.z,
