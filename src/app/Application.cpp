@@ -394,6 +394,13 @@ struct PersistenceState {
     std::string pointStylePresetPath;
     std::string animationDirectoryPath;
     std::vector<QueuedLayerLoad> queuedLoads;
+    // Layer/scene-group records from the loaded project that reference files
+    // this machine does not have (another machine's local-only scene, e.g. a
+    // local Scene1 or the local gSplats). They are re-emitted verbatim by
+    // BuildProjectDocument so a save from this machine cannot strip them
+    // from the shared project. Overwritten on every project load.
+    invisible_places::serialization::UnresolvedProjectSceneEntries
+        unresolvedSceneEntries;
 };
 
 struct PreservedAnimationEdit {
@@ -24315,6 +24322,14 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
         document.layers.push_back(std::move(layerDocument));
     }
 
+    // Re-emit the loaded document's records for scenes this machine cannot
+    // resolve (and its saved selection when that named such a scene), so a
+    // save from this machine never reads as a deletion of another machine's
+    // local-only content in the shared project's three-way merge.
+    invisible_places::serialization::RestoreUnresolvedProjectSceneEntries(
+        &document,
+        runtimeState.persistence.unresolvedSceneEntries);
+
     return document;
 }
 
@@ -25602,6 +25617,33 @@ bool ApplyProjectDocumentToRuntime(
     }
     EnsureCameraShotSelections(&runtimeState->cameraPanel, runtimeState->cameraShots.size());
     runtimeState->persistence.queuedLoads.clear();
+    // Records this machine cannot resolve are split off before the apply
+    // loops (which silently skip them) so the next save preserves them; a
+    // shared project legitimately references scenes that exist on only one
+    // machine.
+    runtimeState->persistence.unresolvedSceneEntries =
+        invisible_places::serialization::ExtractUnresolvedProjectSceneEntries(
+            document,
+            [&](const invisible_places::serialization::ProjectLayerDocument&
+                    layer) {
+                return std::any_of(
+                    runtimeState->sessions.begin(),
+                    runtimeState->sessions.end(),
+                    [&](const PreviewLayerSession& session) {
+                        return PathsReferToSameLocation(
+                            layer.sourcePath,
+                            session.sourcePath);
+                    });
+            },
+            [&](const invisible_places::serialization::
+                    ScenePointCloudGroupDocument& group) {
+                return std::any_of(
+                    runtimeState->pointCloudScenes.begin(),
+                    runtimeState->pointCloudScenes.end(),
+                    [&](const ScenePointCloudRuntime& scene) {
+                        return scene.sceneGroupName == group.sceneGroupName;
+                    });
+            });
     const bool hasProjectCamera = document.cameraState.has_value();
     bool requestedLoadedLayer = false;
 
@@ -25783,6 +25825,29 @@ bool ApplyProjectDocumentToRuntime(
     }
     runtimeState->statusMessage =
         "Loaded project with " + FormatPointCount(document.layers.size()) + " layer settings.";
+    if (const auto& unresolved =
+            runtimeState->persistence.unresolvedSceneEntries;
+        !unresolved.Empty()) {
+        std::string unavailableGroups;
+        for (const auto& group : unresolved.scenePointCloudGroups) {
+            if (!unavailableGroups.empty()) {
+                unavailableGroups += ", ";
+            }
+            unavailableGroups += group.sceneGroupName;
+        }
+        runtimeState->statusMessage +=
+            " " + std::to_string(unresolved.layers.size()) +
+            " layer(s) reference files not on this machine" +
+            (unavailableGroups.empty()
+                 ? std::string{}
+                 : " (scene " + unavailableGroups + ")") +
+            "; they stay in the project and load where their files exist.";
+        if (!unresolved.activeSceneGroupName.empty()) {
+            runtimeState->statusMessage +=
+                " Active scene " + unresolved.activeSceneGroupName +
+                " is unavailable here; showing the available scenes instead.";
+        }
+    }
     if (restoredActiveAnimation) {
         runtimeState->statusMessage +=
             " Restored active animation " +

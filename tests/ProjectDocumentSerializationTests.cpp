@@ -4360,3 +4360,129 @@ TEST_CASE("Animation default live-view window size round-trips and remains unset
   CHECK(legacy->defaultLiveViewWindowWidth == 0U);
   CHECK(legacy->defaultLiveViewWindowHeight == 0U);
 }
+
+TEST_CASE("Unresolved scene entries survive a load-save round trip",
+          "[serialization][project][unresolved-scenes]") {
+  using invisible_places::serialization::ExtractUnresolvedProjectSceneEntries;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::ProjectLayerDocument;
+  using invisible_places::serialization::RestoreUnresolvedProjectSceneEntries;
+  using invisible_places::serialization::ScenePointVisualStateDocument;
+
+  // A shared project referencing one machine-local scene (Scene1) plus the
+  // shared Scene3. On a machine without the Scene1 files the runtime can
+  // resolve only Scene3, and its rebuilt document must still carry Scene1.
+  ProjectDocument loaded;
+  ProjectLayerDocument scene3Layer;
+  scene3Layer.sourcePath = "Data/Scene3/Site3-ROCK-1mm.ply";
+  scene3Layer.sceneGroupName = "Scene3";
+  ProjectLayerDocument scene1Layer;
+  scene1Layer.sourcePath = "Data/Scene1/Site1-ROCK-1mm.ply";
+  scene1Layer.sceneGroupName = "Scene1";
+  scene1Layer.loaded = true;
+  scene1Layer.visible = true;
+  ProjectLayerDocument localSplat;
+  localSplat.kind =
+      invisible_places::serialization::SerializedLayerKind::GaussianSplat;
+  localSplat.sourcePath = "Data/gSplats/gSplat-Site3-1.ply";
+  loaded.layers = {scene3Layer, scene1Layer, localSplat};
+
+  ScenePointCloudGroupDocument scene3Group;
+  scene3Group.sceneGroupName = "Scene3";
+  ScenePointCloudGroupDocument scene1Group;
+  scene1Group.sceneGroupName = "Scene1";
+  scene1Group.displayLoaded = true;
+  scene1Group.displaySpacingMeters = 0.005F;
+  loaded.scenePointCloudGroups = {scene3Group, scene1Group};
+
+  loaded.activeSceneGroupName = "Scene1";
+  loaded.selectedLayerPath = scene1Layer.sourcePath;
+
+  const auto layerResolves = [](const ProjectLayerDocument &layer) {
+    return layer.sceneGroupName == "Scene3";
+  };
+  const auto groupResolves = [](const ScenePointCloudGroupDocument &group) {
+    return group.sceneGroupName == "Scene3";
+  };
+
+  const auto unresolved = ExtractUnresolvedProjectSceneEntries(
+      loaded, layerResolves, groupResolves);
+  REQUIRE(unresolved.layers.size() == 2U);
+  CHECK(unresolved.layers[0].sceneGroupName == "Scene1");
+  CHECK(unresolved.layers[0].loaded);
+  CHECK(unresolved.layers[1].kind ==
+        invisible_places::serialization::SerializedLayerKind::GaussianSplat);
+  REQUIRE(unresolved.scenePointCloudGroups.size() == 1U);
+  CHECK(unresolved.scenePointCloudGroups[0].sceneGroupName == "Scene1");
+  CHECK(unresolved.scenePointCloudGroups[0].displayLoaded);
+  CHECK(unresolved.activeSceneGroupName == "Scene1");
+  CHECK(unresolved.selectedLayerPath == scene1Layer.sourcePath);
+  CHECK_FALSE(unresolved.Empty());
+
+  SECTION("restore appends the preserved records and selection") {
+    // The rebuilt document only contains what this machine resolved, and its
+    // selection reflects whichever scene the runtime landed on.
+    ProjectDocument rebuilt;
+    rebuilt.layers = {scene3Layer};
+    rebuilt.scenePointCloudGroups = {scene3Group};
+    rebuilt.activeSceneGroupName = "Scene3";
+    rebuilt.selectedLayerPath = scene3Layer.sourcePath;
+
+    RestoreUnresolvedProjectSceneEntries(&rebuilt, unresolved);
+
+    REQUIRE(rebuilt.layers.size() == 3U);
+    CHECK(rebuilt.layers[1].sourcePath == scene1Layer.sourcePath);
+    CHECK(rebuilt.layers[1].loaded);
+    CHECK(rebuilt.layers[2].sourcePath == localSplat.sourcePath);
+    REQUIRE(rebuilt.scenePointCloudGroups.size() == 2U);
+    CHECK(rebuilt.scenePointCloudGroups[1].sceneGroupName == "Scene1");
+    // The authoring machine's active scene is not rewritten by a machine
+    // that cannot even present it.
+    CHECK(rebuilt.activeSceneGroupName == "Scene1");
+    CHECK(rebuilt.selectedLayerPath == scene1Layer.sourcePath);
+  }
+
+  SECTION("a scene the rebuild already emitted is runtime-owned") {
+    ProjectDocument rebuilt;
+    ProjectLayerDocument freshScene1 = scene1Layer;
+    freshScene1.visible = false;
+    rebuilt.layers = {scene3Layer, freshScene1};
+    ScenePointCloudGroupDocument freshGroup = scene1Group;
+    freshGroup.displayLoaded = false;
+    rebuilt.scenePointCloudGroups = {scene3Group, freshGroup};
+
+    RestoreUnresolvedProjectSceneEntries(&rebuilt, unresolved);
+
+    REQUIRE(rebuilt.layers.size() == 3U);
+    CHECK_FALSE(rebuilt.layers[1].visible);
+    REQUIRE(rebuilt.scenePointCloudGroups.size() == 2U);
+    CHECK_FALSE(rebuilt.scenePointCloudGroups[1].displayLoaded);
+  }
+
+  SECTION("an available active scene keeps runtime selection ownership") {
+    ProjectDocument available = loaded;
+    available.activeSceneGroupName = "Scene3";
+    available.selectedLayerPath = scene3Layer.sourcePath;
+    const auto stillUnresolved = ExtractUnresolvedProjectSceneEntries(
+        available, layerResolves, groupResolves);
+    CHECK(stillUnresolved.activeSceneGroupName.empty());
+    ProjectDocument rebuilt;
+    rebuilt.activeSceneGroupName = "Scene3";
+    RestoreUnresolvedProjectSceneEntries(&rebuilt, stillUnresolved);
+    CHECK(rebuilt.activeSceneGroupName == "Scene3");
+  }
+
+  SECTION("preserved layers keep scene visual states across the prune") {
+    ProjectDocument rebuilt;
+    rebuilt.layers = {scene3Layer};
+    RestoreUnresolvedProjectSceneEntries(&rebuilt, unresolved);
+    ScenePointVisualStateDocument scene1State;
+    scene1State.sceneGroupName = "Scene1";
+    ScenePointVisualStateDocument scene3State;
+    scene3State.sceneGroupName = "Scene3";
+    rebuilt.sceneVisualStates = {scene1State, scene3State};
+    invisible_places::serialization::PruneSceneVisualStatesToKnownSceneGroups(
+        &rebuilt);
+    REQUIRE(rebuilt.sceneVisualStates.size() == 2U);
+  }
+}

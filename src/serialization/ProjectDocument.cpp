@@ -1422,6 +1422,11 @@ void UpsertSceneVisualStateDocument(
     }
 }
 
+}  // namespace
+
+// Public (declared in ProjectDocument.hpp) so tests can assert that layers
+// preserved for another machine's local-only scene keep that scene's visual
+// states out of this prune.
 void PruneSceneVisualStatesToKnownSceneGroups(ProjectDocument* document) {
     if (document == nullptr || document->sceneVisualStates.empty()) {
         return;
@@ -1448,6 +1453,8 @@ void PruneSceneVisualStatesToKnownSceneGroups(ProjectDocument* document) {
             }),
         document->sceneVisualStates.end());
 }
+
+namespace {
 
 bool SceneGroupHasName(std::string_view sceneGroupName, std::string_view expected) {
     return TrimAsciiWhitespace(std::string{sceneGroupName}) == expected;
@@ -1935,6 +1942,74 @@ bool SerializedPathsMatch(const std::filesystem::path &left,
   return left.lexically_normal().generic_string() ==
          right.lexically_normal().generic_string();
 }
+}  // namespace
+
+UnresolvedProjectSceneEntries ExtractUnresolvedProjectSceneEntries(
+    const ProjectDocument &document,
+    const std::function<bool(const ProjectLayerDocument &)> &layerResolves,
+    const std::function<bool(const ScenePointCloudGroupDocument &)>
+        &groupResolves) {
+  UnresolvedProjectSceneEntries unresolved;
+  for (const auto &layer : document.layers) {
+    if (!layerResolves(layer)) {
+      unresolved.layers.push_back(layer);
+    }
+  }
+  for (const auto &group : document.scenePointCloudGroups) {
+    if (!groupResolves(group)) {
+      unresolved.scenePointCloudGroups.push_back(group);
+    }
+  }
+  // The saved selection is preserved only when the active scene group itself
+  // is one of the unavailable groups; an available active scene remains
+  // runtime-owned as before.
+  if (!document.activeSceneGroupName.empty() &&
+      std::any_of(unresolved.scenePointCloudGroups.begin(),
+                  unresolved.scenePointCloudGroups.end(),
+                  [&](const ScenePointCloudGroupDocument &group) {
+                    return group.sceneGroupName ==
+                           document.activeSceneGroupName;
+                  })) {
+    unresolved.activeSceneGroupName = document.activeSceneGroupName;
+    unresolved.selectedLayerPath = document.selectedLayerPath;
+  }
+  return unresolved;
+}
+
+void RestoreUnresolvedProjectSceneEntries(
+    ProjectDocument *document,
+    const UnresolvedProjectSceneEntries &unresolved) {
+  if (document == nullptr || unresolved.Empty()) {
+    return;
+  }
+  for (const auto &layer : unresolved.layers) {
+    const bool alreadyEmitted = std::any_of(
+        document->layers.begin(), document->layers.end(),
+        [&](const ProjectLayerDocument &existing) {
+          return SerializedPathsMatch(existing.sourcePath, layer.sourcePath);
+        });
+    if (!alreadyEmitted) {
+      document->layers.push_back(layer);
+    }
+  }
+  for (const auto &group : unresolved.scenePointCloudGroups) {
+    const bool alreadyEmitted = std::any_of(
+        document->scenePointCloudGroups.begin(),
+        document->scenePointCloudGroups.end(),
+        [&](const ScenePointCloudGroupDocument &existing) {
+          return existing.sceneGroupName == group.sceneGroupName;
+        });
+    if (!alreadyEmitted) {
+      document->scenePointCloudGroups.push_back(group);
+    }
+  }
+  if (!unresolved.activeSceneGroupName.empty()) {
+    document->activeSceneGroupName = unresolved.activeSceneGroupName;
+    document->selectedLayerPath = unresolved.selectedLayerPath;
+  }
+}
+
+namespace {
 
 float LegacySceneLayerSpacingMeters(const ProjectLayerDocument &layer) {
   if (std::isfinite(layer.inferredPointSpacingMeters) &&

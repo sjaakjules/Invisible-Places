@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -385,6 +386,54 @@ struct StagedDocumentReplacement {
 bool CommitStagedDocumentReplacements(
     std::span<const StagedDocumentReplacement> replacements,
     std::string* errorMessage);
+
+// Project entries whose referenced files are not present on this machine.
+// One shared project serves machines whose data roots hold different subsets
+// (the OneDrive source set plus machine-local scenes such as a local-only
+// Scene1). A load splits off the layer and scene-group records it cannot
+// resolve against the discovered catalog, and the next save appends them
+// back verbatim; without this, the rebuilt document would omit them and the
+// three-way merge would read the omission as a deliberate deletion,
+// stripping another machine's local-only scenes from the shared project.
+struct UnresolvedProjectSceneEntries {
+    std::vector<ProjectLayerDocument> layers;
+    std::vector<ScenePointCloudGroupDocument> scenePointCloudGroups;
+    // The document's saved selection when it named a scene group this
+    // machine cannot present. Re-emitted on save so a session on a machine
+    // without that scene does not permanently rewrite the authoring
+    // machine's active scene.
+    std::filesystem::path selectedLayerPath;
+    std::string activeSceneGroupName;
+
+    [[nodiscard]] bool Empty() const {
+        return layers.empty() && scenePointCloudGroups.empty() &&
+               activeSceneGroupName.empty();
+    }
+};
+
+// Drops scene visual states whose scene group no longer appears in the
+// document's layers. Exposed for tests: preserved unresolved layers must
+// keep their scene groups "known" so this prune cannot cascade-delete a
+// local-only scene's authored visuals after a save on another machine.
+void PruneSceneVisualStatesToKnownSceneGroups(ProjectDocument* document);
+
+// Splits the entries the caller's predicates cannot resolve out of the
+// loaded document view. The predicates receive each stored layer / scene
+// group and return whether this machine can present it.
+[[nodiscard]] UnresolvedProjectSceneEntries
+ExtractUnresolvedProjectSceneEntries(
+    const ProjectDocument& document,
+    const std::function<bool(const ProjectLayerDocument&)>& layerResolves,
+    const std::function<bool(const ScenePointCloudGroupDocument&)>&
+        groupResolves);
+
+// Appends the preserved entries to a freshly rebuilt document, skipping any
+// identity (layer source path / scene group name) the rebuild already
+// emitted — a scene that became resolvable again is owned by the runtime.
+// A preserved active scene overrides the rebuilt selection fields.
+void RestoreUnresolvedProjectSceneEntries(
+    ProjectDocument* document,
+    const UnresolvedProjectSceneEntries& unresolved);
 
 bool SaveProjectDocument(
     const ProjectDocument& document,
