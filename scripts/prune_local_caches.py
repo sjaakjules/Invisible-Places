@@ -236,9 +236,12 @@ def main() -> int:
                         help="delete the listed items (default: dry run)")
     parser.add_argument("--only", action="append", default=None,
                         help="restrict to one or more categories")
-    parser.add_argument("--keep-latest-water", type=int, default=1,
+    parser.add_argument("--keep-latest-water", type=int, default=2,
                         help="always keep the N newest unreferenced .surfacecache "
-                             "files per directory (default 1)")
+                             "files per directory (default 2; the app finds its "
+                             "cache by signature filename, so the current one is "
+                             "normally among the newest even when no project "
+                             "manifest references it)")
     parser.add_argument("--allow-running", action="store_true",
                         help="proceed even while invisible_places is running")
     args = parser.parse_args()
