@@ -116898,6 +116898,183 @@ std::uint64_t LinkedHqTimingColouriseFingerprint(
     return fingerprint;
 }
 
+// Pins the cross-machine contract for local-only scenes: a project record
+// whose files are absent from this machine's roots (another machine's local
+// scene, e.g. Scene1 on the authoring laptop) must survive apply + rebuild
+// untouched, keep its scene visual states through the parse-time prune, and
+// keep the authoring machine's active-scene selection.
+int RunLocalScenePreservationSmoke(
+    const GuiSmokeOptions& options,
+    platform::Window* window,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    PreviewRuntimeState* runtimeState) {
+    GuiSmokeReport report{
+        .scenario = options.scenario,
+        .outputPath = (options.outputDirectory.empty()
+                           ? std::filesystem::path{"."}
+                           : options.outputDirectory) /
+            "local-scene-preservation-report.json",
+    };
+    const auto finish = [&]() {
+        if (!WriteGuiSmokeReport(report)) {
+            std::cerr << "Failed to write local-scene preservation report: "
+                      << report.outputPath.string() << "\n";
+            return 1;
+        }
+        std::cout << "Local-scene preservation report: "
+                  << report.outputPath.string() << "\n";
+        for (const auto& failure : report.failures) {
+            std::cerr << "Local-scene preservation failure: " << failure
+                      << "\n";
+        }
+        return report.Passed() ? 0 : 1;
+    };
+    if (window == nullptr || viewport == nullptr || runtimeState == nullptr) {
+        report.Fail(
+            "The preservation smoke requires a live window, viewport, and runtime.");
+        return finish();
+    }
+    const auto projectPath = runtimeState->localSavedRoot / "validation" /
+        "SampleSceneValidation_project.json";
+    std::string loadError;
+    auto project = invisible_places::serialization::LoadProjectDocument(
+        projectPath,
+        &loadError);
+    if (!project.has_value()) {
+        report.Fail(
+            "The SampleScene validation project did not load: " + loadError);
+        return finish();
+    }
+
+    // Records for a scene group that exists on no machine, standing in for
+    // another machine's local-only scene.
+    const auto ghostSourcePath =
+        runtimeState->dataRoot / "GhostScene" / "SiteG-ROCK-1mm.ply";
+    invisible_places::serialization::ProjectLayerDocument ghostLayer;
+    ghostLayer.sourcePath = ghostSourcePath;
+    ghostLayer.sceneGroupName = "GhostScene";
+    ghostLayer.sceneRole = "ROCK";
+    ghostLayer.loaded = true;
+    ghostLayer.visible = true;
+    project->layers.push_back(ghostLayer);
+    invisible_places::serialization::ScenePointCloudGroupDocument ghostGroup;
+    ghostGroup.sceneGroupName = "GhostScene";
+    ghostGroup.displayLoaded = true;
+    ghostGroup.displaySpacingMeters = 0.005F;
+    project->scenePointCloudGroups.push_back(ghostGroup);
+    invisible_places::serialization::ScenePointVisualStateDocument ghostState;
+    ghostState.sceneGroupName = "GhostScene";
+    project->sceneVisualStates.push_back(ghostState);
+    project->activeSceneGroupName = "GhostScene";
+    project->selectedLayerPath = ghostSourcePath;
+
+    if (!ApplyProjectDocumentToRuntime(project.value(), runtimeState, viewport)) {
+        report.Fail(
+            "Applying the project with an unavailable scene group failed.");
+        return finish();
+    }
+    const auto& unresolved =
+        runtimeState->persistence.unresolvedSceneEntries;
+    const bool ghostLayerHeld = std::any_of(
+        unresolved.layers.begin(),
+        unresolved.layers.end(),
+        [&](const invisible_places::serialization::ProjectLayerDocument&
+                layer) {
+            return layer.sceneGroupName == "GhostScene" && layer.loaded;
+        });
+    const bool ghostGroupHeld = std::any_of(
+        unresolved.scenePointCloudGroups.begin(),
+        unresolved.scenePointCloudGroups.end(),
+        [&](const invisible_places::serialization::
+                ScenePointCloudGroupDocument& group) {
+            return group.sceneGroupName == "GhostScene" &&
+                   group.displayLoaded;
+        });
+    if (ghostLayerHeld && ghostGroupHeld &&
+        unresolved.activeSceneGroupName == "GhostScene") {
+        report.Pass(
+            "Apply split the unavailable scene's layer, group, and active selection into the preserved set.");
+    } else {
+        report.Fail(
+            "Apply did not preserve the unavailable scene's records.");
+    }
+
+    auto rebuilt = BuildProjectDocument(*runtimeState);
+    const auto rebuiltHasGhost = [&](const ProjectDocument& document) {
+        const bool layerPresent = std::any_of(
+            document.layers.begin(),
+            document.layers.end(),
+            [&](const invisible_places::serialization::ProjectLayerDocument&
+                    layer) {
+                return layer.sceneGroupName == "GhostScene";
+            });
+        const bool groupPresent = std::any_of(
+            document.scenePointCloudGroups.begin(),
+            document.scenePointCloudGroups.end(),
+            [&](const invisible_places::serialization::
+                    ScenePointCloudGroupDocument& group) {
+                return group.sceneGroupName == "GhostScene";
+            });
+        const bool statePresent = std::any_of(
+            document.sceneVisualStates.begin(),
+            document.sceneVisualStates.end(),
+            [&](const invisible_places::serialization::
+                    ScenePointVisualStateDocument& state) {
+                return state.sceneGroupName == "GhostScene";
+            });
+        return layerPresent && groupPresent && statePresent;
+    };
+    if (rebuiltHasGhost(rebuilt) &&
+        rebuilt.activeSceneGroupName == "GhostScene") {
+        report.Pass(
+            "The rebuilt document re-emits the unavailable scene's records and active selection.");
+    } else {
+        report.Fail(
+            "The rebuilt document dropped the unavailable scene (layer/group/visual state/selection).");
+    }
+    const bool sampleSceneStillOwned = std::any_of(
+        rebuilt.scenePointCloudGroups.begin(),
+        rebuilt.scenePointCloudGroups.end(),
+        [](const invisible_places::serialization::
+               ScenePointCloudGroupDocument& group) {
+            return group.sceneGroupName == "SampleScene";
+        });
+    if (sampleSceneStillOwned) {
+        report.Pass("The resolvable SampleScene group stays runtime-owned.");
+    } else {
+        report.Fail("The rebuilt document lost the resolvable SampleScene group.");
+    }
+
+    // Full disk round trip: the parse-time visual-state prune must treat the
+    // preserved layers as known scene groups.
+    const auto roundTripPath = report.outputPath.parent_path() /
+        "local-scene-preservation-roundtrip.json";
+    std::string saveError;
+    if (!invisible_places::serialization::SaveProjectDocument(
+            rebuilt,
+            roundTripPath,
+            &saveError)) {
+        report.Fail("Round-trip save failed: " + saveError);
+        return finish();
+    }
+    const auto reloaded = invisible_places::serialization::LoadProjectDocument(
+        roundTripPath,
+        &loadError);
+    if (!reloaded.has_value()) {
+        report.Fail("Round-trip load failed: " + loadError);
+        return finish();
+    }
+    if (rebuiltHasGhost(reloaded.value()) &&
+        reloaded->activeSceneGroupName == "GhostScene") {
+        report.Pass(
+            "The unavailable scene survives a full save/parse round trip, including the visual-state prune.");
+    } else {
+        report.Fail(
+            "The save/parse round trip dropped the unavailable scene.");
+    }
+    return finish();
+}
+
 int RunLinkedHqPreviewSmoke(
     const GuiSmokeOptions& options,
     platform::Window* window,
@@ -120852,6 +121029,16 @@ int Application::Run(ApplicationRunOptions options) const {
             const auto smokeExitCode = RunScene3PatchBoundarySmoke(
                 options.guiSmoke.value(),
                 assetCatalog,
+                &window,
+                &viewport.value(),
+                &runtimeState);
+            StopBackgroundWorkForShutdown(&runtimeState);
+            viewport->WaitIdle();
+            return smokeExitCode;
+        }
+        if (options.guiSmoke->scenario == "local-scene-preservation") {
+            const auto smokeExitCode = RunLocalScenePreservationSmoke(
+                options.guiSmoke.value(),
                 &window,
                 &viewport.value(),
                 &runtimeState);
