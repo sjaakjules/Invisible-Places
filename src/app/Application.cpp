@@ -24960,6 +24960,32 @@ bool ApplyScenePointCloudGroupDocuments(
             });
         if (groupIt == document.scenePointCloudGroups.end()) {
             ReleaseScenePointCloudResidency(runtimeState, viewport, &scene);
+            // A scene the project has never recorded (a freshly added local
+            // scan such as Scene1) starts at its coarsest complete bundle:
+            // the first interactive load should cost the 5 mm set, not the
+            // multi-GB finest bundle the discovery default points at. The
+            // choice persists into the project on the next save, so this
+            // runs at most once per scene.
+            if (!scene.displayBundles.empty()) {
+                const auto coarsest = std::max_element(
+                    scene.displayBundles.begin(),
+                    scene.displayBundles.end(),
+                    [](const SceneDisplayBundleRuntime& left,
+                       const SceneDisplayBundleRuntime& right) {
+                        return left.spacingMicrometres <
+                               right.spacingMicrometres;
+                    });
+                for (std::size_t roleIndex = 0;
+                     roleIndex <
+                     invisible_places::scene::kScenePointCloudRoleCount;
+                     ++roleIndex) {
+                    scene.committedDisplaySessionIndices[roleIndex] =
+                        coarsest->sessionIndices[roleIndex];
+                }
+                scene.committedDisplaySpacingMicrometres =
+                    coarsest->spacingMicrometres;
+                scene.mixedDisplay = false;
+            }
             continue;
         }
 
