@@ -21903,12 +21903,36 @@ WaterSurfaceCacheRuntimeStatus InitialWaterSurfaceCacheStatus(
     return WaterSurfaceCacheRuntimeStatus::Missing;
 }
 
+// Whether a scene group carries the 5 mm MESH-sampled Ground cloud. Scenes
+// without one (a local-only scan such as Scene1) run without water features:
+// the user authors them with base Visuals and Visual features only, and the
+// surface-cache warmup would otherwise fall back to streaming the complete
+// 1 mm bundle on every launch once the resulting cache exceeds the 5 GiB
+// persistence ceiling.
+bool SceneHasSampledGroundSource(const ScenePointCloudRuntime& scene) {
+    return std::any_of(
+        scene.waterSurfaceSources.begin(),
+        scene.waterSurfaceSources.end(),
+        [](const invisible_places::water::WaterSurfaceSource& source) {
+            return source.role ==
+                   invisible_places::water::WaterSurfaceRole::Ground;
+        });
+}
+
+// Standalone clouds (no scene group) keep their legacy water behaviour; the
+// gate applies only to a scene group that lacks the ground cloud.
+bool ActiveSceneWaterFeaturesAvailable(PreviewRuntimeState* runtimeState) {
+    const auto* scene = ActiveWaterSurfaceScene(runtimeState);
+    return scene == nullptr || SceneHasSampledGroundSource(*scene);
+}
+
 void StartWaterSurfaceCacheWarmup(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport,
     ScenePointCloudRuntime* scene) {
     if (runtimeState == nullptr || viewport == nullptr || scene == nullptr ||
-        scene->waterSurfaceSources.empty()) {
+        scene->waterSurfaceSources.empty() ||
+        !SceneHasSampledGroundSource(*scene)) {
         return;
     }
     auto& water = runtimeState->water;
@@ -22293,6 +22317,7 @@ bool RequestWaterSurfaceCacheRebuild(PreviewRuntimeState* runtimeState) {
     auto* scene = ActiveWaterSurfaceScene(runtimeState);
     if (runtimeState == nullptr || scene == nullptr ||
         scene->waterSurfaceSources.empty() ||
+        !SceneHasSampledGroundSource(*scene) ||
         runtimeState->water.waterSurfaceCacheWarmup.worker.joinable()) {
         return false;
     }
@@ -103886,7 +103911,28 @@ void DrawControlsWindow(
         if (beginControlsTabItem("Water", ControlsTab::Water)) {
             runtimeState->activeControlsTab = ControlsTab::Water;
             drawReadOnlyNotice();
-            ImGui::BeginDisabled(renderSetupReadOnly);
+            // Scenes without the 5 mm MESH-sampled ground cloud (a local
+            // scan such as Scene1) author with Visuals only: every water
+            // feature is greyed out rather than half-working on a surface
+            // cache that would have to stream the complete 1 mm bundle.
+            const auto* activeWaterScene =
+                ActiveWaterSurfaceScene(runtimeState);
+            const bool sceneWaterUnavailable =
+                activeWaterScene != nullptr &&
+                !SceneHasSampledGroundSource(*activeWaterScene);
+            if (sceneWaterUnavailable) {
+                ImGui::TextColored(
+                    ImVec4{1.0F, 0.72F, 0.28F, 1.0F},
+                    "%s has no 5 mm MESH-sampled ground cloud; water "
+                    "features are disabled for this scene.",
+                    activeWaterScene->sceneGroupName.c_str());
+                ImGui::TextDisabled(
+                    "Base Visuals and Visual features remain fully "
+                    "available. Select a scene with a MESH-sampled cloud "
+                    "(e.g. Scene3) to author water.");
+            }
+            ImGui::BeginDisabled(
+                renderSetupReadOnly || sceneWaterUnavailable);
             DrawWaterPanel(runtimeState, viewport);
             ImGui::EndDisabled();
             ImGui::EndTabItem();
@@ -121122,7 +121168,8 @@ int Application::Run(ApplicationRunOptions options) const {
             viewport->SetLiveSceneRenderingEnabled(!pauseLiveViewport);
             viewport->SetLiveRainSimulationEnabled(
                 !runtimeState.offlineRenderJob.active &&
-                !reciprocalPanWizardActive);
+                !reciprocalPanWizardActive &&
+                ActiveSceneWaterFeaturesAvailable(&runtimeState));
             if (!pauseLiveViewport) {
                 const bool previewLiveEffectsAffectScene =
                     !reciprocalPanWizardActive &&
