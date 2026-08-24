@@ -302,7 +302,10 @@ TEST_CASE("GPU timestamp deltas respect valid-bit wrapping", "[renderer][timing]
     CHECK_FALSE(averages.PublishedActive(0U));
 }
 
-TEST_CASE("Scene3 exposes 1, 2, 3, and 5 millimetre display bundles", "[scene][density][data]") {
+TEST_CASE("Scene3 exposes 1 and 5 millimetre display bundles", "[scene][density][data]") {
+    // The 2 mm and 3 mm role variants were retired from Data/Scene3 in the
+    // 2026-08 disk cleanup; the canonical set is the shared 1 mm analysis
+    // bundle plus the 5 mm display bundle.
     const std::filesystem::path dataRoot{INVISIBLE_PLACES_DEFAULT_DATA_DIR};
     if (!std::filesystem::exists(dataRoot / "Scene3")) {
         SKIP("Scene3 fixture is not present in the local Data directory.");
@@ -312,11 +315,9 @@ TEST_CASE("Scene3 exposes 1, 2, 3, and 5 millimetre display bundles", "[scene][d
     const auto sceneCatalog = invisible_places::scene::SceneCatalog::FromDiscoveredAssets(assetCatalog);
     const auto* scene3 = sceneCatalog.FindPointCloudGroup("Scene3");
     REQUIRE(scene3 != nullptr);
-    REQUIRE(scene3->completeDisplayBundles.size() == 4U);
-    const std::array<PointSpacingMicrometres, 4U> expectedSpacings{
+    REQUIRE(scene3->completeDisplayBundles.size() == 2U);
+    const std::array<PointSpacingMicrometres, 2U> expectedSpacings{
         1'000U,
-        2'000U,
-        3'000U,
         5'000U,
     };
     for (std::size_t index = 0; index < expectedSpacings.size(); ++index) {
