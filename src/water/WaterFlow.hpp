@@ -727,6 +727,10 @@ struct WaterFeatureTimeline {
     WaterKeyedFeatureId feature{};
     std::vector<WaterKeyedSettingTrack> settings;
     std::vector<WaterFeatureSettingsClip> clips;
+    // Schema 84: when false, this water feature leaves the standing-water
+    // gap-fill layer untouched (waves, wetness, splashes all skip the
+    // generated sheet) while behaving normally on the scanned clouds.
+    bool applyToWaterFill = true;
     // Load/runtime migration marker. Older documents inferred membership
     // from non-overlapping clip spans; current documents serialize clip_id
     // on every timeline key, including zero for deliberately loose keys.
@@ -1273,6 +1277,12 @@ struct WaterFeatureTimingOverlay {
     // global permits every matching object, while assigning any object keeps
     // its category-level master available without permitting its siblings.
     [[nodiscard]] bool Allows(const WaterKeyedFeatureId& feature) const;
+    // Schema 84: features whose enabled run timelines opted out of the
+    // standing-water gap-fill layer. Consulted by the shoreline resolver
+    // and the rain-eligibility of the water-fill session.
+    std::vector<WaterKeyedFeatureId> waterFillOptOuts;
+    [[nodiscard]] bool AppliesToWaterFill(
+        const WaterKeyedFeatureId& feature) const;
 };
 
 [[nodiscard]] WaterFeatureTimingOverlay BuildWaterFeatureTimingOverlay(

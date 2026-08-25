@@ -263,6 +263,11 @@ struct TimingColouriseEffect {
     bool colouriseEnabled = true;
     bool emissiveEnabled = false;
     bool enabled = true;
+    // Schema 84: when false, this Visual Feature skips the standing-water
+    // gap-fill layer. The generated water cloud has zeroed curvature and
+    // roughness fields, so features bound to those fields would otherwise
+    // paint the whole sheet with one dominant palette entry.
+    bool applyToWaterFill = true;
     TimingColouriseActivationRange activationRange{};
     TimingColouriseFieldSelector field{};
     TimingColourisePalette basePalette{};
@@ -365,6 +370,11 @@ struct TimingTakeDefinition {
     std::string assignedRainProfileName;
     std::string baseRainProfileId;
     std::string baseRainProfileName;
+    // Schema 84: the scene group this take belongs to. Empty means the take
+    // is universal (visible under every scene) -- the built-in Authored
+    // Timing take always stays universal, and legacy takes are backfilled
+    // from their scene states on load.
+    std::string sceneGroup;
 };
 
 struct TimingTakeSceneState {

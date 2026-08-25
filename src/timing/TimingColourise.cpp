@@ -3608,6 +3608,9 @@ TimingTakeDefinition SanitizeTimingTakeDefinition(
     definition.id = NormalizeTimingTakeId(definition.id);
     if (definition.id == kAuthoredTimingTakeId) {
         definition.name = std::string{kAuthoredTimingTakeName};
+        // The built-in take is the fallback context for every scene, so it
+        // never carries a scene scope.
+        definition.sceneGroup.clear();
     } else if (definition.name.empty()) {
         definition.name = "Timing Take";
     }

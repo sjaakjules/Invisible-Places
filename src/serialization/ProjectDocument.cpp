@@ -158,6 +158,13 @@ constexpr std::uint32_t kShorelineInstancesProjectSchemaVersion = 64U;
 // Schema 83: per-scene water scene states carry shoreline instances, scene
 // groups carry a display name, and non-active scenes' states are preserved.
 constexpr std::uint32_t kSceneScopedWaterProjectSchemaVersion = 83U;
+// Schema 84: timing takes carry a scene group (legacy takes backfill from
+// their states), visual features and water-feature timelines carry an
+// apply-to-water-fill opt-out, and scene groups remember their last take.
+constexpr std::uint32_t kSceneScopedTimingTakesProjectSchemaVersion = 84U;
+static_assert(
+    kProjectDocumentSchemaVersion >=
+    kSceneScopedTimingTakesProjectSchemaVersion);
 static_assert(
     kProjectDocumentSchemaVersion >=
     kSmoothVelocityProjectSchemaVersion);
@@ -1634,6 +1641,9 @@ json SerializeScenePointCloudGroup(const ScenePointCloudGroupDocument &group) {
     groupJson["last_animation_path"] = group.lastAnimationPath.generic_string();
     groupJson["last_animation_edited"] = group.lastAnimationUsesEdited;
   }
+  if (!group.lastTimingTakeId.empty()) {
+    groupJson["last_timing_take_id"] = group.lastTimingTakeId;
+  }
   groupJson.update(json{
       {"display_spacing_meters", group.displaySpacingMeters},
       {"display_loaded", group.displayLoaded},
@@ -1659,6 +1669,7 @@ ScenePointCloudGroupDocument ParseScenePointCloudGroup(const json &groupJson) {
   }
   group.lastAnimationPath = groupJson.value("last_animation_path", std::string{});
   group.lastAnimationUsesEdited = groupJson.value("last_animation_edited", false);
+  group.lastTimingTakeId = groupJson.value("last_timing_take_id", std::string{});
   group.displaySpacingMeters = groupJson.value("display_spacing_meters", 0.0F);
   group.displayLoaded = groupJson.value("display_loaded", false);
   group.displayVisible = groupJson.value("display_visible", false);
@@ -4447,6 +4458,11 @@ json SerializeWaterFeatureTimingRun(
             }
             timelineJson["clips"] = std::move(clipsJson);
         }
+        // Applying to the water fill is the norm; only the opt-out is
+        // written so untouched documents stay byte-identical.
+        if (!timeline.applyToWaterFill) {
+            timelineJson["apply_to_water_fill"] = false;
+        }
         featuresJson.push_back(std::move(timelineJson));
     }
     json runJson{
@@ -4502,6 +4518,8 @@ invisible_places::water::WaterFeatureTimingRun ParseWaterFeatureTimingRun(
             }
             timeline.feature.kind = kind.value();
             timeline.feature.objectId = featureJson.value("object_id", 0U);
+            timeline.applyToWaterFill =
+                featureJson.value("apply_to_water_fill", true);
             if (featureJson.contains("settings") &&
                 featureJson.at("settings").is_array()) {
                 for (const auto& settingJson : featureJson.at("settings")) {
@@ -5057,7 +5075,7 @@ json SerializeTimingColouriseEffect(
              WaterScenarioInterpolationName(key.interpolation)},
         });
     }
-    return {
+    json effectJson = {
         {"id", sanitized.id},
         {"name", sanitized.name},
         // The legacy kind is still written so pre-Visual-Feature readers can
@@ -5151,6 +5169,12 @@ json SerializeTimingColouriseEffect(
              return memoryJson;
          }()},
     };
+    // Applying to the water fill is the norm; only the opt-out is written
+    // so untouched documents stay byte-identical.
+    if (!sanitized.applyToWaterFill) {
+        effectJson["apply_to_water_fill"] = false;
+    }
+    return effectJson;
 }
 
 std::optional<invisible_places::timing::TimingColouriseEffect>
@@ -5183,6 +5207,8 @@ ParseTimingColouriseEffect(
         effect.emissiveEnabled = false;
     }
     effect.id = effectJson.value("id", std::string{});
+    effect.applyToWaterFill =
+        effectJson.value("apply_to_water_fill", true);
     effect.name = effectJson.value("name", effect.name);
     effect.enabled = effectJson.value("enabled", effect.enabled);
     if (effectJson.contains("activation_range") &&
@@ -5487,7 +5513,7 @@ json SerializeTimingTakeDefinition(
     const invisible_places::timing::TimingTakeDefinition& definition) {
     const auto sanitized =
         invisible_places::timing::SanitizeTimingTakeDefinition(definition);
-    return {
+    json takeJson{
         {"id", sanitized.id},
         {"name", sanitized.name},
         {"assigned_rain_profile_id", sanitized.assignedRainProfileId},
@@ -5495,6 +5521,11 @@ json SerializeTimingTakeDefinition(
         {"base_rain_profile_id", sanitized.baseRainProfileId},
         {"base_rain_profile_name", sanitized.baseRainProfileName},
     };
+    // Universal takes (and every pre-84 document) omit the key entirely.
+    if (!sanitized.sceneGroup.empty()) {
+        takeJson["scene_group"] = sanitized.sceneGroup;
+    }
+    return takeJson;
 }
 
 invisible_places::timing::TimingTakeDefinition
@@ -5515,6 +5546,7 @@ ParseTimingTakeDefinition(const json& definitionJson) {
         .baseRainProfileName = definitionJson.value(
             "base_rain_profile_name",
             std::string{}),
+        .sceneGroup = definitionJson.value("scene_group", std::string{}),
     });
 }
 
@@ -9517,6 +9549,33 @@ std::optional<ProjectDocument> LoadProjectDocument(
             }
             document.timingTakeStates.push_back(
                 ParseTimingTakeSceneState(migratedStateJson));
+        }
+    }
+    // Schema 84 backfill: a pre-84 take carries no scene group. Derive it
+    // from the take's scene states -- exactly one authored scene means the
+    // take belongs there; none or several keeps it universal. The built-in
+    // Authored Timing take is always universal (its sanitizer clears the
+    // field).
+    for (auto& take : document.timingTakes) {
+        if (!take.sceneGroup.empty() ||
+            take.id == invisible_places::timing::kAuthoredTimingTakeId) {
+            continue;
+        }
+        std::optional<std::string> uniqueScene;
+        bool ambiguous = false;
+        for (const auto& state : document.timingTakeStates) {
+            if (state.takeId != take.id || state.sceneGroupName.empty() ||
+                state.sceneGroupName == "Default") {
+                continue;
+            }
+            if (!uniqueScene.has_value()) {
+                uniqueScene = state.sceneGroupName;
+            } else if (uniqueScene.value() != state.sceneGroupName) {
+                ambiguous = true;
+            }
+        }
+        if (uniqueScene.has_value() && !ambiguous) {
+            take.sceneGroup = uniqueScene.value();
         }
     }
     if (projectJson->contains("timing_colourise_palettes") &&

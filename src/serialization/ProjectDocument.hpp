@@ -22,7 +22,7 @@
 
 namespace invisible_places::serialization {
 
-inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 83U;
+inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 84U;
 inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 32U;
 inline constexpr std::uint32_t kWaterRainProfilesSourcesSchemaVersion = 31U;
 inline constexpr std::uint32_t kWaterOwnedShorelineProjectSchemaVersion = 66U;
@@ -152,6 +152,8 @@ struct ScenePointCloudGroupDocument {
     std::optional<invisible_places::camera::CameraState> lastCamera;
     std::filesystem::path lastAnimationPath;
     bool lastAnimationUsesEdited = false;
+    // Schema 84: the Timing Take this scene last had selected.
+    std::string lastTimingTakeId;
     float displaySpacingMeters = 0.0F;
     bool displayLoaded = false;
     bool displayVisible = false;

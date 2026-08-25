@@ -12079,6 +12079,13 @@ WaterFeatureTimingOverlay BuildWaterFeatureTimingOverlay(
             continue;
         }
         for (const auto& timeline : run.features) {
+            if (!timeline.applyToWaterFill &&
+                std::find(
+                    overlay.waterFillOptOuts.begin(),
+                    overlay.waterFillOptOuts.end(),
+                    timeline.feature) == overlay.waterFillOptOuts.end()) {
+                overlay.waterFillOptOuts.push_back(timeline.feature);
+            }
             for (const auto& setting : timeline.settings) {
                 const auto value = cyclic
                     ? EvaluateWaterKeyedSettingTrackCyclic(
@@ -12099,6 +12106,17 @@ WaterFeatureTimingOverlay BuildWaterFeatureTimingOverlay(
         }
     }
     return overlay;
+}
+
+bool WaterFeatureTimingOverlay::AppliesToWaterFill(
+    const WaterKeyedFeatureId& feature) const {
+    // One opt-out wins: if any enabled run's timeline for this feature says
+    // "leave the water sheet alone", the feature skips the water fill even
+    // when another run also keys it.
+    return std::find(
+               waterFillOptOuts.begin(),
+               waterFillOptOuts.end(),
+               feature) == waterFillOptOuts.end();
 }
 
 void ApplyWaterFeatureTimingOverlayToScenario(

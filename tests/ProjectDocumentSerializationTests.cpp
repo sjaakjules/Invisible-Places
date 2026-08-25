@@ -4361,6 +4361,156 @@ TEST_CASE("Animation default live-view window size round-trips and remains unset
   CHECK(legacy->defaultLiveViewWindowHeight == 0U);
 }
 
+TEST_CASE("Schema 84 scene-scoped takes and water opt-outs round-trip",
+          "[project][serialization][timings][scene-scope]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::timing::TimingColouriseEffect;
+  using invisible_places::timing::TimingTakeDefinition;
+  using invisible_places::timing::TimingTakeSceneState;
+  using invisible_places::water::WaterFeatureTimingRun;
+  using invisible_places::water::WaterKeyedFeatureKind;
+
+  ProjectDocument document;
+  document.projectName = "scene-scoped-takes";
+  TimingTakeDefinition pools;
+  pools.id = "timing-take-1";
+  pools.name = "Pools Surface";
+  pools.sceneGroup = "Scene3";
+  TimingTakeDefinition universal;
+  universal.id = "timing-take-2";
+  universal.name = "Everywhere";
+  document.timingTakes = {pools, universal};
+
+  TimingTakeSceneState state;
+  state.takeId = "timing-take-1";
+  state.sceneGroupName = "Scene3";
+  TimingColouriseEffect keepsWater;
+  keepsWater.id = "effect-1";
+  keepsWater.name = "On Water";
+  TimingColouriseEffect skipsWater;
+  skipsWater.id = "effect-2";
+  skipsWater.name = "Dry";
+  skipsWater.applyToWaterFill = false;
+  state.colouriseEffects = {keepsWater, skipsWater};
+  WaterFeatureTimingRun run;
+  run.id = 1U;
+  run.name = "Shoreline";
+  run.features.push_back(
+      {.feature = {.kind = WaterKeyedFeatureKind::ShorelineInstance,
+                   .objectId = 3U}});
+  run.features.push_back(
+      {.feature = {.kind = WaterKeyedFeatureKind::Rain},
+       .applyToWaterFill = false});
+  state.waterFeatureTimingRuns = {run};
+  document.timingTakeStates = {state};
+
+  TemporaryProjectFile file{"invisible_places_scene_scoped_takes.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  const auto takeScene = [&](std::string_view id) -> std::string {
+    const auto* take = invisible_places::timing::FindTimingTakeDefinition(
+        std::span<const invisible_places::timing::TimingTakeDefinition>{
+            loaded->timingTakes},
+        id);
+    REQUIRE(take != nullptr);
+    return take->sceneGroup;
+  };
+  CHECK(takeScene("timing-take-1") == "Scene3");
+  CHECK(takeScene("timing-take-2").empty());
+  REQUIRE(loaded->timingTakeStates.size() == 1U);
+  const auto& loadedState = loaded->timingTakeStates[0];
+  REQUIRE(loadedState.colouriseEffects.size() == 2U);
+  CHECK(loadedState.colouriseEffects[0].applyToWaterFill);
+  CHECK_FALSE(loadedState.colouriseEffects[1].applyToWaterFill);
+  REQUIRE(loadedState.waterFeatureTimingRuns.size() == 1U);
+  const auto& features = loadedState.waterFeatureTimingRuns[0].features;
+  REQUIRE(features.size() == 2U);
+  CHECK(features[0].applyToWaterFill);
+  CHECK_FALSE(features[1].applyToWaterFill);
+
+  // Defaults are omitted so untouched documents stay byte-identical.
+  std::ifstream savedInput{file.path};
+  REQUIRE(savedInput.is_open());
+  const auto savedJson = nlohmann::json::parse(savedInput);
+  savedInput.close();
+  CHECK_FALSE(savedJson["timing_takes"][1].contains("scene_group"));
+  const auto& stateJson = savedJson["timing_take_states"][0];
+  CHECK_FALSE(stateJson["timing_effects"][0].contains("apply_to_water_fill"));
+  CHECK(stateJson["timing_effects"][1]["apply_to_water_fill"] == false);
+  const auto& featureJson =
+      stateJson["water_feature_timing_runs"][0]["features"];
+  CHECK_FALSE(featureJson[0].contains("apply_to_water_fill"));
+  CHECK(featureJson[1]["apply_to_water_fill"] == false);
+}
+
+TEST_CASE("Legacy takes backfill their scene from single-scene states",
+          "[project][serialization][timings][scene-scope][migration]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::timing::TimingTakeDefinition;
+  using invisible_places::timing::TimingTakeSceneState;
+
+  ProjectDocument document;
+  document.projectName = "take-scene-backfill";
+  TimingTakeDefinition surface;
+  surface.id = "timing-take-1";
+  surface.name = "Surface";
+  TimingTakeDefinition both;
+  both.id = "timing-take-2";
+  both.name = "Shared";
+  TimingTakeDefinition authored;
+  authored.id = std::string{invisible_places::timing::kAuthoredTimingTakeId};
+  document.timingTakes = {surface, both, authored};
+  const auto addState = [&](const char* takeId, const char* scene) {
+    TimingTakeSceneState state;
+    state.takeId = takeId;
+    state.sceneGroupName = scene;
+    document.timingTakeStates.push_back(state);
+  };
+  addState("timing-take-1", "Scene3");
+  addState("timing-take-2", "Scene3");
+  addState("timing-take-2", "Scene1");
+  addState("authored-timing", "Scene3");
+
+  TemporaryProjectFile file{"invisible_places_take_scene_backfill.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+  // Strip the scene_group keys to model a pre-84 document on disk.
+  {
+    std::ifstream savedInput{file.path};
+    REQUIRE(savedInput.is_open());
+    auto savedJson = nlohmann::json::parse(savedInput);
+    savedInput.close();
+    for (auto& takeJson : savedJson["timing_takes"]) {
+      takeJson.erase("scene_group");
+    }
+    std::ofstream out{file.path, std::ios::trunc};
+    out << savedJson.dump(2);
+  }
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  const auto takeScene = [&](std::string_view id) -> std::string {
+    const auto* take = invisible_places::timing::FindTimingTakeDefinition(
+        std::span<const invisible_places::timing::TimingTakeDefinition>{
+            loaded->timingTakes},
+        id);
+    REQUIRE(take != nullptr);
+    return take->sceneGroup;
+  };
+  // One authored scene: the take belongs there. Two scenes: universal.
+  // The built-in Authored Timing take always stays universal.
+  CHECK(takeScene("timing-take-1") == "Scene3");
+  CHECK(takeScene("timing-take-2").empty());
+  CHECK(takeScene("authored-timing").empty());
+}
+
 TEST_CASE("Water-fill detached visual settings survive a serialize-parse round trip",
           "[serialization][project][water-fill]") {
     using invisible_places::serialization::LoadProjectDocument;
