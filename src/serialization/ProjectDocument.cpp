@@ -155,6 +155,9 @@ constexpr std::uint32_t kWaterClipWrapSourcesSchemaVersion = 32U;
 constexpr std::uint32_t kRelativePalettePhaseProjectSchemaVersion = 62U;
 constexpr std::uint32_t kFieldMapBoundsMemoryProjectSchemaVersion = 63U;
 constexpr std::uint32_t kShorelineInstancesProjectSchemaVersion = 64U;
+// Schema 83: per-scene water scene states carry shoreline instances, scene
+// groups carry a display name, and non-active scenes' states are preserved.
+constexpr std::uint32_t kSceneScopedWaterProjectSchemaVersion = 83U;
 static_assert(
     kProjectDocumentSchemaVersion >=
     kSmoothVelocityProjectSchemaVersion);
@@ -167,6 +170,9 @@ static_assert(
 static_assert(
     kProjectDocumentSchemaVersion >=
     kShorelineInstancesProjectSchemaVersion);
+static_assert(
+    kProjectDocumentSchemaVersion >=
+    kSceneScopedWaterProjectSchemaVersion);
 static_assert(
     kProjectDocumentSchemaVersion >=
     kWaterOwnedShorelineProjectSchemaVersion);
@@ -1616,6 +1622,7 @@ ParseScenePointCloudRoleSource(const json &sourceJson) {
 json SerializeScenePointCloudGroup(const ScenePointCloudGroupDocument &group) {
   json groupJson{
       {"scene_group", group.sceneGroupName},
+      {"display_name", group.displayName},
       {"display_spacing_meters", group.displaySpacingMeters},
       {"display_loaded", group.displayLoaded},
       {"display_visible", group.displayVisible},
@@ -1634,6 +1641,7 @@ json SerializeScenePointCloudGroup(const ScenePointCloudGroupDocument &group) {
 ScenePointCloudGroupDocument ParseScenePointCloudGroup(const json &groupJson) {
   ScenePointCloudGroupDocument group;
   group.sceneGroupName = groupJson.value("scene_group", std::string{});
+  group.displayName = groupJson.value("display_name", std::string{});
   group.displaySpacingMeters = groupJson.value("display_spacing_meters", 0.0F);
   group.displayLoaded = groupJson.value("display_loaded", false);
   group.displayVisible = groupJson.value("display_visible", false);
@@ -6521,6 +6529,22 @@ json SerializeWaterSceneState(const WaterSceneStateDocument& state) {
     for (const auto& node : state.seepageNodes) {
         stateJson["water_seepage_nodes"].push_back(SerializeWaterSeepageNode(node));
     }
+    if (!state.shorelineInstances.empty()) {
+        auto& instancesJson = stateJson["water_shoreline_instances"];
+        instancesJson = json::array();
+        for (const auto& instance : state.shorelineInstances) {
+            instancesJson.push_back(json{
+                {"id", instance.id},
+                {"name", instance.name},
+                {"enabled", instance.enabled},
+                {"profile_name", instance.profileName},
+                {"base_profile_name", instance.baseProfileName},
+                {"settings",
+                 SerializePointCloudShorelineWaveSettings(instance.settings)},
+            });
+        }
+        stateJson["next_shoreline_instance_id"] = state.nextShorelineInstanceId;
+    }
     if (state.pathCacheManifest.has_value()) {
         stateJson["water_path_cache_manifest"] =
             SerializeWaterPathCacheManifest(state.pathCacheManifest.value());
@@ -6542,6 +6566,28 @@ WaterSceneStateDocument ParseWaterSceneState(
         state.sceneGroupName = "Default";
     }
     state.dynamicMeshPath = stateJson.value("dynamic_mesh_path", std::string{});
+    if (stateJson.contains("water_shoreline_instances") &&
+        stateJson.at("water_shoreline_instances").is_array()) {
+        for (const auto& instanceJson : stateJson.at("water_shoreline_instances")) {
+            if (!instanceJson.is_object()) {
+                continue;
+            }
+            invisible_places::renderer::pointcloud::PointCloudShorelineInstance instance;
+            instance.id = instanceJson.value("id", 0U);
+            instance.name = instanceJson.value("name", std::string{"Shoreline"});
+            instance.enabled = instanceJson.value("enabled", true);
+            instance.profileName = instanceJson.value("profile_name", std::string{});
+            instance.baseProfileName =
+                instanceJson.value("base_profile_name", std::string{});
+            if (instanceJson.contains("settings")) {
+                instance.settings = ParsePointCloudShorelineWaveSettings(
+                    instanceJson.at("settings"));
+            }
+            state.shorelineInstances.push_back(std::move(instance));
+        }
+        state.nextShorelineInstanceId =
+            stateJson.value("next_shoreline_instance_id", 1U);
+    }
     if (stateJson.contains("water_emitters") && stateJson.at("water_emitters").is_array()) {
         for (const auto& emitterJson : stateJson.at("water_emitters")) {
             state.emitters.push_back(ParseWaterEmitter(emitterJson));

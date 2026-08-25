@@ -22,7 +22,7 @@
 
 namespace invisible_places::serialization {
 
-inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 82U;
+inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 83U;
 inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 32U;
 inline constexpr std::uint32_t kWaterRainProfilesSourcesSchemaVersion = 31U;
 inline constexpr std::uint32_t kWaterOwnedShorelineProjectSchemaVersion = 66U;
@@ -119,6 +119,12 @@ struct WaterSceneStateDocument {
     std::vector<invisible_places::water::WaterEmitter> emitters;
     std::vector<invisible_places::water::WaterManualFlowPathSource> manualFlowPaths;
     std::vector<invisible_places::water::WaterSeepageNode> seepageNodes;
+    // Schema 83: shoreline effects are scene-scoped like the other water
+    // objects; older documents leave these empty and the top-level
+    // water_shoreline_instances stay authoritative for the active scene.
+    std::vector<invisible_places::renderer::pointcloud::PointCloudShorelineInstance>
+        shorelineInstances;
+    std::uint32_t nextShorelineInstanceId = 1U;
     std::optional<invisible_places::water::WaterPathCache> pathCache;
     std::optional<WaterPathCacheManifestDocument> pathCacheManifest;
     std::filesystem::path dynamicMeshPath;
@@ -139,6 +145,8 @@ struct ScenePointCloudRoleSourceDocument {
 
 struct ScenePointCloudGroupDocument {
     std::string sceneGroupName;
+    // Schema 83: user-facing label (folder names stay the identity keys).
+    std::string displayName;
     float displaySpacingMeters = 0.0F;
     bool displayLoaded = false;
     bool displayVisible = false;

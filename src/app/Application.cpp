@@ -401,6 +401,11 @@ struct PersistenceState {
     // from the shared project. Overwritten on every project load.
     invisible_places::serialization::UnresolvedProjectSceneEntries
         unresolvedSceneEntries;
+    // Water scene states for every scene EXCEPT the active one, captured at
+    // project load and updated by the scene switcher. Re-emitted on save so
+    // switching scenes can never strip another scene's authored water.
+    std::vector<invisible_places::serialization::WaterSceneStateDocument>
+        inactiveWaterSceneStates;
 };
 
 struct PreservedAnimationEdit {
@@ -3015,6 +3020,8 @@ constexpr std::uint8_t DeferredSceneAnalysisActionBit(DeferredSceneAnalysisActio
 
 struct ScenePointCloudRuntime {
     std::string sceneGroupName;
+    // User-facing label (persisted per scene; folder name stays the key).
+    std::string displayName;
     std::filesystem::path sourceFolder;
     std::vector<WaterSurfaceSource> waterSurfaceSources;
     std::string waterSurfaceSignature;
@@ -7249,6 +7256,9 @@ bool PointStylesEqualForSelection(
 bool IsGeneratedWaterOverlaySession(const PreviewLayerSession& session);
 bool IsWaterFillPointCloudSession(const PreviewLayerSession& session);
 bool ShorelineWaveEligibleSession(const PreviewLayerSession& session);
+std::optional<std::size_t> FindWaterFillSceneSandSessionIndex(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& waterSession);
 bool IsInactiveLegacyWaterOverlaySession(
     const PreviewLayerSession& session);
 bool IsGeneratedWaterFlowOverlaySession(const PreviewLayerSession& session);
@@ -9581,6 +9591,31 @@ std::optional<std::size_t> SessionIndexForSourcePath(
     return std::nullopt;
 }
 
+// The identity of a scene stays its folder name; the label is what people
+// see. The project's site names seed as defaults until renamed.
+std::string DefaultSceneDisplayName(std::string_view sceneGroupName) {
+    if (sceneGroupName == "Scene1") {
+        return "Fossils";
+    }
+    if (sceneGroupName == "Scene3") {
+        return "Pools";
+    }
+    return std::string{sceneGroupName};
+}
+
+std::string SceneDisplayLabel(
+    const PreviewRuntimeState& runtimeState,
+    std::string_view sceneGroupName) {
+    for (const auto& scene : runtimeState.pointCloudScenes) {
+        if (scene.sceneGroupName == sceneGroupName) {
+            return scene.displayName.empty()
+                       ? DefaultSceneDisplayName(sceneGroupName)
+                       : scene.displayName;
+        }
+    }
+    return DefaultSceneDisplayName(sceneGroupName);
+}
+
 std::vector<ScenePointCloudRuntime> BuildScenePointCloudRuntimeStates(
     const invisible_places::io::AssetCatalog& assetCatalog,
     std::vector<PreviewLayerSession>* sessions) {
@@ -9594,6 +9629,7 @@ std::vector<ScenePointCloudRuntime> BuildScenePointCloudRuntimeStates(
     for (const auto& group : groups) {
         ScenePointCloudRuntime scene;
         scene.sceneGroupName = group.name;
+        scene.displayName = DefaultSceneDisplayName(group.name);
         scene.sourceFolder = group.sourceFolder;
         scene.waterSurfaceSources = invisible_places::water::SelectWaterSurfaceSources(group);
         if (const auto groundPath =
@@ -9807,7 +9843,7 @@ PointCloudStyleState MakeSceneRenderStyle(
 
 std::string NormalizeSceneRoleName(std::string_view role);
 
-PointCloudDensityCompensation ResolveSessionDensityCompensation(
+PointCloudDensityCompensation ResolveSessionDensityCompensationRaw(
     const PreviewRuntimeState& runtimeState,
     const PreviewLayerSession& session) {
     if (!IsSceneGroupedPointCloud(session)) {
@@ -9906,6 +9942,73 @@ PointCloudDensityCompensation ResolveSessionDensityCompensation(
         session.totalPrimitives,
         referenceSpacing,
         reference != nullptr ? reference->totalPrimitives : 0U);
+}
+
+// A role whose coverage correction landed on the floor has an
+// unrepresentative reference (Site1's split "1 mm" clouds are only ~10x the
+// 5 mm counts, and the shortfall differs per role). In that case the whole
+// scene's references are equally suspect, so every role shares the scene's
+// largest per-role correction -- ROCK/SAND/VEG then draw with identical
+// per-fragment alpha and the roles stay cohesive in the live view. Scene3
+// never floors (its measured corrections are 0.64/0.68/0.246), so this is a
+// no-op there.
+PointCloudDensityCompensation HarmonizeSceneCoverageCorrection(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& session,
+    PointCloudDensityCompensation compensation) {
+    constexpr float kEpsilon = 1.0e-4F;
+    if (compensation.coverageCorrection >
+        invisible_places::renderer::pointcloud::kPointCloudCoverageCorrectionFloor + kEpsilon) {
+        return compensation;
+    }
+    const auto* scene = FindScenePointCloudRuntime(runtimeState, session);
+    if (scene == nullptr) {
+        return compensation;
+    }
+    float best = compensation.coverageCorrection;
+    for (const auto siblingIndex : scene->committedDisplaySessionIndices) {
+        if (!siblingIndex.has_value() ||
+            siblingIndex.value() >= runtimeState.sessions.size()) {
+            continue;
+        }
+        const auto& sibling = runtimeState.sessions[siblingIndex.value()];
+        if (&sibling == &session) {
+            continue;
+        }
+        best = std::max(
+            best,
+            ResolveSessionDensityCompensationRaw(runtimeState, sibling).coverageCorrection);
+    }
+    compensation.coverageCorrection = std::min(1.0F, best);
+    return compensation;
+}
+
+PointCloudDensityCompensation ResolveSessionDensityCompensation(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& session) {
+    auto compensation = ResolveSessionDensityCompensationRaw(runtimeState, session);
+    if (IsSceneGroupedPointCloud(session)) {
+        return HarmonizeSceneCoverageCorrection(runtimeState, session, compensation);
+    }
+    // The water gap fill is a SAND peer: it adopts the committed SAND role's
+    // (harmonized) coverage correction so both draw with the same
+    // per-fragment alpha in the live view. Export snapshots override this to
+    // identity because exports render the finest bundle at identity coverage.
+    if (IsWaterFillPointCloudSession(session) &&
+        compensation.footprintScale > 1.0F + 1.0e-4F) {
+        if (const auto sandIndex = FindWaterFillSceneSandSessionIndex(runtimeState, session);
+            sandIndex.has_value()) {
+            const auto& sandSession = runtimeState.sessions[sandIndex.value()];
+            const auto sandCompensation = HarmonizeSceneCoverageCorrection(
+                runtimeState,
+                sandSession,
+                ResolveSessionDensityCompensationRaw(runtimeState, sandSession));
+            if (sandCompensation.coverageCorrection < 1.0F) {
+                compensation.coverageCorrection = sandCompensation.coverageCorrection;
+            }
+        }
+    }
+    return compensation;
 }
 
 std::string NormalizeSceneRoleName(std::string_view role) {
@@ -10026,6 +10129,20 @@ std::string SceneVisualDisplayName(const PreviewLayerSession& session) {
         return session.sceneGroupName.empty() ? session.displayName : session.sceneGroupName;
     }
     return session.displayName;
+}
+
+std::string SceneDisplayLabel(
+    const PreviewRuntimeState& runtimeState,
+    std::string_view sceneGroupName);
+
+// Display variant: grouped clouds show the scene's user-facing label.
+std::string SceneVisualDisplayName(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& session) {
+    if (IsSceneGroupedPointCloud(session) && !session.sceneGroupName.empty()) {
+        return SceneDisplayLabel(runtimeState, session.sceneGroupName);
+    }
+    return SceneVisualDisplayName(session);
 }
 
 bool SceneVisualGroupVisible(
@@ -10752,6 +10869,38 @@ void RecomputeWaterFillDetachedVisualSettings(
     session->waterFillDetachedVisualSettings = std::move(detached);
 }
 
+void QueueLayerLoad(
+    PreviewRuntimeState* runtimeState,
+    std::size_t sessionIndex,
+    PointCloudLoadPurpose purpose,
+    std::uint64_t generation);
+
+// Queues the companion load for every water-fill session whose scene display
+// is loaded while the fill itself is still unloaded but meant to be visible.
+// Deduped by QueueLayerLoad, so calling this from the display-commit tail and
+// after project applies is safe.
+void QueueWaterFillCompanionLoads(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    for (std::size_t index = 0; index < runtimeState->sessions.size(); ++index) {
+        const auto& session = runtimeState->sessions[index];
+        if (!IsWaterFillPointCloudSession(session) ||
+            !session.visible ||
+            session.loaded) {
+            continue;
+        }
+        for (const auto& scene : runtimeState->pointCloudScenes) {
+            if (scene.displayLoaded &&
+                NormalizePathKey(session.sourcePath.parent_path()) ==
+                    NormalizePathKey(scene.sourceFolder)) {
+                QueueLayerLoad(runtimeState, index, PointCloudLoadPurpose::Interactive, 0U);
+                break;
+            }
+        }
+    }
+}
+
 // Copies every linked setting group from the same-folder SAND session onto
 // each water-fill session. Called after visual edits, project applies, layer
 // loads, and display commits; in-memory only (linked values never persist).
@@ -11009,13 +11158,42 @@ bool AssociatedLayerPathsIntersect(
     return AssociatedLayerPathsIntersect(canonicalLeft, canonicalRight);
 }
 
+// Registered animations list only for the active scene: an entry whose
+// canonicalised associations name a different grouped scene is hidden, while
+// entries with no scene association (legacy/unassigned) show everywhere.
+bool AnimationRegistryEntryMatchesActiveScene(
+    const PreviewRuntimeState& runtimeState,
+    std::size_t fileIndex) {
+    const auto& panel = runtimeState.animationPanel;
+    if (fileIndex >= panel.availableFileAssociatedLayerPaths.size()) {
+        return true;
+    }
+    const auto activeScene = ActiveWaterTimingSceneGroupName(runtimeState.water);
+    if (activeScene.empty() || activeScene == "Default") {
+        return true;
+    }
+    auto paths = panel.availableFileAssociatedLayerPaths[fileIndex];
+    CanonicalizeAssociatedLayerPathsForSceneGroups(runtimeState, &paths);
+    bool sawScene = false;
+    for (const auto& path : paths) {
+        if (const auto sceneName = SceneGroupNameFromAssociationPath(path);
+            sceneName.has_value()) {
+            sawScene = true;
+            if (sceneName.value() == activeScene) {
+                return true;
+            }
+        }
+    }
+    return !sawScene;
+}
+
 std::string AssociationDisplayName(
     const PreviewRuntimeState& runtimeState,
     const std::filesystem::path& path) {
     const auto canonicalPath = CanonicalAssociationPathForRuntime(runtimeState, path);
     if (const auto sceneGroupName = SceneGroupNameFromAssociationPath(canonicalPath);
         sceneGroupName.has_value()) {
-        return sceneGroupName.value();
+        return SceneDisplayLabel(runtimeState, sceneGroupName.value());
     }
 
     auto name = canonicalPath.stem().string();
@@ -13935,22 +14113,10 @@ bool CommitSceneDisplaySwitch(
     scene->stagedReadyCount = 0U;
     scene->switchError.clear();
     // A standing-water gap fill (Site1-WATER-5mm) behaves as part of its
-    // scene: whenever the scene display commits loaded, queue the companion
-    // load for any same-folder water fill that is still unloaded but meant
-    // to be visible. Unloading the water layer clears its visible flag, so
-    // an explicit unload — or a project record hiding it — is respected.
-    for (std::size_t companionIndex = 0;
-         companionIndex < runtimeState->sessions.size();
-         ++companionIndex) {
-        const auto& companion = runtimeState->sessions[companionIndex];
-        if (IsWaterFillPointCloudSession(companion) &&
-            companion.visible &&
-            !companion.loaded &&
-            NormalizePathKey(companion.sourcePath.parent_path()) ==
-                NormalizePathKey(scene->sourceFolder)) {
-            QueueLayerLoad(runtimeState, companionIndex, PointCloudLoadPurpose::Interactive);
-        }
-    }
+    // scene: whenever a scene display commits loaded, queue the companion
+    // load for any same-folder water fill that is still unloaded. An
+    // explicit in-session unload clears the visible flag and is respected.
+    QueueWaterFillCompanionLoads(runtimeState);
     SyncWaterFillVisualsFromScene(runtimeState);
     if (runtimeState->water.authoritativeWaterSurfaceSceneGroupName.empty() ||
         runtimeState->water.authoritativeWaterSurfaceSceneGroupName ==
@@ -24555,9 +24721,19 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
         waterSceneState.emitters = runtimeState.water.emitters;
         waterSceneState.manualFlowPaths = runtimeState.water.manualFlowPaths;
         waterSceneState.seepageNodes = runtimeState.water.seepageNodes;
+        waterSceneState.shorelineInstances = runtimeState.water.shorelineInstances;
+        waterSceneState.nextShorelineInstanceId = runtimeState.water.nextShorelineInstanceId;
         waterSceneState.pathCache = CurrentWaterPathCacheForDocument(runtimeState);
         waterSceneState.dynamicMeshPath = runtimeState.water.dynamicMeshFlowSettings.meshPath;
+        const auto activeStateName = waterSceneState.sceneGroupName;
         document.waterSceneStates.push_back(std::move(waterSceneState));
+        // Every other scene's authored water rides along untouched, so a
+        // save while Fossils is active cannot strip Pools' nodes and paths.
+        for (const auto& inactive : runtimeState.persistence.inactiveWaterSceneStates) {
+            if (inactive.sceneGroupName != activeStateName) {
+                document.waterSceneStates.push_back(inactive);
+            }
+        }
     }
     document.waterSourceSettings = runtimeState.water.defaultSourceSettings;
     document.tempWaterSourceSettings = runtimeState.water.tempDefaultSourceSettings;
@@ -24682,6 +24858,7 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
     for (const auto& scene : runtimeState.pointCloudScenes) {
         invisible_places::serialization::ScenePointCloudGroupDocument groupDocument;
         groupDocument.sceneGroupName = scene.sceneGroupName;
+        groupDocument.displayName = scene.displayName;
         groupDocument.displaySpacingMeters =
             scene.committedDisplaySpacingMicrometres.has_value()
                 ? static_cast<float>(scene.committedDisplaySpacingMicrometres.value()) / 1'000'000.0F
@@ -25321,6 +25498,171 @@ void ReleaseScenePointCloudResidency(
     runtimeState->water.trailSurfaceIndexSupportPath.clear();
 }
 
+// ---- Exclusive scene activation (the Project panel Scene selector) -------
+
+invisible_places::serialization::WaterSceneStateDocument
+BuildActiveWaterSceneStateSnapshot(
+    const PreviewRuntimeState& runtimeState,
+    const std::string& sceneGroupName) {
+    invisible_places::serialization::WaterSceneStateDocument state;
+    state.sceneGroupName = sceneGroupName.empty() ? std::string{"Default"} : sceneGroupName;
+    state.emitters = runtimeState.water.emitters;
+    state.manualFlowPaths = runtimeState.water.manualFlowPaths;
+    state.seepageNodes = runtimeState.water.seepageNodes;
+    state.shorelineInstances = runtimeState.water.shorelineInstances;
+    state.nextShorelineInstanceId = runtimeState.water.nextShorelineInstanceId;
+    state.pathCache = CurrentWaterPathCacheForDocument(runtimeState);
+    state.dynamicMeshPath = runtimeState.water.dynamicMeshFlowSettings.meshPath;
+    return state;
+}
+
+// Swaps the scene-scoped water objects (flow sources, manual paths, seepage
+// nodes, shoreline effects) when the active scene changes: the outgoing
+// scene's authored state is stored on persistence.inactiveWaterSceneStates
+// (and re-emitted on save), the incoming scene's stored state is applied, and
+// a scene with no stored state starts empty. Global settings (rain, trail
+// defaults, scenarios, takes) stay put; timing runs and takes are already
+// keyed per scene by ActiveWaterTimingSceneGroupName.
+void SwitchActiveWaterSceneState(
+    PreviewRuntimeState* runtimeState,
+    const std::string& targetSceneGroupName) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    const auto current = ActiveWaterTimingSceneGroupName(runtimeState->water);
+    if (current == targetSceneGroupName) {
+        return;
+    }
+    auto& store = runtimeState->persistence.inactiveWaterSceneStates;
+    auto outgoing = BuildActiveWaterSceneStateSnapshot(*runtimeState, current);
+    if (const auto existing = std::find_if(
+            store.begin(), store.end(),
+            [&](const auto& state) { return state.sceneGroupName == outgoing.sceneGroupName; });
+        existing != store.end()) {
+        *existing = std::move(outgoing);
+    } else {
+        store.push_back(std::move(outgoing));
+    }
+
+    CancelWaterFlowTrailBuildJob(&runtimeState->water);
+    runtimeState->water.flowTrailSourceRequests.clear();
+    runtimeState->water.flowTrailSourceArtifacts.clear();
+
+    const auto incoming = std::find_if(
+        store.begin(), store.end(),
+        [&](const auto& state) { return state.sceneGroupName == targetSceneGroupName; });
+    if (incoming != store.end()) {
+        runtimeState->water.emitters = incoming->emitters;
+        runtimeState->water.manualFlowPaths = incoming->manualFlowPaths;
+        runtimeState->water.seepageNodes = incoming->seepageNodes;
+        runtimeState->water.shorelineInstances = incoming->shorelineInstances;
+        auto nextId = std::max(incoming->nextShorelineInstanceId, 1U);
+        for (const auto& instance : runtimeState->water.shorelineInstances) {
+            nextId = std::max(nextId, instance.id + 1U);
+        }
+        runtimeState->water.nextShorelineInstanceId = nextId;
+        store.erase(incoming);
+    } else {
+        runtimeState->water.emitters.clear();
+        runtimeState->water.manualFlowPaths.clear();
+        runtimeState->water.seepageNodes.clear();
+        runtimeState->water.shorelineInstances.clear();
+    }
+    InvalidateWaterSeepageTopology(&runtimeState->water);
+}
+
+void ActivateExclusiveScene(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    const std::string& targetSceneGroupName) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return;
+    }
+    ScenePointCloudRuntime* target = nullptr;
+    for (auto& scene : runtimeState->pointCloudScenes) {
+        if (scene.sceneGroupName == targetSceneGroupName) {
+            target = &scene;
+            break;
+        }
+    }
+    if (target == nullptr) {
+        runtimeState->errorMessage =
+            "Scene '" + targetSceneGroupName + "' is not available on this machine.";
+        return;
+    }
+
+    SwitchActiveWaterSceneState(runtimeState, target->sceneGroupName);
+    CancelWaterSurfaceCacheWarmup(&runtimeState->water);
+
+    for (auto& scene : runtimeState->pointCloudScenes) {
+        if (&scene == target) {
+            continue;
+        }
+        if (scene.displayLoaded ||
+            scene.pendingDisplaySpacingMicrometres.has_value() ||
+            scene.pendingMixedDisplay) {
+            ReleaseScenePointCloudResidency(runtimeState, viewport, &scene);
+        }
+        scene.displayVisible = false;
+        // the role-less water fill lives in the same folder but is not
+        // scene-grouped, so release it explicitly
+        for (std::size_t index = 0; index < runtimeState->sessions.size(); ++index) {
+            auto& session = runtimeState->sessions[index];
+            if (IsWaterFillPointCloudSession(session) &&
+                NormalizePathKey(session.sourcePath.parent_path()) ==
+                    NormalizePathKey(scene.sourceFolder) &&
+                (session.gpuResident || session.cpuResident)) {
+                UnloadLayerByIndex(runtimeState, viewport, index, true);
+                session.visible = true;  // keep the follow-the-scene default
+            }
+        }
+    }
+
+    runtimeState->water.authoritativeWaterSurfaceSceneGroupName = target->sceneGroupName;
+    runtimeState->water.activeWaterSurfaceSceneGroupName = target->sceneGroupName;
+    target->displayVisible = true;
+    if (!target->displayLoaded) {
+        const bool mixedLoadAvailable = target->mixedDisplay &&
+            std::all_of(
+                target->committedDisplaySessionIndices.begin(),
+                target->committedDisplaySessionIndices.end(),
+                [](const std::optional<std::size_t>& index) { return index.has_value(); });
+        if (target->committedDisplaySpacingMicrometres.has_value()) {
+            RequestSceneDisplaySwitch(
+                runtimeState, viewport, target,
+                target->committedDisplaySpacingMicrometres.value());
+        } else if (mixedLoadAvailable) {
+            RequestSceneMixedDisplayLoad(
+                runtimeState, viewport, target, target->committedDisplaySessionIndices);
+        } else if (!target->displayBundles.empty()) {
+            const auto coarsest = std::max_element(
+                target->displayBundles.begin(),
+                target->displayBundles.end(),
+                [](const auto& left, const auto& right) {
+                    return left.spacingMicrometres < right.spacingMicrometres;
+                });
+            RequestSceneDisplaySwitch(
+                runtimeState, viewport, target, coarsest->spacingMicrometres);
+        }
+    } else {
+        for (const auto sessionIndex : target->committedDisplaySessionIndices) {
+            if (sessionIndex.has_value() && sessionIndex.value() < runtimeState->sessions.size()) {
+                runtimeState->sessions[sessionIndex.value()].visible = true;
+            }
+        }
+        QueueWaterFillCompanionLoads(runtimeState);
+    }
+    QueueWaterFlowTrailRefresh(
+        runtimeState,
+        WaterOverlayRefreshPersistence::InMemoryOnly,
+        std::chrono::milliseconds{500});
+    SyncWaterFillVisualsFromScene(runtimeState);
+    runtimeState->previewRenderStateSignatureValid = false;
+    runtimeState->statusMessage =
+        "Switched to " + SceneDisplayLabel(*runtimeState, target->sceneGroupName) +
+        " (" + target->sceneGroupName + ").";
+}
+
 bool ApplyScenePointCloudGroupDocuments(
     const ProjectDocument& document,
     PreviewRuntimeState* runtimeState,
@@ -25435,6 +25777,9 @@ bool ApplyScenePointCloudGroupDocuments(
         }
 
         scene.displayVisible = groupIt->displayVisible;
+        if (!groupIt->displayName.empty()) {
+            scene.displayName = groupIt->displayName;
+        }
         scene.waterSurfaceCache = groupIt->waterSurfaceCache;
         scene.waterSurfaceCacheStatus = InitialWaterSurfaceCacheStatus(
             *runtimeState,
@@ -25693,6 +26038,12 @@ bool ApplyProjectDocumentToRuntime(
             runtimeState->animationPanel.selectedExportPresetName);
     EnsureExportPresets(runtimeState);
     ApplyActiveExportPresetToRenderSettings(runtimeState);
+    runtimeState->persistence.inactiveWaterSceneStates.clear();
+    for (const auto& state : document.waterSceneStates) {
+        if (state.sceneGroupName != document.activeWaterSceneGroupName) {
+            runtimeState->persistence.inactiveWaterSceneStates.push_back(state);
+        }
+    }
     runtimeState->water.emitters = document.waterEmitters;
     runtimeState->water.manualFlowPaths = document.waterManualFlowPaths;
     runtimeState->water.seepageNodes = document.waterSeepageNodes;
@@ -26192,6 +26543,15 @@ bool ApplyProjectDocumentToRuntime(
             continue;
         }
 
+        // Water-fill layers always follow their scene: a stale per-layer
+        // record (saved before the companion behaviour existed, or while the
+        // water was unloaded) must not hide them. Their load is queued by the
+        // companion hook when the scene display commits.
+        if (IsWaterFillPointCloudSession(session)) {
+            session.visible = true;
+            continue;
+        }
+
         requestedLoadedLayer |= layerIt->loaded;
         if (!layerIt->loaded) {
             UnloadLayerByIndex(runtimeState, viewport, sessionIndex);
@@ -26209,6 +26569,7 @@ bool ApplyProjectDocumentToRuntime(
         document,
         runtimeState,
         viewport);
+    QueueWaterFillCompanionLoads(runtimeState);
 
     const auto selectedLayerIndex =
         document.selectedLayerPath.empty()
@@ -50094,23 +50455,86 @@ void DrawSpinnerArc(float radius, float thickness, ImU32 color) {
     ImGui::Dummy(ImVec2{radius * 2.0F, radius * 2.0F});
 }
 
+// Every background activity the corner card reports beside the single
+// in-flight layer load: queued loads, scene display staging, the water
+// surface cache warm-up, scalar-field streaming, colourise histogram
+// prewarms, linked-HQ patch preparation, and flow trail builds.
+std::vector<std::string> CollectBackgroundActivityLines(
+    const PreviewRuntimeState& runtimeState) {
+    std::vector<std::string> lines;
+    if (!runtimeState.persistence.queuedLoads.empty()) {
+        lines.push_back(
+            std::to_string(runtimeState.persistence.queuedLoads.size()) +
+            " layer load(s) queued");
+    }
+    for (const auto& scene : runtimeState.pointCloudScenes) {
+        if (scene.pendingDisplaySpacingMicrometres.has_value() ||
+            scene.pendingMixedDisplay) {
+            lines.push_back(
+                "Staging " + SceneDisplayLabel(runtimeState, scene.sceneGroupName) +
+                ": " + std::to_string(scene.stagedReadyCount) + "/" +
+                std::to_string(invisible_places::scene::kScenePointCloudRoleCount) +
+                " clouds");
+        }
+    }
+    if (runtimeState.water.waterSurfaceCacheWarmup.worker.joinable()) {
+        std::string stage;
+        if (runtimeState.water.waterSurfaceCacheWarmup.shared != nullptr) {
+            const std::lock_guard<std::mutex> lock(
+                runtimeState.water.waterSurfaceCacheWarmup.shared->mutex);
+            stage = runtimeState.water.waterSurfaceCacheWarmup.shared->stage;
+        }
+        lines.push_back(
+            stage.empty() ? std::string{"Building the water surface cache"}
+                          : "Water cache: " + stage);
+    } else if (runtimeState.water.waterSurfaceCachePreprocessPending) {
+        lines.push_back("Water cache: preparing GPU tables");
+    }
+    if (runtimeState.pendingScalarFieldLoad.has_value()) {
+        lines.push_back(
+            "Loading field '" +
+            runtimeState.pendingScalarFieldLoad->fieldName + "'");
+    }
+    if (runtimeState.timingColouriseHistogram.worker.joinable()) {
+        lines.push_back("Updating colourise histograms");
+    }
+    if (runtimeState.linkedHqPreview.stage ==
+            LinkedHqPreparationStage::Scanning ||
+        runtimeState.linkedHqPreview.stage ==
+            LinkedHqPreparationStage::Organising ||
+        runtimeState.linkedHqPreview.stage ==
+            LinkedHqPreparationStage::Uploading) {
+        lines.push_back(
+            "HQ patches: " +
+            std::to_string(static_cast<int>(
+                runtimeState.linkedHqPreview.displayedProgress * 100.0F)) +
+            "%");
+    }
+    if (runtimeState.water.flowTrailBuildJob.worker.joinable()) {
+        lines.push_back("Building flow trails");
+    }
+    return lines;
+}
+
 void DrawLoadingOverlay(const PreviewRuntimeState& runtimeState) {
-    if (!runtimeState.pendingLoad.has_value()) {
+    const auto backgroundLines = CollectBackgroundActivityLines(runtimeState);
+    if (!runtimeState.pendingLoad.has_value() && backgroundLines.empty()) {
         return;
     }
 
     const auto& io = ImGui::GetIO();
-    const auto& pendingLoad = runtimeState.pendingLoad.value();
-    const auto& targetSession = runtimeState.sessions[pendingLoad.sessionIndex];
-    const float elapsedSeconds = std::chrono::duration<float>(
-                                     std::chrono::steady_clock::now() - pendingLoad.startedAt)
-                                     .count();
-    const bool firstVisibleLayerLoad = VisibleLayerCount(runtimeState) == 0;
+    const bool firstVisibleLayerLoad = runtimeState.pendingLoad.has_value() &&
+                                       VisibleLayerCount(runtimeState) == 0;
     const ImGuiViewport* mainViewport = ImGui::GetMainViewport();
     const ImVec2 viewportPosition = mainViewport != nullptr ? mainViewport->Pos : ImVec2{0.0F, 0.0F};
     const ImVec2 viewportSize = mainViewport != nullptr ? mainViewport->Size : io.DisplaySize;
 
     if (firstVisibleLayerLoad) {
+        const auto& pendingLoad = runtimeState.pendingLoad.value();
+        const auto& targetSession = runtimeState.sessions[pendingLoad.sessionIndex];
+        const float elapsedSeconds = std::chrono::duration<float>(
+                                         std::chrono::steady_clock::now() - pendingLoad.startedAt)
+                                         .count();
         if (mainViewport != nullptr) {
             ImGui::SetNextWindowViewport(mainViewport->ID);
         }
@@ -50176,11 +50600,22 @@ void DrawLoadingOverlay(const PreviewRuntimeState& runtimeState) {
     DrawSpinnerArc(14.0F, 4.0F, IM_COL32(110, 86, 34, 255));
     ImGui::SameLine();
     ImGui::BeginGroup();
-    ImGui::Text("%s", targetSession.displayName.c_str());
-    ImGui::Text("%s", LayerKindLabel(targetSession.kind));
-    ImGui::TextUnformatted(
-        pendingLoad.phase == PendingLoadPhase::CpuLoading ? "Loading in the background..." : "Uploading to GPU...");
-    ImGui::TextDisabled("Existing loaded layers stay visible. %.1f s", elapsedSeconds);
+    if (runtimeState.pendingLoad.has_value()) {
+        const auto& pendingLoad = runtimeState.pendingLoad.value();
+        const auto& targetSession = runtimeState.sessions[pendingLoad.sessionIndex];
+        const float elapsedSeconds = std::chrono::duration<float>(
+                                         std::chrono::steady_clock::now() - pendingLoad.startedAt)
+                                         .count();
+        ImGui::Text("%s", targetSession.displayName.c_str());
+        ImGui::TextUnformatted(
+            pendingLoad.phase == PendingLoadPhase::CpuLoading
+                ? "Loading in the background..."
+                : "Uploading to GPU...");
+        ImGui::TextDisabled("%.1f s", elapsedSeconds);
+    }
+    for (const auto& line : backgroundLines) {
+        ImGui::TextUnformatted(line.c_str());
+    }
     ImGui::EndGroup();
     ImGui::End();
 }
@@ -65388,6 +65823,14 @@ void DrawAnimationSection(
     ImGui::SameLine();
     ImGui::Checkbox("Show Splines", &panel.showSplines);
 
+    {
+        const auto activeScene = ActiveWaterTimingSceneGroupName(runtimeState->water);
+        if (!activeScene.empty() && activeScene != "Default") {
+            ImGui::TextDisabled(
+                "Showing %s animations (others are hidden with their scene).",
+                SceneDisplayLabel(*runtimeState, activeScene).c_str());
+        }
+    }
     if (panel.availableFiles.empty()) {
         ImGui::TextDisabled("No project animation paths are registered.");
     } else if (ImGui::BeginListBox("Animation Versions", ImVec2{-FLT_MIN, 160.0F})) {
@@ -65426,6 +65869,9 @@ void DrawAnimationSection(
                 }
             };
         for (std::size_t index = 0; index < panel.availableFiles.size(); ++index) {
+            if (!AnimationRegistryEntryMatchesActiveScene(*runtimeState, index)) {
+                continue;
+            }
             const bool selectedSaved =
                 panel.selectedFileIndex.has_value() &&
                 panel.selectedFileIndex.value() == index &&
@@ -72144,7 +72590,7 @@ PreviewLayerSession* DrawLoadedPointCloudLookdevSelector(PreviewRuntimeState* ru
 
     const auto currentIndex = visualIndex.value();
     const std::string currentLabel =
-        SceneVisualDisplayName(runtimeState->sessions[currentIndex]) +
+        SceneVisualDisplayName(*runtimeState, runtimeState->sessions[currentIndex]) +
         (SceneVisualGroupVisible(*runtimeState, runtimeState->sessions[currentIndex]) ? "" : " [hidden]");
     if (ImGui::BeginCombo("Cloud", currentLabel.c_str())) {
         std::vector<std::string> listedSceneGroups;
@@ -72170,7 +72616,7 @@ PreviewLayerSession* DrawLoadedPointCloudLookdevSelector(PreviewRuntimeState* ru
             const auto& itemSession = runtimeState->sessions[itemIndex];
             const bool selected = visualIndex.has_value() && visualIndex.value() == itemIndex;
             const std::string label =
-                SceneVisualDisplayName(itemSession) +
+                SceneVisualDisplayName(*runtimeState, itemSession) +
                 (SceneVisualGroupVisible(*runtimeState, itemSession) ? "" : " [hidden]");
             if (ImGui::Selectable(label.c_str(), selected)) {
                 runtimeState->selectedSessionIndex = itemIndex;
@@ -72390,7 +72836,9 @@ void DrawLidarPanel(
 
         for (auto& scene : runtimeState->pointCloudScenes) {
             ImGui::PushID(scene.sourceFolder.string().c_str());
-            if (ImGui::CollapsingHeader(scene.sceneGroupName.c_str(), ImGuiTreeNodeFlags_DefaultOpen)) {
+            const auto sceneHeaderLabel =
+                SceneDisplayLabel(*runtimeState, scene.sceneGroupName) + "###" + scene.sceneGroupName;
+            if (ImGui::CollapsingHeader(sceneHeaderLabel.c_str(), ImGuiTreeNodeFlags_DefaultOpen)) {
                 bool visible = scene.displayVisible;
                 if (!scene.displayLoaded) {
                     ImGui::BeginDisabled();
@@ -81408,7 +81856,10 @@ void DrawWaterPanel(
         auto activeSupportIndex = ResolveWaterRuntimeSessionIndex(*runtimeState);
         if (activeSupportIndex.has_value()) {
             const auto& supportSession = runtimeState->sessions[activeSupportIndex.value()];
-            const auto activeLabel = WaterSupportDisplayName(*runtimeState, supportSession);
+            const auto activeLabel =
+                IsSceneGroupedPointCloud(supportSession)
+                    ? SceneDisplayLabel(*runtimeState, supportSession.sceneGroupName)
+                    : WaterSupportDisplayName(*runtimeState, supportSession);
             ImGui::TextDisabled("Active Scene: %s", activeLabel.c_str());
             if (IsSceneGroupedPointCloud(supportSession)) {
                 ImGui::TextDisabled("Flow support combines canonical ROCK, SAND, and VEG analysis roles.");
@@ -83254,6 +83705,70 @@ void DrawProjectPanel(
         }
         EndPanelSection();
     }
+    if (BeginPanelSection("Scene")) {
+        const auto activeSceneName =
+            ActiveWaterTimingSceneGroupName(runtimeState->water);
+        const auto previewLabel =
+            activeSceneName.empty() || activeSceneName == "Default"
+                ? std::string{"Select a scene"}
+                : SceneDisplayLabel(*runtimeState, activeSceneName);
+        if (ImGui::BeginCombo("Active Scene", previewLabel.c_str())) {
+            for (auto& scene : runtimeState->pointCloudScenes) {
+                const bool isActive = scene.sceneGroupName == activeSceneName;
+                auto itemLabel =
+                    SceneDisplayLabel(*runtimeState, scene.sceneGroupName);
+                if (itemLabel != scene.sceneGroupName) {
+                    itemLabel += " (" + scene.sceneGroupName + ")";
+                }
+                itemLabel += "###scene_" + scene.sceneGroupName;
+                if (ImGui::Selectable(itemLabel.c_str(), isActive) && !isActive) {
+                    ActivateExclusiveScene(
+                        runtimeState, viewport, scene.sceneGroupName);
+                }
+            }
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Loads the selected scene's clouds and water content and\n"
+                "unloads the other scene. Water features, shoreline effects,\n"
+                "and the animation list follow the selected scene.");
+        }
+        for (const auto& scene : runtimeState->pointCloudScenes) {
+            if (scene.pendingDisplaySpacingMicrometres.has_value() ||
+                scene.pendingMixedDisplay) {
+                ImGui::TextDisabled(
+                    "Loading %s: %u/%u clouds staged...",
+                    SceneDisplayLabel(*runtimeState, scene.sceneGroupName).c_str(),
+                    scene.stagedReadyCount,
+                    static_cast<unsigned>(
+                        invisible_places::scene::kScenePointCloudRoleCount));
+            }
+        }
+        for (auto& scene : runtimeState->pointCloudScenes) {
+            if (scene.sceneGroupName != activeSceneName) {
+                continue;
+            }
+            if (scene.displayName.empty()) {
+                scene.displayName = DefaultSceneDisplayName(scene.sceneGroupName);
+            }
+            ImGui::SetNextItemWidth(210.0F);
+            if (InputTextString("Scene Name", &scene.displayName)) {
+                if (scene.displayName.empty()) {
+                    scene.displayName =
+                        DefaultSceneDisplayName(scene.sceneGroupName);
+                }
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Display name only; the folder name (%s) stays the "
+                    "identity in files and caches.",
+                    scene.sceneGroupName.c_str());
+            }
+        }
+        EndPanelSection();
+    }
+
     DrawProjectSection(runtimeState, viewport);
 }
 
@@ -104451,11 +104966,13 @@ void DrawControlsWindow(
                     ImVec4{1.0F, 0.72F, 0.28F, 1.0F},
                     "%s has no 5 mm MESH-sampled ground cloud; water "
                     "features are disabled for this scene.",
-                    activeWaterScene->sceneGroupName.c_str());
+                    SceneDisplayLabel(
+                        *runtimeState,
+                        activeWaterScene->sceneGroupName).c_str());
                 ImGui::TextDisabled(
                     "Base Visuals and Visual features remain fully "
                     "available. Select a scene with a MESH-sampled cloud "
-                    "(e.g. Scene3) to author water.");
+                    "to author water.");
             }
             ImGui::BeginDisabled(
                 renderSetupReadOnly || sceneWaterUnavailable);
