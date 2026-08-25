@@ -150,12 +150,12 @@ For a displayed role:
 gNominal = displaySpacing / 0.001
 C = (displayPointCount / referencePointCount)
     x (displaySpacing / referenceSpacing)^2
-areaCorrection = clamp(1 / C, 1/16, 16)
+areaCorrection = clamp(1 / C, 1/16, 16)   # coverage floors at 0.2 (below)
 if areaCorrection > 1:   g = gNominal x sqrt(areaCorrection),  k = 1
 else:                    g = gNominal,                         k = areaCorrection
 ```
 
-The appearance reference is the role's 1 mm variant when it exists; otherwise it is that role's canonical analysis source or densest known variant. Invalid or zero point-count data uses `areaCorrection = 1`.
+The appearance reference is the role's 1 mm variant when it exists; otherwise it is that role's canonical analysis source or densest known variant. Invalid or zero point-count data uses `areaCorrection = 1`. The per-fragment coverage correction floors at `kPointCloudCoverageCorrectionFloor = 0.2`: a display bundle is never assumed to over-cover its reference by more than 5x, so a sparse pseudo-canonical reference (Site1's split "1 mm" clouds are only ~10x the 5 mm counts) cannot drive per-role alpha to extremes that make ROCK/SAND/VEG diverge in the live view. The floor sits below every measured Scene3 correction (SAND 0.64 / ROCK 0.68 / VEG 0.246), so validated Scene3 parity is unchanged.
 
 Standalone spaced clouds are compensated too: a role-less point cloud whose filename carries a spacing token coarser than 1 mm (for example the generated `Site1-WATER-5mm` gap fill) belongs to no display bundle, so density switching never swaps it for a finer variant — it renders at its authored pitch beside the coarse live bundles and beside the full-density export sources alike. Such a session receives spacing-only compensation (`g = gNominal`, `k = 1`, the ideal-lattice assumption) because no sibling cloud exists to derive a coverage correction from. Generated water overlays keep identity compensation; their sprite sizing carries water-content semantics of its own. As with bundled layers, the non-identity footprint pins these sessions to the unified accumulation material.
 
