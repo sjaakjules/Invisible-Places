@@ -860,7 +860,16 @@ PointCloudDensityCompensation ResolvePointCloudDensityCompensation(
         if (areaCorrection > 1.0F) {
             compensation.footprintScale *= std::sqrt(areaCorrection);
         } else {
-            compensation.coverageCorrection = areaCorrection;
+            // A display bundle is never assumed to over-cover its reference by
+            // more than 5x. Beyond that the reference is treated as
+            // unrepresentative -- Site1's pseudo-1 mm sources are only ~10x the
+            // 5 mm counts instead of 25x, which sent per-role alpha to 0.06-0.15
+            // and made ROCK/SAND/VEG visibly diverge in the live view while the
+            // full-density render kept them cohesive. The floor bounds that
+            // divergence and sits below every measured Scene3 correction
+            // (0.64/0.68/0.246), so validated Scene3 parity is unchanged.
+            compensation.coverageCorrection =
+                std::max(areaCorrection, kPointCloudCoverageCorrectionFloor);
         }
     }
     return SanitizePointCloudDensityCompensation(compensation);

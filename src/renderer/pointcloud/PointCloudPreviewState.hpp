@@ -242,6 +242,14 @@ inline constexpr std::size_t kMaxAdditionalShorelineInstances = 4U;
 inline constexpr std::size_t kMaxShorelineInstances =
     kMaxAdditionalShorelineInstances + 1U;
 
+// Lower bound for the per-fragment coverage correction: a display bundle is
+// never assumed to over-cover its appearance reference by more than 5x, so a
+// sparse pseudo-canonical reference (Site1's split "1 mm" clouds) cannot drive
+// per-role alpha to extremes that make roles diverge in the live view. The
+// floor sits below every measured Scene3 correction (smallest: VEG 0.2456),
+// so the validated Scene3 live/export parity is bit-for-bit unchanged.
+inline constexpr float kPointCloudCoverageCorrectionFloor = 0.2F;
+
 struct PointCloudDensityCompensation {
     float footprintScale = 1.0F;
     float coverageCorrection = 1.0F;

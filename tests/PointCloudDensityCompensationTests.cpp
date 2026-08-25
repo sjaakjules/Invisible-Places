@@ -269,6 +269,16 @@ TEST_CASE("Density compensation resolves spacing and count-aware coverage", "[po
     CHECK(scene3Rock.footprintScale == Catch::Approx(5.0F));
     CHECK(scene3Rock.coverageCorrection == Catch::Approx(0.6809F).epsilon(1.0e-3));
 
+    // A sparse pseudo-canonical reference (Site1 VEG: 22,065,445 at 5 mm vs
+    // 28,404,413 at "1 mm") must not drive per-fragment alpha to extremes:
+    // the coverage correction floors at 1/4 so roles stay cohesive live.
+    const auto site1Veg =
+        ResolvePointCloudDensityCompensation(0.005F, 22'065'445U, 0.001F, 28'404'413U);
+    CHECK(site1Veg.footprintScale == Catch::Approx(5.0F));
+    CHECK(site1Veg.coverageCorrection ==
+          Catch::Approx(invisible_places::renderer::pointcloud::
+                            kPointCloudCoverageCorrectionFloor));
+
     const auto clamped = ResolvePointCloudDensityCompensation(0.005F, 1U, 0.001F, 1'000'000U);
     CHECK(clamped.footprintScale == Catch::Approx(20.0F));
     CHECK(clamped.coverageCorrection == Catch::Approx(1.0F));
