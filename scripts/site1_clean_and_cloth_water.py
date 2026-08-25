@@ -97,12 +97,32 @@ FILL_TRIGGER = 0.85             # fill only where density < 85% of target
 KEEP_CLEAR = 0.004
 OUTSIDE_Z_CAP = 2.6
 WATER_SCAN_ID = 999.0
-RUN_NAME = "20260825-noise-cleanup-v1"
+RUN_NAME = "20260825-noise-cleanup-v2"
+
+# v2 classifier guards (after the v1 review): ghost tests only where the
+# cloth is near-flat (rock intersections broke the band logic and lost real
+# squares), the below-cover must be a near-horizontal surface, and a
+# candidate must be locally sparse (ripple-trough floors are dense ~28k/m^2,
+# reflection ghosts ~6k). 1 mm ghosts inherit from removed 5 mm ghosts so
+# both densities always agree.
+SLOPE_MAX_DEG = 15.0
+HORIZONTAL_NZ = 0.6
+BELOW_DENSITY_MAX = 12_000.0
+ABOVE_DENSITY_MAX = 15_000.0
+DENSITY_NEIGHBOURS = 13
+INHERIT_RADIUS = 0.012
+SEED_CLUSTERS = [               # user-marked limbs/equipment on the ledge
+    (762.3, 820.6, 2.9),
+    (762.4, 829.1, 2.8),
+]
+SEED_BOX = 1.25                 # half-width of the seed neighbourhood
+SEED_MIN_COMPONENT = 300        # 5 mm points; smaller far-specks are left
+SEED_VOXEL = 0.03               # connectivity voxel for far-component labelling
 
 CLEAN_TARGETS = [
     ("SAND", "5mm"), ("ROCK", "5mm"), ("SAND", "1mm"), ("ROCK", "1mm"),
 ]
-REASON_NAMES = {1: "manual", 2: "below-ghost", 3: "above-ghost"}
+REASON_NAMES = {1: "manual", 2: "below-ghost", 3: "above-ghost", 4: "seeded-cluster"}
 
 
 def read_header(path):
@@ -188,10 +208,13 @@ class Context:
         self.cloth_defined = np.isfinite(self.cloth_raw)
         self.cloth_near = ndimage.binary_dilation(self.cloth_defined, iterations=2)
         self.cloth_filled = self._harmonic_fill(self.cloth_raw, self.hull)
+        gradient_y, gradient_x = np.gradient(self.cloth_filled, REGION_CELL)
+        self.cloth_slope_deg = np.degrees(
+            np.arctan(np.hypot(gradient_x, gradient_y))).astype(np.float32)
         np.savez_compressed(
             work / "context.npz",
             hull=self.hull, safe=self.safe, cloth_filled=self.cloth_filled,
-            cloth_defined=self.cloth_defined,
+            cloth_defined=self.cloth_defined, cloth_slope=self.cloth_slope_deg,
             meta=np.array([self.x0, self.y0, REGION_CELL, self.nx, self.ny]))
 
         self._tree = None
@@ -288,7 +311,12 @@ class Context:
                 gy = np.clip((chunk["y"][inside] - self.y0) / REGION_CELL,
                              0, self.ny - 1).astype(np.int64)
                 dz = z - self.cloth_filled[gy, gx]
-                in_band = np.abs(dz) <= SURFACE_BAND
+                normals = np.stack([chunk["nx"][inside], chunk["ny"][inside],
+                                    chunk["nz"][inside]], 1).astype(np.float32)
+                length = np.linalg.norm(normals, axis=1)
+                horizontal = (length > 0.5) & (
+                    np.abs(normals[:, 2]) / np.maximum(length, 1e-6) >= HORIZONTAL_NZ)
+                in_band = (np.abs(dz) <= SURFACE_BAND) & horizontal
                 np.maximum.at(band_top.ravel(), flat[in_band], z[in_band])
                 band.ravel()[flat[in_band]] = True
         size = 2 * COVER_RADIUS_CELLS + 1
@@ -322,67 +350,175 @@ class Context:
 
 # ---- classify -----------------------------------------------------------
 
-def classify_file(context: Context, data_dir: Path, role: str, spacing: str):
+def classify_5mm(context: Context, data_dir: Path, role: str):
+    from scipy import ndimage
+    from scipy.spatial import cKDTree
     band, band_top, conn_top = context.columns(data_dir)
     cny, cnx = band.shape
-    tree = context.tomesh_tree()
-    cloud, _, _ = memmap_cloud(cloud_path(data_dir, role, spacing))
+    tomesh = context.tomesh_tree()
+    cloud, _, _ = memmap_cloud(cloud_path(data_dir, role, "5mm"))
     reasons = np.zeros(len(cloud), np.uint8)
+    xyz = np.empty((len(cloud), 3), np.float32)
+    below_idx, above_idx = [], []
+    seed_idx = {i: [] for i in range(len(SEED_CLUSTERS))}
+    seed_far = {i: [] for i in range(len(SEED_CLUSTERS))}
     for start in range(0, len(cloud), 8_000_000):
         chunk = cloud[start:start + 8_000_000]
         x = chunk["x"].astype(np.float32); y = chunk["y"].astype(np.float32)
         z = chunk["z"].astype(np.float32)
+        xyz[start:start + len(chunk), 0] = x
+        xyz[start:start + len(chunk), 1] = y
+        xyz[start:start + len(chunk), 2] = z
         gx = ((x - context.x0) / REGION_CELL).astype(np.int64)
         gy = ((y - context.y0) / REGION_CELL).astype(np.int64)
         inside = (gx >= 0) & (gx < context.nx) & (gy >= 0) & (gy < context.ny)
         gxc = np.clip(gx, 0, context.nx - 1); gyc = np.clip(gy, 0, context.ny - 1)
         in_safe = inside & context.safe[gyc, gxc]
         near_cloth = inside & context.cloth_near[gyc, gxc]
+        slope_ok = context.cloth_slope_deg[gyc, gxc] < SLOPE_MAX_DEG
         chunk_reason = np.zeros(len(chunk), np.uint8)
 
         if in_safe.any():
             pts = np.stack([x[in_safe], y[in_safe], z[in_safe]], 1)
-            distance, _ = tree.query(pts, k=1, workers=-1)
+            distance, _ = tomesh.query(pts, k=1, workers=-1)
             manual = np.zeros(len(chunk), bool)
             manual[np.nonzero(in_safe)[0][distance > MANUAL_DISTANCE]] = True
             chunk_reason[manual] = 1
 
-        ghosts_domain = near_cloth & (chunk_reason == 0)
-        if ghosts_domain.any():
+        domain = near_cloth & slope_ok & (chunk_reason == 0)
+        if domain.any():
             dz = z - context.cloth_filled[gyc, gxc]
             cx = np.clip(((x - context.x0) / COLUMN_CELL).astype(np.int64), 0, cnx - 1)
             cy = np.clip(((y - context.y0) / COLUMN_CELL).astype(np.int64), 0, cny - 1)
             has_band = band[cy, cx]
             top_band = band_top[cy, cx]
-            # below-ghost: under the cloth AND a real surface continues above
-            # it (double layer). A channel floor the cloth bridges has no
-            # surface band above and is kept.
-            below = ghosts_domain & (dz < BELOW_DZ) & has_band & (top_band > z + 0.04)
-            chunk_reason[below] = 2
-            # above-ghost: over the cloth AND not reachable from the surface
-            # band by a connected column (>= 6 cm air gap below it).
-            floating = ghosts_domain & (dz > ABOVE_DZ) & has_band & (
-                z > conn_top[cy, cx] + 0.03)
-            chunk_reason[floating] = 3
+            below = domain & (dz < BELOW_DZ) & has_band & (top_band > z + 0.04)
+            above = domain & (dz > ABOVE_DZ) & has_band & (z > conn_top[cy, cx] + 0.03)
+            below_idx.append(np.nonzero(below)[0] + start)
+            above_idx.append(np.nonzero(above)[0] + start)
+
+        for i, (sx, sy, sz) in enumerate(SEED_CLUSTERS):
+            in_box = (np.abs(x - sx) < SEED_BOX) & (np.abs(y - sy) < SEED_BOX)
+            if in_box.any():
+                pts = np.stack([x[in_box], y[in_box], z[in_box]], 1)
+                distance, _ = tomesh.query(pts, k=1, workers=-1)
+                seed_idx[i].append(np.nonzero(in_box)[0] + start)
+                seed_far[i].append(distance > MANUAL_DISTANCE)
         reasons[start:start + len(chunk)] = chunk_reason
-    return reasons
+
+    # density screen on the ghost candidates (own-cloud k-NN): reflection
+    # ghosts are locally sparse, ripple-trough floors and real rock are dense
+    # The density screen applies to below-candidates only: ripple-trough
+    # floors are dense parts of the real surface while under-water mirror
+    # plumes are sparse. Above-candidates skip it -- a mirrored rock slab is
+    # itself a locally dense 2D manifold, and the column-connectivity test
+    # already separates hovering slabs from grounded relief.
+    self_tree = cKDTree(xyz)
+    if below_idx:
+        candidates = np.concatenate(below_idx)
+        if len(candidates):
+            distance, _ = self_tree.query(xyz[candidates], k=DENSITY_NEIGHBOURS + 1,
+                                          workers=-1)
+            radius = np.maximum(distance[:, DENSITY_NEIGHBOURS], 1e-4)
+            density = DENSITY_NEIGHBOURS / (np.pi * radius ** 2)
+            reasons[candidates[density < BELOW_DENSITY_MAX]] = 2
+    if above_idx:
+        candidates = np.concatenate(above_idx)
+        if len(candidates):
+            reasons[candidates] = 3
+
+    # user-marked clusters: label the far points around each seed at 3 cm
+    # connectivity; the dominant component is the unselected ledge mass, all
+    # other sizeable components are limbs/equipment standing on the shelf
+    for i, (sx, sy, sz) in enumerate(SEED_CLUSTERS):
+        if not seed_idx[i]:
+            continue
+        indices = np.concatenate(seed_idx[i])
+        far = np.concatenate(seed_far[i])
+        far_indices = indices[far]
+        if len(far_indices) == 0:
+            continue
+        pts = xyz[far_indices]
+        vx = ((pts[:, 0] - (sx - SEED_BOX)) / SEED_VOXEL).astype(np.int64)
+        vy = ((pts[:, 1] - (sy - SEED_BOX)) / SEED_VOXEL).astype(np.int64)
+        vz = ((pts[:, 2] - pts[:, 2].min()) / SEED_VOXEL).astype(np.int64)
+        shape = (vx.max() + 1, vy.max() + 1, vz.max() + 1)
+        occupancy = np.zeros(shape, bool)
+        occupancy[vx, vy, vz] = True
+        labels, count = ndimage.label(occupancy, structure=np.ones((3, 3, 3), bool))
+        point_label = labels[vx, vy, vz]
+        sizes = np.bincount(point_label, minlength=count + 1)
+        mass = np.argmax(sizes[1:]) + 1 if count else 0
+        for component in range(1, count + 1):
+            if component == mass or sizes[component] < SEED_MIN_COMPONENT:
+                continue
+            members = far_indices[point_label == component]
+            keep_zero = reasons[members] == 0
+            reasons[members[keep_zero]] = 4
+    return reasons, xyz
 
 
 def stage_classify(context: Context, data_dir: Path, work: Path):
+    from scipy.spatial import cKDTree
     summary = {}
-    for role, spacing in CLEAN_TARGETS:
-        key = f"{role}-{spacing}"
-        out = work / f"reasons-{key}.npy"
-        if out.exists():
-            reasons = np.load(out)
-        else:
-            reasons = classify_file(context, data_dir, role, spacing)
-            np.save(out, reasons)
+    removed_xyz, removed_reason = [], []
+    for role in ("SAND", "ROCK"):
+        key = f"{role}-5mm"
+        reasons, xyz = classify_5mm(context, data_dir, role)
+        np.save(work / f"reasons-{key}.npy", reasons)
+        ghost = reasons >= 2
+        removed_xyz.append(xyz[ghost])
+        removed_reason.append(reasons[ghost])
         counts = {name: int((reasons == code).sum()) for code, name in REASON_NAMES.items()}
         counts["total_removed"] = int((reasons > 0).sum())
         counts["total_points"] = int(len(reasons))
         summary[key] = counts
-        print(f"[classify] {key}: {counts}")
+        print(f"[classify] {key}: {counts}", flush=True)
+
+    # 1 mm ghosts and seeded clusters inherit from the removed 5 mm points so
+    # both densities always agree; the manual membership test runs directly.
+    inherit_tree = cKDTree(np.vstack(removed_xyz))
+    inherit_reason = np.concatenate(removed_reason)
+    tomesh = context.tomesh_tree()
+    for role in ("SAND", "ROCK"):
+        key = f"{role}-1mm"
+        cloud, _, _ = memmap_cloud(cloud_path(data_dir, role, "1mm"))
+        reasons = np.zeros(len(cloud), np.uint8)
+        for start in range(0, len(cloud), 8_000_000):
+            chunk = cloud[start:start + 8_000_000]
+            x = chunk["x"].astype(np.float32); y = chunk["y"].astype(np.float32)
+            z = chunk["z"].astype(np.float32)
+            gx = ((x - context.x0) / REGION_CELL).astype(np.int64)
+            gy = ((y - context.y0) / REGION_CELL).astype(np.int64)
+            inside = (gx >= 0) & (gx < context.nx) & (gy >= 0) & (gy < context.ny)
+            gxc = np.clip(gx, 0, context.nx - 1); gyc = np.clip(gy, 0, context.ny - 1)
+            in_safe = inside & context.safe[gyc, gxc]
+            near_cloth = inside & context.cloth_near[gyc, gxc]
+            chunk_reason = np.zeros(len(chunk), np.uint8)
+            if in_safe.any():
+                pts = np.stack([x[in_safe], y[in_safe], z[in_safe]], 1)
+                distance, _ = tomesh.query(pts, k=1, workers=-1)
+                manual = np.zeros(len(chunk), bool)
+                manual[np.nonzero(in_safe)[0][distance > MANUAL_DISTANCE]] = True
+                chunk_reason[manual] = 1
+            in_box = np.zeros(len(chunk), bool)
+            for sx, sy, _ in SEED_CLUSTERS:
+                in_box |= (np.abs(x - sx) < SEED_BOX) & (np.abs(y - sy) < SEED_BOX)
+            query = (near_cloth | in_box) & (chunk_reason == 0)
+            if query.any():
+                pts = np.stack([x[query], y[query], z[query]], 1)
+                distance, neighbour = inherit_tree.query(
+                    pts, k=1, workers=-1, distance_upper_bound=INHERIT_RADIUS)
+                hit = np.isfinite(distance)
+                rows = np.nonzero(query)[0][hit]
+                chunk_reason[rows] = inherit_reason[neighbour[hit]]
+            reasons[start:start + len(chunk)] = chunk_reason
+        np.save(work / f"reasons-{key}.npy", reasons)
+        counts = {name: int((reasons == code).sum()) for code, name in REASON_NAMES.items()}
+        counts["total_removed"] = int((reasons > 0).sum())
+        counts["total_points"] = int(len(reasons))
+        summary[key] = counts
+        print(f"[classify] {key}: {counts}", flush=True)
     (work / "classify-summary.json").write_text(json.dumps(summary, indent=2))
     return summary
 
@@ -502,7 +638,7 @@ def stage_cloth(context: Context, data_dir: Path):
     out = data_dir / "Site1-ClothMesh-Refined.ply"
     fine_cell = 0.05
     scale = int(REGION_CELL / fine_cell)
-    filled = context.cloth_filled
+    filled = fill_nan_nearest(context.cloth_filled.copy())
     fine = np.kron(filled, np.ones((scale, scale), np.float32))
     fine = ndimage.gaussian_filter(fine, 1.0)
     hull_fine = np.kron(context.hull, np.ones((scale, scale), bool))
@@ -550,6 +686,25 @@ def stage_cloth(context: Context, data_dir: Path):
 
 # ---- water --------------------------------------------------------------
 
+def fill_nan_nearest(grid):
+    """Replace NaNs with the nearest finite value (spline prefilters are
+    global, so a single NaN would otherwise poison bicubic sampling)."""
+    from scipy.ndimage import distance_transform_edt
+    mask = ~np.isfinite(grid)
+    if not mask.any():
+        return grid
+    index = distance_transform_edt(mask, return_distances=False, return_indices=True)
+    return grid[tuple(index)]
+
+
+def sample_grid(grid, px, py, gx0, gy0, cell, order=1):
+    """Sample a cell-centred grid at world coordinates (chunk-friendly)."""
+    from scipy.ndimage import map_coordinates
+    u = (px - gx0) / cell - 0.5
+    v = (py - gy0) / cell - 0.5
+    return map_coordinates(grid, [v, u], order=order, mode="nearest").astype(np.float32)
+
+
 def stage_water(context: Context, data_dir: Path, work: Path):
     import open3d as o3d
     from scipy import ndimage
@@ -560,13 +715,22 @@ def stage_water(context: Context, data_dir: Path, work: Path):
     y0 = context.y0 - 45.0
     nx = int(120.0 / DENSITY_CELL)
     ny = int(165.0 / DENSITY_CELL)
+    ATTR_CELL = 0.025
+    anx = int(120.0 / ATTR_CELL)
+    any_ = int(165.0 / ATTR_CELL)
+    idw_fields = ["red", "green", "blue", "scalar_Intensity", "scalar_Composite",
+                  "scalar_A_R_Shelter_Lower", "scalar_A_R_RainExposure_Lower",
+                  "scalar_A_R_SVF_Lower"]
 
-    # -- coverage density + measured surface height from the cleaned clouds
+    # ---- one streaming pass: 1 cm coverage counts + measured heights,
+    # ---- 2.5 cm attribute sums/squares, and the keep-clear XY set
     counts = np.zeros((ny, nx), np.float32)
-    ground_counts = np.zeros(ny * nx, np.float64)
     zsum = np.zeros(ny * nx, np.float64)
     zcnt = np.zeros(ny * nx, np.int64)
-    attr_sources = []
+    attr_count = np.zeros(any_ * anx, np.float32)
+    attr_sum = {name: np.zeros(any_ * anx, np.float32) for name in idw_fields}
+    attr_sq = {name: np.zeros(any_ * anx, np.float32) for name in idw_fields}
+    clear_xy = []
     for role in ("SAND", "ROCK", "VEG"):
         cloud, _, _ = memmap_cloud(cloud_path(data_dir, role, "5mm"))
         for start in range(0, len(cloud), 8_000_000):
@@ -576,57 +740,50 @@ def stage_water(context: Context, data_dir: Path, work: Path):
             inside = (gx >= 0) & (gx < nx) & (gy >= 0) & (gy < ny)
             flat = gy[inside] * nx + gx[inside]
             np.add.at(counts.ravel(), flat, 1.0)
-            if role != "VEG":
-                np.add.at(zsum, flat, chunk["z"][inside].astype(np.float64))
-                np.add.at(zcnt, flat, 1)
-        if role != "VEG":
-            stride = max(1, len(cloud) // 12_000_000)
-            attr_sources.append(cloud[::stride])
+            if role == "VEG":
+                continue
+            np.add.at(zsum, flat, chunk["z"][inside].astype(np.float64))
+            np.add.at(zcnt, flat, 1)
+            ax = ((chunk["x"] - x0) / ATTR_CELL).astype(np.int64)
+            ay = ((chunk["y"] - y0) / ATTR_CELL).astype(np.int64)
+            ainside = (ax >= 0) & (ax < anx) & (ay >= 0) & (ay < any_)
+            aflat = ay[ainside] * anx + ax[ainside]
+            np.add.at(attr_count, aflat, 1.0)
+            for name in idw_fields:
+                values = np.asarray(chunk[name], dtype=np.float32)[ainside]
+                np.add.at(attr_sum[name], aflat, values)
+                np.add.at(attr_sq[name], aflat, values * values)
+            clear_xy.append(np.stack([chunk["x"][inside], chunk["y"][inside]], 1)
+                            .astype(np.float32))
     sigma_cells = DENSITY_SIGMA_M / DENSITY_CELL
     density = ndimage.gaussian_filter(counts, sigma_cells) / (DENSITY_CELL ** 2)
     covered = density[density > WELL_COVERED_MIN]
     target = float(np.percentile(covered, TARGET_PERCENTILE))
     print(f"[water] density target = {target:,.0f} pts/m^2 "
-          f"(median covered {np.median(covered):,.0f})")
+          f"(median covered {np.median(covered):,.0f})", flush=True)
     zmean = np.divide(zsum, zcnt, out=np.full(ny * nx, np.nan), where=zcnt > 0)
     zmean = zmean.reshape(ny, nx).astype(np.float32)
     zmean_s = ndimage.gaussian_filter(np.nan_to_num(zmean, nan=0.0), 2.0)
     zmean_w = ndimage.gaussian_filter(np.isfinite(zmean).astype(np.float32), 2.0)
-    zdata = np.divide(zmean_s, zmean_w, out=np.full_like(zmean_s, np.nan), where=zmean_w > 0.05)
+    del zsum, zcnt, zmean
 
-    # -- reference surfaces: refined cloth inside the hull, v1 harmonic outside
-    region_scale = REGION_CELL / DENSITY_CELL
-    def region_lookup(mask):
-        gx = ((np.arange(nx) * DENSITY_CELL + x0 - context.x0) / REGION_CELL).astype(np.int64)
-        gy = ((np.arange(ny) * DENSITY_CELL + y0 - context.y0) / REGION_CELL).astype(np.int64)
-        ok_x = (gx >= 0) & (gx < context.nx)
-        ok_y = (gy >= 0) & (gy < context.ny)
-        out = np.zeros((ny, nx), bool)
-        sub = mask[np.clip(gy, 0, context.ny - 1)[:, None],
-                   np.clip(gx, 0, context.nx - 1)[None, :]]
-        out[np.ix_(ok_y, ok_x)] = sub[np.ix_(ok_y, ok_x)]
-        return out
+    # ---- region routing masks (cell level)
+    hull_gx = ((np.arange(nx) * DENSITY_CELL + x0 - context.x0) / REGION_CELL).astype(np.int64)
+    hull_gy = ((np.arange(ny) * DENSITY_CELL + y0 - context.y0) / REGION_CELL).astype(np.int64)
+    okx = (hull_gx >= 0) & (hull_gx < context.nx)
+    oky = (hull_gy >= 0) & (hull_gy < context.ny)
+    in_hull = np.zeros((ny, nx), bool)
+    sub = context.hull[np.clip(hull_gy, 0, context.ny - 1)[:, None],
+                       np.clip(hull_gx, 0, context.nx - 1)[None, :]]
+    in_hull[np.ix_(oky, okx)] = sub[np.ix_(oky, okx)]
+    hull_mix = ndimage.gaussian_filter(in_hull.astype(np.float32), 50.0)
 
-    in_hull = region_lookup(context.hull)
-    cloth_z = np.full((ny, nx), np.nan, np.float32)
-    gx = ((np.arange(nx) * DENSITY_CELL + x0 - context.x0) / REGION_CELL).astype(np.int64)
-    gy = ((np.arange(ny) * DENSITY_CELL + y0 - context.y0) / REGION_CELL).astype(np.int64)
-    okx = (gx >= 0) & (gx < context.nx); oky = (gy >= 0) & (gy < context.ny)
-    cloth_z[np.ix_(oky, okx)] = context.cloth_filled[
-        np.clip(gy, 0, context.ny - 1)[oky][:, None],
-        np.clip(gx, 0, context.nx - 1)[okx][None, :]]
-
-    # outside surface: the Poisson mesh limits the extent (raycast hit +
-    # z-cap keeps rock occlusion shadows dry there), but the height is a
-    # harmonic sheet solved at 5 cm from the measured surrounding surface --
-    # the raw mesh wobbles in unsupported spans (the v1 lesson).
+    # ---- outside surface: mesh raycast bounds the extent, a coarse (5 cm)
+    # ---- harmonic sheet from measured rims provides the height
     mesh = o3d.io.read_triangle_mesh(str(data_dir / "Site1-MESH.ply"))
     scene = o3d.t.geometry.RaycastingScene()
     scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
     deficit = (density < target * FILL_TRIGGER) & ~in_hull
-    # footprint at 10 cm with a 2 m closing (as in v1): the open bay sits
-    # tens of metres from the nearest return and only a coarse closing over
-    # the sparse surrounding speckle encloses it
     coarse_factor = 10
     fny, fnx = ny // coarse_factor, nx // coarse_factor
     occupied_coarse = counts[:fny * coarse_factor, :fnx * coarse_factor].reshape(
@@ -641,7 +798,8 @@ def stage_water(context: Context, data_dir: Path, work: Path):
         footprint_coarse, np.ones((coarse_factor, coarse_factor), bool))
     outside_mask = deficit & footprint
     oy, ox = np.nonzero(outside_mask)
-    outside_z = np.full((ny, nx), np.nan, np.float32)
+    allowed = np.zeros((ny, nx), bool)
+    solved = np.full((ny // 5, nx // 5), np.nan, np.float32)
     if len(ox):
         rays = np.zeros((len(ox), 6), np.float32)
         rays[:, 0] = x0 + (ox + 0.5) * DENSITY_CELL
@@ -650,34 +808,30 @@ def stage_water(context: Context, data_dir: Path, work: Path):
         hit = scene.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy()
         zray = 60.0 - hit
         rayok = np.isfinite(hit) & (zray <= OUTSIDE_Z_CAP)
-        allowed = np.zeros((ny, nx), bool)
         allowed[oy[rayok], ox[rayok]] = True
-        # coarse (5 cm) harmonic solve with measured-surface rims
         factor = 5
         cny, cnx = ny // factor, nx // factor
         coarse_mask = allowed[:cny * factor, :cnx * factor].reshape(
             cny, factor, cnx, factor).any(axis=(1, 3))
+        zdata_grid = np.divide(zmean_s, zmean_w,
+                               out=np.full_like(zmean_s, np.nan),
+                               where=zmean_w > 0.05)
         zdata_coarse = np.nanmean(
-            np.where(np.isfinite(zdata[:cny * factor, :cnx * factor]),
-                     zdata[:cny * factor, :cnx * factor], np.nan).reshape(
+            zdata_grid[:cny * factor, :cnx * factor].reshape(
                 cny, factor, cnx, factor), axis=(1, 3))
         rim = ndimage.binary_dilation(coarse_mask, iterations=2) & ~coarse_mask
         seed = np.where(rim & np.isfinite(zdata_coarse), zdata_coarse, np.nan)
         solved = context._harmonic_fill(seed, coarse_mask | rim)
-        fine = np.kron(solved, np.ones((factor, factor), np.float32))
-        fine = ndimage.gaussian_filter(fine, 4.0)
-        outside_z[:cny * factor, :cnx * factor] = fine
-        outside_z = np.where(allowed, np.minimum(outside_z, OUTSIDE_Z_CAP), np.nan)
+        solved = np.minimum(solved, OUTSIDE_Z_CAP).astype(np.float32)
+        del zdata_grid
 
-    reference = np.where(in_hull, cloth_z, outside_z)
-
-    # -- candidates: jittered 5 mm grid where the deficit says so
+    # ---- candidates from the density deficit
     rng = np.random.default_rng(41)
-    fill_region = np.isfinite(reference) & (density < target * FILL_TRIGGER) & (
-        in_hull | outside_mask)
+    fill_region = (density < target * FILL_TRIGGER) & (in_hull | allowed)
     fy, fx = np.nonzero(fill_region)
-    print(f"[water] fill region: {len(fx):,} cells ({len(fx)*DENSITY_CELL**2:.0f} m^2)")
-    per_cell = 4  # 1 cm cell -> 4 candidates = 5 mm pitch
+    print(f"[water] fill region: {len(fx):,} cells ({len(fx)*DENSITY_CELL**2:.0f} m^2)",
+          flush=True)
+    per_cell = 4
     offsets = np.array([[0.25, 0.25], [0.75, 0.25], [0.25, 0.75], [0.75, 0.75]], np.float32)
     px = (x0 + (fx[:, None] + offsets[None, :, 0]) * DENSITY_CELL).ravel()
     py = (y0 + (fy[:, None] + offsets[None, :, 1]) * DENSITY_CELL).ravel()
@@ -686,87 +840,124 @@ def stage_water(context: Context, data_dir: Path, work: Path):
     cell_density = np.repeat(density[fy, fx], per_cell)
     accept = rng.random(len(px)) < np.clip(1.0 - cell_density / target, 0.0, 1.0)
     px, py = px[accept].astype(np.float32), py[accept].astype(np.float32)
-    print(f"[water] accepted {len(px):,} candidates from the density deficit")
+    print(f"[water] accepted {len(px):,} candidates from the density deficit", flush=True)
 
-    # keep-clear against real points where any coverage exists
     gxc = np.clip(((px - x0) / DENSITY_CELL).astype(np.int64), 0, nx - 1)
     gyc = np.clip(((py - y0) / DENSITY_CELL).astype(np.int64), 0, ny - 1)
     near_data = density[gyc, gxc] > target * 0.02
     if near_data.any():
-        neighbour_xy = []
-        for source in attr_sources:
-            sx = ((source["x"] - x0) / DENSITY_CELL).astype(np.int64)
-            sy = ((source["y"] - y0) / DENSITY_CELL).astype(np.int64)
-            ok = (sx >= 0) & (sx < nx) & (sy >= 0) & (sy < ny)
-            ok[ok] = density[sy[ok], sx[ok]] > target * 0.02
-            neighbour_xy.append(np.stack([source["x"][ok], source["y"][ok]], 1).astype(np.float32))
-        clear_tree = cKDTree(np.vstack(neighbour_xy))
+        clear_tree = cKDTree(np.vstack(clear_xy))
         distance, _ = clear_tree.query(np.stack([px[near_data], py[near_data]], 1),
                                        k=1, workers=-1, distance_upper_bound=KEEP_CLEAR)
         collide = np.zeros(len(px), bool)
         collide[np.nonzero(near_data)[0][np.isfinite(distance)]] = True
         px, py = px[~collide], py[~collide]
         gxc, gyc = gxc[~collide], gyc[~collide]
-        print(f"[water] keep-clear dropped {collide.sum():,}")
+        print(f"[water] keep-clear dropped {collide.sum():,}", flush=True)
+    del clear_xy
 
-    # Trust the measured local surface wherever real points exist (full trust
-    # from half the target density up), and only let the reference sheet rule
-    # where the ground is truly empty. The clamp brackets the blend partners,
-    # not the reference alone -- otherwise fill on sparse sloped sand hovers
-    # above the real slope (the bay's west edge in v2.0).
-    z_ref = reference[gyc, gxc]
-    z_dat = zdata[gyc, gxc]
-    has_data = np.isfinite(z_dat)
-    weight = np.clip(density[gyc, gxc] / (0.5 * target), 0.0, 1.0)
-    weight[~has_data] = 0.0
-    pz = ((1.0 - weight) * z_ref + weight * np.nan_to_num(z_dat, nan=0.0)).astype(np.float32)
-    low = np.where(has_data, np.minimum(z_ref, np.nan_to_num(z_dat, nan=np.inf)), z_ref) - 0.08
-    high = np.where(has_data, np.maximum(z_ref, np.nan_to_num(z_dat, nan=-np.inf)), z_ref) + 0.08
-    pz = np.clip(pz, low, high)
+    # ---- continuous fill surface: bicubic cloth inside the hull, bicubic
+    # ---- harmonic sheet outside, hull-blended; measured surface wins where
+    # ---- real points exist. No cell-quantised lookups anywhere.
+    cloth_sample = fill_nan_nearest(context.cloth_filled.copy())
+
+    def surface_z(qx, qy):
+        z_cloth = sample_grid(cloth_sample, qx, qy,
+                              context.x0, context.y0, REGION_CELL, order=3)
+        z_out = sample_grid(solved, qx, qy, x0, y0, DENSITY_CELL * 5, order=1)
+        z_out = np.where(np.isfinite(z_out), z_out, z_cloth)
+        mix = sample_grid(hull_mix, qx, qy, x0, y0, DENSITY_CELL, order=1)
+        z_ref = mix * z_cloth + (1.0 - mix) * z_out
+        num = sample_grid(zmean_s, qx, qy, x0, y0, DENSITY_CELL, order=1)
+        den = sample_grid(zmean_w, qx, qy, x0, y0, DENSITY_CELL, order=1)
+        has_data = den > 0.05
+        z_dat = np.where(has_data, num / np.maximum(den, 1e-6), np.nan)
+        local_density = sample_grid(density, qx, qy, x0, y0, DENSITY_CELL, order=1)
+        weight = np.clip(local_density / (0.5 * target), 0.0, 1.0)
+        weight[~has_data] = 0.0
+        blended = (1.0 - weight) * z_ref + weight * np.nan_to_num(z_dat, nan=0.0)
+        low = np.where(has_data, np.minimum(z_ref, np.nan_to_num(z_dat, nan=np.inf)),
+                       z_ref) - 0.08
+        high = np.where(has_data, np.maximum(z_ref, np.nan_to_num(z_dat, nan=-np.inf)),
+                        z_ref) + 0.08
+        return np.clip(blended, low, high).astype(np.float32)
+
+    pz = np.empty(len(px), np.float32)
+    normal = np.empty((len(px), 3), np.float32)
+    delta = 0.02
+    for start in range(0, len(px), 4_000_000):
+        stop = min(start + 4_000_000, len(px))
+        qx, qy = px[start:stop], py[start:stop]
+        centre = surface_z(qx, qy)
+        dzdx = (surface_z(qx + delta, qy) - surface_z(qx - delta, qy)) / (2 * delta)
+        dzdy = (surface_z(qx, qy + delta) - surface_z(qx, qy - delta)) / (2 * delta)
+        vector = np.stack([-dzdx, -dzdy, np.ones(stop - start, np.float32)], 1)
+        vector /= np.linalg.norm(vector, axis=1, keepdims=True)
+        pz[start:stop] = centre
+        normal[start:stop] = vector
     pz += rng.normal(0.0, 0.0005, len(pz)).astype(np.float32)
 
-    # normals + slope from the blended reference surface
-    blend_surface = np.where(np.isfinite(zdata) & (density > target),
-                             zdata, reference)
-    blend_surface = ndimage.gaussian_filter(
-        np.nan_to_num(blend_surface, nan=np.nanmedian(reference)), 3.0)
-    gsy, gsx = np.gradient(blend_surface, DENSITY_CELL)
-    nvec = np.stack([-gsx[gyc, gxc], -gsy[gyc, gxc], np.ones(len(px), np.float32)], 1)
-    nvec /= np.linalg.norm(nvec, axis=1, keepdims=True)
-    slope = np.degrees(np.arccos(np.clip(nvec[:, 2], -1.0, 1.0))).astype(np.float32)
+    # ---- attributes: cell means diffused outward (multi-scale masked
+    # ---- Gaussian) and sampled bilinearly, plus correlated noise whose
+    # ---- amplitude follows the local measured variance
+    def diffuse(mean_grid):
+        filled = mean_grid.copy()
+        for sigma in (2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0):
+            known = np.isfinite(filled).astype(np.float32)
+            blurred = ndimage.gaussian_filter(np.nan_to_num(filled, nan=0.0), sigma)
+            weightg = ndimage.gaussian_filter(known, sigma)
+            estimate = np.divide(blurred, weightg,
+                                 out=np.zeros_like(blurred), where=weightg > 1e-4)
+            need = ~np.isfinite(filled) & (weightg > 1e-4)
+            filled[need] = estimate[need]
+        remaining = ~np.isfinite(filled)
+        if remaining.any():
+            filled[remaining] = np.nanmedian(mean_grid)
+        return ndimage.gaussian_filter(filled, 1.0)
 
-    # attributes via 2D IDW from cleaned SAND+ROCK
+    have_attr = attr_count > 0
+    noise_a = ndimage.gaussian_filter(
+        rng.standard_normal((any_, anx)).astype(np.float32), 4.0)
+    noise_a /= max(noise_a.std(), 1e-6)
+    noise_b = ndimage.gaussian_filter(
+        rng.standard_normal((any_, anx)).astype(np.float32), 4.0)
+    noise_b /= max(noise_b.std(), 1e-6)
+    noise_amplitude = 0.7
+
     dtype, _, _, _ = read_header(cloud_path(data_dir, "SAND", "5mm"))
     record = np.zeros(len(px), dtype)
     record["x"], record["y"], record["z"] = px, py, pz
-    record["nx"], record["ny"], record["nz"] = nvec.T
+    record["nx"], record["ny"], record["nz"] = normal.T
+    slope = np.degrees(np.arccos(np.clip(normal[:, 2], -1.0, 1.0))).astype(np.float32)
     record["scalar_ScanID"] = WATER_SCAN_ID
     record["scalar_A_R_Horizontalness"] = np.cos(np.radians(slope))
     record["scalar_A_R_Slope_deg"] = slope
-    downhill = np.stack([gsx[gyc, gxc], gsy[gyc, gxc], np.zeros(len(px), np.float32)], 1)
-    magnitude = np.linalg.norm(downhill[:, :2], axis=1)
-    safe = magnitude > 1e-5
-    record["scalar_A_R_Downhill_X"][safe] = (-downhill[safe, 0] / magnitude[safe])
-    record["scalar_A_R_Downhill_Y"][safe] = (-downhill[safe, 1] / magnitude[safe])
+    horizontal = np.linalg.norm(normal[:, :2], axis=1)
+    safe = horizontal > 1e-5
+    record["scalar_A_R_Downhill_X"][safe] = normal[safe, 0] / horizontal[safe]
+    record["scalar_A_R_Downhill_Y"][safe] = normal[safe, 1] / horizontal[safe]
     record["scalar_A_R_DownhillMagnitude"] = np.tan(np.radians(slope))
 
-    idw_fields = ["red", "green", "blue", "scalar_Intensity", "scalar_Composite",
-                  "scalar_A_R_Shelter_Lower", "scalar_A_R_RainExposure_Lower",
-                  "scalar_A_R_SVF_Lower"]
-    source_xy = np.vstack([
-        np.stack([s["x"], s["y"]], 1).astype(np.float32) for s in attr_sources])
-    stacked = {name: np.concatenate([np.asarray(s[name], dtype=np.float64)
-                                     for s in attr_sources])
-               for name in idw_fields}
-    attr_tree = cKDTree(source_xy)
-    for start in range(0, len(px), 4_000_000):
-        stop = min(start + 4_000_000, len(px))
-        distance, neighbour = attr_tree.query(
-            np.stack([px[start:stop], py[start:stop]], 1), k=6, workers=-1)
-        idw = 1.0 / np.maximum(distance, 0.01) ** 2
-        idw /= idw.sum(axis=1, keepdims=True)
-        for name in idw_fields:
-            value = (stacked[name][neighbour] * idw).sum(axis=1)
+    for name in idw_fields:
+        mean_grid = np.divide(attr_sum[name], attr_count,
+                              out=np.full(any_ * anx, np.nan, np.float32),
+                              where=have_attr).reshape(any_, anx)
+        var_grid = np.divide(attr_sq[name], attr_count,
+                             out=np.full(any_ * anx, np.nan, np.float32),
+                             where=have_attr).reshape(any_, anx)
+        var_grid = np.clip(var_grid - np.nan_to_num(mean_grid, nan=0.0) ** 2, 0.0, None)
+        mean_field = diffuse(mean_grid)
+        sigma_field = np.sqrt(diffuse(var_grid))
+        noise_field = noise_a if name in ("red", "green", "blue") else noise_b
+        for start in range(0, len(px), 8_000_000):
+            stop = min(start + 8_000_000, len(px))
+            value = sample_grid(mean_field, px[start:stop], py[start:stop],
+                                x0, y0, ATTR_CELL, order=1)
+            spread = sample_grid(sigma_field, px[start:stop], py[start:stop],
+                                 x0, y0, ATTR_CELL, order=1)
+            wobble = sample_grid(noise_field, px[start:stop], py[start:stop],
+                                 x0, y0, ATTR_CELL, order=1)
+            value = value + noise_amplitude * spread * wobble
             if record.dtype[name].kind == "u":
                 record[name][start:stop] = np.clip(value + 0.5, 0, 255).astype(np.uint8)
             else:
@@ -774,11 +965,12 @@ def stage_water(context: Context, data_dir: Path, work: Path):
 
     out = data_dir / "Site1-WATER-5mm.ply"
     header = ["ply", "format binary_little_endian 1.0",
-              f"comment Site1 water gap fill v2 generated {stamp} (cloth-guided, density-continuous)",
+              f"comment Site1 water gap fill v3 generated {stamp} (cloth-guided, density-continuous)",
               "comment Fill accepted per point with probability 1 - density/target so the",
               "comment combined cloud density stays seam-free against the real points",
-              f"comment ScanID={WATER_SCAN_ID:.0f}; heights ride the refined CSF cloth inside the",
-              f"comment central flat and the harmonic sheet outside (z <= {OUTSIDE_Z_CAP} m there)",
+              "comment Heights sample the refined cloth bicubically (no grid tiling);",
+              "comment attributes are diffusion-blended cell means plus variance-scaled noise",
+              f"comment ScanID={WATER_SCAN_ID:.0f}; outside sheet capped at z <= {OUTSIDE_Z_CAP} m",
               "comment Generated by scripts/site1_clean_and_cloth_water.py",
               f"element vertex {len(record)}"]
     typemap = {"f4": "float", "f8": "double", "u1": "uchar"}
@@ -788,7 +980,8 @@ def stage_water(context: Context, data_dir: Path, work: Path):
     with open(out, "wb") as handle:
         handle.write(("\n".join(header) + "\n").encode("ascii"))
         record.tofile(handle)
-    print(f"[water] wrote {out} ({len(record):,} pts, {out.stat().st_size/1e9:.2f} GB)")
+    print(f"[water] wrote {out} ({len(record):,} pts, {out.stat().st_size/1e9:.2f} GB)",
+          flush=True)
 
 
 def main():
