@@ -97,7 +97,7 @@ FILL_TRIGGER = 0.85             # fill only where density < 85% of target
 KEEP_CLEAR = 0.004
 OUTSIDE_Z_CAP = 2.6
 WATER_SCAN_ID = 999.0
-RUN_NAME = "20260825-noise-cleanup-v2"
+RUN_NAME = "20260825-noise-cleanup-v3"
 
 # v2 classifier guards (after the v1 review): ghost tests only where the
 # cloth is near-flat (rock intersections broke the band logic and lost real
@@ -118,6 +118,12 @@ SEED_CLUSTERS = [               # user-marked limbs/equipment on the ledge
 SEED_BOX = 1.25                 # half-width of the seed neighbourhood
 SEED_MIN_COMPONENT = 300        # 5 mm points; smaller far-specks are left
 SEED_VOXEL = 0.03               # connectivity voxel for far-component labelling
+SEED_RADIUS = 0.9               # a cluster must come within this XY radius of the seed
+SEED_Z_BELOW = 0.4              # accepted cluster z window around the marked point
+SEED_Z_ABOVE = 0.9
+STEEP_DILATE_CELLS = 4          # ghost tests keep 0.4 m clear of steep cloth: a shelf
+                                # crest is locally flat while its face is steep, and v2
+                                # removed column-quantised squares exactly there
 
 CLEAN_TARGETS = [
     ("SAND", "5mm"), ("ROCK", "5mm"), ("SAND", "1mm"), ("ROCK", "1mm"),
@@ -211,6 +217,9 @@ class Context:
         gradient_y, gradient_x = np.gradient(self.cloth_filled, REGION_CELL)
         self.cloth_slope_deg = np.degrees(
             np.arctan(np.hypot(gradient_x, gradient_y))).astype(np.float32)
+        steep = self.cloth_slope_deg >= SLOPE_MAX_DEG
+        self.steep_near = ndimage.binary_dilation(
+            steep, structure=disk(STEEP_DILATE_CELLS))
         np.savez_compressed(
             work / "context.npz",
             hull=self.hull, safe=self.safe, cloth_filled=self.cloth_filled,
@@ -375,7 +384,7 @@ def classify_5mm(context: Context, data_dir: Path, role: str):
         gxc = np.clip(gx, 0, context.nx - 1); gyc = np.clip(gy, 0, context.ny - 1)
         in_safe = inside & context.safe[gyc, gxc]
         near_cloth = inside & context.cloth_near[gyc, gxc]
-        slope_ok = context.cloth_slope_deg[gyc, gxc] < SLOPE_MAX_DEG
+        slope_ok = ~context.steep_near[gyc, gxc]
         chunk_reason = np.zeros(len(chunk), np.uint8)
 
         if in_safe.any():
@@ -452,7 +461,17 @@ def classify_5mm(context: Context, data_dir: Path, role: str):
         for component in range(1, count + 1):
             if component == mass or sizes[component] < SEED_MIN_COMPONENT:
                 continue
-            members = far_indices[point_label == component]
+            member_mask = point_label == component
+            members = far_indices[member_mask]
+            component_points = pts[member_mask]
+            # a limb/equipment cluster must reach the marked point and sit in
+            # its height window; box-cropped fragments of the real ledge fail
+            planar = np.hypot(component_points[:, 0] - sx, component_points[:, 1] - sy)
+            if planar.min() > SEED_RADIUS:
+                continue
+            if (component_points[:, 2].min() < sz - SEED_Z_BELOW or
+                    component_points[:, 2].max() > sz + SEED_Z_ABOVE):
+                continue
             keep_zero = reasons[members] == 0
             reasons[members[keep_zero]] = 4
     return reasons, xyz
@@ -777,6 +796,16 @@ def stage_water(context: Context, data_dir: Path, work: Path):
                        np.clip(hull_gx, 0, context.nx - 1)[None, :]]
     in_hull[np.ix_(oky, okx)] = sub[np.ix_(oky, okx)]
     hull_mix = ndimage.gaussian_filter(in_hull.astype(np.float32), 50.0)
+    # The fill stays roughly at water level: no candidates on or near steep
+    # cloth (the ledge faces produced draped drip-cones) and none above the
+    # cap (no water high on the rock tops).
+    flat_sub = (~context.steep_near)[np.clip(hull_gy, 0, context.ny - 1)[:, None],
+                                     np.clip(hull_gx, 0, context.nx - 1)[None, :]]
+    cloth_sub = context.cloth_filled[np.clip(hull_gy, 0, context.ny - 1)[:, None],
+                                     np.clip(hull_gx, 0, context.nx - 1)[None, :]]
+    cloth_capped = np.nan_to_num(cloth_sub, nan=OUTSIDE_Z_CAP + 1.0) <= OUTSIDE_Z_CAP
+    level_ok = np.zeros((ny, nx), bool)
+    level_ok[np.ix_(oky, okx)] = (flat_sub & cloth_capped)[np.ix_(oky, okx)]
 
     # ---- outside surface: mesh raycast bounds the extent, a coarse (5 cm)
     # ---- harmonic sheet from measured rims provides the height
@@ -827,7 +856,7 @@ def stage_water(context: Context, data_dir: Path, work: Path):
 
     # ---- candidates from the density deficit
     rng = np.random.default_rng(41)
-    fill_region = (density < target * FILL_TRIGGER) & (in_hull | allowed)
+    fill_region = (density < target * FILL_TRIGGER) & ((in_hull & level_ok) | allowed)
     fy, fx = np.nonzero(fill_region)
     print(f"[water] fill region: {len(fx):,} cells ({len(fx)*DENSITY_CELL**2:.0f} m^2)",
           flush=True)
