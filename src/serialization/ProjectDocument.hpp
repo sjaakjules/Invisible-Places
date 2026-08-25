@@ -147,6 +147,11 @@ struct ScenePointCloudGroupDocument {
     std::string sceneGroupName;
     // Schema 83: user-facing label (folder names stay the identity keys).
     std::string displayName;
+    // Schema 83: per-scene workspace memory -- the camera pose and loaded
+    // animation to restore when this scene is activated again.
+    std::optional<invisible_places::camera::CameraState> lastCamera;
+    std::filesystem::path lastAnimationPath;
+    bool lastAnimationUsesEdited = false;
     float displaySpacingMeters = 0.0F;
     bool displayLoaded = false;
     bool displayVisible = false;

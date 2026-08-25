@@ -1619,15 +1619,27 @@ ParseScenePointCloudRoleSource(const json &sourceJson) {
   return source;
 }
 
+json SerializeCameraState(const CameraState& state);
+CameraState ParseCameraState(const json& stateJson);
+
 json SerializeScenePointCloudGroup(const ScenePointCloudGroupDocument &group) {
   json groupJson{
       {"scene_group", group.sceneGroupName},
       {"display_name", group.displayName},
+  };
+  if (group.lastCamera.has_value()) {
+    groupJson["last_camera"] = SerializeCameraState(group.lastCamera.value());
+  }
+  if (!group.lastAnimationPath.empty()) {
+    groupJson["last_animation_path"] = group.lastAnimationPath.generic_string();
+    groupJson["last_animation_edited"] = group.lastAnimationUsesEdited;
+  }
+  groupJson.update(json{
       {"display_spacing_meters", group.displaySpacingMeters},
       {"display_loaded", group.displayLoaded},
       {"display_visible", group.displayVisible},
       {"roles", json::array()},
-  };
+  });
   for (const auto &source : group.roleSources) {
     groupJson["roles"].push_back(SerializeScenePointCloudRoleSource(source));
   }
@@ -1642,6 +1654,11 @@ ScenePointCloudGroupDocument ParseScenePointCloudGroup(const json &groupJson) {
   ScenePointCloudGroupDocument group;
   group.sceneGroupName = groupJson.value("scene_group", std::string{});
   group.displayName = groupJson.value("display_name", std::string{});
+  if (groupJson.contains("last_camera") && groupJson.at("last_camera").is_object()) {
+    group.lastCamera = ParseCameraState(groupJson.at("last_camera"));
+  }
+  group.lastAnimationPath = groupJson.value("last_animation_path", std::string{});
+  group.lastAnimationUsesEdited = groupJson.value("last_animation_edited", false);
   group.displaySpacingMeters = groupJson.value("display_spacing_meters", 0.0F);
   group.displayLoaded = groupJson.value("display_loaded", false);
   group.displayVisible = groupJson.value("display_visible", false);

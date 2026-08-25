@@ -3022,6 +3022,12 @@ struct ScenePointCloudRuntime {
     std::string sceneGroupName;
     // User-facing label (persisted per scene; folder name stays the key).
     std::string displayName;
+    // Per-scene workspace memory: the camera pose and loaded animation to
+    // restore when this scene is activated again.
+    bool hasLastCamera = false;
+    invisible_places::camera::CameraState lastCamera{};
+    std::filesystem::path lastAnimationPath;
+    bool lastAnimationUsesEdited = false;
     std::filesystem::path sourceFolder;
     std::vector<WaterSurfaceSource> waterSurfaceSources;
     std::string waterSurfaceSignature;
@@ -24897,6 +24903,25 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
         invisible_places::serialization::ScenePointCloudGroupDocument groupDocument;
         groupDocument.sceneGroupName = scene.sceneGroupName;
         groupDocument.displayName = scene.displayName;
+        if (scene.sceneGroupName ==
+            ActiveWaterTimingSceneGroupName(runtimeState.water)) {
+            // The active scene saves its live pose so the next launch (or
+            // the next switch back) returns exactly here.
+            groupDocument.lastCamera = runtimeState.camera.CaptureState();
+            groupDocument.lastAnimationPath =
+                runtimeState.animationPanel.currentFilePath.empty()
+                    ? std::filesystem::path{}
+                    : std::filesystem::path{
+                          runtimeState.animationPanel.currentFilePath};
+            groupDocument.lastAnimationUsesEdited =
+                runtimeState.animationPanel.currentPathUsesEdited;
+        } else {
+            if (scene.hasLastCamera) {
+                groupDocument.lastCamera = scene.lastCamera;
+            }
+            groupDocument.lastAnimationPath = scene.lastAnimationPath;
+            groupDocument.lastAnimationUsesEdited = scene.lastAnimationUsesEdited;
+        }
         groupDocument.displaySpacingMeters =
             scene.committedDisplaySpacingMicrometres.has_value()
                 ? static_cast<float>(scene.committedDisplaySpacingMicrometres.value()) / 1'000'000.0F
@@ -25538,6 +25563,14 @@ void ReleaseScenePointCloudResidency(
 
 // ---- Exclusive scene activation (the Project panel Scene selector) -------
 
+bool UnloadGeneratedWaterFlowOverlaySessions(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport);
+bool LoadAnimationPathVariant(
+    PreviewRuntimeState* runtimeState,
+    const std::filesystem::path& inputPath,
+    bool useEditedVersion);
+
 invisible_places::serialization::WaterSceneStateDocument
 BuildActiveWaterSceneStateSnapshot(
     const PreviewRuntimeState& runtimeState,
@@ -25563,6 +25596,7 @@ BuildActiveWaterSceneStateSnapshot(
 // keyed per scene by ActiveWaterTimingSceneGroupName.
 void SwitchActiveWaterSceneState(
     PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
     const std::string& targetSceneGroupName) {
     if (runtimeState == nullptr) {
         return;
@@ -25570,6 +25604,12 @@ void SwitchActiveWaterSceneState(
     const auto current = ActiveWaterTimingSceneGroupName(runtimeState->water);
     if (current == targetSceneGroupName) {
         return;
+    }
+    // Derived trail overlays belong to the outgoing scene's sources; drop
+    // them so Fossils never shows Pools' trails (they regenerate from the
+    // incoming scene's sources on the queued refresh).
+    if (viewport != nullptr) {
+        UnloadGeneratedWaterFlowOverlaySessions(runtimeState, viewport);
     }
     auto& store = runtimeState->persistence.inactiveWaterSceneStates;
     auto outgoing = BuildActiveWaterSceneStateSnapshot(*runtimeState, current);
@@ -25623,15 +25663,100 @@ void SwitchActiveWaterSceneState(
 // (Project panel, Lidar checkboxes, Load Scene buttons) can flip the name
 // while another scene's seepage/flow/shoreline objects stay in the runtime
 // -- that mismatch is what mis-attributed Scene3's water to Scene1 on save.
+ScenePointCloudRuntime* FindSceneRuntimeByGroupName(
+    PreviewRuntimeState* runtimeState,
+    const std::string& sceneGroupName) {
+    for (auto& scene : runtimeState->pointCloudScenes) {
+        if (scene.sceneGroupName == sceneGroupName) {
+            return &scene;
+        }
+    }
+    return nullptr;
+}
+
+void ClearActiveAnimationSelection(PreviewRuntimeState* runtimeState) {
+    auto& panel = runtimeState->animationPanel;
+    runtimeState->animationPlayback.active = false;
+    runtimeState->cameraPlayback.active = false;
+    panel.currentFilePath.clear();
+    panel.currentPath.reset();
+    panel.currentPathUsesEdited = false;
+    panel.selectedFileUsesEdited = false;
+    panel.selectedFileIndex.reset();
+    panel.selectedKeyIndex.reset();
+}
+
+// The outgoing scene remembers where the user was: camera pose and loaded
+// animation, restored the next time that scene is activated (and persisted
+// with the scene group record).
+void CaptureSceneWorkspaceMemento(
+    PreviewRuntimeState* runtimeState,
+    const std::string& sceneGroupName) {
+    auto* scene = FindSceneRuntimeByGroupName(runtimeState, sceneGroupName);
+    if (scene == nullptr) {
+        return;
+    }
+    scene->hasLastCamera = true;
+    scene->lastCamera = runtimeState->camera.CaptureState();
+    const auto& panel = runtimeState->animationPanel;
+    scene->lastAnimationPath = panel.currentFilePath.empty()
+                                   ? std::filesystem::path{}
+                                   : std::filesystem::path{panel.currentFilePath};
+    scene->lastAnimationUsesEdited = panel.currentPathUsesEdited;
+}
+
+void RestoreSceneWorkspaceMemento(
+    PreviewRuntimeState* runtimeState,
+    const std::string& sceneGroupName) {
+    auto* scene = FindSceneRuntimeByGroupName(runtimeState, sceneGroupName);
+    auto& panel = runtimeState->animationPanel;
+    const bool hasStoredAnimation =
+        scene != nullptr && !scene->lastAnimationPath.empty() &&
+        std::filesystem::exists(scene->lastAnimationPath);
+    if (hasStoredAnimation) {
+        LoadAnimationPathVariant(
+            runtimeState,
+            scene->lastAnimationPath,
+            scene->lastAnimationUsesEdited);
+        runtimeState->animationPlayback.active = false;
+        runtimeState->cameraPlayback.active = false;
+    } else if (!panel.dirty) {
+        // A fresh scene starts without the other scene's animation. Unsaved
+        // edits are never discarded by a scene switch.
+        ClearActiveAnimationSelection(runtimeState);
+    }
+    if (scene != nullptr && scene->hasLastCamera) {
+        runtimeState->camera.ApplyState(scene->lastCamera);
+        runtimeState->cameraPlayback.active = false;
+        SyncPivotOverlayToCamera(runtimeState);
+        // The display commit must keep this restored pose instead of
+        // re-framing the freshly loaded scene.
+        runtimeState->preserveProjectCameraOnNextLayerActivation = true;
+    } else {
+        // First visit: let the commit's framing pick the scene's own view.
+        runtimeState->selectedSessionIndex.reset();
+    }
+    runtimeState->previewRenderStateSignatureValid = false;
+}
+
 void SetAuthoritativeWaterScene(
     PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
     const std::string& sceneGroupName) {
     if (runtimeState == nullptr) {
         return;
     }
-    SwitchActiveWaterSceneState(runtimeState, sceneGroupName);
+    const auto current = ActiveWaterTimingSceneGroupName(runtimeState->water);
+    const bool changingScene = current != sceneGroupName;
+    if (changingScene) {
+        CaptureSceneWorkspaceMemento(runtimeState, current);
+    }
+    SwitchActiveWaterSceneState(runtimeState, viewport, sceneGroupName);
     runtimeState->water.authoritativeWaterSurfaceSceneGroupName = sceneGroupName;
     runtimeState->water.activeWaterSurfaceSceneGroupName = sceneGroupName;
+    if (changingScene) {
+        RestoreSceneWorkspaceMemento(runtimeState, sceneGroupName);
+    }
 }
 
 void ActivateExclusiveScene(
@@ -25654,7 +25779,7 @@ void ActivateExclusiveScene(
         return;
     }
 
-    SetAuthoritativeWaterScene(runtimeState, target->sceneGroupName);
+    SetAuthoritativeWaterScene(runtimeState, viewport, target->sceneGroupName);
     CancelWaterSurfaceCacheWarmup(&runtimeState->water);
 
     for (auto& scene : runtimeState->pointCloudScenes) {
@@ -25841,6 +25966,12 @@ bool ApplyScenePointCloudGroupDocuments(
         if (!groupIt->displayName.empty()) {
             scene.displayName = groupIt->displayName;
         }
+        if (groupIt->lastCamera.has_value()) {
+            scene.hasLastCamera = true;
+            scene.lastCamera = groupIt->lastCamera.value();
+        }
+        scene.lastAnimationPath = groupIt->lastAnimationPath;
+        scene.lastAnimationUsesEdited = groupIt->lastAnimationUsesEdited;
         scene.waterSurfaceCache = groupIt->waterSurfaceCache;
         scene.waterSurfaceCacheStatus = InitialWaterSurfaceCacheStatus(
             *runtimeState,
@@ -72753,7 +72884,7 @@ void DrawVisiblePointCloudSelector(
                                    3) +
                                " mm — " + FormatPointCount(bundle.totalPointCount) + " points";
             if (ImGui::Selectable(label.c_str(), selected)) {
-                SetAuthoritativeWaterScene(runtimeState, scene->sceneGroupName);
+                SetAuthoritativeWaterScene(runtimeState, viewport, scene->sceneGroupName);
                 RequestSceneDisplaySwitch(
                     runtimeState,
                     viewport,
@@ -72921,7 +73052,7 @@ void DrawLidarPanel(
                 if (ImGui::Checkbox("Visible", &visible)) {
                     scene.displayVisible = visible;
                     if (visible) {
-                        SetAuthoritativeWaterScene(runtimeState, scene.sceneGroupName);
+                        SetAuthoritativeWaterScene(runtimeState, viewport, scene.sceneGroupName);
                     }
                     for (const auto sessionIndex : scene.committedDisplaySessionIndices) {
                         if (sessionIndex.has_value() && runtimeState->sessions[sessionIndex.value()].gpuResident) {
@@ -72952,7 +73083,7 @@ void DrawLidarPanel(
                     (scene.committedDisplaySpacingMicrometres.has_value() || mixedLoadAvailable)) {
                     if (ImGui::Button("Load Scene")) {
                         scene.displayVisible = true;
-                        SetAuthoritativeWaterScene(runtimeState, scene.sceneGroupName);
+                        SetAuthoritativeWaterScene(runtimeState, viewport, scene.sceneGroupName);
                         if (scene.committedDisplaySpacingMicrometres.has_value()) {
                             RequestSceneDisplaySwitch(
                                 runtimeState,
