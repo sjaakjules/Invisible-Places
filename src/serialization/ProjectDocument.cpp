@@ -1901,6 +1901,9 @@ json SerializeProjectLayer(const ProjectLayerDocument& layer) {
     if (!layer.selectedSceneVariantPath.empty()) {
         layerJson["selected_scene_variant_path"] = layer.selectedSceneVariantPath.generic_string();
     }
+    if (!layer.waterFillDetachedVisualSettings.empty()) {
+        layerJson["water_fill_detached_visuals"] = layer.waterFillDetachedVisualSettings;
+    }
     return layerJson;
 }
 
@@ -1915,6 +1918,14 @@ ProjectLayerDocument ParseProjectLayer(const json& layerJson) {
     layer.pointSpacingManualOverride = layerJson.value("point_spacing_manual_override", false);
     layer.scenePrimaryRole = layerJson.value("scene_primary_role", false);
     layer.selectedSceneVariantPath = layerJson.value("selected_scene_variant_path", std::string{});
+    if (layerJson.contains("water_fill_detached_visuals") &&
+        layerJson.at("water_fill_detached_visuals").is_array()) {
+        for (const auto& idJson : layerJson.at("water_fill_detached_visuals")) {
+            if (idJson.is_string()) {
+                layer.waterFillDetachedVisualSettings.push_back(idJson.get<std::string>());
+            }
+        }
+    }
     layer.loaded = layerJson.value("loaded", false);
     layer.visible = layerJson.value("visible", false);
     layer.pointBudgetActivePoints = layerJson.value("point_budget_active_points", 0ULL);

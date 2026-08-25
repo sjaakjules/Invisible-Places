@@ -22,7 +22,7 @@
 
 namespace invisible_places::serialization {
 
-inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 81U;
+inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 82U;
 inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 32U;
 inline constexpr std::uint32_t kWaterRainProfilesSourcesSchemaVersion = 31U;
 inline constexpr std::uint32_t kWaterOwnedShorelineProjectSchemaVersion = 66U;
@@ -46,6 +46,9 @@ struct ProjectLayerDocument {
     bool pointSpacingManualOverride = false;
     bool scenePrimaryRole = false;
     std::filesystem::path selectedSceneVariantPath;
+    // Schema 82: water-fill sessions that follow the scene's SAND visuals
+    // record which setting groups the user detached from the link.
+    std::vector<std::string> waterFillDetachedVisualSettings;
     bool loaded = false;
     bool visible = false;
     std::uint64_t pointBudgetActivePoints = 0;

@@ -2892,6 +2892,9 @@ struct PreviewLayerSession {
     std::vector<SavedPointVisualState> pointVisuals;
     std::string selectedPointVisualName = std::string{kDefaultPointVisualName};
     std::string pointVisualNameBuffer = std::string{kDefaultPointVisualName};
+    // Water-fill sessions follow their scene's SAND visuals; these are the
+    // setting-group ids the user detached (empty for every other session).
+    std::vector<std::string> waterFillDetachedVisualSettings;
     GaussianSplatStyleState gsplatStyle{};
 };
 
@@ -4570,6 +4573,8 @@ ResolveCurrentTimingTakeExportSnapshot(
         errorMessage);
 }
 
+bool IsWaterFillPointCloudSession(const PreviewLayerSession& session);
+
 bool IsAuthoredTimingColouriseLayer(
     const PreviewLayerSession& session) {
     if (session.kind != LayerKind::PointCloud ||
@@ -4580,7 +4585,10 @@ bool IsAuthoredTimingColouriseLayer(
     const auto role =
         invisible_places::scene::ParseScenePointCloudRole(
             session.sceneRole);
-    return role.has_value();
+    // The standing-water gap fill takes Visual features exactly like the
+    // scene's SAND layer: it carries the full source scalar schema, so the
+    // authored timing colourise stacks resolve on it unchanged.
+    return role.has_value() || IsWaterFillPointCloudSession(session);
 }
 
 invisible_places::renderer::pointcloud::ResolvedTimingColouriseStack
@@ -10492,6 +10500,296 @@ bool ShorelineWaveEligibleSession(const PreviewLayerSession& session) {
            IsWaterFillPointCloudSession(session);
 }
 
+// ---- Water-fill visual linking ------------------------------------------
+// The standing-water gap fill follows its scene's SAND visuals by default.
+// Each named setting group stays linked until the user edits it on the water
+// cloud; a group whose value matches the SAND style again re-links itself.
+// Linked groups are copied from SAND in memory only (they never persist),
+// while detached groups persist through the water session's own scene visual
+// state plus the detached-id list carried on its project layer record.
+
+struct WaterFillVisualSettingGroup {
+    const char* id;
+    void (*copy)(PointCloudStyleState*, const PointCloudStyleState&);
+    bool (*equal)(const PointCloudStyleState&, const PointCloudStyleState&);
+};
+
+bool WaterFillVisualFloatsEqual(float left, float right) {
+    return std::fabs(left - right) <= 1.0e-4F;
+}
+
+template <std::size_t Size>
+bool WaterFillVisualColoursEqual(const std::array<float, Size>& left,
+                                 const std::array<float, Size>& right) {
+    for (std::size_t index = 0; index < Size; ++index) {
+        if (!WaterFillVisualFloatsEqual(left[index], right[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool WaterFillVisualBindingsEqual(
+    const invisible_places::style::RenderParameterBinding& left,
+    const invisible_places::style::RenderParameterBinding& right) {
+    return invisible_places::style::ScalarRenderParameterBindingsAuthoringEqual(left, right);
+}
+
+const std::array<WaterFillVisualSettingGroup, 14>& WaterFillVisualSettingGroups() {
+    static const std::array<WaterFillVisualSettingGroup, 14> groups{{
+        {"geometry",
+         [](PointCloudStyleState* target, const PointCloudStyleState& source) {
+             target->geometryMode = source.geometryMode;
+             target->screenSpriteSizeMode = source.screenSpriteSizeMode;
+             target->waterStreakAspect = source.waterStreakAspect;
+         },
+         [](const PointCloudStyleState& a, const PointCloudStyleState& b) {
+             return a.geometryMode == b.geometryMode &&
+                    a.screenSpriteSizeMode == b.screenSpriteSizeMode &&
+                    WaterFillVisualFloatsEqual(a.waterStreakAspect, b.waterStreakAspect);
+         }},
+        {"point_size",
+         [](PointCloudStyleState* target, const PointCloudStyleState& source) {
+             target->pointSize = source.pointSize;
+             target->surfelDiameter = source.surfelDiameter;
+         },
+         [](const PointCloudStyleState& a, const PointCloudStyleState& b) {
+             return WaterFillVisualBindingsEqual(a.pointSize, b.pointSize) &&
+                    WaterFillVisualBindingsEqual(a.surfelDiameter, b.surfelDiameter);
+         }},
+        {"colour_source",
+         [](PointCloudStyleState* target, const PointCloudStyleState& source) {
+             target->colorMode = source.colorMode;
+         },
+         [](const PointCloudStyleState& a, const PointCloudStyleState& b) {
+             return a.colorMode == b.colorMode;
+         }},
+        {"solid_colour",
+         [](PointCloudStyleState* target, const PointCloudStyleState& source) {
+             target->solidColor = source.solidColor;
+         },
+         [](const PointCloudStyleState& a, const PointCloudStyleState& b) {
+             return WaterFillVisualColoursEqual(a.solidColor, b.solidColor);
+         }},
+        {"colormap",
+         [](PointCloudStyleState* target, const PointCloudStyleState& source) {
+             target->colormap = source.colormap;
+             target->gradientStartColor = source.gradientStartColor;
+             target->gradientEndColor = source.gradientEndColor;
+         },
+         [](const PointCloudStyleState& a, const PointCloudStyleState& b) {
+             return a.colormap == b.colormap &&
+                    WaterFillVisualColoursEqual(a.gradientStartColor, b.gradientStartColor) &&
+                    WaterFillVisualColoursEqual(a.gradientEndColor, b.gradientEndColor);
+         }},
+        {"colourise",
+         [](PointCloudStyleState* target, const PointCloudStyleState& source) {
+             target->colorizeColor = source.colorizeColor;
+             target->colorizeAmount = source.colorizeAmount;
+         },
+         [](const PointCloudStyleState& a, const PointCloudStyleState& b) {
+             return WaterFillVisualColoursEqual(a.colorizeColor, b.colorizeColor) &&
+                    WaterFillVisualFloatsEqual(a.colorizeAmount, b.colorizeAmount);
+         }},
+        {"colormap_position",
+         [](PointCloudStyleState* target, const PointCloudStyleState& source) {
+             target->colormapPosition = source.colormapPosition;
+         },
+         [](const PointCloudStyleState& a, const PointCloudStyleState& b) {
+             return WaterFillVisualBindingsEqual(a.colormapPosition, b.colormapPosition);
+         }},
+        {"stylisation",
+         [](PointCloudStyleState* target, const PointCloudStyleState& source) {
+             target->stylisationMode = source.stylisationMode;
+             target->nprPreset = source.nprPreset;
+             target->stylisationStrength = source.stylisationStrength;
+             target->stylisationColorLevels = source.stylisationColorLevels;
+             target->stylisationInkStrength = source.stylisationInkStrength;
+             target->stylisationPaperGrain = source.stylisationPaperGrain;
+             target->stylisationPigmentBleed = source.stylisationPigmentBleed;
+             target->brushAspect = source.brushAspect;
+             target->strokeJitter = source.strokeJitter;
+             target->hatchStrength = source.hatchStrength;
+             target->strokeOpacityVariance = source.strokeOpacityVariance;
+             target->pigmentVariation = source.pigmentVariation;
+             target->pigmentAnimationSpeed = source.pigmentAnimationSpeed;
+             target->granulationAngleStrength = source.granulationAngleStrength;
+         },
+         [](const PointCloudStyleState& a, const PointCloudStyleState& b) {
+             return a.stylisationMode == b.stylisationMode &&
+                    a.nprPreset == b.nprPreset &&
+                    WaterFillVisualFloatsEqual(a.stylisationStrength, b.stylisationStrength) &&
+                    WaterFillVisualFloatsEqual(a.stylisationColorLevels, b.stylisationColorLevels) &&
+                    WaterFillVisualFloatsEqual(a.stylisationInkStrength, b.stylisationInkStrength) &&
+                    WaterFillVisualFloatsEqual(a.stylisationPaperGrain, b.stylisationPaperGrain) &&
+                    WaterFillVisualFloatsEqual(a.stylisationPigmentBleed, b.stylisationPigmentBleed) &&
+                    WaterFillVisualFloatsEqual(a.brushAspect, b.brushAspect) &&
+                    WaterFillVisualFloatsEqual(a.strokeJitter, b.strokeJitter) &&
+                    WaterFillVisualFloatsEqual(a.hatchStrength, b.hatchStrength) &&
+                    WaterFillVisualFloatsEqual(a.strokeOpacityVariance, b.strokeOpacityVariance) &&
+                    WaterFillVisualFloatsEqual(a.pigmentVariation, b.pigmentVariation) &&
+                    WaterFillVisualFloatsEqual(a.pigmentAnimationSpeed, b.pigmentAnimationSpeed) &&
+                    WaterFillVisualFloatsEqual(a.granulationAngleStrength, b.granulationAngleStrength);
+         }},
+        {"surface_motion",
+         [](PointCloudStyleState* target, const PointCloudStyleState& source) {
+             target->roughnessMotionStrength = source.roughnessMotionStrength;
+             target->roughnessMotionScale = source.roughnessMotionScale;
+             target->roughnessMotionSpeed = source.roughnessMotionSpeed;
+             target->roughnessMotionThreshold = source.roughnessMotionThreshold;
+             target->roughnessMotionGroundId = source.roughnessMotionGroundId;
+             target->roughnessMotionFullLayer = source.roughnessMotionFullLayer;
+         },
+         [](const PointCloudStyleState& a, const PointCloudStyleState& b) {
+             return WaterFillVisualFloatsEqual(a.roughnessMotionStrength, b.roughnessMotionStrength) &&
+                    WaterFillVisualFloatsEqual(a.roughnessMotionScale, b.roughnessMotionScale) &&
+                    WaterFillVisualFloatsEqual(a.roughnessMotionSpeed, b.roughnessMotionSpeed) &&
+                    WaterFillVisualFloatsEqual(a.roughnessMotionThreshold, b.roughnessMotionThreshold) &&
+                    WaterFillVisualFloatsEqual(a.roughnessMotionGroundId, b.roughnessMotionGroundId) &&
+                    a.roughnessMotionFullLayer == b.roughnessMotionFullLayer;
+         }},
+        {"falloff",
+         [](PointCloudStyleState* target, const PointCloudStyleState& source) {
+             target->falloffProfile = source.falloffProfile;
+             target->solidCenters = source.solidCenters;
+             target->innerRadius = source.innerRadius;
+             target->gaussianSharpness = source.gaussianSharpness;
+             target->featherPower = source.featherPower;
+         },
+         [](const PointCloudStyleState& a, const PointCloudStyleState& b) {
+             return a.falloffProfile == b.falloffProfile &&
+                    a.solidCenters == b.solidCenters &&
+                    WaterFillVisualFloatsEqual(a.innerRadius, b.innerRadius) &&
+                    WaterFillVisualFloatsEqual(a.gaussianSharpness, b.gaussianSharpness) &&
+                    WaterFillVisualFloatsEqual(a.featherPower, b.featherPower);
+         }},
+        {"opacity",
+         [](PointCloudStyleState* target, const PointCloudStyleState& source) {
+             target->opacity = source.opacity;
+         },
+         [](const PointCloudStyleState& a, const PointCloudStyleState& b) {
+             return WaterFillVisualBindingsEqual(a.opacity, b.opacity);
+         }},
+        {"emission",
+         [](PointCloudStyleState* target, const PointCloudStyleState& source) {
+             target->emissiveStrength = source.emissiveStrength;
+         },
+         [](const PointCloudStyleState& a, const PointCloudStyleState& b) {
+             return WaterFillVisualBindingsEqual(a.emissiveStrength, b.emissiveStrength);
+         }},
+        {"exposure",
+         [](PointCloudStyleState* target, const PointCloudStyleState& source) {
+             target->exposure = source.exposure;
+         },
+         [](const PointCloudStyleState& a, const PointCloudStyleState& b) {
+             return WaterFillVisualFloatsEqual(a.exposure, b.exposure);
+         }},
+        {"depth_fade",
+         [](PointCloudStyleState* target, const PointCloudStyleState& source) {
+             target->depthFade = source.depthFade;
+         },
+         [](const PointCloudStyleState& a, const PointCloudStyleState& b) {
+             return WaterFillVisualBindingsEqual(a.depthFade, b.depthFade);
+         }},
+    }};
+    return groups;
+}
+
+std::optional<std::size_t> FindWaterFillSceneSandSessionIndex(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& waterSession) {
+    if (!IsWaterFillPointCloudSession(waterSession)) {
+        return std::nullopt;
+    }
+    const auto folderKey = NormalizePathKey(waterSession.sourcePath.parent_path());
+    const auto sandRole = invisible_places::scene::ScenePointCloudRoleIndex(
+        invisible_places::scene::ScenePointCloudRole::Sand);
+    for (const auto& scene : runtimeState.pointCloudScenes) {
+        if (NormalizePathKey(scene.sourceFolder) != folderKey) {
+            continue;
+        }
+        for (const auto candidate : {scene.committedDisplaySessionIndices[sandRole],
+                                     scene.analysisSessionIndices[sandRole]}) {
+            if (candidate.has_value() && candidate.value() < runtimeState.sessions.size()) {
+                return candidate;
+            }
+        }
+    }
+    for (std::size_t index = 0; index < runtimeState.sessions.size(); ++index) {
+        const auto& candidate = runtimeState.sessions[index];
+        if (candidate.kind == LayerKind::PointCloud &&
+            SceneRoleIs(candidate.sceneRole, "sand") &&
+            NormalizePathKey(candidate.sourcePath.parent_path()) == folderKey) {
+            return index;
+        }
+    }
+    return std::nullopt;
+}
+
+bool WaterFillVisualSettingDetached(const PreviewLayerSession& session, std::string_view id) {
+    return std::find(session.waterFillDetachedVisualSettings.begin(),
+                     session.waterFillDetachedVisualSettings.end(),
+                     id) != session.waterFillDetachedVisualSettings.end();
+}
+
+void RecomputeWaterFillDetachedVisualSettings(
+    PreviewRuntimeState* runtimeState,
+    PreviewLayerSession* session) {
+    if (runtimeState == nullptr || session == nullptr) {
+        return;
+    }
+    const auto sandIndex = FindWaterFillSceneSandSessionIndex(*runtimeState, *session);
+    if (!sandIndex.has_value()) {
+        return;
+    }
+    const auto& sandStyle = runtimeState->sessions[sandIndex.value()].pointStyle;
+    std::vector<std::string> detached;
+    for (const auto& group : WaterFillVisualSettingGroups()) {
+        if (!group.equal(session->pointStyle, sandStyle)) {
+            detached.emplace_back(group.id);
+        }
+    }
+    session->waterFillDetachedVisualSettings = std::move(detached);
+}
+
+// Copies every linked setting group from the same-folder SAND session onto
+// each water-fill session. Called after visual edits, project applies, layer
+// loads, and display commits; in-memory only (linked values never persist).
+bool SyncWaterFillVisualsFromScene(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+    bool anyChanged = false;
+    for (auto& session : runtimeState->sessions) {
+        if (!IsWaterFillPointCloudSession(session)) {
+            continue;
+        }
+        const auto sandIndex = FindWaterFillSceneSandSessionIndex(*runtimeState, session);
+        if (!sandIndex.has_value()) {
+            continue;
+        }
+        const auto& sandStyle = runtimeState->sessions[sandIndex.value()].pointStyle;
+        bool changed = false;
+        for (const auto& group : WaterFillVisualSettingGroups()) {
+            if (WaterFillVisualSettingDetached(session, group.id)) {
+                continue;
+            }
+            if (!group.equal(session.pointStyle, sandStyle)) {
+                group.copy(&session.pointStyle, sandStyle);
+                changed = true;
+            }
+        }
+        if (changed) {
+            SanitizePointCloudStyle(&session);
+            anyChanged = true;
+        }
+    }
+    if (anyChanged) {
+        runtimeState->previewRenderStateSignatureValid = false;
+    }
+    return anyChanged;
+}
+
 bool IsInactiveLegacyWaterOverlaySession(
     const PreviewLayerSession& session) {
     if (session.kind != LayerKind::PointCloud) {
@@ -12016,6 +12314,9 @@ bool ActivateLoadedPointCloud(
     } else {
         SanitizePointCloudStyle(&session);
     }
+    // A freshly loaded water fill adopts the scene visuals for its linked
+    // groups (and a freshly loaded SAND propagates to any loaded water fill).
+    SyncWaterFillVisualsFromScene(runtimeState);
     if (session.kind == LayerKind::PointCloud) {
         if (session.sceneRole == "SAND" && session.bounds.valid) {
             const float widthX = session.bounds.maximum.x - session.bounds.minimum.x;
@@ -13650,6 +13951,7 @@ bool CommitSceneDisplaySwitch(
             QueueLayerLoad(runtimeState, companionIndex, PointCloudLoadPurpose::Interactive);
         }
     }
+    SyncWaterFillVisualsFromScene(runtimeState);
     if (runtimeState->water.authoritativeWaterSurfaceSceneGroupName.empty() ||
         runtimeState->water.authoritativeWaterSurfaceSceneGroupName ==
             scene->sceneGroupName) {
@@ -24424,6 +24726,7 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
         layerDocument.pointSpacingManualOverride = session.pointSpacingManualOverride;
         layerDocument.scenePrimaryRole = session.scenePrimaryRole;
         layerDocument.selectedSceneVariantPath = session.selectedSceneVariantPath;
+        layerDocument.waterFillDetachedVisualSettings = session.waterFillDetachedVisualSettings;
         layerDocument.loaded = session.loaded;
         layerDocument.visible = session.visible;
         if (const auto* scene = FindScenePointCloudRuntime(runtimeState, session); scene != nullptr) {
@@ -25825,6 +26128,8 @@ bool ApplyProjectDocumentToRuntime(
             if (!layerIt->sceneRole.empty()) {
                 session.sceneRole = layerIt->sceneRole;
             }
+            session.waterFillDetachedVisualSettings =
+                layerIt->waterFillDetachedVisualSettings;
             if (layerIt->inferredPointSpacingMeters > 0.0F) {
                 session.inferredPointSpacingMeters = layerIt->inferredPointSpacingMeters;
             }
@@ -25861,6 +26166,7 @@ bool ApplyProjectDocumentToRuntime(
                         runtimeState->pointVisualLibrary,
                         session.selectedPointVisualName);
                 ApplyProjectPointVisualToSession(runtimeState, &session);
+                SyncWaterFillVisualsFromScene(runtimeState);
             }
         } else if (session.kind == LayerKind::GaussianSplat) {
             ApplyProjectGsplatVisualStyleToSession(*runtimeState, &session);
@@ -51099,7 +51405,8 @@ bool DrawPointCloudEmissionSection(
 
 bool DrawPointCloudDepthFadeSection(
     PreviewRuntimeState* runtimeState,
-    PreviewLayerSession* session) {
+    PreviewLayerSession* session,
+    const invisible_places::style::RenderParameterBinding* savedBaseBinding = nullptr) {
     if (session == nullptr) {
         return false;
     }
@@ -51118,12 +51425,14 @@ bool DrawPointCloudDepthFadeSection(
          .defaultConstant = 0.0F,
          .format = "%.2f",
          .hardMin = 0.0F,
-         .hardMax = 1.0F});
+         .hardMax = 1.0F},
+        savedBaseBinding);
 }
 
 bool DrawPointCloudStyleSection(
     PreviewRuntimeState* runtimeState,
-    PreviewLayerSession* session) {
+    PreviewLayerSession* session,
+    const PointCloudStyleState* linkedBaseStyle = nullptr) {
     if (session == nullptr) {
         return false;
     }
@@ -51135,7 +51444,7 @@ bool DrawPointCloudStyleSection(
     changed |= DrawPointCloudStylisationSection(session);
     changed |= DrawPointCloudSurfaceMotionSection(session);
     changed |= DrawPointCloudFalloffSection(session);
-    changed |= DrawPointCloudColourSection(runtimeState, session);
+    changed |= DrawPointCloudColourSection(runtimeState, session, linkedBaseStyle);
     changed |= DrawVisualBindingSection(
         "Opacity",
         "Opacity",
@@ -51150,9 +51459,13 @@ bool DrawPointCloudStyleSection(
          .defaultConstant = 1.0F,
          .format = "%.2f",
          .hardMin = 0.0F,
-         .hardMax = 1.0F});
-    changed |= DrawPointCloudEmissionSection(runtimeState, session);
-    changed |= DrawPointCloudDepthFadeSection(runtimeState, session);
+         .hardMax = 1.0F},
+        linkedBaseStyle != nullptr ? &linkedBaseStyle->opacity : nullptr);
+    changed |= DrawPointCloudEmissionSection(runtimeState, session, linkedBaseStyle);
+    changed |= DrawPointCloudDepthFadeSection(
+        runtimeState,
+        session,
+        linkedBaseStyle != nullptr ? &linkedBaseStyle->depthFade : nullptr);
 
     if (changed) {
         SanitizePointCloudStyle(session);
@@ -72203,6 +72516,64 @@ void DrawPointRendererPanel(PreviewRuntimeState* runtimeState) {
     EndPanelSection();
 }
 
+void RelinkWaterFillVisualSetting(
+    PreviewRuntimeState* runtimeState,
+    PreviewLayerSession* session,
+    std::string_view id) {
+    if (runtimeState == nullptr || session == nullptr) {
+        return;
+    }
+    if (const auto sandIndex = FindWaterFillSceneSandSessionIndex(*runtimeState, *session);
+        sandIndex.has_value()) {
+        const auto& sandStyle = runtimeState->sessions[sandIndex.value()].pointStyle;
+        for (const auto& group : WaterFillVisualSettingGroups()) {
+            if (id == group.id) {
+                group.copy(&session->pointStyle, sandStyle);
+                break;
+            }
+        }
+    }
+    std::erase(session->waterFillDetachedVisualSettings, std::string{id});
+    SanitizePointCloudStyle(session);
+    MarkPointVisualEdited(runtimeState, session);
+    runtimeState->statusMessage =
+        "Re-linked '" + std::string{id} + "' to the scene cloud visuals.";
+}
+
+void DrawWaterFillVisualLinkBanner(
+    PreviewRuntimeState* runtimeState,
+    PreviewLayerSession* session) {
+    const auto sandIndex = FindWaterFillSceneSandSessionIndex(*runtimeState, *session);
+    if (!sandIndex.has_value()) {
+        ImGui::TextDisabled("No SAND layer in this folder to follow; settings are standalone.");
+        return;
+    }
+    const auto& sandSession = runtimeState->sessions[sandIndex.value()];
+    const auto sceneLabel = sandSession.sceneGroupName.empty()
+                                ? sandSession.displayName
+                                : sandSession.sceneGroupName;
+    ImGui::TextUnformatted(("Following " + sceneLabel + " scene visuals.").c_str());
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Linked settings update whenever the scene cloud's visuals change.\n"
+            "Editing a setting here detaches just that setting (the scene value\n"
+            "shows in brackets where supported). Set it back to the scene value\n"
+            "or click its chip below to re-link it.");
+    }
+    if (session->waterFillDetachedVisualSettings.empty()) {
+        ImGui::TextDisabled("All settings linked.");
+        return;
+    }
+    ImGui::TextDisabled("Detached (click to re-link):");
+    const auto detached = session->waterFillDetachedVisualSettings;
+    for (const auto& id : detached) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton(id.c_str())) {
+            RelinkWaterFillVisualSetting(runtimeState, session, id);
+        }
+    }
+}
+
 void DrawVisualsPanel(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
@@ -72222,12 +72593,27 @@ void DrawVisualsPanel(
         return;
     }
 
-    if (DrawPointCloudStyleSection(runtimeState, session)) {
+    const PointCloudStyleState* linkedBaseStyle = nullptr;
+    if (IsWaterFillPointCloudSession(*session)) {
+        if (const auto sandIndex = FindWaterFillSceneSandSessionIndex(*runtimeState, *session);
+            sandIndex.has_value()) {
+            linkedBaseStyle = &runtimeState->sessions[sandIndex.value()].pointStyle;
+        }
+        ImGui::Spacing();
+        DrawWaterFillVisualLinkBanner(runtimeState, session);
+        ImGui::Spacing();
+    }
+
+    if (DrawPointCloudStyleSection(runtimeState, session, linkedBaseStyle)) {
+        if (IsWaterFillPointCloudSession(*session)) {
+            RecomputeWaterFillDetachedVisualSettings(runtimeState, session);
+        }
         MarkPointVisualEdited(runtimeState, session);
         if (!IsProjectPointVisualSession(*session)) {
             SyncScenePointVisualsFromOwner(runtimeState, session);
         }
         SyncWaterPointVisualSelectionFromSession(runtimeState, *session);
+        SyncWaterFillVisualsFromScene(runtimeState);
     }
 }
 

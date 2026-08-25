@@ -4361,6 +4361,39 @@ TEST_CASE("Animation default live-view window size round-trips and remains unset
   CHECK(legacy->defaultLiveViewWindowHeight == 0U);
 }
 
+TEST_CASE("Water-fill detached visual settings survive a serialize-parse round trip",
+          "[serialization][project][water-fill]") {
+    using invisible_places::serialization::LoadProjectDocument;
+    using invisible_places::serialization::ProjectDocument;
+    using invisible_places::serialization::ProjectLayerDocument;
+    using invisible_places::serialization::SaveProjectDocument;
+    using invisible_places::serialization::SerializedLayerKind;
+    ProjectDocument document;
+    ProjectLayerDocument layer;
+    layer.kind = SerializedLayerKind::PointCloud;
+    layer.sourcePath = "Data/Scene1/Site1-WATER-5mm.ply";
+    layer.loaded = true;
+    layer.visible = true;
+    layer.waterFillDetachedVisualSettings = {"opacity", "colormap", "exposure"};
+    document.layers.push_back(layer);
+
+    // A layer without the key must parse to an empty (all-linked) list.
+    ProjectLayerDocument plain;
+    plain.kind = SerializedLayerKind::PointCloud;
+    plain.sourcePath = "Data/Scene1/Site1-SAND-5mm.ply";
+    document.layers.push_back(plain);
+
+    TemporaryProjectFile file{"invisible_places_water_fill_visuals_project.json"};
+    std::string errorMessage;
+    REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+    const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded->layers.size() == 2U);
+    CHECK(loaded->layers.front().waterFillDetachedVisualSettings ==
+          std::vector<std::string>{"opacity", "colormap", "exposure"});
+    CHECK(loaded->layers.back().waterFillDetachedVisualSettings.empty());
+}
+
 TEST_CASE("Unresolved scene entries survive a load-save round trip",
           "[serialization][project][unresolved-scenes]") {
   using invisible_places::serialization::ExtractUnresolvedProjectSceneEntries;
