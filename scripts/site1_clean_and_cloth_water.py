@@ -99,6 +99,22 @@ OUTSIDE_Z_CAP = 2.6
 WATER_SCAN_ID = 999.0
 RUN_NAME = "20260825-noise-cleanup-v3"
 
+# Conservative recovery for gaps punched into the water fill by the coarse
+# steep-cloth veto.  Recovery is inferred from the SAND layer in XY, but its
+# height must also agree in 3D and a high ROCK neighbourhood vetoes it.
+WATER_SUPPORT_CELL = 0.025
+WATER_SUPPORT_Z_CAP = 2.65
+WATER_XY_SEED_CLOSE_M = 0.05
+WATER_XY_CLOSE_M = 0.40
+WATER_Z_COHERENCE_SIGMA_M = 0.20
+WATER_Z_STD_MAX = 0.10
+WATER_ROCK_CLEARANCE = 0.12
+WATER_ROCK_LOCAL_MIN = 0.15
+WATER_ROCK_DOMINANCE = 1.00
+WATER_RECOVERY_EDGE_CLEAR_M = 0.075
+WATER_RECOVERY_MAX_COMPONENT_M2 = 5.0
+WATER_RECOVERY_MIN_CONFIDENCE = 0.10
+
 # v2 classifier guards (after the v1 review): ghost tests only where the
 # cloth is near-flat (rock intersections broke the band logic and lost real
 # squares), the below-cover must be a near-horizontal surface, and a
@@ -724,6 +740,112 @@ def sample_grid(grid, px, py, gx0, gy0, cell, order=1):
     return map_coordinates(grid, [v, u], order=order, mode="nearest").astype(np.float32)
 
 
+def _disk_close(mask, radius_cells):
+    """Binary closing with a Euclidean disk and an explicit empty border."""
+    from scipy import ndimage
+    radius_cells = int(radius_cells)
+    if radius_cells <= 0:
+        return mask.copy()
+    padded = np.pad(mask, radius_cells, mode="constant", constant_values=False)
+    dilated = ndimage.distance_transform_edt(~padded) <= radius_cells
+    closed = ndimage.distance_transform_edt(dilated) > radius_cells
+    return closed[radius_cells:-radius_cells, radius_cells:-radius_cells]
+
+
+def _normalised_gaussian(values, known, sigma):
+    """Gaussian mean and support weight without allowing NaNs to spread."""
+    from scipy import ndimage
+    numerator = ndimage.gaussian_filter(
+        np.where(known, values, 0.0).astype(np.float32), sigma)
+    weight = ndimage.gaussian_filter(known.astype(np.float32), sigma)
+    mean = np.divide(numerator, weight, out=np.full_like(numerator, np.nan),
+                     where=weight > 1e-4)
+    return mean, weight
+
+
+def build_water_xy_recovery(sand_count, sand_zsum, rock_count, rock_zsum,
+                            in_hull, base_allowed, cell=WATER_SUPPORT_CELL):
+    """Recover small steep-mask holes only where original SAND is continuous.
+
+    The XY closing identifies gaps surrounded by the SAND layer.  A sand-only
+    height sheet and local height variance provide the 3D-connectedness test;
+    high, locally dominant ROCK and large/open regions remain excluded.  The
+    returned confidence is softly feathered to avoid a new cell-shaped edge.
+    """
+    from scipy import ndimage
+
+    shape = in_hull.shape
+    arrays = (sand_count, sand_zsum, rock_count, rock_zsum, base_allowed)
+    if any(array.shape != shape for array in arrays):
+        raise ValueError("water recovery grids must have matching shapes")
+
+    sand_z = np.divide(
+        sand_zsum, sand_count,
+        out=np.full(shape, np.nan, np.float32), where=sand_count > 0)
+    rock_z = np.divide(
+        rock_zsum, rock_count,
+        out=np.full(shape, np.nan, np.float32), where=rock_count > 0)
+    sand_anchor = (in_hull & (sand_count > 0) & np.isfinite(sand_z) &
+                   (sand_z <= WATER_SUPPORT_Z_CAP))
+    empty_confidence = np.zeros(shape, np.float32)
+    if not sand_anchor.any():
+        stats = {"sand_anchor_cells": 0, "xy_continuity_cells": 0,
+                 "recovered_cells": 0, "recovered_area_m2": 0.0,
+                 "rock_veto_cells": 0, "z_veto_cells": 0,
+                 "large_component_veto_cells": 0}
+        return empty_confidence, np.full(shape, np.nan, np.float32), stats
+
+    seed_radius = max(1, int(round(WATER_XY_SEED_CLOSE_M / cell)))
+    close_radius = max(seed_radius, int(round(WATER_XY_CLOSE_M / cell)))
+    sand_surface = _disk_close(sand_anchor, seed_radius)
+    xy_continuity = _disk_close(sand_surface, close_radius)
+
+    sigma = max(1.0, WATER_Z_COHERENCE_SIGMA_M / cell)
+    sand_sheet, sand_weight = _normalised_gaussian(sand_z, sand_anchor, sigma)
+    sand_z2, _ = _normalised_gaussian(sand_z * sand_z, sand_anchor, sigma)
+    sand_z_std = np.sqrt(np.maximum(sand_z2 - sand_sheet * sand_sheet, 0.0))
+
+    sand_local = ndimage.gaussian_filter(sand_anchor.astype(np.float32), sigma)
+    high_rock = ((rock_count > 0) & np.isfinite(rock_z) &
+                 (rock_z > sand_sheet + WATER_ROCK_CLEARANCE))
+    rock_local = ndimage.gaussian_filter(high_rock.astype(np.float32), sigma)
+    rock_dominant = (high_rock |
+                     ((rock_local > WATER_ROCK_LOCAL_MIN) &
+                      (rock_local > WATER_ROCK_DOMINANCE * sand_local)))
+
+    edge_distance = ndimage.distance_transform_edt(in_hull) * cell
+    candidate = (in_hull & ~base_allowed & xy_continuity &
+                 (edge_distance >= WATER_RECOVERY_EDGE_CLEAR_M) &
+                 (sand_weight > 0.01) & (sand_sheet <= WATER_SUPPORT_Z_CAP) &
+                 (sand_z_std <= WATER_Z_STD_MAX) & ~rock_dominant)
+
+    labels, component_count = ndimage.label(
+        candidate, structure=np.ones((3, 3), bool))
+    sizes = np.bincount(labels.ravel(), minlength=component_count + 1)
+    max_cells = int(WATER_RECOVERY_MAX_COMPONENT_M2 / (cell * cell))
+    too_large = candidate & (sizes[labels] > max_cells)
+    recovered = candidate & ~too_large
+
+    # A one-cell halo and soft confidence make the recovery edge sub-cell and
+    # irregular after jittering, instead of exposing another square mask.
+    confidence = ndimage.gaussian_filter(recovered.astype(np.float32), 1.0)
+    confidence = np.clip(confidence / 0.5, 0.0, 1.0)
+    halo = ndimage.binary_dilation(recovered, iterations=1)
+    confidence[~(halo & in_hull)] = 0.0
+
+    stats = {
+        "sand_anchor_cells": int(sand_anchor.sum()),
+        "xy_continuity_cells": int((xy_continuity & in_hull).sum()),
+        "recovered_cells": int(recovered.sum()),
+        "recovered_area_m2": float(recovered.sum() * cell * cell),
+        "rock_veto_cells": int((xy_continuity & in_hull & rock_dominant).sum()),
+        "z_veto_cells": int((xy_continuity & in_hull &
+                             (sand_z_std > WATER_Z_STD_MAX)).sum()),
+        "large_component_veto_cells": int(too_large.sum()),
+    }
+    return confidence.astype(np.float32), sand_sheet.astype(np.float32), stats
+
+
 def stage_water(context: Context, data_dir: Path, work: Path):
     import open3d as o3d
     from scipy import ndimage
@@ -740,9 +862,15 @@ def stage_water(context: Context, data_dir: Path, work: Path):
     idw_fields = ["red", "green", "blue", "scalar_Intensity", "scalar_Composite",
                   "scalar_A_R_Shelter_Lower", "scalar_A_R_RainExposure_Lower",
                   "scalar_A_R_SVF_Lower"]
+    support_nx = int(context.nx * REGION_CELL / WATER_SUPPORT_CELL) + 1
+    support_ny = int(context.ny * REGION_CELL / WATER_SUPPORT_CELL) + 1
+    sand_support_count = np.zeros((support_ny, support_nx), np.uint32)
+    rock_support_count = np.zeros((support_ny, support_nx), np.uint32)
+    sand_support_zsum = np.zeros((support_ny, support_nx), np.float64)
+    rock_support_zsum = np.zeros((support_ny, support_nx), np.float64)
 
     # ---- one streaming pass: 1 cm coverage counts + measured heights,
-    # ---- 2.5 cm attribute sums/squares, and the keep-clear XY set
+    # ---- 2.5 cm SAND/ROCK continuity and attribute grids, plus keep-clear XY
     counts = np.zeros((ny, nx), np.float32)
     zsum = np.zeros(ny * nx, np.float64)
     zcnt = np.zeros(ny * nx, np.int64)
@@ -759,6 +887,19 @@ def stage_water(context: Context, data_dir: Path, work: Path):
             inside = (gx >= 0) & (gx < nx) & (gy >= 0) & (gy < ny)
             flat = gy[inside] * nx + gx[inside]
             np.add.at(counts.ravel(), flat, 1.0)
+            if role in ("SAND", "ROCK"):
+                sx = ((chunk["x"] - context.x0) / WATER_SUPPORT_CELL).astype(np.int64)
+                sy = ((chunk["y"] - context.y0) / WATER_SUPPORT_CELL).astype(np.int64)
+                support_inside = ((sx >= 0) & (sx < support_nx) &
+                                  (sy >= 0) & (sy < support_ny))
+                support_flat = sy[support_inside] * support_nx + sx[support_inside]
+                support_z = chunk["z"][support_inside].astype(np.float64)
+                if role == "SAND":
+                    np.add.at(sand_support_count.ravel(), support_flat, 1)
+                    np.add.at(sand_support_zsum.ravel(), support_flat, support_z)
+                else:
+                    np.add.at(rock_support_count.ravel(), support_flat, 1)
+                    np.add.at(rock_support_zsum.ravel(), support_flat, support_z)
             if role == "VEG":
                 continue
             np.add.at(zsum, flat, chunk["z"][inside].astype(np.float64))
@@ -786,6 +927,30 @@ def stage_water(context: Context, data_dir: Path, work: Path):
     zmean_w = ndimage.gaussian_filter(np.isfinite(zmean).astype(np.float32), 2.0)
     del zsum, zcnt, zmean
 
+    # ---- role-aware XY/3D recovery at 2.5 cm.  This is deliberately based
+    # ---- on original SAND only; ROCK can veto the sheet but never define it.
+    support_x = context.x0 + (np.arange(support_nx) + 0.5) * WATER_SUPPORT_CELL
+    support_y = context.y0 + (np.arange(support_ny) + 0.5) * WATER_SUPPORT_CELL
+    context_x = np.clip(((support_x - context.x0) / REGION_CELL).astype(np.int64),
+                        0, context.nx - 1)
+    context_y = np.clip(((support_y - context.y0) / REGION_CELL).astype(np.int64),
+                        0, context.ny - 1)
+    support_hull = context.hull[context_y[:, None], context_x[None, :]]
+    support_base_allowed = (
+        support_hull & ~context.steep_near[context_y[:, None], context_x[None, :]] &
+        (context.cloth_filled[context_y[:, None], context_x[None, :]] <= OUTSIDE_Z_CAP))
+    recovery_confidence, sand_recovery_sheet, recovery_stats = build_water_xy_recovery(
+        sand_support_count, sand_support_zsum, rock_support_count, rock_support_zsum,
+        support_hull, support_base_allowed, WATER_SUPPORT_CELL)
+    print("[water] sand XY/3D recovery: "
+          f"{recovery_stats['recovered_cells']:,} support cells "
+          f"({recovery_stats['recovered_area_m2']:.1f} m^2); "
+          f"rock veto {recovery_stats['rock_veto_cells']:,}, "
+          f"height veto {recovery_stats['z_veto_cells']:,}, "
+          f"large-patch veto {recovery_stats['large_component_veto_cells']:,}",
+          flush=True)
+    del sand_support_count, sand_support_zsum, rock_support_count, rock_support_zsum
+
     # ---- region routing masks (cell level)
     hull_gx = ((np.arange(nx) * DENSITY_CELL + x0 - context.x0) / REGION_CELL).astype(np.int64)
     hull_gy = ((np.arange(ny) * DENSITY_CELL + y0 - context.y0) / REGION_CELL).astype(np.int64)
@@ -806,6 +971,24 @@ def stage_water(context: Context, data_dir: Path, work: Path):
     cloth_capped = np.nan_to_num(cloth_sub, nan=OUTSIDE_Z_CAP + 1.0) <= OUTSIDE_Z_CAP
     level_ok = np.zeros((ny, nx), bool)
     level_ok[np.ix_(oky, okx)] = (flat_sub & cloth_capped)[np.ix_(oky, okx)]
+
+    # Add only the support-grid recovery.  Sampling and assignment are limited
+    # to the small ToMesh rectangle so the 120 x 165 m density grid does not
+    # need another full-size float allocation.
+    recover_gx = ((np.arange(nx) * DENSITY_CELL + x0 - context.x0) /
+                  WATER_SUPPORT_CELL).astype(np.int64)
+    recover_gy = ((np.arange(ny) * DENSITY_CELL + y0 - context.y0) /
+                  WATER_SUPPORT_CELL).astype(np.int64)
+    recover_okx = (recover_gx >= 0) & (recover_gx < support_nx)
+    recover_oky = (recover_gy >= 0) & (recover_gy < support_ny)
+    recover_x = np.nonzero(recover_okx)[0]
+    recover_y = np.nonzero(recover_oky)[0]
+    if len(recover_x) and len(recover_y):
+        block = level_ok[np.ix_(recover_y, recover_x)]
+        sampled_recovery = recovery_confidence[
+            recover_gy[recover_y, None], recover_gx[None, recover_x]]
+        block |= sampled_recovery >= WATER_RECOVERY_MIN_CONFIDENCE
+        level_ok[np.ix_(recover_y, recover_x)] = block
 
     # ---- outside surface: mesh raycast bounds the extent, a coarse (5 cm)
     # ---- harmonic sheet from measured rims provides the height
@@ -890,6 +1073,12 @@ def stage_water(context: Context, data_dir: Path, work: Path):
     # ---- real points exist. No cell-quantised lookups anywhere.
     cloth_sample = fill_nan_nearest(context.cloth_filled.copy())
 
+    if np.isfinite(sand_recovery_sheet).any():
+        sand_recovery_sample = fill_nan_nearest(sand_recovery_sheet.copy())
+    else:
+        sand_recovery_sample = np.full_like(
+            sand_recovery_sheet, np.nanmedian(context.cloth_filled))
+
     def surface_z(qx, qy):
         z_cloth = sample_grid(cloth_sample, qx, qy,
                               context.x0, context.y0, REGION_CELL, order=3)
@@ -909,7 +1098,17 @@ def stage_water(context: Context, data_dir: Path, work: Path):
                        z_ref) - 0.08
         high = np.where(has_data, np.maximum(z_ref, np.nan_to_num(z_dat, nan=-np.inf)),
                         z_ref) + 0.08
-        return np.clip(blended, low, high).astype(np.float32)
+        bounded = np.clip(blended, low, high).astype(np.float32)
+        recovery = sample_grid(
+            recovery_confidence, qx, qy, context.x0, context.y0,
+            WATER_SUPPORT_CELL, order=1)
+        recovery = np.clip(recovery, 0.0, 1.0)
+        z_sand = sample_grid(
+            sand_recovery_sample, qx, qy, context.x0, context.y0,
+            WATER_SUPPORT_CELL, order=1)
+        surface = ((1.0 - recovery) * bounded + recovery * z_sand).astype(np.float32)
+        # Last-resort guard against sparse high ROCK leaking through z_dat.
+        return np.minimum(surface, WATER_SUPPORT_Z_CAP)
 
     pz = np.empty(len(px), np.float32)
     normal = np.empty((len(px), 3), np.float32)
@@ -925,6 +1124,7 @@ def stage_water(context: Context, data_dir: Path, work: Path):
         pz[start:stop] = centre
         normal[start:stop] = vector
     pz += rng.normal(0.0, 0.0005, len(pz)).astype(np.float32)
+    np.minimum(pz, WATER_SUPPORT_Z_CAP, out=pz)
 
     # ---- attributes: cell means diffused outward (multi-scale masked
     # ---- Gaussian) and sampled bilinearly, plus correlated noise whose
@@ -994,11 +1194,15 @@ def stage_water(context: Context, data_dir: Path, work: Path):
 
     out = data_dir / "Site1-WATER-5mm.ply"
     header = ["ply", "format binary_little_endian 1.0",
-              f"comment Site1 water gap fill v3 generated {stamp} (cloth-guided, density-continuous)",
+              f"comment Site1 water gap fill v5 generated {stamp} (sand-continuous, rock-vetoed)",
               "comment Fill accepted per point with probability 1 - density/target so the",
               "comment combined cloud density stays seam-free against the real points",
               "comment Heights sample the refined cloth bicubically (no grid tiling);",
-              "comment attributes are diffusion-blended cell means plus variance-scaled noise",
+              "comment steep-mask holes recover only where SAND is XY-continuous and",
+              "comment locally height-coherent; high/dominant ROCK and large patches veto fill",
+              "comment Recovery heights use a sand-only sheet, preventing cloth drip-cones;",
+              "comment attributes use diffusion-blended means plus variance-scaled noise",
+              f"comment Final fill surface is capped at z <= {WATER_SUPPORT_Z_CAP} m",
               f"comment ScanID={WATER_SCAN_ID:.0f}; outside sheet capped at z <= {OUTSIDE_Z_CAP} m",
               "comment Generated by scripts/site1_clean_and_cloth_water.py",
               f"element vertex {len(record)}"]
@@ -1006,9 +1210,11 @@ def stage_water(context: Context, data_dir: Path, work: Path):
     for name in record.dtype.names:
         header.append(f"property {typemap[record.dtype[name].str.lstrip('<>|=')]} {name}")
     header.append("end_header")
-    with open(out, "wb") as handle:
+    temp = out.with_suffix(".ply.tmp")
+    with open(temp, "wb") as handle:
         handle.write(("\n".join(header) + "\n").encode("ascii"))
         record.tofile(handle)
+    temp.replace(out)
     print(f"[water] wrote {out} ({len(record):,} pts, {out.stat().st_size/1e9:.2f} GB)",
           flush=True)
 
