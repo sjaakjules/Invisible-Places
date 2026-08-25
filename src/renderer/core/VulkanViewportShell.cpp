@@ -2610,7 +2610,10 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
             renderState_.rainSettings.enabled &&
             renderState_.rainSettings.impactEffectsEnabled &&
             rainCanShadeThisFrame &&
-            impactCanReachLayer;
+            impactCanReachLayer &&
+            // A rain feature toggled off the water sheet leaves the
+            // gap-fill layer dry while every scanned cloud keeps shading.
+            (!layer.waterFillLayer || renderState_.rainAppliesToWaterFill);
     }
     ++sceneRevision_;
 
@@ -14418,6 +14421,12 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
                 break;
             }
             if (!instanceSettings.enabled) {
+                continue;
+            }
+            // Instances that opted out of the water sheet skip the gap-fill
+            // layer; later instances compact upward exactly like disabled
+            // ones so the shader sees a dense slot range.
+            if (layer.waterFillLayer && !instanceSettings.applyToWaterFill) {
                 continue;
             }
             // Same lane recipe as the primary block above, read from the

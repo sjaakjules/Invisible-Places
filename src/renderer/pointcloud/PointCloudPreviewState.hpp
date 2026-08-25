@@ -202,6 +202,10 @@ struct PointCloudFoamFrontsShorelineSettings {
 
 struct PointCloudShorelineWaveSettings {
     bool enabled = false;
+    // Schema 84: resolved from the timing-run timelines. When false, the
+    // standing-water gap-fill layer skips this instance (both the primary
+    // style bake and the additional-instance uniform array).
+    bool applyToWaterFill = true;
     PointCloudShorelineWaveAlgorithm algorithm =
         PointCloudShorelineWaveAlgorithm::FoamFronts;
     PointCloudFoamFrontsShorelineSettings foamFronts{};

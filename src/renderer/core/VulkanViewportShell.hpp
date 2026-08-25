@@ -229,6 +229,10 @@ struct SceneRenderState {
         // SAND-role layers render the scene's additional shoreline
         // instances alongside (or without) the style's own shoreline.
         bool shorelineInstancesEligible = false;
+        // The standing-water gap-fill layer: shoreline instances that opted
+        // out of the water sheet are skipped for it, and rain impact obeys
+        // SceneRenderState::rainAppliesToWaterFill.
+        bool waterFillLayer = false;
         // World-space Z extent of the layer's points. Rain impact shading is
         // gated per point by world-Z height bands, so a layer whose extent no
         // enabled band can reach may skip the impact-capable material variant
@@ -256,6 +260,11 @@ struct SceneRenderState {
     // kMaxAdditionalShorelineInstances of them for eligible layers.
     std::vector<renderer::pointcloud::PointCloudShorelineWaveSettings>
         additionalShorelines;
+    // Schema 84: whether the timing-run rain feature still applies to the
+    // standing-water gap-fill layer (layers flag themselves via
+    // PointCloudLayerState::waterFillLayer). Defaults on so paths that do
+    // not resolve timing runs keep today's behaviour.
+    bool rainAppliesToWaterFill = true;
 };
 
 enum class PointCloudExrReadbackMask : std::uint32_t {

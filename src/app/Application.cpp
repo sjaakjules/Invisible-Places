@@ -3028,6 +3028,7 @@ struct ScenePointCloudRuntime {
     invisible_places::camera::CameraState lastCamera{};
     std::filesystem::path lastAnimationPath;
     bool lastAnimationUsesEdited = false;
+    std::string lastTimingTakeId;
     std::filesystem::path sourceFolder;
     std::vector<WaterSurfaceSource> waterSurfaceSources;
     std::string waterSurfaceSignature;
@@ -4611,7 +4612,8 @@ ResolveTimingColouriseStack(
     std::span<const invisible_places::io::ScalarFieldStats> scalarFields,
     bool hasNormals,
     float normalizedPosition,
-    bool cyclic) {
+    bool cyclic,
+    bool forWaterFillSession = false) {
     using invisible_places::renderer::pointcloud::
         ResolvedTimingColouriseEffect;
     using invisible_places::renderer::pointcloud::
@@ -4651,6 +4653,12 @@ ResolveTimingColouriseStack(
                     effect,
                     normalizedPosition,
                     cyclic)) {
+            continue;
+        }
+        // The water fill's generated points carry near-constant curvature
+        // and roughness fields; features opted out of the water sheet skip
+        // it here while keeping their slot order on every scanned cloud.
+        if (forWaterFillSession && !effect.applyToWaterFill) {
             continue;
         }
 
@@ -5535,6 +5543,8 @@ ResolveShorelinesForFrame(
             continue;
         }
         auto settings = instance.settings;
+        settings.applyToWaterFill =
+            overlay == nullptr || overlay->AppliesToWaterFill(feature);
         if (overlay != nullptr) {
             const auto keyed = [&](const char* settingId) {
                 return overlay->Find(feature, settingId);
@@ -11191,6 +11201,22 @@ bool AnimationRegistryEntryMatchesActiveScene(
         }
     }
     return !sawScene;
+}
+
+// Timing takes follow the active scene: a take tagged with another grouped
+// scene is hidden, while untagged takes (the built-in Authored Timing and
+// legacy documents that never resolved to one scene) show everywhere.
+bool TimingTakeMatchesActiveScene(
+    const WaterWorkflowState& water,
+    const invisible_places::timing::TimingTakeDefinition& take) {
+    if (take.sceneGroup.empty()) {
+        return true;
+    }
+    const auto activeScene = ActiveWaterTimingSceneGroupName(water);
+    if (activeScene.empty() || activeScene == "Default") {
+        return true;
+    }
+    return take.sceneGroup == activeScene;
 }
 
 // Saved camera shots follow the active scene like animations: a shot whose
@@ -24915,12 +24941,15 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
                           runtimeState.animationPanel.currentFilePath};
             groupDocument.lastAnimationUsesEdited =
                 runtimeState.animationPanel.currentPathUsesEdited;
+            groupDocument.lastTimingTakeId =
+                runtimeState.water.selectedTimingTakeId;
         } else {
             if (scene.hasLastCamera) {
                 groupDocument.lastCamera = scene.lastCamera;
             }
             groupDocument.lastAnimationPath = scene.lastAnimationPath;
             groupDocument.lastAnimationUsesEdited = scene.lastAnimationUsesEdited;
+            groupDocument.lastTimingTakeId = scene.lastTimingTakeId;
         }
         groupDocument.displaySpacingMeters =
             scene.committedDisplaySpacingMicrometres.has_value()
@@ -25570,6 +25599,7 @@ bool LoadAnimationPathVariant(
     PreviewRuntimeState* runtimeState,
     const std::filesystem::path& inputPath,
     bool useEditedVersion);
+void ResetTimingTakeEditorSelections(PreviewRuntimeState* runtimeState);
 
 invisible_places::serialization::WaterSceneStateDocument
 BuildActiveWaterSceneStateSnapshot(
@@ -25703,6 +25733,7 @@ void CaptureSceneWorkspaceMemento(
                                    ? std::filesystem::path{}
                                    : std::filesystem::path{panel.currentFilePath};
     scene->lastAnimationUsesEdited = panel.currentPathUsesEdited;
+    scene->lastTimingTakeId = runtimeState->water.selectedTimingTakeId;
 }
 
 void RestoreSceneWorkspaceMemento(
@@ -25735,6 +25766,28 @@ void RestoreSceneWorkspaceMemento(
     } else {
         // First visit: let the commit's framing pick the scene's own view.
         runtimeState->selectedSessionIndex.reset();
+    }
+    // The take selection follows the scene: restore the take this scene
+    // last used, keep the current one when it is visible here too, and fall
+    // back to the universal Authored Timing take otherwise.
+    auto& water = runtimeState->water;
+    const auto takeVisibleHere = [&](const std::string& takeId) {
+        const auto* take = invisible_places::timing::FindTimingTakeDefinition(
+            &water.timingTakes,
+            takeId);
+        return take != nullptr && TimingTakeMatchesActiveScene(water, *take);
+    };
+    std::string desiredTake =
+        scene != nullptr ? scene->lastTimingTakeId : std::string{};
+    if (desiredTake.empty() || !takeVisibleHere(desiredTake)) {
+        desiredTake = takeVisibleHere(water.selectedTimingTakeId)
+                          ? water.selectedTimingTakeId
+                          : std::string{
+                                invisible_places::timing::kAuthoredTimingTakeId};
+    }
+    if (desiredTake != water.selectedTimingTakeId) {
+        water.selectedTimingTakeId = desiredTake;
+        ResetTimingTakeEditorSelections(runtimeState);
     }
     runtimeState->previewRenderStateSignatureValid = false;
 }
@@ -25972,6 +26025,7 @@ bool ApplyScenePointCloudGroupDocuments(
         }
         scene.lastAnimationPath = groupIt->lastAnimationPath;
         scene.lastAnimationUsesEdited = groupIt->lastAnimationUsesEdited;
+        scene.lastTimingTakeId = groupIt->lastTimingTakeId;
         scene.waterSurfaceCache = groupIt->waterSurfaceCache;
         scene.waterSurfaceCacheStatus = InitialWaterSurfaceCacheStatus(
             *runtimeState,
@@ -31812,8 +31866,12 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
             &style,
             &activeWater.featureOverlay);
         ClearPointCloudStyleShoreline(&style);
+        const bool sessionIsWaterFill =
+            IsWaterFillPointCloudSession(session);
         if (ShorelineWaveEligibleSession(session) &&
-            !resolvedShorelines.empty()) {
+            !resolvedShorelines.empty() &&
+            (!sessionIsWaterFill ||
+             resolvedShorelines.front().applyToWaterFill)) {
             invisible_places::renderer::pointcloud::
                 ApplyPointCloudShorelineWaveSettings(
                     &style,
@@ -31882,7 +31940,8 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
                            session.scalarFields,
                            session.hasNormals,
                            activeWater.normalizedTime,
-                           activeWater.timingIsCyclic)
+                           activeWater.timingIsCyclic,
+                           sessionIsWaterFill)
                      : invisible_places::renderer::pointcloud::
                            ResolvedTimingColouriseStack{},
              .generatedWaterOverlay = IsGeneratedWaterOverlaySession(session),
@@ -32876,6 +32935,7 @@ BuildAnimationExportPointCloudLayerSnapshot(
                  IsAuthoredTimingColouriseLayer(session),
              .shorelineInstancesEligible =
                  ShorelineWaveEligibleSession(session),
+             .waterFillLayer = IsWaterFillPointCloudSession(session),
              .drawPointCount = static_cast<std::uint32_t>(std::min<std::uint64_t>(
                  drawPointCount,
                  std::numeric_limits<std::uint32_t>::max())),
@@ -33704,7 +33764,8 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
                       layer.scalarFields,
                       layer.hasNormals,
                       waterFrame.normalizedTime,
-                      waterFrame.timingIsCyclic)
+                      waterFrame.timingIsCyclic,
+                      layer.waterFillLayer)
                 : invisible_places::renderer::pointcloud::
                       ResolvedTimingColouriseStack{};
     }
@@ -33784,10 +33845,17 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
         job.frozenShorelineInstances,
         &waterFrame.featureOverlay,
         waterFrame.rawScenarioState);
+    renderState.rainAppliesToWaterFill =
+        waterFrame.featureOverlay.AppliesToWaterFill(
+            invisible_places::water::WaterKeyedFeatureId{
+                .kind =
+                    invisible_places::water::WaterKeyedFeatureKind::Rain});
     for (auto& layer : renderState.pointCloudLayers) {
         ClearPointCloudStyleShoreline(&layer.style);
         if (layer.shorelineInstancesEligible &&
-            !resolvedShorelines.empty()) {
+            !resolvedShorelines.empty() &&
+            (!layer.waterFillLayer ||
+             resolvedShorelines.front().applyToWaterFill)) {
             invisible_places::renderer::pointcloud::
                 ApplyPointCloudShorelineWaveSettings(
                     &layer.style,
@@ -91441,6 +91509,25 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                     }
                     ImGui::EndCombo();
                 }
+                {
+                    using invisible_places::water::WaterKeyedFeatureKind;
+                    const auto kind = timeline.feature.kind;
+                    // Flow trails and seepage never touch the water sheet,
+                    // so only the kinds that do offer the toggle.
+                    if (kind == WaterKeyedFeatureKind::Rain ||
+                        kind == WaterKeyedFeatureKind::Shoreline ||
+                        kind == WaterKeyedFeatureKind::ShorelineInstance) {
+                        ImGui::SameLine();
+                        if (ImGui::Checkbox(
+                                "Water",
+                                &timeline.applyToWaterFill)) {
+                            runtimeState->previewRenderStateSignatureValid =
+                                false;
+                        }
+                        DrawWaterSeepageParameterTooltip(
+                            "Apply this feature to the standing-water cloud. Untick to keep the generated water sheet untouched while the scanned clouds keep the effect.");
+                    }
+                }
                 // Per-setting summary in the same colours as the graphs
                 // below: which settings are keyed, and how many keys each
                 // holds. Pin overlays a setting's curve on the Global
@@ -101454,6 +101541,13 @@ void DrawTimingColouriseSection(
         &effect.name);
     DrawTimingLabelTooltip(
         "Rename this Visual Feature. Its output aspects are toggled in the Emissive and Colourise sections below.");
+    if (ImGui::Checkbox(
+            "Apply To Water Cloud",
+            &effect.applyToWaterFill)) {
+        runtimeState->previewRenderStateSignatureValid = false;
+    }
+    DrawTimingLabelTooltip(
+        "The generated standing-water sheet carries flat curvature and roughness fields, so a feature bound to those fields paints the whole sheet with one dominant colour. Untick to leave the water cloud out of this Visual Feature; every scanned cloud keeps it.");
     DrawTimingColouriseTimelineZoomToggle(runtimeState);
     ImGui::SeparatorText("Scalar Field and Bounds");
     auto catalog =
@@ -102115,6 +102209,9 @@ void DrawAuthoredTimingsPanel(
                 "Timing Take",
                 takePreview)) {
             for (const auto& take : water.timingTakes) {
+                if (!TimingTakeMatchesActiveScene(water, take)) {
+                    continue;
+                }
                 const bool selected =
                     take.id == selectedTakeId;
                 if (ImGui::Selectable(
@@ -102198,6 +102295,11 @@ void DrawAuthoredTimingsPanel(
                 "Timing Take " +
                 std::to_string(
                     water.timingTakes.size());
+            const auto createScene =
+                ActiveWaterTimingSceneGroupName(water);
+            if (!createScene.empty() && createScene != "Default") {
+                take.sceneGroup = createScene;
+            }
             if (!inheritedRainBaseId.empty()) {
                 (void)invisible_places::timing::
                     AssignTimingTakeRainBaseProfile(
@@ -102229,6 +102331,13 @@ void DrawAuthoredTimingsPanel(
                         water.timingTakes,
                         &water.nextTimingTakeSequence);
             copy.name += " Copy";
+            if (copy.sceneGroup.empty()) {
+                const auto duplicateScene =
+                    ActiveWaterTimingSceneGroupName(water);
+                if (!duplicateScene.empty() && duplicateScene != "Default") {
+                    copy.sceneGroup = duplicateScene;
+                }
+            }
             const std::string sourceId = selectedTakeId;
             (void)invisible_places::timing::
                 DuplicateTimingTakeRainProfileAssignment(
@@ -106950,6 +107059,10 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
             resolvedShorelines.begin() + 1,
             resolvedShorelines.end());
     }
+    renderState.rainAppliesToWaterFill =
+        waterFrame.featureOverlay.AppliesToWaterFill(
+            invisible_places::water::WaterKeyedFeatureId{
+            .kind = invisible_places::water::WaterKeyedFeatureKind::Rain});
 
     const bool linkedHqLiveReady =
         includeLinkedHqPreview &&
@@ -107007,8 +107120,12 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                 &renderStyle,
                 &waterFrame.featureOverlay);
             ClearPointCloudStyleShoreline(&renderStyle);
+            const bool sessionIsWaterFill =
+                IsWaterFillPointCloudSession(session);
             if (ShorelineWaveEligibleSession(session) &&
-                !resolvedShorelines.empty()) {
+                !resolvedShorelines.empty() &&
+                (!sessionIsWaterFill ||
+                 resolvedShorelines.front().applyToWaterFill)) {
                 invisible_places::renderer::pointcloud::
                     ApplyPointCloudShorelineWaveSettings(
                         &renderStyle,
@@ -107030,7 +107147,8 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                                session.scalarFields,
                                session.hasNormals,
                                waterFrame.normalizedTime,
-                               waterFrame.timingIsCyclic)
+                               waterFrame.timingIsCyclic,
+                               sessionIsWaterFill)
                          : invisible_places::renderer::pointcloud::
                            ResolvedTimingColouriseStack{},
                  .scalarFields = session.scalarFields,
@@ -107042,6 +107160,7 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                      IsAuthoredTimingColouriseLayer(session),
                  .shorelineInstancesEligible =
                      ShorelineWaveEligibleSession(session),
+                 .waterFillLayer = sessionIsWaterFill,
                  .worldZBoundsValid = session.bounds.valid,
                  .worldMinZ = session.bounds.minimum.z,
                  .worldMaxZ = session.bounds.maximum.z,
@@ -107137,7 +107256,8 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                                resolvedPatchFields,
                                patch.cloud->hasNormals,
                                waterFrame.normalizedTime,
-                               waterFrame.timingIsCyclic)
+                               waterFrame.timingIsCyclic,
+                               IsWaterFillPointCloudSession(baseSession))
                          : invisible_places::renderer::pointcloud::
                                ResolvedTimingColouriseStack{},
                  .scalarFields = resolvedPatchFields,
