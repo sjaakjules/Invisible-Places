@@ -102,3 +102,66 @@ class WaterXYRecoveryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClassifyVerdictTests(unittest.TestCase):
+    """The v4 cluster-verdict table: one row per calibrated behaviour."""
+
+    def metrics(self, **overrides):
+        base = {
+            "n": np.asarray([1000]),
+            "dens_med": np.asarray([20000.0], np.float32),
+            "i_med": np.asarray([400000.0], np.float32),
+            "i_p90": np.asarray([500000.0], np.float32),
+            "share": np.asarray([0.4], np.float32),
+            "f_under": np.asarray([0.9], np.float32),
+            "f_gap8": np.asarray([0.05], np.float32),
+            "man_f": np.asarray([0.0], np.float32),
+            "flat_f": np.asarray([1.0], np.float32),
+            "h_med": np.asarray([0.2], np.float32),
+            "contact": np.asarray([500]),
+            "seedhit": np.zeros(1, np.int8),
+        }
+        for key, value in overrides.items():
+            base[key] = np.asarray([value],
+                                   base[key].dtype if key in base else None)
+        return base
+
+    def verdict(self, **overrides):
+        return int(SITE1.classify_verdicts(self.metrics(**overrides))[0])
+
+    def test_dense_grounded_cluster_keeps(self):
+        self.assertEqual(self.verdict(), 0)
+
+    def test_big_structure_keeps_even_when_bright(self):
+        self.assertEqual(self.verdict(n=30000, i_med=700000.0, share=1.0), 0)
+
+    def test_sparse_cluster_marked(self):
+        self.assertEqual(self.verdict(dens_med=3000.0), 2)
+
+    def test_fully_detached_cluster_floats(self):
+        self.assertEqual(self.verdict(contact=0), 3)
+
+    def test_bright_single_scan_object_removed(self):
+        self.assertEqual(self.verdict(i_med=650000.0, share=1.0), 4)
+
+    def test_bright_multi_scan_surface_keeps(self):
+        self.assertEqual(self.verdict(i_med=650000.0, share=0.4), 0)
+
+    def test_dark_object_with_air_gap_removed(self):
+        self.assertEqual(self.verdict(i_med=100000.0, f_gap8=0.5), 4)
+
+    def test_self_shadow_needs_height_and_flat_ground(self):
+        self.assertEqual(
+            self.verdict(i_med=650000.0, f_under=0.2, h_med=0.05), 0)
+        self.assertEqual(
+            self.verdict(i_med=650000.0, f_under=0.2, h_med=0.2, flat_f=0.0), 0)
+        self.assertEqual(
+            self.verdict(i_med=650000.0, f_under=0.2, h_med=0.2), 4)
+
+    def test_manual_majority_removed_only_on_the_flat(self):
+        self.assertEqual(self.verdict(man_f=0.9), 4)
+        self.assertEqual(self.verdict(man_f=0.9, flat_f=0.2), 0)
+
+    def test_seed_marked_cluster_removed(self):
+        self.assertEqual(self.verdict(seedhit=1), 5)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Site1 reflection-noise cleanup and cloth-guided water fill (v2).
+"""Site1 reflection-noise cleanup and cloth-guided water fill.
 
 Inputs authored by hand in CloudCompare (2026-08-25):
   Data/Scene1/Site1-ToMesh.ply     manually selected SAND+ROCK subset of the
@@ -13,24 +13,22 @@ Inputs authored by hand in CloudCompare (2026-08-25):
 
 What this pipeline does:
 
-classify  Region = the ToMesh footprint hull (the central flat; everything
-          outside it is untouched). Three per-point noise tests, identical
-          for the 5 mm and 1 mm SAND/ROCK clouds:
-            manual   farther than 25 mm from any ToMesh point inside the
-                     eroded-safe region (recovers the by-hand deselection --
-                     membership is verbatim, 99.9% of kept points sit at 0)
-            below    more than 3 cm under the cloth AND covered by a real
-                     surface above (a surface-band point within 7.5 cm XY);
-                     kills the mirrored under-water ghosts while keeping
-                     channel floors the stiff cloth bridges (nothing above
-                     those)
-            above    more than 5 cm over the cloth AND floating: no
-                     surface-band support within 7.5 cm XY and no kept point
-                     within 6 cm below it in its own column; kills hovering
-                     rock "shadow" slabs while keeping grounded sand mounds
-          The surface band (|z - cloth| <= 3 cm) is built once from the 5 mm
-          SAND+ROCK clouds on a 2.5 cm column grid, so both densities are
-          classified against the same physical surface.
+classify  v4 (2026-08-26): cluster-first over the WHOLE site (v3 only
+          examined the ToMesh hull). Candidates are points farther than
+          25 mm from the hand-made ToMesh selection (inside the eroded safe
+          hull) plus points more than 6 cm above an opened+smoothed ground
+          sheet, clustered at 3 cm. Per-cluster verdicts: big attached
+          structures keep; sparse clusters (kNN density < 6 k/m^2) lose
+          their hovering members (>= 22 cm over the 12.5 cm column minimum,
+          vetoed on near-vertical faces); fully detached clusters and
+          intensity-extreme clusters with transience evidence (air gap
+          under, single-scan capture, self-shadowed ground) are removed as
+          objects; bright/dark/manual sub-objects are extracted out of kept
+          clusters (2 cm linking, single-scan or hovering, free-standing by
+          lateral perimeter touch); removals complete through
+          intensity-matched neighbours. The v3 below-cloth mirror rule is
+          unchanged. Reasons: 1 below, 2 sparse, 3 floating, 4 object,
+          5 seed, 6 sub-object, 7 completion, 8 strict-sparse.
 
 apply     Rewrites the four canonical clouds atomically (temp + rename)
           minus the flagged records, and stores the minimum for a byte-exact
@@ -97,7 +95,54 @@ FILL_TRIGGER = 0.85             # fill only where density < 85% of target
 KEEP_CLEAR = 0.004
 OUTSIDE_Z_CAP = 2.6
 WATER_SCAN_ID = 999.0
-RUN_NAME = "20260825-noise-cleanup-v3"
+RUN_NAME = "20260826-noise-cleanup-v4"
+
+# ---- v4 classifier constants (calibrated on named exemplars: user-marked
+# ---- legs/bags/poles, the two trail areas, and every dense patch v3 lost;
+# ---- the dry-run harness lives in the session notes) ---------------------
+ENV_CELL = 0.10                 # ground-sheet cell
+OPEN_RADIUS_CELLS = 2           # 0.2 m grey opening: sheet hugs the low ground
+SHEET_SIGMA = 1.2
+ISLAND_MAX_CELLS = 60           # small sparse data-islands cannot support
+ISLAND_SPARSE = 6_000.0         # ...the sheet beneath themselves
+H_CAND = 0.06                   # candidate height over the sheet
+CLUSTER_VOX = 0.03
+SPARSE_DENSITY_MAX = 6_000.0    # cluster-median kNN density below = sparse
+PP_SPARSE_DENSITY = 4_300.0     # strict per-point sparse inside kept clusters
+PP_HOVER3 = 0.25
+HOVER3_REMOVE = 0.22            # hover over the 12.5 cm column minimum
+HOVER3_COMPLETE = 0.15
+SPARSE_SHEET_H = 0.35
+VOID_SHEET_H = 0.25             # lower bar on env-voided island cells
+WALL_RELIEF_MAX = 0.5           # hover rules stand down on near-vertical faces
+BIG_KEEP_N = 20_000
+BIG_KEEP_DENSITY = 8_000.0
+FLOAT_CONTACT_R = 0.045
+FLOAT_MIN_N = 60
+OBJ_I_MED_HI = 590_000.0        # intensity gates for transient objects
+OBJ_I_P90_HI = 950_000.0
+OBJ_I_MED_LO = 150_000.0
+OBJ_MANUAL_FRAC = 0.70          # the user's hand is evidence on the flat
+FLAT_MAJOR = 0.5
+EV_GAP_FRAC = 0.35              # air-gap under, single-scan, self-shadow
+EV_GAP = 0.08
+EV_SINGLE_SCAN = 0.95
+EV_SELF_SHADOW = 0.45
+EV_SHADOW_H = 0.12
+MIN_OBJ_N = 60
+SUB_I_HI = 520_000.0            # sub-object extraction out of kept clusters
+SUB_VOX = 0.02
+SUB_MAX_N = 30_000
+SUB_MAX_PARENT_FRAC = 0.5
+SUB_HOVER3 = 0.30
+SUB_LOCAL_SCANS = 1.3           # transient volumes are one scan's private space
+SUB_FREE_TOUCH = 0.05
+SUB_FREE_H3 = 0.5
+SUB_PTOUCH_BRIGHT = 0.35
+SUB_PTOUCH_MANUAL = 0.25
+COMPLETE_R = 0.04
+COMPLETE_BRIGHT = 450_000.0
+COMPLETE_DARK = 220_000.0
 
 # Conservative recovery for gaps punched into the water fill by the coarse
 # steep-cloth veto.  Recovery is inferred from the SAND layer in XY, but its
@@ -144,7 +189,9 @@ STEEP_DILATE_CELLS = 4          # ghost tests keep 0.4 m clear of steep cloth: a
 CLEAN_TARGETS = [
     ("SAND", "5mm"), ("ROCK", "5mm"), ("SAND", "1mm"), ("ROCK", "1mm"),
 ]
-REASON_NAMES = {1: "manual", 2: "below-ghost", 3: "above-ghost", 4: "seeded-cluster"}
+REASON_NAMES = {1: "below-ghost", 2: "sparse-noise", 3: "floating", 4: "object",
+                5: "seeded-cluster", 6: "sub-object", 7: "completion",
+                8: "strict-sparse"}
 
 
 def read_header(path):
@@ -373,185 +420,471 @@ class Context:
         return self._columns
 
 
-# ---- classify -----------------------------------------------------------
+# ---- classify (v4) -------------------------------------------------------
 
-def classify_5mm(context: Context, data_dir: Path, role: str):
-    from scipy import ndimage
-    from scipy.spatial import cKDTree
-    band, band_top, conn_top = context.columns(data_dir)
-    cny, cnx = band.shape
-    tomesh = context.tomesh_tree()
-    cloud, _, _ = memmap_cloud(cloud_path(data_dir, role, "5mm"))
-    reasons = np.zeros(len(cloud), np.uint8)
-    xyz = np.empty((len(cloud), 3), np.float32)
-    below_idx, above_idx = [], []
-    seed_idx = {i: [] for i in range(len(SEED_CLUSTERS))}
-    seed_far = {i: [] for i in range(len(SEED_CLUSTERS))}
-    for start in range(0, len(cloud), 8_000_000):
-        chunk = cloud[start:start + 8_000_000]
-        x = chunk["x"].astype(np.float32); y = chunk["y"].astype(np.float32)
-        z = chunk["z"].astype(np.float32)
-        xyz[start:start + len(chunk), 0] = x
-        xyz[start:start + len(chunk), 1] = y
-        xyz[start:start + len(chunk), 2] = z
-        gx = ((x - context.x0) / REGION_CELL).astype(np.int64)
-        gy = ((y - context.y0) / REGION_CELL).astype(np.int64)
-        inside = (gx >= 0) & (gx < context.nx) & (gy >= 0) & (gy < context.ny)
-        gxc = np.clip(gx, 0, context.nx - 1); gyc = np.clip(gy, 0, context.ny - 1)
-        in_safe = inside & context.safe[gyc, gxc]
-        near_cloth = inside & context.cloth_near[gyc, gxc]
-        slope_ok = ~context.steep_near[gyc, gxc]
-        chunk_reason = np.zeros(len(chunk), np.uint8)
+def _cluster_labels(xyz, vox):
+    """Sparse 26-connectivity voxel clustering; per-point labels."""
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+    v = np.floor(xyz / vox).astype(np.int64)
+    v -= v.min(axis=0)
+    span = v.max(axis=0) + 2
+    pack = (v[:, 0] * span[1] + v[:, 1]) * span[2] + v[:, 2]
+    keys, inverse = np.unique(pack, return_inverse=True)
+    rows, cols = [], []
+    for dx in (0, 1):
+        for dy in (-1, 0, 1):
+            for dz in (-1, 0, 1):
+                if (dx, dy, dz) <= (0, 0, 0):
+                    continue
+                off = dx * span[1] * span[2] + dy * span[2] + dz
+                pos = np.clip(np.searchsorted(keys, keys + off), 0, len(keys) - 1)
+                hit = keys[pos] == keys + off
+                rows.append(np.nonzero(hit)[0])
+                cols.append(pos[hit])
+    graph = coo_matrix(
+        (np.ones(sum(len(r) for r in rows), np.uint8),
+         (np.concatenate(rows), np.concatenate(cols))),
+        shape=(len(keys), len(keys)))
+    _, voxel_label = connected_components(graph, directed=False)
+    return voxel_label[inverse]
 
-        if in_safe.any():
-            pts = np.stack([x[in_safe], y[in_safe], z[in_safe]], 1)
-            distance, _ = tomesh.query(pts, k=1, workers=-1)
-            manual = np.zeros(len(chunk), bool)
-            manual[np.nonzero(in_safe)[0][distance > MANUAL_DISTANCE]] = True
-            chunk_reason[manual] = 1
 
-        domain = near_cloth & slope_ok & (chunk_reason == 0)
-        if domain.any():
-            dz = z - context.cloth_filled[gyc, gxc]
-            cx = np.clip(((x - context.x0) / COLUMN_CELL).astype(np.int64), 0, cnx - 1)
-            cy = np.clip(((y - context.y0) / COLUMN_CELL).astype(np.int64), 0, cny - 1)
-            has_band = band[cy, cx]
-            top_band = band_top[cy, cx]
-            below = domain & (dz < BELOW_DZ) & has_band & (top_band > z + 0.04)
-            above = domain & (dz > ABOVE_DZ) & has_band & (z > conn_top[cy, cx] + 0.03)
-            below_idx.append(np.nonzero(below)[0] + start)
-            above_idx.append(np.nonzero(above)[0] + start)
+def classify_verdicts(metrics):
+    """Pure cluster-verdict table over per-cluster metric arrays.
 
-        for i, (sx, sy, sz) in enumerate(SEED_CLUSTERS):
-            in_box = (np.abs(x - sx) < SEED_BOX) & (np.abs(y - sy) < SEED_BOX)
-            if in_box.any():
-                pts = np.stack([x[in_box], y[in_box], z[in_box]], 1)
-                distance, _ = tomesh.query(pts, k=1, workers=-1)
-                seed_idx[i].append(np.nonzero(in_box)[0] + start)
-                seed_far[i].append(distance > MANUAL_DISTANCE)
-        reasons[start:start + len(chunk)] = chunk_reason
-
-    # density screen on the ghost candidates (own-cloud k-NN): reflection
-    # ghosts are locally sparse, ripple-trough floors and real rock are dense
-    # The density screen applies to below-candidates only: ripple-trough
-    # floors are dense parts of the real surface while under-water mirror
-    # plumes are sparse. Above-candidates skip it -- a mirrored rock slab is
-    # itself a locally dense 2D manifold, and the column-connectivity test
-    # already separates hovering slabs from grounded relief.
-    self_tree = cKDTree(xyz)
-    if below_idx:
-        candidates = np.concatenate(below_idx)
-        if len(candidates):
-            distance, _ = self_tree.query(xyz[candidates], k=DENSITY_NEIGHBOURS + 1,
-                                          workers=-1)
-            radius = np.maximum(distance[:, DENSITY_NEIGHBOURS], 1e-4)
-            density = DENSITY_NEIGHBOURS / (np.pi * radius ** 2)
-            reasons[candidates[density < BELOW_DENSITY_MAX]] = 2
-    if above_idx:
-        candidates = np.concatenate(above_idx)
-        if len(candidates):
-            reasons[candidates] = 3
-
-    # user-marked clusters: label the far points around each seed at 3 cm
-    # connectivity; the dominant component is the unselected ledge mass, all
-    # other sizeable components are limbs/equipment standing on the shelf
-    for i, (sx, sy, sz) in enumerate(SEED_CLUSTERS):
-        if not seed_idx[i]:
-            continue
-        indices = np.concatenate(seed_idx[i])
-        far = np.concatenate(seed_far[i])
-        far_indices = indices[far]
-        if len(far_indices) == 0:
-            continue
-        pts = xyz[far_indices]
-        vx = ((pts[:, 0] - (sx - SEED_BOX)) / SEED_VOXEL).astype(np.int64)
-        vy = ((pts[:, 1] - (sy - SEED_BOX)) / SEED_VOXEL).astype(np.int64)
-        vz = ((pts[:, 2] - pts[:, 2].min()) / SEED_VOXEL).astype(np.int64)
-        shape = (vx.max() + 1, vy.max() + 1, vz.max() + 1)
-        occupancy = np.zeros(shape, bool)
-        occupancy[vx, vy, vz] = True
-        labels, count = ndimage.label(occupancy, structure=np.ones((3, 3, 3), bool))
-        point_label = labels[vx, vy, vz]
-        sizes = np.bincount(point_label, minlength=count + 1)
-        mass = np.argmax(sizes[1:]) + 1 if count else 0
-        for component in range(1, count + 1):
-            if component == mass or sizes[component] < SEED_MIN_COMPONENT:
-                continue
-            member_mask = point_label == component
-            members = far_indices[member_mask]
-            component_points = pts[member_mask]
-            # a limb/equipment cluster must reach the marked point and sit in
-            # its height window; box-cropped fragments of the real ledge fail
-            planar = np.hypot(component_points[:, 0] - sx, component_points[:, 1] - sy)
-            if planar.min() > SEED_RADIUS:
-                continue
-            if (component_points[:, 2].min() < sz - SEED_Z_BELOW or
-                    component_points[:, 2].max() > sz + SEED_Z_ABOVE):
-                continue
-            keep_zero = reasons[members] == 0
-            reasons[members[keep_zero]] = 4
-    return reasons, xyz
+    metrics: dict with n, dens_med, i_med, i_p90, share, f_under, f_gap8,
+    man_f, flat_f, h_med, contact, seedhit (equal-length numpy arrays).
+    Returns uint8 verdicts: 0 keep, 2 sparse, 3 floating, 4 object, 5 seed.
+    """
+    n = metrics["n"]
+    big = (n >= BIG_KEEP_N) & (metrics["dens_med"] >= BIG_KEEP_DENSITY)
+    sparse = ~big & (metrics["dens_med"] < SPARSE_DENSITY_MAX)
+    floating = (~big & ~sparse & (n >= FLOAT_MIN_N) &
+                (metrics["contact"] < np.minimum(25, np.maximum(1, n // 100))))
+    flat_major = metrics["flat_f"] >= FLAT_MAJOR
+    gate = ((metrics["i_med"] >= OBJ_I_MED_HI) |
+            (metrics["i_p90"] >= OBJ_I_P90_HI) |
+            (metrics["i_med"] <= OBJ_I_MED_LO))
+    evidence = ((metrics["f_gap8"] >= EV_GAP_FRAC) |
+                (metrics["share"] >= EV_SINGLE_SCAN) |
+                ((metrics["f_under"] <= EV_SELF_SHADOW) &
+                 (metrics["h_med"] >= EV_SHADOW_H) & flat_major))
+    obj = (~big & ~sparse & ~floating & (n >= MIN_OBJ_N) &
+           ((gate & evidence) |
+            ((metrics["man_f"] >= OBJ_MANUAL_FRAC) & flat_major)))
+    verdict = np.zeros(len(n), np.uint8)
+    verdict[floating] = 3
+    verdict[obj] = 4
+    verdict[(metrics["seedhit"] == 1) & ~big & (verdict == 0)] = 5
+    verdict[sparse] = 2
+    return verdict
 
 
 def stage_classify(context: Context, data_dir: Path, work: Path):
+    from scipy import ndimage
     from scipy.spatial import cKDTree
-    summary = {}
-    removed_xyz, removed_reason = [], []
-    for role in ("SAND", "ROCK"):
-        key = f"{role}-5mm"
-        reasons, xyz = classify_5mm(context, data_dir, role)
-        np.save(work / f"reasons-{key}.npy", reasons)
-        ghost = reasons >= 2
-        removed_xyz.append(xyz[ghost])
-        removed_reason.append(reasons[ghost])
-        counts = {name: int((reasons == code).sum()) for code, name in REASON_NAMES.items()}
-        counts["total_removed"] = int((reasons > 0).sum())
-        counts["total_points"] = int(len(reasons))
-        summary[key] = counts
-        print(f"[classify] {key}: {counts}", flush=True)
 
-    # 1 mm ghosts and seeded clusters inherit from the removed 5 mm points so
-    # both densities always agree; the manual membership test runs directly.
-    inherit_tree = cKDTree(np.vstack(removed_xyz))
-    inherit_reason = np.concatenate(removed_reason)
+    def log(message):
+        print(f"[classify] {message}", flush=True)
+
+    # ---- combined 5 mm SAND+ROCK arrays (original clouds on disk) --------
+    role_span = {}
+    xs, ys, zs, is_, ss = [], [], [], [], []
+    cursor = 0
+    for role in ("SAND", "ROCK"):
+        cloud, _, _ = memmap_cloud(cloud_path(data_dir, role, "5mm"))
+        for a in range(0, len(cloud), 8_000_000):
+            k = cloud[a:a + 8_000_000]
+            xs.append(k["x"].astype(np.float32))
+            ys.append(k["y"].astype(np.float32))
+            zs.append(k["z"].astype(np.float32))
+            is_.append(k["scalar_Intensity"].astype(np.float32))
+            ss.append(k["scalar_ScanID"].astype(np.float32))
+        role_span[role] = (cursor, cursor + len(cloud))
+        cursor += len(cloud)
+    X = np.concatenate(xs); Y = np.concatenate(ys); Z = np.concatenate(zs)
+    I = np.concatenate(is_); S = np.concatenate(ss)
+    del xs, ys, zs, is_, ss
+    log(f"combined 5 mm cloud: {len(X):,} points")
+
+    # ---- global kNN surface density (13 neighbours, disk-equivalent) -----
+    tree = cKDTree(np.stack([X, Y, Z], 1))
+    dens = np.empty(len(X), np.float32)
+    for a in range(0, len(X), 4_000_000):
+        d, _ = tree.query(
+            np.stack([X[a:a + 4_000_000], Y[a:a + 4_000_000],
+                      Z[a:a + 4_000_000]], 1), k=14, workers=-1)
+        dens[a:a + 4_000_000] = 13.0 / (np.pi * np.maximum(d[:, 13], 1e-4) ** 2)
+    log("global density done")
+
+    # ---- v3 below-cloth mirror rule (unchanged; combined-tree density) ---
+    band, band_top, _ = context.columns(data_dir)
+    cny, cnx = band.shape
+    gx = np.clip(((X - context.x0) / REGION_CELL).astype(np.int64), 0, context.nx - 1)
+    gy = np.clip(((Y - context.y0) / REGION_CELL).astype(np.int64), 0, context.ny - 1)
+    inside = ((X >= context.x0) & (X < context.x0 + context.nx * REGION_CELL) &
+              (Y >= context.y0) & (Y < context.y0 + context.ny * REGION_CELL))
+    in_safe = inside & context.safe[gy, gx]
+    near_cloth = inside & context.cloth_near[gy, gx]
+    point_flat = inside & ~context.steep_near[gy, gx]
+    dz = Z - context.cloth_filled[gy, gx]
+    ccx = np.clip(((X - context.x0) / COLUMN_CELL).astype(np.int64), 0, cnx - 1)
+    ccy = np.clip(((Y - context.y0) / COLUMN_CELL).astype(np.int64), 0, cny - 1)
+    below = (near_cloth & ~context.steep_near[gy, gx] & (dz < BELOW_DZ) &
+             band[ccy, ccx] & (band_top[ccy, ccx] > Z + 0.04) &
+             (dens < BELOW_DENSITY_MAX))
+    log(f"below-cloth mirrors: {below.sum():,}")
+
+    # ---- ground sheet: cell minima, island voiding, opening, smoothing ---
+    ex0, ey0 = X.min() - 0.5, Y.min() - 0.5
+    enx = int((X.max() + 0.5 - ex0) / ENV_CELL) + 1
+    eny = int((Y.max() + 0.5 - ey0) / ENV_CELL) + 1
+    egx = ((X - ex0) / ENV_CELL).astype(np.int64)
+    egy = ((Y - ey0) / ENV_CELL).astype(np.int64)
+    eflat = egy * enx + egx
+    env = np.full(eny * enx, np.inf, np.float32)
+    np.minimum.at(env, eflat[~below], Z[~below])
+    dens_sum = np.zeros(eny * enx, np.float64)
+    dens_cnt = np.zeros(eny * enx, np.int64)
+    np.add.at(dens_sum, eflat[~below], dens[~below])
+    np.add.at(dens_cnt, eflat[~below], 1)
+    cell_dens = np.divide(dens_sum, dens_cnt, out=np.zeros(eny * enx),
+                          where=dens_cnt > 0).reshape(eny, enx)
+    have = np.isfinite(env).reshape(eny, enx)
+    env = env.reshape(eny, enx)
+    env[~have] = np.nan
+    point_voided = np.zeros(len(X), bool)
+    labels, ncomp = ndimage.label(have, structure=np.ones((3, 3), bool))
+    if ncomp:
+        sizes = np.bincount(labels.ravel())
+        comp_dens = np.bincount(labels.ravel(),
+                                weights=np.nan_to_num(cell_dens).ravel())
+        comp_mean = np.divide(comp_dens, np.maximum(sizes, 1))
+        void = (sizes <= ISLAND_MAX_CELLS) & (comp_mean < ISLAND_SPARSE)
+        void[0] = False
+        voided = void[labels]
+        env[voided] = np.nan
+        have &= ~voided
+        point_voided = voided[egy, egx]
+        log(f"env islands voided: {int(void.sum()):,} components")
+    disk_span = np.mgrid[-OPEN_RADIUS_CELLS:OPEN_RADIUS_CELLS + 1,
+                         -OPEN_RADIUS_CELLS:OPEN_RADIUS_CELLS + 1]
+    disk = np.hypot(disk_span[0], disk_span[1]) <= OPEN_RADIUS_CELLS
+    sheet = ndimage.grey_dilation(
+        ndimage.grey_erosion(fill_nan_nearest(env.copy()), footprint=disk),
+        footprint=disk)
+    sheet = ndimage.gaussian_filter(sheet, SHEET_SIGMA)
+    H = Z - sheet[egy, egx]
+
+    # ---- 2.5 cm column minima, hover, and wall relief --------------------
+    ncx2 = int((X.max() + 0.5 - ex0) / COLUMN_CELL) + 1
+    ncy2 = int((Y.max() + 0.5 - ey0) / COLUMN_CELL) + 1
+    c2x = ((X - ex0) / COLUMN_CELL).astype(np.int64)
+    c2y = ((Y - ey0) / COLUMN_CELL).astype(np.int64)
+    c2flat = c2y * ncx2 + c2x
+    colbase = np.full(ncy2 * ncx2, np.inf, np.float32)
+    np.minimum.at(colbase, c2flat[~below], Z[~below])
+    colbase = colbase.reshape(ncy2, ncx2)
+    lo5 = ndimage.minimum_filter(
+        np.where(np.isfinite(colbase), colbase, np.inf), size=5)
+    hi5 = ndimage.maximum_filter(
+        np.where(np.isfinite(colbase), colbase, -np.inf), size=5)
+    RELIEF = (hi5 - lo5)[c2y, c2x]
+    colmin = ndimage.minimum_filter(colbase, size=5)
+    HOVER3 = Z - colmin[c2y, c2x]
+    log("sheet + column minima done")
+
+    # ---- candidates: far from the hand-made mesh, or above the sheet -----
     tomesh = context.tomesh_tree()
+    manual = np.zeros(len(X), bool)
+    sidx = np.nonzero(in_safe & ~below)[0]
+    for a in range(0, len(sidx), 6_000_000):
+        q = sidx[a:a + 6_000_000]
+        d, _ = tomesh.query(np.stack([X[q], Y[q], Z[q]], 1), k=1, workers=-1,
+                            distance_upper_bound=MANUAL_DISTANCE)
+        manual[q[~np.isfinite(d)]] = True
+    cand = ~below & (manual | (np.isfinite(H) & (H > H_CAND)))
+    cidx = np.nonzero(cand)[0]
+    label = _cluster_labels(np.stack([X[cidx], Y[cidx], Z[cidx]], 1), CLUSTER_VOX)
+    n_clusters = int(label.max()) + 1 if len(cidx) else 0
+    log(f"candidates {len(cidx):,} in {n_clusters:,} clusters")
+
+    # ---- under metrics against non-candidates (site-wide columns) --------
+    colkey = c2x * np.int64(200_003) + c2y
+    nc_idx = np.nonzero(~cand & ~below)[0]
+    order = np.lexsort((Z[nc_idx], colkey[nc_idx]))
+    nc_key = colkey[nc_idx][order]
+    nc_z = Z[nc_idx][order]
+
+    def under_of(points_idx):
+        pk = colkey[points_idx]
+        pz = Z[points_idx] - 0.01
+        a = np.searchsorted(nc_key, pk, "left")
+        b = np.searchsorted(nc_key, pk, "right")
+        zi = np.fromiter(
+            (np.searchsorted(nc_z[lo:hi], q) for lo, hi, q in zip(a, b, pz)),
+            np.int64, len(pk)) - 1
+        out = np.full(len(pk), -np.inf, np.float32)
+        ok = (b > a) & (zi >= 0)
+        out[ok] = nc_z[(a + np.maximum(zi, 0))[ok]]
+        return out
+
+    ck = colkey[cidx]
+    pair = ck * np.int64(1 << 21) + label
+    o2 = np.lexsort((Z[cidx], pair))
+    _, ufirst = np.unique(pair[o2], return_index=True)
+    rep = o2[ufirst]
+    rep_lab = label[rep]
+    rep_under = under_of(cidx[rep])
+    rep_gap = Z[cidx[rep]] - rep_under
+    cnt_cols = np.bincount(rep_lab, minlength=n_clusters)
+    f_under = np.bincount(rep_lab[rep_under > -np.inf],
+                          minlength=n_clusters) / np.maximum(cnt_cols, 1)
+    f_gap8 = np.bincount(rep_lab[(rep_under > -np.inf) & (rep_gap >= EV_GAP)],
+                         minlength=n_clusters) / np.maximum(cnt_cols, 1)
+    nc_tree = cKDTree(np.stack([X[nc_idx], Y[nc_idx], Z[nc_idx]], 1))
+    contact = np.zeros(len(cidx), bool)
+    for a in range(0, len(cidx), 4_000_000):
+        q = cidx[a:a + 4_000_000]
+        d, _ = nc_tree.query(np.stack([X[q], Y[q], Z[q]], 1), k=1, workers=-1,
+                             distance_upper_bound=FLOAT_CONTACT_R)
+        contact[a:a + len(q)] = np.isfinite(d)
+    cnt_contact = np.bincount(label[contact], minlength=n_clusters)
+    log("under metrics + contact done")
+
+    # ---- per-cluster aggregates -----------------------------------------
+    CI = I[cidx]; CD = dens[cidx]; CS = S[cidx]; CM = manual[cidx]
+    CX = X[cidx]; CY = Y[cidx]; CZ = Z[cidx]
+    CH = H[cidx]; CH3 = HOVER3[cidx]; CF = point_flat[cidx]
+    sort_order = np.argsort(label, kind="stable")
+    lab_s = label[sort_order]
+    starts = np.concatenate([[0], np.nonzero(np.diff(lab_s))[0] + 1])
+    ends = np.concatenate([starts[1:], [len(lab_s)]])
+    m = {name: np.zeros(n_clusters, np.float32)
+         for name in ("i_med", "i_p90", "dens_med", "share", "man_f",
+                      "flat_f", "h_med")}
+    seedhit = np.zeros(n_clusters, np.int8)
+    for st, en in zip(starts, ends):
+        li = lab_s[st]
+        idx = sort_order[st:en]
+        m["i_med"][li] = np.median(CI[idx])
+        m["i_p90"][li] = np.percentile(CI[idx], 90)
+        m["dens_med"][li] = np.median(CD[idx])
+        m["h_med"][li] = np.nanmedian(CH[idx])
+        _, cc = np.unique(CS[idx], return_counts=True)
+        m["share"][li] = cc.max() / (en - st)
+        m["man_f"][li] = CM[idx].mean()
+        m["flat_f"][li] = CF[idx].mean()
+        for sx, sy, sz in SEED_CLUSTERS:
+            if (np.hypot(CX[idx] - sx, CY[idx] - sy).min() <= SEED_RADIUS and
+                    CZ[idx].min() >= sz - SEED_Z_BELOW and
+                    CZ[idx].max() <= sz + SEED_Z_ABOVE and
+                    (en - st) >= SEED_MIN_COMPONENT):
+                seedhit[li] = 1
+    n_of = np.bincount(label, minlength=n_clusters)
+    verdict = classify_verdicts({
+        "n": n_of, "dens_med": m["dens_med"], "i_med": m["i_med"],
+        "i_p90": m["i_p90"], "share": m["share"], "f_under": f_under,
+        "f_gap8": f_gap8, "man_f": m["man_f"], "flat_f": m["flat_f"],
+        "h_med": m["h_med"], "contact": cnt_contact, "seedhit": seedhit})
+    sparse_isolated = ((verdict == 2) &
+                       (cnt_contact < np.maximum(2, n_of // 200)))
+    vp = verdict[label]
+
+    # ---- per-point removals with reasons ---------------------------------
+    reasons = np.zeros(len(X), np.uint8)
+    reasons[below] = 1
+    remove_pt = np.isin(vp, (3, 4, 5))
+    point_reason = np.where(remove_pt, vp, 0).astype(np.uint8)
+    iso = sparse_isolated[label] & ~remove_pt
+    remove_pt |= iso
+    point_reason[iso] = 2
+    sp_pts = np.nonzero((vp == 2) & ~remove_pt)[0]
+    if len(sp_pts):
+        gentle = RELIEF[cidx[sp_pts]] <= WALL_RELIEF_MAX
+        airborne = gentle & (
+            (CH3[sp_pts] >= HOVER3_REMOVE) |
+            (np.nan_to_num(CH[sp_pts], nan=0.0) >= SPARSE_SHEET_H) |
+            (point_voided[cidx[sp_pts]] &
+             (np.nan_to_num(CH[sp_pts], nan=1.0) >= VOID_SHEET_H)))
+        remove_pt[sp_pts[airborne]] = True
+        point_reason[sp_pts[airborne]] = 2
+    keep_pts = np.nonzero((vp == 0) & (CD < PP_SPARSE_DENSITY) & ~remove_pt)[0]
+    if len(keep_pts):
+        airborne = ((CH3[keep_pts] >= PP_HOVER3) &
+                    (RELIEF[cidx[keep_pts]] <= WALL_RELIEF_MAX))
+        remove_pt[keep_pts[airborne]] = True
+        point_reason[keep_pts[airborne]] = 8
+    log(f"cluster + sparse removals: {int(remove_pt.sum()):,}")
+
+    # ---- sub-object extraction out of kept clusters ----------------------
+    kept_candidate = np.nonzero((vp == 0) & ~remove_pt)[0]
+
+    def run_sub_extraction(sel_idx, need_man):
+        removed = np.zeros(len(cidx), bool)
+        if not len(sel_idx):
+            return removed
+        slab = _cluster_labels(
+            np.stack([CX[sel_idx], CY[sel_idx], CZ[sel_idx]], 1), SUB_VOX)
+        n_sub = int(slab.max()) + 1
+        sn = np.bincount(slab, minlength=n_sub)
+        in_sel = np.zeros(len(cidx), bool)
+        in_sel[sel_idx] = True
+        outside = kept_candidate[~in_sel[kept_candidate]]
+        touch = np.zeros(len(sel_idx), bool)
+        if len(outside):
+            ot = cKDTree(np.stack([CX[outside], CY[outside], CZ[outside]], 1))
+            d, j = ot.query(
+                np.stack([CX[sel_idx], CY[sel_idx], CZ[sel_idx]], 1),
+                k=4, workers=-1, distance_upper_bound=0.035)
+            oz = CZ[outside]
+            for col in range(d.shape[1]):
+                ok = np.isfinite(d[:, col])
+                jj = np.clip(j[ok, col], 0, len(oz) - 1)
+                lateral = oz[jj] >= CZ[sel_idx[ok]] - 0.03
+                touch[np.nonzero(ok)[0][lateral]] = True
+        s_touch = np.bincount(slab[touch], minlength=n_sub) / np.maximum(sn, 1)
+        dloc, jloc = tree.query(
+            np.stack([X[cidx[sel_idx]], Y[cidx[sel_idx]], Z[cidx[sel_idx]]], 1),
+            k=8, workers=-1)
+        neigh = S[jloc]
+        local_scans = np.ones(len(sel_idx), np.float32)
+        for col in range(1, neigh.shape[1]):
+            near = dloc[:, col] <= 0.025
+            fresh = near & (np.abs(neigh[:, col] - neigh[:, 0]) > 0.5)
+            for prev in range(1, col):
+                fresh &= ~(near & (np.abs(neigh[:, col] - neigh[:, prev]) < 0.5))
+            local_scans += fresh.astype(np.float32)
+        s_share = np.zeros(n_sub, np.float32)
+        s_h3 = np.zeros(n_sub, np.float32)
+        s_mix = np.zeros(n_sub, np.float32)
+        s_man = np.zeros(n_sub, np.float32)
+        s_pf = np.zeros(n_sub, np.float32)
+        parent_n = n_of[label]
+        so2 = np.argsort(slab, kind="stable")
+        sl_s = slab[so2]
+        st2 = np.concatenate([[0], np.nonzero(np.diff(sl_s))[0] + 1])
+        en2 = np.concatenate([st2[1:], [len(sl_s)]])
+        for st, en in zip(st2, en2):
+            li = sl_s[st]
+            idx = sel_idx[so2[st:en]]
+            _, cc = np.unique(CS[idx], return_counts=True)
+            s_share[li] = cc.max() / (en - st)
+            s_h3[li] = np.median(CH3[idx])
+            s_mix[li] = np.median(local_scans[so2[st:en]])
+            s_man[li] = CM[idx].mean()
+            s_pf[li] = (en - st) / parent_n[idx[0]]
+        base = (sn >= MIN_OBJ_N) & (sn <= SUB_MAX_N) & (s_pf <= SUB_MAX_PARENT_FRAC)
+        if need_man:
+            s_obj = base & (s_man >= OBJ_MANUAL_FRAC) & (s_touch <= SUB_PTOUCH_MANUAL)
+        else:
+            s_obj = base & (
+                ((s_touch <= SUB_PTOUCH_BRIGHT) &
+                 ((s_share >= EV_SINGLE_SCAN) |
+                  ((s_h3 >= SUB_HOVER3) & (s_mix <= SUB_LOCAL_SCANS)))) |
+                ((s_touch <= SUB_FREE_TOUCH) & (s_h3 >= SUB_FREE_H3)))
+        removed[sel_idx[s_obj[slab]]] = True
+        return removed
+
+    kept_mask = (vp == 0) & ~remove_pt
+    sub_rm = (run_sub_extraction(
+                  np.nonzero(kept_mask & ((CI >= SUB_I_HI) |
+                                          (CI <= OBJ_I_MED_LO)))[0], False) |
+              run_sub_extraction(np.nonzero(kept_mask & CM)[0], True))
+    sub_rm &= ~remove_pt
+    remove_pt |= sub_rm
+    point_reason[sub_rm] = 6
+    log(f"sub-objects: {int(sub_rm.sum()):,}")
+
+    # ---- completions ------------------------------------------------------
+    rm_all = below.copy()
+    reasons[cidx[remove_pt]] = point_reason[remove_pt]
+    rm_all[cidx[remove_pt]] = True
+    obj_global = cidx[remove_pt & (point_reason != 2) & (point_reason != 8)]
+    for _ in range(2):
+        if not len(obj_global):
+            break
+        ot = cKDTree(np.stack([X[obj_global], Y[obj_global], Z[obj_global]], 1))
+        oI = I[obj_global]
+        newly = []
+        left = np.nonzero(~rm_all)[0]
+        for a in range(0, len(left), 6_000_000):
+            q = left[a:a + 6_000_000]
+            d, j = ot.query(np.stack([X[q], Y[q], Z[q]], 1), k=1, workers=-1,
+                            distance_upper_bound=COMPLETE_R)
+            hit = np.isfinite(d)
+            src_bright = oI[np.clip(j[hit], 0, len(oI) - 1)] >= OBJ_I_MED_HI
+            okj = np.where(src_bright, I[q[hit]] >= COMPLETE_BRIGHT,
+                           I[q[hit]] <= COMPLETE_DARK)
+            newly.append(q[hit][okj])
+        newly = np.concatenate(newly) if newly else np.array([], np.int64)
+        if not len(newly):
+            break
+        rm_all[newly] = True
+        reasons[newly] = 7
+        obj_global = newly
+    sparse_global = cidx[remove_pt & (point_reason == 2)]
+    if len(sparse_global):
+        stree = cKDTree(np.stack([X[sparse_global], Y[sparse_global],
+                                  Z[sparse_global]], 1))
+        left = np.nonzero(~rm_all & (dens < SPARSE_DENSITY_MAX) &
+                          (HOVER3 >= HOVER3_COMPLETE) &
+                          (RELIEF <= WALL_RELIEF_MAX))[0]
+        for a in range(0, len(left), 6_000_000):
+            q = left[a:a + 6_000_000]
+            d, _ = stree.query(np.stack([X[q], Y[q], Z[q]], 1), k=1, workers=-1,
+                               distance_upper_bound=0.025)
+            hit = np.isfinite(d)
+            rm_all[q[hit]] = True
+            reasons[q[hit]] = 7
+    reasons[~rm_all] = 0
+    log(f"total 5 mm removal: {int(rm_all.sum()):,} "
+        f"({rm_all.sum() / len(X) * 100:.2f}%)")
+
+    # ---- split back per role, save, summarize ----------------------------
+    summary = {}
+    removed_xyz = []
+    for role in ("SAND", "ROCK"):
+        lo, hi = role_span[role]
+        role_reasons = reasons[lo:hi]
+        np.save(work / f"reasons-{role}-5mm.npy", role_reasons)
+        counts = {name: int((role_reasons == code).sum())
+                  for code, name in REASON_NAMES.items()}
+        counts["total_removed"] = int((role_reasons > 0).sum())
+        counts["total_points"] = int(hi - lo)
+        summary[f"{role}-5mm"] = counts
+        print(f"[classify] {role}-5mm: {counts}", flush=True)
+        removed_xyz.append(np.stack(
+            [X[lo:hi][role_reasons > 0], Y[lo:hi][role_reasons > 0],
+             Z[lo:hi][role_reasons > 0]], 1))
+    inherit_reason = np.concatenate(
+        [reasons[np.arange(*role_span[role])][
+             reasons[np.arange(*role_span[role])] > 0]
+         for role in ("SAND", "ROCK")])
+    inherit_tree = cKDTree(np.vstack(removed_xyz))
+
+    # ---- 1 mm: pure inheritance (the 5 mm cloud is a greedy min-spacing
+    # ---- subset of the 1 mm cloud, so every 1 mm member of a removed
+    # ---- structure has a removed 5 mm point within the inherit radius) ---
     for role in ("SAND", "ROCK"):
         key = f"{role}-1mm"
         cloud, _, _ = memmap_cloud(cloud_path(data_dir, role, "1mm"))
-        reasons = np.zeros(len(cloud), np.uint8)
-        for start in range(0, len(cloud), 8_000_000):
-            chunk = cloud[start:start + 8_000_000]
-            x = chunk["x"].astype(np.float32); y = chunk["y"].astype(np.float32)
-            z = chunk["z"].astype(np.float32)
-            gx = ((x - context.x0) / REGION_CELL).astype(np.int64)
-            gy = ((y - context.y0) / REGION_CELL).astype(np.int64)
-            inside = (gx >= 0) & (gx < context.nx) & (gy >= 0) & (gy < context.ny)
-            gxc = np.clip(gx, 0, context.nx - 1); gyc = np.clip(gy, 0, context.ny - 1)
-            in_safe = inside & context.safe[gyc, gxc]
-            near_cloth = inside & context.cloth_near[gyc, gxc]
-            chunk_reason = np.zeros(len(chunk), np.uint8)
-            if in_safe.any():
-                pts = np.stack([x[in_safe], y[in_safe], z[in_safe]], 1)
-                distance, _ = tomesh.query(pts, k=1, workers=-1)
-                manual = np.zeros(len(chunk), bool)
-                manual[np.nonzero(in_safe)[0][distance > MANUAL_DISTANCE]] = True
-                chunk_reason[manual] = 1
-            in_box = np.zeros(len(chunk), bool)
-            for sx, sy, _ in SEED_CLUSTERS:
-                in_box |= (np.abs(x - sx) < SEED_BOX) & (np.abs(y - sy) < SEED_BOX)
-            query = (near_cloth | in_box) & (chunk_reason == 0)
-            if query.any():
-                pts = np.stack([x[query], y[query], z[query]], 1)
-                distance, neighbour = inherit_tree.query(
-                    pts, k=1, workers=-1, distance_upper_bound=INHERIT_RADIUS)
-                hit = np.isfinite(distance)
-                rows = np.nonzero(query)[0][hit]
-                chunk_reason[rows] = inherit_reason[neighbour[hit]]
-            reasons[start:start + len(chunk)] = chunk_reason
-        np.save(work / f"reasons-{key}.npy", reasons)
-        counts = {name: int((reasons == code).sum()) for code, name in REASON_NAMES.items()}
-        counts["total_removed"] = int((reasons > 0).sum())
-        counts["total_points"] = int(len(reasons))
+        fine_reasons = np.zeros(len(cloud), np.uint8)
+        for a in range(0, len(cloud), 8_000_000):
+            k = cloud[a:a + 8_000_000]
+            pts = np.stack([k["x"].astype(np.float32),
+                            k["y"].astype(np.float32),
+                            k["z"].astype(np.float32)], 1)
+            distance, neighbour = inherit_tree.query(
+                pts, k=1, workers=-1, distance_upper_bound=INHERIT_RADIUS)
+            hit = np.isfinite(distance)
+            fine_reasons[a + np.nonzero(hit)[0]] = inherit_reason[neighbour[hit]]
+        np.save(work / f"reasons-{key}.npy", fine_reasons)
+        counts = {name: int((fine_reasons == code).sum())
+                  for code, name in REASON_NAMES.items()}
+        counts["total_removed"] = int((fine_reasons > 0).sum())
+        counts["total_points"] = int(len(fine_reasons))
         summary[key] = counts
         print(f"[classify] {key}: {counts}", flush=True)
     (work / "classify-summary.json").write_text(json.dumps(summary, indent=2))
@@ -571,15 +904,18 @@ def patched_header(header: bytes, new_count: int) -> bytes:
     return patched.encode("ascii")
 
 
-def stage_apply(data_dir: Path, work: Path):
-    run_dir = data_dir / "PatchRefinement" / RUN_NAME
+def stage_apply(data_dir: Path, work: Path, run_name: str = RUN_NAME):
+    run_dir = data_dir / "PatchRefinement" / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     (data_dir / "PatchRefinement" / ".invisible_places-ignore").touch()
-    manifest = {"run": RUN_NAME, "created": _dt.datetime.now().isoformat(),
+    manifest = {"run": run_name, "created": _dt.datetime.now().isoformat(),
                 "parameters": {
-                    "manual_distance": MANUAL_DISTANCE, "surface_band": SURFACE_BAND,
-                    "below_dz": BELOW_DZ, "above_dz": ABOVE_DZ,
-                    "support_gap": SUPPORT_GAP, "cover_radius_cells": COVER_RADIUS_CELLS},
+                    "manual_distance": MANUAL_DISTANCE, "below_dz": BELOW_DZ,
+                    "sparse_density_max": SPARSE_DENSITY_MAX,
+                    "hover3_remove": HOVER3_REMOVE,
+                    "wall_relief_max": WALL_RELIEF_MAX,
+                    "obj_i_med_hi": OBJ_I_MED_HI, "obj_i_med_lo": OBJ_I_MED_LO,
+                    "sub_i_hi": SUB_I_HI, "complete_r": COMPLETE_R},
                 "files": {}}
     for role, spacing in CLEAN_TARGETS:
         key = f"{role}-{spacing}"
@@ -628,8 +964,8 @@ def stage_apply(data_dir: Path, work: Path):
     print(f"[apply] manifest -> {run_dir/'manifest.json'}")
 
 
-def stage_restore(data_dir: Path):
-    run_dir = data_dir / "PatchRefinement" / RUN_NAME
+def stage_restore(data_dir: Path, run_name: str = RUN_NAME):
+    run_dir = data_dir / "PatchRefinement" / run_name
     manifest = json.loads((run_dir / "manifest.json").read_text())
     for key, entry in manifest["files"].items():
         role, spacing = key.split("-")
@@ -1225,16 +1561,18 @@ def main():
                                           "restore", "all"])
     parser.add_argument("--data-dir", type=Path, default=Path("Data/Scene1"))
     parser.add_argument("--work-dir", type=Path, required=True)
+    parser.add_argument("--run-name", default=RUN_NAME,
+                        help="PatchRefinement run to apply into or restore from")
     args = parser.parse_args()
     args.work_dir.mkdir(parents=True, exist_ok=True)
     if args.stage == "restore":
-        stage_restore(args.data_dir)
+        stage_restore(args.data_dir, args.run_name)
         return
     context = Context(args.data_dir, args.work_dir)
     if args.stage in ("classify", "all"):
         stage_classify(context, args.data_dir, args.work_dir)
     if args.stage in ("apply", "all"):
-        stage_apply(args.data_dir, args.work_dir)
+        stage_apply(args.data_dir, args.work_dir, args.run_name)
     if args.stage in ("cloth", "all"):
         stage_cloth(context, args.data_dir)
     if args.stage in ("water", "all"):
