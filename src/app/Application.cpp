@@ -11187,6 +11187,30 @@ bool AnimationRegistryEntryMatchesActiveScene(
     return !sawScene;
 }
 
+// Saved camera shots follow the active scene like animations: a shot whose
+// associations name a different grouped scene is hidden from the path list.
+bool CameraShotMatchesActiveScene(
+    const PreviewRuntimeState& runtimeState,
+    const CameraShot& shot) {
+    const auto activeScene = ActiveWaterTimingSceneGroupName(runtimeState.water);
+    if (activeScene.empty() || activeScene == "Default") {
+        return true;
+    }
+    auto paths = shot.associatedLayerPaths;
+    CanonicalizeAssociatedLayerPathsForSceneGroups(runtimeState, &paths);
+    bool sawScene = false;
+    for (const auto& path : paths) {
+        if (const auto sceneName = SceneGroupNameFromAssociationPath(path);
+            sceneName.has_value()) {
+            sawScene = true;
+            if (sceneName.value() == activeScene) {
+                return true;
+            }
+        }
+    }
+    return !sawScene;
+}
+
 std::string AssociationDisplayName(
     const PreviewRuntimeState& runtimeState,
     const std::filesystem::path& path) {
@@ -24726,13 +24750,27 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
         waterSceneState.pathCache = CurrentWaterPathCacheForDocument(runtimeState);
         waterSceneState.dynamicMeshPath = runtimeState.water.dynamicMeshFlowSettings.meshPath;
         const auto activeStateName = waterSceneState.sceneGroupName;
-        document.waterSceneStates.push_back(std::move(waterSceneState));
+        const auto stateHasContent =
+            [](const invisible_places::serialization::WaterSceneStateDocument& state) {
+                return !state.emitters.empty() || !state.manualFlowPaths.empty() ||
+                       !state.seepageNodes.empty() || !state.shorelineInstances.empty();
+            };
         // Every other scene's authored water rides along untouched, so a
         // save while Fossils is active cannot strip Pools' nodes and paths.
+        // If the runtime's active state is empty but a stored state for the
+        // same scene has content, the stored one is emitted instead -- an
+        // empty runtime must never erase authored water on save.
+        bool activeEmitted = false;
         for (const auto& inactive : runtimeState.persistence.inactiveWaterSceneStates) {
             if (inactive.sceneGroupName != activeStateName) {
                 document.waterSceneStates.push_back(inactive);
+            } else if (!stateHasContent(waterSceneState) && stateHasContent(inactive)) {
+                document.waterSceneStates.push_back(inactive);
+                activeEmitted = true;
             }
+        }
+        if (!activeEmitted) {
+            document.waterSceneStates.push_back(std::move(waterSceneState));
         }
     }
     document.waterSourceSettings = runtimeState.water.defaultSourceSettings;
@@ -25535,11 +25573,20 @@ void SwitchActiveWaterSceneState(
     }
     auto& store = runtimeState->persistence.inactiveWaterSceneStates;
     auto outgoing = BuildActiveWaterSceneStateSnapshot(*runtimeState, current);
+    const auto stateHasContent = [](const invisible_places::serialization::WaterSceneStateDocument& state) {
+        return !state.emitters.empty() || !state.manualFlowPaths.empty() ||
+               !state.seepageNodes.empty() || !state.shorelineInstances.empty();
+    };
     if (const auto existing = std::find_if(
             store.begin(), store.end(),
             [&](const auto& state) { return state.sceneGroupName == outgoing.sceneGroupName; });
         existing != store.end()) {
-        *existing = std::move(outgoing);
+        // Never let an empty runtime snapshot destroy a stored authored
+        // state: a double switch through an unrouted path used to do exactly
+        // that. Content only ever replaces content (or fills emptiness).
+        if (stateHasContent(outgoing) || !stateHasContent(*existing)) {
+            *existing = std::move(outgoing);
+        }
     } else {
         store.push_back(std::move(outgoing));
     }
@@ -25571,6 +25618,22 @@ void SwitchActiveWaterSceneState(
     InvalidateWaterSeepageTopology(&runtimeState->water);
 }
 
+// The single entry point for pointing the authoritative water scene at a
+// scene group: the per-scene water objects swap first, so no activation path
+// (Project panel, Lidar checkboxes, Load Scene buttons) can flip the name
+// while another scene's seepage/flow/shoreline objects stay in the runtime
+// -- that mismatch is what mis-attributed Scene3's water to Scene1 on save.
+void SetAuthoritativeWaterScene(
+    PreviewRuntimeState* runtimeState,
+    const std::string& sceneGroupName) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    SwitchActiveWaterSceneState(runtimeState, sceneGroupName);
+    runtimeState->water.authoritativeWaterSurfaceSceneGroupName = sceneGroupName;
+    runtimeState->water.activeWaterSurfaceSceneGroupName = sceneGroupName;
+}
+
 void ActivateExclusiveScene(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport,
@@ -25591,7 +25654,7 @@ void ActivateExclusiveScene(
         return;
     }
 
-    SwitchActiveWaterSceneState(runtimeState, target->sceneGroupName);
+    SetAuthoritativeWaterScene(runtimeState, target->sceneGroupName);
     CancelWaterSurfaceCacheWarmup(&runtimeState->water);
 
     for (auto& scene : runtimeState->pointCloudScenes) {
@@ -25618,8 +25681,6 @@ void ActivateExclusiveScene(
         }
     }
 
-    runtimeState->water.authoritativeWaterSurfaceSceneGroupName = target->sceneGroupName;
-    runtimeState->water.activeWaterSurfaceSceneGroupName = target->sceneGroupName;
     target->displayVisible = true;
     if (!target->displayLoaded) {
         const bool mixedLoadAvailable = target->mixedDisplay &&
@@ -52285,10 +52346,27 @@ void DrawCameraSection(
         SaveCurrentCameraPathAsAnimation(runtimeState);
     }
 
+    {
+        std::size_t hiddenShots = 0;
+        for (const auto shotIndex : runtimeState->cameraPanel.pathShotIndices) {
+            if (shotIndex < runtimeState->cameraShots.size() &&
+                !CameraShotMatchesActiveScene(*runtimeState, runtimeState->cameraShots[shotIndex])) {
+                ++hiddenShots;
+            }
+        }
+        if (hiddenShots > 0) {
+            ImGui::TextDisabled(
+                "%zu camera shot(s) hidden with their scene.", hiddenShots);
+        }
+    }
     if (ImGui::BeginListBox("Path Order", ImVec2{-FLT_MIN, 160.0F})) {
         for (std::size_t pathItemIndex = 0; pathItemIndex < runtimeState->cameraPanel.pathShotIndices.size(); ++pathItemIndex) {
             const auto shotIndex = runtimeState->cameraPanel.pathShotIndices[pathItemIndex];
             const bool validShot = shotIndex < runtimeState->cameraShots.size();
+            if (validShot &&
+                !CameraShotMatchesActiveScene(*runtimeState, runtimeState->cameraShots[shotIndex])) {
+                continue;
+            }
             const auto label = std::to_string(pathItemIndex + 1U) +
                                "  " +
                                (validShot ? runtimeState->cameraShots[shotIndex].name : std::string{"Missing Shot"});
@@ -72675,10 +72753,7 @@ void DrawVisiblePointCloudSelector(
                                    3) +
                                " mm — " + FormatPointCount(bundle.totalPointCount) + " points";
             if (ImGui::Selectable(label.c_str(), selected)) {
-                runtimeState->water.authoritativeWaterSurfaceSceneGroupName =
-                    scene->sceneGroupName;
-                runtimeState->water.activeWaterSurfaceSceneGroupName =
-                    scene->sceneGroupName;
+                SetAuthoritativeWaterScene(runtimeState, scene->sceneGroupName);
                 RequestSceneDisplaySwitch(
                     runtimeState,
                     viewport,
@@ -72846,10 +72921,7 @@ void DrawLidarPanel(
                 if (ImGui::Checkbox("Visible", &visible)) {
                     scene.displayVisible = visible;
                     if (visible) {
-                        runtimeState->water.authoritativeWaterSurfaceSceneGroupName =
-                            scene.sceneGroupName;
-                        runtimeState->water.activeWaterSurfaceSceneGroupName =
-                            scene.sceneGroupName;
+                        SetAuthoritativeWaterScene(runtimeState, scene.sceneGroupName);
                     }
                     for (const auto sessionIndex : scene.committedDisplaySessionIndices) {
                         if (sessionIndex.has_value() && runtimeState->sessions[sessionIndex.value()].gpuResident) {
@@ -72880,10 +72952,7 @@ void DrawLidarPanel(
                     (scene.committedDisplaySpacingMicrometres.has_value() || mixedLoadAvailable)) {
                     if (ImGui::Button("Load Scene")) {
                         scene.displayVisible = true;
-                        runtimeState->water.authoritativeWaterSurfaceSceneGroupName =
-                            scene.sceneGroupName;
-                        runtimeState->water.activeWaterSurfaceSceneGroupName =
-                            scene.sceneGroupName;
+                        SetAuthoritativeWaterScene(runtimeState, scene.sceneGroupName);
                         if (scene.committedDisplaySpacingMicrometres.has_value()) {
                             RequestSceneDisplaySwitch(
                                 runtimeState,
