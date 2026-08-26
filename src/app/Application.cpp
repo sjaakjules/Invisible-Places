@@ -95703,6 +95703,18 @@ void DetachTimingColouriseSavedPaletteSource(
                 candidate.paletteSourceId.clear();
                 candidate.paletteEdited = false;
             }
+            // Private _edited variants of the deleted saved palette lose
+            // their original; drop them everywhere. An effect that had the
+            // variant active keeps its content in the Custom base above.
+            std::erase_if(
+                candidate.localPaletteEdits,
+                [&](const auto& edit) {
+                    return edit.sourceKind ==
+                               invisible_places::timing::
+                                   TimingColourisePaletteSourceKind::
+                                       Saved &&
+                           edit.presetId == paletteId;
+                });
         }
     }
 }
@@ -96396,8 +96408,12 @@ void DrawTimingColourisePaletteEditor(
                                  found))};
     };
     const auto markPaletteBaseEdited = [&]() {
+        // Preset and saved sources fork into a private "_edited" variant on
+        // their first edit; a Custom palette is already effect-local.
         if (effect->paletteSourceKind ==
-            TimingColourisePaletteSourceKind::Preset) {
+                TimingColourisePaletteSourceKind::Preset ||
+            effect->paletteSourceKind ==
+                TimingColourisePaletteSourceKind::Saved) {
             (void)invisible_places::timing::
                 UpsertTimingColouriseLocalPaletteEdit(
                     effect,
@@ -96433,11 +96449,27 @@ void DrawTimingColourisePaletteEditor(
 
     bool hasPaletteKeys =
         TimingColouriseEffectHasPaletteKeys(*effect);
+    // Preset and saved sources keep private "_edited" variants, so switching
+    // never discards work; only an edited Custom palette (which has no
+    // variant to survive in) still locks the source combos.
     const bool paletteSourceLocked =
         hasPaletteKeys ||
         (effect->paletteEdited &&
-         effect->paletteSourceKind !=
-             TimingColourisePaletteSourceKind::Preset);
+         effect->paletteSourceKind ==
+             TimingColourisePaletteSourceKind::Custom);
+    // While a source's "_edited" variant exists, its selected original is
+    // view-only: editing it again would silently overwrite the variant.
+    // Deleting the variant reopens the original.
+    const bool baseEditingBlocked =
+        !effect->paletteEdited &&
+        (effect->paletteSourceKind ==
+             TimingColourisePaletteSourceKind::Preset ||
+         effect->paletteSourceKind ==
+             TimingColourisePaletteSourceKind::Saved) &&
+        invisible_places::timing::FindTimingColouriseLocalPaletteEdit(
+            *effect,
+            effect->paletteSourceKind,
+            effect->paletteSourceId) != nullptr;
     const auto presets =
         invisible_places::timing::
             BuiltInTimingColourisePalettePresets();
@@ -96610,23 +96642,51 @@ void DrawTimingColourisePaletteEditor(
             savedPreview.c_str())) {
         for (const auto& saved :
              water.savedTimingColourisePalettes) {
-            const bool selected =
+            const bool originalSelected =
                 effect->paletteSourceKind ==
                     TimingColourisePaletteSourceKind::Saved &&
-                effect->paletteSourceId == saved.id;
+                effect->paletteSourceId == saved.id &&
+                !effect->paletteEdited;
             if (DrawTimingPaletteComboEntry(
                     saved,
-                    selected)) {
-                ApplyTimingColourisePaletteSource(
-                    effect,
-                    TimingColourisePaletteSourceKind::Saved,
-                    saved);
-                timings.selectedColourisePaletteStopIndex = 0U;
-                timings.draggingColourisePaletteStop = false;
-                timings.draggingColourisePaletteStopAmount = false;
-                runtimeState
-                    ->previewRenderStateSignatureValid = false;
+                    originalSelected) &&
+                invisible_places::timing::
+                    ActivateTimingColouriseOriginalSource(
+                        effect,
+                        TimingColourisePaletteSourceKind::Saved,
+                        saved)) {
+                resetPaletteInteraction();
             }
+            const auto* savedLocalEdit = invisible_places::timing::
+                FindTimingColouriseLocalPaletteEdit(
+                    *effect,
+                    TimingColourisePaletteSourceKind::Saved,
+                    saved.id);
+            if (savedLocalEdit == nullptr) {
+                continue;
+            }
+            TimingColourisePaletteDefinition editedDefinition{
+                .id = saved.id + "-effect-local-edit",
+                .name = savedLocalEdit->presetName + "_edited",
+                .palette = savedLocalEdit->palette,
+            };
+            const bool localEditSelected =
+                effect->paletteSourceKind ==
+                    TimingColourisePaletteSourceKind::Saved &&
+                effect->paletteSourceId == saved.id &&
+                effect->paletteEdited;
+            ImGui::Indent(10.0F);
+            if (DrawTimingPaletteComboEntry(
+                    editedDefinition,
+                    localEditSelected) &&
+                invisible_places::timing::
+                    ActivateTimingColouriseLocalPaletteEdit(
+                        effect,
+                        TimingColourisePaletteSourceKind::Saved,
+                        saved.id)) {
+                resetPaletteInteraction();
+            }
+            ImGui::Unindent(10.0F);
         }
         if (water.savedTimingColourisePalettes.empty()) {
             ImGui::TextDisabled(
@@ -96639,19 +96699,24 @@ void DrawTimingColourisePaletteEditor(
         hasPaletteKeys
             ? "Palette source changes are locked while this effect has keyed palette versions."
         : paletteSourceLocked
-            ? "Save the active _edited palette before choosing another palette if you want to keep the changes."
-            : "Copy a saved project palette into this Colourise effect.");
+            ? "Save the active custom palette with + before choosing another palette if you want to keep the changes."
+            : "Choose a saved project palette or one of this effect's private _edited versions. Editing an original creates its private version; switching does not discard either version.");
 
+    // The active private variant, when one is selected: promoted by "+",
+    // written over its saved original by "Save", removed by "X".
+    const bool activeVariantSelected =
+        (effect->paletteSourceKind ==
+             TimingColourisePaletteSourceKind::Preset ||
+         effect->paletteSourceKind ==
+             TimingColourisePaletteSourceKind::Saved) &&
+        effect->paletteEdited &&
+        invisible_places::timing::
+                FindTimingColouriseLocalPaletteEdit(
+                    *effect,
+                    effect->paletteSourceKind,
+                    effect->paletteSourceId) != nullptr;
     ImGui::SameLine();
     if (ImGui::SmallButton("+")) {
-        const bool promotesLocalPresetEdit =
-            effect->paletteSourceKind ==
-                TimingColourisePaletteSourceKind::Preset &&
-            effect->paletteEdited &&
-            invisible_places::timing::
-                    FindTimingColouriseLocalPaletteEdit(
-                        *effect,
-                        effect->paletteSourceId) != nullptr;
         timings.paletteNameBuffer =
             effect->paletteSourceName.empty()
                 ? "Palette " +
@@ -96659,17 +96724,17 @@ void DrawTimingColourisePaletteEditor(
                           water.savedTimingColourisePalettes
                                   .size() +
                               1U)
-            : promotesLocalPresetEdit
+            : activeVariantSelected &&
+                      effect->paletteSourceKind ==
+                          TimingColourisePaletteSourceKind::Preset
                 ? effect->paletteSourceName
                 : effect->paletteSourceName + " Copy";
         ImGui::OpenPopup(
             "Save New Colourise Palette");
     }
     DrawTimingControlTooltip(
-        effect->paletteSourceKind ==
-                    TimingColourisePaletteSourceKind::Preset &&
-                effect->paletteEdited
-            ? "Promote the active private _edited preset to a shared saved project palette. Other private preset edits on this effect remain available."
+        activeVariantSelected
+            ? "Promote the active private _edited version to a shared saved project palette. Other private edits on this effect remain available."
             : "Save this palette under a new editable project name. Effect-local keys remain attached.");
 
     ImGui::SameLine(0.0F, 2.0F);
@@ -96684,11 +96749,22 @@ void DrawTimingColourisePaletteEditor(
     ImGui::BeginDisabled(!canSaveEdited);
     if (ImGui::SmallButton("Save") &&
         selectedSavedPalette != nullptr) {
+        // Write the active _edited version over its saved original, then
+        // retire the variant: discarding it against the updated original
+        // returns this effect to the (now identical) saved base.
         selectedSavedPalette->palette =
             invisible_places::timing::
                 SanitizeTimingColourisePalette(
                     effect->basePalette);
-        effect->paletteEdited = false;
+        if (invisible_places::timing::
+                DiscardTimingColouriseLocalPaletteEdit(
+                    effect,
+                    TimingColourisePaletteSourceKind::Saved,
+                    *selectedSavedPalette)) {
+            resetPaletteInteraction();
+        } else {
+            effect->paletteEdited = false;
+        }
         runtimeState->statusMessage =
             "Saved palette " +
             selectedSavedPalette->name + ".";
@@ -96696,8 +96772,8 @@ void DrawTimingColourisePaletteEditor(
     ImGui::EndDisabled();
     DrawTimingControlTooltip(
         canSaveEdited
-            ? "Overwrite the saved palette with this _edited base and return to its saved name."
-            : "Edit a saved palette before overwriting it.");
+            ? "Overwrite the saved palette with this _edited version and return to its saved name. The private version is retired because the original now matches it."
+            : "Select a saved palette's _edited version before overwriting its original.");
 
     ImGui::SameLine(0.0F, 2.0F);
     const bool savedPaletteHasKeyedUse =
@@ -96707,11 +96783,17 @@ void DrawTimingColourisePaletteEditor(
             selectedSavedPalette->id);
     const bool hadSelectedSavedPalette =
         selectedSavedPalette != nullptr;
-    ImGui::BeginDisabled(
-        selectedSavedPalette == nullptr ||
-        savedPaletteHasKeyedUse);
-    if (ImGui::SmallButton("X") &&
-        selectedSavedPalette != nullptr) {
+    const bool savedEditExists =
+        selectedSavedPalette != nullptr &&
+        invisible_places::timing::
+                FindTimingColouriseLocalPaletteEdit(
+                    *effect,
+                    TimingColourisePaletteSourceKind::Saved,
+                    selectedSavedPalette->id) != nullptr;
+    const auto deleteSelectedSavedPalette = [&]() {
+        if (selectedSavedPalette == nullptr) {
+            return;
+        }
         const std::string deletedId =
             selectedSavedPalette->id;
         const std::string deletedName =
@@ -96725,16 +96807,97 @@ void DrawTimingColourisePaletteEditor(
                 return candidate.id == deletedId;
             });
         selectedSavedPalette = nullptr;
+        resetPaletteInteraction();
         runtimeState->statusMessage =
             "Deleted saved palette " + deletedName + ".";
+    };
+    const auto discardSelectedSavedEdit = [&]() {
+        if (selectedSavedPalette == nullptr) {
+            return;
+        }
+        const std::string editedName =
+            selectedSavedPalette->name;
+        if (invisible_places::timing::
+                DiscardTimingColouriseLocalPaletteEdit(
+                    effect,
+                    TimingColourisePaletteSourceKind::Saved,
+                    *selectedSavedPalette)) {
+            resetPaletteInteraction();
+            runtimeState->statusMessage =
+                "Discarded " + editedName +
+                "_edited and restored the saved palette.";
+            runtimeState->errorMessage.clear();
+        }
+    };
+    // X deletes the active _edited version when one is selected; on an
+    // original it deletes the saved palette, asking which of the two to
+    // remove when an _edited version also exists.
+    const bool deletesActiveSavedEdit =
+        selectedSavedPalette != nullptr && effect->paletteEdited &&
+        savedEditExists;
+    const bool savedDeleteDisabled =
+        selectedSavedPalette == nullptr ||
+        (deletesActiveSavedEdit
+             ? hasPaletteKeys
+             : savedPaletteHasKeyedUse ||
+                   (savedEditExists && hasPaletteKeys));
+    ImGui::BeginDisabled(savedDeleteDisabled);
+    if (ImGui::SmallButton("X") &&
+        selectedSavedPalette != nullptr) {
+        if (deletesActiveSavedEdit) {
+            discardSelectedSavedEdit();
+        } else if (savedEditExists) {
+            ImGui::OpenPopup("Delete Saved Palette");
+        } else {
+            deleteSelectedSavedPalette();
+        }
     }
     ImGui::EndDisabled();
     DrawTimingControlTooltip(
         !hadSelectedSavedPalette
             ? "Select a saved palette before deleting it."
+        : deletesActiveSavedEdit
+            ? hasPaletteKeys
+                  ? "Palette keys lock this private edit. Remove its palette keys before discarding it."
+                  : "Delete this saved palette's _edited version and restore the saved original."
         : savedPaletteHasKeyedUse
             ? "This saved palette is used by keyed Colourise versions and cannot be deleted."
+        : savedEditExists
+            ? hasPaletteKeys
+                  ? "Palette keys lock this palette's _edited version; remove them before deleting."
+                  : "Delete this saved palette. Because an _edited version exists you will be asked whether it goes too."
             : "Delete this saved palette. Unkeyed effects keep independent custom snapshots.");
+    if (ImGui::BeginPopupModal(
+            "Delete Saved Palette",
+            nullptr,
+            ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted(
+            selectedSavedPalette != nullptr
+                ? selectedSavedPalette->name.c_str()
+                : "Saved palette");
+        ImGui::TextDisabled(
+            "An _edited version of this saved palette exists.");
+        if (ImGui::Button("Delete Palette and Edited Version") &&
+            selectedSavedPalette != nullptr) {
+            discardSelectedSavedEdit();
+            deleteSelectedSavedPalette();
+            ImGui::CloseCurrentPopup();
+        }
+        DrawTimingControlTooltip(
+            "Remove the saved palette and this effect's private _edited version of it.");
+        ImGui::SameLine();
+        if (ImGui::Button("Delete Edited Version")) {
+            discardSelectedSavedEdit();
+            ImGui::CloseCurrentPopup();
+        }
+        DrawTimingControlTooltip(
+            "Keep the saved palette; remove only its private _edited version.");
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
 
     if (ImGui::BeginPopupModal(
             "Save New Colourise Palette",
@@ -96779,22 +96942,27 @@ void DrawTimingColourisePaletteEditor(
                         water.savedTimingColourisePalettes,
                         &water
                              .nextTimingColourisePaletteSequence);
-            const bool promotesLocalPresetEdit =
-                effect->paletteSourceKind ==
-                    TimingColourisePaletteSourceKind::Preset &&
+            const bool promotesLocalEdit =
+                (effect->paletteSourceKind ==
+                     TimingColourisePaletteSourceKind::Preset ||
+                 effect->paletteSourceKind ==
+                     TimingColourisePaletteSourceKind::Saved) &&
                 effect->paletteEdited &&
                 invisible_places::timing::
                         FindTimingColouriseLocalPaletteEdit(
                             *effect,
+                            effect->paletteSourceKind,
                             effect->paletteSourceId) != nullptr;
             bool saved = false;
-            if (promotesLocalPresetEdit) {
-                const std::string presetId =
+            if (promotesLocalEdit) {
+                const auto sourceKind = effect->paletteSourceKind;
+                const std::string sourceId =
                     effect->paletteSourceId;
                 if (auto promoted = invisible_places::timing::
                         PromoteTimingColouriseLocalPaletteEdit(
                             effect,
-                            presetId,
+                            sourceKind,
+                            sourceId,
                             savedId,
                             newName);
                     promoted.has_value()) {
@@ -96997,6 +97165,7 @@ void DrawTimingColourisePaletteEditor(
 
     const auto drawFlipPaletteButton = [&]() {
     const bool canFlipPalette =
+        !baseEditingBlocked &&
         invisible_places::timing::
             CanReverseTimingColourisePaletteAtPosition(
                 *effect,
@@ -97085,7 +97254,11 @@ void DrawTimingColourisePaletteEditor(
     }
     ImGui::EndDisabled();
     const char* flipPaletteTooltip = nullptr;
-    if (!canFlipPalette) {
+    if (baseEditingBlocked) {
+        flipPaletteTooltip =
+            "This original is view-only while its _edited version "
+            "exists. Select or delete the _edited version first.";
+    } else if (!canFlipPalette) {
         flipPaletteTooltip =
             "Move onto a legacy palette key before flipping it.";
     } else if (
@@ -97150,9 +97323,16 @@ void DrawTimingColourisePaletteEditor(
             cyclicTiming);
 
     const bool canEditStops =
-        !legacyModel || legacyEditable != nullptr;
+        (!legacyModel || legacyEditable != nullptr) &&
+        !baseEditingBlocked;
     const bool canEditTopology =
         canEditStops && !hasPaletteKeys;
+    if (baseEditingBlocked) {
+        ImGui::TextDisabled(
+            "This original is view-only while its _edited version "
+            "exists. Select the _edited version to keep editing, or "
+            "delete it to reopen the original.");
+    }
     // Shared by the Colour Stop popup's Remove button and the Delete key.
     // Refusals stay silent here; the popup's disabled-button tooltip
     // explains the topology gates.

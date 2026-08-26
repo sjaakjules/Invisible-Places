@@ -55,10 +55,22 @@ struct TimingColourisePalette {
         TimingColourisePaletteStop{}};
 };
 
-// An effect-local alternative derived from a built-in preset. It is not part
-// of the shared project palette library and remains owned by one Colourise
-// effect while that effect switches between presets.
+enum class TimingColourisePaletteSourceKind : std::uint8_t {
+    Custom = 0,
+    Preset,
+    Saved,
+};
+
+// An effect-local "_edited" variant derived from a built-in preset or a saved
+// project palette. It is not part of the shared palette library and remains
+// owned by one Colourise effect while that effect switches between sources.
+// While a variant exists its original stays view-only, so the variant is the
+// single edited descendant of that source.
 struct TimingColouriseLocalPaletteEdit {
+    // The shadowed source library. Legacy documents carried preset variants
+    // only, so parsing defaults to Preset.
+    TimingColourisePaletteSourceKind sourceKind =
+        TimingColourisePaletteSourceKind::Preset;
     std::string presetId;
     std::string presetName;
     TimingColourisePalette palette{};
@@ -70,12 +82,6 @@ struct TimingColouriseLocalPaletteEdit {
 enum class TimingColourisePaletteKeyModel : std::uint8_t {
     LegacySnapshots = 0,
     StopParameters,
-};
-
-enum class TimingColourisePaletteSourceKind : std::uint8_t {
-    Custom = 0,
-    Preset,
-    Saved,
 };
 
 enum class TimingColouriseAmountOverrideMode : std::uint8_t {
@@ -365,30 +371,57 @@ struct TimingColourisePaletteDefinition {
     TimingColourisePalette palette{};
 };
 
+// Private "_edited" variants exist for built-in presets and saved project
+// palettes alike; Custom palettes have no source library to shadow. The
+// preset-named overloads below remain for the built-in library.
+[[nodiscard]] const TimingColouriseLocalPaletteEdit*
+FindTimingColouriseLocalPaletteEdit(
+    const TimingColouriseEffect& effect,
+    TimingColourisePaletteSourceKind sourceKind,
+    std::string_view sourceId);
 [[nodiscard]] const TimingColouriseLocalPaletteEdit*
 FindTimingColouriseLocalPaletteEdit(
     const TimingColouriseEffect& effect,
     std::string_view presetId);
-// Stores an effect-local variant for the effect's current built-in preset and
-// makes that variant the active base palette.
+// Stores an effect-local variant for the effect's current preset or saved
+// source and makes that variant the active base palette.
 [[nodiscard]] bool UpsertTimingColouriseLocalPaletteEdit(
     TimingColouriseEffect* effect,
     TimingColourisePalette palette);
-// Selects a built-in source snapshot without deleting any private variants
+// Selects an original library snapshot without deleting any private variants
 // already owned by this effect.
+[[nodiscard]] bool ActivateTimingColouriseOriginalSource(
+    TimingColouriseEffect* effect,
+    TimingColourisePaletteSourceKind sourceKind,
+    const TimingColourisePaletteDefinition& definition);
 [[nodiscard]] bool ActivateTimingColouriseOriginalPreset(
     TimingColouriseEffect* effect,
     const TimingColourisePaletteDefinition& preset);
 [[nodiscard]] bool ActivateTimingColouriseLocalPaletteEdit(
     TimingColouriseEffect* effect,
+    TimingColourisePaletteSourceKind sourceKind,
+    std::string_view sourceId);
+[[nodiscard]] bool ActivateTimingColouriseLocalPaletteEdit(
+    TimingColouriseEffect* effect,
     std::string_view presetId);
-// Removes the private variant derived from `originalPreset`. If that variant
-// is active, the supplied original becomes active in its place.
+// Removes the private variant derived from `originalDefinition`. If that
+// variant is active, the supplied original becomes active in its place.
+[[nodiscard]] bool DiscardTimingColouriseLocalPaletteEdit(
+    TimingColouriseEffect* effect,
+    TimingColourisePaletteSourceKind sourceKind,
+    const TimingColourisePaletteDefinition& originalDefinition);
 [[nodiscard]] bool DiscardTimingColouriseLocalPaletteEdit(
     TimingColouriseEffect* effect,
     const TimingColourisePaletteDefinition& originalPreset);
 // Converts a private variant into a shared Saved definition, activates that
 // saved snapshot on the effect, and removes only the promoted private entry.
+[[nodiscard]] std::optional<TimingColourisePaletteDefinition>
+PromoteTimingColouriseLocalPaletteEdit(
+    TimingColouriseEffect* effect,
+    TimingColourisePaletteSourceKind sourceKind,
+    std::string_view sourceId,
+    std::string savedPaletteId,
+    std::string savedPaletteName);
 [[nodiscard]] std::optional<TimingColourisePaletteDefinition>
 PromoteTimingColouriseLocalPaletteEdit(
     TimingColouriseEffect* effect,

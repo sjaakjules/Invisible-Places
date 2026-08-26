@@ -3298,7 +3298,13 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
     std::vector<TimingColouriseLocalPaletteEdit> localPaletteEdits;
     localPaletteEdits.reserve(effect.localPaletteEdits.size() + 1U);
     for (auto& edit : effect.localPaletteEdits) {
-        if (edit.presetId.empty()) {
+        // Only library-backed variants are meaningful; a Custom source has
+        // nothing to shadow.
+        if (edit.presetId.empty() ||
+            (edit.sourceKind !=
+                 TimingColourisePaletteSourceKind::Preset &&
+             edit.sourceKind !=
+                 TimingColourisePaletteSourceKind::Saved)) {
             continue;
         }
         if (edit.presetName.empty()) {
@@ -3310,7 +3316,8 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
             localPaletteEdits.begin(),
             localPaletteEdits.end(),
             [&](const TimingColouriseLocalPaletteEdit& candidate) {
-                return candidate.presetId == edit.presetId;
+                return candidate.sourceKind == edit.sourceKind &&
+                       candidate.presetId == edit.presetId;
             });
         if (existing == localPaletteEdits.end()) {
             localPaletteEdits.push_back(std::move(edit));
@@ -3320,11 +3327,14 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
     }
     effect.localPaletteEdits = std::move(localPaletteEdits);
     // Projects authored before effect-local variants stored an active
-    // Preset_edited palette only in basePalette. A non-empty preset id makes
-    // that provenance safe to synthesize, and also keeps direct active edits
-    // and Flip Palette synchronized with their private snapshot.
-    if (effect.paletteSourceKind ==
-            TimingColourisePaletteSourceKind::Preset &&
+    // Preset_edited (and, before saved-source variants, a Saved_edited)
+    // palette only in basePalette. A non-empty source id makes that
+    // provenance safe to synthesize, and also keeps direct active edits and
+    // Flip Palette synchronized with their private snapshot.
+    if ((effect.paletteSourceKind ==
+             TimingColourisePaletteSourceKind::Preset ||
+         effect.paletteSourceKind ==
+             TimingColourisePaletteSourceKind::Saved) &&
         effect.paletteEdited && !effect.paletteSourceId.empty()) {
         if (effect.paletteSourceName.empty()) {
             effect.paletteSourceName = effect.paletteSourceId;
@@ -3333,11 +3343,14 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
             effect.localPaletteEdits.begin(),
             effect.localPaletteEdits.end(),
             [&](const TimingColouriseLocalPaletteEdit& candidate) {
-                return candidate.presetId == effect.paletteSourceId;
+                return candidate.sourceKind ==
+                           effect.paletteSourceKind &&
+                       candidate.presetId == effect.paletteSourceId;
             });
         if (activeEdit == effect.localPaletteEdits.end()) {
             effect.localPaletteEdits.push_back(
                 TimingColouriseLocalPaletteEdit{
+                    .sourceKind = effect.paletteSourceKind,
                     .presetId = effect.paletteSourceId,
                     .presetName = effect.paletteSourceName,
                     .palette = effect.basePalette,
@@ -3530,14 +3543,26 @@ TimingColourisePaletteDefinition SanitizeTimingColourisePaletteDefinition(
 const TimingColouriseLocalPaletteEdit*
 FindTimingColouriseLocalPaletteEdit(
     const TimingColouriseEffect& effect,
-    std::string_view presetId) {
+    TimingColourisePaletteSourceKind sourceKind,
+    std::string_view sourceId) {
     const auto found = std::find_if(
         effect.localPaletteEdits.begin(),
         effect.localPaletteEdits.end(),
         [&](const TimingColouriseLocalPaletteEdit& edit) {
-            return edit.presetId == presetId;
+            return edit.sourceKind == sourceKind &&
+                   edit.presetId == sourceId;
         });
     return found == effect.localPaletteEdits.end() ? nullptr : &*found;
+}
+
+const TimingColouriseLocalPaletteEdit*
+FindTimingColouriseLocalPaletteEdit(
+    const TimingColouriseEffect& effect,
+    std::string_view presetId) {
+    return FindTimingColouriseLocalPaletteEdit(
+        effect,
+        TimingColourisePaletteSourceKind::Preset,
+        presetId);
 }
 
 bool UpsertTimingColouriseLocalPaletteEdit(
@@ -3546,8 +3571,12 @@ bool UpsertTimingColouriseLocalPaletteEdit(
     if (effect == nullptr) {
         return false;
     }
-    if (effect->paletteSourceKind !=
-            TimingColourisePaletteSourceKind::Preset ||
+    // Only library-backed sources own "_edited" variants; a Custom palette
+    // is already effect-local state.
+    if ((effect->paletteSourceKind !=
+             TimingColourisePaletteSourceKind::Preset &&
+         effect->paletteSourceKind !=
+             TimingColourisePaletteSourceKind::Saved) ||
         effect->paletteSourceId.empty()) {
         return false;
     }
@@ -3556,9 +3585,11 @@ bool UpsertTimingColouriseLocalPaletteEdit(
         effect->localPaletteEdits.begin(),
         effect->localPaletteEdits.end(),
         [&](const TimingColouriseLocalPaletteEdit& edit) {
-            return edit.presetId == effect->paletteSourceId;
+            return edit.sourceKind == effect->paletteSourceKind &&
+                   edit.presetId == effect->paletteSourceId;
         });
     TimingColouriseLocalPaletteEdit localEdit{
+        .sourceKind = effect->paletteSourceKind,
         .presetId = effect->paletteSourceId,
         .presetName = effect->paletteSourceName.empty()
                           ? effect->paletteSourceId
@@ -3575,28 +3606,41 @@ bool UpsertTimingColouriseLocalPaletteEdit(
     return true;
 }
 
-bool ActivateTimingColouriseOriginalPreset(
+bool ActivateTimingColouriseOriginalSource(
     TimingColouriseEffect* effect,
-    const TimingColourisePaletteDefinition& preset) {
-    if (effect == nullptr || preset.id.empty()) {
+    TimingColourisePaletteSourceKind sourceKind,
+    const TimingColourisePaletteDefinition& definition) {
+    if (effect == nullptr || definition.id.empty() ||
+        (sourceKind != TimingColourisePaletteSourceKind::Preset &&
+         sourceKind != TimingColourisePaletteSourceKind::Saved)) {
         return false;
     }
     auto updated = SanitizeTimingColouriseEffect(*effect);
-    const auto sanitizedPreset =
-        SanitizeTimingColourisePaletteDefinition(preset);
-    updated.basePalette = sanitizedPreset.palette;
-    updated.paletteSourceKind = TimingColourisePaletteSourceKind::Preset;
-    updated.paletteSourceId = sanitizedPreset.id;
-    updated.paletteSourceName = sanitizedPreset.name;
+    const auto sanitizedDefinition =
+        SanitizeTimingColourisePaletteDefinition(definition);
+    updated.basePalette = sanitizedDefinition.palette;
+    updated.paletteSourceKind = sourceKind;
+    updated.paletteSourceId = sanitizedDefinition.id;
+    updated.paletteSourceName = sanitizedDefinition.name;
     updated.paletteEdited = false;
     *effect = SanitizeTimingColouriseEffect(std::move(updated));
     return true;
 }
 
+bool ActivateTimingColouriseOriginalPreset(
+    TimingColouriseEffect* effect,
+    const TimingColourisePaletteDefinition& preset) {
+    return ActivateTimingColouriseOriginalSource(
+        effect,
+        TimingColourisePaletteSourceKind::Preset,
+        preset);
+}
+
 bool ActivateTimingColouriseLocalPaletteEdit(
     TimingColouriseEffect* effect,
-    std::string_view presetId) {
-    if (effect == nullptr || presetId.empty()) {
+    TimingColourisePaletteSourceKind sourceKind,
+    std::string_view sourceId) {
+    if (effect == nullptr || sourceId.empty()) {
         return false;
     }
     auto updated = SanitizeTimingColouriseEffect(*effect);
@@ -3604,13 +3648,14 @@ bool ActivateTimingColouriseLocalPaletteEdit(
         updated.localPaletteEdits.begin(),
         updated.localPaletteEdits.end(),
         [&](const TimingColouriseLocalPaletteEdit& edit) {
-            return edit.presetId == presetId;
+            return edit.sourceKind == sourceKind &&
+                   edit.presetId == sourceId;
         });
     if (localEdit == updated.localPaletteEdits.end()) {
         return false;
     }
     updated.basePalette = localEdit->palette;
-    updated.paletteSourceKind = TimingColourisePaletteSourceKind::Preset;
+    updated.paletteSourceKind = sourceKind;
     updated.paletteSourceId = localEdit->presetId;
     updated.paletteSourceName = localEdit->presetName;
     updated.paletteEdited = true;
@@ -3618,10 +3663,20 @@ bool ActivateTimingColouriseLocalPaletteEdit(
     return true;
 }
 
+bool ActivateTimingColouriseLocalPaletteEdit(
+    TimingColouriseEffect* effect,
+    std::string_view presetId) {
+    return ActivateTimingColouriseLocalPaletteEdit(
+        effect,
+        TimingColourisePaletteSourceKind::Preset,
+        presetId);
+}
+
 bool DiscardTimingColouriseLocalPaletteEdit(
     TimingColouriseEffect* effect,
-    const TimingColourisePaletteDefinition& originalPreset) {
-    if (effect == nullptr || originalPreset.id.empty()) {
+    TimingColourisePaletteSourceKind sourceKind,
+    const TimingColourisePaletteDefinition& originalDefinition) {
+    if (effect == nullptr || originalDefinition.id.empty()) {
         return false;
     }
     auto updated = SanitizeTimingColouriseEffect(*effect);
@@ -3629,36 +3684,46 @@ bool DiscardTimingColouriseLocalPaletteEdit(
         updated.localPaletteEdits.begin(),
         updated.localPaletteEdits.end(),
         [&](const TimingColouriseLocalPaletteEdit& edit) {
-            return edit.presetId == originalPreset.id;
+            return edit.sourceKind == sourceKind &&
+                   edit.presetId == originalDefinition.id;
         });
     if (localEdit == updated.localPaletteEdits.end()) {
         return false;
     }
     const bool discardingActiveEdit =
-        updated.paletteSourceKind ==
-            TimingColourisePaletteSourceKind::Preset &&
+        updated.paletteSourceKind == sourceKind &&
         updated.paletteEdited &&
-        updated.paletteSourceId == originalPreset.id;
+        updated.paletteSourceId == originalDefinition.id;
     updated.localPaletteEdits.erase(localEdit);
     if (discardingActiveEdit) {
-        const auto sanitizedPreset =
-            SanitizeTimingColourisePaletteDefinition(originalPreset);
-        updated.basePalette = sanitizedPreset.palette;
-        updated.paletteSourceId = sanitizedPreset.id;
-        updated.paletteSourceName = sanitizedPreset.name;
+        const auto sanitizedDefinition =
+            SanitizeTimingColourisePaletteDefinition(originalDefinition);
+        updated.basePalette = sanitizedDefinition.palette;
+        updated.paletteSourceId = sanitizedDefinition.id;
+        updated.paletteSourceName = sanitizedDefinition.name;
         updated.paletteEdited = false;
     }
     *effect = SanitizeTimingColouriseEffect(std::move(updated));
     return true;
 }
 
+bool DiscardTimingColouriseLocalPaletteEdit(
+    TimingColouriseEffect* effect,
+    const TimingColourisePaletteDefinition& originalPreset) {
+    return DiscardTimingColouriseLocalPaletteEdit(
+        effect,
+        TimingColourisePaletteSourceKind::Preset,
+        originalPreset);
+}
+
 std::optional<TimingColourisePaletteDefinition>
 PromoteTimingColouriseLocalPaletteEdit(
     TimingColouriseEffect* effect,
-    std::string_view presetId,
+    TimingColourisePaletteSourceKind sourceKind,
+    std::string_view sourceId,
     std::string savedPaletteId,
     std::string savedPaletteName) {
-    if (effect == nullptr || presetId.empty() ||
+    if (effect == nullptr || sourceId.empty() ||
         savedPaletteId.empty()) {
         return std::nullopt;
     }
@@ -3667,7 +3732,8 @@ PromoteTimingColouriseLocalPaletteEdit(
         updated.localPaletteEdits.begin(),
         updated.localPaletteEdits.end(),
         [&](const TimingColouriseLocalPaletteEdit& edit) {
-            return edit.presetId == presetId;
+            return edit.sourceKind == sourceKind &&
+                   edit.presetId == sourceId;
         });
     if (localEdit == updated.localPaletteEdits.end()) {
         return std::nullopt;
@@ -3686,6 +3752,20 @@ PromoteTimingColouriseLocalPaletteEdit(
     updated.paletteEdited = false;
     *effect = SanitizeTimingColouriseEffect(std::move(updated));
     return definition;
+}
+
+std::optional<TimingColourisePaletteDefinition>
+PromoteTimingColouriseLocalPaletteEdit(
+    TimingColouriseEffect* effect,
+    std::string_view presetId,
+    std::string savedPaletteId,
+    std::string savedPaletteName) {
+    return PromoteTimingColouriseLocalPaletteEdit(
+        effect,
+        TimingColourisePaletteSourceKind::Preset,
+        presetId,
+        std::move(savedPaletteId),
+        std::move(savedPaletteName));
 }
 
 TimingTakeDefinition SanitizeTimingTakeDefinition(

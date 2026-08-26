@@ -4556,6 +4556,75 @@ TEST_CASE("Palette skew base values and keys round-trip",
                  ["parameter"] == "palette_skew_centre");
 }
 
+TEST_CASE("Saved palette edited variants round-trip with their kind",
+          "[project][serialization][timing][colourise][palette]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::timing::TimingColouriseEffect;
+  using invisible_places::timing::TimingColouriseLocalPaletteEdit;
+  using invisible_places::timing::TimingColourisePaletteSourceKind;
+  using invisible_places::timing::TimingColourisePaletteStop;
+  using invisible_places::timing::TimingTakeSceneState;
+
+  ProjectDocument document;
+  document.projectName = "saved-palette-variants";
+  document.timingColourisePalettes.push_back({
+      .id = "colourise-palette-1",
+      .name = "Shoreline",
+      .palette = {.stops = {TimingColourisePaletteStop{.id = "stop-1"}}},
+  });
+  TimingTakeSceneState state;
+  TimingColouriseEffect effect;
+  effect.id = "effect-1";
+  effect.name = "Variants";
+  effect.paletteSourceKind = TimingColourisePaletteSourceKind::Saved;
+  effect.paletteSourceId = "colourise-palette-1";
+  effect.paletteSourceName = "Shoreline";
+  effect.localPaletteEdits.push_back(TimingColouriseLocalPaletteEdit{
+      .sourceKind = TimingColourisePaletteSourceKind::Preset,
+      .presetId = "viridis",
+      .presetName = "Viridis",
+  });
+  effect.localPaletteEdits.push_back(TimingColouriseLocalPaletteEdit{
+      .sourceKind = TimingColourisePaletteSourceKind::Saved,
+      .presetId = "colourise-palette-1",
+      .presetName = "Shoreline",
+  });
+  state.colouriseEffects = {effect};
+  document.timingTakeStates = {state};
+
+  TemporaryProjectFile file{"invisible_places_saved_palette_variants.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  const auto& loadedEffect =
+      loaded->timingTakeStates.at(0).colouriseEffects.at(0);
+  REQUIRE(loadedEffect.localPaletteEdits.size() == 2U);
+  CHECK(loadedEffect.localPaletteEdits[0].sourceKind ==
+        TimingColourisePaletteSourceKind::Preset);
+  CHECK(loadedEffect.localPaletteEdits[0].presetId == "viridis");
+  CHECK(loadedEffect.localPaletteEdits[1].sourceKind ==
+        TimingColourisePaletteSourceKind::Saved);
+  CHECK(loadedEffect.localPaletteEdits[1].presetId ==
+        "colourise-palette-1");
+
+  // Preset variants stay key-free so pre-variant documents are unchanged;
+  // saved variants name their library.
+  std::ifstream savedInput{file.path};
+  REQUIRE(savedInput.is_open());
+  const auto savedJson = nlohmann::json::parse(savedInput);
+  savedInput.close();
+  const auto& editsJson =
+      savedJson["timing_take_states"][0]["timing_effects"][0]
+               ["local_palette_edits"];
+  REQUIRE(editsJson.size() == 2U);
+  CHECK_FALSE(editsJson[0].contains("source_kind"));
+  CHECK(editsJson[1]["source_kind"] == "saved");
+}
+
 TEST_CASE("Per-edge fades round-trip and legacy shared fades split",
           "[project][serialization][timing][colourise][bounds][migration]") {
   using invisible_places::serialization::LoadProjectDocument;

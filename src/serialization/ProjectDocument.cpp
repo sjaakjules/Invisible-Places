@@ -5072,6 +5072,15 @@ json SerializeTimingColouriseEffect(
             {"preset_name", localEdit.presetName},
             {"palette", SerializeTimingColourisePalette(localEdit.palette)},
         });
+        // Preset variants stay key-free so pre-saved-variant documents are
+        // byte-identical; only saved-palette variants name their library.
+        if (localEdit.sourceKind !=
+            invisible_places::timing::
+                TimingColourisePaletteSourceKind::Preset) {
+            localPaletteEditsJson.back()["source_kind"] =
+                TimingColourisePaletteSourceKindName(
+                    localEdit.sourceKind);
+        }
     }
     json paletteKeysJson = json::array();
     for (const auto& key : sanitized.paletteKeys) {
@@ -5355,6 +5364,11 @@ ParseTimingColouriseEffect(
             }
             invisible_places::timing::
                 TimingColouriseLocalPaletteEdit localEdit;
+            if (localEditJson.contains("source_kind")) {
+                localEdit.sourceKind =
+                    ParseTimingColourisePaletteSourceKind(
+                        localEditJson.at("source_kind"));
+            }
             localEdit.presetId =
                 presetIdJson->get<std::string>();
             const auto presetNameJson =

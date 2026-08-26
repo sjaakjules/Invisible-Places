@@ -2340,6 +2340,150 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Timing Colourise saved palettes keep private edited variants",
+    "[timing][colourise][palette][local-edit][saved]") {
+    using invisible_places::timing::TimingColourisePaletteSourceKind;
+    const TimingColourisePaletteDefinition saved{
+        .id = "colourise-palette-3",
+        .name = "Shoreline",
+        .palette = Solid({0.2F, 0.5F, 0.7F}, 0.8F),
+    };
+    TimingColouriseEffect effect;
+    REQUIRE(invisible_places::timing::
+                ActivateTimingColouriseOriginalSource(
+                    &effect,
+                    TimingColourisePaletteSourceKind::Saved,
+                    saved));
+    CHECK(effect.paletteSourceKind ==
+          TimingColourisePaletteSourceKind::Saved);
+    CHECK_FALSE(effect.paletteEdited);
+
+    // The first edit forks a private variant instead of locking the source.
+    auto edited = saved.palette;
+    edited.stops.front().colouriseAmount = 0.25F;
+    REQUIRE(invisible_places::timing::
+                UpsertTimingColouriseLocalPaletteEdit(
+                    &effect,
+                    edited));
+    CHECK(effect.paletteEdited);
+    const auto* variant = invisible_places::timing::
+        FindTimingColouriseLocalPaletteEdit(
+            effect,
+            TimingColourisePaletteSourceKind::Saved,
+            saved.id);
+    REQUIRE(variant != nullptr);
+    CHECK(variant->sourceKind ==
+          TimingColourisePaletteSourceKind::Saved);
+    CHECK(variant->palette.stops.front().colouriseAmount ==
+          Approx(0.25F));
+
+    // Switching to the original and back never discards the variant, and a
+    // same-id preset variant coexists because identity is kind plus id.
+    REQUIRE(invisible_places::timing::
+                ActivateTimingColouriseOriginalSource(
+                    &effect,
+                    TimingColourisePaletteSourceKind::Saved,
+                    saved));
+    CHECK_FALSE(effect.paletteEdited);
+    CHECK(effect.basePalette.stops.front().colouriseAmount ==
+          Approx(0.8F));
+    const TimingColourisePaletteDefinition presetTwin{
+        .id = saved.id,
+        .name = "Preset Twin",
+        .palette = Solid({0.9F, 0.1F, 0.1F}, 0.5F),
+    };
+    REQUIRE(invisible_places::timing::
+                ActivateTimingColouriseOriginalPreset(
+                    &effect,
+                    presetTwin));
+    auto presetEdited = presetTwin.palette;
+    presetEdited.stops.front().colouriseAmount = 0.9F;
+    REQUIRE(invisible_places::timing::
+                UpsertTimingColouriseLocalPaletteEdit(
+                    &effect,
+                    presetEdited));
+    REQUIRE(effect.localPaletteEdits.size() == 2U);
+    REQUIRE(invisible_places::timing::
+                ActivateTimingColouriseLocalPaletteEdit(
+                    &effect,
+                    TimingColourisePaletteSourceKind::Saved,
+                    saved.id));
+    CHECK(effect.paletteSourceKind ==
+          TimingColourisePaletteSourceKind::Saved);
+    CHECK(effect.paletteEdited);
+    CHECK(effect.basePalette.stops.front().colouriseAmount ==
+          Approx(0.25F));
+
+    // Promoting the saved variant creates a new saved definition and
+    // removes only that variant; the preset twin's variant survives.
+    const auto promoted = invisible_places::timing::
+        PromoteTimingColouriseLocalPaletteEdit(
+            &effect,
+            TimingColourisePaletteSourceKind::Saved,
+            saved.id,
+            "colourise-palette-9",
+            "Shoreline Deep");
+    REQUIRE(promoted.has_value());
+    CHECK(promoted->name == "Shoreline Deep");
+    CHECK(effect.paletteSourceId == "colourise-palette-9");
+    CHECK_FALSE(effect.paletteEdited);
+    REQUIRE(effect.localPaletteEdits.size() == 1U);
+    CHECK(effect.localPaletteEdits.front().sourceKind ==
+          TimingColourisePaletteSourceKind::Preset);
+
+    // Discard restores the saved original when its variant is active.
+    REQUIRE(invisible_places::timing::
+                ActivateTimingColouriseOriginalSource(
+                    &effect,
+                    TimingColourisePaletteSourceKind::Saved,
+                    saved));
+    auto secondEdit = saved.palette;
+    secondEdit.stops.front().colouriseAmount = 0.1F;
+    REQUIRE(invisible_places::timing::
+                UpsertTimingColouriseLocalPaletteEdit(
+                    &effect,
+                    secondEdit));
+    REQUIRE(invisible_places::timing::
+                DiscardTimingColouriseLocalPaletteEdit(
+                    &effect,
+                    TimingColourisePaletteSourceKind::Saved,
+                    saved));
+    CHECK_FALSE(effect.paletteEdited);
+    CHECK(effect.basePalette.stops.front().colouriseAmount ==
+          Approx(0.8F));
+    CHECK(invisible_places::timing::
+              FindTimingColouriseLocalPaletteEdit(
+                  effect,
+                  TimingColourisePaletteSourceKind::Saved,
+                  saved.id) == nullptr);
+}
+
+TEST_CASE(
+    "Timing Colourise sanitize synthesizes a saved edited variant",
+    "[timing][colourise][palette][local-edit][saved][migration]") {
+    using invisible_places::timing::TimingColourisePaletteSourceKind;
+    // A pre-variant document stored an edited saved palette only in
+    // basePalette with the edited flag set. Sanitize must promote that
+    // state into a private variant so the original becomes reselectable.
+    TimingColouriseEffect effect;
+    effect.paletteSourceKind = TimingColourisePaletteSourceKind::Saved;
+    effect.paletteSourceId = "colourise-palette-4";
+    effect.paletteSourceName = "Mineral";
+    effect.paletteEdited = true;
+    effect.basePalette = Solid({0.6F, 0.3F, 0.1F}, 0.45F);
+    const auto sanitized =
+        invisible_places::timing::SanitizeTimingColouriseEffect(effect);
+    REQUIRE(sanitized.localPaletteEdits.size() == 1U);
+    const auto& variant = sanitized.localPaletteEdits.front();
+    CHECK(variant.sourceKind ==
+          TimingColourisePaletteSourceKind::Saved);
+    CHECK(variant.presetId == "colourise-palette-4");
+    CHECK(variant.presetName == "Mineral");
+    CHECK(variant.palette.stops.front().colouriseAmount ==
+          Approx(0.45F));
+}
+
+TEST_CASE(
     "Timing Colourise keyed reversal authors only stop positions",
     "[timing][colourise][palette][reverse][parameters]") {
     TimingColouriseEffect effect;
