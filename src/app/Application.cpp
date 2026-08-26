@@ -796,6 +796,14 @@ enum class TimingColouriseHistogramHandle : std::int8_t {
     UpperSpread,
     LowerFade,
     UpperFade,
+    // Palette Skew row: the dot repositions the palette midpoint inside the
+    // bounds; each side's triangle pair marks where the palette quarter
+    // (inner) and three-quarter (outer) coordinates of that side land.
+    SkewCentre,
+    LowerSkewInner,
+    LowerSkewOuter,
+    UpperSkewInner,
+    UpperSkewOuter,
 };
 
 struct TimingColouriseKeyPositionEditState {
@@ -95816,6 +95824,12 @@ const char* TimingColouriseEffectParameterLabel(
             return "Colourise Amount Overrides";
         case TimingColouriseEffectParameter::EmissiveLevel:
             return "Emissive Level";
+        case TimingColouriseEffectParameter::PaletteSkewCentre:
+            return "Skew Centre";
+        case TimingColouriseEffectParameter::PaletteSkewLower:
+            return "Lower Skew";
+        case TimingColouriseEffectParameter::PaletteSkewUpper:
+            return "Upper Skew";
     }
     return "Effect Control";
 }
@@ -96153,6 +96167,15 @@ bool DrawTimingColouriseEffectParameterEditor(
             parameterTooltip =
                 "Apply a field-masked light level without changing point opacity. Positive values add emission; negative values darken, with -1 fully dark at full mask. Click to edit or double-click to type any finite value.";
             break;
+        case TimingColouriseEffectParameter::PaletteSkewCentre:
+            parameterTooltip =
+                "Bounds fraction where the palette midpoint lands, from 0 to 1. 0.5 keeps the mapping symmetric. Drag the plum dot in the histogram or click here for exact entry.";
+            break;
+        case TimingColouriseEffectParameter::PaletteSkewLower:
+        case TimingColouriseEffectParameter::PaletteSkewUpper:
+            parameterTooltip =
+                "Redistribute this side of the palette from -1 to +1. Positive values stretch the centre-adjacent colours; negative values stretch the end colours. Markers never move - only how they are sampled changes.";
+            break;
     }
     DrawTimingControlTooltip(parameterTooltip);
 
@@ -96202,6 +96225,11 @@ bool DrawTimingColouriseEffectParameterEditor(
             DrawTimingControlTooltip(
                 parameter == TimingColouriseEffectParameter::PalettePhase
                     ? "Enter a signed phase change from -1 to +1 turn."
+                : parameter == TimingColouriseEffectParameter::
+                                   PaletteSkewLower ||
+                        parameter == TimingColouriseEffectParameter::
+                                         PaletteSkewUpper
+                    ? "Enter a signed skew from -1 to +1."
                     : "Enter a value from 0 to 1.");
         }
         ImGui::EndPopup();
@@ -96212,6 +96240,16 @@ bool DrawTimingColouriseEffectParameterEditor(
         } else if (
             parameter == TimingColouriseEffectParameter::AmountOverride) {
             authoredValue = std::clamp(authoredValue, 0.0F, 1.0F);
+        } else if (
+            parameter ==
+            TimingColouriseEffectParameter::PaletteSkewCentre) {
+            authoredValue = std::clamp(authoredValue, 0.0F, 1.0F);
+        } else if (
+            parameter ==
+                TimingColouriseEffectParameter::PaletteSkewLower ||
+            parameter ==
+                TimingColouriseEffectParameter::PaletteSkewUpper) {
+            authoredValue = std::clamp(authoredValue, -1.0F, 1.0F);
         }
         if (hasKeys) {
             (void)invisible_places::timing::
@@ -96231,6 +96269,15 @@ bool DrawTimingColouriseEffectParameterEditor(
                     break;
                 case TimingColouriseEffectParameter::EmissiveLevel:
                     effect->emissiveLevel = authoredValue;
+                    break;
+                case TimingColouriseEffectParameter::PaletteSkewCentre:
+                    effect->paletteSkewCentre = authoredValue;
+                    break;
+                case TimingColouriseEffectParameter::PaletteSkewLower:
+                    effect->paletteSkewLower = authoredValue;
+                    break;
+                case TimingColouriseEffectParameter::PaletteSkewUpper:
+                    effect->paletteSkewUpper = authoredValue;
                     break;
             }
         }
@@ -97191,6 +97238,36 @@ void DrawTimingColourisePaletteEditor(
             effectControlsChanged;
         ImGui::EndTable();
     }
+    // Palette Skew editors mirror the histogram's plum row: the same three
+    // controls, each independently keyable with the shared track buttons.
+    if (ImGui::BeginTable(
+            "##TimingColouriseSkewControls",
+            3,
+            ImGuiTableFlags_SizingStretchSame |
+                ImGuiTableFlags_NoSavedSettings)) {
+        ImGui::TableNextColumn();
+        effectControlsChanged =
+            DrawTimingColouriseEffectParameterEditor(
+                runtimeState,
+                effect,
+                TimingColouriseEffectParameter::PaletteSkewCentre) ||
+            effectControlsChanged;
+        ImGui::TableNextColumn();
+        effectControlsChanged =
+            DrawTimingColouriseEffectParameterEditor(
+                runtimeState,
+                effect,
+                TimingColouriseEffectParameter::PaletteSkewLower) ||
+            effectControlsChanged;
+        ImGui::TableNextColumn();
+        effectControlsChanged =
+            DrawTimingColouriseEffectParameterEditor(
+                runtimeState,
+                effect,
+                TimingColouriseEffectParameter::PaletteSkewUpper) ||
+            effectControlsChanged;
+        ImGui::EndTable();
+    }
     const auto amountKeyPositions = invisible_places::timing::
         TimingColouriseEffectParameterKeyPositions(
             *effect,
@@ -97199,7 +97276,19 @@ void DrawTimingColourisePaletteEditor(
         TimingColouriseEffectParameterKeyPositions(
             *effect,
             TimingColouriseEffectParameter::PalettePhase);
-    const std::array effectParameterLanes{
+    const auto skewCentreKeyPositions = invisible_places::timing::
+        TimingColouriseEffectParameterKeyPositions(
+            *effect,
+            TimingColouriseEffectParameter::PaletteSkewCentre);
+    const auto skewLowerKeyPositions = invisible_places::timing::
+        TimingColouriseEffectParameterKeyPositions(
+            *effect,
+            TimingColouriseEffectParameter::PaletteSkewLower);
+    const auto skewUpperKeyPositions = invisible_places::timing::
+        TimingColouriseEffectParameterKeyPositions(
+            *effect,
+            TimingColouriseEffectParameter::PaletteSkewUpper);
+    std::vector<TimingColouriseKeyLaneSeries> effectParameterLanes{
         TimingColouriseKeyLaneSeries{
             .label = "Colourise Amount",
             .track = TimingColouriseKeyTrack::EffectParameter,
@@ -97217,6 +97306,38 @@ void DrawTimingColourisePaletteEditor(
             .colour = IM_COL32(238, 174, 72, 255),
         },
     };
+    // Skew lanes join the shared graph only once they own keys, keeping the
+    // default view down to the two established curves.
+    if (!skewCentreKeyPositions.empty()) {
+        effectParameterLanes.push_back(TimingColouriseKeyLaneSeries{
+            .label = "Skew Centre",
+            .track = TimingColouriseKeyTrack::EffectParameter,
+            .effectParameter =
+                TimingColouriseEffectParameter::PaletteSkewCentre,
+            .positions = std::span<const float>{skewCentreKeyPositions},
+            .colour = IM_COL32(186, 132, 232, 255),
+        });
+    }
+    if (!skewLowerKeyPositions.empty()) {
+        effectParameterLanes.push_back(TimingColouriseKeyLaneSeries{
+            .label = "Lower Skew",
+            .track = TimingColouriseKeyTrack::EffectParameter,
+            .effectParameter =
+                TimingColouriseEffectParameter::PaletteSkewLower,
+            .positions = std::span<const float>{skewLowerKeyPositions},
+            .colour = IM_COL32(150, 142, 240, 255),
+        });
+    }
+    if (!skewUpperKeyPositions.empty()) {
+        effectParameterLanes.push_back(TimingColouriseKeyLaneSeries{
+            .label = "Upper Skew",
+            .track = TimingColouriseKeyTrack::EffectParameter,
+            .effectParameter =
+                TimingColouriseEffectParameter::PaletteSkewUpper,
+            .positions = std::span<const float>{skewUpperKeyPositions},
+            .colour = IM_COL32(222, 148, 214, 255),
+        });
+    }
     ImGui::TextDisabled("Value over animation position");
     DrawTimingControlTooltip(
         "Colourise Amount uses its own visible value range. Colour Phase uses a fixed -1 to +1 turn range with wrapped copies. Left-drag dots to edit time and value; lower markers and Time-only drag retime only. Right-drag scrubs.");
@@ -98780,6 +98901,155 @@ bool SetTimingColouriseBoundsParameterAt(
     return true;
 }
 
+bool TimingColouriseHistogramHandleIsSkew(
+    TimingColouriseHistogramHandle handle) {
+    return handle == TimingColouriseHistogramHandle::SkewCentre ||
+           handle == TimingColouriseHistogramHandle::LowerSkewInner ||
+           handle == TimingColouriseHistogramHandle::LowerSkewOuter ||
+           handle == TimingColouriseHistogramHandle::UpperSkewInner ||
+           handle == TimingColouriseHistogramHandle::UpperSkewOuter;
+}
+
+invisible_places::timing::TimingColouriseEffectParameter
+TimingColouriseHistogramSkewHandleParameter(
+    TimingColouriseHistogramHandle handle) {
+    using invisible_places::timing::TimingColouriseEffectParameter;
+    switch (handle) {
+        case TimingColouriseHistogramHandle::LowerSkewInner:
+        case TimingColouriseHistogramHandle::LowerSkewOuter:
+            return TimingColouriseEffectParameter::PaletteSkewLower;
+        case TimingColouriseHistogramHandle::UpperSkewInner:
+        case TimingColouriseHistogramHandle::UpperSkewOuter:
+            return TimingColouriseEffectParameter::PaletteSkewUpper;
+        default:
+            return TimingColouriseEffectParameter::PaletteSkewCentre;
+    }
+}
+
+// Writes one Palette Skew control the way the bounds editors write theirs:
+// an armed track receives an automatic key at the current position, an
+// unarmed control edits its base value.
+bool SetTimingColouriseEffectParameterAt(
+    invisible_places::timing::TimingColouriseEffect* effect,
+    invisible_places::timing::TimingColouriseEffectParameter parameter,
+    float position,
+    float value) {
+    using invisible_places::timing::TimingColouriseEffectParameter;
+    if (effect == nullptr || !std::isfinite(value)) {
+        return false;
+    }
+    const bool armed = std::any_of(
+        effect->effectParameterKeys.begin(),
+        effect->effectParameterKeys.end(),
+        [&](const auto& key) { return key.parameter == parameter; });
+    if (armed) {
+        const auto interpolation = TimingScalarTrackInterpolationAt(
+            effect->effectParameterKeys,
+            [&](const auto& key) { return key.parameter == parameter; },
+            position);
+        return invisible_places::timing::
+            AddOrUpdateTimingColouriseEffectParameterKey(
+                effect,
+                parameter,
+                position,
+                value,
+                interpolation);
+    }
+    switch (parameter) {
+        case TimingColouriseEffectParameter::PaletteSkewCentre:
+            effect->paletteSkewCentre = std::clamp(value, 0.0F, 1.0F);
+            return true;
+        case TimingColouriseEffectParameter::PaletteSkewLower:
+            effect->paletteSkewLower = std::clamp(value, -1.0F, 1.0F);
+            return true;
+        case TimingColouriseEffectParameter::PaletteSkewUpper:
+            effect->paletteSkewUpper = std::clamp(value, -1.0F, 1.0F);
+            return true;
+        case TimingColouriseEffectParameter::PalettePhase:
+            effect->palettePhaseOffset =
+                std::clamp(value, -1.0F, 1.0F);
+            return true;
+        case TimingColouriseEffectParameter::AmountOverride:
+            effect->colouriseAmountOverride =
+                std::clamp(value, 0.0F, 1.0F);
+            return true;
+        case TimingColouriseEffectParameter::EmissiveLevel:
+            effect->emissiveLevel = value;
+            return true;
+    }
+    return false;
+}
+
+struct TimingColouriseHistogramSkewState {
+    float centre = 0.5F;
+    float lowerSkew = 0.0F;
+    float upperSkew = 0.0F;
+};
+
+TimingColouriseHistogramSkewState
+EvaluateTimingColouriseHistogramSkew(
+    const invisible_places::timing::TimingColouriseEffect& effect,
+    float position,
+    bool cyclicTiming) {
+    using invisible_places::timing::TimingColouriseEffectParameter;
+    return {
+        .centre = invisible_places::timing::
+            EvaluateTimingColouriseEffectParameter(
+                effect,
+                TimingColouriseEffectParameter::PaletteSkewCentre,
+                position,
+                cyclicTiming),
+        .lowerSkew = invisible_places::timing::
+            EvaluateTimingColouriseEffectParameter(
+                effect,
+                TimingColouriseEffectParameter::PaletteSkewLower,
+                position,
+                cyclicTiming),
+        .upperSkew = invisible_places::timing::
+            EvaluateTimingColouriseEffectParameter(
+                effect,
+                TimingColouriseEffectParameter::PaletteSkewUpper,
+                position,
+                cyclicTiming),
+    };
+}
+
+// Raw field value where one skew handle currently sits. The triangle pairs
+// mark where the palette quarter (inner) and three-quarter (outer)
+// coordinates of their side land inside the bounds span.
+float TimingColouriseHistogramSkewHandleValue(
+    const invisible_places::timing::TimingColouriseBounds& bounds,
+    const TimingColouriseHistogramSkewState& skew,
+    TimingColouriseHistogramHandle handle) {
+    const float span = bounds.upper - bounds.lower;
+    const float centreRaw = bounds.lower + span * skew.centre;
+    const auto sideFraction = [](float sideSkew, float quantile) {
+        const float gamma = std::pow(4.0F, sideSkew);
+        return std::pow(quantile, 1.0F / gamma);
+    };
+    switch (handle) {
+        case TimingColouriseHistogramHandle::LowerSkewInner:
+            return centreRaw -
+                   sideFraction(skew.lowerSkew, 0.25F) *
+                       (centreRaw - bounds.lower);
+        case TimingColouriseHistogramHandle::LowerSkewOuter:
+            return centreRaw -
+                   sideFraction(skew.lowerSkew, 0.75F) *
+                       (centreRaw - bounds.lower);
+        case TimingColouriseHistogramHandle::UpperSkewInner:
+            return centreRaw +
+                   sideFraction(skew.upperSkew, 0.25F) *
+                       (bounds.upper - centreRaw);
+        case TimingColouriseHistogramHandle::UpperSkewOuter:
+            return centreRaw +
+                   sideFraction(skew.upperSkew, 0.75F) *
+                       (bounds.upper - centreRaw);
+        case TimingColouriseHistogramHandle::SkewCentre:
+        default:
+            return centreRaw;
+    }
+}
+
 bool TimingColouriseHistogramHandleEditableAt(
     invisible_places::timing::TimingColouriseEffect* effect,
     TimingColouriseHistogramHandle handle,
@@ -98787,6 +99057,11 @@ bool TimingColouriseHistogramHandleEditableAt(
     if (effect == nullptr ||
         handle == TimingColouriseHistogramHandle::None) {
         return false;
+    }
+    if (TimingColouriseHistogramHandleIsSkew(handle)) {
+        // Skew is a colourise sampling control, independent of the Bounds
+        // Keying mode; it needs a real span to express a fraction of.
+        return effect->colouriseEnabled;
     }
     if (handle == TimingColouriseHistogramHandle::LowerFade ||
         handle == TimingColouriseHistogramHandle::UpperFade) {
@@ -98858,6 +99133,56 @@ bool ApplyTimingColouriseHistogramBounds(
             position,
             cyclicTiming);
     const float span = bounds.upper - bounds.lower;
+    if (TimingColouriseHistogramHandleIsSkew(handle)) {
+        if (span <= std::numeric_limits<float>::epsilon()) {
+            return false;
+        }
+        const auto skew = EvaluateTimingColouriseHistogramSkew(
+            *effect,
+            position,
+            cyclicTiming);
+        const float boundsFraction = std::clamp(
+            (targetValue - bounds.lower) / span,
+            0.0F,
+            1.0F);
+        float value = 0.0F;
+        if (handle == TimingColouriseHistogramHandle::SkewCentre) {
+            value = boundsFraction;
+        } else {
+            const bool lowerSide =
+                handle ==
+                    TimingColouriseHistogramHandle::LowerSkewInner ||
+                handle == TimingColouriseHistogramHandle::LowerSkewOuter;
+            const float half = lowerSide
+                ? skew.centre
+                : 1.0F - skew.centre;
+            if (half <= 1.0e-4F) {
+                return false;
+            }
+            const float towardEnd = std::clamp(
+                lowerSide
+                    ? (skew.centre - boundsFraction) / half
+                    : (boundsFraction - skew.centre) / half,
+                0.0F,
+                1.0F);
+            const float quantile =
+                handle == TimingColouriseHistogramHandle::
+                              LowerSkewInner ||
+                        handle == TimingColouriseHistogramHandle::
+                                      UpperSkewInner
+                    ? 0.25F
+                    : 0.75F;
+            value = invisible_places::timing::
+                TimingColourisePaletteSkewFromSideFraction(
+                    towardEnd,
+                    quantile);
+        }
+        return SetTimingColouriseEffectParameterAt(
+            effect,
+            TimingColouriseHistogramSkewHandleParameter(handle),
+            position,
+            value);
+    }
     if (handle == TimingColouriseHistogramHandle::LowerFade ||
         handle == TimingColouriseHistogramHandle::UpperFade) {
         if (span <= std::numeric_limits<float>::epsilon()) {
@@ -98926,6 +99251,11 @@ bool ApplyTimingColouriseHistogramBounds(
         }
         case TimingColouriseHistogramHandle::LowerFade:
         case TimingColouriseHistogramHandle::UpperFade:
+        case TimingColouriseHistogramHandle::SkewCentre:
+        case TimingColouriseHistogramHandle::LowerSkewInner:
+        case TimingColouriseHistogramHandle::LowerSkewOuter:
+        case TimingColouriseHistogramHandle::UpperSkewInner:
+        case TimingColouriseHistogramHandle::UpperSkewOuter:
         case TimingColouriseHistogramHandle::None:
             return false;
     }
@@ -99239,12 +99569,137 @@ void DrawTimingColouriseHistogram(
     drawFadeHandle(lowerX, lowerFadeX);
     drawFadeHandle(upperX, upperFadeX);
 
+    // Palette Skew row: a plum rail above the bounds rail carrying the
+    // palette-midpoint dot and each side's quarter/three-quarter triangles,
+    // with the final sampled palette (loop, phase, skew, override applied)
+    // drawn between the two rails so the remap is visible in place.
+    const bool skewControlsVisible = effect->colouriseEnabled;
+    const float skewY = railY - 16.0F;
+    const ImU32 skewColour = IM_COL32(176, 122, 208, 255);
+    const auto skewState = EvaluateTimingColouriseHistogramSkew(
+        *effect,
+        position,
+        cyclicTiming);
+    const auto skewHandleX =
+        [&](TimingColouriseHistogramHandle handle) {
+            return xForRaw(
+                TimingColouriseHistogramSkewHandleValue(
+                    evaluated,
+                    skewState,
+                    handle));
+        };
+    if (skewControlsVisible) {
+        const auto paletteLut =
+            invisible_places::timing::EvaluateTimingColourisePaletteLut(
+                *effect,
+                position,
+                cyclicTiming);
+        const float stripTop = skewY + 5.0F;
+        const float stripBottom = railY - 5.0F;
+        const float stripLeft = std::min(lowerX, upperX);
+        const float stripRight = std::max(lowerX, upperX);
+        constexpr int kStripSegments = 48;
+        if (stripRight - stripLeft > 2.0F &&
+            stripBottom > stripTop) {
+            for (int segment = 0; segment < kStripSegments; ++segment) {
+                const float startFraction =
+                    static_cast<float>(segment) /
+                    static_cast<float>(kStripSegments);
+                const float endFraction =
+                    static_cast<float>(segment + 1) /
+                    static_cast<float>(kStripSegments);
+                const auto startSample =
+                    invisible_places::timing::SampleTimingColouriseLut(
+                        paletteLut,
+                        startFraction);
+                const auto endSample =
+                    invisible_places::timing::SampleTimingColouriseLut(
+                        paletteLut,
+                        endFraction);
+                const auto stripColour = [](const auto& sample) {
+                    return ImGui::ColorConvertFloat4ToU32(ImVec4{
+                        sample.colour[0],
+                        sample.colour[1],
+                        sample.colour[2],
+                        1.0F});
+                };
+                drawList->AddRectFilledMultiColor(
+                    ImVec2{
+                        std::lerp(stripLeft, stripRight, startFraction),
+                        stripTop},
+                    ImVec2{
+                        std::lerp(stripLeft, stripRight, endFraction),
+                        stripBottom},
+                    stripColour(startSample),
+                    stripColour(endSample),
+                    stripColour(endSample),
+                    stripColour(startSample));
+            }
+            drawList->AddRect(
+                ImVec2{stripLeft, stripTop},
+                ImVec2{stripRight, stripBottom},
+                ImGui::GetColorU32(ImGuiCol_Border));
+        }
+
+        drawList->AddLine(
+            ImVec2{lowerX, skewY},
+            ImVec2{upperX, skewY},
+            (skewColour & 0x00FFFFFFU) | 0x60000000U,
+            1.5F);
+        const auto drawSkewTriangle =
+            [&](TimingColouriseHistogramHandle handle,
+                bool pointsRight) {
+                const float x = skewHandleX(handle);
+                const float direction = pointsRight ? 1.0F : -1.0F;
+                drawList->AddTriangleFilled(
+                    ImVec2{x - direction * 4.0F, skewY - 4.5F},
+                    ImVec2{x - direction * 4.0F, skewY + 4.5F},
+                    ImVec2{x + direction * 4.0F, skewY},
+                    skewColour);
+                drawList->AddTriangle(
+                    ImVec2{x - direction * 4.0F, skewY - 4.5F},
+                    ImVec2{x - direction * 4.0F, skewY + 4.5F},
+                    ImVec2{x + direction * 4.0F, skewY},
+                    ImGui::GetColorU32(ImGuiCol_Border),
+                    1.0F);
+            };
+        // End triangles face the centre; centre triangles face their end,
+        // so each pair points across the side whose area it trades.
+        drawSkewTriangle(
+            TimingColouriseHistogramHandle::LowerSkewOuter,
+            true);
+        drawSkewTriangle(
+            TimingColouriseHistogramHandle::LowerSkewInner,
+            false);
+        drawSkewTriangle(
+            TimingColouriseHistogramHandle::UpperSkewInner,
+            true);
+        drawSkewTriangle(
+            TimingColouriseHistogramHandle::UpperSkewOuter,
+            false);
+        const float skewCentreX =
+            skewHandleX(TimingColouriseHistogramHandle::SkewCentre);
+        drawList->AddCircleFilled(
+            ImVec2{skewCentreX, skewY},
+            4.5F,
+            skewColour);
+        drawList->AddCircle(
+            ImVec2{skewCentreX, skewY},
+            6.0F,
+            ImGui::GetColorU32(ImGuiCol_Border),
+            0,
+            1.0F);
+    }
+
     const std::string helpMarkText =
         std::string{
             "Bounds histogram\n"
             "Drag the upper part of either vertical line to move that bound.\n"
             "Drag the centre rail to translate the interval. Drag either rail circle to resize symmetrically.\n"
             "The sideways T handles set signed Fade: inward is positive, outward is negative.\n"} +
+        (skewControlsVisible
+             ? "The plum row above the rail is Palette Skew: drag the dot to move the palette midpoint, and drag a triangle to trade area between that side's centre and end colours. The strip between the rows previews the sampled palette.\n"
+             : std::string{}) +
         (axis.UsesDistributionSpread()
              ? "Distribution Spread uses the cached high-resolution distribution for graph spacing and drag sensitivity; the vertical density shape stays in raw-value space and authored values remain raw."
              : "Histogram heights show the finite full-scene scalar distribution using a fixed raw-value density window.");
@@ -99286,7 +99741,29 @@ void DrawTimingColouriseHistogram(
         const float upperSpreadDistance = std::hypot(
             mouse.x - upperX,
             mouse.y - railY);
-        if (std::min(lowerFadeDistance, upperFadeDistance) <= 9.0F) {
+        if (skewControlsVisible) {
+            constexpr std::array kSkewHandles{
+                TimingColouriseHistogramHandle::SkewCentre,
+                TimingColouriseHistogramHandle::LowerSkewInner,
+                TimingColouriseHistogramHandle::LowerSkewOuter,
+                TimingColouriseHistogramHandle::UpperSkewInner,
+                TimingColouriseHistogramHandle::UpperSkewOuter,
+            };
+            float nearestSkewDistance = 8.0F;
+            for (const auto candidate : kSkewHandles) {
+                const float distance = std::hypot(
+                    mouse.x - skewHandleX(candidate),
+                    mouse.y - skewY);
+                if (distance <= nearestSkewDistance) {
+                    nearestSkewDistance = distance;
+                    hoveredHandle = candidate;
+                }
+            }
+        }
+        if (hoveredHandle !=
+            TimingColouriseHistogramHandle::None) {
+            // The skew row already claimed the pointer.
+        } else if (std::min(lowerFadeDistance, upperFadeDistance) <= 9.0F) {
             hoveredHandle =
                 lowerFadeDistance <= upperFadeDistance
                     ? TimingColouriseHistogramHandle::LowerFade
@@ -99332,9 +99809,14 @@ void DrawTimingColouriseHistogram(
             hoveredHandle;
         runtimeState->timingsPanel.histogramHandleGrabOffset =
             mouseValue -
-            TimingColouriseHistogramHandleValue(
-                evaluated,
-                hoveredHandle);
+            (TimingColouriseHistogramHandleIsSkew(hoveredHandle)
+                 ? TimingColouriseHistogramSkewHandleValue(
+                       evaluated,
+                       skewState,
+                       hoveredHandle)
+                 : TimingColouriseHistogramHandleValue(
+                       evaluated,
+                       hoveredHandle));
     }
     if (runtimeState->timingsPanel.activeHistogramHandle !=
             TimingColouriseHistogramHandle::None &&
