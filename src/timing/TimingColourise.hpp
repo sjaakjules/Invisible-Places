@@ -118,6 +118,23 @@ enum class TimingColourisePaletteStopParameter : std::uint8_t {
     ColouriseAmount,
 };
 
+// Colour space in which a stop's keyed colours interpolate over animation
+// time. sRGB reproduces the historical component-wise blend of the stored
+// values; Linear blends physical light; OkLab follows a perceptually even
+// path between hues.
+enum class TimingColouriseColourSpace : std::uint8_t {
+    Srgb = 0,
+    LinearRgb,
+    OkLab,
+};
+
+[[nodiscard]] std::array<float, 3> TimingColouriseColourToSpace(
+    std::array<float, 3> colour,
+    TimingColouriseColourSpace space);
+[[nodiscard]] std::array<float, 3> TimingColouriseColourFromSpace(
+    std::array<float, 3> coordinates,
+    TimingColouriseColourSpace space);
+
 using TimingColouriseLut =
     std::array<std::array<float, 4>, kTimingColouriseLutSampleCount>;
 
@@ -307,6 +324,10 @@ struct TimingColouriseEffect {
     // matching local variant is the active snapshot.
     std::vector<TimingColouriseLocalPaletteEdit> localPaletteEdits;
     bool paletteEdited = false;
+    // Colour space used when interpolating keyed stop colours over time.
+    // Authored, non-animated; sRGB matches the historical blend exactly.
+    TimingColouriseColourSpace colourKeyInterpolationSpace =
+        TimingColouriseColourSpace::Srgb;
     TimingColouriseAmountOverrideMode colouriseAmountOverrideMode =
         TimingColouriseAmountOverrideMode::Maximum;
     // Applied after palette/key evaluation. This changes colour mixing only,

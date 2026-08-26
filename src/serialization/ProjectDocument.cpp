@@ -4790,6 +4790,36 @@ ParseTimingColouriseBounds(const json& boundsJson) {
     return invisible_places::timing::SanitizeTimingColouriseBounds(bounds);
 }
 
+std::string TimingColouriseColourSpaceName(
+    invisible_places::timing::TimingColouriseColourSpace space) {
+    using invisible_places::timing::TimingColouriseColourSpace;
+    switch (space) {
+        case TimingColouriseColourSpace::Srgb:
+            return "srgb";
+        case TimingColouriseColourSpace::LinearRgb:
+            return "linear";
+        case TimingColouriseColourSpace::OkLab:
+            return "oklab";
+    }
+    return "srgb";
+}
+
+invisible_places::timing::TimingColouriseColourSpace
+ParseTimingColouriseColourSpace(const json& spaceJson) {
+    using invisible_places::timing::TimingColouriseColourSpace;
+    if (!spaceJson.is_string()) {
+        return TimingColouriseColourSpace::Srgb;
+    }
+    const auto name = spaceJson.get<std::string>();
+    if (name == "linear") {
+        return TimingColouriseColourSpace::LinearRgb;
+    }
+    if (name == "oklab") {
+        return TimingColouriseColourSpace::OkLab;
+    }
+    return TimingColouriseColourSpace::Srgb;
+}
+
 std::string TimingColouriseAmountOverrideModeName(
     invisible_places::timing::TimingColouriseAmountOverrideMode mode) {
     using invisible_places::timing::TimingColouriseAmountOverrideMode;
@@ -5246,6 +5276,14 @@ json SerializeTimingColouriseEffect(
     if (sanitized.paletteLooped) {
         effectJson["palette_looped"] = true;
     }
+    // The keyed-colour blend space is written only away from the sRGB
+    // default so untouched documents stay byte-identical.
+    if (sanitized.colourKeyInterpolationSpace !=
+        invisible_places::timing::TimingColouriseColourSpace::Srgb) {
+        effectJson["colour_key_interpolation"] =
+            TimingColouriseColourSpaceName(
+                sanitized.colourKeyInterpolationSpace);
+    }
     // Palette Skew base values are written only away from the identity so
     // untouched documents stay byte-identical; keyed skew rides the shared
     // effect_parameter_keys list, whose unknown names older readers skip.
@@ -5418,6 +5456,11 @@ ParseTimingColouriseEffect(
     }
     effect.paletteLooped =
         effectJson.value("palette_looped", false);
+    if (effectJson.contains("colour_key_interpolation")) {
+        effect.colourKeyInterpolationSpace =
+            ParseTimingColouriseColourSpace(
+                effectJson.at("colour_key_interpolation"));
+    }
     effect.paletteSkewCentre = effectJson.value(
         "palette_skew_centre",
         effect.paletteSkewCentre);

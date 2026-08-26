@@ -97542,6 +97542,68 @@ void DrawTimingColourisePaletteEditor(
         runtimeState->previewRenderStateSignatureValid = false;
     }
     drawKeyedPaletteVersionsCombo();
+    // Colour keys can blend along different colour paths; the choice is
+    // authored per effect and only matters once a stop colour is keyed.
+    const bool hasColourStopKeys = std::any_of(
+        effect->paletteStopParameterKeys.begin(),
+        effect->paletteStopParameterKeys.end(),
+        [](const auto& key) {
+            return key.parameter ==
+                   TimingColourisePaletteStopParameter::Colour;
+        });
+    if (hasColourStopKeys) {
+        using invisible_places::timing::TimingColouriseColourSpace;
+        struct ColourSpaceChoice {
+            TimingColouriseColourSpace space;
+            const char* label;
+            const char* explanation;
+        };
+        constexpr std::array colourSpaceChoices{
+            ColourSpaceChoice{
+                TimingColouriseColourSpace::Srgb,
+                "sRGB components",
+                "Blend the stored sRGB components directly - the historical behaviour."},
+            ColourSpaceChoice{
+                TimingColouriseColourSpace::LinearRgb,
+                "Linear light",
+                "Blend in linear light, like mixing physical illumination; midpoints look brighter."},
+            ColourSpaceChoice{
+                TimingColouriseColourSpace::OkLab,
+                "OkLab perceptual",
+                "Blend along a perceptually even OkLab path; hue transitions stay clean without grey midpoints."},
+        };
+        const auto currentChoice = std::find_if(
+            colourSpaceChoices.begin(),
+            colourSpaceChoices.end(),
+            [&](const auto& choice) {
+                return choice.space ==
+                       effect->colourKeyInterpolationSpace;
+            });
+        if (ImGui::BeginCombo(
+                "Colour Key Blend",
+                currentChoice != colourSpaceChoices.end()
+                    ? currentChoice->label
+                    : colourSpaceChoices.front().label)) {
+            for (const auto& choice : colourSpaceChoices) {
+                const bool selected =
+                    effect->colourKeyInterpolationSpace ==
+                    choice.space;
+                if (ImGui::Selectable(choice.label, selected)) {
+                    effect->colourKeyInterpolationSpace =
+                        choice.space;
+                    runtimeState->previewRenderStateSignatureValid =
+                        false;
+                }
+                DrawTimingControlTooltip(choice.explanation);
+                if (selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        DrawTimingLabelTooltip(
+            "Colour space used when a stop's keyed colours interpolate over animation time. This changes only how keyed colours travel between keys, never the keys themselves.");
+    }
     if (isDraggingPaletteStop()) {
         StopAnimationPlayback(runtimeState);
         if (!wasDraggingPaletteStop ||
@@ -98001,7 +98063,8 @@ void DrawTimingColourisePaletteEditor(
                     key != nullptr &&
                     DrawTimingInterpolationCombo(
                         "Colour Interpolation",
-                        &key->interpolation)) {
+                        &key->interpolation,
+                        /*includeSplineModes=*/true)) {
                     runtimeState
                         ->previewRenderStateSignatureValid =
                         false;
@@ -98014,7 +98077,8 @@ void DrawTimingColourisePaletteEditor(
                     key != nullptr &&
                     DrawTimingInterpolationCombo(
                         "Position Interpolation",
-                        &key->interpolation)) {
+                        &key->interpolation,
+                        /*includeSplineModes=*/true)) {
                     runtimeState
                         ->previewRenderStateSignatureValid =
                         false;
@@ -98027,7 +98091,8 @@ void DrawTimingColourisePaletteEditor(
                     key != nullptr &&
                     DrawTimingInterpolationCombo(
                         "Amount Interpolation",
-                        &key->interpolation)) {
+                        &key->interpolation,
+                        /*includeSplineModes=*/true)) {
                     runtimeState
                         ->previewRenderStateSignatureValid =
                         false;

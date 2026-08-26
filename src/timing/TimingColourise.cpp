@@ -172,6 +172,31 @@ float ClampPalettePhaseDelta(float value) {
     return std::clamp(FiniteOr(value, 0.0F), -1.0F, 1.0F);
 }
 
+float SrgbChannelToLinear(float value) {
+    value = Clamp01(value);
+    return value <= 0.04045F
+               ? value / 12.92F
+               : std::pow((value + 0.055F) / 1.055F, 2.4F);
+}
+
+float LinearChannelToSrgb(float value) {
+    value = std::max(0.0F, FiniteOr(value, 0.0F));
+    return Clamp01(
+        value <= 0.0031308F
+            ? value * 12.92F
+            : 1.055F * std::pow(value, 1.0F / 2.4F) - 0.055F);
+}
+
+bool IsValidColourSpace(TimingColouriseColourSpace space) {
+    switch (space) {
+        case TimingColouriseColourSpace::Srgb:
+        case TimingColouriseColourSpace::LinearRgb:
+        case TimingColouriseColourSpace::OkLab:
+            return true;
+    }
+    return false;
+}
+
 float InterpolationAmount(
     invisible_places::water::WaterScenarioInterpolation interpolation,
     float amount) {
@@ -962,52 +987,26 @@ std::optional<float> EvaluateBoundsParameterTrack(
         [](const auto& key) { return key.value; });
 }
 
-struct PaletteStopParameterBrackets {
-    const TimingColourisePaletteStopParameterKey* first = nullptr;
-    const TimingColourisePaletteStopParameterKey* last = nullptr;
-    const TimingColourisePaletteStopParameterKey* left = nullptr;
-    const TimingColourisePaletteStopParameterKey* right = nullptr;
-};
-
-PaletteStopParameterBrackets PaletteStopParameterKeysAround(
+// Sanitized keys are sorted by (stop, parameter, position), so one track is
+// a contiguous range; find it so the shared scalar evaluator (and its
+// Monotone Spline / Centripetal Catmull-Rom modes) can run over iterators.
+std::pair<
+    std::vector<TimingColourisePaletteStopParameterKey>::const_iterator,
+    std::vector<TimingColourisePaletteStopParameterKey>::const_iterator>
+PaletteStopParameterTrackRange(
     const std::vector<TimingColourisePaletteStopParameterKey>& keys,
     std::string_view stopId,
-    TimingColourisePaletteStopParameter parameter,
-    float normalizedPosition) {
-    PaletteStopParameterBrackets result;
-    for (const auto& key : keys) {
-        if (key.stopId != stopId || key.parameter != parameter) {
-            continue;
-        }
-        if (result.first == nullptr) {
-            result.first = &key;
-        }
-        result.last = &key;
-        if (key.position <= normalizedPosition) {
-            result.left = &key;
-        }
-        if (result.right == nullptr && key.position >= normalizedPosition) {
-            result.right = &key;
-        }
+    TimingColourisePaletteStopParameter parameter) {
+    const auto matches =
+        [&](const TimingColourisePaletteStopParameterKey& key) {
+            return key.stopId == stopId && key.parameter == parameter;
+        };
+    const auto begin = std::find_if(keys.begin(), keys.end(), matches);
+    auto end = begin;
+    while (end != keys.end() && matches(*end)) {
+        ++end;
     }
-    if (result.first == nullptr) {
-        return result;
-    }
-    if (normalizedPosition <= result.first->position) {
-        result.left = result.first;
-        result.right = result.first;
-    } else if (normalizedPosition >= result.last->position) {
-        result.left = result.last;
-        result.right = result.last;
-    } else {
-        if (result.left == nullptr) {
-            result.left = result.first;
-        }
-        if (result.right == nullptr) {
-            result.right = result.last;
-        }
-    }
-    return result;
+    return {begin, end};
 }
 
 std::optional<float> EvaluatePaletteStopScalarTrack(
@@ -1015,58 +1014,54 @@ std::optional<float> EvaluatePaletteStopScalarTrack(
     std::string_view stopId,
     TimingColourisePaletteStopParameter parameter,
     float normalizedPosition) {
-    const auto brackets = PaletteStopParameterKeysAround(
+    const auto [begin, end] = PaletteStopParameterTrackRange(
         keys,
         stopId,
-        parameter,
-        normalizedPosition);
-    if (brackets.first == nullptr) {
+        parameter);
+    if (begin == end) {
         return std::nullopt;
     }
-    if (brackets.left == brackets.right ||
-        std::abs(brackets.right->position - brackets.left->position) <=
-            kTimingColouriseKeyTolerance) {
-        return brackets.right->scalarValue;
-    }
-    const float amount = InterpolationAmount(
-        brackets.left->interpolation,
-        (normalizedPosition - brackets.left->position) /
-            (brackets.right->position - brackets.left->position));
-    return std::lerp(
-        brackets.left->scalarValue,
-        brackets.right->scalarValue,
-        amount);
+    return EvaluateScalarKeyTrack(
+        begin,
+        end,
+        normalizedPosition,
+        [](const TimingColourisePaletteStopParameterKey& key) {
+            return key.scalarValue;
+        });
 }
 
 std::optional<std::array<float, 3>> EvaluatePaletteStopColourTrack(
     const std::vector<TimingColourisePaletteStopParameterKey>& keys,
     std::string_view stopId,
-    float normalizedPosition) {
-    const auto brackets = PaletteStopParameterKeysAround(
+    float normalizedPosition,
+    TimingColouriseColourSpace space) {
+    const auto [begin, end] = PaletteStopParameterTrackRange(
         keys,
         stopId,
-        TimingColourisePaletteStopParameter::Colour,
-        normalizedPosition);
-    if (brackets.first == nullptr) {
+        TimingColourisePaletteStopParameter::Colour);
+    if (begin == end) {
         return std::nullopt;
     }
-    if (brackets.left == brackets.right ||
-        std::abs(brackets.right->position - brackets.left->position) <=
-            kTimingColouriseKeyTolerance) {
-        return brackets.right->colourValue;
+    // Each channel follows the shared scalar evaluator in the chosen colour
+    // space, so keyed colours honour every curve style and blend along an
+    // sRGB, linear-light, or perceptual OkLab path.
+    std::array<float, 3> coordinates{};
+    for (std::size_t channel = 0U;
+         channel < coordinates.size();
+         ++channel) {
+        coordinates[channel] =
+            EvaluateScalarKeyTrack(
+                begin,
+                end,
+                normalizedPosition,
+                [&](const TimingColourisePaletteStopParameterKey& key) {
+                    return TimingColouriseColourToSpace(
+                        key.colourValue,
+                        space)[channel];
+                })
+                .value_or(0.0F);
     }
-    const float amount = InterpolationAmount(
-        brackets.left->interpolation,
-        (normalizedPosition - brackets.left->position) /
-            (brackets.right->position - brackets.left->position));
-    std::array<float, 3> colour{};
-    for (std::size_t channel = 0U; channel < colour.size(); ++channel) {
-        colour[channel] = std::lerp(
-            brackets.left->colourValue[channel],
-            brackets.right->colourValue[channel],
-            amount);
-    }
-    return colour;
+    return TimingColouriseColourFromSpace(coordinates, space);
 }
 
 TimingColouriseBounds EvaluateLegacyTimingColouriseBounds(
@@ -2610,6 +2605,73 @@ std::size_t RemoveTimingTakeRainOwnerProfiles(
     return removed.size();
 }
 
+std::array<float, 3> TimingColouriseColourToSpace(
+    std::array<float, 3> colour,
+    TimingColouriseColourSpace space) {
+    for (auto& channel : colour) {
+        channel = Clamp01(channel);
+    }
+    if (space == TimingColouriseColourSpace::Srgb) {
+        return colour;
+    }
+    const std::array<float, 3> linear{
+        SrgbChannelToLinear(colour[0]),
+        SrgbChannelToLinear(colour[1]),
+        SrgbChannelToLinear(colour[2]),
+    };
+    if (space == TimingColouriseColourSpace::LinearRgb) {
+        return linear;
+    }
+    // OkLab (Bjorn Ottosson's reference matrices) from linear sRGB.
+    const float l = std::cbrt(
+        0.4122214708F * linear[0] + 0.5363325363F * linear[1] +
+        0.0514459929F * linear[2]);
+    const float m = std::cbrt(
+        0.2119034982F * linear[0] + 0.6806995451F * linear[1] +
+        0.1073969566F * linear[2]);
+    const float s = std::cbrt(
+        0.0883024619F * linear[0] + 0.2817188376F * linear[1] +
+        0.6299787005F * linear[2]);
+    return {
+        0.2104542553F * l + 0.7936177850F * m - 0.0040720468F * s,
+        1.9779984951F * l - 2.4285922050F * m + 0.4505937099F * s,
+        0.0259040371F * l + 0.7827717662F * m - 0.8086757660F * s,
+    };
+}
+
+std::array<float, 3> TimingColouriseColourFromSpace(
+    std::array<float, 3> coordinates,
+    TimingColouriseColourSpace space) {
+    if (space == TimingColouriseColourSpace::Srgb) {
+        for (auto& channel : coordinates) {
+            channel = Clamp01(channel);
+        }
+        return coordinates;
+    }
+    std::array<float, 3> linear = coordinates;
+    if (space == TimingColouriseColourSpace::OkLab) {
+        const float l = coordinates[0] + 0.3963377774F * coordinates[1] +
+                        0.2158037573F * coordinates[2];
+        const float m = coordinates[0] - 0.1055613458F * coordinates[1] -
+                        0.0638541728F * coordinates[2];
+        const float s = coordinates[0] - 0.0894841775F * coordinates[1] -
+                        1.2914855480F * coordinates[2];
+        linear = {
+            4.0767416621F * (l * l * l) - 3.3077115913F * (m * m * m) +
+                0.2309699292F * (s * s * s),
+            -1.2684380046F * (l * l * l) + 2.6097574011F * (m * m * m) -
+                0.3413193965F * (s * s * s),
+            -0.0041960863F * (l * l * l) - 0.7034186147F * (m * m * m) +
+                1.7076147010F * (s * s * s),
+        };
+    }
+    return {
+        LinearChannelToSrgb(linear[0]),
+        LinearChannelToSrgb(linear[1]),
+        LinearChannelToSrgb(linear[2]),
+    };
+}
+
 TimingColourisePalette SanitizeTimingColourisePalette(
     TimingColourisePalette palette) {
     if (palette.stops.size() > kMaximumTimingColourisePaletteStops) {
@@ -3368,6 +3430,10 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
             effect.colouriseAmountOverrideMode)) {
         effect.colouriseAmountOverrideMode =
             TimingColouriseAmountOverrideMode::Maximum;
+    }
+    if (!IsValidColourSpace(effect.colourKeyInterpolationSpace)) {
+        effect.colourKeyInterpolationSpace =
+            TimingColouriseColourSpace::Srgb;
     }
     effect.colouriseAmountOverride = std::clamp(
         FiniteOr(effect.colouriseAmountOverride, 1.0F),
@@ -5913,7 +5979,8 @@ TimingColourisePalette EvaluatePreparedTimingColourisePalette(
         stop.colour = EvaluatePaletteStopColourTrack(
                           prepared.paletteStopParameterKeys,
                           stop.id,
-                          normalizedPosition)
+                          normalizedPosition,
+                          prepared.colourKeyInterpolationSpace)
                           .value_or(stop.colour);
         stop.colouriseAmount = EvaluatePaletteStopScalarTrack(
                                   prepared.paletteStopParameterKeys,

@@ -2340,6 +2340,139 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Timing Colourise stop tracks honour spline curve styles",
+    "[timing][colourise][palette][keys][spline]") {
+    TimingColouriseEffect effect;
+    effect.basePalette = TimingColourisePalette{
+        .stops = {
+            {.id = "stop-a",
+             .position = 0.2F,
+             .colour = {0.5F, 0.5F, 0.5F},
+             .colouriseAmount = 1.0F},
+        },
+    };
+    const auto addPositionKey = [&](float position,
+                                    float value,
+                                    WaterScenarioInterpolation
+                                        interpolation) {
+        REQUIRE(invisible_places::timing::
+                    AddOrUpdateTimingColourisePaletteStopScalarKey(
+                        &effect,
+                        "stop-a",
+                        TimingColourisePaletteStopParameter::Position,
+                        position,
+                        value,
+                        interpolation));
+    };
+    // Uneven spacing with a continuing direction: the centripetal spline
+    // carries speed through the middle key, so the value just after it
+    // differs from a per-segment smoothstep that rests at every key.
+    addPositionKey(0.0F, 0.1F, WaterScenarioInterpolation::
+                                    CentripetalCatmullRom);
+    addPositionKey(0.2F, 0.4F, WaterScenarioInterpolation::
+                                    CentripetalCatmullRom);
+    addPositionKey(0.9F, 0.9F, WaterScenarioInterpolation::
+                                    CentripetalCatmullRom);
+    const auto splinePosition = [&](float position) {
+        return invisible_places::timing::
+            EvaluateTimingColourisePalette(effect, position)
+                .stops.front()
+                .position;
+    };
+    CHECK(splinePosition(0.0F) == Approx(0.1F));
+    CHECK(splinePosition(0.2F) == Approx(0.4F));
+    CHECK(splinePosition(0.9F) == Approx(0.9F));
+    auto smoothStepped = effect;
+    for (auto& key : smoothStepped.paletteStopParameterKeys) {
+        key.interpolation = WaterScenarioInterpolation::Smooth;
+    }
+    const float splineSample = splinePosition(0.25F);
+    const float smoothSample = invisible_places::timing::
+        EvaluateTimingColourisePalette(smoothStepped, 0.25F)
+            .stops.front()
+            .position;
+    CHECK(std::abs(splineSample - smoothSample) > 1.0e-3F);
+}
+
+TEST_CASE(
+    "Timing Colourise keyed colours blend in the chosen colour space",
+    "[timing][colourise][palette][keys][colour-space]") {
+    using invisible_places::timing::TimingColouriseColourSpace;
+
+    SECTION("space conversions round-trip sRGB colours") {
+        for (const auto space :
+             {TimingColouriseColourSpace::Srgb,
+              TimingColouriseColourSpace::LinearRgb,
+              TimingColouriseColourSpace::OkLab}) {
+            for (const std::array<float, 3> colour :
+                 {std::array<float, 3>{0.0F, 0.0F, 0.0F},
+                  std::array<float, 3>{1.0F, 1.0F, 1.0F},
+                  std::array<float, 3>{0.9F, 0.2F, 0.35F},
+                  std::array<float, 3>{0.1F, 0.6F, 0.8F}}) {
+                const auto roundTrip =
+                    invisible_places::timing::
+                        TimingColouriseColourFromSpace(
+                            invisible_places::timing::
+                                TimingColouriseColourToSpace(
+                                    colour,
+                                    space),
+                            space);
+                for (std::size_t channel = 0U; channel < 3U;
+                     ++channel) {
+                    CHECK(roundTrip[channel] ==
+                          Approx(colour[channel]).margin(2.0e-3F));
+                }
+            }
+        }
+    }
+
+    SECTION("the blend path follows the authored space") {
+        TimingColouriseEffect effect;
+        effect.basePalette = TimingColourisePalette{
+            .stops = {
+                {.id = "stop-a",
+                 .position = 0.5F,
+                 .colour = {0.0F, 0.0F, 0.0F},
+                 .colouriseAmount = 1.0F},
+            },
+        };
+        REQUIRE(invisible_places::timing::
+                    AddOrUpdateTimingColourisePaletteStopColourKey(
+                        &effect,
+                        "stop-a",
+                        0.0F,
+                        {0.0F, 0.0F, 0.0F},
+                        WaterScenarioInterpolation::Linear));
+        REQUIRE(invisible_places::timing::
+                    AddOrUpdateTimingColourisePaletteStopColourKey(
+                        &effect,
+                        "stop-a",
+                        1.0F,
+                        {1.0F, 1.0F, 1.0F},
+                        WaterScenarioInterpolation::Linear));
+        const auto midpointRed = [&](TimingColouriseColourSpace space) {
+            auto configured = effect;
+            configured.colourKeyInterpolationSpace = space;
+            return invisible_places::timing::
+                EvaluateTimingColourisePalette(configured, 0.5F)
+                    .stops.front()
+                    .colour[0];
+        };
+        // The default reproduces the historical component-wise blend.
+        CHECK(midpointRed(TimingColouriseColourSpace::Srgb) ==
+              Approx(0.5F));
+        // Linear-light midpoint grey is brighter in sRGB terms.
+        CHECK(midpointRed(TimingColouriseColourSpace::LinearRgb) ==
+              Approx(0.735F).margin(0.01F));
+        // OkLab lightness is close to a cube root of linear light, so its
+        // perceptual midpoint grey reads darker than the sRGB blend:
+        // L = 0.5 cubes to 0.125 linear, about 0.387 in sRGB.
+        CHECK(midpointRed(TimingColouriseColourSpace::OkLab) ==
+              Approx(0.387F).margin(0.01F));
+    }
+}
+
+TEST_CASE(
     "Timing Colourise saved palettes keep private edited variants",
     "[timing][colourise][palette][local-edit][saved]") {
     using invisible_places::timing::TimingColourisePaletteSourceKind;
