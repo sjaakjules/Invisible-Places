@@ -5091,6 +5091,151 @@ ParseTimingColouriseBoundsKeys(const json& keysJson) {
     return keys;
 }
 
+json SerializeTimingColourisePaletteKeys(
+    const std::vector<invisible_places::timing::TimingColourisePaletteKey>&
+        keys) {
+    json keysJson = json::array();
+    for (const auto& key : keys) {
+        keysJson.push_back({
+            {"position", key.position},
+            {"interpolation",
+             WaterScenarioInterpolationName(key.interpolation)},
+            {"palette", SerializeTimingColourisePalette(key.palette)},
+        });
+    }
+    return keysJson;
+}
+
+std::vector<invisible_places::timing::TimingColourisePaletteKey>
+ParseTimingColourisePaletteKeys(const json& keysJson) {
+    std::vector<invisible_places::timing::TimingColourisePaletteKey> keys;
+    if (!keysJson.is_array()) {
+        return keys;
+    }
+    for (const auto& keyJson : keysJson) {
+        invisible_places::timing::TimingColourisePaletteKey key;
+        key.position = keyJson.value("position", key.position);
+        if (keyJson.contains("interpolation")) {
+            key.interpolation = ParseWaterScenarioInterpolation(
+                keyJson.at("interpolation"));
+        }
+        if (keyJson.contains("palette")) {
+            key.palette =
+                ParseTimingColourisePalette(keyJson.at("palette"));
+        }
+        keys.push_back(std::move(key));
+    }
+    return keys;
+}
+
+json SerializeTimingColourisePaletteStopParameterKeys(
+    const std::vector<
+        invisible_places::timing::TimingColourisePaletteStopParameterKey>&
+        keys) {
+    json keysJson = json::array();
+    for (const auto& key : keys) {
+        keysJson.push_back({
+            {"stop_id", key.stopId},
+            {"parameter",
+             TimingColourisePaletteStopParameterName(key.parameter)},
+            {"position", key.position},
+            {"scalar_value", key.scalarValue},
+            {"colour_value", key.colourValue},
+            {"interpolation",
+             WaterScenarioInterpolationName(key.interpolation)},
+        });
+    }
+    return keysJson;
+}
+
+std::vector<
+    invisible_places::timing::TimingColourisePaletteStopParameterKey>
+ParseTimingColourisePaletteStopParameterKeys(const json& keysJson) {
+    std::vector<
+        invisible_places::timing::TimingColourisePaletteStopParameterKey>
+        keys;
+    if (!keysJson.is_array()) {
+        return keys;
+    }
+    for (const auto& keyJson : keysJson) {
+        const auto parameter =
+            keyJson.contains("parameter")
+                ? ParseTimingColourisePaletteStopParameter(
+                      keyJson.at("parameter"))
+                : std::nullopt;
+        if (!parameter.has_value()) {
+            continue;
+        }
+        invisible_places::timing::TimingColourisePaletteStopParameterKey
+            key;
+        key.stopId = keyJson.value("stop_id", std::string{});
+        key.parameter = parameter.value();
+        key.position = keyJson.value("position", key.position);
+        key.scalarValue =
+            keyJson.value("scalar_value", key.scalarValue);
+        if (keyJson.contains("colour_value") &&
+            keyJson.at("colour_value").is_array() &&
+            keyJson.at("colour_value").size() >= 3U) {
+            key.colourValue =
+                keyJson.at("colour_value").get<std::array<float, 3>>();
+        }
+        if (keyJson.contains("interpolation")) {
+            key.interpolation = ParseWaterScenarioInterpolation(
+                keyJson.at("interpolation"));
+        }
+        keys.push_back(std::move(key));
+    }
+    return keys;
+}
+
+json SerializeTimingColouriseEffectParameterKeys(
+    const std::vector<
+        invisible_places::timing::TimingColouriseEffectParameterKey>&
+        keys) {
+    json keysJson = json::array();
+    for (const auto& key : keys) {
+        keysJson.push_back({
+            {"parameter",
+             TimingColouriseEffectParameterName(key.parameter)},
+            {"position", key.position},
+            {"value", key.value},
+            {"interpolation",
+             WaterScenarioInterpolationName(key.interpolation)},
+        });
+    }
+    return keysJson;
+}
+
+std::vector<invisible_places::timing::TimingColouriseEffectParameterKey>
+ParseTimingColouriseEffectParameterKeys(const json& keysJson) {
+    std::vector<
+        invisible_places::timing::TimingColouriseEffectParameterKey>
+        keys;
+    if (!keysJson.is_array()) {
+        return keys;
+    }
+    for (const auto& keyJson : keysJson) {
+        const auto parameter =
+            keyJson.contains("parameter")
+                ? ParseTimingColouriseEffectParameter(
+                      keyJson.at("parameter"))
+                : std::nullopt;
+        if (!parameter.has_value()) {
+            continue;
+        }
+        invisible_places::timing::TimingColouriseEffectParameterKey key;
+        key.parameter = parameter.value();
+        key.position = keyJson.value("position", key.position);
+        key.value = keyJson.value("value", key.value);
+        if (keyJson.contains("interpolation")) {
+            key.interpolation = ParseWaterScenarioInterpolation(
+                keyJson.at("interpolation"));
+        }
+        keys.push_back(std::move(key));
+    }
+    return keys;
+}
+
 json SerializeTimingColouriseEffect(
     const invisible_places::timing::TimingColouriseEffect& effect) {
     const auto sanitized =
@@ -5112,39 +5257,14 @@ json SerializeTimingColouriseEffect(
                     localEdit.sourceKind);
         }
     }
-    json paletteKeysJson = json::array();
-    for (const auto& key : sanitized.paletteKeys) {
-        paletteKeysJson.push_back({
-            {"position", key.position},
-            {"interpolation",
-             WaterScenarioInterpolationName(key.interpolation)},
-            {"palette", SerializeTimingColourisePalette(key.palette)},
-        });
-    }
-    json paletteStopParameterKeysJson = json::array();
-    for (const auto& key : sanitized.paletteStopParameterKeys) {
-        paletteStopParameterKeysJson.push_back({
-            {"stop_id", key.stopId},
-            {"parameter",
-             TimingColourisePaletteStopParameterName(key.parameter)},
-            {"position", key.position},
-            {"scalar_value", key.scalarValue},
-            {"colour_value", key.colourValue},
-            {"interpolation",
-             WaterScenarioInterpolationName(key.interpolation)},
-        });
-    }
-    json effectParameterKeysJson = json::array();
-    for (const auto& key : sanitized.effectParameterKeys) {
-        effectParameterKeysJson.push_back({
-            {"parameter",
-             TimingColouriseEffectParameterName(key.parameter)},
-            {"position", key.position},
-            {"value", key.value},
-            {"interpolation",
-             WaterScenarioInterpolationName(key.interpolation)},
-        });
-    }
+    json paletteKeysJson =
+        SerializeTimingColourisePaletteKeys(sanitized.paletteKeys);
+    json paletteStopParameterKeysJson =
+        SerializeTimingColourisePaletteStopParameterKeys(
+            sanitized.paletteStopParameterKeys);
+    json effectParameterKeysJson =
+        SerializeTimingColouriseEffectParameterKeys(
+            sanitized.effectParameterKeys);
     json boundsKeysJson = json::array();
     for (const auto& key : sanitized.boundsKeys) {
         boundsKeysJson.push_back({
@@ -5270,6 +5390,82 @@ json SerializeTimingColouriseEffect(
     // Linked fade handles are the norm; only the split is written.
     if (!sanitized.edgeFadesLinked) {
         effectJson["edge_fades_linked"] = false;
+    }
+    // Field-linked visual settings are the norm; only the Global opt-out
+    // and non-empty memories are written.
+    if (!sanitized.fieldScopedVisualSettings) {
+        effectJson["field_scoped_visual_settings"] = false;
+    }
+    if (!sanitized.fieldVisualMemory.empty()) {
+        json visualMemoryJson = json::array();
+        for (const auto& memory : sanitized.fieldVisualMemory) {
+            json memoryJson = {
+                {"field",
+                 {
+                     {"source",
+                      TimingColouriseFieldSourceName(
+                          memory.selector.source)},
+                     {"scalar_field_name",
+                      memory.selector.scalarFieldName},
+                 }},
+                {"base_palette",
+                 SerializeTimingColourisePalette(memory.basePalette)},
+                {"palette_key_model",
+                 TimingColourisePaletteKeyModelName(
+                     memory.paletteKeyModel)},
+                {"palette_source",
+                 {
+                     {"kind",
+                      TimingColourisePaletteSourceKindName(
+                          memory.paletteSourceKind)},
+                     {"id", memory.paletteSourceId},
+                     {"name", memory.paletteSourceName},
+                     {"edited", memory.paletteEdited},
+                 }},
+                {"colourise_amount_override",
+                 {
+                     {"mode",
+                      TimingColouriseAmountOverrideModeName(
+                          memory.colouriseAmountOverrideMode)},
+                     {"value", memory.colouriseAmountOverride},
+                 }},
+                {"palette_phase_offset", memory.palettePhaseOffset},
+                {"emissive_level", memory.emissiveLevel},
+                {"effect_parameter_keys",
+                 SerializeTimingColouriseEffectParameterKeys(
+                     memory.effectParameterKeys)},
+                {"palette_keys",
+                 SerializeTimingColourisePaletteKeys(
+                     memory.paletteKeys)},
+                {"palette_stop_parameter_keys",
+                 SerializeTimingColourisePaletteStopParameterKeys(
+                     memory.paletteStopParameterKeys)},
+            };
+            if (memory.paletteLooped) {
+                memoryJson["palette_looped"] = true;
+            }
+            if (memory.colourKeyInterpolationSpace !=
+                invisible_places::timing::TimingColouriseColourSpace::
+                    Srgb) {
+                memoryJson["colour_key_interpolation"] =
+                    TimingColouriseColourSpaceName(
+                        memory.colourKeyInterpolationSpace);
+            }
+            if (memory.paletteSkewCentre != 0.5F) {
+                memoryJson["palette_skew_centre"] =
+                    memory.paletteSkewCentre;
+            }
+            if (memory.paletteSkewLower != 0.0F) {
+                memoryJson["palette_skew_lower"] =
+                    memory.paletteSkewLower;
+            }
+            if (memory.paletteSkewUpper != 0.0F) {
+                memoryJson["palette_skew_upper"] =
+                    memory.paletteSkewUpper;
+            }
+            visualMemoryJson.push_back(std::move(memoryJson));
+        }
+        effectJson["field_visual_memory"] = std::move(visualMemoryJson);
     }
     // Loop Palette is written only when engaged so untouched documents stay
     // byte-identical; older readers drop the key harmlessly.
@@ -5476,47 +5672,18 @@ ParseTimingColouriseEffect(
     effect.emissiveLevel = effectJson.value(
         "emissive_level",
         effect.emissiveLevel);
-    if (effectJson.contains("effect_parameter_keys") &&
-        effectJson.at("effect_parameter_keys").is_array()) {
-        for (const auto& keyJson :
-             effectJson.at("effect_parameter_keys")) {
-            const auto parameter = keyJson.contains("parameter")
-                                       ? ParseTimingColouriseEffectParameter(
-                                             keyJson.at("parameter"))
-                                       : std::nullopt;
-            if (!parameter.has_value()) {
-                continue;
-            }
-            invisible_places::timing::TimingColouriseEffectParameterKey key;
-            key.parameter = parameter.value();
-            key.position = keyJson.value("position", key.position);
-            key.value = keyJson.value("value", key.value);
-            if (keyJson.contains("interpolation")) {
-                key.interpolation = ParseWaterScenarioInterpolation(
-                    keyJson.at("interpolation"));
-            }
-            effect.effectParameterKeys.push_back(std::move(key));
-        }
+    if (effectJson.contains("effect_parameter_keys")) {
+        effect.effectParameterKeys =
+            ParseTimingColouriseEffectParameterKeys(
+                effectJson.at("effect_parameter_keys"));
     }
     if (effectJson.contains("bounds_key_mode")) {
         effect.boundsKeyMode = ParseTimingColouriseBoundsKeyMode(
             effectJson.at("bounds_key_mode"));
     }
-    if (effectJson.contains("palette_keys") &&
-        effectJson.at("palette_keys").is_array()) {
-        for (const auto& keyJson : effectJson.at("palette_keys")) {
-            invisible_places::timing::TimingColourisePaletteKey key;
-            key.position = keyJson.value("position", key.position);
-            if (keyJson.contains("interpolation")) {
-                key.interpolation = ParseWaterScenarioInterpolation(
-                    keyJson.at("interpolation"));
-            }
-            if (keyJson.contains("palette")) {
-                key.palette =
-                    ParseTimingColourisePalette(keyJson.at("palette"));
-            }
-            effect.paletteKeys.push_back(std::move(key));
-        }
+    if (effectJson.contains("palette_keys")) {
+        effect.paletteKeys = ParseTimingColourisePaletteKeys(
+            effectJson.at("palette_keys"));
     }
     effect.paletteKeyModel =
         parsedPaletteKeyModel.value_or(
@@ -5525,42 +5692,10 @@ ParseTimingColouriseEffect(
                       TimingColourisePaletteKeyModel::StopParameters
                 : invisible_places::timing::
                       TimingColourisePaletteKeyModel::LegacySnapshots);
-    if (effectJson.contains("palette_stop_parameter_keys") &&
-        effectJson.at("palette_stop_parameter_keys").is_array()) {
-        for (const auto& keyJson :
-             effectJson.at("palette_stop_parameter_keys")) {
-            const auto parameter =
-                keyJson.contains("parameter")
-                    ? ParseTimingColourisePaletteStopParameter(
-                          keyJson.at("parameter"))
-                    : std::nullopt;
-            if (!parameter.has_value()) {
-                continue;
-            }
-            invisible_places::timing::
-                TimingColourisePaletteStopParameterKey key;
-            key.stopId =
-                keyJson.value("stop_id", std::string{});
-            key.parameter = parameter.value();
-            key.position =
-                keyJson.value("position", key.position);
-            key.scalarValue = keyJson.value(
-                "scalar_value",
-                key.scalarValue);
-            if (keyJson.contains("colour_value") &&
-                keyJson.at("colour_value").is_array() &&
-                keyJson.at("colour_value").size() >= 3U) {
-                key.colourValue = keyJson.at("colour_value")
-                                      .get<std::array<float, 3>>();
-            }
-            if (keyJson.contains("interpolation")) {
-                key.interpolation =
-                    ParseWaterScenarioInterpolation(
-                        keyJson.at("interpolation"));
-            }
-            effect.paletteStopParameterKeys.push_back(
-                std::move(key));
-        }
+    if (effectJson.contains("palette_stop_parameter_keys")) {
+        effect.paletteStopParameterKeys =
+            ParseTimingColourisePaletteStopParameterKeys(
+                effectJson.at("palette_stop_parameter_keys"));
     }
     if (effectJson.contains("bounds_parameter_keys") &&
         effectJson.at("bounds_parameter_keys").is_array()) {
@@ -5650,6 +5785,106 @@ ParseTimingColouriseEffect(
                 "adopted_global_revision",
                 memory.adoptedGlobalRevision);
             effect.fieldBoundsMemory.push_back(std::move(memory));
+        }
+    }
+    effect.fieldScopedVisualSettings =
+        effectJson.value("field_scoped_visual_settings", true);
+    if (effectJson.contains("field_visual_memory") &&
+        effectJson.at("field_visual_memory").is_array()) {
+        for (const auto& memoryJson :
+             effectJson.at("field_visual_memory")) {
+            if (!memoryJson.is_object() ||
+                !memoryJson.contains("field") ||
+                !memoryJson.at("field").is_object()) {
+                continue;
+            }
+            invisible_places::timing::TimingColouriseFieldVisualMemory
+                memory;
+            const auto& fieldJson = memoryJson.at("field");
+            if (fieldJson.contains("source")) {
+                memory.selector.source = ParseTimingColouriseFieldSource(
+                    fieldJson.at("source"));
+            }
+            memory.selector.scalarFieldName = fieldJson.value(
+                "scalar_field_name",
+                memory.selector.scalarFieldName);
+            if (memoryJson.contains("base_palette")) {
+                memory.basePalette = ParseTimingColourisePalette(
+                    memoryJson.at("base_palette"));
+            }
+            if (memoryJson.contains("palette_key_model")) {
+                memory.paletteKeyModel =
+                    ParseTimingColourisePaletteKeyModel(
+                        memoryJson.at("palette_key_model"))
+                        .value_or(memory.paletteKeyModel);
+            }
+            if (memoryJson.contains("palette_source") &&
+                memoryJson.at("palette_source").is_object()) {
+                const auto& sourceJson =
+                    memoryJson.at("palette_source");
+                if (sourceJson.contains("kind")) {
+                    memory.paletteSourceKind =
+                        ParseTimingColourisePaletteSourceKind(
+                            sourceJson.at("kind"));
+                }
+                memory.paletteSourceId =
+                    sourceJson.value("id", std::string{});
+                memory.paletteSourceName =
+                    sourceJson.value("name", std::string{});
+                memory.paletteEdited =
+                    sourceJson.value("edited", false);
+            }
+            if (memoryJson.contains("colourise_amount_override") &&
+                memoryJson.at("colourise_amount_override")
+                    .is_object()) {
+                const auto& overrideJson =
+                    memoryJson.at("colourise_amount_override");
+                if (overrideJson.contains("mode")) {
+                    memory.colouriseAmountOverrideMode =
+                        ParseTimingColouriseAmountOverrideMode(
+                            overrideJson.at("mode"));
+                }
+                memory.colouriseAmountOverride = overrideJson.value(
+                    "value",
+                    memory.colouriseAmountOverride);
+            }
+            memory.paletteLooped =
+                memoryJson.value("palette_looped", false);
+            if (memoryJson.contains("colour_key_interpolation")) {
+                memory.colourKeyInterpolationSpace =
+                    ParseTimingColouriseColourSpace(
+                        memoryJson.at("colour_key_interpolation"));
+            }
+            memory.palettePhaseOffset = memoryJson.value(
+                "palette_phase_offset",
+                memory.palettePhaseOffset);
+            memory.paletteSkewCentre = memoryJson.value(
+                "palette_skew_centre",
+                memory.paletteSkewCentre);
+            memory.paletteSkewLower = memoryJson.value(
+                "palette_skew_lower",
+                memory.paletteSkewLower);
+            memory.paletteSkewUpper = memoryJson.value(
+                "palette_skew_upper",
+                memory.paletteSkewUpper);
+            memory.emissiveLevel = memoryJson.value(
+                "emissive_level",
+                memory.emissiveLevel);
+            if (memoryJson.contains("effect_parameter_keys")) {
+                memory.effectParameterKeys =
+                    ParseTimingColouriseEffectParameterKeys(
+                        memoryJson.at("effect_parameter_keys"));
+            }
+            if (memoryJson.contains("palette_keys")) {
+                memory.paletteKeys = ParseTimingColourisePaletteKeys(
+                    memoryJson.at("palette_keys"));
+            }
+            if (memoryJson.contains("palette_stop_parameter_keys")) {
+                memory.paletteStopParameterKeys =
+                    ParseTimingColourisePaletteStopParameterKeys(
+                        memoryJson.at("palette_stop_parameter_keys"));
+            }
+            effect.fieldVisualMemory.push_back(std::move(memory));
         }
     }
     return invisible_places::timing::SanitizeTimingColouriseEffect(

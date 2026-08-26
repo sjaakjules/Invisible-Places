@@ -103293,6 +103293,19 @@ void DrawTimingColouriseSection(
             runtimeState,
             &effect);
     }
+    if (ImGui::Checkbox(
+            "Field-Linked Visuals",
+            &effect.fieldScopedVisualSettings)) {
+        if (effect.fieldScopedVisualSettings) {
+            // Turning the link on adopts the current settings as this
+            // field's remembered state.
+            invisible_places::timing::StashTimingColouriseFieldVisuals(
+                &effect);
+        }
+        runtimeState->previewRenderStateSignatureValid = false;
+    }
+    DrawTimingLabelTooltip(
+        "When ticked, the Colourise and Emissive settings below - palette, its keys, phase, amounts, skew, loop, and emissive level - follow the selected scalar field: switching fields restores what each field was using, and Bounds already do. Untick for one global set of settings shared across every field. A field visited for the first time keeps the current settings either way.");
     ImGui::SeparatorText("Emissive");
     {
         const bool scalarSource =

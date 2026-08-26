@@ -4556,6 +4556,92 @@ TEST_CASE("Palette skew base values and keys round-trip",
                  ["parameter"] == "palette_skew_centre");
 }
 
+TEST_CASE("Field-scoped visual settings round-trip",
+          "[project][serialization][timing][colourise][field-memory]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::timing::TimingColouriseColourSpace;
+  using invisible_places::timing::TimingColouriseEffect;
+  using invisible_places::timing::TimingColouriseFieldVisualMemory;
+  using invisible_places::timing::TimingColourisePaletteSourceKind;
+  using invisible_places::timing::TimingColourisePaletteStop;
+  using invisible_places::timing::TimingTakeSceneState;
+
+  ProjectDocument document;
+  document.projectName = "field-visual-memory";
+  TimingTakeSceneState state;
+  TimingColouriseEffect effect;
+  effect.id = "effect-1";
+  effect.name = "Follows Fields";
+  effect.field.scalarFieldName = "Roughness";
+  TimingColouriseFieldVisualMemory memory;
+  memory.selector.scalarFieldName = "Curvature";
+  memory.basePalette = {
+      .stops = {TimingColourisePaletteStop{
+          .id = "stop-1",
+          .colour = {0.2F, 0.6F, 0.9F}}}};
+  memory.paletteSourceKind = TimingColourisePaletteSourceKind::Saved;
+  memory.paletteSourceId = "colourise-palette-2";
+  memory.paletteSourceName = "Mineral";
+  memory.paletteLooped = true;
+  memory.colourKeyInterpolationSpace = TimingColouriseColourSpace::OkLab;
+  memory.palettePhaseOffset = -0.3F;
+  memory.paletteSkewCentre = 0.75F;
+  memory.emissiveLevel = 1.5F;
+  memory.effectParameterKeys.push_back({
+      .parameter = invisible_places::timing::
+          TimingColouriseEffectParameter::AmountOverride,
+      .position = 0.4F,
+      .value = 0.7F,
+  });
+  effect.fieldVisualMemory = {memory};
+  TimingColouriseEffect globalEffect;
+  globalEffect.id = "effect-2";
+  globalEffect.name = "Global";
+  globalEffect.fieldScopedVisualSettings = false;
+  state.colouriseEffects = {effect, globalEffect};
+  document.timingTakeStates = {state};
+
+  TemporaryProjectFile file{"invisible_places_field_visual_memory.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  const auto& effects = loaded->timingTakeStates.at(0).colouriseEffects;
+  REQUIRE(effects.size() == 2U);
+  CHECK(effects[0].fieldScopedVisualSettings);
+  REQUIRE(effects[0].fieldVisualMemory.size() == 1U);
+  const auto& loadedMemory = effects[0].fieldVisualMemory.front();
+  CHECK(loadedMemory.selector.scalarFieldName == "Curvature");
+  CHECK(loadedMemory.paletteSourceKind ==
+        TimingColourisePaletteSourceKind::Saved);
+  CHECK(loadedMemory.paletteSourceId == "colourise-palette-2");
+  CHECK(loadedMemory.paletteLooped);
+  CHECK(loadedMemory.colourKeyInterpolationSpace ==
+        TimingColouriseColourSpace::OkLab);
+  CHECK(loadedMemory.palettePhaseOffset == Catch::Approx(-0.3F));
+  CHECK(loadedMemory.paletteSkewCentre == Catch::Approx(0.75F));
+  CHECK(loadedMemory.emissiveLevel == Catch::Approx(1.5F));
+  REQUIRE(loadedMemory.effectParameterKeys.size() == 1U);
+  CHECK(loadedMemory.effectParameterKeys.front().value ==
+        Catch::Approx(0.7F));
+  CHECK_FALSE(effects[1].fieldScopedVisualSettings);
+
+  // Defaults stay out of the document.
+  std::ifstream savedInput{file.path};
+  REQUIRE(savedInput.is_open());
+  const auto savedJson = nlohmann::json::parse(savedInput);
+  savedInput.close();
+  const auto& effectsJson =
+      savedJson["timing_take_states"][0]["timing_effects"];
+  CHECK_FALSE(effectsJson[0].contains("field_scoped_visual_settings"));
+  CHECK(effectsJson[0].contains("field_visual_memory"));
+  CHECK(effectsJson[1]["field_scoped_visual_settings"] == false);
+  CHECK_FALSE(effectsJson[1].contains("field_visual_memory"));
+}
+
 TEST_CASE("Saved palette edited variants round-trip with their kind",
           "[project][serialization][timing][colourise][palette]") {
   using invisible_places::serialization::LoadProjectDocument;

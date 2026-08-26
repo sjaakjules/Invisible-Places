@@ -2340,6 +2340,90 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Timing Colourise visual settings follow the scalar field",
+    "[timing][colourise][field-memory][visuals]") {
+    using invisible_places::timing::TimingColouriseFieldSelector;
+    const TimingColouriseFieldSelector roughness{
+        .scalarFieldName = "Roughness"};
+    const TimingColouriseFieldSelector curvature{
+        .scalarFieldName = "Curvature"};
+    const TimingColouriseBounds fallback{.lower = 0.0F, .upper = 1.0F};
+
+    TimingColouriseEffect effect;
+    effect.field = roughness;
+    effect.basePalette = Solid({0.9F, 0.1F, 0.1F}, 1.0F);
+    effect.palettePhaseOffset = 0.25F;
+    effect.paletteLooped = true;
+    effect.paletteSkewCentre = 0.3F;
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColouriseEffectParameterKey(
+                    &effect,
+                    TimingColouriseEffectParameter::AmountOverride,
+                    0.5F,
+                    0.6F));
+
+    SECTION("field-linked settings restore per field") {
+        invisible_places::timing::ApplyTimingColouriseFieldSelection(
+            &effect,
+            curvature,
+            fallback,
+            nullptr);
+        // A first visit carries the settings over...
+        CHECK(effect.palettePhaseOffset == Approx(0.25F));
+        // ...and edits on the new field stay its own.
+        effect.basePalette = Solid({0.1F, 0.2F, 0.9F}, 0.5F);
+        effect.palettePhaseOffset = -0.4F;
+        effect.paletteLooped = false;
+        effect.paletteSkewCentre = 0.8F;
+        effect.effectParameterKeys.clear();
+
+        invisible_places::timing::ApplyTimingColouriseFieldSelection(
+            &effect,
+            roughness,
+            fallback,
+            nullptr);
+        CHECK(effect.basePalette.stops.front().colour[0] ==
+              Approx(0.9F));
+        CHECK(effect.palettePhaseOffset == Approx(0.25F));
+        CHECK(effect.paletteLooped);
+        CHECK(effect.paletteSkewCentre == Approx(0.3F));
+        REQUIRE(effect.effectParameterKeys.size() == 1U);
+        CHECK(effect.effectParameterKeys.front().value ==
+              Approx(0.6F));
+
+        invisible_places::timing::ApplyTimingColouriseFieldSelection(
+            &effect,
+            curvature,
+            fallback,
+            nullptr);
+        CHECK(effect.basePalette.stops.front().colour[2] ==
+              Approx(0.9F));
+        CHECK(effect.palettePhaseOffset == Approx(-0.4F));
+        CHECK_FALSE(effect.paletteLooped);
+        CHECK(effect.paletteSkewCentre == Approx(0.8F));
+        CHECK(effect.effectParameterKeys.empty());
+    }
+
+    SECTION("choosing Global keeps one shared set of settings") {
+        effect.fieldScopedVisualSettings = false;
+        invisible_places::timing::ApplyTimingColouriseFieldSelection(
+            &effect,
+            curvature,
+            fallback,
+            nullptr);
+        effect.palettePhaseOffset = -0.4F;
+        invisible_places::timing::ApplyTimingColouriseFieldSelection(
+            &effect,
+            roughness,
+            fallback,
+            nullptr);
+        // The historical behaviour: settings travel with the effect.
+        CHECK(effect.palettePhaseOffset == Approx(-0.4F));
+        CHECK(effect.fieldVisualMemory.empty());
+    }
+}
+
+TEST_CASE(
     "Timing Colourise stop tracks honour spline curve styles",
     "[timing][colourise][palette][keys][spline]") {
     TimingColouriseEffect effect;

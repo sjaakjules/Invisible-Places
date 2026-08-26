@@ -3593,6 +3593,113 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
         fieldBoundsMemory.push_back(std::move(memory));
     }
     effect.fieldBoundsMemory = std::move(fieldBoundsMemory);
+    std::vector<TimingColouriseFieldVisualMemory> fieldVisualMemory;
+    fieldVisualMemory.reserve(effect.fieldVisualMemory.size());
+    for (auto& memory : effect.fieldVisualMemory) {
+        if (memory.selector.source ==
+                TimingColouriseFieldSource::Scalar &&
+            memory.selector.scalarFieldName.empty()) {
+            continue;
+        }
+        const bool duplicate = std::any_of(
+            fieldVisualMemory.begin(),
+            fieldVisualMemory.end(),
+            [&](const TimingColouriseFieldVisualMemory& kept) {
+                return kept.selector == memory.selector;
+            });
+        if (duplicate) {
+            continue;
+        }
+        memory.basePalette =
+            SanitizeTimingColourisePalette(std::move(memory.basePalette));
+        if (!IsValidPaletteKeyModel(memory.paletteKeyModel)) {
+            memory.paletteKeyModel = memory.paletteKeys.empty()
+                ? TimingColourisePaletteKeyModel::StopParameters
+                : TimingColourisePaletteKeyModel::LegacySnapshots;
+        }
+        if (!IsValidPaletteSourceKind(memory.paletteSourceKind)) {
+            memory.paletteSourceKind =
+                TimingColourisePaletteSourceKind::Custom;
+        }
+        if (!IsValidColourSpace(memory.colourKeyInterpolationSpace)) {
+            memory.colourKeyInterpolationSpace =
+                TimingColouriseColourSpace::Srgb;
+        }
+        if (!IsValidAmountOverrideMode(
+                memory.colouriseAmountOverrideMode)) {
+            memory.colouriseAmountOverrideMode =
+                TimingColouriseAmountOverrideMode::Maximum;
+        }
+        memory.colouriseAmountOverride = std::clamp(
+            FiniteOr(memory.colouriseAmountOverride, 1.0F),
+            0.0F,
+            1.0F);
+        memory.palettePhaseOffset =
+            FiniteOr(memory.palettePhaseOffset, 0.0F);
+        memory.paletteSkewCentre = std::clamp(
+            FiniteOr(memory.paletteSkewCentre, 0.5F),
+            0.0F,
+            1.0F);
+        memory.paletteSkewLower =
+            ClampPaletteSkew(memory.paletteSkewLower);
+        memory.paletteSkewUpper =
+            ClampPaletteSkew(memory.paletteSkewUpper);
+        memory.emissiveLevel = FiniteOr(memory.emissiveLevel, 1.0F);
+        std::erase_if(
+            memory.effectParameterKeys,
+            [](const TimingColouriseEffectParameterKey& key) {
+                return !IsValidEffectParameter(key.parameter);
+            });
+        for (auto& key : memory.effectParameterKeys) {
+            key.position = Clamp01(key.position);
+            key.value =
+                SanitizeEffectParameterValue(key.parameter, key.value);
+            if (!IsValidInterpolation(key.interpolation)) {
+                key.interpolation = invisible_places::water::
+                    WaterScenarioInterpolation::Smooth;
+            }
+        }
+        for (auto& key : memory.paletteKeys) {
+            key.position = Clamp01(key.position);
+            key.palette =
+                SanitizeTimingColourisePalette(std::move(key.palette));
+            if (!IsValidInterpolation(key.interpolation)) {
+                key.interpolation = invisible_places::water::
+                    WaterScenarioInterpolation::Smooth;
+            }
+        }
+        std::unordered_set<std::string> memoryStopIds;
+        memoryStopIds.reserve(memory.basePalette.stops.size());
+        for (const auto& stop : memory.basePalette.stops) {
+            memoryStopIds.insert(stop.id);
+        }
+        std::erase_if(
+            memory.paletteStopParameterKeys,
+            [&](const TimingColourisePaletteStopParameterKey& key) {
+                return key.stopId.empty() ||
+                       !memoryStopIds.contains(key.stopId) ||
+                       !IsValidPaletteStopParameter(key.parameter);
+            });
+        for (auto& key : memory.paletteStopParameterKeys) {
+            key.position = Clamp01(key.position);
+            key.scalarValue = SanitizePaletteStopScalarValue(
+                key.parameter,
+                key.scalarValue);
+            key.colourValue =
+                SanitizePaletteStopColour(key.colourValue);
+            if (!IsValidInterpolation(key.interpolation)) {
+                key.interpolation = invisible_places::water::
+                    WaterScenarioInterpolation::Smooth;
+            }
+        }
+        SortAndCoalesceKeys(&memory.paletteKeys);
+        SortAndCoalescePaletteStopParameterKeys(
+            &memory.paletteStopParameterKeys);
+        SortAndCoalesceEffectParameterKeys(
+            &memory.effectParameterKeys);
+        fieldVisualMemory.push_back(std::move(memory));
+    }
+    effect.fieldVisualMemory = std::move(fieldVisualMemory);
     return effect;
 }
 
@@ -5360,6 +5467,43 @@ void StashTimingColouriseFieldBounds(TimingColouriseEffect* effect) {
     entry->adoptedGlobalRevision = effect->boundsAdoptedGlobalRevision;
 }
 
+void StashTimingColouriseFieldVisuals(TimingColouriseEffect* effect) {
+    if (effect == nullptr) {
+        return;
+    }
+    auto entry = std::find_if(
+        effect->fieldVisualMemory.begin(),
+        effect->fieldVisualMemory.end(),
+        [&](const TimingColouriseFieldVisualMemory& memory) {
+            return memory.selector == effect->field;
+        });
+    if (entry == effect->fieldVisualMemory.end()) {
+        effect->fieldVisualMemory.emplace_back();
+        entry = std::prev(effect->fieldVisualMemory.end());
+        entry->selector = effect->field;
+    }
+    entry->basePalette = effect->basePalette;
+    entry->paletteKeyModel = effect->paletteKeyModel;
+    entry->paletteSourceKind = effect->paletteSourceKind;
+    entry->paletteSourceId = effect->paletteSourceId;
+    entry->paletteSourceName = effect->paletteSourceName;
+    entry->paletteEdited = effect->paletteEdited;
+    entry->paletteLooped = effect->paletteLooped;
+    entry->colourKeyInterpolationSpace =
+        effect->colourKeyInterpolationSpace;
+    entry->colouriseAmountOverrideMode =
+        effect->colouriseAmountOverrideMode;
+    entry->colouriseAmountOverride = effect->colouriseAmountOverride;
+    entry->palettePhaseOffset = effect->palettePhaseOffset;
+    entry->paletteSkewCentre = effect->paletteSkewCentre;
+    entry->paletteSkewLower = effect->paletteSkewLower;
+    entry->paletteSkewUpper = effect->paletteSkewUpper;
+    entry->emissiveLevel = effect->emissiveLevel;
+    entry->effectParameterKeys = effect->effectParameterKeys;
+    entry->paletteKeys = effect->paletteKeys;
+    entry->paletteStopParameterKeys = effect->paletteStopParameterKeys;
+}
+
 void ApplyTimingColouriseFieldSelection(
     TimingColouriseEffect* effect,
     const TimingColouriseFieldSelector& selector,
@@ -5369,6 +5513,44 @@ void ApplyTimingColouriseFieldSelection(
         return;
     }
     StashTimingColouriseFieldBounds(effect);
+    // Visual settings follow the field unless the user chose Global. A
+    // field visited for the first time keeps the current settings, so the
+    // link only ever restores state this feature actually authored there.
+    if (effect->fieldScopedVisualSettings) {
+        StashTimingColouriseFieldVisuals(effect);
+        const auto visualEntry = std::find_if(
+            effect->fieldVisualMemory.begin(),
+            effect->fieldVisualMemory.end(),
+            [&](const TimingColouriseFieldVisualMemory& memory) {
+                return memory.selector == selector;
+            });
+        if (visualEntry != effect->fieldVisualMemory.end()) {
+            effect->basePalette = visualEntry->basePalette;
+            effect->paletteKeyModel = visualEntry->paletteKeyModel;
+            effect->paletteSourceKind = visualEntry->paletteSourceKind;
+            effect->paletteSourceId = visualEntry->paletteSourceId;
+            effect->paletteSourceName = visualEntry->paletteSourceName;
+            effect->paletteEdited = visualEntry->paletteEdited;
+            effect->paletteLooped = visualEntry->paletteLooped;
+            effect->colourKeyInterpolationSpace =
+                visualEntry->colourKeyInterpolationSpace;
+            effect->colouriseAmountOverrideMode =
+                visualEntry->colouriseAmountOverrideMode;
+            effect->colouriseAmountOverride =
+                visualEntry->colouriseAmountOverride;
+            effect->palettePhaseOffset =
+                visualEntry->palettePhaseOffset;
+            effect->paletteSkewCentre = visualEntry->paletteSkewCentre;
+            effect->paletteSkewLower = visualEntry->paletteSkewLower;
+            effect->paletteSkewUpper = visualEntry->paletteSkewUpper;
+            effect->emissiveLevel = visualEntry->emissiveLevel;
+            effect->effectParameterKeys =
+                visualEntry->effectParameterKeys;
+            effect->paletteKeys = visualEntry->paletteKeys;
+            effect->paletteStopParameterKeys =
+                visualEntry->paletteStopParameterKeys;
+        }
+    }
     effect->field = selector;
     const auto entry = std::find_if(
         effect->fieldBoundsMemory.begin(),

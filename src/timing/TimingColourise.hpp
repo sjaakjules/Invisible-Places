@@ -274,6 +274,38 @@ struct TimingColouriseFieldBoundsMemory {
     std::uint64_t adoptedGlobalRevision = 0U;
 };
 
+// Remembered colourise/emissive authoring for one scalar field selector, the
+// visual sibling of TimingColouriseFieldBoundsMemory: switching a Visual
+// Feature between fields and back restores the palette, its keys, and the
+// effect controls that field was using. The effect-wide private "_edited"
+// variant library and the aspect/activation state deliberately stay shared.
+struct TimingColouriseFieldVisualMemory {
+    TimingColouriseFieldSelector selector{};
+    TimingColourisePalette basePalette{};
+    TimingColourisePaletteKeyModel paletteKeyModel =
+        TimingColourisePaletteKeyModel::StopParameters;
+    TimingColourisePaletteSourceKind paletteSourceKind =
+        TimingColourisePaletteSourceKind::Custom;
+    std::string paletteSourceId;
+    std::string paletteSourceName;
+    bool paletteEdited = false;
+    bool paletteLooped = false;
+    TimingColouriseColourSpace colourKeyInterpolationSpace =
+        TimingColouriseColourSpace::Srgb;
+    TimingColouriseAmountOverrideMode colouriseAmountOverrideMode =
+        TimingColouriseAmountOverrideMode::Maximum;
+    float colouriseAmountOverride = 1.0F;
+    float palettePhaseOffset = 0.0F;
+    float paletteSkewCentre = 0.5F;
+    float paletteSkewLower = 0.0F;
+    float paletteSkewUpper = 0.0F;
+    float emissiveLevel = 1.0F;
+    std::vector<TimingColouriseEffectParameterKey> effectParameterKeys;
+    std::vector<TimingColourisePaletteKey> paletteKeys;
+    std::vector<TimingColourisePaletteStopParameterKey>
+        paletteStopParameterKeys;
+};
+
 // A named, shareable bounds state for one scalar field selector.
 struct TimingScalarBoundsProfile {
     std::string name;
@@ -384,6 +416,13 @@ struct TimingColouriseEffect {
     std::uint64_t boundsAdoptedGlobalRevision = 0U;
     // Per-selector authoring memory for every field this feature visited.
     std::vector<TimingColouriseFieldBoundsMemory> fieldBoundsMemory;
+    // Visual sibling of the bounds memory: the colourise/emissive authoring
+    // each visited field was using. Consulted only while
+    // fieldScopedVisualSettings is enabled; a first visit to a field keeps
+    // the current settings, so disabling the link reproduces the historical
+    // shared-settings behaviour exactly.
+    std::vector<TimingColouriseFieldVisualMemory> fieldVisualMemory;
+    bool fieldScopedVisualSettings = true;
 };
 
 struct TimingColourisePaletteDefinition {
@@ -932,6 +971,9 @@ void MergeTimingTakeSceneStateKeepingFirst(
 // vectors, edited flag) into the effect's per-selector memory under its
 // current field selector.
 void StashTimingColouriseFieldBounds(TimingColouriseEffect* effect);
+// Visual counterpart: upserts the live colourise/emissive authoring into
+// the effect's per-selector visual memory under its current field selector.
+void StashTimingColouriseFieldVisuals(TimingColouriseEffect* effect);
 // Switches the effect's field selector without losing authoring: the
 // current selector's bounds state is stashed first, then the new selector
 // restores its remembered state when one exists. Otherwise the effect
