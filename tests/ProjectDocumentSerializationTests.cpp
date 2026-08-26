@@ -4448,6 +4448,50 @@ TEST_CASE("Schema 84 scene-scoped takes and water opt-outs round-trip",
   CHECK(featureJson[1]["apply_to_water_fill"] == false);
 }
 
+TEST_CASE("Loop Palette round-trips and stays omitted when disabled",
+          "[project][serialization][timing][colourise][loop]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::timing::TimingColouriseEffect;
+  using invisible_places::timing::TimingTakeSceneState;
+
+  ProjectDocument document;
+  document.projectName = "loop-palette";
+  TimingTakeSceneState state;
+  TimingColouriseEffect plain;
+  plain.id = "effect-1";
+  plain.name = "Straight";
+  TimingColouriseEffect looped;
+  looped.id = "effect-2";
+  looped.name = "Looped";
+  looped.paletteLooped = true;
+  state.colouriseEffects = {plain, looped};
+  document.timingTakeStates = {state};
+
+  TemporaryProjectFile file{"invisible_places_loop_palette.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->timingTakeStates.size() == 1U);
+  const auto& effects = loaded->timingTakeStates[0].colouriseEffects;
+  REQUIRE(effects.size() == 2U);
+  CHECK_FALSE(effects[0].paletteLooped);
+  CHECK(effects[1].paletteLooped);
+
+  // The key is written only when engaged so untouched documents stay
+  // byte-identical for older readers.
+  std::ifstream savedInput{file.path};
+  REQUIRE(savedInput.is_open());
+  const auto savedJson = nlohmann::json::parse(savedInput);
+  savedInput.close();
+  const auto& stateJson = savedJson["timing_take_states"][0];
+  CHECK_FALSE(stateJson["timing_effects"][0].contains("palette_looped"));
+  CHECK(stateJson["timing_effects"][1]["palette_looped"] == true);
+}
+
 TEST_CASE("Legacy takes backfill their scene from single-scene states",
           "[project][serialization][timings][scene-scope][migration]") {
   using invisible_places::serialization::LoadProjectDocument;

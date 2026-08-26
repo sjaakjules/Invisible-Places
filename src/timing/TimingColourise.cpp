@@ -5492,6 +5492,25 @@ TimingColouriseLut ApplyTimingColourisePalettePhase(
     return shifted;
 }
 
+TimingColouriseLut ApplyTimingColourisePaletteLoop(
+    const TimingColouriseLut& lut) {
+    TimingColouriseLut mirrored{};
+    for (std::size_t index = 0U; index < mirrored.size(); ++index) {
+        const float destination =
+            static_cast<float>(index) /
+            static_cast<float>(mirrored.size() - 1U);
+        const float source = std::abs(2.0F * destination - 1.0F);
+        const auto sample = SampleTimingColouriseLut(lut, source);
+        mirrored[index] = {
+            sample.colour[0],
+            sample.colour[1],
+            sample.colour[2],
+            sample.colouriseAmount,
+        };
+    }
+    return mirrored;
+}
+
 namespace {
 
 template <typename Key, typename SameTrack, typename TrackLess>
@@ -5755,6 +5774,11 @@ TimingColouriseLut EvaluateTimingColourisePaletteLut(
     const float amountOverride = evaluatedParameter(
         TimingColouriseEffectParameter::AmountOverride);
     const auto finalize = [&](TimingColouriseLut lut) {
+        // Loop first so the phase rotation cycles a seamless, end-matched
+        // palette instead of dragging the mirror seam through the output.
+        if (sanitized.paletteLooped) {
+            lut = ApplyTimingColourisePaletteLoop(lut);
+        }
         return ApplyTimingColouriseAmountOverride(
             ApplyTimingColourisePalettePhase(lut, phaseOffset),
             sanitized.colouriseAmountOverrideMode,

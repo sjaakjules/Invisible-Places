@@ -96811,6 +96811,9 @@ void DrawTimingColourisePaletteEditor(
             TimingColouriseAmountOverrideMode::Maximum;
         rawEffect.colouriseAmountOverride = 1.0F;
         rawEffect.palettePhaseOffset = 0.0F;
+        // The raw LUT backs stop insertion and legacy materialization, so it
+        // must show the authored stops, not the looped sampling of them.
+        rawEffect.paletteLooped = false;
         rawEffect.effectParameterKeys.clear();
         return invisible_places::timing::
             EvaluateTimingColourisePaletteLut(
@@ -97063,6 +97066,16 @@ void DrawTimingColourisePaletteEditor(
             "becomes _edited.";
     }
     DrawTimingControlTooltip(flipPaletteTooltip);
+    ImGui::SameLine(0.0F, 6.0F);
+    if (ImGui::Checkbox("Loop", &effect->paletteLooped)) {
+        runtimeState->previewRenderStateSignatureValid = false;
+    }
+    DrawTimingControlTooltip(
+        "Loop the palette output: its left colour moves to the centre and "
+        "its right colour reaches both ends, making the sampled range "
+        "seamless. Colour markers are not changed or duplicated - only how "
+        "they are sampled - so a Colour Phase animation cycles without a "
+        "visible join.");
     };
 
     const float evaluatedPhase = invisible_places::timing::

@@ -290,6 +290,12 @@ struct TimingColouriseEffect {
     // Applied after palette/key evaluation. This changes colour mixing only,
     // never point opacity or the authored per-stop amounts.
     float colouriseAmountOverride = 1.0F;
+    // Mirrors the sampled palette so the leftmost authored colour sits at the
+    // output centre and the rightmost colour reaches both ends. Like Palette
+    // Phase this changes only how the palette is sampled: the authored stops
+    // and every stop key keep their positions. The mirrored output is
+    // seamless, so phase animation cycles without a visible join.
+    bool paletteLooped = false;
     // Base cyclic offset in palette turns. Palette Phase keys below store a
     // signed delta from the preceding phase key (or this base for the first
     // key), constrained to one turn in either direction. Evaluation
@@ -902,6 +908,12 @@ std::size_t MergeLegacyTimingEffectAspects(
 [[nodiscard]] TimingColouriseLut ApplyTimingColourisePalettePhase(
     const TimingColouriseLut& lut,
     float phaseOffset);
+// Loop Palette: resamples the LUT through the mirror |2t - 1|, so the input
+// palette's left end appears at the output centre and its right end at both
+// output edges. Applied before the phase rotation, which therefore rotates
+// an end-matched cyclic palette.
+[[nodiscard]] TimingColouriseLut ApplyTimingColourisePaletteLoop(
+    const TimingColouriseLut& lut);
 [[nodiscard]] float EvaluateTimingColouriseEffectParameter(
     const TimingColouriseEffect& effect,
     TimingColouriseEffectParameter parameter,

@@ -5174,6 +5174,11 @@ json SerializeTimingColouriseEffect(
     if (!sanitized.applyToWaterFill) {
         effectJson["apply_to_water_fill"] = false;
     }
+    // Loop Palette is written only when engaged so untouched documents stay
+    // byte-identical; older readers drop the key harmlessly.
+    if (sanitized.paletteLooped) {
+        effectJson["palette_looped"] = true;
+    }
     return effectJson;
 }
 
@@ -5327,6 +5332,8 @@ ParseTimingColouriseEffect(
             "value",
             effect.colouriseAmountOverride);
     }
+    effect.paletteLooped =
+        effectJson.value("palette_looped", false);
     effect.palettePhaseOffset = effectJson.value(
         "palette_phase_offset",
         effect.palettePhaseOffset);

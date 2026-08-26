@@ -3544,6 +3544,71 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Timing Colourise Loop Palette mirrors sampled output without moving stops",
+    "[timing][colourise][palette][loop]") {
+    TimingColouriseEffect effect;
+    effect.basePalette = TimingColourisePalette{
+        .stops = {
+            {.id = "left",
+             .position = 0.0F,
+             .colour = {0.1F, 0.2F, 0.3F},
+             .colouriseAmount = 0.25F},
+            {.id = "right",
+             .position = 1.0F,
+             .colour = {0.9F, 0.8F, 0.7F},
+             .colouriseAmount = 1.0F},
+        },
+    };
+    const auto raw =
+        invisible_places::timing::CompileTimingColourisePaletteLut(
+            effect.basePalette);
+    const auto looped =
+        invisible_places::timing::ApplyTimingColourisePaletteLoop(raw);
+
+    // The authored left colour sits at the output centre; the authored
+    // right colour reaches both output ends, so the loop is seamless.
+    const auto centre =
+        invisible_places::timing::SampleTimingColouriseLut(looped, 0.5F);
+    CHECK(centre.colour[0] == Approx(0.1F).margin(0.02F));
+    CHECK(centre.colour[1] == Approx(0.2F).margin(0.02F));
+    CHECK(centre.colour[2] == Approx(0.3F).margin(0.02F));
+    CHECK(looped.front() == raw.back());
+    CHECK(looped.back() == raw.back());
+
+    // The mirror is symmetric around the centre sample.
+    for (std::size_t index = 0U; index < looped.size(); ++index) {
+        const auto& forward = looped[index];
+        const auto& mirroredTwin = looped[looped.size() - 1U - index];
+        for (std::size_t channel = 0U; channel < 4U; ++channel) {
+            CHECK(forward[channel] == Approx(mirroredTwin[channel]));
+        }
+    }
+
+    // Evaluation applies the loop before the phase rotation, so the phase
+    // cycles the mirrored, end-matched palette.
+    effect.paletteLooped = true;
+    effect.palettePhaseOffset = 0.25F;
+    const auto evaluated =
+        invisible_places::timing::EvaluateTimingColourisePaletteLut(
+            effect,
+            0.0F);
+    const auto expected =
+        invisible_places::timing::ApplyTimingColourisePalettePhase(
+            looped,
+            0.25F);
+    CHECK(evaluated == expected);
+
+    // Loop is a sampling change only: authored stops stay untouched.
+    const auto authored =
+        invisible_places::timing::EvaluateTimingColourisePalette(
+            effect,
+            0.0F);
+    REQUIRE(authored.stops.size() == 2U);
+    CHECK(authored.stops[0].position == Approx(0.0F));
+    CHECK(authored.stops[1].position == Approx(1.0F));
+}
+
+TEST_CASE(
     "Timing Colourise phase and amount own independent animated control tracks",
     "[timing][colourise][palette][effect-parameters]") {
     TimingColouriseEffect effect;
