@@ -1,0 +1,103 @@
+{
+  "version": 1,
+  "provenance": {
+    "source_screenshots": [
+      "/Users/juju/Documents/Screenshots/Screenshot 2026-08-26 at 5.07.48 pm.png",
+      "/Users/juju/Documents/Screenshots/Screenshot 2026-08-26 at 5.06.30 pm.png",
+      "/Users/juju/Documents/Screenshots/Screenshot 2026-08-26 at 5.06.09 pm.png",
+      "/Users/juju/Documents/Screenshots/Screenshot 2026-08-26 at 5.05.47 pm.png"
+    ],
+    "registration_method": "Plan-view WATER occupancy registration, cross-checked between native screenshots and the archived v9 25 mm wet mask",
+    "pixel_to_world": {
+      "image_1": "x = 776.7075 + u/1000; y = 838.4375 - v/1000",
+      "image_2": "x = 777.44824 + u/1512; y = 837.78142 - v/1512",
+      "image_3": "x = 764.34666 + u/177.905; y = 815.07669 - v/177.905",
+      "image_4": "x = 754.80505 + u/40.664; y = 854.71864 - v/40.664"
+    },
+    "registration_uncertainty_m": 0.04,
+    "note": "Screenshots locate review sites only. Classification uses measured SAND/ROCK support and the written request."
+  },
+  "add_water_regions": [
+    {
+      "id": "southern_mixed_void_1",
+      "reason": "True empty subset of the missing region near image-3 mark 1; retain measured SAND islands",
+      "max_terrain_count": 2,
+      "polygon": [
+        [771.740, 810.450], [771.660, 810.655],
+        [771.465, 810.740], [771.270, 810.655],
+        [771.190, 810.450], [771.270, 810.245],
+        [771.465, 810.160], [771.660, 810.245]
+      ]
+    },
+    {
+      "id": "southern_mixed_void_2",
+      "reason": "Actual gap southwest of image-3 mark 2; retain measured SAND islands",
+      "max_terrain_count": 2,
+      "polygon": [
+        [774.460, 809.615], [774.355, 809.774],
+        [774.100, 809.840], [773.845, 809.774],
+        [773.740, 809.615], [773.845, 809.456],
+        [774.100, 809.390], [774.355, 809.456]
+      ]
+    },
+    {
+      "id": "southern_shore_extension",
+      "reason": "Smooth the missing lower shoreline while preventing an unconstrained exterior fill",
+      "max_terrain_count": 0,
+      "max_distance_to_existing_wet_m": 0.25,
+      "y_max": 805.56,
+      "polygon": [
+        [775.980, 805.150], [775.848, 805.362],
+        [775.530, 805.450], [775.212, 805.362],
+        [775.080, 805.150], [775.212, 804.938],
+        [775.530, 804.850], [775.848, 804.938]
+      ]
+    }
+  ],
+  "add_water_polygons": [],
+  "remove_water_polygons": [],
+  "marked_locations": {
+    "hard_density_edge": {
+      "world": [778.893, 837.156],
+      "review_bbox": [778.60, 779.10, 836.82, 837.38],
+      "action": "point-level SAND-priority complement; do not use a rectangular quota"
+    },
+    "sparse_terrain_fringe": {
+      "world": [777.451, 837.623],
+      "review_bbox": [777.30, 777.75, 837.45, 837.95],
+      "action": "thin only coincident WATER; measured heights do not support blanket lowering or deletion"
+    },
+    "overlap": {
+      "world": [766.084, 821.824],
+      "review_bbox": [765.90, 766.25, 821.65, 822.00],
+      "action": "point-level SAND-priority complement; preserve the plausible approximately 3.3 mm film"
+    },
+    "dense_sand_not_water_holes": [
+      [775.280, 808.873],
+      [772.808, 819.474]
+    ]
+  },
+  "acceptance": {
+    "minimum_dense_spacing_m": 0.002,
+    "minimum_coarse_spacing_m": 0.005,
+    "minimum_combined_wet_occupancy_fraction": 0.99,
+    "minimum_review_addition_occupancy_fraction": 0.98,
+    "maximum_surface_reproduction_error_m": 0.00025,
+    "maximum_noise_abs_p99_m": 0.0055,
+    "maximum_noise_abs_max_m": 0.009,
+    "fine_roughness_median_m": [0.00055, 0.0011],
+    "scalar_quantile_bands": {
+      "scalar_A_R_MeanCurvature_Fine": {
+        "q25": [-8.0, -1.5],
+        "q75": [1.5, 8.0]
+      },
+      "scalar_A_R_CrossCurvature_Fine": {
+        "q25": [-18.0, -3.5],
+        "q75": [3.5, 18.0]
+      }
+    },
+    "no_fixed_25mm_quota_floor": true,
+    "strict_v9_exclusions_retained": true,
+    "canonical_clouds_must_not_change_before_install": true
+  }
+}
