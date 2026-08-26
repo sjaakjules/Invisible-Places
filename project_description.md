@@ -590,6 +590,20 @@ the animation overview.
 
 - Colourise effects retain their palette, phase, colourise-amount, scalar
   field, bounds, fade, and smooth key tracks.
+- Palette sampling adds marker-free transforms: a Loop toggle mirrors the
+  output so the palette's left colour sits at the centre and the ends match,
+  and a keyable Palette Skew (a centre dot plus per-side triangle pairs on a
+  plum histogram row, with the final sampled palette previewed in place)
+  redistributes how the bounds span reads the palette. Preset and saved
+  palettes both fork private `_edited` variants on first edit; originals stay
+  view-only while their variant exists, and delete asks which of the pair to
+  remove. Bounds edge fades are independent per edge, keyable, reach a whole
+  span in either direction, and stay linked until a fade handle is
+  double-clicked apart. Keyed palette-stop properties draw as auto-ranged
+  curves on the shared value graph with every curve style, keyed colours
+  blend in a chosen sRGB, linear-light, or OkLab space while tinting their
+  curve, and each scalar field remembers its own Colourise/Emissive settings
+  unless the feature opts into one global set.
 - Emissive effects have no palette UI. They apply a non-negative, smoothly
   keyable emissive level through a scalar-field bounds/fade mask; bounds and
   fade use the same keyable histogram controls as Colourise effects.

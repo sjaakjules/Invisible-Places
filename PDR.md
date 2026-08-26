@@ -695,6 +695,30 @@ assignments. Project schema 80 adds the optional
 `only_show_water_features_in_runs` scene-state flag; older projects default to
 the unrestricted behaviour.
 
+#### FR-STYLE-18
+Visual Feature palettes shall support per-source private `_edited` variants
+for built-in presets and saved project palettes alike, keyed by source kind
+plus id. While a variant exists its original shall be view-only until the
+variant is deleted; switching between any original or variant shall never
+discard work. Save shall overwrite a saved original from its variant and
+retire the variant; deleting a saved original beside a variant shall ask
+whether the variant goes too. The palette shall additionally offer, without
+moving any colour marker: a Loop toggle that mirrors the sampled output so
+the left colour sits at the centre and the ends match; and a keyable Palette
+Skew (centre plus per-side spreads on a 4^skew power curve) that
+redistributes how the bounds span samples the palette, edited from a
+dedicated histogram row that also previews the final sampled palette. Bounds
+edge fades shall be independent per edge, each keyable and reaching a whole
+span in either direction, with linked-by-default histogram handles that
+double-click to separate and relink. Keyed palette-stop properties shall
+join the shared value graph as one auto-ranged curve per track with the full
+curve-style set; keyed stop colours shall interpolate in an authored sRGB,
+linear-light, or OkLab space and tint their curve with the interpolated
+colour. Colourise and Emissive settings shall follow the selected scalar
+field through a per-field visual memory unless the user opts a feature into
+one global set. Project schema 85 introduces the per-edge fades; the
+remaining state serializes additively with omitted defaults.
+
 ### 5.8 Procedural Motion
 #### FR-MOTION-1
 Dynamic point motion shall be procedural and non-destructive.
