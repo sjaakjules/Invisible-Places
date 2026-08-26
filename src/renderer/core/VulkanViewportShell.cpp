@@ -164,10 +164,15 @@ struct alignas(16) PointCloudStyleGpu {
     // z.
     std::array<glm::uvec4, renderer::pointcloud::kTimingColouriseMaxEffects>
         timingColouriseSources{};
-    // x/y: lower/upper bounds; z: signed edge-fade fraction (positive inward,
-    // negative outward); w: signed emissive/darkening level.
+    // x/y: lower/upper bounds; z: unused since the per-edge fade split
+    // (schema 85) moved fades into timingColouriseFades; w: signed
+    // emissive/darkening level.
     std::array<glm::vec4, renderer::pointcloud::kTimingColouriseMaxEffects>
         timingColouriseRanges{};
+    // x/y: signed lower/upper edge-fade fractions (positive inward,
+    // negative outward, up to a whole span each); z/w: spare.
+    std::array<glm::vec4, renderer::pointcloud::kTimingColouriseMaxEffects>
+        timingColouriseFades{};
     // Effect-major 64-sample RGBA lookup tables. RGB is tint; A is mix only.
     std::array<
         glm::vec4,
@@ -202,10 +207,11 @@ struct alignas(16) PointCloudStyleGpu {
 static_assert(offsetof(PointCloudStyleGpu, timingColouriseControl) == 976U);
 static_assert(offsetof(PointCloudStyleGpu, timingColouriseSources) == 992U);
 static_assert(offsetof(PointCloudStyleGpu, timingColouriseRanges) == 1120U);
-static_assert(offsetof(PointCloudStyleGpu, timingColouriseLut) == 1248U);
+static_assert(offsetof(PointCloudStyleGpu, timingColouriseFades) == 1248U);
+static_assert(offsetof(PointCloudStyleGpu, timingColouriseLut) == 1376U);
 static_assert(
-    offsetof(PointCloudStyleGpu, additionalShorelineCount) == 9440U);
-static_assert(sizeof(PointCloudStyleGpu) == 9968U);
+    offsetof(PointCloudStyleGpu, additionalShorelineCount) == 9568U);
+static_assert(sizeof(PointCloudStyleGpu) == 10096U);
 
 // The surfel/EXR pair has the largest point-cloud stage interface: 20 scalar
 // components plus one flat vec4 per Timing Colourise effect.
@@ -14119,18 +14125,29 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         styleGpu.timingColouriseRanges[packedEffectIndex] = glm::vec4{
             std::isfinite(effect.lowerBound) ? effect.lowerBound : 0.0F,
             std::isfinite(effect.upperBound) ? effect.upperBound : 0.0F,
-            std::clamp(
-                std::isfinite(effect.edgeFadeFraction)
-                    ? effect.edgeFadeFraction
-                    : 0.10F,
-                -0.5F,
-                0.5F),
+            0.0F,
             effect.output ==
                     renderer::pointcloud::TimingColouriseOutput::Emissive
                 ? (std::isfinite(effect.emissiveLevel)
                        ? effect.emissiveLevel
                        : 0.0F)
                 : 0.0F,
+        };
+        styleGpu.timingColouriseFades[packedEffectIndex] = glm::vec4{
+            std::clamp(
+                std::isfinite(effect.edgeFadeLowerFraction)
+                    ? effect.edgeFadeLowerFraction
+                    : 0.10F,
+                -1.0F,
+                1.0F),
+            std::clamp(
+                std::isfinite(effect.edgeFadeUpperFraction)
+                    ? effect.edgeFadeUpperFraction
+                    : 0.10F,
+                -1.0F,
+                1.0F),
+            0.0F,
+            0.0F,
         };
         if (effect.output ==
             renderer::pointcloud::TimingColouriseOutput::Colourise) {

@@ -162,9 +162,18 @@ constexpr std::uint32_t kSceneScopedWaterProjectSchemaVersion = 83U;
 // their states), visual features and water-feature timelines carry an
 // apply-to-water-fill opt-out, and scene groups remember their last take.
 constexpr std::uint32_t kSceneScopedTimingTakesProjectSchemaVersion = 84U;
+// Schema 85: Visual Feature bounds carry independent lower/upper edge fades
+// ("edge_fade_lower"/"edge_fade_upper" beside the legacy mean, and split
+// bounds-parameter key lanes). Migration is presence-based: a document with
+// only "edge_fade" loads it into both edges and sanitize splits legacy
+// shared-fade keys, so no version gate is needed.
+constexpr std::uint32_t kSplitEdgeFadeProjectSchemaVersion = 85U;
 static_assert(
     kProjectDocumentSchemaVersion >=
     kSceneScopedTimingTakesProjectSchemaVersion);
+static_assert(
+    kProjectDocumentSchemaVersion >=
+    kSplitEdgeFadeProjectSchemaVersion);
 static_assert(
     kProjectDocumentSchemaVersion >=
     kSmoothVelocityProjectSchemaVersion);
@@ -4752,7 +4761,18 @@ json SerializeTimingColouriseBounds(
     return {
         {"lower", sanitized.lower},
         {"upper", sanitized.upper},
-        {"edge_fade", sanitized.edgeFade},
+        // Schema 85 splits the edge fade per edge. The legacy shared key is
+        // still written (mean, clamped to its historical range) so pre-85
+        // readers keep a sensible symmetric fade.
+        {"edge_fade",
+         std::clamp(
+             std::midpoint(
+                 sanitized.edgeFadeLower,
+                 sanitized.edgeFadeUpper),
+             -0.5F,
+             0.5F)},
+        {"edge_fade_lower", sanitized.edgeFadeLower},
+        {"edge_fade_upper", sanitized.edgeFadeUpper},
     };
 }
 
@@ -4761,7 +4781,12 @@ ParseTimingColouriseBounds(const json& boundsJson) {
     invisible_places::timing::TimingColouriseBounds bounds;
     bounds.lower = boundsJson.value("lower", bounds.lower);
     bounds.upper = boundsJson.value("upper", bounds.upper);
-    bounds.edgeFade = boundsJson.value("edge_fade", bounds.edgeFade);
+    // Pre-85 documents carry one shared fade; load it into both edges.
+    const float legacyEdgeFade = boundsJson.value("edge_fade", 0.10F);
+    bounds.edgeFadeLower =
+        boundsJson.value("edge_fade_lower", legacyEdgeFade);
+    bounds.edgeFadeUpper =
+        boundsJson.value("edge_fade_upper", legacyEdgeFade);
     return invisible_places::timing::SanitizeTimingColouriseBounds(bounds);
 }
 
@@ -4912,6 +4937,10 @@ std::string TimingColouriseBoundsParameterName(
             return "spread";
         case TimingColouriseBoundsParameter::EdgeFade:
             return "edge_fade";
+        case TimingColouriseBoundsParameter::EdgeFadeLower:
+            return "edge_fade_lower";
+        case TimingColouriseBoundsParameter::EdgeFadeUpper:
+            return "edge_fade_upper";
     }
     return "lower";
 }
@@ -4936,7 +4965,14 @@ ParseTimingColouriseBoundsParameter(const json& parameterJson) {
         return TimingColouriseBoundsParameter::Spread;
     }
     if (name == "edge_fade") {
+        // Legacy shared-fade keys; sanitize splits them per edge on load.
         return TimingColouriseBoundsParameter::EdgeFade;
+    }
+    if (name == "edge_fade_lower") {
+        return TimingColouriseBoundsParameter::EdgeFadeLower;
+    }
+    if (name == "edge_fade_upper") {
+        return TimingColouriseBoundsParameter::EdgeFadeUpper;
     }
     return std::nullopt;
 }
@@ -5180,6 +5216,9 @@ json SerializeTimingColouriseEffect(
                      {"adopted_global_revision",
                       memory.adoptedGlobalRevision},
                  });
+                 if (!memory.edgeFadesLinked) {
+                     memoryJson.back()["edge_fades_linked"] = false;
+                 }
              }
              return memoryJson;
          }()},
@@ -5188,6 +5227,10 @@ json SerializeTimingColouriseEffect(
     // so untouched documents stay byte-identical.
     if (!sanitized.applyToWaterFill) {
         effectJson["apply_to_water_fill"] = false;
+    }
+    // Linked fade handles are the norm; only the split is written.
+    if (!sanitized.edgeFadesLinked) {
+        effectJson["edge_fades_linked"] = false;
     }
     // Loop Palette is written only when engaged so untouched documents stay
     // byte-identical; older readers drop the key harmlessly.
@@ -5502,6 +5545,8 @@ ParseTimingColouriseEffect(
     }
     effect.boundsEdited =
         effectJson.value("bounds_edited", effect.boundsEdited);
+    effect.edgeFadesLinked =
+        effectJson.value("edge_fades_linked", true);
     effect.boundsAdoptedGlobalRevision = effectJson.value(
         "bounds_adopted_global_revision",
         effect.boundsAdoptedGlobalRevision);
@@ -5542,6 +5587,8 @@ ParseTimingColouriseEffect(
                     memoryJson.at("bounds_keys"));
             }
             memory.edited = memoryJson.value("edited", memory.edited);
+            memory.edgeFadesLinked =
+                memoryJson.value("edge_fades_linked", true);
             memory.adoptedGlobalRevision = memoryJson.value(
                 "adopted_global_revision",
                 memory.adoptedGlobalRevision);

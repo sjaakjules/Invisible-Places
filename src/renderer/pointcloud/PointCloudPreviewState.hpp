@@ -48,8 +48,10 @@ struct ResolvedTimingColouriseEffect {
     float lowerBound = 0.0F;
     float upperBound = 1.0F;
     // Signed fraction of the selected [lower, upper] span used by each edge
-    // fade. Positive values fade inward and negative values fade outward.
-    float edgeFadeFraction = 0.10F;
+    // fade, independently per edge. Positive values fade inward and negative
+    // values fade outward.
+    float edgeFadeLowerFraction = 0.10F;
+    float edgeFadeUpperFraction = 0.10F;
     // A signed scalar applied after the field bounds/fade mask. Positive
     // values add emission; negative values darken point colour, with -1 fully
     // dark at full mask. Colourise effects ignore this value.

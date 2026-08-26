@@ -164,7 +164,7 @@ RenderSetupDocument MakeRenderSetup() {
     };
     effect.boundsKeys.push_back(TimingColouriseBoundsKey{
         .position = 0.8F,
-        .bounds = {.lower = -0.1F, .upper = 0.2F, .edgeFade = 0.1F},
+        .bounds = {.lower = -0.1F, .upper = 0.2F, .edgeFadeLower = 0.1F, .edgeFadeUpper = 0.1F},
     });
     document.timingState.takeId = document.timingTakeId;
     document.timingState.sceneGroupName = document.sceneGroupName;
@@ -391,7 +391,24 @@ TEST_CASE(
     CHECK(effect.paletteKeys.size() == 1U);
     CHECK(effect.paletteStopParameterKeys.size() == 3U);
     CHECK(effect.effectParameterKeys.size() == 2U);
-    CHECK(effect.boundsParameterKeys.size() == 3U);
+    // The authored legacy shared EdgeFade key splits into per-edge lower
+    // and upper fade keys on load.
+    CHECK(effect.boundsParameterKeys.size() == 4U);
+    CHECK(
+        std::count_if(
+            effect.boundsParameterKeys.begin(),
+            effect.boundsParameterKeys.end(),
+            [](const auto& key) {
+                return (key.parameter ==
+                            invisible_places::timing::
+                                TimingColouriseBoundsParameter::
+                                    EdgeFadeLower ||
+                        key.parameter ==
+                            invisible_places::timing::
+                                TimingColouriseBoundsParameter::
+                                    EdgeFadeUpper) &&
+                       key.value == Approx(0.2F);
+            }) == 2);
     CHECK(effect.boundsKeys.size() == 1U);
     CHECK(loaded->timingState.colouriseEffects[1].boundsKeyMode ==
           invisible_places::timing::TimingColouriseBoundsKeyMode::CentreSpread);

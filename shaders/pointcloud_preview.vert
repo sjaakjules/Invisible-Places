@@ -100,6 +100,7 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     uvec4 timingColouriseControl;
     uvec4 timingColouriseSources[8];
     vec4 timingColouriseRanges[8];
+    vec4 timingColouriseFades[8];
     vec4 timingColouriseLut[512];
     uvec4 additionalShorelineCount;
     uvec4 additionalShorelineControl[4];

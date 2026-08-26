@@ -4755,34 +4755,40 @@ TEST_CASE(
 TEST_CASE(
     "Timing Colourise signed edge fade works inward and outward",
     "[timing][colourise][bounds]") {
-    CHECK(TimingColouriseBounds{}.edgeFade == Approx(0.10F));
+    CHECK(TimingColouriseBounds{}.edgeFadeLower == Approx(0.10F));
+    CHECK(TimingColouriseBounds{}.edgeFadeUpper == Approx(0.10F));
+    // Each edge clamps independently to the whole-span [-1, 1] range.
     CHECK(
         invisible_places::timing::SanitizeTimingColouriseBounds(
-            {.edgeFade = -0.75F})
-            .edgeFade == Approx(-0.5F));
+            {.edgeFadeLower = -1.5F, .edgeFadeUpper = 0.75F})
+            .edgeFadeLower == Approx(-1.0F));
     CHECK(
         invisible_places::timing::SanitizeTimingColouriseBounds(
-            {.edgeFade = 0.75F})
-            .edgeFade == Approx(0.5F));
+            {.edgeFadeLower = -1.5F, .edgeFadeUpper = 0.75F})
+            .edgeFadeUpper == Approx(0.75F));
     CHECK(
         invisible_places::timing::SanitizeTimingColouriseBounds(
-            {.edgeFade = 0.0F})
-            .edgeFade == Approx(0.0F));
+            {.edgeFadeLower = 1.5F, .edgeFadeUpper = 1.5F})
+            .edgeFadeLower == Approx(1.0F));
     CHECK(
         invisible_places::timing::SanitizeTimingColouriseBounds(
-            {.edgeFade = std::numeric_limits<float>::quiet_NaN()})
-            .edgeFade == Approx(0.10F));
+            {.edgeFadeLower = 0.0F, .edgeFadeUpper = 0.0F})
+            .edgeFadeLower == Approx(0.0F));
+    CHECK(
+        invisible_places::timing::SanitizeTimingColouriseBounds(
+            {.edgeFadeLower = std::numeric_limits<float>::quiet_NaN(), .edgeFadeUpper = std::numeric_limits<float>::quiet_NaN()})
+            .edgeFadeLower == Approx(0.10F));
 
     TimingColouriseEffect effect;
     invisible_places::timing::AddOrUpdateTimingColouriseBoundsKey(
         &effect,
         0.0F,
-        {.lower = 10.0F, .upper = 20.0F, .edgeFade = 0.1F},
+        {.lower = 10.0F, .upper = 20.0F, .edgeFadeLower = 0.1F, .edgeFadeUpper = 0.1F},
         WaterScenarioInterpolation::Linear);
     invisible_places::timing::AddOrUpdateTimingColouriseBoundsKey(
         &effect,
         1.0F,
-        {.lower = 20.0F, .upper = 40.0F, .edgeFade = 0.3F});
+        {.lower = 20.0F, .upper = 40.0F, .edgeFadeLower = 0.3F, .edgeFadeUpper = 0.3F});
 
     auto bounds =
         invisible_places::timing::EvaluateTimingColouriseBounds(
@@ -4790,7 +4796,7 @@ TEST_CASE(
             0.5F);
     CHECK(bounds.lower == Approx(15.0F));
     CHECK(bounds.upper == Approx(30.0F));
-    CHECK(bounds.edgeFade == Approx(0.2F));
+    CHECK(bounds.edgeFadeLower == Approx(0.2F));
     CHECK(
         invisible_places::timing::TimingColouriseBoundsMask(bounds, 14.9F) ==
         Approx(0.0F));
@@ -4805,10 +4811,11 @@ TEST_CASE(
         Approx(1.0F));
     CHECK(
         invisible_places::timing::TimingColouriseBoundsMask(
-            {.lower = 1.0F, .upper = 1.0F, .edgeFade = 0.0F},
+            {.lower = 1.0F, .upper = 1.0F, .edgeFadeLower = 0.0F, .edgeFadeUpper = 0.0F},
             1.0F) == Approx(0.0F));
 
-    bounds.edgeFade = -0.2F;
+    bounds.edgeFadeLower = -0.2F;
+    bounds.edgeFadeUpper = -0.2F;
     CHECK(
         invisible_places::timing::TimingColouriseBoundsMask(bounds, 11.9F) ==
         Approx(0.0F));
@@ -4832,6 +4839,31 @@ TEST_CASE(
         Approx(0.0F));
     CHECK(
         invisible_places::timing::TimingColouriseBoundsMask(bounds, 33.1F) ==
+        Approx(0.0F));
+
+    // Mixed per-edge fades act independently: the lower edge fades inward
+    // across half the span while the upper edge fades outward, and each
+    // side's midpoint still reads exactly one half.
+    const TimingColouriseBounds mixed{
+        .lower = 10.0F,
+        .upper = 20.0F,
+        .edgeFadeLower = 0.5F,
+        .edgeFadeUpper = -0.2F,
+    };
+    CHECK(
+        invisible_places::timing::TimingColouriseBoundsMask(mixed, 9.9F) ==
+        Approx(0.0F));
+    CHECK(
+        invisible_places::timing::TimingColouriseBoundsMask(mixed, 12.5F) ==
+        Approx(0.5F));
+    CHECK(
+        invisible_places::timing::TimingColouriseBoundsMask(mixed, 15.5F) ==
+        Approx(1.0F));
+    CHECK(
+        invisible_places::timing::TimingColouriseBoundsMask(mixed, 21.0F) ==
+        Approx(0.5F));
+    CHECK(
+        invisible_places::timing::TimingColouriseBoundsMask(mixed, 22.1F) ==
         Approx(0.0F));
 }
 
@@ -4973,7 +5005,7 @@ TEST_CASE(
     effect.baseBounds = {
         .lower = 10.0F,
         .upper = 20.0F,
-        .edgeFade = 0.1F};
+        .edgeFadeLower = 0.1F, .edgeFadeUpper = 0.1F};
 
     SECTION("Lower and Upper") {
         CHECK(
@@ -5012,7 +5044,7 @@ TEST_CASE(
                 0.5F);
         CHECK(halfway.lower == Approx(5.0F));
         CHECK(halfway.upper == Approx(30.0F));
-        CHECK(halfway.edgeFade == Approx(0.1F));
+        CHECK(halfway.edgeFadeLower == Approx(0.1F));
     }
 
     SECTION("Crossing endpoints collapse without exchanging identities") {
@@ -5077,7 +5109,7 @@ TEST_CASE(
             invisible_places::timing::
                 AddOrUpdateTimingColouriseBoundsParameterKey(
                     &effect,
-                    TimingColouriseBoundsParameter::EdgeFade,
+                    TimingColouriseBoundsParameter::EdgeFadeLower,
                     0.5F,
                     0.75F));
 
@@ -5087,7 +5119,9 @@ TEST_CASE(
                 0.5F);
         CHECK(halfway.lower == Approx(17.0F));
         CHECK(halfway.upper == Approx(23.0F));
-        CHECK(halfway.edgeFade == Approx(0.5F));
+        // The keyed lower fade never disturbs the independent upper fade.
+        CHECK(halfway.edgeFadeLower == Approx(0.75F));
+        CHECK(halfway.edgeFadeUpper == Approx(0.10F));
         CHECK_FALSE(
             invisible_places::timing::SetTimingColouriseBoundsKeyMode(
                 &effect,
@@ -5234,7 +5268,7 @@ TEST_CASE(
     const TimingColouriseBounds current{
         .lower = 2.0F,
         .upper = 6.0F,
-        .edgeFade = 0.2F};
+        .edgeFadeLower = 0.2F, .edgeFadeUpper = 0.2F};
     const auto resolve =
         [&](TimingColouriseBoundsKeyMode mode,
             TimingColouriseBoundsHandle handle,
@@ -5249,7 +5283,7 @@ TEST_CASE(
                         0.0F,
                         10.0F);
             REQUIRE(edit.has_value());
-            CHECK(edit->bounds.edgeFade == Approx(0.2F));
+            CHECK(edit->bounds.edgeFadeLower == Approx(0.2F));
             return edit.value();
         };
 
@@ -5516,7 +5550,7 @@ TEST_CASE(
         invisible_places::timing::
             AddOrUpdateTimingColouriseBoundsParameterKey(
                 &effect,
-                TimingColouriseBoundsParameter::EdgeFade,
+                TimingColouriseBoundsParameter::EdgeFadeLower,
                 0.2F,
                 0.1F));
     REQUIRE(
@@ -5557,7 +5591,7 @@ TEST_CASE(
         invisible_places::timing::
             TimingColouriseBoundsParameterKeyCountAtPosition(
                 effect,
-                TimingColouriseBoundsParameter::EdgeFade,
+                TimingColouriseBoundsParameter::EdgeFadeLower,
                 0.2F) == 1U);
 
     REQUIRE(
@@ -5583,14 +5617,14 @@ TEST_CASE(
         invisible_places::timing::
             MoveTimingColouriseBoundsParameterKey(
                 &effect,
-                TimingColouriseBoundsParameter::EdgeFade,
+                TimingColouriseBoundsParameter::EdgeFadeLower,
                 0.2F,
                 0.3F));
     CHECK(
         invisible_places::timing::
             TimingColouriseBoundsParameterKeyCountAtPosition(
                 effect,
-                TimingColouriseBoundsParameter::EdgeFade,
+                TimingColouriseBoundsParameter::EdgeFadeLower,
                 0.3F) == 1U);
     CHECK(
         invisible_places::timing::
@@ -5634,12 +5668,12 @@ TEST_CASE(
     invisible_places::timing::AddOrUpdateTimingColouriseBoundsKey(
         &effect,
         0.0F,
-        {.lower = 0.0F, .upper = 10.0F, .edgeFade = 0.1F},
+        {.lower = 0.0F, .upper = 10.0F, .edgeFadeLower = 0.1F, .edgeFadeUpper = 0.1F},
         WaterScenarioInterpolation::Linear);
     invisible_places::timing::AddOrUpdateTimingColouriseBoundsKey(
         &effect,
         1.0F,
-        {.lower = 10.0F, .upper = 30.0F, .edgeFade = 0.3F});
+        {.lower = 10.0F, .upper = 30.0F, .edgeFadeLower = 0.3F, .edgeFadeUpper = 0.3F});
     REQUIRE(
         invisible_places::timing::
             AddOrUpdateTimingColouriseBoundsParameterKey(
@@ -5665,10 +5699,10 @@ TEST_CASE(
             1.0F);
     CHECK(start.lower == Approx(0.0F));
     CHECK(start.upper == Approx(10.0F));
-    CHECK(start.edgeFade == Approx(0.1F));
+    CHECK(start.edgeFadeLower == Approx(0.1F));
     CHECK(end.lower == Approx(10.0F));
     CHECK(end.upper == Approx(30.0F));
-    CHECK(end.edgeFade == Approx(0.3F));
+    CHECK(end.edgeFadeLower == Approx(0.3F));
     CHECK(
         invisible_places::timing::
             PreviousTimingColouriseBoundsKeyPosition(effect, 0.5F) ==
@@ -5726,11 +5760,11 @@ TEST_CASE(
     invisible_places::timing::AddOrUpdateTimingColouriseBoundsKey(
         &effect,
         0.5F,
-        {.lower = 0.1F, .upper = 0.9F, .edgeFade = 0.1F});
+        {.lower = 0.1F, .upper = 0.9F, .edgeFadeLower = 0.1F, .edgeFadeUpper = 0.1F});
     invisible_places::timing::AddOrUpdateTimingColouriseBoundsKey(
         &effect,
         0.80005F,
-        {.lower = 0.2F, .upper = 0.8F, .edgeFade = 0.2F});
+        {.lower = 0.2F, .upper = 0.8F, .edgeFadeLower = 0.2F, .edgeFadeUpper = 0.2F});
 
     CHECK(
         invisible_places::timing::
@@ -6005,7 +6039,7 @@ TEST_CASE(
     effect.name = "Roughness";
     effect.activationRange = {.start = 0.2F, .end = 0.85F};
     effect.field.scalarFieldName = "SurfaceRoughness-Sml";
-    effect.baseBounds = {.lower = -2.0F, .upper = 4.0F, .edgeFade = 0.2F};
+    effect.baseBounds = {.lower = -2.0F, .upper = 4.0F, .edgeFadeLower = 0.2F, .edgeFadeUpper = 0.2F};
     effect.boundsKeyMode =
         invisible_places::timing::
             TimingColouriseBoundsKeyMode::CentreSpread;
@@ -6016,7 +6050,7 @@ TEST_CASE(
     invisible_places::timing::AddOrUpdateTimingColouriseBoundsKey(
         &effect,
         0.75F,
-        {.lower = -1.0F, .upper = 2.0F, .edgeFade = 0.1F});
+        {.lower = -1.0F, .upper = 2.0F, .edgeFadeLower = 0.1F, .edgeFadeUpper = 0.1F});
     REQUIRE(
         invisible_places::timing::
             AddOrUpdateTimingColouriseBoundsParameterKey(
@@ -6038,7 +6072,7 @@ TEST_CASE(
             AddOrUpdateTimingColouriseBoundsParameterKey(
                 &effect,
                 invisible_places::timing::
-                    TimingColouriseBoundsParameter::EdgeFade,
+                    TimingColouriseBoundsParameter::EdgeFadeLower,
                 0.5F,
                 0.15F));
     state.colouriseEffects.push_back(effect);
@@ -6272,7 +6306,7 @@ TEST_CASE(
     boundsEmissive.baseBounds = {
         .lower = 0.0F,
         .upper = 0.9F,
-        .edgeFade = 0.1F,
+        .edgeFadeLower = 0.1F, .edgeFadeUpper = 0.1F,
     };
     state.colouriseEffects.push_back(boundsEmissive);
 
@@ -6616,7 +6650,7 @@ TEST_CASE(
     effect.fieldBoundsMemory.push_back(TimingColouriseFieldBoundsMemory{
         .selector = {.source = TimingColouriseFieldSource::Scalar,
                      .scalarFieldName = "Heat"},
-        .bounds = {.lower = 0.15F, .upper = 0.85F, .edgeFade = 0.05F},
+        .bounds = {.lower = 0.15F, .upper = 0.85F, .edgeFadeLower = 0.05F, .edgeFadeUpper = 0.05F},
         .boundsKeyMode = TimingColouriseBoundsKeyMode::CentreSpread,
         .boundsParameterKeys = {{.parameter =
                                      TimingColouriseBoundsParameter::Centre,
@@ -6625,7 +6659,7 @@ TEST_CASE(
         .boundsKeys = {{.position = 0.25F,
                         .bounds = {.lower = 0.2F,
                                    .upper = 0.6F,
-                                   .edgeFade = 0.1F}}},
+                                   .edgeFadeLower = 0.1F, .edgeFadeUpper = 0.1F}}},
         .edited = true,
         .adoptedGlobalRevision = 3U,
     });
@@ -6738,7 +6772,7 @@ TEST_CASE(
     CHECK(loadedMemory.selector.scalarFieldName == "Heat");
     CHECK(loadedMemory.bounds.lower == Approx(0.15F));
     CHECK(loadedMemory.bounds.upper == Approx(0.85F));
-    CHECK(loadedMemory.bounds.edgeFade == Approx(0.05F));
+    CHECK(loadedMemory.bounds.edgeFadeLower == Approx(0.05F));
     CHECK(loadedMemory.boundsKeyMode ==
           TimingColouriseBoundsKeyMode::CentreSpread);
     REQUIRE(loadedMemory.boundsParameterKeys.size() == 1U);
@@ -6761,7 +6795,7 @@ TEST_CASE(
 
     TimingColouriseEffect effect;
     effect.field.scalarFieldName = "SurfaceRoughness";
-    effect.baseBounds = {.lower = -2.0F, .upper = 4.0F, .edgeFade = 0.2F};
+    effect.baseBounds = {.lower = -2.0F, .upper = 4.0F, .edgeFadeLower = 0.2F, .edgeFadeUpper = 0.2F};
     effect.boundsKeyMode = TimingColouriseBoundsKeyMode::CentreSpread;
     effect.boundsParameterKeys = {
         {.parameter = TimingColouriseBoundsParameter::Centre,
@@ -6770,7 +6804,7 @@ TEST_CASE(
     };
     effect.boundsKeys = {
         {.position = 0.75F,
-         .bounds = {.lower = -1.0F, .upper = 2.0F, .edgeFade = 0.1F}},
+         .bounds = {.lower = -1.0F, .upper = 2.0F, .edgeFadeLower = 0.1F, .edgeFadeUpper = 0.1F}},
     };
     effect.boundsEdited = true;
     effect.boundsAdoptedGlobalRevision = 2U;
@@ -6782,7 +6816,7 @@ TEST_CASE(
     const TimingColouriseBounds fallback{
         .lower = 0.0F,
         .upper = 10.0F,
-        .edgeFade = 0.1F,
+        .edgeFadeLower = 0.1F, .edgeFadeUpper = 0.1F,
     };
     invisible_places::timing::ApplyTimingColouriseFieldSelection(
         &effect,
@@ -6818,7 +6852,7 @@ TEST_CASE(
         .source = TimingColouriseFieldSource::Scalar,
         .scalarFieldName = "Moss",
     };
-    store.globalBounds = {.lower = 0.3F, .upper = 0.7F, .edgeFade = 0.15F};
+    store.globalBounds = {.lower = 0.3F, .upper = 0.7F, .edgeFadeLower = 0.15F, .edgeFadeUpper = 0.15F};
     store.revision = 5U;
     invisible_places::timing::ApplyTimingColouriseFieldSelection(
         &effect,
@@ -6844,7 +6878,7 @@ TEST_CASE(
     CHECK(effect.field.scalarFieldName == "SurfaceRoughness");
     CHECK(effect.baseBounds.lower == Approx(-2.0F));
     CHECK(effect.baseBounds.upper == Approx(4.0F));
-    CHECK(effect.baseBounds.edgeFade == Approx(0.2F));
+    CHECK(effect.baseBounds.edgeFadeLower == Approx(0.2F));
     CHECK(effect.boundsKeyMode ==
           TimingColouriseBoundsKeyMode::CentreSpread);
     REQUIRE(effect.boundsParameterKeys.size() == 1U);
@@ -6867,7 +6901,7 @@ TEST_CASE(
     std::vector<TimingScalarBoundsStore> stores;
     TimingColouriseEffect editor;
     editor.field.scalarFieldName = "Heat";
-    editor.baseBounds = {.lower = 0.1F, .upper = 0.9F, .edgeFade = 0.1F};
+    editor.baseBounds = {.lower = 0.1F, .upper = 0.9F, .edgeFadeLower = 0.1F, .edgeFadeUpper = 0.1F};
     TimingColouriseEffect follower;
     follower.field.scalarFieldName = "Heat";
     TimingColouriseEffect otherField;
@@ -6901,7 +6935,7 @@ TEST_CASE(
             &otherField,
             stores));
 
-    editor.baseBounds = {.lower = 0.2F, .upper = 0.6F, .edgeFade = 0.1F};
+    editor.baseBounds = {.lower = 0.2F, .upper = 0.6F, .edgeFadeLower = 0.1F, .edgeFadeUpper = 0.1F};
     invisible_places::timing::RecordTimingScalarBoundsEdit(
         &stores,
         &editor);
@@ -6914,7 +6948,7 @@ TEST_CASE(
 
     // A locally edited feature stays detached from later Global edits.
     follower.boundsEdited = true;
-    editor.baseBounds = {.lower = 0.05F, .upper = 0.4F, .edgeFade = 0.1F};
+    editor.baseBounds = {.lower = 0.05F, .upper = 0.4F, .edgeFadeLower = 0.1F, .edgeFadeUpper = 0.1F};
     invisible_places::timing::RecordTimingScalarBoundsEdit(
         &stores,
         &editor);

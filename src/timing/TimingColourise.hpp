@@ -118,9 +118,12 @@ using TimingColouriseLut =
 struct TimingColouriseBounds {
     float lower = 0.0F;
     float upper = 1.0F;
-    // Signed fraction of the selected span faded at each edge, in [-0.5,
-    // 0.5]. Positive values fade inward; negative values fade outward.
-    float edgeFade = 0.10F;
+    // Signed fraction of the selected span faded at each edge, in [-1, 1].
+    // Positive values fade inward; negative values fade outward. The two
+    // edges are independent; the editor links them by default and documents
+    // authored before the split load the shared legacy value into both.
+    float edgeFadeLower = 0.10F;
+    float edgeFadeUpper = 0.10F;
 };
 
 // An effect chooses exactly one bounds parameterisation. This makes the two
@@ -138,7 +141,12 @@ enum class TimingColouriseBoundsParameter : std::uint8_t {
     Upper,
     Centre,
     Spread,
+    // Legacy shared fade lane. Documents may still carry keys for it;
+    // sanitize splits each one into the two per-edge tracks below, so no
+    // runtime track ever holds this parameter.
     EdgeFade,
+    EdgeFadeLower,
+    EdgeFadeUpper,
 };
 
 enum class TimingColouriseBoundsHandle : std::uint8_t {
@@ -237,6 +245,7 @@ struct TimingColouriseFieldBoundsMemory {
     std::vector<TimingColouriseBoundsParameterKey> boundsParameterKeys;
     std::vector<TimingColouriseBoundsKey> boundsKeys;
     bool edited = false;
+    bool edgeFadesLinked = true;
     // Global-store revision this entry last adopted; unedited entries with
     // an older revision refresh from the shared store.
     std::uint64_t adoptedGlobalRevision = 0U;
@@ -340,6 +349,11 @@ struct TimingColouriseEffect {
     // Whether the live bounds above were locally edited for the current
     // field selector (detaching them from the shared Global bounds).
     bool boundsEdited = false;
+    // While linked (the default) the histogram fade handles and the fade
+    // editors write both per-edge tracks together; double-clicking a fade
+    // handle separates them. Purely an authoring convenience: evaluation
+    // always reads the two tracks independently.
+    bool edgeFadesLinked = true;
     std::uint64_t boundsAdoptedGlobalRevision = 0U;
     // Per-selector authoring memory for every field this feature visited.
     std::vector<TimingColouriseFieldBoundsMemory> fieldBoundsMemory;

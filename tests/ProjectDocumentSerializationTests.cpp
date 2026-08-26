@@ -909,21 +909,21 @@ TEST_CASE("Timing scalar bounds stores and named profiles round-trip",
   TimingScalarBoundsStore store;
   store.selector.source = TimingColouriseFieldSource::Scalar;
   store.selector.scalarFieldName = "Heat";
-  store.globalBounds = {.lower = 0.2F, .upper = 0.8F, .edgeFade = 0.15F};
+  store.globalBounds = {.lower = 0.2F, .upper = 0.8F, .edgeFadeLower = 0.15F, .edgeFadeUpper = 0.15F};
   store.revision = 3U;
   store.profiles = {
       TimingScalarBoundsProfile{
           .name = "Wet season",
-          .bounds = {.lower = 0.1F, .upper = 0.5F, .edgeFade = 0.05F},
+          .bounds = {.lower = 0.1F, .upper = 0.5F, .edgeFadeLower = 0.05F, .edgeFadeUpper = 0.05F},
       },
       // Nameless entries are tolerated on disk but dropped on load.
       TimingScalarBoundsProfile{
           .name = "",
-          .bounds = {.lower = 0.0F, .upper = 1.0F, .edgeFade = 0.1F},
+          .bounds = {.lower = 0.0F, .upper = 1.0F, .edgeFadeLower = 0.1F, .edgeFadeUpper = 0.1F},
       },
       TimingScalarBoundsProfile{
           .name = "Dry season",
-          .bounds = {.lower = 0.4F, .upper = 0.9F, .edgeFade = 0.2F},
+          .bounds = {.lower = 0.4F, .upper = 0.9F, .edgeFadeLower = 0.2F, .edgeFadeUpper = 0.2F},
       },
   };
   document.timingScalarBoundsStores.push_back(store);
@@ -961,13 +961,13 @@ TEST_CASE("Timing scalar bounds stores and named profiles round-trip",
   CHECK(loadedStore.selector.scalarFieldName == "Heat");
   CHECK(loadedStore.globalBounds.lower == Catch::Approx(0.2F));
   CHECK(loadedStore.globalBounds.upper == Catch::Approx(0.8F));
-  CHECK(loadedStore.globalBounds.edgeFade == Catch::Approx(0.15F));
+  CHECK(loadedStore.globalBounds.edgeFadeLower == Catch::Approx(0.15F));
   CHECK(loadedStore.revision == 3U);
   REQUIRE(loadedStore.profiles.size() == 2U);
   CHECK(loadedStore.profiles[0].name == "Wet season");
   CHECK(loadedStore.profiles[0].bounds.lower == Catch::Approx(0.1F));
   CHECK(loadedStore.profiles[0].bounds.upper == Catch::Approx(0.5F));
-  CHECK(loadedStore.profiles[0].bounds.edgeFade == Catch::Approx(0.05F));
+  CHECK(loadedStore.profiles[0].bounds.edgeFadeLower == Catch::Approx(0.05F));
   CHECK(loadedStore.profiles[1].name == "Dry season");
   CHECK(loadedStore.profiles[1].bounds.upper == Catch::Approx(0.9F));
 }
@@ -4554,6 +4554,107 @@ TEST_CASE("Palette skew base values and keys round-trip",
         Catch::Approx(0.25));
   CHECK(stateJson["timing_effects"][1]["effect_parameter_keys"][0]
                  ["parameter"] == "palette_skew_centre");
+}
+
+TEST_CASE("Per-edge fades round-trip and legacy shared fades split",
+          "[project][serialization][timing][colourise][bounds][migration]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::timing::TimingColouriseBoundsParameter;
+  using invisible_places::timing::TimingColouriseEffect;
+  using invisible_places::timing::TimingTakeSceneState;
+
+  ProjectDocument document;
+  document.projectName = "per-edge-fades";
+  TimingTakeSceneState state;
+  TimingColouriseEffect effect;
+  effect.id = "effect-1";
+  effect.name = "Asymmetric";
+  effect.baseBounds = {
+      .lower = -1.0F,
+      .upper = 3.0F,
+      .edgeFadeLower = 0.8F,
+      .edgeFadeUpper = -0.6F,
+  };
+  effect.edgeFadesLinked = false;
+  REQUIRE(invisible_places::timing::
+              AddOrUpdateTimingColouriseBoundsParameterKey(
+                  &effect,
+                  TimingColouriseBoundsParameter::EdgeFadeLower,
+                  0.5F,
+                  0.9F));
+  state.colouriseEffects = {effect};
+  document.timingTakeStates = {state};
+
+  TemporaryProjectFile file{"invisible_places_per_edge_fades.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->timingTakeStates.size() == 1U);
+  const auto& loadedEffect =
+      loaded->timingTakeStates[0].colouriseEffects.at(0);
+  CHECK(loadedEffect.baseBounds.edgeFadeLower == Catch::Approx(0.8F));
+  CHECK(loadedEffect.baseBounds.edgeFadeUpper == Catch::Approx(-0.6F));
+  CHECK_FALSE(loadedEffect.edgeFadesLinked);
+  REQUIRE(loadedEffect.boundsParameterKeys.size() == 1U);
+  CHECK(loadedEffect.boundsParameterKeys[0].parameter ==
+        TimingColouriseBoundsParameter::EdgeFadeLower);
+  CHECK(loadedEffect.boundsParameterKeys[0].value == Catch::Approx(0.9F));
+
+  // The document carries the split values plus a clamped legacy mean for
+  // pre-85 readers.
+  std::ifstream savedInput{file.path};
+  REQUIRE(savedInput.is_open());
+  const auto savedJson = nlohmann::json::parse(savedInput);
+  savedInput.close();
+  const auto& boundsJson =
+      savedJson["timing_take_states"][0]["timing_effects"][0]
+               ["base_bounds"];
+  CHECK(boundsJson["edge_fade_lower"] == Catch::Approx(0.8));
+  CHECK(boundsJson["edge_fade_upper"] == Catch::Approx(-0.6));
+  CHECK(boundsJson["edge_fade"] == Catch::Approx(0.1));
+
+  // A pre-85 document with only the shared fade loads it into both edges,
+  // and a shared-fade parameter key splits into the two per-edge tracks.
+  auto legacyJson = savedJson;
+  auto& legacyEffect =
+      legacyJson["timing_take_states"][0]["timing_effects"][0];
+  legacyEffect["base_bounds"] = {
+      {"lower", -1.0F},
+      {"upper", 3.0F},
+      {"edge_fade", 0.25F},
+  };
+  legacyEffect["bounds_parameter_keys"] = nlohmann::json::array({
+      {{"parameter", "edge_fade"},
+       {"position", 0.5F},
+       {"value", 0.2F},
+       {"interpolation", "linear"}},
+  });
+  legacyEffect.erase("edge_fades_linked");
+  legacyJson["schema_version"] = 84U;
+  {
+    std::ofstream legacyOutput{file.path};
+    REQUIRE(legacyOutput.is_open());
+    legacyOutput << legacyJson.dump(2);
+  }
+  const auto legacyLoaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(legacyLoaded.has_value());
+  const auto& migrated =
+      legacyLoaded->timingTakeStates[0].colouriseEffects.at(0);
+  CHECK(migrated.baseBounds.edgeFadeLower == Catch::Approx(0.25F));
+  CHECK(migrated.baseBounds.edgeFadeUpper == Catch::Approx(0.25F));
+  CHECK(migrated.edgeFadesLinked);
+  REQUIRE(migrated.boundsParameterKeys.size() == 2U);
+  CHECK(migrated.boundsParameterKeys[0].parameter ==
+        TimingColouriseBoundsParameter::EdgeFadeLower);
+  CHECK(migrated.boundsParameterKeys[1].parameter ==
+        TimingColouriseBoundsParameter::EdgeFadeUpper);
+  CHECK(migrated.boundsParameterKeys[0].value == Catch::Approx(0.2F));
+  CHECK(migrated.boundsParameterKeys[1].value == Catch::Approx(0.2F));
 }
 
 TEST_CASE("Legacy takes backfill their scene from single-scene states",

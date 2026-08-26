@@ -22,7 +22,7 @@
 
 namespace invisible_places::serialization {
 
-inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 84U;
+inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 85U;
 inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 32U;
 inline constexpr std::uint32_t kWaterRainProfilesSourcesSchemaVersion = 31U;
 inline constexpr std::uint32_t kWaterOwnedShorelineProjectSchemaVersion = 66U;

@@ -251,10 +251,39 @@ bool IsValidBoundsParameter(TimingColouriseBoundsParameter parameter) {
         case TimingColouriseBoundsParameter::Upper:
         case TimingColouriseBoundsParameter::Centre:
         case TimingColouriseBoundsParameter::Spread:
+        // Legacy shared-fade keys stay valid through parsing so sanitize can
+        // split them into the two per-edge tracks.
         case TimingColouriseBoundsParameter::EdgeFade:
+        case TimingColouriseBoundsParameter::EdgeFadeLower:
+        case TimingColouriseBoundsParameter::EdgeFadeUpper:
             return true;
     }
     return false;
+}
+
+// Splits every legacy shared EdgeFade key into coincident EdgeFadeLower and
+// EdgeFadeUpper keys. Runs before per-key sanitizing, so runtime tracks
+// never hold the legacy parameter.
+void SplitLegacyEdgeFadeKeys(
+    std::vector<TimingColouriseBoundsParameterKey>* keys) {
+    if (keys == nullptr) {
+        return;
+    }
+    std::vector<TimingColouriseBoundsParameterKey> split;
+    split.reserve(keys->size());
+    for (auto& key : *keys) {
+        if (key.parameter != TimingColouriseBoundsParameter::EdgeFade) {
+            split.push_back(std::move(key));
+            continue;
+        }
+        auto lower = key;
+        lower.parameter = TimingColouriseBoundsParameter::EdgeFadeLower;
+        auto upper = std::move(key);
+        upper.parameter = TimingColouriseBoundsParameter::EdgeFadeUpper;
+        split.push_back(std::move(lower));
+        split.push_back(std::move(upper));
+    }
+    *keys = std::move(split);
 }
 
 bool IsValidPaletteKeyModel(TimingColourisePaletteKeyModel model) {
@@ -371,6 +400,11 @@ float SanitizeBoundsParameterValue(
     float value) {
     if (parameter == TimingColouriseBoundsParameter::EdgeFade) {
         return std::clamp(FiniteOr(value, 0.10F), -0.5F, 0.5F);
+    }
+    if (parameter == TimingColouriseBoundsParameter::EdgeFadeLower ||
+        parameter == TimingColouriseBoundsParameter::EdgeFadeUpper) {
+        // The split fades reach a whole-span fade in either direction.
+        return std::clamp(FiniteOr(value, 0.10F), -1.0F, 1.0F);
     }
     value = FiniteOr(value, 0.0F);
     if (parameter == TimingColouriseBoundsParameter::Spread) {
@@ -1054,8 +1088,14 @@ TimingColouriseBounds EvaluateLegacyTimingColouriseBounds(
     return SanitizeTimingColouriseBounds(TimingColouriseBounds{
         .lower = std::lerp(left->bounds.lower, right->bounds.lower, amount),
         .upper = std::lerp(left->bounds.upper, right->bounds.upper, amount),
-        .edgeFade =
-            std::lerp(left->bounds.edgeFade, right->bounds.edgeFade, amount),
+        .edgeFadeLower = std::lerp(
+            left->bounds.edgeFadeLower,
+            right->bounds.edgeFadeLower,
+            amount),
+        .edgeFadeUpper = std::lerp(
+            left->bounds.edgeFadeUpper,
+            right->bounds.edgeFadeUpper,
+            amount),
     });
 }
 
@@ -2760,8 +2800,10 @@ TimingColouriseBounds SanitizeTimingColouriseBounds(
     if (bounds.lower > bounds.upper) {
         std::swap(bounds.lower, bounds.upper);
     }
-    bounds.edgeFade =
-        std::clamp(FiniteOr(bounds.edgeFade, 0.10F), -0.5F, 0.5F);
+    bounds.edgeFadeLower =
+        std::clamp(FiniteOr(bounds.edgeFadeLower, 0.10F), -1.0F, 1.0F);
+    bounds.edgeFadeUpper =
+        std::clamp(FiniteOr(bounds.edgeFadeUpper, 0.10F), -1.0F, 1.0F);
     return bounds;
 }
 
@@ -2772,8 +2814,14 @@ bool TimingColouriseBoundsParameterIsAllowed(
         !IsValidBoundsParameter(parameter)) {
         return false;
     }
-    if (parameter == TimingColouriseBoundsParameter::EdgeFade) {
+    if (parameter == TimingColouriseBoundsParameter::EdgeFadeLower ||
+        parameter == TimingColouriseBoundsParameter::EdgeFadeUpper) {
         return true;
+    }
+    if (parameter == TimingColouriseBoundsParameter::EdgeFade) {
+        // The legacy shared lane only exists between parsing and sanitize,
+        // which splits it; no live track may keep it.
+        return false;
     }
     const auto pair = TimingColouriseBoundsParametersForMode(mode);
     return parameter == pair[0] || parameter == pair[1];
@@ -2817,7 +2865,14 @@ float TimingColouriseBoundsParameterValue(
         case TimingColouriseBoundsParameter::Spread:
             return sanitized.upper - sanitized.lower;
         case TimingColouriseBoundsParameter::EdgeFade:
-            return sanitized.edgeFade;
+            // Legacy readback: the closest single value is the mean.
+            return std::midpoint(
+                sanitized.edgeFadeLower,
+                sanitized.edgeFadeUpper);
+        case TimingColouriseBoundsParameter::EdgeFadeLower:
+            return sanitized.edgeFadeLower;
+        case TimingColouriseBoundsParameter::EdgeFadeUpper:
+            return sanitized.edgeFadeUpper;
     }
     return 0.0F;
 }
@@ -2830,7 +2885,10 @@ float RemapTimingColouriseBoundsParameterValueToRange(
     float destinationMinimum,
     float destinationMaximum) {
     value = SanitizeBoundsParameterValue(parameter, value);
-    if (parameter == TimingColouriseBoundsParameter::EdgeFade) {
+    if (parameter == TimingColouriseBoundsParameter::EdgeFade ||
+        parameter == TimingColouriseBoundsParameter::EdgeFadeLower ||
+        parameter == TimingColouriseBoundsParameter::EdgeFadeUpper) {
+        // Fades are dimensionless fractions of the span.
         return value;
     }
 
@@ -3378,6 +3436,7 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
         effect.boundsKeyMode =
             TimingColouriseBoundsKeyMode::LowerUpper;
     }
+    SplitLegacyEdgeFadeKeys(&effect.boundsParameterKeys);
     std::erase_if(
         effect.boundsParameterKeys,
         [&](const TimingColouriseBoundsParameterKey& key) {
@@ -3424,6 +3483,7 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
             memory.boundsKeyMode =
                 TimingColouriseBoundsKeyMode::LowerUpper;
         }
+        SplitLegacyEdgeFadeKeys(&memory.boundsParameterKeys);
         std::erase_if(
             memory.boundsParameterKeys,
             [&](const TimingColouriseBoundsParameterKey& key) {
@@ -5150,6 +5210,7 @@ void StashTimingColouriseFieldBounds(TimingColouriseEffect* effect) {
     entry->boundsParameterKeys = effect->boundsParameterKeys;
     entry->boundsKeys = effect->boundsKeys;
     entry->edited = effect->boundsEdited;
+    entry->edgeFadesLinked = effect->edgeFadesLinked;
     entry->adoptedGlobalRevision = effect->boundsAdoptedGlobalRevision;
 }
 
@@ -5175,6 +5236,7 @@ void ApplyTimingColouriseFieldSelection(
         effect->boundsParameterKeys = entry->boundsParameterKeys;
         effect->boundsKeys = entry->boundsKeys;
         effect->boundsEdited = entry->edited;
+        effect->edgeFadesLinked = entry->edgeFadesLinked;
         effect->boundsAdoptedGlobalRevision =
             entry->adoptedGlobalRevision;
     } else {
@@ -5186,6 +5248,7 @@ void ApplyTimingColouriseFieldSelection(
         effect->boundsParameterKeys.clear();
         effect->boundsKeys.clear();
         effect->boundsEdited = false;
+        effect->edgeFadesLinked = true;
         effect->boundsAdoptedGlobalRevision =
             globalStore != nullptr ? globalStore->revision : 0U;
     }
@@ -5316,7 +5379,10 @@ std::size_t MergeLegacyTimingEffectAspects(
                            return x.position == y.position &&
                                   x.bounds.lower == y.bounds.lower &&
                                   x.bounds.upper == y.bounds.upper &&
-                                  x.bounds.edgeFade == y.bounds.edgeFade &&
+                                  x.bounds.edgeFadeLower ==
+                                      y.bounds.edgeFadeLower &&
+                                  x.bounds.edgeFadeUpper ==
+                                      y.bounds.edgeFadeUpper &&
                                   x.interpolation == y.interpolation;
                        });
         };
@@ -5328,7 +5394,10 @@ std::size_t MergeLegacyTimingEffectAspects(
             const TimingColouriseEffect& b) {
             return a.baseBounds.lower == b.baseBounds.lower &&
                    a.baseBounds.upper == b.baseBounds.upper &&
-                   a.baseBounds.edgeFade == b.baseBounds.edgeFade &&
+                   a.baseBounds.edgeFadeLower ==
+                       b.baseBounds.edgeFadeLower &&
+                   a.baseBounds.edgeFadeUpper ==
+                       b.baseBounds.edgeFadeUpper &&
                    a.boundsKeyMode == b.boundsKeyMode &&
                    boundsParameterKeysMatch(
                        a.boundsParameterKeys,
@@ -5973,7 +6042,10 @@ TimingColouriseBounds EvaluateTimingColouriseBounds(
     };
 
     TimingColouriseBounds result{
-        .edgeFade = value(TimingColouriseBoundsParameter::EdgeFade),
+        .edgeFadeLower =
+            value(TimingColouriseBoundsParameter::EdgeFadeLower),
+        .edgeFadeUpper =
+            value(TimingColouriseBoundsParameter::EdgeFadeUpper),
     };
     switch (sanitized.boundsKeyMode) {
         case TimingColouriseBoundsKeyMode::CentreSpread: {
@@ -6035,6 +6107,9 @@ TimingColouriseLayerSample SampleTimingColouriseLut(
 float TimingColouriseBoundsMask(
     const TimingColouriseBounds& bounds,
     float fieldValue) {
+    // Mirrors the per-edge smoothstep mask the renderer computes in
+    // shaders/pointcloud_timing_colourise.glsl and the offline port in
+    // OfflinePointRenderer, so model-level answers match the shipped image.
     if (!std::isfinite(fieldValue)) {
         return 0.0F;
     }
@@ -6043,32 +6118,48 @@ float TimingColouriseBoundsMask(
     if (span <= std::numeric_limits<float>::epsilon()) {
         return 0.0F;
     }
-    const float fadeWidth = span * std::abs(sanitized.edgeFade);
-    if (fadeWidth <= std::numeric_limits<float>::epsilon()) {
-        return fieldValue >= sanitized.lower &&
-                       fieldValue <= sanitized.upper
-                   ? 1.0F
-                   : 0.0F;
-    }
-    if (sanitized.edgeFade < 0.0F) {
-        if (fieldValue < sanitized.lower - fadeWidth ||
-            fieldValue > sanitized.upper + fadeWidth) {
-            return 0.0F;
-        }
-        const float lowerAmount = Clamp01(
-            (fieldValue - (sanitized.lower - fadeWidth)) / fadeWidth);
-        const float upperAmount = Clamp01(
-            ((sanitized.upper + fadeWidth) - fieldValue) / fadeWidth);
-        return std::min(lowerAmount, upperAmount);
-    }
-    if (fieldValue < sanitized.lower || fieldValue > sanitized.upper) {
+    const auto smoothStep = [](float edge0, float edge1, float value) {
+        const float amount = Clamp01(
+            (value - edge0) / std::max(
+                                  edge1 - edge0,
+                                  std::numeric_limits<float>::epsilon()));
+        return amount * amount * (3.0F - 2.0F * amount);
+    };
+    const float lowerOutward =
+        span * std::max(-sanitized.edgeFadeLower, 0.0F);
+    const float upperOutward =
+        span * std::max(-sanitized.edgeFadeUpper, 0.0F);
+    if (fieldValue < sanitized.lower - lowerOutward ||
+        fieldValue > sanitized.upper + upperOutward) {
         return 0.0F;
     }
-    const float lowerAmount =
-        Clamp01((fieldValue - sanitized.lower) / fadeWidth);
-    const float upperAmount =
-        Clamp01((sanitized.upper - fieldValue) / fadeWidth);
-    return std::min(lowerAmount, upperAmount);
+    const float normalized =
+        Clamp01((fieldValue - sanitized.lower) / span);
+    float lowerAmount = 1.0F;
+    if (sanitized.edgeFadeLower > 1.0e-6F) {
+        lowerAmount = smoothStep(
+            0.0F,
+            sanitized.edgeFadeLower,
+            normalized);
+    } else if (sanitized.edgeFadeLower < -1.0e-6F) {
+        lowerAmount = smoothStep(
+            sanitized.lower - lowerOutward,
+            sanitized.lower,
+            fieldValue);
+    }
+    float upperAmount = 1.0F;
+    if (sanitized.edgeFadeUpper > 1.0e-6F) {
+        upperAmount = smoothStep(
+            0.0F,
+            sanitized.edgeFadeUpper,
+            1.0F - normalized);
+    } else if (sanitized.edgeFadeUpper < -1.0e-6F) {
+        upperAmount = 1.0F - smoothStep(
+                                 sanitized.upper,
+                                 sanitized.upper + upperOutward,
+                                 fieldValue);
+    }
+    return Clamp01(std::min(lowerAmount, upperAmount));
 }
 
 std::array<float, 3> ApplyTimingColouriseStack(

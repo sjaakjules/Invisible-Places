@@ -4746,7 +4746,8 @@ ResolveTimingColouriseStack(
                 cyclic);
         resolved.lowerBound = bounds.lower;
         resolved.upperBound = bounds.upper;
-        resolved.edgeFadeFraction = bounds.edgeFade;
+        resolved.edgeFadeLowerFraction = bounds.edgeFadeLower;
+        resolved.edgeFadeUpperFraction = bounds.edgeFadeUpper;
         // A combined Visual Feature occupies one renderer slot per enabled
         // aspect. Colourise and negative emissive entries compose in slot
         // order; positive emissive entries retain their additive behaviour.
@@ -6465,7 +6466,8 @@ void HashTimingColouriseStack(
                     effect.scalarFieldSlot)));
         HashFloat(seed, effect.lowerBound);
         HashFloat(seed, effect.upperBound);
-        HashFloat(seed, effect.edgeFadeFraction);
+        HashFloat(seed, effect.edgeFadeLowerFraction);
+        HashFloat(seed, effect.edgeFadeUpperFraction);
         HashFloat(seed, effect.emissiveLevel);
         for (const auto& sample : effect.rgbaLut) {
             for (const float value : sample) {
@@ -94711,10 +94713,15 @@ void DrawTimingKeyLaneGroup(
                     valueDrag.handle.boundsParameter.has_value()) {
                     const auto parameter =
                         valueDrag.handle.boundsParameter.value();
-                    if (destinationRange.has_value() &&
-                        parameter != invisible_places::timing::
+                    const bool fadeParameter =
+                        parameter == invisible_places::timing::
                                          TimingColouriseBoundsParameter::
-                                             EdgeFade) {
+                                             EdgeFadeLower ||
+                        parameter == invisible_places::timing::
+                                         TimingColouriseBoundsParameter::
+                                             EdgeFadeUpper;
+                    if (destinationRange.has_value() &&
+                        !fadeParameter) {
                         const auto [rangeMinimum, rangeMaximum] =
                             std::minmax(
                                 destinationRange->first,
@@ -98714,6 +98721,10 @@ const char* TimingColouriseBoundsParameterLabel(
             return "Spacing";
         case TimingColouriseBoundsParameter::EdgeFade:
             return "Fade";
+        case TimingColouriseBoundsParameter::EdgeFadeLower:
+            return "Lower Fade";
+        case TimingColouriseBoundsParameter::EdgeFadeUpper:
+            return "Upper Fade";
     }
     return "Bound";
 }
@@ -98803,8 +98814,15 @@ void SetTimingColouriseBaseBoundsParameter(
             break;
         }
         case TimingColouriseBoundsParameter::EdgeFade:
-            bounds.edgeFade =
-                std::clamp(value, -0.5F, 0.5F);
+            // Legacy shared lane: apply to both edges.
+            bounds.edgeFadeLower = std::clamp(value, -1.0F, 1.0F);
+            bounds.edgeFadeUpper = bounds.edgeFadeLower;
+            break;
+        case TimingColouriseBoundsParameter::EdgeFadeLower:
+            bounds.edgeFadeLower = std::clamp(value, -1.0F, 1.0F);
+            break;
+        case TimingColouriseBoundsParameter::EdgeFadeUpper:
+            bounds.edgeFadeUpper = std::clamp(value, -1.0F, 1.0F);
             break;
     }
     effect->baseBounds =
@@ -98852,6 +98870,10 @@ bool SetTimingColouriseBoundsParameterAt(
             break;
         case TimingColouriseBoundsParameter::EdgeFade:
             value = std::clamp(value, -0.5F, 0.5F);
+            break;
+        case TimingColouriseBoundsParameter::EdgeFadeLower:
+        case TimingColouriseBoundsParameter::EdgeFadeUpper:
+            value = std::clamp(value, -1.0F, 1.0F);
             break;
         case TimingColouriseBoundsParameter::Centre:
             break;
@@ -99067,8 +99089,11 @@ bool TimingColouriseHistogramHandleEditableAt(
         handle == TimingColouriseHistogramHandle::UpperFade) {
         return TimingColouriseBoundsParameterEditableAt(
             effect,
-            invisible_places::timing::
-                TimingColouriseBoundsParameter::EdgeFade,
+            handle == TimingColouriseHistogramHandle::LowerFade
+                ? invisible_places::timing::
+                      TimingColouriseBoundsParameter::EdgeFadeLower
+                : invisible_places::timing::
+                      TimingColouriseBoundsParameter::EdgeFadeUpper,
             position);
     }
     const auto parameters = invisible_places::timing::
@@ -99099,9 +99124,9 @@ float TimingColouriseHistogramHandleValue(
         case TimingColouriseHistogramHandle::UpperSpread:
             return bounds.upper;
         case TimingColouriseHistogramHandle::LowerFade:
-            return bounds.lower + span * bounds.edgeFade;
+            return bounds.lower + span * bounds.edgeFadeLower;
         case TimingColouriseHistogramHandle::UpperFade:
-            return bounds.upper - span * bounds.edgeFade;
+            return bounds.upper - span * bounds.edgeFadeUpper;
         case TimingColouriseHistogramHandle::Centre:
         case TimingColouriseHistogramHandle::None:
         default:
@@ -99188,18 +99213,45 @@ bool ApplyTimingColouriseHistogramBounds(
         if (span <= std::numeric_limits<float>::epsilon()) {
             return false;
         }
-        const float fade =
-            handle == TimingColouriseHistogramHandle::LowerFade
+        const bool lowerHandle =
+            handle == TimingColouriseHistogramHandle::LowerFade;
+        const float fade = std::clamp(
+            lowerHandle
                 ? (targetValue - bounds.lower) / span
-                : (bounds.upper - targetValue) / span;
-        return SetTimingColouriseBoundsParameterAt(
+                : (bounds.upper - targetValue) / span,
+            -1.0F,
+            1.0F);
+        bool changed = SetTimingColouriseBoundsParameterAt(
             stores,
             effect,
-            invisible_places::timing::
-                TimingColouriseBoundsParameter::EdgeFade,
+            lowerHandle
+                ? invisible_places::timing::
+                      TimingColouriseBoundsParameter::EdgeFadeLower
+                : invisible_places::timing::
+                      TimingColouriseBoundsParameter::EdgeFadeUpper,
             position,
-            std::clamp(fade, -0.5F, 0.5F),
+            fade,
             cyclicTiming);
+        // Linked fades move together: the dragged edge's value is written
+        // to its partner as well. Double-clicking a fade handle separates
+        // them.
+        if (effect->edgeFadesLinked) {
+            changed = SetTimingColouriseBoundsParameterAt(
+                          stores,
+                          effect,
+                          lowerHandle
+                              ? invisible_places::timing::
+                                    TimingColouriseBoundsParameter::
+                                        EdgeFadeUpper
+                              : invisible_places::timing::
+                                    TimingColouriseBoundsParameter::
+                                        EdgeFadeLower,
+                          position,
+                          fade,
+                          cyclicTiming) ||
+                      changed;
+        }
+        return changed;
     }
 
     auto desired = bounds;
@@ -99494,9 +99546,9 @@ void DrawTimingColouriseHistogram(
     const float fadeY = maximum.y - 8.0F;
     const float rawSpan = evaluated.upper - evaluated.lower;
     const float lowerFadeValue =
-        evaluated.lower + rawSpan * evaluated.edgeFade;
+        evaluated.lower + rawSpan * evaluated.edgeFadeLower;
     const float upperFadeValue =
-        evaluated.upper - rawSpan * evaluated.edgeFade;
+        evaluated.upper - rawSpan * evaluated.edgeFadeUpper;
     const float lowerFadeX = xForRaw(lowerFadeValue);
     const float upperFadeX = xForRaw(upperFadeValue);
     const bool histogramRangeEditable =
@@ -99696,7 +99748,8 @@ void DrawTimingColouriseHistogram(
             "Bounds histogram\n"
             "Drag the upper part of either vertical line to move that bound.\n"
             "Drag the centre rail to translate the interval. Drag either rail circle to resize symmetrically.\n"
-            "The sideways T handles set signed Fade: inward is positive, outward is negative.\n"} +
+            "The sideways T handles set each edge's signed Fade: inward is positive, outward is negative, up to a whole span either way.\n"
+            "Fades move together while linked; double-click a fade handle to separate them, and double-click again to relink using that handle's value.\n"} +
         (skewControlsVisible
              ? "The plum row above the rail is Palette Skew: drag the dot to move the palette midpoint, and drag a triangle to trade area between that side's centre and end colours. The strip between the rows previews the sampled palette.\n"
              : std::string{}) +
@@ -99798,7 +99851,52 @@ void DrawTimingColouriseHistogram(
                 TimingColouriseHistogramHandle::Centre;
         }
     }
-    if (hoveredHandle != TimingColouriseHistogramHandle::None &&
+    const bool fadeHandleHovered =
+        hoveredHandle == TimingColouriseHistogramHandle::LowerFade ||
+        hoveredHandle == TimingColouriseHistogramHandle::UpperFade;
+    if (fadeHandleHovered &&
+        ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
+        TimingColouriseHistogramHandleEditableAt(
+            effect,
+            hoveredHandle,
+            position)) {
+        // Double-click toggles the fade link. Re-linking adopts the
+        // double-clicked side's value on both edges.
+        if (effect->edgeFadesLinked) {
+            effect->edgeFadesLinked = false;
+            runtimeState->statusMessage =
+                "Separated the lower and upper fades. Double-click a "
+                "fade handle again to relink them.";
+        } else {
+            const bool lowerHandle =
+                hoveredHandle ==
+                TimingColouriseHistogramHandle::LowerFade;
+            const float adoptedFade = lowerHandle
+                ? evaluated.edgeFadeLower
+                : evaluated.edgeFadeUpper;
+            effect->edgeFadesLinked = true;
+            if (SetTimingColouriseBoundsParameterAt(
+                    &runtimeState->water.timingScalarBoundsStores,
+                    effect,
+                    lowerHandle
+                        ? invisible_places::timing::
+                              TimingColouriseBoundsParameter::
+                                  EdgeFadeUpper
+                        : invisible_places::timing::
+                              TimingColouriseBoundsParameter::
+                                  EdgeFadeLower,
+                    position,
+                    adoptedFade,
+                    cyclicTiming)) {
+                runtimeState->previewRenderStateSignatureValid = false;
+            }
+            runtimeState->statusMessage =
+                "Linked the fades to the double-clicked handle's value.";
+        }
+        runtimeState->timingsPanel.activeHistogramHandle =
+            TimingColouriseHistogramHandle::None;
+    } else if (
+        hoveredHandle != TimingColouriseHistogramHandle::None &&
         ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
         handleInsideHistogramRange(hoveredHandle) &&
         TimingColouriseHistogramHandleEditableAt(
@@ -100053,9 +100151,14 @@ void DrawTimingColouriseBoundsParameterEditor(
             *effect,
             parameter);
     const bool percentage =
+        parameter == invisible_places::timing::
+                         TimingColouriseBoundsParameter::EdgeFade ||
         parameter ==
-        invisible_places::timing::
-            TimingColouriseBoundsParameter::EdgeFade;
+            invisible_places::timing::
+                TimingColouriseBoundsParameter::EdgeFadeLower ||
+        parameter ==
+            invisible_places::timing::
+                TimingColouriseBoundsParameter::EdgeFadeUpper;
     const auto formatDraft = [&](float value) {
         std::array<char, 64> buffer{};
         std::snprintf(
@@ -100166,6 +100269,23 @@ void DrawTimingColouriseBoundsParameterEditor(
             position,
             submittedDraft.value(),
             CurrentAnimationTimingIsCyclic(*runtimeState))) {
+        // While the fades are linked, editing either edge writes both.
+        using invisible_places::timing::TimingColouriseBoundsParameter;
+        if (effect->edgeFadesLinked &&
+            (parameter == TimingColouriseBoundsParameter::EdgeFadeLower ||
+             parameter ==
+                 TimingColouriseBoundsParameter::EdgeFadeUpper)) {
+            (void)SetTimingColouriseBoundsParameterAt(
+                &runtimeState->water.timingScalarBoundsStores,
+                effect,
+                parameter ==
+                        TimingColouriseBoundsParameter::EdgeFadeLower
+                    ? TimingColouriseBoundsParameter::EdgeFadeUpper
+                    : TimingColouriseBoundsParameter::EdgeFadeLower,
+                position,
+                submittedDraft.value(),
+                CurrentAnimationTimingIsCyclic(*runtimeState));
+        }
         runtimeState->previewRenderStateSignatureValid = false;
     }
     if (valueEditMatches && !active) {
@@ -100176,7 +100296,9 @@ void DrawTimingColouriseBoundsParameterEditor(
     if (percentage) {
         DrawTimingControlTooltip(
             editable
-                ? "Signed fade as a percentage of spacing: positive fades inward, negative fades outward."
+                ? effect->edgeFadesLinked
+                      ? "Signed fade for this edge as a percentage of spacing, up to a whole span: positive fades inward, negative fades outward. Fades are linked - editing either writes both. Double-click a green fade handle in the histogram to separate them."
+                      : "Signed fade for this edge as a percentage of spacing, up to a whole span: positive fades inward, negative fades outward. Fades are separated - double-click a green fade handle in the histogram to relink them."
                 : "Fade is view-only in this Bounds Keying mode.");
     } else {
         DrawTimingControlTooltip(
@@ -100299,7 +100421,8 @@ void DrawTimingColouriseBoundsEditor(
         TimingColouriseBoundsParameter::Upper,
         TimingColouriseBoundsParameter::Centre,
         TimingColouriseBoundsParameter::Spread,
-        TimingColouriseBoundsParameter::EdgeFade,
+        TimingColouriseBoundsParameter::EdgeFadeLower,
+        TimingColouriseBoundsParameter::EdgeFadeUpper,
     };
     constexpr std::array<ImU32, parameters.size()> laneColours{
         IM_COL32(255, 190, 74, 255),
@@ -100307,6 +100430,7 @@ void DrawTimingColouriseBoundsEditor(
         IM_COL32(100, 176, 232, 255),
         IM_COL32(190, 132, 224, 255),
         IM_COL32(148, 214, 132, 255),
+        IM_COL32(108, 190, 156, 255),
     };
     if (ImGui::BeginTable(
             "##BoundsParameters",
@@ -102126,7 +102250,8 @@ void DrawTimingColouriseSection(
                     fallbackBounds = {
                         .lower = range->first,
                         .upper = range->second,
-                        .edgeFade = 0.10F,
+                        .edgeFadeLower = 0.10F,
+                        .edgeFadeUpper = 0.10F,
                     };
                 }
                 invisible_places::timing::
@@ -113113,7 +113238,8 @@ void InstallWaterIntegrationScenario(PreviewRuntimeState* runtimeState) {
                     .baseBounds = {
                         .lower = range.first,
                         .upper = range.second,
-                        .edgeFade = 0.08F},
+                        .edgeFadeLower = 0.08F,
+                        .edgeFadeUpper = 0.08F},
                     .emissiveLevel =
                         emissiveEffect
                             ? 0.25F +
@@ -113195,7 +113321,8 @@ void InstallWaterIntegrationScenario(PreviewRuntimeState* runtimeState) {
                          range.first + span * 0.10F,
                      .upper =
                          range.second - span * 0.10F,
-                     .edgeFade = 0.18F});
+                     .edgeFadeLower = 0.18F,
+                     .edgeFadeUpper = 0.18F});
             invisible_places::timing::
                 AddOrUpdateTimingColouriseBoundsKey(
                     &effect,
@@ -113204,7 +113331,8 @@ void InstallWaterIntegrationScenario(PreviewRuntimeState* runtimeState) {
                          range.first + span * 0.20F,
                      .upper =
                          range.second - span * 0.05F,
-                     .edgeFade = 0.05F});
+                     .edgeFadeLower = 0.05F,
+                     .edgeFadeUpper = 0.05F});
             takeState->colouriseEffects.push_back(
                 invisible_places::timing::
                     SanitizeTimingColouriseEffect(
@@ -121797,9 +121925,15 @@ int RunWaterIntegrationSmoke(
                                 kDifferenceTolerance ||
                             std::abs(
                                 firstEffect
-                                        .edgeFadeFraction -
+                                        .edgeFadeLowerFraction -
                                 secondEffect
-                                    .edgeFadeFraction) >
+                                    .edgeFadeLowerFraction) >
+                                kDifferenceTolerance ||
+                            std::abs(
+                                firstEffect
+                                        .edgeFadeUpperFraction -
+                                secondEffect
+                                    .edgeFadeUpperFraction) >
                                 kDifferenceTolerance) {
                             return true;
                         }

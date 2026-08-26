@@ -912,17 +912,25 @@ std::optional<ResolvedTimingColouriseMask> ResolveTimingColouriseMask(
         return std::nullopt;
     }
 
+    // Per-edge signed fades, mirroring the mask in
+    // shaders/pointcloud_timing_colourise.glsl exactly.
     const float span = effect.upperBound - effect.lowerBound;
-    const float fadeFraction = std::clamp(
-        std::isfinite(effect.edgeFadeFraction)
-            ? effect.edgeFadeFraction
+    const float lowerFade = std::clamp(
+        std::isfinite(effect.edgeFadeLowerFraction)
+            ? effect.edgeFadeLowerFraction
             : 0.10F,
-        -0.5F,
-        0.5F);
-    const float outwardWidth =
-        span * std::max(-fadeFraction, 0.0F);
-    if (value.value() < effect.lowerBound - outwardWidth ||
-        value.value() > effect.upperBound + outwardWidth) {
+        -1.0F,
+        1.0F);
+    const float upperFade = std::clamp(
+        std::isfinite(effect.edgeFadeUpperFraction)
+            ? effect.edgeFadeUpperFraction
+            : 0.10F,
+        -1.0F,
+        1.0F);
+    const float lowerOutward = span * std::max(-lowerFade, 0.0F);
+    const float upperOutward = span * std::max(-upperFade, 0.0F);
+    if (value.value() < effect.lowerBound - lowerOutward ||
+        value.value() > effect.upperBound + upperOutward) {
         return std::nullopt;
     }
 
@@ -931,26 +939,29 @@ std::optional<ResolvedTimingColouriseMask> ResolveTimingColouriseMask(
         (value.value() - effect.lowerBound) / span,
         0.0F,
         1.0F);
-    result.edgeMask = 1.0F;
-    if (fadeFraction > 1.0e-6F) {
-        result.edgeMask = std::min(
-            SmoothStep(0.0F, fadeFraction, result.normalizedValue),
-            SmoothStep(
-                0.0F,
-                fadeFraction,
-                1.0F - result.normalizedValue));
-    } else if (fadeFraction < -1.0e-6F) {
-        result.edgeMask = std::min(
-            SmoothStep(
-                effect.lowerBound - outwardWidth,
-                effect.lowerBound,
-                value.value()),
-            1.0F - SmoothStep(
-                effect.upperBound,
-                effect.upperBound + outwardWidth,
-                value.value()));
+    float lowerMask = 1.0F;
+    if (lowerFade > 1.0e-6F) {
+        lowerMask =
+            SmoothStep(0.0F, lowerFade, result.normalizedValue);
+    } else if (lowerFade < -1.0e-6F) {
+        lowerMask = SmoothStep(
+            effect.lowerBound - lowerOutward,
+            effect.lowerBound,
+            value.value());
     }
-    result.edgeMask = Clamp01(result.edgeMask);
+    float upperMask = 1.0F;
+    if (upperFade > 1.0e-6F) {
+        upperMask = SmoothStep(
+            0.0F,
+            upperFade,
+            1.0F - result.normalizedValue);
+    } else if (upperFade < -1.0e-6F) {
+        upperMask = 1.0F - SmoothStep(
+                               effect.upperBound,
+                               effect.upperBound + upperOutward,
+                               value.value());
+    }
+    result.edgeMask = Clamp01(std::min(lowerMask, upperMask));
     return result;
 }
 

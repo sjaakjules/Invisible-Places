@@ -56,31 +56,34 @@ vec4 ResolveTimingColouriseEffect(uint effectIndex, uint pointIndex) {
     }
 
     const vec4 range = styleData.timingColouriseRanges[effectIndex];
+    const vec4 fades = styleData.timingColouriseFades[effectIndex];
     const float span = range.y - range.x;
-    const float fadeFraction = clamp(range.z, -0.5, 0.5);
-    const float outwardWidth = span * max(-fadeFraction, 0.0);
+    // Each edge owns a signed fade fraction of the span (positive inward,
+    // negative outward), independently clamped to a whole span.
+    const float lowerFade = clamp(fades.x, -1.0, 1.0);
+    const float upperFade = clamp(fades.y, -1.0, 1.0);
+    const float lowerOutward = span * max(-lowerFade, 0.0);
+    const float upperOutward = span * max(-upperFade, 0.0);
     if (!(span > 1.0e-12) ||
-        value < range.x - outwardWidth ||
-        value > range.y + outwardWidth) {
+        value < range.x - lowerOutward ||
+        value > range.y + upperOutward) {
         return vec4(0.0);
     }
     const float normalized = clamp((value - range.x) / span, 0.0, 1.0);
-    float edgeMask = 1.0;
-    if (fadeFraction > 1.0e-6) {
-        edgeMask = min(
-            smoothstep(0.0, fadeFraction, normalized),
-            smoothstep(0.0, fadeFraction, 1.0 - normalized));
-    } else if (fadeFraction < -1.0e-6) {
-        edgeMask = min(
-            smoothstep(
-                range.x - outwardWidth,
-                range.x,
-                value),
-            1.0 - smoothstep(
-                range.y,
-                range.y + outwardWidth,
-                value));
+    float lowerMask = 1.0;
+    if (lowerFade > 1.0e-6) {
+        lowerMask = smoothstep(0.0, lowerFade, normalized);
+    } else if (lowerFade < -1.0e-6) {
+        lowerMask = smoothstep(range.x - lowerOutward, range.x, value);
     }
+    float upperMask = 1.0;
+    if (upperFade > 1.0e-6) {
+        upperMask = smoothstep(0.0, upperFade, 1.0 - normalized);
+    } else if (upperFade < -1.0e-6) {
+        upperMask =
+            1.0 - smoothstep(range.y, range.y + upperOutward, value);
+    }
+    const float edgeMask = min(lowerMask, upperMask);
 
     const float safeEdgeMask = clamp(edgeMask, 0.0, 1.0);
     if (source.w == kTimingColouriseEmissiveOutput) {

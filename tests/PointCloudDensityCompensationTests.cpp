@@ -602,7 +602,8 @@ TEST_CASE(
             transparentEffect.scalarFieldSlot = 0;
             transparentEffect.lowerBound = 0.5F;
             transparentEffect.upperBound = 1.5F;
-            transparentEffect.edgeFadeFraction = 0.25F;
+            transparentEffect.edgeFadeLowerFraction = 0.25F;
+            transparentEffect.edgeFadeUpperFraction = 0.25F;
             transparentEffect.rgbaLut.fill({0.0F, 1.0F, 0.0F, 0.0F});
         }
         // Put the visible layer in the eighth slot so this fixture proves the
@@ -613,7 +614,8 @@ TEST_CASE(
         effect.scalarFieldSlot = 0;
         effect.lowerBound = 0.5F;
         effect.upperBound = 1.5F;
-        effect.edgeFadeFraction = 0.25F;
+        effect.edgeFadeLowerFraction = 0.25F;
+        effect.edgeFadeUpperFraction = 0.25F;
         effect.rgbaLut.fill({1.0F, 0.0F, 0.0F, 1.0F});
 
         const invisible_places::output::OfflinePointLayer layer{
@@ -732,7 +734,8 @@ TEST_CASE(
             effect.scalarFieldSlot = useNormalZ ? -1 : 0;
             effect.lowerBound = 0.5F;
             effect.upperBound = 1.5F;
-            effect.edgeFadeFraction = edgeFadeFraction;
+            effect.edgeFadeLowerFraction = edgeFadeFraction;
+            effect.edgeFadeUpperFraction = edgeFadeFraction;
             effect.emissiveLevel = level;
         };
         // Exercise the complete shared capacity by placing the first visible
@@ -892,7 +895,8 @@ TEST_CASE(
             colourise.scalarFieldSlot = 0;
             colourise.lowerBound = 0.5F;
             colourise.upperBound = 1.5F;
-            colourise.edgeFadeFraction = 0.25F;
+            colourise.edgeFadeLowerFraction = 0.25F;
+            colourise.edgeFadeUpperFraction = 0.25F;
             colourise.rgbaLut.fill(
                 {1.0F, 0.0F, 0.0F, topmost && tintVisible ? 1.0F : 0.0F});
             auto& emissive = stack.effects[feature * 2U + 1U];
@@ -902,7 +906,8 @@ TEST_CASE(
             emissive.scalarFieldSlot = 0;
             emissive.lowerBound = 0.5F;
             emissive.upperBound = 1.5F;
-            emissive.edgeFadeFraction = 0.25F;
+            emissive.edgeFadeLowerFraction = 0.25F;
+            emissive.edgeFadeUpperFraction = 0.25F;
             emissive.emissiveLevel = topmost ? emissiveLevel : 0.0F;
         }
 
