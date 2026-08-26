@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "provenance": {
+    "source_screenshot": "/Users/juju/Documents/Screenshots/Screenshot 2026-08-26 at 1.24.54 pm.png",
+    "source_pixels": [4244, 1728],
+    "registration_method": "Exact matching of two distinctive WATER components in the plan view; rotation was negligible",
+    "pixel_to_world": {
+      "x": "758.0646 + (u - 424.9353) / 130.4",
+      "y": "822.6746 - (v - 1202.1147) / 130.4"
+    },
+    "note": "The screenshot supplies review locations only. Classification and reconstruction decisions use the written request and measured point-cloud evidence."
+  },
+  "marked_locations": {
+    "floating_water_over_measured_sand": {
+      "normalised_image_point": [0.538, 0.376],
+      "registered_world_point": [772.32, 826.91],
+      "step_bbox": [772.20, 772.35, 826.50, 826.80],
+      "observed_levels_m": {
+        "high": [2.193, 2.195],
+        "low": [2.129, 2.132],
+        "step_mm": 63.2
+      },
+      "classification": "Remove elevated WATER and retain the densely measured original SAND beneath it; do not blanket-fill SAND with ScanID 9."
+    },
+    "offsite_water": {
+      "normalised_image_point": [0.11, 0.66],
+      "registered_world_point": [758.39, 823.15],
+      "exclusion_boxes": [
+        {
+          "id": "offsite_semicircle",
+          "bbox": [756.675, 759.500, 820.975, 824.575],
+          "source_component": 812,
+          "source_points": 239026
+        },
+        {
+          "id": "offsite_thin_component",
+          "bbox": [759.400, 760.275, 821.125, 824.775],
+          "source_component": 824,
+          "source_points": 32090
+        }
+      ]
+    }
+  },
+  "analogous_step_review_regions": [
+    {"center": [777.209, 826.969], "bbox": [774.70, 779.80, 825.25, 829.60], "step_q95_mm": 57.7, "support": "dense SAND"},
+    {"center": [789.126, 832.275], "bbox": [786.80, 791.10, 829.80, 835.80], "step_q95_mm": 34.3, "support": "almost no terrain; interpolate WATER"},
+    {"center": [763.939, 823.077], "bbox": [763.70, 764.20, 822.55, 823.60], "step_q95_mm": 197.2, "support": "SAND"},
+    {"center": [762.106, 825.664], "bbox": [761.85, 762.45, 824.95, 826.75], "step_q95_mm": 44.5, "support": "ROCK"},
+    {"center": [765.981, 832.886], "bbox": [765.60, 766.40, 832.70, 833.15], "step_q95_mm": 82.0, "support": "mostly SAND"},
+    {"center": [763.227, 820.415], "bbox": [762.95, 763.45, 820.05, 820.75], "step_q95_mm": 85.6, "support": "dense ROCK"},
+    {"center": [767.365, 835.836], "bbox": [766.95, 767.95, 835.60, 836.10], "step_q95_mm": 38.4, "support": "SAND"},
+    {"center": [764.767, 825.319], "bbox": [764.50, 765.15, 825.20, 825.40], "step_q95_mm": 217.6, "support": "dense mixed SAND/ROCK"}
+  ],
+  "acceptance": {
+    "water_scalar_bounds": {
+      "Intensity": [5000, 5302784],
+      "Composite": [50, 255],
+      "combined_signed_geometry": [-1, 1],
+      "combined_roughness": [0, 1],
+      "environmental_fields": [0, 1]
+    },
+    "water_points_per_25mm_cell": [20, 25],
+    "maximum_connected_step_mm": 40,
+    "maximum_q99_connected_step_mm": 10,
+    "canonical_clouds_must_not_change_before_install": true
+  }
+}
